@@ -1,0 +1,87 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment files - NEVER COMMIT SECRETS
+.env
+.env.local
+.env.*.local
+.env.docker
+.env.backup.*
+!.env.example
+!.env.template
+
+# Keys directory - NEVER COMMIT
+.keys/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Coverage
+coverage/
+.nyc_output/
+
+# Test reports
+test-results/
+junit.xml
+
+# Cache
+.cache/
+.npm/
+.eslintcache
+
+# Runtime data
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# Secrets - NEVER COMMIT
+*.pem
+*.key
+*.crt
+*.p12
+secrets/
+credentials/
+
+# Docker
+.docker/
+
+# Kubernetes secrets (only the setup with actual secrets)
+k8s/00-setup.yaml
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Debug
+.debug/
+
+# Lock files (keep package-lock.json)
+yarn.lock
+
+# Generated files
+*.generated.*
+
+# Backup files
+*.bak
+*.backup

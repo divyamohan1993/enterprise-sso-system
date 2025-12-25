@@ -1,0 +1,17 @@
+{
+    "moduleFileExtensions": [
+        "js",
+        "json",
+        "ts"
+    ],
+    "rootDir": ".",
+    "testEnvironment": "node",
+    "testRegex": ".e2e-spec.ts$",
+    "transform": {
+        "^.+\\.(t|j)s$": "ts-jest"
+    },
+    "moduleNameMapper": {
+        "^@noble/post-quantum/ml-dsa$": "<rootDir>/../src/test/jest.setup.ts",
+        "^jose$": "<rootDir>/../src/test/mocks/jose.mock.ts"
+    }
+}
