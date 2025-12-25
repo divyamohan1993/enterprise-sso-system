@@ -1,6 +1,6 @@
 # 🔐 Enterprise SSO System
 
-[![Build Status](https://github.com/YOUR_USERNAME/enterprise-sso/actions/workflows/ci-cd.yml/badge.svg)](https://github.com/YOUR_USERNAME/enterprise-sso/actions)
+[![Build Status](https://github.com/divyamohan1993/enterprise-sso-system/actions/workflows/ci-cd.yml/badge.svg)](https://github.com/divyamohan1993/enterprise-sso-system/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Node.js](https://img.shields.io/badge/Node.js-20.x-green.svg)](https://nodejs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.x-blue.svg)](https://www.typescriptlang.org/)
@@ -27,8 +27,8 @@ A production-ready, enterprise-grade Single Sign-On system featuring quantum-res
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/enterprise-sso.git
-cd enterprise-sso
+git clone https://github.com/divyamohan1993/enterprise-sso-system.git
+cd enterprise-sso-system
 
 # Run automatic setup (installs deps, generates keys, builds)
 npm run setup
@@ -44,7 +44,7 @@ The setup script automatically generates all cryptographic secrets - no manual c
 ## � Project Structure
 
 ```
-enterprise-sso/
+enterprise-sso-system/
 ├── src/                    # Source code
 │   ├── auth/               # Authentication module (JWT, MFA, OAuth)
 │   ├── blockchain/         # Blockchain audit trail
