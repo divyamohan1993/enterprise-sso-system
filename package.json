@@ -1,5 +1,6 @@
 {
   "name": "enterprise-sso-system",
+  "packageManager": "pnpm@10.30.1",
   "version": "1.0.0",
   "description": "Enterprise Grade Quantum-Safe Blockchain-Backed SSO Platform",
   "private": false,
