@@ -190,11 +190,12 @@ assert!(auth.requires_two_person); // Must have 2 people from different departme
 ## Security Properties
 
 - **190+ tests** including attack simulations (DDoS, credential stuffing, token forgery, privilege escalation)
-- **169 attack vectors** analyzed across 6 red team rounds (spec-level analysis)
-- **Zero CVEs** in dependency tree (cargo audit clean)
-- **Post-quantum KEM**: real ML-KEM-768 (FIPS 203) via `ml-kem` crate — fully implemented
-- **Threshold signing algorithm**: real FROST via `frost-ristretto255` — works but uses trusted dealer in single process (distributed deployment pending)
-- **Password hashing**: Argon2id with 64 MiB memory hardness — server-side verification (NOT OPAQUE; server receives password over SHARD channel)
+- **169 attack scenarios** identified during internal design review (self-authored, not independent external red team)
+- **No exploitable CVEs** in dependency tree (1 unmaintained advisory RUSTSEC-2023-0089 for atomic-polyfill, deliberately allowed)
+- **Post-quantum KEM**: real ML-KEM-768 (FIPS 203) via `ml-kem` 0.2 — fully implemented (note: `ml-kem` crate is unaudited)
+- **Post-quantum signatures**: NOT yet implemented — tokens use classical FROST/Ristretto255. ML-DSA-65 planned.
+- **Threshold signing algorithm**: real FROST via `frost-ristretto255` 2.2 — works but uses trusted dealer in single process (distributed deployment pending)
+- **Password hashing**: Argon2id with 64 MiB memory hardness — server-side verification (NOT OPAQUE; server receives plaintext password over SHARD channel). `opaque-ke` 4.0 in deps but not used.
 - **Ratchet library**: HKDF-SHA512 chain with secure key erasure — implemented as library, not yet wired into token verification
 - **Tamper-proof audit**: hash-chained log, any modification detectable — single-node (BFT replication planned)
 - **Key Transparency**: SHA3-256 Merkle tree with inclusion proofs — library only (no signing service yet)

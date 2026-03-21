@@ -8,7 +8,7 @@ An SSO system architected to combine threshold cryptography, post-quantum key ex
 
 **Implementation Status (v0.1.0):** Core cryptographic foundations implemented. End-to-end auth flow working. Several spec-level security properties are library-only and not yet wired into the runtime (see Honest Assessment in README).
 
-**Red Team Coverage:** 169 attack vectors identified across 6 rounds of adversarial analysis at the spec/architecture level. Code-level red team found 11 additional vulnerabilities (4 critical patched, remainder documented as known limitations).
+**Red Team Coverage:** 169 attack scenarios identified during internal design review (self-authored AI-assisted analysis, not independent external red team). Code-level review found 11 additional vulnerabilities (4 critical patched, remainder documented as known limitations).
 
 ---
 
