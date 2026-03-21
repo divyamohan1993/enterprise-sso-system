@@ -12,3 +12,6 @@ hkdf.workspace = true
 hmac.workspace = true
 subtle.workspace = true
 zeroize.workspace = true
+x25519-dalek.workspace = true
+getrandom.workspace = true
+rand.workspace = true
