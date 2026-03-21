@@ -41,30 +41,30 @@
 
 **Files:**
 - Create: `Cargo.toml` (workspace root)
-- Create: `milnet-common/Cargo.toml`
-- Create: `milnet-common/src/lib.rs`
-- Create: `milnet-crypto/Cargo.toml`
-- Create: `milnet-crypto/src/lib.rs`
-- Create: `milnet-shard/Cargo.toml`
-- Create: `milnet-shard/src/lib.rs`
-- Create: `milnet-gateway/Cargo.toml`
-- Create: `milnet-gateway/src/main.rs`
-- Create: `milnet-orchestrator/Cargo.toml`
-- Create: `milnet-orchestrator/src/main.rs`
-- Create: `milnet-tss/Cargo.toml`
-- Create: `milnet-tss/src/main.rs`
-- Create: `milnet-verifier/Cargo.toml`
-- Create: `milnet-verifier/src/main.rs`
-- Create: `milnet-opaque/Cargo.toml`
-- Create: `milnet-opaque/src/main.rs`
-- Create: `milnet-ratchet/Cargo.toml`
-- Create: `milnet-ratchet/src/main.rs`
-- Create: `milnet-kt/Cargo.toml`
-- Create: `milnet-kt/src/main.rs`
-- Create: `milnet-risk/Cargo.toml`
-- Create: `milnet-risk/src/main.rs`
-- Create: `milnet-audit/Cargo.toml`
-- Create: `milnet-audit/src/main.rs`
+- Create: `common/Cargo.toml`
+- Create: `common/src/lib.rs`
+- Create: `crypto/Cargo.toml`
+- Create: `crypto/src/lib.rs`
+- Create: `shard/Cargo.toml`
+- Create: `shard/src/lib.rs`
+- Create: `gateway/Cargo.toml`
+- Create: `gateway/src/main.rs`
+- Create: `orchestrator/Cargo.toml`
+- Create: `orchestrator/src/main.rs`
+- Create: `tss/Cargo.toml`
+- Create: `tss/src/main.rs`
+- Create: `verifier/Cargo.toml`
+- Create: `verifier/src/main.rs`
+- Create: `opaque/Cargo.toml`
+- Create: `opaque/src/main.rs`
+- Create: `ratchet/Cargo.toml`
+- Create: `ratchet/src/main.rs`
+- Create: `kt/Cargo.toml`
+- Create: `kt/src/main.rs`
+- Create: `risk/Cargo.toml`
+- Create: `risk/src/main.rs`
+- Create: `audit/Cargo.toml`
+- Create: `audit/src/main.rs`
 
 - [ ] **Step 1: Create workspace root Cargo.toml**
 
@@ -72,18 +72,18 @@
 [workspace]
 resolver = "2"
 members = [
-    "milnet-common",
-    "milnet-crypto",
-    "milnet-shard",
-    "milnet-gateway",
-    "milnet-orchestrator",
-    "milnet-tss",
-    "milnet-verifier",
-    "milnet-opaque",
-    "milnet-ratchet",
-    "milnet-kt",
-    "milnet-risk",
-    "milnet-audit",
+    "common",
+    "crypto",
+    "shard",
+    "gateway",
+    "orchestrator",
+    "tss",
+    "verifier",
+    "opaque",
+    "ratchet",
+    "kt",
+    "risk",
+    "audit",
 ]
 
 [workspace.package]
@@ -108,12 +108,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }
 ```
 
-- [ ] **Step 2: Create milnet-common crate stub**
+- [ ] **Step 2: Create common crate stub**
 
 ```toml
-# milnet-common/Cargo.toml
+# common/Cargo.toml
 [package]
-name = "milnet-common"
+name = "common"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
@@ -128,7 +128,7 @@ thiserror.workspace = true
 ```
 
 ```rust
-// milnet-common/src/lib.rs
+// common/src/lib.rs
 #![forbid(unsafe_code)]
 
 pub mod types;
@@ -138,17 +138,17 @@ pub mod error;
 
 - [ ] **Step 3: Create all 9 module crate stubs (gateway through audit)**
 
-Each gets a Cargo.toml depending on milnet-common + milnet-shard, and a `main.rs` with:
+Each gets a Cargo.toml depending on common + shard, and a `main.rs` with:
 ```rust
 #![forbid(unsafe_code)]
 fn main() {
-    println!("milnet-<name> starting");
+    println!("<name> starting");
 }
 ```
 
-- [ ] **Step 4: Create milnet-crypto and milnet-shard crate stubs**
+- [ ] **Step 4: Create crypto and shard crate stubs**
 
-Library crates (no main.rs), depending on milnet-common.
+Library crates (no main.rs), depending on common.
 
 - [ ] **Step 5: Verify workspace compiles**
 
@@ -167,16 +167,16 @@ git commit -m "feat: scaffold Rust workspace with 12 crates for MILNET SSO"
 ### Task 0.2: Shared Type Definitions
 
 **Files:**
-- Create: `milnet-common/src/types.rs`
-- Create: `milnet-common/src/domain.rs`
-- Create: `milnet-common/src/error.rs`
-- Test: `milnet-common/tests/types_test.rs`
+- Create: `common/src/types.rs`
+- Create: `common/src/domain.rs`
+- Create: `common/src/error.rs`
+- Test: `common/tests/types_test.rs`
 
 - [ ] **Step 1: Write failing serialization round-trip test**
 
 ```rust
-// milnet-common/tests/types_test.rs
-use milnet_common::types::*;
+// common/tests/types_test.rs
+use common::types::*;
 
 #[test]
 fn token_serializes_roundtrip() {
@@ -199,13 +199,13 @@ fn receipt_serializes_roundtrip() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p milnet-common`
+Run: `cargo test -p common`
 Expected: FAIL — types module not found.
 
 - [ ] **Step 3: Implement Token, Receipt, and all shared types per spec B.14**
 
 ```rust
-// milnet-common/src/types.rs
+// common/src/types.rs
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -373,7 +373,7 @@ impl Receipt {
 - [ ] **Step 4: Implement domain separation constants per spec C.10**
 
 ```rust
-// milnet-common/src/domain.rs
+// common/src/domain.rs
 /// Domain separation prefixes — spec Errata C.10
 /// No two operations share the same prefix.
 pub const FROST_TOKEN: &[u8] = b"MILNET-SSO-v1-FROST-TOKEN";
@@ -392,7 +392,7 @@ pub const ACTION_BIND: &[u8] = b"MILNET-SSO-v1-ACTION";
 - [ ] **Step 5: Implement error types**
 
 ```rust
-// milnet-common/src/error.rs
+// common/src/error.rs
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -428,13 +428,13 @@ pub enum MilnetError {
 
 - [ ] **Step 6: Run tests to verify types serialize/deserialize**
 
-Run: `cargo test -p milnet-common`
+Run: `cargo test -p common`
 Expected: PASS — both round-trip tests pass.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add milnet-common/
+git add common/
 git commit -m "feat(common): add shared types, domain separation, and error types"
 ```
 
@@ -697,16 +697,16 @@ Expected: All formatted.
 ### Task 1.1: X-Wing Hybrid KEM Combiner
 
 **Files:**
-- Create: `milnet-crypto/src/xwing.rs`
-- Test: `milnet-crypto/tests/xwing_test.rs`
+- Create: `crypto/src/xwing.rs`
+- Test: `crypto/tests/xwing_test.rs`
 
 **Spec refs:** C.8 (X-Wing combiner), C.1 (libcrux-ml-kem)
 
 - [ ] **Step 1: Write failing test for X-Wing key exchange**
 
 ```rust
-// milnet-crypto/tests/xwing_test.rs
-use milnet_crypto::xwing::XWing;
+// crypto/tests/xwing_test.rs
+use crypto::xwing::XWing;
 
 #[test]
 fn xwing_key_exchange_produces_shared_secret() {
@@ -728,13 +728,13 @@ fn xwing_different_sessions_produce_different_secrets() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p milnet-crypto`
+Run: `cargo test -p crypto`
 Expected: FAIL — xwing module not found.
 
 - [ ] **Step 3: Implement X-Wing combiner**
 
 ```rust
-// milnet-crypto/src/xwing.rs
+// crypto/src/xwing.rs
 //! X-Wing hybrid KEM combiner (spec Errata C.8)
 //! shared_secret = SHA3-256("X-Wing" || ml_kem_ss || ml_kem_ct
 //!                          || x25519_ss || x25519_pk_c || x25519_pk_s)
@@ -818,13 +818,13 @@ impl XWing {
 
 - [ ] **Step 4: Run tests**
 
-Run: `cargo test -p milnet-crypto`
+Run: `cargo test -p crypto`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add milnet-crypto/
+git add crypto/
 git commit -m "feat(crypto): implement X-Wing hybrid KEM combiner"
 ```
 
@@ -833,16 +833,16 @@ git commit -m "feat(crypto): implement X-Wing hybrid KEM combiner"
 ### Task 1.2: Constant-Time Utilities
 
 **Files:**
-- Create: `milnet-crypto/src/ct.rs`
-- Test: `milnet-crypto/tests/ct_test.rs`
+- Create: `crypto/src/ct.rs`
+- Test: `crypto/tests/ct_test.rs`
 
 **Spec refs:** E.6, C.10
 
 - [ ] **Step 1: Write failing test**
 
 ```rust
-// milnet-crypto/tests/ct_test.rs
-use milnet_crypto::ct::{ct_eq, ct_select};
+// crypto/tests/ct_test.rs
+use crypto::ct::{ct_eq, ct_select};
 
 #[test]
 fn ct_eq_equal_values() {
@@ -861,13 +861,13 @@ fn ct_eq_different_values() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p milnet-crypto -- ct_`
+Run: `cargo test -p crypto -- ct_`
 Expected: FAIL.
 
 - [ ] **Step 3: Implement constant-time comparison**
 
 ```rust
-// milnet-crypto/src/ct.rs
+// crypto/src/ct.rs
 use subtle::ConstantTimeEq;
 
 /// Constant-time byte slice comparison.
@@ -883,13 +883,13 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 - [ ] **Step 4: Run tests**
 
-Run: `cargo test -p milnet-crypto -- ct_`
+Run: `cargo test -p crypto -- ct_`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add milnet-crypto/
+git add crypto/
 git commit -m "feat(crypto): add constant-time comparison utilities"
 ```
 
@@ -898,18 +898,18 @@ git commit -m "feat(crypto): add constant-time comparison utilities"
 ### Task 1.3: SHARD IPC Protocol
 
 **Files:**
-- Create: `milnet-shard/src/protocol.rs`
-- Create: `milnet-shard/src/channel.rs`
-- Test: `milnet-shard/tests/protocol_test.rs`
+- Create: `shard/src/protocol.rs`
+- Create: `shard/src/channel.rs`
+- Test: `shard/tests/protocol_test.rs`
 
 **Spec refs:** Section 11, E.11
 
 - [ ] **Step 1: Write failing test for SHARD message send/receive**
 
 ```rust
-// milnet-shard/tests/protocol_test.rs
-use milnet_shard::protocol::ShardProtocol;
-use milnet_common::types::ModuleId;
+// shard/tests/protocol_test.rs
+use shard::protocol::ShardProtocol;
+use common::types::ModuleId;
 
 #[tokio::test]
 async fn shard_message_roundtrip() {
@@ -938,17 +938,17 @@ async fn shard_rejects_replay() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p milnet-shard`
+Run: `cargo test -p shard`
 Expected: FAIL — protocol module not found.
 
 - [ ] **Step 3: Implement SHARD protocol**
 
 ```rust
-// milnet-shard/src/protocol.rs
+// shard/src/protocol.rs
 use hmac::{Hmac, Mac};
 use sha2::Sha512;
-use milnet_common::types::{ModuleId, ShardMessage};
-use milnet_common::error::MilnetError;
+use common::types::{ModuleId, ShardMessage};
+use common::error::MilnetError;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 type HmacSha512 = Hmac<Sha512>;
@@ -1002,7 +1002,7 @@ impl ShardProtocol {
 
         // Verify HMAC
         let expected_hmac = self.compute_hmac(&raw[..raw.len() - 64]);
-        if !milnet_crypto::ct::ct_eq(&raw[raw.len() - 64..], &expected_hmac) {
+        if !crypto::ct::ct_eq(&raw[raw.len() - 64..], &expected_hmac) {
             return Err(MilnetError::Shard("HMAC mismatch".into()));
         }
 
@@ -1027,7 +1027,7 @@ impl ShardProtocol {
     fn compute_hmac(&self, data: &[u8]) -> [u8; 64] {
         let mut mac = HmacSha512::new_from_slice(&self.hmac_key)
             .expect("HMAC key length is always valid");
-        mac.update(milnet_common::domain::SHARD_AUTH);
+        mac.update(common::domain::SHARD_AUTH);
         mac.update(data);
         mac.finalize().into_bytes().into()
     }
@@ -1043,13 +1043,13 @@ fn now_us() -> i64 {
 
 - [ ] **Step 4: Run tests**
 
-Run: `cargo test -p milnet-shard`
+Run: `cargo test -p shard`
 Expected: PASS — roundtrip works, replay rejected.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add milnet-shard/
+git add shard/
 git commit -m "feat(shard): implement SHARD IPC protocol with replay protection"
 ```
 
@@ -1058,16 +1058,16 @@ git commit -m "feat(shard): implement SHARD IPC protocol with replay protection"
 ### Task 1.4: FROST Threshold Signing Wrapper
 
 **Files:**
-- Create: `milnet-crypto/src/threshold.rs`
-- Test: `milnet-crypto/tests/threshold_test.rs`
+- Create: `crypto/src/threshold.rs`
+- Test: `crypto/tests/threshold_test.rs`
 
 **Spec refs:** C.6 (ROAST), C.7 (nonce tracking), C.15 (ristretto255), E.2 (DKG mandatory), E.4 (nonce commitment)
 
 - [ ] **Step 1: Write failing test for 3-of-5 threshold signing**
 
 ```rust
-// milnet-crypto/tests/threshold_test.rs
-use milnet_crypto::threshold::FrostSigner;
+// crypto/tests/threshold_test.rs
+use crypto::threshold::FrostSigner;
 
 #[test]
 fn frost_3_of_5_produces_valid_signature() {
@@ -1092,7 +1092,7 @@ fn frost_2_of_5_fails() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p milnet-crypto -- frost_`
+Run: `cargo test -p crypto -- frost_`
 Expected: FAIL.
 
 - [ ] **Step 3: Implement FROST wrapper around frost-ristretto255**
@@ -1101,13 +1101,13 @@ Wrap the `frost-ristretto255` crate's DKG, signing, and verification. Add monoto
 
 - [ ] **Step 4: Run tests**
 
-Run: `cargo test -p milnet-crypto -- frost_`
+Run: `cargo test -p crypto -- frost_`
 Expected: PASS — 3-of-5 signs successfully, 2-of-5 fails.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add milnet-crypto/
+git add crypto/
 git commit -m "feat(crypto): implement FROST 3-of-5 threshold signing with DKG"
 ```
 
@@ -1116,17 +1116,17 @@ git commit -m "feat(crypto): implement FROST 3-of-5 threshold signing with DKG"
 ### Task 1.5: Receipt Signing and Chain Validation
 
 **Files:**
-- Create: `milnet-crypto/src/receipts.rs`
-- Test: `milnet-crypto/tests/receipt_test.rs`
+- Create: `crypto/src/receipts.rs`
+- Test: `crypto/tests/receipt_test.rs`
 
 **Spec refs:** Section 6 (receipt structure), C.10 (domain separation), E.15 (session ID tracking)
 
 - [ ] **Step 1: Write failing test for receipt chain validation**
 
 ```rust
-// milnet-crypto/tests/receipt_test.rs
-use milnet_crypto::receipts::ReceiptChain;
-use milnet_common::types::Receipt;
+// crypto/tests/receipt_test.rs
+use crypto::receipts::ReceiptChain;
+use common::types::Receipt;
 
 #[test]
 fn valid_receipt_chain_validates() {
@@ -1150,7 +1150,7 @@ fn mismatched_session_id_fails() {
 - [ ] **Step 3: Commit**
 
 ```bash
-git add milnet-crypto/
+git add crypto/
 git commit -m "feat(crypto): implement receipt chain signing and validation"
 ```
 
@@ -1159,8 +1159,8 @@ git commit -m "feat(crypto): implement receipt chain signing and validation"
 ### Task 1.6: Entropy Combiner
 
 **Files:**
-- Create: `milnet-crypto/src/entropy.rs`
-- Test: `milnet-crypto/tests/entropy_test.rs`
+- Create: `crypto/src/entropy.rs`
+- Test: `crypto/tests/entropy_test.rs`
 
 **Spec refs:** E.5 (multiple entropy sources), E.21 Truth 1
 
@@ -1169,7 +1169,7 @@ git commit -m "feat(crypto): implement receipt chain signing and validation"
 - [ ] **Step 2: Implement XOR combination of getrandom + environmental noise**
 
 ```rust
-// milnet-crypto/src/entropy.rs
+// crypto/src/entropy.rs
 use sha2::{Sha512, Digest};
 
 /// Combine multiple entropy sources per spec E.5
@@ -1206,7 +1206,7 @@ pub fn combined_entropy() -> [u8; 32] {
 - [ ] **Step 3: Test and commit**
 
 ```bash
-git add milnet-crypto/
+git add crypto/
 git commit -m "feat(crypto): implement multi-source entropy combiner"
 ```
 
