@@ -34,8 +34,8 @@ pub struct DkgResult {
 pub fn dkg(total: u16, threshold: u16) -> DkgResult {
     let mut rng = thread_rng();
     let (shares_map, public_key_package) = frost::keys::generate_with_dealer(
-        total.into(),
-        threshold.into(),
+        total,
+        threshold,
         frost::keys::IdentifierList::Default,
         &mut rng,
     )
