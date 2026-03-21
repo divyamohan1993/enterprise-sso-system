@@ -17,6 +17,7 @@ tracing-subscriber.workspace = true
 opaque-ke.workspace = true
 sha2.workspace = true
 rand.workspace = true
+rusqlite.workspace = true
 
 [dev-dependencies]
 opaque-ke.workspace = true

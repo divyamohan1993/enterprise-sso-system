@@ -1,4 +1,3 @@
-#![forbid(unsafe_code)]
 //! common: Shared types for the MILNET SSO system.
 //!
 //! Provides core domain types including Token, Receipt, DeviceTier,
@@ -6,6 +5,7 @@
 
 pub mod actions;
 pub mod config;
+pub mod db;
 pub mod domain;
 pub mod duress;
 pub mod error;
