@@ -1,14 +1,19 @@
 output "server_ip" {
-  description = "External IP address of the MILNET SSO server"
-  value       = google_compute_instance.sso_server.network_interface[0].access_config[0].nat_ip
+  value       = google_compute_address.sso_ip.address
+  description = "Public IP of the SSO server"
 }
 
-output "sso_url" {
-  description = "URL to access the MILNET SSO admin API"
-  value       = "http://${google_compute_instance.sso_server.network_interface[0].access_config[0].nat_ip}:8080"
+output "frontend_url" {
+  value       = "http://${google_compute_address.sso_ip.address}:8080"
+  description = "Frontend URL"
 }
 
-output "instance_name" {
-  description = "Name of the Compute Engine instance"
-  value       = google_compute_instance.sso_server.name
+output "oidc_discovery" {
+  value       = "http://${google_compute_address.sso_ip.address}:8080/.well-known/openid-configuration"
+  description = "OIDC Discovery endpoint"
+}
+
+output "health_check" {
+  value       = "http://${google_compute_address.sso_ip.address}:8080/api/health"
+  description = "Health check endpoint"
 }
