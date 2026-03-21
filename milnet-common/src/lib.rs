@@ -3,3 +3,7 @@
 //!
 //! Provides core domain types including Token, Receipt, DeviceTier,
 //! ActionLevel, and other foundational structures used across all crates.
+
+pub mod domain;
+pub mod error;
+pub mod types;
