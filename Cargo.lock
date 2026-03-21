@@ -1256,9 +1256,11 @@ name = "sso-e2e"
 version = "0.1.0"
 dependencies = [
  "frost-ristretto255",
+ "hmac",
  "postcard",
  "rand",
  "serde",
+ "sha2",
  "sso-audit",
  "sso-common",
  "sso-crypto",
