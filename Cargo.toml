@@ -13,6 +13,7 @@ members = [
     "milnet-kt",
     "milnet-risk",
     "milnet-audit",
+    "milnet-e2e",
 ]
 
 [workspace.package]

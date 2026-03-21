@@ -483,6 +483,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "milnet-e2e"
+version = "0.1.0"
+dependencies = [
+ "milnet-common",
+ "milnet-crypto",
+ "milnet-gateway",
+ "milnet-opaque",
+ "milnet-orchestrator",
+ "milnet-shard",
+ "milnet-tss",
+ "milnet-verifier",
+ "postcard",
+ "rand",
+ "serde",
+ "sha2",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "milnet-gateway"
 version = "0.1.0"
 dependencies = [

@@ -1,24 +1,36 @@
 //! Bastion Gateway TCP server.
 //!
 //! Accepts client connections, issues a hash puzzle challenge, verifies
-//! the solution, reads an authentication request, and (for now) returns
-//! a stub success response. Orchestrator forwarding via SHARD will be
-//! added in Task 2.4.
+//! the solution, reads an authentication request, and forwards to the
+//! orchestrator via SHARD for real authentication.
+
+use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{error, info, warn};
 
+use milnet_common::types::ModuleId;
+use milnet_shard::transport::connect;
+
 use crate::puzzle::{generate_challenge, verify_solution, PuzzleSolution};
-use crate::wire::{AuthRequest, AuthResponse};
+use crate::wire::{AuthRequest, AuthResponse, OrchestratorRequest, OrchestratorResponse};
 
 /// Maximum wire frame payload size (1 MiB).
 const MAX_FRAME_LEN: u32 = 1024 * 1024;
+
+/// Configuration for orchestrator forwarding.
+#[derive(Clone)]
+pub struct OrchestratorConfig {
+    pub addr: String,
+    pub hmac_key: [u8; 64],
+}
 
 /// The Bastion Gateway server.
 pub struct GatewayServer {
     listener: TcpListener,
     difficulty: u8,
+    orchestrator: Option<Arc<OrchestratorConfig>>,
 }
 
 impl GatewayServer {
@@ -29,6 +41,22 @@ impl GatewayServer {
         Ok(Self {
             listener,
             difficulty,
+            orchestrator: None,
+        })
+    }
+
+    /// Bind the gateway with orchestrator forwarding enabled.
+    pub async fn bind_with_orchestrator(
+        addr: &str,
+        difficulty: u8,
+        orchestrator_config: OrchestratorConfig,
+    ) -> std::io::Result<Self> {
+        let listener = TcpListener::bind(addr).await?;
+        info!("Gateway listening on {}", listener.local_addr()?);
+        Ok(Self {
+            listener,
+            difficulty,
+            orchestrator: Some(Arc::new(orchestrator_config)),
         })
     }
 
@@ -42,8 +70,9 @@ impl GatewayServer {
         loop {
             let (stream, addr) = self.listener.accept().await?;
             let difficulty = self.difficulty;
+            let orch = self.orchestrator.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(stream, difficulty).await {
+                if let Err(e) = handle_connection(stream, difficulty, orch).await {
                     warn!("connection from {addr} failed: {e}");
                 }
             });
@@ -53,7 +82,7 @@ impl GatewayServer {
     /// Accept and handle exactly one connection (useful for tests).
     pub async fn accept_one(&self) -> std::io::Result<()> {
         let (stream, addr) = self.listener.accept().await?;
-        handle_connection(stream, self.difficulty)
+        handle_connection(stream, self.difficulty, self.orchestrator.clone())
             .await
             .map_err(|e| {
                 error!("connection from {addr} failed: {e}");
@@ -63,7 +92,11 @@ impl GatewayServer {
 }
 
 /// Handle a single client connection through the full puzzle + auth flow.
-async fn handle_connection(mut stream: TcpStream, difficulty: u8) -> Result<(), String> {
+async fn handle_connection(
+    mut stream: TcpStream,
+    difficulty: u8,
+    orchestrator: Option<Arc<OrchestratorConfig>>,
+) -> Result<(), String> {
     // 1. Send puzzle challenge
     let challenge = generate_challenge(difficulty);
     send_frame(&mut stream, &challenge).await?;
@@ -93,18 +126,61 @@ async fn handle_connection(mut stream: TcpStream, difficulty: u8) -> Result<(), 
     }
 
     // 4. Read auth request
-    let _auth_req: AuthRequest = recv_frame(&mut stream).await?;
+    let auth_req: AuthRequest = recv_frame(&mut stream).await?;
 
-    // 5. Forward to orchestrator (stub: echo success)
-    // TODO(task-2.4): forward via SHARD to orchestrator
-    let resp = AuthResponse {
-        success: true,
-        token: Some(vec![0xAA; 32]), // placeholder token
-        error: None,
+    // 5. Forward to orchestrator via SHARD (or stub if not configured)
+    let resp = if let Some(orch) = orchestrator {
+        forward_to_orchestrator(&auth_req, &orch).await?
+    } else {
+        // Stub response when no orchestrator is configured
+        AuthResponse {
+            success: true,
+            token: Some(vec![0xAA; 32]), // placeholder token
+            error: None,
+        }
     };
     send_frame(&mut stream, &resp).await?;
 
     Ok(())
+}
+
+/// Forward an auth request to the orchestrator via SHARD and return the response.
+async fn forward_to_orchestrator(
+    auth_req: &AuthRequest,
+    config: &OrchestratorConfig,
+) -> Result<AuthResponse, String> {
+    let orch_req = OrchestratorRequest {
+        username: auth_req.username.clone(),
+        password_hash: auth_req.password_hash,
+        dpop_key_hash: [0u8; 32], // Gateway does not have DPoP yet
+        tier: 2, // Default to Tier 2 (Operational)
+    };
+
+    let req_bytes = postcard::to_allocvec(&orch_req)
+        .map_err(|e| format!("serialize orchestrator request: {e}"))?;
+
+    let mut transport = connect(&config.addr, ModuleId::Gateway, config.hmac_key)
+        .await
+        .map_err(|e| format!("connect to orchestrator: {e}"))?;
+
+    transport
+        .send(&req_bytes)
+        .await
+        .map_err(|e| format!("send to orchestrator: {e}"))?;
+
+    let (_sender, resp_bytes) = transport
+        .recv()
+        .await
+        .map_err(|e| format!("recv from orchestrator: {e}"))?;
+
+    let orch_resp: OrchestratorResponse = postcard::from_bytes(&resp_bytes)
+        .map_err(|e| format!("deserialize orchestrator response: {e}"))?;
+
+    Ok(AuthResponse {
+        success: orch_resp.success,
+        token: orch_resp.token_bytes,
+        error: orch_resp.error,
+    })
 }
 
 /// Send a postcard-serialized value with 4-byte BE length prefix.

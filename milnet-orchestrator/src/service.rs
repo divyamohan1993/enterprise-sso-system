@@ -131,7 +131,7 @@ impl OrchestratorService {
             scope: 0x0000_000F,
             dpop_hash: request.dpop_key_hash,
             ceremony_id: session_id,
-            tier: 1,
+            tier: if request.tier == 0 { 2 } else { request.tier },
             ratchet_epoch: 0,
         };
 

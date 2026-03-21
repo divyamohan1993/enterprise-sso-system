@@ -1,0 +1,20 @@
+[package]
+name = "milnet-e2e"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+milnet-common = { path = "../milnet-common" }
+milnet-crypto = { path = "../milnet-crypto" }
+milnet-shard = { path = "../milnet-shard" }
+milnet-gateway = { path = "../milnet-gateway" }
+milnet-orchestrator = { path = "../milnet-orchestrator" }
+milnet-opaque = { path = "../milnet-opaque" }
+milnet-tss = { path = "../milnet-tss" }
+milnet-verifier = { path = "../milnet-verifier" }
+tokio.workspace = true
+serde.workspace = true
+postcard.workspace = true
+uuid.workspace = true
+sha2.workspace = true
+rand = "0.8"

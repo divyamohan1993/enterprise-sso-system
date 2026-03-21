@@ -177,6 +177,7 @@ async fn orchestrator_processes_auth() {
         username: "alice".into(),
         password_hash: [0xAA; 32],
         dpop_key_hash: [0xBB; 32],
+        tier: 2,
     };
 
     let response = service.process_auth(&request).await;
@@ -240,6 +241,7 @@ async fn orchestrator_handles_opaque_failure() {
         username: "baduser".into(),
         password_hash: [0x00; 32],
         dpop_key_hash: [0xBB; 32],
+        tier: 2,
     };
 
     let response = service.process_auth(&request).await;

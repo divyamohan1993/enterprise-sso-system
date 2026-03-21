@@ -8,6 +8,8 @@ pub struct OrchestratorRequest {
     pub username: String,
     pub password_hash: [u8; 32],
     pub dpop_key_hash: [u8; 32],
+    /// Requested authentication tier (1-4). Defaults to 2 if 0.
+    pub tier: u8,
 }
 
 /// Response from the Orchestrator to the Gateway.
