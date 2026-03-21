@@ -1,0 +1,27 @@
+# Build stage
+FROM rust:1.85-slim AS builder
+WORKDIR /app
+COPY . .
+RUN apt-get update && apt-get install -y pkg-config libssl-dev cmake gcc g++ && rm -rf /var/lib/apt/lists/*
+RUN cargo build --release -p admin
+
+# Runtime stage — self-contained with PostgreSQL for demo
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates libssl3 postgresql postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/admin /usr/local/bin/admin
+COPY --from=builder /app/frontend/ /opt/frontend/
+
+# Entrypoint script that starts PostgreSQL then the admin server
+COPY deploy/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 8080
+ENV ADMIN_PORT=8080
+ENV RUST_LOG=info
+ENV DATABASE_URL=postgres://milnet:milnet_secure@localhost/milnet_sso
+
+ENTRYPOINT ["/entrypoint.sh"]
