@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: milnet-sso
+  labels:
+    app: milnet-sso
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: milnet-sso
+  template:
+    metadata:
+      labels:
+        app: milnet-sso
+    spec:
+      containers:
+        - name: milnet-sso
+          image: gcr.io/PROJECT_ID/milnet-sso:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: ADMIN_PORT
+              value: "8080"
+            - name: RUST_LOG
+              value: "info"
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: 250m
+            limits:
+              memory: 512Mi
+              cpu: "1"
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
