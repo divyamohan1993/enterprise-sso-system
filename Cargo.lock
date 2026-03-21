@@ -446,9 +446,13 @@ name = "milnet-audit"
 version = "0.1.0"
 dependencies = [
  "milnet-common",
- "milnet-shard",
+ "milnet-crypto",
+ "postcard",
+ "serde",
+ "sha2",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -523,9 +527,12 @@ name = "milnet-kt"
 version = "0.1.0"
 dependencies = [
  "milnet-common",
- "milnet-shard",
+ "milnet-crypto",
+ "postcard",
+ "serde",
+ "sha3",
  "tokio",
- "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -567,10 +574,19 @@ dependencies = [
 name = "milnet-ratchet"
 version = "0.1.0"
 dependencies = [
+ "hkdf",
+ "hmac",
  "milnet-common",
+ "milnet-crypto",
  "milnet-shard",
+ "postcard",
+ "serde",
+ "sha2",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -578,9 +594,13 @@ name = "milnet-risk"
 version = "0.1.0"
 dependencies = [
  "milnet-common",
+ "milnet-crypto",
  "milnet-shard",
+ "postcard",
+ "serde",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
