@@ -1272,6 +1272,211 @@ Ed25519 has well-documented cofactor-8 issues. FROST-Ed25519 uses Ristretto enco
 
 **Fix:** Replace `frost-ed25519` with `frost-ristretto255` in the crypto stack. Both are from the ZF FROST implementation (RFC 9591 compatible). Ristretto255 provides a prime-order group without cofactor concerns.
 
+## Appendix E: Nation-State Red Team Errata (Round 3)
+
+37 attack vectors from combined NSA TAO / Unit 8200 / GRU / GCHQ / Lazarus analysis. 5 systemic conclusions. All critical findings addressed below. Lower-severity findings documented with accepted risk rationale.
+
+### E.1: CRITICAL — Emergency Recovery Path Hardening (Attacks 5, 9, 29)
+
+The red team identified the emergency recovery path as the system's Achilles' heel: crash audit → force emergency mode → exploit single-TSS node → extract recovery key.
+
+**Fixes:**
+1. **Recovery key MUST be reconstructed inside an HSM/TEE**, never in software. The HSM directly performs signing operations. The raw key never exists in addressable memory.
+2. **Emergency bootstrap rate limit:** Maximum 1 per 24 hours. Second emergency within 24h requires 7-of-9 custodians (not 5-of-9).
+3. **Increase custodian pool:** 7-of-13 (up from 5-of-9). Custodians in different countries/jurisdictions. Proactive Shamir share refresh annually.
+4. **Emergency system retains threshold:** Even emergency mode uses 2-of-3 threshold signing (reduced from 3-of-5, but never single-node). This requires pre-positioning 3 emergency TSS HSMs in geographically separate locations.
+5. **Audit degradation instead of kill switch:** When BFT audit is unavailable, authentication continues with LOCAL HSM-signed audit logging for up to 30 minutes, with mandatory reconciliation when BFT recovers. After 30 minutes, human authorization required to extend. This removes the "crash audit = kill all auth" DoS vector.
+
+### E.2: CRITICAL — Mandatory DKG, Remove Dealer Ceremony (Attack 4)
+
+"Preferred" is not "mandatory." The dealer ceremony creates an unverifiable destruction problem.
+
+**Fix:** MANDATE Gennaro et al.'s secure DKG (or FROST's built-in DKG from draft-irtf-cfrg-frost-dkg) with full complaint/justification phase. Remove ALL references to dealer ceremony from the spec. DKG is the ONLY key generation method. Each node verifies other nodes' Feldman VSS commitments independently. DKG conducted over audited mTLS channels.
+
+### E.3: CRITICAL — Surge Token Security Properties (Attack 1)
+
+Surge tokens bypass ratchet verification — this contradicts the core security model.
+
+**Fix:** Surge tokens MUST retain:
+- DPoP binding (NEVER relaxed)
+- Ratchet epoch tag (bound to issuing epoch)
+- Threshold signature (but may use cached partial signatures from a pre-signing pool)
+- Maximum lifetime: 60 seconds (not "slightly longer-lived")
+
+The TSS pre-computes a pool of partial signatures during normal operation. During surge, the orchestrator assembles tokens from the pre-computed pool without real-time TSS coordination. This preserves threshold security while reducing surge latency. Pool is refreshed every 30 seconds.
+
+### E.4: CRITICAL — FROST Nonce Commitment Tracking (Attack 3)
+
+Compromised coordinator replaying nonce commitments enables key share extraction.
+
+**Fix:**
+- TSS nodes maintain monotonic signing session counter in tamper-evident persistent storage
+- Nonce = H(secret_share || counter || fresh_randomness)
+- TSS nodes MUST verify all other signers' commitments independently (peer-to-peer, NOT via coordinator)
+- Wrap FROST with ROAST (already in Errata C.6)
+- Any duplicate nonce commitment → abort session, quarantine suspect node, trigger investigation
+
+### E.5: CRITICAL — Multiple Independent Entropy Sources (Attack 36)
+
+If CPU RNG (RDRAND) is backdoored, all cryptography collapses.
+
+**Fix:** Require XOR combination of multiple independent entropy sources:
+```
+entropy = RDRAND ⊕ dedicated_hardware_rng ⊕ H(network_timing_jitter || disk_access_timing)
+```
+- Dedicated hardware RNG: separate physical device (e.g., OneRNG, Infinite Noise TRNG)
+- Environmental noise: network packet timing, disk I/O timing, interrupt timing
+- No single source's compromise is sufficient
+- Continuous entropy health testing (NIST SP 800-90B)
+- Alert on entropy quality degradation
+
+### E.6: CRITICAL — Insider Timing Oracle Prevention (Attack 37)
+
+Subtle non-constant-time comparisons introduced by insider pass code review.
+
+**Fix:**
+- MANDATE `subtle::ConstantTimeEq` for ALL security-critical comparisons
+- CI static analysis: flag any use of `==` on `[u8]`, `Vec<u8>`, or `Hash` types in security modules
+- Continuous timing analysis in CI: benchmark all security functions with varying inputs, fail on input-dependent timing
+- Two independent implementations of receipt validation (diverse redundancy)
+- Red-team code reviews specifically targeting timing side-channels quarterly
+
+### E.7: HIGH — Risk Scoring: Remove Published Weights (Attack 8)
+
+Publishing exact weights and thresholds enables systematic evasion.
+
+**Fix:**
+- Remove all weight and threshold values from the spec. Reference an operational classified document instead.
+- Implement per-user adaptive ML model (not fixed weights)
+- Expand to 20+ signals including: keystroke dynamics, API call sequencing, inter-request timing, session duration patterns
+- Add mimicry detector: flag sessions where ALL signals are simultaneously perfect (statistically improbable)
+- Add canary resources that real users never access but attackers might explore
+- Dual baseline: short-term adaptive (30-day) + long-term fixed (enrollment). Both must agree.
+- Rate-limit baseline drift: maximum 5% change per week. Alert on monotonic expansion.
+
+### E.8: HIGH — Binary Attestation Must Use TEE (Attack 21)
+
+File-based integrity checks don't prevent in-memory modification by kernel-level adversary.
+
+**Fix:** TSS nodes and Ratchet Manager MUST run inside hardware TEEs (AMD SEV-SNP or Intel TDX) where kernel cannot modify enclave memory. Attestation verifies the TEE enclave, not just the file hash. Without TEE, acknowledge as known limitation: "binary integrity against root-level adversary requires hardware enclave protection."
+
+### E.9: HIGH — Level 4 Ceremony: Three-Person, Random Selection (Attacks 12, 16)
+
+Two-person cross-department is weak against patient nation-state (recruit 2 assets over 5 years).
+
+**Fix:**
+- Level 4 requires THREE persons from THREE departments (raise from 2 to 3)
+- Participants RANDOMLY SELECTED from qualified pool (not self-selected)
+- Cooling period: positive acknowledgment from 2+ monitors required (silence = DENIAL)
+- Maximum Level 4 frequency: 1 per 72 hours. More requires additional approval.
+- Alert channel cryptographically authenticated (signed alerts to FIDO2-protected consoles)
+
+### E.10: HIGH — Verifier Cache Staleness Timeout (Attack 13)
+
+Verifier partitioned from Ratchet Manager continues with stale ratchet state indefinitely.
+
+**Fix:** Verifier MUST have maximum cache staleness for ratchet state: 60 seconds without heartbeat from Ratchet Manager → REJECT ALL TOKENS (fail-secure). Add heartbeat protocol between Verifier and Ratchet Manager. Document in failure mode table.
+
+### E.11: HIGH — SHARD Messages Need HSM Countersignature (Attack 6)
+
+Root access on a module = SHARD channel fully compromised.
+
+**Fix:** Security-critical SHARD messages (receipt issuance, risk scores, signing requests) MUST be countersigned by the module's HSM/TEE-resident key. Transport-layer HMAC provides channel security; HSM signature provides endpoint integrity. Even root-on-host cannot forge without HSM compromise.
+
+### E.12: HIGH — DPoP Must Include TLS Channel Binding (Attack 34)
+
+DPoP binds to client key, not TLS session. Stolen client key = DPoP bypass.
+
+**Fix:** Include TLS channel binding (tls-exporter value per RFC 9449 Section 4.2) in DPoP proof. Verifier checks BOTH DPoP signature AND TLS exporter match. Stolen client key cannot create valid DPoP for different TLS session. For Tier 1: DPoP key stored in FIDO2 secure element (non-extractable).
+
+### E.13: HIGH — TSS Node Replacement as Level 3 Action (Attack 30)
+
+Attacker runs genuine binary on compromised hardware, receives valid share.
+
+**Fix:** TSS node replacement = Level 3 action (two-person approval from different departments). New node gets 24-hour probation period: participates in signing but shares are verified in zero-knowledge. TSS nodes MUST run in TEE. Share refresh to new node requires explicit k-of-n authorization from existing nodes.
+
+### E.14: HIGH — Receipt Key Overlap Window Reduction (Attack 31)
+
+24-hour receipt key overlap is 24,000x longer than needed.
+
+**Fix:** Reduce overlap from 24 hours to 2 hours. Old key only valid for receipts timestamped before rotation. New ceremonies after rotation MUST use new key.
+
+### E.15: HIGH — Ceremony Session ID Replay Prevention (Attack 22)
+
+Compromised orchestrator replays complete receipt chain within 30s TTL.
+
+**Fix:** TSS nodes maintain used ceremony_session_id set for 120 seconds (4x TTL). Reject any previously-seen ID. Set replicated across all TSS nodes via piggyback on FROST coordination messages.
+
+### E.16: HIGH — Server Entropy in Ratchet (Attack 15)
+
+Compromised client sends zero-entropy. Ratchet becomes deterministic.
+
+**Fix:** Ratchet formula updated:
+```
+chain_key_{n+1} = HKDF-SHA512(chain_key_n, "MILNET-SSO-v1-RATCHET" || client_entropy || server_entropy)
+```
+`server_entropy` = fresh 32 bytes from Ratchet Manager's CSPRNG each epoch. Client entropy provides additional unpredictability but is not relied upon.
+
+### E.17: HIGH — FIDO2 Key Vendor Diversity (Attack 27)
+
+Single custom FIDO2 vendor = single supply chain target.
+
+**Fix:** Require FIDO2 keys from at least TWO independent vendors. Destructive analysis of random samples per batch (X-ray, decapping, firmware audit). Open-source firmware requirement for custom keys with reproducible builds. Duress protocol not solely dependent on FIDO2 — add independent duress signal (separate device gesture, time-based dead-man's switch).
+
+### E.18: MEDIUM — Share Refresh Atomic Transition (Attack 23)
+
+Mixed-epoch partial signatures during refresh leak information.
+
+**Fix:** Explicit share epoch transition protocol:
+1. BFT consensus among TSS nodes to begin refresh
+2. Signing PAUSED (expected <1 second)
+3. All nodes switch atomically (or roll back on failure)
+4. Signing resumes
+Never reveal partial signatures from different epochs for same message.
+
+### E.19: MEDIUM — Postcard Deserialization Hardening (Attack 32)
+
+**Fix:** Pre-parsing validation layer: check magic bytes, total length, fixed-field sizes before deserialization. Use `#[serde(deny_unknown_fields)]`. Catch panics at module boundaries. Fuzz all deserialization paths with cargo-fuzz. Memory allocation limits per deserialization.
+
+### E.20: MEDIUM — Crypto Agility for PQ Upgrades (Attack 35)
+
+**Fix:** Algorithm byte in token format supports multiple values. Define key rotation procedure for PQ parameter upgrade (ML-KEM-768 → ML-KEM-1024). Re-evaluation schedule: annual review of lattice cryptanalysis progress. For >25-year classified data on inter-module channels: consider triple-hybrid (ML-KEM + X25519 + Classic McEliece).
+
+### E.21: SYSTEMIC — Acknowledged Limitations
+
+The red team identified 5 systemic conclusions that require honest acknowledgment:
+
+**1. The system assumes hardware enclaves are trustworthy.** The spec claims "trust nothing" but relies on HSMs, TPMs, TEEs, and CPU entropy. Honest statement: "We assume hardware enclaves are trustworthy when properly attested. Without hardware trust anchors, the threat model is unsatisfiable."
+
+**2. No cryptographic system can verify human intent.** Two legitimate, authorized, un-coerced insiders who conspire can execute any action they are authorized for. Mitigation is counterintelligence, not cryptography. Three-person with random selection raises the bar but doesn't eliminate it.
+
+**3. Complexity is a risk.** 9 modules, 72 channels, 5 tiers, 5 levels. Formal verification (TLA+/Alloy) of the state machine is REQUIRED before production deployment. Chaos testing is REQUIRED. This is not optional.
+
+**4. Surge/degradation modes are where attacks succeed.** 95% of the spec covers steady-state. The red team attacks steady-state transitions. Each degradation mode needs the same rigor as the primary path.
+
+**5. This system raises the cost of attack, it does not eliminate it.** No system is unbreakable against unlimited resources and unlimited time. The goal is to make the cost of breaking this system exceed the value of what it protects. For the targets where this system is appropriate, the residual risk requires operational security, counterintelligence, and continuous monitoring — not just cryptography.
+
+## Appendix F: Formal Verification Requirements
+
+Based on Attack 18 (Complexity Catastrophe), the following formal verification is MANDATORY before production:
+
+1. **TLA+ model** of the 9-module state machine covering all inter-module interactions
+2. **Safety property verification:** "No authentication bypass" (no state reachable where an unauthenticated entity holds a valid token)
+3. **Liveness property verification:** "Authentication eventually succeeds for legitimate users" (no permanent deadlock)
+4. **Chaos testing:** Random module kills, network partitions, message corruption — 10,000 hours minimum
+5. **Composition security analysis:** Commissioned from IACR-affiliated researchers (see Errata C.14)
+
+## Appendix G: Operational Security Requirements
+
+Based on Attacks 5, 8, 12, 14, 16, 37 (human-layer attacks), the following OpSec is MANDATORY:
+
+1. **Personnel vetting:** All custodians, ceremony participants, and system operators require enhanced background investigation with periodic re-evaluation
+2. **Random assignment:** Level 3-4 ceremony participants randomly selected from qualified pool
+3. **Behavioral monitoring:** Continuous counterintelligence screening of privileged personnel
+4. **Separation of duties:** No single person can access source code AND production systems AND serve as ceremony participant
+5. **Code review specialization:** Quarterly red-team code reviews specifically targeting timing side-channels and subtle logic errors
+6. **Incident response:** Defined procedures for each attack class, with tabletop exercises quarterly
+
 ## Appendix D: Cryptographic References (Round 3)
 
 - KyberSlash timing attack: Kannwischer et al., TCHES 2025
