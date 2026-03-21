@@ -16,6 +16,8 @@ postcard.workspace = true
 uuid.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+frost-ristretto255.workspace = true
+ml-dsa.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
-rand.workspace = true

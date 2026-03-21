@@ -21,13 +21,13 @@ use common::types::{
 use crypto::ct::{ct_eq, ct_eq_32, ct_eq_64};
 use crypto::receipts::{hash_receipt, sign_receipt};
 use crypto::threshold::{dkg, threshold_sign, verify_group_signature};
+use tss::distributed::distribute_shares;
 use crypto::xwing::{xwing_decapsulate, xwing_encapsulate, XWingKeyPair};
 use gateway::puzzle::{solve_challenge, PuzzleChallenge, PuzzleSolution};
 use gateway::server::{GatewayServer, OrchestratorConfig};
 use gateway::wire::{AuthRequest, AuthResponse};
 use kt::merkle::MerkleTree;
-use opaque::messages::OpaqueRequest;
-use opaque::service::handle_request as opaque_handle_request;
+use opaque::messages::{OpaqueRequest, OpaqueResponse};
 use opaque::store::CredentialStore;
 use orchestrator::service::OrchestratorService;
 use ratchet::chain::RatchetChain;
@@ -36,7 +36,8 @@ use risk::tiers::check_tier_access;
 use shard::protocol::ShardProtocol;
 use shard::transport::ShardListener;
 use tss::messages::{SigningRequest, SigningResponse};
-use tss::token_builder::build_token;
+use crypto::pq_sign::{generate_pq_keypair, PqSigningKey, PqVerifyingKey};
+use tss::token_builder::build_token_distributed;
 use tss::validator::validate_receipt_chain;
 use verifier::verify::verify_token;
 use uuid::Uuid;
@@ -46,6 +47,12 @@ use uuid::Uuid;
 const SHARD_HMAC_KEY: [u8; 64] = [0x37u8; 64];
 const RECEIPT_SIGNING_KEY: [u8; 64] = [0x42u8; 64];
 const TEST_DIFFICULTY: u8 = 4;
+
+/// Shared PQ keypair for unit-level tests.
+static TEST_PQ_KEYPAIR: std::sync::LazyLock<(PqSigningKey, PqVerifyingKey)> =
+    std::sync::LazyLock::new(generate_pq_keypair);
+fn test_pq_sk() -> &'static PqSigningKey { &TEST_PQ_KEYPAIR.0 }
+fn test_pq_vk() -> &'static PqVerifyingKey { &TEST_PQ_KEYPAIR.1 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -89,6 +96,10 @@ async fn recv_frame<T: serde::de::DeserializeOwned>(stream: &mut TcpStream) -> R
 // ── Service boot helpers (reused from tier2_ceremony_test pattern) ───────
 
 async fn boot_opaque(store: CredentialStore) -> String {
+    use std::sync::{Arc, Mutex};
+    use opaque::messages::{OpaqueRequest, OpaqueResponse};
+
+    let store = Arc::new(Mutex::new(store));
     let listener = ShardListener::bind("127.0.0.1:0", ModuleId::Opaque, SHARD_HMAC_KEY)
         .await
         .expect("bind OPAQUE listener");
@@ -100,17 +111,53 @@ async fn boot_opaque(store: CredentialStore) -> String {
                 Ok(t) => t,
                 Err(_) => continue,
             };
-            let (_sender, payload) = match transport.recv().await {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            let request: OpaqueRequest = match postcard::from_bytes(&payload) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            let response = opaque_handle_request(&store, &request, &RECEIPT_SIGNING_KEY);
-            let response_bytes = postcard::to_allocvec(&response).expect("serialize OPAQUE response");
-            let _ = transport.send(&response_bytes).await;
+            let store = Arc::clone(&store);
+            tokio::spawn(async move {
+                let (_sender, payload) = match transport.recv().await {
+                    Ok(r) => r,
+                    Err(_) => return,
+                };
+                let request: OpaqueRequest = match postcard::from_bytes(&payload) {
+                    Ok(r) => r,
+                    Err(_) => return,
+                };
+                match request {
+                    OpaqueRequest::LoginStart { username, credential_request, ceremony_session_id, dpop_key_hash } => {
+                        // Extract all data from store while holding lock, then drop lock before any await
+                        let login_result_and_id = {
+                            let store_guard = store.lock().unwrap();
+                            let login_result = opaque::service::handle_login_start(&store_guard, &username, &credential_request);
+                            let user_id = store_guard.get_user_id(&username).unwrap_or(uuid::Uuid::nil());
+                            (login_result, user_id)
+                        }; // MutexGuard dropped here, before any await
+                        let (login_result, user_id) = login_result_and_id;
+                        match login_result {
+                            Ok((response_bytes, server_login)) => {
+                                let resp = OpaqueResponse::LoginChallenge { credential_response: response_bytes };
+                                let resp_bytes = postcard::to_allocvec(&resp).unwrap();
+                                if transport.send(&resp_bytes).await.is_err() { return; }
+                                let (_sender, payload2) = match transport.recv().await { Ok(r) => r, Err(_) => return };
+                                let req2: OpaqueRequest = match postcard::from_bytes(&payload2) { Ok(r) => r, Err(_) => return };
+                                if let OpaqueRequest::LoginFinish { credential_finalization } = req2 {
+                                    let response = opaque::service::handle_login_finish(server_login, &credential_finalization, &RECEIPT_SIGNING_KEY, user_id, ceremony_session_id, dpop_key_hash);
+                                    let resp_bytes = postcard::to_allocvec(&response).unwrap();
+                                    let _ = transport.send(&resp_bytes).await;
+                                }
+                            }
+                            Err(e) => {
+                                let resp = OpaqueResponse::Error { message: e };
+                                let resp_bytes = postcard::to_allocvec(&resp).unwrap();
+                                let _ = transport.send(&resp_bytes).await;
+                            }
+                        }
+                    }
+                    _ => {
+                        let resp = OpaqueResponse::Error { message: "unexpected request type".into() };
+                        let resp_bytes = postcard::to_allocvec(&resp).unwrap();
+                        let _ = transport.send(&resp_bytes).await;
+                    }
+                }
+            });
         }
     });
 
@@ -118,8 +165,9 @@ async fn boot_opaque(store: CredentialStore) -> String {
 }
 
 async fn boot_tss(
-    mut signers: Vec<crypto::threshold::SignerShare>,
-    group: crypto::threshold::ThresholdGroup,
+    coordinator: tss::distributed::SigningCoordinator,
+    mut nodes: Vec<tss::distributed::SignerNode>,
+    pq_signing_key: crypto::pq_sign::PqSigningKey,
 ) -> String {
     let listener = ShardListener::bind("127.0.0.1:0", ModuleId::Tss, SHARD_HMAC_KEY)
         .await
@@ -151,21 +199,25 @@ async fn boot_tss(
             };
             let response =
                 match validate_receipt_chain(&request.receipts, &RECEIPT_SIGNING_KEY) {
-                    Ok(()) => match build_token(&request.claims, &mut signers, &group, &request.ratchet_key) {
-                        Ok(token) => {
-                            let token_bytes =
-                                postcard::to_allocvec(&token).expect("serialize token");
-                            SigningResponse {
-                                success: true,
-                                token: Some(token_bytes),
-                                error: None,
+                    Ok(()) => {
+                        let mut signers: Vec<&mut _> =
+                            nodes.iter_mut().take(coordinator.threshold).collect();
+                        match build_token_distributed(&request.claims, &coordinator, &mut signers, &request.ratchet_key, &pq_signing_key) {
+                            Ok(token) => {
+                                let token_bytes =
+                                    postcard::to_allocvec(&token).expect("serialize token");
+                                SigningResponse {
+                                    success: true,
+                                    token: Some(token_bytes),
+                                    error: None,
+                                }
                             }
+                            Err(e) => SigningResponse {
+                                success: false,
+                                token: None,
+                                error: Some(format!("token build: {e}")),
+                            },
                         }
-                        Err(e) => SigningResponse {
-                            success: false,
-                            token: None,
-                            error: Some(format!("token build: {e}")),
-                        },
                     },
                     Err(e) => SigningResponse {
                         success: false,
@@ -243,12 +295,12 @@ async fn boot_gateway(orchestrator_addr: String) -> String {
 async fn boot_full_system(
     store: CredentialStore,
 ) -> (String, frost_ristretto255::keys::PublicKeyPackage) {
-    let dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3);
     let group_verifying_key = dkg_result.group.public_key_package.clone();
-    let signers: Vec<_> = dkg_result.shares.into_iter().take(3).collect();
+    let (coordinator, nodes) = distribute_shares(&mut dkg_result);
 
     let opaque_addr = boot_opaque(store).await;
-    let tss_addr = boot_tss(signers, dkg_result.group).await;
+    let tss_addr = boot_tss(coordinator, nodes, test_pq_sk().clone()).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let orchestrator_addr = boot_orchestrator(opaque_addr, tss_addr).await;
@@ -329,7 +381,7 @@ fn build_valid_receipt_chain(signing_key: &[u8; 64]) -> Vec<Receipt> {
 }
 
 fn make_valid_token_and_key() -> (Token, frost_ristretto255::keys::PublicKeyPackage) {
-    let dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3);
     let group_key = dkg_result.group.public_key_package.clone();
     let claims = TokenClaims {
         sub: Uuid::new_v4(),
@@ -342,8 +394,9 @@ fn make_valid_token_and_key() -> (Token, frost_ristretto255::keys::PublicKeyPack
         tier: 2,
         ratchet_epoch: 1,
     };
-    let mut signers: Vec<_> = dkg_result.shares.into_iter().take(3).collect();
-    let token = build_token(&claims, &mut signers, &dkg_result.group, &[0x55u8; 64])
+    let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
+    let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
+    let token = build_token_distributed(&claims, &coordinator, &mut signers, &[0x55u8; 64], test_pq_sk())
         .expect("build token should succeed");
     (token, group_key)
 }
@@ -354,8 +407,9 @@ fn make_valid_token_and_key() -> (Token, frost_ristretto255::keys::PublicKeyPack
 
 #[tokio::test]
 async fn test_complete_tier2_auth_flow() {
+    let pq_vk = test_pq_vk();
     let mut store = CredentialStore::new();
-    store.register("alice", b"password123");
+    store.register_with_password("alice", b"password123");
     let (gateway_addr, group_key) = boot_full_system(store).await;
 
     let resp = client_auth(&gateway_addr, "alice", b"password123").await;
@@ -364,7 +418,7 @@ async fn test_complete_tier2_auth_flow() {
 
     let token_bytes = resp.token.unwrap();
     let token: Token = postcard::from_bytes(&token_bytes).expect("deserialize token");
-    let claims = verify_token(&token, &group_key).expect("token verification should succeed");
+    let claims = verify_token(&token, &group_key, test_pq_vk()).expect("token verification should succeed");
 
     assert_eq!(claims.tier, 2, "token tier should be 2");
     assert!(claims.exp > now_us(), "token should not be expired");
@@ -377,7 +431,7 @@ async fn test_multiple_users_concurrent_auth() {
     let mut store = CredentialStore::new();
     let mut user_ids = Vec::new();
     for i in 0..5 {
-        let uid = store.register(&format!("user{i}"), format!("pass{i}").as_bytes());
+        let uid = store.register_with_password(&format!("user{i}"), format!("pass{i}").as_bytes());
         user_ids.push(uid);
     }
     let (gateway_addr, group_key) = boot_full_system(store).await;
@@ -392,7 +446,7 @@ async fn test_multiple_users_concurrent_auth() {
             assert!(resp.success, "user{i} auth should succeed: {:?}", resp.error);
             let token_bytes = resp.token.unwrap();
             let token: Token = postcard::from_bytes(&token_bytes).expect("deserialize token");
-            let claims = verify_token(&token, &gk).expect("token should verify");
+            let claims = verify_token(&token, &gk, test_pq_vk()).expect("token should verify");
             assert_eq!(claims.tier, 2);
             claims.sub
         }));
@@ -409,8 +463,9 @@ async fn test_multiple_users_concurrent_auth() {
 
 #[tokio::test]
 async fn test_sequential_auth_sessions() {
+    let pq_vk = test_pq_vk();
     let mut store = CredentialStore::new();
-    store.register("bob", b"bobpass");
+    store.register_with_password("bob", b"bobpass");
     let (gateway_addr, group_key) = boot_full_system(store).await;
 
     let mut ceremony_ids = Vec::new();
@@ -419,7 +474,7 @@ async fn test_sequential_auth_sessions() {
         assert!(resp.success);
         let token_bytes = resp.token.unwrap();
         let token: Token = postcard::from_bytes(&token_bytes).expect("deserialize token");
-        let claims = verify_token(&token, &group_key).expect("token should verify");
+        let claims = verify_token(&token, &group_key, test_pq_vk()).expect("token should verify");
         ceremony_ids.push(claims.ceremony_id);
     }
 
@@ -441,7 +496,7 @@ async fn test_sequential_auth_sessions() {
 #[tokio::test]
 async fn test_wrong_password_rejected() {
     let mut store = CredentialStore::new();
-    store.register("alice", b"password123");
+    store.register_with_password("alice", b"password123");
     let (gateway_addr, _) = boot_full_system(store).await;
 
     let resp = client_auth(&gateway_addr, "alice", b"wrong_password").await;
@@ -464,7 +519,7 @@ async fn test_nonexistent_user_rejected() {
 #[tokio::test]
 async fn test_empty_password_rejected() {
     let mut store = CredentialStore::new();
-    store.register("alice", b"password123");
+    store.register_with_password("alice", b"password123");
     let (gateway_addr, _) = boot_full_system(store).await;
 
     let resp = client_auth(&gateway_addr, "alice", b"").await;
@@ -475,7 +530,7 @@ async fn test_empty_password_rejected() {
 #[tokio::test]
 async fn test_empty_username_rejected() {
     let mut store = CredentialStore::new();
-    store.register("alice", b"password123");
+    store.register_with_password("alice", b"password123");
     let (gateway_addr, _) = boot_full_system(store).await;
 
     let resp = client_auth(&gateway_addr, "", b"password123").await;
@@ -485,37 +540,39 @@ async fn test_empty_username_rejected() {
 
 #[tokio::test]
 async fn test_unicode_username_works() {
+    let pq_vk = test_pq_vk();
     let mut store = CredentialStore::new();
     let username = "\u{7528}\u{6237}\u{03B1}\u{03B2}\u{03B3}";
-    store.register(username, b"unicodepass");
+    store.register_with_password(username, b"unicodepass");
     let (gateway_addr, group_key) = boot_full_system(store).await;
 
     let resp = client_auth(&gateway_addr, username, b"unicodepass").await;
     assert!(resp.success, "unicode username auth should succeed: {:?}", resp.error);
     let token_bytes = resp.token.unwrap();
     let token: Token = postcard::from_bytes(&token_bytes).expect("deserialize token");
-    let claims = verify_token(&token, &group_key).expect("token should verify");
+    let claims = verify_token(&token, &group_key, test_pq_vk()).expect("token should verify");
     assert_eq!(claims.tier, 2);
 }
 
 #[tokio::test]
 async fn test_very_long_password_works() {
+    let (_, pq_vk) = crypto::pq_sign::generate_pq_keypair();
     let mut store = CredentialStore::new();
     let long_pass = vec![0x41u8; 1000];
-    store.register("longpass_user", &long_pass);
+    store.register_with_password("longpass_user", &long_pass);
     let (gateway_addr, group_key) = boot_full_system(store).await;
 
     let resp = client_auth(&gateway_addr, "longpass_user", &long_pass).await;
     assert!(resp.success, "long password auth should succeed: {:?}", resp.error);
     let token_bytes = resp.token.unwrap();
     let token: Token = postcard::from_bytes(&token_bytes).expect("deserialize token");
-    verify_token(&token, &group_key).expect("token should verify");
+    verify_token(&token, &group_key, test_pq_vk()).expect("token should verify");
 }
 
 #[tokio::test]
 async fn test_puzzle_not_solved_rejected() {
     let mut store = CredentialStore::new();
-    store.register("alice", b"password123");
+    store.register_with_password("alice", b"password123");
     let (gateway_addr, _) = boot_full_system(store).await;
 
     let mut stream = TcpStream::connect(&gateway_addr)
@@ -549,21 +606,23 @@ async fn test_puzzle_not_solved_rejected() {
 
 #[test]
 fn test_token_cannot_be_modified() {
+    let pq_vk = test_pq_vk();
     let (mut token, group_key) = make_valid_token_and_key();
 
     // Verify it is valid first
-    assert!(verify_token(&token, &group_key).is_ok());
+    assert!(verify_token(&token, &group_key, test_pq_vk()).is_ok());
 
     // Flip one bit in the tier claim
     token.claims.tier = 1;
 
-    let result = verify_token(&token, &group_key);
+    let result = verify_token(&token, &group_key, test_pq_vk());
     assert!(result.is_err(), "tampered token must be rejected");
 }
 
 #[test]
 fn test_token_signature_cannot_be_transplanted() {
-    let dkg_result = dkg(5, 3);
+    let pq_vk = test_pq_vk();
+    let mut dkg_result = dkg(5, 3);
     let group_key = dkg_result.group.public_key_package.clone();
 
     let claims_a = TokenClaims {
@@ -589,11 +648,13 @@ fn test_token_signature_cannot_be_transplanted() {
         ratchet_epoch: 1,
     };
 
-    let mut signers: Vec<_> = dkg_result.shares.into_iter().take(3).collect();
+    let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
+    let (pq_sk, _pq_vk) = crypto::pq_sign::generate_pq_keypair();
+    let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
     let token_a =
-        build_token(&claims_a, &mut signers, &dkg_result.group, &[0x55u8; 64]).expect("build token A");
+        build_token_distributed(&claims_a, &coordinator, &mut signers, &[0x55u8; 64], test_pq_sk()).expect("build token A");
     let token_b =
-        build_token(&claims_b, &mut signers, &dkg_result.group, &[0x55u8; 64]).expect("build token B");
+        build_token_distributed(&claims_b, &coordinator, &mut signers, &[0x55u8; 64], test_pq_sk()).expect("build token B");
 
     // Transplant A's signature onto B's claims
     let franken_token = Token {
@@ -604,13 +665,14 @@ fn test_token_signature_cannot_be_transplanted() {
         pq_signature: token_b.pq_signature.clone(),
     };
 
-    let result = verify_token(&franken_token, &group_key);
+    let result = verify_token(&franken_token, &group_key, test_pq_vk());
     assert!(result.is_err(), "transplanted signature must be rejected");
 }
 
 #[test]
 fn test_expired_token_rejected() {
-    let dkg_result = dkg(5, 3);
+    let pq_vk = test_pq_vk();
+    let mut dkg_result = dkg(5, 3);
     let group_key = dkg_result.group.public_key_package.clone();
 
     let claims = TokenClaims {
@@ -625,11 +687,13 @@ fn test_expired_token_rejected() {
         ratchet_epoch: 1,
     };
 
-    let mut signers: Vec<_> = dkg_result.shares.into_iter().take(3).collect();
-    let token = build_token(&claims, &mut signers, &dkg_result.group, &[0x55u8; 64])
+    let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
+    let (pq_sk, _pq_vk) = crypto::pq_sign::generate_pq_keypair();
+    let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
+    let token = build_token_distributed(&claims, &coordinator, &mut signers, &[0x55u8; 64], test_pq_sk())
         .expect("build token should succeed");
 
-    let result = verify_token(&token, &group_key);
+    let result = verify_token(&token, &group_key, test_pq_vk());
     assert!(result.is_err(), "expired token must be rejected");
     let err = format!("{}", result.unwrap_err());
     assert!(err.contains("expired"), "error should mention expiry, got: {err}");
@@ -637,8 +701,9 @@ fn test_expired_token_rejected() {
 
 #[test]
 fn test_token_from_different_dkg_rejected() {
+    let pq_vk = test_pq_vk();
     // Group 1
-    let dkg1 = dkg(5, 3);
+    let mut dkg1 = dkg(5, 3);
     let claims = TokenClaims {
         sub: Uuid::new_v4(),
         iss: [0xAA; 32],
@@ -650,15 +715,17 @@ fn test_token_from_different_dkg_rejected() {
         tier: 2,
         ratchet_epoch: 1,
     };
-    let mut signers1: Vec<_> = dkg1.shares.into_iter().take(3).collect();
-    let token = build_token(&claims, &mut signers1, &dkg1.group, &[0x55u8; 64])
+    let (coordinator1, mut nodes1) = distribute_shares(&mut dkg1);
+    let (pq_sk, _pq_vk) = crypto::pq_sign::generate_pq_keypair();
+    let mut signers1: Vec<&mut _> = nodes1.iter_mut().take(3).collect();
+    let token = build_token_distributed(&claims, &coordinator1, &mut signers1, &[0x55u8; 64], test_pq_sk())
         .expect("build token with group 1");
 
     // Group 2 (different DKG)
     let dkg2 = dkg(5, 3);
     let group2_key = dkg2.group.public_key_package.clone();
 
-    let result = verify_token(&token, &group2_key);
+    let result = verify_token(&token, &group2_key, test_pq_vk());
     assert!(
         result.is_err(),
         "token signed by group 1 must fail verification against group 2's key"

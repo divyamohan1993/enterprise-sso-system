@@ -1,7 +1,12 @@
+#[allow(deprecated)]
+use tss::token_builder::build_token;
+
 use common::types::{Receipt, TokenClaims};
+use crypto::pq_sign::generate_pq_keypair;
 use crypto::receipts::{hash_receipt, sign_receipt};
 use crypto::threshold::{dkg, verify_group_signature};
-use tss::token_builder::build_token;
+use tss::distributed::distribute_shares;
+use tss::token_builder::build_token_distributed;
 use tss::validator::validate_receipt_chain;
 use uuid::Uuid;
 
@@ -110,6 +115,7 @@ fn unsigned_receipt_rejected() {
     );
 }
 
+#[allow(deprecated)]
 #[test]
 fn token_built_and_verifiable() {
     let dkg_result = dkg(5, 3);
@@ -117,8 +123,9 @@ fn token_built_and_verifiable() {
     let group = dkg_result.group;
     let claims = test_claims();
     let ratchet_key = test_ratchet_key();
+    let (pq_sk, _pq_vk) = generate_pq_keypair();
 
-    let token = build_token(&claims, &mut shares[..3], &group, &ratchet_key)
+    let token = build_token(&claims, &mut shares[..3], &group, &ratchet_key, &pq_sk)
         .expect("build_token should succeed");
 
     // Verify the FROST signature against the group key
@@ -127,6 +134,7 @@ fn token_built_and_verifiable() {
     assert!(verify_group_signature(&group, &msg, &token.frost_signature));
 }
 
+#[allow(deprecated)]
 #[test]
 fn token_claims_preserved() {
     let dkg_result = dkg(5, 3);
@@ -134,8 +142,9 @@ fn token_claims_preserved() {
     let group = dkg_result.group;
     let claims = test_claims();
     let ratchet_key = test_ratchet_key();
+    let (pq_sk, _pq_vk) = generate_pq_keypair();
 
-    let token = build_token(&claims, &mut shares[..3], &group, &ratchet_key)
+    let token = build_token(&claims, &mut shares[..3], &group, &ratchet_key, &pq_sk)
         .expect("build_token should succeed");
 
     // Serialize and deserialize the token, verify claims match
@@ -156,6 +165,7 @@ fn token_claims_preserved() {
     assert_eq!(deserialized.header.tier, claims.tier);
 }
 
+#[allow(deprecated)]
 #[test]
 fn test_ratchet_tag_is_real() {
     let dkg_result = dkg(5, 3);
@@ -163,12 +173,157 @@ fn test_ratchet_tag_is_real() {
     let group = dkg_result.group;
     let claims = test_claims();
     let ratchet_key = test_ratchet_key();
+    let (pq_sk, _pq_vk) = generate_pq_keypair();
 
-    let token = build_token(&claims, &mut shares[..3], &group, &ratchet_key)
+    let token = build_token(&claims, &mut shares[..3], &group, &ratchet_key, &pq_sk)
         .expect("build_token should succeed");
 
     // The ratchet tag must NOT be all zeros (the old placeholder)
     assert_ne!(token.ratchet_tag, [0u8; 64], "ratchet tag must not be all zeros");
     // It also should not be a trivial constant
     assert_ne!(token.ratchet_tag, [0xDD; 64]);
+}
+
+// ── Distributed signing tests ─────────────────────────────────────────
+
+#[test]
+fn test_distributed_signing_works() {
+    // DKG -> distribute into 5 separate SignerNodes
+    let mut dkg_result = dkg(5, 3);
+    let group = &dkg_result.group;
+    let public_key_package = group.public_key_package.clone();
+    let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
+
+    // Coordinator takes 3 nodes, signs message
+    let message = b"distributed-signing-test";
+    let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
+    let sig = coordinator
+        .coordinate_signing(&mut signers, message)
+        .expect("distributed signing should succeed");
+
+    // Verify signature with public key
+    assert!(verify_group_signature(
+        &crypto::threshold::ThresholdGroup {
+            threshold: 3,
+            total: 5,
+            public_key_package,
+        },
+        message,
+        &sig,
+    ));
+}
+
+#[test]
+fn test_distributed_2_of_5_fails() {
+    // Only 2 nodes -> coordinator rejects (below threshold)
+    let mut dkg_result = dkg(5, 3);
+    let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
+
+    let message = b"should-fail";
+    let mut signers: Vec<&mut _> = nodes.iter_mut().take(2).collect();
+    let result = coordinator.coordinate_signing(&mut signers, message);
+    assert!(result.is_err(), "signing with 2 of 5 (threshold=3) must fail");
+    assert!(
+        result.unwrap_err().contains("need 3 signers, got 2"),
+        "error should mention threshold requirement"
+    );
+}
+
+#[test]
+fn test_distributed_different_subsets_produce_valid_sigs() {
+    // Nodes {0,1,2} sign -> valid
+    // Nodes {2,3,4} sign -> valid
+    // Same group key verifies both
+    let mut dkg_result = dkg(5, 3);
+    let public_key_package = dkg_result.group.public_key_package.clone();
+    let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
+
+    let message = b"subset-test-message";
+
+    let group_for_verify = crypto::threshold::ThresholdGroup {
+        threshold: 3,
+        total: 5,
+        public_key_package,
+    };
+
+    // Subset {0,1,2}
+    {
+        let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
+        let sig = coordinator
+            .coordinate_signing(&mut signers, message)
+            .expect("subset {0,1,2} should sign");
+        assert!(verify_group_signature(&group_for_verify, message, &sig));
+    }
+
+    // Subset {2,3,4}
+    {
+        let mut signers: Vec<&mut _> = nodes.iter_mut().skip(2).take(3).collect();
+        let sig = coordinator
+            .coordinate_signing(&mut signers, message)
+            .expect("subset {2,3,4} should sign");
+        assert!(verify_group_signature(&group_for_verify, message, &sig));
+    }
+}
+
+#[test]
+fn test_each_node_holds_exactly_one_share() {
+    // After distribute_shares, each SignerNode has one KeyPackage
+    // The coordinator has NO signing capability (only PublicKeyPackage)
+    let mut dkg_result = dkg(5, 3);
+    let (coordinator, nodes) = distribute_shares(&mut dkg_result);
+
+    // 5 nodes, each with a unique identifier
+    assert_eq!(nodes.len(), 5);
+    let mut ids: Vec<_> = nodes.iter().map(|n| n.identifier()).collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), 5, "each node must have a unique identifier");
+
+    // The coordinator only has the public key package -- verify it has
+    // the right threshold configured.
+    assert_eq!(coordinator.threshold, 3);
+
+    // The original DKG result's shares are drained (moved into nodes)
+    assert!(dkg_result.shares.is_empty());
+}
+
+#[test]
+fn test_coordinator_cannot_sign_alone() {
+    // Coordinator with 0 signers -> error
+    let mut dkg_result = dkg(5, 3);
+    let (coordinator, _nodes) = distribute_shares(&mut dkg_result);
+
+    let message = b"coordinator-alone";
+    let mut no_signers: Vec<&mut tss::distributed::SignerNode> = vec![];
+    let result = coordinator.coordinate_signing(&mut no_signers, message);
+    assert!(result.is_err(), "coordinator with 0 signers must fail");
+}
+
+#[test]
+fn test_distributed_token_built_and_verifiable() {
+    // Use the distributed path to build a token and verify it
+    let mut dkg_result = dkg(5, 3);
+    let public_key_package = dkg_result.group.public_key_package.clone();
+    let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
+
+    let claims = test_claims();
+    let ratchet_key = test_ratchet_key();
+
+    let (pq_sk, _pq_vk) = generate_pq_keypair();
+    let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
+    let token = build_token_distributed(&claims, &coordinator, &mut signers, &ratchet_key, &pq_sk)
+        .expect("build_token_distributed should succeed");
+
+    // Verify the FROST signature against the group key
+    let claims_bytes = postcard::to_allocvec(&claims).unwrap();
+    let msg = [common::domain::FROST_TOKEN, claims_bytes.as_slice()].concat();
+    let group_for_verify = crypto::threshold::ThresholdGroup {
+        threshold: 3,
+        total: 5,
+        public_key_package,
+    };
+    assert!(verify_group_signature(&group_for_verify, &msg, &token.frost_signature));
+
+    // Ratchet tag must be real
+    assert_ne!(token.ratchet_tag, [0u8; 64]);
 }

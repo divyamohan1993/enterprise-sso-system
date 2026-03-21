@@ -9,4 +9,5 @@ pub mod dpop;
 pub mod entropy;
 pub mod receipts;
 pub mod threshold;
+pub mod pq_sign;
 pub mod xwing;

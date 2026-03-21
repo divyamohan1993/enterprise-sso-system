@@ -15,12 +15,14 @@ use common::types::{
     ActionLevel, AuditEventType, DeviceTier, ModuleId, Receipt, Token, TokenClaims, TokenHeader,
 };
 use crypto::receipts::{hash_receipt, sign_receipt};
-use crypto::threshold::{dkg, verify_group_signature};
+use crypto::threshold::dkg;
 use kt::merkle::MerkleTree;
 use ratchet::chain::RatchetChain;
 use risk::scoring::{RiskEngine, RiskSignals};
 use risk::tiers::check_tier_access;
-use tss::token_builder::build_token;
+use crypto::pq_sign::generate_pq_keypair;
+use tss::distributed::distribute_shares;
+use tss::token_builder::build_token_distributed;
 use tss::validator::validate_receipt_chain;
 use verifier::verify::verify_token;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -111,7 +113,7 @@ fn receipt_chain_forgery_rejected() {
 
 #[test]
 fn expired_token_rejected() {
-    let dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3);
     let group_key = dkg_result.group.public_key_package.clone();
 
     // Build a token that expired in the past
@@ -127,11 +129,13 @@ fn expired_token_rejected() {
         ratchet_epoch: 1,
     };
 
-    let mut signers: Vec<_> = dkg_result.shares.into_iter().take(3).collect();
+    let (pq_sk, pq_vk) = generate_pq_keypair();
+    let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
+    let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
     let token =
-        build_token(&claims, &mut signers, &dkg_result.group, &[0x55u8; 64]).expect("build token should succeed");
+        build_token_distributed(&claims, &coordinator, &mut signers, &[0x55u8; 64], &pq_sk).expect("build token should succeed");
 
-    let result = verify_token(&token, &group_key);
+    let result = verify_token(&token, &group_key, &pq_vk);
     assert!(result.is_err(), "expired token must be rejected");
     let err = result.unwrap_err();
     assert!(
@@ -144,7 +148,7 @@ fn expired_token_rejected() {
 
 #[test]
 fn tampered_token_rejected() {
-    let dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3);
     let group_key = dkg_result.group.public_key_package.clone();
 
     // Build a valid, non-expired token
@@ -160,14 +164,16 @@ fn tampered_token_rejected() {
         ratchet_epoch: 1,
     };
 
-    let mut signers: Vec<_> = dkg_result.shares.into_iter().take(3).collect();
+    let (pq_sk, pq_vk) = generate_pq_keypair();
+    let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
+    let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
     let mut token =
-        build_token(&claims, &mut signers, &dkg_result.group, &[0x55u8; 64]).expect("build token should succeed");
+        build_token_distributed(&claims, &coordinator, &mut signers, &[0x55u8; 64], &pq_sk).expect("build token should succeed");
 
     // Tamper with claims — change the tier
     token.claims.tier = 1;
 
-    let result = verify_token(&token, &group_key);
+    let result = verify_token(&token, &group_key, &pq_vk);
     assert!(result.is_err(), "tampered token must be rejected");
 }
 

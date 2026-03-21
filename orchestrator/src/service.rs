@@ -65,47 +65,117 @@ impl OrchestratorService {
     }
 
     /// Inner implementation that returns Result for ergonomic error handling.
+    ///
+    /// The orchestrator acts as the OPAQUE client: it receives the password
+    /// from the gateway and runs the client side of the OPAQUE protocol.
+    /// The OPAQUE service (server side) never sees the plaintext password.
     async fn process_auth_inner(&self, request: &OrchestratorRequest) -> Result<Vec<u8>, String> {
+        use opaque::opaque_impl::OpaqueCs;
+        use opaque_ke::{ClientLogin, ClientLoginFinishParameters};
+        use rand::rngs::OsRng;
+
         // 1. Generate ceremony session ID
         let session_id = generate_nonce();
         let mut session = CeremonySession::new(session_id);
 
-        // 2. Build and send OPAQUE request
-        let opaque_req = OpaqueRequest {
+        // 2. OPAQUE Login Round 1: Client starts, sends CredentialRequest
+        let mut rng = OsRng;
+        let client_login_start = ClientLogin::<OpaqueCs>::start(&mut rng, &request.password)
+            .map_err(|e| format!("OPAQUE client login start: {e}"))?;
+
+        let credential_request_bytes = client_login_start.message.serialize().to_vec();
+
+        let login_start_req = OpaqueRequest::LoginStart {
             username: request.username.clone(),
-            password: request.password.clone(),
+            credential_request: credential_request_bytes,
             ceremony_session_id: session_id,
             dpop_key_hash: request.dpop_key_hash,
         };
 
-        let opaque_bytes = postcard::to_allocvec(&opaque_req)
-            .map_err(|e| format!("serialize opaque request: {e}"))?;
+        let login_start_bytes = postcard::to_allocvec(&login_start_req)
+            .map_err(|e| format!("serialize login start: {e}"))?;
 
         let mut opaque_transport = self.connect_opaque().await?;
         opaque_transport
-            .send(&opaque_bytes)
+            .send(&login_start_bytes)
             .await
-            .map_err(|e| format!("send to OPAQUE: {e}"))?;
+            .map_err(|e| format!("send login start to OPAQUE: {e}"))?;
 
-        let (_sender, opaque_resp_bytes) = opaque_transport
+        let (_sender, opaque_resp1_bytes) = opaque_transport
             .recv()
             .await
-            .map_err(|e| format!("recv from OPAQUE: {e}"))?;
+            .map_err(|e| format!("recv login challenge from OPAQUE: {e}"))?;
 
-        let opaque_resp: OpaqueResponse = postcard::from_bytes(&opaque_resp_bytes)
-            .map_err(|e| format!("deserialize opaque response: {e}"))?;
+        let opaque_resp1: OpaqueResponse = postcard::from_bytes(&opaque_resp1_bytes)
+            .map_err(|e| format!("deserialize login challenge: {e}"))?;
 
-        if !opaque_resp.success {
-            session
-                .fail(opaque_resp.error.clone().unwrap_or_default())
-                .ok();
-            return Err(opaque_resp
-                .error
-                .unwrap_or_else(|| "OPAQUE auth failed".into()));
-        }
+        let credential_response_bytes = match opaque_resp1 {
+            OpaqueResponse::LoginChallenge {
+                credential_response,
+            } => credential_response,
+            OpaqueResponse::Error { message } => {
+                session.fail(message.clone()).ok();
+                return Err(message);
+            }
+            _ => {
+                session.fail("unexpected OPAQUE response".into()).ok();
+                return Err("unexpected OPAQUE response to LoginStart".into());
+            }
+        };
 
-        // 3. Add receipt to chain
-        let receipt = opaque_resp.receipt.ok_or("OPAQUE success but no receipt")?;
+        // 3. OPAQUE Login Round 2: Client finishes, sends CredentialFinalization
+        let credential_response =
+            opaque_ke::CredentialResponse::<OpaqueCs>::deserialize(&credential_response_bytes)
+                .map_err(|e| format!("deserialize credential response: {e}"))?;
+
+        let client_login_finish = client_login_start
+            .state
+            .finish(
+                &mut rng,
+                &request.password,
+                credential_response,
+                ClientLoginFinishParameters::default(),
+            )
+            .map_err(|e| {
+                session.fail(format!("OPAQUE login finish: {e}")).ok();
+                format!("OPAQUE client login finish: {e}")
+            })?;
+
+        let credential_finalization_bytes = client_login_finish.message.serialize().to_vec();
+
+        let login_finish_req = OpaqueRequest::LoginFinish {
+            credential_finalization: credential_finalization_bytes,
+        };
+
+        let login_finish_bytes = postcard::to_allocvec(&login_finish_req)
+            .map_err(|e| format!("serialize login finish: {e}"))?;
+
+        opaque_transport
+            .send(&login_finish_bytes)
+            .await
+            .map_err(|e| format!("send login finish to OPAQUE: {e}"))?;
+
+        let (_sender, opaque_resp2_bytes) = opaque_transport
+            .recv()
+            .await
+            .map_err(|e| format!("recv login result from OPAQUE: {e}"))?;
+
+        let opaque_resp2: OpaqueResponse = postcard::from_bytes(&opaque_resp2_bytes)
+            .map_err(|e| format!("deserialize login result: {e}"))?;
+
+        let receipt = match opaque_resp2 {
+            OpaqueResponse::LoginSuccess { receipt } => receipt,
+            OpaqueResponse::Error { message } => {
+                session.fail(message.clone()).ok();
+                return Err(message);
+            }
+            _ => {
+                session.fail("unexpected OPAQUE response".into()).ok();
+                return Err("unexpected OPAQUE response to LoginFinish".into());
+            }
+        };
+
+        // 4. Add receipt to chain
         session.user_id = Some(receipt.user_id);
         session
             .receipt_chain
@@ -113,7 +183,7 @@ impl OrchestratorService {
             .map_err(|e| format!("receipt chain: {e}"))?;
         session.opaque_complete()?;
 
-        // 4. Build and send TSS signing request
+        // 5. Build and send TSS signing request
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

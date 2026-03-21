@@ -1,6 +1,7 @@
 use common::domain;
 use common::error::MilnetError;
 use common::types::{Token, TokenClaims, TokenHeader};
+use crypto::pq_sign::{generate_pq_keypair, pq_sign, PqSigningKey, PqVerifyingKey};
 use crypto::threshold;
 use hmac::{Hmac, Mac};
 use sha2::Sha512;
@@ -24,8 +25,18 @@ fn compute_ratchet_tag(ratchet_key: &[u8; 64], claims_bytes: &[u8], epoch: u64) 
     mac.finalize().into_bytes().into()
 }
 
-/// Helper: build a valid signed token with a real ratchet tag.
-fn build_signed_token(dkg: &mut threshold::DkgResult, claims: TokenClaims, ratchet_key: &[u8; 64]) -> Token {
+/// Lazily-generated PQ keypair shared across tests that don't care about key identity.
+fn test_pq_keypair() -> (PqSigningKey, PqVerifyingKey) {
+    generate_pq_keypair()
+}
+
+/// Helper: build a valid signed token with a real ratchet tag and real PQ signature.
+fn build_signed_token(
+    dkg: &mut threshold::DkgResult,
+    claims: TokenClaims,
+    ratchet_key: &[u8; 64],
+    pq_sk: &PqSigningKey,
+) -> Token {
     // Serialize claims with domain prefix
     let claims_bytes = postcard::to_allocvec(&claims).unwrap();
     let mut message = Vec::with_capacity(domain::FROST_TOKEN.len() + claims_bytes.len());
@@ -37,6 +48,7 @@ fn build_signed_token(dkg: &mut threshold::DkgResult, claims: TokenClaims, ratch
             .unwrap();
 
     let ratchet_tag = compute_ratchet_tag(ratchet_key, &claims_bytes, claims.ratchet_epoch);
+    let pq_signature = pq_sign(pq_sk, &message, &frost_signature);
 
     Token {
         header: TokenHeader {
@@ -47,12 +59,16 @@ fn build_signed_token(dkg: &mut threshold::DkgResult, claims: TokenClaims, ratch
         claims,
         ratchet_tag,
         frost_signature,
-        pq_signature: vec![0xFF; 128],
+        pq_signature,
     }
 }
 
-/// Helper: build a signed token with a dummy (placeholder) ratchet tag for backward-compat tests.
-fn build_signed_token_legacy(dkg: &mut threshold::DkgResult, claims: TokenClaims) -> Token {
+/// Helper: build a signed token with a dummy ratchet tag but real PQ signature.
+fn build_signed_token_legacy(
+    dkg: &mut threshold::DkgResult,
+    claims: TokenClaims,
+    pq_sk: &PqSigningKey,
+) -> Token {
     let claims_bytes = postcard::to_allocvec(&claims).unwrap();
     let mut message = Vec::with_capacity(domain::FROST_TOKEN.len() + claims_bytes.len());
     message.extend_from_slice(domain::FROST_TOKEN);
@@ -61,6 +77,8 @@ fn build_signed_token_legacy(dkg: &mut threshold::DkgResult, claims: TokenClaims
     let frost_signature =
         threshold::threshold_sign(&mut dkg.shares, &dkg.group, &message, dkg.group.threshold)
             .unwrap();
+
+    let pq_signature = pq_sign(pq_sk, &message, &frost_signature);
 
     Token {
         header: TokenHeader {
@@ -71,7 +89,7 @@ fn build_signed_token_legacy(dkg: &mut threshold::DkgResult, claims: TokenClaims
         claims,
         ratchet_tag: [0xAA; 64],
         frost_signature,
-        pq_signature: vec![0xFF; 128],
+        pq_signature,
     }
 }
 
@@ -97,13 +115,14 @@ fn future_claims() -> TokenClaims {
 #[test]
 fn valid_token_verifies() {
     let mut dkg = threshold::dkg(5, 3);
+    let (pq_sk, pq_vk) = test_pq_keypair();
     let claims = future_claims();
     let expected_sub = claims.sub;
     let expected_scope = claims.scope;
     let expected_tier = claims.tier;
 
-    let token = build_signed_token_legacy(&mut dkg, claims);
-    let result = verifier::verify_token(&token, &dkg.group.public_key_package);
+    let token = build_signed_token_legacy(&mut dkg, claims, &pq_sk);
+    let result = verifier::verify_token(&token, &dkg.group.public_key_package, &pq_vk);
 
     assert!(result.is_ok(), "expected valid token: {:?}", result.err());
     let verified_claims = result.unwrap();
@@ -115,6 +134,7 @@ fn valid_token_verifies() {
 #[test]
 fn expired_token_rejected() {
     let mut dkg = threshold::dkg(5, 3);
+    let (pq_sk, pq_vk) = test_pq_keypair();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -132,8 +152,8 @@ fn expired_token_rejected() {
         ratchet_epoch: 1,
     };
 
-    let token = build_signed_token_legacy(&mut dkg, claims);
-    let result = verifier::verify_token(&token, &dkg.group.public_key_package);
+    let token = build_signed_token_legacy(&mut dkg, claims, &pq_sk);
+    let result = verifier::verify_token(&token, &dkg.group.public_key_package, &pq_vk);
 
     assert!(result.is_err());
     assert!(
@@ -145,13 +165,14 @@ fn expired_token_rejected() {
 #[test]
 fn tampered_signature_rejected() {
     let mut dkg = threshold::dkg(5, 3);
+    let (pq_sk, pq_vk) = test_pq_keypair();
     let claims = future_claims();
-    let mut token = build_signed_token_legacy(&mut dkg, claims);
+    let mut token = build_signed_token_legacy(&mut dkg, claims, &pq_sk);
 
     // Flip a byte in the FROST signature
     token.frost_signature[0] ^= 0xFF;
 
-    let result = verifier::verify_token(&token, &dkg.group.public_key_package);
+    let result = verifier::verify_token(&token, &dkg.group.public_key_package, &pq_vk);
     assert!(result.is_err());
     assert!(
         matches!(result.unwrap_err(), MilnetError::CryptoVerification(_)),
@@ -162,13 +183,14 @@ fn tampered_signature_rejected() {
 #[test]
 fn tampered_claims_rejected() {
     let mut dkg = threshold::dkg(5, 3);
+    let (pq_sk, pq_vk) = test_pq_keypair();
     let claims = future_claims();
-    let mut token = build_signed_token_legacy(&mut dkg, claims);
+    let mut token = build_signed_token_legacy(&mut dkg, claims, &pq_sk);
 
     // Modify claims after signing — signature should no longer match
     token.claims.scope = 0xFFFF_FFFF;
 
-    let result = verifier::verify_token(&token, &dkg.group.public_key_package);
+    let result = verifier::verify_token(&token, &dkg.group.public_key_package, &pq_vk);
     assert!(result.is_err());
     assert!(
         matches!(result.unwrap_err(), MilnetError::CryptoVerification(_)),
@@ -180,11 +202,12 @@ fn tampered_claims_rejected() {
 fn wrong_group_key_rejected() {
     let mut dkg1 = threshold::dkg(5, 3);
     let dkg2 = threshold::dkg(5, 3);
+    let (pq_sk, pq_vk) = test_pq_keypair();
     let claims = future_claims();
-    let token = build_signed_token_legacy(&mut dkg1, claims);
+    let token = build_signed_token_legacy(&mut dkg1, claims, &pq_sk);
 
     // Verify with a different group's key
-    let result = verifier::verify_token(&token, &dkg2.group.public_key_package);
+    let result = verifier::verify_token(&token, &dkg2.group.public_key_package, &pq_vk);
     assert!(result.is_err());
     assert!(
         matches!(result.unwrap_err(), MilnetError::CryptoVerification(_)),
@@ -197,14 +220,16 @@ fn wrong_group_key_rejected() {
 #[test]
 fn test_ratchet_tag_verifies() {
     let mut dkg = threshold::dkg(5, 3);
+    let (pq_sk, pq_vk) = test_pq_keypair();
     let ratchet_key = test_ratchet_key();
     let claims = future_claims();
     let epoch = claims.ratchet_epoch;
 
-    let token = build_signed_token(&mut dkg, claims, &ratchet_key);
+    let token = build_signed_token(&mut dkg, claims, &ratchet_key, &pq_sk);
     let result = verifier::verify_token_with_ratchet(
         &token,
         &dkg.group.public_key_package,
+        &pq_vk,
         &ratchet_key,
         epoch,
     );
@@ -219,16 +244,18 @@ fn test_ratchet_tag_verifies() {
 #[test]
 fn test_ratchet_tag_verifies_within_window() {
     let mut dkg = threshold::dkg(5, 3);
+    let (pq_sk, pq_vk) = test_pq_keypair();
     let ratchet_key = test_ratchet_key();
     let claims = future_claims(); // ratchet_epoch = 1
     let token_epoch = claims.ratchet_epoch;
 
-    let token = build_signed_token(&mut dkg, claims, &ratchet_key);
+    let token = build_signed_token(&mut dkg, claims, &ratchet_key, &pq_sk);
 
     // Verifier is at epoch = token_epoch + 3 (within window)
     let result = verifier::verify_token_with_ratchet(
         &token,
         &dkg.group.public_key_package,
+        &pq_vk,
         &ratchet_key,
         token_epoch + 3,
     );
@@ -242,16 +269,18 @@ fn test_ratchet_tag_verifies_within_window() {
 #[test]
 fn test_wrong_ratchet_key_rejected() {
     let mut dkg = threshold::dkg(5, 3);
+    let (pq_sk, pq_vk) = test_pq_keypair();
     let ratchet_key = test_ratchet_key();
     let wrong_key = [0xEE; 64];
     let claims = future_claims();
     let epoch = claims.ratchet_epoch;
 
-    let token = build_signed_token(&mut dkg, claims, &ratchet_key);
+    let token = build_signed_token(&mut dkg, claims, &ratchet_key, &pq_sk);
 
     let result = verifier::verify_token_with_ratchet(
         &token,
         &dkg.group.public_key_package,
+        &pq_vk,
         &wrong_key,
         epoch,
     );
@@ -266,16 +295,18 @@ fn test_wrong_ratchet_key_rejected() {
 #[test]
 fn test_wrong_epoch_rejected() {
     let mut dkg = threshold::dkg(5, 3);
+    let (pq_sk, pq_vk) = test_pq_keypair();
     let ratchet_key = test_ratchet_key();
     let claims = future_claims(); // ratchet_epoch = 1
     let token_epoch = claims.ratchet_epoch;
 
-    let token = build_signed_token(&mut dkg, claims, &ratchet_key);
+    let token = build_signed_token(&mut dkg, claims, &ratchet_key, &pq_sk);
 
     // Verifier is at epoch = token_epoch + 4 (outside +/-3 window)
     let result = verifier::verify_token_with_ratchet(
         &token,
         &dkg.group.public_key_package,
+        &pq_vk,
         &ratchet_key,
         token_epoch + 4,
     );
@@ -284,5 +315,80 @@ fn test_wrong_epoch_rejected() {
     assert!(
         matches!(result.unwrap_err(), MilnetError::TokenExpired),
         "expected TokenExpired error for epoch outside window"
+    );
+}
+
+// ── Post-quantum signature tests ─────────────────────────────────────
+
+#[test]
+fn test_token_with_pq_signature_verifies() {
+    let mut dkg = threshold::dkg(5, 3);
+    let (pq_sk, pq_vk) = test_pq_keypair();
+    let claims = future_claims();
+
+    let token = build_signed_token_legacy(&mut dkg, claims, &pq_sk);
+
+    // Both FROST and PQ signatures must pass
+    let result = verifier::verify_token(&token, &dkg.group.public_key_package, &pq_vk);
+    assert!(result.is_ok(), "token with valid PQ sig should verify: {:?}", result.err());
+    // Verify PQ signature is non-empty
+    assert!(!token.pq_signature.is_empty(), "pq_signature must not be empty");
+}
+
+#[test]
+fn test_missing_pq_signature_rejected() {
+    let mut dkg = threshold::dkg(5, 3);
+    let (pq_sk, pq_vk) = test_pq_keypair();
+    let claims = future_claims();
+
+    let mut token = build_signed_token_legacy(&mut dkg, claims, &pq_sk);
+    // Strip the PQ signature
+    token.pq_signature = Vec::new();
+
+    let result = verifier::verify_token(&token, &dkg.group.public_key_package, &pq_vk);
+    assert!(result.is_err());
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(
+        err_msg.contains("missing post-quantum signature"),
+        "expected missing PQ sig error, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_wrong_pq_key_rejected() {
+    let mut dkg = threshold::dkg(5, 3);
+    let (pq_sk, _pq_vk) = test_pq_keypair();
+    let (_pq_sk2, pq_vk2) = test_pq_keypair();
+    let claims = future_claims();
+
+    let token = build_signed_token_legacy(&mut dkg, claims, &pq_sk);
+
+    // Verify with a different PQ key -- must fail
+    let result = verifier::verify_token(&token, &dkg.group.public_key_package, &pq_vk2);
+    assert!(result.is_err());
+    assert!(
+        matches!(result.unwrap_err(), MilnetError::CryptoVerification(_)),
+        "expected CryptoVerification error for wrong PQ key"
+    );
+}
+
+#[test]
+fn test_tampered_pq_signature_rejected() {
+    let mut dkg = threshold::dkg(5, 3);
+    let (pq_sk, pq_vk) = test_pq_keypair();
+    let claims = future_claims();
+
+    let mut token = build_signed_token_legacy(&mut dkg, claims, &pq_sk);
+    // Corrupt the PQ signature
+    if let Some(byte) = token.pq_signature.first_mut() {
+        *byte ^= 0xFF;
+    }
+
+    let result = verifier::verify_token(&token, &dkg.group.public_key_package, &pq_vk);
+    assert!(result.is_err());
+    assert!(
+        matches!(result.unwrap_err(), MilnetError::CryptoVerification(_)),
+        "expected CryptoVerification error for tampered PQ sig"
     );
 }

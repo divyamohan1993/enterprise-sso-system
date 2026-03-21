@@ -4,6 +4,8 @@ use common::types::{ModuleId, Receipt, Token};
 use crypto::entropy::generate_key_64;
 use crypto::receipts::sign_receipt;
 use opaque::messages::{OpaqueRequest, OpaqueResponse};
+use opaque::opaque_impl::OpaqueCs;
+use opaque::store::CredentialStore;
 use orchestrator::ceremony::{CeremonySession, CeremonyState, CEREMONY_TIMEOUT_SECS};
 use orchestrator::messages::{OrchestratorRequest, OrchestratorResponse};
 use orchestrator::service::OrchestratorService;
@@ -85,10 +87,20 @@ fn ceremony_session_timeout() {
 
 #[tokio::test]
 async fn orchestrator_processes_auth() {
+    use opaque_ke::{
+        CredentialFinalization, CredentialRequest, ServerLogin, ServerLoginParameters,
+        ServerRegistration,
+    };
+
     let hmac_key = generate_key_64();
     let receipt_signing_key = generate_key_64();
 
-    // Start mock OPAQUE listener
+    // Create a real OPAQUE credential store with a registered user
+    let mut store = CredentialStore::new();
+    let user_id = store.register_with_password("alice", b"password123");
+    let server_setup_bytes = store.server_setup().serialize().to_vec();
+
+    // Start mock OPAQUE listener that runs REAL OPAQUE server-side protocol
     let opaque_listener = ShardListener::bind("127.0.0.1:0", ModuleId::Opaque, hmac_key)
         .await
         .expect("bind opaque");
@@ -102,40 +114,59 @@ async fn orchestrator_processes_auth() {
 
     let rsk = receipt_signing_key;
 
-    // Spawn mock OPAQUE service
+    // Spawn mock OPAQUE service — implements real 2-round-trip OPAQUE
     let opaque_handle = tokio::spawn(async move {
         let mut transport = opaque_listener.accept().await.expect("accept opaque");
+
+        // Round 1: Receive LoginStart, respond with LoginChallenge
         let (_sender, req_bytes) = transport.recv().await.expect("recv opaque req");
+        let req: OpaqueRequest =
+            postcard::from_bytes(&req_bytes).expect("deserialize opaque req");
 
-        let req: OpaqueRequest = postcard::from_bytes(&req_bytes).expect("deserialize opaque req");
+        let (credential_response_bytes, server_login, ceremony_session_id, dpop_key_hash) =
+            match req {
+                OpaqueRequest::LoginStart {
+                    username,
+                    credential_request,
+                    ceremony_session_id,
+                    dpop_key_hash,
+                } => {
+                    let (resp_bytes, server_login) =
+                        opaque::service::handle_login_start(&store, &username, &credential_request)
+                            .expect("login start");
+                    (resp_bytes, server_login, ceremony_session_id, dpop_key_hash)
+                }
+                _ => panic!("expected LoginStart"),
+            };
 
-        // Build a valid receipt
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_micros() as i64;
-
-        let user_id = Uuid::new_v4();
-        let mut receipt = Receipt {
-            ceremony_session_id: req.ceremony_session_id,
-            step_id: 1,
-            prev_receipt_hash: [0u8; 32],
-            user_id,
-            dpop_key_hash: req.dpop_key_hash,
-            timestamp: now,
-            nonce: crypto::entropy::generate_nonce(),
-            signature: vec![],
-            ttl_seconds: 30,
+        let resp = OpaqueResponse::LoginChallenge {
+            credential_response: credential_response_bytes,
         };
-        sign_receipt(&mut receipt, &rsk);
+        let resp_bytes = postcard::to_allocvec(&resp).expect("serialize challenge");
+        transport.send(&resp_bytes).await.expect("send challenge");
 
-        let resp = OpaqueResponse {
-            success: true,
-            receipt: Some(receipt),
-            error: None,
-        };
-        let resp_bytes = postcard::to_allocvec(&resp).expect("serialize opaque resp");
-        transport.send(&resp_bytes).await.expect("send opaque resp");
+        // Round 2: Receive LoginFinish, respond with LoginSuccess
+        let (_sender, req2_bytes) = transport.recv().await.expect("recv login finish");
+        let req2: OpaqueRequest =
+            postcard::from_bytes(&req2_bytes).expect("deserialize login finish");
+
+        match req2 {
+            OpaqueRequest::LoginFinish {
+                credential_finalization,
+            } => {
+                let response = opaque::service::handle_login_finish(
+                    server_login,
+                    &credential_finalization,
+                    &rsk,
+                    user_id,
+                    ceremony_session_id,
+                    dpop_key_hash,
+                );
+                let resp_bytes = postcard::to_allocvec(&response).expect("serialize result");
+                transport.send(&resp_bytes).await.expect("send result");
+            }
+            _ => panic!("expected LoginFinish"),
+        }
     });
 
     // Spawn mock TSS service
@@ -164,7 +195,7 @@ async fn orchestrator_processes_auth() {
 
     let request = OrchestratorRequest {
         username: "alice".into(),
-        password: vec![0xAA; 32],
+        password: b"password123".to_vec(),
         dpop_key_hash: [0xBB; 32],
         tier: 2,
     };
@@ -195,7 +226,11 @@ async fn orchestrator_handles_opaque_failure() {
     let hmac_key = generate_key_64();
     let receipt_signing_key = generate_key_64();
 
-    // Start mock OPAQUE listener that returns failure
+    // Create store with a registered user
+    let mut store = CredentialStore::new();
+    store.register_with_password("alice", b"password123");
+
+    // Start mock OPAQUE listener — real OPAQUE, but user sends wrong password
     let opaque_listener = ShardListener::bind("127.0.0.1:0", ModuleId::Opaque, hmac_key)
         .await
         .expect("bind opaque");
@@ -209,31 +244,69 @@ async fn orchestrator_handles_opaque_failure() {
 
     let opaque_handle = tokio::spawn(async move {
         let mut transport = opaque_listener.accept().await.expect("accept opaque");
-        let (_sender, _req_bytes) = transport.recv().await.expect("recv opaque req");
 
-        let resp = OpaqueResponse {
-            success: false,
-            receipt: None,
-            error: Some("invalid credentials".into()),
-        };
-        let resp_bytes = postcard::to_allocvec(&resp).expect("serialize opaque resp");
-        transport.send(&resp_bytes).await.expect("send opaque resp");
+        // Round 1: Receive LoginStart, respond with LoginChallenge
+        let (_sender, req_bytes) = transport.recv().await.expect("recv opaque req");
+        let req: OpaqueRequest =
+            postcard::from_bytes(&req_bytes).expect("deserialize opaque req");
+
+        match req {
+            OpaqueRequest::LoginStart {
+                username,
+                credential_request,
+                ..
+            } => {
+                let (resp_bytes, server_login) =
+                    opaque::service::handle_login_start(&store, &username, &credential_request)
+                        .expect("login start");
+
+                let resp = OpaqueResponse::LoginChallenge {
+                    credential_response: resp_bytes,
+                };
+                let resp_bytes = postcard::to_allocvec(&resp).expect("serialize");
+                transport.send(&resp_bytes).await.expect("send");
+
+                // Round 2: Client will fail to finish (wrong password) but
+                // the orchestrator will send the finalization anyway.
+                // Wait for it and respond with error.
+                let result = transport.recv().await;
+                if let Ok((_sender, req2_bytes)) = result {
+                    let req2: OpaqueRequest =
+                        postcard::from_bytes(&req2_bytes).expect("deserialize");
+                    if let OpaqueRequest::LoginFinish {
+                        credential_finalization,
+                    } = req2
+                    {
+                        let response = opaque::service::handle_login_finish(
+                            server_login,
+                            &credential_finalization,
+                            &[0u8; 64],
+                            Uuid::nil(),
+                            [0u8; 32],
+                            [0u8; 32],
+                        );
+                        let resp_bytes = postcard::to_allocvec(&response).expect("serialize");
+                        transport.send(&resp_bytes).await.expect("send");
+                    }
+                }
+            }
+            _ => panic!("expected LoginStart"),
+        }
     });
 
     let service = OrchestratorService::new(hmac_key, opaque_addr, tss_addr, receipt_signing_key);
 
     let request = OrchestratorRequest {
-        username: "baduser".into(),
-        password: vec![0x00; 32],
+        username: "alice".into(),
+        password: b"wrong_password".to_vec(),
         dpop_key_hash: [0xBB; 32],
         tier: 2,
     };
 
     let response = service.process_auth(&request).await;
 
-    assert!(!response.success);
+    assert!(!response.success, "auth should fail with wrong password");
     assert!(response.token_bytes.is_none());
-    assert_eq!(response.error.as_deref(), Some("invalid credentials"));
 
     opaque_handle.await.expect("opaque mock");
     drop(tss_listener);

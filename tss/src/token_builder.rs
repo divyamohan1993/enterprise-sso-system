@@ -1,9 +1,12 @@
 use common::domain;
 use common::error::MilnetError;
 use common::types::{Token, TokenClaims, TokenHeader};
+use crypto::pq_sign::{pq_sign, PqSigningKey};
 use crypto::threshold::{threshold_sign, SignerShare, ThresholdGroup};
 use hmac::{Hmac, Mac};
 use sha2::Sha512;
+
+use crate::distributed::{SignerNode, SigningCoordinator};
 
 type HmacSha512 = Hmac<Sha512>;
 
@@ -17,18 +20,24 @@ fn compute_ratchet_tag(ratchet_key: &[u8; 64], claims_bytes: &[u8], epoch: u64) 
     mac.finalize().into_bytes().into()
 }
 
-/// Build a threshold-signed token from validated claims.
+/// Build a threshold-signed token from validated claims (monolithic).
+///
+/// **Deprecated**: all signer shares live in one process, which defeats
+/// the purpose of threshold cryptography.  Use [`build_token_distributed`]
+/// instead.
 ///
 /// Steps:
 /// 1. Serialize claims with `FROST_TOKEN` domain prefix.
 /// 2. Compute ratchet tag via HMAC-SHA512 using the provided ratchet key.
 /// 3. Run FROST threshold signing ceremony.
 /// 4. Build the final [`Token`].
+#[deprecated(note = "use build_token_distributed — shares must not be co-located")]
 pub fn build_token(
     claims: &TokenClaims,
     signers: &mut [SignerShare],
     group: &ThresholdGroup,
     ratchet_key: &[u8; 64],
+    pq_signing_key: &PqSigningKey,
 ) -> Result<Token, MilnetError> {
     // Domain-separated message
     let claims_bytes =
@@ -42,6 +51,9 @@ pub fn build_token(
     let frost_signature = threshold_sign(signers, group, &msg, group.threshold)
         .map_err(MilnetError::CryptoVerification)?;
 
+    // Compute ML-DSA-65 post-quantum signature over (message || frost_signature)
+    let pq_signature = pq_sign(pq_signing_key, &msg, &frost_signature);
+
     Ok(Token {
         header: TokenHeader {
             version: 1,
@@ -51,6 +63,53 @@ pub fn build_token(
         claims: claims.clone(),
         ratchet_tag,
         frost_signature,
-        pq_signature: Vec::new(), // PQ placeholder
+        pq_signature,
+    })
+}
+
+/// Build a threshold-signed token using the distributed signing coordinator.
+///
+/// Each `SignerNode` holds exactly ONE FROST key share and runs in its own
+/// process.  The `SigningCoordinator` holds NO signing keys -- it only
+/// aggregates the partial signatures produced by the signer nodes.
+///
+/// Steps:
+/// 1. Serialize claims with `FROST_TOKEN` domain prefix.
+/// 2. Compute ratchet tag via HMAC-SHA512 using the provided ratchet key.
+/// 3. Run the two-round FROST ceremony via the coordinator.
+/// 4. Build the final [`Token`].
+pub fn build_token_distributed(
+    claims: &TokenClaims,
+    coordinator: &SigningCoordinator,
+    signers: &mut [&mut SignerNode],
+    ratchet_key: &[u8; 64],
+    pq_signing_key: &PqSigningKey,
+) -> Result<Token, MilnetError> {
+    // Domain-separated message
+    let claims_bytes =
+        postcard::to_allocvec(claims).map_err(|e| MilnetError::Serialization(e.to_string()))?;
+    let msg = [domain::FROST_TOKEN, &claims_bytes].concat();
+
+    // Compute real ratchet tag
+    let ratchet_tag = compute_ratchet_tag(ratchet_key, &claims_bytes, claims.ratchet_epoch);
+
+    // Run distributed FROST threshold signing
+    let frost_signature = coordinator
+        .coordinate_signing(signers, &msg)
+        .map_err(MilnetError::CryptoVerification)?;
+
+    // Compute ML-DSA-65 post-quantum signature over (message || frost_signature)
+    let pq_signature = pq_sign(pq_signing_key, &msg, &frost_signature);
+
+    Ok(Token {
+        header: TokenHeader {
+            version: 1,
+            algorithm: 1,
+            tier: claims.tier,
+        },
+        claims: claims.clone(),
+        ratchet_tag,
+        frost_signature,
+        pq_signature,
     })
 }

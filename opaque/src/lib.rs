@@ -1,8 +1,11 @@
 #![forbid(unsafe_code)]
 //! opaque: T-OPAQUE Password Service.
 //!
-//! Provides simulated OPAQUE password authentication with ceremony receipt issuance.
+//! Implements real OPAQUE (RFC 9497) password-authenticated key exchange using
+//! the opaque-ke crate. The server NEVER sees the plaintext password — not
+//! during registration, not during login.
 
 pub mod messages;
+pub mod opaque_impl;
 pub mod service;
 pub mod store;

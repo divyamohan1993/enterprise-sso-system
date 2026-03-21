@@ -2,17 +2,27 @@ use frost_ristretto255::keys::PublicKeyPackage;
 use common::domain;
 use common::error::MilnetError;
 use common::types::{Token, TokenClaims};
+use crypto::pq_sign::{pq_verify, PqVerifyingKey};
 use hmac::{Hmac, Mac};
 use sha2::Sha512;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 type HmacSha512 = Hmac<Sha512>;
 
-/// Verify a token's signature and claims.
-/// This is the O(1) hot path — must be as fast as possible.
+/// Verify a token's signature and claims (spec C.11).
+///
+/// Verification order:
+/// 1. Check version and expiry
+/// 2. Check pq_signature is NOT empty (reject if missing)
+/// 3. Verify ML-DSA-65 signature over (claims_msg || frost_signature)
+/// 4. Verify FROST signature over claims_msg
+/// 5. Check tier validity
+///
+/// Both PQ and FROST signatures must pass.
 pub fn verify_token(
     token: &Token,
     public_key_package: &PublicKeyPackage,
+    pq_verifying_key: &PqVerifyingKey,
 ) -> Result<TokenClaims, MilnetError> {
     // 1. Check version
     if token.header.version != 1 {
@@ -37,7 +47,21 @@ pub fn verify_token(
     message.extend_from_slice(domain::FROST_TOKEN);
     message.extend_from_slice(&claims_bytes);
 
-    // 4. Verify FROST threshold signature
+    // 4. Check PQ signature is present (spec C.11: reject if missing)
+    if token.pq_signature.is_empty() {
+        return Err(MilnetError::CryptoVerification(
+            "missing post-quantum signature".into(),
+        ));
+    }
+
+    // 5. Verify ML-DSA-65 post-quantum signature over (message || frost_signature)
+    if !pq_verify(pq_verifying_key, &message, &token.frost_signature, &token.pq_signature) {
+        return Err(MilnetError::CryptoVerification(
+            "ML-DSA-65 post-quantum signature invalid".into(),
+        ));
+    }
+
+    // 6. Verify FROST threshold signature
     let sig = frost_ristretto255::Signature::deserialize(&token.frost_signature)
         .map_err(|e| MilnetError::CryptoVerification(format!("invalid signature encoding: {e}")))?;
     public_key_package
@@ -45,7 +69,7 @@ pub fn verify_token(
         .verify(&message, &sig)
         .map_err(|_| MilnetError::CryptoVerification("FROST signature invalid".into()))?;
 
-    // 5. Check tier is valid (1-4)
+    // 7. Check tier is valid (1-4)
     if token.claims.tier == 0 || token.claims.tier > 4 {
         return Err(MilnetError::CryptoVerification("invalid tier".into()));
     }
@@ -60,9 +84,10 @@ pub fn verify_token(
 pub fn verify_token_with_dpop(
     token: &Token,
     public_key_package: &PublicKeyPackage,
+    pq_verifying_key: &PqVerifyingKey,
     client_dpop_key: &[u8],
 ) -> Result<TokenClaims, MilnetError> {
-    let claims = verify_token(token, public_key_package)?;
+    let claims = verify_token(token, public_key_package, pq_verifying_key)?;
 
     // Verify DPoP binding
     let expected_hash = crypto::dpop::dpop_key_hash(client_dpop_key);
@@ -93,11 +118,12 @@ fn compute_ratchet_tag(ratchet_key: &[u8; 64], claims_bytes: &[u8], epoch: u64) 
 pub fn verify_token_with_ratchet(
     token: &Token,
     public_key_package: &PublicKeyPackage,
+    pq_verifying_key: &PqVerifyingKey,
     ratchet_key: &[u8; 64],
     current_epoch: u64,
 ) -> Result<TokenClaims, MilnetError> {
-    // 1. Do all existing checks (version, expiry, FROST signature, tier)
-    let claims = verify_token(token, public_key_package)?;
+    // 1. Do all existing checks (version, expiry, FROST + PQ signature, tier)
+    let claims = verify_token(token, public_key_package, pq_verifying_key)?;
 
     // 2. Check ratchet epoch is within +/-3 window
     let epoch_diff = token.claims.ratchet_epoch.abs_diff(current_epoch);

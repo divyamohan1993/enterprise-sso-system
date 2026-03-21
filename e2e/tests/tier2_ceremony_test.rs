@@ -3,6 +3,8 @@
 //! Boots all five Phase 2 modules (OPAQUE, TSS, Orchestrator, Gateway, Verifier)
 //! as tokio tasks and runs a complete authentication flow from client connection
 //! through to token verification.
+//!
+//! Uses real OPAQUE protocol: the OPAQUE service never sees plaintext passwords.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -10,17 +12,16 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use common::types::{ModuleId, Token};
-use crypto::threshold::{dkg, SignerShare, ThresholdGroup};
+use crypto::threshold::dkg;
 use gateway::puzzle::{solve_challenge, PuzzleChallenge, PuzzleSolution};
 use gateway::server::{GatewayServer, OrchestratorConfig};
 use gateway::wire::{AuthRequest, AuthResponse};
-use opaque::messages::OpaqueRequest;
-use opaque::service::handle_request as opaque_handle_request;
 use opaque::store::CredentialStore;
 use orchestrator::service::OrchestratorService;
 use shard::transport::ShardListener;
+use tss::distributed::{distribute_shares, SignerNode, SigningCoordinator};
 use tss::messages::{SigningRequest, SigningResponse};
-use tss::token_builder::build_token;
+use tss::token_builder::build_token_distributed;
 use tss::validator::validate_receipt_chain;
 use verifier::verify::verify_token;
 
@@ -29,7 +30,6 @@ const SHARD_HMAC_KEY: [u8; 64] = [0x37u8; 64];
 
 /// Fixed 64-byte receipt signing key shared between OPAQUE and TSS.
 const RECEIPT_SIGNING_KEY: [u8; 64] = [0x42u8; 64];
-
 
 /// Puzzle difficulty (low for fast tests).
 const TEST_DIFFICULTY: u8 = 4;
@@ -68,59 +68,80 @@ async fn recv_frame<T: serde::de::DeserializeOwned>(stream: &mut TcpStream) -> R
 
 // ── Service boot helpers ────────────────────────────────────────────────
 
-/// Boot the OPAQUE service as a SHARD listener. Returns the bound address.
+/// Boot the OPAQUE service as a SHARD listener with real OPAQUE protocol.
+/// Handles 2-round-trip login and registration flows.
 async fn boot_opaque(store: CredentialStore) -> String {
+    use std::sync::{Arc, Mutex};
+    use opaque::messages::{OpaqueRequest, OpaqueResponse};
+
+    let store = Arc::new(Mutex::new(store));
     let listener = ShardListener::bind("127.0.0.1:0", ModuleId::Opaque, SHARD_HMAC_KEY)
         .await
         .expect("bind OPAQUE listener");
-    let addr = listener
-        .local_addr()
-        .expect("OPAQUE local_addr")
-        .to_string();
+    let addr = listener.local_addr().expect("OPAQUE local_addr").to_string();
 
     tokio::spawn(async move {
         loop {
             let mut transport = match listener.accept().await {
                 Ok(t) => t,
-                Err(e) => {
-                    eprintln!("OPAQUE accept error: {e}");
-                    continue;
-                }
+                Err(_) => continue,
             };
-
-            let (_sender, payload) = match transport.recv().await {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("OPAQUE recv error: {e}");
-                    continue;
+            let store = Arc::clone(&store);
+            tokio::spawn(async move {
+                let (_sender, payload) = match transport.recv().await {
+                    Ok(r) => r,
+                    Err(_) => return,
+                };
+                let request: OpaqueRequest = match postcard::from_bytes(&payload) {
+                    Ok(r) => r,
+                    Err(_) => return,
+                };
+                match request {
+                    OpaqueRequest::LoginStart { username, credential_request, ceremony_session_id, dpop_key_hash } => {
+                        // Extract all data from store while holding lock, then drop lock before any await
+                        let login_result_and_id = {
+                            let store_guard = store.lock().unwrap();
+                            let login_result = opaque::service::handle_login_start(&store_guard, &username, &credential_request);
+                            let user_id = store_guard.get_user_id(&username).unwrap_or(uuid::Uuid::nil());
+                            (login_result, user_id)
+                        }; // MutexGuard dropped here, before any await
+                        let (login_result, user_id) = login_result_and_id;
+                        match login_result {
+                            Ok((response_bytes, server_login)) => {
+                                let resp = OpaqueResponse::LoginChallenge { credential_response: response_bytes };
+                                let resp_bytes = postcard::to_allocvec(&resp).unwrap();
+                                if transport.send(&resp_bytes).await.is_err() { return; }
+                                let (_sender, payload2) = match transport.recv().await { Ok(r) => r, Err(_) => return };
+                                let req2: OpaqueRequest = match postcard::from_bytes(&payload2) { Ok(r) => r, Err(_) => return };
+                                if let OpaqueRequest::LoginFinish { credential_finalization } = req2 {
+                                    let response = opaque::service::handle_login_finish(server_login, &credential_finalization, &RECEIPT_SIGNING_KEY, user_id, ceremony_session_id, dpop_key_hash);
+                                    let resp_bytes = postcard::to_allocvec(&response).unwrap();
+                                    let _ = transport.send(&resp_bytes).await;
+                                }
+                            }
+                            Err(e) => {
+                                let resp = OpaqueResponse::Error { message: e };
+                                let resp_bytes = postcard::to_allocvec(&resp).unwrap();
+                                let _ = transport.send(&resp_bytes).await;
+                            }
+                        }
+                    }
+                    _ => {
+                        let resp = OpaqueResponse::Error { message: "unexpected request type".into() };
+                        let resp_bytes = postcard::to_allocvec(&resp).unwrap();
+                        let _ = transport.send(&resp_bytes).await;
+                    }
                 }
-            };
-
-            let request: OpaqueRequest = match postcard::from_bytes(&payload) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("OPAQUE deserialize error: {e}");
-                    continue;
-                }
-            };
-
-            let response = opaque_handle_request(&store, &request, &RECEIPT_SIGNING_KEY);
-
-            let response_bytes =
-                postcard::to_allocvec(&response).expect("serialize OPAQUE response");
-
-            if let Err(e) = transport.send(&response_bytes).await {
-                eprintln!("OPAQUE send error: {e}");
-            }
+            });
         }
     });
 
     addr
 }
 
-/// Boot the TSS service as a SHARD listener. Returns the bound address.
-/// Needs signer shares and threshold group from DKG.
-async fn boot_tss(mut signers: Vec<SignerShare>, group: ThresholdGroup) -> String {
+/// Boot the TSS service as a SHARD listener using distributed signing.
+/// The coordinator holds NO keys; each SignerNode holds exactly one share.
+async fn boot_tss(coordinator: SigningCoordinator, mut nodes: Vec<SignerNode>, pq_signing_key: crypto::pq_sign::PqSigningKey) -> String {
     let listener = ShardListener::bind("127.0.0.1:0", ModuleId::Tss, SHARD_HMAC_KEY)
         .await
         .expect("bind TSS listener");
@@ -166,8 +187,16 @@ async fn boot_tss(mut signers: Vec<SignerShare>, group: ThresholdGroup) -> Strin
             let response =
                 match validate_receipt_chain(&request.receipts, &tss_receipt_signing_key) {
                     Ok(()) => {
-                        // Build threshold-signed token
-                        match build_token(&request.claims, &mut signers, &group, &request.ratchet_key) {
+                        // Build threshold-signed token using distributed coordinator
+                        let mut signers: Vec<&mut SignerNode> =
+                            nodes.iter_mut().take(coordinator.threshold).collect();
+                        match build_token_distributed(
+                            &request.claims,
+                            &coordinator,
+                            &mut signers,
+                            &request.ratchet_key,
+                            &pq_signing_key,
+                        ) {
                             Ok(token) => {
                                 let token_bytes =
                                     postcard::to_allocvec(&token).expect("serialize token");
@@ -285,22 +314,23 @@ async fn boot_gateway(orchestrator_addr: String) -> String {
 
 #[tokio::test]
 async fn tier2_full_ceremony_success() {
-    // 1. Setup crypto: DKG(5,3)
-    let dkg_result = dkg(5, 3);
+    // 1. Setup crypto: DKG(5,3) -> distributed signing
+    let mut dkg_result = dkg(5, 3);
     let group_verifying_key = dkg_result.group.public_key_package.clone();
 
-    // Take only 3 shares (threshold) for the TSS
-    let signers: Vec<SignerShare> = dkg_result.shares.into_iter().take(3).collect();
+    // Distribute shares: coordinator holds NO keys, each node holds 1 share
+    let (coordinator, nodes) = distribute_shares(&mut dkg_result);
+    let (pq_sk, pq_vk) = crypto::pq_sign::generate_pq_keypair();
 
     // 2. Boot services in dependency order
     let opaque_addr = boot_opaque({
         let mut store = CredentialStore::new();
-        store.register("alice", b"password123");
+        store.register_with_password("alice", b"password123");
         store
     })
     .await;
 
-    let tss_addr = boot_tss(signers, dkg_result.group).await;
+    let tss_addr = boot_tss(coordinator, nodes, pq_sk).await;
 
     // Small delay to let listeners bind
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -360,7 +390,7 @@ async fn tier2_full_ceremony_success() {
     let token: Token = postcard::from_bytes(&token_bytes).expect("deserialize token");
 
     let claims =
-        verify_token(&token, &group_verifying_key).expect("token verification should succeed");
+        verify_token(&token, &group_verifying_key, &pq_vk).expect("token verification should succeed");
 
     // Assert tier == 2 (Operational)
     assert_eq!(claims.tier, 2, "token tier should be 2");
@@ -379,19 +409,20 @@ async fn tier2_full_ceremony_success() {
 
 #[tokio::test]
 async fn tier2_wrong_password_fails() {
-    // 1. Setup crypto: DKG(5,3)
-    let dkg_result = dkg(5, 3);
-    let signers: Vec<SignerShare> = dkg_result.shares.into_iter().take(3).collect();
+    // 1. Setup crypto: DKG(5,3) -> distributed signing
+    let mut dkg_result = dkg(5, 3);
+    let (coordinator, nodes) = distribute_shares(&mut dkg_result);
+    let (pq_sk, _pq_vk) = crypto::pq_sign::generate_pq_keypair();
 
     // 2. Boot services
     let opaque_addr = boot_opaque({
         let mut store = CredentialStore::new();
-        store.register("alice", b"password123");
+        store.register_with_password("alice", b"password123");
         store
     })
     .await;
 
-    let tss_addr = boot_tss(signers, dkg_result.group).await;
+    let tss_addr = boot_tss(coordinator, nodes, pq_sk).await;
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
