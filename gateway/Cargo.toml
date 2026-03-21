@@ -18,3 +18,4 @@ tracing-subscriber.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 rand.workspace = true
+rcgen.workspace = true

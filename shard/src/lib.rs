@@ -5,4 +5,6 @@
 //! communication between MILNET SSO microservices.
 
 pub mod protocol;
+pub mod tls;
+pub mod tls_transport;
 pub mod transport;
