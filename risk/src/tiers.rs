@@ -47,6 +47,16 @@ impl DeviceRegistry {
         self.devices.get(device_id)
     }
 
+    /// Return the number of enrolled devices.
+    pub fn device_count(&self) -> usize {
+        self.devices.len()
+    }
+
+    /// Return references to all enrolled devices.
+    pub fn all_devices(&self) -> Vec<&DeviceEnrollment> {
+        self.devices.values().collect()
+    }
+
     pub fn revoke(&mut self, device_id: &uuid::Uuid) -> bool {
         if let Some(device) = self.devices.get_mut(device_id) {
             device.is_active = false;

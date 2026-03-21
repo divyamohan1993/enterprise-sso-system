@@ -14,6 +14,7 @@ members = [
     "risk",
     "audit",
     "e2e",
+    "admin",
 ]
 
 [workspace.package]

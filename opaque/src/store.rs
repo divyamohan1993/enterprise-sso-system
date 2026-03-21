@@ -1,93 +1,159 @@
-//! In-memory credential store with Argon2id password authentication.
+//! In-memory credential store with real OPAQUE ServerRegistration records.
+//!
+//! The store holds serialized `ServerRegistration` blobs — these contain NO
+//! password information. The server never sees the plaintext password at any
+//! point during registration or login.
 
 use std::collections::HashMap;
 
-use argon2::password_hash::rand_core::OsRng;
-use argon2::password_hash::SaltString;
-use argon2::{Argon2, Algorithm, Params, PasswordHash, PasswordHasher, PasswordVerifier, Version};
 use uuid::Uuid;
 
 use common::error::MilnetError;
+use opaque_ke::{ServerRegistration, ServerSetup};
+use rand::rngs::OsRng;
+
+use crate::opaque_impl::OpaqueCs;
 
 /// A stored user credential record.
 pub struct UserRecord {
     pub user_id: Uuid,
-    pub password_hash: String, // PHC format Argon2id hash
+    /// Serialized `ServerRegistration<OpaqueCs>` — contains NO password info.
+    pub registration: Vec<u8>,
 }
 
-/// In-memory credential store mapping usernames to password records.
+/// In-memory credential store mapping usernames to OPAQUE registration records.
 pub struct CredentialStore {
     users: HashMap<String, UserRecord>,
-    params: Params,
-}
-
-/// Production Argon2id parameters: 64 MiB, 3 iterations, 4 parallel lanes.
-pub fn production_params() -> Params {
-    Params::new(65536, 3, 4, None).unwrap()
-}
-
-/// Reduced Argon2id parameters for fast tests: 1 MiB, 1 iteration, 1 lane.
-pub fn test_params() -> Params {
-    Params::new(1024, 1, 1, None).unwrap()
+    /// The server's OPAQUE setup (OPRF seed + keypair). Must be persisted
+    /// across restarts in production.
+    server_setup: ServerSetup<OpaqueCs>,
 }
 
 impl CredentialStore {
-    /// Create an empty credential store with production Argon2id parameters.
+    /// Create an empty credential store with a fresh ServerSetup.
     pub fn new() -> Self {
+        let mut rng = OsRng;
+        let server_setup = ServerSetup::<OpaqueCs>::new(&mut rng);
         Self {
             users: HashMap::new(),
-            params: test_params(),
+            server_setup,
         }
     }
 
-    /// Create a credential store with custom Argon2id parameters.
-    pub fn with_params(params: Params) -> Self {
+    /// Create a credential store with a provided ServerSetup (for testing or
+    /// when restoring from persistent storage).
+    pub fn with_server_setup(server_setup: ServerSetup<OpaqueCs>) -> Self {
         Self {
             users: HashMap::new(),
-            params,
+            server_setup,
         }
     }
 
-    /// Register a new user with the given username and plaintext password.
-    /// Hashes the password with Argon2id, stores the record, and returns the user_id.
-    pub fn register(&mut self, username: &str, password: &[u8]) -> Uuid {
-        let salt = SaltString::generate(&mut OsRng);
-        let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, self.params.clone());
-        let hash = argon2
-            .hash_password(password, &salt)
-            .unwrap()
-            .to_string();
+    /// Returns a reference to the server setup.
+    pub fn server_setup(&self) -> &ServerSetup<OpaqueCs> {
+        &self.server_setup
+    }
 
+    /// Store a completed registration for a user.
+    ///
+    /// This is called after the full OPAQUE registration flow completes
+    /// (client_start -> server_start -> client_finish -> server_finish).
+    /// The `registration` is a serialized `ServerRegistration<OpaqueCs>`.
+    pub fn store_registration(
+        &mut self,
+        username: &str,
+        registration_bytes: Vec<u8>,
+    ) -> Uuid {
         let user_id = Uuid::new_v4();
         self.users.insert(
             username.to_string(),
             UserRecord {
                 user_id,
-                password_hash: hash,
+                registration: registration_bytes,
             },
         );
         user_id
     }
 
-    /// Verify a user's password using Argon2id.
-    /// Returns the user_id on success or an error if the user doesn't exist
-    /// or the password doesn't match.
-    pub fn verify(&self, username: &str, password: &[u8]) -> Result<Uuid, MilnetError> {
+    /// Look up a user's OPAQUE registration record.
+    /// Returns the deserialized ServerRegistration and user_id, or an error.
+    pub fn get_registration(
+        &self,
+        username: &str,
+    ) -> Result<(ServerRegistration<OpaqueCs>, Uuid), MilnetError> {
         let record = self
             .users
             .get(username)
             .ok_or_else(|| MilnetError::CryptoVerification("unknown user".into()))?;
 
-        let parsed = PasswordHash::new(&record.password_hash)
-            .map_err(|e| MilnetError::CryptoVerification(e.to_string()))?;
+        let server_registration =
+            ServerRegistration::<OpaqueCs>::deserialize(&record.registration)
+                .map_err(|e| MilnetError::CryptoVerification(format!("corrupt registration: {e}")))?;
 
-        Argon2::default()
-            .verify_password(password, &parsed)
-            .map_err(|_| {
-                MilnetError::CryptoVerification("password verification failed".into())
-            })?;
+        Ok((server_registration, record.user_id))
+    }
 
-        Ok(record.user_id)
+    /// Check if a user exists.
+    pub fn user_exists(&self, username: &str) -> bool {
+        self.users.contains_key(username)
+    }
+
+    /// Get user_id for a username.
+    pub fn get_user_id(&self, username: &str) -> Option<Uuid> {
+        self.users.get(username).map(|r| r.user_id)
+    }
+
+    /// Return the number of registered users.
+    pub fn user_count(&self) -> usize {
+        self.users.len()
+    }
+
+    /// Return a list of all registered usernames.
+    pub fn usernames(&self) -> Vec<String> {
+        self.users.keys().cloned().collect()
+    }
+
+    /// Perform OPAQUE registration using the full client+server flow.
+    /// This is a convenience method that runs the entire registration
+    /// protocol internally (both client and server sides).
+    ///
+    /// The password is only used on the client side of the OPAQUE protocol;
+    /// the server side never sees it. After registration, the stored record
+    /// contains no password-derived information that could be used to
+    /// recover the password.
+    pub fn register_with_password(&mut self, username: &str, password: &[u8]) -> Uuid {
+        use opaque_ke::{
+            ClientRegistration, ClientRegistrationFinishParameters,
+        };
+
+        let mut rng = OsRng;
+
+        // Step 1: Client starts registration
+        let client_start = ClientRegistration::<OpaqueCs>::start(&mut rng, password)
+            .expect("client registration start");
+
+        // Step 2: Server processes registration request
+        let server_start = ServerRegistration::<OpaqueCs>::start(
+            &self.server_setup,
+            client_start.message,
+            username.as_bytes(),
+        )
+        .expect("server registration start");
+
+        // Step 3: Client finishes registration
+        let client_finish = client_start.state.finish(
+            &mut rng,
+            password,
+            server_start.message,
+            ClientRegistrationFinishParameters::default(),
+        )
+        .expect("client registration finish");
+
+        // Step 4: Server finishes registration — produces the password file
+        let server_registration = ServerRegistration::<OpaqueCs>::finish(client_finish.message);
+        let registration_bytes = server_registration.serialize().to_vec();
+
+        self.store_registration(username, registration_bytes)
     }
 }
 
