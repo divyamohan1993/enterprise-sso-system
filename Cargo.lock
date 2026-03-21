@@ -21,6 +21,7 @@ dependencies = [
  "risk",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sha2",
  "sqlx",
  "sso-protocol",

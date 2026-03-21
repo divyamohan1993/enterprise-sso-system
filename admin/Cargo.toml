@@ -16,6 +16,7 @@ sso-protocol = { path = "../sso-protocol" }
 serde.workspace = true
 base64 = "0.22"
 serde_json = "1"
+serde_urlencoded = "0.7"
 tokio.workspace = true
 uuid.workspace = true
 hmac.workspace = true

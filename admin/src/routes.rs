@@ -842,8 +842,16 @@ struct TokenRequest {
 
 async fn oauth_token(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<TokenRequest>,
+    body: String,
 ) -> Json<serde_json::Value> {
+    // Accept both JSON and form-urlencoded (OAuth standard uses form)
+    let req: TokenRequest = if let Ok(r) = serde_json::from_str(&body) {
+        r
+    } else if let Ok(r) = serde_urlencoded::from_str(&body) {
+        r
+    } else {
+        return Json(serde_json::json!({"error": "invalid_request", "error_description": "could not parse request body"}));
+    };
     if req.grant_type != "authorization_code" {
         return Json(serde_json::json!({"error": "unsupported_grant_type"}));
     }
