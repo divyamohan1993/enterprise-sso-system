@@ -15,6 +15,8 @@ members = [
     "audit",
     "e2e",
     "admin",
+    "sso-protocol",
+    "fido",
 ]
 
 [workspace.package]
@@ -50,3 +52,5 @@ argon2 = "0.5"
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
 tokio-rustls = "0.26"
 rcgen = "0.13"
+hex = "0.4"
+rusqlite = { version = "0.32", features = ["bundled"] }
