@@ -15,16 +15,16 @@ An SSO system architected to combine threshold cryptography, post-quantum key ex
 | FROST threshold signing | Specified | Algorithm works (trusted dealer, single process — NOT distributed across 5 nodes yet) |
 | ML-KEM-768 post-quantum KEM | Specified | Fully implemented (real ml-kem crate, real encap/decap) |
 | Password auth | OPAQUE specified | Argon2id server-side (NOT OPAQUE — server sees password) |
-| Session ratcheting | Specified | Library works (NOT wired into token verification path yet) |
+| Session ratcheting | Specified | HMAC-SHA512 ratchet tag computed in TSS, verified in verifier with ±3 epoch window |
 | Key Transparency | Specified | Merkle tree works (NOT signed tree heads, no service) |
 | Audit log | Specified | Hash chain works (NOT BFT replicated, no service) |
 | Process isolation | 9 processes specified | 3 processes communicate (gateway, orchestrator, opaque). TSS holds all shares in one process. |
-| Token verification | O(1) specified | Signature verification works. Ratchet tag NOT checked. DPoP NOT enforced. |
+| Token verification | O(1) specified | Signature + ratchet tag + DPoP all verified. Epoch ±3 lookahead enforced. |
 | Risk scoring | Specified | Algorithm works (NOT wired as a service) |
 
 **What IS real right now:** ML-KEM-768 post-quantum KEM, FROST algorithm (not distributed), Argon2id password hashing, receipt chain cryptography, SHARD IPC protocol, hash-chained audit, Merkle tree proofs, end-to-end auth flow (gateway → orchestrator → opaque → tss → verifier).
 
-**What is NOT real yet:** Distributed threshold signing across separate processes, OPAQUE protocol (RFC 9807), ratchet integration in verification, DPoP channel binding, BFT audit replication, TLS transport, FIDO2 support.
+**What is NOT real yet:** Distributed threshold signing across separate processes, OPAQUE protocol (RFC 9807 — currently Argon2id server-side), BFT audit replication, TLS transport, FIDO2 support, ML-DSA-65 PQ token signatures.
 
 ## Quick Start
 
@@ -61,7 +61,7 @@ Internet → Gateway (puzzle) → Orchestrator → OPAQUE (password)
 | `tss` | FROST threshold token signing | All shares (single process; distributed deployment pending) |
 | `verifier` | O(1) token verification (no benchmark yet) | Public keys only |
 | `opaque` | Argon2id password auth + receipt issuance (server-side, not OPAQUE PAKE yet) | Password hashes |
-| `ratchet` | Forward-secret session management (library, not yet in verification path) | Ephemeral keys |
+| `ratchet` | Forward-secret session management (wired into token builder + verifier) | Ephemeral keys |
 | `kt` | SHA3-256 Merkle tree for credential transparency | Append-only log |
 | `risk` | Continuous risk scoring + device tier enforcement | Baselines |
 | `audit` | Hash-chained tamper-proof event log | Event log |
@@ -152,7 +152,7 @@ Even if the client device is fully compromised:
 - The **threshold signature** can't be forged without the signing key (currently single-process; distributed across 5 nodes when deployed)
 - The **audit log** records everything for forensic analysis
 
-**Not yet enforced in v0.1.0:** Ratchet-based token expiry (library exists, not wired to verifier), DPoP channel binding (field exists, not checked), distributed threshold signing across separate processes.
+**Not yet enforced in v0.1.0:** Distributed threshold signing across separate processes (FROST algorithm works, shares in single process), full OPAQUE PAKE protocol (using Argon2id server-side), ML-DSA-65 PQ token signatures.
 
 ### 5. Admin Operations
 
@@ -196,7 +196,7 @@ assert!(auth.requires_two_person); // Must have 2 people from different departme
 - **Post-quantum signatures**: NOT yet implemented — tokens use classical FROST/Ristretto255. ML-DSA-65 planned.
 - **Threshold signing algorithm**: real FROST via `frost-ristretto255` 2.2 — works but uses trusted dealer in single process (distributed deployment pending)
 - **Password hashing**: Argon2id with 64 MiB memory hardness — server-side verification (NOT OPAQUE; server receives plaintext password over SHARD channel). `opaque-ke` 4.0 in deps but not used.
-- **Ratchet library**: HKDF-SHA512 chain with secure key erasure — implemented as library, not yet wired into token verification
+- **Session ratcheting**: HKDF-SHA512 chain with secure key erasure — wired into token builder (real tags) and verifier (±3 epoch window, constant-time verification)
 - **Tamper-proof audit**: hash-chained log, any modification detectable — single-node (BFT replication planned)
 - **Key Transparency**: SHA3-256 Merkle tree with inclusion proofs — library only (no signing service yet)
 
