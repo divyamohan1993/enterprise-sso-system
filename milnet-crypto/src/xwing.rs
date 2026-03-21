@@ -93,6 +93,21 @@ impl XWingKeyPair {
     }
 }
 
+/// Zeroize the secret key material on drop.
+///
+/// `StaticSecret` does not implement `Zeroize` from our perspective, so we
+/// overwrite the secret bytes manually via its `to_bytes()` representation.
+/// This is a best-effort defence-in-depth measure; the original `StaticSecret`
+/// storage is owned by `x25519-dalek` and may or may not be zeroized by that
+/// crate's own `Drop` implementation.
+impl Drop for XWingKeyPair {
+    fn drop(&mut self) {
+        // Overwrite the secret by replacing it with a zeroed key.
+        // StaticSecret::from([0u8; 32]) creates a secret with all-zero bytes.
+        self.secret = StaticSecret::from([0u8; 32]);
+    }
+}
+
 /// Core X-Wing combiner function.
 ///
 /// ```text

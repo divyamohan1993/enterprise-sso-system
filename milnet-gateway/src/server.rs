@@ -105,7 +105,7 @@ async fn handle_connection(
     let solution: PuzzleSolution = recv_frame(&mut stream).await?;
 
     // 3. Verify solution
-    if solution.nonce != challenge.nonce {
+    if !milnet_crypto::ct::ct_eq_32(&solution.nonce, &challenge.nonce) {
         let resp = AuthResponse {
             success: false,
             token: None,
@@ -149,11 +149,14 @@ async fn forward_to_orchestrator(
     auth_req: &AuthRequest,
     config: &OrchestratorConfig,
 ) -> Result<AuthResponse, String> {
+    // Gateway sets tier to 0 — the Orchestrator decides the actual tier
+    // based on the authenticated identity (known limitation: should come
+    // from device registry after auth, not be hardcoded anywhere).
     let orch_req = OrchestratorRequest {
         username: auth_req.username.clone(),
         password_hash: auth_req.password_hash,
         dpop_key_hash: [0u8; 32], // Gateway does not have DPoP yet
-        tier: 2,                  // Default to Tier 2 (Operational)
+        tier: 0,                  // Orchestrator decides tier
     };
 
     let req_bytes = postcard::to_allocvec(&orch_req)

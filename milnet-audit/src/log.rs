@@ -75,6 +75,16 @@ pub fn hash_entry(entry: &AuditEntry) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(domain::AUDIT_ENTRY);
     hasher.update(entry.event_id.as_bytes());
+    // Include event_type in the hash to prevent type-confusion attacks
+    let event_type_bytes =
+        postcard::to_allocvec(&entry.event_type).unwrap_or_default();
+    hasher.update(&event_type_bytes);
+    // Include user_ids to bind the entry to specific users
+    for uid in &entry.user_ids {
+        hasher.update(uid.as_bytes());
+    }
+    // Include risk_score to prevent score tampering
+    hasher.update(entry.risk_score.to_le_bytes());
     hasher.update(entry.timestamp.to_le_bytes());
     hasher.update(entry.prev_hash);
     let result = hasher.finalize();

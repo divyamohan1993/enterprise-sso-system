@@ -126,6 +126,9 @@ async fn boot_tss(mut signers: Vec<SignerShare>, group: ThresholdGroup) -> Strin
         .expect("bind TSS listener");
     let addr = listener.local_addr().expect("TSS local_addr").to_string();
 
+    // TSS holds its own copy of the receipt signing key at init (CRIT-1)
+    let tss_receipt_signing_key = RECEIPT_SIGNING_KEY;
+
     tokio::spawn(async move {
         loop {
             let mut transport = match listener.accept().await {
@@ -159,9 +162,9 @@ async fn boot_tss(mut signers: Vec<SignerShare>, group: ThresholdGroup) -> Strin
                 }
             };
 
-            // Validate receipt chain
+            // Validate receipt chain using TSS's own key (not from request)
             let response =
-                match validate_receipt_chain(&request.receipts, &request.receipt_signing_key) {
+                match validate_receipt_chain(&request.receipts, &tss_receipt_signing_key) {
                     Ok(()) => {
                         // Build threshold-signed token
                         match build_token(&request.claims, &mut signers, &group) {

@@ -11,11 +11,19 @@ use tracing::{error, info};
 use crate::messages::{OpaqueRequest, OpaqueResponse};
 use crate::store::CredentialStore;
 
-/// Fixed 64-byte signing key for Phase 2 (HSM-backed in production).
-const RECEIPT_SIGNING_KEY: [u8; 64] = [0x42u8; 64];
+/// Load receipt signing key: generate random key at startup with a warning.
+/// In production, this MUST be loaded from an HSM or secure key store.
+fn load_receipt_signing_key() -> [u8; 64] {
+    eprintln!("WARNING: RECEIPT_SIGNING_KEY generated randomly at startup (NOT FOR PRODUCTION — use HSM)");
+    milnet_crypto::entropy::generate_key_64()
+}
 
-/// HMAC key for SHARD transport authentication.
-const SHARD_HMAC_KEY: [u8; 64] = [0x37u8; 64];
+/// Load SHARD HMAC key: generate random key at startup with a warning.
+/// In production, this MUST be loaded from a secure configuration store.
+fn load_shard_hmac_key() -> [u8; 64] {
+    eprintln!("WARNING: SHARD_HMAC_KEY generated randomly at startup (NOT FOR PRODUCTION — use secure config)");
+    milnet_crypto::entropy::generate_key_64()
+}
 
 /// Default listen address for the OPAQUE service.
 const DEFAULT_ADDR: &str = "127.0.0.1:9005";
@@ -64,7 +72,10 @@ pub fn handle_request(
 
 /// Run the OPAQUE service, listening for SHARD connections.
 pub async fn run(store: CredentialStore) -> Result<(), Box<dyn std::error::Error>> {
-    let listener = ShardListener::bind(DEFAULT_ADDR, ModuleId::Opaque, SHARD_HMAC_KEY).await?;
+    let shard_hmac_key = load_shard_hmac_key();
+    let receipt_signing_key = load_receipt_signing_key();
+
+    let listener = ShardListener::bind(DEFAULT_ADDR, ModuleId::Opaque, shard_hmac_key).await?;
     info!("OPAQUE service listening on {}", DEFAULT_ADDR);
 
     loop {
@@ -76,7 +87,7 @@ pub async fn run(store: CredentialStore) -> Result<(), Box<dyn std::error::Error
         let request: OpaqueRequest =
             postcard::from_bytes(&payload).map_err(|e| format!("deserialize request: {e}"))?;
 
-        let response = handle_request(&store, &request, &RECEIPT_SIGNING_KEY);
+        let response = handle_request(&store, &request, &receipt_signing_key);
 
         let response_bytes =
             postcard::to_allocvec(&response).map_err(|e| format!("serialize response: {e}"))?;

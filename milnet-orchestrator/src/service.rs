@@ -134,7 +134,6 @@ impl OrchestratorService {
         let signing_req = SigningRequest {
             receipts: session.receipt_chain.receipts().to_vec(),
             claims,
-            receipt_signing_key: self.receipt_signing_key,
         };
 
         let signing_bytes = postcard::to_allocvec(&signing_req)

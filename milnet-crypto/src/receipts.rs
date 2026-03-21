@@ -79,7 +79,7 @@ impl ReceiptChain {
         // Verify hash chain linkage
         if self.receipts.is_empty() {
             // First receipt: prev_receipt_hash should be zeros
-            if receipt.prev_receipt_hash != [0u8; 32] {
+            if !crate::ct::ct_eq(&receipt.prev_receipt_hash, &[0u8; 32]) {
                 return Err("first receipt must have zero prev_hash".into());
             }
         } else {
@@ -103,10 +103,28 @@ impl ReceiptChain {
         Ok(())
     }
 
-    /// Validate the complete chain
+    /// Validate the complete chain (structural check only, no signature verification).
     pub fn validate(&self) -> Result<(), String> {
         if self.receipts.is_empty() {
             return Err("empty receipt chain".into());
+        }
+        Ok(())
+    }
+
+    /// Validate the complete chain including signature verification against the
+    /// provided signing key. This is the method that MUST be used for
+    /// security-critical validation.
+    pub fn validate_with_key(&self, signing_key: &[u8; 64]) -> Result<(), String> {
+        if self.receipts.is_empty() {
+            return Err("empty receipt chain".into());
+        }
+        for receipt in &self.receipts {
+            if !verify_receipt_signature(receipt, signing_key) {
+                return Err(format!(
+                    "receipt step {} has invalid signature",
+                    receipt.step_id
+                ));
+            }
         }
         Ok(())
     }
@@ -119,6 +137,13 @@ impl ReceiptChain {
             .as_micros() as i64;
 
         for receipt in &self.receipts {
+            // Reject future-timestamped receipts
+            if receipt.timestamp > now {
+                return Err(format!(
+                    "receipt step {} has future timestamp",
+                    receipt.step_id
+                ));
+            }
             let age_us = now - receipt.timestamp;
             let ttl_us = receipt.ttl_seconds as i64 * 1_000_000;
             if age_us > ttl_us {

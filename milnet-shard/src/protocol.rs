@@ -136,4 +136,21 @@ impl ShardProtocol {
 
         Ok((msg.sender_module, msg.payload))
     }
+
+    /// Restore previously persisted per-sender sequence numbers.
+    ///
+    /// Callers MUST persist sequence numbers (via [`get_sequences`]) across
+    /// restarts and restore them here to maintain replay protection continuity.
+    pub fn set_initial_sequences(&mut self, sequences: HashMap<ModuleId, u64>) {
+        self.recv_sequences = sequences;
+    }
+
+    /// Return the current per-sender receive sequence numbers for persistence.
+    ///
+    /// Callers MUST persist these values and restore them via
+    /// [`set_initial_sequences`] after a restart to avoid replay attacks
+    /// during the window between restarts.
+    pub fn get_sequences(&self) -> &HashMap<ModuleId, u64> {
+        &self.recv_sequences
+    }
 }

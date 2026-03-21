@@ -1,5 +1,6 @@
 use milnet_common::error::MilnetError;
 use milnet_common::types::Receipt;
+use milnet_crypto::ct::ct_eq;
 use milnet_crypto::receipts::{hash_receipt, verify_receipt_signature};
 
 /// Validate a receipt chain for submission to the TSS.
@@ -25,16 +26,16 @@ pub fn validate_receipt_chain(
     let dpop_hash = &receipts[0].dpop_key_hash;
 
     for (i, receipt) in receipts.iter().enumerate() {
-        // Check session ID consistency
-        if receipt.ceremony_session_id != *session_id {
+        // Check session ID consistency (constant-time)
+        if !ct_eq(&receipt.ceremony_session_id, session_id) {
             return Err(MilnetError::ReceiptChain(format!(
                 "receipt {} has mismatched ceremony_session_id",
                 i
             )));
         }
 
-        // Check dpop_key_hash consistency
-        if receipt.dpop_key_hash != *dpop_hash {
+        // Check dpop_key_hash consistency (constant-time)
+        if !ct_eq(&receipt.dpop_key_hash, dpop_hash) {
             return Err(MilnetError::ReceiptChain(format!(
                 "receipt {} has mismatched dpop_key_hash",
                 i
@@ -43,14 +44,14 @@ pub fn validate_receipt_chain(
 
         // Check hash chain linkage
         if i == 0 {
-            if receipt.prev_receipt_hash != [0u8; 32] {
+            if !ct_eq(&receipt.prev_receipt_hash, &[0u8; 32]) {
                 return Err(MilnetError::ReceiptChain(
                     "first receipt must have zero prev_receipt_hash".into(),
                 ));
             }
         } else {
             let expected_hash = hash_receipt(&receipts[i - 1]);
-            if receipt.prev_receipt_hash != expected_hash {
+            if !ct_eq(&receipt.prev_receipt_hash, &expected_hash) {
                 return Err(MilnetError::ReceiptChain(format!(
                     "receipt {} has invalid prev_receipt_hash",
                     i
