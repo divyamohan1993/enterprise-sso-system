@@ -1,9 +1,14 @@
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, Request, State};
+use axum::http::StatusCode;
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
+use tower_http::services::ServeDir;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -11,14 +16,104 @@ use uuid::Uuid;
 // ---------------------------------------------------------------------------
 
 pub struct AppState {
+    pub db: Mutex<Connection>,
     pub credential_store: RwLock<opaque::store::CredentialStore>,
     pub device_registry: RwLock<risk::tiers::DeviceRegistry>,
     pub audit_log: RwLock<audit::log::AuditLog>,
     pub kt_tree: RwLock<kt::merkle::MerkleTree>,
     pub portals: RwLock<Vec<Portal>>,
+    pub oauth_clients: RwLock<sso_protocol::clients::ClientRegistry>,
+    pub auth_codes: RwLock<sso_protocol::authorize::AuthorizationStore>,
+    pub oidc_signing_key: [u8; 64],
+    pub admin_api_key: String,
+    pub fido_store: RwLock<fido::registration::CredentialStore>,
 }
 
 // ---------------------------------------------------------------------------
+// Auth middleware
+// ---------------------------------------------------------------------------
+
+/// Bearer token authentication middleware.
+///
+/// Skips auth for health, discovery, public OAuth endpoints, and static assets.
+/// For all other routes, requires a valid Bearer token that matches either:
+/// - the admin API key (from ADMIN_API_KEY env var), or
+/// - a user auth token issued by /api/auth/login.
+async fn auth_middleware(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    // Skip auth for health, discovery, and public endpoints
+    let path = request.uri().path();
+    if path == "/api/health"
+        || path == "/.well-known/openid-configuration"
+        || path == "/oauth/authorize"
+        || path == "/oauth/token"
+        || path.starts_with("/api/auth/")
+        || path == "/"
+        || path.ends_with(".html")
+        || path.ends_with(".css")
+        || path.ends_with(".js")
+    {
+        return Ok(next.run(request).await);
+    }
+
+    // Check Bearer token
+    let auth_header = request
+        .headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok());
+
+    match auth_header {
+        Some(header) if header.starts_with("Bearer ") => {
+            let token = &header[7..];
+            // Accept the admin API key
+            if token == state.admin_api_key {
+                return Ok(next.run(request).await);
+            }
+            // Accept a valid user auth token (user_id:timestamp:hmac)
+            if verify_user_token(token) {
+                return Ok(next.run(request).await);
+            }
+            Err(StatusCode::UNAUTHORIZED)
+        }
+        _ => Err(StatusCode::UNAUTHORIZED),
+    }
+}
+
+/// Verify an HMAC-based user token (same logic as auth_verify handler).
+fn verify_user_token(token: &str) -> bool {
+    let parts: Vec<&str> = token.splitn(3, ':').collect();
+    if parts.len() != 3 {
+        return false;
+    }
+    if Uuid::parse_str(parts[0]).is_err() {
+        return false;
+    }
+
+    let payload = format!("{}:{}", parts[0], parts[1]);
+
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+
+    let mut mac =
+        HmacSha256::new_from_slice(b"MILNET-SSO-v1-ADMIN-TOKEN").expect("HMAC key");
+    mac.update(payload.as_bytes());
+    let expected = hex(&mac.finalize().into_bytes());
+
+    expected == parts[2]
+}
+
+// ---------------------------------------------------------------------------
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
 // Domain types
 // ---------------------------------------------------------------------------
 
@@ -167,8 +262,20 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         // Key Transparency
         .route("/api/kt/root", get(get_kt_root))
         .route("/api/kt/proof/{index}", get(get_kt_proof))
+        // OIDC / OAuth2
+        .route("/.well-known/openid-configuration", get(oidc_discovery))
+        .route("/oauth/authorize", get(oauth_authorize))
+        .route("/oauth/token", post(oauth_token))
+        .route("/oauth/userinfo", get(oauth_userinfo))
+        // FIDO2/WebAuthn
+        .route("/api/fido/register/begin", post(fido_register_begin))
+        .route("/api/fido/register/complete", post(fido_register_complete))
+        .route("/api/fido/authenticate/begin", post(fido_authenticate_begin))
+        .route("/api/fido/authenticate/complete", post(fido_authenticate_complete))
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state)
         .layer(tower_http::cors::CorsLayer::permissive())
+        .fallback_service(ServeDir::new("frontend").append_index_html_on_directories(true))
 }
 
 // ---------------------------------------------------------------------------
@@ -180,17 +287,21 @@ async fn health_check() -> Json<serde_json::Value> {
 }
 
 async fn get_status(State(state): State<Arc<AppState>>) -> Json<SystemStatus> {
-    let store = state.credential_store.read().await;
-    let registry = state.device_registry.read().await;
-    let portals = state.portals.read().await;
-    let audit = state.audit_log.read().await;
+    let (users_registered, devices_enrolled, portals_active, audit_entries) = {
+        let db = state.db.lock().unwrap();
+        let u: usize = db.query_row("SELECT COUNT(*) FROM users WHERE is_active = 1", [], |row| row.get(0)).unwrap_or(0);
+        let d: usize = db.query_row("SELECT COUNT(*) FROM devices WHERE is_active = 1", [], |row| row.get(0)).unwrap_or(0);
+        let p: usize = db.query_row("SELECT COUNT(*) FROM portals WHERE is_active = 1", [], |row| row.get(0)).unwrap_or(0);
+        let a: usize = db.query_row("SELECT COUNT(*) FROM audit_log", [], |row| row.get(0)).unwrap_or(0);
+        (u, d, p, a)
+    };
     let kt = state.kt_tree.read().await;
     Json(SystemStatus {
         version: "0.1.0".to_string(),
-        users_registered: store.user_count(),
-        devices_enrolled: registry.device_count(),
-        portals_active: portals.iter().filter(|p| p.is_active).count(),
-        audit_entries: audit.len(),
+        users_registered,
+        devices_enrolled,
+        portals_active,
+        audit_entries,
         kt_operations: kt.len(),
     })
 }
@@ -206,15 +317,40 @@ async fn register_user(
     let mut store = state.credential_store.write().await;
     let user_id = store.register_with_password(&req.username, req.password.as_bytes());
 
-    // Log to audit
+    // Persist user to SQLite
+    {
+        let db = state.db.lock().unwrap();
+        let _ = db.execute(
+            "INSERT OR REPLACE INTO users (id, username, created_at, is_active) VALUES (?1, ?2, ?3, 1)",
+            params![user_id.to_string(), &req.username, now_secs()],
+        );
+    }
+
+    // Log to audit (in-memory chain + SQLite)
     let mut audit = state.audit_log.write().await;
-    audit.append(
+    let entry = audit.append(
         common::types::AuditEventType::CredentialRegistered,
         vec![user_id],
         vec![],
         0.0,
         vec![],
     );
+
+    {
+        let db = state.db.lock().unwrap();
+        let user_ids_json = serde_json::to_string(&entry.user_ids).unwrap_or_default();
+        let _ = db.execute(
+            "INSERT INTO audit_log (id, event_type, user_ids, timestamp, prev_hash, signature) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                entry.event_id.to_string(),
+                format!("{:?}", entry.event_type),
+                user_ids_json,
+                entry.timestamp,
+                entry.prev_hash.to_vec(),
+                entry.signature.clone(),
+            ],
+        );
+    }
 
     // Log to KT
     let mut kt = state.kt_tree.write().await;
@@ -231,8 +367,16 @@ async fn register_user(
 }
 
 async fn list_users(State(state): State<Arc<AppState>>) -> Json<Vec<String>> {
-    let store = state.credential_store.read().await;
-    Json(store.usernames())
+    let db = state.db.lock().unwrap();
+    let mut stmt = db
+        .prepare("SELECT username FROM users WHERE is_active = 1")
+        .unwrap();
+    let names: Vec<String> = stmt
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
+    Json(names)
 }
 
 // ---------------------------------------------------------------------------
@@ -243,49 +387,63 @@ async fn register_portal(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RegisterPortalRequest>,
 ) -> Json<PortalResponse> {
-    let portal = Portal {
-        id: Uuid::new_v4(),
+    let portal_id = Uuid::new_v4();
+
+    let db = state.db.lock().unwrap();
+    let _ = db.execute(
+        "INSERT INTO portals (id, name, callback_url, required_tier, required_scope, is_active, created_at) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)",
+        params![
+            portal_id.to_string(),
+            &req.name,
+            &req.callback_url,
+            req.required_tier as i64,
+            req.required_scope as i64,
+            now_secs(),
+        ],
+    );
+
+    Json(PortalResponse {
+        id: portal_id,
         name: req.name,
         callback_url: req.callback_url,
         required_tier: req.required_tier,
         required_scope: req.required_scope,
         is_active: true,
-    };
-    let resp = PortalResponse {
-        id: portal.id,
-        name: portal.name.clone(),
-        callback_url: portal.callback_url.clone(),
-        required_tier: portal.required_tier,
-        required_scope: portal.required_scope,
-        is_active: portal.is_active,
-    };
-    state.portals.write().await.push(portal);
-    Json(resp)
+    })
 }
 
 async fn list_portals(State(state): State<Arc<AppState>>) -> Json<Vec<PortalResponse>> {
-    let portals = state.portals.read().await;
-    Json(
-        portals
-            .iter()
-            .map(|p| PortalResponse {
-                id: p.id,
-                name: p.name.clone(),
-                callback_url: p.callback_url.clone(),
-                required_tier: p.required_tier,
-                required_scope: p.required_scope,
-                is_active: p.is_active,
+    let db = state.db.lock().unwrap();
+    let mut stmt = db
+        .prepare("SELECT id, name, callback_url, required_tier, required_scope, is_active FROM portals WHERE is_active = 1")
+        .unwrap();
+    let portals: Vec<PortalResponse> = stmt
+        .query_map([], |row| {
+            let id_str: String = row.get(0)?;
+            Ok(PortalResponse {
+                id: Uuid::parse_str(&id_str).unwrap_or(Uuid::nil()),
+                name: row.get(1)?,
+                callback_url: row.get(2)?,
+                required_tier: row.get::<_, i64>(3)? as u8,
+                required_scope: row.get::<_, i64>(4)? as u32,
+                is_active: row.get::<_, i64>(5)? != 0,
             })
-            .collect(),
-    )
+        })
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
+    Json(portals)
 }
 
 async fn delete_portal(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
 ) -> Json<serde_json::Value> {
-    let mut portals = state.portals.write().await;
-    portals.retain(|p| p.id != id);
+    let db = state.db.lock().unwrap();
+    let _ = db.execute(
+        "UPDATE portals SET is_active = 0 WHERE id = ?1",
+        params![id.to_string()],
+    );
     Json(serde_json::json!({"deleted": true}))
 }
 
@@ -293,62 +451,54 @@ async fn delete_portal(
 // Handlers — Devices
 // ---------------------------------------------------------------------------
 
-fn tier_from_u8(v: u8) -> common::types::DeviceTier {
-    match v {
-        1 => common::types::DeviceTier::Sovereign,
-        2 => common::types::DeviceTier::Operational,
-        3 => common::types::DeviceTier::Sensor,
-        _ => common::types::DeviceTier::Emergency,
-    }
-}
-
-fn parse_hex_32(s: &str) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    let bytes: Vec<u8> = (0..s.len())
-        .step_by(2)
-        .filter_map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
-        .collect();
-    let len = bytes.len().min(32);
-    out[..len].copy_from_slice(&bytes[..len]);
-    out
-}
-
 async fn enroll_device(
     State(state): State<Arc<AppState>>,
     Json(req): Json<EnrollDeviceRequest>,
 ) -> Json<DeviceResponse> {
     let device_id = Uuid::new_v4();
-    let enrollment = risk::tiers::DeviceEnrollment {
-        device_id,
-        tier: tier_from_u8(req.tier),
-        attestation_hash: parse_hex_32(&req.attestation_hash),
-        enrolled_by: req.enrolled_by,
-        is_active: true,
-    };
-    let resp = DeviceResponse {
+
+    {
+        let db = state.db.lock().unwrap();
+        let _ = db.execute(
+            "INSERT INTO devices (id, tier, attestation_hash, enrolled_by, is_active, created_at) VALUES (?1, ?2, ?3, ?4, 1, ?5)",
+            params![
+                device_id.to_string(),
+                req.tier as i64,
+                &req.attestation_hash,
+                req.enrolled_by.to_string(),
+                now_secs(),
+            ],
+        );
+    }
+
+    Json(DeviceResponse {
         device_id,
         tier: req.tier,
         enrolled_by: req.enrolled_by,
         is_active: true,
-    };
-    state.device_registry.write().await.enroll(enrollment);
-    Json(resp)
+    })
 }
 
 async fn list_devices(State(state): State<Arc<AppState>>) -> Json<Vec<DeviceResponse>> {
-    let registry = state.device_registry.read().await;
-    Json(
-        registry
-            .all_devices()
-            .iter()
-            .map(|d| DeviceResponse {
-                device_id: d.device_id,
-                tier: d.tier as u8,
-                enrolled_by: d.enrolled_by,
-                is_active: d.is_active,
+    let db = state.db.lock().unwrap();
+    let mut stmt = db
+        .prepare("SELECT id, tier, enrolled_by, is_active FROM devices WHERE is_active = 1")
+        .unwrap();
+    let devices: Vec<DeviceResponse> = stmt
+        .query_map([], |row| {
+            let id_str: String = row.get(0)?;
+            let enrolled_str: String = row.get(2)?;
+            Ok(DeviceResponse {
+                device_id: Uuid::parse_str(&id_str).unwrap_or(Uuid::nil()),
+                tier: row.get::<_, i64>(1)? as u8,
+                enrolled_by: Uuid::parse_str(&enrolled_str).unwrap_or(Uuid::nil()),
+                is_active: row.get::<_, i64>(3)? != 0,
             })
-            .collect(),
-    )
+        })
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
+    Json(devices)
 }
 
 // ---------------------------------------------------------------------------
@@ -356,21 +506,28 @@ async fn list_devices(State(state): State<Arc<AppState>>) -> Json<Vec<DeviceResp
 // ---------------------------------------------------------------------------
 
 async fn get_audit_log(State(state): State<Arc<AppState>>) -> Json<Vec<AuditEntryResponse>> {
-    let audit = state.audit_log.read().await;
-    Json(
-        audit
-            .entries()
-            .iter()
-            .map(|e| AuditEntryResponse {
-                event_id: e.event_id,
-                event_type: format!("{:?}", e.event_type),
-                user_ids: e.user_ids.clone(),
-                device_ids: e.device_ids.clone(),
-                risk_score: e.risk_score,
-                timestamp: e.timestamp,
+    let db = state.db.lock().unwrap();
+    let mut stmt = db
+        .prepare("SELECT id, event_type, user_ids, timestamp FROM audit_log ORDER BY timestamp ASC")
+        .unwrap();
+    let entries: Vec<AuditEntryResponse> = stmt
+        .query_map([], |row| {
+            let id_str: String = row.get(0)?;
+            let user_ids_json: String = row.get::<_, String>(2).unwrap_or_else(|_| "[]".into());
+            let user_ids: Vec<Uuid> = serde_json::from_str(&user_ids_json).unwrap_or_default();
+            Ok(AuditEntryResponse {
+                event_id: Uuid::parse_str(&id_str).unwrap_or(Uuid::nil()),
+                event_type: row.get(1)?,
+                user_ids,
+                device_ids: vec![],
+                risk_score: 0.0,
+                timestamp: row.get(3)?,
             })
-            .collect(),
-    )
+        })
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
+    Json(entries)
 }
 
 async fn verify_audit_chain(
@@ -434,6 +591,22 @@ async fn auth_login(
             mac.update(payload.as_bytes());
             let sig = hex(&mac.finalize().into_bytes());
             let token = format!("{payload}:{sig}");
+
+            // Persist session to SQLite
+            {
+                let db = state.db.lock().unwrap();
+                let session_id = Uuid::new_v4();
+                let expires_at = now as i64 + 3600;
+                let _ = db.execute(
+                    "INSERT INTO sessions (id, user_id, created_at, expires_at, is_active) VALUES (?1, ?2, ?3, ?4, 1)",
+                    params![
+                        session_id.to_string(),
+                        user_id.to_string(),
+                        now as i64,
+                        expires_at,
+                    ],
+                );
+            }
 
             Json(LoginResponse {
                 success: true,
@@ -529,5 +702,317 @@ async fn get_kt_proof(
             Json(serde_json::to_value(resp).unwrap())
         }
         None => Json(serde_json::json!({"error": "index out of range"})),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Handlers — OIDC / OAuth2
+// ---------------------------------------------------------------------------
+
+async fn oidc_discovery() -> Json<sso_protocol::discovery::OpenIdConfiguration> {
+    // In production the issuer would come from configuration.
+    let issuer = "https://sso.milnet.local";
+    Json(sso_protocol::discovery::OpenIdConfiguration::new(issuer))
+}
+
+#[derive(Deserialize)]
+struct AuthorizeParams {
+    client_id: String,
+    redirect_uri: String,
+    response_type: String,
+    scope: String,
+    state: String,
+    code_challenge: Option<String>,
+    code_challenge_method: Option<String>,
+    nonce: Option<String>,
+}
+
+async fn oauth_authorize(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<AuthorizeParams>,
+) -> Json<serde_json::Value> {
+    if params.response_type != "code" {
+        return Json(serde_json::json!({"error": "unsupported_response_type"}));
+    }
+
+    // Validate client
+    let clients = state.oauth_clients.read().await;
+    let client = match clients.get(&params.client_id) {
+        Some(c) => c,
+        None => return Json(serde_json::json!({"error": "invalid_client"})),
+    };
+
+    if !client.redirect_uris.contains(&params.redirect_uri) {
+        return Json(serde_json::json!({"error": "invalid_redirect_uri"}));
+    }
+    drop(clients);
+
+    // In a real deployment the user would authenticate interactively here.
+    // For the API we use a placeholder user ID. Callers that have already
+    // authenticated via /api/auth/login can supply the user_id separately.
+    let user_id = Uuid::nil();
+
+    let mut codes = state.auth_codes.write().await;
+    let code = codes.create_code(
+        &params.client_id,
+        &params.redirect_uri,
+        user_id,
+        &params.scope,
+        params.code_challenge,
+        params.nonce,
+    );
+
+    Json(serde_json::json!({
+        "redirect_uri": format!("{}?code={}&state={}", params.redirect_uri, code, params.state),
+        "code": code,
+        "state": params.state,
+    }))
+}
+
+#[derive(Deserialize)]
+struct TokenRequest {
+    grant_type: String,
+    code: String,
+    redirect_uri: String,
+    client_id: String,
+    client_secret: String,
+    code_verifier: Option<String>,
+}
+
+async fn oauth_token(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<TokenRequest>,
+) -> Json<serde_json::Value> {
+    if req.grant_type != "authorization_code" {
+        return Json(serde_json::json!({"error": "unsupported_grant_type"}));
+    }
+
+    // Validate client credentials
+    let clients = state.oauth_clients.read().await;
+    if clients.validate(&req.client_id, &req.client_secret).is_none() {
+        return Json(serde_json::json!({"error": "invalid_client"}));
+    }
+    drop(clients);
+
+    // Consume authorization code
+    let mut codes = state.auth_codes.write().await;
+    let auth_code = match codes.consume_code(&req.code) {
+        Some(c) => c,
+        None => return Json(serde_json::json!({"error": "invalid_grant"})),
+    };
+    drop(codes);
+
+    // Verify redirect_uri matches
+    if auth_code.redirect_uri != req.redirect_uri {
+        return Json(serde_json::json!({"error": "invalid_grant", "description": "redirect_uri mismatch"}));
+    }
+
+    // Verify PKCE if challenge was present
+    if let Some(ref challenge) = auth_code.code_challenge {
+        match &req.code_verifier {
+            Some(verifier) => {
+                if !sso_protocol::pkce::verify_pkce(verifier, challenge) {
+                    return Json(serde_json::json!({"error": "invalid_grant", "description": "PKCE verification failed"}));
+                }
+            }
+            None => {
+                return Json(serde_json::json!({"error": "invalid_grant", "description": "code_verifier required"}));
+            }
+        }
+    }
+
+    // Create tokens
+    let id_token = sso_protocol::tokens::create_id_token(
+        "https://sso.milnet.local",
+        &auth_code.user_id,
+        &req.client_id,
+        auth_code.nonce,
+        &state.oidc_signing_key,
+    );
+
+    let access_token = Uuid::new_v4().to_string();
+
+    let response = sso_protocol::tokens::TokenResponse {
+        access_token,
+        token_type: "Bearer".into(),
+        expires_in: 3600,
+        id_token,
+        scope: auth_code.scope,
+    };
+
+    Json(serde_json::to_value(response).unwrap())
+}
+
+async fn oauth_userinfo() -> Json<sso_protocol::userinfo::UserInfo> {
+    // In production this would extract the access token from the Authorization
+    // header, look up the associated user, and return real profile data.
+    Json(sso_protocol::userinfo::UserInfo {
+        sub: Uuid::nil().to_string(),
+        name: None,
+        preferred_username: None,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// FIDO2/WebAuthn request / response types
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct FidoRegisterBeginRequest {
+    pub user_id: Uuid,
+    pub username: String,
+    #[serde(default)]
+    pub prefer_platform: bool,
+}
+
+#[derive(Serialize)]
+pub struct FidoRegisterBeginResponse {
+    pub options: fido::types::PublicKeyCredentialCreationOptions,
+}
+
+#[derive(Deserialize)]
+pub struct FidoRegisterCompleteRequest {
+    pub user_id: Uuid,
+    pub credential_id: Vec<u8>,
+    pub public_key: Vec<u8>,
+    pub attestation_object: Vec<u8>,
+    pub client_data: Vec<u8>,
+    #[serde(default = "default_authenticator_type")]
+    pub authenticator_type: String,
+}
+
+fn default_authenticator_type() -> String {
+    "cross-platform".to_string()
+}
+
+#[derive(Serialize)]
+pub struct FidoRegisterCompleteResponse {
+    pub success: bool,
+    pub credential_id: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+pub struct FidoAuthBeginRequest {
+    pub user_id: Uuid,
+}
+
+#[derive(Serialize)]
+pub struct FidoAuthBeginResponse {
+    pub options: fido::types::PublicKeyCredentialRequestOptions,
+}
+
+#[derive(Deserialize)]
+pub struct FidoAuthCompleteRequest {
+    pub credential_id: Vec<u8>,
+    pub authenticator_data: Vec<u8>,
+    pub client_data: Vec<u8>,
+    pub signature: Vec<u8>,
+}
+
+#[derive(Serialize)]
+pub struct FidoAuthCompleteResponse {
+    pub success: bool,
+    pub user_id: Option<Uuid>,
+    pub error: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Handlers — FIDO2/WebAuthn
+// ---------------------------------------------------------------------------
+
+async fn fido_register_begin(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<FidoRegisterBeginRequest>,
+) -> Json<FidoRegisterBeginResponse> {
+    let options = fido::registration::create_registration_options(
+        "MILNET SSO",
+        "sso.milnet.local",
+        &req.user_id,
+        &req.username,
+        req.prefer_platform,
+    );
+
+    // Store the challenge so we can verify it on completion
+    let mut fido_store = state.fido_store.write().await;
+    fido_store.store_challenge(&options.challenge, req.user_id);
+
+    Json(FidoRegisterBeginResponse { options })
+}
+
+async fn fido_register_complete(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<FidoRegisterCompleteRequest>,
+) -> Json<FidoRegisterCompleteResponse> {
+    let cred = fido::types::StoredCredential {
+        credential_id: req.credential_id.clone(),
+        public_key: req.public_key,
+        user_id: req.user_id,
+        sign_count: 0,
+        authenticator_type: req.authenticator_type,
+    };
+
+    let mut fido_store = state.fido_store.write().await;
+    fido_store.store_credential(cred);
+
+    // Log to audit
+    let mut audit = state.audit_log.write().await;
+    audit.append(
+        common::types::AuditEventType::CredentialRegistered,
+        vec![req.user_id],
+        vec![],
+        0.0,
+        vec![],
+    );
+
+    Json(FidoRegisterCompleteResponse {
+        success: true,
+        credential_id: req.credential_id,
+    })
+}
+
+async fn fido_authenticate_begin(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<FidoAuthBeginRequest>,
+) -> Json<serde_json::Value> {
+    let fido_store = state.fido_store.read().await;
+    let creds = fido_store.get_user_credentials(&req.user_id);
+
+    if creds.is_empty() {
+        return Json(serde_json::json!({
+            "error": "no credentials registered for this user"
+        }));
+    }
+
+    let options = fido::authentication::create_authentication_options(
+        "sso.milnet.local",
+        &creds,
+    );
+
+    Json(serde_json::to_value(FidoAuthBeginResponse { options }).unwrap())
+}
+
+async fn fido_authenticate_complete(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<FidoAuthCompleteRequest>,
+) -> Json<FidoAuthCompleteResponse> {
+    let fido_store = state.fido_store.read().await;
+
+    // Look up the credential
+    match fido_store.get_credential(&req.credential_id) {
+        Some(cred) => {
+            // In a full implementation we would verify the signature against
+            // the stored public key and check the sign count. For now, we
+            // confirm the credential exists and return the associated user.
+            Json(FidoAuthCompleteResponse {
+                success: true,
+                user_id: Some(cred.user_id),
+                error: None,
+            })
+        }
+        None => Json(FidoAuthCompleteResponse {
+            success: false,
+            user_id: None,
+            error: Some("unknown credential".into()),
+        }),
     }
 }

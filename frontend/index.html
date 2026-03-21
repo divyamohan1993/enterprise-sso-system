@@ -336,7 +336,8 @@ function clearTerm(termId) {
 async function api(path, opts) {
   opts = opts || {};
   var headers = Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {});
-  if (authToken) headers['Authorization'] = 'Bearer ' + authToken;
+  var token = authToken || localStorage.getItem('authToken') || localStorage.getItem('adminKey');
+  if (token) headers['Authorization'] = 'Bearer ' + token;
   var resp = await fetch('/api' + path, Object.assign({}, opts, { headers: headers }));
   var body;
   try { body = await resp.json(); } catch(e) { body = {}; }
@@ -544,6 +545,7 @@ async function doLogin() {
     });
 
     authToken = data.token || data.access_token;
+    localStorage.setItem('authToken', authToken);
     if (!authToken) throw new Error('No token in response');
 
     tokenClaims = decodeJwtPayload(authToken);
@@ -564,6 +566,8 @@ async function doLogin() {
 
 function doLogout() {
   authToken = null;
+  localStorage.removeItem('authToken');
+  localStorage.removeItem('adminKey');
   tokenClaims = null;
   $('mainNav').style.display = 'none';
   $('userInfo').style.display = 'none';
