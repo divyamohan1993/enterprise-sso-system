@@ -529,9 +529,18 @@ name = "milnet-orchestrator"
 version = "0.1.0"
 dependencies = [
  "milnet-common",
+ "milnet-crypto",
+ "milnet-gateway",
+ "milnet-opaque",
  "milnet-shard",
+ "milnet-tss",
+ "postcard",
+ "serde",
+ "sha2",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

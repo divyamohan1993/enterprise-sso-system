@@ -5,6 +5,15 @@ edition.workspace = true
 
 [dependencies]
 milnet-common = { path = "../milnet-common" }
+milnet-crypto = { path = "../milnet-crypto" }
 milnet-shard = { path = "../milnet-shard" }
+milnet-opaque = { path = "../milnet-opaque" }
+milnet-tss = { path = "../milnet-tss" }
+milnet-gateway = { path = "../milnet-gateway" }
+serde.workspace = true
+postcard.workspace = true
+uuid.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
