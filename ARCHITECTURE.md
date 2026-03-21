@@ -2,11 +2,13 @@
 
 ## System Overview
 
-The world's first SSO system combining threshold cryptography, OPAQUE password authentication, ratcheting sessions, key transparency, microkernel process isolation, and post-quantum cryptography. No publicly documented system — commercial, government, or academic — has achieved this combination.
+An SSO system architected to combine threshold cryptography, post-quantum key exchange, forward-secret sessions, key transparency, and defense-in-depth process isolation. The architecture specification targets a threat model no publicly documented system has addressed at this combination level.
 
-**Threat Model:** Total compromise of host, network, clients, database, and individual processes. Nation-state adversary with raw internet access, no firewall. DDoS + APTs simultaneously. Hundreds of thousands of users under full mobilization.
+**Threat Model (Spec):** Total compromise of host, network, clients, database, and individual processes. Nation-state adversary with raw internet access, no firewall.
 
-**Red Team Coverage:** 169 attack vectors identified across 6 rounds of nation-state adversarial analysis. All mitigated.
+**Implementation Status (v0.1.0):** Core cryptographic foundations implemented. End-to-end auth flow working. Several spec-level security properties are library-only and not yet wired into the runtime (see Honest Assessment in README).
+
+**Red Team Coverage:** 169 attack vectors identified across 6 rounds of adversarial analysis at the spec/architecture level. Code-level red team found 11 additional vulnerabilities (4 critical patched, remainder documented as known limitations).
 
 ---
 
@@ -65,7 +67,7 @@ Verify       Ratchet  Proof    Tree
 | `risk` | Binary | Risk scoring engine + device tier enforcement | 11 |
 | `e2e` | Test | End-to-end ceremony + security test suite | 13 |
 | `formal-model` | TLA+ | State machine with safety/liveness verification | — |
-| **Total** | | | **133** |
+| **Total** | | | **190+** |
 
 ## Security Properties
 
@@ -227,7 +229,7 @@ Client                Gateway        Orchestrator      OPAQUE         TSS
 # Build entire workspace
 cargo build --workspace
 
-# Run all 133 tests
+# Run all tests
 cargo test --workspace
 
 # Lint (zero warnings required)

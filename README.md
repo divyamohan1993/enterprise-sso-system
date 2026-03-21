@@ -2,11 +2,29 @@
 
 **Research-Grade Military Network Authentication**
 
-The world's first SSO system combining threshold cryptography, OPAQUE password authentication, ratcheting sessions, key transparency, microkernel process isolation, and post-quantum cryptography in a single architecture.
+An SSO system architected to combine threshold cryptography, post-quantum key exchange, forward-secret sessions, key transparency, and defense-in-depth process isolation. The architecture specification is complete; the implementation delivers the cryptographic foundations with known limitations documented below.
 
 ## Status
 
-**v0.1.0** — Core implementation complete. 242 tests passing. Zero CVEs.
+**v0.1.0** — Core cryptographic implementation. 190+ tests passing. Zero CVEs.
+
+### Honest Assessment (v0.1.0)
+
+| Feature | Spec Status | Code Status |
+|---------|------------|-------------|
+| FROST threshold signing | Specified | Algorithm works (trusted dealer, single process — NOT distributed across 5 nodes yet) |
+| ML-KEM-768 post-quantum KEM | Specified | Fully implemented (real ml-kem crate, real encap/decap) |
+| Password auth | OPAQUE specified | Argon2id server-side (NOT OPAQUE — server sees password) |
+| Session ratcheting | Specified | Library works (NOT wired into token verification path yet) |
+| Key Transparency | Specified | Merkle tree works (NOT signed tree heads, no service) |
+| Audit log | Specified | Hash chain works (NOT BFT replicated, no service) |
+| Process isolation | 9 processes specified | 3 processes communicate (gateway, orchestrator, opaque). TSS holds all shares in one process. |
+| Token verification | O(1) specified | Signature verification works. Ratchet tag NOT checked. DPoP NOT enforced. |
+| Risk scoring | Specified | Algorithm works (NOT wired as a service) |
+
+**What IS real right now:** ML-KEM-768 post-quantum KEM, FROST algorithm (not distributed), Argon2id password hashing, receipt chain cryptography, SHARD IPC protocol, hash-chained audit, Merkle tree proofs, end-to-end auth flow (gateway → orchestrator → opaque → tss → verifier).
+
+**What is NOT real yet:** Distributed threshold signing across separate processes, OPAQUE protocol (RFC 9807), ratchet integration in verification, DPoP channel binding, BFT audit replication, TLS transport, FIDO2 support.
 
 ## Quick Start
 
@@ -40,10 +58,10 @@ Internet → Gateway (puzzle) → Orchestrator → OPAQUE (password)
 |--------|---------|---------------|
 | `gateway` | DDoS filter, puzzle challenge, TLS termination | No |
 | `orchestrator` | Ceremony state machine, routes auth steps | No |
-| `tss` | FROST 3-of-5 threshold token signing | 1 share only |
-| `verifier` | O(1) token verification (~72us) | Public keys only |
-| `opaque` | Argon2id password auth + receipt issuance | OPRF share only |
-| `ratchet` | Forward-secret session management | Ephemeral keys |
+| `tss` | FROST threshold token signing | All shares (single process; distributed deployment pending) |
+| `verifier` | O(1) token verification (no benchmark yet) | Public keys only |
+| `opaque` | Argon2id password auth + receipt issuance (server-side, not OPAQUE PAKE yet) | Password hashes |
+| `ratchet` | Forward-secret session management (library, not yet in verification path) | Ephemeral keys |
 | `kt` | SHA3-256 Merkle tree for credential transparency | Append-only log |
 | `risk` | Continuous risk scoring + device tier enforcement | Baselines |
 | `audit` | Hash-chained tamper-proof event log | Event log |
@@ -130,10 +148,11 @@ The system uses **multiple layers** to verify client legitimacy:
 | **Risk scoring** | Behavior matches baseline | 6 signals, step-up on anomaly |
 
 Even if the client device is fully compromised:
-- The **token expires** in 5-15 minutes
-- The **ratchet advances** — stolen tokens die within 90 seconds
-- The **threshold signature** can't be forged without 3 TSS nodes
+- The **token expires** in 5-15 minutes (enforced by verifier)
+- The **threshold signature** can't be forged without the signing key (currently single-process; distributed across 5 nodes when deployed)
 - The **audit log** records everything for forensic analysis
+
+**Not yet enforced in v0.1.0:** Ratchet-based token expiry (library exists, not wired to verifier), DPoP channel binding (field exists, not checked), distributed threshold signing across separate processes.
 
 ### 5. Admin Operations
 
@@ -170,15 +189,15 @@ assert!(auth.requires_two_person); // Must have 2 people from different departme
 
 ## Security Properties
 
-- **242 tests** including 37 nation-state attack simulations
-- **169 attack vectors** analyzed across 6 red team rounds
-- **Zero CVEs** in dependency tree
-- **Post-quantum**: real ML-KEM-768 (FIPS 203) via `ml-kem` crate
-- **Threshold signing**: real FROST 3-of-5 via `frost-ristretto255`
-- **Password security**: Argon2id with 64 MiB memory hardness
-- **Forward secrecy**: HKDF-SHA512 ratchet, old keys securely erased
-- **Tamper-proof audit**: hash-chained log, any modification detectable
-- **Key Transparency**: SHA3-256 Merkle tree with inclusion proofs
+- **190+ tests** including attack simulations (DDoS, credential stuffing, token forgery, privilege escalation)
+- **169 attack vectors** analyzed across 6 red team rounds (spec-level analysis)
+- **Zero CVEs** in dependency tree (cargo audit clean)
+- **Post-quantum KEM**: real ML-KEM-768 (FIPS 203) via `ml-kem` crate — fully implemented
+- **Threshold signing algorithm**: real FROST via `frost-ristretto255` — works but uses trusted dealer in single process (distributed deployment pending)
+- **Password hashing**: Argon2id with 64 MiB memory hardness — server-side verification (NOT OPAQUE; server receives password over SHARD channel)
+- **Ratchet library**: HKDF-SHA512 chain with secure key erasure — implemented as library, not yet wired into token verification
+- **Tamper-proof audit**: hash-chained log, any modification detectable — single-node (BFT replication planned)
+- **Key Transparency**: SHA3-256 Merkle tree with inclusion proofs — library only (no signing service yet)
 
 ## Crate Structure
 

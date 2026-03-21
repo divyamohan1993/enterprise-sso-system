@@ -50,7 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Audit hash includes all forensically significant fields
 
 #### Testing
-- 242 tests across 13 crates
+- 190+ tests across 13 crates
 - End-to-end Tier 2 ceremony flow (gateway → orchestrator → opaque → tss → verifier)
 - SSO multi-portal proof (single login, 5 service portals, independent verifiers)
 - Nation-state attack simulation (37 tests: DDoS, credential stuffing, token forgery, receipt chain attacks, SHARD protocol attacks, session hijacking, privilege escalation, audit evasion)
