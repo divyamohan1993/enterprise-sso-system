@@ -16,6 +16,9 @@ x25519-dalek.workspace = true
 getrandom.workspace = true
 rand.workspace = true
 ed25519-dalek.workspace = true
+frost-ristretto255.workspace = true
+frost-core.workspace = true
+ml-kem.workspace = true
 
 [dev-dependencies]
 uuid.workspace = true

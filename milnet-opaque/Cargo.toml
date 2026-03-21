@@ -14,5 +14,7 @@ uuid.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+opaque-ke.workspace = true
+argon2.workspace = true
 
 [dev-dependencies]

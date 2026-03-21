@@ -40,3 +40,12 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 getrandom = "0.2"
 rand = "0.8"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+frost-ristretto255 = "2.2"
+frost-core = "2.2"
+opaque-ke = { version = "4.0", features = ["argon2", "ristretto255"] }
+ml-kem = "0.2"
+argon2 = "0.5"
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
+rustls-pemfile = "2"
+tokio-rustls = "0.26"
+webpki-roots = "0.26"
