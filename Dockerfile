@@ -10,6 +10,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates libssl3 && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/admin /usr/local/bin/admin
 COPY --from=builder /app/target/release/gateway /usr/local/bin/gateway
+# Frontend served via reverse proxy or static file server
 COPY --from=builder /app/frontend/ /usr/local/share/frontend/
 
 EXPOSE 8080

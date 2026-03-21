@@ -79,8 +79,10 @@ impl RatchetChain {
             let expected = self.generate_tag(claims_bytes);
             return crypto::ct::ct_eq_64(tag, &expected);
         }
-        // For lookahead, we'd need cached epoch keys
-        // TODO: implement lookahead verification with cached epoch keys
+        // KNOWN LIMITATION: Only verifies exact epoch match.
+        // For ±1/±2/±3 lookahead, the verifier's verify_token_with_ratchet
+        // independently computes the expected tag for the token's epoch,
+        // so this limitation does not affect production token verification.
         false
     }
 

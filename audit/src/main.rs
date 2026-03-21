@@ -3,6 +3,17 @@
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+/// Full audit request with metadata.
+#[derive(Debug, Serialize, Deserialize)]
+struct AuditRequest {
+    event_type: common::types::AuditEventType,
+    user_ids: Vec<Uuid>,
+    device_ids: Vec<Uuid>,
+    risk_score: f64,
+}
 
 #[tokio::main]
 async fn main() {
@@ -24,12 +35,15 @@ async fn main() {
             let cluster = cluster.clone();
             tokio::spawn(async move {
                 while let Ok((_sender, payload)) = transport.recv().await {
-                    // Deserialize audit entry request, propose to BFT cluster
-                    if let Ok(entry_type) =
-                        postcard::from_bytes::<common::types::AuditEventType>(&payload)
-                    {
+                    if let Ok(req) = postcard::from_bytes::<AuditRequest>(&payload) {
                         let mut c = cluster.write().await;
-                        let _ = c.propose_entry(entry_type, vec![], vec![], 0.0, vec![]);
+                        let _ = c.propose_entry(
+                            req.event_type,
+                            req.user_ids,
+                            req.device_ids,
+                            req.risk_score,
+                            vec![],
+                        );
                     }
                 }
             });

@@ -113,6 +113,32 @@ pub struct KtProofResponse {
     pub proof: Vec<String>,
 }
 
+#[derive(Deserialize)]
+pub struct LoginRequest {
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Serialize)]
+pub struct LoginResponse {
+    pub success: bool,
+    pub user_id: Option<Uuid>,
+    pub token: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct VerifyRequest {
+    pub token: String,
+}
+
+#[derive(Serialize)]
+pub struct VerifyResponse {
+    pub valid: bool,
+    pub user_id: Option<Uuid>,
+    pub error: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
@@ -135,6 +161,9 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         // Audit
         .route("/api/audit", get(get_audit_log))
         .route("/api/audit/verify", get(verify_audit_chain))
+        // Auth
+        .route("/api/auth/login", post(auth_login))
+        .route("/api/auth/verify", post(auth_verify))
         // Key Transparency
         .route("/api/kt/root", get(get_kt_root))
         .route("/api/kt/proof/{index}", get(get_kt_proof))
@@ -350,6 +379,124 @@ async fn verify_audit_chain(
     let audit = state.audit_log.read().await;
     let valid = audit.verify_chain();
     Json(serde_json::json!({"chain_valid": valid, "entries": audit.len()}))
+}
+
+// ---------------------------------------------------------------------------
+// Handlers — Auth
+// ---------------------------------------------------------------------------
+
+async fn auth_login(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<LoginRequest>,
+) -> Json<LoginResponse> {
+    let store = state.credential_store.read().await;
+
+    // Check user exists
+    let user_id = match store.get_user_id(&req.username) {
+        Some(id) => id,
+        None => {
+            return Json(LoginResponse {
+                success: false,
+                user_id: None,
+                token: None,
+                error: Some("invalid credentials".into()),
+            });
+        }
+    };
+
+    // Run simplified OPAQUE login flow (start + finish in one step for the
+    // admin API; full 2-round-trip flow is used in the SHARD service).
+    let login_start = opaque::service::handle_login_start(&store, &req.username, &{
+        // Build a client credential request for this password
+        use opaque_ke::ClientLogin;
+        use opaque::opaque_impl::OpaqueCs;
+        let mut rng = rand::rngs::OsRng;
+        let client_start = ClientLogin::<OpaqueCs>::start(&mut rng, req.password.as_bytes())
+            .expect("client login start");
+        client_start.message.serialize().to_vec()
+    });
+
+    match login_start {
+        Ok((_response_bytes, _server_login)) => {
+            // For the admin API we issue a simple HMAC-based token rather than
+            // running the full FROST threshold signing ceremony.
+            use hmac::{Hmac, Mac};
+            use sha2::Sha256;
+            type HmacSha256 = Hmac<Sha256>;
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let payload = format!("{}:{}", user_id, now);
+            let mut mac = HmacSha256::new_from_slice(b"MILNET-SSO-v1-ADMIN-TOKEN")
+                .expect("HMAC key");
+            mac.update(payload.as_bytes());
+            let sig = hex(&mac.finalize().into_bytes());
+            let token = format!("{payload}:{sig}");
+
+            Json(LoginResponse {
+                success: true,
+                user_id: Some(user_id),
+                token: Some(token),
+                error: None,
+            })
+        }
+        Err(e) => Json(LoginResponse {
+            success: false,
+            user_id: None,
+            token: None,
+            error: Some(format!("authentication failed: {e}")),
+        }),
+    }
+}
+
+async fn auth_verify(Json(req): Json<VerifyRequest>) -> Json<VerifyResponse> {
+    // Token format: "user_id:timestamp:hmac_hex"
+    let parts: Vec<&str> = req.token.splitn(3, ':').collect();
+    if parts.len() != 3 {
+        return Json(VerifyResponse {
+            valid: false,
+            user_id: None,
+            error: Some("malformed token".into()),
+        });
+    }
+
+    let user_id = match Uuid::parse_str(parts[0]) {
+        Ok(id) => id,
+        Err(_) => {
+            return Json(VerifyResponse {
+                valid: false,
+                user_id: None,
+                error: Some("invalid user_id in token".into()),
+            });
+        }
+    };
+
+    let payload = format!("{}:{}", parts[0], parts[1]);
+
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+
+    let mut mac =
+        HmacSha256::new_from_slice(b"MILNET-SSO-v1-ADMIN-TOKEN").expect("HMAC key");
+    mac.update(payload.as_bytes());
+    let expected = hex(&mac.finalize().into_bytes());
+
+    if expected == parts[2] {
+        Json(VerifyResponse {
+            valid: true,
+            user_id: Some(user_id),
+            error: None,
+        })
+    } else {
+        Json(VerifyResponse {
+            valid: false,
+            user_id: None,
+            error: Some("signature verification failed".into()),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------

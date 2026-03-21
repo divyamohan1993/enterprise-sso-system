@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 #### Architecture & Spec
 - 1,597-line architecture specification with 8 appendices (A-H)
 - TLA+ formal model with safety and liveness property verification
-- 169 attack vectors identified across 6 red team rounds, all mitigated
+- 169 attack vectors identified across 6 review rounds (5 red team + 1 internal spec review), all mitigated
 
 #### Core Modules (13 crates)
 - `common` — shared types (Token, Receipt, AuditEntry), domain separation (11 prefixes), error types, action-level auth, security config, module communication matrix

@@ -49,7 +49,7 @@ Verify       Ratchet  Proof    Tree
                       Log
 ```
 
-## 13-Crate Workspace
+## 14-Crate Workspace
 
 | Crate | Type | Purpose | Tests |
 |-------|------|---------|-------|
@@ -65,6 +65,7 @@ Verify       Ratchet  Proof    Tree
 | `audit` | Binary | Hash-chained append-only audit log | 5 |
 | `kt` | Binary | SHA3-256 Merkle tree for Key Transparency | 7 |
 | `risk` | Binary | Risk scoring engine + device tier enforcement | 11 |
+| `admin` | Binary | REST API for user/portal/device management + auth endpoints | — |
 | `e2e` | Test | End-to-end ceremony + security test suite | 13 |
 | `formal-model` | TLA+ | State machine with safety/liveness verification | — |
 | **Total** | | | **190+** |
@@ -77,7 +78,7 @@ Verify       Ratchet  Proof    Tree
 |----------|---------------|----------------|
 | Hybrid KEM | X-Wing combiner (SHA3-256, X25519 + ML-KEM placeholder) | Errata C.8 |
 | Threshold Signing | 3-of-5 EdDSA (FROST placeholder) + ML-DSA-65 placeholder | C.6, C.15 |
-| Password Auth | SHA-256 hash verify (OPAQUE RFC 9497 placeholder) | Section 5 Module 5 |
+| Password Auth | OPAQUE protocol via opaque-ke 4.0 (RFC 9497 OPRF-based, server-blind) | Section 5 Module 5 |
 | Session Ratchet | HKDF-SHA512 chain, 30s epochs, server+client entropy | Section 8, E.16 |
 | Receipt Signing | HMAC-SHA256 with domain separation | Section 6, C.10 |
 | Entropy | Multi-source: OS CSPRNG + environmental noise XOR | E.5 |

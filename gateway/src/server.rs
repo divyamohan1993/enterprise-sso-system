@@ -144,11 +144,11 @@ async fn handle_connection(
     let resp = if let Some(orch) = orchestrator {
         forward_to_orchestrator(&auth_req, &orch).await?
     } else {
-        // Stub response when no orchestrator is configured
+        // No orchestrator configured — return error instead of placeholder token
         AuthResponse {
-            success: true,
-            token: Some(vec![0xAA; 32]), // placeholder token
-            error: None,
+            success: false,
+            token: None,
+            error: Some("no orchestrator configured".to_string()),
         }
     };
     send_frame(&mut stream, &resp).await?;

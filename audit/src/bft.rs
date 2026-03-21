@@ -7,6 +7,7 @@
 
 use crate::log::{hash_entry, AuditLog};
 use common::types::{AuditEntry, AuditEventType, Receipt};
+use crypto::pq_sign;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -50,6 +51,8 @@ pub struct BftAuditCluster {
     pub nodes: Vec<AuditNode>,
     /// Minimum number of nodes that must accept for an entry to be committed.
     pub quorum_size: usize,
+    /// Optional ML-DSA-65 signing key for signing audit entries.
+    pq_signing_key: Option<pq_sign::PqSigningKey>,
 }
 
 impl BftAuditCluster {
@@ -62,6 +65,19 @@ impl BftAuditCluster {
         Self {
             nodes,
             quorum_size: quorum,
+            pq_signing_key: None,
+        }
+    }
+
+    /// Create a new cluster with an ML-DSA-65 signing key for entry signing.
+    pub fn new_with_signing_key(node_count: usize, signing_key: pq_sign::PqSigningKey) -> Self {
+        let f = (node_count - 1) / 3;
+        let quorum = 2 * f + 1;
+        let nodes: Vec<AuditNode> = (0..node_count as u8).map(AuditNode::new).collect();
+        Self {
+            nodes,
+            quorum_size: quorum,
+            pq_signing_key: Some(signing_key),
         }
     }
 
@@ -88,7 +104,7 @@ impl BftAuditCluster {
             })
             .unwrap_or([0u8; 32]);
 
-        let entry = AuditEntry {
+        let mut entry = AuditEntry {
             event_id: Uuid::new_v4(),
             event_type,
             user_ids,
@@ -102,6 +118,11 @@ impl BftAuditCluster {
             prev_hash,
             signature: Vec::new(),
         };
+
+        if let Some(ref key) = self.pq_signing_key {
+            let hash = hash_entry(&entry);
+            entry.signature = pq_sign::pq_sign_raw(key, &hash);
+        }
 
         // Propose to all nodes, count acceptances.
         let mut accept_count = 0usize;

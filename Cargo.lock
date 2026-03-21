@@ -10,11 +10,15 @@ dependencies = [
  "axum",
  "common",
  "crypto",
+ "hmac",
  "kt",
  "opaque",
+ "opaque-ke",
+ "rand",
  "risk",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tower",
  "tower-http",
@@ -2120,6 +2124,7 @@ dependencies = [
  "shard",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

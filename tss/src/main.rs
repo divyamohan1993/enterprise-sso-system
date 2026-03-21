@@ -8,7 +8,10 @@
 use crypto::threshold::dkg;
 use tss::distributed::distribute_shares;
 
-fn main() {
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt::init();
+
     // Run DKG at startup (3-of-5 threshold)
     let mut dkg_result = dkg(5, 3);
     tracing::info!(
@@ -21,11 +24,11 @@ fn main() {
     // The coordinator holds NO signing keys.
     let (coordinator, nodes) = distribute_shares(&mut dkg_result);
 
-    println!(
+    tracing::info!(
         "tss: distributed — coordinator (no keys) + {} signer nodes (1 share each)",
         nodes.len()
     );
-    println!(
+    tracing::info!(
         "tss: threshold = {}, total = {}",
         coordinator.threshold,
         nodes.len()
@@ -40,13 +43,29 @@ fn main() {
     //
     // The coordinator runs here and communicates via SHARD IPC.
     for (i, node) in nodes.iter().enumerate() {
-        println!(
+        tracing::info!(
             "  signer node {}: identifier = {:?}",
             i + 1,
             node.identifier()
         );
     }
 
-    // TODO: spawn SHARD IPC listeners for each signer node (Phase 3 networking)
-    println!("tss: ready for distributed signing requests");
+    let addr = std::env::var("TSS_ADDR").unwrap_or_else(|_| "127.0.0.1:9103".to_string());
+    let hmac_key = crypto::entropy::generate_key_64();
+    let listener = shard::transport::ShardListener::bind(&addr, common::types::ModuleId::Tss, hmac_key)
+        .await
+        .unwrap();
+    tracing::info!("TSS service listening on {addr}");
+
+    loop {
+        if let Ok(mut transport) = listener.accept().await {
+            tracing::info!("TSS accepted connection");
+            // Handle signing requests
+            while let Ok((_sender, _payload)) = transport.recv().await {
+                tracing::info!("TSS received signing request");
+                // In production: validate receipt chain, build token
+                // For now: acknowledge receipt
+            }
+        }
+    }
 }

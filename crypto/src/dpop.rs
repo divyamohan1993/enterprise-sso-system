@@ -22,19 +22,34 @@ pub fn generate_dpop_proof(
     claims_bytes: &[u8],
     timestamp: i64,
 ) -> [u8; 64] {
-    let mut mac = HmacSha512::new_from_slice(client_secret_key).unwrap();
+    generate_dpop_proof_with_key(client_secret_key, claims_bytes, timestamp)
+}
+
+/// Generate a DPoP proof using an arbitrary key (used for both generation and verification).
+fn generate_dpop_proof_with_key(
+    key: &[u8],
+    claims_bytes: &[u8],
+    timestamp: i64,
+) -> [u8; 64] {
+    let mac = HmacSha512::new_from_slice(key).unwrap_or_else(|_| {
+        let mut padded = vec![0u8; 64];
+        let len = key.len().min(64);
+        padded[..len].copy_from_slice(&key[..len]);
+        HmacSha512::new_from_slice(&padded).unwrap()
+    });
+    let mut mac = mac;
     mac.update(domain::DPOP_PROOF);
     mac.update(claims_bytes);
     mac.update(&timestamp.to_le_bytes());
     mac.finalize().into_bytes().into()
 }
 
-/// Verify a DPoP proof by checking the key hash matches the expected binding.
+/// Verify a DPoP proof by checking the key hash and recomputing the HMAC.
 pub fn verify_dpop_proof(
     client_public_key: &[u8],
-    _proof: &[u8; 64],
-    _claims_bytes: &[u8],
-    _timestamp: i64,
+    proof: &[u8; 64],
+    claims_bytes: &[u8],
+    timestamp: i64,
     expected_key_hash: &[u8; 32],
 ) -> bool {
     // 1. Verify the key hash matches
@@ -42,9 +57,9 @@ pub fn verify_dpop_proof(
     if !crate::ct::ct_eq(&hash, expected_key_hash) {
         return false;
     }
-    // DPoP proof verification would normally use the client's public key
-    // to verify a signature. For now, we verify the HMAC binding.
-    true
+    // 2. Recompute the expected proof and verify
+    let expected = generate_dpop_proof_with_key(client_public_key, claims_bytes, timestamp);
+    crate::ct::ct_eq(proof, &expected)
 }
 
 #[cfg(test)]
@@ -72,8 +87,10 @@ mod tests {
     fn test_dpop_binding_verified() {
         let client_key = [0xABu8; 32];
         let expected = dpop_key_hash(&client_key);
-        let proof = [0u8; 64]; // placeholder proof
-        assert!(verify_dpop_proof(&client_key, &proof, b"claims", 1000, &expected));
+        let claims = b"claims";
+        let timestamp = 1000i64;
+        let proof = generate_dpop_proof_with_key(&client_key, claims, timestamp);
+        assert!(verify_dpop_proof(&client_key, &proof, claims, timestamp, &expected));
     }
 
     #[test]
@@ -83,5 +100,22 @@ mod tests {
         let expected = dpop_key_hash(&client_key);
         let proof = [0u8; 64];
         assert!(!verify_dpop_proof(&wrong_key, &proof, b"claims", 1000, &expected));
+    }
+
+    #[test]
+    fn test_dpop_wrong_proof_rejected() {
+        let client_key = [0xABu8; 32];
+        let expected = dpop_key_hash(&client_key);
+        let bad_proof = [0u8; 64]; // wrong proof
+        assert!(!verify_dpop_proof(&client_key, &bad_proof, b"claims", 1000, &expected));
+    }
+
+    #[test]
+    fn test_dpop_wrong_timestamp_rejected() {
+        let client_key = [0xABu8; 32];
+        let expected = dpop_key_hash(&client_key);
+        let claims = b"claims";
+        let proof = generate_dpop_proof_with_key(&client_key, claims, 1000);
+        assert!(!verify_dpop_proof(&client_key, &proof, claims, 9999, &expected));
     }
 }

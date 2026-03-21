@@ -11,4 +11,5 @@ pub mod duress;
 pub mod error;
 pub mod network;
 pub mod types;
+pub mod shared_keys;
 pub mod witness;

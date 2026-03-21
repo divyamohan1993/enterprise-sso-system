@@ -14,7 +14,7 @@ An SSO system architected to combine threshold cryptography, post-quantum key ex
 |---------|------------|-------------|
 | FROST threshold signing | Specified | Algorithm works (trusted dealer, single process — NOT distributed across 5 nodes yet) |
 | ML-KEM-768 post-quantum KEM | Specified | Fully implemented (real ml-kem crate, real encap/decap) |
-| Password auth | OPAQUE specified | Argon2id server-side (NOT OPAQUE — server sees password) |
+| Password auth | OPAQUE specified | Real OPAQUE protocol via opaque-ke 4.0 — server never sees password (OPRF-based, RFC 9497) |
 | Session ratcheting | Specified | HMAC-SHA512 ratchet tag computed in TSS, verified in verifier with ±3 epoch window |
 | Key Transparency | Specified | Merkle tree works (NOT signed tree heads, no service) |
 | Audit log | Specified | Hash chain works (NOT BFT replicated, no service) |
@@ -22,9 +22,9 @@ An SSO system architected to combine threshold cryptography, post-quantum key ex
 | Token verification | O(1) specified | Signature + ratchet tag + DPoP all verified. Epoch ±3 lookahead enforced. |
 | Risk scoring | Specified | Algorithm works (NOT wired as a service) |
 
-**What IS real right now:** ML-KEM-768 post-quantum KEM, FROST algorithm (not distributed), Argon2id password hashing, receipt chain cryptography, SHARD IPC protocol, hash-chained audit, Merkle tree proofs, end-to-end auth flow (gateway → orchestrator → opaque → tss → verifier).
+**What IS real right now:** ML-KEM-768 post-quantum KEM, FROST algorithm (not distributed), OPAQUE password auth via opaque-ke 4.0 (server-blind, OPRF-based), receipt chain cryptography, SHARD IPC protocol, hash-chained audit, Merkle tree proofs, end-to-end auth flow (gateway → orchestrator → opaque → tss → verifier).
 
-**What is NOT real yet:** Distributed threshold signing across separate processes, OPAQUE protocol (RFC 9807 — currently Argon2id server-side), BFT audit replication, TLS transport, FIDO2 support, ML-DSA-65 PQ token signatures.
+**What is NOT real yet:** Distributed threshold signing across separate processes, BFT audit replication, TLS transport, FIDO2 support, ML-DSA-65 PQ token signatures.
 
 ## Quick Start
 
@@ -60,7 +60,7 @@ Internet → Gateway (puzzle) → Orchestrator → OPAQUE (password)
 | `orchestrator` | Ceremony state machine, routes auth steps | No |
 | `tss` | FROST threshold token signing | All shares (single process; distributed deployment pending) |
 | `verifier` | O(1) token verification (no benchmark yet) | Public keys only |
-| `opaque` | Argon2id password auth + receipt issuance (server-side, not OPAQUE PAKE yet) | Password hashes |
+| `opaque` | OPAQUE password auth (opaque-ke 4.0, server-blind) + receipt issuance | OPAQUE registration records (no passwords) |
 | `ratchet` | Forward-secret session management (wired into token builder + verifier) | Ephemeral keys |
 | `kt` | SHA3-256 Merkle tree for credential transparency | Append-only log |
 | `risk` | Continuous risk scoring + device tier enforcement | Baselines |
@@ -140,7 +140,7 @@ The system uses **multiple layers** to verify client legitimacy:
 | Layer | What It Proves | How |
 |-------|---------------|-----|
 | **Puzzle** | Client spent CPU time (not a bot) | Hash-based proof-of-work |
-| **Password** | Client knows the secret | Argon2id (64 MiB, constant-time) |
+| **Password** | Client knows the secret | OPAQUE PAKE (opaque-ke 4.0, server-blind OPRF) |
 | **Receipt chain** | Each auth step completed in order | Cryptographically signed + hash-chained |
 | **Threshold signature** | 3-of-5 independent signers agreed | FROST threshold EdDSA |
 | **DPoP binding** | Token bound to TLS channel | Channel-specific proof (planned) |
@@ -152,7 +152,7 @@ Even if the client device is fully compromised:
 - The **threshold signature** can't be forged without the signing key (currently single-process; distributed across 5 nodes when deployed)
 - The **audit log** records everything for forensic analysis
 
-**Not yet enforced in v0.1.0:** Distributed threshold signing across separate processes (FROST algorithm works, shares in single process), full OPAQUE PAKE protocol (using Argon2id server-side), ML-DSA-65 PQ token signatures.
+**Not yet enforced in v0.1.0:** Distributed threshold signing across separate processes (FROST algorithm works, shares in single process), ML-DSA-65 PQ token signatures.
 
 ### 5. Admin Operations
 
@@ -195,7 +195,7 @@ assert!(auth.requires_two_person); // Must have 2 people from different departme
 - **Post-quantum KEM**: real ML-KEM-768 (FIPS 203) via `ml-kem` 0.2 — fully implemented (note: `ml-kem` crate is unaudited)
 - **Post-quantum signatures**: NOT yet implemented — tokens use classical FROST/Ristretto255. ML-DSA-65 planned.
 - **Threshold signing algorithm**: real FROST via `frost-ristretto255` 2.2 — works but uses trusted dealer in single process (distributed deployment pending)
-- **Password hashing**: Argon2id with 64 MiB memory hardness — server-side verification (NOT OPAQUE; server receives plaintext password over SHARD channel). `opaque-ke` 4.0 in deps but not used.
+- **Password authentication**: Real OPAQUE protocol via opaque-ke 4.0 (RFC 9497 OPRF-based) — server never sees the plaintext password. Registration and login use the full OPAQUE client/server flow.
 - **Session ratcheting**: HKDF-SHA512 chain with secure key erasure — wired into token builder (real tags) and verifier (±3 epoch window, constant-time verification)
 - **Tamper-proof audit**: hash-chained log, any modification detectable — single-node (BFT replication planned)
 - **Key Transparency**: SHA3-256 Merkle tree with inclusion proofs — library only (no signing service yet)
@@ -207,7 +207,7 @@ common/        — Shared types, domain separation, errors, actions, config
 crypto/        — X-Wing KEM, FROST threshold, receipts, entropy
 shard/         — SHARD IPC protocol + TCP transport
 gateway/       — Bastion Gateway: puzzle + forwarding
-opaque/        — Argon2id password auth + receipts
+opaque/        — OPAQUE password auth (server-blind, opaque-ke 4.0) + receipts
 tss/           — Receipt validation + threshold signing
 verifier/      — O(1) token verification
 orchestrator/  — Ceremony state machine
@@ -215,6 +215,7 @@ ratchet/       — Forward-secret sessions
 audit/         — Hash-chained audit log
 kt/            — Key Transparency Merkle tree
 risk/          — Risk scoring + device tiers
+admin/         — REST API for user/portal/device management + auth endpoints
 e2e/           — Comprehensive test suite
 formal-model/  — TLA+ state machine verification
 ```

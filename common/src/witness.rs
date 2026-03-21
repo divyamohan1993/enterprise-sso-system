@@ -42,6 +42,23 @@ impl WitnessLog {
         });
     }
 
+    /// Add a signed checkpoint using a provided signing function.
+    ///
+    /// The signing function receives the concatenation of `audit_root || kt_root`
+    /// and returns the ML-DSA-65 signature bytes.
+    pub fn add_signed_checkpoint(
+        &mut self,
+        audit_root: [u8; 32],
+        kt_root: [u8; 32],
+        sign_fn: impl FnOnce(&[u8]) -> Vec<u8>,
+    ) {
+        let mut data = Vec::with_capacity(64);
+        data.extend_from_slice(&audit_root);
+        data.extend_from_slice(&kt_root);
+        let signature = sign_fn(&data);
+        self.add_checkpoint(audit_root, kt_root, signature);
+    }
+
     pub fn latest(&self) -> Option<&WitnessCheckpoint> {
         self.checkpoints.last()
     }

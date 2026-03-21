@@ -21,16 +21,29 @@ pub enum PinVerification {
 impl DuressConfig {
     pub fn new(user_id: Uuid, normal_pin: &[u8], duress_pin: &[u8]) -> Self {
         use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"MILNET-SSO-v1-DURESS-PIN");
+        hasher.update(normal_pin);
+        let normal_pin_hash: [u8; 32] = hasher.finalize().into();
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"MILNET-SSO-v1-DURESS-PIN");
+        hasher.update(duress_pin);
+        let duress_pin_hash: [u8; 32] = hasher.finalize().into();
+
         Self {
             user_id,
-            normal_pin_hash: Sha256::digest(normal_pin).into(),
-            duress_pin_hash: Sha256::digest(duress_pin).into(),
+            normal_pin_hash,
+            duress_pin_hash,
         }
     }
 
     pub fn verify_pin(&self, pin: &[u8]) -> PinVerification {
         use sha2::{Digest, Sha256};
-        let hash: [u8; 32] = Sha256::digest(pin).into();
+        let mut hasher = Sha256::new();
+        hasher.update(b"MILNET-SSO-v1-DURESS-PIN");
+        hasher.update(pin);
+        let hash: [u8; 32] = hasher.finalize().into();
         use subtle::ConstantTimeEq;
         if hash.ct_eq(&self.normal_pin_hash).into() {
             PinVerification::Normal
