@@ -63,6 +63,12 @@ impl AuditLog {
     pub fn entries(&self) -> &[AuditEntry] {
         &self.entries
     }
+
+    /// Append a pre-built entry directly (used by BFT replication layer).
+    pub fn append_raw(&mut self, entry: AuditEntry) {
+        self.last_hash = hash_entry(&entry);
+        self.entries.push(entry);
+    }
 }
 
 impl Default for AuditLog {
