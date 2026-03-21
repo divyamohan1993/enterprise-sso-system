@@ -30,6 +30,7 @@ const SHARD_HMAC_KEY: [u8; 64] = [0x37u8; 64];
 /// Fixed 64-byte receipt signing key shared between OPAQUE and TSS.
 const RECEIPT_SIGNING_KEY: [u8; 64] = [0x42u8; 64];
 
+
 /// Puzzle difficulty (low for fast tests).
 const TEST_DIFFICULTY: u8 = 4;
 
@@ -166,7 +167,7 @@ async fn boot_tss(mut signers: Vec<SignerShare>, group: ThresholdGroup) -> Strin
                 match validate_receipt_chain(&request.receipts, &tss_receipt_signing_key) {
                     Ok(()) => {
                         // Build threshold-signed token
-                        match build_token(&request.claims, &mut signers, &group) {
+                        match build_token(&request.claims, &mut signers, &group, &request.ratchet_key) {
                             Ok(token) => {
                                 let token_bytes =
                                     postcard::to_allocvec(&token).expect("serialize token");

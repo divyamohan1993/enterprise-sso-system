@@ -154,7 +154,7 @@ async fn boot_tss(
             };
             let response =
                 match validate_receipt_chain(&request.receipts, &RECEIPT_SIGNING_KEY) {
-                    Ok(()) => match build_token(&request.claims, &mut signers, &group) {
+                    Ok(()) => match build_token(&request.claims, &mut signers, &group, &request.ratchet_key) {
                         Ok(token) => {
                             let token_bytes =
                                 postcard::to_allocvec(&token).expect("serialize token");
@@ -350,7 +350,7 @@ fn make_valid_token_and_key() -> (Token, frost_ristretto255::keys::PublicKeyPack
         ratchet_epoch: 1,
     };
     let mut signers: Vec<_> = dkg_result.shares.into_iter().take(3).collect();
-    let token = build_token(&claims, &mut signers, &dkg_result.group)
+    let token = build_token(&claims, &mut signers, &dkg_result.group, &[0x55u8; 64])
         .expect("build token should succeed");
     (token, group_key)
 }
@@ -700,7 +700,7 @@ fn test_attack_token_replay_across_sessions() {
         ratchet_epoch: 1,
     };
     let mut signers: Vec<_> = dkg_result.shares.into_iter().take(3).collect();
-    let token = build_token(&claims_session1, &mut signers, &dkg_result.group)
+    let token = build_token(&claims_session1, &mut signers, &dkg_result.group, &[0x55u8; 64])
         .expect("build session 1 token");
 
     // Verify token is valid
@@ -751,7 +751,7 @@ fn test_attack_cross_dkg_token_injection() {
     };
 
     let mut signers1: Vec<_> = dkg1.shares.into_iter().take(3).collect();
-    let token = build_token(&claims, &mut signers1, &dkg1.group)
+    let token = build_token(&claims, &mut signers1, &dkg1.group, &[0x55u8; 64])
         .expect("build token with DKG 1");
 
     let result = verify_token(&token, &group2_key);

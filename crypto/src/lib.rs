@@ -5,6 +5,7 @@
 //! HMAC message authentication, and constant-time comparison utilities.
 
 pub mod ct;
+pub mod dpop;
 pub mod entropy;
 pub mod receipts;
 pub mod threshold;

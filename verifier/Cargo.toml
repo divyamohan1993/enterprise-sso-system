@@ -11,6 +11,7 @@ shard = { path = "../shard" }
 ed25519-dalek.workspace = true
 frost-ristretto255.workspace = true
 sha2.workspace = true
+hmac.workspace = true
 serde.workspace = true
 postcard.workspace = true
 uuid.workspace = true

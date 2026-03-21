@@ -5,4 +5,4 @@ pub mod messages;
 pub mod verify;
 
 pub use messages::{VerifyRequest, VerifyResponse};
-pub use verify::verify_token;
+pub use verify::{verify_token, verify_token_with_dpop, verify_token_with_ratchet};

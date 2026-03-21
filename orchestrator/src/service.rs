@@ -1,7 +1,7 @@
 //! Auth Orchestrator service — coordinates Gateway, OPAQUE, and TSS.
 
 use common::types::{ModuleId, TokenClaims};
-use crypto::entropy::generate_nonce;
+use crypto::entropy::{generate_key_64, generate_nonce};
 use opaque::messages::{OpaqueRequest, OpaqueResponse};
 use shard::transport::{connect, ShardListener, ShardTransport};
 use tss::messages::{SigningRequest, SigningResponse};
@@ -131,9 +131,13 @@ impl OrchestratorService {
             ratchet_epoch: 0,
         };
 
+        // Generate a ratchet key for this session's token tag
+        let ratchet_key = generate_key_64();
+
         let signing_req = SigningRequest {
             receipts: session.receipt_chain.receipts().to_vec(),
             claims,
+            ratchet_key,
         };
 
         let signing_bytes = postcard::to_allocvec(&signing_req)

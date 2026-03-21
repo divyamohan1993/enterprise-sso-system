@@ -10,6 +10,11 @@ fn test_signing_key() -> [u8; 64] {
     [0xAB; 64]
 }
 
+/// Create a deterministic 64-byte ratchet key for tests.
+fn test_ratchet_key() -> [u8; 64] {
+    [0xCD; 64]
+}
+
 /// Build a valid receipt chain of the given length, signing each receipt.
 fn build_signed_chain(len: usize, signing_key: &[u8; 64]) -> Vec<Receipt> {
     let session_id = [0x01; 32];
@@ -111,8 +116,10 @@ fn token_built_and_verifiable() {
     let mut shares = dkg_result.shares;
     let group = dkg_result.group;
     let claims = test_claims();
+    let ratchet_key = test_ratchet_key();
 
-    let token = build_token(&claims, &mut shares[..3], &group).expect("build_token should succeed");
+    let token = build_token(&claims, &mut shares[..3], &group, &ratchet_key)
+        .expect("build_token should succeed");
 
     // Verify the FROST signature against the group key
     let claims_bytes = postcard::to_allocvec(&claims).unwrap();
@@ -126,8 +133,10 @@ fn token_claims_preserved() {
     let mut shares = dkg_result.shares;
     let group = dkg_result.group;
     let claims = test_claims();
+    let ratchet_key = test_ratchet_key();
 
-    let token = build_token(&claims, &mut shares[..3], &group).expect("build_token should succeed");
+    let token = build_token(&claims, &mut shares[..3], &group, &ratchet_key)
+        .expect("build_token should succeed");
 
     // Serialize and deserialize the token, verify claims match
     let serialized = postcard::to_allocvec(&token).unwrap();
@@ -145,4 +154,21 @@ fn token_claims_preserved() {
     assert_eq!(deserialized.header.version, 1);
     assert_eq!(deserialized.header.algorithm, 1);
     assert_eq!(deserialized.header.tier, claims.tier);
+}
+
+#[test]
+fn test_ratchet_tag_is_real() {
+    let dkg_result = dkg(5, 3);
+    let mut shares = dkg_result.shares;
+    let group = dkg_result.group;
+    let claims = test_claims();
+    let ratchet_key = test_ratchet_key();
+
+    let token = build_token(&claims, &mut shares[..3], &group, &ratchet_key)
+        .expect("build_token should succeed");
+
+    // The ratchet tag must NOT be all zeros (the old placeholder)
+    assert_ne!(token.ratchet_tag, [0u8; 64], "ratchet tag must not be all zeros");
+    // It also should not be a trivial constant
+    assert_ne!(token.ratchet_tag, [0xDD; 64]);
 }

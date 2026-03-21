@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use rand::Rng;
 use tracing::{error, info, warn};
 
 use common::types::ModuleId;
@@ -155,7 +156,11 @@ async fn forward_to_orchestrator(
     let orch_req = OrchestratorRequest {
         username: auth_req.username.clone(),
         password: auth_req.password.clone(),
-        dpop_key_hash: [0u8; 32], // Gateway does not have DPoP yet
+        dpop_key_hash: {
+            // Generate a per-connection simulated client DPoP key and compute its hash
+            let client_dpop_key: [u8; 32] = rand::thread_rng().gen();
+            crypto::dpop::dpop_key_hash(&client_dpop_key)
+        },
         tier: 0,                  // Orchestrator decides tier
     };
 

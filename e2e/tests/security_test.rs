@@ -129,7 +129,7 @@ fn expired_token_rejected() {
 
     let mut signers: Vec<_> = dkg_result.shares.into_iter().take(3).collect();
     let token =
-        build_token(&claims, &mut signers, &dkg_result.group).expect("build token should succeed");
+        build_token(&claims, &mut signers, &dkg_result.group, &[0x55u8; 64]).expect("build token should succeed");
 
     let result = verify_token(&token, &group_key);
     assert!(result.is_err(), "expired token must be rejected");
@@ -162,7 +162,7 @@ fn tampered_token_rejected() {
 
     let mut signers: Vec<_> = dkg_result.shares.into_iter().take(3).collect();
     let mut token =
-        build_token(&claims, &mut signers, &dkg_result.group).expect("build token should succeed");
+        build_token(&claims, &mut signers, &dkg_result.group, &[0x55u8; 64]).expect("build token should succeed");
 
     // Tamper with claims — change the tier
     token.claims.tier = 1;

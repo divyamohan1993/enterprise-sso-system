@@ -134,7 +134,7 @@ async fn boot_tss(mut signers: Vec<SignerShare>, group: ThresholdGroup) -> Strin
             };
             let response =
                 match validate_receipt_chain(&request.receipts, &RECEIPT_SIGNING_KEY) {
-                    Ok(()) => match build_token(&request.claims, &mut signers, &group) {
+                    Ok(()) => match build_token(&request.claims, &mut signers, &group, &request.ratchet_key) {
                         Ok(token) => {
                             let token_bytes =
                                 postcard::to_allocvec(&token).expect("serialize token");
@@ -324,12 +324,15 @@ impl ServicePortal {
 
 /// Helper: build a token directly with threshold signing for unit-level tests
 /// that don't need the full ceremony.
+/// Fixed 64-byte ratchet key for helper token building.
+const HELPER_RATCHET_KEY: [u8; 64] = [0x55u8; 64];
+
 fn build_signed_token(
     claims: &TokenClaims,
     signers: &mut [SignerShare],
     group: &ThresholdGroup,
 ) -> Token {
-    build_token(claims, signers, group).expect("build_token should succeed")
+    build_token(claims, signers, group, &HELPER_RATCHET_KEY).expect("build_token should succeed")
 }
 
 /// Helper: create standard claims with configurable tier and scope.
@@ -534,18 +537,19 @@ async fn test_attack_stolen_token_used_at_different_portal() {
     assert!(resp.success);
     let token: Token = postcard::from_bytes(&resp.token.unwrap()).expect("deserialize");
 
-    // Token has dpop_hash = [0;32] (no DPoP binding in Phase 2)
-    assert_eq!(token.claims.dpop_hash, [0u8; 32], "Phase 2: DPoP not bound");
+    // Token has a real DPoP hash (gateway generates per-connection DPoP key)
+    assert_ne!(token.claims.dpop_hash, [0u8; 32], "DPoP hash should be bound");
 
-    // The "stolen" token IS valid at a different portal (SSO works)
+    // The "stolen" token IS valid at a different portal (SSO works) because
+    // portal-level check_access only verifies FROST signature, not DPoP binding.
     let portal_a = ServicePortal::new("Portal A", 2, 0x01, &group_key);
     let portal_b = ServicePortal::new("Portal B", 2, 0x01, &group_key);
     assert!(portal_a.check_access(&token).is_ok(), "original portal accepts");
     assert!(
         portal_b.check_access(&token).is_ok(),
-        "different portal also accepts (DPoP not enforced in Phase 2)"
+        "different portal also accepts (portal does not enforce DPoP)"
     );
-    // NOTE: When DPoP is enforced (Phase 3), channel-bound tokens will
+    // NOTE: When DPoP is enforced at portal level, channel-bound tokens will
     // restrict usage to the original client-portal binding.
 }
 
