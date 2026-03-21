@@ -3,7 +3,7 @@ use milnet_crypto::xwing::{xwing_decapsulate, xwing_encapsulate, XWingKeyPair};
 #[test]
 fn xwing_key_exchange_produces_shared_secret() {
     let server_kp = XWingKeyPair::generate();
-    let server_pk = server_kp.public_key_bytes();
+    let server_pk = server_kp.public_key();
 
     let (client_ss, ciphertext) = xwing_encapsulate(&server_pk);
     let server_ss = xwing_decapsulate(&server_kp, &ciphertext);
@@ -18,7 +18,7 @@ fn xwing_key_exchange_produces_shared_secret() {
 #[test]
 fn xwing_different_sessions_different_secrets() {
     let server_kp = XWingKeyPair::generate();
-    let server_pk = server_kp.public_key_bytes();
+    let server_pk = server_kp.public_key();
 
     let (ss1, _ct1) = xwing_encapsulate(&server_pk);
     let (ss2, _ct2) = xwing_encapsulate(&server_pk);
@@ -34,7 +34,7 @@ fn xwing_different_sessions_different_secrets() {
 fn xwing_wrong_key_fails() {
     let server_kp = XWingKeyPair::generate();
     let wrong_kp = XWingKeyPair::generate();
-    let server_pk = server_kp.public_key_bytes();
+    let server_pk = server_kp.public_key();
 
     let (client_ss, ciphertext) = xwing_encapsulate(&server_pk);
     let wrong_ss = xwing_decapsulate(&wrong_kp, &ciphertext);
