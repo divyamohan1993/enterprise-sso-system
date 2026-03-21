@@ -17,14 +17,14 @@ INTERNET (raw, hostile)
     │
     ▼
 ┌─────────────────────────────────────────┐
-│  BASTION GATEWAY (milnet-gateway)       │
+│  BASTION GATEWAY (gateway)       │
 │  Hash puzzle · Rate limiting · TLS      │
 │  HOLDS ZERO SECRETS                     │
 └──────────────┬──────────────────────────┘
                │ SHARD IPC (HMAC-SHA512)
                ▼
 ┌─────────────────────────────────────────┐
-│  AUTH ORCHESTRATOR (milnet-orchestrator) │
+│  AUTH ORCHESTRATOR (orchestrator) │
 │  Ceremony state machine · Routing       │
 │  HOLDS NO KEYS                          │
 └──┬────────┬────────┬────────────────────┘
@@ -51,19 +51,19 @@ Verify       Ratchet  Proof    Tree
 
 | Crate | Type | Purpose | Tests |
 |-------|------|---------|-------|
-| `milnet-common` | Library | Shared types, domain separation, errors, actions, config, network matrix | 17 |
-| `milnet-crypto` | Library | X-Wing KEM, constant-time, threshold signing, receipts, entropy | 27 |
-| `milnet-shard` | Library | SHARD IPC protocol + async TCP transport | 9 |
-| `milnet-gateway` | Binary | Bastion Gateway: hash puzzle + request forwarding | 5 |
-| `milnet-opaque` | Binary | Simulated OPAQUE password auth + receipt issuance | 5 |
-| `milnet-tss` | Binary | Receipt chain validation + threshold token signing | 5 |
-| `milnet-verifier` | Binary | O(1) token signature verification | 5 |
-| `milnet-orchestrator` | Binary | Ceremony state machine + auth coordination | 6 |
-| `milnet-ratchet` | Binary | Forward-secret HKDF-SHA512 session ratcheting | 10 |
-| `milnet-audit` | Binary | Hash-chained append-only audit log | 5 |
-| `milnet-kt` | Binary | SHA3-256 Merkle tree for Key Transparency | 7 |
-| `milnet-risk` | Binary | Risk scoring engine + device tier enforcement | 11 |
-| `milnet-e2e` | Test | End-to-end ceremony + security test suite | 13 |
+| `common` | Library | Shared types, domain separation, errors, actions, config, network matrix | 17 |
+| `crypto` | Library | X-Wing KEM, constant-time, threshold signing, receipts, entropy | 27 |
+| `shard` | Library | SHARD IPC protocol + async TCP transport | 9 |
+| `gateway` | Binary | Bastion Gateway: hash puzzle + request forwarding | 5 |
+| `opaque` | Binary | Simulated OPAQUE password auth + receipt issuance | 5 |
+| `tss` | Binary | Receipt chain validation + threshold token signing | 5 |
+| `verifier` | Binary | O(1) token signature verification | 5 |
+| `orchestrator` | Binary | Ceremony state machine + auth coordination | 6 |
+| `ratchet` | Binary | Forward-secret HKDF-SHA512 session ratcheting | 10 |
+| `audit` | Binary | Hash-chained append-only audit log | 5 |
+| `kt` | Binary | SHA3-256 Merkle tree for Key Transparency | 7 |
+| `risk` | Binary | Risk scoring engine + device tier enforcement | 11 |
+| `e2e` | Test | End-to-end ceremony + security test suite | 13 |
 | `formal-model` | TLA+ | State machine with safety/liveness verification | — |
 | **Total** | | | **133** |
 
