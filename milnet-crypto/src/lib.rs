@@ -5,4 +5,5 @@
 //! HMAC message authentication, and constant-time comparison utilities.
 
 pub mod ct;
+pub mod entropy;
 pub mod xwing;
