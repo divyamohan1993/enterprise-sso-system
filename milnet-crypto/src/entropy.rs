@@ -28,8 +28,8 @@ pub fn combined_entropy() -> [u8; 32] {
     // Combine via hash
     let mut hasher = Sha512::new();
     hasher.update(b"MILNET-ENTROPY-COMBINER-v1");
-    hasher.update(&os_entropy);
-    hasher.update(&time_ns.to_le_bytes());
+    hasher.update(os_entropy);
+    hasher.update(time_ns.to_le_bytes());
     hasher.update(thread_id.as_bytes());
     // In production: add dedicated_hardware_rng bytes here
     let hash = hasher.finalize();

@@ -17,22 +17,20 @@ pub fn hash_receipt(receipt: &Receipt) -> [u8; 32] {
     use sha2::Digest;
     let mut hasher = sha2::Sha256::new();
     hasher.update(domain::RECEIPT_CHAIN);
-    hasher.update(&receipt.ceremony_session_id);
-    hasher.update(&[receipt.step_id]);
-    hasher.update(&receipt.prev_receipt_hash);
+    hasher.update(receipt.ceremony_session_id);
+    hasher.update([receipt.step_id]);
+    hasher.update(receipt.prev_receipt_hash);
     hasher.update(receipt.user_id.as_bytes());
-    hasher.update(&receipt.timestamp.to_le_bytes());
-    hasher.update(&receipt.nonce);
+    let ts_bytes = receipt.timestamp.to_le_bytes();
+    hasher.update(ts_bytes);
+    hasher.update(receipt.nonce);
     let result = hasher.finalize();
     let mut hash = [0u8; 32];
     hash.copy_from_slice(&result);
     hash
 }
 
-/// Sign a receipt with HMAC (placeholder for Ed25519 receipt key from HSM)
-pub fn sign_receipt(receipt: &mut Receipt, signing_key: &[u8; 64]) {
-    let mut mac =
-        HmacSha256::new_from_slice(signing_key).expect("HMAC key length is always valid");
+fn mac_receipt_fields(mac: &mut HmacSha256, receipt: &Receipt) {
     mac.update(domain::RECEIPT_SIGN);
     mac.update(&receipt.ceremony_session_id);
     mac.update(&[receipt.step_id]);
@@ -40,6 +38,13 @@ pub fn sign_receipt(receipt: &mut Receipt, signing_key: &[u8; 64]) {
     mac.update(receipt.user_id.as_bytes());
     mac.update(&receipt.timestamp.to_le_bytes());
     mac.update(&receipt.nonce);
+}
+
+/// Sign a receipt with HMAC (placeholder for Ed25519 receipt key from HSM)
+pub fn sign_receipt(receipt: &mut Receipt, signing_key: &[u8; 64]) {
+    let mut mac =
+        HmacSha256::new_from_slice(signing_key).expect("HMAC key length is always valid");
+    mac_receipt_fields(&mut mac, receipt);
     receipt.signature = mac.finalize().into_bytes().to_vec();
 }
 
@@ -47,13 +52,7 @@ pub fn sign_receipt(receipt: &mut Receipt, signing_key: &[u8; 64]) {
 pub fn verify_receipt_signature(receipt: &Receipt, signing_key: &[u8; 64]) -> bool {
     let mut mac =
         HmacSha256::new_from_slice(signing_key).expect("HMAC key length is always valid");
-    mac.update(domain::RECEIPT_SIGN);
-    mac.update(&receipt.ceremony_session_id);
-    mac.update(&[receipt.step_id]);
-    mac.update(&receipt.prev_receipt_hash);
-    mac.update(receipt.user_id.as_bytes());
-    mac.update(&receipt.timestamp.to_le_bytes());
-    mac.update(&receipt.nonce);
+    mac_receipt_fields(&mut mac, receipt);
     let expected = mac.finalize().into_bytes();
     crate::ct::ct_eq(&receipt.signature, &expected)
 }
@@ -111,8 +110,6 @@ impl ReceiptChain {
         if self.receipts.is_empty() {
             return Err("empty receipt chain".into());
         }
-        // Chain is valid if all receipts were added successfully
-        // (add_receipt validates incrementally)
         Ok(())
     }
 
