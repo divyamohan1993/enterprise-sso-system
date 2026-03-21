@@ -16,3 +16,6 @@ x25519-dalek.workspace = true
 getrandom.workspace = true
 rand.workspace = true
 ed25519-dalek.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true
