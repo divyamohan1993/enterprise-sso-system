@@ -5,6 +5,12 @@ edition.workspace = true
 
 [dependencies]
 milnet-common = { path = "../milnet-common" }
+milnet-crypto = { path = "../milnet-crypto" }
 milnet-shard = { path = "../milnet-shard" }
 tokio.workspace = true
 tracing.workspace = true
+sha2.workspace = true
+serde.workspace = true
+postcard.workspace = true
+uuid.workspace = true
+tracing-subscriber.workspace = true

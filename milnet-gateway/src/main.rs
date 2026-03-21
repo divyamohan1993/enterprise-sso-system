@@ -1,6 +1,18 @@
 #![forbid(unsafe_code)]
-//! milnet-gateway: Bastion Gateway (DDoS filter, TLS termination).
+//! milnet-gateway binary entry point.
 
-fn main() {
-    println!("milnet-gateway");
+use milnet_gateway::server::GatewayServer;
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt::init();
+
+    let port = std::env::var("GATEWAY_PORT").unwrap_or_else(|_| "9100".into());
+    let addr = format!("0.0.0.0:{port}");
+
+    let server = GatewayServer::bind(&addr, 4)
+        .await
+        .expect("failed to bind gateway");
+
+    server.run().await.expect("gateway server error");
 }
