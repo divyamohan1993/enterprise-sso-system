@@ -7,3 +7,4 @@
 pub mod ceremony;
 pub mod messages;
 pub mod service;
+pub mod sovereign;

@@ -62,6 +62,26 @@ pub fn pq_verify(
     verifying_key.verify(&data, &sig).is_ok()
 }
 
+/// Sign raw bytes with ML-DSA-65 (no FROST nesting).
+///
+/// Used for audit entry signing, signed tree heads, and witness checkpoints
+/// where a standalone post-quantum signature is needed.
+pub fn pq_sign_raw(signing_key: &PqSigningKey, data: &[u8]) -> Vec<u8> {
+    let sig: PqSignature = signing_key.sign(data);
+    sig.encode().to_vec()
+}
+
+/// Verify a raw ML-DSA-65 signature over `data`.
+///
+/// Returns `true` if the signature is valid.
+pub fn pq_verify_raw(verifying_key: &PqVerifyingKey, data: &[u8], sig_bytes: &[u8]) -> bool {
+    let sig = match PqSignature::try_from(sig_bytes) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    verifying_key.verify(data, &sig).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

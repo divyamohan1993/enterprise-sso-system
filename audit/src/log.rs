@@ -64,6 +64,34 @@ impl AuditLog {
         &self.entries
     }
 
+    /// Append an entry and sign it with ML-DSA-65.
+    pub fn append_signed(
+        &mut self,
+        event_type: AuditEventType,
+        user_ids: Vec<Uuid>,
+        device_ids: Vec<Uuid>,
+        risk_score: f64,
+        ceremony_receipts: Vec<Receipt>,
+        signing_key: &crypto::pq_sign::PqSigningKey,
+    ) -> &AuditEntry {
+        let mut entry = AuditEntry {
+            event_id: Uuid::new_v4(),
+            event_type,
+            user_ids,
+            device_ids,
+            ceremony_receipts,
+            risk_score,
+            timestamp: now_us(),
+            prev_hash: self.last_hash,
+            signature: Vec::new(),
+        };
+        let hash = hash_entry(&entry);
+        entry.signature = crypto::pq_sign::pq_sign_raw(signing_key, &hash);
+        self.last_hash = hash;
+        self.entries.push(entry);
+        self.entries.last().unwrap()
+    }
+
     /// Append a pre-built entry directly (used by BFT replication layer).
     pub fn append_raw(&mut self, entry: AuditEntry) {
         self.last_hash = hash_entry(&entry);

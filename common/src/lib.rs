@@ -7,6 +7,8 @@
 pub mod actions;
 pub mod config;
 pub mod domain;
+pub mod duress;
 pub mod error;
 pub mod network;
 pub mod types;
+pub mod witness;

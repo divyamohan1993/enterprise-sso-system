@@ -71,6 +71,50 @@ impl Default for MerkleTree {
     }
 }
 
+/// Signed Tree Head — ML-DSA-65 signature over the Merkle root
+#[derive(Debug, Clone)]
+pub struct SignedTreeHead {
+    pub root: [u8; 32],
+    pub timestamp: i64,
+    pub tree_size: usize,
+    pub signature: Vec<u8>, // ML-DSA-65
+}
+
+impl MerkleTree {
+    pub fn signed_tree_head(
+        &self,
+        signing_key: &crypto::pq_sign::PqSigningKey,
+    ) -> SignedTreeHead {
+        let root = self.root();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64;
+        let mut data = Vec::new();
+        data.extend_from_slice(&root);
+        data.extend_from_slice(&timestamp.to_le_bytes());
+        data.extend_from_slice(&(self.len() as u64).to_le_bytes());
+        let signature = crypto::pq_sign::pq_sign_raw(signing_key, &data);
+        SignedTreeHead {
+            root,
+            timestamp,
+            tree_size: self.len(),
+            signature,
+        }
+    }
+
+    pub fn verify_tree_head(
+        sth: &SignedTreeHead,
+        verifying_key: &crypto::pq_sign::PqVerifyingKey,
+    ) -> bool {
+        let mut data = Vec::new();
+        data.extend_from_slice(&sth.root);
+        data.extend_from_slice(&sth.timestamp.to_le_bytes());
+        data.extend_from_slice(&(sth.tree_size as u64).to_le_bytes());
+        crypto::pq_sign::pq_verify_raw(verifying_key, &data, &sth.signature)
+    }
+}
+
 fn compute_leaf(
     user_id: &Uuid,
     operation: &str,
