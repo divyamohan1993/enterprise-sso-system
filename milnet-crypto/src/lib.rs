@@ -3,3 +3,6 @@
 //!
 //! Provides hash functions (SHA-2, SHA-3, BLAKE3), HKDF key derivation,
 //! HMAC message authentication, and constant-time comparison utilities.
+
+pub mod ct;
+pub mod xwing;
