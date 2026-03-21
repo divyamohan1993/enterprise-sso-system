@@ -5,6 +5,7 @@
 //! orchestrator via SHARD for real authentication.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -14,7 +15,7 @@ use tracing::{error, info, warn};
 use common::types::ModuleId;
 use shard::transport::connect;
 
-use crate::puzzle::{generate_challenge, verify_solution, PuzzleSolution};
+use crate::puzzle::{generate_challenge, get_adaptive_difficulty, verify_solution, PuzzleSolution};
 use crate::wire::{AuthRequest, AuthResponse, OrchestratorRequest, OrchestratorResponse};
 
 /// Maximum wire frame payload size (1 MiB).
@@ -32,6 +33,7 @@ pub struct GatewayServer {
     listener: TcpListener,
     difficulty: u8,
     orchestrator: Option<Arc<OrchestratorConfig>>,
+    active_connections: Arc<AtomicUsize>,
 }
 
 impl GatewayServer {
@@ -43,6 +45,7 @@ impl GatewayServer {
             listener,
             difficulty,
             orchestrator: None,
+            active_connections: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -58,6 +61,7 @@ impl GatewayServer {
             listener,
             difficulty,
             orchestrator: Some(Arc::new(orchestrator_config)),
+            active_connections: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -67,15 +71,22 @@ impl GatewayServer {
     }
 
     /// Run the server loop, accepting connections forever.
+    ///
+    /// Uses adaptive puzzle difficulty based on the current number of active
+    /// connections.  The per-instance `self.difficulty` field acts as the
+    /// *minimum* difficulty; the adaptive function may raise it under load.
     pub async fn run(&self) -> std::io::Result<()> {
         loop {
             let (stream, addr) = self.listener.accept().await?;
-            let difficulty = self.difficulty;
+            let active = self.active_connections.fetch_add(1, Ordering::Relaxed) + 1;
+            let difficulty = get_adaptive_difficulty(active).max(self.difficulty);
             let orch = self.orchestrator.clone();
+            let counter = self.active_connections.clone();
             tokio::spawn(async move {
                 if let Err(e) = handle_connection(stream, difficulty, orch).await {
                     warn!("connection from {addr} failed: {e}");
                 }
+                counter.fetch_sub(1, Ordering::Relaxed);
             });
         }
     }

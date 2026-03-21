@@ -5,9 +5,34 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crypto::entropy::generate_nonce;
+
+/// Global adaptive difficulty -- increases under load.
+static CURRENT_DIFFICULTY: AtomicU8 = AtomicU8::new(8);
+
+/// Compute the appropriate puzzle difficulty based on the number of active
+/// connections and store it globally.
+pub fn get_adaptive_difficulty(active_connections: usize) -> u8 {
+    let difficulty = if active_connections > 1000 {
+        20 // DDoS level
+    } else if active_connections > 500 {
+        16 // High load
+    } else if active_connections > 100 {
+        12 // Moderate load
+    } else {
+        8 // Normal
+    };
+    CURRENT_DIFFICULTY.store(difficulty, Ordering::Relaxed);
+    difficulty
+}
+
+/// Return the last stored adaptive difficulty.
+pub fn current_difficulty() -> u8 {
+    CURRENT_DIFFICULTY.load(Ordering::Relaxed)
+}
 
 /// Maximum age of a puzzle challenge before it expires (10 seconds).
 const PUZZLE_TTL_SECS: i64 = 10;

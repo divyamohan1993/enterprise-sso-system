@@ -77,8 +77,10 @@ dependencies = [
  "postcard",
  "serde",
  "sha2",
+ "shard",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -287,6 +289,7 @@ version = "0.1.0"
 dependencies = [
  "postcard",
  "serde",
+ "sha2",
  "subtle",
  "thiserror",
  "uuid",
@@ -1108,7 +1111,10 @@ dependencies = [
  "postcard",
  "serde",
  "sha3 0.10.8",
+ "shard",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -1562,6 +1568,7 @@ dependencies = [
  "shard",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
