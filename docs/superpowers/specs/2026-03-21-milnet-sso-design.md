@@ -866,7 +866,222 @@ No publicly documented system — DoD CAC/PIV, NSA CSfC, Google BeyondCorp, Micr
 - **Equihash:** Memory-hard proof-of-work function
 - **Roughtime:** Authenticated time protocol (Byzantine-tolerant)
 
-## Appendix B: References
+## Appendix B: Spec Review Errata (Round 1)
+
+The following issues were identified during spec review and are resolved here.
+
+### B.1: Token Structure — Dual-Layer (CRITICAL)
+
+Tokens use TWO layers, not one:
+- **Outer layer:** Threshold-signed (FROST Ed25519 + nested ML-DSA-65) JWT-like structure. This is what the TSS produces at ceremony completion. Contains claims, tier, scope, expiry, DPoP binding.
+- **Inner layer:** HMAC-SHA512 ratchet tag appended per-use/per-epoch. The ratchet tag proves the token was used at a specific epoch. The verifier checks BOTH: (1) threshold signature on claims (using cached public key, O(1)), and (2) ratchet HMAC tag matches current or ±3 epoch (using in-memory chain state, O(1)).
+
+This is NOT a contradiction — it is layered verification. The threshold signature proves issuance authority. The ratchet tag proves temporal freshness. Both are required.
+
+### B.2: Receipt TTL (CRITICAL)
+
+Receipt TTL is per-step, not per-ceremony. Each step's receipt has 30-second TTL from its issuance. The TSS validates each receipt against its own issuance timestamp, not against the ceremony start time. A 73ms ceremony easily fits. Human delay (fumbling for FIDO2 key) is between steps — the receipt for step N is not issued until step N completes. Clock is the TSS's own Roughtime-synchronized clock.
+
+For ceremonies requiring human interaction (Level 3-4), the orchestrator issues a "ceremony-in-progress" hold at the TSS, extending the validation window to 120 seconds for human-interactive ceremonies. This hold is requested before the first receipt and cannot be forged (requires orchestrator mTLS identity).
+
+### B.3: ML-DSA-65 Key Management (CRITICAL)
+
+The ML-DSA-65 key for nested PQ signatures IS threshold-split. Each TSS node holds a share of both the Ed25519 key AND the ML-DSA-65 key. Threshold ML-DSA is achieved via the generic threshold signing framework: the coordinator collects partial signatures from t-of-n nodes and combines them. While threshold ML-DSA is not standardized (unlike FROST for Schnorr), the generic linear secret sharing approach works for ML-DSA because it is based on lattice operations that are compatible with additive secret sharing.
+
+If threshold ML-DSA proves infeasible in implementation, the fallback is: one TSS node computes the full ML-DSA-65 signature (rotating which node per request), and the other nodes verify it before the combined token is released. This provides detection (malicious ML-DSA signatures are caught) but not prevention of a single-node ML-DSA forgery. The FROST layer provides the threshold guarantee; ML-DSA provides quantum resistance.
+
+### B.4: Duress PIN Implementation (CRITICAL)
+
+Standard FIDO2 authenticators do not support dual PINs. The implementation options:
+
+1. **Custom firmware (preferred for MILNET):** Military-issue FIDO2 keys (e.g., custom YubiKey FIPS with modified firmware) that support duress PIN extension. This is feasible for a controlled military deployment where devices are issued centrally.
+
+2. **Client-side software layer:** The client application (not the authenticator) accepts two PINs. Normal PIN proceeds normally. Duress PIN sends a pre-registered "canary" signal to the orchestrator before initiating the FIDO2 ceremony. The authenticator itself is unaware. Less secure (malware on client could detect the canary) but works with COTS hardware.
+
+3. **Separate duress button:** A physical dead-man's switch or panic button on the device that triggers the duress protocol independently of the FIDO2 ceremony.
+
+For MILNET deployment, option 1 is recommended. The spec acknowledges this requires custom hardware.
+
+### B.5: Argon2 Client-Side vs Server-Side (CRITICAL)
+
+In OPAQUE, Argon2 runs CLIENT-SIDE as part of the key stretching to derive the OPRF input. The server never runs Argon2 for OPAQUE authentication.
+
+The "maximum 10 concurrent Argon2 operations server-side" refers to a SEPARATE concern: password quality validation during initial user enrollment/registration (where the server must verify the password meets complexity requirements by testing it against the KDF). This is a one-time operation, not per-login.
+
+The DDoS cost calculation in Section 12 is corrected: the server-side bottleneck is the OPRF evaluation (~1ms), not Argon2. The memory exhaustion attack via Argon2 does not apply because Argon2 runs on the client.
+
+### B.6: BFT Quorum Math (CRITICAL)
+
+Corrected: With 7 nodes and f=2:
+- BFT consensus requires 2f+1 = 5 honest nodes to agree
+- The system tolerates 2 Byzantine faults
+- "Any 3 honest nodes reconstruct" was INCORRECT. Corrected to: "requires 5 honest nodes for consensus; any 5 honest nodes produce a consistent view."
+- Data replication uses standard BFT replication, not erasure coding.
+
+### B.7: Ratchet ±3 Epoch Lookahead (IMPORTANT)
+
+The ±3 lookahead creates a 90-second replay window. This is an intentional trade-off:
+- Without lookahead: network jitter causes false rejections → availability impact
+- With ±3: 90-second window where a stolen token might work
+
+Mitigation: The DPoP channel binding means a stolen token can only be replayed on the same TLS connection (which the attacker would need to hijack, not just observe). The combination of ratcheting + DPoP means the attacker needs BOTH a stolen token AND control of the victim's TLS session, within 90 seconds. This is acceptable for the threat model.
+
+The spec text claiming "stolen tokens die instantly" is corrected to: "stolen tokens are usable only within a ±90-second window AND only on the same TLS channel (DPoP-bound)."
+
+### B.8: DPoP HMAC Algorithm (IMPORTANT)
+
+Corrected: All HMAC operations use HMAC-SHA512 for consistency. The DPoP binding verification uses HMAC-SHA512, not HMAC-SHA256. Updated time estimate: ~7us (negligible impact on total).
+
+### B.9: Key Lifecycle Management (CRITICAL — NEW SECTION)
+
+Added to the spec:
+
+**Initial FROST key generation:** Performed via a trusted dealer ceremony during system bootstrapping. The dealer generates the group secret, computes shares, distributes to TSS nodes over secure channels, and then DESTROYS the complete secret. Alternatively, a Distributed Key Generation (DKG) protocol is used where no single party ever holds the complete key. DKG is preferred.
+
+**Key rotation (group key change):** Triggered by compromise detection or policy (e.g., annually). New DKG ceremony produces new group key. Old key retained for verification-only during transition period. All new tokens signed with new key. Old tokens verified with old key until expiry.
+
+**TSS node revocation:** Compromised node is removed from the group. New DKG ceremony with N-1 remaining nodes + 1 new node. Old shares invalidated.
+
+**Receipt signing keys:** Generated in HSM, rotated daily, old keys retained for 24h verification window.
+
+### B.10: Disaster Recovery / Bootstrapping (CRITICAL — NEW SECTION)
+
+**Cold start procedure:**
+1. Minimum 3-of-5 TSS nodes must be online
+2. Each node verifies own binary integrity against transparency log
+3. Nodes perform mutual attestation
+4. FROST DKG ceremony establishes new signing key (or restore from encrypted backup shares)
+5. Orchestrator starts, discovers available modules
+6. Gateway starts, begins accepting connections
+7. Audit module MUST be running before any auth is permitted
+
+**Backup:** Encrypted threshold shares backed up to geographically separate cold storage. k-of-n backup custodians required to restore. Backup verification tested quarterly.
+
+**Tier 4 Emergency recovery:** Shamir secret share (5-of-9 human custodians) reconstructs a master recovery key that can bootstrap a minimal system (audit + 1 TSS + orchestrator + gateway) for emergency access.
+
+### B.11: User Enrollment Ceremony (IMPORTANT — NEW SECTION)
+
+**First user enrollment:**
+1. Admin initiates enrollment (Level 2 action, requires step-up re-auth)
+2. User receives enrollment token via secure out-of-band channel (in-person, encrypted email)
+3. User presents enrollment token to system
+4. OPAQUE registration: client-side key stretching → server stores OPAQUE record
+5. FIDO2 credential registration: user taps hardware key → public key stored
+6. KT log entry created for registration event
+7. Device enrollment (if not already enrolled): 2-party approval
+8. Audit entry: enrollment event with admin ID, user ID, devices, timestamp
+
+### B.12: Revocation (IMPORTANT — NEW SECTION)
+
+**User revocation:**
+1. Admin initiates (Level 2 action)
+2. User's OPAQUE record marked revoked in DB
+3. All active sessions terminated: ratchet manager broadcasts "kill session" for user ID
+4. FIDO2 credentials marked revoked
+5. KT log entry for revocation
+6. Audit entry for revocation
+7. Immediate — no token can be verified for this user after revocation event
+
+**Credential revocation (lost FIDO2 key):**
+1. User authenticates via remaining factor + step-up
+2. Lost key's public key marked revoked
+3. KT log entry
+4. New key enrollment ceremony
+
+**Token revocation:** Not needed — ratchet advancement + short lifetimes (5-15 min) + DPoP binding make explicit token revocation unnecessary. Revoke the user or session, not individual tokens.
+
+### B.13: Horizontal Scaling (IMPORTANT — NEW SECTION)
+
+**Stateless modules (Gateway, Orchestrator, Verifier):** Horizontally scalable. Run N replicas behind load balancer. No shared state.
+
+**Stateful modules (TSS):** Fixed at 5 nodes (threshold group). Not horizontally scalable — adding nodes requires DKG re-ceremony. Throughput: ~500 signings/sec (with 3-node participation per signing). For surge scenarios (100K+ users), use token caching: issue a slightly longer-lived token during surge that can be verified without TSS involvement, reducing TSS load.
+
+**Ratchet Manager:** Partitioned by session ID. Each instance manages a shard of sessions. Horizontal scaling via consistent hash ring.
+
+**T-OPAQUE:** Stateless per-request (OPRF evaluation). Horizontally scalable.
+
+**KT Log:** Single writer (batched appends). Multiple read replicas for proof serving.
+
+**Risk Engine:** Partitioned by user ID. Horizontally scalable.
+
+**Audit:** Fixed at 7 BFT nodes. Not horizontally scalable (BFT complexity grows O(n^2)).
+
+**Surge throughput estimate (revised):** With token caching during surge, the TSS bottleneck is mitigated. Verifier handles 100K+ verifications/sec (in-memory, O(1)). Auth ceremonies limited to ~500/sec by TSS — during surge, a queue with priority (Tier 1 first) manages backlog. 100K users authenticating over a 5-minute window = ~333/sec, within capacity.
+
+### B.14: Token Format (IMPORTANT — NEW SECTION)
+
+```
+Token (binary, postcard-serialized):
+  header:
+    version: u8
+    algorithm: u8 (0x01 = Ed25519+ML-DSA-65)
+    tier: u8
+  claims:
+    sub: UUID (user_id)
+    iss: [u8; 32] (issuer hash)
+    iat: i64 (issued at, microseconds)
+    exp: i64 (expires at, microseconds)
+    scope: u32 (bitfield of resource scopes)
+    dpop_hash: [u8; 32] (H(client DPoP public key))
+    ceremony_id: [u8; 32]
+    tier: u8
+    ratchet_epoch: u64
+  ratchet_tag: [u8; 64] (HMAC-SHA512 for current epoch)
+  frost_signature: [u8; 64] (Ed25519 threshold signature over header+claims)
+  pq_signature: Vec<u8> (ML-DSA-65 over header+claims+frost_signature)
+```
+
+Total size: ~3.5 KB (ML-DSA-65 signatures are ~3.3 KB). Compared to typical JWT: larger, but binary serialization compensates for parse overhead.
+
+### B.15: FROST Coordinator Role (CRITICAL — NEW SECTION)
+
+The **Auth Orchestrator** (Module 2) acts as the FROST coordinator. It collects partial signatures from t TSS nodes and aggregates them. FROST is secure against a malicious coordinator — the coordinator sees partial signatures but cannot forge a valid aggregate signature without t valid shares. A malicious coordinator can only cause DoS (refuse to aggregate), not forgery.
+
+If the orchestrator is compromised and refuses to coordinate, any TSS node can act as fallback coordinator (FROST does not require a fixed coordinator). The TSS nodes detect coordinator failure via timeout and elect a new coordinator.
+
+### B.16: KT Split-View Protection (IMPORTANT)
+
+Key Transparency requires a gossip protocol to prevent split-view attacks. Added: clients and monitors periodically exchange signed tree heads (STHs) and verify consistency. If any two parties observe inconsistent STHs for the same epoch, a split-view attack is detected and an alert is triggered. The gossip protocol runs over the existing PQ-hybrid mTLS channels.
+
+### B.17: mTLS Certificate Management (IMPORTANT)
+
+Module certificates are issued by a private CA that is itself threshold-managed (the root CA private key is FROST-split across TSS nodes). Certificate lifetimes are 24 hours with automated renewal. Each module verifies the peer's certificate against the private CA root + the module attestation record (binary hash must match transparency log). "Ephemeral per-connection keys" refers to TLS session keys (ephemeral DH), not certificates — certificates are persistent (24h) and identity-bearing.
+
+### B.18: Implementation Risk Acknowledgment (IMPORTANT)
+
+This system combines 8+ techniques that are individually proven but have never been integrated. Implementation risks include: unknown interaction effects between components, performance characteristics under real load that differ from theoretical analysis, operational complexity of managing 9+ processes with threshold crypto, and the absence of a community of practice for troubleshooting. Mitigation: phased implementation with extensive integration testing, red-team exercises at each phase, and graceful degradation paths that allow falling back to simpler (but still secure) configurations during the maturation period.
+
+### B.19: Risk Scoring Parameters (IMPORTANT)
+
+Risk score = weighted sum of signals, range [0.0, 1.0]:
+- Device attestation freshness: weight 0.25 (stale attestation increases risk)
+- Geo-velocity: weight 0.20 (impossible travel between auth events)
+- Network context: weight 0.15 (unusual IP range, VPN, Tor)
+- Time-of-day: weight 0.10 (auth outside normal hours)
+- Access pattern: weight 0.15 (unusual API calls for this user/device class)
+- Failed attempt history: weight 0.15 (recent failures increase risk)
+
+Thresholds:
+- score < 0.3: normal (no action)
+- 0.3 <= score < 0.6: elevated (increase logging, shorten token lifetime)
+- 0.6 <= score < 0.8: high (require step-up re-authentication)
+- score >= 0.8: critical (terminate session, require full ceremony)
+
+Thresholds are configurable via Level 3 action (two-person approval). Changes audited.
+
+### B.20: Ceremony Tier vs Device Tier Mapping (IMPORTANT)
+
+- Device Tier determines the MAXIMUM ceremony level the device can perform
+- Ceremony Tier determines the authentication strength REQUIRED for the resource
+- A Tier 2 device CANNOT perform a Tier 1 ceremony (lacks FIDO2 hardware)
+- A Tier 1 device CAN perform a Tier 2 ceremony (has all capabilities)
+- Resource access requires: device_tier >= resource_tier AND ceremony completed at resource_tier level
+
+### B.21: Equihash Cost Estimate Correction (SUGGESTION)
+
+Corrected: At 10ms difficulty, one core does 100 puzzles/sec. For 1M req/s, attacker needs ~10,000 cores at normal difficulty. Under DDoS (1-5s difficulty), attacker needs 1M-5M core-seconds/sec = 1M-5M cores. The original estimate of 100,000 was for moderate difficulty (~100ms). Corrected in spec.
+
+## Appendix C: References
 
 - NIST FIPS 203 (ML-KEM), FIPS 204 (ML-DSA), FIPS 205 (SLH-DSA)
 - RFC 9497 (OPAQUE / OPRFs Using Prime-Order Groups)
