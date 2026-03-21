@@ -6,4 +6,6 @@
 
 pub mod ct;
 pub mod entropy;
+pub mod receipts;
+pub mod threshold;
 pub mod xwing;
