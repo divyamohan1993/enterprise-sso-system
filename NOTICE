@@ -1,0 +1,35 @@
+MILNET SSO System
+Copyright (c) 2026 Divya Mohan (https://dmj.one)
+
+This software was designed and built through a human-AI collaboration:
+
+  Creator & Project Lead:
+    Divya Mohan (https://dmj.one)
+    GitHub: @divyamohan1993
+
+  AI Architecture & Orchestration Partner:
+    Claude Opus 4.6 (Anthropic)
+    Role: Architecture design, security specification, red team analysis,
+          implementation planning, code generation, and test development
+
+This notice must be preserved in all copies or substantial portions
+of the software, as required by the MIT License above.
+
+---
+
+Acknowledgments:
+
+The cryptographic foundations of this system rely on the work of:
+- Zcash Foundation (FROST threshold signatures, RFC 9591)
+- RustCrypto contributors (ml-kem, argon2, sha2, sha3, hkdf, hmac)
+- Cryspen (libcrux formally verified crypto)
+- Meta/WhatsApp (opaque-ke, OPAQUE RFC 9807)
+- The Tor Project (equix client puzzles)
+- curve25519-dalek contributors (x25519-dalek, ed25519-dalek)
+- rustls contributors (memory-safe TLS)
+
+Red team methodology inspired by:
+- NSA CNSA 2.0 migration guidance
+- NIST SP 800-207 Zero Trust Architecture
+- Nuclear command and control (Two-Person Integrity, Permissive Action Links)
+- NASA/ESA flight software formal verification practices
