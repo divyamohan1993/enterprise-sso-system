@@ -55,3 +55,20 @@ temp/
 
 # Debug
 .debug/
+
+# Terraform
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
+*.tfstate
+*.tfstate.backup
+.terraform/
+
+# Database
+*.db
+*.sqlite
+
+# Runtime
+milnet-sso.db
+*.pid
