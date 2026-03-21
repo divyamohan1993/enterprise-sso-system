@@ -4,9 +4,9 @@ use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
+use sqlx::PgPool;
+use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_http::services::ServeDir;
 use uuid::Uuid;
@@ -16,7 +16,7 @@ use uuid::Uuid;
 // ---------------------------------------------------------------------------
 
 pub struct AppState {
-    pub db: Mutex<Connection>,
+    pub db: PgPool,
     pub credential_store: RwLock<opaque::store::CredentialStore>,
     pub device_registry: RwLock<risk::tiers::DeviceRegistry>,
     pub audit_log: RwLock<audit::log::AuditLog>,
@@ -179,10 +179,10 @@ pub struct DeviceResponse {
 #[derive(Serialize)]
 pub struct SystemStatus {
     pub version: String,
-    pub users_registered: usize,
-    pub devices_enrolled: usize,
-    pub portals_active: usize,
-    pub audit_entries: usize,
+    pub users_registered: i64,
+    pub devices_enrolled: i64,
+    pub portals_active: i64,
+    pub audit_entries: i64,
     pub kt_operations: usize,
 }
 
@@ -287,21 +287,30 @@ async fn health_check() -> Json<serde_json::Value> {
 }
 
 async fn get_status(State(state): State<Arc<AppState>>) -> Json<SystemStatus> {
-    let (users_registered, devices_enrolled, portals_active, audit_entries) = {
-        let db = state.db.lock().unwrap();
-        let u: usize = db.query_row("SELECT COUNT(*) FROM users WHERE is_active = 1", [], |row| row.get(0)).unwrap_or(0);
-        let d: usize = db.query_row("SELECT COUNT(*) FROM devices WHERE is_active = 1", [], |row| row.get(0)).unwrap_or(0);
-        let p: usize = db.query_row("SELECT COUNT(*) FROM portals WHERE is_active = 1", [], |row| row.get(0)).unwrap_or(0);
-        let a: usize = db.query_row("SELECT COUNT(*) FROM audit_log", [], |row| row.get(0)).unwrap_or(0);
-        (u, d, p, a)
-    };
+    let u: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE is_active = true")
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or((0,));
+    let d: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM devices WHERE is_active = true")
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or((0,));
+    let p: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM portals WHERE is_active = true")
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or((0,));
+    let a: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or((0,));
+
     let kt = state.kt_tree.read().await;
     Json(SystemStatus {
         version: "0.1.0".to_string(),
-        users_registered,
-        devices_enrolled,
-        portals_active,
-        audit_entries,
+        users_registered: u.0,
+        devices_enrolled: d.0,
+        portals_active: p.0,
+        audit_entries: a.0,
         kt_operations: kt.len(),
     })
 }
@@ -317,16 +326,17 @@ async fn register_user(
     let mut store = state.credential_store.write().await;
     let user_id = store.register_with_password(&req.username, req.password.as_bytes());
 
-    // Persist user to SQLite
-    {
-        let db = state.db.lock().unwrap();
-        let _ = db.execute(
-            "INSERT OR REPLACE INTO users (id, username, created_at, is_active) VALUES (?1, ?2, ?3, 1)",
-            params![user_id.to_string(), &req.username, now_secs()],
-        );
-    }
+    // Persist user to PostgreSQL
+    let _ = sqlx::query(
+        "INSERT INTO users (id, username, created_at, is_active) VALUES ($1, $2, $3, true) ON CONFLICT (id) DO UPDATE SET username = $2"
+    )
+    .bind(user_id)
+    .bind(&req.username)
+    .bind(now_secs())
+    .execute(&state.db)
+    .await;
 
-    // Log to audit (in-memory chain + SQLite)
+    // Log to audit (in-memory chain + PostgreSQL)
     let mut audit = state.audit_log.write().await;
     let entry = audit.append(
         common::types::AuditEventType::CredentialRegistered,
@@ -336,21 +346,18 @@ async fn register_user(
         vec![],
     );
 
-    {
-        let db = state.db.lock().unwrap();
-        let user_ids_json = serde_json::to_string(&entry.user_ids).unwrap_or_default();
-        let _ = db.execute(
-            "INSERT INTO audit_log (id, event_type, user_ids, timestamp, prev_hash, signature) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                entry.event_id.to_string(),
-                format!("{:?}", entry.event_type),
-                user_ids_json,
-                entry.timestamp,
-                entry.prev_hash.to_vec(),
-                entry.signature.clone(),
-            ],
-        );
-    }
+    let user_ids_json = serde_json::to_string(&entry.user_ids).unwrap_or_default();
+    let _ = sqlx::query(
+        "INSERT INTO audit_log (id, event_type, user_ids, timestamp, prev_hash, signature) VALUES ($1, $2, $3, $4, $5, $6)"
+    )
+    .bind(entry.event_id)
+    .bind(format!("{:?}", entry.event_type))
+    .bind(user_ids_json)
+    .bind(entry.timestamp)
+    .bind(entry.prev_hash.to_vec())
+    .bind(entry.signature.clone())
+    .execute(&state.db)
+    .await;
 
     // Log to KT
     let mut kt = state.kt_tree.write().await;
@@ -367,16 +374,14 @@ async fn register_user(
 }
 
 async fn list_users(State(state): State<Arc<AppState>>) -> Json<Vec<String>> {
-    let db = state.db.lock().unwrap();
-    let mut stmt = db
-        .prepare("SELECT username FROM users WHERE is_active = 1")
-        .unwrap();
-    let names: Vec<String> = stmt
-        .query_map([], |row| row.get(0))
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .collect();
-    Json(names)
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT username FROM users WHERE is_active = true"
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    Json(rows.into_iter().map(|r| r.0).collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -389,18 +394,17 @@ async fn register_portal(
 ) -> Json<PortalResponse> {
     let portal_id = Uuid::new_v4();
 
-    let db = state.db.lock().unwrap();
-    let _ = db.execute(
-        "INSERT INTO portals (id, name, callback_url, required_tier, required_scope, is_active, created_at) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)",
-        params![
-            portal_id.to_string(),
-            &req.name,
-            &req.callback_url,
-            req.required_tier as i64,
-            req.required_scope as i64,
-            now_secs(),
-        ],
-    );
+    let _ = sqlx::query(
+        "INSERT INTO portals (id, name, callback_url, required_tier, required_scope, is_active, created_at) VALUES ($1, $2, $3, $4, $5, true, $6)"
+    )
+    .bind(portal_id)
+    .bind(&req.name)
+    .bind(&req.callback_url)
+    .bind(req.required_tier as i32)
+    .bind(req.required_scope as i32)
+    .bind(now_secs())
+    .execute(&state.db)
+    .await;
 
     Json(PortalResponse {
         id: portal_id,
@@ -413,25 +417,22 @@ async fn register_portal(
 }
 
 async fn list_portals(State(state): State<Arc<AppState>>) -> Json<Vec<PortalResponse>> {
-    let db = state.db.lock().unwrap();
-    let mut stmt = db
-        .prepare("SELECT id, name, callback_url, required_tier, required_scope, is_active FROM portals WHERE is_active = 1")
-        .unwrap();
-    let portals: Vec<PortalResponse> = stmt
-        .query_map([], |row| {
-            let id_str: String = row.get(0)?;
-            Ok(PortalResponse {
-                id: Uuid::parse_str(&id_str).unwrap_or(Uuid::nil()),
-                name: row.get(1)?,
-                callback_url: row.get(2)?,
-                required_tier: row.get::<_, i64>(3)? as u8,
-                required_scope: row.get::<_, i64>(4)? as u32,
-                is_active: row.get::<_, i64>(5)? != 0,
-            })
-        })
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .collect();
+    let rows: Vec<(Uuid, String, String, i32, i32, bool)> = sqlx::query_as(
+        "SELECT id, name, callback_url, required_tier, required_scope, is_active FROM portals WHERE is_active = true"
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    let portals = rows.into_iter().map(|r| PortalResponse {
+        id: r.0,
+        name: r.1,
+        callback_url: r.2,
+        required_tier: r.3 as u8,
+        required_scope: r.4 as u32,
+        is_active: r.5,
+    }).collect();
+
     Json(portals)
 }
 
@@ -439,11 +440,10 @@ async fn delete_portal(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
 ) -> Json<serde_json::Value> {
-    let db = state.db.lock().unwrap();
-    let _ = db.execute(
-        "UPDATE portals SET is_active = 0 WHERE id = ?1",
-        params![id.to_string()],
-    );
+    let _ = sqlx::query("UPDATE portals SET is_active = false WHERE id = $1")
+        .bind(id)
+        .execute(&state.db)
+        .await;
     Json(serde_json::json!({"deleted": true}))
 }
 
@@ -457,19 +457,16 @@ async fn enroll_device(
 ) -> Json<DeviceResponse> {
     let device_id = Uuid::new_v4();
 
-    {
-        let db = state.db.lock().unwrap();
-        let _ = db.execute(
-            "INSERT INTO devices (id, tier, attestation_hash, enrolled_by, is_active, created_at) VALUES (?1, ?2, ?3, ?4, 1, ?5)",
-            params![
-                device_id.to_string(),
-                req.tier as i64,
-                &req.attestation_hash,
-                req.enrolled_by.to_string(),
-                now_secs(),
-            ],
-        );
-    }
+    let _ = sqlx::query(
+        "INSERT INTO devices (id, tier, attestation_hash, enrolled_by, is_active, created_at) VALUES ($1, $2, $3, $4, true, $5)"
+    )
+    .bind(device_id)
+    .bind(req.tier as i32)
+    .bind(req.attestation_hash.as_bytes())
+    .bind(req.enrolled_by)
+    .bind(now_secs())
+    .execute(&state.db)
+    .await;
 
     Json(DeviceResponse {
         device_id,
@@ -480,24 +477,20 @@ async fn enroll_device(
 }
 
 async fn list_devices(State(state): State<Arc<AppState>>) -> Json<Vec<DeviceResponse>> {
-    let db = state.db.lock().unwrap();
-    let mut stmt = db
-        .prepare("SELECT id, tier, enrolled_by, is_active FROM devices WHERE is_active = 1")
-        .unwrap();
-    let devices: Vec<DeviceResponse> = stmt
-        .query_map([], |row| {
-            let id_str: String = row.get(0)?;
-            let enrolled_str: String = row.get(2)?;
-            Ok(DeviceResponse {
-                device_id: Uuid::parse_str(&id_str).unwrap_or(Uuid::nil()),
-                tier: row.get::<_, i64>(1)? as u8,
-                enrolled_by: Uuid::parse_str(&enrolled_str).unwrap_or(Uuid::nil()),
-                is_active: row.get::<_, i64>(3)? != 0,
-            })
-        })
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .collect();
+    let rows: Vec<(Uuid, i32, Uuid, bool)> = sqlx::query_as(
+        "SELECT id, tier, enrolled_by, is_active FROM devices WHERE is_active = true"
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    let devices = rows.into_iter().map(|r| DeviceResponse {
+        device_id: r.0,
+        tier: r.1 as u8,
+        enrolled_by: r.2,
+        is_active: r.3,
+    }).collect();
+
     Json(devices)
 }
 
@@ -506,27 +499,28 @@ async fn list_devices(State(state): State<Arc<AppState>>) -> Json<Vec<DeviceResp
 // ---------------------------------------------------------------------------
 
 async fn get_audit_log(State(state): State<Arc<AppState>>) -> Json<Vec<AuditEntryResponse>> {
-    let db = state.db.lock().unwrap();
-    let mut stmt = db
-        .prepare("SELECT id, event_type, user_ids, timestamp FROM audit_log ORDER BY timestamp ASC")
-        .unwrap();
-    let entries: Vec<AuditEntryResponse> = stmt
-        .query_map([], |row| {
-            let id_str: String = row.get(0)?;
-            let user_ids_json: String = row.get::<_, String>(2).unwrap_or_else(|_| "[]".into());
-            let user_ids: Vec<Uuid> = serde_json::from_str(&user_ids_json).unwrap_or_default();
-            Ok(AuditEntryResponse {
-                event_id: Uuid::parse_str(&id_str).unwrap_or(Uuid::nil()),
-                event_type: row.get(1)?,
-                user_ids,
-                device_ids: vec![],
-                risk_score: 0.0,
-                timestamp: row.get(3)?,
-            })
-        })
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .collect();
+    let rows: Vec<(Uuid, String, Option<String>, i64)> = sqlx::query_as(
+        "SELECT id, event_type, user_ids, timestamp FROM audit_log ORDER BY timestamp ASC"
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    let entries = rows.into_iter().map(|r| {
+        let user_ids: Vec<Uuid> = r.2
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        AuditEntryResponse {
+            event_id: r.0,
+            event_type: r.1,
+            user_ids,
+            device_ids: vec![],
+            risk_score: 0.0,
+            timestamp: r.3,
+        }
+    }).collect();
+
     Json(entries)
 }
 
@@ -592,21 +586,18 @@ async fn auth_login(
             let sig = hex(&mac.finalize().into_bytes());
             let token = format!("{payload}:{sig}");
 
-            // Persist session to SQLite
-            {
-                let db = state.db.lock().unwrap();
-                let session_id = Uuid::new_v4();
-                let expires_at = now as i64 + 3600;
-                let _ = db.execute(
-                    "INSERT INTO sessions (id, user_id, created_at, expires_at, is_active) VALUES (?1, ?2, ?3, ?4, 1)",
-                    params![
-                        session_id.to_string(),
-                        user_id.to_string(),
-                        now as i64,
-                        expires_at,
-                    ],
-                );
-            }
+            // Persist session to PostgreSQL
+            let session_id = Uuid::new_v4();
+            let expires_at = now as i64 + 3600;
+            let _ = sqlx::query(
+                "INSERT INTO sessions (id, user_id, created_at, expires_at, is_active) VALUES ($1, $2, $3, $4, true)"
+            )
+            .bind(session_id)
+            .bind(user_id)
+            .bind(now as i64)
+            .bind(expires_at)
+            .execute(&state.db)
+            .await;
 
             Json(LoginResponse {
                 success: true,

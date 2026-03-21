@@ -12,4 +12,5 @@ subtle.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
 sha2.workspace = true
-rusqlite.workspace = true
+sqlx.workspace = true
+tokio.workspace = true

@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use admin::routes::{api_router, AppState};
@@ -13,12 +13,13 @@ async fn main() {
         key
     });
 
-    let db_path = std::env::var("DB_PATH").unwrap_or_else(|_| "milnet-sso.db".to_string());
-    let db = common::db::init_database(&db_path);
-    tracing::info!("Database opened at {db_path}");
+    let db_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://localhost/milnet_sso".to_string());
+    let pool = common::db::init_database(&db_url).await;
+    tracing::info!("Connected to PostgreSQL");
 
     let state = Arc::new(AppState {
-        db: Mutex::new(db),
+        db: pool,
         credential_store: RwLock::new(opaque::store::CredentialStore::new()),
         device_registry: RwLock::new(risk::tiers::DeviceRegistry::new()),
         audit_log: RwLock::new(audit::log::AuditLog::new()),

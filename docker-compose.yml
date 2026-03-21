@@ -1,15 +1,38 @@
 version: '3.8'
 
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: milnet_sso
+      POSTGRES_USER: milnet
+      POSTGRES_PASSWORD: milnet_secure_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U milnet"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   sso-admin:
     build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://milnet:milnet_secure_password@postgres:5432/milnet_sso
+      ADMIN_PORT: 8080
+      RUST_LOG: info
     ports:
       - "8080:8080"
-    environment:
-      - ADMIN_PORT=8080
-      - RUST_LOG=info
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/api/health"]
       interval: 10s
       timeout: 5s
       retries: 3
+
+volumes:
+  pgdata:

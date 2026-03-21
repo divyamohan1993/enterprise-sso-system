@@ -1,165 +1,158 @@
-//! SQLite persistence layer for the SSO system.
-//! Uses rusqlite with bundled SQLite for zero-dependency deployment.
+//! PostgreSQL persistence layer for the SSO system.
+//! Uses sqlx with async PostgreSQL driver.
 
-use rusqlite::{Connection, params};
+use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
 
-pub fn init_database(path: &str) -> Connection {
-    let conn = Connection::open(path).expect("Failed to open database");
-    conn.execute_batch("
-        PRAGMA journal_mode = WAL;
-        PRAGMA foreign_keys = ON;
+/// Initialize the PostgreSQL connection pool
+pub async fn init_database(database_url: &str) -> PgPool {
+    let pool = PgPoolOptions::new()
+        .max_connections(20)
+        .connect(database_url)
+        .await
+        .expect("Failed to connect to PostgreSQL");
 
+    // Run migrations
+    sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS users (
-            id TEXT PRIMARY KEY,
-            username TEXT UNIQUE NOT NULL,
-            opaque_registration BLOB,
-            created_at INTEGER NOT NULL,
-            is_active INTEGER NOT NULL DEFAULT 1
-        );
+            id UUID PRIMARY KEY,
+            username VARCHAR(255) UNIQUE NOT NULL,
+            opaque_registration BYTEA,
+            created_at BIGINT NOT NULL,
+            is_active BOOLEAN NOT NULL DEFAULT true
+        )
+    "#).execute(&pool).await.expect("Failed to create users table");
 
+    sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS devices (
-            id TEXT PRIMARY KEY,
+            id UUID PRIMARY KEY,
             tier INTEGER NOT NULL,
-            attestation_hash BLOB,
-            enrolled_by TEXT,
-            is_active INTEGER NOT NULL DEFAULT 1,
-            created_at INTEGER NOT NULL
-        );
+            attestation_hash BYTEA,
+            enrolled_by UUID,
+            is_active BOOLEAN NOT NULL DEFAULT true,
+            created_at BIGINT NOT NULL
+        )
+    "#).execute(&pool).await.expect("Failed to create devices table");
 
+    sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS portals (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
+            id UUID PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
             callback_url TEXT NOT NULL,
-            client_id TEXT UNIQUE,
-            client_secret TEXT,
+            client_id VARCHAR(255) UNIQUE,
+            client_secret VARCHAR(255),
             required_tier INTEGER NOT NULL DEFAULT 2,
             required_scope INTEGER NOT NULL DEFAULT 0,
-            is_active INTEGER NOT NULL DEFAULT 1,
-            created_at INTEGER NOT NULL
-        );
+            is_active BOOLEAN NOT NULL DEFAULT true,
+            created_at BIGINT NOT NULL
+        )
+    "#).execute(&pool).await.expect("Failed to create portals table");
 
+    sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS audit_log (
-            id TEXT PRIMARY KEY,
-            event_type TEXT NOT NULL,
+            id UUID PRIMARY KEY,
+            event_type VARCHAR(100) NOT NULL,
             user_ids TEXT,
-            timestamp INTEGER NOT NULL,
-            prev_hash BLOB,
-            signature BLOB,
+            timestamp BIGINT NOT NULL,
+            prev_hash BYTEA,
+            signature BYTEA,
             data TEXT
-        );
+        )
+    "#).execute(&pool).await.expect("Failed to create audit_log table");
 
+    sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS sessions (
-            id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            ratchet_epoch INTEGER NOT NULL DEFAULT 0,
-            created_at INTEGER NOT NULL,
-            expires_at INTEGER NOT NULL,
-            is_active INTEGER NOT NULL DEFAULT 1
-        );
+            id UUID PRIMARY KEY,
+            user_id UUID NOT NULL,
+            ratchet_epoch BIGINT NOT NULL DEFAULT 0,
+            created_at BIGINT NOT NULL,
+            expires_at BIGINT NOT NULL,
+            is_active BOOLEAN NOT NULL DEFAULT true
+        )
+    "#).execute(&pool).await.expect("Failed to create sessions table");
 
+    sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS oauth_codes (
-            code TEXT PRIMARY KEY,
-            client_id TEXT NOT NULL,
-            user_id TEXT NOT NULL,
+            code VARCHAR(255) PRIMARY KEY,
+            client_id VARCHAR(255) NOT NULL,
+            user_id UUID NOT NULL,
             redirect_uri TEXT NOT NULL,
             scope TEXT,
             code_challenge TEXT,
             nonce TEXT,
-            expires_at INTEGER NOT NULL
-        );
-    ").expect("Failed to initialize database schema");
+            expires_at BIGINT NOT NULL
+        )
+    "#).execute(&pool).await.expect("Failed to create oauth_codes table");
 
-    conn
+    sqlx::query(r#"
+        CREATE TABLE IF NOT EXISTS fido_credentials (
+            credential_id BYTEA PRIMARY KEY,
+            user_id UUID NOT NULL,
+            public_key BYTEA NOT NULL,
+            sign_count INTEGER NOT NULL DEFAULT 0,
+            authenticator_type VARCHAR(50) NOT NULL,
+            created_at BIGINT NOT NULL
+        )
+    "#).execute(&pool).await.expect("Failed to create fido_credentials table");
+
+    pool
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::params;
 
-    #[test]
-    fn test_db_init_creates_tables() {
-        let conn = init_database(":memory:");
-        let tables: Vec<String> = conn
-            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect();
-        assert!(tables.contains(&"users".to_string()));
-        assert!(tables.contains(&"devices".to_string()));
-        assert!(tables.contains(&"portals".to_string()));
-        assert!(tables.contains(&"audit_log".to_string()));
-        assert!(tables.contains(&"sessions".to_string()));
-        assert!(tables.contains(&"oauth_codes".to_string()));
+    #[tokio::test]
+    #[ignore = "requires running PostgreSQL — set DATABASE_URL"]
+    async fn test_db_init_creates_tables() {
+        let url = std::env::var("DATABASE_URL").unwrap();
+        let pool = init_database(&url).await;
+        // Verify tables exist by querying the information_schema
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ('users', 'devices', 'portals', 'audit_log', 'sessions', 'oauth_codes', 'fido_credentials')"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, 7);
     }
 
-    #[test]
-    fn test_db_insert_and_query_user() {
-        let conn = init_database(":memory:");
-        let user_id = uuid::Uuid::new_v4().to_string();
+    #[tokio::test]
+    #[ignore = "requires running PostgreSQL — set DATABASE_URL"]
+    async fn test_db_insert_and_query_user() {
+        let url = std::env::var("DATABASE_URL").unwrap();
+        let pool = init_database(&url).await;
+        let user_id = uuid::Uuid::new_v4();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
 
-        conn.execute(
-            "INSERT INTO users (id, username, opaque_registration, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![user_id, "alice", &[0u8; 32] as &[u8], now],
+        sqlx::query("INSERT INTO users (id, username, opaque_registration, created_at) VALUES ($1, $2, $3, $4)")
+            .bind(user_id)
+            .bind("alice")
+            .bind(&[0u8; 32] as &[u8])
+            .bind(now)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let row: (uuid::Uuid, String) = sqlx::query_as(
+            "SELECT id, username FROM users WHERE username = $1"
         )
+        .bind("alice")
+        .fetch_one(&pool)
+        .await
         .unwrap();
 
-        let (found_id, found_name): (String, String) = conn
-            .query_row(
-                "SELECT id, username FROM users WHERE username = ?1",
-                params!["alice"],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
+        assert_eq!(row.0, user_id);
+        assert_eq!(row.1, "alice");
+
+        // Clean up
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
             .unwrap();
-
-        assert_eq!(found_id, user_id);
-        assert_eq!(found_name, "alice");
-    }
-
-    #[test]
-    fn test_db_survives_reconnect() {
-        let dir = std::env::temp_dir().join(format!("sso_test_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let db_path = dir.join("test.db");
-        let db_path_str = db_path.to_str().unwrap();
-
-        let user_id = uuid::Uuid::new_v4().to_string();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-
-        // Open, insert, close
-        {
-            let conn = init_database(db_path_str);
-            conn.execute(
-                "INSERT INTO users (id, username, created_at) VALUES (?1, ?2, ?3)",
-                params![user_id, "bob", now],
-            )
-            .unwrap();
-            // conn dropped here
-        }
-
-        // Reopen and verify data persists
-        {
-            let conn = init_database(db_path_str);
-            let found: String = conn
-                .query_row(
-                    "SELECT username FROM users WHERE id = ?1",
-                    params![user_id],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(found, "bob");
-        }
-
-        // Cleanup
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
