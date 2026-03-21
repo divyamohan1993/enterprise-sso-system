@@ -1,0 +1,25 @@
+[package]
+name = "sso-e2e"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sso-common = { path = "../sso-common" }
+sso-crypto = { path = "../sso-crypto" }
+sso-shard = { path = "../sso-shard" }
+sso-gateway = { path = "../sso-gateway" }
+sso-orchestrator = { path = "../sso-orchestrator" }
+sso-opaque = { path = "../sso-opaque" }
+sso-tss = { path = "../sso-tss" }
+sso-verifier = { path = "../sso-verifier" }
+sso-ratchet = { path = "../sso-ratchet" }
+sso-audit = { path = "../sso-audit" }
+sso-kt = { path = "../sso-kt" }
+sso-risk = { path = "../sso-risk" }
+tokio.workspace = true
+serde.workspace = true
+postcard.workspace = true
+uuid.workspace = true
+frost-ristretto255.workspace = true
+rand = "0.8"

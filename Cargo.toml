@@ -1,19 +1,19 @@
 [workspace]
 resolver = "2"
 members = [
-    "milnet-common",
-    "milnet-crypto",
-    "milnet-shard",
-    "milnet-gateway",
-    "milnet-orchestrator",
-    "milnet-tss",
-    "milnet-verifier",
-    "milnet-opaque",
-    "milnet-ratchet",
-    "milnet-kt",
-    "milnet-risk",
-    "milnet-audit",
-    "milnet-e2e",
+    "sso-common",
+    "sso-crypto",
+    "sso-shard",
+    "sso-gateway",
+    "sso-orchestrator",
+    "sso-tss",
+    "sso-verifier",
+    "sso-opaque",
+    "sso-ratchet",
+    "sso-kt",
+    "sso-risk",
+    "sso-audit",
+    "sso-e2e",
 ]
 
 [workspace.package]

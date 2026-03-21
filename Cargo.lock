@@ -755,226 +755,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
-name = "milnet-audit"
-version = "0.1.0"
-dependencies = [
- "milnet-common",
- "milnet-crypto",
- "postcard",
- "serde",
- "sha2",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "milnet-common"
-version = "0.1.0"
-dependencies = [
- "postcard",
- "serde",
- "subtle",
- "thiserror",
- "uuid",
- "zeroize",
-]
-
-[[package]]
-name = "milnet-crypto"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "ed25519-dalek",
- "frost-core",
- "frost-ristretto255",
- "getrandom 0.2.17",
- "hkdf",
- "hmac",
- "milnet-common",
- "ml-kem",
- "rand",
- "sha2",
- "sha3",
- "subtle",
- "uuid",
- "x25519-dalek",
- "zeroize",
-]
-
-[[package]]
-name = "milnet-e2e"
-version = "0.1.0"
-dependencies = [
- "frost-ristretto255",
- "milnet-audit",
- "milnet-common",
- "milnet-crypto",
- "milnet-gateway",
- "milnet-kt",
- "milnet-opaque",
- "milnet-orchestrator",
- "milnet-ratchet",
- "milnet-risk",
- "milnet-shard",
- "milnet-tss",
- "milnet-verifier",
- "postcard",
- "rand",
- "serde",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "milnet-gateway"
-version = "0.1.0"
-dependencies = [
- "milnet-common",
- "milnet-crypto",
- "milnet-shard",
- "postcard",
- "rustls",
- "serde",
- "sha2",
- "tokio",
- "tokio-rustls",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "milnet-kt"
-version = "0.1.0"
-dependencies = [
- "milnet-common",
- "milnet-crypto",
- "postcard",
- "serde",
- "sha3",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "milnet-opaque"
-version = "0.1.0"
-dependencies = [
- "argon2",
- "milnet-common",
- "milnet-crypto",
- "milnet-shard",
- "opaque-ke",
- "postcard",
- "serde",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "milnet-orchestrator"
-version = "0.1.0"
-dependencies = [
- "milnet-common",
- "milnet-crypto",
- "milnet-gateway",
- "milnet-opaque",
- "milnet-shard",
- "milnet-tss",
- "postcard",
- "serde",
- "sha2",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "milnet-ratchet"
-version = "0.1.0"
-dependencies = [
- "hkdf",
- "hmac",
- "milnet-common",
- "milnet-crypto",
- "milnet-shard",
- "postcard",
- "serde",
- "sha2",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "zeroize",
-]
-
-[[package]]
-name = "milnet-risk"
-version = "0.1.0"
-dependencies = [
- "milnet-common",
- "milnet-crypto",
- "milnet-shard",
- "postcard",
- "serde",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "milnet-shard"
-version = "0.1.0"
-dependencies = [
- "hmac",
- "milnet-common",
- "milnet-crypto",
- "postcard",
- "serde",
- "sha2",
- "tokio",
-]
-
-[[package]]
-name = "milnet-tss"
-version = "0.1.0"
-dependencies = [
- "ed25519-dalek",
- "milnet-common",
- "milnet-crypto",
- "milnet-shard",
- "postcard",
- "rand",
- "serde",
- "sha2",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "milnet-verifier"
-version = "0.1.0"
-dependencies = [
- "ed25519-dalek",
- "frost-ristretto255",
- "milnet-common",
- "milnet-crypto",
- "milnet-shard",
- "postcard",
- "rand",
- "serde",
- "sha2",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "mio"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1421,6 +1201,226 @@ checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
 dependencies = [
  "base64ct",
  "der",
+]
+
+[[package]]
+name = "sso-audit"
+version = "0.1.0"
+dependencies = [
+ "postcard",
+ "serde",
+ "sha2",
+ "sso-common",
+ "sso-crypto",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "sso-common"
+version = "0.1.0"
+dependencies = [
+ "postcard",
+ "serde",
+ "subtle",
+ "thiserror",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "sso-crypto"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ed25519-dalek",
+ "frost-core",
+ "frost-ristretto255",
+ "getrandom 0.2.17",
+ "hkdf",
+ "hmac",
+ "ml-kem",
+ "rand",
+ "sha2",
+ "sha3",
+ "sso-common",
+ "subtle",
+ "uuid",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "sso-e2e"
+version = "0.1.0"
+dependencies = [
+ "frost-ristretto255",
+ "postcard",
+ "rand",
+ "serde",
+ "sso-audit",
+ "sso-common",
+ "sso-crypto",
+ "sso-gateway",
+ "sso-kt",
+ "sso-opaque",
+ "sso-orchestrator",
+ "sso-ratchet",
+ "sso-risk",
+ "sso-shard",
+ "sso-tss",
+ "sso-verifier",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "sso-gateway"
+version = "0.1.0"
+dependencies = [
+ "postcard",
+ "rustls",
+ "serde",
+ "sha2",
+ "sso-common",
+ "sso-crypto",
+ "sso-shard",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "sso-kt"
+version = "0.1.0"
+dependencies = [
+ "postcard",
+ "serde",
+ "sha3",
+ "sso-common",
+ "sso-crypto",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "sso-opaque"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "opaque-ke",
+ "postcard",
+ "serde",
+ "sso-common",
+ "sso-crypto",
+ "sso-shard",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "sso-orchestrator"
+version = "0.1.0"
+dependencies = [
+ "postcard",
+ "serde",
+ "sha2",
+ "sso-common",
+ "sso-crypto",
+ "sso-gateway",
+ "sso-opaque",
+ "sso-shard",
+ "sso-tss",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "sso-ratchet"
+version = "0.1.0"
+dependencies = [
+ "hkdf",
+ "hmac",
+ "postcard",
+ "serde",
+ "sha2",
+ "sso-common",
+ "sso-crypto",
+ "sso-shard",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "sso-risk"
+version = "0.1.0"
+dependencies = [
+ "postcard",
+ "serde",
+ "sso-common",
+ "sso-crypto",
+ "sso-shard",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "sso-shard"
+version = "0.1.0"
+dependencies = [
+ "hmac",
+ "postcard",
+ "serde",
+ "sha2",
+ "sso-common",
+ "sso-crypto",
+ "tokio",
+]
+
+[[package]]
+name = "sso-tss"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "postcard",
+ "rand",
+ "serde",
+ "sha2",
+ "sso-common",
+ "sso-crypto",
+ "sso-shard",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "sso-verifier"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "frost-ristretto255",
+ "postcard",
+ "rand",
+ "serde",
+ "sha2",
+ "sso-common",
+ "sso-crypto",
+ "sso-shard",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
