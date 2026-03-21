@@ -137,8 +137,44 @@
   <button onclick="showPage('security',this)">Security Demo</button>
 </nav>
 
+<!-- ONBOARDING PAGE -->
+<div class="page" id="page-onboarding">
+  <div class="login-wrap">
+    <div class="login-box" style="max-width:480px">
+      <div class="logo">
+        <h1>MILNET</h1>
+        <p>FIRST-RUN SYSTEM INITIALIZATION</p>
+      </div>
+      <div class="card">
+        <h2>// INITIALIZE SYSTEM</h2>
+        <p style="color:var(--text-dim);font-size:0.8rem;margin-bottom:1rem;">No users detected. Create the initial superuser account to begin.</p>
+        <div class="form-group">
+          <label>Organization Name</label>
+          <input type="text" id="setupOrg" placeholder="MILNET COMMAND">
+        </div>
+        <div class="form-group">
+          <label>Superuser Username</label>
+          <input type="text" id="setupUser" placeholder="admin" autocomplete="username">
+        </div>
+        <div class="form-group">
+          <label>Superuser Password</label>
+          <input type="password" id="setupPass" placeholder="password" autocomplete="new-password">
+        </div>
+        <div class="form-group">
+          <label>Confirm Password</label>
+          <input type="password" id="setupPassConfirm" placeholder="confirm password" autocomplete="new-password">
+        </div>
+        <button class="btn" style="width:100%;margin-top:0.5rem;padding:0.8rem;font-size:1rem;letter-spacing:3px;" onclick="doSetup()">INITIALIZE SYSTEM</button>
+      </div>
+      <div class="terminal" id="setupTerminal">
+        <div class="prompt">&gt; Awaiting system initialization...</div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- LOGIN PAGE -->
-<div class="page active" id="page-login">
+<div class="page" id="page-login">
   <div class="login-wrap">
     <div class="login-box">
       <div class="logo">
@@ -860,10 +896,86 @@ async function demoScope() {
   termLog(term, 'RESULT: Scope-based access control is enforced. Least privilege principle verified.', 'line-ok');
 }
 
+// ── First-run setup check ───────────────────────────────────────────────────
+async function checkSetup() {
+  try {
+    var resp = await fetch('/api/setup/status');
+    var data = await resp.json();
+    if (!data.setup_complete) {
+      showOnboarding();
+    } else {
+      showLogin();
+    }
+  } catch(e) {
+    // If endpoint fails, assume setup is complete and show login
+    showLogin();
+  }
+}
+
+function showOnboarding() {
+  document.querySelectorAll('.page').forEach(function(p) { p.classList.remove('active'); });
+  $('page-onboarding').classList.add('active');
+}
+
+function showLogin() {
+  document.querySelectorAll('.page').forEach(function(p) { p.classList.remove('active'); });
+  $('page-login').classList.add('active');
+}
+
+async function doSetup() {
+  var org = $('setupOrg').value.trim();
+  var user = $('setupUser').value.trim();
+  var pass = $('setupPass').value;
+  var passConfirm = $('setupPassConfirm').value;
+
+  if (!user || !pass) return showToast('Enter username and password', true);
+  if (pass !== passConfirm) return showToast('Passwords do not match', true);
+
+  var term = 'setupTerminal';
+  clearTerm(term);
+  termLog(term, '> Initializing MILNET SSO system...', 'prompt');
+  termLog(term, '[1/3] Creating superuser account...', 'line-info');
+
+  try {
+    var resp = await fetch('/api/setup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: user, password: pass, organization: org || null })
+    });
+    var data = await resp.json();
+
+    if (!resp.ok) {
+      throw new Error(data.message || data.error || 'Setup failed (status ' + resp.status + ')');
+    }
+
+    termLog(term, '[2/3] Superuser created: ' + user, 'line-ok');
+    termLog(term, '[3/3] System initialized successfully.', 'line-ok');
+    termLog(term, '', '');
+    termLog(term, 'ADMIN API KEY: ' + (data.admin_api_key || 'N/A'), 'line-warn');
+    termLog(term, 'Save this key securely. It will not be shown again.', 'line-warn');
+    termLog(term, '', '');
+    termLog(term, '> Redirecting to login...', 'prompt');
+
+    if (data.admin_api_key) {
+      localStorage.setItem('adminKey', data.admin_api_key);
+    }
+
+    showToast('System initialized. Redirecting to login...');
+    setTimeout(function() { showLogin(); }, 3000);
+  } catch(e) {
+    termLog(term, '[ERROR] ' + (e.message || 'Setup failed'), 'line-err');
+    showToast(e.message || 'Setup failed', true);
+  }
+}
+
 // ── Keyboard shortcut ──────────────────────────────────────────────────────────
 document.addEventListener('keydown', function(e) {
   if (e.key === 'Enter' && $('page-login').classList.contains('active')) doLogin();
+  if (e.key === 'Enter' && $('page-onboarding').classList.contains('active')) doSetup();
 });
+
+// ── Auto-check setup on page load ──────────────────────────────────────────────
+checkSetup();
 </script>
 </body>
 </html>

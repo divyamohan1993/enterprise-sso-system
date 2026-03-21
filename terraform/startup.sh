@@ -85,7 +85,51 @@ systemctl daemon-reload
 systemctl enable milnet-sso
 systemctl start milnet-sso
 
-# 10. Wait and verify
+# 10. Setup auto-update cron
+echo ">>> Setting up auto-update from GitHub..."
+cat > /etc/cron.d/milnet-sso-update << 'CRON'
+# Pull latest code from GitHub every 15 minutes
+# Only rebuilds if there are new commits
+*/15 * * * * root /opt/milnet-sso/scripts/auto-update.sh >> /var/log/milnet-sso-update.log 2>&1
+CRON
+
+# Create the auto-update script
+mkdir -p /opt/milnet-sso/scripts
+cat > /opt/milnet-sso/scripts/auto-update.sh << 'UPDATE'
+#!/bin/bash
+set -euo pipefail
+cd /opt/milnet-sso
+
+# Fetch latest
+git fetch origin master --quiet
+
+# Check if there are new commits
+LOCAL=$(git rev-parse HEAD)
+REMOTE=$(git rev-parse origin/master)
+
+if [ "$LOCAL" = "$REMOTE" ]; then
+    echo "$(date): No updates available"
+    exit 0
+fi
+
+echo "$(date): New commits detected. Updating..."
+git pull origin master --quiet
+
+# Rebuild
+source /root/.cargo/env
+cargo build --release -p admin 2>&1 | tail -3
+
+# Install and restart
+cp target/release/admin /usr/local/bin/admin
+cp -r frontend/* /usr/local/share/milnet-sso/frontend/ 2>/dev/null || true
+systemctl restart milnet-sso
+
+echo "$(date): Update complete. New version: $(git rev-parse --short HEAD)"
+UPDATE
+
+chmod +x /opt/milnet-sso/scripts/auto-update.sh
+
+# 11. Wait and verify
 sleep 3
 if curl -s http://localhost:8080/api/health | grep -q "ok"; then
     echo "=== MILNET SSO DEPLOYED SUCCESSFULLY ==="

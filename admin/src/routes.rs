@@ -6,6 +6,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_http::services::ServeDir;
@@ -27,6 +28,7 @@ pub struct AppState {
     pub oidc_signing_key: [u8; 64],
     pub admin_api_key: String,
     pub fido_store: RwLock<fido::registration::CredentialStore>,
+    pub setup_complete: Arc<AtomicBool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -51,6 +53,7 @@ async fn auth_middleware(
         || path == "/oauth/authorize"
         || path == "/oauth/token"
         || path.starts_with("/api/auth/")
+        || path.starts_with("/api/setup")
         || path == "/"
         || path.ends_with(".html")
         || path.ends_with(".css")
@@ -234,6 +237,13 @@ pub struct VerifyResponse {
     pub error: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct SetupRequest {
+    pub username: String,
+    pub password: String,
+    pub organization: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
@@ -243,6 +253,9 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         // System
         .route("/api/status", get(get_status))
         .route("/api/health", get(health_check))
+        // First-run setup
+        .route("/api/setup", post(initial_setup))
+        .route("/api/setup/status", get(setup_status))
         // Users
         .route("/api/users", post(register_user))
         .route("/api/users", get(list_users))
@@ -284,6 +297,46 @@ pub fn api_router(state: Arc<AppState>) -> Router {
 
 async fn health_check() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status": "ok"}))
+}
+
+async fn setup_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "setup_complete": state.setup_complete.load(Ordering::Relaxed)
+    }))
+}
+
+async fn initial_setup(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SetupRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Only allow if no users exist yet
+    if state.setup_complete.load(Ordering::Relaxed) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    // Create the superuser
+    let mut store = state.credential_store.write().await;
+    let user_id = store.register_with_password(&req.username, req.password.as_bytes());
+
+    // Persist user to PostgreSQL
+    let _ = sqlx::query(
+        "INSERT INTO users (id, username, created_at, is_active) VALUES ($1, $2, $3, true) ON CONFLICT (id) DO UPDATE SET username = $2"
+    )
+    .bind(user_id)
+    .bind(&req.username)
+    .bind(now_secs())
+    .execute(&state.db)
+    .await;
+
+    // Mark setup as complete
+    state.setup_complete.store(true, Ordering::Relaxed);
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "user_id": user_id.to_string(),
+        "admin_api_key": state.admin_api_key.clone(),
+        "message": "Superuser created. Save your admin API key securely."
+    })))
 }
 
 async fn get_status(State(state): State<Arc<AppState>>) -> Json<SystemStatus> {

@@ -1,3 +1,4 @@
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -30,6 +31,7 @@ async fn main() {
         oidc_signing_key: crypto::entropy::generate_key_64(),
         admin_api_key: api_key,
         fido_store: RwLock::new(fido::registration::CredentialStore::new()),
+        setup_complete: Arc::new(AtomicBool::new(false)),
     });
 
     let app = api_router(state);
