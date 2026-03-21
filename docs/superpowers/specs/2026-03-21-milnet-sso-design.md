@@ -44,7 +44,7 @@ This document specifies a research-grade Single Sign-On (SSO) system designed fo
 - **Language:** Rust (memory-safe, zero GC, predictable latency)
 - **Architecture:** 9 isolated mutually-distrusting processes
 - **Password Auth:** T-OPAQUE (threshold OPRF, server-blind)
-- **Token Signing:** FROST 3-of-5 threshold EdDSA + nested ML-DSA-65
+- **Token Signing:** FROST 3-of-5 threshold Ristretto255 (via ROAST) + nested ML-DSA-65
 - **Sessions:** HKDF-SHA512 symmetric ratchet with forward secrecy and post-compromise security
 - **Key Exchange:** X25519 + ML-KEM-768 hybrid (mandatory, no fallback)
 - **Action Auth:** 5-level classification with two-person sovereign ceremony
@@ -135,7 +135,7 @@ INTERNET (raw, hostile)
    v      v      v      v      v      v      v
 
 MODULE 3: THRESHOLD SIGNER (TSS)
-  FROST 3-of-5 threshold EdDSA + nested ML-DSA-65
+  FROST 3-of-5 threshold Ristretto255 (via ROAST) + nested ML-DSA-65
   Proactive share refresh every hour
   Verifies ALL ceremony receipts before signing
 
@@ -297,7 +297,7 @@ MODULE 9: AUDIT LOG (BFT-REPLICATED)
 - Every entry: ML-DSA-65 signed, hash-chained to previous
 - Ceremony transcripts: full receipt chains, FIDO2 attestations, timestamps
 - Periodic Merkle root checkpoints to external immutable witness
-- If audit module crashes: ALL AUTHENTICATION STOPS (unaudited auth is worse than no auth)
+- If audit module crashes: LOCAL HSM-signed audit for up to 30 minutes, then human authorization to extend (see Errata E.1)
 
 ---
 
@@ -630,7 +630,7 @@ Ratchet chain states (encrypted), receipt cache (30s TTL), risk signals (no PII)
 
 - 7 nodes across different administrative domains (different providers, locations)
 - Tolerates 2 fully Byzantine (malicious) nodes
-- Any 3 honest nodes reconstruct complete log
+- Requires 5 honest nodes for consensus; any 5 honest nodes produce a consistent view (see B.6)
 
 ### Entry Structure
 
@@ -672,7 +672,7 @@ AuditEntry {
 | Ratchet | Crash | Active sessions invalidated. Users re-auth. SAFE failure. |
 | KT | Crash | Credential ops queue. Auth continues. |
 | Risk Engine | Crash | Default to HIGHEST RISK. Step-up required. Fail-secure. |
-| Audit | Crash | AUTH STOPS. No auth without audit. Deliberate. |
+| Audit | Crash | Local HSM-signed audit for 30 min, then human auth to extend (E.1). |
 | Network partition | TSS can't form quorum | No new tokens. Existing tokens until epoch expiry. Alerts fire. |
 | Clock skew | Roughtime disagrees | Halt token issuance. Fail-secure. |
 | Ratchet desync | Client/server mismatch | ±3 lookahead: accept+resync. Beyond: force re-auth. |
@@ -760,7 +760,7 @@ AuditEntry {
 |------|-----------|-----------|------|
 | 1 | Parse token header (binary, fixed-size) | O(1) | ~10us |
 | 2 | Check ratchet epoch (counter compare) | O(1) | ~1us |
-| 3 | Verify DPoP binding (HMAC-SHA256) | O(1) | ~5us |
+| 3 | Verify DPoP binding (HMAC-SHA512) | O(1) | ~7us |
 | 4 | Verify threshold signature (Ed25519) | O(1) | ~50us |
 | 5 | Check tier vs resource (integer compare) | O(1) | ~1us |
 | 6 | Advance ratchet (single HKDF) | O(1) | ~5us |
@@ -957,7 +957,7 @@ Added to the spec:
 
 **Backup:** Encrypted threshold shares backed up to geographically separate cold storage. k-of-n backup custodians required to restore. Backup verification tested quarterly.
 
-**Tier 4 Emergency recovery:** Shamir secret share (5-of-9 human custodians) reconstructs a master recovery key that can bootstrap a minimal system (audit + 1 TSS + orchestrator + gateway) for emergency access.
+**Tier 4 Emergency recovery:** Shamir secret share (7-of-13 multi-jurisdictional custodians, per E.1) reconstructs a master recovery key inside an HSM/TEE. Emergency mode uses 2-of-3 threshold signing (never single-node). Rate limited: 1 per 24 hours.
 
 ### B.11: User Enrollment Ceremony (IMPORTANT — NEW SECTION)
 
@@ -1559,3 +1559,39 @@ Based on Attacks 5, 8, 12, 14, 16, 37 (human-layer attacks), the following OpSec
 - NSA CNSA 2.0 FAQ
 - W3C WebAuthn Level 3
 - FIDO Alliance Attestation Whitepaper
+
+## Appendix H: Implementation Decisions (To Be Resolved in Phase 0-2)
+
+The following areas require concrete decisions during implementation. Each is documented here so implementors know what is NOT yet specified.
+
+1. **OPRF client-direct channel.** C.4 mandates partial OPRF evaluations go directly to clients, but the architecture shows Gateway as sole entry point. Resolution: Gateway forwards encrypted OPRF blobs that the Orchestrator cannot inspect (onion-encrypted to client's DPoP key). Implement in Phase 2.
+
+2. **BFT consensus protocol selection.** The spec says "7 BFT nodes" but does not name the protocol. Decision required: HotStuff (O(n) message complexity, used by Meta's Diem) vs PBFT (O(n^2) but simpler). Recommend HotStuff for throughput. Decide in Phase 4.
+
+3. **KT gossip protocol.** B.16 is underspecified. Implement as: STH exchange every 60 seconds over dedicated SHARD channels; split-view detection triggers immediate auth halt + alert; recovery requires human verification of tree consistency. Specify fully in Phase 4.
+
+4. **Roughtime clock skew threshold.** Define: if any 2 of 5 Roughtime sources disagree by >500ms, halt token issuance. Recovery: human operator verifies time sources and restarts. Implement in Phase 2.
+
+5. **Tier 3 token size for constrained devices.** ML-DSA-65 signatures are ~3.3KB. For LoRa/Zigbee: use a proxy model where the gateway holds the full token and the sensor holds a compact HMAC-SHA512 session ticket (64 bytes) that maps to the full token at the gateway. Implement in Phase 5.
+
+6. **Level 4 qualified pool management.** Minimum pool size: 3x the required participants per ceremony tier (9 people across 3+ departments for Level 4). Pool membership changes are Level 2 actions. Pool too small → Level 4 ceremonies blocked until pool is replenished. Implement in Phase 6.
+
+7. **Share refresh during partition.** Rule: never raise threshold above (reachable_nodes - 1). If only 3 of 5 TSS nodes are reachable and refresh has failed 3x, threshold stays at 3-of-5 (not raised to 4-of-5). Alert escalation instead. Implement in Phase 1.
+
+8. **FIDO2 post-quantum gap.** FIDO2 uses ECDSA/EdDSA (quantum-vulnerable). Acknowledge as known limitation. Migration plan: adopt PQ FIDO2 when FIDO Alliance standardizes it. In the interim, FIDO2 is one factor in a multi-factor ceremony — quantum break of FIDO2 alone does not bypass auth (OPAQUE + threshold signing remain PQ-safe). Document in Phase 5.
+
+9. **Diverse double-compilation.** Upgrade from "considered" to MANDATORY for production deployment. Compile with Rust compiler AND cross-verify critical functions (FROST signing, receipt validation, ratchet advancement) against an independent F*/SPARK implementation. Implement in Phase 7.
+
+10. **Level 4 ceremony initiation rate limit.** Cap at 3 initiations per 24 hours (not just 1 completion per 72 hours). Prevents alert fatigue attack. Implement in Phase 6.
+
+11. **Module communication matrix.** Permitted channels (all others DENIED at network namespace level):
+    - Gateway ↔ Orchestrator
+    - Orchestrator ↔ OPAQUE, TSS, Risk, Ratchet
+    - TSS ↔ TSS (peer-to-peer for FROST), Audit
+    - Verifier ↔ Ratchet (heartbeat), TSS (JWKS refresh)
+    - KT ↔ Audit, Orchestrator
+    - Risk ↔ Ratchet, Audit
+    - Audit ↔ all modules (receive events)
+    Total: ~18 permitted channels (not 72). Enforce in Phase 7.
+
+12. **Canary resources.** Create synthetic API endpoints that appear in documentation but serve no real function. Any access by authenticated sessions triggers silent alert + session forensics. Rotate canaries quarterly. Implement in Phase 5.
