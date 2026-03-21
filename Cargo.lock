@@ -42,6 +42,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "audit"
+version = "0.1.0"
+dependencies = [
+ "common",
+ "crypto",
+ "postcard",
+ "serde",
+ "sha2",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "aws-lc-rs"
 version = "1.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -168,6 +182,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "common"
+version = "0.1.0"
+dependencies = [
+ "postcard",
+ "serde",
+ "subtle",
+ "thiserror",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "const-crc32-nostd"
 version = "1.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -199,6 +225,28 @@ name = "critical-section"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b"
+
+[[package]]
+name = "crypto"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "common",
+ "ed25519-dalek",
+ "frost-core",
+ "frost-ristretto255",
+ "getrandom 0.2.17",
+ "hkdf",
+ "hmac",
+ "ml-kem",
+ "rand",
+ "sha2",
+ "sha3",
+ "subtle",
+ "uuid",
+ "x25519-dalek",
+ "zeroize",
+]
 
 [[package]]
 name = "crypto-bigint"
@@ -325,6 +373,32 @@ name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
+
+[[package]]
+name = "e2e"
+version = "0.1.0"
+dependencies = [
+ "audit",
+ "common",
+ "crypto",
+ "frost-ristretto255",
+ "gateway",
+ "hmac",
+ "kt",
+ "opaque",
+ "orchestrator",
+ "postcard",
+ "rand",
+ "ratchet",
+ "risk",
+ "serde",
+ "sha2",
+ "shard",
+ "tokio",
+ "tss",
+ "uuid",
+ "verifier",
+]
 
 [[package]]
 name = "ecdsa"
@@ -500,6 +574,24 @@ name = "fs_extra"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
+
+[[package]]
+name = "gateway"
+version = "0.1.0"
+dependencies = [
+ "common",
+ "crypto",
+ "postcard",
+ "rustls",
+ "serde",
+ "sha2",
+ "shard",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
 
 [[package]]
 name = "generic-array"
@@ -710,6 +802,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kt"
+version = "0.1.0"
+dependencies = [
+ "common",
+ "crypto",
+ "postcard",
+ "serde",
+ "sha3",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -793,6 +898,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "opaque"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "common",
+ "crypto",
+ "opaque-ke",
+ "postcard",
+ "serde",
+ "shard",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "opaque-ke"
 version = "4.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -814,6 +936,25 @@ dependencies = [
  "subtle",
  "voprf",
  "zeroize",
+]
+
+[[package]]
+name = "orchestrator"
+version = "0.1.0"
+dependencies = [
+ "common",
+ "crypto",
+ "gateway",
+ "opaque",
+ "postcard",
+ "serde",
+ "sha2",
+ "shard",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "tss",
+ "uuid",
 ]
 
 [[package]]
@@ -959,6 +1100,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "ratchet"
+version = "0.1.0"
+dependencies = [
+ "common",
+ "crypto",
+ "hkdf",
+ "hmac",
+ "postcard",
+ "serde",
+ "sha2",
+ "shard",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -979,6 +1139,20 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "risk"
+version = "0.1.0"
+dependencies = [
+ "common",
+ "crypto",
+ "postcard",
+ "serde",
+ "shard",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1134,6 +1308,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "shard"
+version = "0.1.0"
+dependencies = [
+ "common",
+ "crypto",
+ "hmac",
+ "postcard",
+ "serde",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1201,228 +1388,6 @@ checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
 dependencies = [
  "base64ct",
  "der",
-]
-
-[[package]]
-name = "sso-audit"
-version = "0.1.0"
-dependencies = [
- "postcard",
- "serde",
- "sha2",
- "sso-common",
- "sso-crypto",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "sso-common"
-version = "0.1.0"
-dependencies = [
- "postcard",
- "serde",
- "subtle",
- "thiserror",
- "uuid",
- "zeroize",
-]
-
-[[package]]
-name = "sso-crypto"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "ed25519-dalek",
- "frost-core",
- "frost-ristretto255",
- "getrandom 0.2.17",
- "hkdf",
- "hmac",
- "ml-kem",
- "rand",
- "sha2",
- "sha3",
- "sso-common",
- "subtle",
- "uuid",
- "x25519-dalek",
- "zeroize",
-]
-
-[[package]]
-name = "sso-e2e"
-version = "0.1.0"
-dependencies = [
- "frost-ristretto255",
- "hmac",
- "postcard",
- "rand",
- "serde",
- "sha2",
- "sso-audit",
- "sso-common",
- "sso-crypto",
- "sso-gateway",
- "sso-kt",
- "sso-opaque",
- "sso-orchestrator",
- "sso-ratchet",
- "sso-risk",
- "sso-shard",
- "sso-tss",
- "sso-verifier",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "sso-gateway"
-version = "0.1.0"
-dependencies = [
- "postcard",
- "rustls",
- "serde",
- "sha2",
- "sso-common",
- "sso-crypto",
- "sso-shard",
- "tokio",
- "tokio-rustls",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "sso-kt"
-version = "0.1.0"
-dependencies = [
- "postcard",
- "serde",
- "sha3",
- "sso-common",
- "sso-crypto",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "sso-opaque"
-version = "0.1.0"
-dependencies = [
- "argon2",
- "opaque-ke",
- "postcard",
- "serde",
- "sso-common",
- "sso-crypto",
- "sso-shard",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "sso-orchestrator"
-version = "0.1.0"
-dependencies = [
- "postcard",
- "serde",
- "sha2",
- "sso-common",
- "sso-crypto",
- "sso-gateway",
- "sso-opaque",
- "sso-shard",
- "sso-tss",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "sso-ratchet"
-version = "0.1.0"
-dependencies = [
- "hkdf",
- "hmac",
- "postcard",
- "serde",
- "sha2",
- "sso-common",
- "sso-crypto",
- "sso-shard",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "zeroize",
-]
-
-[[package]]
-name = "sso-risk"
-version = "0.1.0"
-dependencies = [
- "postcard",
- "serde",
- "sso-common",
- "sso-crypto",
- "sso-shard",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "sso-shard"
-version = "0.1.0"
-dependencies = [
- "hmac",
- "postcard",
- "serde",
- "sha2",
- "sso-common",
- "sso-crypto",
- "tokio",
-]
-
-[[package]]
-name = "sso-tss"
-version = "0.1.0"
-dependencies = [
- "ed25519-dalek",
- "postcard",
- "rand",
- "serde",
- "sha2",
- "sso-common",
- "sso-crypto",
- "sso-shard",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "sso-verifier"
-version = "0.1.0"
-dependencies = [
- "ed25519-dalek",
- "frost-ristretto255",
- "postcard",
- "rand",
- "serde",
- "sha2",
- "sso-common",
- "sso-crypto",
- "sso-shard",
- "tokio",
- "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -1586,6 +1551,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "tss"
+version = "0.1.0"
+dependencies = [
+ "common",
+ "crypto",
+ "ed25519-dalek",
+ "postcard",
+ "rand",
+ "serde",
+ "sha2",
+ "shard",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "typenum"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1626,6 +1608,24 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
+
+[[package]]
+name = "verifier"
+version = "0.1.0"
+dependencies = [
+ "common",
+ "crypto",
+ "ed25519-dalek",
+ "frost-ristretto255",
+ "postcard",
+ "rand",
+ "serde",
+ "sha2",
+ "shard",
+ "tokio",
+ "tracing",
+ "uuid",
+]
 
 [[package]]
 name = "version_check"

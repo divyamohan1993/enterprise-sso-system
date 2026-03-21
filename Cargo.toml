@@ -1,19 +1,19 @@
 [workspace]
 resolver = "2"
 members = [
-    "sso-common",
-    "sso-crypto",
-    "sso-shard",
-    "sso-gateway",
-    "sso-orchestrator",
-    "sso-tss",
-    "sso-verifier",
-    "sso-opaque",
-    "sso-ratchet",
-    "sso-kt",
-    "sso-risk",
-    "sso-audit",
-    "sso-e2e",
+    "common",
+    "crypto",
+    "shard",
+    "gateway",
+    "orchestrator",
+    "tss",
+    "verifier",
+    "opaque",
+    "ratchet",
+    "kt",
+    "risk",
+    "audit",
+    "e2e",
 ]
 
 [workspace.package]
