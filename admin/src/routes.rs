@@ -754,9 +754,9 @@ async fn get_kt_proof(
 // ---------------------------------------------------------------------------
 
 async fn oidc_discovery() -> Json<sso_protocol::discovery::OpenIdConfiguration> {
-    // In production the issuer would come from configuration.
-    let issuer = "https://sso.milnet.local";
-    Json(sso_protocol::discovery::OpenIdConfiguration::new(issuer))
+    let issuer = std::env::var("SSO_ISSUER")
+        .unwrap_or_else(|_| "https://sso-system.dmj.one".to_string());
+    Json(sso_protocol::discovery::OpenIdConfiguration::new(&issuer))
 }
 
 #[derive(Deserialize)]
@@ -774,27 +774,44 @@ struct AuthorizeParams {
 async fn oauth_authorize(
     State(state): State<Arc<AppState>>,
     Query(params): Query<AuthorizeParams>,
-) -> Json<serde_json::Value> {
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    use axum::http::header;
+
     if params.response_type != "code" {
-        return Json(serde_json::json!({"error": "unsupported_response_type"}));
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "unsupported_response_type"}))).into_response();
     }
 
     // Validate client
     let clients = state.oauth_clients.read().await;
     let client = match clients.get(&params.client_id) {
-        Some(c) => c,
-        None => return Json(serde_json::json!({"error": "invalid_client"})),
+        Some(c) => c.clone(),
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid_client"}))).into_response(),
     };
-
-    if !client.redirect_uris.contains(&params.redirect_uri) {
-        return Json(serde_json::json!({"error": "invalid_redirect_uri"}));
-    }
     drop(clients);
 
-    // In a real deployment the user would authenticate interactively here.
-    // For the API we use a placeholder user ID. Callers that have already
-    // authenticated via /api/auth/login can supply the user_id separately.
-    let user_id = Uuid::nil();
+    if !client.redirect_uris.iter().any(|u| params.redirect_uri.starts_with(u.trim_end_matches("/callback")) || u == &params.redirect_uri) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid_redirect_uri"}))).into_response();
+    }
+
+    // For SSO flow: auto-approve if there's an authenticated session
+    // In production: show consent screen. For demo: auto-approve with a default user.
+    // Check if setup has a user
+    let store = state.credential_store.read().await;
+    let usernames = store.usernames();
+    let user_id = if let Some(first_user) = usernames.first() {
+        // Look up user ID from DB
+        let row = sqlx::query_scalar::<_, String>("SELECT id FROM users WHERE username = $1")
+            .bind(first_user)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten();
+        row.and_then(|id| Uuid::parse_str(&id).ok()).unwrap_or_else(Uuid::new_v4)
+    } else {
+        Uuid::new_v4()
+    };
+    drop(store);
 
     let mut codes = state.auth_codes.write().await;
     let code = codes.create_code(
@@ -802,15 +819,15 @@ async fn oauth_authorize(
         &params.redirect_uri,
         user_id,
         &params.scope,
-        params.code_challenge,
-        params.nonce,
+        params.code_challenge.clone(),
+        params.nonce.clone(),
     );
+    drop(codes);
 
-    Json(serde_json::json!({
-        "redirect_uri": format!("{}?code={}&state={}", params.redirect_uri, code, params.state),
-        "code": code,
-        "state": params.state,
-    }))
+    // HTTP 302 redirect back to the client with the authorization code
+    let redirect_url = format!("{}?code={}&state={}", params.redirect_uri, code, params.state);
+
+    (StatusCode::FOUND, [(header::LOCATION, redirect_url)]).into_response()
 }
 
 #[derive(Deserialize)]
@@ -867,7 +884,7 @@ async fn oauth_token(
 
     // Create tokens
     let id_token = sso_protocol::tokens::create_id_token(
-        "https://sso.milnet.local",
+        std::env::var("SSO_ISSUER").unwrap_or_else(|_| "https://sso-system.dmj.one".to_string()).as_str(),
         &auth_code.user_id,
         &req.client_id,
         auth_code.nonce,
@@ -970,7 +987,7 @@ async fn fido_register_begin(
 ) -> Json<FidoRegisterBeginResponse> {
     let options = fido::registration::create_registration_options(
         "MILNET SSO",
-        "sso.milnet.local",
+        "sso-system.dmj.one",
         &req.user_id,
         &req.username,
         req.prefer_platform,
@@ -1028,7 +1045,7 @@ async fn fido_authenticate_begin(
     }
 
     let options = fido::authentication::create_authentication_options(
-        "sso.milnet.local",
+        "sso-system.dmj.one",
         &creds,
     );
 

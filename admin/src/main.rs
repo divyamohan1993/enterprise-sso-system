@@ -19,6 +19,20 @@ async fn main() {
     let pool = common::db::init_database(&db_url).await;
     tracing::info!("Connected to PostgreSQL");
 
+    // Pre-seed OAuth clients for known applications
+    let mut oauth_clients = sso_protocol::clients::ClientRegistry::new();
+
+    // Register demo app as OAuth client (always available)
+    let demo_redirect = std::env::var("DEMO_REDIRECT_URI")
+        .unwrap_or_else(|_| "https://sso-system-demo.dmj.one/callback".to_string());
+    oauth_clients.register_with_id(
+        "demo-app",
+        "demo-secret",
+        "Demo Application",
+        vec![demo_redirect],
+    );
+    tracing::info!("Pre-seeded OAuth client: demo-app");
+
     let state = Arc::new(AppState {
         db: pool,
         credential_store: RwLock::new(opaque::store::CredentialStore::new()),
@@ -26,7 +40,7 @@ async fn main() {
         audit_log: RwLock::new(audit::log::AuditLog::new()),
         kt_tree: RwLock::new(kt::merkle::MerkleTree::new()),
         portals: RwLock::new(Vec::new()),
-        oauth_clients: RwLock::new(sso_protocol::clients::ClientRegistry::new()),
+        oauth_clients: RwLock::new(oauth_clients),
         auth_codes: RwLock::new(sso_protocol::authorize::AuthorizationStore::new()),
         oidc_signing_key: crypto::entropy::generate_key_64(),
         admin_api_key: api_key,

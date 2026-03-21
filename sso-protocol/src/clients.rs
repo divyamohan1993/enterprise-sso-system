@@ -33,6 +33,25 @@ impl ClientRegistry {
         client
     }
 
+    /// Register a client with a specific client_id and secret (for pre-seeding)
+    pub fn register_with_id(
+        &mut self,
+        client_id: &str,
+        client_secret: &str,
+        name: &str,
+        redirect_uris: Vec<String>,
+    ) -> OAuthClient {
+        let client = OAuthClient {
+            client_id: client_id.to_string(),
+            client_secret: client_secret.to_string(),
+            redirect_uris,
+            name: name.to_string(),
+            allowed_scopes: vec!["openid".into(), "profile".into(), "email".into()],
+        };
+        self.clients.insert(client.client_id.clone(), client.clone());
+        client
+    }
+
     pub fn validate(&self, client_id: &str, client_secret: &str) -> Option<&OAuthClient> {
         self.clients
             .get(client_id)
