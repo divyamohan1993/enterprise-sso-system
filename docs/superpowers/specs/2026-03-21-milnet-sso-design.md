@@ -454,15 +454,15 @@ T2: Attacker uses stolen token_0
 
 | Function | Library | Justification |
 |----------|---------|---------------|
-| PQ Key Exchange | `pqcrypto` (liboqs bindings) | FIPS 203 ML-KEM-768. Audited. |
-| PQ Signatures | `pqcrypto` | FIPS 204 ML-DSA-65 + FIPS 205 SLH-DSA fallback. |
-| Classical KEM | `x25519-dalek` | Constant-time X25519. NCC Group audited. |
-| Threshold Signing | `frost-ed25519` (ZF FROST) | RFC 9591. Zcash Foundation. Audited. |
+| PQ Key Exchange | `libcrux-ml-kem` (Cryspen) | FIPS 203 ML-KEM-768. Formally verified constant-time. See Errata C.1. |
+| PQ Signatures | `libcrux-ml-dsa` (Cryspen) | FIPS 204 ML-DSA-65. Formally verified. See Errata C.1. |
+| Classical KEM | `x25519-dalek` >= 4.1.3 | Constant-time X25519. Pin post CVE-2024-58262. See Errata C.2. |
+| Threshold Signing | `frost-ristretto255` (ZF FROST) + ROAST | RFC 9591. Cofactor-free. Liveness-guaranteed. See Errata C.6, C.15. |
 | OPAQUE | `opaque-ke` | RFC 9497. Meta's impl. NCC Group audited. |
 | Ratchet | Custom (hkdf + sha2) | 20 lines, formally verifiable. |
 | KDF | `argon2` | RFC 9106 Argon2id. 64 MiB, 3 iter, 4 parallel. |
 | TLS | `rustls` + `rustls-post-quantum` | Memory-safe TLS 1.3. No OpenSSL. |
-| AEAD | `aes-gcm-siv` | AES-256-GCM-SIV. Nonce-misuse resistant. |
+| AEAD | `aes-gcm-siv` + Encrypt-then-HMAC for OPAQUE | AES-256-GCM-SIV general. Committing AEAD for OPAQUE envelopes. See Errata C.3. |
 | Hash | `sha2`, `sha3`, `blake3` | SHA-512 chains, SHA3-256 Merkle, BLAKE3 integrity. |
 | HMAC | `hmac` | Constant-time HMAC-SHA512. |
 | Secure Erase | `zeroize` | Compiler-fenced zeroization. |
@@ -1081,7 +1081,218 @@ Thresholds are configurable via Level 3 action (two-person approval). Changes au
 
 Corrected: At 10ms difficulty, one core does 100 puzzles/sec. For 1M req/s, attacker needs ~10,000 cores at normal difficulty. Under DDoS (1-5s difficulty), attacker needs 1M-5M core-seconds/sec = 1M-5M cores. The original estimate of 100,000 was for moderate difficulty (~100ms). Corrected in spec.
 
-## Appendix C: References
+## Appendix C: Cryptographic Red Team Errata (Round 3)
+
+Findings from IACR-level cryptographic analysis. 15 attack vectors identified, all addressed below.
+
+### C.1: CRITICAL — Replace pqcrypto with libcrux
+
+The `pqcrypto` crate wraps PQClean, which self-describes as "primarily for academic and experimental purposes." It has NO independent security audit, NO NIST KAT vector tests, and the KyberSlash timing attack (TCHES 2025) demonstrated key recovery in minutes on ARM via secret-dependent division instructions in the reference code.
+
+**Fix:** Replace `pqcrypto` with **Cryspen's libcrux** for ML-KEM-768 and ML-DSA-65. libcrux provides:
+- Formally verified constant-time behavior (using hax/F* extraction)
+- NIST KAT vector compliance
+- Independent security audit
+- Spectre-hardened implementation with speculative load barriers
+
+Updated library table:
+
+| Function | Library (REVISED) | Justification |
+|----------|-------------------|---------------|
+| PQ Key Exchange | `libcrux-ml-kem` | Formally verified constant-time ML-KEM-768. Cryspen. |
+| PQ Signatures | `libcrux-ml-dsa` | Formally verified ML-DSA-65. Cryspen. |
+| Classical KEM | `x25519-dalek` >= 4.1.3 | Constant-time X25519. Pin version post CVE-2024-58262 fix. |
+
+### C.2: CRITICAL — Pin curve25519-dalek >= 4.1.3
+
+CVE-2024-58262 (RUSTSEC-2024-0344): timing variability in `Scalar29::sub` and `Scalar52::sub` caused by LLVM inserting conditional branches around masking operations. Fixed in v4.1.3 with volatile read barriers.
+
+**Fix:** Pin `curve25519-dalek >= 4.1.3` in Cargo.toml. Add CI check that fails if any transitive dependency pulls an older version.
+
+### C.3: HIGH — Use Committing AEAD for OPAQUE Envelopes
+
+The partitioning oracle attack (Len et al., USENIX Security 2021) demonstrated that OPAQUE requires a CMT-4 secure (key-committing) AEAD. AES-256-GCM-SIV is nonce-misuse resistant but NOT proven CMT-4 secure. Non-committing AEAD enables offline dictionary attacks after server compromise by constructing ciphertexts that decrypt validly under multiple keys.
+
+**Fix:** Use **Encrypt-then-HMAC** (AES-256-CTR + HMAC-SHA256) for OPAQUE envelopes. This is provably key-committing (the HMAC commits to the key). Alternatively, use the OPAQUE-recommended `Envelope` mode with an explicit key commitment scheme.
+
+The `opaque-ke` crate's NCC Group audit (2021, v0.5.0) predates the partitioning oracle paper. Verify that the current version uses a committing AEAD or patch the AEAD layer.
+
+### C.4: HIGH — Threshold OPRF Reconstruction Must Happen Client-Side
+
+The spec routes OPRF evaluations through the Auth Orchestrator. In T-OPAQUE, each threshold OPRF node produces a partial evaluation. If the orchestrator collects these partial evaluations and combines them before forwarding to the client, it sees ALL partial evaluations — exactly the information needed for offline dictionary attack (the orchestrator can compute the full OPRF output for candidate passwords).
+
+**Fix:** Partial OPRF evaluations must be forwarded INDIVIDUALLY to the client. The CLIENT performs the threshold reconstruction (Lagrange interpolation) of the OPRF output. The orchestrator sees encrypted partial evaluations but never the combined result. This preserves OPAQUE's security model where the server never sees the password-derived value.
+
+Protocol flow:
+```
+Client → Orchestrator: blinded password element
+Orchestrator → OPRF Node 1: blinded element
+Orchestrator → OPRF Node 2: blinded element
+Orchestrator → OPRF Node 3: blinded element
+OPRF Node 1 → Client (directly via mTLS): partial evaluation 1
+OPRF Node 2 → Client (directly via mTLS): partial evaluation 2
+OPRF Node 3 → Client (directly via mTLS): partial evaluation 3
+Client: combines partials → full OPRF output → OPAQUE key derivation
+```
+
+The orchestrator relays the initial blinded element but NEVER sees partial evaluations.
+
+### C.5: HIGH — Threshold ML-DSA Implementation Strategy (Revised)
+
+Additive secret sharing is NOT directly compatible with ML-DSA due to rejection sampling. The combined noise from independent signers exceeds rejection bounds with high probability, requiring expensive re-signing rounds. Research (Eprint 2026/013, "Efficient Threshold ML-DSA") shows this is feasible only for small parties (~6) with ~1MB communication per party.
+
+**Revised strategy:**
+1. **Primary:** Use the Quorus construction (Eprint 2025/1163) which is specifically designed for scalable threshold ML-DSA with practical communication overhead.
+2. **Implementation:** Commission a custom implementation based on the Quorus paper, with formal verification and independent audit before deployment.
+3. **Interim fallback:** Until threshold ML-DSA is production-ready, use the following:
+   - FROST threshold Ed25519 provides the threshold guarantee
+   - A SINGLE ML-DSA-65 signature is computed by ONE TSS node (rotated round-robin)
+   - ALL other TSS nodes verify the ML-DSA-65 signature before releasing their FROST partial signatures
+   - This means: you need 3-of-5 FROST agreement AND a valid ML-DSA-65 signature
+   - A malicious ML-DSA signer can produce garbage → caught by verification → rotated out
+   - A malicious ML-DSA signer can refuse to sign → detected by timeout → another node takes over
+   - The ML-DSA layer provides PQ resistance; FROST provides threshold guarantee
+4. **Risk:** The single ML-DSA signer is a temporary SPOF for PQ resistance (not for forgery — you still need the FROST threshold). Document this as a known limitation with a timeline for migrating to full threshold ML-DSA.
+
+### C.6: HIGH — Adopt ROAST Wrapper for FROST Liveness
+
+CertiK's research documents commitment equivocation attacks in decentralized FROST. Even in centralized mode, a compromised coordinator can selectively delay nonce commitments to prevent signing quorums from forming (liveness attack). RFC 9591 does not address this.
+
+**Fix:** Wrap FROST with **ROAST** (Robust Asynchronous Schnorr Threshold Signatures, Ruffing et al., CCS 2022). ROAST guarantees that if t honest signers are available, a signature WILL be produced regardless of coordinator behavior. ROAST is backward-compatible with FROST — it is a coordination wrapper, not a new signing scheme.
+
+### C.7: CRITICAL (Conditional) — FROST Nonce Tracking for Clone Detection
+
+If a TSS node is cloned or restored from backup, its CSPRNG state may repeat, producing nonce collisions. Two partial signatures with the same nonce reveal the signer's secret share via `s1 - s2 = (c1 - c2) * sk_i`.
+
+**Fix:**
+1. The FROST coordinator MUST track all nonce commitments (per RFC 9591 Section 7.3). If a duplicate commitment is detected, the signing session is aborted and the node is quarantined.
+2. Each TSS node maintains a persistent monotonic counter that is included in nonce generation: `nonce = H(secret_share || counter || randomness)`. The counter is persisted to durable storage and incremented on every signing session. Even after a clone/restore, the counter prevents repeating the same nonce (unless the attacker also resets the persistent counter AND controls the randomness source).
+3. TSS nodes MUST NOT be restored from backup without generating fresh key shares via proactive refresh. Restoring a backup node is equivalent to enrolling a new node.
+
+### C.8: MEDIUM-HIGH — Adopt X-Wing Hybrid KEM Combiner
+
+The spec uses a generic `KDF(ml_kem_ss || x25519_ss || context)` combiner. X-Wing (Eprint 2024/039) provides a formal proof that this structure is IND-CCA secure when using SHA3-256 and including the ML-KEM ciphertext in the KDF input.
+
+**Fix:** Adopt the **X-Wing combiner** specification:
+```
+shared_secret = SHA3-256(
+    "X-Wing" ||
+    ml_kem_shared_secret ||
+    ml_kem_ciphertext ||
+    x25519_shared_secret ||
+    x25519_public_key_client ||
+    x25519_public_key_server
+)
+```
+This is provably IND-CCA secure if either ML-KEM or X25519 is secure. Use SHA3-256 (not HKDF-SHA512) for the KEM combiner to match X-Wing's proof.
+
+### C.9: MEDIUM-HIGH — HKDF Ratchet Client Entropy Must Be Blinded
+
+The attacker fully controls `client_entropy` in the ratchet advancement. While HKDF's PRF assumption holds when the chain key is secret, attacker-controlled input creates a chosen-input oracle. Additionally, HKDF is not collision-resistant for arbitrary inputs (Eprint 2025/657).
+
+**Fix:**
+1. Client entropy is blinded before use: `blinded_entropy = H(client_entropy || server_nonce)` where `server_nonce` is a random value generated by the ratchet manager and sent to the client per-epoch.
+2. The ratchet formula becomes: `chain_key_{n+1} = HKDF-SHA512(chain_key_n, "ratchet-advance" || blinded_entropy)`
+3. Neither party alone controls the KDF input. The attacker would need to control both the client entropy AND the server nonce to predict ratchet output.
+
+### C.10: MEDIUM-HIGH — Comprehensive Domain Separation Scheme
+
+Multiple sub-protocols use overlapping primitives (Ed25519, HMAC-SHA512, SHA-512). Without domain separation, cross-protocol message injection is possible.
+
+**Fix:** Define a system-wide domain separation scheme:
+```
+All Ed25519 signatures include a domain prefix:
+  FROST token signing:   "MILNET-SSO-v1-FROST-TOKEN" || payload
+  Receipt signing:        "MILNET-SSO-v1-RECEIPT" || receipt_data
+  DPoP proof:            "MILNET-SSO-v1-DPOP" || dpop_data
+  Audit entry:           "MILNET-SSO-v1-AUDIT" || entry_data
+  Module attestation:    "MILNET-SSO-v1-ATTEST" || binary_hash
+
+All HMAC-SHA512 operations include a domain prefix:
+  Ratchet advance:       "MILNET-SSO-v1-RATCHET" || chain_data
+  SHARD message auth:    "MILNET-SSO-v1-SHARD" || message_data
+  Token ratchet tag:     "MILNET-SSO-v1-TOKEN-TAG" || claims
+
+All hash operations include a domain prefix:
+  Merkle tree leaf:      "MILNET-SSO-v1-KT-LEAF" || leaf_data
+  Receipt chain:         "MILNET-SSO-v1-RECEIPT-CHAIN" || prev_hash
+  Action binding:        "MILNET-SSO-v1-ACTION" || action_data
+```
+No two operations in the system share the same domain prefix. This makes cross-protocol injection cryptographically impossible.
+
+### C.11: MEDIUM — Nested Signature Verification Order
+
+The nested signing (PQ over classical) creates a signature stripping risk if a future quantum computer breaks ML-DSA. The verifier MUST enforce both signatures are always present.
+
+**Fix:** Token verification algorithm (mandatory, in order):
+1. Parse token. If `pq_signature` field is missing → REJECT (not optional)
+2. Verify ML-DSA-65 signature over `(header || claims || frost_signature)` → REJECT if invalid
+3. Verify FROST Ed25519 signature over `(header || claims)` → REJECT if invalid
+4. Both must pass. There is no "classical-only" mode. PQ is mandatory.
+
+Additionally: FROST uses Ristretto encoding (cofactor-free). The spec MUST verify that the Ristretto-to-Ed25519 compatibility layer does not introduce cofactor-related malleability into the ML-DSA input. Use `frost-ristretto255` (not `frost-ed25519`) to avoid cofactor issues entirely.
+
+### C.12: MEDIUM — Spectre Mitigations for Crypto Code
+
+Spectre v1/v2 can break constant-time guarantees even in formally verified code (Serberus, IEEE S&P 2024). Speculative execution leaks secret-dependent memory accesses through cache timing.
+
+**Fix:**
+1. Compile all crypto modules with LLVM's **Speculative Load Hardening (SLH)**: `-C llvm-args=-x86-speculative-load-hardening`
+2. Use `lfence` barriers after branch instructions in crypto hot paths
+3. Pin to dedicated physical hardware (not VMs) for TSS nodes — eliminates cross-VM Spectre
+4. If cloud deployment is required: use confidential computing (AMD SEV-SNP) which provides memory encryption even against hypervisor-level Spectre
+
+### C.13: MEDIUM-HIGH — FROST Adaptive Security Gap
+
+FROST's security proof covers static corruption (adversary chooses corrupt parties before protocol start). The spec's threat model is adaptive (adversary corrupts parties over time). This gap is theoretical but real.
+
+**Fix:**
+1. Acknowledge this as a known theoretical limitation in the spec
+2. Mitigate via proactive share refresh (already in spec, hourly). Each refresh is equivalent to running a new DKG, which resets the adaptive corruption window. An attacker must compromise t shares within a single refresh epoch (1 hour) for the attack to succeed.
+3. Reduce refresh interval to 30 minutes for TSS nodes under elevated risk scoring
+4. Monitor for research on adaptively-secure FROST constructions and upgrade when available
+
+### C.14: HIGH — Commission Formal Composition Analysis
+
+No published work analyzes the composition of FROST + OPAQUE + ratcheting + DPoP + ML-KEM + BFT. Mixing ROM (FROST), standard model (ML-KEM), and UC (OPAQUE) proof models is hazardous.
+
+**Fix:**
+1. Commission a formal security analysis from an academic cryptography group (e.g., IACR-affiliated researchers) specifically analyzing the composition of sub-protocols as used in this system
+2. Until the analysis is complete, maintain defense-in-depth: each sub-protocol independently prevents a class of attacks, so composition failure degrades gracefully (you lose one layer's guarantee, not all security)
+3. Document the assumption that sub-protocol composition preserves individual security guarantees as an explicit UNVERIFIED ASSUMPTION in the spec, with a timeline for formal verification
+4. The composition analysis should specifically address:
+   - Domain separation sufficiency (C.10 above)
+   - Threshold OPRF → OPAQUE UC proof compatibility
+   - ROM → standard model interaction between FROST and ML-KEM
+   - Ratchet forward secrecy under composed protocol leakage
+
+### C.15: Use frost-ristretto255, Not frost-ed25519
+
+Ed25519 has well-documented cofactor-8 issues. FROST-Ed25519 uses Ristretto encoding to mitigate, but the Ristretto-to-Ed25519 compatibility layer is a known source of subtle bugs. Using `frost-ristretto255` directly avoids the cofactor entirely and provides cleaner group arithmetic.
+
+**Fix:** Replace `frost-ed25519` with `frost-ristretto255` in the crypto stack. Both are from the ZF FROST implementation (RFC 9591 compatible). Ristretto255 provides a prime-order group without cofactor concerns.
+
+## Appendix D: Cryptographic References (Round 3)
+
+- KyberSlash timing attack: Kannwischer et al., TCHES 2025
+- CVE-2024-58262 (curve25519-dalek): RUSTSEC-2024-0344
+- Partitioning oracle attacks on OPAQUE: Len et al., USENIX Security 2021
+- FROST commitment equivocation: CertiK Threshold Cryptography II
+- ROAST: Ruffing et al., CCS 2022 (Eprint 2022/550)
+- FROST adaptive security analysis: Eprint 2025/943
+- T-OPAQUE / TOPPSS: Jarecki et al., ACNS 2017 (Eprint 2017/363)
+- Efficient Threshold ML-DSA: Eprint 2026/013
+- Quorus (scalable threshold ML-DSA): Eprint 2025/1163
+- X-Wing hybrid KEM: Eprint 2024/039
+- HKDF security: Krawczyk, Crypto 2010 (Eprint 2010/264)
+- KDF without salt: Eprint 2025/657
+- Spectre on constant-time crypto (Serberus): Mosier et al., IEEE S&P 2024
+- Module-lattice reduction: Eprint 2025/1904
+- Cryspen libcrux verified ML-KEM: cryspen.com
+- NCC Group FROST audit: NCC Group 2023
+- NCC Group opaque-ke audit: NCC Group 2021 (v0.5.0)
+- Quarkslab dalek audit: Quarkslab 2019
+- Project Eleven PQ Rust analysis: blog.projecteleven.com
 
 - NIST FIPS 203 (ML-KEM), FIPS 204 (ML-DSA), FIPS 205 (SLH-DSA)
 - RFC 9497 (OPAQUE / OPRFs Using Prime-Order Groups)
