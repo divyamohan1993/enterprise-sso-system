@@ -383,7 +383,7 @@ fn build_valid_receipt_chain(signing_key: &[u8; 64]) -> Vec<Receipt> {
     vec![r1, r2]
 }
 
-fn make_valid_token_and_key() -> (Token, frost_ristretto255::keys::PublicKeyPackage, crypto::pq_sign::PqVerifyingKey) {
+fn make_valid_token_and_key() -> (Token, frost_ristretto255::keys::PublicKeyPackage) {
     let mut dkg_result = dkg(5, 3);
     let group_key = dkg_result.group.public_key_package.clone();
     let claims = TokenClaims {
@@ -398,11 +398,10 @@ fn make_valid_token_and_key() -> (Token, frost_ristretto255::keys::PublicKeyPack
         ratchet_epoch: 1,
     };
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
-    let (pq_sk, pq_vk) = crypto::pq_sign::generate_pq_keypair();
     let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
     let token = build_token_distributed(&claims, &coordinator, &mut signers, &[0x55u8; 64], test_pq_sk())
         .expect("build token should succeed");
-    (token, group_key, pq_vk)
+    (token, group_key)
 }
 
 // ==========================================================================
@@ -485,7 +484,7 @@ async fn test_attack_ddos_wrong_puzzle_flood() {
 
 #[tokio::test]
 async fn test_attack_ddos_concurrent_legitimate_under_load() {
-    let pq_vk = test_pq_vk();
+
     // Start 20 legitimate auth sessions simultaneously while also
     // sending 50 bogus connections. The 20 legitimate ones must all succeed.
     let mut store = CredentialStore::new();
@@ -538,7 +537,7 @@ async fn test_attack_ddos_concurrent_legitimate_under_load() {
 
 #[tokio::test]
 async fn test_attack_credential_stuffing_attack() {
-    let pq_vk = test_pq_vk();
+
     // Register user "admin". Try 100 different passwords in rapid succession.
     // All must fail. The correct password must still work after the attack.
     let mut store = CredentialStore::new();
@@ -566,7 +565,7 @@ async fn test_attack_credential_stuffing_attack() {
 
 #[tokio::test]
 async fn test_attack_password_spray_attack() {
-    let pq_vk = test_pq_vk();
+
     // Register 10 users. Try the same wrong password against all 10.
     // All must fail. Then try correct passwords — all must succeed.
     let mut store = CredentialStore::new();
@@ -679,7 +678,7 @@ async fn test_attack_timing_attack_on_password_verification() {
 
 #[test]
 fn test_attack_forged_token_random_signature_rejected() {
-    let pq_vk = test_pq_vk();
+
     // Create a token with valid claims but completely random signature bytes.
     let dkg_result = dkg(5, 3);
     let group_key = dkg_result.group.public_key_package.clone();
@@ -718,9 +717,9 @@ fn test_attack_forged_token_random_signature_rejected() {
 
 #[test]
 fn test_attack_forged_token_partial_signature_rejected() {
-    let pq_vk = test_pq_vk();
+
     // Create a valid token, modify just 1 byte of the signature. Must reject.
-    let (mut token, group_key, pq_vk) = make_valid_token_and_key();
+    let (mut token, group_key) = make_valid_token_and_key();
 
     // Verify it works first
     assert!(verify_token(&token, &group_key, test_pq_vk()).is_ok());
@@ -737,7 +736,7 @@ fn test_attack_forged_token_partial_signature_rejected() {
 
 #[test]
 fn test_attack_token_replay_across_sessions() {
-    let pq_vk = test_pq_vk();
+
     // Get a valid token from session 1. Try to use it in session 2
     // context (different DPoP key hash). Must fail because DPoP binding differs.
     let mut dkg_result = dkg(5, 3);
@@ -756,7 +755,6 @@ fn test_attack_token_replay_across_sessions() {
         ratchet_epoch: 1,
     };
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
-    let (pq_sk, pq_vk) = crypto::pq_sign::generate_pq_keypair();
     let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
     let token = build_token_distributed(&claims_session1, &coordinator, &mut signers, &[0x55u8; 64], test_pq_sk())
         .expect("build session 1 token");
@@ -790,7 +788,7 @@ fn test_attack_threshold_forgery_with_2_of_5_shares() {
 
 #[test]
 fn test_attack_cross_dkg_token_injection() {
-    let pq_vk = test_pq_vk();
+
     // Run two separate DKGs. Token signed by DKG-1 must fail verification
     // against DKG-2's public key. Proves cryptographic isolation.
     let mut dkg1 = dkg(5, 3);
@@ -810,7 +808,6 @@ fn test_attack_cross_dkg_token_injection() {
     };
 
     let (coordinator1, mut nodes1) = distribute_shares(&mut dkg1);
-    let (pq_sk, pq_vk) = crypto::pq_sign::generate_pq_keypair();
     let mut signers1: Vec<&mut _> = nodes1.iter_mut().take(3).collect();
     let token = build_token_distributed(&claims, &coordinator1, &mut signers1, &[0x55u8; 64], test_pq_sk())
         .expect("build token with DKG 1");

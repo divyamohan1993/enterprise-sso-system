@@ -278,14 +278,12 @@ async fn boot_gateway(orchestrator_addr: String) -> String {
 async fn boot_full_system(
     store: CredentialStore,
 ) -> (String, PublicKeyPackage, PqVerifyingKey) {
-    let pq_vk = test_pq_vk();
     let mut dkg_result = dkg(5, 3);
     let group_verifying_key = dkg_result.group.public_key_package.clone();
-    let (pq_sk, pq_vk) = generate_pq_keypair();
     let (coordinator, nodes) = distribute_shares(&mut dkg_result);
 
     let opaque_addr = boot_opaque(store).await;
-    let tss_addr = boot_tss(coordinator, nodes, pq_sk).await;
+    let tss_addr = boot_tss(coordinator, nodes, test_pq_sk().clone()).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let orchestrator_addr = boot_orchestrator(opaque_addr, tss_addr).await;
@@ -294,7 +292,7 @@ async fn boot_full_system(
     let gateway_addr = boot_gateway(orchestrator_addr).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    (gateway_addr, group_verifying_key, pq_vk)
+    (gateway_addr, group_verifying_key, test_pq_vk().clone())
 }
 
 /// Run a full client auth flow against a gateway, returning the AuthResponse.
@@ -342,7 +340,6 @@ struct ServicePortal {
 
 impl ServicePortal {
     fn new(name: &str, required_tier: u8, required_scope: u32, key: &PublicKeyPackage, pq_vk: &PqVerifyingKey) -> Self {
-    let pq_vk = test_pq_vk();
         Self {
             name: name.to_string(),
             required_tier,
