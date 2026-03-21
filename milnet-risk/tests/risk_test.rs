@@ -30,7 +30,10 @@ fn zero_risk_signals_score_zero() {
     let engine = RiskEngine::new();
     let user = Uuid::new_v4();
     let score = engine.compute_score(&user, &clean_signals());
-    assert!((score - 0.0).abs() < f64::EPSILON, "expected 0.0, got {score}");
+    assert!(
+        (score - 0.0).abs() < f64::EPSILON,
+        "expected 0.0, got {score}"
+    );
 }
 
 #[test]
@@ -53,10 +56,7 @@ fn failed_attempts_increase_risk() {
     signals.recent_failed_attempts = 5;
     let score = engine.compute_score(&user, &signals);
     // 5/5 * 0.15 = 0.15
-    assert!(
-        (score - 0.15).abs() < 0.001,
-        "expected ~0.15, got {score}"
-    );
+    assert!((score - 0.15).abs() < 0.001, "expected ~0.15, got {score}");
 }
 
 #[test]
@@ -66,10 +66,7 @@ fn impossible_travel_high_risk() {
     let mut signals = clean_signals();
     signals.geo_velocity_kmh = 2000.0;
     let score = engine.compute_score(&user, &signals);
-    assert!(
-        (score - 0.20).abs() < 0.001,
-        "expected ~0.20, got {score}"
-    );
+    assert!((score - 0.20).abs() < 0.001, "expected ~0.20, got {score}");
 }
 
 #[test]

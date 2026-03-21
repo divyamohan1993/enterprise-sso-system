@@ -94,15 +94,17 @@ fn receipt_has_correct_fields() {
     let receipt = response.receipt.expect("receipt should be present");
     assert_eq!(receipt.step_id, 1, "step_id must be 1 (first in chain)");
     assert_eq!(
-        receipt.prev_receipt_hash,
-        [0u8; 32],
+        receipt.prev_receipt_hash, [0u8; 32],
         "prev_receipt_hash must be zeros for first receipt"
     );
     assert_eq!(
         receipt.ceremony_session_id, session_id,
         "ceremony_session_id must match request"
     );
-    assert_eq!(receipt.user_id, user_id, "user_id must match registered user");
+    assert_eq!(
+        receipt.user_id, user_id,
+        "user_id must match registered user"
+    );
     assert_eq!(
         receipt.dpop_key_hash, dpop_hash,
         "dpop_key_hash must match request"

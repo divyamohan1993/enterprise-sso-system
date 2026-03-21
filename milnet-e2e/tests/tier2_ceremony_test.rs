@@ -12,7 +12,7 @@ use tokio::net::TcpStream;
 
 use milnet_common::types::{ModuleId, Token};
 use milnet_crypto::threshold::{dkg, SignerShare, ThresholdGroup};
-use milnet_gateway::puzzle::{PuzzleChallenge, PuzzleSolution, solve_challenge};
+use milnet_gateway::puzzle::{solve_challenge, PuzzleChallenge, PuzzleSolution};
 use milnet_gateway::server::{GatewayServer, OrchestratorConfig};
 use milnet_gateway::wire::{AuthRequest, AuthResponse};
 use milnet_opaque::messages::OpaqueRequest;
@@ -36,12 +36,8 @@ const TEST_DIFFICULTY: u8 = 4;
 
 // ── Wire helpers (length-prefixed postcard over TCP) ────────────────────
 
-async fn send_frame<T: serde::Serialize>(
-    stream: &mut TcpStream,
-    value: &T,
-) -> Result<(), String> {
-    let payload =
-        postcard::to_allocvec(value).map_err(|e| format!("serialize: {e}"))?;
+async fn send_frame<T: serde::Serialize>(stream: &mut TcpStream, value: &T) -> Result<(), String> {
+    let payload = postcard::to_allocvec(value).map_err(|e| format!("serialize: {e}"))?;
     let len = payload.len() as u32;
     stream
         .write_all(&len.to_be_bytes())
@@ -51,16 +47,11 @@ async fn send_frame<T: serde::Serialize>(
         .write_all(&payload)
         .await
         .map_err(|e| format!("write payload: {e}"))?;
-    stream
-        .flush()
-        .await
-        .map_err(|e| format!("flush: {e}"))?;
+    stream.flush().await.map_err(|e| format!("flush: {e}"))?;
     Ok(())
 }
 
-async fn recv_frame<T: serde::de::DeserializeOwned>(
-    stream: &mut TcpStream,
-) -> Result<T, String> {
+async fn recv_frame<T: serde::de::DeserializeOwned>(stream: &mut TcpStream) -> Result<T, String> {
     let mut len_buf = [0u8; 4];
     stream
         .read_exact(&mut len_buf)
@@ -82,7 +73,10 @@ async fn boot_opaque(store: CredentialStore) -> String {
     let listener = ShardListener::bind("127.0.0.1:0", ModuleId::Opaque, SHARD_HMAC_KEY)
         .await
         .expect("bind OPAQUE listener");
-    let addr = listener.local_addr().expect("OPAQUE local_addr").to_string();
+    let addr = listener
+        .local_addr()
+        .expect("OPAQUE local_addr")
+        .to_string();
 
     tokio::spawn(async move {
         loop {
@@ -112,8 +106,8 @@ async fn boot_opaque(store: CredentialStore) -> String {
 
             let response = opaque_handle_request(&store, &request, &RECEIPT_SIGNING_KEY);
 
-            let response_bytes = postcard::to_allocvec(&response)
-                .expect("serialize OPAQUE response");
+            let response_bytes =
+                postcard::to_allocvec(&response).expect("serialize OPAQUE response");
 
             if let Err(e) = transport.send(&response_bytes).await {
                 eprintln!("OPAQUE send error: {e}");
@@ -166,35 +160,35 @@ async fn boot_tss(mut signers: Vec<SignerShare>, group: ThresholdGroup) -> Strin
             };
 
             // Validate receipt chain
-            let response = match validate_receipt_chain(&request.receipts, &request.receipt_signing_key) {
-                Ok(()) => {
-                    // Build threshold-signed token
-                    match build_token(&request.claims, &mut signers, &group) {
-                        Ok(token) => {
-                            let token_bytes = postcard::to_allocvec(&token)
-                                .expect("serialize token");
-                            SigningResponse {
-                                success: true,
-                                token: Some(token_bytes),
-                                error: None,
+            let response =
+                match validate_receipt_chain(&request.receipts, &request.receipt_signing_key) {
+                    Ok(()) => {
+                        // Build threshold-signed token
+                        match build_token(&request.claims, &mut signers, &group) {
+                            Ok(token) => {
+                                let token_bytes =
+                                    postcard::to_allocvec(&token).expect("serialize token");
+                                SigningResponse {
+                                    success: true,
+                                    token: Some(token_bytes),
+                                    error: None,
+                                }
                             }
+                            Err(e) => SigningResponse {
+                                success: false,
+                                token: None,
+                                error: Some(format!("token build: {e}")),
+                            },
                         }
-                        Err(e) => SigningResponse {
-                            success: false,
-                            token: None,
-                            error: Some(format!("token build: {e}")),
-                        },
                     }
-                }
-                Err(e) => SigningResponse {
-                    success: false,
-                    token: None,
-                    error: Some(format!("receipt validation: {e}")),
-                },
-            };
+                    Err(e) => SigningResponse {
+                        success: false,
+                        token: None,
+                        error: Some(format!("receipt validation: {e}")),
+                    },
+                };
 
-            let response_bytes = postcard::to_allocvec(&response)
-                .expect("serialize TSS response");
+            let response_bytes = postcard::to_allocvec(&response).expect("serialize TSS response");
 
             if let Err(e) = transport.send(&response_bytes).await {
                 eprintln!("TSS send error: {e}");
@@ -210,14 +204,13 @@ async fn boot_orchestrator(opaque_addr: String, tss_addr: String) -> String {
     let listener = ShardListener::bind("127.0.0.1:0", ModuleId::Orchestrator, SHARD_HMAC_KEY)
         .await
         .expect("bind Orchestrator listener");
-    let addr = listener.local_addr().expect("Orchestrator local_addr").to_string();
+    let addr = listener
+        .local_addr()
+        .expect("Orchestrator local_addr")
+        .to_string();
 
-    let service = OrchestratorService::new(
-        SHARD_HMAC_KEY,
-        opaque_addr,
-        tss_addr,
-        RECEIPT_SIGNING_KEY,
-    );
+    let service =
+        OrchestratorService::new(SHARD_HMAC_KEY, opaque_addr, tss_addr, RECEIPT_SIGNING_KEY);
 
     tokio::spawn(async move {
         loop {
@@ -248,8 +241,8 @@ async fn boot_orchestrator(opaque_addr: String, tss_addr: String) -> String {
 
             let response = service.process_auth(&request).await;
 
-            let resp_bytes = postcard::to_allocvec(&response)
-                .expect("serialize Orchestrator response");
+            let resp_bytes =
+                postcard::to_allocvec(&response).expect("serialize Orchestrator response");
 
             if let Err(e) = transport.send(&resp_bytes).await {
                 eprintln!("Orchestrator send error: {e}");
@@ -273,7 +266,10 @@ async fn boot_gateway(orchestrator_addr: String) -> String {
     .await
     .expect("bind Gateway");
 
-    let addr = gateway.local_addr().expect("Gateway local_addr").to_string();
+    let addr = gateway
+        .local_addr()
+        .expect("Gateway local_addr")
+        .to_string();
 
     tokio::spawn(async move {
         gateway.run().await.expect("Gateway run");
@@ -367,11 +363,10 @@ async fn tier2_full_ceremony_success() {
 
     // 4. Verify the token
     let token_bytes = auth_resp.token.unwrap();
-    let token: Token = postcard::from_bytes(&token_bytes)
-        .expect("deserialize token");
+    let token: Token = postcard::from_bytes(&token_bytes).expect("deserialize token");
 
-    let claims = verify_token(&token, &group_verifying_key)
-        .expect("token verification should succeed");
+    let claims =
+        verify_token(&token, &group_verifying_key).expect("token verification should succeed");
 
     // Assert tier == 2 (Operational)
     assert_eq!(claims.tier, 2, "token tier should be 2");

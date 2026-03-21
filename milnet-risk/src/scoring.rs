@@ -1,5 +1,5 @@
-use uuid::Uuid;
 use std::collections::HashMap;
+use uuid::Uuid;
 
 /// Risk signal types
 #[derive(Debug, Clone)]
@@ -22,10 +22,12 @@ pub enum RiskLevel {
 }
 
 pub struct RiskEngine {
+    #[allow(dead_code)]
     baselines: HashMap<Uuid, UserBaseline>,
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct UserBaseline {
     avg_login_hour: f64,
     usual_networks: Vec<String>,

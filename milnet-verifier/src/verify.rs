@@ -39,11 +39,7 @@ pub fn verify_token(
         total: 5,
         group_verifying_key: *group_verifying_key,
     };
-    if !milnet_crypto::threshold::verify_group_signature(
-        &group,
-        &message,
-        &token.frost_signature,
-    ) {
+    if !milnet_crypto::threshold::verify_group_signature(&group, &message, &token.frost_signature) {
         return Err(MilnetError::CryptoVerification(
             "FROST signature invalid".into(),
         ));

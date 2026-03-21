@@ -12,6 +12,10 @@ milnet-orchestrator = { path = "../milnet-orchestrator" }
 milnet-opaque = { path = "../milnet-opaque" }
 milnet-tss = { path = "../milnet-tss" }
 milnet-verifier = { path = "../milnet-verifier" }
+milnet-ratchet = { path = "../milnet-ratchet" }
+milnet-audit = { path = "../milnet-audit" }
+milnet-kt = { path = "../milnet-kt" }
+milnet-risk = { path = "../milnet-risk" }
 tokio.workspace = true
 serde.workspace = true
 postcard.workspace = true

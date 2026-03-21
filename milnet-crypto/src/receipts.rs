@@ -42,16 +42,14 @@ fn mac_receipt_fields(mac: &mut HmacSha256, receipt: &Receipt) {
 
 /// Sign a receipt with HMAC (placeholder for Ed25519 receipt key from HSM)
 pub fn sign_receipt(receipt: &mut Receipt, signing_key: &[u8; 64]) {
-    let mut mac =
-        HmacSha256::new_from_slice(signing_key).expect("HMAC key length is always valid");
+    let mut mac = HmacSha256::new_from_slice(signing_key).expect("HMAC key length is always valid");
     mac_receipt_fields(&mut mac, receipt);
     receipt.signature = mac.finalize().into_bytes().to_vec();
 }
 
 /// Verify a receipt's signature
 pub fn verify_receipt_signature(receipt: &Receipt, signing_key: &[u8; 64]) -> bool {
-    let mut mac =
-        HmacSha256::new_from_slice(signing_key).expect("HMAC key length is always valid");
+    let mut mac = HmacSha256::new_from_slice(signing_key).expect("HMAC key length is always valid");
     mac_receipt_fields(&mut mac, receipt);
     let expected = mac.finalize().into_bytes();
     crate::ct::ct_eq(&receipt.signature, &expected)

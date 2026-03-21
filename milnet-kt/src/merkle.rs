@@ -46,7 +46,7 @@ impl MerkleTree {
         let mut current = *leaf;
         let mut idx = index;
         for sibling in proof {
-            current = if idx % 2 == 0 {
+            current = if idx.is_multiple_of(2) {
                 hash_pair(&current, sibling)
             } else {
                 hash_pair(sibling, &current)
@@ -82,7 +82,7 @@ fn compute_leaf(
     hasher.update(user_id.as_bytes());
     hasher.update(operation.as_bytes());
     hasher.update(credential_hash);
-    hasher.update(&timestamp.to_le_bytes());
+    hasher.update(timestamp.to_le_bytes());
     hasher.finalize().into()
 }
 
@@ -117,7 +117,11 @@ fn build_proof(leaves: &[[u8; 32]], index: usize) -> Vec<[u8; 32]> {
     let mut level: Vec<[u8; 32]> = leaves.to_vec();
     let mut idx = index;
     while level.len() > 1 {
-        let sibling_idx = if idx % 2 == 0 { idx + 1 } else { idx - 1 };
+        let sibling_idx = if idx.is_multiple_of(2) {
+            idx + 1
+        } else {
+            idx - 1
+        };
         let sibling = if sibling_idx < level.len() {
             level[sibling_idx]
         } else {

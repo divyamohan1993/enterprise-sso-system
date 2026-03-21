@@ -48,11 +48,7 @@ impl SessionManager {
     }
 
     /// Generate a ratchet tag for the given session's current epoch.
-    pub fn generate_tag(
-        &self,
-        session_id: &Uuid,
-        claims_bytes: &[u8],
-    ) -> Result<[u8; 64], String> {
+    pub fn generate_tag(&self, session_id: &Uuid, claims_bytes: &[u8]) -> Result<[u8; 64], String> {
         let chain = self
             .sessions
             .get(session_id)

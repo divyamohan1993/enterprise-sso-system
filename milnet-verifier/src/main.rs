@@ -2,8 +2,6 @@
 //! milnet-verifier: Credential Verifier (O(1) token verification).
 
 use ed25519_dalek::VerifyingKey;
-use tracing;
-
 fn main() {
     tracing::info!("milnet-verifier starting");
 

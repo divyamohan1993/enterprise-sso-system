@@ -82,12 +82,8 @@ impl CeremonySession {
     /// Transition to the `Failed` state from any non-terminal state.
     pub fn fail(&mut self, reason: String) -> Result<(), String> {
         match &self.state {
-            CeremonyState::Complete => {
-                Err("cannot fail an already-completed ceremony".into())
-            }
-            CeremonyState::Failed(_) => {
-                Err("ceremony has already failed".into())
-            }
+            CeremonyState::Complete => Err("cannot fail an already-completed ceremony".into()),
+            CeremonyState::Failed(_) => Err("ceremony has already failed".into()),
             _ => {
                 self.state = CeremonyState::Failed(reason);
                 Ok(())

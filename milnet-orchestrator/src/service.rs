@@ -49,10 +49,7 @@ impl OrchestratorService {
     }
 
     /// Process a single authentication request end-to-end.
-    pub async fn process_auth(
-        &self,
-        request: &OrchestratorRequest,
-    ) -> OrchestratorResponse {
+    pub async fn process_auth(&self, request: &OrchestratorRequest) -> OrchestratorResponse {
         match self.process_auth_inner(request).await {
             Ok(token_bytes) => OrchestratorResponse {
                 success: true,
@@ -68,10 +65,7 @@ impl OrchestratorService {
     }
 
     /// Inner implementation that returns Result for ergonomic error handling.
-    async fn process_auth_inner(
-        &self,
-        request: &OrchestratorRequest,
-    ) -> Result<Vec<u8>, String> {
+    async fn process_auth_inner(&self, request: &OrchestratorRequest) -> Result<Vec<u8>, String> {
         // 1. Generate ceremony session ID
         let session_id = generate_nonce();
         let mut session = CeremonySession::new(session_id);
@@ -102,14 +96,16 @@ impl OrchestratorService {
             .map_err(|e| format!("deserialize opaque response: {e}"))?;
 
         if !opaque_resp.success {
-            session.fail(opaque_resp.error.clone().unwrap_or_default()).ok();
-            return Err(opaque_resp.error.unwrap_or_else(|| "OPAQUE auth failed".into()));
+            session
+                .fail(opaque_resp.error.clone().unwrap_or_default())
+                .ok();
+            return Err(opaque_resp
+                .error
+                .unwrap_or_else(|| "OPAQUE auth failed".into()));
         }
 
         // 3. Add receipt to chain
-        let receipt = opaque_resp
-            .receipt
-            .ok_or("OPAQUE success but no receipt")?;
+        let receipt = opaque_resp.receipt.ok_or("OPAQUE success but no receipt")?;
         session.user_id = Some(receipt.user_id);
         session
             .receipt_chain
@@ -159,22 +155,27 @@ impl OrchestratorService {
             .map_err(|e| format!("deserialize signing response: {e}"))?;
 
         if !tss_resp.success {
-            session.fail(tss_resp.error.clone().unwrap_or_default()).ok();
-            return Err(tss_resp.error.unwrap_or_else(|| "TSS signing failed".into()));
+            session
+                .fail(tss_resp.error.clone().unwrap_or_default())
+                .ok();
+            return Err(tss_resp
+                .error
+                .unwrap_or_else(|| "TSS signing failed".into()));
         }
 
         session.tss_complete()?;
 
-        tss_resp.token.ok_or_else(|| "TSS success but no token".into())
+        tss_resp
+            .token
+            .ok_or_else(|| "TSS success but no token".into())
     }
 
     /// Start the orchestrator as a SHARD listener, processing auth requests
     /// from the Gateway.
     pub async fn run(&self, listen_addr: &str) -> Result<(), String> {
-        let listener =
-            ShardListener::bind(listen_addr, ModuleId::Orchestrator, self.hmac_key)
-                .await
-                .map_err(|e| format!("bind orchestrator listener: {e}"))?;
+        let listener = ShardListener::bind(listen_addr, ModuleId::Orchestrator, self.hmac_key)
+            .await
+            .map_err(|e| format!("bind orchestrator listener: {e}"))?;
 
         tracing::info!("Orchestrator listening on {}", listen_addr);
 
@@ -199,8 +200,8 @@ impl OrchestratorService {
 
             let response = self.process_auth(&request).await;
 
-            let resp_bytes = postcard::to_allocvec(&response)
-                .map_err(|e| format!("serialize response: {e}"))?;
+            let resp_bytes =
+                postcard::to_allocvec(&response).map_err(|e| format!("serialize response: {e}"))?;
 
             transport
                 .send(&resp_bytes)

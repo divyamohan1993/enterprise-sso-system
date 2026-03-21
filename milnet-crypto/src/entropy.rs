@@ -4,7 +4,7 @@
 //! entropy source compromise is sufficient. In production, a
 //! dedicated hardware RNG would be added as a third source.
 
-use sha2::{Sha512, Digest};
+use sha2::{Digest, Sha512};
 
 /// Combine multiple entropy sources per spec E.5.
 /// Returns 32 bytes of combined entropy.

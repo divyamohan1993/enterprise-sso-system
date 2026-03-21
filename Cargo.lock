@@ -490,11 +490,15 @@ dependencies = [
 name = "milnet-e2e"
 version = "0.1.0"
 dependencies = [
+ "milnet-audit",
  "milnet-common",
  "milnet-crypto",
  "milnet-gateway",
+ "milnet-kt",
  "milnet-opaque",
  "milnet-orchestrator",
+ "milnet-ratchet",
+ "milnet-risk",
  "milnet-shard",
  "milnet-tss",
  "milnet-verifier",

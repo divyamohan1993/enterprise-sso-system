@@ -70,11 +70,7 @@ impl RatchetChain {
     /// (lookahead verification with cached epoch keys is a future
     /// enhancement).
     pub fn verify_tag(&self, claims_bytes: &[u8], tag: &[u8; 64], token_epoch: u64) -> bool {
-        let epoch_diff = if token_epoch > self.epoch {
-            token_epoch - self.epoch
-        } else {
-            self.epoch - token_epoch
-        };
+        let epoch_diff = token_epoch.abs_diff(self.epoch);
         if epoch_diff > 3 {
             return false;
         }

@@ -98,13 +98,7 @@ fn chain_detects_tampering() {
 fn entries_are_ordered() {
     let mut log = AuditLog::new();
     for _ in 0..5 {
-        log.append(
-            AuditEventType::KeyRotation,
-            vec![],
-            vec![],
-            0.0,
-            Vec::new(),
-        );
+        log.append(AuditEventType::KeyRotation, vec![], vec![], 0.0, Vec::new());
     }
     let entries = log.entries();
     for window in entries.windows(2) {

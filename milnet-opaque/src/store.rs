@@ -52,9 +52,10 @@ impl CredentialStore {
     /// Returns the user_id on success or an error if the user doesn't exist
     /// or the password hash doesn't match.
     pub fn verify(&self, username: &str, password_hash: &[u8; 32]) -> Result<Uuid, MilnetError> {
-        let record = self.users.get(username).ok_or_else(|| {
-            MilnetError::CryptoVerification("unknown user".into())
-        })?;
+        let record = self
+            .users
+            .get(username)
+            .ok_or_else(|| MilnetError::CryptoVerification("unknown user".into()))?;
 
         if !ct_eq(&record.password_hash, password_hash) {
             return Err(MilnetError::CryptoVerification(

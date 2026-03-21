@@ -3,10 +3,10 @@
 use milnet_common::types::{ModuleId, Receipt, Token};
 use milnet_crypto::entropy::generate_key_64;
 use milnet_crypto::receipts::sign_receipt;
+use milnet_opaque::messages::{OpaqueRequest, OpaqueResponse};
 use milnet_orchestrator::ceremony::{CeremonySession, CeremonyState, CEREMONY_TIMEOUT_SECS};
 use milnet_orchestrator::messages::{OrchestratorRequest, OrchestratorResponse};
 use milnet_orchestrator::service::OrchestratorService;
-use milnet_opaque::messages::{OpaqueRequest, OpaqueResponse};
 use milnet_shard::transport::{connect, ShardListener};
 use milnet_tss::messages::{SigningRequest, SigningResponse};
 use uuid::Uuid;
@@ -47,10 +47,7 @@ fn ceremony_state_transitions() {
 fn ceremony_fail_from_pending_opaque() {
     let mut session = CeremonySession::new([0x01; 32]);
     assert!(session.fail("opaque error".into()).is_ok());
-    assert_eq!(
-        session.state,
-        CeremonyState::Failed("opaque error".into())
-    );
+    assert_eq!(session.state, CeremonyState::Failed("opaque error".into()));
     // Cannot fail again
     assert!(session.fail("double fail".into()).is_err());
 }
@@ -92,17 +89,15 @@ async fn orchestrator_processes_auth() {
     let receipt_signing_key = generate_key_64();
 
     // Start mock OPAQUE listener
-    let opaque_listener =
-        ShardListener::bind("127.0.0.1:0", ModuleId::Opaque, hmac_key)
-            .await
-            .expect("bind opaque");
+    let opaque_listener = ShardListener::bind("127.0.0.1:0", ModuleId::Opaque, hmac_key)
+        .await
+        .expect("bind opaque");
     let opaque_addr = opaque_listener.local_addr().unwrap().to_string();
 
     // Start mock TSS listener
-    let tss_listener =
-        ShardListener::bind("127.0.0.1:0", ModuleId::Tss, hmac_key)
-            .await
-            .expect("bind tss");
+    let tss_listener = ShardListener::bind("127.0.0.1:0", ModuleId::Tss, hmac_key)
+        .await
+        .expect("bind tss");
     let tss_addr = tss_listener.local_addr().unwrap().to_string();
 
     let rsk = receipt_signing_key;
@@ -112,8 +107,7 @@ async fn orchestrator_processes_auth() {
         let mut transport = opaque_listener.accept().await.expect("accept opaque");
         let (_sender, req_bytes) = transport.recv().await.expect("recv opaque req");
 
-        let req: OpaqueRequest =
-            postcard::from_bytes(&req_bytes).expect("deserialize opaque req");
+        let req: OpaqueRequest = postcard::from_bytes(&req_bytes).expect("deserialize opaque req");
 
         // Build a valid receipt
         let now = std::time::SystemTime::now()
@@ -166,12 +160,7 @@ async fn orchestrator_processes_auth() {
     });
 
     // Create orchestrator service and process auth
-    let service = OrchestratorService::new(
-        hmac_key,
-        opaque_addr,
-        tss_addr,
-        receipt_signing_key,
-    );
+    let service = OrchestratorService::new(hmac_key, opaque_addr, tss_addr, receipt_signing_key);
 
     let request = OrchestratorRequest {
         username: "alice".into(),
@@ -183,14 +172,17 @@ async fn orchestrator_processes_auth() {
     let response = service.process_auth(&request).await;
 
     // Verify success
-    assert!(response.success, "auth should succeed: {:?}", response.error);
+    assert!(
+        response.success,
+        "auth should succeed: {:?}",
+        response.error
+    );
     assert!(response.token_bytes.is_some(), "should have token bytes");
     assert!(response.error.is_none());
 
     // Verify the token deserializes
     let token_bytes = response.token_bytes.unwrap();
-    let token: Token =
-        postcard::from_bytes(&token_bytes).expect("token should deserialize");
+    let token: Token = postcard::from_bytes(&token_bytes).expect("token should deserialize");
     assert_eq!(token.header.version, 0x01);
 
     // Wait for mock services to finish
@@ -204,17 +196,15 @@ async fn orchestrator_handles_opaque_failure() {
     let receipt_signing_key = generate_key_64();
 
     // Start mock OPAQUE listener that returns failure
-    let opaque_listener =
-        ShardListener::bind("127.0.0.1:0", ModuleId::Opaque, hmac_key)
-            .await
-            .expect("bind opaque");
+    let opaque_listener = ShardListener::bind("127.0.0.1:0", ModuleId::Opaque, hmac_key)
+        .await
+        .expect("bind opaque");
     let opaque_addr = opaque_listener.local_addr().unwrap().to_string();
 
     // TSS listener (won't be reached)
-    let tss_listener =
-        ShardListener::bind("127.0.0.1:0", ModuleId::Tss, hmac_key)
-            .await
-            .expect("bind tss");
+    let tss_listener = ShardListener::bind("127.0.0.1:0", ModuleId::Tss, hmac_key)
+        .await
+        .expect("bind tss");
     let tss_addr = tss_listener.local_addr().unwrap().to_string();
 
     let opaque_handle = tokio::spawn(async move {
@@ -230,12 +220,7 @@ async fn orchestrator_handles_opaque_failure() {
         transport.send(&resp_bytes).await.expect("send opaque resp");
     });
 
-    let service = OrchestratorService::new(
-        hmac_key,
-        opaque_addr,
-        tss_addr,
-        receipt_signing_key,
-    );
+    let service = OrchestratorService::new(hmac_key, opaque_addr, tss_addr, receipt_signing_key);
 
     let request = OrchestratorRequest {
         username: "baduser".into(),

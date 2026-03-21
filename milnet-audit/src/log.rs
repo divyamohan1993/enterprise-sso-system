@@ -75,8 +75,8 @@ pub fn hash_entry(entry: &AuditEntry) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(domain::AUDIT_ENTRY);
     hasher.update(entry.event_id.as_bytes());
-    hasher.update(&entry.timestamp.to_le_bytes());
-    hasher.update(&entry.prev_hash);
+    hasher.update(entry.timestamp.to_le_bytes());
+    hasher.update(entry.prev_hash);
     let result = hasher.finalize();
     let mut hash = [0u8; 32];
     hash.copy_from_slice(&result);

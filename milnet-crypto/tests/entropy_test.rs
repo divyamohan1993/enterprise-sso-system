@@ -1,4 +1,4 @@
-use milnet_crypto::entropy::{combined_entropy, generate_nonce, generate_key_64};
+use milnet_crypto::entropy::{combined_entropy, generate_key_64, generate_nonce};
 
 #[test]
 fn combined_entropy_is_nonzero() {

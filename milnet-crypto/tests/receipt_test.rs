@@ -1,7 +1,5 @@
 use milnet_common::types::Receipt;
-use milnet_crypto::receipts::{
-    hash_receipt, sign_receipt, verify_receipt_signature, ReceiptChain,
-};
+use milnet_crypto::receipts::{hash_receipt, sign_receipt, verify_receipt_signature, ReceiptChain};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 

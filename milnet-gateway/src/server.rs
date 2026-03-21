@@ -86,7 +86,7 @@ impl GatewayServer {
             .await
             .map_err(|e| {
                 error!("connection from {addr} failed: {e}");
-                std::io::Error::new(std::io::ErrorKind::Other, e)
+                std::io::Error::other(e)
             })
     }
 }
@@ -153,7 +153,7 @@ async fn forward_to_orchestrator(
         username: auth_req.username.clone(),
         password_hash: auth_req.password_hash,
         dpop_key_hash: [0u8; 32], // Gateway does not have DPoP yet
-        tier: 2, // Default to Tier 2 (Operational)
+        tier: 2,                  // Default to Tier 2 (Operational)
     };
 
     let req_bytes = postcard::to_allocvec(&orch_req)
@@ -184,12 +184,8 @@ async fn forward_to_orchestrator(
 }
 
 /// Send a postcard-serialized value with 4-byte BE length prefix.
-async fn send_frame<T: serde::Serialize>(
-    stream: &mut TcpStream,
-    value: &T,
-) -> Result<(), String> {
-    let payload =
-        postcard::to_allocvec(value).map_err(|e| format!("serialize: {e}"))?;
+async fn send_frame<T: serde::Serialize>(stream: &mut TcpStream, value: &T) -> Result<(), String> {
+    let payload = postcard::to_allocvec(value).map_err(|e| format!("serialize: {e}"))?;
     let len = payload.len() as u32;
     stream
         .write_all(&len.to_be_bytes())
@@ -199,17 +195,12 @@ async fn send_frame<T: serde::Serialize>(
         .write_all(&payload)
         .await
         .map_err(|e| format!("write payload: {e}"))?;
-    stream
-        .flush()
-        .await
-        .map_err(|e| format!("flush: {e}"))?;
+    stream.flush().await.map_err(|e| format!("flush: {e}"))?;
     Ok(())
 }
 
 /// Read a length-prefixed frame and deserialize with postcard.
-async fn recv_frame<T: serde::de::DeserializeOwned>(
-    stream: &mut TcpStream,
-) -> Result<T, String> {
+async fn recv_frame<T: serde::de::DeserializeOwned>(stream: &mut TcpStream) -> Result<T, String> {
     let mut len_buf = [0u8; 4];
     stream
         .read_exact(&mut len_buf)

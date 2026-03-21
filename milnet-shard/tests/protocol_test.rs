@@ -35,7 +35,9 @@ fn rejects_replay() {
     receiver.verify_message(&raw).expect("first verify");
 
     // Replaying the same message must fail (same sequence number)
-    let err = receiver.verify_message(&raw).expect_err("replay should fail");
+    let err = receiver
+        .verify_message(&raw)
+        .expect_err("replay should fail");
     let msg = format!("{err}");
     assert!(msg.contains("replay"), "error should mention replay: {msg}");
 }
@@ -46,7 +48,9 @@ fn rejects_tampered_payload() {
     let mut sender = ShardProtocol::new(ModuleId::Gateway, key);
     let mut receiver = ShardProtocol::new(ModuleId::Orchestrator, key);
 
-    let mut raw = sender.create_message(b"original payload").expect("create_message");
+    let mut raw = sender
+        .create_message(b"original payload")
+        .expect("create_message");
 
     // Tamper with a byte in the payload area (somewhere in the middle of the serialized data)
     // We flip a byte near the end but before the HMAC to corrupt the payload.
@@ -62,7 +66,9 @@ fn rejects_wrong_key() {
     let mut sender = ShardProtocol::new(ModuleId::Gateway, test_key_a());
     let mut receiver = ShardProtocol::new(ModuleId::Orchestrator, test_key_b());
 
-    let raw = sender.create_message(b"secret data").expect("create_message");
+    let raw = sender
+        .create_message(b"secret data")
+        .expect("create_message");
 
     let err = receiver.verify_message(&raw);
     assert!(err.is_err(), "wrong key should fail HMAC verification");
@@ -88,19 +94,25 @@ fn tracks_multiple_senders() {
     assert_eq!(pay_b, b"from tss");
 
     // Second message from each sender should also work
-    let raw_a2 = sender_a.create_message(b"gateway msg 2").expect("create a2");
+    let raw_a2 = sender_a
+        .create_message(b"gateway msg 2")
+        .expect("create a2");
     let raw_b2 = sender_b.create_message(b"tss msg 2").expect("create b2");
 
     receiver.verify_message(&raw_a2).expect("verify a2");
     receiver.verify_message(&raw_b2).expect("verify b2");
 
     // Replaying a1 should fail (sequence 1 already seen for Gateway)
-    let err = receiver.verify_message(&raw_a1).expect_err("replay a1 should fail");
+    let err = receiver
+        .verify_message(&raw_a1)
+        .expect_err("replay a1 should fail");
     let msg = format!("{err}");
     assert!(msg.contains("replay"), "error should mention replay: {msg}");
 
     // But b1 replay should also fail independently
-    let err = receiver.verify_message(&raw_b1).expect_err("replay b1 should fail");
+    let err = receiver
+        .verify_message(&raw_b1)
+        .expect_err("replay b1 should fail");
     let msg = format!("{err}");
     assert!(msg.contains("replay"), "error should mention replay: {msg}");
 }

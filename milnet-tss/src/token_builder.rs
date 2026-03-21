@@ -24,8 +24,8 @@ pub fn build_token(
     let partials: Vec<_> = signers.iter_mut().map(|s| s.partial_sign(&msg)).collect();
 
     // Combine partials into a single group signature
-    let frost_signature = combine_partials(group, &partials, &msg)
-        .map_err(|e| MilnetError::CryptoVerification(e))?;
+    let frost_signature =
+        combine_partials(group, &partials, &msg).map_err(MilnetError::CryptoVerification)?;
 
     Ok(Token {
         header: TokenHeader {

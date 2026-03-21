@@ -51,8 +51,7 @@ impl ShardProtocol {
 
     /// Compute HMAC-SHA512 over the domain prefix and message fields (excluding the HMAC field).
     fn compute_hmac(key: &[u8; 64], msg: &ShardMessage) -> [u8; 64] {
-        let mut mac = HmacSha512::new_from_slice(key)
-            .expect("HMAC-SHA512 accepts any key size");
+        let mut mac = HmacSha512::new_from_slice(key).expect("HMAC-SHA512 accepts any key size");
 
         // Domain separation prefix
         mac.update(SHARD_AUTH);
@@ -122,7 +121,11 @@ impl ShardProtocol {
         }
 
         // 3. Replay protection: sequence must be strictly increasing per sender
-        let last_seq = self.recv_sequences.get(&msg.sender_module).copied().unwrap_or(0);
+        let last_seq = self
+            .recv_sequences
+            .get(&msg.sender_module)
+            .copied()
+            .unwrap_or(0);
         if msg.sequence <= last_seq {
             return Err(MilnetError::Shard(format!(
                 "replay detected: seq={} <= last={}",
