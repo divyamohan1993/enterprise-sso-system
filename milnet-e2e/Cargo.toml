@@ -21,4 +21,5 @@ tokio.workspace = true
 serde.workspace = true
 postcard.workspace = true
 uuid.workspace = true
+frost-ristretto255.workspace = true
 rand = "0.8"

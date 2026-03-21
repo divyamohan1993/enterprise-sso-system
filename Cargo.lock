@@ -806,6 +806,7 @@ dependencies = [
 name = "milnet-e2e"
 version = "0.1.0"
 dependencies = [
+ "frost-ristretto255",
  "milnet-audit",
  "milnet-common",
  "milnet-crypto",
