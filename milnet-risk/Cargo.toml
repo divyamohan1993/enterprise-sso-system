@@ -1,0 +1,10 @@
+[package]
+name = "milnet-risk"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+milnet-common = { path = "../milnet-common" }
+milnet-shard = { path = "../milnet-shard" }
+tokio.workspace = true
+tracing.workspace = true

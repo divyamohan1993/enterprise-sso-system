@@ -1,0 +1,13 @@
+[package]
+name = "milnet-shard"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+milnet-common = { path = "../milnet-common" }
+milnet-crypto = { path = "../milnet-crypto" }
+serde.workspace = true
+postcard.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+tokio.workspace = true
