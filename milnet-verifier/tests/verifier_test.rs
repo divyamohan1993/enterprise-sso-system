@@ -13,15 +13,9 @@ fn build_signed_token(dkg: &mut threshold::DkgResult, claims: TokenClaims) -> To
     message.extend_from_slice(domain::FROST_TOKEN);
     message.extend_from_slice(&claims_bytes);
 
-    // Collect threshold partial signatures
-    let partials: Vec<threshold::PartialSignature> = dkg
-        .shares
-        .iter_mut()
-        .take(dkg.group.threshold)
-        .map(|share| share.partial_sign(&message))
-        .collect();
-
-    let frost_signature = threshold::combine_partials(&dkg.group, &partials, &message).unwrap();
+    let frost_signature =
+        threshold::threshold_sign(&mut dkg.shares, &dkg.group, &message, dkg.group.threshold)
+            .unwrap();
 
     Token {
         header: TokenHeader {
@@ -64,7 +58,7 @@ fn valid_token_verifies() {
     let expected_tier = claims.tier;
 
     let token = build_signed_token(&mut dkg, claims);
-    let result = milnet_verifier::verify_token(&token, &dkg.group.group_verifying_key);
+    let result = milnet_verifier::verify_token(&token, &dkg.group.public_key_package);
 
     assert!(result.is_ok(), "expected valid token: {:?}", result.err());
     let verified_claims = result.unwrap();
@@ -94,7 +88,7 @@ fn expired_token_rejected() {
     };
 
     let token = build_signed_token(&mut dkg, claims);
-    let result = milnet_verifier::verify_token(&token, &dkg.group.group_verifying_key);
+    let result = milnet_verifier::verify_token(&token, &dkg.group.public_key_package);
 
     assert!(result.is_err());
     assert!(
@@ -112,7 +106,7 @@ fn tampered_signature_rejected() {
     // Flip a byte in the FROST signature
     token.frost_signature[0] ^= 0xFF;
 
-    let result = milnet_verifier::verify_token(&token, &dkg.group.group_verifying_key);
+    let result = milnet_verifier::verify_token(&token, &dkg.group.public_key_package);
     assert!(result.is_err());
     assert!(
         matches!(result.unwrap_err(), MilnetError::CryptoVerification(_)),
@@ -129,7 +123,7 @@ fn tampered_claims_rejected() {
     // Modify claims after signing — signature should no longer match
     token.claims.scope = 0xFFFF_FFFF;
 
-    let result = milnet_verifier::verify_token(&token, &dkg.group.group_verifying_key);
+    let result = milnet_verifier::verify_token(&token, &dkg.group.public_key_package);
     assert!(result.is_err());
     assert!(
         matches!(result.unwrap_err(), MilnetError::CryptoVerification(_)),
@@ -145,7 +139,7 @@ fn wrong_group_key_rejected() {
     let token = build_signed_token(&mut dkg1, claims);
 
     // Verify with a different group's key
-    let result = milnet_verifier::verify_token(&token, &dkg2.group.group_verifying_key);
+    let result = milnet_verifier::verify_token(&token, &dkg2.group.public_key_package);
     assert!(result.is_err());
     assert!(
         matches!(result.unwrap_err(), MilnetError::CryptoVerification(_)),

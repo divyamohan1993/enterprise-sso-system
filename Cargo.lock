@@ -821,7 +821,6 @@ dependencies = [
  "postcard",
  "rand",
  "serde",
- "sha2",
  "tokio",
  "uuid",
 ]
@@ -868,7 +867,6 @@ dependencies = [
  "opaque-ke",
  "postcard",
  "serde",
- "sha2",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -962,6 +960,7 @@ name = "milnet-verifier"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "frost-ristretto255",
  "milnet-common",
  "milnet-crypto",
  "milnet-shard",

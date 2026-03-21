@@ -20,5 +20,4 @@ tokio.workspace = true
 serde.workspace = true
 postcard.workspace = true
 uuid.workspace = true
-sha2.workspace = true
 rand = "0.8"

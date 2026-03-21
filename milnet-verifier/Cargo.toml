@@ -8,6 +8,7 @@ milnet-common = { path = "../milnet-common" }
 milnet-crypto = { path = "../milnet-crypto" }
 milnet-shard = { path = "../milnet-shard" }
 ed25519-dalek.workspace = true
+frost-ristretto255.workspace = true
 sha2.workspace = true
 serde.workspace = true
 postcard.workspace = true

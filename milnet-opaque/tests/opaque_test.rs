@@ -1,7 +1,5 @@
 //! Integration tests for the OPAQUE password service.
 
-use sha2::{Digest, Sha256};
-
 use milnet_crypto::receipts::verify_receipt_signature;
 use milnet_opaque::messages::OpaqueRequest;
 use milnet_opaque::service::handle_request;
@@ -10,23 +8,13 @@ use milnet_opaque::store::CredentialStore;
 /// Fixed signing key matching the one in service.rs (Phase 2 placeholder).
 const SIGNING_KEY: [u8; 64] = [0x42u8; 64];
 
-fn sha256(data: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    let result = hasher.finalize();
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&result);
-    hash
-}
-
 #[test]
 fn store_register_and_verify() {
     let mut store = CredentialStore::new();
     let password = b"correct-horse-battery-staple";
     let user_id = store.register("alice", password);
 
-    let hash = sha256(password);
-    let result = store.verify("alice", &hash);
+    let result = store.verify("alice", password);
     assert!(result.is_ok());
     assert_eq!(result.unwrap(), user_id);
 }
@@ -36,16 +24,14 @@ fn store_wrong_password_rejected() {
     let mut store = CredentialStore::new();
     store.register("bob", b"real-password");
 
-    let wrong_hash = sha256(b"wrong-password");
-    let result = store.verify("bob", &wrong_hash);
+    let result = store.verify("bob", b"wrong-password");
     assert!(result.is_err());
 }
 
 #[test]
 fn store_unknown_user_rejected() {
     let store = CredentialStore::new();
-    let hash = sha256(b"any-password");
-    let result = store.verify("nonexistent", &hash);
+    let result = store.verify("nonexistent", b"any-password");
     assert!(result.is_err());
 }
 
@@ -57,7 +43,7 @@ fn receipt_is_properly_signed() {
 
     let request = OpaqueRequest {
         username: "charlie".into(),
-        password_hash: sha256(password),
+        password: password.to_vec(),
         ceremony_session_id: [0xAA; 32],
         dpop_key_hash: [0xBB; 32],
     };
@@ -83,7 +69,7 @@ fn receipt_has_correct_fields() {
 
     let request = OpaqueRequest {
         username: "diana".into(),
-        password_hash: sha256(password),
+        password: password.to_vec(),
         ceremony_session_id: session_id,
         dpop_key_hash: dpop_hash,
     };

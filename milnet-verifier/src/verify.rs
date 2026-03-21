@@ -1,4 +1,4 @@
-use ed25519_dalek::VerifyingKey;
+use frost_ristretto255::keys::PublicKeyPackage;
 use milnet_common::domain;
 use milnet_common::error::MilnetError;
 use milnet_common::types::{Token, TokenClaims};
@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// This is the O(1) hot path — must be as fast as possible.
 pub fn verify_token(
     token: &Token,
-    group_verifying_key: &VerifyingKey,
+    public_key_package: &PublicKeyPackage,
 ) -> Result<TokenClaims, MilnetError> {
     // 1. Check version
     if token.header.version != 1 {
@@ -34,16 +34,12 @@ pub fn verify_token(
     message.extend_from_slice(&claims_bytes);
 
     // 4. Verify FROST threshold signature
-    let group = milnet_crypto::threshold::ThresholdGroup {
-        threshold: 3,
-        total: 5,
-        group_verifying_key: *group_verifying_key,
-    };
-    if !milnet_crypto::threshold::verify_group_signature(&group, &message, &token.frost_signature) {
-        return Err(MilnetError::CryptoVerification(
-            "FROST signature invalid".into(),
-        ));
-    }
+    let sig = frost_ristretto255::Signature::deserialize(&token.frost_signature)
+        .map_err(|e| MilnetError::CryptoVerification(format!("invalid signature encoding: {e}")))?;
+    public_key_package
+        .verifying_key()
+        .verify(&message, &sig)
+        .map_err(|_| MilnetError::CryptoVerification("FROST signature invalid".into()))?;
 
     // 5. Check tier is valid (1-4)
     if token.claims.tier == 0 || token.claims.tier > 4 {

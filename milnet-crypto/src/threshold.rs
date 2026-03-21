@@ -1,123 +1,142 @@
-//! Simplified threshold signing (spec C.6, C.15)
+//! FROST threshold signing (spec C.6, C.15)
 //!
-//! This is a placeholder that demonstrates the 3-of-5 threshold concept.
-//! In production, this will be replaced with frost-ristretto255 + ROAST.
-//! The API is designed to match what the real FROST integration will need.
+//! Uses frost-ristretto255 with trusted dealer key generation.
+//! Phase 2: trusted dealer is acceptable; real DKG requires TSS service wiring.
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use frost_ristretto255 as frost;
+use frost::keys::{KeyPackage, PublicKeyPackage};
+use frost::{Identifier, SigningPackage};
+use rand::thread_rng;
+use std::collections::BTreeMap;
 
-/// Represents a group of threshold signers
+/// Represents a group of threshold signers.
 pub struct ThresholdGroup {
-    pub threshold: usize, // t (e.g., 3)
-    pub total: usize,     // n (e.g., 5)
-    pub group_verifying_key: VerifyingKey,
-    // In real FROST: this would be the group public key
-    // In this placeholder: it's the key that all signers share
+    pub threshold: usize,
+    pub total: usize,
+    pub public_key_package: PublicKeyPackage,
 }
 
-/// A single signer's share
+/// A single signer's share.
 pub struct SignerShare {
-    pub index: usize, // 1-based signer index
-    signing_key: SigningKey,
-    pub nonce_counter: u64, // monotonic per E.4
+    pub identifier: Identifier,
+    pub key_package: KeyPackage,
+    pub nonce_counter: u64,
 }
 
-/// Result of a DKG ceremony
+/// Result of a DKG ceremony.
 pub struct DkgResult {
     pub group: ThresholdGroup,
     pub shares: Vec<SignerShare>,
 }
 
-/// A partial signature from one signer
-pub struct PartialSignature {
-    pub signer_index: usize,
-    pub signature: Signature,
-    pub nonce_count: u64,
-}
-
-impl SignerShare {
-    /// Sign a message, incrementing the nonce counter (spec E.4)
-    pub fn partial_sign(&mut self, message: &[u8]) -> PartialSignature {
-        self.nonce_counter += 1;
-        let sig = self.signing_key.sign(message);
-        PartialSignature {
-            signer_index: self.index,
-            signature: sig,
-            nonce_count: self.nonce_counter,
-        }
-    }
-}
-
 /// Run a DKG ceremony to generate a threshold group.
-/// In production: Gennaro et al. secure DKG (spec E.2)
-/// Placeholder: generates a shared signing key
-pub fn dkg(total: usize, threshold: usize) -> DkgResult {
-    assert!(threshold <= total, "threshold must be <= total");
-    assert!(threshold > 0, "threshold must be > 0");
+/// Uses trusted dealer (frost::keys::generate_with_dealer).
+pub fn dkg(total: u16, threshold: u16) -> DkgResult {
+    let mut rng = thread_rng();
+    let (shares_map, public_key_package) = frost::keys::generate_with_dealer(
+        total.into(),
+        threshold.into(),
+        frost::keys::IdentifierList::Default,
+        &mut rng,
+    )
+    .expect("DKG failed");
 
-    // Placeholder: all signers share the same key
-    // Real FROST: each gets a unique share via Shamir secret sharing
-    let mut rng = rand::thread_rng();
-    let signing_key = SigningKey::generate(&mut rng);
-    let verifying_key = signing_key.verifying_key();
-
-    let shares: Vec<SignerShare> = (1..=total)
-        .map(|i| {
-            // Placeholder: clone the key (real FROST uses proper shares)
-            let sk_bytes = signing_key.to_bytes();
-            SignerShare {
-                index: i,
-                signing_key: SigningKey::from_bytes(&sk_bytes),
-                nonce_counter: 0,
-            }
+    let shares: Vec<SignerShare> = shares_map
+        .into_iter()
+        .map(|(id, secret_share)| SignerShare {
+            identifier: id,
+            key_package: KeyPackage::try_from(secret_share).unwrap(),
+            nonce_counter: 0,
         })
         .collect();
 
     DkgResult {
         group: ThresholdGroup {
-            threshold,
-            total,
-            group_verifying_key: verifying_key,
+            threshold: threshold as usize,
+            total: total as usize,
+            public_key_package,
         },
         shares,
     }
 }
 
-/// Combine partial signatures from t signers into a final signature.
-/// Returns the signature bytes if enough valid partials are provided.
-/// In real FROST: aggregates Schnorr partial signatures.
-/// Placeholder: uses the first valid signature.
-pub fn combine_partials(
+/// Perform a full threshold signing ceremony with the given signers.
+///
+/// Takes the first `threshold` signers from `shares`, runs FROST round1 (commit),
+/// round2 (sign), and aggregation, returning the 64-byte group signature.
+pub fn threshold_sign(
+    shares: &mut [SignerShare],
     group: &ThresholdGroup,
-    partials: &[PartialSignature],
     message: &[u8],
+    threshold: usize,
 ) -> Result<[u8; 64], String> {
-    if partials.len() < group.threshold {
+    if shares.len() < threshold {
         return Err(format!(
-            "need {} partials, got {}",
-            group.threshold,
-            partials.len()
+            "need {} signers, got {}",
+            threshold,
+            shares.len()
         ));
     }
 
-    // Verify each partial is valid
-    for partial in partials.iter().take(group.threshold) {
-        group
-            .group_verifying_key
-            .verify(message, &partial.signature)
-            .map_err(|e| format!("partial sig {} invalid: {}", partial.signer_index, e))?;
+    let mut rng = thread_rng();
+
+    // Round 1: each signer commits
+    let mut nonces_map: BTreeMap<Identifier, frost::round1::SigningNonces> = BTreeMap::new();
+    let mut commitments_map: BTreeMap<Identifier, frost::round1::SigningCommitments> =
+        BTreeMap::new();
+
+    for signer in shares.iter_mut().take(threshold) {
+        signer.nonce_counter += 1;
+        let (nonces, commitments) =
+            frost::round1::commit(signer.key_package.signing_share(), &mut rng);
+        nonces_map.insert(signer.identifier, nonces);
+        commitments_map.insert(signer.identifier, commitments);
     }
 
-    // Return the first valid signature (placeholder for FROST aggregation)
-    Ok(partials[0].signature.to_bytes())
+    // Create signing package
+    let signing_package =
+        SigningPackage::new(commitments_map, message);
+
+    // Round 2: each signer signs
+    let mut signature_shares: BTreeMap<Identifier, frost::round2::SignatureShare> = BTreeMap::new();
+    for signer in shares.iter().take(threshold) {
+        let nonces = nonces_map
+            .remove(&signer.identifier)
+            .ok_or_else(|| format!("missing nonces for signer {:?}", signer.identifier))?;
+        let share = frost::round2::sign(&signing_package, &nonces, &signer.key_package)
+            .map_err(|e| format!("round2 sign failed: {e}"))?;
+        signature_shares.insert(signer.identifier, share);
+    }
+
+    // Aggregate
+    let group_signature = frost::aggregate(
+        &signing_package,
+        &signature_shares,
+        &group.public_key_package,
+    )
+    .map_err(|e| format!("aggregation failed: {e}"))?;
+
+    let sig_bytes = group_signature
+        .serialize()
+        .map_err(|e| format!("signature serialization failed: {e}"))?;
+    let mut out = [0u8; 64];
+    out.copy_from_slice(&sig_bytes);
+    Ok(out)
 }
 
-/// Verify a combined signature against the group key
+/// Verify a combined group signature against the group's verifying key.
 pub fn verify_group_signature(
     group: &ThresholdGroup,
     message: &[u8],
     signature_bytes: &[u8; 64],
 ) -> bool {
-    let sig = Signature::from_bytes(signature_bytes);
-    group.group_verifying_key.verify(message, &sig).is_ok()
+    let sig = match frost::Signature::deserialize(signature_bytes) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    group
+        .public_key_package
+        .verifying_key()
+        .verify(message, &sig)
+        .is_ok()
 }

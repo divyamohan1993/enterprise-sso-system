@@ -96,7 +96,7 @@ async fn gateway_accepts_solved_puzzle() {
     // 3. Send auth request
     let auth_req = AuthRequest {
         username: "testuser".into(),
-        password_hash: [0xBB; 32],
+        password: vec![0xBB; 32],
     };
     send_frame(&mut stream, &auth_req).await;
 

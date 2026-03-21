@@ -6,7 +6,6 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -287,7 +286,7 @@ async fn boot_gateway(orchestrator_addr: String) -> String {
 async fn tier2_full_ceremony_success() {
     // 1. Setup crypto: DKG(5,3)
     let dkg_result = dkg(5, 3);
-    let group_verifying_key = dkg_result.group.group_verifying_key;
+    let group_verifying_key = dkg_result.group.public_key_package.clone();
 
     // Take only 3 shares (threshold) for the TSS
     let signers: Vec<SignerShare> = dkg_result.shares.into_iter().take(3).collect();
@@ -334,19 +333,10 @@ async fn tier2_full_ceremony_success() {
         .await
         .expect("send puzzle solution");
 
-    // Send auth request with correct password hash
-    let password_hash = {
-        let mut hasher = Sha256::new();
-        hasher.update(b"password123");
-        let h = hasher.finalize();
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&h);
-        arr
-    };
-
+    // Send auth request with correct password
     let auth_req = AuthRequest {
         username: "alice".to_string(),
-        password_hash,
+        password: b"password123".to_vec(),
     };
     send_frame(&mut stream, &auth_req)
         .await
@@ -431,19 +421,10 @@ async fn tier2_wrong_password_fails() {
         .await
         .expect("send puzzle solution");
 
-    // Send auth request with WRONG password hash
-    let wrong_hash = {
-        let mut hasher = Sha256::new();
-        hasher.update(b"wrong_password");
-        let h = hasher.finalize();
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&h);
-        arr
-    };
-
+    // Send auth request with WRONG password
     let auth_req = AuthRequest {
         username: "alice".to_string(),
-        password_hash: wrong_hash,
+        password: b"wrong_password".to_vec(),
     };
     send_frame(&mut stream, &auth_req)
         .await

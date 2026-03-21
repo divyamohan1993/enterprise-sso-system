@@ -73,7 +73,7 @@ impl OrchestratorService {
         // 2. Build and send OPAQUE request
         let opaque_req = OpaqueRequest {
             username: request.username.clone(),
-            password_hash: request.password_hash,
+            password: request.password.clone(),
             ceremony_session_id: session_id,
             dpop_key_hash: request.dpop_key_hash,
         };

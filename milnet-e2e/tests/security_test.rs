@@ -112,7 +112,7 @@ fn receipt_chain_forgery_rejected() {
 #[test]
 fn expired_token_rejected() {
     let dkg_result = dkg(5, 3);
-    let group_key = dkg_result.group.group_verifying_key;
+    let group_key = dkg_result.group.public_key_package.clone();
 
     // Build a token that expired in the past
     let claims = TokenClaims {
@@ -145,7 +145,7 @@ fn expired_token_rejected() {
 #[test]
 fn tampered_token_rejected() {
     let dkg_result = dkg(5, 3);
-    let group_key = dkg_result.group.group_verifying_key;
+    let group_key = dkg_result.group.public_key_package.clone();
 
     // Build a valid, non-expired token
     let claims = TokenClaims {

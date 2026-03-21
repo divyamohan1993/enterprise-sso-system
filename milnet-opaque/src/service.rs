@@ -35,7 +35,7 @@ pub fn handle_request(
     request: &OpaqueRequest,
     signing_key: &[u8; 64],
 ) -> OpaqueResponse {
-    match store.verify(&request.username, &request.password_hash) {
+    match store.verify(&request.username, &request.password) {
         Ok(user_id) => {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)

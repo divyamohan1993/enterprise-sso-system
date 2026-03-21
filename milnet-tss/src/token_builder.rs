@@ -1,15 +1,14 @@
 use milnet_common::domain;
 use milnet_common::error::MilnetError;
 use milnet_common::types::{Token, TokenClaims, TokenHeader};
-use milnet_crypto::threshold::{combine_partials, SignerShare, ThresholdGroup};
+use milnet_crypto::threshold::{threshold_sign, SignerShare, ThresholdGroup};
 
 /// Build a threshold-signed token from validated claims.
 ///
 /// Steps:
 /// 1. Serialize claims with `FROST_TOKEN` domain prefix.
-/// 2. Collect threshold partial signatures from signers.
-/// 3. Combine via `combine_partials`.
-/// 4. Build the final [`Token`].
+/// 2. Run FROST threshold signing ceremony.
+/// 3. Build the final [`Token`].
 pub fn build_token(
     claims: &TokenClaims,
     signers: &mut [SignerShare],
@@ -20,12 +19,9 @@ pub fn build_token(
         postcard::to_allocvec(claims).map_err(|e| MilnetError::Serialization(e.to_string()))?;
     let msg = [domain::FROST_TOKEN, &claims_bytes].concat();
 
-    // Collect partial signatures from each signer
-    let partials: Vec<_> = signers.iter_mut().map(|s| s.partial_sign(&msg)).collect();
-
-    // Combine partials into a single group signature
-    let frost_signature =
-        combine_partials(group, &partials, &msg).map_err(MilnetError::CryptoVerification)?;
+    // Run FROST threshold signing
+    let frost_signature = threshold_sign(signers, group, &msg, group.threshold)
+        .map_err(MilnetError::CryptoVerification)?;
 
     Ok(Token {
         header: TokenHeader {

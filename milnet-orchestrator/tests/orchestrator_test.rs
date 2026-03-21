@@ -164,7 +164,7 @@ async fn orchestrator_processes_auth() {
 
     let request = OrchestratorRequest {
         username: "alice".into(),
-        password_hash: [0xAA; 32],
+        password: vec![0xAA; 32],
         dpop_key_hash: [0xBB; 32],
         tier: 2,
     };
@@ -224,7 +224,7 @@ async fn orchestrator_handles_opaque_failure() {
 
     let request = OrchestratorRequest {
         username: "baduser".into(),
-        password_hash: [0x00; 32],
+        password: vec![0x00; 32],
         dpop_key_hash: [0xBB; 32],
         tier: 2,
     };

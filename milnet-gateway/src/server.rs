@@ -154,7 +154,7 @@ async fn forward_to_orchestrator(
     // from device registry after auth, not be hardcoded anywhere).
     let orch_req = OrchestratorRequest {
         username: auth_req.username.clone(),
-        password_hash: auth_req.password_hash,
+        password: auth_req.password.clone(),
         dpop_key_hash: [0u8; 32], // Gateway does not have DPoP yet
         tier: 0,                  // Orchestrator decides tier
     };
