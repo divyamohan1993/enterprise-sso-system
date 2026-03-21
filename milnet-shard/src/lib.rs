@@ -5,3 +5,4 @@
 //! communication between MILNET SSO microservices.
 
 pub mod protocol;
+pub mod transport;
