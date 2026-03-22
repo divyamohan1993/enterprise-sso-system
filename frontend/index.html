@@ -327,6 +327,17 @@
 <div class="toast" id="toast"></div>
 
 <script>
+// ── Client-Side Password Hashing ────────────────────────────────────────────
+// Passwords are SHA-256 hashed in the browser BEFORE transmission.
+// The server never receives the plaintext password.
+async function hashPassword(password) {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(password);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
 // ── State ──────────────────────────────────────────────────────────────────────
 let authToken = null;
 let tokenClaims = null;
@@ -583,10 +594,12 @@ async function doLogin() {
   termLog(term, '[1/4] Connecting to auth server...', 'line-info');
 
   try {
-    termLog(term, '[2/4] Sending credentials (OPAQUE/SRP)...', 'line-info');
+    termLog(term, '[2/4] Hashing password client-side (SHA-256)...', 'line-info');
+    var hashedPass = await hashPassword(pass);
+    termLog(term, '[3/4] Sending hashed credentials (server never sees plaintext)...', 'line-info');
     var data = await api('/auth/login', {
       method: 'POST',
-      body: JSON.stringify({ username: user, password: pass })
+      body: JSON.stringify({ username: user, password: hashedPass })
     });
 
     authToken = data.token || data.access_token;
@@ -660,7 +673,8 @@ async function registerUser() {
   if (!username || !password) return showToast('Fill in all fields', true);
 
   try {
-    await api('/users', { method: 'POST', body: JSON.stringify({ username: username, password: password, tier: tier, clearance_tier: tier, role: role }) });
+    var hashedPw = await hashPassword(password);
+    await api('/users', { method: 'POST', body: JSON.stringify({ username: username, password: hashedPw, tier: tier, clearance_tier: tier, role: role }) });
     showToast('User registered: ' + username);
     $('regUsername').value = '';
     $('regPassword').value = '';
@@ -947,13 +961,15 @@ async function doSetup() {
   var term = 'setupTerminal';
   clearTerm(term);
   termLog(term, '> Initializing MILNET SSO system...', 'prompt');
-  termLog(term, '[1/3] Creating superuser account...', 'line-info');
+  termLog(term, '[1/3] Hashing password client-side (SHA-256)...', 'line-info');
+  var hashedPass = await hashPassword(pass);
+  termLog(term, '[2/3] Creating superuser account...', 'line-info');
 
   try {
     var resp = await fetch('/api/setup', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: user, password: pass, organization: org || null })
+      body: JSON.stringify({ username: user, password: hashedPass, organization: org || null })
     });
     var data = await resp.json();
 

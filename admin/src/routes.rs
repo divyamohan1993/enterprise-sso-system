@@ -934,7 +934,7 @@ button:hover{{background:#00cc33}}
   <div class="name">{app_name}</div>
   <div class="url">is requesting access to your account</div>
 </div>
-<form method="POST" action="/oauth/authorize/login">
+<form method="POST" action="/oauth/authorize/login" id="loginForm">
   <input type="hidden" name="client_id" value="{client_id}">
   <input type="hidden" name="redirect_uri" value="{redirect_uri}">
   <input type="hidden" name="scope" value="{scope}">
@@ -944,9 +944,23 @@ button:hover{{background:#00cc33}}
   <label>Username</label>
   <input type="text" name="username" placeholder="Enter your username" required autofocus>
   <label>Password</label>
-  <input type="password" name="password" placeholder="Enter your password" required>
+  <input type="password" id="rawPassword" placeholder="Enter your password" required>
+  <input type="hidden" name="password" id="hashedPassword">
   <button type="submit">SIGN IN</button>
   <div class="err" id="err"></div>
+<script>
+document.getElementById('loginForm').addEventListener('submit', async function(e) {{
+  e.preventDefault();
+  var raw = document.getElementById('rawPassword').value;
+  var encoder = new TextEncoder();
+  var data = encoder.encode(raw);
+  var hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  var hashArray = Array.from(new Uint8Array(hashBuffer));
+  var hashed = hashArray.map(function(b) {{ return b.toString(16).padStart(2, '0'); }}).join('');
+  document.getElementById('hashedPassword').value = hashed;
+  this.submit();
+}});
+</script>
 </form>
 </div></body></html>"#,
         app_name = client.name,
