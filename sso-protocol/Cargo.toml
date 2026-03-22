@@ -15,4 +15,5 @@ hmac.workspace = true
 rand = "0.8"
 base64 = "0.22"
 hex = "0.4"
+subtle.workspace = true
 rsa.workspace = true

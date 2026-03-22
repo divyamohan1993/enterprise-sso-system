@@ -1,13 +1,16 @@
 //! SHARD (Secure Hardened Authenticated Request Dispatch) IPC protocol.
 //!
 //! Implements spec Section 11: authenticated inter-module messaging with
-//! HMAC-SHA512, replay protection, and timestamp validation.
+//! HMAC-SHA512, AES-256-GCM encryption, replay protection, and timestamp validation.
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::{Aes256Gcm, Nonce};
+use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
-use sha2::Sha512;
+use sha2::{Sha256, Sha512};
 
 use common::domain::SHARD_AUTH;
 use common::error::MilnetError;
@@ -16,28 +19,54 @@ use crypto::ct::ct_eq;
 
 type HmacSha512 = Hmac<Sha512>;
 
+/// Domain separation label for deriving the encryption key via HKDF.
+const ENCRYPT_DOMAIN: &[u8] = b"MILNET-SHARD-ENCRYPT-v1";
+
+/// AES-256-GCM nonce length in bytes.
+const NONCE_LEN: usize = 12;
+
 /// Maximum allowed clock skew between sender and receiver (2 seconds in microseconds).
 const MAX_TIMESTAMP_DRIFT_US: i64 = 2_000_000;
 
 /// SHARD protocol state for a single module.
 ///
 /// Each module instantiates one `ShardProtocol` to create and verify
-/// authenticated IPC messages.
+/// authenticated IPC messages. Payloads are encrypted with AES-256-GCM
+/// and authenticated with HMAC-SHA512.
 pub struct ShardProtocol {
     module_id: ModuleId,
     hmac_key: [u8; 64],
+    /// AES-256-GCM cipher derived once from the HMAC key via HKDF.
+    cipher: Aes256Gcm,
     send_sequence: u64,
     recv_sequences: HashMap<ModuleId, u64>,
+    /// The epoch (send_sequence) at which sequences were last persisted.
+    last_persisted_epoch: u64,
+}
+
+/// Derive an AES-256 encryption key from the HMAC key using HKDF-SHA256
+/// with domain separation.
+fn derive_encryption_key(hmac_key: &[u8; 64]) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(None, hmac_key);
+    let mut okm = [0u8; 32];
+    hk.expand(ENCRYPT_DOMAIN, &mut okm)
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    okm
 }
 
 impl ShardProtocol {
     /// Create a new protocol instance for the given module.
     pub fn new(module_id: ModuleId, hmac_key: [u8; 64]) -> Self {
+        let enc_key = derive_encryption_key(&hmac_key);
+        let cipher = Aes256Gcm::new_from_slice(&enc_key)
+            .expect("32-byte key is valid for AES-256-GCM");
         Self {
             module_id,
             hmac_key,
+            cipher,
             send_sequence: 0,
             recv_sequences: HashMap::new(),
+            last_persisted_epoch: 0,
         }
     }
 
@@ -69,49 +98,87 @@ impl ShardProtocol {
         out
     }
 
-    /// Create an authenticated SHARD message containing the given payload.
+    /// Encrypt a plaintext payload with AES-256-GCM.
     ///
-    /// The message includes an HMAC-SHA512 tag, a monotonically increasing
-    /// sequence number, and a microsecond-precision timestamp.
+    /// Returns `nonce || ciphertext` (12 bytes nonce prepended).
+    fn encrypt_payload(&self, plaintext: &[u8]) -> Result<Vec<u8>, MilnetError> {
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        getrandom::getrandom(&mut nonce_bytes)
+            .map_err(|e| MilnetError::Shard(format!("rng failed: {e}")))?;
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let ciphertext = self
+            .cipher
+            .encrypt(nonce, plaintext)
+            .map_err(|e| MilnetError::Shard(format!("encryption failed: {e}")))?;
+        let mut out = Vec::with_capacity(NONCE_LEN + ciphertext.len());
+        out.extend_from_slice(&nonce_bytes);
+        out.extend_from_slice(&ciphertext);
+        Ok(out)
+    }
+
+    /// Decrypt a `nonce || ciphertext` blob with AES-256-GCM.
+    fn decrypt_payload(&self, data: &[u8]) -> Result<Vec<u8>, MilnetError> {
+        if data.len() < NONCE_LEN {
+            return Err(MilnetError::Shard("encrypted payload too short".into()));
+        }
+        let (nonce_bytes, ciphertext) = data.split_at(NONCE_LEN);
+        let nonce = Nonce::from_slice(nonce_bytes);
+        self.cipher
+            .decrypt(nonce, ciphertext)
+            .map_err(|e| MilnetError::Shard(format!("decryption failed: {e}")))
+    }
+
+    /// Create an authenticated and encrypted SHARD message containing the given payload.
+    ///
+    /// The message includes AES-256-GCM encryption, an HMAC-SHA512 tag, a monotonically
+    /// increasing sequence number, and a microsecond-precision timestamp.
     pub fn create_message(&mut self, payload: &[u8]) -> Result<Vec<u8>, MilnetError> {
         self.send_sequence += 1;
 
         let timestamp = Self::now_us()?;
+
+        // Encrypt the plaintext payload
+        let encrypted_payload = self.encrypt_payload(payload)?;
 
         let mut msg = ShardMessage {
             version: 1,
             sender_module: self.module_id,
             sequence: self.send_sequence,
             timestamp,
-            payload: payload.to_vec(),
+            payload: encrypted_payload,
             hmac: [0u8; 64],
         };
 
+        // HMAC covers the encrypted payload (encrypt-then-MAC)
         msg.hmac = Self::compute_hmac(&self.hmac_key, &msg);
 
         postcard::to_allocvec(&msg)
             .map_err(|e| MilnetError::Serialization(format!("shard serialize: {e}")))
     }
 
-    /// Verify an incoming SHARD message.
+    /// Verify and decrypt an incoming SHARD message.
     ///
     /// Checks:
     /// 1. HMAC-SHA512 integrity (constant-time comparison)
-    /// 2. Timestamp within +-2 seconds of local clock
-    /// 3. Sequence number is strictly greater than last seen for that sender
+    /// 2. AES-256-GCM decryption of the payload
+    /// 3. Timestamp within +-2 seconds of local clock
+    /// 4. Sequence number is strictly greater than last seen for that sender
     ///
-    /// Returns `(sender_module, payload)` on success.
+    /// Returns `(sender_module, plaintext_payload)` on success.
     pub fn verify_message(&mut self, raw: &[u8]) -> Result<(ModuleId, Vec<u8>), MilnetError> {
         let msg: ShardMessage = postcard::from_bytes(raw)
             .map_err(|e| MilnetError::Serialization(format!("shard deserialize: {e}")))?;
 
-        // 1. Verify HMAC
+        // 1. Verify HMAC over encrypted payload
         let expected_hmac = Self::compute_hmac(&self.hmac_key, &msg);
         if !ct_eq(&expected_hmac, &msg.hmac) {
             return Err(MilnetError::Shard("HMAC verification failed".into()));
         }
 
-        // 2. Verify timestamp
+        // 2. Decrypt payload
+        let plaintext = self.decrypt_payload(&msg.payload)?;
+
+        // 3. Verify timestamp
         let now = Self::now_us()?;
         let drift = (now - msg.timestamp).abs();
         if drift > MAX_TIMESTAMP_DRIFT_US {
@@ -120,7 +187,7 @@ impl ShardProtocol {
             )));
         }
 
-        // 3. Replay protection: sequence must be strictly increasing per sender
+        // 4. Replay protection: sequence must be strictly increasing per sender
         let last_seq = self
             .recv_sequences
             .get(&msg.sender_module)
@@ -134,7 +201,7 @@ impl ShardProtocol {
         }
         self.recv_sequences.insert(msg.sender_module, msg.sequence);
 
-        Ok((msg.sender_module, msg.payload))
+        Ok((msg.sender_module, plaintext))
     }
 
     /// Restore previously persisted per-sender sequence numbers.
@@ -153,4 +220,48 @@ impl ShardProtocol {
     pub fn get_sequences(&self) -> &HashMap<ModuleId, u64> {
         &self.recv_sequences
     }
+
+    /// Serialize the current sequence state (send sequence + per-sender receive
+    /// sequences) to a byte vector suitable for durable storage.
+    ///
+    /// Callers MUST persist these to durable storage and reload on restart
+    /// to maintain replay protection across process restarts.
+    pub fn export_sequences(&self) -> Vec<u8> {
+        let state = SequenceState {
+            send_sequence: self.send_sequence,
+            recv_sequences: self.recv_sequences.clone(),
+        };
+        postcard::to_allocvec(&state).expect("sequence state serialization should not fail")
+    }
+
+    /// Deserialize and restore previously exported sequence state.
+    ///
+    /// Callers MUST persist these to durable storage and reload on restart
+    /// to maintain replay protection across process restarts.
+    pub fn import_sequences(&mut self, data: &[u8]) {
+        if let Ok(state) = postcard::from_bytes::<SequenceState>(data) {
+            self.send_sequence = state.send_sequence;
+            self.recv_sequences = state.recv_sequences;
+            self.last_persisted_epoch = self.send_sequence;
+        }
+    }
+
+    /// Returns `true` if the protocol state has changed since the last
+    /// persistence (i.e., new messages have been sent since the last export).
+    pub fn needs_persistence(&self) -> bool {
+        self.send_sequence > self.last_persisted_epoch
+    }
+
+    /// Mark the current epoch as persisted. Call this after successfully
+    /// writing [`export_sequences`] to durable storage.
+    pub fn mark_persisted(&mut self) {
+        self.last_persisted_epoch = self.send_sequence;
+    }
+}
+
+/// Internal serializable snapshot of sequence state.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SequenceState {
+    send_sequence: u64,
+    recv_sequences: HashMap<ModuleId, u64>,
 }

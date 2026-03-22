@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use uuid::Uuid;
 
-/// RSA key size for OIDC signing (2048-bit is the OIDC/JWT minimum for RS256).
-const RSA_KEY_BITS: usize = 2048;
+/// RSA key size for OIDC signing (3072-bit per CNSA 2.0 requirements).
+const RSA_KEY_BITS: usize = 3072;
 
 #[derive(Serialize, Deserialize)]
 pub struct IdTokenClaims {
@@ -38,7 +38,7 @@ pub struct OidcSigningKey {
 }
 
 impl OidcSigningKey {
-    /// Generate a new RSA-2048 signing key for OIDC.
+    /// Generate a new RSA-3072 signing key for OIDC.
     pub fn generate() -> Self {
         let mut rng = rand::thread_rng();
         let private_key =

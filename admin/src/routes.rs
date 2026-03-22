@@ -1,5 +1,5 @@
 use axum::extract::{Path, Query, Request, State};
-use axum::http::StatusCode;
+use axum::http::{header, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{delete, get, post};
@@ -12,6 +12,20 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_http::services::ServeDir;
 use uuid::Uuid;
+
+// ---------------------------------------------------------------------------
+// Security utilities
+// ---------------------------------------------------------------------------
+
+/// Escape HTML special characters to prevent XSS/HTML injection.
+fn html_escape(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
 
 // ---------------------------------------------------------------------------
 // Shared application state
@@ -168,6 +182,46 @@ fn verify_user_token(token: &str) -> bool {
     }
 
     true
+}
+
+/// Middleware that adds HTTP security headers to all responses.
+async fn security_headers_middleware(
+    request: Request,
+    next: Next,
+) -> Response {
+    let is_auth_endpoint = {
+        let path = request.uri().path();
+        path.starts_with("/oauth/") || path.starts_with("/api/auth/")
+    };
+
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+
+    headers.insert(
+        axum::http::header::HeaderName::from_static("x-content-type-options"),
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        axum::http::header::HeaderName::from_static("x-frame-options"),
+        axum::http::HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        axum::http::header::HeaderName::from_static("x-xss-protection"),
+        axum::http::HeaderValue::from_static("1; mode=block"),
+    );
+    headers.insert(
+        axum::http::header::HeaderName::from_static("referrer-policy"),
+        axum::http::HeaderValue::from_static("strict-origin-when-cross-origin"),
+    );
+
+    if is_auth_endpoint {
+        headers.insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+    }
+
+    response
 }
 
 /// Check if the authenticated user's tier allows access to this endpoint.
@@ -382,8 +436,19 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/pitch", get(|| async { axum::response::Redirect::permanent("/pitch.html") }))
         .route("/docs", get(|| async { axum::response::Redirect::permanent("/docs.html") }))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .layer(middleware::from_fn(security_headers_middleware))
         .with_state(state)
-        .layer(tower_http::cors::CorsLayer::permissive())
+        .layer(
+            tower_http::cors::CorsLayer::new()
+                .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+                .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION, header::ACCEPT])
+                .allow_origin(
+                    std::env::var("CORS_ALLOWED_ORIGIN")
+                        .unwrap_or_else(|_| "https://sso-system.dmj.one".to_string())
+                        .parse::<axum::http::HeaderValue>()
+                        .unwrap_or_else(|_| axum::http::HeaderValue::from_static("https://sso-system.dmj.one")),
+                ),
+        )
         .fallback_service(ServeDir::new("frontend").append_index_html_on_directories(true))
 }
 
@@ -1076,7 +1141,7 @@ async fn oauth_authorize(
     };
     drop(clients);
 
-    if !client.redirect_uris.iter().any(|u| params.redirect_uri.starts_with(u.trim_end_matches("/callback")) || u == &params.redirect_uri) {
+    if !client.redirect_uris.iter().any(|u| u == &params.redirect_uri) {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid_redirect_uri"}))).into_response();
     }
 
@@ -1126,25 +1191,25 @@ button:hover{{background:#00cc33}}
 </form>
 {google_btn}
 </div></body></html>"#,
-        app_name = client.name,
-        client_id = params.client_id,
-        redirect_uri = params.redirect_uri,
-        scope = params.scope,
-        state = params.state,
-        nonce = params.nonce.as_deref().unwrap_or(""),
-        code_challenge = params.code_challenge.as_deref().unwrap_or(""),
+        app_name = html_escape(&client.name),
+        client_id = html_escape(&params.client_id),
+        redirect_uri = html_escape(&params.redirect_uri),
+        scope = html_escape(&params.scope),
+        state = html_escape(&params.state),
+        nonce = html_escape(params.nonce.as_deref().unwrap_or("")),
+        code_challenge = html_escape(params.code_challenge.as_deref().unwrap_or("")),
         google_btn = if state.google_config.is_some() {
             format!(r#"<div style="margin-top:20px;text-align:center">
 <div style="color:#555;font-size:0.7rem;margin-bottom:12px">or</div>
 <a href="/oauth/google/start?client_id={cid}&redirect_uri={ruri}&scope={sc}&state={st}&nonce={nc}&code_challenge={cc}" style="display:inline-block;padding:12px 24px;background:#111;border:1px solid #333;border-radius:4px;text-decoration:none;font-family:inherit;font-size:0.85rem;cursor:pointer">
 <span style="color:#4285F4">G</span><span style="color:#EA4335">o</span><span style="color:#FBBC05">o</span><span style="color:#4285F4">g</span><span style="color:#34A853">l</span><span style="color:#EA4335">e</span><span style="color:#888"> &nbsp;Sign In</span>
 </a></div>"#,
-                cid = params.client_id,
-                ruri = urlencoding::encode(&params.redirect_uri),
-                sc = urlencoding::encode(&params.scope),
-                st = urlencoding::encode(&params.state),
-                nc = urlencoding::encode(params.nonce.as_deref().unwrap_or("")),
-                cc = urlencoding::encode(params.code_challenge.as_deref().unwrap_or("")),
+                cid = html_escape(&params.client_id),
+                ruri = html_escape(&urlencoding::encode(&params.redirect_uri)),
+                sc = html_escape(&urlencoding::encode(&params.scope)),
+                st = html_escape(&urlencoding::encode(&params.state)),
+                nc = html_escape(&urlencoding::encode(params.nonce.as_deref().unwrap_or(""))),
+                cc = html_escape(&urlencoding::encode(params.code_challenge.as_deref().unwrap_or(""))),
             )
         } else {
             String::new()
@@ -1176,7 +1241,10 @@ a{{color:#00ff41}}</style></head><body>
 <p style="margin:20px 0;color:#888">Invalid username or password.</p>
 <a href="/oauth/authorize?client_id={}&redirect_uri={}&response_type=code&scope={}&state={}">Try Again</a>
 </body></html>"#,
-                form.client_id, form.redirect_uri, form.scope, form.state
+                html_escape(&form.client_id),
+                html_escape(&urlencoding::encode(&form.redirect_uri)),
+                html_escape(&urlencoding::encode(&form.scope)),
+                html_escape(&urlencoding::encode(&form.state)),
             )).into_response();
         }
     };
@@ -1274,8 +1342,18 @@ a{color:#00ff41}</style></head><body>
     );
     drop(audit);
 
-    // Redirect back to the client with the auth code
-    let redirect_url = format!("{}?code={}&state={}", form.redirect_uri, code, form.state);
+    // Validate redirect_uri contains no CRLF characters (prevent header injection)
+    if form.redirect_uri.contains('\n') || form.redirect_uri.contains('\r') {
+        return (StatusCode::BAD_REQUEST, "invalid redirect_uri").into_response();
+    }
+
+    // Redirect back to the client with the auth code (URL-encode state to prevent injection)
+    let redirect_url = format!(
+        "{}?code={}&state={}",
+        form.redirect_uri,
+        urlencoding::encode(&code),
+        urlencoding::encode(&form.state),
+    );
     (StatusCode::FOUND, [(header::LOCATION, redirect_url)]).into_response()
 }
 
@@ -1371,8 +1449,8 @@ async fn oauth_google_callback(
 <html><head><title>MILNET SSO // Google Error</title>
 <style>body{{background:#0a0a0a;color:#ff3333;font-family:'JetBrains Mono',monospace;padding:60px;text-align:center}}</style></head><body>
 <h1>GOOGLE SIGN-IN FAILED</h1>
-<p style="margin:20px 0;color:#888">{err}</p>
-</body></html>"#)).into_response();
+<p style="margin:20px 0;color:#888">{}</p>
+</body></html>"#, html_escape(err))).into_response();
     }
 
     let code = match &params.code {
@@ -1410,19 +1488,21 @@ async fn oauth_google_callback(
 <html><head><title>MILNET SSO // Error</title>
 <style>body{{background:#0a0a0a;color:#ff3333;font-family:'JetBrains Mono',monospace;padding:60px;text-align:center}}</style></head><body>
 <h1>TOKEN EXCHANGE FAILED</h1>
-<p style="margin:20px 0;color:#888">{e}</p>
-</body></html>"#)).into_response();
+<p style="margin:20px 0;color:#888">{}</p>
+</body></html>"#, html_escape(&e))).into_response();
         }
     };
 
-    // Extract and verify Google ID token claims
-    let claims = match crate::google_oauth::extract_google_claims(&tokens.id_token) {
+    // Extract and verify Google ID token claims (includes algorithm, issuer,
+    // audience, and expiry validation inside extract_google_claims)
+    let claims = match crate::google_oauth::extract_google_claims(&tokens.id_token, &google_config.client_id) {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!("Google claim extraction failed: {e}");
+            tracing::error!("Google claim extraction/validation failed: {e}");
             return (StatusCode::BAD_REQUEST, format!("invalid id_token: {e}")).into_response();
         }
     };
+    // Additional verification (email_verified, etc.)
     if let Err(e) = crate::google_oauth::verify_google_id_token(&claims, &google_config.client_id) {
         tracing::error!("Google claim verification failed: {e}");
         return (StatusCode::BAD_REQUEST, format!("id_token verification failed: {e}")).into_response();
@@ -1495,10 +1575,17 @@ async fn oauth_google_callback(
     );
     drop(audit);
 
-    // Redirect back to the MILNET client
+    // Validate redirect_uri contains no CRLF characters (prevent header injection)
+    if pending.milnet_redirect_uri.contains('\n') || pending.milnet_redirect_uri.contains('\r') {
+        return (StatusCode::BAD_REQUEST, "invalid redirect_uri").into_response();
+    }
+
+    // Redirect back to the MILNET client (URL-encode params to prevent injection)
     let redirect_url = format!(
         "{}?code={}&state={}",
-        pending.milnet_redirect_uri, auth_code, pending.milnet_state
+        pending.milnet_redirect_uri,
+        urlencoding::encode(&auth_code),
+        urlencoding::encode(&pending.milnet_state),
     );
     (StatusCode::FOUND, [(header::LOCATION, redirect_url)]).into_response()
 }

@@ -162,26 +162,48 @@ impl<const N: usize> SecretBuffer<N> {
     ///
     /// # Panics
     /// Panics if a canary violation is detected — this indicates memory
-    /// corruption and continuing would be a security risk.
+    /// corruption and continuing would be a security risk.  Before
+    /// panicking, the violation is logged and all data is zeroized so
+    /// that sensitive material is destroyed even if the panic is caught.
     pub fn as_bytes(&self) -> &[u8; N] {
-        assert!(
-            self.verify_canaries(),
-            "SECURITY: canary violation detected — possible buffer overflow or \
-             use-after-free"
-        );
+        if !self.verify_canaries() {
+            tracing::error!(
+                "SECURITY: canary violation detected in SecretBuffer<{N}> — \
+                 possible buffer overflow or use-after-free. Zeroizing data before panic."
+            );
+            // Zeroize data before panicking.  We need a mutable reference, so
+            // use unsafe to cast away const — the buffer is about to be
+            // destroyed anyway and we MUST clear the secret material.
+            #[allow(unsafe_code)]
+            unsafe {
+                let data_ptr = &self.data as *const [u8; N] as *mut [u8; N];
+                (*data_ptr).zeroize();
+            }
+            panic!(
+                "SECURITY: canary violation detected — possible buffer overflow or \
+                 use-after-free"
+            );
+        }
         &self.data
     }
 
     /// Mutably borrow the protected data.
     ///
     /// # Panics
-    /// Panics if a canary violation is detected.
+    /// Panics if a canary violation is detected.  Before panicking, the
+    /// violation is logged and all data is zeroized.
     pub fn as_bytes_mut(&mut self) -> &mut [u8; N] {
-        assert!(
-            self.verify_canaries(),
-            "SECURITY: canary violation detected — possible buffer overflow or \
-             use-after-free"
-        );
+        if !self.verify_canaries() {
+            tracing::error!(
+                "SECURITY: canary violation detected in SecretBuffer<{N}> — \
+                 possible buffer overflow or use-after-free. Zeroizing data before panic."
+            );
+            self.data.zeroize();
+            panic!(
+                "SECURITY: canary violation detected — possible buffer overflow or \
+                 use-after-free"
+            );
+        }
         &mut self.data
     }
 
@@ -280,12 +302,22 @@ impl SecretVec {
     /// Borrow the protected data as a byte slice.
     ///
     /// # Panics
-    /// Panics if a canary violation is detected.
+    /// Panics if a canary violation is detected.  Before panicking, the
+    /// violation is logged and all data is zeroized.
     pub fn as_bytes(&self) -> &[u8] {
-        assert!(
-            self.verify_canary(),
-            "SECURITY: canary violation detected in SecretVec"
-        );
+        if !self.verify_canary() {
+            tracing::error!(
+                "SECURITY: canary violation detected in SecretVec (len={}) — \
+                 possible buffer overflow or use-after-free. Zeroizing data before panic.",
+                self.data.len()
+            );
+            #[allow(unsafe_code)]
+            unsafe {
+                let data_ptr = &self.data as *const Vec<u8> as *mut Vec<u8>;
+                (*data_ptr).zeroize();
+            }
+            panic!("SECURITY: canary violation detected in SecretVec");
+        }
         &self.data
     }
 

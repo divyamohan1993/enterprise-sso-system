@@ -1,36 +1,36 @@
-//! Post-quantum digital signatures using ML-DSA-65 (FIPS 204)
+//! Post-quantum digital signatures using ML-DSA-87 (FIPS 204)
 //!
 //! Nested signing: PQ signature covers (payload || FROST_signature),
 //! providing post-quantum security on top of classical FROST.
 
 use ml_dsa::{
     signature::{Signer, Verifier},
-    EncodedSignature, EncodedVerifyingKey, KeyGen, MlDsa65, SigningKey, VerifyingKey,
+    EncodedSignature, EncodedVerifyingKey, KeyGen, MlDsa87, SigningKey, VerifyingKey,
 };
 
-/// Type aliases for ML-DSA-65 key types.
-pub type PqSigningKey = SigningKey<MlDsa65>;
-pub type PqVerifyingKey = VerifyingKey<MlDsa65>;
-pub type PqSignature = ml_dsa::Signature<MlDsa65>;
+/// Type aliases for ML-DSA-87 key types.
+pub type PqSigningKey = SigningKey<MlDsa87>;
+pub type PqVerifyingKey = VerifyingKey<MlDsa87>;
+pub type PqSignature = ml_dsa::Signature<MlDsa87>;
 
 /// Encoded verifying key size for serialization.
-pub type PqEncodedVerifyingKey = EncodedVerifyingKey<MlDsa65>;
-pub type PqEncodedSignature = EncodedSignature<MlDsa65>;
+pub type PqEncodedVerifyingKey = EncodedVerifyingKey<MlDsa87>;
+pub type PqEncodedSignature = EncodedSignature<MlDsa87>;
 
-/// Generate an ML-DSA-65 keypair from a random seed.
+/// Generate an ML-DSA-87 keypair from a random seed.
 ///
 /// Uses `getrandom` (via the workspace crate) to obtain 32 bytes of entropy,
 /// then derives the keypair deterministically via `from_seed`.
 pub fn generate_pq_keypair() -> (PqSigningKey, PqVerifyingKey) {
     let mut seed = [0u8; 32];
     getrandom::getrandom(&mut seed).expect("getrandom failed");
-    let kp = MlDsa65::from_seed(&seed.into());
+    let kp = MlDsa87::from_seed(&seed.into());
     // Zeroize the seed on the stack
     seed.fill(0);
     (kp.signing_key().clone(), kp.verifying_key().clone())
 }
 
-/// Sign with ML-DSA-65: signs `(message || frost_signature)`.
+/// Sign with ML-DSA-87: signs `(message || frost_signature)`.
 ///
 /// This nested construction ensures the PQ signature commits to both the
 /// application payload and the classical FROST signature, preventing
@@ -43,7 +43,7 @@ pub fn pq_sign(signing_key: &PqSigningKey, message: &[u8], frost_sig: &[u8; 64])
     sig.encode().to_vec()
 }
 
-/// Verify ML-DSA-65 signature over `(message || frost_signature)`.
+/// Verify ML-DSA-87 signature over `(message || frost_signature)`.
 ///
 /// Returns `true` if the PQ signature is valid.
 pub fn pq_verify(
@@ -62,7 +62,7 @@ pub fn pq_verify(
     verifying_key.verify(&data, &sig).is_ok()
 }
 
-/// Sign raw bytes with ML-DSA-65 (no FROST nesting).
+/// Sign raw bytes with ML-DSA-87 (no FROST nesting).
 ///
 /// Used for audit entry signing, signed tree heads, and witness checkpoints
 /// where a standalone post-quantum signature is needed.
@@ -71,7 +71,7 @@ pub fn pq_sign_raw(signing_key: &PqSigningKey, data: &[u8]) -> Vec<u8> {
     sig.encode().to_vec()
 }
 
-/// Verify a raw ML-DSA-65 signature over `data`.
+/// Verify a raw ML-DSA-87 signature over `data`.
 ///
 /// Returns `true` if the signature is valid.
 pub fn pq_verify_raw(verifying_key: &PqVerifyingKey, data: &[u8], sig_bytes: &[u8]) -> bool {

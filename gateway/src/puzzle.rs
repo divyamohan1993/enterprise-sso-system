@@ -5,10 +5,15 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crypto::entropy::generate_nonce;
+
+/// Maximum number of consumed puzzle entries before forced cleanup.
+const MAX_CONSUMED_ENTRIES: usize = 100_000;
 
 /// Global adaptive difficulty -- increases under load.
 static CURRENT_DIFFICULTY: AtomicU8 = AtomicU8::new(8);
@@ -36,6 +41,58 @@ pub fn current_difficulty() -> u8 {
 
 /// Maximum age of a puzzle challenge before it expires (10 seconds).
 const PUZZLE_TTL_SECS: i64 = 10;
+
+// ---------------------------------------------------------------------------
+// Consumed puzzle nonce tracker (replay protection)
+// ---------------------------------------------------------------------------
+
+/// Tracks solved puzzle nonces to prevent replay attacks.
+///
+/// Each consumed nonce is stored with the timestamp it was consumed at.
+/// Entries older than `PUZZLE_TTL_SECS` are automatically purged during
+/// cleanup, and the set is bounded by `MAX_CONSUMED_ENTRIES`.
+pub struct ConsumedPuzzles {
+    /// Map from nonce to the unix timestamp (seconds) when it was consumed.
+    entries: HashMap<[u8; 32], i64>,
+}
+
+impl ConsumedPuzzles {
+    /// Create an empty consumed puzzles tracker.
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Returns `true` if the nonce has already been consumed.
+    pub fn is_consumed(&self, nonce: &[u8; 32]) -> bool {
+        self.entries.contains_key(nonce)
+    }
+
+    /// Mark a nonce as consumed at the given unix timestamp.
+    pub fn insert(&mut self, nonce: [u8; 32], timestamp: i64) {
+        // Enforce size bound: if at capacity, run cleanup first.
+        if self.entries.len() >= MAX_CONSUMED_ENTRIES {
+            self.cleanup_expired(timestamp);
+        }
+        self.entries.insert(nonce, timestamp);
+    }
+
+    /// Remove all entries older than `PUZZLE_TTL_SECS` relative to `now`.
+    pub fn cleanup_expired(&mut self, now: i64) {
+        self.entries.retain(|_, ts| now - *ts <= PUZZLE_TTL_SECS);
+    }
+}
+
+impl Default for ConsumedPuzzles {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Global consumed-puzzles tracker, protected by a mutex.
+static CONSUMED_PUZZLES: std::sync::LazyLock<Mutex<ConsumedPuzzles>> =
+    std::sync::LazyLock::new(|| Mutex::new(ConsumedPuzzles::new()));
 
 /// A proof-of-work challenge sent by the gateway to connecting clients.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,7 +125,8 @@ pub fn generate_challenge(difficulty: u8) -> PuzzleChallenge {
 }
 
 /// Check whether `SHA-256(nonce || solution)` has at least `difficulty`
-/// leading zero bits, and the challenge has not expired (10s TTL).
+/// leading zero bits, the challenge has not expired (10s TTL), and the
+/// nonce has not already been consumed (replay protection).
 pub fn verify_solution(challenge: &PuzzleChallenge, solution: &[u8; 32]) -> bool {
     // Check expiration
     let now = SystemTime::now()
@@ -79,7 +137,28 @@ pub fn verify_solution(challenge: &PuzzleChallenge, solution: &[u8; 32]) -> bool
         return false;
     }
 
-    has_leading_zero_bits(challenge, solution)
+    // Check replay: reject already-consumed nonces
+    {
+        let mut consumed = CONSUMED_PUZZLES.lock().unwrap_or_else(|e| e.into_inner());
+        // Periodically clean up expired entries
+        consumed.cleanup_expired(now);
+        if consumed.is_consumed(&challenge.nonce) {
+            return false;
+        }
+    }
+
+    // Verify the proof-of-work
+    if !has_leading_zero_bits(challenge, solution) {
+        return false;
+    }
+
+    // Mark nonce as consumed after successful verification
+    {
+        let mut consumed = CONSUMED_PUZZLES.lock().unwrap_or_else(|e| e.into_inner());
+        consumed.insert(challenge.nonce, now);
+    }
+
+    true
 }
 
 /// Check the hash without expiration (internal helper).

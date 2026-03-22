@@ -1,4 +1,5 @@
 use crate::types::*;
+use crate::verification;
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -100,6 +101,55 @@ impl CredentialStore {
     pub fn credential_count(&self) -> usize {
         self.credentials.len()
     }
+
+    /// Check whether a credential ID is already registered.
+    pub fn credential_exists(&self, credential_id: &[u8]) -> bool {
+        self.credentials.contains_key(credential_id)
+    }
+
+    /// Get a mutable reference to a stored credential (for sign count updates).
+    pub fn get_credential_mut(&mut self, credential_id: &[u8]) -> Option<&mut StoredCredential> {
+        self.credentials.get_mut(credential_id)
+    }
+}
+
+/// Validate an attestation response and register the credential.
+///
+/// Performs the following checks before storing:
+/// 1. Parse the authenticator data from the attestation.
+/// 2. Validate the RP ID hash matches `expected_rp_id`.
+/// 3. Validate the User Present flag is set.
+/// 4. Validate the Attested Credential Data flag is set.
+/// 5. Extract the credential ID and public key.
+/// 6. Reject duplicate credential IDs.
+/// 7. Store the credential.
+///
+/// Returns the stored credential on success.
+pub fn validate_and_register(
+    store: &mut CredentialStore,
+    auth_data: &[u8],
+    expected_rp_id: &str,
+    user_id: Uuid,
+    authenticator_type: &str,
+) -> Result<StoredCredential, &'static str> {
+    // Parse and validate attestation authenticator data
+    let att_data = verification::parse_attestation_auth_data(auth_data, expected_rp_id)?;
+
+    // Reject duplicate credential IDs
+    if store.credential_exists(&att_data.credential_id) {
+        return Err("Credential ID already registered (duplicate registration rejected)");
+    }
+
+    let cred = StoredCredential {
+        credential_id: att_data.credential_id,
+        public_key: att_data.public_key_cose,
+        user_id,
+        sign_count: att_data.sign_count,
+        authenticator_type: authenticator_type.to_string(),
+    };
+
+    store.store_credential(cred.clone());
+    Ok(cred)
 }
 
 impl Default for CredentialStore {
@@ -111,6 +161,32 @@ impl Default for CredentialStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
+
+    /// Helper: build auth data with attested credential data.
+    fn make_attestation_auth_data(
+        rp_id: &str,
+        flags: u8,
+        sign_count: u32,
+        credential_id: &[u8],
+        public_key_cose: &[u8],
+    ) -> Vec<u8> {
+        let rp_hash = Sha256::digest(rp_id.as_bytes());
+        let mut data = Vec::new();
+        data.extend_from_slice(&rp_hash);
+        data.push(flags);
+        data.extend_from_slice(&sign_count.to_be_bytes());
+        // AAGUID (16 zero bytes)
+        data.extend_from_slice(&[0u8; 16]);
+        // credential ID length
+        let cred_len = credential_id.len() as u16;
+        data.extend_from_slice(&cred_len.to_be_bytes());
+        // credential ID
+        data.extend_from_slice(credential_id);
+        // COSE public key
+        data.extend_from_slice(public_key_cose);
+        data
+    }
 
     #[test]
     fn test_registration_options_created() {
@@ -186,5 +262,104 @@ mod tests {
         // Unknown user
         let other = Uuid::new_v4();
         assert!(store.get_user_credentials(&other).is_empty());
+    }
+
+    #[test]
+    fn test_validate_and_register_success() {
+        let mut store = CredentialStore::new();
+        let rp_id = "sso.milnet.example";
+        let user_id = Uuid::new_v4();
+        let cred_id = vec![0xAA, 0xBB, 0xCC];
+        let cose_key = vec![0x01, 0x02, 0x03];
+
+        // flags: UP | UV | AT = 0x45
+        let auth_data = make_attestation_auth_data(rp_id, 0x45, 0, &cred_id, &cose_key);
+
+        let result = validate_and_register(&mut store, &auth_data, rp_id, user_id, "cross-platform");
+        assert!(result.is_ok());
+
+        let cred = result.unwrap();
+        assert_eq!(cred.credential_id, cred_id);
+        assert_eq!(cred.public_key, cose_key);
+        assert_eq!(cred.user_id, user_id);
+        assert_eq!(cred.sign_count, 0);
+        assert_eq!(cred.authenticator_type, "cross-platform");
+
+        // Verify it was stored
+        assert_eq!(store.credential_count(), 1);
+        assert!(store.get_credential(&cred_id).is_some());
+    }
+
+    #[test]
+    fn test_validate_and_register_duplicate_rejected() {
+        let mut store = CredentialStore::new();
+        let rp_id = "sso.milnet.example";
+        let user_id = Uuid::new_v4();
+        let cred_id = vec![0xAA, 0xBB];
+        let cose_key = vec![0x01];
+
+        let auth_data = make_attestation_auth_data(rp_id, 0x45, 0, &cred_id, &cose_key);
+
+        // First registration succeeds
+        assert!(validate_and_register(&mut store, &auth_data, rp_id, user_id, "platform").is_ok());
+
+        // Second registration with same credential ID is rejected
+        let err = validate_and_register(&mut store, &auth_data, rp_id, user_id, "platform").unwrap_err();
+        assert_eq!(err, "Credential ID already registered (duplicate registration rejected)");
+        assert_eq!(store.credential_count(), 1);
+    }
+
+    #[test]
+    fn test_validate_and_register_rp_id_mismatch() {
+        let mut store = CredentialStore::new();
+        let cred_id = vec![0xAA];
+        let cose_key = vec![0x01];
+
+        // Auth data for "evil.com"
+        let auth_data = make_attestation_auth_data("evil.com", 0x45, 0, &cred_id, &cose_key);
+
+        let err = validate_and_register(
+            &mut store,
+            &auth_data,
+            "sso.milnet.example",
+            Uuid::new_v4(),
+            "platform",
+        )
+        .unwrap_err();
+        assert_eq!(err, "RP ID hash mismatch");
+        assert_eq!(store.credential_count(), 0);
+    }
+
+    #[test]
+    fn test_validate_and_register_no_at_flag() {
+        let mut store = CredentialStore::new();
+        let rp_id = "sso.milnet.example";
+
+        // flags: UP | UV = 0x05 (no AT flag) — just 37 bytes, no attested data
+        let rp_hash = Sha256::digest(rp_id.as_bytes());
+        let mut auth_data = Vec::new();
+        auth_data.extend_from_slice(&rp_hash);
+        auth_data.push(0x05); // UP | UV, no AT
+        auth_data.extend_from_slice(&0u32.to_be_bytes());
+
+        let err = validate_and_register(&mut store, &auth_data, rp_id, Uuid::new_v4(), "platform")
+            .unwrap_err();
+        assert_eq!(err, "Attested credential data flag not set in registration response");
+    }
+
+    #[test]
+    fn test_credential_exists() {
+        let mut store = CredentialStore::new();
+        let cred_id = vec![1, 2, 3];
+        assert!(!store.credential_exists(&cred_id));
+
+        store.store_credential(StoredCredential {
+            credential_id: cred_id.clone(),
+            public_key: vec![4],
+            user_id: Uuid::new_v4(),
+            sign_count: 0,
+            authenticator_type: "platform".into(),
+        });
+        assert!(store.credential_exists(&cred_id));
     }
 }

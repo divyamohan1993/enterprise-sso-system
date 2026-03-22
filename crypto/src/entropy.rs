@@ -332,18 +332,52 @@ pub fn combined_entropy_checked() -> Result<[u8; 32], EntropyError> {
     Err(EntropyError::AllSourcesFailed)
 }
 
+/// Generate 32 bytes of hardened entropy with a configurable number of retries.
+///
+/// Each retry gathers completely fresh entropy from all sources.  If all
+/// retries are exhausted, a `&'static str` error is returned describing the
+/// failure.
+pub fn combined_entropy_with_retries(max_retries: u32) -> Result<[u8; 32], &'static str> {
+    for attempt in 0..=max_retries {
+        match combined_entropy_checked() {
+            Ok(output) => return Ok(output),
+            Err(e) => {
+                if attempt < max_retries {
+                    tracing::warn!(
+                        "Entropy health check failed on attempt {}/{}: {} — retrying with fresh sources",
+                        attempt + 1,
+                        max_retries + 1,
+                        e
+                    );
+                    continue;
+                }
+                // All retries exhausted — log CRITICAL before returning error
+                tracing::error!(
+                    "CRITICAL: Entropy health check failed after {} attempts: {}",
+                    max_retries + 1,
+                    e
+                );
+                return Err("entropy health failure: all retries exhausted");
+            }
+        }
+    }
+    Err("entropy health failure: all retries exhausted")
+}
+
 /// Generate 32 bytes of hardened entropy.
+///
+/// Retries up to 3 times with fresh entropy sources before panicking.
+/// If all retries fail, a CRITICAL error is logged via `tracing::error!`
+/// before the panic, giving logging infrastructure time to record the event.
 ///
 /// # Panics
 ///
 /// Panics with `ENTROPY HEALTH FAILURE` if continuous health monitoring
-/// detects a potential entropy source compromise. This is the correct
-/// behaviour for a military-grade system: fail-closed rather than
-/// silently producing weak entropy.
+/// detects a potential entropy source compromise after all retries.
 pub fn combined_entropy() -> [u8; 32] {
-    match combined_entropy_checked() {
+    match combined_entropy_with_retries(3) {
         Ok(output) => output,
-        Err(e) => panic!("ENTROPY HEALTH FAILURE: {}", e),
+        Err(msg) => panic!("ENTROPY HEALTH FAILURE: {}", msg),
     }
 }
 

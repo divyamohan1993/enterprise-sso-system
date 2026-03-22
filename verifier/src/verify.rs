@@ -1,22 +1,28 @@
-use frost_ristretto255::keys::PublicKeyPackage;
 use common::domain;
 use common::error::MilnetError;
 use common::types::{Token, TokenClaims};
 use crypto::pq_sign::{pq_verify, PqVerifyingKey};
+use frost_ristretto255::keys::PublicKeyPackage;
 use hmac::{Hmac, Mac};
 use sha2::Sha512;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 type HmacSha512 = Hmac<Sha512>;
 
+/// Maximum session epochs (8 hours at 10s/epoch).
+const MAX_SESSION_EPOCHS: u64 = 2880;
+
 /// Verify a token's signature and claims (spec C.11).
 ///
 /// Verification order:
 /// 1. Check version and expiry
-/// 2. Check pq_signature is NOT empty (reject if missing)
-/// 3. Verify ML-DSA-65 signature over (claims_msg || frost_signature)
-/// 4. Verify FROST signature over claims_msg
-/// 5. Check tier validity
+/// 2. Enforce algorithm field (must be 1 — prevents downgrade attacks)
+/// 3. Check pq_signature is NOT empty (reject if missing)
+/// 4. Verify DPoP hash is non-empty (not all zeros)
+/// 5. Validate ratchet_epoch is within reasonable bounds
+/// 6. Verify ML-DSA-65 signature over (claims_msg || frost_signature)
+/// 7. Verify FROST signature over claims_msg
+/// 8. Check tier validity
 ///
 /// Both PQ and FROST signatures must pass.
 pub fn verify_token(
@@ -31,7 +37,16 @@ pub fn verify_token(
         ));
     }
 
-    // 2. Check expiry
+    // 2. Enforce algorithm field — must be 1 (FROST+ML-DSA-65).
+    //    Prevents downgrade attacks where attacker specifies algorithm=0
+    //    to use weaker crypto.
+    if token.header.algorithm != 1 {
+        return Err(MilnetError::CryptoVerification(
+            "unsupported algorithm: only algorithm 1 (FROST+ML-DSA-65) is permitted".into(),
+        ));
+    }
+
+    // 3. Check expiry
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -40,28 +55,50 @@ pub fn verify_token(
         return Err(MilnetError::TokenExpired);
     }
 
-    // 3. Reconstruct signed message: domain prefix + serialized claims
+    // 4. Verify DPoP hash is non-empty (not all zeros) — reject tokens
+    //    with empty DPoP binding to prevent unbound token usage.
+    let all_zeros = [0u8; 32];
+    if token.claims.dpop_hash == all_zeros {
+        return Err(MilnetError::CryptoVerification(
+            "DPoP hash is empty (all zeros) — token must be bound to a client key".into(),
+        ));
+    }
+
+    // 5. Validate ratchet_epoch is within reasonable bounds
+    if token.claims.ratchet_epoch == 0 || token.claims.ratchet_epoch > MAX_SESSION_EPOCHS {
+        return Err(MilnetError::CryptoVerification(format!(
+            "ratchet_epoch {} out of valid range [1, {}]",
+            token.claims.ratchet_epoch, MAX_SESSION_EPOCHS
+        )));
+    }
+
+    // 6. Reconstruct signed message: domain prefix + serialized claims
     let claims_bytes = postcard::to_allocvec(&token.claims)
         .map_err(|e| MilnetError::Serialization(e.to_string()))?;
     let mut message = Vec::with_capacity(domain::FROST_TOKEN.len() + claims_bytes.len());
     message.extend_from_slice(domain::FROST_TOKEN);
     message.extend_from_slice(&claims_bytes);
 
-    // 4. Check PQ signature is present (spec C.11: reject if missing)
+    // 7. Check PQ signature is present (spec C.11: reject if missing)
     if token.pq_signature.is_empty() {
         return Err(MilnetError::CryptoVerification(
             "missing post-quantum signature".into(),
         ));
     }
 
-    // 5. Verify ML-DSA-65 post-quantum signature over (message || frost_signature)
-    if !pq_verify(pq_verifying_key, &message, &token.frost_signature, &token.pq_signature) {
+    // 8. Verify ML-DSA-65 post-quantum signature over (message || frost_signature)
+    if !pq_verify(
+        pq_verifying_key,
+        &message,
+        &token.frost_signature,
+        &token.pq_signature,
+    ) {
         return Err(MilnetError::CryptoVerification(
             "ML-DSA-65 post-quantum signature invalid".into(),
         ));
     }
 
-    // 6. Verify FROST threshold signature
+    // 9. Verify FROST threshold signature
     let sig = frost_ristretto255::Signature::deserialize(&token.frost_signature)
         .map_err(|e| MilnetError::CryptoVerification(format!("invalid signature encoding: {e}")))?;
     public_key_package
@@ -69,7 +106,7 @@ pub fn verify_token(
         .verify(&message, &sig)
         .map_err(|_| MilnetError::CryptoVerification("FROST signature invalid".into()))?;
 
-    // 7. Check tier is valid (1-4)
+    // 10. Check tier is valid (1-4)
     if token.claims.tier == 0 || token.claims.tier > 4 {
         return Err(MilnetError::CryptoVerification("invalid tier".into()));
     }

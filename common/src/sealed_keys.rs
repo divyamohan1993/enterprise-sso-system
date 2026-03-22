@@ -19,23 +19,32 @@
 
 /// Whether the system is running in production mode.
 /// In production, dev key fallbacks are forbidden.
+/// Returns `true` if `MILNET_PRODUCTION` is set to ANY value (not just "1").
 pub fn is_production() -> bool {
-    std::env::var("MILNET_PRODUCTION")
-        .map(|v| v == "1" || v.to_lowercase() == "true")
-        .unwrap_or(false)
+    std::env::var("MILNET_PRODUCTION").is_ok()
 }
 
 /// Load the master KEK from environment.
 /// Returns 32-byte key derived from `MILNET_MASTER_KEK` (hex-encoded, 64 chars).
 /// In dev mode, falls back to a deterministic key.
+///
+/// After reading, the env var is removed from the process environment to
+/// prevent leakage via `/proc/pid/environ`, and the in-memory String is
+/// zeroized.
 pub fn load_master_kek() -> [u8; 32] {
+    use zeroize::Zeroize;
     match std::env::var("MILNET_MASTER_KEK") {
-        Ok(hex_str) if hex_str.len() >= 64 => {
+        Ok(mut hex_str) if hex_str.len() >= 64 => {
+            // Remove from process environment immediately
+            std::env::remove_var("MILNET_MASTER_KEK");
             let mut key = [0u8; 32];
             for (i, chunk) in hex_str.as_bytes().chunks(2).take(32).enumerate() {
                 let hex = std::str::from_utf8(chunk).unwrap_or("00");
                 key[i] = u8::from_str_radix(hex, 16).unwrap_or(0);
             }
+            // Zeroize the hex string in memory
+            zeroize_string(&mut hex_str);
+            hex_str.zeroize();
             key
         }
         _ => {
@@ -71,12 +80,21 @@ pub fn load_receipt_signing_key_sealed() -> [u8; 64] {
 }
 
 /// Hardened key loading with sealed key support.
+///
+/// After reading, env vars are removed from the process environment and
+/// the in-memory Strings are zeroized to prevent leakage.
 fn load_key_hardened(var: &str, purpose: &str, dev_seed: &[u8]) -> [u8; 64] {
+    use zeroize::Zeroize;
     let sealed_var = format!("{var}_SEALED");
 
     // 1. Try sealed key
-    if let Ok(hex_str) = std::env::var(&sealed_var) {
-        if let Some(key) = unseal_key_from_hex(&hex_str, purpose) {
+    if let Ok(mut hex_str) = std::env::var(&sealed_var) {
+        // Remove from process environment immediately
+        std::env::remove_var(&sealed_var);
+        let result = unseal_key_from_hex(&hex_str, purpose);
+        zeroize_string(&mut hex_str);
+        hex_str.zeroize();
+        if let Some(key) = result {
             eprintln!("INFO: {var} loaded from sealed storage.");
             return key;
         }
@@ -84,9 +102,13 @@ fn load_key_hardened(var: &str, purpose: &str, dev_seed: &[u8]) -> [u8; 64] {
     }
 
     // 2. Try raw key (blocked in production)
-    if let Ok(hex_str) = std::env::var(var) {
+    if let Ok(mut hex_str) = std::env::var(var) {
+        // Remove from process environment immediately
+        std::env::remove_var(var);
         if hex_str.len() >= 128 {
             if is_production() {
+                zeroize_string(&mut hex_str);
+                hex_str.zeroize();
                 panic!(
                     "FATAL: Raw (unencrypted) {var} detected in production mode. \
                      Use {sealed_var} with sealed keys instead."
@@ -98,8 +120,12 @@ fn load_key_hardened(var: &str, purpose: &str, dev_seed: &[u8]) -> [u8; 64] {
                 let hex = std::str::from_utf8(chunk).unwrap_or("00");
                 key[i] = u8::from_str_radix(hex, 16).unwrap_or(0);
             }
+            zeroize_string(&mut hex_str);
+            hex_str.zeroize();
             return key;
         }
+        zeroize_string(&mut hex_str);
+        hex_str.zeroize();
     }
 
     // 3. Dev fallback

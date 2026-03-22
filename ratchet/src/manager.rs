@@ -1,8 +1,10 @@
 //! Session manager — tracks multiple ratchet chains keyed by session ID.
 
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::RwLock;
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 use crate::chain::RatchetChain;
 
@@ -49,39 +51,42 @@ pub struct RatchetResponse {
     pub error: Option<String>,
 }
 
-/// Manages forward-secret ratchet sessions.
+/// Manages forward-secret ratchet sessions with thread-safe access.
 ///
 /// Each session is identified by a UUID and backed by its own
-/// [`RatchetChain`]. When a session is destroyed the chain key is
-/// securely erased via `ZeroizeOnDrop`.
+/// [`RatchetChain`]. The sessions map is protected by an `RwLock` for
+/// safe concurrent access — read locks for lookups, write locks for
+/// mutations. When a session is destroyed the chain key is securely
+/// erased via `ZeroizeOnDrop`.
 pub struct SessionManager {
-    sessions: HashMap<Uuid, RatchetChain>,
+    sessions: RwLock<HashMap<Uuid, RatchetChain>>,
 }
 
 impl SessionManager {
     pub fn new() -> Self {
         Self {
-            sessions: HashMap::new(),
+            sessions: RwLock::new(HashMap::new()),
         }
     }
 
     /// Create a new session and return its initial epoch (always 0).
-    pub fn create_session(&mut self, session_id: Uuid, master_secret: &[u8; 64]) -> u64 {
+    pub fn create_session(&self, session_id: Uuid, master_secret: &[u8; 64]) -> u64 {
         let chain = RatchetChain::new(master_secret);
         let epoch = chain.epoch();
-        self.sessions.insert(session_id, chain);
+        let mut sessions = self.sessions.write().expect("sessions lock poisoned");
+        sessions.insert(session_id, chain);
         epoch
     }
 
     /// Advance a session's chain by one epoch, returning the new epoch.
     pub fn advance_session(
-        &mut self,
+        &self,
         session_id: &Uuid,
         client_entropy: &[u8; 32],
         server_entropy: &[u8; 32],
     ) -> Result<u64, String> {
-        let chain = self
-            .sessions
+        let mut sessions = self.sessions.write().expect("sessions lock poisoned");
+        let chain = sessions
             .get_mut(session_id)
             .ok_or_else(|| "session not found".to_string())?;
         if chain.is_expired() {
@@ -93,8 +98,8 @@ impl SessionManager {
 
     /// Generate a ratchet tag for the given session's current epoch.
     pub fn generate_tag(&self, session_id: &Uuid, claims_bytes: &[u8]) -> Result<[u8; 64], String> {
-        let chain = self
-            .sessions
+        let sessions = self.sessions.read().expect("sessions lock poisoned");
+        let chain = sessions
             .get(session_id)
             .ok_or_else(|| "session not found".to_string())?;
         Ok(chain.generate_tag(claims_bytes))
@@ -108,16 +113,29 @@ impl SessionManager {
         tag: &[u8; 64],
         token_epoch: u64,
     ) -> Result<bool, String> {
-        let chain = self
-            .sessions
+        let sessions = self.sessions.read().expect("sessions lock poisoned");
+        let chain = sessions
             .get(session_id)
             .ok_or_else(|| "session not found".to_string())?;
         Ok(chain.verify_tag(claims_bytes, tag, token_epoch))
     }
 
     /// Destroy a session, securely erasing its chain key.
-    pub fn destroy_session(&mut self, session_id: &Uuid) {
-        self.sessions.remove(session_id); // ZeroizeOnDrop handles key cleanup
+    pub fn destroy_session(&self, session_id: &Uuid) {
+        let mut sessions = self.sessions.write().expect("sessions lock poisoned");
+        sessions.remove(session_id); // ZeroizeOnDrop handles key cleanup
+    }
+
+    /// Destroy a session with explicit zeroization of the chain key
+    /// before removal from the map. This ensures the key material is
+    /// erased even if `ZeroizeOnDrop` is somehow bypassed.
+    pub fn destroy_session_secure(&mut self, session_id: &Uuid) {
+        let sessions = self.sessions.get_mut().expect("sessions lock poisoned");
+        if let Some(mut chain) = sessions.remove(session_id) {
+            // Explicitly zeroize before drop. The ZeroizeOnDrop derive
+            // on RatchetChain will also fire, but belt-and-suspenders.
+            chain.zeroize();
+        }
     }
 }
 

@@ -1,12 +1,15 @@
 //! Core ratchet chain — HKDF-SHA512 forward-secret key advancement (spec Section 8).
 
+use common::domain;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
-use common::domain;
 use sha2::Sha512;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 type HmacSha512 = Hmac<Sha512>;
+
+/// Maximum lookahead/lookbehind window for epoch verification.
+const EPOCH_WINDOW: u64 = 3;
 
 /// A single session's ratchet chain state.
 ///
@@ -19,6 +22,10 @@ pub struct RatchetChain {
     epoch: u64,
     /// Maximum lifetime in epochs (8 hours at 10s/epoch = 2880).
     max_epoch_lifetime: u64,
+    /// Recent chain keys for lookbehind verification (up to last 3 epochs).
+    /// Each entry is (epoch, key). Oldest entries are evicted when the
+    /// buffer exceeds `EPOCH_WINDOW` entries.
+    recent_keys: Vec<(u64, [u8; 64])>,
 }
 
 impl RatchetChain {
@@ -32,6 +39,7 @@ impl RatchetChain {
             chain_key,
             epoch: 0,
             max_epoch_lifetime: 2880,
+            recent_keys: Vec::new(),
         }
     }
 
@@ -40,6 +48,14 @@ impl RatchetChain {
     /// Uses both `client_entropy` and `server_entropy` per spec E.16 so
     /// that compromise of a single entropy source is insufficient.
     pub fn advance(&mut self, client_entropy: &[u8; 32], server_entropy: &[u8; 32]) {
+        // Store current key in recent_keys before overwriting
+        self.recent_keys.push((self.epoch, self.chain_key));
+        // Evict oldest entries beyond the window
+        while self.recent_keys.len() > EPOCH_WINDOW as usize {
+            self.recent_keys[0].1.zeroize();
+            self.recent_keys.remove(0);
+        }
+
         let hk = Hkdf::<Sha512>::new(Some(&self.chain_key), domain::RATCHET_ADVANCE);
         let mut info = Vec::with_capacity(64);
         info.extend_from_slice(client_entropy);
@@ -54,36 +70,83 @@ impl RatchetChain {
 
     /// Generate a ratchet tag (HMAC-SHA512) for the current epoch.
     pub fn generate_tag(&self, claims_bytes: &[u8]) -> [u8; 64] {
-        let mut mac = HmacSha512::new_from_slice(&self.chain_key)
-            .expect("HMAC-SHA512 accepts any key length");
+        Self::generate_tag_with_key(&self.chain_key, claims_bytes, self.epoch)
+    }
+
+    /// Generate a ratchet tag using an explicit key and epoch.
+    fn generate_tag_with_key(key: &[u8; 64], claims_bytes: &[u8], epoch: u64) -> [u8; 64] {
+        let mut mac = HmacSha512::new_from_slice(key).expect("HMAC-SHA512 accepts any key length");
         mac.update(domain::TOKEN_TAG);
         mac.update(claims_bytes);
-        mac.update(&self.epoch.to_le_bytes());
+        mac.update(&epoch.to_le_bytes());
         mac.finalize().into_bytes().into()
     }
 
-    /// Verify a ratchet tag, checking +/-1 epoch lookahead window for
-    /// network jitter tolerance (10s epochs → ±10s window).
+    /// Derive what the chain key would be `steps` epochs into the future
+    /// from the given starting key, WITHOUT advancing the actual chain.
     ///
-    /// Exact-epoch match is verified via constant-time comparison.
-    /// For non-exact matches within the window, returns `false` for now
-    /// (lookahead verification with cached epoch keys is a future
-    /// enhancement).
+    /// Uses a zero-entropy derivation (deterministic forward derivation)
+    /// since we don't have the future client/server entropy. This is only
+    /// used for forward-lookahead verification where exact entropy is not
+    /// available — the server side uses the same deterministic derivation.
+    fn derive_forward_key(starting_key: &[u8; 64], steps: u64) -> [u8; 64] {
+        let mut key = *starting_key;
+        let zero_entropy = [0u8; 32];
+        for _ in 0..steps {
+            let hk = Hkdf::<Sha512>::new(Some(&key), domain::RATCHET_ADVANCE);
+            let mut info = Vec::with_capacity(64);
+            info.extend_from_slice(&zero_entropy);
+            info.extend_from_slice(&zero_entropy);
+            let mut new_key = [0u8; 64];
+            hk.expand(&info, &mut new_key)
+                .expect("64-byte expand must succeed for HKDF-SHA512");
+            key.zeroize();
+            key = new_key;
+        }
+        key
+    }
+
+    /// Verify a ratchet tag, checking +/-3 epoch lookahead window for
+    /// network jitter tolerance (10s epochs → ±30s window).
+    ///
+    /// - Exact epoch match: verify with current chain key.
+    /// - Past epochs (token_epoch < self.epoch, within 3): verify using
+    ///   cached recent keys.
+    /// - Future epochs (token_epoch > self.epoch, within 3): derive forward
+    ///   keys temporarily without advancing the actual chain.
+    ///
+    /// All paths use constant-time comparison.
     pub fn verify_tag(&self, claims_bytes: &[u8], tag: &[u8; 64], token_epoch: u64) -> bool {
         let epoch_diff = token_epoch.abs_diff(self.epoch);
-        if epoch_diff > 1 {
+        if epoch_diff > EPOCH_WINDOW {
             return false;
         }
-        // For exact match, verify with constant-time comparison
+
+        // Exact match: verify with current key
         if token_epoch == self.epoch {
             let expected = self.generate_tag(claims_bytes);
             return crypto::ct::ct_eq_64(tag, &expected);
         }
-        // KNOWN LIMITATION: Only verifies exact epoch match.
-        // For ±1/±2/±3 lookahead, the verifier's verify_token_with_ratchet
-        // independently computes the expected tag for the token's epoch,
-        // so this limitation does not affect production token verification.
-        false
+
+        // Past epoch: look up in recent_keys cache
+        if token_epoch < self.epoch {
+            for (cached_epoch, cached_key) in &self.recent_keys {
+                if *cached_epoch == token_epoch {
+                    let expected =
+                        Self::generate_tag_with_key(cached_key, claims_bytes, token_epoch);
+                    return crypto::ct::ct_eq_64(tag, &expected);
+                }
+            }
+            // Key not in cache (was evicted or chain was just created)
+            return false;
+        }
+
+        // Future epoch: derive forward without advancing the real chain
+        let steps = token_epoch - self.epoch;
+        let mut forward_key = Self::derive_forward_key(&self.chain_key, steps);
+        let expected = Self::generate_tag_with_key(&forward_key, claims_bytes, token_epoch);
+        forward_key.zeroize();
+        crypto::ct::ct_eq_64(tag, &expected)
     }
 
     /// Current epoch of this chain.

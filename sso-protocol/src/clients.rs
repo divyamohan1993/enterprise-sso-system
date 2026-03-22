@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -55,7 +56,17 @@ impl ClientRegistry {
     pub fn validate(&self, client_id: &str, client_secret: &str) -> Option<&OAuthClient> {
         self.clients
             .get(client_id)
-            .filter(|c| c.client_secret == client_secret)
+            .filter(|c| {
+                let stored = c.client_secret.as_bytes();
+                let provided = client_secret.as_bytes();
+                // Pad to equal length to avoid leaking length info, then constant-time compare
+                let max_len = stored.len().max(provided.len());
+                let mut a = vec![0u8; max_len];
+                let mut b = vec![0u8; max_len];
+                a[..stored.len()].copy_from_slice(stored);
+                b[..provided.len()].copy_from_slice(provided);
+                stored.len() == provided.len() && a.ct_eq(&b).into()
+            })
     }
 
     pub fn get(&self, client_id: &str) -> Option<&OAuthClient> {

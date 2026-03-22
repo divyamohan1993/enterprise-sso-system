@@ -208,7 +208,9 @@ pub async fn tls_connect(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tls::{client_tls_config, generate_module_cert, server_tls_config, tls_connector};
+    use crate::tls::{
+        client_tls_config, generate_ca, generate_module_cert, server_tls_config, tls_connector,
+    };
 
     fn test_hmac_key() -> [u8; 64] {
         [0x42u8; 64]
@@ -216,9 +218,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_tls_shard_roundtrip() {
-        let cert = generate_module_cert("localhost");
-        let server_cfg = server_tls_config(&cert);
-        let client_cfg = client_tls_config(&cert);
+        let ca = generate_ca();
+        let server_cert = generate_module_cert("localhost", &ca);
+        let client_cert = generate_module_cert("client", &ca);
+        let server_cfg = server_tls_config(&server_cert, &ca);
+        let client_cfg = client_tls_config(&client_cert, &ca);
 
         let listener = TlsShardListener::bind(
             "127.0.0.1:0",
@@ -260,8 +264,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_tls_shard_rejects_plaintext_client() {
-        let cert = generate_module_cert("localhost");
-        let server_cfg = server_tls_config(&cert);
+        let ca = generate_ca();
+        let cert = generate_module_cert("localhost", &ca);
+        let server_cfg = server_tls_config(&cert, &ca);
 
         let listener = TlsShardListener::bind(
             "127.0.0.1:0",
@@ -290,9 +295,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_tls_multiple_messages() {
-        let cert = generate_module_cert("localhost");
-        let server_cfg = server_tls_config(&cert);
-        let client_cfg = client_tls_config(&cert);
+        let ca = generate_ca();
+        let server_cert = generate_module_cert("localhost", &ca);
+        let client_cert = generate_module_cert("client", &ca);
+        let server_cfg = server_tls_config(&server_cert, &ca);
+        let client_cfg = client_tls_config(&client_cert, &ca);
 
         let listener = TlsShardListener::bind(
             "127.0.0.1:0",

@@ -162,21 +162,91 @@ pub async fn exchange_code_for_tokens(
 // JWT claim extraction
 // ---------------------------------------------------------------------------
 
-/// Decode the payload of a Google ID token (a JWT) without cryptographic
-/// signature verification (signature is validated by TLS trust in the token
-/// endpoint). Returns the parsed claims.
-pub fn extract_google_claims(id_token: &str) -> Result<GoogleIdTokenClaims, String> {
+/// JWT header claims used for algorithm validation.
+#[derive(Debug, Deserialize)]
+struct JwtHeader {
+    alg: String,
+    #[serde(default)]
+    typ: Option<String>,
+}
+
+/// Decode and validate the structure of a Google ID token (a JWT).
+///
+/// Performs the following security checks:
+/// 1. Token has exactly 3 parts (header.payload.signature)
+/// 2. Header specifies RS256 algorithm
+/// 3. Signature part is present and non-empty (format validation)
+/// 4. Issuer is accounts.google.com or https://accounts.google.com
+/// 5. Token has not expired (exp claim vs current time)
+/// 6. Audience matches the expected client_id
+///
+/// NOTE: Full RS256 cryptographic signature verification against Google's JWKS
+/// keys (https://www.googleapis.com/oauth2/v3/certs) is not implemented here.
+/// The token is received directly from Google's token endpoint over TLS, which
+/// provides transport-level authenticity. For defense-in-depth, a production
+/// deployment should fetch and cache Google's JWKS and verify the RSA signature.
+pub fn extract_google_claims(id_token: &str, expected_client_id: &str) -> Result<GoogleIdTokenClaims, String> {
     let parts: Vec<&str> = id_token.split('.').collect();
     if parts.len() != 3 {
         return Err("id_token is not a valid JWT (expected 3 parts)".into());
     }
 
+    // Validate that the signature part is non-empty (structural check)
+    if parts[2].is_empty() {
+        return Err("id_token has an empty signature".into());
+    }
+
+    // Decode and validate the JWT header
+    let header_bytes = URL_SAFE_NO_PAD
+        .decode(parts[0])
+        .map_err(|e| format!("base64 decode error on header: {e}"))?;
+    let header: JwtHeader = serde_json::from_slice(&header_bytes)
+        .map_err(|e| format!("failed to parse JWT header: {e}"))?;
+
+    if header.alg != "RS256" {
+        return Err(format!(
+            "unexpected JWT algorithm: expected RS256, got {}",
+            header.alg
+        ));
+    }
+
+    // Validate that the signature is valid base64url (well-formed)
+    URL_SAFE_NO_PAD
+        .decode(parts[2])
+        .map_err(|e| format!("signature is not valid base64url: {e}"))?;
+
+    // Decode the payload
     let payload_bytes = URL_SAFE_NO_PAD
         .decode(parts[1])
-        .map_err(|e| format!("base64 decode error: {e}"))?;
+        .map_err(|e| format!("base64 decode error on payload: {e}"))?;
 
-    serde_json::from_slice::<GoogleIdTokenClaims>(&payload_bytes)
-        .map_err(|e| format!("failed to parse id_token claims: {e}"))
+    let claims: GoogleIdTokenClaims = serde_json::from_slice(&payload_bytes)
+        .map_err(|e| format!("failed to parse id_token claims: {e}"))?;
+
+    // Validate issuer
+    if claims.iss != "https://accounts.google.com" && claims.iss != "accounts.google.com" {
+        return Err(format!("unexpected issuer: {}", claims.iss));
+    }
+
+    // Validate audience matches our client_id
+    if claims.aud != expected_client_id {
+        return Err(format!(
+            "audience mismatch: expected {}, got {}",
+            expected_client_id, claims.aud
+        ));
+    }
+
+    // Validate expiry
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    // Allow 5 minutes of clock skew
+    if claims.exp < now - 300 {
+        return Err("id_token has expired".into());
+    }
+
+    Ok(claims)
 }
 
 // ---------------------------------------------------------------------------
@@ -322,9 +392,12 @@ mod tests {
 
     #[test]
     fn test_extract_google_claims() {
-        // Build a fake JWT with a valid base64url-encoded payload
+        // Build a fake JWT with a valid base64url-encoded header and payload
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
+
+        let header_json = serde_json::json!({"alg": "RS256", "typ": "JWT"});
+        let header = URL_SAFE_NO_PAD.encode(header_json.to_string().as_bytes());
 
         let claims_json = serde_json::json!({
             "sub": "12345",
@@ -336,13 +409,98 @@ mod tests {
             "exp": 9999999999i64,
         });
         let payload = URL_SAFE_NO_PAD.encode(claims_json.to_string().as_bytes());
-        let fake_jwt = format!("header.{payload}.signature");
+        // Use a non-empty base64url signature stub (structural validation only)
+        let fake_sig = URL_SAFE_NO_PAD.encode(b"fake-signature-bytes");
+        let fake_jwt = format!("{header}.{payload}.{fake_sig}");
 
-        let claims = extract_google_claims(&fake_jwt).unwrap();
+        let claims = extract_google_claims(&fake_jwt, "my-client-id").unwrap();
         assert_eq!(claims.sub, "12345");
         assert_eq!(claims.email, "user@example.com");
         assert!(claims.email_verified);
         assert_eq!(claims.iss, "https://accounts.google.com");
+    }
+
+    #[test]
+    fn test_extract_google_claims_rejects_wrong_alg() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        let header_json = serde_json::json!({"alg": "HS256", "typ": "JWT"});
+        let header = URL_SAFE_NO_PAD.encode(header_json.to_string().as_bytes());
+
+        let claims_json = serde_json::json!({
+            "sub": "12345", "email": "user@example.com", "email_verified": true,
+            "iss": "https://accounts.google.com", "aud": "my-client-id", "exp": 9999999999i64,
+        });
+        let payload = URL_SAFE_NO_PAD.encode(claims_json.to_string().as_bytes());
+        let fake_sig = URL_SAFE_NO_PAD.encode(b"sig");
+        let fake_jwt = format!("{header}.{payload}.{fake_sig}");
+
+        let result = extract_google_claims(&fake_jwt, "my-client-id");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("RS256"));
+    }
+
+    #[test]
+    fn test_extract_google_claims_rejects_wrong_audience() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        let header_json = serde_json::json!({"alg": "RS256", "typ": "JWT"});
+        let header = URL_SAFE_NO_PAD.encode(header_json.to_string().as_bytes());
+
+        let claims_json = serde_json::json!({
+            "sub": "12345", "email": "user@example.com", "email_verified": true,
+            "iss": "https://accounts.google.com", "aud": "wrong-client-id", "exp": 9999999999i64,
+        });
+        let payload = URL_SAFE_NO_PAD.encode(claims_json.to_string().as_bytes());
+        let fake_sig = URL_SAFE_NO_PAD.encode(b"sig");
+        let fake_jwt = format!("{header}.{payload}.{fake_sig}");
+
+        let result = extract_google_claims(&fake_jwt, "my-client-id");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("audience mismatch"));
+    }
+
+    #[test]
+    fn test_extract_google_claims_rejects_expired() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        let header_json = serde_json::json!({"alg": "RS256", "typ": "JWT"});
+        let header = URL_SAFE_NO_PAD.encode(header_json.to_string().as_bytes());
+
+        let claims_json = serde_json::json!({
+            "sub": "12345", "email": "user@example.com", "email_verified": true,
+            "iss": "https://accounts.google.com", "aud": "my-client-id", "exp": 1000000i64,
+        });
+        let payload = URL_SAFE_NO_PAD.encode(claims_json.to_string().as_bytes());
+        let fake_sig = URL_SAFE_NO_PAD.encode(b"sig");
+        let fake_jwt = format!("{header}.{payload}.{fake_sig}");
+
+        let result = extract_google_claims(&fake_jwt, "my-client-id");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("expired"));
+    }
+
+    #[test]
+    fn test_extract_google_claims_rejects_empty_signature() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        let header_json = serde_json::json!({"alg": "RS256", "typ": "JWT"});
+        let header = URL_SAFE_NO_PAD.encode(header_json.to_string().as_bytes());
+
+        let claims_json = serde_json::json!({
+            "sub": "12345", "email": "user@example.com", "email_verified": true,
+            "iss": "https://accounts.google.com", "aud": "my-client-id", "exp": 9999999999i64,
+        });
+        let payload = URL_SAFE_NO_PAD.encode(claims_json.to_string().as_bytes());
+        let fake_jwt = format!("{header}.{payload}.");
+
+        let result = extract_google_claims(&fake_jwt, "my-client-id");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("empty signature"));
     }
 
     #[test]

@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use rand::Rng;
 use tracing::{error, info, warn};
 
 use common::types::ModuleId;
@@ -153,6 +152,11 @@ async fn handle_connection(
     let auth_req: AuthRequest = recv_frame(&mut stream).await?;
 
     // 5. Forward to orchestrator via SHARD (or stub if not configured)
+    // Record the start time before processing the auth request so we can
+    // enforce a constant-time floor on the response, preventing timing-based
+    // username enumeration attacks.
+    let auth_start = tokio::time::Instant::now();
+
     let resp = if let Some(orch) = orchestrator {
         forward_to_orchestrator(&auth_req, &orch).await?
     } else {
@@ -163,6 +167,15 @@ async fn handle_connection(
             error: Some("no orchestrator configured".to_string()),
         }
     };
+
+    // Constant-time delay: pad response to a fixed minimum duration (100ms)
+    // to prevent timing-based username enumeration via OPAQUE.
+    const AUTH_RESPONSE_FLOOR: std::time::Duration = std::time::Duration::from_millis(100);
+    let elapsed = auth_start.elapsed();
+    if elapsed < AUTH_RESPONSE_FLOOR {
+        tokio::time::sleep(AUTH_RESPONSE_FLOOR - elapsed).await;
+    }
+
     send_frame(&mut stream, &resp).await?;
 
     Ok(())
@@ -180,17 +193,15 @@ async fn forward_to_orchestrator(
         username: auth_req.username.clone(),
         password: auth_req.password.clone(),
         dpop_key_hash: {
-            // Read client DPoP public key from the auth request payload
-            // The client must send their Ed25519 public key as the first 32 bytes of the auth frame
+            // Read client DPoP public key from the auth request payload.
+            // The client MUST send their Ed25519 public key as the first 32 bytes.
+            // Generating a fallback key would defeat the purpose of DPoP channel binding.
             let auth_payload = &auth_req.password;
-            let client_dpop_key: [u8; 32] = if auth_payload.len() >= 32 {
-                let mut key = [0u8; 32];
-                key.copy_from_slice(&auth_payload[..32]);
-                key
-            } else {
-                tracing::warn!("Client did not provide DPoP key — generating ephemeral (NOT spec-compliant)");
-                rand::thread_rng().gen()
-            };
+            if auth_payload.len() < 32 {
+                return Err("DPoP key required".into());
+            }
+            let mut client_dpop_key = [0u8; 32];
+            client_dpop_key.copy_from_slice(&auth_payload[..32]);
             crypto::dpop::dpop_key_hash(&client_dpop_key)
         },
         tier: 0,                  // Orchestrator decides tier

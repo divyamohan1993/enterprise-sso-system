@@ -1,6 +1,6 @@
 //! X-Wing hybrid KEM combiner per spec Errata C.8.
 //!
-//! Combines X25519 (classical) with ML-KEM-768 (post-quantum) to produce a
+//! Combines X25519 (classical) with ML-KEM-1024 (post-quantum) to produce a
 //! shared secret via:
 //!
 //! ```text
@@ -8,7 +8,7 @@
 //! ```
 
 use ml_kem::kem::{Decapsulate, Encapsulate};
-use ml_kem::{EncodedSizeUser, KemCore, MlKem768};
+use ml_kem::{EncodedSizeUser, KemCore, MlKem1024};
 use sha3::{Digest, Sha3_256};
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -16,11 +16,11 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 /// Length of the X25519 public key in bytes.
 const X25519_PK_LEN: usize = 32;
 
-/// Length of the ML-KEM-768 ciphertext in bytes.
-const ML_KEM_CT_LEN: usize = 1088;
+/// Length of the ML-KEM-1024 ciphertext in bytes.
+const ML_KEM_CT_LEN: usize = 1568;
 
-/// Length of the ML-KEM-768 encapsulation key in bytes.
-const ML_KEM_EK_LEN: usize = 1184;
+/// Length of the ML-KEM-1024 encapsulation key in bytes.
+const ML_KEM_EK_LEN: usize = 1568;
 
 /// Domain separator for the X-Wing combiner.
 const XWING_LABEL: &[u8] = b"X-Wing";
@@ -43,11 +43,11 @@ impl AsRef<[u8]> for SharedSecret {
 }
 
 /// The public portion of an X-Wing key pair, containing both an X25519 public
-/// key and an ML-KEM-768 encapsulation key.
+/// key and an ML-KEM-1024 encapsulation key.
 #[derive(Clone)]
 pub struct XWingPublicKey {
     x25519_pk: PublicKey,
-    ml_kem_ek: <MlKem768 as KemCore>::EncapsulationKey,
+    ml_kem_ek: <MlKem1024 as KemCore>::EncapsulationKey,
 }
 
 impl XWingPublicKey {
@@ -68,12 +68,12 @@ impl XWingPublicKey {
         x25519_bytes.copy_from_slice(&bytes[..X25519_PK_LEN]);
         let x25519_pk = PublicKey::from(x25519_bytes);
 
-        let ek_bytes = ml_kem::Encoded::<<MlKem768 as KemCore>::EncapsulationKey>::try_from(
+        let ek_bytes = ml_kem::Encoded::<<MlKem1024 as KemCore>::EncapsulationKey>::try_from(
             &bytes[X25519_PK_LEN..X25519_PK_LEN + ML_KEM_EK_LEN],
         )
         .ok()?;
         let ml_kem_ek =
-            <MlKem768 as KemCore>::EncapsulationKey::from_bytes(&ek_bytes);
+            <MlKem1024 as KemCore>::EncapsulationKey::from_bytes(&ek_bytes);
 
         Some(Self {
             x25519_pk,
@@ -89,13 +89,13 @@ impl XWingPublicKey {
 
 /// Ciphertext produced by X-Wing encapsulation.
 ///
-/// Contains an ephemeral X25519 public key (32 bytes) and an ML-KEM-768
+/// Contains an ephemeral X25519 public key (32 bytes) and an ML-KEM-1024
 /// ciphertext (1088 bytes).
 #[derive(Clone)]
 pub struct Ciphertext {
     /// Ephemeral X25519 public key from the client.
     x25519_pk_client: [u8; X25519_PK_LEN],
-    /// ML-KEM-768 ciphertext.
+    /// ML-KEM-1024 ciphertext.
     ml_kem_ct: [u8; ML_KEM_CT_LEN],
 }
 
@@ -124,12 +124,12 @@ impl Ciphertext {
     }
 }
 
-/// An X-Wing key pair holding both X25519 and ML-KEM-768 key material.
+/// An X-Wing key pair holding both X25519 and ML-KEM-1024 key material.
 pub struct XWingKeyPair {
     x25519_secret: StaticSecret,
     x25519_public: PublicKey,
-    ml_kem_dk: <MlKem768 as KemCore>::DecapsulationKey,
-    ml_kem_ek: <MlKem768 as KemCore>::EncapsulationKey,
+    ml_kem_dk: <MlKem1024 as KemCore>::DecapsulationKey,
+    ml_kem_ek: <MlKem1024 as KemCore>::EncapsulationKey,
 }
 
 impl XWingKeyPair {
@@ -138,7 +138,7 @@ impl XWingKeyPair {
         let mut rng = rand::thread_rng();
         let x25519_secret = StaticSecret::random_from_rng(&mut rng);
         let x25519_public = PublicKey::from(&x25519_secret);
-        let (ml_kem_dk, ml_kem_ek) = MlKem768::generate(&mut rng);
+        let (ml_kem_dk, ml_kem_ek) = MlKem1024::generate(&mut rng);
         Self {
             x25519_secret,
             x25519_public,
@@ -196,7 +196,7 @@ fn combine(
 /// Client-side encapsulation.
 ///
 /// Generates an ephemeral X25519 key pair, computes the DH shared secret
-/// against the server's public key, performs ML-KEM-768 encapsulation against
+/// against the server's public key, performs ML-KEM-1024 encapsulation against
 /// the server's encapsulation key, and combines everything through the X-Wing
 /// formula.
 ///
@@ -214,11 +214,11 @@ pub fn xwing_encapsulate(server_pk: &XWingPublicKey) -> (SharedSecret, Ciphertex
 
     let client_pk = *eph_public.as_bytes();
 
-    // ML-KEM-768 encapsulation.
+    // ML-KEM-1024 encapsulation.
     let (ml_kem_ct_arr, ml_kem_ss_arr) = server_pk
         .ml_kem_ek
         .encapsulate(&mut rng)
-        .expect("ML-KEM-768 encapsulation should not fail");
+        .expect("ML-KEM-1024 encapsulation should not fail");
 
     let ml_kem_ss: &[u8] = ml_kem_ss_arr.as_slice();
     let ml_kem_ct: &[u8] = ml_kem_ct_arr.as_slice();
@@ -256,13 +256,13 @@ pub fn xwing_decapsulate(server_kp: &XWingKeyPair, ciphertext: &Ciphertext) -> S
 
     let server_pk = server_kp.public_key_bytes();
 
-    // ML-KEM-768 decapsulation.
-    let ml_kem_ct = ml_kem::Ciphertext::<MlKem768>::try_from(ciphertext.ml_kem_ct.as_slice())
-        .expect("ML-KEM-768 ciphertext should be the correct length");
+    // ML-KEM-1024 decapsulation.
+    let ml_kem_ct = ml_kem::Ciphertext::<MlKem1024>::try_from(ciphertext.ml_kem_ct.as_slice())
+        .expect("ML-KEM-1024 ciphertext should be the correct length");
     let ml_kem_ss = server_kp
         .ml_kem_dk
         .decapsulate(&ml_kem_ct)
-        .expect("ML-KEM-768 decapsulation should not fail");
+        .expect("ML-KEM-1024 decapsulation should not fail");
 
     combine(
         ml_kem_ss.as_slice(),

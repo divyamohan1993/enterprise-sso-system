@@ -69,6 +69,17 @@ pub struct SecurityConfig {
     pub require_dpop_all_operations: bool,
     /// Maximum concurrent sessions per user.
     pub max_concurrent_sessions_per_user: u32,
+
+    // ── OAuth/OIDC hardening parameters ──
+
+    /// Require exact redirect URI matching (no wildcards or prefix matching).
+    pub require_strict_redirect_uri: bool,
+    /// Require PKCE (Proof Key for Code Exchange) for all authorization code flows.
+    pub require_pkce: bool,
+    /// Require mutual TLS (mTLS) for all client authentication.
+    pub require_mtls: bool,
+    /// Require encryption of TSS key shards at rest and in transit.
+    pub shard_encryption_enabled: bool,
 }
 
 impl Default for SecurityConfig {
@@ -106,6 +117,12 @@ impl Default for SecurityConfig {
             max_session_age_forced_reauth_secs: 14400, // 4 hours (stricter than 8h max)
             require_dpop_all_operations: true,
             max_concurrent_sessions_per_user: 3,
+
+            // OAuth/OIDC hardening defaults — all enabled for maximum security
+            require_strict_redirect_uri: true,
+            require_pkce: true,
+            require_mtls: true,
+            shard_encryption_enabled: true,
         }
     }
 }
@@ -156,6 +173,21 @@ mod tests {
         assert_eq!(cfg.share_refresh_interval_secs, 3600);
         assert_eq!(cfg.verifier_staleness_timeout_secs, 60);
         assert_eq!(cfg.audit_degradation_max_secs, 1800);
+    }
+
+    #[test]
+    fn hardening_defaults_are_maximum_security() {
+        let cfg = SecurityConfig::default();
+        assert!(cfg.require_encryption_at_rest);
+        assert!(cfg.require_sealed_keys);
+        assert!(cfg.require_binary_attestation);
+        assert!(cfg.require_mlock);
+        assert!(cfg.entropy_fail_closed);
+        assert!(cfg.require_dpop_all_operations);
+        assert!(cfg.require_strict_redirect_uri);
+        assert!(cfg.require_pkce);
+        assert!(cfg.require_mtls);
+        assert!(cfg.shard_encryption_enabled);
     }
 
     #[test]
