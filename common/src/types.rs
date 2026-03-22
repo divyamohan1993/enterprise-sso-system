@@ -179,6 +179,7 @@ pub enum AuditEventType {
     ShareRefresh,
     SystemDegraded,
     SystemRecovered,
+    DuressDetected,
 }
 
 // ── AuditEntry ────────────────────────────────────────────────────────
