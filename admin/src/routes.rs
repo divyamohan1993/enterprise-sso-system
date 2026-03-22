@@ -720,6 +720,7 @@ async fn auth_login(
             return Json(LoginResponse {
                 success: false,
                 user_id: None,
+                username: None,
                 token: None,
                 tier: None,
                 error: Some("invalid credentials".into()),
