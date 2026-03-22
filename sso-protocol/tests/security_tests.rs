@@ -5,6 +5,7 @@ use sso_protocol::clients::ClientRegistry;
 use sso_protocol::discovery::OpenIdConfiguration;
 use sso_protocol::pkce;
 use sso_protocol::tokens;
+use sso_protocol::tokens::OidcSigningKey;
 use uuid::Uuid;
 
 #[test]
@@ -41,16 +42,44 @@ fn test_oidc_discovery_only_code_response_type() {
 }
 
 #[test]
+fn test_oidc_discovery_advertises_rs256() {
+    let config = OpenIdConfiguration::new("https://sso.mil");
+    assert!(config.id_token_signing_alg_values_supported.contains(&"RS256".to_string()));
+    // Must NOT advertise HS512 (symmetric)
+    assert!(!config.id_token_signing_alg_values_supported.contains(&"HS512".to_string()));
+}
+
+#[test]
 fn test_jwt_signature_changes_with_different_key() {
     let user_id = Uuid::new_v4();
-    let key1 = [0x11u8; 64];
-    let key2 = [0x22u8; 64];
+    let key1 = OidcSigningKey::generate();
+    let key2 = OidcSigningKey::generate();
     let t1 = tokens::create_id_token("https://iss", &user_id, "c", None, &key1);
     let t2 = tokens::create_id_token("https://iss", &user_id, "c", None, &key2);
     // Signatures (third JWT segment) must differ
     let sig1 = t1.split('.').nth(2).unwrap();
     let sig2 = t2.split('.').nth(2).unwrap();
     assert_ne!(sig1, sig2);
+}
+
+#[test]
+fn test_rs256_token_verifiable_with_public_key() {
+    let user_id = Uuid::new_v4();
+    let key = OidcSigningKey::generate();
+    let token = tokens::create_id_token("https://iss", &user_id, "c", None, &key);
+    // Must verify with the matching public key
+    let claims = tokens::verify_id_token(&token, key.public_key()).unwrap();
+    assert_eq!(claims.sub, user_id.to_string());
+}
+
+#[test]
+fn test_rs256_token_rejected_with_wrong_public_key() {
+    let user_id = Uuid::new_v4();
+    let key1 = OidcSigningKey::generate();
+    let key2 = OidcSigningKey::generate();
+    let token = tokens::create_id_token("https://iss", &user_id, "c", None, &key1);
+    // Must NOT verify with a different key's public key
+    assert!(tokens::verify_id_token(&token, key2.public_key()).is_err());
 }
 
 #[test]
@@ -86,13 +115,10 @@ fn test_nonexistent_client_get_returns_none() {
 #[test]
 fn test_jwt_tier_values_propagate() {
     let user_id = Uuid::new_v4();
-    let key = [0x55u8; 64];
+    let key = OidcSigningKey::generate();
     for tier in 1..=4u8 {
         let token = tokens::create_id_token_with_tier("https://iss", &user_id, "c", None, &key, tier);
-        let parts: Vec<&str> = token.split('.').collect();
-        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-        let claims_bytes = URL_SAFE_NO_PAD.decode(parts[1]).unwrap();
-        let claims: tokens::IdTokenClaims = serde_json::from_slice(&claims_bytes).unwrap();
+        let claims = tokens::verify_id_token(&token, key.public_key()).unwrap();
         assert_eq!(claims.tier, tier, "tier {tier} should propagate into JWT claims");
     }
 }

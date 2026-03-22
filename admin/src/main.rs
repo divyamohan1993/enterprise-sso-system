@@ -108,7 +108,7 @@ async fn main() {
         portals: RwLock::new(Vec::new()),
         oauth_clients: RwLock::new(oauth_clients),
         auth_codes: RwLock::new(sso_protocol::authorize::AuthorizationStore::new()),
-        oidc_signing_key: crypto::entropy::generate_key_64(),
+        oidc_signing_key: sso_protocol::tokens::OidcSigningKey::generate(),
         admin_api_key: api_key,
         fido_store: RwLock::new(fido::registration::CredentialStore::new()),
         setup_complete: Arc::new(AtomicBool::new(false)),

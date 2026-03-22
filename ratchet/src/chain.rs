@@ -17,7 +17,7 @@ type HmacSha512 = Hmac<Sha512>;
 pub struct RatchetChain {
     chain_key: [u8; 64],
     epoch: u64,
-    /// Maximum lifetime in epochs (8 hours at 30s/epoch = 960).
+    /// Maximum lifetime in epochs (8 hours at 10s/epoch = 2880).
     max_epoch_lifetime: u64,
 }
 
@@ -31,7 +31,7 @@ impl RatchetChain {
         Self {
             chain_key,
             epoch: 0,
-            max_epoch_lifetime: 960,
+            max_epoch_lifetime: 2880,
         }
     }
 
@@ -62,8 +62,8 @@ impl RatchetChain {
         mac.finalize().into_bytes().into()
     }
 
-    /// Verify a ratchet tag, checking +/-3 epoch lookahead window for
-    /// network jitter tolerance.
+    /// Verify a ratchet tag, checking +/-1 epoch lookahead window for
+    /// network jitter tolerance (10s epochs → ±10s window).
     ///
     /// Exact-epoch match is verified via constant-time comparison.
     /// For non-exact matches within the window, returns `false` for now
@@ -71,7 +71,7 @@ impl RatchetChain {
     /// enhancement).
     pub fn verify_tag(&self, claims_bytes: &[u8], tag: &[u8; 64], token_epoch: u64) -> bool {
         let epoch_diff = token_epoch.abs_diff(self.epoch);
-        if epoch_diff > 3 {
+        if epoch_diff > 1 {
             return false;
         }
         // For exact match, verify with constant-time comparison

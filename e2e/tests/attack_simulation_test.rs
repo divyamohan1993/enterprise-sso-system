@@ -1210,30 +1210,30 @@ fn test_attack_ratchet_cloned_server_detected() {
 
 #[test]
 fn test_attack_session_cannot_exceed_8_hours() {
-    // Try to advance past 960 epochs. Must be flagged as expired.
+    // Try to advance past 2880 epochs. Must be flagged as expired.
     let master = [0x99u8; 64];
     let mut chain = RatchetChain::new(&master);
 
     let client_e = [0x11u8; 32];
     let server_e = [0x22u8; 32];
 
-    // Advance to epoch 959 (just under limit)
-    for _ in 0..959 {
+    // Advance to epoch 2879 (just under limit)
+    for _ in 0..2879 {
         chain.advance(&client_e, &server_e);
     }
-    assert!(!chain.is_expired(), "epoch 959 should not be expired");
+    assert!(!chain.is_expired(), "epoch 2879 should not be expired");
 
-    // Advance to epoch 960
+    // Advance to epoch 2880
     chain.advance(&client_e, &server_e);
-    assert_eq!(chain.epoch(), 960);
+    assert_eq!(chain.epoch(), 2880);
     assert!(
         chain.is_expired(),
-        "epoch 960 (8h at 30s/epoch) must be expired"
+        "epoch 2880 (8h at 10s/epoch) must be expired"
     );
 
     // Advancing further stays expired
     chain.advance(&client_e, &server_e);
-    assert!(chain.is_expired(), "epoch 961 must still be expired");
+    assert!(chain.is_expired(), "epoch 2881 must still be expired");
 }
 
 // ==========================================================================

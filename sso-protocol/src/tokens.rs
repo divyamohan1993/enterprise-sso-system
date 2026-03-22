@@ -1,6 +1,14 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use rsa::pkcs1v15::SigningKey;
+use rsa::signature::{SignatureEncoding, SignerMut};
+use rsa::traits::PublicKeyParts;
+use rsa::{RsaPrivateKey, RsaPublicKey};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use uuid::Uuid;
+
+/// RSA key size for OIDC signing (2048-bit is the OIDC/JWT minimum for RS256).
+const RSA_KEY_BITS: usize = 2048;
 
 #[derive(Serialize, Deserialize)]
 pub struct IdTokenClaims {
@@ -23,24 +31,70 @@ pub struct TokenResponse {
     pub scope: String,
 }
 
-/// Create a simple HMAC-signed JWT (for the OIDC layer)
+/// Wrapper around an RSA private key used for signing OIDC ID tokens with RS256.
+pub struct OidcSigningKey {
+    private_key: RsaPrivateKey,
+    kid: String,
+}
+
+impl OidcSigningKey {
+    /// Generate a new RSA-2048 signing key for OIDC.
+    pub fn generate() -> Self {
+        let mut rng = rand::thread_rng();
+        let private_key =
+            RsaPrivateKey::new(&mut rng, RSA_KEY_BITS).expect("RSA key generation failed");
+        Self {
+            private_key,
+            kid: "milnet-rs256-v1".to_string(),
+        }
+    }
+
+    /// Return the public key for JWKS.
+    pub fn public_key(&self) -> &RsaPublicKey {
+        self.private_key.as_ref()
+    }
+
+    /// Key ID for JWK `kid` field.
+    pub fn kid(&self) -> &str {
+        &self.kid
+    }
+
+    /// Build the JWKS JSON value for this key.
+    pub fn jwks_json(&self) -> serde_json::Value {
+        let pub_key = self.public_key();
+        let n = URL_SAFE_NO_PAD.encode(pub_key.n().to_bytes_be());
+        let e = URL_SAFE_NO_PAD.encode(pub_key.e().to_bytes_be());
+        serde_json::json!({
+            "keys": [{
+                "kty": "RSA",
+                "alg": "RS256",
+                "use": "sig",
+                "kid": self.kid,
+                "n": n,
+                "e": e
+            }]
+        })
+    }
+}
+
+/// Create an RS256-signed JWT (for the OIDC layer)
 pub fn create_id_token(
     issuer: &str,
     user_id: &Uuid,
     client_id: &str,
     nonce: Option<String>,
-    signing_key: &[u8; 64],
+    signing_key: &OidcSigningKey,
 ) -> String {
     create_id_token_with_tier(issuer, user_id, client_id, nonce, signing_key, 2)
 }
 
-/// Create an HMAC-signed JWT with an explicit tier claim
+/// Create an RS256-signed JWT with an explicit tier claim
 pub fn create_id_token_with_tier(
     issuer: &str,
     user_id: &Uuid,
     client_id: &str,
     nonce: Option<String>,
-    signing_key: &[u8; 64],
+    signing_key: &OidcSigningKey,
     tier: u8,
 ) -> String {
     let now = std::time::SystemTime::now()
@@ -48,7 +102,11 @@ pub fn create_id_token_with_tier(
         .unwrap()
         .as_secs() as i64;
 
-    let header = serde_json::json!({"alg": "HS512", "typ": "JWT"});
+    let header = serde_json::json!({
+        "alg": "RS256",
+        "typ": "JWT",
+        "kid": signing_key.kid()
+    });
     let claims = IdTokenClaims {
         iss: issuer.to_string(),
         sub: user_id.to_string(),
@@ -64,12 +122,40 @@ pub fn create_id_token_with_tier(
     let claims_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
     let signing_input = format!("{header_b64}.{claims_b64}");
 
-    use hmac::{Hmac, Mac};
-    use sha2::Sha512;
-    let mut mac = Hmac::<Sha512>::new_from_slice(signing_key).unwrap();
-    mac.update(signing_input.as_bytes());
-    let sig = mac.finalize().into_bytes();
-    let sig_b64 = URL_SAFE_NO_PAD.encode(sig);
+    let mut signer = SigningKey::<Sha256>::new(signing_key.private_key.clone());
+    let signature = signer
+        .sign(signing_input.as_bytes());
+    let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_vec());
 
     format!("{signing_input}.{sig_b64}")
+}
+
+/// Verify an RS256-signed JWT using the RSA public key.
+pub fn verify_id_token(token: &str, public_key: &RsaPublicKey) -> Result<IdTokenClaims, String> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err("invalid JWT: expected 3 parts".into());
+    }
+
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+    let sig_bytes = URL_SAFE_NO_PAD
+        .decode(parts[2])
+        .map_err(|e| format!("base64 decode sig: {e}"))?;
+
+    use rsa::pkcs1v15::VerifyingKey;
+    use rsa::signature::Verifier;
+    let verifying_key = VerifyingKey::<Sha256>::new(public_key.clone());
+    let signature = rsa::pkcs1v15::Signature::try_from(sig_bytes.as_slice())
+        .map_err(|e| format!("invalid signature: {e}"))?;
+    verifying_key
+        .verify(signing_input.as_bytes(), &signature)
+        .map_err(|e| format!("RS256 verification failed: {e}"))?;
+
+    let claims_bytes = URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .map_err(|e| format!("base64 decode claims: {e}"))?;
+    let claims: IdTokenClaims =
+        serde_json::from_slice(&claims_bytes).map_err(|e| format!("parse claims: {e}"))?;
+
+    Ok(claims)
 }

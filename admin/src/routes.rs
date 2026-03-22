@@ -26,7 +26,7 @@ pub struct AppState {
     pub portals: RwLock<Vec<Portal>>,
     pub oauth_clients: RwLock<sso_protocol::clients::ClientRegistry>,
     pub auth_codes: RwLock<sso_protocol::authorize::AuthorizationStore>,
-    pub oidc_signing_key: [u8; 64],
+    pub oidc_signing_key: sso_protocol::tokens::OidcSigningKey,
     pub admin_api_key: String,
     pub fido_store: RwLock<fido::registration::CredentialStore>,
     pub setup_complete: Arc<AtomicBool>,
@@ -1826,15 +1826,10 @@ async fn get_user_profile(
 // Handlers — JWKS
 // ---------------------------------------------------------------------------
 
-async fn oauth_jwks() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "keys": [{
-            "kty": "oct",
-            "alg": "HS512",
-            "use": "sig",
-            "kid": "milnet-hs512-v1"
-        }]
-    }))
+async fn oauth_jwks(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    Json(state.oidc_signing_key.jwks_json())
 }
 
 

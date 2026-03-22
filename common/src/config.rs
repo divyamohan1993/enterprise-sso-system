@@ -8,9 +8,9 @@
 pub struct SecurityConfig {
     /// Maximum session lifetime (8 hours).
     pub max_session_lifetime_secs: u64,
-    /// Ratchet epoch length.
+    /// Ratchet epoch length (10 seconds — stolen tokens expire within ±10s).
     pub ratchet_epoch_secs: u64,
-    /// Ratchet lookahead window for clock jitter tolerance.
+    /// Ratchet lookahead window for clock jitter tolerance (±1 epoch).
     pub ratchet_lookahead_epochs: u64,
     /// Receipt time-to-live.
     pub receipt_ttl_secs: u64,
@@ -48,8 +48,8 @@ impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
             max_session_lifetime_secs: 28800,
-            ratchet_epoch_secs: 30,
-            ratchet_lookahead_epochs: 3,
+            ratchet_epoch_secs: 10,
+            ratchet_lookahead_epochs: 1,
             receipt_ttl_secs: 30,
             ceremony_ttl_secs: 30,
             puzzle_difficulty_normal: 8,
@@ -98,8 +98,8 @@ mod tests {
     fn default_values_match_spec() {
         let cfg = SecurityConfig::default();
         assert_eq!(cfg.max_session_lifetime_secs, 28800);
-        assert_eq!(cfg.ratchet_epoch_secs, 30);
-        assert_eq!(cfg.ratchet_lookahead_epochs, 3);
+        assert_eq!(cfg.ratchet_epoch_secs, 10);
+        assert_eq!(cfg.ratchet_lookahead_epochs, 1);
         assert_eq!(cfg.receipt_ttl_secs, 30);
         assert_eq!(cfg.ceremony_ttl_secs, 30);
         assert_eq!(cfg.puzzle_difficulty_normal, 8);
@@ -131,6 +131,6 @@ mod tests {
     #[test]
     fn max_ratchet_epochs() {
         let cfg = SecurityConfig::default();
-        assert_eq!(cfg.max_ratchet_epochs(), 960); // 28800 / 30
+        assert_eq!(cfg.max_ratchet_epochs(), 2880); // 28800 / 10
     }
 }

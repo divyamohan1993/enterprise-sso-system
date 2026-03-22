@@ -805,16 +805,16 @@ fn test_ratchet_session_expires_at_8_hours() {
     let client_e = [0x11u8; 32];
     let server_e = [0x22u8; 32];
 
-    // Advance 959 times (just before expiry at epoch 960)
-    for _ in 0..959 {
+    // Advance 2879 times (just before expiry at epoch 2880)
+    for _ in 0..2879 {
         chain.advance(&client_e, &server_e);
     }
-    assert!(!chain.is_expired(), "chain should not be expired at epoch 959");
+    assert!(!chain.is_expired(), "chain should not be expired at epoch 2879");
 
-    // Advance to epoch 960
+    // Advance to epoch 2880
     chain.advance(&client_e, &server_e);
-    assert_eq!(chain.epoch(), 960);
-    assert!(chain.is_expired(), "chain must be expired at epoch 960 (8h at 30s)");
+    assert_eq!(chain.epoch(), 2880);
+    assert!(chain.is_expired(), "chain must be expired at epoch 2880 (8h at 10s)");
 }
 
 #[test]

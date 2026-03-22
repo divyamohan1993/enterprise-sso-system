@@ -84,7 +84,7 @@ fn chain_reject_wrong_epoch() {
     let chain = RatchetChain::new(&test_secret());
     let claims = b"test-claims-data";
     let tag = chain.generate_tag(claims);
-    // Epoch 10 is way outside the ±3 window
+    // Epoch 10 is way outside the ±1 window
     assert!(!chain.verify_tag(claims, &tag, 10));
 }
 
@@ -110,18 +110,18 @@ fn session_manager_create_and_advance() {
 }
 
 #[test]
-fn session_manager_expired_after_960_epochs() {
+fn session_manager_expired_after_2880_epochs() {
     let mut mgr = SessionManager::new();
     let sid = Uuid::new_v4();
     mgr.create_session(sid, &test_secret());
 
-    // Advance 960 times to reach the 8-hour limit
-    for _ in 0..960 {
+    // Advance 2880 times to reach the 8-hour limit (at 10s/epoch)
+    for _ in 0..2880 {
         mgr.advance_session(&sid, &test_entropy_a(), &test_entropy_b())
             .unwrap();
     }
 
-    // The 961st advance should fail
+    // The 2881st advance should fail
     let result = mgr.advance_session(&sid, &test_entropy_a(), &test_entropy_b());
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("expired"));

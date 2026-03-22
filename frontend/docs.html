@@ -587,7 +587,7 @@ footer a:hover {
 <h2 id="getting-started">Getting Started</h2>
 <p>
   MILNET SSO is an OpenID Connect (OIDC) identity provider that issues ID tokens
-  signed with <strong style="color:var(--green)">HS512</strong> (HMAC-SHA512). It implements the
+  signed with <strong style="color:var(--green)">RS256</strong> (RSA-SHA256). It implements the
   Authorization Code flow with PKCE support, tiered access control, and hash-chained
   audit logging.
 </p>
@@ -596,10 +596,10 @@ footer a:hover {
   with MILNET SSO.
 </p>
 
-<div class="callout warn">
-  <strong>Important:</strong> MILNET SSO uses HS512 (symmetric HMAC) for token signing, not RS256.
-  Every client library and configuration must explicitly set the algorithm to HS512.
-  The shared secret is your <code>client_secret</code>.
+<div class="callout">
+  <strong>Standard RS256 signing.</strong> MILNET SSO uses RS256 (asymmetric RSA) for ID token signing.
+  Public keys are available at the <code>/oauth/jwks</code> endpoint.
+  Standard OIDC client libraries work out of the box with no special configuration.
 </div>
 
 <h3 id="prerequisites">Prerequisites</h3>
@@ -694,7 +694,7 @@ footer a:hover {
     <div class="flow-body">
       <strong>Receive tokens</strong><br>
       The response contains <code>access_token</code> (a UUID, not a JWT),
-      <code>id_token</code> (a JWT signed with HS512), and <code>token_type=Bearer</code>.
+      <code>id_token</code> (a JWT signed with RS256), and <code>token_type=Bearer</code>.
       Verify the <code>id_token</code> for user identity. The access_token is used for the
       userinfo endpoint.
     </div>
@@ -730,7 +730,7 @@ footer a:hover {
   <span class="key">"token_endpoint"</span>: <span class="str">"https://sso.example.mil/oauth/token"</span>,
   <span class="key">"userinfo_endpoint"</span>: <span class="str">"https://sso.example.mil/oauth/userinfo"</span>,
   <span class="key">"jwks_uri"</span>: <span class="str">"https://sso.example.mil/oauth/jwks"</span>,
-  <span class="key">"id_token_signing_alg_values_supported"</span>: [<span class="str">"HS512"</span>],
+  <span class="key">"id_token_signing_alg_values_supported"</span>: [<span class="str">"RS256"</span>],
   <span class="key">"token_endpoint_auth_methods_supported"</span>: [<span class="str">"client_secret_post"</span>],
   ...
 }</pre>
@@ -882,8 +882,8 @@ footer a:hover {
 
 <!-- EP: JWKS -->
 <h3 id="ep-jwks"><span class="badge badge-get">GET</span> /oauth/jwks</h3>
-<p>Returns the JSON Web Key Set. For HS512, this contains the symmetric key metadata
-  (the actual secret is your client_secret).</p>
+<p>Returns the JSON Web Key Set containing the RSA public key used for RS256 signature verification.
+  Standard OIDC client libraries fetch this automatically.</p>
 <div class="code-wrap">
   <button class="copy-btn" onclick="copyCode(this)">Copy</button>
   <pre class="code-block"><span class="kw">GET</span> <span class="str">/oauth/jwks</span>
@@ -892,9 +892,12 @@ footer a:hover {
 {
   <span class="key">"keys"</span>: [
     {
-      <span class="key">"kty"</span>: <span class="str">"oct"</span>,
-      <span class="key">"alg"</span>: <span class="str">"HS512"</span>,
-      <span class="key">"use"</span>: <span class="str">"sig"</span>
+      <span class="key">"kty"</span>: <span class="str">"RSA"</span>,
+      <span class="key">"alg"</span>: <span class="str">"RS256"</span>,
+      <span class="key">"use"</span>: <span class="str">"sig"</span>,
+      <span class="key">"kid"</span>: <span class="str">"milnet-rs256-v1"</span>,
+      <span class="key">"n"</span>: <span class="str">"&lt;base64url-encoded RSA modulus&gt;"</span>,
+      <span class="key">"e"</span>: <span class="str">"AQAB"</span>
     }
   ]
 }</pre>
@@ -978,16 +981,17 @@ footer a:hover {
 <!-- ======== JWT FORMAT ======== -->
 <h2 id="jwt-format">JWT / ID Token Format</h2>
 <p>
-  The <code>id_token</code> is a standard JWT signed with <strong style="color:var(--green)">HS512</strong>
-  (HMAC-SHA512). The signing key is the <code>client_secret</code>.
+  The <code>id_token</code> is a standard JWT signed with <strong style="color:var(--green)">RS256</strong>
+  (RSA-SHA256). The public key is available at the <code>/oauth/jwks</code> endpoint.
 </p>
 
 <h4>Header</h4>
 <div class="code-wrap">
   <button class="copy-btn" onclick="copyCode(this)">Copy</button>
   <pre class="code-block">{
-  <span class="key">"alg"</span>: <span class="str">"HS512"</span>,
-  <span class="key">"typ"</span>: <span class="str">"JWT"</span>
+  <span class="key">"alg"</span>: <span class="str">"RS256"</span>,
+  <span class="key">"typ"</span>: <span class="str">"JWT"</span>,
+  <span class="key">"kid"</span>: <span class="str">"milnet-rs256-v1"</span>
 }</pre>
 </div>
 
@@ -1023,16 +1027,16 @@ footer a:hover {
 </table>
 
 <div class="callout">
-  <strong>Verify the id_token signature.</strong> Decode the JWT and verify the HS512 signature
-  using your <code>client_secret</code> as the key. Reject tokens with mismatched signatures,
-  expired <code>exp</code>, or incorrect <code>aud</code>.
+  <strong>Verify the id_token signature.</strong> Fetch the RSA public key from <code>/oauth/jwks</code>
+  and verify the RS256 signature. Reject tokens with mismatched signatures,
+  expired <code>exp</code>, or incorrect <code>aud</code>. Standard OIDC libraries handle this automatically.
 </div>
 
 <!-- ======== CODE SAMPLES ======== -->
 <h2 id="code-samples">Code Samples</h2>
 <p>
-  Configure your OIDC client library to use HS512 and client_secret_post. Below are
-  examples for popular languages.
+  MILNET SSO uses RS256 (asymmetric RSA). Standard OIDC client libraries work out of the box.
+  Below are examples for popular languages.
 </p>
 
 <div class="lang-tabs" id="langTabs">
@@ -1061,17 +1065,20 @@ oauth.<span class="fn">register</span>(
     <span class="key">server_metadata_url</span>=<span class="str">"https://sso.example.mil/.well-known/openid-configuration"</span>,
     <span class="key">client_kwargs</span>={
         <span class="str">"scope"</span>: <span class="str">"openid"</span>,
-        <span class="cmt"># HS512 — use client_secret as HMAC key</span>
         <span class="str">"token_endpoint_auth_method"</span>: <span class="str">"client_secret_post"</span>,
     },
 )
 
-<span class="cmt"># Verify the id_token with HS512</span>
-<span class="kw">import</span> jwt  <span class="cmt"># pip install PyJWT</span>
+<span class="cmt"># Verify the id_token with RS256 (uses JWKS automatically)</span>
+<span class="kw">import</span> jwt  <span class="cmt"># pip install PyJWT cryptography</span>
+<span class="kw">from</span> jwt <span class="kw">import</span> PyJWKClient
+
+jwks_client = PyJWKClient(<span class="str">"https://sso.example.mil/oauth/jwks"</span>)
+signing_key = jwks_client.<span class="fn">get_signing_key_from_jwt</span>(id_token)
 <span class="key">decoded</span> = jwt.<span class="fn">decode</span>(
     id_token,
-    <span class="str">"your_client_secret"</span>,
-    <span class="key">algorithms</span>=[<span class="str">"HS512"</span>],
+    signing_key.<span class="fn">key</span>,
+    <span class="key">algorithms</span>=[<span class="str">"RS256"</span>],
     <span class="key">audience</span>=<span class="str">"your_client_id"</span>,
 )
 <span class="fn">print</span>(decoded[<span class="str">"sub"</span>], decoded[<span class="str">"tier"</span>])</pre>
@@ -1095,15 +1102,12 @@ oauth.<span class="fn">register</span>(
   <span class="key">client_secret</span>: <span class="str">'your_client_secret'</span>,
   <span class="key">response_types</span>: [<span class="str">'code'</span>],
   <span class="key">token_endpoint_auth_method</span>: <span class="str">'client_secret_post'</span>,
-  <span class="key">id_token_signed_response_alg</span>: <span class="str">'HS512'</span>,
+  <span class="key">id_token_signed_response_alg</span>: <span class="str">'RS256'</span>,
 });
 
-<span class="cmt">// Verify id_token manually with HS512</span>
-<span class="kw">const</span> decoded = jwt.<span class="fn">verify</span>(
-  idToken,
-  <span class="str">'your_client_secret'</span>,
-  { <span class="key">algorithms</span>: [<span class="str">'HS512'</span>], <span class="key">audience</span>: <span class="str">'your_client_id'</span> }
-);
+<span class="cmt">// Verify id_token with RS256 (uses JWKS automatically via openid-client)</span>
+<span class="kw">const</span> tokenSet = <span class="kw">await</span> client.<span class="fn">callback</span>(redirectUri, params, { state });
+<span class="kw">const</span> decoded = tokenSet.<span class="fn">claims</span>();
 console.<span class="fn">log</span>(decoded.sub, decoded.tier);</pre>
 </div>
 </div>
@@ -1113,11 +1117,14 @@ console.<span class="fn">log</span>(decoded.sub, decoded.tier);</pre>
 <div class="code-wrap">
   <button class="copy-btn" onclick="copyCode(this)">Copy</button>
   <pre class="code-block"><span class="cmt">// build.gradle: implementation 'com.auth0:java-jwt:4.4.0'</span>
+<span class="cmt">// build.gradle: implementation 'com.auth0:jwks-rsa:0.22.1'</span>
 <span class="kw">import</span> com.auth0.jwt.JWT;
 <span class="kw">import</span> com.auth0.jwt.algorithms.Algorithm;
+<span class="kw">import</span> com.auth0.jwk.JwkProviderBuilder;
 
-<span class="kw">String</span> clientSecret = <span class="str">"your_client_secret"</span>;
-Algorithm algorithm = Algorithm.<span class="fn">HMAC512</span>(clientSecret);
+<span class="kw">var</span> provider = <span class="kw">new</span> <span class="fn">JwkProviderBuilder</span>(<span class="str">"https://sso.example.mil"</span>).<span class="fn">build</span>();
+<span class="kw">var</span> jwk = provider.<span class="fn">get</span>(<span class="str">"milnet-rs256-v1"</span>);
+Algorithm algorithm = Algorithm.<span class="fn">RSA256</span>((RSAPublicKey) jwk.<span class="fn">getPublicKey</span>(), <span class="fn">null</span>);
 
 <span class="kw">var</span> verifier = JWT.<span class="fn">require</span>(algorithm)
     .<span class="fn">withIssuer</span>(<span class="str">"https://sso.example.mil"</span>)
@@ -1142,14 +1149,17 @@ Algorithm algorithm = Algorithm.<span class="fn">HMAC512</span>(clientSecret);
     jwt <span class="str">"github.com/golang-jwt/jwt/v5"</span>
 )
 
-<span class="kw">func</span> <span class="fn">verifyIDToken</span>(idToken, clientSecret <span class="kw">string</span>) {
+<span class="kw">func</span> <span class="fn">verifyIDToken</span>(idToken <span class="kw">string</span>) {
+    <span class="cmt">// Fetch JWKS and verify RS256</span>
+    keySet, _ := jwk.<span class="fn">Fetch</span>(context.<span class="fn">Background</span>(), <span class="str">"https://sso.example.mil/oauth/jwks"</span>)
     token, err := jwt.<span class="fn">Parse</span>(idToken, <span class="kw">func</span>(t *jwt.Token) (<span class="kw">interface</span>{}, <span class="kw">error</span>) {
-        <span class="cmt">// Enforce HS512</span>
-        <span class="kw">if</span> _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+        <span class="kw">if</span> _, ok := t.Method.(*jwt.SigningMethodRSA); !ok {
             <span class="kw">return</span> <span class="fn">nil</span>, fmt.<span class="fn">Errorf</span>(<span class="str">"unexpected signing method: %v"</span>, t.Header[<span class="str">"alg"</span>])
         }
-        <span class="kw">return</span> []<span class="fn">byte</span>(clientSecret), <span class="fn">nil</span>
-    }, jwt.<span class="fn">WithValidMethods</span>([]<span class="kw">string</span>{<span class="str">"HS512"</span>}))
+        kid := t.Header[<span class="str">"kid"</span>].(<span class="kw">string</span>)
+        key, _ := keySet.<span class="fn">LookupKeyID</span>(kid)
+        <span class="kw">return</span> key.<span class="fn">Materialize</span>()
+    }, jwt.<span class="fn">WithValidMethods</span>([]<span class="kw">string</span>{<span class="str">"RS256"</span>}))
 
     <span class="kw">if</span> err != <span class="fn">nil</span> {
         panic(err)
@@ -1176,11 +1186,12 @@ Algorithm algorithm = Algorithm.<span class="fn">HMAC512</span>(clientSecret);
     exp: usize,
 }
 
-<span class="kw">fn</span> <span class="fn">verify_id_token</span>(id_token: &amp;<span class="kw">str</span>, client_secret: &amp;<span class="kw">str</span>) -&gt; Claims {
-    <span class="kw">let mut</span> validation = Validation::<span class="fn">new</span>(Algorithm::HS512);
+<span class="kw">fn</span> <span class="fn">verify_id_token</span>(id_token: &amp;<span class="kw">str</span>, jwks_pem: &amp;[u8]) -&gt; Claims {
+    <span class="kw">let mut</span> validation = Validation::<span class="fn">new</span>(Algorithm::RS256);
     validation.set_audience(&amp;[<span class="str">"your_client_id"</span>]);
 
-    <span class="kw">let</span> key = DecodingKey::<span class="fn">from_secret</span>(client_secret.<span class="fn">as_bytes</span>());
+    <span class="kw">let</span> key = DecodingKey::<span class="fn">from_rsa_pem</span>(jwks_pem)
+        .<span class="fn">expect</span>(<span class="str">"invalid RSA public key"</span>);
     <span class="kw">let</span> data = <span class="fn">decode</span>::&lt;Claims&gt;(id_token, &amp;key, &amp;validation)
         .<span class="fn">expect</span>(<span class="str">"token verification failed"</span>);
     data.claims
@@ -1196,13 +1207,15 @@ Algorithm algorithm = Algorithm.<span class="fn">HMAC512</span>(clientSecret);
 <span class="kw">use</span> Firebase\JWT\JWT;
 <span class="kw">use</span> Firebase\JWT\Key;
 
-<span class="key">$clientSecret</span> = <span class="str">'your_client_secret'</span>;
-<span class="key">$idToken</span>      = <span class="str">'eyJhbGciOiJIUzUxMiJ9...'</span>;
+<span class="key">$idToken</span> = <span class="str">'eyJhbGciOiJSUzI1NiJ9...'</span>;
 
-<span class="cmt">// Decode and verify with HS512</span>
+<span class="cmt">// Fetch JWKS and verify with RS256</span>
+<span class="key">$jwks</span> = <span class="fn">json_decode</span>(<span class="fn">file_get_contents</span>(
+    <span class="str">'https://sso.example.mil/oauth/jwks'</span>
+), <span class="fn">true</span>);
 <span class="key">$decoded</span> = JWT::<span class="fn">decode</span>(
     <span class="key">$idToken</span>,
-    <span class="kw">new</span> <span class="fn">Key</span>(<span class="key">$clientSecret</span>, <span class="str">'HS512'</span>)
+    JWK::<span class="fn">parseKeySet</span>(<span class="key">$jwks</span>)
 );
 
 <span class="fn">echo</span> <span class="key">$decoded</span>-&gt;sub;   <span class="cmt">// user UUID</span>
@@ -1219,17 +1232,17 @@ Algorithm algorithm = Algorithm.<span class="fn">HMAC512</span>(clientSecret);
 <span class="kw">using</span> Microsoft.IdentityModel.Tokens;
 <span class="kw">using</span> System.Text;
 
-<span class="kw">var</span> secret = <span class="str">"your_client_secret"</span>;
-<span class="kw">var</span> key = <span class="kw">new</span> <span class="fn">SymmetricSecurityKey</span>(
-    Encoding.UTF8.<span class="fn">GetBytes</span>(secret)
-);
-
+<span class="cmt">// RS256 with JWKS auto-discovery</span>
 <span class="kw">var</span> parameters = <span class="kw">new</span> <span class="fn">TokenValidationParameters</span> {
     <span class="key">ValidIssuer</span>           = <span class="str">"https://sso.example.mil"</span>,
     <span class="key">ValidAudience</span>         = <span class="str">"your_client_id"</span>,
-    <span class="key">IssuerSigningKey</span>      = key,
-    <span class="key">ValidAlgorithms</span>       = <span class="kw">new</span>[] { <span class="str">"HS512"</span> },
+    <span class="key">ValidAlgorithms</span>       = <span class="kw">new</span>[] { <span class="str">"RS256"</span> },
     <span class="key">ValidateLifetime</span>     = <span class="fn">true</span>,
+    <span class="key">IssuerSigningKeyResolver</span> = (token, secToken, kid, parameters) =&gt; {
+        <span class="kw">var</span> jwks = <span class="kw">new</span> <span class="fn">HttpClient</span>()
+            .<span class="fn">GetStringAsync</span>(<span class="str">"https://sso.example.mil/oauth/jwks"</span>).<span class="fn">Result</span>;
+        <span class="kw">return new</span> <span class="fn">JsonWebKeySet</span>(jwks).<span class="fn">GetSigningKeys</span>();
+    },
 };
 
 <span class="kw">var</span> handler = <span class="kw">new</span> <span class="fn">JwtSecurityTokenHandler</span>();
@@ -1319,7 +1332,7 @@ code_challenge_method=S256"</span></pre>
 <div class="code-wrap">
   <button class="copy-btn" onclick="copyCode(this)">Copy</button>
   <pre class="code-block"><span class="cmt"># Decode the JWT payload (base64url decode the second segment)</span>
-<span class="key">ID_TOKEN</span>=<span class="str">"eyJhbGciOiJIUzUxMiJ9.eyJpc3Mi..."</span>
+<span class="key">ID_TOKEN</span>=<span class="str">"eyJhbGciOiJSUzI1NiJ9.eyJpc3Mi..."</span>
 
 <span class="fn">echo</span> "$ID_TOKEN" | cut -d. -f2 \
   | tr '_-' '/+' \
@@ -1339,12 +1352,12 @@ code_challenge_method=S256"</span></pre>
   <li>Contact the SSO operator (Tier 1 / Sovereign user).</li>
   <li>Provide your application name, description, and redirect URIs.</li>
   <li>The operator will create the client via the admin panel and provide your <code>client_id</code> and <code>client_secret</code>.</li>
-  <li>Store the <code>client_secret</code> securely. It is used both for token exchange and for HS512 signature verification.</li>
+  <li>Store the <code>client_secret</code> securely. It is used for the token exchange request.</li>
 </ol>
 
 <div class="callout">
-  <strong>Keep your client_secret safe.</strong> With HS512, the client_secret is the signing key.
-  Anyone with your secret can forge valid id_tokens for your client. Treat it like a private key.
+  <strong>Keep your client_secret safe.</strong> The client_secret authenticates your application during
+  token exchange. ID tokens are signed with RS256 — verify them using the public key from <code>/oauth/jwks</code>.
 </div>
 
 <h3>Quick Reference Summary</h3>
@@ -1353,7 +1366,7 @@ code_challenge_method=S256"</span></pre>
     <tr><th>Property</th><th>Value</th></tr>
   </thead>
   <tbody>
-    <tr><td>Signing Algorithm</td><td>HS512 (HMAC-SHA512)</td></tr>
+    <tr><td>Signing Algorithm</td><td>RS256 (RSA-SHA256)</td></tr>
     <tr><td>Token Auth Method</td><td>client_secret_post (no Basic Auth)</td></tr>
     <tr><td>Auth Code Lifetime</td><td>60 seconds</td></tr>
     <tr><td>Access Token Format</td><td>UUID (not JWT)</td></tr>

@@ -25,7 +25,7 @@ impl OpenIdConfiguration {
             jwks_uri: format!("{issuer}/oauth/jwks"),
             response_types_supported: vec!["code".into()],
             subject_types_supported: vec!["public".into()],
-            id_token_signing_alg_values_supported: vec!["HS512".into()],
+            id_token_signing_alg_values_supported: vec!["RS256".into()],
             scopes_supported: vec!["openid".into(), "profile".into(), "email".into()],
             token_endpoint_auth_methods_supported: vec!["client_secret_post".into()],
             code_challenge_methods_supported: vec!["S256".into()],

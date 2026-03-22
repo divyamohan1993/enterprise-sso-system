@@ -31,7 +31,7 @@ fn test_invalid_tier_returns_zero() {
 #[test]
 fn test_max_ratchet_epochs() {
     let c = SecurityConfig::default();
-    assert_eq!(c.max_ratchet_epochs(), 960); // 28800/30
+    assert_eq!(c.max_ratchet_epochs(), 2880); // 28800/10
 }
 
 #[test]
@@ -108,9 +108,15 @@ fn test_tier1_shorter_than_tier3() {
 }
 
 #[test]
-fn test_ratchet_lookahead_is_3() {
+fn test_ratchet_lookahead_is_1() {
     let c = SecurityConfig::default();
-    assert_eq!(c.ratchet_lookahead_epochs, 3);
+    assert_eq!(c.ratchet_lookahead_epochs, 1);
+}
+
+#[test]
+fn test_ratchet_epoch_is_10s() {
+    let c = SecurityConfig::default();
+    assert_eq!(c.ratchet_epoch_secs, 10);
 }
 
 #[test]

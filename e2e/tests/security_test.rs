@@ -474,6 +474,6 @@ fn security_config_defaults_are_sane() {
     // DDoS puzzle difficulty must be higher than normal
     assert!(cfg.puzzle_difficulty_ddos > cfg.puzzle_difficulty_normal);
 
-    // Max ratchet epochs matches expected (28800 / 30 = 960)
-    assert_eq!(cfg.max_ratchet_epochs(), 960);
+    // Max ratchet epochs matches expected (28800 / 10 = 2880)
+    assert_eq!(cfg.max_ratchet_epochs(), 2880);
 }

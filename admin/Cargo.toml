@@ -33,3 +33,4 @@ sqlx.workspace = true
 postcard = { workspace = true, features = ["alloc"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 urlencoding = "2"
+rsa.workspace = true
