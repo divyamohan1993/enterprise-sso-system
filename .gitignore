@@ -56,7 +56,7 @@ temp/
 # Debug
 .debug/
 
-# Terraform
+# Terraform state (generated)
 terraform/.terraform/
 terraform/.terraform.lock.hcl
 terraform/terraform.tfstate
@@ -65,10 +65,17 @@ terraform/terraform.tfstate.backup
 *.tfstate.backup
 .terraform/
 
-# Database
+# Database (generated)
 *.db
 *.sqlite
 
 # Runtime
-milnet-sso.db
 *.pid
+
+# Screenshots (generated during testing)
+*.png
+*.jpg
+*.jpeg
+
+# Playwright
+.playwright-mcp/
