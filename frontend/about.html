@@ -1,0 +1,703 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MILNET SSO — The Most Secure Authentication System Ever Built</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700;800&display=swap');
+
+*, *::before, *::after {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+:root {
+  --green: #00ff41;
+  --cyan: #00d4ff;
+  --bg: #0a0a0a;
+  --text: #e0e0e0;
+  --dim: #666;
+  --surface: #111;
+}
+
+html {
+  scroll-behavior: smooth;
+  scroll-snap-type: y mandatory;
+}
+
+body {
+  font-family: 'JetBrains Mono', monospace;
+  background: var(--bg);
+  color: var(--text);
+  overflow-x: hidden;
+  line-height: 1.6;
+}
+
+/* Scroll-snap sections */
+section {
+  min-height: 100vh;
+  scroll-snap-align: start;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  padding: 4rem 2rem;
+  position: relative;
+  overflow: hidden;
+}
+
+/* Fade-in animation */
+.reveal {
+  opacity: 0;
+  transform: translateY(60px);
+  transition: opacity 0.9s cubic-bezier(0.22, 1, 0.36, 1),
+              transform 0.9s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.reveal.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.reveal-delay-1 { transition-delay: 0.15s; }
+.reveal-delay-2 { transition-delay: 0.3s; }
+.reveal-delay-3 { transition-delay: 0.45s; }
+.reveal-delay-4 { transition-delay: 0.6s; }
+
+/* Typography */
+.headline {
+  font-size: clamp(2.5rem, 7vw, 6rem);
+  font-weight: 800;
+  text-align: center;
+  letter-spacing: -0.03em;
+  line-height: 1.1;
+}
+
+.subheadline {
+  font-size: clamp(1.2rem, 2.5vw, 1.8rem);
+  font-weight: 300;
+  text-align: center;
+  max-width: 800px;
+  color: var(--dim);
+  margin-top: 1.5rem;
+}
+
+.accent-green { color: var(--green); }
+.accent-cyan { color: var(--cyan); }
+
+.section-label {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.3em;
+  color: var(--cyan);
+  margin-bottom: 2rem;
+}
+
+.body-text {
+  font-size: clamp(1rem, 1.5vw, 1.2rem);
+  font-weight: 300;
+  max-width: 700px;
+  text-align: center;
+  color: var(--dim);
+  margin-top: 1.5rem;
+  line-height: 1.8;
+}
+
+.bold-statement {
+  font-size: clamp(1.5rem, 3.5vw, 2.8rem);
+  font-weight: 700;
+  text-align: center;
+  max-width: 900px;
+  line-height: 1.3;
+}
+
+/* ============================== */
+/* HERO                           */
+/* ============================== */
+.hero {
+  position: relative;
+}
+
+.hero-title {
+  font-size: clamp(4rem, 12vw, 10rem);
+  font-weight: 800;
+  letter-spacing: -0.04em;
+  background: linear-gradient(135deg, var(--green), var(--cyan));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  position: relative;
+  z-index: 1;
+}
+
+.hero-border {
+  position: absolute;
+  inset: -4px;
+  border-radius: 24px;
+  padding: 4px;
+  background: linear-gradient(135deg, var(--green), var(--cyan), var(--green));
+  background-size: 300% 300%;
+  animation: gradient-shift 6s ease infinite;
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  opacity: 0.4;
+  z-index: 0;
+}
+
+@keyframes gradient-shift {
+  0%, 100% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+}
+
+.hero-wrapper {
+  position: relative;
+  padding: 3rem 4rem;
+}
+
+.hero-subtitle {
+  font-size: clamp(1rem, 2vw, 1.5rem);
+  font-weight: 300;
+  color: var(--dim);
+  margin-top: 1.5rem;
+  text-align: center;
+}
+
+/* Scroll indicator */
+.scroll-hint {
+  position: absolute;
+  bottom: 3rem;
+  animation: float 2.5s ease-in-out infinite;
+  color: var(--dim);
+  font-size: 0.8rem;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+}
+
+@keyframes float {
+  0%, 100% { transform: translateY(0); opacity: 0.4; }
+  50% { transform: translateY(12px); opacity: 1; }
+}
+
+/* ============================== */
+/* DIAGRAM (Section 2)            */
+/* ============================== */
+.diagram {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-top: 3rem;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.diagram-node {
+  background: var(--surface);
+  border: 1px solid #222;
+  border-radius: 12px;
+  padding: 1.2rem 1.8rem;
+  font-size: 0.95rem;
+  font-weight: 500;
+  text-align: center;
+  min-width: 100px;
+  transition: border-color 0.3s, box-shadow 0.3s;
+}
+
+.diagram-node:hover {
+  border-color: var(--cyan);
+  box-shadow: 0 0 30px rgba(0, 212, 255, 0.15);
+}
+
+.diagram-node.primary {
+  border-color: var(--green);
+  color: var(--green);
+}
+
+.diagram-arrow {
+  color: var(--dim);
+  font-size: 1.5rem;
+}
+
+/* ============================== */
+/* THRESHOLD VISUAL (Section 5)   */
+/* ============================== */
+.nodes-visual {
+  display: flex;
+  gap: 1.5rem;
+  margin-top: 3rem;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.node-circle {
+  width: 70px;
+  height: 70px;
+  border-radius: 50%;
+  border: 2px solid #333;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.8rem;
+  font-weight: 700;
+  transition: all 0.4s;
+}
+
+.node-circle.active {
+  border-color: var(--green);
+  color: var(--green);
+  box-shadow: 0 0 25px rgba(0, 255, 65, 0.3);
+}
+
+.node-circle.inactive {
+  border-color: #333;
+  color: #444;
+}
+
+/* ============================== */
+/* CODE BLOCK (Section 9)         */
+/* ============================== */
+.code-block {
+  background: #0d0d0d;
+  border: 1px solid #1a1a1a;
+  border-radius: 12px;
+  padding: 2rem 2.5rem;
+  margin-top: 2rem;
+  font-size: clamp(0.8rem, 1.2vw, 1rem);
+  color: var(--green);
+  max-width: 700px;
+  width: 100%;
+  overflow-x: auto;
+  position: relative;
+}
+
+.code-block .prompt {
+  color: var(--cyan);
+  user-select: none;
+}
+
+/* ============================== */
+/* FEATURE GRID (Section 7)       */
+/* ============================== */
+.feature-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 1.2rem;
+  margin-top: 3rem;
+  max-width: 800px;
+  width: 100%;
+}
+
+.feature-card {
+  background: var(--surface);
+  border: 1px solid #1a1a1a;
+  border-radius: 10px;
+  padding: 1.5rem;
+  text-align: center;
+  font-size: 0.85rem;
+  transition: border-color 0.3s, transform 0.3s;
+}
+
+.feature-card:hover {
+  border-color: var(--green);
+  transform: translateY(-4px);
+}
+
+.feature-card .label {
+  color: var(--green);
+  font-weight: 700;
+  margin-bottom: 0.4rem;
+  font-size: 0.9rem;
+}
+
+/* ============================== */
+/* STATS (Section 8)              */
+/* ============================== */
+.stats-row {
+  display: flex;
+  gap: 4rem;
+  margin-top: 3rem;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.stat {
+  text-align: center;
+}
+
+.stat-number {
+  font-size: clamp(3rem, 6vw, 5rem);
+  font-weight: 800;
+  background: linear-gradient(135deg, var(--green), var(--cyan));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.stat-label {
+  font-size: 0.85rem;
+  color: var(--dim);
+  margin-top: 0.5rem;
+}
+
+/* ============================== */
+/* TECH LIST (Section 10)         */
+/* ============================== */
+.tech-list {
+  list-style: none;
+  margin-top: 2.5rem;
+  text-align: left;
+  max-width: 500px;
+}
+
+.tech-list li {
+  padding: 0.8rem 0;
+  border-bottom: 1px solid #1a1a1a;
+  font-size: 1rem;
+  font-weight: 400;
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.tech-list li .check {
+  color: var(--green);
+  font-weight: 700;
+}
+
+/* ============================== */
+/* FOOTER                         */
+/* ============================== */
+footer {
+  padding: 4rem 2rem;
+  text-align: center;
+  border-top: 1px solid #1a1a1a;
+  color: var(--dim);
+  font-size: 0.85rem;
+  min-height: auto;
+}
+
+footer a {
+  color: var(--cyan);
+  text-decoration: none;
+  transition: color 0.2s;
+}
+
+footer a:hover {
+  color: var(--green);
+}
+
+.footer-links {
+  display: flex;
+  gap: 2rem;
+  justify-content: center;
+  margin-top: 1.5rem;
+  flex-wrap: wrap;
+}
+
+/* Separator dots between sections */
+.section-sep {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--dim);
+  margin: 0 auto;
+  opacity: 0.3;
+}
+
+/* Quote style */
+.quote {
+  font-style: italic;
+  color: var(--cyan);
+  font-size: clamp(1.1rem, 2vw, 1.5rem);
+  max-width: 700px;
+  text-align: center;
+  margin-top: 2rem;
+  font-weight: 300;
+}
+
+.pill {
+  display: inline-block;
+  background: rgba(0, 255, 65, 0.08);
+  border: 1px solid rgba(0, 255, 65, 0.2);
+  border-radius: 100px;
+  padding: 0.4rem 1.2rem;
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: var(--green);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+/* Responsive */
+@media (max-width: 600px) {
+  section {
+    padding: 3rem 1.5rem;
+  }
+  .diagram {
+    flex-direction: column;
+  }
+  .diagram-arrow {
+    transform: rotate(90deg);
+  }
+  .stats-row {
+    gap: 2rem;
+  }
+}
+</style>
+</head>
+<body>
+
+<!-- ============================================ -->
+<!-- HERO                                         -->
+<!-- ============================================ -->
+<section class="hero">
+  <div class="hero-wrapper reveal">
+    <div class="hero-border"></div>
+    <div class="hero-title">MILNET SSO</div>
+  </div>
+  <p class="hero-subtitle reveal reveal-delay-1">The most secure authentication system ever built.</p>
+  <div class="scroll-hint">Scroll</div>
+</section>
+
+<!-- ============================================ -->
+<!-- THE PROBLEM                                  -->
+<!-- ============================================ -->
+<section>
+  <span class="section-label reveal">The Problem</span>
+  <h2 class="bold-statement reveal reveal-delay-1">
+    Every authentication system trusts something.<br>
+    <span class="accent-green">We trust nothing.</span>
+  </h2>
+  <p class="body-text reveal reveal-delay-2">
+    Our threat model assumes nation-state adversaries, total host compromise, and raw internet exposure.
+    If your security relies on a perimeter, you have no security.
+  </p>
+</section>
+
+<!-- ============================================ -->
+<!-- ONE LOGIN                                    -->
+<!-- ============================================ -->
+<section>
+  <span class="section-label reveal">Single Sign-On</span>
+  <h2 class="headline reveal reveal-delay-1">
+    One Login. <span class="accent-cyan">Every Service.</span>
+  </h2>
+  <div class="diagram reveal reveal-delay-2">
+    <div class="diagram-node">User</div>
+    <span class="diagram-arrow">&rarr;</span>
+    <div class="diagram-node primary">SSO</div>
+    <span class="diagram-arrow">&rarr;</span>
+    <div class="diagram-node">JWT</div>
+    <span class="diagram-arrow">&rarr;</span>
+    <div class="diagram-node">Portal A</div>
+    <span class="diagram-arrow">&rarr;</span>
+    <div class="diagram-node">Portal B</div>
+    <span class="diagram-arrow">&rarr;</span>
+    <div class="diagram-node">Portal C</div>
+  </div>
+  <p class="quote reveal reveal-delay-3">Authenticate once. Access everything. Securely.</p>
+</section>
+
+<!-- ============================================ -->
+<!-- POST-QUANTUM                                 -->
+<!-- ============================================ -->
+<section>
+  <span class="section-label reveal">Post-Quantum Cryptography</span>
+  <h2 class="headline reveal reveal-delay-1">
+    Post-Quantum. <span class="accent-green">Today.</span>
+  </h2>
+  <p class="body-text reveal reveal-delay-2">
+    While others plan for quantum threats, we are already protected.
+  </p>
+  <div class="feature-grid reveal reveal-delay-3" style="max-width: 600px;">
+    <div class="feature-card">
+      <div class="label">ML-KEM-768</div>
+      FIPS 203 &mdash; hybrid key encapsulation with X25519
+    </div>
+    <div class="feature-card">
+      <div class="label">ML-DSA-65</div>
+      FIPS 204 &mdash; post-quantum token signatures
+    </div>
+  </div>
+  <p class="quote reveal reveal-delay-4">Your tokens are quantum-safe right now.</p>
+</section>
+
+<!-- ============================================ -->
+<!-- OPAQUE                                       -->
+<!-- ============================================ -->
+<section>
+  <span class="section-label reveal">Zero-Knowledge Auth</span>
+  <h2 class="headline reveal reveal-delay-1">
+    Your Password?<br><span class="accent-cyan">We Never See It.</span>
+  </h2>
+  <p class="body-text reveal reveal-delay-2">
+    The OPAQUE protocol authenticates you without the server ever knowing your password.
+  </p>
+  <div style="margin-top: 2rem; display: flex; gap: 1.5rem; flex-wrap: wrap; justify-content: center;" class="reveal reveal-delay-3">
+    <span class="pill">Not Hashed</span>
+    <span class="pill">Not Encrypted</span>
+    <span class="pill">Never Transmitted</span>
+  </div>
+</section>
+
+<!-- ============================================ -->
+<!-- THRESHOLD TRUST                              -->
+<!-- ============================================ -->
+<section>
+  <span class="section-label reveal">Threshold Cryptography</span>
+  <h2 class="headline reveal reveal-delay-1">
+    Threshold <span class="accent-green">Trust</span>
+  </h2>
+  <p class="body-text reveal reveal-delay-2">
+    FROST 3-of-5 threshold signing. No single server can forge a token. Ever.
+  </p>
+  <div class="nodes-visual reveal reveal-delay-3">
+    <div class="node-circle active">S1</div>
+    <div class="node-circle active">S2</div>
+    <div class="node-circle active">S3</div>
+    <div class="node-circle inactive">S4</div>
+    <div class="node-circle inactive">S5</div>
+  </div>
+  <p class="quote reveal reveal-delay-4">3 of 5 nodes must agree to sign.</p>
+</section>
+
+<!-- ============================================ -->
+<!-- FORWARD SECRECY                              -->
+<!-- ============================================ -->
+<section>
+  <span class="section-label reveal">Forward Secrecy</span>
+  <h2 class="headline reveal reveal-delay-1">
+    The Past Stays <span class="accent-cyan">in the Past.</span>
+  </h2>
+  <p class="body-text reveal reveal-delay-2">
+    Ratcheting sessions ensure every token expires and every key is destroyed.
+    Compromise a future key and the past remains sealed.
+  </p>
+  <div style="margin-top: 2.5rem; display: flex; gap: 0.5rem; align-items: center;" class="reveal reveal-delay-3">
+    <div style="width: 40px; height: 40px; border-radius: 8px; background: var(--green); opacity: 0.15;"></div>
+    <div style="width: 40px; height: 40px; border-radius: 8px; background: var(--green); opacity: 0.3;"></div>
+    <div style="width: 40px; height: 40px; border-radius: 8px; background: var(--green); opacity: 0.5;"></div>
+    <div style="width: 40px; height: 40px; border-radius: 8px; background: var(--green); opacity: 0.7;"></div>
+    <div style="width: 40px; height: 40px; border-radius: 8px; background: var(--green); opacity: 1.0;"></div>
+    <span style="margin-left: 1rem; color: var(--dim); font-size: 0.8rem;">Key ratchet &rarr; each epoch is independent</span>
+  </div>
+</section>
+
+<!-- ============================================ -->
+<!-- DEFENSE IN DEPTH                             -->
+<!-- ============================================ -->
+<section>
+  <span class="section-label reveal">Architecture</span>
+  <h2 class="headline reveal reveal-delay-1">
+    Defense <span class="accent-green">in Depth</span>
+  </h2>
+  <p class="bold-statement reveal reveal-delay-2" style="font-size: clamp(1.1rem, 2vw, 1.6rem);">
+    9 isolated modules. Compromise one. The rest hold.
+  </p>
+  <div class="feature-grid reveal reveal-delay-3">
+    <div class="feature-card"><div class="label">Crypto</div>PQ primitives</div>
+    <div class="feature-card"><div class="label">OPAQUE</div>Blind auth</div>
+    <div class="feature-card"><div class="label">TSS</div>Key sharding</div>
+    <div class="feature-card"><div class="label">Ratchet</div>Forward secrecy</div>
+    <div class="feature-card"><div class="label">Audit</div>Hash-chained logs</div>
+    <div class="feature-card"><div class="label">KT</div>Key transparency</div>
+    <div class="feature-card"><div class="label">Risk</div>Adaptive scoring</div>
+    <div class="feature-card"><div class="label">FIDO2</div>WebAuthn</div>
+    <div class="feature-card"><div class="label">Gateway</div>Rate limiting</div>
+  </div>
+</section>
+
+<!-- ============================================ -->
+<!-- BATTLE-TESTED                                -->
+<!-- ============================================ -->
+<section>
+  <span class="section-label reveal">Assurance</span>
+  <h2 class="headline reveal reveal-delay-1">
+    Battle-<span class="accent-cyan">Tested.</span>
+  </h2>
+  <div class="stats-row reveal reveal-delay-2">
+    <div class="stat">
+      <div class="stat-number">169</div>
+      <div class="stat-label">Attack scenarios analyzed</div>
+    </div>
+    <div class="stat">
+      <div class="stat-number">200+</div>
+      <div class="stat-label">Automated tests</div>
+    </div>
+    <div class="stat">
+      <div class="stat-number">9</div>
+      <div class="stat-label">Isolated modules</div>
+    </div>
+  </div>
+  <p class="quote reveal reveal-delay-3">We attacked ourselves so you don't have to.</p>
+</section>
+
+<!-- ============================================ -->
+<!-- ONE CLICK DEPLOY                             -->
+<!-- ============================================ -->
+<section>
+  <span class="section-label reveal">Deployment</span>
+  <h2 class="headline reveal reveal-delay-1">
+    One Click <span class="accent-green">Deploy</span>
+  </h2>
+  <div class="code-block reveal reveal-delay-2">
+    <span class="prompt">$</span> git clone https://github.com/divyamohan1993/enterprise-sso-system.git<br>
+    <span class="prompt">$</span> cd enterprise-sso-system/terraform<br>
+    <span class="prompt">$</span> terraform apply
+  </div>
+  <p class="quote reveal reveal-delay-3">From zero to military-grade SSO in 10 minutes.</p>
+</section>
+
+<!-- ============================================ -->
+<!-- BUILT FOR THE FUTURE                         -->
+<!-- ============================================ -->
+<section>
+  <span class="section-label reveal">Standards</span>
+  <h2 class="headline reveal reveal-delay-1">
+    Built for the <span class="accent-cyan">Future</span>
+  </h2>
+  <ul class="tech-list reveal reveal-delay-2">
+    <li><span class="check">+</span> OIDC / OAuth 2.0 standard flows</li>
+    <li><span class="check">+</span> FIDO2 / WebAuthn passwordless</li>
+    <li><span class="check">+</span> PostgreSQL persistence</li>
+    <li><span class="check">+</span> Terraform infrastructure-as-code</li>
+    <li><span class="check">+</span> Auto-update from GitHub</li>
+    <li><span class="check">+</span> Docker &amp; Compose ready</li>
+  </ul>
+</section>
+
+<!-- ============================================ -->
+<!-- FOOTER                                       -->
+<!-- ============================================ -->
+<footer>
+  <p>Built by <strong>Divya Mohan</strong> + <strong>Claude</strong> (Anthropic)</p>
+  <div class="footer-links">
+    <a href="https://github.com/divyamohan1993/enterprise-sso-system" target="_blank">GitHub</a>
+    <a href="https://sso-system-demo.dmj.one" target="_blank">Live Demo</a>
+    <a href="/pitch.html">Pitch Deck</a>
+    <a href="/">Dashboard</a>
+  </div>
+</footer>
+
+<!-- Minimal JS for scroll reveal -->
+<script>
+(function() {
+  const observer = new IntersectionObserver(function(entries) {
+    entries.forEach(function(entry) {
+      if (entry.isIntersecting) {
+        entry.target.classList.add('visible');
+      }
+    });
+  }, { threshold: 0.15 });
+
+  document.querySelectorAll('.reveal').forEach(function(el) {
+    observer.observe(el);
+  });
+})();
+</script>
+
+</body>
+</html>

@@ -55,6 +55,8 @@ async fn auth_middleware(
         || path.starts_with("/api/auth/")
         || path.starts_with("/api/setup")
         || path == "/"
+        || path == "/about"
+        || path == "/pitch"
         || path.ends_with(".html")
         || path.ends_with(".css")
         || path.ends_with(".js")
@@ -286,6 +288,9 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/fido/register/complete", post(fido_register_complete))
         .route("/api/fido/authenticate/begin", post(fido_authenticate_begin))
         .route("/api/fido/authenticate/complete", post(fido_authenticate_complete))
+        // Static page redirects
+        .route("/about", get(|| async { axum::response::Redirect::permanent("/about.html") }))
+        .route("/pitch", get(|| async { axum::response::Redirect::permanent("/pitch.html") }))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state)
         .layer(tower_http::cors::CorsLayer::permissive())

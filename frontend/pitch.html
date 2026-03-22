@@ -1,0 +1,698 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MILNET SSO — Pitch Deck</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700;800&display=swap');
+
+*, *::before, *::after {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+:root {
+  --green: #00ff41;
+  --cyan: #00d4ff;
+  --bg: #0a0a0a;
+  --text: #e0e0e0;
+  --dim: #666;
+  --surface: #111;
+}
+
+html {
+  scroll-behavior: smooth;
+  scroll-snap-type: y mandatory;
+  overflow-x: hidden;
+}
+
+body {
+  font-family: 'JetBrains Mono', monospace;
+  background: var(--bg);
+  color: var(--text);
+  overflow-x: hidden;
+  line-height: 1.6;
+}
+
+/* ============================== */
+/* SLIDES                         */
+/* ============================== */
+.slide {
+  min-height: 100vh;
+  scroll-snap-align: start;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  padding: 5rem 3rem;
+  position: relative;
+}
+
+/* Slide number */
+.slide-number {
+  position: absolute;
+  top: 2rem;
+  right: 2.5rem;
+  font-size: 0.7rem;
+  color: #333;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+}
+
+/* Fade-in */
+.reveal {
+  opacity: 0;
+  transform: translateY(40px);
+  transition: opacity 0.8s cubic-bezier(0.22, 1, 0.36, 1),
+              transform 0.8s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.reveal.visible { opacity: 1; transform: translateY(0); }
+.reveal-delay-1 { transition-delay: 0.12s; }
+.reveal-delay-2 { transition-delay: 0.24s; }
+.reveal-delay-3 { transition-delay: 0.36s; }
+.reveal-delay-4 { transition-delay: 0.48s; }
+.reveal-delay-5 { transition-delay: 0.60s; }
+
+/* Typography */
+.slide-title {
+  font-size: clamp(2rem, 5vw, 3.5rem);
+  font-weight: 800;
+  text-align: center;
+  letter-spacing: -0.03em;
+  line-height: 1.15;
+  margin-bottom: 2rem;
+}
+
+.slide-subtitle {
+  font-size: clamp(1rem, 2vw, 1.3rem);
+  font-weight: 300;
+  color: var(--dim);
+  text-align: center;
+  max-width: 700px;
+  margin-bottom: 1rem;
+}
+
+.accent-green { color: var(--green); }
+.accent-cyan { color: var(--cyan); }
+
+/* Bullet list */
+.bullet-list {
+  list-style: none;
+  max-width: 750px;
+  width: 100%;
+  text-align: left;
+}
+
+.bullet-list li {
+  padding: 0.9rem 0;
+  border-bottom: 1px solid #151515;
+  font-size: clamp(0.95rem, 1.5vw, 1.15rem);
+  font-weight: 400;
+  display: flex;
+  align-items: flex-start;
+  gap: 1rem;
+  line-height: 1.5;
+}
+
+.bullet-list li .marker {
+  color: var(--green);
+  font-weight: 700;
+  flex-shrink: 0;
+  margin-top: 0.1em;
+}
+
+.bullet-list li:last-child {
+  border-bottom: none;
+}
+
+/* Comparison table */
+.compare-table {
+  border-collapse: collapse;
+  margin-top: 1rem;
+  font-size: clamp(0.75rem, 1.2vw, 0.95rem);
+  max-width: 850px;
+  width: 100%;
+}
+
+.compare-table th,
+.compare-table td {
+  padding: 0.7rem 1rem;
+  text-align: center;
+  border-bottom: 1px solid #1a1a1a;
+}
+
+.compare-table th {
+  color: var(--cyan);
+  font-weight: 700;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+.compare-table td:first-child {
+  text-align: left;
+  font-weight: 500;
+}
+
+.compare-table .yes { color: var(--green); font-weight: 700; }
+.compare-table .no { color: #ff4444; font-weight: 700; }
+
+/* Big quote */
+.big-quote {
+  font-size: clamp(1.3rem, 2.5vw, 2rem);
+  font-weight: 700;
+  text-align: center;
+  max-width: 800px;
+  line-height: 1.4;
+  margin: 1.5rem 0;
+}
+
+/* Hero-specific */
+.pitch-hero-title {
+  font-size: clamp(4rem, 10vw, 8rem);
+  font-weight: 800;
+  letter-spacing: -0.04em;
+  background: linear-gradient(135deg, var(--green), var(--cyan));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  line-height: 1;
+  margin-bottom: 1.5rem;
+}
+
+.meta-info {
+  color: var(--dim);
+  font-size: 0.85rem;
+  letter-spacing: 0.15em;
+  margin-top: 1rem;
+}
+
+/* Tags */
+.tag-row {
+  display: flex;
+  gap: 0.8rem;
+  flex-wrap: wrap;
+  justify-content: center;
+  margin-top: 1.5rem;
+}
+
+.tag {
+  display: inline-block;
+  background: rgba(0, 255, 65, 0.06);
+  border: 1px solid rgba(0, 255, 65, 0.15);
+  border-radius: 100px;
+  padding: 0.35rem 1rem;
+  font-size: 0.7rem;
+  font-weight: 500;
+  color: var(--green);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.tag.cyan {
+  background: rgba(0, 212, 255, 0.06);
+  border-color: rgba(0, 212, 255, 0.15);
+  color: var(--cyan);
+}
+
+/* Phase timeline */
+.phases {
+  display: flex;
+  gap: 2rem;
+  margin-top: 2rem;
+  flex-wrap: wrap;
+  justify-content: center;
+  max-width: 900px;
+}
+
+.phase {
+  flex: 1;
+  min-width: 200px;
+  background: var(--surface);
+  border: 1px solid #1a1a1a;
+  border-radius: 12px;
+  padding: 1.5rem;
+  text-align: center;
+  transition: border-color 0.3s;
+}
+
+.phase:hover { border-color: var(--cyan); }
+
+.phase-number {
+  font-size: 0.7rem;
+  color: var(--cyan);
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  margin-bottom: 0.8rem;
+}
+
+.phase-title {
+  font-weight: 700;
+  font-size: 1rem;
+  margin-bottom: 0.5rem;
+}
+
+.phase-desc {
+  font-size: 0.8rem;
+  color: var(--dim);
+  line-height: 1.5;
+}
+
+/* Team */
+.team-cards {
+  display: flex;
+  gap: 2rem;
+  margin-top: 2rem;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.team-card {
+  background: var(--surface);
+  border: 1px solid #1a1a1a;
+  border-radius: 12px;
+  padding: 2rem;
+  text-align: center;
+  min-width: 220px;
+  transition: border-color 0.3s;
+}
+
+.team-card:hover { border-color: var(--green); }
+
+.team-name {
+  font-weight: 700;
+  font-size: 1.1rem;
+  margin-bottom: 0.4rem;
+}
+
+.team-role {
+  font-size: 0.8rem;
+  color: var(--dim);
+}
+
+/* CTA block */
+.cta-block {
+  background: #0d0d0d;
+  border: 1px solid #1a1a1a;
+  border-radius: 12px;
+  padding: 2rem 2.5rem;
+  margin-top: 1rem;
+  font-size: 0.95rem;
+  max-width: 550px;
+  width: 100%;
+}
+
+.cta-block .cta-line {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.6rem 0;
+}
+
+.cta-block .cta-label {
+  color: var(--dim);
+  min-width: 70px;
+  font-size: 0.8rem;
+}
+
+.cta-block .cta-value {
+  color: var(--green);
+  font-weight: 500;
+}
+
+.cta-block a {
+  color: var(--cyan);
+  text-decoration: none;
+}
+
+.cta-block a:hover { color: var(--green); }
+
+/* ============================== */
+/* NAV DOTS                       */
+/* ============================== */
+.nav-dots {
+  position: fixed;
+  bottom: 2rem;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 0.6rem;
+  z-index: 100;
+  background: rgba(10, 10, 10, 0.8);
+  backdrop-filter: blur(10px);
+  padding: 0.6rem 1rem;
+  border-radius: 100px;
+  border: 1px solid #1a1a1a;
+}
+
+.nav-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #333;
+  cursor: pointer;
+  transition: background 0.3s, transform 0.3s;
+  border: none;
+  padding: 0;
+}
+
+.nav-dot.active {
+  background: var(--green);
+  transform: scale(1.3);
+}
+
+.nav-dot:hover {
+  background: var(--cyan);
+}
+
+/* Keyboard hint */
+.key-hint {
+  position: fixed;
+  bottom: 5rem;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 0.65rem;
+  color: #333;
+  letter-spacing: 0.15em;
+  z-index: 100;
+  pointer-events: none;
+  transition: opacity 3s;
+}
+
+/* Responsive */
+@media (max-width: 600px) {
+  .slide { padding: 3rem 1.5rem; }
+  .phases { flex-direction: column; align-items: center; }
+  .phase { min-width: unset; width: 100%; max-width: 320px; }
+  .compare-table { font-size: 0.7rem; }
+  .compare-table th, .compare-table td { padding: 0.5rem 0.4rem; }
+}
+</style>
+</head>
+<body>
+
+<!-- Navigation dots -->
+<nav class="nav-dots" id="navDots"></nav>
+<div class="key-hint" id="keyHint">Arrow keys to navigate</div>
+
+<!-- ============================================ -->
+<!-- SLIDE 1: TITLE                               -->
+<!-- ============================================ -->
+<section class="slide" id="slide-0">
+  <div class="slide-number">01 / 10</div>
+  <div class="pitch-hero-title reveal">MILNET SSO</div>
+  <p class="slide-subtitle reveal reveal-delay-1">Military-Grade Authentication for the Post-Quantum Era</p>
+  <p class="meta-info reveal reveal-delay-2">Divya Mohan &nbsp;|&nbsp; 2026</p>
+</section>
+
+<!-- ============================================ -->
+<!-- SLIDE 2: PROBLEM                             -->
+<!-- ============================================ -->
+<section class="slide" id="slide-1">
+  <div class="slide-number">02 / 10</div>
+  <h2 class="slide-title reveal">The <span class="accent-cyan">Problem</span></h2>
+  <ul class="bullet-list">
+    <li class="reveal reveal-delay-1"><span class="marker">01</span> Authentication systems are the #1 attack vector in modern breaches</li>
+    <li class="reveal reveal-delay-2"><span class="marker">02</span> Nation-states can compromise any single server or certificate authority</li>
+    <li class="reveal reveal-delay-3"><span class="marker">03</span> Passwords stored on servers &mdash; even hashed &mdash; are ticking time bombs</li>
+    <li class="reveal reveal-delay-4"><span class="marker">04</span> No existing system combines post-quantum + threshold signing + OPAQUE</li>
+  </ul>
+</section>
+
+<!-- ============================================ -->
+<!-- SLIDE 3: SOLUTION                            -->
+<!-- ============================================ -->
+<section class="slide" id="slide-2">
+  <div class="slide-number">03 / 10</div>
+  <h2 class="slide-title reveal">The <span class="accent-green">Solution</span></h2>
+  <p class="slide-subtitle reveal reveal-delay-1">An SSO system where:</p>
+  <ul class="bullet-list">
+    <li class="reveal reveal-delay-1"><span class="marker">&rarr;</span> The server <strong>never sees your password</strong> (OPAQUE)</li>
+    <li class="reveal reveal-delay-2"><span class="marker">&rarr;</span> No single server can <strong>forge tokens</strong> (FROST threshold)</li>
+    <li class="reveal reveal-delay-3"><span class="marker">&rarr;</span> Quantum computers <strong>can't break it</strong> (ML-KEM + ML-DSA)</li>
+    <li class="reveal reveal-delay-4"><span class="marker">&rarr;</span> Stolen tokens <strong>die in seconds</strong> (ratcheting sessions)</li>
+  </ul>
+</section>
+
+<!-- ============================================ -->
+<!-- SLIDE 4: VALUE PROPOSITION                   -->
+<!-- ============================================ -->
+<section class="slide" id="slide-3">
+  <div class="slide-number">04 / 10</div>
+  <h2 class="slide-title reveal">Value <span class="accent-cyan">Proposition</span></h2>
+  <p class="big-quote reveal reveal-delay-1">
+    &ldquo;The only SSO system that assumes <span class="accent-green">everything is compromised</span> &mdash; and still works.&rdquo;
+  </p>
+  <div class="tag-row reveal reveal-delay-2">
+    <span class="tag">Military</span>
+    <span class="tag">Government</span>
+    <span class="tag">Critical Infrastructure</span>
+    <span class="tag cyan">Financial Institutions</span>
+    <span class="tag cyan">Healthcare</span>
+  </div>
+</section>
+
+<!-- ============================================ -->
+<!-- SLIDE 5: TECHNOLOGY                          -->
+<!-- ============================================ -->
+<section class="slide" id="slide-4">
+  <div class="slide-number">05 / 10</div>
+  <h2 class="slide-title reveal">Underlying <span class="accent-green">Magic</span></h2>
+  <ul class="bullet-list">
+    <li class="reveal reveal-delay-1"><span class="marker">01</span> <strong>FROST</strong> threshold signing &mdash; 3-of-5 signers required</li>
+    <li class="reveal reveal-delay-2"><span class="marker">02</span> <strong>OPAQUE</strong> (RFC 9807) &mdash; server-blind authentication</li>
+    <li class="reveal reveal-delay-3"><span class="marker">03</span> <strong>ML-KEM-768 + ML-DSA-65</strong> &mdash; post-quantum key exchange &amp; signatures</li>
+    <li class="reveal reveal-delay-4"><span class="marker">04</span> <strong>HKDF-SHA512</strong> ratcheting &mdash; per-epoch forward secrecy</li>
+    <li class="reveal reveal-delay-5"><span class="marker">05</span> <strong>BFT audit chain</strong> &mdash; tamper-proof logging with hash chains</li>
+  </ul>
+</section>
+
+<!-- ============================================ -->
+<!-- SLIDE 6: BUSINESS MODEL                      -->
+<!-- ============================================ -->
+<section class="slide" id="slide-5">
+  <div class="slide-number">06 / 10</div>
+  <h2 class="slide-title reveal">Business <span class="accent-cyan">Model</span></h2>
+  <ul class="bullet-list">
+    <li class="reveal reveal-delay-1"><span class="marker">01</span> <strong>Open source core</strong> &mdash; MIT license, free forever</li>
+    <li class="reveal reveal-delay-2"><span class="marker">02</span> <strong>Enterprise support</strong> &mdash; managed deployment + SLAs</li>
+    <li class="reveal reveal-delay-3"><span class="marker">03</span> <strong>Compliance consulting</strong> &mdash; CNSA 2.0, NIST 800-207 readiness</li>
+    <li class="reveal reveal-delay-4"><span class="marker">04</span> <strong>Custom integrations</strong> &mdash; SCIM, LDAP bridge, HSM support</li>
+  </ul>
+</section>
+
+<!-- ============================================ -->
+<!-- SLIDE 7: GO-TO-MARKET                        -->
+<!-- ============================================ -->
+<section class="slide" id="slide-6">
+  <div class="slide-number">07 / 10</div>
+  <h2 class="slide-title reveal">Go-to-<span class="accent-green">Market</span></h2>
+  <div class="phases reveal reveal-delay-1">
+    <div class="phase">
+      <div class="phase-number">Phase 1</div>
+      <div class="phase-title">Open Source Adoption</div>
+      <div class="phase-desc">Developers, startups, security researchers. Build community and trust.</div>
+    </div>
+    <div class="phase">
+      <div class="phase-number">Phase 2</div>
+      <div class="phase-title">Government Contracts</div>
+      <div class="phase-desc">Military and government agencies requiring post-quantum compliance.</div>
+    </div>
+    <div class="phase">
+      <div class="phase-number">Phase 3</div>
+      <div class="phase-title">Enterprise SaaS</div>
+      <div class="phase-desc">Managed cloud offering for financial institutions and healthcare.</div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================ -->
+<!-- SLIDE 8: COMPETITIVE LANDSCAPE               -->
+<!-- ============================================ -->
+<section class="slide" id="slide-7">
+  <div class="slide-number">08 / 10</div>
+  <h2 class="slide-title reveal">Competitive <span class="accent-cyan">Landscape</span></h2>
+  <table class="compare-table reveal reveal-delay-1">
+    <thead>
+      <tr>
+        <th></th>
+        <th>Post-Quantum</th>
+        <th>Threshold</th>
+        <th>OPAQUE</th>
+        <th>Ratcheting</th>
+        <th>Open Source</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong class="accent-green">MILNET SSO</strong></td>
+        <td class="yes">Yes</td>
+        <td class="yes">Yes</td>
+        <td class="yes">Yes</td>
+        <td class="yes">Yes</td>
+        <td class="yes">Yes</td>
+      </tr>
+      <tr>
+        <td>Okta</td>
+        <td class="no">No</td>
+        <td class="no">No</td>
+        <td class="no">No</td>
+        <td class="no">No</td>
+        <td class="no">No</td>
+      </tr>
+      <tr>
+        <td>Keycloak</td>
+        <td class="no">No</td>
+        <td class="no">No</td>
+        <td class="no">No</td>
+        <td class="no">No</td>
+        <td class="yes">Yes</td>
+      </tr>
+      <tr>
+        <td>DoD CAC/PIV</td>
+        <td class="no">No</td>
+        <td class="no">No</td>
+        <td class="no">No</td>
+        <td class="no">No</td>
+        <td class="no">No</td>
+      </tr>
+    </tbody>
+  </table>
+  <p class="big-quote reveal reveal-delay-2" style="margin-top: 2rem; font-size: clamp(1rem, 1.8vw, 1.4rem);">
+    We are the only one with <span class="accent-green">all of these</span>.
+  </p>
+</section>
+
+<!-- ============================================ -->
+<!-- SLIDE 9: TEAM                                -->
+<!-- ============================================ -->
+<section class="slide" id="slide-8">
+  <div class="slide-number">09 / 10</div>
+  <h2 class="slide-title reveal">The <span class="accent-green">Team</span></h2>
+  <div class="team-cards reveal reveal-delay-1">
+    <div class="team-card">
+      <div class="team-name">Divya Mohan</div>
+      <div class="team-role">Creator &amp; Architecture Lead</div>
+    </div>
+    <div class="team-card">
+      <div class="team-name">Claude (Anthropic)</div>
+      <div class="team-role">AI Architecture Partner</div>
+    </div>
+    <div class="team-card">
+      <div class="team-name">You?</div>
+      <div class="team-role">Open Source Contributors Welcome</div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================ -->
+<!-- SLIDE 10: THE ASK                            -->
+<!-- ============================================ -->
+<section class="slide" id="slide-9">
+  <div class="slide-number">10 / 10</div>
+  <h2 class="slide-title reveal">The <span class="accent-cyan">Ask</span></h2>
+  <div class="cta-block reveal reveal-delay-1">
+    <div class="cta-line">
+      <span class="cta-label">Try it</span>
+      <a href="https://sso-system-demo.dmj.one" target="_blank" class="cta-value">sso-system-demo.dmj.one</a>
+    </div>
+    <div class="cta-line">
+      <span class="cta-label">Deploy</span>
+      <span class="cta-value">terraform apply</span>
+    </div>
+    <div class="cta-line">
+      <span class="cta-label">Star it</span>
+      <a href="https://github.com/divyamohan1993/enterprise-sso-system" target="_blank" class="cta-value">GitHub</a>
+    </div>
+  </div>
+  <p class="big-quote reveal reveal-delay-2" style="margin-top: 2.5rem;">
+    Join us in building the <span class="accent-green">future of authentication</span>.
+  </p>
+</section>
+
+<!-- Minimal JS: navigation, dots, keyboard -->
+<script>
+(function() {
+  var TOTAL = 10;
+  var currentSlide = 0;
+
+  // Intersection observer for reveal animations
+  var revealObserver = new IntersectionObserver(function(entries) {
+    entries.forEach(function(entry) {
+      if (entry.isIntersecting) {
+        entry.target.classList.add('visible');
+      }
+    });
+  }, { threshold: 0.15 });
+
+  document.querySelectorAll('.reveal').forEach(function(el) {
+    revealObserver.observe(el);
+  });
+
+  // Build nav dots
+  var dotsContainer = document.getElementById('navDots');
+  for (var i = 0; i < TOTAL; i++) {
+    var dot = document.createElement('button');
+    dot.className = 'nav-dot' + (i === 0 ? ' active' : '');
+    dot.setAttribute('aria-label', 'Slide ' + (i + 1));
+    dot.dataset.index = i;
+    dot.addEventListener('click', function() {
+      goToSlide(parseInt(this.dataset.index));
+    });
+    dotsContainer.appendChild(dot);
+  }
+
+  function goToSlide(n) {
+    if (n < 0 || n >= TOTAL) return;
+    currentSlide = n;
+    var target = document.getElementById('slide-' + n);
+    if (target) target.scrollIntoView({ behavior: 'smooth' });
+    updateDots();
+  }
+
+  function updateDots() {
+    var dots = dotsContainer.querySelectorAll('.nav-dot');
+    dots.forEach(function(d, i) {
+      d.classList.toggle('active', i === currentSlide);
+    });
+  }
+
+  // Track current slide via intersection
+  var slideObserver = new IntersectionObserver(function(entries) {
+    entries.forEach(function(entry) {
+      if (entry.isIntersecting) {
+        var idx = parseInt(entry.target.id.replace('slide-', ''));
+        currentSlide = idx;
+        updateDots();
+      }
+    });
+  }, { threshold: 0.5 });
+
+  for (var i = 0; i < TOTAL; i++) {
+    var slide = document.getElementById('slide-' + i);
+    if (slide) slideObserver.observe(slide);
+  }
+
+  // Keyboard navigation
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
+      e.preventDefault();
+      goToSlide(currentSlide + 1);
+    } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      goToSlide(currentSlide - 1);
+    }
+  });
+
+  // Hide key hint after 5 seconds
+  setTimeout(function() {
+    var hint = document.getElementById('keyHint');
+    if (hint) hint.style.opacity = '0';
+  }, 5000);
+})();
+</script>
+
+</body>
+</html>
