@@ -80,6 +80,25 @@ async fn main() {
     }
     tracing::info!("Restored {} user registrations from database", store.user_count());
 
+    let google_config = match (
+        std::env::var("GOOGLE_CLIENT_ID"),
+        std::env::var("GOOGLE_CLIENT_SECRET"),
+        std::env::var("SSO_BASE_URL"),
+    ) {
+        (Ok(cid), Ok(csec), Ok(base)) => {
+            tracing::info!("Google OAuth configured");
+            Some(admin::google_oauth::GoogleOAuthConfig {
+                client_id: cid,
+                client_secret: csec,
+                redirect_uri: format!("{base}/oauth/google/callback"),
+            })
+        }
+        _ => {
+            tracing::warn!("Google OAuth not configured — set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, SSO_BASE_URL");
+            None
+        }
+    };
+
     let state = Arc::new(AppState {
         db: pool,
         credential_store: RwLock::new(store),
@@ -96,6 +115,9 @@ async fn main() {
         pending_ceremonies: RwLock::new(std::collections::HashMap::new()),
         last_level4_ceremony: RwLock::new(None),
         level4_count_72h: RwLock::new(Vec::new()),
+        google_config,
+        pending_google: RwLock::new(admin::google_oauth::PendingGoogleStore::new()),
+        http_client: reqwest::Client::new(),
     });
 
     let app = api_router(state);
