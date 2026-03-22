@@ -26,6 +26,10 @@ services:
       DATABASE_URL: postgres://milnet:milnet_secure_password@postgres:5432/milnet_sso
       ADMIN_PORT: 8080
       RUST_LOG: info
+      # Google OAuth (optional — SSO login won't work without these)
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      SSO_BASE_URL: ${SSO_BASE_URL:-http://localhost:8080}
     ports:
       - "8080:8080"
     healthcheck:
