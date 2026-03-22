@@ -52,6 +52,9 @@ async fn main() {
 
     tracing::info!("verifier listening on {addr}");
 
+    // TODO: Implement ratchet heartbeat with config.verifier_staleness_timeout_secs (60s)
+    // Reject all tokens if Ratchet Manager doesn't respond within timeout
+
     // 4. Accept connections and verify tokens
     loop {
         if let Ok(mut transport) = listener.accept().await {

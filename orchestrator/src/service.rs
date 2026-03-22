@@ -209,19 +209,25 @@ impl OrchestratorService {
             .unwrap()
             .as_micros() as i64;
 
+        // Use SecurityConfig for tier-based token lifetimes (spec Section 5)
+        let security_config = common::config::SecurityConfig::default();
+        let tier = if request.tier == 0 { 2 } else { request.tier };
+        let token_lifetime_us = security_config.token_lifetime_for_tier(tier) as i64 * 1_000_000;
+
         let claims = TokenClaims {
             sub: session.user_id.unwrap_or(Uuid::nil()),
             iss: [0xAA; 32],
             iat: now,
-            exp: now + 30_000_000, // 30 seconds
+            exp: now + token_lifetime_us,
             scope: 0x0000_000F,
             dpop_hash: request.dpop_key_hash,
             ceremony_id: session_id,
-            tier: if request.tier == 0 { 2 } else { request.tier },
+            tier,
             ratchet_epoch: 0,
         };
 
-        // Generate a ratchet key for this session's token tag
+        // TODO: Use X-Wing shared secret from gateway as ratchet initial key
+        // For now: generate random initial key
         let ratchet_key = generate_key_64();
 
         let signing_req = SigningRequest {
