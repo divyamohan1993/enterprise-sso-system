@@ -100,6 +100,11 @@ pub struct PuzzleChallenge {
     pub nonce: [u8; 32],
     pub difficulty: u8,
     pub timestamp: i64,
+    /// Server's X-Wing public key (X25519 || ML-KEM-1024 EK) for hybrid
+    /// post-quantum key exchange.  Clients encapsulate against this key and
+    /// return the ciphertext with their puzzle solution.
+    #[serde(default)]
+    pub xwing_server_pk: Option<Vec<u8>>,
 }
 
 /// A client's solution to a [`PuzzleChallenge`].
@@ -107,6 +112,10 @@ pub struct PuzzleChallenge {
 pub struct PuzzleSolution {
     pub nonce: [u8; 32],
     pub solution: [u8; 32],
+    /// Client's X-Wing public key.  The server encapsulates against this key
+    /// and sends the resulting ciphertext back so both sides share a secret.
+    #[serde(default)]
+    pub xwing_client_pk: Option<Vec<u8>>,
 }
 
 /// Generate a new puzzle challenge with the given difficulty (number of
@@ -121,6 +130,7 @@ pub fn generate_challenge(difficulty: u8) -> PuzzleChallenge {
         nonce,
         difficulty,
         timestamp,
+        xwing_server_pk: None,
     }
 }
 

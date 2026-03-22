@@ -10,8 +10,9 @@ use audit::log::{AuditRequest, AuditResponse};
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    // Harden process: disable core dumps, prevent ptrace escalation
-    crypto::memguard::harden_process();
+    // Platform integrity: vTPM check, process hardening, self-attestation, monitor
+    let (_platform_report, _monitor_handle, _monitor) =
+        common::startup_checks::run_platform_checks(crypto::memguard::harden_process);
 
     tracing::info!("Audit service starting");
 
@@ -44,7 +45,7 @@ async fn main() {
                 if let Some(audit_root) = audit_root {
                     // KT root placeholder: the Key Transparency tree lives in a separate service.
                     // TODO: fetch real KT root from the KT service once integrated.
-                    let kt_root = [0u8; 32];
+                    let kt_root = [0u8; 64];
 
                     let mut wl = witness_log.lock().await;
                     wl.add_signed_checkpoint(audit_root, kt_root, |data| {

@@ -4,7 +4,7 @@ use common::types::AuditEventType;
 use uuid::Uuid;
 
 /// Helper: propose a single entry with default values.
-fn propose_default(cluster: &mut BftAuditCluster) -> Result<[u8; 32], String> {
+fn propose_default(cluster: &mut BftAuditCluster) -> Result<[u8; 64], String> {
     cluster.propose_entry(
         AuditEventType::AuthSuccess,
         vec![Uuid::new_v4()],

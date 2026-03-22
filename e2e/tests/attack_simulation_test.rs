@@ -46,7 +46,14 @@ const TEST_DIFFICULTY: u8 = 4;
 
 /// Shared PQ keypair for unit-level tests.
 static TEST_PQ_KEYPAIR: std::sync::LazyLock<(crypto::pq_sign::PqSigningKey, crypto::pq_sign::PqVerifyingKey)> =
-    std::sync::LazyLock::new(crypto::pq_sign::generate_pq_keypair);
+    std::sync::LazyLock::new(|| {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(crypto::pq_sign::generate_pq_keypair)
+            .expect("spawn keygen thread")
+            .join()
+            .expect("keygen thread panicked")
+    });
 fn test_pq_sk() -> &'static crypto::pq_sign::PqSigningKey { &TEST_PQ_KEYPAIR.0 }
 fn test_pq_vk() -> &'static crypto::pq_sign::PqVerifyingKey { &TEST_PQ_KEYPAIR.1 }
 
@@ -329,6 +336,7 @@ async fn client_auth(gateway_addr: &str, username: &str, password: &[u8]) -> Aut
     let solution = PuzzleSolution {
         nonce: challenge.nonce,
         solution: solution_bytes,
+        xwing_client_pk: None,
     };
     send_frame(&mut stream, &solution)
         .await
@@ -356,7 +364,7 @@ fn build_valid_receipt_chain(signing_key: &[u8; 64]) -> Vec<Receipt> {
     let mut r1 = Receipt {
         ceremony_session_id: session_id,
         step_id: 1,
-        prev_receipt_hash: [0u8; 32],
+        prev_receipt_hash: [0u8; 64],
         user_id,
         dpop_key_hash: dpop_hash,
         timestamp: ts,
@@ -396,6 +404,7 @@ fn make_valid_token_and_key() -> (Token, frost_ristretto255::keys::PublicKeyPack
         ceremony_id: [0xCC; 32],
         tier: 2,
         ratchet_epoch: 1,
+        token_id: [0xAB; 16],
     };
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
     let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
@@ -432,6 +441,7 @@ async fn test_attack_ddos_puzzle_prevents_unauthenticated_flood() {
         let bogus_solution = PuzzleSolution {
             nonce: [0xDE; 32], // deliberately wrong nonce
             solution: [0u8; 32],
+        xwing_client_pk: None,
         };
         send_frame(&mut stream, &bogus_solution)
             .await
@@ -469,6 +479,7 @@ async fn test_attack_ddos_wrong_puzzle_flood() {
         let wrong_solution = PuzzleSolution {
             nonce: [0xDE; 32], // deliberately wrong nonce
             solution: [0u8; 32],
+        xwing_client_pk: None,
         };
         send_frame(&mut stream, &wrong_solution)
             .await
@@ -506,6 +517,7 @@ async fn test_attack_ddos_concurrent_legitimate_under_load() {
         let bogus = PuzzleSolution {
             nonce: [0xDE; 32], // deliberately wrong nonce
             solution: [0u8; 32],
+        xwing_client_pk: None,
         };
         let _ = send_frame(&mut stream, &bogus).await;
         // Read rejection to keep connection clean
@@ -693,6 +705,7 @@ fn test_attack_forged_token_random_signature_rejected() {
         ceremony_id: [0xCC; 32],
         tier: 2,
         ratchet_epoch: 1,
+        token_id: [0xAB; 16],
     };
 
     // Random signature bytes
@@ -753,6 +766,7 @@ fn test_attack_token_replay_across_sessions() {
         ceremony_id: [0x01; 32],
         tier: 2,
         ratchet_epoch: 1,
+        token_id: [0xAB; 16],
     };
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
     let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
@@ -805,6 +819,7 @@ fn test_attack_cross_dkg_token_injection() {
         ceremony_id: [0xCC; 32],
         tier: 2,
         ratchet_epoch: 1,
+        token_id: [0xAB; 16],
     };
 
     let (coordinator1, mut nodes1) = distribute_shares(&mut dkg1);
@@ -860,7 +875,7 @@ fn test_attack_receipt_from_different_ceremony_injected() {
     let mut r_a1 = Receipt {
         ceremony_session_id: session_a,
         step_id: 1,
-        prev_receipt_hash: [0u8; 32],
+        prev_receipt_hash: [0u8; 64],
         user_id,
         dpop_key_hash: dpop_hash,
         timestamp: ts,
@@ -874,7 +889,7 @@ fn test_attack_receipt_from_different_ceremony_injected() {
     let mut r_b1 = Receipt {
         ceremony_session_id: session_b,
         step_id: 1,
-        prev_receipt_hash: [0u8; 32],
+        prev_receipt_hash: [0u8; 64],
         user_id,
         dpop_key_hash: dpop_hash,
         timestamp: ts,
@@ -900,7 +915,7 @@ fn test_attack_receipt_signature_forgery() {
     let mut receipt = Receipt {
         ceremony_session_id: [0x01; 32],
         step_id: 1,
-        prev_receipt_hash: [0u8; 32],
+        prev_receipt_hash: [0u8; 64],
         user_id: Uuid::nil(),
         dpop_key_hash: [0x02; 32],
         timestamp: now_us(),
@@ -937,7 +952,7 @@ fn test_attack_receipt_hash_chain_splice() {
     let mut r1 = Receipt {
         ceremony_session_id: session_id,
         step_id: 1,
-        prev_receipt_hash: [0u8; 32],
+        prev_receipt_hash: [0u8; 64],
         user_id,
         dpop_key_hash: dpop_hash,
         timestamp: ts,
@@ -1014,7 +1029,7 @@ fn test_attack_receipt_with_future_timestamp_rejected() {
     let mut receipt = Receipt {
         ceremony_session_id: session_id,
         step_id: 1,
-        prev_receipt_hash: [0u8; 32],
+        prev_receipt_hash: [0u8; 64],
         user_id: Uuid::nil(),
         dpop_key_hash: [0x02; 32],
         timestamp: future_ts,

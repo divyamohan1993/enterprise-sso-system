@@ -4,6 +4,12 @@
 //! files. A signed manifest of BLAKE3 hashes is checked at startup and
 //! can be re-verified at runtime intervals.
 //!
+//! CNSA 2.0 note: BLAKE3 is not in the CNSA 2.0 approved algorithm suite.
+//! It is used here for *performance-critical file integrity checking* in
+//! the attestation subsystem only, not for key derivation or digital
+//! signatures. The manifest itself is authenticated via HMAC-SHA512,
+//! which IS CNSA 2.0 compliant.
+//!
 //! # Threat Model
 //! Detects:
 //! - Binary replacement/patching by compromised host

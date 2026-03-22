@@ -106,7 +106,7 @@ pub fn handle_login_finish(
             let mut receipt = Receipt {
                 ceremony_session_id,
                 step_id: 1,
-                prev_receipt_hash: [0u8; 32], // First in chain
+                prev_receipt_hash: [0u8; 64], // First in chain
                 user_id,
                 dpop_key_hash,
                 timestamp: now,

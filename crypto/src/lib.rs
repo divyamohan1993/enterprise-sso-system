@@ -26,3 +26,5 @@ pub mod seal;
 #[allow(unsafe_code)]
 pub mod memguard;
 pub mod attest;
+pub mod hsm;
+pub mod tpm;

@@ -53,7 +53,7 @@ fn chain_detects_tampering() {
     let mut tampered = AuditLog::new();
     for (i, mut entry) in entries.into_iter().enumerate() {
         if i == 1 {
-            entry.prev_hash = [0xFF; 32]; // tamper
+            entry.prev_hash = [0xFF; 64]; // tamper
         }
         // We can't use append here since it generates new entries,
         // so we verify the original log's chain after external tampering.
@@ -88,7 +88,7 @@ fn chain_detects_tampering() {
     // an entry with wrong prev_hash would fail.
     let entries = log2.entries();
     let mut fake_entry = entries[1].clone();
-    fake_entry.prev_hash = [0xAB; 32];
+    fake_entry.prev_hash = [0xAB; 64];
     // The hash of entry[0] should not equal fake prev_hash
     let expected_prev = hash_entry(&entries[0]);
     assert_ne!(fake_entry.prev_hash, expected_prev);

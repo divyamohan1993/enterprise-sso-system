@@ -2,11 +2,27 @@
 //!
 //! Provides configuration, pending-auth state management, token exchange,
 //! and JWT ID-token claim extraction and verification for Google sign-in.
+//! Includes JWKS-based RS256 signature verification against Google's public keys.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use rsa::pkcs1v15::VerifyingKey;
+use rsa::signature::Verifier;
+use rsa::{BigUint, RsaPublicKey};
 use serde::Deserialize;
+use sha2::Sha256;
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
+
+/// Google JWKS endpoint URL.
+const GOOGLE_JWKS_URL: &str = "https://www.googleapis.com/oauth2/v3/certs";
+
+/// JWKS cache TTL: 1 hour.
+const JWKS_CACHE_TTL: Duration = Duration::from_secs(3600);
+
+/// HTTP request timeout for external calls.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -18,6 +34,156 @@ pub struct GoogleOAuthConfig {
     pub client_id: String,
     pub client_secret: String,
     pub redirect_uri: String,
+}
+
+// ---------------------------------------------------------------------------
+// JWKS cache
+// ---------------------------------------------------------------------------
+
+/// A single RSA public key from the JWKS response, indexed by key ID.
+#[derive(Clone, Debug)]
+struct CachedRsaKey {
+    pub key: RsaPublicKey,
+}
+
+/// Thread-safe cache for Google's JWKS public keys.
+/// Keys are refreshed when the TTL expires.
+pub struct GoogleJwksCache {
+    inner: RwLock<JwksCacheInner>,
+}
+
+struct JwksCacheInner {
+    /// Map from key ID (`kid`) to parsed RSA public key.
+    keys: HashMap<String, CachedRsaKey>,
+    /// When the cache was last populated.
+    fetched_at: Option<Instant>,
+}
+
+/// A single JWK entry from Google's JWKS response.
+#[derive(Debug, Deserialize)]
+struct JwkEntry {
+    kid: String,
+    kty: String,
+    #[serde(default)]
+    alg: Option<String>,
+    /// RSA modulus, base64url-encoded.
+    n: String,
+    /// RSA exponent, base64url-encoded.
+    e: String,
+}
+
+/// The top-level JWKS response from Google.
+#[derive(Debug, Deserialize)]
+struct JwksResponse {
+    keys: Vec<JwkEntry>,
+}
+
+impl GoogleJwksCache {
+    pub fn new() -> Self {
+        Self {
+            inner: RwLock::new(JwksCacheInner {
+                keys: HashMap::new(),
+                fetched_at: None,
+            }),
+        }
+    }
+
+    /// Return the cached RSA public key for the given `kid`, refreshing the
+    /// cache from Google's JWKS endpoint if it is stale or missing the key.
+    async fn get_key(
+        &self,
+        kid: &str,
+        http_client: &reqwest::Client,
+    ) -> Result<RsaPublicKey, String> {
+        // Fast path: read lock, check if cached and fresh.
+        {
+            let cache = self.inner.read().await;
+            if let Some(fetched_at) = cache.fetched_at {
+                if fetched_at.elapsed() < JWKS_CACHE_TTL {
+                    if let Some(entry) = cache.keys.get(kid) {
+                        return Ok(entry.key.clone());
+                    }
+                    // kid not found but cache is fresh — this is an error,
+                    // but we will try one refresh in case Google rotated keys.
+                }
+            }
+        }
+
+        // Slow path: fetch and update.
+        self.refresh(http_client).await?;
+
+        let cache = self.inner.read().await;
+        cache
+            .keys
+            .get(kid)
+            .map(|e| e.key.clone())
+            .ok_or_else(|| format!("no JWKS key found for kid: {kid}"))
+    }
+
+    /// Fetch Google's JWKS and replace the cache contents.
+    async fn refresh(&self, http_client: &reqwest::Client) -> Result<(), String> {
+        let resp = http_client
+            .get(GOOGLE_JWKS_URL)
+            .timeout(HTTP_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| format!("JWKS fetch failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            return Err(format!("JWKS endpoint returned HTTP {status}"));
+        }
+
+        let jwks: JwksResponse = resp
+            .json()
+            .await
+            .map_err(|e| format!("failed to parse JWKS response: {e}"))?;
+
+        let mut new_keys = HashMap::new();
+        for entry in &jwks.keys {
+            if entry.kty != "RSA" {
+                continue;
+            }
+            // If algorithm is specified, it must be RS256.
+            if let Some(ref alg) = entry.alg {
+                if alg != "RS256" {
+                    continue;
+                }
+            }
+            let n_bytes = URL_SAFE_NO_PAD
+                .decode(&entry.n)
+                .map_err(|e| format!("bad base64url in JWKS n for kid {}: {e}", entry.kid))?;
+            let e_bytes = URL_SAFE_NO_PAD
+                .decode(&entry.e)
+                .map_err(|e| format!("bad base64url in JWKS e for kid {}: {e}", entry.kid))?;
+
+            let n = BigUint::from_bytes_be(&n_bytes);
+            let e = BigUint::from_bytes_be(&e_bytes);
+
+            let pubkey = RsaPublicKey::new(n, e)
+                .map_err(|err| format!("invalid RSA key for kid {}: {err}", entry.kid))?;
+
+            new_keys.insert(
+                entry.kid.clone(),
+                CachedRsaKey { key: pubkey },
+            );
+        }
+
+        if new_keys.is_empty() {
+            return Err("JWKS response contained no usable RSA keys".into());
+        }
+
+        let mut cache = self.inner.write().await;
+        cache.keys = new_keys;
+        cache.fetched_at = Some(Instant::now());
+        Ok(())
+    }
+}
+
+impl Default for GoogleJwksCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -142,6 +308,7 @@ pub async fn exchange_code_for_tokens(
 
     let resp = http_client
         .post("https://oauth2.googleapis.com/token")
+        .timeout(HTTP_TIMEOUT)
         .form(&params)
         .send()
         .await
@@ -149,8 +316,11 @@ pub async fn exchange_code_for_tokens(
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("token endpoint returned {status}: {body}"));
+        // Sanitize: do not leak the response body which may contain tokens or
+        // sensitive error details to upstream callers.
+        let _body = resp.text().await.unwrap_or_default();
+        tracing::error!("Google token endpoint returned {status}");
+        return Err(format!("token endpoint returned {status}"));
     }
 
     resp.json::<GoogleTokenResponse>()
@@ -159,33 +329,38 @@ pub async fn exchange_code_for_tokens(
 }
 
 // ---------------------------------------------------------------------------
-// JWT claim extraction
+// JWT claim extraction with JWKS signature verification
 // ---------------------------------------------------------------------------
 
-/// JWT header claims used for algorithm validation.
+/// JWT header claims used for algorithm and key-id validation.
 #[derive(Debug, Deserialize)]
 struct JwtHeader {
     alg: String,
     #[serde(default)]
+    #[allow(dead_code)]
     typ: Option<String>,
+    /// Key ID used to select the correct key from the JWKS.
+    #[serde(default)]
+    kid: Option<String>,
 }
 
-/// Decode and validate the structure of a Google ID token (a JWT).
+/// Decode and validate a Google ID token (a JWT), including full RS256
+/// cryptographic signature verification against Google's JWKS public keys.
 ///
 /// Performs the following security checks:
 /// 1. Token has exactly 3 parts (header.payload.signature)
 /// 2. Header specifies RS256 algorithm
-/// 3. Signature part is present and non-empty (format validation)
-/// 4. Issuer is accounts.google.com or https://accounts.google.com
-/// 5. Token has not expired (exp claim vs current time)
-/// 6. Audience matches the expected client_id
-///
-/// NOTE: Full RS256 cryptographic signature verification against Google's JWKS
-/// keys (https://www.googleapis.com/oauth2/v3/certs) is not implemented here.
-/// The token is received directly from Google's token endpoint over TLS, which
-/// provides transport-level authenticity. For defense-in-depth, a production
-/// deployment should fetch and cache Google's JWKS and verify the RSA signature.
-pub fn extract_google_claims(id_token: &str, expected_client_id: &str) -> Result<GoogleIdTokenClaims, String> {
+/// 3. `kid` header is present and maps to a Google JWKS key
+/// 4. RS256 signature is cryptographically verified against the JWKS public key
+/// 5. Issuer is accounts.google.com or https://accounts.google.com
+/// 6. Token has not expired (exp claim vs current time, 5-min skew allowed)
+/// 7. Audience matches the expected client_id
+pub async fn extract_google_claims(
+    id_token: &str,
+    expected_client_id: &str,
+    jwks_cache: &GoogleJwksCache,
+    http_client: &reqwest::Client,
+) -> Result<GoogleIdTokenClaims, String> {
     let parts: Vec<&str> = id_token.split('.').collect();
     if parts.len() != 3 {
         return Err("id_token is not a valid JWT (expected 3 parts)".into());
@@ -210,10 +385,33 @@ pub fn extract_google_claims(id_token: &str, expected_client_id: &str) -> Result
         ));
     }
 
-    // Validate that the signature is valid base64url (well-formed)
-    URL_SAFE_NO_PAD
+    let kid = header
+        .kid
+        .as_deref()
+        .ok_or("JWT header missing required 'kid' field")?;
+
+    // -----------------------------------------------------------------------
+    // RS256 signature verification against Google JWKS
+    // -----------------------------------------------------------------------
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+    let sig_bytes = URL_SAFE_NO_PAD
         .decode(parts[2])
         .map_err(|e| format!("signature is not valid base64url: {e}"))?;
+
+    let rsa_pubkey = jwks_cache.get_key(kid, http_client).await?;
+    let verifying_key = VerifyingKey::<Sha256>::new(rsa_pubkey);
+    let signature = rsa::pkcs1v15::Signature::try_from(sig_bytes.as_slice())
+        .map_err(|e| format!("invalid RSA signature encoding: {e}"))?;
+
+    // SECURITY: Timing floor for RSA verification (RUSTSEC-2023-0071 mitigation)
+    let verify_start = std::time::Instant::now();
+    let verify_result = verifying_key.verify(signing_input.as_bytes(), &signature);
+    let verify_elapsed = verify_start.elapsed();
+    let verify_floor = Duration::from_millis(50);
+    if verify_elapsed < verify_floor {
+        std::thread::sleep(verify_floor - verify_elapsed);
+    }
+    verify_result.map_err(|_| "RS256 signature verification failed".to_string())?;
 
     // Decode the payload
     let payload_bytes = URL_SAFE_NO_PAD
@@ -390,117 +588,36 @@ mod tests {
         assert!(store.map.get("new").is_some());
     }
 
+    /// Test that the JWT header parsing extracts the `kid` field.
     #[test]
-    fn test_extract_google_claims() {
-        // Build a fake JWT with a valid base64url-encoded header and payload
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        use base64::Engine;
-
-        let header_json = serde_json::json!({"alg": "RS256", "typ": "JWT"});
-        let header = URL_SAFE_NO_PAD.encode(header_json.to_string().as_bytes());
-
-        let claims_json = serde_json::json!({
-            "sub": "12345",
-            "email": "user@example.com",
-            "email_verified": true,
-            "name": "Test User",
-            "iss": "https://accounts.google.com",
-            "aud": "my-client-id",
-            "exp": 9999999999i64,
-        });
-        let payload = URL_SAFE_NO_PAD.encode(claims_json.to_string().as_bytes());
-        // Use a non-empty base64url signature stub (structural validation only)
-        let fake_sig = URL_SAFE_NO_PAD.encode(b"fake-signature-bytes");
-        let fake_jwt = format!("{header}.{payload}.{fake_sig}");
-
-        let claims = extract_google_claims(&fake_jwt, "my-client-id").unwrap();
-        assert_eq!(claims.sub, "12345");
-        assert_eq!(claims.email, "user@example.com");
-        assert!(claims.email_verified);
-        assert_eq!(claims.iss, "https://accounts.google.com");
+    fn test_jwt_header_parses_kid() {
+        let hdr_json = serde_json::json!({"alg": "RS256", "typ": "JWT", "kid": "abc123"});
+        let hdr: JwtHeader = serde_json::from_value(hdr_json).unwrap();
+        assert_eq!(hdr.alg, "RS256");
+        assert_eq!(hdr.kid.as_deref(), Some("abc123"));
     }
 
+    /// Test that JWKS entry deserialization works.
     #[test]
-    fn test_extract_google_claims_rejects_wrong_alg() {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        use base64::Engine;
-
-        let header_json = serde_json::json!({"alg": "HS256", "typ": "JWT"});
-        let header = URL_SAFE_NO_PAD.encode(header_json.to_string().as_bytes());
-
-        let claims_json = serde_json::json!({
-            "sub": "12345", "email": "user@example.com", "email_verified": true,
-            "iss": "https://accounts.google.com", "aud": "my-client-id", "exp": 9999999999i64,
+    fn test_jwks_entry_deserialize() {
+        let json = serde_json::json!({
+            "kid": "key1",
+            "kty": "RSA",
+            "alg": "RS256",
+            "n": "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw",
+            "e": "AQAB"
         });
-        let payload = URL_SAFE_NO_PAD.encode(claims_json.to_string().as_bytes());
-        let fake_sig = URL_SAFE_NO_PAD.encode(b"sig");
-        let fake_jwt = format!("{header}.{payload}.{fake_sig}");
-
-        let result = extract_google_claims(&fake_jwt, "my-client-id");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("RS256"));
+        let entry: JwkEntry = serde_json::from_value(json).unwrap();
+        assert_eq!(entry.kid, "key1");
+        assert_eq!(entry.kty, "RSA");
     }
 
+    /// Test that GoogleJwksCache can be constructed.
     #[test]
-    fn test_extract_google_claims_rejects_wrong_audience() {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        use base64::Engine;
-
-        let header_json = serde_json::json!({"alg": "RS256", "typ": "JWT"});
-        let header = URL_SAFE_NO_PAD.encode(header_json.to_string().as_bytes());
-
-        let claims_json = serde_json::json!({
-            "sub": "12345", "email": "user@example.com", "email_verified": true,
-            "iss": "https://accounts.google.com", "aud": "wrong-client-id", "exp": 9999999999i64,
-        });
-        let payload = URL_SAFE_NO_PAD.encode(claims_json.to_string().as_bytes());
-        let fake_sig = URL_SAFE_NO_PAD.encode(b"sig");
-        let fake_jwt = format!("{header}.{payload}.{fake_sig}");
-
-        let result = extract_google_claims(&fake_jwt, "my-client-id");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("audience mismatch"));
-    }
-
-    #[test]
-    fn test_extract_google_claims_rejects_expired() {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        use base64::Engine;
-
-        let header_json = serde_json::json!({"alg": "RS256", "typ": "JWT"});
-        let header = URL_SAFE_NO_PAD.encode(header_json.to_string().as_bytes());
-
-        let claims_json = serde_json::json!({
-            "sub": "12345", "email": "user@example.com", "email_verified": true,
-            "iss": "https://accounts.google.com", "aud": "my-client-id", "exp": 1000000i64,
-        });
-        let payload = URL_SAFE_NO_PAD.encode(claims_json.to_string().as_bytes());
-        let fake_sig = URL_SAFE_NO_PAD.encode(b"sig");
-        let fake_jwt = format!("{header}.{payload}.{fake_sig}");
-
-        let result = extract_google_claims(&fake_jwt, "my-client-id");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("expired"));
-    }
-
-    #[test]
-    fn test_extract_google_claims_rejects_empty_signature() {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        use base64::Engine;
-
-        let header_json = serde_json::json!({"alg": "RS256", "typ": "JWT"});
-        let header = URL_SAFE_NO_PAD.encode(header_json.to_string().as_bytes());
-
-        let claims_json = serde_json::json!({
-            "sub": "12345", "email": "user@example.com", "email_verified": true,
-            "iss": "https://accounts.google.com", "aud": "my-client-id", "exp": 9999999999i64,
-        });
-        let payload = URL_SAFE_NO_PAD.encode(claims_json.to_string().as_bytes());
-        let fake_jwt = format!("{header}.{payload}.");
-
-        let result = extract_google_claims(&fake_jwt, "my-client-id");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("empty signature"));
+    fn test_jwks_cache_new() {
+        let cache = GoogleJwksCache::new();
+        // Just verify it can be created without panic.
+        drop(cache);
     }
 
     #[test]
@@ -561,5 +678,157 @@ mod tests {
             exp: future_exp,
         };
         assert!(verify_google_id_token(&claims, "my-client-id").is_err());
+    }
+
+    /// Integration-style test: verify RS256 signature with a locally generated key.
+    #[tokio::test]
+    async fn test_extract_google_claims_verifies_rs256() {
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::signature::SignerMut;
+
+        // Generate a test RSA key pair
+        let mut rng = rand::thread_rng();
+        let private_key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let public_key = RsaPublicKey::from(&private_key);
+
+        let kid = "test-kid-001";
+
+        // Build JWT header
+        let header_json = serde_json::json!({"alg": "RS256", "typ": "JWT", "kid": kid});
+        let header_b64 = URL_SAFE_NO_PAD.encode(header_json.to_string().as_bytes());
+
+        // Build JWT payload
+        let claims_json = serde_json::json!({
+            "sub": "12345",
+            "email": "user@example.com",
+            "email_verified": true,
+            "name": "Test User",
+            "iss": "https://accounts.google.com",
+            "aud": "my-client-id",
+            "exp": 9999999999i64,
+        });
+        let payload_b64 = URL_SAFE_NO_PAD.encode(claims_json.to_string().as_bytes());
+
+        // Sign
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        let mut signing_key = SigningKey::<Sha256>::new(private_key);
+        let sig = rsa::signature::SignerMut::sign(&mut signing_key, signing_input.as_bytes());
+        use rsa::signature::SignatureEncoding;
+        let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes());
+
+        let jwt = format!("{header_b64}.{payload_b64}.{sig_b64}");
+
+        // Pre-populate the JWKS cache with our test key (no HTTP needed)
+        let cache = GoogleJwksCache::new();
+        {
+            let mut inner = cache.inner.write().await;
+            inner.keys.insert(
+                kid.to_string(),
+                CachedRsaKey {
+                    key: public_key.clone(),
+                },
+            );
+            inner.fetched_at = Some(Instant::now());
+        }
+
+        // The HTTP client won't be used since the cache is populated
+        let http_client = reqwest::Client::new();
+        let claims = extract_google_claims(&jwt, "my-client-id", &cache, &http_client)
+            .await
+            .unwrap();
+        assert_eq!(claims.sub, "12345");
+        assert_eq!(claims.email, "user@example.com");
+        assert!(claims.email_verified);
+    }
+
+    /// Verify that a token with an invalid signature is rejected.
+    #[tokio::test]
+    async fn test_extract_google_claims_rejects_bad_signature() {
+        let mut rng = rand::thread_rng();
+        let private_key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let public_key = RsaPublicKey::from(&private_key);
+
+        let kid = "test-kid-002";
+
+        let header_json = serde_json::json!({"alg": "RS256", "typ": "JWT", "kid": kid});
+        let header_b64 = URL_SAFE_NO_PAD.encode(header_json.to_string().as_bytes());
+
+        let claims_json = serde_json::json!({
+            "sub": "12345",
+            "email": "user@example.com",
+            "email_verified": true,
+            "iss": "https://accounts.google.com",
+            "aud": "my-client-id",
+            "exp": 9999999999i64,
+        });
+        let payload_b64 = URL_SAFE_NO_PAD.encode(claims_json.to_string().as_bytes());
+
+        // Use garbage signature bytes (valid base64url but not a real RS256 sig)
+        let fake_sig = URL_SAFE_NO_PAD.encode(&[0xDEu8; 64]);
+
+        let jwt = format!("{header_b64}.{payload_b64}.{fake_sig}");
+
+        let cache = GoogleJwksCache::new();
+        {
+            let mut inner = cache.inner.write().await;
+            inner.keys.insert(
+                kid.to_string(),
+                CachedRsaKey {
+                    key: public_key,
+                },
+            );
+            inner.fetched_at = Some(Instant::now());
+        }
+
+        let http_client = reqwest::Client::new();
+        let result = extract_google_claims(&jwt, "my-client-id", &cache, &http_client).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("signature") || err.contains("Signature"),
+            "error should mention signature, got: {err}"
+        );
+    }
+
+    /// Verify wrong algorithm is rejected (before any JWKS lookup).
+    #[tokio::test]
+    async fn test_extract_rejects_wrong_alg() {
+        let header_json = serde_json::json!({"alg": "HS256", "typ": "JWT", "kid": "k"});
+        let header = URL_SAFE_NO_PAD.encode(header_json.to_string().as_bytes());
+
+        let claims_json = serde_json::json!({
+            "sub": "12345", "email": "user@example.com", "email_verified": true,
+            "iss": "https://accounts.google.com", "aud": "my-client-id", "exp": 9999999999i64,
+        });
+        let payload = URL_SAFE_NO_PAD.encode(claims_json.to_string().as_bytes());
+        let fake_sig = URL_SAFE_NO_PAD.encode(b"sig");
+        let jwt = format!("{header}.{payload}.{fake_sig}");
+
+        let cache = GoogleJwksCache::new();
+        let http_client = reqwest::Client::new();
+        let result = extract_google_claims(&jwt, "my-client-id", &cache, &http_client).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("RS256"));
+    }
+
+    /// Verify missing kid is rejected.
+    #[tokio::test]
+    async fn test_extract_rejects_missing_kid() {
+        let header_json = serde_json::json!({"alg": "RS256", "typ": "JWT"});
+        let header = URL_SAFE_NO_PAD.encode(header_json.to_string().as_bytes());
+
+        let claims_json = serde_json::json!({
+            "sub": "12345", "email": "user@example.com", "email_verified": true,
+            "iss": "https://accounts.google.com", "aud": "my-client-id", "exp": 9999999999i64,
+        });
+        let payload = URL_SAFE_NO_PAD.encode(claims_json.to_string().as_bytes());
+        let fake_sig = URL_SAFE_NO_PAD.encode(b"sig");
+        let jwt = format!("{header}.{payload}.{fake_sig}");
+
+        let cache = GoogleJwksCache::new();
+        let http_client = reqwest::Client::new();
+        let result = extract_google_claims(&jwt, "my-client-id", &cache, &http_client).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("kid"));
     }
 }

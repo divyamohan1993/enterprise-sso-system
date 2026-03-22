@@ -46,7 +46,7 @@ fn build_valid_receipt_chain(signing_key: &[u8; 64]) -> Vec<Receipt> {
     let mut r1 = Receipt {
         ceremony_session_id: session_id,
         step_id: 1,
-        prev_receipt_hash: [0u8; 32],
+        prev_receipt_hash: [0u8; 64],
         user_id,
         dpop_key_hash: dpop_hash,
         timestamp: ts,
@@ -100,7 +100,7 @@ fn receipt_chain_forgery_rejected() {
     let mut chain = build_valid_receipt_chain(&signing_key);
 
     // Tamper with the second receipt's prev_receipt_hash
-    chain[1].prev_receipt_hash = [0xFF; 32];
+    chain[1].prev_receipt_hash = [0xFF; 64];
 
     let result = validate_receipt_chain(&chain, &signing_key);
     assert!(
@@ -127,6 +127,7 @@ fn expired_token_rejected() {
         ceremony_id: [0xCC; 32],
         tier: 2,
         ratchet_epoch: 1,
+        token_id: [0xAB; 16],
     };
 
     let (pq_sk, pq_vk) = generate_pq_keypair();
@@ -162,6 +163,7 @@ fn tampered_token_rejected() {
         ceremony_id: [0xCC; 32],
         tier: 2,
         ratchet_epoch: 1,
+        token_id: [0xAB; 16],
     };
 
     let (pq_sk, pq_vk) = generate_pq_keypair();
@@ -266,7 +268,7 @@ fn merkle_inclusion_proof_valid() {
     );
 
     // Tampered leaf should fail
-    let fake_leaf = [0xFF; 32];
+    let fake_leaf = [0xFF; 64];
     assert!(
         !MerkleTree::verify_inclusion(&root, &fake_leaf, &proof, 0),
         "tampered leaf must fail verification"

@@ -2,6 +2,16 @@
 
 use serde::{Deserialize, Serialize};
 
+/// X-Wing KEM ciphertext sent from server to client after puzzle verification.
+///
+/// The client decapsulates this against their private key to obtain the same
+/// shared secret the server derived during encapsulation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KemCiphertext {
+    /// Serialized `crypto::xwing::Ciphertext` (X25519 ephemeral PK || ML-KEM-1024 CT).
+    pub ciphertext: Vec<u8>,
+}
+
 /// Authentication request sent by a client after solving the puzzle.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthRequest {

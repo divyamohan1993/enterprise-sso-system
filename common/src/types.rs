@@ -39,6 +39,8 @@ pub struct TokenClaims {
     pub ceremony_id: [u8; 32],
     pub tier: u8,
     pub ratchet_epoch: u64,
+    /// Unique token identifier for revocation lookups.
+    pub token_id: [u8; 16],
 }
 
 /// Custom Debug for TokenClaims — redacts cryptographic material.
@@ -54,6 +56,7 @@ impl std::fmt::Debug for TokenClaims {
             .field("ceremony_id", &"[REDACTED]")
             .field("tier", &self.tier)
             .field("ratchet_epoch", &self.ratchet_epoch)
+            .field("token_id", &"[REDACTED]")
             .finish()
     }
 }
@@ -64,6 +67,7 @@ impl Drop for TokenClaims {
         self.iss.zeroize();
         self.dpop_hash.zeroize();
         self.ceremony_id.zeroize();
+        self.token_id.zeroize();
     }
 }
 
@@ -110,6 +114,7 @@ impl Token {
                 ceremony_id: [0xCC; 32],
                 tier: 1,
                 ratchet_epoch: 42,
+                token_id: [0xAB; 16],
             },
             ratchet_tag: [0xDD; 64],
             frost_signature: [0xEE; 64],
@@ -124,7 +129,8 @@ impl Token {
 pub struct Receipt {
     pub ceremony_session_id: [u8; 32],
     pub step_id: u8,
-    pub prev_receipt_hash: [u8; 32],
+    #[serde(with = "byte_array_64")]
+    pub prev_receipt_hash: [u8; 64],
     pub user_id: Uuid,
     pub dpop_key_hash: [u8; 32],
     pub timestamp: i64,
@@ -163,7 +169,7 @@ impl Receipt {
         Receipt {
             ceremony_session_id: [0x01; 32],
             step_id: 1,
-            prev_receipt_hash: [0x00; 32],
+            prev_receipt_hash: [0x00; 64],
             user_id: Uuid::nil(),
             dpop_key_hash: [0x02; 32],
             timestamp: 1_700_000_000_000_000,
@@ -240,7 +246,8 @@ pub struct AuditEntry {
     pub ceremony_receipts: Vec<Receipt>,
     pub risk_score: f64,
     pub timestamp: i64,
-    pub prev_hash: [u8; 32],
+    #[serde(with = "byte_array_64")]
+    pub prev_hash: [u8; 64],
     pub signature: Vec<u8>,
 }
 

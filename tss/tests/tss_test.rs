@@ -28,7 +28,7 @@ fn build_signed_chain(len: usize, signing_key: &[u8; 64]) -> Vec<Receipt> {
 
     for i in 0..len {
         let prev_hash = if i == 0 {
-            [0u8; 32]
+            [0u8; 64]
         } else {
             hash_receipt(&chain[i - 1])
         };
@@ -63,6 +63,7 @@ fn test_claims() -> TokenClaims {
         ceremony_id: [0x01; 32],
         tier: 1,
         ratchet_epoch: 42,
+        token_id: [0xAB; 16],
     }
 }
 
@@ -83,7 +84,7 @@ fn broken_chain_rejected() {
     let mut chain = build_signed_chain(3, &key);
 
     // Tamper with the second receipt's prev_receipt_hash
-    chain[1].prev_receipt_hash = [0xFF; 32];
+    chain[1].prev_receipt_hash = [0xFF; 64];
     // Re-sign so signature is valid but chain linkage is broken
     sign_receipt(&mut chain[1], &key);
 

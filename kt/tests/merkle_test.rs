@@ -4,7 +4,7 @@ use uuid::Uuid;
 #[test]
 fn empty_tree_has_zero_root() {
     let tree = MerkleTree::new();
-    assert_eq!(tree.root(), [0u8; 32]);
+    assert_eq!(tree.root(), [0u8; 64]);
     assert!(tree.is_empty());
 }
 
@@ -47,7 +47,7 @@ fn inclusion_proof_rejects_wrong_leaf() {
 
     let root = tree.root();
     let proof = tree.inclusion_proof(2).expect("proof should exist");
-    let wrong_leaf = [0xFF; 32];
+    let wrong_leaf = [0xFF; 64];
     assert!(!MerkleTree::verify_inclusion(&root, &wrong_leaf, &proof, 2));
 }
 

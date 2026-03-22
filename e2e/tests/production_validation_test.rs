@@ -326,6 +326,7 @@ async fn client_auth(gateway_addr: &str, username: &str, password: &[u8]) -> Aut
     let solution = PuzzleSolution {
         nonce: challenge.nonce,
         solution: solution_bytes,
+        xwing_client_pk: None,
     };
     send_frame(&mut stream, &solution)
         .await
@@ -353,7 +354,7 @@ fn build_valid_receipt_chain(signing_key: &[u8; 64]) -> Vec<Receipt> {
     let mut r1 = Receipt {
         ceremony_session_id: session_id,
         step_id: 1,
-        prev_receipt_hash: [0u8; 32],
+        prev_receipt_hash: [0u8; 64],
         user_id,
         dpop_key_hash: dpop_hash,
         timestamp: ts,
@@ -393,6 +394,7 @@ fn make_valid_token_and_key() -> (Token, frost_ristretto255::keys::PublicKeyPack
         ceremony_id: [0xCC; 32],
         tier: 2,
         ratchet_epoch: 1,
+        token_id: [0xAB; 16],
     };
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
     let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
@@ -587,6 +589,7 @@ async fn test_puzzle_not_solved_rejected() {
     let solution = PuzzleSolution {
         nonce: challenge.nonce,
         solution: [0u8; 32],
+        xwing_client_pk: None,
     };
     send_frame(&mut stream, &solution)
         .await
@@ -635,6 +638,7 @@ fn test_token_signature_cannot_be_transplanted() {
         ceremony_id: [0x01; 32],
         tier: 2,
         ratchet_epoch: 1,
+        token_id: [0xAB; 16],
     };
     let claims_b = TokenClaims {
         sub: Uuid::new_v4(),
@@ -646,6 +650,7 @@ fn test_token_signature_cannot_be_transplanted() {
         ceremony_id: [0x02; 32],
         tier: 2,
         ratchet_epoch: 1,
+        token_id: [0xAB; 16],
     };
 
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
@@ -685,6 +690,7 @@ fn test_expired_token_rejected() {
         ceremony_id: [0xCC; 32],
         tier: 2,
         ratchet_epoch: 1,
+        token_id: [0xAB; 16],
     };
 
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
@@ -714,6 +720,7 @@ fn test_token_from_different_dkg_rejected() {
         ceremony_id: [0xCC; 32],
         tier: 2,
         ratchet_epoch: 1,
+        token_id: [0xAB; 16],
     };
     let (coordinator1, mut nodes1) = distribute_shares(&mut dkg1);
     let (pq_sk, _pq_vk) = crypto::pq_sign::generate_pq_keypair();
@@ -1006,7 +1013,7 @@ fn test_kt_proof_invalid_for_modified_credential() {
     assert!(MerkleTree::verify_inclusion(&root, &leaf, &proof, 0));
 
     // Modify the leaf hash
-    let fake_leaf = [0xFF; 32];
+    let fake_leaf = [0xFF; 64];
     assert!(
         !MerkleTree::verify_inclusion(&root, &fake_leaf, &proof, 0),
         "modified credential must fail proof verification"
@@ -1628,7 +1635,7 @@ fn test_receipt_chain_integrity() {
 
     // Tamper with hash chain linkage -> should fail
     let mut tampered = chain.clone();
-    tampered[1].prev_receipt_hash = [0xFF; 32];
+    tampered[1].prev_receipt_hash = [0xFF; 64];
     assert!(validate_receipt_chain(&tampered, &signing_key).is_err());
 
     // Tamper with signature -> should fail

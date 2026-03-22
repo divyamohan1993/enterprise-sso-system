@@ -1,7 +1,8 @@
+//! CNSA 2.0 compliant audit log with SHA-512 hash chain.
 use common::domain;
 use common::types::{AuditEntry, AuditEventType, Receipt};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha512};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -25,14 +26,14 @@ pub struct AuditResponse {
 
 pub struct AuditLog {
     entries: Vec<AuditEntry>,
-    last_hash: [u8; 32],
+    last_hash: [u8; 64],
 }
 
 impl AuditLog {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
-            last_hash: [0u8; 32],
+            last_hash: [0u8; 64],
         }
     }
 
@@ -61,7 +62,7 @@ impl AuditLog {
     }
 
     pub fn verify_chain(&self) -> bool {
-        let mut expected_prev = [0u8; 32];
+        let mut expected_prev = [0u8; 64];
         for entry in &self.entries {
             if entry.prev_hash != expected_prev {
                 return false;
@@ -124,8 +125,9 @@ impl Default for AuditLog {
     }
 }
 
-pub fn hash_entry(entry: &AuditEntry) -> [u8; 32] {
-    let mut hasher = Sha256::new();
+/// Hash an audit entry using SHA-512 (CNSA 2.0 compliant).
+pub fn hash_entry(entry: &AuditEntry) -> [u8; 64] {
+    let mut hasher = Sha512::new();
     hasher.update(domain::AUDIT_ENTRY);
     hasher.update(entry.event_id.as_bytes());
     // Include event_type in the hash to prevent type-confusion attacks
@@ -141,7 +143,7 @@ pub fn hash_entry(entry: &AuditEntry) -> [u8; 32] {
     hasher.update(entry.timestamp.to_le_bytes());
     hasher.update(entry.prev_hash);
     let result = hasher.finalize();
-    let mut hash = [0u8; 32];
+    let mut hash = [0u8; 64];
     hash.copy_from_slice(&result);
     hash
 }

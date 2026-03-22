@@ -7,8 +7,10 @@
 //! shared_secret = SHA3-256("X-Wing" || ml_kem_ss || ml_kem_ct || x25519_ss || x25519_pk_client || x25519_pk_server)
 //! ```
 
+use hkdf::Hkdf;
 use ml_kem::kem::{Decapsulate, Encapsulate};
 use ml_kem::{EncodedSizeUser, KemCore, MlKem1024};
+use sha2::Sha512;
 use sha3::{Digest, Sha3_256};
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -40,6 +42,25 @@ impl AsRef<[u8]> for SharedSecret {
     fn as_ref(&self) -> &[u8] {
         &self.0
     }
+}
+
+/// Length of the HKDF-derived session key in bytes (64 bytes = 512 bits).
+pub const SESSION_KEY_LEN: usize = 64;
+
+/// Derive a session encryption key from the X-Wing shared secret using
+/// HKDF-SHA512.  The `context` parameter should uniquely bind the derivation
+/// to the current session (e.g. concatenation of nonces from both sides).
+///
+/// Returns a 64-byte key suitable for splitting into encryption + MAC keys.
+pub fn derive_session_key(
+    shared_secret: &SharedSecret,
+    context: &[u8],
+) -> [u8; SESSION_KEY_LEN] {
+    let hk = Hkdf::<Sha512>::new(Some(context), shared_secret.as_bytes());
+    let mut okm = [0u8; SESSION_KEY_LEN];
+    hk.expand(b"X-Wing-Session-Key-v1", &mut okm)
+        .expect("64 bytes is within HKDF-SHA512 output limit");
+    okm
 }
 
 /// The public portion of an X-Wing key pair, containing both an X25519 public

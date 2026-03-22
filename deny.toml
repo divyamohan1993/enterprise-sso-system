@@ -70,7 +70,13 @@ feature-depth = 1
 # A list of advisory IDs to ignore. Note that ignored advisories will still
 # output a note when they are encountered.
 ignore = [
-    { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill unmaintained — transitive via postcard->heapless, no security impact" },
+    # RUSTSEC-2023-0089: atomic-polyfill is unmaintained.
+    # This is a transitive dependency pulled in via: postcard -> heapless -> atomic-polyfill.
+    # atomic-polyfill provides AtomicU* polyfills for targets without native atomics (e.g., thumbv6).
+    # On our target (x86_64), native atomics are used and this crate is never invoked at runtime.
+    # No known security vulnerability — this advisory is "unmaintained" only.
+    # Re-evaluate when heapless >= 0.9 drops the atomic-polyfill dependency.
+    { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill unmaintained — transitive via postcard->heapless, no security impact on x86_64; dead code on native-atomic targets" },
     #{ crate = "a-crate-that-is-yanked@0.1.1", reason = "you can specify why you are ignoring the yanked crate" },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
@@ -224,10 +230,10 @@ skip-tree = [
 [sources]
 # Lint level for what to happen when a crate from a crate registry that is not
 # in the allow list is encountered
-unknown-registry = "warn"
+unknown-registry = "deny"
 # Lint level for what to happen when a crate from a git repository that is not
 # in the allow list is encountered
-unknown-git = "warn"
+unknown-git = "deny"
 # List of URLs for allowed crate registries. Defaults to the crates.io index
 # if not specified. If it is specified but empty, no registries are allowed.
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -70,6 +70,27 @@ pub struct SecurityConfig {
     /// Maximum concurrent sessions per user.
     pub max_concurrent_sessions_per_user: u32,
 
+    // ── HSM/Key Management parameters ──
+
+    /// HSM backend type: "pkcs11", "aws-kms", "tpm2", or "software".
+    /// In production mode, "software" triggers a warning (or failure if
+    /// `require_hsm_backend` is true).
+    pub hsm_backend: String,
+    /// Require a hardware HSM backend in production mode.
+    /// When true and production mode is active, the "software" backend
+    /// is rejected at startup.
+    pub require_hsm_backend: bool,
+    /// PKCS#11 library path (e.g., `/usr/lib/softhsm/libsofthsm2.so`).
+    pub hsm_pkcs11_library_path: String,
+    /// PKCS#11 slot number.
+    pub hsm_pkcs11_slot: u64,
+    /// AWS KMS key ARN or alias.
+    pub hsm_aws_kms_key_id: String,
+    /// TPM 2.0 device path.
+    pub hsm_tpm2_device: String,
+    /// Key label in the HSM for the master key.
+    pub hsm_key_label: String,
+
     // ── OAuth/OIDC hardening parameters ──
 
     /// Require exact redirect URI matching (no wildcards or prefix matching).
@@ -118,6 +139,15 @@ impl Default for SecurityConfig {
             require_dpop_all_operations: true,
             max_concurrent_sessions_per_user: 3,
 
+            // HSM/Key Management defaults
+            hsm_backend: "software".to_string(),
+            require_hsm_backend: true,
+            hsm_pkcs11_library_path: String::new(),
+            hsm_pkcs11_slot: 0,
+            hsm_aws_kms_key_id: String::new(),
+            hsm_tpm2_device: "/dev/tpmrm0".to_string(),
+            hsm_key_label: "MILNET-MASTER-KEK-v1".to_string(),
+
             // OAuth/OIDC hardening defaults — all enabled for maximum security
             require_strict_redirect_uri: true,
             require_pkce: true,
@@ -137,6 +167,44 @@ impl SecurityConfig {
             4 => self.token_lifetime_tier4_secs,
             _ => 0,
         }
+    }
+
+    /// Validate the HSM configuration for the current environment.
+    ///
+    /// In production mode (`MILNET_PRODUCTION=1`):
+    /// - If `require_hsm_backend` is true and `hsm_backend` is "software",
+    ///   this returns an error message.
+    /// - If `require_hsm_backend` is false but `hsm_backend` is "software",
+    ///   a warning is printed.
+    ///
+    /// Returns `Ok(())` if the configuration is acceptable, or `Err(msg)`
+    /// with a description of the problem.
+    pub fn validate_hsm_config(&self) -> Result<(), String> {
+        let is_production = crate::sealed_keys::is_production();
+        let is_software = self.hsm_backend == "software";
+
+        if is_production && is_software {
+            if self.require_hsm_backend {
+                return Err(
+                    "FATAL: Software HSM backend is forbidden in production mode. \
+                     Set MILNET_HSM_BACKEND to pkcs11, aws-kms, or tpm2."
+                        .to_string(),
+                );
+            }
+            eprintln!(
+                "WARNING: Software HSM backend in production mode. \
+                 This is NOT recommended — configure a hardware HSM."
+            );
+        }
+
+        if is_production && !is_software {
+            eprintln!(
+                "INFO: Production mode with hardware HSM backend '{}'.",
+                self.hsm_backend
+            );
+        }
+
+        Ok(())
     }
 
     /// Maximum ratchet epoch for the configured session lifetime.

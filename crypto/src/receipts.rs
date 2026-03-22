@@ -3,19 +3,22 @@
 //! Each ceremony step produces a Receipt signed by the issuing service.
 //! Receipts form a hash chain: each includes H(previous_receipt).
 //! The TSS validates the complete chain before signing a token.
+//!
+//! CNSA 2.0 compliance: All hashing upgraded from SHA-256 to SHA-512.
+//! HMAC upgraded from HMAC-SHA256 to HMAC-SHA512.
 
 use hmac::{Hmac, Mac};
 use common::domain;
 use common::types::Receipt;
-use sha2::Sha256;
+use sha2::Sha512;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-type HmacSha256 = Hmac<Sha256>;
+type HmacSha512 = Hmac<Sha512>;
 
-/// Hash a receipt for chain linking
-pub fn hash_receipt(receipt: &Receipt) -> [u8; 32] {
+/// Hash a receipt for chain linking (CNSA 2.0: SHA-512)
+pub fn hash_receipt(receipt: &Receipt) -> [u8; 64] {
     use sha2::Digest;
-    let mut hasher = sha2::Sha256::new();
+    let mut hasher = sha2::Sha512::new();
     hasher.update(domain::RECEIPT_CHAIN);
     hasher.update(receipt.ceremony_session_id);
     hasher.update([receipt.step_id]);
@@ -25,12 +28,12 @@ pub fn hash_receipt(receipt: &Receipt) -> [u8; 32] {
     hasher.update(ts_bytes);
     hasher.update(receipt.nonce);
     let result = hasher.finalize();
-    let mut hash = [0u8; 32];
+    let mut hash = [0u8; 64];
     hash.copy_from_slice(&result);
     hash
 }
 
-fn mac_receipt_fields(mac: &mut HmacSha256, receipt: &Receipt) {
+fn mac_receipt_fields(mac: &mut HmacSha512, receipt: &Receipt) {
     mac.update(domain::RECEIPT_SIGN);
     mac.update(&receipt.ceremony_session_id);
     mac.update(&[receipt.step_id]);
@@ -40,16 +43,16 @@ fn mac_receipt_fields(mac: &mut HmacSha256, receipt: &Receipt) {
     mac.update(&receipt.nonce);
 }
 
-/// Sign a receipt with HMAC (placeholder for Ed25519 receipt key from HSM)
+/// Sign a receipt with HMAC-SHA512 (CNSA 2.0 compliant)
 pub fn sign_receipt(receipt: &mut Receipt, signing_key: &[u8; 64]) {
-    let mut mac = HmacSha256::new_from_slice(signing_key).expect("HMAC key length is always valid");
+    let mut mac = HmacSha512::new_from_slice(signing_key).expect("HMAC key length is always valid");
     mac_receipt_fields(&mut mac, receipt);
     receipt.signature = mac.finalize().into_bytes().to_vec();
 }
 
-/// Verify a receipt's signature
+/// Verify a receipt's signature (HMAC-SHA512)
 pub fn verify_receipt_signature(receipt: &Receipt, signing_key: &[u8; 64]) -> bool {
-    let mut mac = HmacSha256::new_from_slice(signing_key).expect("HMAC key length is always valid");
+    let mut mac = HmacSha512::new_from_slice(signing_key).expect("HMAC key length is always valid");
     mac_receipt_fields(&mut mac, receipt);
     let expected = mac.finalize().into_bytes();
     crate::ct::ct_eq(&receipt.signature, &expected)
@@ -79,7 +82,7 @@ impl ReceiptChain {
         // Verify hash chain linkage
         if self.receipts.is_empty() {
             // First receipt: prev_receipt_hash should be zeros
-            if !crate::ct::ct_eq(&receipt.prev_receipt_hash, &[0u8; 32]) {
+            if !crate::ct::ct_eq(&receipt.prev_receipt_hash, &[0u8; 64]) {
                 return Err("first receipt must have zero prev_hash".into());
             }
         } else {

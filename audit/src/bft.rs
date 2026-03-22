@@ -28,13 +28,13 @@ impl AuditNode {
     }
 
     /// Accept an entry proposal. Returns the entry hash if accepted.
-    pub fn accept_entry(&mut self, entry: &AuditEntry) -> Option<[u8; 32]> {
+    pub fn accept_entry(&mut self, entry: &AuditEntry) -> Option<[u8; 64]> {
         if self.is_byzantine {
             return None; // Byzantine node refuses
         }
         // Verify the entry's prev_hash matches our last hash
         let our_last = if self.log.is_empty() {
-            [0u8; 32]
+            [0u8; 64]
         } else {
             hash_entry(&self.log.entries()[self.log.len() - 1])
         };
@@ -89,7 +89,7 @@ impl BftAuditCluster {
         device_ids: Vec<Uuid>,
         risk_score: f64,
         ceremony_receipts: Vec<Receipt>,
-    ) -> Result<[u8; 32], String> {
+    ) -> Result<[u8; 64], String> {
         // Build the entry using the first honest node's state for prev_hash.
         let prev_hash = self
             .nodes
@@ -97,12 +97,12 @@ impl BftAuditCluster {
             .find(|n| !n.is_byzantine)
             .map(|n| {
                 if n.log.is_empty() {
-                    [0u8; 32]
+                    [0u8; 64]
                 } else {
                     hash_entry(&n.log.entries()[n.log.len() - 1])
                 }
             })
-            .unwrap_or([0u8; 32]);
+            .unwrap_or([0u8; 64]);
 
         let mut entry = AuditEntry {
             event_id: Uuid::new_v4(),
@@ -126,7 +126,7 @@ impl BftAuditCluster {
 
         // Propose to all nodes, count acceptances.
         let mut accept_count = 0usize;
-        let mut entry_hash = [0u8; 32];
+        let mut entry_hash = [0u8; 64];
 
         for node in &mut self.nodes {
             if let Some(hash) = node.accept_entry(&entry) {

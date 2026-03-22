@@ -21,6 +21,11 @@ enum KtRequest {
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
+
+    // Platform integrity: vTPM check, process hardening, self-attestation, monitor
+    let (_platform_report, _monitor_handle, _monitor) =
+        common::startup_checks::run_platform_checks(crypto::memguard::harden_process);
+
     tracing::info!("Key Transparency service starting");
 
     let tree = Arc::new(RwLock::new(kt::merkle::MerkleTree::new()));

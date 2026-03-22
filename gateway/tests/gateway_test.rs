@@ -90,6 +90,7 @@ async fn gateway_accepts_solved_puzzle() {
     let solution = PuzzleSolution {
         nonce: challenge.nonce,
         solution: solution_bytes,
+        xwing_client_pk: None,
     };
     send_frame(&mut stream, &solution).await;
 

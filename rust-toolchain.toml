@@ -1,0 +1,5 @@
+[toolchain]
+channel = "1.85.0"
+components = ["clippy", "rustfmt"]
+# Pin to a specific Rust release for reproducible builds across CI and developer machines.
+# Update deliberately after testing — do not use "stable" channel in production pipelines.

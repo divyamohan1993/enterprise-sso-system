@@ -3,6 +3,11 @@
 //! Implements authenticator data validation per the W3C WebAuthn spec
 //! (§6.1 "Authenticator Data"). Actual ECDSA signature verification
 //! is stubbed until a suitable crypto crate (e.g. `p256`) is added.
+//!
+//! CNSA 2.0 exception: SHA-256 is mandated by the W3C WebAuthn specification
+//! and FIDO2 CTAP2 protocol for RP ID hashing and client data hashing.
+//! Changing this hash would break all WebAuthn authenticators. CNSA 2.0
+//! exception granted for FIDO2/WebAuthn interoperability.
 
 use sha2::{Digest, Sha256};
 

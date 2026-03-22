@@ -1,5 +1,9 @@
 //! Duress PIN protocol (spec Section 7, Errata B.4)
 //! A secondary PIN that appears to work but silently triggers lockdown.
+//!
+//! CNSA 2.0 compliance: All PIN hashing uses SHA-512 family.
+//! Legacy v1 SHA-256 path upgraded to SHA-512 (v1b).
+//! New installations use HKDF-SHA512 (v2).
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -7,14 +11,20 @@ use uuid::Uuid;
 /// Version tag prepended to HKDF-based hashes to distinguish from legacy SHA-256.
 const HKDF_V2_TAG: u8 = 0x02;
 
-/// Version tag for legacy SHA-256 hashes (implicit in old data, explicit here).
+/// Version tag for legacy SHA-256 hashes — no longer generated, only accepted
+/// for backward compatibility during migration.
 const SHA256_V1_TAG: u8 = 0x01;
+
+/// Version tag for upgraded legacy path using SHA-512 (CNSA 2.0 compliant).
+const SHA512_V1B_TAG: u8 = 0x03;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DuressConfig {
     pub user_id: Uuid,
     /// PIN hash bytes. Format: version_tag(1) || hash_data(variable).
-    /// v1 = SHA-256 (32 bytes payload), v2 = HKDF-SHA512 (64 bytes payload).
+    /// v1 = SHA-256 (32 bytes payload) [legacy, read-only],
+    /// v1b = SHA-512 (64 bytes payload) [CNSA 2.0 upgrade of v1],
+    /// v2 = HKDF-SHA512 (64 bytes payload).
     pub normal_pin_hash: Vec<u8>,
     pub duress_pin_hash: Vec<u8>,
     /// Random salt for HKDF-based PIN hashing (v2+).
@@ -45,8 +55,25 @@ fn hash_pin_v2(pin: &[u8], salt: &[u8; 32]) -> Vec<u8> {
     result
 }
 
+/// Hash a PIN using SHA-512 with domain separation (v1b format, CNSA 2.0 compliant).
+/// Returns version_tag(1) || sha512_hash(64).
+fn hash_pin_v1b(pin: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha512};
+    let mut hasher = Sha512::new();
+    hasher.update(b"MILNET-SSO-v2-DURESS-PIN");
+    hasher.update(pin);
+    let hash: [u8; 64] = hasher.finalize().into();
+
+    let mut result = Vec::with_capacity(1 + 64);
+    result.push(SHA512_V1B_TAG);
+    result.extend_from_slice(&hash);
+    result
+}
+
 /// Hash a PIN using legacy SHA-256 with domain separation (v1 format).
 /// Returns version_tag(1) || sha256_hash(32).
+/// DEPRECATED: Only used for verifying existing v1 hashes during migration.
+/// Not CNSA 2.0 compliant — retained solely for backward compatibility.
 fn hash_pin_v1(pin: &[u8]) -> Vec<u8> {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -61,7 +88,7 @@ fn hash_pin_v1(pin: &[u8]) -> Vec<u8> {
 }
 
 /// Constant-time comparison of a candidate hash against a stored hash.
-/// Handles both v1 (SHA-256) and v2 (HKDF-SHA512) formats.
+/// Handles v1 (SHA-256, legacy), v1b (SHA-512, CNSA 2.0), and v2 (HKDF-SHA512) formats.
 fn verify_pin_hash(pin: &[u8], stored: &[u8], salt: &[u8; 32]) -> bool {
     use subtle::ConstantTimeEq;
 
@@ -74,14 +101,30 @@ fn verify_pin_hash(pin: &[u8], stored: &[u8], salt: &[u8; 32]) -> bool {
             let candidate = hash_pin_v2(pin, salt);
             candidate.ct_eq(stored).into()
         }
+        SHA512_V1B_TAG => {
+            let candidate = hash_pin_v1b(pin);
+            candidate.ct_eq(stored).into()
+        }
         SHA256_V1_TAG => {
+            // Legacy SHA-256 path — accepted for backward compatibility only.
+            // New DuressConfig instances always use v2 (HKDF-SHA512).
             let candidate = hash_pin_v1(pin);
             candidate.ct_eq(stored).into()
         }
         _ => {
-            // Legacy format without version tag: treat as raw SHA-256 (32 bytes)
+            // Legacy format without version tag: treat as raw SHA-512 (64 bytes)
             // for backward compatibility with pre-versioned data.
-            if stored.len() == 32 {
+            // CNSA 2.0: upgraded from SHA-256 to SHA-512.
+            if stored.len() == 64 {
+                use sha2::{Digest, Sha512};
+                let mut hasher = Sha512::new();
+                hasher.update(b"MILNET-SSO-v2-DURESS-PIN");
+                hasher.update(pin);
+                let hash: [u8; 64] = hasher.finalize().into();
+                hash.ct_eq(stored).into()
+            } else if stored.len() == 32 {
+                // Very old legacy format (SHA-256, 32 bytes, no tag).
+                // Retained for migration path only. Not CNSA 2.0 compliant.
                 use sha2::{Digest, Sha256};
                 let mut hasher = Sha256::new();
                 hasher.update(b"MILNET-SSO-v1-DURESS-PIN");
@@ -113,7 +156,7 @@ impl DuressConfig {
     }
 
     /// Verify a PIN against both normal and duress hashes.
-    /// Supports both legacy SHA-256 (v1) and HKDF-SHA512 (v2) formats
+    /// Supports legacy SHA-256 (v1), SHA-512 (v1b), and HKDF-SHA512 (v2) formats
     /// for backward compatibility.
     pub fn verify_pin(&self, pin: &[u8]) -> PinVerification {
         let is_normal = verify_pin_hash(pin, &self.normal_pin_hash, &self.salt);

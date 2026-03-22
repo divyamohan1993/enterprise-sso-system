@@ -8,7 +8,7 @@ license.workspace = true
 common = { path = "../common" }
 crypto = { path = "../crypto" }
 shard = { path = "../shard" }
-sha3.workspace = true
+sha2.workspace = true
 serde.workspace = true
 postcard.workspace = true
 uuid.workspace = true

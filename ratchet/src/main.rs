@@ -10,8 +10,9 @@ use ratchet::manager::{RatchetAction, RatchetRequest, RatchetResponse};
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    // Harden process: disable core dumps, prevent ptrace escalation
-    crypto::memguard::harden_process();
+    // Platform integrity: vTPM check, process hardening, self-attestation, monitor
+    let (_platform_report, _monitor_handle, _monitor) =
+        common::startup_checks::run_platform_checks(crypto::memguard::harden_process);
 
     tracing::info!("Ratchet Session Manager starting");
 

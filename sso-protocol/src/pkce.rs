@@ -1,3 +1,6 @@
+// CNSA 2.0 exception: SHA-256 mandated by RFC 7636 S256 method;
+// CNSA 2.0 exception granted for OAuth interoperability.
+// Changing this hash would break all OAuth 2.0/2.1 PKCE clients.
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;

@@ -1,9 +1,10 @@
+//! Key Transparency Merkle tree — CNSA 2.0 compliant (SHA-512).
 use common::domain;
-use sha3::{Digest, Sha3_256};
+use sha2::{Digest, Sha512};
 use uuid::Uuid;
 
 pub struct MerkleTree {
-    leaves: Vec<[u8; 32]>,
+    leaves: Vec<[u8; 64]>,
 }
 
 impl MerkleTree {
@@ -17,20 +18,20 @@ impl MerkleTree {
         operation: &str,
         credential_hash: &[u8; 32],
         timestamp: i64,
-    ) -> [u8; 32] {
+    ) -> [u8; 64] {
         let leaf = compute_leaf(user_id, operation, credential_hash, timestamp);
         self.leaves.push(leaf);
         leaf
     }
 
-    pub fn root(&self) -> [u8; 32] {
+    pub fn root(&self) -> [u8; 64] {
         if self.leaves.is_empty() {
-            return [0u8; 32];
+            return [0u8; 64];
         }
         compute_root(&self.leaves)
     }
 
-    pub fn inclusion_proof(&self, index: usize) -> Option<Vec<[u8; 32]>> {
+    pub fn inclusion_proof(&self, index: usize) -> Option<Vec<[u8; 64]>> {
         if index >= self.leaves.len() {
             return None;
         }
@@ -38,15 +39,15 @@ impl MerkleTree {
     }
 
     pub fn verify_inclusion(
-        root: &[u8; 32],
-        leaf: &[u8; 32],
-        proof: &[[u8; 32]],
+        root: &[u8; 64],
+        leaf: &[u8; 64],
+        proof: &[[u8; 64]],
         index: usize,
     ) -> bool {
         let mut current = *leaf;
         let mut idx = index;
         for sibling in proof {
-            current = if idx.is_multiple_of(2) {
+            current = if idx % 2 == 0 {
                 hash_pair(&current, sibling)
             } else {
                 hash_pair(sibling, &current)
@@ -74,7 +75,7 @@ impl Default for MerkleTree {
 /// Signed Tree Head — ML-DSA-65 signature over the Merkle root
 #[derive(Debug, Clone)]
 pub struct SignedTreeHead {
-    pub root: [u8; 32],
+    pub root: [u8; 64],
     pub timestamp: i64,
     pub tree_size: usize,
     pub signature: Vec<u8>, // ML-DSA-65
@@ -120,28 +121,34 @@ fn compute_leaf(
     operation: &str,
     credential_hash: &[u8; 32],
     timestamp: i64,
-) -> [u8; 32] {
-    let mut hasher = Sha3_256::new();
+) -> [u8; 64] {
+    let mut hasher = Sha512::new();
     hasher.update(domain::KT_LEAF);
     hasher.update(user_id.as_bytes());
     hasher.update(operation.as_bytes());
     hasher.update(credential_hash);
     hasher.update(timestamp.to_le_bytes());
-    hasher.finalize().into()
+    let result = hasher.finalize();
+    let mut hash = [0u8; 64];
+    hash.copy_from_slice(&result);
+    hash
 }
 
-fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    let mut hasher = Sha3_256::new();
+fn hash_pair(left: &[u8; 64], right: &[u8; 64]) -> [u8; 64] {
+    let mut hasher = Sha512::new();
     hasher.update(left);
     hasher.update(right);
-    hasher.finalize().into()
+    let result = hasher.finalize();
+    let mut hash = [0u8; 64];
+    hash.copy_from_slice(&result);
+    hash
 }
 
-fn compute_root(leaves: &[[u8; 32]]) -> [u8; 32] {
+fn compute_root(leaves: &[[u8; 64]]) -> [u8; 64] {
     if leaves.len() == 1 {
         return leaves[0];
     }
-    let mut level: Vec<[u8; 32]> = leaves.to_vec();
+    let mut level: Vec<[u8; 64]> = leaves.to_vec();
     while level.len() > 1 {
         let mut next = Vec::new();
         for chunk in level.chunks(2) {
@@ -156,12 +163,12 @@ fn compute_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     level[0]
 }
 
-fn build_proof(leaves: &[[u8; 32]], index: usize) -> Vec<[u8; 32]> {
+fn build_proof(leaves: &[[u8; 64]], index: usize) -> Vec<[u8; 64]> {
     let mut proof = Vec::new();
-    let mut level: Vec<[u8; 32]> = leaves.to_vec();
+    let mut level: Vec<[u8; 64]> = leaves.to_vec();
     let mut idx = index;
     while level.len() > 1 {
-        let sibling_idx = if idx.is_multiple_of(2) {
+        let sibling_idx = if idx % 2 == 0 {
             idx + 1
         } else {
             idx - 1

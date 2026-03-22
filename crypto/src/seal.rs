@@ -299,6 +299,37 @@ impl ProductionKeySource for SoftwareKeySource {
 }
 
 // ---------------------------------------------------------------------------
+// Factory: create key source from HSM configuration
+// ---------------------------------------------------------------------------
+
+/// Create a [`ProductionKeySource`] from an [`HsmConfig`](crate::hsm::HsmConfig).
+///
+/// This is the recommended way to instantiate the key management layer.
+/// The returned source delegates to the appropriate HSM backend:
+///
+/// - `HsmBackend::Pkcs11` — PKCS#11 HSM (Thales Luna, CloudHSM, YubiHSM2, SoftHSM2)
+/// - `HsmBackend::AwsKms` — AWS KMS envelope encryption
+/// - `HsmBackend::Tpm2` — TPM 2.0 sealed keys
+/// - `HsmBackend::Software` — development fallback (blocked in production)
+///
+/// # Fail-Closed
+/// In production mode (`MILNET_PRODUCTION=1`), the `Software` backend is
+/// rejected. All hardware backend errors fail-closed (deny access).
+pub fn create_key_source(
+    config: &crate::hsm::HsmConfig,
+) -> Result<Box<dyn ProductionKeySource>, crate::hsm::HsmError> {
+    crate::hsm::create_key_source(config)
+}
+
+/// Create a [`ProductionKeySource`] from environment variables.
+///
+/// Reads `MILNET_HSM_BACKEND` and related env vars. Falls back to `Software`
+/// if `MILNET_HSM_BACKEND` is not set.
+pub fn create_key_source_from_env() -> Result<Box<dyn ProductionKeySource>, crate::hsm::HsmError> {
+    crate::hsm::create_key_source_from_env()
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

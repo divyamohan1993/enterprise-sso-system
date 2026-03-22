@@ -1,5 +1,6 @@
 use common::domain;
 use common::error::MilnetError;
+use common::revocation::RevocationList;
 use common::types::{Token, TokenClaims};
 use crypto::pq_sign::{pq_verify, PqVerifyingKey};
 use frost_ristretto255::keys::PublicKeyPackage;
@@ -114,6 +115,26 @@ pub fn verify_token(
     }
 
     Ok(token.claims.clone())
+}
+
+/// Verify a token with revocation check (fail-fast before crypto).
+///
+/// Checks the revocation list first (O(1) HashMap lookup), then delegates
+/// to full signature verification only if the token is not revoked.
+pub fn verify_token_with_revocation(
+    token: &Token,
+    public_key_package: &PublicKeyPackage,
+    pq_verifying_key: &PqVerifyingKey,
+    revocation_list: &RevocationList,
+) -> Result<TokenClaims, MilnetError> {
+    // Fail fast: check revocation before any expensive crypto
+    if revocation_list.is_revoked(&token.claims.token_id) {
+        return Err(MilnetError::CryptoVerification(
+            "token has been revoked".into(),
+        ));
+    }
+
+    verify_token(token, public_key_package, pq_verifying_key)
 }
 
 /// Verify a token's signature, claims, AND DPoP channel binding.

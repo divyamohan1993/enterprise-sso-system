@@ -217,6 +217,14 @@ impl OrchestratorService {
         let tier = if request.tier == 0 { 2 } else { request.tier };
         let token_lifetime_us = security_config.token_lifetime_for_tier(tier) as i64 * 1_000_000;
 
+        // Generate a cryptographically random token_id for revocation support
+        let token_id: [u8; 16] = {
+            let nonce = generate_nonce();
+            let mut id = [0u8; 16];
+            id.copy_from_slice(&nonce[..16]);
+            id
+        };
+
         let claims = TokenClaims {
             sub: session.user_id.unwrap_or(Uuid::nil()),
             iss: [0xAA; 32],
@@ -227,6 +235,7 @@ impl OrchestratorService {
             ceremony_id: session_id,
             tier,
             ratchet_epoch: 0,
+            token_id,
         };
 
         // TODO: Use X-Wing shared secret from gateway as ratchet initial key

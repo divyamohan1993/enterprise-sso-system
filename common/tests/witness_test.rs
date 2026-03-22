@@ -7,8 +7,8 @@ fn test_witness_checkpoint() {
     assert_eq!(log.len(), 0);
     assert!(log.latest().is_none());
 
-    let audit_root = [0xAA; 32];
-    let kt_root = [0xBB; 32];
+    let audit_root = [0xAA; 64];
+    let kt_root = [0xBB; 64];
     let signature = vec![0xCC; 128];
 
     log.add_checkpoint(audit_root, kt_root, signature.clone());
@@ -23,7 +23,7 @@ fn test_witness_checkpoint() {
     let first_timestamp = cp.timestamp;
 
     // Add a second checkpoint
-    log.add_checkpoint([0xDD; 32], [0xEE; 32], vec![0xFF; 64]);
+    log.add_checkpoint([0xDD; 64], [0xEE; 64], vec![0xFF; 64]);
     assert_eq!(log.len(), 2);
     let cp2 = log.latest().unwrap();
     assert_eq!(cp2.sequence, 1);

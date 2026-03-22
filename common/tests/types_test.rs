@@ -88,7 +88,7 @@ fn audit_entry_round_trip() {
         ceremony_receipts: vec![Receipt::test_fixture()],
         risk_score: 0.42,
         timestamp: 1_700_000_000_000_000,
-        prev_hash: [0x00; 32],
+        prev_hash: [0x00; 64],
         signature: vec![0x11; 64],
     };
     let bytes = postcard::to_allocvec(&entry).expect("serialize audit entry");

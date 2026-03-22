@@ -359,6 +359,7 @@ async fn tier2_full_ceremony_success() {
     let solution = PuzzleSolution {
         nonce: challenge.nonce,
         solution: solution_bytes,
+        xwing_client_pk: None,
     };
     send_frame(&mut stream, &solution)
         .await
@@ -448,6 +449,7 @@ async fn tier2_wrong_password_fails() {
     let solution = PuzzleSolution {
         nonce: challenge.nonce,
         solution: solution_bytes,
+        xwing_client_pk: None,
     };
     send_frame(&mut stream, &solution)
         .await

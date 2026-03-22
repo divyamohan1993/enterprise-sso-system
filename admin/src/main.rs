@@ -8,12 +8,25 @@ use admin::routes::{api_router, AppState};
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    // Harden process: disable core dumps, prevent ptrace escalation
-    crypto::memguard::harden_process();
+    // Platform integrity: vTPM check, process hardening, self-attestation, monitor
+    let (_platform_report, _monitor_handle, _monitor) =
+        common::startup_checks::run_platform_checks(crypto::memguard::harden_process);
 
+    // Derive admin API key deterministically from the master KEK via HKDF-SHA512.
+    // This avoids printing secrets and ensures the key is stable across restarts.
     let api_key = std::env::var("ADMIN_API_KEY").unwrap_or_else(|_| {
-        let key = hex::encode(crypto::entropy::generate_nonce());
-        eprintln!("Generated admin API key: {key}");
+        let master_kek = common::sealed_keys::load_master_kek();
+        let derived = {
+            use hkdf::Hkdf;
+            use sha2::Sha512;
+            let hk = Hkdf::<Sha512>::new(Some(b"MILNET-ADMIN-API-KEY-v1"), &master_kek);
+            let mut okm = [0u8; 32];
+            hk.expand(b"admin-api-key", &mut okm)
+                .expect("HKDF expand");
+            okm
+        };
+        let key = hex::encode(derived);
+        tracing::info!("Admin API key derived from master KEK (HKDF-SHA512)");
         key
     });
 
@@ -102,6 +115,17 @@ async fn main() {
         }
     };
 
+    // Generate ML-DSA-87 signing key for audit log entries.
+    // ML-DSA-87 keys are large (~4KB); generate on a thread with 8MB stack to avoid overflow.
+    let pq_signing_key = std::thread::Builder::new()
+        .name("pq-keygen".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| crypto::pq_sign::generate_pq_keypair().0)
+        .expect("failed to spawn PQ keygen thread")
+        .join()
+        .expect("PQ keygen thread panicked");
+    tracing::info!("Generated ML-DSA-87 signing key for audit log");
+
     let state = Arc::new(AppState {
         db: pool,
         credential_store: RwLock::new(store),
@@ -120,17 +144,32 @@ async fn main() {
         level4_count_72h: RwLock::new(Vec::new()),
         google_config,
         pending_google: RwLock::new(admin::google_oauth::PendingGoogleStore::new()),
+        google_jwks_cache: admin::google_oauth::GoogleJwksCache::new(),
         http_client: reqwest::Client::new(),
         access_tokens: RwLock::new(std::collections::HashMap::new()),
+        session_activity: RwLock::new(std::collections::HashMap::new()),
         login_attempts: RwLock::new(std::collections::HashMap::new()),
+        pq_signing_key: pq_signing_key,
     });
 
     let app = api_router(state);
 
     let port = std::env::var("ADMIN_PORT").unwrap_or_else(|_| "8080".to_string());
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
+    let is_production = std::env::var("MILNET_PRODUCTION").is_ok();
+    // In production, default to loopback; override with ADMIN_BIND_ADDR if needed.
+    let default_bind = if is_production { "127.0.0.1" } else { "0.0.0.0" };
+    let bind_addr = std::env::var("ADMIN_BIND_ADDR").unwrap_or_else(|_| default_bind.to_string());
+
+    if bind_addr == "0.0.0.0" {
+        tracing::warn!("WARNING: Binding to all interfaces (0.0.0.0). Use a TLS-terminating reverse proxy in production.");
+        if is_production {
+            tracing::warn!("MILNET_PRODUCTION is set but binding to 0.0.0.0 — set ADMIN_BIND_ADDR=127.0.0.1 for loopback-only.");
+        }
+    }
+
+    let listener = tokio::net::TcpListener::bind(format!("{bind_addr}:{port}"))
         .await
         .unwrap();
-    tracing::info!("Admin API listening on port {port}");
+    tracing::info!("Admin API listening on {bind_addr}:{port}");
     axum::serve(listener, app).await.unwrap();
 }

@@ -309,6 +309,7 @@ async fn client_auth(gateway_addr: &str, username: &str, password: &[u8]) -> Aut
     let solution = PuzzleSolution {
         nonce: challenge.nonce,
         solution: solution_bytes,
+        xwing_client_pk: None,
     };
     send_frame(&mut stream, &solution)
         .await
@@ -401,6 +402,7 @@ fn make_claims(user_id: Uuid, tier: u8, scope: u32, ttl_secs: u64) -> TokenClaim
         ceremony_id: [0xCC; 32],
         tier,
         ratchet_epoch: 0,
+        token_id: [0xAB; 16],
     }
 }
 
@@ -692,6 +694,7 @@ async fn test_attack_expired_token_at_portal() {
         ceremony_id: [0xCC; 32],
         tier: 2,
         ratchet_epoch: 0,
+        token_id: [0xAC; 16],
     };
     let mut signer_refs: Vec<&mut _> = nodes.iter_mut().take(3).collect();
     let token = build_signed_token(&claims, &coordinator, &mut signer_refs);

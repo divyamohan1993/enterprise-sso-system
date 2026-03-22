@@ -49,10 +49,25 @@ pub struct AppState {
     pub level4_count_72h: RwLock<Vec<i64>>,
     pub google_config: Option<crate::google_oauth::GoogleOAuthConfig>,
     pub pending_google: RwLock<crate::google_oauth::PendingGoogleStore>,
+    pub google_jwks_cache: crate::google_oauth::GoogleJwksCache,
     pub http_client: reqwest::Client,
-    pub access_tokens: RwLock<HashMap<String, Uuid>>,
+    pub access_tokens: RwLock<HashMap<String, AccessTokenEntry>>,
+    /// Tracks the last activity timestamp (epoch seconds) for each user session
+    /// token.  Used to enforce the AAL3 15-minute inactivity timeout.
+    pub session_activity: RwLock<HashMap<String, i64>>,
     pub login_attempts: RwLock<HashMap<String, (u32, i64)>>,
+    pub pq_signing_key: crypto::pq_sign::PqSigningKey,
 }
+
+/// Entry in the access_tokens map, pairing a user ID with a last-activity
+/// timestamp for inactivity timeout enforcement (AAL3: 15 minutes).
+pub struct AccessTokenEntry {
+    pub user_id: Uuid,
+    pub last_activity: i64,
+}
+
+/// Maximum inactivity window before a session is considered expired (AAL3).
+const INACTIVITY_TIMEOUT_SECS: i64 = 15 * 60;
 
 /// A pending multi-person ceremony that requires multiple approvers.
 #[derive(Clone, Serialize)]
@@ -115,12 +130,36 @@ async fn auth_middleware(
         Some(header) if header.starts_with("Bearer ") => {
             let token = &header[7..];
             // Accept the admin API key — treated as tier 1 (Sovereign)
-            if token == state.admin_api_key {
+            // Use constant-time comparison to prevent timing side-channels.
+            if crypto::ct::ct_eq(token.as_bytes(), state.admin_api_key.as_bytes()) {
                 request.extensions_mut().insert(AuthTier(1));
                 return Ok(next.run(request).await);
             }
             // Accept a valid user auth token (user_id:timestamp:hmac)
             if verify_user_token(token) {
+                // Enforce AAL3 inactivity timeout (15 minutes)
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64;
+                {
+                    let activity = state.session_activity.read().await;
+                    if let Some(&last) = activity.get(token) {
+                        if now - last > INACTIVITY_TIMEOUT_SECS {
+                            drop(activity);
+                            // Remove the expired session
+                            state.session_activity.write().await.remove(token);
+                            return Err(StatusCode::UNAUTHORIZED);
+                        }
+                    }
+                }
+                // Update last activity timestamp
+                state
+                    .session_activity
+                    .write()
+                    .await
+                    .insert(token.to_string(), now);
+
                 // Look up user tier from DB
                 let parts: Vec<&str> = token.splitn(3, ':').collect();
                 let tier = if parts.len() == 3 {
@@ -635,19 +674,15 @@ async fn register_user(
     .execute(&state.db)
     .await;
 
-    // Log to audit (in-memory chain + PostgreSQL)
-    // NOTE: Using append() which creates unsigned entries (empty signature).
-    // TODO: Switch to append_signed() once a PqSigningKey is provisioned in AppState.
-    // SECURITY TODO: Audit entries should be HMAC-signed or ML-DSA-65 signed to
-    // prevent tampering. Currently signature field is empty. Provision a signing
-    // key in AppState and use audit.append_signed() instead.
+    // Log to audit (in-memory chain + PostgreSQL), signed with ML-DSA-87
     let mut audit = state.audit_log.write().await;
-    let entry = audit.append(
+    let entry = audit.append_signed(
         common::types::AuditEventType::CredentialRegistered,
         vec![user_id],
         vec![],
         0.0,
         vec![],
+        &state.pq_signing_key,
     );
 
     let user_ids_json = serde_json::to_string(&entry.user_ids).unwrap_or_default();
@@ -903,15 +938,34 @@ async fn auth_login(
     {
         let mut attempts = state.login_attempts.write().await;
         let now = now_secs();
+
+        // TTL-based eviction: purge all entries older than 30 minutes on each access
+        const RATE_LIMIT_TTL_SECS: i64 = 1800;
+        attempts.retain(|_, (_, first_time)| now - *first_time < RATE_LIMIT_TTL_SECS);
+
+        // Capacity bound: prevent unbounded memory growth (max 50,000 entries).
+        // When full, evict the oldest 10% to amortise eviction cost.
+        const MAX_RATE_LIMIT_ENTRIES: usize = 50_000;
+        if attempts.len() > MAX_RATE_LIMIT_ENTRIES {
+            let target = MAX_RATE_LIMIT_ENTRIES * 9 / 10;
+            let mut entries: Vec<(String, i64)> =
+                attempts.iter().map(|(k, (_, ts))| (k.clone(), *ts)).collect();
+            entries.sort_by_key(|(_, ts)| *ts);
+            let to_remove = attempts.len() - target;
+            for (key, _) in entries.into_iter().take(to_remove) {
+                attempts.remove(&key);
+            }
+        }
+
         if let Some((count, first_time)) = attempts.get(&req.username) {
-            if now - first_time < 1800 && *count >= 5 {
+            if now - *first_time < RATE_LIMIT_TTL_SECS && *count >= 5 {
                 return Json(LoginResponse {
                     success: false,
                     error: Some("account locked — too many attempts".into()),
                     ..Default::default()
                 });
             }
-            if now - first_time >= 1800 {
+            if now - *first_time >= RATE_LIMIT_TTL_SECS {
                 attempts.remove(&req.username);
             }
         }
@@ -1356,12 +1410,11 @@ a{color:#00ff41}</style></head><body>
             if let Ok(config) = postcard::from_bytes::<common::duress::DuressConfig>(&bytes) {
                 if config.verify_pin(form.password.as_bytes()) == common::duress::PinVerification::Duress {
                     tracing::error!("DURESS PIN DETECTED for user {user_id}");
-                    // SECURITY TODO: Use append_signed() with a provisioned PqSigningKey
-                    // to prevent audit log tampering. Currently entries are unsigned.
                     let mut audit = state.audit_log.write().await;
-                    audit.append(
+                    audit.append_signed(
                         common::types::AuditEventType::DuressDetected,
                         vec![user_id], vec![], 1.0, vec![],
+                        &state.pq_signing_key,
                     );
                     drop(audit);
                     // Revoke all active sessions for this user
@@ -1404,13 +1457,12 @@ a{color:#00ff41}</style></head><body>
     );
     drop(codes);
 
-    // Log to audit
-    // SECURITY TODO: Use append_signed() with a provisioned PqSigningKey
-    // to prevent audit log tampering. Currently entries are unsigned.
+    // Log to audit, signed with ML-DSA-87
     let mut audit = state.audit_log.write().await;
-    audit.append(
+    audit.append_signed(
         common::types::AuditEventType::AuthSuccess,
         vec![user_id], vec![], 0.0, vec![],
+        &state.pq_signing_key,
     );
     drop(audit);
 
@@ -1491,6 +1543,8 @@ async fn oauth_google_start(
     };
     {
         let mut store = state.pending_google.write().await;
+        // Evict expired entries on every insert to prevent unbounded growth
+        store.cleanup_expired(now_secs());
         store.insert(state_token.clone(), pending);
     }
 
@@ -1567,7 +1621,12 @@ async fn oauth_google_callback(
 
     // Extract and verify Google ID token claims (includes algorithm, issuer,
     // audience, and expiry validation inside extract_google_claims)
-    let claims = match crate::google_oauth::extract_google_claims(&tokens.id_token, &google_config.client_id) {
+    let claims = match crate::google_oauth::extract_google_claims(
+        &tokens.id_token,
+        &google_config.client_id,
+        &state.google_jwks_cache,
+        &state.http_client,
+    ).await {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("Google claim extraction/validation failed: {e}");
@@ -1615,13 +1674,12 @@ async fn oauth_google_callback(
         }
         tracing::info!("Auto-enrolled Google user {} ({})", claims.email, new_id);
 
-        // Log auto-enrollment to audit
-        // SECURITY TODO: Use append_signed() with a provisioned PqSigningKey
-        // to prevent audit log tampering. Currently entries are unsigned.
+        // Log auto-enrollment to audit, signed with ML-DSA-87
         let mut audit = state.audit_log.write().await;
-        audit.append(
+        audit.append_signed(
             common::types::AuditEventType::AuthSuccess,
             vec![new_id], vec![], 0.0, vec![],
+            &state.pq_signing_key,
         );
         drop(audit);
 
@@ -1642,12 +1700,11 @@ async fn oauth_google_callback(
     drop(codes);
 
     // Log successful auth
-    // SECURITY TODO: Use append_signed() with a provisioned PqSigningKey
-    // to prevent audit log tampering. Currently entries are unsigned.
     let mut audit = state.audit_log.write().await;
-    audit.append(
+    audit.append_signed(
         common::types::AuditEventType::AuthSuccess,
         vec![user_id], vec![], 0.0, vec![],
+        &state.pq_signing_key,
     );
     drop(audit);
 
@@ -1739,7 +1796,17 @@ async fn oauth_token(
     let access_token = Uuid::new_v4().to_string();
 
     // Store access_token -> user_id mapping for userinfo endpoint
-    state.access_tokens.write().await.insert(access_token.clone(), auth_code.user_id);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    state.access_tokens.write().await.insert(
+        access_token.clone(),
+        AccessTokenEntry {
+            user_id: auth_code.user_id,
+            last_activity: now,
+        },
+    );
 
     let response = sso_protocol::tokens::TokenResponse {
         access_token,
@@ -1761,9 +1828,26 @@ async fn oauth_userinfo(
         .map(|s| s.trim_start_matches("Bearer ").to_string())
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
-    let tokens = state.access_tokens.read().await;
-    let user_id = tokens.get(&token).copied().ok_or(StatusCode::UNAUTHORIZED)?;
-    drop(tokens);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    // Check inactivity timeout on OAuth access tokens (AAL3: 15 min)
+    let user_id = {
+        let mut tokens = state.access_tokens.write().await;
+        match tokens.get(&token) {
+            None => return Err(StatusCode::UNAUTHORIZED),
+            Some(entry) if now - entry.last_activity > INACTIVITY_TIMEOUT_SECS => {
+                tokens.remove(&token);
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+            _ => {}
+        }
+        let entry = tokens.get_mut(&token).unwrap();
+        entry.last_activity = now;
+        entry.user_id
+    };
 
     let row: Option<(String, Option<String>)> = sqlx::query_as(
         "SELECT username, email FROM users WHERE id = $1"
@@ -1882,15 +1966,14 @@ async fn fido_register_complete(
     fido_store.store_credential(cred);
 
     // Log to audit
-    // SECURITY TODO: Use append_signed() with a provisioned PqSigningKey
-    // to prevent audit log tampering. Currently entries are unsigned.
     let mut audit = state.audit_log.write().await;
-    audit.append(
+    audit.append_signed(
         common::types::AuditEventType::CredentialRegistered,
         vec![req.user_id],
         vec![],
         0.0,
         vec![],
+        &state.pq_signing_key,
     );
 
     Json(FidoRegisterCompleteResponse {
@@ -1924,24 +2007,57 @@ async fn fido_authenticate_complete(
     State(state): State<Arc<AppState>>,
     Json(req): Json<FidoAuthCompleteRequest>,
 ) -> Json<FidoAuthCompleteResponse> {
-    let fido_store = state.fido_store.read().await;
+    let mut fido_store = state.fido_store.write().await;
 
-    // Look up the credential
-    match fido_store.get_credential(&req.credential_id) {
-        Some(cred) => {
-            // In a full implementation we would verify the signature against
-            // the stored public key and check the sign count. For now, we
-            // confirm the credential exists and return the associated user.
+    // Look up the credential (immutable borrow first for verification)
+    let verification_result = match fido_store.get_credential(&req.credential_id) {
+        Some(stored_cred) => {
+            // Build the AuthenticationResult from the client's response
+            let auth_result = fido::types::AuthenticationResult {
+                credential_id: req.credential_id.clone(),
+                authenticator_data: req.authenticator_data.clone(),
+                client_data: req.client_data.clone(),
+                signature: req.signature.clone(),
+            };
+
+            // Verify the cryptographic signature, RP ID, flags, and sign counter
+            let rp_id = "sso-system.dmj.one";
+            match fido::authentication::verify_authentication_response(
+                &auth_result,
+                stored_cred,
+                rp_id,
+                true, // require user verification
+            ) {
+                Ok(new_sign_count) => Ok((stored_cred.user_id, new_sign_count)),
+                Err(e) => Err(e.to_string()),
+            }
+        }
+        None => Err("unknown credential".into()),
+    };
+
+    match verification_result {
+        Ok((user_id, new_sign_count)) => {
+            // Update the stored sign counter to detect cloned authenticators
+            if let Some(cred_mut) = fido_store.get_credential_mut(&req.credential_id) {
+                if let Err(e) = fido::authentication::update_sign_count(cred_mut, new_sign_count) {
+                    return Json(FidoAuthCompleteResponse {
+                        success: false,
+                        user_id: None,
+                        error: Some(format!("sign count update failed: {}", e)),
+                    });
+                }
+            }
+
             Json(FidoAuthCompleteResponse {
                 success: true,
-                user_id: Some(cred.user_id),
+                user_id: Some(user_id),
                 error: None,
             })
         }
-        None => Json(FidoAuthCompleteResponse {
+        Err(e) => Json(FidoAuthCompleteResponse {
             success: false,
             user_id: None,
-            error: Some("unknown credential".into()),
+            error: Some(e),
         }),
     }
 }

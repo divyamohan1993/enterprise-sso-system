@@ -240,6 +240,63 @@ pub fn seal_key_for_storage(key: &[u8; 64], purpose: &str) -> Vec<u8> {
     out
 }
 
+/// Detect whether an HSM backend is configured via environment.
+///
+/// Returns the HSM backend name if `MILNET_HSM_BACKEND` is set and valid.
+/// Valid values: `pkcs11`, `aws-kms`, `tpm2`, `software`.
+pub fn hsm_backend_from_env() -> Option<String> {
+    std::env::var("MILNET_HSM_BACKEND").ok().filter(|s| {
+        matches!(
+            s.to_lowercase().as_str(),
+            "pkcs11" | "aws-kms" | "awskms" | "kms" | "tpm2" | "tpm" | "software" | "soft" | "dev"
+        )
+    })
+}
+
+/// Load the master KEK with HSM awareness.
+///
+/// If `MILNET_HSM_BACKEND` is set, this returns a sentinel value indicating
+/// that the caller should use the HSM key manager (`crypto::hsm::HsmKeyManager`)
+/// instead of a raw key. The sentinel is all-zeros, which is detected by the
+/// crypto layer as "use HSM path".
+///
+/// If `MILNET_HSM_BACKEND` is not set, falls back to [`load_master_kek`].
+///
+/// # Usage
+/// ```ignore
+/// let kek = load_master_kek_hsm_aware();
+/// if kek == [0u8; 32] {
+///     // HSM backend configured — use HsmKeyManager
+///     let config = crypto::hsm::HsmConfig::from_env();
+///     let source = crypto::hsm::create_key_source(&config)?;
+///     let master_key = source.load_master_key()?;
+/// } else {
+///     // Software/env var path
+///     let master_key = crypto::seal::MasterKey::from_bytes(kek);
+/// }
+/// ```
+pub fn load_master_kek_hsm_aware() -> [u8; 32] {
+    if let Some(backend) = hsm_backend_from_env() {
+        let is_software = matches!(
+            backend.to_lowercase().as_str(),
+            "software" | "soft" | "dev"
+        );
+        if !is_software {
+            eprintln!(
+                "INFO: HSM backend '{}' detected. Master KEK will be loaded from HSM.",
+                backend
+            );
+            // Return sentinel — caller must use HsmKeyManager.
+            return [0u8; 32];
+        }
+        // Software backend: fall through to normal env var loading.
+        eprintln!(
+            "INFO: Software HSM backend detected. Falling back to env var key loading."
+        );
+    }
+    load_master_kek()
+}
+
 /// Convert sealed bytes to hex string for env var storage.
 pub fn sealed_to_hex(sealed: &[u8]) -> String {
     sealed.iter().map(|b| format!("{b:02x}")).collect()

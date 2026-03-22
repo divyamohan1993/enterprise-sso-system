@@ -1,5 +1,9 @@
 //! DPoP (Demonstration of Proof of Possession) — RFC 9449
 //! Binds tokens to a client key pair, preventing token theft.
+//!
+//! CNSA 2.0 compliance: HMAC-SHA512 is used for proof generation/verification
+//! (CNSA 2.0 compliant). The dpop_key_hash function uses SHA-256 for thumbprint
+//! computation per RFC 9449/RFC 7638 JWK Thumbprint interoperability requirements.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha512;

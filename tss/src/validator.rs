@@ -44,7 +44,7 @@ pub fn validate_receipt_chain(
 
         // Check hash chain linkage
         if i == 0 {
-            if !ct_eq(&receipt.prev_receipt_hash, &[0u8; 32]) {
+            if !ct_eq(&receipt.prev_receipt_hash, &[0u8; 64]) {
                 return Err(MilnetError::ReceiptChain(
                     "first receipt must have zero prev_receipt_hash".into(),
                 ));

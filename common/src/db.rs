@@ -51,13 +51,19 @@ pub async fn init_database(database_url: &str) -> PgPool {
             name VARCHAR(255) NOT NULL,
             callback_url TEXT NOT NULL,
             client_id VARCHAR(255) UNIQUE,
-            client_secret VARCHAR(255),
+            client_secret BYTEA,
             required_tier INTEGER NOT NULL DEFAULT 2,
             required_scope INTEGER NOT NULL DEFAULT 0,
             is_active BOOLEAN NOT NULL DEFAULT true,
             created_at BIGINT NOT NULL
         )
     "#).execute(&pool).await.expect("Failed to create portals table");
+
+    // Migration: convert client_secret from VARCHAR to BYTEA for envelope encryption.
+    // ALTER TYPE with USING handles existing plaintext values by casting to bytes.
+    let _ = sqlx::query(
+        "ALTER TABLE portals ALTER COLUMN client_secret TYPE BYTEA USING client_secret::BYTEA"
+    ).execute(&pool).await;
 
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS audit_log (

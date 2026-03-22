@@ -11,11 +11,18 @@ pub mod domain;
 pub mod duress;
 pub mod error;
 pub mod network;
+pub mod revocation;
 pub mod types;
 pub mod persistence;
 pub mod shared_keys;
 pub mod witness;
 
 // ── Military hardening modules ──
+pub mod cnsa2;
 pub mod encrypted_db;
 pub mod sealed_keys;
+
+// ── Platform integrity and measured boot ──
+pub mod platform_integrity;
+pub mod measured_boot;
+pub mod startup_checks;

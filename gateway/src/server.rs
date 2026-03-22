@@ -15,7 +15,7 @@ use common::types::ModuleId;
 use shard::transport::connect;
 
 use crate::puzzle::{generate_challenge, get_adaptive_difficulty, verify_solution, PuzzleSolution};
-use crate::wire::{AuthRequest, AuthResponse, OrchestratorRequest, OrchestratorResponse};
+use crate::wire::{AuthRequest, AuthResponse, KemCiphertext, OrchestratorRequest, OrchestratorResponse};
 
 /// Maximum wire frame payload size (1 MiB).
 const MAX_FRAME_LEN: u32 = 1024 * 1024;
@@ -28,11 +28,17 @@ pub struct OrchestratorConfig {
 }
 
 /// The Bastion Gateway server.
+///
+/// Holds a long-lived X-Wing keypair generated once at startup.  The public
+/// key is sent to every connecting client as part of the puzzle challenge so
+/// clients can perform hybrid post-quantum key exchange.
 pub struct GatewayServer {
     listener: TcpListener,
     difficulty: u8,
     orchestrator: Option<Arc<OrchestratorConfig>>,
     active_connections: Arc<AtomicUsize>,
+    /// Server-side X-Wing public key bytes, shared across connections via Arc.
+    xwing_server_pk: Arc<Vec<u8>>,
 }
 
 impl GatewayServer {
@@ -40,11 +46,15 @@ impl GatewayServer {
     pub async fn bind(addr: &str, difficulty: u8) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr).await?;
         info!("Gateway listening on {}", listener.local_addr()?);
+        let xwing_kp = crypto::xwing::XWingKeyPair::generate();
+        let xwing_server_pk = Arc::new(xwing_kp.public_key().to_bytes());
+        info!("X-Wing server keypair generated ({} byte public key)", xwing_server_pk.len());
         Ok(Self {
             listener,
             difficulty,
             orchestrator: None,
             active_connections: Arc::new(AtomicUsize::new(0)),
+            xwing_server_pk,
         })
     }
 
@@ -56,11 +66,15 @@ impl GatewayServer {
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr).await?;
         info!("Gateway listening on {}", listener.local_addr()?);
+        let xwing_kp = crypto::xwing::XWingKeyPair::generate();
+        let xwing_server_pk = Arc::new(xwing_kp.public_key().to_bytes());
+        info!("X-Wing server keypair generated ({} byte public key)", xwing_server_pk.len());
         Ok(Self {
             listener,
             difficulty,
             orchestrator: Some(Arc::new(orchestrator_config)),
             active_connections: Arc::new(AtomicUsize::new(0)),
+            xwing_server_pk,
         })
     }
 
@@ -81,8 +95,9 @@ impl GatewayServer {
             let difficulty = get_adaptive_difficulty(active).max(self.difficulty);
             let orch = self.orchestrator.clone();
             let counter = self.active_connections.clone();
+            let server_pk = self.xwing_server_pk.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(stream, difficulty, orch).await {
+                if let Err(e) = handle_connection(stream, difficulty, orch, server_pk).await {
                     warn!("connection from {addr} failed: {e}");
                 }
                 counter.fetch_sub(1, Ordering::Relaxed);
@@ -93,7 +108,7 @@ impl GatewayServer {
     /// Accept and handle exactly one connection (useful for tests).
     pub async fn accept_one(&self) -> std::io::Result<()> {
         let (stream, addr) = self.listener.accept().await?;
-        handle_connection(stream, self.difficulty, self.orchestrator.clone())
+        handle_connection(stream, self.difficulty, self.orchestrator.clone(), self.xwing_server_pk.clone())
             .await
             .map_err(|e| {
                 error!("connection from {addr} failed: {e}");
@@ -103,16 +118,28 @@ impl GatewayServer {
 }
 
 /// Handle a single client connection through the full puzzle + auth flow.
+///
+/// Protocol steps:
+///   1. Server → Client: `PuzzleChallenge` (includes server X-Wing public key)
+///   2. Client → Server: `PuzzleSolution`  (includes client X-Wing public key)
+///   3. Server verifies puzzle solution
+///   4. Server encapsulates against client's X-Wing public key
+///   5. Server → Client: `KemCiphertext`
+///   6. Both sides derive session key via HKDF-SHA512 over the shared secret
+///   7. Client → Server: `AuthRequest`
+///   8. Server → Client: `AuthResponse`
 async fn handle_connection(
     mut stream: TcpStream,
     difficulty: u8,
     orchestrator: Option<Arc<OrchestratorConfig>>,
+    server_xwing_pk: Arc<Vec<u8>>,
 ) -> Result<(), String> {
-    // 1. Send puzzle challenge
-    let challenge = generate_challenge(difficulty);
+    // 1. Send puzzle challenge with the server's X-Wing public key
+    let mut challenge = generate_challenge(difficulty);
+    challenge.xwing_server_pk = Some((*server_xwing_pk).clone());
     send_frame(&mut stream, &challenge).await?;
 
-    // 2. Read puzzle solution
+    // 2. Read puzzle solution (expected to contain the client's X-Wing public key)
     let solution: PuzzleSolution = recv_frame(&mut stream).await?;
 
     // 3. Verify solution
@@ -136,22 +163,35 @@ async fn handle_connection(
         return Err("invalid puzzle solution".into());
     }
 
-    // X-Wing hybrid KEM for session key establishment (post-quantum)
-    // Generate a shared secret using X-Wing (ML-KEM-768 + X25519)
-    let _xwing_shared_secret = {
-        // Generate an ephemeral X-Wing keypair (X25519 + ML-KEM-768)
-        let xwing_kp = crypto::xwing::XWingKeyPair::generate();
-        let xwing_pk = xwing_kp.public_key();
-        // Encapsulate against the public key to derive a shared secret
-        let (shared_secret, _ciphertext) = crypto::xwing::xwing_encapsulate(&xwing_pk);
-        shared_secret
+    // 4. X-Wing hybrid KEM key exchange (ML-KEM-1024 + X25519)
+    //
+    // The client sends its X-Wing public key alongside the puzzle solution.
+    // The server encapsulates against the *client's* key, producing a shared
+    // secret and a ciphertext.  The ciphertext is sent to the client so it
+    // can decapsulate with its private key and arrive at the same secret.
+    let client_pk_bytes = solution.xwing_client_pk.ok_or(
+        "client did not provide X-Wing public key in puzzle solution",
+    )?;
+    let client_pk = crypto::xwing::XWingPublicKey::from_bytes(&client_pk_bytes)
+        .ok_or("invalid X-Wing public key from client")?;
+
+    let (shared_secret, kem_ct) = crypto::xwing::xwing_encapsulate(&client_pk);
+
+    // 5. Send the KEM ciphertext to the client so it can decapsulate
+    let kem_msg = KemCiphertext {
+        ciphertext: kem_ct.to_bytes(),
     };
+    send_frame(&mut stream, &kem_msg).await?;
+
+    // 6. Derive session key via HKDF-SHA512
+    //    Context binds to this specific handshake via the puzzle nonce.
+    let _session_key = crypto::xwing::derive_session_key(&shared_secret, &challenge.nonce);
     tracing::debug!("X-Wing KEM: session key established (hybrid PQ + classical)");
 
-    // 4. Read auth request
+    // 7. Read auth request
     let auth_req: AuthRequest = recv_frame(&mut stream).await?;
 
-    // 5. Forward to orchestrator via SHARD (or stub if not configured)
+    // 8. Forward to orchestrator via SHARD (or stub if not configured)
     // Record the start time before processing the auth request so we can
     // enforce a constant-time floor on the response, preventing timing-based
     // username enumeration attacks.

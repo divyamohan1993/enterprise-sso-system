@@ -108,7 +108,7 @@ fn receipt_chain_rejects_wrong_session_id() {
     let mut chain = ReceiptChain::new(session_id);
     let mut receipt = Receipt::test_fixture();
     receipt.ceremony_session_id = [0x02; 32]; // wrong session
-    receipt.prev_receipt_hash = [0x00; 32];
+    receipt.prev_receipt_hash = [0x00; 64];
     receipt.step_id = 1;
     assert!(chain.add_receipt(receipt).is_err());
 }
@@ -119,7 +119,7 @@ fn receipt_chain_rejects_out_of_order_steps() {
     let mut chain = ReceiptChain::new(session_id);
     let mut receipt = Receipt::test_fixture();
     receipt.step_id = 2; // should be 1 for first receipt
-    receipt.prev_receipt_hash = [0x00; 32];
+    receipt.prev_receipt_hash = [0x00; 64];
     assert!(chain.add_receipt(receipt).is_err());
 }
 
@@ -139,7 +139,7 @@ fn receipt_chain_valid_two_step() {
     let mut r1 = Receipt::test_fixture();
     r1.ceremony_session_id = session_id;
     r1.step_id = 1;
-    r1.prev_receipt_hash = [0x00; 32];
+    r1.prev_receipt_hash = [0x00; 64];
     sign_receipt(&mut r1, &key);
     chain.add_receipt(r1.clone()).unwrap();
 
@@ -166,7 +166,7 @@ fn receipt_chain_rejects_invalid_signature() {
     let mut r1 = Receipt::test_fixture();
     r1.ceremony_session_id = session_id;
     r1.step_id = 1;
-    r1.prev_receipt_hash = [0x00; 32];
+    r1.prev_receipt_hash = [0x00; 64];
     sign_receipt(&mut r1, &wrong_key); // signed with wrong key
     chain.add_receipt(r1).unwrap();
 
