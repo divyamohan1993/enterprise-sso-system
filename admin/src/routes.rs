@@ -525,6 +525,8 @@ async fn register_user(
     .await;
 
     // Log to audit (in-memory chain + PostgreSQL)
+    // NOTE: Using append() which creates unsigned entries (empty signature).
+    // TODO: Switch to append_signed() once a PqSigningKey is provisioned in AppState.
     let mut audit = state.audit_log.write().await;
     let entry = audit.append(
         common::types::AuditEventType::CredentialRegistered,
@@ -665,7 +667,7 @@ async fn enroll_device(
     let req: EnrollDeviceRequest = serde_json::from_slice(&body)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
     let device_id = Uuid::new_v4();
-    let tier = req.tier.unwrap_or(2).min(4).max(1);
+    let tier = req.tier.unwrap_or(2).clamp(1, 4);
     let attestation = req.attestation_hash.unwrap_or_default();
     let enrolled_by = req.enrolled_by.unwrap_or_else(Uuid::new_v4);
 
@@ -679,6 +681,31 @@ async fn enroll_device(
     .bind(now_secs())
     .execute(&state.db)
     .await;
+
+    // Mirror enrollment into the in-memory DeviceRegistry
+    {
+        let mut att_hash = [0u8; 32];
+        let att_bytes = attestation.as_bytes();
+        let copy_len = att_bytes.len().min(32);
+        att_hash[..copy_len].copy_from_slice(&att_bytes[..copy_len]);
+
+        let device_tier = match tier {
+            1 => common::types::DeviceTier::Sovereign,
+            2 => common::types::DeviceTier::Operational,
+            3 => common::types::DeviceTier::Sensor,
+            _ => common::types::DeviceTier::Emergency,
+        };
+
+        let enrollment = risk::tiers::DeviceEnrollment {
+            device_id,
+            tier: device_tier,
+            attestation_hash: att_hash,
+            enrolled_by,
+            is_active: true,
+        };
+        let mut registry = state.device_registry.write().await;
+        registry.enroll(enrollment);
+    }
 
     Ok(Json(DeviceResponse {
         device_id,
@@ -1513,6 +1540,9 @@ async fn oauth_token(
 
     let access_token = Uuid::new_v4().to_string();
 
+    // Store access_token -> user_id mapping for userinfo endpoint
+    state.access_tokens.write().await.insert(access_token.clone(), auth_code.user_id);
+
     let response = sso_protocol::tokens::TokenResponse {
         access_token,
         token_type: "Bearer".into(),
@@ -1524,15 +1554,32 @@ async fn oauth_token(
     Json(serde_json::to_value(response).unwrap())
 }
 
-async fn oauth_userinfo() -> Json<sso_protocol::userinfo::UserInfo> {
-    // In production this would extract the access token from the Authorization
-    // header, look up the associated user, and return real profile data.
-    Json(sso_protocol::userinfo::UserInfo {
-        sub: Uuid::nil().to_string(),
-        name: None,
-        preferred_username: None,
-        email: None,
-    })
+async fn oauth_userinfo(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Json<sso_protocol::userinfo::UserInfo>, StatusCode> {
+    let token = request.headers().get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim_start_matches("Bearer ").to_string())
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    let tokens = state.access_tokens.read().await;
+    let user_id = tokens.get(&token).copied().ok_or(StatusCode::UNAUTHORIZED)?;
+    drop(tokens);
+
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT username, email FROM users WHERE id = $1"
+    ).bind(user_id).fetch_optional(&state.db).await.unwrap_or(None);
+
+    match row {
+        Some((username, email)) => Ok(Json(sso_protocol::userinfo::UserInfo {
+            sub: user_id.to_string(),
+            name: Some(username.clone()),
+            preferred_username: Some(username),
+            email,
+        })),
+        None => Err(StatusCode::NOT_FOUND),
+    }
 }
 
 // ---------------------------------------------------------------------------
