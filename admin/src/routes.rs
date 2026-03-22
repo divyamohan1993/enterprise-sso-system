@@ -1257,6 +1257,7 @@ async fn oauth_userinfo() -> Json<sso_protocol::userinfo::UserInfo> {
         sub: Uuid::nil().to_string(),
         name: None,
         preferred_username: None,
+        email: None,
     })
 }
 

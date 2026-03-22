@@ -123,6 +123,14 @@ pub async fn init_database(database_url: &str) -> PgPool {
         )
     "#).execute(&pool).await.expect("Failed to create key_material table");
 
+    // Migration: add email and auth_provider columns for Google OAuth
+    let _ = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(255)")
+        .execute(&pool).await;
+    let _ = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_provider VARCHAR(50) NOT NULL DEFAULT 'opaque'")
+        .execute(&pool).await;
+    let _ = sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS users_email_unique ON users (email) WHERE email IS NOT NULL")
+        .execute(&pool).await;
+
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS shard_sequences (
             module_pair VARCHAR(100) PRIMARY KEY,
