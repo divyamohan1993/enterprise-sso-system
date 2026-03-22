@@ -157,8 +157,8 @@ fn expired_token_rejected() {
 
     assert!(result.is_err());
     assert!(
-        matches!(result.unwrap_err(), MilnetError::TokenExpired),
-        "expected TokenExpired error"
+        matches!(result.unwrap_err(), MilnetError::CryptoVerification(_)),
+        "expected CryptoVerification error for expired token"
     );
 }
 
@@ -313,8 +313,8 @@ fn test_wrong_epoch_rejected() {
 
     assert!(result.is_err());
     assert!(
-        matches!(result.unwrap_err(), MilnetError::TokenExpired),
-        "expected TokenExpired error for epoch outside window"
+        matches!(result.unwrap_err(), MilnetError::CryptoVerification(_)),
+        "expected CryptoVerification error for epoch outside window"
     );
 }
 

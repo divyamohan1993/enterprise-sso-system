@@ -31,13 +31,10 @@ fn generate_dpop_proof_with_key(
     claims_bytes: &[u8],
     timestamp: i64,
 ) -> [u8; 64] {
-    let mac = HmacSha512::new_from_slice(key).unwrap_or_else(|_| {
-        let mut padded = vec![0u8; 64];
-        let len = key.len().min(64);
-        padded[..len].copy_from_slice(&key[..len]);
-        HmacSha512::new_from_slice(&padded).unwrap()
-    });
-    let mut mac = mac;
+    // HMAC-SHA512 accepts any key length; the library handles padding internally.
+    // No manual padding fallback — reject invalid keys instead.
+    let mut mac = HmacSha512::new_from_slice(key)
+        .expect("HMAC-SHA512 accepts any non-empty key");
     mac.update(domain::DPOP_PROOF);
     mac.update(claims_bytes);
     mac.update(&timestamp.to_le_bytes());

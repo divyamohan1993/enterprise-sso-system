@@ -9,6 +9,10 @@ use ratchet::manager::{RatchetAction, RatchetRequest, RatchetResponse};
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
+
+    // Harden process: disable core dumps, prevent ptrace escalation
+    crypto::memguard::harden_process();
+
     tracing::info!("Ratchet Session Manager starting");
 
     let manager = Arc::new(RwLock::new(ratchet::manager::SessionManager::new()));

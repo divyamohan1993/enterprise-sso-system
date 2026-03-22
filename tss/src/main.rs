@@ -19,6 +19,9 @@ use tss::validator::validate_receipt_chain;
 async fn main() {
     tracing_subscriber::fmt::init();
 
+    // Harden process: disable core dumps, prevent ptrace escalation
+    crypto::memguard::harden_process();
+
     // Run DKG at startup (3-of-5 threshold)
     let mut dkg_result = dkg(5, 3);
     tracing::info!(

@@ -7,6 +7,9 @@ use gateway::server::GatewayServer;
 async fn main() {
     tracing_subscriber::fmt::init();
 
+    // Harden process: disable core dumps, prevent ptrace escalation
+    crypto::memguard::harden_process();
+
     let port = std::env::var("GATEWAY_PORT").unwrap_or_else(|_| "9100".into());
     let addr = format!("0.0.0.0:{port}");
 

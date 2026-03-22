@@ -205,6 +205,12 @@ async fn forward_to_orchestrator(
             crypto::dpop::dpop_key_hash(&client_dpop_key)
         },
         tier: 0,                  // Orchestrator decides tier
+        device_attestation_age_secs: None,
+        geo_velocity_kmh: None,
+        is_unusual_network: None,
+        is_unusual_time: None,
+        unusual_access_score: None,
+        recent_failed_attempts: None,
     };
 
     let req_bytes = postcard::to_allocvec(&orch_req)

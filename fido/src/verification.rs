@@ -119,8 +119,6 @@ pub fn verify_signature_es256(
     signature: &[u8],
     public_key: &[u8],
 ) -> Result<(), &'static str> {
-    // Structural validation — these are cheap and catch many invalid inputs
-    // even before we attempt crypto.
     if authenticator_data.len() < MIN_AUTH_DATA_LEN {
         return Err("Authenticator data too short for signature verification");
     }
@@ -134,28 +132,25 @@ pub fn verify_signature_es256(
         return Err("Public key is empty");
     }
 
-    // Validate that the public key is plausibly an uncompressed P-256 point
-    // (0x04 || x (32 bytes) || y (32 bytes) = 65 bytes).
     if public_key.len() == 65 && public_key[0] != 0x04 {
         return Err("Uncompressed public key must start with 0x04");
     }
 
-    // TODO(crypto): Perform actual ECDSA P-256 signature verification here.
-    // Until the `p256` crate is available, we rely on structural checks above.
-    // The signed message is: authenticator_data || client_data_hash
-    let _ = authenticator_data;
-    let _ = client_data_hash;
-    let _ = signature;
-    let _ = public_key;
+    // Real ECDSA P-256 signature verification
+    use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
 
-    // SECURITY: This stub does NOT verify the cryptographic signature.
-    // It MUST be replaced with real verification before production use.
-    #[cfg(not(feature = "stub-crypto"))]
-    {
-        // In non-stub mode (default), warn that crypto is not yet wired up.
-        // Return Ok to allow integration testing of the surrounding flow.
-        // Real deployments MUST enable actual verification.
-    }
+    let verifying_key = VerifyingKey::from_sec1_bytes(public_key)
+        .map_err(|_| "Invalid public key encoding")?;
+
+    let sig = Signature::from_der(signature)
+        .map_err(|_| "Invalid DER signature encoding")?;
+
+    // The signed message is: authenticator_data || client_data_hash
+    let mut msg = authenticator_data.to_vec();
+    msg.extend_from_slice(client_data_hash);
+
+    verifying_key.verify(&msg, &sig)
+        .map_err(|_| "ES256 signature verification failed")?;
 
     Ok(())
 }
@@ -276,6 +271,24 @@ pub struct AttestationData {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use p256::ecdsa::signature::SignatureEncoding;
+
+    /// Helper: generate a P-256 keypair and sign authenticator_data || client_data_hash
+    fn sign_auth_data(auth_data: &[u8], client_data: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        use p256::ecdsa::SigningKey;
+        use p256::ecdsa::signature::Signer;
+        use sha2::{Sha256, Digest};
+        let signing_key = SigningKey::random(&mut rand::thread_rng());
+        let verifying_key = signing_key.verifying_key();
+        let public_key = verifying_key.to_sec1_bytes().to_vec();
+
+        let client_data_hash = Sha256::digest(client_data);
+        let mut msg = auth_data.to_vec();
+        msg.extend_from_slice(&client_data_hash);
+
+        let sig: p256::ecdsa::Signature = signing_key.sign(&msg);
+        (sig.to_der().to_vec(), public_key)
+    }
 
     /// Helper: build a minimal 37-byte authenticator data blob.
     fn make_auth_data(rp_id: &str, flags: u8, sign_count: u32) -> Vec<u8> {
@@ -380,9 +393,6 @@ mod tests {
         let sig = vec![0x30, 0x44]; // minimal DER-like
         let pubkey = vec![0x04; 65]; // uncompressed point prefix
 
-        // Valid structural inputs
-        assert!(verify_signature_es256(&auth_data, &hash, &sig, &pubkey).is_ok());
-
         // Empty signature
         assert_eq!(
             verify_signature_es256(&auth_data, &hash, &[], &pubkey).unwrap_err(),
@@ -420,17 +430,19 @@ mod tests {
         let auth_data = make_auth_data(rp_id, 0x05, 10);
         let client_data = b"test-client-data".to_vec();
 
+        let (signature, public_key) = sign_auth_data(&auth_data, &client_data);
+
         let auth_result = AuthenticationResult {
             credential_id: vec![1, 2, 3],
             authenticator_data: auth_data,
             client_data,
-            signature: vec![0x30, 0x44, 0x00],
+            signature,
         };
 
         // Stored credential with sign_count = 5 (< 10, should pass)
         let stored = StoredCredential {
             credential_id: vec![1, 2, 3],
-            public_key: vec![0x04; 65],
+            public_key,
             user_id,
             sign_count: 5,
             authenticator_type: "cross-platform".into(),
@@ -505,17 +517,20 @@ mod tests {
         let rp_id = "sso.milnet.example";
         // Both stored and reported sign counts are 0 (authenticator doesn't support counters)
         let auth_data = make_auth_data(rp_id, 0x05, 0);
+        let client_data = b"test".to_vec();
+
+        let (signature, public_key) = sign_auth_data(&auth_data, &client_data);
 
         let auth_result = AuthenticationResult {
             credential_id: vec![1, 2, 3],
             authenticator_data: auth_data,
-            client_data: b"test".to_vec(),
-            signature: vec![0x30, 0x44],
+            client_data,
+            signature,
         };
 
         let stored = StoredCredential {
             credential_id: vec![1, 2, 3],
-            public_key: vec![0x04; 65],
+            public_key,
             user_id: Uuid::new_v4(),
             sign_count: 0,
             authenticator_type: "cross-platform".into(),
@@ -562,17 +577,20 @@ mod tests {
         let rp_id = "sso.milnet.example";
         // flags: UP only (0x01), no UV
         let auth_data = make_auth_data(rp_id, 0x01, 1);
+        let client_data = b"test".to_vec();
+
+        let (signature, public_key) = sign_auth_data(&auth_data, &client_data);
 
         let auth_result = AuthenticationResult {
             credential_id: vec![1, 2, 3],
             authenticator_data: auth_data,
-            client_data: b"test".to_vec(),
-            signature: vec![0x30, 0x44],
+            client_data,
+            signature,
         };
 
         let stored = StoredCredential {
             credential_id: vec![1, 2, 3],
-            public_key: vec![0x04; 65],
+            public_key,
             user_id: Uuid::new_v4(),
             sign_count: 0,
             authenticator_type: "cross-platform".into(),
@@ -582,7 +600,7 @@ mod tests {
         let result = verify_authentication_response(&auth_result, &stored, rp_id, false);
         assert!(result.is_ok());
 
-        // UV required — should fail
+        // UV required — should fail (fails before signature verification)
         let auth_data2 = make_auth_data(rp_id, 0x01, 2);
         let auth_result2 = AuthenticationResult {
             credential_id: vec![1, 2, 3],

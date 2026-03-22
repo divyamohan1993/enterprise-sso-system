@@ -122,9 +122,18 @@ pub fn create_id_token_with_tier(
     let claims_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
     let signing_input = format!("{header_b64}.{claims_b64}");
 
+    // SECURITY: Add timing floor to mitigate RUSTSEC-2023-0071 (Marvin Attack).
+    // The `rsa` crate v0.9 has non-constant-time RSA operations.
+    // We add a minimum operation time to reduce timing side-channel signal.
+    let sign_start = std::time::Instant::now();
     let mut signer = SigningKey::<Sha256>::new(signing_key.private_key.clone());
     let signature = signer
         .sign(signing_input.as_bytes());
+    let sign_elapsed = sign_start.elapsed();
+    let sign_floor = std::time::Duration::from_millis(50);
+    if sign_elapsed < sign_floor {
+        std::thread::sleep(sign_floor - sign_elapsed);
+    }
     let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_vec());
 
     format!("{signing_input}.{sig_b64}")
@@ -147,9 +156,15 @@ pub fn verify_id_token(token: &str, public_key: &RsaPublicKey) -> Result<IdToken
     let verifying_key = VerifyingKey::<Sha256>::new(public_key.clone());
     let signature = rsa::pkcs1v15::Signature::try_from(sig_bytes.as_slice())
         .map_err(|e| format!("invalid signature: {e}"))?;
-    verifying_key
-        .verify(signing_input.as_bytes(), &signature)
-        .map_err(|e| format!("RS256 verification failed: {e}"))?;
+    // SECURITY: Timing floor for RSA verification (RUSTSEC-2023-0071 mitigation)
+    let verify_start = std::time::Instant::now();
+    let verify_result = verifying_key.verify(signing_input.as_bytes(), &signature);
+    let verify_elapsed = verify_start.elapsed();
+    let verify_floor = std::time::Duration::from_millis(50);
+    if verify_elapsed < verify_floor {
+        std::thread::sleep(verify_floor - verify_elapsed);
+    }
+    verify_result.map_err(|e| format!("RS256 verification failed: {e}"))?;
 
     let claims_bytes = URL_SAFE_NO_PAD
         .decode(parts[1])

@@ -78,6 +78,30 @@ impl RiskEngine {
         let fail_score = (signals.recent_failed_attempts as f64 / 5.0).min(1.0);
         score += fail_score * 0.15;
 
+        // Mimicry detection: flag sessions where ALL signals are simultaneously
+        // perfect (statistically improbable for real users). A legitimate user
+        // will have at least some non-zero signal noise.
+        let all_perfect = signals.device_attestation_age_secs == 0.0
+            && signals.geo_velocity_kmh == 0.0
+            && !signals.is_unusual_network
+            && !signals.is_unusual_time
+            && signals.unusual_access_score == 0.0
+            && signals.recent_failed_attempts == 0;
+        if all_perfect {
+            // Suspiciously clean — add a small penalty.
+            // Real users always have *some* attestation age and minor anomalies.
+            score += 0.05;
+        }
+
+        // Add small random noise to prevent attackers from computing exact
+        // threshold-crossing signal combinations. Noise range: [0.0, 0.03)
+        let noise_byte = {
+            let mut buf = [0u8; 1];
+            getrandom::getrandom(&mut buf).unwrap_or_default();
+            (buf[0] as f64 / 255.0) * 0.03
+        };
+        score += noise_byte;
+
         score.min(1.0)
     }
 

@@ -8,6 +8,10 @@ use verifier::{VerifyRequest, VerifyResponse};
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
+
+    // Harden process: disable core dumps, prevent ptrace escalation
+    crypto::memguard::harden_process();
+
     tracing::info!("verifier starting");
 
     // 1. Load group verifying key from env (hex-encoded postcard bytes)

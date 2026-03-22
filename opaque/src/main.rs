@@ -7,6 +7,9 @@ use opaque::store::CredentialStore;
 async fn main() {
     tracing_subscriber::fmt::init();
 
+    // Harden process: disable core dumps, prevent ptrace escalation
+    crypto::memguard::harden_process();
+
     let store = CredentialStore::new();
     if let Err(e) = opaque::service::run(store).await {
         eprintln!("OPAQUE service error: {e}");

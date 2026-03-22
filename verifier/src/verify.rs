@@ -52,7 +52,9 @@ pub fn verify_token(
         .unwrap()
         .as_micros() as i64;
     if token.claims.exp <= now {
-        return Err(MilnetError::TokenExpired);
+        return Err(MilnetError::CryptoVerification(
+            "token validation failed".into(),
+        ));
     }
 
     // 4. Verify DPoP hash is non-empty (not all zeros) — reject tokens
@@ -165,7 +167,9 @@ pub fn verify_token_with_ratchet(
     // 2. Check ratchet epoch is within +/-3 window
     let epoch_diff = token.claims.ratchet_epoch.abs_diff(current_epoch);
     if epoch_diff > 3 {
-        return Err(MilnetError::TokenExpired);
+        return Err(MilnetError::CryptoVerification(
+            "token validation failed".into(),
+        ));
     }
 
     // 3. Verify ratchet tag

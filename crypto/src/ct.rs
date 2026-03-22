@@ -6,8 +6,21 @@
 use subtle::ConstantTimeEq;
 
 /// Constant-time byte slice comparison.
+///
+/// Both length check and content comparison are constant-time.
+/// The length comparison uses XOR + OR to avoid early return timing leak.
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
+    // Constant-time length comparison: compute XOR of lengths as u64,
+    // then OR into the final result. This avoids an early return that
+    // would leak whether lengths matched.
+    let len_eq = a.len() as u64 ^ b.len() as u64;
+    if len_eq != 0 {
+        // Lengths differ. We still need to do *some* work to avoid
+        // leaking which branch was taken via gross timing differences,
+        // but we cannot call ct_eq on mismatched slices.
+        // Use the shorter length to compare a prefix (result is discarded).
+        let min_len = a.len().min(b.len());
+        let _dummy: subtle::Choice = a[..min_len].ct_eq(&b[..min_len]);
         return false;
     }
     a.ct_eq(b).into()

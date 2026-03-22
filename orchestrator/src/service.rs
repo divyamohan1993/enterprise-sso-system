@@ -188,12 +188,12 @@ impl OrchestratorService {
         // 5. Risk evaluation
         let user_id = session.user_id.unwrap_or(Uuid::nil());
         let risk_signals = risk::scoring::RiskSignals {
-            device_attestation_age_secs: 0.0,
-            geo_velocity_kmh: 0.0,
-            is_unusual_network: false,
-            is_unusual_time: false,
-            unusual_access_score: 0.0,
-            recent_failed_attempts: 0,
+            device_attestation_age_secs: request.device_attestation_age_secs.unwrap_or(0.0),
+            geo_velocity_kmh: request.geo_velocity_kmh.unwrap_or(0.0),
+            is_unusual_network: request.is_unusual_network.unwrap_or(false),
+            is_unusual_time: request.is_unusual_time.unwrap_or(false),
+            unusual_access_score: request.unusual_access_score.unwrap_or(0.0),
+            recent_failed_attempts: request.recent_failed_attempts.unwrap_or(0),
         };
         let risk_score = self.risk_engine.compute_score(&user_id, &risk_signals);
         if self.risk_engine.requires_termination(risk_score) {
@@ -201,6 +201,9 @@ impl OrchestratorService {
         }
         if self.risk_engine.requires_step_up(risk_score) {
             tracing::warn!("Risk score {risk_score} >= 0.6 — step-up re-auth required");
+            return Err(format!(
+                "risk: step-up re-authentication required (score={risk_score:.2})"
+            ));
         }
 
         // 6. Build and send TSS signing request

@@ -162,12 +162,21 @@ fn verify_user_token(token: &str) -> bool {
     use sha2::Sha256;
     type HmacSha256 = Hmac<Sha256>;
 
-    let mut mac =
-        HmacSha256::new_from_slice(b"MILNET-SSO-v1-ADMIN-TOKEN").expect("HMAC key");
+    // Derive HMAC key from master KEK — prevents forging tokens without KEK
+    let master_kek = common::sealed_keys::load_master_kek();
+    let derived = {
+        use hkdf::Hkdf;
+        let hk = Hkdf::<Sha256>::new(Some(b"MILNET-ADMIN-TOKEN-v2"), &master_kek);
+        let mut okm = [0u8; 32];
+        hk.expand(b"admin-token-hmac", &mut okm)
+            .expect("HKDF expand");
+        okm
+    };
+    let mut mac = HmacSha256::new_from_slice(&derived).expect("HMAC key");
     mac.update(payload.as_bytes());
     let expected = hex(&mac.finalize().into_bytes());
 
-    if expected != parts[2] {
+    if !crypto::ct::ct_eq(expected.as_bytes(), parts[2].as_bytes()) {
         return false;
     }
 
@@ -212,6 +221,22 @@ async fn security_headers_middleware(
     headers.insert(
         axum::http::header::HeaderName::from_static("referrer-policy"),
         axum::http::HeaderValue::from_static("strict-origin-when-cross-origin"),
+    );
+    headers.insert(
+        axum::http::header::HeaderName::from_static("strict-transport-security"),
+        axum::http::HeaderValue::from_static("max-age=63072000; includeSubDomains; preload"),
+    );
+    headers.insert(
+        axum::http::header::HeaderName::from_static("content-security-policy"),
+        axum::http::HeaderValue::from_static(
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+        ),
+    );
+    headers.insert(
+        axum::http::header::HeaderName::from_static("permissions-policy"),
+        axum::http::HeaderValue::from_static(
+            "camera=(), microphone=(), geolocation=(), payment=()"
+        ),
     );
 
     if is_auth_endpoint {
@@ -571,6 +596,27 @@ async fn register_user(
     let req: RegisterUserRequest = serde_json::from_slice(&body)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
     let tier = req.tier.unwrap_or(2).clamp(1, 4);
+
+    // Check if user already exists — return identical response shape to prevent
+    // username enumeration (no 409, no distinguishable error).
+    let existing: Option<(Uuid, i32)> = sqlx::query_as(
+        "SELECT id, tier FROM users WHERE username = $1"
+    )
+    .bind(&req.username)
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
+
+    if let Some((existing_id, existing_tier)) = existing {
+        // User already exists — return generic success with existing user's ID.
+        // Do NOT reveal that the account was pre-existing.
+        return Ok(Json(RegisterUserResponse {
+            user_id: existing_id,
+            username: req.username,
+            tier: existing_tier as u8,
+        }));
+    }
+
     let mut store = state.credential_store.write().await;
     let user_id = store.register_with_password(&req.username, req.password.as_bytes());
 
@@ -579,7 +625,7 @@ async fn register_user(
 
     // Persist user to PostgreSQL (with tier and OPAQUE registration)
     let _ = sqlx::query(
-        "INSERT INTO users (id, username, tier, opaque_registration, created_at, is_active) VALUES ($1, $2, $3, $4, $5, true) ON CONFLICT (username) DO UPDATE SET opaque_registration = $4"
+        "INSERT INTO users (id, username, tier, opaque_registration, created_at, is_active) VALUES ($1, $2, $3, $4, $5, true) ON CONFLICT (username) DO NOTHING"
     )
     .bind(user_id)
     .bind(&req.username)
@@ -592,6 +638,9 @@ async fn register_user(
     // Log to audit (in-memory chain + PostgreSQL)
     // NOTE: Using append() which creates unsigned entries (empty signature).
     // TODO: Switch to append_signed() once a PqSigningKey is provisioned in AppState.
+    // SECURITY TODO: Audit entries should be HMAC-signed or ML-DSA-65 signed to
+    // prevent tampering. Currently signature field is empty. Provision a signing
+    // key in AppState and use audit.append_signed() instead.
     let mut audit = state.audit_log.write().await;
     let entry = audit.append(
         common::types::AuditEventType::CredentialRegistered,
@@ -910,7 +959,17 @@ async fn auth_login(
                 .unwrap()
                 .as_secs();
             let payload = format!("{}:{}", user_id, now);
-            let mut mac = HmacSha256::new_from_slice(b"MILNET-SSO-v1-ADMIN-TOKEN")
+            // Derive HMAC key from master KEK — prevents forging tokens without KEK
+            let master_kek = common::sealed_keys::load_master_kek();
+            let derived = {
+                use hkdf::Hkdf;
+                let hk = Hkdf::<Sha256>::new(Some(b"MILNET-ADMIN-TOKEN-v2"), &master_kek);
+                let mut okm = [0u8; 32];
+                hk.expand(b"admin-token-hmac", &mut okm)
+                    .expect("HKDF expand");
+                okm
+            };
+            let mut mac = HmacSha256::new_from_slice(&derived)
                 .expect("HMAC key");
             mac.update(payload.as_bytes());
             let sig = hex(&mac.finalize().into_bytes());
@@ -996,8 +1055,17 @@ async fn auth_verify(Json(req): Json<VerifyRequest>) -> Json<VerifyResponse> {
     use sha2::Sha256;
     type HmacSha256 = Hmac<Sha256>;
 
-    let mut mac =
-        HmacSha256::new_from_slice(b"MILNET-SSO-v1-ADMIN-TOKEN").expect("HMAC key");
+    // Derive HMAC key from master KEK — prevents forging tokens without KEK
+    let master_kek = common::sealed_keys::load_master_kek();
+    let derived = {
+        use hkdf::Hkdf;
+        let hk = Hkdf::<Sha256>::new(Some(b"MILNET-ADMIN-TOKEN-v2"), &master_kek);
+        let mut okm = [0u8; 32];
+        hk.expand(b"admin-token-hmac", &mut okm)
+            .expect("HKDF expand");
+        okm
+    };
+    let mut mac = HmacSha256::new_from_slice(&derived).expect("HMAC key");
     mac.update(payload.as_bytes());
     let expected = hex(&mac.finalize().into_bytes());
 
@@ -1288,6 +1356,8 @@ a{color:#00ff41}</style></head><body>
             if let Ok(config) = postcard::from_bytes::<common::duress::DuressConfig>(&bytes) {
                 if config.verify_pin(form.password.as_bytes()) == common::duress::PinVerification::Duress {
                     tracing::error!("DURESS PIN DETECTED for user {user_id}");
+                    // SECURITY TODO: Use append_signed() with a provisioned PqSigningKey
+                    // to prevent audit log tampering. Currently entries are unsigned.
                     let mut audit = state.audit_log.write().await;
                     audit.append(
                         common::types::AuditEventType::DuressDetected,
@@ -1335,6 +1405,8 @@ a{color:#00ff41}</style></head><body>
     drop(codes);
 
     // Log to audit
+    // SECURITY TODO: Use append_signed() with a provisioned PqSigningKey
+    // to prevent audit log tampering. Currently entries are unsigned.
     let mut audit = state.audit_log.write().await;
     audit.append(
         common::types::AuditEventType::AuthSuccess,
@@ -1544,6 +1616,8 @@ async fn oauth_google_callback(
         tracing::info!("Auto-enrolled Google user {} ({})", claims.email, new_id);
 
         // Log auto-enrollment to audit
+        // SECURITY TODO: Use append_signed() with a provisioned PqSigningKey
+        // to prevent audit log tampering. Currently entries are unsigned.
         let mut audit = state.audit_log.write().await;
         audit.append(
             common::types::AuditEventType::AuthSuccess,
@@ -1568,6 +1642,8 @@ async fn oauth_google_callback(
     drop(codes);
 
     // Log successful auth
+    // SECURITY TODO: Use append_signed() with a provisioned PqSigningKey
+    // to prevent audit log tampering. Currently entries are unsigned.
     let mut audit = state.audit_log.write().await;
     audit.append(
         common::types::AuditEventType::AuthSuccess,
@@ -1806,6 +1882,8 @@ async fn fido_register_complete(
     fido_store.store_credential(cred);
 
     // Log to audit
+    // SECURITY TODO: Use append_signed() with a provisioned PqSigningKey
+    // to prevent audit log tampering. Currently entries are unsigned.
     let mut audit = state.audit_log.write().await;
     audit.append(
         common::types::AuditEventType::CredentialRegistered,

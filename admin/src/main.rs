@@ -8,6 +8,9 @@ use admin::routes::{api_router, AppState};
 async fn main() {
     tracing_subscriber::fmt::init();
 
+    // Harden process: disable core dumps, prevent ptrace escalation
+    crypto::memguard::harden_process();
+
     let api_key = std::env::var("ADMIN_API_KEY").unwrap_or_else(|_| {
         let key = hex::encode(crypto::entropy::generate_nonce());
         eprintln!("Generated admin API key: {key}");

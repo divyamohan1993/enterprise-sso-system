@@ -9,6 +9,10 @@ use audit::log::{AuditRequest, AuditResponse};
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
+
+    // Harden process: disable core dumps, prevent ptrace escalation
+    crypto::memguard::harden_process();
+
     tracing::info!("Audit service starting");
 
     // Generate ML-DSA-65 keypair for signing audit entries.

@@ -184,6 +184,10 @@ fn unseal_key_from_hex(hex_str: &str, purpose: &str) -> Option<[u8; 64]> {
 
     let mut key = [0u8; 64];
     key.copy_from_slice(&plaintext);
+    // Zeroize the intermediate plaintext Vec to prevent heap fragment leakage
+    let mut plaintext = plaintext;
+    use zeroize::Zeroize;
+    plaintext.zeroize();
     Some(key)
 }
 

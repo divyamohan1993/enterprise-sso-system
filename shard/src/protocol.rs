@@ -238,10 +238,22 @@ impl ShardProtocol {
     ///
     /// Callers MUST persist these to durable storage and reload on restart
     /// to maintain replay protection across process restarts.
+    ///
+    /// Sequences are only advanced, never rolled backward, to prevent
+    /// downgrade attacks where a stale snapshot replays old sequence numbers.
     pub fn import_sequences(&mut self, data: &[u8]) {
         if let Ok(state) = postcard::from_bytes::<SequenceState>(data) {
-            self.send_sequence = state.send_sequence;
-            self.recv_sequences = state.recv_sequences;
+            // Only advance send_sequence, never go backward (prevents downgrade)
+            if state.send_sequence > self.send_sequence {
+                self.send_sequence = state.send_sequence;
+            }
+            // Only advance per-sender receive sequences, never go backward
+            for (module, seq) in state.recv_sequences {
+                let entry = self.recv_sequences.entry(module).or_insert(0);
+                if seq > *entry {
+                    *entry = seq;
+                }
+            }
             self.last_persisted_epoch = self.send_sequence;
         }
     }

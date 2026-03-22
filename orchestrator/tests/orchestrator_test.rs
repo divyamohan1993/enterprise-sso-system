@@ -198,6 +198,12 @@ async fn orchestrator_processes_auth() {
         password: b"password123".to_vec(),
         dpop_key_hash: [0xBB; 32],
         tier: 2,
+        device_attestation_age_secs: None,
+        geo_velocity_kmh: None,
+        is_unusual_network: None,
+        is_unusual_time: None,
+        unusual_access_score: None,
+        recent_failed_attempts: None,
     };
 
     let response = service.process_auth(&request).await;
@@ -301,6 +307,12 @@ async fn orchestrator_handles_opaque_failure() {
         password: b"wrong_password".to_vec(),
         dpop_key_hash: [0xBB; 32],
         tier: 2,
+        device_attestation_age_secs: None,
+        geo_velocity_kmh: None,
+        is_unusual_network: None,
+        is_unusual_time: None,
+        unusual_access_score: None,
+        recent_failed_attempts: None,
     };
 
     let response = service.process_auth(&request).await;

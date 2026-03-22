@@ -30,9 +30,11 @@ fn zero_risk_signals_score_zero() {
     let engine = RiskEngine::new();
     let user = Uuid::new_v4();
     let score = engine.compute_score(&user, &clean_signals());
+    // All-zero signals trigger the mimicry detection penalty (+0.05)
+    // plus random noise in [0.0, 0.03), so score should be in [0.05, 0.08).
     assert!(
-        (score - 0.0).abs() < f64::EPSILON,
-        "expected 0.0, got {score}"
+        score >= 0.05 && score < 0.08,
+        "expected [0.05, 0.08) with mimicry penalty + noise, got {score}"
     );
 }
 
@@ -55,8 +57,8 @@ fn failed_attempts_increase_risk() {
     let mut signals = clean_signals();
     signals.recent_failed_attempts = 5;
     let score = engine.compute_score(&user, &signals);
-    // 5/5 * 0.15 = 0.15
-    assert!((score - 0.15).abs() < 0.001, "expected ~0.15, got {score}");
+    // 5/5 * 0.15 = 0.15 + noise [0.0, 0.03)
+    assert!(score >= 0.15 && score < 0.18, "expected [0.15, 0.18), got {score}");
 }
 
 #[test]
@@ -66,7 +68,8 @@ fn impossible_travel_high_risk() {
     let mut signals = clean_signals();
     signals.geo_velocity_kmh = 2000.0;
     let score = engine.compute_score(&user, &signals);
-    assert!((score - 0.20).abs() < 0.001, "expected ~0.20, got {score}");
+    // 0.20 + noise [0.0, 0.03)
+    assert!(score >= 0.20 && score < 0.23, "expected [0.20, 0.23), got {score}");
 }
 
 #[test]
@@ -216,7 +219,8 @@ fn unusual_network_adds_risk() {
     let mut signals = clean_signals();
     signals.is_unusual_network = true;
     let score = engine.compute_score(&user, &signals);
-    assert!((score - 0.15).abs() < 0.001, "unusual network should add 0.15, got {score}");
+    // 0.15 + noise [0.0, 0.03)
+    assert!(score >= 0.15 && score < 0.18, "unusual network should add 0.15 + noise, got {score}");
 }
 
 #[test]
@@ -226,7 +230,8 @@ fn unusual_time_adds_risk() {
     let mut signals = clean_signals();
     signals.is_unusual_time = true;
     let score = engine.compute_score(&user, &signals);
-    assert!((score - 0.10).abs() < 0.001, "unusual time should add 0.10, got {score}");
+    // 0.10 + noise [0.0, 0.03)
+    assert!(score >= 0.10 && score < 0.13, "unusual time should add 0.10 + noise, got {score}");
 }
 
 #[test]
@@ -236,7 +241,8 @@ fn stale_device_attestation_moderate_risk() {
     let mut signals = clean_signals();
     signals.device_attestation_age_secs = 400.0; // > 300, < 3600
     let score = engine.compute_score(&user, &signals);
-    assert!((score - 0.10).abs() < 0.001, "stale attestation (400s) should add 0.10, got {score}");
+    // 0.10 + noise [0.0, 0.03)
+    assert!(score >= 0.10 && score < 0.13, "stale attestation (400s) should add 0.10 + noise, got {score}");
 }
 
 #[test]
@@ -248,8 +254,9 @@ fn combined_signals_additive() {
     signals.is_unusual_time = true;    // +0.10
     signals.recent_failed_attempts = 5; // +0.15
     let score = engine.compute_score(&user, &signals);
-    assert!((score - 0.40).abs() < 0.001, "combined signals should be 0.40, got {score}");
-    assert_eq!(engine.classify(score), RiskLevel::Elevated);
+    // 0.40 + noise [0.0, 0.03)
+    assert!(score >= 0.40 && score < 0.43, "combined signals should be 0.40 + noise, got {score}");
+    assert!(matches!(engine.classify(score), RiskLevel::Elevated), "expected Elevated classification");
 }
 
 #[test]

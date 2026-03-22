@@ -64,6 +64,13 @@ fn mlock_slice(ptr: *const u8, len: usize) -> bool {
     unsafe { libc::mlock(ptr as *const libc::c_void, len) == 0 }
 }
 
+/// Mark a memory region as excluded from core dumps (MADV_DONTDUMP).
+///
+/// Returns `true` on success.
+fn madv_dontdump(ptr: *const u8, len: usize) -> bool {
+    unsafe { libc::madvise(ptr as *mut libc::c_void, len, libc::MADV_DONTDUMP) == 0 }
+}
+
 /// Unlock a previously mlocked memory region.
 ///
 /// # Safety
@@ -134,10 +141,16 @@ impl<const N: usize> SecretBuffer<N> {
         let data_ptr = buf.data.as_ptr();
         if mlock_slice(data_ptr, N) {
             buf.locked = true;
+            // Exclude from core dumps
+            madv_dontdump(data_ptr, N);
         } else {
-            // Non-fatal: log and continue.  In production the orchestrator
-            // should ensure sufficient RLIMIT_MEMLOCK.
-            #[cfg(debug_assertions)]
+            // In production mode, mlock failure is fatal — keys must not be swappable.
+            if common::sealed_keys::is_production() {
+                panic!(
+                    "FATAL: mlock failed for {N}-byte SecretBuffer in production mode. \
+                     Ensure RLIMIT_MEMLOCK is sufficient."
+                );
+            }
             eprintln!(
                 "[memguard] WARNING: mlock failed for {N}-byte buffer — \
                  data may be swappable"
@@ -283,8 +296,16 @@ impl SecretVec {
         let len = sv.data.len();
         if mlock_slice(ptr, len) {
             sv.locked = true;
+            // Exclude from core dumps
+            madv_dontdump(ptr, len);
         } else {
-            #[cfg(debug_assertions)]
+            // In production mode, mlock failure is fatal — keys must not be swappable.
+            if common::sealed_keys::is_production() {
+                panic!(
+                    "FATAL: mlock failed for {len}-byte SecretVec in production mode. \
+                     Ensure RLIMIT_MEMLOCK is sufficient."
+                );
+            }
             eprintln!(
                 "[memguard] WARNING: mlock failed for {len}-byte SecretVec — \
                  data may be swappable"
@@ -392,6 +413,28 @@ pub fn generate_secret<const N: usize>() -> Result<SecretBuffer<N>, MemguardErro
     let mut buf = [0u8; N];
     getrandom::getrandom(&mut buf).map_err(|_| MemguardError::AllocationFailed)?;
     SecretBuffer::new(buf)
+}
+
+/// Harden the current process against memory disclosure attacks.
+///
+/// Call once at startup (in main) to:
+/// - Disable core dumps via prctl(PR_SET_DUMPABLE, 0)
+/// - Prevent new privilege escalation via prctl(PR_SET_NO_NEW_PRIVS, 1)
+///
+/// Returns `true` if all hardening succeeded.
+pub fn harden_process() -> bool {
+    let mut ok = true;
+    unsafe {
+        if libc::prctl(libc::PR_SET_DUMPABLE, 0) != 0 {
+            eprintln!("[memguard] WARNING: prctl(PR_SET_DUMPABLE, 0) failed");
+            ok = false;
+        }
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+            eprintln!("[memguard] WARNING: prctl(PR_SET_NO_NEW_PRIVS) failed");
+            ok = false;
+        }
+    }
+    ok
 }
 
 // ===========================================================================

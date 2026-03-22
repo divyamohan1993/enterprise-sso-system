@@ -25,6 +25,18 @@ pub struct OrchestratorRequest {
     pub dpop_key_hash: [u8; 32],
     /// Requested authentication tier (1-4). Defaults to 2 if 0.
     pub tier: u8,
+    #[serde(default)]
+    pub device_attestation_age_secs: Option<f64>,
+    #[serde(default)]
+    pub geo_velocity_kmh: Option<f64>,
+    #[serde(default)]
+    pub is_unusual_network: Option<bool>,
+    #[serde(default)]
+    pub is_unusual_time: Option<bool>,
+    #[serde(default)]
+    pub unusual_access_score: Option<f64>,
+    #[serde(default)]
+    pub recent_failed_attempts: Option<u32>,
 }
 
 /// Response from the Orchestrator to the Gateway (mirrors orchestrator message type).
