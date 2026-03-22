@@ -785,6 +785,24 @@ async fn auth_login(
     State(state): State<Arc<AppState>>,
     Json(req): Json<LoginRequest>,
 ) -> Json<LoginResponse> {
+    // Rate limiting: max 5 attempts per 30 minutes per username
+    {
+        let mut attempts = state.login_attempts.write().await;
+        let now = now_secs();
+        if let Some((count, first_time)) = attempts.get(&req.username) {
+            if now - first_time < 1800 && *count >= 5 {
+                return Json(LoginResponse {
+                    success: false,
+                    error: Some("account locked — too many attempts".into()),
+                    ..Default::default()
+                });
+            }
+            if now - first_time >= 1800 {
+                attempts.remove(&req.username);
+            }
+        }
+    }
+
     let store = state.credential_store.read().await;
 
     // Check user exists
@@ -853,6 +871,9 @@ async fn auth_login(
                 .await
                 .unwrap_or(2);
 
+            // Clear rate limit on successful login
+            state.login_attempts.write().await.remove(&req.username);
+
             Json(LoginResponse {
                 success: true,
                 user_id: Some(user_id),
@@ -862,14 +883,23 @@ async fn auth_login(
                 error: None,
             })
         }
-        Err(e) => Json(LoginResponse {
-            success: false,
-            user_id: None,
-            username: None,
-            token: None,
-            tier: None,
-            error: Some(format!("authentication failed: {e}")),
-        }),
+        Err(e) => {
+            // Increment failed login attempt counter
+            let mut attempts = state.login_attempts.write().await;
+            let now = now_secs();
+            let entry = attempts.entry(req.username.clone()).or_insert((0, now));
+            entry.0 += 1;
+            drop(attempts);
+
+            Json(LoginResponse {
+                success: false,
+                user_id: None,
+                username: None,
+                token: None,
+                tier: None,
+                error: Some(format!("authentication failed: {e}")),
+            })
+        }
     }
 }
 
@@ -1196,6 +1226,11 @@ a{color:#00ff41}</style></head><body>
                         vec![user_id], vec![], 1.0, vec![],
                     );
                     drop(audit);
+                    // Revoke all active sessions for this user
+                    let _ = sqlx::query("UPDATE sessions SET is_active = false WHERE user_id = $1")
+                        .bind(user_id)
+                        .execute(&state.db)
+                        .await;
                     user_tier = 4;
                 }
             }

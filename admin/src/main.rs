@@ -118,6 +118,8 @@ async fn main() {
         google_config,
         pending_google: RwLock::new(admin::google_oauth::PendingGoogleStore::new()),
         http_client: reqwest::Client::new(),
+        access_tokens: RwLock::new(std::collections::HashMap::new()),
+        login_attempts: RwLock::new(std::collections::HashMap::new()),
     });
 
     let app = api_router(state);
