@@ -889,10 +889,15 @@ struct RegisterDuressPinRequest {
 async fn register_duress_pin(
     State(state): State<Arc<AppState>>,
     request: Request,
-    Json(req): Json<RegisterDuressPinRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(4);
     check_tier(caller_tier, 2)?;
+
+    let body = axum::body::to_bytes(request.into_body(), 1024 * 64)
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let req: RegisterDuressPinRequest = serde_json::from_slice(&body)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
 
     let config = common::duress::DuressConfig::new(
         req.user_id,
