@@ -1,8 +1,27 @@
 use common::domain;
 use common::types::{AuditEntry, AuditEventType, Receipt};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+
+/// Wire request type for audit service.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AuditRequest {
+    pub event_type: AuditEventType,
+    pub user_ids: Vec<Uuid>,
+    pub device_ids: Vec<Uuid>,
+    pub risk_score: f64,
+    pub metadata: Vec<u8>,
+}
+
+/// Wire response type from audit service.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AuditResponse {
+    pub success: bool,
+    pub event_id: Option<Uuid>,
+    pub error: Option<String>,
+}
 
 pub struct AuditLog {
     entries: Vec<AuditEntry>,
