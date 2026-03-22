@@ -1,9 +1,53 @@
 //! Session manager — tracks multiple ratchet chains keyed by session ID.
 
 use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::chain::RatchetChain;
+
+// ── Wire message types ─────────────────────────────────────────────────
+
+/// Requests handled by the Ratchet Session Manager over SHARD transport.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RatchetRequest {
+    pub action: RatchetAction,
+}
+
+/// Actions that can be performed on ratchet sessions.
+///
+/// Note: there is intentionally no `GetKey` variant — exposing raw chain
+/// keys would break forward secrecy per spec.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum RatchetAction {
+    CreateSession {
+        session_id: Uuid,
+        /// 64-byte initial key sent as Vec since serde doesn't natively
+        /// support `[u8; 64]`.
+        initial_key: Vec<u8>,
+    },
+    Advance {
+        session_id: Uuid,
+        client_entropy: [u8; 32],
+        server_entropy: [u8; 32],
+    },
+    GetTag {
+        session_id: Uuid,
+        claims_bytes: Vec<u8>,
+    },
+    Destroy {
+        session_id: Uuid,
+    },
+}
+
+/// Response returned by the Ratchet Session Manager.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RatchetResponse {
+    pub success: bool,
+    pub epoch: Option<u64>,
+    pub tag: Option<Vec<u8>>,
+    pub error: Option<String>,
+}
 
 /// Manages forward-secret ratchet sessions.
 ///

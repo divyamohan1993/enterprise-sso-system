@@ -1,7 +1,7 @@
 //! Integration tests for the ratchet session manager.
 
 use ratchet::chain::RatchetChain;
-use ratchet::manager::SessionManager;
+use ratchet::manager::{RatchetAction, RatchetRequest, RatchetResponse, SessionManager};
 use uuid::Uuid;
 
 fn test_secret() -> [u8; 64] {
@@ -138,4 +138,127 @@ fn session_manager_destroy_removes() {
     let result = mgr.generate_tag(&sid, b"claims");
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("not found"));
+}
+
+// ── Wire message serialization round-trip tests ────────────────────
+
+#[test]
+fn request_create_session_roundtrip() {
+    let req = RatchetRequest {
+        action: RatchetAction::CreateSession {
+            session_id: Uuid::new_v4(),
+            initial_key: vec![0xAB; 64],
+        },
+    };
+    let bytes = postcard::to_allocvec(&req).unwrap();
+    let decoded: RatchetRequest = postcard::from_bytes(&bytes).unwrap();
+    match decoded.action {
+        RatchetAction::CreateSession { initial_key, .. } => {
+            assert_eq!(initial_key.len(), 64);
+            assert!(initial_key.iter().all(|&b| b == 0xAB));
+        }
+        _ => panic!("expected CreateSession"),
+    }
+}
+
+#[test]
+fn request_advance_roundtrip() {
+    let sid = Uuid::new_v4();
+    let req = RatchetRequest {
+        action: RatchetAction::Advance {
+            session_id: sid,
+            client_entropy: [0xCC; 32],
+            server_entropy: [0xDD; 32],
+        },
+    };
+    let bytes = postcard::to_allocvec(&req).unwrap();
+    let decoded: RatchetRequest = postcard::from_bytes(&bytes).unwrap();
+    match decoded.action {
+        RatchetAction::Advance { session_id, client_entropy, server_entropy } => {
+            assert_eq!(session_id, sid);
+            assert_eq!(client_entropy, [0xCC; 32]);
+            assert_eq!(server_entropy, [0xDD; 32]);
+        }
+        _ => panic!("expected Advance"),
+    }
+}
+
+#[test]
+fn request_get_tag_roundtrip() {
+    let sid = Uuid::new_v4();
+    let claims = b"test-claims".to_vec();
+    let req = RatchetRequest {
+        action: RatchetAction::GetTag {
+            session_id: sid,
+            claims_bytes: claims.clone(),
+        },
+    };
+    let bytes = postcard::to_allocvec(&req).unwrap();
+    let decoded: RatchetRequest = postcard::from_bytes(&bytes).unwrap();
+    match decoded.action {
+        RatchetAction::GetTag { session_id, claims_bytes } => {
+            assert_eq!(session_id, sid);
+            assert_eq!(claims_bytes, claims);
+        }
+        _ => panic!("expected GetTag"),
+    }
+}
+
+#[test]
+fn request_destroy_roundtrip() {
+    let sid = Uuid::new_v4();
+    let req = RatchetRequest {
+        action: RatchetAction::Destroy { session_id: sid },
+    };
+    let bytes = postcard::to_allocvec(&req).unwrap();
+    let decoded: RatchetRequest = postcard::from_bytes(&bytes).unwrap();
+    match decoded.action {
+        RatchetAction::Destroy { session_id } => assert_eq!(session_id, sid),
+        _ => panic!("expected Destroy"),
+    }
+}
+
+#[test]
+fn response_success_with_epoch_roundtrip() {
+    let resp = RatchetResponse {
+        success: true,
+        epoch: Some(42),
+        tag: None,
+        error: None,
+    };
+    let bytes = postcard::to_allocvec(&resp).unwrap();
+    let decoded: RatchetResponse = postcard::from_bytes(&bytes).unwrap();
+    assert!(decoded.success);
+    assert_eq!(decoded.epoch, Some(42));
+    assert!(decoded.tag.is_none());
+    assert!(decoded.error.is_none());
+}
+
+#[test]
+fn response_success_with_tag_roundtrip() {
+    let tag = vec![0xFF; 64];
+    let resp = RatchetResponse {
+        success: true,
+        epoch: None,
+        tag: Some(tag.clone()),
+        error: None,
+    };
+    let bytes = postcard::to_allocvec(&resp).unwrap();
+    let decoded: RatchetResponse = postcard::from_bytes(&bytes).unwrap();
+    assert!(decoded.success);
+    assert_eq!(decoded.tag.unwrap(), tag);
+}
+
+#[test]
+fn response_error_roundtrip() {
+    let resp = RatchetResponse {
+        success: false,
+        epoch: None,
+        tag: None,
+        error: Some("session not found".into()),
+    };
+    let bytes = postcard::to_allocvec(&resp).unwrap();
+    let decoded: RatchetResponse = postcard::from_bytes(&bytes).unwrap();
+    assert!(!decoded.success);
+    assert_eq!(decoded.error.unwrap(), "session not found");
 }
