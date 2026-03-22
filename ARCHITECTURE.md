@@ -6,7 +6,7 @@ An SSO system architected to combine threshold cryptography, post-quantum key ex
 
 **Threat Model (Spec):** Total compromise of host, network, clients, database, and individual processes. Nation-state adversary with raw internet access, no firewall.
 
-**Implementation Status (v0.1.0):** Core cryptographic foundations implemented. End-to-end auth flow working. Several spec-level security properties are library-only and not yet wired into the runtime (see Honest Assessment in README).
+**Implementation Status (v0.2.0):** All cryptographic modules wired into runtime orchestration. Distributed FROST signing, session ratcheting, risk scoring, BFT audit with ML-DSA-65 signing, key transparency with signed tree heads, multi-person ceremony enforcement, duress PIN detection, FIDO2 integration, X-Wing hybrid KEM, DPoP channel binding, witness checkpoints, secret persistence, login rate limiting, and token expiry enforcement are all operational. Google OAuth federated login and public integration docs page added.
 
 **Red Team Coverage:** 169 attack scenarios identified during internal design review (self-authored AI-assisted analysis, not independent external red team). Code-level review found 11 additional vulnerabilities (4 critical patched, remainder documented as known limitations).
 
