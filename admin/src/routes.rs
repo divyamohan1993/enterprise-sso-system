@@ -36,6 +36,8 @@ pub struct AppState {
     pub google_config: Option<crate::google_oauth::GoogleOAuthConfig>,
     pub pending_google: RwLock<crate::google_oauth::PendingGoogleStore>,
     pub http_client: reqwest::Client,
+    pub access_tokens: RwLock<HashMap<String, Uuid>>,
+    pub login_attempts: RwLock<HashMap<String, (u32, i64)>>,
 }
 
 /// A pending multi-person ceremony that requires multiple approvers.
@@ -151,7 +153,21 @@ fn verify_user_token(token: &str) -> bool {
     mac.update(payload.as_bytes());
     let expected = hex(&mac.finalize().into_bytes());
 
-    expected == parts[2]
+    if expected != parts[2] {
+        return false;
+    }
+
+    // Check token age — expire after 1 hour
+    let timestamp: u64 = parts[1].parse().unwrap_or(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    if now - timestamp > 3600 {
+        return false; // Token expired (1 hour)
+    }
+
+    true
 }
 
 /// Check if the authenticated user's tier allows access to this endpoint.
@@ -983,10 +999,16 @@ async fn oauth_authorize(
     Query(params): Query<AuthorizeParams>,
 ) -> axum::response::Response {
     use axum::response::{IntoResponse, Html};
-    use axum::http::header;
 
     if params.response_type != "code" {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "unsupported_response_type"}))).into_response();
+    }
+
+    // Validate PKCE code_challenge_method if provided
+    if let Some(ref method) = params.code_challenge_method {
+        if method != "S256" {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid_request", "description": "only S256 code_challenge_method supported"}))).into_response();
+        }
     }
 
     // Validate client
@@ -1356,14 +1378,14 @@ async fn oauth_google_callback(
     let (user_id, user_tier) = if let Some((id, tier)) = row {
         (id, tier as u8)
     } else {
-        // Auto-create tier 2 user with google auth provider
+        // Auto-create tier 4 (Emergency/minimal access) user with google auth provider
         let new_id = Uuid::new_v4();
         let now = now_secs();
         let username = claims.email.split('@').next().unwrap_or(&claims.email);
         let display_name = claims.name.as_deref().unwrap_or(username);
         let _ = display_name; // reserved for future profile use
-        sqlx::query(
-            "INSERT INTO users (id, username, email, tier, is_active, auth_provider, opaque_registration, created_at) VALUES ($1, $2, $3, 2, true, 'google', NULL, $4)"
+        let insert_result = sqlx::query(
+            "INSERT INTO users (id, username, email, tier, is_active, auth_provider, opaque_registration, created_at) VALUES ($1, $2, $3, 4, true, 'google', NULL, $4)"
         )
             .bind(new_id)
             .bind(username)
@@ -1371,10 +1393,12 @@ async fn oauth_google_callback(
             .bind(now)
             .execute(&state.db)
             .await
-            .unwrap_or_else(|e| {
+            .map_err(|e| {
                 tracing::error!("Failed to auto-create Google user: {e}");
-                panic!("Failed to create user");
             });
+        if insert_result.is_err() {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to create user account").into_response();
+        }
         tracing::info!("Auto-enrolled Google user {} ({})", claims.email, new_id);
 
         // Log auto-enrollment to audit
@@ -1385,7 +1409,7 @@ async fn oauth_google_callback(
         );
         drop(audit);
 
-        (new_id, 2u8)
+        (new_id, 4u8)
     };
 
     // Create MILNET authorization code
