@@ -9,6 +9,25 @@ An authentication system combining threshold cryptography (FROST), post-quantum 
 **Demo:** [https://sso-system-demo.dmj.one](https://sso-system-demo.dmj.one)
 **GitHub:** [github.com/divyamohan1993/enterprise-sso-system](https://github.com/divyamohan1993/enterprise-sso-system)
 
+## Try It Now
+
+Log in to the live system — no signup required:
+
+| Credential | Username | Password | Access Level |
+|-----------|----------|----------|-------------|
+| **Admin** | `admin` | `admin` | Tier 1 (Sovereign) — full admin panel, register users/portals, view audit log |
+| **Demo** | `demo` | `demo` | Tier 3 (Sensor) — limited user portal, read-only access |
+
+## Screenshots
+
+**Security Demo** — tamper a token, watch it get rejected:
+
+![Security Demo](screenshots/security-demo.jpg)
+
+**Integration Docs** — code samples in 7 languages, copy-paste ready:
+
+![Integration Docs](screenshots/docs.jpg)
+
 ## One-Click Deployment
 
 ```bash

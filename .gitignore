@@ -72,10 +72,13 @@ terraform/terraform.tfstate.backup
 # Runtime
 *.pid
 
-# Screenshots (generated during testing)
-*.png
+# Screenshots (generated during testing) — except README screenshots
 *.jpg
 *.jpeg
+# Allow screenshots directory for README
+!screenshots/
+!screenshots/*.png
+!screenshots/*.jpg
 
 # Playwright
 .playwright-mcp/
