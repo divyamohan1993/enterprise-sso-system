@@ -37,7 +37,7 @@
 
 This document specifies a research-grade Single Sign-On (SSO) system designed for military network (MILNET) deployment under the most extreme adversarial conditions. The system assumes **total compromise** of host, network, client devices, database, and even individual auth server processes — and still defends.
 
-**No system combining all these properties has ever been built.** Research confirms that no publicly documented system — commercial, government, or academic — combines threshold token signing, OPAQUE password authentication, ratcheting sessions, key transparency, microkernel process isolation, and post-quantum cryptography in a single authentication system.
+**To our knowledge, no publicly documented system combines all these properties in a single implementation.** Based on our survey of publicly available documentation (as of March 2026), no commercial, government, or academic system combines threshold token signing, OPAQUE password authentication, ratcheting sessions, key transparency, microkernel process isolation, and post-quantum cryptography in a single authentication system.
 
 ### Key Properties
 
@@ -59,7 +59,7 @@ This document specifies a research-grade Single Sign-On (SSO) system designed fo
 
 ### Adversary Profile
 
-- **Capability:** Nation-state with unlimited resources, years of patience
+- **Capability:** Well-resourced adversary with significant capabilities, years of patience
 - **Access:** Raw internet exposure, no firewall, all traffic flows directly to system
 - **Compromise Level:** Assume host, network, clients, database, individual processes all compromised simultaneously
 - **Attack Types:** DDoS, APTs, supply chain, side-channel, physical, social engineering, insider threat, coercion — all simultaneously
@@ -843,9 +843,9 @@ Based on exhaustive research, this system would be the first to combine:
 | Microkernel isolation for auth | seL4/KasperskyOS (OS only) | **Novel in auth** |
 | Crypto client puzzles in auth | Academic concept since 1999 | **Novel in production** |
 | PQ crypto at auth protocol level | Transport layer only | **Novel at protocol level** |
-| All combined | Nobody | **Unprecedented** |
+| All combined | Not found in surveyed systems | **Novel combination** |
 
-No publicly documented system — DoD CAC/PIV, NSA CSfC, Google BeyondCorp, Microsoft Entra, NATO, Five Eyes — combines even three of these properties.
+Based on our survey of publicly available documentation (as of March 2026), no publicly documented system — DoD CAC/PIV, NSA CSfC, Google BeyondCorp, Microsoft Entra, NATO, Five Eyes — combines even three of these properties.
 
 ---
 
@@ -1272,7 +1272,7 @@ Ed25519 has well-documented cofactor-8 issues. FROST-Ed25519 uses Ristretto enco
 
 **Fix:** Replace `frost-ed25519` with `frost-ristretto255` in the crypto stack. Both are from the ZF FROST implementation (RFC 9591 compatible). Ristretto255 provides a prime-order group without cofactor concerns.
 
-## Appendix E: Nation-State Red Team Errata (Round 3)
+## Appendix E: Advanced Threat Red Team Errata (Round 3)
 
 37 attack vectors from combined NSA TAO / Unit 8200 / GRU / GCHQ / Lazarus analysis. 5 systemic conclusions. All critical findings addressed below. Lower-severity findings documented with accepted risk rationale.
 
@@ -1362,7 +1362,7 @@ File-based integrity checks don't prevent in-memory modification by kernel-level
 
 ### E.9: HIGH — Level 4 Ceremony: Three-Person, Random Selection (Attacks 12, 16)
 
-Two-person cross-department is weak against patient nation-state (recruit 2 assets over 5 years).
+Two-person cross-department is weak against patient adversary with insider recruitment capability (recruit 2 assets over 5 years).
 
 **Fix:**
 - Level 4 requires THREE persons from THREE departments (raise from 2 to 3)

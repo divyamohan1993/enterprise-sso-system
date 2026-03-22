@@ -1280,6 +1280,6 @@ Each plan follows this same format: exact files, TDD steps, commit points.
 | Section 18 (Supply Chain) | Phase 7 |
 | Appendix B (Errata) | Phase 0-2 |
 | Appendix C (Crypto Errata) | Phase 1 |
-| Appendix E (Nation-State Errata) | Phase 2-7 |
+| Appendix E (Advanced Threat Errata) | Phase 2-7 |
 | Appendix F (Formal Verification) | Phase 0, 7 |
 | Appendix G (OpSec) | Phase 7 |

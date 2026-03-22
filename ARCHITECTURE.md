@@ -2,9 +2,9 @@
 
 ## System Overview
 
-An SSO system architected to combine threshold cryptography, post-quantum key exchange, forward-secret sessions, key transparency, and defense-in-depth process isolation. The architecture specification targets a threat model no publicly documented system has addressed at this combination level.
+An SSO system architected to combine threshold cryptography, post-quantum key exchange, forward-secret sessions, key transparency, and defense-in-depth process isolation. The architecture specification explores a defense-in-depth approach combining multiple cryptographic properties in a single authentication system.
 
-**Threat Model (Spec):** Total compromise of host, network, clients, database, and individual processes. Nation-state adversary with raw internet access, no firewall.
+**Threat Model (Spec):** Total compromise of host, network, clients, database, and individual processes. Well-resourced adversary with raw internet access, no firewall.
 
 **Implementation Status (v0.2.0):** All cryptographic modules wired into runtime orchestration. Distributed FROST signing, session ratcheting, risk scoring, BFT audit with ML-DSA-65 signing, key transparency with signed tree heads, multi-person ceremony enforcement, duress PIN detection, FIDO2 integration, X-Wing hybrid KEM, DPoP channel binding, witness checkpoints, secret persistence, login rate limiting, and token expiry enforcement are all operational. Google OAuth federated login and public integration docs page added.
 
@@ -221,7 +221,7 @@ Client                Gateway        Orchestrator      OPAQUE         TSS
 | 2 | Red Team vs Architecture | 40 | Proposed design gaps |
 | Review | Spec Internal Review | 21 | Contradictions and completeness |
 | 3a | IACR Crypto Team | 15 | Mathematical/cryptographic attacks |
-| 3b | Nation-State Combined | 37 | Compound, human, systemic attacks |
+| 3b | Combined Advanced Threats | 37 | Compound, human, systemic attacks |
 | **Total** | | **169** | **All mitigated** |
 
 ## Build & Test

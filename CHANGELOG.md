@@ -53,7 +53,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 190+ tests across 13 crates
 - End-to-end Tier 2 ceremony flow (gateway → orchestrator → opaque → tss → verifier)
 - SSO multi-portal proof (single login, 5 service portals, independent verifiers)
-- Nation-state attack simulation (37 tests: DDoS, credential stuffing, token forgery, receipt chain attacks, SHARD protocol attacks, session hijacking, privilege escalation, audit evasion)
+- Advanced threat simulation (37 tests: DDoS, credential stuffing, token forgery, receipt chain attacks, SHARD protocol attacks, session hijacking, privilege escalation, audit evasion)
 - Production validation (53 tests: all modules, edge cases, false positives, concurrent load)
 
 #### CI/CD & Supply Chain
