@@ -10,6 +10,7 @@ crypto = { path = "../crypto" }
 shard = { path = "../shard" }
 opaque = { path = "../opaque" }
 tss = { path = "../tss" }
+risk = { path = "../risk" }
 gateway = { path = "../gateway" }
 serde.workspace = true
 postcard.workspace = true

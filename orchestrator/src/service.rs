@@ -16,6 +16,7 @@ pub struct OrchestratorService {
     pub opaque_addr: String,
     pub tss_addr: String,
     pub receipt_signing_key: [u8; 64],
+    pub risk_engine: risk::scoring::RiskEngine,
 }
 
 impl OrchestratorService {
@@ -31,6 +32,7 @@ impl OrchestratorService {
             opaque_addr,
             tss_addr,
             receipt_signing_key,
+            risk_engine: risk::scoring::RiskEngine::new(),
         }
     }
 
@@ -183,7 +185,25 @@ impl OrchestratorService {
             .map_err(|e| format!("receipt chain: {e}"))?;
         session.opaque_complete()?;
 
-        // 5. Build and send TSS signing request
+        // 5. Risk evaluation
+        let user_id = session.user_id.unwrap_or(Uuid::nil());
+        let risk_signals = risk::scoring::RiskSignals {
+            device_attestation_age_secs: 0.0,
+            geo_velocity_kmh: 0.0,
+            is_unusual_network: false,
+            is_unusual_time: false,
+            unusual_access_score: 0.0,
+            recent_failed_attempts: 0,
+        };
+        let risk_score = self.risk_engine.compute_score(&user_id, &risk_signals);
+        if self.risk_engine.requires_termination(risk_score) {
+            return Err("risk: session terminated — critical risk score".into());
+        }
+        if self.risk_engine.requires_step_up(risk_score) {
+            tracing::warn!("Risk score {risk_score} >= 0.6 — step-up re-auth required");
+        }
+
+        // 6. Build and send TSS signing request
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

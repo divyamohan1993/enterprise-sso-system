@@ -1,5 +1,5 @@
 use common::types::DeviceTier;
-use risk::scoring::{RiskEngine, RiskLevel, RiskSignals};
+use risk::scoring::{RiskEngine, RiskLevel, RiskRequest, RiskResponse, RiskSignals};
 use risk::tiers::{check_tier_access, DeviceEnrollment, DeviceRegistry};
 use uuid::Uuid;
 
@@ -150,4 +150,91 @@ fn device_registry_revoke() {
 
     // Revoking non-existent device returns false
     assert!(!registry.revoke(&Uuid::new_v4()));
+}
+
+#[test]
+fn risk_request_serialization_round_trip() {
+    let request = RiskRequest {
+        user_id: Uuid::new_v4(),
+        device_tier: 2,
+        signals: RiskSignals {
+            device_attestation_age_secs: 120.0,
+            geo_velocity_kmh: 50.0,
+            is_unusual_network: true,
+            is_unusual_time: false,
+            unusual_access_score: 0.3,
+            recent_failed_attempts: 2,
+        },
+    };
+
+    let bytes = postcard::to_allocvec(&request).expect("serialize RiskRequest");
+    let decoded: RiskRequest = postcard::from_bytes(&bytes).expect("deserialize RiskRequest");
+
+    assert_eq!(decoded.user_id, request.user_id);
+    assert_eq!(decoded.device_tier, request.device_tier);
+    assert!((decoded.signals.device_attestation_age_secs - 120.0).abs() < f64::EPSILON);
+    assert!((decoded.signals.geo_velocity_kmh - 50.0).abs() < f64::EPSILON);
+    assert!(decoded.signals.is_unusual_network);
+    assert!(!decoded.signals.is_unusual_time);
+    assert!((decoded.signals.unusual_access_score - 0.3).abs() < f64::EPSILON);
+    assert_eq!(decoded.signals.recent_failed_attempts, 2);
+}
+
+#[test]
+fn risk_response_serialization_round_trip() {
+    let response = RiskResponse {
+        score: 0.75,
+        classification: "High".to_string(),
+        step_up_required: true,
+        session_terminate: false,
+    };
+
+    let bytes = postcard::to_allocvec(&response).expect("serialize RiskResponse");
+    let decoded: RiskResponse = postcard::from_bytes(&bytes).expect("deserialize RiskResponse");
+
+    assert!((decoded.score - 0.75).abs() < f64::EPSILON);
+    assert_eq!(decoded.classification, "High");
+    assert!(decoded.step_up_required);
+    assert!(!decoded.session_terminate);
+}
+
+#[test]
+fn risk_request_end_to_end_with_engine() {
+    let request = RiskRequest {
+        user_id: Uuid::new_v4(),
+        device_tier: 2,
+        signals: RiskSignals {
+            device_attestation_age_secs: 7200.0,
+            geo_velocity_kmh: 2000.0,
+            is_unusual_network: true,
+            is_unusual_time: true,
+            unusual_access_score: 1.0,
+            recent_failed_attempts: 10,
+        },
+    };
+
+    // Serialize and deserialize the request (simulating SHARD transport)
+    let req_bytes = postcard::to_allocvec(&request).expect("serialize");
+    let decoded_req: RiskRequest = postcard::from_bytes(&req_bytes).expect("deserialize");
+
+    // Process with engine
+    let engine = RiskEngine::new();
+    let score = engine.compute_score(&decoded_req.user_id, &decoded_req.signals);
+    let classification = format!("{:?}", engine.classify(score));
+
+    let response = RiskResponse {
+        score,
+        classification: classification.clone(),
+        step_up_required: engine.requires_step_up(score),
+        session_terminate: engine.requires_termination(score),
+    };
+
+    // Serialize and deserialize the response
+    let resp_bytes = postcard::to_allocvec(&response).expect("serialize response");
+    let decoded_resp: RiskResponse = postcard::from_bytes(&resp_bytes).expect("deserialize response");
+
+    assert!((decoded_resp.score - 1.0).abs() < f64::EPSILON);
+    assert_eq!(decoded_resp.classification, "Critical");
+    assert!(decoded_resp.step_up_required);
+    assert!(decoded_resp.session_terminate);
 }

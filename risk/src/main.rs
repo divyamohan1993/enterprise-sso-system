@@ -21,11 +21,44 @@ async fn main() {
     tracing::info!("Risk Scoring service listening on {addr}");
     loop {
         if let Ok(mut transport) = listener.accept().await {
-            let _engine = engine.clone();
+            let engine_handle = engine.clone();
             let _registry = registry.clone();
             tokio::spawn(async move {
-                while let Ok((_sender, _payload)) = transport.recv().await {
-                    // Compute risk scores for incoming requests
+                while let Ok((_sender, payload)) = transport.recv().await {
+                    let request: risk::scoring::RiskRequest = match postcard::from_bytes(&payload) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::error!("Failed to deserialize RiskRequest: {e}");
+                            continue;
+                        }
+                    };
+
+                    let eng = engine_handle.read().await;
+                    let score = eng.compute_score(&request.user_id, &request.signals);
+                    let classification = format!("{:?}", eng.classify(score));
+                    let step_up_required = eng.requires_step_up(score);
+                    let session_terminate = eng.requires_termination(score);
+                    drop(eng);
+
+                    let response = risk::scoring::RiskResponse {
+                        score,
+                        classification,
+                        step_up_required,
+                        session_terminate,
+                    };
+
+                    let resp_bytes = match postcard::to_allocvec(&response) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::error!("Failed to serialize RiskResponse: {e}");
+                            continue;
+                        }
+                    };
+
+                    if let Err(e) = transport.send(&resp_bytes).await {
+                        tracing::error!("Failed to send RiskResponse: {e}");
+                        break;
+                    }
                 }
             });
         }

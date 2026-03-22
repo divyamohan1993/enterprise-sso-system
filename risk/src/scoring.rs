@@ -1,8 +1,9 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
 /// Risk signal types
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RiskSignals {
     pub device_attestation_age_secs: f64, // 0 = fresh, higher = stale
     pub geo_velocity_kmh: f64,            // impossible travel speed
@@ -107,4 +108,21 @@ impl Default for RiskEngine {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Wire request type for risk scoring via SHARD transport.
+#[derive(Serialize, Deserialize)]
+pub struct RiskRequest {
+    pub user_id: uuid::Uuid,
+    pub device_tier: u8,
+    pub signals: RiskSignals,
+}
+
+/// Wire response type for risk scoring via SHARD transport.
+#[derive(Serialize, Deserialize)]
+pub struct RiskResponse {
+    pub score: f64,
+    pub classification: String,
+    pub step_up_required: bool,
+    pub session_terminate: bool,
 }

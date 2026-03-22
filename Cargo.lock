@@ -1744,6 +1744,7 @@ dependencies = [
  "opaque-ke",
  "postcard",
  "rand",
+ "risk",
  "serde",
  "sha2",
  "shard",
