@@ -29,6 +29,11 @@ pub async fn init_database(database_url: &str) -> PgPool {
         .execute(&pool)
         .await;
 
+    // Migration: add duress_pin_hash column for duress PIN system
+    let _ = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS duress_pin_hash BYTEA")
+        .execute(&pool)
+        .await;
+
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS devices (
             id UUID PRIMARY KEY,

@@ -333,6 +333,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         // Auth
         .route("/api/auth/login", post(auth_login))
         .route("/api/auth/verify", post(auth_verify))
+        .route("/api/auth/duress-pin", post(register_duress_pin))
         // Key Transparency
         .route("/api/kt/root", get(get_kt_root))
         .route("/api/kt/proof/{index}", get(get_kt_proof))
@@ -868,6 +869,46 @@ async fn auth_verify(Json(req): Json<VerifyRequest>) -> Json<VerifyResponse> {
             error: Some("signature verification failed".into()),
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Handlers — Key Transparency
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Handlers — Duress PIN
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct RegisterDuressPinRequest {
+    user_id: Uuid,
+    normal_pin: String,
+    duress_pin: String,
+}
+
+async fn register_duress_pin(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    Json(req): Json<RegisterDuressPinRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(4);
+    check_tier(caller_tier, 2)?;
+
+    let config = common::duress::DuressConfig::new(
+        req.user_id,
+        req.normal_pin.as_bytes(),
+        req.duress_pin.as_bytes(),
+    );
+    let serialized = postcard::to_allocvec(&config).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    sqlx::query("UPDATE users SET duress_pin_hash = $1 WHERE id = $2")
+        .bind(&serialized)
+        .bind(req.user_id)
+        .execute(&state.db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(serde_json::json!({"success": true})))
 }
 
 // ---------------------------------------------------------------------------
