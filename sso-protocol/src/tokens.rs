@@ -11,6 +11,7 @@ pub struct IdTokenClaims {
     pub iat: i64,
     pub nonce: Option<String>,
     pub auth_time: i64,
+    pub tier: u8,
 }
 
 #[derive(Serialize)]
@@ -30,6 +31,18 @@ pub fn create_id_token(
     nonce: Option<String>,
     signing_key: &[u8; 64],
 ) -> String {
+    create_id_token_with_tier(issuer, user_id, client_id, nonce, signing_key, 2)
+}
+
+/// Create an HMAC-signed JWT with an explicit tier claim
+pub fn create_id_token_with_tier(
+    issuer: &str,
+    user_id: &Uuid,
+    client_id: &str,
+    nonce: Option<String>,
+    signing_key: &[u8; 64],
+    tier: u8,
+) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -44,6 +57,7 @@ pub fn create_id_token(
         iat: now,
         nonce,
         auth_time: now,
+        tier,
     };
 
     let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());

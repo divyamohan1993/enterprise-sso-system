@@ -41,9 +41,13 @@ pub struct AppState {
 /// For all other routes, requires a valid Bearer token that matches either:
 /// - the admin API key (from ADMIN_API_KEY env var), or
 /// - a user auth token issued by /api/auth/login.
+/// Extension to carry the authenticated user's tier through the request.
+#[derive(Debug, Clone, Copy)]
+pub struct AuthTier(pub u8);
+
 async fn auth_middleware(
     State(state): State<Arc<AppState>>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
     // Skip auth for health, discovery, and public endpoints
@@ -68,17 +72,36 @@ async fn auth_middleware(
     let auth_header = request
         .headers()
         .get("Authorization")
-        .and_then(|v| v.to_str().ok());
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
 
     match auth_header {
         Some(header) if header.starts_with("Bearer ") => {
             let token = &header[7..];
-            // Accept the admin API key
+            // Accept the admin API key — treated as tier 1 (Sovereign)
             if token == state.admin_api_key {
+                request.extensions_mut().insert(AuthTier(1));
                 return Ok(next.run(request).await);
             }
             // Accept a valid user auth token (user_id:timestamp:hmac)
             if verify_user_token(token) {
+                // Look up user tier from DB
+                let parts: Vec<&str> = token.splitn(3, ':').collect();
+                let tier = if parts.len() == 3 {
+                    if let Ok(user_id) = Uuid::parse_str(parts[0]) {
+                        let t: i32 = sqlx::query_scalar("SELECT tier FROM users WHERE id = $1")
+                            .bind(user_id)
+                            .fetch_one(&state.db)
+                            .await
+                            .unwrap_or(4);
+                        t as u8
+                    } else {
+                        4
+                    }
+                } else {
+                    4
+                };
+                request.extensions_mut().insert(AuthTier(tier));
                 return Ok(next.run(request).await);
             }
             Err(StatusCode::UNAUTHORIZED)
@@ -111,6 +134,16 @@ fn verify_user_token(token: &str) -> bool {
     expected == parts[2]
 }
 
+/// Check if the authenticated user's tier allows access to this endpoint.
+/// Lower tier number = higher privilege.
+fn check_tier(token_tier: u8, required_tier: u8) -> Result<(), StatusCode> {
+    if token_tier <= required_tier {
+        Ok(())
+    } else {
+        Err(StatusCode::FORBIDDEN)
+    }
+}
+
 // ---------------------------------------------------------------------------
 fn now_secs() -> i64 {
     std::time::SystemTime::now()
@@ -140,12 +173,14 @@ pub struct Portal {
 pub struct RegisterUserRequest {
     pub username: String,
     pub password: String,
+    pub tier: Option<u8>,  // 1=Sovereign, 2=Operational, 3=Sensor, 4=Emergency. Default: 2
 }
 
 #[derive(Serialize)]
 pub struct RegisterUserResponse {
     pub user_id: Uuid,
     pub username: String,
+    pub tier: u8,
 }
 
 #[derive(Deserialize)]
@@ -224,6 +259,7 @@ pub struct LoginResponse {
     pub success: bool,
     pub user_id: Option<Uuid>,
     pub token: Option<String>,
+    pub tier: Option<u8>,
     pub error: Option<String>,
 }
 
@@ -343,9 +379,9 @@ async fn initial_setup(
     let mut store = state.credential_store.write().await;
     let user_id = store.register_with_password(&req.username, req.password.as_bytes());
 
-    // Persist user to PostgreSQL
+    // Persist superuser to PostgreSQL with tier 1 (Sovereign)
     let _ = sqlx::query(
-        "INSERT INTO users (id, username, created_at, is_active) VALUES ($1, $2, $3, true) ON CONFLICT (id) DO UPDATE SET username = $2"
+        "INSERT INTO users (id, username, tier, created_at, is_active) VALUES ($1, $2, 1, $3, true) ON CONFLICT (id) DO UPDATE SET username = $2, tier = 1"
     )
     .bind(user_id)
     .bind(&req.username)
@@ -399,17 +435,29 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<SystemStatus> {
 
 async fn register_user(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<RegisterUserRequest>,
-) -> Json<RegisterUserResponse> {
+    request: Request,
+) -> Result<Json<RegisterUserResponse>, StatusCode> {
+    // Extract tier from auth middleware
+    let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(4);
+    // Registering users requires tier 1 (Sovereign)
+    check_tier(caller_tier, 1)?;
+
+    let body = axum::body::to_bytes(request.into_body(), 1024 * 64)
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let req: RegisterUserRequest = serde_json::from_slice(&body)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let tier = req.tier.unwrap_or(2).clamp(1, 4);
     let mut store = state.credential_store.write().await;
     let user_id = store.register_with_password(&req.username, req.password.as_bytes());
 
-    // Persist user to PostgreSQL
+    // Persist user to PostgreSQL (with tier)
     let _ = sqlx::query(
-        "INSERT INTO users (id, username, created_at, is_active) VALUES ($1, $2, $3, true) ON CONFLICT (id) DO UPDATE SET username = $2"
+        "INSERT INTO users (id, username, tier, created_at, is_active) VALUES ($1, $2, $3, $4, true) ON CONFLICT (id) DO UPDATE SET username = $2, tier = $3"
     )
     .bind(user_id)
     .bind(&req.username)
+    .bind(tier as i32)
     .bind(now_secs())
     .execute(&state.db)
     .await;
@@ -445,10 +493,11 @@ async fn register_user(
         .as_micros() as i64;
     kt.append_credential_op(&user_id, "register", &[0u8; 32], now);
 
-    Json(RegisterUserResponse {
+    Ok(Json(RegisterUserResponse {
         user_id,
         username: req.username,
-    })
+        tier,
+    }))
 }
 
 async fn list_users(State(state): State<Arc<AppState>>) -> Json<Vec<String>> {
@@ -468,8 +517,16 @@ async fn list_users(State(state): State<Arc<AppState>>) -> Json<Vec<String>> {
 
 async fn register_portal(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<RegisterPortalRequest>,
-) -> Json<PortalResponse> {
+    request: Request,
+) -> Result<Json<PortalResponse>, StatusCode> {
+    let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(4);
+    check_tier(caller_tier, 1)?;
+
+    let body = axum::body::to_bytes(request.into_body(), 1024 * 64)
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let req: RegisterPortalRequest = serde_json::from_slice(&body)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
     let portal_id = Uuid::new_v4();
 
     let _ = sqlx::query(
@@ -484,14 +541,14 @@ async fn register_portal(
     .execute(&state.db)
     .await;
 
-    Json(PortalResponse {
+    Ok(Json(PortalResponse {
         id: portal_id,
         name: req.name,
         callback_url: req.callback_url,
         required_tier: req.required_tier,
         required_scope: req.required_scope,
         is_active: true,
-    })
+    }))
 }
 
 async fn list_portals(State(state): State<Arc<AppState>>) -> Json<Vec<PortalResponse>> {
@@ -517,12 +574,16 @@ async fn list_portals(State(state): State<Arc<AppState>>) -> Json<Vec<PortalResp
 async fn delete_portal(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
-) -> Json<serde_json::Value> {
+    request: Request,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(4);
+    check_tier(caller_tier, 1)?;
+
     let _ = sqlx::query("UPDATE portals SET is_active = false WHERE id = $1")
         .bind(id)
         .execute(&state.db)
         .await;
-    Json(serde_json::json!({"deleted": true}))
+    Ok(Json(serde_json::json!({"deleted": true})))
 }
 
 // ---------------------------------------------------------------------------
@@ -531,8 +592,16 @@ async fn delete_portal(
 
 async fn enroll_device(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<EnrollDeviceRequest>,
-) -> Json<DeviceResponse> {
+    request: Request,
+) -> Result<Json<DeviceResponse>, StatusCode> {
+    let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(4);
+    check_tier(caller_tier, 1)?;
+
+    let body = axum::body::to_bytes(request.into_body(), 1024 * 64)
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let req: EnrollDeviceRequest = serde_json::from_slice(&body)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
     let device_id = Uuid::new_v4();
 
     let _ = sqlx::query(
@@ -546,12 +615,12 @@ async fn enroll_device(
     .execute(&state.db)
     .await;
 
-    Json(DeviceResponse {
+    Ok(Json(DeviceResponse {
         device_id,
         tier: req.tier,
         enrolled_by: req.enrolled_by,
         is_active: true,
-    })
+    }))
 }
 
 async fn list_devices(State(state): State<Arc<AppState>>) -> Json<Vec<DeviceResponse>> {
@@ -576,7 +645,13 @@ async fn list_devices(State(state): State<Arc<AppState>>) -> Json<Vec<DeviceResp
 // Handlers — Audit
 // ---------------------------------------------------------------------------
 
-async fn get_audit_log(State(state): State<Arc<AppState>>) -> Json<Vec<AuditEntryResponse>> {
+async fn get_audit_log(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Json<Vec<AuditEntryResponse>>, StatusCode> {
+    let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(4);
+    check_tier(caller_tier, 2)?;
+
     let rows: Vec<(Uuid, String, Option<String>, i64)> = sqlx::query_as(
         "SELECT id, event_type, user_ids, timestamp FROM audit_log ORDER BY timestamp ASC"
     )
@@ -599,7 +674,7 @@ async fn get_audit_log(State(state): State<Arc<AppState>>) -> Json<Vec<AuditEntr
         }
     }).collect();
 
-    Json(entries)
+    Ok(Json(entries))
 }
 
 async fn verify_audit_chain(
@@ -628,6 +703,7 @@ async fn auth_login(
                 success: false,
                 user_id: None,
                 token: None,
+                tier: None,
                 error: Some("invalid credentials".into()),
             });
         }
@@ -677,10 +753,18 @@ async fn auth_login(
             .execute(&state.db)
             .await;
 
+            // Look up user tier
+            let user_tier: i32 = sqlx::query_scalar("SELECT tier FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap_or(2);
+
             Json(LoginResponse {
                 success: true,
                 user_id: Some(user_id),
                 token: Some(token),
+                tier: Some(user_tier as u8),
                 error: None,
             })
         }
@@ -688,6 +772,7 @@ async fn auth_login(
             success: false,
             user_id: None,
             token: None,
+            tier: None,
             error: Some(format!("authentication failed: {e}")),
         }),
     }
@@ -904,15 +989,23 @@ a{{color:#00ff41}}</style></head><body>
     };
     drop(store);
 
-    // Authentication succeeded — create authorization code
+    // Look up the user's tier from the database
+    let user_tier: i32 = sqlx::query_scalar("SELECT tier FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or(2);
+
+    // Authentication succeeded — create authorization code with tier
     let mut codes = state.auth_codes.write().await;
-    let code = codes.create_code(
+    let code = codes.create_code_with_tier(
         &form.client_id,
         &form.redirect_uri,
         user_id,
         &form.scope,
         if form.code_challenge.is_empty() { None } else { Some(form.code_challenge.clone()) },
         if form.nonce.is_empty() { None } else { Some(form.nonce.clone()) },
+        user_tier as u8,
     );
     drop(codes);
 
@@ -1001,13 +1094,14 @@ async fn oauth_token(
         }
     }
 
-    // Create tokens
-    let id_token = sso_protocol::tokens::create_id_token(
+    // Create tokens (with the user's tier from the auth code)
+    let id_token = sso_protocol::tokens::create_id_token_with_tier(
         std::env::var("SSO_ISSUER").unwrap_or_else(|_| "https://sso-system.dmj.one".to_string()).as_str(),
         &auth_code.user_id,
         &req.client_id,
         auth_code.nonce,
         &state.oidc_signing_key,
+        auth_code.tier,
     );
 
     let access_token = Uuid::new_v4().to_string();

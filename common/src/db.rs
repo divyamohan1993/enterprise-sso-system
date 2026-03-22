@@ -18,10 +18,16 @@ pub async fn init_database(database_url: &str) -> PgPool {
             id UUID PRIMARY KEY,
             username VARCHAR(255) UNIQUE NOT NULL,
             opaque_registration BYTEA,
+            tier INTEGER NOT NULL DEFAULT 2,
             created_at BIGINT NOT NULL,
             is_active BOOLEAN NOT NULL DEFAULT true
         )
     "#).execute(&pool).await.expect("Failed to create users table");
+
+    // Migration: add tier column to existing users tables that lack it
+    let _ = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS tier INTEGER NOT NULL DEFAULT 2")
+        .execute(&pool)
+        .await;
 
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS devices (

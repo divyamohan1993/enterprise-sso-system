@@ -24,6 +24,7 @@ pub struct AuthorizationCode {
     pub scope: String,
     pub code_challenge: Option<String>,
     pub nonce: Option<String>,
+    pub tier: u8,
     pub expires_at: i64,
 }
 
@@ -47,6 +48,19 @@ impl AuthorizationStore {
         code_challenge: Option<String>,
         nonce: Option<String>,
     ) -> String {
+        self.create_code_with_tier(client_id, redirect_uri, user_id, scope, code_challenge, nonce, 2)
+    }
+
+    pub fn create_code_with_tier(
+        &mut self,
+        client_id: &str,
+        redirect_uri: &str,
+        user_id: Uuid,
+        scope: &str,
+        code_challenge: Option<String>,
+        nonce: Option<String>,
+        tier: u8,
+    ) -> String {
         let code = Uuid::new_v4().to_string();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -62,6 +76,7 @@ impl AuthorizationStore {
                 scope: scope.to_string(),
                 code_challenge,
                 nonce,
+                tier,
                 expires_at: now + 60, // 60 second expiry per OAuth 2.0 BCP
             },
         );

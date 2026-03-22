@@ -207,6 +207,7 @@
     <div class="stat"><div class="value" id="statDevices">--</div><div class="label">Devices</div></div>
     <div class="stat"><div class="value" id="statPortals">--</div><div class="label">Portals</div></div>
     <div class="stat"><div class="value" id="statAudit">--</div><div class="label">Audit Entries</div></div>
+    <div class="stat"><div class="value" id="statTier">--</div><div class="label">Your Tier</div></div>
   </div>
 
   <div class="card">
@@ -220,7 +221,7 @@
       <div class="form-group"><label>Username</label><input type="text" id="regUsername"></div>
       <div class="form-row">
         <div class="form-group"><label>Clearance Tier</label>
-          <select id="regTier"><option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option></select>
+          <select id="regTier"><option value="1">1 (Sovereign)</option><option value="2" selected>2 (Operational)</option><option value="3">3 (Sensor)</option><option value="4">4 (Emergency)</option></select>
         </div>
         <div class="form-group"><label>Role</label>
           <select id="regRole"><option>operator</option><option>analyst</option><option>commander</option><option>admin</option></select>
@@ -236,7 +237,7 @@
       <div class="form-group"><label>Callback URL</label><input type="text" id="portalCallback" placeholder="https://..."></div>
       <div class="form-row">
         <div class="form-group"><label>Required Tier</label>
-          <select id="portalTier"><option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option></select>
+          <select id="portalTier"><option value="1">1 (Sovereign)</option><option value="2" selected>2 (Operational)</option><option value="3">3 (Sensor)</option><option value="4">4 (Emergency)</option></select>
         </div>
         <div class="form-group"><label>Scope</label>
           <select id="portalScope"><option>read</option><option>write</option><option>admin</option></select>
@@ -310,7 +311,7 @@
 
   <div class="card demo-section">
     <h3>3. Tier Enforcement</h3>
-    <p>Attempts to access a Tier 5 restricted portal with a lower-tier token. Access is denied.</p>
+    <p>Attempts to access a Tier 1 (Sovereign) restricted portal. Lower tier number = higher privilege. Access is denied if your tier is too low (higher number).</p>
     <button class="btn btn-sm btn-cyan" onclick="demoTier()">WRONG TIER</button>
     <div class="terminal" id="termTier"></div>
   </div>
@@ -331,11 +332,11 @@ let authToken = null;
 let tokenClaims = null;
 
 const SIMULATED_PORTALS = [
-  { name: 'Command Dashboard',   icon: 'CMD',  tier: 5, scope: 'admin', desc: 'Strategic command and control interface' },
-  { name: 'Personnel System',    icon: 'PER',  tier: 3, scope: 'read',  desc: 'Personnel records and assignments' },
-  { name: 'Communications Hub',  icon: 'COM',  tier: 2, scope: 'write', desc: 'Secure messaging and signal relay' },
-  { name: 'Intelligence Portal', icon: 'INT',  tier: 4, scope: 'read',  desc: 'Classified intelligence briefings' },
-  { name: 'Logistics Network',   icon: 'LOG',  tier: 1, scope: 'read',  desc: 'Supply chain and resource tracking' },
+  { name: 'Command Dashboard',   icon: 'CMD',  required_tier: 1, scope: 'admin', desc: 'Strategic command — Sovereign only' },
+  { name: 'Intelligence Portal', icon: 'INT',  required_tier: 1, scope: 'read',  desc: 'Classified intelligence — Sovereign only' },
+  { name: 'Personnel System',    icon: 'PER',  required_tier: 2, scope: 'read',  desc: 'Personnel records — Operational+' },
+  { name: 'Communications Hub',  icon: 'COM',  required_tier: 2, scope: 'write', desc: 'Secure messaging — Operational+' },
+  { name: 'Logistics Network',   icon: 'LOG',  required_tier: 3, scope: 'read',  desc: 'Supply chain — Sensor+' },
 ];
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -398,15 +399,21 @@ function fmtTime(ts) {
 
 var SCOPE_RANK = { read: 1, write: 2, admin: 3 };
 
+var TIER_NAMES = { 1: 'Sovereign', 2: 'Operational', 3: 'Sensor', 4: 'Emergency' };
+
 function checkAccess(portal) {
   if (!tokenClaims) return { ok: false, reason: 'No active token' };
-  var userTier = tokenClaims.tier || tokenClaims.clearance_tier || 0;
-  if (userTier < portal.tier) return { ok: false, reason: 'Tier ' + userTier + ' < required ' + portal.tier };
+  // Lower tier number = higher privilege. User tier must be <= portal's required tier.
+  var userTier = tokenClaims.tier || 4;
+  var requiredTier = portal.required_tier || portal.tier || 2;
+  if (userTier > requiredTier) {
+    return { ok: false, reason: 'Your tier ' + userTier + ' (' + (TIER_NAMES[userTier] || '?') + ') > required tier ' + requiredTier + ' (' + (TIER_NAMES[requiredTier] || '?') + ') — access denied' };
+  }
   var userScope = tokenClaims.scope || 'read';
   if ((SCOPE_RANK[userScope] || 0) < (SCOPE_RANK[portal.scope] || 0)) {
     return { ok: false, reason: 'Scope "' + userScope + '" insufficient, need "' + portal.scope + '"' };
   }
-  return { ok: true, reason: 'Access granted -- SSO token validated' };
+  return { ok: true, reason: 'Access granted — tier ' + userTier + ' (' + (TIER_NAMES[userTier] || '?') + ') meets requirement' };
 }
 
 // ── Safe DOM builders ──────────────────────────────────────────────────────────
@@ -439,7 +446,7 @@ function buildPortalTable(portals) {
       var tr = document.createElement('tr');
       var td1 = document.createElement('td'); td1.textContent = p.name; tr.appendChild(td1);
       var td2 = document.createElement('td'); td2.style.color = 'var(--text-dim)'; td2.textContent = p.callback_url || p.callback || '--'; tr.appendChild(td2);
-      var td3 = document.createElement('td'); td3.textContent = p.tier || p.required_tier || '--'; tr.appendChild(td3);
+      var td3 = document.createElement('td'); td3.textContent = p.required_tier || p.tier || '--'; tr.appendChild(td3);
       var td4 = document.createElement('td'); td4.textContent = p.scope || '--'; tr.appendChild(td4);
       var td5 = document.createElement('td');
       var btn = document.createElement('button');
@@ -515,7 +522,8 @@ function renderSimPortals() {
 
     var meta = document.createElement('div');
     meta.className = 'meta';
-    var s1 = document.createElement('span'); s1.textContent = 'TIER: ' + p.tier; meta.appendChild(s1);
+    var pt = p.required_tier || p.tier;
+    var s1 = document.createElement('span'); s1.textContent = 'REQ TIER: ' + pt + ' (' + (TIER_NAMES[pt] || '?') + ')'; meta.appendChild(s1);
     var s2 = document.createElement('span'); s2.textContent = 'SCOPE: ' + p.scope.toUpperCase(); meta.appendChild(s2);
     card.appendChild(meta);
 
@@ -558,7 +566,8 @@ function enterApp() {
   $('page-login').classList.remove('active');
   $('mainNav').style.display = 'flex';
   $('userInfo').style.display = '';
-  $('currentUser').textContent = tokenClaims ? (tokenClaims.sub || tokenClaims.username || 'unknown') : 'unknown';
+  var tierLabel = tokenClaims && tokenClaims.tier ? ' [Tier ' + tokenClaims.tier + ']' : '';
+  $('currentUser').textContent = (tokenClaims ? (tokenClaims.sub || tokenClaims.username || 'unknown') : 'unknown') + tierLabel;
   showPage('dashboard', $('mainNav').querySelector('button'));
 }
 
@@ -584,7 +593,9 @@ async function doLogin() {
     localStorage.setItem('authToken', authToken);
     if (!authToken) throw new Error('No token in response');
 
-    tokenClaims = decodeJwtPayload(authToken);
+    tokenClaims = decodeJwtPayload(authToken) || {};
+    // Ensure tier is present in claims (from login response if not in JWT)
+    if (!tokenClaims.tier && data.tier) tokenClaims.tier = data.tier;
     termLog(term, '[3/4] Token received. Decoding claims...', 'line-info');
     termLog(term, '[4/4] Session established.', 'line-ok');
     termLog(term, '', '');
@@ -592,6 +603,8 @@ async function doLogin() {
     termLog(term, JSON.stringify(tokenClaims, null, 2), 'line-ok');
 
     $('tokenClaims').textContent = JSON.stringify(tokenClaims, null, 2);
+    var ut = tokenClaims.tier || '--';
+    $('statTier').textContent = ut + (TIER_NAMES[ut] ? ' (' + TIER_NAMES[ut] + ')' : '');
     showToast('Authentication successful');
     setTimeout(enterApp, 800);
   } catch (e) {
@@ -839,24 +852,24 @@ async function demoTier() {
   clearTerm(term);
   if (!tokenClaims) { termLog(term, '[ERROR] Log in first to get a token.', 'line-err'); return; }
 
-  var userTier = tokenClaims.tier || tokenClaims.clearance_tier || 1;
-  termLog(term, '> Current user tier: ' + userTier, 'prompt');
-  termLog(term, '> Attempting access to Tier 5 portal (Command Dashboard)...', 'prompt');
+  var userTier = tokenClaims.tier || 4;
+  termLog(term, '> Current user tier: ' + userTier + ' (' + (TIER_NAMES[userTier] || '?') + ')', 'prompt');
+  termLog(term, '> Attempting access to Tier 1 (Sovereign) portal (Command Dashboard)...', 'prompt');
   termLog(term, '', '');
 
-  var target = SIMULATED_PORTALS[0]; // Command Dashboard, tier 5
+  var target = SIMULATED_PORTALS[0]; // Command Dashboard, required_tier 1
   var result = checkAccess(target);
 
   if (result.ok) {
-    termLog(term, '[GRANTED] User has sufficient clearance (tier ' + userTier + ' >= 5).', 'line-ok');
+    termLog(term, '[GRANTED] User tier ' + userTier + ' <= required tier 1. Sovereign access confirmed.', 'line-ok');
   } else {
     termLog(term, '[DENIED] Access denied to ' + target.name + '.', 'line-err');
     termLog(term, '  Reason: ' + result.reason, 'line-err');
     termLog(term, '', '');
-    termLog(term, '> Attempting access to Tier 1 portal (Logistics Network)...', 'prompt');
-    var fallback = checkAccess(SIMULATED_PORTALS[4]); // tier 1
+    termLog(term, '> Attempting access to Tier 3 (Sensor) portal (Logistics Network)...', 'prompt');
+    var fallback = checkAccess(SIMULATED_PORTALS[4]); // required_tier 3
     if (fallback.ok) {
-      termLog(term, '[GRANTED] Tier ' + userTier + ' >= 1. Access to Logistics Network confirmed.', 'line-ok');
+      termLog(term, '[GRANTED] Tier ' + userTier + ' <= 3. Access to Logistics Network confirmed.', 'line-ok');
     } else {
       termLog(term, '[DENIED] ' + fallback.reason, 'line-err');
     }

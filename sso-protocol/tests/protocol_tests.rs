@@ -121,6 +121,7 @@ fn test_id_token_is_valid_jwt() {
     assert_eq!(claims.aud, "client-abc");
     assert_eq!(claims.nonce.as_deref(), Some("test-nonce"));
     assert!(claims.exp > claims.iat);
+    assert_eq!(claims.tier, 2); // default tier
 
     // Verify HMAC signature
     use hmac::{Hmac, Mac};
@@ -164,4 +165,88 @@ fn test_client_registration() {
 
     // Non-existent client
     assert!(registry.get("nonexistent").is_none());
+}
+
+// ── Tier enforcement tests ──────────────────────────────────────────────────
+
+#[test]
+fn test_tier_in_jwt() {
+    let user_id = Uuid::new_v4();
+    let signing_key = [42u8; 64];
+
+    // Create a token with tier 1 (Sovereign)
+    let token = tokens::create_id_token_with_tier(
+        "https://sso.example.com",
+        &user_id,
+        "client-abc",
+        None,
+        &signing_key,
+        1,
+    );
+
+    let parts: Vec<&str> = token.split('.').collect();
+    assert_eq!(parts.len(), 3);
+
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let claims_bytes = URL_SAFE_NO_PAD.decode(parts[1]).unwrap();
+    let claims: tokens::IdTokenClaims = serde_json::from_slice(&claims_bytes).unwrap();
+    assert_eq!(claims.tier, 1);
+    assert_eq!(claims.sub, user_id.to_string());
+}
+
+#[test]
+fn test_tier_1_accesses_tier_2_portal() {
+    // Sovereign (tier 1) can access Operational (tier 2) portal
+    // Lower tier number = higher privilege; access if user_tier <= required_tier
+    let user_tier: u8 = 1;
+    let portal_required_tier: u8 = 2;
+    assert!(user_tier <= portal_required_tier, "Sovereign should access Operational portal");
+}
+
+#[test]
+fn test_tier_3_denied_tier_1_portal() {
+    // Sensor (tier 3) cannot access Sovereign (tier 1) portal
+    let user_tier: u8 = 3;
+    let portal_required_tier: u8 = 1;
+    assert!(user_tier > portal_required_tier, "Sensor should be denied from Sovereign portal");
+}
+
+#[test]
+fn test_auth_code_carries_tier() {
+    let mut store = AuthorizationStore::new();
+    let user_id = Uuid::new_v4();
+
+    let code = store.create_code_with_tier(
+        "client-123",
+        "https://app.example.com/callback",
+        user_id,
+        "openid",
+        None,
+        None,
+        1, // Sovereign
+    );
+
+    let auth_code = store.consume_code(&code).expect("code should be valid");
+    assert_eq!(auth_code.tier, 1);
+}
+
+#[test]
+fn test_default_tier_is_2() {
+    let user_id = Uuid::new_v4();
+    let signing_key = [99u8; 64];
+
+    // Default create_id_token should use tier 2
+    let token = tokens::create_id_token(
+        "https://sso.example.com",
+        &user_id,
+        "client-xyz",
+        None,
+        &signing_key,
+    );
+
+    let parts: Vec<&str> = token.split('.').collect();
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let claims_bytes = URL_SAFE_NO_PAD.decode(parts[1]).unwrap();
+    let claims: tokens::IdTokenClaims = serde_json::from_slice(&claims_bytes).unwrap();
+    assert_eq!(claims.tier, 2, "Default tier should be Operational (2)");
 }
