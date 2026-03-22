@@ -1,0 +1,1456 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MILNET SSO — Integration Docs</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700;800&display=swap');
+
+*, *::before, *::after {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+:root {
+  --green: #00ff41;
+  --cyan: #00d4ff;
+  --bg: #0a0a0a;
+  --text: #e0e0e0;
+  --dim: #666;
+  --surface: #111;
+  --border: #1a1a1a;
+  --orange: #ff9500;
+  --blue: #569cd6;
+  --yellow: #dcdcaa;
+  --red: #f44;
+}
+
+html { scroll-behavior: smooth; }
+
+body {
+  font-family: 'JetBrains Mono', monospace;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.6;
+  overflow-x: hidden;
+}
+
+/* ============================== */
+/* LAYOUT                         */
+/* ============================== */
+.page-layout {
+  display: flex;
+  min-height: 100vh;
+}
+
+/* ============================== */
+/* SIDEBAR                        */
+/* ============================== */
+.sidebar {
+  width: 280px;
+  flex-shrink: 0;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
+  padding: 2rem 0;
+  z-index: 100;
+}
+
+.sidebar-brand {
+  padding: 0 1.5rem 1.5rem;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 1rem;
+}
+
+.sidebar-brand h1 {
+  font-size: 1.1rem;
+  font-weight: 800;
+  background: linear-gradient(135deg, var(--green), var(--cyan));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.sidebar-brand .sub {
+  font-size: 0.7rem;
+  color: var(--dim);
+  margin-top: 0.3rem;
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+}
+
+.nav-section {
+  padding: 0.8rem 1.5rem 0.3rem;
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  color: var(--dim);
+}
+
+.sidebar a {
+  display: block;
+  padding: 0.45rem 1.5rem;
+  font-size: 0.8rem;
+  color: var(--text);
+  text-decoration: none;
+  transition: background 0.2s, color 0.2s;
+  border-left: 2px solid transparent;
+}
+
+.sidebar a:hover {
+  background: rgba(0, 255, 65, 0.05);
+  color: var(--green);
+}
+
+.sidebar a.active {
+  color: var(--green);
+  border-left-color: var(--green);
+  background: rgba(0, 255, 65, 0.08);
+}
+
+/* ============================== */
+/* MAIN CONTENT                   */
+/* ============================== */
+.main-content {
+  flex: 1;
+  max-width: 900px;
+  padding: 3rem 4rem 6rem;
+}
+
+.main-content h2 {
+  font-size: 1.8rem;
+  font-weight: 800;
+  color: var(--green);
+  margin-top: 4rem;
+  margin-bottom: 1rem;
+  padding-top: 1rem;
+}
+
+.main-content h2:first-child {
+  margin-top: 0;
+}
+
+.main-content h3 {
+  font-size: 1.2rem;
+  font-weight: 700;
+  color: var(--cyan);
+  margin-top: 2.5rem;
+  margin-bottom: 0.8rem;
+}
+
+.main-content h4 {
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--text);
+  margin-top: 1.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.main-content p {
+  margin-bottom: 1rem;
+  color: var(--dim);
+  font-size: 0.88rem;
+  font-weight: 300;
+}
+
+.main-content a {
+  color: var(--cyan);
+  text-decoration: none;
+}
+
+.main-content a:hover {
+  color: var(--green);
+}
+
+.main-content ul, .main-content ol {
+  margin-bottom: 1rem;
+  padding-left: 1.5rem;
+  color: var(--dim);
+  font-size: 0.88rem;
+}
+
+.main-content li {
+  margin-bottom: 0.4rem;
+}
+
+/* ============================== */
+/* CALLOUT BOXES                  */
+/* ============================== */
+.callout {
+  border-left: 3px solid var(--green);
+  background: rgba(0, 255, 65, 0.04);
+  padding: 1rem 1.2rem;
+  margin: 1.2rem 0;
+  border-radius: 0 8px 8px 0;
+  font-size: 0.85rem;
+  color: var(--text);
+}
+
+.callout.warn {
+  border-left-color: var(--orange);
+  background: rgba(255, 149, 0, 0.04);
+}
+
+.callout.danger {
+  border-left-color: var(--red);
+  background: rgba(255, 68, 68, 0.04);
+}
+
+.callout strong {
+  color: var(--green);
+}
+
+.callout.warn strong {
+  color: var(--orange);
+}
+
+.callout.danger strong {
+  color: var(--red);
+}
+
+/* ============================== */
+/* CODE BLOCKS                    */
+/* ============================== */
+.code-wrap {
+  position: relative;
+  margin: 1rem 0 1.5rem;
+}
+
+.code-block {
+  background: #0d0d0d;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.2rem 1.5rem;
+  font-size: 0.82rem;
+  color: var(--green);
+  overflow-x: auto;
+  line-height: 1.7;
+  white-space: pre;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.copy-btn {
+  position: absolute;
+  top: 0.5rem;
+  right: 0.5rem;
+  background: #1a1a1a;
+  border: 1px solid #333;
+  border-radius: 4px;
+  color: var(--dim);
+  font-size: 0.7rem;
+  padding: 0.25rem 0.6rem;
+  cursor: pointer;
+  font-family: 'JetBrains Mono', monospace;
+  transition: color 0.2s, border-color 0.2s;
+}
+
+.copy-btn:hover {
+  color: var(--green);
+  border-color: var(--green);
+}
+
+/* Inline code */
+code {
+  background: #1a1a1a;
+  padding: 0.15rem 0.4rem;
+  border-radius: 4px;
+  font-size: 0.82rem;
+  color: var(--cyan);
+  font-family: 'JetBrains Mono', monospace;
+}
+
+/* Syntax highlight classes */
+.kw  { color: var(--blue); }
+.str { color: var(--orange); }
+.cmt { color: #6a9955; }
+.fn  { color: var(--yellow); }
+.key { color: var(--cyan); }
+
+/* ============================== */
+/* PARAM TABLES                   */
+/* ============================== */
+.param-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1rem 0 1.5rem;
+  font-size: 0.8rem;
+}
+
+.param-table th {
+  text-align: left;
+  padding: 0.6rem 0.8rem;
+  border-bottom: 2px solid var(--green);
+  color: var(--green);
+  font-weight: 700;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+.param-table td {
+  padding: 0.5rem 0.8rem;
+  border-bottom: 1px solid var(--border);
+  color: var(--dim);
+  vertical-align: top;
+}
+
+.param-table td:first-child {
+  color: var(--cyan);
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.param-table .required {
+  color: var(--red);
+  font-size: 0.7rem;
+  margin-left: 0.3rem;
+}
+
+.param-table .badge {
+  display: inline-block;
+  font-size: 0.65rem;
+  padding: 0.1rem 0.4rem;
+  border-radius: 3px;
+  text-transform: uppercase;
+  font-weight: 600;
+}
+
+.badge-get { background: rgba(0, 212, 255, 0.1); color: var(--cyan); border: 1px solid rgba(0, 212, 255, 0.3); }
+.badge-post { background: rgba(0, 255, 65, 0.1); color: var(--green); border: 1px solid rgba(0, 255, 65, 0.3); }
+
+/* ============================== */
+/* FLOW DIAGRAM                   */
+/* ============================== */
+.flow-diagram {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  margin: 1.5rem 0;
+  padding: 1.5rem;
+  background: #0d0d0d;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.flow-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 1rem;
+}
+
+.flow-num {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 2px solid var(--green);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.7rem;
+  font-weight: 700;
+  color: var(--green);
+  flex-shrink: 0;
+}
+
+.flow-body {
+  flex: 1;
+  padding-bottom: 1.2rem;
+  border-left: 1px solid #222;
+  margin-left: -28px;
+  padding-left: 42px;
+  font-size: 0.82rem;
+  color: var(--dim);
+}
+
+.flow-step:last-child .flow-body {
+  border-left: none;
+  padding-bottom: 0;
+}
+
+.flow-body strong {
+  color: var(--text);
+}
+
+/* ============================== */
+/* LANGUAGE TABS                  */
+/* ============================== */
+.lang-tabs {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid var(--border);
+  margin-top: 1.5rem;
+  overflow-x: auto;
+}
+
+.lang-tab {
+  padding: 0.5rem 1rem;
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: var(--dim);
+  cursor: pointer;
+  border: none;
+  background: none;
+  font-family: 'JetBrains Mono', monospace;
+  border-bottom: 2px solid transparent;
+  transition: color 0.2s, border-color 0.2s;
+  white-space: nowrap;
+}
+
+.lang-tab:hover {
+  color: var(--text);
+}
+
+.lang-tab.active {
+  color: var(--green);
+  border-bottom-color: var(--green);
+}
+
+.lang-panel {
+  display: none;
+}
+
+.lang-panel.active {
+  display: block;
+}
+
+/* ============================== */
+/* TIER TABLE                     */
+/* ============================== */
+.tier-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1rem 0;
+  font-size: 0.82rem;
+}
+
+.tier-table th {
+  text-align: left;
+  padding: 0.6rem 0.8rem;
+  border-bottom: 2px solid var(--cyan);
+  color: var(--cyan);
+  font-weight: 700;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+.tier-table td {
+  padding: 0.5rem 0.8rem;
+  border-bottom: 1px solid var(--border);
+  color: var(--dim);
+}
+
+.tier-table td:first-child {
+  color: var(--green);
+  font-weight: 600;
+}
+
+/* ============================== */
+/* MOBILE HAMBURGER               */
+/* ============================== */
+.mobile-toggle {
+  display: none;
+  position: fixed;
+  top: 1rem;
+  left: 1rem;
+  z-index: 200;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--green);
+  font-size: 1.2rem;
+  padding: 0.4rem 0.7rem;
+  cursor: pointer;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+/* ============================== */
+/* FOOTER                         */
+/* ============================== */
+footer {
+  padding: 3rem 2rem;
+  text-align: center;
+  border-top: 1px solid var(--border);
+  color: var(--dim);
+  font-size: 0.8rem;
+}
+
+footer a {
+  color: var(--cyan);
+  text-decoration: none;
+  transition: color 0.2s;
+}
+
+footer a:hover {
+  color: var(--green);
+}
+
+.footer-links {
+  display: flex;
+  gap: 2rem;
+  justify-content: center;
+  margin-top: 1rem;
+  flex-wrap: wrap;
+}
+
+/* ============================== */
+/* RESPONSIVE                     */
+/* ============================== */
+@media (max-width: 768px) {
+  .mobile-toggle {
+    display: block;
+  }
+
+  .sidebar {
+    position: fixed;
+    left: -300px;
+    top: 0;
+    transition: left 0.3s;
+    box-shadow: 4px 0 20px rgba(0,0,0,0.5);
+  }
+
+  .sidebar.open {
+    left: 0;
+  }
+
+  .main-content {
+    padding: 2rem 1.5rem 4rem;
+    padding-top: 4rem;
+  }
+
+  .flow-diagram {
+    padding: 1rem;
+  }
+
+  .param-table {
+    font-size: 0.72rem;
+  }
+}
+</style>
+</head>
+<body>
+
+<button class="mobile-toggle" id="mobileToggle" aria-label="Toggle navigation">[ ]</button>
+
+<div class="page-layout">
+
+<!-- ============================================ -->
+<!-- SIDEBAR                                       -->
+<!-- ============================================ -->
+<nav class="sidebar" id="sidebar">
+  <div class="sidebar-brand">
+    <h1>MILNET SSO</h1>
+    <div class="sub">Integration Docs</div>
+  </div>
+
+  <div class="nav-section">Getting Started</div>
+  <a href="#getting-started">Overview</a>
+  <a href="#prerequisites">Prerequisites</a>
+  <a href="#discovery">Discovery URL</a>
+
+  <div class="nav-section">OAuth2 Flow</div>
+  <a href="#auth-code-flow">Authorization Code Flow</a>
+  <a href="#flow-diagram">Flow Diagram</a>
+
+  <div class="nav-section">Endpoints</div>
+  <a href="#ep-discovery">OIDC Discovery</a>
+  <a href="#ep-authorize">GET /oauth/authorize</a>
+  <a href="#ep-token">POST /oauth/token</a>
+  <a href="#ep-userinfo">GET /oauth/userinfo</a>
+  <a href="#ep-jwks">GET /oauth/jwks</a>
+  <a href="#ep-login">POST /api/auth/login</a>
+  <a href="#ep-verify">POST /api/auth/verify</a>
+
+  <div class="nav-section">Token Format</div>
+  <a href="#jwt-format">JWT / ID Token</a>
+  <a href="#tier-claims">Tier Claims</a>
+
+  <div class="nav-section">Code Samples</div>
+  <a href="#code-samples">Language Examples</a>
+  <a href="#curl-examples">curl Examples</a>
+
+  <div class="nav-section">Registration</div>
+  <a href="#client-registration">Client Registration</a>
+</nav>
+
+<!-- ============================================ -->
+<!-- MAIN CONTENT                                  -->
+<!-- ============================================ -->
+<main class="main-content">
+
+<!-- ======== GETTING STARTED ======== -->
+<h2 id="getting-started">Getting Started</h2>
+<p>
+  MILNET SSO is an OpenID Connect (OIDC) identity provider that issues ID tokens
+  signed with <strong style="color:var(--green)">HS512</strong> (HMAC-SHA512). It implements the
+  Authorization Code flow with PKCE support, tiered access control, and hash-chained
+  audit logging.
+</p>
+<p>
+  This guide covers everything you need to integrate a client application (relying party)
+  with MILNET SSO.
+</p>
+
+<div class="callout warn">
+  <strong>Important:</strong> MILNET SSO uses HS512 (symmetric HMAC) for token signing, not RS256.
+  Every client library and configuration must explicitly set the algorithm to HS512.
+  The shared secret is your <code>client_secret</code>.
+</div>
+
+<h3 id="prerequisites">Prerequisites</h3>
+<ol>
+  <li>A registered client application — obtain a <code>client_id</code> and <code>client_secret</code> from the SSO operator.</li>
+  <li>A registered <code>redirect_uri</code> that your application controls.</li>
+  <li>Network access to the SSO server (e.g., <code>https://sso.example.mil</code>).</li>
+</ol>
+
+<div class="callout">
+  <strong>No self-service registration.</strong> Client applications are provisioned by the SSO operator
+  via the admin API. Contact your operator to obtain credentials.
+</div>
+
+<h3 id="discovery">Discovery URL</h3>
+<p>The OIDC discovery endpoint exposes all configuration metadata:</p>
+<div class="code-wrap">
+  <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+  <pre class="code-block"><span class="kw">GET</span> <span class="str">/.well-known/openid-configuration</span></pre>
+</div>
+<p>
+  Use this URL to auto-configure your OIDC client library. The response includes the
+  authorization, token, userinfo, and JWKS endpoints plus supported algorithms and grant types.
+</p>
+
+<!-- ======== OAUTH2 FLOW ======== -->
+<h2 id="auth-code-flow">OAuth2 Authorization Code Flow</h2>
+<p>
+  MILNET SSO supports the standard Authorization Code flow. PKCE (Proof Key for Code Exchange)
+  is supported and recommended for public clients. The flow proceeds as follows:
+</p>
+
+<div class="callout danger">
+  <strong>Authorization codes expire in 60 seconds.</strong> This is significantly stricter than the
+  typical 10-minute window. Your application must exchange the code immediately upon receiving
+  the callback.
+</div>
+
+<h3 id="flow-diagram">Step-by-Step Flow</h3>
+<div class="flow-diagram">
+  <div class="flow-step">
+    <div class="flow-num">1</div>
+    <div class="flow-body">
+      <strong>Generate state + PKCE verifier</strong><br>
+      Create a random <code>state</code> value (CSRF protection, required) and a
+      <code>code_verifier</code> / <code>code_challenge</code> pair (PKCE, recommended).
+    </div>
+  </div>
+  <div class="flow-step">
+    <div class="flow-num">2</div>
+    <div class="flow-body">
+      <strong>Redirect user to /oauth/authorize</strong><br>
+      Build the authorization URL with query parameters: <code>client_id</code>,
+      <code>redirect_uri</code>, <code>response_type=code</code>, <code>scope=openid</code>,
+      <code>state</code>, <code>code_challenge</code>, <code>code_challenge_method=S256</code>.
+    </div>
+  </div>
+  <div class="flow-step">
+    <div class="flow-num">3</div>
+    <div class="flow-body">
+      <strong>User authenticates</strong><br>
+      The SSO server presents a login form. The user enters their credentials.
+    </div>
+  </div>
+  <div class="flow-step">
+    <div class="flow-num">4</div>
+    <div class="flow-body">
+      <strong>SSO redirects back with code</strong><br>
+      On success, the server redirects to your <code>redirect_uri</code> with
+      <code>?code=AUTH_CODE&amp;state=YOUR_STATE</code>.
+    </div>
+  </div>
+  <div class="flow-step">
+    <div class="flow-num">5</div>
+    <div class="flow-body">
+      <strong>Validate state</strong><br>
+      Confirm the returned <code>state</code> matches what you sent. Reject the response if it
+      does not match.
+    </div>
+  </div>
+  <div class="flow-step">
+    <div class="flow-num">6</div>
+    <div class="flow-body">
+      <strong>Exchange code for tokens (within 60 seconds)</strong><br>
+      POST to <code>/oauth/token</code> with the authorization code, <code>redirect_uri</code>,
+      <code>client_id</code>, <code>client_secret</code>, and <code>code_verifier</code> (if PKCE).
+      Use <code>application/x-www-form-urlencoded</code>.
+    </div>
+  </div>
+  <div class="flow-step">
+    <div class="flow-num">7</div>
+    <div class="flow-body">
+      <strong>Receive tokens</strong><br>
+      The response contains <code>access_token</code> (a UUID, not a JWT),
+      <code>id_token</code> (a JWT signed with HS512), and <code>token_type=Bearer</code>.
+      Verify the <code>id_token</code> for user identity. The access_token is used for the
+      userinfo endpoint.
+    </div>
+  </div>
+</div>
+
+<div class="callout warn">
+  <strong>No refresh tokens.</strong> MILNET SSO does not issue refresh tokens. Tokens expire
+  after 3600 seconds. Re-initiate the authorization flow to obtain new tokens.
+</div>
+
+<div class="callout warn">
+  <strong>access_token is a UUID, not a JWT.</strong> Do not attempt to decode it.
+  User identity claims are in the <code>id_token</code>. The access_token is only used to
+  call the <code>/oauth/userinfo</code> endpoint.
+</div>
+
+<!-- ======== ENDPOINTS ======== -->
+<h2 id="endpoints">Endpoint Reference</h2>
+
+<!-- EP: Discovery -->
+<h3 id="ep-discovery"><span class="badge badge-get">GET</span> /.well-known/openid-configuration</h3>
+<p>Returns the OpenID Connect discovery document containing all endpoint URLs, supported
+  algorithms, grant types, and response types.</p>
+<div class="code-wrap">
+  <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+  <pre class="code-block"><span class="kw">GET</span> <span class="str">/.well-known/openid-configuration</span>
+
+<span class="cmt">// Response (JSON)</span>
+{
+  <span class="key">"issuer"</span>: <span class="str">"https://sso.example.mil"</span>,
+  <span class="key">"authorization_endpoint"</span>: <span class="str">"https://sso.example.mil/oauth/authorize"</span>,
+  <span class="key">"token_endpoint"</span>: <span class="str">"https://sso.example.mil/oauth/token"</span>,
+  <span class="key">"userinfo_endpoint"</span>: <span class="str">"https://sso.example.mil/oauth/userinfo"</span>,
+  <span class="key">"jwks_uri"</span>: <span class="str">"https://sso.example.mil/oauth/jwks"</span>,
+  <span class="key">"id_token_signing_alg_values_supported"</span>: [<span class="str">"HS512"</span>],
+  <span class="key">"token_endpoint_auth_methods_supported"</span>: [<span class="str">"client_secret_post"</span>],
+  ...
+}</pre>
+</div>
+
+<!-- EP: Authorize -->
+<h3 id="ep-authorize"><span class="badge badge-get">GET</span> /oauth/authorize</h3>
+<p>Initiates the authorization code flow. Redirect the user's browser to this endpoint.</p>
+
+<table class="param-table">
+  <thead>
+    <tr><th>Parameter</th><th>Required</th><th>Description</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>client_id</td>
+      <td><span class="required">REQUIRED</span></td>
+      <td>Your registered client identifier.</td>
+    </tr>
+    <tr>
+      <td>redirect_uri</td>
+      <td><span class="required">REQUIRED</span></td>
+      <td>Must exactly match one of your registered redirect URIs.</td>
+    </tr>
+    <tr>
+      <td>response_type</td>
+      <td><span class="required">REQUIRED</span></td>
+      <td>Must be <code>code</code>.</td>
+    </tr>
+    <tr>
+      <td>scope</td>
+      <td><span class="required">REQUIRED</span></td>
+      <td>Space-separated scopes. Must include <code>openid</code>.</td>
+    </tr>
+    <tr>
+      <td>state</td>
+      <td><span class="required">REQUIRED</span></td>
+      <td>Opaque CSRF token. The server will reject requests without a state parameter.</td>
+    </tr>
+    <tr>
+      <td>code_challenge</td>
+      <td>Recommended</td>
+      <td>Base64url-encoded SHA256 hash of the code_verifier (PKCE).</td>
+    </tr>
+    <tr>
+      <td>code_challenge_method</td>
+      <td>Recommended</td>
+      <td>Must be <code>S256</code> when using PKCE.</td>
+    </tr>
+    <tr>
+      <td>nonce</td>
+      <td>Optional</td>
+      <td>Random string included in the id_token for replay protection.</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout danger">
+  <strong>state is REQUIRED.</strong> Unlike many OAuth2 providers that treat state as optional,
+  MILNET SSO will reject authorization requests that omit the state parameter.
+</div>
+
+<!-- EP: Token -->
+<h3 id="ep-token"><span class="badge badge-post">POST</span> /oauth/token</h3>
+<p>Exchange an authorization code for tokens. Request body must be
+  <code>application/x-www-form-urlencoded</code>.</p>
+
+<table class="param-table">
+  <thead>
+    <tr><th>Parameter</th><th>Required</th><th>Description</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>grant_type</td>
+      <td><span class="required">REQUIRED</span></td>
+      <td>Must be <code>authorization_code</code>.</td>
+    </tr>
+    <tr>
+      <td>code</td>
+      <td><span class="required">REQUIRED</span></td>
+      <td>The authorization code received from the callback. Expires in 60 seconds.</td>
+    </tr>
+    <tr>
+      <td>redirect_uri</td>
+      <td><span class="required">REQUIRED</span></td>
+      <td>Must exactly match the redirect_uri used in the authorize request.</td>
+    </tr>
+    <tr>
+      <td>client_id</td>
+      <td><span class="required">REQUIRED</span></td>
+      <td>Your registered client identifier.</td>
+    </tr>
+    <tr>
+      <td>client_secret</td>
+      <td><span class="required">REQUIRED</span></td>
+      <td>Your client secret. Sent in the POST body (client_secret_post).</td>
+    </tr>
+    <tr>
+      <td>code_verifier</td>
+      <td>If PKCE</td>
+      <td>The original PKCE code verifier (43-128 characters).</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout warn">
+  <strong>client_secret_post only.</strong> MILNET SSO does not support HTTP Basic authentication
+  (client_secret_basic). Always send <code>client_id</code> and <code>client_secret</code>
+  in the POST body.
+</div>
+
+<div class="code-wrap">
+  <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+  <pre class="code-block"><span class="cmt"># Token exchange request</span>
+<span class="kw">POST</span> <span class="str">/oauth/token</span>
+<span class="key">Content-Type</span>: application/x-www-form-urlencoded
+
+<span class="key">grant_type</span>=authorization_code&amp;
+<span class="key">code</span>=AUTH_CODE&amp;
+<span class="key">redirect_uri</span>=https://app.example.com/callback&amp;
+<span class="key">client_id</span>=your_client_id&amp;
+<span class="key">client_secret</span>=your_client_secret
+
+<span class="cmt">// Response (JSON)</span>
+{
+  <span class="key">"access_token"</span>: <span class="str">"550e8400-e29b-41d4-a716-446655440000"</span>,
+  <span class="key">"token_type"</span>: <span class="str">"Bearer"</span>,
+  <span class="key">"expires_in"</span>: <span class="fn">3600</span>,
+  <span class="key">"id_token"</span>: <span class="str">"eyJhbGciOiJIUzUxMiJ9.eyJpc3Mi..."</span>
+}</pre>
+</div>
+
+<!-- EP: Userinfo -->
+<h3 id="ep-userinfo"><span class="badge badge-get">GET</span> /oauth/userinfo</h3>
+<p>Returns claims about the authenticated user. Requires a valid access_token in the
+  Authorization header.</p>
+<div class="code-wrap">
+  <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+  <pre class="code-block"><span class="kw">GET</span> <span class="str">/oauth/userinfo</span>
+<span class="key">Authorization</span>: Bearer 550e8400-e29b-41d4-a716-446655440000
+
+<span class="cmt">// Response (JSON)</span>
+{
+  <span class="key">"sub"</span>: <span class="str">"user-uuid"</span>,
+  <span class="key">"preferred_username"</span>: <span class="str">"operator1"</span>,
+  <span class="key">"tier"</span>: <span class="fn">2</span>
+}</pre>
+</div>
+
+<!-- EP: JWKS -->
+<h3 id="ep-jwks"><span class="badge badge-get">GET</span> /oauth/jwks</h3>
+<p>Returns the JSON Web Key Set. For HS512, this contains the symmetric key metadata
+  (the actual secret is your client_secret).</p>
+<div class="code-wrap">
+  <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+  <pre class="code-block"><span class="kw">GET</span> <span class="str">/oauth/jwks</span>
+
+<span class="cmt">// Response (JSON)</span>
+{
+  <span class="key">"keys"</span>: [
+    {
+      <span class="key">"kty"</span>: <span class="str">"oct"</span>,
+      <span class="key">"alg"</span>: <span class="str">"HS512"</span>,
+      <span class="key">"use"</span>: <span class="str">"sig"</span>
+    }
+  ]
+}</pre>
+</div>
+
+<!-- EP: Login -->
+<h3 id="ep-login"><span class="badge badge-post">POST</span> /api/auth/login</h3>
+<p>Direct authentication endpoint. Returns a bearer token for API access.
+  Request body is JSON.</p>
+
+<table class="param-table">
+  <thead>
+    <tr><th>Parameter</th><th>Type</th><th>Description</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>username</td>
+      <td>string</td>
+      <td>The user's username.</td>
+    </tr>
+    <tr>
+      <td>password</td>
+      <td>string</td>
+      <td>The user's password.</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="code-wrap">
+  <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+  <pre class="code-block"><span class="kw">POST</span> <span class="str">/api/auth/login</span>
+<span class="key">Content-Type</span>: application/json
+
+{
+  <span class="key">"username"</span>: <span class="str">"operator1"</span>,
+  <span class="key">"password"</span>: <span class="str">"secure_password"</span>
+}
+
+<span class="cmt">// Response (JSON)</span>
+{
+  <span class="key">"token"</span>: <span class="str">"bearer-token-string"</span>,
+  <span class="key">"user_id"</span>: <span class="str">"uuid"</span>,
+  <span class="key">"username"</span>: <span class="str">"operator1"</span>,
+  <span class="key">"tier"</span>: <span class="fn">1</span>
+}</pre>
+</div>
+
+<!-- EP: Verify -->
+<h3 id="ep-verify"><span class="badge badge-post">POST</span> /api/auth/verify</h3>
+<p>Verify whether a bearer token is still valid. Request body is JSON.</p>
+
+<table class="param-table">
+  <thead>
+    <tr><th>Parameter</th><th>Type</th><th>Description</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>token</td>
+      <td>string</td>
+      <td>The bearer token to verify.</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="code-wrap">
+  <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+  <pre class="code-block"><span class="kw">POST</span> <span class="str">/api/auth/verify</span>
+<span class="key">Content-Type</span>: application/json
+
+{
+  <span class="key">"token"</span>: <span class="str">"bearer-token-string"</span>
+}
+
+<span class="cmt">// Response (JSON)</span>
+{
+  <span class="key">"valid"</span>: <span class="fn">true</span>,
+  <span class="key">"user_id"</span>: <span class="str">"uuid"</span>
+}</pre>
+</div>
+
+<!-- ======== JWT FORMAT ======== -->
+<h2 id="jwt-format">JWT / ID Token Format</h2>
+<p>
+  The <code>id_token</code> is a standard JWT signed with <strong style="color:var(--green)">HS512</strong>
+  (HMAC-SHA512). The signing key is the <code>client_secret</code>.
+</p>
+
+<h4>Header</h4>
+<div class="code-wrap">
+  <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+  <pre class="code-block">{
+  <span class="key">"alg"</span>: <span class="str">"HS512"</span>,
+  <span class="key">"typ"</span>: <span class="str">"JWT"</span>
+}</pre>
+</div>
+
+<h4>Payload Claims</h4>
+<table class="param-table">
+  <thead>
+    <tr><th>Claim</th><th>Type</th><th>Description</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>iss</td><td>string</td><td>Issuer URL of the SSO server.</td></tr>
+    <tr><td>sub</td><td>string</td><td>Subject — the user's unique ID (UUID).</td></tr>
+    <tr><td>aud</td><td>string</td><td>Audience — your client_id.</td></tr>
+    <tr><td>exp</td><td>number</td><td>Expiration time (Unix timestamp). Tokens expire after 3600 seconds.</td></tr>
+    <tr><td>iat</td><td>number</td><td>Issued-at time (Unix timestamp).</td></tr>
+    <tr><td>nonce</td><td>string</td><td>Echo of the nonce parameter (if provided in authorize request).</td></tr>
+    <tr><td>auth_time</td><td>number</td><td>Time of user authentication (Unix timestamp).</td></tr>
+    <tr><td>tier</td><td>number</td><td>Proprietary access tier (1-4). See Tier Claims below.</td></tr>
+  </tbody>
+</table>
+
+<h3 id="tier-claims">Tier Claims</h3>
+<p>The <code>tier</code> claim is a proprietary extension representing the user's access level:</p>
+<table class="tier-table">
+  <thead>
+    <tr><th>Tier</th><th>Name</th><th>Description</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1</td><td>Sovereign</td><td>Full administrative access. System operators.</td></tr>
+    <tr><td>2</td><td>Operational</td><td>Standard operational users with full mission access.</td></tr>
+    <tr><td>3</td><td>Sensor</td><td>Limited access for automated systems and sensors.</td></tr>
+    <tr><td>4</td><td>Emergency</td><td>Restricted emergency-only access.</td></tr>
+  </tbody>
+</table>
+
+<div class="callout">
+  <strong>Verify the id_token signature.</strong> Decode the JWT and verify the HS512 signature
+  using your <code>client_secret</code> as the key. Reject tokens with mismatched signatures,
+  expired <code>exp</code>, or incorrect <code>aud</code>.
+</div>
+
+<!-- ======== CODE SAMPLES ======== -->
+<h2 id="code-samples">Code Samples</h2>
+<p>
+  Configure your OIDC client library to use HS512 and client_secret_post. Below are
+  examples for popular languages.
+</p>
+
+<div class="lang-tabs" id="langTabs">
+  <button class="lang-tab active" data-lang="python">Python</button>
+  <button class="lang-tab" data-lang="nodejs">Node.js</button>
+  <button class="lang-tab" data-lang="java">Java</button>
+  <button class="lang-tab" data-lang="go">Go</button>
+  <button class="lang-tab" data-lang="rust">Rust</button>
+  <button class="lang-tab" data-lang="php">PHP</button>
+  <button class="lang-tab" data-lang="dotnet">.NET</button>
+</div>
+
+<!-- Python -->
+<div class="lang-panel active" data-lang="python">
+<div class="code-wrap">
+  <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+  <pre class="code-block"><span class="cmt"># pip install authlib httpx</span>
+<span class="kw">from</span> authlib.integrations.starlette_client <span class="kw">import</span> OAuth
+<span class="kw">from</span> starlette.applications <span class="kw">import</span> Starlette
+
+oauth = OAuth()
+oauth.<span class="fn">register</span>(
+    <span class="key">name</span>=<span class="str">"milnet"</span>,
+    <span class="key">client_id</span>=<span class="str">"your_client_id"</span>,
+    <span class="key">client_secret</span>=<span class="str">"your_client_secret"</span>,
+    <span class="key">server_metadata_url</span>=<span class="str">"https://sso.example.mil/.well-known/openid-configuration"</span>,
+    <span class="key">client_kwargs</span>={
+        <span class="str">"scope"</span>: <span class="str">"openid"</span>,
+        <span class="cmt"># HS512 — use client_secret as HMAC key</span>
+        <span class="str">"token_endpoint_auth_method"</span>: <span class="str">"client_secret_post"</span>,
+    },
+)
+
+<span class="cmt"># Verify the id_token with HS512</span>
+<span class="kw">import</span> jwt  <span class="cmt"># pip install PyJWT</span>
+<span class="key">decoded</span> = jwt.<span class="fn">decode</span>(
+    id_token,
+    <span class="str">"your_client_secret"</span>,
+    <span class="key">algorithms</span>=[<span class="str">"HS512"</span>],
+    <span class="key">audience</span>=<span class="str">"your_client_id"</span>,
+)
+<span class="fn">print</span>(decoded[<span class="str">"sub"</span>], decoded[<span class="str">"tier"</span>])</pre>
+</div>
+</div>
+
+<!-- Node.js -->
+<div class="lang-panel" data-lang="nodejs">
+<div class="code-wrap">
+  <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+  <pre class="code-block"><span class="cmt">// npm install openid-client jsonwebtoken</span>
+<span class="kw">const</span> { <span class="fn">Issuer</span> } = <span class="fn">require</span>(<span class="str">'openid-client'</span>);
+<span class="kw">const</span> jwt = <span class="fn">require</span>(<span class="str">'jsonwebtoken'</span>);
+
+<span class="kw">const</span> issuer = <span class="kw">await</span> Issuer.<span class="fn">discover</span>(
+  <span class="str">'https://sso.example.mil'</span>
+);
+
+<span class="kw">const</span> client = <span class="kw">new</span> issuer.<span class="fn">Client</span>({
+  <span class="key">client_id</span>: <span class="str">'your_client_id'</span>,
+  <span class="key">client_secret</span>: <span class="str">'your_client_secret'</span>,
+  <span class="key">response_types</span>: [<span class="str">'code'</span>],
+  <span class="key">token_endpoint_auth_method</span>: <span class="str">'client_secret_post'</span>,
+  <span class="key">id_token_signed_response_alg</span>: <span class="str">'HS512'</span>,
+});
+
+<span class="cmt">// Verify id_token manually with HS512</span>
+<span class="kw">const</span> decoded = jwt.<span class="fn">verify</span>(
+  idToken,
+  <span class="str">'your_client_secret'</span>,
+  { <span class="key">algorithms</span>: [<span class="str">'HS512'</span>], <span class="key">audience</span>: <span class="str">'your_client_id'</span> }
+);
+console.<span class="fn">log</span>(decoded.sub, decoded.tier);</pre>
+</div>
+</div>
+
+<!-- Java -->
+<div class="lang-panel" data-lang="java">
+<div class="code-wrap">
+  <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+  <pre class="code-block"><span class="cmt">// build.gradle: implementation 'com.auth0:java-jwt:4.4.0'</span>
+<span class="kw">import</span> com.auth0.jwt.JWT;
+<span class="kw">import</span> com.auth0.jwt.algorithms.Algorithm;
+
+<span class="kw">String</span> clientSecret = <span class="str">"your_client_secret"</span>;
+Algorithm algorithm = Algorithm.<span class="fn">HMAC512</span>(clientSecret);
+
+<span class="kw">var</span> verifier = JWT.<span class="fn">require</span>(algorithm)
+    .<span class="fn">withIssuer</span>(<span class="str">"https://sso.example.mil"</span>)
+    .<span class="fn">withAudience</span>(<span class="str">"your_client_id"</span>)
+    .<span class="fn">build</span>();
+
+<span class="kw">var</span> decoded = verifier.<span class="fn">verify</span>(idToken);
+<span class="kw">int</span> tier = decoded.<span class="fn">getClaim</span>(<span class="str">"tier"</span>).<span class="fn">asInt</span>();
+<span class="kw">String</span> sub = decoded.<span class="fn">getSubject</span>();</pre>
+</div>
+</div>
+
+<!-- Go -->
+<div class="lang-panel" data-lang="go">
+<div class="code-wrap">
+  <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+  <pre class="code-block"><span class="cmt">// go get github.com/golang-jwt/jwt/v5</span>
+<span class="kw">package</span> main
+
+<span class="kw">import</span> (
+    <span class="str">"fmt"</span>
+    jwt <span class="str">"github.com/golang-jwt/jwt/v5"</span>
+)
+
+<span class="kw">func</span> <span class="fn">verifyIDToken</span>(idToken, clientSecret <span class="kw">string</span>) {
+    token, err := jwt.<span class="fn">Parse</span>(idToken, <span class="kw">func</span>(t *jwt.Token) (<span class="kw">interface</span>{}, <span class="kw">error</span>) {
+        <span class="cmt">// Enforce HS512</span>
+        <span class="kw">if</span> _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+            <span class="kw">return</span> <span class="fn">nil</span>, fmt.<span class="fn">Errorf</span>(<span class="str">"unexpected signing method: %v"</span>, t.Header[<span class="str">"alg"</span>])
+        }
+        <span class="kw">return</span> []<span class="fn">byte</span>(clientSecret), <span class="fn">nil</span>
+    }, jwt.<span class="fn">WithValidMethods</span>([]<span class="kw">string</span>{<span class="str">"HS512"</span>}))
+
+    <span class="kw">if</span> err != <span class="fn">nil</span> {
+        panic(err)
+    }
+    claims := token.Claims.(jwt.MapClaims)
+    fmt.<span class="fn">Println</span>(claims[<span class="str">"sub"</span>], claims[<span class="str">"tier"</span>])
+}</pre>
+</div>
+</div>
+
+<!-- Rust -->
+<div class="lang-panel" data-lang="rust">
+<div class="code-wrap">
+  <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+  <pre class="code-block"><span class="cmt">// Cargo.toml: jsonwebtoken = "9"</span>
+<span class="kw">use</span> jsonwebtoken::{<span class="fn">decode</span>, DecodingKey, Validation, Algorithm};
+<span class="kw">use</span> serde::Deserialize;
+
+<span class="kw">#[derive(Deserialize)]</span>
+<span class="kw">struct</span> <span class="fn">Claims</span> {
+    sub: String,
+    aud: String,
+    tier: u8,
+    exp: usize,
+}
+
+<span class="kw">fn</span> <span class="fn">verify_id_token</span>(id_token: &amp;<span class="kw">str</span>, client_secret: &amp;<span class="kw">str</span>) -&gt; Claims {
+    <span class="kw">let mut</span> validation = Validation::<span class="fn">new</span>(Algorithm::HS512);
+    validation.set_audience(&amp;[<span class="str">"your_client_id"</span>]);
+
+    <span class="kw">let</span> key = DecodingKey::<span class="fn">from_secret</span>(client_secret.<span class="fn">as_bytes</span>());
+    <span class="kw">let</span> data = <span class="fn">decode</span>::&lt;Claims&gt;(id_token, &amp;key, &amp;validation)
+        .<span class="fn">expect</span>(<span class="str">"token verification failed"</span>);
+    data.claims
+}</pre>
+</div>
+</div>
+
+<!-- PHP -->
+<div class="lang-panel" data-lang="php">
+<div class="code-wrap">
+  <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+  <pre class="code-block"><span class="cmt">// composer require firebase/php-jwt</span>
+<span class="kw">use</span> Firebase\JWT\JWT;
+<span class="kw">use</span> Firebase\JWT\Key;
+
+<span class="key">$clientSecret</span> = <span class="str">'your_client_secret'</span>;
+<span class="key">$idToken</span>      = <span class="str">'eyJhbGciOiJIUzUxMiJ9...'</span>;
+
+<span class="cmt">// Decode and verify with HS512</span>
+<span class="key">$decoded</span> = JWT::<span class="fn">decode</span>(
+    <span class="key">$idToken</span>,
+    <span class="kw">new</span> <span class="fn">Key</span>(<span class="key">$clientSecret</span>, <span class="str">'HS512'</span>)
+);
+
+<span class="fn">echo</span> <span class="key">$decoded</span>-&gt;sub;   <span class="cmt">// user UUID</span>
+<span class="fn">echo</span> <span class="key">$decoded</span>-&gt;tier;  <span class="cmt">// 1-4</span></pre>
+</div>
+</div>
+
+<!-- .NET -->
+<div class="lang-panel" data-lang="dotnet">
+<div class="code-wrap">
+  <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+  <pre class="code-block"><span class="cmt">// NuGet: System.IdentityModel.Tokens.Jwt</span>
+<span class="kw">using</span> System.IdentityModel.Tokens.Jwt;
+<span class="kw">using</span> Microsoft.IdentityModel.Tokens;
+<span class="kw">using</span> System.Text;
+
+<span class="kw">var</span> secret = <span class="str">"your_client_secret"</span>;
+<span class="kw">var</span> key = <span class="kw">new</span> <span class="fn">SymmetricSecurityKey</span>(
+    Encoding.UTF8.<span class="fn">GetBytes</span>(secret)
+);
+
+<span class="kw">var</span> parameters = <span class="kw">new</span> <span class="fn">TokenValidationParameters</span> {
+    <span class="key">ValidIssuer</span>           = <span class="str">"https://sso.example.mil"</span>,
+    <span class="key">ValidAudience</span>         = <span class="str">"your_client_id"</span>,
+    <span class="key">IssuerSigningKey</span>      = key,
+    <span class="key">ValidAlgorithms</span>       = <span class="kw">new</span>[] { <span class="str">"HS512"</span> },
+    <span class="key">ValidateLifetime</span>     = <span class="fn">true</span>,
+};
+
+<span class="kw">var</span> handler = <span class="kw">new</span> <span class="fn">JwtSecurityTokenHandler</span>();
+<span class="kw">var</span> principal = handler.<span class="fn">ValidateToken</span>(
+    idToken, parameters, <span class="kw">out</span> <span class="kw">var</span> validated
+);
+<span class="kw">var</span> tier = principal.<span class="fn">FindFirst</span>(<span class="str">"tier"</span>)?.<span class="key">Value</span>;</pre>
+</div>
+</div>
+
+<!-- ======== CURL EXAMPLES ======== -->
+<h2 id="curl-examples">curl Examples</h2>
+<p>
+  Complete PKCE flow using only curl and standard Unix tools. Copy and paste these commands
+  in sequence.
+</p>
+
+<h3>Step 1: Generate PKCE verifier and challenge</h3>
+<div class="code-wrap">
+  <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+  <pre class="code-block"><span class="cmt"># Generate a random code_verifier (43+ characters)</span>
+<span class="key">CODE_VERIFIER</span>=$(<span class="fn">openssl</span> rand -base64 32 | tr -d '=/+' | head -c 64)
+<span class="fn">echo</span> <span class="str">"code_verifier: $CODE_VERIFIER"</span>
+
+<span class="cmt"># Compute code_challenge = BASE64URL(SHA256(code_verifier))</span>
+<span class="key">CODE_CHALLENGE</span>=$(<span class="fn">printf</span> '%s' "$CODE_VERIFIER" \
+  | openssl dgst -sha256 -binary \
+  | openssl base64 -A \
+  | tr '+/' '-_' | tr -d '=')
+<span class="fn">echo</span> <span class="str">"code_challenge: $CODE_CHALLENGE"</span>
+
+<span class="cmt"># Generate a random state</span>
+<span class="key">STATE</span>=$(<span class="fn">openssl</span> rand -hex 16)
+<span class="fn">echo</span> <span class="str">"state: $STATE"</span></pre>
+</div>
+
+<h3>Step 2: Build the authorization URL</h3>
+<div class="code-wrap">
+  <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+  <pre class="code-block"><span class="cmt"># Open this URL in a browser (or follow the redirect)</span>
+<span class="key">SSO</span>=<span class="str">"https://sso.example.mil"</span>
+<span class="key">CLIENT_ID</span>=<span class="str">"your_client_id"</span>
+<span class="key">REDIRECT</span>=<span class="str">"https://app.example.com/callback"</span>
+
+<span class="fn">echo</span> <span class="str">"${SSO}/oauth/authorize?\
+client_id=${CLIENT_ID}&amp;\
+redirect_uri=${REDIRECT}&amp;\
+response_type=code&amp;\
+scope=openid&amp;\
+state=${STATE}&amp;\
+code_challenge=${CODE_CHALLENGE}&amp;\
+code_challenge_method=S256"</span></pre>
+</div>
+
+<h3>Step 3: Exchange code for tokens</h3>
+<div class="code-wrap">
+  <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+  <pre class="code-block"><span class="cmt"># Replace AUTH_CODE with the code from the callback URL</span>
+<span class="key">AUTH_CODE</span>=<span class="str">"paste_auth_code_here"</span>
+
+<span class="fn">curl</span> -s -X POST "${SSO}/oauth/token" \
+  -H <span class="str">"Content-Type: application/x-www-form-urlencoded"</span> \
+  -d <span class="str">"grant_type=authorization_code\
+&amp;code=${AUTH_CODE}\
+&amp;redirect_uri=${REDIRECT}\
+&amp;client_id=${CLIENT_ID}\
+&amp;client_secret=your_client_secret\
+&amp;code_verifier=${CODE_VERIFIER}"</span></pre>
+</div>
+
+<div class="callout danger">
+  <strong>Exchange within 60 seconds.</strong> The authorization code expires quickly.
+  Run this command immediately after receiving the callback.
+</div>
+
+<h3>Step 4: Call userinfo</h3>
+<div class="code-wrap">
+  <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+  <pre class="code-block"><span class="cmt"># Use the access_token from the token response</span>
+<span class="key">ACCESS_TOKEN</span>=<span class="str">"550e8400-e29b-41d4-a716-446655440000"</span>
+
+<span class="fn">curl</span> -s "${SSO}/oauth/userinfo" \
+  -H <span class="str">"Authorization: Bearer ${ACCESS_TOKEN}"</span></pre>
+</div>
+
+<h3>Step 5: Decode the id_token (inspect only)</h3>
+<div class="code-wrap">
+  <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+  <pre class="code-block"><span class="cmt"># Decode the JWT payload (base64url decode the second segment)</span>
+<span class="key">ID_TOKEN</span>=<span class="str">"eyJhbGciOiJIUzUxMiJ9.eyJpc3Mi..."</span>
+
+<span class="fn">echo</span> "$ID_TOKEN" | cut -d. -f2 \
+  | tr '_-' '/+' \
+  | base64 -d 2>/dev/null \
+  | python3 -m json.tool</pre>
+</div>
+
+<!-- ======== CLIENT REGISTRATION ======== -->
+<h2 id="client-registration">Client Registration</h2>
+<p>
+  MILNET SSO does not support dynamic client registration (RFC 7591). All client
+  applications must be provisioned by the SSO operator.
+</p>
+
+<h3>To register a client application:</h3>
+<ol>
+  <li>Contact the SSO operator (Tier 1 / Sovereign user).</li>
+  <li>Provide your application name, description, and redirect URIs.</li>
+  <li>The operator will create the client via the admin panel and provide your <code>client_id</code> and <code>client_secret</code>.</li>
+  <li>Store the <code>client_secret</code> securely. It is used both for token exchange and for HS512 signature verification.</li>
+</ol>
+
+<div class="callout">
+  <strong>Keep your client_secret safe.</strong> With HS512, the client_secret is the signing key.
+  Anyone with your secret can forge valid id_tokens for your client. Treat it like a private key.
+</div>
+
+<h3>Quick Reference Summary</h3>
+<table class="param-table">
+  <thead>
+    <tr><th>Property</th><th>Value</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Signing Algorithm</td><td>HS512 (HMAC-SHA512)</td></tr>
+    <tr><td>Token Auth Method</td><td>client_secret_post (no Basic Auth)</td></tr>
+    <tr><td>Auth Code Lifetime</td><td>60 seconds</td></tr>
+    <tr><td>Access Token Format</td><td>UUID (not JWT)</td></tr>
+    <tr><td>Token Lifetime</td><td>3600 seconds (1 hour)</td></tr>
+    <tr><td>Refresh Tokens</td><td>Not supported</td></tr>
+    <tr><td>State Parameter</td><td>Required (not optional)</td></tr>
+    <tr><td>PKCE</td><td>Supported (S256), recommended</td></tr>
+    <tr><td>Tier Claim</td><td>1=Sovereign, 2=Operational, 3=Sensor, 4=Emergency</td></tr>
+    <tr><td>Client Registration</td><td>Operator-provisioned only</td></tr>
+  </tbody>
+</table>
+
+</main>
+</div>
+
+<!-- ============================================ -->
+<!-- FOOTER                                        -->
+<!-- ============================================ -->
+<footer>
+  <p>Built by <strong>Divya Mohan</strong> + <strong>Claude</strong> (Anthropic)</p>
+  <div class="footer-links">
+    <a href="https://github.com/divyamohan1993/enterprise-sso-system" target="_blank">GitHub</a>
+    <a href="https://sso-system-demo.dmj.one" target="_blank">Live Demo</a>
+    <a href="/about">About</a>
+    <a href="/pitch">Pitch Deck</a>
+    <a href="/">Dashboard</a>
+  </div>
+</footer>
+
+<!-- ============================================ -->
+<!-- JAVASCRIPT                                    -->
+<!-- ============================================ -->
+<script>
+(function() {
+  // ---- Mobile sidebar toggle ----
+  var toggle = document.getElementById('mobileToggle');
+  var sidebar = document.getElementById('sidebar');
+  toggle.addEventListener('click', function() {
+    sidebar.classList.toggle('open');
+    toggle.textContent = sidebar.classList.contains('open') ? '[X]' : '[ ]';
+  });
+
+  // Close sidebar when clicking a link on mobile
+  sidebar.addEventListener('click', function(e) {
+    if (e.target.tagName === 'A' && window.innerWidth <= 768) {
+      sidebar.classList.remove('open');
+      toggle.textContent = '[ ]';
+    }
+  });
+
+  // ---- Active section tracking via IntersectionObserver ----
+  var sections = document.querySelectorAll('h2[id], h3[id]');
+  var navLinks = document.querySelectorAll('.sidebar a[href^="#"]');
+  var linkMap = {};
+  navLinks.forEach(function(link) {
+    linkMap[link.getAttribute('href').substring(1)] = link;
+  });
+
+  var observer = new IntersectionObserver(function(entries) {
+    entries.forEach(function(entry) {
+      if (entry.isIntersecting) {
+        navLinks.forEach(function(l) { l.classList.remove('active'); });
+        var link = linkMap[entry.target.id];
+        if (link) link.classList.add('active');
+      }
+    });
+  }, { rootMargin: '-10% 0px -80% 0px', threshold: 0 });
+
+  sections.forEach(function(section) {
+    observer.observe(section);
+  });
+
+  // ---- Language tab switcher ----
+  var tabs = document.querySelectorAll('.lang-tab');
+  var panels = document.querySelectorAll('.lang-panel');
+
+  tabs.forEach(function(tab) {
+    tab.addEventListener('click', function() {
+      var lang = this.getAttribute('data-lang');
+      tabs.forEach(function(t) { t.classList.remove('active'); });
+      panels.forEach(function(p) { p.classList.remove('active'); });
+      this.classList.add('active');
+      document.querySelector('.lang-panel[data-lang="' + lang + '"]').classList.add('active');
+    });
+  });
+})();
+
+// ---- Copy to clipboard ----
+function copyCode(btn) {
+  var pre = btn.parentElement.querySelector('pre');
+  var text = pre.textContent;
+  navigator.clipboard.writeText(text).then(function() {
+    btn.textContent = 'Copied!';
+    setTimeout(function() { btn.textContent = 'Copy'; }, 2000);
+  });
+}
+</script>
+
+</body>
+</html>

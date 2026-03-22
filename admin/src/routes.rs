@@ -33,6 +33,9 @@ pub struct AppState {
     pub pending_ceremonies: RwLock<HashMap<Uuid, PendingCeremony>>,
     pub last_level4_ceremony: RwLock<Option<i64>>,
     pub level4_count_72h: RwLock<Vec<i64>>,
+    pub google_config: Option<crate::google_oauth::GoogleOAuthConfig>,
+    pub pending_google: RwLock<crate::google_oauth::PendingGoogleStore>,
+    pub http_client: reqwest::Client,
 }
 
 /// A pending multi-person ceremony that requires multiple approvers.
@@ -77,6 +80,7 @@ async fn auth_middleware(
         || path == "/"
         || path == "/about"
         || path == "/pitch"
+        || path == "/docs"
         || path.ends_with(".html")
         || path.ends_with(".css")
         || path.ends_with(".js")
@@ -341,6 +345,8 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/.well-known/openid-configuration", get(oidc_discovery))
         .route("/oauth/authorize", get(oauth_authorize))
         .route("/oauth/authorize/login", post(oauth_authorize_login))
+        .route("/oauth/google/start", get(oauth_google_start))
+        .route("/oauth/google/callback", get(oauth_google_callback))
         .route("/oauth/token", post(oauth_token))
         .route("/oauth/userinfo", get(oauth_userinfo))
         .route("/oauth/jwks", get(oauth_jwks))
@@ -358,6 +364,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         // Static page redirects
         .route("/about", get(|| async { axum::response::Redirect::permanent("/about.html") }))
         .route("/pitch", get(|| async { axum::response::Redirect::permanent("/pitch.html") }))
+        .route("/docs", get(|| async { axum::response::Redirect::permanent("/docs.html") }))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state)
         .layer(tower_http::cors::CorsLayer::permissive())
@@ -1038,6 +1045,7 @@ button:hover{{background:#00cc33}}
   <button type="submit">SIGN IN</button>
   <div class="err" id="err"></div>
 </form>
+{google_btn}
 </div></body></html>"#,
         app_name = client.name,
         client_id = params.client_id,
@@ -1046,6 +1054,22 @@ button:hover{{background:#00cc33}}
         state = params.state,
         nonce = params.nonce.as_deref().unwrap_or(""),
         code_challenge = params.code_challenge.as_deref().unwrap_or(""),
+        google_btn = if state.google_config.is_some() {
+            format!(r#"<div style="margin-top:20px;text-align:center">
+<div style="color:#555;font-size:0.7rem;margin-bottom:12px">or</div>
+<a href="/oauth/google/start?client_id={cid}&redirect_uri={ruri}&scope={sc}&state={st}&nonce={nc}&code_challenge={cc}" style="display:inline-block;padding:12px 24px;background:#111;border:1px solid #333;border-radius:4px;text-decoration:none;font-family:inherit;font-size:0.85rem;cursor:pointer">
+<span style="color:#4285F4">G</span><span style="color:#EA4335">o</span><span style="color:#FBBC05">o</span><span style="color:#4285F4">g</span><span style="color:#34A853">l</span><span style="color:#EA4335">e</span><span style="color:#888"> &nbsp;Sign In</span>
+</a></div>"#,
+                cid = params.client_id,
+                ruri = urlencoding::encode(&params.redirect_uri),
+                sc = urlencoding::encode(&params.scope),
+                st = urlencoding::encode(&params.state),
+                nc = urlencoding::encode(params.nonce.as_deref().unwrap_or("")),
+                cc = urlencoding::encode(params.code_challenge.as_deref().unwrap_or("")),
+            )
+        } else {
+            String::new()
+        },
     );
 
     Html(login_html).into_response()
@@ -1078,6 +1102,22 @@ a{{color:#00ff41}}</style></head><body>
         }
     };
     drop(store);
+
+    // Guard: Google-only users must use Google login
+    let auth_provider: String = sqlx::query_scalar("SELECT auth_provider FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or_else(|_| "opaque".to_string());
+    if auth_provider == "google" {
+        return Html(r#"<!DOCTYPE html>
+<html><head><title>MILNET SSO // Error</title>
+<style>body{background:#0a0a0a;color:#ff3333;font-family:'JetBrains Mono',monospace;padding:60px;text-align:center}
+a{color:#00ff41}</style></head><body>
+<h1>GOOGLE ACCOUNT</h1>
+<p style="margin:20px 0;color:#888">This account uses Google sign-in. Please use the Google button to authenticate.</p>
+</body></html>"#.to_string()).into_response();
+    }
 
     // Look up the user's tier from the database
     let mut user_tier: i32 = sqlx::query_scalar("SELECT tier FROM users WHERE id = $1")
@@ -1165,6 +1205,216 @@ struct OAuthLoginForm {
     state: String,
     nonce: String,
     code_challenge: String,
+}
+
+// ---------------------------------------------------------------------------
+// Google OAuth handlers
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct GoogleStartParams {
+    client_id: String,
+    redirect_uri: String,
+    scope: String,
+    state: String,
+    nonce: Option<String>,
+    code_challenge: Option<String>,
+}
+
+/// Start the Google OAuth flow: validate MILNET params, store pending state,
+/// then redirect to Google's authorization endpoint.
+async fn oauth_google_start(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<GoogleStartParams>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    use axum::http::header;
+
+    let google_config = match &state.google_config {
+        Some(c) => c,
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "google_oauth_not_configured"}))).into_response(),
+    };
+
+    // Validate the MILNET client_id
+    let clients = state.oauth_clients.read().await;
+    if clients.get(&params.client_id).is_none() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid_client"}))).into_response();
+    }
+    drop(clients);
+
+    // Generate a random state token for the Google flow
+    let state_token = hex::encode(crypto::entropy::generate_nonce());
+
+    // Store pending auth so we can resume on callback
+    let pending = crate::google_oauth::PendingGoogleAuth {
+        milnet_client_id: params.client_id,
+        milnet_redirect_uri: params.redirect_uri,
+        milnet_scope: params.scope,
+        milnet_state: params.state,
+        milnet_nonce: params.nonce,
+        milnet_code_challenge: params.code_challenge,
+        created_at: now_secs(),
+    };
+    {
+        let mut store = state.pending_google.write().await;
+        store.insert(state_token.clone(), pending);
+    }
+
+    // Build Google auth URL and redirect
+    let google_url = crate::google_oauth::build_google_auth_url(google_config, &state_token);
+    (StatusCode::FOUND, [(header::LOCATION, google_url)]).into_response()
+}
+
+#[derive(Deserialize)]
+struct GoogleCallbackParams {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
+/// Handle Google's OAuth callback: exchange code, verify claims, find or create
+/// the user, issue a MILNET auth code, and redirect back to the client.
+async fn oauth_google_callback(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<GoogleCallbackParams>,
+) -> axum::response::Response {
+    use axum::response::{IntoResponse, Html};
+    use axum::http::header;
+
+    // Handle error from Google
+    if let Some(err) = &params.error {
+        return Html(format!(r#"<!DOCTYPE html>
+<html><head><title>MILNET SSO // Google Error</title>
+<style>body{{background:#0a0a0a;color:#ff3333;font-family:'JetBrains Mono',monospace;padding:60px;text-align:center}}</style></head><body>
+<h1>GOOGLE SIGN-IN FAILED</h1>
+<p style="margin:20px 0;color:#888">{err}</p>
+</body></html>"#)).into_response();
+    }
+
+    let code = match &params.code {
+        Some(c) => c,
+        None => return (StatusCode::BAD_REQUEST, "missing code").into_response(),
+    };
+    let state_token = match &params.state {
+        Some(s) => s,
+        None => return (StatusCode::BAD_REQUEST, "missing state").into_response(),
+    };
+
+    // Consume pending state
+    let pending = {
+        let mut store = state.pending_google.write().await;
+        store.consume(state_token, now_secs())
+    };
+    let pending = match pending {
+        Some(p) => p,
+        None => return (StatusCode::BAD_REQUEST, "invalid or expired state").into_response(),
+    };
+
+    let google_config = match &state.google_config {
+        Some(c) => c,
+        None => return (StatusCode::INTERNAL_SERVER_ERROR, "google not configured").into_response(),
+    };
+
+    // Exchange code for tokens
+    let tokens = match crate::google_oauth::exchange_code_for_tokens(
+        google_config, code, &state.http_client,
+    ).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!("Google token exchange failed: {e}");
+            return Html(format!(r#"<!DOCTYPE html>
+<html><head><title>MILNET SSO // Error</title>
+<style>body{{background:#0a0a0a;color:#ff3333;font-family:'JetBrains Mono',monospace;padding:60px;text-align:center}}</style></head><body>
+<h1>TOKEN EXCHANGE FAILED</h1>
+<p style="margin:20px 0;color:#888">{e}</p>
+</body></html>"#)).into_response();
+        }
+    };
+
+    // Extract and verify Google ID token claims
+    let claims = match crate::google_oauth::extract_google_claims(&tokens.id_token) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Google claim extraction failed: {e}");
+            return (StatusCode::BAD_REQUEST, format!("invalid id_token: {e}")).into_response();
+        }
+    };
+    if let Err(e) = crate::google_oauth::verify_google_id_token(&claims, &google_config.client_id) {
+        tracing::error!("Google claim verification failed: {e}");
+        return (StatusCode::BAD_REQUEST, format!("id_token verification failed: {e}")).into_response();
+    }
+
+    // Look up user by email
+    let row: Option<(Uuid, i32)> = sqlx::query_as(
+        "SELECT id, tier FROM users WHERE email = $1 AND is_active = true"
+    )
+        .bind(&claims.email)
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or(None);
+
+    let (user_id, user_tier) = if let Some((id, tier)) = row {
+        (id, tier as u8)
+    } else {
+        // Auto-create tier 2 user with google auth provider
+        let new_id = Uuid::new_v4();
+        let now = now_secs();
+        let username = claims.email.split('@').next().unwrap_or(&claims.email);
+        let display_name = claims.name.as_deref().unwrap_or(username);
+        let _ = display_name; // reserved for future profile use
+        sqlx::query(
+            "INSERT INTO users (id, username, email, tier, is_active, auth_provider, opaque_registration, created_at) VALUES ($1, $2, $3, 2, true, 'google', NULL, $4)"
+        )
+            .bind(new_id)
+            .bind(username)
+            .bind(&claims.email)
+            .bind(now)
+            .execute(&state.db)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!("Failed to auto-create Google user: {e}");
+                panic!("Failed to create user");
+            });
+        tracing::info!("Auto-enrolled Google user {} ({})", claims.email, new_id);
+
+        // Log auto-enrollment to audit
+        let mut audit = state.audit_log.write().await;
+        audit.append(
+            common::types::AuditEventType::AuthSuccess,
+            vec![new_id], vec![], 0.0, vec![],
+        );
+        drop(audit);
+
+        (new_id, 2u8)
+    };
+
+    // Create MILNET authorization code
+    let mut codes = state.auth_codes.write().await;
+    let auth_code = codes.create_code_with_tier(
+        &pending.milnet_client_id,
+        &pending.milnet_redirect_uri,
+        user_id,
+        &pending.milnet_scope,
+        pending.milnet_code_challenge,
+        pending.milnet_nonce,
+        user_tier,
+    );
+    drop(codes);
+
+    // Log successful auth
+    let mut audit = state.audit_log.write().await;
+    audit.append(
+        common::types::AuditEventType::AuthSuccess,
+        vec![user_id], vec![], 0.0, vec![],
+    );
+    drop(audit);
+
+    // Redirect back to the MILNET client
+    let redirect_url = format!(
+        "{}?code={}&state={}",
+        pending.milnet_redirect_uri, auth_code, pending.milnet_state
+    );
+    (StatusCode::FOUND, [(header::LOCATION, redirect_url)]).into_response()
 }
 
 #[derive(Deserialize)]
