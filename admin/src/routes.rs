@@ -255,12 +255,18 @@ pub struct LoginRequest {
     pub password: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 pub struct LoginResponse {
     pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub user_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tier: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
@@ -775,6 +781,7 @@ async fn auth_login(
             Json(LoginResponse {
                 success: true,
                 user_id: Some(user_id),
+                username: Some(req.username.clone()),
                 token: Some(token),
                 tier: Some(user_tier as u8),
                 error: None,
@@ -783,6 +790,7 @@ async fn auth_login(
         Err(e) => Json(LoginResponse {
             success: false,
             user_id: None,
+            username: None,
             token: None,
             tier: None,
             error: Some(format!("authentication failed: {e}")),

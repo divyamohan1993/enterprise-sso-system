@@ -577,7 +577,7 @@ function enterApp() {
   $('mainNav').style.display = 'flex';
   $('userInfo').style.display = '';
   var tierLabel = tokenClaims && tokenClaims.tier ? ' [Tier ' + tokenClaims.tier + ']' : '';
-  $('currentUser').textContent = (tokenClaims ? (tokenClaims.sub || tokenClaims.username || 'unknown') : 'unknown') + tierLabel;
+  $('currentUser').textContent = (tokenClaims ? (tokenClaims.username || localStorage.getItem('username') || tokenClaims.sub || 'unknown') : 'unknown') + tierLabel;
   showPage('dashboard', $('mainNav').querySelector('button'));
 }
 
@@ -606,8 +606,10 @@ async function doLogin() {
     if (!authToken) throw new Error('No token in response');
 
     tokenClaims = decodeJwtPayload(authToken) || {};
-    // Ensure tier is present in claims (from login response if not in JWT)
+    // Ensure tier and username are present in claims (from login response if not in JWT)
     if (!tokenClaims.tier && data.tier) tokenClaims.tier = data.tier;
+    if (!tokenClaims.username && data.username) tokenClaims.username = data.username;
+    if (data.username) localStorage.setItem('username', data.username);
     termLog(term, '[3/4] Token received. Decoding claims...', 'line-info');
     termLog(term, '[4/4] Session established.', 'line-ok');
     termLog(term, '', '');
@@ -645,10 +647,10 @@ function doLogout() {
 async function loadStatus() {
   try {
     var s = await api('/status');
-    $('statUsers').textContent = s.users != null ? s.users : (s.user_count != null ? s.user_count : '--');
-    $('statDevices').textContent = s.devices != null ? s.devices : (s.device_count != null ? s.device_count : '--');
-    $('statPortals').textContent = s.portals != null ? s.portals : (s.portal_count != null ? s.portal_count : '--');
-    $('statAudit').textContent = s.audit_entries != null ? s.audit_entries : (s.audit_count != null ? s.audit_count : '--');
+    $('statUsers').textContent = s.users_registered != null ? s.users_registered : (s.users != null ? s.users : '--');
+    $('statDevices').textContent = s.devices_enrolled != null ? s.devices_enrolled : (s.devices != null ? s.devices : '--');
+    $('statPortals').textContent = s.portals_active != null ? s.portals_active : (s.portals != null ? s.portals : '--');
+    $('statAudit').textContent = s.audit_entries != null ? s.audit_entries : '--';
   } catch(e) {
     // Status endpoint may not exist yet
   }
