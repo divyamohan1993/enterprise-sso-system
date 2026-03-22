@@ -80,7 +80,7 @@ impl ShardProtocol {
 
     /// Compute HMAC-SHA512 over the domain prefix and message fields (excluding the HMAC field).
     fn compute_hmac(key: &[u8; 64], msg: &ShardMessage) -> [u8; 64] {
-        let mut mac = HmacSha512::new_from_slice(key).expect("HMAC-SHA512 accepts any key size");
+        let mut mac = <HmacSha512 as Mac>::new_from_slice(key).expect("HMAC-SHA512 accepts any key size");
 
         // Domain separation prefix
         mac.update(SHARD_AUTH);

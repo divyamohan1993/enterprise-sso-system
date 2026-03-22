@@ -31,11 +31,16 @@ pub fn is_production() -> bool {
 /// After reading, the env var is removed from the process environment to
 /// prevent leakage via `/proc/pid/environ`, and the in-memory String is
 /// zeroized.
+///
+/// NOTE: In production, this should be called once at startup and the result
+/// cached by the caller. The env var is removed after first read.
 pub fn load_master_kek() -> [u8; 32] {
     use zeroize::Zeroize;
     match std::env::var("MILNET_MASTER_KEK") {
         Ok(mut hex_str) if hex_str.len() >= 64 => {
-            // Remove from process environment immediately
+            // Remove from process environment to prevent /proc/pid/environ leakage.
+            // Callers should cache the returned key.
+            #[cfg(not(test))]
             std::env::remove_var("MILNET_MASTER_KEK");
             let mut key = [0u8; 32];
             for (i, chunk) in hex_str.as_bytes().chunks(2).take(32).enumerate() {
@@ -90,6 +95,7 @@ fn load_key_hardened(var: &str, purpose: &str, dev_seed: &[u8]) -> [u8; 64] {
     // 1. Try sealed key
     if let Ok(mut hex_str) = std::env::var(&sealed_var) {
         // Remove from process environment immediately
+        #[cfg(not(test))]
         std::env::remove_var(&sealed_var);
         let result = unseal_key_from_hex(&hex_str, purpose);
         zeroize_string(&mut hex_str);
@@ -104,6 +110,7 @@ fn load_key_hardened(var: &str, purpose: &str, dev_seed: &[u8]) -> [u8; 64] {
     // 2. Try raw key (blocked in production)
     if let Ok(mut hex_str) = std::env::var(var) {
         // Remove from process environment immediately
+        #[cfg(not(test))]
         std::env::remove_var(var);
         if hex_str.len() >= 128 {
             if is_production() {

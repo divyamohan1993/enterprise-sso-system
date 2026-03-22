@@ -86,36 +86,53 @@ pub fn pq_verify_raw(verifying_key: &PqVerifyingKey, data: &[u8], sig_bytes: &[u
 mod tests {
     use super::*;
 
+    // ML-DSA-87 keys are large (~4KB signing key, ~2.5KB verifying key).
+    // Spawn tests with 8MB stacks to prevent stack overflow.
+    fn run_with_large_stack<F: FnOnce() + Send + 'static>(f: F) {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(f)
+            .expect("thread spawn failed")
+            .join()
+            .expect("thread panicked");
+    }
+
     #[test]
     fn test_pq_sign_and_verify() {
-        let (sk, vk) = generate_pq_keypair();
-        let message = b"test message for PQ signing";
-        let frost_sig = [0xABu8; 64];
+        run_with_large_stack(|| {
+            let (sk, vk) = generate_pq_keypair();
+            let message = b"test message for PQ signing";
+            let frost_sig = [0xABu8; 64];
 
-        let sig = pq_sign(&sk, message, &frost_sig);
-        assert!(!sig.is_empty());
-        assert!(pq_verify(&vk, message, &frost_sig, &sig));
+            let sig = pq_sign(&sk, message, &frost_sig);
+            assert!(!sig.is_empty());
+            assert!(pq_verify(&vk, message, &frost_sig, &sig));
+        });
     }
 
     #[test]
     fn test_pq_wrong_key_rejected() {
-        let (sk, _vk) = generate_pq_keypair();
-        let (_sk2, vk2) = generate_pq_keypair();
-        let message = b"test message";
-        let frost_sig = [0xCDu8; 64];
+        run_with_large_stack(|| {
+            let (sk, _vk) = generate_pq_keypair();
+            let (_sk2, vk2) = generate_pq_keypair();
+            let message = b"test message";
+            let frost_sig = [0xCDu8; 64];
 
-        let sig = pq_sign(&sk, message, &frost_sig);
-        // Verification with a different key must fail
-        assert!(!pq_verify(&vk2, message, &frost_sig, &sig));
+            let sig = pq_sign(&sk, message, &frost_sig);
+            // Verification with a different key must fail
+            assert!(!pq_verify(&vk2, message, &frost_sig, &sig));
+        });
     }
 
     #[test]
     fn test_pq_wrong_message_rejected() {
-        let (sk, vk) = generate_pq_keypair();
-        let frost_sig = [0x11u8; 64];
+        run_with_large_stack(|| {
+            let (sk, vk) = generate_pq_keypair();
+            let frost_sig = [0x11u8; 64];
 
-        let sig = pq_sign(&sk, b"original", &frost_sig);
-        assert!(!pq_verify(&vk, b"tampered", &frost_sig, &sig));
+            let sig = pq_sign(&sk, b"original", &frost_sig);
+            assert!(!pq_verify(&vk, b"tampered", &frost_sig, &sig));
+        });
     }
 
     #[test]
