@@ -14,32 +14,40 @@ provider "google" {
   zone    = var.zone
 }
 
-# Static IP for the SSO server
+# ── Static IPs ──────────────────────────────────────────────
+
 resource "google_compute_address" "sso_ip" {
-  name   = "milnet-sso-ip"
+  name   = "sso-system-ip"
   region = var.region
 }
 
-# Firewall: allow HTTP (8080) and SSH (22)
+resource "google_compute_address" "demo_ip" {
+  name   = "sso-demo-ip"
+  region = var.region
+}
+
+# ── Firewall ────────────────────────────────────────────────
+
 resource "google_compute_firewall" "sso_allow" {
-  name    = "milnet-sso-allow"
+  name    = "sso-allow-web"
   network = "default"
 
   allow {
     protocol = "tcp"
-    ports    = ["8080", "22", "443"]
+    ports    = ["80", "443", "22"]
   }
 
   source_ranges = ["0.0.0.0/0"]
-  target_tags   = ["milnet-sso"]
+  target_tags   = ["sso-server"]
 }
 
-# The SSO server VM
-resource "google_compute_instance" "sso_server" {
-  name         = "milnet-sso-server"
+# ── VM 1: SSO System (sso-system.dmj.one) ───────────────────
+
+resource "google_compute_instance" "sso_system" {
+  name         = "sso-system"
   machine_type = var.machine_type
   zone         = var.zone
-  tags         = ["milnet-sso"]
+  tags         = ["sso-server"]
 
   boot_disk {
     initialize_params {
@@ -69,12 +77,72 @@ resource "google_compute_instance" "sso_server" {
   }
 }
 
-output "sso_url" {
-  value       = "http://${google_compute_address.sso_ip.address}:8080"
-  description = "MILNET SSO System URL"
+# ── VM 2: Demo App (sso-system-demo.dmj.one) ────────────────
+
+resource "google_compute_instance" "sso_demo" {
+  name         = "sso-demo"
+  machine_type = "e2-small"
+  zone         = var.zone
+  tags         = ["sso-server"]
+
+  boot_disk {
+    initialize_params {
+      image = "projects/debian-cloud/global/images/family/debian-12"
+      size  = 10
+    }
+  }
+
+  network_interface {
+    network = "default"
+    access_config {
+      nat_ip = google_compute_address.demo_ip.address
+    }
+  }
+
+  metadata = {
+    startup-script = file("${path.module}/demo-startup.sh")
+    sso-system-ip  = google_compute_address.sso_ip.address
+  }
+
+  service_account {
+    scopes = ["cloud-platform"]
+  }
+
+  depends_on = [google_compute_instance.sso_system]
+
+  lifecycle {
+    ignore_changes = [metadata["startup-script"]]
+  }
 }
 
-output "ssh_command" {
-  value       = "gcloud compute ssh ${google_compute_instance.sso_server.name} --zone=${var.zone}"
-  description = "SSH into the SSO server"
+# ── Outputs ──────────────────────────────────────────────────
+
+output "sso_system_url" {
+  value       = "http://${google_compute_address.sso_ip.address}"
+  description = "SSO System URL (map A record: sso-system.dmj.one)"
+}
+
+output "demo_app_url" {
+  value       = "http://${google_compute_address.demo_ip.address}"
+  description = "Demo App URL (map A record: sso-system-demo.dmj.one)"
+}
+
+output "sso_system_ip" {
+  value       = google_compute_address.sso_ip.address
+  description = "SSO System IP — set DNS A record for sso-system.dmj.one"
+}
+
+output "demo_app_ip" {
+  value       = google_compute_address.demo_ip.address
+  description = "Demo App IP — set DNS A record for sso-system-demo.dmj.one"
+}
+
+output "ssh_sso" {
+  value       = "gcloud compute ssh sso-system --zone=${var.zone}"
+  description = "SSH into SSO server"
+}
+
+output "ssh_demo" {
+  value       = "gcloud compute ssh sso-demo --zone=${var.zone}"
+  description = "SSH into demo server"
 }

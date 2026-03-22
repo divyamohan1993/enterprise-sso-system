@@ -300,17 +300,36 @@ async fn health_check() -> Json<serde_json::Value> {
 }
 
 async fn setup_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "setup_complete": state.setup_complete.load(Ordering::Relaxed)
-    }))
+    // Check in-memory flag first, then fall back to database
+    if state.setup_complete.load(Ordering::Relaxed) {
+        return Json(serde_json::json!({"setup_complete": true}));
+    }
+    // Check if any users exist in the database (survives restarts)
+    let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or(0);
+    if user_count > 0 {
+        state.setup_complete.store(true, Ordering::Relaxed);
+        return Json(serde_json::json!({"setup_complete": true}));
+    }
+    Json(serde_json::json!({"setup_complete": false}))
 }
 
 async fn initial_setup(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SetupRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // Only allow if no users exist yet
+    // Only allow if no users exist yet (check both memory and DB)
     if state.setup_complete.load(Ordering::Relaxed) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or(0);
+    if user_count > 0 {
+        state.setup_complete.store(true, Ordering::Relaxed);
         return Err(StatusCode::FORBIDDEN);
     }
 
