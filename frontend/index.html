@@ -403,8 +403,13 @@ function decodeJwtPayload(token) {
 
 function fmtTime(ts) {
   if (!ts) return '--';
-  var d = new Date(typeof ts === 'number' ? ts * 1000 : ts);
-  return d.toISOString().replace('T', ' ').slice(0, 19) + 'Z';
+  var n = typeof ts === 'number' ? ts : parseInt(ts);
+  // Detect microseconds (>1e15), milliseconds (>1e12), or seconds
+  if (n > 1e15) n = Math.floor(n / 1000); // microseconds to milliseconds
+  else if (n > 1e12) { /* already milliseconds */ }
+  else n = n * 1000; // seconds to milliseconds
+  try { return new Date(n).toISOString().replace('T', ' ').slice(0, 19) + 'Z'; }
+  catch(e) { return '--'; }
 }
 
 var SCOPE_RANK = { read: 1, write: 2, admin: 3 };
@@ -502,7 +507,7 @@ function buildAuditTable(entries) {
       var tr = document.createElement('tr');
       var td1 = document.createElement('td'); td1.style.whiteSpace = 'nowrap'; td1.textContent = fmtTime(e.timestamp || e.created_at); tr.appendChild(td1);
       var td2 = document.createElement('td'); td2.textContent = e.event_type || e.event || '--'; tr.appendChild(td2);
-      var td3 = document.createElement('td'); td3.textContent = e.user_id || e.user || e.subject || '--'; tr.appendChild(td3);
+      var td3 = document.createElement('td'); td3.textContent = (e.user_ids && e.user_ids.length ? e.user_ids[0].slice(0,8) + '...' : (e.user_id || '--')); tr.appendChild(td3);
       var td4 = document.createElement('td'); td4.style.color = 'var(--text-dim)'; td4.style.maxWidth = '200px'; td4.style.overflow = 'hidden'; td4.style.textOverflow = 'ellipsis'; td4.textContent = e.details || e.description || '--'; tr.appendChild(td4);
       var td5 = document.createElement('td'); td5.style.color = 'var(--text-dim)'; td5.style.fontSize = '0.7rem'; td5.textContent = (e.hash || '--').slice(0, 12) + '...'; tr.appendChild(td5);
       tbody.appendChild(tr);
