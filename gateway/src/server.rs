@@ -168,8 +168,17 @@ async fn forward_to_orchestrator(
         username: auth_req.username.clone(),
         password: auth_req.password.clone(),
         dpop_key_hash: {
-            // Generate a per-connection simulated client DPoP key and compute its hash
-            let client_dpop_key: [u8; 32] = rand::thread_rng().gen();
+            // Read client DPoP public key from the auth request payload
+            // The client must send their Ed25519 public key as the first 32 bytes of the auth frame
+            let auth_payload = &auth_req.password;
+            let client_dpop_key: [u8; 32] = if auth_payload.len() >= 32 {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&auth_payload[..32]);
+                key
+            } else {
+                tracing::warn!("Client did not provide DPoP key — generating ephemeral (NOT spec-compliant)");
+                rand::thread_rng().gen()
+            };
             crypto::dpop::dpop_key_hash(&client_dpop_key)
         },
         tier: 0,                  // Orchestrator decides tier
