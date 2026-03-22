@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MILNET SSO // User Portal</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root { --bg: #0a0a0a; --bg2: #111; --border: #222; --green: #00ff41; --cyan: #00d4ff; --red: #ff3333; --text: #c0c0c0; --dim: #666; --font: 'JetBrains Mono', monospace; }
+body { background: var(--bg); color: var(--text); font-family: var(--font); min-height: 100vh; }
+.header { background: var(--bg2); border-bottom: 1px solid var(--border); padding: 12px 24px; display: flex; justify-content: space-between; align-items: center; }
+.header h1 { font-size: 0.85rem; color: var(--dim); }
+.header h1 span { color: var(--green); font-weight: 700; }
+.header .user-info { display: flex; align-items: center; gap: 12px; font-size: 0.8rem; }
+.header .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); display: inline-block; }
+.header strong { color: var(--cyan); }
+.logout { background: none; border: 1px solid var(--red); color: var(--red); padding: 6px 16px; font-family: var(--font); font-size: 0.75rem; cursor: pointer; border-radius: 3px; }
+.logout:hover { background: var(--red); color: #000; }
+.container { max-width: 900px; margin: 0 auto; padding: 2rem 1.5rem; }
+.card { background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin-bottom: 1.5rem; }
+.card.green { background: #0a1a0a; border-color: #003300; }
+.card.red { border-color: #330000; }
+.card h2 { color: var(--green); font-size: 0.85rem; text-transform: uppercase; margin-bottom: 1rem; }
+.card h2.red { color: var(--red); }
+.card p { color: var(--dim); font-size: 0.8rem; line-height: 1.6; margin-bottom: 1rem; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+.field .label { color: var(--dim); font-size: 0.65rem; text-transform: uppercase; margin-bottom: 4px; }
+.field .val { font-size: 1rem; }
+.field .val.green { color: var(--green); }
+.field .val.cyan { color: var(--cyan); }
+.field .val.small { font-size: 0.7rem; color: var(--dim); word-break: break-all; }
+.portals { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 1rem; }
+.portal { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 1.2rem; }
+.portal:hover { border-color: var(--green); }
+.portal .name { color: var(--cyan); font-weight: 700; margin-bottom: 6px; }
+.portal .meta { color: var(--dim); font-size: 0.7rem; margin-bottom: 8px; }
+.portal .badge { font-size: 0.75rem; padding: 4px 10px; border-radius: 3px; display: inline-block; margin-top: 8px; }
+.portal .badge.ok { background: #002200; border: 1px solid #003300; color: var(--green); }
+.portal .badge.no { background: #1a0000; border: 1px solid #330000; color: var(--red); }
+.info-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #1a1a1a; font-size: 0.8rem; }
+.info-row:last-child { border-bottom: none; }
+.info-row .k { color: var(--green); }
+.info-row .v { color: #fff; }
+.footer { text-align: center; padding: 2rem; color: var(--dim); font-size: 0.7rem; border-top: 1px solid var(--border); margin-top: 2rem; }
+.footer a { color: var(--cyan); text-decoration: none; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1><span>MILNET SSO</span> // USER PORTAL</h1>
+  <div class="user-info">
+    <span class="dot"></span>
+    <strong id="dUser">--</strong>
+    <span id="dTier">--</span>
+    <button class="logout" onclick="doLogout()">LOGOUT</button>
+  </div>
+</div>
+<div class="container">
+  <div class="card green">
+    <h2>// My Profile</h2>
+    <div class="grid2">
+      <div class="field"><div class="label">Username</div><div class="val cyan" id="pUser">--</div></div>
+      <div class="field"><div class="label">Clearance Level</div><div class="val green" id="pTier">--</div></div>
+      <div class="field"><div class="label">User ID</div><div class="val small" id="pId">--</div></div>
+      <div class="field"><div class="label">Session</div><div class="val green">Active</div></div>
+    </div>
+  </div>
+  <div class="card">
+    <h2>// Available Service Portals</h2>
+    <p>Services you can access with your current clearance level.</p>
+    <div class="portals" id="portalsList"></div>
+  </div>
+  <div class="card">
+    <h2>// Session Information</h2>
+    <div class="info-row"><span class="k">Authenticated via</span><span class="v">MILNET SSO (OPAQUE)</span></div>
+    <div class="info-row"><span class="k">Token Type</span><span class="v">HMAC-SHA512</span></div>
+    <div class="info-row"><span class="k">Login Time</span><span class="v" id="loginTime">--</span></div>
+    <div class="info-row"><span class="k">SSO Provider</span><span class="v">sso-system.dmj.one</span></div>
+  </div>
+  <div class="card red">
+    <h2 class="red">// Security Notice</h2>
+    <p>Your session is protected by OPAQUE (server-blind), threshold signing (FROST 3-of-5), and forward-secret ratcheting. Lock your terminal when stepping away. Report suspicious activity immediately.</p>
+  </div>
+</div>
+<div class="footer">MILNET SSO | <a href="https://sso-system.dmj.one">sso-system.dmj.one</a> | <a href="https://dmj.one">Divya Mohan</a></div>
+<script>
+var TN = {1:'Sovereign',2:'Operational',3:'Sensor',4:'Emergency'};
+var PORTALS = [
+  {name:'Intelligence Portal',tier:1,scope:'read',desc:'Classified intelligence briefings'},
+  {name:'Command Dashboard',tier:1,scope:'admin',desc:'Strategic command and control'},
+  {name:'Personnel System',tier:2,scope:'read',desc:'Personnel records and assignments'},
+  {name:'Communications Hub',tier:2,scope:'write',desc:'Secure messaging and signals'},
+  {name:'Logistics Network',tier:3,scope:'read',desc:'Supply chain and resources'},
+  {name:'Sensor Dashboard',tier:3,scope:'read',desc:'Field sensor telemetry'}
+];
+function init(){
+  var t=localStorage.getItem('authToken'), u=localStorage.getItem('username'), tier=parseInt(localStorage.getItem('userTier')||'4');
+  if(!t){window.location.href='/';return;}
+  document.getElementById('dUser').textContent=u||'unknown';
+  document.getElementById('dTier').textContent='[Tier '+tier+']';
+  document.getElementById('pUser').textContent=u||'--';
+  document.getElementById('pTier').textContent='Tier '+tier+' ('+(TN[tier]||'?')+')';
+  document.getElementById('pId').textContent=t.split(':')[0]||'--';
+  document.getElementById('loginTime').textContent=new Date().toISOString().replace('T',' ').substring(0,19)+' UTC';
+  var c=document.getElementById('portalsList');
+  PORTALS.forEach(function(p){
+    var ok=tier<=p.tier;
+    var d=document.createElement('div');d.className='portal';
+    var n=document.createElement('div');n.className='name';n.textContent=p.name;d.appendChild(n);
+    var m=document.createElement('div');m.className='meta';m.textContent='Tier '+p.tier+' ('+TN[p.tier]+') | '+p.scope;d.appendChild(m);
+    var ds=document.createElement('div');ds.textContent=p.desc;d.appendChild(ds);
+    var b=document.createElement('div');b.style.marginTop='10px';
+    var s=document.createElement('span');s.className='badge '+(ok?'ok':'no');s.textContent=ok?'ACCESS GRANTED':'INSUFFICIENT CLEARANCE';
+    b.appendChild(s);d.appendChild(b);c.appendChild(d);
+  });
+}
+function doLogout(){localStorage.removeItem('authToken');localStorage.removeItem('username');localStorage.removeItem('userTier');window.location.href='/';}
+init();
+</script>
+</body>
+</html>

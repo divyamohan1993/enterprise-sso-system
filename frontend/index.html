@@ -215,7 +215,7 @@
     <pre id="tokenClaims" style="font-size:0.8rem;color:var(--green);overflow-x:auto;white-space:pre-wrap;">No active token</pre>
   </div>
 
-  <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;">
+  <div  style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;">
     <div class="card">
       <h2>// REGISTER USER</h2>
       <div class="form-group"><label>Username</label><input type="text" id="regUsername"></div>
@@ -573,11 +573,25 @@ function showPage(name, btn) {
 }
 
 function enterApp() {
+  var tier = tokenClaims ? tokenClaims.tier : 4;
+  var username = tokenClaims ? (tokenClaims.username || localStorage.getItem('username') || 'unknown') : 'unknown';
+
+  // Store tier for the user dashboard page
+  localStorage.setItem('userTier', tier);
+
+  // Non-admin users (Tier 2-4) get their own separate dashboard
+  if (tier !== 1) {
+    window.location.href = '/user-dashboard.html';
+    return;
+  }
+
+  // Tier 1 Sovereign: show the admin panel
   $('page-login').classList.remove('active');
+  $('page-onboarding').classList.remove('active');
   $('mainNav').style.display = 'flex';
   $('userInfo').style.display = '';
-  var tierLabel = tokenClaims && tokenClaims.tier ? ' [Tier ' + tokenClaims.tier + ']' : '';
-  $('currentUser').textContent = (tokenClaims ? (tokenClaims.username || localStorage.getItem('username') || tokenClaims.sub || 'unknown') : 'unknown') + tierLabel;
+  var tierName = TIER_NAMES[tier] || '';
+  $('currentUser').textContent = username + ' [Tier ' + tier + (tierName ? ' ' + tierName : '') + ']';
   showPage('dashboard', $('mainNav').querySelector('button'));
 }
 
