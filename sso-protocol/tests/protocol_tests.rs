@@ -230,6 +230,75 @@ fn test_auth_code_carries_tier() {
     assert_eq!(auth_code.tier, 1);
 }
 
+// ── Additional security property tests ───────────────────────────────────────
+
+#[test]
+fn test_pkce_correct_verifier_succeeds() {
+    let verifier = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+    let challenge = pkce::generate_challenge(verifier);
+    assert!(pkce::verify_pkce(verifier, &challenge));
+}
+
+#[test]
+fn test_pkce_wrong_verifier_fails() {
+    let verifier = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+    let challenge = pkce::generate_challenge(verifier);
+    assert!(!pkce::verify_pkce("WRONG_VERIFIER_VALUE", &challenge));
+}
+
+#[test]
+fn test_authorization_code_single_use() {
+    let mut store = AuthorizationStore::new();
+    let user_id = Uuid::new_v4();
+    let code = store.create_code("c1", "https://x.com/cb", user_id, "openid", None, None);
+    // First consume succeeds
+    assert!(store.consume_code(&code).is_some());
+    // Second consume fails — code already consumed
+    assert!(store.consume_code(&code).is_none());
+}
+
+#[test]
+fn test_token_claims_include_required_fields() {
+    let user_id = Uuid::new_v4();
+    let signing_key = [0xABu8; 64];
+    let token = tokens::create_id_token(
+        "https://issuer.example.com",
+        &user_id,
+        "client-id",
+        Some("nonce-123".into()),
+        &signing_key,
+    );
+    let parts: Vec<&str> = token.split('.').collect();
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let claims_bytes = URL_SAFE_NO_PAD.decode(parts[1]).unwrap();
+    let claims: tokens::IdTokenClaims = serde_json::from_slice(&claims_bytes).unwrap();
+    // All required OIDC fields present
+    assert_eq!(claims.iss, "https://issuer.example.com");
+    assert_eq!(claims.sub, user_id.to_string());
+    assert_eq!(claims.aud, "client-id");
+    assert!(claims.iat > 0);
+    assert!(claims.exp > claims.iat);
+    assert_eq!(claims.nonce.as_deref(), Some("nonce-123"));
+    assert!(claims.auth_time > 0);
+}
+
+#[test]
+fn test_client_registration_produces_unique_ids() {
+    let mut registry = sso_protocol::clients::ClientRegistry::new();
+    let c1 = registry.register("App A", vec!["https://a.com/cb".into()]);
+    let c2 = registry.register("App B", vec!["https://b.com/cb".into()]);
+    assert_ne!(c1.client_id, c2.client_id);
+    assert_ne!(c1.client_secret, c2.client_secret);
+}
+
+#[test]
+fn test_client_validation_rejects_wrong_secret() {
+    let mut registry = sso_protocol::clients::ClientRegistry::new();
+    let client = registry.register("Secure App", vec!["https://s.com/cb".into()]);
+    assert!(registry.validate(&client.client_id, &client.client_secret).is_some());
+    assert!(registry.validate(&client.client_id, "totally-wrong-secret").is_none());
+}
+
 #[test]
 fn test_default_tier_is_2() {
     let user_id = Uuid::new_v4();

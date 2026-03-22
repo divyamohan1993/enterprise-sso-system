@@ -199,6 +199,60 @@ fn risk_response_serialization_round_trip() {
 }
 
 #[test]
+fn high_geo_velocity_triggers_elevated_score() {
+    let engine = RiskEngine::new();
+    let user = Uuid::new_v4();
+    let mut signals = clean_signals();
+    signals.geo_velocity_kmh = 600.0; // above 500 threshold
+    let score = engine.compute_score(&user, &signals);
+    assert!(score >= 0.10, "geo velocity 600 km/h should add at least 0.10, got {score}");
+    assert_eq!(engine.classify(score), RiskLevel::Normal); // 0.10 is still Normal
+}
+
+#[test]
+fn unusual_network_adds_risk() {
+    let engine = RiskEngine::new();
+    let user = Uuid::new_v4();
+    let mut signals = clean_signals();
+    signals.is_unusual_network = true;
+    let score = engine.compute_score(&user, &signals);
+    assert!((score - 0.15).abs() < 0.001, "unusual network should add 0.15, got {score}");
+}
+
+#[test]
+fn unusual_time_adds_risk() {
+    let engine = RiskEngine::new();
+    let user = Uuid::new_v4();
+    let mut signals = clean_signals();
+    signals.is_unusual_time = true;
+    let score = engine.compute_score(&user, &signals);
+    assert!((score - 0.10).abs() < 0.001, "unusual time should add 0.10, got {score}");
+}
+
+#[test]
+fn stale_device_attestation_moderate_risk() {
+    let engine = RiskEngine::new();
+    let user = Uuid::new_v4();
+    let mut signals = clean_signals();
+    signals.device_attestation_age_secs = 400.0; // > 300, < 3600
+    let score = engine.compute_score(&user, &signals);
+    assert!((score - 0.10).abs() < 0.001, "stale attestation (400s) should add 0.10, got {score}");
+}
+
+#[test]
+fn combined_signals_additive() {
+    let engine = RiskEngine::new();
+    let user = Uuid::new_v4();
+    let mut signals = clean_signals();
+    signals.is_unusual_network = true; // +0.15
+    signals.is_unusual_time = true;    // +0.10
+    signals.recent_failed_attempts = 5; // +0.15
+    let score = engine.compute_score(&user, &signals);
+    assert!((score - 0.40).abs() < 0.001, "combined signals should be 0.40, got {score}");
+    assert_eq!(engine.classify(score), RiskLevel::Elevated);
+}
+
+#[test]
 fn risk_request_end_to_end_with_engine() {
     let request = RiskRequest {
         user_id: Uuid::new_v4(),
