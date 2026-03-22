@@ -20,6 +20,21 @@ fn compute_ratchet_tag(ratchet_key: &[u8; 64], claims_bytes: &[u8], epoch: u64) 
     mac.finalize().into_bytes().into()
 }
 
+/// Prepare claims with an optional audience field.
+///
+/// If `audience` is `Some`, sets `claims.aud` to that value.
+/// Another agent is adding `aud: Option<String>` to `TokenClaims` —
+/// this function must be called before serialization so the audience
+/// is included in the signed claims.
+pub fn prepare_claims_with_audience(
+    claims: &TokenClaims,
+    audience: Option<String>,
+) -> TokenClaims {
+    let mut claims = claims.clone();
+    claims.aud = audience;
+    claims
+}
+
 /// Build a threshold-signed token from validated claims (monolithic).
 ///
 /// **Deprecated**: all signer shares live in one process, which defeats
@@ -38,10 +53,14 @@ pub fn build_token(
     group: &ThresholdGroup,
     ratchet_key: &[u8; 64],
     pq_signing_key: &PqSigningKey,
+    audience: Option<String>,
 ) -> Result<Token, MilnetError> {
+    // Apply audience to claims before signing
+    let claims = prepare_claims_with_audience(claims, audience);
+
     // Domain-separated message
     let claims_bytes =
-        postcard::to_allocvec(claims).map_err(|e| MilnetError::Serialization(e.to_string()))?;
+        postcard::to_allocvec(&claims).map_err(|e| MilnetError::Serialization(e.to_string()))?;
     let msg = [domain::FROST_TOKEN, &claims_bytes].concat();
 
     // Compute real ratchet tag
@@ -60,7 +79,7 @@ pub fn build_token(
             algorithm: 1,
             tier: claims.tier,
         },
-        claims: claims.clone(),
+        claims,
         ratchet_tag,
         frost_signature,
         pq_signature,
@@ -84,10 +103,14 @@ pub fn build_token_distributed(
     signers: &mut [&mut SignerNode],
     ratchet_key: &[u8; 64],
     pq_signing_key: &PqSigningKey,
+    audience: Option<String>,
 ) -> Result<Token, MilnetError> {
+    // Apply audience to claims before signing
+    let claims = prepare_claims_with_audience(claims, audience);
+
     // Domain-separated message
     let claims_bytes =
-        postcard::to_allocvec(claims).map_err(|e| MilnetError::Serialization(e.to_string()))?;
+        postcard::to_allocvec(&claims).map_err(|e| MilnetError::Serialization(e.to_string()))?;
     let msg = [domain::FROST_TOKEN, &claims_bytes].concat();
 
     // Compute real ratchet tag
@@ -107,7 +130,7 @@ pub fn build_token_distributed(
             algorithm: 1,
             tier: claims.tier,
         },
-        claims: claims.clone(),
+        claims,
         ratchet_tag,
         frost_signature,
         pq_signature,

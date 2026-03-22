@@ -128,13 +128,14 @@ fn expired_token_rejected() {
         tier: 2,
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
+        aud: None,
     };
 
     let (pq_sk, pq_vk) = generate_pq_keypair();
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
     let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
     let token =
-        build_token_distributed(&claims, &coordinator, &mut signers, &[0x55u8; 64], &pq_sk).expect("build token should succeed");
+        build_token_distributed(&claims, &coordinator, &mut signers, &[0x55u8; 64], &pq_sk, None).expect("build token should succeed");
 
     let result = verify_token(&token, &group_key, &pq_vk);
     assert!(result.is_err(), "expired token must be rejected");
@@ -164,13 +165,14 @@ fn tampered_token_rejected() {
         tier: 2,
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
+        aud: None,
     };
 
     let (pq_sk, pq_vk) = generate_pq_keypair();
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
     let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
     let mut token =
-        build_token_distributed(&claims, &coordinator, &mut signers, &[0x55u8; 64], &pq_sk).expect("build token should succeed");
+        build_token_distributed(&claims, &coordinator, &mut signers, &[0x55u8; 64], &pq_sk, None).expect("build token should succeed");
 
     // Tamper with claims — change the tier
     token.claims.tier = 1;

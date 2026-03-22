@@ -156,7 +156,7 @@ pub struct XWingKeyPair {
 impl XWingKeyPair {
     /// Generate a new random key pair.
     pub fn generate() -> Self {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rngs::OsRng;
         let x25519_secret = StaticSecret::random_from_rng(&mut rng);
         let x25519_public = PublicKey::from(&x25519_secret);
         let (ml_kem_dk, ml_kem_ek) = MlKem1024::generate(&mut rng);
@@ -185,7 +185,17 @@ impl XWingKeyPair {
 /// Zeroize the secret key material on drop.
 impl Drop for XWingKeyPair {
     fn drop(&mut self) {
+        // Zeroize the X25519 secret key
         self.x25519_secret = StaticSecret::from([0u8; 32]);
+        // Zeroize the ML-KEM decapsulation key (several KB of PQ private key material).
+        // DecapsulationKey does not impl Zeroize, so we zero the underlying bytes via
+        // pointer write. This is critical — leaking the PQ decapsulation key would
+        // allow an attacker to recover all shared secrets.
+        unsafe {
+            let ptr = &mut self.ml_kem_dk as *mut _ as *mut u8;
+            let size = core::mem::size_of::<<MlKem1024 as KemCore>::DecapsulationKey>();
+            core::ptr::write_bytes(ptr, 0, size);
+        }
     }
 }
 
@@ -224,7 +234,7 @@ fn combine(
 /// Returns `(shared_secret, ciphertext)`. The ciphertext must be sent to
 /// the server so it can decapsulate.
 pub fn xwing_encapsulate(server_pk: &XWingPublicKey) -> (SharedSecret, Ciphertext) {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rngs::OsRng;
 
     // Ephemeral X25519 key pair for this session.
     let eph_secret = EphemeralSecret::random_from_rng(&mut rng);

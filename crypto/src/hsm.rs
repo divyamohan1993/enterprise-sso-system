@@ -507,7 +507,13 @@ impl HsmKeyManager {
                 let seed = config
                     .software_seed
                     .as_deref()
-                    .unwrap_or(b"MILNET-DEV-MASTER-KEK-NOT-FOR-PRODUCTION");
+                    .unwrap_or_else(|| {
+                        if std::env::var("MILNET_PRODUCTION").is_ok() {
+                            panic!("FATAL: No master KEK seed configured in PRODUCTION mode. Set MILNET_MASTER_KEK or provide software_seed");
+                        }
+                        eprintln!("SECURITY WARNING: Using deterministic dev seed. NOT FOR PRODUCTION.");
+                        b"MILNET-DEV-MASTER-KEK-NOT-FOR-PRODUCTION"
+                    });
                 let source = SoftwareKeySource::new(seed)
                     .map_err(|e| HsmError::InitializationFailed(format!("{e}")))?;
                 eprintln!(

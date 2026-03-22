@@ -58,7 +58,7 @@ fn test_authorization_code_create_and_consume() {
         "openid profile",
         Some("challenge-value".into()),
         Some("nonce-value".into()),
-    );
+    ).unwrap();
 
     // Code should be consumable exactly once
     let auth_code = store.consume_code(&code).expect("code should be valid");
@@ -86,7 +86,7 @@ fn test_authorization_code_expires() {
     assert!(store.consume_code("nonexistent-code").is_none());
 
     // Create and immediately consume should work (not expired)
-    let code = store.create_code("c", "https://x.com/cb", user_id, "openid", None, None);
+    let code = store.create_code("c", "https://x.com/cb", user_id, "openid", Some("dummy-challenge".into()), None).unwrap();
     assert!(store.consume_code(&code).is_some());
 }
 
@@ -213,10 +213,10 @@ fn test_auth_code_carries_tier() {
         "https://app.example.com/callback",
         user_id,
         "openid",
-        None,
+        Some("dummy-challenge".into()),
         None,
         1, // Sovereign
-    );
+    ).unwrap();
 
     let auth_code = store.consume_code(&code).expect("code should be valid");
     assert_eq!(auth_code.tier, 1);
@@ -242,7 +242,7 @@ fn test_pkce_wrong_verifier_fails() {
 fn test_authorization_code_single_use() {
     let mut store = AuthorizationStore::new();
     let user_id = Uuid::new_v4();
-    let code = store.create_code("c1", "https://x.com/cb", user_id, "openid", None, None);
+    let code = store.create_code("c1", "https://x.com/cb", user_id, "openid", Some("dummy-challenge".into()), None).unwrap();
     // First consume succeeds
     assert!(store.consume_code(&code).is_some());
     // Second consume fails — code already consumed

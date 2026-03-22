@@ -110,6 +110,7 @@ fn future_claims() -> TokenClaims {
         tier: 2,
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
+        aud: None,
     }
 }
 
@@ -152,6 +153,7 @@ fn expired_token_rejected() {
         tier: 1,
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
+        aud: None,
     };
 
     let token = build_signed_token_legacy(&mut dkg, claims, &pq_sk);

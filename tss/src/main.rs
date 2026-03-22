@@ -134,6 +134,7 @@ async fn main() {
                             &mut signers,
                             &request.ratchet_key,
                             &pq_signing_key,
+                            request.claims.aud.clone(),
                         )
                     };
 

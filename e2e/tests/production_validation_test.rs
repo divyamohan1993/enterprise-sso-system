@@ -42,6 +42,8 @@ use tss::validator::validate_receipt_chain;
 use verifier::verify::verify_token;
 use uuid::Uuid;
 
+use e2e::{client_auth, send_frame, recv_frame, send_raw_frame, recv_raw_frame};
+
 // ── Constants ────────────────────────────────────────────────────────────
 
 const SHARD_HMAC_KEY: [u8; 64] = [0x37u8; 64];
@@ -61,36 +63,6 @@ fn now_us() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_micros() as i64
-}
-
-async fn send_frame<T: serde::Serialize>(stream: &mut TcpStream, value: &T) -> Result<(), String> {
-    let payload = postcard::to_allocvec(value).map_err(|e| format!("serialize: {e}"))?;
-    let len = payload.len() as u32;
-    stream
-        .write_all(&len.to_be_bytes())
-        .await
-        .map_err(|e| format!("write length: {e}"))?;
-    stream
-        .write_all(&payload)
-        .await
-        .map_err(|e| format!("write payload: {e}"))?;
-    stream.flush().await.map_err(|e| format!("flush: {e}"))?;
-    Ok(())
-}
-
-async fn recv_frame<T: serde::de::DeserializeOwned>(stream: &mut TcpStream) -> Result<T, String> {
-    let mut len_buf = [0u8; 4];
-    stream
-        .read_exact(&mut len_buf)
-        .await
-        .map_err(|e| format!("read length: {e}"))?;
-    let len = u32::from_be_bytes(len_buf);
-    let mut buf = vec![0u8; len as usize];
-    stream
-        .read_exact(&mut buf)
-        .await
-        .map_err(|e| format!("read payload: {e}"))?;
-    postcard::from_bytes(&buf).map_err(|e| format!("deserialize: {e}"))
 }
 
 // ── Service boot helpers (reused from tier2_ceremony_test pattern) ───────
@@ -139,7 +111,8 @@ async fn boot_opaque(store: CredentialStore) -> String {
                                 let (_sender, payload2) = match transport.recv().await { Ok(r) => r, Err(_) => return };
                                 let req2: OpaqueRequest = match postcard::from_bytes(&payload2) { Ok(r) => r, Err(_) => return };
                                 if let OpaqueRequest::LoginFinish { credential_finalization } = req2 {
-                                    let response = opaque::service::handle_login_finish(server_login, &credential_finalization, &RECEIPT_SIGNING_KEY, user_id, ceremony_session_id, dpop_key_hash);
+                                    let receipt_signer = opaque::service::ReceiptSigner::new(RECEIPT_SIGNING_KEY);
+                                    let response = opaque::service::handle_login_finish(server_login, &credential_finalization, &receipt_signer, user_id, ceremony_session_id, dpop_key_hash);
                                     let resp_bytes = postcard::to_allocvec(&response).unwrap();
                                     let _ = transport.send(&resp_bytes).await;
                                 }
@@ -202,7 +175,7 @@ async fn boot_tss(
                     Ok(()) => {
                         let mut signers: Vec<&mut _> =
                             nodes.iter_mut().take(coordinator.threshold).collect();
-                        match build_token_distributed(&request.claims, &coordinator, &mut signers, &request.ratchet_key, &pq_signing_key) {
+                        match build_token_distributed(&request.claims, &coordinator, &mut signers, &request.ratchet_key, &pq_signing_key, None) {
                             Ok(token) => {
                                 let token_bytes =
                                     postcard::to_allocvec(&token).expect("serialize token");
@@ -243,7 +216,7 @@ async fn boot_orchestrator(opaque_addr: String, tss_addr: String) -> String {
         .to_string();
 
     let service =
-        OrchestratorService::new(SHARD_HMAC_KEY, opaque_addr, tss_addr, RECEIPT_SIGNING_KEY);
+        OrchestratorService::new(SHARD_HMAC_KEY, opaque_addr, tss_addr);
 
     tokio::spawn(async move {
         loop {
@@ -312,39 +285,6 @@ async fn boot_full_system(
     (gateway_addr, group_verifying_key)
 }
 
-/// Run a full client auth flow against a gateway, returning the AuthResponse.
-async fn client_auth(gateway_addr: &str, username: &str, password: &[u8]) -> AuthResponse {
-    let mut stream = TcpStream::connect(gateway_addr)
-        .await
-        .expect("connect to gateway");
-
-    let challenge: PuzzleChallenge = recv_frame(&mut stream)
-        .await
-        .expect("receive puzzle challenge");
-
-    let solution_bytes = solve_challenge(&challenge);
-    let solution = PuzzleSolution {
-        nonce: challenge.nonce,
-        solution: solution_bytes,
-        xwing_client_pk: None,
-    };
-    send_frame(&mut stream, &solution)
-        .await
-        .expect("send puzzle solution");
-
-    let auth_req = AuthRequest {
-        username: username.to_string(),
-        password: password.to_vec(),
-    };
-    send_frame(&mut stream, &auth_req)
-        .await
-        .expect("send auth request");
-
-    recv_frame(&mut stream)
-        .await
-        .expect("receive auth response")
-}
-
 fn build_valid_receipt_chain(signing_key: &[u8; 64]) -> Vec<Receipt> {
     let session_id = [0x01; 32];
     let user_id = Uuid::nil();
@@ -395,10 +335,11 @@ fn make_valid_token_and_key() -> (Token, frost_ristretto255::keys::PublicKeyPack
         tier: 2,
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
+        aud: None,
     };
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
     let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
-    let token = build_token_distributed(&claims, &coordinator, &mut signers, &[0x55u8; 64], test_pq_sk())
+    let token = build_token_distributed(&claims, &coordinator, &mut signers, &[0x55u8; 64], test_pq_sk(), None)
         .expect("build token should succeed");
     (token, group_key)
 }
@@ -639,6 +580,7 @@ fn test_token_signature_cannot_be_transplanted() {
         tier: 2,
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
+        aud: None,
     };
     let claims_b = TokenClaims {
         sub: Uuid::new_v4(),
@@ -651,15 +593,16 @@ fn test_token_signature_cannot_be_transplanted() {
         tier: 2,
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
+        aud: None,
     };
 
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
     let (pq_sk, _pq_vk) = crypto::pq_sign::generate_pq_keypair();
     let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
     let token_a =
-        build_token_distributed(&claims_a, &coordinator, &mut signers, &[0x55u8; 64], test_pq_sk()).expect("build token A");
+        build_token_distributed(&claims_a, &coordinator, &mut signers, &[0x55u8; 64], test_pq_sk(), None).expect("build token A");
     let token_b =
-        build_token_distributed(&claims_b, &coordinator, &mut signers, &[0x55u8; 64], test_pq_sk()).expect("build token B");
+        build_token_distributed(&claims_b, &coordinator, &mut signers, &[0x55u8; 64], test_pq_sk(), None).expect("build token B");
 
     // Transplant A's signature onto B's claims
     let franken_token = Token {
@@ -691,12 +634,13 @@ fn test_expired_token_rejected() {
         tier: 2,
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
+        aud: None,
     };
 
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
     let (pq_sk, _pq_vk) = crypto::pq_sign::generate_pq_keypair();
     let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
-    let token = build_token_distributed(&claims, &coordinator, &mut signers, &[0x55u8; 64], test_pq_sk())
+    let token = build_token_distributed(&claims, &coordinator, &mut signers, &[0x55u8; 64], test_pq_sk(), None)
         .expect("build token should succeed");
 
     let result = verify_token(&token, &group_key, test_pq_vk());
@@ -721,11 +665,12 @@ fn test_token_from_different_dkg_rejected() {
         tier: 2,
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
+        aud: None,
     };
     let (coordinator1, mut nodes1) = distribute_shares(&mut dkg1);
     let (pq_sk, _pq_vk) = crypto::pq_sign::generate_pq_keypair();
     let mut signers1: Vec<&mut _> = nodes1.iter_mut().take(3).collect();
-    let token = build_token_distributed(&claims, &coordinator1, &mut signers1, &[0x55u8; 64], test_pq_sk())
+    let token = build_token_distributed(&claims, &coordinator1, &mut signers1, &[0x55u8; 64], test_pq_sk(), None)
         .expect("build token with group 1");
 
     // Group 2 (different DKG)

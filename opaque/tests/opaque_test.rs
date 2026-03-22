@@ -128,10 +128,11 @@ fn full_login_flow_succeeds_with_correct_password() {
     let credential_finalization_bytes = client_login_finish.message.serialize().to_vec();
 
     // Login Step 4: Server finishes login
+    let receipt_signer = opaque::service::ReceiptSigner::new(SIGNING_KEY);
     let response = handle_login_finish(
         server_login,
         &credential_finalization_bytes,
-        &SIGNING_KEY,
+        &receipt_signer,
         user_id,
         ceremony_session_id,
         dpop_key_hash,
@@ -241,10 +242,11 @@ fn receipt_has_correct_fields() {
         )
         .unwrap();
 
+    let receipt_signer2 = opaque::service::ReceiptSigner::new(SIGNING_KEY);
     let response = handle_login_finish(
         server_login,
         &client_finish.message.serialize().to_vec(),
-        &SIGNING_KEY,
+        &receipt_signer2,
         user_id,
         session_id,
         dpop_hash,

@@ -148,15 +148,19 @@ version = "0.1.0"
 dependencies = [
  "common",
  "crypto",
+ "getrandom 0.2.17",
  "hex",
+ "ml-dsa",
  "postcard",
  "serde",
+ "serde_json",
  "sha2",
  "shard",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -545,6 +549,7 @@ dependencies = [
  "libc",
  "ml-dsa",
  "ml-kem",
+ "p256",
  "rand 0.8.5",
  "sha2",
  "sha3 0.10.8",
@@ -741,11 +746,13 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 name = "e2e"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "audit",
  "common",
  "crypto",
  "frost-ristretto255",
  "gateway",
+ "getrandom 0.2.17",
  "hmac",
  "kt",
  "opaque",
@@ -1079,8 +1086,10 @@ dependencies = [
 name = "gateway"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "common",
  "crypto",
+ "getrandom 0.2.17",
  "postcard",
  "rand 0.8.5",
  "rcgen",

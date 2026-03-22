@@ -27,6 +27,8 @@ use tss::token_builder::build_token_distributed;
 use tss::validator::validate_receipt_chain;
 use verifier::verify::verify_token;
 
+use e2e::{client_auth, send_frame, recv_frame, send_raw_frame, recv_raw_frame};
+
 // ── Constants ────────────────────────────────────────────────────────────
 
 const SHARD_HMAC_KEY: [u8; 64] = [0x37u8; 64];
@@ -47,36 +49,6 @@ fn now_us() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_micros() as i64
-}
-
-async fn send_frame<T: serde::Serialize>(stream: &mut TcpStream, value: &T) -> Result<(), String> {
-    let payload = postcard::to_allocvec(value).map_err(|e| format!("serialize: {e}"))?;
-    let len = payload.len() as u32;
-    stream
-        .write_all(&len.to_be_bytes())
-        .await
-        .map_err(|e| format!("write length: {e}"))?;
-    stream
-        .write_all(&payload)
-        .await
-        .map_err(|e| format!("write payload: {e}"))?;
-    stream.flush().await.map_err(|e| format!("flush: {e}"))?;
-    Ok(())
-}
-
-async fn recv_frame<T: serde::de::DeserializeOwned>(stream: &mut TcpStream) -> Result<T, String> {
-    let mut len_buf = [0u8; 4];
-    stream
-        .read_exact(&mut len_buf)
-        .await
-        .map_err(|e| format!("read length: {e}"))?;
-    let len = u32::from_be_bytes(len_buf);
-    let mut buf = vec![0u8; len as usize];
-    stream
-        .read_exact(&mut buf)
-        .await
-        .map_err(|e| format!("read payload: {e}"))?;
-    postcard::from_bytes(&buf).map_err(|e| format!("deserialize: {e}"))
 }
 
 // ── Service boot helpers ─────────────────────────────────────────────────
@@ -125,7 +97,8 @@ async fn boot_opaque(store: CredentialStore) -> String {
                                 let (_sender, payload2) = match transport.recv().await { Ok(r) => r, Err(_) => return };
                                 let req2: OpaqueRequest = match postcard::from_bytes(&payload2) { Ok(r) => r, Err(_) => return };
                                 if let OpaqueRequest::LoginFinish { credential_finalization } = req2 {
-                                    let response = opaque::service::handle_login_finish(server_login, &credential_finalization, &RECEIPT_SIGNING_KEY, user_id, ceremony_session_id, dpop_key_hash);
+                                    let receipt_signer = opaque::service::ReceiptSigner::new(RECEIPT_SIGNING_KEY);
+                                    let response = opaque::service::handle_login_finish(server_login, &credential_finalization, &receipt_signer, user_id, ceremony_session_id, dpop_key_hash);
                                     let resp_bytes = postcard::to_allocvec(&response).unwrap();
                                     let _ = transport.send(&resp_bytes).await;
                                 }
@@ -184,7 +157,7 @@ async fn boot_tss(coordinator: SigningCoordinator, mut nodes: Vec<SignerNode>, p
                     Ok(()) => {
                         let mut signers: Vec<&mut _> =
                             nodes.iter_mut().take(coordinator.threshold).collect();
-                        match build_token_distributed(&request.claims, &coordinator, &mut signers, &request.ratchet_key, &pq_signing_key) {
+                        match build_token_distributed(&request.claims, &coordinator, &mut signers, &request.ratchet_key, &pq_signing_key, None) {
                             Ok(token) => {
                                 let token_bytes =
                                     postcard::to_allocvec(&token).expect("serialize token");
@@ -226,7 +199,7 @@ async fn boot_orchestrator(opaque_addr: String, tss_addr: String) -> String {
         .to_string();
 
     let service =
-        OrchestratorService::new(SHARD_HMAC_KEY, opaque_addr, tss_addr, RECEIPT_SIGNING_KEY);
+        OrchestratorService::new(SHARD_HMAC_KEY, opaque_addr, tss_addr);
 
     tokio::spawn(async move {
         loop {
@@ -295,39 +268,6 @@ async fn boot_full_system(
     (gateway_addr, group_verifying_key, test_pq_vk().clone())
 }
 
-/// Run a full client auth flow against a gateway, returning the AuthResponse.
-async fn client_auth(gateway_addr: &str, username: &str, password: &[u8]) -> AuthResponse {
-    let mut stream = TcpStream::connect(gateway_addr)
-        .await
-        .expect("connect to gateway");
-
-    let challenge: PuzzleChallenge = recv_frame(&mut stream)
-        .await
-        .expect("receive puzzle challenge");
-
-    let solution_bytes = solve_challenge(&challenge);
-    let solution = PuzzleSolution {
-        nonce: challenge.nonce,
-        solution: solution_bytes,
-        xwing_client_pk: None,
-    };
-    send_frame(&mut stream, &solution)
-        .await
-        .expect("send puzzle solution");
-
-    let auth_req = AuthRequest {
-        username: username.to_string(),
-        password: password.to_vec(),
-    };
-    send_frame(&mut stream, &auth_req)
-        .await
-        .expect("send auth request");
-
-    recv_frame(&mut stream)
-        .await
-        .expect("receive auth response")
-}
-
 // ── ServicePortal ────────────────────────────────────────────────────────
 
 /// Simulated service portal that verifies tokens independently.
@@ -386,7 +326,7 @@ fn build_signed_token(
     coordinator: &SigningCoordinator,
     signers: &mut [&mut SignerNode],
 ) -> Token {
-    build_token_distributed(claims, coordinator, signers, &HELPER_RATCHET_KEY, test_pq_sk()).expect("build_token_distributed should succeed")
+    build_token_distributed(claims, coordinator, signers, &HELPER_RATCHET_KEY, test_pq_sk(), None).expect("build_token_distributed should succeed")
 }
 
 /// Helper: create standard claims with configurable tier and scope.
@@ -403,6 +343,7 @@ fn make_claims(user_id: Uuid, tier: u8, scope: u32, ttl_secs: u64) -> TokenClaim
         tier,
         ratchet_epoch: 0,
         token_id: [0xAB; 16],
+        aud: None,
     }
 }
 
@@ -695,6 +636,7 @@ async fn test_attack_expired_token_at_portal() {
         tier: 2,
         ratchet_epoch: 0,
         token_id: [0xAC; 16],
+        aud: None,
     };
     let mut signer_refs: Vec<&mut _> = nodes.iter_mut().take(3).collect();
     let token = build_signed_token(&claims, &coordinator, &mut signer_refs);

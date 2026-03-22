@@ -18,9 +18,10 @@ async fn main() {
 
     // In production these would be loaded from an HSM / sealed config.
     let hmac_key = generate_key_64();
-    let receipt_signing_key = generate_key_64();
 
-    let service = OrchestratorService::new(hmac_key, opaque_addr, tss_addr, receipt_signing_key);
+    // SECURITY: No receipt_signing_key — receipts are signed solely by the
+    // OPAQUE service and forwarded to the TSS without re-signing.
+    let service = OrchestratorService::new(hmac_key, opaque_addr, tss_addr);
 
     tracing::info!("Starting orchestrator on {listen_addr}");
     if let Err(e) = service.run(&listen_addr).await {

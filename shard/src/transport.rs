@@ -161,9 +161,29 @@ impl ShardListener {
         let protocol = ShardProtocol::new(self.module_id, self.hmac_key);
         Ok(ShardTransport::new(stream, protocol))
     }
+
+    /// Accept a single inbound connection with communication matrix enforcement.
+    ///
+    /// Validates that `sender_module` is permitted to communicate with this
+    /// listener's module before returning the transport.
+    pub async fn accept_checked(
+        &self,
+        sender_module: ModuleId,
+    ) -> Result<ShardTransport, MilnetError> {
+        common::network::enforce_channel(sender_module, self.module_id)
+            .map_err(|e| MilnetError::Shard(format!(
+                "channel {sender_module:?} -> {:?} denied: {e}",
+                self.module_id
+            )))?;
+        self.accept().await
+    }
 }
 
 /// Connect to a remote SHARD peer and return a [`ShardTransport`].
+///
+/// Validates the communication channel against the module communication
+/// matrix before establishing the connection.  `module_id` is the local
+/// (sender) module; `peer_module` is the remote (receiver) module.
 pub async fn connect(
     addr: &str,
     module_id: ModuleId,
@@ -174,4 +194,22 @@ pub async fn connect(
         .map_err(|e| MilnetError::Shard(format!("connect {addr}: {e}")))?;
     let protocol = ShardProtocol::new(module_id, hmac_key);
     Ok(ShardTransport::new(stream, protocol))
+}
+
+/// Connect to a remote SHARD peer with communication matrix enforcement.
+///
+/// Like [`connect`], but additionally validates that `sender_module` is
+/// permitted to communicate with `receiver_module` per the module
+/// communication matrix before establishing the TCP connection.
+pub async fn connect_checked(
+    addr: &str,
+    sender_module: ModuleId,
+    receiver_module: ModuleId,
+    hmac_key: [u8; 64],
+) -> Result<ShardTransport, MilnetError> {
+    common::network::enforce_channel(sender_module, receiver_module)
+        .map_err(|e| MilnetError::Shard(format!(
+            "channel {sender_module:?} -> {receiver_module:?} denied: {e}"
+        )))?;
+    connect(addr, sender_module, hmac_key).await
 }

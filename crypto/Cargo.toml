@@ -23,6 +23,7 @@ ml-dsa.workspace = true
 ml-kem.workspace = true
 aes-gcm.workspace = true
 chacha20poly1305.workspace = true
+p256.workspace = true
 libc.workspace = true
 tracing.workspace = true
 

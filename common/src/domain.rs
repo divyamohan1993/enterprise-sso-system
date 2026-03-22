@@ -25,5 +25,5 @@ pub const ENVELOPE_AAD: &[u8] = b"MILNET-SSO-v1-ENVELOPE-AAD";
 pub const KEY_WRAP: &[u8] = b"MILNET-SSO-v1-KEY-WRAP";
 pub const SEAL_KEY: &[u8] = b"MILNET-SSO-v1-SEAL";
 pub const MASTER_KEK_DERIVE: &[u8] = b"MILNET-SSO-v1-MASTER-KEK";
-pub const ATTEST_MANIFEST: &[u8] = b"MILNET-SSO-v1-ATTEST";
+pub const ATTEST_MANIFEST: &[u8] = b"MILNET-SSO-v1-ATTEST-MANIFEST";
 pub const ENTROPY_COMBINE: &[u8] = b"MILNET-SSO-v1-ENTROPY";

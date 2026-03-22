@@ -82,15 +82,22 @@ impl SovereignCeremony {
         };
     }
 
-    /// Proceed after abort window (requires explicit proceed from all participants)
+    /// Proceed after abort window (requires explicit proceed from all participants).
+    ///
+    /// SECURITY: Enforces that the abort deadline has actually passed before
+    /// allowing the transition to the cooling period.
     pub fn proceed_to_cooling(&mut self) -> Result<(), String> {
         match &self.state {
             SovereignState::AbortWindow {
-                deadline: _,
+                deadline,
                 participants,
                 action,
             } => {
-                let cooling_expires = now_us() + 900_000_000; // 15 minutes
+                let now = now_us();
+                if now < *deadline {
+                    return Err("Cannot proceed: abort window has not expired".into());
+                }
+                let cooling_expires = now + 900_000_000; // 15 minutes
                 self.state = SovereignState::CoolingPeriod {
                     expires: cooling_expires,
                     participants: participants.clone(),

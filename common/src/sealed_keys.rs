@@ -44,8 +44,14 @@ pub fn load_master_kek() -> [u8; 32] {
             std::env::remove_var("MILNET_MASTER_KEK");
             let mut key = [0u8; 32];
             for (i, chunk) in hex_str.as_bytes().chunks(2).take(32).enumerate() {
-                let hex = std::str::from_utf8(chunk).unwrap_or("00");
-                key[i] = u8::from_str_radix(hex, 16).unwrap_or(0);
+                let hex = std::str::from_utf8(chunk)
+                    .unwrap_or_else(|_| panic!("FATAL: MILNET_MASTER_KEK contains invalid UTF-8 at byte {}", i * 2));
+                key[i] = u8::from_str_radix(hex, 16)
+                    .unwrap_or_else(|_| panic!("FATAL: MILNET_MASTER_KEK contains invalid hex '{}' at position {}", hex, i * 2));
+            }
+            // Reject all-zero keys
+            if key.iter().all(|&b| b == 0) {
+                panic!("FATAL: all-zero key detected in MILNET_MASTER_KEK");
             }
             // Zeroize the hex string in memory
             zeroize_string(&mut hex_str);
@@ -61,6 +67,10 @@ pub fn load_master_kek() -> [u8; 32] {
             use sha2::{Digest, Sha256};
             let hash = Sha256::digest(b"MILNET-DEV-MASTER-KEK-NOT-FOR-PRODUCTION");
             key.copy_from_slice(&hash);
+            // Reject all-zero keys even in dev mode
+            if key.iter().all(|&b| b == 0) {
+                panic!("FATAL: all-zero key detected in dev master KEK derivation");
+            }
             key
         }
     }
@@ -101,6 +111,10 @@ fn load_key_hardened(var: &str, purpose: &str, dev_seed: &[u8]) -> [u8; 64] {
         zeroize_string(&mut hex_str);
         hex_str.zeroize();
         if let Some(key) = result {
+            // Reject all-zero keys
+            if key.iter().all(|&b| b == 0) {
+                panic!("FATAL: all-zero key detected after unsealing {var}");
+            }
             eprintln!("INFO: {var} loaded from sealed storage.");
             return key;
         }
@@ -124,8 +138,14 @@ fn load_key_hardened(var: &str, purpose: &str, dev_seed: &[u8]) -> [u8; 64] {
             eprintln!("WARNING: {var} loaded as raw plaintext. Use sealed keys in production.");
             let mut key = [0u8; 64];
             for (i, chunk) in hex_str.as_bytes().chunks(2).take(64).enumerate() {
-                let hex = std::str::from_utf8(chunk).unwrap_or("00");
-                key[i] = u8::from_str_radix(hex, 16).unwrap_or(0);
+                let hex = std::str::from_utf8(chunk)
+                    .unwrap_or_else(|_| panic!("FATAL: {var} contains invalid UTF-8 at byte {}", i * 2));
+                key[i] = u8::from_str_radix(hex, 16)
+                    .unwrap_or_else(|_| panic!("FATAL: {var} contains invalid hex '{}' at position {}", hex, i * 2));
+            }
+            // Reject all-zero keys
+            if key.iter().all(|&b| b == 0) {
+                panic!("FATAL: all-zero key detected in {var}");
             }
             zeroize_string(&mut hex_str);
             hex_str.zeroize();
@@ -208,6 +228,10 @@ fn deterministic_dev_key(seed: &[u8]) -> [u8; 64] {
     let hash = Sha512::digest(seed);
     let mut key = [0u8; 64];
     key.copy_from_slice(&hash);
+    // Reject all-zero keys
+    if key.iter().all(|&b| b == 0) {
+        panic!("FATAL: all-zero key detected in deterministic dev key derivation");
+    }
     key
 }
 

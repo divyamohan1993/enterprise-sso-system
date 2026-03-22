@@ -25,9 +25,10 @@ for i in $(seq 1 30); do
 done
 
 # Create user and database
-su - postgres -c "psql -c \"CREATE USER milnet WITH PASSWORD 'milnet_secure';\"" 2>/dev/null || true
+su - postgres -c "psql -c \"CREATE USER milnet WITH PASSWORD '${MILNET_DB_PASSWORD}';\"" 2>/dev/null || true
 su - postgres -c "psql -c \"CREATE DATABASE milnet_sso OWNER milnet;\"" 2>/dev/null || true
 
-# Start the admin server — cd to /opt so ServeDir::new("frontend") resolves to /opt/frontend/
+# Start the admin server as non-root milnet user
+# cd to /opt so ServeDir::new("frontend") resolves to /opt/frontend/
 cd /opt
-exec /usr/local/bin/admin
+exec su -s /bin/bash milnet -c "/usr/local/bin/admin"

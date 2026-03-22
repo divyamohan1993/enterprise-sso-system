@@ -154,7 +154,7 @@ registries = [
 # Lint level for when multiple versions of the same crate are detected
 multiple-versions = "warn"
 # Lint level for when a crate version requirement is `*`
-wildcards = "allow"
+wildcards = "deny"
 # The graph highlighting used when creating dotgraphs for crates
 # with multiple versions
 # * lowest-version - The path to the lowest versioned duplicate is highlighted
@@ -180,11 +180,10 @@ allow = [
 allow-workspace = false
 # List of crates to deny
 deny = [
-    #"ansi_term@0.11.0",
-    #{ crate = "ansi_term@0.11.0", reason = "you can specify a reason it is banned" },
-    # Wrapper crates can optionally be specified to allow the crate when it
-    # is a direct dependency of the otherwise banned crate
-    #{ crate = "ansi_term@0.11.0", wrappers = ["this-crate-directly-depends-on-ansi_term"] },
+    { crate = "openssl", reason = "Use rustls instead for TLS — openssl has a large C attack surface" },
+    { crate = "openssl-sys", reason = "Use rustls instead — avoid linking to OpenSSL C library" },
+    { crate = "cmake", reason = "Avoid C/C++ build dependencies — prefer pure-Rust crates" },
+    { crate = "cpython", reason = "Avoid embedding CPython — use pure-Rust alternatives" },
 ]
 
 # List of features to allow/deny

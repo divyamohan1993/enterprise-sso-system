@@ -44,15 +44,52 @@ impl MerkleTree {
         proof: &[[u8; 64]],
         index: usize,
     ) -> bool {
+        Self::verify_inclusion_with_size(root, leaf, proof, index, 0)
+    }
+
+    /// Verify inclusion with knowledge of the tree size, correctly handling
+    /// odd-node promotion at each level (no self-hashing).
+    pub fn verify_inclusion_with_size(
+        root: &[u8; 64],
+        leaf: &[u8; 64],
+        proof: &[[u8; 64]],
+        index: usize,
+        tree_size: usize,
+    ) -> bool {
         let mut current = *leaf;
         let mut idx = index;
-        for sibling in proof {
-            current = if idx % 2 == 0 {
-                hash_pair(&current, sibling)
-            } else {
-                hash_pair(sibling, &current)
-            };
-            idx /= 2;
+        let mut proof_iter = proof.iter();
+        // Reconstruct level sizes to detect promotion levels.
+        // If tree_size is 0, fall back to consuming all proof elements (legacy).
+        if tree_size > 0 {
+            let mut level_size = tree_size;
+            while level_size > 1 {
+                if idx % 2 == 0 && idx + 1 >= level_size {
+                    // This node was promoted — no sibling, no proof element consumed
+                } else {
+                    let sibling = match proof_iter.next() {
+                        Some(s) => s,
+                        None => return false,
+                    };
+                    current = if idx % 2 == 0 {
+                        hash_pair(&current, sibling)
+                    } else {
+                        hash_pair(sibling, &current)
+                    };
+                }
+                level_size = (level_size + 1) / 2;
+                idx /= 2;
+            }
+        } else {
+            // Legacy path: no tree_size, consume all proof elements
+            for sibling in proof_iter {
+                current = if idx % 2 == 0 {
+                    hash_pair(&current, sibling)
+                } else {
+                    hash_pair(sibling, &current)
+                };
+                idx /= 2;
+            }
         }
         crypto::ct::ct_eq(&current, root)
     }
@@ -123,6 +160,7 @@ fn compute_leaf(
     timestamp: i64,
 ) -> [u8; 64] {
     let mut hasher = Sha512::new();
+    hasher.update(&[0x00]); // RFC 6962 leaf node prefix
     hasher.update(domain::KT_LEAF);
     hasher.update(user_id.as_bytes());
     hasher.update(operation.as_bytes());
@@ -136,6 +174,7 @@ fn compute_leaf(
 
 fn hash_pair(left: &[u8; 64], right: &[u8; 64]) -> [u8; 64] {
     let mut hasher = Sha512::new();
+    hasher.update(&[0x01]); // RFC 6962 internal node prefix
     hasher.update(left);
     hasher.update(right);
     let result = hasher.finalize();
@@ -155,7 +194,9 @@ fn compute_root(leaves: &[[u8; 64]]) -> [u8; 64] {
             if chunk.len() == 2 {
                 next.push(hash_pair(&chunk[0], &chunk[1]));
             } else {
-                next.push(hash_pair(&chunk[0], &chunk[0])); // duplicate for odd
+                // Promote the odd node unchanged to prevent [A,B,C] and
+                // [A,B,C,C] from producing the same root (tree ambiguity).
+                next.push(chunk[0]);
             }
         }
         level = next;
@@ -168,23 +209,25 @@ fn build_proof(leaves: &[[u8; 64]], index: usize) -> Vec<[u8; 64]> {
     let mut level: Vec<[u8; 64]> = leaves.to_vec();
     let mut idx = index;
     while level.len() > 1 {
-        let sibling_idx = if idx % 2 == 0 {
-            idx + 1
+        // If idx is the last element in an odd-length level, it gets promoted
+        // with no sibling — skip adding a proof element for this level.
+        if idx % 2 == 0 && idx + 1 >= level.len() {
+            // Odd node promoted: no sibling to add to proof
         } else {
-            idx - 1
-        };
-        let sibling = if sibling_idx < level.len() {
-            level[sibling_idx]
-        } else {
-            level[idx]
-        };
-        proof.push(sibling);
+            let sibling_idx = if idx % 2 == 0 {
+                idx + 1
+            } else {
+                idx - 1
+            };
+            proof.push(level[sibling_idx]);
+        }
         let mut next = Vec::new();
         for chunk in level.chunks(2) {
             if chunk.len() == 2 {
                 next.push(hash_pair(&chunk[0], &chunk[1]));
             } else {
-                next.push(hash_pair(&chunk[0], &chunk[0]));
+                // Promote the odd node unchanged (matches compute_root)
+                next.push(chunk[0]);
             }
         }
         level = next;

@@ -72,3 +72,31 @@ impl Default for DeviceRegistry {
         Self::new()
     }
 }
+
+/// Validate that a claimed tier matches the tier registered for a device.
+///
+/// Looks up `device_id` in the registry and checks:
+/// 1. The device exists and is enrolled.
+/// 2. The device is active (not revoked).
+/// 3. The claimed tier matches the registered tier exactly.
+///
+/// This should be called by the orchestrator during authentication to prevent
+/// a client from claiming a higher-privilege tier than its device is enrolled at.
+pub fn validate_tier_claim(
+    claimed_tier: u8,
+    device_id: &uuid::Uuid,
+    registry: &DeviceRegistry,
+) -> bool {
+    match registry.lookup(device_id) {
+        Some(enrollment) => {
+            // Device must be active
+            if !enrollment.is_active {
+                return false;
+            }
+            // Claimed tier must match the registered tier exactly
+            (enrollment.tier as u8) == claimed_tier
+        }
+        // Device not found in registry — claim is invalid
+        None => false,
+    }
+}

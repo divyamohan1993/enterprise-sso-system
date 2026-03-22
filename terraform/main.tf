@@ -28,16 +28,29 @@ resource "google_compute_address" "demo_ip" {
 
 # ── Firewall ────────────────────────────────────────────────
 
-resource "google_compute_firewall" "sso_allow" {
+resource "google_compute_firewall" "sso_allow_web" {
   name    = "sso-allow-web"
   network = "default"
 
   allow {
     protocol = "tcp"
-    ports    = ["80", "443", "22"]
+    ports    = ["80", "443"]
   }
 
   source_ranges = ["0.0.0.0/0"]
+  target_tags   = ["sso-server"]
+}
+
+resource "google_compute_firewall" "sso_allow_ssh" {
+  name    = "sso-allow-ssh"
+  network = "default"
+
+  allow {
+    protocol = "tcp"
+    ports    = ["22"]
+  }
+
+  source_ranges = ["10.0.0.0/8"]  # Restrict to internal network — configure for your bastion IP
   target_tags   = ["sso-server"]
 }
 
@@ -69,7 +82,7 @@ resource "google_compute_instance" "sso_system" {
   }
 
   service_account {
-    scopes = ["cloud-platform"]
+    scopes = ["compute-ro", "storage-ro", "logging-write"]
   }
 
   lifecycle {
@@ -105,7 +118,7 @@ resource "google_compute_instance" "sso_demo" {
   }
 
   service_account {
-    scopes = ["cloud-platform"]
+    scopes = ["compute-ro", "storage-ro", "logging-write"]
   }
 
   depends_on = [google_compute_instance.sso_system]

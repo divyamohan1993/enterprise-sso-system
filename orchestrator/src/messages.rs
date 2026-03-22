@@ -10,6 +10,10 @@ pub struct OrchestratorRequest {
     pub dpop_key_hash: [u8; 32],
     /// Requested authentication tier (1-4). Defaults to 2 if 0.
     pub tier: u8,
+    /// Target audience for the token (passed through to the TSS for inclusion
+    /// in the token's `aud` claim). If `None`, the TSS uses a default audience.
+    #[serde(default)]
+    pub audience: Option<String>,
     #[serde(default)]
     pub device_attestation_age_secs: Option<f64>,
     #[serde(default)]

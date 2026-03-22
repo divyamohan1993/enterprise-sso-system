@@ -25,6 +25,8 @@ use tss::token_builder::build_token_distributed;
 use tss::validator::validate_receipt_chain;
 use verifier::verify::verify_token;
 
+use e2e::{client_auth, send_frame, recv_frame, send_raw_frame, recv_raw_frame};
+
 /// Fixed 64-byte HMAC key for SHARD communication in tests.
 const SHARD_HMAC_KEY: [u8; 64] = [0x37u8; 64];
 
@@ -33,38 +35,6 @@ const RECEIPT_SIGNING_KEY: [u8; 64] = [0x42u8; 64];
 
 /// Puzzle difficulty (low for fast tests).
 const TEST_DIFFICULTY: u8 = 4;
-
-// ── Wire helpers (length-prefixed postcard over TCP) ────────────────────
-
-async fn send_frame<T: serde::Serialize>(stream: &mut TcpStream, value: &T) -> Result<(), String> {
-    let payload = postcard::to_allocvec(value).map_err(|e| format!("serialize: {e}"))?;
-    let len = payload.len() as u32;
-    stream
-        .write_all(&len.to_be_bytes())
-        .await
-        .map_err(|e| format!("write length: {e}"))?;
-    stream
-        .write_all(&payload)
-        .await
-        .map_err(|e| format!("write payload: {e}"))?;
-    stream.flush().await.map_err(|e| format!("flush: {e}"))?;
-    Ok(())
-}
-
-async fn recv_frame<T: serde::de::DeserializeOwned>(stream: &mut TcpStream) -> Result<T, String> {
-    let mut len_buf = [0u8; 4];
-    stream
-        .read_exact(&mut len_buf)
-        .await
-        .map_err(|e| format!("read length: {e}"))?;
-    let len = u32::from_be_bytes(len_buf);
-    let mut buf = vec![0u8; len as usize];
-    stream
-        .read_exact(&mut buf)
-        .await
-        .map_err(|e| format!("read payload: {e}"))?;
-    postcard::from_bytes(&buf).map_err(|e| format!("deserialize: {e}"))
-}
 
 // ── Service boot helpers ────────────────────────────────────────────────
 
@@ -114,7 +84,8 @@ async fn boot_opaque(store: CredentialStore) -> String {
                                 let (_sender, payload2) = match transport.recv().await { Ok(r) => r, Err(_) => return };
                                 let req2: OpaqueRequest = match postcard::from_bytes(&payload2) { Ok(r) => r, Err(_) => return };
                                 if let OpaqueRequest::LoginFinish { credential_finalization } = req2 {
-                                    let response = opaque::service::handle_login_finish(server_login, &credential_finalization, &RECEIPT_SIGNING_KEY, user_id, ceremony_session_id, dpop_key_hash);
+                                    let receipt_signer = opaque::service::ReceiptSigner::new(RECEIPT_SIGNING_KEY);
+                                    let response = opaque::service::handle_login_finish(server_login, &credential_finalization, &receipt_signer, user_id, ceremony_session_id, dpop_key_hash);
                                     let resp_bytes = postcard::to_allocvec(&response).unwrap();
                                     let _ = transport.send(&resp_bytes).await;
                                 }
@@ -196,6 +167,7 @@ async fn boot_tss(coordinator: SigningCoordinator, mut nodes: Vec<SignerNode>, p
                             &mut signers,
                             &request.ratchet_key,
                             &pq_signing_key,
+                            None,
                         ) {
                             Ok(token) => {
                                 let token_bytes =
@@ -242,7 +214,7 @@ async fn boot_orchestrator(opaque_addr: String, tss_addr: String) -> String {
         .to_string();
 
     let service =
-        OrchestratorService::new(SHARD_HMAC_KEY, opaque_addr, tss_addr, RECEIPT_SIGNING_KEY);
+        OrchestratorService::new(SHARD_HMAC_KEY, opaque_addr, tss_addr);
 
     tokio::spawn(async move {
         loop {

@@ -17,10 +17,35 @@ pub fn verify_pkce(code_verifier: &str, code_challenge: &str) -> bool {
 
 /// Enforce that PKCE is present. Returns an error if code_challenge is None.
 /// PKCE MUST be mandatory for all authorization requests per OAuth 2.1 / RFC 9126.
+///
+/// This function MUST be called at the start of every authorization code creation
+/// flow. It is not optional — OAuth 2.1 (draft-ietf-oauth-v2-1) requires PKCE
+/// for ALL clients, including confidential clients.
 pub fn require_pkce(code_challenge: Option<&str>) -> Result<(), &'static str> {
     match code_challenge {
-        Some(_) => Ok(()),
-        None => Err("PKCE code_challenge is required for all authorization requests"),
+        Some(c) if !c.is_empty() => Ok(()),
+        _ => Err("PKCE code_challenge is required for all authorization requests"),
+    }
+}
+
+/// Combined PKCE enforcement and verification in one call.
+/// Enforces that both code_challenge and code_verifier are present, then
+/// verifies the S256 challenge. Returns an error if PKCE is missing or invalid.
+pub fn verify_pkce_mandatory(
+    code_verifier: Option<&str>,
+    code_challenge: Option<&str>,
+) -> Result<(), &'static str> {
+    let challenge = code_challenge
+        .ok_or("PKCE code_challenge is required for all authorization requests")?;
+    let verifier = code_verifier
+        .ok_or("PKCE code_verifier is required for token exchange")?;
+    if challenge.is_empty() || verifier.is_empty() {
+        return Err("PKCE code_challenge and code_verifier must not be empty");
+    }
+    if verify_pkce(verifier, challenge) {
+        Ok(())
+    } else {
+        Err("PKCE verification failed: code_verifier does not match code_challenge")
     }
 }
 

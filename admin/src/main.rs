@@ -38,16 +38,18 @@ async fn main() {
     // Pre-seed OAuth clients for known applications
     let mut oauth_clients = sso_protocol::clients::ClientRegistry::new();
 
-    // Register demo app as OAuth client (always available)
-    let demo_redirect = std::env::var("DEMO_REDIRECT_URI")
-        .unwrap_or_else(|_| "https://sso-system-demo.dmj.one/callback".to_string());
-    oauth_clients.register_with_id(
-        "demo-app",
-        "demo-secret",
-        "Demo Application",
-        vec![demo_redirect],
-    );
-    tracing::info!("Pre-seeded OAuth client: demo-app");
+    // Register demo app as OAuth client only in demo mode
+    if std::env::var("MILNET_DEMO_MODE").is_ok() {
+        let demo_redirect = std::env::var("DEMO_REDIRECT_URI")
+            .unwrap_or_else(|_| "https://sso-system-demo.dmj.one/callback".to_string());
+        oauth_clients.register_with_id(
+            "demo-app",
+            "demo-secret",
+            "Demo Application",
+            vec![demo_redirect],
+        );
+        tracing::warn!("Pre-seeded demo OAuth client: demo-app (MILNET_DEMO_MODE is set)");
+    }
 
     // Try to load existing ServerSetup from DB
     let server_setup_bytes: Option<Vec<u8>> = sqlx::query_scalar(

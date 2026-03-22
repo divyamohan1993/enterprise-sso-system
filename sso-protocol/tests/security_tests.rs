@@ -86,7 +86,7 @@ fn test_rs256_token_rejected_with_wrong_public_key() {
 fn test_auth_code_default_tier_is_2() {
     let mut store = AuthorizationStore::new();
     let user_id = Uuid::new_v4();
-    let code = store.create_code("c", "https://x.com/cb", user_id, "openid", None, None);
+    let code = store.create_code("c", "https://x.com/cb", user_id, "openid", Some("dummy-challenge".into()), None).unwrap();
     let auth_code = store.consume_code(&code).unwrap();
     assert_eq!(auth_code.tier, 2);
 }

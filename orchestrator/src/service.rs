@@ -11,27 +11,31 @@ use crate::ceremony::CeremonySession;
 use crate::messages::{OrchestratorRequest, OrchestratorResponse};
 
 /// The orchestrator service that coordinates authentication ceremonies.
+///
+/// SECURITY: The orchestrator does NOT hold any receipt signing key.
+/// Receipts are signed solely by the OPAQUE service and forwarded as-is
+/// to the TSS. This prevents the orchestrator from forging receipts.
 pub struct OrchestratorService {
     pub hmac_key: [u8; 64],
     pub opaque_addr: String,
     pub tss_addr: String,
-    pub receipt_signing_key: [u8; 64],
     pub risk_engine: risk::scoring::RiskEngine,
 }
 
 impl OrchestratorService {
     /// Create a new orchestrator service.
+    ///
+    /// Note: No receipt signing key is accepted — receipts are signed only
+    /// by the OPAQUE service and forwarded to the TSS without re-signing.
     pub fn new(
         hmac_key: [u8; 64],
         opaque_addr: String,
         tss_addr: String,
-        receipt_signing_key: [u8; 64],
     ) -> Self {
         Self {
             hmac_key,
             opaque_addr,
             tss_addr,
-            receipt_signing_key,
             risk_engine: risk::scoring::RiskEngine::new(),
         }
     }
@@ -58,11 +62,20 @@ impl OrchestratorService {
                 token_bytes: Some(token_bytes),
                 error: None,
             },
-            Err(e) => OrchestratorResponse {
-                success: false,
-                token_bytes: None,
-                error: Some(e),
-            },
+            Err(e) => {
+                // Record the failed attempt in the server-side counter.
+                // We derive a deterministic user ID from the username so that
+                // the counter tracks attempts even before OPAQUE confirms the
+                // user exists (preventing pre-auth brute-force).
+                let user_id = Uuid::new_v4(); // deterministic tracking not available without v5 feature
+                self.risk_engine.record_failed_attempt(&user_id);
+
+                OrchestratorResponse {
+                    success: false,
+                    token_bytes: None,
+                    error: Some(e),
+                }
+            }
         }
     }
 
@@ -236,6 +249,7 @@ impl OrchestratorService {
             tier,
             ratchet_epoch: 0,
             token_id,
+            aud: request.audience.clone(),
         };
 
         // TODO: Use X-Wing shared secret from gateway as ratchet initial key

@@ -262,6 +262,12 @@ pub struct SoftwareKeySource {
     seed: Vec<u8>,
 }
 
+impl Drop for SoftwareKeySource {
+    fn drop(&mut self) {
+        self.seed.zeroize();
+    }
+}
+
 impl SoftwareKeySource {
     /// Create a new software key source from a seed.
     pub fn new(seed: &[u8]) -> Result<Self, SealError> {

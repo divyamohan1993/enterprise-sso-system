@@ -48,6 +48,20 @@ pub fn is_permitted_channel(from: ModuleId, to: ModuleId) -> bool {
     )
 }
 
+/// Enforce the module communication matrix at runtime.
+///
+/// Returns `Ok(())` if the channel from `sender` to `receiver` is permitted,
+/// or `Err` with a descriptive message if the channel is denied.  This is
+/// intended to be called at connection establishment time in the SHARD
+/// transport layer.
+pub fn enforce_channel(sender: ModuleId, receiver: ModuleId) -> Result<(), &'static str> {
+    if is_permitted_channel(sender, receiver) {
+        Ok(())
+    } else {
+        Err("communication channel denied by module communication matrix")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

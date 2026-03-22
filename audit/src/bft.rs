@@ -4,10 +4,16 @@
 //! An entry is considered committed when a quorum (2f + 1 = 5) of nodes accept it.
 //! Byzantine nodes that produce conflicting entries are detectable via chain
 //! divergence checks.
+//!
+//! Each node optionally persists its accepted entries to a separate file so
+//! that surviving files provide tamper evidence even if some nodes crash.
 
 use crate::log::{hash_entry, AuditLog};
 use common::types::{AuditEntry, AuditEventType, Receipt};
 use crypto::pq_sign;
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, BufReader, Write as IoWrite};
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -16,6 +22,8 @@ pub struct AuditNode {
     pub node_id: u8,
     pub log: AuditLog,
     pub is_byzantine: bool,
+    /// Optional path to a JSONL persistence file for this node.
+    persistence_path: Option<PathBuf>,
 }
 
 impl AuditNode {
@@ -24,6 +32,48 @@ impl AuditNode {
             node_id,
             log: AuditLog::new(),
             is_byzantine: false,
+            persistence_path: None,
+        }
+    }
+
+    /// Create a node with file-based persistence.
+    /// On construction, reloads any previously persisted entries from the file.
+    pub fn new_with_persistence(node_id: u8, path: PathBuf) -> Self {
+        // Ensure the parent directory exists.
+        if let Some(parent) = path.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                tracing::error!(
+                    "BFT node {}: failed to create persistence directory {:?}: {}",
+                    node_id, parent, e
+                );
+            }
+        }
+
+        // Reload persisted entries.
+        let entries = load_entries_from_file(&path, node_id);
+        let log = if entries.is_empty() {
+            AuditLog::new()
+        } else {
+            let log = AuditLog::from_entries(entries);
+            if !log.verify_chain() {
+                tracing::error!(
+                    "CRITICAL: BFT node {}: persisted chain verification FAILED on reload from {:?}",
+                    node_id, path
+                );
+            } else {
+                tracing::info!(
+                    "BFT node {}: reloaded {} entries from {:?}",
+                    node_id, log.len(), path
+                );
+            }
+            log
+        };
+
+        Self {
+            node_id,
+            log,
+            is_byzantine: false,
+            persistence_path: Some(path),
         }
     }
 
@@ -42,6 +92,17 @@ impl AuditNode {
             return None; // Chain mismatch
         }
         self.log.append_raw(entry.clone());
+
+        // Persist to file if configured.
+        if let Some(ref path) = self.persistence_path {
+            if let Err(e) = append_entry_to_file(path, entry) {
+                tracing::error!(
+                    "BFT node {}: failed to persist entry to {:?}: {}",
+                    self.node_id, path, e
+                );
+            }
+        }
+
         Some(hash_entry(entry))
     }
 }
@@ -74,6 +135,32 @@ impl BftAuditCluster {
         let f = (node_count - 1) / 3;
         let quorum = 2 * f + 1;
         let nodes: Vec<AuditNode> = (0..node_count as u8).map(AuditNode::new).collect();
+        Self {
+            nodes,
+            quorum_size: quorum,
+            pq_signing_key: Some(signing_key),
+        }
+    }
+
+    /// Create a new cluster with signing key and per-node file persistence.
+    ///
+    /// Each node gets its own persistence file under `persistence_dir`:
+    ///   `persistence_dir/node_<id>.jsonl`
+    ///
+    /// On startup, each node reloads its entries and verifies its chain.
+    pub fn new_with_persistence(
+        node_count: usize,
+        signing_key: pq_sign::PqSigningKey,
+        persistence_dir: &std::path::Path,
+    ) -> Self {
+        let f = (node_count - 1) / 3;
+        let quorum = 2 * f + 1;
+        let nodes: Vec<AuditNode> = (0..node_count as u8)
+            .map(|id| {
+                let path = persistence_dir.join(format!("node_{}.jsonl", id));
+                AuditNode::new_with_persistence(id, path)
+            })
+            .collect();
         Self {
             nodes,
             quorum_size: quorum,
@@ -178,4 +265,66 @@ impl BftAuditCluster {
             node.is_byzantine = true;
         }
     }
+}
+
+// ── File persistence helpers ─────────────────────────────────────────────
+
+/// Append a single audit entry as a JSON line to the given file.
+fn append_entry_to_file(path: &std::path::Path, entry: &AuditEntry) -> std::io::Result<()> {
+    let json = serde_json::to_string(entry).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+    })?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(file, "{}", json)?;
+    file.sync_data()?;
+    Ok(())
+}
+
+/// Load audit entries from a JSONL persistence file.
+/// Returns an empty vec if the file does not exist or is empty.
+/// Logs warnings for malformed lines but continues loading valid ones.
+fn load_entries_from_file(path: &std::path::Path, node_id: u8) -> Vec<AuditEntry> {
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            tracing::error!(
+                "BFT node {}: failed to open persistence file {:?}: {}",
+                node_id, path, e
+            );
+            return Vec::new();
+        }
+    };
+
+    let reader = BufReader::new(file);
+    let mut entries = Vec::new();
+    for (line_num, line) in reader.lines().enumerate() {
+        match line {
+            Ok(text) => {
+                let text = text.trim().to_string();
+                if text.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<AuditEntry>(&text) {
+                    Ok(entry) => entries.push(entry),
+                    Err(e) => {
+                        tracing::warn!(
+                            "BFT node {}: skipping malformed line {} in {:?}: {}",
+                            node_id, line_num + 1, path, e
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "BFT node {}: I/O error reading line {} from {:?}: {}",
+                    node_id, line_num + 1, path, e
+                );
+            }
+        }
+    }
+    entries
 }

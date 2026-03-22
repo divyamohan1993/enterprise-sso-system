@@ -1,3 +1,6 @@
+# Passwords must be provided via a .env file or external secret manager.
+# Example .env:
+#   MILNET_DB_PASSWORD=your_secure_password_here
 version: '3.8'
 
 services:
@@ -6,7 +9,7 @@ services:
     environment:
       POSTGRES_DB: milnet_sso
       POSTGRES_USER: milnet
-      POSTGRES_PASSWORD: milnet_secure_password
+      POSTGRES_PASSWORD: ${MILNET_DB_PASSWORD:?Set MILNET_DB_PASSWORD}
     ports:
       - "5432:5432"
     volumes:
@@ -23,7 +26,7 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgres://milnet:milnet_secure_password@postgres:5432/milnet_sso
+      DATABASE_URL: postgres://milnet:${MILNET_DB_PASSWORD:?Set MILNET_DB_PASSWORD}@postgres:5432/milnet_sso
       ADMIN_PORT: 8080
       RUST_LOG: info
       # Google OAuth (optional — SSO login won't work without these)

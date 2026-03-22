@@ -16,19 +16,22 @@ use crypto::entropy::generate_nonce;
 const MAX_CONSUMED_ENTRIES: usize = 100_000;
 
 /// Global adaptive difficulty -- increases under load.
-static CURRENT_DIFFICULTY: AtomicU8 = AtomicU8::new(8);
+static CURRENT_DIFFICULTY: AtomicU8 = AtomicU8::new(16);
 
 /// Compute the appropriate puzzle difficulty based on the number of active
 /// connections and store it globally.
+///
+/// Minimum difficulty is 16 (~65536 hashes, ~3ms) to provide meaningful
+/// DDoS mitigation.  Maximum is 24 (~16M hashes) under extreme load.
 pub fn get_adaptive_difficulty(active_connections: usize) -> u8 {
     let difficulty = if active_connections > 1000 {
-        20 // DDoS level
+        24 // DDoS level
     } else if active_connections > 500 {
-        16 // High load
+        22 // High load
     } else if active_connections > 100 {
-        12 // Moderate load
+        18 // Moderate load
     } else {
-        8 // Normal
+        16 // Normal
     };
     CURRENT_DIFFICULTY.store(difficulty, Ordering::Relaxed);
     difficulty
@@ -39,8 +42,8 @@ pub fn current_difficulty() -> u8 {
     CURRENT_DIFFICULTY.load(Ordering::Relaxed)
 }
 
-/// Maximum age of a puzzle challenge before it expires (10 seconds).
-const PUZZLE_TTL_SECS: i64 = 10;
+/// Maximum age of a puzzle challenge before it expires (30 seconds).
+const PUZZLE_TTL_SECS: i64 = 30;
 
 // ---------------------------------------------------------------------------
 // Consumed puzzle nonce tracker (replay protection)

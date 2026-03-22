@@ -21,6 +21,11 @@ COPY --from=builder /app/target/release/opaque /usr/local/bin/opaque
 # Frontend served via reverse proxy or static file server
 COPY --from=builder /app/frontend/ /usr/local/share/frontend/
 
+# Run as non-root user
+RUN groupadd -r milnet && useradd -r -g milnet -s /bin/false milnet
+RUN chown -R milnet:milnet /usr/local/share/frontend/
+
 EXPOSE 8080
 ENV ADMIN_PORT=8080
+USER milnet
 CMD ["admin"]

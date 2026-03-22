@@ -28,8 +28,17 @@ rustup default stable
 
 # 3. Setup PostgreSQL
 echo ">>> Setting up PostgreSQL..."
+# Read password from instance metadata; fall back to environment variable
+MILNET_DB_PASSWORD=$(curl -s -H "Metadata-Flavor: Google" \
+    http://metadata.google.internal/computeMetadata/v1/instance/attributes/milnet-db-password 2>/dev/null \
+    || echo "${MILNET_DB_PASSWORD:-}")
+if [ -z "$MILNET_DB_PASSWORD" ]; then
+    echo "ERROR: MILNET_DB_PASSWORD not set in instance metadata or environment"
+    exit 1
+fi
+export MILNET_DB_PASSWORD
 sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='milnet'" | grep -q 1 || \
-    sudo -u postgres psql -c "CREATE USER milnet WITH PASSWORD 'milnet_secure_2026';"
+    sudo -u postgres psql -c "CREATE USER milnet WITH PASSWORD '${MILNET_DB_PASSWORD}';"
 sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='milnet_sso'" | grep -q 1 || \
     sudo -u postgres psql -c "CREATE DATABASE milnet_sso OWNER milnet;"
 
@@ -69,7 +78,7 @@ Type=simple
 ExecStart=/usr/local/bin/admin
 WorkingDirectory=/usr/local/share/milnet-sso
 Environment=ADMIN_PORT=8080
-Environment=DATABASE_URL=postgres://milnet:milnet_secure_2026@localhost/milnet_sso
+Environment=DATABASE_URL=postgres://milnet:${MILNET_DB_PASSWORD}@localhost/milnet_sso
 Environment=RUST_LOG=info
 Restart=always
 RestartSec=5
@@ -86,20 +95,31 @@ systemctl daemon-reload
 systemctl enable milnet-sso
 systemctl start milnet-sso
 
-# 10. Setup auto-update cron
-echo ">>> Setting up auto-update from GitHub..."
+# 10. Auto-update cron DISABLED by default
+# WARNING: Automatic git pull + cargo build + systemctl restart is a security risk.
+# An attacker who compromises the Git repo could deploy arbitrary code.
+# Enable only if you have signed commits, branch protection, and a verified CI pipeline.
+# To enable, uncomment the cron entry below and review the update script carefully.
+echo ">>> Auto-update cron is DISABLED for security (see comments in startup.sh)..."
+mkdir -p /opt/milnet-sso/scripts
 cat > /etc/cron.d/milnet-sso-update << 'CRON'
-# Pull latest code from GitHub every 15 minutes
-# Only rebuilds if there are new commits
-*/15 * * * * root /opt/milnet-sso/scripts/auto-update.sh >> /var/log/milnet-sso-update.log 2>&1
+# DISABLED: Automatic updates from GitHub are a security risk without commit signature verification.
+# Uncomment only after configuring GPG signature verification in the update script.
+# */15 * * * * root /opt/milnet-sso/scripts/auto-update.sh >> /var/log/milnet-sso-update.log 2>&1
 CRON
 
-# Create the auto-update script
-mkdir -p /opt/milnet-sso/scripts
+# Create the auto-update script (not active until cron is enabled)
 cat > /opt/milnet-sso/scripts/auto-update.sh << 'UPDATE'
 #!/bin/bash
 set -euo pipefail
 cd /opt/milnet-sso
+
+# SECURITY WARNING: This script does git pull && cargo build && systemctl restart
+# without verifying commit signatures. An attacker who gains push access to the
+# repository could deploy arbitrary code. Before enabling:
+# 1. Enforce signed commits on the repository
+# 2. Add GPG signature verification below (git verify-commit)
+# 3. Restrict branch protection rules on master
 
 # Fetch latest
 git fetch origin master --quiet
@@ -112,6 +132,12 @@ if [ "$LOCAL" = "$REMOTE" ]; then
     echo "$(date): No updates available"
     exit 0
 fi
+
+# TODO: Verify commit signatures before proceeding
+# if ! git verify-commit origin/master 2>/dev/null; then
+#     echo "$(date): ERROR — commit signature verification failed, aborting update"
+#     exit 1
+# fi
 
 echo "$(date): New commits detected. Updating..."
 git pull origin master --quiet

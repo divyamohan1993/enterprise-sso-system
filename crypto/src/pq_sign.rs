@@ -7,6 +7,7 @@ use ml_dsa::{
     signature::{Signer, Verifier},
     EncodedSignature, EncodedVerifyingKey, KeyGen, MlDsa87, SigningKey, VerifyingKey,
 };
+use zeroize::Zeroize;
 
 /// Type aliases for ML-DSA-87 key types.
 pub type PqSigningKey = SigningKey<MlDsa87>;
@@ -26,7 +27,7 @@ pub fn generate_pq_keypair() -> (PqSigningKey, PqVerifyingKey) {
     getrandom::getrandom(&mut seed).expect("getrandom failed");
     let kp = MlDsa87::from_seed(&seed.into());
     // Zeroize the seed on the stack
-    seed.fill(0);
+    seed.zeroize();
     (kp.signing_key().clone(), kp.verifying_key().clone())
 }
 

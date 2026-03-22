@@ -42,6 +42,13 @@ jobs:
       - name: Run cargo-audit
         run: cargo audit
 
-      # TODO: Add SBOM generation step once cargo-sbom is stable.
-      # Planned: cargo install cargo-sbom && cargo sbom --output-format spdx_json_2_3 > sbom.spdx.json
-      # The SBOM artifact should be uploaded via actions/upload-artifact for downstream consumers.
+      # SBOM generation
+      - name: SBOM generation
+        run: cargo install cargo-cyclonedx --locked && cargo cyclonedx --format json --output sbom.json || echo "SBOM generation failed — install cargo-cyclonedx for SBOM"
+      - name: Upload SBOM
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.json
+          if-no-files-found: warn

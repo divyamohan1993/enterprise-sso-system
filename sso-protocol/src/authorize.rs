@@ -1,3 +1,4 @@
+use crate::pkce;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -59,6 +60,9 @@ impl AuthorizationStore {
         }
     }
 
+    /// Create an authorization code with the default tier (2).
+    ///
+    /// Returns `Err` if `code_challenge` is `None` — PKCE is mandatory per OAuth 2.1.
     pub fn create_code(
         &mut self,
         client_id: &str,
@@ -67,10 +71,13 @@ impl AuthorizationStore {
         scope: &str,
         code_challenge: Option<String>,
         nonce: Option<String>,
-    ) -> String {
+    ) -> Result<String, &'static str> {
         self.create_code_with_tier(client_id, redirect_uri, user_id, scope, code_challenge, nonce, 2)
     }
 
+    /// Create an authorization code with an explicit tier.
+    ///
+    /// Returns `Err` if `code_challenge` is `None` — PKCE is mandatory per OAuth 2.1.
     pub fn create_code_with_tier(
         &mut self,
         client_id: &str,
@@ -80,7 +87,10 @@ impl AuthorizationStore {
         code_challenge: Option<String>,
         nonce: Option<String>,
         tier: u8,
-    ) -> String {
+    ) -> Result<String, &'static str> {
+        // PKCE is mandatory per OAuth 2.1 — reject requests without code_challenge.
+        pkce::require_pkce(code_challenge.as_deref())?;
+
         let code = Uuid::new_v4().to_string();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -101,7 +111,7 @@ impl AuthorizationStore {
                 expires_at: now + CODE_EXPIRY_SECS, // 30 second expiry for tighter security
             },
         );
-        code
+        Ok(code)
     }
 
     pub fn consume_code(&mut self, code: &str) -> Option<AuthorizationCode> {

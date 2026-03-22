@@ -28,9 +28,14 @@ COPY --from=builder /app/frontend/ /opt/frontend/
 COPY deploy/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
+# Run as non-root user for application processes
+# Note: entrypoint.sh starts PostgreSQL as postgres user via su, then drops to milnet
+RUN groupadd -r milnet && useradd -r -g milnet -s /bin/false milnet
+RUN chown -R milnet:milnet /opt/frontend/
+
 EXPOSE 8080
 ENV ADMIN_PORT=8080
 ENV RUST_LOG=info
-ENV DATABASE_URL=postgres://milnet:milnet_secure@localhost/milnet_sso
+# DATABASE_URL must be provided at runtime via: docker run -e DATABASE_URL=...
 
 ENTRYPOINT ["/entrypoint.sh"]

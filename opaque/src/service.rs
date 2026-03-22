@@ -3,6 +3,10 @@
 //! Implements the server side of the real OPAQUE protocol. The server NEVER
 //! sees the plaintext password — it only performs OPRF evaluation and key
 //! exchange.
+//!
+//! SECURITY: This service is the SOLE holder of the receipt signing key.
+//! The orchestrator does NOT hold or generate any receipt signing key; it
+//! forwards receipts from this service to the TSS without re-signing.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -21,8 +25,51 @@ use crate::messages::{OpaqueRequest, OpaqueResponse};
 use crate::opaque_impl::OpaqueCs;
 use crate::store::CredentialStore;
 
+/// The receipt signing key holder. This struct owns the key material and
+/// provides access only within this service.
+///
+/// TODO: Migrate from HMAC-SHA512 to Ed25519 asymmetric signing once
+/// `crypto::receipts::sign_receipt_asymmetric` is available (another agent is
+/// adding it). When that lands:
+///   1. Generate an Ed25519 keypair at startup (or load from HSM/sealed storage).
+///   2. Sign receipts with the Ed25519 private key via `sign_receipt_asymmetric`.
+///   3. Export the Ed25519 verifying (public) key so the TSS can verify receipts
+///      without needing the private key.
+///   4. Remove the symmetric HMAC signing path.
+pub struct ReceiptSigner {
+    /// HMAC-SHA512 signing key (symmetric, to be replaced by Ed25519).
+    signing_key: [u8; 64],
+    // TODO: Add Ed25519 keypair field:
+    // ed25519_signing_key: ed25519_dalek::SigningKey,
+    // ed25519_verifying_key: ed25519_dalek::VerifyingKey,
+}
+
+impl ReceiptSigner {
+    /// Create a new receipt signer. In production, the key MUST be loaded from
+    /// an HSM or secure key store.
+    pub fn new(signing_key: [u8; 64]) -> Self {
+        Self { signing_key }
+    }
+
+    /// Sign a receipt using the current signing scheme (HMAC-SHA512).
+    /// TODO: Replace with Ed25519 once available.
+    pub fn sign(&self, receipt: &mut Receipt) {
+        sign_receipt(receipt, &self.signing_key);
+    }
+
+    /// Return the signing key for HMAC verification.
+    /// TODO: Replace with `pub fn verifying_key(&self) -> &[u8; 32]` that
+    /// returns the Ed25519 public key for asymmetric verification by the TSS.
+    pub fn verification_key(&self) -> &[u8; 64] {
+        &self.signing_key
+    }
+}
+
 /// Load receipt signing key: generate random key at startup with a warning.
 /// In production, this MUST be loaded from an HSM or secure key store.
+///
+/// SECURITY: This is the ONLY place in the system where the receipt signing
+/// key is generated/loaded. No other service should hold this key.
 fn load_receipt_signing_key() -> [u8; 64] {
     eprintln!("WARNING: RECEIPT_SIGNING_KEY generated randomly at startup (NOT FOR PRODUCTION — use HSM)");
     crypto::entropy::generate_key_64()
@@ -74,11 +121,11 @@ pub fn handle_login_start(
 
 /// Handle a LoginFinish request: verify the client's credential finalization.
 ///
-/// On success, creates and signs a Receipt.
+/// On success, creates and signs a Receipt using the provided `ReceiptSigner`.
 pub fn handle_login_finish(
     server_login: ServerLogin<OpaqueCs>,
     credential_finalization_bytes: &[u8],
-    signing_key: &[u8; 64],
+    signer: &ReceiptSigner,
     user_id: uuid::Uuid,
     ceremony_session_id: [u8; 32],
     dpop_key_hash: [u8; 32],
@@ -115,7 +162,7 @@ pub fn handle_login_finish(
                 ttl_seconds: 30,
             };
 
-            sign_receipt(&mut receipt, signing_key);
+            signer.sign(&mut receipt);
 
             OpaqueResponse::LoginSuccess { receipt }
         }
@@ -220,9 +267,13 @@ pub fn handle_request(
 
 /// Run the OPAQUE service, listening for SHARD connections.
 /// Handles the 2-round-trip login protocol.
+///
+/// SECURITY: The receipt signing key is created and held exclusively within
+/// this function. It is never exported or shared with other services.
 pub async fn run(mut store: CredentialStore) -> Result<(), Box<dyn std::error::Error>> {
     let shard_hmac_key = load_shard_hmac_key();
     let receipt_signing_key = load_receipt_signing_key();
+    let receipt_signer = ReceiptSigner::new(receipt_signing_key);
 
     let listener = ShardListener::bind(DEFAULT_ADDR, ModuleId::Opaque, shard_hmac_key).await?;
     info!("OPAQUE service listening on {}", DEFAULT_ADDR);
@@ -269,7 +320,7 @@ pub async fn run(mut store: CredentialStore) -> Result<(), Box<dyn std::error::E
                             let response = handle_login_finish(
                                 server_login,
                                 &credential_finalization,
-                                &receipt_signing_key,
+                                &receipt_signer,
                                 user_id,
                                 ceremony_session_id,
                                 dpop_key_hash,

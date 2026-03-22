@@ -135,22 +135,6 @@ fn decode_u64(b: &[u8]) -> u64 {
     u64::from_be_bytes(arr)
 }
 
-/// Constant-time comparison of two byte slices.
-///
-/// Returns `true` iff the slices are the same length and contain
-/// identical bytes. Runs in time proportional to the shorter slice
-/// length regardless of where (or whether) bytes differ.
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
 /// Hex-encode a byte slice (lowercase).
 fn hex_encode(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -250,7 +234,7 @@ pub fn verify_manifest(
     let expected =
         compute_manifest_hmac(manifest.version, manifest.created_at, &manifest.entries, signing_key);
 
-    if !ct_eq(&expected, &manifest.hmac_tag) {
+    if !crate::ct::ct_eq(&expected, &manifest.hmac_tag) {
         return Err(AttestError::ManifestTampered);
     }
     Ok(())
@@ -717,9 +701,9 @@ mod tests {
 
     #[test]
     fn test_ct_eq() {
-        assert!(ct_eq(b"hello", b"hello"));
-        assert!(!ct_eq(b"hello", b"hellp"));
-        assert!(!ct_eq(b"hello", b"hell"));
-        assert!(ct_eq(b"", b""));
+        assert!(crate::ct::ct_eq(b"hello", b"hello"));
+        assert!(!crate::ct::ct_eq(b"hello", b"hellp"));
+        assert!(!crate::ct::ct_eq(b"hello", b"hell"));
+        assert!(crate::ct::ct_eq(b"", b""));
     }
 }

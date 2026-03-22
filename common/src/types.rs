@@ -41,6 +41,9 @@ pub struct TokenClaims {
     pub ratchet_epoch: u64,
     /// Unique token identifier for revocation lookups.
     pub token_id: [u8; 16],
+    /// Audience — the relying party this token is bound to.
+    #[serde(default)]
+    pub aud: Option<String>,
 }
 
 /// Custom Debug for TokenClaims — redacts cryptographic material.
@@ -57,6 +60,7 @@ impl std::fmt::Debug for TokenClaims {
             .field("tier", &self.tier)
             .field("ratchet_epoch", &self.ratchet_epoch)
             .field("token_id", &"[REDACTED]")
+            .field("aud", &"[REDACTED]")
             .finish()
     }
 }
@@ -68,6 +72,9 @@ impl Drop for TokenClaims {
         self.dpop_hash.zeroize();
         self.ceremony_id.zeroize();
         self.token_id.zeroize();
+        if let Some(ref mut aud) = self.aud {
+            aud.zeroize();
+        }
     }
 }
 
@@ -115,6 +122,7 @@ impl Token {
                 tier: 1,
                 ratchet_epoch: 42,
                 token_id: [0xAB; 16],
+                aud: None,
             },
             ratchet_tag: [0xDD; 64],
             frost_signature: [0xEE; 64],

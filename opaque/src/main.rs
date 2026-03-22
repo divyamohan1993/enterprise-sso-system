@@ -1,5 +1,10 @@
 #![forbid(unsafe_code)]
 //! opaque: T-OPAQUE Password Service.
+//!
+//! SECURITY: This service is the SOLE holder of the receipt signing key.
+//! The key is generated (or loaded from HSM) inside `opaque::service::run()`
+//! and never leaves this process. The orchestrator forwards receipts to the
+//! TSS without re-signing.
 
 use opaque::store::CredentialStore;
 

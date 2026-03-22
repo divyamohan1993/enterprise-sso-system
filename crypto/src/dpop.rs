@@ -1,71 +1,82 @@
 //! DPoP (Demonstration of Proof of Possession) — RFC 9449
 //! Binds tokens to a client key pair, preventing token theft.
 //!
-//! CNSA 2.0 compliance: HMAC-SHA512 is used for proof generation/verification
-//! (CNSA 2.0 compliant). The dpop_key_hash function uses SHA-256 for thumbprint
+//! RFC 9449 requires asymmetric signatures for DPoP proofs. This implementation
+//! uses ECDSA P-256 (NIST-approved, widely supported) for proof generation and
+//! verification. The dpop_key_hash function uses SHA-256 for thumbprint
 //! computation per RFC 9449/RFC 7638 JWK Thumbprint interoperability requirements.
 
-use hmac::{Hmac, Mac};
-use sha2::Sha512;
+use p256::ecdsa::{signature::Signer, signature::Verifier, Signature, SigningKey, VerifyingKey};
+use sha2::{Digest, Sha256};
 use common::domain;
-
-type HmacSha512 = Hmac<Sha512>;
 
 /// Generate a DPoP key hash from a client's public key bytes.
 pub fn dpop_key_hash(client_public_key: &[u8]) -> [u8; 32] {
-    use sha2::{Sha256, Digest};
     let mut hasher = Sha256::new();
     hasher.update(domain::DPOP_PROOF);
     hasher.update(client_public_key);
     hasher.finalize().into()
 }
 
-/// Generate a DPoP proof (HMAC over token claims + client key).
+/// Generate a DPoP proof using ECDSA P-256.
+///
+/// Signs SHA-256(claims_bytes || timestamp_bytes) with the provided signing key.
+/// Returns the ECDSA signature bytes (DER-encoded).
 pub fn generate_dpop_proof(
-    client_secret_key: &[u8; 64],
+    signing_key: &SigningKey,
     claims_bytes: &[u8],
     timestamp: i64,
-) -> [u8; 64] {
-    generate_dpop_proof_with_key(client_secret_key, claims_bytes, timestamp)
+) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(claims_bytes);
+    hasher.update(&timestamp.to_le_bytes());
+    let digest = hasher.finalize();
+    let sig: Signature = signing_key.sign(&digest);
+    sig.to_vec()
 }
 
-/// Generate a DPoP proof using an arbitrary key (used for both generation and verification).
-fn generate_dpop_proof_with_key(
-    key: &[u8],
-    claims_bytes: &[u8],
-    timestamp: i64,
-) -> [u8; 64] {
-    // HMAC-SHA512 accepts any key length; the library handles padding internally.
-    // No manual padding fallback — reject invalid keys instead.
-    let mut mac = HmacSha512::new_from_slice(key)
-        .expect("HMAC-SHA512 accepts any non-empty key");
-    mac.update(domain::DPOP_PROOF);
-    mac.update(claims_bytes);
-    mac.update(&timestamp.to_le_bytes());
-    mac.finalize().into_bytes().into()
-}
-
-/// Verify a DPoP proof by checking the key hash and recomputing the HMAC.
+/// Verify a DPoP proof using ECDSA P-256.
+///
+/// Verifies the ECDSA signature over SHA-256(claims_bytes || timestamp_bytes)
+/// against the provided verifying key. Also checks the key hash matches.
 pub fn verify_dpop_proof(
-    client_public_key: &[u8],
-    proof: &[u8; 64],
+    verifying_key: &VerifyingKey,
+    proof: &[u8],
     claims_bytes: &[u8],
     timestamp: i64,
     expected_key_hash: &[u8; 32],
 ) -> bool {
     // 1. Verify the key hash matches
-    let hash = dpop_key_hash(client_public_key);
+    let pk_bytes = verifying_key.to_encoded_point(false);
+    let hash = dpop_key_hash(pk_bytes.as_bytes());
     if !crate::ct::ct_eq(&hash, expected_key_hash) {
         return false;
     }
-    // 2. Recompute the expected proof and verify
-    let expected = generate_dpop_proof_with_key(client_public_key, claims_bytes, timestamp);
-    crate::ct::ct_eq(proof, &expected)
+
+    // 2. Parse the signature
+    let sig = match Signature::from_slice(proof) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    // 3. Recompute the digest and verify
+    let mut hasher = Sha256::new();
+    hasher.update(claims_bytes);
+    hasher.update(&timestamp.to_le_bytes());
+    let digest = hasher.finalize();
+
+    verifying_key.verify(&digest, &sig).is_ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_keypair() -> (SigningKey, VerifyingKey) {
+        let sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let vk = VerifyingKey::from(&sk);
+        (sk, vk)
+    }
 
     #[test]
     fn test_dpop_key_hash_deterministic() {
@@ -85,38 +96,55 @@ mod tests {
     }
 
     #[test]
-    fn test_dpop_binding_verified() {
-        let client_key = [0xABu8; 32];
-        let expected = dpop_key_hash(&client_key);
+    fn test_dpop_sign_and_verify() {
+        let (sk, vk) = test_keypair();
+        let pk_bytes = vk.to_encoded_point(false);
+        let expected_hash = dpop_key_hash(pk_bytes.as_bytes());
         let claims = b"claims";
         let timestamp = 1000i64;
-        let proof = generate_dpop_proof_with_key(&client_key, claims, timestamp);
-        assert!(verify_dpop_proof(&client_key, &proof, claims, timestamp, &expected));
+        let proof = generate_dpop_proof(&sk, claims, timestamp);
+        assert!(verify_dpop_proof(&vk, &proof, claims, timestamp, &expected_hash));
     }
 
     #[test]
     fn test_dpop_wrong_key_rejected() {
-        let client_key = [0xABu8; 32];
-        let wrong_key = [0xCDu8; 32];
-        let expected = dpop_key_hash(&client_key);
-        let proof = [0u8; 64];
-        assert!(!verify_dpop_proof(&wrong_key, &proof, b"claims", 1000, &expected));
+        let (sk, _vk) = test_keypair();
+        let (_sk2, vk2) = test_keypair();
+        let pk_bytes = vk2.to_encoded_point(false);
+        let expected_hash = dpop_key_hash(pk_bytes.as_bytes());
+        let claims = b"claims";
+        let timestamp = 1000i64;
+        let proof = generate_dpop_proof(&sk, claims, timestamp);
+        // Signature was made with sk (whose vk != vk2), so verification fails
+        assert!(!verify_dpop_proof(&vk2, &proof, claims, timestamp, &expected_hash));
     }
 
     #[test]
     fn test_dpop_wrong_proof_rejected() {
-        let client_key = [0xABu8; 32];
-        let expected = dpop_key_hash(&client_key);
-        let bad_proof = [0u8; 64]; // wrong proof
-        assert!(!verify_dpop_proof(&client_key, &bad_proof, b"claims", 1000, &expected));
+        let (_sk, vk) = test_keypair();
+        let pk_bytes = vk.to_encoded_point(false);
+        let expected_hash = dpop_key_hash(pk_bytes.as_bytes());
+        let bad_proof = vec![0u8; 64];
+        assert!(!verify_dpop_proof(&vk, &bad_proof, b"claims", 1000, &expected_hash));
     }
 
     #[test]
     fn test_dpop_wrong_timestamp_rejected() {
-        let client_key = [0xABu8; 32];
-        let expected = dpop_key_hash(&client_key);
+        let (sk, vk) = test_keypair();
+        let pk_bytes = vk.to_encoded_point(false);
+        let expected_hash = dpop_key_hash(pk_bytes.as_bytes());
         let claims = b"claims";
-        let proof = generate_dpop_proof_with_key(&client_key, claims, 1000);
-        assert!(!verify_dpop_proof(&client_key, &proof, claims, 9999, &expected));
+        let proof = generate_dpop_proof(&sk, claims, 1000);
+        assert!(!verify_dpop_proof(&vk, &proof, claims, 9999, &expected_hash));
+    }
+
+    #[test]
+    fn test_dpop_wrong_key_hash_rejected() {
+        let (sk, vk) = test_keypair();
+        let claims = b"claims";
+        let timestamp = 1000i64;
+        let proof = generate_dpop_proof(&sk, claims, timestamp);
+        let wrong_hash = [0xFFu8; 32];
+        assert!(!verify_dpop_proof(&vk, &proof, claims, timestamp, &wrong_hash));
     }
 }

@@ -154,10 +154,11 @@ async fn orchestrator_processes_auth() {
             OpaqueRequest::LoginFinish {
                 credential_finalization,
             } => {
+                let receipt_signer = opaque::service::ReceiptSigner::new(rsk);
                 let response = opaque::service::handle_login_finish(
                     server_login,
                     &credential_finalization,
-                    &rsk,
+                    &receipt_signer,
                     user_id,
                     ceremony_session_id,
                     dpop_key_hash,
@@ -191,13 +192,14 @@ async fn orchestrator_processes_auth() {
     });
 
     // Create orchestrator service and process auth
-    let service = OrchestratorService::new(hmac_key, opaque_addr, tss_addr, receipt_signing_key);
+    let service = OrchestratorService::new(hmac_key, opaque_addr, tss_addr);
 
     let request = OrchestratorRequest {
         username: "alice".into(),
         password: b"password123".to_vec(),
         dpop_key_hash: [0xBB; 32],
         tier: 2,
+        audience: None,
         device_attestation_age_secs: None,
         geo_velocity_kmh: None,
         is_unusual_network: None,
@@ -283,10 +285,11 @@ async fn orchestrator_handles_opaque_failure() {
                         credential_finalization,
                     } = req2
                     {
+                        let receipt_signer = opaque::service::ReceiptSigner::new([0u8; 64]);
                         let response = opaque::service::handle_login_finish(
                             server_login,
                             &credential_finalization,
-                            &[0u8; 64],
+                            &receipt_signer,
                             Uuid::nil(),
                             [0u8; 32],
                             [0u8; 32],
@@ -300,13 +303,14 @@ async fn orchestrator_handles_opaque_failure() {
         }
     });
 
-    let service = OrchestratorService::new(hmac_key, opaque_addr, tss_addr, receipt_signing_key);
+    let service = OrchestratorService::new(hmac_key, opaque_addr, tss_addr);
 
     let request = OrchestratorRequest {
         username: "alice".into(),
         password: b"wrong_password".to_vec(),
         dpop_key_hash: [0xBB; 32],
         tier: 2,
+        audience: None,
         device_attestation_age_secs: None,
         geo_velocity_kmh: None,
         is_unusual_network: None,

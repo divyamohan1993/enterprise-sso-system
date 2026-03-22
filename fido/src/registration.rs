@@ -79,6 +79,26 @@ impl CredentialStore {
         self.challenges.remove(challenge)
     }
 
+    /// Consume a pending challenge for a specific user, returning true if one was found.
+    /// This removes the first challenge associated with the given user ID.
+    pub fn consume_challenge_for_user(&mut self, user_id: &Uuid) -> bool {
+        let key = self.challenges
+            .iter()
+            .find(|(_, uid)| *uid == user_id)
+            .map(|(k, _)| k.clone());
+        if let Some(k) = key {
+            self.challenges.remove(&k);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Check whether a pending challenge exists for the given user.
+    pub fn has_pending_challenge(&self, user_id: &Uuid) -> bool {
+        self.challenges.values().any(|uid| uid == user_id)
+    }
+
     /// Store a completed credential registration.
     pub fn store_credential(&mut self, cred: StoredCredential) {
         self.credentials.insert(cred.credential_id.clone(), cred);

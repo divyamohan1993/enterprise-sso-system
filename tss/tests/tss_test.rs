@@ -64,6 +64,7 @@ fn test_claims() -> TokenClaims {
         tier: 1,
         ratchet_epoch: 42,
         token_id: [0xAB; 16],
+        aud: None,
     }
 }
 
@@ -126,7 +127,7 @@ fn token_built_and_verifiable() {
     let ratchet_key = test_ratchet_key();
     let (pq_sk, _pq_vk) = generate_pq_keypair();
 
-    let token = build_token(&claims, &mut shares[..3], &group, &ratchet_key, &pq_sk)
+    let token = build_token(&claims, &mut shares[..3], &group, &ratchet_key, &pq_sk, None)
         .expect("build_token should succeed");
 
     // Verify the FROST signature against the group key
@@ -145,7 +146,7 @@ fn token_claims_preserved() {
     let ratchet_key = test_ratchet_key();
     let (pq_sk, _pq_vk) = generate_pq_keypair();
 
-    let token = build_token(&claims, &mut shares[..3], &group, &ratchet_key, &pq_sk)
+    let token = build_token(&claims, &mut shares[..3], &group, &ratchet_key, &pq_sk, None)
         .expect("build_token should succeed");
 
     // Serialize and deserialize the token, verify claims match
@@ -176,7 +177,7 @@ fn test_ratchet_tag_is_real() {
     let ratchet_key = test_ratchet_key();
     let (pq_sk, _pq_vk) = generate_pq_keypair();
 
-    let token = build_token(&claims, &mut shares[..3], &group, &ratchet_key, &pq_sk)
+    let token = build_token(&claims, &mut shares[..3], &group, &ratchet_key, &pq_sk, None)
         .expect("build_token should succeed");
 
     // The ratchet tag must NOT be all zeros (the old placeholder)
@@ -312,7 +313,7 @@ fn test_distributed_token_built_and_verifiable() {
 
     let (pq_sk, _pq_vk) = generate_pq_keypair();
     let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
-    let token = build_token_distributed(&claims, &coordinator, &mut signers, &ratchet_key, &pq_sk)
+    let token = build_token_distributed(&claims, &coordinator, &mut signers, &ratchet_key, &pq_sk, None)
         .expect("build_token_distributed should succeed");
 
     // Verify the FROST signature against the group key
@@ -417,6 +418,7 @@ fn test_full_signing_flow_with_valid_receipts() {
         &mut signers,
         &decoded.ratchet_key,
         &pq_sk,
+        None,
     )
     .expect("build_token_distributed should succeed");
 

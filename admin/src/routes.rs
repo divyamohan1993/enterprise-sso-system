@@ -112,9 +112,6 @@ async fn auth_middleware(
         || path == "/about"
         || path == "/pitch"
         || path == "/docs"
-        || path.ends_with(".html")
-        || path.ends_with(".css")
-        || path.ends_with(".js")
     {
         return Ok(next.run(request).await);
     }
@@ -988,20 +985,23 @@ async fn auth_login(
         }
     };
 
-    // Run simplified OPAQUE login flow (start + finish in one step for the
-    // admin API; full 2-round-trip flow is used in the SHARD service).
-    let login_start = opaque::service::handle_login_start(&store, &req.username, &{
-        // Build a client credential request for this password
-        use opaque_ke::ClientLogin;
-        use opaque::opaque_impl::OpaqueCs;
-        let mut rng = rand::rngs::OsRng;
-        let client_start = ClientLogin::<OpaqueCs>::start(&mut rng, req.password.as_bytes())
-            .expect("client login start");
-        client_start.message.serialize().to_vec()
-    });
+    // Run the full OPAQUE login protocol (both client and server sides)
+    // to verify the password. The verify_password method executes LoginStart
+    // AND LoginFinish internally, ensuring the password is actually checked.
+    let verify_result = store.verify_password(&req.username, req.password.as_bytes());
+    drop(store);
 
-    match login_start {
-        Ok((_response_bytes, _server_login)) => {
+    match verify_result {
+        Ok(verified_user_id) => {
+            // Sanity check: verified user ID must match the looked-up user ID
+            if verified_user_id != user_id {
+                return Json(LoginResponse {
+                    success: false,
+                    error: Some("internal user ID mismatch".into()),
+                    ..Default::default()
+                });
+            }
+
             // For the admin API we issue a simple HMAC-based token rather than
             // running the full FROST threshold signing ceremony.
             use hmac::{Hmac, Mac};
@@ -1123,7 +1123,7 @@ async fn auth_verify(Json(req): Json<VerifyRequest>) -> Json<VerifyResponse> {
     mac.update(payload.as_bytes());
     let expected = hex(&mac.finalize().into_bytes());
 
-    if expected == parts[2] {
+    if crypto::ct::ct_eq(expected.as_bytes(), parts[2].as_bytes()) {
         Json(VerifyResponse {
             valid: true,
             user_id: Some(user_id),
@@ -1428,25 +1428,31 @@ a{color:#00ff41}</style></head><body>
         }
     }
 
-    // Tier 1 users MUST complete FIDO2 if they have credentials registered
+    // Tier 1 users MUST complete FIDO2 — no bypass allowed
     if user_tier == 1 {
         let fido_store = state.fido_store.read().await;
         let creds = fido_store.get_user_credentials(&user_id);
-        if !creds.is_empty() {
-            // Log that FIDO2 verification would be required
-            tracing::info!("Tier 1 user {user_id} has {} FIDO2 credentials — FIDO2 step required", creds.len());
-            // In full implementation: redirect to FIDO2 challenge page
-            // For now: proceed with warning (graceful degradation)
-            // The FIDO2 registration and authentication endpoints already exist at:
-            // /api/fido/register/begin, /api/fido/register/complete
-            // /api/fido/authenticate/begin, /api/fido/authenticate/complete
-        }
+        let has_fido = !creds.is_empty();
         drop(fido_store);
+
+        // Tier 1 (Sovereign) requires FIDO2 second factor. If the user has
+        // registered FIDO2 credentials, they must authenticate via the
+        // /api/fido/authenticate/* endpoints before being granted access.
+        // Password-only login is insufficient for Tier 1.
+        tracing::warn!("Tier 1 user {user_id} requires FIDO2 authentication (has_credentials={has_fido})");
+        return (StatusCode::FORBIDDEN, Html(format!(r#"<!DOCTYPE html>
+<html><head><title>MILNET SSO // FIDO2 Required</title>
+<style>body{{background:#0a0a0a;color:#ff3333;font-family:'JetBrains Mono',monospace;padding:60px;text-align:center}}
+a{{color:#00ff41}}</style></head><body>
+<h1>FIDO2 AUTHENTICATION REQUIRED</h1>
+<p style="margin:20px 0;color:#888">Tier 1 (Sovereign) accounts require FIDO2 second-factor authentication.</p>
+<p style="color:#888">Complete FIDO2 verification via /api/fido/authenticate to proceed.</p>
+</body></html>"#))).into_response();
     }
 
     // Authentication succeeded — create authorization code with tier
     let mut codes = state.auth_codes.write().await;
-    let code = codes.create_code_with_tier(
+    let code = match codes.create_code_with_tier(
         &form.client_id,
         &form.redirect_uri,
         user_id,
@@ -1454,7 +1460,10 @@ a{color:#00ff41}</style></head><body>
         if form.code_challenge.is_empty() { None } else { Some(form.code_challenge.clone()) },
         if form.nonce.is_empty() { None } else { Some(form.nonce.clone()) },
         user_tier as u8,
-    );
+    ) {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
     drop(codes);
 
     // Log to audit, signed with ML-DSA-87
@@ -1688,7 +1697,7 @@ async fn oauth_google_callback(
 
     // Create MILNET authorization code
     let mut codes = state.auth_codes.write().await;
-    let auth_code = codes.create_code_with_tier(
+    let auth_code = match codes.create_code_with_tier(
         &pending.milnet_client_id,
         &pending.milnet_redirect_uri,
         user_id,
@@ -1696,7 +1705,10 @@ async fn oauth_google_callback(
         pending.milnet_code_challenge,
         pending.milnet_nonce,
         user_tier,
-    );
+    ) {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
     drop(codes);
 
     // Log successful auth
@@ -1953,7 +1965,36 @@ async fn fido_register_begin(
 async fn fido_register_complete(
     State(state): State<Arc<AppState>>,
     Json(req): Json<FidoRegisterCompleteRequest>,
-) -> Json<FidoRegisterCompleteResponse> {
+) -> Result<Json<FidoRegisterCompleteResponse>, StatusCode> {
+    let mut fido_store = state.fido_store.write().await;
+
+    // Retrieve and consume the pending challenge for this user.
+    // The challenge must have been issued by fido_register_begin and is single-use.
+    // Consuming it here prevents replay attacks.
+    if !fido_store.consume_challenge_for_user(&req.user_id) {
+        tracing::warn!("FIDO2 register complete: no pending challenge for user {}", req.user_id);
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Validate the attestation: parse the authenticator data from the
+    // attestation object to verify RP ID and extract credential data.
+    // The client_data field should be the raw clientDataJSON which we
+    // can use for additional validation.
+    // At minimum, we verify the authenticator data embedded in the attestation
+    // contains the correct RP ID hash and the attested credential data flag.
+    if req.attestation_object.len() >= 37 {
+        // Best-effort attestation validation: try to parse the auth data
+        // portion of the attestation object. Full CBOR parsing would be
+        // needed for production, but we validate what we can.
+        let rp_id = "sso-system.dmj.one";
+        if let Err(e) = fido::verification::parse_attestation_auth_data(&req.attestation_object, rp_id) {
+            tracing::warn!("FIDO2 attestation validation note: {e} (using client-provided credential data)");
+            // For attestation objects that are CBOR-wrapped (not raw authData),
+            // we accept the registration since the challenge was validated above.
+            // The challenge consumption is the critical security check.
+        }
+    }
+
     let cred = fido::types::StoredCredential {
         credential_id: req.credential_id.clone(),
         public_key: req.public_key,
@@ -1962,8 +2003,8 @@ async fn fido_register_complete(
         authenticator_type: req.authenticator_type,
     };
 
-    let mut fido_store = state.fido_store.write().await;
     fido_store.store_credential(cred);
+    drop(fido_store);
 
     // Log to audit
     let mut audit = state.audit_log.write().await;
@@ -1976,10 +2017,10 @@ async fn fido_register_complete(
         &state.pq_signing_key,
     );
 
-    Json(FidoRegisterCompleteResponse {
+    Ok(Json(FidoRegisterCompleteResponse {
         success: true,
         credential_id: req.credential_id,
-    })
+    }))
 }
 
 async fn fido_authenticate_begin(

@@ -13,13 +13,17 @@ type HmacSha512 = Hmac<Sha512>;
 /// Maximum session epochs (8 hours at 10s/epoch).
 const MAX_SESSION_EPOCHS: u64 = 2880;
 
-/// Verify a token's signature and claims (spec C.11).
+/// Verify a token's signature and claims (spec C.11), optionally enforcing
+/// DPoP channel binding when a client key is provided.
 ///
 /// Verification order:
 /// 1. Check version and expiry
 /// 2. Enforce algorithm field (must be 1 — prevents downgrade attacks)
 /// 3. Check pq_signature is NOT empty (reject if missing)
 /// 4. Verify DPoP hash is non-empty (not all zeros)
+/// 4b. If `client_dpop_key` is provided, verify that the token's `dpop_hash`
+///     actually matches `dpop_key_hash(client_dpop_key)` — prevents token
+///     theft where attacker presents a stolen token without the original key
 /// 5. Validate ratchet_epoch is within reasonable bounds
 /// 6. Verify ML-DSA-65 signature over (claims_msg || frost_signature)
 /// 7. Verify FROST signature over claims_msg
@@ -30,6 +34,28 @@ pub fn verify_token(
     token: &Token,
     public_key_package: &PublicKeyPackage,
     pq_verifying_key: &PqVerifyingKey,
+) -> Result<TokenClaims, MilnetError> {
+    verify_token_inner(token, public_key_package, pq_verifying_key, None)
+}
+
+/// Verify a token's signature and claims, enforcing DPoP binding against the
+/// provided client key. This is the preferred entry point when the caller
+/// knows the expected client key.
+pub fn verify_token_bound(
+    token: &Token,
+    public_key_package: &PublicKeyPackage,
+    pq_verifying_key: &PqVerifyingKey,
+    client_dpop_key: &[u8],
+) -> Result<TokenClaims, MilnetError> {
+    verify_token_inner(token, public_key_package, pq_verifying_key, Some(client_dpop_key))
+}
+
+/// Inner verification logic shared by `verify_token` and `verify_token_bound`.
+fn verify_token_inner(
+    token: &Token,
+    public_key_package: &PublicKeyPackage,
+    pq_verifying_key: &PqVerifyingKey,
+    client_dpop_key: Option<&[u8]>,
 ) -> Result<TokenClaims, MilnetError> {
     // 1. Check version
     if token.header.version != 1 {
@@ -65,6 +91,18 @@ pub fn verify_token(
         return Err(MilnetError::CryptoVerification(
             "DPoP hash is empty (all zeros) — token must be bound to a client key".into(),
         ));
+    }
+
+    // 4b. If a client DPoP key is provided, verify the token's dpop_hash
+    //     actually matches the hash of that key. This prevents an attacker
+    //     from presenting a stolen token without possessing the original key.
+    if let Some(key) = client_dpop_key {
+        let expected_hash = crypto::dpop::dpop_key_hash(key);
+        if !crypto::ct::ct_eq(&token.claims.dpop_hash, &expected_hash) {
+            return Err(MilnetError::CryptoVerification(
+                "DPoP key hash mismatch — token bound to different client".into(),
+            ));
+        }
     }
 
     // 5. Validate ratchet_epoch is within reasonable bounds

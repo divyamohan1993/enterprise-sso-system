@@ -19,3 +19,5 @@ rustls.workspace = true
 tokio-rustls.workspace = true
 rand.workspace = true
 rcgen.workspace = true
+aes-gcm.workspace = true
+getrandom.workspace = true

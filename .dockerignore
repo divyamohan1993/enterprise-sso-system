@@ -1,0 +1,11 @@
+.git
+target
+*.md
+screenshots
+docs
+formal-model
+e2e
+.env
+*.pem
+*.key
+.github

@@ -1,4 +1,11 @@
 use crypto::dpop::*;
+use p256::ecdsa::{SigningKey, VerifyingKey};
+
+fn test_keypair() -> (SigningKey, VerifyingKey) {
+    let sk = SigningKey::random(&mut rand::rngs::OsRng);
+    let vk = VerifyingKey::from(&sk);
+    (sk, vk)
+}
 
 #[test]
 fn test_dpop_key_hash_deterministic() {
@@ -17,33 +24,36 @@ fn test_dpop_key_hash_different_keys_differ() {
 
 #[test]
 fn test_dpop_proof_generation_and_verification() {
-    let key = [7u8; 64];
+    let (sk, vk) = test_keypair();
     let claims = b"test-claims";
     let timestamp = 12345i64;
-    let proof = generate_dpop_proof(&key, claims, timestamp);
-    let key_hash = dpop_key_hash(&key);
-    assert!(verify_dpop_proof(&key, &proof, claims, timestamp, &key_hash));
+    let proof = generate_dpop_proof(&sk, claims, timestamp);
+    let pk_bytes = vk.to_encoded_point(false);
+    let key_hash = dpop_key_hash(pk_bytes.as_bytes());
+    assert!(verify_dpop_proof(&vk, &proof, claims, timestamp, &key_hash));
 }
 
 #[test]
 fn test_dpop_proof_rejects_wrong_key() {
-    let key1 = [7u8; 64];
-    let key2 = [8u8; 64];
+    let (sk1, vk1) = test_keypair();
+    let (_sk2, vk2) = test_keypair();
     let claims = b"test-claims";
     let timestamp = 12345i64;
-    let proof = generate_dpop_proof(&key1, claims, timestamp);
-    let key_hash = dpop_key_hash(&key1);
-    // key2 won't match the key_hash derived from key1
-    assert!(!verify_dpop_proof(&key2, &proof, claims, timestamp, &key_hash));
+    let proof = generate_dpop_proof(&sk1, claims, timestamp);
+    let pk_bytes = vk2.to_encoded_point(false);
+    let key_hash = dpop_key_hash(pk_bytes.as_bytes());
+    // vk2 won't match the signature made with sk1
+    assert!(!verify_dpop_proof(&vk2, &proof, claims, timestamp, &key_hash));
 }
 
 #[test]
 fn test_dpop_proof_rejects_wrong_claims() {
-    let key = [7u8; 64];
+    let (sk, vk) = test_keypair();
     let timestamp = 12345i64;
-    let proof = generate_dpop_proof(&key, b"original", timestamp);
-    let key_hash = dpop_key_hash(&key);
-    assert!(!verify_dpop_proof(&key, &proof, b"tampered", timestamp, &key_hash));
+    let proof = generate_dpop_proof(&sk, b"original", timestamp);
+    let pk_bytes = vk.to_encoded_point(false);
+    let key_hash = dpop_key_hash(pk_bytes.as_bytes());
+    assert!(!verify_dpop_proof(&vk, &proof, b"tampered", timestamp, &key_hash));
 }
 
 #[test]
@@ -55,9 +65,10 @@ fn test_dpop_key_hash_length_is_32() {
 
 #[test]
 fn test_dpop_proof_rejects_wrong_timestamp() {
-    let key = [9u8; 64];
+    let (sk, vk) = test_keypair();
     let claims = b"claims-data";
-    let proof = generate_dpop_proof(&key, claims, 1000);
-    let key_hash = dpop_key_hash(&key);
-    assert!(!verify_dpop_proof(&key, &proof, claims, 2000, &key_hash));
+    let proof = generate_dpop_proof(&sk, claims, 1000);
+    let pk_bytes = vk.to_encoded_point(false);
+    let key_hash = dpop_key_hash(pk_bytes.as_bytes());
+    assert!(!verify_dpop_proof(&vk, &proof, claims, 2000, &key_hash));
 }

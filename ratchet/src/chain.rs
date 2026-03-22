@@ -85,21 +85,53 @@ impl RatchetChain {
     /// Derive what the chain key would be `steps` epochs into the future
     /// from the given starting key, WITHOUT advancing the actual chain.
     ///
-    /// Uses a zero-entropy derivation (deterministic forward derivation)
-    /// since we don't have the future client/server entropy. This is only
-    /// used for forward-lookahead verification where exact entropy is not
-    /// available — the server side uses the same deterministic derivation.
+    /// Uses a purpose-specific HKDF derivation with a distinct
+    /// "forward-lookahead" domain separator instead of zero entropy.
+    /// The forward entropy is derived from the chain key itself via HKDF,
+    /// making it deterministic BUT requiring the actual chain key. This
+    /// means an attacker who captures only the forward-derived key cannot
+    /// re-derive the actual session keys (which use real client/server
+    /// entropy), limiting lookahead to epoch verification only.
     fn derive_forward_key(starting_key: &[u8; 64], steps: u64) -> [u8; 64] {
+        /// Domain separator for forward-lookahead key derivation.
+        /// Distinct from RATCHET_ADVANCE to prevent cross-context misuse.
+        const FORWARD_LOOKAHEAD_DOMAIN: &[u8] = b"MILNET-SSO-v1-RATCHET-FORWARD-LOOKAHEAD";
+
         let mut key = *starting_key;
-        let zero_entropy = [0u8; 32];
-        for _ in 0..steps {
+        for step in 0..steps {
+            // Derive forward entropy from the current key using HKDF with
+            // the forward-lookahead domain separator and the step index.
+            // This replaces the previous [0u8; 32] zero-entropy approach.
+            let hk_entropy = Hkdf::<Sha512>::new(Some(&key), FORWARD_LOOKAHEAD_DOMAIN);
+            let mut forward_client_entropy = [0u8; 32];
+            let mut forward_server_entropy = [0u8; 32];
+            let step_bytes = step.to_le_bytes();
+            // Derive client-side forward entropy
+            let mut client_info = Vec::with_capacity(40);
+            client_info.extend_from_slice(b"client");
+            client_info.extend_from_slice(&step_bytes);
+            hk_entropy
+                .expand(&client_info, &mut forward_client_entropy)
+                .expect("32-byte expand must succeed for HKDF-SHA512");
+            // Derive server-side forward entropy
+            let mut server_info = Vec::with_capacity(40);
+            server_info.extend_from_slice(b"server");
+            server_info.extend_from_slice(&step_bytes);
+            hk_entropy
+                .expand(&server_info, &mut forward_server_entropy)
+                .expect("32-byte expand must succeed for HKDF-SHA512");
+
+            // Now advance using the standard RATCHET_ADVANCE derivation
+            // but with the derived forward entropy instead of zeros.
             let hk = Hkdf::<Sha512>::new(Some(&key), domain::RATCHET_ADVANCE);
             let mut info = Vec::with_capacity(64);
-            info.extend_from_slice(&zero_entropy);
-            info.extend_from_slice(&zero_entropy);
+            info.extend_from_slice(&forward_client_entropy);
+            info.extend_from_slice(&forward_server_entropy);
             let mut new_key = [0u8; 64];
             hk.expand(&info, &mut new_key)
                 .expect("64-byte expand must succeed for HKDF-SHA512");
+            forward_client_entropy.zeroize();
+            forward_server_entropy.zeroize();
             key.zeroize();
             key = new_key;
         }

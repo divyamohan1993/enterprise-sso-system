@@ -6,7 +6,6 @@
 use frost_ristretto255 as frost;
 use frost::keys::{KeyPackage, PublicKeyPackage};
 use frost::{Identifier, SigningPackage};
-use rand::thread_rng;
 use std::collections::BTreeMap;
 
 /// Represents a group of threshold signers.
@@ -32,7 +31,7 @@ pub struct DkgResult {
 /// Run a DKG ceremony to generate a threshold group.
 /// Uses trusted dealer (frost::keys::generate_with_dealer).
 pub fn dkg(total: u16, threshold: u16) -> DkgResult {
-    let mut rng = thread_rng();
+    let mut rng = rand::rngs::OsRng;
     let (shares_map, public_key_package) = frost::keys::generate_with_dealer(
         total,
         threshold,
@@ -78,7 +77,7 @@ pub fn threshold_sign(
         ));
     }
 
-    let mut rng = thread_rng();
+    let mut rng = rand::rngs::OsRng;
 
     // Round 1: each signer commits
     let mut nonces_map: BTreeMap<Identifier, frost::round1::SigningNonces> = BTreeMap::new();

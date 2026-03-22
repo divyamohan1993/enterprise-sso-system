@@ -101,7 +101,7 @@ async fn main() {
                     // Try the new envelope format first, fall back to legacy VerifyRequest
                     let response_bytes = match postcard::from_bytes::<VerifierMessage>(&payload) {
                         Ok(VerifierMessage::Verify(req)) => {
-                            let resp = handle_verify(&req.token_bytes, &group_key, &pq_key, &rl).await;
+                            let resp = handle_verify(&req, &group_key, &pq_key, &rl).await;
                             postcard::to_allocvec(&resp).ok()
                         }
                         Ok(VerifierMessage::Revoke(req)) => {
@@ -112,7 +112,7 @@ async fn main() {
                             // Legacy path: try to deserialize as bare VerifyRequest
                             match postcard::from_bytes::<verifier::VerifyRequest>(&payload) {
                                 Ok(req) => {
-                                    let resp = handle_verify(&req.token_bytes, &group_key, &pq_key, &rl).await;
+                                    let resp = handle_verify(&req, &group_key, &pq_key, &rl).await;
                                     postcard::to_allocvec(&resp).ok()
                                 }
                                 Err(e) => {
@@ -136,29 +136,64 @@ async fn main() {
     }
 }
 
-/// Handle a token verification request with revocation check.
+/// Handle a token verification request with revocation, DPoP, and ratchet checks.
 async fn handle_verify(
-    token_bytes: &[u8],
+    req: &verifier::VerifyRequest,
     group_key: &PublicKeyPackage,
     pq_key: &crypto::pq_sign::PqVerifyingKey,
     rl: &Arc<Mutex<RevocationList>>,
 ) -> VerifyResponse {
-    match postcard::from_bytes::<common::types::Token>(token_bytes) {
+    match postcard::from_bytes::<common::types::Token>(&req.token_bytes) {
         Ok(token) => {
-            let revocation_list = rl.lock().await;
-            match verifier::verify_token_with_revocation(
-                &token, group_key, pq_key, &revocation_list,
-            ) {
-                Ok(claims) => VerifyResponse {
-                    valid: true,
-                    claims: Some(claims),
-                    error: None,
-                },
-                Err(e) => VerifyResponse {
-                    valid: false,
-                    claims: None,
-                    error: Some(e.to_string()),
-                },
+            // 1. Revocation check (fail-fast before expensive crypto)
+            {
+                let revocation_list = rl.lock().await;
+                if let Err(e) = verifier::verify_token_with_revocation(
+                    &token, group_key, pq_key, &revocation_list,
+                ) {
+                    return VerifyResponse {
+                        valid: false,
+                        claims: None,
+                        error: Some(e.to_string()),
+                    };
+                }
+            }
+
+            // 2. DPoP channel binding check (if client DPoP key provided)
+            if let Some(ref dpop_key) = req.client_dpop_key {
+                if let Err(e) = verifier::verify_token_with_dpop(
+                    &token, group_key, pq_key, dpop_key,
+                ) {
+                    return VerifyResponse {
+                        valid: false,
+                        claims: None,
+                        error: Some(e.to_string()),
+                    };
+                }
+            }
+
+            // 3. Ratchet temporal binding check (if ratchet state provided)
+            if let Some(ref ratchet) = req.ratchet_state {
+                if let Err(e) = verifier::verify_token_with_ratchet(
+                    &token,
+                    group_key,
+                    pq_key,
+                    &ratchet.ratchet_key,
+                    ratchet.current_epoch,
+                ) {
+                    return VerifyResponse {
+                        valid: false,
+                        claims: None,
+                        error: Some(e.to_string()),
+                    };
+                }
+            }
+
+            // All checks passed — return valid claims
+            VerifyResponse {
+                valid: true,
+                claims: Some(token.claims.clone()),
+                error: None,
             }
         }
         Err(e) => VerifyResponse {
