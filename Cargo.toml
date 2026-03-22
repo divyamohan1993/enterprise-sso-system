@@ -55,3 +55,6 @@ rcgen = "0.13"
 hex = "0.4"
 rsa = { version = "0.9", features = ["sha2"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "migrate"] }
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+libc = "0.2"

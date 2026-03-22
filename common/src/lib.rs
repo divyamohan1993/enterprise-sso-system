@@ -15,3 +15,7 @@ pub mod types;
 pub mod persistence;
 pub mod shared_keys;
 pub mod witness;
+
+// ── Military hardening modules ──
+pub mod encrypted_db;
+pub mod sealed_keys;

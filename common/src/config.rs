@@ -42,6 +42,33 @@ pub struct SecurityConfig {
     pub verifier_staleness_timeout_secs: u64,
     /// Maximum time the audit subsystem may be degraded.
     pub audit_degradation_max_secs: u64,
+
+    // ── Military hardening parameters ──
+
+    /// Require envelope encryption for all database writes.
+    pub require_encryption_at_rest: bool,
+    /// Require sealed (encrypted) keys — reject raw env vars.
+    pub require_sealed_keys: bool,
+    /// Require binary attestation check at startup.
+    pub require_binary_attestation: bool,
+    /// Binary attestation re-check interval (seconds, 0 = disabled).
+    pub attestation_recheck_interval_secs: u64,
+    /// Require mlock for all key material (fail-closed if unavailable).
+    pub require_mlock: bool,
+    /// Entropy health check: fail-closed on health test failure.
+    pub entropy_fail_closed: bool,
+    /// Maximum allowed entropy health test failures before service shutdown.
+    pub max_entropy_failures: u32,
+    /// Enable continuous entropy self-test at this interval (seconds, 0 = disabled).
+    pub entropy_selftest_interval_secs: u64,
+    /// Key rotation interval for envelope DEKs (seconds).
+    pub dek_rotation_interval_secs: u64,
+    /// Maximum age of any session before forced re-authentication (seconds).
+    pub max_session_age_forced_reauth_secs: u64,
+    /// Require DPoP for all token operations (not just modify).
+    pub require_dpop_all_operations: bool,
+    /// Maximum concurrent sessions per user.
+    pub max_concurrent_sessions_per_user: u32,
 }
 
 impl Default for SecurityConfig {
@@ -65,6 +92,20 @@ impl Default for SecurityConfig {
             share_refresh_interval_secs: 3600,
             verifier_staleness_timeout_secs: 60,
             audit_degradation_max_secs: 1800,
+
+            // Military hardening defaults — all enabled for maximum security
+            require_encryption_at_rest: true,
+            require_sealed_keys: true,
+            require_binary_attestation: true,
+            attestation_recheck_interval_secs: 300, // 5 minutes
+            require_mlock: true,
+            entropy_fail_closed: true,
+            max_entropy_failures: 3,
+            entropy_selftest_interval_secs: 60,
+            dek_rotation_interval_secs: 86400, // 24 hours
+            max_session_age_forced_reauth_secs: 14400, // 4 hours (stricter than 8h max)
+            require_dpop_all_operations: true,
+            max_concurrent_sessions_per_user: 3,
         }
     }
 }

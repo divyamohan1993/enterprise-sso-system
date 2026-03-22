@@ -29,4 +29,36 @@ pub enum MilnetError {
 
     #[error("audit subsystem unavailable")]
     AuditUnavailable,
+
+    // ── Military hardening errors ──
+
+    #[error("envelope encryption failed: {0}")]
+    EnvelopeEncryption(String),
+
+    #[error("envelope decryption failed: {0}")]
+    EnvelopeDecryption(String),
+
+    #[error("key seal/unseal failed: {0}")]
+    KeySeal(String),
+
+    #[error("entropy health check failed: {0}")]
+    EntropyHealth(String),
+
+    #[error("binary attestation failed: {0}")]
+    AttestationFailure(String),
+
+    #[error("secure memory error: {0}")]
+    SecureMemory(String),
+
+    #[error("production mode violation: {0}")]
+    ProductionViolation(String),
+
+    #[error("session limit exceeded: max {max} concurrent sessions")]
+    SessionLimitExceeded { max: u32 },
+
+    #[error("forced re-authentication required")]
+    ForcedReauth,
+
+    #[error("canary violation — possible memory corruption")]
+    CanaryViolation,
 }
