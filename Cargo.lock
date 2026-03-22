@@ -1451,6 +1451,7 @@ version = "0.1.0"
 dependencies = [
  "common",
  "crypto",
+ "hex",
  "postcard",
  "serde",
  "sha3 0.10.8",
@@ -3052,6 +3053,7 @@ dependencies = [
  "crypto",
  "ed25519-dalek",
  "frost-ristretto255",
+ "hex",
  "hmac",
  "ml-dsa",
  "postcard",
@@ -3061,6 +3063,7 @@ dependencies = [
  "shard",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
