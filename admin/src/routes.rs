@@ -50,7 +50,7 @@ async fn auth_middleware(
     let path = request.uri().path();
     if path == "/api/health"
         || path == "/.well-known/openid-configuration"
-        || path == "/oauth/authorize"
+        || path.starts_with("/oauth/")
         || path == "/oauth/token"
         || path.starts_with("/api/auth/")
         || path.starts_with("/api/setup")
@@ -278,6 +278,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         // OIDC / OAuth2
         .route("/.well-known/openid-configuration", get(oidc_discovery))
         .route("/oauth/authorize", get(oauth_authorize))
+        .route("/oauth/authorize/login", post(oauth_authorize_login))
         .route("/oauth/token", post(oauth_token))
         .route("/oauth/userinfo", get(oauth_userinfo))
         // FIDO2/WebAuthn
@@ -794,7 +795,7 @@ async fn oauth_authorize(
     State(state): State<Arc<AppState>>,
     Query(params): Query<AuthorizeParams>,
 ) -> axum::response::Response {
-    use axum::response::IntoResponse;
+    use axum::response::{IntoResponse, Html};
     use axum::http::header;
 
     if params.response_type != "code" {
@@ -813,40 +814,126 @@ async fn oauth_authorize(
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid_redirect_uri"}))).into_response();
     }
 
-    // For SSO flow: auto-approve if there's an authenticated session
-    // In production: show consent screen. For demo: auto-approve with a default user.
-    // Check if setup has a user
+    // Show login page — user MUST authenticate before getting an auth code
+    let login_html = format!(r#"<!DOCTYPE html>
+<html><head><title>MILNET SSO // Authenticate</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{background:#0a0a0a;color:#c0c0c0;font-family:'JetBrains Mono',monospace;min-height:100vh;display:flex;align-items:center;justify-content:center}}
+.c{{text-align:center;max-width:500px;padding:40px}}
+h1{{color:#00ff41;font-size:1.8rem;margin-bottom:5px}}
+h2{{color:#666;font-size:0.8rem;margin-bottom:30px;font-weight:400}}
+.app{{background:#111;border:1px solid #222;border-radius:8px;padding:20px;margin-bottom:20px}}
+.app .name{{color:#00d4ff;font-weight:700}}
+.app .url{{color:#666;font-size:0.75rem}}
+form{{background:#111;border:1px solid #222;border-radius:8px;padding:30px;text-align:left}}
+label{{display:block;color:#00ff41;font-size:0.75rem;text-transform:uppercase;margin-bottom:5px;margin-top:15px}}
+input{{width:100%;padding:12px;background:#0a0a0a;border:1px solid #333;color:#fff;font-family:inherit;font-size:0.9rem;border-radius:4px}}
+input:focus{{outline:none;border-color:#00ff41}}
+button{{width:100%;padding:14px;background:#00ff41;color:#000;font-family:inherit;font-weight:700;font-size:1rem;border:none;border-radius:4px;cursor:pointer;margin-top:20px}}
+button:hover{{background:#00cc33}}
+.err{{color:#ff3333;margin-top:10px;font-size:0.8rem;display:none}}
+.badge{{display:inline-block;background:#002200;border:1px solid #00ff41;color:#00ff41;padding:3px 10px;border-radius:20px;font-size:0.65rem;margin-bottom:15px}}
+</style></head><body>
+<div class="c">
+<div class="badge">MILNET SSO</div>
+<h1>AUTHENTICATE</h1>
+<h2>Sign in to continue</h2>
+<div class="app">
+  <div class="name">{app_name}</div>
+  <div class="url">is requesting access to your account</div>
+</div>
+<form method="POST" action="/oauth/authorize/login">
+  <input type="hidden" name="client_id" value="{client_id}">
+  <input type="hidden" name="redirect_uri" value="{redirect_uri}">
+  <input type="hidden" name="scope" value="{scope}">
+  <input type="hidden" name="state" value="{state}">
+  <input type="hidden" name="nonce" value="{nonce}">
+  <input type="hidden" name="code_challenge" value="{code_challenge}">
+  <label>Username</label>
+  <input type="text" name="username" placeholder="Enter your username" required autofocus>
+  <label>Password</label>
+  <input type="password" name="password" placeholder="Enter your password" required>
+  <button type="submit">SIGN IN</button>
+  <div class="err" id="err"></div>
+</form>
+</div></body></html>"#,
+        app_name = client.name,
+        client_id = params.client_id,
+        redirect_uri = params.redirect_uri,
+        scope = params.scope,
+        state = params.state,
+        nonce = params.nonce.as_deref().unwrap_or(""),
+        code_challenge = params.code_challenge.as_deref().unwrap_or(""),
+    );
+
+    Html(login_html).into_response()
+}
+
+/// Handle the login form POST from the OAuth authorize page
+async fn oauth_authorize_login(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Form(form): axum::extract::Form<OAuthLoginForm>,
+) -> axum::response::Response {
+    use axum::response::{IntoResponse, Html};
+    use axum::http::header;
+
+    // Authenticate the user
     let store = state.credential_store.read().await;
-    let usernames = store.usernames();
-    let user_id = if let Some(first_user) = usernames.first() {
-        // Look up user ID from DB
-        let row = sqlx::query_scalar::<_, String>("SELECT id FROM users WHERE username = $1")
-            .bind(first_user)
-            .fetch_optional(&state.db)
-            .await
-            .ok()
-            .flatten();
-        row.and_then(|id| Uuid::parse_str(&id).ok()).unwrap_or_else(Uuid::new_v4)
-    } else {
-        Uuid::new_v4()
+    let user_id = match store.verify_password(&form.username, form.password.as_bytes()) {
+        Ok(id) => id,
+        Err(_) => {
+            // Authentication failed — show error
+            return Html(format!(r#"<!DOCTYPE html>
+<html><head><title>MILNET SSO // Error</title>
+<style>body{{background:#0a0a0a;color:#ff3333;font-family:'JetBrains Mono',monospace;padding:60px;text-align:center}}
+a{{color:#00ff41}}</style></head><body>
+<h1>AUTHENTICATION FAILED</h1>
+<p style="margin:20px 0;color:#888">Invalid username or password.</p>
+<a href="/oauth/authorize?client_id={}&redirect_uri={}&response_type=code&scope={}&state={}">Try Again</a>
+</body></html>"#,
+                form.client_id, form.redirect_uri, form.scope, form.state
+            )).into_response();
+        }
     };
     drop(store);
 
+    // Authentication succeeded — create authorization code
     let mut codes = state.auth_codes.write().await;
     let code = codes.create_code(
-        &params.client_id,
-        &params.redirect_uri,
+        &form.client_id,
+        &form.redirect_uri,
         user_id,
-        &params.scope,
-        params.code_challenge.clone(),
-        params.nonce.clone(),
+        &form.scope,
+        if form.code_challenge.is_empty() { None } else { Some(form.code_challenge.clone()) },
+        if form.nonce.is_empty() { None } else { Some(form.nonce.clone()) },
     );
     drop(codes);
 
-    // HTTP 302 redirect back to the client with the authorization code
-    let redirect_url = format!("{}?code={}&state={}", params.redirect_uri, code, params.state);
+    // Log to audit
+    let mut audit = state.audit_log.write().await;
+    audit.append(
+        common::types::AuditEventType::AuthSuccess,
+        vec![user_id], vec![], 0.0, vec![],
+    );
+    drop(audit);
 
+    // Redirect back to the client with the auth code
+    let redirect_url = format!("{}?code={}&state={}", form.redirect_uri, code, form.state);
     (StatusCode::FOUND, [(header::LOCATION, redirect_url)]).into_response()
+}
+
+#[derive(Deserialize)]
+struct OAuthLoginForm {
+    username: String,
+    password: String,
+    client_id: String,
+    redirect_uri: String,
+    scope: String,
+    state: String,
+    nonce: String,
+    code_challenge: String,
 }
 
 #[derive(Deserialize)]

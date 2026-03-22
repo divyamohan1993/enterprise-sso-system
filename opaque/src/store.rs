@@ -155,6 +155,51 @@ impl CredentialStore {
 
         self.store_registration(username, registration_bytes)
     }
+
+    /// Verify a password using the full OPAQUE login protocol internally.
+    /// Runs both client and server sides — the password is only used on the
+    /// client side. Returns Ok(user_id) on success.
+    pub fn verify_password(&self, username: &str, password: &[u8]) -> Result<Uuid, MilnetError> {
+        use opaque_ke::{ClientLogin, ClientLoginFinishParameters, ServerLogin, ServerLoginParameters};
+
+        let record = self.users.get(username)
+            .ok_or_else(|| MilnetError::CryptoVerification("user not found".into()))?;
+
+        let server_registration = ServerRegistration::<OpaqueCs>::deserialize(&record.registration)
+            .map_err(|_| MilnetError::CryptoVerification("corrupt registration".into()))?;
+
+        let mut rng = OsRng;
+
+        // Client starts login
+        let client_start = ClientLogin::<OpaqueCs>::start(&mut rng, password)
+            .map_err(|_| MilnetError::CryptoVerification("login start failed".into()))?;
+
+        // Server processes login request
+        let server_start = ServerLogin::<OpaqueCs>::start(
+            &mut rng,
+            &self.server_setup,
+            Some(server_registration),
+            client_start.message,
+            username.as_bytes(),
+            ServerLoginParameters::default(),
+        )
+        .map_err(|_| MilnetError::CryptoVerification("server login failed".into()))?;
+
+        // Client finishes login
+        let client_finish = client_start.state.finish(
+            &mut rng,
+            password,
+            server_start.message,
+            ClientLoginFinishParameters::default(),
+        )
+        .map_err(|_| MilnetError::CryptoVerification("invalid password".into()))?;
+
+        // Server verifies finalization
+        server_start.state.finish(client_finish.message, ServerLoginParameters::default())
+            .map_err(|_| MilnetError::CryptoVerification("authentication failed".into()))?;
+
+        Ok(record.user_id)
+    }
 }
 
 impl Default for CredentialStore {
