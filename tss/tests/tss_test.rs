@@ -327,3 +327,150 @@ fn test_distributed_token_built_and_verifiable() {
     // Ratchet tag must be real
     assert_ne!(token.ratchet_tag, [0u8; 64]);
 }
+
+// ── Runtime signing flow tests (message serde + receipt validation + token) ──
+
+use tss::messages::{SigningRequest, SigningResponse};
+
+#[test]
+fn test_signing_request_roundtrip() {
+    let key = test_signing_key();
+    let chain = build_signed_chain(2, &key);
+    let claims = test_claims();
+    let ratchet_key = test_ratchet_key();
+
+    let request = SigningRequest {
+        receipts: chain,
+        claims,
+        ratchet_key,
+    };
+
+    // Serialize and deserialize with postcard (same as the runtime uses)
+    let bytes = postcard::to_allocvec(&request).expect("serialize SigningRequest");
+    let decoded: SigningRequest = postcard::from_bytes(&bytes).expect("deserialize SigningRequest");
+
+    assert_eq!(decoded.receipts.len(), 2);
+    assert_eq!(decoded.claims.sub, request.claims.sub);
+    assert_eq!(decoded.claims.tier, request.claims.tier);
+    assert_eq!(decoded.ratchet_key, ratchet_key);
+}
+
+#[test]
+fn test_signing_response_roundtrip() {
+    let resp = SigningResponse {
+        success: true,
+        token: Some(vec![1, 2, 3, 4]),
+        error: None,
+    };
+    let bytes = postcard::to_allocvec(&resp).expect("serialize SigningResponse");
+    let decoded: SigningResponse =
+        postcard::from_bytes(&bytes).expect("deserialize SigningResponse");
+    assert!(decoded.success);
+    assert_eq!(decoded.token, Some(vec![1, 2, 3, 4]));
+    assert!(decoded.error.is_none());
+
+    let err_resp = SigningResponse {
+        success: false,
+        token: None,
+        error: Some("bad receipt".into()),
+    };
+    let bytes2 = postcard::to_allocvec(&err_resp).unwrap();
+    let decoded2: SigningResponse = postcard::from_bytes(&bytes2).unwrap();
+    assert!(!decoded2.success);
+    assert!(decoded2.token.is_none());
+    assert_eq!(decoded2.error.as_deref(), Some("bad receipt"));
+}
+
+#[test]
+fn test_full_signing_flow_with_valid_receipts() {
+    // Simulate the runtime flow: deserialize request, validate receipts,
+    // build token, serialize response.
+    let receipt_key = test_signing_key();
+    let chain = build_signed_chain(3, &receipt_key);
+    let claims = test_claims();
+    let ratchet_key = test_ratchet_key();
+
+    let request = SigningRequest {
+        receipts: chain,
+        claims: claims.clone(),
+        ratchet_key,
+    };
+
+    // Serialize as runtime would receive it
+    let payload = postcard::to_allocvec(&request).unwrap();
+
+    // Step 1: Deserialize
+    let decoded: SigningRequest = postcard::from_bytes(&payload).unwrap();
+
+    // Step 2: Validate receipt chain
+    assert!(validate_receipt_chain(&decoded.receipts, &receipt_key).is_ok());
+
+    // Step 3: Build token with distributed signing
+    let mut dkg_result = dkg(5, 3);
+    let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
+    let (pq_sk, _pq_vk) = generate_pq_keypair();
+    let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
+    let token = build_token_distributed(
+        &decoded.claims,
+        &coordinator,
+        &mut signers,
+        &decoded.ratchet_key,
+        &pq_sk,
+    )
+    .expect("build_token_distributed should succeed");
+
+    // Step 4: Serialize response
+    let token_bytes = postcard::to_allocvec(&token).unwrap();
+    let resp = SigningResponse {
+        success: true,
+        token: Some(token_bytes.clone()),
+        error: None,
+    };
+    let resp_bytes = postcard::to_allocvec(&resp).unwrap();
+
+    // Verify response deserializes correctly
+    let decoded_resp: SigningResponse = postcard::from_bytes(&resp_bytes).unwrap();
+    assert!(decoded_resp.success);
+    assert!(decoded_resp.token.is_some());
+
+    // Verify the token inside the response
+    let final_token: common::types::Token =
+        postcard::from_bytes(&decoded_resp.token.unwrap()).unwrap();
+    assert_eq!(final_token.claims.sub, claims.sub);
+    assert_eq!(final_token.claims.tier, claims.tier);
+    assert_ne!(final_token.ratchet_tag, [0u8; 64]);
+    assert_ne!(final_token.frost_signature, [0u8; 64]);
+}
+
+#[test]
+fn test_signing_flow_rejects_invalid_receipts() {
+    let receipt_key = test_signing_key();
+    let mut chain = build_signed_chain(2, &receipt_key);
+
+    // Tamper with signature to break validation
+    chain[0].signature = vec![0xFF; 32];
+
+    let request = SigningRequest {
+        receipts: chain,
+        claims: test_claims(),
+        ratchet_key: test_ratchet_key(),
+    };
+
+    let payload = postcard::to_allocvec(&request).unwrap();
+    let decoded: SigningRequest = postcard::from_bytes(&payload).unwrap();
+
+    // Receipt validation should fail
+    let result = validate_receipt_chain(&decoded.receipts, &receipt_key);
+    assert!(result.is_err());
+
+    // Build error response as runtime would
+    let resp = SigningResponse {
+        success: false,
+        token: None,
+        error: Some(format!("receipt chain invalid: {}", result.unwrap_err())),
+    };
+    let resp_bytes = postcard::to_allocvec(&resp).unwrap();
+    let decoded_resp: SigningResponse = postcard::from_bytes(&resp_bytes).unwrap();
+    assert!(!decoded_resp.success);
+    assert!(decoded_resp.error.unwrap().contains("invalid signature"));
+}
