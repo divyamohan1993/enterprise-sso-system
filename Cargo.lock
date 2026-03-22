@@ -17,6 +17,7 @@ dependencies = [
  "kt",
  "opaque",
  "opaque-ke",
+ "postcard",
  "rand",
  "risk",
  "serde",
@@ -108,6 +109,7 @@ version = "0.1.0"
 dependencies = [
  "common",
  "crypto",
+ "hex",
  "postcard",
  "serde",
  "sha2",

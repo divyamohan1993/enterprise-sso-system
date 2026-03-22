@@ -125,6 +125,16 @@ pub async fn init_database(database_url: &str) -> PgPool {
         )
     "#).execute(&pool).await.expect("Failed to create shard_sequences table");
 
+    sqlx::query(r#"
+        CREATE TABLE IF NOT EXISTS witness_checkpoints (
+            sequence BIGINT PRIMARY KEY,
+            audit_root BYTEA NOT NULL,
+            kt_root BYTEA NOT NULL,
+            timestamp BIGINT NOT NULL,
+            signature BYTEA NOT NULL
+        )
+    "#).execute(&pool).await.expect("Failed to create witness_checkpoints table");
+
     pool
 }
 
