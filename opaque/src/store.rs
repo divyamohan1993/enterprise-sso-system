@@ -113,6 +113,19 @@ impl CredentialStore {
         self.users.keys().cloned().collect()
     }
 
+    /// Restore a user registration from persistent storage (e.g. PostgreSQL).
+    pub fn restore_user(&mut self, username: &str, user_id: Uuid, registration_bytes: Vec<u8>) {
+        self.users.insert(username.to_string(), UserRecord {
+            user_id,
+            registration: registration_bytes,
+        });
+    }
+
+    /// Get the raw OPAQUE registration bytes for a user.
+    pub fn get_registration_bytes(&self, username: &str) -> Option<Vec<u8>> {
+        self.users.get(username).map(|r| r.registration.clone())
+    }
+
     /// Perform OPAQUE registration using the full client+server flow.
     /// This is a convenience method that runs the entire registration
     /// protocol internally (both client and server sides).

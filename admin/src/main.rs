@@ -33,9 +33,56 @@ async fn main() {
     );
     tracing::info!("Pre-seeded OAuth client: demo-app");
 
+    // Try to load existing ServerSetup from DB
+    let server_setup_bytes: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT value FROM server_config WHERE key = 'opaque_server_setup'"
+    )
+        .fetch_optional(&pool)
+        .await
+        .ok()
+        .flatten();
+
+    let credential_store = if let Some(setup_bytes) = server_setup_bytes {
+        // Restore existing ServerSetup — all previous user registrations remain valid
+        use opaque_ke::ServerSetup;
+        let server_setup = ServerSetup::<opaque::opaque_impl::OpaqueCs>::deserialize(&setup_bytes)
+            .expect("Failed to deserialize stored ServerSetup");
+        tracing::info!("Restored OPAQUE ServerSetup from database");
+        opaque::store::CredentialStore::with_server_setup(server_setup)
+    } else {
+        // First run — create new ServerSetup and persist it
+        let store = opaque::store::CredentialStore::new();
+        let setup_bytes: Vec<u8> = store.server_setup().serialize().to_vec();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        sqlx::query("INSERT INTO server_config (key, value, created_at) VALUES ($1, $2, $3)")
+            .bind("opaque_server_setup")
+            .bind(&setup_bytes)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .expect("Failed to persist ServerSetup");
+        tracing::info!("Created and persisted new OPAQUE ServerSetup");
+        store
+    };
+
+    // Restore user registrations from PostgreSQL
+    let rows = sqlx::query_as::<_, (uuid::Uuid, String, Vec<u8>)>(
+        "SELECT id, username, opaque_registration FROM users WHERE opaque_registration IS NOT NULL"
+    )
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+
+    let mut store = credential_store;
+    for (user_id, username, registration) in rows {
+        store.restore_user(&username, user_id, registration);
+    }
+    tracing::info!("Restored {} user registrations from database", store.user_count());
+
     let state = Arc::new(AppState {
         db: pool,
-        credential_store: RwLock::new(opaque::store::CredentialStore::new()),
+        credential_store: RwLock::new(store),
         device_registry: RwLock::new(risk::tiers::DeviceRegistry::new()),
         audit_log: RwLock::new(audit::log::AuditLog::new()),
         kt_tree: RwLock::new(kt::merkle::MerkleTree::new()),

@@ -91,6 +91,14 @@ pub async fn init_database(database_url: &str) -> PgPool {
     "#).execute(&pool).await.expect("Failed to create oauth_codes table");
 
     sqlx::query(r#"
+        CREATE TABLE IF NOT EXISTS server_config (
+            key VARCHAR(255) PRIMARY KEY,
+            value BYTEA NOT NULL,
+            created_at BIGINT NOT NULL
+        )
+    "#).execute(&pool).await.expect("Failed to create server_config table");
+
+    sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS fido_credentials (
             credential_id BYTEA PRIMARY KEY,
             user_id UUID NOT NULL,
