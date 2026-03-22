@@ -109,6 +109,22 @@ pub async fn init_database(database_url: &str) -> PgPool {
         )
     "#).execute(&pool).await.expect("Failed to create fido_credentials table");
 
+    sqlx::query(r#"
+        CREATE TABLE IF NOT EXISTS key_material (
+            key_name VARCHAR(255) PRIMARY KEY,
+            key_bytes BYTEA NOT NULL,
+            created_at BIGINT NOT NULL,
+            rotated_at BIGINT
+        )
+    "#).execute(&pool).await.expect("Failed to create key_material table");
+
+    sqlx::query(r#"
+        CREATE TABLE IF NOT EXISTS shard_sequences (
+            module_pair VARCHAR(100) PRIMARY KEY,
+            sequence BIGINT NOT NULL DEFAULT 0
+        )
+    "#).execute(&pool).await.expect("Failed to create shard_sequences table");
+
     pool
 }
 
