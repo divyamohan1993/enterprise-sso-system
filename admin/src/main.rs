@@ -93,6 +93,9 @@ async fn main() {
         admin_api_key: api_key,
         fido_store: RwLock::new(fido::registration::CredentialStore::new()),
         setup_complete: Arc::new(AtomicBool::new(false)),
+        pending_ceremonies: RwLock::new(std::collections::HashMap::new()),
+        last_level4_ceremony: RwLock::new(None),
+        level4_count_72h: RwLock::new(Vec::new()),
     });
 
     let app = api_router(state);
