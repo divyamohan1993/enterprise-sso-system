@@ -203,9 +203,10 @@ pub struct PortalResponse {
 
 #[derive(Deserialize)]
 pub struct EnrollDeviceRequest {
-    pub tier: u8,
-    pub attestation_hash: String,
-    pub enrolled_by: Uuid,
+    pub name: Option<String>,
+    pub tier: Option<u8>,
+    pub attestation_hash: Option<String>,
+    pub enrolled_by: Option<Uuid>,
 }
 
 #[derive(Serialize)]
@@ -611,22 +612,25 @@ async fn enroll_device(
     let req: EnrollDeviceRequest = serde_json::from_slice(&body)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
     let device_id = Uuid::new_v4();
+    let tier = req.tier.unwrap_or(2).min(4).max(1);
+    let attestation = req.attestation_hash.unwrap_or_default();
+    let enrolled_by = req.enrolled_by.unwrap_or_else(Uuid::new_v4);
 
     let _ = sqlx::query(
         "INSERT INTO devices (id, tier, attestation_hash, enrolled_by, is_active, created_at) VALUES ($1, $2, $3, $4, true, $5)"
     )
     .bind(device_id)
-    .bind(req.tier as i32)
-    .bind(req.attestation_hash.as_bytes())
-    .bind(req.enrolled_by)
+    .bind(tier as i32)
+    .bind(attestation.as_bytes())
+    .bind(enrolled_by)
     .bind(now_secs())
     .execute(&state.db)
     .await;
 
     Ok(Json(DeviceResponse {
         device_id,
-        tier: req.tier,
-        enrolled_by: req.enrolled_by,
+        tier,
+        enrolled_by,
         is_active: true,
     }))
 }
