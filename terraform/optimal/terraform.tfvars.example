@@ -1,0 +1,36 @@
+# ============================================================================
+# MILNET SSO — Optimal Cost Configuration
+# ============================================================================
+# Copy this file to terraform.tfvars and fill in your values.
+# NEVER commit terraform.tfvars to version control (it contains secrets).
+# ============================================================================
+
+project_id = "lmsforshantithakur"
+
+region = "us-central1"
+zone   = "us-central1-a"
+
+environment = "production"
+
+# Domain for the Admin API (must have DNS control)
+domain = "sso.example.com"
+
+# Database password — use a strong random password
+# Generate with: openssl rand -base64 32
+db_password = "CHANGE_ME_GENERATE_WITH_openssl_rand_base64_32"
+
+# Database sizing (db-f1-micro is fine for <1000 logins/day)
+db_tier         = "db-f1-micro"
+db_disk_size_gb = 10
+
+# Audit BFT replicas (3 = f=1 fault tolerance, cost-optimized)
+audit_bft_replicas = 3
+
+# Cloud Armor rate limit (requests per minute per IP)
+cloud_armor_rate_limit = 120
+
+# Container image tag
+container_image_tag = "latest"
+
+# Source repository
+github_repo = "https://github.com/divyamohan1993/enterprise-sso-system.git"
