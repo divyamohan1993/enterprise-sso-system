@@ -528,14 +528,15 @@ async fn test_attack_credential_stuffing_attack() {
 
     // Register user "admin". Try wrong passwords in rapid succession.
     // All must fail. The correct password must still work after the attack.
-    // Limited to stay within per-IP rate limit (10 connections per 60s).
-    // We use 7 wrong + 1 correct = 8 total connections.
+    // Limited to stay within per-IP rate limit (10 connections per 60s)
+    // and account lockout threshold (5 failed attempts).
+    // We use 4 wrong + 1 correct = 5 total connections (under lockout limit).
     let mut store = CredentialStore::new();
     store.register_with_password("admin", b"correct_password");
     let (gateway_addr, group_key) = boot_full_system(store).await;
 
-    // 7 wrong passwords — sent sequentially to test persistence under attack
-    for i in 0..7 {
+    // 4 wrong passwords — stays under the 5-attempt lockout threshold
+    for i in 0..4 {
         let wrong = format!("wrong_password_{i}");
         let resp = client_auth(&gateway_addr, "admin", wrong.as_bytes()).await;
         assert!(!resp.success, "stuffed credential {i} must fail");

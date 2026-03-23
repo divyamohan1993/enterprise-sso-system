@@ -152,7 +152,19 @@ async fn main() {
         session_activity: RwLock::new(std::collections::HashMap::new()),
         login_attempts: RwLock::new(std::collections::HashMap::new()),
         pq_signing_key: pq_signing_key,
+        session_tracker: Arc::new(common::session_limits::SessionTracker::new(
+            common::config::SecurityConfig::default().max_concurrent_sessions_per_user,
+        )),
     });
+
+    // Start the key rotation monitor in the background
+    let _rotation_shutdown = common::key_rotation::start_rotation_monitor(
+        common::key_rotation::RotationSchedule::default(),
+        || {
+            tracing::info!("Key rotation callback invoked (manual rotation required)");
+            Ok(())
+        },
+    );
 
     let app = api_router(state);
 

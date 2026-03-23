@@ -430,6 +430,7 @@ dependencies = [
  "ml-dsa",
  "postcard",
  "serde",
+ "serde_json",
  "sha2",
  "sqlx",
  "subtle",

@@ -208,6 +208,23 @@ impl RiskEngine {
     pub fn requires_termination(&self, score: f64) -> bool {
         score >= 0.8
     }
+
+    /// Check if a user is currently locked out due to too many failed attempts.
+    /// Returns true if the user has exceeded `max_attempts` within the tracking window.
+    pub fn is_locked_out(&self, user_id: &Uuid, max_attempts: u32) -> bool {
+        let counter = self.failed_attempt_counter.lock().unwrap_or_else(|e| e.into_inner());
+        match counter.get(user_id) {
+            Some((count, first_attempt)) => {
+                // Check if still within the lockout window
+                if first_attempt.elapsed().as_secs() > FAILED_ATTEMPT_WINDOW_SECS {
+                    false // Window expired, not locked out
+                } else {
+                    *count >= max_attempts
+                }
+            }
+            None => false,
+        }
+    }
 }
 
 impl Default for RiskEngine {

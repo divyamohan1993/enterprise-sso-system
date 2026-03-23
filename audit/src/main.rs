@@ -238,6 +238,15 @@ fn persist_seed(path: &Path, seed: &[u8; 32]) {
                 tracing::error!("Failed to sync seed file {:?}: {}", path, e);
             } else {
                 tracing::info!("Persisted ML-DSA-87 seed to {:?}", path);
+                // Set restrictive permissions (owner read/write only)
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let perms = std::fs::Permissions::from_mode(0o600);
+                    if let Err(e) = std::fs::set_permissions(path, perms) {
+                        tracing::error!("Failed to set permissions on {:?}: {}", path, e);
+                    }
+                }
             }
         }
         Err(e) => {
@@ -262,6 +271,16 @@ fn persist_verifying_key(path: &Path, vk: &crypto::pq_sign::PqVerifyingKey) {
                 tracing::error!("Failed to write verifying key to {:?}: {}", path, e);
             } else if let Err(e) = f.sync_all() {
                 tracing::error!("Failed to sync verifying key file {:?}: {}", path, e);
+            } else {
+                // Set restrictive permissions (owner read/write only)
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let perms = std::fs::Permissions::from_mode(0o600);
+                    if let Err(e) = std::fs::set_permissions(path, perms) {
+                        tracing::error!("Failed to set permissions on {:?}: {}", path, e);
+                    }
+                }
             }
         }
         Err(e) => {

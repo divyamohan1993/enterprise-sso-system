@@ -492,7 +492,8 @@ async fn recv_raw_frame(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
     if len > MAX_FRAME_LEN {
         return Err(format!("frame too large: {len} bytes"));
     }
-    let mut buf = vec![0u8; len as usize];
+    let buf_len = usize::try_from(len).map_err(|_| "frame size overflows usize".to_string())?;
+    let mut buf = vec![0u8; buf_len];
     stream
         .read_exact(&mut buf)
         .await

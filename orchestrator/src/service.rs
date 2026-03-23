@@ -28,6 +28,10 @@ pub struct OrchestratorService {
     pub risk_engine: risk::scoring::RiskEngine,
     /// TLS connector for outbound mTLS connections to peer services.
     pub tls_connector: TlsConnector,
+    /// Circuit breaker for OPAQUE service connections.
+    pub opaque_breaker: common::circuit_breaker::CircuitBreaker,
+    /// Circuit breaker for TSS service connections.
+    pub tss_breaker: common::circuit_breaker::CircuitBreaker,
 }
 
 impl OrchestratorService {
@@ -47,6 +51,8 @@ impl OrchestratorService {
             tss_addr,
             risk_engine: risk::scoring::RiskEngine::new(),
             tls_connector,
+            opaque_breaker: common::circuit_breaker::CircuitBreaker::new(3, std::time::Duration::from_secs(30)),
+            tss_breaker: common::circuit_breaker::CircuitBreaker::new(3, std::time::Duration::from_secs(30)),
         }
     }
 
@@ -63,12 +69,17 @@ impl OrchestratorService {
             tss_addr,
             risk_engine: risk::scoring::RiskEngine::new(),
             tls_connector,
+            opaque_breaker: common::circuit_breaker::CircuitBreaker::new(3, std::time::Duration::from_secs(30)),
+            tss_breaker: common::circuit_breaker::CircuitBreaker::new(3, std::time::Duration::from_secs(30)),
         }
     }
 
     /// Connect to the OPAQUE service via SHARD over mTLS.
     async fn connect_opaque(&self) -> Result<TlsShardTransport, String> {
-        tls_connect(
+        if !self.opaque_breaker.allow_request() {
+            return Err("OPAQUE service circuit breaker is open — service unavailable".into());
+        }
+        match tls_connect(
             &self.opaque_addr,
             ModuleId::Orchestrator,
             self.hmac_key,
@@ -76,12 +87,24 @@ impl OrchestratorService {
             "localhost",
         )
         .await
-        .map_err(|e| format!("connect to OPAQUE: {e}"))
+        {
+            Ok(transport) => {
+                self.opaque_breaker.record_success();
+                Ok(transport)
+            }
+            Err(e) => {
+                self.opaque_breaker.record_failure();
+                Err(format!("connect to OPAQUE: {e}"))
+            }
+        }
     }
 
     /// Connect to the TSS service via SHARD over mTLS.
     async fn connect_tss(&self) -> Result<TlsShardTransport, String> {
-        tls_connect(
+        if !self.tss_breaker.allow_request() {
+            return Err("TSS service circuit breaker is open — service unavailable".into());
+        }
+        match tls_connect(
             &self.tss_addr,
             ModuleId::Orchestrator,
             self.hmac_key,
@@ -89,17 +112,41 @@ impl OrchestratorService {
             "localhost",
         )
         .await
-        .map_err(|e| format!("connect to TSS: {e}"))
+        {
+            Ok(transport) => {
+                self.tss_breaker.record_success();
+                Ok(transport)
+            }
+            Err(e) => {
+                self.tss_breaker.record_failure();
+                Err(format!("connect to TSS: {e}"))
+            }
+        }
     }
 
     /// Process a single authentication request end-to-end.
     pub async fn process_auth(&self, request: &OrchestratorRequest) -> OrchestratorResponse {
         match self.process_auth_inner(request).await {
-            Ok(token_bytes) => OrchestratorResponse {
-                success: true,
-                token_bytes: Some(token_bytes),
-                error: None,
-            },
+            Ok(token_bytes) => {
+                // Emit SIEM event for successful authentication
+                common::siem::SecurityEvent::auth_success(
+                    {
+                        use sha2::{Digest, Sha256};
+                        let hash = Sha256::digest(request.username.as_bytes());
+                        let mut bytes = [0u8; 16];
+                        bytes.copy_from_slice(&hash[..16]);
+                        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+                        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+                        Uuid::from_bytes(bytes)
+                    },
+                    None,
+                );
+                OrchestratorResponse {
+                    success: true,
+                    token_bytes: Some(token_bytes),
+                    error: None,
+                }
+            }
             Err(e) => {
                 // Record the failed attempt in the server-side counter.
                 // Derive deterministic user ID from username for rate limiting
@@ -113,6 +160,11 @@ impl OrchestratorService {
                     Uuid::from_bytes(bytes)
                 };
                 self.risk_engine.record_failed_attempt(&user_id);
+                common::siem::SecurityEvent::auth_failure(
+                    Some(user_id),
+                    None,
+                    &e,
+                );
 
                 OrchestratorResponse {
                     success: false,
@@ -132,6 +184,25 @@ impl OrchestratorService {
         // 1. Generate ceremony session ID
         let session_id = generate_nonce();
         let mut session = CeremonySession::new(session_id);
+
+        // Account lockout check: reject if user has exceeded max failed attempts
+        {
+            use sha2::{Digest, Sha256};
+            let hash = Sha256::digest(request.username.as_bytes());
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(&hash[..16]);
+            bytes[6] = (bytes[6] & 0x0f) | 0x40;
+            bytes[8] = (bytes[8] & 0x3f) | 0x80;
+            let user_id = Uuid::from_bytes(bytes);
+            let config = common::config::SecurityConfig::default();
+            if self.risk_engine.is_locked_out(&user_id, config.max_failed_attempts) {
+                common::siem::SecurityEvent::account_lockout(user_id);
+                return Err(format!(
+                    "account locked: too many failed attempts (max {}), try again later",
+                    config.max_failed_attempts
+                ));
+            }
+        }
 
         // 2. OPAQUE Login Round 1: Client starts, sends CredentialRequest
         //    Runs in spawn_blocking because Argon2id KSF is CPU-bound.

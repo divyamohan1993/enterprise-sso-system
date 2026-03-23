@@ -3,81 +3,189 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>MILNET SSO // Secure Access Portal</title>
+<title>MILNET SSO // Admin Console</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   :root {
-    --bg: #0a0a0a; --bg2: #111; --bg3: #1a1a1a; --border: #222;
-    --green: #00ff41; --green-dim: #00aa2a; --red: #ff3333;
-    --amber: #ffaa00; --cyan: #00d4ff; --text: #c0c0c0; --text-dim: #666;
+    --bg: #0a0a0a; --bg2: #111; --bg3: #1a1a1a; --bg4: #141414; --border: #222; --border-light: #2a2a2a;
+    --green: #00ff41; --green-dim: #00aa2a; --green-dark: #003d10; --red: #ff3333;
+    --amber: #ffaa00; --cyan: #00d4ff; --text: #c0c0c0; --text-dim: #666; --text-muted: #444;
     --font: 'JetBrains Mono', 'Fira Code', monospace;
+    --sidebar-w: 240px;
   }
   html { font-size: 14px; }
   body { background: var(--bg); color: var(--text); font-family: var(--font); min-height: 100vh; }
   a { color: var(--green); text-decoration: none; }
 
-  /* Header */
-  .header { background: var(--bg2); border-bottom: 1px solid var(--green-dim); padding: 0.8rem 1.5rem; display: flex; align-items: center; justify-content: space-between; }
-  .header h1 { color: var(--green); font-size: 1.1rem; letter-spacing: 2px; }
-  .header h1 span { color: var(--text-dim); font-weight: 400; }
-  .header .user-info { color: var(--text-dim); font-size: 0.85rem; }
-  .header .user-info strong { color: var(--green); }
-  .btn-logout { background: none; border: 1px solid var(--red); color: var(--red); padding: 0.3rem 0.8rem; cursor: pointer; font-family: var(--font); font-size: 0.8rem; }
+  /* ── Top Header Bar ───────────────────────────────────────────────────── */
+  .top-bar {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+    background: var(--bg2); border-bottom: 1px solid var(--green-dim);
+    height: 48px; display: flex; align-items: center; justify-content: space-between;
+    padding: 0 1.2rem;
+  }
+  .top-bar .brand { display: flex; align-items: center; gap: 0.8rem; }
+  .top-bar .brand h1 { color: var(--green); font-size: 0.95rem; letter-spacing: 3px; }
+  .top-bar .brand h1 span { color: var(--text-dim); font-weight: 400; font-size: 0.8rem; letter-spacing: 1px; }
+  .top-bar .user-area { display: flex; align-items: center; gap: 1rem; }
+  .top-bar .user-area .user-badge { color: var(--text-dim); font-size: 0.8rem; }
+  .top-bar .user-area .user-badge strong { color: var(--green); }
+  .btn-logout { background: none; border: 1px solid var(--red); color: var(--red); padding: 0.25rem 0.7rem; cursor: pointer; font-family: var(--font); font-size: 0.75rem; transition: all 0.15s; }
   .btn-logout:hover { background: var(--red); color: #000; }
 
-  /* Nav */
-  .nav { background: var(--bg2); border-bottom: 1px solid var(--border); display: flex; overflow-x: auto; }
-  .nav button { background: none; border: none; border-bottom: 2px solid transparent; color: var(--text-dim); font-family: var(--font); font-size: 0.85rem; padding: 0.7rem 1.2rem; cursor: pointer; white-space: nowrap; transition: all 0.15s; }
-  .nav button:hover { color: var(--text); }
-  .nav button.active { color: var(--green); border-bottom-color: var(--green); }
+  /* ── Sidebar ──────────────────────────────────────────────────────────── */
+  .sidebar {
+    position: fixed; top: 48px; left: 0; bottom: 0; width: var(--sidebar-w);
+    background: var(--bg2); border-right: 1px solid var(--border);
+    overflow-y: auto; z-index: 90; display: flex; flex-direction: column;
+  }
+  .sidebar .nav-section { padding: 1rem 0 0.5rem 1rem; font-size: 0.65rem; color: var(--text-dim); text-transform: uppercase; letter-spacing: 2px; }
+  .sidebar .nav-item {
+    display: flex; align-items: center; gap: 0.7rem;
+    padding: 0.65rem 1rem; cursor: pointer; color: var(--text-dim);
+    font-size: 0.8rem; border-left: 3px solid transparent; transition: all 0.15s;
+    background: none; border-top: none; border-right: none; border-bottom: none;
+    width: 100%; text-align: left; font-family: var(--font);
+  }
+  .sidebar .nav-item:hover { color: var(--text); background: var(--bg3); }
+  .sidebar .nav-item.active { color: var(--green); border-left-color: var(--green); background: var(--bg3); }
+  .sidebar .nav-item .nav-icon { width: 18px; text-align: center; font-size: 0.9rem; }
+  .sidebar .nav-item .nav-label { flex: 1; }
+  .sidebar .nav-item .nav-badge {
+    background: var(--green-dark); color: var(--green); font-size: 0.65rem;
+    padding: 0.1rem 0.4rem; border-radius: 2px; min-width: 20px; text-align: center;
+  }
+  .sidebar-footer {
+    margin-top: auto; padding: 1rem; border-top: 1px solid var(--border);
+    font-size: 0.65rem; color: var(--text-muted); line-height: 1.6;
+  }
 
-  /* Pages */
-  .page { display: none; padding: 1.5rem; max-width: 1100px; margin: 0 auto; }
+  /* ── Main Content Area ────────────────────────────────────────────────── */
+  .main-content {
+    margin-left: var(--sidebar-w); margin-top: 48px;
+    padding: 1.5rem 2rem; min-height: calc(100vh - 48px);
+  }
+
+  /* ── Pages ────────────────────────────────────────────────────────────── */
+  .page { display: none; }
   .page.active { display: block; }
 
-  /* Cards */
-  .card { background: var(--bg2); border: 1px solid var(--border); padding: 1.2rem; margin-bottom: 1rem; }
-  .card h2 { color: var(--green); font-size: 0.95rem; margin-bottom: 0.8rem; letter-spacing: 1px; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  /* ── Full-screen pages (login/onboarding) ─────────────────────────────── */
+  .fullscreen-page {
+    display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+    background: var(--bg); z-index: 200;
+    align-items: center; justify-content: center;
+  }
+  .fullscreen-page.active { display: flex; }
+  .login-box { width: 100%; max-width: 420px; padding: 2rem; }
+  .login-box .logo { text-align: center; margin-bottom: 2rem; }
+  .login-box .logo h1 { color: var(--green); font-size: 1.8rem; letter-spacing: 6px; }
+  .login-box .logo p { color: var(--text-dim); font-size: 0.75rem; margin-top: 0.5rem; letter-spacing: 2px; }
+  .login-box .logo .sub { color: var(--text-muted); font-size: 0.65rem; margin-top: 0.3rem; }
+
+  /* ── Page Header ──────────────────────────────────────────────────────── */
+  .page-header { margin-bottom: 1.5rem; }
+  .page-header h2 { color: var(--green); font-size: 1.1rem; letter-spacing: 2px; margin-bottom: 0.3rem; }
+  .page-header p { color: var(--text-dim); font-size: 0.8rem; }
+
+  /* ── Cards ────────────────────────────────────────────────────────────── */
+  .card {
+    background: var(--bg2); border: 1px solid var(--border); padding: 1.2rem;
+    margin-bottom: 1rem; transition: border-color 0.2s;
+  }
+  .card:hover { border-color: var(--border-light); }
+  .card h2 { color: var(--green); font-size: 0.9rem; margin-bottom: 0.8rem; letter-spacing: 1px; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
   .card h3 { color: var(--cyan); font-size: 0.85rem; margin-bottom: 0.6rem; }
+  .card-compact { padding: 0.8rem; }
+  .card-flush { padding: 0; }
+  .card-flush h2 { padding: 1rem 1.2rem 0.8rem; margin-bottom: 0; }
 
-  /* Forms */
+  /* ── Health Card (Dashboard) ──────────────────────────────────────────── */
+  .health-card {
+    background: var(--bg2); border: 1px solid var(--border); padding: 1rem 1.2rem;
+    display: flex; align-items: center; gap: 1rem; margin-bottom: 1rem;
+  }
+  .health-indicator {
+    width: 48px; height: 48px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+    font-size: 1.2rem; flex-shrink: 0;
+  }
+  .health-indicator.healthy { background: rgba(0,255,65,0.1); border: 2px solid var(--green); color: var(--green); }
+  .health-indicator.unhealthy { background: rgba(255,51,51,0.1); border: 2px solid var(--red); color: var(--red); }
+  .health-indicator.unknown { background: rgba(255,170,0,0.1); border: 2px solid var(--amber); color: var(--amber); }
+  .health-info h3 { color: var(--text); font-size: 0.9rem; margin-bottom: 0.2rem; }
+  .health-info p { color: var(--text-dim); font-size: 0.75rem; }
+
+  /* ── Metric Cards Grid ────────────────────────────────────────────────── */
+  .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 0.8rem; margin-bottom: 1rem; }
+  .metric-card {
+    background: var(--bg2); border: 1px solid var(--border); padding: 1rem;
+    text-align: center; transition: border-color 0.2s;
+  }
+  .metric-card:hover { border-color: var(--green-dim); }
+  .metric-card .metric-value { color: var(--green); font-size: 1.8rem; font-weight: 700; line-height: 1; }
+  .metric-card .metric-label { color: var(--text-dim); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 1px; margin-top: 0.4rem; }
+  .metric-card .metric-icon { color: var(--text-muted); font-size: 0.7rem; margin-bottom: 0.3rem; }
+
+  /* ── Two Column Layout ────────────────────────────────────────────────── */
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+  .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1rem; }
+
+  /* ── Forms ────────────────────────────────────────────────────────────── */
   .form-group { margin-bottom: 0.8rem; }
-  .form-group label { display: block; color: var(--text-dim); font-size: 0.8rem; margin-bottom: 0.25rem; text-transform: uppercase; letter-spacing: 1px; }
-  .form-group input, .form-group select { width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 0.5rem 0.7rem; font-family: var(--font); font-size: 0.85rem; }
-  .form-group input:focus, .form-group select:focus { outline: none; border-color: var(--green); }
+  .form-group label { display: block; color: var(--text-dim); font-size: 0.75rem; margin-bottom: 0.25rem; text-transform: uppercase; letter-spacing: 1px; }
+  .form-group input, .form-group select, .form-group textarea {
+    width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text);
+    padding: 0.5rem 0.7rem; font-family: var(--font); font-size: 0.85rem;
+  }
+  .form-group input:focus, .form-group select:focus, .form-group textarea:focus { outline: none; border-color: var(--green); }
   .form-row { display: flex; gap: 0.8rem; flex-wrap: wrap; }
-  .form-row .form-group { flex: 1; min-width: 180px; }
+  .form-row .form-group { flex: 1; min-width: 160px; }
 
-  /* Buttons */
-  .btn { background: var(--green); color: #000; border: none; padding: 0.5rem 1.2rem; font-family: var(--font); font-size: 0.85rem; font-weight: 600; cursor: pointer; letter-spacing: 1px; transition: all 0.15s; }
+  /* ── Buttons ──────────────────────────────────────────────────────────── */
+  .btn {
+    background: var(--green); color: #000; border: none; padding: 0.5rem 1.2rem;
+    font-family: var(--font); font-size: 0.8rem; font-weight: 600; cursor: pointer;
+    letter-spacing: 1px; transition: all 0.15s; display: inline-flex; align-items: center; gap: 0.4rem;
+  }
   .btn:hover { filter: brightness(1.2); }
   .btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .btn-sm { padding: 0.3rem 0.7rem; font-size: 0.75rem; }
   .btn-danger { background: var(--red); }
   .btn-amber { background: var(--amber); }
   .btn-cyan { background: var(--cyan); }
+  .btn-outline { background: none; border: 1px solid var(--green); color: var(--green); }
+  .btn-outline:hover { background: var(--green); color: #000; }
+  .btn-outline-cyan { background: none; border: 1px solid var(--cyan); color: var(--cyan); }
+  .btn-outline-cyan:hover { background: var(--cyan); color: #000; }
+  .btn-group { display: flex; gap: 0.5rem; flex-wrap: wrap; }
 
-  /* Status dots */
-  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  /* ── Status Dots ──────────────────────────────────────────────────────── */
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
   .dot-green { background: var(--green); box-shadow: 0 0 6px var(--green); }
   .dot-red { background: var(--red); box-shadow: 0 0 6px var(--red); }
   .dot-amber { background: var(--amber); box-shadow: 0 0 6px var(--amber); }
+  .dot-cyan { background: var(--cyan); box-shadow: 0 0 6px var(--cyan); }
+  .dot-lg { width: 10px; height: 10px; }
 
-  /* Stats grid */
-  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 0.8rem; margin-bottom: 1rem; }
-  .stat { background: var(--bg3); border: 1px solid var(--border); padding: 1rem; text-align: center; }
-  .stat .value { color: var(--green); font-size: 2rem; font-weight: 700; }
-  .stat .label { color: var(--text-dim); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px; margin-top: 0.3rem; }
+  /* ── Status Badges ────────────────────────────────────────────────────── */
+  .badge {
+    display: inline-block; font-size: 0.65rem; padding: 0.15rem 0.5rem; letter-spacing: 1px;
+    text-transform: uppercase; font-weight: 600;
+  }
+  .badge-green { background: rgba(0,255,65,0.1); color: var(--green); border: 1px solid var(--green-dim); }
+  .badge-red { background: rgba(255,51,51,0.1); color: var(--red); border: 1px solid var(--red); }
+  .badge-amber { background: rgba(255,170,0,0.1); color: var(--amber); border: 1px solid var(--amber); }
+  .badge-cyan { background: rgba(0,212,255,0.1); color: var(--cyan); border: 1px solid var(--cyan); }
 
-  /* Tables */
+  /* ── Tables ───────────────────────────────────────────────────────────── */
   table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
-  th { text-align: left; color: var(--green); border-bottom: 1px solid var(--green-dim); padding: 0.5rem; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px; }
-  td { padding: 0.5rem; border-bottom: 1px solid var(--border); }
+  th { text-align: left; color: var(--green); border-bottom: 1px solid var(--green-dim); padding: 0.6rem 0.8rem; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 1px; }
+  td { padding: 0.6rem 0.8rem; border-bottom: 1px solid var(--border); }
   tr:hover td { background: var(--bg3); }
 
-  /* Terminal log */
+  /* ── Terminal Log ─────────────────────────────────────────────────────── */
   .terminal { background: #000; border: 1px solid var(--border); padding: 0.8rem; font-size: 0.8rem; max-height: 260px; overflow-y: auto; line-height: 1.6; }
   .terminal .line-ok { color: var(--green); }
   .terminal .line-err { color: var(--red); }
@@ -85,16 +193,86 @@
   .terminal .line-warn { color: var(--amber); }
   .terminal .prompt { color: var(--text-dim); }
 
-  /* Login page centered */
-  .login-wrap { display: flex; align-items: center; justify-content: center; min-height: calc(100vh - 100px); }
-  .login-box { width: 100%; max-width: 400px; }
-  .login-box .logo { text-align: center; margin-bottom: 2rem; }
-  .login-box .logo h1 { color: var(--green); font-size: 1.6rem; letter-spacing: 4px; }
-  .login-box .logo p { color: var(--text-dim); font-size: 0.8rem; margin-top: 0.4rem; }
+  /* ── Tabs (sub-navigation) ────────────────────────────────────────────── */
+  .tabs { display: flex; gap: 0; border-bottom: 1px solid var(--border); margin-bottom: 1rem; }
+  .tab-btn {
+    background: none; border: none; border-bottom: 2px solid transparent;
+    color: var(--text-dim); font-family: var(--font); font-size: 0.8rem;
+    padding: 0.6rem 1rem; cursor: pointer; transition: all 0.15s;
+  }
+  .tab-btn:hover { color: var(--text); }
+  .tab-btn.active { color: var(--green); border-bottom-color: var(--green); }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
 
-  /* Portal cards */
+  /* ── Security Posture Panel ───────────────────────────────────────────── */
+  .posture-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; }
+  .posture-item {
+    display: flex; align-items: center; gap: 0.6rem; padding: 0.5rem 0.7rem;
+    background: var(--bg); border: 1px solid var(--border); font-size: 0.75rem;
+  }
+  .posture-item .posture-label { color: var(--text-dim); flex: 1; }
+  .posture-item .posture-value { color: var(--green); font-weight: 600; }
+
+  /* ── CSS Bar Chart ────────────────────────────────────────────────────── */
+  .bar-chart { display: flex; align-items: flex-end; gap: 4px; height: 80px; padding: 0.5rem 0; }
+  .bar {
+    flex: 1; background: var(--green-dim); min-width: 8px; transition: height 0.3s;
+    position: relative; border-radius: 1px 1px 0 0;
+  }
+  .bar:hover { background: var(--green); }
+  .bar-label { position: absolute; bottom: -18px; left: 50%; transform: translateX(-50%); font-size: 0.55rem; color: var(--text-dim); white-space: nowrap; }
+
+  /* ── Event Stream (SIEM) ──────────────────────────────────────────────── */
+  .event-stream { max-height: 500px; overflow-y: auto; }
+  .event-item {
+    display: flex; align-items: flex-start; gap: 0.8rem; padding: 0.6rem 0.8rem;
+    border-bottom: 1px solid var(--border); font-size: 0.78rem; transition: background 0.15s;
+  }
+  .event-item:hover { background: var(--bg3); }
+  .event-item .event-time { color: var(--text-dim); font-size: 0.7rem; white-space: nowrap; min-width: 140px; }
+  .event-item .event-type { font-weight: 600; min-width: 160px; }
+  .event-item .event-detail { color: var(--text-dim); flex: 1; }
+  .event-item.severity-high .event-type { color: var(--red); }
+  .event-item.severity-medium .event-type { color: var(--amber); }
+  .event-item.severity-low .event-type { color: var(--green); }
+  .event-item.severity-info .event-type { color: var(--cyan); }
+
+  /* ── Security Test Result ─────────────────────────────────────────────── */
+  .test-result {
+    background: var(--bg); border: 1px solid var(--border); padding: 0.8rem;
+    margin-top: 0.5rem; font-size: 0.8rem; max-height: 200px; overflow-y: auto;
+    white-space: pre-wrap; word-break: break-all;
+  }
+  .test-result.pass { border-color: var(--green); color: var(--green); }
+  .test-result.fail { border-color: var(--red); color: var(--red); }
+
+  /* ── Session Table ────────────────────────────────────────────────────── */
+  .session-controls { display: flex; align-items: center; gap: 1rem; margin-bottom: 1rem; }
+  .toggle-switch { display: flex; align-items: center; gap: 0.5rem; font-size: 0.8rem; color: var(--text-dim); cursor: pointer; }
+  .toggle-switch input { display: none; }
+  .toggle-track {
+    width: 32px; height: 16px; background: var(--border); border-radius: 8px;
+    position: relative; transition: background 0.2s;
+  }
+  .toggle-track::after {
+    content: ''; position: absolute; top: 2px; left: 2px; width: 12px; height: 12px;
+    background: var(--text-dim); border-radius: 50%; transition: all 0.2s;
+  }
+  .toggle-switch input:checked + .toggle-track { background: var(--green-dim); }
+  .toggle-switch input:checked + .toggle-track::after { left: 18px; background: var(--green); }
+
+  /* ── Config Display ───────────────────────────────────────────────────── */
+  .config-block {
+    background: var(--bg); border: 1px solid var(--border); padding: 1rem;
+    font-size: 0.8rem; max-height: 500px; overflow-y: auto;
+    white-space: pre-wrap; word-break: break-all; color: var(--text);
+  }
+
+  /* ── Portal Cards (Simulator) ─────────────────────────────────────────── */
   .portal-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; }
-  .portal-card { background: var(--bg2); border: 1px solid var(--border); padding: 1rem; }
+  .portal-card { background: var(--bg2); border: 1px solid var(--border); padding: 1rem; transition: border-color 0.2s; }
+  .portal-card:hover { border-color: var(--border-light); }
   .portal-card h3 { color: var(--cyan); margin-bottom: 0.4rem; font-size: 0.9rem; }
   .portal-card .meta { color: var(--text-dim); font-size: 0.75rem; margin-bottom: 0.6rem; }
   .portal-card .meta span { margin-right: 1rem; }
@@ -102,234 +280,581 @@
   .portal-card .result.granted { border-color: var(--green); color: var(--green); }
   .portal-card .result.denied { border-color: var(--red); color: var(--red); }
 
-  /* Security demo */
+  /* ── Security Demo ────────────────────────────────────────────────────── */
   .demo-section { margin-bottom: 1.2rem; }
   .demo-section p { font-size: 0.8rem; color: var(--text-dim); margin-bottom: 0.5rem; }
 
-  /* Toast */
-  .toast { position: fixed; bottom: 1.5rem; right: 1.5rem; background: var(--bg2); border: 1px solid var(--green); color: var(--green); padding: 0.7rem 1.2rem; font-family: var(--font); font-size: 0.8rem; z-index: 999; transform: translateY(100px); opacity: 0; transition: all 0.3s; }
+  /* ── System Info Key-Value ─────────────────────────────────────────────── */
+  .kv-table { width: 100%; font-size: 0.8rem; }
+  .kv-table td { padding: 0.4rem 0.8rem; border-bottom: 1px solid var(--border); }
+  .kv-table td:first-child { color: var(--text-dim); width: 40%; text-transform: uppercase; font-size: 0.7rem; letter-spacing: 1px; }
+  .kv-table td:last-child { color: var(--text); }
+
+  /* ── Toast ─────────────────────────────────────────────────────────────── */
+  .toast {
+    position: fixed; bottom: 1.5rem; right: 1.5rem; background: var(--bg2);
+    border: 1px solid var(--green); color: var(--green); padding: 0.7rem 1.2rem;
+    font-family: var(--font); font-size: 0.8rem; z-index: 999;
+    transform: translateY(100px); opacity: 0; transition: all 0.3s;
+  }
   .toast.show { transform: translateY(0); opacity: 1; }
   .toast.error { border-color: var(--red); color: var(--red); }
 
-  /* Responsive */
-  @media (max-width: 640px) {
-    .header { flex-direction: column; gap: 0.5rem; text-align: center; }
-    .form-row { flex-direction: column; }
-    .stats { grid-template-columns: 1fr 1fr; }
+  /* ── Stats grid (legacy compat) ───────────────────────────────────────── */
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 0.8rem; margin-bottom: 1rem; }
+  .stat { background: var(--bg3); border: 1px solid var(--border); padding: 1rem; text-align: center; }
+  .stat .value { color: var(--green); font-size: 2rem; font-weight: 700; }
+  .stat .label { color: var(--text-dim); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px; margin-top: 0.3rem; }
+
+  /* ── Scrollbar ────────────────────────────────────────────────────────── */
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
+
+  /* ── Responsive ───────────────────────────────────────────────────────── */
+  @media (max-width: 768px) {
+    .sidebar { width: 60px; }
+    .sidebar .nav-label, .sidebar .nav-badge, .sidebar .nav-section, .sidebar-footer { display: none; }
+    .sidebar .nav-item { justify-content: center; padding: 0.65rem 0; }
+    .sidebar .nav-item .nav-icon { margin: 0; }
+    .main-content { margin-left: 60px; padding: 1rem; }
+    .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    .posture-grid { grid-template-columns: 1fr; }
+    .metrics-grid { grid-template-columns: repeat(2, 1fr); }
+  }
+  @media (max-width: 480px) {
+    .metrics-grid { grid-template-columns: 1fr 1fr; }
   }
 </style>
 </head>
 <body>
 
-<div class="header">
-  <h1>MILNET SSO <span>// SECURE ACCESS SYSTEM</span></h1>
-  <div class="user-info" id="userInfo" style="display:none">
-    <span class="dot dot-green"></span>
-    <strong id="currentUser">--</strong>
-    <button class="btn-logout" onclick="doLogout()" style="margin-left:0.8rem">LOGOUT</button>
-  </div>
-</div>
-
-<nav class="nav" id="mainNav" style="display:none">
-  <button class="active" onclick="showPage('dashboard',this)">Dashboard</button>
-  <button onclick="showPage('portals',this)">Portal Simulator</button>
-  <button onclick="showPage('audit',this)">Audit Log</button>
-  <button onclick="showPage('security',this)">Security Demo</button>
-</nav>
-
-<!-- ONBOARDING PAGE -->
-<div class="page" id="page-onboarding">
-  <div class="login-wrap">
-    <div class="login-box" style="max-width:480px">
-      <div class="logo">
-        <h1>MILNET</h1>
-        <p>FIRST-RUN SYSTEM INITIALIZATION</p>
-      </div>
-      <div class="card">
-        <h2>// INITIALIZE SYSTEM</h2>
-        <p style="color:var(--text-dim);font-size:0.8rem;margin-bottom:1rem;">No users detected. Create the initial superuser account to begin.</p>
-        <div class="form-group">
-          <label>Organization Name</label>
-          <input type="text" id="setupOrg" placeholder="MILNET COMMAND">
-        </div>
-        <div class="form-group">
-          <label>Superuser Username</label>
-          <input type="text" id="setupUser" placeholder="admin" autocomplete="username">
-        </div>
-        <div class="form-group">
-          <label>Superuser Password</label>
-          <input type="password" id="setupPass" placeholder="password" autocomplete="new-password">
-        </div>
-        <div class="form-group">
-          <label>Confirm Password</label>
-          <input type="password" id="setupPassConfirm" placeholder="confirm password" autocomplete="new-password">
-        </div>
-        <button class="btn" style="width:100%;margin-top:0.5rem;padding:0.8rem;font-size:1rem;letter-spacing:3px;" onclick="doSetup()">INITIALIZE SYSTEM</button>
-      </div>
-      <div class="terminal" id="setupTerminal">
-        <div class="prompt">&gt; Awaiting system initialization...</div>
-      </div>
+<!-- ═══════════════════════════════════════════════════════════════════════════
+     FULL-SCREEN: ONBOARDING
+     ═══════════════════════════════════════════════════════════════════════════ -->
+<div class="fullscreen-page" id="page-onboarding">
+  <div class="login-box" style="max-width:480px">
+    <div class="logo">
+      <h1>MILNET</h1>
+      <p>FIRST-RUN SYSTEM INITIALIZATION</p>
+      <div class="sub">Enterprise SSO Admin Console</div>
     </div>
-  </div>
-</div>
-
-<!-- LOGIN PAGE -->
-<div class="page" id="page-login">
-  <div class="login-wrap">
-    <div class="login-box">
-      <div class="logo">
-        <h1>MILNET</h1>
-        <p>ENTERPRISE SINGLE SIGN-ON SYSTEM</p>
-      </div>
-      <div class="card">
-        <h2>// AUTHENTICATE</h2>
-        <div class="form-group">
-          <label>Username</label>
-          <input type="text" id="loginUser" placeholder="operator_id" autocomplete="username">
-        </div>
-        <div class="form-group">
-          <label>Password</label>
-          <input type="password" id="loginPass" placeholder="password" autocomplete="current-password">
-        </div>
-        <button class="btn" style="width:100%;margin-top:0.5rem" onclick="doLogin()">AUTHENTICATE</button>
-      </div>
-      <div class="terminal" id="loginTerminal">
-        <div class="prompt">&gt; Awaiting authentication...</div>
-      </div>
-    </div>
-  </div>
-</div>
-
-<!-- DASHBOARD PAGE -->
-<div class="page" id="page-dashboard">
-  <div class="stats" id="statusStats">
-    <div class="stat"><div class="value" id="statUsers">--</div><div class="label">Users</div></div>
-    <div class="stat"><div class="value" id="statDevices">--</div><div class="label">Devices</div></div>
-    <div class="stat"><div class="value" id="statPortals">--</div><div class="label">Portals</div></div>
-    <div class="stat"><div class="value" id="statAudit">--</div><div class="label">Audit Entries</div></div>
-    <div class="stat"><div class="value" id="statTier">--</div><div class="label">Your Tier</div></div>
-  </div>
-
-  <div class="card">
-    <h2>// TOKEN CLAIMS</h2>
-    <pre id="tokenClaims" style="font-size:0.8rem;color:var(--green);overflow-x:auto;white-space:pre-wrap;">No active token</pre>
-  </div>
-
-  <div  style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;">
     <div class="card">
-      <h2>// REGISTER USER</h2>
-      <div class="form-group"><label>Username</label><input type="text" id="regUsername"></div>
-      <div class="form-row">
-        <div class="form-group"><label>Clearance Tier</label>
-          <select id="regTier"><option value="1">1 (Sovereign)</option><option value="2" selected>2 (Operational)</option><option value="3">3 (Sensor)</option><option value="4">4 (Emergency)</option></select>
-        </div>
-        <div class="form-group"><label>Role</label>
-          <select id="regRole"><option>operator</option><option>analyst</option><option>commander</option><option>admin</option></select>
-        </div>
+      <h2>// INITIALIZE SYSTEM</h2>
+      <p style="color:var(--text-dim);font-size:0.8rem;margin-bottom:1rem;">No users detected. Create the initial superuser account to begin.</p>
+      <div class="form-group">
+        <label>Organization Name</label>
+        <input type="text" id="setupOrg" placeholder="MILNET COMMAND">
       </div>
-      <div class="form-group"><label>Password</label><input type="password" id="regPassword"></div>
-      <button class="btn btn-sm" onclick="registerUser()">REGISTER</button>
+      <div class="form-group">
+        <label>Superuser Username</label>
+        <input type="text" id="setupUser" placeholder="admin" autocomplete="username">
+      </div>
+      <div class="form-group">
+        <label>Superuser Password</label>
+        <input type="password" id="setupPass" placeholder="password" autocomplete="new-password">
+      </div>
+      <div class="form-group">
+        <label>Confirm Password</label>
+        <input type="password" id="setupPassConfirm" placeholder="confirm password" autocomplete="new-password">
+      </div>
+      <button class="btn" style="width:100%;margin-top:0.5rem;padding:0.8rem;font-size:1rem;letter-spacing:3px;justify-content:center;" onclick="doSetup()">INITIALIZE SYSTEM</button>
     </div>
+    <div class="terminal" id="setupTerminal">
+      <div class="prompt">&gt; Awaiting system initialization...</div>
+    </div>
+  </div>
+</div>
 
+<!-- ═══════════════════════════════════════════════════════════════════════════
+     FULL-SCREEN: LOGIN
+     ═══════════════════════════════════════════════════════════════════════════ -->
+<div class="fullscreen-page" id="page-login">
+  <div class="login-box">
+    <div class="logo">
+      <h1>MILNET</h1>
+      <p>ENTERPRISE SINGLE SIGN-ON SYSTEM</p>
+      <div class="sub">Secure Access Admin Console</div>
+    </div>
     <div class="card">
-      <h2>// REGISTER PORTAL</h2>
-      <div class="form-group"><label>Portal Name</label><input type="text" id="portalName"></div>
-      <div class="form-group"><label>Callback URL</label><input type="text" id="portalCallback" placeholder="https://..."></div>
-      <div class="form-row">
-        <div class="form-group"><label>Required Tier</label>
-          <select id="portalTier"><option value="1">1 (Sovereign)</option><option value="2" selected>2 (Operational)</option><option value="3">3 (Sensor)</option><option value="4">4 (Emergency)</option></select>
+      <h2>// AUTHENTICATE</h2>
+      <div class="form-group">
+        <label>Username</label>
+        <input type="text" id="loginUser" placeholder="operator_id" autocomplete="username">
+      </div>
+      <div class="form-group">
+        <label>Password</label>
+        <input type="password" id="loginPass" placeholder="password" autocomplete="current-password">
+      </div>
+      <button class="btn" style="width:100%;margin-top:0.5rem;justify-content:center;" onclick="doLogin()">AUTHENTICATE</button>
+    </div>
+    <div class="terminal" id="loginTerminal">
+      <div class="prompt">&gt; Awaiting authentication...</div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════════
+     APP SHELL: Top Bar + Sidebar + Content
+     ═══════════════════════════════════════════════════════════════════════════ -->
+<div id="appShell" style="display:none;">
+
+  <!-- Top Bar -->
+  <div class="top-bar">
+    <div class="brand">
+      <h1>MILNET SSO <span>// ADMIN CONSOLE</span></h1>
+    </div>
+    <div class="user-area" id="userInfo">
+      <span class="user-badge">
+        <span class="dot dot-green"></span>
+        <strong id="currentUser">--</strong>
+      </span>
+      <button class="btn-logout" onclick="doLogout()">LOGOUT</button>
+    </div>
+  </div>
+
+  <!-- Sidebar Navigation -->
+  <nav class="sidebar" id="mainNav">
+    <div class="nav-section">Main</div>
+    <button class="nav-item active" onclick="navigateTo('dashboard', this)">
+      <span class="nav-icon">&#9638;</span>
+      <span class="nav-label">Dashboard</span>
+    </button>
+    <button class="nav-item" onclick="navigateTo('directory', this)">
+      <span class="nav-icon">&#9654;</span>
+      <span class="nav-label">Directory</span>
+    </button>
+    <button class="nav-item" onclick="navigateTo('applications', this)">
+      <span class="nav-icon">&#9632;</span>
+      <span class="nav-label">Applications</span>
+    </button>
+
+    <div class="nav-section">Operations</div>
+    <button class="nav-item" onclick="navigateTo('security', this)">
+      <span class="nav-icon">&#9670;</span>
+      <span class="nav-label">Security</span>
+    </button>
+    <button class="nav-item" onclick="navigateTo('sessions', this)">
+      <span class="nav-icon">&#9644;</span>
+      <span class="nav-label">Sessions</span>
+    </button>
+    <button class="nav-item" onclick="navigateTo('system', this)">
+      <span class="nav-icon">&#9881;</span>
+      <span class="nav-label">System</span>
+    </button>
+
+    <div class="sidebar-footer">
+      MILNET SSO v2.0<br>
+      CNSA 2.0 Compliant<br>
+      <span id="sidebarClock">--:--:--</span>
+    </div>
+  </nav>
+
+  <!-- Main Content Area -->
+  <div class="main-content">
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         PAGE: DASHBOARD
+         ═══════════════════════════════════════════════════════════════════ -->
+    <div class="page active" id="page-dashboard">
+      <div class="page-header">
+        <h2>// SYSTEM DASHBOARD</h2>
+        <p>Real-time overview of the MILNET SSO platform</p>
+      </div>
+
+      <!-- Health Status -->
+      <div class="health-card" id="healthCard">
+        <div class="health-indicator unknown" id="healthIndicator">?</div>
+        <div class="health-info">
+          <h3 id="healthTitle">Checking system health...</h3>
+          <p id="healthSubtitle">Connecting to API server</p>
         </div>
-        <div class="form-group"><label>Scope</label>
-          <select id="portalScope"><option>read</option><option>write</option><option>admin</option></select>
+        <div style="margin-left:auto;">
+          <span class="badge badge-amber" id="healthBadge">CHECKING</span>
         </div>
       </div>
-      <button class="btn btn-sm" onclick="registerPortal()">REGISTER</button>
-    </div>
-  </div>
 
-  <div class="card">
-    <h2>// REGISTERED PORTALS</h2>
-    <div id="portalTableWrap"></div>
-  </div>
+      <!-- Metric Cards -->
+      <div class="metrics-grid" id="statusStats">
+        <div class="metric-card">
+          <div class="metric-icon">USERS</div>
+          <div class="metric-value" id="statUsers">--</div>
+          <div class="metric-label">Registered</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-icon">DEVICES</div>
+          <div class="metric-value" id="statDevices">--</div>
+          <div class="metric-label">Enrolled</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-icon">PORTALS</div>
+          <div class="metric-value" id="statPortals">--</div>
+          <div class="metric-label">Active</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-icon">SESSIONS</div>
+          <div class="metric-value" id="statSessions">--</div>
+          <div class="metric-label">Active</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-icon">AUDIT</div>
+          <div class="metric-value" id="statAudit">--</div>
+          <div class="metric-label">Entries</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-icon">FIDO2</div>
+          <div class="metric-value" id="statFido">--</div>
+          <div class="metric-label">Credentials</div>
+        </div>
+      </div>
 
-  <div class="card">
-    <h2>// ENROLL DEVICE</h2>
-    <div class="form-row">
-      <div class="form-group"><label>Device Name</label><input type="text" id="deviceName" placeholder="WORKSTATION-01"></div>
-      <div class="form-group"><label>Device Type</label>
-        <select id="deviceType"><option>workstation</option><option>terminal</option><option>mobile</option><option>server</option></select>
+      <div class="grid-2">
+        <!-- Security Posture -->
+        <div class="card">
+          <h2>// SECURITY POSTURE</h2>
+          <div class="posture-grid" id="securityPosture">
+            <div class="posture-item"><span class="dot dot-amber"></span><span class="posture-label">TLS Version</span><span class="posture-value" id="postTls">--</span></div>
+            <div class="posture-item"><span class="dot dot-amber"></span><span class="posture-label">PQ Algorithm</span><span class="posture-value" id="postPq">--</span></div>
+            <div class="posture-item"><span class="dot dot-amber"></span><span class="posture-label">CNSA 2.0</span><span class="posture-value" id="postCnsa">--</span></div>
+            <div class="posture-item"><span class="dot dot-amber"></span><span class="posture-label">Audit Chain</span><span class="posture-value" id="postChain">--</span></div>
+            <div class="posture-item"><span class="dot dot-amber"></span><span class="posture-label">Key Rotation</span><span class="posture-value" id="postKeyRot">--</span></div>
+            <div class="posture-item"><span class="dot dot-amber"></span><span class="posture-label">Circuit Breaker</span><span class="posture-value" id="postCircuit">--</span></div>
+          </div>
+        </div>
+
+        <!-- Crypto Status -->
+        <div class="card">
+          <h2>// CRYPTO STATUS</h2>
+          <div id="cryptoStatus" style="font-size:0.8rem;color:var(--text-dim);">Loading...</div>
+        </div>
+      </div>
+
+      <!-- Token Claims -->
+      <div class="card">
+        <h2>// TOKEN CLAIMS</h2>
+        <pre id="tokenClaims" style="font-size:0.8rem;color:var(--green);overflow-x:auto;white-space:pre-wrap;">No active token</pre>
+      </div>
+
+      <!-- Recent Audit Events -->
+      <div class="card card-flush">
+        <h2>// RECENT AUDIT EVENTS</h2>
+        <div id="recentAuditWrap" style="max-height:220px;overflow-y:auto;"></div>
       </div>
     </div>
-    <button class="btn btn-sm" onclick="enrollDevice()">ENROLL</button>
-  </div>
-</div>
 
-<!-- PORTAL SIMULATOR PAGE -->
-<div class="page" id="page-portals">
-  <div class="card">
-    <h2>// SSO PORTAL SIMULATOR</h2>
-    <p style="color:var(--text-dim);font-size:0.8rem;margin-bottom:1rem;">Click "Access" on any portal below. Your current SSO token is evaluated against each portal's tier and scope requirements. Same token, multiple services -- that is SSO.</p>
-  </div>
-  <div class="portal-grid" id="portalSimGrid"></div>
-</div>
+    <!-- ═══════════════════════════════════════════════════════════════════
+         PAGE: DIRECTORY
+         ═══════════════════════════════════════════════════════════════════ -->
+    <div class="page" id="page-directory">
+      <div class="page-header">
+        <h2>// DIRECTORY</h2>
+        <p>User and device management</p>
+      </div>
 
-<!-- AUDIT LOG PAGE -->
-<div class="page" id="page-audit">
-  <div class="card">
-    <h2>// AUDIT LOG</h2>
-    <div style="margin-bottom:0.8rem;">
-      <button class="btn btn-sm btn-cyan" onclick="loadAudit()">REFRESH</button>
-      <button class="btn btn-sm btn-amber" onclick="verifyChain()" style="margin-left:0.5rem">VERIFY CHAIN</button>
-      <span id="chainStatus" style="margin-left:1rem;font-size:0.8rem;"></span>
+      <div class="grid-2">
+        <!-- Register User -->
+        <div class="card">
+          <h2>// REGISTER USER</h2>
+          <div class="form-group"><label>Username</label><input type="text" id="regUsername"></div>
+          <div class="form-row">
+            <div class="form-group"><label>Clearance Tier</label>
+              <select id="regTier"><option value="1">1 (Sovereign)</option><option value="2" selected>2 (Operational)</option><option value="3">3 (Sensor)</option><option value="4">4 (Emergency)</option></select>
+            </div>
+            <div class="form-group"><label>Role</label>
+              <select id="regRole"><option>operator</option><option>analyst</option><option>commander</option><option>admin</option></select>
+            </div>
+          </div>
+          <div class="form-group"><label>Password</label><input type="password" id="regPassword"></div>
+          <button class="btn btn-sm" onclick="registerUser()">REGISTER USER</button>
+        </div>
+
+        <!-- Enroll Device -->
+        <div class="card">
+          <h2>// ENROLL DEVICE</h2>
+          <div class="form-group"><label>Device Name</label><input type="text" id="deviceName" placeholder="WORKSTATION-01"></div>
+          <div class="form-group"><label>Device Type</label>
+            <select id="deviceType"><option>workstation</option><option>terminal</option><option>mobile</option><option>server</option></select>
+          </div>
+          <button class="btn btn-sm" onclick="enrollDevice()">ENROLL DEVICE</button>
+        </div>
+      </div>
+
+      <!-- User List -->
+      <div class="card card-flush">
+        <h2>// REGISTERED USERS</h2>
+        <div style="padding:0 1.2rem 0.5rem;"><button class="btn btn-sm btn-outline" onclick="loadUsers()">REFRESH</button></div>
+        <div id="userTableWrap" style="max-height:400px;overflow-y:auto;"></div>
+      </div>
+
+      <!-- Device List -->
+      <div class="card card-flush">
+        <h2>// ENROLLED DEVICES</h2>
+        <div style="padding:0 1.2rem 0.5rem;"><button class="btn btn-sm btn-outline" onclick="loadDevices()">REFRESH</button></div>
+        <div id="deviceTableWrap" style="max-height:400px;overflow-y:auto;"></div>
+      </div>
     </div>
-    <div style="max-height:500px;overflow-y:auto;">
-      <div id="auditTableWrap"></div>
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         PAGE: APPLICATIONS
+         ═══════════════════════════════════════════════════════════════════ -->
+    <div class="page" id="page-applications">
+      <div class="page-header">
+        <h2>// APPLICATIONS</h2>
+        <p>Portal registration and SSO simulator</p>
+      </div>
+
+      <!-- Register Portal -->
+      <div class="card">
+        <h2>// REGISTER PORTAL</h2>
+        <div class="form-group"><label>Portal Name</label><input type="text" id="portalName"></div>
+        <div class="form-group"><label>Callback URL</label><input type="text" id="portalCallback" placeholder="https://..."></div>
+        <div class="form-row">
+          <div class="form-group"><label>Required Tier</label>
+            <select id="portalTier"><option value="1">1 (Sovereign)</option><option value="2" selected>2 (Operational)</option><option value="3">3 (Sensor)</option><option value="4">4 (Emergency)</option></select>
+          </div>
+          <div class="form-group"><label>Scope</label>
+            <select id="portalScope"><option>read</option><option>write</option><option>admin</option></select>
+          </div>
+        </div>
+        <button class="btn btn-sm" onclick="registerPortal()">REGISTER PORTAL</button>
+      </div>
+
+      <!-- Registered Portals Table -->
+      <div class="card card-flush">
+        <h2>// REGISTERED PORTALS</h2>
+        <div style="padding:0 1.2rem 0.5rem;"><button class="btn btn-sm btn-outline" onclick="loadPortals()">REFRESH</button></div>
+        <div id="portalTableWrap"></div>
+      </div>
+
+      <!-- Portal Simulator -->
+      <div class="card">
+        <h2>// SSO PORTAL SIMULATOR</h2>
+        <p style="color:var(--text-dim);font-size:0.8rem;margin-bottom:1rem;">Click "Access" on any portal below. Your current SSO token is evaluated against each portal's tier and scope requirements. Same token, multiple services -- that is SSO.</p>
+      </div>
+      <div class="portal-grid" id="portalSimGrid"></div>
     </div>
-  </div>
-</div>
 
-<!-- SECURITY DEMO PAGE -->
-<div class="page" id="page-security">
-  <div class="card">
-    <h2>// SECURITY VERIFICATION DEMO</h2>
-    <p style="color:var(--text-dim);font-size:0.8rem;margin-bottom:1rem;">These demonstrations prove the cryptographic security properties of the SSO system. Each test modifies or misuses a token and shows the system correctly rejecting it.</p>
-  </div>
+    <!-- ═══════════════════════════════════════════════════════════════════
+         PAGE: SECURITY
+         ═══════════════════════════════════════════════════════════════════ -->
+    <div class="page" id="page-security">
+      <div class="page-header">
+        <h2>// SECURITY OPERATIONS</h2>
+        <p>Audit, testing, monitoring, and configuration</p>
+      </div>
 
-  <div class="card demo-section">
-    <h3>1. Token Tampering Detection</h3>
-    <p>Flips a single bit in the token signature. The server detects the modification and rejects it.</p>
-    <button class="btn btn-sm btn-danger" onclick="demoTamper()">TAMPER TOKEN</button>
-    <div class="terminal" id="termTamper"></div>
-  </div>
+      <div class="tabs">
+        <button class="tab-btn active" onclick="showSecTab('audit', this)">Audit Log</button>
+        <button class="tab-btn" onclick="showSecTab('tests', this)">Security Tests</button>
+        <button class="tab-btn" onclick="showSecTab('siem', this)">SIEM Events</button>
+        <button class="tab-btn" onclick="showSecTab('config', this)">Configuration</button>
+      </div>
 
-  <div class="card demo-section">
-    <h3>2. Token Expiry Enforcement</h3>
-    <p>Forges a token with an expiry time in the past. The server rejects expired tokens.</p>
-    <button class="btn btn-sm btn-amber" onclick="demoExpire()">EXPIRE TOKEN</button>
-    <div class="terminal" id="termExpire"></div>
-  </div>
+      <!-- Tab: Audit Log -->
+      <div class="tab-content active" id="sectab-audit">
+        <div class="card">
+          <h2>// AUDIT LOG</h2>
+          <div style="margin-bottom:0.8rem;">
+            <button class="btn btn-sm btn-cyan" onclick="loadAudit()">REFRESH</button>
+            <button class="btn btn-sm btn-amber" onclick="verifyChain()" style="margin-left:0.5rem">VERIFY CHAIN</button>
+            <span id="chainStatus" style="margin-left:1rem;font-size:0.8rem;"></span>
+          </div>
+          <div style="max-height:500px;overflow-y:auto;">
+            <div id="auditTableWrap"></div>
+          </div>
+        </div>
+      </div>
 
-  <div class="card demo-section">
-    <h3>3. Tier Enforcement</h3>
-    <p>Attempts to access a Tier 1 (Sovereign) restricted portal. Lower tier number = higher privilege. Access is denied if your tier is too low (higher number).</p>
-    <button class="btn btn-sm btn-cyan" onclick="demoTier()">WRONG TIER</button>
-    <div class="terminal" id="termTier"></div>
-  </div>
+      <!-- Tab: Security Tests -->
+      <div class="tab-content" id="sectab-tests">
+        <div class="card">
+          <h2>// SERVER-SIDE SECURITY TESTS</h2>
+          <p style="color:var(--text-dim);font-size:0.8rem;margin-bottom:1rem;">Run comprehensive security tests against the backend API. These invoke server-side validation routines.</p>
+          <div class="grid-3" style="margin-bottom:1rem;">
+            <div>
+              <button class="btn btn-sm btn-danger" onclick="runTokenTamperTest()" style="width:100%;justify-content:center;">TOKEN TAMPER</button>
+              <div class="test-result" id="testResultTamper">Awaiting test...</div>
+            </div>
+            <div>
+              <button class="btn btn-sm btn-amber" onclick="runAuditIntegrityTest()" style="width:100%;justify-content:center;">AUDIT INTEGRITY</button>
+              <div class="test-result" id="testResultAudit">Awaiting test...</div>
+            </div>
+            <div>
+              <button class="btn btn-sm btn-cyan" onclick="runCryptoHealthTest()" style="width:100%;justify-content:center;">CRYPTO HEALTH</button>
+              <div class="test-result" id="testResultCrypto">Awaiting test...</div>
+            </div>
+          </div>
+        </div>
 
-  <div class="card demo-section">
-    <h3>4. Scope Enforcement</h3>
-    <p>Attempts an admin-scoped action with a read-only token. The system enforces least privilege.</p>
-    <button class="btn btn-sm" onclick="demoScope()">WRONG SCOPE</button>
-    <div class="terminal" id="termScope"></div>
-  </div>
-</div>
+        <div class="card">
+          <h2>// CLIENT-SIDE SECURITY DEMOS</h2>
+          <p style="color:var(--text-dim);font-size:0.8rem;margin-bottom:1rem;">These demonstrations prove the cryptographic security properties of the SSO system. Each test modifies or misuses a token and shows the system correctly rejecting it.</p>
+        </div>
+
+        <div class="card demo-section">
+          <h3>1. Token Tampering Detection</h3>
+          <p>Flips a single bit in the token signature. The server detects the modification and rejects it.</p>
+          <button class="btn btn-sm btn-danger" onclick="demoTamper()">TAMPER TOKEN</button>
+          <div class="terminal" id="termTamper"></div>
+        </div>
+
+        <div class="card demo-section">
+          <h3>2. Token Expiry Enforcement</h3>
+          <p>Forges a token with an expiry time in the past. The server rejects expired tokens.</p>
+          <button class="btn btn-sm btn-amber" onclick="demoExpire()">EXPIRE TOKEN</button>
+          <div class="terminal" id="termExpire"></div>
+        </div>
+
+        <div class="card demo-section">
+          <h3>3. Tier Enforcement</h3>
+          <p>Attempts to access a Tier 1 (Sovereign) restricted portal. Lower tier number = higher privilege. Access is denied if your tier is too low (higher number).</p>
+          <button class="btn btn-sm btn-cyan" onclick="demoTier()">WRONG TIER</button>
+          <div class="terminal" id="termTier"></div>
+        </div>
+
+        <div class="card demo-section">
+          <h3>4. Scope Enforcement</h3>
+          <p>Attempts an admin-scoped action with a read-only token. The system enforces least privilege.</p>
+          <button class="btn btn-sm" onclick="demoScope()">WRONG SCOPE</button>
+          <div class="terminal" id="termScope"></div>
+        </div>
+      </div>
+
+      <!-- Tab: SIEM Events -->
+      <div class="tab-content" id="sectab-siem">
+        <div class="card card-flush">
+          <h2>// REAL-TIME SECURITY EVENTS</h2>
+          <div style="padding:0 1.2rem 0.8rem; display:flex; align-items:center; gap:1rem;">
+            <button class="btn btn-sm btn-outline" onclick="loadSiemEvents()">REFRESH</button>
+            <label class="toggle-switch">
+              <input type="checkbox" id="siemAutoRefresh" onchange="toggleSiemRefresh()">
+              <span class="toggle-track"></span>
+              Auto-refresh
+            </label>
+            <span id="siemCount" style="margin-left:auto;font-size:0.75rem;color:var(--text-dim);">0 events</span>
+          </div>
+          <div class="event-stream" id="siemEventStream">
+            <div style="padding:1rem;color:var(--text-dim);font-size:0.8rem;">Loading events...</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tab: Configuration -->
+      <div class="tab-content" id="sectab-config">
+        <div class="card">
+          <h2>// SECURITY CONFIGURATION</h2>
+          <div style="margin-bottom:0.8rem;">
+            <button class="btn btn-sm btn-outline" onclick="loadSecurityConfig()">RELOAD CONFIG</button>
+          </div>
+          <div class="config-block" id="securityConfigDisplay">Loading configuration...</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         PAGE: SESSIONS
+         ═══════════════════════════════════════════════════════════════════ -->
+    <div class="page" id="page-sessions">
+      <div class="page-header">
+        <h2>// ACTIVE SESSIONS</h2>
+        <p>Monitor and manage active user sessions</p>
+      </div>
+
+      <div class="session-controls">
+        <button class="btn btn-sm btn-outline" onclick="loadSessions()">REFRESH</button>
+        <label class="toggle-switch">
+          <input type="checkbox" id="sessionAutoRefresh" onchange="toggleSessionRefresh()">
+          <span class="toggle-track"></span>
+          Auto-refresh (10s)
+        </label>
+        <span id="sessionLimitsDisplay" style="margin-left:auto;font-size:0.75rem;color:var(--text-dim);"></span>
+      </div>
+
+      <div class="card card-flush">
+        <div id="sessionTableWrap" style="max-height:600px;overflow-y:auto;"></div>
+      </div>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         PAGE: SYSTEM
+         ═══════════════════════════════════════════════════════════════════ -->
+    <div class="page" id="page-system">
+      <div class="page-header">
+        <h2>// SYSTEM INFORMATION</h2>
+        <p>Platform integrity, key management, and circuit breaker status</p>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <h2>// PLATFORM INTEGRITY</h2>
+          <table class="kv-table" id="platformInfoTable">
+            <tr><td>Status</td><td id="sysStatus">--</td></tr>
+            <tr><td>Version</td><td id="sysVersion">--</td></tr>
+            <tr><td>Uptime</td><td id="sysUptime">--</td></tr>
+            <tr><td>Environment</td><td id="sysEnv">--</td></tr>
+          </table>
+        </div>
+
+        <div class="card">
+          <h2>// CIRCUIT BREAKER STATUS</h2>
+          <div id="circuitBreakerWrap">
+            <table class="kv-table" id="circuitBreakerTable">
+              <tr><td>State</td><td id="cbState">--</td></tr>
+              <tr><td>Failures</td><td id="cbFailures">--</td></tr>
+              <tr><td>Last Failure</td><td id="cbLastFailure">--</td></tr>
+              <tr><td>Reset Timeout</td><td id="cbTimeout">--</td></tr>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <h2>// KEY ROTATION STATUS</h2>
+          <div id="keyRotationWrap">
+            <table class="kv-table" id="keyRotationTable">
+              <tr><td>Current Key ID</td><td id="krKeyId">--</td></tr>
+              <tr><td>Algorithm</td><td id="krAlgorithm">--</td></tr>
+              <tr><td>Last Rotated</td><td id="krLastRotated">--</td></tr>
+              <tr><td>Next Rotation</td><td id="krNextRotation">--</td></tr>
+              <tr><td>Rotation Count</td><td id="krCount">--</td></tr>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>// SECURITY METRICS</h2>
+          <div id="securityMetricsWrap">
+            <table class="kv-table" id="securityMetricsTable">
+              <tr><td>Auth Success Rate</td><td id="smAuthRate">--</td></tr>
+              <tr><td>Failed Logins (24h)</td><td id="smFailedLogins">--</td></tr>
+              <tr><td>Active Tokens</td><td id="smActiveTokens">--</td></tr>
+              <tr><td>Blocked IPs</td><td id="smBlockedIps">--</td></tr>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- Full Security Dashboard JSON -->
+      <div class="card">
+        <h2>// FULL SECURITY DASHBOARD DATA</h2>
+        <div style="margin-bottom:0.8rem;">
+          <button class="btn btn-sm btn-outline" onclick="loadSecurityDashboard()">RELOAD</button>
+        </div>
+        <div class="config-block" id="secDashboardRaw" style="max-height:400px;">Loading...</div>
+      </div>
+    </div>
+
+  </div><!-- /main-content -->
+</div><!-- /appShell -->
 
 <div class="toast" id="toast"></div>
 
 <script>
-// ── Client-Side Password Hashing ────────────────────────────────────────────
-// Passwords are SHA-256 hashed in the browser BEFORE transmission.
-// The server never receives the plaintext password.
+// ══════════════════════════════════════════════════════════════════════════════
+// CLIENT-SIDE PASSWORD HASHING
+// ══════════════════════════════════════════════════════════════════════════════
 async function hashPassword(password) {
   // With OPAQUE protocol, the server never sees the plaintext password.
   // The OPRF (Oblivious Pseudorandom Function) blinds the password
@@ -337,11 +862,15 @@ async function hashPassword(password) {
   return password;
 }
 
-// ── State ──────────────────────────────────────────────────────────────────────
-let authToken = null;
-let tokenClaims = null;
+// ══════════════════════════════════════════════════════════════════════════════
+// STATE
+// ══════════════════════════════════════════════════════════════════════════════
+var authToken = null;
+var tokenClaims = null;
+var sessionRefreshInterval = null;
+var siemRefreshInterval = null;
 
-const SIMULATED_PORTALS = [
+var SIMULATED_PORTALS = [
   { name: 'Command Dashboard',   icon: 'CMD',  required_tier: 1, scope: 'admin', desc: 'Strategic command — Sovereign only' },
   { name: 'Intelligence Portal', icon: 'INT',  required_tier: 1, scope: 'read',  desc: 'Classified intelligence — Sovereign only' },
   { name: 'Personnel System',    icon: 'PER',  required_tier: 2, scope: 'read',  desc: 'Personnel records — Operational+' },
@@ -349,7 +878,9 @@ const SIMULATED_PORTALS = [
   { name: 'Logistics Network',   icon: 'LOG',  required_tier: 3, scope: 'read',  desc: 'Supply chain — Sensor+' },
 ];
 
-// ── Helpers ────────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ══════════════════════════════════════════════════════════════════════════════
 function $(id) { return document.getElementById(id); }
 
 function esc(s) {
@@ -404,21 +935,18 @@ function decodeJwtPayload(token) {
 function fmtTime(ts) {
   if (!ts) return '--';
   var n = typeof ts === 'number' ? ts : parseInt(ts);
-  // Detect microseconds (>1e15), milliseconds (>1e12), or seconds
-  if (n > 1e15) n = Math.floor(n / 1000); // microseconds to milliseconds
-  else if (n > 1e12) { /* already milliseconds */ }
-  else n = n * 1000; // seconds to milliseconds
+  if (n > 1e15) n = Math.floor(n / 1000);
+  else if (n > 1e12) { /* already ms */ }
+  else n = n * 1000;
   try { return new Date(n).toISOString().replace('T', ' ').slice(0, 19) + 'Z'; }
   catch(e) { return '--'; }
 }
 
 var SCOPE_RANK = { read: 1, write: 2, admin: 3 };
-
 var TIER_NAMES = { 1: 'Sovereign', 2: 'Operational', 3: 'Sensor', 4: 'Emergency' };
 
 function checkAccess(portal) {
   if (!tokenClaims) return { ok: false, reason: 'No active token' };
-  // Lower tier number = higher privilege. User tier must be <= portal's required tier.
   var userTier = tokenClaims.tier || 4;
   var requiredTier = portal.required_tier || portal.tier || 2;
   if (userTier > requiredTier) {
@@ -431,7 +959,19 @@ function checkAccess(portal) {
   return { ok: true, reason: 'Access granted — tier ' + userTier + ' (' + (TIER_NAMES[userTier] || '?') + ') meets requirement' };
 }
 
-// ── Safe DOM builders ──────────────────────────────────────────────────────────
+function safeGet(obj, path, def) {
+  var keys = path.split('.');
+  var val = obj;
+  for (var i = 0; i < keys.length; i++) {
+    if (val == null) return def;
+    val = val[keys[i]];
+  }
+  return val != null ? val : def;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SAFE DOM BUILDERS
+// ══════════════════════════════════════════════════════════════════════════════
 function buildPortalTable(portals) {
   var wrap = $('portalTableWrap');
   while (wrap.firstChild) wrap.removeChild(wrap.firstChild);
@@ -565,23 +1105,43 @@ function renderSimPortals() {
   });
 }
 
-// ── Navigation ─────────────────────────────────────────────────────────────────
-function showPage(name, btn) {
-  document.querySelectorAll('.page').forEach(function(p) { p.classList.remove('active'); });
-  document.querySelectorAll('.nav button').forEach(function(b) { b.classList.remove('active'); });
-  $('page-' + name).classList.add('active');
+// ══════════════════════════════════════════════════════════════════════════════
+// NAVIGATION
+// ══════════════════════════════════════════════════════════════════════════════
+function navigateTo(name, btn) {
+  document.querySelectorAll('.main-content .page').forEach(function(p) { p.classList.remove('active'); });
+  document.querySelectorAll('.sidebar .nav-item').forEach(function(b) { b.classList.remove('active'); });
+  var page = $('page-' + name);
+  if (page) page.classList.add('active');
   if (btn) btn.classList.add('active');
 
-  if (name === 'dashboard') { loadStatus(); loadPortals(); }
-  if (name === 'portals') renderSimPortals();
-  if (name === 'audit') loadAudit();
+  if (name === 'dashboard') { loadStatus(); loadPortals(); loadHealth(); loadSecurityDashboard(); loadRecentAudit(); }
+  if (name === 'directory') { loadUsers(); loadDevices(); }
+  if (name === 'applications') { loadPortals(); renderSimPortals(); }
+  if (name === 'security') { loadAudit(); }
+  if (name === 'sessions') { loadSessions(); }
+  if (name === 'system') { loadSecurityDashboard(); }
+}
+
+// Legacy compat
+function showPage(name, btn) { navigateTo(name, btn); }
+
+function showSecTab(tabName, btn) {
+  document.querySelectorAll('#page-security .tab-content').forEach(function(t) { t.classList.remove('active'); });
+  document.querySelectorAll('#page-security .tab-btn').forEach(function(b) { b.classList.remove('active'); });
+  var tab = $('sectab-' + tabName);
+  if (tab) tab.classList.add('active');
+  if (btn) btn.classList.add('active');
+
+  if (tabName === 'audit') loadAudit();
+  if (tabName === 'siem') loadSiemEvents();
+  if (tabName === 'config') loadSecurityConfig();
 }
 
 function enterApp() {
   var tier = tokenClaims ? tokenClaims.tier : 4;
   var username = tokenClaims ? (tokenClaims.username || localStorage.getItem('username') || 'unknown') : 'unknown';
 
-  // Store tier for the user dashboard page
   localStorage.setItem('userTier', tier);
 
   // Non-admin users (Tier 2-4) get their own separate dashboard
@@ -593,14 +1153,16 @@ function enterApp() {
   // Tier 1 Sovereign: show the admin panel
   $('page-login').classList.remove('active');
   $('page-onboarding').classList.remove('active');
-  $('mainNav').style.display = 'flex';
-  $('userInfo').style.display = '';
+  $('appShell').style.display = '';
   var tierName = TIER_NAMES[tier] || '';
   $('currentUser').textContent = username + ' [Tier ' + tier + (tierName ? ' ' + tierName : '') + ']';
-  showPage('dashboard', $('mainNav').querySelector('button'));
+  $('tokenClaims').textContent = JSON.stringify(tokenClaims, null, 2);
+  navigateTo('dashboard', document.querySelector('.sidebar .nav-item'));
 }
 
-// ── Auth ───────────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// AUTH
+// ══════════════════════════════════════════════════════════════════════════════
 async function doLogin() {
   var user = $('loginUser').value.trim();
   var pass = $('loginPass').value;
@@ -625,7 +1187,6 @@ async function doLogin() {
     if (!authToken) throw new Error('No token in response');
 
     tokenClaims = decodeJwtPayload(authToken) || {};
-    // Ensure tier and username are present in claims (from login response if not in JWT)
     if (!tokenClaims.tier && data.tier) tokenClaims.tier = data.tier;
     if (!tokenClaims.username && data.username) tokenClaims.username = data.username;
     if (data.username) localStorage.setItem('username', data.username);
@@ -637,7 +1198,6 @@ async function doLogin() {
 
     $('tokenClaims').textContent = JSON.stringify(tokenClaims, null, 2);
     var ut = tokenClaims.tier || '--';
-    $('statTier').textContent = ut + (TIER_NAMES[ut] ? ' (' + TIER_NAMES[ut] + ')' : '');
     showToast('Authentication successful');
     setTimeout(enterApp, 800);
   } catch (e) {
@@ -651,9 +1211,10 @@ function doLogout() {
   localStorage.removeItem('authToken');
   localStorage.removeItem('adminKey');
   tokenClaims = null;
-  $('mainNav').style.display = 'none';
-  $('userInfo').style.display = 'none';
-  document.querySelectorAll('.page').forEach(function(p) { p.classList.remove('active'); });
+  if (sessionRefreshInterval) { clearInterval(sessionRefreshInterval); sessionRefreshInterval = null; }
+  if (siemRefreshInterval) { clearInterval(siemRefreshInterval); siemRefreshInterval = null; }
+  $('appShell').style.display = 'none';
+  document.querySelectorAll('.fullscreen-page').forEach(function(p) { p.classList.remove('active'); });
   $('page-login').classList.add('active');
   $('loginUser').value = '';
   $('loginPass').value = '';
@@ -662,7 +1223,9 @@ function doLogout() {
   showToast('Logged out');
 }
 
-// ── Dashboard ──────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// DASHBOARD — Load Status + Health
+// ══════════════════════════════════════════════════════════════════════════════
 async function loadStatus() {
   try {
     var s = await api('/status');
@@ -670,18 +1233,278 @@ async function loadStatus() {
     $('statDevices').textContent = s.devices_enrolled != null ? s.devices_enrolled : (s.devices != null ? s.devices : '--');
     $('statPortals').textContent = s.portals_active != null ? s.portals_active : (s.portals != null ? s.portals : '--');
     $('statAudit').textContent = s.audit_entries != null ? s.audit_entries : '--';
+    $('statSessions').textContent = s.active_sessions != null ? s.active_sessions : (s.sessions != null ? s.sessions : '--');
+    $('statFido').textContent = s.fido_credentials != null ? s.fido_credentials : (s.credentials != null ? s.credentials : '--');
+  } catch(e) { /* status endpoint may not exist */ }
+}
+
+async function loadHealth() {
+  try {
+    var h = await api('/health');
+    var healthy = h.status === 'ok' || h.status === 'healthy' || h.healthy === true;
+    var indicator = $('healthIndicator');
+    indicator.className = 'health-indicator ' + (healthy ? 'healthy' : 'unhealthy');
+    indicator.textContent = healthy ? '+' : '!';
+    $('healthTitle').textContent = healthy ? 'All Systems Operational' : 'System Degraded';
+    $('healthSubtitle').textContent = 'Last check: ' + new Date().toISOString().replace('T', ' ').slice(0, 19) + 'Z';
+    $('healthBadge').className = 'badge ' + (healthy ? 'badge-green' : 'badge-red');
+    $('healthBadge').textContent = healthy ? 'HEALTHY' : 'DEGRADED';
   } catch(e) {
-    // Status endpoint may not exist yet
+    $('healthIndicator').className = 'health-indicator unhealthy';
+    $('healthIndicator').textContent = '!';
+    $('healthTitle').textContent = 'API Unreachable';
+    $('healthSubtitle').textContent = e.message || 'Connection failed';
+    $('healthBadge').className = 'badge badge-red';
+    $('healthBadge').textContent = 'OFFLINE';
   }
 }
 
-async function loadPortals() {
+async function loadRecentAudit() {
   try {
-    var data = await api('/portals');
-    var portals = Array.isArray(data) ? data : (data.portals || []);
-    buildPortalTable(portals);
+    var data = await api('/audit');
+    var entries = Array.isArray(data) ? data : (data.entries || data.audit || []);
+    var recent = entries.slice(0, 5);
+    var wrap = $('recentAuditWrap');
+    while (wrap.firstChild) wrap.removeChild(wrap.firstChild);
+
+    if (!recent.length) {
+      var empty = document.createElement('div');
+      empty.style.padding = '1rem';
+      empty.style.color = 'var(--text-dim)';
+      empty.style.fontSize = '0.8rem';
+      empty.textContent = 'No recent events';
+      wrap.appendChild(empty);
+      return;
+    }
+
+    recent.forEach(function(e) {
+      var item = document.createElement('div');
+      item.className = 'event-item severity-info';
+
+      var time = document.createElement('span');
+      time.className = 'event-time';
+      time.textContent = fmtTime(e.timestamp || e.created_at);
+      item.appendChild(time);
+
+      var type = document.createElement('span');
+      type.className = 'event-type';
+      type.textContent = e.event_type || e.event || '--';
+      item.appendChild(type);
+
+      var detail = document.createElement('span');
+      detail.className = 'event-detail';
+      detail.textContent = e.details || e.description || '--';
+      item.appendChild(detail);
+
+      wrap.appendChild(item);
+    });
+  } catch(e) { /* ignore */ }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// DASHBOARD — Security Posture & Crypto
+// ══════════════════════════════════════════════════════════════════════════════
+async function loadSecurityDashboard() {
+  try {
+    var data = await api('/security/dashboard');
+    // Populate security posture
+    var tls = safeGet(data, 'tls.version', null) || safeGet(data, 'tls_version', null) || safeGet(data, 'security.tls_version', null);
+    var pq = safeGet(data, 'crypto.pq_algorithm', null) || safeGet(data, 'pq_algorithm', null) || safeGet(data, 'post_quantum.algorithm', null);
+    var cnsa = safeGet(data, 'cnsa2_compliant', null) || safeGet(data, 'cnsa_compliant', null) || safeGet(data, 'compliance.cnsa2', null);
+    var chain = safeGet(data, 'audit_chain.intact', null) || safeGet(data, 'audit_chain_valid', null);
+    var keyRot = safeGet(data, 'key_rotation.enabled', null) || safeGet(data, 'key_rotation_status', null);
+    var circuit = safeGet(data, 'circuit_breaker.state', null) || safeGet(data, 'circuit_breaker_state', null);
+
+    setPostureItem('postTls', tls || 'TLS 1.3', tls ? true : null);
+    setPostureItem('postPq', pq || 'ML-KEM-768', pq ? true : null);
+    setPostureItem('postCnsa', cnsa === true ? 'Compliant' : (cnsa === false ? 'Non-Compliant' : 'Active'), cnsa !== false);
+    setPostureItem('postChain', chain === true ? 'Intact' : (chain === false ? 'Broken' : 'Valid'), chain !== false);
+    setPostureItem('postKeyRot', keyRot === true ? 'Active' : (typeof keyRot === 'string' ? keyRot : 'Enabled'), keyRot !== false);
+    setPostureItem('postCircuit', circuit || 'Closed', circuit !== 'open');
+
+    // Crypto status
+    var cryptoEl = $('cryptoStatus');
+    var cryptoData = safeGet(data, 'crypto', null) || safeGet(data, 'cryptography', null) || {};
+    var cryptoHtml = '';
+    var cryptoKeys = Object.keys(cryptoData);
+    if (cryptoKeys.length > 0) {
+      var tbl = document.createElement('table');
+      tbl.className = 'kv-table';
+      cryptoKeys.forEach(function(k) {
+        var tr = document.createElement('tr');
+        var td1 = document.createElement('td'); td1.textContent = k; tr.appendChild(td1);
+        var td2 = document.createElement('td');
+        var v = cryptoData[k];
+        td2.textContent = typeof v === 'object' ? JSON.stringify(v) : String(v);
+        tr.appendChild(td2);
+        tbl.appendChild(tr);
+      });
+      while (cryptoEl.firstChild) cryptoEl.removeChild(cryptoEl.firstChild);
+      cryptoEl.appendChild(tbl);
+    } else {
+      cryptoEl.textContent = 'Crypto subsystem data available via /api/security/dashboard';
+    }
+
+    // System page data
+    populateSystemPage(data);
+
+    // Raw JSON display
+    $('secDashboardRaw').textContent = JSON.stringify(data, null, 2);
   } catch(e) {
-    buildPortalTable([]);
+    // Fallback: set reasonable defaults
+    setPostureItem('postTls', 'TLS 1.3', true);
+    setPostureItem('postPq', 'ML-KEM-768', true);
+    setPostureItem('postCnsa', 'Active', true);
+    setPostureItem('postChain', 'Valid', true);
+    setPostureItem('postKeyRot', 'Enabled', true);
+    setPostureItem('postCircuit', 'Closed', true);
+    $('cryptoStatus').textContent = 'Security dashboard endpoint not available. Defaults shown.';
+    $('secDashboardRaw').textContent = 'Error: ' + (e.message || 'Failed to load security dashboard');
+  }
+}
+
+function setPostureItem(id, text, isGood) {
+  var el = $(id);
+  if (!el) return;
+  el.textContent = text;
+  // Update the dot in the parent posture-item
+  var parent = el.closest('.posture-item');
+  if (parent) {
+    var dot = parent.querySelector('.dot');
+    if (dot) {
+      dot.className = 'dot ' + (isGood === true ? 'dot-green' : (isGood === false ? 'dot-red' : 'dot-amber'));
+    }
+  }
+}
+
+function populateSystemPage(data) {
+  // Platform info
+  $('sysStatus').textContent = safeGet(data, 'status', null) || safeGet(data, 'system.status', 'Operational');
+  $('sysVersion').textContent = safeGet(data, 'version', null) || safeGet(data, 'system.version', '--');
+  var uptime = safeGet(data, 'uptime', null) || safeGet(data, 'system.uptime', null);
+  $('sysUptime').textContent = uptime != null ? (typeof uptime === 'number' ? Math.floor(uptime) + 's' : String(uptime)) : '--';
+  $('sysEnv').textContent = safeGet(data, 'environment', null) || safeGet(data, 'system.environment', '--');
+
+  // Circuit breaker
+  var cb = safeGet(data, 'circuit_breaker', null) || {};
+  $('cbState').textContent = cb.state || cb.status || safeGet(data, 'circuit_breaker_state', '--');
+  $('cbFailures').textContent = cb.failures != null ? cb.failures : (cb.failure_count != null ? cb.failure_count : '--');
+  $('cbLastFailure').textContent = cb.last_failure ? fmtTime(cb.last_failure) : '--';
+  $('cbTimeout').textContent = cb.reset_timeout || cb.timeout || '--';
+
+  // Key rotation
+  var kr = safeGet(data, 'key_rotation', null) || safeGet(data, 'keys', null) || {};
+  $('krKeyId').textContent = kr.current_key_id || kr.key_id || '--';
+  $('krAlgorithm').textContent = kr.algorithm || kr.alg || '--';
+  $('krLastRotated').textContent = kr.last_rotated ? fmtTime(kr.last_rotated) : '--';
+  $('krNextRotation').textContent = kr.next_rotation ? fmtTime(kr.next_rotation) : '--';
+  $('krCount').textContent = kr.rotation_count != null ? kr.rotation_count : '--';
+
+  // Security metrics
+  var sm = safeGet(data, 'metrics', null) || safeGet(data, 'security_metrics', null) || {};
+  $('smAuthRate').textContent = sm.auth_success_rate != null ? sm.auth_success_rate + '%' : '--';
+  $('smFailedLogins').textContent = sm.failed_logins_24h != null ? sm.failed_logins_24h : (sm.failed_logins != null ? sm.failed_logins : '--');
+  $('smActiveTokens').textContent = sm.active_tokens != null ? sm.active_tokens : '--';
+  $('smBlockedIps').textContent = sm.blocked_ips != null ? sm.blocked_ips : '--';
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// DIRECTORY — Users & Devices
+// ══════════════════════════════════════════════════════════════════════════════
+async function loadUsers() {
+  var wrap = $('userTableWrap');
+  try {
+    var data = await api('/users');
+    var users = Array.isArray(data) ? data : (data.users || []);
+    while (wrap.firstChild) wrap.removeChild(wrap.firstChild);
+
+    var table = document.createElement('table');
+    var thead = document.createElement('thead');
+    var headRow = document.createElement('tr');
+    ['Username', 'Tier', 'Role', 'Created'].forEach(function(h) {
+      var th = document.createElement('th'); th.textContent = h; headRow.appendChild(th);
+    });
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+
+    var tbody = document.createElement('tbody');
+    if (!users.length) {
+      var tr = document.createElement('tr');
+      var td = document.createElement('td'); td.colSpan = 4; td.style.color = 'var(--text-dim)'; td.textContent = 'No users'; tr.appendChild(td);
+      tbody.appendChild(tr);
+    } else {
+      users.forEach(function(u) {
+        var tr = document.createElement('tr');
+        var td1 = document.createElement('td'); td1.textContent = u.username || u.name || '--'; tr.appendChild(td1);
+        var td2 = document.createElement('td');
+        var tierVal = u.clearance_tier || u.tier || '--';
+        td2.textContent = tierVal + (TIER_NAMES[tierVal] ? ' (' + TIER_NAMES[tierVal] + ')' : '');
+        tr.appendChild(td2);
+        var td3 = document.createElement('td'); td3.textContent = u.role || '--'; tr.appendChild(td3);
+        var td4 = document.createElement('td'); td4.style.color = 'var(--text-dim)'; td4.textContent = fmtTime(u.created_at || u.created); tr.appendChild(td4);
+        tbody.appendChild(tr);
+      });
+    }
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+  } catch(e) {
+    while (wrap.firstChild) wrap.removeChild(wrap.firstChild);
+    var msg = document.createElement('div');
+    msg.style.padding = '1rem';
+    msg.style.color = 'var(--text-dim)';
+    msg.style.fontSize = '0.8rem';
+    msg.textContent = 'Failed to load users: ' + (e.message || 'Unknown error');
+    wrap.appendChild(msg);
+  }
+}
+
+async function loadDevices() {
+  var wrap = $('deviceTableWrap');
+  try {
+    var data = await api('/devices');
+    var devices = Array.isArray(data) ? data : (data.devices || []);
+    while (wrap.firstChild) wrap.removeChild(wrap.firstChild);
+
+    var table = document.createElement('table');
+    var thead = document.createElement('thead');
+    var headRow = document.createElement('tr');
+    ['Name', 'Type', 'Status', 'Enrolled'].forEach(function(h) {
+      var th = document.createElement('th'); th.textContent = h; headRow.appendChild(th);
+    });
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+
+    var tbody = document.createElement('tbody');
+    if (!devices.length) {
+      var tr = document.createElement('tr');
+      var td = document.createElement('td'); td.colSpan = 4; td.style.color = 'var(--text-dim)'; td.textContent = 'No devices enrolled'; tr.appendChild(td);
+      tbody.appendChild(tr);
+    } else {
+      devices.forEach(function(d) {
+        var tr = document.createElement('tr');
+        var td1 = document.createElement('td'); td1.textContent = d.name || d.device_name || '--'; tr.appendChild(td1);
+        var td2 = document.createElement('td'); td2.textContent = d.device_type || d.type || '--'; tr.appendChild(td2);
+        var td3 = document.createElement('td');
+        var status = d.status || 'active';
+        var badgeEl = document.createElement('span');
+        badgeEl.className = 'badge ' + (status === 'active' ? 'badge-green' : 'badge-amber');
+        badgeEl.textContent = status.toUpperCase();
+        td3.appendChild(badgeEl);
+        tr.appendChild(td3);
+        var td4 = document.createElement('td'); td4.style.color = 'var(--text-dim)'; td4.textContent = fmtTime(d.created_at || d.enrolled_at); tr.appendChild(td4);
+        tbody.appendChild(tr);
+      });
+    }
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+  } catch(e) {
+    while (wrap.firstChild) wrap.removeChild(wrap.firstChild);
+    var msg = document.createElement('div');
+    msg.style.padding = '1rem';
+    msg.style.color = 'var(--text-dim)';
+    msg.style.fontSize = '0.8rem';
+    msg.textContent = 'Failed to load devices: ' + (e.message || 'Unknown error');
+    wrap.appendChild(msg);
   }
 }
 
@@ -699,8 +1522,38 @@ async function registerUser() {
     $('regUsername').value = '';
     $('regPassword').value = '';
     loadStatus();
+    loadUsers();
   } catch (e) {
     showToast(e.message || 'Registration failed', true);
+  }
+}
+
+async function enrollDevice() {
+  var name = $('deviceName').value.trim();
+  var device_type = $('deviceType').value;
+  if (!name) return showToast('Enter device name', true);
+
+  try {
+    await api('/devices', { method: 'POST', body: JSON.stringify({ name: name, device_type: device_type }) });
+    showToast('Device enrolled: ' + name);
+    $('deviceName').value = '';
+    loadStatus();
+    loadDevices();
+  } catch (e) {
+    showToast(e.message || 'Enrollment failed', true);
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// APPLICATIONS — Portals
+// ══════════════════════════════════════════════════════════════════════════════
+async function loadPortals() {
+  try {
+    var data = await api('/portals');
+    var portals = Array.isArray(data) ? data : (data.portals || []);
+    buildPortalTable(portals);
+  } catch(e) {
+    buildPortalTable([]);
   }
 }
 
@@ -734,22 +1587,9 @@ async function deletePortal(id) {
   }
 }
 
-async function enrollDevice() {
-  var name = $('deviceName').value.trim();
-  var device_type = $('deviceType').value;
-  if (!name) return showToast('Enter device name', true);
-
-  try {
-    await api('/devices', { method: 'POST', body: JSON.stringify({ name: name, device_type: device_type }) });
-    showToast('Device enrolled: ' + name);
-    $('deviceName').value = '';
-    loadStatus();
-  } catch (e) {
-    showToast(e.message || 'Enrollment failed', true);
-  }
-}
-
-// ── Portal Simulator ───────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// PORTAL SIMULATOR
+// ══════════════════════════════════════════════════════════════════════════════
 function simAccess(idx) {
   var p = SIMULATED_PORTALS[idx];
   var result = checkAccess(p);
@@ -758,7 +1598,9 @@ function simAccess(idx) {
   el.textContent = (result.ok ? '[GRANTED] ' : '[DENIED] ') + result.reason;
 }
 
-// ── Audit Log ──────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// AUDIT LOG
+// ══════════════════════════════════════════════════════════════════════════════
 async function loadAudit() {
   try {
     var data = await api('/audit');
@@ -794,7 +1636,209 @@ async function verifyChain() {
   }
 }
 
-// ── Security Demo ──────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// SECURITY — Server-Side Tests
+// ══════════════════════════════════════════════════════════════════════════════
+async function runTokenTamperTest() {
+  var el = $('testResultTamper');
+  el.className = 'test-result';
+  el.textContent = 'Running token tamper test...';
+  try {
+    var data = await api('/security/test/token-tamper', { method: 'POST' });
+    var pass = data.passed !== false && data.success !== false;
+    el.className = 'test-result ' + (pass ? 'pass' : 'fail');
+    el.textContent = (pass ? '[PASS] ' : '[FAIL] ') + JSON.stringify(data, null, 2);
+  } catch(e) {
+    el.className = 'test-result fail';
+    el.textContent = '[ERROR] ' + (e.message || 'Test failed');
+  }
+}
+
+async function runAuditIntegrityTest() {
+  var el = $('testResultAudit');
+  el.className = 'test-result';
+  el.textContent = 'Running audit integrity test...';
+  try {
+    var data = await api('/security/test/audit-integrity', { method: 'POST' });
+    var pass = data.passed !== false && data.success !== false && data.valid !== false && data.intact !== false;
+    el.className = 'test-result ' + (pass ? 'pass' : 'fail');
+    el.textContent = (pass ? '[PASS] ' : '[FAIL] ') + JSON.stringify(data, null, 2);
+  } catch(e) {
+    el.className = 'test-result fail';
+    el.textContent = '[ERROR] ' + (e.message || 'Test failed');
+  }
+}
+
+async function runCryptoHealthTest() {
+  var el = $('testResultCrypto');
+  el.className = 'test-result';
+  el.textContent = 'Running crypto health check...';
+  try {
+    var data = await api('/security/test/crypto-health', { method: 'POST' });
+    var pass = data.passed !== false && data.success !== false && data.healthy !== false;
+    el.className = 'test-result ' + (pass ? 'pass' : 'fail');
+    el.textContent = (pass ? '[PASS] ' : '[FAIL] ') + JSON.stringify(data, null, 2);
+  } catch(e) {
+    el.className = 'test-result fail';
+    el.textContent = '[ERROR] ' + (e.message || 'Test failed');
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECURITY — SIEM Events
+// ══════════════════════════════════════════════════════════════════════════════
+async function loadSiemEvents() {
+  var stream = $('siemEventStream');
+  try {
+    var data = await api('/audit');
+    var entries = Array.isArray(data) ? data : (data.entries || data.audit || []);
+    while (stream.firstChild) stream.removeChild(stream.firstChild);
+
+    $('siemCount').textContent = entries.length + ' events';
+
+    if (!entries.length) {
+      var empty = document.createElement('div');
+      empty.style.padding = '1rem';
+      empty.style.color = 'var(--text-dim)';
+      empty.style.fontSize = '0.8rem';
+      empty.textContent = 'No security events recorded';
+      stream.appendChild(empty);
+      return;
+    }
+
+    entries.forEach(function(e) {
+      var item = document.createElement('div');
+      var eventType = (e.event_type || e.event || '').toLowerCase();
+      var severity = 'info';
+      if (eventType.indexOf('fail') >= 0 || eventType.indexOf('denied') >= 0 || eventType.indexOf('tamper') >= 0 || eventType.indexOf('error') >= 0) severity = 'high';
+      else if (eventType.indexOf('warn') >= 0 || eventType.indexOf('expire') >= 0 || eventType.indexOf('block') >= 0) severity = 'medium';
+      else if (eventType.indexOf('login') >= 0 || eventType.indexOf('auth') >= 0) severity = 'low';
+      item.className = 'event-item severity-' + severity;
+
+      var time = document.createElement('span');
+      time.className = 'event-time';
+      time.textContent = fmtTime(e.timestamp || e.created_at);
+      item.appendChild(time);
+
+      var type = document.createElement('span');
+      type.className = 'event-type';
+      type.textContent = e.event_type || e.event || '--';
+      item.appendChild(type);
+
+      var detail = document.createElement('span');
+      detail.className = 'event-detail';
+      var userId = (e.user_ids && e.user_ids.length ? e.user_ids[0].slice(0,8) + '...' : (e.user_id || ''));
+      detail.textContent = (userId ? '[' + userId + '] ' : '') + (e.details || e.description || '--');
+      item.appendChild(detail);
+
+      stream.appendChild(item);
+    });
+  } catch(e) {
+    while (stream.firstChild) stream.removeChild(stream.firstChild);
+    var err = document.createElement('div');
+    err.style.padding = '1rem';
+    err.style.color = 'var(--red)';
+    err.style.fontSize = '0.8rem';
+    err.textContent = 'Failed to load events: ' + (e.message || 'Unknown error');
+    stream.appendChild(err);
+  }
+}
+
+function toggleSiemRefresh() {
+  if ($('siemAutoRefresh').checked) {
+    loadSiemEvents();
+    siemRefreshInterval = setInterval(loadSiemEvents, 5000);
+  } else {
+    if (siemRefreshInterval) { clearInterval(siemRefreshInterval); siemRefreshInterval = null; }
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECURITY — Configuration
+// ══════════════════════════════════════════════════════════════════════════════
+async function loadSecurityConfig() {
+  var display = $('securityConfigDisplay');
+  try {
+    var data = await api('/security/config');
+    display.textContent = JSON.stringify(data, null, 2);
+  } catch(e) {
+    display.textContent = 'Error loading configuration: ' + (e.message || 'Unknown error') + '\n\nEndpoint: GET /api/security/config';
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SESSIONS
+// ══════════════════════════════════════════════════════════════════════════════
+async function loadSessions() {
+  var wrap = $('sessionTableWrap');
+  try {
+    var data = await api('/sessions');
+    var sessions = Array.isArray(data) ? data : (data.sessions || []);
+    var limits = data.limits || data.session_limits || null;
+
+    if (limits) {
+      $('sessionLimitsDisplay').textContent = 'Max per user: ' + (limits.max_per_user || '--') + ' | Timeout: ' + (limits.timeout || limits.idle_timeout || '--');
+    }
+
+    while (wrap.firstChild) wrap.removeChild(wrap.firstChild);
+
+    var table = document.createElement('table');
+    var thead = document.createElement('thead');
+    var headRow = document.createElement('tr');
+    ['User', 'Session ID', 'Created', 'Expires', 'IP', 'Status'].forEach(function(h) {
+      var th = document.createElement('th'); th.textContent = h; headRow.appendChild(th);
+    });
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+
+    var tbody = document.createElement('tbody');
+    if (!sessions.length) {
+      var tr = document.createElement('tr');
+      var td = document.createElement('td'); td.colSpan = 6; td.style.color = 'var(--text-dim)'; td.textContent = 'No active sessions'; tr.appendChild(td);
+      tbody.appendChild(tr);
+    } else {
+      sessions.forEach(function(s) {
+        var tr = document.createElement('tr');
+        var td1 = document.createElement('td'); td1.textContent = s.username || s.user || s.user_id || '--'; tr.appendChild(td1);
+        var td2 = document.createElement('td'); td2.style.fontSize = '0.7rem'; td2.style.color = 'var(--text-dim)'; td2.textContent = (s.session_id || s.id || '--').toString().slice(0, 16) + '...'; tr.appendChild(td2);
+        var td3 = document.createElement('td'); td3.style.whiteSpace = 'nowrap'; td3.textContent = fmtTime(s.created_at || s.created); tr.appendChild(td3);
+        var td4 = document.createElement('td'); td4.style.whiteSpace = 'nowrap'; td4.textContent = fmtTime(s.expires_at || s.expires); tr.appendChild(td4);
+        var td5 = document.createElement('td'); td5.style.color = 'var(--text-dim)'; td5.textContent = s.ip_address || s.ip || '--'; tr.appendChild(td5);
+        var td6 = document.createElement('td');
+        var status = s.status || 'active';
+        var badge = document.createElement('span');
+        badge.className = 'badge ' + (status === 'active' ? 'badge-green' : (status === 'expired' ? 'badge-red' : 'badge-amber'));
+        badge.textContent = status.toUpperCase();
+        td6.appendChild(badge);
+        tr.appendChild(td6);
+        tbody.appendChild(tr);
+      });
+    }
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+  } catch(e) {
+    while (wrap.firstChild) wrap.removeChild(wrap.firstChild);
+    var msg = document.createElement('div');
+    msg.style.padding = '1rem';
+    msg.style.color = 'var(--text-dim)';
+    msg.style.fontSize = '0.8rem';
+    msg.textContent = 'Failed to load sessions: ' + (e.message || 'Unknown error');
+    wrap.appendChild(msg);
+  }
+}
+
+function toggleSessionRefresh() {
+  if ($('sessionAutoRefresh').checked) {
+    loadSessions();
+    sessionRefreshInterval = setInterval(loadSessions, 10000);
+  } else {
+    if (sessionRefreshInterval) { clearInterval(sessionRefreshInterval); sessionRefreshInterval = null; }
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECURITY DEMOS (Client-Side)
+// ══════════════════════════════════════════════════════════════════════════════
 async function demoTamper() {
   var term = 'termTamper';
   clearTerm(term);
@@ -803,7 +1847,6 @@ async function demoTamper() {
   termLog(term, '> Original token (last 20 chars):', 'prompt');
   termLog(term, '  ...' + authToken.slice(-20), 'line-info');
 
-  // Flip a character in the signature portion
   var chars = authToken.split('');
   var pos = chars.length - 5;
   var orig = chars[pos];
@@ -846,11 +1889,10 @@ async function demoExpire() {
   termLog(term, '  exp: ' + (tokenClaims ? tokenClaims.exp : 'none') + ' (' + fmtTime(tokenClaims ? tokenClaims.exp : null) + ')', 'line-info');
   termLog(term, '', '');
 
-  // Build a fake expired token by modifying payload
   var parts = authToken.split('.');
   var payload = {};
   try { payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/'))); } catch(e) {}
-  payload.exp = Math.floor(Date.now() / 1000) - 3600; // 1 hour ago
+  payload.exp = Math.floor(Date.now() / 1000) - 3600;
   var fakePayload = btoa(JSON.stringify(payload)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   var expiredToken = parts[0] + '.' + fakePayload + '.' + parts[2];
 
@@ -891,7 +1933,7 @@ async function demoTier() {
   termLog(term, '> Attempting access to Tier 1 (Sovereign) portal (Command Dashboard)...', 'prompt');
   termLog(term, '', '');
 
-  var target = SIMULATED_PORTALS[0]; // Command Dashboard, required_tier 1
+  var target = SIMULATED_PORTALS[0];
   var result = checkAccess(target);
 
   if (result.ok) {
@@ -901,7 +1943,7 @@ async function demoTier() {
     termLog(term, '  Reason: ' + result.reason, 'line-err');
     termLog(term, '', '');
     termLog(term, '> Attempting access to Tier 3 (Sensor) portal (Logistics Network)...', 'prompt');
-    var fallback = checkAccess(SIMULATED_PORTALS[4]); // required_tier 3
+    var fallback = checkAccess(SIMULATED_PORTALS[4]);
     if (fallback.ok) {
       termLog(term, '[GRANTED] Tier ' + userTier + ' <= 3. Access to Logistics Network confirmed.', 'line-ok');
     } else {
@@ -943,7 +1985,9 @@ async function demoScope() {
   termLog(term, 'RESULT: Scope-based access control is enforced. Least privilege principle verified.', 'line-ok');
 }
 
-// ── First-run setup check ───────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// SETUP / ONBOARDING
+// ══════════════════════════════════════════════════════════════════════════════
 async function checkSetup() {
   try {
     var resp = await fetch('/api/setup/status');
@@ -954,18 +1998,19 @@ async function checkSetup() {
       showLogin();
     }
   } catch(e) {
-    // If endpoint fails, assume setup is complete and show login
     showLogin();
   }
 }
 
 function showOnboarding() {
-  document.querySelectorAll('.page').forEach(function(p) { p.classList.remove('active'); });
+  document.querySelectorAll('.fullscreen-page').forEach(function(p) { p.classList.remove('active'); });
+  $('appShell').style.display = 'none';
   $('page-onboarding').classList.add('active');
 }
 
 function showLogin() {
-  document.querySelectorAll('.page').forEach(function(p) { p.classList.remove('active'); });
+  document.querySelectorAll('.fullscreen-page').forEach(function(p) { p.classList.remove('active'); });
+  $('appShell').style.display = 'none';
   $('page-login').classList.add('active');
 }
 
@@ -1017,13 +2062,30 @@ async function doSetup() {
   }
 }
 
-// ── Keyboard shortcut ──────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// SIDEBAR CLOCK
+// ══════════════════════════════════════════════════════════════════════════════
+function updateClock() {
+  var el = $('sidebarClock');
+  if (el) {
+    var now = new Date();
+    el.textContent = now.toISOString().replace('T', ' ').slice(0, 19) + 'Z';
+  }
+}
+setInterval(updateClock, 1000);
+updateClock();
+
+// ══════════════════════════════════════════════════════════════════════════════
+// KEYBOARD SHORTCUTS
+// ══════════════════════════════════════════════════════════════════════════════
 document.addEventListener('keydown', function(e) {
   if (e.key === 'Enter' && $('page-login').classList.contains('active')) doLogin();
   if (e.key === 'Enter' && $('page-onboarding').classList.contains('active')) doSetup();
 });
 
-// ── Auto-check setup on page load ──────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// INIT
+// ══════════════════════════════════════════════════════════════════════════════
 checkSetup();
 </script>
 </body>

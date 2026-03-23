@@ -26,3 +26,10 @@ pub mod sealed_keys;
 pub mod platform_integrity;
 pub mod measured_boot;
 pub mod startup_checks;
+
+// ── Security infrastructure ──
+pub mod session_limits;
+pub mod circuit_breaker;
+pub mod siem;
+pub mod key_rotation;
+pub mod retry;

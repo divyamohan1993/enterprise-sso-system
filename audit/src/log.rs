@@ -176,6 +176,9 @@ impl AuditLog {
                      Possible tampering detected!",
                     self.entries.len()
                 );
+                common::siem::SecurityEvent::tamper_detected(
+                    &format!("audit log chain verification FAILED at entry {}", self.entries.len())
+                );
             }
         }
     }

@@ -198,6 +198,47 @@ pub fn verify_token_full(
     verify_token_inner(token, public_key_package, pq_verifying_key, client_dpop_key)
 }
 
+/// Verify a token with full checks including audience validation.
+///
+/// When `expected_audience` is `Some`, the token's `aud` field must match
+/// exactly. When `None`, audience is not checked (for internal service calls).
+pub fn verify_token_with_audience(
+    token: &Token,
+    public_key_package: &PublicKeyPackage,
+    pq_verifying_key: &PqVerifyingKey,
+    revocation_list: &RevocationList,
+    client_dpop_key: Option<&[u8]>,
+    expected_audience: Option<&str>,
+) -> Result<TokenClaims, MilnetError> {
+    // 1. Revocation check (fail-fast)
+    if revocation_list.is_revoked(&token.claims.token_id) {
+        return Err(MilnetError::CryptoVerification(
+            "token has been revoked".into(),
+        ));
+    }
+
+    // 2. Audience validation — if expected audience is provided, token must match
+    if let Some(expected) = expected_audience {
+        match &token.claims.aud {
+            Some(aud) if aud == expected => {} // match
+            Some(aud) => {
+                return Err(MilnetError::CryptoVerification(format!(
+                    "audience mismatch: token bound to '{}', expected '{}'",
+                    aud, expected
+                )));
+            }
+            None => {
+                return Err(MilnetError::CryptoVerification(
+                    "token has no audience claim but audience validation is required".into(),
+                ));
+            }
+        }
+    }
+
+    // 3. Full signature + DPoP verification
+    verify_token_inner(token, public_key_package, pq_verifying_key, client_dpop_key)
+}
+
 /// Verify a token's signature, claims, AND DPoP channel binding.
 ///
 /// This ensures the token is bound to the client that originally requested it,

@@ -90,7 +90,8 @@ impl ShardTransport {
                 "frame too large: {len} bytes (max {MAX_FRAME_LEN})"
             )));
         }
-        let mut buf = vec![0u8; len as usize];
+        let buf_len = usize::try_from(len).map_err(|_| MilnetError::Shard("frame size overflows usize".to_string()))?;
+        let mut buf = vec![0u8; buf_len];
         self.reader
             .read_exact(&mut buf)
             .await
@@ -112,7 +113,8 @@ impl ShardTransport {
                 "frame too large: {len} bytes (max {MAX_FRAME_LEN})"
             )));
         }
-        let mut buf = vec![0u8; len as usize];
+        let buf_len = usize::try_from(len).map_err(|_| MilnetError::Shard("frame size overflows usize".to_string()))?;
+        let mut buf = vec![0u8; buf_len];
         self.reader
             .read_exact(&mut buf)
             .await

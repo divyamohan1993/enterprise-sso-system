@@ -126,6 +126,18 @@ pub fn verify_id_token(token: &str, verifying_key: &PqVerifyingKey) -> Result<Id
         return Err("invalid JWT: expected 3 parts".into());
     }
 
+    // Validate algorithm header to prevent algorithm confusion attacks
+    let header_bytes = URL_SAFE_NO_PAD
+        .decode(parts[0])
+        .map_err(|e| format!("base64 decode header: {e}"))?;
+    let header: serde_json::Value =
+        serde_json::from_slice(&header_bytes).map_err(|e| format!("parse header: {e}"))?;
+    match header.get("alg").and_then(|v| v.as_str()) {
+        Some("ML-DSA-87") => {}
+        Some(other) => return Err(format!("unsupported algorithm: {other}")),
+        None => return Err("missing alg in JWT header".into()),
+    }
+
     let signing_input = format!("{}.{}", parts[0], parts[1]);
     let sig_bytes = URL_SAFE_NO_PAD
         .decode(parts[2])

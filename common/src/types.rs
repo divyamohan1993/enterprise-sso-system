@@ -102,6 +102,15 @@ impl std::fmt::Debug for Token {
     }
 }
 
+/// Zeroize cryptographic material on drop — prevents memory forensics.
+impl Drop for Token {
+    fn drop(&mut self) {
+        self.ratchet_tag.zeroize();
+        self.frost_signature.zeroize();
+        self.pq_signature.zeroize();
+    }
+}
+
 impl Token {
     /// Returns a deterministic fixture suitable for tests.
     pub fn test_fixture() -> Self {
