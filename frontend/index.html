@@ -329,6 +329,44 @@
   @media (max-width: 480px) {
     .metrics-grid { grid-template-columns: 1fr 1fr; }
   }
+
+  /* ── Recovery Code UI ──────────────────────────────────────────────── */
+  .recovery-link {
+    display: block; text-align: center; margin-top: 1rem;
+    color: var(--amber); font-size: 0.75rem; cursor: pointer;
+    letter-spacing: 1px; transition: color 0.15s;
+  }
+  .recovery-link:hover { color: #ffd700; }
+  .recovery-form { display: none; }
+  .recovery-form.active { display: block; }
+  .recovery-codes-box {
+    background: #000; border: 2px solid var(--amber); padding: 1.2rem;
+    margin: 1rem 0; position: relative;
+  }
+  .recovery-codes-box::before {
+    content: 'TOP SECRET'; position: absolute; top: -0.6rem; left: 1rem;
+    background: var(--bg2); color: var(--amber); font-size: 0.65rem;
+    padding: 0 0.5rem; letter-spacing: 3px; font-weight: 700;
+  }
+  .recovery-codes-list {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 0.4rem 1.5rem;
+    font-size: 0.85rem; color: var(--green); padding: 0.5rem 0;
+  }
+  .recovery-codes-list .code-item {
+    padding: 0.3rem 0.5rem; background: rgba(0,255,65,0.05);
+    border: 1px solid var(--border); font-family: var(--font);
+    letter-spacing: 1px;
+  }
+  .recovery-warning {
+    color: var(--amber); font-size: 0.8rem; font-weight: 600;
+    padding: 0.6rem 0; border-top: 1px solid var(--border);
+    margin-top: 0.8rem; letter-spacing: 1px;
+  }
+  .recovery-status {
+    display: flex; align-items: center; gap: 0.6rem;
+    font-size: 0.8rem; color: var(--text-dim); margin-bottom: 0.8rem;
+  }
+  .recovery-status .count { color: var(--green); font-weight: 600; }
 </style>
 </head>
 <body>
@@ -394,6 +432,23 @@
     </div>
     <div class="terminal" id="loginTerminal">
       <div class="prompt">&gt; Awaiting authentication...</div>
+    </div>
+    <a class="recovery-link" id="recoveryToggle" onclick="toggleRecoveryForm()">Lost your device? Use a recovery code</a>
+    <div class="recovery-form" id="recoveryForm">
+      <div class="card" style="margin-top:0.8rem;">
+        <h2>// EMERGENCY RECOVERY</h2>
+        <div class="form-group">
+          <label>Username</label>
+          <input type="text" id="recoveryUser" placeholder="operator_id" autocomplete="username">
+        </div>
+        <div class="form-group">
+          <label>Recovery Code</label>
+          <input type="text" id="recoveryCode" placeholder="XXXXXXXX-XXXXXXXX-XXXXXXXX-XXXXXXXX" style="letter-spacing:1px;">
+        </div>
+        <button class="btn btn-amber" style="width:100%;justify-content:center;" onclick="doRecovery()">RECOVER ACCESS</button>
+        <a class="recovery-link" style="margin-top:0.8rem;color:var(--green);" onclick="toggleRecoveryForm()">Back to login</a>
+      </div>
+      <div class="terminal" id="recoveryTerminal"></div>
     </div>
   </div>
 </div>
@@ -537,6 +592,28 @@
       <div class="card">
         <h2>// TOKEN CLAIMS</h2>
         <pre id="tokenClaims" style="font-size:0.8rem;color:var(--green);overflow-x:auto;white-space:pre-wrap;">No active token</pre>
+      </div>
+
+      <!-- Recovery Codes / Security -->
+      <div class="card" id="recoveryCodesCard">
+        <h2>// RECOVERY CODES</h2>
+        <div class="recovery-status" id="recoveryStatusWrap">
+          <span class="dot dot-amber"></span>
+          <span>Remaining codes: <span class="count" id="recoveryRemaining">--</span></span>
+        </div>
+        <p style="color:var(--text-dim);font-size:0.8rem;margin-bottom:0.8rem;">Generate one-time recovery codes for emergency access if you lose your security key.</p>
+        <button class="btn btn-sm btn-amber" onclick="generateRecoveryCodes()">GENERATE RECOVERY CODES</button>
+        <button class="btn btn-sm btn-outline" onclick="loadRecoveryStatus()" style="margin-left:0.5rem;">CHECK STATUS</button>
+        <div id="recoveryCodesDisplay" style="display:none;">
+          <div class="recovery-codes-box">
+            <div class="recovery-codes-list" id="recoveryCodesList"></div>
+          </div>
+          <div class="recovery-warning">WARNING: Save these codes NOW. They will NOT be shown again.</div>
+          <div class="btn-group" style="margin-top:0.8rem;">
+            <button class="btn btn-sm btn-outline-cyan" onclick="copyAllRecoveryCodes()">COPY ALL</button>
+            <button class="btn btn-sm btn-outline" onclick="confirmCodesSaved()">I'VE SAVED MY CODES</button>
+          </div>
+        </div>
       </div>
 
       <!-- Recent Audit Events -->
@@ -1118,7 +1195,7 @@ function navigateTo(name, btn) {
   if (page) page.classList.add('active');
   if (btn) btn.classList.add('active');
 
-  if (name === 'dashboard') { loadStatus(); loadPortals(); loadHealth(); loadSecurityDashboard(); loadRecentAudit(); }
+  if (name === 'dashboard') { loadStatus(); loadPortals(); loadHealth(); loadSecurityDashboard(); loadRecentAudit(); loadRecoveryStatus(); }
   if (name === 'directory') { loadUsers(); loadDevices(); }
   if (name === 'applications') { loadPortals(); renderSimPortals(); }
   if (name === 'security') { loadAudit(); }
@@ -1989,6 +2066,148 @@ async function demoScope() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+// RECOVERY CODES
+// ══════════════════════════════════════════════════════════════════════════════
+var generatedRecoveryCodes = [];
+
+function toggleRecoveryForm() {
+  var form = $('recoveryForm');
+  var toggle = $('recoveryToggle');
+  var loginCard = document.querySelector('#page-login .card');
+  var loginTerminal = $('loginTerminal');
+  if (form.classList.contains('active')) {
+    form.classList.remove('active');
+    toggle.style.display = '';
+    loginCard.style.display = '';
+    loginTerminal.style.display = '';
+  } else {
+    form.classList.add('active');
+    toggle.style.display = 'none';
+    loginCard.style.display = 'none';
+    loginTerminal.style.display = 'none';
+    // Pre-fill username if already typed
+    var loginUser = $('loginUser').value.trim();
+    if (loginUser) $('recoveryUser').value = loginUser;
+  }
+}
+
+async function doRecovery() {
+  var user = $('recoveryUser').value.trim();
+  var code = $('recoveryCode').value.trim();
+  if (!user || !code) return showToast('Enter username and recovery code', true);
+
+  var term = 'recoveryTerminal';
+  clearTerm(term);
+  termLog(term, '> Initiating emergency recovery...', 'prompt');
+  termLog(term, '[1/3] Validating recovery code format...', 'line-info');
+
+  try {
+    termLog(term, '[2/3] Verifying recovery code with auth server...', 'line-info');
+    var data = await api('/recovery/verify', {
+      method: 'POST',
+      body: JSON.stringify({ username: user, recovery_code: code })
+    });
+
+    termLog(term, '[3/3] Recovery code accepted.', 'line-ok');
+    termLog(term, '', '');
+
+    authToken = data.token || data.access_token;
+    if (authToken) {
+      localStorage.setItem('authToken', authToken);
+      tokenClaims = decodeJwtPayload(authToken) || {};
+      if (!tokenClaims.tier && data.tier) tokenClaims.tier = data.tier;
+      if (!tokenClaims.username && data.username) tokenClaims.username = data.username;
+      if (data.username) localStorage.setItem('username', data.username);
+    }
+
+    termLog(term, 'Emergency access granted. Please re-enroll your security key.', 'line-warn');
+    showToast('Emergency access granted');
+    if (authToken) {
+      setTimeout(enterApp, 1200);
+    }
+  } catch (e) {
+    termLog(term, '[ERROR] Invalid or expired recovery code', 'line-err');
+    showToast('Invalid or expired recovery code', true);
+  }
+}
+
+async function generateRecoveryCodes() {
+  try {
+    var data = await api('/recovery/generate', { method: 'POST' });
+    var codes = data.codes || data.recovery_codes || [];
+    generatedRecoveryCodes = codes;
+
+    var list = $('recoveryCodesList');
+    while (list.firstChild) list.removeChild(list.firstChild);
+
+    codes.forEach(function(code) {
+      var item = document.createElement('div');
+      item.className = 'code-item';
+      item.textContent = code;
+      list.appendChild(item);
+    });
+
+    $('recoveryCodesDisplay').style.display = 'block';
+    showToast('Recovery codes generated');
+    loadRecoveryStatus();
+  } catch (e) {
+    showToast(e.message || 'Failed to generate recovery codes', true);
+  }
+}
+
+async function loadRecoveryStatus() {
+  try {
+    var data = await api('/recovery/status');
+    var remaining = data.remaining != null ? data.remaining : (data.codes_remaining != null ? data.codes_remaining : (data.count != null ? data.count : '--'));
+    $('recoveryRemaining').textContent = remaining;
+    var dot = document.querySelector('#recoveryStatusWrap .dot');
+    if (dot) {
+      if (remaining === 0) { dot.className = 'dot dot-red'; }
+      else if (remaining !== '--' && remaining <= 2) { dot.className = 'dot dot-amber'; }
+      else if (remaining !== '--') { dot.className = 'dot dot-green'; }
+    }
+  } catch (e) {
+    $('recoveryRemaining').textContent = '--';
+  }
+}
+
+function copyAllRecoveryCodes() {
+  if (!generatedRecoveryCodes.length) return showToast('No codes to copy', true);
+  var text = generatedRecoveryCodes.join('\n');
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(function() {
+      showToast('Recovery codes copied to clipboard');
+    }).catch(function() {
+      fallbackCopy(text);
+    });
+  } else {
+    fallbackCopy(text);
+  }
+}
+
+function fallbackCopy(text) {
+  var ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.left = '-9999px';
+  document.body.appendChild(ta);
+  ta.select();
+  try {
+    document.execCommand('copy');
+    showToast('Recovery codes copied to clipboard');
+  } catch (e) {
+    showToast('Copy failed — select codes manually', true);
+  }
+  document.body.removeChild(ta);
+}
+
+function confirmCodesSaved() {
+  $('recoveryCodesDisplay').style.display = 'none';
+  generatedRecoveryCodes = [];
+  showToast('Recovery codes hidden. Keep them safe.');
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 // SETUP / ONBOARDING
 // ══════════════════════════════════════════════════════════════════════════════
 async function checkSetup() {
@@ -2082,7 +2301,10 @@ updateClock();
 // KEYBOARD SHORTCUTS
 // ══════════════════════════════════════════════════════════════════════════════
 document.addEventListener('keydown', function(e) {
-  if (e.key === 'Enter' && $('page-login').classList.contains('active')) doLogin();
+  if (e.key === 'Enter' && $('page-login').classList.contains('active')) {
+    if ($('recoveryForm').classList.contains('active')) { doRecovery(); }
+    else { doLogin(); }
+  }
   if (e.key === 'Enter' && $('page-onboarding').classList.contains('active')) doSetup();
 });
 

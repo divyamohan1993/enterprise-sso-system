@@ -259,6 +259,7 @@ async fn auth_middleware(
         || path.starts_with("/oauth/")
         || path == "/oauth/token"
         || path.starts_with("/api/auth/")
+        || path == "/api/recovery/verify"
         || path.starts_with("/api/setup")
         || path == "/"
         || path == "/about"
@@ -638,6 +639,11 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/fido/register/complete", post(fido_register_complete))
         .route("/api/fido/authenticate/begin", post(fido_authenticate_begin))
         .route("/api/fido/authenticate/complete", post(fido_authenticate_complete))
+        // Recovery codes
+        .route("/api/recovery/generate", post(recovery_generate))
+        .route("/api/recovery/verify", post(recovery_verify))
+        .route("/api/recovery/status", get(recovery_status))
+        .route("/api/recovery/revoke-all", delete(recovery_revoke_all))
         // Static page redirects
         .route("/about", get(|| async { axum::response::Redirect::permanent("/about.html") }))
         .route("/pitch", get(|| async { axum::response::Redirect::permanent("/pitch.html") }))
@@ -2917,4 +2923,420 @@ async fn ceremony_status(
         .cloned()
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
+}
+
+// ---------------------------------------------------------------------------
+// Handlers — Recovery Codes
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct RecoveryGenerateRequest {
+    pub user_id: Uuid,
+}
+
+#[derive(Serialize)]
+pub struct RecoveryGenerateResponse {
+    pub codes: Vec<String>,
+    pub count: usize,
+    pub expires_in_days: u64,
+}
+
+#[derive(Deserialize)]
+pub struct RecoveryVerifyRequest {
+    pub username: String,
+    pub code: String,
+}
+
+#[derive(Serialize, Default)]
+pub struct RecoveryVerifyResponse {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tier: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct RecoveryStatusResponse {
+    pub total: usize,
+    pub remaining: usize,
+    pub used: usize,
+    pub expired: usize,
+}
+
+/// POST /api/recovery/generate — generate 8 recovery codes for a user.
+/// Requires authentication (admin API key or valid session token).
+async fn recovery_generate(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Json<RecoveryGenerateResponse>, StatusCode> {
+    let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(4);
+    check_tier(caller_tier, 2)?;
+
+    let body = axum::body::to_bytes(request.into_body(), 1024 * 64)
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let req: RecoveryGenerateRequest = serde_json::from_slice(&body)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    // Verify user exists
+    let user_exists: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM users WHERE id = $1 AND is_active = true"
+    )
+    .bind(req.user_id)
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
+
+    if user_exists.is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    // Delete any existing unused recovery codes for this user (revoke old batch)
+    let _ = sqlx::query("DELETE FROM recovery_codes WHERE user_id = $1 AND is_used = false")
+        .bind(req.user_id)
+        .execute(&state.db)
+        .await;
+
+    // Generate 8 recovery codes
+    let codes = common::recovery::generate_recovery_codes(8);
+    let now = now_secs();
+    let ttl = common::recovery::recovery_code_ttl_secs();
+    let expires_at = now + ttl;
+
+    let mut display_codes = Vec::with_capacity(codes.len());
+
+    for (display, salt, hash) in &codes {
+        let code_id = Uuid::new_v4();
+        let _ = sqlx::query(
+            "INSERT INTO recovery_codes (id, user_id, code_hash, code_salt, is_used, created_at, expires_at) VALUES ($1, $2, $3, $4, false, $5, $6)"
+        )
+        .bind(code_id)
+        .bind(req.user_id)
+        .bind(hash)
+        .bind(salt)
+        .bind(now)
+        .bind(expires_at)
+        .execute(&state.db)
+        .await;
+
+        display_codes.push(display.clone());
+    }
+
+    // Log audit event
+    let mut audit = state.audit_log.write().await;
+    let entry = audit.append_signed(
+        common::types::AuditEventType::RecoveryCodesGenerated,
+        vec![req.user_id],
+        vec![],
+        0.0,
+        vec![],
+        &state.pq_signing_key,
+    );
+
+    let user_ids_json = serde_json::to_string(&entry.user_ids).unwrap_or_default();
+    let _ = sqlx::query(
+        "INSERT INTO audit_log (id, event_type, user_ids, timestamp, prev_hash, signature) VALUES ($1, $2, $3, $4, $5, $6)"
+    )
+    .bind(entry.event_id)
+    .bind(format!("{:?}", entry.event_type))
+    .bind(user_ids_json)
+    .bind(entry.timestamp)
+    .bind(entry.prev_hash.to_vec())
+    .bind(entry.signature.clone())
+    .execute(&state.db)
+    .await;
+
+    let count = display_codes.len();
+    Ok(Json(RecoveryGenerateResponse {
+        codes: display_codes,
+        count,
+        expires_in_days: 365,
+    }))
+}
+
+/// POST /api/recovery/verify — use a recovery code to authenticate.
+/// This is a public endpoint (no auth required) for account recovery.
+async fn recovery_verify(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RecoveryVerifyRequest>,
+) -> Json<RecoveryVerifyResponse> {
+    // Rate limiting: max 5 attempts per 30 minutes per username (same as login)
+    {
+        let mut attempts = state.login_attempts.write().await;
+        let now = now_secs();
+        const RATE_LIMIT_TTL_SECS: i64 = 1800;
+
+        if let Some((count, first_time)) = attempts.get(&req.username) {
+            if now - *first_time < RATE_LIMIT_TTL_SECS && *count >= 5 {
+                return Json(RecoveryVerifyResponse {
+                    success: false,
+                    message: Some("account locked — too many attempts".into()),
+                    ..Default::default()
+                });
+            }
+            if now - *first_time >= RATE_LIMIT_TTL_SECS {
+                attempts.remove(&req.username);
+            }
+        }
+    }
+
+    // Look up user by username
+    let user_row: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM users WHERE username = $1 AND is_active = true"
+    )
+    .bind(&req.username)
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
+
+    let user_id = match user_row {
+        Some((id,)) => id,
+        None => {
+            // Do not reveal whether user exists
+            return Json(RecoveryVerifyResponse {
+                success: false,
+                message: Some("invalid recovery code".into()),
+                ..Default::default()
+            });
+        }
+    };
+
+    // Parse the recovery code
+    let code_bytes = match common::recovery::parse_code(&req.code) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            // Increment rate limiter on invalid format
+            let mut attempts = state.login_attempts.write().await;
+            let now = now_secs();
+            let entry = attempts.entry(req.username.clone()).or_insert((0, now));
+            entry.0 += 1;
+
+            return Json(RecoveryVerifyResponse {
+                success: false,
+                message: Some("invalid recovery code".into()),
+                ..Default::default()
+            });
+        }
+    };
+
+    // Fetch all unused, non-expired recovery codes for this user
+    let now = now_secs();
+    let stored_codes: Vec<(Uuid, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+        "SELECT id, code_hash, code_salt FROM recovery_codes WHERE user_id = $1 AND is_used = false AND expires_at > $2"
+    )
+    .bind(user_id)
+    .bind(now)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    // Try to verify against each stored code
+    let mut matched_code_id: Option<Uuid> = None;
+    for (code_id, hash, salt) in &stored_codes {
+        if common::recovery::verify_code(&code_bytes, salt, hash) {
+            matched_code_id = Some(*code_id);
+            break;
+        }
+    }
+
+    match matched_code_id {
+        Some(code_id) => {
+            // Mark code as used
+            let _ = sqlx::query(
+                "UPDATE recovery_codes SET is_used = true, used_at = $1 WHERE id = $2"
+            )
+            .bind(now)
+            .bind(code_id)
+            .execute(&state.db)
+            .await;
+
+            // Issue a Tier 4 (Emergency) token — short-lived, 2 minutes
+            use hmac::{Hmac, Mac};
+            use sha2::Sha512;
+            type HmacSha512 = Hmac<Sha512>;
+
+            let now_ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let payload = format!("{}:{}", user_id, now_ts);
+            let master_kek = common::sealed_keys::load_master_kek();
+            let derived = {
+                use hkdf::Hkdf;
+                let hk = Hkdf::<Sha512>::new(Some(b"MILNET-ADMIN-TOKEN-v3"), &master_kek);
+                let mut okm = [0u8; 32];
+                hk.expand(b"admin-token-hmac", &mut okm)
+                    .expect("HKDF expand");
+                okm
+            };
+            let mut mac = HmacSha512::new_from_slice(&derived).expect("HMAC key");
+            mac.update(payload.as_bytes());
+            let sig = hex(&mac.finalize().into_bytes());
+            let token = format!("{payload}:{sig}");
+
+            // Persist emergency session (2-minute expiry)
+            let session_id = Uuid::new_v4();
+            let expires_at = now_ts as i64 + 120;
+            let _ = sqlx::query(
+                "INSERT INTO sessions (id, user_id, created_at, expires_at, is_active) VALUES ($1, $2, $3, $4, true)"
+            )
+            .bind(session_id)
+            .bind(user_id)
+            .bind(now_ts as i64)
+            .bind(expires_at)
+            .execute(&state.db)
+            .await;
+
+            // Log audit event with elevated risk
+            let mut audit = state.audit_log.write().await;
+            let entry = audit.append_signed(
+                common::types::AuditEventType::RecoveryCodeUsed,
+                vec![user_id],
+                vec![],
+                0.85, // Elevated risk score for recovery code usage
+                vec![],
+                &state.pq_signing_key,
+            );
+
+            let user_ids_json = serde_json::to_string(&entry.user_ids).unwrap_or_default();
+            let _ = sqlx::query(
+                "INSERT INTO audit_log (id, event_type, user_ids, timestamp, prev_hash, signature) VALUES ($1, $2, $3, $4, $5, $6)"
+            )
+            .bind(entry.event_id)
+            .bind(format!("{:?}", entry.event_type))
+            .bind(user_ids_json)
+            .bind(entry.timestamp)
+            .bind(entry.prev_hash.to_vec())
+            .bind(entry.signature.clone())
+            .execute(&state.db)
+            .await;
+            drop(audit);
+
+            // Emit SIEM event
+            common::siem::SecurityEvent::auth_success(user_id, None);
+
+            // Clear rate limit on success
+            state.login_attempts.write().await.remove(&req.username);
+
+            Json(RecoveryVerifyResponse {
+                success: true,
+                user_id: Some(user_id),
+                token: Some(token),
+                tier: Some(4), // Always Tier 4 (Emergency) — user must re-enroll FIDO2 for higher tier
+                message: Some("emergency access granted — re-enroll FIDO2 to restore full access".into()),
+            })
+        }
+        None => {
+            // No match — increment rate limiter
+            let mut attempts = state.login_attempts.write().await;
+            let entry = attempts.entry(req.username.clone()).or_insert((0, now));
+            entry.0 += 1;
+
+            Json(RecoveryVerifyResponse {
+                success: false,
+                message: Some("invalid recovery code".into()),
+                ..Default::default()
+            })
+        }
+    }
+}
+
+/// GET /api/recovery/status — check remaining recovery codes for a user.
+async fn recovery_status(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+    request: Request,
+) -> Result<Json<RecoveryStatusResponse>, StatusCode> {
+    let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(4);
+    check_tier(caller_tier, 2)?;
+
+    let user_id_str = params.get("user_id").ok_or(StatusCode::BAD_REQUEST)?;
+    let user_id = Uuid::parse_str(user_id_str).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let now = now_secs();
+
+    let all_codes: Vec<(bool, i64)> = sqlx::query_as(
+        "SELECT is_used, expires_at FROM recovery_codes WHERE user_id = $1"
+    )
+    .bind(user_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    let total = all_codes.len();
+    let mut used = 0usize;
+    let mut expired = 0usize;
+    let mut remaining = 0usize;
+
+    for (is_used, expires_at) in &all_codes {
+        if *is_used {
+            used += 1;
+        } else if *expires_at <= now {
+            expired += 1;
+        } else {
+            remaining += 1;
+        }
+    }
+
+    Ok(Json(RecoveryStatusResponse {
+        total,
+        remaining,
+        used,
+        expired,
+    }))
+}
+
+/// DELETE /api/recovery/revoke-all — revoke all recovery codes for a user.
+async fn recovery_revoke_all(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+    request: Request,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(4);
+    check_tier(caller_tier, 1)?;
+
+    let user_id_str = params.get("user_id").ok_or(StatusCode::BAD_REQUEST)?;
+    let user_id = Uuid::parse_str(user_id_str).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let result = sqlx::query("DELETE FROM recovery_codes WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&state.db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let deleted = result.rows_affected();
+
+    // Log audit event
+    let mut audit = state.audit_log.write().await;
+    let entry = audit.append_signed(
+        common::types::AuditEventType::CredentialRevoked,
+        vec![user_id],
+        vec![],
+        0.5,
+        vec![],
+        &state.pq_signing_key,
+    );
+
+    let user_ids_json = serde_json::to_string(&entry.user_ids).unwrap_or_default();
+    let _ = sqlx::query(
+        "INSERT INTO audit_log (id, event_type, user_ids, timestamp, prev_hash, signature) VALUES ($1, $2, $3, $4, $5, $6)"
+    )
+    .bind(entry.event_id)
+    .bind(format!("{:?}", entry.event_type))
+    .bind(user_ids_json)
+    .bind(entry.timestamp)
+    .bind(entry.prev_hash.to_vec())
+    .bind(entry.signature.clone())
+    .execute(&state.db)
+    .await;
+
+    Ok(Json(serde_json::json!({
+        "revoked": true,
+        "deleted_count": deleted,
+    })))
 }

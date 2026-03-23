@@ -34,3 +34,4 @@ pub mod siem;
 pub mod key_rotation;
 pub mod retry;
 pub mod health;
+pub mod recovery;

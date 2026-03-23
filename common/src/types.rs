@@ -250,6 +250,8 @@ pub enum AuditEventType {
     SystemDegraded,
     SystemRecovered,
     DuressDetected,
+    RecoveryCodeUsed,
+    RecoveryCodesGenerated,
 }
 
 // ── AuditEntry ────────────────────────────────────────────────────────
@@ -308,6 +310,37 @@ impl std::fmt::Debug for ShardMessage {
             .field("timestamp", &self.timestamp)
             .field("payload", &"[REDACTED]")
             .field("hmac", &"[REDACTED]")
+            .finish()
+    }
+}
+
+// ── Recovery codes ────────────────────────────────────────────────────
+
+/// A recovery code stored in the database (hash only, never plaintext)
+#[derive(Clone, Serialize, Deserialize)]
+pub struct StoredRecoveryCode {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub code_hash: Vec<u8>,
+    pub code_salt: Vec<u8>,
+    pub is_used: bool,
+    pub used_at: Option<i64>,
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+
+/// Custom Debug for StoredRecoveryCode — redacts cryptographic material.
+impl std::fmt::Debug for StoredRecoveryCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredRecoveryCode")
+            .field("id", &self.id)
+            .field("user_id", &self.user_id)
+            .field("code_hash", &"[REDACTED]")
+            .field("code_salt", &"[REDACTED]")
+            .field("is_used", &self.is_used)
+            .field("used_at", &self.used_at)
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
             .finish()
     }
 }

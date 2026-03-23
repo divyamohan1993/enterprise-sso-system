@@ -154,6 +154,23 @@ pub async fn init_database(database_url: &str) -> PgPool {
         )
     "#).execute(&pool).await.expect("Failed to create witness_checkpoints table");
 
+    sqlx::query(r#"
+        CREATE TABLE IF NOT EXISTS recovery_codes (
+            id UUID PRIMARY KEY,
+            user_id UUID NOT NULL REFERENCES users(id),
+            code_hash BYTEA NOT NULL,
+            code_salt BYTEA NOT NULL,
+            is_used BOOLEAN NOT NULL DEFAULT false,
+            used_at BIGINT,
+            created_at BIGINT NOT NULL,
+            expires_at BIGINT NOT NULL
+        )
+    "#).execute(&pool).await.expect("Failed to create recovery_codes table");
+
+    sqlx::query(r#"
+        CREATE INDEX IF NOT EXISTS idx_recovery_codes_user ON recovery_codes (user_id) WHERE NOT is_used
+    "#).execute(&pool).await.expect("Failed to create recovery_codes index");
+
     pool
 }
 
