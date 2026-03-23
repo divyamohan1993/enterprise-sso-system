@@ -18,7 +18,7 @@ use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use common::types::ModuleId;
-use shard::transport::connect;
+use shard::tls_transport::tls_connect;
 
 use crate::puzzle::{generate_challenge, get_adaptive_difficulty, verify_solution, PuzzleSolution};
 use crate::wire::{AuthRequest, AuthResponse, KemCiphertext, OrchestratorRequest, OrchestratorResponse};
@@ -46,6 +46,8 @@ const AES_GCM_NONCE_LEN: usize = 12;
 pub struct OrchestratorConfig {
     pub addr: String,
     pub hmac_key: [u8; 64],
+    /// TLS connector for mTLS connections to the orchestrator.
+    pub tls_connector: tokio_rustls::TlsConnector,
 }
 
 /// Per-IP rate-limit state: (connection count, window start).
@@ -387,7 +389,13 @@ async fn forward_to_orchestrator(
     let req_bytes = postcard::to_allocvec(&orch_req)
         .map_err(|e| format!("serialize orchestrator request: {e}"))?;
 
-    let mut transport = connect(&config.addr, ModuleId::Gateway, config.hmac_key)
+    let mut transport = tls_connect(
+            &config.addr,
+            ModuleId::Gateway,
+            config.hmac_key,
+            &config.tls_connector,
+            "localhost",
+        )
         .await
         .map_err(|e| format!("connect to orchestrator: {e}"))?;
 

@@ -19,9 +19,12 @@
 
 /// Whether the system is running in production mode.
 /// In production, dev key fallbacks are forbidden.
-/// Returns `true` if `MILNET_PRODUCTION` is set to ANY value (not just "1").
+/// Returns `true` only if `MILNET_PRODUCTION` is set to `"1"` or `"true"` (case-insensitive).
 pub fn is_production() -> bool {
-    std::env::var("MILNET_PRODUCTION").is_ok()
+    match std::env::var("MILNET_PRODUCTION") {
+        Ok(val) => val == "1" || val.eq_ignore_ascii_case("true"),
+        Err(_) => false,
+    }
 }
 
 /// Load the master KEK from environment.
@@ -83,6 +86,31 @@ pub fn load_shard_hmac_key_sealed() -> [u8; 64] {
         "shard-hmac",
         b"MILNET-DEV-SHARD-HMAC-KEY-NOT-FOR-PRODUCTION!!!!!",
     )
+}
+
+/// Derive a per-module SHARD HMAC key from the master KEK.
+///
+/// Each module gets a unique key derived via HKDF-SHA512 with the module name
+/// as domain separator. This prevents one compromised module from impersonating
+/// another on the SHARD channel. Both endpoints of a channel must derive the
+/// same key by using a canonical channel name.
+pub fn derive_module_hmac_key(module_a: &str, module_b: &str) -> [u8; 64] {
+    let master_kek = load_master_kek();
+    // Canonical ordering: alphabetically sort module names for consistent derivation
+    let (first, second) = if module_a <= module_b {
+        (module_a, module_b)
+    } else {
+        (module_b, module_a)
+    };
+    let domain = format!("MILNET-SHARD-CHANNEL-v1:{}:{}", first, second);
+
+    use hkdf::Hkdf;
+    use sha2::Sha512;
+    let hk = Hkdf::<Sha512>::new(Some(domain.as_bytes()), &master_kek);
+    let mut okm = [0u8; 64];
+    hk.expand(b"shard-channel-hmac", &mut okm)
+        .expect("64-byte HKDF expand must succeed");
+    okm
 }
 
 /// Load the shared receipt signing key with sealed key support.

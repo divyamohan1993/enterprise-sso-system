@@ -116,6 +116,55 @@ impl TlsShardTransport {
             TlsTransportStream::Client(s) => recv_on(s, &mut self.protocol).await,
         }
     }
+
+    /// Read raw framed bytes from the TLS stream without verification.
+    /// Useful for testing replay scenarios.
+    pub async fn recv_raw(&mut self) -> Result<Vec<u8>, MilnetError> {
+        let mut len_buf = [0u8; 4];
+        match &mut self.stream {
+            TlsTransportStream::Server(s) => s.read_exact(&mut len_buf).await,
+            TlsTransportStream::Client(s) => s.read_exact(&mut len_buf).await,
+        }
+        .map_err(|e| MilnetError::Shard(format!("tls read length: {e}")))?;
+        let len = u32::from_be_bytes(len_buf);
+        if len > MAX_FRAME_LEN {
+            return Err(MilnetError::Shard(format!(
+                "frame too large: {len} bytes (max {MAX_FRAME_LEN})"
+            )));
+        }
+        let mut buf = vec![0u8; len as usize];
+        match &mut self.stream {
+            TlsTransportStream::Server(s) => s.read_exact(&mut buf).await,
+            TlsTransportStream::Client(s) => s.read_exact(&mut buf).await,
+        }
+        .map_err(|e| MilnetError::Shard(format!("tls read payload: {e}")))?;
+        Ok(buf)
+    }
+
+    /// Write raw pre-framed bytes to the TLS stream (length prefix + payload).
+    /// Useful for testing replay scenarios.
+    pub async fn send_raw(&mut self, raw: &[u8]) -> Result<(), MilnetError> {
+        let len = raw.len() as u32;
+        match &mut self.stream {
+            TlsTransportStream::Server(s) => {
+                s.write_all(&len.to_be_bytes()).await
+                    .map_err(|e| MilnetError::Shard(format!("tls write length: {e}")))?;
+                s.write_all(raw).await
+                    .map_err(|e| MilnetError::Shard(format!("tls write payload: {e}")))?;
+                s.flush().await
+                    .map_err(|e| MilnetError::Shard(format!("tls flush: {e}")))?;
+            }
+            TlsTransportStream::Client(s) => {
+                s.write_all(&len.to_be_bytes()).await
+                    .map_err(|e| MilnetError::Shard(format!("tls write length: {e}")))?;
+                s.write_all(raw).await
+                    .map_err(|e| MilnetError::Shard(format!("tls write payload: {e}")))?;
+                s.flush().await
+                    .map_err(|e| MilnetError::Shard(format!("tls flush: {e}")))?;
+            }
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -199,6 +248,45 @@ pub async fn tls_connect(
 
     let protocol = ShardProtocol::new(module_id, hmac_key);
     Ok(TlsShardTransport::from_client(tls_stream, protocol))
+}
+
+// ---------------------------------------------------------------------------
+// Convenience helpers
+// ---------------------------------------------------------------------------
+
+/// Ensure the rustls crypto provider is installed (idempotent).
+fn ensure_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
+/// Create a TLS-enabled SHARD listener for the given module.
+/// Generates a self-signed CA and module certificate at startup.
+/// Returns (listener, ca, cert_key) for the caller to share the CA with clients.
+pub async fn tls_bind(
+    addr: &str,
+    module_id: ModuleId,
+    hmac_key: [u8; 64],
+    module_name: &str,
+) -> Result<(TlsShardListener, crate::tls::CertificateAuthority, rcgen::CertifiedKey), common::error::MilnetError> {
+    ensure_crypto_provider();
+    let ca = crate::tls::generate_ca();
+    let cert_key = crate::tls::generate_module_cert(module_name, &ca);
+    let server_config = crate::tls::server_tls_config(&cert_key, &ca);
+    let listener = TlsShardListener::bind(addr, module_id, hmac_key, server_config).await?;
+    Ok((listener, ca, cert_key))
+}
+
+/// Create a TLS connector for a client module, generating its own CA and certificate.
+/// Returns (connector, ca, cert_key) so the caller can share the CA with servers.
+pub fn tls_client_setup(
+    module_name: &str,
+) -> (TlsConnector, crate::tls::CertificateAuthority, rcgen::CertifiedKey) {
+    ensure_crypto_provider();
+    let ca = crate::tls::generate_ca();
+    let cert_key = crate::tls::generate_module_cert(module_name, &ca);
+    let client_config = crate::tls::client_tls_config(&cert_key, &ca);
+    let connector = crate::tls::tls_connector(client_config);
+    (connector, ca, cert_key)
 }
 
 // ---------------------------------------------------------------------------

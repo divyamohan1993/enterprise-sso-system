@@ -21,3 +21,5 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 opaque-ke.workspace = true
 rand.workspace = true
+tokio-rustls.workspace = true
+rcgen.workspace = true

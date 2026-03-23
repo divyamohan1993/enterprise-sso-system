@@ -207,6 +207,29 @@ impl SecurityConfig {
         Ok(())
     }
 
+    /// Validate critical security settings in production mode.
+    /// Panics if production mode is active and required settings are disabled.
+    pub fn validate_production(&self) {
+        if !crate::sealed_keys::is_production() {
+            return;
+        }
+        if !self.require_encryption_at_rest {
+            panic!("FATAL: require_encryption_at_rest must be true in production");
+        }
+        if !self.require_sealed_keys {
+            panic!("FATAL: require_sealed_keys must be true in production");
+        }
+        if !self.require_binary_attestation {
+            panic!("FATAL: require_binary_attestation must be true in production");
+        }
+        if !self.require_mlock {
+            panic!("FATAL: require_mlock must be true in production");
+        }
+        if !self.entropy_fail_closed {
+            panic!("FATAL: entropy_fail_closed must be true in production");
+        }
+    }
+
     /// Maximum ratchet epoch for the configured session lifetime.
     pub fn max_ratchet_epochs(&self) -> u64 {
         if self.ratchet_epoch_secs == 0 {

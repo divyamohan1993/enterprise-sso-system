@@ -32,7 +32,7 @@ use opaque::store::CredentialStore;
 use ratchet::chain::RatchetChain;
 use risk::tiers::check_tier_access;
 use shard::protocol::ShardProtocol;
-use shard::transport::ShardListener;
+use shard::tls_transport;
 use tss::token_builder::build_token_distributed;
 use tss::validator::validate_receipt_chain;
 use verifier::verify::verify_token;
@@ -70,14 +70,16 @@ fn now_us() -> i64 {
 
 // ── Service boot helpers (reused from production_validation_test pattern) ─
 
-async fn boot_opaque(store: CredentialStore) -> String {
+async fn boot_opaque(store: CredentialStore, ca: &shard::tls::CertificateAuthority) -> String {
     use std::sync::{Arc, Mutex};
     use opaque::messages::{OpaqueRequest, OpaqueResponse};
 
     let store = Arc::new(Mutex::new(store));
-    let listener = ShardListener::bind("127.0.0.1:0", ModuleId::Opaque, SHARD_HMAC_KEY)
-        .await
-        .expect("bind OPAQUE listener");
+    let cert_key = shard::tls::generate_module_cert("localhost", ca);
+    let server_config = shard::tls::server_tls_config(&cert_key, ca);
+    let listener = shard::tls_transport::TlsShardListener::bind(
+        "127.0.0.1:0", ModuleId::Opaque, SHARD_HMAC_KEY, server_config
+    ).await.expect("bind OPAQUE TLS listener");
     let addr = listener.local_addr().expect("OPAQUE local_addr").to_string();
 
     tokio::spawn(async move {
@@ -144,13 +146,15 @@ async fn boot_tss(
     coordinator: tss::distributed::SigningCoordinator,
     mut nodes: Vec<tss::distributed::SignerNode>,
     pq_signing_key: Box<crypto::pq_sign::PqSigningKey>,
+    ca: &shard::tls::CertificateAuthority,
 ) -> String {
-    use shard::transport::ShardListener;
     use tss::messages::{SigningRequest, SigningResponse};
 
-    let listener = ShardListener::bind("127.0.0.1:0", ModuleId::Tss, SHARD_HMAC_KEY)
-        .await
-        .expect("bind TSS listener");
+    let cert_key = shard::tls::generate_module_cert("localhost", ca);
+    let server_config = shard::tls::server_tls_config(&cert_key, ca);
+    let listener = shard::tls_transport::TlsShardListener::bind(
+        "127.0.0.1:0", ModuleId::Tss, SHARD_HMAC_KEY, server_config
+    ).await.expect("bind TSS TLS listener");
     let addr = listener.local_addr().expect("TSS local_addr").to_string();
 
     tokio::spawn(async move {
@@ -213,20 +217,27 @@ async fn boot_tss(
     addr
 }
 
-async fn boot_orchestrator(opaque_addr: String, tss_addr: String) -> String {
+async fn boot_orchestrator(opaque_addr: String, tss_addr: String, ca: &shard::tls::CertificateAuthority) -> String {
     use orchestrator::service::OrchestratorService;
-    use shard::transport::ShardListener;
 
-    let listener = ShardListener::bind("127.0.0.1:0", ModuleId::Orchestrator, SHARD_HMAC_KEY)
-        .await
-        .expect("bind Orchestrator listener");
+    let cert_key = shard::tls::generate_module_cert("localhost", ca);
+    let server_config = shard::tls::server_tls_config(&cert_key, ca);
+    let listener = shard::tls_transport::TlsShardListener::bind(
+        "127.0.0.1:0", ModuleId::Orchestrator, SHARD_HMAC_KEY, server_config
+    ).await.expect("bind Orchestrator TLS listener");
     let addr = listener
         .local_addr()
         .expect("Orchestrator local_addr")
         .to_string();
 
-    let service =
-        OrchestratorService::new(SHARD_HMAC_KEY, opaque_addr, tss_addr);
+    // Create TLS connector that trusts the shared CA
+    let client_cert = shard::tls::generate_module_cert("orchestrator-client", ca);
+    let client_config = shard::tls::client_tls_config(&client_cert, ca);
+    let connector = shard::tls::tls_connector(client_config);
+
+    let service = std::sync::Arc::new(
+        OrchestratorService::new_with_tls(SHARD_HMAC_KEY, opaque_addr, tss_addr, connector),
+    );
 
     tokio::spawn(async move {
         loop {
@@ -234,32 +245,40 @@ async fn boot_orchestrator(opaque_addr: String, tss_addr: String) -> String {
                 Ok(t) => t,
                 Err(_) => continue,
             };
-            let (_sender, req_bytes) = match transport.recv().await {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            let request: orchestrator::messages::OrchestratorRequest =
-                match postcard::from_bytes(&req_bytes) {
+            let svc = std::sync::Arc::clone(&service);
+            tokio::spawn(async move {
+                let (_sender, req_bytes) = match transport.recv().await {
                     Ok(r) => r,
-                    Err(_) => continue,
+                    Err(_) => return,
                 };
-            let response = service.process_auth(&request).await;
-            let resp_bytes =
-                postcard::to_allocvec(&response).expect("serialize Orchestrator response");
-            let _ = transport.send(&resp_bytes).await;
+                let request: orchestrator::messages::OrchestratorRequest =
+                    match postcard::from_bytes(&req_bytes) {
+                        Ok(r) => r,
+                        Err(_) => return,
+                    };
+                let response = svc.process_auth(&request).await;
+                let resp_bytes =
+                    postcard::to_allocvec(&response).expect("serialize Orchestrator response");
+                let _ = transport.send(&resp_bytes).await;
+            });
         }
     });
 
     addr
 }
 
-async fn boot_gateway(orchestrator_addr: String) -> String {
+async fn boot_gateway(orchestrator_addr: String, ca: &shard::tls::CertificateAuthority) -> String {
+    let gateway_cert = shard::tls::generate_module_cert("gateway-client", ca);
+    let gateway_client_config = shard::tls::client_tls_config(&gateway_cert, ca);
+    let gateway_connector = shard::tls::tls_connector(gateway_client_config);
+
     let gateway = GatewayServer::bind_with_orchestrator(
         "127.0.0.1:0",
         TEST_DIFFICULTY,
         OrchestratorConfig {
             addr: orchestrator_addr,
             hmac_key: SHARD_HMAC_KEY,
+            tls_connector: gateway_connector,
         },
     )
     .await
@@ -292,14 +311,17 @@ async fn boot_full_system(
         .await
         .expect("DKG task");
 
-    let opaque_addr = boot_opaque(store).await;
-    let tss_addr = boot_tss(coordinator, nodes, pq_sk).await;
+    // Generate shared CA for all inter-service mTLS
+    let ca = shard::tls::generate_ca();
+
+    let opaque_addr = boot_opaque(store, &ca).await;
+    let tss_addr = boot_tss(coordinator, nodes, pq_sk, &ca).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let orchestrator_addr = boot_orchestrator(opaque_addr, tss_addr).await;
+    let orchestrator_addr = boot_orchestrator(opaque_addr, tss_addr, &ca).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let gateway_addr = boot_gateway(orchestrator_addr).await;
+    let gateway_addr = boot_gateway(orchestrator_addr, &ca).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     (gateway_addr, group_verifying_key)

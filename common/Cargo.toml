@@ -18,6 +18,7 @@ getrandom.workspace = true
 aes-gcm.workspace = true
 hkdf.workspace = true
 hmac.workspace = true
+ml-dsa.workspace = true
 blake3.workspace = true
 tracing.workspace = true
 hex.workspace = true

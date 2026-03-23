@@ -51,11 +51,12 @@ async fn main() {
 
     let addr = std::env::var("KT_ADDR").unwrap_or_else(|_| "127.0.0.1:9107".to_string());
     let hmac_key = crypto::entropy::generate_key_64();
-    let listener = shard::transport::ShardListener::bind(&addr, common::types::ModuleId::Kt, hmac_key)
-        .await
-        .unwrap();
+    let (listener, _ca, _cert_key) =
+        shard::tls_transport::tls_bind(&addr, common::types::ModuleId::Kt, hmac_key, "kt")
+            .await
+            .unwrap();
 
-    tracing::info!("Key Transparency service listening on {addr}");
+    tracing::info!("Key Transparency service listening on {addr} (mTLS)");
     loop {
         if let Ok(mut transport) = listener.accept().await {
             let tree = tree.clone();

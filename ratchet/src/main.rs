@@ -20,11 +20,12 @@ async fn main() {
 
     let addr = std::env::var("RATCHET_ADDR").unwrap_or_else(|_| "127.0.0.1:9105".to_string());
     let hmac_key = crypto::entropy::generate_key_64();
-    let listener = shard::transport::ShardListener::bind(&addr, common::types::ModuleId::Ratchet, hmac_key)
-        .await
-        .unwrap();
+    let (listener, _ca, _cert_key) =
+        shard::tls_transport::tls_bind(&addr, common::types::ModuleId::Ratchet, hmac_key, "ratchet")
+            .await
+            .unwrap();
 
-    tracing::info!("Ratchet Session Manager listening on {addr}");
+    tracing::info!("Ratchet Session Manager listening on {addr} (mTLS)");
     loop {
         if let Ok(mut transport) = listener.accept().await {
             let manager = manager.clone();

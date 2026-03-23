@@ -34,7 +34,7 @@ use ratchet::chain::RatchetChain;
 use risk::scoring::{RiskEngine, RiskLevel, RiskSignals};
 use risk::tiers::check_tier_access;
 use shard::protocol::ShardProtocol;
-use shard::transport::ShardListener;
+use shard::tls_transport;
 use tss::messages::{SigningRequest, SigningResponse};
 use crypto::pq_sign::{generate_pq_keypair, PqSigningKey, PqVerifyingKey};
 use tss::token_builder::build_token_distributed;
@@ -76,14 +76,16 @@ fn now_us() -> i64 {
 
 // ── Service boot helpers (reused from tier2_ceremony_test pattern) ───────
 
-async fn boot_opaque(store: CredentialStore) -> String {
+async fn boot_opaque(store: CredentialStore, ca: &shard::tls::CertificateAuthority) -> String {
     use std::sync::{Arc, Mutex};
     use opaque::messages::{OpaqueRequest, OpaqueResponse};
 
     let store = Arc::new(Mutex::new(store));
-    let listener = ShardListener::bind("127.0.0.1:0", ModuleId::Opaque, SHARD_HMAC_KEY)
-        .await
-        .expect("bind OPAQUE listener");
+    let cert_key = shard::tls::generate_module_cert("localhost", ca);
+    let server_config = shard::tls::server_tls_config(&cert_key, ca);
+    let listener = shard::tls_transport::TlsShardListener::bind(
+        "127.0.0.1:0", ModuleId::Opaque, SHARD_HMAC_KEY, server_config
+    ).await.expect("bind OPAQUE TLS listener");
     let addr = listener.local_addr().expect("OPAQUE local_addr").to_string();
 
     tokio::spawn(async move {
@@ -150,10 +152,13 @@ async fn boot_tss(
     coordinator: tss::distributed::SigningCoordinator,
     mut nodes: Vec<tss::distributed::SignerNode>,
     pq_signing_key: Box<crypto::pq_sign::PqSigningKey>,
+    ca: &shard::tls::CertificateAuthority,
 ) -> String {
-    let listener = ShardListener::bind("127.0.0.1:0", ModuleId::Tss, SHARD_HMAC_KEY)
-        .await
-        .expect("bind TSS listener");
+    let cert_key = shard::tls::generate_module_cert("localhost", ca);
+    let server_config = shard::tls::server_tls_config(&cert_key, ca);
+    let listener = shard::tls_transport::TlsShardListener::bind(
+        "127.0.0.1:0", ModuleId::Tss, SHARD_HMAC_KEY, server_config
+    ).await.expect("bind TSS TLS listener");
     let addr = listener.local_addr().expect("TSS local_addr").to_string();
 
     tokio::spawn(async move {
@@ -215,17 +220,24 @@ async fn boot_tss(
     addr
 }
 
-async fn boot_orchestrator(opaque_addr: String, tss_addr: String) -> String {
-    let listener = ShardListener::bind("127.0.0.1:0", ModuleId::Orchestrator, SHARD_HMAC_KEY)
-        .await
-        .expect("bind Orchestrator listener");
+async fn boot_orchestrator(opaque_addr: String, tss_addr: String, ca: &shard::tls::CertificateAuthority) -> String {
+    let cert_key = shard::tls::generate_module_cert("localhost", ca);
+    let server_config = shard::tls::server_tls_config(&cert_key, ca);
+    let listener = shard::tls_transport::TlsShardListener::bind(
+        "127.0.0.1:0", ModuleId::Orchestrator, SHARD_HMAC_KEY, server_config
+    ).await.expect("bind Orchestrator TLS listener");
     let addr = listener
         .local_addr()
         .expect("Orchestrator local_addr")
         .to_string();
 
+    // Create TLS connector that trusts the shared CA
+    let client_cert = shard::tls::generate_module_cert("orchestrator-client", ca);
+    let client_config = shard::tls::client_tls_config(&client_cert, ca);
+    let connector = shard::tls::tls_connector(client_config);
+
     let service = std::sync::Arc::new(
-        OrchestratorService::new(SHARD_HMAC_KEY, opaque_addr, tss_addr),
+        OrchestratorService::new_with_tls(SHARD_HMAC_KEY, opaque_addr, tss_addr, connector),
     );
 
     tokio::spawn(async move {
@@ -256,13 +268,18 @@ async fn boot_orchestrator(opaque_addr: String, tss_addr: String) -> String {
     addr
 }
 
-async fn boot_gateway(orchestrator_addr: String) -> String {
+async fn boot_gateway(orchestrator_addr: String, ca: &shard::tls::CertificateAuthority) -> String {
+    let gateway_cert = shard::tls::generate_module_cert("gateway-client", ca);
+    let gateway_client_config = shard::tls::client_tls_config(&gateway_cert, ca);
+    let gateway_connector = shard::tls::tls_connector(gateway_client_config);
+
     let gateway = GatewayServer::bind_with_orchestrator(
         "127.0.0.1:0",
         TEST_DIFFICULTY,
         OrchestratorConfig {
             addr: orchestrator_addr,
             hmac_key: SHARD_HMAC_KEY,
+            tls_connector: gateway_connector,
         },
     )
     .await
@@ -295,14 +312,17 @@ async fn boot_full_system(
         .await
         .expect("DKG task");
 
-    let opaque_addr = boot_opaque(store).await;
-    let tss_addr = boot_tss(coordinator, nodes, pq_sk).await;
+    // Generate shared CA for all inter-service mTLS
+    let ca = shard::tls::generate_ca();
+
+    let opaque_addr = boot_opaque(store, &ca).await;
+    let tss_addr = boot_tss(coordinator, nodes, pq_sk, &ca).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let orchestrator_addr = boot_orchestrator(opaque_addr, tss_addr).await;
+    let orchestrator_addr = boot_orchestrator(opaque_addr, tss_addr, &ca).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let gateway_addr = boot_gateway(orchestrator_addr).await;
+    let gateway_addr = boot_gateway(orchestrator_addr, &ca).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     (gateway_addr, group_verifying_key)
@@ -1410,10 +1430,15 @@ fn test_all_modules_can_send_to_audit() {
 
 #[tokio::test]
 async fn test_shard_100_messages_sequential() {
-    let listener = ShardListener::bind("127.0.0.1:0", ModuleId::Orchestrator, SHARD_HMAC_KEY)
-        .await
-        .expect("bind listener");
+    let (listener, ca, _cert_key) = tls_transport::tls_bind(
+        "127.0.0.1:0", ModuleId::Orchestrator, SHARD_HMAC_KEY, "localhost"
+    ).await.expect("bind listener");
     let addr = listener.local_addr().expect("local addr").to_string();
+
+    // Build a client connector that trusts the server's CA
+    let client_cert = shard::tls::generate_module_cert("client", &ca);
+    let client_cfg = shard::tls::client_tls_config(&client_cert, &ca);
+    let connector = shard::tls::tls_connector(client_cfg);
 
     tokio::spawn(async move {
         for _ in 0..100 {
@@ -1427,7 +1452,7 @@ async fn test_shard_100_messages_sequential() {
 
     for i in 0u32..100 {
         let mut transport =
-            shard::transport::connect(&addr, ModuleId::Gateway, SHARD_HMAC_KEY)
+            tls_transport::tls_connect(&addr, ModuleId::Gateway, SHARD_HMAC_KEY, &connector, "localhost")
                 .await
                 .expect("connect");
         let msg = format!("message-{i}");
@@ -1439,10 +1464,15 @@ async fn test_shard_100_messages_sequential() {
 
 #[tokio::test]
 async fn test_shard_replay_detected_even_under_load() {
-    let listener = ShardListener::bind("127.0.0.1:0", ModuleId::Orchestrator, SHARD_HMAC_KEY)
-        .await
-        .expect("bind listener");
+    let (listener, ca, _cert_key) = tls_transport::tls_bind(
+        "127.0.0.1:0", ModuleId::Orchestrator, SHARD_HMAC_KEY, "localhost"
+    ).await.expect("bind listener");
     let addr = listener.local_addr().expect("local addr").to_string();
+
+    // Build a client connector that trusts the server's CA
+    let client_cert = shard::tls::generate_module_cert("client", &ca);
+    let client_cfg = shard::tls::client_tls_config(&client_cert, &ca);
+    let connector = shard::tls::tls_connector(client_cfg);
 
     // Server side: accept one connection, receive messages, detect replay
     let server = tokio::spawn(async move {
@@ -1467,9 +1497,10 @@ async fn test_shard_replay_detected_even_under_load() {
 
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    let stream = tokio::net::TcpStream::connect(&addr).await.expect("connect");
-    let protocol = ShardProtocol::new(ModuleId::Gateway, SHARD_HMAC_KEY);
-    let mut transport = shard::transport::ShardTransport::new(stream, protocol);
+    let mut transport =
+        tls_transport::tls_connect(&addr, ModuleId::Gateway, SHARD_HMAC_KEY, &connector, "localhost")
+            .await
+            .expect("connect");
 
     // Send first message, capture raw bytes
     let msg1_payload = b"message-1";
@@ -1487,10 +1518,15 @@ async fn test_shard_replay_detected_even_under_load() {
 
 #[tokio::test]
 async fn test_shard_large_payload() {
-    let listener = ShardListener::bind("127.0.0.1:0", ModuleId::Orchestrator, SHARD_HMAC_KEY)
-        .await
-        .expect("bind listener");
+    let (listener, ca, _cert_key) = tls_transport::tls_bind(
+        "127.0.0.1:0", ModuleId::Orchestrator, SHARD_HMAC_KEY, "localhost"
+    ).await.expect("bind listener");
     let addr = listener.local_addr().expect("local addr").to_string();
+
+    // Build a client connector that trusts the server's CA
+    let client_cert = shard::tls::generate_module_cert("client", &ca);
+    let client_cfg = shard::tls::client_tls_config(&client_cert, &ca);
+    let connector = shard::tls::tls_connector(client_cfg);
 
     tokio::spawn(async move {
         let mut transport = listener.accept().await.expect("accept");
@@ -1501,7 +1537,7 @@ async fn test_shard_large_payload() {
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let mut transport =
-        shard::transport::connect(&addr, ModuleId::Gateway, SHARD_HMAC_KEY)
+        tls_transport::tls_connect(&addr, ModuleId::Gateway, SHARD_HMAC_KEY, &connector, "localhost")
             .await
             .expect("connect");
 
@@ -1515,10 +1551,15 @@ async fn test_shard_large_payload() {
 
 #[tokio::test]
 async fn test_shard_oversized_payload_rejected() {
-    let listener = ShardListener::bind("127.0.0.1:0", ModuleId::Orchestrator, SHARD_HMAC_KEY)
-        .await
-        .expect("bind listener");
+    let (listener, ca, _cert_key) = tls_transport::tls_bind(
+        "127.0.0.1:0", ModuleId::Orchestrator, SHARD_HMAC_KEY, "localhost"
+    ).await.expect("bind listener");
     let addr = listener.local_addr().expect("local addr").to_string();
+
+    // Build a client connector that trusts the server's CA
+    let client_cert = shard::tls::generate_module_cert("client", &ca);
+    let client_cfg = shard::tls::client_tls_config(&client_cert, &ca);
+    let connector = shard::tls::tls_connector(client_cfg);
 
     tokio::spawn(async move {
         let mut transport = listener.accept().await.expect("accept");
@@ -1528,13 +1569,14 @@ async fn test_shard_oversized_payload_rejected() {
 
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    // Connect raw and send an oversized frame header (> 16 MiB)
-    let mut stream = tokio::net::TcpStream::connect(&addr).await.expect("connect");
-    let huge_len: u32 = 17 * 1024 * 1024; // 17 MiB
-    stream
-        .write_all(&huge_len.to_be_bytes())
-        .await
-        .expect("write oversized length");
+    // Connect via TLS and send an oversized frame header (> 16 MiB)
+    let mut transport =
+        tls_transport::tls_connect(&addr, ModuleId::Gateway, SHARD_HMAC_KEY, &connector, "localhost")
+            .await
+            .expect("connect");
+    let huge_payload = vec![0u8; 17 * 1024 * 1024]; // 17 MiB
+    // send_raw writes length prefix + payload; server's recv should reject the oversized frame
+    let _result = transport.send_raw(&huge_payload).await;
     // The server should reject or close the connection before reading the full payload.
     // We just verify no panic/crash happened by the test completing.
 }

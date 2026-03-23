@@ -74,11 +74,11 @@ async fn main() {
 
     let addr = std::env::var("TSS_ADDR").unwrap_or_else(|_| "127.0.0.1:9103".to_string());
     let hmac_key = crypto::entropy::generate_key_64();
-    let listener =
-        shard::transport::ShardListener::bind(&addr, common::types::ModuleId::Tss, hmac_key)
+    let (listener, _ca, _cert_key) =
+        shard::tls_transport::tls_bind(&addr, common::types::ModuleId::Tss, hmac_key, "tss")
             .await
             .unwrap();
-    tracing::info!("TSS service listening on {addr}");
+    tracing::info!("TSS service listening on {addr} (mTLS)");
 
     loop {
         if let Ok(mut transport) = listener.accept().await {
@@ -89,7 +89,20 @@ async fn main() {
             let pq_signing_key = Arc::clone(&pq_signing_key);
 
             tokio::spawn(async move {
-                while let Ok((_sender, payload)) = transport.recv().await {
+                while let Ok((sender, payload)) = transport.recv().await {
+                    // C11: Validate sender identity — only Orchestrator may request signing
+                    if sender != common::types::ModuleId::Orchestrator {
+                        tracing::warn!("TSS: rejecting signing request from unauthorized sender {:?}", sender);
+                        let resp = SigningResponse {
+                            success: false,
+                            token: None,
+                            error: Some(format!("unauthorized sender: {:?} (only Orchestrator permitted)", sender)),
+                        };
+                        let resp_bytes = postcard::to_allocvec(&resp).unwrap();
+                        let _ = transport.send(&resp_bytes).await;
+                        continue;
+                    }
+
                     tracing::info!("TSS received signing request");
 
                     // 1. Deserialize the signing request

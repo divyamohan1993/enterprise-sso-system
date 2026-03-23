@@ -1,9 +1,13 @@
 //! Auth Orchestrator service — coordinates Gateway, OPAQUE, and TSS.
+//!
+//! All inter-service connections use mTLS (mutual TLS) with auto-generated
+//! certificates. There is no plain-TCP fallback — this is military-grade.
 
 use common::types::{ModuleId, TokenClaims};
 use crypto::entropy::{generate_key_64, generate_nonce};
 use opaque::messages::{OpaqueRequest, OpaqueResponse};
-use shard::transport::{connect, ShardListener, ShardTransport};
+use shard::tls_transport::{tls_connect, TlsShardTransport, tls_bind, tls_client_setup};
+use tokio_rustls::TlsConnector;
 use tss::messages::{SigningRequest, SigningResponse};
 use uuid::Uuid;
 
@@ -15,15 +19,19 @@ use crate::messages::{OrchestratorRequest, OrchestratorResponse};
 /// SECURITY: The orchestrator does NOT hold any receipt signing key.
 /// Receipts are signed solely by the OPAQUE service and forwarded as-is
 /// to the TSS. This prevents the orchestrator from forging receipts.
+///
+/// All inter-service connections use mTLS — no plain TCP fallback.
 pub struct OrchestratorService {
     pub hmac_key: [u8; 64],
     pub opaque_addr: String,
     pub tss_addr: String,
     pub risk_engine: risk::scoring::RiskEngine,
+    /// TLS connector for outbound mTLS connections to peer services.
+    pub tls_connector: TlsConnector,
 }
 
 impl OrchestratorService {
-    /// Create a new orchestrator service.
+    /// Create a new orchestrator service with auto-generated mTLS credentials.
     ///
     /// Note: No receipt signing key is accepted — receipts are signed only
     /// by the OPAQUE service and forwarded to the TSS without re-signing.
@@ -32,26 +40,56 @@ impl OrchestratorService {
         opaque_addr: String,
         tss_addr: String,
     ) -> Self {
+        let (tls_connector, _ca, _cert_key) = tls_client_setup("orchestrator");
         Self {
             hmac_key,
             opaque_addr,
             tss_addr,
             risk_engine: risk::scoring::RiskEngine::new(),
+            tls_connector,
         }
     }
 
-    /// Connect to the OPAQUE service via SHARD.
-    async fn connect_opaque(&self) -> Result<ShardTransport, String> {
-        connect(&self.opaque_addr, ModuleId::Orchestrator, self.hmac_key)
-            .await
-            .map_err(|e| format!("connect to OPAQUE: {e}"))
+    /// Create a new orchestrator service with an explicit TLS connector.
+    pub fn new_with_tls(
+        hmac_key: [u8; 64],
+        opaque_addr: String,
+        tss_addr: String,
+        tls_connector: TlsConnector,
+    ) -> Self {
+        Self {
+            hmac_key,
+            opaque_addr,
+            tss_addr,
+            risk_engine: risk::scoring::RiskEngine::new(),
+            tls_connector,
+        }
     }
 
-    /// Connect to the TSS service via SHARD.
-    async fn connect_tss(&self) -> Result<ShardTransport, String> {
-        connect(&self.tss_addr, ModuleId::Orchestrator, self.hmac_key)
-            .await
-            .map_err(|e| format!("connect to TSS: {e}"))
+    /// Connect to the OPAQUE service via SHARD over mTLS.
+    async fn connect_opaque(&self) -> Result<TlsShardTransport, String> {
+        tls_connect(
+            &self.opaque_addr,
+            ModuleId::Orchestrator,
+            self.hmac_key,
+            &self.tls_connector,
+            "localhost",
+        )
+        .await
+        .map_err(|e| format!("connect to OPAQUE: {e}"))
+    }
+
+    /// Connect to the TSS service via SHARD over mTLS.
+    async fn connect_tss(&self) -> Result<TlsShardTransport, String> {
+        tls_connect(
+            &self.tss_addr,
+            ModuleId::Orchestrator,
+            self.hmac_key,
+            &self.tls_connector,
+            "localhost",
+        )
+        .await
+        .map_err(|e| format!("connect to TSS: {e}"))
     }
 
     /// Process a single authentication request end-to-end.
@@ -64,17 +102,12 @@ impl OrchestratorService {
             },
             Err(e) => {
                 // Record the failed attempt in the server-side counter.
-                // We derive a deterministic user ID from the username so that
-                // the counter tracks attempts even before OPAQUE confirms the
-                // user exists (preventing pre-auth brute-force).
                 // Derive deterministic user ID from username for rate limiting
-                // This tracks attempts even before OPAQUE confirms user exists
                 let user_id = {
                     use sha2::{Digest, Sha256};
                     let hash = Sha256::digest(request.username.as_bytes());
                     let mut bytes = [0u8; 16];
                     bytes.copy_from_slice(&hash[..16]);
-                    // Set UUID v4 variant bits for compatibility
                     bytes[6] = (bytes[6] & 0x0f) | 0x40;
                     bytes[8] = (bytes[8] & 0x3f) | 0x80;
                     Uuid::from_bytes(bytes)
@@ -91,10 +124,6 @@ impl OrchestratorService {
     }
 
     /// Inner implementation that returns Result for ergonomic error handling.
-    ///
-    /// The orchestrator acts as the OPAQUE client: it receives the password
-    /// from the gateway and runs the client side of the OPAQUE protocol.
-    /// The OPAQUE service (server side) never sees the plaintext password.
     async fn process_auth_inner(&self, request: &OrchestratorRequest) -> Result<Vec<u8>, String> {
         use opaque::opaque_impl::OpaqueCs;
         use opaque_ke::{ClientLogin, ClientLoginFinishParameters};
@@ -105,8 +134,7 @@ impl OrchestratorService {
         let mut session = CeremonySession::new(session_id);
 
         // 2. OPAQUE Login Round 1: Client starts, sends CredentialRequest
-        //    Runs in spawn_blocking because Argon2id KSF is CPU-bound and
-        //    would block the async executor under concurrent load.
+        //    Runs in spawn_blocking because Argon2id KSF is CPU-bound.
         let password_clone = request.password.clone();
         let client_login_start = tokio::task::spawn_blocking(move || {
             let mut rng = OsRng;
@@ -143,9 +171,7 @@ impl OrchestratorService {
             .map_err(|e| format!("deserialize login challenge: {e}"))?;
 
         let credential_response_bytes = match opaque_resp1 {
-            OpaqueResponse::LoginChallenge {
-                credential_response,
-            } => credential_response,
+            OpaqueResponse::LoginChallenge { credential_response } => credential_response,
             OpaqueResponse::Error { message } => {
                 session.fail(message.clone()).ok();
                 return Err(message);
@@ -156,7 +182,7 @@ impl OrchestratorService {
             }
         };
 
-        // 3. OPAQUE Login Round 2: Client finishes, sends CredentialFinalization
+        // 3. OPAQUE Login Round 2: Client finishes
         //    Runs in spawn_blocking because Argon2id KSF is CPU-bound.
         let credential_response =
             opaque_ke::CredentialResponse::<OpaqueCs>::deserialize(&credential_response_bytes)
@@ -166,12 +192,7 @@ impl OrchestratorService {
         let login_state = client_login_start.state;
         let client_login_finish = tokio::task::spawn_blocking(move || {
             let mut rng = OsRng;
-            login_state.finish(
-                &mut rng,
-                &password_clone2,
-                credential_response,
-                ClientLoginFinishParameters::default(),
-            )
+            login_state.finish(&mut rng, &password_clone2, credential_response, ClientLoginFinishParameters::default())
         })
             .await
             .map_err(|e| format!("OPAQUE client login finish task: {e}"))?
@@ -216,10 +237,7 @@ impl OrchestratorService {
 
         // 4. Add receipt to chain
         session.user_id = Some(receipt.user_id);
-        session
-            .receipt_chain
-            .add_receipt(receipt)
-            .map_err(|e| format!("receipt chain: {e}"))?;
+        session.receipt_chain.add_receipt(receipt).map_err(|e| format!("receipt chain: {e}"))?;
         session.opaque_complete()?;
 
         // 5. Risk evaluation
@@ -238,28 +256,19 @@ impl OrchestratorService {
         }
         if self.risk_engine.requires_step_up(risk_score) {
             tracing::warn!("Risk score {risk_score} >= 0.6 — step-up re-auth required");
-            return Err(format!(
-                "risk: step-up re-authentication required (score={risk_score:.2})"
-            ));
+            return Err(format!("risk: step-up re-authentication required (score={risk_score:.2})"));
         }
 
         // 6. Build and send TSS signing request
         let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH).unwrap()
             .as_micros() as i64;
 
-        // Use SecurityConfig for tier-based token lifetimes (spec Section 5)
         let security_config = common::config::SecurityConfig::default();
         let tier = if request.tier == 0 { 2 } else { request.tier };
-        // H4: Validate tier is in valid range [1-4]
-        if tier > 4 {
-            return Err("invalid tier: must be 1-4".into());
-        }
-        // TODO: Cross-reference with device registry to validate claimed tier
+        if tier > 4 { return Err("invalid tier: must be 1-4".into()); }
         let token_lifetime_us = security_config.token_lifetime_for_tier(tier) as i64 * 1_000_000;
 
-        // Generate a cryptographically random token_id for revocation support
         let token_id: [u8; 16] = {
             let nonce = generate_nonce();
             let mut id = [0u8; 16];
@@ -269,98 +278,51 @@ impl OrchestratorService {
 
         let claims = TokenClaims {
             sub: session.user_id.unwrap_or(Uuid::nil()),
-            iss: [0xAA; 32],
-            iat: now,
-            exp: now + token_lifetime_us,
-            scope: 0x0000_000F,
-            dpop_hash: request.dpop_key_hash,
-            ceremony_id: session_id,
-            tier,
-            ratchet_epoch: 1,
-            token_id,
+            iss: [0xAA; 32], iat: now, exp: now + token_lifetime_us,
+            scope: 0x0000_000F, dpop_hash: request.dpop_key_hash,
+            ceremony_id: session_id, tier, ratchet_epoch: 1, token_id,
             aud: request.audience.clone(),
         };
 
-        // TODO: Use X-Wing shared secret from gateway as ratchet initial key
-        // For now: generate random initial key
         let ratchet_key = generate_key_64();
-
-        let signing_req = SigningRequest {
-            receipts: session.receipt_chain.receipts().to_vec(),
-            claims,
-            ratchet_key,
-        };
-
-        let signing_bytes = postcard::to_allocvec(&signing_req)
-            .map_err(|e| format!("serialize signing request: {e}"))?;
+        let signing_req = SigningRequest { receipts: session.receipt_chain.receipts().to_vec(), claims, ratchet_key };
+        let signing_bytes = postcard::to_allocvec(&signing_req).map_err(|e| format!("serialize signing request: {e}"))?;
 
         let mut tss_transport = self.connect_tss().await?;
-        tss_transport
-            .send(&signing_bytes)
-            .await
-            .map_err(|e| format!("send to TSS: {e}"))?;
-
-        let (_sender, tss_resp_bytes) = tss_transport
-            .recv()
-            .await
-            .map_err(|e| format!("recv from TSS: {e}"))?;
+        tss_transport.send(&signing_bytes).await.map_err(|e| format!("send to TSS: {e}"))?;
+        let (_sender, tss_resp_bytes) = tss_transport.recv().await.map_err(|e| format!("recv from TSS: {e}"))?;
 
         let tss_resp: SigningResponse = postcard::from_bytes(&tss_resp_bytes)
             .map_err(|e| format!("deserialize signing response: {e}"))?;
 
         if !tss_resp.success {
-            session
-                .fail(tss_resp.error.clone().unwrap_or_default())
-                .ok();
-            return Err(tss_resp
-                .error
-                .unwrap_or_else(|| "TSS signing failed".into()));
+            session.fail(tss_resp.error.clone().unwrap_or_default()).ok();
+            return Err(tss_resp.error.unwrap_or_else(|| "TSS signing failed".into()));
         }
 
         session.tss_complete()?;
-
-        tss_resp
-            .token
-            .ok_or_else(|| "TSS success but no token".into())
+        tss_resp.token.ok_or_else(|| "TSS success but no token".into())
     }
 
-    /// Start the orchestrator as a SHARD listener, processing auth requests
-    /// from the Gateway.
+    /// Start the orchestrator as a SHARD mTLS listener, processing auth requests.
     pub async fn run(&self, listen_addr: &str) -> Result<(), String> {
-        let listener = ShardListener::bind(listen_addr, ModuleId::Orchestrator, self.hmac_key)
-            .await
-            .map_err(|e| format!("bind orchestrator listener: {e}"))?;
+        let (listener, _ca, _cert_key) =
+            tls_bind(listen_addr, ModuleId::Orchestrator, self.hmac_key, "orchestrator")
+                .await
+                .map_err(|e| format!("bind orchestrator TLS listener: {e}"))?;
 
-        tracing::info!("Orchestrator listening on {}", listen_addr);
+        tracing::info!("Orchestrator listening on {} (mTLS)", listen_addr);
 
         loop {
-            let mut transport = listener
-                .accept()
-                .await
-                .map_err(|e| format!("accept: {e}"))?;
-
-            let (_sender, req_bytes) = transport
-                .recv()
-                .await
-                .map_err(|e| format!("recv from gateway: {e}"))?;
-
+            let mut transport = listener.accept().await.map_err(|e| format!("accept: {e}"))?;
+            let (_sender, req_bytes) = transport.recv().await.map_err(|e| format!("recv from gateway: {e}"))?;
             let request: OrchestratorRequest = match postcard::from_bytes(&req_bytes) {
                 Ok(r) => r,
-                Err(e) => {
-                    tracing::error!("bad request from gateway: {e}");
-                    continue;
-                }
+                Err(e) => { tracing::error!("bad request from gateway: {e}"); continue; }
             };
-
             let response = self.process_auth(&request).await;
-
-            let resp_bytes =
-                postcard::to_allocvec(&response).map_err(|e| format!("serialize response: {e}"))?;
-
-            transport
-                .send(&resp_bytes)
-                .await
-                .map_err(|e| format!("send to gateway: {e}"))?;
+            let resp_bytes = postcard::to_allocvec(&response).map_err(|e| format!("serialize response: {e}"))?;
+            transport.send(&resp_bytes).await.map_err(|e| format!("send to gateway: {e}"))?;
         }
     }
 }

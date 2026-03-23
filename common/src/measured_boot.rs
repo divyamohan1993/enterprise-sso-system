@@ -59,7 +59,11 @@ impl BootAttestation {
         }
     }
 
-    /// Generate an HMAC-SHA512 signed attestation report.
+    /// Generate an HMAC-SHA512 signed attestation report (legacy, symmetric).
+    ///
+    /// **DEPRECATED**: Use [`to_signed_report_mldsa65`] for new deployments.
+    /// HMAC is symmetric — a remote verifier needs the signing key to verify,
+    /// which also gives them the ability to forge attestation reports.
     ///
     /// The report covers the binary hash, boot_id, TPM status, and
     /// timestamp, keyed with `signing_key`.
@@ -95,6 +99,57 @@ impl BootAttestation {
 
         report.extend_from_slice(&tag);
         report
+    }
+
+    /// Generate an ML-DSA-65 signed attestation report (asymmetric).
+    ///
+    /// Uses asymmetric ML-DSA-65 signing instead of HMAC-SHA512, allowing
+    /// remote parties to verify attestation without the ability to forge.
+    /// The `signing_seed` is a 32-byte seed used to deterministically derive
+    /// an ML-DSA-65 keypair. The verifying key is returned alongside the report
+    /// so the verifier can check signatures without holding the signing key.
+    ///
+    /// # Returns
+    /// `(signed_report, encoded_verifying_key)` — the report contains the
+    /// attestation data followed by the ML-DSA-65 signature, and the
+    /// verifying key is returned separately for the verifier.
+    pub fn to_signed_report_mldsa65(
+        &self,
+        signing_seed: &[u8; 32],
+    ) -> (Vec<u8>, Vec<u8>) {
+        use ml_dsa::{KeyGen, MlDsa65, SigningKey};
+        use ml_dsa::signature::Signer;
+
+        // Derive a deterministic ML-DSA-65 keypair from the 32-byte seed
+        let kp = MlDsa65::from_seed(&(*signing_seed).into());
+        let sk: &SigningKey<MlDsa65> = kp.signing_key();
+
+        // Build the attestation data payload
+        let mut report = Vec::new();
+        report.extend_from_slice(&self.attestation_time.to_be_bytes());
+        report.push(self.tpm_available as u8);
+
+        let ver_bytes = self.tpm_version.as_bytes();
+        report.extend_from_slice(&(ver_bytes.len() as u32).to_be_bytes());
+        report.extend_from_slice(ver_bytes);
+
+        report.extend_from_slice(&self.binary_hash);
+
+        let bid_bytes = self.boot_id.as_bytes();
+        report.extend_from_slice(&(bid_bytes.len() as u32).to_be_bytes());
+        report.extend_from_slice(bid_bytes);
+
+        // Sign the report data with ML-DSA-65
+        let signature = sk.sign(&report);
+        let sig_bytes = signature.encode();
+
+        // Append signature to report
+        report.extend_from_slice(&sig_bytes);
+
+        // Encode the verifying key for the remote verifier
+        let vk_bytes = kp.verifying_key().encode().to_vec();
+
+        (report, vk_bytes)
     }
 }
 

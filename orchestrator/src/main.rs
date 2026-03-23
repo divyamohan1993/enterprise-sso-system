@@ -21,9 +21,10 @@ async fn main() {
 
     // SECURITY: No receipt_signing_key — receipts are signed solely by the
     // OPAQUE service and forwarded to the TSS without re-signing.
+    // mTLS client credentials are auto-generated at construction time.
     let service = OrchestratorService::new(hmac_key, opaque_addr, tss_addr);
 
-    tracing::info!("Starting orchestrator on {listen_addr}");
+    tracing::info!("Starting orchestrator on {listen_addr} (mTLS)");
     if let Err(e) = service.run(&listen_addr).await {
         tracing::error!("Orchestrator exited with error: {e}");
         std::process::exit(1);

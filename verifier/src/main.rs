@@ -77,15 +77,15 @@ async fn main() {
         });
     }
 
-    // 5. Bind SHARD listener
+    // 5. Bind SHARD TLS listener
     let addr = std::env::var("VERIFIER_ADDR").unwrap_or_else(|_| "127.0.0.1:9104".to_string());
     let hmac_key = crypto::entropy::generate_key_64();
-    let listener =
-        shard::transport::ShardListener::bind(&addr, ModuleId::Verifier, hmac_key)
+    let (listener, _ca, _cert_key) =
+        shard::tls_transport::tls_bind(&addr, ModuleId::Verifier, hmac_key, "verifier")
             .await
-            .expect("failed to bind verifier SHARD listener");
+            .expect("failed to bind verifier SHARD TLS listener");
 
-    tracing::info!("verifier listening on {addr}");
+    tracing::info!("verifier listening on {addr} (mTLS)");
 
     // TODO: Implement ratchet heartbeat with config.verifier_staleness_timeout_secs (60s)
     // Reject all tokens if Ratchet Manager doesn't respond within timeout

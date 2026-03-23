@@ -19,7 +19,11 @@ pub struct CertificateAuthority {
 }
 
 /// Generate a self-signed CA certificate for signing module certificates.
+///
+/// Automatically installs the rustls crypto provider if not already installed.
 pub fn generate_ca() -> CertificateAuthority {
+    // Ensure rustls crypto provider is available (idempotent).
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let key_pair = KeyPair::generate().expect("CA key generation failed");
     let mut params = CertificateParams::new(Vec::<String>::new())
         .expect("empty SAN list is valid for a CA");

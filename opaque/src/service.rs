@@ -18,7 +18,6 @@ use opaque_ke::{
     RegistrationRequest, RegistrationUpload,
     ServerLogin, ServerLoginParameters, ServerRegistration,
 };
-use shard::transport::ShardListener;
 use tracing::{error, info};
 
 use crate::messages::{OpaqueRequest, OpaqueResponse};
@@ -274,8 +273,9 @@ pub async fn run(mut store: CredentialStore) -> Result<(), Box<dyn std::error::E
     let receipt_signing_key = load_receipt_signing_key();
     let receipt_signer = ReceiptSigner::new(receipt_signing_key);
 
-    let listener = ShardListener::bind(DEFAULT_ADDR, ModuleId::Opaque, shard_hmac_key).await?;
-    info!("OPAQUE service listening on {}", DEFAULT_ADDR);
+    let (listener, _ca, _cert_key) =
+        shard::tls_transport::tls_bind(DEFAULT_ADDR, ModuleId::Opaque, shard_hmac_key, "opaque").await?;
+    info!("OPAQUE service listening on {} (mTLS)", DEFAULT_ADDR);
 
     loop {
         let mut transport = listener.accept().await?;
