@@ -40,7 +40,7 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
-getrandom = "0.2"
+getrandom = "0.4"
 rand = "0.8"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 frost-ristretto255 = "2.2"
