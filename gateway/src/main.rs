@@ -26,7 +26,7 @@ async fn main() {
 
     let addr = format!("{bind_addr}:{port}");
 
-    let server = GatewayServer::bind(&addr, 4)
+    let server = GatewayServer::bind(&addr, 16)
         .await
         .expect("failed to bind gateway");
 

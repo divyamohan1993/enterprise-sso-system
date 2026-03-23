@@ -16,13 +16,16 @@ use crypto::entropy::generate_nonce;
 const MAX_CONSUMED_ENTRIES: usize = 100_000;
 
 /// Global adaptive difficulty -- increases under load.
-static CURRENT_DIFFICULTY: AtomicU8 = AtomicU8::new(16);
+static CURRENT_DIFFICULTY: AtomicU8 = AtomicU8::new(0);
 
-/// Compute the appropriate puzzle difficulty based on the number of active
+/// Compute the adaptive difficulty INCREASE based on the number of active
 /// connections and store it globally.
 ///
-/// Minimum difficulty is 16 (~65536 hashes, ~3ms) to provide meaningful
-/// DDoS mitigation.  Maximum is 24 (~16M hashes) under extreme load.
+/// Returns 0 under normal load (the server's configured base difficulty
+/// applies), scaling up to 24 under extreme load.  The server takes
+/// `max(base_difficulty, adaptive_difficulty)` so the configured difficulty
+/// always acts as a floor — allowing tests to use a low difficulty while
+/// production servers enforce a meaningful minimum.
 pub fn get_adaptive_difficulty(active_connections: usize) -> u8 {
     let difficulty = if active_connections > 1000 {
         24 // DDoS level
@@ -31,7 +34,7 @@ pub fn get_adaptive_difficulty(active_connections: usize) -> u8 {
     } else if active_connections > 100 {
         18 // Moderate load
     } else {
-        16 // Normal
+        0 // Normal — use base difficulty
     };
     CURRENT_DIFFICULTY.store(difficulty, Ordering::Relaxed);
     difficulty

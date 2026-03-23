@@ -90,9 +90,14 @@ pub async fn client_auth(
         .expect("receive puzzle challenge");
 
     // 2. Generate X-Wing keypair and solve puzzle
-    //    Use spawn_blocking for puzzle solving since it's CPU-intensive and
-    //    would block the single-threaded tokio runtime at difficulty >= 16.
-    let client_kp = crypto::xwing::XWingKeyPair::generate();
+    //    Use spawn_blocking for both keygen and puzzle solving since they are
+    //    CPU-intensive. ML-KEM-1024 keygen also uses significant stack space
+    //    that can overflow the async task's stack in debug builds.
+    let client_kp: Box<crypto::xwing::XWingKeyPair> = tokio::task::spawn_blocking(|| {
+        Box::new(crypto::xwing::XWingKeyPair::generate())
+    })
+    .await
+    .expect("keygen task");
     let client_pk_bytes = client_kp.public_key().to_bytes();
 
     let challenge_clone = challenge.clone();
@@ -123,7 +128,7 @@ pub async fn client_auth(
     let kem_msg: KemCiphertext = postcard::from_bytes(&raw_kem)
         .unwrap_or_else(|e| panic!("deserialize KemCiphertext ({} bytes): {e}", raw_kem.len()));
 
-    // 4. Decapsulate to get shared secret
+    // 4. Decapsulate to get shared secret (spawn_blocking for ML-KEM stack usage)
     let kem_ct = crypto::xwing::Ciphertext::from_bytes(&kem_msg.ciphertext)
         .unwrap_or_else(|| {
             panic!(
@@ -131,8 +136,11 @@ pub async fn client_auth(
                 kem_msg.ciphertext.len()
             )
         });
-    let shared_secret =
-        crypto::xwing::xwing_decapsulate(&client_kp, &kem_ct);
+    let shared_secret = tokio::task::spawn_blocking(move || {
+        crypto::xwing::xwing_decapsulate(&client_kp, &kem_ct)
+    })
+    .await
+    .expect("decapsulate task");
 
     // 5. Derive session key
     let session_key =

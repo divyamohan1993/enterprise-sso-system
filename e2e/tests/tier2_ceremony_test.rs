@@ -112,7 +112,7 @@ async fn boot_opaque(store: CredentialStore) -> String {
 
 /// Boot the TSS service as a SHARD listener using distributed signing.
 /// The coordinator holds NO keys; each SignerNode holds exactly one share.
-async fn boot_tss(coordinator: SigningCoordinator, mut nodes: Vec<SignerNode>, pq_signing_key: crypto::pq_sign::PqSigningKey) -> String {
+async fn boot_tss(coordinator: SigningCoordinator, mut nodes: Vec<SignerNode>, pq_signing_key: Box<crypto::pq_sign::PqSigningKey>) -> String {
     let listener = ShardListener::bind("127.0.0.1:0", ModuleId::Tss, SHARD_HMAC_KEY)
         .await
         .expect("bind TSS listener");
@@ -287,12 +287,18 @@ async fn boot_gateway(orchestrator_addr: String) -> String {
 #[tokio::test]
 async fn tier2_full_ceremony_success() {
     // 1. Setup crypto: DKG(5,3) -> distributed signing
-    let mut dkg_result = dkg(5, 3);
-    let group_verifying_key = dkg_result.group.public_key_package.clone();
-
-    // Distribute shares: coordinator holds NO keys, each node holds 1 share
-    let (coordinator, nodes) = distribute_shares(&mut dkg_result);
-    let (pq_sk, pq_vk) = crypto::pq_sign::generate_pq_keypair();
+    //    Run on a blocking thread to avoid overflowing the async task stack
+    //    (ML-DSA-87 keygen + FROST DKG use significant stack in debug builds).
+    let (group_verifying_key, coordinator, nodes, pq_sk, pq_vk) =
+        tokio::task::spawn_blocking(|| {
+            let mut dkg_result = dkg(5, 3);
+            let group_verifying_key = dkg_result.group.public_key_package.clone();
+            let (coordinator, nodes) = distribute_shares(&mut dkg_result);
+            let (pq_sk, pq_vk) = crypto::pq_sign::generate_pq_keypair();
+            (group_verifying_key, coordinator, nodes, pq_sk, pq_vk)
+        })
+        .await
+        .expect("DKG/keygen task");
 
     // 2. Boot services in dependency order
     let opaque_addr = boot_opaque({
@@ -302,7 +308,7 @@ async fn tier2_full_ceremony_success() {
     })
     .await;
 
-    let tss_addr = boot_tss(coordinator, nodes, pq_sk).await;
+    let tss_addr = boot_tss(coordinator, nodes, Box::new(pq_sk)).await;
 
     // Small delay to let listeners bind
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -383,9 +389,16 @@ async fn tier2_full_ceremony_success() {
 #[tokio::test]
 async fn tier2_wrong_password_fails() {
     // 1. Setup crypto: DKG(5,3) -> distributed signing
-    let mut dkg_result = dkg(5, 3);
-    let (coordinator, nodes) = distribute_shares(&mut dkg_result);
-    let (pq_sk, _pq_vk) = crypto::pq_sign::generate_pq_keypair();
+    //    Run on a blocking thread to avoid stack overflow in debug builds.
+    let (coordinator, nodes, pq_sk) =
+        tokio::task::spawn_blocking(|| {
+            let mut dkg_result = dkg(5, 3);
+            let (coordinator, nodes) = distribute_shares(&mut dkg_result);
+            let (pq_sk, _pq_vk) = crypto::pq_sign::generate_pq_keypair();
+            (coordinator, nodes, pq_sk)
+        })
+        .await
+        .expect("DKG/keygen task");
 
     // 2. Boot services
     let opaque_addr = boot_opaque({
@@ -395,7 +408,7 @@ async fn tier2_wrong_password_fails() {
     })
     .await;
 
-    let tss_addr = boot_tss(coordinator, nodes, pq_sk).await;
+    let tss_addr = boot_tss(coordinator, nodes, Box::new(pq_sk)).await;
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 

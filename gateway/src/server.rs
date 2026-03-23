@@ -72,7 +72,9 @@ impl GatewayServer {
     pub async fn bind(addr: &str, difficulty: u8) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr).await?;
         info!("Gateway listening on {}", listener.local_addr()?);
-        let xwing_kp = crypto::xwing::XWingKeyPair::generate();
+        let xwing_kp = tokio::task::spawn_blocking(crypto::xwing::XWingKeyPair::generate)
+            .await
+            .map_err(|e| std::io::Error::other(format!("XWing keygen: {e}")))?;
         let xwing_server_pk = Arc::new(xwing_kp.public_key().to_bytes());
         info!("X-Wing server keypair generated ({} byte public key)", xwing_server_pk.len());
         Ok(Self {
@@ -93,7 +95,9 @@ impl GatewayServer {
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr).await?;
         info!("Gateway listening on {}", listener.local_addr()?);
-        let xwing_kp = crypto::xwing::XWingKeyPair::generate();
+        let xwing_kp = tokio::task::spawn_blocking(crypto::xwing::XWingKeyPair::generate)
+            .await
+            .map_err(|e| std::io::Error::other(format!("XWing keygen: {e}")))?;
         let xwing_server_pk = Arc::new(xwing_kp.public_key().to_bytes());
         info!("X-Wing server keypair generated ({} byte public key)", xwing_server_pk.len());
         Ok(Self {
@@ -280,7 +284,14 @@ async fn handle_connection(
     let client_pk = crypto::xwing::XWingPublicKey::from_bytes(&client_pk_bytes)
         .ok_or("invalid X-Wing public key from client")?;
 
-    let (shared_secret, kem_ct) = crypto::xwing::xwing_encapsulate(&client_pk);
+    // ML-KEM-1024 encapsulation uses significant stack space; run on a blocking
+    // thread to avoid overflowing the async task stack in debug builds.
+    let (shared_secret, kem_ct) = {
+        let pk = client_pk;
+        tokio::task::spawn_blocking(move || crypto::xwing::xwing_encapsulate(&pk))
+            .await
+            .map_err(|e| format!("KEM encapsulate task: {e}"))?
+    };
 
     // 5. Send the KEM ciphertext to the client so it can decapsulate
     let kem_msg = KemCiphertext {
@@ -364,6 +375,7 @@ async fn forward_to_orchestrator(
         password: auth_req.password.clone(),
         dpop_key_hash: client_pk_hash,
         tier: 0,                  // Orchestrator decides tier
+        audience: None,
         device_attestation_age_secs: None,
         geo_velocity_kmh: None,
         is_unusual_network: None,

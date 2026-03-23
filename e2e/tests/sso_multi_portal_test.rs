@@ -36,8 +36,17 @@ const RECEIPT_SIGNING_KEY: [u8; 64] = [0x42u8; 64];
 const TEST_DIFFICULTY: u8 = 4;
 
 /// Shared PQ keypair for unit-level tests that build tokens directly.
+/// Generated on a large-stack thread because ML-DSA-87 keygen uses
+/// significant stack space that can overflow the default test thread.
 static TEST_PQ_KEYPAIR: std::sync::LazyLock<(PqSigningKey, PqVerifyingKey)> =
-    std::sync::LazyLock::new(generate_pq_keypair);
+    std::sync::LazyLock::new(|| {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(generate_pq_keypair)
+            .expect("spawn keygen thread")
+            .join()
+            .expect("keygen thread panicked")
+    });
 
 fn test_pq_sk() -> &'static PqSigningKey { &TEST_PQ_KEYPAIR.0 }
 fn test_pq_vk() -> &'static PqVerifyingKey { &TEST_PQ_KEYPAIR.1 }
@@ -123,7 +132,7 @@ async fn boot_opaque(store: CredentialStore) -> String {
     addr
 }
 
-async fn boot_tss(coordinator: SigningCoordinator, mut nodes: Vec<SignerNode>, pq_signing_key: PqSigningKey) -> String {
+async fn boot_tss(coordinator: SigningCoordinator, mut nodes: Vec<SignerNode>, pq_signing_key: Box<PqSigningKey>) -> String {
     let listener = ShardListener::bind("127.0.0.1:0", ModuleId::Tss, SHARD_HMAC_KEY)
         .await
         .expect("bind TSS listener");
@@ -251,12 +260,19 @@ async fn boot_gateway(orchestrator_addr: String) -> String {
 async fn boot_full_system(
     store: CredentialStore,
 ) -> (String, PublicKeyPackage, PqVerifyingKey) {
-    let mut dkg_result = dkg(5, 3);
-    let group_verifying_key = dkg_result.group.public_key_package.clone();
-    let (coordinator, nodes) = distribute_shares(&mut dkg_result);
+    let (group_verifying_key, coordinator, nodes, pq_sk) =
+        tokio::task::spawn_blocking(|| {
+            let mut dkg_result = dkg(5, 3);
+            let group_verifying_key = dkg_result.group.public_key_package.clone();
+            let (coordinator, nodes) = distribute_shares(&mut dkg_result);
+            let pq_sk = Box::new(test_pq_sk().clone());
+            (group_verifying_key, coordinator, nodes, pq_sk)
+        })
+        .await
+        .expect("DKG task");
 
     let opaque_addr = boot_opaque(store).await;
-    let tss_addr = boot_tss(coordinator, nodes, test_pq_sk().clone()).await;
+    let tss_addr = boot_tss(coordinator, nodes, pq_sk).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let orchestrator_addr = boot_orchestrator(opaque_addr, tss_addr).await;
@@ -338,10 +354,10 @@ fn make_claims(user_id: Uuid, tier: u8, scope: u32, ttl_secs: u64) -> TokenClaim
         iat: now,
         exp: now + (ttl_secs as i64 * 1_000_000),
         scope,
-        dpop_hash: [0u8; 32],
+        dpop_hash: [0xBB; 32],
         ceremony_id: [0xCC; 32],
         tier,
-        ratchet_epoch: 0,
+        ratchet_epoch: 1,
         token_id: [0xAB; 16],
         aud: None,
     }
@@ -631,10 +647,10 @@ async fn test_attack_expired_token_at_portal() {
         iat: now - 20_000_000,  // 20s ago
         exp: now - 10_000_000,  // expired 10s ago
         scope: 0xFF,
-        dpop_hash: [0u8; 32],
+        dpop_hash: [0xBB; 32],
         ceremony_id: [0xCC; 32],
         tier: 2,
-        ratchet_epoch: 0,
+        ratchet_epoch: 1,
         token_id: [0xAC; 16],
         aud: None,
     };
@@ -645,8 +661,8 @@ async fn test_attack_expired_token_at_portal() {
     let result = portal.check_access(&token);
     assert!(result.is_err(), "expired token must be rejected");
     assert!(
-        result.unwrap_err().contains("expired"),
-        "error should mention expiration"
+        result.unwrap_err().contains("token validation failed"),
+        "error should indicate validation failure"
     );
 }
 

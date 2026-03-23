@@ -143,7 +143,7 @@ async fn boot_opaque(store: CredentialStore) -> String {
 async fn boot_tss(
     coordinator: tss::distributed::SigningCoordinator,
     mut nodes: Vec<tss::distributed::SignerNode>,
-    pq_signing_key: crypto::pq_sign::PqSigningKey,
+    pq_signing_key: Box<crypto::pq_sign::PqSigningKey>,
 ) -> String {
     use shard::transport::ShardListener;
     use tss::messages::{SigningRequest, SigningResponse};
@@ -278,12 +278,22 @@ async fn boot_gateway(orchestrator_addr: String) -> String {
 async fn boot_full_system(
     store: CredentialStore,
 ) -> (String, frost_ristretto255::keys::PublicKeyPackage) {
-    let mut dkg_result = dkg(5, 3);
-    let group_verifying_key = dkg_result.group.public_key_package.clone();
-    let (coordinator, nodes) = distribute_shares(&mut dkg_result);
+    // Run DKG and PQ key clone on a blocking thread to avoid overflowing
+    // the async task stack (ML-DSA-87 keys and FROST DKG use significant
+    // stack space that exceeds the default 2MB test thread stack in debug).
+    let (group_verifying_key, coordinator, nodes, pq_sk) =
+        tokio::task::spawn_blocking(|| {
+            let mut dkg_result = dkg(5, 3);
+            let group_verifying_key = dkg_result.group.public_key_package.clone();
+            let (coordinator, nodes) = distribute_shares(&mut dkg_result);
+            let pq_sk = Box::new(test_pq_sk().clone());
+            (group_verifying_key, coordinator, nodes, pq_sk)
+        })
+        .await
+        .expect("DKG task");
 
     let opaque_addr = boot_opaque(store).await;
-    let tss_addr = boot_tss(coordinator, nodes, test_pq_sk().clone()).await;
+    let tss_addr = boot_tss(coordinator, nodes, pq_sk).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let orchestrator_addr = boot_orchestrator(opaque_addr, tss_addr).await;

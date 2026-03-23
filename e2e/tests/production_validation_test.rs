@@ -51,8 +51,17 @@ const RECEIPT_SIGNING_KEY: [u8; 64] = [0x42u8; 64];
 const TEST_DIFFICULTY: u8 = 4;
 
 /// Shared PQ keypair for unit-level tests.
+/// Generated on a large-stack thread because ML-DSA-87 keygen uses
+/// significant stack space that can overflow the default test thread.
 static TEST_PQ_KEYPAIR: std::sync::LazyLock<(PqSigningKey, PqVerifyingKey)> =
-    std::sync::LazyLock::new(generate_pq_keypair);
+    std::sync::LazyLock::new(|| {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(generate_pq_keypair)
+            .expect("spawn keygen thread")
+            .join()
+            .expect("keygen thread panicked")
+    });
 fn test_pq_sk() -> &'static PqSigningKey { &TEST_PQ_KEYPAIR.0 }
 fn test_pq_vk() -> &'static PqVerifyingKey { &TEST_PQ_KEYPAIR.1 }
 
@@ -140,7 +149,7 @@ async fn boot_opaque(store: CredentialStore) -> String {
 async fn boot_tss(
     coordinator: tss::distributed::SigningCoordinator,
     mut nodes: Vec<tss::distributed::SignerNode>,
-    pq_signing_key: crypto::pq_sign::PqSigningKey,
+    pq_signing_key: Box<crypto::pq_sign::PqSigningKey>,
 ) -> String {
     let listener = ShardListener::bind("127.0.0.1:0", ModuleId::Tss, SHARD_HMAC_KEY)
         .await
@@ -268,12 +277,22 @@ async fn boot_gateway(orchestrator_addr: String) -> String {
 async fn boot_full_system(
     store: CredentialStore,
 ) -> (String, frost_ristretto255::keys::PublicKeyPackage) {
-    let mut dkg_result = dkg(5, 3);
-    let group_verifying_key = dkg_result.group.public_key_package.clone();
-    let (coordinator, nodes) = distribute_shares(&mut dkg_result);
+    // Run DKG and PQ key clone on a blocking thread to avoid overflowing
+    // the async task stack (ML-DSA-87 keys and FROST DKG use significant
+    // stack space that exceeds the default test thread stack in debug builds).
+    let (group_verifying_key, coordinator, nodes, pq_sk) =
+        tokio::task::spawn_blocking(|| {
+            let mut dkg_result = dkg(5, 3);
+            let group_verifying_key = dkg_result.group.public_key_package.clone();
+            let (coordinator, nodes) = distribute_shares(&mut dkg_result);
+            let pq_sk = Box::new(test_pq_sk().clone());
+            (group_verifying_key, coordinator, nodes, pq_sk)
+        })
+        .await
+        .expect("DKG task");
 
     let opaque_addr = boot_opaque(store).await;
-    let tss_addr = boot_tss(coordinator, nodes, test_pq_sk().clone()).await;
+    let tss_addr = boot_tss(coordinator, nodes, pq_sk).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let orchestrator_addr = boot_orchestrator(opaque_addr, tss_addr).await;
@@ -619,34 +638,41 @@ fn test_token_signature_cannot_be_transplanted() {
 
 #[test]
 fn test_expired_token_rejected() {
-    let pq_vk = test_pq_vk();
-    let mut dkg_result = dkg(5, 3);
-    let group_key = dkg_result.group.public_key_package.clone();
+    // Run on a large-stack thread because DKG + ML-DSA-87 signing exceed
+    // the default 5MB test thread stack in debug builds.
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let mut dkg_result = dkg(5, 3);
+            let group_key = dkg_result.group.public_key_package.clone();
 
-    let claims = TokenClaims {
-        sub: Uuid::nil(),
-        iss: [0xAA; 32],
-        iat: 1_000_000,
-        exp: 1_000_001, // far in the past
-        scope: 0x0000_000F,
-        dpop_hash: [0xBB; 32],
-        ceremony_id: [0xCC; 32],
-        tier: 2,
-        ratchet_epoch: 1,
-        token_id: [0xAB; 16],
-        aud: None,
-    };
+            let claims = TokenClaims {
+                sub: Uuid::nil(),
+                iss: [0xAA; 32],
+                iat: 1_000_000,
+                exp: 1_000_001, // far in the past
+                scope: 0x0000_000F,
+                dpop_hash: [0xBB; 32],
+                ceremony_id: [0xCC; 32],
+                tier: 2,
+                ratchet_epoch: 1,
+                token_id: [0xAB; 16],
+                aud: None,
+            };
 
-    let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
-    let (pq_sk, _pq_vk) = crypto::pq_sign::generate_pq_keypair();
-    let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
-    let token = build_token_distributed(&claims, &coordinator, &mut signers, &[0x55u8; 64], test_pq_sk(), None)
-        .expect("build token should succeed");
+            let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
+            let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
+            let token = build_token_distributed(&claims, &coordinator, &mut signers, &[0x55u8; 64], test_pq_sk(), None)
+                .expect("build token should succeed");
 
-    let result = verify_token(&token, &group_key, test_pq_vk());
-    assert!(result.is_err(), "expired token must be rejected");
-    let err = format!("{}", result.unwrap_err());
-    assert!(err.contains("expired"), "error should mention expiry, got: {err}");
+            let result = verify_token(&token, &group_key, test_pq_vk());
+            assert!(result.is_err(), "expired token must be rejected");
+            let err = format!("{}", result.unwrap_err());
+            assert!(err.contains("token validation failed"), "error should indicate validation failure, got: {err}");
+        })
+        .expect("spawn thread")
+        .join()
+        .expect("thread panicked");
 }
 
 #[test]
@@ -916,10 +942,11 @@ fn test_kt_merkle_proof_valid_for_all_operations() {
     }
 
     let root = tree.root();
+    let tree_size = tree.len();
     for (idx, leaf) in leaves.iter().enumerate() {
         let proof = tree.inclusion_proof(idx).expect("proof should exist");
         assert!(
-            MerkleTree::verify_inclusion(&root, leaf, &proof, idx),
+            MerkleTree::verify_inclusion_with_size(&root, leaf, &proof, idx, tree_size),
             "inclusion proof for index {idx} must verify"
         );
     }

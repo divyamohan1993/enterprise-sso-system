@@ -141,8 +141,8 @@ fn expired_token_rejected() {
     assert!(result.is_err(), "expired token must be rejected");
     let err = result.unwrap_err();
     assert!(
-        format!("{err}").contains("expired"),
-        "error should mention expiry"
+        format!("{err}").contains("token validation failed"),
+        "error should indicate validation failure"
     );
 }
 

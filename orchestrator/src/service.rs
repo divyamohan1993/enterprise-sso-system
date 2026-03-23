@@ -247,7 +247,7 @@ impl OrchestratorService {
             dpop_hash: request.dpop_key_hash,
             ceremony_id: session_id,
             tier,
-            ratchet_epoch: 0,
+            ratchet_epoch: 1,
             token_id,
             aud: request.audience.clone(),
         };
