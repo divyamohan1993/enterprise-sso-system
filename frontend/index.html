@@ -80,13 +80,28 @@
     display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0;
     background: var(--bg); z-index: 200;
     align-items: center; justify-content: center;
+    overflow-y: auto;
   }
   .fullscreen-page.active { display: flex; }
-  .login-box { width: 100%; max-width: 420px; padding: 2rem; }
+  .login-box { width: 100%; max-width: 440px; padding: 2rem 1.5rem; }
   .login-box .logo { text-align: center; margin-bottom: 2rem; }
-  .login-box .logo h1 { color: var(--green); font-size: 1.8rem; letter-spacing: 6px; }
+  .login-box .logo h1 { color: var(--green); font-size: 1.6rem; letter-spacing: 6px; }
   .login-box .logo p { color: var(--text-dim); font-size: 0.75rem; margin-top: 0.5rem; letter-spacing: 2px; }
   .login-box .logo .sub { color: var(--text-muted); font-size: 0.65rem; margin-top: 0.3rem; }
+  .login-divider { display: flex; align-items: center; gap: 0.8rem; margin: 1.2rem 0; color: var(--text-dim); font-size: 0.7rem; letter-spacing: 1px; }
+  .login-divider::before, .login-divider::after { content: ''; flex: 1; height: 1px; background: var(--border); }
+  .login-methods { display: flex; flex-direction: column; gap: 0.6rem; margin-bottom: 0.8rem; }
+  .btn-method {
+    display: flex; align-items: center; justify-content: center; gap: 0.6rem;
+    width: 100%; padding: 0.65rem 1rem; background: var(--bg3); border: 1px solid var(--border);
+    color: var(--text); font-family: var(--font); font-size: 0.8rem; cursor: pointer;
+    transition: all 0.15s; letter-spacing: 0.5px;
+  }
+  .btn-method:hover { border-color: var(--green); color: var(--green); }
+  .btn-method:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-method .method-icon { font-size: 1rem; width: 20px; text-align: center; }
+  .btn-method.btn-method-primary { background: var(--green); color: #000; border-color: var(--green); font-weight: 600; }
+  .btn-method.btn-method-primary:hover { filter: brightness(1.15); }
 
   /* ── Page Header ──────────────────────────────────────────────────────── */
   .page-header { margin-bottom: 1.5rem; }
@@ -367,6 +382,43 @@
     font-size: 0.8rem; color: var(--text-dim); margin-bottom: 0.8rem;
   }
   .recovery-status .count { color: var(--green); font-weight: 600; }
+
+  /* ── FIDO2 Enrollment Banner ─────────────────────────────────────────── */
+  .fido-enroll-banner {
+    background: rgba(255,170,0,0.08); border: 2px solid var(--amber); padding: 1.2rem;
+    margin-bottom: 1rem; display: none;
+  }
+  .fido-enroll-banner.active { display: block; }
+  .fido-enroll-banner h2 { color: var(--amber); border-bottom-color: var(--amber); }
+  .fido-enroll-banner .fido-enroll-desc {
+    color: var(--text-dim); font-size: 0.8rem; margin-bottom: 1rem; line-height: 1.6;
+  }
+  .fido-enroll-banner .fido-timer {
+    color: var(--red); font-size: 0.75rem; margin-top: 0.8rem; font-weight: 600;
+  }
+  .fido-enroll-options { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 0.8rem; }
+  .fido-option-btn {
+    display: flex; align-items: center; gap: 0.8rem; padding: 0.8rem 1rem;
+    background: var(--bg); border: 1px solid var(--border); cursor: pointer;
+    font-family: var(--font); font-size: 0.8rem; color: var(--text); transition: all 0.15s;
+    width: 100%; text-align: left;
+  }
+  .fido-option-btn:hover { border-color: var(--green); }
+  .fido-option-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .fido-option-btn .fido-opt-icon { font-size: 1.2rem; width: 28px; text-align: center; flex-shrink: 0; }
+  .fido-option-btn .fido-opt-info { flex: 1; }
+  .fido-option-btn .fido-opt-title { color: var(--green); font-weight: 600; font-size: 0.8rem; }
+  .fido-option-btn .fido-opt-desc { color: var(--text-dim); font-size: 0.7rem; margin-top: 0.15rem; }
+  .fido-enroll-status { margin-top: 0.8rem; font-size: 0.8rem; }
+  .fido-enroll-status .status-ok { color: var(--green); }
+  .fido-enroll-status .status-err { color: var(--red); }
+  .fido-enroll-status .status-wait { color: var(--amber); }
+
+  /* ── Accessible focus ────────────────────────────────────────────────── */
+  .btn:focus-visible, .btn-method:focus-visible, .fido-option-btn:focus-visible,
+  .nav-item:focus-visible, input:focus-visible, select:focus-visible {
+    outline: 2px solid var(--cyan); outline-offset: 2px;
+  }
 </style>
 </head>
 <body>
@@ -415,38 +467,71 @@
   <div class="login-box">
     <div class="logo">
       <h1>MILNET</h1>
-      <p>ENTERPRISE SINGLE SIGN-ON SYSTEM</p>
-      <div class="sub">Secure Access Admin Console</div>
+      <p>ENTERPRISE SINGLE SIGN-ON</p>
+      <div class="sub">Secure Access Portal</div>
     </div>
-    <div class="card">
-      <h2>// AUTHENTICATE</h2>
-      <div class="form-group">
-        <label>Username</label>
-        <input type="text" id="loginUser" placeholder="operator_id" autocomplete="username">
+
+    <!-- Sign-in method selection (default view) -->
+    <div id="loginMethodSelect">
+      <div class="card">
+        <h2>// SIGN IN</h2>
+        <div class="form-group">
+          <label>Username</label>
+          <input type="text" id="loginUser" placeholder="operator_id" autocomplete="username">
+        </div>
+        <div class="login-methods" style="margin-top:0.8rem;">
+          <button class="btn-method btn-method-primary" id="btnPasskeyLogin" onclick="doPasskeyLogin()">
+            <span class="method-icon">&#128273;</span> Sign in with Passkey
+          </button>
+          <button class="btn-method" onclick="showPasswordForm()">
+            <span class="method-icon">&#128274;</span> Sign in with Password
+          </button>
+        </div>
       </div>
-      <div class="form-group">
-        <label>Password</label>
-        <input type="password" id="loginPass" placeholder="password" autocomplete="current-password">
-      </div>
-      <button class="btn" style="width:100%;margin-top:0.5rem;justify-content:center;" onclick="doLogin()">AUTHENTICATE</button>
+      <a class="recovery-link" id="recoveryToggle" onclick="toggleRecoveryForm()">Lost your device? Use a recovery code</a>
     </div>
+
+    <!-- Password form (shown when "Sign in with Password" is clicked) -->
+    <div id="loginPasswordForm" style="display:none;">
+      <div class="card">
+        <h2>// PASSWORD AUTHENTICATION</h2>
+        <div class="form-group">
+          <label>Username</label>
+          <input type="text" id="loginUserPw" placeholder="operator_id" autocomplete="username">
+        </div>
+        <div class="form-group">
+          <label>Password</label>
+          <input type="password" id="loginPass" placeholder="password" autocomplete="current-password">
+        </div>
+        <button class="btn" style="width:100%;margin-top:0.5rem;justify-content:center;" onclick="doLogin()">AUTHENTICATE</button>
+        <div class="login-divider">OR</div>
+        <button class="btn-method" onclick="showMethodSelect()">
+          <span class="method-icon">&#8592;</span> Other sign-in methods
+        </button>
+      </div>
+    </div>
+
     <div class="terminal" id="loginTerminal">
       <div class="prompt">&gt; Awaiting authentication...</div>
     </div>
-    <a class="recovery-link" id="recoveryToggle" onclick="toggleRecoveryForm()">Lost your device? Use a recovery code</a>
+
+    <!-- Recovery form (shown when recovery link is clicked) -->
     <div class="recovery-form" id="recoveryForm">
       <div class="card" style="margin-top:0.8rem;">
         <h2>// EMERGENCY RECOVERY</h2>
+        <p style="color:var(--text-dim);font-size:0.78rem;margin-bottom:0.8rem;line-height:1.5;">
+          Enter your username and one of your recovery codes. This will grant temporary emergency access (2 minutes) so you can re-enroll a security key.
+        </p>
         <div class="form-group">
           <label>Username</label>
           <input type="text" id="recoveryUser" placeholder="operator_id" autocomplete="username">
         </div>
         <div class="form-group">
           <label>Recovery Code</label>
-          <input type="text" id="recoveryCode" placeholder="XXXXXXXX-XXXXXXXX-XXXXXXXX-XXXXXXXX" style="letter-spacing:1px;">
+          <input type="text" id="recoveryCode" placeholder="XXXXXXXX-XXXXXXXX-XXXXXXXX-XXXXXXXX" style="letter-spacing:1px;" autocomplete="off" spellcheck="false">
         </div>
         <button class="btn btn-amber" style="width:100%;justify-content:center;" onclick="doRecovery()">RECOVER ACCESS</button>
-        <a class="recovery-link" style="margin-top:0.8rem;color:var(--green);" onclick="toggleRecoveryForm()">Back to login</a>
+        <a class="recovery-link" style="margin-top:0.8rem;color:var(--green);" onclick="toggleRecoveryForm()">Back to sign in</a>
       </div>
       <div class="terminal" id="recoveryTerminal"></div>
     </div>
@@ -592,6 +677,48 @@
       <div class="card">
         <h2>// TOKEN CLAIMS</h2>
         <pre id="tokenClaims" style="font-size:0.8rem;color:var(--green);overflow-x:auto;white-space:pre-wrap;">No active token</pre>
+      </div>
+
+      <!-- FIDO2 Re-Enrollment Banner (Tier 4 Emergency) -->
+      <div class="fido-enroll-banner" id="fidoEnrollBanner">
+        <h2>// SECURITY KEY RE-ENROLLMENT REQUIRED</h2>
+        <div class="fido-enroll-desc">
+          You are on <strong style="color:var(--amber);">emergency access (Tier 4)</strong>. To restore full access, register a security key or passkey now. Your emergency session expires in <strong id="fidoEnrollCountdown">2:00</strong>.
+        </div>
+        <div class="fido-enroll-options">
+          <button class="fido-option-btn" onclick="fidoEnrollPlatform()" id="btnFidoPlatform">
+            <span class="fido-opt-icon">&#128187;</span>
+            <span class="fido-opt-info">
+              <span class="fido-opt-title">This Device (Built-in)</span>
+              <span class="fido-opt-desc">Windows Hello, Touch ID, Face ID, Android biometrics</span>
+            </span>
+          </button>
+          <button class="fido-option-btn" onclick="fidoEnrollCrossPlatform()" id="btnFidoCross">
+            <span class="fido-opt-icon">&#128273;</span>
+            <span class="fido-opt-info">
+              <span class="fido-opt-title">Security Key (External)</span>
+              <span class="fido-opt-desc">YubiKey, Titan, or other FIDO2 USB/NFC key</span>
+            </span>
+          </button>
+        </div>
+        <div class="fido-enroll-status" id="fidoEnrollStatus"></div>
+        <div class="fido-timer" id="fidoTimerWarn"></div>
+      </div>
+
+      <!-- Security Keys Management -->
+      <div class="card" id="fidoKeysCard">
+        <h2>// SECURITY KEYS</h2>
+        <div class="recovery-status" id="fidoKeysStatus">
+          <span class="dot dot-amber"></span>
+          <span>Registered keys: <span class="count" id="fidoKeysCount">--</span></span>
+        </div>
+        <div id="fidoKeysList" style="margin-bottom:0.8rem;"></div>
+        <div class="btn-group">
+          <button class="btn btn-sm" onclick="fidoAddKey(true)" id="btnAddPlatformKey">ADD THIS DEVICE</button>
+          <button class="btn btn-sm btn-outline" onclick="fidoAddKey(false)" id="btnAddExternalKey">ADD SECURITY KEY</button>
+          <button class="btn btn-sm btn-outline" onclick="loadFidoKeys()" style="margin-left:0.5rem;">REFRESH</button>
+        </div>
+        <div class="fido-enroll-status" id="fidoKeysEnrollStatus" style="margin-top:0.6rem;"></div>
       </div>
 
       <!-- Recovery Codes / Security -->
@@ -1025,18 +1152,26 @@ function fmtTime(ts) {
 var SCOPE_RANK = { read: 1, write: 2, admin: 3 };
 var TIER_NAMES = { 1: 'Sovereign', 2: 'Operational', 3: 'Sensor', 4: 'Emergency' };
 
+// Access check is done server-side — frontend NEVER decides access.
+async function checkAccessAsync(portal) {
+  if (!authToken) return { ok: false, reason: 'No active token' };
+  try {
+    var data = await api('/portals/check-access', {
+      method: 'POST',
+      body: JSON.stringify({
+        name: portal.name,
+        required_tier: portal.required_tier || portal.tier || 2
+      })
+    });
+    return { ok: data.granted === true, reason: data.reason || 'unknown' };
+  } catch (e) {
+    return { ok: false, reason: e.message || 'Backend check failed' };
+  }
+}
+// Synchronous wrapper for rendering (uses cached result, defaults to unknown)
 function checkAccess(portal) {
-  if (!tokenClaims) return { ok: false, reason: 'No active token' };
-  var userTier = tokenClaims.tier || 4;
-  var requiredTier = portal.required_tier || portal.tier || 2;
-  if (userTier > requiredTier) {
-    return { ok: false, reason: 'Your tier ' + userTier + ' (' + (TIER_NAMES[userTier] || '?') + ') > required tier ' + requiredTier + ' (' + (TIER_NAMES[requiredTier] || '?') + ') — access denied' };
-  }
-  var userScope = tokenClaims.scope || 'read';
-  if ((SCOPE_RANK[userScope] || 0) < (SCOPE_RANK[portal.scope] || 0)) {
-    return { ok: false, reason: 'Scope "' + userScope + '" insufficient, need "' + portal.scope + '"' };
-  }
-  return { ok: true, reason: 'Access granted — tier ' + userTier + ' (' + (TIER_NAMES[userTier] || '?') + ') meets requirement' };
+  // Return a pending state — actual check is done async by the caller
+  return { ok: false, reason: 'checking...' };
 }
 
 function safeGet(obj, path, def) {
@@ -1147,12 +1282,17 @@ function renderSimPortals() {
 
     var h3 = document.createElement('h3');
     var dot = document.createElement('span');
-    var dotClass = 'dot ';
-    if (!tokenClaims) dotClass += 'dot-amber';
-    else dotClass += checkAccess(p).ok ? 'dot-green' : 'dot-red';
-    dot.className = dotClass;
+    dot.className = 'dot dot-amber'; // Start amber, update after backend check
+    dot.id = 'simDot' + i;
     h3.appendChild(dot);
     h3.appendChild(document.createTextNode(p.name));
+    // Async update dot color from backend
+    (function(portalData, dotIdx) {
+      checkAccessAsync(portalData).then(function(result) {
+        var d = $('simDot' + dotIdx);
+        if (d) d.className = 'dot ' + (result.ok ? 'dot-green' : 'dot-red');
+      });
+    })(p, i);
     card.appendChild(h3);
 
     var meta = document.createElement('div');
@@ -1195,7 +1335,7 @@ function navigateTo(name, btn) {
   if (page) page.classList.add('active');
   if (btn) btn.classList.add('active');
 
-  if (name === 'dashboard') { loadStatus(); loadPortals(); loadHealth(); loadSecurityDashboard(); loadRecentAudit(); loadRecoveryStatus(); }
+  if (name === 'dashboard') { loadStatus(); loadPortals(); loadHealth(); loadSecurityDashboard(); loadRecentAudit(); loadRecoveryStatus(); loadFidoKeys(); }
   if (name === 'directory') { loadUsers(); loadDevices(); }
   if (name === 'applications') { loadPortals(); renderSimPortals(); }
   if (name === 'security') { loadAudit(); }
@@ -1221,16 +1361,20 @@ function showSecTab(tabName, btn) {
 function enterApp() {
   var tier = tokenClaims ? tokenClaims.tier : 4;
   var username = tokenClaims ? (tokenClaims.username || localStorage.getItem('username') || 'unknown') : 'unknown';
+  var isRecovery = localStorage.getItem('isRecoverySession') === 'true';
+  var dashboard = localStorage.getItem('dashboard') || 'user';
 
   localStorage.setItem('userTier', tier);
 
-  // Non-admin users (Tier 2-4) get their own separate dashboard
-  if (tier !== 1) {
-    window.location.href = '/user-dashboard.html';
+  // Follow the backend's routing decision — frontend never decides this
+  if (dashboard !== 'admin') {
+    var url = '/user-dashboard.html';
+    if (isRecovery) url += '?recovery=1';
+    window.location.href = url;
     return;
   }
 
-  // Tier 1 Sovereign: show the admin panel
+  // Backend said "admin" — show the admin panel
   $('page-login').classList.remove('active');
   $('page-onboarding').classList.remove('active');
   $('appShell').style.display = '';
@@ -1238,13 +1382,18 @@ function enterApp() {
   $('currentUser').textContent = username + ' [Tier ' + tier + (tierName ? ' ' + tierName : '') + ']';
   $('tokenClaims').textContent = JSON.stringify(tokenClaims, null, 2);
   navigateTo('dashboard', document.querySelector('.sidebar .nav-item'));
+
+  // Show FIDO2 enrollment banner if this is a recovery session
+  if (isRecovery) {
+    showFidoEnrollBanner();
+  }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
 // AUTH
 // ══════════════════════════════════════════════════════════════════════════════
 async function doLogin() {
-  var user = $('loginUser').value.trim();
+  var user = ($('loginUserPw') ? $('loginUserPw').value.trim() : '') || $('loginUser').value.trim();
   var pass = $('loginPass').value;
   if (!user || !pass) return showToast('Enter credentials', true);
 
@@ -1270,6 +1419,9 @@ async function doLogin() {
     if (!tokenClaims.tier && data.tier) tokenClaims.tier = data.tier;
     if (!tokenClaims.username && data.username) tokenClaims.username = data.username;
     if (data.username) localStorage.setItem('username', data.username);
+    if (data.user_id) localStorage.setItem('userId', data.user_id);
+    // Store backend's routing decision
+    if (data.dashboard) localStorage.setItem('dashboard', data.dashboard);
     termLog(term, '[3/4] Token received. Decoding claims...', 'line-info');
     termLog(term, '[4/4] Session established.', 'line-ok');
     termLog(term, '', '');
@@ -1277,7 +1429,6 @@ async function doLogin() {
     termLog(term, JSON.stringify(tokenClaims, null, 2), 'line-ok');
 
     $('tokenClaims').textContent = JSON.stringify(tokenClaims, null, 2);
-    var ut = tokenClaims.tier || '--';
     showToast('Authentication successful');
     setTimeout(enterApp, 800);
   } catch (e) {
@@ -1290,6 +1441,10 @@ function doLogout() {
   authToken = null;
   localStorage.removeItem('authToken');
   localStorage.removeItem('adminKey');
+  localStorage.removeItem('isRecoverySession');
+  localStorage.removeItem('recoveryUserId');
+  localStorage.removeItem('userId');
+  localStorage.removeItem('dashboard');
   tokenClaims = null;
   if (sessionRefreshInterval) { clearInterval(sessionRefreshInterval); sessionRefreshInterval = null; }
   if (siemRefreshInterval) { clearInterval(siemRefreshInterval); siemRefreshInterval = null; }
@@ -1670,10 +1825,12 @@ async function deletePortal(id) {
 // ══════════════════════════════════════════════════════════════════════════════
 // PORTAL SIMULATOR
 // ══════════════════════════════════════════════════════════════════════════════
-function simAccess(idx) {
+async function simAccess(idx) {
   var p = SIMULATED_PORTALS[idx];
-  var result = checkAccess(p);
   var el = $('simResult' + idx);
+  el.className = 'result';
+  el.textContent = 'Checking access...';
+  var result = await checkAccessAsync(p);
   el.className = 'result ' + (result.ok ? 'granted' : 'denied');
   el.textContent = (result.ok ? '[GRANTED] ' : '[DENIED] ') + result.reason;
 }
@@ -2006,57 +2163,57 @@ async function demoExpire() {
 async function demoTier() {
   var term = 'termTier';
   clearTerm(term);
-  if (!tokenClaims) { termLog(term, '[ERROR] Log in first to get a token.', 'line-err'); return; }
+  if (!authToken) { termLog(term, '[ERROR] Log in first to get a token.', 'line-err'); return; }
 
-  var userTier = tokenClaims.tier || 4;
-  termLog(term, '> Current user tier: ' + userTier + ' (' + (TIER_NAMES[userTier] || '?') + ')', 'prompt');
-  termLog(term, '> Attempting access to Tier 1 (Sovereign) portal (Command Dashboard)...', 'prompt');
+  termLog(term, '> Asking server to check access to Tier 1 (Sovereign) portal...', 'prompt');
   termLog(term, '', '');
 
   var target = SIMULATED_PORTALS[0];
-  var result = checkAccess(target);
+  var result = await checkAccessAsync(target);
 
   if (result.ok) {
-    termLog(term, '[GRANTED] User tier ' + userTier + ' <= required tier 1. Sovereign access confirmed.', 'line-ok');
+    termLog(term, '[GRANTED] Server confirmed access to ' + target.name + '.', 'line-ok');
+    termLog(term, '  ' + result.reason, 'line-ok');
   } else {
     termLog(term, '[DENIED] Access denied to ' + target.name + '.', 'line-err');
     termLog(term, '  Reason: ' + result.reason, 'line-err');
     termLog(term, '', '');
-    termLog(term, '> Attempting access to Tier 3 (Sensor) portal (Logistics Network)...', 'prompt');
-    var fallback = checkAccess(SIMULATED_PORTALS[4]);
+    termLog(term, '> Asking server to check access to Tier 3 (Sensor) portal...', 'prompt');
+    var fallback = await checkAccessAsync(SIMULATED_PORTALS[4]);
     if (fallback.ok) {
-      termLog(term, '[GRANTED] Tier ' + userTier + ' <= 3. Access to Logistics Network confirmed.', 'line-ok');
+      termLog(term, '[GRANTED] Server confirmed access to Logistics Network.', 'line-ok');
+      termLog(term, '  ' + fallback.reason, 'line-ok');
     } else {
       termLog(term, '[DENIED] ' + fallback.reason, 'line-err');
     }
   }
   termLog(term, '', '');
-  termLog(term, 'RESULT: Hierarchical tier enforcement is working correctly.', 'line-ok');
+  termLog(term, 'RESULT: All access decisions made by server. Hierarchical tier enforcement verified.', 'line-ok');
 }
 
 async function demoScope() {
   var term = 'termScope';
   clearTerm(term);
-  if (!tokenClaims) { termLog(term, '[ERROR] Log in first to get a token.', 'line-err'); return; }
+  if (!authToken) { termLog(term, '[ERROR] Log in first to get a token.', 'line-err'); return; }
 
-  var userScope = tokenClaims.scope || 'read';
-  termLog(term, '> Current token scope: ' + userScope, 'prompt');
-  termLog(term, '> Attempting admin-scoped action on Command Dashboard...', 'prompt');
+  termLog(term, '> Asking server to check access to admin-scoped action...', 'prompt');
   termLog(term, '', '');
 
   var adminPortal = { name: 'Admin Action', tier: 1, scope: 'admin' };
-  var result = checkAccess(adminPortal);
+  var result = await checkAccessAsync(adminPortal);
 
   if (result.ok) {
-    termLog(term, '[GRANTED] Token has admin scope. Action permitted.', 'line-ok');
+    termLog(term, '[GRANTED] Server confirmed admin scope access.', 'line-ok');
+    termLog(term, '  ' + result.reason, 'line-ok');
   } else {
     termLog(term, '[DENIED] ' + result.reason, 'line-err');
     termLog(term, '', '');
-    termLog(term, '> Attempting read-scoped action instead...', 'prompt');
+    termLog(term, '> Asking server to check access to read-scoped action...', 'prompt');
     var readPortal = { name: 'Read Action', tier: 1, scope: 'read' };
-    var r2 = checkAccess(readPortal);
+    var r2 = await checkAccessAsync(readPortal);
     if (r2.ok) {
-      termLog(term, '[GRANTED] Read-scoped action permitted with "' + userScope + '" scope.', 'line-ok');
+      termLog(term, '[GRANTED] Server confirmed read-scoped access.', 'line-ok');
+      termLog(term, '  ' + r2.reason, 'line-ok');
     } else {
       termLog(term, '[DENIED] ' + r2.reason, 'line-err');
     }
@@ -2070,23 +2227,42 @@ async function demoScope() {
 // ══════════════════════════════════════════════════════════════════════════════
 var generatedRecoveryCodes = [];
 
+function showMethodSelect() {
+  $('loginMethodSelect').style.display = '';
+  $('loginPasswordForm').style.display = 'none';
+  $('loginTerminal').style.display = '';
+  // Sync username back
+  var pwUser = $('loginUserPw').value.trim();
+  if (pwUser) $('loginUser').value = pwUser;
+}
+
+function showPasswordForm() {
+  $('loginMethodSelect').style.display = 'none';
+  $('loginPasswordForm').style.display = '';
+  $('loginTerminal').style.display = '';
+  // Sync username forward
+  var user = $('loginUser').value.trim();
+  if (user) $('loginUserPw').value = user;
+  $('loginPass').focus();
+}
+
 function toggleRecoveryForm() {
   var form = $('recoveryForm');
-  var toggle = $('recoveryToggle');
-  var loginCard = document.querySelector('#page-login .card');
+  var methodSelect = $('loginMethodSelect');
+  var pwForm = $('loginPasswordForm');
   var loginTerminal = $('loginTerminal');
   if (form.classList.contains('active')) {
     form.classList.remove('active');
-    toggle.style.display = '';
-    loginCard.style.display = '';
+    methodSelect.style.display = '';
+    pwForm.style.display = 'none';
     loginTerminal.style.display = '';
   } else {
     form.classList.add('active');
-    toggle.style.display = 'none';
-    loginCard.style.display = 'none';
+    methodSelect.style.display = 'none';
+    pwForm.style.display = 'none';
     loginTerminal.style.display = 'none';
     // Pre-fill username if already typed
-    var loginUser = $('loginUser').value.trim();
+    var loginUser = $('loginUser').value.trim() || ($('loginUserPw') ? $('loginUserPw').value.trim() : '');
     if (loginUser) $('recoveryUser').value = loginUser;
   }
 }
@@ -2105,8 +2281,12 @@ async function doRecovery() {
     termLog(term, '[2/3] Verifying recovery code with auth server...', 'line-info');
     var data = await api('/recovery/verify', {
       method: 'POST',
-      body: JSON.stringify({ username: user, recovery_code: code })
+      body: JSON.stringify({ username: user, code: code })
     });
+
+    if (data.success === false) {
+      throw new Error(data.message || 'Invalid recovery code');
+    }
 
     termLog(term, '[3/3] Recovery code accepted.', 'line-ok');
     termLog(term, '', '');
@@ -2117,17 +2297,26 @@ async function doRecovery() {
       tokenClaims = decodeJwtPayload(authToken) || {};
       if (!tokenClaims.tier && data.tier) tokenClaims.tier = data.tier;
       if (!tokenClaims.username && data.username) tokenClaims.username = data.username;
+      if (!tokenClaims.username) tokenClaims.username = user;
       if (data.username) localStorage.setItem('username', data.username);
+      else localStorage.setItem('username', user);
+      if (data.user_id) localStorage.setItem('userId', data.user_id);
     }
 
-    termLog(term, 'Emergency access granted. Please re-enroll your security key.', 'line-warn');
-    showToast('Emergency access granted');
+    // Mark this as a recovery session so the dashboard shows FIDO2 enrollment
+    localStorage.setItem('isRecoverySession', 'true');
+    if (data.user_id) localStorage.setItem('recoveryUserId', data.user_id);
+    // Store backend's routing decision
+    if (data.dashboard) localStorage.setItem('dashboard', data.dashboard);
+
+    termLog(term, 'Emergency access granted (2 min). Re-enroll your security key now.', 'line-warn');
+    showToast('Emergency access granted — enroll security key');
     if (authToken) {
       setTimeout(enterApp, 1200);
     }
   } catch (e) {
-    termLog(term, '[ERROR] Invalid or expired recovery code', 'line-err');
-    showToast('Invalid or expired recovery code', true);
+    termLog(term, '[ERROR] ' + (e.message || 'Invalid or expired recovery code'), 'line-err');
+    showToast(e.message || 'Invalid or expired recovery code', true);
   }
 }
 
@@ -2205,6 +2394,469 @@ function confirmCodesSaved() {
   $('recoveryCodesDisplay').style.display = 'none';
   generatedRecoveryCodes = [];
   showToast('Recovery codes hidden. Keep them safe.');
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// WEBAUTHN / FIDO2 — Cross-platform support
+// ══════════════════════════════════════════════════════════════════════════════
+var fidoCountdownInterval = null;
+
+function webAuthnSupported() {
+  return !!(window.PublicKeyCredential && navigator.credentials && navigator.credentials.create);
+}
+
+async function platformAuthAvailable() {
+  if (!webAuthnSupported()) return false;
+  try {
+    return await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
+  } catch (e) { return false; }
+}
+
+function showFidoEnrollBanner() {
+  var banner = $('fidoEnrollBanner');
+  if (!banner) return;
+  banner.classList.add('active');
+
+  if (!webAuthnSupported()) {
+    $('btnFidoPlatform').disabled = true;
+    $('btnFidoCross').disabled = true;
+    setFidoStatus('Your browser does not support WebAuthn/FIDO2. Use a modern browser (Chrome, Firefox, Safari, Edge).', 'err');
+    return;
+  }
+
+  // Detect platform authenticator availability
+  platformAuthAvailable().then(function(available) {
+    if (!available) {
+      var desc = $('btnFidoPlatform').querySelector('.fido-opt-desc');
+      if (desc) desc.textContent = 'Not available on this device';
+      $('btnFidoPlatform').disabled = true;
+    }
+  });
+
+  // Start 2-minute countdown
+  startFidoCountdown(120);
+}
+
+function startFidoCountdown(seconds) {
+  var remaining = seconds;
+  function update() {
+    var m = Math.floor(remaining / 60);
+    var s = remaining % 60;
+    var el = $('fidoEnrollCountdown');
+    if (el) el.textContent = m + ':' + (s < 10 ? '0' : '') + s;
+    var warn = $('fidoTimerWarn');
+    if (remaining <= 30 && warn) {
+      warn.textContent = 'Session expires in ' + remaining + 's — enroll now!';
+    }
+    if (remaining <= 0) {
+      clearInterval(fidoCountdownInterval);
+      if (warn) warn.textContent = 'Session expired. You will need to use another recovery code.';
+      $('btnFidoPlatform').disabled = true;
+      $('btnFidoCross').disabled = true;
+    }
+    remaining--;
+  }
+  update();
+  if (fidoCountdownInterval) clearInterval(fidoCountdownInterval);
+  fidoCountdownInterval = setInterval(update, 1000);
+}
+
+function setFidoStatus(msg, type) {
+  var el = $('fidoEnrollStatus');
+  if (!el) return;
+  el.textContent = '';
+  var span = document.createElement('span');
+  span.className = 'status-' + (type || 'wait');
+  span.textContent = msg;
+  el.appendChild(span);
+}
+
+function getUserIdForFido() {
+  return localStorage.getItem('recoveryUserId') || localStorage.getItem('userId') ||
+    (tokenClaims ? tokenClaims.sub : null) ||
+    (authToken ? authToken.split(':')[0] : null);
+}
+
+function getUsernameForFido() {
+  return (tokenClaims ? tokenClaims.username : null) || localStorage.getItem('username') || 'unknown';
+}
+
+async function fidoEnrollPlatform() { await fidoEnroll(true); }
+async function fidoEnrollCrossPlatform() { await fidoEnroll(false); }
+
+async function fidoEnroll(preferPlatform) {
+  if (!webAuthnSupported()) {
+    setFidoStatus('WebAuthn not supported in this browser.', 'err');
+    return;
+  }
+
+  var userId = getUserIdForFido();
+  var username = getUsernameForFido();
+  if (!userId) {
+    setFidoStatus('No user ID available. Please log in again.', 'err');
+    return;
+  }
+
+  setFidoStatus('Starting credential registration...', 'wait');
+
+  try {
+    // Step 1: Request registration options from server
+    var beginData = await api('/fido/register/begin', {
+      method: 'POST',
+      body: JSON.stringify({ user_id: userId, username: username, prefer_platform: preferPlatform })
+    });
+
+    var options = beginData.options || beginData;
+
+    // Step 2: Convert server options to WebAuthn credential creation options
+    var publicKey = {
+      challenge: b64ToUint8(options.challenge),
+      rp: { name: options.rp.name, id: options.rp.id },
+      user: {
+        id: b64ToUint8(options.user.id),
+        name: options.user.name,
+        displayName: options.user.display_name || options.user.name
+      },
+      pubKeyCredParams: (options.pub_key_cred_params || []).map(function(p) {
+        return { type: p.cred_type || p.type || 'public-key', alg: p.alg };
+      }),
+      timeout: options.timeout || 60000,
+      attestation: options.attestation || 'direct',
+      authenticatorSelection: {}
+    };
+
+    // Set authenticator selection based on user choice
+    if (options.authenticator_selection) {
+      publicKey.authenticatorSelection = {
+        userVerification: options.authenticator_selection.user_verification || 'required',
+        residentKey: options.authenticator_selection.resident_key || 'preferred'
+      };
+      if (options.authenticator_selection.authenticator_attachment) {
+        publicKey.authenticatorSelection.authenticatorAttachment = options.authenticator_selection.authenticator_attachment;
+      }
+    }
+    if (preferPlatform) {
+      publicKey.authenticatorSelection.authenticatorAttachment = 'platform';
+    }
+
+    // excludeCredentials — prevent re-registering the same authenticator
+    if (options.exclude_credentials && options.exclude_credentials.length) {
+      publicKey.excludeCredentials = options.exclude_credentials.map(function(c) {
+        return { type: c.cred_type || c.type || 'public-key', id: b64ToUint8(c.id) };
+      });
+    }
+
+    setFidoStatus('Waiting for authenticator — follow your device prompt...', 'wait');
+
+    // Step 3: Create credential via browser WebAuthn API
+    var credential = await navigator.credentials.create({ publicKey: publicKey });
+
+    setFidoStatus('Processing registration...', 'wait');
+
+    // Step 4: Send attestation to server
+    var attestationResponse = credential.response;
+    var completeData = await api('/fido/register/complete', {
+      method: 'POST',
+      body: JSON.stringify({
+        user_id: userId,
+        credential_id: uint8ToArray(new Uint8Array(credential.rawId)),
+        public_key: uint8ToArray(new Uint8Array(attestationResponse.getPublicKey ? attestationResponse.getPublicKey() : [])),
+        attestation_object: uint8ToArray(new Uint8Array(attestationResponse.attestationObject)),
+        client_data: uint8ToArray(new Uint8Array(attestationResponse.clientDataJSON)),
+        authenticator_type: preferPlatform ? 'platform' : 'cross-platform'
+      })
+    });
+
+    if (completeData.success) {
+      setFidoStatus('Key enrolled! You can add another device or sign in with this key.', 'ok');
+      localStorage.removeItem('isRecoverySession');
+      showToast('Security key enrolled');
+      if (fidoCountdownInterval) clearInterval(fidoCountdownInterval);
+      // Refresh the keys list if on admin dashboard
+      if (typeof loadFidoKeys === 'function') loadFidoKeys();
+    } else {
+      setFidoStatus('Registration failed: ' + (completeData.error || 'unknown error'), 'err');
+    }
+  } catch (e) {
+    var msg = e.message || 'Registration failed';
+    if (e.name === 'NotAllowedError') {
+      msg = 'Registration cancelled or timed out. Try again.';
+    } else if (e.name === 'SecurityError') {
+      msg = 'Security error — this may happen if the page is not served over HTTPS.';
+    } else if (e.name === 'InvalidStateError') {
+      msg = 'A credential is already registered on this authenticator.';
+    }
+    setFidoStatus(msg, 'err');
+  }
+}
+
+// Passkey login from the sign-in page
+async function doPasskeyLogin() {
+  var user = $('loginUser').value.trim();
+  if (!user) return showToast('Enter your username first', true);
+
+  var term = 'loginTerminal';
+  clearTerm(term);
+  termLog(term, '> Initiating passkey authentication...', 'prompt');
+
+  if (!webAuthnSupported()) {
+    termLog(term, '[ERROR] WebAuthn not supported in this browser.', 'line-err');
+    showToast('WebAuthn not supported — use password login instead', true);
+    return;
+  }
+
+  try {
+    // We need the user_id. Try to look it up or use stored value.
+    var storedUserId = localStorage.getItem('userId');
+    if (!storedUserId) {
+      termLog(term, '[INFO] Looking up user...', 'line-info');
+      // Attempt to get user_id via a login-init or similar; fallback to password
+      termLog(term, '[INFO] No cached user ID. Use password login first, then passkeys will work.', 'line-warn');
+      showToast('Use password login first to register your passkey', true);
+      return;
+    }
+
+    termLog(term, '[1/3] Requesting authentication challenge...', 'line-info');
+    var beginData = await api('/fido/authenticate/begin', {
+      method: 'POST',
+      body: JSON.stringify({ user_id: storedUserId })
+    });
+
+    if (beginData.error) {
+      termLog(term, '[ERROR] ' + beginData.error, 'line-err');
+      showToast(beginData.error, true);
+      return;
+    }
+
+    var options = beginData.options || beginData;
+
+    var publicKey = {
+      challenge: b64ToUint8(options.challenge),
+      timeout: options.timeout || 60000,
+      rpId: options.rp_id,
+      userVerification: options.user_verification || 'required',
+      allowCredentials: (options.allow_credentials || []).map(function(c) {
+        return {
+          type: c.cred_type || c.type || 'public-key',
+          id: b64ToUint8(c.id || c.credential_id)
+        };
+      })
+    };
+
+    termLog(term, '[2/3] Waiting for authenticator...', 'line-info');
+    var assertion = await navigator.credentials.get({ publicKey: publicKey });
+
+    termLog(term, '[3/3] Verifying with server...', 'line-info');
+    var verifyData = await api('/fido/authenticate/complete', {
+      method: 'POST',
+      body: JSON.stringify({
+        credential_id: uint8ToArray(new Uint8Array(assertion.rawId)),
+        authenticator_data: uint8ToArray(new Uint8Array(assertion.response.authenticatorData)),
+        client_data: uint8ToArray(new Uint8Array(assertion.response.clientDataJSON)),
+        signature: uint8ToArray(new Uint8Array(assertion.response.signature))
+      })
+    });
+
+    if (verifyData.success) {
+      authToken = verifyData.token || verifyData.access_token;
+      if (authToken) {
+        localStorage.setItem('authToken', authToken);
+        tokenClaims = decodeJwtPayload(authToken) || {};
+        if (!tokenClaims.tier && verifyData.tier) tokenClaims.tier = verifyData.tier;
+        if (!tokenClaims.username) tokenClaims.username = user;
+        localStorage.setItem('username', user);
+      }
+      termLog(term, 'Passkey authentication successful.', 'line-ok');
+      showToast('Authenticated with passkey');
+      setTimeout(enterApp, 800);
+    } else {
+      termLog(term, '[ERROR] ' + (verifyData.error || 'Authentication failed'), 'line-err');
+      showToast('Passkey authentication failed', true);
+    }
+  } catch (e) {
+    var errMsg = e.message || 'Passkey authentication failed';
+    if (e.name === 'NotAllowedError') errMsg = 'Authentication cancelled or timed out.';
+    termLog(term, '[ERROR] ' + errMsg, 'line-err');
+    showToast(errMsg, true);
+  }
+}
+
+// ── Binary helpers for WebAuthn ──────────────────────────────────────────
+function b64ToUint8(b64) {
+  // Handle both standard base64 and arrays (server may send byte arrays)
+  if (Array.isArray(b64)) return new Uint8Array(b64);
+  if (b64 instanceof ArrayBuffer) return new Uint8Array(b64);
+  if (typeof b64 !== 'string') return new Uint8Array(0);
+  // URL-safe base64 to standard
+  var s = b64.replace(/-/g, '+').replace(/_/g, '/');
+  while (s.length % 4) s += '=';
+  var raw = atob(s);
+  var arr = new Uint8Array(raw.length);
+  for (var i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+  return arr;
+}
+
+function uint8ToArray(uint8) {
+  return Array.from(uint8);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// FIDO2 — Security Keys Management (multi-key)
+// ══════════════════════════════════════════════════════════════════════════════
+async function loadFidoKeys() {
+  var userId = getUserIdForFido();
+  if (!userId) { $('fidoKeysCount').textContent = '--'; return; }
+
+  try {
+    var data = await api('/fido/credentials?user_id=' + encodeURIComponent(userId));
+    var creds = data.credentials || [];
+    $('fidoKeysCount').textContent = creds.length;
+
+    // Update status dot
+    var dot = document.querySelector('#fidoKeysStatus .dot');
+    if (dot) {
+      dot.className = 'dot ' + (creds.length === 0 ? 'dot-red' : (creds.length === 1 ? 'dot-amber' : 'dot-green'));
+    }
+
+    // Render key list
+    var list = $('fidoKeysList');
+    while (list.firstChild) list.removeChild(list.firstChild);
+
+    if (creds.length === 0) {
+      var p = document.createElement('p');
+      p.style.cssText = 'color:var(--text-dim);font-size:0.78rem;margin-bottom:0.5rem;';
+      p.textContent = 'No security keys registered. Add at least one key for secure access.';
+      list.appendChild(p);
+      return;
+    }
+
+    var tbl = document.createElement('table');
+    tbl.style.marginBottom = '0.5rem';
+    var thead = document.createElement('thead');
+    var hr = document.createElement('tr');
+    ['Type', 'Key ID', 'Sign Count'].forEach(function(h) {
+      var th = document.createElement('th'); th.textContent = h; hr.appendChild(th);
+    });
+    thead.appendChild(hr);
+    tbl.appendChild(thead);
+
+    var tbody = document.createElement('tbody');
+    creds.forEach(function(c) {
+      var tr = document.createElement('tr');
+      var td1 = document.createElement('td');
+      td1.textContent = c.authenticator_type === 'platform' ? 'Built-in' : 'External';
+      tr.appendChild(td1);
+      var td2 = document.createElement('td');
+      td2.style.cssText = 'font-size:0.7rem;color:var(--text-dim);';
+      td2.textContent = (c.credential_id_hex || '--').slice(0, 16) + '...';
+      tr.appendChild(td2);
+      var td3 = document.createElement('td');
+      td3.textContent = c.sign_count != null ? c.sign_count : '--';
+      tr.appendChild(td3);
+      tbody.appendChild(tr);
+    });
+    tbl.appendChild(tbody);
+    list.appendChild(tbl);
+  } catch (e) {
+    $('fidoKeysCount').textContent = '--';
+  }
+}
+
+async function fidoAddKey(preferPlatform) {
+  var statusEl = $('fidoKeysEnrollStatus');
+  function setKeyStatus(msg, type) {
+    if (!statusEl) return;
+    statusEl.textContent = '';
+    var span = document.createElement('span');
+    span.className = 'status-' + (type || 'wait');
+    span.textContent = msg;
+    statusEl.appendChild(span);
+  }
+
+  if (!webAuthnSupported()) {
+    setKeyStatus('WebAuthn not supported in this browser.', 'err');
+    return;
+  }
+
+  var userId = getUserIdForFido();
+  var username = getUsernameForFido();
+  if (!userId) {
+    setKeyStatus('No user ID available.', 'err');
+    return;
+  }
+
+  setKeyStatus('Starting registration...', 'wait');
+
+  try {
+    var beginData = await api('/fido/register/begin', {
+      method: 'POST',
+      body: JSON.stringify({ user_id: userId, username: username, prefer_platform: preferPlatform })
+    });
+
+    var options = beginData.options || beginData;
+
+    var publicKey = {
+      challenge: b64ToUint8(options.challenge),
+      rp: { name: options.rp.name, id: options.rp.id },
+      user: {
+        id: b64ToUint8(options.user.id),
+        name: options.user.name,
+        displayName: options.user.display_name || options.user.name
+      },
+      pubKeyCredParams: (options.pub_key_cred_params || []).map(function(p) {
+        return { type: p.cred_type || p.type || 'public-key', alg: p.alg };
+      }),
+      timeout: options.timeout || 60000,
+      attestation: options.attestation || 'direct',
+      authenticatorSelection: {
+        userVerification: (options.authenticator_selection || {}).user_verification || 'required',
+        residentKey: (options.authenticator_selection || {}).resident_key || 'preferred'
+      }
+    };
+
+    // excludeCredentials — prevent re-registering the same authenticator
+    if (options.exclude_credentials && options.exclude_credentials.length) {
+      publicKey.excludeCredentials = options.exclude_credentials.map(function(c) {
+        return { type: c.cred_type || c.type || 'public-key', id: b64ToUint8(c.id) };
+      });
+    }
+
+    if (preferPlatform) {
+      publicKey.authenticatorSelection.authenticatorAttachment = 'platform';
+    }
+
+    setKeyStatus('Follow your device prompt...', 'wait');
+
+    var credential = await navigator.credentials.create({ publicKey: publicKey });
+
+    setKeyStatus('Processing...', 'wait');
+
+    var resp = credential.response;
+    var result = await api('/fido/register/complete', {
+      method: 'POST',
+      body: JSON.stringify({
+        user_id: userId,
+        credential_id: uint8ToArray(new Uint8Array(credential.rawId)),
+        public_key: uint8ToArray(new Uint8Array(resp.getPublicKey ? resp.getPublicKey() : [])),
+        attestation_object: uint8ToArray(new Uint8Array(resp.attestationObject)),
+        client_data: uint8ToArray(new Uint8Array(resp.clientDataJSON)),
+        authenticator_type: preferPlatform ? 'platform' : 'cross-platform'
+      })
+    });
+
+    if (result.success) {
+      setKeyStatus('Key added successfully!', 'ok');
+      showToast('Security key registered');
+      loadFidoKeys();
+    } else {
+      setKeyStatus('Failed: ' + (result.error || 'unknown'), 'err');
+    }
+  } catch (e) {
+    var msg = e.message || 'Failed';
+    if (e.name === 'NotAllowedError') msg = 'Cancelled or timed out. Try again.';
+    else if (e.name === 'InvalidStateError') msg = 'This authenticator is already registered.';
+    setKeyStatus(msg, 'err');
+  }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════

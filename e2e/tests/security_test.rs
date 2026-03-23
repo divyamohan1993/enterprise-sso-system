@@ -12,7 +12,7 @@ use common::actions::{
 use common::config::SecurityConfig;
 use common::network::is_permitted_channel;
 use common::types::{
-    ActionLevel, AuditEventType, DeviceTier, ModuleId, Receipt, Token, TokenClaims, TokenHeader,
+    ActionLevel, AuditEventType, DeviceTier, ModuleId, Receipt, TokenClaims,
 };
 use crypto::receipts::{hash_receipt, sign_receipt};
 use crypto::threshold::dkg;

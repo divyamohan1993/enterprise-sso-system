@@ -8,14 +8,11 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-
 use common::types::{ModuleId, Token};
+use crypto::pq_sign::PqVerifyingKey;
 use crypto::threshold::dkg;
-use gateway::puzzle::{solve_challenge, PuzzleChallenge, PuzzleSolution};
+use frost_ristretto255::keys::PublicKeyPackage;
 use gateway::server::{GatewayServer, OrchestratorConfig};
-use gateway::wire::{AuthRequest, AuthResponse};
 use opaque::store::CredentialStore;
 use orchestrator::service::OrchestratorService;
 use shard::tls_transport;
@@ -25,7 +22,7 @@ use tss::token_builder::build_token_distributed;
 use tss::validator::validate_receipt_chain;
 use verifier::verify::verify_token;
 
-use e2e::{client_auth, send_frame, recv_frame, send_raw_frame, recv_raw_frame};
+use e2e::client_auth;
 
 /// Fixed 64-byte HMAC key for SHARD communication in tests.
 const SHARD_HMAC_KEY: [u8; 64] = [0x37u8; 64];
@@ -122,31 +119,19 @@ async fn boot_tss(coordinator: SigningCoordinator, mut nodes: Vec<SignerNode>, p
     ).await.expect("bind TSS TLS listener");
     let addr = listener.local_addr().expect("TSS local_addr").to_string();
 
-    // TSS holds its own copy of the receipt signing key at init (CRIT-1)
-    let tss_receipt_signing_key = RECEIPT_SIGNING_KEY;
-
     tokio::spawn(async move {
         loop {
             let mut transport = match listener.accept().await {
                 Ok(t) => t,
-                Err(e) => {
-                    eprintln!("TSS accept error: {e}");
-                    continue;
-                }
+                Err(_) => continue,
             };
-
             let (_sender, payload) = match transport.recv().await {
                 Ok(r) => r,
-                Err(e) => {
-                    eprintln!("TSS recv error: {e}");
-                    continue;
-                }
+                Err(_) => continue,
             };
-
             let request: SigningRequest = match postcard::from_bytes(&payload) {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("TSS deserialize error: {e}");
                     let resp = SigningResponse {
                         success: false,
                         token: None,
@@ -157,22 +142,12 @@ async fn boot_tss(coordinator: SigningCoordinator, mut nodes: Vec<SignerNode>, p
                     continue;
                 }
             };
-
-            // Validate receipt chain using TSS's own key (not from request)
             let response =
-                match validate_receipt_chain(&request.receipts, &tss_receipt_signing_key) {
+                match validate_receipt_chain(&request.receipts, &RECEIPT_SIGNING_KEY) {
                     Ok(()) => {
-                        // Build threshold-signed token using distributed coordinator
-                        let mut signers: Vec<&mut SignerNode> =
+                        let mut signers: Vec<&mut _> =
                             nodes.iter_mut().take(coordinator.threshold).collect();
-                        match build_token_distributed(
-                            &request.claims,
-                            &coordinator,
-                            &mut signers,
-                            &request.ratchet_key,
-                            &pq_signing_key,
-                            None,
-                        ) {
+                        match build_token_distributed(&request.claims, &coordinator, &mut signers, &request.ratchet_key, &pq_signing_key, None) {
                             Ok(token) => {
                                 let token_bytes =
                                     postcard::to_allocvec(&token).expect("serialize token");
@@ -188,19 +163,16 @@ async fn boot_tss(coordinator: SigningCoordinator, mut nodes: Vec<SignerNode>, p
                                 error: Some(format!("token build: {e}")),
                             },
                         }
-                    }
+                    },
                     Err(e) => SigningResponse {
                         success: false,
                         token: None,
                         error: Some(format!("receipt validation: {e}")),
                     },
                 };
-
-            let response_bytes = postcard::to_allocvec(&response).expect("serialize TSS response");
-
-            if let Err(e) = transport.send(&response_bytes).await {
-                eprintln!("TSS send error: {e}");
-            }
+            let response_bytes =
+                postcard::to_allocvec(&response).expect("serialize TSS response");
+            let _ = transport.send(&response_bytes).await;
         }
     });
 
@@ -302,13 +274,17 @@ async fn boot_gateway(orchestrator_addr: String, ca: &shard::tls::CertificateAut
     addr
 }
 
-// ── Tests ───────────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn tier2_full_ceremony_success() {
-    // 1. Setup crypto: DKG(5,3) -> distributed signing
-    //    Run on a blocking thread to avoid overflowing the async task stack
-    //    (ML-DSA-87 keygen + FROST DKG use significant stack in debug builds).
+/// Boot all five services and return (gateway_addr, group_verifying_key, pq_verifying_key).
+///
+/// Extracted into a separate async function so that the large intermediate crypto
+/// objects (DKG state, signing keys, TLS certificates) are confined to this
+/// function's Future state and don't inflate the caller's async state machine —
+/// which would otherwise cause stack overflow in debug builds due to ML-DSA-87
+/// and FROST key sizes.
+async fn boot_full_system(
+    store: CredentialStore,
+) -> (String, PublicKeyPackage, PqVerifyingKey) {
+    // Run DKG and PQ keygen on a blocking thread (large stack usage in debug builds)
     let (group_verifying_key, coordinator, nodes, pq_sk, pq_vk) =
         tokio::task::spawn_blocking(|| {
             let mut dkg_result = dkg(5, 3);
@@ -320,167 +296,98 @@ async fn tier2_full_ceremony_success() {
         .await
         .expect("DKG/keygen task");
 
-    // 2. Generate shared CA for all inter-service mTLS
+    // Generate shared CA for all inter-service mTLS
     let ca = shard::tls::generate_ca();
 
-    // 3. Boot services in dependency order
-    let opaque_addr = boot_opaque({
-        let mut store = CredentialStore::new();
-        store.register_with_password("alice", b"password123");
-        store
-    }, &ca)
-    .await;
-
+    // Boot services in dependency order
+    let opaque_addr = boot_opaque(store, &ca).await;
     let tss_addr = boot_tss(coordinator, nodes, Box::new(pq_sk), &ca).await;
-
-    // Small delay to let listeners bind
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     let orchestrator_addr = boot_orchestrator(opaque_addr, tss_addr, &ca).await;
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     let gateway_addr = boot_gateway(orchestrator_addr, &ca).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    // 3. Run the client flow
-    let mut stream = TcpStream::connect(&gateway_addr)
-        .await
-        .expect("connect to gateway");
-
-    // Receive puzzle challenge
-    let challenge: PuzzleChallenge = recv_frame(&mut stream)
-        .await
-        .expect("receive puzzle challenge");
-    assert_eq!(challenge.difficulty, TEST_DIFFICULTY);
-
-    // Solve puzzle
-    let solution_bytes = solve_challenge(&challenge);
-    let solution = PuzzleSolution {
-        nonce: challenge.nonce,
-        solution: solution_bytes,
-        xwing_client_pk: None,
-    };
-    send_frame(&mut stream, &solution)
-        .await
-        .expect("send puzzle solution");
-
-    // Send auth request with correct password
-    let auth_req = AuthRequest {
-        username: "alice".to_string(),
-        password: b"password123".to_vec(),
-    };
-    send_frame(&mut stream, &auth_req)
-        .await
-        .expect("send auth request");
-
-    // Receive auth response
-    let auth_resp: AuthResponse = recv_frame(&mut stream)
-        .await
-        .expect("receive auth response");
-
-    assert!(
-        auth_resp.success,
-        "auth should succeed, got error: {:?}",
-        auth_resp.error
-    );
-    assert!(auth_resp.token.is_some(), "token should be present");
-
-    // 4. Verify the token
-    let token_bytes = auth_resp.token.unwrap();
-    let token: Token = postcard::from_bytes(&token_bytes).expect("deserialize token");
-
-    let claims =
-        verify_token(&token, &group_verifying_key, &pq_vk).expect("token verification should succeed");
-
-    // Assert tier == 2 (Operational)
-    assert_eq!(claims.tier, 2, "token tier should be 2");
-
-    // Assert token is not expired
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_micros() as i64;
-    assert!(claims.exp > now, "token should not be expired");
-
-    // Assert token header matches
-    assert_eq!(token.header.version, 1);
-    assert_eq!(token.header.tier, 2);
+    (gateway_addr, group_verifying_key, pq_vk)
 }
 
-#[tokio::test]
-async fn tier2_wrong_password_fails() {
-    // 1. Setup crypto: DKG(5,3) -> distributed signing
-    //    Run on a blocking thread to avoid stack overflow in debug builds.
-    let (coordinator, nodes, pq_sk) =
-        tokio::task::spawn_blocking(|| {
-            let mut dkg_result = dkg(5, 3);
-            let (coordinator, nodes) = distribute_shares(&mut dkg_result);
-            let (pq_sk, _pq_vk) = crypto::pq_sign::generate_pq_keypair();
-            (coordinator, nodes, pq_sk)
-        })
-        .await
-        .expect("DKG/keygen task");
+// ── Tests ───────────────────────────────────────────────────────────────
 
-    // 2. Generate shared CA for all inter-service mTLS
-    let ca = shard::tls::generate_ca();
+/// Helper: build a tokio runtime with enough stack for post-quantum crypto
+/// operations (ML-DSA-87, FROST DKG) that use significant stack in debug builds.
+fn build_pq_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("build test runtime")
+}
 
-    // 3. Boot services
-    let opaque_addr = boot_opaque({
+#[test]
+fn tier2_full_ceremony_success() {
+    let rt = build_pq_runtime();
+    rt.block_on(rt.spawn(async {
+        // 1. Boot all services
         let mut store = CredentialStore::new();
         store.register_with_password("alice", b"password123");
-        store
-    }, &ca)
-    .await;
+        let (gateway_addr, group_verifying_key, pq_vk) = boot_full_system(store).await;
 
-    let tss_addr = boot_tss(coordinator, nodes, Box::new(pq_sk), &ca).await;
+        // 2. Run the client flow using encrypted X-Wing channel
+        let auth_resp = client_auth(&gateway_addr, "alice", b"password123").await;
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            auth_resp.success,
+            "auth should succeed, got error: {:?}",
+            auth_resp.error
+        );
+        assert!(auth_resp.token.is_some(), "token should be present");
 
-    let orchestrator_addr = boot_orchestrator(opaque_addr, tss_addr, &ca).await;
+        // 3. Verify the token on a blocking thread (ML-DSA-87 verification uses
+        //    significant stack space that can overflow async task stacks in debug builds)
+        let token_bytes = auth_resp.token.unwrap();
+        let token: Token = postcard::from_bytes(&token_bytes).expect("deserialize token");
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let gateway_addr = boot_gateway(orchestrator_addr, &ca).await;
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    // 3. Run the client flow with WRONG password
-    let mut stream = TcpStream::connect(&gateway_addr)
+        let token_header = token.header.clone();
+        let claims = tokio::task::spawn_blocking(move || {
+            verify_token(&token, &group_verifying_key, &pq_vk)
+        })
         .await
-        .expect("connect to gateway");
+        .expect("verify task")
+        .expect("token verification should succeed");
 
-    // Receive and solve puzzle
-    let challenge: PuzzleChallenge = recv_frame(&mut stream)
-        .await
-        .expect("receive puzzle challenge");
+        // Assert tier == 2 (Operational)
+        assert_eq!(claims.tier, 2, "token tier should be 2");
 
-    let solution_bytes = solve_challenge(&challenge);
-    let solution = PuzzleSolution {
-        nonce: challenge.nonce,
-        solution: solution_bytes,
-        xwing_client_pk: None,
-    };
-    send_frame(&mut stream, &solution)
-        .await
-        .expect("send puzzle solution");
+        // Assert token is not expired
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64;
+        assert!(claims.exp > now, "token should not be expired");
 
-    // Send auth request with WRONG password
-    let auth_req = AuthRequest {
-        username: "alice".to_string(),
-        password: b"wrong_password".to_vec(),
-    };
-    send_frame(&mut stream, &auth_req)
-        .await
-        .expect("send auth request");
+        // Assert token header matches
+        assert_eq!(token_header.version, 1);
+        assert_eq!(token_header.tier, 2);
+    })).expect("test task");
+}
 
-    // Receive auth response — should be failure
-    let auth_resp: AuthResponse = recv_frame(&mut stream)
-        .await
-        .expect("receive auth response");
+#[test]
+fn tier2_wrong_password_fails() {
+    let rt = build_pq_runtime();
+    rt.block_on(rt.spawn(async {
+        // 1. Boot all services
+        let mut store = CredentialStore::new();
+        store.register_with_password("alice", b"password123");
+        let (gateway_addr, _group_verifying_key, _pq_vk) = boot_full_system(store).await;
 
-    assert!(!auth_resp.success, "auth should fail with wrong password");
-    assert!(auth_resp.token.is_none(), "no token on failure");
-    assert!(auth_resp.error.is_some(), "error message should be present");
+        // 2. Run the client flow with WRONG password using encrypted X-Wing channel
+        let auth_resp = client_auth(&gateway_addr, "alice", b"wrong_password").await;
+
+        assert!(!auth_resp.success, "auth should fail with wrong password");
+        assert!(auth_resp.token.is_none(), "no token on failure");
+        assert!(auth_resp.error.is_some(), "error message should be present");
+    })).expect("test task");
 }

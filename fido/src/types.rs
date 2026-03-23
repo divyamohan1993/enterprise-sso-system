@@ -10,6 +10,8 @@ pub struct PublicKeyCredentialCreationOptions {
     pub timeout: u64,
     pub attestation: String,
     pub authenticator_selection: AuthenticatorSelection,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_credentials: Vec<AllowCredential>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

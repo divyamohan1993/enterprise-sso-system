@@ -44,7 +44,7 @@ async fn main() {
     // external verification.
     let signing_seed_path = data_dir.join("signing_seed.bin");
     let verifying_key_path = data_dir.join("verifying_key.bin");
-    let (pq_signing_key, pq_verifying_key) =
+    let (pq_signing_key, _pq_verifying_key) =
         load_or_generate_keypair(&signing_seed_path, &verifying_key_path);
 
     // ── Witness signing key persistence ──────────────────────────────────

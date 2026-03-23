@@ -7,7 +7,6 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use audit::log::{hash_entry, AuditLog};
@@ -23,17 +22,15 @@ use crypto::receipts::{hash_receipt, sign_receipt};
 use crypto::threshold::{dkg, threshold_sign, verify_group_signature};
 use tss::distributed::distribute_shares;
 use crypto::xwing::{xwing_decapsulate, xwing_encapsulate, XWingKeyPair};
-use gateway::puzzle::{solve_challenge, PuzzleChallenge, PuzzleSolution};
+use gateway::puzzle::{PuzzleChallenge, PuzzleSolution};
 use gateway::server::{GatewayServer, OrchestratorConfig};
-use gateway::wire::{AuthRequest, AuthResponse};
+use gateway::wire::AuthResponse;
 use kt::merkle::MerkleTree;
-use opaque::messages::{OpaqueRequest, OpaqueResponse};
 use opaque::store::CredentialStore;
 use orchestrator::service::OrchestratorService;
 use ratchet::chain::RatchetChain;
 use risk::scoring::{RiskEngine, RiskLevel, RiskSignals};
 use risk::tiers::check_tier_access;
-use shard::protocol::ShardProtocol;
 use shard::tls_transport;
 use tss::messages::{SigningRequest, SigningResponse};
 use crypto::pq_sign::{generate_pq_keypair, PqSigningKey, PqVerifyingKey};
@@ -42,7 +39,7 @@ use tss::validator::validate_receipt_chain;
 use verifier::verify::verify_token;
 use uuid::Uuid;
 
-use e2e::{client_auth, send_frame, recv_frame, send_raw_frame, recv_raw_frame};
+use e2e::{client_auth, send_frame, recv_frame};
 
 // ── Constants ────────────────────────────────────────────────────────────
 
@@ -393,7 +390,7 @@ fn make_valid_token_and_key() -> (Token, frost_ristretto255::keys::PublicKeyPack
 
 #[tokio::test]
 async fn test_complete_tier2_auth_flow() {
-    let pq_vk = test_pq_vk();
+    let _pq_vk = test_pq_vk();
     let mut store = CredentialStore::new();
     store.register_with_password("alice", b"password123");
     let (gateway_addr, group_key) = boot_full_system(store).await;
@@ -449,7 +446,7 @@ async fn test_multiple_users_concurrent_auth() {
 
 #[tokio::test]
 async fn test_sequential_auth_sessions() {
-    let pq_vk = test_pq_vk();
+    let _pq_vk = test_pq_vk();
     let mut store = CredentialStore::new();
     store.register_with_password("bob", b"bobpass");
     let (gateway_addr, group_key) = boot_full_system(store).await;
@@ -526,7 +523,7 @@ async fn test_empty_username_rejected() {
 
 #[tokio::test]
 async fn test_unicode_username_works() {
-    let pq_vk = test_pq_vk();
+    let _pq_vk = test_pq_vk();
     let mut store = CredentialStore::new();
     let username = "\u{7528}\u{6237}\u{03B1}\u{03B2}\u{03B3}";
     store.register_with_password(username, b"unicodepass");
@@ -542,7 +539,7 @@ async fn test_unicode_username_works() {
 
 #[tokio::test]
 async fn test_very_long_password_works() {
-    let (_, pq_vk) = crypto::pq_sign::generate_pq_keypair();
+    let (_, _pq_vk) = crypto::pq_sign::generate_pq_keypair();
     let mut store = CredentialStore::new();
     let long_pass = vec![0x41u8; 1000];
     store.register_with_password("longpass_user", &long_pass);
@@ -593,7 +590,7 @@ async fn test_puzzle_not_solved_rejected() {
 
 #[test]
 fn test_token_cannot_be_modified() {
-    let pq_vk = test_pq_vk();
+    let _pq_vk = test_pq_vk();
     let (mut token, group_key) = make_valid_token_and_key();
 
     // Verify it is valid first
@@ -608,7 +605,7 @@ fn test_token_cannot_be_modified() {
 
 #[test]
 fn test_token_signature_cannot_be_transplanted() {
-    let pq_vk = test_pq_vk();
+    let _pq_vk = test_pq_vk();
     let mut dkg_result = dkg(5, 3);
     let group_key = dkg_result.group.public_key_package.clone();
 
@@ -640,7 +637,7 @@ fn test_token_signature_cannot_be_transplanted() {
     };
 
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
-    let (pq_sk, _pq_vk) = crypto::pq_sign::generate_pq_keypair();
+    let (_pq_sk, _pq_vk) = crypto::pq_sign::generate_pq_keypair();
     let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
     let token_a =
         build_token_distributed(&claims_a, &coordinator, &mut signers, &[0x55u8; 64], test_pq_sk(), None).expect("build token A");
@@ -701,7 +698,7 @@ fn test_expired_token_rejected() {
 
 #[test]
 fn test_token_from_different_dkg_rejected() {
-    let pq_vk = test_pq_vk();
+    let _pq_vk = test_pq_vk();
     // Group 1
     let mut dkg1 = dkg(5, 3);
     let claims = TokenClaims {
@@ -718,7 +715,7 @@ fn test_token_from_different_dkg_rejected() {
         aud: None,
     };
     let (coordinator1, mut nodes1) = distribute_shares(&mut dkg1);
-    let (pq_sk, _pq_vk) = crypto::pq_sign::generate_pq_keypair();
+    let (_pq_sk, _pq_vk) = crypto::pq_sign::generate_pq_keypair();
     let mut signers1: Vec<&mut _> = nodes1.iter_mut().take(3).collect();
     let token = build_token_distributed(&claims, &coordinator1, &mut signers1, &[0x55u8; 64], test_pq_sk(), None)
         .expect("build token with group 1");

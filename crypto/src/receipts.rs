@@ -245,7 +245,6 @@ pub fn verify_receipt_asymmetric(verifying_key: &[u8], data: &[u8], signature: &
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ml_dsa::signature::Keypair;
 
     fn run_with_large_stack<F: FnOnce() + Send + 'static>(f: F) {
         std::thread::Builder::new()

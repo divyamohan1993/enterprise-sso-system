@@ -50,7 +50,7 @@ fn chain_detects_tampering() {
     // Tamper with an entry's prev_hash — we need mutable access to the internal entries.
     // We'll reconstruct a tampered log by cloning entries and modifying one.
     let entries = log.entries().to_vec();
-    let mut tampered = AuditLog::new();
+    let tampered = AuditLog::new();
     for (i, mut entry) in entries.into_iter().enumerate() {
         if i == 1 {
             entry.prev_hash = [0xFF; 64]; // tamper

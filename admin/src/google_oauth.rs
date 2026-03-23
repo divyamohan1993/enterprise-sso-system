@@ -697,7 +697,6 @@ mod tests {
     #[tokio::test]
     async fn test_extract_google_claims_verifies_rs256() {
         use rsa::pkcs1v15::SigningKey;
-        use rsa::signature::SignerMut;
 
         // Generate a test RSA key pair
         let mut rng = rand::thread_rng();

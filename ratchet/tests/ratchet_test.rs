@@ -92,7 +92,7 @@ fn chain_reject_wrong_epoch() {
 
 #[test]
 fn session_manager_create_and_advance() {
-    let mut mgr = SessionManager::new();
+    let mgr = SessionManager::new();
     let sid = Uuid::new_v4();
     let epoch = mgr.create_session(sid, &test_secret());
     assert_eq!(epoch, 0);
@@ -111,7 +111,7 @@ fn session_manager_create_and_advance() {
 
 #[test]
 fn session_manager_expired_after_2880_epochs() {
-    let mut mgr = SessionManager::new();
+    let mgr = SessionManager::new();
     let sid = Uuid::new_v4();
     mgr.create_session(sid, &test_secret());
 
@@ -129,7 +129,7 @@ fn session_manager_expired_after_2880_epochs() {
 
 #[test]
 fn session_manager_destroy_removes() {
-    let mut mgr = SessionManager::new();
+    let mgr = SessionManager::new();
     let sid = Uuid::new_v4();
     mgr.create_session(sid, &test_secret());
 

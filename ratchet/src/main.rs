@@ -65,7 +65,7 @@ async fn handle_request(
             }
             let mut secret = [0u8; 64];
             secret.copy_from_slice(&initial_key);
-            let mut mgr = manager.write().await;
+            let mgr = manager.write().await;
             let epoch = mgr.create_session(session_id, &secret);
             RatchetResponse {
                 success: true,
@@ -75,7 +75,7 @@ async fn handle_request(
             }
         }
         RatchetAction::Advance { session_id, client_entropy, server_entropy } => {
-            let mut mgr = manager.write().await;
+            let mgr = manager.write().await;
             match mgr.advance_session(&session_id, &client_entropy, &server_entropy) {
                 Ok(epoch) => RatchetResponse {
                     success: true,
@@ -109,7 +109,7 @@ async fn handle_request(
             }
         }
         RatchetAction::Destroy { session_id } => {
-            let mut mgr = manager.write().await;
+            let mgr = manager.write().await;
             mgr.destroy_session(&session_id);
             RatchetResponse {
                 success: true,

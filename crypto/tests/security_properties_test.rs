@@ -1,7 +1,7 @@
 //! Security property tests — verifying critical invariants of the crypto layer.
 
 use crypto::ct::{ct_eq, ct_eq_32, ct_eq_64};
-use crypto::entropy::{combined_entropy, generate_key_64, generate_nonce};
+use crypto::entropy::{generate_key_64, generate_nonce};
 use crypto::receipts::{hash_receipt, sign_receipt, verify_receipt_signature, ReceiptChain};
 use common::types::Receipt;
 

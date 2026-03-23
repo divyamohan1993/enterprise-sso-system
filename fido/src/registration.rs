@@ -7,6 +7,10 @@ use uuid::Uuid;
 ///
 /// Set `prefer_platform` to `true` to request a platform authenticator
 /// such as Windows Hello or Touch ID.
+///
+/// `existing_credential_ids` lists credential IDs already registered for this
+/// user.  They are sent as `excludeCredentials` so the browser can skip
+/// authenticators that would produce a duplicate.
 pub fn create_registration_options(
     rp_name: &str,
     rp_id: &str,
@@ -14,7 +18,35 @@ pub fn create_registration_options(
     user_name: &str,
     prefer_platform: bool,
 ) -> PublicKeyCredentialCreationOptions {
+    create_registration_options_with_excludes(
+        rp_name,
+        rp_id,
+        user_id,
+        user_name,
+        prefer_platform,
+        &[],
+    )
+}
+
+/// Like [`create_registration_options`] but allows passing existing credential
+/// IDs to populate the `excludeCredentials` list.
+pub fn create_registration_options_with_excludes(
+    rp_name: &str,
+    rp_id: &str,
+    user_id: &Uuid,
+    user_name: &str,
+    prefer_platform: bool,
+    existing_credential_ids: &[Vec<u8>],
+) -> PublicKeyCredentialCreationOptions {
     let challenge = crypto::entropy::generate_nonce().to_vec();
+
+    let exclude_credentials: Vec<AllowCredential> = existing_credential_ids
+        .iter()
+        .map(|id| AllowCredential {
+            cred_type: "public-key".into(),
+            id: id.clone(),
+        })
+        .collect();
 
     PublicKeyCredentialCreationOptions {
         challenge,
@@ -52,6 +84,7 @@ pub fn create_registration_options(
             resident_key: "preferred".into(),
             user_verification: "required".into(),
         },
+        exclude_credentials,
     }
 }
 

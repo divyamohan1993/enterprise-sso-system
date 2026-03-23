@@ -16,7 +16,7 @@ pub enum HealthStatus {
 /// Tracks health of peer services
 pub struct HealthMonitor {
     peers: Mutex<HashMap<String, PeerHealth>>,
-    check_interval: Duration,
+    _check_interval: Duration,
     unhealthy_threshold: Duration,
     degraded_threshold: Duration,
 }
@@ -33,7 +33,7 @@ impl HealthMonitor {
     pub fn new() -> Self {
         Self {
             peers: Mutex::new(HashMap::new()),
-            check_interval: Duration::from_secs(10),
+            _check_interval: Duration::from_secs(10),
             unhealthy_threshold: Duration::from_secs(30),
             degraded_threshold: Duration::from_secs(15),
         }

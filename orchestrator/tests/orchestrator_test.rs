@@ -1,15 +1,13 @@
 //! Integration and unit tests for the Auth Orchestrator.
 
-use common::types::{ModuleId, Receipt, Token};
+use common::types::{ModuleId, Token};
 use crypto::entropy::generate_key_64;
-use crypto::receipts::sign_receipt;
 use opaque::messages::{OpaqueRequest, OpaqueResponse};
-use opaque::opaque_impl::OpaqueCs;
 use opaque::store::CredentialStore;
 use orchestrator::ceremony::{CeremonySession, CeremonyState, CEREMONY_TIMEOUT_SECS};
-use orchestrator::messages::{OrchestratorRequest, OrchestratorResponse};
+use orchestrator::messages::OrchestratorRequest;
 use orchestrator::service::OrchestratorService;
-use shard::transport::{connect, ShardListener};
+use shard::transport::ShardListener;
 use tss::messages::{SigningRequest, SigningResponse};
 use uuid::Uuid;
 
@@ -87,18 +85,13 @@ fn ceremony_session_timeout() {
 
 #[tokio::test]
 async fn orchestrator_processes_auth() {
-    use opaque_ke::{
-        CredentialFinalization, CredentialRequest, ServerLogin, ServerLoginParameters,
-        ServerRegistration,
-    };
-
     let hmac_key = generate_key_64();
     let receipt_signing_key = generate_key_64();
 
     // Create a real OPAQUE credential store with a registered user
     let mut store = CredentialStore::new();
     let user_id = store.register_with_password("alice", b"password123");
-    let server_setup_bytes = store.server_setup().serialize().to_vec();
+    let _server_setup_bytes = store.server_setup().serialize().to_vec();
 
     // Start mock OPAQUE listener that runs REAL OPAQUE server-side protocol
     let opaque_listener = ShardListener::bind("127.0.0.1:0", ModuleId::Opaque, hmac_key)
@@ -232,7 +225,7 @@ async fn orchestrator_processes_auth() {
 #[tokio::test]
 async fn orchestrator_handles_opaque_failure() {
     let hmac_key = generate_key_64();
-    let receipt_signing_key = generate_key_64();
+    let _receipt_signing_key = generate_key_64();
 
     // Create store with a registered user
     let mut store = CredentialStore::new();

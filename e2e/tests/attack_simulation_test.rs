@@ -8,7 +8,6 @@
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use audit::log::{hash_entry, AuditLog};
@@ -25,20 +24,19 @@ use crypto::receipts::{hash_receipt, sign_receipt, verify_receipt_signature, Rec
 use crypto::threshold::{dkg, threshold_sign};
 use tss::distributed::distribute_shares;
 use crypto::xwing::{xwing_decapsulate, xwing_encapsulate, XWingKeyPair};
-use gateway::puzzle::{solve_challenge, PuzzleChallenge, PuzzleSolution};
+use gateway::puzzle::{PuzzleChallenge, PuzzleSolution};
 use gateway::server::{GatewayServer, OrchestratorConfig};
-use gateway::wire::{AuthRequest, AuthResponse};
+use gateway::wire::AuthResponse;
 use opaque::store::CredentialStore;
 use ratchet::chain::RatchetChain;
 use risk::tiers::check_tier_access;
 use shard::protocol::ShardProtocol;
-use shard::tls_transport;
 use tss::token_builder::build_token_distributed;
 use tss::validator::validate_receipt_chain;
 use verifier::verify::verify_token;
 use uuid::Uuid;
 
-use e2e::{client_auth, send_frame, recv_frame, send_raw_frame, recv_raw_frame};
+use e2e::{client_auth, send_frame, recv_frame};
 
 // ── Constants ────────────────────────────────────────────────────────────
 

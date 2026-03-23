@@ -20,10 +20,10 @@
 //! # requires: tss-esapi = "7.x"     — for TPM 2.0 backend
 //! ```
 
-use std::sync::{Arc, Mutex};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use std::sync::Mutex;
+use zeroize::Zeroize;
 
-use crate::seal::{DerivedKek, MasterKey, ProductionKeySource, SealError, SoftwareKeySource};
+use crate::seal::{MasterKey, ProductionKeySource, SealError, SoftwareKeySource};
 
 // ---------------------------------------------------------------------------
 // HSM Backend enum
@@ -189,7 +189,7 @@ impl HsmConfig {
             .unwrap_or_else(|_| "MILNET-MASTER-KEK-v1".to_string());
 
         // Software seed from master KEK env var
-        let software_seed = std::env::var("MILNET_MASTER_KEK").ok().map(|mut hex| {
+        let software_seed = std::env::var("MILNET_MASTER_KEK").ok().map(|hex| {
             let bytes: Vec<u8> = (0..hex.len())
                 .step_by(2)
                 .filter_map(|i| hex.get(i..i + 2).and_then(|s| u8::from_str_radix(s, 16).ok()))

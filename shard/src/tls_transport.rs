@@ -335,7 +335,7 @@ mod tests {
     use super::*;
     use crate::tls::{
         build_pin_set_from_certs, client_tls_config, client_tls_config_pinned,
-        compute_cert_fingerprint, generate_ca, generate_module_cert, server_tls_config,
+        generate_ca, generate_module_cert, server_tls_config,
         server_tls_config_pinned, tls_connector, CertificatePinSet,
     };
 

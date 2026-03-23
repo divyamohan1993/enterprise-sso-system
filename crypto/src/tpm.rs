@@ -267,7 +267,7 @@ impl SealedBlob {
 /// The interface is defined here; actual TPM calls are marked with TODO.
 pub struct Tpm2Context {
     /// Device path (e.g., `/dev/tpmrm0`).
-    device_path: String,
+    _device_path: String,
     /// Default PCR selection for sealing operations.
     default_pcr_selection: PcrSelection,
     /// Whether the context has been initialized.
@@ -317,7 +317,7 @@ impl Tpm2Context {
         // ```
 
         Ok(Self {
-            device_path: device_path.to_string(),
+            _device_path: device_path.to_string(),
             default_pcr_selection: pcr_selection,
             initialized: true,
         })
@@ -769,7 +769,7 @@ mod tests {
 
     #[test]
     fn sealed_blob_malformed_magic() {
-        let mut bytes = vec![0x00; 48];
+        let bytes = vec![0x00; 48];
         let result = SealedBlob::from_bytes(&bytes);
         assert!(matches!(result, Err(TpmError::MalformedBlob)));
     }

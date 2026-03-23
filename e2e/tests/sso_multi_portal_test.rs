@@ -6,16 +6,11 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use frost_ristretto255::keys::PublicKeyPackage;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use uuid::Uuid;
 
 use common::types::{ModuleId, Token, TokenClaims};
 use crypto::threshold::dkg;
-use gateway::puzzle::{solve_challenge, PuzzleChallenge, PuzzleSolution};
 use gateway::server::{GatewayServer, OrchestratorConfig};
-use gateway::wire::{AuthRequest, AuthResponse};
-use opaque::messages::{OpaqueRequest, OpaqueResponse};
 use opaque::store::CredentialStore;
 use orchestrator::service::OrchestratorService;
 use ratchet::chain::RatchetChain;
@@ -27,7 +22,7 @@ use tss::token_builder::build_token_distributed;
 use tss::validator::validate_receipt_chain;
 use verifier::verify::verify_token;
 
-use e2e::{client_auth, send_frame, recv_frame, send_raw_frame, recv_raw_frame};
+use e2e::client_auth;
 
 // ── Constants ────────────────────────────────────────────────────────────
 
@@ -392,7 +387,7 @@ fn make_claims(user_id: Uuid, tier: u8, scope: u32, ttl_secs: u64) -> TokenClaim
 
 #[tokio::test]
 async fn test_sso_single_login_multiple_portals() {
-    let pq_vk = test_pq_vk();
+    let _pq_vk = test_pq_vk();
     // 1. Boot full auth system
     let mut store = CredentialStore::new();
     store.register_with_password("alice", b"password123");
@@ -467,7 +462,7 @@ async fn test_sso_token_works_across_independent_verifiers() {
 
 #[tokio::test]
 async fn test_sso_different_users_different_tokens_same_portals() {
-    let pq_vk = test_pq_vk();
+    let _pq_vk = test_pq_vk();
     // 1. Register alice and bob
     let mut store = CredentialStore::new();
     store.register_with_password("alice", b"alice_pass");
@@ -571,7 +566,7 @@ async fn test_sso_tier_restricts_portal_access() {
 
 #[tokio::test]
 async fn test_attack_stolen_token_used_at_different_portal() {
-    let pq_vk = test_pq_vk();
+    let _pq_vk = test_pq_vk();
     // Get token for alice via full ceremony
     let mut store = CredentialStore::new();
     store.register_with_password("alice", b"password123");

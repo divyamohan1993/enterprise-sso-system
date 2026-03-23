@@ -382,6 +382,82 @@ fn verify_user_token(token: &str) -> bool {
     true
 }
 
+/// Middleware that validates Origin/Referer on mutating requests to prevent
+/// cross-origin request forgery, and enforces Content-Type on request bodies.
+/// GET, HEAD, OPTIONS are exempt (safe methods).
+async fn origin_and_content_type_middleware(
+    request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+
+    // Safe methods are exempt from both checks
+    if method == axum::http::Method::GET
+        || method == axum::http::Method::HEAD
+        || method == axum::http::Method::OPTIONS
+    {
+        return Ok(next.run(request).await);
+    }
+
+    // ── Content-Type enforcement ──────────────────────────────────────
+    // All POST/PUT/DELETE with a body must send application/json.
+    // Skip for OAuth token endpoint (uses form-urlencoded per RFC 6749)
+    // and static file routes.
+    if !path.starts_with("/oauth/token") && path.starts_with("/api") {
+        let ct = request
+            .headers()
+            .get("Content-Type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !ct.contains("application/json") {
+            tracing::warn!("Content-Type rejected: {ct:?} on {method} {path}");
+            return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        }
+    }
+
+    // ── Origin/Referer validation ─────────────────────────────────────
+    let origin = request
+        .headers()
+        .get("Origin")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let referer = request
+        .headers()
+        .get("Referer")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let host = request
+        .headers()
+        .get("Host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let allowed = match (&origin, &referer) {
+        // Origin present: must reference our host
+        (Some(o), _) => {
+            let o_lower = o.to_lowercase();
+            o_lower.contains(host) || o_lower == "null" || host.is_empty()
+        }
+        // No Origin, Referer present: must reference our host
+        (None, Some(r)) => r.contains(host) || host.is_empty(),
+        // Neither: allow only Bearer-token API calls (non-browser clients)
+        (None, None) => request.headers().get("Authorization").is_some(),
+    };
+
+    if allowed {
+        Ok(next.run(request).await)
+    } else {
+        tracing::warn!(
+            "Origin check failed: origin={:?} referer={:?} host={:?} path={path}",
+            origin,
+            referer,
+            host
+        );
+        Err(StatusCode::FORBIDDEN)
+    }
+}
+
 /// Middleware that adds HTTP security headers to all responses.
 async fn security_headers_middleware(
     request: Request,
@@ -564,6 +640,9 @@ pub struct LoginResponse {
     pub token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tier: Option<u8>,
+    /// Backend-decided dashboard: "admin" or "user"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dashboard: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -606,6 +685,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/portals", post(register_portal))
         .route("/api/portals", get(list_portals))
         .route("/api/portals/{id}", delete(delete_portal))
+        .route("/api/portals/check-access", post(check_portal_access))
         // Devices
         .route("/api/devices", post(enroll_device))
         .route("/api/devices", get(list_devices))
@@ -637,6 +717,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         // FIDO2/WebAuthn
         .route("/api/fido/register/begin", post(fido_register_begin))
         .route("/api/fido/register/complete", post(fido_register_complete))
+        .route("/api/fido/credentials", get(fido_credentials_list))
         .route("/api/fido/authenticate/begin", post(fido_authenticate_begin))
         .route("/api/fido/authenticate/complete", post(fido_authenticate_complete))
         // Recovery codes
@@ -659,7 +740,10 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/tokens/revoke", post(revoke_token))
         .route("/api/tokens/revoked", get(revoked_token_count))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .layer(middleware::from_fn(origin_and_content_type_middleware))
         .layer(middleware::from_fn(security_headers_middleware))
+        // Reject request bodies larger than 64 KB to prevent abuse
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
         .with_state(state)
         .layer(
             tower_http::cors::CorsLayer::new()
@@ -1242,6 +1326,45 @@ async fn delete_portal(
     Ok(Json(serde_json::json!({"deleted": true})))
 }
 
+/// POST /api/portals/check-access — server-side access check for a portal.
+/// The frontend must NEVER compute access decisions itself.
+async fn check_portal_access(
+    State(_state): State<Arc<AppState>>,
+    request: Request,
+) -> Json<serde_json::Value> {
+    let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(255);
+
+    // Parse the request body to get portal requirements
+    let body = axum::body::to_bytes(request.into_body(), 4096)
+        .await
+        .unwrap_or_default();
+    let req: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+
+    let required_tier = req.get("required_tier")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1) as u8;
+    let portal_name = req.get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    let granted = caller_tier <= required_tier;
+    let reason = if caller_tier == 255 {
+        "no valid authentication token".to_string()
+    } else if granted {
+        format!("tier {} meets requirement tier {}", caller_tier, required_tier)
+    } else {
+        format!("tier {} insufficient, need tier {} or higher", caller_tier, required_tier)
+    };
+
+    Json(serde_json::json!({
+        "portal": portal_name,
+        "granted": granted,
+        "reason": reason,
+        "user_tier": caller_tier,
+        "required_tier": required_tier,
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Handlers — Devices
 // ---------------------------------------------------------------------------
@@ -1422,11 +1545,8 @@ async fn auth_login(
         None => {
             return Json(LoginResponse {
                 success: false,
-                user_id: None,
-                username: None,
-                token: None,
-                tier: None,
                 error: Some("invalid credentials".into()),
+                ..Default::default()
             });
         }
     };
@@ -1498,12 +1618,14 @@ async fn auth_login(
             // Clear rate limit on successful login
             state.login_attempts.write().await.remove(&req.username);
 
+            let dashboard = if user_tier <= 1 { "admin" } else { "user" };
             Json(LoginResponse {
                 success: true,
                 user_id: Some(user_id),
                 username: Some(req.username.clone()),
                 token: Some(token),
                 tier: Some(user_tier as u8),
+                dashboard: Some(dashboard.into()),
                 error: None,
             })
         }
@@ -1517,11 +1639,8 @@ async fn auth_login(
 
             Json(LoginResponse {
                 success: false,
-                user_id: None,
-                username: None,
-                token: None,
-                tier: None,
                 error: Some(format!("authentication failed: {e}")),
+                ..Default::default()
             })
         }
     }
@@ -2487,16 +2606,25 @@ async fn fido_register_begin(
     State(state): State<Arc<AppState>>,
     Json(req): Json<FidoRegisterBeginRequest>,
 ) -> Json<FidoRegisterBeginResponse> {
-    let options = fido::registration::create_registration_options(
+    let mut fido_store = state.fido_store.write().await;
+
+    // Collect existing credential IDs so the browser can skip duplicate authenticators
+    let existing_ids: Vec<Vec<u8>> = fido_store
+        .get_user_credentials(&req.user_id)
+        .iter()
+        .map(|c| c.credential_id.clone())
+        .collect();
+
+    let options = fido::registration::create_registration_options_with_excludes(
         "MILNET SSO",
         "sso-system.dmj.one",
         &req.user_id,
         &req.username,
         req.prefer_platform,
+        &existing_ids,
     );
 
     // Store the challenge so we can verify it on completion
-    let mut fido_store = state.fido_store.write().await;
     fido_store.store_challenge(&options.challenge, req.user_id);
 
     Json(FidoRegisterBeginResponse { options })
@@ -2561,6 +2689,31 @@ async fn fido_register_complete(
         success: true,
         credential_id: req.credential_id,
     }))
+}
+
+/// GET /api/fido/credentials?user_id=<uuid> — list registered FIDO2 credentials for a user.
+async fn fido_credentials_list(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let user_id_str = params.get("user_id").ok_or(StatusCode::BAD_REQUEST)?;
+    let user_id = Uuid::parse_str(user_id_str).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let fido_store = state.fido_store.read().await;
+    let creds = fido_store.get_user_credentials(&user_id);
+
+    let list: Vec<serde_json::Value> = creds.iter().map(|c| {
+        serde_json::json!({
+            "credential_id_hex": hex::encode(&c.credential_id),
+            "authenticator_type": c.authenticator_type,
+            "sign_count": c.sign_count,
+        })
+    }).collect();
+
+    Ok(Json(serde_json::json!({
+        "credentials": list,
+        "count": list.len(),
+    })))
 }
 
 async fn fido_authenticate_begin(
@@ -2944,6 +3097,7 @@ pub struct RecoveryGenerateResponse {
 #[derive(Deserialize)]
 pub struct RecoveryVerifyRequest {
     pub username: String,
+    #[serde(alias = "recovery_code")]
     pub code: String,
 }
 
@@ -2953,9 +3107,14 @@ pub struct RecoveryVerifyResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tier: Option<u8>,
+    /// Backend-decided dashboard: "admin" or "user"; recovery always gets "user"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dashboard: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
@@ -3223,11 +3382,14 @@ async fn recovery_verify(
             // Clear rate limit on success
             state.login_attempts.write().await.remove(&req.username);
 
+            // Recovery always routes to user dashboard — even admins must re-enroll first
             Json(RecoveryVerifyResponse {
                 success: true,
                 user_id: Some(user_id),
+                username: Some(req.username.clone()),
                 token: Some(token),
                 tier: Some(4), // Always Tier 4 (Emergency) — user must re-enroll FIDO2 for higher tier
+                dashboard: Some("user".into()),
                 message: Some("emergency access granted — re-enroll FIDO2 to restore full access".into()),
             })
         }

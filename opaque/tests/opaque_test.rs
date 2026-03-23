@@ -8,7 +8,7 @@ use opaque::service::{handle_login_finish, handle_login_start};
 use opaque::store::CredentialStore;
 use opaque_ke::{
     ClientLogin, ClientLoginFinishParameters, ClientRegistration,
-    ClientRegistrationFinishParameters, ServerRegistration,
+    ClientRegistrationFinishParameters,
 };
 use rand::rngs::OsRng;
 
@@ -275,7 +275,7 @@ fn receipt_has_correct_fields() {
 fn client_and_server_agree_on_session_key() {
     let mut store = CredentialStore::new();
     let password = b"session-key-test";
-    let user_id = store.register_with_password("eve", password);
+    let _user_id = store.register_with_password("eve", password);
 
     let mut rng = OsRng;
 

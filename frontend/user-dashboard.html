@@ -7,13 +7,15 @@
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-:root { --bg: #0a0a0a; --bg2: #111; --border: #222; --green: #00ff41; --cyan: #00d4ff; --red: #ff3333; --text: #c0c0c0; --dim: #666; --font: 'JetBrains Mono', monospace; }
+:root { --bg: #0a0a0a; --bg2: #111; --bg3: #1a1a1a; --border: #222; --green: #00ff41; --cyan: #00d4ff; --red: #ff3333; --amber: #ffaa00; --text: #c0c0c0; --dim: #666; --font: 'JetBrains Mono', monospace; }
 body { background: var(--bg); color: var(--text); font-family: var(--font); min-height: 100vh; }
-.header { background: var(--bg2); border-bottom: 1px solid var(--border); padding: 12px 24px; display: flex; justify-content: space-between; align-items: center; }
+.header { background: var(--bg2); border-bottom: 1px solid var(--border); padding: 12px 24px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
 .header h1 { font-size: 0.85rem; color: var(--dim); }
 .header h1 span { color: var(--green); font-weight: 700; }
 .header .user-info { display: flex; align-items: center; gap: 12px; font-size: 0.8rem; }
-.header .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); display: inline-block; }
+.header .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.header .dot-green { background: var(--green); }
+.header .dot-amber { background: var(--amber); }
 .header strong { color: var(--cyan); }
 .logout { background: none; border: 1px solid var(--red); color: var(--red); padding: 6px 16px; font-family: var(--font); font-size: 0.75rem; cursor: pointer; border-radius: 3px; }
 .logout:hover { background: var(--red); color: #000; }
@@ -21,14 +23,17 @@ body { background: var(--bg); color: var(--text); font-family: var(--font); min-
 .card { background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin-bottom: 1.5rem; }
 .card.green { background: #0a1a0a; border-color: #003300; }
 .card.red { border-color: #330000; }
+.card.amber { background: rgba(255,170,0,0.05); border: 2px solid var(--amber); }
 .card h2 { color: var(--green); font-size: 0.85rem; text-transform: uppercase; margin-bottom: 1rem; }
 .card h2.red { color: var(--red); }
+.card h2.amber { color: var(--amber); }
 .card p { color: var(--dim); font-size: 0.8rem; line-height: 1.6; margin-bottom: 1rem; }
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
 .field .label { color: var(--dim); font-size: 0.65rem; text-transform: uppercase; margin-bottom: 4px; }
 .field .val { font-size: 1rem; }
 .field .val.green { color: var(--green); }
 .field .val.cyan { color: var(--cyan); }
+.field .val.amber { color: var(--amber); }
 .field .val.small { font-size: 0.7rem; color: var(--dim); word-break: break-all; }
 .portals { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 1rem; }
 .portal { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 1.2rem; }
@@ -44,26 +49,74 @@ body { background: var(--bg); color: var(--text); font-family: var(--font); min-
 .info-row .v { color: #fff; }
 .footer { text-align: center; padding: 2rem; color: var(--dim); font-size: 0.7rem; border-top: 1px solid var(--border); margin-top: 2rem; }
 .footer a { color: var(--cyan); text-decoration: none; }
+
+/* FIDO2 enrollment */
+.fido-enroll-options { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 0.8rem; }
+.fido-option-btn {
+  display: flex; align-items: center; gap: 0.8rem; padding: 0.8rem 1rem;
+  background: var(--bg); border: 1px solid var(--border); cursor: pointer;
+  font-family: var(--font); font-size: 0.8rem; color: var(--text); transition: all 0.15s;
+  width: 100%; text-align: left; border-radius: 4px;
+}
+.fido-option-btn:hover { border-color: var(--green); }
+.fido-option-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.fido-option-btn .fido-opt-icon { font-size: 1.2rem; width: 28px; text-align: center; flex-shrink: 0; }
+.fido-option-btn .fido-opt-info { flex: 1; }
+.fido-option-btn .fido-opt-title { color: var(--green); font-weight: 600; font-size: 0.8rem; }
+.fido-option-btn .fido-opt-desc { color: var(--dim); font-size: 0.7rem; margin-top: 0.15rem; }
+.fido-status { margin-top: 0.8rem; font-size: 0.8rem; }
+.fido-status .ok { color: var(--green); }
+.fido-status .err { color: var(--red); }
+.fido-status .wait { color: var(--amber); }
+.fido-timer { color: var(--red); font-size: 0.75rem; margin-top: 0.8rem; font-weight: 600; }
+
+/* Focus styles */
+button:focus-visible, input:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+@media (max-width: 600px) { .grid2 { grid-template-columns: 1fr; } .header { padding: 10px 16px; } .container { padding: 1rem; } }
 </style>
 </head>
 <body>
 <div class="header">
   <h1><span>MILNET SSO</span> // USER PORTAL</h1>
   <div class="user-info">
-    <span class="dot"></span>
+    <span class="dot dot-green" id="headerDot"></span>
     <strong id="dUser">--</strong>
     <span id="dTier">--</span>
     <button class="logout" onclick="doLogout()">LOGOUT</button>
   </div>
 </div>
 <div class="container">
+  <!-- FIDO2 Enrollment Banner (shown for Tier 4 recovery sessions) -->
+  <div class="card amber" id="fidoEnrollCard" style="display:none;">
+    <h2 class="amber">// SECURITY KEY RE-ENROLLMENT REQUIRED</h2>
+    <p>You are on <strong style="color:var(--amber);">emergency access (Tier 4)</strong>. Register a security key or passkey to restore full access. Your emergency session expires in <strong id="fidoCountdown">2:00</strong>.</p>
+    <div class="fido-enroll-options">
+      <button class="fido-option-btn" onclick="fidoEnroll(true)" id="btnPlatform">
+        <span class="fido-opt-icon">&#128187;</span>
+        <span class="fido-opt-info">
+          <span class="fido-opt-title">This Device (Built-in)</span>
+          <span class="fido-opt-desc">Windows Hello, Touch ID, Face ID, Android biometrics</span>
+        </span>
+      </button>
+      <button class="fido-option-btn" onclick="fidoEnroll(false)" id="btnExternal">
+        <span class="fido-opt-icon">&#128273;</span>
+        <span class="fido-opt-info">
+          <span class="fido-opt-title">Security Key (External)</span>
+          <span class="fido-opt-desc">YubiKey, Titan, or other FIDO2 USB/NFC key</span>
+        </span>
+      </button>
+    </div>
+    <div class="fido-status" id="fidoStatus"></div>
+    <div class="fido-timer" id="fidoTimerWarn"></div>
+  </div>
+
   <div class="card green">
     <h2>// My Profile</h2>
     <div class="grid2">
       <div class="field"><div class="label">Username</div><div class="val cyan" id="pUser">--</div></div>
       <div class="field"><div class="label">Clearance Level</div><div class="val green" id="pTier">--</div></div>
       <div class="field"><div class="label">User ID</div><div class="val small" id="pId">--</div></div>
-      <div class="field"><div class="label">Session</div><div class="val green">Active</div></div>
+      <div class="field"><div class="label">Session</div><div class="val green" id="pSession">Active</div></div>
     </div>
   </div>
   <div class="card">
@@ -73,7 +126,7 @@ body { background: var(--bg); color: var(--text); font-family: var(--font); min-
   </div>
   <div class="card">
     <h2>// Session Information</h2>
-    <div class="info-row"><span class="k">Authenticated via</span><span class="v">MILNET SSO (OPAQUE)</span></div>
+    <div class="info-row"><span class="k">Authenticated via</span><span class="v" id="authMethod">MILNET SSO (OPAQUE)</span></div>
     <div class="info-row"><span class="k">Token Type</span><span class="v">HMAC-SHA512</span></div>
     <div class="info-row"><span class="k">Login Time</span><span class="v" id="loginTime">--</span></div>
     <div class="info-row"><span class="k">SSO Provider</span><span class="v">sso-system.dmj.one</span></div>
@@ -94,28 +147,240 @@ var PORTALS = [
   {name:'Logistics Network',tier:3,scope:'read',desc:'Supply chain and resources'},
   {name:'Sensor Dashboard',tier:3,scope:'read',desc:'Field sensor telemetry'}
 ];
-function init(){
-  var t=localStorage.getItem('authToken'), u=localStorage.getItem('username'), tier=parseInt(localStorage.getItem('userTier')||'4');
-  if(!t){window.location.href='/';return;}
-  document.getElementById('dUser').textContent=u||'unknown';
-  document.getElementById('dTier').textContent='[Tier '+tier+']';
-  document.getElementById('pUser').textContent=u||'--';
-  document.getElementById('pTier').textContent='Tier '+tier+' ('+(TN[tier]||'?')+')';
-  document.getElementById('pId').textContent=t.split(':')[0]||'--';
-  document.getElementById('loginTime').textContent=new Date().toISOString().replace('T',' ').substring(0,19)+' UTC';
-  var c=document.getElementById('portalsList');
-  PORTALS.forEach(function(p){
-    var ok=tier<=p.tier;
-    var d=document.createElement('div');d.className='portal';
-    var n=document.createElement('div');n.className='name';n.textContent=p.name;d.appendChild(n);
-    var m=document.createElement('div');m.className='meta';m.textContent='Tier '+p.tier+' ('+TN[p.tier]+') | '+p.scope;d.appendChild(m);
-    var ds=document.createElement('div');ds.textContent=p.desc;d.appendChild(ds);
-    var b=document.createElement('div');b.style.marginTop='10px';
-    var s=document.createElement('span');s.className='badge '+(ok?'ok':'no');s.textContent=ok?'ACCESS GRANTED':'INSUFFICIENT CLEARANCE';
-    b.appendChild(s);d.appendChild(b);c.appendChild(d);
+var fidoCountdownInterval = null;
+
+function $(id) { return document.getElementById(id); }
+
+function api(path, opts) {
+  opts = opts || {};
+  var headers = opts.headers || {};
+  headers['Content-Type'] = headers['Content-Type'] || 'application/json';
+  var t = localStorage.getItem('authToken');
+  if (t) headers['Authorization'] = 'Bearer ' + t;
+  return fetch('/api' + path, Object.assign({}, opts, { headers: headers }))
+    .then(function(r) {
+      if (!r.ok) return r.json().then(function(d) { throw new Error(d.message || d.error || 'Request failed'); });
+      return r.json();
+    });
+}
+
+function init() {
+  var t = localStorage.getItem('authToken');
+  var u = localStorage.getItem('username');
+  var tier = parseInt(localStorage.getItem('userTier') || '4');
+  var isRecovery = localStorage.getItem('isRecoverySession') === 'true' ||
+    window.location.search.indexOf('recovery=1') >= 0;
+
+  if (!t) { window.location.href = '/'; return; }
+
+  $('dUser').textContent = u || 'unknown';
+  $('dTier').textContent = '[Tier ' + tier + ']';
+  $('pUser').textContent = u || '--';
+  $('pTier').textContent = 'Tier ' + tier + ' (' + (TN[tier] || '?') + ')';
+  if (tier === 4) {
+    $('pTier').className = 'val amber';
+  }
+  $('pId').textContent = localStorage.getItem('userId') || localStorage.getItem('recoveryUserId') || t.split(':')[0] || '--';
+  $('loginTime').textContent = new Date().toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
+
+  // Show emergency state for Tier 4
+  if (tier === 4) {
+    $('headerDot').className = 'dot dot-amber';
+    $('pSession').textContent = 'Emergency (2 min)';
+    $('pSession').className = 'val amber';
+    $('authMethod').textContent = isRecovery ? 'Recovery Code (Emergency)' : 'MILNET SSO';
+  }
+
+  // Show FIDO2 enrollment if recovery session
+  if (isRecovery || tier === 4) {
+    showFidoEnrollment();
+  }
+
+  // Render portals
+  var c = $('portalsList');
+  PORTALS.forEach(function(p) {
+    var ok = tier <= p.tier;
+    var d = document.createElement('div'); d.className = 'portal';
+    var n = document.createElement('div'); n.className = 'name'; n.textContent = p.name; d.appendChild(n);
+    var m = document.createElement('div'); m.className = 'meta'; m.textContent = 'Tier ' + p.tier + ' (' + TN[p.tier] + ') | ' + p.scope; d.appendChild(m);
+    var ds = document.createElement('div'); ds.textContent = p.desc; d.appendChild(ds);
+    var b = document.createElement('div'); b.style.marginTop = '10px';
+    var s = document.createElement('span'); s.className = 'badge ' + (ok ? 'ok' : 'no'); s.textContent = ok ? 'ACCESS GRANTED' : 'INSUFFICIENT CLEARANCE';
+    b.appendChild(s); d.appendChild(b); c.appendChild(d);
   });
 }
-function doLogout(){localStorage.removeItem('authToken');localStorage.removeItem('username');localStorage.removeItem('userTier');window.location.href='/';}
+
+// ── FIDO2 Enrollment ─────────────────────────────────────────────────────
+function showFidoEnrollment() {
+  var card = $('fidoEnrollCard');
+  if (!card) return;
+  card.style.display = '';
+
+  if (!window.PublicKeyCredential || !navigator.credentials || !navigator.credentials.create) {
+    $('btnPlatform').disabled = true;
+    $('btnExternal').disabled = true;
+    setStatus('Your browser does not support WebAuthn/FIDO2. Use Chrome, Firefox, Safari, or Edge.', 'err');
+    return;
+  }
+
+  // Detect platform authenticator
+  if (PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable) {
+    PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable().then(function(ok) {
+      if (!ok) {
+        $('btnPlatform').querySelector('.fido-opt-desc').textContent = 'Not available on this device';
+        $('btnPlatform').disabled = true;
+      }
+    });
+  }
+
+  startCountdown(120);
+}
+
+function startCountdown(secs) {
+  var remaining = secs;
+  function tick() {
+    var m = Math.floor(remaining / 60);
+    var s = remaining % 60;
+    var el = $('fidoCountdown');
+    if (el) el.textContent = m + ':' + (s < 10 ? '0' : '') + s;
+    if (remaining <= 30) {
+      var w = $('fidoTimerWarn');
+      if (w) w.textContent = 'Session expires in ' + remaining + 's — enroll now!';
+    }
+    if (remaining <= 0) {
+      clearInterval(fidoCountdownInterval);
+      $('btnPlatform').disabled = true;
+      $('btnExternal').disabled = true;
+      var w = $('fidoTimerWarn');
+      if (w) w.textContent = 'Session expired. Use another recovery code to try again.';
+    }
+    remaining--;
+  }
+  tick();
+  fidoCountdownInterval = setInterval(tick, 1000);
+}
+
+function setStatus(msg, type) {
+  var el = $('fidoStatus');
+  if (!el) return;
+  el.textContent = '';
+  var span = document.createElement('span');
+  span.className = type || 'wait';
+  span.textContent = msg;
+  el.appendChild(span);
+}
+
+function b64ToUint8(b64) {
+  if (Array.isArray(b64)) return new Uint8Array(b64);
+  if (b64 instanceof ArrayBuffer) return new Uint8Array(b64);
+  if (typeof b64 !== 'string') return new Uint8Array(0);
+  var s = b64.replace(/-/g, '+').replace(/_/g, '/');
+  while (s.length % 4) s += '=';
+  var raw = atob(s);
+  var arr = new Uint8Array(raw.length);
+  for (var i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+  return arr;
+}
+
+function uint8ToArray(u8) { return Array.from(u8); }
+
+async function fidoEnroll(preferPlatform) {
+  var userId = localStorage.getItem('recoveryUserId') || localStorage.getItem('userId');
+  var username = localStorage.getItem('username') || 'unknown';
+
+  if (!userId) {
+    setStatus('No user ID found. Please log in again with a recovery code.', 'err');
+    return;
+  }
+
+  setStatus('Starting credential registration...', 'wait');
+
+  try {
+    var beginData = await api('/fido/register/begin', {
+      method: 'POST',
+      body: JSON.stringify({ user_id: userId, username: username, prefer_platform: preferPlatform })
+    });
+
+    var options = beginData.options || beginData;
+
+    var publicKey = {
+      challenge: b64ToUint8(options.challenge),
+      rp: { name: options.rp.name, id: options.rp.id },
+      user: {
+        id: b64ToUint8(options.user.id),
+        name: options.user.name,
+        displayName: options.user.display_name || options.user.name
+      },
+      pubKeyCredParams: (options.pub_key_cred_params || []).map(function(p) {
+        return { type: p.cred_type || p.type || 'public-key', alg: p.alg };
+      }),
+      timeout: options.timeout || 60000,
+      attestation: options.attestation || 'direct',
+      authenticatorSelection: {
+        userVerification: (options.authenticator_selection || {}).user_verification || 'required',
+        residentKey: (options.authenticator_selection || {}).resident_key || 'preferred'
+      }
+    };
+
+    if (preferPlatform) {
+      publicKey.authenticatorSelection.authenticatorAttachment = 'platform';
+    }
+
+    // excludeCredentials — prevent re-registering the same authenticator
+    if (options.exclude_credentials && options.exclude_credentials.length) {
+      publicKey.excludeCredentials = options.exclude_credentials.map(function(c) {
+        return { type: c.cred_type || c.type || 'public-key', id: b64ToUint8(c.id) };
+      });
+    }
+
+    setStatus('Waiting for authenticator — follow your device prompt...', 'wait');
+
+    var credential = await navigator.credentials.create({ publicKey: publicKey });
+
+    setStatus('Processing registration...', 'wait');
+
+    var attestationResponse = credential.response;
+    var completeData = await api('/fido/register/complete', {
+      method: 'POST',
+      body: JSON.stringify({
+        user_id: userId,
+        credential_id: uint8ToArray(new Uint8Array(credential.rawId)),
+        public_key: uint8ToArray(new Uint8Array(attestationResponse.getPublicKey ? attestationResponse.getPublicKey() : [])),
+        attestation_object: uint8ToArray(new Uint8Array(attestationResponse.attestationObject)),
+        client_data: uint8ToArray(new Uint8Array(attestationResponse.clientDataJSON)),
+        authenticator_type: preferPlatform ? 'platform' : 'cross-platform'
+      })
+    });
+
+    if (completeData.success) {
+      setStatus('Key enrolled! You can add another device (e.g. phone) or sign in with this key for full access.', 'ok');
+      localStorage.removeItem('isRecoverySession');
+      if (fidoCountdownInterval) clearInterval(fidoCountdownInterval);
+      var w = $('fidoTimerWarn');
+      if (w) w.textContent = '';
+    } else {
+      setStatus('Registration failed: ' + (completeData.error || 'unknown error'), 'err');
+    }
+  } catch (e) {
+    var msg = e.message || 'Registration failed';
+    if (e.name === 'NotAllowedError') msg = 'Registration cancelled or timed out. Try again.';
+    else if (e.name === 'SecurityError') msg = 'Security error — ensure the page is served over HTTPS.';
+    else if (e.name === 'InvalidStateError') msg = 'A credential is already registered on this authenticator.';
+    setStatus(msg, 'err');
+  }
+}
+
+function doLogout() {
+  localStorage.removeItem('authToken');
+  localStorage.removeItem('username');
+  localStorage.removeItem('userTier');
+  localStorage.removeItem('isRecoverySession');
+  localStorage.removeItem('recoveryUserId');
+  localStorage.removeItem('userId');
+  localStorage.removeItem('dashboard');
+  window.location.href = '/';
+}
+
 init();
 </script>
 </body>
