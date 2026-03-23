@@ -9,8 +9,8 @@ output "ssh_command" {
 }
 
 output "admin_url" {
-  description = "Admin panel URL"
-  value       = "http://${google_compute_address.sso_demo.address}:8080"
+  description = "Admin panel URL (HTTPS via nginx reverse proxy)"
+  value       = "https://${google_compute_address.sso_demo.address}"
 }
 
 output "gateway_address" {
@@ -19,6 +19,11 @@ output "gateway_address" {
 }
 
 output "frontend_url" {
-  description = "Frontend URL"
-  value       = "http://${google_compute_address.sso_demo.address}"
+  description = "Frontend URL (redirects to HTTPS)"
+  value       = "https://${google_compute_address.sso_demo.address}"
+}
+
+output "service_status_command" {
+  description = "Command to check all milnet service statuses"
+  value       = "gcloud compute ssh sso-demo-vm --zone=${var.zone} --project=${var.project_id} -- 'systemctl list-units milnet-*.service --no-pager'"
 }

@@ -4,7 +4,7 @@
 # NEVER commit terraform.tfvars — it contains secrets.
 ###############################################################################
 
-project_id = "lmsforshantithakur"
+project_id = "dmjone"
 
 region = "us-central1"
 

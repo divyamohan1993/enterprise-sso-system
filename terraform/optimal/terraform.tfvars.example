@@ -5,7 +5,7 @@
 # NEVER commit terraform.tfvars to version control (it contains secrets).
 # ============================================================================
 
-project_id = "lmsforshantithakur"
+project_id = "dmjone"
 
 region = "us-central1"
 zone   = "us-central1-a"

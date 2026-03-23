@@ -1,7 +1,8 @@
 ###############################################################################
 # Enterprise SSO System — MVP Demo Deployment
 #
-# Single VM running all services via docker-compose.
+# Single VM running all services as native systemd units (no Docker).
+# Rust services built from source, PostgreSQL 16 installed via apt.
 # Designed for <10 users/month demo/showcase.
 # Estimated cost: ~$15-25/month (e2-medium spot instance).
 #
@@ -34,7 +35,7 @@ data "google_project" "current" {
 }
 
 # ---------------------------------------------------------------------------
-# Secret Manager — store db_password (1 secret ≈ free)
+# Secret Manager — store db_password (1 secret ~ free)
 # ---------------------------------------------------------------------------
 resource "google_secret_manager_secret" "db_password" {
   secret_id = "sso-demo-db-password"
