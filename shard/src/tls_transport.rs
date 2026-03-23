@@ -291,6 +291,41 @@ pub fn tls_client_setup(
     (connector, ca, cert_key)
 }
 
+/// Create a TLS-enabled SHARD listener with certificate pinning.
+///
+/// Like [`tls_bind`] but enforces that connecting clients present a certificate
+/// whose SHA-256 fingerprint is in `pin_set`.
+pub async fn tls_bind_pinned(
+    addr: &str,
+    module_id: ModuleId,
+    hmac_key: [u8; 64],
+    module_name: &str,
+    pin_set: crate::tls::CertificatePinSet,
+) -> Result<(TlsShardListener, crate::tls::CertificateAuthority, rcgen::CertifiedKey), common::error::MilnetError> {
+    ensure_crypto_provider();
+    let ca = crate::tls::generate_ca();
+    let cert_key = crate::tls::generate_module_cert(module_name, &ca);
+    let server_config = crate::tls::server_tls_config_pinned(&cert_key, &ca, pin_set);
+    let listener = TlsShardListener::bind(addr, module_id, hmac_key, server_config).await?;
+    Ok((listener, ca, cert_key))
+}
+
+/// Create a TLS connector for a client module with certificate pinning.
+///
+/// Like [`tls_client_setup`] but enforces that the server presents a certificate
+/// whose SHA-256 fingerprint is in `pin_set`.
+pub fn tls_client_setup_pinned(
+    module_name: &str,
+    pin_set: crate::tls::CertificatePinSet,
+) -> (TlsConnector, crate::tls::CertificateAuthority, rcgen::CertifiedKey) {
+    ensure_crypto_provider();
+    let ca = crate::tls::generate_ca();
+    let cert_key = crate::tls::generate_module_cert(module_name, &ca);
+    let client_config = crate::tls::client_tls_config_pinned(&cert_key, &ca, pin_set);
+    let connector = crate::tls::tls_connector(client_config);
+    (connector, ca, cert_key)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -299,7 +334,9 @@ pub fn tls_client_setup(
 mod tests {
     use super::*;
     use crate::tls::{
-        client_tls_config, generate_ca, generate_module_cert, server_tls_config, tls_connector,
+        build_pin_set_from_certs, client_tls_config, client_tls_config_pinned,
+        compute_cert_fingerprint, generate_ca, generate_module_cert, server_tls_config,
+        server_tls_config_pinned, tls_connector, CertificatePinSet,
     };
 
     fn test_hmac_key() -> [u8; 64] {
@@ -434,6 +471,107 @@ mod tests {
             let expected = format!("ack-{i}");
             assert_eq!(payload, expected.as_bytes());
         }
+
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_tls_pinned_roundtrip() {
+        // Generate shared CA and certs.
+        let ca = generate_ca();
+        let server_cert = generate_module_cert("localhost", &ca);
+        let client_cert = generate_module_cert("client", &ca);
+
+        // Build pin set from both certs.
+        let pin_set = build_pin_set_from_certs(&[&server_cert, &client_cert]);
+
+        let server_cfg = server_tls_config_pinned(&server_cert, &ca, pin_set.clone());
+        let client_cfg = client_tls_config_pinned(&client_cert, &ca, pin_set);
+
+        let listener = TlsShardListener::bind(
+            "127.0.0.1:0",
+            ModuleId::Orchestrator,
+            test_hmac_key(),
+            server_cfg,
+        )
+        .await
+        .unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let connector = tls_connector(client_cfg);
+
+        let server_handle = tokio::spawn(async move {
+            let mut transport = listener.accept().await.unwrap();
+            let (sender, payload) = transport.recv().await.unwrap();
+            assert_eq!(sender, ModuleId::Gateway);
+            assert_eq!(payload, b"pinned hello");
+            transport.send(b"pinned ack").await.unwrap();
+        });
+
+        let mut client = tls_connect(
+            &addr.to_string(),
+            ModuleId::Gateway,
+            test_hmac_key(),
+            &connector,
+            "localhost",
+        )
+        .await
+        .unwrap();
+
+        client.send(b"pinned hello").await.unwrap();
+        let (sender, payload) = client.recv().await.unwrap();
+        assert_eq!(sender, ModuleId::Orchestrator);
+        assert_eq!(payload, b"pinned ack");
+
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_tls_pinned_rejects_unpinned_client() {
+        // Generate shared CA and certs.
+        let ca = generate_ca();
+        let server_cert = generate_module_cert("localhost", &ca);
+        let client_cert = generate_module_cert("client", &ca);
+
+        // Pin set contains ONLY the server cert — client is not pinned.
+        let mut server_pin_set = CertificatePinSet::new();
+        server_pin_set.add_certificate(server_cert.cert.der().as_ref());
+
+        // Client-side pin set has the server cert so it will accept the server.
+        let mut client_pin_set = CertificatePinSet::new();
+        client_pin_set.add_certificate(server_cert.cert.der().as_ref());
+
+        let server_cfg = server_tls_config_pinned(&server_cert, &ca, server_pin_set);
+        let client_cfg = client_tls_config_pinned(&client_cert, &ca, client_pin_set);
+
+        let listener = TlsShardListener::bind(
+            "127.0.0.1:0",
+            ModuleId::Orchestrator,
+            test_hmac_key(),
+            server_cfg,
+        )
+        .await
+        .unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let connector = tls_connector(client_cfg);
+
+        let server_handle = tokio::spawn(async move {
+            // The accept should fail because the client cert is not in the server's pin set.
+            let result = listener.accept().await;
+            assert!(result.is_err(), "server should reject unpinned client certificate");
+        });
+
+        // The client connect may succeed or fail depending on handshake ordering,
+        // but the overall exchange should not complete successfully.
+        let _client_result = tls_connect(
+            &addr.to_string(),
+            ModuleId::Gateway,
+            test_hmac_key(),
+            &connector,
+            "localhost",
+        )
+        .await;
 
         server_handle.await.unwrap();
     }

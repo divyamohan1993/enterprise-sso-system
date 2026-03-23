@@ -1,6 +1,6 @@
 use common::domain;
 use common::error::MilnetError;
-use common::revocation::RevocationList;
+use common::revocation::{RevocationList, SharedRevocationList};
 use common::types::{Token, TokenClaims};
 use crypto::pq_sign::{pq_verify, PqVerifyingKey};
 use frost_ristretto255::keys::PublicKeyPackage;
@@ -12,6 +12,9 @@ type HmacSha512 = Hmac<Sha512>;
 
 /// Maximum session epochs (8 hours at 10s/epoch).
 const MAX_SESSION_EPOCHS: u64 = 2880;
+
+/// Default max token lifetime for lazy cleanup (8 hours in seconds).
+const DEFAULT_MAX_TOKEN_LIFETIME_SECS: i64 = 8 * 60 * 60;
 
 /// Verify a token's signature and claims (spec C.11), optionally enforcing
 /// DPoP channel binding when a client key is provided.
@@ -201,7 +204,9 @@ pub fn verify_token_full(
 /// Verify a token with full checks including audience validation.
 ///
 /// When `expected_audience` is `Some`, the token's `aud` field must match
-/// exactly. When `None`, audience is not checked (for internal service calls).
+/// exactly. When `None`, audience is not checked — but if `REQUIRE_TOKEN_AUDIENCE`
+/// is set to `true` (the default), tokens without an audience claim are rejected
+/// even when no expected audience is specified.
 pub fn verify_token_with_audience(
     token: &Token,
     public_key_package: &PublicKeyPackage,
@@ -232,6 +237,19 @@ pub fn verify_token_with_audience(
                     "token has no audience claim but audience validation is required".into(),
                 ));
             }
+        }
+    } else {
+        // No expected audience specified — enforce audience presence if configured.
+        // REQUIRE_TOKEN_AUDIENCE defaults to true; set to "false" to allow tokens without aud.
+        let require_aud = std::env::var("REQUIRE_TOKEN_AUDIENCE")
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(true);
+        if require_aud && token.claims.aud.is_none() {
+            return Err(MilnetError::CryptoVerification(
+                "token audience (aud) claim is required but missing — \
+                 set REQUIRE_TOKEN_AUDIENCE=false to allow tokens without audience binding"
+                    .into(),
+            ));
         }
     }
 
@@ -306,4 +324,36 @@ pub fn verify_token_with_ratchet(
     }
 
     Ok(claims)
+}
+
+// ---------------------------------------------------------------------------
+// SharedRevocationList-based verification (thread-safe, with lazy cleanup)
+// ---------------------------------------------------------------------------
+
+/// Full token verification using the thread-safe [`SharedRevocationList`].
+///
+/// This is the recommended entry point for production verification with
+/// concurrent access. It performs:
+/// 1. Lazy cleanup of expired revocation entries (at most once per 60 seconds)
+/// 2. Fail-fast revocation check (O(1) lookup, BEFORE any crypto)
+/// 3. Full signature + DPoP verification
+pub fn verify_token_with_shared_revocation(
+    token: &Token,
+    public_key_package: &PublicKeyPackage,
+    pq_verifying_key: &PqVerifyingKey,
+    revocation_list: &SharedRevocationList,
+    client_dpop_key: Option<&[u8]>,
+) -> Result<TokenClaims, MilnetError> {
+    // 1. Lazy cleanup: runs at most once per 60 seconds
+    revocation_list.maybe_lazy_cleanup(DEFAULT_MAX_TOKEN_LIFETIME_SECS);
+
+    // 2. Fail fast: check revocation BEFORE expensive cryptographic verification
+    if revocation_list.is_revoked(&token.claims.token_id) {
+        return Err(MilnetError::CryptoVerification(
+            "token has been revoked".into(),
+        ));
+    }
+
+    // 3. Full signature + DPoP verification
+    verify_token_inner(token, public_key_package, pq_verifying_key, client_dpop_key)
 }

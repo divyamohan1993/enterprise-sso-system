@@ -30,9 +30,18 @@ impl SessionTracker {
 
         // Evict sessions older than 8 hours (max session lifetime)
         const MAX_SESSION_AGE_SECS: i64 = 28800;
+        let len_before = sessions.len();
         sessions.retain(|(_sid, created)| now - created < MAX_SESSION_AGE_SECS);
+        let evicted_age = len_before - sessions.len();
+        for _ in 0..evicted_age {
+            crate::siem::SecurityEvent::session_expired(&user_id.to_string());
+        }
 
         if sessions.len() >= self.max_per_user as usize {
+            crate::siem::SecurityEvent::session_revoked(
+                &user_id.to_string(),
+                "concurrent session limit exceeded",
+            );
             return Err(format!(
                 "session limit exceeded: max {} concurrent sessions per user",
                 self.max_per_user
@@ -40,6 +49,10 @@ impl SessionTracker {
         }
 
         sessions.push((session_id, now));
+        crate::siem::SecurityEvent::session_created(
+            &user_id.to_string(),
+            "internal",
+        );
         Ok(())
     }
 

@@ -120,7 +120,41 @@ pub fn create_id_token_with_tier(
 }
 
 /// Verify an ML-DSA-87-signed JWT using the verifying key.
+///
+/// This performs signature verification only. Use `verify_id_token_with_audience`
+/// for full audience-bound verification in production.
 pub fn verify_id_token(token: &str, verifying_key: &PqVerifyingKey) -> Result<IdTokenClaims, String> {
+    verify_id_token_inner(token, verifying_key, None, false)
+}
+
+/// Verify an ML-DSA-87-signed JWT with mandatory audience binding.
+///
+/// When `require_audience` is true (recommended for production, controlled by
+/// `REQUIRE_TOKEN_AUDIENCE` env var, default true), the token's `aud` field
+/// MUST be present and match `expected_audience`.
+pub fn verify_id_token_with_audience(
+    token: &str,
+    verifying_key: &PqVerifyingKey,
+    expected_audience: &str,
+    require_audience: bool,
+) -> Result<IdTokenClaims, String> {
+    verify_id_token_inner(token, verifying_key, Some(expected_audience), require_audience)
+}
+
+/// Returns whether audience enforcement is enabled via environment config.
+/// Defaults to true (audience required) unless `REQUIRE_TOKEN_AUDIENCE=false`.
+pub fn is_audience_required() -> bool {
+    std::env::var("REQUIRE_TOKEN_AUDIENCE")
+        .map(|v| v != "false" && v != "0")
+        .unwrap_or(true)
+}
+
+fn verify_id_token_inner(
+    token: &str,
+    verifying_key: &PqVerifyingKey,
+    expected_audience: Option<&str>,
+    require_audience: bool,
+) -> Result<IdTokenClaims, String> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
         return Err("invalid JWT: expected 3 parts".into());
@@ -152,6 +186,18 @@ pub fn verify_id_token(token: &str, verifying_key: &PqVerifyingKey) -> Result<Id
         .map_err(|e| format!("base64 decode claims: {e}"))?;
     let claims: IdTokenClaims =
         serde_json::from_slice(&claims_bytes).map_err(|e| format!("parse claims: {e}"))?;
+
+    // Audience validation
+    if let Some(expected) = expected_audience {
+        if claims.aud != expected {
+            return Err(format!(
+                "audience mismatch: expected '{}', got '{}'",
+                expected, claims.aud
+            ));
+        }
+    } else if require_audience && claims.aud.is_empty() {
+        return Err("token audience (aud) is required but missing or empty".into());
+    }
 
     Ok(claims)
 }

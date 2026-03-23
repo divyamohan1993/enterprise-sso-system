@@ -6,7 +6,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -25,6 +25,145 @@ fn html_escape(input: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#x27;")
+}
+
+// ---------------------------------------------------------------------------
+// CSRF protection utilities
+// ---------------------------------------------------------------------------
+
+/// Generate a CSRF token using HMAC-SHA256 over (session_state + timestamp + nonce).
+/// The token encodes: timestamp:nonce:hmac_hex
+fn generate_csrf_token(session_state: &str, api_key: &str) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let nonce: [u8; 16] = rand::random();
+    let nonce_hex = hex::encode(nonce);
+
+    let payload = format!("{}:{}:{}", session_state, now, nonce_hex);
+    let mut mac = HmacSha256::new_from_slice(api_key.as_bytes()).expect("HMAC key");
+    mac.update(payload.as_bytes());
+    let sig = hex::encode(mac.finalize().into_bytes());
+
+    format!("{}:{}:{}", now, nonce_hex, sig)
+}
+
+/// CSRF token TTL in seconds (60 seconds).
+const CSRF_TOKEN_TTL_SECS: u64 = 60;
+
+/// Validate a CSRF token against the expected session_state and api_key.
+/// Returns true if the token is valid and not expired.
+fn validate_csrf_token(token: &str, session_state: &str, api_key: &str) -> bool {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+
+    let parts: Vec<&str> = token.splitn(3, ':').collect();
+    if parts.len() != 3 {
+        return false;
+    }
+    let (ts_str, nonce_hex, provided_sig) = (parts[0], parts[1], parts[2]);
+
+    // Check expiry
+    let timestamp: u64 = match ts_str.parse() {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    if now.saturating_sub(timestamp) > CSRF_TOKEN_TTL_SECS {
+        return false;
+    }
+
+    // Recompute HMAC
+    let payload = format!("{}:{}:{}", session_state, timestamp, nonce_hex);
+    let mut mac = HmacSha256::new_from_slice(api_key.as_bytes()).expect("HMAC key");
+    mac.update(payload.as_bytes());
+    let expected_sig = hex::encode(mac.finalize().into_bytes());
+
+    crypto::ct::ct_eq(expected_sig.as_bytes(), provided_sig.as_bytes())
+}
+
+// ---------------------------------------------------------------------------
+// Token revocation
+// ---------------------------------------------------------------------------
+
+/// Maximum number of entries in the in-memory revocation set.
+const MAX_REVOCATION_ENTRIES: usize = 100_000;
+
+/// Maximum token lifetime — entries older than this are eligible for cleanup.
+const MAX_TOKEN_LIFETIME_SECS: i64 = 15 * 60;
+
+/// An entry in the revocation set, tracking when it was revoked for cleanup.
+struct RevokedTokenEntry {
+    token_id: [u8; 16],
+    revoked_at: i64,
+}
+
+/// In-memory token revocation list.
+pub struct RevocationList {
+    entries: HashSet<[u8; 16]>,
+    timed_entries: Vec<RevokedTokenEntry>,
+}
+
+impl RevocationList {
+    pub fn new() -> Self {
+        Self {
+            entries: HashSet::new(),
+            timed_entries: Vec::new(),
+        }
+    }
+
+    /// Add a token_id to the revocation set. Returns false if at capacity.
+    fn revoke(&mut self, token_id: [u8; 16]) -> bool {
+        if self.entries.len() >= MAX_REVOCATION_ENTRIES {
+            return false;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        if self.entries.insert(token_id) {
+            self.timed_entries.push(RevokedTokenEntry {
+                token_id,
+                revoked_at: now,
+            });
+        }
+        true
+    }
+
+    /// Returns the number of currently revoked tokens.
+    fn count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Remove entries older than MAX_TOKEN_LIFETIME_SECS.
+    fn cleanup_expired(&mut self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let cutoff = now - MAX_TOKEN_LIFETIME_SECS;
+        let mut to_remove = Vec::new();
+        self.timed_entries.retain(|entry| {
+            if entry.revoked_at < cutoff {
+                to_remove.push(entry.token_id);
+                false
+            } else {
+                true
+            }
+        });
+        for id in to_remove {
+            self.entries.remove(&id);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -58,6 +197,7 @@ pub struct AppState {
     pub login_attempts: RwLock<HashMap<String, (u32, i64)>>,
     pub pq_signing_key: crypto::pq_sign::PqSigningKey,
     pub session_tracker: Arc<common::session_limits::SessionTracker>,
+    pub revocation_list: RwLock<RevocationList>,
 }
 
 /// Entry in the access_tokens map, pairing a user ID with a last-activity
@@ -246,11 +386,6 @@ async fn security_headers_middleware(
     request: Request,
     next: Next,
 ) -> Response {
-    let is_auth_endpoint = {
-        let path = request.uri().path();
-        path.starts_with("/oauth/") || path.starts_with("/api/auth/")
-    };
-
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
 
@@ -287,12 +422,11 @@ async fn security_headers_middleware(
         ),
     );
 
-    if is_auth_endpoint {
-        headers.insert(
-            axum::http::header::CACHE_CONTROL,
-            axum::http::HeaderValue::from_static("no-store"),
-        );
-    }
+    // Cache-Control: no-store on all responses (not just auth endpoints)
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
 
     response
 }
@@ -515,6 +649,9 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/security/test/audit-integrity", post(test_audit_integrity))
         .route("/api/security/test/crypto-health", post(test_crypto_health))
         .route("/api/security/config", get(security_config))
+        // Token revocation
+        .route("/api/tokens/revoke", post(revoke_token))
+        .route("/api/tokens/revoked", get(revoked_token_count))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .layer(middleware::from_fn(security_headers_middleware))
         .with_state(state)
@@ -1570,6 +1707,9 @@ async fn oauth_authorize(
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid_redirect_uri"}))).into_response();
     }
 
+    // Generate CSRF token bound to this OAuth session state
+    let csrf_token = generate_csrf_token(&params.state, &state.admin_api_key);
+
     // Show login page — user MUST authenticate before getting an auth code
     let login_html = format!(r#"<!DOCTYPE html>
 <html><head><title>MILNET SSO // Authenticate</title>
@@ -1607,6 +1747,7 @@ button:hover{{background:#00cc33}}
   <input type="hidden" name="state" value="{state}">
   <input type="hidden" name="nonce" value="{nonce}">
   <input type="hidden" name="code_challenge" value="{code_challenge}">
+  <input type="hidden" name="csrf_token" value="{csrf_token}">
   <label>Username</label>
   <input type="text" name="username" placeholder="Enter your username" required autofocus>
   <label>Password</label>
@@ -1623,6 +1764,7 @@ button:hover{{background:#00cc33}}
         state = html_escape(&params.state),
         nonce = html_escape(params.nonce.as_deref().unwrap_or("")),
         code_challenge = html_escape(params.code_challenge.as_deref().unwrap_or("")),
+        csrf_token = html_escape(&csrf_token),
         google_btn = if state.google_config.is_some() {
             format!(r#"<div style="margin-top:20px;text-align:center">
 <div style="color:#555;font-size:0.7rem;margin-bottom:12px">or</div>
@@ -1651,6 +1793,17 @@ async fn oauth_authorize_login(
 ) -> axum::response::Response {
     use axum::response::{IntoResponse, Html};
     use axum::http::header;
+
+    // Validate CSRF token before processing the login form
+    if !validate_csrf_token(&form.csrf_token, &form.state, &state.admin_api_key) {
+        return (StatusCode::FORBIDDEN, Html(r#"<!DOCTYPE html>
+<html><head><title>MILNET SSO // Error</title>
+<style>body{background:#0a0a0a;color:#ff3333;font-family:'JetBrains Mono',monospace;padding:60px;text-align:center}
+a{color:#00ff41}</style></head><body>
+<h1>CSRF VALIDATION FAILED</h1>
+<p style="margin:20px 0;color:#888">The form has expired or the request was forged. Please try again.</p>
+</body></html>"#.to_string())).into_response();
+    }
 
     // Authenticate the user
     let store = state.credential_store.read().await;
@@ -1808,6 +1961,51 @@ struct OAuthLoginForm {
     state: String,
     nonce: String,
     code_challenge: String,
+    #[serde(default)]
+    csrf_token: String,
+}
+
+// ---------------------------------------------------------------------------
+// Handlers — Token Revocation
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct RevokeTokenRequest {
+    token_id: String,
+}
+
+/// POST /api/tokens/revoke — add a token_id (hex string) to the revocation set.
+async fn revoke_token(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<RevokeTokenRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Parse hex token_id into [u8; 16]
+    let bytes = hex::decode(&body.token_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if bytes.len() != 16 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut token_id = [0u8; 16];
+    token_id.copy_from_slice(&bytes);
+
+    let mut revocation = state.revocation_list.write().await;
+    // Run periodic cleanup before inserting
+    revocation.cleanup_expired();
+    if !revocation.revoke(token_id) {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let count = revocation.count();
+    drop(revocation);
+
+    Ok(Json(serde_json::json!({"status": "revoked", "revoked_count": count})))
+}
+
+/// GET /api/tokens/revoked — return the count of revoked tokens.
+async fn revoked_token_count(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let revocation = state.revocation_list.read().await;
+    let count = revocation.count();
+    Json(serde_json::json!({"revoked_count": count}))
 }
 
 // ---------------------------------------------------------------------------

@@ -225,7 +225,7 @@ async fn boot_orchestrator(opaque_addr: String, tss_addr: String, ca: &shard::tl
     let connector = shard::tls::tls_connector(client_config);
 
     let service = std::sync::Arc::new(
-        OrchestratorService::new_with_tls(SHARD_HMAC_KEY, opaque_addr, tss_addr, connector),
+        OrchestratorService::new_with_tls_and_receipt_key(SHARD_HMAC_KEY, RECEIPT_SIGNING_KEY, opaque_addr, tss_addr, connector),
     );
 
     tokio::spawn(async move {

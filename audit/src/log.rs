@@ -3,6 +3,8 @@ use common::domain;
 use common::types::{AuditEntry, AuditEventType, Receipt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
+use std::fs::OpenOptions;
+use std::io::Write as IoWrite;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -27,11 +29,18 @@ pub struct AuditResponse {
 /// How often (in number of appended entries) to run automatic chain verification.
 const VERIFY_CHAIN_INTERVAL: usize = 100;
 
+/// Default maximum entries to keep in memory before triggering archival.
+const DEFAULT_MAX_ENTRIES: usize = 100_000;
+
 pub struct AuditLog {
     entries: Vec<AuditEntry>,
     last_hash: [u8; 64],
     /// Set to `true` if an automatic `verify_chain()` check ever fails.
     tamper_detected: bool,
+    /// Maximum entries to keep in memory. When exceeded, archival is triggered.
+    max_entries: usize,
+    /// Optional directory for automatic archival on overflow.
+    archive_dir: Option<String>,
 }
 
 impl AuditLog {
@@ -40,6 +49,19 @@ impl AuditLog {
             entries: Vec::new(),
             last_hash: [0u8; 64],
             tamper_detected: false,
+            max_entries: DEFAULT_MAX_ENTRIES,
+            archive_dir: None,
+        }
+    }
+
+    /// Create an AuditLog with a custom max_entries limit and archive directory.
+    pub fn new_with_limits(max_entries: usize, archive_dir: Option<String>) -> Self {
+        Self {
+            entries: Vec::new(),
+            last_hash: [0u8; 64],
+            tamper_detected: false,
+            max_entries,
+            archive_dir,
         }
     }
 
@@ -52,7 +74,19 @@ impl AuditLog {
             entries,
             last_hash,
             tamper_detected: false,
+            max_entries: DEFAULT_MAX_ENTRIES,
+            archive_dir: None,
         }
+    }
+
+    /// Set the archive directory for automatic overflow archival.
+    pub fn set_archive_dir(&mut self, dir: String) {
+        self.archive_dir = Some(dir);
+    }
+
+    /// Set the maximum entries limit.
+    pub fn set_max_entries(&mut self, max: usize) {
+        self.max_entries = max;
     }
 
     pub fn append(
@@ -77,6 +111,7 @@ impl AuditLog {
         self.last_hash = hash_entry(&entry);
         self.entries.push(entry);
         self.periodic_verify();
+        self.auto_archive();
         self.entries.last().unwrap()
     }
 
@@ -123,6 +158,11 @@ impl AuditLog {
         &self.entries
     }
 
+    /// Return the total number of entries currently in memory.
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
     /// Append an entry and sign it with ML-DSA-65.
     pub fn append_signed(
         &mut self,
@@ -149,6 +189,7 @@ impl AuditLog {
         self.last_hash = hash;
         self.entries.push(entry);
         self.periodic_verify();
+        self.auto_archive();
         self.entries.last().unwrap()
     }
 
@@ -162,7 +203,63 @@ impl AuditLog {
         self.last_hash = hash_entry(&entry);
         self.entries.push(entry);
         self.periodic_verify();
+        self.auto_archive();
         Ok(())
+    }
+
+    /// Archive old entries to a JSON lines file in the given directory.
+    ///
+    /// Keeps the last `max_entries` entries in memory and writes the rest
+    /// to an archive file with a timestamp suffix.  The hash chain is
+    /// preserved across archives by keeping `last_hash` intact.
+    ///
+    /// Returns the count of archived entries.
+    pub fn archive_old_entries(&mut self, archive_dir: &str) -> Result<usize, String> {
+        if self.entries.len() <= self.max_entries {
+            return Ok(0);
+        }
+
+        let archive_count = self.entries.len() - self.max_entries;
+
+        // Ensure the archive directory exists.
+        std::fs::create_dir_all(archive_dir)
+            .map_err(|e| format!("failed to create archive dir {:?}: {}", archive_dir, e))?;
+
+        // Build archive filename with timestamp.
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros();
+        let archive_path =
+            std::path::Path::new(archive_dir).join(format!("audit_archive_{}.jsonl", timestamp));
+
+        // Write the old entries to the archive file.
+        let entries_to_archive: Vec<AuditEntry> = self.entries.drain(..archive_count).collect();
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&archive_path)
+            .map_err(|e| format!("failed to open archive file {:?}: {}", archive_path, e))?;
+
+        for entry in &entries_to_archive {
+            let json = serde_json::to_string(entry)
+                .map_err(|e| format!("failed to serialize entry: {}", e))?;
+            writeln!(file, "{}", json)
+                .map_err(|e| format!("failed to write to archive: {}", e))?;
+        }
+
+        file.sync_data()
+            .map_err(|e| format!("failed to sync archive file: {}", e))?;
+
+        tracing::info!(
+            "Archived {} audit entries to {:?} ({} entries remain in memory)",
+            archive_count,
+            archive_path,
+            self.entries.len()
+        );
+
+        Ok(archive_count)
     }
 
     /// Run `verify_chain()` every `VERIFY_CHAIN_INTERVAL` entries.
@@ -179,6 +276,23 @@ impl AuditLog {
                 common::siem::SecurityEvent::tamper_detected(
                     &format!("audit log chain verification FAILED at entry {}", self.entries.len())
                 );
+            }
+        }
+    }
+
+    /// Trigger automatic archival when entries exceed max_entries.
+    fn auto_archive(&mut self) {
+        if self.entries.len() > self.max_entries {
+            if let Some(ref dir) = self.archive_dir.clone() {
+                match self.archive_old_entries(dir) {
+                    Ok(count) if count > 0 => {
+                        tracing::info!("Auto-archived {} audit entries", count);
+                    }
+                    Err(e) => {
+                        tracing::error!("Auto-archival failed: {}", e);
+                    }
+                    _ => {}
+                }
             }
         }
     }

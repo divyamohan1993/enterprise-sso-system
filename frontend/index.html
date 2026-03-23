@@ -3,10 +3,13 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'nonce-MILNET2025'; style-src 'self' 'nonce-MILNET2025' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'">
+<meta http-equiv="X-Content-Type-Options" content="nosniff">
+<meta name="referrer" content="strict-origin-when-cross-origin">
 <title>MILNET SSO // Admin Console</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
-<style>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet" crossorigin="anonymous">
+<style nonce="MILNET2025">
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   :root {
     --bg: #0a0a0a; --bg2: #111; --bg3: #1a1a1a; --bg4: #141414; --border: #222; --border-light: #2a2a2a;
@@ -851,7 +854,7 @@
 
 <div class="toast" id="toast"></div>
 
-<script>
+<script nonce="MILNET2025">
 // ══════════════════════════════════════════════════════════════════════════════
 // CLIENT-SIDE PASSWORD HASHING
 // ══════════════════════════════════════════════════════════════════════════════

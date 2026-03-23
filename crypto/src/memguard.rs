@@ -420,6 +420,8 @@ pub fn generate_secret<const N: usize>() -> Result<SecretBuffer<N>, MemguardErro
 /// Call once at startup (in main) to:
 /// - Disable core dumps via prctl(PR_SET_DUMPABLE, 0)
 /// - Prevent new privilege escalation via prctl(PR_SET_NO_NEW_PRIVS, 1)
+/// - Prevent ptrace attachment via prctl(PR_SET_PTRACER, 0) (anti-debugging)
+/// - Set RLIMIT_CORE to 0 (belt-and-suspenders core dump prevention)
 ///
 /// Returns `true` if all hardening succeeded.
 pub fn harden_process() -> bool {
@@ -428,10 +430,39 @@ pub fn harden_process() -> bool {
         if libc::prctl(libc::PR_SET_DUMPABLE, 0) != 0 {
             eprintln!("[memguard] WARNING: prctl(PR_SET_DUMPABLE, 0) failed");
             ok = false;
+        } else {
+            eprintln!("[memguard] hardening: PR_SET_DUMPABLE=0 applied (core dumps disabled)");
         }
         if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
             eprintln!("[memguard] WARNING: prctl(PR_SET_NO_NEW_PRIVS) failed");
             ok = false;
+        } else {
+            eprintln!("[memguard] hardening: PR_SET_NO_NEW_PRIVS=1 applied");
+        }
+
+        // Prevent ptrace attachment (anti-debugging)
+        #[cfg(target_os = "linux")]
+        {
+            // PR_SET_PTRACER with 0 = deny all ptrace
+            if libc::prctl(libc::PR_SET_PTRACER, 0, 0, 0, 0) != 0 {
+                // PR_SET_PTRACER may not be available on all kernels (requires Yama LSM),
+                // so treat failure as non-fatal but log it.
+                eprintln!("[memguard] WARNING: prctl(PR_SET_PTRACER, 0) failed (Yama LSM may not be enabled)");
+            } else {
+                eprintln!("[memguard] hardening: PR_SET_PTRACER=0 applied (ptrace attachment denied)");
+            }
+        }
+
+        // Set RLIMIT_CORE to 0 — belt-and-suspenders with PR_SET_DUMPABLE
+        #[cfg(target_os = "linux")]
+        {
+            let rlim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            if libc::setrlimit(libc::RLIMIT_CORE, &rlim) != 0 {
+                eprintln!("[memguard] WARNING: setrlimit(RLIMIT_CORE, 0) failed");
+                ok = false;
+            } else {
+                eprintln!("[memguard] hardening: RLIMIT_CORE=0 applied (core dumps prevented at resource limit level)");
+            }
         }
     }
     ok

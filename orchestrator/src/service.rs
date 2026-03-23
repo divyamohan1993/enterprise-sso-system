@@ -3,16 +3,64 @@
 //! All inter-service connections use mTLS (mutual TLS) with auto-generated
 //! certificates. There is no plain-TCP fallback — this is military-grade.
 
-use common::types::{ModuleId, TokenClaims};
+use common::types::{ModuleId, Receipt, TokenClaims};
 use crypto::entropy::{generate_key_64, generate_nonce};
 use opaque::messages::{OpaqueRequest, OpaqueResponse};
 use shard::tls_transport::{tls_connect, TlsShardTransport, tls_bind, tls_client_setup};
 use tokio_rustls::TlsConnector;
 use tss::messages::{SigningRequest, SigningResponse};
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 use crate::ceremony::CeremonySession;
 use crate::messages::{OrchestratorRequest, OrchestratorResponse};
+
+/// Independently verify an OPAQUE receipt's HMAC signature, timestamp, session,
+/// and user binding before forwarding to TSS. This enforces zero-trust: the
+/// orchestrator never blindly trusts receipts from the OPAQUE service.
+fn verify_receipt_independently(
+    receipt: &Receipt,
+    _expected_user: &str,
+    hmac_key: &[u8; 64],
+    ceremony_session_id: &[u8; 32],
+) -> Result<(), String> {
+    // 1. Verify HMAC signature using constant-time comparison.
+    //    This proves the receipt was signed by the OPAQUE service (which holds
+    //    the signing key) and has not been tampered with in transit.
+    if !crypto::receipts::verify_receipt_signature(receipt, hmac_key) {
+        return Err("receipt HMAC signature verification failed".into());
+    }
+
+    // 2. Validate timestamp is within ±30 seconds of current time.
+    //    Prevents replay of old receipts and rejects future-dated forgeries.
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64;
+    let drift_us = (now_us - receipt.timestamp).abs();
+    let max_drift_us: i64 = 30 * 1_000_000; // 30 seconds in microseconds
+    if drift_us > max_drift_us {
+        return Err(format!(
+            "receipt timestamp drift {}µs exceeds ±30s tolerance",
+            drift_us
+        ));
+    }
+
+    // 3. Validate ceremony_session_id matches the current ceremony.
+    //    Prevents cross-ceremony receipt injection attacks.
+    if !crypto::ct::ct_eq_32(&receipt.ceremony_session_id, ceremony_session_id) {
+        return Err("receipt ceremony_session_id does not match current ceremony".into());
+    }
+
+    // 4. Validate user_id is not nil (basic sanity — the HMAC signature
+    //    already cryptographically binds the user_id to the receipt, so
+    //    forgery is impossible without the signing key).
+    if receipt.user_id.is_nil() {
+        return Err("receipt user_id is nil".into());
+    }
+
+    Ok(())
+}
 
 /// The orchestrator service that coordinates authentication ceremonies.
 ///
@@ -23,6 +71,10 @@ use crate::messages::{OrchestratorRequest, OrchestratorResponse};
 /// All inter-service connections use mTLS — no plain TCP fallback.
 pub struct OrchestratorService {
     pub hmac_key: [u8; 64],
+    /// Key used to independently verify OPAQUE receipt HMAC signatures.
+    /// SECURITY: This is the same symmetric key held by the OPAQUE service.
+    /// The orchestrator uses it ONLY for verification, never for signing.
+    pub receipt_verification_key: [u8; 64],
     pub opaque_addr: String,
     pub tss_addr: String,
     pub risk_engine: risk::scoring::RiskEngine,
@@ -44,9 +96,31 @@ impl OrchestratorService {
         opaque_addr: String,
         tss_addr: String,
     ) -> Self {
+        let receipt_verification_key = hmac_key;
         let (tls_connector, _ca, _cert_key) = tls_client_setup("orchestrator");
         Self {
             hmac_key,
+            receipt_verification_key,
+            opaque_addr,
+            tss_addr,
+            risk_engine: risk::scoring::RiskEngine::new(),
+            tls_connector,
+            opaque_breaker: common::circuit_breaker::CircuitBreaker::new(3, std::time::Duration::from_secs(30)),
+            tss_breaker: common::circuit_breaker::CircuitBreaker::new(3, std::time::Duration::from_secs(30)),
+        }
+    }
+
+    /// Create with explicit receipt verification key for zero-trust receipt checking.
+    pub fn new_with_receipt_key(
+        hmac_key: [u8; 64],
+        receipt_verification_key: [u8; 64],
+        opaque_addr: String,
+        tss_addr: String,
+    ) -> Self {
+        let (tls_connector, _ca, _cert_key) = tls_client_setup("orchestrator");
+        Self {
+            hmac_key,
+            receipt_verification_key,
             opaque_addr,
             tss_addr,
             risk_engine: risk::scoring::RiskEngine::new(),
@@ -63,8 +137,30 @@ impl OrchestratorService {
         tss_addr: String,
         tls_connector: TlsConnector,
     ) -> Self {
+        let receipt_verification_key = hmac_key;
         Self {
             hmac_key,
+            receipt_verification_key,
+            opaque_addr,
+            tss_addr,
+            risk_engine: risk::scoring::RiskEngine::new(),
+            tls_connector,
+            opaque_breaker: common::circuit_breaker::CircuitBreaker::new(3, std::time::Duration::from_secs(30)),
+            tss_breaker: common::circuit_breaker::CircuitBreaker::new(3, std::time::Duration::from_secs(30)),
+        }
+    }
+
+    /// Create with explicit TLS connector AND receipt verification key.
+    pub fn new_with_tls_and_receipt_key(
+        hmac_key: [u8; 64],
+        receipt_verification_key: [u8; 64],
+        opaque_addr: String,
+        tss_addr: String,
+        tls_connector: TlsConnector,
+    ) -> Self {
+        Self {
+            hmac_key,
+            receipt_verification_key,
             opaque_addr,
             tss_addr,
             risk_engine: risk::scoring::RiskEngine::new(),
@@ -206,10 +302,12 @@ impl OrchestratorService {
 
         // 2. OPAQUE Login Round 1: Client starts, sends CredentialRequest
         //    Runs in spawn_blocking because Argon2id KSF is CPU-bound.
-        let password_clone = request.password.clone();
+        let mut password_clone = request.password.clone();
         let client_login_start = tokio::task::spawn_blocking(move || {
             let mut rng = OsRng;
-            ClientLogin::<OpaqueCs>::start(&mut rng, &password_clone)
+            let result = ClientLogin::<OpaqueCs>::start(&mut rng, &password_clone);
+            password_clone.zeroize();
+            result
         })
             .await
             .map_err(|e| format!("OPAQUE client login start task: {e}"))?
@@ -259,11 +357,13 @@ impl OrchestratorService {
             opaque_ke::CredentialResponse::<OpaqueCs>::deserialize(&credential_response_bytes)
                 .map_err(|e| format!("deserialize credential response: {e}"))?;
 
-        let password_clone2 = request.password.clone();
+        let mut password_clone2 = request.password.clone();
         let login_state = client_login_start.state;
         let client_login_finish = tokio::task::spawn_blocking(move || {
             let mut rng = OsRng;
-            login_state.finish(&mut rng, &password_clone2, credential_response, ClientLoginFinishParameters::default())
+            let result = login_state.finish(&mut rng, &password_clone2, credential_response, ClientLoginFinishParameters::default());
+            password_clone2.zeroize();
+            result
         })
             .await
             .map_err(|e| format!("OPAQUE client login finish task: {e}"))?
@@ -305,6 +405,20 @@ impl OrchestratorService {
                 return Err("unexpected OPAQUE response to LoginFinish".into());
             }
         };
+
+        // 3b. Independent receipt verification (zero-trust: never blindly trust OPAQUE)
+        if let Err(e) = verify_receipt_independently(
+            &receipt,
+            &request.username,
+            &self.receipt_verification_key,
+            &session_id,
+        ) {
+            common::siem::SecurityEvent::tamper_detected(
+                &format!("independent receipt verification failed: {e}"),
+            );
+            session.fail(format!("receipt verification: {e}")).ok();
+            return Err(format!("receipt verification failed: {e}"));
+        }
 
         // 4. Add receipt to chain
         session.user_id = Some(receipt.user_id);

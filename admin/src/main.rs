@@ -155,6 +155,7 @@ async fn main() {
         session_tracker: Arc::new(common::session_limits::SessionTracker::new(
             common::config::SecurityConfig::default().max_concurrent_sessions_per_user,
         )),
+        revocation_list: RwLock::new(admin::routes::RevocationList::new()),
     });
 
     // Start the key rotation monitor in the background
@@ -174,16 +175,87 @@ async fn main() {
     let default_bind = if is_production { "127.0.0.1" } else { "0.0.0.0" };
     let bind_addr = std::env::var("ADMIN_BIND_ADDR").unwrap_or_else(|_| default_bind.to_string());
 
-    if bind_addr == "0.0.0.0" {
-        tracing::warn!("WARNING: Binding to all interfaces (0.0.0.0). Use a TLS-terminating reverse proxy in production.");
+    // TLS configuration check
+    let tls_cert = std::env::var("ADMIN_TLS_CERT").ok();
+    let tls_key = std::env::var("ADMIN_TLS_KEY").ok();
+    let require_tls = std::env::var("REQUIRE_TLS")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    let has_tls = tls_cert.is_some() && tls_key.is_some();
+
+    // If REQUIRE_TLS is set but no cert/key provided, refuse to start
+    if require_tls && !has_tls {
+        tracing::error!(
+            "REQUIRE_TLS=true but ADMIN_TLS_CERT and/or ADMIN_TLS_KEY not set. \
+             Refusing to start without TLS configuration."
+        );
+        std::process::exit(1);
+    }
+
+    if bind_addr == "0.0.0.0" && !has_tls {
         if is_production {
-            tracing::warn!("MILNET_PRODUCTION is set but binding to 0.0.0.0 — set ADMIN_BIND_ADDR=127.0.0.1 for loopback-only.");
+            tracing::error!(
+                "SECURITY: Binding to all interfaces (0.0.0.0) without TLS in production mode. \
+                 Set ADMIN_TLS_CERT and ADMIN_TLS_KEY, or use ADMIN_BIND_ADDR=127.0.0.1 \
+                 behind a TLS-terminating reverse proxy."
+            );
+        } else {
+            tracing::warn!(
+                "WARNING: Binding to all interfaces (0.0.0.0) without TLS. \
+                 Use a TLS-terminating reverse proxy in production."
+            );
         }
+    } else if bind_addr == "127.0.0.1" && !has_tls {
+        tracing::warn!(
+            "Admin API running without TLS on loopback. \
+             Ensure a TLS-terminating reverse proxy is in front of this service."
+        );
+    }
+
+    // Add HSTS header middleware to all responses (signals to browsers/proxies
+    // that this service should only be accessed over HTTPS)
+    let app = app.layer(axum::middleware::from_fn(hsts_middleware));
+
+    if has_tls {
+        // TLS cert/key paths were provided — validate they exist and are readable
+        let cert_path = tls_cert.as_deref().unwrap();
+        let key_path = tls_key.as_deref().unwrap();
+
+        if !std::path::Path::new(cert_path).exists() {
+            tracing::error!("ADMIN_TLS_CERT path does not exist: {cert_path}");
+            std::process::exit(1);
+        }
+        if !std::path::Path::new(key_path).exists() {
+            tracing::error!("ADMIN_TLS_KEY path does not exist: {key_path}");
+            std::process::exit(1);
+        }
+
+        tracing::info!(
+            "TLS certificate and key configured (cert={cert_path}, key={key_path}). \
+             Use a TLS-terminating reverse proxy (e.g., nginx, envoy) pointed at these \
+             files, or deploy with axum-server-rustls for native TLS termination."
+        );
     }
 
     let listener = tokio::net::TcpListener::bind(format!("{bind_addr}:{port}"))
         .await
         .unwrap();
-    tracing::info!("Admin API listening on {bind_addr}:{port}");
+    tracing::info!(
+        "Admin API listening on {bind_addr}:{port} (TLS={})",
+        if has_tls { "configured" } else { "disabled" }
+    );
     axum::serve(listener, app).await.unwrap();
+}
+
+/// Middleware that adds Strict-Transport-Security header to all responses.
+async fn hsts_middleware(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        axum::http::header::STRICT_TRANSPORT_SECURITY,
+        axum::http::HeaderValue::from_static("max-age=63072000; includeSubDomains; preload"),
+    );
+    response
 }

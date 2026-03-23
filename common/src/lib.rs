@@ -33,3 +33,4 @@ pub mod circuit_breaker;
 pub mod siem;
 pub mod key_rotation;
 pub mod retry;
+pub mod health;
