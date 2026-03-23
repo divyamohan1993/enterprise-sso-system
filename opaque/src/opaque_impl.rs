@@ -5,16 +5,16 @@
 
 use opaque_ke::CipherSuite;
 
-/// OPAQUE cipher suite: Ristretto255 + TripleDH + Identity KSF.
+/// OPAQUE cipher suite: Ristretto255 + TripleDH + Argon2id KSF.
 ///
-/// Identity KSF is used because the key stretching is performed client-side
-/// (the orchestrator acting as the OPAQUE client can apply Argon2 if desired
-/// before feeding the password to OPAQUE). The OPRF already prevents the
-/// server from learning the password.
+/// Argon2id is used as the key stretching function to provide memory-hard
+/// password hashing within the OPAQUE protocol itself (RFC 9106).
+/// This prevents offline brute-force attacks even if the server's OPRF
+/// seed is compromised.
 pub struct OpaqueCs;
 
 impl CipherSuite for OpaqueCs {
     type OprfCs = opaque_ke::Ristretto255;
     type KeyExchange = opaque_ke::TripleDh<opaque_ke::Ristretto255, sha2::Sha512>;
-    type Ksf = opaque_ke::ksf::Identity;
+    type Ksf = argon2::Argon2<'static>;
 }

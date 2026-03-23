@@ -24,9 +24,14 @@
 //! | `audit/src/log.rs`        | SHA-512 (chain) | PASS    | Upgraded from SHA-256                  |
 //! | `kt/src/merkle.rs`        | SHA-512         | PASS    | Upgraded from SHA3-256                 |
 //! | `crypto/src/entropy.rs`   | SHA-512         | PASS    | Already SHA-512 for combining          |
-//! | `crypto/src/dpop.rs`      | HMAC-SHA512     | PASS    | Already HMAC-SHA512 for proofs         |
+//! | `crypto/src/dpop.rs`      | ML-DSA-65       | PASS    | Upgraded from ECDSA P-256 to ML-DSA-65 for proofs |
 //! | `crypto/src/attest.rs`    | HMAC-SHA512     | PASS    | Manifest authentication                |
 //! | `common/src/duress.rs`    | HKDF-SHA512     | PASS    | v2 format; v1 upgraded to SHA-512      |
+//! | `crypto/src/receipts.rs`  | ML-DSA-65       | PASS    | Upgraded from Ed25519 to ML-DSA-65     |
+//! | `sso-protocol/src/tokens.rs` | ML-DSA-87   | PASS    | Upgraded from RSA-3072/RS256 to ML-DSA-87 |
+//! | `shard/src/protocol.rs`  | HKDF-SHA512     | PASS    | Upgraded from HKDF-SHA256              |
+//! | `crypto/src/puzzle.rs`   | SHA-512         | PASS    | Upgraded from SHA-256                  |
+//! | `admin/src/routes.rs`    | HMAC-SHA512     | PASS    | Upgraded from HMAC-SHA256              |
 //! | `crypto/src/pq_sign.rs`   | ML-DSA-65       | PASS    | Post-quantum signature scheme          |
 //! | `crypto/src/sealed.rs`    | AES-256-GCM     | PASS    | Symmetric encryption                   |
 //!

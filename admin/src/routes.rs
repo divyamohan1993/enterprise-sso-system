@@ -195,20 +195,20 @@ fn verify_user_token(token: &str) -> bool {
     let payload = format!("{}:{}", parts[0], parts[1]);
 
     use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-    type HmacSha256 = Hmac<Sha256>;
+    use sha2::Sha512;
+    type HmacSha512 = Hmac<Sha512>;
 
     // Derive HMAC key from master KEK — prevents forging tokens without KEK
     let master_kek = common::sealed_keys::load_master_kek();
     let derived = {
         use hkdf::Hkdf;
-        let hk = Hkdf::<Sha256>::new(Some(b"MILNET-ADMIN-TOKEN-v2"), &master_kek);
+        let hk = Hkdf::<Sha512>::new(Some(b"MILNET-ADMIN-TOKEN-v3"), &master_kek);
         let mut okm = [0u8; 32];
         hk.expand(b"admin-token-hmac", &mut okm)
             .expect("HKDF expand");
         okm
     };
-    let mut mac = HmacSha256::new_from_slice(&derived).expect("HMAC key");
+    let mut mac = HmacSha512::new_from_slice(&derived).expect("HMAC key");
     mac.update(payload.as_bytes());
     let expected = hex(&mac.finalize().into_bytes());
 
@@ -710,7 +710,10 @@ async fn register_user(
     }))
 }
 
-async fn list_users(State(state): State<Arc<AppState>>) -> Json<Vec<String>> {
+async fn list_users(State(state): State<Arc<AppState>>, request: Request) -> Result<Json<Vec<String>>, StatusCode> {
+    let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(4);
+    check_tier(caller_tier, 2)?;
+
     let rows: Vec<(String,)> = sqlx::query_as(
         "SELECT username FROM users WHERE is_active = true"
     )
@@ -718,7 +721,7 @@ async fn list_users(State(state): State<Arc<AppState>>) -> Json<Vec<String>> {
     .await
     .unwrap_or_default();
 
-    Json(rows.into_iter().map(|r| r.0).collect())
+    Ok(Json(rows.into_iter().map(|r| r.0).collect()))
 }
 
 // ---------------------------------------------------------------------------
@@ -761,7 +764,10 @@ async fn register_portal(
     }))
 }
 
-async fn list_portals(State(state): State<Arc<AppState>>) -> Json<Vec<PortalResponse>> {
+async fn list_portals(State(state): State<Arc<AppState>>, request: Request) -> Result<Json<Vec<PortalResponse>>, StatusCode> {
+    let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(4);
+    check_tier(caller_tier, 2)?;
+
     let rows: Vec<(Uuid, String, String, i32, i32, bool)> = sqlx::query_as(
         "SELECT id, name, callback_url, required_tier, required_scope, is_active FROM portals WHERE is_active = true"
     )
@@ -778,7 +784,7 @@ async fn list_portals(State(state): State<Arc<AppState>>) -> Json<Vec<PortalResp
         is_active: r.5,
     }).collect();
 
-    Json(portals)
+    Ok(Json(portals))
 }
 
 async fn delete_portal(
@@ -1005,8 +1011,8 @@ async fn auth_login(
             // For the admin API we issue a simple HMAC-based token rather than
             // running the full FROST threshold signing ceremony.
             use hmac::{Hmac, Mac};
-            use sha2::Sha256;
-            type HmacSha256 = Hmac<Sha256>;
+            use sha2::Sha512;
+            type HmacSha512 = Hmac<Sha512>;
 
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1017,13 +1023,13 @@ async fn auth_login(
             let master_kek = common::sealed_keys::load_master_kek();
             let derived = {
                 use hkdf::Hkdf;
-                let hk = Hkdf::<Sha256>::new(Some(b"MILNET-ADMIN-TOKEN-v2"), &master_kek);
+                let hk = Hkdf::<Sha512>::new(Some(b"MILNET-ADMIN-TOKEN-v3"), &master_kek);
                 let mut okm = [0u8; 32];
                 hk.expand(b"admin-token-hmac", &mut okm)
                     .expect("HKDF expand");
                 okm
             };
-            let mut mac = HmacSha256::new_from_slice(&derived)
+            let mut mac = HmacSha512::new_from_slice(&derived)
                 .expect("HMAC key");
             mac.update(payload.as_bytes());
             let sig = hex(&mac.finalize().into_bytes());
@@ -1106,20 +1112,20 @@ async fn auth_verify(Json(req): Json<VerifyRequest>) -> Json<VerifyResponse> {
     let payload = format!("{}:{}", parts[0], parts[1]);
 
     use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-    type HmacSha256 = Hmac<Sha256>;
+    use sha2::Sha512;
+    type HmacSha512 = Hmac<Sha512>;
 
     // Derive HMAC key from master KEK — prevents forging tokens without KEK
     let master_kek = common::sealed_keys::load_master_kek();
     let derived = {
         use hkdf::Hkdf;
-        let hk = Hkdf::<Sha256>::new(Some(b"MILNET-ADMIN-TOKEN-v2"), &master_kek);
+        let hk = Hkdf::<Sha512>::new(Some(b"MILNET-ADMIN-TOKEN-v3"), &master_kek);
         let mut okm = [0u8; 32];
         hk.expand(b"admin-token-hmac", &mut okm)
             .expect("HKDF expand");
         okm
     };
-    let mut mac = HmacSha256::new_from_slice(&derived).expect("HMAC key");
+    let mut mac = HmacSha512::new_from_slice(&derived).expect("HMAC key");
     mac.update(payload.as_bytes());
     let expected = hex(&mac.finalize().into_bytes());
 
@@ -1532,8 +1538,14 @@ async fn oauth_google_start(
 
     // Validate the MILNET client_id
     let clients = state.oauth_clients.read().await;
-    if clients.get(&params.client_id).is_none() {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid_client"}))).into_response();
+    let client = match clients.get(&params.client_id) {
+        Some(c) => c,
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid_client"}))).into_response(),
+    };
+
+    // H10: Validate redirect_uri against client registry to prevent open redirect
+    if !client.redirect_uris.iter().any(|u| u == &params.redirect_uri) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid_redirect_uri"}))).into_response();
     }
     drop(clients);
 

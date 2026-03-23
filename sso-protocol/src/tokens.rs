@@ -1,14 +1,7 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use rsa::pkcs1v15::SigningKey;
-use rsa::signature::{SignatureEncoding, SignerMut};
-use rsa::traits::PublicKeyParts;
-use rsa::{RsaPrivateKey, RsaPublicKey};
+use crypto::pq_sign::{PqSigningKey, PqVerifyingKey, generate_pq_keypair, pq_sign_raw, pq_verify_raw};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 use uuid::Uuid;
-
-/// RSA key size for OIDC signing (3072-bit per CNSA 2.0 requirements).
-const RSA_KEY_BITS: usize = 3072;
 
 #[derive(Serialize, Deserialize)]
 pub struct IdTokenClaims {
@@ -31,27 +24,27 @@ pub struct TokenResponse {
     pub scope: String,
 }
 
-/// Wrapper around an RSA private key used for signing OIDC ID tokens with RS256.
+/// Wrapper around an ML-DSA-87 keypair used for signing OIDC ID tokens.
 pub struct OidcSigningKey {
-    private_key: RsaPrivateKey,
+    signing_key: PqSigningKey,
+    verifying_key: PqVerifyingKey,
     kid: String,
 }
 
 impl OidcSigningKey {
-    /// Generate a new RSA-3072 signing key for OIDC.
+    /// Generate a new ML-DSA-87 signing key for OIDC.
     pub fn generate() -> Self {
-        let mut rng = rand::thread_rng();
-        let private_key =
-            RsaPrivateKey::new(&mut rng, RSA_KEY_BITS).expect("RSA key generation failed");
+        let (signing_key, verifying_key) = generate_pq_keypair();
         Self {
-            private_key,
-            kid: "milnet-rs256-v1".to_string(),
+            signing_key,
+            verifying_key,
+            kid: "milnet-mldsa87-v1".to_string(),
         }
     }
 
-    /// Return the public key for JWKS.
-    pub fn public_key(&self) -> &RsaPublicKey {
-        self.private_key.as_ref()
+    /// Return the verifying key for signature verification.
+    pub fn verifying_key(&self) -> &PqVerifyingKey {
+        &self.verifying_key
     }
 
     /// Key ID for JWK `kid` field.
@@ -61,23 +54,21 @@ impl OidcSigningKey {
 
     /// Build the JWKS JSON value for this key.
     pub fn jwks_json(&self) -> serde_json::Value {
-        let pub_key = self.public_key();
-        let n = URL_SAFE_NO_PAD.encode(pub_key.n().to_bytes_be());
-        let e = URL_SAFE_NO_PAD.encode(pub_key.e().to_bytes_be());
+        let vk_bytes = self.verifying_key.encode();
+        let vk_b64 = URL_SAFE_NO_PAD.encode(AsRef::<[u8]>::as_ref(&vk_bytes));
         serde_json::json!({
             "keys": [{
-                "kty": "RSA",
-                "alg": "RS256",
+                "kty": "ML-DSA",
+                "alg": "ML-DSA-87",
                 "use": "sig",
                 "kid": self.kid,
-                "n": n,
-                "e": e
+                "pub": vk_b64
             }]
         })
     }
 }
 
-/// Create an RS256-signed JWT (for the OIDC layer)
+/// Create an ML-DSA-87-signed JWT (for the OIDC layer)
 pub fn create_id_token(
     issuer: &str,
     user_id: &Uuid,
@@ -88,7 +79,7 @@ pub fn create_id_token(
     create_id_token_with_tier(issuer, user_id, client_id, nonce, signing_key, 2)
 }
 
-/// Create an RS256-signed JWT with an explicit tier claim
+/// Create an ML-DSA-87-signed JWT with an explicit tier claim
 pub fn create_id_token_with_tier(
     issuer: &str,
     user_id: &Uuid,
@@ -103,7 +94,7 @@ pub fn create_id_token_with_tier(
         .as_secs() as i64;
 
     let header = serde_json::json!({
-        "alg": "RS256",
+        "alg": "ML-DSA-87",
         "typ": "JWT",
         "kid": signing_key.kid()
     });
@@ -122,25 +113,14 @@ pub fn create_id_token_with_tier(
     let claims_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
     let signing_input = format!("{header_b64}.{claims_b64}");
 
-    // SECURITY: Add timing floor to mitigate RUSTSEC-2023-0071 (Marvin Attack).
-    // The `rsa` crate v0.9 has non-constant-time RSA operations.
-    // We add a minimum operation time to reduce timing side-channel signal.
-    let sign_start = std::time::Instant::now();
-    let mut signer = SigningKey::<Sha256>::new(signing_key.private_key.clone());
-    let signature = signer
-        .sign(signing_input.as_bytes());
-    let sign_elapsed = sign_start.elapsed();
-    let sign_floor = std::time::Duration::from_millis(50);
-    if sign_elapsed < sign_floor {
-        std::thread::sleep(sign_floor - sign_elapsed);
-    }
-    let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_vec());
+    let signature = pq_sign_raw(&signing_key.signing_key, signing_input.as_bytes());
+    let sig_b64 = URL_SAFE_NO_PAD.encode(&signature);
 
     format!("{signing_input}.{sig_b64}")
 }
 
-/// Verify an RS256-signed JWT using the RSA public key.
-pub fn verify_id_token(token: &str, public_key: &RsaPublicKey) -> Result<IdTokenClaims, String> {
+/// Verify an ML-DSA-87-signed JWT using the verifying key.
+pub fn verify_id_token(token: &str, verifying_key: &PqVerifyingKey) -> Result<IdTokenClaims, String> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
         return Err("invalid JWT: expected 3 parts".into());
@@ -151,20 +131,9 @@ pub fn verify_id_token(token: &str, public_key: &RsaPublicKey) -> Result<IdToken
         .decode(parts[2])
         .map_err(|e| format!("base64 decode sig: {e}"))?;
 
-    use rsa::pkcs1v15::VerifyingKey;
-    use rsa::signature::Verifier;
-    let verifying_key = VerifyingKey::<Sha256>::new(public_key.clone());
-    let signature = rsa::pkcs1v15::Signature::try_from(sig_bytes.as_slice())
-        .map_err(|e| format!("invalid signature: {e}"))?;
-    // SECURITY: Timing floor for RSA verification (RUSTSEC-2023-0071 mitigation)
-    let verify_start = std::time::Instant::now();
-    let verify_result = verifying_key.verify(signing_input.as_bytes(), &signature);
-    let verify_elapsed = verify_start.elapsed();
-    let verify_floor = std::time::Duration::from_millis(50);
-    if verify_elapsed < verify_floor {
-        std::thread::sleep(verify_floor - verify_elapsed);
+    if !pq_verify_raw(verifying_key, signing_input.as_bytes(), &sig_bytes) {
+        return Err("ML-DSA-87 verification failed".into());
     }
-    verify_result.map_err(|e| format!("RS256 verification failed: {e}"))?;
 
     let claims_bytes = URL_SAFE_NO_PAD
         .decode(parts[1])

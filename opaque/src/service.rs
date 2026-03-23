@@ -28,20 +28,19 @@ use crate::store::CredentialStore;
 /// The receipt signing key holder. This struct owns the key material and
 /// provides access only within this service.
 ///
-/// TODO: Migrate from HMAC-SHA512 to Ed25519 asymmetric signing once
-/// `crypto::receipts::sign_receipt_asymmetric` is available (another agent is
-/// adding it). When that lands:
-///   1. Generate an Ed25519 keypair at startup (or load from HSM/sealed storage).
-///   2. Sign receipts with the Ed25519 private key via `sign_receipt_asymmetric`.
-///   3. Export the Ed25519 verifying (public) key so the TSS can verify receipts
-///      without needing the private key.
+/// TODO: Migrate from HMAC-SHA512 to ML-DSA-65 asymmetric signing using
+/// `crypto::receipts::sign_receipt_asymmetric` (now available). When ready:
+///   1. Generate an ML-DSA-65 keypair at startup (or load from HSM/sealed storage).
+///   2. Sign receipts with the ML-DSA-65 seed via `sign_receipt_asymmetric`.
+///   3. Export the ML-DSA-65 verifying key (1952 bytes) so the TSS can verify
+///      receipts without needing the private key.
 ///   4. Remove the symmetric HMAC signing path.
 pub struct ReceiptSigner {
-    /// HMAC-SHA512 signing key (symmetric, to be replaced by Ed25519).
+    /// HMAC-SHA512 signing key (symmetric, to be replaced by ML-DSA-65).
     signing_key: [u8; 64],
-    // TODO: Add Ed25519 keypair field:
-    // ed25519_signing_key: ed25519_dalek::SigningKey,
-    // ed25519_verifying_key: ed25519_dalek::VerifyingKey,
+    // TODO: Add ML-DSA-65 keypair field:
+    // mldsa65_seed: [u8; 32],
+    // mldsa65_verifying_key: Vec<u8>,
 }
 
 impl ReceiptSigner {
@@ -52,14 +51,14 @@ impl ReceiptSigner {
     }
 
     /// Sign a receipt using the current signing scheme (HMAC-SHA512).
-    /// TODO: Replace with Ed25519 once available.
+    /// TODO: Replace with ML-DSA-65 once migration is complete.
     pub fn sign(&self, receipt: &mut Receipt) {
         sign_receipt(receipt, &self.signing_key);
     }
 
     /// Return the signing key for HMAC verification.
-    /// TODO: Replace with `pub fn verifying_key(&self) -> &[u8; 32]` that
-    /// returns the Ed25519 public key for asymmetric verification by the TSS.
+    /// TODO: Replace with `pub fn verifying_key(&self) -> &[u8]` that
+    /// returns the ML-DSA-65 verifying key for asymmetric verification by the TSS.
     pub fn verification_key(&self) -> &[u8; 64] {
         &self.signing_key
     }

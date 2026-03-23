@@ -4,7 +4,7 @@
 //! process their authentication request.
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha512};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;
@@ -140,7 +140,7 @@ pub fn generate_challenge(difficulty: u8) -> PuzzleChallenge {
     }
 }
 
-/// Check whether `SHA-256(nonce || solution)` has at least `difficulty`
+/// Check whether `SHA-512(nonce || solution)` has at least `difficulty`
 /// leading zero bits, the challenge has not expired (10s TTL), and the
 /// nonce has not already been consumed (replay protection).
 pub fn verify_solution(challenge: &PuzzleChallenge, solution: &[u8; 32]) -> bool {
@@ -179,7 +179,7 @@ pub fn verify_solution(challenge: &PuzzleChallenge, solution: &[u8; 32]) -> bool
 
 /// Check the hash without expiration (internal helper).
 fn has_leading_zero_bits(challenge: &PuzzleChallenge, solution: &[u8; 32]) -> bool {
-    let mut hasher = Sha256::new();
+    let mut hasher = Sha512::new();
     hasher.update(challenge.nonce);
     hasher.update(solution);
     let hash = hasher.finalize();

@@ -15,6 +15,14 @@ use crate::protocol::ShardProtocol;
 /// Maximum SHARD frame payload size (16 MiB). Prevents allocation bombs.
 const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
 
+/// Default timeout for SHARD transport recv operations (120 seconds).
+/// Set higher to accommodate Argon2id KSF and sequential request processing
+/// under concurrent load. Still prevents indefinite blocking (H9).
+const SHARD_RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Default timeout for SHARD transport send operations (30 seconds).
+const SHARD_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A TCP transport that sends and receives SHARD-authenticated messages
 /// using 4-byte big-endian length-prefixed framing.
 pub struct ShardTransport {
@@ -39,6 +47,12 @@ impl ShardTransport {
     /// Create an authenticated SHARD message from `payload`, frame it with a
     /// 4-byte big-endian length prefix, and write it to the TCP stream.
     pub async fn send(&mut self, payload: &[u8]) -> Result<(), MilnetError> {
+        tokio::time::timeout(SHARD_SEND_TIMEOUT, self.send_inner(payload))
+            .await
+            .map_err(|_| MilnetError::Shard("SHARD send timed out after 30s".into()))?
+    }
+
+    async fn send_inner(&mut self, payload: &[u8]) -> Result<(), MilnetError> {
         let msg = self.protocol.create_message(payload)?;
         let len = msg.len() as u32;
         self.writer
@@ -59,6 +73,12 @@ impl ShardTransport {
     /// Read a length-prefixed frame from the TCP stream, verify the SHARD
     /// authentication, and return `(sender_module, payload)`.
     pub async fn recv(&mut self) -> Result<(ModuleId, Vec<u8>), MilnetError> {
+        tokio::time::timeout(SHARD_RECV_TIMEOUT, self.recv_inner())
+            .await
+            .map_err(|_| MilnetError::Shard("SHARD recv timed out after 30s".into()))?
+    }
+
+    async fn recv_inner(&mut self) -> Result<(ModuleId, Vec<u8>), MilnetError> {
         let mut len_buf = [0u8; 4];
         self.reader
             .read_exact(&mut len_buf)

@@ -217,6 +217,19 @@ impl PendingGoogleStore {
     }
 
     pub fn insert(&mut self, state: String, pending: PendingGoogleAuth) {
+        const MAX_PENDING_ENTRIES: usize = 10_000;
+
+        // Capacity bound: reject new entries if at limit (after cleanup)
+        if self.map.len() >= MAX_PENDING_ENTRIES {
+            self.cleanup_expired(pending.created_at);
+        }
+        if self.map.len() >= MAX_PENDING_ENTRIES {
+            tracing::warn!("PendingGoogleStore at capacity ({MAX_PENDING_ENTRIES}), dropping oldest");
+            // Evict oldest entry
+            if let Some(oldest_key) = self.map.iter().min_by_key(|(_, v)| v.created_at).map(|(k, _)| k.clone()) {
+                self.map.remove(&oldest_key);
+            }
+        }
         self.map.insert(state, pending);
     }
 

@@ -175,6 +175,29 @@ pub fn verify_token_with_revocation(
     verify_token(token, public_key_package, pq_verifying_key)
 }
 
+/// Full token verification: revocation + DPoP key binding + signatures.
+///
+/// This is the recommended entry point for production verification. It
+/// performs all checks in optimal order:
+/// 1. Fail fast: check revocation list (O(1) lookup)
+/// 2. Full signature + DPoP verification (including key binding if provided)
+pub fn verify_token_full(
+    token: &Token,
+    public_key_package: &PublicKeyPackage,
+    pq_verifying_key: &PqVerifyingKey,
+    revocation_list: &RevocationList,
+    client_dpop_key: Option<&[u8]>,
+) -> Result<TokenClaims, MilnetError> {
+    // 1. Fail fast: check revocation
+    if revocation_list.is_revoked(&token.claims.token_id) {
+        return Err(MilnetError::CryptoVerification(
+            "token has been revoked".into(),
+        ));
+    }
+    // 2. Full signature + DPoP verification
+    verify_token_inner(token, public_key_package, pq_verifying_key, client_dpop_key)
+}
+
 /// Verify a token's signature, claims, AND DPoP channel binding.
 ///
 /// This ensures the token is bound to the client that originally requested it,

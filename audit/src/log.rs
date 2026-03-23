@@ -81,10 +81,24 @@ impl AuditLog {
     }
 
     pub fn verify_chain(&self) -> bool {
+        self.verify_chain_with_key(None)
+    }
+
+    /// Verify chain integrity: hash linkage AND (optionally) ML-DSA-65 signatures.
+    pub fn verify_chain_with_key(&self, verifying_key: Option<&crypto::pq_sign::PqVerifyingKey>) -> bool {
         let mut expected_prev = [0u8; 64];
         for entry in &self.entries {
             if entry.prev_hash != expected_prev {
                 return false;
+            }
+            // Verify signature if present and key provided
+            if let Some(vk) = verifying_key {
+                if !entry.signature.is_empty() {
+                    let hash = hash_entry(entry);
+                    if !crypto::pq_sign::pq_verify_raw(vk, &hash, &entry.signature) {
+                        return false;
+                    }
+                }
             }
             expected_prev = hash_entry(entry);
         }
@@ -139,10 +153,16 @@ impl AuditLog {
     }
 
     /// Append a pre-built entry directly (used by BFT replication layer).
-    pub fn append_raw(&mut self, entry: AuditEntry) {
+    /// Validates hash chain linkage before accepting.
+    pub fn append_raw(&mut self, entry: AuditEntry) -> Result<(), String> {
+        // Validate hash chain linkage
+        if entry.prev_hash != self.last_hash {
+            return Err("append_raw: prev_hash does not match current chain head".into());
+        }
         self.last_hash = hash_entry(&entry);
         self.entries.push(entry);
         self.periodic_verify();
+        Ok(())
     }
 
     /// Run `verify_chain()` every `VERIFY_CHAIN_INTERVAL` entries.

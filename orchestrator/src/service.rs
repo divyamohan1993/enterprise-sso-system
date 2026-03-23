@@ -67,7 +67,18 @@ impl OrchestratorService {
                 // We derive a deterministic user ID from the username so that
                 // the counter tracks attempts even before OPAQUE confirms the
                 // user exists (preventing pre-auth brute-force).
-                let user_id = Uuid::new_v4(); // deterministic tracking not available without v5 feature
+                // Derive deterministic user ID from username for rate limiting
+                // This tracks attempts even before OPAQUE confirms user exists
+                let user_id = {
+                    use sha2::{Digest, Sha256};
+                    let hash = Sha256::digest(request.username.as_bytes());
+                    let mut bytes = [0u8; 16];
+                    bytes.copy_from_slice(&hash[..16]);
+                    // Set UUID v4 variant bits for compatibility
+                    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+                    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+                    Uuid::from_bytes(bytes)
+                };
                 self.risk_engine.record_failed_attempt(&user_id);
 
                 OrchestratorResponse {
@@ -94,8 +105,15 @@ impl OrchestratorService {
         let mut session = CeremonySession::new(session_id);
 
         // 2. OPAQUE Login Round 1: Client starts, sends CredentialRequest
-        let mut rng = OsRng;
-        let client_login_start = ClientLogin::<OpaqueCs>::start(&mut rng, &request.password)
+        //    Runs in spawn_blocking because Argon2id KSF is CPU-bound and
+        //    would block the async executor under concurrent load.
+        let password_clone = request.password.clone();
+        let client_login_start = tokio::task::spawn_blocking(move || {
+            let mut rng = OsRng;
+            ClientLogin::<OpaqueCs>::start(&mut rng, &password_clone)
+        })
+            .await
+            .map_err(|e| format!("OPAQUE client login start task: {e}"))?
             .map_err(|e| format!("OPAQUE client login start: {e}"))?;
 
         let credential_request_bytes = client_login_start.message.serialize().to_vec();
@@ -139,18 +157,24 @@ impl OrchestratorService {
         };
 
         // 3. OPAQUE Login Round 2: Client finishes, sends CredentialFinalization
+        //    Runs in spawn_blocking because Argon2id KSF is CPU-bound.
         let credential_response =
             opaque_ke::CredentialResponse::<OpaqueCs>::deserialize(&credential_response_bytes)
                 .map_err(|e| format!("deserialize credential response: {e}"))?;
 
-        let client_login_finish = client_login_start
-            .state
-            .finish(
+        let password_clone2 = request.password.clone();
+        let login_state = client_login_start.state;
+        let client_login_finish = tokio::task::spawn_blocking(move || {
+            let mut rng = OsRng;
+            login_state.finish(
                 &mut rng,
-                &request.password,
+                &password_clone2,
                 credential_response,
                 ClientLoginFinishParameters::default(),
             )
+        })
+            .await
+            .map_err(|e| format!("OPAQUE client login finish task: {e}"))?
             .map_err(|e| {
                 session.fail(format!("OPAQUE login finish: {e}")).ok();
                 format!("OPAQUE client login finish: {e}")
@@ -228,6 +252,11 @@ impl OrchestratorService {
         // Use SecurityConfig for tier-based token lifetimes (spec Section 5)
         let security_config = common::config::SecurityConfig::default();
         let tier = if request.tier == 0 { 2 } else { request.tier };
+        // H4: Validate tier is in valid range [1-4]
+        if tier > 4 {
+            return Err("invalid tier: must be 1-4".into());
+        }
+        // TODO: Cross-reference with device registry to validate claimed tier
         let token_lifetime_us = security_config.token_lifetime_for_tier(tier) as i64 * 1_000_000;
 
         // Generate a cryptographically random token_id for revocation support

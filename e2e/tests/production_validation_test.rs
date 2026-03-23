@@ -224,8 +224,9 @@ async fn boot_orchestrator(opaque_addr: String, tss_addr: String) -> String {
         .expect("Orchestrator local_addr")
         .to_string();
 
-    let service =
-        OrchestratorService::new(SHARD_HMAC_KEY, opaque_addr, tss_addr);
+    let service = std::sync::Arc::new(
+        OrchestratorService::new(SHARD_HMAC_KEY, opaque_addr, tss_addr),
+    );
 
     tokio::spawn(async move {
         loop {
@@ -233,19 +234,22 @@ async fn boot_orchestrator(opaque_addr: String, tss_addr: String) -> String {
                 Ok(t) => t,
                 Err(_) => continue,
             };
-            let (_sender, req_bytes) = match transport.recv().await {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            let request: orchestrator::messages::OrchestratorRequest =
-                match postcard::from_bytes(&req_bytes) {
+            let svc = std::sync::Arc::clone(&service);
+            tokio::spawn(async move {
+                let (_sender, req_bytes) = match transport.recv().await {
                     Ok(r) => r,
-                    Err(_) => continue,
+                    Err(_) => return,
                 };
-            let response = service.process_auth(&request).await;
-            let resp_bytes =
-                postcard::to_allocvec(&response).expect("serialize Orchestrator response");
-            let _ = transport.send(&resp_bytes).await;
+                let request: orchestrator::messages::OrchestratorRequest =
+                    match postcard::from_bytes(&req_bytes) {
+                        Ok(r) => r,
+                        Err(_) => return,
+                    };
+                let response = svc.process_auth(&request).await;
+                let resp_bytes =
+                    postcard::to_allocvec(&response).expect("serialize Orchestrator response");
+                let _ = transport.send(&resp_bytes).await;
+            });
         }
     });
 
@@ -388,7 +392,7 @@ async fn test_complete_tier2_auth_flow() {
     assert_eq!(token.header.tier, 2);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_multiple_users_concurrent_auth() {
     let mut store = CredentialStore::new();
     let mut user_ids = Vec::new();

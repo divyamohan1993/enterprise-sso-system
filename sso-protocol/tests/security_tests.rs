@@ -42,11 +42,12 @@ fn test_oidc_discovery_only_code_response_type() {
 }
 
 #[test]
-fn test_oidc_discovery_advertises_rs256() {
+fn test_oidc_discovery_advertises_mldsa87() {
     let config = OpenIdConfiguration::new("https://sso.mil");
-    assert!(config.id_token_signing_alg_values_supported.contains(&"RS256".to_string()));
-    // Must NOT advertise HS512 (symmetric)
+    assert!(config.id_token_signing_alg_values_supported.contains(&"ML-DSA-87".to_string()));
+    // Must NOT advertise HS512 (symmetric) or RS256 (legacy RSA)
     assert!(!config.id_token_signing_alg_values_supported.contains(&"HS512".to_string()));
+    assert!(!config.id_token_signing_alg_values_supported.contains(&"RS256".to_string()));
 }
 
 #[test]
@@ -63,23 +64,23 @@ fn test_jwt_signature_changes_with_different_key() {
 }
 
 #[test]
-fn test_rs256_token_verifiable_with_public_key() {
+fn test_mldsa87_token_verifiable_with_verifying_key() {
     let user_id = Uuid::new_v4();
     let key = OidcSigningKey::generate();
     let token = tokens::create_id_token("https://iss", &user_id, "c", None, &key);
-    // Must verify with the matching public key
-    let claims = tokens::verify_id_token(&token, key.public_key()).unwrap();
+    // Must verify with the matching verifying key
+    let claims = tokens::verify_id_token(&token, key.verifying_key()).unwrap();
     assert_eq!(claims.sub, user_id.to_string());
 }
 
 #[test]
-fn test_rs256_token_rejected_with_wrong_public_key() {
+fn test_mldsa87_token_rejected_with_wrong_verifying_key() {
     let user_id = Uuid::new_v4();
     let key1 = OidcSigningKey::generate();
     let key2 = OidcSigningKey::generate();
     let token = tokens::create_id_token("https://iss", &user_id, "c", None, &key1);
-    // Must NOT verify with a different key's public key
-    assert!(tokens::verify_id_token(&token, key2.public_key()).is_err());
+    // Must NOT verify with a different key's verifying key
+    assert!(tokens::verify_id_token(&token, key2.verifying_key()).is_err());
 }
 
 #[test]
@@ -118,7 +119,7 @@ fn test_jwt_tier_values_propagate() {
     let key = OidcSigningKey::generate();
     for tier in 1..=4u8 {
         let token = tokens::create_id_token_with_tier("https://iss", &user_id, "c", None, &key, tier);
-        let claims = tokens::verify_id_token(&token, key.public_key()).unwrap();
+        let claims = tokens::verify_id_token(&token, key.verifying_key()).unwrap();
         assert_eq!(claims.tier, tier, "tier {tier} should propagate into JWT claims");
     }
 }

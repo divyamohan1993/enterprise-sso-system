@@ -6,18 +6,25 @@
 //!
 //! CNSA 2.0 compliance: All hashing upgraded from SHA-256 to SHA-512.
 //! HMAC upgraded from HMAC-SHA256 to HMAC-SHA512.
+//! Asymmetric receipt signing upgraded from Ed25519 to ML-DSA-65 (FIPS 204).
 
-use ed25519_dalek::{
-    Signer as Ed25519Signer, Verifier as Ed25519Verifier,
-    SigningKey as Ed25519SigningKey, VerifyingKey as Ed25519VerifyingKey,
+use ml_dsa::{
+    signature::{Signer, Verifier},
+    EncodedVerifyingKey, KeyGen, MlDsa65, SigningKey, VerifyingKey,
 };
 use hmac::{Hmac, Mac};
 use common::domain;
 use common::types::Receipt;
 use sha2::Sha512;
 use std::time::{SystemTime, UNIX_EPOCH};
+use zeroize::Zeroize;
 
 type HmacSha512 = Hmac<Sha512>;
+
+/// Type aliases for ML-DSA-65 receipt key types.
+pub type ReceiptSigningKey = SigningKey<MlDsa65>;
+pub type ReceiptVerifyingKey = VerifyingKey<MlDsa65>;
+pub type ReceiptSignature = ml_dsa::Signature<MlDsa65>;
 
 /// Hash a receipt for chain linking (CNSA 2.0: SHA-512)
 pub fn hash_receipt(receipt: &Receipt) -> [u8; 64] {
@@ -174,16 +181,18 @@ impl ReceiptChain {
 }
 
 // ---------------------------------------------------------------------------
-// Asymmetric receipt signing (Ed25519)
+// Asymmetric receipt signing (ML-DSA-65, CNSA 2.0 compliant)
 // ---------------------------------------------------------------------------
 
-/// Generate an Ed25519 keypair for asymmetric receipt signing.
+/// Generate an ML-DSA-65 keypair for asymmetric receipt signing.
 ///
-/// Returns (signing_key, verifying_key) as the ed25519-dalek types.
-pub fn generate_receipt_keypair() -> (Ed25519SigningKey, Ed25519VerifyingKey) {
-    let sk = Ed25519SigningKey::generate(&mut rand::rngs::OsRng);
-    let vk = sk.verifying_key();
-    (sk, vk)
+/// Returns (signing_key, verifying_key) as ML-DSA-65 types.
+pub fn generate_receipt_keypair() -> (ReceiptSigningKey, ReceiptVerifyingKey) {
+    let mut seed = [0u8; 32];
+    getrandom::getrandom(&mut seed).expect("getrandom failed");
+    let kp = MlDsa65::from_seed(&seed.into());
+    seed.zeroize();
+    (kp.signing_key().clone(), kp.verifying_key().clone())
 }
 
 /// Serialize receipt fields (excluding signature) into a canonical byte
@@ -200,33 +209,33 @@ pub fn receipt_signing_data(receipt: &Receipt) -> Vec<u8> {
     data
 }
 
-/// Sign receipt data with an Ed25519 signing key.
+/// Sign receipt data with an ML-DSA-65 signing key.
 ///
-/// `signing_key` must be a 32-byte Ed25519 secret key.
-/// Returns the 64-byte Ed25519 signature.
+/// `signing_key` must be the encoded ML-DSA-65 signing key bytes.
+/// Returns the encoded ML-DSA-65 signature bytes.
 pub fn sign_receipt_asymmetric(signing_key: &[u8], data: &[u8]) -> Vec<u8> {
-    let sk_bytes: [u8; 32] = signing_key
+    // Reconstruct the signing key from a 32-byte seed
+    // ML-DSA-65 signing keys are 4032 bytes encoded, but we accept a 32-byte
+    // seed for ergonomic parity with the old Ed25519 API.
+    let seed: [u8; 32] = signing_key
         .try_into()
-        .expect("signing_key must be exactly 32 bytes");
-    let sk = Ed25519SigningKey::from_bytes(&sk_bytes);
-    let sig = sk.sign(data);
-    sig.to_vec()
+        .expect("signing_key must be exactly 32 bytes (seed)");
+    let sk = SigningKey::<MlDsa65>::from_seed(&seed.into());
+    let sig: ReceiptSignature = sk.sign(data);
+    sig.encode().to_vec()
 }
 
-/// Verify an Ed25519 signature over receipt data.
+/// Verify an ML-DSA-65 signature over receipt data.
 ///
-/// `verifying_key` must be a 32-byte Ed25519 public key.
-/// Uses constant-time signature verification (provided by ed25519-dalek).
+/// `verifying_key` must be the encoded ML-DSA-65 verifying key bytes (1952 bytes).
+/// Uses ML-DSA-65 signature verification (CNSA 2.0 compliant).
 pub fn verify_receipt_asymmetric(verifying_key: &[u8], data: &[u8], signature: &[u8]) -> bool {
-    let vk_bytes: [u8; 32] = match verifying_key.try_into() {
-        Ok(b) => b,
+    let vk_enc = match EncodedVerifyingKey::<MlDsa65>::try_from(verifying_key) {
+        Ok(enc) => enc,
         Err(_) => return false,
     };
-    let vk = match Ed25519VerifyingKey::from_bytes(&vk_bytes) {
-        Ok(k) => k,
-        Err(_) => return false,
-    };
-    let sig = match ed25519_dalek::Signature::from_slice(signature) {
+    let vk = VerifyingKey::<MlDsa65>::decode(&vk_enc);
+    let sig = match ReceiptSignature::try_from(signature) {
         Ok(s) => s,
         Err(_) => return false,
     };
@@ -236,45 +245,81 @@ pub fn verify_receipt_asymmetric(verifying_key: &[u8], data: &[u8], signature: &
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ml_dsa::signature::Keypair;
+
+    fn run_with_large_stack<F: FnOnce() + Send + 'static>(f: F) {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(f)
+            .expect("thread spawn failed")
+            .join()
+            .expect("thread panicked");
+    }
 
     #[test]
     fn test_generate_receipt_keypair() {
-        let (sk, vk) = generate_receipt_keypair();
-        let vk2 = sk.verifying_key();
-        assert_eq!(vk.as_bytes(), vk2.as_bytes());
+        run_with_large_stack(|| {
+            let (sk, vk) = generate_receipt_keypair();
+            let vk2 = sk.verifying_key();
+            assert_eq!(vk.encode(), vk2.encode());
+        });
     }
 
     #[test]
     fn test_sign_and_verify_asymmetric() {
-        let (sk, vk) = generate_receipt_keypair();
-        let data = b"receipt data to sign";
-        let sig = sign_receipt_asymmetric(sk.as_bytes(), data);
-        assert!(verify_receipt_asymmetric(vk.as_bytes(), data, &sig));
+        run_with_large_stack(|| {
+            // Use a seed for signing, and the encoded verifying key for verification
+            let mut seed = [0u8; 32];
+            getrandom::getrandom(&mut seed).expect("getrandom failed");
+            let kp = MlDsa65::from_seed(&seed.into());
+            let vk = kp.verifying_key();
+            let vk_bytes = vk.encode();
+
+            let data = b"receipt data to sign";
+            let sig = sign_receipt_asymmetric(&seed, data);
+            assert!(verify_receipt_asymmetric(vk_bytes.as_ref(), data, &sig));
+        });
     }
 
     #[test]
     fn test_asymmetric_wrong_key_rejected() {
-        let (sk, _vk) = generate_receipt_keypair();
-        let (_sk2, vk2) = generate_receipt_keypair();
-        let data = b"receipt data";
-        let sig = sign_receipt_asymmetric(sk.as_bytes(), data);
-        assert!(!verify_receipt_asymmetric(vk2.as_bytes(), data, &sig));
+        run_with_large_stack(|| {
+            let mut seed1 = [0u8; 32];
+            getrandom::getrandom(&mut seed1).expect("getrandom failed");
+            let mut seed2 = [0u8; 32];
+            getrandom::getrandom(&mut seed2).expect("getrandom failed");
+            let kp2 = MlDsa65::from_seed(&seed2.into());
+            let vk2_bytes = kp2.verifying_key().encode();
+
+            let data = b"receipt data";
+            let sig = sign_receipt_asymmetric(&seed1, data);
+            assert!(!verify_receipt_asymmetric(vk2_bytes.as_ref(), data, &sig));
+        });
     }
 
     #[test]
     fn test_asymmetric_tampered_data_rejected() {
-        let (sk, vk) = generate_receipt_keypair();
-        let data = b"original data";
-        let sig = sign_receipt_asymmetric(sk.as_bytes(), data);
-        assert!(!verify_receipt_asymmetric(vk.as_bytes(), b"tampered data", &sig));
+        run_with_large_stack(|| {
+            let mut seed = [0u8; 32];
+            getrandom::getrandom(&mut seed).expect("getrandom failed");
+            let kp = MlDsa65::from_seed(&seed.into());
+            let vk_bytes = kp.verifying_key().encode();
+
+            let data = b"original data";
+            let sig = sign_receipt_asymmetric(&seed, data);
+            assert!(!verify_receipt_asymmetric(vk_bytes.as_ref(), b"tampered data", &sig));
+        });
     }
 
     #[test]
     fn test_asymmetric_bad_signature_rejected() {
-        let (_sk, vk) = generate_receipt_keypair();
-        let data = b"some data";
-        let bad_sig = vec![0u8; 64];
-        assert!(!verify_receipt_asymmetric(vk.as_bytes(), data, &bad_sig));
+        run_with_large_stack(|| {
+            let (_sk, vk) = generate_receipt_keypair();
+            let vk_bytes = vk.encode();
+            let data = b"some data";
+            let bad_sig = vec![0u8; 64];
+            assert!(!verify_receipt_asymmetric(vk_bytes.as_ref(), data, &bad_sig));
+        });
     }
 
     #[test]

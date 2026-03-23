@@ -10,7 +10,7 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
-use sha2::{Sha256, Sha512};
+use sha2::Sha512;
 
 use common::domain::SHARD_AUTH;
 use common::error::MilnetError;
@@ -44,13 +44,13 @@ pub struct ShardProtocol {
     last_persisted_epoch: u64,
 }
 
-/// Derive an AES-256 encryption key from the HMAC key using HKDF-SHA256
+/// Derive an AES-256 encryption key from the HMAC key using HKDF-SHA512
 /// with domain separation.
 fn derive_encryption_key(hmac_key: &[u8; 64]) -> [u8; 32] {
-    let hk = Hkdf::<Sha256>::new(None, hmac_key);
+    let hk = Hkdf::<Sha512>::new(None, hmac_key);
     let mut okm = [0u8; 32];
     hk.expand(ENCRYPT_DOMAIN, &mut okm)
-        .expect("32 bytes is a valid HKDF-SHA256 output length");
+        .expect("32 bytes is a valid HKDF-SHA512 output length");
     okm
 }
 

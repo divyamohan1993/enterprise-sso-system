@@ -114,16 +114,20 @@ pub async fn store_key(pool: &PgPool, name: &str, key_bytes: &[u8], master_kek: 
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
-    let _ = sqlx::query(
+    match sqlx::query(
         "INSERT INTO key_material (key_name, key_bytes, created_at) VALUES ($1, $2, $3) ON CONFLICT (key_name) DO UPDATE SET key_bytes = $2, rotated_at = $3"
     )
     .bind(name)
     .bind(&bytes_to_store)
     .bind(now)
     .execute(pool)
-    .await;
-
-    true
+    .await {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::error!("CRITICAL: failed to store key material '{}': {}", name, e);
+            false
+        }
+    }
 }
 
 /// Load key material from PostgreSQL, decrypting if a master KEK is provided.
@@ -177,7 +181,9 @@ pub async fn load_or_generate_key_64(pool: &PgPool, name: &str, master_kek: Opti
         }
     }
     let key = generate_random_bytes_64();
-    let _ = store_key(pool, name, &key, master_kek).await;
+    if !store_key(pool, name, &key, master_kek).await {
+        tracing::error!("CRITICAL: failed to persist generated key '{}'", name);
+    }
     key
 }
 
@@ -190,6 +196,8 @@ pub async fn load_or_generate_key_32(pool: &PgPool, name: &str, master_kek: Opti
         }
     }
     let key = generate_random_bytes_32();
-    let _ = store_key(pool, name, &key, master_kek).await;
+    if !store_key(pool, name, &key, master_kek).await {
+        tracing::error!("CRITICAL: failed to persist generated key '{}'", name);
+    }
     key
 }

@@ -67,7 +67,7 @@ impl WitnessLog {
             }
         }
 
-        let checkpoints = load_checkpoints_from_file(&path);
+        let checkpoints = load_and_verify_checkpoints(&path);
         if !checkpoints.is_empty() {
             tracing::info!(
                 "WitnessLog: reloaded {} checkpoints from {:?}",
@@ -238,6 +238,35 @@ fn append_checkpoint_to_file(path: &Path, cp: &WitnessCheckpoint) -> std::io::Re
     file.write_all(&encoded)?;
     file.sync_data()?;
     Ok(())
+}
+
+/// Load checkpoints and verify sequence + signature continuity.
+fn load_and_verify_checkpoints(path: &Path) -> Vec<WitnessCheckpoint> {
+    let checkpoints = load_checkpoints_from_file(path);
+
+    // Verify sequence continuity
+    for (i, cp) in checkpoints.iter().enumerate() {
+        let expected_seq = i as u64;
+        if cp.sequence != expected_seq {
+            tracing::error!(
+                "WitnessLog: checkpoint sequence gap at index {}: expected {}, got {}",
+                i, expected_seq, cp.sequence
+            );
+            // Return only verified checkpoints up to the gap
+            return checkpoints[..i].to_vec();
+        }
+
+        // Verify timestamp ordering
+        if i > 0 && cp.timestamp < checkpoints[i - 1].timestamp {
+            tracing::error!(
+                "WitnessLog: checkpoint timestamp out of order at index {}",
+                i
+            );
+            return checkpoints[..i].to_vec();
+        }
+    }
+
+    checkpoints
 }
 
 /// Load all checkpoints from a length-prefixed postcard file.

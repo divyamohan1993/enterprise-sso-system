@@ -64,9 +64,9 @@ pub fn load_master_kek() -> [u8; 32] {
             }
             eprintln!("WARNING: MILNET_MASTER_KEK not set. Using deterministic dev KEK. NOT FOR PRODUCTION.");
             let mut key = [0u8; 32];
-            use sha2::{Digest, Sha256};
-            let hash = Sha256::digest(b"MILNET-DEV-MASTER-KEK-NOT-FOR-PRODUCTION");
-            key.copy_from_slice(&hash);
+            use sha2::{Digest, Sha512};
+            let hash = Sha512::digest(b"MILNET-DEV-MASTER-KEK-NOT-FOR-PRODUCTION");
+            key.copy_from_slice(&hash[..32]);
             // Reject all-zero keys even in dev mode
             if key.iter().all(|&b| b == 0) {
                 panic!("FATAL: all-zero key detected in dev master KEK derivation");

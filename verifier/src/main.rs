@@ -145,24 +145,14 @@ async fn handle_verify(
 ) -> VerifyResponse {
     match postcard::from_bytes::<common::types::Token>(&req.token_bytes) {
         Ok(token) => {
-            // 1. Revocation check (fail-fast before expensive crypto)
+            // 1+2. Revocation check (fail-fast) + full signature + DPoP verification
+            //       Uses verify_token_full which combines revocation, signatures,
+            //       and DPoP key binding in a single pass (H3/H5 fixes).
             {
                 let revocation_list = rl.lock().await;
-                if let Err(e) = verifier::verify_token_with_revocation(
-                    &token, group_key, pq_key, &revocation_list,
-                ) {
-                    return VerifyResponse {
-                        valid: false,
-                        claims: None,
-                        error: Some(e.to_string()),
-                    };
-                }
-            }
-
-            // 2. DPoP channel binding check (if client DPoP key provided)
-            if let Some(ref dpop_key) = req.client_dpop_key {
-                if let Err(e) = verifier::verify_token_with_dpop(
-                    &token, group_key, pq_key, dpop_key,
+                let dpop_key = req.client_dpop_key.as_deref();
+                if let Err(e) = verifier::verify_token_full(
+                    &token, group_key, pq_key, &revocation_list, dpop_key,
                 ) {
                     return VerifyResponse {
                         valid: false,

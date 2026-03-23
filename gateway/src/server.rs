@@ -330,7 +330,7 @@ async fn handle_connection(
                 AuthResponse {
                     success: false,
                     token: None,
-                    error: Some(format!("authentication failed: {e}")),
+                    error: Some("authentication failed".to_string()),
                 }
             }
         }

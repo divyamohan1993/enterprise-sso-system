@@ -91,7 +91,10 @@ impl AuditNode {
         if entry.prev_hash != our_last {
             return None; // Chain mismatch
         }
-        self.log.append_raw(entry.clone());
+        if let Err(e) = self.log.append_raw(entry.clone()) {
+            tracing::error!("BFT node {}: append_raw failed: {}", self.node_id, e);
+            return None;
+        }
 
         // Persist to file if configured.
         if let Some(ref path) = self.persistence_path {
