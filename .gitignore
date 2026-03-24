@@ -68,6 +68,7 @@ terraform/terraform.tfstate.backup
 **/.terraform.lock.hcl
 **/cloudbuild.yaml
 !**/cloudbuild.yaml.example
+**/ACTIVE_RESOURCES.md
 
 # Database (generated)
 *.db
@@ -86,3 +87,4 @@ terraform/terraform.tfstate.backup
 
 # Playwright
 .playwright-mcp/
+deploy/dev-test/plan.tfplan
