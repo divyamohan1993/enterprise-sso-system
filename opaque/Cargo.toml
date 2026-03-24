@@ -21,6 +21,9 @@ rand.workspace = true
 sqlx.workspace = true
 tokio-rustls.workspace = true
 rcgen.workspace = true
+ml-dsa = "0.1.0-rc.7"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+getrandom = "0.2"
 
 [dev-dependencies]
 opaque-ke.workspace = true

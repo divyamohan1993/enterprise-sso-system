@@ -1,11 +1,34 @@
-//! X-Wing hybrid KEM combiner per spec Errata C.8.
+//! CNSA 2.0 adapted hybrid KEM using ML-KEM-1024 + X25519.
 //!
-//! Combines X25519 (classical) with ML-KEM-1024 (post-quantum) to produce a
-//! shared secret via:
+//! This module implements a hybrid Key Encapsulation Mechanism (KEM) that
+//! combines X25519 (classical ECDH) with ML-KEM-1024 (post-quantum lattice
+//! KEM, FIPS 203) to produce a shared secret resistant to both classical
+//! and quantum attacks.
+//!
+//! # Relationship to X-Wing (IETF draft-connolly-cfrg-xwing-kem)
+//!
+//! The standard X-Wing specification (draft-connolly-cfrg-xwing-kem) uses
+//! **ML-KEM-768** as the post-quantum component. This implementation
+//! **deviates** by using **ML-KEM-1024** instead, to achieve CNSA 2.0
+//! Suite Level 5 compliance (NIST Security Level 5 / AES-256 equivalent).
+//!
+//! The combiner formula remains the same as the X-Wing draft:
 //!
 //! ```text
 //! shared_secret = SHA3-256("X-Wing" || ml_kem_ss || ml_kem_ct || x25519_ss || x25519_pk_client || x25519_pk_server)
 //! ```
+//!
+//! # Why ML-KEM-1024 instead of ML-KEM-768?
+//!
+//! CNSA 2.0 (CNSSP-15) mandates NIST Security Level 5 for classified
+//! systems. ML-KEM-768 provides Level 3, which is insufficient for
+//! this system's threat model. ML-KEM-1024 provides Level 5.
+//!
+//! # References
+//!
+//! - IETF draft-connolly-cfrg-xwing-kem (X-Wing specification)
+//! - FIPS 203 (ML-KEM / CRYSTALS-Kyber)
+//! - CNSA 2.0 / CNSSP-15 (NSA post-quantum algorithm requirements)
 
 use hkdf::Hkdf;
 use ml_kem::kem::{Decapsulate, Encapsulate};

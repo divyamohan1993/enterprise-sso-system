@@ -269,7 +269,41 @@ impl ShardProtocol {
     pub fn mark_persisted(&mut self) {
         self.last_persisted_epoch = self.send_sequence;
     }
+
+    /// Connect to a remote SHARD peer over TLS.
+    pub async fn connect_tls(self, addr: &str, connector: &tokio_rustls::TlsConnector, server_name: &str) -> Result<crate::tls_transport::TlsShardTransport, MilnetError> {
+        crate::tls_transport::tls_connect(addr, self.module_id, self.hmac_key, connector, server_name).await
+    }
+    /// Bind a TLS-enabled listener.
+    pub async fn listen_tls(self, addr: &str, tls_config: std::sync::Arc<rustls::ServerConfig>) -> Result<crate::tls_transport::TlsShardListener, MilnetError> {
+        crate::tls_transport::TlsShardListener::bind(addr, self.module_id, self.hmac_key, tls_config).await
+    }
+    /// Connect with TLS in production or plain TCP in development.
+    pub async fn connect_auto(self, addr: &str, production: bool, connector: Option<&tokio_rustls::TlsConnector>, server_name: &str) -> Result<TransportKind, MilnetError> {
+        if production {
+            let c = connector.ok_or_else(|| MilnetError::Shard("TLS required in production".into()))?;
+            Ok(TransportKind::Tls(crate::tls_transport::tls_connect(addr, self.module_id, self.hmac_key, c, server_name).await?))
+        } else {
+            Ok(TransportKind::Plain(crate::transport::connect(addr, self.module_id, self.hmac_key).await?))
+        }
+    }
 }
+
+
+/// Unified transport for production (TLS) and development (plain TCP).
+pub enum TransportKind {
+    Tls(crate::tls_transport::TlsShardTransport),
+    Plain(crate::transport::ShardTransport),
+}
+impl TransportKind {
+    pub async fn send(&mut self, payload: &[u8]) -> Result<(), MilnetError> {
+        match self { TransportKind::Tls(t) => t.send(payload).await, TransportKind::Plain(t) => t.send(payload).await }
+    }
+    pub async fn recv(&mut self) -> Result<(ModuleId, Vec<u8>), MilnetError> {
+        match self { TransportKind::Tls(t) => t.recv().await, TransportKind::Plain(t) => t.recv().await }
+    }
+}
+
 
 /// Internal serializable snapshot of sequence state.
 #[derive(serde::Serialize, serde::Deserialize)]

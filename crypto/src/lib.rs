@@ -8,6 +8,9 @@
 //! - Key seal abstraction (HSM-ready key hierarchy)
 //! - Hardened multi-source entropy (NIST SP 800-90B)
 //! - Binary/config attestation (BLAKE3 tamper detection)
+//! - SLH-DSA (FIPS 205) lattice-independent signatures
+//! - LMS/XMSS (SP 800-208) stateful hash-based signatures
+//! - FIPS 140-3 startup known-answer tests
 //!
 //! The `memguard` module requires unsafe for mlock/munlock and is excluded
 //! from the crate-level `deny(unsafe_code)` via its own module-level allow.
@@ -20,8 +23,9 @@ pub mod threshold;
 pub mod pq_sign;
 #[allow(unsafe_code)]
 pub mod xwing;
-
-// ── Military hardening modules ──
+pub mod slh_dsa;
+pub mod hbs;
+pub mod fips_kat;
 pub mod envelope;
 pub mod seal;
 #[allow(unsafe_code)]

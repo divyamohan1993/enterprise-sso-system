@@ -2,127 +2,151 @@ use audit::log::{hash_entry, AuditLog, AuditRequest, AuditResponse};
 use common::types::AuditEventType;
 use uuid::Uuid;
 
+/// Helper: generate an ML-DSA-87 keypair for signing audit entries.
+fn make_signing_key() -> (crypto::pq_sign::PqSigningKey, crypto::pq_sign::PqVerifyingKey) {
+    crypto::pq_sign::generate_pq_keypair()
+}
+
+fn run_with_large_stack<F: FnOnce() + Send + 'static>(f: F) {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(f)
+        .expect("thread spawn failed")
+        .join()
+        .expect("thread panicked");
+}
+
 #[test]
 fn append_creates_entry() {
-    let mut log = AuditLog::new();
-    let entry = log.append(
-        AuditEventType::AuthSuccess,
-        vec![Uuid::new_v4()],
-        vec![Uuid::new_v4()],
-        0.1,
-        Vec::new(),
-    );
-    assert_eq!(entry.event_type, AuditEventType::AuthSuccess);
-    assert_eq!(log.len(), 1);
-    assert!(!log.is_empty());
+    run_with_large_stack(|| {
+        let (sk, _vk) = make_signing_key();
+        let mut log = AuditLog::new();
+        let entry = log.append(
+            AuditEventType::AuthSuccess,
+            vec![Uuid::new_v4()],
+            vec![Uuid::new_v4()],
+            0.1,
+            Vec::new(),
+            &sk,
+        );
+        assert_eq!(entry.event_type, AuditEventType::AuthSuccess);
+        assert!(!entry.signature.is_empty(), "entry must be signed");
+        assert_eq!(log.len(), 1);
+        assert!(!log.is_empty());
+    });
 }
 
 #[test]
 fn chain_integrity_valid() {
-    let mut log = AuditLog::new();
-    for _ in 0..5 {
-        log.append(
-            AuditEventType::AuthSuccess,
-            vec![Uuid::new_v4()],
-            vec![],
-            0.5,
-            Vec::new(),
-        );
-    }
-    assert_eq!(log.len(), 5);
-    assert!(log.verify_chain());
+    run_with_large_stack(|| {
+        let (sk, _vk) = make_signing_key();
+        let mut log = AuditLog::new();
+        for _ in 0..5 {
+            log.append(
+                AuditEventType::AuthSuccess,
+                vec![Uuid::new_v4()],
+                vec![],
+                0.5,
+                Vec::new(),
+                &sk,
+            );
+        }
+        assert_eq!(log.len(), 5);
+        assert!(log.verify_chain());
+    });
 }
 
 #[test]
 fn chain_detects_tampering() {
-    let mut log = AuditLog::new();
-    for _ in 0..3 {
-        log.append(
+    run_with_large_stack(|| {
+        let (sk, _vk) = make_signing_key();
+        let mut log = AuditLog::new();
+        for _ in 0..3 {
+            log.append(
+                AuditEventType::AuthSuccess,
+                vec![Uuid::new_v4()],
+                vec![],
+                0.2,
+                Vec::new(),
+                &sk,
+            );
+        }
+        assert!(log.verify_chain());
+
+        let entries = log.entries().to_vec();
+        let tampered = AuditLog::new();
+        for (i, mut entry) in entries.into_iter().enumerate() {
+            if i == 1 {
+                entry.prev_hash = [0xFF; 64];
+            }
+            let _ = tampered;
+            let _ = entry;
+            break;
+        }
+
+        let mut log2 = AuditLog::new();
+        log2.append(
             AuditEventType::AuthSuccess,
             vec![Uuid::new_v4()],
             vec![],
-            0.2,
+            0.1,
             Vec::new(),
+            &sk,
         );
-    }
-    assert!(log.verify_chain());
+        log2.append(
+            AuditEventType::AuthFailure,
+            vec![Uuid::new_v4()],
+            vec![],
+            0.9,
+            Vec::new(),
+            &sk,
+        );
+        assert!(log2.verify_chain());
 
-    // Tamper with an entry's prev_hash — we need mutable access to the internal entries.
-    // We'll reconstruct a tampered log by cloning entries and modifying one.
-    let entries = log.entries().to_vec();
-    let tampered = AuditLog::new();
-    for (i, mut entry) in entries.into_iter().enumerate() {
-        if i == 1 {
-            entry.prev_hash = [0xFF; 64]; // tamper
-        }
-        // We can't use append here since it generates new entries,
-        // so we verify the original log's chain after external tampering.
-        // Instead, let's just verify that hash_entry is consistent and
-        // a modified prev_hash breaks the chain.
-        let _ = tampered;
-        let _ = entry;
-        break;
-    }
-
-    // Direct approach: build entries manually and verify chain detects tampering.
-    // Since AuditLog doesn't expose mutable entries, we test via the hash_entry function.
-    let mut log2 = AuditLog::new();
-    log2.append(
-        AuditEventType::AuthSuccess,
-        vec![Uuid::new_v4()],
-        vec![],
-        0.1,
-        Vec::new(),
-    );
-    log2.append(
-        AuditEventType::AuthFailure,
-        vec![Uuid::new_v4()],
-        vec![],
-        0.9,
-        Vec::new(),
-    );
-    // The valid chain should verify
-    assert!(log2.verify_chain());
-
-    // Now create a scenario where prev_hash doesn't match by checking that
-    // an entry with wrong prev_hash would fail.
-    let entries = log2.entries();
-    let mut fake_entry = entries[1].clone();
-    fake_entry.prev_hash = [0xAB; 64];
-    // The hash of entry[0] should not equal fake prev_hash
-    let expected_prev = hash_entry(&entries[0]);
-    assert_ne!(fake_entry.prev_hash, expected_prev);
+        let entries = log2.entries();
+        let mut fake_entry = entries[1].clone();
+        fake_entry.prev_hash = [0xAB; 64];
+        let expected_prev = hash_entry(&entries[0]);
+        assert_ne!(fake_entry.prev_hash, expected_prev);
+    });
 }
 
 #[test]
 fn entries_are_ordered() {
-    let mut log = AuditLog::new();
-    for _ in 0..5 {
-        log.append(AuditEventType::KeyRotation, vec![], vec![], 0.0, Vec::new());
-    }
-    let entries = log.entries();
-    for window in entries.windows(2) {
-        assert!(
-            window[0].timestamp <= window[1].timestamp,
-            "timestamps must be monotonically increasing"
-        );
-    }
+    run_with_large_stack(|| {
+        let (sk, _vk) = make_signing_key();
+        let mut log = AuditLog::new();
+        for _ in 0..5 {
+            log.append(AuditEventType::KeyRotation, vec![], vec![], 0.0, Vec::new(), &sk);
+        }
+        let entries = log.entries();
+        for window in entries.windows(2) {
+            assert!(
+                window[0].timestamp <= window[1].timestamp,
+                "timestamps must be monotonically increasing"
+            );
+        }
+    });
 }
 
 #[test]
 fn hash_is_deterministic() {
-    let mut log = AuditLog::new();
-    log.append(
-        AuditEventType::CredentialRegistered,
-        vec![Uuid::nil()],
-        vec![],
-        0.0,
-        Vec::new(),
-    );
-    let entry = &log.entries()[0];
-    let h1 = hash_entry(entry);
-    let h2 = hash_entry(entry);
-    assert_eq!(h1, h2);
+    run_with_large_stack(|| {
+        let (sk, _vk) = make_signing_key();
+        let mut log = AuditLog::new();
+        log.append(
+            AuditEventType::CredentialRegistered,
+            vec![Uuid::nil()],
+            vec![],
+            0.0,
+            Vec::new(),
+            &sk,
+        );
+        let entry = &log.entries()[0];
+        let h1 = hash_entry(entry);
+        let h2 = hash_entry(entry);
+        assert_eq!(h1, h2);
+    });
 }
 
 // ── Wire message type tests ──────────────────────────────────────────
@@ -189,7 +213,6 @@ fn bft_cluster_with_signing_proposes_entry() {
     );
     assert!(result.is_ok(), "quorum should be met with 7 honest nodes");
 
-    // Verify entries have non-empty signatures (ML-DSA signed)
     for node in &cluster.nodes {
         assert_eq!(node.log.len(), 1);
         let entry = &node.log.entries()[0];
@@ -225,7 +248,6 @@ fn bft_signed_cluster_tolerates_byzantine() {
     let (signing_key, _verifying_key) = crypto::pq_sign::generate_pq_keypair();
     let mut cluster = audit::bft::BftAuditCluster::new_with_signing_key(7, signing_key);
 
-    // Mark 2 nodes as Byzantine (max tolerable for 7 nodes)
     cluster.set_byzantine(5);
     cluster.set_byzantine(6);
 
@@ -238,7 +260,6 @@ fn bft_signed_cluster_tolerates_byzantine() {
     );
     assert!(result.is_ok(), "quorum of 5 should still be met with 2 Byzantine nodes");
 
-    // But 3 Byzantine nodes should fail quorum
     cluster.set_byzantine(4);
     let result2 = cluster.propose_entry(
         AuditEventType::SystemDegraded,
@@ -268,7 +289,61 @@ fn bft_signed_entries_have_valid_signature_bytes() {
     let entry = &cluster.nodes[0].log.entries()[0];
     let entry_hash = hash_entry(entry);
 
-    // Verify signature using the verifying key
     let valid = crypto::pq_sign::pq_verify_raw(&verifying_key, &entry_hash, &entry.signature);
     assert!(valid, "ML-DSA-65 signature should verify");
+}
+
+// ── Signature verification tests ─────────────────────────────────────
+
+#[test]
+fn test_all_entries_are_signed() {
+    run_with_large_stack(|| {
+        let (sk, vk) = make_signing_key();
+        let mut log = AuditLog::new();
+
+        for _ in 0..5 {
+            log.append(
+                AuditEventType::AuthSuccess,
+                vec![Uuid::new_v4()],
+                vec![],
+                0.1,
+                Vec::new(),
+                &sk,
+            );
+        }
+
+        for entry in log.entries() {
+            assert!(!entry.signature.is_empty(), "all entries must be signed");
+        }
+
+        assert!(log.verify_chain_with_key(Some(&vk)));
+    });
+}
+
+#[test]
+fn test_unsigned_entries_rejected_during_verification() {
+    run_with_large_stack(|| {
+        let (_sk, vk) = make_signing_key();
+
+        let mut log = AuditLog::new();
+        let unsigned_entry = common::types::AuditEntry {
+            event_id: Uuid::new_v4(),
+            event_type: AuditEventType::AuthSuccess,
+            user_ids: vec![],
+            device_ids: vec![],
+            ceremony_receipts: vec![],
+            risk_score: 0.0,
+            timestamp: 12345,
+            prev_hash: [0u8; 64],
+            signature: Vec::new(),
+        };
+        log.append_raw(unsigned_entry).unwrap();
+
+        assert!(log.verify_chain());
+
+        assert!(
+            !log.verify_chain_with_key(Some(&vk)),
+            "unsigned entries must be rejected when a verifying key is provided"
+        );
+    });
 }

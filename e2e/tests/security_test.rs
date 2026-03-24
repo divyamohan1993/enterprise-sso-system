@@ -216,6 +216,7 @@ fn ratchet_forward_secrecy() {
 
 #[test]
 fn audit_chain_integrity() {
+    let (sk, _vk) = crypto::pq_sign::generate_pq_keypair();
     let mut log = AuditLog::new();
     log.append(
         AuditEventType::AuthSuccess,
@@ -223,6 +224,7 @@ fn audit_chain_integrity() {
         vec![Uuid::new_v4()],
         0.1,
         Vec::new(),
+        &sk,
     );
     log.append(
         AuditEventType::KeyRotation,
@@ -230,6 +232,7 @@ fn audit_chain_integrity() {
         vec![Uuid::new_v4()],
         0.0,
         Vec::new(),
+        &sk,
     );
     log.append(
         AuditEventType::AuthFailure,
@@ -237,6 +240,7 @@ fn audit_chain_integrity() {
         vec![Uuid::new_v4()],
         0.5,
         Vec::new(),
+        &sk,
     );
 
     assert!(log.verify_chain(), "untampered audit chain must verify");

@@ -32,7 +32,7 @@ use ratchet::chain::RatchetChain;
 use risk::tiers::check_tier_access;
 use shard::protocol::ShardProtocol;
 use tss::token_builder::build_token_distributed;
-use tss::validator::validate_receipt_chain;
+use tss::validator::{validate_receipt_chain, validate_receipt_chain_with_key, ReceiptVerificationKey};
 use verifier::verify::verify_token;
 use uuid::Uuid;
 
@@ -43,6 +43,15 @@ use e2e::{client_auth, send_frame, recv_frame};
 const SHARD_HMAC_KEY: [u8; 64] = [0x37u8; 64];
 const RECEIPT_SIGNING_KEY: [u8; 64] = [0x42u8; 64];
 const TEST_DIFFICULTY: u8 = 4;
+
+/// ML-DSA-65 verifying key for receipt verification (derived from RECEIPT_SIGNING_KEY seed).
+static RECEIPT_MLDSA65_VK: std::sync::LazyLock<Vec<u8>> =
+    std::sync::LazyLock::new(|| {
+        use ml_dsa::{KeyGen, MlDsa65};
+        let seed: [u8; 32] = RECEIPT_SIGNING_KEY[..32].try_into().unwrap();
+        let kp = MlDsa65::from_seed(&seed.into());
+        kp.verifying_key().encode().to_vec()
+    });
 
 /// Shared PQ keypair for unit-level tests.
 static TEST_PQ_KEYPAIR: std::sync::LazyLock<(crypto::pq_sign::PqSigningKey, crypto::pq_sign::PqVerifyingKey)> =
@@ -178,8 +187,13 @@ async fn boot_tss(
                     continue;
                 }
             };
+            let vk = &*RECEIPT_MLDSA65_VK;
+            let verification_key = ReceiptVerificationKey::Both {
+                hmac_key: &RECEIPT_SIGNING_KEY,
+                mldsa65_key: vk,
+            };
             let response =
-                match validate_receipt_chain(&request.receipts, &RECEIPT_SIGNING_KEY) {
+                match validate_receipt_chain_with_key(&request.receipts, &verification_key) {
                     Ok(()) => {
                         let mut signers: Vec<&mut _> =
                             nodes.iter_mut().take(coordinator.threshold).collect();
@@ -1384,6 +1398,7 @@ fn test_attack_same_department_in_sovereign_rejected() {
 fn test_attack_audit_log_tamper_detection() {
     // Build 100-entry audit log. Modify entry #50's event_type.
     // Chain verification must detect the tampering.
+    let (sk, _vk) = crypto::pq_sign::generate_pq_keypair();
     let mut log = AuditLog::new();
     for i in 0..100 {
         log.append(
@@ -1396,6 +1411,7 @@ fn test_attack_audit_log_tamper_detection() {
             vec![Uuid::new_v4()],
             0.1,
             Vec::new(),
+            &sk,
         );
     }
 
@@ -1418,6 +1434,7 @@ fn test_attack_audit_log_tamper_detection() {
             entry.device_ids.clone(),
             entry.risk_score,
             entry.ceremony_receipts.clone(),
+            &sk,
         );
     }
 
@@ -1437,6 +1454,7 @@ fn test_attack_audit_log_tamper_detection() {
 fn test_attack_audit_log_deletion_detected() {
     // Build 10-entry log. Remove entry #5, relink #4 to #6.
     // The prev_hash won't match — chain broken.
+    let (sk, _vk) = crypto::pq_sign::generate_pq_keypair();
     let mut log = AuditLog::new();
     for _ in 0..10 {
         log.append(
@@ -1445,6 +1463,7 @@ fn test_attack_audit_log_deletion_detected() {
             vec![Uuid::new_v4()],
             0.1,
             Vec::new(),
+            &sk,
         );
     }
     assert!(log.verify_chain(), "original log must verify");
@@ -1462,6 +1481,7 @@ fn test_attack_audit_log_deletion_detected() {
             entry.device_ids.clone(),
             entry.risk_score,
             entry.ceremony_receipts.clone(),
+            &sk,
         );
     }
 
@@ -1481,6 +1501,7 @@ fn test_attack_audit_log_deletion_detected() {
 fn test_attack_audit_log_insertion_detected() {
     // Build 5-entry log. Insert a fake entry between #2 and #3.
     // Hash chain breaks.
+    let (sk, _vk) = crypto::pq_sign::generate_pq_keypair();
     let mut log = AuditLog::new();
     for _ in 0..5 {
         log.append(
@@ -1489,6 +1510,7 @@ fn test_attack_audit_log_insertion_detected() {
             vec![Uuid::new_v4()],
             0.1,
             Vec::new(),
+            &sk,
         );
     }
     assert!(log.verify_chain(), "original 5-entry log must verify");
@@ -1503,6 +1525,7 @@ fn test_attack_audit_log_insertion_detected() {
             entry.device_ids.clone(),
             entry.risk_score,
             entry.ceremony_receipts.clone(),
+            &sk,
         );
         if i == 2 {
             // Insert fake entry after #2
@@ -1512,6 +1535,7 @@ fn test_attack_audit_log_insertion_detected() {
                 vec![Uuid::new_v4()],
                 0.0,
                 Vec::new(),
+                &sk,
             );
         }
     }

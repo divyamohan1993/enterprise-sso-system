@@ -15,3 +15,6 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 getrandom.workspace = true
+
+[dev-dependencies]
+proptest = "1"

@@ -1,0 +1,52 @@
+[package]
+name = "enterprise-sso-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+crypto = { path = "../crypto" }
+shard = { path = "../shard" }
+sso-protocol = { path = "../sso-protocol" }
+common = { path = "../common" }
+ratchet = { path = "../ratchet" }
+arbitrary = { version = "1", features = ["derive"] }
+
+[[bin]]
+name = "fuzz_shard_message"
+path = "fuzz_targets/fuzz_shard_message.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_envelope_decrypt"
+path = "fuzz_targets/fuzz_envelope_decrypt.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_token_verify"
+path = "fuzz_targets/fuzz_token_verify.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_pkce_verify"
+path = "fuzz_targets/fuzz_pkce_verify.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_receipt_chain"
+path = "fuzz_targets/fuzz_receipt_chain.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_ratchet_verify"
+path = "fuzz_targets/fuzz_ratchet_verify.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_revocation"
+path = "fuzz_targets/fuzz_revocation.rs"
+doc = false

@@ -89,6 +89,10 @@ impl AuditLog {
         self.max_entries = max;
     }
 
+    /// Append an audit entry, always signing it with ML-DSA-65.
+    ///
+    /// Every audit entry MUST be signed. This prevents log entries from
+    /// being forged or injected without possession of the signing key.
     pub fn append(
         &mut self,
         event_type: AuditEventType,
@@ -96,8 +100,9 @@ impl AuditLog {
         device_ids: Vec<Uuid>,
         risk_score: f64,
         ceremony_receipts: Vec<Receipt>,
+        signing_key: &crypto::pq_sign::PqSigningKey,
     ) -> &AuditEntry {
-        let entry = AuditEntry {
+        let mut entry = AuditEntry {
             event_id: Uuid::new_v4(),
             event_type,
             user_ids,
@@ -106,9 +111,11 @@ impl AuditLog {
             risk_score,
             timestamp: now_us(),
             prev_hash: self.last_hash,
-            signature: Vec::new(), // placeholder for ML-DSA-65
+            signature: Vec::new(),
         };
-        self.last_hash = hash_entry(&entry);
+        let hash = hash_entry(&entry);
+        entry.signature = crypto::pq_sign::pq_sign_raw(signing_key, &hash);
+        self.last_hash = hash;
         self.entries.push(entry);
         self.periodic_verify();
         self.auto_archive();
@@ -120,19 +127,23 @@ impl AuditLog {
     }
 
     /// Verify chain integrity: hash linkage AND (optionally) ML-DSA-65 signatures.
+    ///
+    /// When a verifying key is provided, ALL entries MUST have valid signatures.
+    /// Unsigned entries are rejected during verification to prevent log injection.
     pub fn verify_chain_with_key(&self, verifying_key: Option<&crypto::pq_sign::PqVerifyingKey>) -> bool {
         let mut expected_prev = [0u8; 64];
         for entry in &self.entries {
             if entry.prev_hash != expected_prev {
                 return false;
             }
-            // Verify signature if present and key provided
+            // When a verifying key is provided, reject unsigned entries
             if let Some(vk) = verifying_key {
-                if !entry.signature.is_empty() {
-                    let hash = hash_entry(entry);
-                    if !crypto::pq_sign::pq_verify_raw(vk, &hash, &entry.signature) {
-                        return false;
-                    }
+                if entry.signature.is_empty() {
+                    return false;
+                }
+                let hash = hash_entry(entry);
+                if !crypto::pq_sign::pq_verify_raw(vk, &hash, &entry.signature) {
+                    return false;
                 }
             }
             expected_prev = hash_entry(entry);

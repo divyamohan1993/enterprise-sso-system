@@ -15,3 +15,10 @@ hmac.workspace = true
 base64 = "0.22"
 hex = "0.4"
 subtle.workspace = true
+sqlx = { workspace = true, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid"] }
+tokio = { workspace = true, features = ["full"] }
+
+[dev-dependencies]
+proptest = "1"
+ratchet = { path = "../ratchet" }
+uuid = { version = "1", features = ["v4"] }

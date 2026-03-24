@@ -191,3 +191,12 @@ impl RatchetChain {
         self.epoch >= self.max_epoch_lifetime
     }
 }
+
+impl RatchetChain {
+    /// Reconstruct a chain from a persisted chain key and epoch.
+    pub fn from_persisted(chain_key: [u8; 64], epoch: u64) -> Self {
+        Self { chain_key, epoch, max_epoch_lifetime: 2880, recent_keys: Vec::new() }
+    }
+    /// Return a copy of the current chain key for persistence (must be encrypted before storage).
+    pub fn current_key(&self) -> [u8; 64] { self.chain_key }
+}

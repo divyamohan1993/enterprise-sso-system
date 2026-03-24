@@ -27,3 +27,5 @@ hmac = "0.12"
 sha2 = "0.10"
 aes-gcm.workspace = true
 getrandom.workspace = true
+sso-protocol = { version = "0.1.0", path = "../sso-protocol" }
+ml-dsa.workspace = true

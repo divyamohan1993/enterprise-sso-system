@@ -401,3 +401,50 @@ mod tests {
         assert!(clone.is_revoked(&id));
     }
 }
+
+/// Database-backed revocation list that maintains O(1) in-memory lookups
+/// while persisting all revocations to PostgreSQL for durability.
+pub struct PersistentRevocationList {
+    memory: SharedRevocationList,
+    pool: sqlx::PgPool,
+}
+
+impl PersistentRevocationList {
+    pub async fn new(pool: sqlx::PgPool) -> Result<Self, String> {
+        let memory = SharedRevocationList::new();
+        let prl = Self { memory, pool };
+        prl.load_from_db().await?;
+        Ok(prl)
+    }
+    async fn load_from_db(&self) -> Result<(), String> {
+        let now = RevocationList::now_us();
+        let rows: Vec<(Vec<u8>, i64)> = sqlx::query_as("SELECT token_hash, revoked_at FROM revoked_tokens WHERE expires_at > $1")
+            .bind(now).fetch_all(&self.pool).await.map_err(|e| format!("load revocations: {e}"))?;
+        let mut list = self.memory.inner.write().unwrap();
+        for (th, ra) in rows { if th.len() == 16 { let mut id = [0u8; 16]; id.copy_from_slice(&th); list.revoked_ids.insert(id); list.revocation_times.insert(id, ra); } }
+        Ok(())
+    }
+    pub async fn revoke(&self, token_id: [u8; 16]) -> Result<bool, String> {
+        if self.memory.is_revoked(&token_id) { return Ok(false); }
+        let now = RevocationList::now_us();
+        let expires_at = now + MAX_TOKEN_LIFETIME_US;
+        sqlx::query("INSERT INTO revoked_tokens (token_hash, revoked_at, expires_at) VALUES ($1, $2, $3) ON CONFLICT (token_hash) DO NOTHING")
+            .bind(&token_id[..]).bind(now).bind(expires_at).execute(&self.pool).await.map_err(|e| format!("persist revocation: {e}"))?;
+        Ok(self.memory.revoke(token_id))
+    }
+    pub fn is_revoked(&self, token_id: &[u8; 16]) -> bool { self.memory.is_revoked(token_id) }
+    pub async fn cleanup_expired(&self, max_token_lifetime_secs: i64) -> Result<(), String> {
+        let cutoff = RevocationList::now_us() - (max_token_lifetime_secs * 1_000_000);
+        sqlx::query("DELETE FROM revoked_tokens WHERE revoked_at <= $1").bind(cutoff).execute(&self.pool).await.map_err(|e| format!("cleanup: {e}"))?;
+        self.memory.cleanup_expired(max_token_lifetime_secs); Ok(())
+    }
+    pub async fn cleanup(&self) -> Result<(), String> {
+        let now = RevocationList::now_us();
+        sqlx::query("DELETE FROM revoked_tokens WHERE expires_at <= $1").bind(now).execute(&self.pool).await.map_err(|e| format!("cleanup: {e}"))?;
+        self.memory.cleanup(); Ok(())
+    }
+    pub fn revoked_count(&self) -> usize { self.memory.revoked_count() }
+    pub fn len(&self) -> usize { self.memory.len() }
+    pub fn is_empty(&self) -> bool { self.memory.is_empty() }
+    pub fn shared(&self) -> &SharedRevocationList { &self.memory }
+}

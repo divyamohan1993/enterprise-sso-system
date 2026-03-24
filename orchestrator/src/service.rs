@@ -5,6 +5,7 @@
 
 use common::types::{ModuleId, Receipt, TokenClaims};
 use crypto::entropy::{generate_key_64, generate_nonce};
+use ml_dsa::KeyGen;
 use opaque::messages::{OpaqueRequest, OpaqueResponse};
 use shard::tls_transport::{tls_connect, TlsShardTransport, tls_bind, tls_client_setup};
 use tokio_rustls::TlsConnector;
@@ -24,11 +25,22 @@ fn verify_receipt_independently(
     hmac_key: &[u8; 64],
     ceremony_session_id: &[u8; 32],
 ) -> Result<(), String> {
-    // 1. Verify HMAC signature using constant-time comparison.
-    //    This proves the receipt was signed by the OPAQUE service (which holds
-    //    the signing key) and has not been tampered with in transit.
-    if !crypto::receipts::verify_receipt_signature(receipt, hmac_key) {
-        return Err("receipt HMAC signature verification failed".into());
+    // 1. Verify receipt signature (ML-DSA-65 preferred, HMAC-SHA512 fallback).
+    //    This proves the receipt was signed by the OPAQUE service and has not
+    //    been tampered with in transit.
+    let mldsa_ok = if hmac_key.len() >= 32 {
+        // Derive ML-DSA-65 verifying key from the first 32 bytes (seed)
+        let seed: [u8; 32] = hmac_key[..32].try_into().unwrap();
+        let kp = ml_dsa::MlDsa65::from_seed(&seed.into());
+        let vk_bytes = kp.verifying_key().encode();
+        let data = crypto::receipts::receipt_signing_data(receipt);
+        crypto::receipts::verify_receipt_asymmetric(vk_bytes.as_ref(), &data, &receipt.signature)
+    } else {
+        false
+    };
+    let hmac_ok = crypto::receipts::verify_receipt_signature(receipt, hmac_key);
+    if !mldsa_ok && !hmac_ok {
+        return Err("receipt signature verification failed (neither ML-DSA-65 nor HMAC valid)".into());
     }
 
     // 2. Validate timestamp is within ±30 seconds of current time.

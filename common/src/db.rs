@@ -88,6 +88,41 @@ pub async fn init_database(database_url: &str) -> PgPool {
         )
     "#).execute(&pool).await.expect("Failed to create sessions table");
 
+
+    sqlx::query(r#"
+        CREATE TABLE IF NOT EXISTS ratchet_sessions (
+            session_id UUID PRIMARY KEY,
+            current_epoch BIGINT NOT NULL,
+            chain_key_encrypted BYTEA NOT NULL,
+            client_entropy BYTEA,
+            server_entropy BYTEA,
+            created_at BIGINT NOT NULL,
+            last_advanced_at BIGINT NOT NULL
+        )
+    "#).execute(&pool).await.expect("Failed to create ratchet_sessions table");
+
+    sqlx::query(r#"
+        CREATE TABLE IF NOT EXISTS authorization_codes (
+            code VARCHAR(255) PRIMARY KEY,
+            client_id VARCHAR(255) NOT NULL,
+            redirect_uri TEXT NOT NULL,
+            user_id UUID NOT NULL,
+            code_challenge VARCHAR(255),
+            tier INTEGER NOT NULL,
+            nonce VARCHAR(255),
+            created_at BIGINT NOT NULL,
+            consumed BOOLEAN DEFAULT FALSE
+        )
+    "#).execute(&pool).await.expect("Failed to create authorization_codes table");
+
+    sqlx::query(r#"
+        CREATE TABLE IF NOT EXISTS revoked_tokens (
+            token_hash BYTEA PRIMARY KEY,
+            revoked_at BIGINT NOT NULL,
+            expires_at BIGINT NOT NULL
+        )
+    "#).execute(&pool).await.expect("Failed to create revoked_tokens table");
+
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS oauth_codes (
             code VARCHAR(255) PRIMARY KEY,

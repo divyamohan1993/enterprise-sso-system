@@ -35,7 +35,7 @@ use shard::tls_transport;
 use tss::messages::{SigningRequest, SigningResponse};
 use crypto::pq_sign::{generate_pq_keypair, PqSigningKey, PqVerifyingKey};
 use tss::token_builder::build_token_distributed;
-use tss::validator::validate_receipt_chain;
+use tss::validator::{validate_receipt_chain, validate_receipt_chain_with_key, ReceiptVerificationKey};
 use verifier::verify::verify_token;
 use uuid::Uuid;
 
@@ -46,6 +46,15 @@ use e2e::{client_auth, send_frame, recv_frame};
 const SHARD_HMAC_KEY: [u8; 64] = [0x37u8; 64];
 const RECEIPT_SIGNING_KEY: [u8; 64] = [0x42u8; 64];
 const TEST_DIFFICULTY: u8 = 4;
+
+/// ML-DSA-65 verifying key for receipt verification (derived from RECEIPT_SIGNING_KEY seed).
+static RECEIPT_MLDSA65_VK: std::sync::LazyLock<Vec<u8>> =
+    std::sync::LazyLock::new(|| {
+        use ml_dsa::{KeyGen, MlDsa65};
+        let seed: [u8; 32] = RECEIPT_SIGNING_KEY[..32].try_into().unwrap();
+        let kp = MlDsa65::from_seed(&seed.into());
+        kp.verifying_key().encode().to_vec()
+    });
 
 /// Shared PQ keypair for unit-level tests.
 /// Generated on a large-stack thread because ML-DSA-87 keygen uses
@@ -181,8 +190,13 @@ async fn boot_tss(
                     continue;
                 }
             };
+            let vk = &*RECEIPT_MLDSA65_VK;
+            let verification_key = ReceiptVerificationKey::Both {
+                hmac_key: &RECEIPT_SIGNING_KEY,
+                mldsa65_key: vk,
+            };
             let response =
-                match validate_receipt_chain(&request.receipts, &RECEIPT_SIGNING_KEY) {
+                match validate_receipt_chain_with_key(&request.receipts, &verification_key) {
                     Ok(()) => {
                         let mut signers: Vec<&mut _> =
                             nodes.iter_mut().take(coordinator.threshold).collect();
@@ -873,6 +887,7 @@ fn test_ratchet_different_entropy_different_chains() {
 
 #[test]
 fn test_audit_chain_survives_1000_entries() {
+    let (sk, _vk) = crypto::pq_sign::generate_pq_keypair();
     let mut log = AuditLog::new();
     for _ in 0..1000 {
         log.append(
@@ -881,6 +896,7 @@ fn test_audit_chain_survives_1000_entries() {
             vec![Uuid::new_v4()],
             0.1,
             Vec::new(),
+            &sk,
         );
     }
     assert_eq!(log.len(), 1000);
@@ -889,6 +905,7 @@ fn test_audit_chain_survives_1000_entries() {
 
 #[test]
 fn test_audit_tamper_detection_any_position() {
+    let (sk, _vk) = crypto::pq_sign::generate_pq_keypair();
     let mut log = AuditLog::new();
     for i in 0..100 {
         log.append(
@@ -901,6 +918,7 @@ fn test_audit_tamper_detection_any_position() {
             vec![Uuid::new_v4()],
             0.1 * (i as f64 / 100.0),
             Vec::new(),
+            &sk,
         );
     }
     assert!(log.verify_chain(), "untampered chain should verify");
@@ -923,6 +941,7 @@ fn test_audit_tamper_detection_any_position() {
 
 #[test]
 fn test_audit_entries_capture_full_ceremony() {
+    let (sk, _vk) = crypto::pq_sign::generate_pq_keypair();
     let mut log = AuditLog::new();
     let user_id = Uuid::new_v4();
     let device_id = Uuid::new_v4();
@@ -933,6 +952,7 @@ fn test_audit_entries_capture_full_ceremony() {
         vec![device_id],
         0.1,
         Vec::new(),
+        &sk,
     );
 
     let entries = log.entries();
