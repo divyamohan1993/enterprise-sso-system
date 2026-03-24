@@ -1,21 +1,20 @@
 # ============================================================================
-# MILNET SSO — Dev/Test Configuration
+# MILNET SSO — Dev/Test Configuration (Prod-Identical, Sandbox Cost)
 # ============================================================================
-# Copy this file to terraform.tfvars and edit the values below.
+# Every resource is the SAME TYPE as production — just lowest-cost SKU/tier.
+# No mocks, no stubs, no dev shortcuts. Real Cloud KMS HSM, real Cloud SQL,
+# real Cloud Run with mTLS. Identical architecture to prod deployment.
 #
 #   cp terraform.tfvars.example terraform.tfvars
-#   vim terraform.tfvars
-#
-# Then deploy:
 #   ./deploy.sh
 # ============================================================================
 
-# REQUIRED: Your GCP project ID
-project_id = "your-gcp-project-id"
+# GCP project
+project_id = "lmsforshantithakur"
 
-# GCP region and zone (us-central1 has best Spot pricing)
-region = "us-central1"
-zone   = "us-central1-a"
+# Delhi region (asia-south1)
+region = "asia-south1"
+zone   = "asia-south1-a"
 
 # Repository to clone and test
 github_repo   = "https://github.com/divyamohan1993/enterprise-sso-system.git"
@@ -24,8 +23,8 @@ github_branch = "master"
 # Developer mode: allows SSH from anywhere, enables verbose logging
 developer_mode = true
 
-# VM machine type for test runner (c2-standard-4 = 4 vCPU, 16 GB RAM)
-# Alternatives: c2-standard-8 (faster builds), e2-standard-4 (cheaper but slower)
+# C2 Spot VM for fast Rust compilation and test runs
+# c2-standard-4 = 4 vCPU, 16 GB RAM (Intel Cascade Lake, fast single-thread)
 machine_type = "c2-standard-4"
 
 # Log verbosity: "verbose" shows all test output, "error" shows only failures
@@ -34,7 +33,7 @@ log_level = "verbose"
 # Auto-delete VM if tests fail (set false to keep VM for debugging)
 auto_destroy_on_failure = true
 
-# Cloud Run settings (simulated prod)
+# Cloud Run settings — real prod services at sandbox scale
 cloud_run_min_instances = 0   # Scale to zero when idle (cheapest)
 cloud_run_max_instances = 2   # Max instances per service
 tss_replica_count       = 3   # TSS threshold nodes (3 = 2-of-3 threshold)

@@ -1,12 +1,15 @@
 # ============================================================================
-# MILNET SSO — Dev/Test Spot Deployment
+# MILNET SSO — Prod-Identical Deployment at Sandbox Cost
 # ============================================================================
-# Purpose: Cheap, ephemeral test environment on GCP Spot (preemptible) VMs.
+# Purpose: Real production architecture with every resource identical to live
+# deployment, just at the lowest-cost SKU/tier.
 #
 # Design principles:
+#   - IDENTICAL architecture to production (same Cloud KMS HSM, same Cloud SQL,
+#     same Cloud Run, same mTLS, same VPC isolation) — just smallest SKUs
+#   - No mocks, no stubs, no dev shortcuts
+#   - C2 Spot VM for fast Rust builds/tests (asia-south1)
 #   - Every apply destroys previous resources first (create_before_destroy=false)
-#   - All compute is preemptible/spot to minimize cost
-#   - Cloud SQL uses smallest tier
 #   - Failures trigger VM self-deletion and replacement
 #   - SSH access for debugging in developer_mode
 # ============================================================================

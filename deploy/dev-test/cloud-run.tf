@@ -1,9 +1,9 @@
 # ============================================================================
-# MILNET SSO — Cloud Run Services (Simulated Prod for Dev/Test)
+# MILNET SSO — Cloud Run Services (Prod-Identical at Sandbox Cost)
 # ============================================================================
-# Deploys all microservices to Cloud Run with scale-to-zero (spot-like cost).
-# Cloud Run does not have a "spot" mode but scale-to-zero with min_instances=0
-# achieves the same cost goal — you pay nothing when idle.
+# Deploys all microservices to Cloud Run with scale-to-zero.
+# IDENTICAL to production: real Cloud KMS HSM, real Secret Manager, real mTLS.
+# Only difference from prod: smallest SKUs, scale-to-zero, no always-on.
 # ============================================================================
 
 locals {
@@ -68,7 +68,7 @@ resource "google_kms_crypto_key" "master_kek" {
 
   version_template {
     algorithm        = "GOOGLE_SYMMETRIC_ENCRYPTION"
-    protection_level = "SOFTWARE"
+    protection_level = "HSM"  # FIPS 140-3 Level 3 — same as prod
   }
 
   rotation_period = "7776000s" # 90 days
@@ -85,7 +85,7 @@ resource "google_kms_crypto_key" "signing_key" {
 
   version_template {
     algorithm        = "EC_SIGN_P256_SHA256"
-    protection_level = "SOFTWARE"
+    protection_level = "HSM"  # FIPS 140-3 Level 3 — same as prod
   }
 
   lifecycle {
