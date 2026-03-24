@@ -11,8 +11,8 @@ screenshots/
 docs/
 formal-model/
 
-# Tests (e2e has its own binary, not needed in service images)
-e2e/
+# Fuzz targets not needed in production images
+fuzz/
 
 # Secrets and credentials
 .env
