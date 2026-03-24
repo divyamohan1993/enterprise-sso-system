@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio_stream::StreamExt;
 use tower_http::services::ServeDir;
 use uuid::Uuid;
 
@@ -747,6 +748,8 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         // Developer mode
         .route("/api/admin/developer-mode", put(set_developer_mode))
         .route("/api/admin/developer-mode", get(get_developer_mode))
+        // Live SIEM event stream (SSE)
+        .route("/api/admin/siem/stream", get(siem_stream))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .layer(middleware::from_fn(origin_and_content_type_middleware))
         .layer(middleware::from_fn(security_headers_middleware))
@@ -2337,6 +2340,64 @@ async fn get_developer_mode(
         developer_mode: enabled,
         log_level: level.to_string(),
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Live SIEM event streaming (Server-Sent Events)
+// ---------------------------------------------------------------------------
+
+/// Query parameters for the SIEM SSE stream.
+#[derive(Deserialize)]
+struct SiemStreamQuery {
+    /// Only forward events with severity >= this value (0-10).
+    severity_min: Option<u8>,
+}
+
+/// `GET /api/admin/siem/stream` — SSE endpoint that streams SIEM events in
+/// real time.  Requires the admin API key as a Bearer token.
+async fn siem_stream(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Query(query): Query<SiemStreamQuery>,
+) -> Result<axum::response::sse::Sse<impl futures_core::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>>, StatusCode> {
+    // ---- Authenticate: require admin API key via Bearer token ----
+    let auth_header = headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let token = auth_header.strip_prefix("Bearer ").unwrap_or("");
+    if !crypto::ct::ct_eq(token.as_bytes(), state.admin_api_key.as_bytes()) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let severity_min = query.severity_min.unwrap_or(0);
+    let rx = common::siem::subscribe();
+
+    // Convert the broadcast receiver into a Stream of SSE Events.
+    let stream = tokio_stream::wrappers::BroadcastStream::new(rx)
+        .filter_map(move |result| {
+            match result {
+                Ok(siem_event) if siem_event.severity >= severity_min => {
+                    let data = serde_json::json!({
+                        "timestamp": siem_event.timestamp,
+                        "severity": siem_event.severity,
+                        "event_type": siem_event.event_type,
+                        "details": serde_json::from_str::<serde_json::Value>(&siem_event.json).unwrap_or(serde_json::Value::Null),
+                    });
+                    let event = axum::response::sse::Event::default()
+                        .event("siem")
+                        .data(data.to_string());
+                    Some(Ok(event))
+                }
+                // Severity too low — skip
+                Ok(_) => None,
+                // Lagged — skip lost events and continue
+                Err(_) => None,
+            }
+        });
+
+    Ok(axum::response::sse::Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default()))
 }
 
 // ---------------------------------------------------------------------------

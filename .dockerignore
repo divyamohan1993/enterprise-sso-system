@@ -1,11 +1,38 @@
+# Build artifacts
+target/
+
+# Git
 .git
-target
+.gitignore
+
+# Documentation
 *.md
-screenshots
-docs
-formal-model
-e2e
+screenshots/
+docs/
+formal-model/
+
+# Tests (e2e has its own binary, not needed in service images)
+e2e/
+
+# Secrets and credentials
 .env
+.env.*
 *.pem
 *.key
-.github
+*.p12
+credentials.json
+
+# CI/CD
+.github/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Terraform state (contains secrets)
+*.tfstate
+*.tfstate.backup
+.terraform/

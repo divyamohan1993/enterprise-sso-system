@@ -2,10 +2,50 @@
 //!
 //! Emits JSON-formatted security events to stdout (structured logging) that
 //! can be consumed by SIEM systems (Splunk, Elastic, etc.) via log forwarding.
+//!
+//! Also publishes events to an in-process broadcast channel so that SSE
+//! consumers (e.g. the admin `/api/admin/siem/stream` endpoint) can receive
+//! events in real time.
 #![forbid(unsafe_code)]
 
 use serde::Serialize;
+use std::sync::LazyLock;
 use uuid::Uuid;
+
+// ---------------------------------------------------------------------------
+// Global broadcast bus for live SIEM event streaming
+// ---------------------------------------------------------------------------
+
+/// A lightweight, cloneable event that flows through the broadcast channel.
+#[derive(Debug, Clone, Serialize)]
+pub struct SiemEvent {
+    /// Unix-epoch seconds when the event was created.
+    pub timestamp: i64,
+    /// CEF-compatible severity (0-10).
+    pub severity: u8,
+    /// Machine-readable event type (e.g. `"tamper_detected"`).
+    pub event_type: String,
+    /// Full JSON representation of the underlying `SecurityEvent`.
+    pub json: String,
+}
+
+/// Global broadcast sender.  Capacity of 1000 means slow consumers that fall
+/// more than 1000 events behind will see `RecvError::Lagged`.
+static SIEM_BUS: LazyLock<tokio::sync::broadcast::Sender<SiemEvent>> = LazyLock::new(|| {
+    let (tx, _rx) = tokio::sync::broadcast::channel(1000);
+    tx
+});
+
+/// Publish a `SiemEvent` to all current subscribers.
+/// Silently drops the event if there are no active receivers.
+pub fn broadcast_event(event: &SiemEvent) {
+    let _ = SIEM_BUS.send(event.clone());
+}
+
+/// Obtain a new receiver handle for the global SIEM event bus.
+pub fn subscribe() -> tokio::sync::broadcast::Receiver<SiemEvent> {
+    SIEM_BUS.subscribe()
+}
 
 /// Security event severity levels (CEF-compatible, 0-10 scale).
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -279,10 +319,23 @@ impl SecurityEvent {
         event.emit();
     }
 
-    /// Emit this event via structured logging (JSON to tracing).
+    /// Emit this event via structured logging (JSON to tracing) and broadcast
+    /// it to the live SIEM event bus for SSE consumers.
     fn emit(&self) {
         if let Ok(json) = serde_json::to_string(self) {
             tracing::info!(target: "siem", "{}", json);
+
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+
+            broadcast_event(&SiemEvent {
+                timestamp,
+                severity: self.severity as u8,
+                event_type: self.action.to_string(),
+                json,
+            });
         }
     }
 }

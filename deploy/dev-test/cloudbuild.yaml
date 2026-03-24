@@ -1,0 +1,201 @@
+# ==============================================================================
+# MILNET SSO — Cloud Build Configuration
+# ==============================================================================
+# Builds all 8 service Docker images and pushes them to Artifact Registry.
+# Optionally deploys to Cloud Run.
+#
+# Trigger manually:
+#   gcloud builds submit . \
+#     --config=deploy/dev-test/cloudbuild.yaml \
+#     --substitutions=_REGION=asia-south1,_ENV_SUFFIX=dev
+#
+# Required substitutions:
+#   _REGION      — GCP region (default: asia-south1)
+#   _ENV_SUFFIX  — environment suffix (default: dev)
+#   _DEPLOY      — set to "true" to deploy to Cloud Run after build
+# ==============================================================================
+
+substitutions:
+  _REGION: asia-south1
+  _ENV_SUFFIX: dev
+  _DEPLOY: "false"
+  _AR_REPO: "${_REGION}-docker.pkg.dev/${PROJECT_ID}/milnet-sso-${_ENV_SUFFIX}"
+
+options:
+  machineType: E2_HIGHCPU_8
+  logging: CLOUD_LOGGING_ONLY
+  substitution_option: ALLOW_LOOSE
+
+timeout: 3600s
+
+steps:
+  # ── Step 1: Build all binaries in a single builder image ────────────────────
+  # This maximises cargo cache reuse across all 8 services.
+  - name: gcr.io/cloud-builders/docker
+    id: build-builder
+    args:
+      - build
+      - --target=builder
+      - --tag=builder:latest
+      - --build-arg=SERVICE_NAME=admin
+      - .
+    waitFor: ['-']
+
+  # ── Step 2: Build service images in parallel ────────────────────────────────
+  # Each service image copies its binary from the builder stage.
+
+  - name: gcr.io/cloud-builders/docker
+    id: build-gateway
+    args:
+      - build
+      - --build-arg=SERVICE_NAME=gateway
+      - --tag=${_AR_REPO}/gateway:${SHORT_SHA}
+      - --tag=${_AR_REPO}/gateway:latest
+      - .
+    waitFor: [build-builder]
+
+  - name: gcr.io/cloud-builders/docker
+    id: build-orchestrator
+    args:
+      - build
+      - --build-arg=SERVICE_NAME=orchestrator
+      - --tag=${_AR_REPO}/orchestrator:${SHORT_SHA}
+      - --tag=${_AR_REPO}/orchestrator:latest
+      - .
+    waitFor: [build-builder]
+
+  - name: gcr.io/cloud-builders/docker
+    id: build-opaque
+    args:
+      - build
+      - --build-arg=SERVICE_NAME=opaque
+      - --tag=${_AR_REPO}/opaque:${SHORT_SHA}
+      - --tag=${_AR_REPO}/opaque:latest
+      - .
+    waitFor: [build-builder]
+
+  - name: gcr.io/cloud-builders/docker
+    id: build-tss
+    args:
+      - build
+      - --build-arg=SERVICE_NAME=tss
+      - --tag=${_AR_REPO}/tss:${SHORT_SHA}
+      - --tag=${_AR_REPO}/tss:latest
+      - .
+    waitFor: [build-builder]
+
+  - name: gcr.io/cloud-builders/docker
+    id: build-verifier
+    args:
+      - build
+      - --build-arg=SERVICE_NAME=verifier
+      - --tag=${_AR_REPO}/verifier:${SHORT_SHA}
+      - --tag=${_AR_REPO}/verifier:latest
+      - .
+    waitFor: [build-builder]
+
+  - name: gcr.io/cloud-builders/docker
+    id: build-admin
+    args:
+      - build
+      - --build-arg=SERVICE_NAME=admin
+      - --tag=${_AR_REPO}/admin:${SHORT_SHA}
+      - --tag=${_AR_REPO}/admin:latest
+      - .
+    waitFor: [build-builder]
+
+  - name: gcr.io/cloud-builders/docker
+    id: build-ratchet
+    args:
+      - build
+      - --build-arg=SERVICE_NAME=ratchet
+      - --tag=${_AR_REPO}/ratchet:${SHORT_SHA}
+      - --tag=${_AR_REPO}/ratchet:latest
+      - .
+    waitFor: [build-builder]
+
+  - name: gcr.io/cloud-builders/docker
+    id: build-audit
+    args:
+      - build
+      - --build-arg=SERVICE_NAME=audit
+      - --tag=${_AR_REPO}/audit:${SHORT_SHA}
+      - --tag=${_AR_REPO}/audit:latest
+      - .
+    waitFor: [build-builder]
+
+  # ── Step 3: Conditional Cloud Run deployment ────────────────────────────────
+  # Only runs when _DEPLOY=true
+
+  - name: gcr.io/cloud-builders/gcloud
+    id: deploy-services
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        if [ "${_DEPLOY}" != "true" ]; then
+          echo "Skipping deployment (_DEPLOY != true)"
+          exit 0
+        fi
+
+        SERVICES="gateway orchestrator opaque tss verifier admin ratchet audit"
+        SUFFIX="${_ENV_SUFFIX}"
+
+        # Port mapping
+        declare -A PORTS=(
+          [gateway]=9100
+          [orchestrator]=9101
+          [opaque]=9102
+          [tss]=9103
+          [verifier]=9104
+          [admin]=8080
+          [ratchet]=9105
+          [audit]=9108
+        )
+
+        for SVC in $SERVICES; do
+          echo ">>> Deploying milnet-$${SVC}-$${SUFFIX}..."
+          gcloud run deploy "milnet-$${SVC}-$${SUFFIX}" \
+            --image="${_AR_REPO}/$${SVC}:${SHORT_SHA}" \
+            --region="${_REGION}" \
+            --platform=managed \
+            --port=$${PORTS[$SVC]} \
+            --cpu=1 \
+            --memory=512Mi \
+            --min-instances=0 \
+            --max-instances=2 \
+            --no-allow-unauthenticated \
+            --set-env-vars="SERVICE_NAME=$${SVC},RUST_LOG=info" \
+            --quiet \
+            || echo "WARNING: Failed to deploy $${SVC}"
+        done
+
+        echo ">>> All services deployed."
+    waitFor:
+      - build-gateway
+      - build-orchestrator
+      - build-opaque
+      - build-tss
+      - build-verifier
+      - build-admin
+      - build-ratchet
+      - build-audit
+
+# Push all images to Artifact Registry
+images:
+  - ${_AR_REPO}/gateway:${SHORT_SHA}
+  - ${_AR_REPO}/gateway:latest
+  - ${_AR_REPO}/orchestrator:${SHORT_SHA}
+  - ${_AR_REPO}/orchestrator:latest
+  - ${_AR_REPO}/opaque:${SHORT_SHA}
+  - ${_AR_REPO}/opaque:latest
+  - ${_AR_REPO}/tss:${SHORT_SHA}
+  - ${_AR_REPO}/tss:latest
+  - ${_AR_REPO}/verifier:${SHORT_SHA}
+  - ${_AR_REPO}/verifier:latest
+  - ${_AR_REPO}/admin:${SHORT_SHA}
+  - ${_AR_REPO}/admin:latest
+  - ${_AR_REPO}/ratchet:${SHORT_SHA}
+  - ${_AR_REPO}/ratchet:latest
+  - ${_AR_REPO}/audit:${SHORT_SHA}
+  - ${_AR_REPO}/audit:latest

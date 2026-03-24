@@ -1,45 +1,252 @@
-# Passwords must be provided via a .env file or external secret manager.
-# Example .env:
-#   MILNET_DB_PASSWORD=your_secure_password_here
-version: '3.8'
+# ==============================================================================
+# MILNET SSO — Docker Compose (Local Development & Testing)
+# ==============================================================================
+# Spins up all 8 microservices + PostgreSQL for local testing.
+#
+# Prerequisites:
+#   1. Create a .env file with: MILNET_DB_PASSWORD=<secure_password>
+#   2. docker compose up --build
+#
+# Service ports:
+#   gateway:      9100  (TCP — puzzle challenge + X-Wing KEM)
+#   orchestrator: 9101  (SHARD mTLS — auth coordination)
+#   opaque:       9102  (SHARD mTLS — OPAQUE password auth)
+#   tss:          9103  (SHARD mTLS — FROST threshold signing)
+#   verifier:     9104  (SHARD mTLS — token verification)
+#   ratchet:      9105  (SHARD mTLS — session ratcheting)
+#   audit:        9108  (SHARD mTLS — audit logging)
+#   admin:        8080  (HTTP REST API)
+#   postgres:     5432  (PostgreSQL)
+# ==============================================================================
 
 services:
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
   postgres:
-    image: postgres:16-alpine
+    image: postgres:15-alpine
     environment:
       POSTGRES_DB: milnet_sso
       POSTGRES_USER: milnet
-      POSTGRES_PASSWORD: ${MILNET_DB_PASSWORD:?Set MILNET_DB_PASSWORD}
+      POSTGRES_PASSWORD: ${MILNET_DB_PASSWORD:?Set MILNET_DB_PASSWORD in .env}
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U milnet"]
+      test: ["CMD-SHELL", "pg_isready -U milnet -d milnet_sso"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
+    networks:
+      - milnet
 
-  sso-admin:
-    build: .
-    depends_on:
-      postgres:
-        condition: service_healthy
+  # ── Audit Service ───────────────────────────────────────────────────────────
+  # Started first (no service dependencies, other services log to it)
+  audit:
+    build:
+      context: .
+      args:
+        SERVICE_NAME: audit
     environment:
-      DATABASE_URL: postgres://milnet:${MILNET_DB_PASSWORD:?Set MILNET_DB_PASSWORD}@postgres:5432/milnet_sso
-      ADMIN_PORT: 8080
+      AUDIT_ADDR: "0.0.0.0:9108"
+      AUDIT_DATA_DIR: /var/lib/milnet/audit
       RUST_LOG: info
-      # Google OAuth (optional — SSO login won't work without these)
+      DEVELOPER_MODE: "true"
+    ports:
+      - "9108:9108"
+    volumes:
+      - audit_data:/var/lib/milnet/audit
+    networks:
+      - milnet
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ── Ratchet Session Manager ─────────────────────────────────────────────────
+  ratchet:
+    build:
+      context: .
+      args:
+        SERVICE_NAME: ratchet
+    environment:
+      RATCHET_ADDR: "0.0.0.0:9105"
+      RUST_LOG: info
+      DEVELOPER_MODE: "true"
+    ports:
+      - "9105:9105"
+    networks:
+      - milnet
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ── OPAQUE Password Service ─────────────────────────────────────────────────
+  opaque:
+    build:
+      context: .
+      args:
+        SERVICE_NAME: opaque
+    environment:
+      OPAQUE_ADDR: "0.0.0.0:9102"
+      RUST_LOG: info
+      DEVELOPER_MODE: "true"
+    ports:
+      - "9102:9102"
+    networks:
+      - milnet
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ── TSS Threshold Signing ───────────────────────────────────────────────────
+  tss:
+    build:
+      context: .
+      args:
+        SERVICE_NAME: tss
+    environment:
+      TSS_ADDR: "0.0.0.0:9103"
+      TSS_NODE_ID: "0"
+      TSS_TOTAL_NODES: "5"
+      TSS_THRESHOLD: "3"
+      RUST_LOG: info
+      DEVELOPER_MODE: "true"
+    ports:
+      - "9103:9103"
+    networks:
+      - milnet
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ── Verifier ────────────────────────────────────────────────────────────────
+  verifier:
+    build:
+      context: .
+      args:
+        SERVICE_NAME: verifier
+    environment:
+      VERIFIER_ADDR: "0.0.0.0:9104"
+      RUST_LOG: info
+      DEVELOPER_MODE: "true"
+    ports:
+      - "9104:9104"
+    networks:
+      - milnet
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ── Orchestrator ────────────────────────────────────────────────────────────
+  orchestrator:
+    build:
+      context: .
+      args:
+        SERVICE_NAME: orchestrator
+    environment:
+      ORCH_LISTEN_ADDR: "0.0.0.0:9101"
+      OPAQUE_ADDR: "opaque:9102"
+      TSS_ADDR: "tss:9103"
+      RUST_LOG: info
+      DEVELOPER_MODE: "true"
+    ports:
+      - "9101:9101"
+    depends_on:
+      opaque:
+        condition: service_started
+      tss:
+        condition: service_started
+    networks:
+      - milnet
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ── Gateway ─────────────────────────────────────────────────────────────────
+  gateway:
+    build:
+      context: .
+      args:
+        SERVICE_NAME: gateway
+    environment:
+      GATEWAY_PORT: "9100"
+      GATEWAY_BIND_ADDR: "0.0.0.0"
+      ORCHESTRATOR_ADDR: "orchestrator:9101"
+      RUST_LOG: info
+      DEVELOPER_MODE: "true"
+    ports:
+      - "9100:9100"
+    depends_on:
+      orchestrator:
+        condition: service_started
+    networks:
+      - milnet
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ── Admin API ───────────────────────────────────────────────────────────────
+  admin:
+    build:
+      context: .
+      args:
+        SERVICE_NAME: admin
+    environment:
+      ADMIN_PORT: "8080"
+      ADMIN_BIND_ADDR: "0.0.0.0"
+      DATABASE_URL: "postgres://milnet:${MILNET_DB_PASSWORD:?Set MILNET_DB_PASSWORD}@postgres:5432/milnet_sso"
+      GATEWAY_ADDR: "gateway:9100"
+      ORCHESTRATOR_ADDR: "orchestrator:9101"
+      VERIFIER_ADDR: "verifier:9104"
+      RATCHET_ADDR: "ratchet:9105"
+      AUDIT_ADDR: "audit:9108"
+      RUST_LOG: info
+      DEVELOPER_MODE: "true"
+      # Google OAuth (optional)
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
       SSO_BASE_URL: ${SSO_BASE_URL:-http://localhost:8080}
     ports:
       - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      gateway:
+        condition: service_started
+      orchestrator:
+        condition: service_started
+      verifier:
+        condition: service_started
+      ratchet:
+        condition: service_started
+      audit:
+        condition: service_started
+    networks:
+      - milnet
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/api/health"]
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/api/health"]
       interval: 10s
       timeout: 5s
-      retries: 3
+      start_period: 15s
+      retries: 5
 
 volumes:
   pgdata:
+  audit_data:
+
+networks:
+  milnet:
+    driver: bridge

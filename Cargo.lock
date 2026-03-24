@@ -12,6 +12,7 @@ dependencies = [
  "common",
  "crypto",
  "fido",
+ "futures-core",
  "hex",
  "hkdf",
  "hmac",
@@ -30,6 +31,7 @@ dependencies = [
  "sqlx",
  "sso-protocol",
  "tokio",
+ "tokio-stream",
  "tower",
  "tower-http",
  "tracing",
@@ -3315,6 +3317,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
