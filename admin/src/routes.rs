@@ -267,6 +267,7 @@ async fn auth_middleware(
         || path == "/api/recovery/verify"
         || path.starts_with("/api/setup")
         || path == "/"
+        || path == "/challenge"
         || path == "/about"
         || path == "/pitch"
         || path == "/docs"
@@ -731,6 +732,9 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/recovery/verify", post(recovery_verify))
         .route("/api/recovery/status", get(recovery_status))
         .route("/api/recovery/revoke-all", delete(recovery_revoke_all))
+        // Public challenge page
+        .route("/", get(|| async { axum::response::Redirect::temporary("/challenge") }))
+        .route("/challenge", get(crate::challenge::challenge_page))
         // Static page redirects
         .route("/about", get(|| async { axum::response::Redirect::permanent("/about.html") }))
         .route("/pitch", get(|| async { axum::response::Redirect::permanent("/pitch.html") }))
