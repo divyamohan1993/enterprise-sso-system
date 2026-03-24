@@ -22,4 +22,5 @@ ml-dsa.workspace = true
 blake3.workspace = true
 tracing.workspace = true
 hex.workspace = true
+sha1 = "0.10"
 serde_json = "1"

@@ -4,8 +4,111 @@
 //! them in one place and operators can override them via environment or config
 //! file without touching code.
 
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
+/// Log verbosity level for the system.
+///
+/// Controls what gets logged.  `Verbose` logs everything including request
+/// details, crypto operations and timing; `Error` logs only errors and
+/// security events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    /// Log everything: requests, responses, crypto operations, timing.
+    Verbose = 0,
+    /// Log only errors and security events.
+    Error = 1,
+}
+
+impl LogLevel {
+    /// Convert from the atomic u8 representation.
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => LogLevel::Verbose,
+            _ => LogLevel::Error,
+        }
+    }
+}
+
+impl std::fmt::Display for LogLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LogLevel::Verbose => write!(f, "verbose"),
+            LogLevel::Error => write!(f, "error"),
+        }
+    }
+}
+
+/// Runtime-toggleable developer mode settings.
+///
+/// Uses atomics so that reads from hot paths (every request) are lock-free.
+/// Writes happen only through the admin API.
+pub struct DeveloperModeConfig {
+    enabled: AtomicBool,
+    log_level: AtomicU8,
+}
+
+impl DeveloperModeConfig {
+    /// Create a new config with developer mode disabled and log level Error.
+    pub const fn new() -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            log_level: AtomicU8::new(LogLevel::Error as u8),
+        }
+    }
+
+    /// Check whether developer mode is currently enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    /// Get the current log level.
+    pub fn log_level(&self) -> LogLevel {
+        LogLevel::from_u8(self.log_level.load(Ordering::Relaxed))
+    }
+
+    /// Enable or disable developer mode at runtime.
+    pub fn set_developer_mode(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
+        tracing::warn!(
+            developer_mode = enabled,
+            "developer mode {}",
+            if enabled { "ENABLED — detailed errors will be exposed in responses" } else { "DISABLED — production error masking active" }
+        );
+    }
+
+    /// Set the log level at runtime.
+    pub fn set_log_level(&self, level: LogLevel) {
+        self.log_level.store(level as u8, Ordering::Relaxed);
+        tracing::info!(log_level = %level, "log level changed");
+    }
+
+    /// Returns true if verbose logging is active (developer mode on AND level Verbose).
+    pub fn is_verbose(&self) -> bool {
+        self.is_enabled() && self.log_level() == LogLevel::Verbose
+    }
+}
+
+impl Default for DeveloperModeConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Global singleton for developer mode, accessible from any crate.
+static DEVELOPER_MODE: DeveloperModeConfig = DeveloperModeConfig::new();
+
+/// Get a reference to the global developer mode configuration.
+pub fn developer_mode() -> &'static DeveloperModeConfig {
+    &DEVELOPER_MODE
+}
+
 /// System-wide security configuration per spec.
 pub struct SecurityConfig {
+    /// Developer mode — exposes detailed errors in HTTP responses.
+    pub developer_mode: bool,
+    /// Log level — controls verbosity of structured logging.
+    pub log_level: LogLevel,
     /// Maximum session lifetime (8 hours).
     pub max_session_lifetime_secs: u64,
     /// Ratchet epoch length (10 seconds — stolen tokens expire within ±10s).
@@ -103,9 +206,30 @@ pub struct SecurityConfig {
     pub shard_encryption_enabled: bool,
 }
 
+impl SecurityConfig {
+    /// Apply the developer mode and log level from this config to the
+    /// global runtime toggle.  Called once at startup.
+    pub fn apply_developer_mode(&self) {
+        developer_mode().set_developer_mode(self.developer_mode);
+        developer_mode().set_log_level(self.log_level);
+    }
+
+    /// Toggle developer mode at runtime (called from admin API).
+    pub fn set_developer_mode(enabled: bool) {
+        developer_mode().set_developer_mode(enabled);
+    }
+
+    /// Set the log level at runtime (called from admin API).
+    pub fn set_log_level(level: LogLevel) {
+        developer_mode().set_log_level(level);
+    }
+}
+
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
+            developer_mode: false,
+            log_level: LogLevel::Error,
             max_session_lifetime_secs: 28800,
             ratchet_epoch_secs: 10,
             ratchet_lookahead_epochs: 1,
@@ -157,6 +281,7 @@ impl Default for SecurityConfig {
     }
 }
 
+// Second impl block for SecurityConfig: query methods and validation.
 impl SecurityConfig {
     /// Returns the token lifetime for a given device tier (1-4).
     pub fn token_lifetime_for_tier(&self, tier: u8) -> u64 {
@@ -242,6 +367,30 @@ impl SecurityConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_developer_mode_is_off() {
+        let cfg = SecurityConfig::default();
+        assert!(!cfg.developer_mode);
+        assert_eq!(cfg.log_level, LogLevel::Error);
+    }
+
+    #[test]
+    fn developer_mode_runtime_toggle() {
+        let dm = DeveloperModeConfig::new();
+        assert!(!dm.is_enabled());
+        assert_eq!(dm.log_level(), LogLevel::Error);
+
+        dm.set_developer_mode(true);
+        assert!(dm.is_enabled());
+
+        dm.set_log_level(LogLevel::Verbose);
+        assert_eq!(dm.log_level(), LogLevel::Verbose);
+        assert!(dm.is_verbose());
+
+        dm.set_developer_mode(false);
+        assert!(!dm.is_verbose());
+    }
 
     #[test]
     fn default_values_match_spec() {

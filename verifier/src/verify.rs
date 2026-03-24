@@ -87,24 +87,46 @@ fn verify_token_inner(
         ));
     }
 
-    // 4. Verify DPoP hash is non-empty (not all zeros) — reject tokens
-    //    with empty DPoP binding to prevent unbound token usage.
+    // 4. Tier-aware DPoP enforcement:
+    //    - Tier 1 (Sovereign), Tier 2 (Operational), Tier 4 (Emergency): DPoP MANDATORY
+    //    - Tier 3 (Sensor): DPoP optional
     let all_zeros = [0u8; 32];
-    if token.claims.dpop_hash == all_zeros {
-        return Err(MilnetError::CryptoVerification(
-            "DPoP hash is empty (all zeros) — token must be bound to a client key".into(),
-        ));
-    }
+    let dpop_mandatory = matches!(token.claims.tier, 1 | 2 | 4);
 
-    // 4b. If a client DPoP key is provided, verify the token's dpop_hash
-    //     actually matches the hash of that key. This prevents an attacker
-    //     from presenting a stolen token without possessing the original key.
-    if let Some(key) = client_dpop_key {
-        let expected_hash = crypto::dpop::dpop_key_hash(key);
-        if !crypto::ct::ct_eq(&token.claims.dpop_hash, &expected_hash) {
+    if dpop_mandatory {
+        // DPoP hash must be non-zero for mandatory tiers
+        if token.claims.dpop_hash == all_zeros {
             return Err(MilnetError::CryptoVerification(
-                "DPoP key hash mismatch — token bound to different client".into(),
+                "DPoP hash is empty (all zeros) — token must be bound to a client key".into(),
             ));
+        }
+        // Client MUST provide a matching DPoP key for mandatory tiers
+        match client_dpop_key {
+            Some(key) => {
+                let expected_hash = crypto::dpop::dpop_key_hash(key);
+                if !crypto::ct::ct_eq(&token.claims.dpop_hash, &expected_hash) {
+                    return Err(MilnetError::CryptoVerification(
+                        "DPoP key hash mismatch — token bound to different client".into(),
+                    ));
+                }
+            }
+            None => {
+                return Err(MilnetError::CryptoVerification(
+                    "DPoP client key is required for tier 1/2/4 tokens".into(),
+                ));
+            }
+        }
+    } else {
+        // Tier 3 (sensor): DPoP is optional — only verify if both present
+        if token.claims.dpop_hash != all_zeros {
+            if let Some(key) = client_dpop_key {
+                let expected_hash = crypto::dpop::dpop_key_hash(key);
+                if !crypto::ct::ct_eq(&token.claims.dpop_hash, &expected_hash) {
+                    return Err(MilnetError::CryptoVerification(
+                        "DPoP key hash mismatch — token bound to different client".into(),
+                    ));
+                }
+            }
         }
     }
 

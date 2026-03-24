@@ -35,3 +35,7 @@ pub mod key_rotation;
 pub mod retry;
 pub mod health;
 pub mod recovery;
+pub mod totp;
+
+// ── Developer mode & error response sanitisation ──
+pub mod error_response;

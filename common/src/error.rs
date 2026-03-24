@@ -62,3 +62,76 @@ pub enum MilnetError {
     #[error("canary violation — possible memory corruption")]
     CanaryViolation,
 }
+
+impl MilnetError {
+    /// Return a user-facing message appropriate for the current developer
+    /// mode setting.
+    ///
+    /// - In developer mode: includes the full error chain plus guidance.
+    /// - In production:     returns a generic safe message.
+    pub fn to_response_message(&self) -> String {
+        crate::error_response::sanitize(&self.to_string())
+    }
+
+    /// Return an actionable description of what the caller should do.
+    ///
+    /// This is always safe to show externally — it never leaks internals.
+    pub fn caller_guidance(&self) -> &'static str {
+        match self {
+            MilnetError::CryptoVerification(_) => {
+                "Retry the operation. If the error persists, re-authenticate."
+            }
+            MilnetError::ReceiptChain(_) => {
+                "Restart the authentication ceremony from step 1."
+            }
+            MilnetError::TokenExpired => {
+                "Your session has expired. Please log in again."
+            }
+            MilnetError::InsufficientTier { .. } => {
+                "Your device does not meet the required security tier for this action."
+            }
+            MilnetError::CeremonyReplay => {
+                "This ceremony has already been used. Start a new one."
+            }
+            MilnetError::QuorumNotMet => {
+                "Not enough approvers have signed. Wait for additional approvals."
+            }
+            MilnetError::Shard(_) => {
+                "An internal communication error occurred. Try again shortly."
+            }
+            MilnetError::Serialization(_) => {
+                "Invalid request format. Check the request body and try again."
+            }
+            MilnetError::AuditUnavailable => {
+                "The audit subsystem is temporarily unavailable. Operations are paused for safety."
+            }
+            MilnetError::EnvelopeEncryption(_) | MilnetError::EnvelopeDecryption(_) => {
+                "A data protection error occurred. Contact your administrator."
+            }
+            MilnetError::KeySeal(_) => {
+                "Key management error. Contact your administrator."
+            }
+            MilnetError::EntropyHealth(_) => {
+                "System entropy is degraded. The system will resume when hardware RNG recovers."
+            }
+            MilnetError::AttestationFailure(_) => {
+                "Binary integrity check failed. The system cannot start until resolved."
+            }
+            MilnetError::SecureMemory(_) => {
+                "Secure memory allocation failed. Contact your administrator."
+            }
+            MilnetError::ProductionViolation(_) => {
+                "A required production security setting is misconfigured."
+            }
+            MilnetError::SessionLimitExceeded { .. } => {
+                "You have too many active sessions. Log out of another session first."
+            }
+            MilnetError::ForcedReauth => {
+                "Your session requires re-authentication. Please log in again."
+            }
+            MilnetError::CanaryViolation => {
+                "Memory integrity check failed. Contact your administrator immediately."
+            }
+        }
+    }
+}

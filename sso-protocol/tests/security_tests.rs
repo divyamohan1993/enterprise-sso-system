@@ -19,10 +19,11 @@ fn test_pkce_challenge_is_base64url_no_padding() {
 }
 
 #[test]
-fn test_pkce_empty_verifier_produces_valid_challenge() {
+fn test_pkce_empty_verifier_rejected_by_length_check() {
     let challenge = pkce::generate_challenge("");
     assert!(!challenge.is_empty());
-    assert!(pkce::verify_pkce("", &challenge));
+    // Empty verifier must be rejected per RFC 7636 (min 43 chars)
+    assert!(!pkce::verify_pkce("", &challenge));
 }
 
 #[test]

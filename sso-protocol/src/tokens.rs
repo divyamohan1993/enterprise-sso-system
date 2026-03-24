@@ -201,3 +201,32 @@ fn verify_id_token_inner(
 
     Ok(claims)
 }
+
+/// Verify an ML-DSA-87-signed JWT with audience and optional nonce validation.
+///
+/// Performs full signature verification, audience check, and — when
+/// `expected_nonce` is `Some` — verifies that the token's nonce matches
+/// using constant-time comparison.
+pub fn verify_id_token_full(
+    token: &str,
+    verifying_key: &PqVerifyingKey,
+    expected_audience: &str,
+    expected_nonce: Option<&str>,
+) -> Result<IdTokenClaims, String> {
+    let claims = verify_id_token_with_audience(token, verifying_key, expected_audience, true)?;
+
+    if let Some(nonce) = expected_nonce {
+        match &claims.nonce {
+            Some(token_nonce) => {
+                if !crypto::ct::ct_eq(token_nonce.as_bytes(), nonce.as_bytes()) {
+                    return Err("nonce mismatch: token nonce does not match expected nonce".into());
+                }
+            }
+            None => {
+                return Err("expected nonce but token has no nonce claim".into());
+            }
+        }
+    }
+
+    Ok(claims)
+}

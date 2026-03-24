@@ -2,12 +2,12 @@ use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_http::services::ServeDir;
@@ -198,6 +198,10 @@ pub struct AppState {
     pub pq_signing_key: crypto::pq_sign::PqSigningKey,
     pub session_tracker: Arc<common::session_limits::SessionTracker>,
     pub revocation_list: RwLock<RevocationList>,
+    /// Atomic developer-mode flag — mirrors the global in common::config.
+    pub developer_mode: AtomicBool,
+    /// Atomic log-level flag (0 = Verbose, 1 = Error).
+    pub developer_log_level: AtomicU8,
 }
 
 /// Entry in the access_tokens map, pairing a user ID with a last-activity
@@ -696,6 +700,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/auth/login", post(auth_login))
         .route("/api/auth/verify", post(auth_verify))
         .route("/api/auth/duress-pin", post(register_duress_pin))
+        .route("/api/auth/logout", post(auth_logout))
         // Key Transparency
         .route("/api/kt/root", get(get_kt_root))
         .route("/api/kt/proof/{index}", get(get_kt_proof))
@@ -739,6 +744,9 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         // Token revocation
         .route("/api/tokens/revoke", post(revoke_token))
         .route("/api/tokens/revoked", get(revoked_token_count))
+        // Developer mode
+        .route("/api/admin/developer-mode", put(set_developer_mode))
+        .route("/api/admin/developer-mode", get(get_developer_mode))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .layer(middleware::from_fn(origin_and_content_type_middleware))
         .layer(middleware::from_fn(security_headers_middleware))
@@ -1637,9 +1645,21 @@ async fn auth_login(
             entry.0 += 1;
             drop(attempts);
 
+            // Always log the full internal error
+            tracing::warn!(
+                username = %req.username,
+                error = %e,
+                "login failed"
+            );
+
+            // Sanitise the error for the HTTP response based on developer mode
+            let external_msg = common::error_response::sanitize(
+                &format!("authentication failed: {e}")
+            );
+
             Json(LoginResponse {
                 success: false,
-                error: Some(format!("authentication failed: {e}")),
+                error: Some(external_msg),
                 ..Default::default()
             })
         }
@@ -1701,6 +1721,92 @@ async fn auth_verify(Json(req): Json<VerifyRequest>) -> Json<VerifyResponse> {
             error: Some("signature verification failed".into()),
         })
     }
+}
+
+/// POST /api/auth/logout — invalidate the caller's Bearer token.
+async fn auth_logout(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> StatusCode {
+    let token = match request
+        .headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(h) if h.starts_with("Bearer ") => h[7..].to_string(),
+        _ => return StatusCode::UNAUTHORIZED,
+    };
+
+    // Remove from access_tokens
+    {
+        let mut tokens = state.access_tokens.write().await;
+        tokens.remove(&token);
+    }
+
+    // Add token hash to revocation list
+    {
+        use sha2::Digest;
+        let hash = sha2::Sha256::digest(token.as_bytes());
+        let mut token_id = [0u8; 16];
+        token_id.copy_from_slice(&hash[..16]);
+        let mut revocation = state.revocation_list.write().await;
+        revocation.revoke(token_id);
+    }
+
+    // Remove from session_activity
+    {
+        let mut activity = state.session_activity.write().await;
+        activity.remove(&token);
+    }
+
+    // Log audit event
+    {
+        let mut audit = state.audit_log.write().await;
+        audit.append_signed(
+            common::types::AuditEventType::CredentialRevoked,
+            vec![],
+            vec![],
+            0.0,
+            vec![],
+            &state.pq_signing_key,
+        );
+    }
+
+    tracing::info!("auth_logout: token invalidated");
+    StatusCode::NO_CONTENT
+}
+
+// ---------------------------------------------------------------------------
+// TTL eviction background task
+// ---------------------------------------------------------------------------
+
+/// Spawn a background task that periodically evicts stale entries from
+/// in-memory maps to prevent unbounded memory growth.
+pub fn spawn_ttl_eviction_task(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            let now = now_secs();
+
+            // Clean access_tokens older than 15 min
+            {
+                let mut tokens = state.access_tokens.write().await;
+                tokens.retain(|_, entry| now - entry.last_activity < 15 * 60);
+            }
+
+            // Clean session_activity older than 30 min
+            {
+                let mut activity = state.session_activity.write().await;
+                activity.retain(|_, &mut last| now - last < 30 * 60);
+            }
+
+            // Clean login_attempts older than 30 min
+            {
+                let mut attempts = state.login_attempts.write().await;
+                attempts.retain(|_, (_, first_time)| now - *first_time < 30 * 60);
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -2131,6 +2237,106 @@ async fn revoked_token_count(
     let revocation = state.revocation_list.read().await;
     let count = revocation.count();
     Json(serde_json::json!({"revoked_count": count}))
+}
+
+// ---------------------------------------------------------------------------
+// Developer mode handlers
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct DeveloperModeRequest {
+    enabled: bool,
+    #[serde(default)]
+    log_level: Option<String>,
+}
+
+#[derive(Serialize)]
+struct DeveloperModeResponse {
+    developer_mode: bool,
+    log_level: String,
+}
+
+/// PUT /api/admin/developer-mode — toggle developer mode (super-admin only).
+///
+/// Requires the admin API key as a Bearer token.  Updates both the local
+/// AppState atomics and the global `common::config::developer_mode()` toggle
+/// so all crates see the change immediately.
+async fn set_developer_mode(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<DeveloperModeRequest>,
+) -> Result<Json<DeveloperModeResponse>, StatusCode> {
+    // Require super-admin (admin API key) — not just any authenticated user.
+    let auth_header = headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let token = auth_header.strip_prefix("Bearer ").unwrap_or("");
+    if !crypto::ct::ct_eq(token.as_bytes(), state.admin_api_key.as_bytes()) {
+        tracing::warn!("developer-mode toggle rejected: not super-admin");
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    // Parse log level (default to "error" if not provided)
+    let log_level = match body.log_level.as_deref() {
+        Some("verbose") => common::config::LogLevel::Verbose,
+        Some("error") | None => common::config::LogLevel::Error,
+        Some(other) => {
+            tracing::warn!(invalid_level = other, "invalid log_level in developer-mode request");
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    };
+
+    // Update local state atomics
+    state.developer_mode.store(body.enabled, Ordering::Relaxed);
+    state.developer_log_level.store(log_level as u8, Ordering::Relaxed);
+
+    // Update the global toggle so all crates (gateway, orchestrator, etc.) see it
+    common::config::SecurityConfig::set_developer_mode(body.enabled);
+    common::config::SecurityConfig::set_log_level(log_level);
+
+    // Emit SIEM event for auditability
+    common::siem::SecurityEvent::key_rotation(&format!(
+        "developer_mode={}, log_level={}",
+        body.enabled, log_level
+    ));
+
+    tracing::info!(
+        developer_mode = body.enabled,
+        log_level = %log_level,
+        "developer mode settings updated via admin API"
+    );
+
+    Ok(Json(DeveloperModeResponse {
+        developer_mode: body.enabled,
+        log_level: log_level.to_string(),
+    }))
+}
+
+/// GET /api/admin/developer-mode — read current developer mode settings.
+async fn get_developer_mode(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<DeveloperModeResponse>, StatusCode> {
+    // Require super-admin
+    let auth_header = headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let token = auth_header.strip_prefix("Bearer ").unwrap_or("");
+    if !crypto::ct::ct_eq(token.as_bytes(), state.admin_api_key.as_bytes()) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let enabled = state.developer_mode.load(Ordering::Relaxed);
+    let level = common::config::LogLevel::from_u8(
+        state.developer_log_level.load(Ordering::Relaxed),
+    );
+
+    Ok(Json(DeveloperModeResponse {
+        developer_mode: enabled,
+        log_level: level.to_string(),
+    }))
 }
 
 // ---------------------------------------------------------------------------

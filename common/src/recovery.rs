@@ -85,6 +85,51 @@ pub fn max_codes_per_user() -> usize {
     MAX_CODES_PER_USER
 }
 
+// ---------------------------------------------------------------------------
+// Recovery rate limiter
+// ---------------------------------------------------------------------------
+
+/// Rate limiter for recovery code attempts: max 3 attempts per 15-minute window.
+pub struct RecoveryRateLimiter {
+    attempts: std::collections::HashMap<uuid::Uuid, (u32, i64)>, // (count, window_start)
+}
+
+impl RecoveryRateLimiter {
+    /// Window duration in seconds (15 minutes).
+    const WINDOW_SECS: i64 = 15 * 60;
+    /// Maximum attempts per window.
+    const MAX_ATTEMPTS: u32 = 3;
+
+    pub fn new() -> Self {
+        Self {
+            attempts: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Check if the user is allowed to attempt recovery, and record the attempt.
+    /// Returns `Ok(())` if allowed, `Err` if rate limited.
+    pub fn check_and_record(&mut self, user_id: uuid::Uuid, now: i64) -> Result<(), &'static str> {
+        let entry = self.attempts.entry(user_id).or_insert((0, now));
+
+        // Reset window if expired
+        if now - entry.1 >= Self::WINDOW_SECS {
+            *entry = (0, now);
+        }
+
+        if entry.0 >= Self::MAX_ATTEMPTS {
+            return Err("recovery rate limit exceeded: max 3 attempts per 15 minutes");
+        }
+
+        entry.0 += 1;
+        Ok(())
+    }
+
+    /// Reset the rate limiter for a specific user (e.g., after successful recovery).
+    pub fn reset(&mut self, user_id: &uuid::Uuid) {
+        self.attempts.remove(user_id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +189,63 @@ mod tests {
                 assert_ne!(displays[i], displays[j]);
             }
         }
+    }
+
+    // ── RecoveryRateLimiter tests ──
+
+    #[test]
+    fn test_rate_limiter_allows_up_to_3() {
+        let mut limiter = RecoveryRateLimiter::new();
+        let user = uuid::Uuid::new_v4();
+        let now = 1000;
+        assert!(limiter.check_and_record(user, now).is_ok());
+        assert!(limiter.check_and_record(user, now + 1).is_ok());
+        assert!(limiter.check_and_record(user, now + 2).is_ok());
+        // 4th should fail
+        assert!(limiter.check_and_record(user, now + 3).is_err());
+    }
+
+    #[test]
+    fn test_rate_limiter_resets_after_window() {
+        let mut limiter = RecoveryRateLimiter::new();
+        let user = uuid::Uuid::new_v4();
+        let now = 1000;
+        assert!(limiter.check_and_record(user, now).is_ok());
+        assert!(limiter.check_and_record(user, now).is_ok());
+        assert!(limiter.check_and_record(user, now).is_ok());
+        assert!(limiter.check_and_record(user, now).is_err());
+
+        // After 15 minutes, window resets
+        let later = now + 15 * 60;
+        assert!(limiter.check_and_record(user, later).is_ok());
+    }
+
+    #[test]
+    fn test_rate_limiter_reset_user() {
+        let mut limiter = RecoveryRateLimiter::new();
+        let user = uuid::Uuid::new_v4();
+        let now = 1000;
+        assert!(limiter.check_and_record(user, now).is_ok());
+        assert!(limiter.check_and_record(user, now).is_ok());
+        assert!(limiter.check_and_record(user, now).is_ok());
+        assert!(limiter.check_and_record(user, now).is_err());
+
+        limiter.reset(&user);
+        assert!(limiter.check_and_record(user, now).is_ok());
+    }
+
+    #[test]
+    fn test_rate_limiter_independent_users() {
+        let mut limiter = RecoveryRateLimiter::new();
+        let user1 = uuid::Uuid::new_v4();
+        let user2 = uuid::Uuid::new_v4();
+        let now = 1000;
+        // Exhaust user1
+        for _ in 0..3 {
+            assert!(limiter.check_and_record(user1, now).is_ok());
+        }
+        assert!(limiter.check_and_record(user1, now).is_err());
+        // user2 should still be allowed
+        assert!(limiter.check_and_record(user2, now).is_ok());
     }
 }

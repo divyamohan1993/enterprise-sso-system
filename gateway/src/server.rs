@@ -15,7 +15,7 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{error, info, warn, debug};
 
 use common::types::ModuleId;
 use shard::tls_transport::tls_connect;
@@ -162,9 +162,22 @@ impl GatewayServer {
             let orch = self.orchestrator.clone();
             let counter = self.active_connections.clone();
             let server_pk = self.xwing_server_pk.clone();
+            // Verbose logging: log incoming connection details
+            common::error_response::verbose_log_fields(
+                "gateway",
+                "incoming connection",
+                &[
+                    ("source_ip", &addr.ip().to_string()),
+                    ("source_port", &addr.port().to_string()),
+                    ("active_connections", &active.to_string()),
+                    ("puzzle_difficulty", &difficulty.to_string()),
+                ],
+            );
             tokio::spawn(async move {
                 if let Err(e) = handle_connection(stream, difficulty, orch, server_pk).await {
-                    warn!("connection from {addr} failed: {e}");
+                    // In production, mask the error; always log internally
+                    let internal_msg = common::error_response::log_error_with_location(&e);
+                    warn!("connection from {addr} failed: {internal_msg}");
                 }
                 counter.fetch_sub(1, Ordering::Relaxed);
             });
@@ -245,20 +258,24 @@ async fn handle_connection(
     orchestrator: Option<Arc<OrchestratorConfig>>,
     server_xwing_pk: Arc<Vec<u8>>,
 ) -> Result<(), String> {
+    let conn_start = Instant::now();
+
     // 1. Send puzzle challenge with the server's X-Wing public key
     let mut challenge = generate_challenge(difficulty);
     challenge.xwing_server_pk = Some((*server_xwing_pk).clone());
     send_frame_with_timeout(&mut stream, &challenge).await?;
+    common::error_response::verbose_log("gateway", "puzzle challenge sent");
 
     // 2. Read puzzle solution (expected to contain the client's X-Wing public key)
     let solution: PuzzleSolution = recv_frame_with_timeout(&mut stream).await?;
 
     // 3. Verify solution
+    common::error_response::verbose_log("gateway", "puzzle solution received, verifying");
     if !crypto::ct::ct_eq_32(&solution.nonce, &challenge.nonce) {
         let resp = AuthResponse {
             success: false,
             token: None,
-            error: Some("nonce mismatch".into()),
+            error: Some(common::error_response::sanitize("nonce mismatch")),
         };
         send_frame_with_timeout(&mut stream, &resp).await?;
         return Err("nonce mismatch".into());
@@ -268,11 +285,18 @@ async fn handle_connection(
         let resp = AuthResponse {
             success: false,
             token: None,
-            error: Some("invalid puzzle solution".into()),
+            error: Some(common::error_response::sanitize("invalid puzzle solution")),
         };
         send_frame_with_timeout(&mut stream, &resp).await?;
         return Err("invalid puzzle solution".into());
     }
+
+    common::error_response::log_crypto_operation("puzzle_verify", "SHA-256", "puzzle");
+    common::error_response::verbose_log_fields(
+        "gateway",
+        "puzzle solution verified",
+        &[("elapsed_ms", &conn_start.elapsed().as_millis().to_string())],
+    );
 
     // 4. X-Wing hybrid KEM key exchange (ML-KEM-1024 + X25519)
     //
@@ -295,6 +319,8 @@ async fn handle_connection(
             .map_err(|e| format!("KEM encapsulate task: {e}"))?
     };
 
+    common::error_response::log_crypto_operation("kem_encapsulate", "X-Wing (ML-KEM-1024 + X25519)", "client_pk");
+
     // 5. Send the KEM ciphertext to the client so it can decapsulate
     let kem_msg = KemCiphertext {
         ciphertext: kem_ct.to_bytes(),
@@ -306,13 +332,17 @@ async fn handle_connection(
     //    The derived key is 64 bytes; we use the first 32 bytes for AES-256-GCM.
     let session_key = crypto::xwing::derive_session_key(&shared_secret, &challenge.nonce);
     let enc_key: [u8; 32] = session_key[..32].try_into().expect("session key >= 32 bytes");
-    tracing::debug!("X-Wing KEM: session key established (hybrid PQ + classical)");
+    common::error_response::log_crypto_operation("key_derive", "HKDF-SHA512", "session_key");
+    debug!("X-Wing KEM: session key established (hybrid PQ + classical)");
 
     // 7. Read encrypted auth request
     let encrypted_auth = recv_raw_frame_with_timeout(&mut stream).await?;
     let auth_plaintext = decrypt_frame(&enc_key, &encrypted_auth)?;
     let auth_req: AuthRequest = postcard::from_bytes(&auth_plaintext)
         .map_err(|e| format!("deserialize auth request: {e}"))?;
+
+    common::error_response::log_crypto_operation("decrypt_frame", "AES-256-GCM", "session_key");
+    common::error_response::verbose_log("gateway", "auth request decrypted and deserialized");
 
     // 8. Forward to orchestrator via SHARD (or stub if not configured)
     // Record the start time before processing the auth request so we can
@@ -328,11 +358,12 @@ async fn handle_connection(
         match forward_to_orchestrator(&auth_req, &orch, client_pk_hash).await {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!("orchestrator error: {e}");
+                let internal_msg = common::error_response::log_error_with_location(&e);
+                tracing::warn!("orchestrator error: {internal_msg}");
                 AuthResponse {
                     success: false,
                     token: None,
-                    error: Some("authentication failed".to_string()),
+                    error: Some(common::error_response::sanitize(&e)),
                 }
             }
         }

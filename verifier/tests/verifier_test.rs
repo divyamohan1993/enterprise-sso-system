@@ -94,6 +94,8 @@ fn build_signed_token_legacy(
 }
 
 /// Helper: create claims that expire in the future.
+/// Uses tier 3 (sensor) where DPoP is optional, so tests that don't
+/// provide a DPoP client key still pass.
 fn future_claims() -> TokenClaims {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -106,6 +108,27 @@ fn future_claims() -> TokenClaims {
         exp: now + 30_000_000, // +30 seconds
         scope: 0x0000_000F,
         dpop_hash: [0xBB; 32],
+        ceremony_id: [0xCC; 32],
+        tier: 3,
+        ratchet_epoch: 1,
+        token_id: [0xAB; 16],
+        aud: None,
+    }
+}
+
+/// Helper: create tier-2 claims for DPoP-mandatory tests.
+fn future_claims_tier2() -> TokenClaims {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64;
+    TokenClaims {
+        sub: Uuid::new_v4(),
+        iss: [0x01; 32],
+        iat: now,
+        exp: now + 30_000_000,
+        scope: 0x0000_000F,
+        dpop_hash: crypto::dpop::dpop_key_hash(&[0xDD; 32]),
         ceremony_id: [0xCC; 32],
         tier: 2,
         ratchet_epoch: 1,
@@ -395,4 +418,47 @@ fn test_tampered_pq_signature_rejected() {
         matches!(result.unwrap_err(), MilnetError::CryptoVerification(_)),
         "expected CryptoVerification error for tampered PQ sig"
     );
+}
+
+// ── DPoP tier-aware enforcement tests ─────────────────────────────────
+
+#[test]
+fn test_tier2_dpop_mandatory_rejects_without_client_key() {
+    let mut dkg = threshold::dkg(5, 3);
+    let (pq_sk, pq_vk) = test_pq_keypair();
+    let claims = future_claims_tier2();
+    let token = build_signed_token_legacy(&mut dkg, claims, &pq_sk);
+
+    // verify_token passes None for client_dpop_key -> should fail for tier 2
+    let result = verifier::verify_token(&token, &dkg.group.public_key_package, &pq_vk);
+    assert!(result.is_err(), "tier 2 without DPoP client key should fail");
+}
+
+#[test]
+fn test_tier2_dpop_mandatory_accepts_with_matching_key() {
+    let mut dkg = threshold::dkg(5, 3);
+    let (pq_sk, pq_vk) = test_pq_keypair();
+    let claims = future_claims_tier2();
+    let token = build_signed_token_legacy(&mut dkg, claims, &pq_sk);
+
+    // verify_token_bound with the correct DPoP key should pass
+    let result = verifier::verify_token_bound(
+        &token,
+        &dkg.group.public_key_package,
+        &pq_vk,
+        &[0xDD; 32],
+    );
+    assert!(result.is_ok(), "tier 2 with matching DPoP key should pass: {:?}", result.err());
+}
+
+#[test]
+fn test_tier3_dpop_optional_passes_without_client_key() {
+    let mut dkg = threshold::dkg(5, 3);
+    let (pq_sk, pq_vk) = test_pq_keypair();
+    let claims = future_claims(); // tier 3
+    let token = build_signed_token_legacy(&mut dkg, claims, &pq_sk);
+
+    // verify_token passes None for client_dpop_key -> should pass for tier 3
+    let result = verifier::verify_token(&token, &dkg.group.public_key_package, &pq_vk);
+    assert!(result.is_ok(), "tier 3 without DPoP client key should pass: {:?}", result.err());
 }

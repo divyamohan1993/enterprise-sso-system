@@ -332,3 +332,84 @@ fn test_jwks_json_has_mldsa87_fields() {
     // Must have pub (ML-DSA-87 verifying key)
     assert!(k["pub"].as_str().unwrap().len() > 10);
 }
+
+#[test]
+fn test_verify_id_token_full_with_nonce() {
+    let user_id = Uuid::new_v4();
+    let signing_key = OidcSigningKey::generate();
+
+    let token = tokens::create_id_token(
+        "https://sso.example.com",
+        &user_id,
+        "client-abc",
+        Some("my-nonce-123".into()),
+        &signing_key,
+    );
+
+    // Correct nonce should pass
+    let result = tokens::verify_id_token_full(
+        &token,
+        signing_key.verifying_key(),
+        "client-abc",
+        Some("my-nonce-123"),
+    );
+    assert!(result.is_ok(), "verify_id_token_full should pass with matching nonce: {:?}", result.err());
+
+    // Wrong nonce should fail
+    let result = tokens::verify_id_token_full(
+        &token,
+        signing_key.verifying_key(),
+        "client-abc",
+        Some("wrong-nonce"),
+    );
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("nonce mismatch"));
+}
+
+#[test]
+fn test_verify_id_token_full_nonce_expected_but_missing() {
+    let user_id = Uuid::new_v4();
+    let signing_key = OidcSigningKey::generate();
+
+    // Create token without nonce
+    let token = tokens::create_id_token(
+        "https://sso.example.com",
+        &user_id,
+        "client-abc",
+        None,
+        &signing_key,
+    );
+
+    // Expecting nonce but token has none -> error
+    let result = tokens::verify_id_token_full(
+        &token,
+        signing_key.verifying_key(),
+        "client-abc",
+        Some("expected-nonce"),
+    );
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("no nonce"));
+}
+
+#[test]
+fn test_verify_id_token_full_no_nonce_expected() {
+    let user_id = Uuid::new_v4();
+    let signing_key = OidcSigningKey::generate();
+
+    let token = tokens::create_id_token(
+        "https://sso.example.com",
+        &user_id,
+        "client-abc",
+        Some("some-nonce".into()),
+        &signing_key,
+    );
+
+    // No expected nonce -> should pass regardless
+    let result = tokens::verify_id_token_full(
+        &token,
+        signing_key.verifying_key(),
+        "client-abc",
+        None,
+    );
+    assert!(result.is_ok());
+}

@@ -5,9 +5,25 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+/// Validate that a PKCE code_verifier is 43-128 characters per RFC 7636 Section 4.1.
+pub fn validate_verifier_length(verifier: &str) -> Result<(), &'static str> {
+    let len = verifier.len();
+    if len < 43 {
+        Err("PKCE code_verifier too short: minimum 43 characters per RFC 7636")
+    } else if len > 128 {
+        Err("PKCE code_verifier too long: maximum 128 characters per RFC 7636")
+    } else {
+        Ok(())
+    }
+}
+
 /// Verify a PKCE code_verifier against a stored code_challenge (S256 method).
 /// Uses constant-time comparison as a defense-in-depth measure.
+/// Returns false if the verifier length is outside the RFC 7636 range (43-128).
 pub fn verify_pkce(code_verifier: &str, code_challenge: &str) -> bool {
+    if validate_verifier_length(code_verifier).is_err() {
+        return false;
+    }
     let hash = Sha256::digest(code_verifier.as_bytes());
     let computed = URL_SAFE_NO_PAD.encode(hash);
     let a = computed.as_bytes();
@@ -42,6 +58,7 @@ pub fn verify_pkce_mandatory(
     if challenge.is_empty() || verifier.is_empty() {
         return Err("PKCE code_challenge and code_verifier must not be empty");
     }
+    validate_verifier_length(verifier)?;
     if verify_pkce(verifier, challenge) {
         Ok(())
     } else {
@@ -52,4 +69,63 @@ pub fn verify_pkce_mandatory(
 pub fn generate_challenge(verifier: &str) -> String {
     let hash = Sha256::digest(verifier.as_bytes());
     URL_SAFE_NO_PAD.encode(hash)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_verifier_length_42_chars_rejected() {
+        let verifier = "a".repeat(42);
+        assert!(validate_verifier_length(&verifier).is_err());
+    }
+
+    #[test]
+    fn test_verifier_length_43_chars_accepted() {
+        let verifier = "a".repeat(43);
+        assert!(validate_verifier_length(&verifier).is_ok());
+    }
+
+    #[test]
+    fn test_verifier_length_128_chars_accepted() {
+        let verifier = "a".repeat(128);
+        assert!(validate_verifier_length(&verifier).is_ok());
+    }
+
+    #[test]
+    fn test_verifier_length_129_chars_rejected() {
+        let verifier = "a".repeat(129);
+        assert!(validate_verifier_length(&verifier).is_err());
+    }
+
+    #[test]
+    fn test_verify_pkce_rejects_short_verifier() {
+        let verifier = "a".repeat(42);
+        let challenge = generate_challenge(&verifier);
+        assert!(!verify_pkce(&verifier, &challenge));
+    }
+
+    #[test]
+    fn test_verify_pkce_rejects_long_verifier() {
+        let verifier = "a".repeat(129);
+        let challenge = generate_challenge(&verifier);
+        assert!(!verify_pkce(&verifier, &challenge));
+    }
+
+    #[test]
+    fn test_verify_pkce_mandatory_rejects_short_verifier() {
+        let verifier = "a".repeat(42);
+        let challenge = generate_challenge(&verifier);
+        let result = verify_pkce_mandatory(Some(&verifier), Some(&challenge));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("too short"));
+    }
+
+    #[test]
+    fn test_verify_pkce_valid_length() {
+        let verifier = "a".repeat(43);
+        let challenge = generate_challenge(&verifier);
+        assert!(verify_pkce(&verifier, &challenge));
+    }
 }

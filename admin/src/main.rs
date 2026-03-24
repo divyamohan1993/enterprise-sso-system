@@ -156,6 +156,8 @@ async fn main() {
             common::config::SecurityConfig::default().max_concurrent_sessions_per_user,
         )),
         revocation_list: RwLock::new(admin::routes::RevocationList::new()),
+        developer_mode: std::sync::atomic::AtomicBool::new(false),
+        developer_log_level: std::sync::atomic::AtomicU8::new(common::config::LogLevel::Error as u8),
     });
 
     // Start the key rotation monitor in the background
