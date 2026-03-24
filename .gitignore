@@ -56,7 +56,7 @@ temp/
 # Debug
 .debug/
 
-# Terraform state (generated)
+# Terraform state and actual config (NEVER COMMIT)
 terraform/.terraform/
 terraform/.terraform.lock.hcl
 terraform/terraform.tfstate
@@ -64,6 +64,8 @@ terraform/terraform.tfstate.backup
 *.tfstate
 *.tfstate.backup
 .terraform/
+**/terraform.tfvars
+**/.terraform.lock.hcl
 
 # Database (generated)
 *.db
