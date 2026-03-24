@@ -45,7 +45,7 @@ tr:hover td{background:#111}
 
 pre{background:#050505;border:1px solid #1a1a2e;padding:1rem;overflow-x:auto;font-size:0.78rem;line-height:1.5;color:#00bcd4}
 
-.warn{color:#ff9800}
+.warn{color:#ff9800}.ok{color:#00ff41}
 .red{color:#ff4444}
 .green{color:#00ff41}
 .cyan{color:#00bcd4}
@@ -221,12 +221,14 @@ footer .tagline{color:#00ff41;font-size:0.9rem;margin-bottom:0.5rem}
   We believe in transparency. These are the current gaps we know about:
 </p>
 <ul>
-  <li><span class="warn">Dev KEK:</span> Master key-encryption-key is derived from a static seed in non-production mode (env-configurable)</li>
-  <li><span class="warn">No vTPM:</span> Platform attestation checks run but vTPM hardware is not available on SPOT VMs</li>
-  <li><span class="warn">TSS on shared VM:</span> All 3 FROST threshold nodes run on the same VM (cost constraint); production would separate them</li>
-  <li><span class="warn">Plain TCP internal:</span> Inter-service communication between VMs uses unencrypted TCP (relies on VPC firewall rules)</li>
-  <li><span class="warn">SPOT VMs:</span> Instances may be preempted by GCP; this is a sandbox, not HA</li>
-  <li><span class="warn">Single Cloud SQL:</span> No read replicas, no multi-region failover</li>
+  <li><span class="ok">Master KEK:</span> 256-bit random, stored in GCP Secret Manager, fetched at runtime via IAM — never on disk, never in metadata</li>
+  <li><span class="ok">Cloud KMS HSM:</span> FIPS 140-3 Level 3 hardware security module — key material never leaves the hardware</li>
+  <li><span class="ok">DB Password:</span> 80-char random, stored in Secret Manager, auto-rotatable — never plaintext anywhere</li>
+  <li><span class="ok">3-VM Isolation:</span> Gateway, Core, and TSS on separate VMs with separate service accounts and unique HMAC keys</li>
+  <li><span class="warn">TSS co-location:</span> 3 FROST nodes share one VM (cost constraint); production would use 3 separate hosts in different zones</li>
+  <li><span class="warn">No vTPM:</span> Platform attestation runs but SPOT VMs lack vTPM hardware; shielded VMs would fix this</li>
+  <li><span class="warn">Plain TCP internal:</span> Inter-service uses unencrypted TCP over private VPC (mTLS code exists, not wired in sandbox)</li>
+  <li><span class="warn">SPOT VMs:</span> Instances may be preempted; this is a sandbox, not HA</li>
 </ul>
 </section>
 
