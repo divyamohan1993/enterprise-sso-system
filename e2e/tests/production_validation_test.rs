@@ -1075,6 +1075,9 @@ fn test_risk_clean_session_is_normal() {
         is_unusual_time: false,
         unusual_access_score: 0.0,
         recent_failed_attempts: 0,
+        login_hour: None,
+        network_id: None,
+        session_duration_secs: None,
     };
     let score = engine.compute_score(&user, &signals);
     assert!(score < 0.3, "clean session score should be < 0.3, got {score}");
@@ -1092,6 +1095,9 @@ fn test_risk_single_anomaly_elevated() {
         is_unusual_time: false,
         unusual_access_score: 0.5,          // 0.5 * 0.15 = +0.075
         recent_failed_attempts: 2,          // 2/5 * 0.15 = +0.06
+        login_hour: None,
+        network_id: None,
+        session_duration_secs: None,
     };
     let score = engine.compute_score(&user, &signals);
     assert!(
@@ -1112,6 +1118,9 @@ fn test_risk_impossible_travel_high() {
         is_unusual_time: false,
         unusual_access_score: 0.0,
         recent_failed_attempts: 0,
+        login_hour: None,
+        network_id: None,
+        session_duration_secs: None,
     };
     let score = engine.compute_score(&user, &signals);
     assert!(score >= 0.6, "impossible travel score should be >= 0.6, got {score}");
@@ -1129,6 +1138,9 @@ fn test_risk_multiple_failures_critical() {
         is_unusual_time: true,
         unusual_access_score: 0.9,
         recent_failed_attempts: 5,
+        login_hour: None,
+        network_id: None,
+        session_duration_secs: None,
     };
     let score = engine.compute_score(&user, &signals);
     assert!(score >= 0.8, "multiple failures score should be >= 0.8, got {score}");
@@ -1148,6 +1160,9 @@ fn test_risk_false_positive_normal_travel() {
         is_unusual_time: false,
         unusual_access_score: 0.0,
         recent_failed_attempts: 0,
+        login_hour: None,
+        network_id: None,
+        session_duration_secs: None,
     };
     let score = engine.compute_score(&user, &signals);
     assert!(
@@ -1171,6 +1186,9 @@ fn test_risk_gradual_degradation() {
             is_unusual_time: i >= 3,
             unusual_access_score: i as f64 * 0.2,
             recent_failed_attempts: i,
+            login_hour: None,
+            network_id: None,
+            session_duration_secs: None,
         };
         let score = engine.compute_score(&user, &signals);
         assert!(

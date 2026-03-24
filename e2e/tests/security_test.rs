@@ -386,6 +386,9 @@ fn risk_score_triggers_step_up() {
         is_unusual_time: false,
         unusual_access_score: 0.0,
         recent_failed_attempts: 0,
+        login_hour: None,
+        network_id: None,
+        session_duration_secs: None,
     };
     let score = engine.compute_score(&user, &normal_signals);
     assert!(
@@ -401,6 +404,9 @@ fn risk_score_triggers_step_up() {
         is_unusual_time: true,
         unusual_access_score: 0.9,
         recent_failed_attempts: 5,
+        login_hour: None,
+        network_id: None,
+        session_duration_secs: None,
     };
     let score = engine.compute_score(&user, &risky_signals);
     assert!(

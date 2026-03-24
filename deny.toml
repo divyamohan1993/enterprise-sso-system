@@ -77,6 +77,7 @@ ignore = [
     # No known security vulnerability — this advisory is "unmaintained" only.
     # Re-evaluate when heapless >= 0.9 drops the atomic-polyfill dependency.
     { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill unmaintained — transitive via postcard->heapless, no security impact on x86_64; dead code on native-atomic targets" },
+    { id = "RUSTSEC-2023-0071", reason = "RSA used only for Google JWKS RS256 verification (not signing). Mitigated with 50ms timing floor in google_oauth.rs. No fix available upstream; monitoring for replacement." },
     #{ crate = "a-crate-that-is-yanked@0.1.1", reason = "you can specify why you are ignoring the yanked crate" },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
@@ -102,6 +103,7 @@ allow = [
     "Unicode-3.0",
     "Unicode-DFS-2016",
     "OpenSSL",
+    "Zlib",
 ]
 # The confidence threshold for detecting a license from license text.
 # The higher the value, the more closely the license text must be to the
@@ -182,7 +184,6 @@ allow-workspace = false
 deny = [
     { crate = "openssl", reason = "Use rustls instead for TLS — openssl has a large C attack surface" },
     { crate = "openssl-sys", reason = "Use rustls instead — avoid linking to OpenSSL C library" },
-    { crate = "cmake", reason = "Avoid C/C++ build dependencies — prefer pure-Rust crates" },
     { crate = "cpython", reason = "Avoid embedding CPython — use pure-Rust alternatives" },
 ]
 
@@ -213,6 +214,7 @@ deny = [
 skip = [
     #"ansi_term@0.11.0",
     #{ crate = "ansi_term@0.11.0", reason = "you can specify a reason why it can't be updated/removed" },
+    { crate = "cmake", reason = "Transitive via aws-lc-sys for FIPS crypto — no pure-Rust alternative for CNSA 2.0 compliance" },
 ]
 # Similarly to `skip` allows you to skip certain crates during duplicate
 # detection. Unlike skip, it also includes the entire tree of transitive

@@ -336,6 +336,137 @@ pub fn create_key_source_from_env() -> Result<Box<dyn ProductionKeySource>, crat
 }
 
 // ---------------------------------------------------------------------------
+// Key Rotation Scheduler (reminder system — operator approval required)
+// ---------------------------------------------------------------------------
+
+/// A scheduler that monitors key age and emits SIEM alerts when rotation is
+/// overdue.
+///
+/// This is a **reminder system only** — it does NOT perform automatic rotation.
+/// Actual key rotation requires operator approval and a key ceremony.  The
+/// scheduler simply detects when the configured interval has elapsed and emits
+/// a HIGH-severity SIEM event to prompt operators.
+pub struct KeyRotationScheduler {
+    /// How often a key should be rotated (default: 90 days).
+    pub rotation_interval: std::time::Duration,
+    /// When the last rotation occurred. `None` means "never rotated / unknown".
+    last_rotation: Option<std::time::Instant>,
+    /// Optional callback invoked when rotation is detected as overdue.
+    /// This can be used for custom notification integrations beyond SIEM.
+    rotation_callback: Option<Box<dyn Fn() + Send + Sync>>,
+}
+
+impl KeyRotationScheduler {
+    /// Create a new scheduler with default 90-day rotation interval.
+    pub fn new() -> Self {
+        Self {
+            rotation_interval: std::time::Duration::from_secs(90 * 24 * 3600),
+            last_rotation: None,
+            rotation_callback: None,
+        }
+    }
+
+    /// Create a scheduler with a custom rotation interval.
+    pub fn with_interval(interval: std::time::Duration) -> Self {
+        Self {
+            rotation_interval: interval,
+            last_rotation: None,
+            rotation_callback: None,
+        }
+    }
+
+    /// Set a callback to invoke when rotation is detected as overdue.
+    pub fn set_rotation_callback<F: Fn() + Send + Sync + 'static>(&mut self, cb: F) {
+        self.rotation_callback = Some(Box::new(cb));
+    }
+
+    /// Record that a key rotation just occurred.
+    pub fn record_rotation(&mut self) {
+        self.last_rotation = Some(std::time::Instant::now());
+    }
+
+    /// Check whether a key rotation is overdue.
+    ///
+    /// Returns `true` if:
+    /// - No rotation has ever been recorded, OR
+    /// - The time since the last rotation exceeds `rotation_interval`.
+    pub fn check_rotation_due(&self) -> bool {
+        match self.last_rotation {
+            None => true,
+            Some(last) => last.elapsed() >= self.rotation_interval,
+        }
+    }
+
+    /// Spawn a background tokio task that periodically checks whether key
+    /// rotation is overdue.  When it is, a HIGH-severity SIEM event
+    /// (`key_rotation_overdue`) is emitted and the optional callback is
+    /// invoked.
+    ///
+    /// The check runs every `check_interval`.  A sensible default is once
+    /// per hour.
+    ///
+    /// Returns a `tokio::task::JoinHandle` that can be used to abort the
+    /// monitor if needed.
+    pub fn schedule_rotation(
+        self,
+        check_interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        // Move self into an Arc<Mutex> so the spawned task can read it.
+        let scheduler = std::sync::Arc::new(std::sync::Mutex::new(self));
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(check_interval);
+            // Skip the first immediate tick to let the system stabilize.
+            interval.tick().await;
+
+            tracing::info!(
+                "key rotation scheduler started (check interval: {:?})",
+                check_interval
+            );
+
+            loop {
+                interval.tick().await;
+
+                let (due, rotation_interval) = {
+                    let sched = scheduler.lock().unwrap_or_else(|e| e.into_inner());
+                    (sched.check_rotation_due(), sched.rotation_interval)
+                };
+
+                if due {
+                    tracing::warn!(
+                        rotation_interval_days = rotation_interval.as_secs() / 86400,
+                        "key rotation is OVERDUE — operator action required"
+                    );
+
+                    // Emit SIEM alert
+                    common::siem::SecurityEvent::key_rotation_overdue(
+                        &format!(
+                            "master key rotation overdue (interval: {} days). \
+                             Operator approval and key ceremony required.",
+                            rotation_interval.as_secs() / 86400
+                        ),
+                    );
+
+                    // Invoke optional callback
+                    let sched = scheduler.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(ref cb) = sched.rotation_callback {
+                        cb();
+                    }
+                } else {
+                    tracing::debug!("key rotation check: not yet due");
+                }
+            }
+        })
+    }
+}
+
+impl Default for KeyRotationScheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

@@ -446,6 +446,9 @@ impl OrchestratorService {
             is_unusual_time: request.is_unusual_time.unwrap_or(false),
             unusual_access_score: request.unusual_access_score.unwrap_or(0.0),
             recent_failed_attempts: request.recent_failed_attempts.unwrap_or(0),
+            login_hour: None,
+            network_id: None,
+            session_duration_secs: None,
         };
         let risk_score = self.risk_engine.compute_score(&user_id, &risk_signals);
         if self.risk_engine.requires_termination(risk_score) {

@@ -11,6 +11,9 @@ fn clean_signals() -> RiskSignals {
         is_unusual_time: false,
         unusual_access_score: 0.0,
         recent_failed_attempts: 0,
+        login_hour: None,
+        network_id: None,
+        session_duration_secs: None,
     }
 }
 
@@ -22,6 +25,9 @@ fn max_risk_signals() -> RiskSignals {
         is_unusual_time: true,
         unusual_access_score: 1.0,
         recent_failed_attempts: 10,
+        login_hour: None,
+        network_id: None,
+        session_duration_secs: None,
     }
 }
 
@@ -167,6 +173,9 @@ fn risk_request_serialization_round_trip() {
             is_unusual_time: false,
             unusual_access_score: 0.3,
             recent_failed_attempts: 2,
+            login_hour: None,
+            network_id: None,
+            session_duration_secs: None,
         },
     };
 
@@ -271,6 +280,9 @@ fn risk_request_end_to_end_with_engine() {
             is_unusual_time: true,
             unusual_access_score: 1.0,
             recent_failed_attempts: 10,
+            login_hour: None,
+            network_id: None,
+            session_duration_secs: None,
         },
     };
 

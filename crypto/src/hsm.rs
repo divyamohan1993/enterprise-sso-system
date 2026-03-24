@@ -612,8 +612,12 @@ impl KeyStore {
 /// by actual `C_Login` and all operations delegate to the PKCS#11 C API.
 struct Pkcs11Session {
     /// Path to the loaded PKCS#11 library.
+    /// Used when real PKCS#11 bindings are linked (C_Initialize, C_OpenSession).
+    #[allow(dead_code)]
     library_path: String,
     /// Slot number this session is bound to.
+    /// Used when real PKCS#11 bindings are linked (C_OpenSession slot parameter).
+    #[allow(dead_code)]
     slot: u64,
     /// Key label used to find/create the master key.
     key_label: String,
@@ -798,6 +802,8 @@ struct AwsKmsSession {
     /// KMS key ARN or alias (the CMK that never leaves AWS).
     key_id: String,
     /// AWS region for KMS API calls.
+    /// Used when real AWS SDK is linked (KMS endpoint routing).
+    #[allow(dead_code)]
     region: String,
     /// Internal key store for managing data keys.
     key_store: KeyStore,
@@ -998,6 +1004,8 @@ impl HsmKeyOps for AwsKmsSession {
 /// - **Attestation**: Generates TPM2_Quote over PCR values for remote verification.
 struct Tpm2Session {
     /// Device path (e.g., `/dev/tpmrm0`).
+    /// Used when real tss-esapi bindings are linked (TCTI device parameter).
+    #[allow(dead_code)]
     device: String,
     /// PCR indices for sealing policy (e.g., [0, 2, 4, 7]).
     pcr_indices: Vec<u8>,
@@ -1009,6 +1017,8 @@ struct Tpm2Session {
     /// The SRK (Storage Root Key) handle identifier.
     srk_handle: [u8; 32],
     /// The storage key derived from the SRK, sealed to PCR values.
+    /// Used during unseal operations to verify PCR-bound key integrity.
+    #[allow(dead_code)]
     storage_key: [u8; 32],
 }
 
@@ -1116,6 +1126,8 @@ impl Tpm2Session {
     ///
     /// Mirrors `TPM2_Unseal` with policy session satisfaction.
     /// Fails with `PcrMismatch` if platform integrity has changed since sealing.
+    /// Used by HsmKeyManager::unwrap_key when TPM2 backend is active.
+    #[allow(dead_code)]
     fn unseal_from_pcrs(&self, sealed_blob: &[u8], label: &str) -> Result<Vec<u8>, HsmError> {
         if sealed_blob.len() < 32 {
             return Err(HsmError::UnwrapFailed("TPM2 sealed blob too short".into()));

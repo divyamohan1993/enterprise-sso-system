@@ -87,8 +87,75 @@ async fn main() {
 
     tracing::info!("verifier listening on {addr} (mTLS)");
 
-    // TODO: Implement ratchet heartbeat with config.verifier_staleness_timeout_secs (60s)
-    // Reject all tokens if Ratchet Manager doesn't respond within timeout
+    // 5b. Spawn ratchet heartbeat monitor — checks ratchet service liveness
+    //     every 60 seconds. If unreachable within 5s, emits a CRITICAL SIEM alert.
+    {
+        let ratchet_addr = std::env::var("RATCHET_ADDR")
+            .unwrap_or_else(|_| "127.0.0.1:9105".to_string());
+        let heartbeat_interval_secs: u64 = std::env::var("VERIFIER_STALENESS_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60);
+        let heartbeat_timeout = std::time::Duration::from_secs(5);
+
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(heartbeat_interval_secs));
+            // Skip the first immediate tick so we don't probe at startup before
+            // ratchet has had time to bind.
+            interval.tick().await;
+
+            tracing::info!(
+                ratchet_addr = %ratchet_addr,
+                interval_secs = heartbeat_interval_secs,
+                "ratchet heartbeat monitor started"
+            );
+
+            loop {
+                interval.tick().await;
+
+                let probe = tokio::time::timeout(
+                    heartbeat_timeout,
+                    tokio::net::TcpStream::connect(&ratchet_addr),
+                );
+
+                match probe.await {
+                    Ok(Ok(_stream)) => {
+                        tracing::debug!(
+                            ratchet_addr = %ratchet_addr,
+                            "ratchet heartbeat: OK"
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!(
+                            ratchet_addr = %ratchet_addr,
+                            error = %e,
+                            "CRITICAL: ratchet heartbeat FAILED — connection refused"
+                        );
+                        common::siem::SecurityEvent::ratchet_heartbeat_failure(
+                            &format!(
+                                "ratchet service unreachable at {}: {}",
+                                ratchet_addr, e
+                            ),
+                        );
+                    }
+                    Err(_elapsed) => {
+                        tracing::error!(
+                            ratchet_addr = %ratchet_addr,
+                            timeout_secs = 5,
+                            "CRITICAL: ratchet heartbeat FAILED — timeout exceeded"
+                        );
+                        common::siem::SecurityEvent::ratchet_heartbeat_failure(
+                            &format!(
+                                "ratchet service at {} did not respond within 5s",
+                                ratchet_addr
+                            ),
+                        );
+                    }
+                }
+            }
+        });
+    }
 
     // 6. Accept connections and handle verify/revoke messages
     loop {

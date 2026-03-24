@@ -32,6 +32,27 @@ const VERIFY_CHAIN_INTERVAL: usize = 100;
 /// Default maximum entries to keep in memory before triggering archival.
 const DEFAULT_MAX_ENTRIES: usize = 100_000;
 
+/// Log retention policy for compliance with long-term audit requirements.
+#[derive(Debug, Clone)]
+pub struct RetentionPolicy {
+    /// Maximum age of retained logs in days (default: 2555 = ~7 years).
+    pub max_age_days: u64,
+    /// Maximum total archive size in megabytes (default: 10240 = 10 GB).
+    pub max_archive_size_mb: u64,
+    /// Whether to automatically archive when limits are exceeded.
+    pub auto_archive: bool,
+}
+
+impl Default for RetentionPolicy {
+    fn default() -> Self {
+        Self {
+            max_age_days: 2555,       // ~7 years
+            max_archive_size_mb: 10240, // 10 GB
+            auto_archive: true,
+        }
+    }
+}
+
 pub struct AuditLog {
     entries: Vec<AuditEntry>,
     last_hash: [u8; 64],
@@ -41,6 +62,8 @@ pub struct AuditLog {
     max_entries: usize,
     /// Optional directory for automatic archival on overflow.
     archive_dir: Option<String>,
+    /// Retention policy controlling archival and size limits.
+    pub retention_policy: RetentionPolicy,
 }
 
 impl AuditLog {
@@ -51,6 +74,7 @@ impl AuditLog {
             tamper_detected: false,
             max_entries: DEFAULT_MAX_ENTRIES,
             archive_dir: None,
+            retention_policy: RetentionPolicy::default(),
         }
     }
 
@@ -62,6 +86,7 @@ impl AuditLog {
             tamper_detected: false,
             max_entries,
             archive_dir,
+            retention_policy: RetentionPolicy::default(),
         }
     }
 
@@ -76,6 +101,7 @@ impl AuditLog {
             tamper_detected: false,
             max_entries: DEFAULT_MAX_ENTRIES,
             archive_dir: None,
+            retention_policy: RetentionPolicy::default(),
         }
     }
 
@@ -119,6 +145,7 @@ impl AuditLog {
         self.entries.push(entry);
         self.periodic_verify();
         self.auto_archive();
+        self.enforce_retention();
         self.entries.last().unwrap()
     }
 
@@ -201,6 +228,7 @@ impl AuditLog {
         self.entries.push(entry);
         self.periodic_verify();
         self.auto_archive();
+        self.enforce_retention();
         self.entries.last().unwrap()
     }
 
@@ -271,6 +299,40 @@ impl AuditLog {
         );
 
         Ok(archive_count)
+    }
+
+    /// Enforce the retention policy: trigger archival if entries exceed limits
+    /// and warn if the archive directory is approaching the size cap.
+    pub fn enforce_retention(&mut self) {
+        // Auto-archive if entries exceed max and retention policy allows it
+        if self.retention_policy.auto_archive && self.entries.len() > self.max_entries {
+            if let Some(ref dir) = self.archive_dir.clone() {
+                match self.archive_old_entries(dir) {
+                    Ok(count) if count > 0 => {
+                        tracing::info!("Retention: archived {} entries", count);
+                    }
+                    Err(e) => {
+                        tracing::error!("Retention: archival failed: {}", e);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Check archive directory size against the configured limit
+        if let Some(ref dir) = self.archive_dir {
+            let dir_size_mb = dir_size_bytes(dir) / (1024 * 1024);
+            let limit = self.retention_policy.max_archive_size_mb;
+            if limit > 0 && dir_size_mb >= limit * 80 / 100 {
+                tracing::warn!(
+                    "Retention: archive directory {:?} is at {} MB / {} MB ({}%)",
+                    dir,
+                    dir_size_mb,
+                    limit,
+                    dir_size_mb * 100 / limit.max(1)
+                );
+            }
+        }
     }
 
     /// Run `verify_chain()` every `VERIFY_CHAIN_INTERVAL` entries.
@@ -376,4 +438,18 @@ fn now_us() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_micros() as i64
+}
+
+/// Calculate total size (in bytes) of all files in a directory (non-recursive
+/// for simplicity — archive files are stored flat).
+fn dir_size_bytes(dir: &str) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.metadata().ok())
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+        .sum()
 }

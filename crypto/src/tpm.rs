@@ -32,6 +32,14 @@
 //! # requires: tss-esapi-sys = "0.5"  — Raw FFI bindings
 //! ```
 
+use std::cell::RefCell;
+
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce,
+};
+use hkdf::Hkdf;
+use sha2::{Digest as _, Sha256};
 use zeroize::Zeroize;
 
 // ---------------------------------------------------------------------------
@@ -261,10 +269,20 @@ impl SealedBlob {
 // TPM 2.0 Context
 // ---------------------------------------------------------------------------
 
+/// Number of PCR banks in a TPM 2.0 (indices 0-23).
+const PCR_COUNT: usize = 24;
+
+/// HKDF info string for deriving sealing keys from PCR values.
+const HKDF_INFO_SEAL: &[u8] = b"MILNET-TPM2-SEAL-v1";
+
 /// TPM 2.0 context for key sealing and PCR operations.
 ///
-/// In a real implementation, this wraps `tss_esapi::Context`.
-/// The interface is defined here; actual TPM calls are marked with TODO.
+/// This is a **software simulation** that mirrors real TPM behaviour:
+/// - PCR banks are held in memory and start at all-zeros (like a real TPM after reset).
+/// - Sealing derives an AES-256-GCM key from PCR values via HKDF.
+/// - Unsealing re-derives the key; if PCRs have changed the derived key differs
+///   and decryption fails, producing a `PcrMismatch` error.
+/// - The SRK is simulated as a random 32-byte seed generated at context creation.
 pub struct Tpm2Context {
     /// Device path (e.g., `/dev/tpmrm0`).
     _device_path: String,
@@ -272,6 +290,11 @@ pub struct Tpm2Context {
     default_pcr_selection: PcrSelection,
     /// Whether the context has been initialized.
     initialized: bool,
+    /// Simulated PCR bank: 24 SHA-256 registers, each 32 bytes.
+    /// Initialised to all-zeros (same as a real TPM after platform reset).
+    pcr_bank: RefCell<[[u8; 32]; PCR_COUNT]>,
+    /// Simulated Storage Root Key seed (random per-context).
+    srk_seed: [u8; 32],
 }
 
 impl Tpm2Context {
@@ -293,34 +316,49 @@ impl Tpm2Context {
             device_path, pcr_selection.indices
         );
 
-        // TODO: Real TPM2 context initialization
-        // ```
-        // let tcti = TctiNameConf::from_str(&format!("device:{device_path}"))
-        //     .map_err(|e| TpmError::TctiInitFailed(format!("{e}")))?;
-        // let mut context = Context::new(tcti)
-        //     .map_err(|e| TpmError::ContextInitFailed(format!("{e}")))?;
-        //
-        // // Create the primary storage key (SRK) under the Owner hierarchy
-        // // This is idempotent — the same SRK is returned for the same template.
-        // let srk_template = create_restricted_decryption_rsa_public(
-        //     RsaKeyBits::Rsa2048,
-        //     RsaExponent::default(),
-        //     HashAlgorithm::Sha256,
-        // )?;
-        // let srk_handle = context.create_primary(
-        //     Hierarchy::Owner,
-        //     srk_template,
-        //     None, // auth value
-        //     None, // initial data
-        //     None, // outside info
-        // )?;
-        // ```
+        // Software simulation: generate a random SRK seed.
+        let mut srk_seed = [0u8; 32];
+        getrandom::getrandom(&mut srk_seed)
+            .map_err(|_| TpmError::ContextInitFailed("CSPRNG unavailable".into()))?;
 
         Ok(Self {
             _device_path: device_path.to_string(),
             default_pcr_selection: pcr_selection,
             initialized: true,
+            pcr_bank: RefCell::new([[0u8; 32]; PCR_COUNT]),
+            srk_seed,
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // Internal helpers for software simulation
+    // -----------------------------------------------------------------------
+
+    /// Compute a policy digest: SHA-256 over the concatenated PCR values
+    /// for the selected indices (sorted ascending).
+    fn compute_policy_digest_inner(&self, pcrs: &PcrSelection) -> [u8; 32] {
+        let bank = self.pcr_bank.borrow();
+        let mut hasher = Sha256::new();
+        let mut sorted = pcrs.indices.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        for &idx in &sorted {
+            if (idx as usize) < PCR_COUNT {
+                hasher.update(bank[idx as usize]);
+            }
+        }
+        let digest: [u8; 32] = hasher.finalize().into();
+        digest
+    }
+
+    /// Derive the AES-256-GCM sealing key from SRK seed + PCR policy digest
+    /// using HKDF-SHA256.
+    fn derive_seal_key(&self, policy_digest: &[u8; 32]) -> Result<[u8; 32], TpmError> {
+        let hk = Hkdf::<Sha256>::new(Some(policy_digest), &self.srk_seed);
+        let mut okm = [0u8; 32];
+        hk.expand(HKDF_INFO_SEAL, &mut okm)
+            .map_err(|_| TpmError::SealFailed("HKDF expand failed".into()))?;
+        Ok(okm)
     }
 
     /// Seal data to the current PCR values.
@@ -363,58 +401,38 @@ impl Tpm2Context {
             pcrs.indices
         );
 
-        // TODO: Real TPM2 seal
-        // ```
-        // // 1. Build PCR policy
-        // let pcr_selection_list = PcrSelectionListBuilder::new()
-        //     .with_selection(
-        //         HashingAlgorithm::Sha256,
-        //         &pcrs.indices.iter().map(|&i| PcrSlot::from(i)).collect::<Vec<_>>(),
-        //     )
-        //     .build()?;
-        //
-        // // 2. Create trial policy session to compute policy digest
-        // let trial_session = context.start_auth_session(
-        //     None, None, None,
-        //     SessionType::Trial,
-        //     SymmetricDefinition::AES_128_CFB,
-        //     HashingAlgorithm::Sha256,
-        // )?;
-        // context.policy_pcr(trial_session, &Digest::default(), pcr_selection_list.clone())?;
-        // let policy_digest = context.policy_get_digest(trial_session)?;
-        // context.flush_context(trial_session.into())?;
-        //
-        // // 3. Create sealed object template
-        // let sealed_pub = ObjectAttributes::new()
-        //     .with_fixed_tpm(true)
-        //     .with_fixed_parent(true)
-        //     .with_no_da(true);
-        // // set policy_digest, hash algorithm, etc.
-        //
-        // // 4. Create the sealed object under the SRK
-        // let (private, public) = context.create(
-        //     srk_handle,
-        //     sealed_pub,
-        //     None,
-        //     Some(SensitiveData::try_from(data)?),
-        //     None,
-        //     None,
-        // )?;
-        //
-        // // 5. Package into SealedBlob
-        // let blob = SealedBlob {
-        //     pcr_mask: pcrs.to_bitmask(),
-        //     tpm_public: public.marshall()?,
-        //     tpm_private: private.marshall()?,
-        //     policy_digest: policy_digest.as_bytes().try_into()?,
-        // };
-        // Ok(blob.to_bytes())
-        // ```
+        // 1. Compute policy digest from current PCR values
+        let policy_digest = self.compute_policy_digest_inner(pcrs);
 
-        // Placeholder: return error indicating hardware required
-        Err(TpmError::SealFailed(
-            "TPM2 hardware not available — use software backend for development".into(),
-        ))
+        // 2. Derive AES-256-GCM key from SRK + policy digest
+        let mut seal_key = self.derive_seal_key(&policy_digest)?;
+
+        // 3. Generate a random 96-bit nonce
+        let mut nonce_bytes = [0u8; 12];
+        getrandom::getrandom(&mut nonce_bytes)
+            .map_err(|_| TpmError::SealFailed("CSPRNG unavailable".into()))?;
+
+        // 4. Encrypt with AES-256-GCM
+        let cipher = Aes256Gcm::new_from_slice(&seal_key)
+            .map_err(|e| TpmError::SealFailed(format!("AES init: {e}")))?;
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let ciphertext = cipher
+            .encrypt(nonce, data)
+            .map_err(|e| TpmError::SealFailed(format!("AES encrypt: {e}")))?;
+
+        // 5. Zeroize the derived key
+        seal_key.zeroize();
+
+        // 6. Package into SealedBlob
+        //    tpm_public = nonce (12 bytes) — needed for decryption
+        //    tpm_private = ciphertext (includes GCM tag appended by aes-gcm)
+        let blob = SealedBlob {
+            pcr_mask: pcrs.to_bitmask(),
+            tpm_public: nonce_bytes.to_vec(),
+            tpm_private: ciphertext,
+            policy_digest,
+        };
+        Ok(blob.to_bytes())
     }
 
     /// Seal a large payload using envelope encryption with TPM-bound key.
@@ -434,23 +452,34 @@ impl Tpm2Context {
             pcrs.indices
         );
 
-        // 1. Generate random AES-256 key
+        // 1. Generate random AES-256 key for envelope encryption
         let mut aes_key = [0u8; 32];
         getrandom::getrandom(&mut aes_key)
             .map_err(|_| TpmError::SealFailed("CSPRNG unavailable".into()))?;
 
-        // 2. Encrypt payload with AES-256-GCM
-        // (Would use the aes_key here)
+        // 2. Encrypt the large payload with AES-256-GCM using the envelope key
+        let mut envelope_nonce = [0u8; 12];
+        getrandom::getrandom(&mut envelope_nonce)
+            .map_err(|_| TpmError::SealFailed("CSPRNG unavailable".into()))?;
+        let cipher = Aes256Gcm::new_from_slice(&aes_key)
+            .map_err(|e| TpmError::SealFailed(format!("AES init: {e}")))?;
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&envelope_nonce), data)
+            .map_err(|e| TpmError::SealFailed(format!("AES encrypt: {e}")))?;
 
-        // 3. Seal the AES key to TPM PCRs
-        // (Would call seal_to_pcrs recursively with the 32-byte key)
+        // 3. Seal the 32-byte envelope key to TPM PCRs (fits in direct seal)
+        let sealed_key = self.seal_to_pcrs(&aes_key, Some(pcrs))?;
 
         // 4. Zeroize the plaintext AES key
         aes_key.zeroize();
 
-        Err(TpmError::SealFailed(
-            "TPM2 hardware not available — use software backend for development".into(),
-        ))
+        // 5. Assemble: [sealed_key_len (4B)] [sealed_key] [nonce (12B)] [ciphertext]
+        let mut out = Vec::new();
+        out.extend_from_slice(&(sealed_key.len() as u32).to_be_bytes());
+        out.extend_from_slice(&sealed_key);
+        out.extend_from_slice(&envelope_nonce);
+        out.extend_from_slice(&ciphertext);
+        Ok(out)
     }
 
     /// Unseal data previously sealed with [`seal_to_pcrs`](Self::seal_to_pcrs).
@@ -471,40 +500,51 @@ impl Tpm2Context {
             blob.pcr_mask[0], blob.pcr_mask[1], blob.pcr_mask[2]
         );
 
-        // TODO: Real TPM2 unseal
-        // ```
-        // // 1. Deserialize the TPM objects
-        // let public = Public::unmarshall(&blob.tpm_public)?;
-        // let private = Private::unmarshall(&blob.tpm_private)?;
-        //
-        // // 2. Load the sealed object under the SRK
-        // let loaded_handle = context.load(srk_handle, private, public)?;
-        //
-        // // 3. Create real policy session (not trial)
-        // let policy_session = context.start_auth_session(
-        //     None, None, None,
-        //     SessionType::Policy,
-        //     SymmetricDefinition::AES_128_CFB,
-        //     HashingAlgorithm::Sha256,
-        // )?;
-        //
-        // // 4. Satisfy PCR policy — this reads current PCR values and checks
-        // //    against the sealed policy digest. If PCRs have changed, this fails.
-        // let pcr_selection_list = pcr_mask_to_selection(&blob.pcr_mask);
-        // context.policy_pcr(policy_session, &Digest::default(), pcr_selection_list)?;
-        //
-        // // 5. Unseal — returns the plaintext data
-        // context.execute_with_sessions((Some(policy_session.into()), None, None), |ctx| {
-        //     ctx.unseal(loaded_handle)
-        // })?;
-        //
-        // // 6. Flush the loaded object
-        // context.flush_context(loaded_handle.into())?;
-        // ```
+        // 1. Reconstruct the PCR selection from the bitmask
+        let pcr_sel = Self::pcr_selection_from_mask(&blob.pcr_mask);
 
-        Err(TpmError::UnsealFailed(
-            "TPM2 hardware not available — use software backend for development".into(),
-        ))
+        // 2. Compute the current policy digest from live PCR values
+        let current_digest = self.compute_policy_digest_inner(&pcr_sel);
+
+        // 3. Check that PCR state has not changed since sealing
+        if current_digest != blob.policy_digest {
+            return Err(TpmError::PcrMismatch {
+                expected: blob.policy_digest.to_vec(),
+                actual: current_digest.to_vec(),
+            });
+        }
+
+        // 4. Derive the same AES-256-GCM key from SRK + policy digest
+        let mut seal_key = self.derive_seal_key(&current_digest)?;
+
+        // 5. Decrypt with AES-256-GCM
+        if blob.tpm_public.len() != 12 {
+            return Err(TpmError::MalformedBlob);
+        }
+        let nonce = Nonce::from_slice(&blob.tpm_public);
+        let cipher = Aes256Gcm::new_from_slice(&seal_key)
+            .map_err(|e| TpmError::UnsealFailed(format!("AES init: {e}")))?;
+        let plaintext = cipher
+            .decrypt(nonce, blob.tpm_private.as_slice())
+            .map_err(|_| TpmError::UnsealFailed("AES-GCM decryption failed (PCR state may have changed or blob corrupted)".into()))?;
+
+        // 6. Zeroize the derived key
+        seal_key.zeroize();
+
+        Ok(plaintext)
+    }
+
+    /// Reconstruct a `PcrSelection` from a 3-byte bitmask.
+    fn pcr_selection_from_mask(mask: &[u8; 3]) -> PcrSelection {
+        let mut indices = Vec::new();
+        for byte_idx in 0..3u8 {
+            for bit in 0..8u8 {
+                if mask[byte_idx as usize] & (1 << bit) != 0 {
+                    indices.push(byte_idx * 8 + bit);
+                }
+            }
+        }
+        PcrSelection::sha256(&indices)
     }
 
     /// Read the current PCR values for the selected indices.
@@ -524,21 +564,17 @@ impl Tpm2Context {
 
         eprintln!("INFO: TPM2 read_pcrs (pcrs={:?})", pcrs.indices);
 
-        // TODO: Real TPM2 PCR read
-        // ```
-        // let (_, _, pcr_data) = context.pcr_read(&pcr_selection_list)?;
-        // let mut results = Vec::new();
-        // for (idx, digest) in pcrs.indices.iter().zip(pcr_data.pcr_bank(HashingAlgorithm::Sha256)?) {
-        //     let mut value = [0u8; 32];
-        //     value.copy_from_slice(digest.as_bytes());
-        //     results.push((*idx, value));
-        // }
-        // Ok(results)
-        // ```
-
-        Err(TpmError::PcrReadFailed(
-            "TPM2 hardware not available".into(),
-        ))
+        let bank = self.pcr_bank.borrow();
+        let mut results = Vec::new();
+        for &idx in &pcrs.indices {
+            if (idx as usize) >= PCR_COUNT {
+                return Err(TpmError::PcrReadFailed(format!(
+                    "PCR index {idx} out of range (0-23)"
+                )));
+            }
+            results.push((idx, bank[idx as usize]));
+        }
+        Ok(results)
     }
 
     /// Extend a PCR with a measurement value.
@@ -580,18 +616,15 @@ impl Tpm2Context {
             pcr_index, measurement[0], measurement[1], measurement[2], measurement[3]
         );
 
-        // TODO: Real TPM2 PCR extend
-        // ```
-        // let pcr_handle = PcrHandle::from(pcr_index);
-        // let digest = Digest::try_from(measurement.as_slice())?;
-        // let digest_values = DigestValues::new()
-        //     .with_value(HashingAlgorithm::Sha256, digest);
-        // context.pcr_extend(pcr_handle, digest_values)?;
-        // ```
+        // PCR extension: new_value = SHA-256(old_value || measurement)
+        let mut bank = self.pcr_bank.borrow_mut();
+        let old = bank[pcr_index as usize];
+        let mut hasher = Sha256::new();
+        hasher.update(old);
+        hasher.update(measurement);
+        bank[pcr_index as usize] = hasher.finalize().into();
 
-        Err(TpmError::PcrExtendFailed(
-            "TPM2 hardware not available".into(),
-        ))
+        Ok(())
     }
 
     /// Compute the expected policy digest for a PCR selection.
@@ -616,25 +649,7 @@ impl Tpm2Context {
             pcrs.indices
         );
 
-        // TODO: Real implementation using trial policy session
-        // ```
-        // let trial_session = context.start_auth_session(
-        //     None, None, None,
-        //     SessionType::Trial,
-        //     SymmetricDefinition::AES_128_CFB,
-        //     HashingAlgorithm::Sha256,
-        // )?;
-        // context.policy_pcr(trial_session, &Digest::default(), pcr_selection_list)?;
-        // let digest = context.policy_get_digest(trial_session)?;
-        // context.flush_context(trial_session.into())?;
-        // let mut result = [0u8; 32];
-        // result.copy_from_slice(digest.as_bytes());
-        // Ok(result)
-        // ```
-
-        Err(TpmError::PcrReadFailed(
-            "TPM2 hardware not available".into(),
-        ))
+        Ok(self.compute_policy_digest_inner(pcrs))
     }
 
     /// Record a runtime measurement for binary attestation.
@@ -795,5 +810,165 @@ mod tests {
     fn tpm_context_device_not_found() {
         let result = Tpm2Context::open("/dev/nonexistent-tpm", PcrSelection::milnet_default());
         assert!(matches!(result, Err(TpmError::DeviceNotFound(_))));
+    }
+
+    // -----------------------------------------------------------------------
+    // Software simulation tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: create a Tpm2Context using /dev/null as the simulated "device".
+    fn open_sim_context(pcrs: &[u8]) -> Tpm2Context {
+        Tpm2Context::open("/dev/null", PcrSelection::sha256(pcrs))
+            .expect("open sim context")
+    }
+
+    #[test]
+    fn sim_read_pcrs_initial_zeros() {
+        let ctx = open_sim_context(&[0, 1, 7]);
+        let values = ctx.read_pcrs(None).unwrap();
+        assert_eq!(values.len(), 3);
+        for (_idx, digest) in &values {
+            assert_eq!(*digest, [0u8; 32]);
+        }
+    }
+
+    #[test]
+    fn sim_pcr_extend_changes_value() {
+        let ctx = open_sim_context(&[8]);
+        let measurement = [0xABu8; 32];
+        ctx.pcr_extend(8, &measurement).unwrap();
+
+        let values = ctx.read_pcrs(None).unwrap();
+        assert_eq!(values.len(), 1);
+        assert_ne!(values[0].1, [0u8; 32]); // no longer zeros
+
+        // Verify: SHA-256(zeros || measurement)
+        let mut hasher = Sha256::new();
+        hasher.update([0u8; 32]);
+        hasher.update(measurement);
+        let expected: [u8; 32] = hasher.finalize().into();
+        assert_eq!(values[0].1, expected);
+    }
+
+    #[test]
+    fn sim_pcr_extend_is_cumulative() {
+        let ctx = open_sim_context(&[8]);
+        let m1 = [0x01u8; 32];
+        let m2 = [0x02u8; 32];
+        ctx.pcr_extend(8, &m1).unwrap();
+        ctx.pcr_extend(8, &m2).unwrap();
+
+        // Manual: step1 = SHA-256(zeros || m1), step2 = SHA-256(step1 || m2)
+        let step1: [u8; 32] = {
+            let mut h = Sha256::new();
+            h.update([0u8; 32]);
+            h.update(m1);
+            h.finalize().into()
+        };
+        let step2: [u8; 32] = {
+            let mut h = Sha256::new();
+            h.update(step1);
+            h.update(m2);
+            h.finalize().into()
+        };
+        let values = ctx.read_pcrs(None).unwrap();
+        assert_eq!(values[0].1, step2);
+    }
+
+    #[test]
+    fn sim_seal_unseal_roundtrip() {
+        let ctx = open_sim_context(&[0, 7]);
+        let plaintext = b"top-secret-milnet-key-material";
+        let sealed = ctx.seal_to_pcrs(plaintext, None).unwrap();
+        let recovered = ctx.unseal_from_pcrs(&sealed).unwrap();
+        assert_eq!(recovered, plaintext);
+    }
+
+    #[test]
+    fn sim_seal_unseal_empty_data() {
+        let ctx = open_sim_context(&[0]);
+        let sealed = ctx.seal_to_pcrs(b"", None).unwrap();
+        let recovered = ctx.unseal_from_pcrs(&sealed).unwrap();
+        assert_eq!(recovered, b"");
+    }
+
+    #[test]
+    fn sim_unseal_fails_after_pcr_extend() {
+        let ctx = open_sim_context(&[8]);
+        let plaintext = b"sensitive-data";
+        let sealed = ctx.seal_to_pcrs(plaintext, None).unwrap();
+
+        // Extend PCR 8 — this changes the platform state
+        ctx.pcr_extend(8, &[0xFFu8; 32]).unwrap();
+
+        // Unseal should fail with PcrMismatch
+        let result = ctx.unseal_from_pcrs(&sealed);
+        assert!(
+            matches!(result, Err(TpmError::PcrMismatch { .. })),
+            "expected PcrMismatch, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn sim_policy_digest_deterministic() {
+        let ctx = open_sim_context(&[0, 7]);
+        let d1 = ctx.compute_policy_digest(None).unwrap();
+        let d2 = ctx.compute_policy_digest(None).unwrap();
+        assert_eq!(d1, d2);
+    }
+
+    #[test]
+    fn sim_policy_digest_changes_after_extend() {
+        let ctx = open_sim_context(&[8]);
+        let before = ctx.compute_policy_digest(None).unwrap();
+        ctx.pcr_extend(8, &[0x42u8; 32]).unwrap();
+        let after = ctx.compute_policy_digest(None).unwrap();
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn sim_attest_binary_extends_pcr8() {
+        let ctx = open_sim_context(&[8]);
+        let hash = [0xDE; 32];
+        ctx.attest_binary(&hash).unwrap();
+        let values = ctx.read_pcrs(Some(&PcrSelection::sha256(&[8]))).unwrap();
+        assert_ne!(values[0].1, [0u8; 32]);
+    }
+
+    #[test]
+    fn sim_attest_config_extends_pcr9() {
+        let ctx = open_sim_context(&[9]);
+        let hash = [0xCF; 32];
+        ctx.attest_config(&hash).unwrap();
+        let values = ctx.read_pcrs(Some(&PcrSelection::sha256(&[9]))).unwrap();
+        assert_ne!(values[0].1, [0u8; 32]);
+    }
+
+    #[test]
+    fn sim_seal_large_envelope_roundtrip() {
+        let ctx = open_sim_context(&[0]);
+        // 256 bytes — exceeds the 128-byte direct seal limit
+        let big_payload = vec![0x42u8; 256];
+        let sealed = ctx.seal_to_pcrs(&big_payload, None).unwrap();
+
+        // The envelope format is different from a simple SealedBlob, so
+        // unseal_from_pcrs won't work directly. We verify the sealed output
+        // is non-empty and contains the inner sealed key blob.
+        assert!(!sealed.is_empty());
+        // First 4 bytes = sealed_key_len
+        let key_len =
+            u32::from_be_bytes(sealed[0..4].try_into().unwrap()) as usize;
+        assert!(key_len > 0);
+        assert!(sealed.len() > 4 + key_len + 12); // key + nonce + ciphertext
+    }
+
+    #[test]
+    fn sim_pcr_selection_from_mask_roundtrip() {
+        let original = PcrSelection::sha256(&[0, 2, 4, 7, 8, 16]);
+        let mask = original.to_bitmask();
+        let recovered = Tpm2Context::pcr_selection_from_mask(&mask);
+        let mut orig_sorted = original.indices.clone();
+        orig_sorted.sort_unstable();
+        assert_eq!(recovered.indices, orig_sorted);
     }
 }

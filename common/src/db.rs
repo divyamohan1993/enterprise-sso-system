@@ -60,12 +60,19 @@ pub async fn init_database(database_url: &str) -> PgPool {
         .after_connect(move |conn, _meta| {
             Box::pin(async move {
                 let query = format!("SET statement_timeout = '{}s'", timeout_secs);
-                sqlx::Executor::execute(conn, query.as_str())
+                sqlx::Executor::execute(&mut *conn, query.as_str())
                     .await
                     .map_err(|e| {
                         tracing::error!("failed to set statement_timeout: {e}");
                         e
                     })?;
+
+                // Enable audit logging for security compliance.
+                // Use .ok() since these may fail if PG doesn't grant SET permission.
+                let _ = sqlx::Executor::execute(&mut *conn, "SET log_statement = 'mod'").await.ok();
+                let _ = sqlx::Executor::execute(&mut *conn, "SET log_connections = 'on'").await.ok();
+                let _ = sqlx::Executor::execute(&mut *conn, "SET log_disconnections = 'on'").await.ok();
+
                 Ok(())
             })
         })

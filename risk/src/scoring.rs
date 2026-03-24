@@ -13,6 +13,19 @@ pub struct RiskSignals {
     pub is_unusual_time: bool,            // outside normal hours
     pub unusual_access_score: f64,        // 0.0-1.0, API pattern anomaly
     pub recent_failed_attempts: u32,      // in last hour (client-supplied, ignored by server)
+    /// Current login hour (0-23) for baseline comparison. Optional for
+    /// backward compatibility; when absent, time-of-day baseline scoring
+    /// falls back to the boolean `is_unusual_time` flag.
+    #[serde(default)]
+    pub login_hour: Option<u8>,
+    /// Network identifier (e.g. AS number, subnet, VPN label) for baseline
+    /// comparison. Optional for backward compatibility.
+    #[serde(default)]
+    pub network_id: Option<String>,
+    /// Session duration in seconds (for completed sessions) used to update
+    /// the baseline after successful auth.
+    #[serde(default)]
+    pub session_duration_secs: Option<f64>,
 }
 
 /// Risk score result
@@ -27,13 +40,201 @@ pub enum RiskLevel {
 /// Window duration for the server-side failed attempt counter (1 hour).
 const FAILED_ATTEMPT_WINDOW_SECS: u64 = 3600;
 
+/// Exponential moving average smoothing factor.
+/// Lower values make the baseline adapt more slowly (more stable).
+const EMA_ALPHA: f64 = 0.1;
+
+// ---------------------------------------------------------------------------
+// Per-user behavioral baseline
+// ---------------------------------------------------------------------------
+
+/// Tracks per-user behavioral norms used for anomaly detection.
+///
+/// Fields are updated via exponential moving average after each successful
+/// authentication so the baseline gradually adapts to changing user behavior
+/// without being easily poisoned by a single anomalous session.
+#[derive(Debug, Clone)]
+pub struct UserBaseline {
+    /// Typical login hour range (start_hour, end_hour) in 24h format.
+    /// For example `(8, 18)` means the user typically logs in between 08:00
+    /// and 18:00. The range wraps around midnight if `start > end`.
+    pub typical_login_hours: (u8, u8),
+    /// Known network identifiers the user has authenticated from before
+    /// (AS numbers, subnet labels, VPN identifiers, etc.).
+    pub known_networks: Vec<String>,
+    /// Exponential moving average of session duration in seconds.
+    pub avg_session_duration_secs: f64,
+    /// Unix timestamp (seconds) of the last baseline update.
+    pub last_updated: i64,
+    /// EMA of the login hour (used internally to track the center).
+    avg_login_hour: f64,
+}
+
+impl UserBaseline {
+    /// Create a new baseline seeded from an initial set of signals.
+    fn new_from_signals(signals: &RiskSignals) -> Self {
+        let hour = signals.login_hour.unwrap_or(12);
+        let network = signals.network_id.clone().unwrap_or_default();
+        let duration = signals.session_duration_secs.unwrap_or(300.0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        Self {
+            typical_login_hours: (hour.saturating_sub(2), (hour + 2).min(23)),
+            known_networks: if network.is_empty() {
+                Vec::new()
+            } else {
+                vec![network]
+            },
+            avg_session_duration_secs: duration,
+            last_updated: now,
+            avg_login_hour: hour as f64,
+        }
+    }
+}
+
+/// Thread-safe store for per-user behavioral baselines.
+///
+/// All access is serialized through a `Mutex`. In a production deployment
+/// this would be backed by a persistent store; the in-memory version is
+/// suitable for single-instance deployments and testing.
+pub struct BaselineStore {
+    inner: Mutex<HashMap<Uuid, UserBaseline>>,
+}
+
+impl BaselineStore {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Update (or create) the baseline for `user_id` after a successful auth.
+    ///
+    /// Numeric fields are updated via exponential moving average so the
+    /// baseline drifts smoothly rather than snapping to the latest value.
+    pub fn update_baseline(&self, user_id: Uuid, signals: &RiskSignals) {
+        let mut store = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        let baseline = store
+            .entry(user_id)
+            .or_insert_with(|| UserBaseline::new_from_signals(signals));
+
+        // --- EMA update for login hour ---
+        if let Some(hour) = signals.login_hour {
+            let h = hour as f64;
+            baseline.avg_login_hour =
+                EMA_ALPHA * h + (1.0 - EMA_ALPHA) * baseline.avg_login_hour;
+            // Re-derive the typical window: center +/- 2 hours
+            let center = baseline.avg_login_hour.round() as u8;
+            baseline.typical_login_hours =
+                (center.saturating_sub(2), (center + 2).min(23));
+        }
+
+        // --- Accumulate known networks (cap at 50 to bound memory) ---
+        if let Some(ref net) = signals.network_id {
+            if !net.is_empty() && !baseline.known_networks.contains(net) {
+                if baseline.known_networks.len() < 50 {
+                    baseline.known_networks.push(net.clone());
+                }
+            }
+        }
+
+        // --- EMA update for session duration ---
+        if let Some(dur) = signals.session_duration_secs {
+            if dur > 0.0 {
+                baseline.avg_session_duration_secs = EMA_ALPHA * dur
+                    + (1.0 - EMA_ALPHA) * baseline.avg_session_duration_secs;
+            }
+        }
+
+        baseline.last_updated = now;
+    }
+
+    /// Compute an anomaly score in `[0.0, 1.0]` by comparing the current
+    /// signals against the stored baseline for `user_id`.
+    ///
+    /// Returns `0.0` if no baseline exists yet (benefit of the doubt for new
+    /// users — other risk signals still apply).
+    pub fn compute_anomaly_score(&self, user_id: &Uuid, signals: &RiskSignals) -> f64 {
+        let store = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let baseline = match store.get(user_id) {
+            Some(b) => b,
+            None => return 0.0, // no baseline yet — no anomaly signal
+        };
+
+        let mut anomaly = 0.0;
+
+        // --- Login hour anomaly (weight 0.4) ---
+        if let Some(hour) = signals.login_hour {
+            let (start, end) = baseline.typical_login_hours;
+            let outside = if start <= end {
+                hour < start || hour > end
+            } else {
+                // wraps midnight
+                hour < start && hour > end
+            };
+            if outside {
+                // Distance from the nearest boundary, normalized to max 12h
+                let dist_start = ((hour as i16 - start as i16).abs() as f64).min(
+                    24.0 - (hour as i16 - start as i16).abs() as f64,
+                );
+                let dist_end = ((hour as i16 - end as i16).abs() as f64).min(
+                    24.0 - (hour as i16 - end as i16).abs() as f64,
+                );
+                let dist = dist_start.min(dist_end);
+                anomaly += (dist / 12.0).min(1.0) * 0.4;
+            }
+        }
+
+        // --- Network anomaly (weight 0.35) ---
+        if let Some(ref net) = signals.network_id {
+            if !net.is_empty() && !baseline.known_networks.contains(net) {
+                anomaly += 0.35;
+            }
+        }
+
+        // --- Session duration anomaly (weight 0.25) ---
+        if let Some(dur) = signals.session_duration_secs {
+            if baseline.avg_session_duration_secs > 0.0 && dur > 0.0 {
+                let ratio = dur / baseline.avg_session_duration_secs;
+                // Flag sessions that are >3x or <0.2x the average duration
+                if ratio > 3.0 || ratio < 0.2 {
+                    let deviation = if ratio > 3.0 {
+                        ((ratio - 3.0) / 10.0).min(1.0)
+                    } else {
+                        ((0.2 - ratio) / 0.2).min(1.0)
+                    };
+                    anomaly += deviation * 0.25;
+                }
+            }
+        }
+
+        anomaly.min(1.0)
+    }
+
+    /// Get a snapshot of the baseline for a user (if it exists).
+    pub fn get_baseline(&self, user_id: &Uuid) -> Option<UserBaseline> {
+        let store = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        store.get(user_id).cloned()
+    }
+}
+
+impl Default for BaselineStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct RiskEngine {
-    // TODO: `baselines` is currently a stub. It needs to be populated with
-    // actual per-user behavioral data (login hours, typical networks, access
-    // patterns) from a persistent store or streaming pipeline. Until then,
-    // baseline-aware scoring is not active.
-    #[allow(dead_code)]
-    baselines: HashMap<Uuid, UserBaseline>,
+    /// Per-user behavioral baselines for anomaly detection.
+    pub baseline_store: BaselineStore,
 
     /// Server-side failed attempt counter per user ID.
     /// Each entry stores (count, window_start). The counter resets when the
@@ -46,19 +247,10 @@ pub struct RiskEngine {
     failed_attempt_counter: Mutex<HashMap<Uuid, (u32, Instant)>>,
 }
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct UserBaseline {
-    avg_login_hour: f64,
-    usual_networks: Vec<String>,
-    typical_access_patterns: Vec<String>,
-    last_updated: i64,
-}
-
 impl RiskEngine {
     pub fn new() -> Self {
         Self {
-            baselines: HashMap::new(),
+            baseline_store: BaselineStore::new(),
             failed_attempt_counter: Mutex::new(HashMap::new()),
         }
     }
@@ -111,6 +303,9 @@ impl RiskEngine {
             // Client-supplied failed attempts field is preserved in the struct
             // but ignored in scoring; the server-side counter is used instead.
             recent_failed_attempts: signals.recent_failed_attempts,
+            login_hour: signals.login_hour.map(|h| h.min(23)),
+            network_id: signals.network_id.clone(),
+            session_duration_secs: signals.session_duration_secs.map(|d| d.max(0.0)),
         }
     }
 
@@ -159,6 +354,11 @@ impl RiskEngine {
         let server_fails = self.server_failed_attempts(user_id);
         let fail_score = (server_fails as f64 / 5.0).min(1.0);
         score += fail_score * 0.15;
+
+        // Baseline anomaly detection (weight ~0.10) — compares current signals
+        // against the user's historical behavioral baseline.
+        let baseline_anomaly = self.baseline_store.compute_anomaly_score(user_id, &signals);
+        score += baseline_anomaly * 0.10;
 
         // Mimicry detection: flag sessions where ALL signals are simultaneously
         // perfect (statistically improbable for real users). A legitimate user

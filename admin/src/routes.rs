@@ -736,6 +736,24 @@ fn now_secs() -> i64 {
         .as_secs() as i64
 }
 
+// Pagination
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct PaginationParams {
+    limit: Option<u32>,
+    offset: Option<u32>,
+}
+
+impl PaginationParams {
+    fn limit(&self) -> u32 {
+        self.limit.unwrap_or(100).min(1000)
+    }
+    fn offset(&self) -> u32 {
+        self.offset.unwrap_or(0)
+    }
+}
+
 // Domain types
 // ---------------------------------------------------------------------------
 
@@ -1211,33 +1229,39 @@ async fn list_sessions(
 }
 
 /// POST /api/security/test/token-tamper — test that token tampering is detected.
-async fn test_token_tamper() -> Json<serde_json::Value> {
+async fn test_token_tamper(request: Request) -> Result<Json<serde_json::Value>, StatusCode> {
+    let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(4);
+    check_tier(caller_tier, 1)?;
     use common::types::Token;
     let mut token = Token::test_fixture();
     // Tamper with one byte of the FROST signature
     token.frost_signature[0] ^= 0xFF;
     let _serialized = postcard::to_allocvec(&token).unwrap_or_default();
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "test": "token_tamper_detection",
         "description": "Modified 1 byte of FROST signature",
         "tampered_bytes": 1,
         "result": "REJECTED",
         "reason": "FROST signature verification would fail on tampered token",
         "passed": true,
-    }))
+    })))
 }
 
 /// POST /api/security/test/audit-integrity — verify audit chain integrity.
 async fn test_audit_integrity(
     State(state): State<Arc<AppState>>,
-) -> Json<serde_json::Value> {
+    request: Request,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(4);
+    check_tier(caller_tier, 1)?;
+
     let audit = state.audit_log.read().await;
     let chain_valid = audit.verify_chain();
     let entries = audit.entries().len();
     let tamper_detected = !audit.is_integrity_intact();
     drop(audit);
 
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "test": "audit_chain_integrity",
         "description": "SHA-512 hash chain + ML-DSA-87 signature verification",
         "entries_verified": entries,
@@ -1245,11 +1269,14 @@ async fn test_audit_integrity(
         "tamper_detected": tamper_detected,
         "result": if chain_valid && !tamper_detected { "PASSED" } else { "FAILED" },
         "passed": chain_valid && !tamper_detected,
-    }))
+    })))
 }
 
 /// POST /api/security/test/crypto-health — verify cryptographic subsystem health.
-async fn test_crypto_health() -> Json<serde_json::Value> {
+async fn test_crypto_health(request: Request) -> Result<Json<serde_json::Value>, StatusCode> {
+    let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(4);
+    check_tier(caller_tier, 1)?;
+
     // Test entropy generation
     let entropy_ok = std::panic::catch_unwind(|| {
         crypto::entropy::combined_entropy()
@@ -1290,7 +1317,7 @@ async fn test_crypto_health() -> Json<serde_json::Value> {
 
     let all_passed = entropy_ok && pq_ok && aes_ok && ct_ok;
 
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "test": "cryptographic_health",
         "description": "Verify all crypto subsystems are functional",
         "checks": {
@@ -1301,13 +1328,16 @@ async fn test_crypto_health() -> Json<serde_json::Value> {
         },
         "result": if all_passed { "ALL PASSED" } else { "SOME FAILED" },
         "passed": all_passed,
-    }))
+    })))
 }
 
 /// GET /api/security/config — get security configuration.
-async fn security_config() -> Json<serde_json::Value> {
+async fn security_config(request: Request) -> Result<Json<serde_json::Value>, StatusCode> {
+    let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(255);
+    check_tier(caller_tier, 2)?;
+
     let config = common::config::SecurityConfig::default();
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "authentication": {
             "max_failed_attempts": config.max_failed_attempts,
             "lockout_duration_secs": config.lockout_duration_secs,
@@ -1342,7 +1372,7 @@ async fn security_config() -> Json<serde_json::Value> {
             "require_mlock": config.require_mlock,
             "entropy_fail_closed": config.entropy_fail_closed,
         },
-    }))
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -1454,13 +1484,15 @@ async fn register_user(
     }))
 }
 
-async fn list_users(State(state): State<Arc<AppState>>, request: Request) -> Result<Json<Vec<String>>, StatusCode> {
+async fn list_users(State(state): State<Arc<AppState>>, Query(pagination): Query<PaginationParams>, request: Request) -> Result<Json<Vec<String>>, StatusCode> {
     let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(4);
     check_tier(caller_tier, 2)?;
 
     let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT username FROM users WHERE is_active = true"
+        "SELECT username FROM users WHERE is_active = true LIMIT $1 OFFSET $2"
     )
+    .bind(pagination.limit() as i64)
+    .bind(pagination.offset() as i64)
     .fetch_all(&state.db)
     .await
     .unwrap_or_default();
@@ -1586,13 +1618,15 @@ async fn register_portal(
     }))
 }
 
-async fn list_portals(State(state): State<Arc<AppState>>, request: Request) -> Result<Json<Vec<PortalResponse>>, StatusCode> {
+async fn list_portals(State(state): State<Arc<AppState>>, Query(pagination): Query<PaginationParams>, request: Request) -> Result<Json<Vec<PortalResponse>>, StatusCode> {
     let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(4);
     check_tier(caller_tier, 2)?;
 
     let rows: Vec<(Uuid, String, String, i32, i32, bool)> = sqlx::query_as(
-        "SELECT id, name, callback_url, required_tier, required_scope, is_active FROM portals WHERE is_active = true"
+        "SELECT id, name, callback_url, required_tier, required_scope, is_active FROM portals WHERE is_active = true LIMIT $1 OFFSET $2"
     )
+    .bind(pagination.limit() as i64)
+    .bind(pagination.offset() as i64)
     .fetch_all(&state.db)
     .await
     .unwrap_or_default();
@@ -1728,10 +1762,12 @@ async fn enroll_device(
     }))
 }
 
-async fn list_devices(State(state): State<Arc<AppState>>) -> Json<Vec<DeviceResponse>> {
+async fn list_devices(State(state): State<Arc<AppState>>, Query(pagination): Query<PaginationParams>) -> Json<Vec<DeviceResponse>> {
     let rows: Vec<(Uuid, i32, Uuid, bool)> = sqlx::query_as(
-        "SELECT id, tier, enrolled_by, is_active FROM devices WHERE is_active = true"
+        "SELECT id, tier, enrolled_by, is_active FROM devices WHERE is_active = true LIMIT $1 OFFSET $2"
     )
+    .bind(pagination.limit() as i64)
+    .bind(pagination.offset() as i64)
     .fetch_all(&state.db)
     .await
     .unwrap_or_default();
@@ -1752,14 +1788,17 @@ async fn list_devices(State(state): State<Arc<AppState>>) -> Json<Vec<DeviceResp
 
 async fn get_audit_log(
     State(state): State<Arc<AppState>>,
+    Query(pagination): Query<PaginationParams>,
     request: Request,
 ) -> Result<Json<Vec<AuditEntryResponse>>, StatusCode> {
     let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(4);
     check_tier(caller_tier, 2)?;
 
     let rows: Vec<(Uuid, String, Option<String>, i64)> = sqlx::query_as(
-        "SELECT id, event_type, user_ids, timestamp FROM audit_log ORDER BY timestamp ASC"
+        "SELECT id, event_type, user_ids, timestamp FROM audit_log ORDER BY timestamp ASC LIMIT $1 OFFSET $2"
     )
+    .bind(pagination.limit() as i64)
+    .bind(pagination.offset() as i64)
     .fetch_all(&state.db)
     .await
     .unwrap_or_default();
@@ -2483,6 +2522,21 @@ a{{color:#00ff41}}</style></head><body>
 </body></html>"#))).into_response();
     }
 
+    // Re-validate redirect_uri against client's registered URIs before issuing code
+    // (defense-in-depth: the initial /oauth/authorize checked this, but re-check here
+    // to prevent TOCTOU attacks where the form's redirect_uri was tampered with)
+    {
+        let clients = state.oauth_clients.read().await;
+        let client = match clients.get(&form.client_id) {
+            Some(c) => c.clone(),
+            None => return (StatusCode::BAD_REQUEST, "invalid_client").into_response(),
+        };
+        drop(clients);
+        if !client.redirect_uris.iter().any(|u| u == &form.redirect_uri) {
+            return (StatusCode::BAD_REQUEST, "invalid_redirect_uri").into_response();
+        }
+    }
+
     // Authentication succeeded — create authorization code with tier
     let mut codes = state.auth_codes.write().await;
     let code = match codes.create_code_with_tier(
@@ -3065,6 +3119,11 @@ async fn oauth_token(
         }
     }
 
+    // OIDC Core 3.1.3.3: if the authorization request included a nonce, the ID
+    // token MUST include it.  We clone before moving into create_id_token_with_tier
+    // so we can verify the invariant.
+    let nonce_for_id_token = auth_code.nonce.clone();
+
     // Create tokens (with the user's tier from the auth code)
     let id_token = sso_protocol::tokens::create_id_token_with_tier(
         std::env::var("SSO_ISSUER").unwrap_or_else(|_| "https://sso-system.dmj.one".to_string()).as_str(),
@@ -3074,6 +3133,24 @@ async fn oauth_token(
         &state.oidc_signing_key,
         auth_code.tier,
     );
+
+    // Enforce nonce presence: if the authorize request carried a nonce, verify
+    // it is actually embedded in the ID token (belt-and-suspenders check).
+    if let Some(ref expected_nonce) = nonce_for_id_token {
+        // Decode the claims segment (second part of the JWT) to verify nonce
+        let parts: Vec<&str> = id_token.splitn(3, '.').collect();
+        let nonce_ok = parts.get(1).and_then(|claims_b64| {
+            use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            use base64::Engine;
+            let bytes = URL_SAFE_NO_PAD.decode(claims_b64).ok()?;
+            let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+            claims.get("nonce").and_then(|v| v.as_str()).map(|n| n == expected_nonce)
+        }).unwrap_or(false);
+        if !nonce_ok {
+            tracing::error!("CRITICAL: nonce missing or mismatched in ID token — aborting token issuance");
+            return Json(serde_json::json!({"error": "server_error", "error_description": "nonce enforcement failure"}));
+        }
+    }
 
     let access_token = Uuid::new_v4().to_string();
 

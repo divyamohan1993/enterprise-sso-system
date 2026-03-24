@@ -458,13 +458,25 @@ pub async fn extract_google_claims(
     let signature = rsa::pkcs1v15::Signature::try_from(sig_bytes.as_slice())
         .map_err(|e| format!("invalid RSA signature encoding: {e}"))?;
 
-    // SECURITY: Timing floor for RSA verification (RUSTSEC-2023-0071 mitigation)
+    // SECURITY: RUSTSEC-2023-0071 (Marvin Attack) mitigation.
+    //
+    // The `rsa` crate's PKCS#1 v1.5 verification is vulnerable to timing
+    // side-channels that can leak information about the private key via
+    // observable differences in verification duration between valid and
+    // invalid signatures.  Because Google mandates RS256 (PKCS#1 v1.5 +
+    // SHA-256) for JWKS ID-token verification, we cannot switch to PSS.
+    //
+    // Mitigation: impose a constant-time floor of 50 ms on the entire
+    // verification operation so that an attacker cannot distinguish fast
+    // rejection from slow success.  The result is captured *before* the
+    // floor elapses and only inspected *after*, ensuring no early-return
+    // timing leak.
     let verify_start = std::time::Instant::now();
     let verify_result = verifying_key.verify(signing_input.as_bytes(), &signature);
     let verify_elapsed = verify_start.elapsed();
     let verify_floor = Duration::from_millis(50);
     if verify_elapsed < verify_floor {
-        std::thread::sleep(verify_floor - verify_elapsed);
+        tokio::time::sleep(verify_floor - verify_elapsed).await;
     }
     verify_result.map_err(|_| "RS256 signature verification failed".to_string())?;
 

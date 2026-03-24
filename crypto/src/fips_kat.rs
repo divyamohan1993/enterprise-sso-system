@@ -22,7 +22,7 @@ use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::{Digest as Sha2Digest, Sha512};
-use sha3::{Digest as Sha3Digest, Sha3_256};
+use sha3::Sha3_256;
 
 type HmacSha512 = Hmac<Sha512>;
 

@@ -9,7 +9,7 @@
 #![forbid(unsafe_code)]
 
 use serde::Serialize;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -45,6 +45,140 @@ pub fn broadcast_event(event: &SiemEvent) {
 /// Obtain a new receiver handle for the global SIEM event bus.
 pub fn subscribe() -> tokio::sync::broadcast::Receiver<SiemEvent> {
     SIEM_BUS.subscribe()
+}
+
+// ---------------------------------------------------------------------------
+// Webhook / file-based alerting for critical events
+// ---------------------------------------------------------------------------
+
+/// Webhook URL for forwarding high-severity events.  Loaded once from
+/// `MILNET_ALERT_WEBHOOK_URL` on first access.
+static ALERT_WEBHOOK_URL: OnceLock<Option<String>> = OnceLock::new();
+
+/// Directory for the file-based alert sink.
+const ALERT_DIR: &str = "/var/lib/milnet/alerts";
+const CRITICAL_ALERT_FILE: &str = "/var/lib/milnet/alerts/critical.jsonl";
+
+/// Return the configured webhook URL (if any).
+fn alert_webhook_url() -> &'static Option<String> {
+    ALERT_WEBHOOK_URL.get_or_init(|| {
+        std::env::var("MILNET_ALERT_WEBHOOK_URL").ok().filter(|u| !u.is_empty())
+    })
+}
+
+/// Persist a critical/high event to the file-based alert sink.
+fn persist_alert_to_file(json: &str) {
+    if let Err(e) = std::fs::create_dir_all(ALERT_DIR) {
+        tracing::warn!("failed to create alert directory {}: {}", ALERT_DIR, e);
+        return;
+    }
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(CRITICAL_ALERT_FILE)
+    {
+        Ok(mut f) => {
+            use std::io::Write;
+            if let Err(e) = writeln!(f, "{}", json) {
+                tracing::warn!("failed to write alert to {}: {}", CRITICAL_ALERT_FILE, e);
+            }
+        }
+        Err(e) => {
+            tracing::warn!("failed to open alert file {}: {}", CRITICAL_ALERT_FILE, e);
+        }
+    }
+}
+
+/// Send a webhook alert for a high-severity SIEM event.
+///
+/// Uses a minimal HTTP/1.1 POST over `std::net::TcpStream` so we do not
+/// require an external HTTP client crate.  The call is best-effort: failures
+/// are logged but never propagated.
+fn send_webhook_alert(event: &SiemEvent) {
+    let url_str = match alert_webhook_url() {
+        Some(u) => u.clone(),
+        None => return,
+    };
+
+    // Minimal URL parsing: expect "http://host:port/path" or "https://..."
+    let body = match serde_json::to_string(event) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+
+    // Spawn a blocking task so we don't block the async runtime.
+    let _ = std::thread::Builder::new()
+        .name("siem-webhook".into())
+        .spawn(move || {
+            send_webhook_blocking(&url_str, &body);
+        });
+}
+
+/// Blocking HTTP POST helper.
+fn send_webhook_blocking(url: &str, body: &str) {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    // Very minimal URL parsing
+    let without_scheme = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+
+    let (host_port, path) = match without_scheme.find('/') {
+        Some(i) => (&without_scheme[..i], &without_scheme[i..]),
+        None => (without_scheme, "/"),
+    };
+
+    let host_port_owned = if host_port.contains(':') {
+        host_port.to_string()
+    } else {
+        format!("{}:80", host_port)
+    };
+
+    let stream = match TcpStream::connect_timeout(
+        &host_port_owned.parse().unwrap_or_else(|_| {
+            std::net::SocketAddr::from(([127, 0, 0, 1], 80))
+        }),
+        Duration::from_secs(5),
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("webhook connect failed: {}", e);
+            return;
+        }
+    };
+
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+
+    let request = format!(
+        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        path, host_port, body.len(), body
+    );
+
+    let mut stream = stream;
+    if let Err(e) = stream.write_all(request.as_bytes()) {
+        tracing::warn!("webhook write failed: {}", e);
+        return;
+    }
+
+    // Read (and discard) the response to complete the TCP exchange.
+    let mut buf = [0u8; 512];
+    let _ = stream.read(&mut buf);
+}
+
+/// Process alerting for a SIEM event: persist to file and optionally forward
+/// via webhook.  Called for events with severity >= HIGH (7).
+fn process_alert(event: &SiemEvent) {
+    // Always persist to file-based sink as a fallback
+    persist_alert_to_file(&event.json);
+
+    // Forward via webhook if configured
+    if alert_webhook_url().is_some() {
+        send_webhook_alert(event);
+    }
 }
 
 /// Security event severity levels (CEF-compatible, 0-10 scale).
@@ -413,6 +547,36 @@ impl SecurityEvent {
         event.emit();
     }
 
+    /// Emit a ratchet heartbeat failure event (service unreachable).
+    pub fn ratchet_heartbeat_failure(detail: &str) {
+        let event = SecurityEvent {
+            timestamp: Self::now_iso8601(),
+            category: "availability",
+            action: "ratchet_heartbeat_failure",
+            severity: Severity::Critical,
+            outcome: "failure",
+            user_id: None,
+            source_ip: None,
+            detail: Some(detail.to_string()),
+        };
+        event.emit();
+    }
+
+    /// Emit a key rotation overdue event (reminder — operator action needed).
+    pub fn key_rotation_overdue(detail: &str) {
+        let event = SecurityEvent {
+            timestamp: Self::now_iso8601(),
+            category: "key_management",
+            action: "key_rotation_overdue",
+            severity: Severity::High,
+            outcome: "failure",
+            user_id: None,
+            source_ip: None,
+            detail: Some(detail.to_string()),
+        };
+        event.emit();
+    }
+
     /// Emit a mutex poisoning recovery event.
     pub fn mutex_poisoning(detail: &str) {
         let event = SecurityEvent {
@@ -479,11 +643,18 @@ impl SecurityEvent {
             .unwrap_or_default()
             .as_secs() as i64;
 
-        broadcast_event(&SiemEvent {
+        let siem_event = SiemEvent {
             timestamp,
             severity: self.severity as u8,
             event_type: self.action.to_string(),
             json,
-        });
+        };
+
+        broadcast_event(&siem_event);
+
+        // Alert on high-severity events (severity >= 7 = HIGH)
+        if siem_event.severity >= 7 {
+            process_alert(&siem_event);
+        }
     }
 }
