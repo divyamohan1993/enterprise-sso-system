@@ -15,9 +15,12 @@ const TIME_STEP: u64 = 30;
 const TOTP_DIGITS: u32 = 6;
 
 /// Generate a 32-byte random secret for TOTP enrollment.
-pub fn generate_secret() -> [u8; 32] {
-    let mut secret = [0u8; 32];
-    getrandom::getrandom(&mut secret).expect("getrandom failed");
+///
+/// Returns a `Zeroizing<[u8; 32]>` — the secret is automatically erased
+/// from memory when dropped, preventing post-use forensic recovery.
+pub fn generate_secret() -> zeroize::Zeroizing<[u8; 32]> {
+    let mut secret = zeroize::Zeroizing::new([0u8; 32]);
+    getrandom::getrandom(secret.as_mut()).expect("getrandom failed");
     secret
 }
 
@@ -150,7 +153,7 @@ mod tests {
     fn test_generate_secret_is_random() {
         let s1 = generate_secret();
         let s2 = generate_secret();
-        assert_ne!(s1, s2);
+        assert_ne!(*s1, *s2);
     }
 
     #[test]

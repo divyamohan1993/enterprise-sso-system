@@ -6,20 +6,9 @@
 //! and cryptographic edge cases.
 
 use std::collections::HashSet;
-use std::sync::Once;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::net::TcpStream;
-
-/// Disable DPoP requirement for attack simulation tests — these tests exercise
-/// other attack vectors (DDoS, credential stuffing, token forgery, etc.) and
-/// use synthetic tokens with placeholder dpop_hash values.
-static INIT: Once = Once::new();
-fn disable_dpop_for_tests() {
-    INIT.call_once(|| {
-        std::env::set_var("MILNET_REQUIRE_DPOP", "false");
-    });
-}
 
 use audit::log::{hash_entry, AuditLog};
 use common::actions::{
@@ -44,10 +33,10 @@ use risk::tiers::check_tier_access;
 use shard::protocol::ShardProtocol;
 use tss::token_builder::build_token_distributed;
 use tss::validator::{validate_receipt_chain, validate_receipt_chain_with_key, ReceiptVerificationKey};
-use verifier::verify::verify_token;
+use verifier::verify::{verify_token, verify_token_bound};
 use uuid::Uuid;
 
-use e2e::{client_auth, send_frame, recv_frame};
+use e2e::{client_auth, client_auth_with_dpop, send_frame, recv_frame};
 
 // ── Constants ────────────────────────────────────────────────────────────
 
@@ -386,16 +375,20 @@ fn build_valid_receipt_chain(signing_key: &[u8; 64]) -> Vec<Receipt> {
     vec![r1, r2]
 }
 
-fn make_valid_token_and_key() -> (Token, frost_ristretto255::keys::PublicKeyPackage) {
+/// Test DPoP key (any stable bytes -- the gateway uses KEM ciphertext).
+const TEST_DPOP_KEY: [u8; 32] = [0xDD; 32];
+
+fn make_valid_token_and_key() -> (Token, frost_ristretto255::keys::PublicKeyPackage, [u8; 32]) {
     let mut dkg_result = dkg(5, 3);
     let group_key = dkg_result.group.public_key_package.clone();
+    let dpop_hash = crypto::dpop::dpop_key_hash(&TEST_DPOP_KEY);
     let claims = TokenClaims {
         sub: Uuid::new_v4(),
         iss: [0xAA; 32],
         iat: now_us(),
         exp: now_us() + 600_000_000,
         scope: 0x0000_000F,
-        dpop_hash: [0u8; 32], // No DPoP binding — tests exercise other attack vectors
+        dpop_hash,
         ceremony_id: [0xCC; 32],
         tier: 2,
         ratchet_epoch: 1,
@@ -406,7 +399,7 @@ fn make_valid_token_and_key() -> (Token, frost_ristretto255::keys::PublicKeyPack
     let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
     let token = build_token_distributed(&claims, &coordinator, &mut signers, &[0x55u8; 64], test_pq_sk(), None)
         .expect("build token should succeed");
-    (token, group_key)
+    (token, group_key, TEST_DPOP_KEY)
 }
 
 // ==========================================================================
@@ -493,8 +486,6 @@ async fn test_attack_ddos_wrong_puzzle_flood() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_attack_ddos_concurrent_legitimate_under_load() {
-    disable_dpop_for_tests();
-
     // Send bogus connections first, then legitimate ones. Total must
     // stay within the per-IP rate limit (10 connections per 60s window).
     // We send 4 bogus + 3 legitimate = 7 total connections.
@@ -530,8 +521,8 @@ async fn test_attack_ddos_concurrent_legitimate_under_load() {
     // Now send 3 legitimate auth sessions sequentially.
     // They must all succeed despite the prior bogus flood.
     for i in 0..3 {
-        let resp =
-            client_auth(&gateway_addr, &format!("user{i}"), format!("pass{i}").as_bytes()).await;
+        let (resp, dpop_key) =
+            client_auth_with_dpop(&gateway_addr, &format!("user{i}"), format!("pass{i}").as_bytes()).await;
         assert!(
             resp.success,
             "legitimate user{i} must succeed after DDoS flood: {:?}",
@@ -539,7 +530,7 @@ async fn test_attack_ddos_concurrent_legitimate_under_load() {
         );
         let token_bytes = resp.token.unwrap();
         let token: Token = postcard::from_bytes(&token_bytes).expect("deserialize token");
-        verify_token(&token, &group_key, test_pq_vk()).expect("token should verify");
+        verify_token_bound(&token, &group_key, test_pq_vk(), &dpop_key).expect("token should verify");
     }
 }
 
@@ -549,8 +540,6 @@ async fn test_attack_ddos_concurrent_legitimate_under_load() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_attack_credential_stuffing_attack() {
-    disable_dpop_for_tests();
-
     // Register user "admin". Try wrong passwords in rapid succession.
     // All must fail. The correct password must still work after the attack.
     // Limited to stay within per-IP rate limit (10 connections per 60s)
@@ -568,7 +557,7 @@ async fn test_attack_credential_stuffing_attack() {
     }
 
     // Correct password must still work
-    let resp = client_auth(&gateway_addr, "admin", b"correct_password").await;
+    let (resp, dpop_key) = client_auth_with_dpop(&gateway_addr, "admin", b"correct_password").await;
     assert!(
         resp.success,
         "correct password must work after credential stuffing: {:?}",
@@ -576,13 +565,11 @@ async fn test_attack_credential_stuffing_attack() {
     );
     let token_bytes = resp.token.unwrap();
     let token: Token = postcard::from_bytes(&token_bytes).expect("deserialize token");
-    verify_token(&token, &group_key, test_pq_vk()).expect("token should verify after attack");
+    verify_token_bound(&token, &group_key, test_pq_vk(), &dpop_key).expect("token should verify after attack");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_attack_password_spray_attack() {
-    disable_dpop_for_tests();
-
     // Register users. Try the same wrong password against several.
     // All must fail. Then try correct passwords — all must succeed.
     // Limited to stay within per-IP rate limit (10 connections per 60s).
@@ -601,8 +588,8 @@ async fn test_attack_password_spray_attack() {
 
     // Now correct passwords must all work — sequentially
     for i in 0..4 {
-        let resp =
-            client_auth(&gateway_addr, &format!("user{i}"), format!("correct{i}").as_bytes()).await;
+        let (resp, dpop_key) =
+            client_auth_with_dpop(&gateway_addr, &format!("user{i}"), format!("correct{i}").as_bytes()).await;
         assert!(
             resp.success,
             "correct password must work for user{i} after spray: {:?}",
@@ -610,7 +597,7 @@ async fn test_attack_password_spray_attack() {
         );
         let token_bytes = resp.token.unwrap();
         let token: Token = postcard::from_bytes(&token_bytes).expect("deserialize token");
-        verify_token(&token, &group_key, test_pq_vk()).expect("token should verify");
+        verify_token_bound(&token, &group_key, test_pq_vk(), &dpop_key).expect("token should verify after spray");
     }
 }
 
@@ -740,18 +727,16 @@ fn test_attack_forged_token_random_signature_rejected() {
 
 #[test]
 fn test_attack_forged_token_partial_signature_rejected() {
-    disable_dpop_for_tests();
-
     // Create a valid token, modify just 1 byte of the signature. Must reject.
-    let (mut token, group_key) = make_valid_token_and_key();
+    let (mut token, group_key, dpop_key) = make_valid_token_and_key();
 
     // Verify it works first
-    assert!(verify_token(&token, &group_key, test_pq_vk()).is_ok());
+    assert!(verify_token_bound(&token, &group_key, test_pq_vk(), &dpop_key).is_ok());
 
     // Flip one byte of the FROST signature
     token.frost_signature[31] ^= 0xFF;
 
-    let result = verify_token(&token, &group_key, test_pq_vk());
+    let result = verify_token_bound(&token, &group_key, test_pq_vk(), &dpop_key);
     assert!(
         result.is_err(),
         "token with 1-byte modified signature must be rejected"
@@ -760,21 +745,21 @@ fn test_attack_forged_token_partial_signature_rejected() {
 
 #[test]
 fn test_attack_token_replay_across_sessions() {
-    disable_dpop_for_tests();
-
     // Get a valid token from session 1. Try to use it in session 2
     // context (different DPoP key hash). Must fail because DPoP binding differs.
     let mut dkg_result = dkg(5, 3);
     let group_key = dkg_result.group.public_key_package.clone();
 
-    // Session 1: token bound to DPoP key hash A
+    // Session 1: token bound to DPoP key derived from session1_dpop_key
+    let session1_dpop_key = [0x11; 32];
+    let session1_dpop_hash = crypto::dpop::dpop_key_hash(&session1_dpop_key);
     let claims_session1 = TokenClaims {
         sub: Uuid::new_v4(),
         iss: [0xAA; 32],
         iat: now_us(),
         exp: now_us() + 600_000_000,
         scope: 0x0000_000F,
-        dpop_hash: [0x11; 32], // DPoP key A
+        dpop_hash: session1_dpop_hash,
         ceremony_id: [0x01; 32],
         tier: 2,
         ratchet_epoch: 1,
@@ -786,14 +771,14 @@ fn test_attack_token_replay_across_sessions() {
     let token = build_token_distributed(&claims_session1, &coordinator, &mut signers, &[0x55u8; 64], test_pq_sk(), None)
         .expect("build session 1 token");
 
-    // Verify token is valid
+    // Verify token with session 1's DPoP key succeeds
     let verified_claims =
-        verify_token(&token, &group_key, test_pq_vk()).expect("session 1 token should verify");
+        verify_token_bound(&token, &group_key, test_pq_vk(), &session1_dpop_key).expect("session 1 token should verify");
 
-    // Session 2 would have a different DPoP key hash [0x22; 32].
-    // The token's dpop_hash is [0x11; 32] — they don't match.
+    // Session 2 has a DIFFERENT DPoP key, so its hash differs
+    let session2_dpop_hash = crypto::dpop::dpop_key_hash(&[0x22; 32]);
     assert_ne!(
-        verified_claims.dpop_hash, [0x22; 32],
+        verified_claims.dpop_hash, session2_dpop_hash,
         "token's DPoP hash must NOT match session 2's DPoP key — replay detected"
     );
 }

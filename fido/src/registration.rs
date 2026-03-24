@@ -164,6 +164,13 @@ impl CredentialStore {
     pub fn get_credential_mut(&mut self, credential_id: &[u8]) -> Option<&mut StoredCredential> {
         self.credentials.get_mut(credential_id)
     }
+
+    /// Remove all credentials and pending challenges belonging to a user.
+    /// Used for GDPR Article 17 right-to-erasure compliance.
+    pub fn remove_user_credentials(&mut self, user_id: &Uuid) {
+        self.credentials.retain(|_, cred| cred.user_id != *user_id);
+        self.challenges.retain(|_, uid| uid != user_id);
+    }
 }
 
 /// Validate an attestation response and register the credential.

@@ -145,6 +145,12 @@ impl AuthorizationStore {
             }
         }
 
+        // Evict stale rate limit entries to prevent unbounded growth
+        if self.code_attempt_tracker.len() > 10_000 {
+            let cutoff = std::time::Instant::now() - std::time::Duration::from_secs(60);
+            self.code_attempt_tracker.retain(|_, (_, ts)| *ts > cutoff);
+        }
+
         let auth_code = self.codes.get_mut(code)?;
 
         // Reject already-consumed codes (replay detection)
@@ -179,6 +185,12 @@ impl AuthorizationStore {
 
         // Mark as consumed, then remove and return
         auth_code.consumed = true;
+
+        // Auto-cleanup: prune expired codes when map grows large
+        if self.codes.len() > 1000 {
+            self.cleanup_expired();
+        }
+
         self.codes.remove(code)
     }
 

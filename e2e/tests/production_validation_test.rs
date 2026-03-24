@@ -36,10 +36,10 @@ use tss::messages::{SigningRequest, SigningResponse};
 use crypto::pq_sign::{generate_pq_keypair, PqSigningKey, PqVerifyingKey};
 use tss::token_builder::build_token_distributed;
 use tss::validator::{validate_receipt_chain, validate_receipt_chain_with_key, ReceiptVerificationKey};
-use verifier::verify::verify_token;
+use verifier::verify::{verify_token, verify_token_bound};
 use uuid::Uuid;
 
-use e2e::{client_auth, send_frame, recv_frame};
+use e2e::{client_auth, client_auth_with_dpop, send_frame, recv_frame};
 
 // ── Constants ────────────────────────────────────────────────────────────
 
@@ -375,16 +375,20 @@ fn build_valid_receipt_chain(signing_key: &[u8; 64]) -> Vec<Receipt> {
     vec![r1, r2]
 }
 
-fn make_valid_token_and_key() -> (Token, frost_ristretto255::keys::PublicKeyPackage) {
+/// Test DPoP key — any stable bytes (gateway uses KEM ciphertext in production).
+const TEST_DPOP_KEY: [u8; 32] = [0xBB; 32];
+
+fn make_valid_token_and_key() -> (Token, frost_ristretto255::keys::PublicKeyPackage, [u8; 32]) {
     let mut dkg_result = dkg(5, 3);
     let group_key = dkg_result.group.public_key_package.clone();
+    let dpop_hash = crypto::dpop::dpop_key_hash(&TEST_DPOP_KEY);
     let claims = TokenClaims {
         sub: Uuid::new_v4(),
         iss: [0xAA; 32],
         iat: now_us(),
         exp: now_us() + 600_000_000,
         scope: 0x0000_000F,
-        dpop_hash: [0xBB; 32],
+        dpop_hash,
         ceremony_id: [0xCC; 32],
         tier: 2,
         ratchet_epoch: 1,
@@ -395,7 +399,7 @@ fn make_valid_token_and_key() -> (Token, frost_ristretto255::keys::PublicKeyPack
     let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
     let token = build_token_distributed(&claims, &coordinator, &mut signers, &[0x55u8; 64], test_pq_sk(), None)
         .expect("build token should succeed");
-    (token, group_key)
+    (token, group_key, TEST_DPOP_KEY)
 }
 
 // ==========================================================================
@@ -409,13 +413,13 @@ async fn test_complete_tier2_auth_flow() {
     store.register_with_password("alice", b"password123");
     let (gateway_addr, group_key) = boot_full_system(store).await;
 
-    let resp = client_auth(&gateway_addr, "alice", b"password123").await;
+    let (resp, dpop_key) = client_auth_with_dpop(&gateway_addr, "alice", b"password123").await;
     assert!(resp.success, "auth should succeed, got error: {:?}", resp.error);
     assert!(resp.token.is_some(), "token should be present");
 
     let token_bytes = resp.token.unwrap();
     let token: Token = postcard::from_bytes(&token_bytes).expect("deserialize token");
-    let claims = verify_token(&token, &group_key, test_pq_vk()).expect("token verification should succeed");
+    let claims = verify_token_bound(&token, &group_key, test_pq_vk(), &dpop_key).expect("token verification should succeed");
 
     assert_eq!(claims.tier, 2, "token tier should be 2");
     assert!(claims.exp > now_us(), "token should not be expired");
@@ -438,12 +442,12 @@ async fn test_multiple_users_concurrent_auth() {
         let addr = gateway_addr.clone();
         let gk = group_key.clone();
         handles.push(tokio::spawn(async move {
-            let resp =
-                client_auth(&addr, &format!("user{i}"), format!("pass{i}").as_bytes()).await;
+            let (resp, dpop_key) =
+                client_auth_with_dpop(&addr, &format!("user{i}"), format!("pass{i}").as_bytes()).await;
             assert!(resp.success, "user{i} auth should succeed: {:?}", resp.error);
             let token_bytes = resp.token.unwrap();
             let token: Token = postcard::from_bytes(&token_bytes).expect("deserialize token");
-            let claims = verify_token(&token, &gk, test_pq_vk()).expect("token should verify");
+            let claims = verify_token_bound(&token, &gk, test_pq_vk(), &dpop_key).expect("token should verify");
             assert_eq!(claims.tier, 2);
             claims.sub
         }));
@@ -467,11 +471,11 @@ async fn test_sequential_auth_sessions() {
 
     let mut ceremony_ids = Vec::new();
     for _ in 0..5 {
-        let resp = client_auth(&gateway_addr, "bob", b"bobpass").await;
+        let (resp, dpop_key) = client_auth_with_dpop(&gateway_addr, "bob", b"bobpass").await;
         assert!(resp.success);
         let token_bytes = resp.token.unwrap();
         let token: Token = postcard::from_bytes(&token_bytes).expect("deserialize token");
-        let claims = verify_token(&token, &group_key, test_pq_vk()).expect("token should verify");
+        let claims = verify_token_bound(&token, &group_key, test_pq_vk(), &dpop_key).expect("token should verify");
         ceremony_ids.push(claims.ceremony_id);
     }
 
@@ -543,11 +547,11 @@ async fn test_unicode_username_works() {
     store.register_with_password(username, b"unicodepass");
     let (gateway_addr, group_key) = boot_full_system(store).await;
 
-    let resp = client_auth(&gateway_addr, username, b"unicodepass").await;
+    let (resp, dpop_key) = client_auth_with_dpop(&gateway_addr, username, b"unicodepass").await;
     assert!(resp.success, "unicode username auth should succeed: {:?}", resp.error);
     let token_bytes = resp.token.unwrap();
     let token: Token = postcard::from_bytes(&token_bytes).expect("deserialize token");
-    let claims = verify_token(&token, &group_key, test_pq_vk()).expect("token should verify");
+    let claims = verify_token_bound(&token, &group_key, test_pq_vk(), &dpop_key).expect("token should verify");
     assert_eq!(claims.tier, 2);
 }
 
@@ -559,11 +563,11 @@ async fn test_very_long_password_works() {
     store.register_with_password("longpass_user", &long_pass);
     let (gateway_addr, group_key) = boot_full_system(store).await;
 
-    let resp = client_auth(&gateway_addr, "longpass_user", &long_pass).await;
+    let (resp, dpop_key) = client_auth_with_dpop(&gateway_addr, "longpass_user", &long_pass).await;
     assert!(resp.success, "long password auth should succeed: {:?}", resp.error);
     let token_bytes = resp.token.unwrap();
     let token: Token = postcard::from_bytes(&token_bytes).expect("deserialize token");
-    verify_token(&token, &group_key, test_pq_vk()).expect("token should verify");
+    verify_token_bound(&token, &group_key, test_pq_vk(), &dpop_key).expect("token should verify");
 }
 
 #[tokio::test]
@@ -605,15 +609,15 @@ async fn test_puzzle_not_solved_rejected() {
 #[test]
 fn test_token_cannot_be_modified() {
     let _pq_vk = test_pq_vk();
-    let (mut token, group_key) = make_valid_token_and_key();
+    let (mut token, group_key, dpop_key) = make_valid_token_and_key();
 
     // Verify it is valid first
-    assert!(verify_token(&token, &group_key, test_pq_vk()).is_ok());
+    assert!(verify_token_bound(&token, &group_key, test_pq_vk(), &dpop_key).is_ok());
 
     // Flip one bit in the tier claim
     token.claims.tier = 1;
 
-    let result = verify_token(&token, &group_key, test_pq_vk());
+    let result = verify_token_bound(&token, &group_key, test_pq_vk(), &dpop_key);
     assert!(result.is_err(), "tampered token must be rejected");
 }
 
@@ -623,13 +627,15 @@ fn test_token_signature_cannot_be_transplanted() {
     let mut dkg_result = dkg(5, 3);
     let group_key = dkg_result.group.public_key_package.clone();
 
+    let dpop_key_a = [0xBB; 32];
+    let dpop_key_b = [0xCC; 32];
     let claims_a = TokenClaims {
         sub: Uuid::new_v4(),
         iss: [0xAA; 32],
         iat: now_us(),
         exp: now_us() + 600_000_000,
         scope: 0x0000_000F,
-        dpop_hash: [0xBB; 32],
+        dpop_hash: crypto::dpop::dpop_key_hash(&dpop_key_a),
         ceremony_id: [0x01; 32],
         tier: 2,
         ratchet_epoch: 1,
@@ -642,7 +648,7 @@ fn test_token_signature_cannot_be_transplanted() {
         iat: now_us(),
         exp: now_us() + 600_000_000,
         scope: 0x0000_000F,
-        dpop_hash: [0xCC; 32],
+        dpop_hash: crypto::dpop::dpop_key_hash(&dpop_key_b),
         ceremony_id: [0x02; 32],
         tier: 2,
         ratchet_epoch: 1,
@@ -687,7 +693,7 @@ fn test_expired_token_rejected() {
                 iat: 1_000_000,
                 exp: 1_000_001, // far in the past
                 scope: 0x0000_000F,
-                dpop_hash: [0xBB; 32],
+                dpop_hash: crypto::dpop::dpop_key_hash(&[0xBB; 32]),
                 ceremony_id: [0xCC; 32],
                 tier: 2,
                 ratchet_epoch: 1,

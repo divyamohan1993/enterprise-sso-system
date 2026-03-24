@@ -156,3 +156,80 @@ pub async fn client_auth(
         .expect("decrypt response");
     postcard::from_bytes(&resp_plain).expect("deserialize auth response")
 }
+
+/// Like `client_auth` but also returns the DPoP binding key (KEM ciphertext bytes)
+/// needed for token verification via `verify_token_bound`.
+pub async fn client_auth_with_dpop(
+    gateway_addr: &str,
+    username: &str,
+    password: &[u8],
+) -> (AuthResponse, Vec<u8>) {
+    let mut stream = TcpStream::connect(gateway_addr)
+        .await
+        .expect("connect to gateway");
+
+    let challenge: PuzzleChallenge = recv_frame(&mut stream)
+        .await
+        .expect("receive puzzle challenge");
+
+    let server_pk_bytes = challenge
+        .xwing_server_pk
+        .as_ref()
+        .expect("server X-Wing PK in challenge");
+    let server_pk = crypto::xwing::XWingPublicKey::from_bytes(server_pk_bytes)
+        .expect("parse server X-Wing PK");
+
+    let (shared_secret, kem_ct) = tokio::task::spawn_blocking(move || {
+        crypto::xwing::xwing_encapsulate(&server_pk)
+    })
+    .await
+    .expect("encapsulate task");
+    let kem_ct_bytes = kem_ct.to_bytes();
+    let dpop_key = kem_ct_bytes.clone();
+
+    let challenge_clone = challenge.clone();
+    let solution_bytes = tokio::task::spawn_blocking(move || solve_challenge(&challenge_clone))
+        .await
+        .expect("puzzle solver task");
+    let solution = PuzzleSolution {
+        nonce: challenge.nonce,
+        solution: solution_bytes,
+        xwing_kem_ciphertext: Some(kem_ct_bytes),
+    };
+    send_frame(&mut stream, &solution)
+        .await
+        .expect("send puzzle solution");
+
+    let session_key =
+        crypto::xwing::derive_session_key(&shared_secret, &challenge.nonce);
+    let enc_key: [u8; 32] = session_key[..32].try_into().unwrap();
+
+    let auth_req = AuthRequest {
+        username: username.to_string(),
+        password: password.to_vec(),
+    };
+    let auth_plain = postcard::to_allocvec(&auth_req).expect("serialize auth request");
+    let cipher = Aes256Gcm::new_from_slice(&enc_key).expect("AES key init");
+    let mut nonce_bytes = [0u8; 12];
+    getrandom::getrandom(&mut nonce_bytes).expect("generate nonce");
+    let nonce = GenericArray::from_slice(&nonce_bytes);
+    let ciphertext = cipher
+        .encrypt(nonce, auth_plain.as_ref())
+        .expect("encrypt");
+    let mut encrypted = Vec::with_capacity(12 + ciphertext.len());
+    encrypted.extend_from_slice(&nonce_bytes);
+    encrypted.extend_from_slice(&ciphertext);
+    send_raw_frame(&mut stream, &encrypted)
+        .await
+        .expect("send encrypted auth");
+
+    let encrypted_resp = recv_raw_frame(&mut stream)
+        .await
+        .expect("receive encrypted response");
+    let resp_nonce = GenericArray::from_slice(&encrypted_resp[..12]);
+    let resp_plain = cipher
+        .decrypt(resp_nonce, &encrypted_resp[12..])
+        .expect("decrypt response");
+    let resp: AuthResponse = postcard::from_bytes(&resp_plain).expect("deserialize auth response");
+    (resp, dpop_key)
+}

@@ -16,17 +16,22 @@ async fn main() {
     // This avoids printing secrets and ensures the key is stable across restarts.
     let api_key = std::env::var("ADMIN_API_KEY").unwrap_or_else(|_| {
         let master_kek = common::sealed_keys::load_master_kek();
+        // Bind admin key to deployment identity for domain separation.
+        // v2: includes deployment-specific context to prevent key reuse.
+        let deployment_id = std::env::var("MILNET_DEPLOYMENT_ID")
+            .unwrap_or_else(|_| "default-deployment".to_string());
+        let salt = format!("MILNET-ADMIN-API-KEY-v2:{}", deployment_id);
         let derived = {
             use hkdf::Hkdf;
             use sha2::Sha512;
-            let hk = Hkdf::<Sha512>::new(Some(b"MILNET-ADMIN-API-KEY-v1"), &master_kek);
+            let hk = Hkdf::<Sha512>::new(Some(salt.as_bytes()), &master_kek);
             let mut okm = [0u8; 32];
-            hk.expand(b"admin-api-key", &mut okm)
+            hk.expand(b"admin-api-key-v2", &mut okm)
                 .expect("HKDF expand");
             okm
         };
         let key = hex::encode(derived);
-        tracing::info!("Admin API key derived from master KEK (HKDF-SHA512)");
+        tracing::info!("Admin API key derived from master KEK (HKDF-SHA512, deployment-bound)");
         key
     });
 

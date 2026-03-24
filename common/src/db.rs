@@ -244,6 +244,15 @@ pub async fn init_database(database_url: &str) -> PgPool {
     let _ = sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS users_email_unique ON users (email) WHERE email IS NOT NULL")
         .execute(&pool).await;
 
+    // Migration: add encrypted email column for PII protection at rest
+    let _ = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS email_encrypted BYTEA")
+        .execute(&pool).await;
+    // Migration: add email_hash column for lookups without decrypting
+    let _ = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS email_hash BYTEA")
+        .execute(&pool).await;
+    let _ = sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS users_email_hash_unique ON users (email_hash) WHERE email_hash IS NOT NULL")
+        .execute(&pool).await;
+
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS shard_sequences (
             module_pair VARCHAR(100) PRIMARY KEY,

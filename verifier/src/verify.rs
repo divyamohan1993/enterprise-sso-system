@@ -60,15 +60,12 @@ pub fn verify_token_bound(
     verify_token_inner(token, public_key_package, pq_verifying_key, Some(client_dpop_key))
 }
 
-/// Returns `true` if DPoP is required based on environment configuration.
-///
-/// Reads `MILNET_REQUIRE_DPOP`:
-/// - `"false"` or `"0"` → DPoP not required (dev/test mode)
-/// - anything else or unset → DPoP required (production default)
+/// DPoP channel binding is ALWAYS required for Tier 1/2.
+/// Previous env var toggle (MILNET_REQUIRE_DPOP) has been removed
+/// for security hardening — stolen tokens cannot be replayed without
+/// the client's DPoP private key.
 fn dpop_required() -> bool {
-    std::env::var("MILNET_REQUIRE_DPOP")
-        .map(|v| v != "false" && v != "0")
-        .unwrap_or(true)
+    true
 }
 
 /// Returns `true` if the given tier is exempt from DPoP requirements.

@@ -13,6 +13,7 @@ pub struct IdTokenClaims {
     pub nonce: Option<String>,
     pub auth_time: i64,
     pub tier: u8,
+    pub jti: String,
 }
 
 #[derive(Serialize)]
@@ -79,6 +80,18 @@ pub fn create_id_token(
     create_id_token_with_tier(issuer, user_id, client_id, nonce, signing_key, 2)
 }
 
+/// Returns token lifetime in seconds based on device tier.
+/// Higher privilege tiers get shorter lifetimes to limit exposure.
+fn token_lifetime_for_tier(tier: u8) -> i64 {
+    match tier {
+        1 => 300,   // Sovereign: 5 minutes
+        2 => 600,   // Operational: 10 minutes
+        3 => 900,   // Sensor: 15 minutes
+        4 => 120,   // Emergency: 2 minutes
+        _ => 120,   // Unknown tier: minimum lifetime
+    }
+}
+
 /// Create an ML-DSA-87-signed JWT with an explicit tier claim
 pub fn create_id_token_with_tier(
     issuer: &str,
@@ -102,11 +115,12 @@ pub fn create_id_token_with_tier(
         iss: issuer.to_string(),
         sub: user_id.to_string(),
         aud: client_id.to_string(),
-        exp: now + 3600,
+        exp: now + token_lifetime_for_tier(tier),
         iat: now,
         nonce,
         auth_time: now,
         tier,
+        jti: Uuid::new_v4().to_string(),
     };
 
     let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
@@ -141,12 +155,11 @@ pub fn verify_id_token_with_audience(
     verify_id_token_inner(token, verifying_key, Some(expected_audience), require_audience)
 }
 
-/// Returns whether audience enforcement is enabled via environment config.
-/// Defaults to true (audience required) unless `REQUIRE_TOKEN_AUDIENCE=false`.
+/// Audience validation is ALWAYS required. This cannot be disabled.
+/// Previous env var toggle (REQUIRE_TOKEN_AUDIENCE) has been removed
+/// for security hardening — tokens without valid audience are rejected.
 pub fn is_audience_required() -> bool {
-    std::env::var("REQUIRE_TOKEN_AUDIENCE")
-        .map(|v| v != "false" && v != "0")
-        .unwrap_or(true)
+    true
 }
 
 fn verify_id_token_inner(

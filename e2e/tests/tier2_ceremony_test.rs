@@ -20,9 +20,9 @@ use tss::distributed::{distribute_shares, SignerNode, SigningCoordinator};
 use tss::messages::{SigningRequest, SigningResponse};
 use tss::token_builder::build_token_distributed;
 use tss::validator::{validate_receipt_chain, validate_receipt_chain_with_key, ReceiptVerificationKey};
-use verifier::verify::verify_token;
+use verifier::verify::verify_token_bound;
 
-use e2e::client_auth;
+use e2e::{client_auth, client_auth_with_dpop};
 
 /// Fixed 64-byte HMAC key for SHARD communication in tests.
 const SHARD_HMAC_KEY: [u8; 64] = [0x37u8; 64];
@@ -350,7 +350,7 @@ fn tier2_full_ceremony_success() {
         let (gateway_addr, group_verifying_key, pq_vk) = boot_full_system(store).await;
 
         // 2. Run the client flow using encrypted X-Wing channel
-        let auth_resp = client_auth(&gateway_addr, "alice", b"password123").await;
+        let (auth_resp, dpop_key) = client_auth_with_dpop(&gateway_addr, "alice", b"password123").await;
 
         assert!(
             auth_resp.success,
@@ -366,7 +366,7 @@ fn tier2_full_ceremony_success() {
 
         let token_header = token.header.clone();
         let claims = tokio::task::spawn_blocking(move || {
-            verify_token(&token, &group_verifying_key, &pq_vk)
+            verify_token_bound(&token, &group_verifying_key, &pq_vk, &dpop_key)
         })
         .await
         .expect("verify task")

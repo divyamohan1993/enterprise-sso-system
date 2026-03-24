@@ -3,7 +3,7 @@ use axum::http::{header, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{delete, get, post, put};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
@@ -524,11 +524,17 @@ async fn auth_middleware(
                 }
 
                 // Look up user tier from DB
-                let t: i32 = sqlx::query_scalar("SELECT tier FROM users WHERE id = $1")
+                let t: i32 = match sqlx::query_scalar("SELECT tier FROM users WHERE id = $1")
                     .bind(user_id)
                     .fetch_one(&state.db)
                     .await
-                    .unwrap_or(4);
+                {
+                    Ok(tier) => tier,
+                    Err(e) => {
+                        tracing::warn!("Failed to fetch tier for user {}: {}", user_id, e);
+                        return Err(StatusCode::UNAUTHORIZED);
+                    }
+                };
                 request.extensions_mut().insert(AuthTier(t as u8));
                 request.extensions_mut().insert(AuthUserId(user_id));
                 return Ok(next.run(request).await);
@@ -890,6 +896,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/portals", get(list_portals))
         .route("/api/portals/{id}", delete(delete_portal))
         .route("/api/portals/check-access", post(check_portal_access))
+        .route("/api/users/{user_id}", delete(delete_user))
         // Devices
         .route("/api/devices", post(enroll_device))
         .route("/api/devices", get(list_devices))
@@ -1038,7 +1045,7 @@ async fn initial_setup(
     Ok(Json(serde_json::json!({
         "success": true,
         "user_id": user_id.to_string(),
-        "admin_api_key": state.admin_api_key.clone(),
+        "admin_api_key": "[REDACTED — shown once at creation only]",
         "message": "Superuser created. Save your admin API key securely."
     })))
 }
@@ -1459,6 +1466,78 @@ async fn list_users(State(state): State<Arc<AppState>>, request: Request) -> Res
     .unwrap_or_default();
 
     Ok(Json(rows.into_iter().map(|r| r.0).collect()))
+}
+
+/// DELETE /api/users/{user_id} — permanently delete a user and all associated data.
+/// Requires Tier 1 (Sovereign) access. Implements GDPR Article 17 right to erasure.
+async fn delete_user(
+    State(state): State<Arc<AppState>>,
+    Path(user_id): Path<Uuid>,
+    request: Request,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(255);
+    check_tier(caller_tier, 1)?;
+
+    // Verify user exists
+    let user_exists: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM users WHERE id = $1"
+    )
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if user_exists.is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    // Cascade delete all user data (GDPR Article 17: right to erasure)
+    // 1. Delete recovery codes
+    let _ = sqlx::query("DELETE FROM recovery_codes WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&state.db)
+        .await;
+
+    // 2. Delete FIDO credentials
+    {
+        let mut fido_store = state.fido_store.write().await;
+        fido_store.remove_user_credentials(&user_id);
+    }
+
+    // 3. Revoke all active sessions
+    state.session_tracker.remove_all_sessions(&user_id);
+
+    // 4. Delete ratchet sessions
+    let _ = sqlx::query("DELETE FROM ratchet_sessions WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&state.db)
+        .await;
+
+    // 5. Delete the user record itself
+    let result = sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(&state.db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // 6. Audit the deletion (audit entries are retained for compliance)
+    let mut audit = state.audit_log.write().await;
+    audit.append_signed(
+        common::types::AuditEventType::UserDeleted,
+        vec![user_id],
+        vec![],
+        0.0,
+        vec![],
+        &state.pq_signing_key,
+    );
+
+    tracing::info!("User {} permanently deleted (GDPR Article 17)", user_id);
+
+    Ok(Json(serde_json::json!({
+        "deleted": true,
+        "user_id": user_id.to_string(),
+        "rows_affected": result.rows_affected(),
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -3153,8 +3232,15 @@ pub struct FidoAuthCompleteResponse {
 
 async fn fido_register_begin(
     State(state): State<Arc<AppState>>,
+    Extension(auth_user): Extension<AuthUserId>,
+    Extension(auth_tier): Extension<AuthTier>,
     Json(req): Json<FidoRegisterBeginRequest>,
-) -> Json<FidoRegisterBeginResponse> {
+) -> Result<Json<FidoRegisterBeginResponse>, StatusCode> {
+    // Ownership check: user can only register FIDO for themselves, unless admin (tier 1)
+    if req.user_id != auth_user.0 && auth_tier.0 > 1 {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
     let mut fido_store = state.fido_store.write().await;
 
     // Collect existing credential IDs so the browser can skip duplicate authenticators
@@ -3176,13 +3262,20 @@ async fn fido_register_begin(
     // Store the challenge so we can verify it on completion
     fido_store.store_challenge(&options.challenge, req.user_id);
 
-    Json(FidoRegisterBeginResponse { options })
+    Ok(Json(FidoRegisterBeginResponse { options }))
 }
 
 async fn fido_register_complete(
     State(state): State<Arc<AppState>>,
+    Extension(auth_user): Extension<AuthUserId>,
+    Extension(auth_tier): Extension<AuthTier>,
     Json(req): Json<FidoRegisterCompleteRequest>,
 ) -> Result<Json<FidoRegisterCompleteResponse>, StatusCode> {
+    // Ownership check: user can only complete FIDO registration for themselves, unless admin (tier 1)
+    if req.user_id != auth_user.0 && auth_tier.0 > 1 {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
     let mut fido_store = state.fido_store.write().await;
 
     // Retrieve and consume the pending challenge for this user.
@@ -3193,23 +3286,18 @@ async fn fido_register_complete(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    // Validate the attestation: parse the authenticator data from the
-    // attestation object to verify RP ID and extract credential data.
-    // The client_data field should be the raw clientDataJSON which we
-    // can use for additional validation.
-    // At minimum, we verify the authenticator data embedded in the attestation
-    // contains the correct RP ID hash and the attested credential data flag.
-    if req.attestation_object.len() >= 37 {
-        // Best-effort attestation validation: try to parse the auth data
-        // portion of the attestation object. Full CBOR parsing would be
-        // needed for production, but we validate what we can.
-        let rp_id = "sso-system.dmj.one";
-        if let Err(e) = fido::verification::parse_attestation_auth_data(&req.attestation_object, rp_id) {
-            tracing::warn!("FIDO2 attestation validation note: {e} (using client-provided credential data)");
-            // For attestation objects that are CBOR-wrapped (not raw authData),
-            // we accept the registration since the challenge was validated above.
-            // The challenge consumption is the critical security check.
-        }
+    // Fail-closed attestation validation: reject registration if we cannot
+    // verify the authenticator data embedded in the attestation object.
+    // Challenge consumption alone is NOT sufficient — we must verify the
+    // attestation proves the credential was created by a genuine authenticator.
+    let rp_id = "sso-system.dmj.one";
+    if req.attestation_object.len() < 37 {
+        tracing::warn!("FIDO2 attestation object too short ({} bytes)", req.attestation_object.len());
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if let Err(e) = fido::verification::parse_attestation_auth_data(&req.attestation_object, rp_id) {
+        tracing::warn!("FIDO2 attestation validation failed: {e} — registration rejected");
+        return Err(StatusCode::BAD_REQUEST);
     }
 
     let cred = fido::types::StoredCredential {
@@ -3243,10 +3331,17 @@ async fn fido_register_complete(
 /// GET /api/fido/credentials?user_id=<uuid> — list registered FIDO2 credentials for a user.
 async fn fido_credentials_list(
     State(state): State<Arc<AppState>>,
+    Extension(auth_user): Extension<AuthUserId>,
+    Extension(auth_tier): Extension<AuthTier>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let user_id_str = params.get("user_id").ok_or(StatusCode::BAD_REQUEST)?;
     let user_id = Uuid::parse_str(user_id_str).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    // Ownership check: user can only list their own credentials, unless operational+ (tier <= 2)
+    if user_id != auth_user.0 && auth_tier.0 > 2 {
+        return Err(StatusCode::FORBIDDEN);
+    }
 
     let fido_store = state.fido_store.read().await;
     let creds = fido_store.get_user_credentials(&user_id);
@@ -3267,15 +3362,22 @@ async fn fido_credentials_list(
 
 async fn fido_authenticate_begin(
     State(state): State<Arc<AppState>>,
+    Extension(auth_user): Extension<AuthUserId>,
+    Extension(auth_tier): Extension<AuthTier>,
     Json(req): Json<FidoAuthBeginRequest>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Ownership check: user can only begin authentication for themselves, unless admin (tier 1)
+    if req.user_id != auth_user.0 && auth_tier.0 > 1 {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
     let fido_store = state.fido_store.read().await;
     let creds = fido_store.get_user_credentials(&req.user_id);
 
     if creds.is_empty() {
-        return Json(serde_json::json!({
+        return Ok(Json(serde_json::json!({
             "error": "no credentials registered for this user"
-        }));
+        })));
     }
 
     let options = fido::authentication::create_authentication_options(
@@ -3283,7 +3385,7 @@ async fn fido_authenticate_begin(
         &creds,
     );
 
-    Json(serde_json::to_value(FidoAuthBeginResponse { options }).unwrap())
+    Ok(Json(serde_json::to_value(FidoAuthBeginResponse { options }).unwrap()))
 }
 
 async fn fido_authenticate_complete(
@@ -3695,11 +3797,20 @@ async fn recovery_generate(
     let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(4);
     check_tier(caller_tier, 2)?;
 
+    let caller_user_id = request.extensions().get::<AuthUserId>().map(|u| u.0);
+
     let body = axum::body::to_bytes(request.into_body(), 1024 * 64)
         .await
         .map_err(|_| StatusCode::BAD_REQUEST)?;
     let req: RecoveryGenerateRequest = serde_json::from_slice(&body)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    // Ownership check: user can only generate recovery codes for themselves, unless admin (tier 1)
+    if let Some(caller_id) = caller_user_id {
+        if req.user_id != caller_id && caller_tier > 1 {
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
 
     // Verify user exists
     let user_exists: Option<(Uuid,)> = sqlx::query_as(
@@ -3975,8 +4086,17 @@ async fn recovery_status(
     let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(4);
     check_tier(caller_tier, 2)?;
 
+    let caller_user_id = request.extensions().get::<AuthUserId>().map(|u| u.0);
+
     let user_id_str = params.get("user_id").ok_or(StatusCode::BAD_REQUEST)?;
     let user_id = Uuid::parse_str(user_id_str).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    // Ownership check: user can only check their own recovery status, unless admin (tier 1)
+    if let Some(caller_id) = caller_user_id {
+        if user_id != caller_id && caller_tier > 1 {
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
 
     let now = now_secs();
 
@@ -4020,8 +4140,15 @@ async fn recovery_revoke_all(
     let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(4);
     check_tier(caller_tier, 1)?;
 
+    let caller_user_id = request.extensions().get::<AuthUserId>().map(|u| u.0);
+
     let user_id_str = params.get("user_id").ok_or(StatusCode::BAD_REQUEST)?;
     let user_id = Uuid::parse_str(user_id_str).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    // Ownership check: even tier 1 admins must be authenticated users
+    if caller_user_id.is_none() {
+        return Err(StatusCode::FORBIDDEN);
+    }
 
     let result = sqlx::query("DELETE FROM recovery_codes WHERE user_id = $1")
         .bind(user_id)

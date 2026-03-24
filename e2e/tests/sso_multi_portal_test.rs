@@ -20,15 +20,16 @@ use tss::messages::{SigningRequest, SigningResponse};
 use crypto::pq_sign::{generate_pq_keypair, PqSigningKey, PqVerifyingKey};
 use tss::token_builder::build_token_distributed;
 use tss::validator::{validate_receipt_chain, validate_receipt_chain_with_key, ReceiptVerificationKey};
-use verifier::verify::verify_token;
+use verifier::verify::verify_token_bound;
 
-use e2e::client_auth;
+use e2e::client_auth_with_dpop;
 
 // ── Constants ────────────────────────────────────────────────────────────
 
 const SHARD_HMAC_KEY: [u8; 64] = [0x37u8; 64];
 const RECEIPT_SIGNING_KEY: [u8; 64] = [0x42u8; 64];
 const TEST_DIFFICULTY: u8 = 4;
+const TEST_DPOP_KEY: [u8; 32] = [0xDD; 32];
 
 /// ML-DSA-65 verifying key for receipt verification (derived from RECEIPT_SIGNING_KEY seed).
 static RECEIPT_MLDSA65_VK: std::sync::LazyLock<Vec<u8>> =
@@ -338,10 +339,10 @@ impl ServicePortal {
         }
     }
 
-    /// Check access: verify signature, tier, scope, and expiry.
-    fn check_access(&self, token: &Token) -> Result<String, String> {
-        // 1. Verify token signature (crypto verification + expiry check)
-        let claims = verify_token(token, &self.verifying_key, &self.pq_verifying_key)
+    /// Check access: verify signature, tier, scope, expiry, and DPoP binding.
+    fn check_access(&self, token: &Token, dpop_key: &[u8]) -> Result<String, String> {
+        // 1. Verify token signature (crypto verification + expiry + DPoP binding)
+        let claims = verify_token_bound(token, &self.verifying_key, &self.pq_verifying_key, dpop_key)
             .map_err(|e| format!("{}: {e}", self.name))?;
 
         // 2. Check tier: lower number = higher privilege, so token tier must be <= required
@@ -386,7 +387,7 @@ fn make_claims(user_id: Uuid, tier: u8, scope: u32, ttl_secs: u64) -> TokenClaim
         iat: now,
         exp: now + (ttl_secs as i64 * 1_000_000),
         scope,
-        dpop_hash: [0xBB; 32],
+        dpop_hash: crypto::dpop::dpop_key_hash(&TEST_DPOP_KEY),
         ceremony_id: [0xCC; 32],
         tier,
         ratchet_epoch: 1,
@@ -407,8 +408,8 @@ async fn test_sso_single_login_multiple_portals() {
     store.register_with_password("alice", b"password123");
     let (gateway_addr, group_key, pq_vk) = boot_full_system(store).await;
 
-    // 2. Alice authenticates ONCE
-    let resp = client_auth(&gateway_addr, "alice", b"password123").await;
+    // 2. Alice authenticates ONCE (with DPoP key return)
+    let (resp, dpop_key) = client_auth_with_dpop(&gateway_addr, "alice", b"password123").await;
     assert!(resp.success, "auth should succeed: {:?}", resp.error);
 
     let token_bytes = resp.token.expect("token should be present");
@@ -427,7 +428,7 @@ async fn test_sso_single_login_multiple_portals() {
     // 4. Use SAME token at all 5 portals
     let mut access_count = 0;
     for portal in &portals {
-        let result = portal.check_access(&token);
+        let result = portal.check_access(&token, &dpop_key);
         assert!(
             result.is_ok(),
             "portal '{}' should grant access: {:?}",
@@ -462,9 +463,9 @@ async fn test_sso_token_works_across_independent_verifiers() {
         group_key.clone(),
     ];
 
-    // 4. All 3 verifiers accept the same token
+    // 4. All 3 verifiers accept the same token (with DPoP binding)
     for (i, vk) in verifier_keys.iter().enumerate() {
-        let result = verify_token(&token, vk, pq_vk);
+        let result = verify_token_bound(&token, vk, pq_vk, &TEST_DPOP_KEY);
         assert!(
             result.is_ok(),
             "independent verifier {} should accept token: {:?}",
@@ -483,13 +484,13 @@ async fn test_sso_different_users_different_tokens_same_portals() {
     store.register_with_password("bob", b"bob_pass");
     let (gateway_addr, group_key, pq_vk) = boot_full_system(store).await;
 
-    // 2. Both authenticate (separate ceremonies)
-    let resp_alice = client_auth(&gateway_addr, "alice", b"alice_pass").await;
+    // 2. Both authenticate (separate ceremonies) with DPoP keys
+    let (resp_alice, dpop_key_alice) = client_auth_with_dpop(&gateway_addr, "alice", b"alice_pass").await;
     assert!(resp_alice.success, "alice auth failed: {:?}", resp_alice.error);
     let token_alice: Token = postcard::from_bytes(&resp_alice.token.unwrap())
         .expect("deserialize alice token");
 
-    let resp_bob = client_auth(&gateway_addr, "bob", b"bob_pass").await;
+    let (resp_bob, dpop_key_bob) = client_auth_with_dpop(&gateway_addr, "bob", b"bob_pass").await;
     assert!(resp_bob.success, "bob auth failed: {:?}", resp_bob.error);
     let token_bob: Token =
         postcard::from_bytes(&resp_bob.token.unwrap()).expect("deserialize bob token");
@@ -502,8 +503,8 @@ async fn test_sso_different_users_different_tokens_same_portals() {
 
     // 4. Both can access the same portals
     let portal = ServicePortal::new("Shared Portal", 2, 0x01, &group_key, &pq_vk);
-    assert!(portal.check_access(&token_alice).is_ok(), "alice should access portal");
-    assert!(portal.check_access(&token_bob).is_ok(), "bob should access portal");
+    assert!(portal.check_access(&token_alice, &dpop_key_alice).is_ok(), "alice should access portal");
+    assert!(portal.check_access(&token_bob, &dpop_key_bob).is_ok(), "bob should access portal");
 
     // 5. Tokens are NOT interchangeable for identity
     assert_ne!(
@@ -531,12 +532,12 @@ async fn test_sso_scope_restricts_portal_access() {
     // Can access portals requiring scope 0x01 or 0x02
     let portal_01 = ServicePortal::new("Scope 0x01", 2, 0x01, &group_key, &pq_vk);
     let portal_02 = ServicePortal::new("Scope 0x02", 2, 0x02, &group_key, &pq_vk);
-    assert!(portal_01.check_access(&token).is_ok(), "scope 0x01 should pass");
-    assert!(portal_02.check_access(&token).is_ok(), "scope 0x02 should pass");
+    assert!(portal_01.check_access(&token, &TEST_DPOP_KEY).is_ok(), "scope 0x01 should pass");
+    assert!(portal_02.check_access(&token, &TEST_DPOP_KEY).is_ok(), "scope 0x02 should pass");
 
     // Cannot access portal requiring scope 0x04 (bit 2 not set)
     let portal_04 = ServicePortal::new("Scope 0x04", 2, 0x04, &group_key, &pq_vk);
-    let result = portal_04.check_access(&token);
+    let result = portal_04.check_access(&token, &TEST_DPOP_KEY);
     assert!(result.is_err(), "scope 0x04 should be denied");
     assert!(
         result.unwrap_err().contains("insufficient scope"),
@@ -558,15 +559,15 @@ async fn test_sso_tier_restricts_portal_access() {
 
     // Can access tier 2 portals
     let portal_t2 = ServicePortal::new("Tier 2 Portal", 2, 0x01, &group_key, &pq_vk);
-    assert!(portal_t2.check_access(&token).is_ok(), "tier 2 portal should pass");
+    assert!(portal_t2.check_access(&token, &TEST_DPOP_KEY).is_ok(), "tier 2 portal should pass");
 
     // Can access tier 3 portals (lower privilege required)
     let portal_t3 = ServicePortal::new("Tier 3 Portal", 3, 0x01, &group_key, &pq_vk);
-    assert!(portal_t3.check_access(&token).is_ok(), "tier 3 portal should pass");
+    assert!(portal_t3.check_access(&token, &TEST_DPOP_KEY).is_ok(), "tier 3 portal should pass");
 
     // Cannot access tier 1 (sovereign) portals
     let portal_t1 = ServicePortal::new("Sovereign Portal", 1, 0x01, &group_key, &pq_vk);
-    let result = portal_t1.check_access(&token);
+    let result = portal_t1.check_access(&token, &TEST_DPOP_KEY);
     assert!(result.is_err(), "sovereign portal should deny tier 2 token");
     assert!(
         result.unwrap_err().contains("insufficient tier"),
@@ -586,24 +587,30 @@ async fn test_attack_stolen_token_used_at_different_portal() {
     store.register_with_password("alice", b"password123");
     let (gateway_addr, group_key, pq_vk) = boot_full_system(store).await;
 
-    let resp = client_auth(&gateway_addr, "alice", b"password123").await;
+    let (resp, dpop_key) = client_auth_with_dpop(&gateway_addr, "alice", b"password123").await;
     assert!(resp.success);
     let token: Token = postcard::from_bytes(&resp.token.unwrap()).expect("deserialize");
 
     // Token has a real DPoP hash (gateway generates per-connection DPoP key)
     assert_ne!(token.claims.dpop_hash, [0u8; 32], "DPoP hash should be bound");
 
-    // The "stolen" token IS valid at a different portal (SSO works) because
-    // portal-level check_access only verifies FROST signature, not DPoP binding.
+    // With DPoP enforcement, the token is accepted when the correct DPoP key
+    // is presented, and rejected when the wrong key is used (stolen scenario).
     let portal_a = ServicePortal::new("Portal A", 2, 0x01, &group_key, &pq_vk);
     let portal_b = ServicePortal::new("Portal B", 2, 0x01, &group_key, &pq_vk);
-    assert!(portal_a.check_access(&token).is_ok(), "original portal accepts");
+    assert!(portal_a.check_access(&token, &dpop_key).is_ok(), "original portal accepts with correct DPoP key");
     assert!(
-        portal_b.check_access(&token).is_ok(),
-        "different portal also accepts (portal does not enforce DPoP)"
+        portal_b.check_access(&token, &dpop_key).is_ok(),
+        "different portal also accepts with correct DPoP key (SSO)"
     );
-    // NOTE: When DPoP is enforced at portal level, channel-bound tokens will
-    // restrict usage to the original client-portal binding.
+
+    // A thief who does NOT have the DPoP key cannot use the stolen token
+    let wrong_dpop_key = [0xEE; 32];
+    let stolen_result = portal_a.check_access(&token, &wrong_dpop_key);
+    assert!(
+        stolen_result.is_err(),
+        "stolen token must be rejected when presented without correct DPoP key"
+    );
 }
 
 #[tokio::test]
@@ -624,7 +631,7 @@ async fn test_attack_forged_scope_escalation() {
 
     // Signature verification MUST fail at portal
     let portal = ServicePortal::new("Restricted", 2, 0xFF, &group_key, &pq_vk);
-    let result = portal.check_access(&tampered);
+    let result = portal.check_access(&tampered, &TEST_DPOP_KEY);
     assert!(
         result.is_err(),
         "forged scope escalation must be rejected"
@@ -657,7 +664,7 @@ async fn test_attack_forged_tier_escalation() {
 
     // Signature verification MUST fail
     let portal = ServicePortal::new("Sovereign", 1, 0x01, &group_key, &pq_vk);
-    let result = portal.check_access(&tampered);
+    let result = portal.check_access(&tampered, &TEST_DPOP_KEY);
     assert!(
         result.is_err(),
         "forged tier escalation must be rejected"
@@ -679,7 +686,7 @@ async fn test_attack_expired_token_at_portal() {
         iat: now - 20_000_000,  // 20s ago
         exp: now - 10_000_000,  // expired 10s ago
         scope: 0xFF,
-        dpop_hash: [0xBB; 32],
+        dpop_hash: crypto::dpop::dpop_key_hash(&TEST_DPOP_KEY),
         ceremony_id: [0xCC; 32],
         tier: 2,
         ratchet_epoch: 1,
@@ -690,7 +697,7 @@ async fn test_attack_expired_token_at_portal() {
     let token = build_signed_token(&claims, &coordinator, &mut signer_refs);
 
     let portal = ServicePortal::new("Portal", 2, 0x01, &group_key, &pq_vk);
-    let result = portal.check_access(&token);
+    let result = portal.check_access(&token, &TEST_DPOP_KEY);
     assert!(result.is_err(), "expired token must be rejected");
     assert!(
         result.unwrap_err().contains("token validation failed"),
@@ -716,7 +723,7 @@ async fn test_attack_token_from_rogue_sso_server() {
 
     // Portal trusts the REAL SSO server's key
     let portal = ServicePortal::new("Trusted Portal", 2, 0x01, &real_key, &pq_vk);
-    let result = portal.check_access(&rogue_token);
+    let result = portal.check_access(&rogue_token, &TEST_DPOP_KEY);
     assert!(
         result.is_err(),
         "token from rogue SSO server must be rejected"
@@ -783,7 +790,7 @@ async fn test_attack_man_in_middle_modifies_token_in_transit() {
     let portal = ServicePortal::new("Portal", 2, 0x01, &group_key, &pq_vk);
     match postcard::from_bytes::<Token>(&token_bytes) {
         Ok(corrupted_token) => {
-            let result = portal.check_access(&corrupted_token);
+            let result = portal.check_access(&corrupted_token, &TEST_DPOP_KEY);
             assert!(
                 result.is_err(),
                 "corrupted token must be rejected by portal"
@@ -916,7 +923,7 @@ async fn test_sso_concurrent_portal_access() {
                     verifying_key: p_key,
                     pq_verifying_key: p_pq_vk,
                 };
-                p.check_access(&t)
+                p.check_access(&t, &TEST_DPOP_KEY)
             }));
         }
     }

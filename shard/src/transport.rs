@@ -4,9 +4,9 @@
 //! messages over TCP or mTLS, and [`ShardListener`] for accepting inbound
 //! connections.
 //!
-//! **TLS enforcement**: In production mode (`MILNET_PRODUCTION` env var set),
-//! all connections MUST use mTLS with certificate pinning. Non-TLS connections
-//! are only permitted in test/development mode.
+//! **TLS enforcement**: mTLS with certificate pinning is ALWAYS required for
+//! all inter-service communication, regardless of environment. Plain TCP is
+//! permanently disabled.
 
 use std::sync::Arc;
 
@@ -39,9 +39,13 @@ const SHARD_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 // TLS enforcement
 // ---------------------------------------------------------------------------
 
-/// Returns `true` if `MILNET_PRODUCTION` is set (any value), meaning TLS is mandatory.
+/// TLS is ALWAYS required for inter-service communication.
+/// Plain TCP is no longer permitted in any deployment mode.
+/// The MILNET_PRODUCTION env var check has been removed — mTLS
+/// is mandatory regardless of environment to prevent accidental
+/// plaintext traffic in any configuration.
 pub fn require_tls() -> bool {
-    std::env::var("MILNET_PRODUCTION").is_ok()
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -228,16 +232,18 @@ pub struct ShardTransport {
 impl ShardTransport {
     /// Wrap an already-connected plain TCP stream with a [`ShardProtocol`] instance.
     ///
-    /// # Panics in production
-    /// This will return an error if `MILNET_PRODUCTION` is set, since plain TCP
-    /// is forbidden in production.
+    /// # Security warning
+    /// Plain TCP is permanently disabled for security hardening.
+    /// All inter-service communication MUST use mTLS with certificate pinning.
+    /// This constructor logs a security violation error; prefer
+    /// [`ShardTransport::connect_tls()`] instead.
     pub fn new(stream: TcpStream, protocol: ShardProtocol) -> Self {
-        if require_tls() {
-            eprintln!(
-                "WARNING: Plain TCP ShardTransport created while MILNET_PRODUCTION is set. \
-                 This should not happen in production."
-            );
-        }
+        // Plain TCP is permanently disabled for security hardening.
+        // All inter-service communication MUST use mTLS with certificate pinning.
+        tracing::error!(
+            "SECURITY: Plain TCP ShardTransport created — this is a security violation. \
+             All inter-service communication must use mTLS."
+        );
         let (reader, writer) = stream.into_split();
         Self {
             stream: TransportStream::Plain { reader, writer },
@@ -570,9 +576,9 @@ pub struct ShardListener {
 impl ShardListener {
     /// Bind to the given address and prepare to accept SHARD connections.
     ///
-    /// In production mode (`MILNET_PRODUCTION` set), this returns an error
-    /// because TLS is mandatory. Use [`ShardListener::tls_bind`] instead,
-    /// or provide a `ServerTlsConfig` via [`ShardListener::bind_with_optional_tls`].
+    /// This always returns an error because plain TCP is permanently disabled.
+    /// Use [`ShardListener::tls_bind`] instead, or provide a `ServerTlsConfig`
+    /// via [`ShardListener::bind_with_optional_tls`].
     pub async fn bind(
         addr: &str,
         module_id: ModuleId,
@@ -580,8 +586,8 @@ impl ShardListener {
     ) -> Result<Self, MilnetError> {
         if require_tls() {
             return Err(MilnetError::Shard(
-                "MILNET_PRODUCTION is set: plain TCP bind refused. \
-                 Use ShardListener::tls_bind() for mTLS connections."
+                "Plain TCP bind permanently disabled — all inter-service \
+                 communication requires mTLS. Use ShardListener::tls_bind()."
                     .into(),
             ));
         }

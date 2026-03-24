@@ -13,6 +13,23 @@
 //! - All HSM errors fail-closed: deny access, never silently degrade
 //! - Key material is never logged; only operation metadata at INFO level
 //!
+//! ## Production HSM Integration
+//!
+//! For classified/military deployments, hardware-backed key storage is mandatory.
+//! The software fallback is automatically blocked when `MILNET_PRODUCTION` is set.
+//!
+//! Supported backends (set via `MILNET_HSM_BACKEND` env var):
+//! - `pkcs11` — Thales Luna, AWS CloudHSM, YubiHSM2, SoftHSM2
+//! - `aws_kms` — AWS KMS envelope encryption (keys never leave AWS)
+//! - `tpm2` — TPM 2.0 sealed to platform PCR values
+//! - `software` — Development only, blocked in production
+//!
+//! ## Audit Logging
+//!
+//! All key operations emit structured audit events via `eprintln!` (and `tracing`
+//! when available). In production, these should be routed to a tamper-evident
+//! audit log (e.g., AWS CloudTrail, syslog with remote forwarding).
+//!
 //! # Backend Implementations
 //! Since this crate does not link against PKCS#11, AWS SDK, or tss-esapi
 //! at compile time, the backends implement a complete trait-based abstraction
@@ -2307,8 +2324,12 @@ impl HsmKeyOps for HsmKeyManager {
                 session.key_store.store_key(key_id, key_type, &key_material)?;
             }
             BackendState::Software(_) => {
+                if common::sealed_keys::is_production() {
+                    return Err(HsmError::SoftwareInProduction);
+                }
                 return Err(HsmError::NotSupported(
-                    "Software backend does not support HsmKeyOps::generate_key".into(),
+                    "Software backend does not support HsmKeyOps::generate_key. \
+                     Configure MILNET_HSM_BACKEND=pkcs11|aws_kms|tpm2".into(),
                 ));
             }
         }
@@ -2331,8 +2352,12 @@ impl HsmKeyOps for HsmKeyManager {
             BackendState::AwsKms(s) => &s.key_store,
             BackendState::Tpm2(s) => &s.key_store,
             BackendState::Software(_) => {
+                if common::sealed_keys::is_production() {
+                    return Err(HsmError::SoftwareInProduction);
+                }
                 return Err(HsmError::NotSupported(
-                    "Software backend does not support HsmKeyOps::sign".into(),
+                    "Software backend does not support HsmKeyOps::sign. \
+                     Configure MILNET_HSM_BACKEND=pkcs11|aws_kms|tpm2".into(),
                 ));
             }
         };
@@ -2363,8 +2388,12 @@ impl HsmKeyOps for HsmKeyManager {
             BackendState::AwsKms(s) => &s.key_store,
             BackendState::Tpm2(s) => &s.key_store,
             BackendState::Software(_) => {
+                if common::sealed_keys::is_production() {
+                    return Err(HsmError::SoftwareInProduction);
+                }
                 return Err(HsmError::NotSupported(
-                    "Software backend does not support HsmKeyOps::verify".into(),
+                    "Software backend does not support HsmKeyOps::verify. \
+                     Configure MILNET_HSM_BACKEND=pkcs11|aws_kms|tpm2".into(),
                 ));
             }
         };
@@ -2396,8 +2425,12 @@ impl HsmKeyOps for HsmKeyManager {
             BackendState::AwsKms(s) => &s.key_store,
             BackendState::Tpm2(s) => &s.key_store,
             BackendState::Software(_) => {
+                if common::sealed_keys::is_production() {
+                    return Err(HsmError::SoftwareInProduction);
+                }
                 return Err(HsmError::NotSupported(
-                    "Software backend does not support HsmKeyOps::encrypt".into(),
+                    "Software backend does not support HsmKeyOps::encrypt. \
+                     Configure MILNET_HSM_BACKEND=pkcs11|aws_kms|tpm2".into(),
                 ));
             }
         };
@@ -2460,8 +2493,12 @@ impl HsmKeyOps for HsmKeyManager {
             BackendState::AwsKms(s) => &s.key_store,
             BackendState::Tpm2(s) => &s.key_store,
             BackendState::Software(_) => {
+                if common::sealed_keys::is_production() {
+                    return Err(HsmError::SoftwareInProduction);
+                }
                 return Err(HsmError::NotSupported(
-                    "Software backend does not support HsmKeyOps::decrypt".into(),
+                    "Software backend does not support HsmKeyOps::decrypt. \
+                     Configure MILNET_HSM_BACKEND=pkcs11|aws_kms|tpm2".into(),
                 ));
             }
         };
@@ -2529,9 +2566,15 @@ impl HsmKeyOps for HsmKeyManager {
             }
             BackendState::AwsKms(session) => session.key_store.remove_key(key_id),
             BackendState::Tpm2(session) => session.key_store.remove_key(key_id),
-            BackendState::Software(_) => Err(HsmError::NotSupported(
-                "Software backend does not support HsmKeyOps::destroy_key".into(),
-            )),
+            BackendState::Software(_) => {
+                if common::sealed_keys::is_production() {
+                    return Err(HsmError::SoftwareInProduction);
+                }
+                Err(HsmError::NotSupported(
+                    "Software backend does not support HsmKeyOps::destroy_key. \
+                     Configure MILNET_HSM_BACKEND=pkcs11|aws_kms|tpm2".into(),
+                ))
+            }
         }
     }
 
@@ -2544,9 +2587,15 @@ impl HsmKeyOps for HsmKeyManager {
             BackendState::Pkcs11(s) => Ok(s.key_store.contains_key(key_id)),
             BackendState::AwsKms(s) => Ok(s.key_store.contains_key(key_id)),
             BackendState::Tpm2(s) => Ok(s.key_store.contains_key(key_id)),
-            BackendState::Software(_) => Err(HsmError::NotSupported(
-                "Software backend does not support HsmKeyOps::key_exists".into(),
-            )),
+            BackendState::Software(_) => {
+                if common::sealed_keys::is_production() {
+                    return Err(HsmError::SoftwareInProduction);
+                }
+                Err(HsmError::NotSupported(
+                    "Software backend does not support HsmKeyOps::key_exists. \
+                     Configure MILNET_HSM_BACKEND=pkcs11|aws_kms|tpm2".into(),
+                ))
+            }
         }
     }
 }
@@ -2682,6 +2731,83 @@ pub fn create_key_source(config: &HsmConfig) -> Result<Box<dyn ProductionKeySour
 pub fn create_key_source_from_env() -> Result<Box<dyn ProductionKeySource>, HsmError> {
     let config = HsmConfig::from_env();
     create_key_source(&config)
+}
+
+/// Create the appropriate HSM backend based on configuration.
+///
+/// Reads `MILNET_HSM_BACKEND` env var:
+/// - `"pkcs11"` -> PKCS#11 (requires linked library)
+/// - `"aws_kms"` / `"aws-kms"` -> AWS KMS (requires aws-sdk-kms)
+/// - `"tpm2"` -> TPM 2.0 (requires tss-esapi)
+/// - `"software"` or unset -> Software fallback (blocked in production)
+///
+/// Returns a boxed [`HsmKeyOps`] backed by an [`HsmKeyManager`] configured
+/// for the selected backend.
+///
+/// # Panics
+/// Panics in production mode if backend is `"software"` or unset.
+/// Panics if the selected hardware backend cannot be initialized (e.g.,
+/// missing library path, credentials, or device).
+pub fn create_hsm_backend() -> Box<dyn HsmKeyOps> {
+    let backend_name = std::env::var("MILNET_HSM_BACKEND")
+        .unwrap_or_else(|_| "software".to_string());
+
+    match backend_name.to_lowercase().as_str() {
+        "pkcs11" => {
+            eprintln!("INFO: HSM backend: PKCS#11");
+            // Requires MILNET_PKCS11_LIB, MILNET_PKCS11_SLOT, MILNET_PKCS11_PIN
+            // When a real PKCS#11 library is linked (build with --features pkcs11),
+            // replace this with a native PKCS#11 session via the `pkcs11` crate.
+            let config = HsmConfig::from_env();
+            let manager = HsmKeyManager::new(config)
+                .expect("FATAL: Failed to initialize PKCS#11 HSM backend. \
+                         Verify MILNET_PKCS11_LIB, MILNET_PKCS11_SLOT, and MILNET_PKCS11_PIN.");
+            eprintln!("AUDIT: HSM backend initialized — type=pkcs11, label={}", manager.key_label());
+            Box::new(manager)
+        }
+        "aws_kms" | "aws-kms" | "awskms" | "kms" => {
+            eprintln!("INFO: HSM backend: AWS KMS");
+            // Requires MILNET_AWS_KMS_KEY_ID, optionally MILNET_AWS_KMS_REGION
+            // When aws-sdk-kms is linked (build with --features aws-kms),
+            // replace this with native KMS envelope encryption.
+            let config = HsmConfig::from_env();
+            let manager = HsmKeyManager::new(config)
+                .expect("FATAL: Failed to initialize AWS KMS HSM backend. \
+                         Verify MILNET_AWS_KMS_KEY_ID and AWS credentials.");
+            eprintln!("AUDIT: HSM backend initialized — type=aws_kms, label={}", manager.key_label());
+            Box::new(manager)
+        }
+        "tpm2" | "tpm" => {
+            eprintln!("INFO: HSM backend: TPM 2.0");
+            // Requires MILNET_TPM2_DEVICE, optionally MILNET_TPM2_PCRS
+            // When tss-esapi is linked (build with --features tpm2),
+            // replace this with native TPM 2.0 sealed storage.
+            let config = HsmConfig::from_env();
+            let manager = HsmKeyManager::new(config)
+                .expect("FATAL: Failed to initialize TPM 2.0 HSM backend. \
+                         Verify MILNET_TPM2_DEVICE and PCR configuration.");
+            eprintln!("AUDIT: HSM backend initialized — type=tpm2, label={}", manager.key_label());
+            Box::new(manager)
+        }
+        "software" | _ => {
+            if common::sealed_keys::is_production() {
+                panic!(
+                    "FATAL: Software HSM backend is forbidden in production mode. \
+                     Set MILNET_HSM_BACKEND to pkcs11, aws_kms, or tpm2. \
+                     Hardware-backed key storage is required for classified deployments."
+                );
+            }
+            eprintln!(
+                "WARNING: HSM backend: SOFTWARE FALLBACK (development only). \
+                 Set MILNET_HSM_BACKEND for production use."
+            );
+            let config = HsmConfig::from_env();
+            let manager = HsmKeyManager::new(config)
+                .expect("Failed to initialize software HSM fallback");
+            eprintln!("AUDIT: HSM backend initialized — type=software (DEV ONLY), label={}", manager.key_label());
+            Box::new(manager)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

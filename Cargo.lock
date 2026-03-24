@@ -2812,6 +2812,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tokio-rustls",
+ "tracing",
 ]
 
 [[package]]

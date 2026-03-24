@@ -23,6 +23,16 @@ use uuid::Uuid;
 /// within this window or it considers itself partitioned.
 const PARTITION_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Minimum BFT nodes for Byzantine fault tolerance (tolerates f=2 failures).
+pub const MIN_BFT_NODES: usize = 7;
+/// Quorum size: 2f+1 where f = floor((n-1)/3).
+pub const BFT_QUORUM: usize = 5;
+
+/// Returns true if the cluster has sufficient nodes for BFT guarantees.
+pub fn has_bft_quorum(node_count: usize) -> bool {
+    node_count >= MIN_BFT_NODES
+}
+
 /// A single audit replica node.
 pub struct AuditNode {
     pub node_id: u8,
@@ -203,6 +213,15 @@ impl BftAuditCluster {
     /// Create a new cluster. `node_count` should be >= 4 for meaningful BFT
     /// (3f + 1). For 7 nodes: f = 2, quorum = 2f + 1 = 5.
     pub fn new(node_count: usize) -> Self {
+        // Production safety: warn if BFT is running with fewer than 7 nodes
+        if std::env::var("MILNET_PRODUCTION").is_ok() && node_count < 7 {
+            tracing::error!(
+                "CRITICAL: BFT audit running with {} nodes in production (minimum 7 required). \
+                 Audit integrity cannot be guaranteed with fewer than 7 nodes (2f+1 = 5 quorum).",
+                node_count
+            );
+        }
+
         let f = (node_count - 1) / 3; // max Byzantine faults tolerated
         let quorum = 2 * f + 1; // minimum for consensus
         let nodes: Vec<AuditNode> = (0..node_count as u8).map(AuditNode::new).collect();
@@ -218,6 +237,15 @@ impl BftAuditCluster {
 
     /// Create a new cluster with an ML-DSA-65 signing key for entry signing.
     pub fn new_with_signing_key(node_count: usize, signing_key: pq_sign::PqSigningKey) -> Self {
+        // Production safety: warn if BFT is running with fewer than 7 nodes
+        if std::env::var("MILNET_PRODUCTION").is_ok() && node_count < 7 {
+            tracing::error!(
+                "CRITICAL: BFT audit running with {} nodes in production (minimum 7 required). \
+                 Audit integrity cannot be guaranteed with fewer than 7 nodes (2f+1 = 5 quorum).",
+                node_count
+            );
+        }
+
         let f = (node_count - 1) / 3;
         let quorum = 2 * f + 1;
         let nodes: Vec<AuditNode> = (0..node_count as u8).map(AuditNode::new).collect();
@@ -242,6 +270,15 @@ impl BftAuditCluster {
         signing_key: pq_sign::PqSigningKey,
         persistence_dir: &std::path::Path,
     ) -> Self {
+        // Production safety: warn if BFT is running with fewer than 7 nodes
+        if std::env::var("MILNET_PRODUCTION").is_ok() && node_count < 7 {
+            tracing::error!(
+                "CRITICAL: BFT audit running with {} nodes in production (minimum 7 required). \
+                 Audit integrity cannot be guaranteed with fewer than 7 nodes (2f+1 = 5 quorum).",
+                node_count
+            );
+        }
+
         let f = (node_count - 1) / 3;
         let quorum = 2 * f + 1;
         let nodes: Vec<AuditNode> = (0..node_count as u8)
@@ -336,6 +373,16 @@ impl BftAuditCluster {
         if let Some(ref key) = self.pq_signing_key {
             let hash = hash_entry(&entry);
             entry.signature = pq_sign::pq_sign_raw(key, &hash);
+        }
+
+        // Quorum enforcement: warn if cluster lacks BFT guarantees
+        if std::env::var("MILNET_PRODUCTION").is_ok() && !has_bft_quorum(self.nodes.len()) {
+            tracing::error!(
+                "CRITICAL: committing audit entry with only {} nodes (minimum {} required for BFT). \
+                 Byzantine fault tolerance is NOT guaranteed.",
+                self.nodes.len(),
+                MIN_BFT_NODES
+            );
         }
 
         // Propose to all nodes, count acceptances.

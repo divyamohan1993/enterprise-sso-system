@@ -252,6 +252,7 @@ pub enum AuditEventType {
     DuressDetected,
     RecoveryCodeUsed,
     RecoveryCodesGenerated,
+    UserDeleted,
 }
 
 // ── AuditEntry ────────────────────────────────────────────────────────
