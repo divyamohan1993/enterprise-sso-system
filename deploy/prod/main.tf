@@ -89,8 +89,43 @@ locals {
   db_host           = "10.207.224.3"
   db_name           = "milnet_sso"
   db_user           = "milnet"
+  db_password       = var.db_password != "" ? var.db_password : random_password.db_password.result
   sql_instance_name = "milnet-test-db-de033d2b"
   sql_connection    = "${var.project_id}:${var.region}:${local.sql_instance_name}"
+}
+
+# ============================================================================
+# Auto-Generated DB Password (80 chars, stored in Secret Manager)
+# ============================================================================
+
+resource "random_password" "db_password" {
+  length  = 80
+  special = false  # Avoid URL-encoding issues in DATABASE_URL
+}
+
+# Store DB password in Secret Manager (never plaintext in terraform state exports)
+resource "google_secret_manager_secret" "db_password" {
+  secret_id = "milnet-db-password"
+  project   = var.project_id
+  replication {
+    auto {}
+  }
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "google_secret_manager_secret_version" "db_password" {
+  secret      = google_secret_manager_secret.db_password.id
+  secret_data = local.db_password
+}
+
+# Set the password on Cloud SQL
+resource "google_sql_user" "milnet" {
+  name     = "milnet"
+  instance = local.sql_instance_name
+  password = local.db_password
+  project  = var.project_id
 }
 
 # ============================================================================
@@ -280,7 +315,6 @@ resource "google_compute_instance" "core" {
       db_host        = local.db_host
       db_name        = local.db_name
       db_user        = local.db_user
-      db_password    = var.db_password
       sql_connection = local.sql_connection
       kms_keyring    = data.google_kms_key_ring.milnet_keyring.id
       project_id     = var.project_id

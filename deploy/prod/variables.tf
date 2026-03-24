@@ -27,7 +27,8 @@ variable "developer_mode" {
 }
 
 variable "db_password" {
-  description = "Password for the Cloud SQL milnet user"
+  description = "Password for Cloud SQL milnet user (auto-generated if empty, stored in Secret Manager)"
   type        = string
   sensitive   = true
+  default     = ""
 }

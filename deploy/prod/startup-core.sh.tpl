@@ -62,8 +62,19 @@ for i in $(seq 1 30); do
   sleep 2
 done
 
+# Fetch DB password from Secret Manager at runtime (NEVER in metadata/env/disk)
+echo "Fetching DB password from Secret Manager..."
+ACCESS_TOKEN=$(curl -s -H "Metadata-Flavor: Google" \
+  "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" | \
+  python3 -c 'import sys,json; print(json.load(sys.stdin)["access_token"])')
+DB_PASSWORD=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
+  "https://secretmanager.googleapis.com/v1/projects/${project_id}/secrets/milnet-db-password/versions/latest:access" | \
+  python3 -c 'import sys,json,base64; print(base64.b64decode(json.load(sys.stdin)["payload"]["data"]).decode())')
+unset ACCESS_TOKEN  # Don't leave token in environment
+echo "DB password fetched from Secret Manager (length: $${#DB_PASSWORD})"
+
 # Database URL via local proxy (SSL enforced by Cloud SQL side)
-DATABASE_URL="postgresql://${db_user}:${db_password}@127.0.0.1:5432/${db_name}"
+DATABASE_URL="postgresql://${db_user}:$${DB_PASSWORD}@127.0.0.1:5432/${db_name}"
 
 # ── Create isolated Docker network ──
 docker network create milnet-internal 2>/dev/null || true
