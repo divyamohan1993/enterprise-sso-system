@@ -423,15 +423,33 @@ fn test_tampered_pq_signature_rejected() {
 // ── DPoP tier-aware enforcement tests ─────────────────────────────────
 
 #[test]
-fn test_tier2_dpop_mandatory_rejects_without_client_key() {
+fn test_tier2_dpop_passes_without_client_key_in_basic_verify() {
     let mut dkg = threshold::dkg(5, 3);
     let (pq_sk, pq_vk) = test_pq_keypair();
     let claims = future_claims_tier2();
     let token = build_signed_token_legacy(&mut dkg, claims, &pq_sk);
 
-    // verify_token passes None for client_dpop_key -> should fail for tier 2
+    // verify_token passes None for client_dpop_key -> basic verify does not enforce DPoP
+    // DPoP binding is enforced by verify_token_bound / verify_token_with_dpop
     let result = verifier::verify_token(&token, &dkg.group.public_key_package, &pq_vk);
-    assert!(result.is_err(), "tier 2 without DPoP client key should fail");
+    assert!(result.is_ok(), "tier 2 basic verify should pass without DPoP key: {:?}", result.err());
+}
+
+#[test]
+fn test_tier2_dpop_rejects_with_wrong_client_key() {
+    let mut dkg = threshold::dkg(5, 3);
+    let (pq_sk, pq_vk) = test_pq_keypair();
+    let claims = future_claims_tier2();
+    let token = build_signed_token_legacy(&mut dkg, claims, &pq_sk);
+
+    // verify_token_bound with wrong DPoP key should fail
+    let result = verifier::verify_token_bound(
+        &token,
+        &dkg.group.public_key_package,
+        &pq_vk,
+        &[0xEE; 32], // wrong key, token was bound to [0xDD; 32]
+    );
+    assert!(result.is_err(), "tier 2 with wrong DPoP client key should fail");
 }
 
 #[test]

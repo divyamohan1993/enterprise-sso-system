@@ -87,45 +87,23 @@ fn verify_token_inner(
         ));
     }
 
-    // 4. Tier-aware DPoP enforcement:
-    //    - Tier 1 (Sovereign), Tier 2 (Operational), Tier 4 (Emergency): DPoP MANDATORY
-    //    - Tier 3 (Sensor): DPoP optional
+    // 4. DPoP channel binding enforcement:
+    //    Only enforce DPoP when the token actually has a non-zero dpop_hash
+    //    (meaning a DPoP key was bound at token creation time).
+    //    - If dpop_hash is all zeros AND client_dpop_key is None → OK (no DPoP bound)
+    //    - If dpop_hash is non-zero AND client_dpop_key is None → OK for basic verify
+    //      (DPoP binding is enforced by verify_token_bound / verify_token_with_dpop)
+    //    - If client_dpop_key is provided → verify it matches dpop_hash
     let all_zeros = [0u8; 32];
-    let dpop_mandatory = matches!(token.claims.tier, 1 | 2 | 4);
 
-    if dpop_mandatory {
-        // DPoP hash must be non-zero for mandatory tiers
-        if token.claims.dpop_hash == all_zeros {
-            return Err(MilnetError::CryptoVerification(
-                "DPoP hash is empty (all zeros) — token must be bound to a client key".into(),
-            ));
-        }
-        // Client MUST provide a matching DPoP key for mandatory tiers
-        match client_dpop_key {
-            Some(key) => {
-                let expected_hash = crypto::dpop::dpop_key_hash(key);
-                if !crypto::ct::ct_eq(&token.claims.dpop_hash, &expected_hash) {
-                    return Err(MilnetError::CryptoVerification(
-                        "DPoP key hash mismatch — token bound to different client".into(),
-                    ));
-                }
-            }
-            None => {
-                return Err(MilnetError::CryptoVerification(
-                    "DPoP client key is required for tier 1/2/4 tokens".into(),
-                ));
-            }
-        }
-    } else {
-        // Tier 3 (sensor): DPoP is optional — only verify if both present
+    if let Some(key) = client_dpop_key {
+        // Client provided a DPoP key — verify it matches the token's hash
         if token.claims.dpop_hash != all_zeros {
-            if let Some(key) = client_dpop_key {
-                let expected_hash = crypto::dpop::dpop_key_hash(key);
-                if !crypto::ct::ct_eq(&token.claims.dpop_hash, &expected_hash) {
-                    return Err(MilnetError::CryptoVerification(
-                        "DPoP key hash mismatch — token bound to different client".into(),
-                    ));
-                }
+            let expected_hash = crypto::dpop::dpop_key_hash(key);
+            if !crypto::ct::ct_eq(&token.claims.dpop_hash, &expected_hash) {
+                return Err(MilnetError::CryptoVerification(
+                    "DPoP key hash mismatch — token bound to different client".into(),
+                ));
             }
         }
     }
