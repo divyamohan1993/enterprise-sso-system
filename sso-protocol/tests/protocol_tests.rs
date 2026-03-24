@@ -363,7 +363,7 @@ fn test_verify_id_token_full_with_nonce() {
         Some("wrong-nonce"),
     );
     assert!(result.is_err());
-    assert!(result.unwrap_err().contains("nonce mismatch"));
+    assert!(result.err().unwrap().contains("nonce mismatch"));
 }
 
 #[test]
@@ -388,7 +388,7 @@ fn test_verify_id_token_full_nonce_expected_but_missing() {
         Some("expected-nonce"),
     );
     assert!(result.is_err());
-    assert!(result.unwrap_err().contains("no nonce"));
+    assert!(result.err().unwrap().contains("no nonce"));
 }
 
 #[test]
