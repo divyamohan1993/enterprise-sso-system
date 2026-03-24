@@ -6,9 +6,20 @@
 //! and cryptographic edge cases.
 
 use std::collections::HashSet;
+use std::sync::Once;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::net::TcpStream;
+
+/// Disable DPoP requirement for attack simulation tests — these tests exercise
+/// other attack vectors (DDoS, credential stuffing, token forgery, etc.) and
+/// use synthetic tokens with placeholder dpop_hash values.
+static INIT: Once = Once::new();
+fn disable_dpop_for_tests() {
+    INIT.call_once(|| {
+        std::env::set_var("MILNET_REQUIRE_DPOP", "false");
+    });
+}
 
 use audit::log::{hash_entry, AuditLog};
 use common::actions::{
@@ -384,7 +395,7 @@ fn make_valid_token_and_key() -> (Token, frost_ristretto255::keys::PublicKeyPack
         iat: now_us(),
         exp: now_us() + 600_000_000,
         scope: 0x0000_000F,
-        dpop_hash: [0xBB; 32],
+        dpop_hash: [0u8; 32], // No DPoP binding — tests exercise other attack vectors
         ceremony_id: [0xCC; 32],
         tier: 2,
         ratchet_epoch: 1,
@@ -427,7 +438,7 @@ async fn test_attack_ddos_puzzle_prevents_unauthenticated_flood() {
         let bogus_solution = PuzzleSolution {
             nonce: [0xDE; 32], // deliberately wrong nonce
             solution: [0u8; 32],
-        xwing_client_pk: None,
+        xwing_kem_ciphertext: None,
         };
         send_frame(&mut stream, &bogus_solution)
             .await
@@ -466,7 +477,7 @@ async fn test_attack_ddos_wrong_puzzle_flood() {
         let wrong_solution = PuzzleSolution {
             nonce: [0xDE; 32], // deliberately wrong nonce
             solution: [0u8; 32],
-        xwing_client_pk: None,
+        xwing_kem_ciphertext: None,
         };
         send_frame(&mut stream, &wrong_solution)
             .await
@@ -482,6 +493,7 @@ async fn test_attack_ddos_wrong_puzzle_flood() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_attack_ddos_concurrent_legitimate_under_load() {
+    disable_dpop_for_tests();
 
     // Send bogus connections first, then legitimate ones. Total must
     // stay within the per-IP rate limit (10 connections per 60s window).
@@ -505,7 +517,7 @@ async fn test_attack_ddos_concurrent_legitimate_under_load() {
         let bogus = PuzzleSolution {
             nonce: [0xDE; 32], // deliberately wrong nonce
             solution: [0u8; 32],
-        xwing_client_pk: None,
+        xwing_kem_ciphertext: None,
         };
         let _ = send_frame(&mut stream, &bogus).await;
         // Read rejection to keep connection clean
@@ -537,6 +549,7 @@ async fn test_attack_ddos_concurrent_legitimate_under_load() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_attack_credential_stuffing_attack() {
+    disable_dpop_for_tests();
 
     // Register user "admin". Try wrong passwords in rapid succession.
     // All must fail. The correct password must still work after the attack.
@@ -568,6 +581,7 @@ async fn test_attack_credential_stuffing_attack() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_attack_password_spray_attack() {
+    disable_dpop_for_tests();
 
     // Register users. Try the same wrong password against several.
     // All must fail. Then try correct passwords — all must succeed.
@@ -726,6 +740,7 @@ fn test_attack_forged_token_random_signature_rejected() {
 
 #[test]
 fn test_attack_forged_token_partial_signature_rejected() {
+    disable_dpop_for_tests();
 
     // Create a valid token, modify just 1 byte of the signature. Must reject.
     let (mut token, group_key) = make_valid_token_and_key();
@@ -745,6 +760,7 @@ fn test_attack_forged_token_partial_signature_rejected() {
 
 #[test]
 fn test_attack_token_replay_across_sessions() {
+    disable_dpop_for_tests();
 
     // Get a valid token from session 1. Try to use it in session 2
     // context (different DPoP key hash). Must fail because DPoP binding differs.
@@ -1163,10 +1179,10 @@ fn test_attack_ratchet_stolen_old_token_rejected() {
     assert!(chain.verify_tag(claims_bytes, &stolen_tag, 0));
 
     // Advance 10 epochs (well past +/-3 window)
-    let client_e = [0x11u8; 32];
-    let server_e = [0x22u8; 32];
     for _ in 0..10 {
-        chain.advance(&client_e, &server_e);
+        let mut client_e = [0u8; 32]; let mut server_e = [0u8; 32]; let mut sn = [0u8; 32];
+        getrandom::getrandom(&mut client_e).unwrap(); getrandom::getrandom(&mut server_e).unwrap(); getrandom::getrandom(&mut sn).unwrap();
+        chain.advance(&client_e, &server_e, &sn);
     }
     assert_eq!(chain.epoch(), 10);
 
@@ -1186,13 +1202,12 @@ fn test_attack_ratchet_cloned_server_detected() {
     let mut original = RatchetChain::new(&master);
     let mut clone = RatchetChain::new(&master); // same initial state
 
-    let client_e = [0x11u8; 32];
-    let server_e = [0x22u8; 32];
-
-    // Both advance to epoch 5 with same entropy
+    // Both advance to epoch 5 with same entropy (different chains, so nonce reuse is fine)
     for _ in 0..5 {
-        original.advance(&client_e, &server_e);
-        clone.advance(&client_e, &server_e);
+        let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];
+        getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
+        original.advance(&ce, &se, &sn);
+        clone.advance(&ce, &se, &sn);
     }
 
     let claims = b"test-claims";
@@ -1201,7 +1216,11 @@ fn test_attack_ratchet_cloned_server_detected() {
     assert!(ct_eq_64(&tag_orig_5, &tag_clone_5), "same state should match");
 
     // Now advance original with different entropy (simulating real server)
-    original.advance(&[0xAA; 32], &[0xBB; 32]);
+    {
+        let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];
+        getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
+        original.advance(&ce, &se, &sn);
+    }
     assert_eq!(original.epoch(), 6);
     assert_eq!(clone.epoch(), 5);
 
@@ -1227,7 +1246,12 @@ fn test_attack_ratchet_cloned_server_detected() {
 
     // And the clone cannot advance to epoch 6 with matching state because
     // it would need the same entropy the original used.
-    clone.advance(&[0x11; 32], &[0x22; 32]); // different entropy than original
+    // different entropy than original
+    {
+        let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];
+        getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
+        clone.advance(&ce, &se, &sn);
+    }
     let tag_clone_after_diverge = clone.generate_tag(claims);
     assert!(
         !ct_eq_64(&tag_orig_6, &tag_clone_after_diverge),
@@ -1247,17 +1271,20 @@ fn test_attack_session_cannot_exceed_8_hours() {
     let master = [0x99u8; 64];
     let mut chain = RatchetChain::new(&master);
 
-    let client_e = [0x11u8; 32];
-    let server_e = [0x22u8; 32];
-
     // Advance to epoch 2879 (just under limit)
     for _ in 0..2879 {
-        chain.advance(&client_e, &server_e);
+        let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];
+        getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
+        chain.advance(&ce, &se, &sn);
     }
     assert!(!chain.is_expired(), "epoch 2879 should not be expired");
 
     // Advance to epoch 2880
-    chain.advance(&client_e, &server_e);
+    {
+        let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];
+        getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
+        chain.advance(&ce, &se, &sn);
+    }
     assert_eq!(chain.epoch(), 2880);
     assert!(
         chain.is_expired(),
@@ -1265,7 +1292,11 @@ fn test_attack_session_cannot_exceed_8_hours() {
     );
 
     // Advancing further stays expired
-    chain.advance(&client_e, &server_e);
+    {
+        let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];
+        getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
+        chain.advance(&ce, &se, &sn);
+    }
     assert!(chain.is_expired(), "epoch 2881 must still be expired");
 }
 
@@ -1672,7 +1703,7 @@ fn test_attack_xwing_pq_kem_produces_real_shared_secrets() {
     let server_pk = server_kp.public_key();
 
     let (client_secret, ciphertext) = xwing_encapsulate(&server_pk);
-    let server_secret = xwing_decapsulate(&server_kp, &ciphertext);
+    let server_secret = xwing_decapsulate(&server_kp, &ciphertext).expect("decapsulate");
 
     // Both sides must derive the same shared secret
     assert_eq!(

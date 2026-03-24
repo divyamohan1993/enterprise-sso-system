@@ -66,12 +66,22 @@ async fn main() {
         load_witness_log(&witness_file),
     ));
 
+    // Track the last known KT root for witness checkpoints.
+    // The KT tree lives in a separate service; we fetch its root via a minimal
+    // HTTP GET over TCP. Falls back to the last known root (marked stale) when
+    // the KT service is unreachable.
+    let last_known_kt_root: Arc<Mutex<([u8; 64], bool)>> =
+        Arc::new(Mutex::new(([0u8; 64], false))); // (root, is_fresh)
+
     // Spawn periodic witness checkpoint generation every 300 seconds (5 min).
     {
         let cluster = cluster.clone();
         let witness_log = witness_log.clone();
         let witness_file = witness_file.clone();
+        let last_known_kt_root = last_known_kt_root.clone();
         tokio::spawn(async move {
+            let kt_addr = std::env::var("KT_ADDR").unwrap_or_else(|_| "127.0.0.1:9109".to_string());
+
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
             loop {
                 interval.tick().await;
@@ -82,9 +92,21 @@ async fn main() {
                     .map(|n| audit::log::hash_entry(&n.log.entries()[n.log.len() - 1]));
 
                 if let Some(audit_root) = audit_root {
-                    // KT root placeholder: the Key Transparency tree lives in a separate service.
-                    // TODO: fetch real KT root from the KT service once integrated.
-                    let kt_root = [0u8; 64];
+                    // Fetch the current KT root from the KT service via minimal HTTP GET.
+                    let (kt_root, kt_fresh) = match fetch_kt_root_http(&kt_addr).await {
+                        Ok(root) => {
+                            let mut cached = last_known_kt_root.lock().await;
+                            *cached = (root, true);
+                            (root, true)
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to fetch KT root from {}: {}; using last known root (stale)", kt_addr, e);
+                            let cached = last_known_kt_root.lock().await;
+                            (cached.0, false)
+                        }
+                    };
+
+                    let staleness_flag = if kt_fresh { "fresh" } else { "stale" };
 
                     let mut wl = witness_log.lock().await;
                     wl.add_signed_checkpoint(audit_root, kt_root, |data| {
@@ -99,9 +121,11 @@ async fn main() {
                     }
 
                     tracing::info!(
-                        "Witness checkpoint #{} generated (audit_root={}, kt_root=placeholder)",
+                        "Witness checkpoint #{} generated (audit_root={}, kt_root={}, kt_status={})",
                         wl.len(),
                         hex::encode(audit_root),
+                        hex::encode(&kt_root[..8]),
+                        staleness_flag,
                     );
                 } else {
                     tracing::debug!("Witness checkpoint skipped: no audit entries yet");
@@ -158,6 +182,69 @@ async fn main() {
             });
         }
     }
+}
+
+// ── KT root fetch ───────────────────────────────────────────────────────
+
+/// Fetch the current KT Merkle root from the Key Transparency service via
+/// a minimal HTTP/1.1 GET request over TCP. Returns a 64-byte SHA-512 root
+/// hash on success.
+///
+/// This avoids pulling in a full HTTP client crate (reqwest/hyper) since this
+/// is the only outgoing HTTP call in the audit service.
+async fn fetch_kt_root_http(addr: &str) -> Result<[u8; 64], String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let mut stream = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        TcpStream::connect(addr),
+    )
+    .await
+    .map_err(|_| "connection timeout".to_string())?
+    .map_err(|e| format!("connect: {e}"))?;
+
+    let request = format!(
+        "GET /api/kt/root HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        addr,
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|e| format!("write: {e}"))?;
+
+    let mut buf = Vec::with_capacity(4096);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.read_to_end(&mut buf),
+    )
+    .await
+    .map_err(|_| "read timeout".to_string())?
+    .map_err(|e| format!("read: {e}"))?;
+
+    let response = String::from_utf8_lossy(&buf);
+    // Find the JSON body after the blank line separating headers from body.
+    let body = response
+        .split("\r\n\r\n")
+        .nth(1)
+        .ok_or_else(|| "malformed HTTP response: no body".to_string())?;
+
+    let json: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("parse JSON: {e}"))?;
+
+    let root_hex = json
+        .get("root")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing 'root' field in KT response".to_string())?;
+
+    let bytes = hex::decode(root_hex).map_err(|e| format!("hex decode: {e}"))?;
+    if bytes.len() != 64 {
+        return Err(format!("KT root is {} bytes, expected 64", bytes.len()));
+    }
+
+    let mut root = [0u8; 64];
+    root.copy_from_slice(&bytes);
+    Ok(root)
 }
 
 // ── Persistence helpers ─────────────────────────────────────────────────

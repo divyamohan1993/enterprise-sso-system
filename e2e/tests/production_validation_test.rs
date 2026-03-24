@@ -584,7 +584,7 @@ async fn test_puzzle_not_solved_rejected() {
     let solution = PuzzleSolution {
         nonce: challenge.nonce,
         solution: [0u8; 32],
-        xwing_client_pk: None,
+        xwing_kem_ciphertext: None,
     };
     send_frame(&mut stream, &solution)
         .await
@@ -760,10 +760,10 @@ fn test_ratchet_forward_secrecy() {
     assert!(chain.verify_tag(claims_bytes, &tag_epoch0, 0), "tag should verify at epoch 0");
 
     // Advance past the lookahead window (> 3 epochs)
-    let client_e = [0x11u8; 32];
-    let server_e = [0x22u8; 32];
     for _ in 0..10 {
-        chain.advance(&client_e, &server_e);
+        let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];
+        getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
+        chain.advance(&ce, &se, &sn);
     }
 
     assert!(
@@ -777,12 +777,11 @@ fn test_ratchet_within_lookahead_window() {
     let master = [0x99u8; 64];
     let mut chain = RatchetChain::new(&master);
 
-    let client_e = [0x11u8; 32];
-    let server_e = [0x22u8; 32];
-
     // Advance to epoch 7
     for _ in 0..7 {
-        chain.advance(&client_e, &server_e);
+        let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];
+        getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
+        chain.advance(&ce, &se, &sn);
     }
     assert_eq!(chain.epoch(), 7);
 
@@ -790,19 +789,22 @@ fn test_ratchet_within_lookahead_window() {
     let tag_epoch7 = chain.generate_tag(claims_bytes);
 
     // Advance to epoch 9 (diff = 2, within +/-3)
-    chain.advance(&client_e, &server_e);
-    chain.advance(&client_e, &server_e);
+    for _ in 0..2 {
+        let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];
+        getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
+        chain.advance(&ce, &se, &sn);
+    }
     assert_eq!(chain.epoch(), 9);
 
-    // Epoch diff = |9-7| = 2, within window but not exact match
-    // verify_tag only verifies exact match or returns false for non-exact within window (TODO in code)
-    // So epoch 7 tag at epoch 9 should return false (lookahead not yet implemented)
-    // but should NOT panic
+    // Epoch diff = |9-7| = 2, within window
     let _result = chain.verify_tag(claims_bytes, &tag_epoch7, 7);
 
     // Advance to epoch 11 (diff = 4, outside window)
-    chain.advance(&client_e, &server_e);
-    chain.advance(&client_e, &server_e);
+    for _ in 0..2 {
+        let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];
+        getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
+        chain.advance(&ce, &se, &sn);
+    }
     assert_eq!(chain.epoch(), 11);
     assert!(
         !chain.verify_tag(claims_bytes, &tag_epoch7, 7),
@@ -815,17 +817,20 @@ fn test_ratchet_session_expires_at_8_hours() {
     let master = [0x99u8; 64];
     let mut chain = RatchetChain::new(&master);
 
-    let client_e = [0x11u8; 32];
-    let server_e = [0x22u8; 32];
-
     // Advance 2879 times (just before expiry at epoch 2880)
     for _ in 0..2879 {
-        chain.advance(&client_e, &server_e);
+        let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];
+        getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
+        chain.advance(&ce, &se, &sn);
     }
     assert!(!chain.is_expired(), "chain should not be expired at epoch 2879");
 
     // Advance to epoch 2880
-    chain.advance(&client_e, &server_e);
+    {
+        let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];
+        getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
+        chain.advance(&ce, &se, &sn);
+    }
     assert_eq!(chain.epoch(), 2880);
     assert!(chain.is_expired(), "chain must be expired at epoch 2880 (8h at 10s)");
 }
@@ -845,8 +850,16 @@ fn test_cloned_ratchet_state_diverges() {
     assert!(ct_eq_64(&tag_a0, &tag_b0), "same master -> same tag at epoch 0");
 
     // Advance A with one entropy, B with different entropy -> diverge
-    chain_a.advance(&[0x11; 32], &[0x22; 32]);
-    chain_b.advance(&[0x33; 32], &[0x44; 32]);
+    {
+        let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];
+        getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
+        chain_a.advance(&ce, &se, &sn);
+    }
+    {
+        let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];
+        getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
+        chain_b.advance(&ce, &se, &sn);
+    }
 
     let tag_a1 = chain_a.generate_tag(claims_bytes);
     let tag_b1 = chain_b.generate_tag(claims_bytes);
@@ -868,8 +881,16 @@ fn test_ratchet_different_entropy_different_chains() {
     let mut chain_a = RatchetChain::new(&master);
     let mut chain_b = RatchetChain::new(&master);
 
-    chain_a.advance(&[0xAA; 32], &[0xBB; 32]);
-    chain_b.advance(&[0xCC; 32], &[0xDD; 32]);
+    {
+        let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];
+        getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
+        chain_a.advance(&ce, &se, &sn);
+    }
+    {
+        let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];
+        getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
+        chain_b.advance(&ce, &se, &sn);
+    }
 
     let claims = b"same-claims";
     let tag_a = chain_a.generate_tag(claims);
@@ -1643,7 +1664,7 @@ fn test_xwing_real_pq_kem() {
     let server_pk = server_kp.public_key();
 
     let (client_ss, ct) = xwing_encapsulate(&server_pk);
-    let server_ss = xwing_decapsulate(&server_kp, &ct);
+    let server_ss = xwing_decapsulate(&server_kp, &ct).expect("decapsulate");
 
     assert_eq!(
         client_ss.as_bytes(),

@@ -22,3 +22,4 @@ tokio = { workspace = true, features = ["full"] }
 proptest = "1"
 ratchet = { path = "../ratchet" }
 uuid = { version = "1", features = ["v4"] }
+getrandom.workspace = true

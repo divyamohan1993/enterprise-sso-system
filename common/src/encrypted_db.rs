@@ -14,6 +14,7 @@
 //! | key_material       | key_bytes           | keymaterial:bytes    |
 //! | audit_log          | signature           | audit:sig           |
 //! | audit_log          | data                | audit:data          |
+//! | ratchet_sessions   | chain_key_encrypted | ratchet:chain_key   |
 //! | witness_checkpoints| signature           | witness:sig         |
 
 use sqlx::PgPool;
@@ -198,6 +199,24 @@ pub async fn load_or_generate_key_32_encrypted(epool: &EncryptedPool, name: &str
 /// Initialize an encrypted pool with the given master KEK.
 pub fn wrap_pool(pool: PgPool, master_kek: [u8; 32]) -> EncryptedPool {
     EncryptedPool::new(pool, master_kek)
+}
+
+/// Encrypt a ratchet chain key for storage in the `ratchet_sessions` table.
+///
+/// Uses the table KEK derived from `ratchet_sessions` with AAD binding to
+/// the specific session ID: `MILNET-AAD-v1:ratchet_sessions:chain_key:{session_id}`.
+///
+/// Returns `nonce(12) || ciphertext || tag(16)`.
+pub fn encrypt_ratchet_key(epool: &EncryptedPool, session_id: &uuid::Uuid, chain_key: &[u8]) -> Vec<u8> {
+    epool.encrypt_field("ratchet_sessions", "chain_key", session_id.as_bytes(), chain_key)
+}
+
+/// Decrypt a ratchet chain key loaded from the `ratchet_sessions` table.
+///
+/// Uses the table KEK derived from `ratchet_sessions` with the same AAD
+/// that was used during encryption.
+pub fn decrypt_ratchet_key(epool: &EncryptedPool, session_id: &uuid::Uuid, sealed: &[u8]) -> Result<Vec<u8>, String> {
+    epool.decrypt_field("ratchet_sessions", "chain_key", session_id.as_bytes(), sealed)
 }
 
 /// Standalone encryption engine for testing without a database connection.

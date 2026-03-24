@@ -100,7 +100,7 @@ locals {
 
 resource "random_password" "db_password" {
   length  = 80
-  special = false  # Avoid URL-encoding issues in DATABASE_URL
+  special = false # Avoid URL-encoding issues in DATABASE_URL
 }
 
 # Store DB password in Secret Manager (never plaintext in terraform state exports)
@@ -126,6 +126,29 @@ resource "google_sql_user" "milnet" {
   instance = local.sql_instance_name
   password = local.db_password
   project  = var.project_id
+}
+
+# Manage existing Cloud SQL instance to enforce deletion protection
+resource "google_sql_database_instance" "milnet_db" {
+  name                = local.sql_instance_name
+  project             = var.project_id
+  region              = var.region
+  database_version    = "POSTGRES_15"
+  deletion_protection = true
+
+  settings {
+    tier              = "db-f1-micro"
+    availability_type = "ZONAL"
+
+    ip_configuration {
+      ipv4_enabled    = false
+      private_network = data.google_compute_network.milnet_vpc.id
+    }
+  }
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 # ============================================================================
@@ -159,7 +182,7 @@ resource "google_compute_firewall" "admin_public" {
     ports    = ["8080"]
   }
 
-  source_ranges = ["0.0.0.0/0"]
+  source_ranges = ["10.207.224.0/22"]
   target_tags   = ["milnet-core"]
   priority      = 1001
 }
@@ -175,7 +198,7 @@ resource "google_compute_firewall" "ssh" {
     ports    = ["22"]
   }
 
-  source_ranges = var.developer_mode ? ["0.0.0.0/0"] : ["35.235.240.0/20"]
+  source_ranges = ["35.235.240.0/20"]
   target_tags   = ["milnet-gateway", "milnet-core", "milnet-tss"]
   priority      = 1002
 }
@@ -201,13 +224,94 @@ resource "google_compute_firewall" "deny_all" {
   name     = "milnet-fw-deny-all"
   network  = data.google_compute_network.milnet_vpc.name
   project  = var.project_id
-  priority = 65534
+  priority = 1000
 
   deny {
     protocol = "all"
   }
 
   source_ranges = ["0.0.0.0/0"]
+}
+
+# ============================================================================
+# Cloud Armor — DDoS Protection + Rate Limiting
+# ============================================================================
+
+resource "google_compute_security_policy" "ddos_protection" {
+  name    = "milnet-ddos-protection"
+  project = var.project_id
+
+  # Default: allow all
+  rule {
+    action   = "allow"
+    priority = 2147483647
+
+    match {
+      versioned_expr = "SRC_IPS_V1"
+
+      config {
+        src_ip_ranges = ["*"]
+      }
+    }
+
+    description = "Default allow"
+  }
+
+  # Rate limit: throttle per IP
+  rule {
+    action   = "throttle"
+    priority = 1000
+
+    match {
+      versioned_expr = "SRC_IPS_V1"
+
+      config {
+        src_ip_ranges = ["*"]
+      }
+    }
+
+    rate_limit_options {
+      conform_action = "allow"
+      exceed_action  = "deny(429)"
+
+      rate_limit_threshold {
+        count        = 100
+        interval_sec = 60
+      }
+
+      enforce_on_key = "IP"
+    }
+
+    description = "Rate limit: 100 req/min per IP"
+  }
+
+  # Block SQL injection attempts
+  rule {
+    action   = "deny(403)"
+    priority = 900
+
+    match {
+      expr {
+        expression = "evaluatePreconfiguredExpr('sqli-v33-stable')"
+      }
+    }
+
+    description = "Block SQL injection attempts"
+  }
+
+  # Block XSS attempts
+  rule {
+    action   = "deny(403)"
+    priority = 901
+
+    match {
+      expr {
+        expression = "evaluatePreconfiguredExpr('xss-v33-stable')"
+      }
+    }
+
+    description = "Block XSS attempts"
+  }
 }
 
 # ============================================================================
@@ -304,9 +408,6 @@ resource "google_compute_instance" "core" {
 
   network_interface {
     subnetwork = data.google_compute_subnetwork.milnet_subnet.id
-    access_config {
-      # Ephemeral public IP
-    }
   }
 
   metadata = {
@@ -322,8 +423,13 @@ resource "google_compute_instance" "core" {
   }
 
   service_account {
-    email  = data.google_service_account.core_sa.email
-    scopes = ["cloud-platform"]
+    email = data.google_service_account.core_sa.email
+    scopes = [
+      "https://www.googleapis.com/auth/sqlservice.admin",
+      "https://www.googleapis.com/auth/cloudkms",
+      "https://www.googleapis.com/auth/secretmanager",
+      "https://www.googleapis.com/auth/logging.write",
+    ]
   }
 
   lifecycle {
@@ -362,9 +468,6 @@ resource "google_compute_instance" "tss" {
 
   network_interface {
     subnetwork = data.google_compute_subnetwork.milnet_subnet.id
-    access_config {
-      # Ephemeral public IP
-    }
   }
 
   metadata = {
@@ -375,8 +478,11 @@ resource "google_compute_instance" "tss" {
   }
 
   service_account {
-    email  = data.google_service_account.tss_sa.email
-    scopes = ["cloud-platform"]
+    email = data.google_service_account.tss_sa.email
+    scopes = [
+      "https://www.googleapis.com/auth/logging.write",
+      "https://www.googleapis.com/auth/monitoring.write",
+    ]
   }
 
   lifecycle {

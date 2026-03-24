@@ -59,6 +59,8 @@ const CSRF_TOKEN_TTL_SECS: u64 = 60;
 
 /// Validate a CSRF token against the expected session_state and api_key.
 /// Returns true if the token is valid and not expired.
+/// NOTE: This is the stateless check only. Callers must also check
+/// and mark the token as used via `check_and_mark_csrf_used()`.
 fn validate_csrf_token(token: &str, session_state: &str, api_key: &str) -> bool {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
@@ -90,6 +92,20 @@ fn validate_csrf_token(token: &str, session_state: &str, api_key: &str) -> bool 
     let expected_sig = hex::encode(mac.finalize().into_bytes());
 
     crypto::ct::ct_eq(expected_sig.as_bytes(), provided_sig.as_bytes())
+}
+
+/// Check if a CSRF token has been used before and mark it as used.
+/// Returns true if the token was NOT previously used (i.e., it is fresh).
+/// Returns false if the token was already consumed (replay attempt).
+async fn check_and_mark_csrf_used(token: &str, used_tokens: &RwLock<HashSet<String>>) -> bool {
+    let mut used = used_tokens.write().await;
+    // Enforce capacity on the used-token set
+    if used.len() >= MAX_USED_CSRF_TOKENS {
+        // Clear the entire set; stale tokens are already expired by TTL check
+        used.clear();
+    }
+    // insert() returns true if the value was newly inserted (not present before)
+    used.insert(token.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -195,7 +211,11 @@ pub struct AppState {
     /// Tracks the last activity timestamp (epoch seconds) for each user session
     /// token.  Used to enforce the AAL3 15-minute inactivity timeout.
     pub session_activity: RwLock<HashMap<String, i64>>,
-    pub login_attempts: RwLock<HashMap<String, (u32, i64)>>,
+    pub login_attempts: RwLock<HashMap<String, LoginAttemptEntry>>,
+    /// Opaque token handle map: random handle -> (user_id, timestamp, expiry).
+    pub opaque_tokens: RwLock<HashMap<String, OpaqueTokenEntry>>,
+    /// Set of used CSRF tokens to enforce single-use semantics.
+    pub used_csrf_tokens: RwLock<HashSet<String>>,
     pub pq_signing_key: crypto::pq_sign::PqSigningKey,
     pub session_tracker: Arc<common::session_limits::SessionTracker>,
     pub revocation_list: RwLock<RevocationList>,
@@ -212,11 +232,21 @@ pub struct AccessTokenEntry {
     pub last_activity: i64,
 }
 
+/// Entry in the opaque_tokens map for the new opaque token format.
+/// Maps a random 32-byte handle (hex-encoded) to user metadata.
+pub struct OpaqueTokenEntry {
+    pub user_id: Uuid,
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+
 /// Maximum inactivity window before a session is considered expired (AAL3).
 const INACTIVITY_TIMEOUT_SECS: i64 = 15 * 60;
 
 /// Maximum length for usernames (prevents allocation attacks).
 const MAX_USERNAME_LEN: usize = 255;
+/// Minimum length for passwords (NIST SP 800-63B minimum).
+const MIN_PASSWORD_LEN: usize = 12;
 /// Maximum length for passwords (prevents Argon2id DoS via huge inputs).
 const MAX_PASSWORD_LEN: usize = 1024;
 /// Maximum length for portal names.
@@ -225,17 +255,165 @@ const MAX_PORTAL_NAME_LEN: usize = 255;
 const MAX_CALLBACK_URL_LEN: usize = 2048;
 /// Maximum number of access tokens before cleanup is triggered.
 const MAX_ACCESS_TOKENS: usize = 50_000;
+/// Maximum number of session_activity entries.
+const MAX_SESSION_ACTIVITY: usize = 50_000;
+/// Maximum number of login_attempts entries.
+const MAX_LOGIN_ATTEMPTS: usize = 100_000;
+/// Maximum number of pending ceremonies.
+const MAX_PENDING_CEREMONIES: usize = 1_000;
+/// Maximum number of used CSRF tokens tracked.
+const MAX_USED_CSRF_TOKENS: usize = 100_000;
+
+/// TTL for session_activity entries (8 hours).
+const SESSION_ACTIVITY_TTL_SECS: i64 = 8 * 3600;
+/// TTL for login_attempts entries (30 minutes).
+const LOGIN_ATTEMPTS_TTL_SECS: i64 = 30 * 60;
+/// TTL for pending ceremonies (15 minutes).
+const PENDING_CEREMONY_TTL_SECS: i64 = 15 * 60;
+
+/// Domain separator for audit log HMAC signatures in admin routes.
+const ADMIN_AUDIT_DOMAIN_SEPARATOR: &[u8] = b"MILNET-ADMIN-AUDIT-v1";
+
+/// Evict the oldest entries from a HashMap when it exceeds max capacity.
+/// Requires the value type to expose a timestamp via the provided closure.
+fn enforce_map_capacity<K: Eq + std::hash::Hash + Clone, V>(
+    map: &mut HashMap<K, V>,
+    max: usize,
+) {
+    if map.len() <= max {
+        return;
+    }
+    // Remove 10% of entries to amortise eviction cost.
+    let target = max * 9 / 10;
+    let to_remove = map.len() - target;
+    let keys: Vec<K> = map.keys().take(to_remove).cloned().collect();
+    for key in keys {
+        map.remove(&key);
+    }
+}
+
+/// Rate-limit lockout thresholds: (attempt_count, lockout_duration_secs).
+const LOCKOUT_TIERS: &[(u32, i64)] = &[
+    (5, 30),       // After 5 failed attempts: 30-second lockout
+    (10, 300),     // After 10 failed attempts: 5-minute lockout
+    (20, 1800),    // After 20 failed attempts: 30-minute lockout
+];
+
+/// Login attempt tracking entry: (count, first_attempt_time, last_attempt_time).
+pub struct LoginAttemptEntry {
+    pub count: u32,
+    pub first_attempt: i64,
+    pub last_attempt: i64,
+}
+
+/// Check whether the given username or IP is locked out based on failed attempts.
+fn is_locked_out(username: &str, ip: &str, attempts: &HashMap<String, LoginAttemptEntry>) -> bool {
+    let now = now_secs();
+    // Check both username-based and IP-based lockouts
+    for key in &[username.to_string(), format!("ip:{}", ip)] {
+        if let Some(entry) = attempts.get(key.as_str()) {
+            for &(threshold, duration) in LOCKOUT_TIERS.iter().rev() {
+                if entry.count >= threshold {
+                    if now - entry.last_attempt < duration {
+                        return true;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Record a failed login attempt for both username and IP.
+fn record_failed_attempt(
+    attempts: &mut HashMap<String, LoginAttemptEntry>,
+    username: &str,
+    ip: &str,
+) {
+    let now = now_secs();
+    for key in &[username.to_string(), format!("ip:{}", ip)] {
+        let entry = attempts.entry(key.clone()).or_insert(LoginAttemptEntry {
+            count: 0,
+            first_attempt: now,
+            last_attempt: now,
+        });
+        entry.count += 1;
+        entry.last_attempt = now;
+    }
+}
+
+/// Compute an HMAC-SHA512 signature over data for audit log signing.
+fn sign_audit_entry(data: &[u8], signing_key: &[u8]) -> Vec<u8> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha512;
+    type HmacSha512 = Hmac<Sha512>;
+
+    let mut mac = HmacSha512::new_from_slice(signing_key).expect("HMAC key");
+    mac.update(ADMIN_AUDIT_DOMAIN_SEPARATOR);
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
+}
+
+/// Derive the admin audit signing key from the master KEK.
+fn derive_admin_audit_key() -> [u8; 64] {
+    use hkdf::Hkdf;
+    use sha2::Sha512;
+
+    let master_kek = common::sealed_keys::load_master_kek();
+    let hk = Hkdf::<Sha512>::new(Some(ADMIN_AUDIT_DOMAIN_SEPARATOR), &master_kek);
+    let mut okm = [0u8; 64];
+    hk.expand(b"admin-audit-signing-key", &mut okm)
+        .expect("HKDF expand");
+    okm
+}
 
 /// A pending multi-person ceremony that requires multiple approvers.
+/// Each approval includes an HMAC-SHA512 signature over the ceremony_id,
+/// providing cryptographic binding between the approver and the ceremony.
 #[derive(Clone, Serialize)]
 pub struct PendingCeremony {
     pub action: String,
     pub level: u8,
     pub initiator: Uuid,
-    pub approvers: Vec<Uuid>,
+    /// Each approval is a (user_id, hmac_signature) pair providing
+    /// cryptographic proof that the specific approver authorized this ceremony.
+    pub approvals: Vec<(Uuid, Vec<u8>)>,
     pub required_approvals: usize,
     pub created_at: i64,
     pub expires_at: i64,
+}
+
+/// Compute the expected HMAC-SHA512 signature for a ceremony approval.
+/// The approver must provide their own signature over the ceremony_id
+/// using a key derived from the master KEK and their user_id.
+fn compute_ceremony_approval_hmac(ceremony_id: &Uuid, approver_id: &Uuid) -> Vec<u8> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha512;
+    type HmacSha512 = Hmac<Sha512>;
+
+    let master_kek = common::sealed_keys::load_master_kek();
+    let derived = {
+        use hkdf::Hkdf;
+        let hk = Hkdf::<Sha512>::new(Some(b"MILNET-CEREMONY-APPROVAL-v1"), &master_kek);
+        let mut okm = [0u8; 64];
+        hk.expand(approver_id.as_bytes(), &mut okm)
+            .expect("HKDF expand");
+        okm
+    };
+    let mut mac = HmacSha512::new_from_slice(&derived).expect("HMAC key");
+    mac.update(ceremony_id.as_bytes());
+    mac.finalize().into_bytes().to_vec()
+}
+
+/// Verify a ceremony approval signature from an approver.
+fn verify_ceremony_approval(
+    ceremony_id: &Uuid,
+    approver_id: &Uuid,
+    provided_signature: &[u8],
+) -> bool {
+    let expected = compute_ceremony_approval_hmac(ceremony_id, approver_id);
+    crypto::ct::ct_eq(&expected, provided_signature)
 }
 
 // ---------------------------------------------------------------------------
@@ -251,6 +429,10 @@ pub struct PendingCeremony {
 /// Extension to carry the authenticated user's tier through the request.
 #[derive(Debug, Clone, Copy)]
 pub struct AuthTier(pub u8);
+
+/// Extension to carry the authenticated user's ID through the request.
+#[derive(Debug, Clone, Copy)]
+pub struct AuthUserId(pub Uuid);
 
 async fn auth_middleware(
     State(state): State<Arc<AppState>>,
@@ -291,48 +473,64 @@ async fn auth_middleware(
                 request.extensions_mut().insert(AuthTier(1));
                 return Ok(next.run(request).await);
             }
-            // Accept a valid user auth token (user_id:timestamp:hmac)
-            if verify_user_token(token) {
+            // Try opaque token format first (32-byte hex handle)
+            let opaque_user = {
+                let now = now_secs();
+                let tokens = state.opaque_tokens.read().await;
+                if let Some(entry) = tokens.get(token) {
+                    if now < entry.expires_at {
+                        Some(entry.user_id)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+
+            // Resolve user_id: either from opaque token or legacy format
+            let resolved_user_id = if let Some(uid) = opaque_user {
+                Some(uid)
+            } else if verify_user_token(token) {
+                // Legacy format backward-compat: user_id:timestamp:hmac
+                let parts: Vec<&str> = token.splitn(3, ':').collect();
+                if parts.len() == 3 {
+                    Uuid::parse_str(parts[0]).ok()
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if let Some(user_id) = resolved_user_id {
                 // Enforce AAL3 inactivity timeout (15 minutes)
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs() as i64;
+                let now = now_secs();
                 {
                     let activity = state.session_activity.read().await;
                     if let Some(&last) = activity.get(token) {
                         if now - last > INACTIVITY_TIMEOUT_SECS {
                             drop(activity);
-                            // Remove the expired session
                             state.session_activity.write().await.remove(token);
                             return Err(StatusCode::UNAUTHORIZED);
                         }
                     }
                 }
-                // Update last activity timestamp
-                state
-                    .session_activity
-                    .write()
-                    .await
-                    .insert(token.to_string(), now);
+                // Update last activity timestamp (with capacity enforcement)
+                {
+                    let mut activity = state.session_activity.write().await;
+                    enforce_map_capacity(&mut *activity, MAX_SESSION_ACTIVITY);
+                    activity.insert(token.to_string(), now);
+                }
 
                 // Look up user tier from DB
-                let parts: Vec<&str> = token.splitn(3, ':').collect();
-                let tier = if parts.len() == 3 {
-                    if let Ok(user_id) = Uuid::parse_str(parts[0]) {
-                        let t: i32 = sqlx::query_scalar("SELECT tier FROM users WHERE id = $1")
-                            .bind(user_id)
-                            .fetch_one(&state.db)
-                            .await
-                            .unwrap_or(4);
-                        t as u8
-                    } else {
-                        4
-                    }
-                } else {
-                    4
-                };
-                request.extensions_mut().insert(AuthTier(tier));
+                let t: i32 = sqlx::query_scalar("SELECT tier FROM users WHERE id = $1")
+                    .bind(user_id)
+                    .fetch_one(&state.db)
+                    .await
+                    .unwrap_or(4);
+                request.extensions_mut().insert(AuthTier(t as u8));
+                request.extensions_mut().insert(AuthUserId(user_id));
                 return Ok(next.run(request).await);
             }
             Err(StatusCode::UNAUTHORIZED)
@@ -1161,7 +1359,7 @@ async fn register_user(
     if req.username.len() > MAX_USERNAME_LEN {
         return Err(StatusCode::BAD_REQUEST);
     }
-    if req.password.len() > MAX_PASSWORD_LEN {
+    if req.password.len() < MIN_PASSWORD_LEN || req.password.len() > MAX_PASSWORD_LEN {
         return Err(StatusCode::BAD_REQUEST);
     }
     let tier = req.tier.unwrap_or(2).clamp(1, 4);
@@ -1204,7 +1402,7 @@ async fn register_user(
     .execute(&state.db)
     .await;
 
-    // Log to audit (in-memory chain + PostgreSQL), signed with ML-DSA-87
+    // Log to audit (in-memory chain + PostgreSQL), signed with ML-DSA-87 + admin HMAC-SHA512
     let mut audit = state.audit_log.write().await;
     let entry = audit.append_signed(
         common::types::AuditEventType::CredentialRegistered,
@@ -1215,6 +1413,12 @@ async fn register_user(
         &state.pq_signing_key,
     );
 
+    // Add admin HMAC-SHA512 signature (domain-separated) to the audit entry
+    let audit_key = derive_admin_audit_key();
+    let admin_sig = sign_audit_entry(&entry.signature, &audit_key);
+    let mut combined_sig = entry.signature.clone();
+    combined_sig.extend_from_slice(&admin_sig);
+
     let user_ids_json = serde_json::to_string(&entry.user_ids).unwrap_or_default();
     let _ = sqlx::query(
         "INSERT INTO audit_log (id, event_type, user_ids, timestamp, prev_hash, signature) VALUES ($1, $2, $3, $4, $5, $6)"
@@ -1224,7 +1428,7 @@ async fn register_user(
     .bind(user_ids_json)
     .bind(entry.timestamp)
     .bind(entry.prev_hash.to_vec())
-    .bind(entry.signature.clone())
+    .bind(combined_sig)
     .execute(&state.db)
     .await;
 
@@ -1513,51 +1717,31 @@ async fn verify_audit_chain(
 
 async fn auth_login(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<LoginRequest>,
+    request: Request,
 ) -> Json<LoginResponse> {
-    // Rate limiting: max 5 attempts per 30 minutes per username
-    {
-        let mut attempts = state.login_attempts.write().await;
-        let now = now_secs();
+    // Extract client IP for per-IP rate limiting
+    let client_ip = request
+        .headers()
+        .get("X-Forwarded-For")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .unwrap_or("unknown")
+        .trim()
+        .to_string();
 
-        // TTL-based eviction: purge all entries older than 30 minutes on each access
-        const RATE_LIMIT_TTL_SECS: i64 = 1800;
-        attempts.retain(|_, (_, first_time)| now - *first_time < RATE_LIMIT_TTL_SECS);
-
-        // Capacity bound: prevent unbounded memory growth (max 50,000 entries).
-        // When full, evict the oldest 10% to amortise eviction cost.
-        const MAX_RATE_LIMIT_ENTRIES: usize = 50_000;
-        if attempts.len() > MAX_RATE_LIMIT_ENTRIES {
-            let target = MAX_RATE_LIMIT_ENTRIES * 9 / 10;
-            let mut entries: Vec<(String, i64)> =
-                attempts.iter().map(|(k, (_, ts))| (k.clone(), *ts)).collect();
-            entries.sort_by_key(|(_, ts)| *ts);
-            let to_remove = attempts.len() - target;
-            for (key, _) in entries.into_iter().take(to_remove) {
-                attempts.remove(&key);
-            }
+    let body = match axum::body::to_bytes(request.into_body(), 1024 * 64).await {
+        Ok(b) => b,
+        Err(_) => {
+            return Json(LoginResponse {
+                success: false,
+                error: Some("invalid credentials".into()),
+                ..Default::default()
+            });
         }
-
-        if let Some((count, first_time)) = attempts.get(&req.username) {
-            if now - *first_time < RATE_LIMIT_TTL_SECS && *count >= 5 {
-                return Json(LoginResponse {
-                    success: false,
-                    error: Some("account locked — too many attempts".into()),
-                    ..Default::default()
-                });
-            }
-            if now - *first_time >= RATE_LIMIT_TTL_SECS {
-                attempts.remove(&req.username);
-            }
-        }
-    }
-
-    let store = state.credential_store.read().await;
-
-    // Check user exists
-    let user_id = match store.get_user_id(&req.username) {
-        Some(id) => id,
-        None => {
+    };
+    let req: LoginRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => {
             return Json(LoginResponse {
                 success: false,
                 error: Some("invalid credentials".into()),
@@ -1566,77 +1750,93 @@ async fn auth_login(
         }
     };
 
-    // Run the full OPAQUE login protocol (both client and server sides)
-    // to verify the password. The verify_password method executes LoginStart
-    // AND LoginFinish internally, ensuring the password is actually checked.
+    // Rate limiting with exponential backoff per username AND per IP
+    {
+        let mut attempts = state.login_attempts.write().await;
+        let now = now_secs();
+
+        // TTL-based eviction: purge all entries older than 30 minutes
+        attempts.retain(|_, entry| now - entry.first_attempt < LOGIN_ATTEMPTS_TTL_SECS);
+
+        // Capacity bound
+        enforce_map_capacity(&mut *attempts, MAX_LOGIN_ATTEMPTS);
+
+        // Check lockout for both username and IP
+        if is_locked_out(&req.username, &client_ip, &attempts) {
+            // Return consistent error regardless of whether user exists
+            return Json(LoginResponse {
+                success: false,
+                error: Some("invalid credentials".into()),
+                ..Default::default()
+            });
+        }
+    }
+
+    let store = state.credential_store.read().await;
+
+    // Run the full OPAQUE login protocol — return consistent error regardless
+    // of whether the user exists to prevent username enumeration.
+    let user_id = store.get_user_id(&req.username);
     let verify_result = store.verify_password(&req.username, req.password.as_bytes());
     drop(store);
 
-    match verify_result {
-        Ok(verified_user_id) => {
-            // Sanity check: verified user ID must match the looked-up user ID
-            if verified_user_id != user_id {
-                return Json(LoginResponse {
-                    success: false,
-                    error: Some("internal user ID mismatch".into()),
-                    ..Default::default()
-                });
+    match (user_id, verify_result) {
+        (Some(uid), Ok(verified_user_id)) if uid == verified_user_id => {
+            // Generate opaque token: random 32-byte handle
+            let handle_bytes: [u8; 32] = rand::random();
+            let token = hex::encode(handle_bytes);
+            let now = now_secs();
+            let expires_at = now + 3600; // 1 hour
+
+            // Store opaque token mapping
+            {
+                let mut opaque_tokens = state.opaque_tokens.write().await;
+                enforce_map_capacity(&mut *opaque_tokens, MAX_ACCESS_TOKENS);
+                opaque_tokens.insert(
+                    token.clone(),
+                    OpaqueTokenEntry {
+                        user_id: verified_user_id,
+                        created_at: now,
+                        expires_at,
+                    },
+                );
             }
-
-            // For the admin API we issue a simple HMAC-based token rather than
-            // running the full FROST threshold signing ceremony.
-            use hmac::{Hmac, Mac};
-            use sha2::Sha512;
-            type HmacSha512 = Hmac<Sha512>;
-
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-            let payload = format!("{}:{}", user_id, now);
-            // Derive HMAC key from master KEK — prevents forging tokens without KEK
-            let master_kek = common::sealed_keys::load_master_kek();
-            let derived = {
-                use hkdf::Hkdf;
-                let hk = Hkdf::<Sha512>::new(Some(b"MILNET-ADMIN-TOKEN-v3"), &master_kek);
-                let mut okm = [0u8; 32];
-                hk.expand(b"admin-token-hmac", &mut okm)
-                    .expect("HKDF expand");
-                okm
-            };
-            let mut mac = HmacSha512::new_from_slice(&derived)
-                .expect("HMAC key");
-            mac.update(payload.as_bytes());
-            let sig = hex(&mac.finalize().into_bytes());
-            let token = format!("{payload}:{sig}");
 
             // Persist session to PostgreSQL
             let session_id = Uuid::new_v4();
-            let expires_at = now as i64 + 3600;
             let _ = sqlx::query(
                 "INSERT INTO sessions (id, user_id, created_at, expires_at, is_active) VALUES ($1, $2, $3, $4, true)"
             )
             .bind(session_id)
-            .bind(user_id)
-            .bind(now as i64)
+            .bind(verified_user_id)
+            .bind(now)
             .bind(expires_at)
             .execute(&state.db)
             .await;
 
             // Look up user tier
             let user_tier: i32 = sqlx::query_scalar("SELECT tier FROM users WHERE id = $1")
-                .bind(user_id)
+                .bind(verified_user_id)
                 .fetch_one(&state.db)
                 .await
                 .unwrap_or(2);
 
-            // Clear rate limit on successful login
-            state.login_attempts.write().await.remove(&req.username);
+            // Clear rate limit on successful login (both username and IP)
+            {
+                let mut attempts = state.login_attempts.write().await;
+                attempts.remove(&req.username);
+                attempts.remove(&format!("ip:{}", client_ip));
+            }
+
+            // Sign audit entry for login success
+            let audit_key = derive_admin_audit_key();
+            let audit_data = format!("auth_login:success:{}:{}", verified_user_id, now);
+            let _audit_sig = sign_audit_entry(audit_data.as_bytes(), &audit_key);
 
             let dashboard = if user_tier <= 1 { "admin" } else { "user" };
             Json(LoginResponse {
                 success: true,
-                user_id: Some(user_id),
+                user_id: Some(verified_user_id),
                 username: Some(req.username.clone()),
                 token: Some(token),
                 tier: Some(user_tier as u8),
@@ -1644,37 +1844,55 @@ async fn auth_login(
                 error: None,
             })
         }
-        Err(e) => {
-            // Increment failed login attempt counter
-            let mut attempts = state.login_attempts.write().await;
-            let now = now_secs();
-            let entry = attempts.entry(req.username.clone()).or_insert((0, now));
-            entry.0 += 1;
-            drop(attempts);
+        _ => {
+            // Increment failed login attempt counter for both username and IP
+            {
+                let mut attempts = state.login_attempts.write().await;
+                record_failed_attempt(&mut *attempts, &req.username, &client_ip);
+            }
 
             // Always log the full internal error
             tracing::warn!(
                 username = %req.username,
-                error = %e,
                 "login failed"
             );
 
-            // Sanitise the error for the HTTP response based on developer mode
-            let external_msg = common::error_response::sanitize(
-                &format!("authentication failed: {e}")
-            );
-
+            // Return consistent error message regardless of whether user exists
             Json(LoginResponse {
                 success: false,
-                error: Some(external_msg),
+                error: Some("invalid credentials".into()),
                 ..Default::default()
             })
         }
     }
 }
 
-async fn auth_verify(Json(req): Json<VerifyRequest>) -> Json<VerifyResponse> {
-    // Token format: "user_id:timestamp:hmac_hex"
+async fn auth_verify(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<VerifyRequest>,
+) -> Json<VerifyResponse> {
+    // Try opaque token format first (hex-encoded 32-byte handle)
+    {
+        let now = now_secs();
+        let tokens = state.opaque_tokens.read().await;
+        if let Some(entry) = tokens.get(&req.token) {
+            if now < entry.expires_at {
+                return Json(VerifyResponse {
+                    valid: true,
+                    user_id: Some(entry.user_id),
+                    error: None,
+                });
+            } else {
+                return Json(VerifyResponse {
+                    valid: false,
+                    user_id: None,
+                    error: Some("token expired".into()),
+                });
+            }
+        }
+    }
+
+    // Legacy format backward-compat: "user_id:timestamp:hmac_hex"
     let parts: Vec<&str> = req.token.splitn(3, ':').collect();
     if parts.len() != 3 {
         return Json(VerifyResponse {
@@ -1690,7 +1908,7 @@ async fn auth_verify(Json(req): Json<VerifyRequest>) -> Json<VerifyResponse> {
             return Json(VerifyResponse {
                 valid: false,
                 user_id: None,
-                error: Some("invalid user_id in token".into()),
+                error: Some("invalid token".into()),
             });
         }
     };
@@ -1750,6 +1968,12 @@ async fn auth_logout(
         tokens.remove(&token);
     }
 
+    // Remove from opaque_tokens
+    {
+        let mut opaque_tokens = state.opaque_tokens.write().await;
+        opaque_tokens.remove(&token);
+    }
+
     // Add token hash to revocation list
     {
         use sha2::Digest;
@@ -1789,28 +2013,62 @@ async fn auth_logout(
 
 /// Spawn a background task that periodically evicts stale entries from
 /// in-memory maps to prevent unbounded memory growth.
+/// Runs every 60 seconds and enforces both TTL and capacity limits.
 pub fn spawn_ttl_eviction_task(state: Arc<AppState>) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             let now = now_secs();
 
-            // Clean access_tokens older than 15 min
+            // Clean access_tokens older than 15 min, enforce capacity
             {
                 let mut tokens = state.access_tokens.write().await;
                 tokens.retain(|_, entry| now - entry.last_activity < 15 * 60);
+                enforce_map_capacity(&mut *tokens, MAX_ACCESS_TOKENS);
             }
 
-            // Clean session_activity older than 30 min
+            // Clean session_activity older than 8 hours, enforce capacity
             {
                 let mut activity = state.session_activity.write().await;
-                activity.retain(|_, &mut last| now - last < 30 * 60);
+                activity.retain(|_, &mut last| now - last < SESSION_ACTIVITY_TTL_SECS);
+                enforce_map_capacity(&mut *activity, MAX_SESSION_ACTIVITY);
             }
 
-            // Clean login_attempts older than 30 min
+            // Clean login_attempts older than 30 min, enforce capacity
             {
                 let mut attempts = state.login_attempts.write().await;
-                attempts.retain(|_, (_, first_time)| now - *first_time < 30 * 60);
+                attempts.retain(|_, entry| now - entry.first_attempt < LOGIN_ATTEMPTS_TTL_SECS);
+                enforce_map_capacity(&mut *attempts, MAX_LOGIN_ATTEMPTS);
+            }
+
+            // Clean pending_ceremonies older than 15 min, enforce capacity
+            {
+                let mut ceremonies = state.pending_ceremonies.write().await;
+                ceremonies.retain(|_, c| now - c.created_at < PENDING_CEREMONY_TTL_SECS);
+                enforce_map_capacity(&mut *ceremonies, MAX_PENDING_CEREMONIES);
+            }
+
+            // Clean opaque_tokens that have expired
+            {
+                let mut tokens = state.opaque_tokens.write().await;
+                tokens.retain(|_, entry| now < entry.expires_at);
+                enforce_map_capacity(&mut *tokens, MAX_ACCESS_TOKENS);
+            }
+
+            // Clean used_csrf_tokens — tokens older than CSRF_TOKEN_TTL_SECS
+            // are already rejected by validate_csrf_token, so a periodic
+            // full clear is safe and prevents unbounded growth.
+            {
+                let mut used = state.used_csrf_tokens.write().await;
+                if used.len() > MAX_USED_CSRF_TOKENS / 2 {
+                    used.clear();
+                }
+            }
+
+            // Clean revocation list
+            {
+                let mut revocation = state.revocation_list.write().await;
+                revocation.cleanup_expired();
             }
         }
     });
@@ -2032,8 +2290,10 @@ async fn oauth_authorize_login(
     use axum::response::{IntoResponse, Html};
     use axum::http::header;
 
-    // Validate CSRF token before processing the login form
-    if !validate_csrf_token(&form.csrf_token, &form.state, &state.admin_api_key) {
+    // Validate CSRF token (cryptographic check + single-use enforcement)
+    if !validate_csrf_token(&form.csrf_token, &form.state, &state.admin_api_key)
+        || !check_and_mark_csrf_used(&form.csrf_token, &state.used_csrf_tokens).await
+    {
         return (StatusCode::FORBIDDEN, Html(r#"<!DOCTYPE html>
 <html><head><title>MILNET SSO // Error</title>
 <style>body{background:#0a0a0a;color:#ff3333;font-family:'JetBrains Mono',monospace;padding:60px;text-align:center}
@@ -2284,6 +2544,24 @@ async fn set_developer_mode(
         return Err(StatusCode::FORBIDDEN);
     }
 
+    // Production mode protection: refuse to enable developer mode at runtime
+    // unless it was set via environment variable at startup.
+    let is_production = common::sealed_keys::is_production();
+    if is_production && body.enabled {
+        let startup_dev_mode = std::env::var("MILNET_DEVELOPER_MODE").is_ok();
+        if !startup_dev_mode {
+            tracing::error!(
+                "CRITICAL: Runtime developer mode toggle attempted in production mode. \
+                 Developer mode can only be enabled via MILNET_DEVELOPER_MODE env var at startup."
+            );
+            // Emit SIEM critical event
+            common::siem::SecurityEvent::key_rotation(
+                "CRITICAL: developer_mode runtime toggle BLOCKED in production"
+            );
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
+
     // Parse log level (default to "error" if not provided)
     let log_level = match body.log_level.as_deref() {
         Some("verbose") => common::config::LogLevel::Verbose,
@@ -2460,9 +2738,9 @@ async fn oauth_google_start(
     };
     {
         let mut store = state.pending_google.write().await;
-        // Evict expired entries on every insert to prevent unbounded growth
-        store.cleanup_expired(now_secs());
-        store.insert(state_token.clone(), pending);
+        if let Err(e) = store.insert(state_token.clone(), pending) {
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "server_error", "description": e}))).into_response();
+        }
     }
 
     // Build Google auth URL and redirect
@@ -3075,18 +3353,8 @@ async fn get_user_profile(
     State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let token = request
-        .headers()
-        .get("Authorization")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.trim_start_matches("Bearer ").to_string())
+    let user_id = extract_user_id_from_request(&request)
         .ok_or(StatusCode::UNAUTHORIZED)?;
-
-    let parts: Vec<&str> = token.splitn(3, ':').collect();
-    if parts.len() != 3 {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-    let user_id = uuid::Uuid::parse_str(parts[0]).map_err(|_| StatusCode::UNAUTHORIZED)?;
 
     let row: Option<(String, i32, i64, bool)> = sqlx::query_as(
         "SELECT username, tier, created_at, is_active FROM users WHERE id = $1",
@@ -3139,6 +3407,10 @@ pub struct InitiateCeremonyResponse {
 #[derive(Deserialize)]
 pub struct ApproveCeremonyRequest {
     pub ceremony_id: Uuid,
+    /// HMAC-SHA512 signature over the ceremony_id, proving cryptographic
+    /// binding between the approver and this specific ceremony.
+    /// Hex-encoded.
+    pub signature: String,
 }
 
 #[derive(Serialize)]
@@ -3154,6 +3426,11 @@ pub struct ApproveCeremonyResponse {
 /// Extract the caller's user ID from the Authorization header token.
 /// Token format: `user_id:timestamp:hmac`
 fn extract_user_id_from_request(request: &Request) -> Option<Uuid> {
+    // Prefer the user ID set by auth_middleware (works for both opaque and legacy tokens)
+    if let Some(auth_user) = request.extensions().get::<AuthUserId>() {
+        return Some(auth_user.0);
+    }
+    // Fallback: parse from legacy token format in the Authorization header
     let header = request
         .headers()
         .get("Authorization")
@@ -3166,7 +3443,6 @@ fn extract_user_id_from_request(request: &Request) -> Option<Uuid> {
     if parts.len() == 3 {
         Uuid::parse_str(parts[0]).ok()
     } else {
-        // Admin API key — no user ID available
         None
     }
 }
@@ -3199,7 +3475,7 @@ async fn initiate_ceremony(
         action: req.action,
         level: req.level,
         initiator,
-        approvers: Vec::new(),
+        approvals: Vec::new(),
         required_approvals,
         created_at: now,
         expires_at: now + 1800, // 30-minute expiry
@@ -3234,6 +3510,18 @@ async fn approve_ceremony(
     let req: ApproveCeremonyRequest =
         serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
 
+    // Verify the approver's cryptographic signature over the ceremony_id
+    let provided_sig = hex::decode(&req.signature).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if !verify_ceremony_approval(&req.ceremony_id, &approver, &provided_sig) {
+        return Ok(Json(ApproveCeremonyResponse {
+            approved: false,
+            complete: false,
+            approvals: 0,
+            required: 0,
+            error: Some("invalid ceremony approval signature".into()),
+        }));
+    }
+
     let mut ceremonies = state.pending_ceremonies.write().await;
     let ceremony = ceremonies
         .get_mut(&req.ceremony_id)
@@ -3259,25 +3547,25 @@ async fn approve_ceremony(
         return Ok(Json(ApproveCeremonyResponse {
             approved: false,
             complete: false,
-            approvals: ceremony.approvers.len(),
+            approvals: ceremony.approvals.len(),
             required: ceremony.required_approvals,
             error: Some("initiator cannot approve their own ceremony".into()),
         }));
     }
 
     // Approver cannot approve twice
-    if ceremony.approvers.contains(&approver) {
+    if ceremony.approvals.iter().any(|(uid, _)| *uid == approver) {
         return Ok(Json(ApproveCeremonyResponse {
             approved: false,
             complete: false,
-            approvals: ceremony.approvers.len(),
+            approvals: ceremony.approvals.len(),
             required: ceremony.required_approvals,
             error: Some("already approved".into()),
         }));
     }
 
-    ceremony.approvers.push(approver);
-    let approvals = ceremony.approvers.len();
+    ceremony.approvals.push((approver, provided_sig));
+    let approvals = ceremony.approvals.len();
     let required = ceremony.required_approvals;
     let complete = approvals >= required;
     let level = ceremony.level;
@@ -3468,6 +3756,11 @@ async fn recovery_generate(
         &state.pq_signing_key,
     );
 
+    let audit_key = derive_admin_audit_key();
+    let admin_sig = sign_audit_entry(&entry.signature, &audit_key);
+    let mut combined_sig = entry.signature.clone();
+    combined_sig.extend_from_slice(&admin_sig);
+
     let user_ids_json = serde_json::to_string(&entry.user_ids).unwrap_or_default();
     let _ = sqlx::query(
         "INSERT INTO audit_log (id, event_type, user_ids, timestamp, prev_hash, signature) VALUES ($1, $2, $3, $4, $5, $6)"
@@ -3477,7 +3770,7 @@ async fn recovery_generate(
     .bind(user_ids_json)
     .bind(entry.timestamp)
     .bind(entry.prev_hash.to_vec())
-    .bind(entry.signature.clone())
+    .bind(combined_sig)
     .execute(&state.db)
     .await;
 
@@ -3495,23 +3788,15 @@ async fn recovery_verify(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RecoveryVerifyRequest>,
 ) -> Json<RecoveryVerifyResponse> {
-    // Rate limiting: max 5 attempts per 30 minutes per username (same as login)
+    // Rate limiting: use same exponential backoff as login
     {
-        let mut attempts = state.login_attempts.write().await;
-        let now = now_secs();
-        const RATE_LIMIT_TTL_SECS: i64 = 1800;
-
-        if let Some((count, first_time)) = attempts.get(&req.username) {
-            if now - *first_time < RATE_LIMIT_TTL_SECS && *count >= 5 {
-                return Json(RecoveryVerifyResponse {
-                    success: false,
-                    message: Some("account locked — too many attempts".into()),
-                    ..Default::default()
-                });
-            }
-            if now - *first_time >= RATE_LIMIT_TTL_SECS {
-                attempts.remove(&req.username);
-            }
+        let attempts = state.login_attempts.read().await;
+        if is_locked_out(&req.username, "recovery", &attempts) {
+            return Json(RecoveryVerifyResponse {
+                success: false,
+                message: Some("invalid recovery code".into()),
+                ..Default::default()
+            });
         }
     }
 
@@ -3542,9 +3827,7 @@ async fn recovery_verify(
         Err(_) => {
             // Increment rate limiter on invalid format
             let mut attempts = state.login_attempts.write().await;
-            let now = now_secs();
-            let entry = attempts.entry(req.username.clone()).or_insert((0, now));
-            entry.0 += 1;
+            record_failed_attempt(&mut *attempts, &req.username, "recovery");
 
             return Json(RecoveryVerifyResponse {
                 success: false,
@@ -3622,7 +3905,7 @@ async fn recovery_verify(
             .execute(&state.db)
             .await;
 
-            // Log audit event with elevated risk
+            // Log audit event with elevated risk, signed with admin HMAC
             let mut audit = state.audit_log.write().await;
             let entry = audit.append_signed(
                 common::types::AuditEventType::RecoveryCodeUsed,
@@ -3633,6 +3916,11 @@ async fn recovery_verify(
                 &state.pq_signing_key,
             );
 
+            let audit_key = derive_admin_audit_key();
+            let admin_sig = sign_audit_entry(&entry.signature, &audit_key);
+            let mut combined_sig = entry.signature.clone();
+            combined_sig.extend_from_slice(&admin_sig);
+
             let user_ids_json = serde_json::to_string(&entry.user_ids).unwrap_or_default();
             let _ = sqlx::query(
                 "INSERT INTO audit_log (id, event_type, user_ids, timestamp, prev_hash, signature) VALUES ($1, $2, $3, $4, $5, $6)"
@@ -3642,7 +3930,7 @@ async fn recovery_verify(
             .bind(user_ids_json)
             .bind(entry.timestamp)
             .bind(entry.prev_hash.to_vec())
-            .bind(entry.signature.clone())
+            .bind(combined_sig)
             .execute(&state.db)
             .await;
             drop(audit);
@@ -3667,8 +3955,7 @@ async fn recovery_verify(
         None => {
             // No match — increment rate limiter
             let mut attempts = state.login_attempts.write().await;
-            let entry = attempts.entry(req.username.clone()).or_insert((0, now));
-            entry.0 += 1;
+            record_failed_attempt(&mut *attempts, &req.username, "recovery");
 
             Json(RecoveryVerifyResponse {
                 success: false,
@@ -3744,7 +4031,7 @@ async fn recovery_revoke_all(
 
     let deleted = result.rows_affected();
 
-    // Log audit event
+    // Log audit event with admin HMAC signature
     let mut audit = state.audit_log.write().await;
     let entry = audit.append_signed(
         common::types::AuditEventType::CredentialRevoked,
@@ -3755,6 +4042,11 @@ async fn recovery_revoke_all(
         &state.pq_signing_key,
     );
 
+    let audit_key = derive_admin_audit_key();
+    let admin_sig = sign_audit_entry(&entry.signature, &audit_key);
+    let mut combined_sig = entry.signature.clone();
+    combined_sig.extend_from_slice(&admin_sig);
+
     let user_ids_json = serde_json::to_string(&entry.user_ids).unwrap_or_default();
     let _ = sqlx::query(
         "INSERT INTO audit_log (id, event_type, user_ids, timestamp, prev_hash, signature) VALUES ($1, $2, $3, $4, $5, $6)"
@@ -3764,7 +4056,7 @@ async fn recovery_revoke_all(
     .bind(user_ids_json)
     .bind(entry.timestamp)
     .bind(entry.prev_hash.to_vec())
-    .bind(entry.signature.clone())
+    .bind(combined_sig)
     .execute(&state.db)
     .await;
 

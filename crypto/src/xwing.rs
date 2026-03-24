@@ -12,11 +12,18 @@
 //! **deviates** by using **ML-KEM-1024** instead, to achieve CNSA 2.0
 //! Suite Level 5 compliance (NIST Security Level 5 / AES-256 equivalent).
 //!
-//! The combiner formula remains the same as the X-Wing draft:
+//! # Combiner
+//!
+//! The shared secret is derived via HKDF-SHA512 over the concatenation of
+//! both sub-protocol shared secrets:
 //!
 //! ```text
-//! shared_secret = SHA3-256("X-Wing" || ml_kem_ss || ml_kem_ct || x25519_ss || x25519_pk_client || x25519_pk_server)
+//! shared_secret = HKDF-SHA512(salt="MILNET-XWING-v1", ikm=x25519_ss || mlkem_ss)
 //! ```
+//!
+//! HKDF-SHA512 provides a robust dual-source randomness extraction that
+//! ensures the output is indistinguishable from random even if one of the
+//! two sub-protocols is completely broken.
 //!
 //! # Why ML-KEM-1024 instead of ML-KEM-768?
 //!
@@ -34,7 +41,6 @@ use hkdf::Hkdf;
 use ml_kem::kem::{Decapsulate, Encapsulate};
 use ml_kem::{EncodedSizeUser, KemCore, MlKem1024};
 use sha2::Sha512;
-use sha3::{Digest, Sha3_256};
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -47,10 +53,33 @@ const ML_KEM_CT_LEN: usize = 1568;
 /// Length of the ML-KEM-1024 encapsulation key in bytes.
 const ML_KEM_EK_LEN: usize = 1568;
 
-/// Domain separator for the X-Wing combiner.
-const XWING_LABEL: &[u8] = b"X-Wing";
+/// HKDF salt for the X-Wing combiner.
+const XWING_HKDF_SALT: &[u8] = b"MILNET-XWING-v1";
 
-/// A shared secret produced by the X-Wing combiner (32 bytes, SHA3-256 output).
+/// HKDF info string for shared secret extraction.
+const XWING_HKDF_INFO: &[u8] = b"X-Wing-SharedSecret-v1";
+
+/// Errors that can occur during X-Wing decapsulation.
+#[derive(Debug)]
+pub enum XWingError {
+    /// The ML-KEM-1024 ciphertext was malformed or could not be decoded.
+    MlKemCiphertextInvalid,
+    /// ML-KEM-1024 decapsulation failed (implicit rejection triggered).
+    MlKemDecapsulationFailed,
+}
+
+impl std::fmt::Display for XWingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MlKemCiphertextInvalid => write!(f, "ML-KEM-1024 ciphertext invalid"),
+            Self::MlKemDecapsulationFailed => write!(f, "ML-KEM-1024 decapsulation failed"),
+        }
+    }
+}
+
+impl std::error::Error for XWingError {}
+
+/// A shared secret produced by the X-Wing HKDF-SHA512 combiner (32 bytes).
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct SharedSecret([u8; 32]);
 
@@ -134,7 +163,7 @@ impl XWingPublicKey {
 /// Ciphertext produced by X-Wing encapsulation.
 ///
 /// Contains an ephemeral X25519 public key (32 bytes) and an ML-KEM-1024
-/// ciphertext (1088 bytes).
+/// ciphertext (1568 bytes).
 #[derive(Clone)]
 pub struct Ciphertext {
     /// Ephemeral X25519 public key from the client.
@@ -176,6 +205,15 @@ pub struct XWingKeyPair {
     ml_kem_ek: <MlKem1024 as KemCore>::EncapsulationKey,
 }
 
+/// Generate a new X-Wing key pair (convenience wrapper).
+///
+/// Returns `(public_key, secret_key)` as `(XWingPublicKey, XWingKeyPair)`.
+pub fn xwing_keygen() -> (XWingPublicKey, XWingKeyPair) {
+    let kp = XWingKeyPair::generate();
+    let pk = kp.public_key();
+    (pk, kp)
+}
+
 impl XWingKeyPair {
     /// Generate a new random key pair.
     pub fn generate() -> Self {
@@ -205,15 +243,18 @@ impl XWingKeyPair {
     }
 }
 
-/// Zeroize the secret key material on drop.
+/// Zeroize all secret key material on drop.
+///
+/// Both the X25519 static secret and the ML-KEM-1024 decapsulation key are
+/// overwritten with zeros to prevent post-free disclosure of key material.
 impl Drop for XWingKeyPair {
     fn drop(&mut self) {
-        // Zeroize the X25519 secret key
+        // Zeroize the X25519 secret key by overwriting with the zero scalar.
         self.x25519_secret = StaticSecret::from([0u8; 32]);
-        // Zeroize the ML-KEM decapsulation key (several KB of PQ private key material).
-        // DecapsulationKey does not impl Zeroize, so we zero the underlying bytes via
-        // pointer write. This is critical — leaking the PQ decapsulation key would
-        // allow an attacker to recover all shared secrets.
+        // Zeroize the ML-KEM decapsulation key.  DecapsulationKey does not
+        // implement Zeroize, so we write zeros over the underlying bytes.
+        // This is critical: leaking the PQ decapsulation key would allow an
+        // attacker to recover all past shared secrets.
         unsafe {
             let ptr = &mut self.ml_kem_dk as *mut _ as *mut u8;
             let size = core::mem::size_of::<<MlKem1024 as KemCore>::DecapsulationKey>();
@@ -222,40 +263,46 @@ impl Drop for XWingKeyPair {
     }
 }
 
-/// Core X-Wing combiner function.
+/// Core X-Wing combiner using HKDF-SHA512.
+///
+/// Extracts a 32-byte shared secret from the concatenated X25519 and ML-KEM
+/// shared secrets via:
 ///
 /// ```text
-/// SHA3-256("X-Wing" || ml_kem_ss || ml_kem_ct || x25519_ss || x25519_pk_client || x25519_pk_server)
+/// HKDF-SHA512(salt="MILNET-XWING-v1", ikm=x25519_ss || mlkem_ss)
 /// ```
+///
+/// This ensures the combined secret is indistinguishable from random even if
+/// one of the two sub-protocols is completely broken (dual-PRF property).
 fn combine(
-    ml_kem_ss: &[u8],
-    ml_kem_ct: &[u8],
     x25519_ss: &[u8],
-    x25519_pk_client: &[u8; 32],
-    x25519_pk_server: &[u8; 32],
+    ml_kem_ss: &[u8],
 ) -> SharedSecret {
-    let mut hasher = Sha3_256::new();
-    hasher.update(XWING_LABEL);
-    hasher.update(ml_kem_ss);
-    hasher.update(ml_kem_ct);
-    hasher.update(x25519_ss);
-    hasher.update(x25519_pk_client);
-    hasher.update(x25519_pk_server);
-    let hash = hasher.finalize();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&hash);
-    SharedSecret(out)
+    // Concatenate: x25519_ss || ml_kem_ss
+    let mut ikm = Vec::with_capacity(x25519_ss.len() + ml_kem_ss.len());
+    ikm.extend_from_slice(x25519_ss);
+    ikm.extend_from_slice(ml_kem_ss);
+
+    let hk = Hkdf::<Sha512>::new(Some(XWING_HKDF_SALT), &ikm);
+    let mut okm = [0u8; 32];
+    hk.expand(XWING_HKDF_INFO, &mut okm)
+        .expect("32 bytes is within HKDF-SHA512 output limit");
+
+    // Zeroize the intermediate key material
+    ikm.zeroize();
+
+    SharedSecret(okm)
 }
 
 /// Client-side encapsulation.
 ///
 /// Generates an ephemeral X25519 key pair, computes the DH shared secret
 /// against the server's public key, performs ML-KEM-1024 encapsulation against
-/// the server's encapsulation key, and combines everything through the X-Wing
-/// formula.
+/// the server's encapsulation key, and combines both shared secrets through
+/// HKDF-SHA512.
 ///
 /// Returns `(shared_secret, ciphertext)`. The ciphertext must be sent to
-/// the server so it can decapsulate.
+/// the server so it can decapsulate and derive the same shared secret.
 pub fn xwing_encapsulate(server_pk: &XWingPublicKey) -> (SharedSecret, Ciphertext) {
     let mut rng = rand::rngs::OsRng;
 
@@ -263,12 +310,12 @@ pub fn xwing_encapsulate(server_pk: &XWingPublicKey) -> (SharedSecret, Ciphertex
     let eph_secret = EphemeralSecret::random_from_rng(&mut rng);
     let eph_public = PublicKey::from(&eph_secret);
 
-    // X25519 DH.
+    // X25519 DH against the server's static public key.
     let x25519_ss = eph_secret.diffie_hellman(&server_pk.x25519_pk);
 
     let client_pk = *eph_public.as_bytes();
 
-    // ML-KEM-1024 encapsulation.
+    // ML-KEM-1024 encapsulation against the server's encapsulation key.
     let (ml_kem_ct_arr, ml_kem_ss_arr) = server_pk
         .ml_kem_ek
         .encapsulate(&mut rng)
@@ -277,15 +324,8 @@ pub fn xwing_encapsulate(server_pk: &XWingPublicKey) -> (SharedSecret, Ciphertex
     let ml_kem_ss: &[u8] = ml_kem_ss_arr.as_slice();
     let ml_kem_ct: &[u8] = ml_kem_ct_arr.as_slice();
 
-    let server_x25519_pk = server_pk.x25519_bytes();
-
-    let ss = combine(
-        ml_kem_ss,
-        ml_kem_ct,
-        x25519_ss.as_bytes(),
-        &client_pk,
-        &server_x25519_pk,
-    );
+    // Combine both shared secrets via HKDF-SHA512.
+    let ss = combine(x25519_ss.as_bytes(), ml_kem_ss);
 
     let mut ct_bytes = [0u8; ML_KEM_CT_LEN];
     ct_bytes.copy_from_slice(ml_kem_ct);
@@ -301,30 +341,29 @@ pub fn xwing_encapsulate(server_pk: &XWingPublicKey) -> (SharedSecret, Ciphertex
 /// Server-side decapsulation.
 ///
 /// Uses the server's key pair and the received ciphertext to recompute the
-/// same shared secret the client derived.
-pub fn xwing_decapsulate(server_kp: &XWingKeyPair, ciphertext: &Ciphertext) -> SharedSecret {
+/// same shared secret the client derived during encapsulation.
+///
+/// Returns an error if the ML-KEM-1024 ciphertext is malformed or
+/// decapsulation fails (implicit rejection).
+pub fn xwing_decapsulate(
+    server_kp: &XWingKeyPair,
+    ciphertext: &Ciphertext,
+) -> Result<SharedSecret, XWingError> {
     let client_public = PublicKey::from(ciphertext.x25519_pk_client);
 
     // X25519 DH with the client's ephemeral public key.
     let x25519_ss = server_kp.x25519_secret.diffie_hellman(&client_public);
 
-    let server_pk = server_kp.public_key_bytes();
-
     // ML-KEM-1024 decapsulation.
     let ml_kem_ct = ml_kem::Ciphertext::<MlKem1024>::try_from(ciphertext.ml_kem_ct.as_slice())
-        .expect("ML-KEM-1024 ciphertext should be the correct length");
+        .map_err(|_| XWingError::MlKemCiphertextInvalid)?;
     let ml_kem_ss = server_kp
         .ml_kem_dk
         .decapsulate(&ml_kem_ct)
-        .expect("ML-KEM-1024 decapsulation should not fail");
+        .map_err(|_| XWingError::MlKemDecapsulationFailed)?;
 
-    combine(
-        ml_kem_ss.as_slice(),
-        &ciphertext.ml_kem_ct,
-        x25519_ss.as_bytes(),
-        &ciphertext.x25519_pk_client,
-        &server_pk,
-    )
+    // Combine both shared secrets via HKDF-SHA512.
+    Ok(combine(x25519_ss.as_bytes(), ml_kem_ss.as_slice()))
 }
 
 #[cfg(test)]
@@ -333,9 +372,22 @@ mod tests {
 
     #[test]
     fn combine_is_deterministic() {
-        let ss1 = combine(&[0u8; 32], &[0u8; 64], &[1u8; 32], &[2u8; 32], &[3u8; 32]);
-        let ss2 = combine(&[0u8; 32], &[0u8; 64], &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+        let ss1 = combine(&[1u8; 32], &[0u8; 32]);
+        let ss2 = combine(&[1u8; 32], &[0u8; 32]);
         assert_eq!(ss1.as_bytes(), ss2.as_bytes());
+    }
+
+    #[test]
+    fn combine_differs_on_different_inputs() {
+        let ss1 = combine(&[1u8; 32], &[0u8; 32]);
+        let ss2 = combine(&[0u8; 32], &[1u8; 32]);
+        assert_ne!(ss1.as_bytes(), ss2.as_bytes());
+    }
+
+    #[test]
+    fn keygen_convenience_wrapper() {
+        let (pk, kp) = xwing_keygen();
+        assert_eq!(pk.x25519_bytes(), kp.public_key_bytes());
     }
 
     #[test]
@@ -344,9 +396,28 @@ mod tests {
         let server_pk = server_kp.public_key();
 
         let (client_ss, ct) = xwing_encapsulate(&server_pk);
-        let server_ss = xwing_decapsulate(&server_kp, &ct);
+        let server_ss = xwing_decapsulate(&server_kp, &ct).expect("decapsulation should succeed");
 
         assert_eq!(client_ss.as_bytes(), server_ss.as_bytes());
+    }
+
+    #[test]
+    fn decapsulate_with_wrong_key_produces_different_secret() {
+        let server_kp = XWingKeyPair::generate();
+        let server_pk = server_kp.public_key();
+
+        let (client_ss, ct) = xwing_encapsulate(&server_pk);
+
+        // Decapsulate with a different keypair should yield a different secret
+        // (ML-KEM implicit rejection returns a pseudorandom value).
+        let wrong_kp = XWingKeyPair::generate();
+        let wrong_ss = xwing_decapsulate(&wrong_kp, &ct);
+        // ML-KEM implicit rejection may or may not return an error depending
+        // on the implementation; either way the secret must differ.
+        match wrong_ss {
+            Ok(ss) => assert_ne!(client_ss.as_bytes(), ss.as_bytes()),
+            Err(_) => { /* decapsulation correctly rejected */ }
+        }
     }
 
     #[test]

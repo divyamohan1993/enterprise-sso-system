@@ -178,12 +178,7 @@ resource "google_compute_firewall" "allow_internal" {
 
   allow {
     protocol = "tcp"
-    ports    = ["0-65535"]
-  }
-
-  allow {
-    protocol = "udp"
-    ports    = ["0-65535"]
+    ports    = ["5432", "8080", "9100-9199"]
   }
 
   allow {
@@ -380,7 +375,6 @@ resource "google_compute_instance" "test_runner" {
     github-branch     = var.github_branch
     log-level         = var.log_level
     db-host           = google_sql_database_instance.test_db.private_ip_address
-    db-password       = local.db_password
     db-name           = "milnet_sso"
     db-user           = "milnet"
     auto-destroy      = var.auto_destroy_on_failure ? "true" : "false"

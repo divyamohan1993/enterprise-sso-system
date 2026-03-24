@@ -50,7 +50,7 @@ resource "google_compute_firewall" "sso_allow_ssh" {
     ports    = ["22"]
   }
 
-  source_ranges = ["10.0.0.0/8"]  # Restrict to internal network — configure for your bastion IP
+  source_ranges = ["35.235.240.0/20"] # IAP tunnel IP range only
   target_tags   = ["sso-server"]
 }
 
@@ -131,12 +131,12 @@ resource "google_compute_instance" "sso_demo" {
 # ── Outputs ──────────────────────────────────────────────────
 
 output "sso_system_url" {
-  value       = "http://${google_compute_address.sso_ip.address}"
+  value       = "https://${google_compute_address.sso_ip.address}"
   description = "SSO System URL (map A record: sso-system.dmj.one)"
 }
 
 output "demo_app_url" {
-  value       = "http://${google_compute_address.demo_ip.address}"
+  value       = "https://${google_compute_address.demo_ip.address}"
   description = "Demo App URL (map A record: sso-system-demo.dmj.one)"
 }
 

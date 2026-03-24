@@ -137,23 +137,60 @@ async fn main() {
 }
 
 /// Handle a token verification request with revocation, DPoP, and ratchet checks.
+///
+/// DPoP enforcement is always active.  The `client_dpop_key` field in the
+/// request is used for DPoP channel binding verification.  Audit log entries
+/// are emitted for every verification attempt, recording whether a DPoP proof
+/// key was present.
 async fn handle_verify(
     req: &verifier::VerifyRequest,
     group_key: &PublicKeyPackage,
     pq_key: &crypto::pq_sign::PqVerifyingKey,
     rl: &Arc<Mutex<RevocationList>>,
 ) -> VerifyResponse {
+    // Extract DPoP key from request — always pass to verify_token_full for
+    // mandatory DPoP enforcement.
+    let dpop_key = req.client_dpop_key.as_deref();
+
+    // Audit: log DPoP presence before any crypto work.
+    if dpop_key.is_some() {
+        tracing::info!(
+            dpop_present = true,
+            dpop_key_len = dpop_key.map(|k| k.len()),
+            "DPoP client key present in verification request"
+        );
+    } else {
+        tracing::warn!(
+            dpop_present = false,
+            "DPoP client key MISSING from verification request — \
+             token will be rejected unless tier-exempt or MILNET_REQUIRE_DPOP=false"
+        );
+    }
+
     match postcard::from_bytes::<common::types::Token>(&req.token_bytes) {
         Ok(token) => {
+            // Audit: log token tier for DPoP exemption visibility.
+            tracing::info!(
+                token_id = ?token.claims.token_id,
+                tier = token.claims.tier,
+                has_dpop_hash = token.claims.dpop_hash != [0u8; 32],
+                "verifying token"
+            );
+
             // 1+2. Revocation check (fail-fast) + full signature + DPoP verification
             //       Uses verify_token_full which combines revocation, signatures,
-            //       and DPoP key binding in a single pass (H3/H5 fixes).
+            //       and mandatory DPoP key binding in a single pass.
             {
                 let revocation_list = rl.lock().await;
-                let dpop_key = req.client_dpop_key.as_deref();
                 if let Err(e) = verifier::verify_token_full(
                     &token, group_key, pq_key, &revocation_list, dpop_key,
                 ) {
+                    tracing::warn!(
+                        token_id = ?token.claims.token_id,
+                        dpop_present = dpop_key.is_some(),
+                        error = %e,
+                        "token verification FAILED"
+                    );
                     return VerifyResponse {
                         valid: false,
                         claims: None,
@@ -171,6 +208,11 @@ async fn handle_verify(
                     &ratchet.ratchet_key,
                     ratchet.current_epoch,
                 ) {
+                    tracing::warn!(
+                        token_id = ?token.claims.token_id,
+                        error = %e,
+                        "ratchet verification FAILED"
+                    );
                     return VerifyResponse {
                         valid: false,
                         claims: None,
@@ -180,17 +222,30 @@ async fn handle_verify(
             }
 
             // All checks passed — return valid claims
+            tracing::info!(
+                token_id = ?token.claims.token_id,
+                tier = token.claims.tier,
+                dpop_bound = dpop_key.is_some(),
+                "token verification PASSED"
+            );
             VerifyResponse {
                 valid: true,
                 claims: Some(token.claims.clone()),
                 error: None,
             }
         }
-        Err(e) => VerifyResponse {
-            valid: false,
-            claims: None,
-            error: Some(format!("token deserialization error: {e}")),
-        },
+        Err(e) => {
+            tracing::warn!(
+                dpop_present = dpop_key.is_some(),
+                error = %e,
+                "token deserialization FAILED"
+            );
+            VerifyResponse {
+                valid: false,
+                claims: None,
+                error: Some(format!("token deserialization error: {e}")),
+            }
+        }
     }
 }
 

@@ -12,12 +12,18 @@ fn test_secret() -> [u8; 64] {
     s
 }
 
-fn test_entropy_a() -> [u8; 32] {
-    [0xAA; 32]
+/// Generate entropy with sufficient quality (>= 4 distinct byte values).
+fn good_entropy() -> [u8; 32] {
+    let mut e = [0u8; 32];
+    getrandom::getrandom(&mut e).unwrap();
+    e
 }
 
-fn test_entropy_b() -> [u8; 32] {
-    [0xBB; 32]
+/// Generate a unique server nonce.
+fn fresh_nonce() -> [u8; 32] {
+    let mut n = [0u8; 32];
+    getrandom::getrandom(&mut n).unwrap();
+    n
 }
 
 // ── Chain tests ──────────────────────────────────────────────────────
@@ -31,9 +37,9 @@ fn chain_new_starts_at_epoch_0() {
 #[test]
 fn chain_advance_increments_epoch() {
     let mut chain = RatchetChain::new(&test_secret());
-    chain.advance(&test_entropy_a(), &test_entropy_b());
+    chain.advance(&good_entropy(), &good_entropy(), &fresh_nonce());
     assert_eq!(chain.epoch(), 1);
-    chain.advance(&test_entropy_a(), &test_entropy_b());
+    chain.advance(&good_entropy(), &good_entropy(), &fresh_nonce());
     assert_eq!(chain.epoch(), 2);
 }
 
@@ -52,7 +58,7 @@ fn chain_different_epochs_different_tags() {
     let mut chain = RatchetChain::new(&test_secret());
     let claims = b"test-claims-data";
     let tag_0 = chain.generate_tag(claims);
-    chain.advance(&test_entropy_a(), &test_entropy_b());
+    chain.advance(&good_entropy(), &good_entropy(), &fresh_nonce());
     let tag_1 = chain.generate_tag(claims);
     assert_ne!(tag_0, tag_1);
 }
@@ -64,7 +70,7 @@ fn chain_old_key_erased() {
     let mut chain = RatchetChain::new(&test_secret());
     let claims = b"test-claims-data";
     let tag_epoch0 = chain.generate_tag(claims);
-    chain.advance(&test_entropy_a(), &test_entropy_b());
+    chain.advance(&good_entropy(), &good_entropy(), &fresh_nonce());
     // A fresh chain at epoch 0 would produce the same tag, but our
     // advanced chain at epoch 1 cannot.
     let tag_after_advance = chain.generate_tag(claims);
@@ -84,7 +90,7 @@ fn chain_reject_wrong_epoch() {
     let chain = RatchetChain::new(&test_secret());
     let claims = b"test-claims-data";
     let tag = chain.generate_tag(claims);
-    // Epoch 10 is way outside the ±1 window
+    // Epoch 10 is way outside the +-3 window
     assert!(!chain.verify_tag(claims, &tag, 10));
 }
 
@@ -98,7 +104,7 @@ fn session_manager_create_and_advance() {
     assert_eq!(epoch, 0);
 
     let new_epoch = mgr
-        .advance_session(&sid, &test_entropy_a(), &test_entropy_b())
+        .advance_session(&sid, &good_entropy(), &good_entropy(), &fresh_nonce())
         .unwrap();
     assert_eq!(new_epoch, 1);
 
@@ -117,12 +123,12 @@ fn session_manager_expired_after_2880_epochs() {
 
     // Advance 2880 times to reach the 8-hour limit (at 10s/epoch)
     for _ in 0..2880 {
-        mgr.advance_session(&sid, &test_entropy_a(), &test_entropy_b())
+        mgr.advance_session(&sid, &good_entropy(), &good_entropy(), &fresh_nonce())
             .unwrap();
     }
 
     // The 2881st advance should fail
-    let result = mgr.advance_session(&sid, &test_entropy_a(), &test_entropy_b());
+    let result = mgr.advance_session(&sid, &good_entropy(), &good_entropy(), &fresh_nonce());
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("expired"));
 }
@@ -169,15 +175,22 @@ fn request_advance_roundtrip() {
             session_id: sid,
             client_entropy: [0xCC; 32],
             server_entropy: [0xDD; 32],
+            server_nonce: [0xEE; 32],
         },
     };
     let bytes = postcard::to_allocvec(&req).unwrap();
     let decoded: RatchetRequest = postcard::from_bytes(&bytes).unwrap();
     match decoded.action {
-        RatchetAction::Advance { session_id, client_entropy, server_entropy } => {
+        RatchetAction::Advance {
+            session_id,
+            client_entropy,
+            server_entropy,
+            server_nonce,
+        } => {
             assert_eq!(session_id, sid);
             assert_eq!(client_entropy, [0xCC; 32]);
             assert_eq!(server_entropy, [0xDD; 32]);
+            assert_eq!(server_nonce, [0xEE; 32]);
         }
         _ => panic!("expected Advance"),
     }

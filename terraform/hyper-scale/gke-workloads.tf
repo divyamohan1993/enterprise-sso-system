@@ -834,14 +834,14 @@ resource "kubernetes_resource_quota" "milnet_sso" {
 
   spec {
     hard = {
-      "requests.cpu"    = "120"
-      "requests.memory" = "256Gi"
-      "limits.cpu"      = "200"
-      "limits.memory"   = "512Gi"
-      "pods"            = "500"
-      "services"        = "50"
-      "secrets"         = "100"
-      "configmaps"      = "100"
+      "requests.cpu"           = "120"
+      "requests.memory"        = "256Gi"
+      "limits.cpu"             = "200"
+      "limits.memory"          = "512Gi"
+      "pods"                   = "500"
+      "services"               = "50"
+      "secrets"                = "100"
+      "configmaps"             = "100"
       "persistentvolumeclaims" = "50"
     }
   }

@@ -38,8 +38,18 @@ async fn main() {
     // Pre-seed OAuth clients for known applications
     let mut oauth_clients = sso_protocol::clients::ClientRegistry::new();
 
-    // Register demo app as OAuth client only in demo mode
-    if std::env::var("MILNET_DEMO_MODE").is_ok() {
+    // Register demo app as OAuth client only in demo mode.
+    // SECURITY: If MILNET_PRODUCTION is set, refuse demo mode entirely.
+    let is_demo = std::env::var("MILNET_DEMO_MODE").is_ok();
+    let is_production = std::env::var("MILNET_PRODUCTION").is_ok();
+    if is_production && is_demo {
+        panic!(
+            "FATAL: MILNET_PRODUCTION and MILNET_DEMO_MODE are both set. \
+             Demo mode with hardcoded credentials is forbidden in production. \
+             Unset MILNET_DEMO_MODE to proceed."
+        );
+    }
+    if is_demo && !is_production {
         let demo_redirect = std::env::var("DEMO_REDIRECT_URI")
             .unwrap_or_else(|_| "https://sso-system-demo.dmj.one/callback".to_string());
         oauth_clients.register_with_id(
@@ -151,6 +161,8 @@ async fn main() {
         access_tokens: RwLock::new(std::collections::HashMap::new()),
         session_activity: RwLock::new(std::collections::HashMap::new()),
         login_attempts: RwLock::new(std::collections::HashMap::new()),
+        opaque_tokens: RwLock::new(std::collections::HashMap::new()),
+        used_csrf_tokens: RwLock::new(std::collections::HashSet::new()),
         pq_signing_key: pq_signing_key,
         session_tracker: Arc::new(common::session_limits::SessionTracker::new(
             common::config::SecurityConfig::default().max_concurrent_sessions_per_user,
@@ -168,6 +180,9 @@ async fn main() {
             Ok(())
         },
     );
+
+    // Start background cleanup task for bounded HashMap growth
+    admin::routes::spawn_ttl_eviction_task(state.clone());
 
     let app = api_router(state);
 

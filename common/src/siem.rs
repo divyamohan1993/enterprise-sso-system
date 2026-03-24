@@ -319,23 +319,171 @@ impl SecurityEvent {
         event.emit();
     }
 
+    /// Emit a DPoP proof missing event.
+    pub fn dpop_missing(source_ip: Option<String>) {
+        let event = SecurityEvent {
+            timestamp: Self::now_iso8601(),
+            category: "authentication",
+            action: "dpop_missing",
+            severity: Severity::Medium,
+            outcome: "failure",
+            user_id: None,
+            source_ip,
+            detail: Some("DPoP proof not provided for token-bound request".into()),
+        };
+        event.emit();
+    }
+
+    /// Emit a capacity warning event for maps/lists approaching limits.
+    pub fn capacity_warning(source_module: &str, current: usize, max: usize) {
+        let event = SecurityEvent {
+            timestamp: Self::now_iso8601(),
+            category: "availability",
+            action: "capacity_warning",
+            severity: Severity::Warning,
+            outcome: "failure",
+            user_id: None,
+            source_ip: None,
+            detail: Some(format!(
+                "module={} current={} max={} pct={}%",
+                source_module, current, max,
+                current * 100 / max.max(1)
+            )),
+        };
+        event.emit();
+    }
+
+    /// Emit an invalid ceremony approval signature event.
+    pub fn ceremony_approval_invalid(user_id: Option<Uuid>, detail: &str) {
+        let event = SecurityEvent {
+            timestamp: Self::now_iso8601(),
+            category: "authorization",
+            action: "ceremony_approval_invalid",
+            severity: Severity::High,
+            outcome: "failure",
+            user_id,
+            source_ip: None,
+            detail: Some(detail.to_string()),
+        };
+        event.emit();
+    }
+
+    /// Emit a developer mode toggle blocked event (production protection).
+    pub fn developer_mode_blocked() {
+        let event = SecurityEvent {
+            timestamp: Self::now_iso8601(),
+            category: "configuration",
+            action: "developer_mode_blocked",
+            severity: Severity::Critical,
+            outcome: "failure",
+            user_id: None,
+            source_ip: None,
+            detail: Some("runtime developer mode toggle blocked in production".into()),
+        };
+        event.emit();
+    }
+
+    /// Emit an entropy quality check failure event.
+    pub fn entropy_quality_failure(detail: &str) {
+        let event = SecurityEvent {
+            timestamp: Self::now_iso8601(),
+            category: "integrity",
+            action: "entropy_quality_failure",
+            severity: Severity::Critical,
+            outcome: "failure",
+            user_id: None,
+            source_ip: None,
+            detail: Some(detail.to_string()),
+        };
+        event.emit();
+    }
+
+    /// Emit a TLS required violation event (non-TLS in production).
+    pub fn tls_required_violation(source_ip: Option<String>) {
+        let event = SecurityEvent {
+            timestamp: Self::now_iso8601(),
+            category: "access_control",
+            action: "tls_required_violation",
+            severity: Severity::High,
+            outcome: "failure",
+            user_id: None,
+            source_ip,
+            detail: Some("non-TLS connection attempted in production environment".into()),
+        };
+        event.emit();
+    }
+
+    /// Emit a mutex poisoning recovery event.
+    pub fn mutex_poisoning(detail: &str) {
+        let event = SecurityEvent {
+            timestamp: Self::now_iso8601(),
+            category: "integrity",
+            action: "mutex_poisoning",
+            severity: Severity::Elevated,
+            outcome: "failure",
+            user_id: None,
+            source_ip: None,
+            detail: Some(detail.to_string()),
+        };
+        event.emit();
+    }
+
+    /// Serialize this event to structured JSON suitable for SIEM ingestion.
+    ///
+    /// Output format:
+    /// ```json
+    /// {
+    ///   "event_type": "login",
+    ///   "timestamp": "1711234567Z",
+    ///   "severity": "MEDIUM",
+    ///   "source_module": "authentication",
+    ///   "details": { "action": "login", "outcome": "failure", ... }
+    /// }
+    /// ```
+    pub fn to_json(&self) -> String {
+        let severity_label = match self.severity {
+            Severity::Critical => "CRITICAL",
+            Severity::Elevated | Severity::High => "HIGH",
+            Severity::Warning | Severity::Medium => "MEDIUM",
+            Severity::Notice | Severity::Low => "LOW",
+            Severity::Info => "INFO",
+        };
+
+        let details = serde_json::json!({
+            "action": self.action,
+            "outcome": self.outcome,
+            "user_id": self.user_id,
+            "source_ip": self.source_ip,
+            "detail": self.detail,
+        });
+
+        let envelope = serde_json::json!({
+            "event_type": self.action,
+            "timestamp": self.timestamp,
+            "severity": severity_label,
+            "source_module": self.category,
+            "details": details,
+        });
+
+        serde_json::to_string(&envelope).unwrap_or_else(|_| "{}".to_string())
+    }
+
     /// Emit this event via structured logging (JSON to tracing) and broadcast
     /// it to the live SIEM event bus for SSE consumers.
     fn emit(&self) {
-        if let Ok(json) = serde_json::to_string(self) {
-            tracing::info!(target: "siem", "{}", json);
+        let json = self.to_json();
+        tracing::info!(target: "siem", "{}", json);
 
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
 
-            broadcast_event(&SiemEvent {
-                timestamp,
-                severity: self.severity as u8,
-                event_type: self.action.to_string(),
-                json,
-            });
-        }
+        broadcast_event(&SiemEvent {
+            timestamp,
+            severity: self.severity as u8,
+            event_type: self.action.to_string(),
+            json,
+        });
     }
 }

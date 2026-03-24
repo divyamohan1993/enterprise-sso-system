@@ -1,5 +1,6 @@
-#![forbid(unsafe_code)]
 //! ratchet: Ratchet Session Manager service entry point.
+
+#![allow(unsafe_code)]
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -13,6 +14,13 @@ async fn main() {
     // Platform integrity: vTPM check, process hardening, self-attestation, monitor
     let (_platform_report, _monitor_handle, _monitor) =
         common::startup_checks::run_platform_checks(crypto::memguard::harden_process);
+
+    // Verify mlock is available by attempting to lock and unlock a test page
+    verify_mlock_available();
+
+    // Set PR_SET_DUMPABLE=0 as belt-and-suspenders (harden_process does this too,
+    // but we ensure it explicitly for this process).
+    set_pr_dumpable();
 
     tracing::info!("Ratchet Session Manager starting");
 
@@ -49,6 +57,43 @@ async fn main() {
     }
 }
 
+/// Verify that mlock is available on this system. In production mode, panic
+/// if mlock fails — chain keys must not be swappable to disk.
+fn verify_mlock_available() {
+    let test_page = [0u8; 4096];
+    let ptr = test_page.as_ptr();
+    let ok = unsafe { libc::mlock(ptr as *const libc::c_void, 4096) == 0 };
+    if ok {
+        unsafe {
+            libc::munlock(ptr as *const libc::c_void, 4096);
+        }
+        tracing::info!("mlock availability verified");
+    } else {
+        if common::sealed_keys::is_production() {
+            panic!(
+                "FATAL: mlock not available in production mode. \
+                 Ratchet chain keys require memory locking. \
+                 Ensure RLIMIT_MEMLOCK is sufficient."
+            );
+        }
+        tracing::warn!(
+            "mlock not available — chain keys may be swappable to disk. \
+             This is acceptable in development but FATAL in production."
+        );
+    }
+}
+
+/// Set PR_SET_DUMPABLE=0 to prevent core dumps from leaking chain keys.
+/// harden_process() already does this, but we call it explicitly as defense-in-depth.
+fn set_pr_dumpable() {
+    let ret = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) };
+    if ret != 0 {
+        tracing::warn!("prctl(PR_SET_DUMPABLE, 0) failed — core dumps may leak key material");
+    } else {
+        tracing::info!("PR_SET_DUMPABLE=0 confirmed for ratchet process");
+    }
+}
+
 async fn handle_request(
     manager: &Arc<RwLock<ratchet::manager::SessionManager>>,
     request: RatchetRequest,
@@ -74,9 +119,15 @@ async fn handle_request(
                 error: None,
             }
         }
-        RatchetAction::Advance { session_id, client_entropy, server_entropy } => {
+        RatchetAction::Advance {
+            session_id,
+            client_entropy,
+            server_entropy,
+            server_nonce,
+        } => {
             let mgr = manager.write().await;
-            match mgr.advance_session(&session_id, &client_entropy, &server_entropy) {
+            match mgr.advance_session(&session_id, &client_entropy, &server_entropy, &server_nonce)
+            {
                 Ok(epoch) => RatchetResponse {
                     success: true,
                     epoch: Some(epoch),

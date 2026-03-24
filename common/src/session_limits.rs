@@ -25,7 +25,16 @@ impl SessionTracker {
     /// Try to register a new session. Returns Ok(()) if within limits,
     /// Err with message if the user has too many active sessions.
     pub fn register_session(&self, user_id: Uuid, session_id: Uuid, now: i64) -> Result<(), String> {
-        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        let mut active = self.active.lock().unwrap_or_else(|e| {
+            tracing::error!(
+                target: "siem",
+                category = "security",
+                action = "mutex_poisoning_recovered",
+                "SessionTracker mutex poisoned — recovering with inner data. \
+                 A thread panicked while holding this lock."
+            );
+            e.into_inner()
+        });
         let sessions = active.entry(user_id).or_default();
 
         // Evict sessions older than 8 hours (max session lifetime)
@@ -58,7 +67,16 @@ impl SessionTracker {
 
     /// Remove a session (on logout or expiry).
     pub fn remove_session(&self, user_id: &Uuid, session_id: &Uuid) {
-        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        let mut active = self.active.lock().unwrap_or_else(|e| {
+            tracing::error!(
+                target: "siem",
+                category = "security",
+                action = "mutex_poisoning_recovered",
+                "SessionTracker mutex poisoned — recovering with inner data. \
+                 A thread panicked while holding this lock."
+            );
+            e.into_inner()
+        });
         if let Some(sessions) = active.get_mut(user_id) {
             sessions.retain(|(sid, _)| sid != session_id);
             if sessions.is_empty() {
@@ -69,14 +87,32 @@ impl SessionTracker {
 
     /// Get number of active sessions for a user.
     pub fn active_count(&self, user_id: &Uuid) -> usize {
-        let active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        let active = self.active.lock().unwrap_or_else(|e| {
+            tracing::error!(
+                target: "siem",
+                category = "security",
+                action = "mutex_poisoning_recovered",
+                "SessionTracker mutex poisoned — recovering with inner data. \
+                 A thread panicked while holding this lock."
+            );
+            e.into_inner()
+        });
         active.get(user_id).map_or(0, |s| s.len())
     }
 
     /// Update the last-activity timestamp for a session.
     /// Returns true if the session was found and updated, false otherwise.
     pub fn touch_session(&self, user_id: &Uuid, session_id: &Uuid, now: i64) -> bool {
-        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        let mut active = self.active.lock().unwrap_or_else(|e| {
+            tracing::error!(
+                target: "siem",
+                category = "security",
+                action = "mutex_poisoning_recovered",
+                "SessionTracker mutex poisoned — recovering with inner data. \
+                 A thread panicked while holding this lock."
+            );
+            e.into_inner()
+        });
         if let Some(sessions) = active.get_mut(user_id) {
             for (sid, ts) in sessions.iter_mut() {
                 if sid == session_id {
@@ -91,7 +127,16 @@ impl SessionTracker {
     /// Remove sessions that have been inactive for longer than `timeout_secs`.
     /// Returns the number of sessions removed.
     pub fn cleanup_inactive(&self, now: i64, timeout_secs: i64) -> usize {
-        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        let mut active = self.active.lock().unwrap_or_else(|e| {
+            tracing::error!(
+                target: "siem",
+                category = "security",
+                action = "mutex_poisoning_recovered",
+                "SessionTracker mutex poisoned — recovering with inner data. \
+                 A thread panicked while holding this lock."
+            );
+            e.into_inner()
+        });
         let mut removed = 0usize;
         active.retain(|_user_id, sessions| {
             let before = sessions.len();

@@ -205,9 +205,24 @@ pub struct PendingGoogleAuth {
 
 /// In-memory store for pending Google OAuth flows keyed by a random state token.
 /// Entries expire after 10 minutes.
+///
+/// **Production Note:** This in-memory store is suitable for single-instance
+/// deployments only. In production with horizontal scaling, replace this with a
+/// distributed store (Redis or PostgreSQL) to ensure state tokens are accessible
+/// across all instances and survive process restarts.
 pub struct PendingGoogleStore {
     map: HashMap<String, PendingGoogleAuth>,
 }
+
+/// Maximum number of pending OAuth entries before the store rejects new inserts.
+/// Protects against state-flooding denial-of-service attacks.
+const MAX_PENDING_ENTRIES: usize = 10_000;
+
+/// Capacity threshold (80%) at which a SIEM warning is emitted.
+const CAPACITY_WARNING_THRESHOLD: usize = MAX_PENDING_ENTRIES * 80 / 100;
+
+/// Entry TTL in seconds (10 minutes).
+const PENDING_TTL_SECS: i64 = 600;
 
 impl PendingGoogleStore {
     pub fn new() -> Self {
@@ -216,29 +231,47 @@ impl PendingGoogleStore {
         }
     }
 
-    pub fn insert(&mut self, state: String, pending: PendingGoogleAuth) {
-        const MAX_PENDING_ENTRIES: usize = 10_000;
-
-        // Capacity bound: reject new entries if at limit (after cleanup)
-        if self.map.len() >= MAX_PENDING_ENTRIES {
+    /// Insert a new pending auth entry. Returns `Err` if the store is at
+    /// capacity (10,000 entries) even after evicting expired entries.
+    pub fn insert(&mut self, state: String, pending: PendingGoogleAuth) -> Result<(), &'static str> {
+        // Proactive cleanup before capacity check
+        if self.map.len() >= CAPACITY_WARNING_THRESHOLD {
             self.cleanup_expired(pending.created_at);
         }
-        if self.map.len() >= MAX_PENDING_ENTRIES {
-            tracing::warn!("PendingGoogleStore at capacity ({MAX_PENDING_ENTRIES}), dropping oldest");
-            // Evict oldest entry
-            if let Some(oldest_key) = self.map.iter().min_by_key(|(_, v)| v.created_at).map(|(k, _)| k.clone()) {
-                self.map.remove(&oldest_key);
-            }
+
+        // Emit SIEM capacity warning at 80% threshold
+        if self.map.len() >= CAPACITY_WARNING_THRESHOLD {
+            tracing::warn!(
+                target: "siem",
+                event_type = "capacity_warning",
+                current = self.map.len(),
+                max = MAX_PENDING_ENTRIES,
+                "PendingGoogleStore at {}% capacity ({}/{})",
+                self.map.len() * 100 / MAX_PENDING_ENTRIES,
+                self.map.len(),
+                MAX_PENDING_ENTRIES
+            );
         }
+
+        // Hard capacity limit: reject if full after cleanup
+        if self.map.len() >= MAX_PENDING_ENTRIES {
+            tracing::error!(
+                target: "siem",
+                event_type = "capacity_warning",
+                "PendingGoogleStore at capacity ({MAX_PENDING_ENTRIES}), rejecting new entry"
+            );
+            return Err("pending OAuth store at capacity — try again later");
+        }
+
         self.map.insert(state, pending);
+        Ok(())
     }
 
     /// Consume and return the pending auth entry if it exists and has not expired.
     /// The 10-minute TTL is measured from `created_at`.
     pub fn consume(&mut self, state: &str, now: i64) -> Option<PendingGoogleAuth> {
         if let Some(entry) = self.map.remove(state) {
-            const TTL_SECS: i64 = 600; // 10 minutes
-            if now - entry.created_at <= TTL_SECS {
+            if now - entry.created_at <= PENDING_TTL_SECS {
                 return Some(entry);
             }
         }
@@ -247,8 +280,17 @@ impl PendingGoogleStore {
 
     /// Remove all entries older than 10 minutes.
     pub fn cleanup_expired(&mut self, now: i64) {
-        const TTL_SECS: i64 = 600;
-        self.map.retain(|_, v| now - v.created_at <= TTL_SECS);
+        self.map.retain(|_, v| now - v.created_at <= PENDING_TTL_SECS);
+    }
+
+    /// Current number of pending entries.
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Whether the store is empty.
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
     }
 }
 
@@ -536,7 +578,7 @@ mod tests {
                 milnet_code_challenge: None,
                 created_at: now,
             },
-        );
+        ).unwrap();
 
         // Consume within TTL
         let entry = store.consume("state1", now + 300);
@@ -562,7 +604,7 @@ mod tests {
                 milnet_code_challenge: None,
                 created_at: now,
             },
-        );
+        ).unwrap();
 
         // Consume after TTL expires
         let entry = store.consume("state1", now + 601);
@@ -583,7 +625,7 @@ mod tests {
                 milnet_code_challenge: None,
                 created_at: 100,
             },
-        );
+        ).unwrap();
         store.insert(
             "new".into(),
             PendingGoogleAuth {
@@ -595,10 +637,45 @@ mod tests {
                 milnet_code_challenge: None,
                 created_at: 1000,
             },
-        );
+        ).unwrap();
         store.cleanup_expired(1100);
         assert!(store.map.get("old").is_none());
         assert!(store.map.get("new").is_some());
+    }
+
+    #[test]
+    fn test_pending_store_capacity_limit() {
+        let mut store = PendingGoogleStore::new();
+        // Fill to capacity
+        for i in 0..10_000 {
+            store.insert(
+                format!("state-{i}"),
+                PendingGoogleAuth {
+                    milnet_client_id: "c".into(),
+                    milnet_redirect_uri: "r".into(),
+                    milnet_scope: "s".into(),
+                    milnet_state: "st".into(),
+                    milnet_nonce: None,
+                    milnet_code_challenge: None,
+                    created_at: 1000,
+                },
+            ).unwrap();
+        }
+        assert_eq!(store.len(), 10_000);
+        // Next insert should fail
+        let result = store.insert(
+            "overflow".into(),
+            PendingGoogleAuth {
+                milnet_client_id: "c".into(),
+                milnet_redirect_uri: "r".into(),
+                milnet_scope: "s".into(),
+                milnet_state: "st".into(),
+                milnet_nonce: None,
+                milnet_code_challenge: None,
+                created_at: 1000,
+            },
+        );
+        assert!(result.is_err());
     }
 
     /// Test that the JWT header parsing extracts the `kid` field.

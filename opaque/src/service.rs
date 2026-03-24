@@ -8,7 +8,7 @@
 //! The orchestrator does NOT hold or generate any receipt signing key; it
 //! forwards receipts from this service to the TSS without re-signing.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH, Instant};
 
 use common::types::{ModuleId, Receipt};
 use crypto::entropy::generate_nonce;
@@ -80,15 +80,34 @@ fn load_shard_hmac_key() -> [u8; 64] {
 /// Default listen address for the OPAQUE service.
 const DEFAULT_ADDR: &str = "127.0.0.1:9005";
 
+/// Maximum allowed username length in bytes.
+/// Prevents oversized inputs from reaching the OPAQUE protocol layer.
+const MAX_USERNAME_BYTES: usize = 255;
+
+/// Minimum time (in microseconds) for the login start path to complete.
+/// Ensures consistent response timing whether the user exists or not,
+/// preventing timing-based username enumeration.
+const LOGIN_LOOKUP_FLOOR_US: u128 = 5_000; // 5ms
+
 /// Handle a LoginStart request: perform the server side of OPAQUE login step 1.
 ///
 /// Returns a CredentialResponse and a ServerLogin state that must be kept
 /// for the LoginFinish step.
+///
+/// Timing: This function enforces a minimum execution time of 5ms to prevent
+/// timing side-channels that could reveal whether a username exists.
 pub fn handle_login_start(
     store: &CredentialStore,
     username: &str,
     credential_request_bytes: &[u8],
 ) -> Result<(Vec<u8>, ServerLogin<OpaqueCs>), String> {
+    // Validate username length before passing to OPAQUE
+    if username.len() > MAX_USERNAME_BYTES {
+        return Err("username exceeds maximum length".to_string());
+    }
+
+    let start = Instant::now();
+
     let credential_request = CredentialRequest::<OpaqueCs>::deserialize(credential_request_bytes)
         .map_err(|e| format!("deserialize credential request: {e}"))?;
 
@@ -110,6 +129,13 @@ pub fn handle_login_start(
     .map_err(|e| format!("server login start: {e}"))?;
 
     let response_bytes = server_login_start.message.serialize().to_vec();
+
+    // Pad execution time to the constant-time floor to prevent timing side-channels.
+    let elapsed_us = start.elapsed().as_micros();
+    if elapsed_us < LOGIN_LOOKUP_FLOOR_US {
+        let remaining = LOGIN_LOOKUP_FLOOR_US - elapsed_us;
+        std::thread::sleep(std::time::Duration::from_micros(remaining as u64));
+    }
 
     Ok((response_bytes, server_login_start.state))
 }

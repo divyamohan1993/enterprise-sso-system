@@ -57,8 +57,8 @@ locals {
     environment = var.environment
     managed-by  = "terraform"
   }
-  ar_repo       = "${var.region}-docker.pkg.dev/${var.project_id}/milnet-sso"
-  image_tag     = var.container_image_tag
+  ar_repo   = "${var.region}-docker.pkg.dev/${var.project_id}/milnet-sso"
+  image_tag = var.container_image_tag
 }
 
 # ============================================================================
@@ -162,8 +162,10 @@ resource "google_service_networking_connection" "private_vpc_connection" {
 # ============================================================================
 
 resource "google_container_cluster" "autopilot" {
-  name     = local.cluster_name
-  location = var.zone # Single zone — saves 3x vs regional
+  name = local.cluster_name
+  # Single zone saves ~66% vs regional (3x fewer node replicas).
+  # For HA, change to var.region — but cost increases ~3x.
+  location = var.zone
 
   enable_autopilot = true
 
@@ -183,8 +185,8 @@ resource "google_container_cluster" "autopilot" {
 
   master_authorized_networks_config {
     cidr_blocks {
-      cidr_block   = "0.0.0.0/0"
-      display_name = "All (restrict in production)"
+      cidr_block   = var.subnet_cidr
+      display_name = "VPC subnet only"
     }
   }
 
@@ -198,6 +200,12 @@ resource "google_container_cluster" "autopilot" {
   }
 
   deletion_protection = false
+
+  # etcd encryption at the application layer using Cloud KMS
+  database_encryption {
+    state    = "ENCRYPTED"
+    key_name = google_kms_crypto_key.data_encryption.id
+  }
 
   resource_labels = local.labels
 
@@ -215,7 +223,7 @@ resource "google_sql_database_instance" "postgres" {
   name                = local.db_instance
   database_version    = "POSTGRES_16"
   region              = var.region
-  deletion_protection = false
+  deletion_protection = true
 
   settings {
     tier              = var.db_tier # db-f1-micro for <1000/day

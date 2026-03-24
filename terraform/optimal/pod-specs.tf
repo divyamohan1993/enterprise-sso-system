@@ -13,11 +13,11 @@ resource "kubernetes_namespace" "milnet_sso" {
     name = "milnet-sso"
 
     labels = {
-      app                                    = "milnet-sso"
-      environment                            = var.environment
-      "pod-security.kubernetes.io/enforce"    = "restricted"
-      "pod-security.kubernetes.io/audit"      = "restricted"
-      "pod-security.kubernetes.io/warn"       = "restricted"
+      app                                  = "milnet-sso"
+      environment                          = var.environment
+      "pod-security.kubernetes.io/enforce" = "restricted"
+      "pod-security.kubernetes.io/audit"   = "restricted"
+      "pod-security.kubernetes.io/warn"    = "restricted"
     }
   }
 
@@ -46,36 +46,36 @@ resource "kubernetes_config_map" "sso_config" {
   }
 
   data = {
-    RUST_LOG              = "info"
-    ENVIRONMENT           = var.environment
-    ADMIN_PORT            = "8080"
-    GATEWAY_PORT          = "8443"
-    ORCHESTRATOR_PORT     = "9000"
-    OPAQUE_PORT           = "9001"
-    TSS_PORT              = "9002"
-    VERIFIER_PORT         = "9003"
-    RATCHET_PORT          = "9004"
-    RISK_PORT             = "9005"
-    KT_PORT               = "9006"
-    AUDIT_PORT            = "9007"
-    DB_HOST               = google_sql_database_instance.postgres.private_ip_address
-    DB_PORT               = "5432"
-    DB_NAME               = var.db_name
-    DB_USER               = var.db_user
-    KMS_KEY_RING          = google_kms_key_ring.sso.id
-    KMS_SIGNING_KEY       = google_kms_crypto_key.token_signing.id
-    KMS_ENCRYPTION_KEY    = google_kms_crypto_key.data_encryption.id
-    KMS_TSS_KEY           = google_kms_crypto_key.tss_shares.id
-    AUDIT_BFT_REPLICAS    = tostring(var.audit_bft_replicas)
+    RUST_LOG           = "info"
+    ENVIRONMENT        = var.environment
+    ADMIN_PORT         = "8080"
+    GATEWAY_PORT       = "8443"
+    ORCHESTRATOR_PORT  = "9000"
+    OPAQUE_PORT        = "9001"
+    TSS_PORT           = "9002"
+    VERIFIER_PORT      = "9003"
+    RATCHET_PORT       = "9004"
+    RISK_PORT          = "9005"
+    KT_PORT            = "9006"
+    AUDIT_PORT         = "9007"
+    DB_HOST            = google_sql_database_instance.postgres.private_ip_address
+    DB_PORT            = "5432"
+    DB_NAME            = var.db_name
+    DB_USER            = var.db_user
+    KMS_KEY_RING       = google_kms_key_ring.sso.id
+    KMS_SIGNING_KEY    = google_kms_crypto_key.token_signing.id
+    KMS_ENCRYPTION_KEY = google_kms_crypto_key.data_encryption.id
+    KMS_TSS_KEY        = google_kms_crypto_key.tss_shares.id
+    AUDIT_BFT_REPLICAS = tostring(var.audit_bft_replicas)
     # Service discovery via ClusterIP DNS
-    ORCHESTRATOR_URL      = "http://orchestrator.milnet-sso.svc.cluster.local:9000"
-    OPAQUE_URL            = "http://opaque.milnet-sso.svc.cluster.local:9001"
-    TSS_URL               = "http://tss.milnet-sso.svc.cluster.local:9002"
-    VERIFIER_URL          = "http://verifier.milnet-sso.svc.cluster.local:9003"
-    RATCHET_URL           = "http://ratchet.milnet-sso.svc.cluster.local:9004"
-    RISK_URL              = "http://risk.milnet-sso.svc.cluster.local:9005"
-    KT_URL                = "http://kt.milnet-sso.svc.cluster.local:9006"
-    AUDIT_URL             = "http://audit.milnet-sso.svc.cluster.local:9007"
+    ORCHESTRATOR_URL = "http://orchestrator.milnet-sso.svc.cluster.local:9000"
+    OPAQUE_URL       = "http://opaque.milnet-sso.svc.cluster.local:9001"
+    TSS_URL          = "http://tss.milnet-sso.svc.cluster.local:9002"
+    VERIFIER_URL     = "http://verifier.milnet-sso.svc.cluster.local:9003"
+    RATCHET_URL      = "http://ratchet.milnet-sso.svc.cluster.local:9004"
+    RISK_URL         = "http://risk.milnet-sso.svc.cluster.local:9005"
+    KT_URL           = "http://kt.milnet-sso.svc.cluster.local:9006"
+    AUDIT_URL        = "http://audit.milnet-sso.svc.cluster.local:9007"
   }
 }
 
@@ -245,13 +245,13 @@ resource "kubernetes_deployment" "services" {
 
           resources {
             requests = {
-              cpu               = each.value.cpu
-              memory            = each.value.memory
+              cpu                 = each.value.cpu
+              memory              = each.value.memory
               "ephemeral-storage" = "100Mi"
             }
             limits = {
-              cpu               = each.value.cpu == "1000m" ? "2000m" : "1000m"
-              memory            = each.value.memory == "512Mi" ? "1Gi" : "512Mi"
+              cpu                 = each.value.cpu == "1000m" ? "2000m" : "1000m"
+              memory              = each.value.memory == "512Mi" ? "1Gi" : "512Mi"
               "ephemeral-storage" = "500Mi"
             }
           }
@@ -404,7 +404,7 @@ resource "kubernetes_deployment" "audit" {
           }
 
           env {
-            name  = "AUDIT_NODE_ID"
+            name = "AUDIT_NODE_ID"
             value_from {
               field_ref {
                 field_path = "metadata.name"
@@ -414,13 +414,13 @@ resource "kubernetes_deployment" "audit" {
 
           resources {
             requests = {
-              cpu               = "250m"
-              memory            = "256Mi"
+              cpu                 = "250m"
+              memory              = "256Mi"
               "ephemeral-storage" = "100Mi"
             }
             limits = {
-              cpu               = "1000m"
-              memory            = "512Mi"
+              cpu                 = "1000m"
+              memory              = "512Mi"
               "ephemeral-storage" = "500Mi"
             }
           }

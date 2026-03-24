@@ -21,7 +21,7 @@ use common::types::ModuleId;
 use shard::tls_transport::tls_connect;
 
 use crate::puzzle::{generate_challenge, get_adaptive_difficulty, verify_solution, PuzzleSolution};
-use crate::wire::{AuthRequest, AuthResponse, KemCiphertext, OrchestratorRequest, OrchestratorResponse};
+use crate::wire::{AuthRequest, AuthResponse, OrchestratorRequest, OrchestratorResponse};
 
 /// Maximum wire frame payload size (1 MiB).
 const MAX_FRAME_LEN: u32 = 1024 * 1024;
@@ -41,6 +41,26 @@ const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// AES-256-GCM nonce size (96 bits / 12 bytes).
 const AES_GCM_NONCE_LEN: usize = 12;
 
+/// Maximum concurrent HTTP/2 streams per connection.
+///
+/// Applied when the gateway is fronted by an HTTP/2 reverse proxy.  Limits
+/// the number of in-flight requests a single TCP connection can multiplex,
+/// preventing a single client from monopolising server resources.
+pub const MAX_CONCURRENT_STREAMS: u32 = 100;
+
+/// Maximum HTTP/2 header list size in bytes (64 KiB).
+///
+/// Prevents oversized HPACK-encoded header blocks from consuming excessive
+/// memory.  Applied via HTTP/2 SETTINGS frame when using hyper/axum.
+pub const MAX_HEADER_LIST_SIZE: u32 = 64 * 1024;
+
+/// Constant-time floor for all authentication responses (100 ms).
+///
+/// Every authentication code path (success, failure, orchestrator error,
+/// username-not-found in OPAQUE) is padded to at least this duration to
+/// prevent timing-based username enumeration.
+const AUTH_RESPONSE_FLOOR: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Configuration for orchestrator forwarding.
 #[derive(Clone)]
 pub struct OrchestratorConfig {
@@ -57,7 +77,8 @@ type RateLimitMap = HashMap<IpAddr, (u32, Instant)>;
 ///
 /// Holds a long-lived X-Wing keypair generated once at startup.  The public
 /// key is sent to every connecting client as part of the puzzle challenge so
-/// clients can perform hybrid post-quantum key exchange.
+/// clients can perform hybrid post-quantum key exchange.  The server retains
+/// the full keypair so it can decapsulate ciphertexts returned by clients.
 pub struct GatewayServer {
     listener: TcpListener,
     difficulty: u8,
@@ -65,6 +86,8 @@ pub struct GatewayServer {
     active_connections: Arc<AtomicUsize>,
     /// Server-side X-Wing public key bytes, shared across connections via Arc.
     xwing_server_pk: Arc<Vec<u8>>,
+    /// Server-side X-Wing full keypair, used for decapsulation.
+    xwing_server_kp: Arc<crypto::xwing::XWingKeyPair>,
     /// Per-IP connection rate limiter.
     rate_limits: Arc<Mutex<RateLimitMap>>,
 }
@@ -79,12 +102,14 @@ impl GatewayServer {
             .map_err(|e| std::io::Error::other(format!("XWing keygen: {e}")))?;
         let xwing_server_pk = Arc::new(xwing_kp.public_key().to_bytes());
         info!("X-Wing server keypair generated ({} byte public key)", xwing_server_pk.len());
+        let xwing_server_kp = Arc::new(xwing_kp);
         Ok(Self {
             listener,
             difficulty,
             orchestrator: None,
             active_connections: Arc::new(AtomicUsize::new(0)),
             xwing_server_pk,
+            xwing_server_kp,
             rate_limits: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -102,12 +127,14 @@ impl GatewayServer {
             .map_err(|e| std::io::Error::other(format!("XWing keygen: {e}")))?;
         let xwing_server_pk = Arc::new(xwing_kp.public_key().to_bytes());
         info!("X-Wing server keypair generated ({} byte public key)", xwing_server_pk.len());
+        let xwing_server_kp = Arc::new(xwing_kp);
         Ok(Self {
             listener,
             difficulty,
             orchestrator: Some(Arc::new(orchestrator_config)),
             active_connections: Arc::new(AtomicUsize::new(0)),
             xwing_server_pk,
+            xwing_server_kp,
             rate_limits: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -162,6 +189,7 @@ impl GatewayServer {
             let orch = self.orchestrator.clone();
             let counter = self.active_connections.clone();
             let server_pk = self.xwing_server_pk.clone();
+            let server_kp = self.xwing_server_kp.clone();
             // Verbose logging: log incoming connection details
             common::error_response::verbose_log_fields(
                 "gateway",
@@ -174,7 +202,7 @@ impl GatewayServer {
                 ],
             );
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(stream, difficulty, orch, server_pk).await {
+                if let Err(e) = handle_connection(stream, difficulty, orch, server_pk, server_kp).await {
                     // In production, mask the error; always log internally
                     let internal_msg = common::error_response::log_error_with_location(&e);
                     warn!("connection from {addr} failed: {internal_msg}");
@@ -187,7 +215,13 @@ impl GatewayServer {
     /// Accept and handle exactly one connection (useful for tests).
     pub async fn accept_one(&self) -> std::io::Result<()> {
         let (stream, addr) = self.listener.accept().await?;
-        handle_connection(stream, self.difficulty, self.orchestrator.clone(), self.xwing_server_pk.clone())
+        handle_connection(
+            stream,
+            self.difficulty,
+            self.orchestrator.clone(),
+            self.xwing_server_pk.clone(),
+            self.xwing_server_kp.clone(),
+        )
             .await
             .map_err(|e| {
                 error!("connection from {addr} failed: {e}");
@@ -241,15 +275,18 @@ fn decrypt_frame(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("AES-256-GCM decrypt: {e}"))
 }
 
-/// Handle a single client connection through the full puzzle + auth flow.
+/// Handle a single client connection through the full puzzle + KEM + auth flow.
 ///
-/// Protocol steps:
+/// Protocol steps (proper client-server X-Wing KEM flow):
 ///   1. Server -> Client: `PuzzleChallenge` (includes server X-Wing public key)
-///   2. Client -> Server: `PuzzleSolution`  (includes client X-Wing public key)
+///   2. Client -> Server: `PuzzleSolution` + `KemCiphertext`
+///      Client encapsulates against server's X-Wing PK, producing a shared
+///      secret and ciphertext.  The ciphertext is sent alongside the puzzle
+///      solution.
 ///   3. Server verifies puzzle solution
-///   4. Server encapsulates against client's X-Wing public key
-///   5. Server -> Client: `KemCiphertext`
-///   6. Both sides derive session key via HKDF-SHA512 over the shared secret
+///   4. Server decapsulates the received ciphertext with its own secret key
+///   5. Both sides now share the same hybrid PQ + classical secret
+///   6. Both derive session key via HKDF-SHA512 over the shared secret
 ///   7. Client -> Server: `AuthRequest` (AES-256-GCM encrypted with session key)
 ///   8. Server -> Client: `AuthResponse` (AES-256-GCM encrypted with session key)
 async fn handle_connection(
@@ -257,19 +294,24 @@ async fn handle_connection(
     difficulty: u8,
     orchestrator: Option<Arc<OrchestratorConfig>>,
     server_xwing_pk: Arc<Vec<u8>>,
+    server_xwing_kp: Arc<crypto::xwing::XWingKeyPair>,
 ) -> Result<(), String> {
     let conn_start = Instant::now();
 
-    // 1. Send puzzle challenge with the server's X-Wing public key
+    // 1. Send puzzle challenge with the server's X-Wing public key.
+    //    The client uses this key to encapsulate and produce a ciphertext.
     let mut challenge = generate_challenge(difficulty);
     challenge.xwing_server_pk = Some((*server_xwing_pk).clone());
     send_frame_with_timeout(&mut stream, &challenge).await?;
     common::error_response::verbose_log("gateway", "puzzle challenge sent");
 
-    // 2. Read puzzle solution (expected to contain the client's X-Wing public key)
+    // 2. Read puzzle solution (contains the client's KEM ciphertext)
     let solution: PuzzleSolution = recv_frame_with_timeout(&mut stream).await?;
 
-    // 3. Verify solution
+    // 3. Verify puzzle solution.  All verification failures go through the
+    //    timing floor to prevent distinguishing failure modes.
+    let auth_start = tokio::time::Instant::now();
+
     common::error_response::verbose_log("gateway", "puzzle solution received, verifying");
     if !crypto::ct::ct_eq_32(&solution.nonce, &challenge.nonce) {
         let resp = AuthResponse {
@@ -277,6 +319,7 @@ async fn handle_connection(
             token: None,
             error: Some(common::error_response::sanitize("nonce mismatch")),
         };
+        enforce_timing_floor(auth_start).await;
         send_frame_with_timeout(&mut stream, &resp).await?;
         return Err("nonce mismatch".into());
     }
@@ -287,11 +330,12 @@ async fn handle_connection(
             token: None,
             error: Some(common::error_response::sanitize("invalid puzzle solution")),
         };
+        enforce_timing_floor(auth_start).await;
         send_frame_with_timeout(&mut stream, &resp).await?;
         return Err("invalid puzzle solution".into());
     }
 
-    common::error_response::log_crypto_operation("puzzle_verify", "SHA-256", "puzzle");
+    common::error_response::log_crypto_operation("puzzle_verify", "SHA-512", "puzzle");
     common::error_response::verbose_log_fields(
         "gateway",
         "puzzle solution verified",
@@ -300,34 +344,29 @@ async fn handle_connection(
 
     // 4. X-Wing hybrid KEM key exchange (ML-KEM-1024 + X25519)
     //
-    // The client sends its X-Wing public key alongside the puzzle solution.
-    // The server encapsulates against the *client's* key, producing a shared
-    // secret and a ciphertext.  The ciphertext is sent to the client so it
-    // can decapsulate with its private key and arrive at the same secret.
-    let client_pk_bytes = solution.xwing_client_pk.ok_or(
-        "client did not provide X-Wing public key in puzzle solution",
+    // The client has encapsulated against the server's X-Wing public key
+    // (sent in step 1) and returned the ciphertext in the puzzle solution.
+    // The server now decapsulates with its secret key to derive the same
+    // shared secret.
+    let kem_ct_bytes = solution.xwing_kem_ciphertext.ok_or(
+        "client did not provide X-Wing KEM ciphertext in puzzle solution",
     )?;
-    let client_pk = crypto::xwing::XWingPublicKey::from_bytes(&client_pk_bytes)
-        .ok_or("invalid X-Wing public key from client")?;
+    let kem_ct = crypto::xwing::Ciphertext::from_bytes(&kem_ct_bytes)
+        .ok_or("invalid X-Wing KEM ciphertext from client")?;
 
-    // ML-KEM-1024 encapsulation uses significant stack space; run on a blocking
+    // ML-KEM-1024 decapsulation uses significant stack space; run on a blocking
     // thread to avoid overflowing the async task stack in debug builds.
-    let (shared_secret, kem_ct) = {
-        let pk = client_pk;
-        tokio::task::spawn_blocking(move || crypto::xwing::xwing_encapsulate(&pk))
+    let shared_secret = {
+        let kp = server_xwing_kp.clone();
+        tokio::task::spawn_blocking(move || crypto::xwing::xwing_decapsulate(&kp, &kem_ct))
             .await
-            .map_err(|e| format!("KEM encapsulate task: {e}"))?
+            .map_err(|e| format!("KEM decapsulate task: {e}"))?
+            .map_err(|e| format!("KEM decapsulation failed: {e}"))?
     };
 
-    common::error_response::log_crypto_operation("kem_encapsulate", "X-Wing (ML-KEM-1024 + X25519)", "client_pk");
+    common::error_response::log_crypto_operation("kem_decapsulate", "X-Wing (ML-KEM-1024 + X25519)", "server_sk");
 
-    // 5. Send the KEM ciphertext to the client so it can decapsulate
-    let kem_msg = KemCiphertext {
-        ciphertext: kem_ct.to_bytes(),
-    };
-    send_frame_with_timeout(&mut stream, &kem_msg).await?;
-
-    // 6. Derive session key via HKDF-SHA512
+    // 5. Derive session key via HKDF-SHA512
     //    Context binds to this specific handshake via the puzzle nonce.
     //    The derived key is 64 bytes; we use the first 32 bytes for AES-256-GCM.
     let session_key = crypto::xwing::derive_session_key(&shared_secret, &challenge.nonce);
@@ -335,7 +374,7 @@ async fn handle_connection(
     common::error_response::log_crypto_operation("key_derive", "HKDF-SHA512", "session_key");
     debug!("X-Wing KEM: session key established (hybrid PQ + classical)");
 
-    // 7. Read encrypted auth request
+    // 6. Read encrypted auth request
     let encrypted_auth = recv_raw_frame_with_timeout(&mut stream).await?;
     let auth_plaintext = decrypt_frame(&enc_key, &encrypted_auth)?;
     let auth_req: AuthRequest = postcard::from_bytes(&auth_plaintext)
@@ -344,18 +383,18 @@ async fn handle_connection(
     common::error_response::log_crypto_operation("decrypt_frame", "AES-256-GCM", "session_key");
     common::error_response::verbose_log("gateway", "auth request decrypted and deserialized");
 
-    // 8. Forward to orchestrator via SHARD (or stub if not configured)
-    // Record the start time before processing the auth request so we can
-    // enforce a constant-time floor on the response, preventing timing-based
-    // username enumeration attacks.
-    let auth_start = tokio::time::Instant::now();
+    // 7. Forward to orchestrator via SHARD (or stub if not configured).
+    //    The timing floor is measured from auth_start to cover the entire
+    //    authentication path including username lookup, OPAQUE processing,
+    //    and orchestrator round-trip.
 
-    // DPoP channel binding: hash the client's X-Wing public key.
-    // The client proved possession of the private key via the KEM exchange.
-    let client_pk_hash = crypto::dpop::dpop_key_hash(&client_pk_bytes);
+    // DPoP channel binding: hash the KEM ciphertext (the client proved
+    // possession of knowledge of the shared secret through successful
+    // encrypted communication).
+    let client_binding_hash = crypto::dpop::dpop_key_hash(&kem_ct_bytes);
 
     let resp = if let Some(orch) = orchestrator {
-        match forward_to_orchestrator(&auth_req, &orch, client_pk_hash).await {
+        match forward_to_orchestrator(&auth_req, &orch, client_binding_hash).await {
             Ok(r) => r,
             Err(e) => {
                 let internal_msg = common::error_response::log_error_with_location(&e);
@@ -376,13 +415,10 @@ async fn handle_connection(
         }
     };
 
-    // Constant-time delay: pad response to a fixed minimum duration (100ms)
-    // to prevent timing-based username enumeration via OPAQUE.
-    const AUTH_RESPONSE_FLOOR: std::time::Duration = std::time::Duration::from_millis(100);
-    let elapsed = auth_start.elapsed();
-    if elapsed < AUTH_RESPONSE_FLOOR {
-        tokio::time::sleep(AUTH_RESPONSE_FLOOR - elapsed).await;
-    }
+    // Enforce constant-time floor on ALL auth responses (success, failure,
+    // orchestrator error, username-not-found) to prevent timing-based
+    // username enumeration via OPAQUE.
+    enforce_timing_floor(auth_start).await;
 
     // Encrypt the response with the session key before sending
     let resp_plaintext = postcard::to_allocvec(&resp)
@@ -393,20 +429,29 @@ async fn handle_connection(
     Ok(())
 }
 
+/// Pad elapsed time to the constant `AUTH_RESPONSE_FLOOR` to prevent
+/// timing-based information leakage across all authentication paths.
+async fn enforce_timing_floor(start: tokio::time::Instant) {
+    let elapsed = start.elapsed();
+    if elapsed < AUTH_RESPONSE_FLOOR {
+        tokio::time::sleep(AUTH_RESPONSE_FLOOR - elapsed).await;
+    }
+}
+
 /// Forward an auth request to the orchestrator via SHARD and return the response.
 ///
-/// `client_pk_hash` is SHA-256 of the client's X-Wing public key, used as the
-/// DPoP channel binding.  The client proved possession of the corresponding
-/// private key through the X-Wing KEM exchange.
+/// `client_binding_hash` is SHA-256 of the client's KEM ciphertext, used as
+/// the DPoP channel binding.  The client proved knowledge of the shared
+/// secret through the encrypted channel.
 async fn forward_to_orchestrator(
     auth_req: &AuthRequest,
     config: &OrchestratorConfig,
-    client_pk_hash: [u8; 32],
+    client_binding_hash: [u8; 32],
 ) -> Result<AuthResponse, String> {
     let orch_req = OrchestratorRequest {
         username: auth_req.username.clone(),
         password: auth_req.password.clone(),
-        dpop_key_hash: client_pk_hash,
+        dpop_key_hash: client_binding_hash,
         tier: 0,                  // Orchestrator decides tier
         audience: None,
         device_attestation_age_secs: None,

@@ -2,12 +2,18 @@ use crate::pkce;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 /// Authorization code expiry in seconds. Set to 30s for tighter security
 /// (OAuth 2.0 recommends a maximum of 10 minutes; 30s limits replay window).
 const CODE_EXPIRY_SECS: i64 = 30;
+
+/// Maximum failed code consumption attempts per client_id within the rate limit window.
+const MAX_CODE_ATTEMPTS_PER_CLIENT: u32 = 10;
+
+/// Rate limit window for code consumption attempts (60 seconds).
+const CODE_ATTEMPT_WINDOW_SECS: u64 = 60;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct AuthorizationRequest {
@@ -50,6 +56,9 @@ pub struct AuthorizationStore {
     /// Used to detect replay attacks — if consume_count exceeds issued code count,
     /// an attack may be underway.
     consume_count: AtomicU64,
+    /// Tracks failed code consumption attempts per client_id for rate limiting.
+    /// Maps client_id -> (failed_attempt_count, window_start).
+    code_attempt_tracker: HashMap<String, (u32, Instant)>,
 }
 
 impl AuthorizationStore {
@@ -57,6 +66,7 @@ impl AuthorizationStore {
         Self {
             codes: HashMap::new(),
             consume_count: AtomicU64::new(0),
+            code_attempt_tracker: HashMap::new(),
         }
     }
 
@@ -117,10 +127,34 @@ impl AuthorizationStore {
     pub fn consume_code(&mut self, code: &str) -> Option<AuthorizationCode> {
         self.consume_count.fetch_add(1, Ordering::SeqCst);
 
+        // Determine the client_id for rate limiting before mutating the code.
+        // If the code exists, use its client_id; otherwise we cannot rate-limit
+        // (the code is unknown and will return None anyway).
+        let client_id = self.codes.get(code).map(|c| c.client_id.clone());
+
+        // Check rate limit for this client_id (if known).
+        if let Some(ref cid) = client_id {
+            let now = Instant::now();
+            let entry = self.code_attempt_tracker.entry(cid.clone()).or_insert((0, now));
+            // Reset window if expired
+            if now.duration_since(entry.1).as_secs() >= CODE_ATTEMPT_WINDOW_SECS {
+                *entry = (0, now);
+            }
+            if entry.0 >= MAX_CODE_ATTEMPTS_PER_CLIENT {
+                return None;
+            }
+        }
+
         let auth_code = self.codes.get_mut(code)?;
 
         // Reject already-consumed codes (replay detection)
         if auth_code.consumed {
+            // Track failed attempt for rate limiting
+            if let Some(ref cid) = client_id {
+                if let Some(entry) = self.code_attempt_tracker.get_mut(cid) {
+                    entry.0 += 1;
+                }
+            }
             // Remove the code entirely on double-consumption attempt (per RFC 6749 sec 4.1.2:
             // "If an authorization code is used more than once, the authorization server MUST
             // deny the request and SHOULD revoke all tokens previously issued based on that code.")
@@ -133,6 +167,12 @@ impl AuthorizationStore {
             .unwrap()
             .as_secs() as i64;
         if now > auth_code.expires_at {
+            // Track failed attempt for rate limiting
+            if let Some(ref cid) = client_id {
+                if let Some(entry) = self.code_attempt_tracker.get_mut(cid) {
+                    entry.0 += 1;
+                }
+            }
             self.codes.remove(code);
             return None;
         }
@@ -154,12 +194,18 @@ impl AuthorizationStore {
     /// Remove all expired codes older than 2x the expiry time.
     /// Should be called periodically (e.g., every 30 seconds) to prevent unbounded growth.
     pub fn cleanup_expired(&mut self) {
-        let now = SystemTime::now()
+        let now_sys = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        let cutoff = now - (CODE_EXPIRY_SECS * 2);
+        let cutoff = now_sys - (CODE_EXPIRY_SECS * 2);
         self.codes.retain(|_, auth_code| auth_code.expires_at > cutoff);
+
+        // Purge stale rate-limit tracker entries whose window has expired.
+        let now_inst = Instant::now();
+        self.code_attempt_tracker.retain(|_, (_, window_start)| {
+            now_inst.duration_since(*window_start).as_secs() < CODE_ATTEMPT_WINDOW_SECS
+        });
     }
 }
 

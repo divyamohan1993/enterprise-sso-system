@@ -12,7 +12,9 @@ SHARD_HMAC_KEY=$(head -c 64 /dev/urandom | base64 -w0)
 echo "Generated unique SHARD HMAC key for TSS VM"
 
 # ── Create milnet user (non-root) ──
-useradd -r -s /bin/false -m milnet 2>/dev/null || true
+if ! id milnet &>/dev/null; then
+    useradd -r -s /bin/false -m milnet
+fi
 
 # ── Install Docker (COS has Docker pre-installed) ──
 if ! command -v docker &>/dev/null; then
@@ -22,15 +24,25 @@ if ! command -v docker &>/dev/null; then
 fi
 
 # ── Wait for Docker ──
+docker_ready=false
 for i in $(seq 1 30); do
-  docker info &>/dev/null && break
+  if docker info &>/dev/null; then
+    docker_ready=true
+    break
+  fi
   echo "Waiting for Docker... ($i/30)"
   sleep 2
 done
+if [ "$docker_ready" = false ]; then
+  echo "ERROR: Docker failed to start after 60 seconds" >&2
+  exit 1
+fi
 
 # ── Authenticate to Artifact Registry ──
 echo "Authenticating to Artifact Registry..."
-gcloud auth configure-docker ${project_id}-docker.pkg.dev,asia-south1-docker.pkg.dev --quiet 2>/dev/null || true
+if ! gcloud auth configure-docker ${project_id}-docker.pkg.dev,asia-south1-docker.pkg.dev --quiet 2>&1; then
+  echo "WARNING: Artifact Registry auth may have failed" >&2
+fi
 
 # ── Pull ONLY TSS image (all 3 nodes use same image, different config) ──
 echo "Pulling TSS image..."
@@ -44,6 +56,9 @@ TSS_0_SHARE_KEY=$(head -c 32 /dev/urandom | base64 -w0)
 TSS_1_SHARE_KEY=$(head -c 32 /dev/urandom | base64 -w0)
 TSS_2_SHARE_KEY=$(head -c 32 /dev/urandom | base64 -w0)
 
+# Common security flags for all containers
+SECURITY_OPTS="--security-opt no-new-privileges:true --cap-drop ALL --read-only --tmpfs /tmp"
+
 # ── Start TSS Node 0 (:9103) ──
 echo "Starting tss-0 on :9103..."
 docker run -d \
@@ -51,7 +66,8 @@ docker run -d \
   --restart unless-stopped \
   --network milnet-internal \
   --user 1000:1000 \
-  -p 9103:9103 \
+  $SECURITY_OPTS \
+  -p 127.0.0.1:9103:9103 \
   -e RUST_LOG=info \
   -e BIND_ADDR=0.0.0.0:9103 \
   -e NODE_ID=0 \
@@ -61,6 +77,8 @@ docker run -d \
   -e PEER_2_URL=http://127.0.0.1:9123 \
   -e SHARD_HMAC_KEY="$SHARD_HMAC_KEY" \
   -e TSS_SHARE_KEY="$TSS_0_SHARE_KEY" \
+  --memory 256m \
+  --cpus 0.5 \
   ${ar_registry}/tss:latest
 
 # ── Start TSS Node 1 (:9113) ──
@@ -70,7 +88,8 @@ docker run -d \
   --restart unless-stopped \
   --network milnet-internal \
   --user 1000:1000 \
-  -p 9113:9113 \
+  $SECURITY_OPTS \
+  -p 127.0.0.1:9113:9113 \
   -e RUST_LOG=info \
   -e BIND_ADDR=0.0.0.0:9113 \
   -e NODE_ID=1 \
@@ -80,6 +99,8 @@ docker run -d \
   -e PEER_2_URL=http://127.0.0.1:9123 \
   -e SHARD_HMAC_KEY="$SHARD_HMAC_KEY" \
   -e TSS_SHARE_KEY="$TSS_1_SHARE_KEY" \
+  --memory 256m \
+  --cpus 0.5 \
   ${ar_registry}/tss:latest
 
 # ── Start TSS Node 2 (:9123) ──
@@ -89,7 +110,8 @@ docker run -d \
   --restart unless-stopped \
   --network milnet-internal \
   --user 1000:1000 \
-  -p 9123:9123 \
+  $SECURITY_OPTS \
+  -p 127.0.0.1:9123:9123 \
   -e RUST_LOG=info \
   -e BIND_ADDR=0.0.0.0:9123 \
   -e NODE_ID=2 \
@@ -99,7 +121,12 @@ docker run -d \
   -e PEER_1_URL=http://127.0.0.1:9113 \
   -e SHARD_HMAC_KEY="$SHARD_HMAC_KEY" \
   -e TSS_SHARE_KEY="$TSS_2_SHARE_KEY" \
+  --memory 256m \
+  --cpus 0.5 \
   ${ar_registry}/tss:latest
+
+# Clear sensitive keys from shell environment
+unset SHARD_HMAC_KEY TSS_0_SHARE_KEY TSS_1_SHARE_KEY TSS_2_SHARE_KEY
 
 echo "=== MILNET TSS startup complete at $(date -u) ==="
 echo "Services: tss-0(:9103) tss-1(:9113) tss-2(:9123)"

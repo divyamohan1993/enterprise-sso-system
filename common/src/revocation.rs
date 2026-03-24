@@ -75,10 +75,14 @@ impl RevocationList {
             .as_micros() as i64
     }
 
+    /// 90% capacity threshold for SIEM alerting.
+    const CAPACITY_WARN_THRESHOLD: usize = MAX_ENTRIES * 90 / 100;
+
     /// Revoke a token by its unique identifier.
     ///
     /// Returns `true` if the token was newly revoked, `false` if it was
-    /// already in the revocation list or the list is at capacity (after cleanup).
+    /// already in the revocation list or the list is at capacity (after cleanup
+    /// and eviction of the oldest entries).
     pub fn revoke(&mut self, token_id: [u8; 16]) -> bool {
         // If already revoked, no-op
         if self.revoked_ids.contains(&token_id) {
@@ -90,15 +94,43 @@ impl RevocationList {
             self.cleanup();
         }
 
-        // If still at capacity after cleanup, reject to prevent unbounded growth
+        // If still at capacity after cleanup, evict the oldest entries to make room
         if self.revoked_ids.len() >= MAX_ENTRIES {
-            return false;
+            self.evict_oldest(MAX_ENTRIES / 10); // Evict 10% of entries
         }
 
         let now = Self::now_us();
         self.revoked_ids.insert(token_id);
         self.revocation_times.insert(token_id, now);
+
+        // Emit SIEM alert when crossing the 90% capacity threshold
+        if self.revoked_ids.len() == Self::CAPACITY_WARN_THRESHOLD {
+            tracing::error!(
+                target: "siem",
+                category = "security",
+                action = "revocation_list_near_capacity",
+                count = self.revoked_ids.len(),
+                max = MAX_ENTRIES,
+                "Revocation list at 90% capacity ({}/{})",
+                self.revoked_ids.len(),
+                MAX_ENTRIES,
+            );
+        }
+
         true
+    }
+
+    /// Evict the `count` oldest entries from the revocation list.
+    fn evict_oldest(&mut self, count: usize) {
+        let mut entries: Vec<([u8; 16], i64)> = self.revocation_times.iter()
+            .map(|(id, ts)| (*id, *ts))
+            .collect();
+        entries.sort_by_key(|(_id, ts)| *ts);
+
+        for (id, _ts) in entries.into_iter().take(count) {
+            self.revoked_ids.remove(&id);
+            self.revocation_times.remove(&id);
+        }
     }
 
     /// Check if a token has been revoked.
@@ -353,10 +385,12 @@ mod tests {
 
         assert_eq!(rl.len(), MAX_ENTRIES);
 
-        // Next insertion should fail (entries are recent, cleanup won't help)
+        // Next insertion evicts the oldest 10% and succeeds
         let overflow_id = [0xFF; 16];
-        assert!(!rl.revoke(overflow_id));
-        assert!(!rl.is_revoked(&overflow_id));
+        assert!(rl.revoke(overflow_id));
+        assert!(rl.is_revoked(&overflow_id));
+        // After eviction of 10% + adding 1, size should be 90% + 1
+        assert_eq!(rl.len(), MAX_ENTRIES - MAX_ENTRIES / 10 + 1);
     }
 
     #[test]

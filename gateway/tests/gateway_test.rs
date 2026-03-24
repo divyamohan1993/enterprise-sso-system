@@ -4,14 +4,14 @@ use gateway::puzzle::{
     generate_challenge, solve_challenge, verify_solution, PuzzleChallenge, PuzzleSolution,
 };
 use gateway::server::GatewayServer;
-use gateway::wire::{AuthRequest, AuthResponse, KemCiphertext};
+use gateway::wire::{AuthRequest, AuthResponse};
 
 use aes_gcm::aead::generic_array::GenericArray;
 use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-// ── Puzzle unit tests ───────────────────────────────────────────────────
+// -- Puzzle unit tests --
 
 #[test]
 fn puzzle_generate_and_solve() {
@@ -44,7 +44,7 @@ fn puzzle_expired_rejected() {
     );
 }
 
-// ── Gateway integration test ────────────────────────────────────────────
+// -- Gateway integration test --
 
 async fn send_frame<T: serde::Serialize>(stream: &mut TcpStream, value: &T) {
     let payload = postcard::to_allocvec(value).unwrap();
@@ -91,13 +91,19 @@ async fn gateway_accepts_solved_puzzle() {
 
     let mut stream = TcpStream::connect(addr).await.unwrap();
 
-    // 1. Receive puzzle challenge
+    // 1. Receive puzzle challenge (includes server's X-Wing public key)
     let challenge: PuzzleChallenge = recv_frame(&mut stream).await;
 
-    // 2. Generate X-Wing keypair and solve puzzle
-    let client_kp = crypto::xwing::XWingKeyPair::generate();
-    let client_pk_bytes = client_kp.public_key().to_bytes();
+    // 2. Parse server's X-Wing public key and encapsulate against it.
+    //    The client produces a shared secret and ciphertext; the ciphertext
+    //    is sent to the server so it can decapsulate.
+    let server_pk_bytes = challenge.xwing_server_pk.as_ref().expect("server PK in challenge");
+    let server_pk = crypto::xwing::XWingPublicKey::from_bytes(server_pk_bytes)
+        .expect("parse server X-Wing PK");
+    let (shared_secret, kem_ct) = crypto::xwing::xwing_encapsulate(&server_pk);
+    let kem_ct_bytes = kem_ct.to_bytes();
 
+    // 3. Solve puzzle and send solution with KEM ciphertext
     let challenge_clone = challenge.clone();
     let solution_bytes = tokio::task::spawn_blocking(move || solve_challenge(&challenge_clone))
         .await
@@ -105,17 +111,11 @@ async fn gateway_accepts_solved_puzzle() {
     let solution = PuzzleSolution {
         nonce: challenge.nonce,
         solution: solution_bytes,
-        xwing_client_pk: Some(client_pk_bytes),
+        xwing_kem_ciphertext: Some(kem_ct_bytes),
     };
     send_frame(&mut stream, &solution).await;
 
-    // 3. Receive KEM ciphertext
-    let kem_msg: KemCiphertext = recv_frame(&mut stream).await;
-    let kem_ct = crypto::xwing::Ciphertext::from_bytes(&kem_msg.ciphertext)
-        .expect("parse KEM ciphertext");
-    let shared_secret = crypto::xwing::xwing_decapsulate(&client_kp, &kem_ct);
-
-    // 4. Derive session key
+    // 4. Derive session key (both sides use the same shared secret)
     let session_key = crypto::xwing::derive_session_key(&shared_secret, &challenge.nonce);
     let enc_key: [u8; 32] = session_key[..32].try_into().unwrap();
 

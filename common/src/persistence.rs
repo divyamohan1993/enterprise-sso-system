@@ -89,18 +89,67 @@ fn is_encrypted(data: &[u8]) -> bool {
     data.len() >= 8 && &data[..8] == ENCRYPTED_KEY_MAGIC
 }
 
+/// Enforce the encryption-at-rest policy.
+///
+/// In production mode (`MILNET_PRODUCTION` is set), `require_encryption_at_rest`
+/// MUST be true. If it is false, this function panics immediately to prevent
+/// any possibility of storing or loading plaintext key material in production.
+///
+/// This is called at the entry point of every store/load path.
+fn enforce_encryption_policy(config: &SecurityConfig) {
+    if crate::sealed_keys::is_production() && !config.require_encryption_at_rest {
+        panic!(
+            "FATAL: require_encryption_at_rest is false while MILNET_PRODUCTION is set. \
+             Encryption at rest cannot be disabled in production."
+        );
+    }
+}
+
+/// Validate the magic header on loaded data.
+///
+/// In production mode, ALL loaded key material MUST carry the encrypted magic
+/// header. Data without the header is rejected unconditionally.
+fn validate_magic_header(data: &[u8], name: &str) -> Result<(), String> {
+    if !is_encrypted(data) {
+        if crate::sealed_keys::is_production() {
+            return Err(format!(
+                "SECURITY VIOLATION: key '{}' loaded without encryption magic header in production mode",
+                name
+            ));
+        }
+        let config = SecurityConfig::default();
+        if config.require_encryption_at_rest {
+            return Err(format!(
+                "key '{}' missing encryption magic header and require_encryption_at_rest is true",
+                name
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Store key material into PostgreSQL with AES-256-GCM encryption at rest.
 ///
 /// If `master_kek` is provided, key bytes are encrypted before storage.
-/// If `SecurityConfig::default().require_encryption_at_rest` is true and no KEK
-/// is provided, this function will refuse to store plaintext and will panic.
+/// In production mode, encryption at rest is mandatory; this function will
+/// panic if `require_encryption_at_rest` is false when `MILNET_PRODUCTION` is set,
+/// and will refuse to store plaintext key material.
 #[must_use = "store_key returns false if encryption-at-rest policy prevents storage"]
 pub async fn store_key(pool: &PgPool, name: &str, key_bytes: &[u8], master_kek: Option<&[u8; 32]>) -> bool {
     let config = SecurityConfig::default();
+    enforce_encryption_policy(&config);
 
     let bytes_to_store = match master_kek {
         Some(kek) => encrypt_key_bytes(kek, name, key_bytes),
         None => {
+            if crate::sealed_keys::is_production() {
+                // Production mode: NEVER store plaintext key material
+                tracing::error!(
+                    "SECURITY VIOLATION: attempted to store key '{}' without KEK in production",
+                    name
+                );
+                return false;
+            }
             if config.require_encryption_at_rest {
                 // Policy requires encryption at rest — check if already encrypted
                 if !is_encrypted(key_bytes) {
@@ -132,10 +181,14 @@ pub async fn store_key(pool: &PgPool, name: &str, key_bytes: &[u8], master_kek: 
 
 /// Load key material from PostgreSQL, decrypting if a master KEK is provided.
 ///
-/// If `master_kek` is provided and the stored data has the encrypted magic header,
-/// decryption is performed. If the header is missing but `require_encryption_at_rest`
-/// is true, the data is rejected (returns None) to prevent loading unprotected keys.
+/// All load paths validate the magic header. In production mode, data without
+/// the encrypted magic header is unconditionally rejected. When
+/// `require_encryption_at_rest` is true (the default), unencrypted data is
+/// also rejected regardless of production mode.
 pub async fn load_key(pool: &PgPool, name: &str, master_kek: Option<&[u8; 32]>) -> Option<Vec<u8>> {
+    let config = SecurityConfig::default();
+    enforce_encryption_policy(&config);
+
     let raw: Option<Vec<u8>> = sqlx::query_scalar("SELECT key_bytes FROM key_material WHERE key_name = $1")
         .bind(name)
         .fetch_optional(pool)
@@ -145,15 +198,22 @@ pub async fn load_key(pool: &PgPool, name: &str, master_kek: Option<&[u8; 32]>) 
 
     let data = raw?;
 
+    // Validate magic header on ALL load paths
+    if let Err(e) = validate_magic_header(&data, name) {
+        tracing::error!("{}", e);
+        if crate::sealed_keys::is_production() || config.require_encryption_at_rest {
+            return None;
+        }
+    }
+
     match master_kek {
         Some(kek) => {
             if is_encrypted(&data) {
                 decrypt_key_bytes(kek, name, &data).ok()
             } else {
                 // Stored data is not encrypted but we have a KEK —
-                // reject if policy requires encryption at rest
-                let config = SecurityConfig::default();
-                if config.require_encryption_at_rest {
+                // reject in production or when policy requires encryption at rest
+                if crate::sealed_keys::is_production() || config.require_encryption_at_rest {
                     None
                 } else {
                     Some(data)
@@ -161,8 +221,14 @@ pub async fn load_key(pool: &PgPool, name: &str, master_kek: Option<&[u8; 32]>) 
             }
         }
         None => {
-            let config = SecurityConfig::default();
-            if config.require_encryption_at_rest && !is_encrypted(&data) {
+            if crate::sealed_keys::is_production() {
+                // Production mode: ALWAYS require KEK for loading
+                tracing::error!(
+                    "SECURITY VIOLATION: attempted to load key '{}' without KEK in production",
+                    name
+                );
+                None
+            } else if config.require_encryption_at_rest && !is_encrypted(&data) {
                 // Policy violation: plaintext key material in database
                 None
             } else {

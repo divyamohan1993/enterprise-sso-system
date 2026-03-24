@@ -734,10 +734,14 @@ async fn test_attack_replay_same_token_after_ratchet_advance() {
     let tag_epoch_0 = chain.generate_tag(claims_bytes);
 
     // Advance ratchet 5 times (well past +-3 window)
-    for i in 0..5 {
-        let client_ent = [i as u8; 32];
-        let server_ent = [(i + 100) as u8; 32];
-        chain.advance(&client_ent, &server_ent);
+    for _i in 0..5 {
+        let mut client_ent = [0u8; 32];
+        let mut server_ent = [0u8; 32];
+        let mut server_nonce = [0u8; 32];
+        getrandom::getrandom(&mut client_ent).unwrap();
+        getrandom::getrandom(&mut server_ent).unwrap();
+        getrandom::getrandom(&mut server_nonce).unwrap();
+        chain.advance(&client_ent, &server_ent, &server_nonce);
     }
     assert_eq!(chain.epoch(), 5);
 
@@ -847,7 +851,11 @@ async fn test_sso_sessions_are_isolated() {
     assert_ne!(alice_tag, bob_tag, "different users must have different tags");
 
     // Advance alice's ratchet, bob stays at epoch 0
-    alice_chain.advance(&[0xA1; 32], &[0xA2; 32]);
+    {
+        let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];
+        getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
+        alice_chain.advance(&ce, &se, &sn);
+    }
     assert_eq!(alice_chain.epoch(), 1);
     assert_eq!(bob_chain.epoch(), 0, "bob's epoch must not change");
 

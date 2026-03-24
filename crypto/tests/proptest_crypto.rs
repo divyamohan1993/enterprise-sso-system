@@ -53,7 +53,7 @@ proptest! {
 
 #[test]
 fn xwing_roundtrip() {
-    for _ in 0..3 { let kp = XWingKeyPair::generate(); let pk = kp.public_key(); let (cs,ct) = xwing_encapsulate(&pk); assert_eq!(cs.as_bytes(), xwing_decapsulate(&kp, &ct).as_bytes()); }
+    for _ in 0..3 { let kp = XWingKeyPair::generate(); let pk = kp.public_key(); let (cs,ct) = xwing_encapsulate(&pk); assert_eq!(cs.as_bytes(), xwing_decapsulate(&kp, &ct).expect("decapsulate").as_bytes()); }
 }
 #[test]
 fn xwing_session_key_det() {

@@ -68,7 +68,19 @@ impl DeveloperModeConfig {
     }
 
     /// Enable or disable developer mode at runtime.
+    ///
+    /// In production mode (`MILNET_PRODUCTION` set), enabling developer mode
+    /// is refused. Developer mode can only be set via the `MILNET_DEV_MODE`
+    /// environment variable at startup in production deployments.
     pub fn set_developer_mode(&self, enabled: bool) {
+        if enabled && crate::sealed_keys::is_production() {
+            tracing::error!(
+                "REFUSED: cannot enable developer mode at runtime in production \
+                 (MILNET_PRODUCTION is set). Developer mode is only settable via \
+                 MILNET_DEV_MODE environment variable at startup."
+            );
+            return;
+        }
         self.enabled.store(enabled, Ordering::Relaxed);
         tracing::warn!(
             developer_mode = enabled,
@@ -215,6 +227,9 @@ impl SecurityConfig {
     }
 
     /// Toggle developer mode at runtime (called from admin API).
+    ///
+    /// In production mode, enabling developer mode is refused — it is only
+    /// settable via the `MILNET_DEV_MODE` environment variable at startup.
     pub fn set_developer_mode(enabled: bool) {
         developer_mode().set_developer_mode(enabled);
     }
@@ -362,6 +377,82 @@ impl SecurityConfig {
         }
         self.max_session_lifetime_secs / self.ratchet_epoch_secs
     }
+
+    /// Validate that all security-critical settings meet minimum production
+    /// thresholds. Returns a list of violations (empty = all OK).
+    ///
+    /// This complements `validate_production()` (which panics on fatal boolean
+    /// flags) by also checking numeric thresholds and returning actionable
+    /// diagnostics instead of panicking.
+    pub fn validate_production_config(&self) -> Vec<String> {
+        let mut violations = Vec::new();
+
+        if self.developer_mode {
+            violations.push("developer_mode must be false in production".into());
+        }
+        if self.log_level != LogLevel::Error {
+            violations.push("log_level must be Error in production (not Verbose)".into());
+        }
+        if self.max_failed_attempts > 5 {
+            violations.push(format!(
+                "max_failed_attempts is {} but must be <= 5",
+                self.max_failed_attempts
+            ));
+        }
+        if self.max_failed_attempts == 0 {
+            violations.push("max_failed_attempts must not be 0".into());
+        }
+        if self.lockout_duration_secs < 1800 {
+            violations.push(format!(
+                "lockout_duration_secs is {} but must be >= 1800 (30 min)",
+                self.lockout_duration_secs
+            ));
+        }
+        if !self.require_encryption_at_rest {
+            violations.push("require_encryption_at_rest must be true".into());
+        }
+        if !self.require_sealed_keys {
+            violations.push("require_sealed_keys must be true".into());
+        }
+        if !self.require_binary_attestation {
+            violations.push("require_binary_attestation must be true".into());
+        }
+        if !self.require_mlock {
+            violations.push("require_mlock must be true".into());
+        }
+        if !self.entropy_fail_closed {
+            violations.push("entropy_fail_closed must be true".into());
+        }
+        if !self.require_pkce {
+            violations.push("require_pkce must be true".into());
+        }
+        if !self.require_strict_redirect_uri {
+            violations.push("require_strict_redirect_uri must be true".into());
+        }
+        if !self.require_dpop_all_operations {
+            violations.push("require_dpop_all_operations must be true".into());
+        }
+        if self.token_lifetime_tier1_secs > 300 {
+            violations.push(format!(
+                "token_lifetime_tier1_secs is {} but must be <= 300 (5 min)",
+                self.token_lifetime_tier1_secs
+            ));
+        }
+        if self.token_lifetime_tier4_secs > 120 {
+            violations.push(format!(
+                "token_lifetime_tier4_secs is {} but must be <= 120 (2 min)",
+                self.token_lifetime_tier4_secs
+            ));
+        }
+        if self.max_session_lifetime_secs > 28800 {
+            violations.push(format!(
+                "max_session_lifetime_secs is {} but must be <= 28800 (8h)",
+                self.max_session_lifetime_secs
+            ));
+        }
+
+        violations
+    }
 }
 
 #[cfg(test)]
@@ -445,5 +536,27 @@ mod tests {
     fn max_ratchet_epochs() {
         let cfg = SecurityConfig::default();
         assert_eq!(cfg.max_ratchet_epochs(), 2880); // 28800 / 10
+    }
+
+    #[test]
+    fn validate_production_config_default_passes() {
+        let cfg = SecurityConfig::default();
+        let violations = cfg.validate_production_config();
+        assert!(violations.is_empty(), "default config should pass: {:?}", violations);
+    }
+
+    #[test]
+    fn validate_production_config_catches_violations() {
+        let mut cfg = SecurityConfig::default();
+        cfg.developer_mode = true;
+        cfg.log_level = LogLevel::Verbose;
+        cfg.max_failed_attempts = 20;
+        cfg.lockout_duration_secs = 60;
+        let violations = cfg.validate_production_config();
+        assert!(violations.len() >= 4);
+        assert!(violations.iter().any(|v| v.contains("developer_mode")));
+        assert!(violations.iter().any(|v| v.contains("log_level")));
+        assert!(violations.iter().any(|v| v.contains("max_failed_attempts")));
+        assert!(violations.iter().any(|v| v.contains("lockout_duration_secs")));
     }
 }

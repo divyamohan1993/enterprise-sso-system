@@ -16,18 +16,25 @@ const MAX_SESSION_EPOCHS: u64 = 2880;
 /// Default max token lifetime for lazy cleanup (8 hours in seconds).
 const DEFAULT_MAX_TOKEN_LIFETIME_SECS: i64 = 8 * 60 * 60;
 
-/// Verify a token's signature and claims (spec C.11), optionally enforcing
-/// DPoP channel binding when a client key is provided.
+/// Verify a token's signature and claims (spec C.11), enforcing DPoP channel
+/// binding.
+///
+/// DPoP enforcement policy (controlled by `MILNET_REQUIRE_DPOP`, defaults to
+/// `true` in production):
+/// - When `client_dpop_key` is `Some`, the token's `dpop_hash` MUST match
+///   the hash of the provided key.
+/// - When `client_dpop_key` is `None` AND the token has a non-zero `dpop_hash`,
+///   the token is rejected (DPoP-bound token presented without proof).
+/// - When `client_dpop_key` is `None` AND `dpop_hash` is all zeros, the token
+///   is rejected in production mode UNLESS the tier is 3 (Sensor) or 4
+///   (Emergency) which may lack DPoP capability.
 ///
 /// Verification order:
 /// 1. Check version and expiry
 /// 2. Enforce algorithm field (must be 1 — prevents downgrade attacks)
-/// 3. Check pq_signature is NOT empty (reject if missing)
-/// 4. Verify DPoP hash is non-empty (not all zeros)
-/// 4b. If `client_dpop_key` is provided, verify that the token's `dpop_hash`
-///     actually matches `dpop_key_hash(client_dpop_key)` — prevents token
-///     theft where attacker presents a stolen token without the original key
-/// 5. Validate ratchet_epoch is within reasonable bounds
+/// 3. Enforce DPoP channel binding (mandatory in production)
+/// 4. Validate ratchet_epoch is within reasonable bounds
+/// 5. Check pq_signature is NOT empty (reject if missing)
 /// 6. Verify ML-DSA-65 signature over (claims_msg || frost_signature)
 /// 7. Verify FROST signature over claims_msg
 /// 8. Check tier validity
@@ -51,6 +58,26 @@ pub fn verify_token_bound(
     client_dpop_key: &[u8],
 ) -> Result<TokenClaims, MilnetError> {
     verify_token_inner(token, public_key_package, pq_verifying_key, Some(client_dpop_key))
+}
+
+/// Returns `true` if DPoP is required based on environment configuration.
+///
+/// Reads `MILNET_REQUIRE_DPOP`:
+/// - `"false"` or `"0"` → DPoP not required (dev/test mode)
+/// - anything else or unset → DPoP required (production default)
+fn dpop_required() -> bool {
+    std::env::var("MILNET_REQUIRE_DPOP")
+        .map(|v| v != "false" && v != "0")
+        .unwrap_or(true)
+}
+
+/// Returns `true` if the given tier is exempt from DPoP requirements.
+///
+/// Tier 3 (Sensor) and Tier 4 (Emergency) devices may lack the computational
+/// resources or stable connectivity needed for DPoP key management, so they
+/// are exempt from the DPoP binding requirement.
+fn is_dpop_exempt_tier(tier: u8) -> bool {
+    tier == 3 || tier == 4
 }
 
 /// Inner verification logic shared by `verify_token` and `verify_token_bound`.
@@ -87,25 +114,62 @@ fn verify_token_inner(
         ));
     }
 
-    // 4. DPoP channel binding enforcement:
-    //    Only enforce DPoP when the token actually has a non-zero dpop_hash
-    //    (meaning a DPoP key was bound at token creation time).
-    //    - If dpop_hash is all zeros AND client_dpop_key is None → OK (no DPoP bound)
-    //    - If dpop_hash is non-zero AND client_dpop_key is None → OK for basic verify
-    //      (DPoP binding is enforced by verify_token_bound / verify_token_with_dpop)
-    //    - If client_dpop_key is provided → verify it matches dpop_hash
+    // 4. DPoP channel binding enforcement (MANDATORY in production):
+    //
+    //    Policy matrix:
+    //    ┌──────────────────┬──────────────────┬──────────────────────────────┐
+    //    │ client_dpop_key  │ token dpop_hash  │ Result                       │
+    //    ├──────────────────┼──────────────────┼──────────────────────────────┤
+    //    │ Some(key)        │ non-zero         │ MUST match hash(key)         │
+    //    │ Some(key)        │ all zeros        │ REJECT (token has no DPoP)   │
+    //    │ None             │ non-zero         │ REJECT (proof missing)       │
+    //    │ None             │ all zeros        │ REJECT unless exempt tier    │
+    //    └──────────────────┴──────────────────┴──────────────────────────────┘
+    //
+    //    Tiers 3 (Sensor) and 4 (Emergency) are exempt from DPoP when
+    //    MILNET_REQUIRE_DPOP is true — they may lack DPoP capability.
     let all_zeros = [0u8; 32];
+    let require_dpop = dpop_required();
+    let has_dpop_hash = token.claims.dpop_hash != all_zeros;
 
     if let Some(key) = client_dpop_key {
-        // Client provided a DPoP key — verify it matches the token's hash
-        if token.claims.dpop_hash != all_zeros {
-            let expected_hash = crypto::dpop::dpop_key_hash(key);
-            if !crypto::ct::ct_eq(&token.claims.dpop_hash, &expected_hash) {
-                return Err(MilnetError::CryptoVerification(
-                    "DPoP key hash mismatch — token bound to different client".into(),
-                ));
-            }
+        // Client provided a DPoP key — token MUST have a matching dpop_hash.
+        if !has_dpop_hash {
+            return Err(MilnetError::CryptoVerification(
+                "DPoP key provided but token has no DPoP binding (dpop_hash is zero)".into(),
+            ));
         }
+        let expected_hash = crypto::dpop::dpop_key_hash(key);
+        if !crypto::ct::ct_eq(&token.claims.dpop_hash, &expected_hash) {
+            return Err(MilnetError::CryptoVerification(
+                "DPoP key hash mismatch — token bound to different client".into(),
+            ));
+        }
+    } else if has_dpop_hash && require_dpop {
+        // Token has a DPoP binding but no client key was provided — reject.
+        // A DPoP-bound token MUST always be presented with its proof key.
+        // This check is gated on require_dpop so that test environments
+        // (MILNET_REQUIRE_DPOP=false) can verify tokens without DPoP keys.
+        return Err(MilnetError::CryptoVerification(
+            "token has DPoP binding but no client DPoP key was provided — \
+             possible token theft"
+                .into(),
+        ));
+    } else if has_dpop_hash && !require_dpop {
+        // DPoP hash present but enforcement disabled (test/dev mode) — warn
+        // but allow. This path should NEVER be reached in production.
+        tracing::warn!(
+            "DPoP binding present but no client key provided — \
+             allowed because MILNET_REQUIRE_DPOP=false (test mode)"
+        );
+    } else if require_dpop && !is_dpop_exempt_tier(token.claims.tier) {
+        // No DPoP on either side, production mode, non-exempt tier — reject.
+        return Err(MilnetError::CryptoVerification(
+            "DPoP binding is required in production mode (MILNET_REQUIRE_DPOP=true) — \
+             token has no dpop_hash and no client key was provided. \
+             Only Tier 3 (Sensor) and Tier 4 (Emergency) are exempt"
+                .into(),
+        ));
     }
 
     // 5. Validate ratchet_epoch is within reasonable bounds

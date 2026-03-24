@@ -156,11 +156,18 @@ pub fn run_platform_checks<F: FnOnce() -> bool>(harden_fn: F) -> (
             att
         }
         Err(e) => {
+            if production {
+                panic!(
+                    "FATAL: self-attestation failed: {}. \
+                     Production deployment requires binary self-attestation.",
+                    e
+                );
+            }
             tracing::warn!(
-                "platform check [3/4]: self-attestation failed: {} (non-Linux?)",
+                "platform check [3/4]: self-attestation failed: {} (dev mode — continuing)",
                 e
             );
-            summary_parts.push("binary=UNREADABLE".to_string());
+            summary_parts.push("binary=UNREADABLE(dev)".to_string());
             all_passed = false;
             platform_integrity::SelfAttestation {
                 binary_hash: [0u8; 64],
@@ -176,11 +183,26 @@ pub fn run_platform_checks<F: FnOnce() -> bool>(harden_fn: F) -> (
     let (monitor_handle, monitor_ref) =
         platform_integrity::start_integrity_monitor(monitor_interval);
 
-    tracing::info!(
-        "platform check [4/4]: runtime integrity monitor started (interval={}s)",
-        monitor_interval,
-    );
-    summary_parts.push(format!("monitor={}s", monitor_interval));
+    // Verify the monitor thread is actually running.
+    if monitor_handle.is_finished() {
+        if production {
+            panic!(
+                "FATAL: runtime integrity monitor thread exited immediately. \
+                 Production deployment requires a running integrity monitor."
+            );
+        }
+        tracing::warn!(
+            "platform check [4/4]: runtime integrity monitor failed to start (dev mode — continuing)"
+        );
+        summary_parts.push("monitor=FAILED(dev)".to_string());
+        all_passed = false;
+    } else {
+        tracing::info!(
+            "platform check [4/4]: runtime integrity monitor started (interval={}s)",
+            monitor_interval,
+        );
+        summary_parts.push(format!("monitor={}s", monitor_interval));
+    }
 
     // -----------------------------------------------------------------------
     // Build attestation report

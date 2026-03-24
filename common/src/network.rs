@@ -62,6 +62,29 @@ pub fn enforce_channel(sender: ModuleId, receiver: ModuleId) -> Result<(), &'sta
     }
 }
 
+/// Assert that a communication channel is permitted, panicking on violation.
+///
+/// Intended for internal use where a denied channel indicates a programming
+/// error or compromised module. Logs the violation to SIEM before panicking.
+pub fn assert_allowed(sender: ModuleId, receiver: ModuleId) {
+    if !is_permitted_channel(sender, receiver) {
+        tracing::error!(
+            target: "siem",
+            category = "security",
+            action = "communication_matrix_violation",
+            sender = ?sender,
+            receiver = ?receiver,
+            "FATAL: communication channel {:?} -> {:?} denied by module communication matrix",
+            sender,
+            receiver,
+        );
+        panic!(
+            "communication matrix violation: {:?} -> {:?} is not permitted",
+            sender, receiver
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

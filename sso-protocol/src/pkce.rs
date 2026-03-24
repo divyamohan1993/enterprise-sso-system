@@ -66,6 +66,22 @@ pub fn verify_pkce_mandatory(
     }
 }
 
+/// Validate that the `code_challenge_method` is S256.
+///
+/// Per OAuth 2.1 (draft-ietf-oauth-v2-1) and this system's security policy,
+/// only the S256 method is accepted. The "plain" method is explicitly forbidden
+/// because it transmits the verifier in the clear, defeating PKCE's purpose.
+///
+/// Returns `Ok(())` if the method is `"S256"` or `None` (defaults to S256).
+/// Returns `Err` for any other value, including `"plain"`.
+pub fn validate_challenge_method(method: Option<&str>) -> Result<(), &'static str> {
+    match method {
+        None | Some("S256") => Ok(()),
+        Some("plain") => Err("code_challenge_method 'plain' is forbidden — only S256 is accepted"),
+        Some(_) => Err("unsupported code_challenge_method — only S256 is accepted"),
+    }
+}
+
 pub fn generate_challenge(verifier: &str) -> String {
     let hash = Sha256::digest(verifier.as_bytes());
     URL_SAFE_NO_PAD.encode(hash)
@@ -127,5 +143,27 @@ mod tests {
         let verifier = "a".repeat(43);
         let challenge = generate_challenge(&verifier);
         assert!(verify_pkce(&verifier, &challenge));
+    }
+
+    #[test]
+    fn test_validate_challenge_method_s256() {
+        assert!(validate_challenge_method(Some("S256")).is_ok());
+    }
+
+    #[test]
+    fn test_validate_challenge_method_none_defaults_s256() {
+        assert!(validate_challenge_method(None).is_ok());
+    }
+
+    #[test]
+    fn test_validate_challenge_method_plain_rejected() {
+        let err = validate_challenge_method(Some("plain")).unwrap_err();
+        assert!(err.contains("plain"));
+        assert!(err.contains("forbidden"));
+    }
+
+    #[test]
+    fn test_validate_challenge_method_unknown_rejected() {
+        assert!(validate_challenge_method(Some("RS256")).is_err());
     }
 }

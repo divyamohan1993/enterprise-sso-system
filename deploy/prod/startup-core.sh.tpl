@@ -13,7 +13,9 @@ SHARD_HMAC_KEY=$(head -c 64 /dev/urandom | base64 -w0)
 echo "Generated unique SHARD HMAC key for core VM"
 
 # ── Create milnet user (non-root) ──
-useradd -r -s /bin/false -m milnet 2>/dev/null || true
+if ! id milnet &>/dev/null; then
+    useradd -r -s /bin/false -m milnet
+fi
 
 # ── Install Docker (COS has Docker pre-installed) ──
 if ! command -v docker &>/dev/null; then
@@ -23,15 +25,25 @@ if ! command -v docker &>/dev/null; then
 fi
 
 # ── Wait for Docker ──
+docker_ready=false
 for i in $(seq 1 30); do
-  docker info &>/dev/null && break
+  if docker info &>/dev/null; then
+    docker_ready=true
+    break
+  fi
   echo "Waiting for Docker... ($i/30)"
   sleep 2
 done
+if [ "$docker_ready" = false ]; then
+  echo "ERROR: Docker failed to start after 60 seconds" >&2
+  exit 1
+fi
 
 # ── Authenticate to Artifact Registry ──
 echo "Authenticating to Artifact Registry..."
-gcloud auth configure-docker ${project_id}-docker.pkg.dev,asia-south1-docker.pkg.dev --quiet 2>/dev/null || true
+if ! gcloud auth configure-docker ${project_id}-docker.pkg.dev,asia-south1-docker.pkg.dev --quiet 2>&1; then
+  echo "WARNING: Artifact Registry auth may have failed" >&2
+fi
 
 # ── Pull ONLY core service images ──
 echo "Pulling core service images..."
@@ -43,11 +55,11 @@ docker pull ${ar_registry}/audit:latest || echo "WARN: audit pull failed"
 
 # ── Start Cloud SQL Auth Proxy (private IP, sidecar) ──
 echo "Starting Cloud SQL Auth Proxy..."
-docker pull gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.14.1 || true
+docker pull gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.14.1
 docker run -d \
   --name cloud-sql-proxy \
   --restart unless-stopped \
-  -p 5432:5432 \
+  -p 127.0.0.1:5432:5432 \
   gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.14.1 \
   --private-ip \
   --address 0.0.0.0 \
@@ -56,11 +68,19 @@ docker run -d \
 
 # Wait for proxy to be ready
 echo "Waiting for Cloud SQL Auth Proxy..."
+proxy_ready=false
 for i in $(seq 1 30); do
-  nc -z 127.0.0.1 5432 2>/dev/null && break
+  if nc -z 127.0.0.1 5432 2>/dev/null; then
+    proxy_ready=true
+    break
+  fi
   echo "Waiting for SQL proxy... ($i/30)"
   sleep 2
 done
+if [ "$proxy_ready" = false ]; then
+  echo "ERROR: Cloud SQL Auth Proxy failed to start after 60 seconds" >&2
+  exit 1
+fi
 
 # Fetch DB password from Secret Manager at runtime (NEVER in metadata/env/disk)
 echo "Fetching DB password from Secret Manager..."
@@ -73,11 +93,18 @@ DB_PASSWORD=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
 unset ACCESS_TOKEN  # Don't leave token in environment
 echo "DB password fetched from Secret Manager (length: $${#DB_PASSWORD})"
 
-# Database URL via local proxy (SSL enforced by Cloud SQL side)
-DATABASE_URL="postgresql://${db_user}:$${DB_PASSWORD}@127.0.0.1:5432/${db_name}"
+# Write DATABASE_URL to a tmpfile with restricted permissions, to avoid
+# exposing credentials via environment variables visible in /proc/*/environ
+DB_CRED_FILE=$(mktemp /tmp/milnet-dburl-XXXXXX)
+chmod 600 "$DB_CRED_FILE"
+echo "postgresql://${db_user}:$${DB_PASSWORD}@127.0.0.1:5432/${db_name}" > "$DB_CRED_FILE"
+unset DB_PASSWORD  # Don't leave password in shell environment
 
 # ── Create isolated Docker network ──
 docker network create milnet-internal 2>/dev/null || true
+
+# Common security flags for all containers
+SECURITY_OPTS="--security-opt no-new-privileges:true --cap-drop ALL --read-only --tmpfs /tmp"
 
 # ── Start OPAQUE service (:9102) ──
 echo "Starting opaque on :9102..."
@@ -86,12 +113,15 @@ docker run -d \
   --restart unless-stopped \
   --network milnet-internal \
   --user 1000:1000 \
-  -p 9102:9102 \
+  $SECURITY_OPTS \
+  -p 127.0.0.1:9102:9102 \
   -e RUST_LOG=info \
   -e BIND_ADDR=0.0.0.0:9102 \
-  -e DATABASE_URL="$DATABASE_URL" \
+  -e DATABASE_URL="$(cat "$DB_CRED_FILE")" \
   -e KMS_KEYRING="${kms_keyring}" \
   -e SHARD_HMAC_KEY="$SHARD_HMAC_KEY" \
+  --memory 256m \
+  --cpus 0.5 \
   ${ar_registry}/opaque:latest
 
 # ── Start Admin service (:8080) ──
@@ -101,12 +131,15 @@ docker run -d \
   --restart unless-stopped \
   --network milnet-internal \
   --user 1000:1000 \
+  $SECURITY_OPTS \
   -p 8080:8080 \
   -e RUST_LOG=info \
   -e BIND_ADDR=0.0.0.0:8080 \
-  -e DATABASE_URL="$DATABASE_URL" \
+  -e DATABASE_URL="$(cat "$DB_CRED_FILE")" \
   -e KMS_KEYRING="${kms_keyring}" \
   -e SHARD_HMAC_KEY="$SHARD_HMAC_KEY" \
+  --memory 512m \
+  --cpus 1.0 \
   ${ar_registry}/admin:latest
 
 # ── Start Verifier service (:9104) ──
@@ -116,12 +149,15 @@ docker run -d \
   --restart unless-stopped \
   --network milnet-internal \
   --user 1000:1000 \
-  -p 9104:9104 \
+  $SECURITY_OPTS \
+  -p 127.0.0.1:9104:9104 \
   -e RUST_LOG=info \
   -e BIND_ADDR=0.0.0.0:9104 \
-  -e DATABASE_URL="$DATABASE_URL" \
+  -e DATABASE_URL="$(cat "$DB_CRED_FILE")" \
   -e KMS_KEYRING="${kms_keyring}" \
   -e SHARD_HMAC_KEY="$SHARD_HMAC_KEY" \
+  --memory 256m \
+  --cpus 0.5 \
   ${ar_registry}/verifier:latest
 
 # ── Start Ratchet service (:9105) ──
@@ -131,12 +167,15 @@ docker run -d \
   --restart unless-stopped \
   --network milnet-internal \
   --user 1000:1000 \
-  -p 9105:9105 \
+  $SECURITY_OPTS \
+  -p 127.0.0.1:9105:9105 \
   -e RUST_LOG=info \
   -e BIND_ADDR=0.0.0.0:9105 \
-  -e DATABASE_URL="$DATABASE_URL" \
+  -e DATABASE_URL="$(cat "$DB_CRED_FILE")" \
   -e KMS_KEYRING="${kms_keyring}" \
   -e SHARD_HMAC_KEY="$SHARD_HMAC_KEY" \
+  --memory 256m \
+  --cpus 0.5 \
   ${ar_registry}/ratchet:latest
 
 # ── Start Audit service (:9108) ──
@@ -146,13 +185,20 @@ docker run -d \
   --restart unless-stopped \
   --network milnet-internal \
   --user 1000:1000 \
-  -p 9108:9108 \
+  $SECURITY_OPTS \
+  -p 127.0.0.1:9108:9108 \
   -e RUST_LOG=info \
   -e BIND_ADDR=0.0.0.0:9108 \
-  -e DATABASE_URL="$DATABASE_URL" \
+  -e DATABASE_URL="$(cat "$DB_CRED_FILE")" \
   -e KMS_KEYRING="${kms_keyring}" \
   -e SHARD_HMAC_KEY="$SHARD_HMAC_KEY" \
+  --memory 256m \
+  --cpus 0.5 \
   ${ar_registry}/audit:latest
+
+# Delete credential file now that all containers have started
+rm -f "$DB_CRED_FILE"
+unset SHARD_HMAC_KEY
 
 echo "=== MILNET Core startup complete at $(date -u) ==="
 echo "Services: opaque(:9102) admin(:8080) verifier(:9104) ratchet(:9105) audit(:9108)"

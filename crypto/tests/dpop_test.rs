@@ -27,7 +27,7 @@ fn test_dpop_key_hash_different_keys_differ() {
 #[test]
 fn test_dpop_proof_generation_and_verification() {
     run_with_large_stack(|| {
-        let (sk, vk) = generate_dpop_keypair();
+        let (sk, vk) = generate_dpop_keypair_raw();
         let claims = b"test-claims";
         let timestamp = 12345i64;
         let proof = generate_dpop_proof(&sk, claims, timestamp);
@@ -40,8 +40,8 @@ fn test_dpop_proof_generation_and_verification() {
 #[test]
 fn test_dpop_proof_rejects_wrong_key() {
     run_with_large_stack(|| {
-        let (sk1, _vk1) = generate_dpop_keypair();
-        let (_sk2, vk2) = generate_dpop_keypair();
+        let (sk1, _vk1) = generate_dpop_keypair_raw();
+        let (_sk2, vk2) = generate_dpop_keypair_raw();
         let claims = b"test-claims";
         let timestamp = 12345i64;
         let proof = generate_dpop_proof(&sk1, claims, timestamp);
@@ -55,7 +55,7 @@ fn test_dpop_proof_rejects_wrong_key() {
 #[test]
 fn test_dpop_proof_rejects_wrong_claims() {
     run_with_large_stack(|| {
-        let (sk, vk) = generate_dpop_keypair();
+        let (sk, vk) = generate_dpop_keypair_raw();
         let timestamp = 12345i64;
         let proof = generate_dpop_proof(&sk, b"original", timestamp);
         let vk_bytes = vk.encode();
@@ -74,11 +74,24 @@ fn test_dpop_key_hash_length_is_32() {
 #[test]
 fn test_dpop_proof_rejects_wrong_timestamp() {
     run_with_large_stack(|| {
-        let (sk, vk) = generate_dpop_keypair();
+        let (sk, vk) = generate_dpop_keypair_raw();
         let claims = b"claims-data";
         let proof = generate_dpop_proof(&sk, claims, 1000);
         let vk_bytes = vk.encode();
         let key_hash = dpop_key_hash(vk_bytes.as_ref());
         assert!(!verify_dpop_proof(&vk, &proof, claims, 2000, &key_hash));
+    });
+}
+
+#[test]
+fn test_guarded_keypair_sign_and_verify() {
+    run_with_large_stack(|| {
+        let (guarded_sk, vk) = generate_dpop_keypair();
+        let claims = b"guarded-test";
+        let timestamp = 99i64;
+        let proof = generate_dpop_proof(guarded_sk.signing_key(), claims, timestamp);
+        let vk_bytes = vk.encode();
+        let key_hash = dpop_key_hash(vk_bytes.as_ref());
+        assert!(verify_dpop_proof(&vk, &proof, claims, timestamp, &key_hash));
     });
 }

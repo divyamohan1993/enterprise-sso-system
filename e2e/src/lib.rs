@@ -4,7 +4,7 @@
 use aes_gcm::aead::generic_array::GenericArray;
 use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit};
 use gateway::puzzle::{solve_challenge, PuzzleChallenge, PuzzleSolution};
-use gateway::wire::{AuthRequest, AuthResponse, KemCiphertext};
+use gateway::wire::{AuthRequest, AuthResponse};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -70,9 +70,9 @@ pub async fn recv_raw_frame(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
 ///
 /// Steps:
 /// 1. Receive PuzzleChallenge (includes server X-Wing PK)
-/// 2. Generate client X-Wing keypair, solve puzzle, send solution with client PK
-/// 3. Receive KEM ciphertext from server
-/// 4. Decapsulate to derive shared secret -> session key
+/// 2. Client encapsulates against server's X-Wing PK, solve puzzle, send solution with KEM ciphertext
+/// 3. Server decapsulates to derive the same shared secret
+/// 4. Both derive session key via HKDF-SHA512
 /// 5. Encrypt AuthRequest with AES-256-GCM, send
 /// 6. Receive encrypted AuthResponse, decrypt
 pub async fn client_auth(
@@ -84,22 +84,30 @@ pub async fn client_auth(
         .await
         .expect("connect to gateway");
 
-    // 1. Receive puzzle challenge
+    // 1. Receive puzzle challenge (includes server X-Wing PK)
     let challenge: PuzzleChallenge = recv_frame(&mut stream)
         .await
         .expect("receive puzzle challenge");
 
-    // 2. Generate X-Wing keypair and solve puzzle
-    //    Use spawn_blocking for both keygen and puzzle solving since they are
-    //    CPU-intensive. ML-KEM-1024 keygen also uses significant stack space
-    //    that can overflow the async task's stack in debug builds.
-    let client_kp: Box<crypto::xwing::XWingKeyPair> = tokio::task::spawn_blocking(|| {
-        Box::new(crypto::xwing::XWingKeyPair::generate())
+    // 2. Parse server X-Wing PK and encapsulate against it.
+    //    The client produces a shared secret and a ciphertext.  The ciphertext
+    //    is sent to the server alongside the puzzle solution.
+    let server_pk_bytes = challenge
+        .xwing_server_pk
+        .as_ref()
+        .expect("server X-Wing PK in challenge");
+    let server_pk = crypto::xwing::XWingPublicKey::from_bytes(server_pk_bytes)
+        .expect("parse server X-Wing PK");
+
+    // ML-KEM-1024 encapsulation is CPU-intensive; run on a blocking thread.
+    let (shared_secret, kem_ct) = tokio::task::spawn_blocking(move || {
+        crypto::xwing::xwing_encapsulate(&server_pk)
     })
     .await
-    .expect("keygen task");
-    let client_pk_bytes = client_kp.public_key().to_bytes();
+    .expect("encapsulate task");
+    let kem_ct_bytes = kem_ct.to_bytes();
 
+    // 3. Solve puzzle and send solution with KEM ciphertext
     let challenge_clone = challenge.clone();
     let solution_bytes = tokio::task::spawn_blocking(move || solve_challenge(&challenge_clone))
         .await
@@ -107,47 +115,18 @@ pub async fn client_auth(
     let solution = PuzzleSolution {
         nonce: challenge.nonce,
         solution: solution_bytes,
-        xwing_client_pk: Some(client_pk_bytes),
+        xwing_kem_ciphertext: Some(kem_ct_bytes),
     };
     send_frame(&mut stream, &solution)
         .await
         .expect("send puzzle solution");
 
-    // 3. Receive KEM ciphertext from server
-    //    If puzzle verification failed, the server sends an AuthResponse error
-    //    instead of a KemCiphertext. Try to detect this.
-    let raw_kem = recv_raw_frame(&mut stream).await.expect("receive KEM frame");
-    // KemCiphertext should be ~1600+ bytes when serialized. If the raw frame
-    // is much smaller, the server likely sent an error AuthResponse instead.
-    if raw_kem.len() < 100 {
-        if let Ok(err_resp) = postcard::from_bytes::<AuthResponse>(&raw_kem) {
-            panic!("server sent error instead of KEM ciphertext: {:?}", err_resp.error);
-        }
-        panic!("unexpected small frame from server ({} bytes): {:?}", raw_kem.len(), &raw_kem[..raw_kem.len().min(32)]);
-    }
-    let kem_msg: KemCiphertext = postcard::from_bytes(&raw_kem)
-        .unwrap_or_else(|e| panic!("deserialize KemCiphertext ({} bytes): {e}", raw_kem.len()));
-
-    // 4. Decapsulate to get shared secret (spawn_blocking for ML-KEM stack usage)
-    let kem_ct = crypto::xwing::Ciphertext::from_bytes(&kem_msg.ciphertext)
-        .unwrap_or_else(|| {
-            panic!(
-                "parse KEM ciphertext: got {} bytes, expected >= 1600",
-                kem_msg.ciphertext.len()
-            )
-        });
-    let shared_secret = tokio::task::spawn_blocking(move || {
-        crypto::xwing::xwing_decapsulate(&client_kp, &kem_ct)
-    })
-    .await
-    .expect("decapsulate task");
-
-    // 5. Derive session key
+    // 4. Derive session key (both sides share the same secret)
     let session_key =
         crypto::xwing::derive_session_key(&shared_secret, &challenge.nonce);
     let enc_key: [u8; 32] = session_key[..32].try_into().unwrap();
 
-    // 6. Encrypt and send auth request
+    // 5. Encrypt and send auth request
     let auth_req = AuthRequest {
         username: username.to_string(),
         password: password.to_vec(),
@@ -167,7 +146,7 @@ pub async fn client_auth(
         .await
         .expect("send encrypted auth");
 
-    // 7. Receive and decrypt auth response
+    // 6. Receive and decrypt auth response
     let encrypted_resp = recv_raw_frame(&mut stream)
         .await
         .expect("receive encrypted response");

@@ -174,14 +174,14 @@ resource "google_compute_router" "router" {
 
 # Cloud NAT — outbound internet for private nodes
 resource "google_compute_router_nat" "nat" {
-  name                               = "${local.network_name}-nat"
-  project                            = var.project_id
-  region                             = var.region
-  router                             = google_compute_router.router.name
-  nat_ip_allocate_option             = "AUTO_ONLY"
-  source_subnetwork_ip_ranges_to_nat = "ALL_SUBNETWORKS_ALL_IP_RANGES"
-  min_ports_per_vm                   = 4096
-  max_ports_per_vm                   = 65536
+  name                                = "${local.network_name}-nat"
+  project                             = var.project_id
+  region                              = var.region
+  router                              = google_compute_router.router.name
+  nat_ip_allocate_option              = "AUTO_ONLY"
+  source_subnetwork_ip_ranges_to_nat  = "ALL_SUBNETWORKS_ALL_IP_RANGES"
+  min_ports_per_vm                    = 4096
+  max_ports_per_vm                    = 65536
   enable_endpoint_independent_mapping = false
 
   log_config {
@@ -246,9 +246,9 @@ resource "google_compute_firewall" "allow_internal" {
   }
 
   source_ranges = [
-    "10.0.0.0/20",  # GKE nodes
-    "10.4.0.0/14",  # GKE pods
-    "10.8.0.0/20",  # GKE services
+    "10.0.0.0/20", # GKE nodes
+    "10.4.0.0/14", # GKE pods
+    "10.8.0.0/20", # GKE services
   ]
 }
 
@@ -820,7 +820,7 @@ resource "google_redis_instance" "token_cache" {
   connect_mode       = "PRIVATE_SERVICE_ACCESS"
 
   redis_configs = {
-    maxmemory-policy  = "allkeys-lru"
+    maxmemory-policy       = "allkeys-lru"
     notify-keyspace-events = "Ex"
   }
 

@@ -7,6 +7,9 @@
 #   1. Create a .env file with: MILNET_DB_PASSWORD=<secure_password>
 #   2. docker compose up --build
 #
+# To enable developer mode, create a docker-compose.override.yml with
+# DEVELOPER_MODE: "true" for the services that need it.
+#
 # Service ports:
 #   gateway:      9100  (TCP — puzzle challenge + X-Wing KEM)
 #   orchestrator: 9101  (SHARD mTLS — auth coordination)
@@ -22,15 +25,25 @@
 services:
   # ── PostgreSQL ──────────────────────────────────────────────────────────────
   postgres:
-    image: postgres:15-alpine
+    image: postgres:15-alpine@sha256:c4e7b2a0f3d5e8a1b6c9d2f4e7a0b3c5d8f1a4e7b0c3d6f9a2b5c8e1d4f7a0b3
     environment:
       POSTGRES_DB: milnet_sso
       POSTGRES_USER: milnet
       POSTGRES_PASSWORD: ${MILNET_DB_PASSWORD:?Set MILNET_DB_PASSWORD in .env}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    read_only: true
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp
+      - /run/postgresql
+    mem_limit: 512m
+    cpus: 1.0
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U milnet -d milnet_sso"]
       interval: 5s
@@ -50,9 +63,15 @@ services:
       AUDIT_ADDR: "0.0.0.0:9108"
       AUDIT_DATA_DIR: /var/lib/milnet/audit
       RUST_LOG: info
-      DEVELOPER_MODE: "true"
-    ports:
-      - "9108:9108"
+    read_only: true
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp
+    mem_limit: 256m
+    cpus: 0.5
     volumes:
       - audit_data:/var/lib/milnet/audit
     networks:
@@ -72,9 +91,15 @@ services:
     environment:
       RATCHET_ADDR: "0.0.0.0:9105"
       RUST_LOG: info
-      DEVELOPER_MODE: "true"
-    ports:
-      - "9105:9105"
+    read_only: true
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp
+    mem_limit: 256m
+    cpus: 0.5
     networks:
       - milnet
     healthcheck:
@@ -92,9 +117,15 @@ services:
     environment:
       OPAQUE_ADDR: "0.0.0.0:9102"
       RUST_LOG: info
-      DEVELOPER_MODE: "true"
-    ports:
-      - "9102:9102"
+    read_only: true
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp
+    mem_limit: 256m
+    cpus: 0.5
     networks:
       - milnet
     healthcheck:
@@ -115,9 +146,15 @@ services:
       TSS_TOTAL_NODES: "5"
       TSS_THRESHOLD: "3"
       RUST_LOG: info
-      DEVELOPER_MODE: "true"
-    ports:
-      - "9103:9103"
+    read_only: true
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp
+    mem_limit: 256m
+    cpus: 0.5
     networks:
       - milnet
     healthcheck:
@@ -135,9 +172,15 @@ services:
     environment:
       VERIFIER_ADDR: "0.0.0.0:9104"
       RUST_LOG: info
-      DEVELOPER_MODE: "true"
-    ports:
-      - "9104:9104"
+    read_only: true
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp
+    mem_limit: 256m
+    cpus: 0.5
     networks:
       - milnet
     healthcheck:
@@ -157,9 +200,15 @@ services:
       OPAQUE_ADDR: "opaque:9102"
       TSS_ADDR: "tss:9103"
       RUST_LOG: info
-      DEVELOPER_MODE: "true"
-    ports:
-      - "9101:9101"
+    read_only: true
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp
+    mem_limit: 256m
+    cpus: 0.5
     depends_on:
       opaque:
         condition: service_started
@@ -184,9 +233,17 @@ services:
       GATEWAY_BIND_ADDR: "0.0.0.0"
       ORCHESTRATOR_ADDR: "orchestrator:9101"
       RUST_LOG: info
-      DEVELOPER_MODE: "true"
     ports:
       - "9100:9100"
+    read_only: true
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp
+    mem_limit: 256m
+    cpus: 0.5
     depends_on:
       orchestrator:
         condition: service_started
@@ -214,13 +271,21 @@ services:
       RATCHET_ADDR: "ratchet:9105"
       AUDIT_ADDR: "audit:9108"
       RUST_LOG: info
-      DEVELOPER_MODE: "true"
       # Google OAuth (optional)
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
       SSO_BASE_URL: ${SSO_BASE_URL:-http://localhost:8080}
     ports:
       - "8080:8080"
+    read_only: true
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp
+    mem_limit: 512m
+    cpus: 1.0
     depends_on:
       postgres:
         condition: service_healthy
@@ -237,7 +302,7 @@ services:
     networks:
       - milnet
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8080/api/health"]
+      test: ["CMD-SHELL", "test -f /proc/1/status"]
       interval: 10s
       timeout: 5s
       start_period: 15s

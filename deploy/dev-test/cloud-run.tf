@@ -68,7 +68,7 @@ resource "google_kms_crypto_key" "master_kek" {
 
   version_template {
     algorithm        = "GOOGLE_SYMMETRIC_ENCRYPTION"
-    protection_level = "HSM"  # FIPS 140-3 Level 3 — same as prod
+    protection_level = "HSM" # FIPS 140-3 Level 3 — same as prod
   }
 
   rotation_period = "7776000s" # 90 days
@@ -85,7 +85,7 @@ resource "google_kms_crypto_key" "signing_key" {
 
   version_template {
     algorithm        = "EC_SIGN_P256_SHA256"
-    protection_level = "HSM"  # FIPS 140-3 Level 3 — same as prod
+    protection_level = "HSM" # FIPS 140-3 Level 3 — same as prod
   }
 
   lifecycle {
