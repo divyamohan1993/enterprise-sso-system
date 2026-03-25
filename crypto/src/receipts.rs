@@ -6,11 +6,11 @@
 //!
 //! CNSA 2.0 compliance: All hashing upgraded from SHA-256 to SHA-512.
 //! HMAC upgraded from HMAC-SHA256 to HMAC-SHA512.
-//! Asymmetric receipt signing upgraded from Ed25519 to ML-DSA-65 (FIPS 204).
+//! Asymmetric receipt signing upgraded from Ed25519 to ML-DSA-87 (FIPS 204, Level 5).
 
 use ml_dsa::{
     signature::{Signer, Verifier},
-    EncodedVerifyingKey, KeyGen, MlDsa65, SigningKey, VerifyingKey,
+    EncodedVerifyingKey, KeyGen, MlDsa87, SigningKey, VerifyingKey,
 };
 use hmac::{Hmac, Mac};
 use common::domain;
@@ -21,10 +21,10 @@ use zeroize::Zeroize;
 
 type HmacSha512 = Hmac<Sha512>;
 
-/// Type aliases for ML-DSA-65 receipt key types.
-pub type ReceiptSigningKey = SigningKey<MlDsa65>;
-pub type ReceiptVerifyingKey = VerifyingKey<MlDsa65>;
-pub type ReceiptSignature = ml_dsa::Signature<MlDsa65>;
+/// Type aliases for ML-DSA-87 receipt key types.
+pub type ReceiptSigningKey = SigningKey<MlDsa87>;
+pub type ReceiptVerifyingKey = VerifyingKey<MlDsa87>;
+pub type ReceiptSignature = ml_dsa::Signature<MlDsa87>;
 
 /// Hash a receipt for chain linking (CNSA 2.0: SHA-512)
 pub fn hash_receipt(receipt: &Receipt) -> [u8; 64] {
@@ -184,13 +184,13 @@ impl ReceiptChain {
 // Asymmetric receipt signing (ML-DSA-65, CNSA 2.0 compliant)
 // ---------------------------------------------------------------------------
 
-/// Generate an ML-DSA-65 keypair for asymmetric receipt signing.
+/// Generate an ML-DSA-87 keypair for asymmetric receipt signing.
 ///
-/// Returns (signing_key, verifying_key) as ML-DSA-65 types.
+/// Returns (signing_key, verifying_key) as ML-DSA-87 types.
 pub fn generate_receipt_keypair() -> (ReceiptSigningKey, ReceiptVerifyingKey) {
     let mut seed = [0u8; 32];
     getrandom::getrandom(&mut seed).expect("getrandom failed");
-    let kp = MlDsa65::from_seed(&seed.into());
+    let kp = MlDsa87::from_seed(&seed.into());
     seed.zeroize();
     (kp.signing_key().clone(), kp.verifying_key().clone())
 }
@@ -209,32 +209,32 @@ pub fn receipt_signing_data(receipt: &Receipt) -> Vec<u8> {
     data
 }
 
-/// Sign receipt data with an ML-DSA-65 signing key.
+/// Sign receipt data with an ML-DSA-87 signing key.
 ///
-/// `signing_key` must be the encoded ML-DSA-65 signing key bytes.
-/// Returns the encoded ML-DSA-65 signature bytes.
+/// `signing_key` must be exactly 32 bytes (seed).
+/// Returns the encoded ML-DSA-87 signature bytes.
 pub fn sign_receipt_asymmetric(signing_key: &[u8], data: &[u8]) -> Vec<u8> {
     // Reconstruct the signing key from a 32-byte seed
-    // ML-DSA-65 signing keys are 4032 bytes encoded, but we accept a 32-byte
+    // ML-DSA-87 signing keys are encoded, but we accept a 32-byte
     // seed for ergonomic parity with the old Ed25519 API.
     let seed: [u8; 32] = signing_key
         .try_into()
         .expect("signing_key must be exactly 32 bytes (seed)");
-    let sk = SigningKey::<MlDsa65>::from_seed(&seed.into());
+    let sk = SigningKey::<MlDsa87>::from_seed(&seed.into());
     let sig: ReceiptSignature = sk.sign(data);
     sig.encode().to_vec()
 }
 
-/// Verify an ML-DSA-65 signature over receipt data.
+/// Verify an ML-DSA-87 signature over receipt data.
 ///
-/// `verifying_key` must be the encoded ML-DSA-65 verifying key bytes (1952 bytes).
-/// Uses ML-DSA-65 signature verification (CNSA 2.0 compliant).
+/// `verifying_key` must be the encoded ML-DSA-87 verifying key bytes.
+/// Uses ML-DSA-87 signature verification (CNSA 2.0 compliant, Level 5).
 pub fn verify_receipt_asymmetric(verifying_key: &[u8], data: &[u8], signature: &[u8]) -> bool {
-    let vk_enc = match EncodedVerifyingKey::<MlDsa65>::try_from(verifying_key) {
+    let vk_enc = match EncodedVerifyingKey::<MlDsa87>::try_from(verifying_key) {
         Ok(enc) => enc,
         Err(_) => return false,
     };
-    let vk = VerifyingKey::<MlDsa65>::decode(&vk_enc);
+    let vk = VerifyingKey::<MlDsa87>::decode(&vk_enc);
     let sig = match ReceiptSignature::try_from(signature) {
         Ok(s) => s,
         Err(_) => return false,
@@ -270,7 +270,7 @@ mod tests {
             // Use a seed for signing, and the encoded verifying key for verification
             let mut seed = [0u8; 32];
             getrandom::getrandom(&mut seed).expect("getrandom failed");
-            let kp = MlDsa65::from_seed(&seed.into());
+            let kp = MlDsa87::from_seed(&seed.into());
             let vk = kp.verifying_key();
             let vk_bytes = vk.encode();
 
@@ -287,7 +287,7 @@ mod tests {
             getrandom::getrandom(&mut seed1).expect("getrandom failed");
             let mut seed2 = [0u8; 32];
             getrandom::getrandom(&mut seed2).expect("getrandom failed");
-            let kp2 = MlDsa65::from_seed(&seed2.into());
+            let kp2 = MlDsa87::from_seed(&seed2.into());
             let vk2_bytes = kp2.verifying_key().encode();
 
             let data = b"receipt data";
@@ -301,7 +301,7 @@ mod tests {
         run_with_large_stack(|| {
             let mut seed = [0u8; 32];
             getrandom::getrandom(&mut seed).expect("getrandom failed");
-            let kp = MlDsa65::from_seed(&seed.into());
+            let kp = MlDsa87::from_seed(&seed.into());
             let vk_bytes = kp.verifying_key().encode();
 
             let data = b"original data";
