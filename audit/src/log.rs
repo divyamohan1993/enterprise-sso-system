@@ -727,7 +727,7 @@ mod tests {
         log.enforce_retention();
         assert_eq!(log.len(), 0); // all expired
 
-        // Verify the archive file exists and is encrypted (starts with MILBK001)
+        // Verify the archive file exists and is encrypted (starts with MILBK001 v1 or MILBK002 v2)
         let archive_files: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -736,7 +736,12 @@ mod tests {
         assert_eq!(archive_files.len(), 1);
 
         let archive_data = std::fs::read(archive_files[0].path()).unwrap();
-        assert_eq!(&archive_data[..8], b"MILBK001", "archive should be encrypted");
+        let magic = &archive_data[..8];
+        assert!(
+            magic == b"MILBK001" || magic == b"MILBK002",
+            "archive should be encrypted (MILBK001 or MILBK002), got {:?}",
+            magic
+        );
 
         // Verify we can decrypt it
         let decrypted = common::backup::import_backup(&kek, &archive_data).unwrap();
