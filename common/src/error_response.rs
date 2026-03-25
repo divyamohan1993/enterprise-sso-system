@@ -320,17 +320,19 @@ mod tests {
 
     #[test]
     fn error_with_location_includes_file_in_dev() {
-        // Temporarily enable dev mode for this test
-        developer_mode().set_developer_mode(true);
-        let msg = error_with_location("test error");
-        assert!(msg.contains("test error"));
+        // Temporarily enable dev mode for this test.
+        // Use a message that does not match any sensitive keyword pattern
+        // in map_to_safe_message, so it passes through verbatim in dev mode.
+        developer_mode().set_developer_mode_unchecked(true);
+        let msg = error_with_location("validation check failed for input");
+        assert!(msg.contains("validation check failed for input"));
         assert!(msg.contains("error_response.rs"));
-        developer_mode().set_developer_mode(false);
+        developer_mode().set_developer_mode_unchecked(false);
     }
 
     #[test]
     fn error_with_location_masks_in_prod() {
-        developer_mode().set_developer_mode(false);
+        developer_mode().set_developer_mode_unchecked(false);
         let msg = error_with_location("AES-256-GCM decrypt failed");
         assert_eq!(msg, "internal error");
         assert!(!msg.contains("error_response.rs"));

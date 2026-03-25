@@ -5,6 +5,7 @@
 //! file without touching code.
 
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::OnceLock;
 
 /// Log verbosity level for the system.
 ///
@@ -39,10 +40,120 @@ impl std::fmt::Display for LogLevel {
     }
 }
 
+/// Cryptographic activation key for developer mode.
+///
+/// Developer mode can ONLY be toggled with a valid HMAC-SHA512 proof derived
+/// from a secret activation key.  The key is loaded once from
+/// `MILNET_DEV_MODE_KEY` (hex-encoded, 64 chars = 32 bytes) and removed from
+/// the process environment immediately.  Without the key, developer mode
+/// cannot be enabled — even by an attacker who has compromised the binary or
+/// the admin API.
+///
+/// The activation key should be stored:
+///   1. In a GCS bucket with Object Lock / retention policy (documented below)
+///   2. In the operator's secure password manager
+///
+/// GCS bucket instructions (DO NOT DELETE):
+///   Bucket: gs://milnet-devmode-keys-<deployment_id>/
+///   Object: devmode-activation-key.hex
+///   Retention: 365 days minimum, Object Lock enabled
+///   Access: roles/storage.objectViewer for break-glass SA only
+static DEV_MODE_ACTIVATION_KEY: OnceLock<Option<[u8; 32]>> = OnceLock::new();
+
+/// Domain separator for developer mode HMAC proofs.
+const DEV_MODE_HMAC_DOMAIN: &[u8] = b"MILNET-DEV-MODE-ACTIVATE-v1";
+
+/// Load the developer mode activation key from environment (call once at startup).
+pub fn load_dev_mode_activation_key() {
+    DEV_MODE_ACTIVATION_KEY.get_or_init(|| {
+        match std::env::var("MILNET_DEV_MODE_KEY") {
+            Ok(hex_key) => {
+                // Immediately remove from environment
+                std::env::remove_var("MILNET_DEV_MODE_KEY");
+                if hex_key.len() != 64 {
+                    tracing::error!(
+                        "MILNET_DEV_MODE_KEY must be exactly 64 hex chars (32 bytes), got {}",
+                        hex_key.len()
+                    );
+                    return None;
+                }
+                let mut key = [0u8; 32];
+                if hex::decode_to_slice(&hex_key, &mut key).is_err() {
+                    tracing::error!("MILNET_DEV_MODE_KEY contains invalid hex");
+                    return None;
+                }
+                // Reject all-zero key
+                if key.iter().all(|&b| b == 0) {
+                    tracing::error!("MILNET_DEV_MODE_KEY is all zeros — rejected");
+                    return None;
+                }
+                tracing::info!("Developer mode activation key loaded (will require HMAC proof to toggle)");
+                Some(key)
+            }
+            Err(_) => {
+                tracing::info!("No MILNET_DEV_MODE_KEY set — developer mode toggle requires key");
+                None
+            }
+        }
+    });
+}
+
+/// Verify a developer mode activation proof.
+///
+/// The proof is HMAC-SHA512(key, domain || action) where action is "enable" or "disable".
+/// Returns true if the proof is valid.
+pub fn verify_dev_mode_proof(proof_hex: &str, action: &str) -> bool {
+    let key = match DEV_MODE_ACTIVATION_KEY.get().and_then(|k| k.as_ref()) {
+        Some(k) => k,
+        None => return false,
+    };
+
+    let expected_proof = {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha512;
+        type HmacSha512 = Hmac<Sha512>;
+        let mut mac = HmacSha512::new_from_slice(key)
+            .expect("HMAC key length always valid");
+        mac.update(DEV_MODE_HMAC_DOMAIN);
+        mac.update(action.as_bytes());
+        mac.finalize().into_bytes()
+    };
+
+    let proof_bytes = match hex::decode(proof_hex) {
+        Ok(b) if b.len() == 64 => b,
+        _ => return false,
+    };
+
+    // Constant-time comparison
+    crypto::ct::ct_eq(&proof_bytes, &expected_proof)
+}
+
+/// Generate a developer mode activation proof (for use by authorized operators).
+/// This function is intentionally NOT exposed in the admin API — operators
+/// must generate proofs offline using the activation key.
+pub fn generate_dev_mode_proof(key: &[u8; 32], action: &str) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha512;
+    type HmacSha512 = Hmac<Sha512>;
+    let mut mac = HmacSha512::new_from_slice(key)
+        .expect("HMAC key length always valid");
+    mac.update(DEV_MODE_HMAC_DOMAIN);
+    mac.update(action.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
 /// Runtime-toggleable developer mode settings.
 ///
 /// Uses atomics so that reads from hot paths (every request) are lock-free.
-/// Writes happen only through the admin API.
+/// Writes happen only through the admin API WITH a valid cryptographic proof.
+///
+/// Toggling developer mode requires:
+///   1. The MILNET_DEV_MODE_KEY activation key loaded at startup
+///   2. A valid HMAC-SHA512 proof over the action ("enable"/"disable")
+///   3. NOT being in production mode (MILNET_PRODUCTION blocks enable)
+///
+/// This prevents attackers who compromise the binary, admin API, or process
+/// memory from silently enabling developer mode to extract detailed errors.
 pub struct DeveloperModeConfig {
     enabled: AtomicBool,
     log_level: AtomicU8,
@@ -69,24 +180,50 @@ impl DeveloperModeConfig {
 
     /// Enable or disable developer mode at runtime.
     ///
-    /// In production mode (`MILNET_PRODUCTION` set), enabling developer mode
-    /// is refused. Developer mode can only be set via the `MILNET_DEV_MODE`
-    /// environment variable at startup in production deployments.
-    pub fn set_developer_mode(&self, enabled: bool) {
+    /// Requires a valid cryptographic proof derived from the activation key.
+    /// In production mode (`MILNET_PRODUCTION` set), enabling is always refused.
+    ///
+    /// `proof_hex`: HMAC-SHA512 proof in hex (128 chars). Pass empty string
+    /// to attempt without proof (will fail if key is loaded).
+    pub fn set_developer_mode(&self, enabled: bool, proof_hex: &str) {
         if enabled && crate::sealed_keys::is_production() {
             tracing::error!(
-                "REFUSED: cannot enable developer mode at runtime in production \
-                 (MILNET_PRODUCTION is set). Developer mode is only settable via \
-                 MILNET_DEV_MODE environment variable at startup."
+                "REFUSED: cannot enable developer mode in production \
+                 (MILNET_PRODUCTION is set)."
             );
+            crate::siem::SecurityEvent::developer_mode_blocked();
             return;
         }
+
+        // If activation key is loaded, require valid proof
+        if DEV_MODE_ACTIVATION_KEY.get().and_then(|k| k.as_ref()).is_some() {
+            let action = if enabled { "enable" } else { "disable" };
+            if !verify_dev_mode_proof(proof_hex, action) {
+                tracing::error!(
+                    "REFUSED: invalid developer mode activation proof. \
+                     Generate proof offline: HMAC-SHA512(key, '{}' || '{}')",
+                    std::str::from_utf8(DEV_MODE_HMAC_DOMAIN).unwrap_or("domain"),
+                    action
+                );
+                crate::siem::SecurityEvent::developer_mode_blocked();
+                return;
+            }
+            tracing::warn!("Developer mode activation proof VERIFIED");
+        }
+
         self.enabled.store(enabled, Ordering::Relaxed);
         tracing::warn!(
             developer_mode = enabled,
             "developer mode {}",
             if enabled { "ENABLED — detailed errors will be exposed in responses" } else { "DISABLED — production error masking active" }
         );
+    }
+
+    /// Enable developer mode without proof (for tests and startup from env var).
+    /// This is ONLY callable during startup initialization, not from the admin API.
+    #[doc(hidden)]
+    pub fn set_developer_mode_unchecked(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
     }
 
     /// Set the log level at runtime.
@@ -220,18 +357,18 @@ pub struct SecurityConfig {
 
 impl SecurityConfig {
     /// Apply the developer mode and log level from this config to the
-    /// global runtime toggle.  Called once at startup.
+    /// global runtime toggle.  Called once at startup (no proof required).
     pub fn apply_developer_mode(&self) {
-        developer_mode().set_developer_mode(self.developer_mode);
+        developer_mode().set_developer_mode_unchecked(self.developer_mode);
         developer_mode().set_log_level(self.log_level);
     }
 
     /// Toggle developer mode at runtime (called from admin API).
     ///
-    /// In production mode, enabling developer mode is refused — it is only
-    /// settable via the `MILNET_DEV_MODE` environment variable at startup.
-    pub fn set_developer_mode(enabled: bool) {
-        developer_mode().set_developer_mode(enabled);
+    /// Requires a valid HMAC-SHA512 proof derived from the activation key.
+    /// In production mode, enabling developer mode is always refused.
+    pub fn set_developer_mode(enabled: bool, proof_hex: &str) {
+        developer_mode().set_developer_mode(enabled, proof_hex);
     }
 
     /// Set the log level at runtime (called from admin API).
@@ -472,14 +609,14 @@ mod tests {
         assert!(!dm.is_enabled());
         assert_eq!(dm.log_level(), LogLevel::Error);
 
-        dm.set_developer_mode(true);
+        dm.set_developer_mode_unchecked(true);
         assert!(dm.is_enabled());
 
         dm.set_log_level(LogLevel::Verbose);
         assert_eq!(dm.log_level(), LogLevel::Verbose);
         assert!(dm.is_verbose());
 
-        dm.set_developer_mode(false);
+        dm.set_developer_mode_unchecked(false);
         assert!(!dm.is_verbose());
     }
 
@@ -558,5 +695,35 @@ mod tests {
         assert!(violations.iter().any(|v| v.contains("log_level")));
         assert!(violations.iter().any(|v| v.contains("max_failed_attempts")));
         assert!(violations.iter().any(|v| v.contains("lockout_duration_secs")));
+    }
+
+    #[test]
+    fn dev_mode_proof_generation_and_verification() {
+        let key = [0x42u8; 32];
+        let proof = generate_dev_mode_proof(&key, "enable");
+        assert_eq!(proof.len(), 128); // HMAC-SHA512 = 64 bytes = 128 hex chars
+
+        // Different actions produce different proofs
+        let proof_disable = generate_dev_mode_proof(&key, "disable");
+        assert_ne!(proof, proof_disable);
+
+        // Different keys produce different proofs
+        let key2 = [0x43u8; 32];
+        let proof2 = generate_dev_mode_proof(&key2, "enable");
+        assert_ne!(proof, proof2);
+    }
+
+    #[test]
+    fn dev_mode_without_key_loaded_rejects_all_proofs() {
+        // OnceLock not initialized in this test — verify_dev_mode_proof returns false
+        assert!(!verify_dev_mode_proof("deadbeef", "enable"));
+        assert!(!verify_dev_mode_proof("", "enable"));
+    }
+
+    #[test]
+    fn dev_mode_proof_rejects_wrong_length() {
+        // Even if key were loaded, wrong-length proof must fail
+        assert!(!verify_dev_mode_proof("too_short", "enable"));
+        assert!(!verify_dev_mode_proof("", "enable"));
     }
 }

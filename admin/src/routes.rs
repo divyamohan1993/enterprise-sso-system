@@ -3027,6 +3027,10 @@ struct DeveloperModeRequest {
     enabled: bool,
     #[serde(default)]
     log_level: Option<String>,
+    /// HMAC-SHA512 activation proof (hex-encoded, 128 chars).
+    /// Required when MILNET_DEV_MODE_KEY is configured.
+    #[serde(default)]
+    activation_proof: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -3089,7 +3093,9 @@ async fn set_developer_mode(
     state.developer_log_level.store(log_level as u8, Ordering::Relaxed);
 
     // Update the global toggle so all crates (gateway, orchestrator, etc.) see it
-    common::config::SecurityConfig::set_developer_mode(body.enabled);
+    // Requires valid activation proof when MILNET_DEV_MODE_KEY is configured
+    let proof = body.activation_proof.as_deref().unwrap_or("");
+    common::config::SecurityConfig::set_developer_mode(body.enabled, proof);
     common::config::SecurityConfig::set_log_level(log_level);
 
     // Emit SIEM event for auditability

@@ -2,6 +2,10 @@
 /target/
 **/*.rs.bk
 
+# Developer mode activation key — NEVER commit
+**/devmode-activation-key*
+**/milnet-keys/
+
 # IDE
 .idea/
 .vscode/
