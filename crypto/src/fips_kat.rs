@@ -13,6 +13,8 @@
 //! - SHA3-256 (FIPS 202)
 //! - HKDF-SHA512 (SP 800-56C)
 //! - HMAC-SHA512 (FIPS 198-1)
+//! - PBKDF2-SHA512 (SP 800-132) — determinism test
+//! - AEGIS-256 — encrypt/decrypt roundtrip
 //! - ML-KEM-1024 (FIPS 203) — roundtrip test
 //! - ML-DSA-87 (FIPS 204) — roundtrip test
 //! - X-Wing combiner (ML-KEM-1024 + X25519) — full encap/decap + session key derivation
@@ -445,6 +447,64 @@ fn kat_slh_dsa() -> Result<(), String> {
     Ok(())
 }
 
+/// KAT: PBKDF2-SHA512 key derivation.
+///
+/// Uses known inputs (password="password", salt="salt", iterations=4096, len=32)
+/// and verifies the output is non-zero and deterministic.
+fn kat_pbkdf2_sha512() -> Result<(), String> {
+    let password = b"password";
+    let salt = b"salt";
+    let iterations = 4096u32;
+    let output_len = 32usize;
+
+    let mut key1 = vec![0u8; output_len];
+    pbkdf2::pbkdf2_hmac::<sha2::Sha512>(password, salt, iterations, &mut key1);
+
+    // Verify output is non-zero
+    if key1.iter().all(|&b| b == 0) {
+        return Err("PBKDF2-SHA512 KAT: derived key is all zeros".into());
+    }
+
+    // Verify determinism
+    let mut key2 = vec![0u8; output_len];
+    pbkdf2::pbkdf2_hmac::<sha2::Sha512>(password, salt, iterations, &mut key2);
+
+    if key1 != key2 {
+        return Err("PBKDF2-SHA512 KAT: non-deterministic output".into());
+    }
+
+    tracing::info!("FIPS KAT: PBKDF2-SHA512 PASSED");
+    Ok(())
+}
+
+/// KAT: AEGIS-256 encrypt/decrypt roundtrip.
+///
+/// Generates a random key, encrypts a known plaintext, decrypts the result,
+/// and verifies the roundtrip matches.
+fn kat_aegis256() -> Result<(), String> {
+    use crate::symmetric::{encrypt_with, decrypt, SymmetricAlgorithm};
+
+    let mut key = [0u8; 32];
+    getrandom::getrandom(&mut key)
+        .map_err(|e| format!("AEGIS-256 KAT: key generation failed: {}", e))?;
+
+    let plaintext = b"AEGIS-256 KAT test data";
+    let aad = &[];
+
+    let sealed = encrypt_with(SymmetricAlgorithm::Aegis256, &key, plaintext, aad)
+        .map_err(|e| format!("AEGIS-256 KAT: encryption failed: {}", e))?;
+
+    let decrypted = decrypt(&key, &sealed, aad)
+        .map_err(|e| format!("AEGIS-256 KAT: decryption failed: {}", e))?;
+
+    if decrypted != plaintext {
+        return Err("AEGIS-256 KAT: decrypted plaintext does not match original".into());
+    }
+
+    tracing::info!("FIPS KAT: AEGIS-256 PASSED");
+    Ok(())
+}
+
 /// KAT: ML-DSA-87 sign/verify roundtrip.
 ///
 /// Since ML-DSA uses randomized signing, we verify the roundtrip property:
@@ -512,6 +572,8 @@ pub fn run_startup_kats() -> Result<(), String> {
     kat_sha3_256()?;
     kat_hkdf_sha512()?;
     kat_hmac_sha512()?;
+    kat_pbkdf2_sha512()?;
+    kat_aegis256()?;
     kat_ml_kem_1024()?;
 
     // ML-DSA-87 keys are large (~4KB). Run in a thread with larger stack.
@@ -554,7 +616,7 @@ pub fn run_startup_kats() -> Result<(), String> {
         .map_err(|_| "SLH-DSA KAT: thread panicked".to_string())?;
     slh_dsa_result?;
 
-    tracing::info!("FIPS 140-3 startup known-answer tests: ALL PASSED (10/10)");
+    tracing::info!("FIPS 140-3 startup known-answer tests: ALL PASSED (12/12)");
     Ok(())
 }
 
@@ -600,6 +662,16 @@ mod tests {
     #[test]
     fn test_kat_hmac_sha512() {
         kat_hmac_sha512().expect("HMAC-SHA512 KAT should pass");
+    }
+
+    #[test]
+    fn test_kat_pbkdf2_sha512() {
+        kat_pbkdf2_sha512().expect("PBKDF2-SHA512 KAT should pass");
+    }
+
+    #[test]
+    fn test_kat_aegis256() {
+        kat_aegis256().expect("AEGIS-256 KAT should pass");
     }
 
     #[test]
