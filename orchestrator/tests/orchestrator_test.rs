@@ -86,7 +86,7 @@ fn ceremony_session_timeout() {
 
 // ── Integration test ────────────────────────────────────────────────────
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn orchestrator_processes_auth() {
     let hmac_key = generate_key_64();
     let receipt_signing_key = generate_key_64();
@@ -207,10 +207,14 @@ async fn orchestrator_processes_auth() {
         transport.send(&resp_bytes).await.expect("send tss resp");
     });
 
-    // Create orchestrator service with the SAME CA trust for mTLS
+    // Create orchestrator service with the SAME CA trust for mTLS.
+    // The receipt verification key must match the key used by the OPAQUE
+    // service's ReceiptSigner (which derives ML-DSA-65 from the first 32
+    // bytes of the signing key).
     let connector = tls_connector(orchestrator_client_cfg);
-    let service = OrchestratorService::new_with_tls(
+    let service = OrchestratorService::new_with_tls_and_receipt_key(
         hmac_key,
+        receipt_signing_key,
         opaque_addr,
         tss_addr,
         connector,
