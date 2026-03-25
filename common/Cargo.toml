@@ -23,5 +23,9 @@ blake3.workspace = true
 tracing.workspace = true
 hex.workspace = true
 argon2.workspace = true
+cryptoki = { workspace = true, optional = true }
 sha1 = "0.10"
 serde_json = "1"
+
+[features]
+cac = ["cryptoki"]
