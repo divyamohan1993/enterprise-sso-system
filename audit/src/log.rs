@@ -44,15 +44,47 @@ pub struct RetentionPolicy {
     /// Optional master KEK for encrypting archived data before deletion.
     /// When set, archived entries are AES-256-GCM encrypted before writing.
     pub archive_encryption_kek: Option<[u8; 32]>,
+    /// Active compliance regime (if any). Overrides age-based deletion floors.
+    pub compliance_regime: Option<common::compliance::ComplianceRegime>,
+    /// Minimum retention (days) for Indian Govt / CERT-In compliance.
+    pub cert_in_min_retention_days: u64,
+    /// Minimum retention (days) for US DoD compliance.
+    pub dod_min_retention_days: u64,
 }
 
 impl Default for RetentionPolicy {
     fn default() -> Self {
         Self {
-            max_age_days: 2555,       // ~7 years
+            max_age_days: 2555,         // ~7 years
             max_archive_size_mb: 10240, // 10 GB
             auto_archive: true,
             archive_encryption_kek: None,
+            compliance_regime: None,
+            cert_in_min_retention_days: 365,
+            dod_min_retention_days: 2555,
+        }
+    }
+}
+
+impl RetentionPolicy {
+    /// Return the minimum retention floor (in microseconds) imposed by the
+    /// active compliance regime, or `0` if no regime is set.
+    pub fn compliance_floor_us(&self) -> i64 {
+        use common::compliance::ComplianceRegime;
+        match self.compliance_regime {
+            Some(ComplianceRegime::IndianGovt) => {
+                self.cert_in_min_retention_days as i64 * MICROS_PER_DAY
+            }
+            Some(ComplianceRegime::UsDod) => {
+                self.dod_min_retention_days as i64 * MICROS_PER_DAY
+            }
+            Some(ComplianceRegime::Dual) => {
+                // Dual: use the stricter (larger) floor
+                let india_floor = self.cert_in_min_retention_days as i64 * MICROS_PER_DAY;
+                let dod_floor = self.dod_min_retention_days as i64 * MICROS_PER_DAY;
+                india_floor.max(dod_floor)
+            }
+            None => 0,
         }
     }
 }
@@ -327,7 +359,21 @@ impl AuditLog {
         let cutoff = now - max_age_us;
 
         // ── 1. Age-based deletion with encrypted archival ──
-        let expired_count = self.entries.iter().take_while(|e| e.timestamp < cutoff).count();
+        // Compliance floor: entries younger than the minimum retention must not be deleted.
+        let now_us_for_floor = now;
+        let compliance_floor_us = self.retention_policy.compliance_floor_us();
+        let expired_count = self
+            .entries
+            .iter()
+            .take_while(|e| {
+                if e.timestamp >= cutoff {
+                    return false; // not yet expired by max_age policy
+                }
+                // Skip deletion if entry is younger than the compliance floor
+                let age_us = now_us_for_floor.saturating_sub(e.timestamp);
+                age_us >= compliance_floor_us
+            })
+            .count();
         if expired_count > 0 {
             if let Some(ref dir) = self.archive_dir.clone() {
                 let expired_entries: Vec<AuditEntry> = self.entries.drain(..expired_count).collect();
@@ -888,5 +934,98 @@ mod tests {
         assert_eq!(policy.max_archive_size_mb, 10240);
         assert!(policy.auto_archive);
         assert!(policy.archive_encryption_kek.is_none());
+    }
+
+    // ── Compliance-aware retention tests ──
+
+    /// IndianGovt regime: a 300-day-old entry must NOT be deleted (floor = 365 days).
+    #[test]
+    fn test_retention_cert_in_blocks_recent() {
+        let dir = std::env::temp_dir().join(format!("audit_certin_recent_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        let signing_key = test_signing_key();
+        let mut log = AuditLog::new_with_limits(100_000, Some(dir.to_str().unwrap().to_string()));
+        // Set max_age_days short enough that the entry would normally expire,
+        // but compliance floor (365 days) must block deletion.
+        log.retention_policy.max_age_days = 1; // 1 day — entry is "expired" by normal policy
+        log.retention_policy.compliance_regime =
+            Some(common::compliance::ComplianceRegime::IndianGovt);
+        log.retention_policy.cert_in_min_retention_days = 365;
+
+        // Entry timestamped 300 days ago — would be deleted by 1-day max_age,
+        // but the 365-day CERT-In floor must prevent it.
+        let three_hundred_days_ago = now_us() - 300 * MICROS_PER_DAY;
+        append_entries_with_timestamp(&mut log, 1, three_hundred_days_ago, &signing_key);
+        assert_eq!(log.len(), 1);
+
+        log.enforce_retention();
+
+        assert_eq!(
+            log.len(),
+            1,
+            "300-day entry must NOT be deleted under IndianGovt 365-day floor"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// IndianGovt regime: a 400-day-old entry MUST be deleted (exceeds 365-day floor).
+    #[test]
+    fn test_retention_cert_in_allows_old() {
+        let dir = std::env::temp_dir().join(format!("audit_certin_old_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        let signing_key = test_signing_key();
+        let mut log = AuditLog::new_with_limits(100_000, Some(dir.to_str().unwrap().to_string()));
+        log.retention_policy.max_age_days = 1; // expired by normal policy
+        log.retention_policy.compliance_regime =
+            Some(common::compliance::ComplianceRegime::IndianGovt);
+        log.retention_policy.cert_in_min_retention_days = 365;
+
+        // Entry timestamped 400 days ago — older than both max_age AND floor, must be deleted.
+        let four_hundred_days_ago = now_us() - 400 * MICROS_PER_DAY;
+        append_entries_with_timestamp(&mut log, 1, four_hundred_days_ago, &signing_key);
+        assert_eq!(log.len(), 1);
+
+        log.enforce_retention();
+
+        assert_eq!(
+            log.len(),
+            0,
+            "400-day entry must be deleted under IndianGovt 365-day floor"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// UsDod regime: a 2000-day-old entry must NOT be deleted (floor = 2555 days).
+    #[test]
+    fn test_retention_dod_blocks_recent() {
+        let dir = std::env::temp_dir().join(format!("audit_dod_blocks_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        let signing_key = test_signing_key();
+        let mut log = AuditLog::new_with_limits(100_000, Some(dir.to_str().unwrap().to_string()));
+        log.retention_policy.max_age_days = 1; // expired by normal policy
+        log.retention_policy.compliance_regime =
+            Some(common::compliance::ComplianceRegime::UsDod);
+        log.retention_policy.dod_min_retention_days = 2555;
+
+        // Entry timestamped 2000 days ago — would be deleted by 1-day max_age,
+        // but the 2555-day DoD floor must prevent it.
+        let two_thousand_days_ago = now_us() - 2000 * MICROS_PER_DAY;
+        append_entries_with_timestamp(&mut log, 1, two_thousand_days_ago, &signing_key);
+        assert_eq!(log.len(), 1);
+
+        log.enforce_retention();
+
+        assert_eq!(
+            log.len(),
+            1,
+            "2000-day entry must NOT be deleted under UsDod 2555-day floor"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
