@@ -1,13 +1,12 @@
 //! SHARD (Secure Hardened Authenticated Request Dispatch) IPC protocol.
 //!
 //! Implements spec Section 11: authenticated inter-module messaging with
-//! HMAC-SHA512, AES-256-GCM encryption, replay protection, and timestamp validation.
+//! HMAC-SHA512, AEGIS-256 encryption (AES-256-GCM in FIPS mode), replay
+//! protection, and timestamp validation.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aes_gcm::aead::{Aead, KeyInit};
-use aes_gcm::{Aes256Gcm, Nonce};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::Sha512;
@@ -22,29 +21,26 @@ type HmacSha512 = Hmac<Sha512>;
 /// Domain separation label for deriving the encryption key via HKDF.
 const ENCRYPT_DOMAIN: &[u8] = b"MILNET-SHARD-ENCRYPT-v1";
 
-/// AES-256-GCM nonce length in bytes.
-const NONCE_LEN: usize = 12;
-
 /// Maximum allowed clock skew between sender and receiver (2 seconds in microseconds).
 const MAX_TIMESTAMP_DRIFT_US: i64 = 2_000_000;
 
 /// SHARD protocol state for a single module.
 ///
 /// Each module instantiates one `ShardProtocol` to create and verify
-/// authenticated IPC messages. Payloads are encrypted with AES-256-GCM
-/// and authenticated with HMAC-SHA512.
+/// authenticated IPC messages. Payloads are encrypted with AEGIS-256
+/// (or AES-256-GCM in FIPS mode) and authenticated with HMAC-SHA512.
 pub struct ShardProtocol {
     module_id: ModuleId,
     hmac_key: [u8; 64],
-    /// AES-256-GCM cipher derived once from the HMAC key via HKDF.
-    cipher: Aes256Gcm,
+    /// Encryption key derived from the HMAC key via HKDF-SHA512.
+    enc_key: [u8; 32],
     send_sequence: u64,
     recv_sequences: HashMap<ModuleId, u64>,
     /// The epoch (send_sequence) at which sequences were last persisted.
     last_persisted_epoch: u64,
 }
 
-/// Derive an AES-256 encryption key from the HMAC key using HKDF-SHA512
+/// Derive an encryption key from the HMAC key using HKDF-SHA512
 /// with domain separation.
 fn derive_encryption_key(hmac_key: &[u8; 64]) -> [u8; 32] {
     let hk = Hkdf::<Sha512>::new(None, hmac_key);
@@ -58,12 +54,10 @@ impl ShardProtocol {
     /// Create a new protocol instance for the given module.
     pub fn new(module_id: ModuleId, hmac_key: [u8; 64]) -> Self {
         let enc_key = derive_encryption_key(&hmac_key);
-        let cipher = Aes256Gcm::new_from_slice(&enc_key)
-            .expect("32-byte key is valid for AES-256-GCM");
         Self {
             module_id,
             hmac_key,
-            cipher,
+            enc_key,
             send_sequence: 0,
             recv_sequences: HashMap::new(),
             last_persisted_epoch: 0,
@@ -98,33 +92,21 @@ impl ShardProtocol {
         out
     }
 
-    /// Encrypt a plaintext payload with AES-256-GCM.
+    /// Encrypt a plaintext payload using the active symmetric algorithm
+    /// (AEGIS-256 by default, AES-256-GCM in FIPS mode).
     ///
-    /// Returns `nonce || ciphertext` (12 bytes nonce prepended).
+    /// Returns `algo_id (1) || nonce || ciphertext || tag`.
     fn encrypt_payload(&self, plaintext: &[u8]) -> Result<Vec<u8>, MilnetError> {
-        let mut nonce_bytes = [0u8; NONCE_LEN];
-        getrandom::getrandom(&mut nonce_bytes)
-            .map_err(|e| MilnetError::Shard(format!("rng failed: {e}")))?;
-        let nonce = Nonce::from_slice(&nonce_bytes);
-        let ciphertext = self
-            .cipher
-            .encrypt(nonce, plaintext)
-            .map_err(|e| MilnetError::Shard(format!("encryption failed: {e}")))?;
-        let mut out = Vec::with_capacity(NONCE_LEN + ciphertext.len());
-        out.extend_from_slice(&nonce_bytes);
-        out.extend_from_slice(&ciphertext);
-        Ok(out)
+        crypto::symmetric::encrypt(&self.enc_key, plaintext, b"")
+            .map_err(|e| MilnetError::Shard(format!("encryption failed: {e}")))
     }
 
-    /// Decrypt a `nonce || ciphertext` blob with AES-256-GCM.
+    /// Decrypt a payload blob produced by [`encrypt_payload`].
+    ///
+    /// Handles both the new algo_id-prefixed format and the legacy
+    /// `nonce (12) || ciphertext+tag` AES-256-GCM format.
     fn decrypt_payload(&self, data: &[u8]) -> Result<Vec<u8>, MilnetError> {
-        if data.len() < NONCE_LEN {
-            return Err(MilnetError::Shard("encrypted payload too short".into()));
-        }
-        let (nonce_bytes, ciphertext) = data.split_at(NONCE_LEN);
-        let nonce = Nonce::from_slice(nonce_bytes);
-        self.cipher
-            .decrypt(nonce, ciphertext)
+        crypto::symmetric::decrypt(&self.enc_key, data, b"")
             .map_err(|e| MilnetError::Shard(format!("decryption failed: {e}")))
     }
 
@@ -719,5 +701,38 @@ mod tests {
         assert!(!seq_path.exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- AEGIS-256 / FIPS encryption ----------------------------------------
+
+    #[test]
+    fn test_shard_aegis256_encryption() {
+        common::fips::set_fips_mode_unchecked(false);
+        let key = test_hmac_key();
+        let mut sender = ShardProtocol::new(ModuleId::Gateway, key);
+        let mut receiver = ShardProtocol::new(ModuleId::Audit, key);
+
+        let payload = b"aegis-256-shard-test-payload";
+        let raw_msg = sender.create_message(payload).unwrap();
+        let (sender_id, recovered) = receiver.verify_message(&raw_msg).unwrap();
+
+        assert_eq!(sender_id, ModuleId::Gateway);
+        assert_eq!(recovered.as_slice(), payload);
+    }
+
+    #[test]
+    fn test_shard_fips_aes256gcm_encryption() {
+        common::fips::set_fips_mode_unchecked(true);
+        let key = test_hmac_key();
+        let mut sender = ShardProtocol::new(ModuleId::Gateway, key);
+        let mut receiver = ShardProtocol::new(ModuleId::Audit, key);
+
+        let payload = b"fips-aes-shard-test-payload";
+        let raw_msg = sender.create_message(payload).unwrap();
+        let (sender_id, recovered) = receiver.verify_message(&raw_msg).unwrap();
+
+        assert_eq!(sender_id, ModuleId::Gateway);
+        assert_eq!(recovered.as_slice(), payload);
+        common::fips::set_fips_mode_unchecked(false);
     }
 }
