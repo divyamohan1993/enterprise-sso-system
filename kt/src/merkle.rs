@@ -109,13 +109,13 @@ impl Default for MerkleTree {
     }
 }
 
-/// Signed Tree Head — ML-DSA-65 signature over the Merkle root
+/// Signed Tree Head — ML-DSA-87 signature over the Merkle root (CNSA 2.0)
 #[derive(Debug, Clone)]
 pub struct SignedTreeHead {
     pub root: [u8; 64],
     pub timestamp: i64,
     pub tree_size: usize,
-    pub signature: Vec<u8>, // ML-DSA-65
+    pub signature: Vec<u8>, // ML-DSA-87
 }
 
 impl MerkleTree {

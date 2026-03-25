@@ -30,9 +30,9 @@ async fn main() {
 
     let tree = Arc::new(RwLock::new(kt::merkle::MerkleTree::new()));
 
-    // Generate ML-DSA-65 signing keypair for signed tree heads
+    // Generate ML-DSA-87 signing keypair for signed tree heads (CNSA 2.0)
     let (pq_signing_key, _pq_verifying_key) = crypto::pq_sign::generate_pq_keypair();
-    tracing::info!("ML-DSA-65 signing keypair generated for tree head signatures");
+    tracing::info!("ML-DSA-87 signing keypair generated for tree head signatures");
 
     // Spawn periodic signed tree head task (every 60 seconds)
     let tree_clone = tree.clone();
