@@ -58,6 +58,14 @@ readonly GROUP_NAME="milnet"
 SKIP_START=false
 SKIP_FIREWALL=false
 
+# Cloud provider integration.
+# Valid values: none, gcp, aws, onprem
+CLOUD_PROVIDER="${CLOUD_PROVIDER:-none}"
+
+# Compliance regime.
+# Valid values: none, fedramp-high, il4, il5, meitygov, itar
+COMPLIANCE_REGIME="${COMPLIANCE_REGIME:-none}"
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 log_info()  { echo "[MILNET_INSTALL] INFO:  $*"; }
@@ -89,8 +97,26 @@ parse_args() {
                 SKIP_FIREWALL=true
                 shift
                 ;;
+            --cloud-provider)
+                CLOUD_PROVIDER="$2"
+                shift 2
+                ;;
+            --cloud-provider=*)
+                CLOUD_PROVIDER="${1#--cloud-provider=}"
+                shift
+                ;;
+            --compliance-regime)
+                COMPLIANCE_REGIME="$2"
+                shift 2
+                ;;
+            --compliance-regime=*)
+                COMPLIANCE_REGIME="${1#--compliance-regime=}"
+                shift
+                ;;
             -h|--help)
                 echo "Usage: $0 [--bin-dir /path/to/binaries] [--skip-start] [--skip-firewall]"
+                echo "          [--cloud-provider none|gcp|aws|onprem]"
+                echo "          [--compliance-regime none|fedramp-high|il4|il5|meitygov|itar]"
                 exit 0
                 ;;
             *)
@@ -98,6 +124,18 @@ parse_args() {
                 ;;
         esac
     done
+
+    # Validate cloud provider
+    case "$CLOUD_PROVIDER" in
+        none|gcp|aws|onprem) ;;
+        *) die "Invalid --cloud-provider: $CLOUD_PROVIDER. Must be none, gcp, aws, or onprem." ;;
+    esac
+
+    # Validate compliance regime
+    case "$COMPLIANCE_REGIME" in
+        none|fedramp-high|il4|il5|meitygov|itar) ;;
+        *) die "Invalid --compliance-regime: $COMPLIANCE_REGIME. Must be none, fedramp-high, il4, il5, meitygov, or itar." ;;
+    esac
 }
 
 # ── Step 1: Create group and users ──────────────────────────────────────────
@@ -377,6 +415,64 @@ install_security_scripts() {
         chown root:root "${SECURITY_DIR}/expected-pcrs.conf"
         log_info "Installed: ${SECURITY_DIR}/expected-pcrs.conf"
     fi
+
+    # Install cloud HSM init script.
+    if [[ -f "${sec_src}/cloud-hsm-init.sh" ]]; then
+        cp "${sec_src}/cloud-hsm-init.sh" "${SECURITY_DIR}/cloud-hsm-init.sh"
+        chmod 0750 "${SECURITY_DIR}/cloud-hsm-init.sh"
+        chown root:root "${SECURITY_DIR}/cloud-hsm-init.sh"
+        log_info "Installed: ${SECURITY_DIR}/cloud-hsm-init.sh"
+    fi
+}
+
+# ── Cloud HSM Initialization ─────────────────────────────────────────────────
+# Run cloud-hsm-init.sh for the selected cloud provider.
+# Only called when --cloud-provider is not 'none'.
+
+init_cloud_hsm() {
+    if [[ "$CLOUD_PROVIDER" == "none" ]]; then
+        log_info "No cloud provider specified — skipping Cloud HSM initialization."
+        return
+    fi
+
+    log_info "Initializing Cloud HSM for provider: $CLOUD_PROVIDER"
+
+    local hsm_init_script="${SECURITY_DIR}/cloud-hsm-init.sh"
+    if [[ ! -x "$hsm_init_script" ]]; then
+        log_warn "Cloud HSM init script not found at ${hsm_init_script}. Skipping."
+        return
+    fi
+
+    local hsm_env_args=()
+
+    case "$CLOUD_PROVIDER" in
+        gcp)
+            # Pass compliance-specific region defaults
+            if [[ "$COMPLIANCE_REGIME" == "meitygov" ]]; then
+                hsm_env_args+=(REGION="${REGION:-asia-south1}")
+            fi
+            ;;
+        aws)
+            # GovCloud FIPS regions for FedRAMP/IL compliance
+            if [[ "$COMPLIANCE_REGIME" == "fedramp-high" || \
+                  "$COMPLIANCE_REGIME" == "il4" || \
+                  "$COMPLIANCE_REGIME" == "il5" || \
+                  "$COMPLIANCE_REGIME" == "itar" ]]; then
+                hsm_env_args+=(REGION="${REGION:-us-gov-west-1}")
+            fi
+            ;;
+        onprem)
+            # On-prem has no region concept
+            ;;
+    esac
+
+    env "${hsm_env_args[@]}" \
+        ENV="${ENVIRONMENT:-production}" \
+        "$hsm_init_script" \
+        --provider="$CLOUD_PROVIDER" \
+        || log_warn "Cloud HSM initialization exited with non-zero status. Review output above."
+
+    log_info "Cloud HSM initialization step complete."
 }
 
 # ── Step 10: Install logrotate ─────────────────────────────────────────────
@@ -498,6 +594,9 @@ main() {
     check_root
     parse_args "$@"
 
+    log_info "Cloud provider : ${CLOUD_PROVIDER}"
+    log_info "Compliance     : ${COMPLIANCE_REGIME}"
+
     create_users
     create_directories
     set_permissions
@@ -508,6 +607,7 @@ main() {
     install_sysctl
     install_security_scripts
     install_logrotate
+    init_cloud_hsm
     enable_and_start
     run_health_checks
 
