@@ -760,7 +760,7 @@ fn test_audit_log_tampering() {
 
     // Append several legitimate entries
     log.append(
-        AuditEventType::AuthenticationSuccess,
+        AuditEventType::AuthSuccess,
         vec![user1],
         vec![],
         0.1,
@@ -768,7 +768,7 @@ fn test_audit_log_tampering() {
         &signing_key,
     );
     log.append(
-        AuditEventType::AuthenticationFailure,
+        AuditEventType::AuthFailure,
         vec![attacker],
         vec![],
         0.9,
@@ -776,7 +776,7 @@ fn test_audit_log_tampering() {
         &signing_key,
     );
     log.append(
-        AuditEventType::AuthenticationSuccess,
+        AuditEventType::AuthSuccess,
         vec![user2],
         vec![],
         0.2,
@@ -1011,10 +1011,9 @@ fn test_supply_chain_dependency_injection() {
 
     // Test 2: DKG produces valid group key that can sign and verify
     let mut dkg_result = dkg(5, 3);
-    let group_key = dkg_result.group.public_key_package.clone();
+    let _group_key = dkg_result.group.public_key_package.clone();
     let message = b"integrity-verification-payload";
-    let mut shares: Vec<_> = dkg_result.shares.iter_mut().take(3).collect();
-    let sig = threshold_sign(&mut shares, &dkg_result.group, message, 3)
+    let sig = threshold_sign(&mut dkg_result.shares[..3], &dkg_result.group, message, 3)
         .expect("threshold sign must succeed — FROST dependency intact");
 
     // The signature must verify against the group key
