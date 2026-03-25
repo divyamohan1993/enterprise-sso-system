@@ -380,4 +380,65 @@ mod tests {
         assert!(!verify_fips_proof("too_short", "enable"));
         assert!(!verify_fips_proof("", "enable"));
     }
+
+    #[test]
+    fn test_fips_mode_toggle_with_proof() {
+        // Test the full proof-based toggle path (not unchecked).
+        let key = [0x42u8; 32];
+        // Try to initialize the OnceLock with our test key.
+        let _ = FIPS_ACTIVATION_KEY.set(Some(key));
+
+        // Only run the proof-based toggle if our key is the one stored.
+        if let Some(Some(stored)) = FIPS_ACTIVATION_KEY.get() {
+            if stored == &key {
+                // Start disabled
+                set_fips_mode_unchecked(false);
+                assert!(!is_fips_mode());
+
+                // Enable with valid proof
+                let enable_proof = generate_fips_proof(&key, "enable");
+                set_fips_mode(true, &enable_proof);
+                assert!(is_fips_mode(), "FIPS mode should be enabled after valid proof");
+
+                // Disable with valid proof (only works when NOT in production)
+                let disable_proof = generate_fips_proof(&key, "disable");
+                set_fips_mode(false, &disable_proof);
+                assert!(!is_fips_mode(), "FIPS mode should be disabled after valid disable proof");
+            }
+        }
+    }
+
+    #[test]
+    fn test_fips_mode_production_forced() {
+        // In production mode, disabling FIPS must be refused.
+        // We test the logic path: enable FIPS, then attempt to disable.
+        // Since is_production() checks MILNET_PRODUCTION env var which we
+        // cannot safely set in parallel tests, we verify the code path
+        // exists by checking that set_fips_mode with a valid proof for
+        // "disable" is handled (the production guard is the first check
+        // in set_fips_mode). In non-production test env, disable succeeds
+        // — the production guard is tested via validate_production_config
+        // which enforces fips_mode=true in production.
+        let key = [0x42u8; 32];
+        let _ = FIPS_ACTIVATION_KEY.set(Some(key));
+
+        set_fips_mode_unchecked(true);
+        assert!(is_fips_mode());
+
+        // The production enforcement is tested indirectly:
+        // validate_production_config() returns violation if fips_mode=false.
+        // Direct env var test would be unsafe in parallel test runs.
+        let cfg = crate::config::SecurityConfig {
+            fips_mode: false,
+            ..Default::default()
+        };
+        let violations = cfg.validate_production_config();
+        assert!(
+            violations.iter().any(|v| v.contains("fips_mode")),
+            "Production config must reject fips_mode=false"
+        );
+
+        // Cleanup
+        set_fips_mode_unchecked(false);
+    }
 }
