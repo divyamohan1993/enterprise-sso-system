@@ -1,13 +1,13 @@
 #![forbid(unsafe_code)]
 
-//! AES-256-GCM envelope encryption for protecting data at rest.
+//! Envelope encryption for protecting data at rest.
 //!
 //! Every sensitive database field is encrypted with a unique Data Encryption Key (DEK).
 //! DEKs are wrapped (encrypted) by a Key Encryption Key (KEK) for secure storage.
 //!
-//! Wire format: 12-byte nonce || ciphertext || 16-byte GCM authentication tag.
-//!
-//! Compliant with FIPS 197 (AES) and NIST SP 800-38D (GCM).
+//! Uses AEGIS-256 by default (non-FIPS) or AES-256-GCM in FIPS mode.
+//! Wire format (new): algo_id (1 byte) || nonce || ciphertext || tag.
+//! Wire format (legacy/wrap): 12-byte nonce || ciphertext || 16-byte GCM tag.
 
 use aes_gcm::aead::generic_array::GenericArray;
 use aes_gcm::aead::Aead;
@@ -182,36 +182,22 @@ impl WrappedKey {
 
 /// Encrypt `plaintext` under `dek` with the given AAD.
 ///
-/// Returns `SealedData` whose wire format is: `nonce (12) || ciphertext || tag (16)`.
+/// Uses AEGIS-256 (non-FIPS) or AES-256-GCM (FIPS mode).
+/// Wire format: `algo_id (1) || nonce || ciphertext || tag`.
 pub fn encrypt(
     dek: &DataEncryptionKey,
     plaintext: &[u8],
     aad: &[u8],
 ) -> Result<SealedData, EnvelopeError> {
-    // Generate a random 96-bit nonce from the OS CSPRNG.
-    let mut nonce_bytes = [0u8; NONCE_LEN];
-    getrandom::getrandom(&mut nonce_bytes).expect("OS CSPRNG failure");
-
-    let cipher = Aes256Gcm::new(GenericArray::from_slice(dek.as_bytes()));
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
-    // aes-gcm encrypt returns ciphertext || tag.
-    let ciphertext_with_tag = cipher
-        .encrypt(
-            nonce,
-            aes_gcm::aead::Payload { msg: plaintext, aad },
-        )
+    let bytes = crate::symmetric::encrypt(dek.as_bytes(), plaintext, aad)
         .map_err(|_| EnvelopeError::EncryptionFailed)?;
-
-    // Build wire format: nonce || ciphertext || tag.
-    let mut sealed = Vec::with_capacity(NONCE_LEN + ciphertext_with_tag.len());
-    sealed.extend_from_slice(&nonce_bytes);
-    sealed.extend_from_slice(&ciphertext_with_tag);
-
-    Ok(SealedData { bytes: sealed })
+    Ok(SealedData { bytes })
 }
 
 /// Decrypt `sealed` using `dek` and the given AAD.
+///
+/// Handles both the new algo_id-prefixed format and the legacy
+/// `nonce (12) || ciphertext+tag` AES-256-GCM format.
 ///
 /// Returns the original plaintext or an error if authentication fails.
 pub fn decrypt(
@@ -219,21 +205,7 @@ pub fn decrypt(
     sealed: &SealedData,
     aad: &[u8],
 ) -> Result<Vec<u8>, EnvelopeError> {
-    let raw = sealed.to_bytes();
-    let nonce_bytes = &raw[..NONCE_LEN];
-    let ciphertext_with_tag = &raw[NONCE_LEN..];
-
-    let cipher = Aes256Gcm::new(GenericArray::from_slice(dek.as_bytes()));
-    let nonce = Nonce::from_slice(nonce_bytes);
-
-    cipher
-        .decrypt(
-            nonce,
-            aes_gcm::aead::Payload {
-                msg: ciphertext_with_tag,
-                aad,
-            },
-        )
+    crate::symmetric::decrypt(dek.as_bytes(), sealed.to_bytes(), aad)
         .map_err(|_| EnvelopeError::DecryptionFailed)
 }
 
@@ -523,5 +495,81 @@ mod tests {
         let result = decrypt(&dek, &bad_sealed, aad);
 
         assert_eq!(result.unwrap_err(), EnvelopeError::DecryptionFailed);
+    }
+
+    // -- AEGIS-256 / FIPS / legacy compat -----------------------------------
+
+    #[test]
+    fn test_envelope_aegis256_roundtrip() {
+        common::fips::set_fips_mode_unchecked(false);
+        let dek = DataEncryptionKey::generate();
+        let plaintext = b"aegis-256-envelope-test-data";
+        let aad = build_aad("users", "secret", b"u-aegis-1");
+
+        let sealed = encrypt(&dek, plaintext, &aad).expect("encrypt");
+        // New format starts with AEGIS-256 algo_id byte
+        assert_eq!(
+            sealed.to_bytes().first().copied(),
+            Some(crate::symmetric::ALGO_ID_AEGIS256)
+        );
+        let recovered = decrypt(&dek, &sealed, &aad).expect("decrypt");
+        assert_eq!(recovered.as_slice(), plaintext);
+    }
+
+    #[test]
+    fn test_envelope_fips_fallback() {
+        common::fips::set_fips_mode_unchecked(true);
+        let dek = DataEncryptionKey::generate();
+        let plaintext = b"fips-envelope-test-data";
+        let aad = build_aad("users", "secret", b"u-fips-1");
+
+        let sealed = encrypt(&dek, plaintext, &aad).expect("encrypt");
+        // FIPS mode uses AES-256-GCM
+        assert_eq!(
+            sealed.to_bytes().first().copied(),
+            Some(crate::symmetric::ALGO_ID_AES256GCM)
+        );
+        let recovered = decrypt(&dek, &sealed, &aad).expect("decrypt");
+        assert_eq!(recovered.as_slice(), plaintext);
+        common::fips::set_fips_mode_unchecked(false);
+    }
+
+    #[test]
+    fn test_envelope_legacy_backward_compat() {
+        // Build a legacy AES-256-GCM blob (no algo_id prefix): nonce (12) || ct+tag
+        common::fips::set_fips_mode_unchecked(false);
+        let dek = DataEncryptionKey::generate();
+        let plaintext = b"legacy-envelope-data";
+        let aad = build_aad("sessions", "token", b"s-legacy-1");
+
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        getrandom::getrandom(&mut nonce_bytes).expect("getrandom");
+        let cipher = Aes256Gcm::new(GenericArray::from_slice(dek.as_bytes()));
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let ct = cipher
+            .encrypt(nonce, aes_gcm::aead::Payload { msg: plaintext, aad: &aad })
+            .expect("legacy encrypt");
+
+        let mut legacy_bytes = Vec::with_capacity(NONCE_LEN + ct.len());
+        legacy_bytes.extend_from_slice(&nonce_bytes);
+        legacy_bytes.extend_from_slice(&ct);
+
+        // Ensure first byte is not 0x01 or 0x02
+        if legacy_bytes.first().copied() == Some(crate::symmetric::ALGO_ID_AEGIS256)
+            || legacy_bytes.first().copied() == Some(crate::symmetric::ALGO_ID_AES256GCM)
+        {
+            nonce_bytes[0] = 0xFF;
+            let nonce2 = Nonce::from_slice(&nonce_bytes);
+            let ct2 = cipher
+                .encrypt(nonce2, aes_gcm::aead::Payload { msg: plaintext, aad: &aad })
+                .expect("legacy re-encrypt");
+            legacy_bytes.clear();
+            legacy_bytes.extend_from_slice(&nonce_bytes);
+            legacy_bytes.extend_from_slice(&ct2);
+        }
+
+        let legacy_sealed = SealedData::from_bytes(legacy_bytes).expect("from_bytes");
+        let recovered = decrypt(&dek, &legacy_sealed, &aad).expect("legacy decrypt");
+        assert_eq!(recovered.as_slice(), plaintext);
     }
 }

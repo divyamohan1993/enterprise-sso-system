@@ -9,8 +9,6 @@
 use hkdf::Hkdf;
 use sha2::Sha512;
 use zeroize::{Zeroize, ZeroizeOnDrop};
-use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
-use aes_gcm::aead::Aead;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -113,54 +111,28 @@ pub struct DerivedKek {
     bytes: [u8; 32],
 }
 
-/// Minimum sealed payload length: 12-byte nonce + 16-byte AES-GCM tag.
-const MIN_SEALED_LEN: usize = 12 + 16;
-
 /// Additional Authenticated Data used for all seal operations.
 const SEAL_AAD: &[u8] = b"MILNET-SEAL-v1";
 
 impl DerivedKek {
-    /// Seal (encrypt) plaintext using AES-256-GCM with a random nonce.
+    /// Seal (encrypt) plaintext using the active symmetric algorithm (AEGIS-256
+    /// by default, AES-256-GCM in FIPS mode) with a random nonce.
     ///
-    /// Returns `nonce (12 bytes) || ciphertext+tag`.
+    /// Returns `algo_id (1 byte) || nonce || ciphertext || tag`.
+    /// Legacy data without an algo_id prefix is still accepted by [`unseal`].
     pub fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>, SealError> {
-        let key = aes_gcm::Key::<Aes256Gcm>::from_slice(&self.bytes);
-        let cipher = Aes256Gcm::new(key);
-
-        let mut nonce_bytes = [0u8; 12];
-        getrandom::getrandom(&mut nonce_bytes).map_err(|_| SealError::SealFailed)?;
-        let nonce = Nonce::from_slice(&nonce_bytes);
-
-        let payload = aes_gcm::aead::Payload {
-            msg: plaintext,
-            aad: SEAL_AAD,
-        };
-        let ciphertext = cipher.encrypt(nonce, payload).map_err(|_| SealError::SealFailed)?;
-
-        let mut sealed = Vec::with_capacity(12 + ciphertext.len());
-        sealed.extend_from_slice(&nonce_bytes);
-        sealed.extend_from_slice(&ciphertext);
-        Ok(sealed)
+        crate::symmetric::encrypt(&self.bytes, plaintext, SEAL_AAD)
+            .map_err(|_| SealError::SealFailed)
     }
 
     /// Unseal (decrypt) a payload previously sealed with [`seal`](Self::seal).
     ///
-    /// Expects the format `nonce (12 bytes) || ciphertext+tag`.
+    /// Handles:
+    /// - New format: `algo_id (1 byte) || nonce || ciphertext || tag`
+    /// - Legacy format: `nonce (12 bytes) || ciphertext+tag` (AES-256-GCM, no prefix)
     pub fn unseal(&self, sealed: &[u8]) -> Result<Vec<u8>, SealError> {
-        if sealed.len() < MIN_SEALED_LEN {
-            return Err(SealError::UnsealFailed);
-        }
-
-        let (nonce_bytes, ciphertext) = sealed.split_at(12);
-        let key = aes_gcm::Key::<Aes256Gcm>::from_slice(&self.bytes);
-        let cipher = Aes256Gcm::new(key);
-        let nonce = Nonce::from_slice(nonce_bytes);
-
-        let payload = aes_gcm::aead::Payload {
-            msg: ciphertext,
-            aad: SEAL_AAD,
-        };
-        cipher.decrypt(nonce, payload).map_err(|_| SealError::UnsealFailed)
+        crate::symmetric::decrypt(&self.bytes, sealed, SEAL_AAD)
+            .map_err(|_| SealError::UnsealFailed)
     }
 }
 
@@ -554,13 +526,15 @@ mod tests {
 
     #[test]
     fn sealed_output_has_expected_overhead() {
+        // Ensure non-FIPS so AEGIS-256 is selected.
+        common::fips::set_fips_mode_unchecked(false);
         let mk = MasterKey::from_seed(TEST_SEED).unwrap();
         let kek = mk.derive_kek("overhead");
 
         let plaintext = b"sixteen-bytes!!!" ; // 16 bytes
         let sealed = kek.seal(plaintext).unwrap();
-        // 12 nonce + 16 plaintext + 16 tag = 44
-        assert_eq!(sealed.len(), 12 + 16 + 16);
+        // AEGIS-256: 1 (algo_id) + 32 (nonce) + 16 (plaintext) + 32 (tag) = 81
+        assert_eq!(sealed.len(), 1 + 32 + 16 + 32);
     }
 
     // -- Wrong key / tampered ciphertext ------------------------------------
@@ -698,5 +672,76 @@ mod tests {
     fn software_key_source_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<SoftwareKeySource>();
+    }
+
+    // -- AEGIS-256 / FIPS / legacy compat -----------------------------------
+
+    #[test]
+    fn test_seal_aegis256_roundtrip() {
+        // Non-FIPS mode → AEGIS-256
+        common::fips::set_fips_mode_unchecked(false);
+        let mk = MasterKey::from_seed(TEST_SEED).unwrap();
+        let kek = mk.derive_kek("aegis-test");
+        let plaintext = b"aegis-256-sealed-secret-data";
+        let sealed = kek.seal(plaintext).unwrap();
+        let recovered = kek.unseal(&sealed).unwrap();
+        assert_eq!(recovered, plaintext);
+    }
+
+    #[test]
+    fn test_seal_fips_aes256gcm_roundtrip() {
+        // FIPS mode → AES-256-GCM
+        common::fips::set_fips_mode_unchecked(true);
+        let mk = MasterKey::from_seed(TEST_SEED).unwrap();
+        let kek = mk.derive_kek("fips-test");
+        let plaintext = b"fips-aes256gcm-sealed-data";
+        let sealed = kek.seal(plaintext).unwrap();
+        let recovered = kek.unseal(&sealed).unwrap();
+        assert_eq!(recovered, plaintext);
+        common::fips::set_fips_mode_unchecked(false);
+    }
+
+    #[test]
+    fn test_seal_legacy_backward_compat() {
+        use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+        use aes_gcm::aead::Aead;
+
+        common::fips::set_fips_mode_unchecked(false);
+        let mk = MasterKey::from_seed(TEST_SEED).unwrap();
+        let kek = mk.derive_kek("legacy-compat");
+        let plaintext = b"legacy-sealed-plaintext";
+
+        // Build a legacy AES-256-GCM blob: nonce (12) || ciphertext+tag  (no algo_id prefix)
+        let mut nonce_bytes = [0u8; 12];
+        getrandom::getrandom(&mut nonce_bytes).unwrap();
+        let cipher = Aes256Gcm::new(aes_gcm::Key::<Aes256Gcm>::from_slice(&kek.bytes));
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let ct = cipher
+            .encrypt(
+                nonce,
+                aes_gcm::aead::Payload { msg: plaintext, aad: SEAL_AAD },
+            )
+            .unwrap();
+
+        let mut legacy_blob = Vec::with_capacity(12 + ct.len());
+        legacy_blob.extend_from_slice(&nonce_bytes);
+        legacy_blob.extend_from_slice(&ct);
+
+        // Ensure the first byte is NOT 0x01 or 0x02 (algo_id values)
+        if legacy_blob.first().copied() == Some(crate::symmetric::ALGO_ID_AEGIS256)
+            || legacy_blob.first().copied() == Some(crate::symmetric::ALGO_ID_AES256GCM)
+        {
+            nonce_bytes[0] = 0xFF;
+            let nonce2 = Nonce::from_slice(&nonce_bytes);
+            let ct2 = cipher
+                .encrypt(nonce2, aes_gcm::aead::Payload { msg: plaintext, aad: SEAL_AAD })
+                .unwrap();
+            legacy_blob.clear();
+            legacy_blob.extend_from_slice(&nonce_bytes);
+            legacy_blob.extend_from_slice(&ct2);
+        }
+
+        let recovered = kek.unseal(&legacy_blob).unwrap();
+        assert_eq!(recovered, plaintext);
     }
 }
