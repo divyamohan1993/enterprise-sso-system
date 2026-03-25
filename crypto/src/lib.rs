@@ -35,3 +35,4 @@ pub mod hsm;
 pub mod tpm;
 pub mod symmetric;
 pub mod kdf;
+pub mod cac;

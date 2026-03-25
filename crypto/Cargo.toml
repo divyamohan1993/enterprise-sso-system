@@ -11,6 +11,7 @@ fips-kat = []
 
 [dependencies]
 common = { path = "../common" }
+serde.workspace = true
 sha2.workspace = true
 sha3.workspace = true
 blake3.workspace = true
@@ -35,6 +36,7 @@ argon2.workspace = true
 pbkdf2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+hex.workspace = true
 
 [dev-dependencies]
 hex = "0.4"
