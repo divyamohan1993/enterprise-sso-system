@@ -2,22 +2,22 @@
 //! Binds tokens to a client key pair, preventing token theft.
 //!
 //! RFC 9449 requires asymmetric signatures for DPoP proofs. This implementation
-//! uses ML-DSA-65 (FIPS 204, CNSA 2.0 compliant) for proof generation and
-//! verification. The dpop_key_hash function uses SHA-256 for thumbprint
-//! computation per RFC 9449/RFC 7638 JWK Thumbprint interoperability requirements.
+//! uses ML-DSA-87 (FIPS 204, CNSA 2.0 compliant, Level 5) for proof generation and
+//! verification. The dpop_key_hash function uses SHA-512 for thumbprint
+//! computation (CNSA 2.0 compliant).
 
 use ml_dsa::{
     signature::{Signer, Verifier},
-    KeyGen, MlDsa65, SigningKey, VerifyingKey,
+    KeyGen, MlDsa87, SigningKey, VerifyingKey,
 };
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 use common::domain;
 
-/// Type aliases for ML-DSA-65 DPoP key types.
-pub type DpopSigningKey = SigningKey<MlDsa65>;
-pub type DpopVerifyingKey = VerifyingKey<MlDsa65>;
-pub type DpopSignature = ml_dsa::Signature<MlDsa65>;
+/// Type aliases for ML-DSA-87 DPoP key types.
+pub type DpopSigningKey = SigningKey<MlDsa87>;
+pub type DpopVerifyingKey = VerifyingKey<MlDsa87>;
+pub type DpopSignature = ml_dsa::Signature<MlDsa87>;
 
 /// A guarded wrapper around an ML-DSA-65 signing key that ensures the key
 /// material is zeroized when dropped and optionally memory-locked to prevent
@@ -68,26 +68,26 @@ impl Drop for GuardedSigningKey {
         // a key derived from a zeroed seed.  The `_locked_bytes` field's
         // SecretVec handles zeroization + munlock of the encoded copy.
         let zero_seed = [0u8; 32];
-        let dummy_kp = MlDsa65::from_seed(&zero_seed.into());
+        let dummy_kp = MlDsa87::from_seed(&zero_seed.into());
         self.key = dummy_kp.signing_key().clone();
         // _locked_bytes is dropped automatically — SecretVec zeroizes + munlocks.
     }
 }
 
-/// Generate an ML-DSA-65 keypair for DPoP proof generation.
+/// Generate an ML-DSA-87 keypair for DPoP proof generation.
 ///
 /// Returns a `GuardedSigningKey` (zeroized on drop, mlocked) and the
 /// corresponding `DpopVerifyingKey`.
 pub fn generate_dpop_keypair() -> (GuardedSigningKey, DpopVerifyingKey) {
     let mut seed = [0u8; 32];
     getrandom::getrandom(&mut seed).expect("getrandom failed");
-    let kp = MlDsa65::from_seed(&seed.into());
+    let kp = MlDsa87::from_seed(&seed.into());
     seed.zeroize();
     let guarded = GuardedSigningKey::new(kp.signing_key().clone());
     (guarded, kp.verifying_key().clone())
 }
 
-/// Generate a raw ML-DSA-65 keypair without `GuardedSigningKey` wrapping.
+/// Generate a raw ML-DSA-87 keypair without `GuardedSigningKey` wrapping.
 ///
 /// This is provided for callers that manage key lifetime themselves (e.g.
 /// tests, short-lived one-shot proofs).  Prefer `generate_dpop_keypair()`
@@ -95,19 +95,20 @@ pub fn generate_dpop_keypair() -> (GuardedSigningKey, DpopVerifyingKey) {
 pub fn generate_dpop_keypair_raw() -> (DpopSigningKey, DpopVerifyingKey) {
     let mut seed = [0u8; 32];
     getrandom::getrandom(&mut seed).expect("getrandom failed");
-    let kp = MlDsa65::from_seed(&seed.into());
+    let kp = MlDsa87::from_seed(&seed.into());
     seed.zeroize();
     (kp.signing_key().clone(), kp.verifying_key().clone())
 }
 
 /// Generate a DPoP key hash from a client's public key bytes.
 ///
-/// Uses SHA-256 per RFC 9449/RFC 7638 JWK Thumbprint (allowed exception).
-pub fn dpop_key_hash(client_public_key: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(domain::DPOP_PROOF);
-    hasher.update(client_public_key);
-    hasher.finalize().into()
+/// Uses SHA-512 (CNSA 2.0 compliant) for thumbprint computation.
+pub fn dpop_key_hash(client_public_key: &[u8]) -> [u8; 64] {
+    use sha2::Sha512;
+    let digest = Sha512::digest([domain::DPOP_PROOF, client_public_key].concat());
+    let mut hash = [0u8; 64];
+    hash.copy_from_slice(&digest);
+    hash
 }
 
 /// Generate a DPoP proof using ML-DSA-65 (CNSA 2.0 compliant).
@@ -127,16 +128,16 @@ pub fn generate_dpop_proof(
     sig.encode().to_vec()
 }
 
-/// Verify a DPoP proof using ML-DSA-65 (CNSA 2.0 compliant).
+/// Verify a DPoP proof using ML-DSA-87 (CNSA 2.0 compliant, Level 5).
 ///
-/// Verifies the ML-DSA-65 signature over SHA-256(claims_bytes || timestamp_bytes)
+/// Verifies the ML-DSA-87 signature over SHA-256(claims_bytes || timestamp_bytes)
 /// against the provided verifying key bytes. Also checks the key hash matches.
 pub fn verify_dpop_proof(
     verifying_key: &DpopVerifyingKey,
     proof: &[u8],
     claims_bytes: &[u8],
     timestamp: i64,
-    expected_key_hash: &[u8; 32],
+    expected_key_hash: &[u8; 64],
 ) -> bool {
     // 1. Verify the key hash matches
     let vk_bytes = verifying_key.encode();
@@ -261,7 +262,7 @@ mod tests {
             let claims = b"claims";
             let timestamp = 1000i64;
             let proof = generate_dpop_proof(&sk, claims, timestamp);
-            let wrong_hash = [0xFFu8; 32];
+            let wrong_hash = [0xFFu8; 64];
             assert!(!verify_dpop_proof(&vk, &proof, claims, timestamp, &wrong_hash));
         });
     }
