@@ -16,6 +16,7 @@ sqlx.workspace = true
 tokio.workspace = true
 getrandom.workspace = true
 aes-gcm.workspace = true
+aegis.workspace = true
 hkdf.workspace = true
 hmac.workspace = true
 ml-dsa.workspace = true

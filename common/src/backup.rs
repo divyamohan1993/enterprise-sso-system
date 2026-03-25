@@ -1,11 +1,21 @@
 //! Encrypted backup and restore for the MILNET SSO system.
 //!
-//! Provides AES-256-GCM encrypted backup export/import using the master KEK.
-//! Backup format:
+//! Provides AEGIS-256 (or AES-256-GCM in FIPS mode) encrypted backup export/import
+//! using the master KEK.
 //!
+//! V2 backup format (new):
+//! ```text
+//! MILBK002              (8 bytes - magic)
+//! version               (2 bytes - u16 LE, currently 2)
+//! encrypted_data_len    (8 bytes - u64 LE)
+//! encrypted_data        (variable - algo_id || nonce || ciphertext || tag)
+//! hmac                  (64 bytes - HMAC-SHA512 over magic..encrypted_data)
+//! ```
+//!
+//! V1 backup format (legacy, read-only):
 //! ```text
 //! MILBK001              (8 bytes - magic)
-//! version               (2 bytes - u16 LE, currently 1)
+//! version               (2 bytes - u16 LE, value 1)
 //! nonce                 (12 bytes - AES-256-GCM nonce)
 //! encrypted_data_len    (8 bytes - u64 LE)
 //! encrypted_data        (variable - AES-256-GCM ciphertext + 16-byte tag)
@@ -21,28 +31,131 @@
 //! For large backups, use [`BackupWriter`] and [`BackupReader`] which process
 //! data in chunks to avoid loading the entire backup into memory.
 
+use aes_gcm::aead::generic_array::GenericArray;
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
+use aegis::aegis256::Aegis256;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::Sha512;
 use std::io::{Read, Write};
 
+// Algo IDs matching crypto::symmetric
+const ALGO_ID_AEGIS256: u8 = 0x01;
+const ALGO_ID_AES256GCM: u8 = 0x02;
+const AEGIS256_NONCE_LEN: usize = 32;
+const AEGIS256_TAG_LEN: usize = 32;
+const AES_GCM_NONCE_LEN: usize = 12;
+
+/// Encrypt plaintext using the active algorithm (AEGIS-256 or AES-256-GCM in FIPS mode).
+/// Wire format: algo_id (1) || nonce || ciphertext || tag
+fn backup_encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    if crate::fips::is_fips_mode() {
+        // AES-256-GCM
+        let mut nonce_bytes = [0u8; AES_GCM_NONCE_LEN];
+        getrandom::getrandom(&mut nonce_bytes)
+            .map_err(|e| format!("nonce generation failed: {e}"))?;
+        let cipher = Aes256Gcm::new(GenericArray::from_slice(key));
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let ct = cipher
+            .encrypt(nonce, aes_gcm::aead::Payload { msg: plaintext, aad: b"" })
+            .map_err(|e| format!("AES-256-GCM encryption failed: {e}"))?;
+        let mut out = Vec::with_capacity(1 + AES_GCM_NONCE_LEN + ct.len());
+        out.push(ALGO_ID_AES256GCM);
+        out.extend_from_slice(&nonce_bytes);
+        out.extend_from_slice(&ct);
+        Ok(out)
+    } else {
+        // AEGIS-256
+        let mut nonce = [0u8; AEGIS256_NONCE_LEN];
+        getrandom::getrandom(&mut nonce)
+            .map_err(|e| format!("nonce generation failed: {e}"))?;
+        let (ct, tag) = Aegis256::<AEGIS256_TAG_LEN>::new(key, &nonce).encrypt(plaintext, b"");
+        let mut out = Vec::with_capacity(1 + AEGIS256_NONCE_LEN + ct.len() + AEGIS256_TAG_LEN);
+        out.push(ALGO_ID_AEGIS256);
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&ct);
+        out.extend_from_slice(&tag);
+        Ok(out)
+    }
+}
+
+/// Decrypt a blob produced by `backup_encrypt` or a legacy AES-256-GCM blob.
+fn backup_decrypt(key: &[u8; 32], sealed: &[u8]) -> Result<Vec<u8>, String> {
+    let first = sealed.first().copied().ok_or_else(|| "empty ciphertext".to_string())?;
+    match first {
+        ALGO_ID_AEGIS256 => {
+            let payload = sealed.get(1..).ok_or_else(|| "truncated AEGIS-256 blob".to_string())?;
+            let min_len = AEGIS256_NONCE_LEN + AEGIS256_TAG_LEN;
+            if payload.len() < min_len {
+                return Err(format!("AEGIS-256 payload too short: {} bytes", payload.len()));
+            }
+            let nonce_slice = payload.get(..AEGIS256_NONCE_LEN)
+                .ok_or_else(|| "nonce slice out of bounds".to_string())?;
+            let rest = payload.get(AEGIS256_NONCE_LEN..)
+                .ok_or_else(|| "rest out of bounds".to_string())?;
+            let tag_offset = rest.len().checked_sub(AEGIS256_TAG_LEN)
+                .ok_or_else(|| "payload too short for tag".to_string())?;
+            let ct = rest.get(..tag_offset)
+                .ok_or_else(|| "ciphertext slice out of bounds".to_string())?;
+            let tag_slice = rest.get(tag_offset..)
+                .ok_or_else(|| "tag slice out of bounds".to_string())?;
+            let mut nonce = [0u8; AEGIS256_NONCE_LEN];
+            nonce.copy_from_slice(nonce_slice);
+            let mut tag = [0u8; AEGIS256_TAG_LEN];
+            tag.copy_from_slice(tag_slice);
+            Aegis256::<AEGIS256_TAG_LEN>::new(key, &nonce)
+                .decrypt(ct, &tag, b"")
+                .map_err(|e| format!("AEGIS-256 decryption failed: {e}"))
+        }
+        ALGO_ID_AES256GCM => {
+            let payload = sealed.get(1..).ok_or_else(|| "truncated AES-256-GCM blob".to_string())?;
+            decrypt_aes256gcm(key, payload)
+        }
+        _ => {
+            // Legacy: no algo_id prefix — treat entire blob as AES-256-GCM
+            decrypt_aes256gcm(key, sealed)
+        }
+    }
+}
+
+fn decrypt_aes256gcm(key: &[u8; 32], payload: &[u8]) -> Result<Vec<u8>, String> {
+    let min_len = AES_GCM_NONCE_LEN + 16; // nonce + tag
+    if payload.len() < min_len {
+        return Err(format!("AES-256-GCM payload too short: {} bytes", payload.len()));
+    }
+    let nonce_slice = payload.get(..AES_GCM_NONCE_LEN)
+        .ok_or_else(|| "nonce slice out of bounds".to_string())?;
+    let ct = payload.get(AES_GCM_NONCE_LEN..)
+        .ok_or_else(|| "ciphertext slice out of bounds".to_string())?;
+    let cipher = Aes256Gcm::new(GenericArray::from_slice(key));
+    let nonce = Nonce::from_slice(nonce_slice);
+    cipher
+        .decrypt(nonce, aes_gcm::aead::Payload { msg: ct, aad: b"" })
+        .map_err(|e| format!("AES-256-GCM decryption failed: {e}"))
+}
+
 type HmacSha512 = Hmac<Sha512>;
 
-/// Magic bytes identifying an encrypted MILNET backup.
-const BACKUP_MAGIC: &[u8; 8] = b"MILBK001";
+/// Magic bytes for the v1 (legacy) AES-256-GCM backup format.
+const BACKUP_MAGIC_V1: &[u8; 8] = b"MILBK001";
+
+/// Magic bytes for the v2 (new) AEGIS-256/AES-256-GCM backup format.
+const BACKUP_MAGIC_V2: &[u8; 8] = b"MILBK002";
+
+/// Current backup magic (used for new exports).
+const BACKUP_MAGIC: &[u8; 8] = BACKUP_MAGIC_V2;
 
 /// Current backup format version.
-const BACKUP_VERSION: u16 = 1;
+const BACKUP_VERSION: u16 = 2;
 
-/// AES-256-GCM nonce length.
+/// AES-256-GCM nonce length (used for legacy v1 parsing).
 const NONCE_LEN: usize = 12;
 
 /// HMAC-SHA512 output length.
 const HMAC_LEN: usize = 64;
 
-/// AES-256-GCM tag length.
+/// AES-256-GCM tag length (used for legacy v1 minimum size check).
 const TAG_LEN: usize = 16;
 
 /// Domain separation for backup encryption key derivation.
@@ -78,8 +191,9 @@ fn derive_backup_hmac_key(master_kek: &[u8; 32]) -> [u8; 64] {
 
 /// Encrypt and export backup data using the master KEK.
 ///
-/// Returns the complete encrypted backup blob including magic, version,
-/// nonce, ciphertext, and HMAC.
+/// Produces a v2 backup (magic `MILBK002`) using AEGIS-256 by default or
+/// AES-256-GCM in FIPS mode. Returns the complete encrypted backup blob
+/// including magic, version, encrypted data length, ciphertext, and HMAC.
 ///
 /// For backups larger than 256 MB, consider using [`BackupWriter`] instead.
 pub fn export_backup(master_kek: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
@@ -93,28 +207,18 @@ pub fn export_backup(master_kek: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>,
     let enc_key = derive_backup_encryption_key(master_kek);
     let hmac_key = derive_backup_hmac_key(master_kek);
 
-    // Generate random nonce
-    let mut nonce_bytes = [0u8; NONCE_LEN];
-    getrandom::getrandom(&mut nonce_bytes)
-        .map_err(|e| format!("entropy failure: {e}"))?;
-
-    // Encrypt with AES-256-GCM
-    let cipher = Aes256Gcm::new_from_slice(&enc_key)
-        .map_err(|e| format!("cipher init: {e}"))?;
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    let ciphertext = cipher
-        .encrypt(nonce, plaintext)
+    // Encrypt with the active symmetric algorithm (AEGIS-256 or AES-256-GCM)
+    let ciphertext = backup_encrypt(&enc_key, plaintext)
         .map_err(|e| format!("encryption failed: {e}"))?;
 
     let encrypted_data_len = ciphertext.len() as u64;
 
-    // Build the backup buffer (everything except HMAC)
-    let header_len = 8 + 2 + NONCE_LEN + 8; // magic + version + nonce + len
+    // V2 format: magic(8) + version(2) + encrypted_data_len(8) + data + hmac(64)
+    let header_len = 8 + 2 + 8;
     let mut backup = Vec::with_capacity(header_len + ciphertext.len() + HMAC_LEN);
 
     backup.extend_from_slice(BACKUP_MAGIC);
     backup.extend_from_slice(&BACKUP_VERSION.to_le_bytes());
-    backup.extend_from_slice(&nonce_bytes);
     backup.extend_from_slice(&encrypted_data_len.to_le_bytes());
     backup.extend_from_slice(&ciphertext);
 
@@ -137,49 +241,141 @@ pub fn export_backup(master_kek: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>,
 
 /// Verify integrity and decrypt a backup using the master KEK.
 ///
+/// Supports both v2 (`MILBK002`, AEGIS-256/AES-256-GCM) and legacy v1
+/// (`MILBK001`, AES-256-GCM only) formats.
+///
 /// Returns the decrypted plaintext data on success.
 pub fn import_backup(master_kek: &[u8; 32], backup: &[u8]) -> Result<Vec<u8>, String> {
-    let min_size = 8 + 2 + NONCE_LEN + 8 + TAG_LEN + HMAC_LEN;
+    // Minimum size: magic(8) + version(2) + anything else
+    if backup.len() < 10 {
+        return Err(format!(
+            "backup too small: {} bytes",
+            backup.len()
+        ));
+    }
+
+    let magic = backup.get(..8).ok_or("backup too short for magic")?;
+
+    if magic == BACKUP_MAGIC_V1 {
+        import_backup_v1(master_kek, backup)
+    } else if magic == BACKUP_MAGIC_V2 {
+        import_backup_v2(master_kek, backup)
+    } else {
+        Err("invalid backup: magic bytes do not match".into())
+    }
+}
+
+/// Import a v2 backup (MILBK002): AEGIS-256 or AES-256-GCM.
+fn import_backup_v2(master_kek: &[u8; 32], backup: &[u8]) -> Result<Vec<u8>, String> {
+    // V2 minimum: magic(8) + version(2) + len(8) + min_cipher_data(1) + hmac(64)
+    let min_size = 8 + 2 + 8 + 1 + HMAC_LEN;
     if backup.len() < min_size {
         return Err(format!(
-            "backup too small: {} bytes (minimum {})",
+            "v2 backup too small: {} bytes (minimum {})",
             backup.len(),
             min_size
         ));
     }
 
-    // Validate magic
-    if &backup[..8] != BACKUP_MAGIC {
-        return Err("invalid backup: magic bytes do not match".into());
-    }
-
-    // Parse version
-    let version = u16::from_le_bytes([backup[8], backup[9]]);
-    if version != BACKUP_VERSION {
-        return Err(format!("unsupported backup version: {version}"));
-    }
-
     let hmac_key = derive_backup_hmac_key(master_kek);
 
-    // Verify HMAC first (before any decryption)
-    let data_portion = &backup[..backup.len() - HMAC_LEN];
-    let stored_hmac = &backup[backup.len() - HMAC_LEN..];
+    // Verify HMAC first
+    let data_portion = backup.get(..backup.len() - HMAC_LEN)
+        .ok_or("backup too short for HMAC verification")?;
+    let stored_hmac = backup.get(backup.len() - HMAC_LEN..)
+        .ok_or("backup too short for HMAC")?;
 
     let mut mac = <HmacSha512 as Mac>::new_from_slice(&hmac_key)
         .expect("HMAC-SHA512 accepts any key size");
     mac.update(data_portion);
     let computed_hmac = mac.finalize().into_bytes();
 
-    // Constant-time comparison via subtle
     use subtle::ConstantTimeEq;
     if computed_hmac.ct_eq(stored_hmac).unwrap_u8() != 1 {
         return Err("backup integrity check failed: HMAC mismatch (wrong KEK or corrupt data)".into());
     }
 
-    // Parse nonce and encrypted data length
-    let nonce_bytes = &backup[10..10 + NONCE_LEN];
+    // Parse encrypted_data_len at offset 10 (after magic + version)
+    let len_bytes: [u8; 8] = backup.get(10..18)
+        .ok_or("backup too short for encrypted_data_len")?
+        .try_into()
+        .map_err(|_| "failed to parse encrypted_data_len")?;
+    let encrypted_data_len = u64::from_le_bytes(len_bytes) as usize;
+
+    let data_start = 18;
+    let data_end = data_start + encrypted_data_len;
+
+    if data_end + HMAC_LEN != backup.len() {
+        return Err(format!(
+            "v2 backup size mismatch: expected {} bytes of encrypted data, got {}",
+            encrypted_data_len,
+            backup.len().saturating_sub(data_start + HMAC_LEN)
+        ));
+    }
+
+    let ciphertext = backup.get(data_start..data_end)
+        .ok_or("backup ciphertext slice out of bounds")?;
+
+    // Decrypt using backup symmetric helper
+    let enc_key = derive_backup_encryption_key(master_kek);
+    let plaintext = backup_decrypt(&enc_key, ciphertext)
+        .map_err(|_| "v2 backup decryption failed: wrong KEK or tampered data".to_string())?;
+
+    use zeroize::Zeroize;
+    let mut enc_key = enc_key;
+    let mut hmac_key = hmac_key;
+    enc_key.zeroize();
+    hmac_key.zeroize();
+
+    Ok(plaintext)
+}
+
+/// Import a v1 (legacy) backup (MILBK001): AES-256-GCM only.
+fn import_backup_v1(master_kek: &[u8; 32], backup: &[u8]) -> Result<Vec<u8>, String> {
+    let min_size = 8 + 2 + NONCE_LEN + 8 + TAG_LEN + HMAC_LEN;
+    if backup.len() < min_size {
+        return Err(format!(
+            "v1 backup too small: {} bytes (minimum {})",
+            backup.len(),
+            min_size
+        ));
+    }
+
+    // Parse version
+    let version = u16::from_le_bytes(
+        backup.get(8..10)
+            .ok_or("backup too short for version")?
+            .try_into()
+            .map_err(|_| "failed to parse version")?,
+    );
+    if version != 1 {
+        return Err(format!("unsupported v1 backup version: {version}"));
+    }
+
+    let hmac_key = derive_backup_hmac_key(master_kek);
+
+    // Verify HMAC first
+    let data_portion = backup.get(..backup.len() - HMAC_LEN)
+        .ok_or("backup too short for HMAC verification")?;
+    let stored_hmac = backup.get(backup.len() - HMAC_LEN..)
+        .ok_or("backup too short for HMAC")?;
+
+    let mut mac = <HmacSha512 as Mac>::new_from_slice(&hmac_key)
+        .expect("HMAC-SHA512 accepts any key size");
+    mac.update(data_portion);
+    let computed_hmac = mac.finalize().into_bytes();
+
+    use subtle::ConstantTimeEq;
+    if computed_hmac.ct_eq(stored_hmac).unwrap_u8() != 1 {
+        return Err("backup integrity check failed: HMAC mismatch (wrong KEK or corrupt data)".into());
+    }
+
+    // Parse nonce and encrypted data length (v1 layout)
+    let nonce_bytes = backup.get(10..10 + NONCE_LEN)
+        .ok_or("v1 backup too short for nonce")?;
     let encrypted_data_len = u64::from_le_bytes(
-        backup[10 + NONCE_LEN..10 + NONCE_LEN + 8]
+        backup.get(10 + NONCE_LEN..10 + NONCE_LEN + 8)
+            .ok_or("v1 backup too short for data length")?
             .try_into()
             .map_err(|_| "failed to parse encrypted_data_len")?,
     ) as usize;
@@ -189,24 +385,24 @@ pub fn import_backup(master_kek: &[u8; 32], backup: &[u8]) -> Result<Vec<u8>, St
 
     if data_end + HMAC_LEN != backup.len() {
         return Err(format!(
-            "backup size mismatch: expected {} bytes of encrypted data, got {}",
+            "v1 backup size mismatch: expected {} bytes of encrypted data, got {}",
             encrypted_data_len,
-            backup.len() - data_start - HMAC_LEN
+            backup.len().saturating_sub(data_start + HMAC_LEN)
         ));
     }
 
-    let ciphertext = &backup[data_start..data_end];
+    let ciphertext = backup.get(data_start..data_end)
+        .ok_or("v1 backup ciphertext slice out of bounds")?;
 
-    // Decrypt
+    // Decrypt using legacy AES-256-GCM
     let enc_key = derive_backup_encryption_key(master_kek);
     let cipher = Aes256Gcm::new_from_slice(&enc_key)
         .map_err(|e| format!("cipher init: {e}"))?;
     let nonce = Nonce::from_slice(nonce_bytes);
     let plaintext = cipher
         .decrypt(nonce, ciphertext)
-        .map_err(|_| "backup decryption failed: wrong KEK or tampered data")?;
+        .map_err(|_| "v1 backup decryption failed: wrong KEK or tampered data")?;
 
-    // Zeroize sensitive key material
     use zeroize::Zeroize;
     let mut enc_key = enc_key;
     let mut hmac_key = hmac_key;
@@ -473,5 +669,59 @@ mod tests {
         // But both decrypt to the same plaintext
         assert_eq!(import_backup(&kek, &b1).unwrap(), data);
         assert_eq!(import_backup(&kek, &b2).unwrap(), data);
+    }
+
+    // -- V2 AEGIS-256 / V1 legacy compat ------------------------------------
+
+    #[test]
+    fn test_backup_v2_aegis256_roundtrip() {
+        crate::fips::set_fips_mode_unchecked(false);
+        let kek = test_kek();
+        let data = b"v2-aegis256-backup-test-data";
+        let backup = export_backup(&kek, data).unwrap();
+        // Should have MILBK002 magic
+        assert_eq!(&backup[..8], BACKUP_MAGIC_V2);
+        // Version should be 2
+        let version = u16::from_le_bytes([backup[8], backup[9]]);
+        assert_eq!(version, 2);
+        let restored = import_backup(&kek, &backup).unwrap();
+        assert_eq!(&restored, data);
+    }
+
+    #[test]
+    fn test_backup_v1_backward_compat() {
+        // Manually construct a v1 backup (MILBK001, AES-256-GCM, version=1)
+        let kek = test_kek();
+        let data = b"v1-legacy-backup-plaintext";
+
+        let enc_key = derive_backup_encryption_key(&kek);
+        let hmac_key = derive_backup_hmac_key(&kek);
+
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        getrandom::getrandom(&mut nonce_bytes).unwrap();
+
+        let cipher = Aes256Gcm::new_from_slice(&enc_key).unwrap();
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let ciphertext = cipher
+            .encrypt(nonce, aes_gcm::aead::Payload { msg: data, aad: b"" })
+            .unwrap();
+
+        let version_v1: u16 = 1;
+        let encrypted_data_len = ciphertext.len() as u64;
+
+        let mut backup = Vec::new();
+        backup.extend_from_slice(BACKUP_MAGIC_V1);
+        backup.extend_from_slice(&version_v1.to_le_bytes());
+        backup.extend_from_slice(&nonce_bytes);
+        backup.extend_from_slice(&encrypted_data_len.to_le_bytes());
+        backup.extend_from_slice(&ciphertext);
+
+        let mut mac = <HmacSha512 as Mac>::new_from_slice(&hmac_key).unwrap();
+        mac.update(&backup);
+        let hmac_result = mac.finalize().into_bytes();
+        backup.extend_from_slice(&hmac_result);
+
+        let restored = import_backup(&kek, &backup).unwrap();
+        assert_eq!(&restored, data);
     }
 }

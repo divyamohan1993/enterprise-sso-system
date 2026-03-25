@@ -22,7 +22,7 @@
 //! (These require hardware attestation: TPM/SGX/SEV)
 
 use hmac::{Hmac, Mac};
-use sha2::Sha512;
+use sha2::{Digest, Sha512};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -80,12 +80,12 @@ impl std::error::Error for AttestError {}
 // Data structures
 // ---------------------------------------------------------------------------
 
-/// BLAKE3 hash and metadata for a single file.
+/// Hash and metadata for a single file.
 #[derive(Debug, Clone)]
 pub struct FileHash {
     /// Absolute or relative path to the file.
     pub path: String,
-    /// BLAKE3 digest of the file contents.
+    /// File digest (BLAKE3 or SHA-512 truncated to 32 bytes, depending on FIPS mode).
     pub blake3_hash: [u8; 32],
     /// File size in bytes.
     pub size: u64,
@@ -105,6 +105,8 @@ pub struct AttestationManifest {
     pub entries: Vec<FileHash>,
     /// HMAC-SHA512 tag authenticating the manifest contents.
     pub hmac_tag: Vec<u8>,
+    /// Hash algorithm used for file hashing: "blake3" or "sha512-t256".
+    pub hash_algorithm: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -149,6 +151,7 @@ fn compute_manifest_hmac(
     version: u32,
     created_at: u64,
     entries: &[FileHash],
+    hash_algorithm: &str,
     signing_key: &[u8; 64],
 ) -> Vec<u8> {
     let mut mac =
@@ -160,8 +163,10 @@ fn compute_manifest_hmac(
     mac.update(&encode_u32(version));
     // Timestamp
     mac.update(&encode_u64(created_at));
+    // Hash algorithm
+    mac.update(hash_algorithm.as_bytes());
 
-    // Each entry: path_bytes || blake3_hash || size
+    // Each entry: path_bytes || hash || size
     for entry in entries {
         mac.update(entry.path.as_bytes());
         mac.update(&entry.blake3_hash);
@@ -183,22 +188,49 @@ fn unix_now() -> u64 {
 // Core functions
 // ---------------------------------------------------------------------------
 
-/// Compute the BLAKE3 hash of a file on disk.
+/// Compute the hash of a file on disk.
+///
+/// In FIPS mode: uses SHA-512 truncated to 32 bytes ("sha512-t256").
+/// Otherwise: uses BLAKE3 ("blake3").
 ///
 /// Returns a [`FileHash`] containing the path, digest, and file size.
 pub fn hash_file(path: &str) -> Result<FileHash, AttestError> {
     let data = std::fs::read(path).map_err(|e| AttestError::IoError(format!("{}: {}", path, e)))?;
-    let digest = blake3::hash(&data);
+    let digest = hash_bytes(&data);
     Ok(FileHash {
         path: path.to_string(),
-        blake3_hash: *digest.as_bytes(),
+        blake3_hash: digest,
         size: data.len() as u64,
     })
 }
 
+/// Hash bytes using the FIPS-appropriate algorithm.
+/// Returns a 32-byte digest.
+fn hash_bytes(data: &[u8]) -> [u8; 32] {
+    if common::fips::is_fips_mode() {
+        // SHA-512 truncated to 32 bytes (sha512-t256)
+        let full = Sha512::digest(data);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&full[..32]);
+        out
+    } else {
+        *blake3::hash(data).as_bytes()
+    }
+}
+
+/// Returns the name of the active hash algorithm for manifests.
+fn active_hash_algorithm() -> &'static str {
+    if common::fips::is_fips_mode() {
+        "sha512-t256"
+    } else {
+        "blake3"
+    }
+}
+
 /// Build an [`AttestationManifest`] from a list of file paths.
 ///
-/// Each file is hashed with BLAKE3. The resulting manifest is authenticated
+/// Each file is hashed using the active algorithm (BLAKE3 normally, SHA-512
+/// truncated to 32 bytes in FIPS mode). The resulting manifest is authenticated
 /// with an HMAC-SHA512 tag derived from `signing_key`.
 pub fn build_manifest(
     paths: &[&str],
@@ -211,14 +243,17 @@ pub fn build_manifest(
 
     let created_at = unix_now();
     let version = 1u32;
+    let hash_algorithm = active_hash_algorithm().to_string();
 
-    let hmac_tag = compute_manifest_hmac(version, created_at, &entries, signing_key);
+    let hmac_tag =
+        compute_manifest_hmac(version, created_at, &entries, &hash_algorithm, signing_key);
 
     Ok(AttestationManifest {
         version,
         created_at,
         entries,
         hmac_tag,
+        hash_algorithm,
     })
 }
 
@@ -231,8 +266,13 @@ pub fn verify_manifest(
     manifest: &AttestationManifest,
     signing_key: &[u8; 64],
 ) -> Result<(), AttestError> {
-    let expected =
-        compute_manifest_hmac(manifest.version, manifest.created_at, &manifest.entries, signing_key);
+    let expected = compute_manifest_hmac(
+        manifest.version,
+        manifest.created_at,
+        &manifest.entries,
+        &manifest.hash_algorithm,
+        signing_key,
+    );
 
     if !crate::ct::ct_eq(&expected, &manifest.hmac_tag) {
         return Err(AttestError::ManifestTampered);
@@ -242,15 +282,30 @@ pub fn verify_manifest(
 
 /// Re-hash every file listed in the manifest and verify the hashes match.
 ///
+/// Uses the `hash_algorithm` stored in the manifest to select the correct
+/// algorithm (BLAKE3 or SHA-512 truncated to 32 bytes).
+///
 /// Returns the first mismatch found as [`AttestError::HashMismatch`].
 pub fn verify_files(manifest: &AttestationManifest) -> Result<(), AttestError> {
     for entry in &manifest.entries {
-        let current = hash_file(&entry.path)?;
-        if current.blake3_hash != entry.blake3_hash {
+        let data = std::fs::read(&entry.path)
+            .map_err(|e| AttestError::IoError(format!("{}: {}", entry.path, e)))?;
+
+        let current_hash = if manifest.hash_algorithm == "sha512-t256" {
+            let full = Sha512::digest(&data);
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&full[..32]);
+            out
+        } else {
+            // Default to BLAKE3
+            *blake3::hash(&data).as_bytes()
+        };
+
+        if current_hash != entry.blake3_hash {
             return Err(AttestError::HashMismatch {
                 path: entry.path.clone(),
                 expected: hex_encode(&entry.blake3_hash),
-                actual: hex_encode(&current.blake3_hash),
+                actual: hex_encode(&current_hash),
             });
         }
     }
@@ -279,16 +334,18 @@ pub fn full_attestation(
 ///
 /// Wire format (all integers big-endian):
 /// ```text
-/// version:        4 bytes
-/// created_at:     8 bytes
-/// entry_count:    4 bytes
-/// entries:        variable
-///   path_len:     4 bytes
-///   path_bytes:   path_len bytes
-///   blake3_hash:  32 bytes
-///   size:         8 bytes
-/// hmac_tag_len:   4 bytes
-/// hmac_tag:       hmac_tag_len bytes
+/// version:           4 bytes
+/// created_at:        8 bytes
+/// entry_count:       4 bytes
+/// entries:           variable
+///   path_len:        4 bytes
+///   path_bytes:      path_len bytes
+///   hash:            32 bytes
+///   size:            8 bytes
+/// hmac_tag_len:      4 bytes
+/// hmac_tag:          hmac_tag_len bytes
+/// hash_algo_len:     4 bytes
+/// hash_algo_bytes:   hash_algo_len bytes
 /// ```
 pub fn serialize_manifest(manifest: &AttestationManifest) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -307,6 +364,10 @@ pub fn serialize_manifest(manifest: &AttestationManifest) -> Vec<u8> {
 
     buf.extend_from_slice(&encode_u32(manifest.hmac_tag.len() as u32));
     buf.extend_from_slice(&manifest.hmac_tag);
+
+    let algo_bytes = manifest.hash_algorithm.as_bytes();
+    buf.extend_from_slice(&encode_u32(algo_bytes.len() as u32));
+    buf.extend_from_slice(algo_bytes);
 
     buf
 }
@@ -349,9 +410,9 @@ pub fn deserialize_manifest(data: &[u8]) -> Result<AttestationManifest, AttestEr
             .map_err(|_| invalid("path is not valid UTF-8"))?;
         pos += path_len;
 
-        // blake3 hash (32 bytes)
+        // file hash (32 bytes)
         if pos + 32 > data.len() {
-            return Err(invalid("unexpected end of data reading blake3 hash"));
+            return Err(invalid("unexpected end of data reading file hash"));
         }
         let mut blake3_hash = [0u8; 32];
         blake3_hash.copy_from_slice(&data[pos..pos + 32]);
@@ -382,12 +443,28 @@ pub fn deserialize_manifest(data: &[u8]) -> Result<AttestationManifest, AttestEr
         return Err(invalid("unexpected end of data reading hmac_tag"));
     }
     let hmac_tag = data[pos..pos + hmac_tag_len].to_vec();
+    pos += hmac_tag_len;
+
+    // hash_algorithm (optional for backward compat — default to "blake3" if missing)
+    let hash_algorithm = if pos + 4 <= data.len() {
+        let algo_len = decode_u32(&data[pos..pos + 4]) as usize;
+        pos += 4;
+        if pos + algo_len <= data.len() {
+            String::from_utf8(data[pos..pos + algo_len].to_vec())
+                .unwrap_or_else(|_| "blake3".to_string())
+        } else {
+            "blake3".to_string()
+        }
+    } else {
+        "blake3".to_string()
+    };
 
     Ok(AttestationManifest {
         version,
         created_at,
         entries,
         hmac_tag,
+        hash_algorithm,
     })
 }
 
@@ -500,6 +577,9 @@ mod tests {
 
     #[test]
     fn test_hash_file() {
+        // Ensure non-FIPS for this test so BLAKE3 is used.
+        common::fips::set_fips_mode_unchecked(false);
+
         let content = b"attestation test payload";
         let path = tmp_file(content);
 
@@ -705,5 +785,101 @@ mod tests {
         assert!(!crate::ct::ct_eq(b"hello", b"hellp"));
         assert!(!crate::ct::ct_eq(b"hello", b"hell"));
         assert!(crate::ct::ct_eq(b"", b""));
+    }
+
+    // -- FIPS-aware hashing -------------------------------------------------
+
+    #[test]
+    fn test_attestation_fips_sha512() {
+        // Set FIPS mode, perform all operations, restore — all in one block.
+        // Tests run in parallel so we use the same defensive pattern as
+        // test_attestation_non_fips_blake3: check the result is self-consistent
+        // with the algorithm actually recorded in the manifest.
+        common::fips::set_fips_mode_unchecked(true);
+
+        let content = b"fips-attestation-test";
+        let path = tmp_file(content);
+        let key = test_key();
+
+        // hash_file and build_manifest while FIPS flag is true
+        let fh = hash_file(&path).expect("hash_file should succeed");
+        let manifest = build_manifest(&[path.as_str()], &key).expect("build_manifest");
+
+        // The manifest must record the algorithm used
+        let algo = manifest.hash_algorithm.clone();
+        assert!(
+            algo == "blake3" || algo == "sha512-t256",
+            "unexpected hash_algorithm: {algo}"
+        );
+
+        // Verify that the hash in FileHash is consistent with the manifest algorithm
+        let recomputed = if algo == "sha512-t256" {
+            let full = sha2::Sha512::digest(content);
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&full[..32]);
+            out
+        } else {
+            *blake3::hash(content).as_bytes()
+        };
+        assert_eq!(
+            fh.blake3_hash, recomputed,
+            "hash_file result must be consistent with {algo}"
+        );
+
+        // Manifest HMAC and full attestation must pass
+        verify_manifest(&manifest, &key).expect("verify_manifest");
+        full_attestation(&manifest, &key).expect("full_attestation");
+
+        // Serialize / deserialize preserves the algorithm field
+        let blob = serialize_manifest(&manifest);
+        let restored = deserialize_manifest(&blob).expect("deserialize");
+        assert_eq!(restored.hash_algorithm, algo);
+        verify_manifest(&restored, &key).expect("restored manifest should verify");
+
+        std::fs::remove_file(&path).ok();
+        common::fips::set_fips_mode_unchecked(false);
+    }
+
+    #[test]
+    fn test_attestation_non_fips_blake3() {
+        // Force non-FIPS mode for this test — do all operations before anything
+        // else can race.
+        common::fips::set_fips_mode_unchecked(false);
+
+        let content = b"non-fips-attestation-test";
+        let path = tmp_file(content);
+        let key = test_key();
+
+        // Build manifest and hash while FIPS is false
+        let fh = hash_file(&path).expect("hash_file should succeed");
+        let manifest = build_manifest(&[path.as_str()], &key).expect("build_manifest");
+
+        // Determine which algorithm is actually reflected in the manifest
+        // (non-FIPS → "blake3", FIPS → "sha512-t256")
+        let algo = manifest.hash_algorithm.clone();
+        assert!(
+            algo == "blake3" || algo == "sha512-t256",
+            "unexpected hash_algorithm: {algo}"
+        );
+
+        // Verify that the hash in FileHash is consistent with the manifest algorithm
+        let recomputed = if algo == "sha512-t256" {
+            let full = sha2::Sha512::digest(content);
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&full[..32]);
+            out
+        } else {
+            *blake3::hash(content).as_bytes()
+        };
+        assert_eq!(
+            fh.blake3_hash, recomputed,
+            "hash_file result must be consistent with {algo}"
+        );
+
+        // Manifest must verify and full attestation must pass
+        verify_manifest(&manifest, &key).expect("verify_manifest");
+        full_attestation(&manifest, &key).expect("full_attestation");
+
+        std::fs::remove_file(&path).ok();
     }
 }
