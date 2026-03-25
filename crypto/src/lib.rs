@@ -34,3 +34,4 @@ pub mod attest;
 pub mod hsm;
 pub mod tpm;
 pub mod symmetric;
+pub mod kdf;
