@@ -12,13 +12,20 @@ use common::error::MilnetError;
 use opaque_ke::{ServerRegistration, ServerSetup};
 use rand::rngs::OsRng;
 
-use crate::opaque_impl::OpaqueCs;
+use crate::opaque_impl::{OpaqueCs, OpaqueCsFips};
+
+/// KSF algorithm identifier stored with each user record.
+pub const KSF_ARGON2ID: &str = "argon2id-v19";
+pub const KSF_PBKDF2_SHA512: &str = "pbkdf2-sha512";
 
 /// A stored user credential record.
 pub struct UserRecord {
     pub user_id: Uuid,
     /// Serialized `ServerRegistration<OpaqueCs>` — contains NO password info.
     pub registration: Vec<u8>,
+    /// Key stretching function algorithm used during registration.
+    /// Defaults to "argon2id-v19".
+    pub ksf_algorithm: String,
 }
 
 /// In-memory credential store mapping usernames to OPAQUE registration records.
@@ -27,6 +34,8 @@ pub struct CredentialStore {
     /// The server's OPAQUE setup (OPRF seed + keypair). Must be persisted
     /// across restarts in production.
     server_setup: ServerSetup<OpaqueCs>,
+    /// Optional FIPS-compliant server setup using PBKDF2-SHA512 KSF.
+    server_setup_fips: Option<ServerSetup<OpaqueCsFips>>,
 }
 
 impl CredentialStore {
@@ -37,6 +46,20 @@ impl CredentialStore {
         Self {
             users: HashMap::new(),
             server_setup,
+            server_setup_fips: None,
+        }
+    }
+
+    /// Create a credential store with both Argon2id and PBKDF2-SHA512 server
+    /// setups initialised.  The FIPS setup is used when FIPS mode is active.
+    pub fn new_dual() -> Self {
+        let mut rng = OsRng;
+        let server_setup = ServerSetup::<OpaqueCs>::new(&mut rng);
+        let server_setup_fips = ServerSetup::<OpaqueCsFips>::new(&mut rng);
+        Self {
+            users: HashMap::new(),
+            server_setup,
+            server_setup_fips: Some(server_setup_fips),
         }
     }
 
@@ -46,12 +69,18 @@ impl CredentialStore {
         Self {
             users: HashMap::new(),
             server_setup,
+            server_setup_fips: None,
         }
     }
 
     /// Returns a reference to the server setup.
     pub fn server_setup(&self) -> &ServerSetup<OpaqueCs> {
         &self.server_setup
+    }
+
+    /// Returns a reference to the FIPS server setup, if initialised.
+    pub fn server_setup_fips(&self) -> Option<&ServerSetup<OpaqueCsFips>> {
+        self.server_setup_fips.as_ref()
     }
 
     /// Store a completed registration for a user.
@@ -70,6 +99,25 @@ impl CredentialStore {
             UserRecord {
                 user_id,
                 registration: registration_bytes,
+                ksf_algorithm: KSF_ARGON2ID.to_string(),
+            },
+        );
+        user_id
+    }
+
+    /// Store a completed FIPS registration for a user (PBKDF2-SHA512 KSF).
+    pub fn store_registration_fips(
+        &mut self,
+        username: &str,
+        registration_bytes: Vec<u8>,
+    ) -> Uuid {
+        let user_id = Uuid::new_v4();
+        self.users.insert(
+            username.to_string(),
+            UserRecord {
+                user_id,
+                registration: registration_bytes,
+                ksf_algorithm: KSF_PBKDF2_SHA512.to_string(),
             },
         );
         user_id
@@ -113,11 +161,17 @@ impl CredentialStore {
         self.users.keys().cloned().collect()
     }
 
+    /// Get the KSF algorithm used for a user's registration.
+    pub fn get_ksf_algorithm(&self, username: &str) -> Option<&str> {
+        self.users.get(username).map(|r| r.ksf_algorithm.as_str())
+    }
+
     /// Restore a user registration from persistent storage (e.g. PostgreSQL).
     pub fn restore_user(&mut self, username: &str, user_id: Uuid, registration_bytes: Vec<u8>) {
         self.users.insert(username.to_string(), UserRecord {
             user_id,
             registration: registration_bytes,
+            ksf_algorithm: KSF_ARGON2ID.to_string(),
         });
     }
 
@@ -167,6 +221,133 @@ impl CredentialStore {
         let registration_bytes = server_registration.serialize().to_vec();
 
         self.store_registration(username, registration_bytes)
+    }
+
+    /// Perform OPAQUE registration using the FIPS cipher suite (PBKDF2-SHA512).
+    ///
+    /// Requires the store to have been created with `new_dual()`.
+    /// Returns an error if the FIPS server setup is not initialised.
+    pub fn register_with_password_fips(
+        &mut self,
+        username: &str,
+        password: &[u8],
+    ) -> Result<Uuid, MilnetError> {
+        use opaque_ke::{ClientRegistration, ClientRegistrationFinishParameters};
+
+        let server_setup = self.server_setup_fips.as_ref()
+            .ok_or_else(|| MilnetError::CryptoVerification(
+                "FIPS server setup not initialised — use new_dual()".into(),
+            ))?;
+
+        let mut rng = OsRng;
+
+        // Step 1: Client starts registration
+        let client_start = ClientRegistration::<OpaqueCsFips>::start(&mut rng, password)
+            .map_err(|e| MilnetError::CryptoVerification(format!("FIPS reg start: {e}")))?;
+
+        // Step 2: Server processes registration request
+        let server_start = ServerRegistration::<OpaqueCsFips>::start(
+            server_setup,
+            client_start.message,
+            username.as_bytes(),
+        )
+        .map_err(|e| MilnetError::CryptoVerification(format!("FIPS server reg start: {e}")))?;
+
+        // Step 3: Client finishes registration
+        let client_finish = client_start.state.finish(
+            &mut rng,
+            password,
+            server_start.message,
+            ClientRegistrationFinishParameters::default(),
+        )
+        .map_err(|e| MilnetError::CryptoVerification(format!("FIPS client reg finish: {e}")))?;
+
+        // Step 4: Server finishes registration
+        let server_registration = ServerRegistration::<OpaqueCsFips>::finish(client_finish.message);
+        let registration_bytes = server_registration.serialize().to_vec();
+
+        Ok(self.store_registration_fips(username, registration_bytes))
+    }
+
+    /// Verify a password adaptively, routing to the correct cipher suite based
+    /// on the user's stored `ksf_algorithm` field.
+    ///
+    /// If the user was registered with Argon2id but FIPS mode is now active,
+    /// the login still succeeds (using the Argon2id path) and the caller
+    /// receives a `needs_reregistration = true` flag signalling that the user
+    /// should be asked to re-register under the FIPS cipher suite.
+    ///
+    /// Returns `(user_id, needs_reregistration)`.
+    pub fn verify_password_adaptive(
+        &self,
+        username: &str,
+        password: &[u8],
+    ) -> Result<(Uuid, bool), MilnetError> {
+        let record = self.users.get(username)
+            .ok_or_else(|| MilnetError::CryptoVerification("user not found".into()))?;
+
+        let fips_active = common::fips::is_fips_mode();
+
+        match record.ksf_algorithm.as_str() {
+            KSF_PBKDF2_SHA512 => {
+                // User was registered under FIPS cipher suite
+                let user_id = self.verify_password_fips_internal(username, password, record)?;
+                Ok((user_id, false))
+            }
+            _ => {
+                // User was registered under Argon2id (non-FIPS)
+                let user_id = self.verify_password(username, password)?;
+                // Flag for re-registration if FIPS mode is now active
+                let needs_reregistration = fips_active;
+                Ok((user_id, needs_reregistration))
+            }
+        }
+    }
+
+    /// Internal: verify a FIPS-registered user's password.
+    fn verify_password_fips_internal(
+        &self,
+        username: &str,
+        password: &[u8],
+        record: &UserRecord,
+    ) -> Result<Uuid, MilnetError> {
+        use opaque_ke::{ClientLogin, ClientLoginFinishParameters, ServerLogin, ServerLoginParameters};
+
+        let server_setup = self.server_setup_fips.as_ref()
+            .ok_or_else(|| MilnetError::CryptoVerification(
+                "FIPS server setup not initialised".into(),
+            ))?;
+
+        let server_registration = ServerRegistration::<OpaqueCsFips>::deserialize(&record.registration)
+            .map_err(|_| MilnetError::CryptoVerification("corrupt FIPS registration".into()))?;
+
+        let mut rng = OsRng;
+
+        let client_start = ClientLogin::<OpaqueCsFips>::start(&mut rng, password)
+            .map_err(|_| MilnetError::CryptoVerification("FIPS login start failed".into()))?;
+
+        let server_start = ServerLogin::<OpaqueCsFips>::start(
+            &mut rng,
+            server_setup,
+            Some(server_registration),
+            client_start.message,
+            username.as_bytes(),
+            ServerLoginParameters::default(),
+        )
+        .map_err(|_| MilnetError::CryptoVerification("FIPS server login failed".into()))?;
+
+        let client_finish = client_start.state.finish(
+            &mut rng,
+            password,
+            server_start.message,
+            ClientLoginFinishParameters::default(),
+        )
+        .map_err(|_| MilnetError::CryptoVerification("invalid FIPS password".into()))?;
+
+        server_start.state.finish(client_finish.message, ServerLoginParameters::default())
+            .map_err(|_| MilnetError::CryptoVerification("FIPS authentication failed".into()))?;
+
+        Ok(record.user_id)
     }
 
     /// Verify a password using the full OPAQUE login protocol internally.

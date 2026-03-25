@@ -5,7 +5,7 @@
 
 use opaque::opaque_impl::OpaqueCs;
 use opaque::service::{handle_login_finish, handle_login_start};
-use opaque::store::CredentialStore;
+use opaque::store::{CredentialStore, KSF_ARGON2ID, KSF_PBKDF2_SHA512};
 use opaque_ke::{
     ClientLogin, ClientLoginFinishParameters, ClientRegistration,
     ClientRegistrationFinishParameters,
@@ -317,4 +317,146 @@ fn client_and_server_agree_on_session_key() {
         client_session_key, server_finish.session_key,
         "client and server session keys must be identical"
     );
+}
+
+// ── FIPS Cipher Suite Tests ──────────────────────────────────────────────
+
+/// Helper to run a closure on a thread with 8 MiB stack (ML-DSA-87 needs it).
+fn run_with_large_stack<F, T>(f: F) -> T
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(f)
+        .expect("spawn")
+        .join()
+        .expect("join")
+}
+
+/// Register with FIPS cipher suite (PBKDF2-SHA512), then verify login succeeds.
+#[test]
+fn test_opaque_fips_registration() {
+    run_with_large_stack(|| {
+        let mut store = CredentialStore::new_dual();
+        let password = b"fips-test-password-hunter42";
+
+        // Register under FIPS cipher suite
+        let user_id = store
+            .register_with_password_fips("fips_alice", password)
+            .expect("FIPS registration must succeed");
+
+        assert!(store.user_exists("fips_alice"));
+        assert_eq!(store.get_user_id("fips_alice"), Some(user_id));
+
+        // The KSF algorithm field must record the FIPS cipher suite
+        assert_eq!(
+            store.get_ksf_algorithm("fips_alice"),
+            Some(KSF_PBKDF2_SHA512),
+            "FIPS registration must set ksf_algorithm to pbkdf2-sha512"
+        );
+
+        // Verify password via adaptive verify (FIPS mode off — still uses correct path)
+        let (verified_id, needs_rereg) = store
+            .verify_password_adaptive("fips_alice", password)
+            .expect("FIPS login must succeed");
+
+        assert_eq!(verified_id, user_id, "user_id must match after FIPS login");
+        assert!(
+            !needs_rereg,
+            "FIPS-registered user does not need re-registration"
+        );
+
+        // Wrong password must fail
+        let result = store.verify_password_adaptive("fips_alice", b"wrong-password");
+        assert!(result.is_err(), "wrong password must fail for FIPS user");
+    });
+}
+
+/// Register with Argon2id, enable FIPS mode, verify adaptive login still works.
+/// The user should be flagged for re-registration.
+#[test]
+fn test_opaque_ksf_migration() {
+    run_with_large_stack(|| {
+        let mut store = CredentialStore::new_dual();
+        let password = b"migration-test-password";
+
+        // Register under Argon2id (non-FIPS)
+        let user_id = store.register_with_password("legacy_bob", password);
+
+        assert_eq!(
+            store.get_ksf_algorithm("legacy_bob"),
+            Some(KSF_ARGON2ID),
+            "Non-FIPS registration must record argon2id-v19"
+        );
+
+        // Enable FIPS mode
+        common::fips::set_fips_mode_unchecked(true);
+
+        // Adaptive verify must still succeed (uses Argon2id path for legacy user)
+        let result = store.verify_password_adaptive("legacy_bob", password);
+
+        // Restore FIPS mode before any assertions (avoids contaminating other tests)
+        common::fips::set_fips_mode_unchecked(false);
+
+        let (verified_id, needs_rereg) = result
+            .expect("Argon2id user must still log in even when FIPS mode is active");
+
+        assert_eq!(verified_id, user_id);
+        assert!(
+            needs_rereg,
+            "Argon2id user in FIPS mode must be flagged for re-registration"
+        );
+    });
+}
+
+/// Verify that ksf_algorithm is set correctly for both cipher suites.
+#[test]
+fn test_opaque_adaptive_verify() {
+    run_with_large_stack(|| {
+        let mut store = CredentialStore::new_dual();
+
+        // Register two users under different cipher suites
+        store.register_with_password("argon2_user", b"pw1");
+        store
+            .register_with_password_fips("fips_user", b"pw2")
+            .expect("FIPS registration");
+
+        // Verify ksf_algorithm is set correctly for each user
+        assert_eq!(
+            store.get_ksf_algorithm("argon2_user"),
+            Some(KSF_ARGON2ID),
+            "Argon2id user must have argon2id-v19 KSF"
+        );
+        assert_eq!(
+            store.get_ksf_algorithm("fips_user"),
+            Some(KSF_PBKDF2_SHA512),
+            "FIPS user must have pbkdf2-sha512 KSF"
+        );
+
+        // Both users can log in adaptively with correct passwords (FIPS mode off)
+        let (_, needs_rereg_argon2) = store
+            .verify_password_adaptive("argon2_user", b"pw1")
+            .expect("argon2 user login");
+        let (_, needs_rereg_fips) = store
+            .verify_password_adaptive("fips_user", b"pw2")
+            .expect("fips user login");
+
+        // Without FIPS mode active, Argon2id users do not need re-registration
+        assert!(
+            !needs_rereg_argon2,
+            "No re-registration needed when FIPS mode is off"
+        );
+        assert!(
+            !needs_rereg_fips,
+            "FIPS user never needs re-registration"
+        );
+
+        // Unknown user must return an error
+        assert!(
+            store.verify_password_adaptive("nobody", b"pw").is_err(),
+            "Unknown user must return error"
+        );
+    });
 }

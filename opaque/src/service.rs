@@ -23,7 +23,7 @@ use opaque_ke::{
 use tracing::{error, info};
 
 use crate::messages::{OpaqueRequest, OpaqueResponse};
-use crate::opaque_impl::OpaqueCs;
+use crate::opaque_impl::{OpaqueCs, OpaqueCsFips};
 use crate::store::CredentialStore;
 
 /// ML-DSA-87 receipt signer (CNSA 2.0 Level 5 compliant).
@@ -231,12 +231,63 @@ pub fn handle_register_finish(
     Ok(user_id)
 }
 
+/// Handle a RegisterStart request using the FIPS cipher suite (PBKDF2-SHA512).
+///
+/// Analogous to `handle_register_start` but uses `OpaqueCsFips`.
+/// Used when `common::fips::is_fips_mode()` is true.
+pub fn handle_register_start_fips(
+    store: &CredentialStore,
+    username: &str,
+    registration_request_bytes: &[u8],
+) -> Result<Vec<u8>, String> {
+    use opaque_ke::RegistrationRequest;
+
+    let server_setup = store.server_setup_fips()
+        .ok_or_else(|| "FIPS server setup not initialised — use CredentialStore::new_dual()".to_string())?;
+
+    let registration_request =
+        RegistrationRequest::<OpaqueCsFips>::deserialize(registration_request_bytes)
+            .map_err(|e| format!("deserialize FIPS registration request: {e}"))?;
+
+    let server_start = ServerRegistration::<OpaqueCsFips>::start(
+        server_setup,
+        registration_request,
+        username.as_bytes(),
+    )
+    .map_err(|e| format!("FIPS server registration start: {e}"))?;
+
+    Ok(server_start.message.serialize().to_vec())
+}
+
+/// Handle a RegisterFinish request using the FIPS cipher suite (PBKDF2-SHA512).
+pub fn handle_register_finish_fips(
+    store: &mut CredentialStore,
+    username: &str,
+    registration_upload_bytes: &[u8],
+) -> Result<uuid::Uuid, String> {
+    use opaque_ke::RegistrationUpload;
+
+    let registration_upload =
+        RegistrationUpload::<OpaqueCsFips>::deserialize(registration_upload_bytes)
+            .map_err(|e| format!("deserialize FIPS registration upload: {e}"))?;
+
+    let server_registration = ServerRegistration::<OpaqueCsFips>::finish(registration_upload);
+    let registration_bytes = server_registration.serialize().to_vec();
+
+    let user_id = store.store_registration_fips(username, registration_bytes);
+    Ok(user_id)
+}
+
 /// Process a single OPAQUE request (for synchronous/test use).
 /// For the 2-round-trip login flow, this handles just LoginStart.
 /// The LoginFinish must be handled separately with the ServerLogin state.
 ///
 /// This function handles Register* messages directly (they are admin ops).
 /// For Login, use handle_login_start + handle_login_finish separately.
+///
+/// FIPS routing: when `common::fips::is_fips_mode()` is true, registration
+/// is routed to the FIPS cipher suite (PBKDF2-SHA512).  Login is routed
+/// adaptively via `CredentialStore::verify_password_adaptive`.
 pub fn handle_request(
     store: &mut CredentialStore,
     request: &OpaqueRequest,
@@ -246,12 +297,24 @@ pub fn handle_request(
         OpaqueRequest::RegisterStart {
             username,
             registration_request,
-        } => match handle_register_start(store, username, registration_request) {
-            Ok(response_bytes) => OpaqueResponse::RegisterChallenge {
-                registration_response: response_bytes,
-            },
-            Err(e) => OpaqueResponse::Error { message: e },
-        },
+        } => {
+            // In FIPS mode, use FIPS cipher suite if the store supports it.
+            if common::fips::is_fips_mode() && store.server_setup_fips().is_some() {
+                match handle_register_start_fips(store, username, registration_request) {
+                    Ok(response_bytes) => OpaqueResponse::RegisterChallenge {
+                        registration_response: response_bytes,
+                    },
+                    Err(e) => OpaqueResponse::Error { message: e },
+                }
+            } else {
+                match handle_register_start(store, username, registration_request) {
+                    Ok(response_bytes) => OpaqueResponse::RegisterChallenge {
+                        registration_response: response_bytes,
+                    },
+                    Err(e) => OpaqueResponse::Error { message: e },
+                }
+            }
+        }
         OpaqueRequest::RegisterFinish {
             username,
             registration_upload,
