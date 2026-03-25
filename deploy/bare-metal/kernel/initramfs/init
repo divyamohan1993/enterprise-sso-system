@@ -1,0 +1,236 @@
+#!/bin/sh
+# ==========================================================================
+# MILNET SSO System — Minimal Initramfs Init
+# ==========================================================================
+#
+# This is a fail-closed init script. If ANY step fails, the system halts
+# with a kernel panic. There is NO recovery shell, NO fallback, NO debug
+# output. An attacker who tampers with the rootfs gets nothing — just a
+# dead machine that must be re-imaged.
+#
+# Boot sequence:
+#   1. Mount essential pseudo-filesystems
+#   2. TPM is built-in (no module loading needed)
+#   3. Unlock LUKS data partition using TPM2-sealed key
+#   4. Activate dm-verity on root partition
+#   5. Mount verified root filesystem (read-only)
+#   6. Mount encrypted data partition
+#   7. Pivot root and exec real init
+#
+# CLASSIFICATION: UNCLASSIFIED // FOUO
+# ==========================================================================
+
+# ---------------------------------------------------------------------------
+# FAIL-CLOSED POLICY
+# ---------------------------------------------------------------------------
+# Any command failure triggers immediate kernel panic.
+# There is no shell fallback. This is intentional.
+# An appliance that cannot verify its integrity MUST NOT run.
+
+die() {
+    # Write to kernel log buffer before panic
+    echo "MILNET INIT FATAL: $1" > /dev/kmsg 2>/dev/null
+    echo "MILNET INIT: System integrity compromised. Halting." > /dev/kmsg 2>/dev/null
+    # Trigger kernel panic — machine requires physical intervention
+    echo 1 > /proc/sysrq-trigger 2>/dev/null
+    # If sysrq is disabled, force panic via invalid PID 1 exit
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# STEP 1: Mount essential pseudo-filesystems
+# ---------------------------------------------------------------------------
+# These are required before any device interaction.
+
+mount -t proc     proc     /proc     || die "Failed to mount /proc"
+mount -t sysfs    sysfs    /sys      || die "Failed to mount /sys"
+mount -t devtmpfs devtmpfs /dev      || die "Failed to mount /dev"
+mount -t tmpfs    tmpfs    /tmp      || die "Failed to mount /tmp"
+
+# Create device nodes that devtmpfs might not auto-create
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts 2>/dev/null
+
+# ---------------------------------------------------------------------------
+# STEP 2: Wait for block devices
+# ---------------------------------------------------------------------------
+# On some hardware, SATA/NVMe takes a moment to enumerate.
+# Wait up to 10 seconds for the root device.
+
+ROOT_DEV="/dev/sda2"
+HASH_DEV="/dev/sda3"
+DATA_DEV="/dev/sda4"
+TIMEOUT=100  # deciseconds (10 seconds)
+
+echo "MILNET INIT: Waiting for block devices..." > /dev/kmsg
+
+i=0
+while [ ! -b "${ROOT_DEV}" ] && [ "$i" -lt "${TIMEOUT}" ]; do
+    sleep 0.1
+    i=$((i + 1))
+done
+
+[ -b "${ROOT_DEV}" ] || die "Root device ${ROOT_DEV} not found after 10s"
+[ -b "${HASH_DEV}" ] || die "Hash device ${HASH_DEV} not found"
+[ -b "${DATA_DEV}" ] || die "Data device ${DATA_DEV} not found"
+
+echo "MILNET INIT: Block devices ready." > /dev/kmsg
+
+# ---------------------------------------------------------------------------
+# STEP 3: Verify and activate dm-verity on root partition
+# ---------------------------------------------------------------------------
+# dm-verity provides block-level integrity checking. Every 4K block read
+# from the root partition is verified against a Merkle hash tree stored
+# on the hash partition. The root hash is passed via kernel command line
+# or embedded here.
+#
+# If any block has been tampered with, dm-verity returns an I/O error,
+# which causes the service reading that file to crash — fail-closed.
+
+echo "MILNET INIT: Activating dm-verity on root filesystem..." > /dev/kmsg
+
+# Parse root hash from kernel command line
+# Format: milnet.roothash=<hex>
+ROOTHASH=""
+for param in $(cat /proc/cmdline); do
+    case "${param}" in
+        milnet.roothash=*)
+            ROOTHASH="${param#milnet.roothash=}"
+            ;;
+    esac
+done
+
+[ -n "${ROOTHASH}" ] || die "No root hash provided (milnet.roothash= missing from cmdline)"
+
+# Validate root hash format (SHA-256 = 64 hex chars)
+echo "${ROOTHASH}" | grep -qE '^[0-9a-f]{64}$' || \
+    die "Invalid root hash format: ${ROOTHASH}"
+
+# Get root partition size for dm-verity table
+ROOT_SECTORS=$(blockdev --getsz "${ROOT_DEV}" 2>/dev/null) || \
+    die "Cannot read root device size"
+ROOT_BLOCKS=$((ROOT_SECTORS / 8))  # 4096-byte blocks = 8 sectors each
+
+# Create dm-verity device using dmsetup
+# Table format: <start> <size> verity <version> <data_dev> <hash_dev> \
+#               <data_block_size> <hash_block_size> <num_data_blocks> \
+#               <hash_start_block> <algorithm> <root_hash> <salt>
+
+# Salt is embedded at image creation time; parse from cmdline
+SALT=""
+for param in $(cat /proc/cmdline); do
+    case "${param}" in
+        milnet.salt=*)
+            SALT="${param#milnet.salt=}"
+            ;;
+    esac
+done
+[ -n "${SALT}" ] || SALT="-"  # no salt if not provided
+
+dmsetup create verity-root --readonly --table \
+    "0 ${ROOT_SECTORS} verity 1 ${ROOT_DEV} ${HASH_DEV} 4096 4096 ${ROOT_BLOCKS} 0 sha256 ${ROOTHASH} ${SALT}" \
+    || die "dm-verity activation FAILED — rootfs integrity cannot be verified"
+
+echo "MILNET INIT: dm-verity active. Root hash verified." > /dev/kmsg
+
+# ---------------------------------------------------------------------------
+# STEP 4: Mount verified root filesystem (READ-ONLY)
+# ---------------------------------------------------------------------------
+mkdir -p /newroot
+mount -o ro /dev/mapper/verity-root /newroot || \
+    die "Failed to mount verified root filesystem"
+
+echo "MILNET INIT: Verified root filesystem mounted (read-only)." > /dev/kmsg
+
+# ---------------------------------------------------------------------------
+# STEP 5: Unlock and mount encrypted data partition
+# ---------------------------------------------------------------------------
+# The LUKS2 data partition key is sealed to TPM2 PCRs 0,2,4,7 (firmware,
+# kernel, boot manager, Secure Boot state). If any measured component
+# changes, the TPM refuses to unseal the key.
+
+echo "MILNET INIT: Unsealing LUKS key from TPM2..." > /dev/kmsg
+
+mkdir -p /newroot/var/lib/milnet
+
+# Use tpm2-tools to unseal the LUKS passphrase
+# The sealed object is stored on the EFI partition
+if [ -x /usr/bin/tpm2_unseal ] || [ -x /bin/tpm2_unseal ]; then
+    TPM2_UNSEAL=$(command -v tpm2_unseal)
+
+    # Unseal key from TPM persistent handle 0x81000001
+    # Bound to PCRs: 0 (firmware), 2 (kernel), 4 (boot manager), 7 (Secure Boot)
+    LUKS_KEY=$("${TPM2_UNSEAL}" \
+        -c 0x81000001 \
+        -p "pcr:sha256:0,2,4,7" \
+        2>/dev/null) || die "TPM2 unseal FAILED — boot chain integrity compromised"
+else
+    # Fallback: try kernel keyring interface (tpm_unseal via /sys)
+    # This path is for environments where tpm2-tools is not in initramfs
+    if [ -f /sys/class/tpm/tpm0/pcr-sha256/0 ]; then
+        echo "MILNET INIT: WARNING: tpm2-tools not found, using keyring fallback" > /dev/kmsg
+        # In production, tpm2-tools MUST be present. This fallback exists
+        # only for initial provisioning.
+        die "tpm2-tools not available in initramfs — cannot unseal LUKS key"
+    else
+        die "No TPM2 device found at /sys/class/tpm/tpm0"
+    fi
+fi
+
+# Open LUKS volume with TPM-unsealed key
+echo -n "${LUKS_KEY}" | cryptsetup luksOpen \
+    --key-file=- \
+    "${DATA_DEV}" milnet-data \
+    || die "LUKS open FAILED — data partition cannot be decrypted"
+
+# Clear key from memory (best effort; shell variables are on heap)
+LUKS_KEY=""
+unset LUKS_KEY
+
+mount -t ext4 -o nosuid,nodev,noexec /dev/mapper/milnet-data /newroot/var/lib/milnet || \
+    die "Failed to mount encrypted data partition"
+
+# Mount PostgreSQL data directory (subdirectory of data partition)
+# Postgres needs exec for JIT; we mount a dedicated bind with specific options
+if [ -d /newroot/var/lib/milnet/postgresql ]; then
+    mkdir -p /newroot/var/lib/postgresql
+    mount --bind /newroot/var/lib/milnet/postgresql /newroot/var/lib/postgresql
+fi
+
+echo "MILNET INIT: Encrypted data partition mounted." > /dev/kmsg
+
+# ---------------------------------------------------------------------------
+# STEP 6: Prepare for pivot_root
+# ---------------------------------------------------------------------------
+# Move pseudo-filesystems to the new root before pivoting.
+
+mkdir -p /newroot/proc /newroot/sys /newroot/dev /newroot/tmp /newroot/run
+
+mount --move /proc /newroot/proc
+mount --move /sys  /newroot/sys
+mount --move /dev  /newroot/dev
+mount --move /tmp  /newroot/tmp
+
+# Create /run as tmpfs (systemd expects this)
+mount -t tmpfs -o nosuid,nodev,noexec,size=64M tmpfs /newroot/run
+
+# ---------------------------------------------------------------------------
+# STEP 7: Pivot root and exec real init
+# ---------------------------------------------------------------------------
+# After pivot_root, the initramfs becomes inaccessible.
+# We exec directly into the real init — no shell, no fallback.
+
+echo "MILNET INIT: Pivoting to verified root. Goodbye." > /dev/kmsg
+
+cd /newroot
+pivot_root . mnt
+
+# Clean up old root (initramfs)
+umount -l /mnt 2>/dev/null
+
+# Execute the real init system
+# systemd is at /sbin/init on the verified root
+exec /sbin/init
+
+# If exec fails, we MUST panic — the system is in an undefined state
+die "exec /sbin/init failed — system is in undefined state"

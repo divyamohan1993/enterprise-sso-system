@@ -1,0 +1,61 @@
+# ==============================================================================
+# MILNET SSO — Log Rotation Configuration
+# ==============================================================================
+# Install to: /etc/logrotate.d/milnet
+#
+# MILNET services log primarily to the systemd journal (stdout/stderr).
+# This logrotate configuration handles:
+#   - Audit data files (Merkle tree logs, retained 365 days for compliance)
+#   - Alert files (SIEM integration exports)
+#   - Any file-based logs services may write to their data directories
+# ==============================================================================
+
+# ── Audit logs — 365-day retention (compliance requirement) ──────────────
+/var/lib/milnet/audit/*.log
+/var/lib/milnet/audit/merkle/*.log
+{
+    daily
+    rotate 365
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 milnet-audit milnet
+    sharedscripts
+    postrotate
+        # Signal audit service to reopen log files.
+        systemctl kill --signal=HUP milnet-audit.service 2>/dev/null || true
+    endscript
+}
+
+# ── Alert files — 90-day retention ───────────────────────────────────────
+/var/lib/milnet/alerts/*.log
+/var/lib/milnet/alerts/*.json
+{
+    daily
+    rotate 90
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 milnet-audit milnet
+}
+
+# ── Service data directory logs — 30-day retention ───────────────────────
+/var/lib/milnet/gateway/*.log
+/var/lib/milnet/orchestrator/*.log
+/var/lib/milnet/opaque/*.log
+/var/lib/milnet/verifier/*.log
+/var/lib/milnet/ratchet/*.log
+/var/lib/milnet/admin/*.log
+/var/lib/milnet/tss/node-*/*.log
+{
+    daily
+    rotate 30
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root milnet
+    sharedscripts
+}

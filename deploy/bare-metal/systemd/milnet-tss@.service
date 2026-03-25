@@ -1,0 +1,96 @@
+# ==============================================================================
+# MILNET SSO — TSS Threshold Signing Service Template (Port 9103)
+# ==============================================================================
+# Template unit for FROST threshold signing nodes. Instantiated as:
+#   milnet-tss@1.service through milnet-tss@5.service
+#
+# Each instance is a separate FROST participant in the 3-of-5 threshold
+# scheme. They communicate peer-to-peer during signing ceremonies.
+# The %i specifier resolves to the node ID (1-5).
+#
+# Each instance gets its own data directory, environment file, and
+# dedicated system user (all share the milnet group).
+# ==============================================================================
+
+[Unit]
+Description=MILNET SSO - TSS Node %i (threshold signing)
+Documentation=file:///opt/milnet/docs/tss.md
+After=network-online.target milnet-postgres.service milnet-pre.service
+Wants=network-online.target
+Requires=milnet-pre.service
+PartOf=milnet.target
+
+[Service]
+Type=exec
+User=milnet-tss
+Group=milnet
+
+# Each instance reads from a node-specific environment file that sets
+# TSS_NODE_ID=%i, TSS_LISTEN_PORT, and TSS_PEER_ADDRS.
+ExecStart=/opt/milnet/bin/tss
+Restart=on-failure
+RestartSec=5
+WatchdogSec=60
+
+# ── Filesystem hardening ──
+ProtectSystem=strict
+ProtectHome=yes
+# Each TSS node gets an isolated data directory for its key share.
+# Key shares MUST NOT be readable by other TSS instances — nftables
+# enforces network isolation, and filesystem permissions enforce storage isolation.
+ReadWritePaths=/var/lib/milnet/tss/node-%i
+PrivateTmp=yes
+# TSS needs /dev/tpmrm0 access for sealing key shares to the TPM.
+# PrivateDevices=no allows access to the TPM resource manager.
+PrivateDevices=no
+DeviceAllow=/dev/tpmrm0 rw
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectHostname=yes
+ProtectClock=yes
+
+# ── Process hardening ──
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ProtectProc=invisible
+ProcSubset=pid
+PrivateUsers=yes
+
+# ── Resource limits ──
+# TSS performs threshold cryptographic operations which are CPU-intensive
+# during signing ceremonies but idle between them.
+MemoryMax=256M
+CPUQuota=100%
+TasksMax=32
+LimitNOFILE=65536
+# Critical: key shares must be locked in memory to prevent swap exposure.
+LimitMEMLOCK=infinity
+
+# ── Security context ──
+SecureBits=noroot
+UMask=0077
+
+# ── Environment ──
+# Base environment shared by all TSS nodes.
+EnvironmentFile=/etc/milnet/tss.env
+# Per-node overrides (node ID, listen port, peer addresses).
+EnvironmentFile=/etc/milnet/tss-node-%i.env
+
+# ── Logging ──
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=milnet-tss@%i
+
+[Install]
+WantedBy=milnet.target

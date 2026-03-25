@@ -1,0 +1,82 @@
+# ==============================================================================
+# MILNET SSO — Orchestrator Service (Port 9101)
+# ==============================================================================
+# Central authentication ceremony coordinator. Receives requests from
+# gateway, fans out to OPAQUE (password auth), TSS (threshold signing),
+# risk engine, and ratchet (session management). Has database access.
+#
+# This is the most connected service — compromise here grants access to
+# the auth pipeline. Hardened accordingly.
+# ==============================================================================
+
+[Unit]
+Description=MILNET SSO - Orchestrator (auth coordinator)
+Documentation=file:///opt/milnet/docs/orchestrator.md
+After=network-online.target milnet-postgres.service milnet-pre.service
+Wants=network-online.target
+Requires=milnet-pre.service
+BindsTo=milnet-postgres.service
+PartOf=milnet.target
+
+[Service]
+Type=exec
+User=milnet-orchestrator
+Group=milnet
+
+ExecStart=/opt/milnet/bin/orchestrator
+Restart=on-failure
+RestartSec=5
+WatchdogSec=60
+
+# ── Filesystem hardening ──
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/milnet/orchestrator
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectHostname=yes
+ProtectClock=yes
+
+# ── Process hardening ──
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ProtectProc=invisible
+ProcSubset=pid
+PrivateUsers=yes
+
+# ── Resource limits ──
+# Orchestrator coordinates multiple backend calls per auth ceremony;
+# 512M covers connection pools + in-flight request state.
+MemoryMax=512M
+CPUQuota=100%
+TasksMax=64
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+
+# ── Security context ──
+SecureBits=noroot
+UMask=0077
+
+# ── Environment ──
+EnvironmentFile=/etc/milnet/orchestrator.env
+
+# ── Logging ──
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=milnet-orchestrator
+
+[Install]
+WantedBy=milnet.target

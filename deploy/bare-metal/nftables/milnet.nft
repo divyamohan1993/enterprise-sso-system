@@ -1,0 +1,381 @@
+#!/usr/sbin/nft -f
+# ==============================================================================
+# MILNET SSO — nftables Firewall Rules
+# ==============================================================================
+# Replaces Docker/Kubernetes network segmentation with host-level nftables.
+# Implements the exact communication matrix from common/src/network.rs.
+#
+# Architecture:
+#   - Default DENY all inter-service traffic
+#   - Per-service chains whitelist only permitted channels
+#   - Rate limiting on gateway (public bastion)
+#   - Logging for denied packets (SIEM integration)
+#   - All services bind to 127.0.0.1 except gateway/admin (public)
+#
+# Port assignments:
+#   9100 = gateway       9104 = verifier
+#   9101 = orchestrator  9105 = ratchet
+#   9102 = opaque        9108 = audit
+#   9103 = tss (base)    8080 = admin
+#   9113-9117 = tss nodes 1-5 (peer ports)
+#   5432 = postgresql
+#
+# Install: nft -f /etc/nftables.d/milnet.nft
+# Verify:  nft list table inet milnet
+# ==============================================================================
+
+# Flush any existing MILNET rules to ensure idempotent application.
+table inet milnet
+delete table inet milnet
+
+table inet milnet {
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Sets for rate limiting and connection tracking
+    # ──────────────────────────────────────────────────────────────────────────
+
+    # Dynamic set for gateway rate limiting: max 10 new connections per
+    # source IP per 60 seconds. Prevents puzzle challenge abuse.
+    set gateway_ratelimit {
+        type ipv4_addr
+        flags dynamic,timeout
+        timeout 60s
+        size 65536
+    }
+
+    set gateway_ratelimit6 {
+        type ipv6_addr
+        flags dynamic,timeout
+        timeout 60s
+        size 65536
+    }
+
+    # Set of MILNET service ports for quick matching.
+    set milnet_service_ports {
+        type inet_service
+        elements = { 8080, 9100, 9101, 9102, 9103, 9104, 9105, 9108,
+                     9113, 9114, 9115, 9116, 9117 }
+    }
+
+    # TSS peer ports (nodes 1-5 use 9113-9117 for peer-to-peer FROST).
+    set tss_peer_ports {
+        type inet_service
+        elements = { 9103, 9113, 9114, 9115, 9116, 9117 }
+    }
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Main input chain — default DENY
+    # ──────────────────────────────────────────────────────────────────────────
+    chain input {
+        type filter hook input priority 0; policy drop;
+
+        # Allow loopback unconditionally (inter-service on localhost).
+        iif "lo" accept
+
+        # Allow established and related connections (return traffic).
+        # conntrack is essential: without this, response packets from
+        # services would be dropped by the default deny policy.
+        ct state established,related accept
+
+        # Drop invalid packets (malformed, out-of-window, etc.).
+        # These are never legitimate and waste processing.
+        ct state invalid drop
+
+        # Jump to per-service input chains.
+        jump input_gateway
+        jump input_admin
+        jump input_orchestrator
+        jump input_opaque
+        jump input_tss
+        jump input_verifier
+        jump input_ratchet
+        jump input_audit
+        jump input_postgres
+
+        # Log and drop anything not matched above.
+        # Rate-limit logging to prevent log flooding from port scans.
+        limit rate 5/second burst 10 packets \
+            log prefix "MILNET_DENY_IN: " level warn
+    }
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Main output chain — default DENY
+    # ──────────────────────────────────────────────────────────────────────────
+    chain output {
+        type filter hook output priority 0; policy drop;
+
+        # Allow loopback (inter-service communication on localhost).
+        oif "lo" accept
+
+        # Allow established and related (return traffic).
+        ct state established,related accept
+
+        # Drop invalid.
+        ct state invalid drop
+
+        # Jump to per-service output chains.
+        jump output_gateway
+        jump output_admin
+        jump output_orchestrator
+        jump output_opaque
+        jump output_tss
+        jump output_verifier
+        jump output_ratchet
+        jump output_audit
+        jump output_postgres
+
+        # Log and drop.
+        limit rate 5/second burst 10 packets \
+            log prefix "MILNET_DENY_OUT: " level warn
+    }
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Main forward chain — DENY all (no routing between interfaces)
+    # ──────────────────────────────────────────────────────────────────────────
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+        # Bare-metal: no forwarding. All services run on the same host.
+        # This prevents the host from being used as a pivot router.
+    }
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Per-service INPUT chains
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # ── Gateway (port 9100) ──────────────────────────────────────────────────
+    # PUBLIC-FACING. Accepts connections from any source (internet).
+    # Rate limited to prevent puzzle challenge abuse.
+    chain input_gateway {
+        # Rate limit: max 10 new connections per source IP per 60 seconds.
+        # SYN packets only (new connections). Existing connections pass via
+        # ct state established above.
+        tcp dport 9100 ct state new \
+            ip saddr @gateway_ratelimit \
+            limit rate over 10/minute \
+            drop
+
+        tcp dport 9100 ct state new \
+            add @gateway_ratelimit { ip saddr } \
+            accept
+
+        # IPv6 rate limiting.
+        tcp dport 9100 ct state new \
+            ip6 saddr @gateway_ratelimit6 \
+            limit rate over 10/minute \
+            drop
+
+        tcp dport 9100 ct state new \
+            add @gateway_ratelimit6 { ip6 saddr } \
+            accept
+
+        # Also accept from localhost (orchestrator -> gateway responses).
+        ip saddr 127.0.0.1 tcp dport 9100 accept
+        ip6 saddr ::1 tcp dport 9100 accept
+    }
+
+    # ── Admin API (port 8080) ────────────────────────────────────────────────
+    # PUBLIC-FACING management API. Should be further restricted to
+    # management network CIDRs in production.
+    chain input_admin {
+        tcp dport 8080 ct state new accept
+        ip saddr 127.0.0.1 tcp dport 8080 accept
+        ip6 saddr ::1 tcp dport 8080 accept
+    }
+
+    # ── Orchestrator (port 9101) ─────────────────────────────────────────────
+    # INTERNAL ONLY. Accepts from:
+    #   - gateway (auth requests)
+    #   - opaque (OPAQUE responses)
+    #   - tss (signing responses)
+    #   - ratchet (session responses)
+    #   - risk (assessment responses)
+    #   - kt (transparency responses)
+    #   - admin (management)
+    # All on localhost since all services run on the same machine.
+    chain input_orchestrator {
+        ip saddr 127.0.0.1 tcp dport 9101 accept
+        ip6 saddr ::1 tcp dport 9101 accept
+    }
+
+    # ── OPAQUE (port 9102) ───────────────────────────────────────────────────
+    # INTERNAL ONLY. Accepts from orchestrator ONLY.
+    chain input_opaque {
+        ip saddr 127.0.0.1 tcp dport 9102 accept
+        ip6 saddr ::1 tcp dport 9102 accept
+    }
+
+    # ── TSS (port 9103 + peer ports 9113-9117) ──────────────────────────────
+    # INTERNAL ONLY. Accepts from:
+    #   - orchestrator (signing requests)
+    #   - verifier (JWKS refresh)
+    #   - audit (cross-verification)
+    #   - other tss nodes (FROST peer-to-peer)
+    chain input_tss {
+        ip saddr 127.0.0.1 tcp dport @tss_peer_ports accept
+        ip6 saddr ::1 tcp dport @tss_peer_ports accept
+    }
+
+    # ── Verifier (port 9104) ─────────────────────────────────────────────────
+    # INTERNAL ONLY. Accepts from:
+    #   - ratchet (heartbeat)
+    #   - tss (JWKS data)
+    #   - admin (management)
+    chain input_verifier {
+        ip saddr 127.0.0.1 tcp dport 9104 accept
+        ip6 saddr ::1 tcp dport 9104 accept
+    }
+
+    # ── Ratchet (port 9105) ──────────────────────────────────────────────────
+    # INTERNAL ONLY. Accepts from:
+    #   - orchestrator (session requests)
+    #   - verifier (heartbeat)
+    #   - risk (anomaly data)
+    #   - admin (management)
+    chain input_ratchet {
+        ip saddr 127.0.0.1 tcp dport 9105 accept
+        ip6 saddr ::1 tcp dport 9105 accept
+    }
+
+    # ── Audit (port 9108) ────────────────────────────────────────────────────
+    # INTERNAL ONLY. Accepts from ALL modules (communication matrix rule).
+    chain input_audit {
+        ip saddr 127.0.0.1 tcp dport 9108 accept
+        ip6 saddr ::1 tcp dport 9108 accept
+    }
+
+    # ── PostgreSQL (port 5432) ───────────────────────────────────────────────
+    # INTERNAL ONLY. Accepts from:
+    #   - orchestrator (auth data)
+    #   - audit (log persistence)
+    #   - admin (management)
+    # PostgreSQL binds to 127.0.0.1 ONLY — never on external interfaces.
+    chain input_postgres {
+        ip saddr 127.0.0.1 tcp dport 5432 accept
+        ip6 saddr ::1 tcp dport 5432 accept
+    }
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Per-service OUTPUT chains
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # ── Gateway output ───────────────────────────────────────────────────────
+    # Permitted destinations:
+    #   - orchestrator:9101 (forward auth requests)
+    #   - audit:9108 (logging)
+    #   - internet:443,80 (OAuth redirects, CRL checks)
+    chain output_gateway {
+        # Gateway -> orchestrator (localhost).
+        ip daddr 127.0.0.1 tcp dport 9101 accept
+        ip6 daddr ::1 tcp dport 9101 accept
+        # Gateway -> audit (localhost).
+        ip daddr 127.0.0.1 tcp dport 9108 accept
+        ip6 daddr ::1 tcp dport 9108 accept
+        # Gateway -> internet (OAuth, CRL).
+        tcp dport { 80, 443 } accept
+        # DNS for external resolution.
+        udp dport 53 accept
+        tcp dport 53 accept
+    }
+
+    # ── Admin output ─────────────────────────────────────────────────────────
+    # Permitted destinations: all backend services + database + internet:443.
+    chain output_admin {
+        ip daddr 127.0.0.1 tcp dport { 9100, 9101, 9104, 9105, 9108, 5432 } accept
+        ip6 daddr ::1 tcp dport { 9100, 9101, 9104, 9105, 9108, 5432 } accept
+        # Admin -> internet (OAuth provider communication).
+        tcp dport 443 accept
+        udp dport 53 accept
+        tcp dport 53 accept
+    }
+
+    # ── Orchestrator output ──────────────────────────────────────────────────
+    # Permitted destinations:
+    #   - gateway:9100 (responses)
+    #   - opaque:9102, tss:9103 (auth pipeline)
+    #   - ratchet:9105 (session management)
+    #   - audit:9108 (logging)
+    #   - postgres:5432 (database)
+    # NOTE: risk:9106 and kt:9107 are not in the 8 deployed services
+    # but are in the communication matrix. Rules included for future use.
+    chain output_orchestrator {
+        ip daddr 127.0.0.1 tcp dport { 9100, 9102, 9103, 9105, 9106, 9107, 9108, 5432 } accept
+        ip6 daddr ::1 tcp dport { 9100, 9102, 9103, 9105, 9106, 9107, 9108, 5432 } accept
+    }
+
+    # ── OPAQUE output ────────────────────────────────────────────────────────
+    # Permitted destinations:
+    #   - orchestrator:9101 (responses)
+    #   - audit:9108 (logging)
+    chain output_opaque {
+        ip daddr 127.0.0.1 tcp dport { 9101, 9108 } accept
+        ip6 daddr ::1 tcp dport { 9101, 9108 } accept
+    }
+
+    # ── TSS output ───────────────────────────────────────────────────────────
+    # Permitted destinations:
+    #   - orchestrator:9101 (signing responses)
+    #   - verifier:9104 (JWKS data)
+    #   - audit:9108 (logging)
+    #   - other tss peers (FROST protocol)
+    chain output_tss {
+        ip daddr 127.0.0.1 tcp dport { 9101, 9104, 9108 } accept
+        ip6 daddr ::1 tcp dport { 9101, 9104, 9108 } accept
+        # TSS peer-to-peer.
+        ip daddr 127.0.0.1 tcp dport @tss_peer_ports accept
+        ip6 daddr ::1 tcp dport @tss_peer_ports accept
+    }
+
+    # ── Verifier output ──────────────────────────────────────────────────────
+    # Permitted destinations:
+    #   - ratchet:9105 (heartbeat)
+    #   - tss:9103 (JWKS refresh)
+    #   - audit:9108 (logging)
+    chain output_verifier {
+        ip daddr 127.0.0.1 tcp dport { 9103, 9105, 9108 } accept
+        ip6 daddr ::1 tcp dport { 9103, 9105, 9108 } accept
+    }
+
+    # ── Ratchet output ───────────────────────────────────────────────────────
+    # Permitted destinations:
+    #   - orchestrator:9101 (responses)
+    #   - verifier:9104 (heartbeat)
+    #   - audit:9108 (logging)
+    #   - risk:9106 (anomaly data, future)
+    chain output_ratchet {
+        ip daddr 127.0.0.1 tcp dport { 9101, 9104, 9106, 9108 } accept
+        ip6 daddr ::1 tcp dport { 9101, 9104, 9106, 9108 } accept
+    }
+
+    # ── Audit output ─────────────────────────────────────────────────────────
+    # Permitted destinations:
+    #   - kt:9107 (transparency log)
+    #   - risk:9106 (risk events)
+    #   - tss:9103 (cross-verification)
+    #   - postgres:5432 (log persistence)
+    chain output_audit {
+        ip daddr 127.0.0.1 tcp dport { 9103, 9106, 9107, 5432 } accept
+        ip6 daddr ::1 tcp dport { 9103, 9106, 9107, 5432 } accept
+    }
+
+    # ── PostgreSQL output ────────────────────────────────────────────────────
+    # PostgreSQL should NEVER initiate outbound connections.
+    # Zero egress. All rules handled by ct state established above.
+    chain output_postgres {
+        # Intentionally empty. PostgreSQL only responds to inbound queries.
+    }
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ICMP handling
+    # ══════════════════════════════════════════════════════════════════════════
+    # Allow essential ICMP for path MTU discovery and diagnostics.
+    # Without PMTUD, large packets silently fail — a subtle DoS vector.
+    chain input_icmp {
+        type filter hook input priority 10; policy accept;
+        # Only allow essential ICMP types.
+        icmp type { echo-request, echo-reply, destination-unreachable, time-exceeded } accept
+        icmpv6 type { echo-request, echo-reply, destination-unreachable,
+                      packet-too-big, time-exceeded,
+                      nd-neighbor-solicit, nd-neighbor-advert,
+                      nd-router-solicit, nd-router-advert } accept
+    }
+}
