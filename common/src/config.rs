@@ -354,6 +354,21 @@ pub struct SecurityConfig {
     pub require_mtls: bool,
     /// Require encryption of TSS key shards at rest and in transit.
     pub shard_encryption_enabled: bool,
+
+    // ── FIPS / Post-Quantum cryptography parameters ──
+
+    /// Enable FIPS 140-3 mode — only FIPS-approved algorithms permitted.
+    pub fips_mode: bool,
+    /// Minimum post-quantum security level (CNSA 2.0 requires 5).
+    pub pq_minimum_level: u8,
+    /// Require post-quantum signatures for all signing operations.
+    pub require_pq_signatures: bool,
+    /// Require post-quantum key exchange for all session establishment.
+    pub require_pq_key_exchange: bool,
+    /// Key stretching function: "argon2id-v19" (non-FIPS) or "pbkdf2-sha512" (FIPS).
+    pub ksf_algorithm: String,
+    /// Symmetric cipher: "aegis-256" (non-FIPS) or "aes-256-gcm" (FIPS).
+    pub symmetric_algorithm: String,
 }
 
 impl SecurityConfig {
@@ -375,6 +390,12 @@ impl SecurityConfig {
     /// Set the log level at runtime (called from admin API).
     pub fn set_log_level(level: LogLevel) {
         developer_mode().set_log_level(level);
+    }
+
+    /// Apply the FIPS mode setting from this config to the global runtime
+    /// toggle.  Called once at startup (no proof required).
+    pub fn apply_fips_mode(&self) {
+        crate::fips::fips_mode().set_fips_mode_unchecked(self.fips_mode);
     }
 }
 
@@ -430,6 +451,14 @@ impl Default for SecurityConfig {
             require_pkce: true,
             require_mtls: true,
             shard_encryption_enabled: true,
+
+            // FIPS / Post-Quantum defaults — maximum security
+            fips_mode: true,
+            pq_minimum_level: 5,
+            require_pq_signatures: true,
+            require_pq_key_exchange: true,
+            ksf_algorithm: "argon2id-v19".into(),
+            symmetric_algorithm: "aegis-256".into(),
         }
     }
 }
@@ -588,6 +617,20 @@ impl SecurityConfig {
                 self.max_session_lifetime_secs
             ));
         }
+        if !self.fips_mode {
+            violations.push("fips_mode must be true in production".into());
+        }
+        if self.pq_minimum_level < 5 {
+            violations.push(
+                "pq_minimum_level must be >= 5 (CNSA 2.0 Level 5)".into()
+            );
+        }
+        if !self.require_pq_signatures {
+            violations.push("require_pq_signatures must be true in production".into());
+        }
+        if !self.require_pq_key_exchange {
+            violations.push("require_pq_key_exchange must be true in production".into());
+        }
 
         violations
     }
@@ -726,5 +769,30 @@ mod tests {
         // Even if key were loaded, wrong-length proof must fail
         assert!(!verify_dev_mode_proof("too_short", "enable"));
         assert!(!verify_dev_mode_proof("", "enable"));
+    }
+
+    #[test]
+    fn test_pq_minimum_level_enforcement() {
+        let mut cfg = SecurityConfig::default();
+        // pq_minimum_level=3 is below CNSA 2.0 minimum of 5
+        cfg.pq_minimum_level = 3;
+        let violations = cfg.validate_production_config();
+        assert!(
+            violations.iter().any(|v| v.contains("pq_minimum_level")),
+            "expected pq_minimum_level violation, got: {:?}",
+            violations
+        );
+    }
+
+    #[test]
+    fn validate_production_config_fips_fields() {
+        let mut cfg = SecurityConfig::default();
+        cfg.fips_mode = false;
+        cfg.require_pq_signatures = false;
+        cfg.require_pq_key_exchange = false;
+        let violations = cfg.validate_production_config();
+        assert!(violations.iter().any(|v| v.contains("fips_mode")));
+        assert!(violations.iter().any(|v| v.contains("require_pq_signatures")));
+        assert!(violations.iter().any(|v| v.contains("require_pq_key_exchange")));
     }
 }

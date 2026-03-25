@@ -45,6 +45,9 @@ pub mod backup;
 // ── Developer mode & error response sanitisation ──
 pub mod error_response;
 
+// ── FIPS mode runtime toggle ──
+pub mod fips;
+
 // ── Observability & incident response ──
 pub mod structured_logging;
 pub mod metrics;

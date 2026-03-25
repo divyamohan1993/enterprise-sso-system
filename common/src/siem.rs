@@ -517,6 +517,21 @@ impl SecurityEvent {
         event.emit();
     }
 
+    /// Emit a FIPS mode toggle blocked event (production protection).
+    pub fn fips_mode_blocked() {
+        let event = SecurityEvent {
+            timestamp: Self::now_iso8601(),
+            category: "configuration",
+            action: "fips_mode_blocked",
+            severity: Severity::Critical,
+            outcome: "failure",
+            user_id: None,
+            source_ip: None,
+            detail: Some("runtime FIPS mode disable blocked in production".into()),
+        };
+        event.emit();
+    }
+
     /// Emit an entropy quality check failure event.
     pub fn entropy_quality_failure(detail: &str) {
         let event = SecurityEvent {
