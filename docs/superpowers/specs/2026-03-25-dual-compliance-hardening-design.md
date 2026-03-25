@@ -4,8 +4,8 @@
 **Approach:** Layered Bottom-Up (6 layers, dependency-ordered)
 **Target:** US DoD (DISA STIG, FIPS 140-3, CMMC 2.0, FedRAMP) + Indian Government (DPDP Act 2023, MeitY, CERT-In, CII)
 **PQ Horizon:** 2031 (CNSA 2.0 exclusive PQ key establishment by 2030, exclusive PQ signatures by 2033)
-**Crypto Policy:** Maximum security — all algorithms upgraded to highest available strength. No legacy.
-**Symmetric:** AES-256-GCM replaced by XChaCha20-Poly1305 (256-bit key, 192-bit nonce eliminates nonce-reuse risk) where FIPS is not required; AES-256-GCM retained ONLY for FIPS-mandated paths.
+**Crypto Policy:** Maximum security — strongest available algorithms at every layer. Future-proof: algorithm selection is a runtime enum, adding new algorithms never breaks existing data.
+**Symmetric:** AEGIS-256 (RFC 9312) as default — 256-bit key, 256-bit nonce, 256-bit auth tag, nonce-misuse resistant. AES-256-GCM as FIPS fallback only (until AEGIS receives NIST approval, expected ~2027-2028 post-RFC 9312). All encrypted data carries an algorithm-ID byte so decryption auto-selects the right path — switching algorithms later is a config change, not a code change.
 **Deployment:** GCP (asia-south1/asia-south2) + AWS GovCloud (us-gov-west-1/us-gov-east-1)
 **Testing:** C2 spot VM (asia-south1-a), developer mode ON with cryptographic key, verbose errors
 
@@ -14,14 +14,15 @@
 ## Cryptographic Upgrade Policy
 
 Every algorithm choice targets **maximum post-quantum security valid through 2031+**.
+Algorithm selection is a runtime enum — adding future algorithms (e.g., NIST-approved AEGIS, new PQ schemes) requires only adding an enum variant and algorithm-ID byte. Existing encrypted data remains readable forever.
 
 | Use Case | Current | Upgraded To | Rationale |
 |----------|---------|-------------|-----------|
 | Key Encapsulation | ML-KEM-1024 + X25519 (X-Wing) | **Same** — already CNSA 2.0 Level 5 | Maximum PQ security |
 | Digital Signatures (audit, receipts, DPoP, tree heads) | ML-DSA-65 (Level 3) | **ML-DSA-87** (Level 5) everywhere | 2031 headroom, CNSA 2.0 |
 | Threshold Signing | FROST Ristretto255 | **Same** — nested under ML-DSA-87 wrapper | Classical inside PQ envelope |
-| Symmetric Encryption (non-FIPS paths) | AES-256-GCM | **XChaCha20-Poly1305** | 192-bit nonce (no nonce-reuse catastrophe), constant-time on all platforms |
-| Symmetric Encryption (FIPS paths) | AES-256-GCM | **AES-256-GCM** (retained for FIPS compliance) | FIPS 197/SP 800-38D mandated |
+| Symmetric Encryption (default) | AES-256-GCM | **AEGIS-256** (RFC 9312) | 256-bit nonce + 256-bit tag + nonce-misuse resistant. Strongest modern AEAD. |
+| Symmetric Encryption (FIPS fallback) | AES-256-GCM | **AES-256-GCM** (retained until AEGIS gets NIST approval) | FIPS 197/SP 800-38D mandated |
 | Hashing | SHA-256 in some paths | **SHA-512 everywhere** (SHA-256 only where RFC-mandated: PKCE) | CNSA 2.0, 256-bit PQ security |
 | KDF | HKDF-SHA512 | **Same** — already maximum | SP 800-56C |
 | MAC | HMAC-SHA512 | **Same** — already maximum | FIPS 198-1 |
@@ -33,13 +34,22 @@ Every algorithm choice targets **maximum post-quantum security valid through 203
 | Stateful Signatures | LMS H=20 | **Same** — SP 800-208 | Firmware signing |
 | DPoP Key Hash | SHA-256 (32 bytes) | **SHA-512 (64 bytes)** | Full PQ security margin |
 | Certificate Pinning | SHA-256 | **SHA-512** | Full PQ security margin |
-| Envelope Encryption (non-FIPS) | AES-256-GCM | **XChaCha20-Poly1305** | Nonce safety |
-| Envelope Encryption (FIPS) | AES-256-GCM | **AES-256-GCM** | FIPS required |
-| SHARD IPC Encryption (non-FIPS) | AES-256-GCM | **XChaCha20-Poly1305** | Nonce safety |
-| SHARD IPC Encryption (FIPS) | AES-256-GCM | **AES-256-GCM** | FIPS required |
-| Backup Encryption | AES-256-GCM | **XChaCha20-Poly1305** (non-FIPS) / **AES-256-GCM** (FIPS) | Consistency |
+| Envelope Encryption (default) | AES-256-GCM | **AEGIS-256** | 256-bit tag, nonce-misuse safe |
+| Envelope Encryption (FIPS) | AES-256-GCM | **AES-256-GCM** | FIPS until AEGIS approved |
+| SHARD IPC Encryption (default) | AES-256-GCM | **AEGIS-256** | 256-bit tag, nonce-misuse safe |
+| SHARD IPC Encryption (FIPS) | AES-256-GCM | **AES-256-GCM** | FIPS until AEGIS approved |
+| Backup Encryption | AES-256-GCM | **AEGIS-256** (default) / **AES-256-GCM** (FIPS) | Consistency |
 
-**Rule:** Every encryption call site checks `is_fips_mode()` and selects the appropriate algorithm. Non-FIPS defaults to XChaCha20-Poly1305. FIPS forces AES-256-GCM.
+**Why AEGIS-256 over AEGIS-256:**
+- AEGIS-256 has a **256-bit auth tag** (vs 128-bit for Poly1305) — 2^128 times harder to forge
+- AEGIS-256 has a **256-bit nonce** (vs 192-bit for XChaCha20) — even safer at scale
+- AEGIS-256 is **nonce-misuse resistant** — accidental nonce reuse only leaks equality, not auth key
+- AEGIS-256 is **faster** on all modern CPUs (uses AES-NI round functions, ~0.5 cycles/byte)
+- AEGIS-256 has an RFC (9312, 2023) and is on NIST's review path
+
+**Rule:** Every encryption call site checks `is_fips_mode()` and selects the appropriate algorithm. Non-FIPS defaults to AEGIS-256. FIPS forces AES-256-GCM. The algorithm-ID byte in the wire format means switching later is seamless — old data always decryptable.
+
+**Future-proofing:** The `SymmetricAlgorithm` enum is extensible. When AEGIS gets NIST approval, the FIPS path switches to AEGIS by adding one variant. When post-quantum symmetric schemes emerge (e.g., Saturnin, Gaston), they slot in the same way. No existing data breaks because every ciphertext self-identifies its algorithm.
 
 ---
 
@@ -68,8 +78,8 @@ Functions:
 Constraints:
   - Production mode (MILNET_PRODUCTION) FORCES fips_mode=true (cannot disable)
   - Developer mode can coexist with FIPS mode (for testing FIPS paths)
-  - FIPS mode blocks: Argon2id, BLAKE3, XChaCha20-Poly1305, non-NIST curves
-  - FIPS mode allows: AES-256-GCM, SHA-2 family, SHA-3 family, HKDF-SHA512,
+  - FIPS mode blocks: Argon2id, BLAKE3, AEGIS-256 (until NIST-approved), non-NIST curves
+  - FIPS mode allows: AES-256-GCM (sole FIPS symmetric AEAD), SHA-2 family, SHA-3 family, HKDF-SHA512,
     HMAC-SHA512, ML-KEM-1024, ML-DSA-65/87, SLH-DSA, PBKDF2-HMAC-SHA512,
     FROST Ristretto255 (nested under ML-DSA-87 PQ wrapper)
 ```
@@ -104,34 +114,41 @@ active_ksf() -> &'static str:
 
 ### 0.3 New Module: `crypto/src/symmetric.rs`
 
-Unified symmetric encryption abstraction — selects XChaCha20-Poly1305 or AES-256-GCM based on FIPS mode.
+Unified symmetric encryption abstraction — extensible enum, algorithm-ID tagged wire format.
 
 ```
 pub enum SymmetricAlgorithm {
-    XChaCha20Poly1305,  // Default (non-FIPS): 192-bit nonce, immune to nonce reuse
-    Aes256Gcm,          // FIPS-only: 96-bit nonce, NIST approved
+    Aegis256,     // Default: 256-bit nonce, 256-bit tag, nonce-misuse resistant (RFC 9312)
+    Aes256Gcm,    // FIPS fallback: 96-bit nonce, 128-bit tag (FIPS 197/SP 800-38D)
+    // Future variants slot in here without breaking existing data:
+    // Aegis256Fips,  // When NIST approves AEGIS — replaces Aes256Gcm as FIPS default
+    // PostQuantumAead,  // When PQ symmetric AEADs emerge
 }
 
 pub fn active_algorithm() -> SymmetricAlgorithm;
-  // Returns Aes256Gcm if is_fips_mode(), else XChaCha20Poly1305
+  // Returns Aes256Gcm if is_fips_mode(), else Aegis256
 
 pub fn encrypt(key: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, String>;
   // Dispatches to active algorithm. Nonce generated from CSPRNG.
   // Wire format: algorithm_id (1 byte) || nonce || ciphertext || tag
+  // Self-describing: any future code can always decrypt by reading the algo byte
 
 pub fn decrypt(key: &[u8; 32], sealed: &[u8], aad: &[u8]) -> Result<Vec<u8>, String>;
   // Reads algorithm_id byte, dispatches to correct decryption
-  // Supports BOTH algorithms for migration (decrypt old AES-256-GCM data)
+  // Supports ALL algorithms forever (decrypt old data with any past algorithm)
+  // Legacy (no algo byte): attempts AES-256-GCM for pre-upgrade data
 
 pub fn encrypt_with(algo: SymmetricAlgorithm, key: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, String>;
-  // Explicit algorithm selection (for tests)
+  // Explicit algorithm selection (for tests and migration)
 
 Constants:
-  XCHACHA20_NONCE_LEN: usize = 24  // 192 bits
-  AES_GCM_NONCE_LEN: usize = 12    // 96 bits
-  TAG_LEN: usize = 16               // 128 bits (both algorithms)
-  ALGO_ID_XCHACHA20: u8 = 0x01
+  AEGIS256_NONCE_LEN: usize = 32     // 256 bits
+  AEGIS256_TAG_LEN: usize = 32       // 256 bits (maximum authentication strength)
+  AES_GCM_NONCE_LEN: usize = 12      // 96 bits
+  AES_GCM_TAG_LEN: usize = 16        // 128 bits
+  ALGO_ID_AEGIS256: u8 = 0x01
   ALGO_ID_AES256GCM: u8 = 0x02
+  // 0x03-0xFF reserved for future algorithms
 ```
 
 ### 0.4 Changes to `opaque/src/opaque_impl.rs`
@@ -211,7 +228,7 @@ AttestationManifest gains:
 
 ### 0.7 Changes to `crypto/src/seal.rs`
 
-Switch to XChaCha20-Poly1305 for key sealing (non-FIPS), AES-256-GCM for FIPS.
+Switch to AEGIS-256 for key sealing (non-FIPS), AES-256-GCM for FIPS.
 
 ```
 DerivedKek::seal() and unseal() now use crypto::symmetric::encrypt/decrypt
@@ -230,7 +247,7 @@ Same dual-algorithm switch for field-level encryption.
 
 ```
 encrypt() and decrypt() now use crypto::symmetric::encrypt/decrypt
-  — XChaCha20-Poly1305 default, AES-256-GCM in FIPS mode
+  — AEGIS-256 default, AES-256-GCM in FIPS mode
   — Legacy migration: same strategy as seal.rs — if first byte is not a
     recognized algorithm_id, attempt legacy AES-256-GCM decryption.
     This ensures all existing encrypted database fields remain readable.
@@ -242,7 +259,7 @@ SHARD IPC encryption upgraded.
 
 ```
 ShardProtocol encrypt/decrypt uses crypto::symmetric module
-  — XChaCha20-Poly1305 for non-FIPS (192-bit nonce = no nonce exhaustion risk even at scale)
+  — AEGIS-256 for non-FIPS (192-bit nonce = no nonce exhaustion risk even at scale)
   — AES-256-GCM for FIPS
   — HMAC-SHA512 MAC unchanged (already maximum)
 ```
@@ -312,7 +329,7 @@ All SHA-256 uses audited and upgraded to SHA-512 except:
 ```
 crypto/src/fips_kat.rs adds:
   kat_pbkdf2_sha512() — RFC 6070 test vector adapted for SHA-512
-  kat_xchacha20_poly1305() — known test vector (non-FIPS but validates implementation)
+  kat_aegis256() — AEGIS-256 known test vector from RFC 9312 appendix (non-FIPS, validates implementation)
 
 run_all_kats() adds both new tests
 ```
@@ -326,7 +343,7 @@ common/src/config.rs SecurityConfig gains:
   pub require_pq_signatures: bool,     // reject classical-only sigs
   pub require_pq_key_exchange: bool,   // reject non-PQ KEM
   pub ksf_algorithm: String,           // "argon2id-v19" or "pbkdf2-sha512"
-  pub symmetric_algorithm: String,     // "xchacha20-poly1305" or "aes-256-gcm"
+  pub symmetric_algorithm: String,     // "aegis256-poly1305" or "aes-256-gcm"
 
 validate_production_config() gains:
   if !fips_mode → violation
@@ -342,14 +359,14 @@ test_fips_mode_toggle_with_proof()
 test_fips_mode_production_forced()
 test_fips_mode_blocks_argon2id()
 test_fips_mode_allows_pbkdf2()
-test_fips_mode_blocks_xchacha20()
+test_fips_mode_blocks_aegis256()
 test_fips_mode_allows_aes256gcm()
 test_pbkdf2_kat_rfc6070()
 test_pbkdf2_roundtrip()
-test_xchacha20_encrypt_decrypt_roundtrip()
-test_xchacha20_wrong_key_fails()
-test_xchacha20_tampered_ciphertext_fails()
-test_xchacha20_nonce_uniqueness()
+test_aegis256_encrypt_decrypt_roundtrip()
+test_aegis256_wrong_key_fails()
+test_aegis256_tampered_ciphertext_fails()
+test_aegis256_nonce_uniqueness()
 test_symmetric_backward_compat_aes_to_xchacha()
   — encrypt with AES-256-GCM (old format), decrypt with new module → works
 test_symmetric_algo_id_byte_correct()
@@ -361,14 +378,14 @@ test_attestation_non_fips_blake3()
 test_dpop_mldsa87_upgrade()
 test_receipt_mldsa87_upgrade()
 test_dpop_key_hash_sha512_64bytes()
-test_seal_xchacha20_roundtrip()
+test_seal_aegis256_roundtrip()
 test_seal_fips_aes256gcm_roundtrip()
-test_shard_xchacha20_encryption()
+test_shard_aegis256_encryption()
 test_shard_fips_aes256gcm_encryption()
-test_backup_v2_xchacha20()
+test_backup_v2_aegis256()
 test_backup_v1_backward_compat()
 test_pq_minimum_level_enforcement()
-test_envelope_xchacha20_roundtrip()
+test_envelope_aegis256_roundtrip()
 test_envelope_fips_fallback()
 test_seal_legacy_aes256gcm_backward_compat()
   — seal with old format (no algo ID), unseal with new module → works
@@ -794,7 +811,7 @@ Real-world failure simulation engine.
 - All signatures ML-DSA-87 (not 65)
 - All KEM ML-KEM-1024 (not 768)
 - No classical-only signatures accepted when require_pq_signatures=true
-- All symmetric: XChaCha20-Poly1305 (non-FIPS) or AES-256-GCM (FIPS)
+- All symmetric: AEGIS-256 (non-FIPS) or AES-256-GCM (FIPS)
 - DPoP zero-sentinel 64-byte check:
   - Token with dpop_hash [0u8; 64] → correctly treated as unbound
   - Token with 32-byte hash zero-padded to 64 → NOT incorrectly accepted as unbound
@@ -862,7 +879,7 @@ All tests on C2 spot VM:
 28. `kt/src/merkle.rs` — ML-DSA-87 for tree heads
 
 ### Dependencies to Add (Cargo.toml):
-- `chacha20poly1305` — already in workspace, version "0.10" (supports XChaCha20-Poly1305)
+- `aegis = "0.6"` — AEGIS-256 AEAD with hardware AES-NI acceleration (RFC 9312)
 - `pbkdf2 = "0.12"` — new crate for FIPS KSF (pure Rust, HMAC-SHA512)
 - `cryptoki = "0.10"` — PKCS#11 safe Rust bindings for CAC/PIV (NOT the older `pkcs11` crate)
 
