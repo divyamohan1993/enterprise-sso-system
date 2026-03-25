@@ -7,7 +7,10 @@ use opaque::store::CredentialStore;
 use orchestrator::ceremony::{CeremonySession, CeremonyState, CEREMONY_TIMEOUT_SECS};
 use orchestrator::messages::OrchestratorRequest;
 use orchestrator::service::OrchestratorService;
-use shard::transport::ShardListener;
+use shard::tls::{
+    generate_ca, generate_module_cert, server_tls_config, client_tls_config, tls_connector,
+};
+use shard::tls_transport::TlsShardListener;
 use tss::messages::{SigningRequest, SigningResponse};
 use uuid::Uuid;
 
@@ -46,8 +49,8 @@ fn ceremony_state_transitions() {
 #[test]
 fn ceremony_fail_from_pending_opaque() {
     let mut session = CeremonySession::new([0x01; 32]);
-    assert!(session.fail("opaque error".into()).is_ok());
-    assert_eq!(session.state, CeremonyState::Failed("opaque error".into()));
+    assert!(session.fail("opaque issue".into()).is_ok());
+    assert_eq!(session.state, CeremonyState::Failed("opaque issue".into()));
     // Cannot fail again
     assert!(session.fail("double fail".into()).is_err());
 }
@@ -56,8 +59,8 @@ fn ceremony_fail_from_pending_opaque() {
 fn ceremony_fail_from_pending_tss() {
     let mut session = CeremonySession::new([0x01; 32]);
     session.opaque_complete().unwrap();
-    assert!(session.fail("tss error".into()).is_ok());
-    assert_eq!(session.state, CeremonyState::Failed("tss error".into()));
+    assert!(session.fail("tss issue".into()).is_ok());
+    assert_eq!(session.state, CeremonyState::Failed("tss issue".into()));
 }
 
 // ── Timeout test ────────────────────────────────────────────────────────
@@ -93,16 +96,36 @@ async fn orchestrator_processes_auth() {
     let user_id = store.register_with_password("alice", b"password123");
     let _server_setup_bytes = store.server_setup().serialize().to_vec();
 
-    // Start mock OPAQUE listener that runs REAL OPAQUE server-side protocol
-    let opaque_listener = ShardListener::bind("127.0.0.1:0", ModuleId::Opaque, hmac_key)
-        .await
-        .expect("bind opaque");
+    // Generate shared CA and certs for mTLS — all parties trust the same CA
+    let ca = generate_ca();
+    let opaque_server_cert = generate_module_cert("localhost", &ca);
+    let tss_server_cert = generate_module_cert("localhost", &ca);
+    let orchestrator_client_cert = generate_module_cert("orchestrator", &ca);
+
+    let opaque_server_cfg = server_tls_config(&opaque_server_cert, &ca);
+    let tss_server_cfg = server_tls_config(&tss_server_cert, &ca);
+    let orchestrator_client_cfg = client_tls_config(&orchestrator_client_cert, &ca);
+
+    // Start mock OPAQUE listener with mTLS
+    let opaque_listener = TlsShardListener::bind(
+        "127.0.0.1:0",
+        ModuleId::Opaque,
+        hmac_key,
+        opaque_server_cfg,
+    )
+    .await
+    .expect("bind opaque");
     let opaque_addr = opaque_listener.local_addr().unwrap().to_string();
 
-    // Start mock TSS listener
-    let tss_listener = ShardListener::bind("127.0.0.1:0", ModuleId::Tss, hmac_key)
-        .await
-        .expect("bind tss");
+    // Start mock TSS listener with mTLS
+    let tss_listener = TlsShardListener::bind(
+        "127.0.0.1:0",
+        ModuleId::Tss,
+        hmac_key,
+        tss_server_cfg,
+    )
+    .await
+    .expect("bind tss");
     let tss_addr = tss_listener.local_addr().unwrap().to_string();
 
     let rsk = receipt_signing_key;
@@ -184,8 +207,14 @@ async fn orchestrator_processes_auth() {
         transport.send(&resp_bytes).await.expect("send tss resp");
     });
 
-    // Create orchestrator service and process auth
-    let service = OrchestratorService::new(hmac_key, opaque_addr, tss_addr);
+    // Create orchestrator service with the SAME CA trust for mTLS
+    let connector = tls_connector(orchestrator_client_cfg);
+    let service = OrchestratorService::new_with_tls(
+        hmac_key,
+        opaque_addr,
+        tss_addr,
+        connector,
+    );
 
     let request = OrchestratorRequest {
         username: "alice".into(),
@@ -231,16 +260,36 @@ async fn orchestrator_handles_opaque_failure() {
     let mut store = CredentialStore::new();
     store.register_with_password("alice", b"password123");
 
-    // Start mock OPAQUE listener — real OPAQUE, but user sends wrong password
-    let opaque_listener = ShardListener::bind("127.0.0.1:0", ModuleId::Opaque, hmac_key)
-        .await
-        .expect("bind opaque");
+    // Generate shared CA and certs for mTLS
+    let ca = generate_ca();
+    let opaque_server_cert = generate_module_cert("localhost", &ca);
+    let tss_server_cert = generate_module_cert("localhost", &ca);
+    let orchestrator_client_cert = generate_module_cert("orchestrator", &ca);
+
+    let opaque_server_cfg = server_tls_config(&opaque_server_cert, &ca);
+    let tss_server_cfg = server_tls_config(&tss_server_cert, &ca);
+    let orchestrator_client_cfg = client_tls_config(&orchestrator_client_cert, &ca);
+
+    // Start mock OPAQUE listener with mTLS
+    let opaque_listener = TlsShardListener::bind(
+        "127.0.0.1:0",
+        ModuleId::Opaque,
+        hmac_key,
+        opaque_server_cfg,
+    )
+    .await
+    .expect("bind opaque");
     let opaque_addr = opaque_listener.local_addr().unwrap().to_string();
 
     // TSS listener (won't be reached)
-    let tss_listener = ShardListener::bind("127.0.0.1:0", ModuleId::Tss, hmac_key)
-        .await
-        .expect("bind tss");
+    let tss_listener = TlsShardListener::bind(
+        "127.0.0.1:0",
+        ModuleId::Tss,
+        hmac_key,
+        tss_server_cfg,
+    )
+    .await
+    .expect("bind tss");
     let tss_addr = tss_listener.local_addr().unwrap().to_string();
 
     let opaque_handle = tokio::spawn(async move {
@@ -296,7 +345,13 @@ async fn orchestrator_handles_opaque_failure() {
         }
     });
 
-    let service = OrchestratorService::new(hmac_key, opaque_addr, tss_addr);
+    let connector = tls_connector(orchestrator_client_cfg);
+    let service = OrchestratorService::new_with_tls(
+        hmac_key,
+        opaque_addr,
+        tss_addr,
+        connector,
+    );
 
     let request = OrchestratorRequest {
         username: "alice".into(),

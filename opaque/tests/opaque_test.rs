@@ -146,10 +146,13 @@ fn full_login_flow_succeeds_with_correct_password() {
             assert_eq!(receipt.step_id, 1);
             assert!(!receipt.signature.is_empty());
 
-            // Verify the receipt signature
+            // Verify the receipt signature using ML-DSA-65 (hardened signing).
+            // The ReceiptSigner now signs with ML-DSA-65 asymmetric signatures
+            // derived from the first 32 bytes of the signing key as a seed.
+            let receipt_signer = opaque::service::ReceiptSigner::new(SIGNING_KEY);
             assert!(
-                crypto::receipts::verify_receipt_signature(&receipt, &SIGNING_KEY),
-                "receipt signature must be valid"
+                receipt_signer.verify(&receipt),
+                "receipt signature must be valid (ML-DSA-65)"
             );
         }
         opaque::messages::OpaqueResponse::Error { message } => {

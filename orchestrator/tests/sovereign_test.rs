@@ -42,7 +42,15 @@ fn test_sovereign_ceremony_full_flow() {
     ceremony.enter_abort_window().unwrap();
     assert!(matches!(ceremony.state, SovereignState::AbortWindow { .. }));
 
-    // Proceed to cooling period
+    // The hardened code enforces that the abort window deadline must actually
+    // expire before proceeding. Set the deadline to the past so the test
+    // can proceed without a 10-second wait, while still validating the
+    // full state machine flow.
+    if let SovereignState::AbortWindow { ref mut deadline, .. } = ceremony.state {
+        *deadline = 0; // Set to epoch 0 (far in the past)
+    }
+
+    // Proceed to cooling period (abort window has now expired)
     ceremony.proceed_to_cooling().unwrap();
     assert!(matches!(
         ceremony.state,

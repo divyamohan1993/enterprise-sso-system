@@ -124,8 +124,9 @@ pub fn verify_dev_mode_proof(proof_hex: &str, action: &str) -> bool {
         _ => return false,
     };
 
-    // Constant-time comparison
-    crypto::ct::ct_eq(&proof_bytes, &expected_proof)
+    // Constant-time comparison using subtle (avoids timing side-channels)
+    use subtle::ConstantTimeEq;
+    proof_bytes.ct_eq(expected_proof.as_slice()).into()
 }
 
 /// Generate a developer mode activation proof (for use by authorized operators).

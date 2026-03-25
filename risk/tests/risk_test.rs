@@ -48,8 +48,14 @@ fn zero_risk_signals_score_zero() {
 fn max_risk_signals_score_one() {
     let engine = RiskEngine::new();
     let user = Uuid::new_v4();
+    // The hardened engine uses a server-side failed attempt counter (not the
+    // client-supplied `recent_failed_attempts` field). Record 5 failures to
+    // max out the failed-attempts weight (5/5 * 0.15 = 0.15).
+    for _ in 0..5 {
+        engine.record_failed_attempt(&user);
+    }
     let score = engine.compute_score(&user, &max_risk_signals());
-    // 0.25 + 0.20 + 0.15 + 0.10 + 0.15 + 0.15 = 1.0
+    // 0.25 + 0.20 + 0.15 + 0.10 + 0.15 + 0.15 + noise = 1.0 (capped)
     assert!(
         (score - 1.0).abs() < f64::EPSILON,
         "expected 1.0, got {score}"
@@ -60,10 +66,17 @@ fn max_risk_signals_score_one() {
 fn failed_attempts_increase_risk() {
     let engine = RiskEngine::new();
     let user = Uuid::new_v4();
-    let mut signals = clean_signals();
-    signals.recent_failed_attempts = 5;
+    // The hardened engine ignores client-supplied `recent_failed_attempts` and
+    // uses a server-side counter instead. Record 5 failures via the engine.
+    for _ in 0..5 {
+        engine.record_failed_attempt(&user);
+    }
+    let signals = clean_signals();
     let score = engine.compute_score(&user, &signals);
-    // 5/5 * 0.15 = 0.15 + noise [0.0, 0.03)
+    // Server-side: 5/5 * 0.15 = 0.15, plus mimicry penalty (+0.05, since
+    // all signal fields are zero/false), plus noise [0.0, 0.03).
+    // But mimicry requires server_fails == 0, and here server_fails == 5,
+    // so no mimicry penalty. Score = 0.15 + noise [0.0, 0.03).
     assert!(score >= 0.15 && score < 0.18, "expected [0.15, 0.18), got {score}");
 }
 
@@ -258,20 +271,26 @@ fn stale_device_attestation_moderate_risk() {
 fn combined_signals_additive() {
     let engine = RiskEngine::new();
     let user = Uuid::new_v4();
+    // The hardened engine uses a server-side failed attempt counter.
+    // Record 5 failures to produce the expected weight.
+    for _ in 0..5 {
+        engine.record_failed_attempt(&user);
+    }
     let mut signals = clean_signals();
     signals.is_unusual_network = true; // +0.15
     signals.is_unusual_time = true;    // +0.10
-    signals.recent_failed_attempts = 5; // +0.15
+    // recent_failed_attempts is ignored; server-side counter is used (+0.15)
     let score = engine.compute_score(&user, &signals);
-    // 0.40 + noise [0.0, 0.03)
+    // 0.15 + 0.10 + 0.15 + noise [0.0, 0.03) = [0.40, 0.43)
     assert!(score >= 0.40 && score < 0.43, "combined signals should be 0.40 + noise, got {score}");
     assert!(matches!(engine.classify(score), RiskLevel::Elevated), "expected Elevated classification");
 }
 
 #[test]
 fn risk_request_end_to_end_with_engine() {
+    let user_id = Uuid::new_v4();
     let request = RiskRequest {
-        user_id: Uuid::new_v4(),
+        user_id,
         device_tier: 2,
         signals: RiskSignals {
             device_attestation_age_secs: 7200.0,
@@ -290,8 +309,13 @@ fn risk_request_end_to_end_with_engine() {
     let req_bytes = postcard::to_allocvec(&request).expect("serialize");
     let decoded_req: RiskRequest = postcard::from_bytes(&req_bytes).expect("deserialize");
 
-    // Process with engine
+    // Process with engine. The hardened engine uses a server-side failed
+    // attempt counter instead of the client-supplied field. Record failures
+    // to reach the max weight.
     let engine = RiskEngine::new();
+    for _ in 0..5 {
+        engine.record_failed_attempt(&decoded_req.user_id);
+    }
     let score = engine.compute_score(&decoded_req.user_id, &decoded_req.signals);
     let classification = format!("{:?}", engine.classify(score));
 

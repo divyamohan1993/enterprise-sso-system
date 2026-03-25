@@ -1,5 +1,6 @@
 use common::types::ModuleId;
-use shard::transport::{connect, ShardListener};
+use shard::tls::{generate_ca, generate_module_cert, server_tls_config, client_tls_config, tls_connector};
+use shard::tls_transport::{TlsShardListener, tls_connect};
 
 /// Shared HMAC key for tests.
 fn test_key() -> [u8; 64] {
@@ -8,17 +9,38 @@ fn test_key() -> [u8; 64] {
 
 #[tokio::test]
 async fn transport_roundtrip() {
-    let listener = ShardListener::bind("127.0.0.1:0", ModuleId::Verifier, test_key())
-        .await
-        .unwrap();
+    let ca = generate_ca();
+    let server_cert = generate_module_cert("localhost", &ca);
+    let client_cert = generate_module_cert("client", &ca);
+    let server_cfg = server_tls_config(&server_cert, &ca);
+    let client_cfg = client_tls_config(&client_cert, &ca);
+
+    let listener = TlsShardListener::bind(
+        "127.0.0.1:0",
+        ModuleId::Verifier,
+        test_key(),
+        server_cfg,
+    )
+    .await
+    .unwrap();
     let addr = listener.local_addr().unwrap().to_string();
+
+    let connector = tls_connector(client_cfg);
 
     let handle = tokio::spawn(async move {
         let mut server = listener.accept().await.unwrap();
         server.recv().await.unwrap()
     });
 
-    let mut client = connect(&addr, ModuleId::Gateway, test_key()).await.unwrap();
+    let mut client = tls_connect(
+        &addr,
+        ModuleId::Gateway,
+        test_key(),
+        &connector,
+        "localhost",
+    )
+    .await
+    .unwrap();
     client.send(b"hello shard").await.unwrap();
 
     let (sender, payload) = handle.await.unwrap();
@@ -28,10 +50,23 @@ async fn transport_roundtrip() {
 
 #[tokio::test]
 async fn transport_replay_rejected() {
-    let listener = ShardListener::bind("127.0.0.1:0", ModuleId::Verifier, test_key())
-        .await
-        .unwrap();
+    let ca = generate_ca();
+    let server_cert = generate_module_cert("localhost", &ca);
+    let client_cert = generate_module_cert("client", &ca);
+    let server_cfg = server_tls_config(&server_cert, &ca);
+    let client_cfg = client_tls_config(&client_cert, &ca);
+
+    let listener = TlsShardListener::bind(
+        "127.0.0.1:0",
+        ModuleId::Verifier,
+        test_key(),
+        server_cfg,
+    )
+    .await
+    .unwrap();
     let addr = listener.local_addr().unwrap().to_string();
+
+    let connector = tls_connector(client_cfg);
 
     // Server side: receive the first message normally, then capture raw bytes
     // of a second message, and try to replay them on a new connection.
@@ -59,7 +94,15 @@ async fn transport_replay_rejected() {
         );
     });
 
-    let mut client = connect(&addr, ModuleId::Gateway, test_key()).await.unwrap();
+    let mut client = tls_connect(
+        &addr,
+        ModuleId::Gateway,
+        test_key(),
+        &connector,
+        "localhost",
+    )
+    .await
+    .unwrap();
     client.send(b"legit message").await.unwrap();
     client.send(b"message to replay").await.unwrap();
     client.send(b"third message").await.unwrap();
@@ -69,10 +112,23 @@ async fn transport_replay_rejected() {
 
 #[tokio::test]
 async fn transport_multiple_messages() {
-    let listener = ShardListener::bind("127.0.0.1:0", ModuleId::Orchestrator, test_key())
-        .await
-        .unwrap();
+    let ca = generate_ca();
+    let server_cert = generate_module_cert("localhost", &ca);
+    let client_cert = generate_module_cert("client", &ca);
+    let server_cfg = server_tls_config(&server_cert, &ca);
+    let client_cfg = client_tls_config(&client_cert, &ca);
+
+    let listener = TlsShardListener::bind(
+        "127.0.0.1:0",
+        ModuleId::Orchestrator,
+        test_key(),
+        server_cfg,
+    )
+    .await
+    .unwrap();
     let addr = listener.local_addr().unwrap().to_string();
+
+    let connector = tls_connector(client_cfg);
 
     let handle = tokio::spawn(async move {
         let mut server = listener.accept().await.unwrap();
@@ -84,7 +140,15 @@ async fn transport_multiple_messages() {
         results
     });
 
-    let mut client = connect(&addr, ModuleId::Gateway, test_key()).await.unwrap();
+    let mut client = tls_connect(
+        &addr,
+        ModuleId::Gateway,
+        test_key(),
+        &connector,
+        "localhost",
+    )
+    .await
+    .unwrap();
     for i in 0..5u8 {
         let msg = format!("message-{i}");
         client.send(msg.as_bytes()).await.unwrap();
@@ -100,10 +164,23 @@ async fn transport_multiple_messages() {
 
 #[tokio::test]
 async fn transport_bidirectional() {
-    let listener = ShardListener::bind("127.0.0.1:0", ModuleId::Verifier, test_key())
-        .await
-        .unwrap();
+    let ca = generate_ca();
+    let server_cert = generate_module_cert("localhost", &ca);
+    let client_cert = generate_module_cert("client", &ca);
+    let server_cfg = server_tls_config(&server_cert, &ca);
+    let client_cfg = client_tls_config(&client_cert, &ca);
+
+    let listener = TlsShardListener::bind(
+        "127.0.0.1:0",
+        ModuleId::Verifier,
+        test_key(),
+        server_cfg,
+    )
+    .await
+    .unwrap();
     let addr = listener.local_addr().unwrap().to_string();
+
+    let connector = tls_connector(client_cfg);
 
     let server_handle = tokio::spawn(async move {
         let mut server = listener.accept().await.unwrap();
@@ -117,7 +194,15 @@ async fn transport_bidirectional() {
         server.send(b"pong").await.unwrap();
     });
 
-    let mut client = connect(&addr, ModuleId::Gateway, test_key()).await.unwrap();
+    let mut client = tls_connect(
+        &addr,
+        ModuleId::Gateway,
+        test_key(),
+        &connector,
+        "localhost",
+    )
+    .await
+    .unwrap();
 
     // Send to server
     client.send(b"ping").await.unwrap();
