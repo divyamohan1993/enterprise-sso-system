@@ -36,3 +36,4 @@ pub mod tpm;
 pub mod symmetric;
 pub mod kdf;
 pub mod cac;
+pub mod honey;

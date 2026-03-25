@@ -67,3 +67,6 @@ pub mod stig;
 // ── CMMC 2.0 assessment and SIEM webhook integration ──
 pub mod cmmc;
 pub mod siem_webhook;
+
+// ── Searchable Symmetric Encryption (blind index for zero-trust DB) ──
+pub mod sse;
