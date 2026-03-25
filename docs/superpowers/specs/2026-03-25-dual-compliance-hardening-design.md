@@ -136,7 +136,7 @@ Constants:
 
 ### 0.4 Changes to `opaque/src/opaque_impl.rs`
 
-Add a second OPAQUE cipher suite for FIPS mode.
+Add a second OPAQUE cipher suite for FIPS mode with concrete Pbkdf2Sha512 wrapper.
 
 ```
 // Existing (non-FIPS):
@@ -152,7 +152,27 @@ pub struct OpaqueCsFips;
 impl CipherSuite for OpaqueCsFips {
     type OprfCs = Ristretto255;
     type KeyExchange = TripleDh<Ristretto255, Sha512>;
-    type Ksf = Pbkdf2Sha512;  // Custom wrapper implementing opaque_ke::Ksf trait
+    type Ksf = Pbkdf2Sha512;
+}
+
+// Concrete Pbkdf2Sha512 wrapper implementing opaque_ke::Ksf trait:
+pub struct Pbkdf2Sha512;
+
+impl opaque_ke::Ksf for Pbkdf2Sha512 {
+    // opaque_ke::Ksf trait requires:
+    //   fn hash<L: ArrayLength<u8>>(
+    //     &self,
+    //     input: GenericArray<u8, L>,
+    //   ) -> Result<Output<L>, InternalError>;
+    //
+    // Implementation:
+    //   1. Use input bytes as password
+    //   2. Salt: first 16 bytes of input (or zeros if input < 16)
+    //   3. Call pbkdf2::pbkdf2_hmac::<Sha512>(input, salt, 210_000, &mut output)
+    //   4. Return GenericArray of requested length L
+    //
+    // The 210_000 iteration count is per OWASP 2024 for PBKDF2-HMAC-SHA512.
+    // pbkdf2 crate version: 0.12 (uses digest 0.10 compatible traits)
 }
 ```
 
@@ -196,7 +216,12 @@ Switch to XChaCha20-Poly1305 for key sealing (non-FIPS), AES-256-GCM for FIPS.
 ```
 DerivedKek::seal() and unseal() now use crypto::symmetric::encrypt/decrypt
   — Automatically selects algorithm based on FIPS mode
-  — Backward compatible: decrypt reads algorithm_id byte to select correct path
+  — Legacy migration: if first byte is NOT a recognized algorithm_id (0x01 or 0x02),
+    treat the entire blob as legacy AES-256-GCM (no algorithm_id prefix).
+    This handles pre-existing sealed data that has raw nonce||ciphertext||tag format.
+    The first byte of a 12-byte AES-GCM nonce is random and statistically will not
+    be 0x01 or 0x02 with >99% probability. For the rare collision case, a secondary
+    check validates the total length: legacy = 12+N+16, new = 1+nonce+N+16.
 ```
 
 ### 0.8 Changes to `crypto/src/envelope.rs`
@@ -206,7 +231,9 @@ Same dual-algorithm switch for field-level encryption.
 ```
 encrypt() and decrypt() now use crypto::symmetric::encrypt/decrypt
   — XChaCha20-Poly1305 default, AES-256-GCM in FIPS mode
-  — Backward compatible decryption
+  — Legacy migration: same strategy as seal.rs — if first byte is not a
+    recognized algorithm_id, attempt legacy AES-256-GCM decryption.
+    This ensures all existing encrypted database fields remain readable.
 ```
 
 ### 0.9 Changes to `shard/src/protocol.rs`
@@ -237,6 +264,7 @@ crypto/src/dpop.rs:
   DpopSigningKey = SigningKey<MlDsa87>     (was MlDsa65)
   DpopVerifyingKey = VerifyingKey<MlDsa87> (was MlDsa65)
   DpopSignature = Signature<MlDsa87>       (was MlDsa65)
+  dpop_key_hash() returns [u8; 64]         (was [u8; 32] — now SHA-512)
 
 crypto/src/receipts.rs:
   ReceiptSigningKey = SigningKey<MlDsa87>     (was MlDsa65)
@@ -246,8 +274,32 @@ crypto/src/receipts.rs:
 kt/src/merkle.rs:
   Tree head signing uses ML-DSA-87 keypair (was ML-DSA-65)
 
-common/src/types.rs:
-  TokenClaims.dpop_hash: [u8; 64]  (was [u8; 32] — SHA-512 upgrade)
+orchestrator/src/service.rs:
+  Replace MlDsa65 with MlDsa87 in receipt verification key generation
+  (currently calls ml_dsa::MlDsa65::from_seed() — must change to MlDsa87)
+
+opaque/src/service.rs:
+  Replace MlDsa65 with MlDsa87 in ReceiptSigner key generation
+  (currently uses ml_dsa::{KeyGen, MlDsa65} — must change to MlDsa87)
+
+dpop_hash size change [u8; 32] → [u8; 64] — ALL affected files:
+  common/src/types.rs:
+    TokenClaims.dpop_hash: [u8; 64]     (was [u8; 32])
+    Receipt.dpop_key_hash: [u8; 64]     (was [u8; 32])
+  gateway/src/wire.rs:
+    OrchestratorRequest.dpop_key_hash: [u8; 64]  (was [u8; 32])
+  orchestrator/src/messages.rs:
+    OrchestratorRequest.dpop_key_hash: [u8; 64]  (was [u8; 32])
+  opaque/src/messages.rs:
+    OpaqueRequest::LoginStart.dpop_key_hash: [u8; 64]  (was [u8; 32])
+  opaque/src/service.rs:
+    dpop_key_hash parameter: [u8; 64]   (was [u8; 32])
+  verifier/src/verify.rs:
+    Zero-sentinel: [0u8; 64]            (was [0u8; 32])
+    ct_eq_64() for DPoP comparison      (was ct_eq_32())
+  verifier/src/main.rs:
+    dpop_hash comparison: [0u8; 64]     (was [0u8; 32])
+  All test files with hardcoded dpop_hash values updated to 64 bytes
 
 All SHA-256 uses audited and upgraded to SHA-512 except:
   - PKCE code_challenge (SHA-256 required by RFC 7636) — keep
@@ -312,11 +364,16 @@ test_dpop_key_hash_sha512_64bytes()
 test_seal_xchacha20_roundtrip()
 test_seal_fips_aes256gcm_roundtrip()
 test_shard_xchacha20_encryption()
+test_shard_fips_aes256gcm_encryption()
 test_backup_v2_xchacha20()
 test_backup_v1_backward_compat()
 test_pq_minimum_level_enforcement()
 test_envelope_xchacha20_roundtrip()
 test_envelope_fips_fallback()
+test_seal_legacy_aes256gcm_backward_compat()
+  — seal with old format (no algo ID), unseal with new module → works
+test_envelope_legacy_aes256gcm_backward_compat()
+  — encrypt with old format, decrypt with new module → works
 ```
 
 ---
@@ -738,6 +795,10 @@ Real-world failure simulation engine.
 - All KEM ML-KEM-1024 (not 768)
 - No classical-only signatures accepted when require_pq_signatures=true
 - All symmetric: XChaCha20-Poly1305 (non-FIPS) or AES-256-GCM (FIPS)
+- DPoP zero-sentinel 64-byte check:
+  - Token with dpop_hash [0u8; 64] → correctly treated as unbound
+  - Token with 32-byte hash zero-padded to 64 → NOT incorrectly accepted as unbound
+  - Verifier uses ct_eq_64() for constant-time comparison
 
 ### 6.3 Test Infrastructure
 
@@ -770,32 +831,39 @@ All tests on C2 spot VM:
 19-25. `terraform/gcp-india/` (main.tf + 7 modules)
 26. `deploy/bare-metal/security/cloud-hsm-init.sh`
 
-### Modified Files (21):
+### Modified Files (28):
 1. `common/src/lib.rs` — new module declarations
 2. `common/src/config.rs` — FIPS, PQ, CAC, compliance, symmetric algo fields
 3. `common/src/startup_checks.rs` — STIG audit, FIPS enforcement
 4. `common/src/encrypted_db.rs` — PII encryption enforcement
 5. `common/src/siem.rs` — new event types
-6. `common/src/types.rs` — dpop_hash to [u8; 64]
+6. `common/src/types.rs` — dpop_hash to [u8; 64], Receipt.dpop_key_hash to [u8; 64]
 7. `common/src/backup.rs` — XChaCha20 + v2 format
 8. `crypto/src/lib.rs` — add kdf, symmetric, cac modules
 9. `crypto/src/fips_kat.rs` — PBKDF2 + XChaCha20 KATs
 10. `crypto/src/attest.rs` — FIPS-aware hashing
-11. `crypto/src/dpop.rs` — ML-DSA-65 to ML-DSA-87
-12. `crypto/src/receipts.rs` — ML-DSA-65 to ML-DSA-87
-13. `crypto/src/seal.rs` — XChaCha20 default, AES-256-GCM FIPS
-14. `crypto/src/envelope.rs` — same dual-algorithm switch
+11. `crypto/src/dpop.rs` — ML-DSA-65→87, dpop_key_hash() returns [u8; 64]
+12. `crypto/src/receipts.rs` — ML-DSA-65→87
+13. `crypto/src/seal.rs` — XChaCha20 default + legacy AES-256-GCM migration
+14. `crypto/src/envelope.rs` — same dual-algorithm switch + legacy migration
 15. `shard/src/protocol.rs` — XChaCha20 for non-FIPS
-16. `opaque/src/opaque_impl.rs` — add OpaqueCsFips
+16. `opaque/src/opaque_impl.rs` — add OpaqueCsFips + Pbkdf2Sha512 wrapper
 17. `opaque/src/store.rs` — dual cipher suite, KSF migration
-18. `opaque/src/service.rs` — FIPS-aware routing
-19. `admin/src/routes.rs` — CAC, STIG, CMMC endpoints
-20. `audit/src/log.rs` — compliance-aware retention
-21. `kt/src/merkle.rs` — ML-DSA-87 for tree heads
+18. `opaque/src/service.rs` — FIPS-aware routing, MlDsa65→MlDsa87
+19. `opaque/src/messages.rs` — dpop_key_hash to [u8; 64]
+20. `orchestrator/src/service.rs` — MlDsa65→MlDsa87 for receipt verification
+21. `orchestrator/src/messages.rs` — dpop_key_hash to [u8; 64]
+22. `gateway/src/wire.rs` — dpop_key_hash to [u8; 64]
+23. `gateway/src/server.rs` — SHA-512 for dpop key hash computation
+24. `verifier/src/verify.rs` — dpop_hash [0u8; 64] sentinel, ct_eq_64()
+25. `verifier/src/main.rs` — dpop_hash comparison to [0u8; 64]
+26. `admin/src/routes.rs` — CAC, STIG, CMMC endpoints
+27. `audit/src/log.rs` — compliance-aware retention
+28. `kt/src/merkle.rs` — ML-DSA-87 for tree heads
 
 ### Dependencies to Add (Cargo.toml):
-- `chacha20poly1305` — already in workspace (XChaCha20-Poly1305 feature)
-- `pbkdf2` — new crate for FIPS KSF
-- `pkcs11` or `cryptoki` — PKCS#11 bindings for CAC/PIV
+- `chacha20poly1305` — already in workspace, version "0.10" (supports XChaCha20-Poly1305)
+- `pbkdf2 = "0.12"` — new crate for FIPS KSF (pure Rust, HMAC-SHA512)
+- `cryptoki = "0.10"` — PKCS#11 safe Rust bindings for CAC/PIV (NOT the older `pkcs11` crate)
 
-### ~95 new test functions across all layers
+### ~100 new test functions across all layers
