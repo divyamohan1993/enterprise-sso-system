@@ -56,3 +56,7 @@ pub mod incident_response;
 // ── CAC/PIV smart card authentication ──
 pub mod cac;
 pub mod cac_auth;
+
+// ── Compliance and data residency ──
+pub mod compliance;
+pub mod data_residency;
