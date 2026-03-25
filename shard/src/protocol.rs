@@ -4,7 +4,7 @@
 //! HMAC-SHA512, AES-256-GCM encryption, replay protection, and timestamp validation.
 
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -312,4 +312,412 @@ impl ShardProtocol {
 struct SequenceState {
     send_sequence: u64,
     recv_sequences: HashMap<ModuleId, u64>,
+}
+
+// ---------------------------------------------------------------------------
+// Automatic sequence persistence
+// ---------------------------------------------------------------------------
+
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+/// Default filename for persisted sequence state alongside the service data dir.
+const SEQUENCE_FILE_NAME: &str = "shard_sequences.bin";
+
+/// Periodic persistence interval in seconds.
+const PERSIST_INTERVAL_SECS: u64 = 60;
+
+/// Automatic sequence persistence manager for SHARD protocol instances.
+///
+/// Wraps a `ShardProtocol` behind an `Arc<Mutex<>>` and manages:
+/// - Loading sequences from disk on startup via `import_sequences()`
+/// - Periodic persistence every 60 seconds (background tokio task)
+/// - Graceful shutdown persistence via tokio signal handler (SIGTERM/SIGINT)
+///
+/// # Usage
+/// ```ignore
+/// let persistence = SequencePersistence::new(protocol, "/var/lib/milnet/shard");
+/// persistence.start();
+/// // ... use persistence.protocol() to access the inner ShardProtocol ...
+/// // On shutdown, sequences are automatically flushed to disk.
+/// ```
+pub struct SequencePersistence {
+    /// The wrapped protocol instance.
+    protocol: Arc<Mutex<ShardProtocol>>,
+    /// Directory where the sequence file is stored.
+    data_dir: PathBuf,
+    /// Handle to the background persistence task (for cancellation).
+    shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+}
+
+impl SequencePersistence {
+    /// Create a new persistence manager.
+    ///
+    /// Immediately attempts to load previously persisted sequences from
+    /// `{data_dir}/shard_sequences.bin`. If the file does not exist or is
+    /// corrupt, the protocol starts with fresh sequence counters.
+    pub fn new(mut protocol: ShardProtocol, data_dir: impl AsRef<Path>) -> Self {
+        let data_dir = data_dir.as_ref().to_path_buf();
+        let seq_path = data_dir.join(SEQUENCE_FILE_NAME);
+
+        // Load sequences on startup
+        if seq_path.exists() {
+            match std::fs::read(&seq_path) {
+                Ok(data) => {
+                    protocol.import_sequences(&data);
+                    tracing::info!(
+                        "SHARD: loaded persisted sequences from {:?} (send_seq={})",
+                        seq_path,
+                        protocol.send_sequence
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "SHARD: failed to read sequence file {:?}: {}. Starting fresh.",
+                        seq_path, e
+                    );
+                }
+            }
+        } else {
+            tracing::info!(
+                "SHARD: no persisted sequence file at {:?}. Starting with fresh sequences.",
+                seq_path
+            );
+        }
+
+        Self {
+            protocol: Arc::new(Mutex::new(protocol)),
+            data_dir,
+            shutdown_tx: None,
+        }
+    }
+
+    /// Get a clone of the `Arc<Mutex<ShardProtocol>>` for use by message
+    /// send/receive code.
+    pub fn protocol(&self) -> Arc<Mutex<ShardProtocol>> {
+        Arc::clone(&self.protocol)
+    }
+
+    /// Persist the current sequence state to disk.
+    ///
+    /// Writes atomically by writing to a `.tmp` file first, then renaming.
+    fn persist_to_disk(protocol: &Mutex<ShardProtocol>, data_dir: &Path) -> Result<(), String> {
+        let data = {
+            let proto = protocol.lock().map_err(|e| format!("lock poisoned: {e}"))?;
+            if !proto.needs_persistence() {
+                return Ok(());
+            }
+            proto.export_sequences()
+        };
+
+        // Ensure directory exists
+        std::fs::create_dir_all(data_dir)
+            .map_err(|e| format!("failed to create data dir {:?}: {e}", data_dir))?;
+
+        let seq_path = data_dir.join(SEQUENCE_FILE_NAME);
+        let tmp_path = data_dir.join(format!("{SEQUENCE_FILE_NAME}.tmp"));
+
+        std::fs::write(&tmp_path, &data)
+            .map_err(|e| format!("failed to write tmp sequence file: {e}"))?;
+        std::fs::rename(&tmp_path, &seq_path)
+            .map_err(|e| format!("failed to rename sequence file: {e}"))?;
+
+        // Mark as persisted
+        {
+            let mut proto = protocol.lock().map_err(|e| format!("lock poisoned: {e}"))?;
+            proto.mark_persisted();
+        }
+
+        tracing::debug!("SHARD: persisted sequence state to {:?}", seq_path);
+        Ok(())
+    }
+
+    /// Start the background persistence tasks:
+    /// - Periodic flush every 60 seconds
+    /// - Graceful shutdown handler (SIGTERM / ctrl-c)
+    ///
+    /// Must be called from within a tokio runtime.
+    pub fn start(&mut self) {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        self.shutdown_tx = Some(shutdown_tx);
+
+        let protocol = Arc::clone(&self.protocol);
+        let data_dir = self.data_dir.clone();
+
+        // Periodic persistence task
+        let periodic_protocol = Arc::clone(&protocol);
+        let periodic_dir = data_dir.clone();
+        let mut periodic_rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(
+                Duration::from_secs(PERSIST_INTERVAL_SECS),
+            );
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        if let Err(e) = SequencePersistence::persist_to_disk(&periodic_protocol, &periodic_dir) {
+                            tracing::error!("SHARD periodic persistence failed: {}", e);
+                        }
+                    }
+                    _ = periodic_rx.changed() => {
+                        tracing::info!("SHARD: periodic persistence task shutting down");
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Graceful shutdown handler
+        let shutdown_protocol = Arc::clone(&protocol);
+        let shutdown_dir = data_dir.clone();
+        tokio::spawn(async move {
+            // Wait for SIGTERM or ctrl-c
+            let ctrl_c = tokio::signal::ctrl_c();
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut sigterm = signal(SignalKind::terminate())
+                    .expect("failed to register SIGTERM handler");
+                tokio::select! {
+                    _ = ctrl_c => {},
+                    _ = sigterm.recv() => {},
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = ctrl_c.await;
+            }
+
+            tracing::info!("SHARD: graceful shutdown — persisting sequences");
+            if let Err(e) = SequencePersistence::persist_to_disk(&shutdown_protocol, &shutdown_dir) {
+                tracing::error!("SHARD: shutdown persistence failed: {}", e);
+            } else {
+                tracing::info!("SHARD: sequences persisted successfully on shutdown");
+            }
+        });
+    }
+
+    /// Manually trigger a persistence flush (e.g., from health checks).
+    pub fn flush(&self) -> Result<(), String> {
+        Self::persist_to_disk(&self.protocol, &self.data_dir)
+    }
+}
+
+impl Drop for SequencePersistence {
+    fn drop(&mut self) {
+        // Signal background tasks to stop
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(true);
+        }
+        // Best-effort final persistence
+        if let Err(e) = Self::persist_to_disk(&self.protocol, &self.data_dir) {
+            tracing::warn!("SHARD: drop persistence failed: {}", e);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_hmac_key() -> [u8; 64] {
+        let mut key = [0u8; 64];
+        getrandom::getrandom(&mut key).unwrap();
+        key
+    }
+
+    #[test]
+    fn export_import_sequences_round_trip() {
+        let key = test_hmac_key();
+        let mut proto = ShardProtocol::new(ModuleId::Gateway, key);
+
+        // Simulate sending some messages to advance send_sequence
+        let _ = proto.create_message(b"msg1").unwrap();
+        let _ = proto.create_message(b"msg2").unwrap();
+        assert_eq!(proto.send_sequence, 2);
+
+        // Export
+        let data = proto.export_sequences();
+
+        // Import into a fresh protocol
+        let mut proto2 = ShardProtocol::new(ModuleId::Gateway, key);
+        assert_eq!(proto2.send_sequence, 0);
+        proto2.import_sequences(&data);
+        assert_eq!(proto2.send_sequence, 2);
+    }
+
+    #[test]
+    fn import_sequences_never_rolls_back() {
+        let key = test_hmac_key();
+        let mut proto = ShardProtocol::new(ModuleId::Gateway, key);
+
+        // Advance to sequence 5
+        for _ in 0..5 {
+            let _ = proto.create_message(b"msg").unwrap();
+        }
+        let old_data = proto.export_sequences();
+
+        // Advance further to 10
+        for _ in 0..5 {
+            let _ = proto.create_message(b"msg").unwrap();
+        }
+        assert_eq!(proto.send_sequence, 10);
+
+        // Try to import the old (stale) snapshot — should NOT roll back
+        proto.import_sequences(&old_data);
+        assert_eq!(proto.send_sequence, 10);
+    }
+
+    #[test]
+    fn recv_sequences_import_advances_only() {
+        let key = test_hmac_key();
+        let mut proto = ShardProtocol::new(ModuleId::Audit, key);
+
+        // Simulate receiving from Gateway at sequence 5
+        let mut seqs = HashMap::new();
+        seqs.insert(ModuleId::Gateway, 5u64);
+        proto.set_initial_sequences(seqs);
+
+        // Export and import with a lower Gateway sequence — should not go backward
+        let mut stale_state = SequenceState {
+            send_sequence: 0,
+            recv_sequences: HashMap::new(),
+        };
+        stale_state.recv_sequences.insert(ModuleId::Gateway, 3);
+        let stale_data = postcard::to_allocvec(&stale_state).unwrap();
+
+        proto.import_sequences(&stale_data);
+        assert_eq!(*proto.recv_sequences.get(&ModuleId::Gateway).unwrap(), 5);
+    }
+
+    #[test]
+    fn replay_detection_after_sequence_restore() {
+        let key = test_hmac_key();
+
+        // Sender creates messages
+        let mut sender = ShardProtocol::new(ModuleId::Gateway, key);
+        let msg1 = sender.create_message(b"first").unwrap();
+        let msg2 = sender.create_message(b"second").unwrap();
+        let msg3 = sender.create_message(b"third").unwrap();
+
+        // Receiver processes first two messages
+        let mut receiver = ShardProtocol::new(ModuleId::Audit, key);
+        receiver.verify_message(&msg1).unwrap();
+        receiver.verify_message(&msg2).unwrap();
+
+        // Export receiver state
+        let state = receiver.export_sequences();
+
+        // Simulate restart: new receiver, import state
+        let mut receiver2 = ShardProtocol::new(ModuleId::Audit, key);
+        receiver2.import_sequences(&state);
+
+        // msg3 (seq=3) should work since last seen was 2
+        receiver2.verify_message(&msg3).unwrap();
+
+        // Replaying msg1 or msg2 should fail
+        assert!(receiver2.verify_message(&msg1).is_err());
+        assert!(receiver2.verify_message(&msg2).is_err());
+    }
+
+    #[test]
+    fn needs_persistence_tracks_changes() {
+        let key = test_hmac_key();
+        let mut proto = ShardProtocol::new(ModuleId::Gateway, key);
+
+        // Fresh protocol does not need persistence
+        assert!(!proto.needs_persistence());
+
+        // After sending a message, it does
+        let _ = proto.create_message(b"msg").unwrap();
+        assert!(proto.needs_persistence());
+
+        // After marking persisted, it does not
+        proto.mark_persisted();
+        assert!(!proto.needs_persistence());
+
+        // After another message, it does again
+        let _ = proto.create_message(b"msg2").unwrap();
+        assert!(proto.needs_persistence());
+    }
+
+    #[test]
+    fn corrupt_import_data_is_ignored() {
+        let key = test_hmac_key();
+        let mut proto = ShardProtocol::new(ModuleId::Gateway, key);
+        let _ = proto.create_message(b"msg").unwrap();
+
+        // Import garbage — should be silently ignored
+        proto.import_sequences(b"not valid postcard data");
+        assert_eq!(proto.send_sequence, 1); // unchanged
+    }
+
+    #[test]
+    fn sequence_persistence_loads_on_startup() {
+        let dir = std::env::temp_dir().join(format!("shard_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        let key = test_hmac_key();
+
+        // Create a protocol, send messages, persist
+        {
+            let mut proto = ShardProtocol::new(ModuleId::Gateway, key);
+            let _ = proto.create_message(b"a").unwrap();
+            let _ = proto.create_message(b"b").unwrap();
+            let _ = proto.create_message(b"c").unwrap();
+            assert_eq!(proto.send_sequence, 3);
+
+            let persistence = SequencePersistence::new(proto, &dir);
+            persistence.flush().unwrap();
+        }
+
+        // Create a new protocol, wrap in persistence — should load seq=3
+        {
+            let proto = ShardProtocol::new(ModuleId::Gateway, key);
+            let persistence = SequencePersistence::new(proto, &dir);
+            let locked = persistence.protocol();
+            let proto = locked.lock().unwrap();
+            assert_eq!(proto.send_sequence, 3);
+        }
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sequence_persistence_atomic_write() {
+        let dir = std::env::temp_dir().join(format!("shard_atomic_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let key = test_hmac_key();
+
+        let mut proto = ShardProtocol::new(ModuleId::Gateway, key);
+        let _ = proto.create_message(b"x").unwrap();
+        let persistence = SequencePersistence::new(proto, &dir);
+        persistence.flush().unwrap();
+
+        // Verify the file exists and the tmp file does not
+        let seq_path = dir.join(SEQUENCE_FILE_NAME);
+        let tmp_path = dir.join(format!("{SEQUENCE_FILE_NAME}.tmp"));
+        assert!(seq_path.exists());
+        assert!(!tmp_path.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sequence_persistence_no_write_when_unnecessary() {
+        let dir = std::env::temp_dir().join(format!("shard_noop_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let key = test_hmac_key();
+
+        let proto = ShardProtocol::new(ModuleId::Gateway, key);
+        let persistence = SequencePersistence::new(proto, &dir);
+
+        // No messages sent — flush should be a no-op (no file created)
+        persistence.flush().unwrap();
+        let seq_path = dir.join(SEQUENCE_FILE_NAME);
+        assert!(!seq_path.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

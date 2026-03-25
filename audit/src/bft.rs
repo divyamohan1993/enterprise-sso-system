@@ -368,6 +368,7 @@ impl BftAuditCluster {
                 .as_micros() as i64,
             prev_hash,
             signature: Vec::new(),
+            classification: 0,
         };
 
         if let Some(ref key) = self.pq_signing_key {

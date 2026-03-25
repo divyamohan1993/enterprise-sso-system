@@ -184,6 +184,358 @@ impl RevocationList {
 }
 
 // ---------------------------------------------------------------------------
+// Admin RBAC — Role-Based Access Control
+// ---------------------------------------------------------------------------
+
+/// Admin roles for the MILNET SSO system.
+///
+/// Each role has specific permissions over API routes. Role hierarchy:
+///   SuperAdmin > UserManager, DeviceManager > Auditor > ReadOnly
+///
+/// Roles are encoded as a u8 in admin tokens and API keys are derived
+/// per-role from the master KEK via HKDF.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum AdminRole {
+    /// Full system access including destructive operations.
+    /// Level 3/4 operations still require multi-person ceremony.
+    SuperAdmin = 0,
+    /// Can create, modify, and delete users. Cannot manage devices or
+    /// system configuration.
+    UserManager = 1,
+    /// Can enroll, modify, and revoke devices. Cannot manage users.
+    DeviceManager = 2,
+    /// Read-only access to audit logs, system status, and security dashboard.
+    Auditor = 3,
+    /// Read-only access to non-sensitive endpoints (status, health).
+    ReadOnly = 4,
+}
+
+impl AdminRole {
+    /// Parse a role from its u8 representation.
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::SuperAdmin),
+            1 => Some(Self::UserManager),
+            2 => Some(Self::DeviceManager),
+            3 => Some(Self::Auditor),
+            4 => Some(Self::ReadOnly),
+            _ => None,
+        }
+    }
+
+    /// The string label used as HKDF info for per-role key derivation.
+    pub fn key_label(&self) -> &'static str {
+        match self {
+            Self::SuperAdmin => "super-admin",
+            Self::UserManager => "user-manager",
+            Self::DeviceManager => "device-manager",
+            Self::Auditor => "auditor",
+            Self::ReadOnly => "read-only",
+        }
+    }
+
+    /// Check whether this role has at least the privileges of `required`.
+    /// SuperAdmin satisfies any role requirement.
+    pub fn satisfies(&self, required: AdminRole) -> bool {
+        match required {
+            AdminRole::ReadOnly => true, // Every role can read
+            AdminRole::Auditor => matches!(
+                self,
+                AdminRole::SuperAdmin | AdminRole::Auditor
+            ),
+            AdminRole::DeviceManager => matches!(
+                self,
+                AdminRole::SuperAdmin | AdminRole::DeviceManager
+            ),
+            AdminRole::UserManager => matches!(
+                self,
+                AdminRole::SuperAdmin | AdminRole::UserManager
+            ),
+            AdminRole::SuperAdmin => *self == AdminRole::SuperAdmin,
+        }
+    }
+}
+
+impl std::fmt::Display for AdminRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.key_label())
+    }
+}
+
+/// Derive a per-role admin API key from the master KEK using HKDF-SHA512.
+///
+/// Each role gets a unique 32-byte key derived as:
+///   HKDF-SHA512(salt=ADMIN_ROLE_KEY_DERIVE, ikm=master_kek, info=role_label)
+///
+/// The returned key is hex-encoded (64 chars) for use as a Bearer token.
+pub fn derive_admin_role_key(role: AdminRole) -> String {
+    use hkdf::Hkdf;
+    use sha2::Sha512;
+
+    let master_kek = common::sealed_keys::load_master_kek();
+    let hk = Hkdf::<Sha512>::new(Some(common::domain::ADMIN_ROLE_KEY_DERIVE), &master_kek);
+    let mut okm = [0u8; 32];
+    hk.expand(role.key_label().as_bytes(), &mut okm)
+        .expect("HKDF expand for admin role key");
+    hex::encode(okm)
+}
+
+/// Resolve an API key to an `AdminRole` by checking all derived role keys.
+///
+/// Returns `None` if the key does not match any role.
+fn resolve_admin_role(api_key: &str) -> Option<AdminRole> {
+    let roles = [
+        AdminRole::SuperAdmin,
+        AdminRole::UserManager,
+        AdminRole::DeviceManager,
+        AdminRole::Auditor,
+        AdminRole::ReadOnly,
+    ];
+    for role in &roles {
+        let derived = derive_admin_role_key(*role);
+        if crypto::ct::ct_eq(api_key.as_bytes(), derived.as_bytes()) {
+            return Some(*role);
+        }
+    }
+    None
+}
+
+/// Determine the minimum required `AdminRole` for a given request path and method.
+///
+/// This is the central policy function: it maps every route to the least-
+/// privileged role that may access it. Unknown routes default to `SuperAdmin`
+/// (fail-closed).
+fn required_role_for_route(path: &str, method: &Method) -> AdminRole {
+    // Read-only endpoints: accessible by all roles
+    if path == "/api/health"
+        || path == "/api/status"
+        || path == "/api/setup/status"
+    {
+        return AdminRole::ReadOnly;
+    }
+
+    // Audit endpoints: Auditor or above
+    if path.starts_with("/api/audit")
+        || path == "/api/security/dashboard"
+        || path == "/api/security/config"
+        || path.starts_with("/api/security/test/")
+        || path == "/api/sessions"
+        || path == "/api/tokens/revoked"
+        || path == "/api/admin/siem/stream"
+    {
+        return AdminRole::Auditor;
+    }
+
+    // User management endpoints
+    if path == "/api/users" && *method == Method::POST {
+        return AdminRole::UserManager;
+    }
+    if path == "/api/users" && *method == Method::GET {
+        return AdminRole::Auditor;
+    }
+    if path.starts_with("/api/users/") && *method == Method::DELETE {
+        return AdminRole::SuperAdmin; // Destructive: requires ceremony
+    }
+    if path == "/api/user/profile" {
+        return AdminRole::ReadOnly;
+    }
+
+    // Device endpoints
+    if path == "/api/devices" && *method == Method::POST {
+        return AdminRole::DeviceManager;
+    }
+    if path == "/api/devices" && *method == Method::GET {
+        return AdminRole::Auditor;
+    }
+
+    // Portal management: UserManager or above
+    if path == "/api/portals" && *method == Method::POST {
+        return AdminRole::UserManager;
+    }
+    if path == "/api/portals" && *method == Method::GET {
+        return AdminRole::Auditor;
+    }
+    if path.starts_with("/api/portals/") && *method == Method::DELETE {
+        return AdminRole::UserManager;
+    }
+    if path == "/api/portals/check-access" {
+        return AdminRole::ReadOnly;
+    }
+
+    // KT endpoints: read-only
+    if path.starts_with("/api/kt/") {
+        return AdminRole::ReadOnly;
+    }
+
+    // Token revocation: UserManager or SuperAdmin
+    if path == "/api/tokens/revoke" {
+        return AdminRole::UserManager;
+    }
+
+    // Developer mode: SuperAdmin only
+    if path.starts_with("/api/admin/developer-mode") {
+        return AdminRole::SuperAdmin;
+    }
+
+    // Ceremony endpoints: SuperAdmin only
+    if path.starts_with("/api/ceremony/") || path == "/api/ceremony/initiate" || path == "/api/ceremony/approve" {
+        return AdminRole::SuperAdmin;
+    }
+
+    // Pending admin actions: SuperAdmin only
+    if path.starts_with("/api/admin/actions") {
+        return AdminRole::SuperAdmin;
+    }
+
+    // Recovery endpoints
+    if path.starts_with("/api/recovery/") {
+        return AdminRole::UserManager;
+    }
+
+    // Auth, OAuth, FIDO, setup, and public endpoints are handled by auth_middleware
+    // before RBAC is checked (they are exempt from admin RBAC).
+    // For everything else: fail-closed to SuperAdmin.
+    AdminRole::SuperAdmin
+}
+
+/// Extension to carry the authenticated admin role through the request.
+#[derive(Debug, Clone, Copy)]
+pub struct AuthAdminRole(pub AdminRole);
+
+// ---------------------------------------------------------------------------
+// Pending Admin Actions — two-person approval for destructive operations
+// ---------------------------------------------------------------------------
+
+/// Maximum pending admin actions to prevent memory exhaustion.
+const MAX_PENDING_ADMIN_ACTIONS: usize = 1_000;
+
+/// TTL for pending admin actions (30 minutes).
+const PENDING_ADMIN_ACTION_TTL_SECS: i64 = 30 * 60;
+
+/// Actions that require multi-person ceremony approval before execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DestructiveAction {
+    /// Delete a user and all associated data.
+    UserDeletion,
+    /// Change a user's security tier.
+    TierChange,
+    /// Trigger key rotation for the system.
+    KeyRotation,
+    /// Bulk revocation of device credentials.
+    BulkDeviceRevocation,
+}
+
+impl DestructiveAction {
+    /// Number of approvals required for this action type.
+    pub fn required_approvals(&self) -> usize {
+        match self {
+            Self::UserDeletion => 2,
+            Self::TierChange => 2,
+            Self::KeyRotation => 3, // Higher bar for key rotation
+            Self::BulkDeviceRevocation => 2,
+        }
+    }
+}
+
+impl std::fmt::Display for DestructiveAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UserDeletion => write!(f, "user_deletion"),
+            Self::TierChange => write!(f, "tier_change"),
+            Self::KeyRotation => write!(f, "key_rotation"),
+            Self::BulkDeviceRevocation => write!(f, "bulk_device_revocation"),
+        }
+    }
+}
+
+/// A pending destructive admin action awaiting multi-person approval.
+#[derive(Clone, Serialize)]
+pub struct PendingAdminAction {
+    /// Unique ID for this pending action.
+    pub action_id: Uuid,
+    /// The destructive action being requested.
+    pub action_type: DestructiveAction,
+    /// Serialized parameters for the action (JSON).
+    pub parameters: String,
+    /// Who initiated this action.
+    pub initiator: Uuid,
+    /// Approvals received: (approver_id, hmac_signature).
+    pub approvals: Vec<(Uuid, Vec<u8>)>,
+    /// Number of approvals required.
+    pub required_approvals: usize,
+    /// When this action was created (epoch seconds).
+    pub created_at: i64,
+    /// When this action expires (epoch seconds).
+    pub expires_at: i64,
+}
+
+/// Request to submit a destructive admin action for approval.
+#[derive(Deserialize)]
+pub struct SubmitAdminActionRequest {
+    pub action_type: DestructiveAction,
+    pub parameters: serde_json::Value,
+}
+
+/// Response after submitting a destructive admin action.
+#[derive(Serialize)]
+pub struct SubmitAdminActionResponse {
+    pub action_id: Uuid,
+    pub required_approvals: usize,
+    pub expires_at: i64,
+}
+
+/// Request to approve a pending admin action.
+#[derive(Deserialize)]
+pub struct ApproveAdminActionRequest {
+    pub action_id: Uuid,
+    /// HMAC-SHA512 signature over the action_id, proving cryptographic
+    /// binding between the approver and this specific action. Hex-encoded.
+    pub signature: String,
+}
+
+/// Response after approving a pending admin action.
+#[derive(Serialize)]
+pub struct ApproveAdminActionResponse {
+    pub approved: bool,
+    pub complete: bool,
+    pub approvals: usize,
+    pub required: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Compute the expected HMAC-SHA512 signature for an admin action approval.
+fn compute_admin_action_approval_hmac(action_id: &Uuid, approver_id: &Uuid) -> Vec<u8> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha512;
+    type HmacSha512 = Hmac<Sha512>;
+
+    let master_kek = common::sealed_keys::load_master_kek();
+    let derived = {
+        use hkdf::Hkdf;
+        let hk = Hkdf::<Sha512>::new(Some(common::domain::PENDING_ADMIN_ACTION), &master_kek);
+        let mut okm = [0u8; 64];
+        hk.expand(approver_id.as_bytes(), &mut okm)
+            .expect("HKDF expand");
+        okm
+    };
+    let mut mac = HmacSha512::new_from_slice(&derived).expect("HMAC key");
+    mac.update(action_id.as_bytes());
+    mac.finalize().into_bytes().to_vec()
+}
+
+/// Verify an admin action approval signature from an approver.
+fn verify_admin_action_approval(
+    action_id: &Uuid,
+    approver_id: &Uuid,
+    provided_signature: &[u8],
+) -> bool {
+    let expected = compute_admin_action_approval_hmac(action_id, approver_id);
+    crypto::ct::ct_eq(&expected, provided_signature)
+}
+
+// ---------------------------------------------------------------------------
 // Shared application state
 // ---------------------------------------------------------------------------
 
@@ -223,6 +575,8 @@ pub struct AppState {
     pub developer_mode: AtomicBool,
     /// Atomic log-level flag (0 = Verbose, 1 = Error).
     pub developer_log_level: AtomicU8,
+    /// Pending destructive admin actions awaiting multi-person approval.
+    pub pending_admin_actions: RwLock<HashMap<Uuid, PendingAdminAction>>,
 }
 
 /// Entry in the access_tokens map, pairing a user ID with a last-activity
@@ -471,6 +825,25 @@ async fn auth_middleware(
             // Use constant-time comparison to prevent timing side-channels.
             if crypto::ct::ct_eq(token.as_bytes(), state.admin_api_key.as_bytes()) {
                 request.extensions_mut().insert(AuthTier(1));
+                request.extensions_mut().insert(AuthAdminRole(AdminRole::SuperAdmin));
+                return Ok(next.run(request).await);
+            }
+
+            // Check per-role admin API keys derived from master KEK.
+            if let Some(role) = resolve_admin_role(token) {
+                // Role-based key authenticated — check RBAC permission
+                let req_path = request.uri().path().to_string();
+                let req_method = request.method().clone();
+                let required = required_role_for_route(&req_path, &req_method);
+                if !role.satisfies(required) {
+                    tracing::warn!(
+                        "RBAC denied: role {} insufficient for {} {} (requires {})",
+                        role, req_method, req_path, required
+                    );
+                    return Err(StatusCode::FORBIDDEN);
+                }
+                request.extensions_mut().insert(AuthTier(1));
+                request.extensions_mut().insert(AuthAdminRole(role));
                 return Ok(next.run(request).await);
             }
             // Try opaque token format first (32-byte hex handle)
@@ -977,6 +1350,12 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/admin/developer-mode", get(get_developer_mode))
         // Live SIEM event stream (SSE)
         .route("/api/admin/siem/stream", get(siem_stream))
+        // ── Admin RBAC & two-person ceremony endpoints ──
+        .route("/api/admin/actions/submit", post(submit_admin_action))
+        .route("/api/admin/actions/approve", post(approve_admin_action))
+        .route("/api/admin/actions/pending", get(list_pending_admin_actions))
+        .route("/api/admin/actions/{id}", get(get_admin_action_status))
+        .route("/api/admin/role-keys", get(get_admin_role_keys))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .layer(middleware::from_fn(origin_and_content_type_middleware))
         .layer(middleware::from_fn(security_headers_middleware))
@@ -4268,4 +4647,605 @@ async fn recovery_revoke_all(
         "revoked": true,
         "deleted_count": deleted,
     })))
+}
+
+// ---------------------------------------------------------------------------
+// Handlers — Admin RBAC & Two-Person Ceremony for Destructive Operations
+// ---------------------------------------------------------------------------
+
+/// POST /api/admin/actions/submit — Submit a destructive action for multi-person approval.
+///
+/// Requires SuperAdmin role. The action is queued and requires the configured
+/// number of additional approvals before execution.
+async fn submit_admin_action(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Json<SubmitAdminActionResponse>, StatusCode> {
+    let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(255);
+    check_tier(caller_tier, 1)?;
+
+    // Enforce SuperAdmin role
+    let caller_role = request
+        .extensions()
+        .get::<AuthAdminRole>()
+        .map(|r| r.0)
+        .unwrap_or(AdminRole::ReadOnly);
+    if !caller_role.satisfies(AdminRole::SuperAdmin) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let initiator = extract_user_id_from_request(&request).unwrap_or_else(Uuid::nil);
+
+    let body = axum::body::to_bytes(request.into_body(), 1024 * 64)
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let req: SubmitAdminActionRequest =
+        serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let now = now_secs();
+    let action_id = Uuid::new_v4();
+    let required_approvals = req.action_type.required_approvals();
+    let action = PendingAdminAction {
+        action_id,
+        action_type: req.action_type,
+        parameters: serde_json::to_string(&req.parameters).unwrap_or_default(),
+        initiator,
+        approvals: Vec::new(),
+        required_approvals,
+        created_at: now,
+        expires_at: now + PENDING_ADMIN_ACTION_TTL_SECS,
+    };
+
+    let mut actions = state.pending_admin_actions.write().await;
+
+    // Enforce capacity
+    if actions.len() >= MAX_PENDING_ADMIN_ACTIONS {
+        // Evict expired actions
+        let cutoff = now;
+        actions.retain(|_, a| a.expires_at > cutoff);
+        if actions.len() >= MAX_PENDING_ADMIN_ACTIONS {
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+    }
+
+    actions.insert(action_id, action);
+
+    // Audit log the submission
+    let mut audit = state.audit_log.write().await;
+    audit.append_signed(
+        common::types::AuditEventType::AdminCeremonyRequired,
+        vec![initiator],
+        vec![],
+        0.0,
+        vec![],
+        &state.pq_signing_key,
+    );
+
+    tracing::info!(
+        "Destructive admin action {} submitted by {}: {:?} (requires {} approvals)",
+        action_id,
+        initiator,
+        req.action_type,
+        required_approvals,
+    );
+
+    Ok(Json(SubmitAdminActionResponse {
+        action_id,
+        required_approvals,
+        expires_at: now + PENDING_ADMIN_ACTION_TTL_SECS,
+    }))
+}
+
+/// POST /api/admin/actions/approve — Approve a pending destructive admin action.
+///
+/// The approver must provide an HMAC-SHA512 signature over the action_id.
+/// The initiator cannot approve their own action. Each approver can only
+/// approve once.
+async fn approve_admin_action(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Json<ApproveAdminActionResponse>, StatusCode> {
+    let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(255);
+    check_tier(caller_tier, 1)?;
+
+    let caller_role = request
+        .extensions()
+        .get::<AuthAdminRole>()
+        .map(|r| r.0)
+        .unwrap_or(AdminRole::ReadOnly);
+    if !caller_role.satisfies(AdminRole::SuperAdmin) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let approver = extract_user_id_from_request(&request).unwrap_or_else(Uuid::nil);
+
+    let body = axum::body::to_bytes(request.into_body(), 1024 * 64)
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let req: ApproveAdminActionRequest =
+        serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    // Verify the approver's cryptographic signature
+    let provided_sig = hex::decode(&req.signature).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if !verify_admin_action_approval(&req.action_id, &approver, &provided_sig) {
+        return Ok(Json(ApproveAdminActionResponse {
+            approved: false,
+            complete: false,
+            approvals: 0,
+            required: 0,
+            error: Some("invalid admin action approval signature".into()),
+        }));
+    }
+
+    let mut actions = state.pending_admin_actions.write().await;
+    let action = actions
+        .get_mut(&req.action_id)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let now = now_secs();
+
+    // Check expiry
+    if now > action.expires_at {
+        let required = action.required_approvals;
+        actions.remove(&req.action_id);
+        return Ok(Json(ApproveAdminActionResponse {
+            approved: false,
+            complete: false,
+            approvals: 0,
+            required,
+            error: Some("admin action expired".into()),
+        }));
+    }
+
+    // Approver cannot be the initiator
+    if approver == action.initiator {
+        return Ok(Json(ApproveAdminActionResponse {
+            approved: false,
+            complete: false,
+            approvals: action.approvals.len(),
+            required: action.required_approvals,
+            error: Some("initiator cannot approve their own action".into()),
+        }));
+    }
+
+    // Approver cannot approve twice
+    if action.approvals.iter().any(|(uid, _)| *uid == approver) {
+        return Ok(Json(ApproveAdminActionResponse {
+            approved: false,
+            complete: false,
+            approvals: action.approvals.len(),
+            required: action.required_approvals,
+            error: Some("already approved".into()),
+        }));
+    }
+
+    action.approvals.push((approver, provided_sig));
+    let approvals = action.approvals.len();
+    let required = action.required_approvals;
+    let complete = approvals >= required;
+
+    if complete {
+        tracing::info!(
+            "Admin action {} ({:?}) fully approved — {} approvals received",
+            req.action_id,
+            action.action_type,
+            approvals,
+        );
+        actions.remove(&req.action_id);
+    }
+
+    Ok(Json(ApproveAdminActionResponse {
+        approved: true,
+        complete,
+        approvals,
+        required,
+        error: None,
+    }))
+}
+
+/// GET /api/admin/actions/pending — List all pending destructive admin actions.
+async fn list_pending_admin_actions(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let actions = state.pending_admin_actions.read().await;
+    let now = now_secs();
+    let items: Vec<serde_json::Value> = actions
+        .values()
+        .filter(|a| a.expires_at > now)
+        .map(|a| {
+            serde_json::json!({
+                "action_id": a.action_id.to_string(),
+                "action_type": format!("{}", a.action_type),
+                "initiator": a.initiator.to_string(),
+                "approvals": a.approvals.len(),
+                "required_approvals": a.required_approvals,
+                "created_at": a.created_at,
+                "expires_at": a.expires_at,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "pending_actions": items, "count": items.len() }))
+}
+
+/// GET /api/admin/actions/{id} — Get the status of a specific pending admin action.
+async fn get_admin_action_status(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let actions = state.pending_admin_actions.read().await;
+    let action = actions.get(&id).ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(serde_json::json!({
+        "action_id": action.action_id.to_string(),
+        "action_type": format!("{}", action.action_type),
+        "parameters": action.parameters,
+        "initiator": action.initiator.to_string(),
+        "approvals": action.approvals.len(),
+        "required_approvals": action.required_approvals,
+        "created_at": action.created_at,
+        "expires_at": action.expires_at,
+        "expired": now_secs() > action.expires_at,
+    })))
+}
+
+/// GET /api/admin/role-keys — Show derived admin role API keys (SuperAdmin only).
+///
+/// Returns the hex-encoded API keys for each admin role. These keys are
+/// derived from the master KEK and can be distributed to operators based
+/// on their assigned role.
+async fn get_admin_role_keys(
+    request: Request,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let caller_role = request
+        .extensions()
+        .get::<AuthAdminRole>()
+        .map(|r| r.0)
+        .unwrap_or(AdminRole::ReadOnly);
+    if !caller_role.satisfies(AdminRole::SuperAdmin) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let keys: Vec<serde_json::Value> = [
+        AdminRole::SuperAdmin,
+        AdminRole::UserManager,
+        AdminRole::DeviceManager,
+        AdminRole::Auditor,
+        AdminRole::ReadOnly,
+    ]
+    .iter()
+    .map(|role| {
+        serde_json::json!({
+            "role": role.key_label(),
+            "api_key": derive_admin_role_key(*role),
+        })
+    })
+    .collect();
+
+    Ok(Json(serde_json::json!({ "role_keys": keys })))
+}
+
+// ---------------------------------------------------------------------------
+// Unit Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Admin Role RBAC Tests ──────────────────────────────────────────────
+
+    #[test]
+    fn superadmin_satisfies_all_roles() {
+        let sa = AdminRole::SuperAdmin;
+        assert!(sa.satisfies(AdminRole::SuperAdmin));
+        assert!(sa.satisfies(AdminRole::UserManager));
+        assert!(sa.satisfies(AdminRole::DeviceManager));
+        assert!(sa.satisfies(AdminRole::Auditor));
+        assert!(sa.satisfies(AdminRole::ReadOnly));
+    }
+
+    #[test]
+    fn user_manager_only_satisfies_user_manager_and_readonly() {
+        let um = AdminRole::UserManager;
+        assert!(!um.satisfies(AdminRole::SuperAdmin));
+        assert!(um.satisfies(AdminRole::UserManager));
+        assert!(!um.satisfies(AdminRole::DeviceManager));
+        assert!(!um.satisfies(AdminRole::Auditor));
+        assert!(um.satisfies(AdminRole::ReadOnly));
+    }
+
+    #[test]
+    fn device_manager_only_satisfies_device_manager_and_readonly() {
+        let dm = AdminRole::DeviceManager;
+        assert!(!dm.satisfies(AdminRole::SuperAdmin));
+        assert!(!dm.satisfies(AdminRole::UserManager));
+        assert!(dm.satisfies(AdminRole::DeviceManager));
+        assert!(!dm.satisfies(AdminRole::Auditor));
+        assert!(dm.satisfies(AdminRole::ReadOnly));
+    }
+
+    #[test]
+    fn auditor_satisfies_auditor_and_readonly() {
+        let aud = AdminRole::Auditor;
+        assert!(!aud.satisfies(AdminRole::SuperAdmin));
+        assert!(!aud.satisfies(AdminRole::UserManager));
+        assert!(!aud.satisfies(AdminRole::DeviceManager));
+        assert!(aud.satisfies(AdminRole::Auditor));
+        assert!(aud.satisfies(AdminRole::ReadOnly));
+    }
+
+    #[test]
+    fn readonly_only_satisfies_readonly() {
+        let ro = AdminRole::ReadOnly;
+        assert!(!ro.satisfies(AdminRole::SuperAdmin));
+        assert!(!ro.satisfies(AdminRole::UserManager));
+        assert!(!ro.satisfies(AdminRole::DeviceManager));
+        assert!(!ro.satisfies(AdminRole::Auditor));
+        assert!(ro.satisfies(AdminRole::ReadOnly));
+    }
+
+    // ── Route-to-Role Mapping Tests ────────────────────────────────────────
+
+    #[test]
+    fn health_endpoint_allows_readonly() {
+        assert_eq!(
+            required_role_for_route("/api/health", &Method::GET),
+            AdminRole::ReadOnly
+        );
+    }
+
+    #[test]
+    fn status_endpoint_allows_readonly() {
+        assert_eq!(
+            required_role_for_route("/api/status", &Method::GET),
+            AdminRole::ReadOnly
+        );
+    }
+
+    #[test]
+    fn audit_endpoint_requires_auditor() {
+        assert_eq!(
+            required_role_for_route("/api/audit", &Method::GET),
+            AdminRole::Auditor
+        );
+    }
+
+    #[test]
+    fn user_creation_requires_user_manager() {
+        assert_eq!(
+            required_role_for_route("/api/users", &Method::POST),
+            AdminRole::UserManager
+        );
+    }
+
+    #[test]
+    fn user_listing_requires_auditor() {
+        assert_eq!(
+            required_role_for_route("/api/users", &Method::GET),
+            AdminRole::Auditor
+        );
+    }
+
+    #[test]
+    fn user_deletion_requires_superadmin() {
+        assert_eq!(
+            required_role_for_route("/api/users/some-id", &Method::DELETE),
+            AdminRole::SuperAdmin
+        );
+    }
+
+    #[test]
+    fn device_enrollment_requires_device_manager() {
+        assert_eq!(
+            required_role_for_route("/api/devices", &Method::POST),
+            AdminRole::DeviceManager
+        );
+    }
+
+    #[test]
+    fn developer_mode_requires_superadmin() {
+        assert_eq!(
+            required_role_for_route("/api/admin/developer-mode", &Method::PUT),
+            AdminRole::SuperAdmin
+        );
+    }
+
+    #[test]
+    fn ceremony_endpoints_require_superadmin() {
+        assert_eq!(
+            required_role_for_route("/api/ceremony/initiate", &Method::POST),
+            AdminRole::SuperAdmin
+        );
+        assert_eq!(
+            required_role_for_route("/api/ceremony/approve", &Method::POST),
+            AdminRole::SuperAdmin
+        );
+    }
+
+    #[test]
+    fn unknown_route_defaults_to_superadmin() {
+        assert_eq!(
+            required_role_for_route("/api/unknown/endpoint", &Method::POST),
+            AdminRole::SuperAdmin
+        );
+    }
+
+    // ── Role Unauthorized Access Tests ─────────────────────────────────────
+
+    #[test]
+    fn auditor_cannot_create_users() {
+        let required = required_role_for_route("/api/users", &Method::POST);
+        assert!(!AdminRole::Auditor.satisfies(required));
+    }
+
+    #[test]
+    fn readonly_cannot_access_audit() {
+        let required = required_role_for_route("/api/audit", &Method::GET);
+        assert!(!AdminRole::ReadOnly.satisfies(required));
+    }
+
+    #[test]
+    fn device_manager_cannot_delete_users() {
+        let required = required_role_for_route("/api/users/some-id", &Method::DELETE);
+        assert!(!AdminRole::DeviceManager.satisfies(required));
+    }
+
+    #[test]
+    fn user_manager_cannot_manage_devices() {
+        let required = required_role_for_route("/api/devices", &Method::POST);
+        assert!(!AdminRole::UserManager.satisfies(required));
+    }
+
+    // ── Per-Role API Key Derivation Tests ──────────────────────────────────
+
+    #[test]
+    fn each_role_gets_unique_api_key() {
+        let roles = [
+            AdminRole::SuperAdmin,
+            AdminRole::UserManager,
+            AdminRole::DeviceManager,
+            AdminRole::Auditor,
+            AdminRole::ReadOnly,
+        ];
+        let keys: Vec<String> = roles.iter().map(|r| derive_admin_role_key(*r)).collect();
+        // All keys must be unique
+        let unique: HashSet<&String> = keys.iter().collect();
+        assert_eq!(keys.len(), unique.len(), "all role keys must be unique");
+    }
+
+    #[test]
+    fn role_key_derivation_is_deterministic() {
+        let key1 = derive_admin_role_key(AdminRole::Auditor);
+        let key2 = derive_admin_role_key(AdminRole::Auditor);
+        assert_eq!(key1, key2, "same role must produce same key");
+    }
+
+    #[test]
+    fn role_keys_are_64_hex_chars() {
+        for role in &[
+            AdminRole::SuperAdmin,
+            AdminRole::UserManager,
+            AdminRole::DeviceManager,
+            AdminRole::Auditor,
+            AdminRole::ReadOnly,
+        ] {
+            let key = derive_admin_role_key(*role);
+            assert_eq!(key.len(), 64, "key must be 64 hex chars (32 bytes)");
+            assert!(
+                key.chars().all(|c| c.is_ascii_hexdigit()),
+                "key must be hex-encoded"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_admin_role_matches_derived_keys() {
+        for role in &[
+            AdminRole::SuperAdmin,
+            AdminRole::UserManager,
+            AdminRole::DeviceManager,
+            AdminRole::Auditor,
+            AdminRole::ReadOnly,
+        ] {
+            let key = derive_admin_role_key(*role);
+            let resolved = resolve_admin_role(&key);
+            assert_eq!(resolved, Some(*role), "key should resolve back to {:?}", role);
+        }
+    }
+
+    #[test]
+    fn resolve_admin_role_rejects_unknown_key() {
+        assert_eq!(resolve_admin_role("not-a-valid-key"), None);
+    }
+
+    // ── AdminRole from_u8 Tests ────────────────────────────────────────────
+
+    #[test]
+    fn admin_role_from_u8_valid() {
+        assert_eq!(AdminRole::from_u8(0), Some(AdminRole::SuperAdmin));
+        assert_eq!(AdminRole::from_u8(1), Some(AdminRole::UserManager));
+        assert_eq!(AdminRole::from_u8(2), Some(AdminRole::DeviceManager));
+        assert_eq!(AdminRole::from_u8(3), Some(AdminRole::Auditor));
+        assert_eq!(AdminRole::from_u8(4), Some(AdminRole::ReadOnly));
+    }
+
+    #[test]
+    fn admin_role_from_u8_invalid() {
+        assert_eq!(AdminRole::from_u8(5), None);
+        assert_eq!(AdminRole::from_u8(255), None);
+    }
+
+    // ── Destructive Action Tests ───────────────────────────────────────────
+
+    #[test]
+    fn destructive_actions_require_multiple_approvals() {
+        assert!(DestructiveAction::UserDeletion.required_approvals() >= 2);
+        assert!(DestructiveAction::TierChange.required_approvals() >= 2);
+        assert!(DestructiveAction::KeyRotation.required_approvals() >= 2);
+        assert!(DestructiveAction::BulkDeviceRevocation.required_approvals() >= 2);
+    }
+
+    #[test]
+    fn key_rotation_requires_most_approvals() {
+        assert!(
+            DestructiveAction::KeyRotation.required_approvals()
+                > DestructiveAction::UserDeletion.required_approvals(),
+            "key rotation should require more approvals than user deletion"
+        );
+    }
+
+    // ── Admin Action Approval HMAC Tests ───────────────────────────────────
+
+    #[test]
+    fn admin_action_approval_hmac_is_deterministic() {
+        let action_id = Uuid::new_v4();
+        let approver_id = Uuid::new_v4();
+        let sig1 = compute_admin_action_approval_hmac(&action_id, &approver_id);
+        let sig2 = compute_admin_action_approval_hmac(&action_id, &approver_id);
+        assert_eq!(sig1, sig2);
+    }
+
+    #[test]
+    fn admin_action_approval_hmac_differs_per_action() {
+        let a1 = Uuid::new_v4();
+        let a2 = Uuid::new_v4();
+        let approver = Uuid::new_v4();
+        let sig1 = compute_admin_action_approval_hmac(&a1, &approver);
+        let sig2 = compute_admin_action_approval_hmac(&a2, &approver);
+        assert_ne!(sig1, sig2, "different actions must produce different signatures");
+    }
+
+    #[test]
+    fn admin_action_approval_hmac_differs_per_approver() {
+        let action_id = Uuid::new_v4();
+        let approver1 = Uuid::new_v4();
+        let approver2 = Uuid::new_v4();
+        let sig1 = compute_admin_action_approval_hmac(&action_id, &approver1);
+        let sig2 = compute_admin_action_approval_hmac(&action_id, &approver2);
+        assert_ne!(sig1, sig2, "different approvers must produce different signatures");
+    }
+
+    #[test]
+    fn verify_admin_action_approval_valid() {
+        let action_id = Uuid::new_v4();
+        let approver = Uuid::new_v4();
+        let sig = compute_admin_action_approval_hmac(&action_id, &approver);
+        assert!(verify_admin_action_approval(&action_id, &approver, &sig));
+    }
+
+    #[test]
+    fn verify_admin_action_approval_wrong_signature_rejected() {
+        let action_id = Uuid::new_v4();
+        let approver = Uuid::new_v4();
+        let wrong_sig = vec![0xFFu8; 64];
+        assert!(!verify_admin_action_approval(&action_id, &approver, &wrong_sig));
+    }
+
+    #[test]
+    fn verify_admin_action_approval_wrong_approver_rejected() {
+        let action_id = Uuid::new_v4();
+        let real_approver = Uuid::new_v4();
+        let fake_approver = Uuid::new_v4();
+        let sig = compute_admin_action_approval_hmac(&action_id, &real_approver);
+        assert!(!verify_admin_action_approval(&action_id, &fake_approver, &sig));
+    }
 }

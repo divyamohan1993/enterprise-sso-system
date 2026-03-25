@@ -27,6 +27,10 @@ pub mod platform_integrity;
 pub mod measured_boot;
 pub mod startup_checks;
 
+// ── Classification and cross-domain guard ──
+pub mod classification;
+pub mod cross_domain;
+
 // ── Security infrastructure ──
 pub mod session_limits;
 pub mod circuit_breaker;
@@ -36,6 +40,12 @@ pub mod retry;
 pub mod health;
 pub mod recovery;
 pub mod totp;
+pub mod backup;
 
 // ── Developer mode & error response sanitisation ──
 pub mod error_response;
+
+// ── Observability & incident response ──
+pub mod structured_logging;
+pub mod metrics;
+pub mod incident_response;

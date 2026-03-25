@@ -1,0 +1,228 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# MILNET SSO — Prometheus Scrape Configuration
+# ──────────────────────────────────────────────────────────────────────────────
+# GKE Managed Prometheus is enabled on the cluster. This config defines
+# PodMonitoring resources that tell GMP which pods to scrape.
+# ──────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+---
+# ── Gateway Service Metrics ──
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: milnet-gateway
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gateway
+  endpoints:
+    - port: metrics
+      interval: 15s
+      path: /metrics
+---
+# ── Orchestrator Service Metrics ──
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: milnet-orchestrator
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/name: orchestrator
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: orchestrator
+  endpoints:
+    - port: metrics
+      interval: 15s
+      path: /metrics
+---
+# ── Verifier Service Metrics ──
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: milnet-verifier
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/name: verifier
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: verifier
+  endpoints:
+    - port: metrics
+      interval: 15s
+      path: /metrics
+---
+# ── Ratchet Service Metrics ──
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: milnet-ratchet
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/name: ratchet
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ratchet
+  endpoints:
+    - port: metrics
+      interval: 15s
+      path: /metrics
+---
+# ── Risk Scoring Service Metrics ──
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: milnet-risk
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/name: risk
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: risk
+  endpoints:
+    - port: metrics
+      interval: 15s
+      path: /metrics
+---
+# ── Audit Service Metrics ──
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: milnet-audit
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/name: audit
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: audit
+  endpoints:
+    - port: metrics
+      interval: 15s
+      path: /metrics
+---
+# ── TSS (Threshold Signing) Service Metrics ──
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: milnet-tss
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/name: tss
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tss
+  endpoints:
+    - port: metrics
+      interval: 15s
+      path: /metrics
+---
+# ── Admin Service Metrics ──
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: milnet-admin
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/name: admin
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: admin
+  endpoints:
+    - port: metrics
+      interval: 15s
+      path: /metrics
+---
+# ── OPAQUE Service Metrics ──
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: milnet-opaque
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/name: opaque
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: opaque
+  endpoints:
+    - port: metrics
+      interval: 15s
+      path: /metrics
+---
+# ── FIDO Service Metrics ──
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: milnet-fido
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/name: fido
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fido
+  endpoints:
+    - port: metrics
+      interval: 15s
+      path: /metrics
+---
+# ── Key Transparency Service Metrics ──
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: milnet-kt
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/name: kt
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kt
+  endpoints:
+    - port: metrics
+      interval: 15s
+      path: /metrics
+---
+# ── SHARD Transport Metrics ──
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: milnet-shard
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/name: shard
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: shard
+  endpoints:
+    - port: metrics
+      interval: 15s
+      path: /metrics

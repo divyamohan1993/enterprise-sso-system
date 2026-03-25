@@ -160,6 +160,13 @@ pub struct PuzzleChallenge {
     /// return the ciphertext with their puzzle solution.
     #[serde(default)]
     pub xwing_server_pk: Option<Vec<u8>>,
+    /// SHA-256 fingerprint of the server's X-Wing public key (hex-encoded).
+    /// Clients SHOULD verify this against a pinned set of trusted fingerprints
+    /// before encapsulating.  If the fingerprint does not match, the client
+    /// MUST abort the connection — a mismatch indicates a potential key
+    /// substitution or man-in-the-middle attack.
+    #[serde(default)]
+    pub xwing_server_pk_fingerprint: Option<String>,
 }
 
 /// A client's solution to a [`PuzzleChallenge`].
@@ -189,6 +196,7 @@ pub fn generate_challenge(difficulty: u8) -> PuzzleChallenge {
         difficulty,
         timestamp,
         xwing_server_pk: None,
+        xwing_server_pk_fingerprint: None,
     }
 }
 

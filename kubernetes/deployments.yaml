@@ -1,0 +1,965 @@
+---
+# ==============================================================================
+# MILNET SSO — Kubernetes Deployments
+# ==============================================================================
+# All 8 services + PostgreSQL as Deployments with:
+#   - Resource limits matching docker-compose
+#   - Liveness and readiness probes
+#   - Restricted security contexts
+#   - Anti-affinity for TSS nodes (spread across physical hosts)
+# ==============================================================================
+
+# --- Gateway Deployment ---
+# Test: kubectl exec into gateway pod and attempt to write to /
+#   Expected: read-only filesystem error (readOnlyRootFilesystem: true)
+# Test: kubectl exec and run `id` inside gateway pod
+#   Expected: uid=1000 (runAsNonRoot enforced)
+# Test: kubectl exec and run `cat /proc/1/status | grep CapEff`
+#   Expected: 0000000000000000 (all capabilities dropped)
+# Test: verify gateway pods are spread across nodes
+#   Expected: topologySpreadConstraints maxSkew=1
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: milnet-sso
+  labels:
+    app: gateway
+    tier: bastion
+    version: v1
+    app.kubernetes.io/part-of: milnet-sso
+    app.kubernetes.io/component: gateway
+  annotations:
+    milnet.io/test-readonly-fs: "exec-touch-tmp-file-expect-ok-touch-root-file-expect-fail"
+    milnet.io/test-nonroot: "exec-id-expect-uid-1000"
+    milnet.io/test-caps: "exec-cat-proc-status-expect-zero-caps"
+    milnet.io/test-spread: "get-pods-wide-verify-different-nodes"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: gateway
+  template:
+    metadata:
+      labels:
+        app: gateway
+        tier: bastion
+        version: v1
+        app.kubernetes.io/part-of: milnet-sso
+        app.kubernetes.io/component: gateway
+    spec:
+      serviceAccountName: gateway
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: gateway
+          image: gcr.io/milnet-sso/gateway:latest
+          ports:
+            - containerPort: 9100
+              protocol: TCP
+              name: shard
+          env:
+            - name: GATEWAY_PORT
+              value: "9100"
+            - name: GATEWAY_BIND_ADDR
+              value: "0.0.0.0"
+            - name: ORCHESTRATOR_ADDR
+              value: "orchestrator:9101"
+            - name: RUST_LOG
+              valueFrom:
+                configMapKeyRef:
+                  name: milnet-config
+                  key: rust-log
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "250m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          livenessProbe:
+            tcpSocket:
+              port: 9100
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: 9100
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: gateway
+
+---
+# --- Orchestrator Deployment ---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orchestrator
+  namespace: milnet-sso
+  labels:
+    app: orchestrator
+    tier: auth
+    version: v1
+    app.kubernetes.io/part-of: milnet-sso
+    app.kubernetes.io/component: orchestrator
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: orchestrator
+  template:
+    metadata:
+      labels:
+        app: orchestrator
+        tier: auth
+        version: v1
+        app.kubernetes.io/part-of: milnet-sso
+        app.kubernetes.io/component: orchestrator
+    spec:
+      serviceAccountName: orchestrator
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: orchestrator
+          image: gcr.io/milnet-sso/orchestrator:latest
+          ports:
+            - containerPort: 9101
+              protocol: TCP
+              name: shard
+          env:
+            - name: ORCH_LISTEN_ADDR
+              value: "0.0.0.0:9101"
+            - name: OPAQUE_ADDR
+              value: "opaque:9102"
+            - name: TSS_ADDR
+              value: "tss:9103"
+            - name: RUST_LOG
+              valueFrom:
+                configMapKeyRef:
+                  name: milnet-config
+                  key: rust-log
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "250m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          livenessProbe:
+            tcpSocket:
+              port: 9101
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: 9101
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+
+---
+# --- OPAQUE Deployment ---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opaque
+  namespace: milnet-sso
+  labels:
+    app: opaque
+    tier: auth
+    version: v1
+    app.kubernetes.io/part-of: milnet-sso
+    app.kubernetes.io/component: opaque
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: opaque
+  template:
+    metadata:
+      labels:
+        app: opaque
+        tier: auth
+        version: v1
+        app.kubernetes.io/part-of: milnet-sso
+        app.kubernetes.io/component: opaque
+    spec:
+      serviceAccountName: opaque
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: opaque
+          image: gcr.io/milnet-sso/opaque:latest
+          ports:
+            - containerPort: 9102
+              protocol: TCP
+              name: shard
+          env:
+            - name: OPAQUE_ADDR
+              value: "0.0.0.0:9102"
+            - name: RUST_LOG
+              valueFrom:
+                configMapKeyRef:
+                  name: milnet-config
+                  key: rust-log
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "250m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          livenessProbe:
+            tcpSocket:
+              port: 9102
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: 9102
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+
+---
+# --- TSS Deployment (with anti-affinity for FROST threshold) ---
+# Test: verify 5 TSS pods are on 5 different nodes (hard anti-affinity)
+#   Expected: kubectl get pods -l app=tss -o wide shows 5 unique NODE values
+#   If cluster has < 5 nodes, pods will be Pending (requiredDuringScheduling)
+# Test: delete 2 TSS pods and verify FROST threshold (t=3) is still met
+#   Expected: 3 remaining pods can still produce signatures
+# Test: verify TSS_NODE_ID is derived from pod name (metadata.name)
+#   Expected: each pod has a unique TSS_NODE_ID
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tss
+  namespace: milnet-sso
+  labels:
+    app: tss
+    tier: auth
+    version: v1
+    app.kubernetes.io/part-of: milnet-sso
+    app.kubernetes.io/component: tss
+  annotations:
+    milnet.io/test-anti-affinity: "get-pods-wide-verify-5-unique-nodes"
+    milnet.io/test-frost-threshold: "delete-2-pods-verify-signing-still-works"
+    milnet.io/test-node-id: "exec-env-verify-TSS_NODE_ID-matches-pod-name"
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: tss
+  template:
+    metadata:
+      labels:
+        app: tss
+        tier: auth
+        version: v1
+        app.kubernetes.io/part-of: milnet-sso
+        app.kubernetes.io/component: tss
+    spec:
+      serviceAccountName: tss
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      # Anti-affinity: spread TSS nodes across different physical hosts
+      # so that compromising one host cannot exceed the FROST threshold
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values:
+                      - tss
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: tss
+          image: gcr.io/milnet-sso/tss:latest
+          ports:
+            - containerPort: 9103
+              protocol: TCP
+              name: shard
+          env:
+            - name: TSS_ADDR
+              value: "0.0.0.0:9103"
+            - name: TSS_TOTAL_NODES
+              value: "5"
+            - name: TSS_THRESHOLD
+              value: "3"
+            - name: TSS_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: RUST_LOG
+              valueFrom:
+                configMapKeyRef:
+                  name: milnet-config
+                  key: rust-log
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "250m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          livenessProbe:
+            tcpSocket:
+              port: 9103
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: 9103
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+
+---
+# --- Verifier Deployment ---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: verifier
+  namespace: milnet-sso
+  labels:
+    app: verifier
+    tier: verify
+    version: v1
+    app.kubernetes.io/part-of: milnet-sso
+    app.kubernetes.io/component: verifier
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: verifier
+  template:
+    metadata:
+      labels:
+        app: verifier
+        tier: verify
+        version: v1
+        app.kubernetes.io/part-of: milnet-sso
+        app.kubernetes.io/component: verifier
+    spec:
+      serviceAccountName: verifier
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: verifier
+          image: gcr.io/milnet-sso/verifier:latest
+          ports:
+            - containerPort: 9104
+              protocol: TCP
+              name: shard
+          env:
+            - name: VERIFIER_ADDR
+              value: "0.0.0.0:9104"
+            - name: RUST_LOG
+              valueFrom:
+                configMapKeyRef:
+                  name: milnet-config
+                  key: rust-log
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "250m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          livenessProbe:
+            tcpSocket:
+              port: 9104
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: 9104
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+
+---
+# --- Ratchet Deployment ---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ratchet
+  namespace: milnet-sso
+  labels:
+    app: ratchet
+    tier: verify
+    version: v1
+    app.kubernetes.io/part-of: milnet-sso
+    app.kubernetes.io/component: ratchet
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ratchet
+  template:
+    metadata:
+      labels:
+        app: ratchet
+        tier: verify
+        version: v1
+        app.kubernetes.io/part-of: milnet-sso
+        app.kubernetes.io/component: ratchet
+    spec:
+      serviceAccountName: ratchet
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: ratchet
+          image: gcr.io/milnet-sso/ratchet:latest
+          ports:
+            - containerPort: 9105
+              protocol: TCP
+              name: shard
+          env:
+            - name: RATCHET_ADDR
+              value: "0.0.0.0:9105"
+            - name: RUST_LOG
+              valueFrom:
+                configMapKeyRef:
+                  name: milnet-config
+                  key: rust-log
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "250m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          livenessProbe:
+            tcpSocket:
+              port: 9105
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: 9105
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+
+---
+# --- Audit Deployment ---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: audit
+  namespace: milnet-sso
+  labels:
+    app: audit
+    tier: support
+    version: v1
+    app.kubernetes.io/part-of: milnet-sso
+    app.kubernetes.io/component: audit
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: audit
+  template:
+    metadata:
+      labels:
+        app: audit
+        tier: support
+        version: v1
+        app.kubernetes.io/part-of: milnet-sso
+        app.kubernetes.io/component: audit
+    spec:
+      serviceAccountName: audit
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: audit
+          image: gcr.io/milnet-sso/audit:latest
+          ports:
+            - containerPort: 9108
+              protocol: TCP
+              name: shard
+          env:
+            - name: AUDIT_ADDR
+              value: "0.0.0.0:9108"
+            - name: AUDIT_DATA_DIR
+              value: /var/lib/milnet/audit
+            - name: RUST_LOG
+              valueFrom:
+                configMapKeyRef:
+                  name: milnet-config
+                  key: rust-log
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "250m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: audit-data
+              mountPath: /var/lib/milnet/audit
+          livenessProbe:
+            tcpSocket:
+              port: 9108
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: 9108
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: audit-data
+          persistentVolumeClaim:
+            claimName: audit-data-pvc
+
+---
+# --- Admin Deployment ---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: admin
+  namespace: milnet-sso
+  labels:
+    app: admin
+    tier: bastion
+    version: v1
+    app.kubernetes.io/part-of: milnet-sso
+    app.kubernetes.io/component: admin
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: admin
+  template:
+    metadata:
+      labels:
+        app: admin
+        tier: bastion
+        version: v1
+        app.kubernetes.io/part-of: milnet-sso
+        app.kubernetes.io/component: admin
+    spec:
+      serviceAccountName: admin
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: admin
+          image: gcr.io/milnet-sso/admin:latest
+          ports:
+            - containerPort: 8080
+              protocol: TCP
+              name: http
+          env:
+            - name: ADMIN_PORT
+              value: "8080"
+            - name: ADMIN_BIND_ADDR
+              value: "0.0.0.0"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: milnet-db-credentials
+                  key: database-url
+            - name: GATEWAY_ADDR
+              value: "gateway:9100"
+            - name: ORCHESTRATOR_ADDR
+              value: "orchestrator:9101"
+            - name: VERIFIER_ADDR
+              value: "verifier:9104"
+            - name: RATCHET_ADDR
+              value: "ratchet:9105"
+            - name: AUDIT_ADDR
+              value: "audit:9108"
+            - name: GOOGLE_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: milnet-oauth-credentials
+                  key: google-client-id
+                  optional: true
+            - name: GOOGLE_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: milnet-oauth-credentials
+                  key: google-client-secret
+                  optional: true
+            - name: SSO_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: milnet-config
+                  key: sso-base-url
+            - name: RUST_LOG
+              valueFrom:
+                configMapKeyRef:
+                  name: milnet-config
+                  key: rust-log
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "500m"
+            limits:
+              memory: "512Mi"
+              cpu: "1000m"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+
+---
+# --- PostgreSQL StatefulSet ---
+# Test: verify PVC is bound and data persists across pod restarts
+#   Expected: kubectl delete pod postgres-0 && wait; data still present
+# Test: verify postgres runs as uid 999 (not root)
+#   Expected: exec id -> uid=999
+# Test: verify readOnlyRootFilesystem with writable PGDATA via PVC
+#   Expected: touch /tmp/test -> ok; touch /etc/test -> read-only error
+# Test: verify pg_isready liveness probe works
+#   Expected: kubectl describe pod shows healthy liveness checks
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: milnet-sso
+  labels:
+    app: postgres
+    tier: data
+    version: v1
+    app.kubernetes.io/part-of: milnet-sso
+    app.kubernetes.io/component: database
+  annotations:
+    milnet.io/test-pvc-persist: "delete-pod-verify-data-survives"
+    milnet.io/test-nonroot: "exec-id-expect-uid-999"
+    milnet.io/test-readonly-fs: "exec-touch-etc-expect-fail-touch-tmp-expect-ok"
+    milnet.io/test-liveness: "describe-pod-verify-healthy-liveness"
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+        tier: data
+        version: v1
+        app.kubernetes.io/part-of: milnet-sso
+        app.kubernetes.io/component: database
+    spec:
+      serviceAccountName: postgres
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          image: postgres:15-alpine
+          ports:
+            - containerPort: 5432
+              protocol: TCP
+              name: postgresql
+          env:
+            - name: POSTGRES_DB
+              value: milnet_sso
+            - name: POSTGRES_USER
+              value: milnet
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: milnet-db-credentials
+                  key: password
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "500m"
+            limits:
+              memory: "512Mi"
+              cpu: "1000m"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 999
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+            - name: tmp
+              mountPath: /tmp
+            - name: run
+              mountPath: /run/postgresql
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - milnet
+                - -d
+                - milnet_sso
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 5
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - milnet
+                - -d
+                - milnet_sso
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: run
+          emptyDir:
+            sizeLimit: 16Mi
+  volumeClaimTemplates:
+    - metadata:
+        name: pgdata
+        labels:
+          app: postgres
+          app.kubernetes.io/part-of: milnet-sso
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+
+---
+# --- Audit PVC ---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: audit-data-pvc
+  namespace: milnet-sso
+  labels:
+    app: audit
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi

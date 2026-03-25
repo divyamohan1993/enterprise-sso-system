@@ -1,0 +1,28 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    app.kubernetes.io/managed-by: kubectl
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+  annotations:
+    description: "MILNET SSO system — military-grade enterprise single sign-on"
+    # ── Testing annotations ──────────────────────────────────────────────────
+    # Verify: kubectl get ns milnet-sso -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}'
+    #   Expected: "restricted"
+    # Verify: kubectl label --dry-run=server ns milnet-sso pod-security.kubernetes.io/enforce=privileged
+    #   Expected: warning about downgrade
+    # Test: deploy a privileged pod into this namespace
+    #   Expected: rejected by admission controller
+    # Test: deploy a pod with hostNetwork: true
+    #   Expected: rejected by restricted PSS
+    milnet.io/test-pss-enforce: "deploy-privileged-pod-expect-reject"
+    milnet.io/test-pss-hostnet: "deploy-hostnetwork-pod-expect-reject"
+    milnet.io/test-pss-caps: "deploy-pod-with-cap-add-expect-reject"

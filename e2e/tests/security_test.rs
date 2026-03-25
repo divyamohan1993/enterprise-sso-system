@@ -129,6 +129,7 @@ fn expired_token_rejected() {
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
         aud: None,
+        classification: 0,
     };
 
     let (pq_sk, pq_vk) = generate_pq_keypair();
@@ -166,6 +167,7 @@ fn tampered_token_rejected() {
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
         aud: None,
+        classification: 0,
     };
 
     let (pq_sk, pq_vk) = generate_pq_keypair();

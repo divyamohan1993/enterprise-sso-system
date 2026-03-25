@@ -20,6 +20,78 @@
 #   audit:        9108  (SHARD mTLS — audit logging)
 #   admin:        8080  (HTTP REST API)
 #   postgres:     5432  (PostgreSQL)
+#
+# ==============================================================================
+# NETWORK SEGMENTATION SECURITY MODEL
+# ==============================================================================
+#
+# Defense-in-depth via tiered Docker bridge networks.  Each network is an
+# isolated L2 broadcast domain.  A service can only reach peers on the same
+# network.  The `internal: true` flag on non-bastion networks prevents any
+# container on that network from reaching external IP addresses, enforcing
+# egress filtering at the Docker networking layer.
+#
+# Tier 0 — BASTION (milnet_bastion, internal: false)
+#   Purpose : Public-facing ingress.  Only the gateway and admin containers
+#             attach here.  This is the sole network with external reachability.
+#   Members : gateway, admin
+#   Threat  : Exposed to the internet; hardened with puzzle challenges,
+#             X-Wing KEM, and adaptive rate limiting.
+#
+# Tier 1 — AUTH CORE (milnet_auth, internal: true)
+#   Purpose : Authentication processing.  The orchestrator coordinates OPAQUE
+#             password verification and FROST threshold signing.  Gateway
+#             attaches to reach the orchestrator, but OPAQUE and TSS are
+#             invisible to external traffic.
+#   Members : gateway (egress to orchestrator only), orchestrator, opaque, tss
+#   Threat  : If gateway is compromised, the attacker can reach the
+#             orchestrator but not OPAQUE or TSS directly (those only accept
+#             connections from orchestrator via SHARD mTLS).
+#
+# Tier 2 — VERIFICATION (milnet_verify, internal: true)
+#   Purpose : Token verification and session ratcheting.  Verifier checks
+#             token signatures against TSS public keys; ratchet manages
+#             session key rotation.
+#   Members : verifier, ratchet, tss (for JWKS refresh)
+#   Threat  : Completely unreachable from the bastion tier.  Even a fully
+#             compromised gateway cannot reach verifier or ratchet.
+#
+# Tier 3 — SUPPORT (milnet_support, internal: true)
+#   Purpose : Audit logging, key transparency, risk assessment.  These
+#             services are write-heavy sinks that receive events from the
+#             auth and verify tiers.
+#   Members : audit, ratchet (for risk<->ratchet channel), orchestrator
+#   Threat  : Audit is append-only; compromise does not grant auth
+#             capabilities.  The internal flag prevents data exfiltration
+#             to external hosts.
+#
+# Tier 4 — DATA (milnet_data, internal: true)
+#   Purpose : Database access.  Only services that need persistent storage
+#             attach here.  PostgreSQL has zero outbound connectivity.
+#   Members : postgres, orchestrator, audit, admin
+#   Threat  : PostgreSQL is the highest-value target.  Only three services
+#             can reach it, and all require SHARD mTLS authentication.
+#
+# Communication matrix enforcement:
+#   The Rust communication matrix in common/src/network.rs is the
+#   authoritative source.  Docker networks provide coarse-grained
+#   segmentation; SHARD mTLS + the matrix provide fine-grained enforcement.
+#   A service on milnet_auth can only talk to peers on milnet_auth, but
+#   within that network, SHARD still rejects disallowed module pairs
+#   (e.g., gateway -> opaque is denied at the SHARD layer even though
+#   both are on milnet_auth).
+#
+# Egress filtering per service:
+#   gateway      — External (milnet_bastion): OAuth redirects, CRL checks
+#   orchestrator — Internal only: auth, support, data networks
+#   opaque       — Internal only: milnet_auth (orchestrator only via SHARD)
+#   tss          — Internal only: milnet_auth + milnet_verify
+#   verifier     — Internal only: milnet_verify
+#   ratchet      — Internal only: milnet_verify + milnet_support
+#   audit        — Internal only: milnet_support + milnet_data
+#   admin        — Internal + External (milnet_bastion): all tiers for mgmt
+#   postgres     — Internal only: milnet_data, zero outbound
+#
 # ==============================================================================
 
 services:
@@ -50,7 +122,7 @@ services:
       timeout: 5s
       retries: 10
     networks:
-      - milnet
+      - milnet_data
 
   # ── Audit Service ───────────────────────────────────────────────────────────
   # Started first (no service dependencies, other services log to it)
@@ -75,7 +147,8 @@ services:
     volumes:
       - audit_data:/var/lib/milnet/audit
     networks:
-      - milnet
+      - milnet_support
+      - milnet_data
     healthcheck:
       test: ["CMD-SHELL", "kill -0 1"]
       interval: 10s
@@ -101,7 +174,8 @@ services:
     mem_limit: 256m
     cpus: 0.5
     networks:
-      - milnet
+      - milnet_verify
+      - milnet_support
     healthcheck:
       test: ["CMD-SHELL", "kill -0 1"]
       interval: 10s
@@ -127,7 +201,7 @@ services:
     mem_limit: 256m
     cpus: 0.5
     networks:
-      - milnet
+      - milnet_auth
     healthcheck:
       test: ["CMD-SHELL", "kill -0 1"]
       interval: 10s
@@ -156,7 +230,8 @@ services:
     mem_limit: 256m
     cpus: 0.5
     networks:
-      - milnet
+      - milnet_auth
+      - milnet_verify
     healthcheck:
       test: ["CMD-SHELL", "kill -0 1"]
       interval: 10s
@@ -182,7 +257,7 @@ services:
     mem_limit: 256m
     cpus: 0.5
     networks:
-      - milnet
+      - milnet_verify
     healthcheck:
       test: ["CMD-SHELL", "kill -0 1"]
       interval: 10s
@@ -215,7 +290,9 @@ services:
       tss:
         condition: service_started
     networks:
-      - milnet
+      - milnet_auth
+      - milnet_support
+      - milnet_data
     healthcheck:
       test: ["CMD-SHELL", "kill -0 1"]
       interval: 10s
@@ -248,7 +325,8 @@ services:
       orchestrator:
         condition: service_started
     networks:
-      - milnet
+      - milnet_bastion
+      - milnet_auth
     healthcheck:
       test: ["CMD-SHELL", "kill -0 1"]
       interval: 10s
@@ -300,7 +378,11 @@ services:
       audit:
         condition: service_started
     networks:
-      - milnet
+      - milnet_bastion
+      - milnet_auth
+      - milnet_verify
+      - milnet_support
+      - milnet_data
     healthcheck:
       test: ["CMD-SHELL", "test -f /proc/1/status"]
       interval: 10s
@@ -313,5 +395,53 @@ volumes:
   audit_data:
 
 networks:
-  milnet:
+  # --------------------------------------------------------------------------
+  # Tier 0 — BASTION (public-facing)
+  # --------------------------------------------------------------------------
+  # The only network with external reachability (internal: false).
+  # Gateway accepts puzzle challenges from the internet; admin serves the
+  # HTTP REST API.  All other networks are fully isolated.
+  milnet_bastion:
     driver: bridge
+    internal: false
+
+  # --------------------------------------------------------------------------
+  # Tier 1 — AUTH CORE (internal, no external egress)
+  # --------------------------------------------------------------------------
+  # Contains the authentication pipeline: orchestrator coordinates OPAQUE
+  # (password verification) and TSS (FROST threshold signing).  Gateway
+  # attaches to forward requests to the orchestrator, but cannot reach
+  # OPAQUE or TSS directly (SHARD mTLS rejects gateway->opaque/tss).
+  milnet_auth:
+    driver: bridge
+    internal: true
+
+  # --------------------------------------------------------------------------
+  # Tier 2 — VERIFICATION (internal, no external egress)
+  # --------------------------------------------------------------------------
+  # Token verification and session management.  Verifier validates tokens
+  # using TSS JWKS; ratchet rotates session keys.  Completely unreachable
+  # from the bastion tier — a compromised gateway cannot access these.
+  milnet_verify:
+    driver: bridge
+    internal: true
+
+  # --------------------------------------------------------------------------
+  # Tier 3 — SUPPORT (internal, no external egress)
+  # --------------------------------------------------------------------------
+  # Audit logging, key transparency, and risk assessment.  Write-heavy
+  # sinks that receive events from auth/verify tiers.  The internal flag
+  # prevents exfiltration of audit data to external hosts.
+  milnet_support:
+    driver: bridge
+    internal: true
+
+  # --------------------------------------------------------------------------
+  # Tier 4 — DATA (internal, no external egress)
+  # --------------------------------------------------------------------------
+  # Database tier.  PostgreSQL is the highest-value target — only
+  # orchestrator, audit, and admin can reach it.  PostgreSQL itself
+  # has zero outbound connectivity (no DNS, no internet, no peer services).
+  milnet_data:
+    driver: bridge
+    internal: true

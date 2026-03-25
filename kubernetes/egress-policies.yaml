@@ -1,0 +1,589 @@
+---
+# ==============================================================================
+# MILNET SSO — Egress Network Policies
+# ==============================================================================
+# Default deny egress is already defined in network-policies.yaml.
+# These policies define the ONLY permitted outbound traffic per service.
+# ==============================================================================
+
+# --- Gateway: allow outbound to internet (OAuth, CRL) ---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-egress-internet
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: gateway
+  policyTypes:
+    - Egress
+  egress:
+    # DNS resolution
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Internal: orchestrator
+    - to:
+        - podSelector:
+            matchLabels:
+              app: orchestrator
+      ports:
+        - protocol: TCP
+          port: 9101
+    # Internal: audit
+    - to:
+        - podSelector:
+            matchLabels:
+              app: audit
+      ports:
+        - protocol: TCP
+          port: 9108
+    # External: HTTPS (OAuth providers, CRL/OCSP endpoints)
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80
+
+---
+# --- Orchestrator: internal only ---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: orchestrator-egress-internal
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: orchestrator
+  policyTypes:
+    - Egress
+  egress:
+    # DNS
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # All internal services orchestrator needs
+    - to:
+        - podSelector:
+            matchLabels:
+              app: gateway
+      ports:
+        - protocol: TCP
+          port: 9100
+    - to:
+        - podSelector:
+            matchLabels:
+              app: opaque
+      ports:
+        - protocol: TCP
+          port: 9102
+    - to:
+        - podSelector:
+            matchLabels:
+              app: tss
+      ports:
+        - protocol: TCP
+          port: 9103
+    - to:
+        - podSelector:
+            matchLabels:
+              app: ratchet
+      ports:
+        - protocol: TCP
+          port: 9105
+    - to:
+        - podSelector:
+            matchLabels:
+              app: risk
+      ports:
+        - protocol: TCP
+          port: 9106
+    - to:
+        - podSelector:
+            matchLabels:
+              app: kt
+      ports:
+        - protocol: TCP
+          port: 9107
+    - to:
+        - podSelector:
+            matchLabels:
+              app: audit
+      ports:
+        - protocol: TCP
+          port: 9108
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+
+---
+# --- OPAQUE: internal only (orchestrator + audit) ---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: opaque-egress-internal
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: opaque
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              app: orchestrator
+      ports:
+        - protocol: TCP
+          port: 9101
+    - to:
+        - podSelector:
+            matchLabels:
+              app: audit
+      ports:
+        - protocol: TCP
+          port: 9108
+
+---
+# --- TSS: internal only (orchestrator, verifier, audit, tss peers) ---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: tss-egress-internal
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: tss
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              app: orchestrator
+      ports:
+        - protocol: TCP
+          port: 9101
+    - to:
+        - podSelector:
+            matchLabels:
+              app: verifier
+      ports:
+        - protocol: TCP
+          port: 9104
+    - to:
+        - podSelector:
+            matchLabels:
+              app: audit
+      ports:
+        - protocol: TCP
+          port: 9108
+    - to:
+        - podSelector:
+            matchLabels:
+              app: tss
+      ports:
+        - protocol: TCP
+          port: 9103
+
+---
+# --- Verifier: internal only (ratchet, tss, audit) ---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: verifier-egress-internal
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: verifier
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              app: ratchet
+      ports:
+        - protocol: TCP
+          port: 9105
+    - to:
+        - podSelector:
+            matchLabels:
+              app: tss
+      ports:
+        - protocol: TCP
+          port: 9103
+    - to:
+        - podSelector:
+            matchLabels:
+              app: audit
+      ports:
+        - protocol: TCP
+          port: 9108
+
+---
+# --- Ratchet: internal only (orchestrator, verifier, risk, audit) ---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ratchet-egress-internal
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: ratchet
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              app: orchestrator
+      ports:
+        - protocol: TCP
+          port: 9101
+    - to:
+        - podSelector:
+            matchLabels:
+              app: verifier
+      ports:
+        - protocol: TCP
+          port: 9104
+    - to:
+        - podSelector:
+            matchLabels:
+              app: risk
+      ports:
+        - protocol: TCP
+          port: 9106
+    - to:
+        - podSelector:
+            matchLabels:
+              app: audit
+      ports:
+        - protocol: TCP
+          port: 9108
+
+---
+# --- Audit: internal only (kt, risk, tss, postgres) ---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: audit-egress-internal
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: audit
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              app: kt
+      ports:
+        - protocol: TCP
+          port: 9107
+    - to:
+        - podSelector:
+            matchLabels:
+              app: risk
+      ports:
+        - protocol: TCP
+          port: 9106
+    - to:
+        - podSelector:
+            matchLabels:
+              app: tss
+      ports:
+        - protocol: TCP
+          port: 9103
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+
+---
+# --- KT: internal only (orchestrator, audit) ---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kt-egress-internal
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: kt
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              app: orchestrator
+      ports:
+        - protocol: TCP
+          port: 9101
+    - to:
+        - podSelector:
+            matchLabels:
+              app: audit
+      ports:
+        - protocol: TCP
+          port: 9108
+
+---
+# --- Risk: internal only (orchestrator, ratchet, audit) ---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: risk-egress-internal
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: risk
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              app: orchestrator
+      ports:
+        - protocol: TCP
+          port: 9101
+    - to:
+        - podSelector:
+            matchLabels:
+              app: ratchet
+      ports:
+        - protocol: TCP
+          port: 9105
+    - to:
+        - podSelector:
+            matchLabels:
+              app: audit
+      ports:
+        - protocol: TCP
+          port: 9108
+
+---
+# --- Admin: internal only (all services + postgres + external OAuth) ---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: admin-egress-internal
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: admin
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              app: gateway
+      ports:
+        - protocol: TCP
+          port: 9100
+    - to:
+        - podSelector:
+            matchLabels:
+              app: orchestrator
+      ports:
+        - protocol: TCP
+          port: 9101
+    - to:
+        - podSelector:
+            matchLabels:
+              app: verifier
+      ports:
+        - protocol: TCP
+          port: 9104
+    - to:
+        - podSelector:
+            matchLabels:
+              app: ratchet
+      ports:
+        - protocol: TCP
+          port: 9105
+    - to:
+        - podSelector:
+            matchLabels:
+              app: audit
+      ports:
+        - protocol: TCP
+          port: 9108
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    # External: OAuth provider endpoints
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
+
+---
+# --- PostgreSQL: no egress at all ---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-egress-deny-all
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres
+  policyTypes:
+    - Egress
+  egress: []

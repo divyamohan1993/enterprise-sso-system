@@ -175,6 +175,7 @@ async fn main() {
         revocation_list: RwLock::new(admin::routes::RevocationList::new()),
         developer_mode: std::sync::atomic::AtomicBool::new(false),
         developer_log_level: std::sync::atomic::AtomicU8::new(common::config::LogLevel::Error as u8),
+        pending_admin_actions: RwLock::new(std::collections::HashMap::new()),
     });
 
     // Start the key rotation monitor in the background

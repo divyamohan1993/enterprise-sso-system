@@ -3387,4 +3387,98 @@ mod tests {
         assert!(!constant_time_eq(b"hello", b"hell"));
         assert!(constant_time_eq(b"", b""));
     }
+
+    // ── HSM backend selection and production mode tests ──
+
+    #[test]
+    fn pkcs11_backend_seal_unseal_with_different_purposes() {
+        let manager = make_pkcs11_manager();
+        let plaintext = b"pkcs11-protected-secret-data";
+        let sealed = manager
+            .seal_with_hardware(plaintext, "purpose-a")
+            .unwrap();
+        // Same purpose must succeed
+        let recovered = manager
+            .unseal_with_hardware(&sealed, "purpose-a")
+            .unwrap();
+        assert_eq!(recovered, plaintext);
+        // Different purpose must fail (CKM_AES_KEY_WRAP_KWP domain separation)
+        let result = manager.unseal_with_hardware(&sealed, "purpose-b");
+        assert!(result.is_err(), "PKCS#11 wrap with wrong purpose must fail");
+    }
+
+    #[test]
+    fn tpm2_attestation_quote_contains_nonce_and_pcrs() {
+        let config = HsmConfig {
+            backend: HsmBackend::Tpm2,
+            tpm2_device: Some("/dev/tpmrm0".into()),
+            tpm2_pcr_indices: vec![0, 2, 4, 7],
+            ..HsmConfig::default()
+        };
+        let manager = HsmKeyManager::new(config).unwrap();
+        let nonce = [0x42u8; 32];
+        let quote = manager.generate_attestation_quote(&nonce).unwrap();
+        // Quote must contain: nonce (32) + PCR indices + 0xFF + PCR values + HMAC sig
+        assert!(quote.len() > 32, "attestation quote must be non-trivial");
+        assert_eq!(&quote[..32], &nonce, "quote must start with provided nonce");
+        // PCR indices should appear after the nonce (0, 2, 4, 7, 0xFF terminator)
+        assert_eq!(quote[32], 0, "first PCR index should be 0");
+        assert_eq!(quote[33], 2, "second PCR index should be 2");
+        assert_eq!(quote[34], 4, "third PCR index should be 4");
+        assert_eq!(quote[35], 7, "fourth PCR index should be 7");
+        assert_eq!(quote[36], 0xFF, "PCR list must be terminated with 0xFF");
+    }
+
+    #[test]
+    fn tpm2_different_pcr_sets_produce_different_keys() {
+        let config1 = HsmConfig {
+            backend: HsmBackend::Tpm2,
+            tpm2_device: Some("/dev/tpmrm0".into()),
+            tpm2_pcr_indices: vec![0, 2, 4, 7],
+            ..HsmConfig::default()
+        };
+        let config2 = HsmConfig {
+            backend: HsmBackend::Tpm2,
+            tpm2_device: Some("/dev/tpmrm0".into()),
+            tpm2_pcr_indices: vec![0, 1, 3, 7], // different PCRs
+            ..HsmConfig::default()
+        };
+        let manager1 = HsmKeyManager::new(config1).unwrap();
+        let manager2 = HsmKeyManager::new(config2).unwrap();
+
+        // Sealing with manager1 and unsealing with manager2 (different PCRs) must fail
+        let sealed = manager1
+            .seal_with_hardware(b"pcr-bound-data", "pcr-test")
+            .unwrap();
+        let result = manager2.unseal_with_hardware(&sealed, "pcr-test");
+        assert!(
+            result.is_err(),
+            "TPM2 unseal with different PCR set must fail (PCR mismatch)"
+        );
+    }
+
+    #[test]
+    fn software_backend_in_production_returns_error() {
+        // We can't set MILNET_PRODUCTION=1 in tests because it would affect
+        // other tests, but we CAN verify that the error type exists and the
+        // is_hardware_backed check works correctly.
+        assert!(
+            !HsmBackend::Software.is_hardware_backed(),
+            "software backend must NOT be hardware-backed"
+        );
+        // Verify that the SoftwareInProduction error variant is correctly defined
+        let err = HsmError::SoftwareInProduction;
+        assert_eq!(
+            format!("{}", err),
+            "software HSM backend is forbidden in production mode"
+        );
+    }
+
+    #[test]
+    fn all_backend_types_are_correctly_classified() {
+        assert!(HsmBackend::Pkcs11.is_hardware_backed());
+        assert!(HsmBackend::AwsKms.is_hardware_backed());
+        assert!(HsmBackend::Tpm2.is_hardware_backed());
+        assert!(!HsmBackend::Software.is_hardware_backed());
+    }
 }

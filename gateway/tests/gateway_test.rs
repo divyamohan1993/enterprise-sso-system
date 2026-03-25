@@ -146,3 +146,77 @@ async fn gateway_accepts_solved_puzzle() {
 
     server_handle.await.unwrap();
 }
+
+// -- X-Wing key pinning tests --
+
+#[test]
+fn xwing_fingerprint_is_deterministic() {
+    let pk_bytes = vec![0xABu8; 1216]; // typical X-Wing PK size
+    let fp1 = compute_fingerprint(&pk_bytes);
+    let fp2 = compute_fingerprint(&pk_bytes);
+    assert_eq!(fp1, fp2, "fingerprint must be deterministic");
+    assert!(!fp1.is_empty());
+    // Must be hex-encoded SHA-256 (64 hex chars)
+    assert_eq!(fp1.len(), 64, "fingerprint must be 64 hex chars (SHA-256)");
+}
+
+#[test]
+fn xwing_fingerprint_different_keys_differ() {
+    let fp1 = compute_fingerprint(&vec![0x01u8; 1216]);
+    let fp2 = compute_fingerprint(&vec![0x02u8; 1216]);
+    assert_ne!(fp1, fp2, "different keys must produce different fingerprints");
+}
+
+#[test]
+fn puzzle_challenge_includes_fingerprint() {
+    // When xwing_server_pk_fingerprint is set, it should be present
+    let mut challenge = generate_challenge(4);
+    challenge.xwing_server_pk_fingerprint = Some("abcdef1234567890".to_string());
+    assert_eq!(
+        challenge.xwing_server_pk_fingerprint.as_deref(),
+        Some("abcdef1234567890")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_challenge_contains_fingerprint() {
+    // Start gateway and verify the challenge includes a fingerprint
+    let server = GatewayServer::bind("127.0.0.1:0", 4).await.unwrap();
+    let addr = server.local_addr().unwrap();
+
+    let server_handle = tokio::spawn(async move {
+        // We only care about receiving the challenge, not completing the handshake.
+        // The accept_one call will error because the client drops the connection.
+        let _ = server.accept_one().await;
+    });
+
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    // Receive puzzle challenge
+    let challenge: PuzzleChallenge = recv_frame(&mut stream).await;
+
+    // The challenge must include a fingerprint
+    assert!(
+        challenge.xwing_server_pk_fingerprint.is_some(),
+        "puzzle challenge must include X-Wing public key fingerprint"
+    );
+    let fingerprint = challenge.xwing_server_pk_fingerprint.unwrap();
+    assert_eq!(fingerprint.len(), 64, "fingerprint must be 64 hex chars");
+
+    // The fingerprint must match the included public key
+    let pk_bytes = challenge.xwing_server_pk.as_ref().unwrap();
+    let expected = compute_fingerprint(pk_bytes);
+    assert_eq!(fingerprint, expected, "fingerprint must match server PK");
+
+    drop(stream);
+    let _ = server_handle.await;
+}
+
+/// Helper to compute X-Wing PK fingerprint (mirrors server implementation).
+fn compute_fingerprint(pk_bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"MILNET-XWING-PIN-v1");
+    hasher.update(pk_bytes);
+    hex::encode(hasher.finalize())
+}

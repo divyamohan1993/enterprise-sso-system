@@ -1,0 +1,437 @@
+//! Cross-Domain Guard — enforces information flow control between security domains.
+//!
+//! Implements a default-deny policy: every cross-domain data transfer must be
+//! explicitly allowed by a configured flow rule. Transfers from a higher
+//! classification domain to a lower one require an explicit declassification
+//! policy entry.
+//!
+//! All cross-domain decisions (grant or deny) are audit-logged.
+
+use crate::classification::ClassificationLevel;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use uuid::Uuid;
+
+/// A security domain with a name and classification level.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityDomain {
+    /// Unique identifier for the domain.
+    pub id: Uuid,
+    /// Human-readable domain name (e.g., "JWICS", "SIPRNet", "NIPRNet").
+    pub name: String,
+    /// Classification level of this domain.
+    pub classification: ClassificationLevel,
+}
+
+/// Direction of a cross-domain flow rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FlowDirection {
+    /// Data flows from source domain to target domain.
+    Unidirectional,
+    /// Data may flow in both directions between the domains.
+    Bidirectional,
+}
+
+/// A policy rule authorizing data flow between two domains.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlowRule {
+    /// Source domain ID.
+    pub source_domain: Uuid,
+    /// Target domain ID.
+    pub target_domain: Uuid,
+    /// Flow direction.
+    pub direction: FlowDirection,
+    /// If true, this rule explicitly authorizes high-to-low declassification.
+    /// Without this flag, flows from higher to lower classification are blocked
+    /// even if a rule exists.
+    pub declassification_authorized: bool,
+    /// Human-readable justification for this flow rule (audit trail).
+    pub justification: String,
+    /// Authorizing officer ID — who approved this rule.
+    pub authorized_by: Uuid,
+    /// Timestamp when this rule was created (epoch seconds).
+    pub created_at: i64,
+}
+
+/// Result of a cross-domain transfer decision.
+#[derive(Debug, Clone, Serialize)]
+pub struct CrossDomainDecision {
+    /// Whether the transfer was allowed.
+    pub allowed: bool,
+    /// Source domain name.
+    pub source_domain: String,
+    /// Target domain name.
+    pub target_domain: String,
+    /// Source domain classification.
+    pub source_classification: ClassificationLevel,
+    /// Target domain classification.
+    pub target_classification: ClassificationLevel,
+    /// Reason for the decision.
+    pub reason: String,
+    /// Timestamp of the decision (epoch seconds).
+    pub timestamp: i64,
+}
+
+/// The Cross-Domain Guard enforces flow control between security domains.
+///
+/// Default policy is DENY: only explicitly configured flow rules permit
+/// cross-domain transfers.
+pub struct CrossDomainGuard {
+    /// Registered security domains.
+    domains: HashMap<Uuid, SecurityDomain>,
+    /// Flow rules indexed by (source_domain_id, target_domain_id).
+    rules: HashMap<(Uuid, Uuid), FlowRule>,
+}
+
+impl CrossDomainGuard {
+    /// Create a new guard with no domains or rules (default-deny).
+    pub fn new() -> Self {
+        Self {
+            domains: HashMap::new(),
+            rules: HashMap::new(),
+        }
+    }
+
+    /// Register a security domain.
+    pub fn register_domain(&mut self, domain: SecurityDomain) {
+        self.domains.insert(domain.id, domain);
+    }
+
+    /// Add a flow rule authorizing data transfer between domains.
+    pub fn add_flow_rule(&mut self, rule: FlowRule) {
+        self.rules
+            .insert((rule.source_domain, rule.target_domain), rule);
+    }
+
+    /// Remove a flow rule.
+    pub fn remove_flow_rule(&mut self, source: &Uuid, target: &Uuid) -> bool {
+        self.rules.remove(&(*source, *target)).is_some()
+    }
+
+    /// Return the number of registered domains.
+    pub fn domain_count(&self) -> usize {
+        self.domains.len()
+    }
+
+    /// Return the number of active flow rules.
+    pub fn rule_count(&self) -> usize {
+        self.rules.len()
+    }
+
+    /// Validate a cross-domain data transfer.
+    ///
+    /// Checks:
+    /// 1. Both domains must be registered.
+    /// 2. A flow rule must exist for the (source, target) pair.
+    /// 3. If the flow is from higher to lower classification, the rule must
+    ///    have `declassification_authorized = true`.
+    /// 4. Bidirectional rules are checked in both directions.
+    ///
+    /// Returns a `CrossDomainDecision` that MUST be audit-logged by the caller.
+    pub fn validate_transfer(
+        &self,
+        source_domain_id: &Uuid,
+        target_domain_id: &Uuid,
+    ) -> CrossDomainDecision {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // Same domain: always allowed
+        if source_domain_id == target_domain_id {
+            let domain_name = self
+                .domains
+                .get(source_domain_id)
+                .map(|d| d.name.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            let classification = self
+                .domains
+                .get(source_domain_id)
+                .map(|d| d.classification)
+                .unwrap_or(ClassificationLevel::Unclassified);
+            return CrossDomainDecision {
+                allowed: true,
+                source_domain: domain_name.clone(),
+                target_domain: domain_name,
+                source_classification: classification,
+                target_classification: classification,
+                reason: "intra-domain transfer".to_string(),
+                timestamp: now,
+            };
+        }
+
+        // Look up domains
+        let source = match self.domains.get(source_domain_id) {
+            Some(d) => d,
+            None => {
+                return CrossDomainDecision {
+                    allowed: false,
+                    source_domain: format!("{}", source_domain_id),
+                    target_domain: format!("{}", target_domain_id),
+                    source_classification: ClassificationLevel::Unclassified,
+                    target_classification: ClassificationLevel::Unclassified,
+                    reason: "source domain not registered".to_string(),
+                    timestamp: now,
+                };
+            }
+        };
+        let target = match self.domains.get(target_domain_id) {
+            Some(d) => d,
+            None => {
+                return CrossDomainDecision {
+                    allowed: false,
+                    source_domain: source.name.clone(),
+                    target_domain: format!("{}", target_domain_id),
+                    source_classification: source.classification,
+                    target_classification: ClassificationLevel::Unclassified,
+                    reason: "target domain not registered".to_string(),
+                    timestamp: now,
+                };
+            }
+        };
+
+        // Look up flow rule: check direct rule first, then reverse (bidirectional)
+        let rule = self
+            .rules
+            .get(&(*source_domain_id, *target_domain_id))
+            .or_else(|| {
+                // Check if there is a bidirectional rule in the reverse direction
+                self.rules
+                    .get(&(*target_domain_id, *source_domain_id))
+                    .filter(|r| r.direction == FlowDirection::Bidirectional)
+            });
+
+        let rule = match rule {
+            Some(r) => r,
+            None => {
+                // DEFAULT DENY: no rule found
+                tracing::warn!(
+                    "cross-domain transfer DENIED (default-deny): {} ({}) -> {} ({})",
+                    source.name,
+                    source.classification.label(),
+                    target.name,
+                    target.classification.label(),
+                );
+                return CrossDomainDecision {
+                    allowed: false,
+                    source_domain: source.name.clone(),
+                    target_domain: target.name.clone(),
+                    source_classification: source.classification,
+                    target_classification: target.classification,
+                    reason: "no flow rule exists — default deny".to_string(),
+                    timestamp: now,
+                };
+            }
+        };
+
+        // Check declassification requirement: high -> low needs explicit authorization
+        if source.classification > target.classification && !rule.declassification_authorized {
+            tracing::warn!(
+                "cross-domain transfer DENIED (declassification not authorized): \
+                 {} ({}) -> {} ({})",
+                source.name,
+                source.classification.label(),
+                target.name,
+                target.classification.label(),
+            );
+            return CrossDomainDecision {
+                allowed: false,
+                source_domain: source.name.clone(),
+                target_domain: target.name.clone(),
+                source_classification: source.classification,
+                target_classification: target.classification,
+                reason: format!(
+                    "flow from {} to {} requires declassification authorization",
+                    source.classification.label(),
+                    target.classification.label(),
+                ),
+                timestamp: now,
+            };
+        }
+
+        tracing::info!(
+            "cross-domain transfer ALLOWED: {} ({}) -> {} ({}), justification: {}",
+            source.name,
+            source.classification.label(),
+            target.name,
+            target.classification.label(),
+            rule.justification,
+        );
+
+        CrossDomainDecision {
+            allowed: true,
+            source_domain: source.name.clone(),
+            target_domain: target.name.clone(),
+            source_classification: source.classification,
+            target_classification: target.classification,
+            reason: format!("allowed by flow rule: {}", rule.justification),
+            timestamp: now,
+        }
+    }
+}
+
+impl Default for CrossDomainGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_domain(name: &str, level: ClassificationLevel) -> SecurityDomain {
+        SecurityDomain {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            classification: level,
+        }
+    }
+
+    #[test]
+    fn default_deny_no_rules() {
+        let guard = CrossDomainGuard::new();
+        let src = Uuid::new_v4();
+        let tgt = Uuid::new_v4();
+        let decision = guard.validate_transfer(&src, &tgt);
+        assert!(!decision.allowed);
+        assert!(decision.reason.contains("not registered"));
+    }
+
+    #[test]
+    fn same_domain_always_allowed() {
+        let mut guard = CrossDomainGuard::new();
+        let domain = make_domain("JWICS", ClassificationLevel::TopSecret);
+        let id = domain.id;
+        guard.register_domain(domain);
+        let decision = guard.validate_transfer(&id, &id);
+        assert!(decision.allowed);
+    }
+
+    #[test]
+    fn explicit_rule_allows_transfer() {
+        let mut guard = CrossDomainGuard::new();
+        let src = make_domain("SIPRNet", ClassificationLevel::Secret);
+        let tgt = make_domain("JWICS", ClassificationLevel::TopSecret);
+        let src_id = src.id;
+        let tgt_id = tgt.id;
+        guard.register_domain(src);
+        guard.register_domain(tgt);
+        guard.add_flow_rule(FlowRule {
+            source_domain: src_id,
+            target_domain: tgt_id,
+            direction: FlowDirection::Unidirectional,
+            declassification_authorized: false,
+            justification: "operational necessity".to_string(),
+            authorized_by: Uuid::nil(),
+            created_at: 0,
+        });
+        let decision = guard.validate_transfer(&src_id, &tgt_id);
+        assert!(decision.allowed);
+    }
+
+    #[test]
+    fn high_to_low_without_declass_denied() {
+        let mut guard = CrossDomainGuard::new();
+        let src = make_domain("JWICS", ClassificationLevel::TopSecret);
+        let tgt = make_domain("NIPRNet", ClassificationLevel::Unclassified);
+        let src_id = src.id;
+        let tgt_id = tgt.id;
+        guard.register_domain(src);
+        guard.register_domain(tgt);
+        guard.add_flow_rule(FlowRule {
+            source_domain: src_id,
+            target_domain: tgt_id,
+            direction: FlowDirection::Unidirectional,
+            declassification_authorized: false,
+            justification: "test".to_string(),
+            authorized_by: Uuid::nil(),
+            created_at: 0,
+        });
+        let decision = guard.validate_transfer(&src_id, &tgt_id);
+        assert!(!decision.allowed);
+        assert!(decision.reason.contains("declassification"));
+    }
+
+    #[test]
+    fn high_to_low_with_declass_allowed() {
+        let mut guard = CrossDomainGuard::new();
+        let src = make_domain("JWICS", ClassificationLevel::TopSecret);
+        let tgt = make_domain("SIPRNet", ClassificationLevel::Secret);
+        let src_id = src.id;
+        let tgt_id = tgt.id;
+        guard.register_domain(src);
+        guard.register_domain(tgt);
+        guard.add_flow_rule(FlowRule {
+            source_domain: src_id,
+            target_domain: tgt_id,
+            direction: FlowDirection::Unidirectional,
+            declassification_authorized: true,
+            justification: "authorized declassification review".to_string(),
+            authorized_by: Uuid::nil(),
+            created_at: 0,
+        });
+        let decision = guard.validate_transfer(&src_id, &tgt_id);
+        assert!(decision.allowed);
+    }
+
+    #[test]
+    fn bidirectional_rule_works_both_ways() {
+        let mut guard = CrossDomainGuard::new();
+        let a = make_domain("DomainA", ClassificationLevel::Secret);
+        let b = make_domain("DomainB", ClassificationLevel::Secret);
+        let a_id = a.id;
+        let b_id = b.id;
+        guard.register_domain(a);
+        guard.register_domain(b);
+        guard.add_flow_rule(FlowRule {
+            source_domain: a_id,
+            target_domain: b_id,
+            direction: FlowDirection::Bidirectional,
+            declassification_authorized: false,
+            justification: "peer domains".to_string(),
+            authorized_by: Uuid::nil(),
+            created_at: 0,
+        });
+        assert!(guard.validate_transfer(&a_id, &b_id).allowed);
+        assert!(guard.validate_transfer(&b_id, &a_id).allowed);
+    }
+
+    #[test]
+    fn no_rule_between_registered_domains_denied() {
+        let mut guard = CrossDomainGuard::new();
+        let src = make_domain("Alpha", ClassificationLevel::Confidential);
+        let tgt = make_domain("Bravo", ClassificationLevel::Confidential);
+        let src_id = src.id;
+        let tgt_id = tgt.id;
+        guard.register_domain(src);
+        guard.register_domain(tgt);
+        let decision = guard.validate_transfer(&src_id, &tgt_id);
+        assert!(!decision.allowed);
+        assert!(decision.reason.contains("default deny"));
+    }
+
+    #[test]
+    fn remove_flow_rule() {
+        let mut guard = CrossDomainGuard::new();
+        let src = make_domain("Src", ClassificationLevel::Secret);
+        let tgt = make_domain("Tgt", ClassificationLevel::Secret);
+        let src_id = src.id;
+        let tgt_id = tgt.id;
+        guard.register_domain(src);
+        guard.register_domain(tgt);
+        guard.add_flow_rule(FlowRule {
+            source_domain: src_id,
+            target_domain: tgt_id,
+            direction: FlowDirection::Unidirectional,
+            declassification_authorized: false,
+            justification: "test".to_string(),
+            authorized_by: Uuid::nil(),
+            created_at: 0,
+        });
+        assert!(guard.validate_transfer(&src_id, &tgt_id).allowed);
+        assert!(guard.remove_flow_rule(&src_id, &tgt_id));
+        assert!(!guard.validate_transfer(&src_id, &tgt_id).allowed);
+    }
+}

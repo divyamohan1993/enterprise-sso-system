@@ -90,6 +90,7 @@ fn audit_entry_round_trip() {
         timestamp: 1_700_000_000_000_000,
         prev_hash: [0x00; 64],
         signature: vec![0x11; 64],
+        classification: 0,
     };
     let bytes = postcard::to_allocvec(&entry).expect("serialize audit entry");
     let decoded: AuditEntry = postcard::from_bytes(&bytes).expect("deserialize audit entry");
@@ -121,4 +122,68 @@ fn domain_separation_constants_are_unique() {
         set.len(),
         "domain separation constants must all be unique"
     );
+}
+
+#[test]
+fn new_domain_separators_unique() {
+    let new_constants: Vec<&[u8]> = vec![
+        domain::ADMIN_ROLE_KEY_DERIVE,
+        domain::CROSS_DOMAIN_AUDIT,
+        domain::PENDING_ADMIN_ACTION,
+    ];
+    // All new constants must be unique among themselves
+    let set: HashSet<&[u8]> = new_constants.iter().copied().collect();
+    assert_eq!(new_constants.len(), set.len());
+    // And must not collide with existing constants
+    let existing = vec![
+        domain::FROST_TOKEN,
+        domain::RECEIPT_SIGN,
+        domain::DPOP_PROOF,
+        domain::AUDIT_ENTRY,
+    ];
+    for existing_const in &existing {
+        for new_const in &new_constants {
+            assert_ne!(existing_const, new_const, "domain separator collision detected");
+        }
+    }
+}
+
+#[test]
+fn token_claims_classification_default() {
+    let token = Token::test_fixture();
+    assert_eq!(token.claims.classification, 0, "default classification must be Unclassified (0)");
+}
+
+#[test]
+fn audit_entry_classification_default() {
+    let entry = AuditEntry {
+        event_id: uuid::Uuid::nil(),
+        event_type: AuditEventType::AuthSuccess,
+        user_ids: vec![],
+        device_ids: vec![],
+        ceremony_receipts: vec![],
+        risk_score: 0.0,
+        timestamp: 0,
+        prev_hash: [0u8; 64],
+        signature: vec![],
+        classification: 0,
+    };
+    assert_eq!(entry.classification, 0);
+}
+
+#[test]
+fn new_audit_event_types_exist() {
+    // Ensure the new event types can be serialized/deserialized
+    let events = vec![
+        AuditEventType::AdminRbacDenied,
+        AuditEventType::AdminRbacGranted,
+        AuditEventType::CrossDomainDecision,
+        AuditEventType::AdminCeremonyRequired,
+        AuditEventType::DpopReplayDetected,
+    ];
+    for event in events {
+        let bytes = postcard::to_allocvec(&event).expect("serialize audit event type");
+        let decoded: AuditEventType = postcard::from_bytes(&bytes).expect("deserialize audit event type");
+        assert_eq!(decoded, event);
+    }
 }

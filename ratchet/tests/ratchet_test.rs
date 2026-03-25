@@ -247,6 +247,79 @@ fn response_success_with_epoch_roundtrip() {
     assert!(decoded.error.is_none());
 }
 
+// ── Nonce history and Bloom filter tests ───────────────────────────
+
+#[test]
+fn chain_nonce_reuse_within_window_panics() {
+    let mut chain = RatchetChain::new(&test_secret());
+    let nonce = fresh_nonce();
+    chain.advance(&good_entropy(), &good_entropy(), &nonce);
+
+    // Reusing the same nonce should panic (clone attack detection)
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        chain.advance(&good_entropy(), &good_entropy(), &nonce);
+    }));
+    assert!(result.is_err(), "nonce reuse within window must panic");
+}
+
+#[test]
+fn chain_1000_unique_nonces_accepted() {
+    // Verify that 1000 unique nonces are accepted without panic,
+    // exercising the full NONCE_HISTORY_SIZE window.
+    let mut chain = RatchetChain::new(&test_secret());
+    for _ in 0..1000 {
+        chain.advance(&good_entropy(), &good_entropy(), &fresh_nonce());
+    }
+    assert_eq!(chain.epoch(), 1000);
+}
+
+#[test]
+fn chain_bloom_filter_catches_old_nonce_reuse() {
+    // Advance 1100 times with unique nonces, then try to reuse the
+    // first nonce.  It should be caught by the Bloom filter even though
+    // it has been evicted from the exact-match window (1000 entries).
+    let mut chain = RatchetChain::new(&test_secret());
+
+    // Save the very first nonce
+    let first_nonce = fresh_nonce();
+    chain.advance(&good_entropy(), &good_entropy(), &first_nonce);
+
+    // Advance 1100 more times to push the first nonce out of the
+    // exact window and into the Bloom filter
+    for _ in 0..1100 {
+        chain.advance(&good_entropy(), &good_entropy(), &fresh_nonce());
+    }
+
+    // Now attempt to reuse the first nonce — should be caught by the Bloom filter
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        chain.advance(&good_entropy(), &good_entropy(), &first_nonce);
+    }));
+    assert!(
+        result.is_err(),
+        "nonce reuse beyond exact window must be caught by Bloom filter"
+    );
+}
+
+#[test]
+fn chain_nonce_replay_at_boundary() {
+    // Test nonce replay detection right at the window boundary (nonce at index 999)
+    let mut chain = RatchetChain::new(&test_secret());
+
+    let boundary_nonce = fresh_nonce();
+    // Advance 999 times with fresh nonces
+    for _ in 0..999 {
+        chain.advance(&good_entropy(), &good_entropy(), &fresh_nonce());
+    }
+    // Use the boundary nonce at position 1000 (fills the window)
+    chain.advance(&good_entropy(), &good_entropy(), &boundary_nonce);
+
+    // Immediately try to reuse it — still in exact window
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        chain.advance(&good_entropy(), &good_entropy(), &boundary_nonce);
+    }));
+    assert!(result.is_err(), "nonce reuse at window boundary must be detected");
+}
+
 #[test]
 fn response_success_with_tag_roundtrip() {
     let tag = vec![0xFF; 64];

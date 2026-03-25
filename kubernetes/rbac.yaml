@@ -1,0 +1,305 @@
+---
+# ==============================================================================
+# MILNET SSO — RBAC (ServiceAccounts, Roles, RoleBindings)
+# ==============================================================================
+# Each service gets its own ServiceAccount with minimal permissions.
+# No service needs Kubernetes API access beyond reading its own secrets
+# and configmaps.
+# ==============================================================================
+
+# --- ServiceAccounts ---
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gateway
+  namespace: milnet-sso
+  labels:
+    app: gateway
+    app.kubernetes.io/part-of: milnet-sso
+automountServiceAccountToken: false
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: orchestrator
+  namespace: milnet-sso
+  labels:
+    app: orchestrator
+    app.kubernetes.io/part-of: milnet-sso
+automountServiceAccountToken: false
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: opaque
+  namespace: milnet-sso
+  labels:
+    app: opaque
+    app.kubernetes.io/part-of: milnet-sso
+automountServiceAccountToken: false
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tss
+  namespace: milnet-sso
+  labels:
+    app: tss
+    app.kubernetes.io/part-of: milnet-sso
+automountServiceAccountToken: false
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: verifier
+  namespace: milnet-sso
+  labels:
+    app: verifier
+    app.kubernetes.io/part-of: milnet-sso
+automountServiceAccountToken: false
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ratchet
+  namespace: milnet-sso
+  labels:
+    app: ratchet
+    app.kubernetes.io/part-of: milnet-sso
+automountServiceAccountToken: false
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: audit
+  namespace: milnet-sso
+  labels:
+    app: audit
+    app.kubernetes.io/part-of: milnet-sso
+automountServiceAccountToken: false
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: admin
+  namespace: milnet-sso
+  labels:
+    app: admin
+    app.kubernetes.io/part-of: milnet-sso
+automountServiceAccountToken: false
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: postgres
+  namespace: milnet-sso
+  labels:
+    app: postgres
+    app.kubernetes.io/part-of: milnet-sso
+automountServiceAccountToken: false
+
+---
+# --- Roles ---
+# Minimal role: read own secrets and configmaps only
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: milnet-service-reader
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+
+---
+# Role for admin service: can also list pods for health checks
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: milnet-admin-reader
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+
+---
+# --- RoleBindings ---
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gateway-reader
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+subjects:
+  - kind: ServiceAccount
+    name: gateway
+    namespace: milnet-sso
+roleRef:
+  kind: Role
+  name: milnet-service-reader
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: orchestrator-reader
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+subjects:
+  - kind: ServiceAccount
+    name: orchestrator
+    namespace: milnet-sso
+roleRef:
+  kind: Role
+  name: milnet-service-reader
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: opaque-reader
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+subjects:
+  - kind: ServiceAccount
+    name: opaque
+    namespace: milnet-sso
+roleRef:
+  kind: Role
+  name: milnet-service-reader
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: tss-reader
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+subjects:
+  - kind: ServiceAccount
+    name: tss
+    namespace: milnet-sso
+roleRef:
+  kind: Role
+  name: milnet-service-reader
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: verifier-reader
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+subjects:
+  - kind: ServiceAccount
+    name: verifier
+    namespace: milnet-sso
+roleRef:
+  kind: Role
+  name: milnet-service-reader
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ratchet-reader
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+subjects:
+  - kind: ServiceAccount
+    name: ratchet
+    namespace: milnet-sso
+roleRef:
+  kind: Role
+  name: milnet-service-reader
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: audit-reader
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+subjects:
+  - kind: ServiceAccount
+    name: audit
+    namespace: milnet-sso
+roleRef:
+  kind: Role
+  name: milnet-service-reader
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: admin-reader
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+subjects:
+  - kind: ServiceAccount
+    name: admin
+    namespace: milnet-sso
+roleRef:
+  kind: Role
+  name: milnet-admin-reader
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: postgres-reader
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+subjects:
+  - kind: ServiceAccount
+    name: postgres
+    namespace: milnet-sso
+roleRef:
+  kind: Role
+  name: milnet-service-reader
+  apiGroup: rbac.authorization.k8s.io

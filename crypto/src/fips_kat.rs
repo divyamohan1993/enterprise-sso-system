@@ -15,6 +15,9 @@
 //! - HMAC-SHA512 (FIPS 198-1)
 //! - ML-KEM-1024 (FIPS 203) — roundtrip test
 //! - ML-DSA-87 (FIPS 204) — roundtrip test
+//! - X-Wing combiner (ML-KEM-1024 + X25519) — full encap/decap + session key derivation
+//! - FROST Ristretto255 — threshold signing (2-of-3 DKG + sign + verify)
+//! - SLH-DSA-SHA2-256f (FIPS 205) — hash-based signature roundtrip
 
 use aes_gcm::aead::generic_array::GenericArray;
 use aes_gcm::aead::Aead;
@@ -290,6 +293,158 @@ fn kat_ml_kem_1024() -> Result<(), String> {
     Ok(())
 }
 
+/// KAT: X-Wing hybrid KEM combiner (ML-KEM-1024 + X25519) roundtrip.
+///
+/// Verifies the full X-Wing encapsulate/decapsulate cycle produces matching
+/// shared secrets, and that the HKDF-SHA512 session key derivation is
+/// deterministic for the same inputs.
+fn kat_xwing_combiner() -> Result<(), String> {
+    use crate::xwing::{XWingKeyPair, xwing_encapsulate, xwing_decapsulate, derive_session_key};
+
+    // Generate a keypair
+    let kp = XWingKeyPair::generate();
+    let pk = kp.public_key();
+
+    // Encapsulate: client produces (shared_secret, ciphertext)
+    let (ss_enc, ct) = xwing_encapsulate(&pk);
+
+    // Decapsulate: server recovers the same shared_secret
+    let ss_dec = xwing_decapsulate(&kp, &ct)
+        .map_err(|e| format!("X-Wing KAT: decapsulation failed: {}", e))?;
+
+    // Shared secrets must match
+    if ss_enc.as_bytes() != ss_dec.as_bytes() {
+        return Err("X-Wing KAT: shared secret mismatch after encap/decap roundtrip".into());
+    }
+
+    // Shared secret must be non-zero
+    if ss_enc.as_bytes().iter().all(|&b| b == 0) {
+        return Err("X-Wing KAT: shared secret is all zeros".into());
+    }
+
+    // Session key derivation must be deterministic
+    let context = b"KAT-test-context";
+    let sk1 = derive_session_key(&ss_enc, context);
+    let sk2 = derive_session_key(&ss_enc, context);
+    if sk1 != sk2 {
+        return Err("X-Wing KAT: session key derivation is non-deterministic".into());
+    }
+
+    // Session key must be non-zero
+    if sk1.iter().all(|&b| b == 0) {
+        return Err("X-Wing KAT: derived session key is all zeros".into());
+    }
+
+    // Different contexts must produce different session keys
+    let sk3 = derive_session_key(&ss_enc, b"different-context");
+    if sk1 == sk3 {
+        return Err("X-Wing KAT: different contexts produced same session key".into());
+    }
+
+    tracing::info!("FIPS KAT: X-Wing combiner (ML-KEM-1024 + X25519) PASSED");
+    Ok(())
+}
+
+/// KAT: FROST Ristretto255 threshold signing roundtrip.
+///
+/// Verifies that a t-of-n threshold group can produce a valid signature
+/// using the trusted dealer ceremony, and that the signature verifies
+/// against the group's public key.
+fn kat_frost_ristretto255() -> Result<(), String> {
+    use crate::threshold;
+
+    // Generate a 2-of-3 threshold group
+    let mut dkg_result = threshold::dkg(3, 2);
+
+    if dkg_result.shares.len() != 3 {
+        return Err(format!(
+            "FROST KAT: expected 3 shares, got {}",
+            dkg_result.shares.len()
+        ));
+    }
+
+    // Verify that the group has the correct threshold
+    if dkg_result.group.threshold != 2 || dkg_result.group.total != 3 {
+        return Err(format!(
+            "FROST KAT: wrong group parameters t={}, n={}",
+            dkg_result.group.threshold, dkg_result.group.total
+        ));
+    }
+
+    // Perform a threshold signing round with 2 of 3 signers
+    let test_message = b"FIPS 140-3 FROST Ristretto255 known-answer test message";
+
+    let signing_result = threshold::threshold_sign(
+        &mut dkg_result.shares,
+        &dkg_result.group,
+        test_message,
+        2, // threshold
+    );
+
+    match signing_result {
+        Ok(signature) => {
+            // Verify the threshold signature against the group public key
+            if !threshold::verify_group_signature(
+                &dkg_result.group,
+                test_message,
+                &signature,
+            ) {
+                return Err("FROST KAT: threshold signature verification failed".into());
+            }
+
+            // Wrong message must not verify
+            if threshold::verify_group_signature(
+                &dkg_result.group,
+                b"tampered message",
+                &signature,
+            ) {
+                return Err("FROST KAT: verification succeeded for wrong message".into());
+            }
+        }
+        Err(e) => {
+            return Err(format!("FROST KAT: threshold signing failed: {}", e));
+        }
+    }
+
+    tracing::info!("FIPS KAT: FROST Ristretto255 (2-of-3) PASSED");
+    Ok(())
+}
+
+/// KAT: SLH-DSA-SHA2-256f (FIPS 205) sign/verify roundtrip.
+///
+/// Verifies that SLH-DSA key generation, signing, and verification produce
+/// correct results, and that tampered messages are rejected.
+fn kat_slh_dsa() -> Result<(), String> {
+    use crate::slh_dsa;
+
+    // Generate a keypair
+    let (sk, vk) = slh_dsa::slh_dsa_keygen();
+
+    let test_message = b"FIPS 140-3 SLH-DSA-SHA2-256f known-answer test message";
+
+    // Sign the test message
+    let signature = slh_dsa::slh_dsa_sign(&sk, test_message);
+
+    // Verify the signature
+    if !slh_dsa::slh_dsa_verify(&vk, test_message, &signature) {
+        return Err("SLH-DSA KAT: signature verification failed".into());
+    }
+
+    // Wrong message must not verify
+    if slh_dsa::slh_dsa_verify(&vk, b"tampered message", &signature) {
+        return Err("SLH-DSA KAT: verification succeeded for wrong message".into());
+    }
+
+    // Public key must be non-zero
+    let pk_bytes = vk.to_bytes();
+    if pk_bytes.iter().all(|&b| b == 0) {
+        return Err("SLH-DSA KAT: public key is all zeros".into());
+    }
+
+    tracing::info!("FIPS KAT: SLH-DSA-SHA2-256f (FIPS 205) PASSED");
+    Ok(())
+}
+
 /// KAT: ML-DSA-87 sign/verify roundtrip.
 ///
 /// Since ML-DSA uses randomized signing, we verify the roundtrip property:
@@ -351,7 +506,7 @@ pub fn run_startup_kats() -> Result<(), String> {
     tracing::info!("FIPS 140-3 startup known-answer tests: BEGIN");
 
     // Run each KAT. On first failure, return the error immediately.
-    // ML-DSA-87 needs a large stack for key generation.
+    // ML-DSA-87 and X-Wing need large stacks for key generation.
     kat_aes_256_gcm()?;
     kat_sha512()?;
     kat_sha3_256()?;
@@ -369,7 +524,37 @@ pub fn run_startup_kats() -> Result<(), String> {
         .map_err(|_| "ML-DSA-87 KAT: thread panicked".to_string())?;
     ml_dsa_result?;
 
-    tracing::info!("FIPS 140-3 startup known-answer tests: ALL PASSED");
+    // X-Wing combiner (ML-KEM-1024 + X25519) — needs large stack for ML-KEM.
+    let xwing_result = std::thread::Builder::new()
+        .name("fips-kat-xwing".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(kat_xwing_combiner)
+        .map_err(|e| format!("X-Wing KAT: failed to spawn thread: {}", e))?
+        .join()
+        .map_err(|_| "X-Wing KAT: thread panicked".to_string())?;
+    xwing_result?;
+
+    // FROST Ristretto255 threshold signing — moderate stack requirements.
+    let frost_result = std::thread::Builder::new()
+        .name("fips-kat-frost".into())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(kat_frost_ristretto255)
+        .map_err(|e| format!("FROST KAT: failed to spawn thread: {}", e))?
+        .join()
+        .map_err(|_| "FROST KAT: thread panicked".to_string())?;
+    frost_result?;
+
+    // SLH-DSA-SHA2-256f (FIPS 205) — hash-based signatures.
+    let slh_dsa_result = std::thread::Builder::new()
+        .name("fips-kat-slh-dsa".into())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(kat_slh_dsa)
+        .map_err(|e| format!("SLH-DSA KAT: failed to spawn thread: {}", e))?
+        .join()
+        .map_err(|_| "SLH-DSA KAT: thread panicked".to_string())?;
+    slh_dsa_result?;
+
+    tracing::info!("FIPS 140-3 startup known-answer tests: ALL PASSED (10/10)");
     Ok(())
 }
 
@@ -429,6 +614,43 @@ mod tests {
             .stack_size(8 * 1024 * 1024)
             .spawn(|| {
                 kat_ml_dsa_87().expect("ML-DSA-87 KAT should pass");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn test_kat_xwing_combiner() {
+        // X-Wing needs large stack for ML-KEM-1024 key generation
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                kat_xwing_combiner().expect("X-Wing combiner KAT should pass");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn test_kat_frost_ristretto255() {
+        std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                kat_frost_ristretto255().expect("FROST Ristretto255 KAT should pass");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn test_kat_slh_dsa() {
+        std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                kat_slh_dsa().expect("SLH-DSA KAT should pass");
             })
             .unwrap()
             .join()

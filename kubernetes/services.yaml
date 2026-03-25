@@ -1,0 +1,241 @@
+---
+# ==============================================================================
+# MILNET SSO — Kubernetes Services
+# ==============================================================================
+# ClusterIP for all internal services. LoadBalancer only for gateway.
+# ==============================================================================
+
+# --- Gateway (public-facing LoadBalancer) ---
+# Test: verify external IP is assigned
+#   Expected: kubectl get svc gateway -o jsonpath='{.status.loadBalancer.ingress[0].ip}' returns IP
+# Test: verify gateway is reachable on port 9100 from outside cluster
+#   Expected: TCP handshake succeeds, puzzle challenge returned
+# Test: verify all internal services are ClusterIP (not externally reachable)
+#   Expected: only gateway has type=LoadBalancer
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: milnet-sso
+  labels:
+    app: gateway
+    tier: bastion
+    app.kubernetes.io/part-of: milnet-sso
+    app.kubernetes.io/component: gateway
+  annotations:
+    cloud.google.com/neg: '{"ingress": true}'
+    milnet.io/test-external-ip: "get-svc-verify-loadbalancer-ip-assigned"
+    milnet.io/test-reachable: "tcp-connect-external-ip:9100-expect-puzzle"
+    milnet.io/test-internal-only: "get-svc-verify-only-gateway-is-loadbalancer"
+spec:
+  type: LoadBalancer
+  loadBalancerSourceRanges:
+    - 0.0.0.0/0
+  selector:
+    app: gateway
+  ports:
+    - name: shard
+      port: 9100
+      targetPort: 9100
+      protocol: TCP
+
+---
+# --- Admin (public-facing LoadBalancer for HTTP API) ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: admin
+  namespace: milnet-sso
+  labels:
+    app: admin
+    tier: bastion
+    app.kubernetes.io/part-of: milnet-sso
+    app.kubernetes.io/component: admin
+  annotations:
+    cloud.google.com/neg: '{"ingress": true}'
+spec:
+  type: ClusterIP
+  selector:
+    app: admin
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+
+---
+# --- Orchestrator (internal) ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orchestrator
+  namespace: milnet-sso
+  labels:
+    app: orchestrator
+    tier: auth
+    app.kubernetes.io/part-of: milnet-sso
+    app.kubernetes.io/component: orchestrator
+spec:
+  type: ClusterIP
+  selector:
+    app: orchestrator
+  ports:
+    - name: shard
+      port: 9101
+      targetPort: 9101
+      protocol: TCP
+
+---
+# --- OPAQUE (internal) ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: opaque
+  namespace: milnet-sso
+  labels:
+    app: opaque
+    tier: auth
+    app.kubernetes.io/part-of: milnet-sso
+    app.kubernetes.io/component: opaque
+spec:
+  type: ClusterIP
+  selector:
+    app: opaque
+  ports:
+    - name: shard
+      port: 9102
+      targetPort: 9102
+      protocol: TCP
+
+---
+# --- TSS (internal, headless for peer-to-peer FROST) ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tss
+  namespace: milnet-sso
+  labels:
+    app: tss
+    tier: auth
+    app.kubernetes.io/part-of: milnet-sso
+    app.kubernetes.io/component: tss
+spec:
+  type: ClusterIP
+  selector:
+    app: tss
+  ports:
+    - name: shard
+      port: 9103
+      targetPort: 9103
+      protocol: TCP
+
+---
+# TSS headless service for pod-to-pod discovery (FROST protocol)
+apiVersion: v1
+kind: Service
+metadata:
+  name: tss-headless
+  namespace: milnet-sso
+  labels:
+    app: tss
+    tier: auth
+    app.kubernetes.io/part-of: milnet-sso
+    app.kubernetes.io/component: tss
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app: tss
+  ports:
+    - name: shard
+      port: 9103
+      targetPort: 9103
+      protocol: TCP
+
+---
+# --- Verifier (internal) ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: verifier
+  namespace: milnet-sso
+  labels:
+    app: verifier
+    tier: verify
+    app.kubernetes.io/part-of: milnet-sso
+    app.kubernetes.io/component: verifier
+spec:
+  type: ClusterIP
+  selector:
+    app: verifier
+  ports:
+    - name: shard
+      port: 9104
+      targetPort: 9104
+      protocol: TCP
+
+---
+# --- Ratchet (internal) ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ratchet
+  namespace: milnet-sso
+  labels:
+    app: ratchet
+    tier: verify
+    app.kubernetes.io/part-of: milnet-sso
+    app.kubernetes.io/component: ratchet
+spec:
+  type: ClusterIP
+  selector:
+    app: ratchet
+  ports:
+    - name: shard
+      port: 9105
+      targetPort: 9105
+      protocol: TCP
+
+---
+# --- Audit (internal) ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: audit
+  namespace: milnet-sso
+  labels:
+    app: audit
+    tier: support
+    app.kubernetes.io/part-of: milnet-sso
+    app.kubernetes.io/component: audit
+spec:
+  type: ClusterIP
+  selector:
+    app: audit
+  ports:
+    - name: shard
+      port: 9108
+      targetPort: 9108
+      protocol: TCP
+
+---
+# --- PostgreSQL (internal) ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: milnet-sso
+  labels:
+    app: postgres
+    tier: data
+    app.kubernetes.io/part-of: milnet-sso
+    app.kubernetes.io/component: database
+spec:
+  type: ClusterIP
+  selector:
+    app: postgres
+  ports:
+    - name: postgresql
+      port: 5432
+      targetPort: 5432
+      protocol: TCP

@@ -482,6 +482,7 @@ impl OrchestratorService {
             scope: 0x0000_000F, dpop_hash: request.dpop_key_hash,
             ceremony_id: session_id, tier, ratchet_epoch: 1, token_id,
             aud: request.audience.clone(),
+            classification: 0,
         };
 
         let ratchet_key = generate_key_64();

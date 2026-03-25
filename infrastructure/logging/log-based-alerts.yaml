@@ -1,0 +1,224 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# MILNET SSO — Log-Based Alert Policies
+# ──────────────────────────────────────────────────────────────────────────────
+# Declarative alert definitions. The Terraform monitoring module creates these
+# as google_monitoring_alert_policy resources. This YAML is the human-readable
+# specification and can also be applied via gcloud wrappers.
+# ──────────────────────────────────────────────────────────────────────────────
+
+alerts:
+
+  # ── Authentication Failure Spike ──
+  - name: auth-failure-spike
+    display_name: "MILNET SSO: Auth Failures > 10/min"
+    severity: HIGH
+    metric: logging.googleapis.com/user/milnet-auth-failures-de033d2b
+    condition:
+      comparison: COMPARISON_GT
+      threshold: 10
+      duration: 60s
+      aggregation:
+        alignment_period: 60s
+        per_series_aligner: ALIGN_RATE
+    documentation: |
+      ## Authentication Failure Spike
+
+      **Threshold:** >10 authentication failures per minute.
+
+      **Possible causes:**
+      - Brute force attack against one or more user accounts
+      - Credential stuffing with leaked password databases
+      - Misconfigured client application
+      - Service account token expiration
+
+      **Response actions:**
+      1. Check the admin dashboard for affected user IDs and source IPs
+      2. If concentrated on one user: check if account is already locked
+      3. If from one IP: verify Cloud Armor WAF rate limiting is active
+      4. If distributed: escalate to incident response (possible coordinated attack)
+
+      **Runbook:** https://milnet-docs/runbook/auth-failure-spike
+    auto_close: 1800s
+
+  # ── Duress Detection ──
+  - name: duress-detected
+    display_name: "MILNET SSO: Duress Detection [CRITICAL]"
+    severity: CRITICAL
+    metric: logging.googleapis.com/user/milnet-duress-detections-de033d2b
+    condition:
+      comparison: COMPARISON_GT
+      threshold: 0
+      duration: 0s
+      aggregation:
+        alignment_period: 60s
+        per_series_aligner: ALIGN_COUNT
+    documentation: |
+      ## CRITICAL: Duress PIN Activated
+
+      A user has entered their duress PIN, indicating possible coercion.
+
+      **Immediate actions (within 5 minutes):**
+      1. Identify the affected user from the SIEM event payload
+      2. All sessions for this user have been automatically revoked
+      3. Contact the user through an out-of-band secure channel
+      4. Do NOT contact via their regular phone/email (may be compromised)
+      5. Notify physical security team if user location is known
+      6. Preserve all logs — do not rotate or delete
+
+      **Escalation:** If no acknowledgment within 15 minutes, escalate to
+      security director and activate physical security protocols.
+
+      **Runbook:** https://milnet-docs/runbook/duress-response
+    auto_close: 86400s
+
+  # ── Tamper Detection ──
+  - name: tamper-detected
+    display_name: "MILNET SSO: Tamper Detection [CRITICAL]"
+    severity: CRITICAL
+    metric: logging.googleapis.com/user/milnet-tamper-detections-de033d2b
+    condition:
+      comparison: COMPARISON_GT
+      threshold: 0
+      duration: 0s
+      aggregation:
+        alignment_period: 60s
+        per_series_aligner: ALIGN_COUNT
+    documentation: |
+      ## CRITICAL: Tamper Detection Triggered
+
+      The platform integrity verification has detected unauthorized modification.
+
+      **Immediate actions:**
+      1. Identify which service/node reported the tamper event
+      2. Isolate the affected node (cordon in Kubernetes)
+      3. Capture forensic snapshot of the node before remediation
+      4. Check all other nodes for similar tampering
+      5. Verify the measured boot chain for the affected node
+      6. Review container image digests against Binary Authorization policy
+
+      **Escalation:** Automatic — all tamper events are P1 incidents.
+
+      **Runbook:** https://milnet-docs/runbook/tamper-response
+    auto_close: 86400s
+
+  # ── Entropy Quality Failure ──
+  - name: entropy-failure
+    display_name: "MILNET SSO: Entropy Quality Failure [CRITICAL]"
+    severity: CRITICAL
+    metric: logging.googleapis.com/user/milnet-entropy-failures-de033d2b
+    condition:
+      comparison: COMPARISON_GT
+      threshold: 0
+      duration: 0s
+      aggregation:
+        alignment_period: 60s
+        per_series_aligner: ALIGN_COUNT
+    documentation: |
+      ## CRITICAL: Entropy Source Degradation
+
+      The cryptographic entropy quality check has failed. All key generation
+      and nonce creation may produce weak values.
+
+      **Immediate actions:**
+      1. Stop all key generation operations on the affected node
+      2. Check /dev/urandom health and kernel entropy pool
+      3. Verify hardware RNG (RDRAND/RDSEED) is functional
+      4. Any keys generated since the failure must be considered compromised
+      5. Re-key all affected sessions after entropy source is restored
+
+      **Runbook:** https://milnet-docs/runbook/entropy-failure
+    auto_close: 86400s
+
+  # ── Certificate Validation Errors ──
+  - name: certificate-errors
+    display_name: "MILNET SSO: Certificate Validation Errors"
+    severity: HIGH
+    metric: logging.googleapis.com/user/milnet-certificate-errors-de033d2b
+    condition:
+      comparison: COMPARISON_GT
+      threshold: 5
+      duration: 300s
+      aggregation:
+        alignment_period: 60s
+        per_series_aligner: ALIGN_RATE
+    documentation: |
+      ## Certificate Validation Errors Exceeding Threshold
+
+      Multiple mTLS certificate validation failures detected.
+
+      **Possible causes:**
+      - Expired service certificates (check rotation schedule)
+      - MITM attack attempting to intercept inter-service traffic
+      - Certificate authority mismatch after CA rotation
+      - Clock skew on nodes causing premature/late validity checks
+
+      **Response actions:**
+      1. Identify the source IPs and services involved
+      2. Check certificate expiry dates across all services
+      3. If from unknown IPs: block at Cloud Armor and investigate
+      4. Verify NTP sync across all nodes
+
+      **Runbook:** https://milnet-docs/runbook/cert-errors
+    auto_close: 3600s
+
+  # ── Brute Force / Account Lockout Cluster ──
+  - name: lockout-cluster
+    display_name: "MILNET SSO: Multiple Account Lockouts"
+    severity: HIGH
+    condition:
+      # Custom: based on counting lockout events in logs
+      log_filter: >-
+        jsonPayload.event_type="lockout"
+      comparison: COMPARISON_GT
+      threshold: 3
+      duration: 300s
+    documentation: |
+      ## Multiple Account Lockouts in Short Window
+
+      3+ accounts locked within 5 minutes suggests a coordinated attack.
+
+      **Response:** Activate enhanced monitoring. Check if source IPs overlap.
+      Consider temporary global rate limit reduction.
+
+      **Runbook:** https://milnet-docs/runbook/brute-force-response
+    auto_close: 3600s
+
+  # ── Circuit Breaker Cascade ──
+  - name: circuit-breaker-cascade
+    display_name: "MILNET SSO: Circuit Breaker Cascade"
+    severity: HIGH
+    condition:
+      log_filter: >-
+        jsonPayload.event_type="circuit_breaker_opened"
+      comparison: COMPARISON_GT
+      threshold: 2
+      duration: 300s
+    documentation: |
+      ## Multiple Circuit Breakers Open
+
+      Multiple services have entered circuit-breaker open state, indicating
+      a potential cascade failure.
+
+      **Response:**
+      1. Check which services are affected
+      2. Identify the root cause service (usually the first to open)
+      3. Check Cloud SQL and KMS health
+      4. If database-related: check connection pool exhaustion
+
+      **Runbook:** https://milnet-docs/runbook/cascade-failure
+    auto_close: 1800s
+
+# ── Notification Channels ──
+# Reference IDs — actual channels created via Terraform or gcloud.
+notification_channels:
+  - type: pagerduty
+    description: "PagerDuty integration for P1/P2 incidents"
+    for_severities: [CRITICAL, HIGH]
+
+  - type: slack
+    description: "Slack #milnet-security-alerts channel"
+    for_severities: [CRITICAL, HIGH, MEDIUM]
+
+  - type: email
+    description: "Security team distribution list"
+    for_severities: [CRITICAL, HIGH, MEDIUM, LOW]

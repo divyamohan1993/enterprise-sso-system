@@ -44,6 +44,10 @@ pub struct TokenClaims {
     /// Audience — the relying party this token is bound to.
     #[serde(default)]
     pub aud: Option<String>,
+    /// Classification level for Mandatory Access Control (MAC).
+    /// Default: 0 (Unclassified) for backward compatibility.
+    #[serde(default)]
+    pub classification: u8,
 }
 
 /// Custom Debug for TokenClaims — redacts cryptographic material.
@@ -61,6 +65,7 @@ impl std::fmt::Debug for TokenClaims {
             .field("ratchet_epoch", &self.ratchet_epoch)
             .field("token_id", &"[REDACTED]")
             .field("aud", &"[REDACTED]")
+            .field("classification", &self.classification)
             .finish()
     }
 }
@@ -132,6 +137,7 @@ impl Token {
                 ratchet_epoch: 42,
                 token_id: [0xAB; 16],
                 aud: None,
+                classification: 0,
             },
             ratchet_tag: [0xDD; 64],
             frost_signature: [0xEE; 64],
@@ -253,6 +259,16 @@ pub enum AuditEventType {
     RecoveryCodeUsed,
     RecoveryCodesGenerated,
     UserDeleted,
+    /// Admin RBAC: insufficient role for requested operation.
+    AdminRbacDenied,
+    /// Admin RBAC: role-based access granted.
+    AdminRbacGranted,
+    /// Cross-domain transfer decision (allowed or denied).
+    CrossDomainDecision,
+    /// Destructive admin action submitted for multi-person ceremony.
+    AdminCeremonyRequired,
+    /// DPoP proof replay detected.
+    DpopReplayDetected,
 }
 
 // ── AuditEntry ────────────────────────────────────────────────────────
@@ -269,6 +285,10 @@ pub struct AuditEntry {
     #[serde(with = "byte_array_64")]
     pub prev_hash: [u8; 64],
     pub signature: Vec<u8>,
+    /// Classification level of this audit entry for MAC enforcement.
+    /// Default: 0 (Unclassified) for backward compatibility.
+    #[serde(default)]
+    pub classification: u8,
 }
 
 /// Custom Debug for AuditEntry — redacts cryptographic material.
@@ -284,6 +304,7 @@ impl std::fmt::Debug for AuditEntry {
             .field("timestamp", &self.timestamp)
             .field("prev_hash", &"[REDACTED]")
             .field("signature", &"[REDACTED]")
+            .field("classification", &self.classification)
             .finish()
     }
 }

@@ -394,6 +394,7 @@ fn make_valid_token_and_key() -> (Token, frost_ristretto255::keys::PublicKeyPack
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
         aud: None,
+        classification: 0,
     };
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
     let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
@@ -641,6 +642,7 @@ fn test_token_signature_cannot_be_transplanted() {
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
         aud: None,
+        classification: 0,
     };
     let claims_b = TokenClaims {
         sub: Uuid::new_v4(),
@@ -654,6 +656,7 @@ fn test_token_signature_cannot_be_transplanted() {
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
         aud: None,
+        classification: 0,
     };
 
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
@@ -699,6 +702,7 @@ fn test_expired_token_rejected() {
                 ratchet_epoch: 1,
                 token_id: [0xAB; 16],
                 aud: None,
+        classification: 0,
             };
 
             let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
@@ -733,6 +737,7 @@ fn test_token_from_different_dkg_rejected() {
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
         aud: None,
+        classification: 0,
     };
     let (coordinator1, mut nodes1) = distribute_shares(&mut dkg1);
     let (_pq_sk, _pq_vk) = crypto::pq_sign::generate_pq_keypair();

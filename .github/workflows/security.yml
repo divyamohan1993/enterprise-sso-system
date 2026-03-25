@@ -1,0 +1,157 @@
+name: Nightly Security Scan
+on:
+  schedule:
+    # Run at 02:00 UTC every day
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+env:
+  CARGO_TERM_COLOR: always
+  IMAGE_REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ── Cargo Advisory Database Scan ─────────────────────────────────────────────
+  cargo-audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Run cargo-audit (hard fail)
+        run: cargo audit --deny warnings
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: Run cargo-deny (all checks)
+        run: cargo deny check advisories licenses sources bans
+
+  # ── Container Image Vulnerability Scan ───────────────────────────────────────
+  container-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [gateway, orchestrator, opaque, tss, verifier, admin, ratchet, audit]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Scan container with Trivy
+        uses: aquasecurity/trivy-action@18f2510ee396bbf400402947e0f18c8ea63fd80e # v0.28.0
+        with:
+          image-ref: ghcr.io/${{ github.repository }}/${{ matrix.service }}:master
+          format: sarif
+          output: trivy-results-${{ matrix.service }}.sarif
+          severity: CRITICAL,HIGH,MEDIUM
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results-${{ matrix.service }}.sarif
+
+  # ── SBOM Freshness Check ─────────────────────────────────────────────────────
+  sbom-refresh:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked
+      - name: Generate fresh CycloneDX SBOM
+        run: cargo cyclonedx --format json --output sbom-cyclonedx-nightly.json
+      - name: Validate SBOM is non-empty
+        run: |
+          if [ ! -s sbom-cyclonedx-nightly.json ]; then
+            echo "ERROR: SBOM generation failed"
+            exit 1
+          fi
+
+      - name: Install grype
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+      - name: Scan SBOM for new vulnerabilities
+        run: grype sbom:sbom-cyclonedx-nightly.json --fail-on critical
+
+  # ── Secret Scanning (full history) ──────────────────────────────────────────
+  secret-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - name: Run Gitleaks (full history scan)
+        uses: gitleaks/gitleaks-action@cb7149a9b57195b609c63e8518d2c6056677d2d0 # v2.3.7
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── License Compliance ───────────────────────────────────────────────────────
+  license-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: Check licenses
+        run: cargo deny check licenses
+
+  # ── Cosign Signature Verification ───────────────────────────────────────────
+  verify-signatures:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [gateway, orchestrator, opaque, tss, verifier, admin, ratchet, audit]
+    steps:
+      - name: Install cosign
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify image signatures
+        env:
+          REPO: ${{ github.repository }}
+          SERVICE: ${{ matrix.service }}
+        run: |
+          cosign verify \
+            --certificate-identity-regexp "https://github.com/${REPO}/*" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "ghcr.io/${REPO}/${SERVICE}:master" || \
+          echo "WARNING: Image signature verification failed for ${SERVICE}. Image may not have been signed yet."

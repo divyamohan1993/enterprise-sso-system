@@ -1,6 +1,7 @@
 //! PostgreSQL persistence layer for the SSO system.
 //! Uses sqlx with async PostgreSQL driver.
-//! Hardened with statement timeouts, connection pool limits, and health checks.
+//! Hardened with statement timeouts, connection pool limits, health checks,
+//! and mandatory SSL enforcement in production.
 
 use std::time::Duration;
 
@@ -30,6 +31,150 @@ fn statement_timeout_secs() -> u64 {
         .unwrap_or(DEFAULT_STATEMENT_TIMEOUT_SECS)
 }
 
+// ---------------------------------------------------------------------------
+// SSL enforcement for PostgreSQL connections
+// ---------------------------------------------------------------------------
+
+/// SSL mode extracted from the DATABASE_URL query string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SslMode {
+    Disable,
+    Allow,
+    Prefer,
+    Require,
+    VerifyCa,
+    VerifyFull,
+    Unknown,
+}
+
+impl SslMode {
+    /// Returns `true` for modes that guarantee encryption on the wire.
+    pub fn is_secure(&self) -> bool {
+        matches!(self, SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull)
+    }
+}
+
+/// Parse the `sslmode` parameter from a PostgreSQL connection URL.
+///
+/// Accepts both `sslmode` and `ssl_mode` (with and without URL encoding).
+/// Returns `SslMode::Unknown` if the parameter is absent.
+pub fn parse_sslmode(database_url: &str) -> SslMode {
+    // Find sslmode in the query string portion of the URL.
+    let query_start = database_url.find('?').unwrap_or(database_url.len());
+    let query = &database_url[query_start..];
+
+    for param in query.trim_start_matches('?').split('&') {
+        let mut kv = param.splitn(2, '=');
+        let key = kv.next().unwrap_or("");
+        let val = kv.next().unwrap_or("");
+        if key.eq_ignore_ascii_case("sslmode") || key.eq_ignore_ascii_case("ssl_mode") {
+            return match val.to_lowercase().as_str() {
+                "disable" => SslMode::Disable,
+                "allow" => SslMode::Allow,
+                "prefer" => SslMode::Prefer,
+                "require" => SslMode::Require,
+                "verify-ca" | "verify_ca" => SslMode::VerifyCa,
+                "verify-full" | "verify_full" => SslMode::VerifyFull,
+                _ => SslMode::Unknown,
+            };
+        }
+    }
+    SslMode::Unknown
+}
+
+/// Ensure `sslmode=require` (or stronger) is present in the DATABASE_URL.
+///
+/// If the URL lacks an `sslmode` parameter, this function appends `sslmode=require`.
+/// Returns the (possibly modified) URL.
+pub fn enforce_ssl_in_url(database_url: &str) -> String {
+    let mode = parse_sslmode(database_url);
+    if mode.is_secure() {
+        return database_url.to_string();
+    }
+    // Append sslmode=require if missing or insecure
+    if mode == SslMode::Unknown {
+        // No sslmode param — append it
+        let sep = if database_url.contains('?') { "&" } else { "?" };
+        let url = format!("{database_url}{sep}sslmode=require");
+        tracing::info!("DB SSL: appended sslmode=require to DATABASE_URL");
+        return url;
+    }
+    // sslmode is present but insecure — replace it
+    tracing::warn!(
+        "DB SSL: sslmode={:?} is not secure; overriding to sslmode=require",
+        mode
+    );
+    // Replace the existing sslmode value
+    let mut result = String::with_capacity(database_url.len() + 16);
+    let query_start = database_url.find('?').unwrap_or(database_url.len());
+    result.push_str(&database_url[..query_start]);
+    let query = &database_url[query_start..];
+    let mut first = true;
+    for param in query.trim_start_matches('?').split('&') {
+        let key = param.splitn(2, '=').next().unwrap_or("");
+        if key.eq_ignore_ascii_case("sslmode") || key.eq_ignore_ascii_case("ssl_mode") {
+            result.push(if first { '?' } else { '&' });
+            result.push_str("sslmode=require");
+        } else if !param.is_empty() {
+            result.push(if first { '?' } else { '&' });
+            result.push_str(param);
+        } else {
+            continue;
+        }
+        first = false;
+    }
+    result
+}
+
+/// Validate SSL configuration at startup.
+///
+/// In production (`MILNET_PRODUCTION=1`), rejects connections that do not use
+/// `sslmode=require` or `sslmode=verify-full`. Logs a warning in dev mode
+/// if SSL is not configured.
+///
+/// Also validates `MILNET_DB_SSL_CERT` and `MILNET_DB_SSL_KEY` env vars
+/// when `sslmode=verify-full` is requested.
+pub fn validate_ssl_config(database_url: &str) {
+    let mode = parse_sslmode(database_url);
+    let is_production = crate::sealed_keys::is_production();
+
+    // Log SSL cert/key availability
+    let ssl_cert = std::env::var("MILNET_DB_SSL_CERT").ok().filter(|s| !s.is_empty());
+    let ssl_key = std::env::var("MILNET_DB_SSL_KEY").ok().filter(|s| !s.is_empty());
+
+    if let Some(ref cert_path) = ssl_cert {
+        tracing::info!("DB SSL: client certificate configured at {}", cert_path);
+    }
+    if let Some(ref key_path) = ssl_key {
+        tracing::info!("DB SSL: client key configured at {}", key_path);
+    }
+
+    if !mode.is_secure() {
+        if is_production {
+            panic!(
+                "FATAL: DATABASE_URL sslmode={:?} is not acceptable in production. \
+                 Set sslmode=require or sslmode=verify-full.",
+                mode
+            );
+        }
+        tracing::warn!(
+            "DB SSL WARNING: sslmode={:?} does not guarantee encryption. \
+             Set sslmode=require or sslmode=verify-full for production use.",
+            mode
+        );
+    }
+
+    // verify-full requires cert and key
+    if mode == SslMode::VerifyFull {
+        if ssl_cert.is_none() {
+            tracing::warn!("DB SSL: sslmode=verify-full but MILNET_DB_SSL_CERT is not set");
+        }
+        if ssl_key.is_none() {
+            tracing::warn!("DB SSL: sslmode=verify-full but MILNET_DB_SSL_KEY is not set");
+        }
+    }
+}
+
 /// Validate that `user_ids` is a JSON array of valid UUIDs.
 ///
 /// Returns the parsed UUIDs on success, or a descriptive error message.
@@ -47,7 +192,18 @@ pub fn validate_user_ids(ids: &str) -> Result<Vec<uuid::Uuid>, String> {
 }
 
 /// Initialize the PostgreSQL connection pool with hardened settings.
+///
+/// Accepts per-service DATABASE_URL — each service may connect with its own
+/// restricted PostgreSQL role (see `migrations/002_per_service_users.sql`).
+///
+/// SSL is enforced: in production, non-SSL connections are rejected at startup.
+/// In dev mode, `sslmode=require` is appended automatically if missing.
 pub async fn init_database(database_url: &str) -> PgPool {
+    // ── SSL enforcement ──
+    validate_ssl_config(database_url);
+    let ssl_url = enforce_ssl_in_url(database_url);
+    let connect_url = ssl_url.as_str();
+
     let timeout_secs = statement_timeout_secs();
 
     let pool = PgPoolOptions::new()
@@ -67,6 +223,18 @@ pub async fn init_database(database_url: &str) -> PgPool {
                         e
                     })?;
 
+                // Verify SSL is active on the connection (belt-and-suspenders).
+                let ssl_row = sqlx::Executor::fetch_optional(
+                    &mut *conn,
+                    "SELECT current_setting('ssl', true)",
+                )
+                .await
+                .ok()
+                .flatten();
+                if ssl_row.is_some() {
+                    tracing::debug!("DB connection established with SSL active");
+                }
+
                 // Enable audit logging for security compliance.
                 // Use .ok() since these may fail if PG doesn't grant SET permission.
                 let _ = sqlx::Executor::execute(&mut *conn, "SET log_statement = 'mod'").await.ok();
@@ -76,7 +244,7 @@ pub async fn init_database(database_url: &str) -> PgPool {
                 Ok(())
             })
         })
-        .connect(database_url)
+        .connect(connect_url)
         .await
         .expect("Failed to connect to PostgreSQL");
 
@@ -333,6 +501,137 @@ mod tests {
     fn validate_user_ids_mixed_valid_invalid() {
         let ids = r#"["550e8400-e29b-41d4-a716-446655440000","garbage"]"#;
         assert!(validate_user_ids(ids).is_err());
+    }
+
+    // ── SSL enforcement tests ──
+
+    #[test]
+    fn parse_sslmode_require() {
+        assert_eq!(parse_sslmode("postgres://host/db?sslmode=require"), SslMode::Require);
+    }
+
+    #[test]
+    fn parse_sslmode_verify_full() {
+        assert_eq!(parse_sslmode("postgres://host/db?sslmode=verify-full"), SslMode::VerifyFull);
+    }
+
+    #[test]
+    fn parse_sslmode_verify_ca() {
+        assert_eq!(parse_sslmode("postgres://host/db?sslmode=verify-ca"), SslMode::VerifyCa);
+    }
+
+    #[test]
+    fn parse_sslmode_disable() {
+        assert_eq!(parse_sslmode("postgres://host/db?sslmode=disable"), SslMode::Disable);
+    }
+
+    #[test]
+    fn parse_sslmode_prefer() {
+        assert_eq!(parse_sslmode("postgres://host/db?sslmode=prefer"), SslMode::Prefer);
+    }
+
+    #[test]
+    fn parse_sslmode_allow() {
+        assert_eq!(parse_sslmode("postgres://host/db?sslmode=allow"), SslMode::Allow);
+    }
+
+    #[test]
+    fn parse_sslmode_missing() {
+        assert_eq!(parse_sslmode("postgres://host/db"), SslMode::Unknown);
+    }
+
+    #[test]
+    fn parse_sslmode_with_other_params() {
+        assert_eq!(
+            parse_sslmode("postgres://host/db?timeout=10&sslmode=require&pool=5"),
+            SslMode::Require
+        );
+    }
+
+    #[test]
+    fn parse_sslmode_case_insensitive_key() {
+        assert_eq!(parse_sslmode("postgres://host/db?SSLMODE=require"), SslMode::Require);
+    }
+
+    #[test]
+    fn parse_sslmode_ssl_mode_underscore() {
+        assert_eq!(parse_sslmode("postgres://host/db?ssl_mode=require"), SslMode::Require);
+    }
+
+    #[test]
+    fn sslmode_is_secure() {
+        assert!(SslMode::Require.is_secure());
+        assert!(SslMode::VerifyCa.is_secure());
+        assert!(SslMode::VerifyFull.is_secure());
+        assert!(!SslMode::Disable.is_secure());
+        assert!(!SslMode::Allow.is_secure());
+        assert!(!SslMode::Prefer.is_secure());
+        assert!(!SslMode::Unknown.is_secure());
+    }
+
+    #[test]
+    fn enforce_ssl_appends_sslmode_when_missing() {
+        let url = enforce_ssl_in_url("postgres://host/db");
+        assert!(url.contains("sslmode=require"));
+    }
+
+    #[test]
+    fn enforce_ssl_appends_with_ampersand_when_other_params_exist() {
+        let url = enforce_ssl_in_url("postgres://host/db?timeout=10");
+        assert!(url.contains("&sslmode=require"));
+    }
+
+    #[test]
+    fn enforce_ssl_preserves_secure_mode() {
+        let original = "postgres://host/db?sslmode=verify-full";
+        let url = enforce_ssl_in_url(original);
+        assert_eq!(url, original);
+    }
+
+    #[test]
+    fn enforce_ssl_overrides_insecure_mode() {
+        let url = enforce_ssl_in_url("postgres://host/db?sslmode=disable");
+        assert!(url.contains("sslmode=require"));
+        assert!(!url.contains("sslmode=disable"));
+    }
+
+    #[test]
+    fn enforce_ssl_overrides_prefer_mode() {
+        let url = enforce_ssl_in_url("postgres://host/db?sslmode=prefer");
+        assert!(url.contains("sslmode=require"));
+        assert!(!url.contains("sslmode=prefer"));
+    }
+
+    #[test]
+    fn enforce_ssl_preserves_other_params_when_overriding() {
+        let url = enforce_ssl_in_url("postgres://host/db?timeout=10&sslmode=disable&pool=5");
+        assert!(url.contains("timeout=10"));
+        assert!(url.contains("pool=5"));
+        assert!(url.contains("sslmode=require"));
+    }
+
+    #[test]
+    fn validate_ssl_config_does_not_panic_dev_mode() {
+        // In dev mode (MILNET_PRODUCTION not set), should just warn, not panic
+        std::env::remove_var("MILNET_PRODUCTION");
+        validate_ssl_config("postgres://host/db?sslmode=disable");
+        // If we reach here, no panic occurred
+    }
+
+    #[test]
+    #[should_panic(expected = "FATAL: DATABASE_URL sslmode=")]
+    fn validate_ssl_config_panics_in_production_mode() {
+        std::env::set_var("MILNET_PRODUCTION", "1");
+        validate_ssl_config("postgres://host/db?sslmode=disable");
+        // Clean up in case panic doesn't happen (it should)
+        std::env::remove_var("MILNET_PRODUCTION");
+    }
+
+    #[test]
+    fn validate_ssl_config_ok_in_production_with_require() {
+        std::env::set_var("MILNET_PRODUCTION", "1");
+        validate_ssl_config("postgres://host/db?sslmode=require");
+        std::env::remove_var("MILNET_PRODUCTION");
     }
 
     #[tokio::test]

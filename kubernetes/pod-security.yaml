@@ -1,0 +1,125 @@
+---
+# ==============================================================================
+# MILNET SSO — Pod Security Policy (Restricted Profile)
+# ==============================================================================
+# NOTE: PodSecurityPolicy is deprecated since K8s 1.21 and removed in 1.25.
+# The namespace-level Pod Security Standards labels in namespace.yaml provide
+# the primary enforcement. This PSP is retained for clusters running < 1.25
+# or using a policy engine (OPA/Kyverno) that consumes PSP-style definitions.
+# ==============================================================================
+apiVersion: policy/v1beta1
+kind: PodSecurityPolicy
+metadata:
+  name: milnet-sso-restricted
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+  annotations:
+    seccomp.security.alpha.kubernetes.io/allowedProfiles: runtime/default
+    apparmor.security.beta.kubernetes.io/allowedProfiles: runtime/default
+spec:
+  privileged: false
+  allowPrivilegeEscalation: false
+  requiredDropCapabilities:
+    - ALL
+  readOnlyRootFilesystem: true
+  runAsUser:
+    rule: MustRunAsNonRoot
+  runAsGroup:
+    rule: MustRunAs
+    ranges:
+      - min: 1000
+        max: 65534
+  fsGroup:
+    rule: MustRunAs
+    ranges:
+      - min: 1000
+        max: 65534
+  supplementalGroups:
+    rule: MustRunAs
+    ranges:
+      - min: 1000
+        max: 65534
+  volumes:
+    - configMap
+    - emptyDir
+    - projected
+    - secret
+    - downwardAPI
+    - persistentVolumeClaim
+  hostNetwork: false
+  hostIPC: false
+  hostPID: false
+  seLinux:
+    rule: RunAsAny
+
+---
+# ==============================================================================
+# Kyverno ClusterPolicy equivalent (for clusters using Kyverno >= 1.6)
+# ==============================================================================
+# Uncomment if using Kyverno instead of PSP:
+#
+# apiVersion: kyverno.io/v1
+# kind: ClusterPolicy
+# metadata:
+#   name: milnet-sso-restricted
+#   annotations:
+#     policies.kyverno.io/title: MILNET SSO Restricted Policy
+#     policies.kyverno.io/category: Pod Security Standards (Restricted)
+#     policies.kyverno.io/severity: high
+# spec:
+#   validationFailureAction: Enforce
+#   background: true
+#   rules:
+#     - name: restrict-escalation
+#       match:
+#         any:
+#           - resources:
+#               kinds: ["Pod"]
+#               namespaces: ["milnet-sso"]
+#       validate:
+#         message: "Privilege escalation is not allowed"
+#         pattern:
+#           spec:
+#             containers:
+#               - securityContext:
+#                   allowPrivilegeEscalation: false
+#     - name: require-run-as-non-root
+#       match:
+#         any:
+#           - resources:
+#               kinds: ["Pod"]
+#               namespaces: ["milnet-sso"]
+#       validate:
+#         message: "Containers must run as non-root"
+#         pattern:
+#           spec:
+#             containers:
+#               - securityContext:
+#                   runAsNonRoot: true
+#     - name: drop-all-capabilities
+#       match:
+#         any:
+#           - resources:
+#               kinds: ["Pod"]
+#               namespaces: ["milnet-sso"]
+#       validate:
+#         message: "Containers must drop all capabilities"
+#         pattern:
+#           spec:
+#             containers:
+#               - securityContext:
+#                   capabilities:
+#                     drop: ["ALL"]
+#     - name: read-only-root-filesystem
+#       match:
+#         any:
+#           - resources:
+#               kinds: ["Pod"]
+#               namespaces: ["milnet-sso"]
+#       validate:
+#         message: "Root filesystem must be read-only"
+#         pattern:
+#           spec:
+#             containers:
+#               - securityContext:
+#                   readOnlyRootFilesystem: true

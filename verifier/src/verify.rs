@@ -1,3 +1,4 @@
+use common::classification::{self, ClassificationLevel};
 use common::domain;
 use common::error::MilnetError;
 use common::revocation::{RevocationList, SharedRevocationList};
@@ -6,6 +7,8 @@ use crypto::pq_sign::{pq_verify, PqVerifyingKey};
 use frost_ristretto255::keys::PublicKeyPackage;
 use hmac::{Hmac, Mac};
 use sha2::Sha512;
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 type HmacSha512 = Hmac<Sha512>;
@@ -15,6 +18,75 @@ const MAX_SESSION_EPOCHS: u64 = 2880;
 
 /// Default max token lifetime for lazy cleanup (8 hours in seconds).
 const DEFAULT_MAX_TOKEN_LIFETIME_SECS: i64 = 8 * 60 * 60;
+
+/// Maximum DPoP timestamp tolerance (seconds). Proofs older than this are rejected.
+const DPOP_TIMESTAMP_TOLERANCE_SECS: i64 = 1;
+
+/// Maximum entries in the DPoP replay cache before cleanup is triggered.
+const DPOP_REPLAY_CACHE_MAX: usize = 100_000;
+
+/// TTL for DPoP replay cache entries (seconds). Entries older than this are
+/// eligible for eviction.
+const DPOP_REPLAY_CACHE_TTL_SECS: i64 = 60;
+
+// ---------------------------------------------------------------------------
+// DPoP Replay Cache
+// ---------------------------------------------------------------------------
+
+/// Bounded DPoP proof replay cache with TTL-based eviction.
+///
+/// Prevents reuse of DPoP proofs within the tolerance window. Each proof is
+/// identified by its SHA-512 hash. Entries expire after `DPOP_REPLAY_CACHE_TTL_SECS`.
+struct DpopReplayCache {
+    /// Map from proof hash -> timestamp when it was first seen.
+    seen: HashMap<[u8; 64], i64>,
+}
+
+impl DpopReplayCache {
+    fn new() -> Self {
+        Self {
+            seen: HashMap::new(),
+        }
+    }
+
+    /// Check if a proof has been seen before. If not, record it and return `false`.
+    /// If already seen (replay), return `true`.
+    fn check_and_record(&mut self, proof_hash: &[u8; 64]) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // Cleanup if at capacity
+        if self.seen.len() >= DPOP_REPLAY_CACHE_MAX {
+            let cutoff = now - DPOP_REPLAY_CACHE_TTL_SECS;
+            self.seen.retain(|_, &mut ts| ts > cutoff);
+        }
+
+        if self.seen.contains_key(proof_hash) {
+            return true; // Replay detected
+        }
+        self.seen.insert(*proof_hash, now);
+        false
+    }
+}
+
+/// Global DPoP replay cache — thread-safe via Mutex.
+static DPOP_REPLAY_CACHE: std::sync::LazyLock<Mutex<DpopReplayCache>> =
+    std::sync::LazyLock::new(|| Mutex::new(DpopReplayCache::new()));
+
+/// Check and record a DPoP proof hash in the replay cache.
+/// Returns `true` if this is a replay (proof was already seen).
+pub fn is_dpop_replay(proof_hash: &[u8; 64]) -> bool {
+    match DPOP_REPLAY_CACHE.lock() {
+        Ok(mut cache) => cache.check_and_record(proof_hash),
+        Err(_) => {
+            // Mutex poisoned — fail closed (reject as replay)
+            tracing::error!("DPoP replay cache mutex poisoned — rejecting proof");
+            true
+        }
+    }
+}
 
 /// Verify a token's signature and claims (spec C.11), enforcing DPoP channel
 /// binding.
@@ -70,11 +142,21 @@ fn dpop_required() -> bool {
 
 /// Returns `true` if the given tier is exempt from DPoP requirements.
 ///
-/// Tier 3 (Sensor) and Tier 4 (Emergency) devices may lack the computational
-/// resources or stable connectivity needed for DPoP key management, so they
-/// are exempt from the DPoP binding requirement.
+/// Controlled by the `MILNET_DPOP_EXEMPT_TIERS` environment variable.
+/// Format: comma-separated tier numbers (e.g., "3,4").
+/// Default: empty string — NO tiers are exempt. All tiers require DPoP.
+///
+/// Previously Tier 3 (Sensor) and Tier 4 (Emergency) were unconditionally
+/// exempt. This is now opt-in to close the DPoP enforcement gap.
 fn is_dpop_exempt_tier(tier: u8) -> bool {
-    tier == 3 || tier == 4
+    let exempt = std::env::var("MILNET_DPOP_EXEMPT_TIERS").unwrap_or_default();
+    if exempt.is_empty() {
+        return false; // Default: no exemptions
+    }
+    exempt
+        .split(',')
+        .filter_map(|s| s.trim().parse::<u8>().ok())
+        .any(|t| t == tier)
 }
 
 /// Inner verification logic shared by `verify_token` and `verify_token_bound`.
@@ -417,4 +499,63 @@ pub fn verify_token_with_shared_revocation(
 
     // 3. Full signature + DPoP verification
     verify_token_inner(token, public_key_package, pq_verifying_key, client_dpop_key)
+}
+
+// ---------------------------------------------------------------------------
+// Classification-enforced verification
+// ---------------------------------------------------------------------------
+
+/// Verify a token with full checks INCLUDING mandatory access control.
+///
+/// In addition to all standard checks (revocation, DPoP, signatures), this
+/// verifies that the token's classification level meets or exceeds the
+/// `required_classification` of the target resource.
+///
+/// Enforces the Bell-LaPadula simple security property: a subject may only
+/// access a resource if their classification >= the resource's classification.
+pub fn verify_token_with_classification(
+    token: &Token,
+    public_key_package: &PublicKeyPackage,
+    pq_verifying_key: &PqVerifyingKey,
+    revocation_list: &SharedRevocationList,
+    client_dpop_key: Option<&[u8]>,
+    required_classification: ClassificationLevel,
+) -> Result<TokenClaims, MilnetError> {
+    // 1. Standard verification (revocation + DPoP + signatures)
+    let claims = verify_token_with_shared_revocation(
+        token,
+        public_key_package,
+        pq_verifying_key,
+        revocation_list,
+        client_dpop_key,
+    )?;
+
+    // 2. Classification enforcement (MAC)
+    let token_classification = ClassificationLevel::from_u8(claims.classification)
+        .unwrap_or(ClassificationLevel::Unclassified);
+    let decision = classification::enforce_classification(
+        token_classification,
+        required_classification,
+    );
+    if !decision.is_granted() {
+        return Err(MilnetError::CryptoVerification(format!(
+            "classification denied: token has {} but resource requires {}",
+            token_classification.label(),
+            required_classification.label(),
+        )));
+    }
+
+    Ok(claims)
+}
+
+/// Return the DPoP timestamp tolerance in seconds.
+///
+/// Reduced from the previous 2-second tolerance to 1 second for tighter
+/// replay protection. Configurable via `MILNET_DPOP_TOLERANCE_SECS` for
+/// environments with known clock skew.
+pub fn dpop_timestamp_tolerance_secs() -> i64 {
+    std::env::var("MILNET_DPOP_TOLERANCE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DPOP_TIMESTAMP_TOLERANCE_SECS)
 }

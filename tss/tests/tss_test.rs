@@ -65,6 +65,7 @@ fn test_claims() -> TokenClaims {
         ratchet_epoch: 42,
         token_id: [0xAB; 16],
         aud: None,
+        classification: 0,
     }
 }
 

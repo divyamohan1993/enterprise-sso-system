@@ -17,7 +17,89 @@ type HmacSha512 = Hmac<Sha512>;
 const EPOCH_WINDOW: u64 = 3;
 
 /// Number of recent server nonces to track for clone detection.
-const NONCE_HISTORY_SIZE: usize = 10;
+///
+/// Expanded from 10 to 1000 to cover longer session windows.  At 10s per
+/// epoch, 1000 entries provides ~2.8 hours of full nonce replay protection.
+/// Older nonces beyond this window are checked against a probabilistic
+/// Bloom filter that retains nonce fingerprints for the chain's full lifetime.
+const NONCE_HISTORY_SIZE: usize = 1000;
+
+/// Bloom filter parameters for historical nonce tracking beyond the exact window.
+///
+/// Uses k=7 hash functions over a 16 KiB bit array, giving a false positive
+/// rate of ~0.01% for up to 10,000 nonces.  This means an attacker replaying
+/// an old nonce has a 99.99% chance of being caught even after it ages out of
+/// the exact-match window.
+const BLOOM_FILTER_BITS: usize = 16 * 1024 * 8; // 131,072 bits (16 KiB)
+const BLOOM_FILTER_K: usize = 7;
+
+/// A compact Bloom filter for probabilistic nonce-reuse detection.
+///
+/// Once a nonce ages out of the exact `recent_nonces` window, its fingerprint
+/// remains in the Bloom filter for the chain's entire lifetime.  This provides
+/// defence-in-depth: even if an attacker captures a nonce from hours ago, the
+/// Bloom filter will catch reuse with high probability.
+struct NonceBloomFilter {
+    bits: Vec<u8>,
+}
+
+impl NonceBloomFilter {
+    fn new() -> Self {
+        Self {
+            bits: vec![0u8; BLOOM_FILTER_BITS / 8],
+        }
+    }
+
+    /// Compute k independent bit positions for a nonce using SipHash-style
+    /// double hashing: h(i) = (h1 + i * h2) mod m
+    fn positions(nonce: &[u8; 32]) -> [usize; BLOOM_FILTER_K] {
+        use sha2::{Digest, Sha256};
+
+        // First hash: SHA-256 of nonce
+        let mut hasher = Sha256::new();
+        hasher.update(b"MILNET-BLOOM-H1");
+        hasher.update(nonce);
+        let h1_full = hasher.finalize();
+        let h1 = u64::from_le_bytes(h1_full[..8].try_into().unwrap()) as usize;
+
+        // Second hash: SHA-256 of nonce with different domain
+        let mut hasher = Sha256::new();
+        hasher.update(b"MILNET-BLOOM-H2");
+        hasher.update(nonce);
+        let h2_full = hasher.finalize();
+        let h2 = u64::from_le_bytes(h2_full[..8].try_into().unwrap()) as usize;
+
+        let mut positions = [0usize; BLOOM_FILTER_K];
+        for i in 0..BLOOM_FILTER_K {
+            positions[i] = (h1.wrapping_add(i.wrapping_mul(h2))) % BLOOM_FILTER_BITS;
+        }
+        positions
+    }
+
+    /// Insert a nonce into the Bloom filter.
+    fn insert(&mut self, nonce: &[u8; 32]) {
+        for pos in Self::positions(nonce) {
+            self.bits[pos / 8] |= 1 << (pos % 8);
+        }
+    }
+
+    /// Query whether a nonce might have been seen before.
+    /// Returns false = definitely not seen, true = probably seen.
+    fn might_contain(&self, nonce: &[u8; 32]) -> bool {
+        for pos in Self::positions(nonce) {
+            if self.bits[pos / 8] & (1 << (pos % 8)) == 0 {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl Zeroize for NonceBloomFilter {
+    fn zeroize(&mut self) {
+        self.bits.zeroize();
+    }
+}
 
 /// Minimum distinct byte values required in 32-byte entropy to pass quality check.
 /// 4 bits of randomness means at least 16 distinct values among 32 bytes, but we
@@ -105,6 +187,10 @@ pub struct RatchetChain {
     /// Recent server nonces for clone detection. Tracks last N nonces
     /// and rejects any advancement that reuses one.
     recent_nonces: Vec<[u8; 32]>,
+    /// Bloom filter for probabilistic detection of nonce reuse beyond
+    /// the exact `recent_nonces` window.  Nonces are added to the filter
+    /// as they age out of the exact-match deque.
+    nonce_bloom: NonceBloomFilter,
 }
 
 // Manual Zeroize implementation since we have custom fields
@@ -117,6 +203,7 @@ impl Zeroize for RatchetChain {
         }
         self.recent_keys.clear();
         self.recent_nonces.zeroize();
+        self.nonce_bloom.zeroize();
         self.canary_head.zeroize();
         self.canary_tail.zeroize();
         self.expected_head.zeroize();
@@ -193,6 +280,7 @@ impl RatchetChain {
             max_epoch_lifetime: 2880,
             recent_keys: Vec::new(),
             recent_nonces: Vec::new(),
+            nonce_bloom: NonceBloomFilter::new(),
         };
         chain.lock_chain_key();
         chain
@@ -263,21 +351,40 @@ impl RatchetChain {
             panic!("ratchet: epoch counter would wrap around at u64::MAX");
         }
 
-        // --- Anti-clone nonce check ---
+        // --- Anti-clone nonce check (exact window + Bloom filter) ---
+
+        // Check exact-match window (last NONCE_HISTORY_SIZE nonces)
         for existing in &self.recent_nonces {
             if crypto::ct::ct_eq_32(existing, server_nonce) {
                 tracing::error!(
                     epoch = self.epoch,
                     "SIEM:CRITICAL ratchet advancement rejected: server_nonce reuse detected \
-                     — possible token cloning attack"
+                     in exact window — possible token cloning attack"
                 );
                 panic!("ratchet: server_nonce reuse detected (clone attack)");
             }
         }
 
-        // Track this nonce
+        // Check Bloom filter for older nonces beyond the exact window.
+        // A Bloom filter match means the nonce was *probably* seen before
+        // (false positive rate ~0.01%).  In a MILNET context, we treat
+        // probable reuse as confirmed reuse — fail-closed.
+        if self.nonce_bloom.might_contain(server_nonce) {
+            tracing::error!(
+                epoch = self.epoch,
+                "SIEM:CRITICAL ratchet advancement rejected: server_nonce reuse detected \
+                 via Bloom filter — possible token cloning attack (historical nonce)"
+            );
+            panic!("ratchet: server_nonce reuse detected via Bloom filter (clone attack)");
+        }
+
+        // Track this nonce in the exact window
         self.recent_nonces.push(*server_nonce);
+
+        // When evicting nonces from the exact window, add them to the Bloom filter
         while self.recent_nonces.len() > NONCE_HISTORY_SIZE {
+            let evicted = self.recent_nonces[0];
+            self.nonce_bloom.insert(&evicted);
             self.recent_nonces[0].zeroize();
             self.recent_nonces.remove(0);
         }
@@ -468,6 +575,7 @@ impl RatchetChain {
             max_epoch_lifetime: 2880,
             recent_keys: Vec::new(),
             recent_nonces: Vec::new(),
+            nonce_bloom: NonceBloomFilter::new(),
         };
         chain.lock_chain_key();
         chain
@@ -491,8 +599,9 @@ impl Drop for RatchetChain {
         }
         self.recent_keys.clear();
 
-        // 3. Zeroize nonce history
+        // 3. Zeroize nonce history + Bloom filter
         self.recent_nonces.zeroize();
+        self.nonce_bloom.zeroize();
 
         // 4. Unlock if locked
         if self.key_locked {

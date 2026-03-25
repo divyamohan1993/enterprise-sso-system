@@ -1,0 +1,90 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# MILNET SSO — Cloud Logging Router Configuration
+# ──────────────────────────────────────────────────────────────────────────────
+# Defines log sinks that route security-relevant logs to BigQuery for
+# long-term forensic analysis and compliance retention.
+#
+# Applied via: gcloud logging sinks create ... (or Terraform — see
+# terraform/modules/monitoring/main.tf for the IaC version).
+#
+# This YAML serves as the declarative specification and can be applied
+# with a CI/CD pipeline wrapper around gcloud commands.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Sink 1: All MILNET SIEM events -> BigQuery (partitioned by day)
+# Retention: 365 days (configured on the BigQuery dataset)
+sinks:
+  - name: milnet-security-events-to-bq
+    destination: bigquery.googleapis.com/projects/lmsforshantithakur/datasets/milnet_security_logs_de033d2b
+    filter: >-
+      jsonPayload.source_module=~"authentication|authorization|integrity|key_management|session|availability|access_control|configuration"
+    description: "Route all MILNET SSO security events to BigQuery for forensic analysis"
+    bigqueryOptions:
+      usePartitionedTables: true
+    disabled: false
+
+  # Sink 2: Critical events only -> Cloud Pub/Sub (for real-time SIEM ingestion)
+  - name: milnet-critical-to-pubsub
+    destination: pubsub.googleapis.com/projects/lmsforshantithakur/topics/milnet-critical-events
+    filter: >-
+      jsonPayload.severity=~"CRITICAL|HIGH"
+      OR jsonPayload.event_type=~"duress|tamper_detected|entropy_quality_failure|privilege_escalation"
+    description: "Route critical security events to Pub/Sub for real-time SIEM consumption"
+    disabled: false
+
+  # Sink 3: Audit trail -> Cloud Storage (immutable, long-term compliance)
+  - name: milnet-audit-to-gcs
+    destination: storage.googleapis.com/milnet-audit-archive-de033d2b
+    filter: >-
+      jsonPayload.source_module=~"authentication|authorization|key_management|session"
+      AND jsonPayload.details.outcome=~"success|failure"
+    description: "Archive all authentication/authorization audit trails to GCS for compliance"
+    disabled: false
+
+  # Sink 4: Infrastructure events -> separate BigQuery dataset
+  - name: milnet-infra-to-bq
+    destination: bigquery.googleapis.com/projects/lmsforshantithakur/datasets/milnet_infra_logs_de033d2b
+    filter: >-
+      jsonPayload.source_module=~"availability|configuration"
+      OR jsonPayload.event_type=~"circuit_breaker_opened|circuit_breaker_closed|ratchet_heartbeat_failure|capacity_warning"
+    description: "Route infrastructure events to BigQuery for operational analysis"
+    bigqueryOptions:
+      usePartitionedTables: true
+    disabled: false
+
+# ── Exclusion Filters ──
+# Reduce noise by excluding high-volume low-value logs from the default sink.
+exclusions:
+  - name: milnet-exclude-debug
+    filter: >-
+      jsonPayload.severity="DEBUG" OR jsonPayload.severity="INFO"
+    description: "Exclude debug/info logs from default _Default sink to reduce cost"
+
+# ── Retention Configuration ──
+# Applied to the BigQuery datasets and GCS buckets.
+retention:
+  bigquery_security_logs:
+    dataset: milnet_security_logs_de033d2b
+    default_table_expiration_days: 365
+    description: "Security events retained for 1 year"
+
+  bigquery_infra_logs:
+    dataset: milnet_infra_logs_de033d2b
+    default_table_expiration_days: 90
+    description: "Infrastructure events retained for 90 days"
+
+  gcs_audit_archive:
+    bucket: milnet-audit-archive-de033d2b
+    lifecycle_rules:
+      - action: SetStorageClass
+        storage_class: NEARLINE
+        age_days: 30
+      - action: SetStorageClass
+        storage_class: COLDLINE
+        age_days: 90
+      - action: SetStorageClass
+        storage_class: ARCHIVE
+        age_days: 365
+      - action: Delete
+        age_days: 2555  # 7 years for compliance
+    description: "Audit archives tiered over 7 years"

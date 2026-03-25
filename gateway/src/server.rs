@@ -20,6 +20,8 @@ use tracing::{error, info, warn, debug};
 use common::types::ModuleId;
 use shard::tls_transport::tls_connect;
 
+use sha2::{Digest, Sha256};
+
 use crate::puzzle::{generate_challenge, get_adaptive_difficulty, verify_solution, PuzzleSolution};
 use crate::wire::{AuthRequest, AuthResponse, OrchestratorRequest, OrchestratorResponse};
 
@@ -73,6 +75,79 @@ pub struct OrchestratorConfig {
 /// Per-IP rate-limit state: (connection count, window start).
 type RateLimitMap = HashMap<IpAddr, (u32, Instant)>;
 
+/// Compute the SHA-256 fingerprint of an X-Wing public key.
+///
+/// The fingerprint is the first 32 bytes of SHA-256 over the full serialized
+/// public key, hex-encoded.  Clients pin this fingerprint and verify it
+/// against the value received in the puzzle challenge.
+fn xwing_pk_fingerprint(pk_bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"MILNET-XWING-PIN-v1");
+    hasher.update(pk_bytes);
+    let digest = hasher.finalize();
+    hex::encode(digest)
+}
+
+/// Load trusted X-Wing public key fingerprints from the `MILNET_GATEWAY_KEY_PINS`
+/// environment variable.
+///
+/// The env var should contain a comma-separated list of hex-encoded SHA-256
+/// fingerprints.  If the env var is not set, returns an empty set (pinning
+/// disabled — clients will accept any server key).
+fn load_key_pins() -> Vec<String> {
+    match std::env::var("MILNET_GATEWAY_KEY_PINS") {
+        Ok(val) if !val.is_empty() => {
+            let pins: Vec<String> = val
+                .split(',')
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+            info!(
+                "X-Wing key pinning enabled: {} pin(s) loaded from MILNET_GATEWAY_KEY_PINS",
+                pins.len()
+            );
+            pins
+        }
+        _ => {
+            debug!("MILNET_GATEWAY_KEY_PINS not set — X-Wing key pinning disabled");
+            Vec::new()
+        }
+    }
+}
+
+/// Verify that the server's X-Wing public key fingerprint matches at least
+/// one of the pinned fingerprints.  If pinning is disabled (empty pin list),
+/// always returns true.
+///
+/// Emits a CRITICAL SIEM event and returns false if the fingerprint does not
+/// match any pinned value, indicating a potential key substitution attack.
+fn verify_key_pin(server_fingerprint: &str, pinned: &[String]) -> bool {
+    if pinned.is_empty() {
+        return true; // Pinning not configured
+    }
+
+    for pin in pinned {
+        if pin == server_fingerprint {
+            return true;
+        }
+    }
+
+    // Key mismatch — possible key substitution or MitM attack
+    error!(
+        server_fingerprint = server_fingerprint,
+        "SIEM:CRITICAL X-Wing public key fingerprint does NOT match any pinned value — \
+         possible key substitution attack"
+    );
+    common::siem::SecurityEvent::tamper_detected(
+        &format!(
+            "X-Wing server key fingerprint mismatch: {} does not match any configured pin. \
+             Possible key substitution or MitM attack on gateway.",
+            server_fingerprint
+        ),
+    );
+    false
+}
+
 /// The Bastion Gateway server.
 ///
 /// Holds a long-lived X-Wing keypair generated once at startup.  The public
@@ -90,6 +165,12 @@ pub struct GatewayServer {
     xwing_server_kp: Arc<crypto::xwing::XWingKeyPair>,
     /// Per-IP connection rate limiter.
     rate_limits: Arc<Mutex<RateLimitMap>>,
+    /// SHA-256 fingerprint of the server's X-Wing public key (hex-encoded).
+    /// Included in puzzle challenges so clients can verify against pinned values.
+    xwing_fingerprint: Arc<String>,
+    /// Trusted X-Wing public key fingerprints loaded from MILNET_GATEWAY_KEY_PINS.
+    /// If empty, pinning is disabled.
+    key_pins: Arc<Vec<String>>,
 }
 
 impl GatewayServer {
@@ -101,7 +182,19 @@ impl GatewayServer {
             .await
             .map_err(|e| std::io::Error::other(format!("XWing keygen: {e}")))?;
         let xwing_server_pk = Arc::new(xwing_kp.public_key().to_bytes());
-        info!("X-Wing server keypair generated ({} byte public key)", xwing_server_pk.len());
+        let fingerprint = xwing_pk_fingerprint(&xwing_server_pk);
+        info!(
+            "X-Wing server keypair generated ({} byte public key, fingerprint={})",
+            xwing_server_pk.len(),
+            &fingerprint[..16]
+        );
+        let key_pins = load_key_pins();
+        if !verify_key_pin(&fingerprint, &key_pins) {
+            return Err(std::io::Error::other(
+                "FATAL: X-Wing server key fingerprint does not match any pinned value. \
+                 Update MILNET_GATEWAY_KEY_PINS or investigate key compromise.",
+            ));
+        }
         let xwing_server_kp = Arc::new(xwing_kp);
         Ok(Self {
             listener,
@@ -111,6 +204,8 @@ impl GatewayServer {
             xwing_server_pk,
             xwing_server_kp,
             rate_limits: Arc::new(Mutex::new(HashMap::new())),
+            xwing_fingerprint: Arc::new(fingerprint),
+            key_pins: Arc::new(key_pins),
         })
     }
 
@@ -126,7 +221,19 @@ impl GatewayServer {
             .await
             .map_err(|e| std::io::Error::other(format!("XWing keygen: {e}")))?;
         let xwing_server_pk = Arc::new(xwing_kp.public_key().to_bytes());
-        info!("X-Wing server keypair generated ({} byte public key)", xwing_server_pk.len());
+        let fingerprint = xwing_pk_fingerprint(&xwing_server_pk);
+        info!(
+            "X-Wing server keypair generated ({} byte public key, fingerprint={})",
+            xwing_server_pk.len(),
+            &fingerprint[..16]
+        );
+        let key_pins = load_key_pins();
+        if !verify_key_pin(&fingerprint, &key_pins) {
+            return Err(std::io::Error::other(
+                "FATAL: X-Wing server key fingerprint does not match any pinned value. \
+                 Update MILNET_GATEWAY_KEY_PINS or investigate key compromise.",
+            ));
+        }
         let xwing_server_kp = Arc::new(xwing_kp);
         Ok(Self {
             listener,
@@ -136,6 +243,8 @@ impl GatewayServer {
             xwing_server_pk,
             xwing_server_kp,
             rate_limits: Arc::new(Mutex::new(HashMap::new())),
+            xwing_fingerprint: Arc::new(fingerprint),
+            key_pins: Arc::new(key_pins),
         })
     }
 
@@ -190,6 +299,7 @@ impl GatewayServer {
             let counter = self.active_connections.clone();
             let server_pk = self.xwing_server_pk.clone();
             let server_kp = self.xwing_server_kp.clone();
+            let fingerprint = self.xwing_fingerprint.clone();
             // Verbose logging: log incoming connection details
             common::error_response::verbose_log_fields(
                 "gateway",
@@ -202,7 +312,7 @@ impl GatewayServer {
                 ],
             );
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(stream, difficulty, orch, server_pk, server_kp).await {
+                if let Err(e) = handle_connection(stream, difficulty, orch, server_pk, server_kp, fingerprint).await {
                     // In production, mask the error; always log internally
                     let internal_msg = common::error_response::log_error_with_location(&e);
                     warn!("connection from {addr} failed: {internal_msg}");
@@ -221,6 +331,7 @@ impl GatewayServer {
             self.orchestrator.clone(),
             self.xwing_server_pk.clone(),
             self.xwing_server_kp.clone(),
+            self.xwing_fingerprint.clone(),
         )
             .await
             .map_err(|e| {
@@ -295,13 +406,17 @@ async fn handle_connection(
     orchestrator: Option<Arc<OrchestratorConfig>>,
     server_xwing_pk: Arc<Vec<u8>>,
     server_xwing_kp: Arc<crypto::xwing::XWingKeyPair>,
+    server_xwing_fingerprint: Arc<String>,
 ) -> Result<(), String> {
     let conn_start = Instant::now();
 
-    // 1. Send puzzle challenge with the server's X-Wing public key.
+    // 1. Send puzzle challenge with the server's X-Wing public key and fingerprint.
     //    The client uses this key to encapsulate and produce a ciphertext.
+    //    The fingerprint allows clients to verify against pinned values before
+    //    encapsulating, detecting key substitution attacks.
     let mut challenge = generate_challenge(difficulty);
     challenge.xwing_server_pk = Some((*server_xwing_pk).clone());
+    challenge.xwing_server_pk_fingerprint = Some((*server_xwing_fingerprint).clone());
     send_frame_with_timeout(&mut stream, &challenge).await?;
     common::error_response::verbose_log("gateway", "puzzle challenge sent");
 

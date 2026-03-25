@@ -1,0 +1,1071 @@
+---
+# ==============================================================================
+# MILNET SSO — Kubernetes Network Policies
+# ==============================================================================
+# Implements the module communication matrix from common/src/network.rs.
+# Default: deny all ingress and egress. Then allow only the 18 permitted
+# channels plus DNS resolution.
+# ==============================================================================
+
+# --- Default deny-all ingress for the entire namespace ---
+# Test: from a pod outside milnet-sso, attempt to curl any service port
+#   Expected: connection refused / timeout (all ingress denied by default)
+# Test: from a pod inside milnet-sso with no matching allow policy, curl audit:9108
+#   Expected: timeout (only pods with explicit allow rules can reach audit)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+  annotations:
+    milnet.io/test-cross-ns: "curl-from-default-ns-to-any-svc-expect-timeout"
+    milnet.io/test-intra-ns: "curl-from-unlabeled-pod-to-audit-expect-timeout"
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+
+---
+# --- Default deny-all egress for the entire namespace ---
+# Test: from any milnet-sso pod, attempt to curl an external IP (e.g., 8.8.8.8)
+#   Expected: timeout (egress denied unless explicitly allowed)
+# Test: from postgres pod, attempt DNS lookup
+#   Expected: timeout (postgres has no DNS egress allowance)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+  annotations:
+    milnet.io/test-external: "curl-8.8.8.8-from-opaque-expect-timeout"
+    milnet.io/test-postgres-dns: "nslookup-from-postgres-expect-timeout"
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+
+---
+# --- Allow DNS resolution for all pods ---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+---
+# ==============================================================================
+# Gateway: accepts external traffic, talks to orchestrator
+# Channels: Gateway <-> Orchestrator
+# ==============================================================================
+# Test: curl gateway:9100 from outside the cluster (via LoadBalancer)
+#   Expected: puzzle challenge response (ingress allowed)
+# Test: curl gateway:9100 from orchestrator pod
+#   Expected: success (orchestrator -> gateway allowed)
+# Test: curl gateway:9100 from opaque pod
+#   Expected: timeout (opaque -> gateway not in matrix)
+# Test: curl opaque:9102 from gateway pod
+#   Expected: timeout (gateway -> opaque denied by matrix)
+# Test: curl tss:9103 from gateway pod
+#   Expected: timeout (gateway -> tss denied by matrix)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-ingress
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+  annotations:
+    milnet.io/test-external-ingress: "curl-lb-ip:9100-expect-puzzle-challenge"
+    milnet.io/test-orch-to-gw: "curl-gateway:9100-from-orchestrator-expect-ok"
+    milnet.io/test-opaque-to-gw: "curl-gateway:9100-from-opaque-expect-timeout"
+    milnet.io/test-gw-to-opaque: "curl-opaque:9102-from-gateway-expect-timeout"
+    milnet.io/test-gw-to-tss: "curl-tss:9103-from-gateway-expect-timeout"
+spec:
+  podSelector:
+    matchLabels:
+      app: gateway
+  policyTypes:
+    - Ingress
+  ingress:
+    # Accept external traffic (LoadBalancer / Ingress controller)
+    - ports:
+        - protocol: TCP
+          port: 9100
+    # Accept responses from orchestrator
+    - from:
+        - podSelector:
+            matchLabels:
+              app: orchestrator
+      ports:
+        - protocol: TCP
+          port: 9100
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-egress
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: gateway
+  policyTypes:
+    - Egress
+  egress:
+    # Gateway -> Orchestrator
+    - to:
+        - podSelector:
+            matchLabels:
+              app: orchestrator
+      ports:
+        - protocol: TCP
+          port: 9101
+    # Gateway -> Audit (all modules can send to audit)
+    - to:
+        - podSelector:
+            matchLabels:
+              app: audit
+      ports:
+        - protocol: TCP
+          port: 9108
+    # Gateway -> Internet (OAuth redirects, CRL)
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80
+
+---
+# ==============================================================================
+# Orchestrator: central auth coordinator
+# Channels: Gateway, OPAQUE, TSS, Risk, Ratchet, KT, Audit, PostgreSQL
+# ==============================================================================
+# Test: curl orchestrator:9101 from gateway pod
+#   Expected: success (gateway -> orchestrator allowed)
+# Test: curl orchestrator:9101 from verifier pod
+#   Expected: timeout (verifier -> orchestrator not in matrix)
+# Test: curl postgres:5432 from orchestrator pod
+#   Expected: success (orchestrator -> postgres allowed)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: orchestrator-ingress
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+  annotations:
+    milnet.io/test-gw-to-orch: "curl-orchestrator:9101-from-gateway-expect-ok"
+    milnet.io/test-verifier-to-orch: "curl-orchestrator:9101-from-verifier-expect-timeout"
+    milnet.io/test-orch-to-pg: "pg_isready-from-orchestrator-expect-ok"
+spec:
+  podSelector:
+    matchLabels:
+      app: orchestrator
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: gateway
+      ports:
+        - protocol: TCP
+          port: 9101
+    - from:
+        - podSelector:
+            matchLabels:
+              app: opaque
+      ports:
+        - protocol: TCP
+          port: 9101
+    - from:
+        - podSelector:
+            matchLabels:
+              app: tss
+      ports:
+        - protocol: TCP
+          port: 9101
+    - from:
+        - podSelector:
+            matchLabels:
+              app: risk
+      ports:
+        - protocol: TCP
+          port: 9101
+    - from:
+        - podSelector:
+            matchLabels:
+              app: ratchet
+      ports:
+        - protocol: TCP
+          port: 9101
+    - from:
+        - podSelector:
+            matchLabels:
+              app: kt
+      ports:
+        - protocol: TCP
+          port: 9101
+    - from:
+        - podSelector:
+            matchLabels:
+              app: admin
+      ports:
+        - protocol: TCP
+          port: 9101
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: orchestrator-egress
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: orchestrator
+  policyTypes:
+    - Egress
+  egress:
+    # Orchestrator -> Gateway
+    - to:
+        - podSelector:
+            matchLabels:
+              app: gateway
+      ports:
+        - protocol: TCP
+          port: 9100
+    # Orchestrator -> OPAQUE
+    - to:
+        - podSelector:
+            matchLabels:
+              app: opaque
+      ports:
+        - protocol: TCP
+          port: 9102
+    # Orchestrator -> TSS
+    - to:
+        - podSelector:
+            matchLabels:
+              app: tss
+      ports:
+        - protocol: TCP
+          port: 9103
+    # Orchestrator -> Risk
+    - to:
+        - podSelector:
+            matchLabels:
+              app: risk
+      ports:
+        - protocol: TCP
+          port: 9106
+    # Orchestrator -> Ratchet
+    - to:
+        - podSelector:
+            matchLabels:
+              app: ratchet
+      ports:
+        - protocol: TCP
+          port: 9105
+    # Orchestrator -> KT
+    - to:
+        - podSelector:
+            matchLabels:
+              app: kt
+      ports:
+        - protocol: TCP
+          port: 9107
+    # Orchestrator -> Audit
+    - to:
+        - podSelector:
+            matchLabels:
+              app: audit
+      ports:
+        - protocol: TCP
+          port: 9108
+    # Orchestrator -> PostgreSQL
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+
+---
+# ==============================================================================
+# OPAQUE: password authentication
+# Channels: Orchestrator (bidirectional), Audit (send)
+# ==============================================================================
+# Test: curl opaque:9102 from orchestrator pod
+#   Expected: success (orchestrator -> opaque allowed)
+# Test: curl opaque:9102 from gateway pod
+#   Expected: timeout (gateway -> opaque denied)
+# Test: curl opaque:9102 from verifier pod
+#   Expected: timeout (verifier -> opaque denied)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: opaque-ingress
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+  annotations:
+    milnet.io/test-orch-to-opaque: "curl-opaque:9102-from-orchestrator-expect-ok"
+    milnet.io/test-gw-to-opaque: "curl-opaque:9102-from-gateway-expect-timeout"
+    milnet.io/test-verifier-to-opaque: "curl-opaque:9102-from-verifier-expect-timeout"
+spec:
+  podSelector:
+    matchLabels:
+      app: opaque
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: orchestrator
+      ports:
+        - protocol: TCP
+          port: 9102
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: opaque-egress
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: opaque
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: orchestrator
+      ports:
+        - protocol: TCP
+          port: 9101
+    - to:
+        - podSelector:
+            matchLabels:
+              app: audit
+      ports:
+        - protocol: TCP
+          port: 9108
+
+---
+# ==============================================================================
+# TSS: threshold signing (FROST)
+# Channels: Orchestrator, Verifier, Audit, TSS<->TSS peer
+# ==============================================================================
+# Test: curl tss:9103 from orchestrator pod
+#   Expected: success (orchestrator -> tss allowed)
+# Test: curl tss:9103 from another tss pod
+#   Expected: success (tss <-> tss peer-to-peer for FROST)
+# Test: curl tss:9103 from gateway pod
+#   Expected: timeout (gateway -> tss denied)
+# Test: curl tss:9103 from ratchet pod
+#   Expected: timeout (ratchet -> tss not in matrix)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: tss-ingress
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+  annotations:
+    milnet.io/test-orch-to-tss: "curl-tss:9103-from-orchestrator-expect-ok"
+    milnet.io/test-tss-peer: "curl-tss:9103-from-tss-expect-ok"
+    milnet.io/test-gw-to-tss: "curl-tss:9103-from-gateway-expect-timeout"
+    milnet.io/test-ratchet-to-tss: "curl-tss:9103-from-ratchet-expect-timeout"
+spec:
+  podSelector:
+    matchLabels:
+      app: tss
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: orchestrator
+      ports:
+        - protocol: TCP
+          port: 9103
+    - from:
+        - podSelector:
+            matchLabels:
+              app: verifier
+      ports:
+        - protocol: TCP
+          port: 9103
+    - from:
+        - podSelector:
+            matchLabels:
+              app: audit
+      ports:
+        - protocol: TCP
+          port: 9103
+    # TSS peer-to-peer (FROST protocol)
+    - from:
+        - podSelector:
+            matchLabels:
+              app: tss
+      ports:
+        - protocol: TCP
+          port: 9103
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: tss-egress
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: tss
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: orchestrator
+      ports:
+        - protocol: TCP
+          port: 9101
+    - to:
+        - podSelector:
+            matchLabels:
+              app: verifier
+      ports:
+        - protocol: TCP
+          port: 9104
+    - to:
+        - podSelector:
+            matchLabels:
+              app: audit
+      ports:
+        - protocol: TCP
+          port: 9108
+    # TSS peer-to-peer
+    - to:
+        - podSelector:
+            matchLabels:
+              app: tss
+      ports:
+        - protocol: TCP
+          port: 9103
+
+---
+# ==============================================================================
+# Verifier: token verification
+# Channels: Ratchet (bidirectional), TSS (bidirectional), Audit (send)
+# ==============================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: verifier-ingress
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: verifier
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: ratchet
+      ports:
+        - protocol: TCP
+          port: 9104
+    - from:
+        - podSelector:
+            matchLabels:
+              app: tss
+      ports:
+        - protocol: TCP
+          port: 9104
+    - from:
+        - podSelector:
+            matchLabels:
+              app: admin
+      ports:
+        - protocol: TCP
+          port: 9104
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: verifier-egress
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: verifier
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: ratchet
+      ports:
+        - protocol: TCP
+          port: 9105
+    - to:
+        - podSelector:
+            matchLabels:
+              app: tss
+      ports:
+        - protocol: TCP
+          port: 9103
+    - to:
+        - podSelector:
+            matchLabels:
+              app: audit
+      ports:
+        - protocol: TCP
+          port: 9108
+
+---
+# ==============================================================================
+# Ratchet: session ratcheting
+# Channels: Orchestrator, Verifier, Risk (bidirectional each), Audit (send)
+# ==============================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ratchet-ingress
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: ratchet
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: orchestrator
+      ports:
+        - protocol: TCP
+          port: 9105
+    - from:
+        - podSelector:
+            matchLabels:
+              app: verifier
+      ports:
+        - protocol: TCP
+          port: 9105
+    - from:
+        - podSelector:
+            matchLabels:
+              app: risk
+      ports:
+        - protocol: TCP
+          port: 9105
+    - from:
+        - podSelector:
+            matchLabels:
+              app: admin
+      ports:
+        - protocol: TCP
+          port: 9105
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ratchet-egress
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: ratchet
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: orchestrator
+      ports:
+        - protocol: TCP
+          port: 9101
+    - to:
+        - podSelector:
+            matchLabels:
+              app: verifier
+      ports:
+        - protocol: TCP
+          port: 9104
+    - to:
+        - podSelector:
+            matchLabels:
+              app: risk
+      ports:
+        - protocol: TCP
+          port: 9106
+    - to:
+        - podSelector:
+            matchLabels:
+              app: audit
+      ports:
+        - protocol: TCP
+          port: 9108
+
+---
+# ==============================================================================
+# Audit: audit logging
+# Channels: receives from ALL modules, sends to KT, Risk, TSS, PostgreSQL
+# ==============================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: audit-ingress
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: audit
+  policyTypes:
+    - Ingress
+  ingress:
+    # All modules in the namespace can send audit events
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 9108
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: audit-egress
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: audit
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: kt
+      ports:
+        - protocol: TCP
+          port: 9107
+    - to:
+        - podSelector:
+            matchLabels:
+              app: risk
+      ports:
+        - protocol: TCP
+          port: 9106
+    - to:
+        - podSelector:
+            matchLabels:
+              app: tss
+      ports:
+        - protocol: TCP
+          port: 9103
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+
+---
+# ==============================================================================
+# KT: key transparency
+# Channels: Orchestrator (bidirectional), Audit (bidirectional)
+# ==============================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kt-ingress
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: kt
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: orchestrator
+      ports:
+        - protocol: TCP
+          port: 9107
+    - from:
+        - podSelector:
+            matchLabels:
+              app: audit
+      ports:
+        - protocol: TCP
+          port: 9107
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kt-egress
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: kt
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: orchestrator
+      ports:
+        - protocol: TCP
+          port: 9101
+    - to:
+        - podSelector:
+            matchLabels:
+              app: audit
+      ports:
+        - protocol: TCP
+          port: 9108
+
+---
+# ==============================================================================
+# Risk: risk assessment
+# Channels: Orchestrator, Ratchet, Audit (bidirectional each)
+# ==============================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: risk-ingress
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: risk
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: orchestrator
+      ports:
+        - protocol: TCP
+          port: 9106
+    - from:
+        - podSelector:
+            matchLabels:
+              app: ratchet
+      ports:
+        - protocol: TCP
+          port: 9106
+    - from:
+        - podSelector:
+            matchLabels:
+              app: audit
+      ports:
+        - protocol: TCP
+          port: 9106
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: risk-egress
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: risk
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: orchestrator
+      ports:
+        - protocol: TCP
+          port: 9101
+    - to:
+        - podSelector:
+            matchLabels:
+              app: ratchet
+      ports:
+        - protocol: TCP
+          port: 9105
+    - to:
+        - podSelector:
+            matchLabels:
+              app: audit
+      ports:
+        - protocol: TCP
+          port: 9108
+
+---
+# ==============================================================================
+# PostgreSQL: database tier
+# Only accepts connections from orchestrator, audit, admin
+# ==============================================================================
+# Test: pg_isready from orchestrator pod -> postgres:5432
+#   Expected: success
+# Test: pg_isready from audit pod -> postgres:5432
+#   Expected: success
+# Test: pg_isready from gateway pod -> postgres:5432
+#   Expected: timeout (gateway has no data-tier access)
+# Test: pg_isready from verifier pod -> postgres:5432
+#   Expected: timeout (verifier has no data-tier access)
+# Test: curl 8.8.8.8 from postgres pod
+#   Expected: timeout (postgres has zero egress)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-ingress
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+  annotations:
+    milnet.io/test-orch-to-pg: "pg_isready-from-orchestrator-expect-ok"
+    milnet.io/test-audit-to-pg: "pg_isready-from-audit-expect-ok"
+    milnet.io/test-gw-to-pg: "pg_isready-from-gateway-expect-timeout"
+    milnet.io/test-verifier-to-pg: "pg_isready-from-verifier-expect-timeout"
+    milnet.io/test-pg-egress: "curl-8.8.8.8-from-postgres-expect-timeout"
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: orchestrator
+      ports:
+        - protocol: TCP
+          port: 5432
+    - from:
+        - podSelector:
+            matchLabels:
+              app: audit
+      ports:
+        - protocol: TCP
+          port: 5432
+    - from:
+        - podSelector:
+            matchLabels:
+              app: admin
+      ports:
+        - protocol: TCP
+          port: 5432
+
+---
+# PostgreSQL: no egress (database should never initiate connections)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-egress-deny
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres
+  policyTypes:
+    - Egress
+  egress: []
+
+---
+# ==============================================================================
+# Admin: management API (connects to all services + database)
+# ==============================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: admin-ingress
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: admin
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 8080
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: admin-egress
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: admin
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: gateway
+      ports:
+        - protocol: TCP
+          port: 9100
+    - to:
+        - podSelector:
+            matchLabels:
+              app: orchestrator
+      ports:
+        - protocol: TCP
+          port: 9101
+    - to:
+        - podSelector:
+            matchLabels:
+              app: verifier
+      ports:
+        - protocol: TCP
+          port: 9104
+    - to:
+        - podSelector:
+            matchLabels:
+              app: ratchet
+      ports:
+        - protocol: TCP
+          port: 9105
+    - to:
+        - podSelector:
+            matchLabels:
+              app: audit
+      ports:
+        - protocol: TCP
+          port: 9108
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Admin -> Internet (OAuth provider communication)
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443

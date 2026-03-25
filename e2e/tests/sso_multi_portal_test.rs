@@ -393,6 +393,7 @@ fn make_claims(user_id: Uuid, tier: u8, scope: u32, ttl_secs: u64) -> TokenClaim
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
         aud: None,
+        classification: 0,
     }
 }
 
@@ -692,6 +693,7 @@ async fn test_attack_expired_token_at_portal() {
         ratchet_epoch: 1,
         token_id: [0xAC; 16],
         aud: None,
+        classification: 0,
     };
     let mut signer_refs: Vec<&mut _> = nodes.iter_mut().take(3).collect();
     let token = build_signed_token(&claims, &coordinator, &mut signer_refs);

@@ -1,0 +1,126 @@
+---
+# ==============================================================================
+# MILNET SSO — Ingress with TLS termination and rate limiting
+# ==============================================================================
+# Uses GKE Ingress (GCE) with Cloud Armor backend policy.
+# For nginx-ingress, see the nginx annotations (commented).
+# ==============================================================================
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: milnet-sso-ingress
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    tier: bastion
+  annotations:
+    # --- GKE-specific ---
+    kubernetes.io/ingress.class: gce
+    kubernetes.io/ingress.global-static-ip-name: milnet-sso-ip
+    networking.gke.io/managed-certificates: milnet-sso-cert
+    # Cloud Armor WAF policy (see cloud-armor.yaml)
+    cloud.google.com/backend-config: '{"default": "milnet-backend-config"}'
+    # ── Testing annotations ──────────────────────────────────────────────────
+    # Test: curl https://sso.milnet.example.com/api/health
+    #   Expected: 200 OK from admin service
+    # Test: curl https://sso.milnet.example.com/auth/callback
+    #   Expected: routed to admin service (OAuth flow)
+    # Test: curl http://sso.milnet.example.com/api/health (plain HTTP)
+    #   Expected: 301/308 redirect to HTTPS (TLS termination required)
+    # Test: curl https://sso.milnet.example.com/internal/orchestrator
+    #   Expected: 403 Forbidden (Cloud Armor blocks /internal/* paths)
+    milnet.io/test-api-route: "curl-https-api-health-expect-200"
+    milnet.io/test-auth-route: "curl-https-auth-callback-expect-routed-to-admin"
+    milnet.io/test-tls-redirect: "curl-http-expect-redirect-to-https"
+    milnet.io/test-internal-block: "curl-https-internal-expect-403"
+
+    # --- nginx-ingress annotations (uncomment if using nginx) ---
+    # kubernetes.io/ingress.class: nginx
+    # nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    # nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    # nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+    # nginx.ingress.kubernetes.io/limit-rps: "10"
+    # nginx.ingress.kubernetes.io/limit-burst-multiplier: "5"
+    # nginx.ingress.kubernetes.io/limit-connections: "10"
+    # nginx.ingress.kubernetes.io/configuration-snippet: |
+    #   more_set_headers "X-Frame-Options: DENY";
+    #   more_set_headers "X-Content-Type-Options: nosniff";
+    #   more_set_headers "X-XSS-Protection: 1; mode=block";
+    #   more_set_headers "Referrer-Policy: strict-origin-when-cross-origin";
+    #   more_set_headers "Content-Security-Policy: default-src 'self'";
+    #   more_set_headers "Strict-Transport-Security: max-age=63072000; includeSubDomains; preload";
+    #   more_set_headers "Permissions-Policy: camera=(), microphone=(), geolocation=()";
+spec:
+  tls:
+    - hosts:
+        - sso.milnet.example.com
+      secretName: milnet-sso-tls
+  rules:
+    - host: sso.milnet.example.com
+      http:
+        paths:
+          # Admin API (HTTP REST)
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: admin
+                port:
+                  number: 8080
+          # OAuth callback
+          - path: /auth
+            pathType: Prefix
+            backend:
+              service:
+                name: admin
+                port:
+                  number: 8080
+          # Health check endpoint
+          - path: /healthz
+            pathType: Exact
+            backend:
+              service:
+                name: admin
+                port:
+                  number: 8080
+
+---
+# GKE Managed Certificate for automatic TLS
+apiVersion: networking.gke.io/v1
+kind: ManagedCertificate
+metadata:
+  name: milnet-sso-cert
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  domains:
+    - sso.milnet.example.com
+
+---
+# GKE BackendConfig for Cloud Armor and health checks
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: milnet-backend-config
+  namespace: milnet-sso
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  securityPolicy:
+    name: milnet-sso-waf
+  healthCheck:
+    checkIntervalSec: 15
+    timeoutSec: 5
+    healthyThreshold: 2
+    unhealthyThreshold: 3
+    type: HTTP
+    requestPath: /healthz
+    port: 8080
+  timeoutSec: 30
+  connectionDraining:
+    drainingTimeoutSec: 60
+  logging:
+    enable: true
+    sampleRate: 1.0

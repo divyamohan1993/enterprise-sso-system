@@ -336,6 +336,7 @@ fn test_unsigned_entries_rejected_during_verification() {
             timestamp: 12345,
             prev_hash: [0u8; 64],
             signature: Vec::new(),
+            classification: 0,
         };
         log.append_raw(unsigned_entry).unwrap();
 
