@@ -33,3 +33,4 @@ pub mod memguard;
 pub mod attest;
 pub mod hsm;
 pub mod tpm;
+pub mod symmetric;
