@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 //! End-to-end integration tests for MILNET SSO
 
+pub mod chaos;
+
 use aes_gcm::aead::generic_array::GenericArray;
 use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit};
 use gateway::puzzle::{solve_challenge, PuzzleChallenge, PuzzleSolution};
