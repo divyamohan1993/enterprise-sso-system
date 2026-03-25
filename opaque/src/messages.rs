@@ -7,6 +7,22 @@
 use common::types::Receipt;
 use serde::{Deserialize, Serialize};
 
+/// Serde helper for `[u8; 64]` — serde only supports arrays up to 32 natively.
+mod byte_array_64 {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(data: &[u8; 64], ser: S) -> Result<S::Ok, S::Error> {
+        data.as_slice().serialize(ser)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<[u8; 64], D::Error> {
+        let v: Vec<u8> = Vec::deserialize(de)?;
+        v.try_into().map_err(|v: Vec<u8>| {
+            serde::de::Error::custom(format!("expected 64 bytes, got {}", v.len()))
+        })
+    }
+}
+
 /// Messages from the orchestrator (acting as OPAQUE client) to the OPAQUE service.
 #[derive(Serialize, Deserialize)]
 pub enum OpaqueRequest {
@@ -16,7 +32,8 @@ pub enum OpaqueRequest {
         /// Serialized `CredentialRequest<OpaqueCs>`.
         credential_request: Vec<u8>,
         ceremony_session_id: [u8; 32],
-        dpop_key_hash: [u8; 32],
+        #[serde(with = "byte_array_64")]
+        dpop_key_hash: [u8; 64],
     },
     /// Login step 2: send the credential finalization.
     LoginFinish {

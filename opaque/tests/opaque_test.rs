@@ -103,7 +103,7 @@ fn full_login_flow_succeeds_with_correct_password() {
 
     let mut rng = OsRng;
     let ceremony_session_id = [0xAA; 32];
-    let dpop_key_hash = [0xBB; 32];
+    let dpop_key_hash = [0xBB; 64];
 
     // Login Step 1: Client starts login
     let client_login_start = ClientLogin::<OpaqueCs>::start(&mut rng, password).unwrap();
@@ -227,7 +227,7 @@ fn receipt_has_correct_fields() {
 
     let mut rng = OsRng;
     let session_id = [0xCC; 32];
-    let dpop_hash = [0xDD; 32];
+    let dpop_hash = [0xDD; 64];
 
     // Full login flow
     let client_start = ClientLogin::<OpaqueCs>::start(&mut rng, password).unwrap();

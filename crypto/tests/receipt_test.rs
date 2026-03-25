@@ -19,7 +19,7 @@ fn make_receipt(step: u8, prev_hash: [u8; 64]) -> Receipt {
         step_id: step,
         prev_receipt_hash: prev_hash,
         user_id: TEST_USER_ID,
-        dpop_key_hash: [0xBB; 32],
+        dpop_key_hash: [0xBB; 64],
         timestamp: now_micros(),
         nonce: [step; 32],
         signature: Vec::new(),

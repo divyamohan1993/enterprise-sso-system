@@ -207,7 +207,7 @@ fn verify_token_inner(
     //
     //    Tiers 3 (Sensor) and 4 (Emergency) are exempt from DPoP when
     //    MILNET_REQUIRE_DPOP is true — they may lack DPoP capability.
-    let all_zeros = [0u8; 32];
+    let all_zeros = [0u8; 64];
     let require_dpop = dpop_required();
     let has_dpop_hash = token.claims.dpop_hash != all_zeros;
 

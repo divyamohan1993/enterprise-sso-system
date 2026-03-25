@@ -7,35 +7,35 @@ use crypto::receipts::{hash_receipt, verify_receipt_signature};
 pub enum ReceiptVerificationKey<'a> {
     /// HMAC-SHA512 symmetric key (legacy).
     Hmac(&'a [u8; 64]),
-    /// ML-DSA-65 asymmetric verifying key (preferred, CNSA 2.0 compliant).
-    /// The verifying key is the encoded ML-DSA-65 public key (1952 bytes).
-    MlDsa65(&'a [u8]),
-    /// Both keys available — prefer ML-DSA-65, fall back to HMAC.
+    /// ML-DSA-87 asymmetric verifying key (preferred, CNSA 2.0 compliant).
+    /// The verifying key is the encoded ML-DSA-87 public key (1952 bytes).
+    MlDsa87(&'a [u8]),
+    /// Both keys available — prefer ML-DSA-87, fall back to HMAC.
     Both {
         hmac_key: &'a [u8; 64],
-        mldsa65_key: &'a [u8],
+        mldsa87_key: &'a [u8],
     },
 }
 
 /// Verify a single receipt's signature using the specified key.
 ///
-/// When `Both` keys are provided, ML-DSA-65 is preferred.  HMAC is only
-/// attempted if no ML-DSA-65 key is available or if ML-DSA-65 verification fails
+/// When `Both` keys are provided, ML-DSA-87 is preferred.  HMAC is only
+/// attempted if no ML-DSA-87 key is available or if ML-DSA-87 verification fails
 /// (to support migration from symmetric to asymmetric signing).
 fn verify_receipt_with_key(receipt: &Receipt, key: &ReceiptVerificationKey<'_>) -> bool {
     match key {
         ReceiptVerificationKey::Hmac(hmac_key) => {
             verify_receipt_signature(receipt, hmac_key)
         }
-        ReceiptVerificationKey::MlDsa65(mldsa65_key) => {
+        ReceiptVerificationKey::MlDsa87(mldsa87_key) => {
             let data = crypto::receipts::receipt_signing_data(receipt);
-            crypto::receipts::verify_receipt_asymmetric(mldsa65_key, &data, &receipt.signature)
+            crypto::receipts::verify_receipt_asymmetric(mldsa87_key, &data, &receipt.signature)
         }
-        ReceiptVerificationKey::Both { hmac_key, mldsa65_key } => {
-            // Prefer ML-DSA-65 when available; fall back to HMAC for
-            // receipts that were signed before the ML-DSA-65 migration.
+        ReceiptVerificationKey::Both { hmac_key, mldsa87_key } => {
+            // Prefer ML-DSA-87 when available; fall back to HMAC for
+            // receipts that were signed before the ML-DSA-87 migration.
             let data = crypto::receipts::receipt_signing_data(receipt);
-            if crypto::receipts::verify_receipt_asymmetric(mldsa65_key, &data, &receipt.signature) {
+            if crypto::receipts::verify_receipt_asymmetric(mldsa87_key, &data, &receipt.signature) {
                 true
             } else {
                 verify_receipt_signature(receipt, hmac_key)
@@ -60,10 +60,10 @@ pub fn validate_receipt_chain(
     validate_receipt_chain_with_key(receipts, &ReceiptVerificationKey::Hmac(receipt_signing_key))
 }
 
-/// Validate a receipt chain with flexible key support (HMAC, ML-DSA-65, or both).
+/// Validate a receipt chain with flexible key support (HMAC, ML-DSA-87, or both).
 ///
-/// This is the preferred entry point when ML-DSA-65 receipt signing is available.
-/// When `ReceiptVerificationKey::Both` is used, ML-DSA-65 is tried first with
+/// This is the preferred entry point when ML-DSA-87 receipt signing is available.
+/// When `ReceiptVerificationKey::Both` is used, ML-DSA-87 is tried first with
 /// HMAC as a fallback, enabling a smooth migration from symmetric to asymmetric
 /// receipt signatures.
 pub fn validate_receipt_chain_with_key(

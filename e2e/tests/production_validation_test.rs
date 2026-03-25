@@ -47,12 +47,12 @@ const SHARD_HMAC_KEY: [u8; 64] = [0x37u8; 64];
 const RECEIPT_SIGNING_KEY: [u8; 64] = [0x42u8; 64];
 const TEST_DIFFICULTY: u8 = 4;
 
-/// ML-DSA-65 verifying key for receipt verification (derived from RECEIPT_SIGNING_KEY seed).
-static RECEIPT_MLDSA65_VK: std::sync::LazyLock<Vec<u8>> =
+/// ML-DSA-87 verifying key for receipt verification (derived from RECEIPT_SIGNING_KEY seed).
+static RECEIPT_MLDSA87_VK: std::sync::LazyLock<Vec<u8>> =
     std::sync::LazyLock::new(|| {
-        use ml_dsa::{KeyGen, MlDsa65};
+        use ml_dsa::{KeyGen, MlDsa87};
         let seed: [u8; 32] = RECEIPT_SIGNING_KEY[..32].try_into().unwrap();
-        let kp = MlDsa65::from_seed(&seed.into());
+        let kp = MlDsa87::from_seed(&seed.into());
         kp.verifying_key().encode().to_vec()
     });
 
@@ -190,10 +190,10 @@ async fn boot_tss(
                     continue;
                 }
             };
-            let vk = &*RECEIPT_MLDSA65_VK;
+            let vk = &*RECEIPT_MLDSA87_VK;
             let verification_key = ReceiptVerificationKey::Both {
                 hmac_key: &RECEIPT_SIGNING_KEY,
-                mldsa65_key: vk,
+                mldsa87_key: vk,
             };
             let response =
                 match validate_receipt_chain_with_key(&request.receipts, &verification_key) {
@@ -342,7 +342,7 @@ async fn boot_full_system(
 fn build_valid_receipt_chain(signing_key: &[u8; 64]) -> Vec<Receipt> {
     let session_id = [0x01; 32];
     let user_id = Uuid::nil();
-    let dpop_hash = [0x02; 32];
+    let dpop_hash = [0x02; 64];
     let ts = now_us();
 
     let mut r1 = Receipt {
@@ -731,7 +731,7 @@ fn test_token_from_different_dkg_rejected() {
         iat: now_us(),
         exp: now_us() + 600_000_000,
         scope: 0x0000_000F,
-        dpop_hash: [0xBB; 32],
+        dpop_hash: [0xBB; 64],
         ceremony_id: [0xCC; 32],
         tier: 2,
         ratchet_epoch: 1,

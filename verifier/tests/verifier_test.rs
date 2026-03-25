@@ -109,7 +109,7 @@ fn future_claims() -> TokenClaims {
         iat: now,
         exp: now + 30_000_000, // +30 seconds
         scope: 0x0000_000F,
-        dpop_hash: [0u8; 32], // Zero hash: no DPoP binding (tests exempt via tier 3)
+        dpop_hash: [0u8; 64], // Zero hash: no DPoP binding (tests exempt via tier 3)
         ceremony_id: [0xCC; 32],
         tier: 3,
         ratchet_epoch: 1,
@@ -175,7 +175,7 @@ fn expired_token_rejected() {
         iat: now - 60_000_000,
         exp: now - 1_000_000, // expired 1 second ago
         scope: 0x0000_000F,
-        dpop_hash: [0xBB; 32],
+        dpop_hash: [0xBB; 64],
         ceremony_id: [0xCC; 32],
         tier: 1,
         ratchet_epoch: 1,
@@ -529,7 +529,7 @@ fn dpop_no_exemptions_by_default() {
         iat: now,
         exp: now + 30_000_000,
         scope: 0x0000_000F,
-        dpop_hash: [0u8; 32], // No DPoP binding
+        dpop_hash: [0u8; 64], // No DPoP binding
         ceremony_id: [0xCC; 32],
         tier: 3,
         ratchet_epoch: 1,
@@ -593,7 +593,7 @@ fn classification_enforcement_denies_insufficient_level() {
     // Create a token with Unclassified classification
     let mut claims = future_claims();
     claims.classification = ClassificationLevel::Unclassified.as_u8();
-    claims.dpop_hash = [0u8; 32]; // no DPoP for simplicity
+    claims.dpop_hash = [0u8; 64]; // no DPoP for simplicity
 
     // Exempt tier 3 for this test
     std::env::set_var("MILNET_DPOP_EXEMPT_TIERS", "3");
@@ -627,7 +627,7 @@ fn classification_enforcement_grants_sufficient_level() {
     // Create a token with Secret classification
     let mut claims = future_claims();
     claims.classification = ClassificationLevel::Secret.as_u8();
-    claims.dpop_hash = [0u8; 32];
+    claims.dpop_hash = [0u8; 64];
 
     std::env::set_var("MILNET_DPOP_EXEMPT_TIERS", "3");
     let token = build_signed_token_legacy(&mut dkg, claims, &pq_sk);

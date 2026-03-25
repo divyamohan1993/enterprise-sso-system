@@ -555,13 +555,13 @@ async fn enforce_timing_floor(start: tokio::time::Instant) {
 
 /// Forward an auth request to the orchestrator via SHARD and return the response.
 ///
-/// `client_binding_hash` is SHA-256 of the client's KEM ciphertext, used as
+/// `client_binding_hash` is SHA-512 of the client's KEM ciphertext, used as
 /// the DPoP channel binding.  The client proved knowledge of the shared
 /// secret through the encrypted channel.
 async fn forward_to_orchestrator(
     auth_req: &AuthRequest,
     config: &OrchestratorConfig,
-    client_binding_hash: [u8; 32],
+    client_binding_hash: [u8; 64],
 ) -> Result<AuthResponse, String> {
     let orch_req = OrchestratorRequest {
         username: auth_req.username.clone(),

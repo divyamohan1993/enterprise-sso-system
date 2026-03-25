@@ -23,7 +23,7 @@ fn test_ratchet_key() -> [u8; 64] {
 /// Build a valid receipt chain of the given length, signing each receipt.
 fn build_signed_chain(len: usize, signing_key: &[u8; 64]) -> Vec<Receipt> {
     let session_id = [0x01; 32];
-    let dpop_hash = [0x02; 32];
+    let dpop_hash = [0x02; 64];
     let mut chain = Vec::with_capacity(len);
 
     for i in 0..len {
@@ -59,7 +59,7 @@ fn test_claims() -> TokenClaims {
         iat: 1_700_000_000_000_000,
         exp: 1_700_000_030_000_000,
         scope: 0x0000_000F,
-        dpop_hash: [0xBB; 32],
+        dpop_hash: [0xBB; 64],
         ceremony_id: [0x01; 32],
         tier: 1,
         ratchet_epoch: 42,

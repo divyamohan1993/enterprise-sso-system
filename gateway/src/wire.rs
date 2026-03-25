@@ -2,6 +2,22 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Serde helper for `[u8; 64]` — serde only supports arrays up to 32 natively.
+mod byte_array_64 {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(data: &[u8; 64], ser: S) -> Result<S::Ok, S::Error> {
+        data.as_slice().serialize(ser)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<[u8; 64], D::Error> {
+        let v: Vec<u8> = Vec::deserialize(de)?;
+        v.try_into().map_err(|v: Vec<u8>| {
+            serde::de::Error::custom(format!("expected 64 bytes, got {}", v.len()))
+        })
+    }
+}
+
 /// X-Wing KEM ciphertext sent from server to client after puzzle verification.
 ///
 /// The client decapsulates this against their private key to obtain the same
@@ -32,7 +48,8 @@ pub struct AuthResponse {
 pub struct OrchestratorRequest {
     pub username: String,
     pub password: Vec<u8>,
-    pub dpop_key_hash: [u8; 32],
+    #[serde(with = "byte_array_64")]
+    pub dpop_key_hash: [u8; 64],
     /// Requested authentication tier (1-4). Defaults to 2 if 0.
     pub tier: u8,
     /// Target audience for the token (passed through to the TSS for inclusion

@@ -35,7 +35,8 @@ pub struct TokenClaims {
     pub iat: i64,
     pub exp: i64,
     pub scope: u32,
-    pub dpop_hash: [u8; 32],
+    #[serde(with = "byte_array_64")]
+    pub dpop_hash: [u8; 64],
     pub ceremony_id: [u8; 32],
     pub tier: u8,
     pub ratchet_epoch: u64,
@@ -131,7 +132,7 @@ impl Token {
                 iat: 1_700_000_000_000_000,
                 exp: 1_700_000_030_000_000,
                 scope: 0x0000_000F,
-                dpop_hash: [0xBB; 32],
+                dpop_hash: [0xBB; 64],
                 ceremony_id: [0xCC; 32],
                 tier: 1,
                 ratchet_epoch: 42,
@@ -155,7 +156,8 @@ pub struct Receipt {
     #[serde(with = "byte_array_64")]
     pub prev_receipt_hash: [u8; 64],
     pub user_id: Uuid,
-    pub dpop_key_hash: [u8; 32],
+    #[serde(with = "byte_array_64")]
+    pub dpop_key_hash: [u8; 64],
     pub timestamp: i64,
     pub nonce: [u8; 32],
     pub signature: Vec<u8>,
@@ -194,7 +196,7 @@ impl Receipt {
             step_id: 1,
             prev_receipt_hash: [0x00; 64],
             user_id: Uuid::nil(),
-            dpop_key_hash: [0x02; 32],
+            dpop_key_hash: [0x02; 64],
             timestamp: 1_700_000_000_000_000,
             nonce: [0x03; 32],
             signature: vec![0x04; 64],

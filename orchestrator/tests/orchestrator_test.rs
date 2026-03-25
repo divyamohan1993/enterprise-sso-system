@@ -223,7 +223,7 @@ async fn orchestrator_processes_auth() {
     let request = OrchestratorRequest {
         username: "alice".into(),
         password: b"password123".to_vec(),
-        dpop_key_hash: [0xBB; 32],
+        dpop_key_hash: [0xBB; 64],
         tier: 2,
         audience: None,
         device_attestation_age_secs: None,
@@ -338,7 +338,7 @@ async fn orchestrator_handles_opaque_failure() {
                             &receipt_signer,
                             Uuid::nil(),
                             [0u8; 32],
-                            [0u8; 32],
+                            [0u8; 64],
                         );
                         let resp_bytes = postcard::to_allocvec(&response).expect("serialize");
                         transport.send(&resp_bytes).await.expect("send");
@@ -360,7 +360,7 @@ async fn orchestrator_handles_opaque_failure() {
     let request = OrchestratorRequest {
         username: "alice".into(),
         password: b"wrong_password".to_vec(),
-        dpop_key_hash: [0xBB; 32],
+        dpop_key_hash: [0xBB; 64],
         tier: 2,
         audience: None,
         device_attestation_age_secs: None,

@@ -240,7 +240,7 @@ async fn handle_verify(
             tracing::info!(
                 token_id = ?token.claims.token_id,
                 tier = token.claims.tier,
-                has_dpop_hash = token.claims.dpop_hash != [0u8; 32],
+                has_dpop_hash = token.claims.dpop_hash != [0u8; 64],
                 "verifying token"
             );
 

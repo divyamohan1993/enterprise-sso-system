@@ -40,7 +40,7 @@ fn now_us() -> i64 {
 fn build_valid_receipt_chain(signing_key: &[u8; 64]) -> Vec<Receipt> {
     let session_id = [0x01; 32];
     let user_id = Uuid::nil();
-    let dpop_hash = [0x02; 32];
+    let dpop_hash = [0x02; 64];
     let ts = now_us();
 
     let mut r1 = Receipt {
@@ -123,7 +123,7 @@ fn expired_token_rejected() {
         iat: 1_000_000,
         exp: 1_000_001, // far in the past (microseconds since epoch)
         scope: 0x0000_000F,
-        dpop_hash: [0xBB; 32],
+        dpop_hash: [0xBB; 64],
         ceremony_id: [0xCC; 32],
         tier: 2,
         ratchet_epoch: 1,
@@ -161,7 +161,7 @@ fn tampered_token_rejected() {
         iat: now_us(),
         exp: now_us() + 600_000_000, // 10 minutes from now
         scope: 0x0000_000F,
-        dpop_hash: [0xBB; 32],
+        dpop_hash: [0xBB; 64],
         ceremony_id: [0xCC; 32],
         tier: 2,
         ratchet_epoch: 1,

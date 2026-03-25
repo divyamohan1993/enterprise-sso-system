@@ -33,12 +33,12 @@ const RECEIPT_SIGNING_KEY: [u8; 64] = [0x42u8; 64];
 /// Puzzle difficulty (low for fast tests).
 const TEST_DIFFICULTY: u8 = 4;
 
-/// ML-DSA-65 verifying key for receipt verification (derived from RECEIPT_SIGNING_KEY seed).
-static RECEIPT_MLDSA65_VK: std::sync::LazyLock<Vec<u8>> =
+/// ML-DSA-87 verifying key for receipt verification (derived from RECEIPT_SIGNING_KEY seed).
+static RECEIPT_MLDSA87_VK: std::sync::LazyLock<Vec<u8>> =
     std::sync::LazyLock::new(|| {
-        use ml_dsa::{KeyGen, MlDsa65};
+        use ml_dsa::{KeyGen, MlDsa87};
         let seed: [u8; 32] = RECEIPT_SIGNING_KEY[..32].try_into().unwrap();
-        let kp = MlDsa65::from_seed(&seed.into());
+        let kp = MlDsa87::from_seed(&seed.into());
         kp.verifying_key().encode().to_vec()
     });
 
@@ -151,10 +151,10 @@ async fn boot_tss(coordinator: SigningCoordinator, mut nodes: Vec<SignerNode>, p
                     continue;
                 }
             };
-            let vk = &*RECEIPT_MLDSA65_VK;
+            let vk = &*RECEIPT_MLDSA87_VK;
             let verification_key = ReceiptVerificationKey::Both {
                 hmac_key: &RECEIPT_SIGNING_KEY,
-                mldsa65_key: vk,
+                mldsa87_key: vk,
             };
             let response =
                 match validate_receipt_chain_with_key(&request.receipts, &verification_key) {

@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH, Instant};
 use common::types::{ModuleId, Receipt};
 use crypto::entropy::generate_nonce;
 use crypto::receipts::{receipt_signing_data, sign_receipt_asymmetric, verify_receipt_asymmetric};
-use ml_dsa::{KeyGen, MlDsa65};
+use ml_dsa::{KeyGen, MlDsa87};
 use zeroize::Zeroize;
 use opaque_ke::{
     CredentialFinalization, CredentialRequest,
@@ -26,17 +26,17 @@ use crate::messages::{OpaqueRequest, OpaqueResponse};
 use crate::opaque_impl::OpaqueCs;
 use crate::store::CredentialStore;
 
-/// ML-DSA-65 receipt signer (CNSA 2.0 compliant).
+/// ML-DSA-87 receipt signer (CNSA 2.0 Level 5 compliant).
 pub struct ReceiptSigner {
-    mldsa65_seed: [u8; 32],
-    mldsa65_verifying_key: Vec<u8>,
+    mldsa87_seed: [u8; 32],
+    mldsa87_verifying_key: Vec<u8>,
 }
 
 impl ReceiptSigner {
     pub fn new_mldsa(seed: [u8; 32]) -> Self {
-        let kp = MlDsa65::from_seed(&seed.into());
+        let kp = MlDsa87::from_seed(&seed.into());
         let vk = kp.verifying_key().encode().to_vec();
-        Self { mldsa65_seed: seed, mldsa65_verifying_key: vk }
+        Self { mldsa87_seed: seed, mldsa87_verifying_key: vk }
     }
     pub fn new(signing_key: [u8; 64]) -> Self {
         let mut seed = [0u8; 32]; seed.copy_from_slice(&signing_key[..32]);
@@ -44,16 +44,16 @@ impl ReceiptSigner {
     }
     pub fn sign(&self, receipt: &mut Receipt) {
         let data = receipt_signing_data(receipt);
-        receipt.signature = sign_receipt_asymmetric(&self.mldsa65_seed, &data);
+        receipt.signature = sign_receipt_asymmetric(&self.mldsa87_seed, &data);
     }
     pub fn verify(&self, receipt: &Receipt) -> bool {
         let data = receipt_signing_data(receipt);
-        verify_receipt_asymmetric(&self.mldsa65_verifying_key, &data, &receipt.signature)
+        verify_receipt_asymmetric(&self.mldsa87_verifying_key, &data, &receipt.signature)
     }
-    pub fn verifying_key(&self) -> &[u8] { &self.mldsa65_verifying_key }
-    pub fn verification_key(&self) -> &[u8] { &self.mldsa65_verifying_key }
+    pub fn verifying_key(&self) -> &[u8] { &self.mldsa87_verifying_key }
+    pub fn verification_key(&self) -> &[u8] { &self.mldsa87_verifying_key }
 }
-impl Drop for ReceiptSigner { fn drop(&mut self) { self.mldsa65_seed.zeroize(); } }
+impl Drop for ReceiptSigner { fn drop(&mut self) { self.mldsa87_seed.zeroize(); } }
 
 /// Load receipt signing key: generate random key at startup with a warning.
 /// In production, this MUST be loaded from an HSM or secure key store.
@@ -61,7 +61,7 @@ impl Drop for ReceiptSigner { fn drop(&mut self) { self.mldsa65_seed.zeroize(); 
 /// SECURITY: This is the ONLY place in the system where the receipt signing
 /// key is generated/loaded. No other service should hold this key.
 fn load_receipt_signing_seed() -> [u8; 32] {
-    eprintln!("WARNING: ML-DSA-65 seed generated randomly (NOT FOR PRODUCTION)");
+    eprintln!("WARNING: ML-DSA-87 seed generated randomly (NOT FOR PRODUCTION)");
     let mut seed = [0u8; 32]; getrandom::getrandom(&mut seed).expect("entropy"); seed
 }
 #[allow(dead_code)]
@@ -149,7 +149,7 @@ pub fn handle_login_finish(
     signer: &ReceiptSigner,
     user_id: uuid::Uuid,
     ceremony_session_id: [u8; 32],
-    dpop_key_hash: [u8; 32],
+    dpop_key_hash: [u8; 64],
 ) -> OpaqueResponse {
     let credential_finalization =
         match CredentialFinalization::<OpaqueCs>::deserialize(credential_finalization_bytes) {
@@ -439,12 +439,12 @@ mod tests {
         std::thread::Builder::new().stack_size(8 * 1024 * 1024).spawn(f).expect("spawn").join().expect("join");
     }
     fn make_receipt() -> Receipt {
-        Receipt { ceremony_session_id: [1; 32], step_id: 1, prev_receipt_hash: [0; 64], user_id: Uuid::new_v4(), dpop_key_hash: [2; 32],
+        Receipt { ceremony_session_id: [1; 32], step_id: 1, prev_receipt_hash: [0; 64], user_id: Uuid::new_v4(), dpop_key_hash: [2; 64],
             timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as i64, nonce: [3; 32], signature: Vec::new(), ttl_seconds: 30 }
     }
     #[test] fn test_mldsa_sign_verify() { run_with_large_stack(|| { let mut s = [0u8; 32]; getrandom::getrandom(&mut s).unwrap(); let signer = ReceiptSigner::new_mldsa(s); let mut r = make_receipt(); signer.sign(&mut r); assert!(!r.signature.is_empty()); assert!(signer.verify(&r)); }); }
     #[test] fn test_backward_compat() { run_with_large_stack(|| { let signer = ReceiptSigner::new([0x42u8; 64]); let mut r = make_receipt(); signer.sign(&mut r); assert!(signer.verify(&r)); }); }
     #[test] fn test_wrong_key() { run_with_large_stack(|| { let mut s1 = [0u8; 32]; getrandom::getrandom(&mut s1).unwrap(); let mut s2 = [0u8; 32]; getrandom::getrandom(&mut s2).unwrap(); let sg1 = ReceiptSigner::new_mldsa(s1); let sg2 = ReceiptSigner::new_mldsa(s2); let mut r = make_receipt(); sg1.sign(&mut r); assert!(!sg2.verify(&r)); }); }
     #[test] fn test_tampered() { run_with_large_stack(|| { let mut s = [0u8; 32]; getrandom::getrandom(&mut s).unwrap(); let signer = ReceiptSigner::new_mldsa(s); let mut r = make_receipt(); signer.sign(&mut r); r.step_id = 99; assert!(!signer.verify(&r)); }); }
-    #[test] fn test_vk_export() { run_with_large_stack(|| { let mut s = [0u8; 32]; getrandom::getrandom(&mut s).unwrap(); let signer = ReceiptSigner::new_mldsa(s); assert_eq!(signer.verifying_key().len(), 1952); let mut r = make_receipt(); signer.sign(&mut r); let d = crypto::receipts::receipt_signing_data(&r); assert!(crypto::receipts::verify_receipt_asymmetric(signer.verifying_key(), &d, &r.signature)); }); }
+    #[test] fn test_vk_export() { run_with_large_stack(|| { let mut s = [0u8; 32]; getrandom::getrandom(&mut s).unwrap(); let signer = ReceiptSigner::new_mldsa(s); assert_eq!(signer.verifying_key().len(), 2592); let mut r = make_receipt(); signer.sign(&mut r); let d = crypto::receipts::receipt_signing_data(&r); assert!(crypto::receipts::verify_receipt_asymmetric(signer.verifying_key(), &d, &r.signature)); }); }
 }

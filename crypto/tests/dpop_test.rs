@@ -65,10 +65,10 @@ fn test_dpop_proof_rejects_wrong_claims() {
 }
 
 #[test]
-fn test_dpop_key_hash_length_is_32() {
+fn test_dpop_key_hash_length_is_64() {
     let key = [0xFFu8; 32];
     let hash = dpop_key_hash(&key);
-    assert_eq!(hash.len(), 32);
+    assert_eq!(hash.len(), 64);
 }
 
 #[test]
