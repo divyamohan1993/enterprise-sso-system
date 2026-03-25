@@ -230,6 +230,29 @@ pub fn run_platform_checks<F: FnOnce() -> bool>(harden_fn: F) -> (
 }
 
 // ---------------------------------------------------------------------------
+// STIG audit integration
+// ---------------------------------------------------------------------------
+
+/// Run all STIG/CIS benchmark checks.
+///
+/// In production mode (`MILNET_PRODUCTION` set) any Category I failure is
+/// treated as fatal and returned as `Err(failures)`.  In dev mode all
+/// failures are surfaced in the `Ok(StigSummary)` for logging/reporting.
+pub fn run_stig_audit() -> Result<crate::stig::StigSummary, Vec<crate::stig::StigCheck>> {
+    let mut auditor = crate::stig::StigAuditor::new();
+    auditor.run_all();
+    let summary = auditor.summary();
+
+    if crate::sealed_keys::is_production() {
+        let cat_i = auditor.cat_i_failures();
+        if !cat_i.is_empty() {
+            return Err(cat_i.into_iter().cloned().collect());
+        }
+    }
+    Ok(summary)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

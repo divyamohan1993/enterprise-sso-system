@@ -60,3 +60,6 @@ pub mod cac_auth;
 // ── Compliance and data residency ──
 pub mod compliance;
 pub mod data_residency;
+
+// ── STIG/CIS benchmark auditor ──
+pub mod stig;
