@@ -2,4 +2,5 @@
 //! audit: Hash-chained append-only audit log.
 
 pub mod bft;
+pub mod blockchain;
 pub mod log;
