@@ -617,13 +617,13 @@ fn test_ratchet_state_manipulation() {
         epoch_tags.push(tag);
         epoch_keys.push(key);
 
-        // Advance with unique entropy per epoch
-        let mut client_ent = [0x11u8; 32];
-        client_ent[0] = i + 1;
-        let mut server_ent = [0x22u8; 32];
-        server_ent[0] = i + 1;
-        let mut nonce = [0x33u8; 32];
-        nonce[0] = i + 1;
+        // Advance with high-entropy values (must pass ratchet quality check)
+        let mut client_ent = [0u8; 32];
+        getrandom::getrandom(&mut client_ent).unwrap();
+        let mut server_ent = [0u8; 32];
+        getrandom::getrandom(&mut server_ent).unwrap();
+        let mut nonce = [0u8; 32];
+        getrandom::getrandom(&mut nonce).unwrap();
         ratchet.advance(&client_ent, &server_ent, &nonce);
     }
 
@@ -1058,7 +1058,13 @@ fn test_memory_scraping_resistance() {
     let test_claims = b"memory-scraping-test-claims";
     let epoch0_tag = ratchet.generate_tag(test_claims);
     let epoch0_key = ratchet.current_key();
-    ratchet.advance(&[0x11; 32], &[0x22; 32], &[0x33; 32]);
+    let mut c_ent = [0u8; 32];
+    getrandom::getrandom(&mut c_ent).unwrap();
+    let mut s_ent = [0u8; 32];
+    getrandom::getrandom(&mut s_ent).unwrap();
+    let mut nonce = [0u8; 32];
+    getrandom::getrandom(&mut nonce).unwrap();
+    ratchet.advance(&c_ent, &s_ent, &nonce);
     let epoch1_tag = ratchet.generate_tag(test_claims);
     let epoch1_key = ratchet.current_key();
 
