@@ -63,3 +63,7 @@ pub mod data_residency;
 
 // ── STIG/CIS benchmark auditor ──
 pub mod stig;
+
+// ── CMMC 2.0 assessment and SIEM webhook integration ──
+pub mod cmmc;
+pub mod siem_webhook;

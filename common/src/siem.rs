@@ -715,6 +715,9 @@ impl SecurityEvent {
 
         broadcast_event(&siem_event);
 
+        // Queue to external SIEM webhook if one has been initialised.
+        crate::siem_webhook::queue_global_event(&siem_event.json);
+
         // Alert on high-severity events (severity >= 7 = HIGH)
         if siem_event.severity >= 7 {
             process_alert(&siem_event);

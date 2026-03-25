@@ -454,6 +454,7 @@ dependencies = [
 name = "common"
 version = "0.1.0"
 dependencies = [
+ "aegis",
  "aes-gcm",
  "argon2",
  "blake3",
@@ -463,7 +464,9 @@ dependencies = [
  "hkdf",
  "hmac",
  "ml-dsa",
+ "p256",
  "postcard",
+ "rand 0.8.5",
  "serde",
  "serde_json",
  "sha1",
@@ -594,6 +597,7 @@ dependencies = [
  "pbkdf2",
  "proptest",
  "rand 0.8.5",
+ "serde",
  "sha2",
  "sha3 0.10.8",
  "subtle",
@@ -1989,6 +1993,7 @@ dependencies = [
  "getrandom 0.2.17",
  "ml-dsa",
  "opaque-ke",
+ "pbkdf2",
  "postcard",
  "rand 0.8.5",
  "rcgen",
