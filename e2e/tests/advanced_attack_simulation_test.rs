@@ -822,7 +822,7 @@ fn test_audit_log_tampering() {
 
     // Verify that modifying the event_type also breaks the hash
     let mut type_tampered = entries[1].clone();
-    type_tampered.event_type = AuditEventType::AuthenticationSuccess; // Change failure to success
+    type_tampered.event_type = AuditEventType::AuthSuccess; // Change failure to success
     let type_tampered_hash = hash_entry(&type_tampered);
     assert_ne!(
         original_hash, type_tampered_hash,
