@@ -24,9 +24,13 @@ blake3.workspace = true
 tracing.workspace = true
 hex.workspace = true
 argon2.workspace = true
+p256 = { workspace = true }
 cryptoki = { workspace = true, optional = true }
 sha1 = "0.10"
 serde_json = "1"
+
+[dev-dependencies]
+rand.workspace = true
 
 [features]
 cac = ["cryptoki"]

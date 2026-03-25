@@ -52,3 +52,7 @@ pub mod fips;
 pub mod structured_logging;
 pub mod metrics;
 pub mod incident_response;
+
+// ── CAC/PIV smart card authentication ──
+pub mod cac;
+pub mod cac_auth;

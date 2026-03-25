@@ -355,6 +355,25 @@ pub struct SecurityConfig {
     /// Require encryption of TSS key shards at rest and in transit.
     pub shard_encryption_enabled: bool,
 
+    // ── CAC / PIV smart card parameters ──
+
+    /// Enable CAC/PIV hardware smart card authentication.
+    pub cac_enabled: bool,
+    /// Path to the PKCS#11 shared library for CAC/PIV (e.g. `/usr/lib/libcackey.so`).
+    pub cac_pkcs11_library: String,
+    /// PKCS#11 slot number for the CAC/PIV reader.
+    pub cac_pkcs11_slot: u64,
+    /// Tiers that require CAC/PIV authentication (default: [1] = Sovereign).
+    pub cac_required_tiers: Vec<u8>,
+    /// Maximum CAC PIN entry attempts before the card is locked (default: 3).
+    pub cac_pin_max_retries: u8,
+    /// CAC session lifetime in seconds (default: 3600 = 1 hour).
+    pub cac_session_timeout_secs: u64,
+    /// Enable Indian CCA Digital Signature Certificate (DSC) authentication.
+    pub indian_dsc_enabled: bool,
+    /// Enable Indian Aadhaar eSign authentication.
+    pub indian_esign_enabled: bool,
+
     // ── FIPS / Post-Quantum cryptography parameters ──
 
     /// Enable FIPS 140-3 mode — only FIPS-approved algorithms permitted.
@@ -451,6 +470,16 @@ impl Default for SecurityConfig {
             require_pkce: true,
             require_mtls: true,
             shard_encryption_enabled: true,
+
+            // CAC / PIV defaults — disabled until hardware is configured
+            cac_enabled: false,
+            cac_pkcs11_library: String::new(),
+            cac_pkcs11_slot: 0,
+            cac_required_tiers: vec![1],
+            cac_pin_max_retries: 3,
+            cac_session_timeout_secs: 3600,
+            indian_dsc_enabled: false,
+            indian_esign_enabled: false,
 
             // FIPS / Post-Quantum defaults — maximum security
             fips_mode: true,

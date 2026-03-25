@@ -502,6 +502,54 @@ impl SecurityEvent {
         event.emit();
     }
 
+    /// Emit a CAC/PIV authentication success event.
+    pub fn cac_auth_success(card_serial: &str, clearance_level: u8) {
+        let event = SecurityEvent {
+            timestamp: Self::now_iso8601(),
+            category: "authentication",
+            action: "cac_auth_success",
+            severity: Severity::Low,
+            outcome: "success",
+            user_id: None,
+            source_ip: None,
+            detail: Some(format!(
+                "CAC authentication succeeded: serial={} clearance={}",
+                card_serial, clearance_level
+            )),
+        };
+        event.emit();
+    }
+
+    /// Emit a CAC/PIV authentication failure event.
+    pub fn cac_auth_failure(reason: &str) {
+        let event = SecurityEvent {
+            timestamp: Self::now_iso8601(),
+            category: "authentication",
+            action: "cac_auth_failure",
+            severity: Severity::High,
+            outcome: "failure",
+            user_id: None,
+            source_ip: None,
+            detail: Some(format!("CAC authentication failed: reason={}", reason)),
+        };
+        event.emit();
+    }
+
+    /// Emit a CAC/PIV PIN locked event (too many failed PIN attempts).
+    pub fn cac_pin_locked(card_serial: &str) {
+        let event = SecurityEvent {
+            timestamp: Self::now_iso8601(),
+            category: "authentication",
+            action: "cac_pin_locked",
+            severity: Severity::High,
+            outcome: "failure",
+            user_id: None,
+            source_ip: None,
+            detail: Some(format!("CAC PIN locked for card: serial={}", card_serial)),
+        };
+        event.emit();
+    }
+
     /// Emit a developer mode toggle blocked event (production protection).
     pub fn developer_mode_blocked() {
         let event = SecurityEvent {
