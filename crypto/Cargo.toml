@@ -8,9 +8,11 @@ license.workspace = true
 default = ["hbs", "fips-kat"]
 hbs = []
 fips-kat = []
+pkcs11-hw = ["dep:cryptoki"]
 
 [dependencies]
 common = { path = "../common" }
+cryptoki = { workspace = true, optional = true }
 serde.workspace = true
 sha2.workspace = true
 sha3.workspace = true

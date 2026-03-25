@@ -2,30 +2,59 @@
 
 ## Overview
 
-This TLA+ specification formally models the Tier 2 authentication ceremony of the MILNET SSO system. It captures the core flow from client initiation through OPAQUE authentication, receipt collection, threshold signing (TSS), and token verification, including an adversary model for node compromise and token forgery.
+This TLA+ specification formally models all critical protocols of the MILNET SSO system:
+
+- **Tier 1 (Sovereign)** -- FIDO2 + risk scoring ceremony
+- **Tier 2 (Command)** -- OPAQUE + TSS threshold signing
+- **Tier 3 (Sensor)** -- Attestation-based authentication
+- **Tier 4 (Emergency)** -- 7-of-13 Shamir + out-of-band verification
+- **FROST DKG** -- Distributed key generation (no single party learns the secret)
+- **OPAQUE** -- Server-blind password authentication
+- **Ratchet** -- Forward secrecy (compromise of current key does not reveal past)
+- **Cross-Domain Guard** -- Bell-LaPadula information flow (no write-down, no read-up)
+- **Token Lifecycle** -- Issuance, validation, revocation, expiry
+- **Key Rotation** -- Atomic key rotation without service interruption
 
 ## What the Model Verifies
 
 ### Safety Properties (Invariants)
 
-- **TypeOK** -- All state variables have correct types and values.
-- **NoUnauthToken** -- Every verified token traces back to a completed ceremony for the same user. No token can be verified without a legitimate authentication flow.
-- **ThresholdIntegrity** -- If fewer than 3 (threshold) of the 5 TSS nodes are compromised, no forged tokens can exist in the system.
-- **SessionUniqueness** -- No two ceremonies share a session ID.
-- **SessionIdMonotonic** -- Session IDs are assigned from a strictly increasing counter, guaranteeing freshness.
+| Property | Description |
+|----------|-------------|
+| **TypeOK** | All state variables have correct types and values |
+| **NoUnauthToken** | Every verified token traces back to a completed ceremony |
+| **ThresholdIntegrity** | If fewer than 3 TSS nodes compromised, no forged tokens exist |
+| **SessionUniqueness** | No two ceremonies share a session ID |
+| **DKGSecretSafety** | No single DKG participant learns the group secret |
+| **OPAQUEPasswordBlindness** | Server never sees the plaintext password |
+| **RatchetForwardSecrecy** | Current epoch key is never in the history of past epochs |
+| **RevokedTokenNeverVerified** | Revoked tokens are never in the verified set |
+| **KeyRotationSafety** | Old key not decommissioned while live tokens depend on it |
+| **Tier4ShareThreshold** | Tier 4 ceremony requires at least 7-of-13 Shamir shares |
+| **Tier1Completeness** | Tier 1 ceremony requires FIDO2 + acceptable risk score |
+| **Tier3AttestationRequired** | Tier 3 ceremony requires valid device attestation |
 
-### Liveness Property (Temporal)
+### Liveness Properties (Temporal)
 
-- **EventualAuth** -- Under weak fairness, every user eventually either gets a verified token or the system is degraded (threshold-many nodes compromised). This ensures the protocol does not deadlock for legitimate users when the system is healthy.
+| Property | Description |
+|----------|-------------|
+| **EventualAuth** | Every user eventually gets a verified token (or system is degraded) |
+| **DKGEventualCompletion** | Every started DKG session eventually completes |
+| **KeyRotationEventualCompletion** | Key rotation transitions eventually finish |
 
 ## Constants
 
 | Constant | Default | Meaning |
-|---|---|---|
+|----------|---------|---------|
 | `Users` | `{u1, u2, u3}` | Set of user identifiers |
 | `TSSNodes` | `{n1, n2, n3, n4, n5}` | Set of TSS signing nodes |
 | `Threshold` | `3` | Minimum honest nodes needed to sign |
-| `MaxCeremonies` | `3` | Upper bound on concurrent ceremonies (for finite model checking) |
+| `MaxCeremonies` | `3` | Upper bound on concurrent ceremonies |
+| `ClassificationLevels` | `{0, 1, 2, 3}` | Security classification levels (U, C, S, TS) |
+| `DKGParticipants` | `{p1, p2, p3, p4, p5}` | FROST DKG participant identifiers |
+| `ShamirNodes` | `{s1..s13}` | Shamir secret sharing nodes for Tier 4 |
+| `ShamirThreshold` | `7` | Minimum Shamir shares for emergency recovery |
+| `MaxEpochs` | `3` | Upper bound on ratchet epochs |
 
 ## How to Run
 
@@ -46,15 +75,33 @@ java -cp /path/to/tla2tools.jar tlc2.TLC milnet.tla -config milnet.cfg -workers 
 
 1. Open the Toolbox and create a new spec pointing to `milnet.tla`.
 2. Create a model using the constants defined in `milnet.cfg`.
-3. Add the invariants (`NoUnauthToken`, `ThresholdIntegrity`, `SessionUniqueness`, `SessionIdMonotonic`, `TypeOK`) and the temporal property (`EventualAuth`).
+3. Add all invariants and temporal properties listed in `milnet.cfg`.
 4. Run TLC.
+
+**Note**: The expanded model with 13 Shamir nodes and 5 DKG participants has a large state space. Consider reducing constants for initial exploration (e.g., `ShamirNodes = {s1, s2, s3}` with `ShamirThreshold = 2`).
 
 ## Architecture Modeled
 
 ```
-Client -> Gateway -> Orchestrator -> OPAQUE -> TSS (3-of-5) -> Verifier
-                                                 ^
-                                          Adversary (CompromiseNode, ForgeAttempt)
+                    ┌── Tier 1: FIDO2 + Risk Scoring ──────────────┐
+                    │── Tier 2: OPAQUE + TSS (3-of-5) ─────────────│
+Client -> Gateway ->│── Tier 3: Attestation ───────────────────────│-> Verifier
+                    │── Tier 4: Shamir (7-of-13) + OOB ────────────│
+                    └──────────────────────────────────────────────┘
+                                      │
+                              ┌───────┴───────┐
+                              │   Adversary    │
+                              │ CompromiseNode │
+                              │  ForgeAttempt  │
+                              └────────────────┘
+
+Cross-cutting concerns:
+  - FROST DKG: key generation for TSS nodes
+  - OPAQUE: server-blind password auth
+  - Ratchet: forward secrecy for token epochs
+  - Cross-Domain Guard: Bell-LaPadula MAC enforcement
+  - Token Lifecycle: issuance, revocation, expiry
+  - Key Rotation: atomic dual-key transition
 ```
 
 The model abstracts each module interaction into discrete actions. Byzantine behavior is modeled via `CompromiseNode` (marks a TSS node as compromised) and `ForgeAttempt` (adversary produces a forged token only when threshold-many nodes are compromised).

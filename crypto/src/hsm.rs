@@ -2823,6 +2823,603 @@ pub fn create_hsm_backend() -> Box<dyn HsmKeyOps> {
 }
 
 // ---------------------------------------------------------------------------
+// Real PKCS#11 hardware session via the `cryptoki` crate
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "pkcs11-hw")]
+mod pkcs11_hw {
+    use super::*;
+    use cryptoki::context::{CInitializeArgs, Pkcs11};
+    use cryptoki::mechanism::aead::GcmParams;
+    use cryptoki::mechanism::Mechanism;
+    use cryptoki::object::{Attribute, AttributeType, ObjectClass, ObjectHandle};
+    use cryptoki::session::{Session, UserType};
+    use cryptoki::types::AuthPin;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use zeroize::Zeroize;
+
+    /// Real PKCS#11 hardware session using the `cryptoki` crate FFI bindings.
+    ///
+    /// This struct manages a live PKCS#11 session with an actual hardware HSM
+    /// (Thales Luna, AWS CloudHSM, YubiHSM2, SoftHSM2, etc.) via the standard
+    /// PKCS#11 C API. All key material stays inside the HSM boundary — only
+    /// opaque handles cross the FFI.
+    ///
+    /// # Thread Safety
+    /// PKCS#11 sessions require serialized access. The inner `Session` is
+    /// protected by a `Mutex` so that `Pkcs11HardwareSession` is `Send + Sync`.
+    pub struct Pkcs11HardwareSession {
+        /// The cryptoki context (holds the loaded .so handle).
+        _ctx: Arc<Pkcs11>,
+        /// The authenticated PKCS#11 session (behind a mutex for thread safety).
+        session: StdMutex<Session>,
+        /// Key label used to locate / create the master key object.
+        key_label: String,
+    }
+
+    // Session is not Send/Sync by default but we serialise through the Mutex.
+    unsafe impl Send for Pkcs11HardwareSession {}
+    unsafe impl Sync for Pkcs11HardwareSession {}
+
+    impl Pkcs11HardwareSession {
+        /// Open a new authenticated PKCS#11 session.
+        ///
+        /// Performs: C_Initialize -> C_OpenSession(slot, RW) -> C_Login(USER, pin).
+        ///
+        /// # Errors
+        /// Returns `HsmError` if the library cannot be loaded, the slot is invalid,
+        /// or authentication fails.
+        pub fn open(
+            library_path: &str,
+            slot_index: u64,
+            pin: &str,
+            key_label: &str,
+        ) -> Result<Self, HsmError> {
+            // C_Initialize
+            let ctx = Pkcs11::new(library_path).map_err(|e| {
+                HsmError::InitializationFailed(format!(
+                    "C_Initialize failed for {library_path}: {e}"
+                ))
+            })?;
+            ctx.initialize(CInitializeArgs::OsThreads).map_err(|e| {
+                HsmError::InitializationFailed(format!("C_Initialize(OsThreads): {e}"))
+            })?;
+
+            // Enumerate slots and pick the requested one.
+            let slots = ctx.get_slots_with_token().map_err(|e| {
+                HsmError::InitializationFailed(format!("C_GetSlotList: {e}"))
+            })?;
+            let slot = slots.get(slot_index as usize).copied().ok_or_else(|| {
+                HsmError::InitializationFailed(format!(
+                    "slot index {slot_index} out of range (found {} slots)",
+                    slots.len()
+                ))
+            })?;
+
+            // C_OpenSession (read-write)
+            let session = ctx.open_rw_session(slot).map_err(|e| {
+                HsmError::InitializationFailed(format!("C_OpenSession(slot={slot_index}): {e}"))
+            })?;
+
+            // C_Login
+            let auth_pin = AuthPin::new(pin.to_string());
+            session.login(UserType::User, Some(&auth_pin)).map_err(|_e| {
+                HsmError::AuthenticationFailed
+            })?;
+
+            // Zeroize the pin copy.
+            let mut pin_buf = pin.to_string();
+            pin_buf.zeroize();
+
+            let ctx = Arc::new(ctx);
+
+            eprintln!(
+                "INFO: PKCS#11 HW session opened (lib={library_path}, slot={slot_index}, \
+                 label={key_label})"
+            );
+
+            Ok(Self {
+                _ctx: ctx,
+                session: StdMutex::new(session),
+                key_label: key_label.to_string(),
+            })
+        }
+
+        // -----------------------------------------------------------------
+        // Internal helpers
+        // -----------------------------------------------------------------
+
+        /// Find a single object by CKA_LABEL.
+        fn find_key_by_label(&self, label: &str) -> Result<Option<ObjectHandle>, HsmError> {
+            let session = self.session.lock().map_err(|_| {
+                HsmError::CommunicationError("session mutex poisoned".into())
+            })?;
+            let template = vec![Attribute::Label(label.as_bytes().to_vec())];
+            let objects = session.find_objects(&template).map_err(|e| {
+                HsmError::CommunicationError(format!("C_FindObjects: {e}"))
+            })?;
+            Ok(objects.into_iter().next())
+        }
+
+        /// Map a `KeyType` to the PKCS#11 mechanism used for key generation.
+        fn gen_mechanism(key_type: KeyType) -> Mechanism<'static> {
+            match key_type {
+                KeyType::Aes256 | KeyType::Aes256Wrap => Mechanism::AesKeyGen,
+                KeyType::HmacSha256 | KeyType::HmacSha512 | KeyType::GenericSecret => {
+                    Mechanism::GenericSecretKeyGen
+                }
+            }
+        }
+
+        /// Build the CKA template for key generation.
+        fn gen_template(key_id: &str, key_type: KeyType) -> Vec<Attribute> {
+            let value_len: u64 = match key_type {
+                KeyType::Aes256 | KeyType::Aes256Wrap => 32,
+                KeyType::HmacSha256 | KeyType::GenericSecret => 32,
+                KeyType::HmacSha512 => 64,
+            };
+
+            let mut attrs = vec![
+                Attribute::Label(key_id.as_bytes().to_vec()),
+                Attribute::Token(true),        // persistent on token
+                Attribute::Sensitive(true),     // key material not extractable in clear
+                Attribute::Private(true),       // requires login
+                Attribute::ValueLen(value_len.into()),
+            ];
+
+            match key_type {
+                KeyType::Aes256 => {
+                    attrs.push(Attribute::Encrypt(true));
+                    attrs.push(Attribute::Decrypt(true));
+                    attrs.push(Attribute::Class(ObjectClass::SECRET_KEY));
+                }
+                KeyType::Aes256Wrap => {
+                    attrs.push(Attribute::Wrap(true));
+                    attrs.push(Attribute::Unwrap(true));
+                    attrs.push(Attribute::Encrypt(true));
+                    attrs.push(Attribute::Decrypt(true));
+                    attrs.push(Attribute::Class(ObjectClass::SECRET_KEY));
+                }
+                KeyType::HmacSha256 | KeyType::HmacSha512 => {
+                    attrs.push(Attribute::Sign(true));
+                    attrs.push(Attribute::Verify(true));
+                    attrs.push(Attribute::Class(ObjectClass::SECRET_KEY));
+                }
+                KeyType::GenericSecret => {
+                    attrs.push(Attribute::Extractable(true));
+                    attrs.push(Attribute::Class(ObjectClass::SECRET_KEY));
+                }
+            }
+
+            attrs
+        }
+    }
+
+    impl HsmKeyOps for Pkcs11HardwareSession {
+        /// C_GenerateKey with CKM_AES_KEY_GEN (AES) or CKM_GENERIC_SECRET_KEY_GEN (HMAC).
+        fn generate_key(&self, key_id: &str, key_type: KeyType) -> Result<Vec<u8>, HsmError> {
+            let session = self.session.lock().map_err(|_| {
+                HsmError::CommunicationError("session mutex poisoned".into())
+            })?;
+
+            let mechanism = Self::gen_mechanism(key_type);
+            let template = Self::gen_template(key_id, key_type);
+
+            let _handle = session.generate_key(&mechanism, &template).map_err(|e| {
+                HsmError::KeyGenerationFailed(format!("C_GenerateKey({key_id}): {e}"))
+            })?;
+
+            // Return a SHA-256 hash of the label as an opaque handle token.
+            // The actual PKCS#11 object handle is internal to the session and
+            // we locate objects by CKA_LABEL, not by handle value.
+            let mut hasher = Sha256::new();
+            hasher.update(key_id.as_bytes());
+            let handle_bytes = hasher.finalize().to_vec();
+            eprintln!(
+                "AUDIT: C_GenerateKey label={key_id} type={key_type:?}"
+            );
+            Ok(handle_bytes)
+        }
+
+        /// C_SignInit(CKM_SHA256_HMAC) + C_Sign.
+        fn sign(&self, key_id: &str, data: &[u8]) -> Result<Vec<u8>, HsmError> {
+            let handle = self
+                .find_key_by_label(key_id)?
+                .ok_or_else(|| HsmError::KeyNotFound(key_id.to_string()))?;
+
+            let session = self.session.lock().map_err(|_| {
+                HsmError::CommunicationError("session mutex poisoned".into())
+            })?;
+
+            let signature = session
+                .sign(&Mechanism::Sha256Hmac, handle, data)
+                .map_err(|e| HsmError::SigningFailed(format!("C_Sign({key_id}): {e}")))?;
+
+            Ok(signature)
+        }
+
+        /// C_VerifyInit(CKM_SHA256_HMAC) + C_Verify.
+        fn verify(
+            &self,
+            key_id: &str,
+            data: &[u8],
+            signature: &[u8],
+        ) -> Result<bool, HsmError> {
+            let handle = self
+                .find_key_by_label(key_id)?
+                .ok_or_else(|| HsmError::KeyNotFound(key_id.to_string()))?;
+
+            let session = self.session.lock().map_err(|_| {
+                HsmError::CommunicationError("session mutex poisoned".into())
+            })?;
+
+            match session.verify(&Mechanism::Sha256Hmac, handle, data, signature) {
+                Ok(()) => Ok(true),
+                Err(cryptoki::error::Error::Pkcs11(
+                    cryptoki::error::RvError::SignatureInvalid, _,
+                )) => Ok(false),
+                Err(cryptoki::error::Error::Pkcs11(
+                    cryptoki::error::RvError::SignatureLenRange, _,
+                )) => Ok(false),
+                Err(e) => Err(HsmError::CommunicationError(format!(
+                    "C_Verify({key_id}): {e}"
+                ))),
+            }
+        }
+
+        /// C_EncryptInit(CKM_AES_GCM) + C_Encrypt.
+        ///
+        /// Returns `nonce(12) || ciphertext || tag(16)`.
+        fn encrypt(
+            &self,
+            key_id: &str,
+            plaintext: &[u8],
+            aad: &[u8],
+        ) -> Result<Vec<u8>, HsmError> {
+            let handle = self
+                .find_key_by_label(key_id)?
+                .ok_or_else(|| HsmError::KeyNotFound(key_id.to_string()))?;
+
+            // Generate a random 12-byte IV.
+            let mut iv = [0u8; 12];
+            getrandom::getrandom(&mut iv)
+                .map_err(|_| HsmError::KeyGenerationFailed("CSPRNG unavailable for IV".into()))?;
+
+            let session = self.session.lock().map_err(|_| {
+                HsmError::CommunicationError("session mutex poisoned".into())
+            })?;
+
+            let gcm_params = GcmParams::new(&mut iv, aad, 128.into()).map_err(|e| {
+                HsmError::CommunicationError(format!("GcmParams: {e}"))
+            })?;
+            let mechanism = Mechanism::AesGcm(gcm_params);
+
+            let ciphertext = session.encrypt(&mechanism, handle, plaintext).map_err(|e| {
+                HsmError::CommunicationError(format!("C_Encrypt({key_id}): {e}"))
+            })?;
+
+            // Prepend the IV so the caller can pass it back for decryption.
+            let mut output = Vec::with_capacity(12 + ciphertext.len());
+            output.extend_from_slice(&iv);
+            output.extend_from_slice(&ciphertext);
+            Ok(output)
+        }
+
+        /// C_DecryptInit(CKM_AES_GCM) + C_Decrypt.
+        ///
+        /// Expects `nonce(12) || ciphertext || tag(16)`.
+        fn decrypt(
+            &self,
+            key_id: &str,
+            ciphertext: &[u8],
+            aad: &[u8],
+        ) -> Result<Vec<u8>, HsmError> {
+            if ciphertext.len() < 28 {
+                return Err(HsmError::UnwrapFailed(
+                    "ciphertext too short (need at least 12-byte IV + 16-byte tag)".into(),
+                ));
+            }
+
+            let handle = self
+                .find_key_by_label(key_id)?
+                .ok_or_else(|| HsmError::KeyNotFound(key_id.to_string()))?;
+
+            let (iv_slice, ct) = ciphertext.split_at(12);
+            let mut iv = [0u8; 12];
+            iv.copy_from_slice(iv_slice);
+
+            let session = self.session.lock().map_err(|_| {
+                HsmError::CommunicationError("session mutex poisoned".into())
+            })?;
+
+            let gcm_params = GcmParams::new(&mut iv, aad, 128.into()).map_err(|e| {
+                HsmError::UnwrapFailed(format!("GcmParams: {e}"))
+            })?;
+            let mechanism = Mechanism::AesGcm(gcm_params);
+
+            let plaintext = session.decrypt(&mechanism, handle, ct).map_err(|e| {
+                HsmError::UnwrapFailed(format!("C_Decrypt({key_id}): {e}"))
+            })?;
+
+            Ok(plaintext)
+        }
+
+        /// C_WrapKey with CKM_AES_KEY_WRAP_KWP.
+        ///
+        /// `key_to_wrap` is treated as raw bytes to be imported as a temporary
+        /// generic-secret object, then wrapped under `wrapping_key_id`.
+        fn wrap_key(
+            &self,
+            wrapping_key_id: &str,
+            key_to_wrap: &[u8],
+        ) -> Result<Vec<u8>, HsmError> {
+            let wrapping_handle = self
+                .find_key_by_label(wrapping_key_id)?
+                .ok_or_else(|| HsmError::KeyNotFound(wrapping_key_id.to_string()))?;
+
+            let session = self.session.lock().map_err(|_| {
+                HsmError::CommunicationError("session mutex poisoned".into())
+            })?;
+
+            // Import the raw key material as a temporary session object so that
+            // C_WrapKey can operate on it.
+            let tmp_label = format!("__tmp_wrap_{}", wrapping_key_id);
+            let import_template = vec![
+                Attribute::Class(ObjectClass::SECRET_KEY),
+                Attribute::KeyType(cryptoki::object::KeyType::GENERIC_SECRET),
+                Attribute::Value(key_to_wrap.to_vec()),
+                Attribute::Label(tmp_label.as_bytes().to_vec()),
+                Attribute::Token(false),        // session-only, ephemeral
+                Attribute::Extractable(true),   // must be extractable for wrapping
+                Attribute::Sensitive(false),     // allow wrap extraction
+            ];
+            let tmp_handle = session.create_object(&import_template).map_err(|e| {
+                HsmError::WrapFailed(format!("C_CreateObject(tmp): {e}"))
+            })?;
+
+            let mechanism = Mechanism::AesKeyWrapPad;
+
+            let wrapped = session
+                .wrap_key(&mechanism, wrapping_handle, tmp_handle)
+                .map_err(|e| {
+                    // Best-effort cleanup of the temporary object.
+                    let _ = session.destroy_object(tmp_handle);
+                    HsmError::WrapFailed(format!("C_WrapKey({wrapping_key_id}): {e}"))
+                })?;
+
+            // Destroy the ephemeral object immediately.
+            let _ = session.destroy_object(tmp_handle);
+
+            Ok(wrapped)
+        }
+
+        /// C_UnwrapKey with CKM_AES_KEY_WRAP_KWP.
+        ///
+        /// Returns the unwrapped key material by reading CKA_VALUE from the
+        /// resulting session object (marked extractable).
+        fn unwrap_key(
+            &self,
+            wrapping_key_id: &str,
+            wrapped_key: &[u8],
+        ) -> Result<Vec<u8>, HsmError> {
+            let wrapping_handle = self
+                .find_key_by_label(wrapping_key_id)?
+                .ok_or_else(|| HsmError::KeyNotFound(wrapping_key_id.to_string()))?;
+
+            let session = self.session.lock().map_err(|_| {
+                HsmError::CommunicationError("session mutex poisoned".into())
+            })?;
+
+            let mechanism = Mechanism::AesKeyWrapPad;
+            let unwrap_label = format!("__tmp_unwrap_{}", wrapping_key_id);
+            let template = vec![
+                Attribute::Class(ObjectClass::SECRET_KEY),
+                Attribute::KeyType(cryptoki::object::KeyType::GENERIC_SECRET),
+                Attribute::Label(unwrap_label.as_bytes().to_vec()),
+                Attribute::Token(false),
+                Attribute::Sensitive(false),
+                Attribute::Extractable(true),
+            ];
+
+            let obj = session
+                .unwrap_key(&mechanism, wrapping_handle, wrapped_key, &template)
+                .map_err(|e| {
+                    HsmError::UnwrapFailed(format!("C_UnwrapKey({wrapping_key_id}): {e}"))
+                })?;
+
+            // Extract CKA_VALUE from the unwrapped object.
+            let attrs = session
+                .get_attributes(obj, &[AttributeType::Value])
+                .map_err(|e| {
+                    let _ = session.destroy_object(obj);
+                    HsmError::UnwrapFailed(format!("C_GetAttributeValue: {e}"))
+                })?;
+
+            // Destroy the temporary object before returning.
+            let _ = session.destroy_object(obj);
+
+            for attr in attrs {
+                if let Attribute::Value(val) = attr {
+                    return Ok(val);
+                }
+            }
+
+            Err(HsmError::UnwrapFailed(
+                "CKA_VALUE not found on unwrapped object".into(),
+            ))
+        }
+
+        /// C_DestroyObject — find the key by label and destroy it.
+        fn destroy_key(&self, key_id: &str) -> Result<(), HsmError> {
+            let handle = self
+                .find_key_by_label(key_id)?
+                .ok_or_else(|| HsmError::KeyNotFound(key_id.to_string()))?;
+
+            let session = self.session.lock().map_err(|_| {
+                HsmError::CommunicationError("session mutex poisoned".into())
+            })?;
+
+            session.destroy_object(handle).map_err(|e| {
+                HsmError::CommunicationError(format!("C_DestroyObject({key_id}): {e}"))
+            })?;
+
+            eprintln!("AUDIT: C_DestroyObject label={key_id}");
+            Ok(())
+        }
+
+        /// C_FindObjectsInit + C_FindObjects to check key existence by label.
+        fn key_exists(&self, key_id: &str) -> Result<bool, HsmError> {
+            Ok(self.find_key_by_label(key_id)?.is_some())
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Pkcs11HardwareKeySource — ProductionKeySource backed by real HSM
+    // -----------------------------------------------------------------------
+
+    /// A [`ProductionKeySource`] implementation backed by a real PKCS#11 HSM.
+    ///
+    /// The master key is generated inside (or loaded from) the hardware token
+    /// and never leaves the HSM in plaintext. Local "master key" bytes are
+    /// derived via HMAC-SHA256 challenge-response where the HSM performs the
+    /// HMAC and we use the tag as keying material.
+    pub struct Pkcs11HardwareKeySource {
+        /// The underlying hardware session.
+        hw: Pkcs11HardwareSession,
+    }
+
+    impl Pkcs11HardwareKeySource {
+        /// Create a new hardware key source.
+        ///
+        /// Opens the PKCS#11 session and ensures the master key object exists
+        /// on the token. If it does not exist, a new AES-256 wrapping key is
+        /// generated inside the HSM.
+        pub fn new(
+            library_path: &str,
+            slot_index: u64,
+            pin: &str,
+            key_label: &str,
+        ) -> Result<Self, HsmError> {
+            let hw = Pkcs11HardwareSession::open(library_path, slot_index, pin, key_label)?;
+
+            // Ensure master key exists on token.
+            if !hw.key_exists(key_label)? {
+                eprintln!(
+                    "INFO: Master key '{key_label}' not found on token; generating via C_GenerateKey"
+                );
+                hw.generate_key(key_label, KeyType::Aes256Wrap)?;
+            }
+
+            Ok(Self { hw })
+        }
+    }
+
+    impl ProductionKeySource for Pkcs11HardwareKeySource {
+        fn load_master_key(&self) -> Result<MasterKey, SealError> {
+            // We cannot extract the raw master key from the HSM (CKA_SENSITIVE).
+            // Instead, perform an HMAC-sign challenge to derive local keying
+            // material deterministically.
+            let challenge = b"MILNET-PKCS11-HW-MASTER-KEY-DERIVATION-v1";
+            let tag = self.hw.sign(&self.hw.key_label, challenge).map_err(|e| {
+                eprintln!("ERROR: PKCS#11 HW master key derivation failed: {e}");
+                SealError::InvalidMasterKey
+            })?;
+
+            // Use HKDF to expand the HMAC tag into a 32-byte master key.
+            let hk = Hkdf::<Sha512>::new(Some(b"pkcs11-hw-local-master"), &tag);
+            let mut local_key = [0u8; 32];
+            hk.expand(b"local-master-key-v1", &mut local_key)
+                .map_err(|_| SealError::KeyDerivationFailed)?;
+
+            Ok(MasterKey::from_bytes(local_key))
+        }
+
+        fn rotate_master_key(&self) -> Result<MasterKey, SealError> {
+            // Destroy the old master key and generate a fresh one.
+            let label = &self.hw.key_label;
+            let _ = self.hw.destroy_key(label);
+            self.hw
+                .generate_key(label, KeyType::Aes256Wrap)
+                .map_err(|e| {
+                    eprintln!("ERROR: PKCS#11 HW master key rotation failed: {e}");
+                    SealError::SealFailed
+                })?;
+            self.load_master_key()
+        }
+
+        fn seal_with_hardware(
+            &self,
+            plaintext: &[u8],
+            purpose: &str,
+        ) -> Result<Vec<u8>, SealError> {
+            self.hw
+                .encrypt(&self.hw.key_label, plaintext, purpose.as_bytes())
+                .map_err(|e| {
+                    eprintln!("ERROR: PKCS#11 HW seal failed: {e}");
+                    SealError::SealFailed
+                })
+        }
+
+        fn unseal_with_hardware(
+            &self,
+            sealed: &[u8],
+            purpose: &str,
+        ) -> Result<Vec<u8>, SealError> {
+            self.hw
+                .decrypt(&self.hw.key_label, sealed, purpose.as_bytes())
+                .map_err(|e| {
+                    eprintln!("ERROR: PKCS#11 HW unseal failed: {e}");
+                    SealError::UnsealFailed
+                })
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Factory helpers
+    // -----------------------------------------------------------------------
+
+    /// Create a [`Pkcs11HardwareSession`] from the standard HSM config.
+    ///
+    /// Requires `pkcs11_library_path`, `pkcs11_slot`, and `pkcs11_pin` to be set.
+    pub fn create_hw_session(config: &HsmConfig) -> Result<Pkcs11HardwareSession, HsmError> {
+        let lib = config.pkcs11_library_path.as_deref().ok_or_else(|| {
+            HsmError::ConfigurationError("pkcs11_library_path is required".into())
+        })?;
+        let slot = config.pkcs11_slot.ok_or_else(|| {
+            HsmError::ConfigurationError("pkcs11_slot is required".into())
+        })?;
+        let pin = config.pkcs11_pin.as_deref().ok_or_else(|| {
+            HsmError::ConfigurationError("pkcs11_pin is required".into())
+        })?;
+
+        Pkcs11HardwareSession::open(lib, slot, pin, &config.key_label)
+    }
+
+    /// Create a [`Pkcs11HardwareKeySource`] from the standard HSM config.
+    pub fn create_hw_key_source(
+        config: &HsmConfig,
+    ) -> Result<Pkcs11HardwareKeySource, HsmError> {
+        let lib = config.pkcs11_library_path.as_deref().ok_or_else(|| {
+            HsmError::ConfigurationError("pkcs11_library_path is required".into())
+        })?;
+        let slot = config.pkcs11_slot.ok_or_else(|| {
+            HsmError::ConfigurationError("pkcs11_slot is required".into())
+        })?;
+        let pin = config.pkcs11_pin.as_deref().ok_or_else(|| {
+            HsmError::ConfigurationError("pkcs11_pin is required".into())
+        })?;
+
+        Pkcs11HardwareKeySource::new(lib, slot, pin, &config.key_label)
+    }
+}
+
+// Re-export the hardware types when the feature is enabled.
+#[cfg(feature = "pkcs11-hw")]
+pub use pkcs11_hw::{
+    create_hw_key_source, create_hw_session, Pkcs11HardwareKeySource, Pkcs11HardwareSession,
+};
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

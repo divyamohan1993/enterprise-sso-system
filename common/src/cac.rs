@@ -736,6 +736,255 @@ fn unix_micros() -> i64 {
 }
 
 // ---------------------------------------------------------------------------
+// Hardware-backed PKCS#11 session (requires `cac-hw` feature + real hardware)
+// ---------------------------------------------------------------------------
+
+/// A real PKCS#11 session backed by `cryptoki` FFI to libcackey/libpcsclite.
+///
+/// Only available with `--features cac-hw`.  Loads the PKCS#11 shared library
+/// at runtime, opens a serial session on the configured slot, and delegates
+/// all cryptographic operations to the smart card hardware.
+///
+/// On drop the user is logged out and the session is closed.
+#[cfg(feature = "cac-hw")]
+pub struct HardwarePkcs11Session {
+    ctx: cryptoki::context::Pkcs11,
+    session: cryptoki::session::Session,
+    slot: cryptoki::slot::Slot,
+    logged_in: bool,
+}
+
+#[cfg(feature = "cac-hw")]
+impl std::fmt::Debug for HardwarePkcs11Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HardwarePkcs11Session")
+            .field("slot", &self.slot)
+            .field("logged_in", &self.logged_in)
+            .finish()
+    }
+}
+
+#[cfg(feature = "cac-hw")]
+impl HardwarePkcs11Session {
+    /// Load the PKCS#11 library and open a read-only serial session.
+    ///
+    /// `library_path` is typically `/usr/lib/libcackey.so` (DoD CAC) or
+    /// `/usr/lib/x86_64-linux-gnu/libpcsclite.so` (PC/SC lite).
+    pub fn open(library_path: &str, slot_id: u64) -> Result<Self, CacError> {
+        use cryptoki::context::{CInitializeArgs, Pkcs11};
+        use cryptoki::slot::Slot;
+
+        let ctx = Pkcs11::new(library_path).map_err(|e| {
+            CacError::LibraryNotFound(format!("{}: {}", library_path, e))
+        })?;
+
+        ctx.initialize(CInitializeArgs::OsThreads).map_err(|e| {
+            CacError::LibraryNotFound(format!("C_Initialize failed: {}", e))
+        })?;
+
+        let slot = Slot::try_from(slot_id)
+            .map_err(|_| CacError::SlotNotAvailable(slot_id))?;
+
+        // Verify the slot has a token present.
+        let slots = ctx
+            .get_slots_with_token()
+            .map_err(|_| CacError::SlotNotAvailable(slot_id))?;
+        if !slots.contains(&slot) {
+            return Err(CacError::SlotNotAvailable(slot_id));
+        }
+
+        // CKF_SERIAL_SESSION, read-only.
+        let session = ctx
+            .open_ro_session(slot)
+            .map_err(|_| CacError::SlotNotAvailable(slot_id))?;
+
+        Ok(Self { ctx, session, slot, logged_in: false })
+    }
+
+    /// `C_Login(CKU_USER, pin)`.
+    pub fn login_user(&mut self, pin: &[u8]) -> Result<(), CacError> {
+        use cryptoki::error::Error as Pkcs11Error;
+        use cryptoki::session::UserType;
+        use cryptoki::types::AuthPin;
+
+        let pin_str = std::str::from_utf8(pin)
+            .map_err(|_| CacError::LoginFailed)?;
+        let auth_pin: AuthPin = pin_str.to_string().into();
+
+        match self.session.login(UserType::User, Some(&auth_pin)) {
+            Ok(()) => {
+                self.logged_in = true;
+                Ok(())
+            }
+            Err(Pkcs11Error::Pkcs11(rv, _func)) => {
+                let code = format!("{:?}", rv);
+                if code.contains("PinLocked") {
+                    Err(CacError::PinLocked)
+                } else {
+                    Err(CacError::LoginFailed)
+                }
+            }
+            Err(_) => Err(CacError::LoginFailed),
+        }
+    }
+
+    /// Log out of the current session.
+    pub fn logout(&mut self) -> Result<(), CacError> {
+        if !self.logged_in {
+            return Ok(());
+        }
+        let _ = self.session.logout();
+        self.logged_in = false;
+        Ok(())
+    }
+
+    /// Find the DER certificate on the card with `CKA_LABEL == label`.
+    pub fn find_certificate(&self, label: &str) -> Result<Vec<u8>, CacError> {
+        use cryptoki::object::{Attribute, AttributeType, ObjectClass};
+
+        if !self.logged_in {
+            return Err(CacError::LoginFailed);
+        }
+
+        let template = vec![
+            Attribute::Class(ObjectClass::CERTIFICATE),
+            Attribute::Label(label.as_bytes().to_vec()),
+        ];
+
+        let objects = self
+            .session
+            .find_objects(&template)
+            .map_err(|e| CacError::CertificateNotFound(format!("{}: {}", label, e)))?;
+
+        let handle = objects
+            .first()
+            .ok_or_else(|| CacError::CertificateNotFound(label.to_string()))?;
+
+        let attrs = self
+            .session
+            .get_attributes(*handle, &[AttributeType::Value])
+            .map_err(|e| CacError::CertificateNotFound(format!("CKA_VALUE: {}", e)))?;
+
+        for attr in attrs {
+            if let Attribute::Value(der) = attr {
+                return Ok(der);
+            }
+        }
+        Err(CacError::CertificateNotFound(label.to_string()))
+    }
+
+    /// `C_FindObjects(CKO_PRIVATE_KEY)` + `C_SignInit` + `C_Sign`.
+    pub fn sign_data(
+        &self,
+        key_label: &str,
+        data: &[u8],
+        mechanism: SignMechanism,
+    ) -> Result<Vec<u8>, CacError> {
+        use cryptoki::mechanism::Mechanism;
+        use cryptoki::object::{Attribute, ObjectClass};
+
+        if !self.logged_in {
+            return Err(CacError::LoginFailed);
+        }
+
+        let template = vec![
+            Attribute::Class(ObjectClass::PRIVATE_KEY),
+            Attribute::Label(key_label.as_bytes().to_vec()),
+        ];
+
+        let objects = self
+            .session
+            .find_objects(&template)
+            .map_err(|e| CacError::SigningFailed(format!("find '{}': {}", key_label, e)))?;
+
+        let key_handle = objects.first().ok_or_else(|| {
+            CacError::SigningFailed(format!("private key '{}' not found", key_label))
+        })?;
+
+        let ckm = match mechanism {
+            SignMechanism::RsaPkcs => Mechanism::RsaPkcs,
+            SignMechanism::EcdsaP256 | SignMechanism::EcdsaP384 => Mechanism::Ecdsa,
+        };
+
+        let signature = self
+            .session
+            .sign(&ckm, *key_handle, data)
+            .map_err(|e| CacError::SigningFailed(format!("C_Sign: {}", e)))?;
+
+        Ok(signature)
+    }
+
+    /// Software-only signature verification (delegates to [`Pkcs11Session::verify_signature`]).
+    pub fn verify_signature(
+        cert_der: &[u8],
+        data: &[u8],
+        sig: &[u8],
+    ) -> Result<bool, CacError> {
+        Pkcs11Session::verify_signature(cert_der, data, sig)
+    }
+
+    /// Build [`CacCardInfo`] from token info and the PIV AUTH certificate.
+    pub fn get_card_info(&self) -> Result<CacCardInfo, CacError> {
+        if !self.logged_in {
+            return Err(CacError::LoginFailed);
+        }
+
+        let token_info = self
+            .ctx
+            .get_token_info(self.slot)
+            .map_err(|_| CacError::SlotNotAvailable(0))?;
+
+        let card_serial = token_info.serial_number().trim().to_string();
+        let card_issuer = token_info.manufacturer_id().trim().to_string();
+
+        let cert_der = self.find_certificate("PIV AUTH").unwrap_or_default();
+        let subject_dn = if cert_der.is_empty() {
+            "CN=Unknown".to_string()
+        } else {
+            extract_subject_dn(&cert_der).unwrap_or_else(|_| "CN=Unknown".to_string())
+        };
+        let edipi = if !cert_der.is_empty() {
+            extract_edipi(&cert_der)
+        } else {
+            None
+        };
+        let cert_fingerprint = cert_fingerprint_sha512(&cert_der);
+
+        Ok(CacCardInfo {
+            card_serial,
+            card_issuer,
+            subject_dn,
+            edipi,
+            aadhaar_vid: None,
+            affiliation: "Unknown".to_string(),
+            cert_fingerprint,
+            pin_verified: self.logged_in,
+            card_type: CardType::Piv,
+            clearance_level: 0,
+            tags: HashMap::new(),
+            inserted_at: unix_micros(),
+            removed_at: None,
+            reader_id: format!("slot-{}", self.slot),
+            facility_code: "0000".to_string(),
+        })
+    }
+
+    /// Returns `true` when a PIN login is currently active.
+    pub fn is_logged_in(&self) -> bool {
+        self.logged_in
+    }
+}
+
+#[cfg(feature = "cac-hw")]
+impl Drop for HardwarePkcs11Session {
+    fn drop(&mut self) {
+        if self.logged_in {
+            let _ = self.session.logout();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

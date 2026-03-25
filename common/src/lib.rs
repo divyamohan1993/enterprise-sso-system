@@ -70,3 +70,16 @@ pub mod siem_webhook;
 
 // ── Searchable Symmetric Encryption (blind index for zero-trust DB) ──
 pub mod sse;
+
+// ── Reproducible build manifest and binary integrity verification ──
+pub mod build_manifest;
+
+// ── Authenticated time, DNS security, BMC hardening, physical security ──
+pub mod secure_time;
+pub mod dns_security;
+pub mod bmc_hardening;
+pub mod physical_security;
+
+// ── Session recording & certificate lifecycle ──
+pub mod session_recording;
+pub mod cert_lifecycle;
