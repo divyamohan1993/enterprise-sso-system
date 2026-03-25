@@ -855,15 +855,15 @@ All tests on C2 spot VM:
 4. `common/src/encrypted_db.rs` — PII encryption enforcement
 5. `common/src/siem.rs` — new event types
 6. `common/src/types.rs` — dpop_hash to [u8; 64], Receipt.dpop_key_hash to [u8; 64]
-7. `common/src/backup.rs` — XChaCha20 + v2 format
+7. `common/src/backup.rs` — AEGIS-256 + v2 format
 8. `crypto/src/lib.rs` — add kdf, symmetric, cac modules
-9. `crypto/src/fips_kat.rs` — PBKDF2 + XChaCha20 KATs
+9. `crypto/src/fips_kat.rs` — PBKDF2 + AEGIS-256 KATs
 10. `crypto/src/attest.rs` — FIPS-aware hashing
 11. `crypto/src/dpop.rs` — ML-DSA-65→87, dpop_key_hash() returns [u8; 64]
 12. `crypto/src/receipts.rs` — ML-DSA-65→87
-13. `crypto/src/seal.rs` — XChaCha20 default + legacy AES-256-GCM migration
+13. `crypto/src/seal.rs` — AEGIS-256 default + legacy AES-256-GCM migration
 14. `crypto/src/envelope.rs` — same dual-algorithm switch + legacy migration
-15. `shard/src/protocol.rs` — XChaCha20 for non-FIPS
+15. `shard/src/protocol.rs` — AEGIS-256 for non-FIPS
 16. `opaque/src/opaque_impl.rs` — add OpaqueCsFips + Pbkdf2Sha512 wrapper
 17. `opaque/src/store.rs` — dual cipher suite, KSF migration
 18. `opaque/src/service.rs` — FIPS-aware routing, MlDsa65→MlDsa87
