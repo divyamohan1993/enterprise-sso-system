@@ -25,3 +25,5 @@ getrandom.workspace = true
 hkdf.workspace = true
 
 [dev-dependencies]
+tokio-rustls.workspace = true
+rustls.workspace = true

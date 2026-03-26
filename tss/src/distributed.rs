@@ -254,6 +254,27 @@ pub async fn run_signer_process(
     )
     .await?;
 
+    run_signer_process_inner(node, addr, listener).await
+}
+
+/// Run a standalone signer process with a pre-configured TLS listener.
+///
+/// This variant is used when the caller provides a shared CA (e.g., in
+/// distributed deployments where all nodes share a CA, or in tests).
+pub async fn run_signer_process_with_listener(
+    node: SignerNode,
+    addr: &str,
+    listener: shard::tls_transport::TlsShardListener,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_signer_process_inner(node, addr, listener).await
+}
+
+async fn run_signer_process_inner(
+    node: SignerNode,
+    addr: &str,
+    listener: shard::tls_transport::TlsShardListener,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+
     tracing::info!("TSS signer node {:?} listening on {}", node.identifier(), addr);
 
     // Store node in a tokio mutex for mutable access during signing.
@@ -809,6 +830,39 @@ mod tests {
         distribute_shares(&mut dkg_result)
     }
 
+    /// Helper: create a shared CA and TLS infrastructure for tests.
+    /// Returns (CA, connector) that can be used by both signers and coordinator.
+    fn shared_tls_ca() -> (
+        shard::tls::CertificateAuthority,
+        tokio_rustls::TlsConnector,
+    ) {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let ca = shard::tls::generate_ca();
+        let client_cert = shard::tls::generate_module_cert("tss-coordinator", &ca);
+        let client_config = shard::tls::client_tls_config(&client_cert, &ca);
+        let connector = shard::tls::tls_connector(client_config);
+        (ca, connector)
+    }
+
+    /// Helper: bind a signer with a shared CA (for tests).
+    async fn bind_signer_with_shared_ca(
+        addr: &str,
+        hmac_key: [u8; 64],
+        ca: &shard::tls::CertificateAuthority,
+        signer_name: &str,
+    ) -> shard::tls_transport::TlsShardListener {
+        let cert_key = shard::tls::generate_module_cert(signer_name, ca);
+        let server_config = shard::tls::server_tls_config(&cert_key, ca);
+        shard::tls_transport::TlsShardListener::bind(
+            addr,
+            common::types::ModuleId::Tss,
+            hmac_key,
+            server_config,
+        )
+        .await
+        .expect("signer bind must succeed")
+    }
+
     #[test]
     fn sealed_share_round_trip() {
         // Ensure deterministic dev KEK is used
@@ -912,44 +966,50 @@ mod tests {
 
     #[tokio::test]
     async fn distributed_coordinator_signer_handshake() {
-        // This test verifies that a coordinator can connect to a signer
-        // process over SHARD/mTLS, perform the commit and sign rounds,
-        // and produce a valid group signature.
+        // This test verifies that a coordinator can connect to signer
+        // processes over SHARD/mTLS with a shared CA, perform the commit
+        // and sign rounds, and produce a valid group signature.
         std::env::remove_var("MILNET_PRODUCTION");
 
         let (coordinator, nodes) = setup_dkg();
         let threshold = coordinator.threshold;
-
         let hmac_key = crypto::entropy::generate_key_64();
 
-        // Spawn signer processes on random ports
+        // Set up shared CA for all nodes
+        let (ca, connector) = shared_tls_ca();
+
         let mut signer_addrs: Vec<(Identifier, String)> = Vec::new();
 
-        // We need `threshold` signers (3)
+        // Spawn signer processes on random ports with the shared CA
         let base_port: u16 = 19200 + (std::process::id() % 1000) as u16;
         for (i, node) in nodes.into_iter().take(threshold).enumerate() {
             let addr = format!("127.0.0.1:{}", base_port + i as u16);
             signer_addrs.push((node.identifier(), addr.clone()));
-            let hmac = hmac_key;
+            let signer_name = format!("tss-signer-{}", i);
+            let listener =
+                bind_signer_with_shared_ca(&addr, hmac_key, &ca, &signer_name).await;
             tokio::spawn(async move {
-                let _ = run_signer_process(node, &addr, hmac).await;
+                let _ = run_signer_process_with_listener(node, &addr, listener).await;
             });
         }
 
-        // Give signers time to bind
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // Give signers time to start accepting
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        // Build the distributed coordinator
+        // Build the distributed coordinator using the shared connector
         let dist_coordinator = DistributedSigningCoordinator {
             public_key_package: coordinator.public_key_package.clone(),
             threshold,
-            signer_addrs,
+            signer_addrs: signer_addrs.clone(),
             hmac_key,
         };
 
-        // Perform a distributed signing ceremony
+        // Perform a distributed signing ceremony using the shared connector
         let message = b"distributed handshake test message";
-        let frost_result = dist_coordinator.coordinate_signing_remote(message).await;
+
+        // Manually drive the signing ceremony with the shared connector
+        let frost_result =
+            coordinate_signing_remote_with_connector(&dist_coordinator, message, &connector).await;
         assert!(
             frost_result.is_ok(),
             "distributed signing must succeed: {:?}",
@@ -981,10 +1041,12 @@ mod tests {
         let threshold = coordinator.threshold;
         let hmac_key = crypto::entropy::generate_key_64();
 
+        let (ca, connector) = shared_tls_ca();
+
         let base_port: u16 = 19300 + (std::process::id() % 1000) as u16;
         let mut signer_addrs: Vec<(Identifier, String)> = Vec::new();
 
-        // Seal each share, unseal it, and run as a signer process
+        // Seal each share, unseal it, and run as a signer process with shared CA
         for (i, node) in nodes.into_iter().take(threshold).enumerate() {
             let sealed_bytes = seal_signer_share(
                 &node,
@@ -999,13 +1061,15 @@ mod tests {
 
             let addr = format!("127.0.0.1:{}", base_port + i as u16);
             signer_addrs.push((unsealed_node.identifier(), addr.clone()));
-            let hmac = hmac_key;
+            let signer_name = format!("tss-signer-sealed-{}", i);
+            let listener =
+                bind_signer_with_shared_ca(&addr, hmac_key, &ca, &signer_name).await;
             tokio::spawn(async move {
-                let _ = run_signer_process(unsealed_node, &addr, hmac).await;
+                let _ = run_signer_process_with_listener(unsealed_node, &addr, listener).await;
             });
         }
 
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         let dist_coordinator = DistributedSigningCoordinator {
             public_key_package: coordinator.public_key_package.clone(),
@@ -1015,7 +1079,8 @@ mod tests {
         };
 
         let message = b"sealed share end-to-end test";
-        let frost_result = dist_coordinator.coordinate_signing_remote(message).await;
+        let frost_result =
+            coordinate_signing_remote_with_connector(&dist_coordinator, message, &connector).await;
         assert!(
             frost_result.is_ok(),
             "signing with unsealed shares must succeed: {:?}",
@@ -1035,5 +1100,142 @@ mod tests {
         );
 
         std::env::remove_var("MILNET_MASTER_KEK");
+    }
+
+    /// Helper: like `DistributedSigningCoordinator::coordinate_signing_remote`
+    /// but uses a pre-existing TLS connector (with shared CA) instead of
+    /// creating its own CA.
+    async fn coordinate_signing_remote_with_connector(
+        coord: &DistributedSigningCoordinator,
+        message: &[u8],
+        connector: &tokio_rustls::TlsConnector,
+    ) -> Result<[u8; 64], String> {
+        if coord.signer_addrs.len() < coord.threshold {
+            return Err(format!(
+                "need {} signers, got {}",
+                coord.threshold,
+                coord.signer_addrs.len()
+            ));
+        }
+
+        let selected: Vec<&(Identifier, String)> =
+            coord.signer_addrs.iter().take(coord.threshold).collect();
+
+        // Round 1: Collect commitments
+        let mut nonces_map: BTreeMap<Identifier, Vec<u8>> = BTreeMap::new();
+        let mut commitments_map: BTreeMap<Identifier, SigningCommitments> = BTreeMap::new();
+
+        for (_id, addr) in &selected {
+            let mut transport = shard::tls_transport::tls_connect(
+                addr,
+                common::types::ModuleId::Orchestrator,
+                coord.hmac_key,
+                connector,
+                "localhost",
+            )
+            .await
+            .map_err(|e| format!("connect to signer at {addr}: {e}"))?;
+
+            let req = SignerMessage::CommitRequest;
+            let req_bytes =
+                postcard::to_allocvec(&req).map_err(|e| format!("serialize: {e}"))?;
+            transport.send(&req_bytes).await.map_err(|e| format!("send: {e}"))?;
+
+            let (_sender, resp_payload) =
+                transport.recv().await.map_err(|e| format!("recv: {e}"))?;
+
+            let resp: SignerMessage = postcard::from_bytes(&resp_payload)
+                .map_err(|e| format!("deserialize: {e}"))?;
+
+            match resp {
+                SignerMessage::CommitResponse {
+                    identifier_bytes,
+                    nonces_bytes,
+                    commitments_bytes,
+                } => {
+                    let identifier = Identifier::deserialize(&identifier_bytes)
+                        .map_err(|e| format!("id: {e}"))?;
+                    let commitments = SigningCommitments::deserialize(&commitments_bytes)
+                        .map_err(|e| format!("commitments: {e}"))?;
+                    nonces_map.insert(identifier, nonces_bytes);
+                    commitments_map.insert(identifier, commitments);
+                }
+                SignerMessage::Error { message } => {
+                    return Err(format!("commit error: {message}"));
+                }
+                _ => return Err("unexpected response".into()),
+            }
+        }
+
+        // Build signing package
+        let signing_package = SigningPackage::new(commitments_map, message);
+        let signing_package_bytes = signing_package
+            .serialize()
+            .map_err(|e| format!("serialize: {e}"))?;
+
+        // Round 2: Collect signature shares
+        let mut signature_shares: BTreeMap<Identifier, SignatureShare> = BTreeMap::new();
+
+        for (id, addr) in &selected {
+            let nonces_bytes = nonces_map
+                .remove(id)
+                .ok_or_else(|| format!("missing nonces for {:?}", id))?;
+
+            let mut transport = shard::tls_transport::tls_connect(
+                addr,
+                common::types::ModuleId::Orchestrator,
+                coord.hmac_key,
+                connector,
+                "localhost",
+            )
+            .await
+            .map_err(|e| format!("connect for sign: {e}"))?;
+
+            let req = SignerMessage::SignRequest {
+                signing_package_bytes: signing_package_bytes.clone(),
+                nonces_bytes,
+            };
+            let req_bytes =
+                postcard::to_allocvec(&req).map_err(|e| format!("serialize: {e}"))?;
+            transport.send(&req_bytes).await.map_err(|e| format!("send: {e}"))?;
+
+            let (_sender, resp_payload) =
+                transport.recv().await.map_err(|e| format!("recv: {e}"))?;
+
+            let resp: SignerMessage = postcard::from_bytes(&resp_payload)
+                .map_err(|e| format!("deserialize: {e}"))?;
+
+            match resp {
+                SignerMessage::SignResponse {
+                    identifier_bytes,
+                    share_bytes,
+                } => {
+                    let identifier = Identifier::deserialize(&identifier_bytes)
+                        .map_err(|e| format!("id: {e}"))?;
+                    let share = SignatureShare::deserialize(&share_bytes)
+                        .map_err(|e| format!("share: {e}"))?;
+                    signature_shares.insert(identifier, share);
+                }
+                SignerMessage::Error { message } => {
+                    return Err(format!("sign error: {message}"));
+                }
+                _ => return Err("unexpected response".into()),
+            }
+        }
+
+        // Aggregate
+        let group_signature = frost::aggregate(
+            &signing_package,
+            &signature_shares,
+            &coord.public_key_package,
+        )
+        .map_err(|e| format!("aggregation: {e}"))?;
+
+        let sig_bytes = group_signature
+            .serialize()
+            .map_err(|e| format!("serialize: {e}"))?;
+        let mut out = [0u8; 64];
+        out.copy_from_slice(&sig_bytes);
+        Ok(out)
     }
 }

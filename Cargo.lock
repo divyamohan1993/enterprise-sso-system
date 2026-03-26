@@ -6,6 +6,7 @@ version = 4
 name = "admin"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "audit",
  "axum",
  "base64",
@@ -13,6 +14,7 @@ dependencies = [
  "crypto",
  "fido",
  "futures-core",
+ "getrandom 0.2.17",
  "hex",
  "hkdf",
  "hmac",
@@ -3620,10 +3622,12 @@ dependencies = [
  "ml-dsa",
  "postcard",
  "rand 0.8.5",
+ "rustls",
  "serde",
  "sha2",
  "shard",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
  "uuid",
