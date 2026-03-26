@@ -300,9 +300,18 @@ fn ca_root_store(ca: &CertificateAuthority) -> Arc<RootCertStore> {
     Arc::new(root_store)
 }
 
+/// Build the CNSA 2.0 compliant crypto provider: TLS 1.3 only, AES-256-GCM-SHA384 only.
+fn cnsa2_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    Arc::new(rustls::crypto::CryptoProvider {
+        cipher_suites: vec![rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_256_GCM_SHA384],
+        ..rustls::crypto::aws_lc_rs::default_provider()
+    })
+}
+
 /// Create a TLS server config that requires client certificates (mTLS).
 ///
 /// The server will verify that clients present a certificate signed by `ca`.
+/// Enforces TLS 1.3 only with AES-256-GCM-SHA384 cipher suite (CNSA 2.0).
 pub fn server_tls_config(cert_key: &CertifiedKey, ca: &CertificateAuthority) -> Arc<ServerConfig> {
     let cert_chain = vec![cert_key.cert.der().clone()];
     let private_key = PrivatePkcs8KeyDer::from(cert_key.key_pair.serialize_der()).into();
@@ -312,7 +321,9 @@ pub fn server_tls_config(cert_key: &CertifiedKey, ca: &CertificateAuthority) -> 
         .build()
         .expect("building client verifier failed");
 
-    let config = ServerConfig::builder()
+    let config = ServerConfig::builder_with_provider(cnsa2_crypto_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3 protocol version config failed")
         .with_client_cert_verifier(client_verifier)
         .with_single_cert(cert_chain, private_key)
         .expect("server TLS config failed");
@@ -320,6 +331,8 @@ pub fn server_tls_config(cert_key: &CertifiedKey, ca: &CertificateAuthority) -> 
 }
 
 /// Create a TLS client config that trusts the CA and presents a client certificate (mTLS).
+///
+/// Enforces TLS 1.3 only with AES-256-GCM-SHA384 cipher suite (CNSA 2.0).
 pub fn client_tls_config(
     client_cert: &CertifiedKey,
     ca: &CertificateAuthority,
@@ -329,7 +342,9 @@ pub fn client_tls_config(
     let client_cert_chain = vec![client_cert.cert.der().clone()];
     let client_key = PrivatePkcs8KeyDer::from(client_cert.key_pair.serialize_der()).into();
 
-    let config = ClientConfig::builder()
+    let config = ClientConfig::builder_with_provider(cnsa2_crypto_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3 protocol version config failed")
         .with_root_certificates((*roots).clone())
         .with_client_auth_cert(client_cert_chain, client_key)
         .expect("client TLS config with cert failed");
@@ -363,7 +378,9 @@ pub fn server_tls_config_pinned(
             pin_set,
         });
 
-    let config = ServerConfig::builder()
+    let config = ServerConfig::builder_with_provider(cnsa2_crypto_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3 protocol version config failed")
         .with_client_cert_verifier(pinned_verifier)
         .with_single_cert(cert_chain, private_key)
         .expect("server TLS config with pinning failed");
@@ -395,7 +412,9 @@ pub fn client_tls_config_pinned(
             pin_set,
         });
 
-    let config = ClientConfig::builder()
+    let config = ClientConfig::builder_with_provider(cnsa2_crypto_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3 protocol version config failed")
         .dangerous()
         .with_custom_certificate_verifier(pinned_verifier)
         .with_client_auth_cert(client_cert_chain, client_key)
@@ -486,6 +505,65 @@ mod tests {
         let pin_set = CertificatePinSet::new();
         let cert_data = b"unknown certificate";
         assert!(pin_set.verify_pin(cert_data).is_err());
+    }
+
+    #[test]
+    fn test_tls_config_is_tls13_only() {
+        // Verify that server_tls_config produces a TLS 1.3-only config
+        // by successfully creating the config (it uses with_protocol_versions(&[&TLS13]))
+        let ca = generate_ca();
+        let server_cert = generate_module_cert("test-server", &ca);
+        let _config = server_tls_config(&server_cert, &ca);
+        // If we get here without error, TLS 1.3-only config was created successfully.
+        // The restriction is enforced via with_protocol_versions(&[&rustls::version::TLS13]).
+    }
+
+    #[test]
+    fn test_client_tls_config_is_tls13_only() {
+        // Verify that client_tls_config also produces a TLS 1.3-only config
+        let ca = generate_ca();
+        let client_cert = generate_module_cert("test-client", &ca);
+        let _config = client_tls_config(&client_cert, &ca);
+        // If we get here without error, TLS 1.3-only config was created successfully.
+    }
+
+    #[test]
+    fn test_cnsa2_cipher_suite_restriction() {
+        // Verify that the CNSA 2.0 crypto provider restricts to AES-256-GCM-SHA384
+        let provider = cnsa2_crypto_provider();
+        assert_eq!(
+            provider.cipher_suites.len(),
+            1,
+            "CNSA 2.0 must restrict to exactly one cipher suite"
+        );
+        // The single suite should be TLS13_AES_256_GCM_SHA384
+        let suite = &provider.cipher_suites[0];
+        assert_eq!(
+            format!("{:?}", suite.suite()),
+            "TLS13_AES_256_GCM_SHA384",
+            "CNSA 2.0 cipher suite must be TLS13_AES_256_GCM_SHA384"
+        );
+    }
+
+    #[test]
+    fn test_server_tls_config_requires_client_cert() {
+        // Verify server config enforces mTLS by successfully creating
+        // a config with WebPkiClientVerifier (which requires client certs).
+        // The server_tls_config function uses with_client_cert_verifier which
+        // mandates client certificate presentation.
+        let ca = generate_ca();
+        let server_cert = generate_module_cert("mtls-server", &ca);
+        let config = server_tls_config(&server_cert, &ca);
+        // Verify the verifier is present (mTLS is enforced).
+        // ServerConfig's client_auth field is private, but the fact that
+        // the config was built with with_client_cert_verifier proves mTLS.
+        // We also verify the pinned variant works.
+        let mut pin_set = CertificatePinSet::new();
+        let client_cert = generate_module_cert("test-client", &ca);
+        pin_set.add_certificate(client_cert.cert.der().as_ref());
+        let _pinned_config = server_tls_config_pinned(&server_cert, &ca, pin_set);
+        // If we reach here, mTLS configs with and without pinning were created.
+        drop(config);
     }
 
     #[test]

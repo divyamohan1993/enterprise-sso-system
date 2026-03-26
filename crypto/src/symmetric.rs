@@ -137,12 +137,10 @@ fn encrypt_aes256gcm(key: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Result<Vec
 
 /// Decrypt a sealed blob, reading the algorithm from the first byte.
 ///
-/// Also handles legacy AES-256-GCM blobs that have no algo_id prefix
-/// (first byte is not 0x01 or 0x02).
+/// Only tagged formats are accepted. Legacy untagged AES-256-GCM blobs
+/// are no longer supported and will return an error.
 ///
-/// Wire formats:
-/// - New: `algo_id (1) || nonce || ciphertext || tag`
-/// - Legacy: `nonce (12) || ciphertext || tag (16)` — AES-256-GCM, no prefix
+/// Wire format: `algo_id (1) || nonce || ciphertext || tag`
 pub fn decrypt(key: &[u8; 32], sealed: &[u8], aad: &[u8]) -> Result<Vec<u8>, String> {
     let first = sealed.first().copied().ok_or_else(|| "empty ciphertext".to_string())?;
 
@@ -156,8 +154,12 @@ pub fn decrypt(key: &[u8; 32], sealed: &[u8], aad: &[u8]) -> Result<Vec<u8>, Str
             decrypt_aes256gcm_payload(key, payload, aad)
         }
         _ => {
-            // Legacy path: no algo_id prefix — treat entire blob as AES-256-GCM
-            decrypt_aes256gcm_payload(key, sealed, aad)
+            return Err(format!(
+                "decrypt: unknown algorithm tag 0x{:02x}. \
+                 Only AEGIS-256 (0x01) and AES-256-GCM (0x02) are supported. \
+                 Legacy untagged ciphertext is no longer accepted.",
+                first
+            ));
         }
     }
 }
@@ -336,7 +338,7 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_aes256gcm_no_algo_byte() {
+    fn test_legacy_aes256gcm_no_algo_byte_rejected() {
         let key = random_key();
         let plaintext = b"legacy data";
         let aad = b"legacy-aad";
@@ -356,13 +358,9 @@ mod tests {
         legacy_blob.extend_from_slice(&nonce_bytes);
         legacy_blob.extend_from_slice(&ciphertext_with_tag);
 
-        // First byte of legacy blob will be part of the nonce — not 0x01 or 0x02 (almost certainly)
-        // but if it happens to be 0x01/0x02, the test is still valid because the data would
-        // be malformed for those algo_ids; we specifically force a known-non-matching first byte.
-        // To guarantee: just set the first nonce byte to something outside {0x01, 0x02}.
+        // Ensure first byte is not a valid algo_id so it hits the unknown-tag path
         if let Some(b) = legacy_blob.get_mut(0) {
             if *b == ALGO_ID_AEGIS256 || *b == ALGO_ID_AES256GCM {
-                // Re-encrypt with known safe nonce byte: set first byte to 0xFF
                 nonce_bytes[0] = 0xFF;
                 let nonce2 = GcmNonce::from_slice(&nonce_bytes);
                 let ct2 = cipher
@@ -374,8 +372,13 @@ mod tests {
             }
         }
 
-        let recovered = decrypt(&key, &legacy_blob, aad).expect("legacy decrypt failed");
-        assert_eq!(recovered.as_slice(), plaintext);
+        // Legacy untagged ciphertext must now be rejected (fallback removed)
+        let result = decrypt(&key, &legacy_blob, aad);
+        assert!(result.is_err(), "legacy untagged ciphertext must be rejected");
+        assert!(
+            result.unwrap_err().contains("unknown algorithm tag"),
+            "error must mention unknown algorithm tag"
+        );
     }
 
     #[test]
@@ -397,6 +400,25 @@ mod tests {
         let recovered = decrypt(&key, &sealed, aad).expect("decrypt failed");
 
         assert!(recovered.is_empty(), "decrypted empty plaintext must be empty");
+    }
+
+    #[test]
+    fn reject_unknown_algorithm_tag() {
+        let key = [0x42u8; 32];
+        // Craft a ciphertext with invalid tag byte
+        let fake_ct = vec![0xFF, 0x00, 0x01, 0x02]; // tag 0xFF is not 0x01 or 0x02
+        let result = decrypt(&key, &fake_ct, &[]);
+        assert!(result.is_err(), "must reject unknown algorithm tags");
+        assert!(result.unwrap_err().contains("unknown algorithm tag"));
+    }
+
+    #[test]
+    fn reject_truncated_ciphertext() {
+        let key = [0x42u8; 32];
+        // Too short to contain nonce + any ciphertext
+        let short = vec![0x01, 0x00];
+        let result = decrypt(&key, &short, &[]);
+        assert!(result.is_err(), "must reject truncated ciphertext");
     }
 
     #[test]

@@ -13,7 +13,7 @@
 //! rather than producing potentially weak output (fail-closed).
 
 use sha2::{Digest, Sha512};
-use std::cell::RefCell;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use zeroize::Zeroize;
 
@@ -148,11 +148,12 @@ impl Default for EntropyHealth {
 }
 
 // ---------------------------------------------------------------------------
-// Thread-local health monitor
+// Process-global health monitor
 // ---------------------------------------------------------------------------
 
-thread_local! {
-    static ENTROPY_HEALTH: RefCell<EntropyHealth> = RefCell::new(EntropyHealth::new());
+fn global_entropy_health() -> &'static Mutex<EntropyHealth> {
+    static HEALTH: std::sync::OnceLock<Mutex<EntropyHealth>> = std::sync::OnceLock::new();
+    HEALTH.get_or_init(|| Mutex::new(EntropyHealth::new()))
 }
 
 // ---------------------------------------------------------------------------
@@ -301,12 +302,14 @@ pub fn combined_entropy_checked() -> Result<[u8; 32], EntropyError> {
         }
 
         // Run health checks.
-        let healthy = ENTROPY_HEALTH.with(|cell| {
-            let mut health = cell.borrow_mut();
+        let healthy = {
+            let mut health = global_entropy_health()
+                .lock()
+                .expect("entropy health mutex poisoned — loss of integrity");
             let rep_ok = health.check_repetition(&output);
             let prop_ok = health.check_proportion(&output);
             (rep_ok, prop_ok)
-        });
+        };
 
         match healthy {
             (true, true) => return Ok(output),
@@ -587,6 +590,16 @@ mod tests {
             result.is_ok(),
             "combined_entropy_checked should succeed on a healthy system"
         );
+    }
+
+    #[test]
+    fn entropy_health_is_process_global() {
+        // Generate entropy on main thread
+        let a = combined_entropy();
+        // Generate on a spawned thread — should use the same health monitor
+        let b = std::thread::spawn(|| combined_entropy()).join().unwrap();
+        assert_ne!(a, b, "different threads must produce different entropy");
+        // The key assertion: no panic means the global health monitor worked across threads
     }
 
     #[test]

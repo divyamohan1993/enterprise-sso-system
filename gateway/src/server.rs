@@ -12,9 +12,11 @@ use std::time::Instant;
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use rustls::ServerConfig;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::sync::Mutex;
+use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, warn, debug};
 
 use common::types::ModuleId;
@@ -178,6 +180,9 @@ pub struct GatewayServer {
     /// Trusted X-Wing public key fingerprints loaded from MILNET_GATEWAY_KEY_PINS.
     /// If empty, pinning is disabled.
     key_pins: Arc<Vec<String>>,
+    /// Optional TLS acceptor for TLS termination on the external listener.
+    /// When set, all accepted TCP connections are upgraded to TLS before processing.
+    tls_acceptor: Option<TlsAcceptor>,
 }
 
 impl GatewayServer {
@@ -213,7 +218,23 @@ impl GatewayServer {
             rate_limits: Arc::new(Mutex::new(HashMap::new())),
             xwing_fingerprint: Arc::new(fingerprint),
             key_pins: Arc::new(key_pins),
+            tls_acceptor: None,
         })
+    }
+
+    /// Bind the gateway with TLS termination on the external listener.
+    ///
+    /// This is REQUIRED for production deployments. The `tls_config` should
+    /// enforce TLS 1.3 with CNSA 2.0 compliant cipher suites.
+    pub async fn bind_tls(
+        addr: &str,
+        difficulty: u8,
+        tls_config: Arc<ServerConfig>,
+    ) -> std::io::Result<Self> {
+        let mut server = Self::bind(addr, difficulty).await?;
+        server.tls_acceptor = Some(TlsAcceptor::from(tls_config));
+        info!("TLS termination enabled on external listener");
+        Ok(server)
     }
 
     /// Bind the gateway with orchestrator forwarding enabled.
@@ -252,7 +273,20 @@ impl GatewayServer {
             rate_limits: Arc::new(Mutex::new(HashMap::new())),
             xwing_fingerprint: Arc::new(fingerprint),
             key_pins: Arc::new(key_pins),
+            tls_acceptor: None,
         })
+    }
+
+    /// Set a TLS acceptor on an existing server instance.
+    ///
+    /// This allows combining TLS with orchestrator forwarding:
+    /// ```ignore
+    /// let mut server = GatewayServer::bind_with_orchestrator(addr, difficulty, orch).await?;
+    /// server.set_tls(tls_config);
+    /// ```
+    pub fn set_tls(&mut self, tls_config: Arc<ServerConfig>) {
+        self.tls_acceptor = Some(TlsAcceptor::from(tls_config));
+        info!("TLS termination enabled on external listener");
     }
 
     /// Return the local address the server is bound to.
@@ -283,20 +317,20 @@ impl GatewayServer {
     /// *minimum* difficulty; the adaptive function may raise it under load.
     pub async fn run(&self) -> std::io::Result<()> {
         loop {
-            let (stream, addr) = self.listener.accept().await?;
+            let (tcp_stream, addr) = self.listener.accept().await?;
 
             // Enforce global concurrent connection cap
             let active = self.active_connections.load(Ordering::Relaxed);
             if active >= MAX_CONCURRENT_CONNECTIONS {
                 warn!("rejecting connection from {addr}: global connection limit ({MAX_CONCURRENT_CONNECTIONS}) reached");
-                drop(stream);
+                drop(tcp_stream);
                 continue;
             }
 
             // Enforce per-IP rate limit
             if !self.check_rate_limit(addr.ip()).await {
                 warn!("rejecting connection from {addr}: per-IP rate limit exceeded ({MAX_CONNECTIONS_PER_IP} per {RATE_LIMIT_WINDOW_SECS}s)");
-                drop(stream);
+                drop(tcp_stream);
                 continue;
             }
 
@@ -307,6 +341,7 @@ impl GatewayServer {
             let server_pk = self.xwing_server_pk.clone();
             let server_kp = self.xwing_server_kp.clone();
             let fingerprint = self.xwing_fingerprint.clone();
+            let tls_acceptor = self.tls_acceptor.clone();
             // Verbose logging: log incoming connection details
             common::error_response::verbose_log_fields(
                 "gateway",
@@ -319,7 +354,23 @@ impl GatewayServer {
                 ],
             );
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(stream, difficulty, orch, server_pk, server_kp, fingerprint).await {
+                // If TLS is configured, upgrade the TCP stream before processing
+                let result = if let Some(acceptor) = tls_acceptor {
+                    match acceptor.accept(tcp_stream).await {
+                        Ok(tls_stream) => {
+                            debug!("TLS handshake completed for {addr}");
+                            handle_connection(tls_stream, difficulty, orch, server_pk, server_kp, fingerprint).await
+                        }
+                        Err(e) => {
+                            warn!("TLS handshake failed from {addr}: {e}");
+                            Err(format!("TLS handshake failed: {e}"))
+                        }
+                    }
+                } else {
+                    handle_connection(tcp_stream, difficulty, orch, server_pk, server_kp, fingerprint).await
+                };
+
+                if let Err(e) = result {
                     // In production, mask the error; always log internally
                     let internal_msg = common::error_response::log_error_with_location(&e);
                     warn!("connection from {addr} failed: {internal_msg}");
@@ -331,20 +382,41 @@ impl GatewayServer {
 
     /// Accept and handle exactly one connection (useful for tests).
     pub async fn accept_one(&self) -> std::io::Result<()> {
-        let (stream, addr) = self.listener.accept().await?;
-        handle_connection(
-            stream,
-            self.difficulty,
-            self.orchestrator.clone(),
-            self.xwing_server_pk.clone(),
-            self.xwing_server_kp.clone(),
-            self.xwing_fingerprint.clone(),
-        )
+        let (tcp_stream, addr) = self.listener.accept().await?;
+
+        if let Some(ref acceptor) = self.tls_acceptor {
+            let tls_stream = acceptor.accept(tcp_stream).await.map_err(|e| {
+                error!("TLS handshake from {addr} failed: {e}");
+                std::io::Error::other(format!("TLS handshake failed: {e}"))
+            })?;
+            handle_connection(
+                tls_stream,
+                self.difficulty,
+                self.orchestrator.clone(),
+                self.xwing_server_pk.clone(),
+                self.xwing_server_kp.clone(),
+                self.xwing_fingerprint.clone(),
+            )
             .await
             .map_err(|e| {
                 error!("connection from {addr} failed: {e}");
                 std::io::Error::other(e)
             })
+        } else {
+            handle_connection(
+                tcp_stream,
+                self.difficulty,
+                self.orchestrator.clone(),
+                self.xwing_server_pk.clone(),
+                self.xwing_server_kp.clone(),
+                self.xwing_fingerprint.clone(),
+            )
+            .await
+            .map_err(|e| {
+                error!("connection from {addr} failed: {e}");
+                std::io::Error::other(e)
+            })
+        }
     }
 }
 
@@ -408,7 +480,7 @@ fn decrypt_frame(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>, String> {
 ///   7. Client -> Server: `AuthRequest` (AES-256-GCM encrypted with session key)
 ///   8. Server -> Client: `AuthResponse` (AES-256-GCM encrypted with session key)
 async fn handle_connection(
-    mut stream: TcpStream,
+    mut stream: impl AsyncRead + AsyncWrite + Unpin,
     difficulty: u8,
     orchestrator: Option<Arc<OrchestratorConfig>>,
     server_xwing_pk: Arc<Vec<u8>>,
@@ -623,7 +695,7 @@ async fn forward_to_orchestrator(
 
 /// Send a postcard-serialized value with 4-byte BE length prefix, with timeout.
 async fn send_frame_with_timeout<T: serde::Serialize>(
-    stream: &mut TcpStream,
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
     value: &T,
 ) -> Result<(), String> {
     tokio::time::timeout(IO_TIMEOUT, send_frame(stream, value))
@@ -633,7 +705,7 @@ async fn send_frame_with_timeout<T: serde::Serialize>(
 
 /// Read a length-prefixed frame and deserialize with postcard, with timeout.
 async fn recv_frame_with_timeout<T: serde::de::DeserializeOwned>(
-    stream: &mut TcpStream,
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
 ) -> Result<T, String> {
     tokio::time::timeout(IO_TIMEOUT, recv_frame(stream))
         .await
@@ -641,7 +713,7 @@ async fn recv_frame_with_timeout<T: serde::de::DeserializeOwned>(
 }
 
 /// Read a raw length-prefixed frame (bytes only), with timeout.
-async fn recv_raw_frame_with_timeout(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
+async fn recv_raw_frame_with_timeout(stream: &mut (impl AsyncRead + AsyncWrite + Unpin)) -> Result<Vec<u8>, String> {
     tokio::time::timeout(IO_TIMEOUT, recv_raw_frame(stream))
         .await
         .map_err(|_| "read timeout".to_string())?
@@ -649,7 +721,7 @@ async fn recv_raw_frame_with_timeout(stream: &mut TcpStream) -> Result<Vec<u8>, 
 
 /// Send a raw byte payload with 4-byte BE length prefix, with timeout.
 async fn send_raw_frame_with_timeout(
-    stream: &mut TcpStream,
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
     data: &[u8],
 ) -> Result<(), String> {
     tokio::time::timeout(IO_TIMEOUT, send_raw_frame(stream, data))
@@ -658,7 +730,7 @@ async fn send_raw_frame_with_timeout(
 }
 
 /// Send a postcard-serialized value with 4-byte BE length prefix.
-async fn send_frame<T: serde::Serialize>(stream: &mut TcpStream, value: &T) -> Result<(), String> {
+async fn send_frame<T: serde::Serialize>(stream: &mut (impl AsyncRead + AsyncWrite + Unpin), value: &T) -> Result<(), String> {
     let payload = postcard::to_allocvec(value).map_err(|e| format!("serialize: {e}"))?;
     let len = payload.len() as u32;
     stream
@@ -674,13 +746,13 @@ async fn send_frame<T: serde::Serialize>(stream: &mut TcpStream, value: &T) -> R
 }
 
 /// Read a length-prefixed frame and deserialize with postcard.
-async fn recv_frame<T: serde::de::DeserializeOwned>(stream: &mut TcpStream) -> Result<T, String> {
+async fn recv_frame<T: serde::de::DeserializeOwned>(stream: &mut (impl AsyncRead + AsyncWrite + Unpin)) -> Result<T, String> {
     let buf = recv_raw_frame(stream).await?;
     postcard::from_bytes(&buf).map_err(|e| format!("deserialize: {e}"))
 }
 
 /// Read a raw length-prefixed frame (bytes without deserialization).
-async fn recv_raw_frame(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
+async fn recv_raw_frame(stream: &mut (impl AsyncRead + AsyncWrite + Unpin)) -> Result<Vec<u8>, String> {
     let mut len_buf = [0u8; 4];
     stream
         .read_exact(&mut len_buf)
@@ -700,7 +772,7 @@ async fn recv_raw_frame(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
 }
 
 /// Send a raw byte payload with 4-byte BE length prefix.
-async fn send_raw_frame(stream: &mut TcpStream, data: &[u8]) -> Result<(), String> {
+async fn send_raw_frame(stream: &mut (impl AsyncRead + AsyncWrite + Unpin), data: &[u8]) -> Result<(), String> {
     let len = data.len() as u32;
     stream
         .write_all(&len.to_be_bytes())

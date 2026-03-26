@@ -324,15 +324,13 @@ async fn run_single_process_mode(
 ) {
     // SECURITY: Production deployment guard — refuse single-process mode in production.
     // All signer shares in a single process reduces N-of-M threshold to effective 1-of-1.
-    if std::env::var("MILNET_PRODUCTION").is_ok()
-        && std::env::var("MILNET_TSS_SINGLE_PROCESS_OVERRIDE").is_err()
-    {
-        tracing::error!(
+    // The MILNET_TSS_SINGLE_PROCESS_OVERRIDE escape hatch has been permanently removed.
+    if std::env::var("MILNET_PRODUCTION").is_ok() {
+        panic!(
             "FATAL: TSS single-process mode is not permitted in production. \
-             Deploy each signer in a separate process (use MILNET_TSS_MODE=distributed). \
-             Set MILNET_TSS_SINGLE_PROCESS_OVERRIDE=1 to bypass (NOT RECOMMENDED)."
+             Deploy 5 separate TSS instances for real 3-of-5 threshold security. \
+             The MILNET_TSS_SINGLE_PROCESS_OVERRIDE escape hatch has been permanently removed."
         );
-        std::process::exit(1);
     }
 
     let total = nodes.len();

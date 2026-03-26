@@ -37,9 +37,9 @@ fn chain_new_starts_at_epoch_0() {
 #[test]
 fn chain_advance_increments_epoch() {
     let mut chain = RatchetChain::new(&test_secret()).unwrap();
-    chain.advance(&good_entropy(), &good_entropy(), &fresh_nonce());
+    chain.advance(&good_entropy(), &good_entropy(), &fresh_nonce()).unwrap();
     assert_eq!(chain.epoch(), 1);
-    chain.advance(&good_entropy(), &good_entropy(), &fresh_nonce());
+    chain.advance(&good_entropy(), &good_entropy(), &fresh_nonce()).unwrap();
     assert_eq!(chain.epoch(), 2);
 }
 
@@ -48,8 +48,8 @@ fn chain_tag_deterministic() {
     let chain_a = RatchetChain::new(&test_secret()).unwrap();
     let chain_b = RatchetChain::new(&test_secret()).unwrap();
     let claims = b"test-claims-data";
-    let tag_a = chain_a.generate_tag(claims);
-    let tag_b = chain_b.generate_tag(claims);
+    let tag_a = chain_a.generate_tag(claims).unwrap();
+    let tag_b = chain_b.generate_tag(claims).unwrap();
     assert_eq!(tag_a, tag_b);
 }
 
@@ -57,9 +57,9 @@ fn chain_tag_deterministic() {
 fn chain_different_epochs_different_tags() {
     let mut chain = RatchetChain::new(&test_secret()).unwrap();
     let claims = b"test-claims-data";
-    let tag_0 = chain.generate_tag(claims);
-    chain.advance(&good_entropy(), &good_entropy(), &fresh_nonce());
-    let tag_1 = chain.generate_tag(claims);
+    let tag_0 = chain.generate_tag(claims).unwrap();
+    chain.advance(&good_entropy(), &good_entropy(), &fresh_nonce()).unwrap();
+    let tag_1 = chain.generate_tag(claims).unwrap();
     assert_ne!(tag_0, tag_1);
 }
 
@@ -69,11 +69,11 @@ fn chain_old_key_erased() {
     // because the old chain key has been zeroized.
     let mut chain = RatchetChain::new(&test_secret()).unwrap();
     let claims = b"test-claims-data";
-    let tag_epoch0 = chain.generate_tag(claims);
-    chain.advance(&good_entropy(), &good_entropy(), &fresh_nonce());
+    let tag_epoch0 = chain.generate_tag(claims).unwrap();
+    chain.advance(&good_entropy(), &good_entropy(), &fresh_nonce()).unwrap();
     // A fresh chain at epoch 0 would produce the same tag, but our
     // advanced chain at epoch 1 cannot.
-    let tag_after_advance = chain.generate_tag(claims);
+    let tag_after_advance = chain.generate_tag(claims).unwrap();
     assert_ne!(tag_epoch0, tag_after_advance);
 }
 
@@ -81,17 +81,17 @@ fn chain_old_key_erased() {
 fn chain_verify_current_epoch() {
     let chain = RatchetChain::new(&test_secret()).unwrap();
     let claims = b"test-claims-data";
-    let tag = chain.generate_tag(claims);
-    assert!(chain.verify_tag(claims, &tag, 0));
+    let tag = chain.generate_tag(claims).unwrap();
+    assert!(chain.verify_tag(claims, &tag, 0).unwrap());
 }
 
 #[test]
 fn chain_reject_wrong_epoch() {
     let chain = RatchetChain::new(&test_secret()).unwrap();
     let claims = b"test-claims-data";
-    let tag = chain.generate_tag(claims);
+    let tag = chain.generate_tag(claims).unwrap();
     // Epoch 10 is way outside the +-3 window
-    assert!(!chain.verify_tag(claims, &tag, 10));
+    assert!(!chain.verify_tag(claims, &tag, 10).unwrap());
 }
 
 // ── SessionManager tests ────────────────────────────────────────────
@@ -250,25 +250,23 @@ fn response_success_with_epoch_roundtrip() {
 // ── Nonce history and Bloom filter tests ───────────────────────────
 
 #[test]
-fn chain_nonce_reuse_within_window_panics() {
+fn chain_nonce_reuse_within_window_rejected() {
     let mut chain = RatchetChain::new(&test_secret()).unwrap();
     let nonce = fresh_nonce();
-    chain.advance(&good_entropy(), &good_entropy(), &nonce);
+    chain.advance(&good_entropy(), &good_entropy(), &nonce).unwrap();
 
-    // Reusing the same nonce should panic (clone attack detection)
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        chain.advance(&good_entropy(), &good_entropy(), &nonce);
-    }));
-    assert!(result.is_err(), "nonce reuse within window must panic");
+    // Reusing the same nonce should return an error (clone attack detection)
+    let result = chain.advance(&good_entropy(), &good_entropy(), &nonce);
+    assert!(result.is_err(), "nonce reuse within window must be rejected");
 }
 
 #[test]
 fn chain_1000_unique_nonces_accepted() {
-    // Verify that 1000 unique nonces are accepted without panic,
+    // Verify that 1000 unique nonces are accepted without error,
     // exercising the full NONCE_HISTORY_SIZE window.
     let mut chain = RatchetChain::new(&test_secret()).unwrap();
     for _ in 0..1000 {
-        chain.advance(&good_entropy(), &good_entropy(), &fresh_nonce());
+        chain.advance(&good_entropy(), &good_entropy(), &fresh_nonce()).unwrap();
     }
     assert_eq!(chain.epoch(), 1000);
 }
@@ -282,18 +280,16 @@ fn chain_bloom_filter_catches_old_nonce_reuse() {
 
     // Save the very first nonce
     let first_nonce = fresh_nonce();
-    chain.advance(&good_entropy(), &good_entropy(), &first_nonce);
+    chain.advance(&good_entropy(), &good_entropy(), &first_nonce).unwrap();
 
     // Advance 1100 more times to push the first nonce out of the
     // exact window and into the Bloom filter
     for _ in 0..1100 {
-        chain.advance(&good_entropy(), &good_entropy(), &fresh_nonce());
+        chain.advance(&good_entropy(), &good_entropy(), &fresh_nonce()).unwrap();
     }
 
     // Now attempt to reuse the first nonce — should be caught by the Bloom filter
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        chain.advance(&good_entropy(), &good_entropy(), &first_nonce);
-    }));
+    let result = chain.advance(&good_entropy(), &good_entropy(), &first_nonce);
     assert!(
         result.is_err(),
         "nonce reuse beyond exact window must be caught by Bloom filter"
@@ -308,15 +304,13 @@ fn chain_nonce_replay_at_boundary() {
     let boundary_nonce = fresh_nonce();
     // Advance 999 times with fresh nonces
     for _ in 0..999 {
-        chain.advance(&good_entropy(), &good_entropy(), &fresh_nonce());
+        chain.advance(&good_entropy(), &good_entropy(), &fresh_nonce()).unwrap();
     }
     // Use the boundary nonce at position 1000 (fills the window)
-    chain.advance(&good_entropy(), &good_entropy(), &boundary_nonce);
+    chain.advance(&good_entropy(), &good_entropy(), &boundary_nonce).unwrap();
 
     // Immediately try to reuse it — still in exact window
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        chain.advance(&good_entropy(), &good_entropy(), &boundary_nonce);
-    }));
+    let result = chain.advance(&good_entropy(), &good_entropy(), &boundary_nonce);
     assert!(result.is_err(), "nonce reuse at window boundary must be detected");
 }
 

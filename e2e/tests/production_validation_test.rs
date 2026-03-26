@@ -766,9 +766,9 @@ fn test_ratchet_forward_secrecy() {
     let mut chain = RatchetChain::new(&master).unwrap();
 
     let claims_bytes = b"test-claims";
-    let tag_epoch0 = chain.generate_tag(claims_bytes);
+    let tag_epoch0 = chain.generate_tag(claims_bytes).unwrap();
 
-    assert!(chain.verify_tag(claims_bytes, &tag_epoch0, 0), "tag should verify at epoch 0");
+    assert!(chain.verify_tag(claims_bytes, &tag_epoch0, 0).unwrap(), "tag should verify at epoch 0");
 
     // Advance past the lookahead window (> 3 epochs)
     for _ in 0..10 {
@@ -778,7 +778,7 @@ fn test_ratchet_forward_secrecy() {
     }
 
     assert!(
-        !chain.verify_tag(claims_bytes, &tag_epoch0, 0),
+        !chain.verify_tag(claims_bytes, &tag_epoch0, 0).unwrap(),
         "old epoch tag must NOT verify after advancing past lookahead (epoch 10 vs 0)"
     );
 }
@@ -797,7 +797,7 @@ fn test_ratchet_within_lookahead_window() {
     assert_eq!(chain.epoch(), 7);
 
     let claims_bytes = b"test-claims";
-    let tag_epoch7 = chain.generate_tag(claims_bytes);
+    let tag_epoch7 = chain.generate_tag(claims_bytes).unwrap();
 
     // Advance to epoch 9 (diff = 2, within +/-3)
     for _ in 0..2 {
@@ -808,7 +808,7 @@ fn test_ratchet_within_lookahead_window() {
     assert_eq!(chain.epoch(), 9);
 
     // Epoch diff = |9-7| = 2, within window
-    let _result = chain.verify_tag(claims_bytes, &tag_epoch7, 7);
+    let _result = chain.verify_tag(claims_bytes, &tag_epoch7, 7).unwrap();
 
     // Advance to epoch 11 (diff = 4, outside window)
     for _ in 0..2 {
@@ -818,7 +818,7 @@ fn test_ratchet_within_lookahead_window() {
     }
     assert_eq!(chain.epoch(), 11);
     assert!(
-        !chain.verify_tag(claims_bytes, &tag_epoch7, 7),
+        !chain.verify_tag(claims_bytes, &tag_epoch7, 7).unwrap(),
         "tag from epoch 7 must NOT verify at epoch 11 (outside +/-3 window)"
     );
 }
@@ -856,8 +856,8 @@ fn test_cloned_ratchet_state_diverges() {
     let claims_bytes = b"test-claims";
 
     // Both should produce same tag at epoch 0
-    let tag_a0 = chain_a.generate_tag(claims_bytes);
-    let tag_b0 = chain_b.generate_tag(claims_bytes);
+    let tag_a0 = chain_a.generate_tag(claims_bytes).unwrap();
+    let tag_b0 = chain_b.generate_tag(claims_bytes).unwrap();
     assert!(ct_eq_64(&tag_a0, &tag_b0), "same master -> same tag at epoch 0");
 
     // Advance A with one entropy, B with different entropy -> diverge
@@ -872,8 +872,8 @@ fn test_cloned_ratchet_state_diverges() {
         chain_b.advance(&ce, &se, &sn).unwrap();
     }
 
-    let tag_a1 = chain_a.generate_tag(claims_bytes);
-    let tag_b1 = chain_b.generate_tag(claims_bytes);
+    let tag_a1 = chain_a.generate_tag(claims_bytes).unwrap();
+    let tag_b1 = chain_b.generate_tag(claims_bytes).unwrap();
     assert!(
         !ct_eq_64(&tag_a1, &tag_b1),
         "divergent entropy must produce different tags"
@@ -881,7 +881,7 @@ fn test_cloned_ratchet_state_diverges() {
 
     // A's tag should NOT verify on B
     assert!(
-        !chain_b.verify_tag(claims_bytes, &tag_a1, 1),
+        !chain_b.verify_tag(claims_bytes, &tag_a1, 1).unwrap(),
         "clone's tag must be rejected by original"
     );
 }
@@ -904,8 +904,8 @@ fn test_ratchet_different_entropy_different_chains() {
     }
 
     let claims = b"same-claims";
-    let tag_a = chain_a.generate_tag(claims);
-    let tag_b = chain_b.generate_tag(claims);
+    let tag_a = chain_a.generate_tag(claims).unwrap();
+    let tag_b = chain_b.generate_tag(claims).unwrap();
 
     assert!(
         !ct_eq_64(&tag_a, &tag_b),

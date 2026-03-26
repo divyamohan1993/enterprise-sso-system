@@ -246,7 +246,18 @@ pub fn run_stig_audit() -> Result<crate::stig::StigSummary, Vec<crate::stig::Sti
     if crate::sealed_keys::is_production() {
         let cat_i = auditor.cat_i_failures();
         if !cat_i.is_empty() {
-            return Err(cat_i.into_iter().cloned().collect());
+            for failure in &cat_i {
+                tracing::error!(
+                    "STIG Category I FAILURE: {} — {}",
+                    failure.id,
+                    failure.detail
+                );
+            }
+            panic!(
+                "FATAL: {} STIG Category I failure(s) detected in production. \
+                 System cannot start with critical security misconfigurations.",
+                cat_i.len()
+            );
         }
     }
     Ok(summary)

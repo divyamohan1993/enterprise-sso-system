@@ -192,11 +192,11 @@ fn ratchet_forward_secrecy() {
 
     // Generate tag at epoch 0
     let claims_bytes = b"test-claims";
-    let tag_epoch0 = chain.generate_tag(claims_bytes);
+    let tag_epoch0 = chain.generate_tag(claims_bytes).unwrap();
 
     // Verify it is valid at epoch 0
     assert!(
-        chain.verify_tag(claims_bytes, &tag_epoch0, 0),
+        chain.verify_tag(claims_bytes, &tag_epoch0, 0).unwrap(),
         "tag should verify at current epoch"
     );
 
@@ -209,7 +209,7 @@ fn ratchet_forward_secrecy() {
 
     // Old tag should no longer verify — epoch 0 is outside the lookahead window
     assert!(
-        !chain.verify_tag(claims_bytes, &tag_epoch0, 0),
+        !chain.verify_tag(claims_bytes, &tag_epoch0, 0).unwrap(),
         "old epoch tag must NOT verify after advancing past lookahead window"
     );
 }

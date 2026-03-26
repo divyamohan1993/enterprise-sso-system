@@ -249,17 +249,23 @@ impl XWingKeyPair {
 /// overwritten with zeros to prevent post-free disclosure of key material.
 impl Drop for XWingKeyPair {
     fn drop(&mut self) {
-        // Zeroize the X25519 secret key by overwriting with the zero scalar.
-        self.x25519_secret = StaticSecret::from([0u8; 32]);
+        // Zeroize the X25519 secret key using the zeroize crate's
+        // volatile-based implementation.
+        self.x25519_secret.zeroize();
         // Zeroize the ML-KEM decapsulation key.  DecapsulationKey does not
-        // implement Zeroize, so we write zeros over the underlying bytes.
+        // implement Zeroize, so we use volatile writes to prevent the
+        // compiler from eliding the zeroization as a dead store.
         // This is critical: leaking the PQ decapsulation key would allow an
         // attacker to recover all past shared secrets.
         unsafe {
             let ptr = &mut self.ml_kem_dk as *mut _ as *mut u8;
             let size = core::mem::size_of::<<MlKem1024 as KemCore>::DecapsulationKey>();
-            core::ptr::write_bytes(ptr, 0, size);
+            for i in 0..size {
+                core::ptr::write_volatile(ptr.add(i), 0u8);
+            }
         }
+        // Compiler fence to prevent reordering past the volatile writes.
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -432,6 +438,19 @@ mod tests {
         let ct2 = Ciphertext::from_bytes(&bytes).unwrap();
         assert_eq!(ct.x25519_pk_client, ct2.x25519_pk_client);
         assert_eq!(ct.ml_kem_ct, ct2.ml_kem_ct);
+    }
+
+    #[test]
+    fn xwing_different_sessions_produce_different_secrets() {
+        let kp = XWingKeyPair::generate();
+        let pk = kp.public_key();
+        let (ss1, _) = xwing_encapsulate(&pk);
+        let (ss2, _) = xwing_encapsulate(&pk);
+        assert_ne!(
+            ss1.as_bytes(),
+            ss2.as_bytes(),
+            "each session must produce unique secrets"
+        );
     }
 
     #[test]

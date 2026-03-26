@@ -861,7 +861,22 @@ fn test_attack_receipt_chain_replay_attack() {
         chain[0].ceremony_session_id, chain[1].ceremony_session_id,
         "all receipts share the same ceremony_session_id"
     );
-    // A replay tracker would detect this duplicate session_id.
+
+    // Verify that a ReceiptChain-based replay tracker actually rejects the
+    // second submission: build a ReceiptChain from the first submission,
+    // then attempt to add the same receipts again.
+    let session_id = chain[0].ceremony_session_id;
+    let mut replay_chain = ReceiptChain::new(session_id);
+    replay_chain.add_receipt(chain[0].clone()).expect("first receipt accepted");
+    replay_chain.add_receipt(chain[1].clone()).expect("second receipt accepted");
+
+    // Attempting to add the same step_id=1 receipt again must fail (duplicate step).
+    let replay_result = replay_chain.add_receipt(chain[0].clone());
+    assert!(
+        replay_result.is_err(),
+        "replayed receipt (same step_id) must be rejected by ReceiptChain — \
+         known limitation: full replay tracking requires orchestrator-level session dedup"
+    );
 }
 
 #[test]
@@ -1162,10 +1177,10 @@ fn test_attack_ratchet_stolen_old_token_rejected() {
     let mut chain = RatchetChain::new(&master).unwrap();
 
     let claims_bytes = b"stolen-claims";
-    let stolen_tag = chain.generate_tag(claims_bytes);
+    let stolen_tag = chain.generate_tag(claims_bytes).unwrap();
 
     // Verify tag is valid at epoch 0
-    assert!(chain.verify_tag(claims_bytes, &stolen_tag, 0));
+    assert!(chain.verify_tag(claims_bytes, &stolen_tag, 0).unwrap());
 
     // Advance 10 epochs (well past +/-3 window)
     for _ in 0..10 {
@@ -1177,7 +1192,7 @@ fn test_attack_ratchet_stolen_old_token_rejected() {
 
     // Stolen epoch-0 tag must be rejected
     assert!(
-        !chain.verify_tag(claims_bytes, &stolen_tag, 0),
+        !chain.verify_tag(claims_bytes, &stolen_tag, 0).unwrap(),
         "stolen token from epoch 0 must be rejected at epoch 10"
     );
 }
@@ -1200,8 +1215,8 @@ fn test_attack_ratchet_cloned_server_detected() {
     }
 
     let claims = b"test-claims";
-    let tag_orig_5 = original.generate_tag(claims);
-    let tag_clone_5 = clone.generate_tag(claims);
+    let tag_orig_5 = original.generate_tag(claims).unwrap();
+    let tag_clone_5 = clone.generate_tag(claims).unwrap();
     assert!(ct_eq_64(&tag_orig_5, &tag_clone_5), "same state should match");
 
     // Now advance original with different entropy (simulating real server)
@@ -1213,7 +1228,7 @@ fn test_attack_ratchet_cloned_server_detected() {
     assert_eq!(original.epoch(), 6);
     assert_eq!(clone.epoch(), 5);
 
-    let tag_orig_6 = original.generate_tag(claims);
+    let tag_orig_6 = original.generate_tag(claims).unwrap();
 
     // Clone's epoch-5 tag DOES verify against original at epoch 6 via
     // the lookbehind cache (epoch 5 is within the +/-3 window and the
@@ -1221,13 +1236,13 @@ fn test_attack_ratchet_cloned_server_detected() {
     // This is correct behavior: the lookbehind cache tolerates jitter for
     // recently-seen epochs.
     assert!(
-        original.verify_tag(claims, &tag_clone_5, 5),
+        original.verify_tag(claims, &tag_clone_5, 5).unwrap(),
         "clone's epoch-5 tag should verify on original at epoch 6 via lookbehind cache"
     );
 
     // However, the clone CANNOT generate a valid tag for epoch 6 because
     // the chain keys diverged after the different-entropy advance.
-    let tag_clone_6_attempt = clone.generate_tag(claims); // clone is still at epoch 5
+    let tag_clone_6_attempt = clone.generate_tag(claims).unwrap(); // clone is still at epoch 5
     assert!(
         !ct_eq_64(&tag_orig_6, &tag_clone_6_attempt),
         "clone at epoch 5 must produce a different tag than original at epoch 6"
@@ -1241,7 +1256,7 @@ fn test_attack_ratchet_cloned_server_detected() {
         getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
         clone.advance(&ce, &se, &sn).unwrap();
     }
-    let tag_clone_after_diverge = clone.generate_tag(claims);
+    let tag_clone_after_diverge = clone.generate_tag(claims).unwrap();
     assert!(
         !ct_eq_64(&tag_orig_6, &tag_clone_after_diverge),
         "diverged chains must produce different tags at same epoch"
@@ -1250,7 +1265,7 @@ fn test_attack_ratchet_cloned_server_detected() {
     // Original's epoch-6 tag differs from clone's epoch-5 tag
     assert!(
         !ct_eq_64(&tag_orig_6, &tag_clone_5),
-        "diverged chains must produce different tags"
+        "different-epoch chains must produce different tags"
     );
 }
 

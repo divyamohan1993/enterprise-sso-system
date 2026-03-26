@@ -6,6 +6,15 @@ use sso_protocol::tokens;
 use sso_protocol::tokens::OidcSigningKey;
 use uuid::Uuid;
 
+fn big<F: FnOnce() + Send + 'static>(f: F) {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(f)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
 #[test]
 fn test_oidc_discovery_has_required_fields() {
     let config = OpenIdConfiguration::new("https://sso.example.com");
@@ -92,42 +101,44 @@ fn test_authorization_code_expires() {
 
 #[test]
 fn test_id_token_is_valid_jwt_mldsa87() {
-    let user_id = Uuid::new_v4();
-    let signing_key = OidcSigningKey::generate();
+    big(|| {
+        let user_id = Uuid::new_v4();
+        let signing_key = OidcSigningKey::generate();
 
-    let token = tokens::create_id_token(
-        "https://sso.example.com",
-        &user_id,
-        "client-abc",
-        Some("test-nonce".into()),
-        &signing_key,
-    );
+        let token = tokens::create_id_token(
+            "https://sso.example.com",
+            &user_id,
+            "client-abc",
+            Some("test-nonce".into()),
+            &signing_key,
+        );
 
-    // JWT should have 3 parts separated by dots
-    let parts: Vec<&str> = token.split('.').collect();
-    assert_eq!(parts.len(), 3, "JWT must have header.payload.signature");
+        // JWT should have 3 parts separated by dots
+        let parts: Vec<&str> = token.split('.').collect();
+        assert_eq!(parts.len(), 3, "JWT must have header.payload.signature");
 
-    // Decode and verify header
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-    let header_bytes = URL_SAFE_NO_PAD.decode(parts[0]).unwrap();
-    let header: serde_json::Value = serde_json::from_slice(&header_bytes).unwrap();
-    assert_eq!(header["alg"], "ML-DSA-87");
-    assert_eq!(header["typ"], "JWT");
+        // Decode and verify header
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        let header_bytes = URL_SAFE_NO_PAD.decode(parts[0]).unwrap();
+        let header: serde_json::Value = serde_json::from_slice(&header_bytes).unwrap();
+        assert_eq!(header["alg"], "ML-DSA-87");
+        assert_eq!(header["typ"], "JWT");
 
-    // Decode and verify claims
-    let claims_bytes = URL_SAFE_NO_PAD.decode(parts[1]).unwrap();
-    let claims: tokens::IdTokenClaims = serde_json::from_slice(&claims_bytes).unwrap();
-    assert_eq!(claims.iss, "https://sso.example.com");
-    assert_eq!(claims.sub, user_id.to_string());
-    assert_eq!(claims.aud, "client-abc");
-    assert_eq!(claims.nonce.as_deref(), Some("test-nonce"));
-    assert!(claims.exp > claims.iat);
-    assert_eq!(claims.tier, 2); // default tier
+        // Decode and verify claims
+        let claims_bytes = URL_SAFE_NO_PAD.decode(parts[1]).unwrap();
+        let claims: tokens::IdTokenClaims = serde_json::from_slice(&claims_bytes).unwrap();
+        assert_eq!(claims.iss, "https://sso.example.com");
+        assert_eq!(claims.sub, user_id.to_string());
+        assert_eq!(claims.aud, "client-abc");
+        assert_eq!(claims.nonce.as_deref(), Some("test-nonce"));
+        assert!(claims.exp > claims.iat);
+        assert_eq!(claims.tier, 2); // default tier
 
-    // Verify ML-DSA-87 signature using the verifying key
-    let verified_claims = tokens::verify_id_token(&token, signing_key.verifying_key())
-        .expect("ML-DSA-87 signature must be valid");
-    assert_eq!(verified_claims.sub, user_id.to_string());
+        // Verify ML-DSA-87 signature using the verifying key
+        let verified_claims = tokens::verify_id_token(&token, signing_key.verifying_key())
+            .expect("ML-DSA-87 signature must be valid");
+        assert_eq!(verified_claims.sub, user_id.to_string());
+    });
 }
 
 #[test]
@@ -168,22 +179,24 @@ fn test_client_registration() {
 
 #[test]
 fn test_tier_in_jwt() {
-    let user_id = Uuid::new_v4();
-    let signing_key = OidcSigningKey::generate();
+    big(|| {
+        let user_id = Uuid::new_v4();
+        let signing_key = OidcSigningKey::generate();
 
-    // Create a token with tier 1 (Sovereign)
-    let token = tokens::create_id_token_with_tier(
-        "https://sso.example.com",
-        &user_id,
-        "client-abc",
-        None,
-        &signing_key,
-        1,
-    );
+        // Create a token with tier 1 (Sovereign)
+        let token = tokens::create_id_token_with_tier(
+            "https://sso.example.com",
+            &user_id,
+            "client-abc",
+            None,
+            &signing_key,
+            1,
+        );
 
-    let claims = tokens::verify_id_token(&token, signing_key.verifying_key()).unwrap();
-    assert_eq!(claims.tier, 1);
-    assert_eq!(claims.sub, user_id.to_string());
+        let claims = tokens::verify_id_token(&token, signing_key.verifying_key()).unwrap();
+        assert_eq!(claims.tier, 1);
+        assert_eq!(claims.sub, user_id.to_string());
+    });
 }
 
 #[test]
@@ -251,24 +264,26 @@ fn test_authorization_code_single_use() {
 
 #[test]
 fn test_token_claims_include_required_fields() {
-    let user_id = Uuid::new_v4();
-    let signing_key = OidcSigningKey::generate();
-    let token = tokens::create_id_token(
-        "https://issuer.example.com",
-        &user_id,
-        "client-id",
-        Some("nonce-123".into()),
-        &signing_key,
-    );
-    let claims = tokens::verify_id_token(&token, signing_key.verifying_key()).unwrap();
-    // All required OIDC fields present
-    assert_eq!(claims.iss, "https://issuer.example.com");
-    assert_eq!(claims.sub, user_id.to_string());
-    assert_eq!(claims.aud, "client-id");
-    assert!(claims.iat > 0);
-    assert!(claims.exp > claims.iat);
-    assert_eq!(claims.nonce.as_deref(), Some("nonce-123"));
-    assert!(claims.auth_time > 0);
+    big(|| {
+        let user_id = Uuid::new_v4();
+        let signing_key = OidcSigningKey::generate();
+        let token = tokens::create_id_token(
+            "https://issuer.example.com",
+            &user_id,
+            "client-id",
+            Some("nonce-123".into()),
+            &signing_key,
+        );
+        let claims = tokens::verify_id_token(&token, signing_key.verifying_key()).unwrap();
+        // All required OIDC fields present
+        assert_eq!(claims.iss, "https://issuer.example.com");
+        assert_eq!(claims.sub, user_id.to_string());
+        assert_eq!(claims.aud, "client-id");
+        assert!(claims.iat > 0);
+        assert!(claims.exp > claims.iat);
+        assert_eq!(claims.nonce.as_deref(), Some("nonce-123"));
+        assert!(claims.auth_time > 0);
+    });
 }
 
 #[test]
@@ -290,56 +305,53 @@ fn test_client_validation_rejects_wrong_secret() {
 
 #[test]
 fn test_default_tier_is_2() {
-    let user_id = Uuid::new_v4();
-    let signing_key = OidcSigningKey::generate();
+    big(|| {
+        let user_id = Uuid::new_v4();
+        let signing_key = OidcSigningKey::generate();
 
-    // Default create_id_token should use tier 2
-    let token = tokens::create_id_token(
-        "https://sso.example.com",
-        &user_id,
-        "client-xyz",
-        None,
-        &signing_key,
-    );
+        // Default create_id_token should use tier 2
+        let token = tokens::create_id_token(
+            "https://sso.example.com",
+            &user_id,
+            "client-xyz",
+            None,
+            &signing_key,
+        );
 
-    let claims = tokens::verify_id_token(&token, signing_key.verifying_key()).unwrap();
-    assert_eq!(claims.tier, 2, "Default tier should be Operational (2)");
+        let claims = tokens::verify_id_token(&token, signing_key.verifying_key()).unwrap();
+        assert_eq!(claims.tier, 2, "Default tier should be Operational (2)");
+    });
 }
 
 #[test]
 fn test_mldsa87_wrong_key_rejects() {
-    let user_id = Uuid::new_v4();
-    let key1 = OidcSigningKey::generate();
-    let key2 = OidcSigningKey::generate();
+    big(|| {
+        let user_id = Uuid::new_v4();
+        let key1 = OidcSigningKey::generate();
+        let key2 = OidcSigningKey::generate();
 
-    let token = tokens::create_id_token("https://iss", &user_id, "c", None, &key1);
-    // Verifying with a different key's verifying key must fail
-    let result = tokens::verify_id_token(&token, key2.verifying_key());
-    assert!(result.is_err(), "ML-DSA-87 verification must fail with wrong verifying key");
+        let token = tokens::create_id_token("https://iss", &user_id, "c", None, &key1);
+        // Verifying with a different key's verifying key must fail
+        let result = tokens::verify_id_token(&token, key2.verifying_key());
+        assert!(result.is_err(), "ML-DSA-87 verification must fail with wrong verifying key");
+    });
 }
 
 #[test]
 fn test_jwks_json_has_mldsa87_fields() {
-    let key = OidcSigningKey::generate();
-    let jwks = key.jwks_json();
-    let keys = jwks["keys"].as_array().unwrap();
-    assert_eq!(keys.len(), 1);
-    let k = &keys[0];
-    assert_eq!(k["kty"], "ML-DSA");
-    assert_eq!(k["alg"], "ML-DSA-87");
-    assert_eq!(k["use"], "sig");
-    assert_eq!(k["kid"], "milnet-mldsa87-v1");
-    // Must have pub (ML-DSA-87 verifying key)
-    assert!(k["pub"].as_str().unwrap().len() > 10);
-}
-
-fn big<F: FnOnce() + Send + 'static>(f: F) {
-    std::thread::Builder::new()
-        .stack_size(16 * 1024 * 1024)
-        .spawn(f)
-        .unwrap()
-        .join()
-        .unwrap();
+    big(|| {
+        let key = OidcSigningKey::generate();
+        let jwks = key.jwks_json();
+        let keys = jwks["keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 1);
+        let k = &keys[0];
+        assert_eq!(k["kty"], "ML-DSA");
+        assert_eq!(k["alg"], "ML-DSA-87");
+        assert_eq!(k["use"], "sig");
+        assert_eq!(k["kid"], "milnet-mldsa87-v1");
+        // Must have pub (ML-DSA-87 verifying key)
+        assert!(k["pub"].as_str().unwrap().len() > 10);
+    });
 }
 
 #[test]
@@ -365,9 +377,16 @@ fn test_verify_id_token_full_with_nonce() {
         );
         assert!(result.is_ok(), "verify_id_token_full should pass with matching nonce: {:?}", result.err());
 
-        // Wrong nonce should fail
+        // Wrong nonce should fail — create a fresh token (new JTI) to avoid JTI replay rejection
+        let token2 = tokens::create_id_token(
+            "https://sso.example.com",
+            &user_id,
+            "client-abc",
+            Some("my-nonce-123".into()),
+            &signing_key,
+        );
         let result = tokens::verify_id_token_full(
-            &token,
+            &token2,
             signing_key.verifying_key(),
             "client-abc",
             Some("wrong-nonce"),

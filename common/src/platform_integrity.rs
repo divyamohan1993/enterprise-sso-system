@@ -131,11 +131,18 @@ pub fn verify_tpm_present() -> Result<TpmInfo, PlatformError> {
         "/dev/tpm0".to_string()
     } else {
         tracing::warn!("platform: no vTPM device found (/dev/tpmrm0, /dev/tpm0)");
-        return Ok(TpmInfo {
+        let tpm_info = TpmInfo {
             available: false,
             version: String::new(),
             device_path: String::new(),
-        });
+        };
+        if !tpm_info.available && crate::sealed_keys::is_production() {
+            panic!(
+                "FATAL: vTPM not available but MILNET_PRODUCTION is set. \
+                 Production deployment requires vTPM 2.0 for measured boot and key sealing."
+            );
+        }
+        return Ok(tpm_info);
     };
 
     // Read TPM version from sysfs

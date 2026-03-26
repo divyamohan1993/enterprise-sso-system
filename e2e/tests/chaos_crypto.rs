@@ -245,10 +245,12 @@ fn test_aes256gcm_fips_roundtrip() {
 // 9. Legacy AES-256-GCM backward compatibility
 // ---------------------------------------------------------------------------
 
-/// Create a legacy AES-256-GCM blob (no algo_id prefix), verify the symmetric
-/// module can decrypt it transparently.
+/// Create a legacy AES-256-GCM blob (no algo_id prefix), verify that the
+/// symmetric module now rejects it. The legacy `_ =>` fallback has been
+/// removed — only tagged ciphertext (AEGIS-256 = 0x01, AES-256-GCM = 0x02)
+/// is accepted.
 #[test]
-fn test_legacy_aes256gcm_backward_compat() {
+fn test_legacy_aes256gcm_rejected_after_fallback_removal() {
     use aes_gcm::{aead::Aead, aead::generic_array::GenericArray, Aes256Gcm, KeyInit};
     use aes_gcm::Nonce as GcmNonce;
     use aes_gcm::aead::Payload;
@@ -273,8 +275,17 @@ fn test_legacy_aes256gcm_backward_compat() {
     legacy_blob.extend_from_slice(&nonce_bytes);
     legacy_blob.extend_from_slice(&ct_with_tag);
 
-    let recovered = decrypt(&key, &legacy_blob, aad).unwrap();
-    assert_eq!(recovered.as_slice(), plaintext, "legacy AES-256-GCM blob must decrypt correctly");
+    // Legacy untagged ciphertext is no longer accepted — decrypt must fail.
+    let result = decrypt(&key, &legacy_blob, aad);
+    assert!(
+        result.is_err(),
+        "legacy AES-256-GCM blob (no algo_id prefix) must be rejected after fallback removal"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("unknown algorithm tag"),
+        "error must mention unknown algorithm tag, got: {err}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -296,13 +307,16 @@ fn test_symmetric_algo_id_corruption() {
         *b = 0xFF;
     }
 
-    // The legacy AES-GCM path will be tried but will fail (wrong structure).
-    // The important thing is that this returns Err and does not panic.
+    // With the legacy fallback removed, 0xFF is an unknown algorithm tag
+    // and must be rejected immediately with a clear error.
     let result = decrypt(&key, &sealed, aad);
-    // With algo_id=0xFF, the system falls through to the legacy AES-GCM path.
-    // Since the payload is actually AEGIS-256 data (not AES-GCM), decryption fails.
     assert!(
         result.is_err(),
         "corrupted algo_id must cause a graceful decryption failure"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("unknown algorithm tag"),
+        "error must mention unknown algorithm tag, got: {err}"
     );
 }

@@ -178,9 +178,28 @@ async fn main() {
         if let Ok(mut transport) = listener.accept().await {
             let cluster = cluster.clone();
             tokio::spawn(async move {
-                while let Ok((_sender, payload)) = transport.recv().await {
+                while let Ok((sender, payload)) = transport.recv().await {
                     let response = match postcard::from_bytes::<AuditRequest>(&payload) {
                         Ok(req) => {
+                            // Verify the sender is an authorized module
+                            let authorized_senders = [
+                                common::types::ModuleId::Orchestrator,
+                                common::types::ModuleId::Opaque,
+                                common::types::ModuleId::Tss,
+                                common::types::ModuleId::Verifier,
+                                common::types::ModuleId::Admin,
+                                common::types::ModuleId::Gateway,
+                                common::types::ModuleId::Ratchet,
+                                common::types::ModuleId::Risk,
+                            ];
+                            if !authorized_senders.contains(&sender) {
+                                tracing::error!(
+                                    sender = ?sender,
+                                    "SECURITY: unauthorized module attempted to submit audit entry"
+                                );
+                                continue;
+                            }
+                            tracing::debug!(sender = ?sender, event_type = ?req.event_type, "audit entry from verified sender");
                             let mut c = cluster.write().await;
                             match c.propose_entry(
                                 req.event_type,

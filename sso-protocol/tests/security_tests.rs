@@ -8,6 +8,15 @@ use sso_protocol::tokens;
 use sso_protocol::tokens::OidcSigningKey;
 use uuid::Uuid;
 
+fn big<F: FnOnce() + Send + 'static>(f: F) {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(f)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
 #[test]
 fn test_pkce_challenge_is_base64url_no_padding() {
     let verifier = "some-random-code-verifier-string-here";
@@ -53,35 +62,41 @@ fn test_oidc_discovery_advertises_mldsa87() {
 
 #[test]
 fn test_jwt_signature_changes_with_different_key() {
-    let user_id = Uuid::new_v4();
-    let key1 = OidcSigningKey::generate();
-    let key2 = OidcSigningKey::generate();
-    let t1 = tokens::create_id_token("https://iss", &user_id, "c", None, &key1);
-    let t2 = tokens::create_id_token("https://iss", &user_id, "c", None, &key2);
-    // Signatures (third JWT segment) must differ
-    let sig1 = t1.split('.').nth(2).unwrap();
-    let sig2 = t2.split('.').nth(2).unwrap();
-    assert_ne!(sig1, sig2);
+    big(|| {
+        let user_id = Uuid::new_v4();
+        let key1 = OidcSigningKey::generate();
+        let key2 = OidcSigningKey::generate();
+        let t1 = tokens::create_id_token("https://iss", &user_id, "c", None, &key1);
+        let t2 = tokens::create_id_token("https://iss", &user_id, "c", None, &key2);
+        // Signatures (third JWT segment) must differ
+        let sig1 = t1.split('.').nth(2).unwrap();
+        let sig2 = t2.split('.').nth(2).unwrap();
+        assert_ne!(sig1, sig2);
+    });
 }
 
 #[test]
 fn test_mldsa87_token_verifiable_with_verifying_key() {
-    let user_id = Uuid::new_v4();
-    let key = OidcSigningKey::generate();
-    let token = tokens::create_id_token("https://iss", &user_id, "c", None, &key);
-    // Must verify with the matching verifying key
-    let claims = tokens::verify_id_token(&token, key.verifying_key()).unwrap();
-    assert_eq!(claims.sub, user_id.to_string());
+    big(|| {
+        let user_id = Uuid::new_v4();
+        let key = OidcSigningKey::generate();
+        let token = tokens::create_id_token("https://iss", &user_id, "c", None, &key);
+        // Must verify with the matching verifying key
+        let claims = tokens::verify_id_token(&token, key.verifying_key()).unwrap();
+        assert_eq!(claims.sub, user_id.to_string());
+    });
 }
 
 #[test]
 fn test_mldsa87_token_rejected_with_wrong_verifying_key() {
-    let user_id = Uuid::new_v4();
-    let key1 = OidcSigningKey::generate();
-    let key2 = OidcSigningKey::generate();
-    let token = tokens::create_id_token("https://iss", &user_id, "c", None, &key1);
-    // Must NOT verify with a different key's verifying key
-    assert!(tokens::verify_id_token(&token, key2.verifying_key()).is_err());
+    big(|| {
+        let user_id = Uuid::new_v4();
+        let key1 = OidcSigningKey::generate();
+        let key2 = OidcSigningKey::generate();
+        let token = tokens::create_id_token("https://iss", &user_id, "c", None, &key1);
+        // Must NOT verify with a different key's verifying key
+        assert!(tokens::verify_id_token(&token, key2.verifying_key()).is_err());
+    });
 }
 
 #[test]
@@ -116,11 +131,13 @@ fn test_nonexistent_client_get_returns_none() {
 
 #[test]
 fn test_jwt_tier_values_propagate() {
-    let user_id = Uuid::new_v4();
-    let key = OidcSigningKey::generate();
-    for tier in 1..=4u8 {
-        let token = tokens::create_id_token_with_tier("https://iss", &user_id, "c", None, &key, tier);
-        let claims = tokens::verify_id_token(&token, key.verifying_key()).unwrap();
-        assert_eq!(claims.tier, tier, "tier {tier} should propagate into JWT claims");
-    }
+    big(|| {
+        let user_id = Uuid::new_v4();
+        let key = OidcSigningKey::generate();
+        for tier in 1..=4u8 {
+            let token = tokens::create_id_token_with_tier("https://iss", &user_id, "c", None, &key, tier);
+            let claims = tokens::verify_id_token(&token, key.verifying_key()).unwrap();
+            assert_eq!(claims.tier, tier, "tier {tier} should propagate into JWT claims");
+        }
+    });
 }

@@ -75,6 +75,13 @@ pub enum OpaqueResponse {
     RegisterComplete {
         user_id: uuid::Uuid,
     },
+    /// Threshold mode: partial OPRF evaluation returned to orchestrator.
+    /// The orchestrator collects evaluations from 2+ servers and combines them.
+    ThresholdPartialEval {
+        server_id: u8,
+        evaluation: Vec<u8>,
+        proof: Vec<u8>,
+    },
     /// Error response for any step.
     Error {
         message: String,

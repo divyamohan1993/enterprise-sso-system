@@ -6,9 +6,11 @@
 //! Software implementation uses HKDF-SHA512 key derivation.
 //! HSM implementation would use PKCS#11 key wrapping.
 
+#![allow(unsafe_code)]
+
 use hkdf::Hkdf;
 use sha2::Sha512;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::Zeroize;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -46,10 +48,34 @@ impl std::error::Error for SealError {}
 
 /// 256-bit master key at the root of the key hierarchy.
 ///
-/// Automatically zeroized when dropped.
-#[derive(Zeroize, ZeroizeOnDrop)]
+/// Automatically zeroized when dropped. Key bytes are mlocked to prevent
+/// swapping to disk.
+#[derive(Zeroize)]
 pub struct MasterKey {
     bytes: [u8; 32],
+}
+
+impl Drop for MasterKey {
+    fn drop(&mut self) {
+        // Munlock before zeroize so the region is still valid.
+        munlock_key_bytes(self.bytes.as_ptr());
+        self.bytes.zeroize();
+    }
+}
+
+/// Lock key bytes into RAM (prevent swap) and exclude from core dumps.
+fn mlock_key_bytes(ptr: *const u8) {
+    unsafe {
+        libc::mlock(ptr as *const libc::c_void, 32);
+        libc::madvise(ptr as *mut libc::c_void, 32, libc::MADV_DONTDUMP);
+    }
+}
+
+/// Unlock previously mlocked key bytes.
+fn munlock_key_bytes(ptr: *const u8) {
+    unsafe {
+        libc::munlock(ptr as *const libc::c_void, 32);
+    }
 }
 
 impl MasterKey {
@@ -66,20 +92,26 @@ impl MasterKey {
         let mut okm = [0u8; 32];
         hk.expand(b"master-key", &mut okm)
             .map_err(|_| SealError::KeyDerivationFailed)?;
-        Ok(Self { bytes: okm })
+        let mk = Self { bytes: okm };
+        mlock_key_bytes(mk.bytes.as_ptr());
+        Ok(mk)
     }
 
     /// Construct a master key from raw bytes (caller is responsible for
     /// ensuring the bytes have sufficient entropy).
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self { bytes }
+        let mk = Self { bytes };
+        mlock_key_bytes(mk.bytes.as_ptr());
+        mk
     }
 
     /// Generate a master key from the OS CSPRNG (`getrandom`).
     pub fn generate() -> Self {
         let mut bytes = [0u8; 32];
         getrandom::getrandom(&mut bytes).expect("OS CSPRNG unavailable");
-        Self { bytes }
+        let mk = Self { bytes };
+        mlock_key_bytes(mk.bytes.as_ptr());
+        mk
     }
 
     /// Derive a purpose-specific Key Encryption Key (KEK) from this master key.
@@ -94,7 +126,9 @@ impl MasterKey {
         let mut okm = [0u8; 32];
         hk.expand(&info, &mut okm)
             .expect("HKDF expand should not fail for 32 byte output");
-        DerivedKek { bytes: okm }
+        let kek = DerivedKek { bytes: okm };
+        mlock_key_bytes(kek.bytes.as_ptr());
+        kek
     }
 }
 
@@ -105,10 +139,18 @@ impl MasterKey {
 /// A purpose-bound Key Encryption Key derived from the master key.
 ///
 /// Used to seal (wrap) and unseal (unwrap) Data Encryption Keys.
-/// Automatically zeroized when dropped.
-#[derive(Zeroize, ZeroizeOnDrop)]
+/// Automatically zeroized when dropped. Key bytes are mlocked to prevent
+/// swapping to disk.
+#[derive(Zeroize)]
 pub struct DerivedKek {
     bytes: [u8; 32],
+}
+
+impl Drop for DerivedKek {
+    fn drop(&mut self) {
+        munlock_key_bytes(self.bytes.as_ptr());
+        self.bytes.zeroize();
+    }
 }
 
 /// Additional Authenticated Data used for all seal operations.

@@ -535,8 +535,9 @@ mod tests {
     }
 
     #[test]
-    fn test_envelope_legacy_backward_compat() {
+    fn test_envelope_legacy_backward_compat_rejected() {
         // Build a legacy AES-256-GCM blob (no algo_id prefix): nonce (12) || ct+tag
+        // Legacy untagged ciphertext is no longer accepted after fallback removal.
         common::fips::set_fips_mode_unchecked(false);
         let dek = DataEncryptionKey::generate();
         let plaintext = b"legacy-envelope-data";
@@ -554,7 +555,7 @@ mod tests {
         legacy_bytes.extend_from_slice(&nonce_bytes);
         legacy_bytes.extend_from_slice(&ct);
 
-        // Ensure first byte is not 0x01 or 0x02
+        // Ensure first byte is not 0x01 or 0x02 so it hits the unknown-tag path
         if legacy_bytes.first().copied() == Some(crate::symmetric::ALGO_ID_AEGIS256)
             || legacy_bytes.first().copied() == Some(crate::symmetric::ALGO_ID_AES256GCM)
         {
@@ -569,7 +570,10 @@ mod tests {
         }
 
         let legacy_sealed = SealedData::from_bytes(legacy_bytes).expect("from_bytes");
-        let recovered = decrypt(&dek, &legacy_sealed, &aad).expect("legacy decrypt");
-        assert_eq!(recovered.as_slice(), plaintext);
+        let result = decrypt(&dek, &legacy_sealed, &aad);
+        assert!(
+            result.is_err(),
+            "legacy untagged ciphertext must be rejected after fallback removal"
+        );
     }
 }

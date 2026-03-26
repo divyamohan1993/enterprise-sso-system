@@ -514,7 +514,7 @@ pub async fn run_threshold(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let shard_hmac_key = load_shard_hmac_key();
     let receipt_signing_seed = load_receipt_signing_seed();
-    let receipt_signer = ReceiptSigner::new_mldsa(receipt_signing_seed);
+    let _receipt_signer = ReceiptSigner::new_mldsa(receipt_signing_seed);
 
     // Build a coordinator on this node so we can combine partial evaluations
     // when we receive them from peer servers (or from ourselves).
@@ -549,8 +549,8 @@ pub async fn run_threshold(
             OpaqueRequest::LoginStart {
                 username,
                 credential_request,
-                ceremony_session_id,
-                dpop_key_hash,
+                ceremony_session_id: _,
+                dpop_key_hash: _,
             } => {
                 // Validate username length
                 if username.len() > MAX_USERNAME_BYTES {
@@ -565,113 +565,51 @@ pub async fn run_threshold(
 
                 let start = Instant::now();
 
-                // Step 1: Perform partial OPRF evaluation using our share
+                // Threshold mode: perform partial OPRF evaluation using our share
+                // and return it to the orchestrator for combining with other servers.
+                // We do NOT fall through to handle_login_start — the monolithic
+                // ServerSetup path is bypassed entirely in threshold mode.
                 let partial_eval = threshold_server.partial_evaluate(&credential_request);
                 info!(
                     "Threshold server {} produced partial evaluation for user '{}'",
                     server_id, username
                 );
 
-                // Step 2: In a full deployment, the coordinator would collect
-                // partial evaluations from multiple servers over the network.
-                // Here, we send our partial evaluation back so the orchestrator
-                // (or a dedicated coordinator process) can combine them.
-                //
-                // For now, we also attempt the standard OPAQUE flow as a
-                // fallback: if this server has the full ServerSetup (for
-                // registration records), it can still do the OPAQUE key
-                // exchange. The threshold layer adds the distributed OPRF
-                // guarantee on top.
-                match handle_login_start(&store, &username, &credential_request) {
-                    Ok((response_bytes, server_login)) => {
-                        // Include the partial evaluation in a log for the
-                        // coordinator to collect. In production this would be
-                        // sent to the coordinator over a separate channel.
-                        info!(
-                            "Threshold partial eval (server_id={}, proof={:02x?}) ready for coordinator",
-                            partial_eval.server_id,
-                            &partial_eval.proof[..8],
-                        );
+                // Save proof prefix for logging before moving fields into response
+                let eval_server_id = partial_eval.server_id;
+                let proof_prefix: [u8; 8] = {
+                    let mut buf = [0u8; 8];
+                    buf.copy_from_slice(&partial_eval.proof[..8]);
+                    buf
+                };
 
-                        let response = OpaqueResponse::LoginChallenge {
-                            credential_response: response_bytes,
-                        };
-                        let response_bytes = postcard::to_allocvec(&response)
-                            .map_err(|e| format!("serialize response: {e}"))?;
+                // Return the partial evaluation to the orchestrator.
+                // The orchestrator collects evaluations from 2+ servers and
+                // combines them to produce the full OPRF output.
+                let response = OpaqueResponse::ThresholdPartialEval {
+                    server_id: partial_eval.server_id,
+                    evaluation: partial_eval.evaluation,
+                    proof: partial_eval.proof.to_vec(),
+                };
 
-                        // Pad timing to prevent side-channel leakage
-                        let elapsed_us = start.elapsed().as_micros();
-                        if elapsed_us < LOGIN_LOOKUP_FLOOR_US {
-                            let remaining = LOGIN_LOOKUP_FLOOR_US - elapsed_us;
-                            std::thread::sleep(std::time::Duration::from_micros(remaining as u64));
-                        }
+                let resp_bytes = postcard::to_allocvec(&response)
+                    .map_err(|e| format!("serialize response: {e}"))?;
 
-                        transport.send(&response_bytes).await?;
-
-                        // Round 2: Wait for LoginFinish
-                        let (_sender, payload2) = transport.recv().await?;
-                        let request2: OpaqueRequest = postcard::from_bytes(&payload2)
-                            .map_err(|e| format!("deserialize login finish: {e}"))?;
-
-                        if let OpaqueRequest::LoginFinish {
-                            credential_finalization,
-                        } = request2
-                        {
-                            let user_id = store
-                                .get_user_id(&username)
-                                .unwrap_or(uuid::Uuid::nil());
-
-                            let response = handle_login_finish(
-                                server_login,
-                                &credential_finalization,
-                                &receipt_signer,
-                                user_id,
-                                ceremony_session_id,
-                                dpop_key_hash,
-                            );
-
-                            let resp_bytes = postcard::to_allocvec(&response)
-                                .map_err(|e| format!("serialize response: {e}"))?;
-                            transport.send(&resp_bytes).await?;
-
-                            match &response {
-                                OpaqueResponse::LoginSuccess { .. } => {
-                                    info!(
-                                        "Threshold authentication succeeded for user '{}' (server {})",
-                                        username, server_id
-                                    );
-                                }
-                                OpaqueResponse::Error { message } => {
-                                    error!(
-                                        "Threshold authentication failed for user '{}': {} (server {})",
-                                        username, message, server_id
-                                    );
-                                }
-                                _ => {}
-                            }
-                        } else {
-                            let err = OpaqueResponse::Error {
-                                message: "expected LoginFinish after LoginStart".into(),
-                            };
-                            let err_bytes = postcard::to_allocvec(&err)?;
-                            transport.send(&err_bytes).await?;
-                            error!("Protocol error: expected LoginFinish (threshold server {})", server_id);
-                        }
-                    }
-                    Err(e) => {
-                        // Pad timing even on error
-                        let elapsed_us = start.elapsed().as_micros();
-                        if elapsed_us < LOGIN_LOOKUP_FLOOR_US {
-                            let remaining = LOGIN_LOOKUP_FLOOR_US - elapsed_us;
-                            std::thread::sleep(std::time::Duration::from_micros(remaining as u64));
-                        }
-
-                        let response = OpaqueResponse::Error { message: e.clone() };
-                        let resp_bytes = postcard::to_allocvec(&response)?;
-                        transport.send(&resp_bytes).await?;
-                        error!("Threshold login start failed: {e} (server {})", server_id);
-                    }
+                // Pad timing to prevent side-channel leakage
+                let elapsed_us = start.elapsed().as_micros();
+                if elapsed_us < LOGIN_LOOKUP_FLOOR_US {
+                    let remaining = LOGIN_LOOKUP_FLOOR_US - elapsed_us;
+                    std::thread::sleep(std::time::Duration::from_micros(remaining as u64));
                 }
+
+                transport.send(&resp_bytes).await?;
+
+                info!(
+                    "Threshold partial eval sent (server_id={}, proof={:02x?}) for user '{}'",
+                    eval_server_id,
+                    &proof_prefix,
+                    username,
+                );
             }
             OpaqueRequest::RegisterStart {
                 username,

@@ -76,32 +76,59 @@ pub fn dkg(total: u16, threshold: u16) -> DkgResult {
     }
 }
 
-/// Perform a full threshold signing ceremony with the given signers.
+/// Perform a threshold signing round using a specific set of signers.
 ///
-/// Takes the first `threshold` signers from `shares`, runs FROST round1 (commit),
-/// round2 (sign), and aggregation, returning the 64-byte group signature.
-pub fn threshold_sign(
+/// `signer_indices` specifies which shares (by their position in `shares`)
+/// should participate. The caller must provide at least `threshold` indices.
+/// This is required for distributed signing where specific nodes are selected.
+pub fn threshold_sign_with_indices(
     shares: &mut [SignerShare],
     group: &ThresholdGroup,
     message: &[u8],
     threshold: usize,
+    signer_indices: &[usize],
 ) -> Result<[u8; 64], String> {
-    if shares.len() < threshold {
+    if signer_indices.len() < threshold {
         return Err(format!(
-            "need {} signers, got {}",
-            threshold,
-            shares.len()
+            "threshold_sign: need at least {} signers, got {}",
+            threshold, signer_indices.len()
         ));
+    }
+
+    // Validate all indices are in range
+    for &idx in signer_indices {
+        if idx >= shares.len() {
+            return Err(format!(
+                "threshold_sign: signer index {} out of range (max {})",
+                idx, shares.len() - 1
+            ));
+        }
+    }
+
+    // Check for duplicate indices
+    let mut seen = std::collections::HashSet::new();
+    for &idx in signer_indices {
+        if !seen.insert(idx) {
+            return Err(format!(
+                "threshold_sign: duplicate signer index {}",
+                idx
+            ));
+        }
     }
 
     let mut rng = rand::rngs::OsRng;
 
-    // Round 1: each signer commits
+    // Use only the first `threshold` of the provided indices
+    let selected_count = signer_indices.len().min(threshold);
+    let selected_indices = &signer_indices[..selected_count];
+
+    // Round 1: each selected signer commits
     let mut nonces_map: BTreeMap<Identifier, frost::round1::SigningNonces> = BTreeMap::new();
     let mut commitments_map: BTreeMap<Identifier, frost::round1::SigningCommitments> =
         BTreeMap::new();
 
-    for signer in shares.iter_mut().take(threshold) {
+    for &idx in selected_indices {
+        let signer = &mut shares[idx];
         signer.nonce_counter += 1;
         let (nonces, commitments) =
             frost::round1::commit(signer.key_package.signing_share(), &mut rng);
@@ -113,9 +140,10 @@ pub fn threshold_sign(
     let signing_package =
         SigningPackage::new(commitments_map, message);
 
-    // Round 2: each signer signs
+    // Round 2: each selected signer signs
     let mut signature_shares: BTreeMap<Identifier, frost::round2::SignatureShare> = BTreeMap::new();
-    for signer in shares.iter().take(threshold) {
+    for &idx in selected_indices {
+        let signer = &shares[idx];
         let nonces = nonces_map
             .remove(&signer.identifier)
             .ok_or_else(|| format!("missing nonces for signer {:?}", signer.identifier))?;
@@ -138,6 +166,23 @@ pub fn threshold_sign(
     let mut out = [0u8; 64];
     out.copy_from_slice(&sig_bytes);
     Ok(out)
+}
+
+/// Perform a full threshold signing ceremony with the given signers.
+///
+/// Takes the first `threshold` signers from `shares`, runs FROST round1 (commit),
+/// round2 (sign), and aggregation, returning the 64-byte group signature.
+///
+/// For distributed deployments where specific signers must be selected,
+/// use [`threshold_sign_with_indices`] instead.
+pub fn threshold_sign(
+    shares: &mut [SignerShare],
+    group: &ThresholdGroup,
+    message: &[u8],
+    threshold: usize,
+) -> Result<[u8; 64], String> {
+    let indices: Vec<usize> = (0..threshold).collect();
+    threshold_sign_with_indices(shares, group, message, threshold, &indices)
 }
 
 /// Verify a combined group signature against the group's verifying key.
@@ -342,6 +387,72 @@ mod tests {
             new_vk.as_slice(),
             "new group verifying key must differ from old"
         );
+    }
+
+    #[test]
+    fn threshold_sign_rejects_duplicate_indices() {
+        let mut dkg_result = make_group(5, 3);
+        let result = threshold_sign_with_indices(
+            &mut dkg_result.shares,
+            &dkg_result.group,
+            b"test",
+            3,
+            &[0, 0, 1], // duplicate index 0
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("duplicate"));
+    }
+
+    #[test]
+    fn threshold_sign_rejects_out_of_range_index() {
+        let mut dkg_result = make_group(5, 3);
+        let result = threshold_sign_with_indices(
+            &mut dkg_result.shares,
+            &dkg_result.group,
+            b"test",
+            3,
+            &[0, 1, 99], // index 99 out of range
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("out of range"));
+    }
+
+    #[test]
+    fn threshold_sign_rejects_below_threshold() {
+        let mut dkg_result = make_group(5, 3);
+        let result = threshold_sign_with_indices(
+            &mut dkg_result.shares,
+            &dkg_result.group,
+            b"test",
+            3,
+            &[0, 1], // only 2, need 3
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn threshold_sign_different_subsets_produce_same_valid_signature() {
+        let mut dkg_result = make_group(5, 3);
+        let msg = b"consistent message";
+        let sig1 = threshold_sign_with_indices(
+            &mut dkg_result.shares,
+            &dkg_result.group,
+            msg,
+            3,
+            &[0, 1, 2],
+        )
+        .unwrap();
+        let sig2 = threshold_sign_with_indices(
+            &mut dkg_result.shares,
+            &dkg_result.group,
+            msg,
+            3,
+            &[2, 3, 4],
+        )
+        .unwrap();
+        // Both must verify against the group public key
+        assert!(verify_group_signature(&dkg_result.group, msg, &sig1));
+        assert!(verify_group_signature(&dkg_result.group, msg, &sig2));
     }
 
     #[test]

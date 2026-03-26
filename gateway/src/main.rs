@@ -53,9 +53,65 @@ async fn main() {
 
     let addr = format!("{bind_addr}:{port}");
 
-    let server = GatewayServer::bind(&addr, 16)
-        .await
-        .expect("failed to bind gateway");
+    // TLS termination for external listener
+    // In production, MILNET_GATEWAY_CERT_PATH and MILNET_GATEWAY_KEY_PATH must be set.
+    let cert_path = std::env::var("MILNET_GATEWAY_CERT_PATH");
+    let key_path = std::env::var("MILNET_GATEWAY_KEY_PATH");
+
+    if is_production && (cert_path.is_err() || key_path.is_err()) {
+        panic!(
+            "FATAL: MILNET_GATEWAY_CERT_PATH and MILNET_GATEWAY_KEY_PATH must be set \
+             in production mode for TLS termination."
+        );
+    }
+
+    let tls_config = if let (Ok(cert_file), Ok(key_file)) = (cert_path, key_path) {
+        tracing::info!("Loading TLS certificate from {cert_file} and key from {key_file}");
+
+        let cert_pem = std::fs::read(&cert_file)
+            .unwrap_or_else(|e| panic!("failed to read TLS cert {cert_file}: {e}"));
+        let key_pem = std::fs::read(&key_file)
+            .unwrap_or_else(|e| panic!("failed to read TLS key {key_file}: {e}"));
+
+        let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut &cert_pem[..])
+                .collect::<Result<Vec<_>, _>>()
+                .expect("failed to parse TLS certificate PEM");
+        let key = rustls_pemfile::private_key(&mut &key_pem[..])
+            .expect("failed to parse TLS private key PEM")
+            .expect("no private key found in PEM file");
+
+        // CNSA 2.0 compliant: TLS 1.3 only with AES-256-GCM-SHA384
+        let provider = rustls::crypto::CryptoProvider {
+            cipher_suites: vec![rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_256_GCM_SHA384],
+            ..rustls::crypto::aws_lc_rs::default_provider()
+        };
+
+        let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(provider))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS 1.3 config failed")
+            .with_no_client_auth()
+            .with_single_cert(certs, key.into())
+            .expect("TLS server config failed");
+
+        Some(std::sync::Arc::new(config))
+    } else {
+        tracing::warn!(
+            "TLS not configured — running without TLS termination. \
+             Set MILNET_GATEWAY_CERT_PATH and MILNET_GATEWAY_KEY_PATH for TLS."
+        );
+        None
+    };
+
+    let server = if let Some(tls_cfg) = tls_config {
+        GatewayServer::bind_tls(&addr, 16, tls_cfg)
+            .await
+            .expect("failed to bind gateway with TLS")
+    } else {
+        GatewayServer::bind(&addr, 16)
+            .await
+            .expect("failed to bind gateway")
+    };
 
     tracing::info!("Gateway listening on {addr}");
     server.run().await.expect("gateway server error");

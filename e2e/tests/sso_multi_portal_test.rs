@@ -740,7 +740,7 @@ async fn test_attack_replay_same_token_after_ratchet_advance() {
     let mut chain = RatchetChain::new(&master_secret).unwrap();
 
     let claims_bytes = b"test-claims-data";
-    let tag_epoch_0 = chain.generate_tag(claims_bytes);
+    let tag_epoch_0 = chain.generate_tag(claims_bytes).unwrap();
 
     // Advance ratchet 5 times (well past +-3 window)
     for _i in 0..5 {
@@ -750,20 +750,20 @@ async fn test_attack_replay_same_token_after_ratchet_advance() {
         getrandom::getrandom(&mut client_ent).unwrap();
         getrandom::getrandom(&mut server_ent).unwrap();
         getrandom::getrandom(&mut server_nonce).unwrap();
-        chain.advance(&client_ent, &server_ent, &server_nonce);
+        chain.advance(&client_ent, &server_ent, &server_nonce).unwrap();
     }
     assert_eq!(chain.epoch(), 5);
 
     // Token from epoch 0 is outside +-3 window (current epoch=5, diff=5 > 3)
-    let valid = chain.verify_tag(claims_bytes, &tag_epoch_0, 0);
+    let valid = chain.verify_tag(claims_bytes, &tag_epoch_0, 0).unwrap();
     assert!(
         !valid,
         "ratchet must reject tag from epoch 0 when current epoch is 5"
     );
 
     // Tag from epoch 5 at epoch 5 should verify
-    let tag_epoch_5 = chain.generate_tag(claims_bytes);
-    let valid_current = chain.verify_tag(claims_bytes, &tag_epoch_5, 5);
+    let tag_epoch_5 = chain.generate_tag(claims_bytes).unwrap();
+    let valid_current = chain.verify_tag(claims_bytes, &tag_epoch_5, 5).unwrap();
     assert!(valid_current, "current epoch tag should verify");
 }
 
@@ -853,8 +853,8 @@ async fn test_sso_sessions_are_isolated() {
     let claims_bytes = b"shared-claims-data";
 
     // Generate tags at epoch 0
-    let alice_tag = alice_chain.generate_tag(claims_bytes);
-    let bob_tag = bob_chain.generate_tag(claims_bytes);
+    let alice_tag = alice_chain.generate_tag(claims_bytes).unwrap();
+    let bob_tag = bob_chain.generate_tag(claims_bytes).unwrap();
 
     // Tags are different (different master secrets)
     assert_ne!(alice_tag, bob_tag, "different users must have different tags");
@@ -863,17 +863,17 @@ async fn test_sso_sessions_are_isolated() {
     {
         let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];
         getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
-        alice_chain.advance(&ce, &se, &sn);
+        alice_chain.advance(&ce, &se, &sn).unwrap();
     }
     assert_eq!(alice_chain.epoch(), 1);
     assert_eq!(bob_chain.epoch(), 0, "bob's epoch must not change");
 
     // alice's tag from epoch 0 does not verify against bob's chain
-    let cross_verify = bob_chain.verify_tag(claims_bytes, &alice_tag, 0);
+    let cross_verify = bob_chain.verify_tag(claims_bytes, &alice_tag, 0).unwrap();
     assert!(!cross_verify, "alice's tag must not verify against bob's chain");
 
     // bob's tag does not verify against alice's chain (alice is now at epoch 1)
-    let cross_verify2 = alice_chain.verify_tag(claims_bytes, &bob_tag, 0);
+    let cross_verify2 = alice_chain.verify_tag(claims_bytes, &bob_tag, 0).unwrap();
     assert!(
         !cross_verify2,
         "bob's tag must not verify against alice's chain"

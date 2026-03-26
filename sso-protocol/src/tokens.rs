@@ -1,9 +1,65 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use crypto::pq_sign::{PqSigningKey, PqVerifyingKey, generate_pq_keypair, pq_sign_raw, pq_verify_raw};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Mutex;
 use uuid::Uuid;
 
-#[derive(Serialize, Deserialize)]
+/// Global JTI replay cache — tracks seen token IDs to prevent replay.
+/// Entries are evicted after they expire (exp + skew tolerance).
+/// Bounded to prevent memory exhaustion from long-lived cache entries.
+static JTI_CACHE: std::sync::OnceLock<Mutex<JtiReplayCache>> = std::sync::OnceLock::new();
+
+struct JtiReplayCache {
+    /// Maps JTI -> expiry timestamp (seconds since epoch)
+    seen: HashMap<String, i64>,
+    /// Maximum cache size — oldest entries evicted when exceeded
+    max_size: usize,
+}
+
+impl JtiReplayCache {
+    fn new(max_size: usize) -> Self {
+        Self {
+            seen: HashMap::new(),
+            max_size,
+        }
+    }
+
+    /// Check if JTI has been seen. If not, record it.
+    /// Returns Err if JTI was already used (replay detected).
+    fn check_and_record(&mut self, jti: &str, exp: i64) -> Result<(), String> {
+        // First, evict expired entries
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        self.seen.retain(|_, &mut e| e + 60 > now); // keep 60s past expiry for safety
+
+        if self.seen.contains_key(jti) {
+            return Err(format!("JTI replay detected: token '{}' has already been used", jti));
+        }
+
+        // Evict oldest if at capacity
+        if self.seen.len() >= self.max_size {
+            // Remove the entry with the earliest expiry
+            if let Some(oldest_key) = self.seen.iter()
+                .min_by_key(|(_, exp)| *exp)
+                .map(|(k, _)| k.clone())
+            {
+                self.seen.remove(&oldest_key);
+            }
+        }
+
+        self.seen.insert(jti.to_string(), exp);
+        Ok(())
+    }
+}
+
+fn jti_cache() -> &'static Mutex<JtiReplayCache> {
+    JTI_CACHE.get_or_init(|| Mutex::new(JtiReplayCache::new(100_000)))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct IdTokenClaims {
     pub iss: String,
     pub sub: String,
@@ -200,6 +256,38 @@ fn verify_id_token_inner(
     let claims: IdTokenClaims =
         serde_json::from_slice(&claims_bytes).map_err(|e| format!("parse claims: {e}"))?;
 
+    // Token expiry enforcement — expired tokens MUST be rejected.
+    // This is checked BEFORE audience to fail fast on expired tokens.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "system clock error".to_string())?
+        .as_secs() as i64;
+
+    // Allow 30 seconds of clock skew tolerance for distributed systems
+    const CLOCK_SKEW_TOLERANCE_SECS: i64 = 30;
+    if claims.exp + CLOCK_SKEW_TOLERANCE_SECS <= now {
+        return Err(format!(
+            "token expired: exp={}, now={}, skew_tolerance={}s",
+            claims.exp, now, CLOCK_SKEW_TOLERANCE_SECS
+        ));
+    }
+
+    // Reject tokens issued too far in the future (> 5 minutes ahead = likely clock skew attack)
+    if claims.iat > now + 300 {
+        return Err(format!(
+            "token issued in the future: iat={}, now={} — possible clock manipulation",
+            claims.iat, now
+        ));
+    }
+
+    // JTI replay prevention — each token can only be verified once
+    if !claims.jti.is_empty() {
+        jti_cache()
+            .lock()
+            .map_err(|_| "JTI cache mutex poisoned".to_string())?
+            .check_and_record(&claims.jti, claims.exp)?;
+    }
+
     // Audience validation
     if let Some(expected) = expected_audience {
         if claims.aud != expected {
@@ -242,4 +330,248 @@ pub fn verify_id_token_full(
     }
 
     Ok(claims)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crypto::pq_sign::pq_sign_raw;
+
+    fn big<F: FnOnce() + Send + 'static>(f: F) {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(f)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// Helper: sign arbitrary IdTokenClaims with an OidcSigningKey.
+    /// This bypasses create_id_token's internal claim generation, allowing
+    /// tests to craft tokens with malicious/expired/future claims.
+    fn sign_claims_manually(sk: &OidcSigningKey, claims: &IdTokenClaims) -> String {
+        let header = serde_json::json!({
+            "alg": "ML-DSA-87",
+            "typ": "JWT",
+            "kid": sk.kid()
+        });
+        let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+        let claims_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).unwrap());
+        let signing_input = format!("{header_b64}.{claims_b64}");
+        let signature = pq_sign_raw(&sk.signing_key, signing_input.as_bytes());
+        let sig_b64 = URL_SAFE_NO_PAD.encode(&signature);
+        format!("{signing_input}.{sig_b64}")
+    }
+
+    fn now_secs() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    // ── Expired token rejection ─────────────────────────────────────────
+
+    #[test]
+    fn verify_rejects_expired_token() {
+        big(|| {
+            let sk = OidcSigningKey::generate();
+            let now = now_secs();
+
+            let claims = IdTokenClaims {
+                iss: "test".into(),
+                sub: Uuid::new_v4().to_string(),
+                aud: "test-client".into(),
+                exp: now - 120, // expired 2 minutes ago
+                iat: now - 720,
+                nonce: None,
+                auth_time: now - 720,
+                tier: 2,
+                jti: Uuid::new_v4().to_string(),
+            };
+
+            let token = sign_claims_manually(&sk, &claims);
+            let result = verify_id_token_with_audience(
+                &token, sk.verifying_key(), "test-client", true,
+            );
+            assert!(result.is_err());
+            assert!(
+                result.unwrap_err().contains("expired"),
+                "error must mention 'expired'"
+            );
+        });
+    }
+
+    // ── Future IAT rejection ────────────────────────────────────────────
+
+    #[test]
+    fn verify_rejects_future_iat() {
+        big(|| {
+            let sk = OidcSigningKey::generate();
+            let now = now_secs();
+
+            let claims = IdTokenClaims {
+                iss: "test".into(),
+                sub: Uuid::new_v4().to_string(),
+                aud: "test-client".into(),
+                exp: now + 1200,
+                iat: now + 600, // 10 min in the future
+                nonce: None,
+                auth_time: now + 600,
+                tier: 2,
+                jti: Uuid::new_v4().to_string(),
+            };
+
+            let token = sign_claims_manually(&sk, &claims);
+            let result = verify_id_token_with_audience(
+                &token, sk.verifying_key(), "test-client", true,
+            );
+            assert!(result.is_err());
+            assert!(
+                result.unwrap_err().contains("future"),
+                "error must mention 'future'"
+            );
+        });
+    }
+
+    // ── JTI replay detection ────────────────────────────────────────────
+
+    #[test]
+    fn verify_rejects_jti_replay() {
+        big(|| {
+            let sk = OidcSigningKey::generate();
+            let token = create_id_token("test-iss", &Uuid::new_v4(), "test-aud", None, &sk);
+
+            // First verification should succeed
+            let r1 = verify_id_token(&token, sk.verifying_key());
+            assert!(r1.is_ok(), "first verification must succeed");
+
+            // Second verification of same token should fail (JTI replay)
+            let r2 = verify_id_token(&token, sk.verifying_key());
+            assert!(r2.is_err(), "JTI replay must be rejected");
+            let err = r2.unwrap_err();
+            assert!(
+                err.contains("replay") || err.contains("JTI"),
+                "error must mention replay or JTI, got: {err}"
+            );
+        });
+    }
+
+    // ── Audience mismatch ───────────────────────────────────────────────
+
+    #[test]
+    fn verify_rejects_audience_mismatch() {
+        big(|| {
+            let sk = OidcSigningKey::generate();
+            let token = create_id_token("test-iss", &Uuid::new_v4(), "real-client", None, &sk);
+
+            let result = verify_id_token_with_audience(
+                &token, sk.verifying_key(), "wrong-client", true,
+            );
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("audience mismatch"));
+        });
+    }
+
+    // ── Algorithm confusion attack ──────────────────────────────────────
+
+    #[test]
+    fn verify_rejects_wrong_algorithm_header() {
+        big(|| {
+            let sk = OidcSigningKey::generate();
+            let now = now_secs();
+
+            // Craft a token with RS256 algorithm header (algorithm confusion)
+            let header = serde_json::json!({
+                "alg": "RS256",
+                "typ": "JWT",
+                "kid": sk.kid()
+            });
+            let claims = IdTokenClaims {
+                iss: "test".into(),
+                sub: Uuid::new_v4().to_string(),
+                aud: "test-client".into(),
+                exp: now + 600,
+                iat: now,
+                nonce: None,
+                auth_time: now,
+                tier: 2,
+                jti: Uuid::new_v4().to_string(),
+            };
+            let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+            let claims_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+            let signing_input = format!("{header_b64}.{claims_b64}");
+            let signature = pq_sign_raw(&sk.signing_key, signing_input.as_bytes());
+            let sig_b64 = URL_SAFE_NO_PAD.encode(&signature);
+            let token = format!("{signing_input}.{sig_b64}");
+
+            let result = verify_id_token(&token, sk.verifying_key());
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("unsupported algorithm"));
+        });
+    }
+
+    // ── Token with empty JTI ────────────────────────────────────────────
+
+    #[test]
+    fn verify_accepts_empty_jti_but_no_replay_protection() {
+        big(|| {
+            let sk = OidcSigningKey::generate();
+            let now = now_secs();
+
+            let claims = IdTokenClaims {
+                iss: "test".into(),
+                sub: Uuid::new_v4().to_string(),
+                aud: "test-client".into(),
+                exp: now + 600,
+                iat: now,
+                nonce: None,
+                auth_time: now,
+                tier: 2,
+                jti: String::new(), // empty JTI
+            };
+
+            let token = sign_claims_manually(&sk, &claims);
+            // Empty JTI tokens skip JTI cache — verification succeeds
+            let r1 = verify_id_token_with_audience(&token, sk.verifying_key(), "test-client", true);
+            assert!(r1.is_ok(), "empty JTI token should still verify");
+
+            // Second verification also succeeds (no replay protection for empty JTI)
+            let r2 = verify_id_token_with_audience(&token, sk.verifying_key(), "test-client", true);
+            assert!(r2.is_ok(), "empty JTI skips replay detection");
+        });
+    }
+
+    // ── Barely-expired token (within skew tolerance) ────────────────────
+
+    #[test]
+    fn verify_accepts_token_within_skew_tolerance() {
+        big(|| {
+            let sk = OidcSigningKey::generate();
+            let now = now_secs();
+
+            // exp is 10 seconds ago — within the 30s skew tolerance
+            let claims = IdTokenClaims {
+                iss: "test".into(),
+                sub: Uuid::new_v4().to_string(),
+                aud: "test-client".into(),
+                exp: now - 10,
+                iat: now - 620,
+                nonce: None,
+                auth_time: now - 620,
+                tier: 2,
+                jti: Uuid::new_v4().to_string(),
+            };
+
+            let token = sign_claims_manually(&sk, &claims);
+            let result = verify_id_token_with_audience(
+                &token, sk.verifying_key(), "test-client", true,
+            );
+            assert!(
+                result.is_ok(),
+                "token within 30s skew tolerance should be accepted: {:?}",
+                result.err()
+            );
+        });
+    }
 }

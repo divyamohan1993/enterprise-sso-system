@@ -292,6 +292,7 @@ pub enum ModuleId {
     Kt = 7,
     Risk = 8,
     Audit = 9,
+    Admin = 10,
 }
 
 /// Audit event classification.

@@ -24,6 +24,7 @@ tokio-rustls.workspace = true
 rcgen.workspace = true
 ml-dsa = "0.1.0-rc.7"
 hmac.workspace = true
+hkdf.workspace = true
 subtle.workspace = true
 zeroize = { version = "1", features = ["zeroize_derive"] }
 getrandom = "0.2"

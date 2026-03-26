@@ -19,6 +19,13 @@
 //! | witness_checkpoints| signature           | witness:sig         |
 
 use sqlx::PgPool;
+use zeroize::Zeroize;
+
+/// Version tag prepended to the new envelope format (per-operation DEK).
+const ENVELOPE_V2_TAG: u8 = 0x02;
+
+/// Size of the wrapped DEK blob: wrap_nonce(12) + encrypted_dek(32) + gcm_tag(16) = 60 bytes.
+const WRAPPED_DEK_LEN: usize = 12 + 32 + 16;
 
 /// Envelope-encryption context carried alongside the database pool.
 /// Services that need encrypted storage must initialise this at startup.
@@ -47,49 +54,122 @@ impl EncryptedPool {
     }
 
     /// Encrypt a plaintext value for a specific table/column/row.
-    /// Returns `nonce(12) || ciphertext || tag(16)`.
+    ///
+    /// Uses envelope encryption: a per-operation DEK encrypts the data, then
+    /// the DEK is wrapped (encrypted) with the table KEK.
+    ///
+    /// Wire format (v2):
+    /// `ENVELOPE_V2_TAG(1) || wrap_nonce(12) || wrapped_dek(48) || data_nonce(12) || ciphertext || tag(16)`
     pub fn encrypt_field(&self, table: &str, column: &str, row_id: &[u8], plaintext: &[u8]) -> Vec<u8> {
         use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
         use aes_gcm::aead::Aead;
 
-        let kek = self.table_kek(table);
-        let cipher = Aes256Gcm::new_from_slice(&kek).expect("32-byte key");
+        // Generate per-operation DEK
+        let mut dek = [0u8; 32];
+        getrandom::getrandom(&mut dek).expect("OS entropy: DEK generation");
 
-        let mut nonce_bytes = [0u8; 12];
-        getrandom::getrandom(&mut nonce_bytes).expect("OS entropy");
-        let nonce = Nonce::from_slice(&nonce_bytes);
-
+        // Encrypt plaintext with DEK
+        let dek_cipher = Aes256Gcm::new_from_slice(&dek).expect("32-byte key");
+        let mut data_nonce_bytes = [0u8; 12];
+        getrandom::getrandom(&mut data_nonce_bytes).expect("OS entropy: data nonce");
+        let data_nonce = Nonce::from_slice(&data_nonce_bytes);
         let aad = build_aad(table, column, row_id);
-
-        let ciphertext = cipher
-            .encrypt(nonce, aes_gcm::aead::Payload { msg: plaintext, aad: &aad })
+        let ciphertext = dek_cipher
+            .encrypt(data_nonce, aes_gcm::aead::Payload { msg: plaintext, aad: &aad })
             .expect("AES-256-GCM encryption must not fail with valid key");
 
-        let mut out = Vec::with_capacity(12 + ciphertext.len());
-        out.extend_from_slice(&nonce_bytes);
+        // Wrap DEK with table KEK
+        let kek = self.table_kek(table);
+        let kek_cipher = Aes256Gcm::new_from_slice(&kek).expect("32-byte key");
+        let mut wrap_nonce_bytes = [0u8; 12];
+        getrandom::getrandom(&mut wrap_nonce_bytes).expect("OS entropy: wrap nonce");
+        let wrap_nonce = Nonce::from_slice(&wrap_nonce_bytes);
+        let wrapped_dek = kek_cipher
+            .encrypt(wrap_nonce, aes_gcm::aead::Payload { msg: dek.as_ref(), aad: b"MILNET-KEK-WRAP-v1" })
+            .expect("AES-256-GCM DEK wrap must not fail");
+
+        // Zeroize DEK
+        dek.zeroize();
+
+        // Output: version(1) || wrap_nonce(12) || wrapped_dek(48) || data_nonce(12) || ciphertext+tag
+        let mut out = Vec::with_capacity(1 + 12 + wrapped_dek.len() + 12 + ciphertext.len());
+        out.push(ENVELOPE_V2_TAG);
+        out.extend_from_slice(&wrap_nonce_bytes);
+        out.extend_from_slice(&wrapped_dek);
+        out.extend_from_slice(&data_nonce_bytes);
         out.extend_from_slice(&ciphertext);
         out
     }
 
     /// Decrypt a sealed field value. Returns plaintext or error.
+    ///
+    /// Supports both:
+    /// - V2 envelope format (first byte == `ENVELOPE_V2_TAG`): per-operation DEK
+    /// - Legacy format (any other first byte): direct KEK encryption
     pub fn decrypt_field(&self, table: &str, column: &str, row_id: &[u8], sealed: &[u8]) -> Result<Vec<u8>, String> {
         use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
         use aes_gcm::aead::Aead;
 
-        if sealed.len() < 12 + 16 {
-            return Err("sealed data too short for nonce + tag".into());
+        if sealed.is_empty() {
+            return Err("sealed data is empty".into());
         }
 
-        let kek = self.table_kek(table);
-        let cipher = Aes256Gcm::new_from_slice(&kek).expect("32-byte key");
+        if sealed[0] == ENVELOPE_V2_TAG {
+            // V2 envelope format: version(1) || wrap_nonce(12) || wrapped_dek(48) || data_nonce(12) || ciphertext+tag
+            let min_v2_len = 1 + WRAPPED_DEK_LEN + 12 + 16;
+            if sealed.len() < min_v2_len {
+                return Err("V2 sealed data too short".into());
+            }
 
-        let nonce = Nonce::from_slice(&sealed[..12]);
-        let ciphertext = &sealed[12..];
-        let aad = build_aad(table, column, row_id);
+            // Layout after version byte: wrap_nonce(12) || wrapped_dek(48) || data_nonce(12) || data_ct
+            let rest = &sealed[1..];
+            let wrap_nonce_bytes = &rest[..12];
+            let wrapped_dek_ct = &rest[12..WRAPPED_DEK_LEN];
+            let data_nonce_bytes = &rest[WRAPPED_DEK_LEN..WRAPPED_DEK_LEN + 12];
+            let data_ct = &rest[WRAPPED_DEK_LEN + 12..];
 
-        cipher
-            .decrypt(nonce, aes_gcm::aead::Payload { msg: ciphertext, aad: &aad })
-            .map_err(|_| "AES-256-GCM decryption failed — tampered or wrong key".to_string())
+            // Unwrap DEK
+            let kek = self.table_kek(table);
+            let kek_cipher = Aes256Gcm::new_from_slice(&kek).expect("32-byte key");
+            let wrap_nonce = Nonce::from_slice(wrap_nonce_bytes);
+            let mut dek_bytes = kek_cipher
+                .decrypt(wrap_nonce, aes_gcm::aead::Payload { msg: wrapped_dek_ct, aad: b"MILNET-KEK-WRAP-v1" })
+                .map_err(|_| "DEK unwrap failed — tampered or wrong KEK".to_string())?;
+
+            if dek_bytes.len() != 32 {
+                dek_bytes.zeroize();
+                return Err("unwrapped DEK has wrong length".into());
+            }
+
+            // Decrypt data with DEK
+            let dek_cipher = Aes256Gcm::new_from_slice(&dek_bytes).expect("32-byte key");
+            let data_nonce = Nonce::from_slice(data_nonce_bytes);
+            let aad = build_aad(table, column, row_id);
+            let result = dek_cipher
+                .decrypt(data_nonce, aes_gcm::aead::Payload { msg: data_ct, aad: &aad })
+                .map_err(|_| "AES-256-GCM decryption failed — tampered or wrong key".to_string());
+
+            // Zeroize DEK
+            dek_bytes.zeroize();
+
+            result
+        } else {
+            // Legacy format: nonce(12) || ciphertext || tag(16)
+            if sealed.len() < 12 + 16 {
+                return Err("sealed data too short for nonce + tag".into());
+            }
+
+            let kek = self.table_kek(table);
+            let cipher = Aes256Gcm::new_from_slice(&kek).expect("32-byte key");
+
+            let nonce = Nonce::from_slice(&sealed[..12]);
+            let ciphertext = &sealed[12..];
+            let aad = build_aad(table, column, row_id);
+
+            cipher
+                .decrypt(nonce, aes_gcm::aead::Payload { msg: ciphertext, aad: &aad })
+                .map_err(|_| "AES-256-GCM decryption failed — tampered or wrong key".to_string())
+        }
     }
 
     /// Encrypt an optional field (returns None if input is None).
@@ -113,7 +193,6 @@ impl EncryptedPool {
 
 impl Drop for EncryptedPool {
     fn drop(&mut self) {
-        use zeroize::Zeroize;
         self.master_kek.zeroize();
     }
 }
@@ -362,7 +441,7 @@ fn pii_decrypt_aes256gcm(key: &[u8; 32], blob: &[u8], aad: &[u8]) -> Result<Vec<
 }
 
 /// Standalone encryption engine for testing without a database connection.
-/// Uses the same HKDF + AES-256-GCM logic as EncryptedPool.
+/// Uses the same envelope encryption (per-operation DEK) logic as EncryptedPool.
 pub struct FieldEncryptor {
     master_kek: [u8; 32],
 }
@@ -386,19 +465,39 @@ impl FieldEncryptor {
         use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
         use aes_gcm::aead::Aead;
 
-        let kek = self.table_kek(table);
-        let cipher = Aes256Gcm::new_from_slice(&kek).expect("32-byte key");
-        let mut nonce_bytes = [0u8; 12];
-        getrandom::getrandom(&mut nonce_bytes).expect("OS entropy");
-        let nonce = Nonce::from_slice(&nonce_bytes);
-        let aad = build_aad(table, column, row_id);
+        // Generate per-operation DEK
+        let mut dek = [0u8; 32];
+        getrandom::getrandom(&mut dek).expect("OS entropy: DEK generation");
 
-        let ciphertext = cipher
-            .encrypt(nonce, aes_gcm::aead::Payload { msg: plaintext, aad: &aad })
+        // Encrypt plaintext with DEK
+        let dek_cipher = Aes256Gcm::new_from_slice(&dek).expect("32-byte key");
+        let mut data_nonce_bytes = [0u8; 12];
+        getrandom::getrandom(&mut data_nonce_bytes).expect("OS entropy: data nonce");
+        let data_nonce = Nonce::from_slice(&data_nonce_bytes);
+        let aad = build_aad(table, column, row_id);
+        let ciphertext = dek_cipher
+            .encrypt(data_nonce, aes_gcm::aead::Payload { msg: plaintext, aad: &aad })
             .expect("encryption must not fail");
 
-        let mut out = Vec::with_capacity(12 + ciphertext.len());
-        out.extend_from_slice(&nonce_bytes);
+        // Wrap DEK with table KEK
+        let kek = self.table_kek(table);
+        let kek_cipher = Aes256Gcm::new_from_slice(&kek).expect("32-byte key");
+        let mut wrap_nonce_bytes = [0u8; 12];
+        getrandom::getrandom(&mut wrap_nonce_bytes).expect("OS entropy: wrap nonce");
+        let wrap_nonce = Nonce::from_slice(&wrap_nonce_bytes);
+        let wrapped_dek = kek_cipher
+            .encrypt(wrap_nonce, aes_gcm::aead::Payload { msg: dek.as_ref(), aad: b"MILNET-KEK-WRAP-v1" })
+            .expect("DEK wrap must not fail");
+
+        // Zeroize DEK
+        dek.zeroize();
+
+        // Output: version(1) || wrap_nonce(12) || wrapped_dek(48) || data_nonce(12) || ciphertext+tag
+        let mut out = Vec::with_capacity(1 + 12 + wrapped_dek.len() + 12 + ciphertext.len());
+        out.push(ENVELOPE_V2_TAG);
+        out.extend_from_slice(&wrap_nonce_bytes);
+        out.extend_from_slice(&wrapped_dek);
+        out.extend_from_slice(&data_nonce_bytes);
         out.extend_from_slice(&ciphertext);
         out
     }
@@ -407,23 +506,67 @@ impl FieldEncryptor {
         use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
         use aes_gcm::aead::Aead;
 
-        if sealed.len() < 12 + 16 {
-            return Err("sealed data too short".into());
+        if sealed.is_empty() {
+            return Err("sealed data is empty".into());
         }
-        let kek = self.table_kek(table);
-        let cipher = Aes256Gcm::new_from_slice(&kek).expect("32-byte key");
-        let nonce = Nonce::from_slice(&sealed[..12]);
-        let aad = build_aad(table, column, row_id);
 
-        cipher
-            .decrypt(nonce, aes_gcm::aead::Payload { msg: &sealed[12..], aad: &aad })
-            .map_err(|_| "decryption failed".to_string())
+        if sealed[0] == ENVELOPE_V2_TAG {
+            // V2 envelope format
+            let min_v2_len = 1 + WRAPPED_DEK_LEN + 12 + 16;
+            if sealed.len() < min_v2_len {
+                return Err("V2 sealed data too short".into());
+            }
+
+            let rest = &sealed[1..];
+            let wrap_nonce_bytes = &rest[..12];
+            let wrapped_dek_ct = &rest[12..WRAPPED_DEK_LEN];
+            let data_nonce_bytes = &rest[WRAPPED_DEK_LEN..WRAPPED_DEK_LEN + 12];
+            let data_ct = &rest[WRAPPED_DEK_LEN + 12..];
+
+            // Unwrap DEK
+            let kek = self.table_kek(table);
+            let kek_cipher = Aes256Gcm::new_from_slice(&kek).expect("32-byte key");
+            let wrap_nonce = Nonce::from_slice(wrap_nonce_bytes);
+            let mut dek_bytes = kek_cipher
+                .decrypt(wrap_nonce, aes_gcm::aead::Payload { msg: wrapped_dek_ct, aad: b"MILNET-KEK-WRAP-v1" })
+                .map_err(|_| "DEK unwrap failed".to_string())?;
+
+            if dek_bytes.len() != 32 {
+                dek_bytes.zeroize();
+                return Err("unwrapped DEK has wrong length".into());
+            }
+
+            // Decrypt data with DEK
+            let dek_cipher = Aes256Gcm::new_from_slice(&dek_bytes).expect("32-byte key");
+            let data_nonce = Nonce::from_slice(data_nonce_bytes);
+            let aad = build_aad(table, column, row_id);
+            let result = dek_cipher
+                .decrypt(data_nonce, aes_gcm::aead::Payload { msg: data_ct, aad: &aad })
+                .map_err(|_| "decryption failed".to_string());
+
+            // Zeroize DEK
+            dek_bytes.zeroize();
+
+            result
+        } else {
+            // Legacy format: nonce(12) || ciphertext || tag(16)
+            if sealed.len() < 12 + 16 {
+                return Err("sealed data too short".into());
+            }
+            let kek = self.table_kek(table);
+            let cipher = Aes256Gcm::new_from_slice(&kek).expect("32-byte key");
+            let nonce = Nonce::from_slice(&sealed[..12]);
+            let aad = build_aad(table, column, row_id);
+
+            cipher
+                .decrypt(nonce, aes_gcm::aead::Payload { msg: &sealed[12..], aad: &aad })
+                .map_err(|_| "decryption failed".to_string())
+        }
     }
 }
 
 impl Drop for FieldEncryptor {
     fn drop(&mut self) {
-        use zeroize::Zeroize;
         self.master_kek.zeroize();
     }
 }
@@ -461,7 +604,10 @@ mod tests {
 
         let sealed = enc.encrypt_field("users", "opaque_registration", row_id, plaintext);
         assert_ne!(&sealed, plaintext.as_slice());
-        assert!(sealed.len() >= 12 + plaintext.len() + 16);
+        // V2 format: version(1) + wrap_nonce(12) + wrapped_dek(48) + data_nonce(12) + plaintext + tag(16)
+        assert!(sealed.len() >= 1 + 60 + 12 + plaintext.len() + 16);
+        // First byte must be the V2 tag
+        assert_eq!(sealed[0], ENVELOPE_V2_TAG);
 
         let decrypted = enc.decrypt_field("users", "opaque_registration", row_id, &sealed).unwrap();
         assert_eq!(&decrypted, plaintext);
@@ -526,6 +672,69 @@ mod tests {
         assert_ne!(k1, k2);
         assert_ne!(k1, k3);
         assert_ne!(k2, k3);
+    }
+
+    // ── V2 envelope encryption hardening tests ──
+
+    #[test]
+    fn encrypt_decrypt_v2_roundtrip_multiple_fields() {
+        let enc = FieldEncryptor::new([0x42; 32]);
+        for i in 0..10 {
+            let data = format!("sensitive-data-{}", i);
+            let row_id = format!("row-{}", i);
+            let ct = enc.encrypt_field("users", "opaque", row_id.as_bytes(), data.as_bytes());
+            assert_eq!(ct[0], 0x02, "must use V2 envelope tag");
+            let pt = enc.decrypt_field("users", "opaque", row_id.as_bytes(), &ct).unwrap();
+            assert_eq!(pt, data.as_bytes());
+        }
+    }
+
+    #[test]
+    fn encrypt_different_plaintext_produces_different_ciphertext() {
+        let enc = FieldEncryptor::new([0x42; 32]);
+        let ct1 = enc.encrypt_field("users", "opaque", b"r1", b"data-a");
+        let ct2 = enc.encrypt_field("users", "opaque", b"r1", b"data-b");
+        assert_ne!(ct1, ct2);
+    }
+
+    #[test]
+    fn encrypt_same_plaintext_produces_different_ciphertext_random_dek() {
+        // Random DEK + random nonce = different ciphertext each time
+        let enc = FieldEncryptor::new([0x42; 32]);
+        let ct1 = enc.encrypt_field("users", "opaque", b"r1", b"same data");
+        let ct2 = enc.encrypt_field("users", "opaque", b"r1", b"same data");
+        assert_ne!(ct1, ct2, "same plaintext must produce different ciphertext (random DEK)");
+    }
+
+    #[test]
+    fn decrypt_with_wrong_kek_fails() {
+        let enc1 = FieldEncryptor::new([0x42; 32]);
+        let enc2 = FieldEncryptor::new([0x43; 32]);
+        let ct = enc1.encrypt_field("users", "opaque", b"r1", b"secret");
+        let result = enc2.decrypt_field("users", "opaque", b"r1", &ct);
+        assert!(result.is_err(), "wrong KEK must fail decryption");
+    }
+
+    #[test]
+    fn decrypt_truncated_v2_ciphertext_fails() {
+        let enc = FieldEncryptor::new([0x42; 32]);
+        let ct = enc.encrypt_field("users", "opaque", b"r1", b"data");
+        // Truncate to just the tag + wrap_nonce (13 bytes)
+        let truncated = &ct[..13];
+        let result = enc.decrypt_field("users", "opaque", b"r1", truncated);
+        assert!(result.is_err(), "truncated ciphertext must fail");
+    }
+
+    #[test]
+    fn decrypt_corrupted_wrapped_dek_fails() {
+        let enc = FieldEncryptor::new([0x42; 32]);
+        let mut ct = enc.encrypt_field("users", "opaque", b"r1", b"data");
+        // Corrupt a byte in the wrapped DEK region (bytes 13..61)
+        if ct.len() > 20 {
+            ct[15] ^= 0xFF;
+        }
+        let result = enc.decrypt_field("users", "opaque", b"r1", &ct);
+        assert!(result.is_err(), "corrupted wrapped DEK must fail");
     }
 
     // ── PII encryption enforcement tests ──

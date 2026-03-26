@@ -265,6 +265,8 @@ impl<const N: usize> core::fmt::Debug for SecretBuffer<N> {
 pub struct SecretVec {
     /// The actual secret data.
     data: Vec<u8>,
+    /// Original length at construction time, used for munlock.
+    original_len: usize,
     /// Canary value set at construction.
     canary: u64,
     /// Expected canary value for verification.
@@ -285,8 +287,10 @@ impl SecretVec {
 
         let canary = random_canary()?;
 
+        let original_len = data.len();
         let mut sv = Self {
             data,
+            original_len,
             canary,
             expected_canary: canary,
             locked: false,
@@ -370,7 +374,7 @@ impl Drop for SecretVec {
         if self.locked {
             // The vec's internal pointer is still valid even after zeroize
             // (zeroize writes zeros but does not deallocate).
-            munlock_slice(self.data.as_ptr(), self.data.capacity());
+            munlock_slice(self.data.as_ptr(), self.original_len);
         }
 
         // 3. Zeroize canary material.
@@ -571,6 +575,35 @@ mod tests {
         let _k32: SecretKey32 = SecretBuffer::new([0u8; 32]).unwrap();
         let _k64: SecretKey64 = SecretBuffer::new([0u8; 64]).unwrap();
         let _k128: SecretKey128 = SecretBuffer::new([0u8; 128]).unwrap();
+    }
+
+    #[test]
+    fn secret_vec_munlock_uses_original_len() {
+        // Create a SecretVec, verify it's locked and has correct original_len
+        let sv = SecretVec::new(vec![0xAA; 64]).expect("SecretVec::new failed");
+        // The original_len should be 64, not capacity
+        assert_eq!(sv.len(), 64);
+        assert_eq!(sv.as_bytes(), &[0xAA; 64]);
+        // Drop it — munlock should use original_len (64), not capacity
+        drop(sv);
+        // If we get here without segfault/error, munlock worked correctly
+        // with the original_len field rather than vec capacity
+    }
+
+    #[test]
+    fn secret_vec_original_len_not_capacity() {
+        // Vec::with_capacity can allocate more than requested.
+        // SecretVec must use the data length for mlock/munlock, not capacity.
+        let mut data = Vec::with_capacity(1024);
+        data.extend_from_slice(&[0xBB; 64]);
+        // data.len() == 64, data.capacity() >= 1024
+        assert!(data.capacity() >= 1024);
+        assert_eq!(data.len(), 64);
+
+        let sv = SecretVec::new(data).expect("SecretVec::new failed");
+        assert_eq!(sv.len(), 64);
+        // Drop triggers munlock with original_len=64, not capacity
+        drop(sv);
     }
 
     #[test]

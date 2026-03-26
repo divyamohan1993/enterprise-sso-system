@@ -128,18 +128,11 @@ fn test_token_future_iat_suspicious() {
         )
         .unwrap();
 
-        // The verifier enforces: `exp` must be in the future AND `iat` must not
-        // be in the future. A token with iat > now should fail.
+        // The verifier MUST reject tokens with iat far in the future.
+        // A token with iat set 1 year ahead is clearly malicious (clock
+        // manipulation attack). The verifier checks `iat ≤ now`.
         let result = verify_token(&token, &group_key, &pq_vk);
-        // Either the token is rejected outright (err) or accepted (but we flag
-        // it as a concern). In this codebase the verifier checks `iat ≤ now`;
-        // if the implementation allows future iat, the test records the concern.
-        let concern = result.is_err() || {
-            // Token passed; check that iat is indeed in the future — which is
-            // concerning. The test asserts the concern is detectable.
-            claims.iat > now_us()
-        };
-        assert!(concern, "future IAT must be detectable as suspicious");
+        assert!(result.is_err(), "verifier must reject tokens with future iat");
     });
 }
 

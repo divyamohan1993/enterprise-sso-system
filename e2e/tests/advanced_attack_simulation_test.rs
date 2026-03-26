@@ -612,8 +612,8 @@ fn test_ratchet_state_manipulation() {
     let mut epoch_tags: Vec<[u8; 64]> = Vec::new();
     let mut epoch_keys: Vec<[u8; 64]> = Vec::new();
     for i in 0u8..5 {
-        let tag = ratchet.generate_tag(test_claims);
-        let key = ratchet.current_key();
+        let tag = ratchet.generate_tag(test_claims).unwrap();
+        let key = ratchet.current_key().unwrap();
         epoch_tags.push(tag);
         epoch_keys.push(key);
 
@@ -628,8 +628,8 @@ fn test_ratchet_state_manipulation() {
     }
 
     // Capture current state (epoch 5)
-    let current_tag = ratchet.generate_tag(test_claims);
-    let current_key = ratchet.current_key();
+    let current_tag = ratchet.generate_tag(test_claims).unwrap();
+    let current_key = ratchet.current_key().unwrap();
 
     // Verify all past tags differ from current (ratchet produces unique tags)
     for (i, past_tag) in epoch_tags.iter().enumerate() {
@@ -662,7 +662,7 @@ fn test_ratchet_state_manipulation() {
     // Forward secrecy test: create a NEW ratchet from the current key.
     // It must NOT be able to reproduce past tags.
     let reconstructed = RatchetChain::new(&current_key).unwrap();
-    let reconstructed_tag = reconstructed.generate_tag(test_claims);
+    let reconstructed_tag = reconstructed.generate_tag(test_claims).unwrap();
 
     // The reconstructed chain from the current key must not produce any past tag
     for (i, past_tag) in epoch_tags.iter().enumerate() {
@@ -1056,8 +1056,8 @@ fn test_memory_scraping_resistance() {
     let initial_key = [0x55u8; 64];
     let mut ratchet = RatchetChain::new(&initial_key).unwrap();
     let test_claims = b"memory-scraping-test-claims";
-    let epoch0_tag = ratchet.generate_tag(test_claims);
-    let epoch0_key = ratchet.current_key();
+    let epoch0_tag = ratchet.generate_tag(test_claims).unwrap();
+    let epoch0_key = ratchet.current_key().unwrap();
     let mut c_ent = [0u8; 32];
     getrandom::getrandom(&mut c_ent).unwrap();
     let mut s_ent = [0u8; 32];
@@ -1065,8 +1065,8 @@ fn test_memory_scraping_resistance() {
     let mut nonce = [0u8; 32];
     getrandom::getrandom(&mut nonce).unwrap();
     ratchet.advance(&c_ent, &s_ent, &nonce).unwrap();
-    let epoch1_tag = ratchet.generate_tag(test_claims);
-    let epoch1_key = ratchet.current_key();
+    let epoch1_tag = ratchet.generate_tag(test_claims).unwrap();
+    let epoch1_key = ratchet.current_key().unwrap();
 
     // The ratchet must have advanced — old tag/key is not current
     assert_ne!(
@@ -1079,7 +1079,7 @@ fn test_memory_scraping_resistance() {
     );
 
     // After advance, requesting generate_tag again must return epoch1's tag, not epoch0's
-    let check_tag = ratchet.generate_tag(test_claims);
+    let check_tag = ratchet.generate_tag(test_claims).unwrap();
     assert_eq!(
         check_tag, epoch1_tag,
         "ratchet must consistently return current epoch tag, not a stale one"

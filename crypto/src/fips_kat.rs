@@ -229,14 +229,10 @@ fn kat_hkdf_sha512() -> Result<(), String> {
         0x68, 0xe4,
     ];
     if okm1[..16] != expected_prefix {
-        // If the prefix doesn't match, we still pass since HKDF-SHA512
-        // test vectors vary by implementation. The determinism check above
-        // is the primary validation.
-        tracing::warn!(
-            "FIPS KAT: HKDF-SHA512 output prefix differs from reference (may be acceptable). \
-             Got {:02x?}",
-            &okm1[..16]
-        );
+        return Err(format!(
+            "HKDF-SHA512 KAT: output prefix mismatch. Got {:02x?}, expected {:02x?}",
+            &okm1[..16], &expected_prefix
+        ));
     }
 
     tracing::info!("FIPS KAT: HKDF-SHA512 PASSED");
@@ -289,6 +285,25 @@ fn kat_ml_kem_1024() -> Result<(), String> {
     // Verify shared secret is non-zero
     if ss_enc.as_slice().iter().all(|&b| b == 0) {
         return Err("ML-KEM-1024 KAT: shared secret is all zeros".into());
+    }
+
+    // Verify shared secret length is 32 bytes (ML-KEM-1024 spec)
+    if ss_enc.as_slice().len() != 32 {
+        return Err(format!(
+            "ML-KEM-1024 KAT: shared secret length is {}, expected 32",
+            ss_enc.as_slice().len()
+        ));
+    }
+
+    // Verify implicit rejection: decapsulating with a different key must produce
+    // a DIFFERENT shared secret (ML-KEM uses implicit rejection, not an error).
+    let (dk_wrong, _ek_wrong) = MlKem1024::generate(&mut rng);
+    let ss_wrong = dk_wrong
+        .decapsulate(&ct)
+        .map_err(|_| "ML-KEM-1024 KAT: wrong-key decapsulation failed unexpectedly".to_string())?;
+
+    if ss_wrong.as_slice() == ss_enc.as_slice() {
+        return Err("ML-KEM-1024 KAT: wrong key produced same shared secret (implicit rejection broken)".into());
     }
 
     tracing::info!("FIPS KAT: ML-KEM-1024 PASSED");
@@ -501,22 +516,46 @@ fn kat_aegis256() -> Result<(), String> {
         return Err("AEGIS-256 KAT: decrypted plaintext does not match original".into());
     }
 
+    // Determinism check: same key + same plaintext + same nonce must produce same ciphertext
+    let sealed2 = encrypt_with(SymmetricAlgorithm::Aegis256, &key, plaintext, aad)
+        .map_err(|e| format!("AEGIS-256 KAT: second encryption failed: {}", e))?;
+    // Note: AEGIS-256 uses random nonces, so sealed != sealed2 is expected.
+    // But both must decrypt to the same plaintext.
+    let decrypted2 = decrypt(&key, &sealed2, aad)
+        .map_err(|e| format!("AEGIS-256 KAT: second decryption failed: {}", e))?;
+    if decrypted2 != plaintext {
+        return Err("AEGIS-256 KAT: second roundtrip mismatch".into());
+    }
+
+    // Wrong key must fail decryption
+    let mut wrong_key = key;
+    wrong_key[0] ^= 0xFF;
+    if decrypt(&wrong_key, &sealed, aad).is_ok() {
+        return Err("AEGIS-256 KAT: decryption succeeded with wrong key".into());
+    }
+
     tracing::info!("FIPS KAT: AEGIS-256 PASSED");
     Ok(())
 }
 
-/// KAT: ML-DSA-87 sign/verify roundtrip.
+/// KAT: ML-DSA-87 sign/verify with fixed seed (deterministic).
 ///
-/// Since ML-DSA uses randomized signing, we verify the roundtrip property:
-/// verify(sign(msg, sk), msg, vk) succeeds.
+/// Uses a hardcoded seed for deterministic keypair generation, signs a fixed
+/// message, verifies the signature, and checks that the same seed always
+/// produces compatible keys.
 fn kat_ml_dsa_87() -> Result<(), String> {
     use ml_dsa::{
         signature::{Signer, Verifier},
         KeyGen, MlDsa87,
     };
 
-    let mut seed = [0u8; 32];
-    getrandom::getrandom(&mut seed).map_err(|e| format!("ML-DSA-87 KAT: getrandom failed: {}", e))?;
+    // Fixed KAT seed — deterministic keypair generation
+    let seed: [u8; 32] = [
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+        0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+        0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+    ];
 
     let kp = MlDsa87::from_seed(&seed.into());
     let sk = kp.signing_key();
@@ -525,16 +564,24 @@ fn kat_ml_dsa_87() -> Result<(), String> {
     let test_message = b"FIPS 140-3 ML-DSA-87 known-answer test message";
     let sig: ml_dsa::Signature<MlDsa87> = sk.sign(test_message);
 
+    // Verify signature is valid
     vk.verify(test_message, &sig)
         .map_err(|_| "ML-DSA-87 KAT: signature verification failed".to_string())?;
 
     // Verify wrong message is rejected
-    let wrong_msg = b"tampered message";
-    if vk.verify(wrong_msg, &sig).is_ok() {
+    if vk.verify(b"tampered message", &sig).is_ok() {
         return Err("ML-DSA-87 KAT: verification succeeded for wrong message".into());
     }
 
-    tracing::info!("FIPS KAT: ML-DSA-87 PASSED");
+    // Verify determinism: same seed must produce same keypair
+    let kp2 = MlDsa87::from_seed(&seed.into());
+    let _vk2 = kp2.verifying_key();
+    let sig2: ml_dsa::Signature<MlDsa87> = kp2.signing_key().sign(test_message);
+
+    vk.verify(test_message, &sig2)
+        .map_err(|_| "ML-DSA-87 KAT: determinism check failed — same seed produced incompatible keys".to_string())?;
+
+    tracing::info!("FIPS KAT: ML-DSA-87 PASSED (fixed-seed deterministic)");
     Ok(())
 }
 

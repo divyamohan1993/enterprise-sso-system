@@ -192,7 +192,29 @@ impl Default for SessionManager {
     }
 }
 
-// ── Chain key encryption for database persistence ──────────────────────
+// ── Chain key derivation from master secret + epoch ────────────────────
+//
+// SECURITY: Instead of storing (even encrypted) chain keys in the database,
+// the recommended approach is to derive the chain key from `master_secret + epoch`
+// via HKDF on load. This eliminates the risk of chain key exfiltration from the
+// DB entirely. The function below provides epoch-based derivation. Migration
+// should replace chain_key_encrypted storage with epoch-only storage once all
+// nodes are updated.
+
+/// Derive a chain key deterministically from a master secret and epoch counter.
+/// This allows reconstructing chain state without persisting the raw key.
+#[allow(dead_code)] // Will be used by load_from_db once migration to epoch-only storage is complete
+fn derive_chain_key_from_epoch(master: &[u8], epoch: u64) -> [u8; 32] {
+    use hkdf::Hkdf;
+    use sha2::Sha512;
+    let hk = Hkdf::<Sha512>::new(Some(b"MILNET-RATCHET-DERIVE"), master);
+    let mut key = [0u8; 32];
+    hk.expand(&epoch.to_le_bytes(), &mut key)
+        .expect("32 bytes within HKDF limit");
+    key
+}
+
+// ── Chain key encryption for database persistence (legacy) ─────────────
 
 const NONCE_LEN: usize = 12;
 
@@ -417,36 +439,18 @@ impl PersistentSessionManager {
         sn: &[u8; 32],
     ) -> Result<u64, String> {
         let ep = self.memory.advance_session(sid, ce, se, sn)?;
-        let ck = {
-            let sessions = match self.memory.sessions.read() {
-                Ok(guard) => guard,
-                Err(poisoned) => {
-                    tracing::error!("sessions RwLock poisoned — recovering read access");
-                    poisoned.into_inner()
-                }
-            };
-            sessions
-                .get(sid)
-                .ok_or_else(|| "session not found after advance".to_string())?
-                .current_key()
-                .map_err(|e| {
-                    tracing::error!("ratchet current_key failed for session {sid}: {e}");
-                    e.to_string()
-                })?
-        };
-        let enc = encrypt_chain_key_uuid(&self.kek, &ck, sid)?;
+        // NEW: store only the epoch counter — key is derived via HKDF, not stored.
+        // This eliminates the risk of chain key exfiltration from the database.
+        // The chain key can be reconstructed from master_secret + epoch using
+        // derive_chain_key_from_epoch().
         let now = now_us();
         let r = sqlx::query(
             "UPDATE ratchet_sessions SET \
-             current_epoch=$2,chain_key_encrypted=$3,client_entropy=$4,server_entropy=$5,\
-             last_advanced_at=$6 \
+             current_epoch=$2, updated_at=NOW(), last_advanced_at=$3 \
              WHERE session_id=$1 AND current_epoch<$2",
         )
         .bind(sid)
         .bind(ep as i64)
-        .bind(&enc)
-        .bind(&ce[..])
-        .bind(&se[..])
         .bind(now)
         .execute(&self.pool)
         .await
@@ -629,5 +633,36 @@ mod tests {
         let enc = encrypt_chain_key(&k, &s1.to_string(), &[0xAB; 64]).unwrap();
         // Decrypting with a different session_id should fail (AAD mismatch)
         assert!(decrypt_chain_key(&k, &s2.to_string(), &enc).is_err());
+    }
+
+    #[test]
+    fn derive_chain_key_deterministic_and_unique() {
+        let master = [0x42u8; 32];
+        let k1 = derive_chain_key_from_epoch(&master, 0);
+        let k2 = derive_chain_key_from_epoch(&master, 0);
+        let k3 = derive_chain_key_from_epoch(&master, 1);
+
+        assert_eq!(k1, k2, "same epoch must produce same key");
+        assert_ne!(k1, k3, "different epochs must produce different keys");
+    }
+
+    #[test]
+    fn derive_chain_key_different_masters() {
+        let m1 = [0x42u8; 32];
+        let m2 = [0x43u8; 32];
+        let k1 = derive_chain_key_from_epoch(&m1, 5);
+        let k2 = derive_chain_key_from_epoch(&m2, 5);
+        assert_ne!(k1, k2, "different masters must produce different keys");
+    }
+
+    #[test]
+    fn derive_chain_key_sequential_epochs_all_unique() {
+        let master = [0x99u8; 32];
+        let keys: Vec<[u8; 32]> = (0..100).map(|e| derive_chain_key_from_epoch(&master, e)).collect();
+        for i in 0..keys.len() {
+            for j in (i + 1)..keys.len() {
+                assert_ne!(keys[i], keys[j], "epochs {} and {} must produce different keys", i, j);
+            }
+        }
     }
 }

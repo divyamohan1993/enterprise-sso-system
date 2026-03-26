@@ -176,16 +176,27 @@ fn test_consumed_puzzles_capacity() {
 
     // After eviction the set must be smaller than or equal to MAX_CONSUMED_ENTRIES.
     // The evict_oldest removes 10% (10 000 entries) when full.
-    let count_after = {
-        // We can't inspect the field directly, but `is_consumed` is public.
-        // Check that the entry we just inserted IS tracked (not spuriously evicted).
-        assert!(
-            tracker.is_consumed(&extra),
-            "the most recently inserted puzzle must still be tracked after eviction"
-        );
-        // Count by probing: the exact count is an implementation detail;
-        // the important invariant is that the tracker accepted the insert.
-        true
-    };
-    assert!(count_after, "consumed puzzles must handle capacity gracefully");
+
+    // The most recently inserted entry must still be tracked (not spuriously evicted).
+    assert!(
+        tracker.is_consumed(&extra),
+        "the most recently inserted puzzle must still be tracked after eviction"
+    );
+
+    // Verify eviction actually occurred: probe a range of the earliest entries.
+    // After inserting 100_001 entries with a 100_000 cap and 10% eviction,
+    // the oldest 10_000 entries should have been evicted.
+    let mut evicted_count = 0u32;
+    for i in 0u32..10_000 {
+        let mut nonce = [0u8; 32];
+        nonce[..4].copy_from_slice(&i.to_le_bytes());
+        if !tracker.is_consumed(&nonce) {
+            evicted_count += 1;
+        }
+    }
+    assert!(
+        evicted_count > 0,
+        "eviction must have removed at least some of the oldest entries (found {} evicted out of first 10000)",
+        evicted_count
+    );
 }

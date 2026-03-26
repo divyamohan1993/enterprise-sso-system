@@ -8,6 +8,7 @@
 //! - Bound to device fingerprint for additional security
 
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 /// Session state for distributed storage.
@@ -147,16 +148,48 @@ impl DistributedSessionStore {
     }
 
     /// Get a session by ID. Returns None if expired or terminated.
+    /// This is a convenience wrapper around `get_session_bound` with no device fingerprint check.
     pub fn get_session(&self, session_id: &Uuid) -> Option<&DistributedSession> {
+        self.get_session_bound(session_id, None)
+    }
+
+    /// Get a session, enforcing device binding and expiry.
+    /// `requesting_device_fingerprint` is the fingerprint of the device making the request.
+    /// If provided, it MUST match the session's stored fingerprint.
+    pub fn get_session_bound(
+        &self,
+        session_id: &Uuid,
+        requesting_device_fingerprint: Option<&[u8; 32]>,
+    ) -> Option<&DistributedSession> {
         let session = self.sessions.get(session_id)?;
-        let now = now_us();
-        if session.terminated || session.expires_at <= now {
+
+        // Check termination
+        if session.terminated {
             return None;
         }
+
+        // Check expiry
+        let now = now_us();
+        if session.expires_at <= now {
+            return None;
+        }
+
+        // Enforce device binding — session MUST be used from the same device
+        if let Some(requesting_fp) = requesting_device_fingerprint {
+            if session.device_fingerprint.ct_eq(requesting_fp).unwrap_u8() == 0 {
+                tracing::warn!(
+                    session_id = %session_id,
+                    "SECURITY: device fingerprint mismatch — possible session theft"
+                );
+                return None;
+            }
+        }
+
         // Check idle timeout
         if now - session.last_activity > self.config.idle_timeout_us {
             return None;
         }
+
         Some(session)
     }
 
@@ -242,6 +275,71 @@ impl DistributedSessionStore {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Persist a session to PostgreSQL for cross-node replication.
+    /// Called after create_session to ensure durability.
+    #[cfg(feature = "persistence")]
+    pub async fn persist_session(
+        &self,
+        pool: &sqlx::PgPool,
+        session: &DistributedSession,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO distributed_sessions \
+             (session_id, user_id, tier, device_fingerprint, created_at, expires_at, last_activity, terminated) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+             ON CONFLICT (session_id) DO UPDATE SET \
+             last_activity = $7, terminated = $8"
+        )
+        .bind(session.session_id)
+        .bind(session.user_id)
+        .bind(session.tier as i16)
+        .bind(&session.device_fingerprint[..])
+        .bind(session.created_at)
+        .bind(session.expires_at)
+        .bind(session.last_activity)
+        .bind(session.terminated)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Load a session from PostgreSQL (fallback when not in local cache).
+    #[cfg(feature = "persistence")]
+    pub async fn load_session(
+        &self,
+        pool: &sqlx::PgPool,
+        session_id: &Uuid,
+    ) -> Result<Option<DistributedSession>, sqlx::Error> {
+        let row: Option<(
+            Uuid, Uuid, i16, Vec<u8>, i64, i64, i64, bool,
+        )> = sqlx::query_as(
+            "SELECT session_id, user_id, tier, device_fingerprint, created_at, expires_at, last_activity, terminated \
+             FROM distributed_sessions WHERE session_id = $1"
+        )
+        .bind(session_id)
+        .fetch_optional(pool)
+        .await?;
+
+        Ok(row.map(|(session_id, user_id, tier, fp_vec, created_at, expires_at, last_activity, terminated)| {
+            let mut device_fingerprint = [0u8; 32];
+            let copy_len = fp_vec.len().min(32);
+            device_fingerprint[..copy_len].copy_from_slice(&fp_vec[..copy_len]);
+            DistributedSession {
+                session_id,
+                user_id,
+                tier: tier as u8,
+                created_at,
+                expires_at,
+                last_activity,
+                ratchet_epoch: 0,
+                encrypted_chain_key: Vec::new(),
+                device_fingerprint,
+                classification: 0,
+                terminated,
+            }
+        }))
     }
 }
 
@@ -674,5 +772,78 @@ mod tests {
         assert_eq!(config.max_sessions_per_user, 5);
         assert_eq!(config.cleanup_interval_secs, 60);
         assert_eq!(config.idle_timeout_us, 30 * 60 * 1_000_000);
+    }
+
+    // ── Device fingerprint enforcement tests ────────────────────────────
+
+    #[test]
+    fn get_session_bound_rejects_wrong_device() {
+        let mut store = make_store();
+        let user_id = Uuid::new_v4();
+        let device_fp = [0xAAu8; 32];
+        let wrong_fp = [0xBBu8; 32];
+
+        let session_id = store
+            .create_session(user_id, 2, device_fp, b"chain-key", 1)
+            .unwrap();
+
+        // Correct device should work
+        let s = store.get_session_bound(&session_id, Some(&device_fp));
+        assert!(s.is_some(), "correct device fingerprint must be accepted");
+
+        // Wrong device should be rejected
+        let s = store.get_session_bound(&session_id, Some(&wrong_fp));
+        assert!(s.is_none(), "wrong device fingerprint must be rejected");
+    }
+
+    #[test]
+    fn get_session_bound_allows_none_fingerprint() {
+        // When no fingerprint is provided, session should still work (backwards compat)
+        let mut store = make_store();
+        let user_id = Uuid::new_v4();
+
+        let session_id = store
+            .create_session(user_id, 2, [0xAAu8; 32], b"chain-key", 1)
+            .unwrap();
+
+        let s = store.get_session_bound(&session_id, None);
+        assert!(s.is_some(), "None fingerprint must be accepted for backwards compatibility");
+    }
+
+    #[test]
+    fn get_session_bound_rejects_subtle_fingerprint_difference() {
+        // Even a single bit difference in the fingerprint must be rejected
+        let mut store = make_store();
+        let user_id = Uuid::new_v4();
+        let device_fp = [0xAAu8; 32];
+        let mut almost_right_fp = device_fp;
+        almost_right_fp[31] ^= 0x01; // flip one bit
+
+        let session_id = store
+            .create_session(user_id, 2, device_fp, b"chain-key", 1)
+            .unwrap();
+
+        let s = store.get_session_bound(&session_id, Some(&almost_right_fp));
+        assert!(
+            s.is_none(),
+            "fingerprint differing by a single bit must be rejected"
+        );
+    }
+
+    #[test]
+    fn terminated_session_rejected_even_with_correct_fingerprint() {
+        let mut store = make_store();
+        let user_id = Uuid::new_v4();
+        let device_fp = [0xAAu8; 32];
+
+        let session_id = store
+            .create_session(user_id, 2, device_fp, b"chain-key", 1)
+            .unwrap();
+
+        store.terminate_session(&session_id);
+
+        // Even correct fingerprint should not resurrect a terminated session
+        let s = store.get_session_bound(&session_id, Some(&device_fp));
+        assert!(s.is_none(), "terminated session must not be accessible");
     }
 }

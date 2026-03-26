@@ -201,7 +201,7 @@ impl HsmBackend {
 /// Loaded from environment variables or a configuration file at startup.
 /// Sensitive fields (PIN, credentials) must be loaded securely — never
 /// hardcoded or logged.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HsmConfig {
     /// Which HSM backend to use.
     pub backend: HsmBackend,
@@ -238,6 +238,20 @@ pub struct HsmConfig {
     /// Software fallback seed (hex-encoded). Only used when `backend == Software`.
     /// If not provided, falls back to env var MILNET_MASTER_KEK.
     pub software_seed: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for HsmConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HsmConfig")
+            .field("backend", &self.backend)
+            .field("pkcs11_library_path", &self.pkcs11_library_path)
+            .field("pkcs11_slot", &self.pkcs11_slot)
+            .field("pkcs11_pin", &"[REDACTED]")
+            .field("aws_kms_key_id", &self.aws_kms_key_id)
+            .field("aws_kms_region", &self.aws_kms_region)
+            .field("tpm2_device", &self.tpm2_device)
+            .finish()
+    }
 }
 
 impl Default for HsmConfig {
@@ -635,6 +649,12 @@ impl Pkcs11Session {
     /// deterministically so that the same credentials always produce the
     /// same root, enabling persistent key storage.
     fn derive_root_key(library_path: &str, slot: u64, pin: &str) -> [u8; 32] {
+        tracing::warn!(
+            "SECURITY: PKCS#11 backend is a SOFTWARE SIMULATION. \
+             No real HSM is being used. Key material exists in process memory. \
+             This does NOT provide hardware key protection."
+        );
+
         // Build the IKM from all session-binding parameters
         let mut ikm = Vec::with_capacity(library_path.len() + 8 + pin.len());
         ikm.extend_from_slice(library_path.as_bytes());
@@ -824,6 +844,12 @@ impl AwsKmsSession {
     /// root DEK from KMS. Here we derive deterministically from the key ARN
     /// so that the same configuration always produces the same root.
     fn derive_root_key(key_id: &str, region: &str) -> [u8; 32] {
+        tracing::warn!(
+            "SECURITY: AWS KMS backend is a SOFTWARE SIMULATION. \
+             No real KMS calls are being made. Key material exists in process memory. \
+             This does NOT provide AWS KMS hardware key protection."
+        );
+
         let mut ikm = Vec::with_capacity(key_id.len() + region.len());
         ikm.extend_from_slice(key_id.as_bytes());
         ikm.extend_from_slice(region.as_bytes());
@@ -1057,6 +1083,12 @@ impl Tpm2Session {
     /// 2. Storage key is derived from SRK + PCR policy digest
     /// 3. All application keys are sealed under the storage key
     fn derive_root_key(device: &str, pcr_digest: &[u8; 32]) -> [u8; 32] {
+        tracing::warn!(
+            "SECURITY: TPM 2.0 backend is a SOFTWARE SIMULATION. \
+             No real TPM hardware is being used. Key material exists in process memory. \
+             This does NOT provide TPM hardware key protection."
+        );
+
         let mut ikm = Vec::with_capacity(device.len() + 32);
         ikm.extend_from_slice(device.as_bytes());
         ikm.extend_from_slice(pcr_digest);
@@ -1375,16 +1407,15 @@ impl HsmKeyManager {
                 BackendState::Tpm2(session)
             }
             HsmBackend::Software => {
-                let seed = config
-                    .software_seed
-                    .as_deref()
-                    .unwrap_or_else(|| {
-                        if std::env::var("MILNET_PRODUCTION").is_ok() {
-                            panic!("FATAL: No master KEK seed configured in PRODUCTION mode. Set MILNET_MASTER_KEK or provide software_seed");
-                        }
-                        eprintln!("SECURITY WARNING: Using deterministic dev seed. NOT FOR PRODUCTION.");
-                        b"MILNET-DEV-MASTER-KEK-NOT-FOR-PRODUCTION"
-                    });
+                let software_seed = config.software_seed.as_deref();
+                // No hardcoded seed — require explicit configuration in ALL modes
+                if software_seed.is_none() {
+                    panic!(
+                        "FATAL: No master seed configured. Set MILNET_MASTER_SEED environment variable. \
+                         Hardcoded development seeds have been removed for security."
+                    );
+                }
+                let seed = software_seed.unwrap();
                 let source = SoftwareKeySource::new(seed)
                     .map_err(|e| HsmError::InitializationFailed(format!("{e}")))?;
                 eprintln!(
@@ -4077,5 +4108,30 @@ mod tests {
         assert!(HsmBackend::AwsKms.is_hardware_backed());
         assert!(HsmBackend::Tpm2.is_hardware_backed());
         assert!(!HsmBackend::Software.is_hardware_backed());
+    }
+
+    #[test]
+    fn hsm_config_debug_redacts_pin() {
+        let config = HsmConfig {
+            backend: HsmBackend::Pkcs11,
+            pkcs11_library_path: Some("/usr/lib/softhsm/libsofthsm2.so".into()),
+            pkcs11_slot: Some(0),
+            pkcs11_pin: Some("my-secret-pin".into()),
+            aws_kms_key_id: None,
+            aws_kms_region: None,
+            tpm2_device: None,
+            tpm2_pcr_indices: vec![0, 2, 4, 7],
+            key_label: "test-key".into(),
+            software_seed: None,
+        };
+        let debug_output = format!("{:?}", config);
+        assert!(
+            !debug_output.contains("my-secret-pin"),
+            "Debug must redact PIN"
+        );
+        assert!(
+            debug_output.contains("[REDACTED]"),
+            "Debug must show [REDACTED]"
+        );
     }
 }
