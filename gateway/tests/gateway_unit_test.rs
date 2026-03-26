@@ -264,6 +264,7 @@ fn test_wire_orchestrator_request_serialization() {
         dpop_key_hash: [0xCC; 64],
         tier: 2,
         audience: Some("resource-server".to_string()),
+        ceremony_id: [0u8; 32],
         device_attestation_age_secs: Some(120.0),
         geo_velocity_kmh: Some(50.0),
         is_unusual_network: Some(false),
