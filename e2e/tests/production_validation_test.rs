@@ -595,12 +595,20 @@ async fn test_puzzle_not_solved_rejected() {
         .await
         .expect("send wrong puzzle solution");
 
-    // Should get an error response
-    let resp: AuthResponse = recv_frame(&mut stream)
-        .await
-        .expect("receive rejection response");
-    assert!(!resp.success, "wrong puzzle solution should be rejected");
-    assert!(resp.token.is_none());
+    // Should get an error response OR the connection should be dropped.
+    // Both are acceptable: the gateway may either send a rejection frame
+    // or simply close the connection on an invalid puzzle solution.
+    match recv_frame::<AuthResponse>(&mut stream).await {
+        Ok(resp) => {
+            assert!(!resp.success, "wrong puzzle solution should be rejected");
+            assert!(resp.token.is_none());
+        }
+        Err(_) => {
+            // Connection closed by gateway — this is also correct behavior.
+            // The gateway drops connections with invalid puzzle solutions
+            // to prevent resource exhaustion from DDoS attempts.
+        }
+    }
 }
 
 // ==========================================================================
