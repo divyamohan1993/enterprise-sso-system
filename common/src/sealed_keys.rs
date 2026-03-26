@@ -17,6 +17,17 @@
 //! - Sealed keys required
 //! - Master KEK must come from env `MILNET_MASTER_KEK` (hex-encoded)
 
+use std::sync::OnceLock;
+use zeroize::Zeroize;
+
+static MASTER_KEK_CACHE: OnceLock<[u8; 32]> = OnceLock::new();
+
+/// Returns a reference to the cached master KEK, loading it once on first call.
+/// The KEK is stored in a static OnceLock to avoid repeated heap allocations.
+pub fn cached_master_kek() -> &'static [u8; 32] {
+    MASTER_KEK_CACHE.get_or_init(|| load_master_kek())
+}
+
 /// Whether the system is running in production mode.
 /// In production, dev key fallbacks are forbidden.
 /// Returns `true` only if `MILNET_PRODUCTION` is set to `"1"` or `"true"` (case-insensitive).
@@ -95,7 +106,7 @@ pub fn load_shard_hmac_key_sealed() -> [u8; 64] {
 /// another on the SHARD channel. Both endpoints of a channel must derive the
 /// same key by using a canonical channel name.
 pub fn derive_module_hmac_key(module_a: &str, module_b: &str) -> [u8; 64] {
-    let master_kek = load_master_kek();
+    let master_kek = cached_master_kek();
     // Canonical ordering: alphabetically sort module names for consistent derivation
     let (first, second) = if module_a <= module_b {
         (module_a, module_b)
@@ -106,7 +117,7 @@ pub fn derive_module_hmac_key(module_a: &str, module_b: &str) -> [u8; 64] {
 
     use hkdf::Hkdf;
     use sha2::Sha512;
-    let hk = Hkdf::<Sha512>::new(Some(domain.as_bytes()), &master_kek);
+    let hk = Hkdf::<Sha512>::new(Some(domain.as_bytes()), master_kek);
     let mut okm = [0u8; 64];
     hk.expand(b"shard-channel-hmac", &mut okm)
         .expect("64-byte HKDF expand must succeed");
@@ -210,8 +221,8 @@ fn unseal_key_from_hex(hex_str: &str, purpose: &str) -> Option<[u8; 64]> {
         return None;
     }
 
-    let master_kek = load_master_kek();
-    let unseal_key = derive_unseal_key(&master_kek, purpose);
+    let master_kek = cached_master_kek();
+    let unseal_key = derive_unseal_key(master_kek, purpose);
 
     use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
     use aes_gcm::aead::Aead;
@@ -266,8 +277,8 @@ fn deterministic_dev_key(seed: &[u8]) -> [u8; 64] {
 /// Seal a 64-byte key for storage in env vars or files.
 /// Used by operators to prepare sealed keys for deployment.
 pub fn seal_key_for_storage(key: &[u8; 64], purpose: &str) -> Vec<u8> {
-    let master_kek = load_master_kek();
-    let seal_key = derive_unseal_key(&master_kek, purpose);
+    let master_kek = cached_master_kek();
+    let seal_key = derive_unseal_key(master_kek, purpose);
 
     use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
     use aes_gcm::aead::Aead;
@@ -341,7 +352,15 @@ pub fn load_master_kek_hsm_aware() -> [u8; 32] {
             // Return sentinel — caller must use HsmKeyManager.
             return [0u8; 32];
         }
-        // Software backend: fall through to normal env var loading.
+        // Software HSM is forbidden in production — silent fallback would mask
+        // a misconfiguration that leaves keys unprotected by hardware.
+        if is_production() {
+            panic!(
+                "FATAL: Software HSM backend forbidden in production. \
+                 Set MILNET_HSM_BACKEND to pkcs11/aws-kms/tpm2"
+            );
+        }
+        // Software backend (dev only): fall through to normal env var loading.
         eprintln!(
             "INFO: Software HSM backend detected. Falling back to env var key loading."
         );
@@ -354,13 +373,11 @@ pub fn sealed_to_hex(sealed: &[u8]) -> String {
     sealed.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Clear a string by replacing its content (best-effort for env var cleanup).
-/// Note: true zeroization of String requires unsafe; this overwrites with zeros.
+/// Securely zeroize a string using volatile writes (cannot be optimized away).
+/// Delegates to the `zeroize` crate which guarantees memory is actually cleared.
 pub fn zeroize_string(s: &mut String) {
-    let len = s.len();
-    s.clear();
-    s.extend(std::iter::repeat('\0').take(len));
-    s.clear();
+    use zeroize::Zeroize;
+    s.zeroize();
 }
 
 #[cfg(test)]

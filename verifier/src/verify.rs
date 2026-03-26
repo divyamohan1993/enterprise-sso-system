@@ -51,16 +51,32 @@ impl DpopReplayCache {
 
     /// Check if a proof has been seen before. If not, record it and return `false`.
     /// If already seen (replay), return `true`.
+    ///
+    /// SECURITY: This method MUST be called under exclusive lock to prevent
+    /// TOCTOU races between the contains_key check and the insert.
+    /// The cleanup, check, and insert form an atomic unit.
+    // SAFETY: &mut self guarantees exclusive access — no TOCTOU possible.
+    // The global DPOP_REPLAY_CACHE wraps this in a Mutex for additional
+    // thread-safety, ensuring the entire check-cleanup-insert sequence is atomic.
     fn check_and_record(&mut self, proof_hash: &[u8; 64]) -> bool {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
 
-        // Cleanup if at capacity
+        // Cleanup if at capacity — TTL-based eviction first
         if self.seen.len() >= DPOP_REPLAY_CACHE_MAX {
             let cutoff = now - DPOP_REPLAY_CACHE_TTL_SECS;
             self.seen.retain(|_, &mut ts| ts > cutoff);
+        }
+
+        // Hard cap: if TTL eviction wasn't enough (all entries are recent),
+        // perform emergency eviction of oldest entries to prevent unbounded growth.
+        if self.seen.len() > DPOP_REPLAY_CACHE_MAX {
+            let mut entries: Vec<_> = self.seen.drain().collect();
+            entries.sort_by_key(|(_, ts)| *ts);
+            entries.truncate(DPOP_REPLAY_CACHE_MAX / 2);
+            self.seen.extend(entries);
         }
 
         if self.seen.contains_key(proof_hash) {
@@ -140,23 +156,16 @@ fn dpop_required() -> bool {
     true
 }
 
-/// Returns `true` if the given tier is exempt from DPoP requirements.
+/// DPoP is mandatory for ALL tiers — no exemptions.
 ///
-/// Controlled by the `MILNET_DPOP_EXEMPT_TIERS` environment variable.
-/// Format: comma-separated tier numbers (e.g., "3,4").
-/// Default: empty string — NO tiers are exempt. All tiers require DPoP.
-///
-/// Previously Tier 3 (Sensor) and Tier 4 (Emergency) were unconditionally
-/// exempt. This is now opt-in to close the DPoP enforcement gap.
-fn is_dpop_exempt_tier(tier: u8) -> bool {
-    let exempt = std::env::var("MILNET_DPOP_EXEMPT_TIERS").unwrap_or_default();
-    if exempt.is_empty() {
-        return false; // Default: no exemptions
+/// The `MILNET_DPOP_EXEMPT_TIERS` env var is deprecated and ignored.
+/// Previously Tier 3 (Sensor) and Tier 4 (Emergency) could be exempted,
+/// but this created a security hole where stolen tokens could be replayed
+/// from any device. DPoP channel binding is now unconditionally enforced.
+fn warn_if_dpop_exempt_tiers_set() {
+    if std::env::var("MILNET_DPOP_EXEMPT_TIERS").is_ok() {
+        tracing::warn!("MILNET_DPOP_EXEMPT_TIERS is deprecated and ignored — DPoP is mandatory for all tiers");
     }
-    exempt
-        .split(',')
-        .filter_map(|s| s.trim().parse::<u8>().ok())
-        .any(|t| t == tier)
 }
 
 /// Inner verification logic shared by `verify_token` and `verify_token_bound`.
@@ -202,11 +211,13 @@ fn verify_token_inner(
     //    │ Some(key)        │ non-zero         │ MUST match hash(key)         │
     //    │ Some(key)        │ all zeros        │ REJECT (token has no DPoP)   │
     //    │ None             │ non-zero         │ REJECT (proof missing)       │
-    //    │ None             │ all zeros        │ REJECT unless exempt tier    │
+    //    │ None             │ all zeros        │ REJECT (mandatory for all)   │
     //    └──────────────────┴──────────────────┴──────────────────────────────┘
     //
-    //    Tiers 3 (Sensor) and 4 (Emergency) are exempt from DPoP when
-    //    MILNET_REQUIRE_DPOP is true — they may lack DPoP capability.
+    //    DPoP is mandatory for ALL tiers — no exemptions.
+    // Warn if deprecated env var is set (no-op, just logs)
+    warn_if_dpop_exempt_tiers_set();
+
     let all_zeros = [0u8; 64];
     let require_dpop = dpop_required();
     let has_dpop_hash = token.claims.dpop_hash != all_zeros;
@@ -241,15 +252,37 @@ fn verify_token_inner(
             "DPoP binding present but no client key provided — \
              allowed because MILNET_REQUIRE_DPOP=false (test mode)"
         );
-    } else if require_dpop && !is_dpop_exempt_tier(token.claims.tier) {
-        // No DPoP on either side, production mode, non-exempt tier — reject.
+    } else if require_dpop {
+        // No DPoP on either side, production mode — reject unconditionally.
+        // DPoP is mandatory for ALL tiers (no exemptions).
         return Err(MilnetError::CryptoVerification(
-            "DPoP binding is required in production mode (MILNET_REQUIRE_DPOP=true) — \
-             token has no dpop_hash and no client key was provided. \
-             Only Tier 3 (Sensor) and Tier 4 (Emergency) are exempt"
+            "DPoP binding is required — token has no dpop_hash and no client \
+             key was provided. DPoP is mandatory for all tiers"
                 .into(),
         ));
     }
+
+    // 4b. Verify ceremony binding if present.
+    //     ceremony_id is set (non-zero) — verify it matches the expected ceremony.
+    //     This prevents tokens from being moved between ceremonies.
+    //
+    // TODO(security): Add ceremony_id to token claims for session-token binding.
+    // Currently tokens are not bound to specific ceremony instances, allowing
+    // token migration between ceremonies if DPoP key is also compromised.
+    //
+    // NOTE: ceremony_id is present in TokenClaims but no expected_ceremony_id
+    // parameter is threaded through the verification API yet. When callers are
+    // updated to supply the expected ceremony ID, uncomment the validation below:
+    //
+    //   if token.claims.ceremony_id != [0u8; 32] {
+    //       if let Some(expected_ceremony) = expected_ceremony_id {
+    //           if !crypto::ct::ct_eq(&token.claims.ceremony_id, expected_ceremony) {
+    //               return Err(MilnetError::CryptoVerification(
+    //                   "token ceremony binding mismatch — token bound to different ceremony".into(),
+    //               ));
+    //           }
+    //       }
+    //   }
 
     // 5. Validate ratchet_epoch is within reasonable bounds
     if token.claims.ratchet_epoch == 0 || token.claims.ratchet_epoch > MAX_SESSION_EPOCHS {
@@ -293,7 +326,15 @@ fn verify_token_inner(
         .verify(&message, &sig)
         .map_err(|_| MilnetError::CryptoVerification("FROST signature invalid".into()))?;
 
-    // 10. Check tier is valid (1-4)
+    // 10. Enforce mandatory audience claim — tokens without `aud` are rejected.
+    //     This prevents tokens from being accepted by unintended services.
+    if token.claims.aud.is_none() {
+        return Err(MilnetError::CryptoVerification(
+            "token missing mandatory audience claim".into(),
+        ));
+    }
+
+    // 11. Check tier is valid (1-4)
     if token.claims.tier == 0 || token.claims.tier > 4 {
         return Err(MilnetError::CryptoVerification("invalid tier".into()));
     }
@@ -445,8 +486,31 @@ pub fn verify_token_with_ratchet(
     ratchet_key: &[u8; 64],
     current_epoch: u64,
 ) -> Result<TokenClaims, MilnetError> {
-    // 1. Do all existing checks (version, expiry, FROST + PQ signature, tier)
-    let claims = verify_token(token, public_key_package, pq_verifying_key)?;
+    verify_token_with_ratchet_inner(token, public_key_package, pq_verifying_key, ratchet_key, current_epoch, None)
+}
+
+/// Verify a token's signature, claims, ratchet tag, AND DPoP binding.
+pub fn verify_token_with_ratchet_bound(
+    token: &Token,
+    public_key_package: &PublicKeyPackage,
+    pq_verifying_key: &PqVerifyingKey,
+    ratchet_key: &[u8; 64],
+    current_epoch: u64,
+    client_dpop_key: &[u8],
+) -> Result<TokenClaims, MilnetError> {
+    verify_token_with_ratchet_inner(token, public_key_package, pq_verifying_key, ratchet_key, current_epoch, Some(client_dpop_key))
+}
+
+fn verify_token_with_ratchet_inner(
+    token: &Token,
+    public_key_package: &PublicKeyPackage,
+    pq_verifying_key: &PqVerifyingKey,
+    ratchet_key: &[u8; 64],
+    current_epoch: u64,
+    client_dpop_key: Option<&[u8]>,
+) -> Result<TokenClaims, MilnetError> {
+    // 1. Do all existing checks (version, expiry, DPoP, FROST + PQ signature, tier)
+    let claims = verify_token_inner(token, public_key_package, pq_verifying_key, client_dpop_key)?;
 
     // 2. Check ratchet epoch is within +/-3 window
     let epoch_diff = token.claims.ratchet_epoch.abs_diff(current_epoch);

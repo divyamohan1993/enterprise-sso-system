@@ -344,13 +344,13 @@ impl ShardTransport {
 
     /// Read a length-prefixed frame from the stream, verify the SHARD
     /// authentication, and return `(sender_module, payload)`.
-    pub async fn recv(&mut self) -> Result<(ModuleId, Vec<u8>), MilnetError> {
+    pub async fn recv(&mut self) -> Result<(ModuleId, super::protocol::SecurePayload), MilnetError> {
         tokio::time::timeout(SHARD_RECV_TIMEOUT, self.recv_inner())
             .await
             .map_err(|_| MilnetError::Shard("SHARD recv timed out after 30s".into()))?
     }
 
-    async fn recv_inner(&mut self) -> Result<(ModuleId, Vec<u8>), MilnetError> {
+    async fn recv_inner(&mut self) -> Result<(ModuleId, super::protocol::SecurePayload), MilnetError> {
         let mut len_buf = [0u8; 4];
         self.read_exact(&mut len_buf).await?;
         let len = u32::from_be_bytes(len_buf);

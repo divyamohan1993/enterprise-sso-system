@@ -57,9 +57,26 @@ async fn main() {
     if is_demo && !is_production {
         let demo_redirect = std::env::var("DEMO_REDIRECT_URI")
             .unwrap_or_else(|_| "https://sso-system-demo.dmj.one/callback".to_string());
+        // SECURITY: Never hardcode secrets. Derive the demo client secret from the
+        // master KEK via HKDF-SHA512 with a unique domain separator.
+        // This is only reachable when is_demo && !is_production, so load_master_kek
+        // will return a deterministic dev key if MILNET_MASTER_KEK is not set.
+        let demo_secret = {
+            let master_kek = common::sealed_keys::load_master_kek();
+            use hkdf::Hkdf;
+            use sha2::Sha512;
+            let hk = Hkdf::<Sha512>::new(
+                Some(b"MILNET-DEMO-CLIENT-SECRET-v1"),
+                &master_kek,
+            );
+            let mut okm = [0u8; 32];
+            hk.expand(b"demo-app-client-secret", &mut okm)
+                .expect("HKDF expand");
+            hex::encode(okm)
+        };
         oauth_clients.register_with_id(
             "demo-app",
-            "demo-secret",
+            &demo_secret,
             "Demo Application",
             vec![demo_redirect],
         );
@@ -215,14 +232,17 @@ async fn main() {
         std::process::exit(1);
     }
 
+    // In production, refuse to start without TLS — no exceptions.
+    if is_production && !has_tls {
+        panic!(
+            "FATAL: Admin API requires TLS in production. \
+             Set ADMIN_TLS_CERT and ADMIN_TLS_KEY, or use a TLS-terminating reverse proxy \
+             with REQUIRE_TLS=false and ADMIN_BIND_ADDR=127.0.0.1."
+        );
+    }
+
     if bind_addr == "0.0.0.0" && !has_tls {
-        if is_production {
-            tracing::error!(
-                "SECURITY: Binding to all interfaces (0.0.0.0) without TLS in production mode. \
-                 Set ADMIN_TLS_CERT and ADMIN_TLS_KEY, or use ADMIN_BIND_ADDR=127.0.0.1 \
-                 behind a TLS-terminating reverse proxy."
-            );
-        } else {
+        {
             tracing::warn!(
                 "WARNING: Binding to all interfaces (0.0.0.0) without TLS. \
                  Use a TLS-terminating reverse proxy in production."
@@ -270,15 +290,51 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-/// Middleware that adds Strict-Transport-Security header to all responses.
+/// Middleware that adds comprehensive security headers to all responses.
 async fn hsts_middleware(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let mut response = next.run(request).await;
-    response.headers_mut().insert(
+    let headers = response.headers_mut();
+    headers.insert(
         axum::http::header::STRICT_TRANSPORT_SECURITY,
         axum::http::HeaderValue::from_static("max-age=63072000; includeSubDomains; preload"),
+    );
+    headers.insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        axum::http::header::X_FRAME_OPTIONS,
+        axum::http::HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        axum::http::HeaderValue::from_static(
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+             img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+        ),
+    );
+    headers.insert(
+        axum::http::header::HeaderName::from_static("x-xss-protection"),
+        axum::http::HeaderValue::from_static("0"),
+    );
+    headers.insert(
+        axum::http::header::REFERRER_POLICY,
+        axum::http::HeaderValue::from_static("strict-origin-when-cross-origin"),
+    );
+    headers.insert(
+        axum::http::header::HeaderName::from_static("permissions-policy"),
+        axum::http::HeaderValue::from_static("camera=(), microphone=(), geolocation=(), payment=()"),
+    );
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+    );
+    headers.insert(
+        axum::http::header::PRAGMA,
+        axum::http::HeaderValue::from_static("no-cache"),
     );
     response
 }

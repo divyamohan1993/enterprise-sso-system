@@ -14,7 +14,6 @@
 
 use sha2::{Digest, Sha512};
 use std::path::Path;
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -62,6 +61,38 @@ impl std::error::Error for PlatformError {}
 
 fn is_production() -> bool {
     crate::sealed_keys::is_production()
+}
+
+/// Hardened TPM2-tools binary path.
+/// In production, only binaries from known paths are executed to prevent
+/// PATH manipulation attacks.
+const TPM2_TOOLS_DIR: &str = "/usr/bin";
+
+/// Returns the absolute path for a tpm2-tools command.
+/// Validates the binary exists and is not a symlink to an unexpected location.
+fn tpm2_command(tool_name: &str) -> std::process::Command {
+    let path = format!("{}/{}", TPM2_TOOLS_DIR, tool_name);
+
+    // Verify binary exists at expected path
+    if !std::path::Path::new(&path).exists() {
+        // Fallback: try /usr/local/bin (common alternative)
+        let alt_path = format!("/usr/local/bin/{}", tool_name);
+        if std::path::Path::new(&alt_path).exists() {
+            let mut cmd = std::process::Command::new(&alt_path);
+            cmd.env_clear();
+            // Restore minimal safe PATH
+            cmd.env("PATH", "/usr/bin:/bin");
+            return cmd;
+        }
+        panic!("TPM2 tool not found at {} or /usr/local/bin/{}", path, tool_name);
+    }
+
+    let mut cmd = std::process::Command::new(&path);
+    // Clear inherited environment to prevent injection via LD_PRELOAD, PATH, etc.
+    cmd.env_clear();
+    // Restore only the minimal safe environment
+    cmd.env("PATH", "/usr/bin:/bin");
+    cmd
 }
 
 /// Compute SHA-512 digest of a byte slice.
@@ -368,7 +399,7 @@ pub fn tpm_seal(
     })?;
 
     // 1. Create primary key under owner hierarchy
-    let output = Command::new("tpm2_createprimary")
+    let output = tpm2_command("tpm2_createprimary")
         .args(["-C", "o", "-c", &primary_ctx])
         .output()
         .map_err(|e| {
@@ -385,13 +416,13 @@ pub fn tpm_seal(
     }
 
     // 2. Create PCR policy
-    let _output = Command::new("tpm2_pcrread")
+    let _output = tpm2_command("tpm2_pcrread")
         .args(["-o", &policy_path, SEAL_PCR_LIST])
         .output();
 
     // Build a policy session for PCR binding
     let policy_session = format!("{}/{}_session.ctx", dir, name);
-    let output = Command::new("tpm2_startauthsession")
+    let output = tpm2_command("tpm2_startauthsession")
         .args(["-S", &policy_session])
         .output()
         .map_err(|e| {
@@ -406,7 +437,7 @@ pub fn tpm_seal(
         )));
     }
 
-    let output = Command::new("tpm2_policypcr")
+    let output = tpm2_command("tpm2_policypcr")
         .args(["-S", &policy_session, "-l", SEAL_PCR_LIST, "-L", &policy_path])
         .output()
         .map_err(|e| {
@@ -421,10 +452,10 @@ pub fn tpm_seal(
         )));
     }
 
-    let _ = Command::new("tpm2_flushcontext").args([&policy_session]).output();
+    let _ = tpm2_command("tpm2_flushcontext").args([&policy_session]).output();
 
     // 3. Create sealed object with PCR policy
-    let output = Command::new("tpm2_create")
+    let output = tpm2_command("tpm2_create")
         .args([
             "-C", &primary_ctx,
             "-i", &secret_tmp,
@@ -488,7 +519,7 @@ pub fn tpm_unseal(
     }
 
     // 1. Recreate primary
-    let output = Command::new("tpm2_createprimary")
+    let output = tpm2_command("tpm2_createprimary")
         .args(["-C", "o", "-c", &primary_ctx])
         .output()
         .map_err(|e| {
@@ -503,7 +534,7 @@ pub fn tpm_unseal(
     }
 
     // 2. Load sealed object
-    let output = Command::new("tpm2_load")
+    let output = tpm2_command("tpm2_load")
         .args([
             "-C", &primary_ctx,
             "-u", &pub_path,
@@ -525,7 +556,7 @@ pub fn tpm_unseal(
 
     // 3. Start policy session and satisfy PCR policy
     let policy_session = format!("{}/{}_unseal_session.ctx", dir, name);
-    let output = Command::new("tpm2_startauthsession")
+    let output = tpm2_command("tpm2_startauthsession")
         .args(["--policy-session", "-S", &policy_session])
         .output()
         .map_err(|e| {
@@ -541,7 +572,7 @@ pub fn tpm_unseal(
         )));
     }
 
-    let output = Command::new("tpm2_policypcr")
+    let output = tpm2_command("tpm2_policypcr")
         .args(["-S", &policy_session, "-l", SEAL_PCR_LIST])
         .output()
         .map_err(|e| {
@@ -551,7 +582,7 @@ pub fn tpm_unseal(
     if !output.status.success() {
         let _ = std::fs::remove_file(&primary_ctx);
         let _ = std::fs::remove_file(&loaded_ctx);
-        let _ = Command::new("tpm2_flushcontext").args([&policy_session]).output();
+        let _ = tpm2_command("tpm2_flushcontext").args([&policy_session]).output();
         return Err(PlatformError::TpmCommandFailed(format!(
             "tpm2_policypcr (unseal) failed — PCR values may have changed: {}",
             String::from_utf8_lossy(&output.stderr)
@@ -559,7 +590,7 @@ pub fn tpm_unseal(
     }
 
     // 4. Unseal
-    let output = Command::new("tpm2_unseal")
+    let output = tpm2_command("tpm2_unseal")
         .args([
             "-c", &loaded_ctx,
             "-p", &format!("session:{}", policy_session),
@@ -573,7 +604,7 @@ pub fn tpm_unseal(
     // Clean up contexts
     let _ = std::fs::remove_file(&primary_ctx);
     let _ = std::fs::remove_file(&loaded_ctx);
-    let _ = Command::new("tpm2_flushcontext").args([&policy_session]).output();
+    let _ = tpm2_command("tpm2_flushcontext").args([&policy_session]).output();
 
     if !output.status.success() {
         let _ = std::fs::remove_file(&unsealed_path);

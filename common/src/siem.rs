@@ -9,8 +9,17 @@
 #![forbid(unsafe_code)]
 
 use serde::Serialize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, OnceLock};
 use uuid::Uuid;
+
+// ── Webhook thread pool limiter ─────────────────────────────────────────────
+static ACTIVE_WEBHOOK_THREADS: AtomicUsize = AtomicUsize::new(0);
+const MAX_WEBHOOK_THREADS: usize = 8;
+
+// ── Alert file rotation ─────────────────────────────────────────────────────
+/// Maximum alert file size before rotation (100 MB).
+const MAX_ALERT_FILE_BYTES: u64 = 100 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Global broadcast bus for live SIEM event streaming
@@ -72,6 +81,20 @@ fn persist_alert_to_file(json: &str) {
         tracing::warn!("failed to create alert directory {}: {}", ALERT_DIR, e);
         return;
     }
+
+    // Rotate alert file if it exceeds the size limit
+    if let Ok(meta) = std::fs::metadata(CRITICAL_ALERT_FILE) {
+        if meta.len() >= MAX_ALERT_FILE_BYTES {
+            let rotate_ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let rotated = format!("{}.{}", CRITICAL_ALERT_FILE, rotate_ts);
+            let _ = std::fs::rename(CRITICAL_ALERT_FILE, &rotated);
+            tracing::warn!(target: "siem", "Alert file rotated due to size limit");
+        }
+    }
+
     match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -100,17 +123,34 @@ fn send_webhook_alert(event: &SiemEvent) {
         None => return,
     };
 
-    // Minimal URL parsing: expect "http://host:port/path" or "https://..."
+    // FIX 3: Refuse non-HTTPS URLs in production
+    if crate::sealed_keys::is_production() && !url_str.starts_with("https://") {
+        tracing::error!(
+            target: "siem",
+            "REFUSED: SIEM webhook URL must use HTTPS in production: {}",
+            url_str
+        );
+        return;
+    }
+
     let body = match serde_json::to_string(event) {
         Ok(b) => b,
         Err(_) => return,
     };
+
+    // FIX 4: Thread pool limiter — refuse to spawn if at capacity
+    if ACTIVE_WEBHOOK_THREADS.load(Ordering::Acquire) >= MAX_WEBHOOK_THREADS {
+        tracing::warn!(target: "siem", "SIEM webhook thread limit reached — dropping event");
+        return;
+    }
+    ACTIVE_WEBHOOK_THREADS.fetch_add(1, Ordering::Release);
 
     // Spawn a blocking task so we don't block the async runtime.
     let _ = std::thread::Builder::new()
         .name("siem-webhook".into())
         .spawn(move || {
             send_webhook_blocking(&url_str, &body);
+            ACTIVE_WEBHOOK_THREADS.fetch_sub(1, Ordering::Release);
         });
 }
 

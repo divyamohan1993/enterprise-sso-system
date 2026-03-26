@@ -15,11 +15,83 @@ use common::domain::SHARD_AUTH;
 use common::error::MilnetError;
 use common::types::{ModuleId, ShardMessage};
 use crypto::ct::ct_eq;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 type HmacSha512 = Hmac<Sha512>;
 
+/// Secure wrapper for decrypted SHARD payloads that zeroizes memory on drop.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct SecurePayload(pub Vec<u8>);
+
+impl SecurePayload {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn into_inner(mut self) -> Vec<u8> {
+        let inner = std::mem::take(&mut self.0);
+        // self.0 is now empty, will be zeroized on drop (no-op)
+        std::mem::forget(self); // Don't double-zeroize
+        inner
+    }
+}
+
+impl AsRef<[u8]> for SecurePayload {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl PartialEq<[u8]> for SecurePayload {
+    fn eq(&self, other: &[u8]) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&[u8]> for SecurePayload {
+    fn eq(&self, other: &&[u8]) -> bool {
+        self.0.as_slice() == *other
+    }
+}
+
+impl<const N: usize> PartialEq<&[u8; N]> for SecurePayload {
+    fn eq(&self, other: &&[u8; N]) -> bool {
+        self.0.as_slice() == other.as_slice()
+    }
+}
+
+impl PartialEq<Vec<u8>> for SecurePayload {
+    fn eq(&self, other: &Vec<u8>) -> bool {
+        self.0 == *other
+    }
+}
+
+impl std::ops::Deref for SecurePayload {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecurePayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SecurePayload").field(&"[REDACTED]").finish()
+    }
+}
+
 /// Domain separation label for deriving the encryption key via HKDF.
-const ENCRYPT_DOMAIN: &[u8] = b"MILNET-SHARD-ENCRYPT-v1";
+const ENCRYPT_DOMAIN: &[u8] = b"MILNET-SHARD-ENCRYPT-v2";
+
+/// Domain separation label for deriving the HMAC key via HKDF.
+/// Both the encryption key and HMAC key are derived from the shared secret
+/// using HKDF with distinct info strings, ensuring proper key separation.
+const HMAC_DOMAIN: &[u8] = b"MILNET-SHARD-HMAC-v2";
+
+/// Current SHARD protocol wire version.
+/// v2: Both encryption and HMAC keys are derived via HKDF from the shared
+///     secret with domain separation (v1 used the raw secret as the HMAC key).
+const PROTOCOL_VERSION: u8 = 2;
 
 /// Maximum allowed clock skew between sender and receiver (2 seconds in microseconds).
 const MAX_TIMESTAMP_DRIFT_US: i64 = 2_000_000;
@@ -31,8 +103,11 @@ const MAX_TIMESTAMP_DRIFT_US: i64 = 2_000_000;
 /// (or AES-256-GCM in FIPS mode) and authenticated with HMAC-SHA512.
 pub struct ShardProtocol {
     module_id: ModuleId,
+    /// The raw shared secret (kept for TLS connect helpers that need it).
+    shared_secret: [u8; 64],
+    /// HMAC key derived from the shared secret via HKDF-SHA512.
     hmac_key: [u8; 64],
-    /// Encryption key derived from the HMAC key via HKDF-SHA512.
+    /// Encryption key derived from the shared secret via HKDF-SHA512.
     enc_key: [u8; 32],
     send_sequence: u64,
     recv_sequences: HashMap<ModuleId, u64>,
@@ -40,22 +115,43 @@ pub struct ShardProtocol {
     last_persisted_epoch: u64,
 }
 
-/// Derive an encryption key from the HMAC key using HKDF-SHA512
+/// Derive an encryption key from the shared secret using HKDF-SHA512
 /// with domain separation.
-fn derive_encryption_key(hmac_key: &[u8; 64]) -> [u8; 32] {
-    let hk = Hkdf::<Sha512>::new(None, hmac_key);
+fn derive_encryption_key(shared_secret: &[u8; 64]) -> [u8; 32] {
+    let hk = Hkdf::<Sha512>::new(None, shared_secret);
     let mut okm = [0u8; 32];
     hk.expand(ENCRYPT_DOMAIN, &mut okm)
         .expect("32 bytes is a valid HKDF-SHA512 output length");
     okm
 }
 
+/// Derive an HMAC key from the shared secret using HKDF-SHA512
+/// with domain separation. This ensures the HMAC key and encryption
+/// key are cryptographically independent, even though they share the
+/// same input keying material.
+fn derive_hmac_key(shared_secret: &[u8; 64]) -> [u8; 64] {
+    let hk = Hkdf::<Sha512>::new(None, shared_secret);
+    let mut okm = [0u8; 64];
+    hk.expand(HMAC_DOMAIN, &mut okm)
+        .expect("64 bytes is a valid HKDF-SHA512 output length");
+    okm
+}
+
 impl ShardProtocol {
     /// Create a new protocol instance for the given module.
-    pub fn new(module_id: ModuleId, hmac_key: [u8; 64]) -> Self {
-        let enc_key = derive_encryption_key(&hmac_key);
+    ///
+    /// The `shared_secret` is used as input keying material for HKDF-SHA512.
+    /// Two independent keys are derived with distinct domain separation labels:
+    /// - Encryption key (32 bytes) for AES-256-GCM / AEGIS-256
+    /// - HMAC key (64 bytes) for HMAC-SHA512
+    ///
+    /// The raw shared secret is never used directly as a cryptographic key.
+    pub fn new(module_id: ModuleId, shared_secret: [u8; 64]) -> Self {
+        let enc_key = derive_encryption_key(&shared_secret);
+        let hmac_key = derive_hmac_key(&shared_secret);
         Self {
             module_id,
+            shared_secret,
             hmac_key,
             enc_key,
             send_sequence: 0,
@@ -123,7 +219,7 @@ impl ShardProtocol {
         let encrypted_payload = self.encrypt_payload(payload)?;
 
         let mut msg = ShardMessage {
-            version: 1,
+            version: PROTOCOL_VERSION,
             sender_module: self.module_id,
             sequence: self.send_sequence,
             timestamp,
@@ -147,7 +243,7 @@ impl ShardProtocol {
     /// 4. Sequence number is strictly greater than last seen for that sender
     ///
     /// Returns `(sender_module, plaintext_payload)` on success.
-    pub fn verify_message(&mut self, raw: &[u8]) -> Result<(ModuleId, Vec<u8>), MilnetError> {
+    pub fn verify_message(&mut self, raw: &[u8]) -> Result<(ModuleId, SecurePayload), MilnetError> {
         let msg: ShardMessage = postcard::from_bytes(raw)
             .map_err(|e| MilnetError::Serialization(format!("shard deserialize: {e}")))?;
 
@@ -157,8 +253,9 @@ impl ShardProtocol {
             return Err(MilnetError::Shard("HMAC verification failed".into()));
         }
 
-        // 2. Decrypt payload
-        let plaintext = self.decrypt_payload(&msg.payload)?;
+        // 2. Decrypt payload — wrap immediately so plaintext is zeroized on
+        //    all exit paths (including timestamp/replay errors below).
+        let plaintext = SecurePayload(self.decrypt_payload(&msg.payload)?);
 
         // 3. Verify timestamp
         let now = Self::now_us()?;
@@ -260,7 +357,7 @@ impl ShardProtocol {
         addr: &str,
         tls_config: &crate::transport::ClientTlsConfig,
     ) -> Result<crate::transport::ShardTransport, MilnetError> {
-        crate::transport::tls_connect(addr, self.module_id, self.hmac_key, tls_config).await
+        crate::transport::tls_connect(addr, self.module_id, self.shared_secret, tls_config).await
     }
 
     /// Bind a TLS-enabled listener using the unified transport.
@@ -271,7 +368,7 @@ impl ShardProtocol {
         addr: &str,
         tls_config: crate::transport::ServerTlsConfig,
     ) -> Result<crate::transport::ShardListener, MilnetError> {
-        crate::transport::ShardListener::tls_bind(addr, self.module_id, self.hmac_key, tls_config)
+        crate::transport::ShardListener::tls_bind(addr, self.module_id, self.shared_secret, tls_config)
             .await
     }
 
@@ -284,7 +381,7 @@ impl ShardProtocol {
         addr: &str,
         tls_config: Option<&crate::transport::ClientTlsConfig>,
     ) -> Result<crate::transport::ShardTransport, MilnetError> {
-        crate::transport::connect_auto(addr, self.module_id, self.hmac_key, tls_config).await
+        crate::transport::connect_auto(addr, self.module_id, self.shared_secret, tls_config).await
     }
 }
 
@@ -717,7 +814,7 @@ mod tests {
         let (sender_id, recovered) = receiver.verify_message(&raw_msg).unwrap();
 
         assert_eq!(sender_id, ModuleId::Gateway);
-        assert_eq!(recovered.as_slice(), payload);
+        assert_eq!(recovered.as_bytes(), payload);
     }
 
     #[test]
@@ -732,7 +829,7 @@ mod tests {
         let (sender_id, recovered) = receiver.verify_message(&raw_msg).unwrap();
 
         assert_eq!(sender_id, ModuleId::Gateway);
-        assert_eq!(recovered.as_slice(), payload);
+        assert_eq!(recovered.as_bytes(), payload);
         common::fips::set_fips_mode_unchecked(false);
     }
 }

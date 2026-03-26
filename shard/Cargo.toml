@@ -19,3 +19,4 @@ rustls.workspace = true
 tokio-rustls.workspace = true
 rcgen.workspace = true
 tracing.workspace = true
+zeroize.workspace = true

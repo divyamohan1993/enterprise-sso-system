@@ -8,6 +8,10 @@
 
 use std::sync::{Arc, Mutex};
 
+// ── Buffer overflow protection ──────────────────────────────────────────────
+/// Maximum number of events that can be buffered before oldest events are dropped.
+const MAX_BUFFER_SIZE: usize = 10_000;
+
 // ── Configuration ─────────────────────────────────────────────────────────────
 
 /// Configuration for the external SIEM webhook integration.
@@ -39,6 +43,8 @@ impl SiemWebhookConfig {
 
         let auth_token = std::env::var("MILNET_SIEM_AUTH_TOKEN")
             .unwrap_or_default();
+        // Remove sensitive auth token from environment immediately
+        std::env::remove_var("MILNET_SIEM_AUTH_TOKEN");
 
         let batch_size = std::env::var("MILNET_SIEM_BATCH_SIZE")
             .ok()
@@ -62,6 +68,28 @@ impl SiemWebhookConfig {
             enabled,
         })
     }
+}
+
+impl Drop for SiemWebhookConfig {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.auth_token.zeroize();
+    }
+}
+
+// ── HMAC-SHA512 payload signing ──────────────────────────────────────────────
+
+/// Compute HMAC-SHA512 over `timestamp || payload` using the given key.
+/// Returns the hex-encoded signature string.
+fn sign_payload(key: &[u8], timestamp: &str, payload: &[u8]) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha512;
+    type HmacSha512 = Hmac<Sha512>;
+    let mut mac = HmacSha512::new_from_slice(key).expect("HMAC key");
+    mac.update(timestamp.as_bytes());
+    mac.update(payload);
+    let result = mac.finalize().into_bytes();
+    hex::encode(result)
 }
 
 // ── Webhook client ────────────────────────────────────────────────────────────
@@ -95,11 +123,21 @@ impl SiemWebhook {
             return;
         }
         match self.buffer.lock() {
-            Ok(mut buf) => buf.push(event_json.to_string()),
+            Ok(mut buf) => {
+                if buf.len() >= MAX_BUFFER_SIZE {
+                    buf.remove(0); // Drop oldest
+                    tracing::warn!(target: "siem", "SIEM webhook buffer overflow — dropping oldest event");
+                }
+                buf.push(event_json.to_string());
+            }
             Err(poisoned) => {
                 // Recover from a poisoned mutex — log and continue
                 tracing::warn!("siem_webhook: buffer mutex poisoned, recovering");
                 let mut buf = poisoned.into_inner();
+                if buf.len() >= MAX_BUFFER_SIZE {
+                    buf.remove(0);
+                    tracing::warn!(target: "siem", "SIEM webhook buffer overflow — dropping oldest event");
+                }
                 buf.push(event_json.to_string());
             }
         }
@@ -133,22 +171,49 @@ impl SiemWebhook {
         // Build a JSON array of all buffered events for the batch POST body.
         let batch_json = format!("[{}]", events.join(","));
 
-        // In production, the HTTP POST would happen here:
-        //   reqwest::blocking::Client::new()
-        //       .post(&self.config.endpoint_url)
-        //       .bearer_auth(&self.config.auth_token)
-        //       .json(&batch_json)
-        //       .send()?;
-        //
-        // For now, emit via tracing so the events are not silently discarded.
+        // Compute HMAC-SHA512 signature for payload authentication
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .to_string();
+
+        let signature = if !self.config.auth_token.is_empty() {
+            Some(sign_payload(
+                self.config.auth_token.as_bytes(),
+                &timestamp,
+                batch_json.as_bytes(),
+            ))
+        } else {
+            None
+        };
+
+        // Log the flush with authentication metadata.
+        // In production, the HTTP POST would include these headers:
+        //   Authorization: Bearer <auth_token>
+        //   X-MILNET-Signature: <hex-encoded HMAC-SHA512>
+        //   X-MILNET-Timestamp: <unix epoch seconds>
         tracing::info!(
             target: "siem_webhook",
             endpoint = %self.config.endpoint_url,
             count = count,
-            batch = %batch_json,
+            timestamp = %timestamp,
+            has_signature = signature.is_some(),
+            has_auth_token = !self.config.auth_token.is_empty(),
             "siem_webhook: flushing {} event(s) to SIEM endpoint",
             count
         );
+
+        // Emit signature and auth headers for downstream consumers
+        if let Some(ref sig) = signature {
+            tracing::debug!(
+                target: "siem_webhook",
+                header_x_milnet_signature = %sig,
+                header_x_milnet_timestamp = %timestamp,
+                header_authorization = "Bearer <redacted>",
+                "siem_webhook: payload signed with HMAC-SHA512"
+            );
+        }
 
         Ok(count)
     }

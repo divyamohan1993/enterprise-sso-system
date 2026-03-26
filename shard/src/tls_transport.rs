@@ -49,7 +49,7 @@ async fn send_on<W: AsyncWriteExt + Unpin>(
 async fn recv_on<R: AsyncReadExt + Unpin>(
     reader: &mut R,
     protocol: &mut ShardProtocol,
-) -> Result<(ModuleId, Vec<u8>), MilnetError> {
+) -> Result<(ModuleId, super::protocol::SecurePayload), MilnetError> {
     let mut len_buf = [0u8; 4];
     reader
         .read_exact(&mut len_buf)
@@ -111,7 +111,7 @@ impl TlsShardTransport {
     }
 
     /// Receive and verify an authenticated SHARD message over TLS.
-    pub async fn recv(&mut self) -> Result<(ModuleId, Vec<u8>), MilnetError> {
+    pub async fn recv(&mut self) -> Result<(ModuleId, super::protocol::SecurePayload), MilnetError> {
         match &mut self.stream {
             TlsTransportStream::Server(s) => recv_on(s, &mut self.protocol).await,
             TlsTransportStream::Client(s) => recv_on(s, &mut self.protocol).await,

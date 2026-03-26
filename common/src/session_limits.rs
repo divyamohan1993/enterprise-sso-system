@@ -34,6 +34,8 @@ impl SessionTracker {
 
     /// Try to register a new session. Returns Ok(()) if within limits,
     /// Err with message if the user has too many active sessions.
+    // SECURITY: The mutex MUST be held continuously from the length check through
+    // the push to prevent TOCTOU race conditions on session limits.
     pub fn register_session(&self, user_id: Uuid, session_id: Uuid, now: i64) -> Result<(), String> {
         let mut active = self.active.lock().unwrap_or_else(|e| {
             tracing::error!(
@@ -70,6 +72,12 @@ impl SessionTracker {
         }
 
         sessions.push(SessionEntry { session_id, created_at: now, last_activity: now });
+        // Defense-in-depth: verify limit was not violated despite mutex protection
+        assert!(
+            sessions.len() <= self.max_per_user as usize + 1,
+            "session limit invariant violated: {} sessions for user {}",
+            sessions.len(), user_id
+        );
         crate::siem::SecurityEvent::session_created(
             &user_id.to_string(),
             "internal",
@@ -110,6 +118,20 @@ impl SessionTracker {
             e.into_inner()
         });
         active.get(user_id).map_or(0, |s| s.len())
+    }
+
+    /// Check if a session has exceeded the idle timeout without being touched.
+    /// Returns true if the session is idle (last activity > 30 minutes ago) or unknown.
+    pub fn is_session_idle(&self, user_id: &Uuid, session_id: &Uuid, now: i64) -> bool {
+        let active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(sessions) = active.get(user_id) {
+            for entry in sessions {
+                if &entry.session_id == session_id {
+                    return (now - entry.last_activity) > Self::IDLE_TIMEOUT_SECS;
+                }
+            }
+        }
+        true // Unknown session = expired
     }
 
     /// Update the last-activity timestamp for a session (call on each API request).

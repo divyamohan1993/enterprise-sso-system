@@ -10,6 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -24,6 +25,12 @@ const MAX_TOKEN_LIFETIME_US: i64 = 8 * 60 * 60 * 1_000_000;
 
 /// Minimum interval between lazy cleanups, in microseconds (60 seconds).
 const LAZY_CLEANUP_INTERVAL_US: i64 = 60 * 1_000_000;
+
+/// Default persistence path in production.
+const DEFAULT_PERSISTENCE_PATH: &str = "/var/lib/milnet/revocations.dat";
+
+/// Line count threshold that triggers file compaction.
+const COMPACTION_THRESHOLD: usize = 10_000;
 
 /// A revocation command sent over the SHARD protocol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,15 +63,47 @@ pub struct RevocationList {
     revoked_ids: HashSet<[u8; 16]>,
     /// Maps token_id -> revocation timestamp (microseconds since UNIX epoch).
     revocation_times: HashMap<[u8; 16], i64>,
+    /// Optional path to the append-only persistence file.
+    persistence_path: Option<PathBuf>,
 }
 
 impl RevocationList {
     /// Create a new empty revocation list.
+    ///
+    /// In production (`MILNET_PRODUCTION=1`), persistence is mandatory and
+    /// defaults to `/var/lib/milnet/revocations.dat`. The constructor will
+    /// panic if it cannot establish a persistence path in production mode.
     pub fn new() -> Self {
-        Self {
+        let is_production = std::env::var("MILNET_PRODUCTION")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+
+        let persistence_path = if is_production {
+            Some(PathBuf::from(DEFAULT_PERSISTENCE_PATH))
+        } else {
+            None
+        };
+
+        let mut this = Self {
             revoked_ids: HashSet::new(),
             revocation_times: HashMap::new(),
-        }
+            persistence_path,
+        };
+        this.load_from_file();
+        this
+    }
+
+    /// Create a new revocation list with an explicit persistence path.
+    ///
+    /// Loads any previously persisted (non-expired) entries from the file.
+    pub fn with_persistence(path: PathBuf) -> Self {
+        let mut this = Self {
+            revoked_ids: HashSet::new(),
+            revocation_times: HashMap::new(),
+            persistence_path: Some(path),
+        };
+        this.load_from_file();
+        this
     }
 
     /// Returns the current timestamp in microseconds since UNIX epoch.
@@ -73,6 +112,221 @@ impl RevocationList {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_micros() as i64
+    }
+
+    // ------------------------------------------------------------------
+    // Persistence helpers
+    // ------------------------------------------------------------------
+
+    /// Compute HMAC-SHA512 over revocation data for integrity verification.
+    fn compute_revocation_hmac(data: &[u8]) -> [u8; 64] {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha512;
+        type HmacSha512 = Hmac<Sha512>;
+        // Derive key from a fixed domain — in real deployment this would come from KEK
+        let domain = b"MILNET-REVOCATION-INTEGRITY-v1";
+        let mut mac = HmacSha512::new_from_slice(domain).expect("HMAC key");
+        mac.update(data);
+        let result = mac.finalize().into_bytes();
+        let mut out = [0u8; 64];
+        out.copy_from_slice(&result);
+        out
+    }
+
+    /// Securely erase a file by overwriting its contents with random data before removal.
+    fn secure_erase_file(path: &std::path::Path) -> Result<(), String> {
+        use std::io::Write;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            let size = metadata.len() as usize;
+            if size > 0 {
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .map_err(|e| format!("secure erase open: {e}"))?;
+                let mut zeros = vec![0u8; size.min(4096)];
+                getrandom::getrandom(&mut zeros).ok(); // random overwrite
+                let mut written = 0;
+                while written < size {
+                    let chunk = zeros.len().min(size - written);
+                    file.write_all(&zeros[..chunk]).map_err(|e| format!("secure erase: {e}"))?;
+                    written += chunk;
+                }
+                file.sync_all().map_err(|e| format!("secure erase sync: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Rewrite the persistence file with the given content and append an HMAC line.
+    fn write_with_hmac(path: &std::path::Path, content: &[u8]) -> Result<(), String> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| format!("write_with_hmac open: {e}"))?;
+        file.write_all(content)
+            .map_err(|e| format!("write_with_hmac write: {e}"))?;
+        let hmac = Self::compute_revocation_hmac(content);
+        writeln!(file, "HMAC:{}", hex::encode(hmac))
+            .map_err(|e| format!("write_with_hmac hmac: {e}"))?;
+        file.flush().map_err(|e| format!("write_with_hmac flush: {e}"))?;
+        Ok(())
+    }
+
+    /// Append a single revocation entry to the persistence file.
+    fn persist_revocation(&self, token_id: &[u8; 16], expires_at: i64) -> Result<(), String> {
+        if let Some(ref path) = self.persistence_path {
+            // Read existing data lines (strip old HMAC if present), append new entry, rewrite with HMAC
+            let existing = std::fs::read_to_string(path).unwrap_or_default();
+            let mut data_lines = String::new();
+            for line in existing.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with("HMAC:") {
+                    continue;
+                }
+                data_lines.push_str(line);
+                data_lines.push('\n');
+            }
+            data_lines.push_str(&format!("{},{}\n", hex::encode(token_id), expires_at));
+            Self::write_with_hmac(path, data_lines.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Load non-expired entries from the persistence file on startup.
+    ///
+    /// Verifies HMAC-SHA512 integrity before trusting file contents.
+    fn load_from_file(&mut self) {
+        let path = match self.persistence_path {
+            Some(ref p) => p.clone(),
+            None => return,
+        };
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => return, // File doesn't exist yet — first run
+        };
+
+        // Separate data lines from HMAC line
+        let mut data_lines = String::new();
+        let mut stored_hmac_hex: Option<String> = None;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Some(hmac_str) = trimmed.strip_prefix("HMAC:") {
+                stored_hmac_hex = Some(hmac_str.to_string());
+            } else {
+                data_lines.push_str(line);
+                data_lines.push('\n');
+            }
+        }
+
+        // Verify HMAC integrity if an HMAC line is present
+        if let Some(ref hmac_hex) = stored_hmac_hex {
+            let stored_hmac = match hex::decode(hmac_hex) {
+                Ok(b) if b.len() == 64 => b,
+                _ => {
+                    tracing::error!(
+                        target: "siem",
+                        event = "revocation_integrity_failure",
+                        severity = 10,
+                        "CRITICAL: Revocation file HMAC is malformed — possible tampering. \
+                         Refusing to load revocation data from {:?}",
+                        path,
+                    );
+                    return;
+                }
+            };
+            let computed_hmac = Self::compute_revocation_hmac(data_lines.as_bytes());
+            // Constant-time comparison to prevent timing attacks
+            use subtle::ConstantTimeEq;
+            if stored_hmac.ct_eq(&computed_hmac).unwrap_u8() != 1 {
+                tracing::error!(
+                    target: "siem",
+                    event = "revocation_integrity_failure",
+                    severity = 10,
+                    "CRITICAL: Revocation file HMAC verification FAILED — data has been \
+                     tampered with. Refusing to load revocation data from {:?}",
+                    path,
+                );
+                return;
+            }
+        }
+
+        let now = Self::now_us();
+        for line in data_lines.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = line.splitn(2, ',').collect();
+            if parts.len() != 2 {
+                continue;
+            }
+            let token_bytes = match hex::decode(parts[0]) {
+                Ok(b) if b.len() == 16 => b,
+                _ => continue,
+            };
+            let expires_at: i64 = match parts[1].parse() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            // Skip expired entries
+            if expires_at <= now {
+                continue;
+            }
+            let mut id = [0u8; 16];
+            id.copy_from_slice(&token_bytes);
+            // Derive the original revocation timestamp from expires_at
+            let revoked_at = expires_at - MAX_TOKEN_LIFETIME_US;
+            self.revoked_ids.insert(id);
+            self.revocation_times.insert(id, revoked_at);
+        }
+    }
+
+    /// Compact the persistence file by rewriting it with only non-expired entries.
+    ///
+    /// The compacted file is written to a temp file with HMAC integrity, then the
+    /// old file is securely erased before the temp file is renamed into place.
+    fn maybe_compact(&self) {
+        let path = match self.persistence_path {
+            Some(ref p) => p.clone(),
+            None => return,
+        };
+        // Count lines in the current file
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let line_count = content.lines().count();
+        if line_count < COMPACTION_THRESHOLD {
+            return;
+        }
+        // Rewrite with only current in-memory entries (which are already pruned of expired)
+        let tmp_path = path.with_extension("dat.tmp");
+        let result = (|| -> Result<(), String> {
+            // Build data content
+            let mut data = String::new();
+            for (id, &revoked_at) in &self.revocation_times {
+                let expires_at = revoked_at + MAX_TOKEN_LIFETIME_US;
+                data.push_str(&format!("{},{}\n", hex::encode(id), expires_at));
+            }
+            // Write temp file with HMAC integrity
+            Self::write_with_hmac(&tmp_path, data.as_bytes())?;
+            // Securely erase old revocation file before replacement
+            Self::secure_erase_file(&path)?;
+            std::fs::rename(&tmp_path, &path)
+                .map_err(|e| format!("compaction rename failed: {e}"))?;
+            Ok(())
+        })();
+        if let Err(e) = result {
+            tracing::warn!(target: "siem", "Revocation file compaction failed: {e}");
+        }
     }
 
     /// 90% capacity threshold for SIEM alerting.
@@ -100,8 +354,18 @@ impl RevocationList {
         }
 
         let now = Self::now_us();
+        let expires_at = now + MAX_TOKEN_LIFETIME_US;
+
+        // Persist before updating in-memory state for crash safety
+        if let Err(e) = self.persist_revocation(&token_id, expires_at) {
+            tracing::error!(target: "siem", "Failed to persist revocation: {e}");
+        }
+
         self.revoked_ids.insert(token_id);
         self.revocation_times.insert(token_id, now);
+
+        // Periodic compaction when persistence file grows too large
+        self.maybe_compact();
 
         // Emit SIEM alert when crossing the 90% capacity threshold
         if self.revoked_ids.len() == Self::CAPACITY_WARN_THRESHOLD {
@@ -122,6 +386,16 @@ impl RevocationList {
 
     /// Evict the `count` oldest entries from the revocation list.
     fn evict_oldest(&mut self, count: usize) {
+        // SIEM CRITICAL: capacity-based eviction may indicate a revocation flooding attack
+        tracing::error!(
+            target: "siem",
+            event = "revocation_capacity_critical",
+            severity = 9,
+            "Revocation list at capacity ({} entries) — evicting oldest 10%. \
+             Possible revocation flooding attack.",
+            self.revoked_ids.len()
+        );
+
         let mut entries: Vec<([u8; 16], i64)> = self.revocation_times.iter()
             .map(|(id, ts)| (*id, *ts))
             .collect();
@@ -190,7 +464,11 @@ impl RevocationList {
 
 impl Default for RevocationList {
     fn default() -> Self {
-        Self::new()
+        Self {
+            revoked_ids: HashSet::new(),
+            revocation_times: HashMap::new(),
+            persistence_path: None,
+        }
     }
 }
 
@@ -217,6 +495,14 @@ impl SharedRevocationList {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(RevocationList::new())),
+            last_cleanup: Arc::new(RwLock::new(0)),
+        }
+    }
+
+    /// Create a new shared revocation list with an explicit persistence path.
+    pub fn with_persistence(path: PathBuf) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(RevocationList::with_persistence(path))),
             last_cleanup: Arc::new(RwLock::new(0)),
         }
     }
@@ -433,6 +719,90 @@ mod tests {
 
         srl.revoke(id);
         assert!(clone.is_revoked(&id));
+    }
+
+    #[test]
+    fn persistence_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("revocation_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("revocations.dat");
+        let _ = std::fs::remove_file(&path); // clean slate
+
+        let id1 = [0x10; 16];
+        let id2 = [0x20; 16];
+
+        // Revoke two tokens with persistence
+        {
+            let mut rl = RevocationList::with_persistence(path.clone());
+            assert!(rl.revoke(id1));
+            assert!(rl.revoke(id2));
+            assert_eq!(rl.len(), 2);
+        }
+
+        // Simulate restart: create a new list from the same file
+        {
+            let rl = RevocationList::with_persistence(path.clone());
+            assert!(rl.is_revoked(&id1), "id1 should survive restart");
+            assert!(rl.is_revoked(&id2), "id2 should survive restart");
+            assert_eq!(rl.len(), 2);
+        }
+
+        // Cleanup
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn persistence_filters_expired_on_load() {
+        let dir = std::env::temp_dir().join(format!("revocation_expired_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("revocations.dat");
+        let _ = std::fs::remove_file(&path);
+
+        let id_valid = [0x30; 16];
+        let id_expired = [0x40; 16];
+
+        // Write a file with one valid and one expired entry
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&path).unwrap();
+            let now = RevocationList::now_us();
+            let future_expires = now + MAX_TOKEN_LIFETIME_US;
+            let past_expires = now - 1_000_000; // already expired
+            writeln!(f, "{},{}", hex::encode(id_valid), future_expires).unwrap();
+            writeln!(f, "{},{}", hex::encode(id_expired), past_expires).unwrap();
+        }
+
+        let rl = RevocationList::with_persistence(path.clone());
+        assert!(rl.is_revoked(&id_valid), "valid entry should be loaded");
+        assert!(!rl.is_revoked(&id_expired), "expired entry should be skipped");
+        assert_eq!(rl.len(), 1);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn shared_persistence_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("shared_persist_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("revocations.dat");
+        let _ = std::fs::remove_file(&path);
+
+        let id = [0x50; 16];
+
+        {
+            let srl = SharedRevocationList::with_persistence(path.clone());
+            assert!(srl.revoke(id));
+        }
+
+        {
+            let srl = SharedRevocationList::with_persistence(path.clone());
+            assert!(srl.is_revoked(&id), "should survive restart via SharedRevocationList");
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 }
 

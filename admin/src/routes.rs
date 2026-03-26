@@ -458,6 +458,8 @@ pub enum DestructiveAction {
     KeyRotation,
     /// Bulk revocation of device credentials.
     BulkDeviceRevocation,
+    /// Toggle developer mode on or off.
+    DeveloperModeToggle,
 }
 
 impl DestructiveAction {
@@ -468,6 +470,18 @@ impl DestructiveAction {
             Self::TierChange => 2,
             Self::KeyRotation => 3, // Higher bar for key rotation
             Self::BulkDeviceRevocation => 2,
+            Self::DeveloperModeToggle => 2,
+        }
+    }
+
+    /// Whether this action requires the approver to be SuperAdmin.
+    pub fn requires_superadmin_approver(&self) -> bool {
+        match self {
+            Self::KeyRotation
+            | Self::UserDeletion
+            | Self::TierChange
+            | Self::BulkDeviceRevocation
+            | Self::DeveloperModeToggle => true,
         }
     }
 }
@@ -479,6 +493,7 @@ impl std::fmt::Display for DestructiveAction {
             Self::TierChange => write!(f, "tier_change"),
             Self::KeyRotation => write!(f, "key_rotation"),
             Self::BulkDeviceRevocation => write!(f, "bulk_device_revocation"),
+            Self::DeveloperModeToggle => write!(f, "developer_mode_toggle"),
         }
     }
 }
@@ -1452,8 +1467,24 @@ async fn setup_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Va
 
 async fn initial_setup(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<SetupRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    // SECURITY: Require out-of-band setup proof when MILNET_SETUP_PROOF is configured.
+    // This prevents unauthorized initial setup even if the endpoint is reachable.
+    // The proof is an HMAC-SHA512 digest that must be delivered via a separate channel.
+    if let Ok(expected_proof) = std::env::var("MILNET_SETUP_PROOF") {
+        let provided_proof = headers
+            .get("X-Setup-Proof")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        // Constant-time comparison to prevent timing side-channels
+        if !crypto::ct::ct_eq(provided_proof.as_bytes(), expected_proof.as_bytes()) {
+            tracing::warn!("initial_setup rejected: invalid or missing X-Setup-Proof header");
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
+
     // Only allow if no users exist yet (check both memory and DB)
     if state.setup_complete.load(Ordering::Relaxed) {
         return Err(StatusCode::FORBIDDEN);
@@ -1811,8 +1842,11 @@ async fn register_user(
     State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Result<Json<RegisterUserResponse>, StatusCode> {
-    // Extract tier from auth middleware
+    // Extract tier and role from auth middleware before consuming body
     let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(4);
+    let caller_role = request.extensions().get::<AuthAdminRole>()
+        .map(|r| r.0)
+        .unwrap_or(AdminRole::ReadOnly);
     // Registering users requires tier 1 (Sovereign)
     check_tier(caller_tier, 1)?;
 
@@ -1828,6 +1862,12 @@ async fn register_user(
         return Err(StatusCode::BAD_REQUEST);
     }
     let tier = req.tier.unwrap_or(2).clamp(1, 4);
+
+    // SECURITY: Only SuperAdmin can create tier-1 (Sovereign) users.
+    // UserManager is restricted to creating tier 2-4 users.
+    if tier == 1 && !caller_role.satisfies(AdminRole::SuperAdmin) {
+        return Err(StatusCode::FORBIDDEN);
+    }
 
     // Check if user already exists — return identical response shape to prevent
     // username enumeration (no 409, no distinguishable error).
@@ -3080,6 +3120,11 @@ struct DeveloperModeRequest {
     /// Required when MILNET_DEV_MODE_KEY is configured.
     #[serde(default)]
     activation_proof: Option<String>,
+    /// ID of an approved DeveloperModeToggle ceremony action.
+    /// Required: developer mode toggle is a destructive operation
+    /// that needs multi-person ceremony approval.
+    #[serde(default)]
+    ceremony_action_id: Option<Uuid>,
 }
 
 #[derive(Serialize)]
@@ -3107,6 +3152,37 @@ async fn set_developer_mode(
     if !crypto::ct::ct_eq(token.as_bytes(), state.admin_api_key.as_bytes()) {
         tracing::warn!("developer-mode toggle rejected: not super-admin");
         return Err(StatusCode::FORBIDDEN);
+    }
+
+    // SECURITY: Developer mode toggle is a destructive operation requiring
+    // multi-person ceremony (DeveloperModeToggle, 2 SuperAdmin approvals).
+    // The caller must submit and get approval via /api/admin/actions/submit first,
+    // then provide the approved action_id here.
+    let action_id = body.ceremony_action_id.ok_or_else(|| {
+        tracing::warn!("developer-mode toggle rejected: no ceremony_action_id provided");
+        StatusCode::FORBIDDEN
+    })?;
+    {
+        let mut actions = state.pending_admin_actions.write().await;
+        let action = actions.get(&action_id).ok_or_else(|| {
+            tracing::warn!("developer-mode toggle rejected: ceremony action not found");
+            StatusCode::FORBIDDEN
+        })?;
+        if action.action_type != DestructiveAction::DeveloperModeToggle {
+            tracing::warn!("developer-mode toggle rejected: wrong ceremony action type");
+            return Err(StatusCode::FORBIDDEN);
+        }
+        if action.approvals.len() < action.required_approvals {
+            tracing::warn!("developer-mode toggle rejected: insufficient ceremony approvals");
+            return Err(StatusCode::FORBIDDEN);
+        }
+        if now_secs() > action.expires_at {
+            actions.remove(&action_id);
+            tracing::warn!("developer-mode toggle rejected: ceremony action expired");
+            return Err(StatusCode::FORBIDDEN);
+        }
+        // Consume the ceremony action so it cannot be reused
+        actions.remove(&action_id);
     }
 
     // Production mode protection: refuse to enable developer mode at runtime
@@ -3533,6 +3609,11 @@ async fn oauth_token(
         None => return Json(serde_json::json!({"error": "invalid_grant"})),
     };
     drop(codes);
+
+    // Verify client_id matches the one that created the authorization code
+    if auth_code.client_id != req.client_id {
+        return Json(serde_json::json!({"error": "invalid_grant"}));
+    }
 
     // Verify redirect_uri matches
     if auth_code.redirect_uri != req.redirect_uri {
@@ -4068,7 +4149,7 @@ async fn initiate_ceremony(
     check_tier(caller_tier, 1)?;
 
     let initiator = extract_user_id_from_request(&request)
-        .unwrap_or_else(Uuid::nil);
+        .ok_or(StatusCode::UNAUTHORIZED)?; // SECURITY: reject nil UUID — ceremony requires verified identity
 
     let body = axum::body::to_bytes(request.into_body(), 1024 * 64)
         .await
@@ -4115,7 +4196,14 @@ async fn approve_ceremony(
     check_tier(caller_tier, 1)?;
 
     let approver = extract_user_id_from_request(&request)
-        .unwrap_or_else(Uuid::nil);
+        .ok_or(StatusCode::UNAUTHORIZED)?; // SECURITY: reject nil UUID — ceremony requires verified identity
+
+    // Extract the approver's admin role before consuming the request body
+    let approver_role = request
+        .extensions()
+        .get::<AuthAdminRole>()
+        .map(|r| r.0)
+        .unwrap_or(AdminRole::ReadOnly);
 
     let body = axum::body::to_bytes(request.into_body(), 1024 * 64)
         .await
@@ -4153,6 +4241,24 @@ async fn approve_ceremony(
             required,
             error: Some("ceremony expired".into()),
         }));
+    }
+
+    // SECURITY: For admin-level ceremonies, the approver must also be SuperAdmin.
+    // This prevents lower-privilege roles from rubber-stamping destructive operations.
+    let admin_ceremony_actions = [
+        "key_rotation", "user_deletion", "tier_change",
+        "bulk_device_revocation", "developer_mode_toggle",
+    ];
+    if admin_ceremony_actions.iter().any(|a| ceremony.action == *a) {
+        if !approver_role.satisfies(AdminRole::SuperAdmin) {
+            return Ok(Json(ApproveCeremonyResponse {
+                approved: false,
+                complete: false,
+                approvals: ceremony.approvals.len(),
+                required: ceremony.required_approvals,
+                error: Some("approver role insufficient — SuperAdmin required for this ceremony type".into()),
+            }));
+        }
     }
 
     // Approver cannot be the initiator
@@ -4729,7 +4835,8 @@ async fn submit_admin_action(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let initiator = extract_user_id_from_request(&request).unwrap_or_else(Uuid::nil);
+    let initiator = extract_user_id_from_request(&request)
+        .ok_or(StatusCode::UNAUTHORIZED)?; // SECURITY: reject nil UUID — ceremony requires verified identity
 
     let body = axum::body::to_bytes(request.into_body(), 1024 * 64)
         .await
@@ -4812,7 +4919,8 @@ async fn approve_admin_action(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let approver = extract_user_id_from_request(&request).unwrap_or_else(Uuid::nil);
+    let approver = extract_user_id_from_request(&request)
+        .ok_or(StatusCode::UNAUTHORIZED)?; // SECURITY: reject nil UUID — ceremony requires verified identity
 
     let body = axum::body::to_bytes(request.into_body(), 1024 * 64)
         .await
@@ -4959,21 +5067,13 @@ async fn get_admin_role_keys(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let keys: Vec<serde_json::Value> = [
-        AdminRole::SuperAdmin,
-        AdminRole::UserManager,
-        AdminRole::DeviceManager,
-        AdminRole::Auditor,
-        AdminRole::ReadOnly,
-    ]
-    .iter()
-    .map(|role| {
-        serde_json::json!({
-            "role": role.key_label(),
-            "api_key": derive_admin_role_key(*role),
-        })
-    })
-    .collect();
+    // SECURITY: Only return the caller's own role key. Returning all role keys
+    // would allow a single compromised SuperAdmin to impersonate every role,
+    // violating least-privilege and making lateral movement trivial.
+    let keys: Vec<serde_json::Value> = vec![serde_json::json!({
+        "role": caller_role.key_label(),
+        "api_key": derive_admin_role_key(caller_role),
+    })];
 
     Ok(Json(serde_json::json!({ "role_keys": keys })))
 }

@@ -71,12 +71,18 @@ impl SessionManager {
     }
 
     /// Create a new session and return its initial epoch (always 0).
-    pub fn create_session(&self, session_id: Uuid, master_secret: &[u8; 64]) -> u64 {
-        let chain = RatchetChain::new(master_secret);
+    pub fn create_session(&self, session_id: Uuid, master_secret: &[u8; 64]) -> Result<u64, String> {
+        let chain = RatchetChain::new(master_secret)?;
         let epoch = chain.epoch();
-        let mut sessions = self.sessions.write().expect("sessions lock poisoned");
+        let mut sessions = match self.sessions.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::error!("sessions RwLock poisoned — recovering write access");
+                poisoned.into_inner()
+            }
+        };
         sessions.insert(session_id, chain);
-        epoch
+        Ok(epoch)
     }
 
     /// Advance a session's chain by one epoch, returning the new epoch.
@@ -87,7 +93,13 @@ impl SessionManager {
         server_entropy: &[u8; 32],
         server_nonce: &[u8; 32],
     ) -> Result<u64, String> {
-        let mut sessions = self.sessions.write().expect("sessions lock poisoned");
+        let mut sessions = match self.sessions.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::error!("sessions RwLock poisoned — recovering write access");
+                poisoned.into_inner()
+            }
+        };
         let chain = sessions
             .get_mut(session_id)
             .ok_or_else(|| "session not found".to_string())?;
@@ -100,7 +112,13 @@ impl SessionManager {
 
     /// Generate a ratchet tag for the given session's current epoch.
     pub fn generate_tag(&self, session_id: &Uuid, claims_bytes: &[u8]) -> Result<[u8; 64], String> {
-        let sessions = self.sessions.read().expect("sessions lock poisoned");
+        let sessions = match self.sessions.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::error!("sessions RwLock poisoned — recovering read access");
+                poisoned.into_inner()
+            }
+        };
         let chain = sessions
             .get(session_id)
             .ok_or_else(|| "session not found".to_string())?;
@@ -115,7 +133,13 @@ impl SessionManager {
         tag: &[u8; 64],
         token_epoch: u64,
     ) -> Result<bool, String> {
-        let sessions = self.sessions.read().expect("sessions lock poisoned");
+        let sessions = match self.sessions.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::error!("sessions RwLock poisoned — recovering read access");
+                poisoned.into_inner()
+            }
+        };
         let chain = sessions
             .get(session_id)
             .ok_or_else(|| "session not found".to_string())?;
@@ -124,7 +148,13 @@ impl SessionManager {
 
     /// Destroy a session, securely erasing its chain key.
     pub fn destroy_session(&self, session_id: &Uuid) {
-        let mut sessions = self.sessions.write().expect("sessions lock poisoned");
+        let mut sessions = match self.sessions.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::error!("sessions RwLock poisoned — recovering write access");
+                poisoned.into_inner()
+            }
+        };
         sessions.remove(session_id); // Drop handles key cleanup
     }
 
@@ -132,7 +162,13 @@ impl SessionManager {
     /// before removal from the map. This ensures the key material is
     /// erased even if `Drop` is somehow bypassed.
     pub fn destroy_session_secure(&mut self, session_id: &Uuid) {
-        let sessions = self.sessions.get_mut().expect("sessions lock poisoned");
+        let sessions = match self.sessions.get_mut() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::error!("sessions RwLock poisoned — recovering mutable access");
+                poisoned.into_inner()
+            }
+        };
         if let Some(mut chain) = sessions.remove(session_id) {
             // Explicitly zeroize before drop. The Drop impl on RatchetChain
             // will also fire, but belt-and-suspenders.
@@ -171,12 +207,21 @@ fn derive_table_kek(master_kek: &[u8; 32]) -> [u8; 32] {
 
 /// Encrypt a chain key with AES-256-GCM using a table-specific KEK derived
 /// from the master KEK. AAD binds to the session ID.
-pub fn encrypt_chain_key(kek: &[u8; 32], session_id: &str, key: &[u8]) -> Vec<u8> {
+pub fn encrypt_chain_key(kek: &[u8; 32], session_id: &str, key: &[u8]) -> Result<Vec<u8>, String> {
     use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
     let table_kek = derive_table_kek(kek);
     let cipher = Aes256Gcm::new_from_slice(&table_kek).expect("32-byte key");
     let mut nb = [0u8; NONCE_LEN];
-    getrandom::getrandom(&mut nb).expect("entropy");
+    for attempt in 0..3u8 {
+        if getrandom::getrandom(&mut nb).is_ok() {
+            break;
+        }
+        tracing::error!("entropy source failed for nonce generation, attempt {}/3", attempt + 1);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        if attempt == 2 {
+            return Err("OS CSPRNG unavailable after 3 retries".into());
+        }
+    }
     let nonce = Nonce::from_slice(&nb);
     let mut aad = Vec::with_capacity(CHAIN_KEY_AAD_PREFIX.len() + session_id.len());
     aad.extend_from_slice(CHAIN_KEY_AAD_PREFIX);
@@ -187,12 +232,15 @@ pub fn encrypt_chain_key(kek: &[u8; 32], session_id: &str, key: &[u8]) -> Vec<u8
     let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
     out.extend_from_slice(&nb);
     out.extend_from_slice(&ct);
-    out
+    Ok(out)
 }
 
 /// Decrypt a chain key with AES-256-GCM using a table-specific KEK derived
 /// from the master KEK. AAD binds to the session ID.
-pub fn decrypt_chain_key(kek: &[u8; 32], session_id: &str, ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+///
+/// Returns a fixed-size `[u8; 64]` array and zeroizes the intermediate heap
+/// allocation to prevent plaintext chain key leakage.
+pub fn decrypt_chain_key(kek: &[u8; 32], session_id: &str, ciphertext: &[u8]) -> Result<[u8; 64], String> {
     use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
     if ciphertext.len() < NONCE_LEN + 16 {
         return Err("ciphertext too short".into());
@@ -202,7 +250,7 @@ pub fn decrypt_chain_key(kek: &[u8; 32], session_id: &str, ciphertext: &[u8]) ->
     let mut aad = Vec::with_capacity(CHAIN_KEY_AAD_PREFIX.len() + session_id.len());
     aad.extend_from_slice(CHAIN_KEY_AAD_PREFIX);
     aad.extend_from_slice(session_id.as_bytes());
-    let pt = cipher
+    let mut pt = cipher
         .decrypt(
             Nonce::from_slice(&ciphertext[..NONCE_LEN]),
             aes_gcm::aead::Payload {
@@ -217,23 +265,24 @@ pub fn decrypt_chain_key(kek: &[u8; 32], session_id: &str, ciphertext: &[u8]) ->
             );
             "chain key decryption failed".to_string()
         })?;
-    Ok(pt)
+    if pt.len() != 64 {
+        pt.zeroize();
+        return Err(format!("expected 64-byte chain key, got {}", pt.len()));
+    }
+    let mut result = [0u8; 64];
+    result.copy_from_slice(&pt);
+    pt.zeroize(); // securely erase heap-allocated plaintext
+    Ok(result)
 }
 
 /// Internal encrypt using Uuid directly (used by PersistentSessionManager).
-fn encrypt_chain_key_uuid(kek: &[u8; 32], chain_key: &[u8; 64], session_id: &Uuid) -> Vec<u8> {
+fn encrypt_chain_key_uuid(kek: &[u8; 32], chain_key: &[u8; 64], session_id: &Uuid) -> Result<Vec<u8>, String> {
     encrypt_chain_key(kek, &session_id.to_string(), chain_key.as_ref())
 }
 
 /// Internal decrypt returning fixed-size key (used by PersistentSessionManager).
 fn decrypt_chain_key_uuid(kek: &[u8; 32], sealed: &[u8], session_id: &Uuid) -> Result<[u8; 64], String> {
-    let pt = decrypt_chain_key(kek, &session_id.to_string(), sealed)?;
-    if pt.len() != 64 {
-        return Err(format!("expected 64-byte chain key, got {}", pt.len()));
-    }
-    let mut k = [0u8; 64];
-    k.copy_from_slice(&pt);
-    Ok(k)
+    decrypt_chain_key(kek, &session_id.to_string(), sealed)
 }
 
 fn now_us() -> i64 {
@@ -269,8 +318,31 @@ impl PersistentSessionManager {
         .await
         .map_err(|e| format!("load: {e}"))?;
 
-        let mut ss = self.memory.sessions.write().expect("lock");
+        let mut ss = match self.memory.sessions.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::error!("sessions RwLock poisoned — recovering write access");
+                poisoned.into_inner()
+            }
+        };
         for (sid, ep, enc, _, _) in rows {
+            // Check epoch against persisted DB state to detect rollback attacks
+            let db_epoch: Option<i64> = sqlx::query_scalar(
+                "SELECT current_epoch FROM ratchet_sessions WHERE session_id = $1"
+            )
+            .bind(sid)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| format!("epoch check: {e}"))?;
+
+            if let Some(stored_ep) = db_epoch {
+                if (ep as i64) < stored_ep {
+                    return Err(format!(
+                        "epoch rollback detected for {sid}: loaded {ep} < stored {stored_ep}"
+                    ));
+                }
+            }
+
             let ck = decrypt_chain_key_uuid(&self.kek, &enc, &sid).map_err(|e| {
                 tracing::error!(
                     session_id = %sid,
@@ -278,7 +350,7 @@ impl PersistentSessionManager {
                 );
                 format!("decrypt chain key for {sid}: {e}")
             })?;
-            let ch = RatchetChain::from_persisted(ck, ep as u64);
+            let ch = RatchetChain::from_persisted(ck, ep as u64)?;
             if let Some(ex) = ss.get(&sid) {
                 if (ep as u64) < ex.epoch() {
                     return Err(format!("rollback {sid}"));
@@ -290,17 +362,21 @@ impl PersistentSessionManager {
     }
 
     pub async fn create_session(&self, sid: Uuid, ms: &[u8; 64]) -> Result<u64, String> {
-        let ep = self.memory.create_session(sid, ms);
+        let ep = self.memory.create_session(sid, ms)?;
         let ck = {
-            self.memory
-                .sessions
-                .read()
-                .expect("l")
+            let sessions = match self.memory.sessions.read() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    tracing::error!("sessions RwLock poisoned — recovering read access");
+                    poisoned.into_inner()
+                }
+            };
+            sessions
                 .get(&sid)
-                .expect("c")
+                .ok_or_else(|| "session just created but not found".to_string())?
                 .current_key()
         };
-        let enc = encrypt_chain_key_uuid(&self.kek, &ck, &sid);
+        let enc = encrypt_chain_key_uuid(&self.kek, &ck, &sid)?;
         let now = now_us();
         sqlx::query(
             "INSERT INTO ratchet_sessions \
@@ -329,15 +405,19 @@ impl PersistentSessionManager {
     ) -> Result<u64, String> {
         let ep = self.memory.advance_session(sid, ce, se, sn)?;
         let ck = {
-            self.memory
-                .sessions
-                .read()
-                .expect("l")
+            let sessions = match self.memory.sessions.read() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    tracing::error!("sessions RwLock poisoned — recovering read access");
+                    poisoned.into_inner()
+                }
+            };
+            sessions
                 .get(sid)
-                .expect("e")
+                .ok_or_else(|| "session not found after advance".to_string())?
                 .current_key()
         };
-        let enc = encrypt_chain_key_uuid(&self.kek, &ck, sid);
+        let enc = encrypt_chain_key_uuid(&self.kek, &ck, sid)?;
         let now = now_us();
         let r = sqlx::query(
             "UPDATE ratchet_sessions SET \
@@ -402,9 +482,9 @@ mod tests {
         let s = Uuid::new_v4();
         let mut ck = [0u8; 64];
         getrandom::getrandom(&mut ck).unwrap();
-        let enc = encrypt_chain_key(&k, &s.to_string(), &ck);
+        let enc = encrypt_chain_key(&k, &s.to_string(), &ck).unwrap();
         let dec = decrypt_chain_key(&k, &s.to_string(), &enc).unwrap();
-        assert_eq!(&ck[..], &dec[..]);
+        assert_eq!(ck, dec);
     }
 
     #[test]
@@ -414,7 +494,7 @@ mod tests {
         let mut k2 = [0u8; 32];
         getrandom::getrandom(&mut k2).unwrap();
         let s = Uuid::new_v4();
-        let enc = encrypt_chain_key(&k1, &s.to_string(), &[0xAB; 64]);
+        let enc = encrypt_chain_key(&k1, &s.to_string(), &[0xAB; 64]).unwrap();
         assert!(decrypt_chain_key(&k2, &s.to_string(), &enc).is_err());
     }
 
@@ -423,7 +503,7 @@ mod tests {
         let mut k = [0u8; 32];
         getrandom::getrandom(&mut k).unwrap();
         let s = Uuid::new_v4();
-        let mut sealed = encrypt_chain_key(&k, &s.to_string(), &[0xEF; 64]);
+        let mut sealed = encrypt_chain_key(&k, &s.to_string(), &[0xEF; 64]).unwrap();
         if sealed.len() > 15 {
             sealed[15] ^= 0xFF;
         }
@@ -434,7 +514,7 @@ mod tests {
     fn test_create_advance() {
         let m = SessionManager::new();
         let s = Uuid::new_v4();
-        assert_eq!(m.create_session(s, &[0x42u8; 64]), 0);
+        assert_eq!(m.create_session(s, &[0x42u8; 64]).unwrap(), 0);
         // Generate valid entropy (not all same byte, has >= 4 distinct values)
         let mut ce = [0u8; 32];
         let mut se = [0u8; 32];
@@ -449,7 +529,7 @@ mod tests {
     fn test_tag() {
         let m = SessionManager::new();
         let s = Uuid::new_v4();
-        m.create_session(s, &[0x42u8; 64]);
+        m.create_session(s, &[0x42u8; 64]).unwrap();
         let t = m.generate_tag(&s, b"c").unwrap();
         assert!(m.verify_tag(&s, b"c", &t, 0).unwrap());
     }
@@ -458,7 +538,7 @@ mod tests {
     fn test_destroy() {
         let m = SessionManager::new();
         let s = Uuid::new_v4();
-        m.create_session(s, &[0x42u8; 64]);
+        m.create_session(s, &[0x42u8; 64]).unwrap();
         m.destroy_session(&s);
         assert!(m.generate_tag(&s, b"x").is_err());
     }
@@ -468,7 +548,7 @@ mod tests {
     fn test_zero_entropy_rejected() {
         let m = SessionManager::new();
         let s = Uuid::new_v4();
-        m.create_session(s, &[0x42u8; 64]);
+        m.create_session(s, &[0x42u8; 64]).unwrap();
         let mut sn = [0u8; 32];
         getrandom::getrandom(&mut sn).unwrap();
         m.advance_session(&s, &[0u8; 32], &[0x11; 32], &sn).unwrap();
@@ -479,7 +559,7 @@ mod tests {
     fn test_low_quality_entropy_rejected() {
         let m = SessionManager::new();
         let s = Uuid::new_v4();
-        m.create_session(s, &[0x42u8; 64]);
+        m.create_session(s, &[0x42u8; 64]).unwrap();
         // Only 2 distinct byte values — below MIN_DISTINCT_BYTES (4)
         let low_quality = {
             let mut e = [0xAA_u8; 32];
@@ -498,7 +578,7 @@ mod tests {
     fn test_nonce_reuse_rejected() {
         let m = SessionManager::new();
         let s = Uuid::new_v4();
-        m.create_session(s, &[0x42u8; 64]);
+        m.create_session(s, &[0x42u8; 64]).unwrap();
         let mut ce = [0u8; 32];
         let mut se = [0u8; 32];
         let mut sn = [0u8; 32];
@@ -526,7 +606,7 @@ mod tests {
         getrandom::getrandom(&mut k).unwrap();
         let s1 = Uuid::new_v4();
         let s2 = Uuid::new_v4();
-        let enc = encrypt_chain_key(&k, &s1.to_string(), &[0xAB; 64]);
+        let enc = encrypt_chain_key(&k, &s1.to_string(), &[0xAB; 64]).unwrap();
         // Decrypting with a different session_id should fail (AAD mismatch)
         assert!(decrypt_chain_key(&k, &s2.to_string(), &enc).is_err());
     }

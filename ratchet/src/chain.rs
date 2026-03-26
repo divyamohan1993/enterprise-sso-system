@@ -9,6 +9,7 @@ use common::domain;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::Sha512;
+use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
 
 type HmacSha512 = Hmac<Sha512>;
@@ -106,11 +107,24 @@ impl Zeroize for NonceBloomFilter {
 /// use a conservative threshold: at least 4 distinct byte values.
 const MIN_DISTINCT_BYTES: usize = 4;
 
+/// Generate random bytes with retry logic, returning an error instead of panicking
+/// on entropy exhaustion.
+fn generate_random_bytes(buf: &mut [u8]) -> Result<(), String> {
+    for attempt in 0..3 {
+        if getrandom::getrandom(buf).is_ok() {
+            return Ok(());
+        }
+        tracing::error!("entropy source failed, attempt {}/3", attempt + 1);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Err("OS CSPRNG unavailable after 3 retries".into())
+}
+
 /// Random canary value set at construction for overflow detection.
-fn random_canary() -> u64 {
+fn random_canary() -> Result<u64, String> {
     let mut buf = [0u8; 8];
-    getrandom::getrandom(&mut buf).expect("OS CSPRNG must be available");
-    u64::from_ne_bytes(buf)
+    generate_random_bytes(&mut buf)?;
+    Ok(u64::from_ne_bytes(buf))
 }
 
 /// Lock a memory region so it cannot be paged to swap.
@@ -213,10 +227,11 @@ impl Zeroize for RatchetChain {
 
 impl RatchetChain {
     /// Verify canary integrity. Returns true if both canaries are intact.
+    /// Uses constant-time comparison to prevent timing side-channels.
     fn verify_canaries(&self) -> bool {
-        let head_diff = self.canary_head ^ self.expected_head;
-        let tail_diff = self.canary_tail ^ self.expected_tail;
-        (head_diff | tail_diff) == 0
+        let h = self.canary_head.to_ne_bytes().ct_eq(&self.expected_head.to_ne_bytes());
+        let t = self.canary_tail.to_ne_bytes().ct_eq(&self.expected_tail.to_ne_bytes());
+        (h & t).into()
     }
 
     /// Assert canary integrity, panicking with zeroization on violation.
@@ -260,14 +275,16 @@ impl RatchetChain {
     }
 
     /// Create a new chain from a master secret.
-    pub fn new(master_secret: &[u8; 64]) -> Self {
+    ///
+    /// Returns an error if the OS CSPRNG is unavailable (entropy exhaustion).
+    pub fn new(master_secret: &[u8; 64]) -> Result<Self, String> {
         let hk = Hkdf::<Sha512>::new(None, master_secret);
         let mut chain_key = [0u8; 64];
         hk.expand(domain::RATCHET_ADVANCE, &mut chain_key)
             .expect("64-byte expand must succeed for HKDF-SHA512");
 
-        let head = random_canary();
-        let tail = random_canary();
+        let head = random_canary()?;
+        let tail = random_canary()?;
 
         let mut chain = Self {
             canary_head: head,
@@ -283,7 +300,7 @@ impl RatchetChain {
             nonce_bloom: NonceBloomFilter::new(),
         };
         chain.lock_chain_key();
-        chain
+        Ok(chain)
     }
 
     /// Advance the chain by one epoch.
@@ -561,9 +578,11 @@ impl RatchetChain {
 
 impl RatchetChain {
     /// Reconstruct a chain from a persisted chain key and epoch.
-    pub fn from_persisted(chain_key: [u8; 64], epoch: u64) -> Self {
-        let head = random_canary();
-        let tail = random_canary();
+    ///
+    /// Returns an error if the OS CSPRNG is unavailable (entropy exhaustion).
+    pub fn from_persisted(chain_key: [u8; 64], epoch: u64) -> Result<Self, String> {
+        let head = random_canary()?;
+        let tail = random_canary()?;
         let mut chain = Self {
             canary_head: head,
             chain_key,
@@ -578,7 +597,7 @@ impl RatchetChain {
             nonce_bloom: NonceBloomFilter::new(),
         };
         chain.lock_chain_key();
-        chain
+        Ok(chain)
     }
 
     /// Return a copy of the current chain key for persistence (must be encrypted before storage).

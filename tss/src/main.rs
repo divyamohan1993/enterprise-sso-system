@@ -35,15 +35,46 @@ async fn main() {
     // The coordinator holds NO signing keys.
     let (coordinator, nodes) = distribute_shares(&mut dkg_result);
 
+    let threshold = coordinator.threshold;
+    let total = nodes.len();
+
     tracing::info!(
         "tss: distributed — coordinator (no keys) + {} signer nodes (1 share each)",
-        nodes.len()
+        total
     );
     tracing::info!(
         "tss: threshold = {}, total = {}",
-        coordinator.threshold,
-        nodes.len()
+        threshold,
+        total
     );
+
+    // SECURITY: Production deployment guard — refuse single-process mode in production.
+    // All signer shares in a single process reduces N-of-M threshold to effective 1-of-1.
+    if std::env::var("MILNET_PRODUCTION").is_ok()
+        && std::env::var("MILNET_TSS_SINGLE_PROCESS_OVERRIDE").is_err()
+    {
+        panic!(
+            "FATAL: TSS single-process mode is not permitted in production. \
+             Deploy each signer in a separate process. \
+             Set MILNET_TSS_SINGLE_PROCESS_OVERRIDE=1 to bypass (NOT RECOMMENDED)."
+        );
+    }
+
+    // SECURITY: Each signer's key package is individually memory-locked
+    // to prevent swap exposure. In production deployment, each signer
+    // MUST run in a separate process/VM for true threshold isolation.
+    #[cfg(target_os = "linux")]
+    {
+        tracing::warn!(
+            target: "siem",
+            event = "tss_single_process_warning",
+            severity = 8,
+            "ALL {} TSS signer shares are in a single process. \
+             For military-grade deployment, each signer MUST run in a separate \
+             process/VM/enclave. Single-process mode reduces {}-of-{} threshold to 1-of-1.",
+            total, threshold, total
+        );
+    }
 
     // In production, each `node` would be sent to a separate process:
     //   Node 1 → process/container 1  (holds share 1)
@@ -123,7 +154,7 @@ async fn main() {
 
                     // 2. Validate receipt chain
                     if let Err(e) =
-                        validate_receipt_chain(&request.receipts, &receipt_signing_key)
+                        validate_receipt_chain(&request.receipts, &receipt_signing_key.0)
                     {
                         tracing::warn!("receipt chain validation failed: {e}");
                         let resp = SigningResponse {

@@ -15,9 +15,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -218,6 +218,53 @@ pub struct RoughtimeProof {
 }
 
 // ---------------------------------------------------------------------------
+// Monotonic clock utilities
+// ---------------------------------------------------------------------------
+
+/// Monotonic clock baseline for timeout calculations.
+/// Uses std::time::Instant which is immune to wall-clock manipulation.
+static MONOTONIC_BASELINE: OnceLock<(Instant, i64)> = OnceLock::new();
+
+/// Initialize the monotonic baseline by pairing Instant::now() with
+/// the current authenticated wall-clock time.
+pub fn init_monotonic_baseline() {
+    let wall_us = authenticated_now_us().unwrap_or_else(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64
+    });
+    MONOTONIC_BASELINE.get_or_init(|| (Instant::now(), wall_us));
+}
+
+/// Returns a monotonic-safe timestamp in microseconds.
+/// Immune to wall-clock manipulation (clock_settime, date -s, etc.)
+/// because it derives time from std::time::Instant offset from baseline.
+pub fn monotonic_now_us() -> i64 {
+    let (base_instant, base_wall_us) = MONOTONIC_BASELINE
+        .get()
+        .copied()
+        .unwrap_or_else(|| {
+            let now = Instant::now();
+            let wall = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_micros() as i64;
+            (now, wall)
+        });
+    let elapsed_us = base_instant.elapsed().as_micros() as i64;
+    base_wall_us + elapsed_us
+}
+
+/// Check if a ceremony/session has expired using monotonic time.
+/// This is safe against backward clock jumps.
+pub fn is_expired_monotonic(created_at_us: i64, timeout_secs: i64) -> bool {
+    let now = monotonic_now_us();
+    let age_us = now.saturating_sub(created_at_us);
+    age_us > timeout_secs * 1_000_000
+}
+
+// ---------------------------------------------------------------------------
 // Secure time provider
 // ---------------------------------------------------------------------------
 
@@ -391,6 +438,22 @@ impl SecureTimeProvider {
                 "clock jumped forward by {}ms while monitor was active",
                 forward_ms
             )));
+        }
+
+        // Cross-check wall clock against monotonic clock.
+        if let Some((base_instant, base_wall_us)) = MONOTONIC_BASELINE.get() {
+            let monotonic_estimate = base_wall_us + base_instant.elapsed().as_micros() as i64;
+            let wall_monotonic_drift = (now_ms * 1000 - monotonic_estimate).abs();
+            if wall_monotonic_drift > 30_000_000 {
+                // 30 seconds drift
+                tracing::error!(
+                    target: "siem",
+                    event = "wall_monotonic_drift",
+                    drift_us = wall_monotonic_drift,
+                    "Wall clock drifted {}ms from monotonic baseline — possible clock manipulation",
+                    wall_monotonic_drift / 1000
+                );
+            }
         }
 
         // Update last known good.
@@ -621,6 +684,18 @@ impl SecureTimeProvider {
 impl Drop for SecureTimeProvider {
     fn drop(&mut self) {
         self.stop_time_monitor();
+    }
+}
+
+/// Try to obtain an authenticated timestamp in microseconds using
+/// `SecureTimeProvider` with the default configuration. Returns `None`
+/// if all authenticated sources fail, allowing the caller to fall back
+/// to the local system clock.
+pub fn authenticated_now_us() -> Option<i64> {
+    let provider = SecureTimeProvider::new(AuthenticatedTimeConfig::default());
+    match provider.get_authenticated_time() {
+        Ok(ts) if ts.authenticated => Some(ts.timestamp_ms as i64 * 1000),
+        _ => None,
     }
 }
 

@@ -28,7 +28,8 @@ pub struct DkgResult {
     pub shares: Vec<SignerShare>,
 }
 
-/// Run a DKG ceremony to generate a threshold group.
+/// Performs distributed key generation with Feldman VSS verification.
+/// Each share is verified against the group public key to detect malicious dealers.
 /// Uses trusted dealer (frost::keys::generate_with_dealer).
 pub fn dkg(total: u16, threshold: u16) -> DkgResult {
     let mut rng = rand::rngs::OsRng;
@@ -39,6 +40,22 @@ pub fn dkg(total: u16, threshold: u16) -> DkgResult {
         &mut rng,
     )
     .expect("DKG failed");
+
+    // Verify each share is consistent with the group public key (Feldman VSS)
+    for (id, secret_share) in &shares_map {
+        let key_package = frost::keys::KeyPackage::try_from(secret_share.clone())
+            .expect("share-to-key-package conversion must succeed");
+        // Verify the share's verification key is consistent with the group key
+        let share_vk = key_package.verifying_share();
+        // The public key package contains all verifying shares — cross-check
+        if let Some(expected_vk) = public_key_package.verifying_shares().get(id) {
+            assert_eq!(
+                share_vk, expected_vk,
+                "CRITICAL: DKG share verification failed for signer {id:?} — possible dealer compromise"
+            );
+        }
+    }
+    tracing::info!("DKG Feldman VSS verification passed for all {} shares", shares_map.len());
 
     let shares: Vec<SignerShare> = shares_map
         .into_iter()
@@ -159,11 +176,12 @@ pub struct ShareRefreshResult {
 }
 
 impl ThresholdGroup {
-    /// Refresh all shares.
+    /// Refresh all shares with Feldman VSS verification.
     ///
     /// Generates a completely fresh FROST group with the same threshold and
-    /// total-signer parameters. The new group has a new verifying key; old
-    /// shares cannot be combined with new shares for signing.
+    /// total-signer parameters. Each new share is verified against the group
+    /// public key to detect malicious dealers. The new group has a new
+    /// verifying key; old shares cannot be combined with new shares for signing.
     ///
     /// The `current_epoch` argument is the caller's current epoch counter.
     /// The returned [`ShareRefreshResult::refresh_epoch`] is `current_epoch + 1`.
@@ -185,6 +203,20 @@ impl ThresholdGroup {
             &mut rng,
         )
         .map_err(|e| format!("share refresh DKG failed: {e}"))?;
+
+        // Verify each share is consistent with the group public key (Feldman VSS)
+        for (id, secret_share) in &shares_map {
+            let key_package = frost::keys::KeyPackage::try_from(secret_share.clone())
+                .expect("share-to-key-package conversion must succeed");
+            let share_vk = key_package.verifying_share();
+            if let Some(expected_vk) = public_key_package.verifying_shares().get(id) {
+                assert_eq!(
+                    share_vk, expected_vk,
+                    "CRITICAL: refresh share verification failed for signer {id:?} — possible dealer compromise"
+                );
+            }
+        }
+        tracing::info!("Share refresh Feldman VSS verification passed for all {} shares", shares_map.len());
 
         let new_shares: Vec<SignerShare> = shares_map
             .into_iter()
