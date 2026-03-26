@@ -37,3 +37,5 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 futures-core = "0.3"
 urlencoding = "2"
 rsa.workspace = true
+aes-gcm.workspace = true
+getrandom.workspace = true
