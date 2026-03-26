@@ -29,6 +29,7 @@ cryptoki = { workspace = true, optional = true }
 sha1 = "0.10"
 serde_json = "1"
 rand.workspace = true
+base64 = "0.22"
 
 [dev-dependencies]
 

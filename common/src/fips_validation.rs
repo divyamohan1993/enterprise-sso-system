@@ -31,7 +31,7 @@ use std::sync::{Mutex, OnceLock};
 /// - Level 2: Tamper-evident coatings, role-based authentication
 /// - Level 3: Tamper-resistant enclosures, identity-based authentication
 /// - Level 4: Complete envelope of protection, environmental failure testing
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub enum FipsLevel {
     Level1,
     Level2,

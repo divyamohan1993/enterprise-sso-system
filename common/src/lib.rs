@@ -99,6 +99,48 @@ pub mod conditional_access;
 
 // ── Multi-tenant isolation ──
 pub mod multi_tenancy;
+pub mod tenant_middleware;
 
 // ── Identity Lifecycle Management ──
 pub mod idm;
+
+// ── Continuous Access Evaluation ──
+pub mod cae;
+
+// ── SCIM 2.0 provisioning server ──
+pub mod scim;
+
+// ── FedRAMP compliance evidence auto-generation ──
+pub mod fedramp_evidence;
+
+// ── Automated STIG scanner with CI/CD integration ──
+pub mod stig_scanner;
+
+// ── SOC 2 Type II evidence collector ──
+pub mod soc2_evidence;
+
+// ── FIPS 140-3 validation abstraction layer ──
+pub mod fips_validation;
+
+// ── FIPS 140-3 CMVP submission tracker dashboard ──
+pub mod fips_tracker;
+
+// ── Encrypted audit metadata ──
+pub mod encrypted_audit;
+
+// ── SAML 2.0 Identity Provider ──
+pub mod saml;
+
+// ── Webhook / Event Streaming ──
+pub mod event_streaming;
+
+// ── Delegated Administration ──
+pub mod delegated_admin;
+
+// ── Self-Service Portal ──
+pub mod self_service;
+
+// ── Service discovery, distributed locks, persistent sessions ──
+pub mod service_discovery;
+pub mod distributed_lock;
+pub mod persistent_session;

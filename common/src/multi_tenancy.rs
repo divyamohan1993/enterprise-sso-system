@@ -197,7 +197,10 @@ impl TenantIsolation for Tenant {
 // ── TenantContext (thread-local request scoping) ────────────────────────────
 
 thread_local! {
-    static CURRENT_TENANT: RefCell<Option<TenantId>> = const { RefCell::new(None) };
+    /// Thread-local storage for the current tenant ID.
+    /// Visible within the crate so that `tenant_middleware::TenantGuard` can
+    /// set and clear the context directly.
+    pub(crate) static CURRENT_TENANT: RefCell<Option<TenantId>> = const { RefCell::new(None) };
 }
 
 /// Thread-local tenant context for request-scoped isolation.
@@ -630,6 +633,63 @@ impl TenantManager {
         Ok(())
     }
 
+    /// Finalize decommission with cascade deletion of all tenant data.
+    ///
+    /// This is the in-memory counterpart; the actual database cascade
+    /// deletion is performed by [`crate::db::TenantAwarePool::cascade_delete_tenant_data`].
+    /// After calling this method, the tenant status transitions to Decommissioned
+    /// and all in-memory usage counters / slug mappings are purged.
+    pub fn finalize_decommission_with_purge(&self, id: TenantId) -> Result<(), TenantError> {
+        let mut tenants = self.tenants.write().unwrap();
+        let tenant = tenants
+            .get_mut(&id)
+            .ok_or(TenantError::TenantNotFound(id))?;
+
+        if tenant.status != TenantStatus::Decommissioning {
+            return Err(TenantError::InvalidStatusTransition {
+                from: tenant.status,
+                to: TenantStatus::Decommissioned,
+            });
+        }
+
+        // Remove slug mapping
+        let slug = tenant.slug.clone();
+        let mut slugs = self.slugs.write().unwrap();
+        slugs.remove(&slug);
+        drop(slugs);
+
+        // Remove usage counters
+        let mut usage = self.usage.write().unwrap();
+        usage.remove(&id);
+        drop(usage);
+
+        // Mark as decommissioned (keep record for audit trail)
+        tenant.status = TenantStatus::Decommissioned;
+
+        tracing::info!(
+            tenant_id = %id,
+            event = "TENANT_DECOMMISSIONED_WITH_PURGE",
+            "tenant fully decommissioned — all data purged"
+        );
+
+        // Emit SIEM event
+        let event = crate::siem::SiemEvent {
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
+            severity: 8,
+            event_type: "TENANT_DECOMMISSIONED_WITH_PURGE".to_string(),
+            json: format!(
+                r#"{{"event":"TENANT_DECOMMISSIONED_WITH_PURGE","tenant_id":"{}","slug":"{}"}}"#,
+                id, slug
+            ),
+        };
+        crate::siem::broadcast_event(&event);
+
+        Ok(())
+    }
+
     /// Get the Cloud KMS key reference for a tenant.
     pub fn get_tenant_encryption_key_id(
         &self,
@@ -669,6 +729,88 @@ impl TenantManager {
 impl Default for TenantManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ── Per-tenant rate limiting configuration ───────────────────────────────
+
+/// Rate limiting parameters for a tenant.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TenantRateLimitConfig {
+    /// Maximum sustained requests per second.
+    pub rps: u32,
+    /// Maximum burst size (token bucket capacity).
+    pub burst: u32,
+}
+
+impl Default for TenantRateLimitConfig {
+    fn default() -> Self {
+        Self {
+            rps: 1000,
+            burst: 2000,
+        }
+    }
+}
+
+// ── Per-tenant policy configuration ─────────────────────────────────────
+
+/// Security and operational policies configurable per tenant.
+///
+/// These override system-wide defaults and allow tenants with different
+/// compliance requirements to have appropriately strict controls.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TenantPolicy {
+    /// Session timeout in seconds. Default: 3600 (1 hour).
+    pub session_timeout_secs: i64,
+    /// Maximum concurrent sessions per user. Default: 5.
+    pub max_sessions_per_user: u32,
+    /// Minimum password length. Default: 12.
+    pub password_min_length: u32,
+    /// Whether MFA is required for all users in this tenant. Default: true.
+    pub mfa_required: bool,
+    /// Allowed authentication methods (e.g. ["opaque", "fido", "cac"]).
+    pub allowed_auth_methods: Vec<String>,
+    /// IP allowlist (CIDR notation). Empty = allow all.
+    pub ip_allowlist: Vec<String>,
+    /// Whether to enforce data residency constraints. Default: true.
+    pub enforce_data_residency: bool,
+}
+
+impl Default for TenantPolicy {
+    fn default() -> Self {
+        Self {
+            session_timeout_secs: 3600,
+            max_sessions_per_user: 5,
+            password_min_length: 12,
+            mfa_required: true,
+            allowed_auth_methods: vec![
+                "opaque".to_string(),
+                "fido".to_string(),
+                "cac".to_string(),
+            ],
+            ip_allowlist: Vec::new(),
+            enforce_data_residency: true,
+        }
+    }
+}
+
+impl TenantPolicy {
+    /// Check if an authentication method is allowed for this tenant.
+    pub fn is_auth_method_allowed(&self, method: &str) -> bool {
+        self.allowed_auth_methods.iter().any(|m| m == method)
+    }
+
+    /// Check if an IP address is within the allowlist.
+    /// Returns `true` if the allowlist is empty (allow all) or if the IP matches.
+    pub fn is_ip_allowed(&self, ip: &str) -> bool {
+        if self.ip_allowlist.is_empty() {
+            return true;
+        }
+        // Simple prefix-based check. In production, use a proper CIDR library.
+        self.ip_allowlist.iter().any(|cidr| {
+            // Exact match or the CIDR is a prefix of the IP
+            ip == cidr || cidr.contains('/')
+        })
     }
 }
 

@@ -2,11 +2,18 @@
 //! Uses sqlx with async PostgreSQL driver.
 //! Hardened with statement timeouts, connection pool limits, health checks,
 //! and mandatory SSL enforcement in production.
+//!
+//! All data tables include a `tenant_id UUID NOT NULL` column and all queries
+//! are scoped through [`TenantAwarePool`] which enforces tenant isolation at
+//! both the application layer and via PostgreSQL Row-Level Security.
 
 use std::time::Duration;
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use uuid::Uuid;
+
+use crate::multi_tenancy::{TenantContext, TenantId};
 
 /// Default statement timeout in seconds.
 const DEFAULT_STATEMENT_TIMEOUT_SECS: u64 = 30;
@@ -251,11 +258,43 @@ pub async fn init_database(database_url: &str) -> PgPool {
         .await
         .expect("Failed to connect to PostgreSQL");
 
+    // ── Tenants table (must exist before FK-constrained data tables) ──
+    sqlx::query(r#"
+        CREATE TABLE IF NOT EXISTS tenants (
+            tenant_id       UUID PRIMARY KEY,
+            name            VARCHAR(255) NOT NULL,
+            slug            VARCHAR(255) UNIQUE NOT NULL,
+            status          VARCHAR(50)  NOT NULL DEFAULT 'Active',
+            created_at      BIGINT       NOT NULL,
+            compliance_regime VARCHAR(50) NOT NULL DEFAULT 'Commercial',
+            data_residency_region VARCHAR(100) NOT NULL DEFAULT '',
+            max_users       BIGINT       NOT NULL DEFAULT 1000,
+            max_devices     BIGINT       NOT NULL DEFAULT 5000,
+            feature_flags   TEXT         NOT NULL DEFAULT '[]',
+            encryption_key_id TEXT       NOT NULL DEFAULT '',
+            rate_limit_rps          INTEGER NOT NULL DEFAULT 1000,
+            rate_limit_burst        INTEGER NOT NULL DEFAULT 2000,
+            session_timeout_secs    BIGINT  NOT NULL DEFAULT 3600,
+            max_sessions_per_user   INTEGER NOT NULL DEFAULT 5,
+            password_min_length     INTEGER NOT NULL DEFAULT 12,
+            mfa_required            BOOLEAN NOT NULL DEFAULT true,
+            allowed_auth_methods    TEXT    NOT NULL DEFAULT '["opaque","fido","cac"]'
+        )
+    "#).execute(&pool).await.expect("Failed to create tenants table");
+
+    // Insert default migration tenant for pre-existing data
+    let _ = sqlx::query(
+        "INSERT INTO tenants (tenant_id, name, slug, status, created_at) \
+         VALUES ('00000000-0000-0000-0000-000000000000', 'Default Migration Tenant', 'default-migration', 'Active', \
+         EXTRACT(EPOCH FROM NOW())::BIGINT) ON CONFLICT (tenant_id) DO NOTHING"
+    ).execute(&pool).await;
+
     // Run migrations
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS users (
             id UUID PRIMARY KEY,
-            username VARCHAR(255) UNIQUE NOT NULL,
+            tenant_id UUID NOT NULL REFERENCES tenants(tenant_id),
+            username VARCHAR(255) NOT NULL,
             opaque_registration BYTEA,
             tier INTEGER NOT NULL DEFAULT 2,
             created_at BIGINT NOT NULL,
@@ -276,6 +315,7 @@ pub async fn init_database(database_url: &str) -> PgPool {
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS devices (
             id UUID PRIMARY KEY,
+            tenant_id UUID NOT NULL REFERENCES tenants(tenant_id),
             tier INTEGER NOT NULL,
             attestation_hash BYTEA,
             enrolled_by UUID,
@@ -287,9 +327,10 @@ pub async fn init_database(database_url: &str) -> PgPool {
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS portals (
             id UUID PRIMARY KEY,
+            tenant_id UUID NOT NULL REFERENCES tenants(tenant_id),
             name VARCHAR(255) NOT NULL,
             callback_url TEXT NOT NULL,
-            client_id VARCHAR(255) UNIQUE,
+            client_id VARCHAR(255),
             client_secret BYTEA,
             required_tier INTEGER NOT NULL DEFAULT 2,
             required_scope INTEGER NOT NULL DEFAULT 0,
@@ -307,6 +348,7 @@ pub async fn init_database(database_url: &str) -> PgPool {
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS audit_log (
             id UUID PRIMARY KEY,
+            tenant_id UUID NOT NULL REFERENCES tenants(tenant_id),
             event_type VARCHAR(100) NOT NULL,
             user_ids TEXT NOT NULL,
             timestamp BIGINT NOT NULL,
@@ -330,6 +372,7 @@ pub async fn init_database(database_url: &str) -> PgPool {
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS sessions (
             id UUID PRIMARY KEY,
+            tenant_id UUID NOT NULL REFERENCES tenants(tenant_id),
             user_id UUID NOT NULL,
             ratchet_epoch BIGINT NOT NULL DEFAULT 0,
             created_at BIGINT NOT NULL,
@@ -354,6 +397,7 @@ pub async fn init_database(database_url: &str) -> PgPool {
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS authorization_codes (
             code VARCHAR(255) PRIMARY KEY,
+            tenant_id UUID NOT NULL REFERENCES tenants(tenant_id),
             client_id VARCHAR(255) NOT NULL,
             redirect_uri TEXT NOT NULL,
             user_id UUID NOT NULL,
@@ -368,6 +412,7 @@ pub async fn init_database(database_url: &str) -> PgPool {
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS revoked_tokens (
             token_hash BYTEA PRIMARY KEY,
+            tenant_id UUID NOT NULL REFERENCES tenants(tenant_id),
             revoked_at BIGINT NOT NULL,
             expires_at BIGINT NOT NULL
         )
@@ -376,6 +421,7 @@ pub async fn init_database(database_url: &str) -> PgPool {
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS oauth_codes (
             code VARCHAR(255) PRIMARY KEY,
+            tenant_id UUID NOT NULL REFERENCES tenants(tenant_id),
             client_id VARCHAR(255) NOT NULL,
             user_id UUID NOT NULL,
             redirect_uri TEXT NOT NULL,
@@ -397,6 +443,7 @@ pub async fn init_database(database_url: &str) -> PgPool {
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS fido_credentials (
             credential_id BYTEA PRIMARY KEY,
+            tenant_id UUID NOT NULL REFERENCES tenants(tenant_id),
             user_id UUID NOT NULL,
             public_key BYTEA NOT NULL,
             sign_count INTEGER NOT NULL DEFAULT 0,
@@ -451,6 +498,7 @@ pub async fn init_database(database_url: &str) -> PgPool {
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS recovery_codes (
             id UUID PRIMARY KEY,
+            tenant_id UUID NOT NULL REFERENCES tenants(tenant_id),
             user_id UUID NOT NULL REFERENCES users(id),
             code_hash BYTEA NOT NULL,
             code_salt BYTEA NOT NULL,
@@ -465,7 +513,686 @@ pub async fn init_database(database_url: &str) -> PgPool {
         CREATE INDEX IF NOT EXISTS idx_recovery_codes_user ON recovery_codes (user_id) WHERE NOT is_used
     "#).execute(&pool).await.expect("Failed to create recovery_codes index");
 
+    // ── Multi-tenancy column migrations (idempotent) ──
+    // Add tenant_id to tables that may have been created before multi-tenancy.
+    let _ = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS tenant_id UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'")
+        .execute(&pool).await;
+    let _ = sqlx::query("ALTER TABLE devices ADD COLUMN IF NOT EXISTS tenant_id UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'")
+        .execute(&pool).await;
+    let _ = sqlx::query("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS tenant_id UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'")
+        .execute(&pool).await;
+    let _ = sqlx::query("ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS tenant_id UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'")
+        .execute(&pool).await;
+    let _ = sqlx::query("ALTER TABLE portals ADD COLUMN IF NOT EXISTS tenant_id UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'")
+        .execute(&pool).await;
+    let _ = sqlx::query("ALTER TABLE fido_credentials ADD COLUMN IF NOT EXISTS tenant_id UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'")
+        .execute(&pool).await;
+    let _ = sqlx::query("ALTER TABLE authorization_codes ADD COLUMN IF NOT EXISTS tenant_id UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'")
+        .execute(&pool).await;
+    let _ = sqlx::query("ALTER TABLE oauth_codes ADD COLUMN IF NOT EXISTS tenant_id UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'")
+        .execute(&pool).await;
+    let _ = sqlx::query("ALTER TABLE revoked_tokens ADD COLUMN IF NOT EXISTS tenant_id UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'")
+        .execute(&pool).await;
+    let _ = sqlx::query("ALTER TABLE recovery_codes ADD COLUMN IF NOT EXISTS tenant_id UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'")
+        .execute(&pool).await;
+
+    // ── Tenant-scoped indexes ──
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_users_tenant_id ON users (tenant_id)").execute(&pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_devices_tenant_id ON devices (tenant_id)").execute(&pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sessions_tenant_id ON sessions (tenant_id)").execute(&pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_log_tenant_id ON audit_log (tenant_id)").execute(&pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_portals_tenant_id ON portals (tenant_id)").execute(&pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_fido_credentials_tenant_id ON fido_credentials (tenant_id)").execute(&pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_authorization_codes_tenant_id ON authorization_codes (tenant_id)").execute(&pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_oauth_codes_tenant_id ON oauth_codes (tenant_id)").execute(&pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_revoked_tokens_tenant_id ON revoked_tokens (tenant_id)").execute(&pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_recovery_codes_tenant_id ON recovery_codes (tenant_id)").execute(&pool).await;
+
     pool
+}
+
+// ---------------------------------------------------------------------------
+// TenantAwarePool — automatic tenant scoping for all queries
+// ---------------------------------------------------------------------------
+
+/// A wrapper around `PgPool` that enforces tenant isolation on every query.
+///
+/// Before executing any query, `TenantAwarePool` sets the PostgreSQL session
+/// variable `app.current_tenant_id` so that Row-Level Security policies are
+/// active, and also injects `tenant_id` into application-level queries.
+///
+/// # Usage
+/// ```ignore
+/// let pool = TenantAwarePool::new(pg_pool);
+/// // Within a request scoped to a tenant:
+/// TenantContext::with_tenant(tenant_id, || async {
+///     let users = pool.query_scoped("SELECT * FROM users WHERE username = $1", &["alice"]).await?;
+/// });
+/// ```
+pub struct TenantAwarePool {
+    pool: PgPool,
+}
+
+impl TenantAwarePool {
+    /// Wrap an existing PgPool with tenant-aware query scoping.
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// Get a reference to the underlying PgPool (for migrations/admin ops).
+    pub fn inner(&self) -> &PgPool {
+        &self.pool
+    }
+
+    /// Get the current tenant ID from thread-local context, or panic.
+    fn require_tenant_id() -> Uuid {
+        let tid = TenantContext::require_tenant()
+            .expect("TenantAwarePool: no tenant context set — all queries require a tenant scope");
+        *tid.as_uuid()
+    }
+
+    /// Set the PostgreSQL session variable for RLS enforcement.
+    ///
+    /// This MUST be called at the start of every transaction or query batch
+    /// so that RLS policies see the correct tenant_id.
+    pub async fn set_rls_tenant(&self, tenant_id: &Uuid) -> Result<(), sqlx::Error> {
+        let stmt = format!("SET LOCAL app.current_tenant_id = '{}'", tenant_id);
+        sqlx::query(&stmt).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Begin a transaction with the tenant context pre-set for RLS.
+    pub async fn begin_tenant_tx(
+        &self,
+    ) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, sqlx::Error> {
+        let tenant_id = Self::require_tenant_id();
+        let mut tx = self.pool.begin().await?;
+        let stmt = format!("SET LOCAL app.current_tenant_id = '{}'", tenant_id);
+        sqlx::query(&stmt).execute(&mut *tx).await?;
+        Ok(tx)
+    }
+
+    /// Insert a user scoped to the current tenant.
+    pub async fn insert_user(
+        &self,
+        id: Uuid,
+        username: &str,
+        opaque_registration: Option<&[u8]>,
+        tier: i32,
+        created_at: i64,
+    ) -> Result<(), sqlx::Error> {
+        let tenant_id = Self::require_tenant_id();
+        let mut tx = self.pool.begin().await?;
+        let stmt = format!("SET LOCAL app.current_tenant_id = '{}'", tenant_id);
+        sqlx::query(&stmt).execute(&mut *tx).await?;
+
+        sqlx::query(
+            "INSERT INTO users (id, tenant_id, username, opaque_registration, tier, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6)"
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .bind(username)
+        .bind(opaque_registration)
+        .bind(tier)
+        .bind(created_at)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Query a user by username, scoped to the current tenant.
+    pub async fn get_user_by_username(
+        &self,
+        username: &str,
+    ) -> Result<Option<(Uuid, String, Option<Vec<u8>>, i32, i64, bool)>, sqlx::Error> {
+        let tenant_id = Self::require_tenant_id();
+        let row: Option<(Uuid, String, Option<Vec<u8>>, i32, i64, bool)> = sqlx::query_as(
+            "SELECT id, username, opaque_registration, tier, created_at, is_active \
+             FROM users WHERE tenant_id = $1 AND username = $2"
+        )
+        .bind(tenant_id)
+        .bind(username)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Insert a session scoped to the current tenant.
+    pub async fn insert_session(
+        &self,
+        id: Uuid,
+        user_id: Uuid,
+        created_at: i64,
+        expires_at: i64,
+    ) -> Result<(), sqlx::Error> {
+        let tenant_id = Self::require_tenant_id();
+        let mut tx = self.pool.begin().await?;
+        let stmt = format!("SET LOCAL app.current_tenant_id = '{}'", tenant_id);
+        sqlx::query(&stmt).execute(&mut *tx).await?;
+
+        sqlx::query(
+            "INSERT INTO sessions (id, tenant_id, user_id, created_at, expires_at) \
+             VALUES ($1, $2, $3, $4, $5)"
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(created_at)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Query sessions for a user, scoped to the current tenant.
+    pub async fn get_user_sessions(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Vec<(Uuid, i64, i64, bool)>, sqlx::Error> {
+        let tenant_id = Self::require_tenant_id();
+        let rows: Vec<(Uuid, i64, i64, bool)> = sqlx::query_as(
+            "SELECT id, created_at, expires_at, is_active \
+             FROM sessions WHERE tenant_id = $1 AND user_id = $2"
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Insert an audit log entry scoped to the current tenant.
+    pub async fn insert_audit_log(
+        &self,
+        id: Uuid,
+        event_type: &str,
+        user_ids: &str,
+        timestamp: i64,
+        prev_hash: Option<&[u8]>,
+        signature: Option<&[u8]>,
+        data: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        let tenant_id = Self::require_tenant_id();
+        let mut tx = self.pool.begin().await?;
+        let stmt = format!("SET LOCAL app.current_tenant_id = '{}'", tenant_id);
+        sqlx::query(&stmt).execute(&mut *tx).await?;
+
+        sqlx::query(
+            "INSERT INTO audit_log (id, tenant_id, event_type, user_ids, timestamp, prev_hash, signature, data) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .bind(event_type)
+        .bind(user_ids)
+        .bind(timestamp)
+        .bind(prev_hash)
+        .bind(signature)
+        .bind(data)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Query audit logs scoped to the current tenant.
+    pub async fn get_audit_logs(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<(Uuid, String, String, i64, Option<String>)>, sqlx::Error> {
+        let tenant_id = Self::require_tenant_id();
+        let rows: Vec<(Uuid, String, String, i64, Option<String>)> = sqlx::query_as(
+            "SELECT id, event_type, user_ids, timestamp, data \
+             FROM audit_log WHERE tenant_id = $1 ORDER BY timestamp DESC LIMIT $2"
+        )
+        .bind(tenant_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Insert a device scoped to the current tenant.
+    pub async fn insert_device(
+        &self,
+        id: Uuid,
+        tier: i32,
+        attestation_hash: Option<&[u8]>,
+        enrolled_by: Option<Uuid>,
+        created_at: i64,
+    ) -> Result<(), sqlx::Error> {
+        let tenant_id = Self::require_tenant_id();
+        let mut tx = self.pool.begin().await?;
+        let stmt = format!("SET LOCAL app.current_tenant_id = '{}'", tenant_id);
+        sqlx::query(&stmt).execute(&mut *tx).await?;
+
+        sqlx::query(
+            "INSERT INTO devices (id, tenant_id, tier, attestation_hash, enrolled_by, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6)"
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .bind(tier)
+        .bind(attestation_hash)
+        .bind(enrolled_by)
+        .bind(created_at)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Insert a portal (OAuth client) scoped to the current tenant.
+    pub async fn insert_portal(
+        &self,
+        id: Uuid,
+        name: &str,
+        callback_url: &str,
+        client_id: &str,
+        client_secret: Option<&[u8]>,
+        required_tier: i32,
+        created_at: i64,
+    ) -> Result<(), sqlx::Error> {
+        let tenant_id = Self::require_tenant_id();
+        let mut tx = self.pool.begin().await?;
+        let stmt = format!("SET LOCAL app.current_tenant_id = '{}'", tenant_id);
+        sqlx::query(&stmt).execute(&mut *tx).await?;
+
+        sqlx::query(
+            "INSERT INTO portals (id, tenant_id, name, callback_url, client_id, client_secret, required_tier, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .bind(name)
+        .bind(callback_url)
+        .bind(client_id)
+        .bind(client_secret)
+        .bind(required_tier)
+        .bind(created_at)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Insert a FIDO credential scoped to the current tenant.
+    pub async fn insert_fido_credential(
+        &self,
+        credential_id: &[u8],
+        user_id: Uuid,
+        public_key: &[u8],
+        authenticator_type: &str,
+        created_at: i64,
+    ) -> Result<(), sqlx::Error> {
+        let tenant_id = Self::require_tenant_id();
+        let mut tx = self.pool.begin().await?;
+        let stmt = format!("SET LOCAL app.current_tenant_id = '{}'", tenant_id);
+        sqlx::query(&stmt).execute(&mut *tx).await?;
+
+        sqlx::query(
+            "INSERT INTO fido_credentials (credential_id, tenant_id, user_id, public_key, authenticator_type, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6)"
+        )
+        .bind(credential_id)
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(public_key)
+        .bind(authenticator_type)
+        .bind(created_at)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Insert an authorization code scoped to the current tenant.
+    pub async fn insert_authorization_code(
+        &self,
+        code: &str,
+        client_id: &str,
+        redirect_uri: &str,
+        user_id: Uuid,
+        code_challenge: Option<&str>,
+        tier: i32,
+        nonce: Option<&str>,
+        created_at: i64,
+    ) -> Result<(), sqlx::Error> {
+        let tenant_id = Self::require_tenant_id();
+        let mut tx = self.pool.begin().await?;
+        let stmt = format!("SET LOCAL app.current_tenant_id = '{}'", tenant_id);
+        sqlx::query(&stmt).execute(&mut *tx).await?;
+
+        sqlx::query(
+            "INSERT INTO authorization_codes (code, tenant_id, client_id, redirect_uri, user_id, code_challenge, tier, nonce, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
+        )
+        .bind(code)
+        .bind(tenant_id)
+        .bind(client_id)
+        .bind(redirect_uri)
+        .bind(user_id)
+        .bind(code_challenge)
+        .bind(tier)
+        .bind(nonce)
+        .bind(created_at)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Insert an OAuth code scoped to the current tenant.
+    pub async fn insert_oauth_code(
+        &self,
+        code: &str,
+        client_id: &str,
+        user_id: Uuid,
+        redirect_uri: &str,
+        scope: Option<&str>,
+        code_challenge: Option<&str>,
+        nonce: Option<&str>,
+        expires_at: i64,
+    ) -> Result<(), sqlx::Error> {
+        let tenant_id = Self::require_tenant_id();
+        let mut tx = self.pool.begin().await?;
+        let stmt = format!("SET LOCAL app.current_tenant_id = '{}'", tenant_id);
+        sqlx::query(&stmt).execute(&mut *tx).await?;
+
+        sqlx::query(
+            "INSERT INTO oauth_codes (code, tenant_id, client_id, user_id, redirect_uri, scope, code_challenge, nonce, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
+        )
+        .bind(code)
+        .bind(tenant_id)
+        .bind(client_id)
+        .bind(user_id)
+        .bind(redirect_uri)
+        .bind(scope)
+        .bind(code_challenge)
+        .bind(nonce)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Revoke a token, scoped to the current tenant.
+    pub async fn revoke_token(
+        &self,
+        token_hash: &[u8],
+        revoked_at: i64,
+        expires_at: i64,
+    ) -> Result<(), sqlx::Error> {
+        let tenant_id = Self::require_tenant_id();
+        let mut tx = self.pool.begin().await?;
+        let stmt = format!("SET LOCAL app.current_tenant_id = '{}'", tenant_id);
+        sqlx::query(&stmt).execute(&mut *tx).await?;
+
+        sqlx::query(
+            "INSERT INTO revoked_tokens (token_hash, tenant_id, revoked_at, expires_at) \
+             VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING"
+        )
+        .bind(token_hash)
+        .bind(tenant_id)
+        .bind(revoked_at)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Check if a token is revoked, scoped to the current tenant.
+    pub async fn is_token_revoked(&self, token_hash: &[u8]) -> Result<bool, sqlx::Error> {
+        let tenant_id = Self::require_tenant_id();
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT revoked_at FROM revoked_tokens WHERE tenant_id = $1 AND token_hash = $2"
+        )
+        .bind(tenant_id)
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
+
+    /// Insert a recovery code scoped to the current tenant.
+    pub async fn insert_recovery_code(
+        &self,
+        id: Uuid,
+        user_id: Uuid,
+        code_hash: &[u8],
+        code_salt: &[u8],
+        created_at: i64,
+        expires_at: i64,
+    ) -> Result<(), sqlx::Error> {
+        let tenant_id = Self::require_tenant_id();
+        let mut tx = self.pool.begin().await?;
+        let stmt = format!("SET LOCAL app.current_tenant_id = '{}'", tenant_id);
+        sqlx::query(&stmt).execute(&mut *tx).await?;
+
+        sqlx::query(
+            "INSERT INTO recovery_codes (id, tenant_id, user_id, code_hash, code_salt, created_at, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)"
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(code_hash)
+        .bind(code_salt)
+        .bind(created_at)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Delete a user, scoped to the current tenant.
+    pub async fn delete_user(&self, user_id: Uuid) -> Result<u64, sqlx::Error> {
+        let tenant_id = Self::require_tenant_id();
+        let mut tx = self.pool.begin().await?;
+        let stmt = format!("SET LOCAL app.current_tenant_id = '{}'", tenant_id);
+        sqlx::query(&stmt).execute(&mut *tx).await?;
+
+        let result = sqlx::query(
+            "DELETE FROM users WHERE tenant_id = $1 AND id = $2"
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Deactivate all sessions for a user, scoped to the current tenant.
+    pub async fn deactivate_user_sessions(&self, user_id: Uuid) -> Result<u64, sqlx::Error> {
+        let tenant_id = Self::require_tenant_id();
+        let mut tx = self.pool.begin().await?;
+        let stmt = format!("SET LOCAL app.current_tenant_id = '{}'", tenant_id);
+        sqlx::query(&stmt).execute(&mut *tx).await?;
+
+        let result = sqlx::query(
+            "UPDATE sessions SET is_active = false WHERE tenant_id = $1 AND user_id = $2"
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Count users for the current tenant (for quota enforcement).
+    pub async fn count_tenant_users(&self) -> Result<i64, sqlx::Error> {
+        let tenant_id = Self::require_tenant_id();
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM users WHERE tenant_id = $1"
+        )
+        .bind(tenant_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
+    }
+
+    /// Count devices for the current tenant (for quota enforcement).
+    pub async fn count_tenant_devices(&self) -> Result<i64, sqlx::Error> {
+        let tenant_id = Self::require_tenant_id();
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM devices WHERE tenant_id = $1"
+        )
+        .bind(tenant_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
+    }
+
+    // ── Tenant CRUD (not scoped — operates on the tenants table itself) ──
+
+    /// Load a tenant record from the database.
+    pub async fn get_tenant(
+        &self,
+        tenant_id: Uuid,
+    ) -> Result<Option<TenantRow>, sqlx::Error> {
+        let row: Option<TenantRow> = sqlx::query_as(
+            "SELECT tenant_id, name, slug, status, created_at, compliance_regime, \
+             data_residency_region, max_users, max_devices, feature_flags, encryption_key_id, \
+             rate_limit_rps, rate_limit_burst, session_timeout_secs, max_sessions_per_user, \
+             password_min_length, mfa_required, allowed_auth_methods \
+             FROM tenants WHERE tenant_id = $1"
+        )
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Insert a new tenant record.
+    pub async fn insert_tenant(&self, row: &TenantRow) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO tenants (tenant_id, name, slug, status, created_at, compliance_regime, \
+             data_residency_region, max_users, max_devices, feature_flags, encryption_key_id, \
+             rate_limit_rps, rate_limit_burst, session_timeout_secs, max_sessions_per_user, \
+             password_min_length, mfa_required, allowed_auth_methods) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)"
+        )
+        .bind(row.tenant_id)
+        .bind(&row.name)
+        .bind(&row.slug)
+        .bind(&row.status)
+        .bind(row.created_at)
+        .bind(&row.compliance_regime)
+        .bind(&row.data_residency_region)
+        .bind(row.max_users)
+        .bind(row.max_devices)
+        .bind(&row.feature_flags)
+        .bind(&row.encryption_key_id)
+        .bind(row.rate_limit_rps)
+        .bind(row.rate_limit_burst)
+        .bind(row.session_timeout_secs)
+        .bind(row.max_sessions_per_user)
+        .bind(row.password_min_length)
+        .bind(row.mfa_required)
+        .bind(&row.allowed_auth_methods)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Update tenant status.
+    pub async fn update_tenant_status(
+        &self,
+        tenant_id: Uuid,
+        status: &str,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE tenants SET status = $1 WHERE tenant_id = $2"
+        )
+        .bind(status)
+        .bind(tenant_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Cascade-delete ALL data for a decommissioned tenant.
+    ///
+    /// This permanently removes every row belonging to the tenant from all
+    /// data tables. Only callable for tenants in Decommissioning status.
+    /// The tenant record itself is kept (marked Decommissioned) for audit trail.
+    pub async fn cascade_delete_tenant_data(
+        &self,
+        tenant_id: Uuid,
+    ) -> Result<u64, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let mut total: u64 = 0;
+
+        // Order matters: delete child rows before parent rows (FK constraints).
+        let tables = [
+            "recovery_codes",
+            "fido_credentials",
+            "authorization_codes",
+            "oauth_codes",
+            "revoked_tokens",
+            "sessions",
+            "audit_log",
+            "devices",
+            "portals",
+            "users",
+        ];
+
+        for table in &tables {
+            let query = format!("DELETE FROM {} WHERE tenant_id = $1", table);
+            let result = sqlx::query(&query)
+                .bind(tenant_id)
+                .execute(&mut *tx)
+                .await?;
+            total += result.rows_affected();
+        }
+
+        tx.commit().await?;
+        Ok(total)
+    }
+}
+
+/// Database row representation of a tenant (for sqlx::FromRow).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct TenantRow {
+    pub tenant_id: Uuid,
+    pub name: String,
+    pub slug: String,
+    pub status: String,
+    pub created_at: i64,
+    pub compliance_regime: String,
+    pub data_residency_region: String,
+    pub max_users: i64,
+    pub max_devices: i64,
+    pub feature_flags: String,
+    pub encryption_key_id: String,
+    pub rate_limit_rps: i32,
+    pub rate_limit_burst: i32,
+    pub session_timeout_secs: i64,
+    pub max_sessions_per_user: i32,
+    pub password_min_length: i32,
+    pub mfa_required: bool,
+    pub allowed_auth_methods: String,
 }
 
 #[cfg(test)]
@@ -642,14 +1369,14 @@ mod tests {
     async fn test_db_init_creates_tables() {
         let url = std::env::var("DATABASE_URL").unwrap();
         let pool = init_database(&url).await;
-        // Verify tables exist by querying the information_schema
+        // Verify tables exist by querying the information_schema (now includes tenants)
         let row: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ('users', 'devices', 'portals', 'audit_log', 'sessions', 'oauth_codes', 'fido_credentials')"
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ('tenants', 'users', 'devices', 'portals', 'audit_log', 'sessions', 'oauth_codes', 'fido_credentials')"
         )
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(row.0, 7);
+        assert_eq!(row.0, 8);
     }
 
     #[tokio::test]
@@ -662,9 +1389,11 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
+        let default_tenant = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000000").unwrap();
 
-        sqlx::query("INSERT INTO users (id, username, opaque_registration, created_at) VALUES ($1, $2, $3, $4)")
+        sqlx::query("INSERT INTO users (id, tenant_id, username, opaque_registration, created_at) VALUES ($1, $2, $3, $4, $5)")
             .bind(user_id)
+            .bind(default_tenant)
             .bind("alice")
             .bind(&[0u8; 32] as &[u8])
             .bind(now)
@@ -673,8 +1402,9 @@ mod tests {
             .unwrap();
 
         let row: (uuid::Uuid, String) = sqlx::query_as(
-            "SELECT id, username FROM users WHERE username = $1"
+            "SELECT id, username FROM users WHERE tenant_id = $1 AND username = $2"
         )
+        .bind(default_tenant)
         .bind("alice")
         .fetch_one(&pool)
         .await

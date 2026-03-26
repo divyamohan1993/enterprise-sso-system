@@ -648,6 +648,7 @@ async fn forward_to_orchestrator(
         dpop_key_hash: client_binding_hash,
         tier: 0,                  // Orchestrator decides tier
         audience: auth_req.audience.clone(),
+        ceremony_id: [0u8; 32],   // Assigned by orchestrator during ceremony
         device_attestation_age_secs: None,
         geo_velocity_kmh: None,
         is_unusual_network: None,

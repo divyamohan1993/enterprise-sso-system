@@ -7,14 +7,14 @@
 //! When a sysctl path does not exist (e.g., in CI containers) the check is
 //! returned as `NotApplicable` so the auditor can run in any environment.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
 /// A single STIG/CIS compliance check result.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StigCheck {
     pub id: String,
     pub title: String,
@@ -26,7 +26,7 @@ pub struct StigCheck {
 }
 
 /// DISA STIG severity category.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StigSeverity {
     /// Category I — most severe; a finding that directly enables privilege
     /// escalation or remote code execution.
@@ -38,7 +38,7 @@ pub enum StigSeverity {
 }
 
 /// Logical grouping for the check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StigCategory {
     Kernel,
     Filesystem,
@@ -51,7 +51,7 @@ pub enum StigCategory {
 }
 
 /// Outcome of a single check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StigStatus {
     /// Control is satisfied.
     Pass,
@@ -65,7 +65,7 @@ pub enum StigStatus {
 }
 
 /// Aggregate statistics over all checks that have been run.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StigSummary {
     pub total: usize,
     pub passed: usize,

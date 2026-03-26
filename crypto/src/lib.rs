@@ -40,3 +40,7 @@ pub mod honey;
 pub mod adaptive;
 pub mod jwe;
 pub mod zkp;
+pub mod verifiable_credentials;
+pub mod did;
+pub mod he_search;
+pub mod enclave;

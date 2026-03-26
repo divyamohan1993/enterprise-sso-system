@@ -67,7 +67,7 @@ pub struct UserBaseline {
     /// Unix timestamp (seconds) of the last baseline update.
     pub last_updated: i64,
     /// EMA of the login hour (used internally to track the center).
-    avg_login_hour: f64,
+    pub avg_login_hour: f64,
 }
 
 impl UserBaseline {

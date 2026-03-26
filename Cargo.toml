@@ -63,6 +63,7 @@ libc = "0.2"
 aegis = "0.6"
 pbkdf2 = "0.12"
 cryptoki = "0.10"
+bs58 = "0.5"
 
 [profile.release]
 panic = "abort"
