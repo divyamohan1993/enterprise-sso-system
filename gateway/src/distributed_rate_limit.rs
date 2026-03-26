@@ -201,6 +201,11 @@ struct LocalEntry {
 }
 
 /// Distributed rate limiter with Redis backend and local fallback.
+///
+/// When Redis is unavailable, local fallback applies a **conservative divisor**
+/// to account for multiple gateway instances that each maintain independent
+/// state. This prevents an attacker from distributing requests across N
+/// gateways to bypass the global limit.
 pub struct DistributedRateLimiter {
     config: RateLimitConfig,
     /// Redis client (None if Redis is not configured or connection failed).
@@ -209,6 +214,11 @@ pub struct DistributedRateLimiter {
     local_state: Arc<Mutex<HashMap<String, LocalEntry>>>,
     /// Whether Redis is currently healthy.
     redis_healthy: Arc<std::sync::atomic::AtomicBool>,
+    /// Conservative divisor for local fallback limits. Each gateway instance
+    /// gets `limit / degraded_limit_divisor` when Redis is down. Set to
+    /// the expected number of gateway instances (e.g., 10 for a 10-instance MIG).
+    /// Default: 10 (conservative — better to over-restrict than under-restrict).
+    degraded_limit_divisor: u64,
 }
 
 /// Minimal Redis client wrapper.
@@ -312,11 +322,18 @@ impl DistributedRateLimiter {
             redis_client.is_some(),
         ));
 
+        let degraded_limit_divisor = std::env::var("MILNET_RATE_LIMIT_DEGRADED_DIVISOR")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10u64)
+            .max(1); // never divide by zero
+
         Self {
             config,
             redis_client,
             local_state: Arc::new(Mutex::new(HashMap::new())),
             redis_healthy,
+            degraded_limit_divisor,
         }
     }
 
@@ -404,8 +421,18 @@ impl DistributedRateLimiter {
             }
         }
 
-        // Local fallback: simple sliding window counter
-        self.check_local(key, limit).await
+        // Local fallback: apply conservative divisor to prevent distributed bypass.
+        // With N gateway instances each using limit/N, the aggregate across all
+        // instances approximates the global limit even without coordination.
+        let degraded_limit = (limit / self.degraded_limit_divisor).max(1);
+        if degraded_limit < limit {
+            debug!(
+                "rate limit degraded mode: {key} using {degraded_limit}/{limit} \
+                 (divisor={}, Redis unavailable)",
+                self.degraded_limit_divisor
+            );
+        }
+        self.check_local(key, degraded_limit).await
     }
 
     /// Local in-memory rate limiting (fallback when Redis is unavailable).
@@ -599,7 +626,7 @@ mod tests {
     // Helper: create a limiter with no Redis (local-only mode).
     // =========================================================================
     async fn local_limiter(per_ip: u64, per_user: u64, window: u64, burst: u64) -> DistributedRateLimiter {
-        DistributedRateLimiter::new(RateLimitConfig {
+        let mut limiter = DistributedRateLimiter::new(RateLimitConfig {
             per_ip_limit: per_ip,
             per_user_limit: per_user,
             window_secs: window,
@@ -607,7 +634,10 @@ mod tests {
             refill_rate: per_ip as f64 / window as f64,
             redis_url: None,
         })
-        .await
+        .await;
+        // In tests, set divisor to 1 so local limits match expected values
+        limiter.degraded_limit_divisor = 1;
+        limiter
     }
 
     // =========================================================================
@@ -807,7 +837,7 @@ mod tests {
     async fn redis_fallback_when_redis_url_provided_but_stub() {
         // When a Redis URL is provided, the stub client connects but always
         // returns errors on operations, triggering local fallback
-        let limiter = DistributedRateLimiter::new(RateLimitConfig {
+        let mut limiter = DistributedRateLimiter::new(RateLimitConfig {
             per_ip_limit: 3,
             per_user_limit: 2,
             window_secs: 60,
@@ -816,6 +846,7 @@ mod tests {
             redis_url: Some("redis://localhost:6379".to_string()),
         })
         .await;
+        limiter.degraded_limit_divisor = 1; // test: no divisor for exact limit checking
 
         // Redis client should be created (stub connects successfully)
         assert!(limiter.redis_client.is_some(), "Redis client should be created");
@@ -836,7 +867,7 @@ mod tests {
 
     #[tokio::test]
     async fn redis_health_flag_transitions_on_failure() {
-        let limiter = DistributedRateLimiter::new(RateLimitConfig {
+        let mut limiter = DistributedRateLimiter::new(RateLimitConfig {
             per_ip_limit: 5,
             per_user_limit: 5,
             window_secs: 60,
@@ -845,6 +876,7 @@ mod tests {
             redis_url: Some("redis://localhost:6379".to_string()),
         })
         .await;
+        limiter.degraded_limit_divisor = 1;
 
         // Initially healthy (stub connects ok)
         assert!(
@@ -870,7 +902,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_fallback_enforces_limits_correctly_after_redis_fails() {
-        let limiter = DistributedRateLimiter::new(RateLimitConfig {
+        let mut limiter = DistributedRateLimiter::new(RateLimitConfig {
             per_ip_limit: 2,
             per_user_limit: 2,
             window_secs: 60,
@@ -879,6 +911,7 @@ mod tests {
             redis_url: Some("redis://localhost:6379".to_string()),
         })
         .await;
+        limiter.degraded_limit_divisor = 1;
 
         let ip: IpAddr = "10.0.0.7".parse().unwrap();
 
@@ -984,7 +1017,7 @@ mod tests {
 
     #[tokio::test]
     async fn burst_allows_up_to_burst_size_then_denies() {
-        let limiter = DistributedRateLimiter::new(RateLimitConfig {
+        let mut limiter = DistributedRateLimiter::new(RateLimitConfig {
             per_ip_limit: 1000,
             per_user_limit: 1000,
             window_secs: 60,
@@ -993,6 +1026,7 @@ mod tests {
             redis_url: None,
         })
         .await;
+        limiter.degraded_limit_divisor = 1;
 
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
@@ -1010,7 +1044,7 @@ mod tests {
 
     #[tokio::test]
     async fn burst_refills_over_time() {
-        let limiter = DistributedRateLimiter::new(RateLimitConfig {
+        let mut limiter = DistributedRateLimiter::new(RateLimitConfig {
             per_ip_limit: 1000,
             per_user_limit: 1000,
             window_secs: 60,
@@ -1019,6 +1053,7 @@ mod tests {
             redis_url: None,
         })
         .await;
+        limiter.degraded_limit_divisor = 1;
 
         let ip: IpAddr = "10.0.0.8".parse().unwrap();
 
@@ -1039,7 +1074,7 @@ mod tests {
     async fn combined_check_denied_by_window_limit_even_with_burst_available() {
         // Window limit = 2, burst = 100. After 2 requests, window denies
         // even though burst tokens are still available.
-        let limiter = DistributedRateLimiter::new(RateLimitConfig {
+        let mut limiter = DistributedRateLimiter::new(RateLimitConfig {
             per_ip_limit: 2,
             per_user_limit: 100,
             window_secs: 60,
@@ -1048,6 +1083,7 @@ mod tests {
             redis_url: None,
         })
         .await;
+        limiter.degraded_limit_divisor = 1;
 
         let ip: IpAddr = "10.0.0.9".parse().unwrap();
 
@@ -1141,6 +1177,58 @@ mod tests {
         // IPv6 localhost should be independent
         let r = limiter.check_ip(v6).await;
         assert!(r.allowed, "IPv6 localhost should be independent of IPv4");
+    }
+
+    // =========================================================================
+    // 8. Degraded mode — verify conservative limits when Redis is down
+    // =========================================================================
+
+    #[tokio::test]
+    async fn degraded_mode_applies_divisor_to_limits() {
+        // With per_ip_limit=100 and divisor=10, local fallback allows only 10.
+        let mut limiter = DistributedRateLimiter::new(RateLimitConfig {
+            per_ip_limit: 100,
+            per_user_limit: 50,
+            window_secs: 60,
+            burst_size: 200,
+            refill_rate: 1.0,
+            redis_url: None,
+        })
+        .await;
+        limiter.degraded_limit_divisor = 10;
+
+        let ip: IpAddr = "10.99.0.1".parse().unwrap();
+
+        // Should allow exactly 10 (100 / 10)
+        for i in 0..10 {
+            let r = limiter.check_ip(ip).await;
+            assert!(r.allowed, "degraded request {i} should be allowed (limit=10)");
+        }
+        // 11th should be denied
+        let r = limiter.check_ip(ip).await;
+        assert!(!r.allowed, "11th request should be denied in degraded mode (limit=10)");
+    }
+
+    #[tokio::test]
+    async fn degraded_divisor_never_allows_zero() {
+        // Even with divisor > limit, at least 1 request should be allowed
+        let mut limiter = DistributedRateLimiter::new(RateLimitConfig {
+            per_ip_limit: 3,
+            per_user_limit: 3,
+            window_secs: 60,
+            burst_size: 100,
+            refill_rate: 1.0,
+            redis_url: None,
+        })
+        .await;
+        limiter.degraded_limit_divisor = 100; // 3/100 = 0, but .max(1) → 1
+
+        let ip: IpAddr = "10.99.0.2".parse().unwrap();
+        let r = limiter.check_ip(ip).await;
+        assert!(r.allowed, "at least 1 request must be allowed (max(1))");
+
+        let r = limiter.check_ip(ip).await;
+        assert!(!r.allowed, "2nd request denied with effective limit of 1");
     }
 
     #[tokio::test]

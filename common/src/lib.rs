@@ -87,3 +87,18 @@ pub mod cert_lifecycle;
 // ── Database HA and distributed sessions ──
 pub mod db_ha;
 pub mod distributed_session;
+
+// ── Privileged Identity Management (just-in-time elevation) ──
+pub mod pim;
+
+// ── Device lifecycle management ──
+pub mod device_lifecycle;
+
+// ── Conditional access policy engine ──
+pub mod conditional_access;
+
+// ── Multi-tenant isolation ──
+pub mod multi_tenancy;
+
+// ── Identity Lifecycle Management ──
+pub mod idm;

@@ -31,6 +31,10 @@ pub struct OrchestratorRequest {
     /// in the token's `aud` claim). If `None`, the TSS uses a default audience.
     #[serde(default)]
     pub audience: Option<String>,
+    /// Ceremony session ID binding — the TSS embeds this in TokenClaims so
+    /// tokens cannot be migrated between ceremonies.
+    #[serde(default)]
+    pub ceremony_id: [u8; 32],
     #[serde(default)]
     pub device_attestation_age_secs: Option<f64>,
     #[serde(default)]

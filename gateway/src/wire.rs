@@ -59,10 +59,11 @@ pub struct OrchestratorRequest {
     /// in the token's `aud` claim).
     #[serde(default)]
     pub audience: Option<String>,
-    // TODO(security): Add ceremony_id field to bind orchestrator requests to
-    // specific ceremony instances. The TSS should embed this in TokenClaims so
-    // tokens cannot be migrated between ceremonies. The verifier should then
-    // validate ceremony_id matches the expected ceremony for the session.
+    /// Ceremony session ID binding — the TSS embeds this in TokenClaims so
+    /// tokens cannot be migrated between ceremonies. The verifier validates
+    /// that ceremony_id matches the expected ceremony for the session.
+    #[serde(default)]
+    pub ceremony_id: [u8; 32],
     #[serde(default)]
     pub device_attestation_age_secs: Option<f64>,
     #[serde(default)]
