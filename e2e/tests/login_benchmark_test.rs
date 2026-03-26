@@ -819,24 +819,41 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 }
 
 /// Run N concurrent logins and print stats.
+///
+/// Uses a semaphore to bound concurrency — Argon2id uses 64 MiB per hash,
+/// so we cap at (available_ram / 64 MiB) concurrent OPAQUE operations to
+/// prevent OOM. On a 32 GB machine that's ~400 concurrent hashes.
 async fn run_concurrent_logins(n: usize) {
     // Register N users
     let mut store = CredentialStore::new();
+    let reg_start = Instant::now();
     for i in 0..n {
         store.register_with_password(&format!("user_{i}"), b"BenchPass!2024");
     }
+    let reg_ms = reg_start.elapsed().as_secs_f64() * 1000.0;
+    println!("Registered {n} users in {reg_ms:.1}ms ({:.1}ms/user)", reg_ms / n as f64);
 
     let gateway_addr = boot_full_system(store).await;
     // Give services a moment to stabilize
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let gateway_addr = Arc::new(gateway_addr);
+
+    // Bound concurrency: 64 MiB per Argon2id, leave 2 GB headroom
+    // On 32 GB machine: (32 - 2) * 1024 / 64 = 480 concurrent
+    // On smaller VMs, use at least 8
+    let max_concurrent = std::cmp::max(8, (30 * 1024) / 64);
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+    println!("Concurrency limit: {max_concurrent} (Argon2id 64MiB/hash)");
+
     let total_start = Instant::now();
 
     let mut handles = Vec::with_capacity(n);
     for i in 0..n {
         let addr = Arc::clone(&gateway_addr);
+        let sem = Arc::clone(&semaphore);
         let handle = tokio::spawn(async move {
+            let _permit = sem.acquire().await.expect("semaphore");
             let login_start = Instant::now();
             let username = format!("user_{i}");
             let resp = client_auth(&addr, &username, b"BenchPass!2024").await;
