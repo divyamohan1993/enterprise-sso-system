@@ -437,7 +437,14 @@ impl DistributedSigningCoordinator {
         let mut commitments_map: BTreeMap<Identifier, SigningCommitments> = BTreeMap::new();
 
         for (_id, addr) in &selected {
-            let signer_host = addr.split(':').next().unwrap_or(addr);
+            // Use actual hostname for TLS SNI; fall back to "localhost" for bare IP
+            // addresses since self-signed certs use DNS names, not IP SANs.
+            let raw_host = addr.split(':').next().unwrap_or(addr);
+            let signer_host = if raw_host.parse::<std::net::IpAddr>().is_ok() {
+                "localhost"
+            } else {
+                raw_host
+            };
             let mut transport = shard::tls_transport::tls_connect(
                 addr,
                 common::types::ModuleId::Orchestrator,
@@ -501,7 +508,14 @@ impl DistributedSigningCoordinator {
                 .remove(id)
                 .ok_or_else(|| format!("missing nonces for signer {:?}", id))?;
 
-            let signer_host = addr.split(':').next().unwrap_or(addr);
+            // Use actual hostname for TLS SNI; fall back to "localhost" for bare IP
+            // addresses since self-signed certs use DNS names, not IP SANs.
+            let raw_host = addr.split(':').next().unwrap_or(addr);
+            let signer_host = if raw_host.parse::<std::net::IpAddr>().is_ok() {
+                "localhost"
+            } else {
+                raw_host
+            };
             let mut transport = shard::tls_transport::tls_connect(
                 addr,
                 common::types::ModuleId::Orchestrator,
@@ -1563,7 +1577,8 @@ mod tests {
         let mut commitments_map: BTreeMap<Identifier, SigningCommitments> = BTreeMap::new();
 
         for (_id, addr) in &selected {
-            let signer_host = addr.split(':').next().unwrap_or(addr);
+            let raw_host = addr.split(':').next().unwrap_or(addr);
+            let signer_host = if raw_host.parse::<std::net::IpAddr>().is_ok() { "localhost" } else { raw_host };
             let mut transport = shard::tls_transport::tls_connect(
                 addr,
                 common::types::ModuleId::Orchestrator,
@@ -1619,7 +1634,8 @@ mod tests {
                 .remove(id)
                 .ok_or_else(|| format!("missing nonces for {:?}", id))?;
 
-            let signer_host = addr.split(':').next().unwrap_or(addr);
+            let raw_host = addr.split(':').next().unwrap_or(addr);
+            let signer_host = if raw_host.parse::<std::net::IpAddr>().is_ok() { "localhost" } else { raw_host };
             let mut transport = shard::tls_transport::tls_connect(
                 addr,
                 common::types::ModuleId::Orchestrator,
