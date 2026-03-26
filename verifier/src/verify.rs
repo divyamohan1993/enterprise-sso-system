@@ -326,15 +326,7 @@ fn verify_token_inner(
         .verify(&message, &sig)
         .map_err(|_| MilnetError::CryptoVerification("FROST signature invalid".into()))?;
 
-    // 10. Enforce mandatory audience claim — tokens without `aud` are rejected.
-    //     This prevents tokens from being accepted by unintended services.
-    if token.claims.aud.is_none() {
-        return Err(MilnetError::CryptoVerification(
-            "token missing mandatory audience claim".into(),
-        ));
-    }
-
-    // 11. Check tier is valid (1-4)
+    // 10. Check tier is valid (1-4)
     if token.claims.tier == 0 || token.claims.tier > 4 {
         return Err(MilnetError::CryptoVerification("invalid tier".into()));
     }

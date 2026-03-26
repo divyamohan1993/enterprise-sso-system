@@ -528,7 +528,6 @@ impl OrchestratorService {
                 Ok(r) => r,
                 Err(e) => { tracing::error!("bad request from gateway: {e}"); continue; }
             };
-            tracing::info!("orchestrator: audience={:?}, user={}", request.audience, request.username);
             let response = self.process_auth(&request).await;
             let resp_bytes = postcard::to_allocvec(&response).map_err(|e| format!("serialize response: {e}"))?;
             transport.send(&resp_bytes).await.map_err(|e| format!("send to gateway: {e}"))?;
