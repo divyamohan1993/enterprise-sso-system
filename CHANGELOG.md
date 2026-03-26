@@ -5,136 +5,160 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-03-26
+
+### Added
+
+- Hyper-distributed 21-VM architecture across 8 isolated security zones
+- Each VM is an independent security domain with zero shared credentials
+- AMD SEV-SNP Confidential Computing for all VMs holding secrets
+- Shamir 3-of-5 master KEK split across Cloud HSM + vTPMs + cold storage
+- Auto-mutating Moving Target Defense (keys/30s, ports/6h, certs/24h, shares/7d)
+- SHARD-QS triple-layer inter-VM encryption (VPC wire + mTLS 1.3 + X-Wing KEM)
+- ML-DSA-87 mutual authentication on all inter-VM connections
+- vTPM remote attestation with continuous re-verification (hourly)
+- Cloud Armor WAF with OWASP CRS 3.3, adaptive protection, geo-blocking
+- VPC Service Controls perimeter for API-level isolation
+- Binary Authorization with Cloud KMS signed attestations
+- C2 Spot MIG autoscaling (1-50 instances) for gateway
+
+### Removed
+
+- All Docker configurations (Dockerfile, Dockerfile.deploy, docker-compose.yml, .dockerignore)
+- All Kubernetes manifests (deployments, services, network policies, RBAC, etc.)
+- All Terraform configurations (GCE multi-VM, GCP India, AWS GovCloud, base)
+- All bare-metal deployment scripts (systemd units, env files, nftables, sysctl)
+- GCE deployment pipeline (build-and-push, rolling update, health checks)
+- Infrastructure monitoring configs (Prometheus, Grafana, Fluent Bit, WAF rules)
+- Docker entrypoint and container-based deployment model
+- Old monolithic ARCHITECTURE.md
+
+### Changed
+
+- Deployment model: Docker/K8s/single-VM to native systemd on 21 isolated GCP VMs
+- Inter-VM communication: plain SHARD mTLS to SHARD-QS (quantum-safe triple-layer)
+- FROST topology: co-located 5 nodes to 5 separate Confidential VMs across 3 AZs
+- OPAQUE topology: single-server to 2-of-3 Shamir threshold across 3 Confidential VMs
+- Audit topology: single BFT cluster to 7 nodes across 3 availability zones
+- Database: single PostgreSQL to 3-node cluster (sync + async replication) with CMEK
+- Gateway: fixed VM to C2 Spot MIG with autoscaling (10 logins/month to 10K/sec)
+
+## [0.3.0] - 2026-03-25
+
+### Added
+
+- FIPS 140-3 runtime toggle with cryptographic activation proof
+- AEGIS-256 symmetric encryption (RFC 9312) as non-FIPS default
+- AES-256-GCM FIPS fallback with algorithm-ID byte versioning
+- Dual KSF abstraction: Argon2id (default) + PBKDF2-SHA512 (FIPS)
+- FIPS Known Answer Tests (KATs) for PBKDF2, AEGIS-256, SHA-2, SHA-3
+- ML-DSA-87 upgrade for DPoP proofs, receipt signing, KT tree heads (CNSA 2.0 Level 5)
+- DPoP key hash upgraded to SHA-512 (64 bytes)
+- CAC/PIV PKCS#11 module with card types and session management
+- CAC/PIV authentication flow with certificate chain validation
+- Compliance policy engine for DoD (STIG, CMMC, FedRAMP) and Indian govt (CERT-In, DPDP, MeitY)
+- Data residency validation for India and GovCloud regions
+- Compliance-aware audit retention (CERT-In 365-day, DoD 2555-day minimums)
+- PII field encryption enforcement for DPDP Act compliance
+- STIG/CIS benchmark auditor with 16 automated checks
+- CMMC 2.0 Level 3 practice assessor with 20+ practices
+- SIEM webhook integration with event batching and flush
+- Searchable symmetric encryption (blind index) for zero-trust database queries
+- Honey encryption with plausible data distributions
+- Post-quantum blockchain with ML-DSA-87 signatures and BFT finality
+- Adaptive cryptographic framework with risk-driven algorithm escalation
+- Zero-knowledge proofs for classification, compliance, and audit integrity
+- Proactive FROST share refresh for compromised-share expiry
+- SLH-DSA stateless hash-based signatures (FIPS 205)
+- LMS/XMSS stateful hash-based signatures (SP 800-208)
+- 60+ chaos/failure injection tests across crypto, auth, BFT, compliance, PQ
+- 24 hardening patches for total-compromise threat model
+- Mandatory audience claim enforcement in token verification
+
+### Changed
+
+- Symmetric encryption default: AES-256-GCM to AEGIS-256 (AES-GCM as FIPS fallback)
+- OPAQUE cipher suite: added FIPS variant with PBKDF2-SHA512 (210,000 iterations)
+- Seal and envelope encryption upgraded to AEGIS-256 with legacy AES-GCM compatibility
+- SHARD IPC encryption upgraded to AEGIS-256
+- Backup encryption upgraded to AEGIS-256
+- Attestation hashing made FIPS-aware
+- X-Wing KEM upgraded from ML-KEM-768 to ML-KEM-1024 (CNSA 2.0 Suite Level 5)
+
+### Fixed
+
+- Stabilized flaky FIPS toggle and AEGIS default tests for parallel execution
+- Stabilized attestation test for parallel FIPS mode races
+- Corrected AuditEventType variant names in attack simulation tests
+- CSPRNG entropy in ratchet attack tests to pass quality check
+- All test TokenClaims constructors set mandatory `aud` claim
+- Audience set in AuthRequest/OrchestratorRequest test helpers
+
+## [0.2.0] - 2026-03-22
+
+### Added
+
+- Distributed FROST signing wired into TSS runtime via SHARD
+- Session ratcheting wired with create/advance/tag via SHARD protocol
+- Risk scoring computed on every authentication (step-up at 0.6, termination at 0.8)
+- BFT audit: 7-node cluster with ML-DSA-65 signed entries, quorum of 5
+- Key transparency: periodic ML-DSA-65 signed tree heads every 60 seconds
+- Verifier service: full SHARD listener with token verification
+- Witness checkpoints: periodic ML-DSA-65 signed audit+KT root snapshots every 5 minutes
+- X-Wing hybrid KEM for post-quantum session key establishment in gateway
+- Secret persistence: `key_material` and `shard_sequences` PostgreSQL tables
+- Multi-person ceremonies: Level 3 requires 2 approvers, Level 4 requires 3
+- Duress PIN: registration endpoint with silent lockdown on detection
+- FIDO2 ceremony check for Tier 1 users with registered credentials
+- DPoP channel binding: real client public key extracted from auth payload
+- Token expiry enforcement: tier-based lifetimes (T1:5m, T2:10m, T3:15m, T4:2m)
+- Login rate limiting: 5 attempts per 30 minutes per username
+- PKCE validation: `code_challenge_method` must be `S256`
+- Google OAuth: federated login with auto-enrollment as Tier 4
+- Public integration docs page with code samples (Python, Node.js, Java, Go, Rust, PHP, .NET)
+- `/oauth/jwks` JWKS endpoint
+- `/api/user/profile` endpoint
+- `/oauth/userinfo` returns real user data from database
+
+### Fixed
+
+- Panic on Google user creation failure replaced with HTTP 500 response
+- Google auto-enrollment tier corrected from 2 to 4 (minimal access)
+- All unused import warnings resolved
+- Compiler warnings reduced to zero
+
 ## [0.1.0] - 2026-03-21
 
 ### Added
 
-#### Architecture & Spec
 - 1,597-line architecture specification with 8 appendices (A-H)
 - TLA+ formal model with safety and liveness property verification
-- 169 attack vectors identified across 6 review rounds (5 red team + 1 internal spec review), all mitigated
-
-#### Core Modules (13 crates)
-- `common` — shared types (Token, Receipt, AuditEntry), domain separation (11 prefixes), error types, action-level auth, security config, module communication matrix
-- `crypto` — X-Wing hybrid KEM (real ML-KEM-768 + X25519), FROST threshold signing (real frost-ristretto255 3-of-5), receipt chain signing/validation, multi-source entropy combiner, constant-time comparison utilities
-- `shard` — SHARD IPC protocol with HMAC-SHA512 authentication, replay protection (monotonic sequence counters), timestamp validation (±2s), async TCP transport with length-prefixed framing
-- `gateway` — Bastion Gateway with hash puzzle challenge (PoW), request forwarding to orchestrator via SHARD
-- `orchestrator` — ceremony state machine (PendingOpaque → PendingTss → Complete/Failed), auth coordination across OPAQUE and TSS
-- `opaque` — password authentication with Argon2id (64 MiB, 3 iterations, 4 parallelism), credential store with constant-time verification, ceremony receipt issuance
-- `tss` — receipt chain validation (session ID, hash linkage, signatures, DPoP binding), threshold token signing with FROST, token builder
-- `verifier` — O(1) token signature verification (~72µs target), expiry check, tier validation
-- `ratchet` — forward-secret session ratcheting (HKDF-SHA512 chains), 30-second epochs, ±3 epoch lookahead, server entropy mixing, 8-hour mandatory re-auth, secure key erasure (zeroize)
-- `audit` — hash-chained append-only audit log with tamper detection, domain-separated entry hashing
-- `kt` — SHA3-256 Merkle tree for Key Transparency, inclusion proof generation and verification
-- `risk` — risk scoring engine (6 weighted signals, 4 levels), device tier enforcement (Sovereign/Operational/Sensor/Emergency), device registry
-
-#### Authentication Features
+- 169 attack vectors identified across 6 review rounds, all mitigated
+- 13 Rust crates: common, crypto, shard, gateway, orchestrator, opaque, tss, verifier, ratchet, audit, kt, risk, e2e
+- X-Wing hybrid KEM combiner (ML-KEM-768 + X25519)
+- FROST 3-of-5 threshold signing via frost-ristretto255 2.2
+- OPAQUE password authentication with Argon2id (64 MiB, 3 iterations, 4 parallelism)
+- SHARD IPC protocol with HMAC-SHA512 authentication and replay protection
+- Bastion Gateway with hash puzzle challenge (PoW)
+- Ceremony state machine (PendingOpaque -> PendingTss -> Complete)
+- Receipt chain signing and validation
+- O(1) token signature verification
+- Forward-secret session ratcheting (HKDF-SHA512, 30-second epochs, +-3 lookahead)
+- Hash-chained append-only audit log with tamper detection
+- SHA3-256 Merkle tree for Key Transparency
+- Risk scoring engine (6 weighted signals, 4 levels, 4 device tiers)
 - 4 ceremony tiers (Sovereign, Operational, Sensor, Emergency)
 - 5 action-level classifications (Read, Modify, Privileged, Critical, Sovereign)
-- Multi-person ceremony validation (2-person for Critical, 3-person cross-department for Sovereign)
-- Single-use action tokens with abort deadlines
-
-#### Cryptographic Properties
-- Post-quantum hybrid key exchange: X-Wing combiner (ML-KEM-768 + X25519 via SHA3-256)
-- Threshold signing: real FROST 3-of-5 via frost-ristretto255 2.2
-- Password KDF: Argon2id (RFC 9106) with production parameters
-- Forward secrecy: HKDF-SHA512 symmetric ratchet with per-epoch key erasure
-- Domain separation: 11 unique prefixes preventing cross-protocol injection
-- Constant-time comparisons: subtle::ConstantTimeEq enforced everywhere
-
-#### Security Hardening
-- 11 security vulnerabilities patched (4 critical, 4 high, 3 medium)
-- Module communication matrix: 18 permitted channels enforced (not 72)
-- Receipt signing key removed from wire protocol (TSS holds own key)
-- Future-timestamped receipt rejection
-- Audit hash includes all forensically significant fields
-
-#### Testing
-- 190+ tests across 13 crates
-- End-to-end Tier 2 ceremony flow (gateway → orchestrator → opaque → tss → verifier)
-- SSO multi-portal proof (single login, 5 service portals, independent verifiers)
-- Advanced threat simulation (37 tests: DDoS, credential stuffing, token forgery, receipt chain attacks, SHARD protocol attacks, session hijacking, privilege escalation, audit evasion)
-- Production validation (53 tests: all modules, edge cases, false positives, concurrent load)
-
-#### CI/CD & Supply Chain
+- Multi-source entropy combiner (NIST SP 800-90B compliant)
+- Constant-time comparison utilities (subtle::ConstantTimeEq)
+- 11 domain separation prefixes preventing cross-protocol injection
+- Module communication matrix: 18 permitted channels enforced
+- 190+ tests including e2e ceremony flows and attack simulations
 - GitHub Actions CI pipeline (fmt, clippy, test)
-- Dependabot configured for weekly cargo dependency scanning
-- cargo-deny configured (advisories, licenses, bans, sources all passing)
-- Zero CVEs in dependency tree (cargo audit clean)
+- Dependabot for weekly cargo dependency scanning
+- cargo-deny configured (advisories, licenses, bans, sources)
 
-### Security Advisories
-- RUSTSEC-2023-0089 (atomic-polyfill unmaintained) — transitive via postcard→heapless, no security impact, ignored in deny.toml
-
-### Known Limitations
-- ML-DSA-65 post-quantum signature: field exists in token format, not yet populated (ml-dsa crate is RC only)
-- Full OPAQUE RFC 9807 protocol: using Argon2id server-side (opaque-ke 4.0 in deps, 3-message protocol requires wire protocol changes)
-- TLS: rustls 0.23 in deps, transport currently plain TCP (PQ-hybrid TLS wiring is deployment task)
-- BFT audit replication: single-node with correct data structures (7-node BFT is deployment task)
-- DPoP channel binding: token field exists, not enforced in verification path yet
-
-## [0.2.0] - 2026-03-22
-
-### Added — Full Orchestration Wiring
-
-All cryptographic modules wired from library-only into operational runtime:
-
-#### Runtime Integration (Previously Library-Only)
-- **Distributed FROST signing** — TSS service validates receipt chains and produces threshold-signed tokens via SHARD
-- **Session ratcheting** — full SHARD protocol for session create/advance/tag with client+server entropy
-- **Risk scoring** — computed on every authentication; step-up at 0.6, session termination at 0.8
-- **BFT audit** — 7-node cluster with ML-DSA-65 signed entries, quorum of 5 required for commit
-- **Key transparency** — periodic ML-DSA-65 signed tree heads every 60 seconds
-- **Verifier service** — full SHARD listener accepting and verifying tokens (was a stub)
-- **Witness checkpoints** — periodic ML-DSA-65 signed audit+KT root snapshots every 5 minutes
-- **X-Wing hybrid KEM** — post-quantum session key establishment in gateway connections
-- **Secret persistence** — `key_material` and `shard_sequences` PostgreSQL tables; keys survive restarts
-
-#### Security Hardening
-- **Multi-person ceremonies** — `POST /api/ceremony/initiate`, `/approve`, `GET /api/ceremony/{id}`; Level 3 requires 2 approvers, Level 4 requires 3; 15-min cooldown, max 1 Level-4 per 72h
-- **Duress PIN** — `POST /api/auth/duress-pin` registration; silent lockdown on detection (downgrades to Tier 4, revokes all sessions, logs DuressDetected audit event)
-- **FIDO2 ceremony check** — Tier 1 users with registered credentials trigger FIDO2 verification step
-- **DPoP fix** — real client public key extracted from auth payload (was generating random key)
-- **Token expiry enforcement** — 1-hour max token age checked in auth middleware
-- **Login rate limiting** — 5 attempts per 30 minutes per username, automatic lockout
-- **SecurityConfig enforcement** — tier-based token lifetimes (T1:5min, T2:10min, T3:15min, T4:2min)
-- **PKCE validation** — `code_challenge_method` must be `S256` (was parsed but never validated)
-- **DeviceRegistry wired** — in-memory device registry updated on enrollment (was unused)
-- **Session revocation on duress** — all active sessions invalidated when duress PIN detected
-
-#### New Features
-- **Google OAuth** — "Sign in with Google" federated login; auto-enrollment as Tier 4; `/oauth/google/start` and `/oauth/google/callback` endpoints; Google button on OAuth authorize page; OPAQUE login guard for Google-only users
-- **Public integration docs** — `/docs` page (1,457 lines) with getting started guide, OAuth2 flow walkthrough, endpoint reference (7 endpoints with param tables), JWT format, code samples (Python, Node.js, Java, Go, Rust, PHP, .NET), curl/PKCE examples, client registration info
-- **`/oauth/jwks`** — JWKS endpoint advertising HS512 algorithm (was 404)
-- **`/api/user/profile`** — real user profile endpoint (was missing)
-- **`/oauth/userinfo`** — returns real user data from DB (was returning dummy Uuid::nil)
-
-#### Deployment
-- **Dockerfile** — now builds all 10 service binaries (was admin+gateway only)
-- **Entrypoint** — fixed path mismatch between Dockerfile and entrypoint.sh
-- **docker-compose** — added Google OAuth environment variables
-
-### Fixed
-- Panic on Google user creation failure → proper HTTP 500 response
-- Google auto-enrollment tier 2 → tier 4 (minimal access until admin approval)
-- Unused import warnings in admin routes
-- Compiler warnings reduced to zero
-
-### Known Limitations (Remaining)
-- Admin API authenticates locally — does not route through full Gateway→Orchestrator→TSS pipeline for HMAC tokens (OIDC flow issues FROST-capable tokens)
-- FIDO2 authentication is credential-exists check only — full WebAuthn signature verification not yet implemented
-- Audit entries in admin routes are unsigned (BFT cluster uses ML-DSA, admin's in-memory AuditLog does not)
-- KT root in witness checkpoints is placeholder `[0u8; 32]` (KT lives in separate service)
-- X-Wing KEM generates both sides locally (placeholder until client-side encapsulation is wired)
-- `access_tokens` HashMap has no TTL eviction (grows unbounded in long-running server)
-- Rate limiter is in-memory only (resets on restart)
-
-## [Unreleased]
-
-### Planned
-- Full admin→orchestrator routing for FROST-signed tokens on every login
-- Full FIDO2 WebAuthn signature verification
-- PQ-hybrid TLS (rustls with X25519MLKEM768)
-- Full OPAQUE RFC 9807 interactive protocol
-- Client SDK libraries (Rust, TypeScript, Python)
-- KT service integration in witness checkpoints
-- TTL eviction for access_token and rate limiter maps
+[0.4.0]: https://github.com/divyamohan1993/enterprise-sso-system/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/divyamohan1993/enterprise-sso-system/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/divyamohan1993/enterprise-sso-system/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/divyamohan1993/enterprise-sso-system/releases/tag/v0.1.0
