@@ -783,7 +783,13 @@ mod tests {
             legacy_blob.extend_from_slice(&ct2);
         }
 
-        let recovered = kek.unseal(&legacy_blob).unwrap();
-        assert_eq!(recovered, plaintext);
+        // Legacy untagged blobs are now rejected after the removal of the
+        // legacy AES-GCM decrypt fallback. This is the expected behavior —
+        // old ciphertexts must be re-encrypted under the V2 envelope format.
+        let result = kek.unseal(&legacy_blob);
+        assert!(
+            result.is_err(),
+            "legacy untagged ciphertext must be rejected after fallback removal"
+        );
     }
 }
