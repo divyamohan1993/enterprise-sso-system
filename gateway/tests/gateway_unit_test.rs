@@ -310,7 +310,8 @@ async fn test_rate_limit_under_threshold() {
         refill_rate: 1.0,
         redis_url: None, // local-only mode
     };
-    let limiter = DistributedRateLimiter::new(config).await;
+    let mut limiter = DistributedRateLimiter::new(config).await;
+    limiter.degraded_limit_divisor = 1;
 
     let ip: std::net::IpAddr = "192.168.1.1".parse().unwrap();
 
@@ -330,7 +331,8 @@ async fn test_rate_limit_over_threshold() {
         refill_rate: 1.0,
         redis_url: None,
     };
-    let limiter = DistributedRateLimiter::new(config).await;
+    let mut limiter = DistributedRateLimiter::new(config).await;
+    limiter.degraded_limit_divisor = 1;
 
     let ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
 
@@ -356,7 +358,8 @@ async fn test_rate_limit_different_ips_independent() {
         refill_rate: 1.0,
         redis_url: None,
     };
-    let limiter = DistributedRateLimiter::new(config).await;
+    let mut limiter = DistributedRateLimiter::new(config).await;
+    limiter.degraded_limit_divisor = 1;
 
     let ip1: std::net::IpAddr = "10.0.0.1".parse().unwrap();
     let ip2: std::net::IpAddr = "10.0.0.2".parse().unwrap();
@@ -382,7 +385,8 @@ async fn test_rate_limit_user_check() {
         refill_rate: 1.0,
         redis_url: None,
     };
-    let limiter = DistributedRateLimiter::new(config).await;
+    let mut limiter = DistributedRateLimiter::new(config).await;
+    limiter.degraded_limit_divisor = 1;
 
     // Use up user limit
     limiter.check_user("user123").await;
@@ -401,7 +405,8 @@ async fn test_rate_limit_result_fields() {
         refill_rate: 1.0,
         redis_url: None,
     };
-    let limiter = DistributedRateLimiter::new(config).await;
+    let mut limiter = DistributedRateLimiter::new(config).await;
+    limiter.degraded_limit_divisor = 1;
 
     let ip: std::net::IpAddr = "172.16.0.1".parse().unwrap();
 

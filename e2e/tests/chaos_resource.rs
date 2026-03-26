@@ -57,7 +57,8 @@ async fn test_rate_limit_enforcement() {
         refill_rate: 5.0 / 60.0,
         redis_url: None, // local-only mode
     };
-    let limiter = DistributedRateLimiter::new(config).await;
+    let mut limiter = DistributedRateLimiter::new(config).await;
+    limiter.degraded_limit_divisor = 1;
     let ip: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
 
     // Exhaust the per-IP limit.

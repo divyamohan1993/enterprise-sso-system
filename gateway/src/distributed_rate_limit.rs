@@ -218,7 +218,7 @@ pub struct DistributedRateLimiter {
     /// gets `limit / degraded_limit_divisor` when Redis is down. Set to
     /// the expected number of gateway instances (e.g., 10 for a 10-instance MIG).
     /// Default: 10 (conservative — better to over-restrict than under-restrict).
-    degraded_limit_divisor: u64,
+    pub degraded_limit_divisor: u64,
 }
 
 /// Minimal Redis client wrapper.
