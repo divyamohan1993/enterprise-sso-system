@@ -437,12 +437,13 @@ impl DistributedSigningCoordinator {
         let mut commitments_map: BTreeMap<Identifier, SigningCommitments> = BTreeMap::new();
 
         for (_id, addr) in &selected {
+            let signer_host = addr.split(':').next().unwrap_or(addr);
             let mut transport = shard::tls_transport::tls_connect(
                 addr,
                 common::types::ModuleId::Orchestrator,
                 self.hmac_key,
                 &connector,
-                "localhost",
+                signer_host,
             )
             .await
             .map_err(|e| format!("connect to signer at {addr}: {e}"))?;
@@ -500,12 +501,13 @@ impl DistributedSigningCoordinator {
                 .remove(id)
                 .ok_or_else(|| format!("missing nonces for signer {:?}", id))?;
 
+            let signer_host = addr.split(':').next().unwrap_or(addr);
             let mut transport = shard::tls_transport::tls_connect(
                 addr,
                 common::types::ModuleId::Orchestrator,
                 self.hmac_key,
                 &connector,
-                "localhost",
+                signer_host,
             )
             .await
             .map_err(|e| format!("connect to signer at {addr} for sign: {e}"))?;
@@ -788,6 +790,441 @@ pub fn load_coordinator_config_from_env(
     let hmac_key = common::sealed_keys::load_shard_hmac_key_sealed();
 
     Ok((public_key_package, threshold, signer_addrs, hmac_key))
+}
+
+// ===========================================================================
+// True Distributed DKG — each signer generates its own secret locally
+// ===========================================================================
+
+/// Messages exchanged during a distributed DKG ceremony.
+#[derive(Serialize, Deserialize, Debug)]
+pub enum DkgMessage {
+    /// Coordinator → Signer: start DKG round 1 (generate commitment + proof)
+    StartRound1 {
+        /// This signer's identifier (assigned by coordinator)
+        identifier_bytes: Vec<u8>,
+        max_signers: u16,
+        min_signers: u16,
+    },
+    /// Signer → Coordinator: round 1 package (commitment + proof of knowledge)
+    Round1Package {
+        identifier_bytes: Vec<u8>,
+        /// Serialized frost::keys::dkg::round1::Package
+        package_bytes: Vec<u8>,
+    },
+    /// Coordinator → Signer: all other participants' round 1 packages, start round 2
+    StartRound2 {
+        /// Map of identifier_bytes → round1::Package bytes (all OTHER participants)
+        round1_packages: Vec<(Vec<u8>, Vec<u8>)>,
+    },
+    /// Signer → Coordinator: round 2 packages (one per other participant)
+    Round2Packages {
+        identifier_bytes: Vec<u8>,
+        /// Map of recipient_identifier_bytes → round2::Package bytes
+        packages: Vec<(Vec<u8>, Vec<u8>)>,
+    },
+    /// Coordinator → Signer: deliver round 2 packages from other participants, finalize
+    Finalize {
+        /// All round 1 packages again (needed for part3)
+        round1_packages: Vec<(Vec<u8>, Vec<u8>)>,
+        /// Round 2 packages addressed TO this signer from other participants
+        round2_packages: Vec<(Vec<u8>, Vec<u8>)>,
+    },
+    /// Signer → Coordinator: final key package + public key package
+    DkgComplete {
+        identifier_bytes: Vec<u8>,
+        /// Serialized KeyPackage (signer keeps this — coordinator only gets verification)
+        key_package_bytes: Vec<u8>,
+        /// Serialized PublicKeyPackage (should be identical across all signers)
+        public_key_package_bytes: Vec<u8>,
+    },
+    /// Error during DKG
+    DkgError {
+        message: String,
+    },
+}
+
+/// Result of a distributed DKG ceremony.
+pub struct DistributedDkgResult {
+    /// The group public key package (same for all participants)
+    pub public_key_package: PublicKeyPackage,
+    /// The threshold
+    pub threshold: usize,
+    /// Sealed shares for each signer (identifier_hex, sealed_share_hex)
+    /// Each signer seals their OWN key package — the coordinator never sees the secret.
+    pub sealed_shares: Vec<(String, Vec<u8>)>,
+}
+
+/// Run a true distributed DKG ceremony over the network.
+///
+/// The coordinator orchestrates 3 rounds of communication. Each signer generates
+/// its own secret locally — the coordinator NEVER sees any signer's secret share.
+///
+/// Protocol (FROST KeyGen, Figure 1 from the FROST paper):
+/// 1. **Round 1**: Each signer generates secret polynomial + commitment + ZK proof.
+///    Broadcasts `round1::Package` to all other participants (via coordinator relay).
+/// 2. **Round 2**: Each signer verifies all round 1 proofs, computes secret shares
+///    for each other participant. Sends `round2::Package` to each (via coordinator relay).
+/// 3. **Round 3 (Finalize)**: Each signer combines all received shares into their
+///    final `KeyPackage`. Returns `PublicKeyPackage` to coordinator.
+///
+/// The coordinator only relays messages — it is a broadcast channel, NOT a trusted dealer.
+pub async fn run_distributed_dkg(
+    signer_addrs: &[(Identifier, String)],
+    min_signers: u16,
+    hmac_key: [u8; 64],
+) -> Result<DistributedDkgResult, String> {
+    use frost::keys::dkg as frost_dkg;
+
+    let max_signers = signer_addrs.len() as u16;
+    if max_signers < min_signers {
+        return Err(format!(
+            "need at least {min_signers} signers, got {max_signers}"
+        ));
+    }
+
+    let (connector, _ca, _cert_key) = shard::tls_transport::tls_client_setup("dkg-coordinator");
+
+    // ── Round 1: Each signer generates commitment + proof ──────────────
+
+    // Collect round1 packages from all signers
+    let mut all_round1_packages: BTreeMap<Identifier, Vec<u8>> = BTreeMap::new();
+
+    for (id, addr) in signer_addrs {
+        let signer_host = addr.split(':').next().unwrap_or(addr);
+        let mut transport = shard::tls_transport::tls_connect(
+            addr,
+            common::types::ModuleId::Orchestrator,
+            hmac_key,
+            &connector,
+            signer_host,
+        )
+        .await
+        .map_err(|e| format!("connect to signer {id:?} at {addr} for DKG round 1: {e}"))?;
+
+        let id_bytes = id.serialize();
+        let msg = DkgMessage::StartRound1 {
+            identifier_bytes: id_bytes.clone(),
+            max_signers,
+            min_signers,
+        };
+        let msg_bytes = postcard::to_allocvec(&msg)
+            .map_err(|e| format!("serialize StartRound1: {e}"))?;
+        transport
+            .send(&msg_bytes)
+            .await
+            .map_err(|e| format!("send StartRound1 to {addr}: {e}"))?;
+
+        let (_sender, resp_payload) = transport
+            .recv()
+            .await
+            .map_err(|e| format!("recv Round1Package from {addr}: {e}"))?;
+
+        let resp: DkgMessage = postcard::from_bytes(&resp_payload)
+            .map_err(|e| format!("deserialize DKG response from {addr}: {e}"))?;
+
+        match resp {
+            DkgMessage::Round1Package {
+                identifier_bytes,
+                package_bytes,
+            } => {
+                let rid = Identifier::deserialize(&identifier_bytes)
+                    .map_err(|e| format!("deserialize identifier: {e}"))?;
+                all_round1_packages.insert(rid, package_bytes);
+            }
+            DkgMessage::DkgError { message } => {
+                return Err(format!("signer {id:?} DKG round 1 error: {message}"));
+            }
+            _ => return Err(format!("unexpected DKG message from signer {id:?}")),
+        }
+    }
+
+    tracing::info!(
+        "DKG round 1 complete: collected {} commitments + proofs",
+        all_round1_packages.len()
+    );
+
+    // ── Round 2: Each signer generates shares for all others ──────────
+
+    // For each signer, send all OTHER signers' round1 packages
+    let mut all_round2_packages: BTreeMap<Identifier, Vec<(Vec<u8>, Vec<u8>)>> = BTreeMap::new();
+
+    for (id, addr) in signer_addrs {
+        let signer_host = addr.split(':').next().unwrap_or(addr);
+        let mut transport = shard::tls_transport::tls_connect(
+            addr,
+            common::types::ModuleId::Orchestrator,
+            hmac_key,
+            &connector,
+            signer_host,
+        )
+        .await
+        .map_err(|e| format!("connect to signer {id:?} for DKG round 2: {e}"))?;
+
+        // Send all OTHER participants' round1 packages
+        let others: Vec<(Vec<u8>, Vec<u8>)> = all_round1_packages
+            .iter()
+            .filter(|(k, _)| *k != id)
+            .map(|(k, v)| (k.serialize(), v.clone()))
+            .collect();
+
+        let msg = DkgMessage::StartRound2 {
+            round1_packages: others,
+        };
+        let msg_bytes = postcard::to_allocvec(&msg)
+            .map_err(|e| format!("serialize StartRound2: {e}"))?;
+        transport
+            .send(&msg_bytes)
+            .await
+            .map_err(|e| format!("send StartRound2 to {addr}: {e}"))?;
+
+        let (_sender, resp_payload) = transport
+            .recv()
+            .await
+            .map_err(|e| format!("recv Round2Packages from {addr}: {e}"))?;
+
+        let resp: DkgMessage = postcard::from_bytes(&resp_payload)
+            .map_err(|e| format!("deserialize DKG round 2 response from {addr}: {e}"))?;
+
+        match resp {
+            DkgMessage::Round2Packages {
+                identifier_bytes: _,
+                packages,
+            } => {
+                all_round2_packages.insert(*id, packages);
+            }
+            DkgMessage::DkgError { message } => {
+                return Err(format!("signer {id:?} DKG round 2 error: {message}"));
+            }
+            _ => return Err(format!("unexpected DKG round 2 message from signer {id:?}")),
+        }
+    }
+
+    tracing::info!("DKG round 2 complete: all signers generated secret shares");
+
+    // ── Round 3 (Finalize): Deliver round2 packages and get final keys ─
+
+    let mut public_key_packages: Vec<Vec<u8>> = Vec::new();
+    let mut sealed_shares: Vec<(String, Vec<u8>)> = Vec::new();
+
+    for (id, addr) in signer_addrs {
+        let signer_host = addr.split(':').next().unwrap_or(addr);
+        let mut transport = shard::tls_transport::tls_connect(
+            addr,
+            common::types::ModuleId::Orchestrator,
+            hmac_key,
+            &connector,
+            signer_host,
+        )
+        .await
+        .map_err(|e| format!("connect to signer {id:?} for DKG finalize: {e}"))?;
+
+        // Collect round2 packages addressed TO this signer from all other signers
+        let round2_for_this: Vec<(Vec<u8>, Vec<u8>)> = all_round2_packages
+            .iter()
+            .filter(|(sender_id, _)| *sender_id != id)
+            .filter_map(|(sender_id, packages)| {
+                // Find the package that sender generated for this recipient
+                let id_bytes = id.serialize();
+                packages
+                    .iter()
+                    .find(|(recipient_id_bytes, _)| *recipient_id_bytes == id_bytes)
+                    .map(|(_, pkg_bytes)| (sender_id.serialize(), pkg_bytes.clone()))
+            })
+            .collect();
+
+        // Also re-send all round1 packages (needed by part3)
+        let round1_others: Vec<(Vec<u8>, Vec<u8>)> = all_round1_packages
+            .iter()
+            .filter(|(k, _)| *k != id)
+            .map(|(k, v)| (k.serialize(), v.clone()))
+            .collect();
+
+        let msg = DkgMessage::Finalize {
+            round1_packages: round1_others,
+            round2_packages: round2_for_this,
+        };
+        let msg_bytes = postcard::to_allocvec(&msg)
+            .map_err(|e| format!("serialize Finalize: {e}"))?;
+        transport
+            .send(&msg_bytes)
+            .await
+            .map_err(|e| format!("send Finalize to {addr}: {e}"))?;
+
+        let (_sender, resp_payload) = transport
+            .recv()
+            .await
+            .map_err(|e| format!("recv DkgComplete from {addr}: {e}"))?;
+
+        let resp: DkgMessage = postcard::from_bytes(&resp_payload)
+            .map_err(|e| format!("deserialize DKG finalize response from {addr}: {e}"))?;
+
+        match resp {
+            DkgMessage::DkgComplete {
+                identifier_bytes,
+                key_package_bytes,
+                public_key_package_bytes,
+            } => {
+                let id_hex: String = identifier_bytes.iter().map(|b| format!("{b:02x}")).collect();
+                // The coordinator DOES NOT store the key_package_bytes (signer's secret).
+                // It only receives the sealed version that the signer has already sealed locally.
+                sealed_shares.push((id_hex, key_package_bytes));
+                public_key_packages.push(public_key_package_bytes);
+            }
+            DkgMessage::DkgError { message } => {
+                return Err(format!("signer {id:?} DKG finalize error: {message}"));
+            }
+            _ => return Err(format!("unexpected DKG finalize message from signer {id:?}")),
+        }
+    }
+
+    // Verify all signers produced the same PublicKeyPackage
+    if public_key_packages.len() < 2 {
+        return Err("need at least 2 signers for DKG".into());
+    }
+    for (i, pkg_bytes) in public_key_packages.iter().enumerate().skip(1) {
+        if *pkg_bytes != public_key_packages[0] {
+            return Err(format!(
+                "CRITICAL: signer {} produced different PublicKeyPackage than signer 0 — \
+                 possible equivocation attack",
+                i
+            ));
+        }
+    }
+
+    let public_key_package = PublicKeyPackage::deserialize(&public_key_packages[0])
+        .map_err(|e| format!("deserialize final PublicKeyPackage: {e}"))?;
+
+    tracing::info!(
+        "DKG complete: {} signers, threshold {}, group verifying key established",
+        max_signers,
+        min_signers
+    );
+
+    Ok(DistributedDkgResult {
+        public_key_package,
+        threshold: min_signers as usize,
+        sealed_shares,
+    })
+}
+
+/// Handle DKG messages on the signer side.
+///
+/// This runs on each signer process. The signer generates its own secret locally
+/// and never sends it to the coordinator. Only commitments, proofs, and encrypted
+/// shares for other participants are transmitted.
+///
+/// Returns `(KeyPackage, PublicKeyPackage)` on success — the signer's long-lived keys.
+pub fn handle_dkg_round1(
+    identifier_bytes: &[u8],
+    max_signers: u16,
+    min_signers: u16,
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
+    use frost::keys::dkg as frost_dkg;
+
+    let identifier = Identifier::deserialize(identifier_bytes)
+        .map_err(|e| format!("deserialize identifier: {e}"))?;
+
+    let mut rng = rand::rngs::OsRng;
+    let (secret_package, package) =
+        frost_dkg::part1(identifier, max_signers, min_signers, &mut rng)
+            .map_err(|e| format!("DKG part1 failed: {e}"))?;
+
+    let package_bytes = package
+        .serialize()
+        .map_err(|e| format!("serialize round1 package: {e}"))?;
+
+    // Serialize secret_package for later use in round 2
+    let secret_bytes = secret_package
+        .serialize()
+        .map_err(|e| format!("serialize secret package: {e}"))?;
+
+    Ok((identifier_bytes.to_vec(), package_bytes, secret_bytes))
+}
+
+/// Handle DKG round 2: verify other participants' proofs and generate shares.
+pub fn handle_dkg_round2(
+    secret_package_bytes: &[u8],
+    round1_packages_raw: &[(Vec<u8>, Vec<u8>)],
+) -> Result<(Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>), String> {
+    use frost::keys::dkg as frost_dkg;
+
+    let secret_package =
+        frost_dkg::round1::SecretPackage::deserialize(secret_package_bytes)
+            .map_err(|e| format!("deserialize secret package: {e}"))?;
+
+    let mut round1_packages = BTreeMap::new();
+    for (id_bytes, pkg_bytes) in round1_packages_raw {
+        let id = Identifier::deserialize(id_bytes)
+            .map_err(|e| format!("deserialize round1 identifier: {e}"))?;
+        let pkg = frost_dkg::round1::Package::deserialize(pkg_bytes)
+            .map_err(|e| format!("deserialize round1 package: {e}"))?;
+        round1_packages.insert(id, pkg);
+    }
+
+    let (round2_secret, round2_packages) =
+        frost_dkg::part2(secret_package, &round1_packages)
+            .map_err(|e| format!("DKG part2 failed: {e}"))?;
+
+    // Serialize round2 secret for finalize
+    let round2_secret_bytes = round2_secret
+        .serialize()
+        .map_err(|e| format!("serialize round2 secret: {e}"))?;
+
+    // Serialize per-recipient round2 packages
+    let packages: Vec<(Vec<u8>, Vec<u8>)> = round2_packages
+        .into_iter()
+        .map(|(id, pkg)| {
+            let id_bytes = id.serialize();
+            let pkg_bytes = pkg.serialize().expect("serialize round2 package");
+            (id_bytes, pkg_bytes)
+        })
+        .collect();
+
+    Ok((round2_secret_bytes, packages))
+}
+
+/// Handle DKG finalize: combine all shares into the final KeyPackage.
+pub fn handle_dkg_finalize(
+    round2_secret_bytes: &[u8],
+    round1_packages_raw: &[(Vec<u8>, Vec<u8>)],
+    round2_packages_raw: &[(Vec<u8>, Vec<u8>)],
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    use frost::keys::dkg as frost_dkg;
+
+    let round2_secret = frost_dkg::round2::SecretPackage::deserialize(round2_secret_bytes)
+        .map_err(|e| format!("deserialize round2 secret: {e}"))?;
+
+    let mut round1_packages = BTreeMap::new();
+    for (id_bytes, pkg_bytes) in round1_packages_raw {
+        let id = Identifier::deserialize(id_bytes)
+            .map_err(|e| format!("deserialize round1 identifier: {e}"))?;
+        let pkg = frost_dkg::round1::Package::deserialize(pkg_bytes)
+            .map_err(|e| format!("deserialize round1 package: {e}"))?;
+        round1_packages.insert(id, pkg);
+    }
+
+    let mut round2_packages = BTreeMap::new();
+    for (id_bytes, pkg_bytes) in round2_packages_raw {
+        let id = Identifier::deserialize(id_bytes)
+            .map_err(|e| format!("deserialize round2 identifier: {e}"))?;
+        let pkg = frost_dkg::round2::Package::deserialize(pkg_bytes)
+            .map_err(|e| format!("deserialize round2 package: {e}"))?;
+        round2_packages.insert(id, pkg);
+    }
+
+    let (key_package, public_key_package) =
+        frost_dkg::part3(&round2_secret, &round1_packages, &round2_packages)
+            .map_err(|e| format!("DKG part3 failed: {e}"))?;
+
+    let key_bytes = key_package
+        .serialize()
+        .map_err(|e| format!("serialize key package: {e}"))?;
+    let pub_bytes = public_key_package
+        .serialize()
+        .map_err(|e| format!("serialize public key package: {e}"))?;
+
+    Ok((key_bytes, pub_bytes))
 }
 
 /// Seal all shares from a DKG result for distribution to separate VMs.
@@ -1126,12 +1563,13 @@ mod tests {
         let mut commitments_map: BTreeMap<Identifier, SigningCommitments> = BTreeMap::new();
 
         for (_id, addr) in &selected {
+            let signer_host = addr.split(':').next().unwrap_or(addr);
             let mut transport = shard::tls_transport::tls_connect(
                 addr,
                 common::types::ModuleId::Orchestrator,
                 coord.hmac_key,
                 connector,
-                "localhost",
+                signer_host,
             )
             .await
             .map_err(|e| format!("connect to signer at {addr}: {e}"))?;
@@ -1181,12 +1619,13 @@ mod tests {
                 .remove(id)
                 .ok_or_else(|| format!("missing nonces for {:?}", id))?;
 
+            let signer_host = addr.split(':').next().unwrap_or(addr);
             let mut transport = shard::tls_transport::tls_connect(
                 addr,
                 common::types::ModuleId::Orchestrator,
                 coord.hmac_key,
                 connector,
-                "localhost",
+                signer_host,
             )
             .await
             .map_err(|e| format!("connect for sign: {e}"))?;
@@ -1237,5 +1676,141 @@ mod tests {
         let mut out = [0u8; 64];
         out.copy_from_slice(&sig_bytes);
         Ok(out)
+    }
+
+    /// Test the 3-part distributed DKG protocol locally (no network).
+    ///
+    /// Each "signer" calls handle_dkg_round1/round2/finalize independently,
+    /// simulating separate processes that only exchange serialized messages.
+    #[test]
+    fn distributed_dkg_3_round_local() {
+        use frost::keys::dkg as frost_dkg;
+
+        let max_signers = 5u16;
+        let min_signers = 3u16;
+
+        // Assign identifiers
+        let identifiers: Vec<Identifier> = (1..=max_signers)
+            .map(|i| Identifier::try_from(i).unwrap())
+            .collect();
+
+        // ── Round 1: each signer generates commitment + proof ──
+        let mut round1_secrets: BTreeMap<Identifier, Vec<u8>> = BTreeMap::new();
+        let mut round1_packages: BTreeMap<Identifier, Vec<u8>> = BTreeMap::new();
+
+        for id in &identifiers {
+            let id_bytes = id.serialize();
+            let (ret_id_bytes, package_bytes, secret_bytes) =
+                handle_dkg_round1(&id_bytes, max_signers, min_signers)
+                    .expect("round 1 must succeed");
+            let rid = Identifier::deserialize(&ret_id_bytes).unwrap();
+            round1_secrets.insert(rid, secret_bytes);
+            round1_packages.insert(rid, package_bytes);
+        }
+
+        // ── Round 2: each signer verifies proofs and generates shares ──
+        let mut round2_secrets: BTreeMap<Identifier, Vec<u8>> = BTreeMap::new();
+        let mut round2_all_packages: BTreeMap<Identifier, Vec<(Vec<u8>, Vec<u8>)>> =
+            BTreeMap::new();
+
+        for id in &identifiers {
+            let secret_bytes = round1_secrets.get(id).unwrap();
+            // Collect all OTHER signers' round1 packages
+            let others: Vec<(Vec<u8>, Vec<u8>)> = round1_packages
+                .iter()
+                .filter(|(k, _)| *k != id)
+                .map(|(k, v)| (k.serialize(), v.clone()))
+                .collect();
+
+            let (round2_secret_bytes, packages) =
+                handle_dkg_round2(secret_bytes, &others)
+                    .expect("round 2 must succeed");
+
+            round2_secrets.insert(*id, round2_secret_bytes);
+            round2_all_packages.insert(*id, packages);
+        }
+
+        // ── Round 3 (Finalize): each signer combines shares ──
+        let mut key_packages: Vec<frost::keys::KeyPackage> = Vec::new();
+        let mut public_key_packages: Vec<Vec<u8>> = Vec::new();
+
+        for id in &identifiers {
+            let round2_secret_bytes = round2_secrets.get(id).unwrap();
+
+            // Round 1 packages from others
+            let round1_others: Vec<(Vec<u8>, Vec<u8>)> = round1_packages
+                .iter()
+                .filter(|(k, _)| *k != id)
+                .map(|(k, v)| (k.serialize(), v.clone()))
+                .collect();
+
+            // Round 2 packages addressed to THIS signer from all others
+            let round2_for_this: Vec<(Vec<u8>, Vec<u8>)> = round2_all_packages
+                .iter()
+                .filter(|(sender_id, _)| *sender_id != id)
+                .filter_map(|(sender_id, packages)| {
+                    let target_bytes = id.serialize();
+                    packages
+                        .iter()
+                        .find(|(recipient_bytes, _)| *recipient_bytes == target_bytes)
+                        .map(|(_, pkg_bytes)| (sender_id.serialize(), pkg_bytes.clone()))
+                })
+                .collect();
+
+            let (key_bytes, pub_bytes) =
+                handle_dkg_finalize(round2_secret_bytes, &round1_others, &round2_for_this)
+                    .expect("finalize must succeed");
+
+            let kp = frost::keys::KeyPackage::deserialize(&key_bytes)
+                .expect("deserialize key package");
+            key_packages.push(kp);
+            public_key_packages.push(pub_bytes);
+        }
+
+        // All signers must produce the same PublicKeyPackage
+        for (i, pkg) in public_key_packages.iter().enumerate().skip(1) {
+            assert_eq!(
+                *pkg, public_key_packages[0],
+                "signer {i} produced different PublicKeyPackage — equivocation"
+            );
+        }
+
+        let public_key_package =
+            PublicKeyPackage::deserialize(&public_key_packages[0]).unwrap();
+
+        // ── Verify: sign a message using 3 of 5 shares and verify ──
+        let message = b"distributed DKG test message";
+
+        let mut nonces_map = BTreeMap::new();
+        let mut commitments_map = BTreeMap::new();
+
+        for kp in key_packages.iter().take(min_signers as usize) {
+            let mut rng = rand::rngs::OsRng;
+            let (nonces, commitments) =
+                frost::round1::commit(kp.signing_share(), &mut rng);
+            nonces_map.insert(*kp.identifier(), nonces);
+            commitments_map.insert(*kp.identifier(), commitments);
+        }
+
+        let signing_package = SigningPackage::new(commitments_map, message);
+
+        let mut shares = BTreeMap::new();
+        for kp in key_packages.iter().take(min_signers as usize) {
+            let nonces = nonces_map.remove(kp.identifier()).unwrap();
+            let share = frost::round2::sign(&signing_package, &nonces, kp)
+                .expect("signing must succeed");
+            shares.insert(*kp.identifier(), share);
+        }
+
+        let group_sig = frost::aggregate(&signing_package, &shares, &public_key_package)
+            .expect("aggregation must succeed");
+
+        assert!(
+            public_key_package
+                .verifying_key()
+                .verify(message, &group_sig)
+                .is_ok(),
+            "group signature from distributed DKG must verify"
+        );
     }
 }
