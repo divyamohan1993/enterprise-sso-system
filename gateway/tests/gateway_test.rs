@@ -123,7 +123,7 @@ async fn gateway_accepts_solved_puzzle() {
     let auth_req = AuthRequest {
         username: "testuser".into(),
         password: vec![0xBB; 32],
-        audience: None,
+        audience: Some("test-service".to_string()),
     };
     let auth_plain = postcard::to_allocvec(&auth_req).unwrap();
     let cipher = Aes256Gcm::new_from_slice(&enc_key).unwrap();
