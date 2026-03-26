@@ -605,7 +605,7 @@ fn test_frost_share_forgery() {
 #[test]
 fn test_ratchet_state_manipulation() {
     let initial_key = [0x55u8; 64];
-    let mut ratchet = RatchetChain::new(&initial_key);
+    let mut ratchet = RatchetChain::new(&initial_key).unwrap();
     let test_claims = b"test-claims-data-for-tag-generation";
 
     // Collect tags and keys at each epoch, then advance
@@ -661,7 +661,7 @@ fn test_ratchet_state_manipulation() {
 
     // Forward secrecy test: create a NEW ratchet from the current key.
     // It must NOT be able to reproduce past tags.
-    let reconstructed = RatchetChain::new(&current_key);
+    let reconstructed = RatchetChain::new(&current_key).unwrap();
     let reconstructed_tag = reconstructed.generate_tag(test_claims);
 
     // The reconstructed chain from the current key must not produce any past tag
@@ -1054,7 +1054,7 @@ fn test_memory_scraping_resistance() {
     // Test 1: Verify that RatchetChain produces different keys after advance.
     // After advancing, old epoch keys should not be recoverable.
     let initial_key = [0x55u8; 64];
-    let mut ratchet = RatchetChain::new(&initial_key);
+    let mut ratchet = RatchetChain::new(&initial_key).unwrap();
     let test_claims = b"memory-scraping-test-claims";
     let epoch0_tag = ratchet.generate_tag(test_claims);
     let epoch0_key = ratchet.current_key();

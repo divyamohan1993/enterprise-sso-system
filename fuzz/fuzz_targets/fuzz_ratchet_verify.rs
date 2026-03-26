@@ -4,7 +4,7 @@ use arbitrary::Arbitrary;
 use ratchet::chain::RatchetChain;
 #[derive(Arbitrary, Debug)] struct RI { ms: [u8;64], claims: Vec<u8>, tag: [u8;64], epoch: u64, steps: u8, ce: Vec<[u8;32]>, se: Vec<[u8;32]>, sn: Vec<[u8;32]> }
 fuzz_target!(|i: RI| {
-    let mut c = RatchetChain::new(&i.ms);
+    let mut c = RatchetChain::new(&i.ms).unwrap();
     for s in 0..i.steps.min(10) as usize {
         let ce = i.ce.get(s).copied().unwrap_or_else(|| { let mut e = [0u8; 32]; for (j, b) in e.iter_mut().enumerate() { *b = (j + s) as u8; } e });
         let se = i.se.get(s).copied().unwrap_or_else(|| { let mut e = [0u8; 32]; for (j, b) in e.iter_mut().enumerate() { *b = (j + s + 128) as u8; } e });

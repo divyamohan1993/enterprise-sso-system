@@ -188,7 +188,7 @@ fn tampered_token_rejected() {
 #[test]
 fn ratchet_forward_secrecy() {
     let master = [0x99u8; 64];
-    let mut chain = RatchetChain::new(&master);
+    let mut chain = RatchetChain::new(&master).unwrap();
 
     // Generate tag at epoch 0
     let claims_bytes = b"test-claims";

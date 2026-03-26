@@ -21,19 +21,19 @@ proptest! {
         let ce = quality_entropy();
         let se = quality_entropy();
         let sn = fresh_nonce();
-        let mut c = RatchetChain::new(&ms); let t1 = c.generate_tag(b"t"); let e1 = c.epoch(); c.advance(&ce, &se, &sn); prop_assert_ne!(t1, c.generate_tag(b"t")); prop_assert_eq!(c.epoch(), e1+1);
+        let mut c = RatchetChain::new(&ms).unwrap(); let t1 = c.generate_tag(b"t"); let e1 = c.epoch(); c.advance(&ce, &se, &sn); prop_assert_ne!(t1, c.generate_tag(b"t")); prop_assert_eq!(c.epoch(), e1+1);
     }
     #[test] fn verify_ok(claims in prop::collection::vec(any::<u8>(), 1..256)) {
-        let c = RatchetChain::new(&[0x42u8;64]); let t = c.generate_tag(&claims); prop_assert!(c.verify_tag(&claims, &t, c.epoch()));
+        let c = RatchetChain::new(&[0x42u8;64]).unwrap(); let t = c.generate_tag(&claims); prop_assert!(c.verify_tag(&claims, &t, c.epoch()));
     }
     #[test] fn verify_wrong(claims in prop::collection::vec(any::<u8>(), 1..128), off in 4u64..100) {
-        let c = RatchetChain::new(&[0x42u8;64]); let t = c.generate_tag(&claims); prop_assert!(!c.verify_tag(&claims, &t, c.epoch()+off));
+        let c = RatchetChain::new(&[0x42u8;64]).unwrap(); let t = c.generate_tag(&claims); prop_assert!(!c.verify_tag(&claims, &t, c.epoch()+off));
     }
 }
 
 #[test]
 fn expiry_2880() {
-    let mut c = RatchetChain::new(&[0x11u8; 64]);
+    let mut c = RatchetChain::new(&[0x11u8; 64]).unwrap();
     for _ in 0..2879 {
         assert!(!c.is_expired());
         c.advance(&quality_entropy(), &quality_entropy(), &fresh_nonce());
@@ -45,7 +45,7 @@ fn expiry_2880() {
 
 #[test]
 fn lookbehind() {
-    let mut c = RatchetChain::new(&[0x33u8; 64]);
+    let mut c = RatchetChain::new(&[0x33u8; 64]).unwrap();
     let t = c.generate_tag(b"lb");
     c.advance(&quality_entropy(), &quality_entropy(), &fresh_nonce());
     c.advance(&quality_entropy(), &quality_entropy(), &fresh_nonce());

@@ -1190,6 +1190,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -2495,6 +2496,7 @@ dependencies = [
  "sha2",
  "shard",
  "sqlx",
+ "subtle",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -2903,6 +2905,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

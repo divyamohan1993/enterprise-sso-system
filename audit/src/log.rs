@@ -27,7 +27,7 @@ pub struct AuditResponse {
 }
 
 /// How often (in number of appended entries) to run automatic chain verification.
-const VERIFY_CHAIN_INTERVAL: usize = 100;
+const VERIFY_CHAIN_INTERVAL: usize = 10;
 
 /// Default maximum entries to keep in memory before triggering archival.
 const DEFAULT_MAX_ENTRIES: usize = 100_000;
@@ -320,9 +320,12 @@ impl AuditLog {
         // Write the old entries to the archive file.
         let entries_to_archive: Vec<AuditEntry> = self.entries.drain(..archive_count).collect();
 
+        #[cfg(unix)]
+        use std::os::unix::fs::OpenOptionsExt;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o600) // Owner read/write only
             .open(&archive_path)
             .map_err(|e| format!("failed to open archive file {:?}: {}", archive_path, e))?;
 
@@ -401,10 +404,23 @@ impl AuditLog {
                     // Encrypt archive if KEK is configured
                     let write_result = if let Some(ref kek) = self.retention_policy.archive_encryption_kek {
                         encrypt_and_write_archive(kek, &archive_path, &json_data)
+                    } else if common::sealed_keys::is_production() {
+                        Err("FATAL: Archive encryption KEK required in production".into())
                     } else {
-                        // Write plaintext archive
-                        std::fs::write(&archive_path, &json_data)
-                            .map_err(|e| format!("write failed: {e}"))
+                        tracing::warn!("Writing UNENCRYPTED audit archive (dev mode only)");
+                        (|| -> Result<(), String> {
+                            #[cfg(unix)]
+                            use std::os::unix::fs::OpenOptionsExt;
+                            let mut f = OpenOptions::new()
+                                .create(true)
+                                .write(true)
+                                .truncate(true)
+                                .mode(0o600) // Owner read/write only
+                                .open(&archive_path)
+                                .map_err(|e| format!("write failed: {e}"))?;
+                            std::io::Write::write_all(&mut f, &json_data)
+                                .map_err(|e| format!("write failed: {e}"))
+                        })()
                     };
 
                     match write_result {
@@ -429,13 +445,12 @@ impl AuditLog {
                         }
                     }
                 }
+            } else if common::sealed_keys::is_production() {
+                tracing::error!("FATAL: Cannot delete audit entries without archival in production");
+                // In production, refuse to delete entries without archiving them first
             } else {
-                // No archive directory configured — just delete expired entries
+                tracing::warn!("Retention: deleted {} expired entries without archival (dev mode)", expired_count);
                 self.entries.drain(..expired_count);
-                tracing::warn!(
-                    "Retention: deleted {} expired entries without archival (no archive_dir configured)",
-                    expired_count
-                );
             }
         }
 
@@ -629,10 +644,14 @@ pub fn hash_entry(entry: &AuditEntry) -> [u8; 64] {
 }
 
 fn now_us() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_micros() as i64
+    // Use authenticated time source when available, fall back to system clock
+    common::secure_time::authenticated_now_us()
+        .unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_micros() as i64
+        })
 }
 
 /// Encrypt archive data with AES-256-GCM and write to the given path.
@@ -645,8 +664,19 @@ fn encrypt_and_write_archive(
     data: &[u8],
 ) -> Result<(), String> {
     let encrypted = common::backup::export_backup(kek, data)?;
-    std::fs::write(path, &encrypted)
-        .map_err(|e| format!("failed to write encrypted archive {:?}: {}", path, e))?;
+    {
+        #[cfg(unix)]
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600) // Owner read/write only
+            .open(path)
+            .map_err(|e| format!("failed to write encrypted archive {:?}: {}", path, e))?;
+        std::io::Write::write_all(&mut file, &encrypted)
+            .map_err(|e| format!("failed to write encrypted archive {:?}: {}", path, e))?;
+    }
 
     // Emit SIEM event for encrypted archive creation
     common::siem::SecurityEvent::key_rotation(&format!(

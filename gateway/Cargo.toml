@@ -22,3 +22,4 @@ rcgen.workspace = true
 aes-gcm.workspace = true
 getrandom.workspace = true
 hex.workspace = true
+zeroize.workspace = true

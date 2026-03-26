@@ -30,13 +30,13 @@ fn fresh_nonce() -> [u8; 32] {
 
 #[test]
 fn chain_new_starts_at_epoch_0() {
-    let chain = RatchetChain::new(&test_secret());
+    let chain = RatchetChain::new(&test_secret()).unwrap();
     assert_eq!(chain.epoch(), 0);
 }
 
 #[test]
 fn chain_advance_increments_epoch() {
-    let mut chain = RatchetChain::new(&test_secret());
+    let mut chain = RatchetChain::new(&test_secret()).unwrap();
     chain.advance(&good_entropy(), &good_entropy(), &fresh_nonce());
     assert_eq!(chain.epoch(), 1);
     chain.advance(&good_entropy(), &good_entropy(), &fresh_nonce());
@@ -45,8 +45,8 @@ fn chain_advance_increments_epoch() {
 
 #[test]
 fn chain_tag_deterministic() {
-    let chain_a = RatchetChain::new(&test_secret());
-    let chain_b = RatchetChain::new(&test_secret());
+    let chain_a = RatchetChain::new(&test_secret()).unwrap();
+    let chain_b = RatchetChain::new(&test_secret()).unwrap();
     let claims = b"test-claims-data";
     let tag_a = chain_a.generate_tag(claims);
     let tag_b = chain_b.generate_tag(claims);
@@ -55,7 +55,7 @@ fn chain_tag_deterministic() {
 
 #[test]
 fn chain_different_epochs_different_tags() {
-    let mut chain = RatchetChain::new(&test_secret());
+    let mut chain = RatchetChain::new(&test_secret()).unwrap();
     let claims = b"test-claims-data";
     let tag_0 = chain.generate_tag(claims);
     chain.advance(&good_entropy(), &good_entropy(), &fresh_nonce());
@@ -67,7 +67,7 @@ fn chain_different_epochs_different_tags() {
 fn chain_old_key_erased() {
     // After advance, the old epoch's tag can no longer be reproduced
     // because the old chain key has been zeroized.
-    let mut chain = RatchetChain::new(&test_secret());
+    let mut chain = RatchetChain::new(&test_secret()).unwrap();
     let claims = b"test-claims-data";
     let tag_epoch0 = chain.generate_tag(claims);
     chain.advance(&good_entropy(), &good_entropy(), &fresh_nonce());
@@ -79,7 +79,7 @@ fn chain_old_key_erased() {
 
 #[test]
 fn chain_verify_current_epoch() {
-    let chain = RatchetChain::new(&test_secret());
+    let chain = RatchetChain::new(&test_secret()).unwrap();
     let claims = b"test-claims-data";
     let tag = chain.generate_tag(claims);
     assert!(chain.verify_tag(claims, &tag, 0));
@@ -87,7 +87,7 @@ fn chain_verify_current_epoch() {
 
 #[test]
 fn chain_reject_wrong_epoch() {
-    let chain = RatchetChain::new(&test_secret());
+    let chain = RatchetChain::new(&test_secret()).unwrap();
     let claims = b"test-claims-data";
     let tag = chain.generate_tag(claims);
     // Epoch 10 is way outside the +-3 window
@@ -100,7 +100,7 @@ fn chain_reject_wrong_epoch() {
 fn session_manager_create_and_advance() {
     let mgr = SessionManager::new();
     let sid = Uuid::new_v4();
-    let epoch = mgr.create_session(sid, &test_secret());
+    let epoch = mgr.create_session(sid, &test_secret()).unwrap();
     assert_eq!(epoch, 0);
 
     let new_epoch = mgr
@@ -119,7 +119,7 @@ fn session_manager_create_and_advance() {
 fn session_manager_expired_after_2880_epochs() {
     let mgr = SessionManager::new();
     let sid = Uuid::new_v4();
-    mgr.create_session(sid, &test_secret());
+    mgr.create_session(sid, &test_secret()).unwrap();
 
     // Advance 2880 times to reach the 8-hour limit (at 10s/epoch)
     for _ in 0..2880 {
@@ -137,7 +137,7 @@ fn session_manager_expired_after_2880_epochs() {
 fn session_manager_destroy_removes() {
     let mgr = SessionManager::new();
     let sid = Uuid::new_v4();
-    mgr.create_session(sid, &test_secret());
+    mgr.create_session(sid, &test_secret()).unwrap();
 
     mgr.destroy_session(&sid);
 
@@ -251,7 +251,7 @@ fn response_success_with_epoch_roundtrip() {
 
 #[test]
 fn chain_nonce_reuse_within_window_panics() {
-    let mut chain = RatchetChain::new(&test_secret());
+    let mut chain = RatchetChain::new(&test_secret()).unwrap();
     let nonce = fresh_nonce();
     chain.advance(&good_entropy(), &good_entropy(), &nonce);
 
@@ -266,7 +266,7 @@ fn chain_nonce_reuse_within_window_panics() {
 fn chain_1000_unique_nonces_accepted() {
     // Verify that 1000 unique nonces are accepted without panic,
     // exercising the full NONCE_HISTORY_SIZE window.
-    let mut chain = RatchetChain::new(&test_secret());
+    let mut chain = RatchetChain::new(&test_secret()).unwrap();
     for _ in 0..1000 {
         chain.advance(&good_entropy(), &good_entropy(), &fresh_nonce());
     }
@@ -278,7 +278,7 @@ fn chain_bloom_filter_catches_old_nonce_reuse() {
     // Advance 1100 times with unique nonces, then try to reuse the
     // first nonce.  It should be caught by the Bloom filter even though
     // it has been evicted from the exact-match window (1000 entries).
-    let mut chain = RatchetChain::new(&test_secret());
+    let mut chain = RatchetChain::new(&test_secret()).unwrap();
 
     // Save the very first nonce
     let first_nonce = fresh_nonce();
@@ -303,7 +303,7 @@ fn chain_bloom_filter_catches_old_nonce_reuse() {
 #[test]
 fn chain_nonce_replay_at_boundary() {
     // Test nonce replay detection right at the window boundary (nonce at index 999)
-    let mut chain = RatchetChain::new(&test_secret());
+    let mut chain = RatchetChain::new(&test_secret()).unwrap();
 
     let boundary_nonce = fresh_nonce();
     // Advance 999 times with fresh nonces

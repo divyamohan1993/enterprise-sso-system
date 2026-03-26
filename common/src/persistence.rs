@@ -6,16 +6,29 @@ use crate::config::SecurityConfig;
 /// Presence of this header indicates the bytes are already envelope-encrypted.
 const ENCRYPTED_KEY_MAGIC: &[u8; 8] = b"MENC0001";
 
-fn generate_random_bytes_32() -> [u8; 32] {
-    let mut buf = [0u8; 32];
-    getrandom::getrandom(&mut buf).expect("OS entropy source must be available");
-    buf
+/// Generate random bytes with retry logic, returning an error instead of panicking
+/// on entropy exhaustion.
+fn generate_random_bytes(buf: &mut [u8]) -> Result<(), String> {
+    for attempt in 0..3 {
+        if getrandom::getrandom(buf).is_ok() {
+            return Ok(());
+        }
+        tracing::error!("entropy source failed, attempt {}/3", attempt + 1);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Err("OS CSPRNG unavailable after 3 retries".into())
 }
 
-fn generate_random_bytes_64() -> [u8; 64] {
+fn generate_random_bytes_32() -> Result<[u8; 32], String> {
+    let mut buf = [0u8; 32];
+    generate_random_bytes(&mut buf)?;
+    Ok(buf)
+}
+
+fn generate_random_bytes_64() -> Result<[u8; 64], String> {
     let mut buf = [0u8; 64];
-    getrandom::getrandom(&mut buf).expect("OS entropy source must be available");
-    buf
+    generate_random_bytes(&mut buf)?;
+    Ok(buf)
 }
 
 /// Derive a domain-separated encryption key from the given master KEK
@@ -32,14 +45,14 @@ fn derive_key_material_kek(master_kek: &[u8; 32]) -> [u8; 32] {
 
 /// Encrypt key bytes using AES-256-GCM with a domain-separated key derived from the master KEK.
 /// Returns `MAGIC(8) || nonce(12) || ciphertext || tag(16)`.
-fn encrypt_key_bytes(master_kek: &[u8; 32], name: &str, key_bytes: &[u8]) -> Vec<u8> {
+fn encrypt_key_bytes(master_kek: &[u8; 32], name: &str, key_bytes: &[u8]) -> Result<Vec<u8>, String> {
     use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
 
     let kek = derive_key_material_kek(master_kek);
     let cipher = Aes256Gcm::new_from_slice(&kek).expect("32-byte key");
 
     let mut nonce_bytes = [0u8; 12];
-    getrandom::getrandom(&mut nonce_bytes).expect("OS entropy");
+    generate_random_bytes(&mut nonce_bytes)?;
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     // AAD binds ciphertext to the key name
@@ -55,7 +68,7 @@ fn encrypt_key_bytes(master_kek: &[u8; 32], name: &str, key_bytes: &[u8]) -> Vec
     out.extend_from_slice(ENCRYPTED_KEY_MAGIC);
     out.extend_from_slice(&nonce_bytes);
     out.extend_from_slice(&ciphertext);
-    out
+    Ok(out)
 }
 
 /// Decrypt key bytes previously encrypted with `encrypt_key_bytes`.
@@ -140,7 +153,13 @@ pub async fn store_key(pool: &PgPool, name: &str, key_bytes: &[u8], master_kek: 
     enforce_encryption_policy(&config);
 
     let bytes_to_store = match master_kek {
-        Some(kek) => encrypt_key_bytes(kek, name, key_bytes),
+        Some(kek) => match encrypt_key_bytes(kek, name, key_bytes) {
+            Ok(enc) => enc,
+            Err(e) => {
+                tracing::error!("CRITICAL: failed to encrypt key '{}': {}", name, e);
+                return false;
+            }
+        },
         None => {
             if crate::sealed_keys::is_production() {
                 // Production mode: NEVER store plaintext key material
@@ -246,7 +265,13 @@ pub async fn load_or_generate_key_64(pool: &PgPool, name: &str, master_kek: Opti
             return key;
         }
     }
-    let key = generate_random_bytes_64();
+    let key = match generate_random_bytes_64() {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!("CRITICAL: entropy failure generating key '{}': {}", name, e);
+            return [0u8; 64]; // caller must handle zero key
+        }
+    };
     if !store_key(pool, name, &key, master_kek).await {
         tracing::error!("CRITICAL: failed to persist generated key '{}'", name);
     }
@@ -261,7 +286,13 @@ pub async fn load_or_generate_key_32(pool: &PgPool, name: &str, master_kek: Opti
             return key;
         }
     }
-    let key = generate_random_bytes_32();
+    let key = match generate_random_bytes_32() {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!("CRITICAL: entropy failure generating key '{}': {}", name, e);
+            return [0u8; 32]; // caller must handle zero key
+        }
+    };
     if !store_key(pool, name, &key, master_kek).await {
         tracing::error!("CRITICAL: failed to persist generated key '{}'", name);
     }

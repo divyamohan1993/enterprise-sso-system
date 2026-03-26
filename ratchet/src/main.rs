@@ -111,12 +111,19 @@ async fn handle_request(
             let mut secret = [0u8; 64];
             secret.copy_from_slice(&initial_key);
             let mgr = manager.write().await;
-            let epoch = mgr.create_session(session_id, &secret);
-            RatchetResponse {
-                success: true,
-                epoch: Some(epoch),
-                tag: None,
-                error: None,
+            match mgr.create_session(session_id, &secret) {
+                Ok(epoch) => RatchetResponse {
+                    success: true,
+                    epoch: Some(epoch),
+                    tag: None,
+                    error: None,
+                },
+                Err(e) => RatchetResponse {
+                    success: false,
+                    epoch: None,
+                    tag: None,
+                    error: Some(e),
+                },
             }
         }
         RatchetAction::Advance {

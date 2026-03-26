@@ -1159,7 +1159,7 @@ fn test_attack_ratchet_stolen_old_token_rejected() {
     // Advance ratchet 10 epochs. Token from epoch 0 must be rejected
     // (outside +/-3 window). Simulates stolen session token.
     let master = [0x99u8; 64];
-    let mut chain = RatchetChain::new(&master);
+    let mut chain = RatchetChain::new(&master).unwrap();
 
     let claims_bytes = b"stolen-claims";
     let stolen_tag = chain.generate_tag(claims_bytes);
@@ -1188,8 +1188,8 @@ fn test_attack_ratchet_cloned_server_detected() {
     // Advance original to epoch 6. Clone is at epoch 5.
     // Tags must differ between original and clone.
     let master = [0x99u8; 64];
-    let mut original = RatchetChain::new(&master);
-    let mut clone = RatchetChain::new(&master); // same initial state
+    let mut original = RatchetChain::new(&master).unwrap();
+    let mut clone = RatchetChain::new(&master).unwrap(); // same initial state
 
     // Both advance to epoch 5 with same entropy (different chains, so nonce reuse is fine)
     for _ in 0..5 {
@@ -1258,7 +1258,7 @@ fn test_attack_ratchet_cloned_server_detected() {
 fn test_attack_session_cannot_exceed_8_hours() {
     // Try to advance past 2880 epochs. Must be flagged as expired.
     let master = [0x99u8; 64];
-    let mut chain = RatchetChain::new(&master);
+    let mut chain = RatchetChain::new(&master).unwrap();
 
     // Advance to epoch 2879 (just under limit)
     for _ in 0..2879 {

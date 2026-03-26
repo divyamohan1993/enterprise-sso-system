@@ -83,6 +83,12 @@ pub fn load_fips_activation_key() {
                     "FIPS mode activation key loaded \
                      (will require HMAC proof to toggle)"
                 );
+                // Ensure volatile zeroization of the hex string
+                {
+                    use zeroize::Zeroize;
+                    let mut hex_key = hex_key;
+                    hex_key.zeroize();
+                }
                 Some(key)
             }
             Err(_) => {

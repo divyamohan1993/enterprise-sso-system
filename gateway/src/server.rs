@@ -21,6 +21,7 @@ use common::types::ModuleId;
 use shard::tls_transport::tls_connect;
 
 use sha2::{Digest, Sha256};
+use zeroize::Zeroize;
 
 use crate::puzzle::{generate_challenge, get_adaptive_difficulty, verify_solution, PuzzleSolution};
 use crate::wire::{AuthRequest, AuthResponse, OrchestratorRequest, OrchestratorResponse};
@@ -72,6 +73,12 @@ pub struct OrchestratorConfig {
     pub tls_connector: tokio_rustls::TlsConnector,
 }
 
+impl Drop for OrchestratorConfig {
+    fn drop(&mut self) {
+        self.hmac_key.zeroize();
+    }
+}
+
 /// Per-IP rate-limit state: (connection count, window start).
 type RateLimitMap = HashMap<IpAddr, (u32, Instant)>;
 
@@ -109,7 +116,7 @@ fn load_key_pins() -> Vec<String> {
             pins
         }
         _ => {
-            debug!("MILNET_GATEWAY_KEY_PINS not set — X-Wing key pinning disabled");
+            warn!("X-Wing key pinning DISABLED — set MILNET_GATEWAY_KEY_PINS for production");
             Vec::new()
         }
     }
@@ -568,7 +575,7 @@ async fn forward_to_orchestrator(
         password: auth_req.password.clone(),
         dpop_key_hash: client_binding_hash,
         tier: 0,                  // Orchestrator decides tier
-        audience: None,
+        audience: auth_req.audience.clone(),
         device_attestation_age_secs: None,
         geo_velocity_kmh: None,
         is_unusual_network: None,

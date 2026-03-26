@@ -93,12 +93,12 @@ fn build_signed_token_legacy(
     }
 }
 
+/// Test DPoP client key used across tests.
+const TEST_DPOP_KEY: [u8; 32] = [0xDD; 32];
+
 /// Helper: create claims that expire in the future.
-/// Uses tier 3 (sensor) where DPoP is optional, so tests that don't
-/// provide a DPoP client key still pass.
+/// All claims include DPoP binding and audience since both are now mandatory.
 fn future_claims() -> TokenClaims {
-    // Exempt tier 3 from DPoP for non-DPoP-specific tests
-    std::env::set_var("MILNET_DPOP_EXEMPT_TIERS", "3,4");
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -109,12 +109,12 @@ fn future_claims() -> TokenClaims {
         iat: now,
         exp: now + 30_000_000, // +30 seconds
         scope: 0x0000_000F,
-        dpop_hash: [0u8; 64], // Zero hash: no DPoP binding (tests exempt via tier 3)
+        dpop_hash: crypto::dpop::dpop_key_hash(&TEST_DPOP_KEY),
         ceremony_id: [0xCC; 32],
         tier: 3,
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
-        aud: None,
+        aud: Some("test-service".to_string()),
         classification: 0,
     }
 }
@@ -131,12 +131,12 @@ fn future_claims_tier2() -> TokenClaims {
         iat: now,
         exp: now + 30_000_000,
         scope: 0x0000_000F,
-        dpop_hash: crypto::dpop::dpop_key_hash(&[0xDD; 32]),
+        dpop_hash: crypto::dpop::dpop_key_hash(&TEST_DPOP_KEY),
         ceremony_id: [0xCC; 32],
         tier: 2,
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
-        aud: None,
+        aud: Some("test-service".to_string()),
         classification: 0,
     }
 }
@@ -151,7 +151,7 @@ fn valid_token_verifies() {
     let expected_tier = claims.tier;
 
     let token = build_signed_token_legacy(&mut dkg, claims, &pq_sk);
-    let result = verifier::verify_token(&token, &dkg.group.public_key_package, &pq_vk);
+    let result = verifier::verify_token_bound(&token, &dkg.group.public_key_package, &pq_vk, &TEST_DPOP_KEY);
 
     assert!(result.is_ok(), "expected valid token: {:?}", result.err());
     let verified_claims = result.unwrap();
@@ -204,7 +204,7 @@ fn tampered_signature_rejected() {
     // Flip a byte in the FROST signature
     token.frost_signature[0] ^= 0xFF;
 
-    let result = verifier::verify_token(&token, &dkg.group.public_key_package, &pq_vk);
+    let result = verifier::verify_token_bound(&token, &dkg.group.public_key_package, &pq_vk, &TEST_DPOP_KEY);
     assert!(result.is_err());
     assert!(
         matches!(result.unwrap_err(), MilnetError::CryptoVerification(_)),
@@ -222,7 +222,7 @@ fn tampered_claims_rejected() {
     // Modify claims after signing — signature should no longer match
     token.claims.scope = 0xFFFF_FFFF;
 
-    let result = verifier::verify_token(&token, &dkg.group.public_key_package, &pq_vk);
+    let result = verifier::verify_token_bound(&token, &dkg.group.public_key_package, &pq_vk, &TEST_DPOP_KEY);
     assert!(result.is_err());
     assert!(
         matches!(result.unwrap_err(), MilnetError::CryptoVerification(_)),
@@ -239,7 +239,7 @@ fn wrong_group_key_rejected() {
     let token = build_signed_token_legacy(&mut dkg1, claims, &pq_sk);
 
     // Verify with a different group's key
-    let result = verifier::verify_token(&token, &dkg2.group.public_key_package, &pq_vk);
+    let result = verifier::verify_token_bound(&token, &dkg2.group.public_key_package, &pq_vk, &TEST_DPOP_KEY);
     assert!(result.is_err());
     assert!(
         matches!(result.unwrap_err(), MilnetError::CryptoVerification(_)),
@@ -258,15 +258,13 @@ fn test_ratchet_tag_verifies() {
     let epoch = claims.ratchet_epoch;
 
     let token = build_signed_token(&mut dkg, claims, &ratchet_key, &pq_sk);
-    // Ensure DPoP exemption for tier 3 is active before verification
-    // (env var may be cleared by concurrent tests).
-    std::env::set_var("MILNET_DPOP_EXEMPT_TIERS", "3,4");
-    let result = verifier::verify_token_with_ratchet(
+    let result = verifier::verify_token_with_ratchet_bound(
         &token,
         &dkg.group.public_key_package,
         &pq_vk,
         &ratchet_key,
         epoch,
+        &TEST_DPOP_KEY,
     );
 
     assert!(
@@ -287,12 +285,13 @@ fn test_ratchet_tag_verifies_within_window() {
     let token = build_signed_token(&mut dkg, claims, &ratchet_key, &pq_sk);
 
     // Verifier is at epoch = token_epoch + 3 (within window)
-    let result = verifier::verify_token_with_ratchet(
+    let result = verifier::verify_token_with_ratchet_bound(
         &token,
         &dkg.group.public_key_package,
         &pq_vk,
         &ratchet_key,
         token_epoch + 3,
+        &TEST_DPOP_KEY,
     );
     assert!(
         result.is_ok(),
@@ -312,12 +311,13 @@ fn test_wrong_ratchet_key_rejected() {
 
     let token = build_signed_token(&mut dkg, claims, &ratchet_key, &pq_sk);
 
-    let result = verifier::verify_token_with_ratchet(
+    let result = verifier::verify_token_with_ratchet_bound(
         &token,
         &dkg.group.public_key_package,
         &pq_vk,
         &wrong_key,
         epoch,
+        &TEST_DPOP_KEY,
     );
 
     assert!(result.is_err());
@@ -338,12 +338,13 @@ fn test_wrong_epoch_rejected() {
     let token = build_signed_token(&mut dkg, claims, &ratchet_key, &pq_sk);
 
     // Verifier is at epoch = token_epoch + 4 (outside +/-3 window)
-    let result = verifier::verify_token_with_ratchet(
+    let result = verifier::verify_token_with_ratchet_bound(
         &token,
         &dkg.group.public_key_package,
         &pq_vk,
         &ratchet_key,
         token_epoch + 4,
+        &TEST_DPOP_KEY,
     );
 
     assert!(result.is_err());
@@ -363,10 +364,8 @@ fn test_token_with_pq_signature_verifies() {
 
     let token = build_signed_token_legacy(&mut dkg, claims, &pq_sk);
 
-    // Ensure DPoP exemption for tier 3 is active before verification
-    std::env::set_var("MILNET_DPOP_EXEMPT_TIERS", "3,4");
     // Both FROST and PQ signatures must pass
-    let result = verifier::verify_token(&token, &dkg.group.public_key_package, &pq_vk);
+    let result = verifier::verify_token_bound(&token, &dkg.group.public_key_package, &pq_vk, &TEST_DPOP_KEY);
     assert!(result.is_ok(), "token with valid PQ sig should verify: {:?}", result.err());
     // Verify PQ signature is non-empty
     assert!(!token.pq_signature.is_empty(), "pq_signature must not be empty");
@@ -382,7 +381,7 @@ fn test_missing_pq_signature_rejected() {
     // Strip the PQ signature
     token.pq_signature = Vec::new();
 
-    let result = verifier::verify_token(&token, &dkg.group.public_key_package, &pq_vk);
+    let result = verifier::verify_token_bound(&token, &dkg.group.public_key_package, &pq_vk, &TEST_DPOP_KEY);
     assert!(result.is_err());
     let err_msg = format!("{}", result.unwrap_err());
     assert!(
@@ -407,7 +406,7 @@ fn test_wrong_pq_key_rejected() {
             let token = build_signed_token_legacy(&mut dkg, claims, &pq_sk);
 
             // Verify with a different PQ key -- must fail
-            let result = verifier::verify_token(&token, &dkg.group.public_key_package, &pq_vk2);
+            let result = verifier::verify_token_bound(&token, &dkg.group.public_key_package, &pq_vk2, &TEST_DPOP_KEY);
             assert!(result.is_err());
             assert!(
                 matches!(result.unwrap_err(), MilnetError::CryptoVerification(_)),
@@ -431,7 +430,7 @@ fn test_tampered_pq_signature_rejected() {
         *byte ^= 0xFF;
     }
 
-    let result = verifier::verify_token(&token, &dkg.group.public_key_package, &pq_vk);
+    let result = verifier::verify_token_bound(&token, &dkg.group.public_key_package, &pq_vk, &TEST_DPOP_KEY);
     assert!(result.is_err());
     assert!(
         matches!(result.unwrap_err(), MilnetError::CryptoVerification(_)),
@@ -495,28 +494,30 @@ fn test_tier2_dpop_mandatory_accepts_with_matching_key() {
 }
 
 #[test]
-fn test_tier3_dpop_optional_passes_without_client_key() {
-    // NOTE: This test verifies that when MILNET_DPOP_EXEMPT_TIERS includes tier 3,
-    // DPoP is not required for tier 3. By default (empty env var), all tiers
-    // require DPoP. We set the env var to "3,4" for this test.
-    std::env::set_var("MILNET_DPOP_EXEMPT_TIERS", "3,4");
+fn test_tier3_dpop_mandatory_rejects_without_client_key() {
+    // DPoP is now mandatory for ALL tiers including tier 3 (sensor).
+    // MILNET_DPOP_EXEMPT_TIERS is deprecated and ignored.
     let mut dkg = threshold::dkg(5, 3);
     let (pq_sk, pq_vk) = test_pq_keypair();
-    let claims = future_claims(); // tier 3
+    let claims = future_claims(); // tier 3 with DPoP binding
     let token = build_signed_token_legacy(&mut dkg, claims, &pq_sk);
 
-    // verify_token passes None for client_dpop_key -> should pass for tier 3 when exempt
+    // verify_token passes None for client_dpop_key -> must be rejected for all tiers
     let result = verifier::verify_token(&token, &dkg.group.public_key_package, &pq_vk);
-    assert!(result.is_ok(), "tier 3 without DPoP client key should pass when exempt: {:?}", result.err());
+    assert!(result.is_err(), "tier 3 without DPoP client key must be rejected");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("DPoP binding") || err.contains("token theft"),
+        "error should mention DPoP binding: {err}"
+    );
 }
 
 // ── DPoP Enforcement Strengthening Tests ───────────────────────────────────
 
 #[test]
-fn dpop_no_exemptions_by_default() {
-    // When MILNET_DPOP_EXEMPT_TIERS is empty, no tier is exempt from DPoP.
-    // Build a tier 3 token with zero dpop_hash (no DPoP binding), then verify
-    // with no exemptions — should be rejected.
+fn dpop_no_exemptions_for_any_tier() {
+    // DPoP is mandatory for ALL tiers — no exemptions possible.
+    // Build a tier 3 token with zero dpop_hash (no DPoP binding) — must be rejected.
     let mut dkg = threshold::dkg(5, 3);
     let (pq_sk, pq_vk) = test_pq_keypair();
     let now = SystemTime::now()
@@ -534,24 +535,17 @@ fn dpop_no_exemptions_by_default() {
         tier: 3,
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
-        aud: None,
+        aud: Some("test-service".to_string()),
         classification: 0,
     };
 
     let token = build_signed_token_legacy(&mut dkg, claims, &pq_sk);
 
-    // Set exemptions to empty (no tiers exempt) right before verification.
-    // We use set_var("") instead of remove_var to avoid race conditions
-    // with parallel tests that depend on this env var.
-    std::env::set_var("MILNET_DPOP_EXEMPT_TIERS", "");
-
     let result = verifier::verify_token(&token, &dkg.group.public_key_package, &pq_vk);
-    // Restore exemptions for other tests
-    std::env::set_var("MILNET_DPOP_EXEMPT_TIERS", "3,4");
-    assert!(result.is_err(), "tier 3 without DPoP exemption should be rejected");
+    assert!(result.is_err(), "tier 3 without DPoP must be rejected");
     let err = format!("{}", result.unwrap_err());
     assert!(
-        err.contains("DPoP binding is required"),
+        err.contains("DPoP binding is required") || err.contains("DPoP is mandatory"),
         "error should mention DPoP requirement: {err}"
     );
 }
@@ -590,25 +584,20 @@ fn classification_enforcement_denies_insufficient_level() {
     let mut dkg = threshold::dkg(5, 3);
     let (pq_sk, pq_vk) = test_pq_keypair();
 
-    // Create a token with Unclassified classification
+    // Create a token with Unclassified classification (DPoP binding included)
     let mut claims = future_claims();
     claims.classification = ClassificationLevel::Unclassified.as_u8();
-    claims.dpop_hash = [0u8; 64]; // no DPoP for simplicity
 
-    // Exempt tier 3 for this test
-    std::env::set_var("MILNET_DPOP_EXEMPT_TIERS", "3");
     let token = build_signed_token_legacy(&mut dkg, claims, &pq_sk);
     let revocation = SharedRevocationList::new();
 
-    // Ensure DPoP exemption is still active right before verification
-    std::env::set_var("MILNET_DPOP_EXEMPT_TIERS", "3");
     // Verify against a Secret resource requirement
     let result = verifier::verify::verify_token_with_classification(
         &token,
         &dkg.group.public_key_package,
         &pq_vk,
         &revocation,
-        None,
+        Some(&TEST_DPOP_KEY),
         ClassificationLevel::Secret,
     );
     assert!(result.is_err(), "Unclassified token must be denied access to Secret resource");
@@ -624,25 +613,20 @@ fn classification_enforcement_grants_sufficient_level() {
     let mut dkg = threshold::dkg(5, 3);
     let (pq_sk, pq_vk) = test_pq_keypair();
 
-    // Create a token with Secret classification
+    // Create a token with Secret classification (DPoP binding included)
     let mut claims = future_claims();
     claims.classification = ClassificationLevel::Secret.as_u8();
-    claims.dpop_hash = [0u8; 64];
 
-    std::env::set_var("MILNET_DPOP_EXEMPT_TIERS", "3");
     let token = build_signed_token_legacy(&mut dkg, claims, &pq_sk);
     let revocation = SharedRevocationList::new();
 
-    // Ensure DPoP exemption is still active right before verification
-    // (parallel tests may have cleared it)
-    std::env::set_var("MILNET_DPOP_EXEMPT_TIERS", "3");
     // Verify against a Confidential resource (lower requirement)
     let result = verifier::verify::verify_token_with_classification(
         &token,
         &dkg.group.public_key_package,
         &pq_vk,
         &revocation,
-        None,
+        Some(&TEST_DPOP_KEY),
         ClassificationLevel::Confidential,
     );
     assert!(result.is_ok(), "Secret token should access Confidential resource: {:?}", result.err());

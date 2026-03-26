@@ -737,7 +737,7 @@ async fn test_attack_token_from_rogue_sso_server() {
 async fn test_attack_replay_same_token_after_ratchet_advance() {
     // Create a ratchet chain and generate a tag at epoch 0
     let master_secret = [0x55u8; 64];
-    let mut chain = RatchetChain::new(&master_secret);
+    let mut chain = RatchetChain::new(&master_secret).unwrap();
 
     let claims_bytes = b"test-claims-data";
     let tag_epoch_0 = chain.generate_tag(claims_bytes);
@@ -847,8 +847,8 @@ async fn test_sso_sessions_are_isolated() {
     // alice and bob both have active ratchet sessions
     let alice_secret = [0x11u8; 64];
     let bob_secret = [0x22u8; 64];
-    let mut alice_chain = RatchetChain::new(&alice_secret);
-    let bob_chain = RatchetChain::new(&bob_secret);
+    let mut alice_chain = RatchetChain::new(&alice_secret).unwrap();
+    let bob_chain = RatchetChain::new(&bob_secret).unwrap();
 
     let claims_bytes = b"shared-claims-data";
 

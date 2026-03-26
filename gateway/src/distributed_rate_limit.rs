@@ -414,6 +414,14 @@ impl DistributedRateLimiter {
         let now = Instant::now();
         let window = Duration::from_secs(self.config.window_secs);
 
+        // Evict oldest entries if map exceeds limit
+        const MAX_LOCAL_ENTRIES: usize = 10_000;
+        if state.len() > MAX_LOCAL_ENTRIES {
+            // Remove entries older than 60 seconds
+            let cutoff = now - Duration::from_secs(60);
+            state.retain(|_, entry| entry.window_start > cutoff);
+        }
+
         let entry = state.entry(key.to_string()).or_insert_with(|| LocalEntry {
             count: 0,
             window_start: now,

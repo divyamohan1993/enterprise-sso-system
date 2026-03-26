@@ -141,6 +141,9 @@ pub fn validate_ssl_config(database_url: &str) {
     // Log SSL cert/key availability
     let ssl_cert = std::env::var("MILNET_DB_SSL_CERT").ok().filter(|s| !s.is_empty());
     let ssl_key = std::env::var("MILNET_DB_SSL_KEY").ok().filter(|s| !s.is_empty());
+    // Remove sensitive env vars after reading
+    std::env::remove_var("MILNET_DB_SSL_KEY");
+    std::env::remove_var("MILNET_DB_SSL_CERT");
 
     if let Some(ref cert_path) = ssl_cert {
         tracing::info!("DB SSL: client certificate configured at {}", cert_path);

@@ -88,6 +88,12 @@ pub fn load_dev_mode_activation_key() {
                     return None;
                 }
                 tracing::info!("Developer mode activation key loaded (will require HMAC proof to toggle)");
+                // Ensure volatile zeroization of the hex string
+                {
+                    use zeroize::Zeroize;
+                    let mut hex_key = hex_key;
+                    hex_key.zeroize();
+                }
                 Some(key)
             }
             Err(_) => {

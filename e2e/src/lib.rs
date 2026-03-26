@@ -132,6 +132,7 @@ pub async fn client_auth(
     let auth_req = AuthRequest {
         username: username.to_string(),
         password: password.to_vec(),
+        audience: None,
     };
     let auth_plain = postcard::to_allocvec(&auth_req).expect("serialize auth request");
     let cipher = Aes256Gcm::new_from_slice(&enc_key).expect("AES key init");
@@ -209,6 +210,7 @@ pub async fn client_auth_with_dpop(
     let auth_req = AuthRequest {
         username: username.to_string(),
         password: password.to_vec(),
+        audience: None,
     };
     let auth_plain = postcard::to_allocvec(&auth_req).expect("serialize auth request");
     let cipher = Aes256Gcm::new_from_slice(&enc_key).expect("AES key init");

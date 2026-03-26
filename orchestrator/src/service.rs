@@ -43,17 +43,17 @@ fn verify_receipt_independently(
         return Err("receipt signature verification failed (neither ML-DSA-87 nor HMAC valid)".into());
     }
 
-    // 2. Validate timestamp is within ±30 seconds of current time.
+    // 2. Validate timestamp is within ±10 seconds of current time.
     //    Prevents replay of old receipts and rejects future-dated forgeries.
     let now_us = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_micros() as i64;
     let drift_us = (now_us - receipt.timestamp).abs();
-    let max_drift_us: i64 = 30 * 1_000_000; // 30 seconds in microseconds
+    let max_drift_us: i64 = 10 * 1_000_000; // 10 seconds in microseconds
     if drift_us > max_drift_us {
         return Err(format!(
-            "receipt timestamp drift {}µs exceeds ±30s tolerance",
+            "receipt timestamp drift {}µs exceeds ±10s tolerance",
             drift_us
         ));
     }
@@ -465,8 +465,15 @@ impl OrchestratorService {
             .as_micros() as i64;
 
         let security_config = common::config::SecurityConfig::default();
-        let tier = if request.tier == 0 { 2 } else { request.tier };
-        if tier > 4 { return Err("invalid tier: must be 1-4".into()); }
+        let tier = if request.tier == 0 {
+            tracing::warn!("No tier specified in request, defaulting to tier 2");
+            2
+        } else {
+            request.tier
+        };
+        if !(1..=4).contains(&tier) {
+            return Err(format!("invalid tier {}: must be 1-4", tier));
+        }
         let token_lifetime_us = security_config.token_lifetime_for_tier(tier) as i64 * 1_000_000;
 
         let token_id: [u8; 16] = {

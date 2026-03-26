@@ -763,7 +763,7 @@ fn test_token_from_different_dkg_rejected() {
 #[test]
 fn test_ratchet_forward_secrecy() {
     let master = [0x99u8; 64];
-    let mut chain = RatchetChain::new(&master);
+    let mut chain = RatchetChain::new(&master).unwrap();
 
     let claims_bytes = b"test-claims";
     let tag_epoch0 = chain.generate_tag(claims_bytes);
@@ -786,7 +786,7 @@ fn test_ratchet_forward_secrecy() {
 #[test]
 fn test_ratchet_within_lookahead_window() {
     let master = [0x99u8; 64];
-    let mut chain = RatchetChain::new(&master);
+    let mut chain = RatchetChain::new(&master).unwrap();
 
     // Advance to epoch 7
     for _ in 0..7 {
@@ -826,7 +826,7 @@ fn test_ratchet_within_lookahead_window() {
 #[test]
 fn test_ratchet_session_expires_at_8_hours() {
     let master = [0x99u8; 64];
-    let mut chain = RatchetChain::new(&master);
+    let mut chain = RatchetChain::new(&master).unwrap();
 
     // Advance 2879 times (just before expiry at epoch 2880)
     for _ in 0..2879 {
@@ -849,9 +849,9 @@ fn test_ratchet_session_expires_at_8_hours() {
 #[test]
 fn test_cloned_ratchet_state_diverges() {
     let master = [0x99u8; 64];
-    let mut chain_a = RatchetChain::new(&master);
+    let mut chain_a = RatchetChain::new(&master).unwrap();
     // Note: RatchetChain doesn't derive Clone due to Zeroize, so we create two from same master
-    let mut chain_b = RatchetChain::new(&master);
+    let mut chain_b = RatchetChain::new(&master).unwrap();
 
     let claims_bytes = b"test-claims";
 
@@ -889,8 +889,8 @@ fn test_cloned_ratchet_state_diverges() {
 #[test]
 fn test_ratchet_different_entropy_different_chains() {
     let master = [0x99u8; 64];
-    let mut chain_a = RatchetChain::new(&master);
-    let mut chain_b = RatchetChain::new(&master);
+    let mut chain_a = RatchetChain::new(&master).unwrap();
+    let mut chain_b = RatchetChain::new(&master).unwrap();
 
     {
         let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];

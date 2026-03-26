@@ -152,7 +152,7 @@ fn test_token_future_iat_suspicious() {
 #[test]
 fn test_ratchet_epoch_bounds() {
     let master = [0x77u8; 64];
-    let chain = RatchetChain::new(&master);
+    let chain = RatchetChain::new(&master).unwrap();
 
     // Epoch 0 is valid — the chain starts here.
     assert_eq!(chain.epoch(), 0, "ratchet chain must start at epoch 0");
@@ -161,7 +161,7 @@ fn test_ratchet_epoch_bounds() {
     assert!(!chain.is_expired(), "fresh chain at epoch 0 must not be expired");
 
     // Build a chain at max epoch by creating it from persisted state.
-    let chain_at_max = RatchetChain::from_persisted([0xBBu8; 64], 2880);
+    let chain_at_max = RatchetChain::from_persisted([0xBBu8; 64], 2880).unwrap();
     assert!(
         chain_at_max.is_expired(),
         "chain at epoch 2880 must be expired (max_epoch_lifetime = 2880)"
