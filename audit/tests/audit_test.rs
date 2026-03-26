@@ -159,6 +159,7 @@ fn audit_request_roundtrip() {
         device_ids: vec![Uuid::new_v4()],
         risk_score: 0.42,
         metadata: vec![1, 2, 3, 4],
+        classification: 2, // Secret
     };
     let bytes = postcard::to_allocvec(&req).expect("serialize");
     let decoded: AuditRequest = postcard::from_bytes(&bytes).expect("deserialize");
