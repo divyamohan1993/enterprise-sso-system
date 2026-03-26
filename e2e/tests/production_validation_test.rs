@@ -393,7 +393,7 @@ fn make_valid_token_and_key() -> (Token, frost_ristretto255::keys::PublicKeyPack
         tier: 2,
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
-        aud: None,
+        aud: Some("test-service".to_string()),
         classification: 0,
     };
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
@@ -641,7 +641,7 @@ fn test_token_signature_cannot_be_transplanted() {
         tier: 2,
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
-        aud: None,
+        aud: Some("test-service".to_string()),
         classification: 0,
     };
     let claims_b = TokenClaims {
@@ -655,7 +655,7 @@ fn test_token_signature_cannot_be_transplanted() {
         tier: 2,
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
-        aud: None,
+        aud: Some("test-service".to_string()),
         classification: 0,
     };
 
@@ -701,7 +701,7 @@ fn test_expired_token_rejected() {
                 tier: 2,
                 ratchet_epoch: 1,
                 token_id: [0xAB; 16],
-                aud: None,
+                aud: Some("test-service".to_string()),
         classification: 0,
             };
 
@@ -736,7 +736,7 @@ fn test_token_from_different_dkg_rejected() {
         tier: 2,
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
-        aud: None,
+        aud: Some("test-service".to_string()),
         classification: 0,
     };
     let (coordinator1, mut nodes1) = distribute_shares(&mut dkg1);

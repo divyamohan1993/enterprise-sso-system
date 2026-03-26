@@ -393,7 +393,7 @@ fn make_valid_token_and_key() -> (Token, frost_ristretto255::keys::PublicKeyPack
         tier: 2,
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
-        aud: None,
+        aud: Some("test-service".to_string()),
         classification: 0,
     };
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
@@ -703,7 +703,7 @@ fn test_attack_forged_token_random_signature_rejected() {
         tier: 2,
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
-        aud: None,
+        aud: Some("test-service".to_string()),
         classification: 0,
     };
 
@@ -766,7 +766,7 @@ fn test_attack_token_replay_across_sessions() {
         tier: 2,
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
-        aud: None,
+        aud: Some("test-service".to_string()),
         classification: 0,
     };
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
@@ -821,7 +821,7 @@ fn test_attack_cross_dkg_token_injection() {
         tier: 2,
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
-        aud: None,
+        aud: Some("test-service".to_string()),
         classification: 0,
     };
 

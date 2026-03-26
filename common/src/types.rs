@@ -137,7 +137,7 @@ impl Token {
                 tier: 1,
                 ratchet_epoch: 42,
                 token_id: [0xAB; 16],
-                aud: None,
+                aud: Some("test-service".to_string()),
                 classification: 0,
             },
             ratchet_tag: [0xDD; 64],

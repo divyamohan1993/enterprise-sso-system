@@ -162,7 +162,7 @@ fn test_token_dpop_hash_zero_sentinel_64() {
         tier: 3,
         ratchet_epoch: 0,
         token_id: [0u8; 16],
-        aud: None,
+        aud: Some("test-service".to_string()),
         classification: 0,
     };
 

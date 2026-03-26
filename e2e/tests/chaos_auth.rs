@@ -214,7 +214,7 @@ fn test_token_claims_dpop_hash_64_bytes() {
         tier: 3,
         ratchet_epoch: 0,
         token_id: [0x03u8; 16],
-        aud: None,
+        aud: Some("test-service".to_string()),
         classification: 0,
     };
     // The type system guarantees [u8; 64]; this assertion verifies the value.

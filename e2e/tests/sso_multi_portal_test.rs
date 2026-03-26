@@ -392,7 +392,7 @@ fn make_claims(user_id: Uuid, tier: u8, scope: u32, ttl_secs: u64) -> TokenClaim
         tier,
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
-        aud: None,
+        aud: Some("test-service".to_string()),
         classification: 0,
     }
 }
@@ -692,7 +692,7 @@ async fn test_attack_expired_token_at_portal() {
         tier: 2,
         ratchet_epoch: 1,
         token_id: [0xAC; 16],
-        aud: None,
+        aud: Some("test-service".to_string()),
         classification: 0,
     };
     let mut signer_refs: Vec<&mut _> = nodes.iter_mut().take(3).collect();

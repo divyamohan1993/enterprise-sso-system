@@ -64,7 +64,7 @@ fn test_token_expired_rejected() {
             tier: 3,                // Tier 3 exempt from DPoP by convention
             ratchet_epoch: 1,
             token_id: [0xABu8; 16],
-            aud: None,
+            aud: Some("test-service".to_string()),
             classification: 0,
         };
 
@@ -111,7 +111,7 @@ fn test_token_future_iat_suspicious() {
             tier: 3,
             ratchet_epoch: 1,
             token_id: [0xABu8; 16],
-            aud: None,
+            aud: Some("test-service".to_string()),
             classification: 0,
         };
 

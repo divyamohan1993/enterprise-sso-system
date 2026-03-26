@@ -128,7 +128,7 @@ fn expired_token_rejected() {
         tier: 2,
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
-        aud: None,
+        aud: Some("test-service".to_string()),
         classification: 0,
     };
 
@@ -166,7 +166,7 @@ fn tampered_token_rejected() {
         tier: 2,
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
-        aud: None,
+        aud: Some("test-service".to_string()),
         classification: 0,
     };
 

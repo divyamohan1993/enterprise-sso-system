@@ -81,7 +81,7 @@ fn make_valid_token_and_key() -> (Token, frost_ristretto255::keys::PublicKeyPack
         tier: 2,
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
-        aud: None,
+        aud: Some("test-service".to_string()),
         classification: 0,
     };
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
@@ -426,7 +426,7 @@ fn test_hsm_fault_injection() {
         tier: 2,
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
-        aud: None,
+        aud: Some("test-service".to_string()),
         classification: 0,
     };
 
@@ -561,7 +561,7 @@ fn test_frost_share_forgery() {
             tier: 2,
             ratchet_epoch: 1,
             token_id: [0xAB; 16],
-            aud: None,
+            aud: Some("test-service".to_string()),
             classification: 0,
         };
 
@@ -705,7 +705,7 @@ fn test_cross_domain_label_injection() {
         tier: 2,
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
-        aud: None,
+        aud: Some("test-service".to_string()),
         classification: 0, // UNCLASSIFIED
     };
 
