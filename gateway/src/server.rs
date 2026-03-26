@@ -32,7 +32,13 @@ use crate::wire::{AuthRequest, AuthResponse, OrchestratorRequest, OrchestratorRe
 const MAX_FRAME_LEN: u32 = 1024 * 1024;
 
 /// Maximum connections per IP within the rate-limit window.
-const MAX_CONNECTIONS_PER_IP: u32 = 10;
+/// Override with MILNET_MAX_CONN_PER_IP for load testing (default: 10).
+fn max_connections_per_ip() -> u32 {
+    std::env::var("MILNET_MAX_CONN_PER_IP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10)
+}
 
 /// Rate-limit window duration (60 seconds).
 const RATE_LIMIT_WINDOW_SECS: u64 = 60;
@@ -307,7 +313,7 @@ impl GatewayServer {
         }
 
         entry.0 += 1;
-        entry.0 <= MAX_CONNECTIONS_PER_IP
+        entry.0 <= max_connections_per_ip()
     }
 
     /// Run the server loop, accepting connections forever.
@@ -329,7 +335,7 @@ impl GatewayServer {
 
             // Enforce per-IP rate limit
             if !self.check_rate_limit(addr.ip()).await {
-                warn!("rejecting connection from {addr}: per-IP rate limit exceeded ({MAX_CONNECTIONS_PER_IP} per {RATE_LIMIT_WINDOW_SECS}s)");
+                warn!("rejecting connection from {addr}: per-IP rate limit exceeded ({} per {RATE_LIMIT_WINDOW_SECS}s)", max_connections_per_ip());
                 drop(tcp_stream);
                 continue;
             }

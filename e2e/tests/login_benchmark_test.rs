@@ -833,6 +833,9 @@ async fn run_concurrent_logins(n: usize) {
     let reg_ms = reg_start.elapsed().as_secs_f64() * 1000.0;
     println!("Registered {n} users in {reg_ms:.1}ms ({:.1}ms/user)", reg_ms / n as f64);
 
+    // Raise per-IP connection limit for benchmarks (default 10 is DDoS protection)
+    std::env::set_var("MILNET_MAX_CONN_PER_IP", &format!("{}", n + 100));
+
     let gateway_addr = boot_full_system(store).await;
     // Give services a moment to stabilize
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -882,13 +885,16 @@ async fn run_concurrent_logins(n: usize) {
 
     let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
     let total_secs = total_ms / 1000.0;
-    let throughput = n as f64 / total_secs;
-    let avg_ms: f64 = latencies.iter().sum::<f64>() / latencies.len() as f64;
+    let throughput = success_count as f64 / total_secs;
 
-    latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let p50 = percentile(&latencies, 50.0);
-    let p95 = percentile(&latencies, 95.0);
-    let p99 = percentile(&latencies, 99.0);
+    // Only include successful logins in latency stats
+    let mut success_latencies: Vec<f64> = latencies.iter().copied().filter(|&l| l < 1_000_000.0).collect();
+    let avg_ms = if success_latencies.is_empty() { 0.0 } else { success_latencies.iter().sum::<f64>() / success_latencies.len() as f64 };
+
+    success_latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p50 = percentile(&success_latencies, 50.0);
+    let p95 = percentile(&success_latencies, 95.0);
+    let p99 = percentile(&success_latencies, 99.0);
 
     println!("\n========== {n} CONCURRENT LOGINS ==========");
     println!("Total wall-clock: {total_ms:.1}ms");
