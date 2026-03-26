@@ -16,6 +16,10 @@ pub struct AuditRequest {
     pub device_ids: Vec<Uuid>,
     pub risk_score: f64,
     pub metadata: Vec<u8>,
+    /// Bell-LaPadula classification level of the resource being accessed.
+    /// 0=Unclassified, 1=Confidential, 2=Secret, 3=TopSecret, 4=SCI
+    #[serde(default)]
+    pub classification: u8,
 }
 
 /// Wire response type from audit service.

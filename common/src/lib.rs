@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 //! common: Shared types for the MILNET SSO system.
 //!
 //! Provides core domain types including Token, Receipt, DeviceTier,
@@ -20,6 +20,7 @@ pub mod witness;
 // ── Military hardening modules ──
 pub mod cnsa2;
 pub mod encrypted_db;
+#[allow(unsafe_code)]
 pub mod sealed_keys;
 
 // ── Platform integrity and measured boot ──

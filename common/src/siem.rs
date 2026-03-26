@@ -154,13 +154,13 @@ fn send_webhook_alert(event: &SiemEvent) {
         });
 }
 
-/// Blocking HTTP POST helper.
+/// Blocking HTTP POST helper with mandatory TLS for https:// URLs.
 fn send_webhook_blocking(url: &str, body: &str) {
     use std::io::{Read, Write};
     use std::net::TcpStream;
     use std::time::Duration;
 
-    // Very minimal URL parsing
+    let is_https = url.starts_with("https://");
     let without_scheme = url
         .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"))
@@ -171,15 +171,23 @@ fn send_webhook_blocking(url: &str, body: &str) {
         None => (without_scheme, "/"),
     };
 
+    // Extract hostname (without port) for TLS SNI
+    let hostname = if let Some(colon) = host_port.find(':') {
+        &host_port[..colon]
+    } else {
+        host_port
+    };
+
+    let default_port = if is_https { 443 } else { 80 };
     let host_port_owned = if host_port.contains(':') {
         host_port.to_string()
     } else {
-        format!("{}:80", host_port)
+        format!("{}:{}", host_port, default_port)
     };
 
-    let stream = match TcpStream::connect_timeout(
+    let tcp_stream = match TcpStream::connect_timeout(
         &host_port_owned.parse().unwrap_or_else(|_| {
-            std::net::SocketAddr::from(([127, 0, 0, 1], 80))
+            std::net::SocketAddr::from(([127, 0, 0, 1], default_port))
         }),
         Duration::from_secs(5),
     ) {
@@ -190,23 +198,55 @@ fn send_webhook_blocking(url: &str, body: &str) {
         }
     };
 
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = tcp_stream.set_write_timeout(Some(Duration::from_secs(5)));
+    let _ = tcp_stream.set_read_timeout(Some(Duration::from_secs(5)));
 
     let request = format!(
         "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         path, host_port, body.len(), body
     );
 
-    let mut stream = stream;
-    if let Err(e) = stream.write_all(request.as_bytes()) {
-        tracing::warn!("webhook write failed: {}", e);
-        return;
+    if is_https {
+        // Use rustls for TLS — mandatory for HTTPS webhooks
+        let root_store = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        };
+        let tls_config = std::sync::Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth()
+        );
+        let server_name = match rustls::pki_types::ServerName::try_from(hostname.to_string()) {
+            Ok(sn) => sn,
+            Err(e) => {
+                tracing::warn!("webhook invalid hostname for TLS: {}: {}", hostname, e);
+                return;
+            }
+        };
+        let tls_conn = match rustls::ClientConnection::new(tls_config, server_name) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("webhook TLS handshake init failed: {}", e);
+                return;
+            }
+        };
+        let mut tls_stream = rustls::StreamOwned::new(tls_conn, tcp_stream);
+        if let Err(e) = tls_stream.write_all(request.as_bytes()) {
+            tracing::warn!("webhook TLS write failed: {}", e);
+            return;
+        }
+        let mut buf = [0u8; 512];
+        let _ = tls_stream.read(&mut buf);
+    } else {
+        // Plain HTTP — only allowed in non-production mode (checked by caller)
+        let mut stream = tcp_stream;
+        if let Err(e) = stream.write_all(request.as_bytes()) {
+            tracing::warn!("webhook write failed: {}", e);
+            return;
+        }
+        let mut buf = [0u8; 512];
+        let _ = stream.read(&mut buf);
     }
-
-    // Read (and discard) the response to complete the TCP exchange.
-    let mut buf = [0u8; 512];
-    let _ = stream.read(&mut buf);
 }
 
 /// Process alerting for a SIEM event: persist to file and optionally forward

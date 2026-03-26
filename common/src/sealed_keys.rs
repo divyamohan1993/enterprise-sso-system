@@ -20,12 +20,56 @@
 use std::sync::OnceLock;
 use zeroize::Zeroize;
 
-static MASTER_KEK_CACHE: OnceLock<[u8; 32]> = OnceLock::new();
+/// Master KEK storage with memory protection.
+/// The key is mlock'd to prevent swapping and marked MADV_DONTDUMP to exclude
+/// from core dumps. This is critical: the master KEK decrypts every other key
+/// in the system.
+struct ProtectedKek {
+    key: [u8; 32],
+}
+
+impl ProtectedKek {
+    fn new(key: [u8; 32]) -> Self {
+        let kek = Self { key };
+        // Lock the key into physical RAM — prevent swap exposure
+        #[cfg(unix)]
+        unsafe {
+            let ptr = kek.key.as_ptr() as *const libc::c_void;
+            let len = std::mem::size_of_val(&kek.key);
+            let _ = libc::mlock(ptr, len);
+            // Exclude from core dumps
+            let _ = libc::madvise(ptr as *mut libc::c_void, len, libc::MADV_DONTDUMP);
+        }
+        kek
+    }
+
+    fn as_bytes(&self) -> &[u8; 32] {
+        &self.key
+    }
+}
+
+impl Drop for ProtectedKek {
+    fn drop(&mut self) {
+        self.key.zeroize();
+        #[cfg(unix)]
+        unsafe {
+            let ptr = self.key.as_ptr() as *const libc::c_void;
+            let len = std::mem::size_of_val(&self.key);
+            let _ = libc::munlock(ptr, len);
+        }
+    }
+}
+
+// SAFETY: The key is only written once via OnceLock and then read-only.
+unsafe impl Sync for ProtectedKek {}
+unsafe impl Send for ProtectedKek {}
+
+static MASTER_KEK_CACHE: OnceLock<ProtectedKek> = OnceLock::new();
 
 /// Returns a reference to the cached master KEK, loading it once on first call.
-/// The KEK is stored in a static OnceLock to avoid repeated heap allocations.
+/// The KEK is mlock'd into physical RAM and excluded from core dumps.
 pub fn cached_master_kek() -> &'static [u8; 32] {
-    MASTER_KEK_CACHE.get_or_init(|| load_master_kek())
+    MASTER_KEK_CACHE.get_or_init(|| ProtectedKek::new(load_master_kek())).as_bytes()
 }
 
 /// Whether the system is running in production mode.

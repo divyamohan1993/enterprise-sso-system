@@ -666,12 +666,19 @@ async fn forward_to_orchestrator(
     let req_bytes = postcard::to_allocvec(&orch_req)
         .map_err(|e| format!("serialize orchestrator request: {e}"))?;
 
+    // Derive TLS SNI hostname from the orchestrator address.
+    // Use the actual hostname/IP — never hardcode "localhost" which defeats
+    // hostname verification in production deployments with real certificates.
+    let orch_hostname = config.addr
+        .split(':')
+        .next()
+        .unwrap_or(&config.addr);
     let mut transport = tls_connect(
             &config.addr,
             ModuleId::Gateway,
             config.hmac_key,
             &config.tls_connector,
-            "localhost",
+            orch_hostname,
         )
         .await
         .map_err(|e| format!("connect to orchestrator: {e}"))?;

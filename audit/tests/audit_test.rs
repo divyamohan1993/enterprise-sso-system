@@ -210,6 +210,7 @@ fn bft_cluster_with_signing_proposes_entry() {
         vec![Uuid::new_v4()],
         0.25,
         vec![],
+        2, // Secret classification
     );
     assert!(result.is_ok(), "quorum should be met with 7 honest nodes");
 
@@ -235,6 +236,7 @@ fn bft_signed_cluster_consistency() {
             vec![],
             i as f64 * 0.1,
             vec![],
+            0,
         );
         assert!(result.is_ok());
     }
@@ -257,6 +259,7 @@ fn bft_signed_cluster_tolerates_byzantine() {
         vec![],
         0.95,
         vec![],
+        3, // TopSecret
     );
     assert!(result.is_ok(), "quorum of 5 should still be met with 2 Byzantine nodes");
 
@@ -267,6 +270,7 @@ fn bft_signed_cluster_tolerates_byzantine() {
         vec![],
         1.0,
         vec![],
+        0,
     );
     assert!(result2.is_err(), "3 Byzantine nodes should prevent quorum");
 }
@@ -283,6 +287,7 @@ fn bft_signed_entries_have_valid_signature_bytes() {
             vec![Uuid::new_v4()],
             0.8,
             vec![],
+            1, // Confidential
         )
         .expect("should succeed");
 

@@ -11,6 +11,7 @@ fn propose_default(cluster: &mut BftAuditCluster) -> Result<[u8; 64], String> {
         vec![Uuid::new_v4()],
         0.1,
         Vec::new(),
+        0, // Unclassified default for tests
     )
 }
 

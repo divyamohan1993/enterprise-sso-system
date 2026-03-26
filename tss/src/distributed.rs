@@ -1,5 +1,25 @@
 //! Distributed FROST signing across separate signer processes.
 //! Each signer holds exactly ONE share. The coordinator aggregates.
+//!
+//! ## Truly Distributed Mode (production)
+//!
+//! Each signer runs as a **separate OS process** (or VM/container).  Shares
+//! are pre-distributed via sealed storage (`MILNET_TSS_SHARE_SEALED` env var)
+//! and never co-located in a single address space.  The coordinator process
+//! holds NO signing keys — it only orchestrates the FROST ceremony over
+//! SHARD/mTLS connections to remote signers.
+//!
+//! ## Sealed Share Format
+//!
+//! A sealed share is the AES-256-GCM encryption (under the master KEK) of
+//! the postcard-serialized [`SealedSharePayload`].  It contains:
+//! - The FROST `KeyPackage` bytes (one signer's secret share)
+//! - The signer's `Identifier` bytes
+//! - The group `PublicKeyPackage` bytes (needed by signer for signing)
+//! - The group threshold
+//!
+//! The coordinator stores the `PublicKeyPackage` and threshold separately
+//! via `MILNET_TSS_PUBLIC_KEY_PACKAGE` and `MILNET_TSS_THRESHOLD` env vars.
 
 use frost_ristretto255 as frost;
 use frost::keys::{KeyPackage, PublicKeyPackage};
@@ -522,5 +542,498 @@ impl DistributedSigningCoordinator {
         let mut out = [0u8; 64];
         out.copy_from_slice(&sig_bytes);
         Ok(out)
+    }
+}
+
+// ===========================================================================
+// Sealed share infrastructure for truly distributed deployment
+// ===========================================================================
+
+/// Payload stored inside a sealed share envelope.
+///
+/// Serialized with postcard, then encrypted with AES-256-GCM under the
+/// master KEK (via `common::sealed_keys`).
+#[derive(Serialize, Deserialize)]
+pub struct SealedSharePayload {
+    /// Serialized `frost::keys::KeyPackage` bytes (the signer's secret share).
+    pub key_package_bytes: Vec<u8>,
+    /// Serialized `frost::Identifier` bytes.
+    pub identifier_bytes: Vec<u8>,
+    /// Serialized `frost::keys::PublicKeyPackage` bytes (the group public key).
+    pub public_key_package_bytes: Vec<u8>,
+    /// The group threshold (minimum signers required).
+    pub threshold: usize,
+}
+
+/// Seal a signer's share for storage in an env var or file.
+///
+/// This is used during DKG ceremony to produce per-signer sealed blobs
+/// that can be deployed to separate VMs.
+pub fn seal_signer_share(
+    node: &SignerNode,
+    public_key_package: &PublicKeyPackage,
+    threshold: usize,
+) -> Vec<u8> {
+    let key_package_bytes = node
+        .key_package
+        .serialize()
+        .expect("KeyPackage serialization must succeed");
+    let identifier_bytes = node.identifier.serialize();
+    let public_key_package_bytes = public_key_package
+        .serialize()
+        .expect("PublicKeyPackage serialization must succeed");
+
+    let payload = SealedSharePayload {
+        key_package_bytes,
+        identifier_bytes,
+        public_key_package_bytes,
+        threshold,
+    };
+
+    let payload_bytes =
+        postcard::to_allocvec(&payload).expect("SealedSharePayload serialization must succeed");
+
+    seal_share_bytes(&payload_bytes)
+}
+
+/// Unseal a signer's share from a hex-encoded sealed blob.
+///
+/// Returns the deserialized `SignerNode`, `PublicKeyPackage`, and threshold.
+pub fn unseal_signer_share(
+    hex_sealed: &str,
+) -> Result<(SignerNode, PublicKeyPackage, usize), String> {
+    let payload_bytes = unseal_share_bytes(hex_sealed)?;
+    let payload: SealedSharePayload =
+        postcard::from_bytes(&payload_bytes).map_err(|e| format!("deserialize payload: {e}"))?;
+
+    let key_package = KeyPackage::deserialize(&payload.key_package_bytes)
+        .map_err(|e| format!("deserialize KeyPackage: {e}"))?;
+    let identifier = Identifier::deserialize(&payload.identifier_bytes)
+        .map_err(|e| format!("deserialize Identifier: {e}"))?;
+    let public_key_package = PublicKeyPackage::deserialize(&payload.public_key_package_bytes)
+        .map_err(|e| format!("deserialize PublicKeyPackage: {e}"))?;
+
+    let node = SignerNode::new(identifier, key_package);
+    Ok((node, public_key_package, payload.threshold))
+}
+
+/// Low-level seal: encrypt arbitrary bytes under the master KEK with
+/// purpose = "tss-share".
+fn seal_share_bytes(plaintext: &[u8]) -> Vec<u8> {
+    use aes_gcm::aead::Aead;
+    use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+
+    let master_kek = common::sealed_keys::cached_master_kek();
+    let seal_key = derive_share_seal_key(master_kek);
+
+    let cipher = Aes256Gcm::new_from_slice(&seal_key).expect("32-byte key");
+
+    let mut nonce_bytes = [0u8; 12];
+    getrandom::getrandom(&mut nonce_bytes).expect("OS entropy");
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let aad = b"MILNET-SEALED-TSS-SHARE-v1";
+    let ciphertext = cipher
+        .encrypt(
+            nonce,
+            aes_gcm::aead::Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .expect("AES-256-GCM encryption must not fail");
+
+    let mut out = Vec::with_capacity(12 + ciphertext.len());
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ciphertext);
+    out
+}
+
+/// Low-level unseal: decrypt a hex-encoded sealed blob.
+fn unseal_share_bytes(hex_str: &str) -> Result<Vec<u8>, String> {
+    use aes_gcm::aead::Aead;
+    use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+
+    let sealed_bytes: Vec<u8> = (0..hex_str.len())
+        .step_by(2)
+        .filter_map(|i| hex_str.get(i..i + 2).and_then(|s| u8::from_str_radix(s, 16).ok()))
+        .collect();
+
+    if sealed_bytes.len() < 12 + 16 {
+        return Err("sealed share too short".into());
+    }
+
+    let master_kek = common::sealed_keys::cached_master_kek();
+    let seal_key = derive_share_seal_key(master_kek);
+
+    let cipher =
+        Aes256Gcm::new_from_slice(&seal_key).map_err(|e| format!("cipher init: {e}"))?;
+    let nonce = Nonce::from_slice(&sealed_bytes[..12]);
+
+    let aad = b"MILNET-SEALED-TSS-SHARE-v1";
+    let plaintext = cipher
+        .decrypt(
+            nonce,
+            aes_gcm::aead::Payload {
+                msg: &sealed_bytes[12..],
+                aad,
+            },
+        )
+        .map_err(|_| "sealed share decryption failed (wrong KEK or tampered data)".to_string())?;
+
+    Ok(plaintext)
+}
+
+/// Derive a 32-byte seal key from the master KEK for TSS share sealing.
+fn derive_share_seal_key(master_kek: &[u8; 32]) -> [u8; 32] {
+    use hkdf::Hkdf;
+    use sha2::Sha512;
+    let hk = Hkdf::<Sha512>::new(Some(b"MILNET-TSS-SHARE-SEAL-v1"), master_kek);
+    let mut okm = [0u8; 32];
+    hk.expand(b"tss-share", &mut okm)
+        .expect("32-byte HKDF expand must succeed");
+    okm
+}
+
+/// Load a signer's share from the `MILNET_TSS_SHARE_SEALED` env var.
+///
+/// Returns (SignerNode, PublicKeyPackage, threshold) or an error.
+pub fn load_signer_share_from_env() -> Result<(SignerNode, PublicKeyPackage, usize), String> {
+    let hex_sealed = std::env::var("MILNET_TSS_SHARE_SEALED")
+        .map_err(|_| "MILNET_TSS_SHARE_SEALED env var not set".to_string())?;
+
+    if hex_sealed.is_empty() {
+        return Err("MILNET_TSS_SHARE_SEALED is empty".into());
+    }
+
+    unseal_signer_share(&hex_sealed)
+}
+
+/// Load the coordinator's public key package and threshold from env vars.
+///
+/// The coordinator needs:
+/// - `MILNET_TSS_PUBLIC_KEY_PACKAGE`: hex-encoded serialized `PublicKeyPackage`
+/// - `MILNET_TSS_THRESHOLD`: the group threshold (integer)
+/// - `MILNET_TSS_SIGNER_ADDRS`: comma-separated list of `identifier_hex@host:port` pairs
+/// - HMAC key loaded via `common::sealed_keys::load_shard_hmac_key_sealed()`
+pub fn load_coordinator_config_from_env(
+) -> Result<(PublicKeyPackage, usize, Vec<(Identifier, String)>, [u8; 64]), String> {
+    // Public key package
+    let pkg_hex = std::env::var("MILNET_TSS_PUBLIC_KEY_PACKAGE")
+        .map_err(|_| "MILNET_TSS_PUBLIC_KEY_PACKAGE not set".to_string())?;
+    let pkg_bytes: Vec<u8> = (0..pkg_hex.len())
+        .step_by(2)
+        .filter_map(|i| pkg_hex.get(i..i + 2).and_then(|s| u8::from_str_radix(s, 16).ok()))
+        .collect();
+    let public_key_package = PublicKeyPackage::deserialize(&pkg_bytes)
+        .map_err(|e| format!("deserialize PublicKeyPackage: {e}"))?;
+
+    // Threshold
+    let threshold: usize = std::env::var("MILNET_TSS_THRESHOLD")
+        .map_err(|_| "MILNET_TSS_THRESHOLD not set".to_string())?
+        .parse()
+        .map_err(|e| format!("invalid MILNET_TSS_THRESHOLD: {e}"))?;
+
+    // Signer addresses: "id_hex@host:port,id_hex@host:port,..."
+    let addrs_str = std::env::var("MILNET_TSS_SIGNER_ADDRS")
+        .map_err(|_| "MILNET_TSS_SIGNER_ADDRS not set".to_string())?;
+    let mut signer_addrs = Vec::new();
+    for entry in addrs_str.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        // Format: id_hex@host:port
+        let parts: Vec<&str> = entry.splitn(2, '@').collect();
+        if parts.len() != 2 {
+            return Err(format!(
+                "invalid signer addr entry '{entry}': expected 'id_hex@host:port'"
+            ));
+        }
+        let id_bytes: Vec<u8> = (0..parts[0].len())
+            .step_by(2)
+            .filter_map(|i| {
+                parts[0]
+                    .get(i..i + 2)
+                    .and_then(|s| u8::from_str_radix(s, 16).ok())
+            })
+            .collect();
+        let identifier = Identifier::deserialize(&id_bytes)
+            .map_err(|e| format!("deserialize identifier from '{entry}': {e}"))?;
+        signer_addrs.push((identifier, parts[1].to_string()));
+    }
+
+    // HMAC key for coordinator-signer communication
+    let hmac_key = common::sealed_keys::load_shard_hmac_key_sealed();
+
+    Ok((public_key_package, threshold, signer_addrs, hmac_key))
+}
+
+/// Seal all shares from a DKG result for distribution to separate VMs.
+///
+/// Returns a Vec of (identifier_hex, sealed_share_hex) pairs.
+/// Each sealed share should be deployed to exactly one signer VM as
+/// the `MILNET_TSS_SHARE_SEALED` env var.
+pub fn seal_all_shares(
+    dkg_result: &mut crypto::threshold::DkgResult,
+) -> Vec<(String, String)> {
+    let (coordinator, nodes) = distribute_shares(dkg_result);
+    let mut sealed = Vec::with_capacity(nodes.len());
+    for node in &nodes {
+        let sealed_bytes =
+            seal_signer_share(node, &coordinator.public_key_package, coordinator.threshold);
+        let id_hex: String = node
+            .identifier()
+            .serialize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let share_hex: String = sealed_bytes.iter().map(|b| format!("{b:02x}")).collect();
+        sealed.push((id_hex, share_hex));
+    }
+    sealed
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crypto::threshold::dkg;
+
+    /// Helper: run DKG and distribute shares.
+    fn setup_dkg() -> (SigningCoordinator, Vec<SignerNode>) {
+        let mut dkg_result = dkg(5, 3);
+        distribute_shares(&mut dkg_result)
+    }
+
+    #[test]
+    fn sealed_share_round_trip() {
+        // Ensure deterministic dev KEK is used
+        std::env::remove_var("MILNET_PRODUCTION");
+        std::env::set_var("MILNET_MASTER_KEK", "ab".repeat(32));
+
+        let (coordinator, nodes) = setup_dkg();
+        let node = &nodes[0];
+        let original_id = node.identifier();
+
+        // Seal the share
+        let sealed_bytes =
+            seal_signer_share(node, &coordinator.public_key_package, coordinator.threshold);
+        let hex: String = sealed_bytes.iter().map(|b| format!("{b:02x}")).collect();
+
+        // Unseal and verify
+        let (recovered_node, recovered_pkg, recovered_threshold) =
+            unseal_signer_share(&hex).expect("unseal must succeed");
+
+        assert_eq!(recovered_node.identifier(), original_id);
+        assert_eq!(recovered_threshold, coordinator.threshold);
+
+        // Verify the recovered node can participate in signing
+        let mut recovered_nodes = vec![recovered_node];
+        // Get 2 more nodes for threshold
+        let mut node2 = SignerNode::new(nodes[1].identifier, nodes[1].key_package.clone());
+        let mut node3 = SignerNode::new(nodes[2].identifier, nodes[2].key_package.clone());
+
+        let mut signers: Vec<&mut SignerNode> =
+            vec![&mut recovered_nodes[0], &mut node2, &mut node3];
+
+        let coordinator_for_sign = SigningCoordinator::new(recovered_pkg, recovered_threshold);
+        let signature = coordinator_for_sign
+            .coordinate_signing(&mut signers, b"test message after unseal")
+            .expect("signing with recovered share must work");
+
+        // Verify signature
+        let sig = frost_ristretto255::Signature::deserialize(&signature)
+            .expect("deserialize signature");
+        assert!(coordinator
+            .public_key_package
+            .verifying_key()
+            .verify(b"test message after unseal", &sig)
+            .is_ok());
+
+        std::env::remove_var("MILNET_MASTER_KEK");
+    }
+
+    #[test]
+    fn sealed_share_tamper_detected() {
+        std::env::remove_var("MILNET_PRODUCTION");
+        std::env::set_var("MILNET_MASTER_KEK", "ab".repeat(32));
+
+        let (coordinator, nodes) = setup_dkg();
+        let node = &nodes[0];
+
+        let mut sealed_bytes =
+            seal_signer_share(node, &coordinator.public_key_package, coordinator.threshold);
+
+        // Tamper with the ciphertext
+        if sealed_bytes.len() > 20 {
+            sealed_bytes[20] ^= 0xFF;
+        }
+
+        let hex: String = sealed_bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let result = unseal_signer_share(&hex);
+        assert!(result.is_err(), "tampered sealed share must fail to unseal");
+
+        std::env::remove_var("MILNET_MASTER_KEK");
+    }
+
+    #[test]
+    fn seal_all_shares_produces_correct_count() {
+        std::env::remove_var("MILNET_PRODUCTION");
+        std::env::set_var("MILNET_MASTER_KEK", "cd".repeat(32));
+
+        let mut dkg_result = dkg(5, 3);
+        let sealed = seal_all_shares(&mut dkg_result);
+
+        assert_eq!(sealed.len(), 5, "must produce exactly 5 sealed shares");
+
+        // Each sealed share must unseal correctly
+        for (id_hex, share_hex) in &sealed {
+            assert!(!id_hex.is_empty());
+            assert!(!share_hex.is_empty());
+            let (node, _pkg, threshold) =
+                unseal_signer_share(share_hex).expect("each sealed share must unseal");
+            assert_eq!(threshold, 3);
+
+            let recovered_id_hex: String = node
+                .identifier()
+                .serialize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            assert_eq!(&recovered_id_hex, id_hex);
+        }
+
+        std::env::remove_var("MILNET_MASTER_KEK");
+    }
+
+    #[tokio::test]
+    async fn distributed_coordinator_signer_handshake() {
+        // This test verifies that a coordinator can connect to a signer
+        // process over SHARD/mTLS, perform the commit and sign rounds,
+        // and produce a valid group signature.
+        std::env::remove_var("MILNET_PRODUCTION");
+
+        let (coordinator, nodes) = setup_dkg();
+        let threshold = coordinator.threshold;
+
+        let hmac_key = crypto::entropy::generate_key_64();
+
+        // Spawn signer processes on random ports
+        let mut signer_addrs: Vec<(Identifier, String)> = Vec::new();
+
+        // We need `threshold` signers (3)
+        let base_port: u16 = 19200 + (std::process::id() % 1000) as u16;
+        for (i, node) in nodes.into_iter().take(threshold).enumerate() {
+            let addr = format!("127.0.0.1:{}", base_port + i as u16);
+            signer_addrs.push((node.identifier(), addr.clone()));
+            let hmac = hmac_key;
+            tokio::spawn(async move {
+                let _ = run_signer_process(node, &addr, hmac).await;
+            });
+        }
+
+        // Give signers time to bind
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Build the distributed coordinator
+        let dist_coordinator = DistributedSigningCoordinator {
+            public_key_package: coordinator.public_key_package.clone(),
+            threshold,
+            signer_addrs,
+            hmac_key,
+        };
+
+        // Perform a distributed signing ceremony
+        let message = b"distributed handshake test message";
+        let frost_result = dist_coordinator.coordinate_signing_remote(message).await;
+        assert!(
+            frost_result.is_ok(),
+            "distributed signing must succeed: {:?}",
+            frost_result.err()
+        );
+
+        // Verify the signature
+        let signature = frost_result.unwrap();
+        let sig = frost_ristretto255::Signature::deserialize(&signature)
+            .expect("deserialize group signature");
+        assert!(
+            coordinator
+                .public_key_package
+                .verifying_key()
+                .verify(message, &sig)
+                .is_ok(),
+            "group signature must verify"
+        );
+    }
+
+    #[tokio::test]
+    async fn signer_loads_sealed_share_and_serves() {
+        // End-to-end: seal a share, unseal it, run as signer, coordinator
+        // connects and signs.
+        std::env::remove_var("MILNET_PRODUCTION");
+        std::env::set_var("MILNET_MASTER_KEK", "ef".repeat(32));
+
+        let (coordinator, nodes) = setup_dkg();
+        let threshold = coordinator.threshold;
+        let hmac_key = crypto::entropy::generate_key_64();
+
+        let base_port: u16 = 19300 + (std::process::id() % 1000) as u16;
+        let mut signer_addrs: Vec<(Identifier, String)> = Vec::new();
+
+        // Seal each share, unseal it, and run as a signer process
+        for (i, node) in nodes.into_iter().take(threshold).enumerate() {
+            let sealed_bytes = seal_signer_share(
+                &node,
+                &coordinator.public_key_package,
+                threshold,
+            );
+            let hex: String = sealed_bytes.iter().map(|b| format!("{b:02x}")).collect();
+
+            // Unseal (simulating a fresh process loading from env)
+            let (unsealed_node, _pkg, _thresh) =
+                unseal_signer_share(&hex).expect("unseal must succeed");
+
+            let addr = format!("127.0.0.1:{}", base_port + i as u16);
+            signer_addrs.push((unsealed_node.identifier(), addr.clone()));
+            let hmac = hmac_key;
+            tokio::spawn(async move {
+                let _ = run_signer_process(unsealed_node, &addr, hmac).await;
+            });
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let dist_coordinator = DistributedSigningCoordinator {
+            public_key_package: coordinator.public_key_package.clone(),
+            threshold,
+            signer_addrs,
+            hmac_key,
+        };
+
+        let message = b"sealed share end-to-end test";
+        let frost_result = dist_coordinator.coordinate_signing_remote(message).await;
+        assert!(
+            frost_result.is_ok(),
+            "signing with unsealed shares must succeed: {:?}",
+            frost_result.err()
+        );
+
+        let signature = frost_result.unwrap();
+        let sig = frost_ristretto255::Signature::deserialize(&signature)
+            .expect("deserialize group signature");
+        assert!(
+            coordinator
+                .public_key_package
+                .verifying_key()
+                .verify(message, &sig)
+                .is_ok(),
+            "group signature from unsealed shares must verify"
+        );
+
+        std::env::remove_var("MILNET_MASTER_KEK");
     }
 }

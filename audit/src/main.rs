@@ -207,6 +207,7 @@ async fn main() {
                                 req.device_ids,
                                 req.risk_score,
                                 vec![],
+                                req.classification,
                             ) {
                                 Ok(_entry_hash) => AuditResponse {
                                     success: true,

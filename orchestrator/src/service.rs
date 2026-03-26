@@ -187,12 +187,13 @@ impl OrchestratorService {
         if !self.opaque_breaker.allow_request() {
             return Err("OPAQUE service circuit breaker is open — service unavailable".into());
         }
+        let opaque_host = self.opaque_addr.split(':').next().unwrap_or(&self.opaque_addr);
         match tls_connect(
             &self.opaque_addr,
             ModuleId::Orchestrator,
             self.hmac_key,
             &self.tls_connector,
-            "localhost",
+            opaque_host,
         )
         .await
         {
@@ -212,12 +213,13 @@ impl OrchestratorService {
         if !self.tss_breaker.allow_request() {
             return Err("TSS service circuit breaker is open — service unavailable".into());
         }
+        let tss_host = self.tss_addr.split(':').next().unwrap_or(&self.tss_addr);
         match tls_connect(
             &self.tss_addr,
             ModuleId::Orchestrator,
             self.hmac_key,
             &self.tls_connector,
-            "localhost",
+            tss_host,
         )
         .await
         {

@@ -1075,7 +1075,13 @@ async fn origin_and_content_type_middleware(
         // Origin present: must reference our host
         (Some(o), _) => {
             let o_lower = o.to_lowercase();
-            o_lower.contains(host) || o_lower == "null" || host.is_empty()
+            // SECURITY: Never accept Origin: null — browsers send it from sandboxed
+            // iframes, data: URIs, and file: contexts, enabling cross-origin CSRF.
+            if o_lower == "null" {
+                false
+            } else {
+                !host.is_empty() && o_lower.contains(host)
+            }
         }
         // No Origin, Referer present: must reference our host
         (None, Some(r)) => r.contains(host) || host.is_empty(),

@@ -7,12 +7,27 @@
 //!
 //! ## Modes
 //!
-//! - `distributed` (default): Each signer runs in its own tokio task on a
-//!   separate SHARD/mTLS port. The coordinator communicates via network IPC.
-//!   Compromising any single task only yields 1 share.
+//! ### Truly Distributed Mode (production)
 //!
-//! - `single-process` (dev only): All signers in one process for local
-//!   development. **NOT permitted in production.**
+//! Set `MILNET_TSS_ROLE=coordinator` or `MILNET_TSS_ROLE=signer` to run
+//! a single role per process. Each process runs on its own VM/container.
+//!
+//! - **Coordinator**: loads `PublicKeyPackage` and signer addresses from env,
+//!   accepts signing requests from the Orchestrator, coordinates the FROST
+//!   ceremony over SHARD/mTLS with remote signer processes.
+//!
+//! - **Signer**: loads exactly ONE sealed key share from
+//!   `MILNET_TSS_SHARE_SEALED`, listens on `MILNET_TSS_SIGNER_ADDR` for
+//!   coordinator requests.
+//!
+//! ### Legacy In-Process Mode (dev/test only)
+//!
+//! If `MILNET_TSS_ROLE` is not set AND `MILNET_PRODUCTION` is not `1`,
+//! falls back to the original in-process mode where all signers run as
+//! tokio tasks. A loud warning is emitted.
+//!
+//! In production (`MILNET_PRODUCTION=1`), the in-process mode is rejected
+//! with a hard exit.
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -34,6 +49,297 @@ async fn main() {
     let (_platform_report, _monitor_handle, _monitor) =
         common::startup_checks::run_platform_checks(crypto::memguard::harden_process);
 
+    let is_production = common::sealed_keys::is_production();
+
+    // --- Role-based dispatch ---
+    match std::env::var("MILNET_TSS_ROLE").ok().as_deref() {
+        Some("coordinator") => {
+            tracing::info!("TSS starting in COORDINATOR role (truly distributed)");
+            run_coordinator_role().await;
+        }
+        Some("signer") => {
+            tracing::info!("TSS starting in SIGNER role (truly distributed)");
+            run_signer_role().await;
+        }
+        Some(other) => {
+            tracing::error!(
+                "FATAL: unknown MILNET_TSS_ROLE={other:?}. Use 'coordinator' or 'signer'."
+            );
+            std::process::exit(1);
+        }
+        None => {
+            // No role set — check if we can fall back to legacy in-process mode
+            if is_production {
+                eprintln!(
+                    "FATAL: MILNET_TSS_ROLE not set in production mode. \
+                     Each TSS process MUST run exactly one role: 'coordinator' or 'signer'. \
+                     In-process mode is forbidden in production — it collapses 3-of-5 \
+                     threshold security to effective 1-of-1."
+                );
+                std::process::exit(1);
+            }
+
+            tracing::warn!(
+                "========================================================================="
+            );
+            tracing::warn!(
+                "WARNING: MILNET_TSS_ROLE not set. Falling back to LEGACY IN-PROCESS MODE."
+            );
+            tracing::warn!(
+                "WARNING: All 5 signer shares exist in the SAME process memory."
+            );
+            tracing::warn!(
+                "WARNING: This defeats threshold security. Set MILNET_TSS_ROLE for production."
+            );
+            tracing::warn!(
+                "========================================================================="
+            );
+
+            run_legacy_inprocess_mode().await;
+        }
+    }
+}
+
+// ===========================================================================
+// Truly Distributed: Coordinator Role
+// ===========================================================================
+
+async fn run_coordinator_role() {
+    // Load coordinator config from env (public key package, threshold, signer addrs, HMAC key)
+    let (public_key_package, threshold, signer_addrs, hmac_key) =
+        match tss::distributed::load_coordinator_config_from_env() {
+            Ok(config) => config,
+            Err(e) => {
+                tracing::error!("FATAL: failed to load coordinator config: {e}");
+                std::process::exit(1);
+            }
+        };
+
+    tracing::info!(
+        threshold = threshold,
+        signers = signer_addrs.len(),
+        "Coordinator loaded config from env (holds NO signing keys)"
+    );
+
+    for (id, addr) in &signer_addrs {
+        tracing::info!("  remote signer {:?} at {}", id, addr);
+    }
+
+    // Build the remote coordinator
+    let dist_coordinator = Arc::new(DistributedSigningCoordinator {
+        public_key_package,
+        threshold,
+        signer_addrs,
+        hmac_key,
+    });
+
+    // Generate PQ signing key at startup (in production, loaded from HSM).
+    let (pq_signing_key, _pq_verifying_key) = generate_pq_keypair();
+    let pq_signing_key = Arc::new(pq_signing_key);
+
+    // Load the shared receipt signing key
+    let receipt_signing_key = common::shared_keys::load_receipt_signing_key();
+
+    // Coordinator listener (accepts signing requests from the Orchestrator)
+    let addr = std::env::var("TSS_ADDR").unwrap_or_else(|_| "127.0.0.1:9103".to_string());
+    let coord_hmac_key = crypto::entropy::generate_key_64();
+    let (listener, _ca, _cert_key) =
+        shard::tls_transport::tls_bind(&addr, common::types::ModuleId::Tss, coord_hmac_key, "tss")
+            .await
+            .unwrap();
+    tracing::info!("TSS coordinator listening on {addr} (mTLS, truly distributed mode)");
+
+    loop {
+        if let Ok(mut transport) = listener.accept().await {
+            tracing::info!("TSS coordinator accepted connection");
+
+            let dist_coordinator = Arc::clone(&dist_coordinator);
+            let pq_signing_key = Arc::clone(&pq_signing_key);
+
+            tokio::spawn(async move {
+                while let Ok((sender, payload)) = transport.recv().await {
+                    // C11: Validate sender identity — only Orchestrator may request signing
+                    if sender != common::types::ModuleId::Orchestrator {
+                        tracing::warn!(
+                            "TSS: rejecting signing request from unauthorized sender {:?}",
+                            sender
+                        );
+                        let resp = SigningResponse {
+                            success: false,
+                            token: None,
+                            error: Some(format!(
+                                "unauthorized sender: {:?} (only Orchestrator permitted)",
+                                sender
+                            )),
+                        };
+                        let resp_bytes = postcard::to_allocvec(&resp).unwrap();
+                        let _ = transport.send(&resp_bytes).await;
+                        continue;
+                    }
+
+                    tracing::info!("TSS received signing request (coordinator role)");
+
+                    // 1. Deserialize the signing request
+                    let request: SigningRequest = match postcard::from_bytes(&payload) {
+                        Ok(req) => req,
+                        Err(e) => {
+                            tracing::error!("failed to deserialize signing request: {e}");
+                            let resp = SigningResponse {
+                                success: false,
+                                token: None,
+                                error: Some(format!("deserialization error: {e}")),
+                            };
+                            let resp_bytes = postcard::to_allocvec(&resp).unwrap();
+                            let _ = transport.send(&resp_bytes).await;
+                            continue;
+                        }
+                    };
+
+                    // 2. Validate receipt chain
+                    if let Err(e) =
+                        validate_receipt_chain(&request.receipts, &receipt_signing_key.0)
+                    {
+                        tracing::warn!("receipt chain validation failed: {e}");
+                        let resp = SigningResponse {
+                            success: false,
+                            token: None,
+                            error: Some(format!("receipt chain invalid: {e}")),
+                        };
+                        let resp_bytes = postcard::to_allocvec(&resp).unwrap();
+                        let _ = transport.send(&resp_bytes).await;
+                        continue;
+                    }
+
+                    // 3. Prepare claims with audience
+                    let claims = prepare_claims_with_audience(
+                        &request.claims,
+                        request.claims.aud.clone(),
+                    );
+
+                    // Domain-separated message for FROST signing
+                    let claims_bytes = match postcard::to_allocvec(&claims) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            let resp = SigningResponse {
+                                success: false,
+                                token: None,
+                                error: Some(format!("claims serialization: {e}")),
+                            };
+                            let resp_bytes = postcard::to_allocvec(&resp).unwrap();
+                            let _ = transport.send(&resp_bytes).await;
+                            continue;
+                        }
+                    };
+                    let msg = [common::domain::FROST_TOKEN, claims_bytes.as_slice()].concat();
+
+                    // 4. Distributed FROST signing via remote signer nodes
+                    let frost_result = dist_coordinator.coordinate_signing_remote(&msg).await;
+
+                    let resp = match frost_result {
+                        Ok(frost_signature) => {
+                            // Compute ratchet tag
+                            use hmac::{Hmac, Mac};
+                            use sha2::Sha512;
+                            type HmacSha512 = Hmac<Sha512>;
+
+                            let mut mac = HmacSha512::new_from_slice(&request.ratchet_key)
+                                .expect("HMAC-SHA512 accepts any key length");
+                            mac.update(common::domain::TOKEN_TAG);
+                            mac.update(&claims_bytes);
+                            mac.update(&claims.ratchet_epoch.to_le_bytes());
+                            let ratchet_tag: [u8; 64] = mac.finalize().into_bytes().into();
+
+                            // PQ signature
+                            let pq_signature =
+                                crypto::pq_sign::pq_sign(&pq_signing_key, &msg, &frost_signature);
+
+                            let token = common::types::Token {
+                                header: common::types::TokenHeader {
+                                    version: 1,
+                                    algorithm: 1,
+                                    tier: claims.tier,
+                                },
+                                claims,
+                                ratchet_tag,
+                                frost_signature,
+                                pq_signature,
+                            };
+
+                            let token_bytes = postcard::to_allocvec(&token).unwrap();
+                            tracing::info!(
+                                "token built successfully via distributed signing ({} bytes)",
+                                token_bytes.len()
+                            );
+                            SigningResponse {
+                                success: true,
+                                token: Some(token_bytes),
+                                error: None,
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("distributed signing failed: {e}");
+                            SigningResponse {
+                                success: false,
+                                token: None,
+                                error: Some(format!("distributed signing failed: {e}")),
+                            }
+                        }
+                    };
+
+                    // 5. Send response back
+                    let resp_bytes = postcard::to_allocvec(&resp).unwrap();
+                    if let Err(e) = transport.send(&resp_bytes).await {
+                        tracing::error!("failed to send signing response: {e}");
+                        break;
+                    }
+                }
+            });
+        }
+    }
+}
+
+// ===========================================================================
+// Truly Distributed: Signer Role
+// ===========================================================================
+
+async fn run_signer_role() {
+    // Load the signer's sealed key share from env
+    let (node, _public_key_package, _threshold) =
+        match tss::distributed::load_signer_share_from_env() {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::error!(
+                    "FATAL: failed to load sealed signer share: {e}. \
+                     Set MILNET_TSS_SHARE_SEALED to a valid sealed share hex blob."
+                );
+                std::process::exit(1);
+            }
+        };
+
+    let signer_addr = std::env::var("MILNET_TSS_SIGNER_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:9110".to_string());
+
+    tracing::info!(
+        identifier = ?node.identifier(),
+        addr = %signer_addr,
+        "Signer loaded sealed key share (holds exactly 1 share)"
+    );
+
+    // Load the SHARD HMAC key for coordinator-signer authentication
+    let hmac_key = common::sealed_keys::load_shard_hmac_key_sealed();
+
+    // Run the signer process (blocks forever, serving coordinator requests)
+    if let Err(e) = tss::distributed::run_signer_process(node, &signer_addr, hmac_key).await {
+        tracing::error!("Signer process failed: {e}");
+        std::process::exit(1);
+    }
+}
+
+// ===========================================================================
+// Legacy in-process mode (dev/test only — NOT for production)
+// ===========================================================================
+
+async fn run_legacy_inprocess_mode() {
     // Run DKG at startup (3-of-5 threshold)
     let mut dkg_result = dkg(5, 3);
     tracing::info!(
@@ -50,7 +356,7 @@ async fn main() {
     let total = nodes.len();
 
     tracing::info!(
-        "tss: distributed — coordinator (no keys) + {} signer nodes (1 share each)",
+        "tss: legacy in-process — coordinator (no keys) + {} signer nodes (1 share each)",
         total
     );
     tracing::info!(
@@ -106,7 +412,7 @@ async fn main() {
 }
 
 // ===========================================================================
-// Distributed mode: each signer on its own SHARD port
+// Distributed mode: each signer on its own SHARD port (legacy in-process)
 // ===========================================================================
 
 async fn run_distributed_mode(

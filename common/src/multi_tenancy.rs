@@ -806,10 +806,34 @@ impl TenantPolicy {
         if self.ip_allowlist.is_empty() {
             return true;
         }
-        // Simple prefix-based check. In production, use a proper CIDR library.
-        self.ip_allowlist.iter().any(|cidr| {
-            // Exact match or the CIDR is a prefix of the IP
-            ip == cidr || cidr.contains('/')
+        self.ip_allowlist.iter().any(|entry| {
+            if let Some(slash_pos) = entry.find('/') {
+                // CIDR notation: parse network address and prefix length
+                let network_str = &entry[..slash_pos];
+                let prefix_len: u32 = match entry[slash_pos + 1..].parse() {
+                    Ok(p) => p,
+                    Err(_) => return false,
+                };
+                // Parse both as IPv4 octets for comparison
+                let net_octets: Vec<u8> = network_str
+                    .split('.')
+                    .filter_map(|s| s.parse().ok())
+                    .collect();
+                let ip_octets: Vec<u8> = ip
+                    .split('.')
+                    .filter_map(|s| s.parse().ok())
+                    .collect();
+                if net_octets.len() != 4 || ip_octets.len() != 4 || prefix_len > 32 {
+                    return false;
+                }
+                let net_u32 = u32::from_be_bytes([net_octets[0], net_octets[1], net_octets[2], net_octets[3]]);
+                let ip_u32 = u32::from_be_bytes([ip_octets[0], ip_octets[1], ip_octets[2], ip_octets[3]]);
+                let mask = if prefix_len == 0 { 0u32 } else { !0u32 << (32 - prefix_len) };
+                (net_u32 & mask) == (ip_u32 & mask)
+            } else {
+                // Exact match
+                ip == entry
+            }
         })
     }
 }
@@ -1180,5 +1204,90 @@ mod tests {
             mgr.increment_usage(id, "users"),
             Err(TenantError::TenantNotActive { .. })
         ));
+    }
+
+    // ── CIDR IP allowlist tests (security-critical) ─────────────────────
+
+    fn make_ctx_with_ip_allowlist(ips: Vec<&str>) -> TenantContext {
+        TenantContext {
+            tenant_id: TenantId::new(),
+            tenant_slug: "test".to_string(),
+            compliance_regime: TenantComplianceRegime::UsDod,
+            allowed_auth_methods: vec![],
+            ip_allowlist: ips.into_iter().map(String::from).collect(),
+            data_residency_region: "us-central1".to_string(),
+        }
+    }
+
+    #[test]
+    fn cidr_allowlist_exact_match() {
+        let ctx = make_ctx_with_ip_allowlist(vec!["10.0.0.5"]);
+        assert!(ctx.is_ip_allowed("10.0.0.5"));
+        assert!(!ctx.is_ip_allowed("10.0.0.6"));
+    }
+
+    #[test]
+    fn cidr_allowlist_24_subnet() {
+        let ctx = make_ctx_with_ip_allowlist(vec!["192.168.1.0/24"]);
+        assert!(ctx.is_ip_allowed("192.168.1.0"));
+        assert!(ctx.is_ip_allowed("192.168.1.1"));
+        assert!(ctx.is_ip_allowed("192.168.1.255"));
+        assert!(!ctx.is_ip_allowed("192.168.2.0"));
+        assert!(!ctx.is_ip_allowed("10.0.0.1"));
+    }
+
+    #[test]
+    fn cidr_allowlist_16_subnet() {
+        let ctx = make_ctx_with_ip_allowlist(vec!["10.10.0.0/16"]);
+        assert!(ctx.is_ip_allowed("10.10.0.1"));
+        assert!(ctx.is_ip_allowed("10.10.255.255"));
+        assert!(!ctx.is_ip_allowed("10.11.0.1"));
+    }
+
+    #[test]
+    fn cidr_allowlist_32_single_host() {
+        let ctx = make_ctx_with_ip_allowlist(vec!["10.0.0.1/32"]);
+        assert!(ctx.is_ip_allowed("10.0.0.1"));
+        assert!(!ctx.is_ip_allowed("10.0.0.2"));
+    }
+
+    #[test]
+    fn cidr_allowlist_rejects_random_ip_with_slash() {
+        // The old buggy code accepted ANY IP when CIDR notation was present.
+        // This test ensures that is fixed.
+        let ctx = make_ctx_with_ip_allowlist(vec!["10.0.0.0/24"]);
+        assert!(!ctx.is_ip_allowed("192.168.100.50"));
+        assert!(!ctx.is_ip_allowed("1.2.3.4"));
+        assert!(!ctx.is_ip_allowed("255.255.255.255"));
+    }
+
+    #[test]
+    fn cidr_allowlist_empty_allows_all() {
+        let ctx = make_ctx_with_ip_allowlist(vec![]);
+        assert!(ctx.is_ip_allowed("1.2.3.4"));
+        assert!(ctx.is_ip_allowed("255.255.255.255"));
+    }
+
+    #[test]
+    fn cidr_allowlist_mixed_entries() {
+        let ctx = make_ctx_with_ip_allowlist(vec!["10.0.0.5", "192.168.0.0/16"]);
+        assert!(ctx.is_ip_allowed("10.0.0.5"));
+        assert!(ctx.is_ip_allowed("192.168.1.100"));
+        assert!(!ctx.is_ip_allowed("10.0.0.6"));
+        assert!(!ctx.is_ip_allowed("172.16.0.1"));
+    }
+
+    #[test]
+    fn cidr_allowlist_invalid_cidr_rejects() {
+        let ctx = make_ctx_with_ip_allowlist(vec!["not-a-cidr/24"]);
+        assert!(!ctx.is_ip_allowed("10.0.0.1"));
+    }
+
+    #[test]
+    fn cidr_allowlist_zero_prefix_matches_all() {
+        let ctx = make_ctx_with_ip_allowlist(vec!["0.0.0.0/0"]);
+        assert!(ctx.is_ip_allowed("10.0.0.1"));
+        assert!(ctx.is_ip_allowed("192.168.1.1"));
+        assert!(ctx.is_ip_allowed("255.255.255.255"));
     }
 }

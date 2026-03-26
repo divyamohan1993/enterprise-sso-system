@@ -300,10 +300,37 @@ fn ca_root_store(ca: &CertificateAuthority) -> Arc<RootCertStore> {
     Arc::new(root_store)
 }
 
-/// Build the CNSA 2.0 compliant crypto provider: TLS 1.3 only, AES-256-GCM-SHA384 only.
+/// Returns `true` if the `MILNET_PQ_TLS_ONLY` environment variable is set to `1`.
+///
+/// When enabled, only the post-quantum hybrid key exchange (X25519MLKEM768) is
+/// offered — no classical fallback.  This enforces CNSA 2.0 strict mode for
+/// quantum-resistant key exchange.
+fn pq_tls_only() -> bool {
+    std::env::var("MILNET_PQ_TLS_ONLY")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// Build the CNSA 2.0 compliant crypto provider.
+///
+/// * Cipher suite: TLS 1.3 AES-256-GCM-SHA384 only (CNSA 2.0).
+/// * Key exchange: X25519MLKEM768 (ML-KEM-768 + X25519 hybrid, post-quantum)
+///   preferred, with classical X25519 fallback unless `MILNET_PQ_TLS_ONLY=1`.
 fn cnsa2_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    let kx_groups: Vec<&'static dyn rustls::crypto::SupportedKxGroup> = if pq_tls_only() {
+        vec![
+            rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768, // PQ hybrid only
+        ]
+    } else {
+        vec![
+            rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768, // PQ hybrid preferred
+            rustls::crypto::aws_lc_rs::kx_group::X25519,          // classical fallback
+        ]
+    };
+
     Arc::new(rustls::crypto::CryptoProvider {
         cipher_suites: vec![rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_256_GCM_SHA384],
+        kx_groups,
         ..rustls::crypto::aws_lc_rs::default_provider()
     })
 }
@@ -546,6 +573,53 @@ mod tests {
     }
 
     #[test]
+    fn test_cnsa2_provider_includes_pq_hybrid_kx() {
+        // Default mode (MILNET_PQ_TLS_ONLY not set): PQ hybrid + classical fallback.
+        let provider = cnsa2_crypto_provider();
+
+        // First kx_group must be X25519MLKEM768 (PQ hybrid preferred).
+        let first_group = &provider.kx_groups[0];
+        assert_eq!(
+            format!("{:?}", first_group.name()),
+            "X25519MLKEM768",
+            "first key exchange group must be PQ hybrid X25519MLKEM768"
+        );
+
+        // Must have at least 2 groups (PQ hybrid + classical fallback).
+        assert!(
+            provider.kx_groups.len() >= 2,
+            "default mode must include classical X25519 fallback"
+        );
+        let second_group = &provider.kx_groups[1];
+        assert_eq!(
+            format!("{:?}", second_group.name()),
+            "X25519",
+            "second key exchange group must be classical X25519 fallback"
+        );
+    }
+
+    #[test]
+    fn test_pq_tls_only_mode_no_classical_fallback() {
+        // Simulate MILNET_PQ_TLS_ONLY=1 by temporarily setting the env var.
+        // Note: this test is not thread-safe with other tests that read this env var,
+        // but Rust test runner serializes tests by default unless --test-threads is set.
+        std::env::set_var("MILNET_PQ_TLS_ONLY", "1");
+        let provider = cnsa2_crypto_provider();
+        std::env::remove_var("MILNET_PQ_TLS_ONLY");
+
+        assert_eq!(
+            provider.kx_groups.len(),
+            1,
+            "PQ-only mode must have exactly one key exchange group"
+        );
+        assert_eq!(
+            format!("{:?}", provider.kx_groups[0].name()),
+            "X25519MLKEM768",
+            "PQ-only mode must use only X25519MLKEM768"
+        );
+    }
+
+    #[test]
     fn test_server_tls_config_requires_client_cert() {
         // Verify server config enforces mTLS by successfully creating
         // a config with WebPkiClientVerifier (which requires client certs).
@@ -564,6 +638,60 @@ mod tests {
         let _pinned_config = server_tls_config_pinned(&server_cert, &ca, pin_set);
         // If we reach here, mTLS configs with and without pinning were created.
         drop(config);
+    }
+
+    #[tokio::test]
+    async fn test_pq_tls_handshake_negotiates_x25519mlkem768() {
+        use tokio::net::TcpListener;
+
+        let ca = generate_ca();
+        let server_cert = generate_module_cert("localhost", &ca);
+        let client_cert = generate_module_cert("test-client", &ca);
+
+        let server_config = server_tls_config(&server_cert, &ca);
+        let client_config = client_tls_config(&client_cert, &ca);
+
+        let acceptor = tls_acceptor(server_config);
+        let connector = tls_connector(client_config);
+
+        // Bind an ephemeral TCP listener.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Spawn server task.
+        let server_handle = tokio::spawn(async move {
+            let (tcp_stream, _) = listener.accept().await.unwrap();
+            let tls_stream = acceptor.accept(tcp_stream).await.unwrap();
+            // Extract negotiated key exchange group from server side.
+            let (_, server_conn) = tls_stream.get_ref();
+            let negotiated = server_conn
+                .negotiated_key_exchange_group()
+                .expect("key exchange group must be negotiated");
+            format!("{:?}", negotiated.name())
+        });
+
+        // Client connects.
+        let tcp_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let tls_stream = connector.connect(server_name, tcp_stream).await.unwrap();
+
+        // Verify client-side negotiated group.
+        let (_, client_conn) = tls_stream.get_ref();
+        let client_group = client_conn
+            .negotiated_key_exchange_group()
+            .expect("client must have negotiated key exchange group");
+        assert_eq!(
+            format!("{:?}", client_group.name()),
+            "X25519MLKEM768",
+            "client must negotiate PQ hybrid X25519MLKEM768 key exchange"
+        );
+
+        // Verify server side agrees.
+        let server_group_name = server_handle.await.unwrap();
+        assert_eq!(
+            server_group_name, "X25519MLKEM768",
+            "server must negotiate PQ hybrid X25519MLKEM768 key exchange"
+        );
     }
 
     #[test]

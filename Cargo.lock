@@ -473,10 +473,12 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "libc",
  "ml-dsa",
  "p256",
  "postcard",
  "rand 0.8.5",
+ "rustls",
  "serde",
  "serde_json",
  "sha1",
@@ -487,6 +489,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "webpki-roots 1.0.6",
  "zeroize",
 ]
 
@@ -2507,6 +2510,7 @@ dependencies = [
  "common",
  "crypto",
  "getrandom 0.2.17",
+ "hex",
  "hkdf",
  "hmac",
  "libc",
@@ -3605,10 +3609,13 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 name = "tss"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "common",
  "crypto",
  "ed25519-dalek",
  "frost-ristretto255",
+ "getrandom 0.2.17",
+ "hkdf",
  "hmac",
  "ml-dsa",
  "postcard",

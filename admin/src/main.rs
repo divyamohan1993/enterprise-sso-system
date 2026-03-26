@@ -149,27 +149,67 @@ async fn main() {
         .ok()
         .flatten();
 
-    let credential_store = if let Some(setup_bytes) = server_setup_bytes {
-        // Restore existing ServerSetup — all previous user registrations remain valid
+    // SECURITY: OPAQUE ServerSetup contains the OPRF seed and server keypair.
+    // It MUST be encrypted at rest using envelope encryption with the master KEK.
+    // Derive a dedicated KEK for OPAQUE server setup via HKDF-SHA512.
+    let opaque_setup_kek = {
+        let master = common::sealed_keys::cached_master_kek();
+        use hkdf::Hkdf;
+        use sha2::Sha512;
+        let hk = Hkdf::<Sha512>::new(Some(b"MILNET-OPAQUE-SETUP-KEK-v1"), master);
+        let mut kek = [0u8; 32];
+        hk.expand(b"opaque-server-setup-encryption", &mut kek)
+            .expect("HKDF expand for OPAQUE setup KEK");
+        kek
+    };
+
+    let credential_store = if let Some(encrypted_bytes) = server_setup_bytes {
+        // Restore existing ServerSetup — decrypt first
         use opaque_ke::ServerSetup;
+        let setup_bytes = {
+            use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
+            use aes_gcm::aead::generic_array::GenericArray;
+            if encrypted_bytes.len() < 12 + 16 {
+                panic!("FATAL: OPAQUE ServerSetup ciphertext too short — data corruption");
+            }
+            let nonce = GenericArray::from_slice(&encrypted_bytes[..12]);
+            let ciphertext = &encrypted_bytes[12..];
+            let cipher = Aes256Gcm::new(GenericArray::from_slice(&opaque_setup_kek));
+            cipher.decrypt(nonce, ciphertext)
+                .expect("FATAL: Failed to decrypt OPAQUE ServerSetup — KEK mismatch or data corruption")
+        };
         let server_setup = ServerSetup::<opaque::opaque_impl::OpaqueCs>::deserialize(&setup_bytes)
             .expect("Failed to deserialize stored ServerSetup");
-        tracing::info!("Restored OPAQUE ServerSetup from database");
+        tracing::info!("Restored and decrypted OPAQUE ServerSetup from database");
         opaque::store::CredentialStore::with_server_setup(server_setup)
     } else {
-        // First run — create new ServerSetup and persist it
+        // First run — create new ServerSetup, encrypt, and persist it
         let store = opaque::store::CredentialStore::new();
         let setup_bytes: Vec<u8> = store.server_setup().serialize().to_vec();
+        let encrypted_bytes = {
+            use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
+            use aes_gcm::aead::generic_array::GenericArray;
+            let cipher = Aes256Gcm::new(GenericArray::from_slice(&opaque_setup_kek));
+            let mut nonce_bytes = [0u8; 12];
+            getrandom::getrandom(&mut nonce_bytes).expect("CSPRNG failure");
+            let nonce = GenericArray::from_slice(&nonce_bytes);
+            let ciphertext = cipher.encrypt(nonce, setup_bytes.as_ref())
+                .expect("AES-256-GCM encryption failed");
+            let mut result = Vec::with_capacity(12 + ciphertext.len());
+            result.extend_from_slice(&nonce_bytes);
+            result.extend_from_slice(&ciphertext);
+            result
+        };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
         sqlx::query("INSERT INTO server_config (key, value, created_at) VALUES ($1, $2, $3)")
             .bind("opaque_server_setup")
-            .bind(&setup_bytes)
+            .bind(&encrypted_bytes)
             .bind(now)
             .execute(&pool)
             .await
-            .expect("Failed to persist ServerSetup");
-        tracing::info!("Created and persisted new OPAQUE ServerSetup");
+            .expect("Failed to persist encrypted ServerSetup");
+        tracing::info!("Created, encrypted, and persisted new OPAQUE ServerSetup");
         store
     };
 

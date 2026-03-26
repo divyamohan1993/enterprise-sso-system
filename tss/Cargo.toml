@@ -20,5 +20,8 @@ tracing-subscriber.workspace = true
 frost-ristretto255.workspace = true
 ml-dsa.workspace = true
 rand.workspace = true
+aes-gcm.workspace = true
+getrandom.workspace = true
+hkdf.workspace = true
 
 [dev-dependencies]

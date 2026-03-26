@@ -328,6 +328,7 @@ impl BftAuditCluster {
         device_ids: Vec<Uuid>,
         risk_score: f64,
         ceremony_receipts: Vec<Receipt>,
+        classification: u8,
     ) -> Result<[u8; 64], String> {
         // Find the first honest node to act as proposer.
         let proposer_idx = self
@@ -368,7 +369,7 @@ impl BftAuditCluster {
                 .as_micros() as i64,
             prev_hash,
             signature: Vec::new(),
-            classification: 0,
+            classification,
         };
 
         if let Some(ref key) = self.pq_signing_key {

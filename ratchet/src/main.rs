@@ -1,4 +1,11 @@
 //! ratchet: Ratchet Session Manager service entry point.
+//!
+//! Operates in two modes:
+//! - **Distributed HA mode** (default): Uses `PersistentSessionManager` backed by
+//!   PostgreSQL with write-through caching. All ratchet chains survive crashes
+//!   and are replicated across instances via Cloud SQL.
+//! - **Standalone mode** (fallback when `DATABASE_URL` is not set): Uses in-memory
+//!   `SessionManager` only. Suitable for development/testing.
 
 #![allow(unsafe_code)]
 
@@ -51,7 +58,50 @@ async fn main() {
 
     tracing::info!("Ratchet Session Manager starting");
 
-    let manager = Arc::new(RwLock::new(ratchet::manager::SessionManager::new()));
+    // Determine operational mode based on DATABASE_URL availability
+    let db_url = std::env::var("DATABASE_URL").ok();
+    let persistent_manager: Option<Arc<RwLock<ratchet::manager::PersistentSessionManager>>>;
+    let standalone_manager: Option<Arc<RwLock<ratchet::manager::SessionManager>>>;
+
+    if let Some(url) = db_url {
+        tracing::info!("DATABASE_URL set — starting in distributed HA mode with PostgreSQL persistence");
+
+        // Connect to Cloud SQL / PostgreSQL
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(10)
+            .connect(&url)
+            .await
+            .expect("Failed to connect to PostgreSQL for ratchet HA persistence");
+
+        // Load KEK from environment (in production, from HSM / sealed storage)
+        let kek_hex = std::env::var("RATCHET_KEK")
+            .expect("RATCHET_KEK must be set in distributed HA mode (64 hex chars = 32 bytes)");
+        let kek_bytes = hex::decode(&kek_hex)
+            .expect("RATCHET_KEK must be valid hex");
+        assert_eq!(kek_bytes.len(), 32, "RATCHET_KEK must be exactly 32 bytes (64 hex chars)");
+        let mut kek = [0u8; 32];
+        kek.copy_from_slice(&kek_bytes);
+
+        // Initialize with startup recovery (loads all sessions from DB)
+        let mgr = ratchet::manager::PersistentSessionManager::new(pool, kek)
+            .await
+            .expect("Failed to initialize PersistentSessionManager with DB recovery");
+
+        tracing::info!(
+            session_count = mgr.session_count(),
+            "distributed HA ratchet manager ready — sessions recovered from PostgreSQL"
+        );
+
+        persistent_manager = Some(Arc::new(RwLock::new(mgr)));
+        standalone_manager = None;
+    } else {
+        tracing::warn!(
+            "DATABASE_URL not set — starting in standalone mode (NO persistence, NO HA). \
+             This is acceptable for development but FATAL-grade in production."
+        );
+        persistent_manager = None;
+        standalone_manager = Some(Arc::new(RwLock::new(ratchet::manager::SessionManager::new())));
+    }
 
     let addr = std::env::var("RATCHET_ADDR").unwrap_or_else(|_| "127.0.0.1:9105".to_string());
     let hmac_key = crypto::entropy::generate_key_64();
@@ -63,11 +113,25 @@ async fn main() {
     tracing::info!("Ratchet Session Manager listening on {addr} (mTLS)");
     loop {
         if let Ok(mut transport) = listener.accept().await {
-            let manager = manager.clone();
+            let pm = persistent_manager.clone();
+            let sm = standalone_manager.clone();
             tokio::spawn(async move {
                 while let Ok((_sender, payload)) = transport.recv().await {
                     let response = match postcard::from_bytes::<RatchetRequest>(&payload) {
-                        Ok(request) => handle_request(&manager, request).await,
+                        Ok(request) => {
+                            if let Some(ref mgr) = pm {
+                                handle_request_persistent(mgr, request).await
+                            } else if let Some(ref mgr) = sm {
+                                handle_request_standalone(mgr, request).await
+                            } else {
+                                RatchetResponse {
+                                    success: false,
+                                    epoch: None,
+                                    tag: None,
+                                    error: Some("no manager configured".into()),
+                                }
+                            }
+                        }
                         Err(e) => RatchetResponse {
                             success: false,
                             epoch: None,
@@ -122,7 +186,8 @@ fn set_pr_dumpable() {
     }
 }
 
-async fn handle_request(
+/// Handle a request using the standalone (in-memory only) session manager.
+async fn handle_request_standalone(
     manager: &Arc<RwLock<ratchet::manager::SessionManager>>,
     request: RatchetRequest,
 ) -> RatchetResponse {
@@ -202,6 +267,99 @@ async fn handle_request(
                 epoch: None,
                 tag: None,
                 error: None,
+            }
+        }
+    }
+}
+
+/// Handle a request using the persistent (write-through PostgreSQL) session manager.
+async fn handle_request_persistent(
+    manager: &Arc<RwLock<ratchet::manager::PersistentSessionManager>>,
+    request: RatchetRequest,
+) -> RatchetResponse {
+    match request.action {
+        RatchetAction::CreateSession { session_id, initial_key } => {
+            if initial_key.len() != 64 {
+                return RatchetResponse {
+                    success: false,
+                    epoch: None,
+                    tag: None,
+                    error: Some("initial_key must be exactly 64 bytes".into()),
+                };
+            }
+            let mut secret = [0u8; 64];
+            secret.copy_from_slice(&initial_key);
+            let mgr = manager.write().await;
+            match mgr.create_session(session_id, &secret).await {
+                Ok(epoch) => RatchetResponse {
+                    success: true,
+                    epoch: Some(epoch),
+                    tag: None,
+                    error: None,
+                },
+                Err(e) => RatchetResponse {
+                    success: false,
+                    epoch: None,
+                    tag: None,
+                    error: Some(e),
+                },
+            }
+        }
+        RatchetAction::Advance {
+            session_id,
+            client_entropy,
+            server_entropy,
+            server_nonce,
+        } => {
+            let mgr = manager.write().await;
+            match mgr.advance_session(&session_id, &client_entropy, &server_entropy, &server_nonce).await
+            {
+                Ok(epoch) => RatchetResponse {
+                    success: true,
+                    epoch: Some(epoch),
+                    tag: None,
+                    error: None,
+                },
+                Err(e) => RatchetResponse {
+                    success: false,
+                    epoch: None,
+                    tag: None,
+                    error: Some(e),
+                },
+            }
+        }
+        RatchetAction::GetTag { session_id, claims_bytes } => {
+            let mgr = manager.read().await;
+            match mgr.generate_tag(&session_id, &claims_bytes) {
+                Ok(tag) => RatchetResponse {
+                    success: true,
+                    epoch: None,
+                    tag: Some(tag.to_vec()),
+                    error: None,
+                },
+                Err(e) => RatchetResponse {
+                    success: false,
+                    epoch: None,
+                    tag: None,
+                    error: Some(e),
+                },
+            }
+        }
+        RatchetAction::Destroy { session_id } => {
+            let mgr = manager.write().await;
+            match mgr.destroy_session(&session_id).await {
+                Ok(()) => RatchetResponse {
+                    success: true,
+                    epoch: None,
+                    tag: None,
+                    error: None,
+                },
+                Err(e) => RatchetResponse {
+                    success: false,
+                    epoch: None,
+                    tag: None,
+                    error: Some(e),
+                },
             }
         }
     }

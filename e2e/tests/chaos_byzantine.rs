@@ -28,6 +28,7 @@ fn propose(cluster: &mut BftAuditCluster) -> Result<[u8; 64], String> {
         vec![Uuid::new_v4()],
         0.1,
         vec![],
+        0, // Unclassified default for chaos tests
     )
 }
 

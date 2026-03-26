@@ -834,8 +834,10 @@ BellLaPadulaNoReadUp ==
     \A entry \in accessLog :
         entry.allowed = TRUE =>
             entry.resource \in DOMAIN dataClassification =>
-                userClearance[entry.user] >= dataClassification[entry.resource]
-                \/ TRUE  \* Write accesses have different rule
+                \* Simple Security Property: no read up
+                \/ (entry.op = "read" /\ userClearance[entry.user] >= dataClassification[entry.resource])
+                \* Star Property: no write down
+                \/ (entry.op = "write" /\ userClearance[entry.user] <= dataClassification[entry.resource])
 
 \* SAFETY 8: Revoked tokens never verified
 RevokedTokenNeverVerified ==
@@ -927,8 +929,7 @@ PIMNoSelfApproval ==
 \* in the future from *any* global step at which it could have been issued.
 PIMTimeBoundedElevation ==
     \A tok \in tokens :
-        tok.expiry_step <= tok.expiry_step  \* Tautology as placeholder: real invariant is
-                                             \* that no expiry_step ever exceeds issuance + 10
+        tok.expiry_step <= tok.issued_step + 10
 
 \* SAFETY 18: Continuous Access Evaluation (CAE) — session re-evaluated on
 \* risk change.

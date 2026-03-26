@@ -82,8 +82,24 @@ async fn main() {
             .expect("no private key found in PEM file");
 
         // CNSA 2.0 compliant: TLS 1.3 only with AES-256-GCM-SHA384
+        // Post-quantum hybrid key exchange: X25519MLKEM768 preferred, X25519 fallback.
+        // Set MILNET_PQ_TLS_ONLY=1 to remove classical fallback (CNSA 2.0 strict).
+        let pq_only = std::env::var("MILNET_PQ_TLS_ONLY")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let kx_groups: Vec<&'static dyn rustls::crypto::SupportedKxGroup> = if pq_only {
+            vec![
+                rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768,
+            ]
+        } else {
+            vec![
+                rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768,
+                rustls::crypto::aws_lc_rs::kx_group::X25519,
+            ]
+        };
         let provider = rustls::crypto::CryptoProvider {
             cipher_suites: vec![rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_256_GCM_SHA384],
+            kx_groups,
             ..rustls::crypto::aws_lc_rs::default_provider()
         };
 
