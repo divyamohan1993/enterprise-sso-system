@@ -774,7 +774,7 @@ fn test_ratchet_forward_secrecy() {
     for _ in 0..10 {
         let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];
         getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
-        chain.advance(&ce, &se, &sn);
+        chain.advance(&ce, &se, &sn).unwrap();
     }
 
     assert!(
@@ -792,7 +792,7 @@ fn test_ratchet_within_lookahead_window() {
     for _ in 0..7 {
         let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];
         getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
-        chain.advance(&ce, &se, &sn);
+        chain.advance(&ce, &se, &sn).unwrap();
     }
     assert_eq!(chain.epoch(), 7);
 
@@ -803,7 +803,7 @@ fn test_ratchet_within_lookahead_window() {
     for _ in 0..2 {
         let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];
         getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
-        chain.advance(&ce, &se, &sn);
+        chain.advance(&ce, &se, &sn).unwrap();
     }
     assert_eq!(chain.epoch(), 9);
 
@@ -814,7 +814,7 @@ fn test_ratchet_within_lookahead_window() {
     for _ in 0..2 {
         let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];
         getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
-        chain.advance(&ce, &se, &sn);
+        chain.advance(&ce, &se, &sn).unwrap();
     }
     assert_eq!(chain.epoch(), 11);
     assert!(
@@ -832,7 +832,7 @@ fn test_ratchet_session_expires_at_8_hours() {
     for _ in 0..2879 {
         let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];
         getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
-        chain.advance(&ce, &se, &sn);
+        chain.advance(&ce, &se, &sn).unwrap();
     }
     assert!(!chain.is_expired(), "chain should not be expired at epoch 2879");
 
@@ -840,7 +840,7 @@ fn test_ratchet_session_expires_at_8_hours() {
     {
         let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];
         getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
-        chain.advance(&ce, &se, &sn);
+        chain.advance(&ce, &se, &sn).unwrap();
     }
     assert_eq!(chain.epoch(), 2880);
     assert!(chain.is_expired(), "chain must be expired at epoch 2880 (8h at 10s)");
@@ -864,12 +864,12 @@ fn test_cloned_ratchet_state_diverges() {
     {
         let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];
         getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
-        chain_a.advance(&ce, &se, &sn);
+        chain_a.advance(&ce, &se, &sn).unwrap();
     }
     {
         let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];
         getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
-        chain_b.advance(&ce, &se, &sn);
+        chain_b.advance(&ce, &se, &sn).unwrap();
     }
 
     let tag_a1 = chain_a.generate_tag(claims_bytes);
@@ -895,12 +895,12 @@ fn test_ratchet_different_entropy_different_chains() {
     {
         let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];
         getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
-        chain_a.advance(&ce, &se, &sn);
+        chain_a.advance(&ce, &se, &sn).unwrap();
     }
     {
         let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];
         getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
-        chain_b.advance(&ce, &se, &sn);
+        chain_b.advance(&ce, &se, &sn).unwrap();
     }
 
     let claims = b"same-claims";

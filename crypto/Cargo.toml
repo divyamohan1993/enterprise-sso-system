@@ -39,6 +39,7 @@ pbkdf2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 hex.workspace = true
+postcard.workspace = true
 
 [dev-dependencies]
 hex = "0.4"

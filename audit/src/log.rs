@@ -26,9 +26,6 @@ pub struct AuditResponse {
     pub error: Option<String>,
 }
 
-/// How often (in number of appended entries) to run automatic chain verification.
-const VERIFY_CHAIN_INTERVAL: usize = 10;
-
 /// Default maximum entries to keep in memory before triggering archival.
 const DEFAULT_MAX_ENTRIES: usize = 100_000;
 
@@ -187,7 +184,7 @@ impl AuditLog {
         entry.signature = crypto::pq_sign::pq_sign_raw(signing_key, &hash);
         self.last_hash = hash;
         self.entries.push(entry);
-        self.periodic_verify();
+        self.incremental_verify();
         self.auto_archive();
         self.enforce_retention();
         self.entries.last().unwrap()
@@ -271,7 +268,7 @@ impl AuditLog {
         entry.signature = crypto::pq_sign::pq_sign_raw(signing_key, &hash);
         self.last_hash = hash;
         self.entries.push(entry);
-        self.periodic_verify();
+        self.incremental_verify();
         self.auto_archive();
         self.enforce_retention();
         self.entries.last().unwrap()
@@ -286,7 +283,7 @@ impl AuditLog {
         }
         self.last_hash = hash_entry(&entry);
         self.entries.push(entry);
-        self.periodic_verify();
+        self.incremental_verify();
         self.auto_archive();
         Ok(())
     }
@@ -545,22 +542,34 @@ impl AuditLog {
         })
     }
 
-    /// Run `verify_chain()` every `VERIFY_CHAIN_INTERVAL` entries.
-    /// If verification fails, log a CRITICAL error and set `tamper_detected`.
-    fn periodic_verify(&mut self) {
-        if self.entries.len() % VERIFY_CHAIN_INTERVAL == 0 {
-            if !self.verify_chain() {
-                self.tamper_detected = true;
-                tracing::error!(
-                    "CRITICAL: audit log chain verification FAILED at entry {}. \
-                     Possible tampering detected!",
-                    self.entries.len()
-                );
-                common::siem::SecurityEvent::tamper_detected(
-                    &format!("audit log chain verification FAILED at entry {}", self.entries.len())
-                );
-            }
+    /// Incremental chain verification — only checks the LAST entry against prev_hash.
+    /// Full chain verification runs in background, not in the hot path.
+    fn incremental_verify(&mut self) {
+        if self.entries.len() < 2 {
+            return;
         }
+        let last = &self.entries[self.entries.len() - 1];
+        let prev = &self.entries[self.entries.len() - 2];
+        let expected_prev = hash_entry(prev);
+        if last.prev_hash != expected_prev {
+            self.tamper_detected = true;
+            tracing::error!(
+                target: "siem",
+                event = "audit_tamper_detected",
+                "SECURITY: Hash chain linkage broken at entry {}",
+                self.entries.len() - 1
+            );
+        }
+    }
+
+    /// Full chain verification — intended for background/scheduled use, NOT hot path.
+    /// Call this from a background tokio task every N minutes.
+    pub fn background_verify_chain(&mut self) -> bool {
+        let result = self.verify_chain();
+        if !result {
+            self.tamper_detected = true;
+        }
+        result
     }
 
     /// Trigger automatic archival when entries exceed max_entries.

@@ -10,9 +10,43 @@ use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::Sha512;
 use subtle::ConstantTimeEq;
+use std::collections::{HashSet, VecDeque};
 use zeroize::Zeroize;
 
 type HmacSha512 = Hmac<Sha512>;
+
+/// Errors from ratchet chain operations. All errors are fail-closed:
+/// the ratchet chain is NOT advanced and the session should be terminated.
+#[derive(Debug, Clone)]
+pub enum RatchetError {
+    /// Entropy source provided all-zero bytes.
+    ZeroEntropy(String),
+    /// Entropy source failed quality check (insufficient distinct bytes).
+    LowQualityEntropy(String),
+    /// Epoch counter would wrap around (session must be terminated).
+    EpochOverflow,
+    /// Server nonce reuse detected — potential clone/replay attack.
+    NonceReuse(String),
+    /// Canary violation — memory corruption detected.
+    CanaryViolation,
+    /// mlock failed in production mode.
+    MlockFailed(String),
+}
+
+impl std::fmt::Display for RatchetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroEntropy(src) => write!(f, "ratchet: {src} must not be all-zero"),
+            Self::LowQualityEntropy(src) => write!(f, "ratchet: {src} fails entropy quality check"),
+            Self::EpochOverflow => write!(f, "ratchet: epoch counter would overflow"),
+            Self::NonceReuse(detail) => write!(f, "ratchet: nonce reuse detected ({detail})"),
+            Self::CanaryViolation => write!(f, "ratchet: memory canary violation detected"),
+            Self::MlockFailed(detail) => write!(f, "ratchet: mlock failed ({detail})"),
+        }
+    }
+}
+
+impl std::error::Error for RatchetError {}
 
 /// Maximum lookahead/lookbehind window for epoch verification.
 const EPOCH_WINDOW: u64 = 3;
@@ -198,9 +232,11 @@ pub struct RatchetChain {
     /// Each entry is (epoch, key). Oldest entries are evicted when the
     /// buffer exceeds `EPOCH_WINDOW` entries.
     recent_keys: Vec<(u64, [u8; 64])>,
-    /// Recent server nonces for clone detection. Tracks last N nonces
-    /// and rejects any advancement that reuses one.
-    recent_nonces: Vec<[u8; 32]>,
+    /// Recent server nonces for clone detection (ordered for FIFO eviction).
+    /// Uses VecDeque for O(1) push_back/pop_front instead of Vec::remove(0).
+    recent_nonces: VecDeque<[u8; 32]>,
+    /// Hash set mirroring recent_nonces for O(1) lookup instead of O(n) scan.
+    recent_nonces_set: HashSet<[u8; 32]>,
     /// Bloom filter for probabilistic detection of nonce reuse beyond
     /// the exact `recent_nonces` window.  Nonces are added to the filter
     /// as they age out of the exact-match deque.
@@ -216,7 +252,11 @@ impl Zeroize for RatchetChain {
             entry.1.zeroize();
         }
         self.recent_keys.clear();
-        self.recent_nonces.zeroize();
+        for nonce in self.recent_nonces.iter_mut() {
+            nonce.zeroize();
+        }
+        self.recent_nonces.clear();
+        self.recent_nonces_set.clear();
         self.nonce_bloom.zeroize();
         self.canary_head.zeroize();
         self.canary_tail.zeroize();
@@ -234,28 +274,28 @@ impl RatchetChain {
         (h & t).into()
     }
 
-    /// Assert canary integrity, panicking with zeroization on violation.
-    fn assert_canaries(&self) {
+    /// Check canary integrity, returning an error on violation.
+    /// On violation, key material is zeroized before returning.
+    fn check_canaries(&self) -> Result<(), RatchetError> {
         if !self.verify_canaries() {
             tracing::error!(
                 "SECURITY: canary violation detected in RatchetChain (epoch={}) — \
                  possible buffer overflow or use-after-free. Zeroizing key material.",
                 self.epoch
             );
-            // Zeroize before panic — we need unsafe to mutate through shared ref
-            // because the chain is about to be destroyed and key material MUST be cleared.
+            // Zeroize before returning — we need unsafe to mutate through shared ref
+            // because key material MUST be cleared on corruption detection.
             unsafe {
                 let key_ptr = &self.chain_key as *const [u8; 64] as *mut [u8; 64];
                 (*key_ptr).zeroize();
             }
-            panic!(
-                "SECURITY: canary violation in RatchetChain — possible buffer overflow"
-            );
+            return Err(RatchetError::CanaryViolation);
         }
+        Ok(())
     }
 
     /// Apply mlock and MADV_DONTDUMP to the chain_key region.
-    fn lock_chain_key(&mut self) {
+    fn lock_chain_key(&mut self) -> Result<(), RatchetError> {
         let ptr = self.chain_key.as_ptr();
         let len = self.chain_key.len();
         if mlock_region(ptr, len) {
@@ -263,20 +303,21 @@ impl RatchetChain {
             madv_dontdump(ptr, len);
         } else {
             if common::sealed_keys::is_production() {
-                panic!(
-                    "FATAL: mlock failed for RatchetChain chain_key in production mode. \
-                     Ensure RLIMIT_MEMLOCK is sufficient."
-                );
+                return Err(RatchetError::MlockFailed(
+                    "mlock failed for RatchetChain chain_key in production mode. \
+                     Ensure RLIMIT_MEMLOCK is sufficient.".into(),
+                ));
             }
             tracing::warn!(
                 "mlock failed for RatchetChain chain_key — data may be swappable to disk"
             );
         }
+        Ok(())
     }
 
     /// Create a new chain from a master secret.
     ///
-    /// Returns an error if the OS CSPRNG is unavailable (entropy exhaustion).
+    /// Returns an error if the OS CSPRNG is unavailable or mlock fails in production.
     pub fn new(master_secret: &[u8; 64]) -> Result<Self, String> {
         let hk = Hkdf::<Sha512>::new(None, master_secret);
         let mut chain_key = [0u8; 64];
@@ -296,10 +337,11 @@ impl RatchetChain {
             epoch: 0,
             max_epoch_lifetime: 2880,
             recent_keys: Vec::new(),
-            recent_nonces: Vec::new(),
+            recent_nonces: VecDeque::new(),
+            recent_nonces_set: HashSet::new(),
             nonce_bloom: NonceBloomFilter::new(),
         };
-        chain.lock_chain_key();
+        chain.lock_chain_key().map_err(|e| e.to_string())?;
         Ok(chain)
     }
 
@@ -311,18 +353,20 @@ impl RatchetChain {
     /// `server_nonce` is a unique nonce from the server for this advancement,
     /// mixed into the derivation and tracked to prevent clone attacks.
     ///
-    /// # Panics
-    /// - If either entropy source is all-zero
-    /// - If either entropy source fails quality check (<4 distinct byte values)
-    /// - If `server_nonce` was already used in a recent advancement
-    /// - If epoch would wrap around u64::MAX
+    /// # Errors
+    /// Returns `RatchetError` (fail-closed) if:
+    /// - Either entropy source is all-zero
+    /// - Either entropy source fails quality check (<4 distinct byte values)
+    /// - `server_nonce` was already used in a recent advancement
+    /// - Epoch would wrap around u64::MAX
+    /// - Memory canary violation detected
     pub fn advance(
         &mut self,
         client_entropy: &[u8; 32],
         server_entropy: &[u8; 32],
         server_nonce: &[u8; 32],
-    ) {
-        self.assert_canaries();
+    ) -> Result<(), RatchetError> {
+        self.check_canaries()?;
 
         // --- Entropy validation ---
 
@@ -332,14 +376,14 @@ impl RatchetChain {
                 epoch = self.epoch,
                 "SIEM:CRITICAL ratchet advancement rejected: client_entropy is all-zero"
             );
-            panic!("ratchet: client_entropy must not be all-zero");
+            return Err(RatchetError::ZeroEntropy("client_entropy".into()));
         }
         if is_all_zero(server_entropy) {
             tracing::error!(
                 epoch = self.epoch,
                 "SIEM:CRITICAL ratchet advancement rejected: server_entropy is all-zero"
             );
-            panic!("ratchet: server_entropy must not be all-zero");
+            return Err(RatchetError::ZeroEntropy("server_entropy".into()));
         }
 
         // Entropy quality check
@@ -349,7 +393,7 @@ impl RatchetChain {
                 "SIEM:CRITICAL ratchet advancement rejected: client_entropy has insufficient \
                  randomness (fewer than {MIN_DISTINCT_BYTES} distinct byte values)"
             );
-            panic!("ratchet: client_entropy fails quality check");
+            return Err(RatchetError::LowQualityEntropy("client_entropy".into()));
         }
         if !entropy_quality_ok(server_entropy) {
             tracing::error!(
@@ -357,7 +401,7 @@ impl RatchetChain {
                 "SIEM:CRITICAL ratchet advancement rejected: server_entropy has insufficient \
                  randomness (fewer than {MIN_DISTINCT_BYTES} distinct byte values)"
             );
-            panic!("ratchet: server_entropy fails quality check");
+            return Err(RatchetError::LowQualityEntropy("server_entropy".into()));
         }
 
         // --- Monotonicity check ---
@@ -365,21 +409,19 @@ impl RatchetChain {
             tracing::error!(
                 "SIEM:CRITICAL ratchet epoch counter at u64::MAX — refusing to wrap"
             );
-            panic!("ratchet: epoch counter would wrap around at u64::MAX");
+            return Err(RatchetError::EpochOverflow);
         }
 
         // --- Anti-clone nonce check (exact window + Bloom filter) ---
 
-        // Check exact-match window (last NONCE_HISTORY_SIZE nonces)
-        for existing in &self.recent_nonces {
-            if crypto::ct::ct_eq_32(existing, server_nonce) {
-                tracing::error!(
-                    epoch = self.epoch,
-                    "SIEM:CRITICAL ratchet advancement rejected: server_nonce reuse detected \
-                     in exact window — possible token cloning attack"
-                );
-                panic!("ratchet: server_nonce reuse detected (clone attack)");
-            }
+        // Check exact-match window (last NONCE_HISTORY_SIZE nonces) — O(1) lookup
+        if self.recent_nonces_set.contains(server_nonce) {
+            tracing::error!(
+                epoch = self.epoch,
+                "SIEM:CRITICAL ratchet advancement rejected: server_nonce reuse detected \
+                 in exact window — possible token cloning attack"
+            );
+            return Err(RatchetError::NonceReuse("exact match in recent history".into()));
         }
 
         // Check Bloom filter for older nonces beyond the exact window.
@@ -392,19 +434,22 @@ impl RatchetChain {
                 "SIEM:CRITICAL ratchet advancement rejected: server_nonce reuse detected \
                  via Bloom filter — possible token cloning attack (historical nonce)"
             );
-            panic!("ratchet: server_nonce reuse detected via Bloom filter (clone attack)");
+            return Err(RatchetError::NonceReuse("clone attack — Bloom filter".into()));
         }
 
-        // Track this nonce in the exact window
-        self.recent_nonces.push(*server_nonce);
-
-        // When evicting nonces from the exact window, add them to the Bloom filter
-        while self.recent_nonces.len() > NONCE_HISTORY_SIZE {
-            let evicted = self.recent_nonces[0];
-            self.nonce_bloom.insert(&evicted);
-            self.recent_nonces[0].zeroize();
-            self.recent_nonces.remove(0);
+        // O(1) eviction with VecDeque + HashSet
+        if self.recent_nonces.len() >= NONCE_HISTORY_SIZE {
+            if let Some(mut evicted) = self.recent_nonces.pop_front() {
+                self.recent_nonces_set.remove(&evicted);
+                // Move to bloom filter for probabilistic detection beyond exact window
+                self.nonce_bloom.insert(&evicted);
+                evicted.zeroize();
+            }
         }
+
+        // Track this nonce in the exact window — O(1) insert into both structures
+        self.recent_nonces.push_back(*server_nonce);
+        self.recent_nonces_set.insert(*server_nonce);
 
         // --- Store current key in recent_keys before overwriting ---
         self.recent_keys.push((self.epoch, self.chain_key));
@@ -434,16 +479,20 @@ impl RatchetChain {
         self.epoch += 1;
 
         // Re-lock the new key
-        self.lock_chain_key();
+        self.lock_chain_key()?;
 
         info.zeroize();
         new_key.zeroize();
+        Ok(())
     }
 
     /// Generate a ratchet tag (HMAC-SHA512) for the current epoch.
-    pub fn generate_tag(&self, claims_bytes: &[u8]) -> [u8; 64] {
-        self.assert_canaries();
-        Self::generate_tag_with_key(&self.chain_key, claims_bytes, self.epoch)
+    ///
+    /// # Errors
+    /// Returns `RatchetError::CanaryViolation` if memory corruption is detected.
+    pub fn generate_tag(&self, claims_bytes: &[u8]) -> Result<[u8; 64], RatchetError> {
+        self.check_canaries()?;
+        Ok(Self::generate_tag_with_key(&self.chain_key, claims_bytes, self.epoch))
     }
 
     /// Generate a ratchet tag using an explicit key and epoch.
@@ -530,18 +579,21 @@ impl RatchetChain {
     ///   keys temporarily without advancing the actual chain.
     ///
     /// All paths use constant-time comparison.
-    pub fn verify_tag(&self, claims_bytes: &[u8], tag: &[u8; 64], token_epoch: u64) -> bool {
-        self.assert_canaries();
+    ///
+    /// # Errors
+    /// Returns `RatchetError::CanaryViolation` if memory corruption is detected.
+    pub fn verify_tag(&self, claims_bytes: &[u8], tag: &[u8; 64], token_epoch: u64) -> Result<bool, RatchetError> {
+        self.check_canaries()?;
 
         let epoch_diff = token_epoch.abs_diff(self.epoch);
         if epoch_diff > EPOCH_WINDOW {
-            return false;
+            return Ok(false);
         }
 
         // Exact match: verify with current key
         if token_epoch == self.epoch {
-            let expected = self.generate_tag(claims_bytes);
-            return crypto::ct::ct_eq_64(tag, &expected);
+            let expected = self.generate_tag(claims_bytes)?;
+            return Ok(crypto::ct::ct_eq_64(tag, &expected));
         }
 
         // Past epoch: look up in recent_keys cache
@@ -550,11 +602,11 @@ impl RatchetChain {
                 if *cached_epoch == token_epoch {
                     let expected =
                         Self::generate_tag_with_key(cached_key, claims_bytes, token_epoch);
-                    return crypto::ct::ct_eq_64(tag, &expected);
+                    return Ok(crypto::ct::ct_eq_64(tag, &expected));
                 }
             }
             // Key not in cache (was evicted or chain was just created)
-            return false;
+            return Ok(false);
         }
 
         // Future epoch: derive forward without advancing the real chain
@@ -562,7 +614,7 @@ impl RatchetChain {
         let mut forward_key = Self::derive_forward_key(&self.chain_key, steps);
         let expected = Self::generate_tag_with_key(&forward_key, claims_bytes, token_epoch);
         forward_key.zeroize();
-        crypto::ct::ct_eq_64(tag, &expected)
+        Ok(crypto::ct::ct_eq_64(tag, &expected))
     }
 
     /// Current epoch of this chain.
@@ -593,17 +645,21 @@ impl RatchetChain {
             epoch,
             max_epoch_lifetime: 2880,
             recent_keys: Vec::new(),
-            recent_nonces: Vec::new(),
+            recent_nonces: VecDeque::new(),
+            recent_nonces_set: HashSet::new(),
             nonce_bloom: NonceBloomFilter::new(),
         };
-        chain.lock_chain_key();
+        chain.lock_chain_key().map_err(|e| e.to_string())?;
         Ok(chain)
     }
 
     /// Return a copy of the current chain key for persistence (must be encrypted before storage).
-    pub fn current_key(&self) -> [u8; 64] {
-        self.assert_canaries();
-        self.chain_key
+    ///
+    /// # Errors
+    /// Returns `RatchetError::CanaryViolation` if memory corruption is detected.
+    pub fn current_key(&self) -> Result<[u8; 64], RatchetError> {
+        self.check_canaries()?;
+        Ok(self.chain_key)
     }
 }
 
@@ -619,7 +675,11 @@ impl Drop for RatchetChain {
         self.recent_keys.clear();
 
         // 3. Zeroize nonce history + Bloom filter
-        self.recent_nonces.zeroize();
+        for nonce in self.recent_nonces.iter_mut() {
+            nonce.zeroize();
+        }
+        self.recent_nonces.clear();
+        self.recent_nonces_set.clear();
         self.nonce_bloom.zeroize();
 
         // 4. Unlock if locked

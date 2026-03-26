@@ -449,3 +449,328 @@ pub struct RiskResponse {
     pub step_up_required: bool,
     pub session_terminate: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn clean_signals() -> RiskSignals {
+        RiskSignals {
+            device_attestation_age_secs: 0.0,
+            geo_velocity_kmh: 0.0,
+            is_unusual_network: false,
+            is_unusual_time: false,
+            unusual_access_score: 0.0,
+            recent_failed_attempts: 0,
+            login_hour: None,
+            network_id: None,
+            session_duration_secs: None,
+        }
+    }
+
+    // -- Risk level threshold tests --
+
+    #[test]
+    fn test_classify_normal_below_03() {
+        let engine = RiskEngine::new();
+        assert_eq!(engine.classify(0.0), RiskLevel::Normal);
+        assert_eq!(engine.classify(0.1), RiskLevel::Normal);
+        assert_eq!(engine.classify(0.29), RiskLevel::Normal);
+    }
+
+    #[test]
+    fn test_classify_elevated_03_to_06() {
+        let engine = RiskEngine::new();
+        assert_eq!(engine.classify(0.3), RiskLevel::Elevated);
+        assert_eq!(engine.classify(0.45), RiskLevel::Elevated);
+        assert_eq!(engine.classify(0.59), RiskLevel::Elevated);
+    }
+
+    #[test]
+    fn test_classify_high_06_to_08() {
+        let engine = RiskEngine::new();
+        assert_eq!(engine.classify(0.6), RiskLevel::High);
+        assert_eq!(engine.classify(0.7), RiskLevel::High);
+        assert_eq!(engine.classify(0.79), RiskLevel::High);
+    }
+
+    #[test]
+    fn test_classify_critical_above_08() {
+        let engine = RiskEngine::new();
+        assert_eq!(engine.classify(0.8), RiskLevel::Critical);
+        assert_eq!(engine.classify(0.9), RiskLevel::Critical);
+        assert_eq!(engine.classify(1.0), RiskLevel::Critical);
+    }
+
+    // -- Risk score computation tests --
+
+    #[test]
+    fn test_clean_signals_mimicry_penalty() {
+        let engine = RiskEngine::new();
+        let user = Uuid::new_v4();
+        let score = engine.compute_score(&user, &clean_signals());
+        // All-zero signals trigger the mimicry detection penalty (+0.05)
+        // plus random noise [0.0, 0.03), so score in [0.05, 0.08)
+        assert!(
+            score >= 0.05 && score < 0.08,
+            "clean signals should trigger mimicry penalty: got {score}"
+        );
+    }
+
+    #[test]
+    fn test_impossible_geo_velocity_max_risk() {
+        let engine = RiskEngine::new();
+        let user = Uuid::new_v4();
+        let mut signals = clean_signals();
+        // > 10,000 km/h is physically impossible and returns 1.0 immediately
+        signals.geo_velocity_kmh = 15_000.0;
+        let score = engine.compute_score(&user, &signals);
+        assert!(
+            (score - 1.0).abs() < f64::EPSILON,
+            "impossible velocity should return 1.0, got {score}"
+        );
+    }
+
+    #[test]
+    fn test_stale_device_attestation() {
+        let engine = RiskEngine::new();
+        let user = Uuid::new_v4();
+        let mut signals = clean_signals();
+        signals.device_attestation_age_secs = 7200.0; // > 3600
+        let score = engine.compute_score(&user, &signals);
+        // 0.25 (stale attestation) + noise
+        assert!(score >= 0.25, "stale attestation should add at least 0.25, got {score}");
+    }
+
+    #[test]
+    fn test_moderate_device_attestation() {
+        let engine = RiskEngine::new();
+        let user = Uuid::new_v4();
+        let mut signals = clean_signals();
+        signals.device_attestation_age_secs = 400.0; // > 300, < 3600
+        let score = engine.compute_score(&user, &signals);
+        assert!(score >= 0.10, "moderate attestation should add at least 0.10, got {score}");
+    }
+
+    #[test]
+    fn test_server_side_failed_attempts() {
+        let engine = RiskEngine::new();
+        let user = Uuid::new_v4();
+
+        // Record 5 server-side failures
+        for _ in 0..5 {
+            engine.record_failed_attempt(&user);
+        }
+
+        let mut signals = clean_signals();
+        // Set a non-zero field to avoid mimicry penalty interfering
+        signals.device_attestation_age_secs = 1.0;
+        let score = engine.compute_score(&user, &signals);
+        // 5/5 * 0.15 = 0.15 from failed attempts + noise
+        assert!(score >= 0.15, "5 failed attempts should add at least 0.15, got {score}");
+    }
+
+    #[test]
+    fn test_client_supplied_failed_attempts_ignored() {
+        let engine = RiskEngine::new();
+        let user = Uuid::new_v4();
+        let mut signals = clean_signals();
+        // Client claims 100 failed attempts, but no server-side failures recorded
+        signals.recent_failed_attempts = 100;
+        signals.device_attestation_age_secs = 1.0; // avoid mimicry
+        let score = engine.compute_score(&user, &signals);
+        // Should NOT include failed attempts contribution since server counter is 0
+        assert!(score < 0.15, "client-supplied failures should be ignored, got {score}");
+    }
+
+    #[test]
+    fn test_signal_validation_negative_values_clamped() {
+        let engine = RiskEngine::new();
+        let signals = RiskSignals {
+            device_attestation_age_secs: -100.0,
+            geo_velocity_kmh: -50.0,
+            is_unusual_network: false,
+            is_unusual_time: false,
+            unusual_access_score: -0.5,
+            recent_failed_attempts: 0,
+            login_hour: None,
+            network_id: None,
+            session_duration_secs: Some(-10.0),
+        };
+        let validated = engine.validate_signals(&signals);
+        assert_eq!(validated.device_attestation_age_secs, 0.0);
+        assert_eq!(validated.geo_velocity_kmh, 0.0);
+        assert_eq!(validated.unusual_access_score, 0.0);
+        assert_eq!(validated.session_duration_secs, Some(0.0));
+    }
+
+    #[test]
+    fn test_signal_validation_unusual_access_score_clamped() {
+        let engine = RiskEngine::new();
+        let mut signals = clean_signals();
+        signals.unusual_access_score = 5.0; // above 1.0 max
+        let validated = engine.validate_signals(&signals);
+        assert_eq!(validated.unusual_access_score, 1.0);
+    }
+
+    #[test]
+    fn test_login_hour_clamped_to_23() {
+        let engine = RiskEngine::new();
+        let mut signals = clean_signals();
+        signals.login_hour = Some(99);
+        let validated = engine.validate_signals(&signals);
+        assert_eq!(validated.login_hour, Some(23));
+    }
+
+    // -- Fail-secure behavior tests --
+
+    #[test]
+    fn test_score_always_capped_at_1() {
+        let engine = RiskEngine::new();
+        let user = Uuid::new_v4();
+        // Max out all signals
+        for _ in 0..10 {
+            engine.record_failed_attempt(&user);
+        }
+        let signals = RiskSignals {
+            device_attestation_age_secs: 100000.0,
+            geo_velocity_kmh: 5000.0,
+            is_unusual_network: true,
+            is_unusual_time: true,
+            unusual_access_score: 1.0,
+            recent_failed_attempts: 100,
+            login_hour: None,
+            network_id: None,
+            session_duration_secs: None,
+        };
+        let score = engine.compute_score(&user, &signals);
+        assert!(score <= 1.0, "score should never exceed 1.0, got {score}");
+    }
+
+    #[test]
+    fn test_score_always_non_negative() {
+        let engine = RiskEngine::new();
+        let user = Uuid::new_v4();
+        let score = engine.compute_score(&user, &clean_signals());
+        assert!(score >= 0.0, "score should never be negative, got {score}");
+    }
+
+    // -- Lockout tests --
+
+    #[test]
+    fn test_lockout_after_max_attempts() {
+        let engine = RiskEngine::new();
+        let user = Uuid::new_v4();
+        let max_attempts = 5u32;
+
+        assert!(!engine.is_locked_out(&user, max_attempts));
+
+        for _ in 0..max_attempts {
+            engine.record_failed_attempt(&user);
+        }
+
+        assert!(engine.is_locked_out(&user, max_attempts));
+    }
+
+    #[test]
+    fn test_not_locked_out_below_threshold() {
+        let engine = RiskEngine::new();
+        let user = Uuid::new_v4();
+
+        for _ in 0..3 {
+            engine.record_failed_attempt(&user);
+        }
+
+        assert!(!engine.is_locked_out(&user, 5));
+    }
+
+    #[test]
+    fn test_lockout_different_users_independent() {
+        let engine = RiskEngine::new();
+        let user1 = Uuid::new_v4();
+        let user2 = Uuid::new_v4();
+
+        for _ in 0..5 {
+            engine.record_failed_attempt(&user1);
+        }
+
+        assert!(engine.is_locked_out(&user1, 5));
+        assert!(!engine.is_locked_out(&user2, 5));
+    }
+
+    // -- Step-up and termination tests --
+
+    #[test]
+    fn test_step_up_threshold() {
+        let engine = RiskEngine::new();
+        assert!(!engine.requires_step_up(0.59));
+        assert!(engine.requires_step_up(0.6));
+        assert!(engine.requires_step_up(1.0));
+    }
+
+    #[test]
+    fn test_termination_threshold() {
+        let engine = RiskEngine::new();
+        assert!(!engine.requires_termination(0.79));
+        assert!(engine.requires_termination(0.8));
+        assert!(engine.requires_termination(1.0));
+    }
+
+    // -- Baseline store tests --
+
+    #[test]
+    fn test_baseline_store_no_baseline_zero_anomaly() {
+        let store = BaselineStore::new();
+        let user = Uuid::new_v4();
+        let score = store.compute_anomaly_score(&user, &clean_signals());
+        assert_eq!(score, 0.0, "no baseline should produce zero anomaly");
+    }
+
+    #[test]
+    fn test_baseline_store_update_creates_baseline() {
+        let store = BaselineStore::new();
+        let user = Uuid::new_v4();
+        let signals = RiskSignals {
+            device_attestation_age_secs: 0.0,
+            geo_velocity_kmh: 0.0,
+            is_unusual_network: false,
+            is_unusual_time: false,
+            unusual_access_score: 0.0,
+            recent_failed_attempts: 0,
+            login_hour: Some(10),
+            network_id: Some("AS1234".to_string()),
+            session_duration_secs: Some(300.0),
+        };
+        store.update_baseline(user, &signals);
+        let baseline = store.get_baseline(&user);
+        assert!(baseline.is_some(), "baseline should exist after update");
+    }
+
+    #[test]
+    fn test_baseline_unknown_network_adds_anomaly() {
+        let store = BaselineStore::new();
+        let user = Uuid::new_v4();
+
+        // Establish baseline with known network
+        let signals = RiskSignals {
+            device_attestation_age_secs: 0.0,
+            geo_velocity_kmh: 0.0,
+            is_unusual_network: false,
+            is_unusual_time: false,
+            unusual_access_score: 0.0,
+            recent_failed_attempts: 0,
+            login_hour: Some(10),
+            network_id: Some("AS1234".to_string()),
+            session_duration_secs: Some(300.0),
+        };
+        store.update_baseline(user, &signals);
+
+        // Compute anomaly from unknown network
+        let new_signals = RiskSignals {
+            network_id: Some("AS9999".to_string()),
+            ..signals.clone()
+        };
+        let anomaly = store.compute_anomaly_score(&user, &new_signals);
+        assert!(anomaly > 0.0, "unknown network should produce anomaly, got {anomaly}");
+    }
+}

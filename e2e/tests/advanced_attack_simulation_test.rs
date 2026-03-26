@@ -624,7 +624,7 @@ fn test_ratchet_state_manipulation() {
         getrandom::getrandom(&mut server_ent).unwrap();
         let mut nonce = [0u8; 32];
         getrandom::getrandom(&mut nonce).unwrap();
-        ratchet.advance(&client_ent, &server_ent, &nonce);
+        ratchet.advance(&client_ent, &server_ent, &nonce).unwrap();
     }
 
     // Capture current state (epoch 5)
@@ -1064,7 +1064,7 @@ fn test_memory_scraping_resistance() {
     getrandom::getrandom(&mut s_ent).unwrap();
     let mut nonce = [0u8; 32];
     getrandom::getrandom(&mut nonce).unwrap();
-    ratchet.advance(&c_ent, &s_ent, &nonce);
+    ratchet.advance(&c_ent, &s_ent, &nonce).unwrap();
     let epoch1_tag = ratchet.generate_tag(test_claims);
     let epoch1_key = ratchet.current_key();
 

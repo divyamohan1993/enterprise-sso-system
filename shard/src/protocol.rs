@@ -832,4 +832,244 @@ mod tests {
         assert_eq!(recovered.as_bytes(), payload);
         common::fips::set_fips_mode_unchecked(false);
     }
+
+    // -- HMAC computation and verification tests --
+
+    #[test]
+    fn test_hmac_computation_deterministic() {
+        let key = [0xAA; 64];
+        let msg = ShardMessage {
+            version: PROTOCOL_VERSION,
+            sender_module: ModuleId::Gateway,
+            sequence: 1,
+            timestamp: 1000000,
+            payload: vec![0x01, 0x02, 0x03],
+            hmac: [0u8; 64],
+        };
+        let hmac1 = ShardProtocol::compute_hmac(&key, &msg);
+        let hmac2 = ShardProtocol::compute_hmac(&key, &msg);
+        assert_eq!(hmac1, hmac2, "HMAC must be deterministic for identical inputs");
+    }
+
+    #[test]
+    fn test_hmac_different_keys_differ() {
+        let msg = ShardMessage {
+            version: PROTOCOL_VERSION,
+            sender_module: ModuleId::Gateway,
+            sequence: 1,
+            timestamp: 1000000,
+            payload: vec![0x01, 0x02, 0x03],
+            hmac: [0u8; 64],
+        };
+        let hmac1 = ShardProtocol::compute_hmac(&[0xAA; 64], &msg);
+        let hmac2 = ShardProtocol::compute_hmac(&[0xBB; 64], &msg);
+        assert_ne!(hmac1, hmac2, "different keys must produce different HMACs");
+    }
+
+    #[test]
+    fn test_hmac_different_payloads_differ() {
+        let key = [0xAA; 64];
+        let msg1 = ShardMessage {
+            version: PROTOCOL_VERSION,
+            sender_module: ModuleId::Gateway,
+            sequence: 1,
+            timestamp: 1000000,
+            payload: vec![0x01],
+            hmac: [0u8; 64],
+        };
+        let mut msg2 = msg1.clone();
+        msg2.payload = vec![0x02];
+        let hmac1 = ShardProtocol::compute_hmac(&key, &msg1);
+        let hmac2 = ShardProtocol::compute_hmac(&key, &msg2);
+        assert_ne!(hmac1, hmac2, "different payloads must produce different HMACs");
+    }
+
+    #[test]
+    fn test_hmac_different_sequences_differ() {
+        let key = [0xAA; 64];
+        let msg1 = ShardMessage {
+            version: PROTOCOL_VERSION,
+            sender_module: ModuleId::Gateway,
+            sequence: 1,
+            timestamp: 1000000,
+            payload: vec![0x01],
+            hmac: [0u8; 64],
+        };
+        let mut msg2 = msg1.clone();
+        msg2.sequence = 2;
+        let hmac1 = ShardProtocol::compute_hmac(&key, &msg1);
+        let hmac2 = ShardProtocol::compute_hmac(&key, &msg2);
+        assert_ne!(hmac1, hmac2, "different sequences must produce different HMACs");
+    }
+
+    #[test]
+    fn test_hmac_nonzero() {
+        let key = [0xAA; 64];
+        let msg = ShardMessage {
+            version: PROTOCOL_VERSION,
+            sender_module: ModuleId::Gateway,
+            sequence: 1,
+            timestamp: 1000000,
+            payload: vec![0x01],
+            hmac: [0u8; 64],
+        };
+        let hmac = ShardProtocol::compute_hmac(&key, &msg);
+        assert_ne!(hmac, [0u8; 64], "HMAC should not be all zeros");
+    }
+
+    // -- Timestamp validation tests --
+
+    #[test]
+    fn test_timestamp_within_tolerance() {
+        let key = test_hmac_key();
+        let mut sender = ShardProtocol::new(ModuleId::Gateway, key);
+        let mut receiver = ShardProtocol::new(ModuleId::Audit, key);
+
+        let payload = b"timestamp test";
+        let raw = sender.create_message(payload).unwrap();
+        // Verify immediately -- should be well within 2 second tolerance
+        let result = receiver.verify_message(&raw);
+        assert!(result.is_ok(), "message with fresh timestamp should verify");
+    }
+
+    // -- Sequence number monotonicity tests --
+
+    #[test]
+    fn test_sequence_monotonically_increasing() {
+        let key = test_hmac_key();
+        let mut sender = ShardProtocol::new(ModuleId::Gateway, key);
+        let mut receiver = ShardProtocol::new(ModuleId::Audit, key);
+
+        // Send 5 messages, all should be accepted in order
+        for i in 0..5 {
+            let payload = format!("msg {}", i);
+            let raw = sender.create_message(payload.as_bytes()).unwrap();
+            let result = receiver.verify_message(&raw);
+            assert!(result.is_ok(), "message {} should verify", i);
+        }
+    }
+
+    #[test]
+    fn test_sequence_rejects_old_sequence() {
+        let key = test_hmac_key();
+        let mut sender = ShardProtocol::new(ModuleId::Gateway, key);
+        let mut receiver = ShardProtocol::new(ModuleId::Audit, key);
+
+        let msg1 = sender.create_message(b"first").unwrap();
+        let msg2 = sender.create_message(b"second").unwrap();
+
+        // Process msg2 first (sequence 2)
+        receiver.verify_message(&msg2).unwrap();
+
+        // msg1 (sequence 1) should be rejected since we already saw sequence 2
+        let err = receiver.verify_message(&msg1);
+        assert!(err.is_err(), "old sequence number should be rejected");
+        let msg = format!("{}", err.unwrap_err());
+        assert!(msg.contains("replay"), "error should mention replay: {msg}");
+    }
+
+    #[test]
+    fn test_sequence_rejects_duplicate() {
+        let key = test_hmac_key();
+        let mut sender = ShardProtocol::new(ModuleId::Gateway, key);
+        let mut receiver = ShardProtocol::new(ModuleId::Audit, key);
+
+        let raw = sender.create_message(b"once").unwrap();
+        receiver.verify_message(&raw).unwrap();
+
+        // Same message (same sequence) should be rejected
+        let err = receiver.verify_message(&raw);
+        assert!(err.is_err(), "duplicate sequence should be rejected");
+    }
+
+    // -- Message serialization/deserialization tests --
+
+    #[test]
+    fn test_shard_message_serialization_roundtrip() {
+        let msg = ShardMessage {
+            version: PROTOCOL_VERSION,
+            sender_module: ModuleId::Gateway,
+            sequence: 42,
+            timestamp: 1700000000_000000,
+            payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            hmac: [0xAB; 64],
+        };
+        let bytes = postcard::to_allocvec(&msg).unwrap();
+        let decoded: ShardMessage = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.version, PROTOCOL_VERSION);
+        assert_eq!(decoded.sender_module, ModuleId::Gateway);
+        assert_eq!(decoded.sequence, 42);
+        assert_eq!(decoded.payload, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(decoded.hmac, [0xAB; 64]);
+    }
+
+    #[test]
+    fn test_shard_message_deserialization_corrupt() {
+        let result = postcard::from_bytes::<ShardMessage>(&[0xFF, 0x00]);
+        assert!(result.is_err(), "corrupt data should fail deserialization");
+    }
+
+    // -- Key derivation tests --
+
+    #[test]
+    fn test_derive_encryption_key_deterministic() {
+        let secret = [0xCC; 64];
+        let k1 = derive_encryption_key(&secret);
+        let k2 = derive_encryption_key(&secret);
+        assert_eq!(k1, k2, "same secret must produce same encryption key");
+    }
+
+    #[test]
+    fn test_derive_hmac_key_deterministic() {
+        let secret = [0xCC; 64];
+        let k1 = derive_hmac_key(&secret);
+        let k2 = derive_hmac_key(&secret);
+        assert_eq!(k1, k2, "same secret must produce same HMAC key");
+    }
+
+    #[test]
+    fn test_encryption_and_hmac_keys_differ() {
+        let secret = [0xCC; 64];
+        let enc_key = derive_encryption_key(&secret);
+        let hmac_key = derive_hmac_key(&secret);
+        // The encryption key is 32 bytes and HMAC key is 64 bytes,
+        // but the first 32 bytes should still differ due to domain separation.
+        assert_ne!(
+            &enc_key[..],
+            &hmac_key[..32],
+            "encryption and HMAC keys must be different (domain separation)"
+        );
+    }
+
+    #[test]
+    fn test_different_secrets_different_keys() {
+        let k1 = derive_encryption_key(&[0xAA; 64]);
+        let k2 = derive_encryption_key(&[0xBB; 64]);
+        assert_ne!(k1, k2, "different secrets must produce different keys");
+    }
+
+    // -- SecurePayload tests --
+
+    #[test]
+    fn test_secure_payload_equality() {
+        let payload = SecurePayload(vec![1, 2, 3]);
+        assert_eq!(payload, vec![1, 2, 3]);
+        assert_eq!(payload, [1, 2, 3].as_slice());
+        assert_eq!(payload, &[1u8, 2, 3]);
+    }
+
+    #[test]
+    fn test_secure_payload_debug_redacted() {
+        let payload = SecurePayload(vec![0xDE, 0xAD]);
+        let debug = format!("{:?}", payload);
+        assert!(debug.contains("REDACTED"), "debug output should be redacted");
+        assert!(!debug.contains("222"), "debug should not leak payload bytes");
+    }
+
+    #[test]
+    fn test_secure_payload_into_inner() {
+        let payload = SecurePayload(vec![1, 2, 3]);
+        let inner = payload.into_inner();
+        assert_eq!(inner, vec![1, 2, 3]);
+    }
 }

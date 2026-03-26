@@ -106,7 +106,10 @@ impl SessionManager {
         if chain.is_expired() {
             return Err("session expired (8h max)".into());
         }
-        chain.advance(client_entropy, server_entropy, server_nonce);
+        chain.advance(client_entropy, server_entropy, server_nonce).map_err(|e| {
+            tracing::error!("ratchet advance failed for session {session_id}: {e}");
+            e.to_string()
+        })?;
         Ok(chain.epoch())
     }
 
@@ -122,7 +125,10 @@ impl SessionManager {
         let chain = sessions
             .get(session_id)
             .ok_or_else(|| "session not found".to_string())?;
-        Ok(chain.generate_tag(claims_bytes))
+        chain.generate_tag(claims_bytes).map_err(|e| {
+            tracing::error!("ratchet generate_tag failed for session {session_id}: {e}");
+            e.to_string()
+        })
     }
 
     /// Verify a ratchet tag for the given session.
@@ -143,7 +149,10 @@ impl SessionManager {
         let chain = sessions
             .get(session_id)
             .ok_or_else(|| "session not found".to_string())?;
-        Ok(chain.verify_tag(claims_bytes, tag, token_epoch))
+        chain.verify_tag(claims_bytes, tag, token_epoch).map_err(|e| {
+            tracing::error!("ratchet verify_tag failed for session {session_id}: {e}");
+            e.to_string()
+        })
     }
 
     /// Destroy a session, securely erasing its chain key.
@@ -375,6 +384,10 @@ impl PersistentSessionManager {
                 .get(&sid)
                 .ok_or_else(|| "session just created but not found".to_string())?
                 .current_key()
+                .map_err(|e| {
+                    tracing::error!("ratchet current_key failed for session {sid}: {e}");
+                    e.to_string()
+                })?
         };
         let enc = encrypt_chain_key_uuid(&self.kek, &ck, &sid)?;
         let now = now_us();
@@ -416,6 +429,10 @@ impl PersistentSessionManager {
                 .get(sid)
                 .ok_or_else(|| "session not found after advance".to_string())?
                 .current_key()
+                .map_err(|e| {
+                    tracing::error!("ratchet current_key failed for session {sid}: {e}");
+                    e.to_string()
+                })?
         };
         let enc = encrypt_chain_key_uuid(&self.kek, &ck, sid)?;
         let now = now_us();
@@ -544,18 +561,18 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "all-zero")]
     fn test_zero_entropy_rejected() {
         let m = SessionManager::new();
         let s = Uuid::new_v4();
         m.create_session(s, &[0x42u8; 64]).unwrap();
         let mut sn = [0u8; 32];
         getrandom::getrandom(&mut sn).unwrap();
-        m.advance_session(&s, &[0u8; 32], &[0x11; 32], &sn).unwrap();
+        let result = m.advance_session(&s, &[0u8; 32], &[0x11; 32], &sn);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("all-zero"));
     }
 
     #[test]
-    #[should_panic(expected = "quality check")]
     fn test_low_quality_entropy_rejected() {
         let m = SessionManager::new();
         let s = Uuid::new_v4();
@@ -570,11 +587,12 @@ mod tests {
         getrandom::getrandom(&mut se).unwrap();
         let mut sn = [0u8; 32];
         getrandom::getrandom(&mut sn).unwrap();
-        m.advance_session(&s, &low_quality, &se, &sn).unwrap();
+        let result = m.advance_session(&s, &low_quality, &se, &sn);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("quality"));
     }
 
     #[test]
-    #[should_panic(expected = "nonce reuse")]
     fn test_nonce_reuse_rejected() {
         let m = SessionManager::new();
         let s = Uuid::new_v4();
@@ -586,10 +604,12 @@ mod tests {
         getrandom::getrandom(&mut se).unwrap();
         getrandom::getrandom(&mut sn).unwrap();
         m.advance_session(&s, &ce, &se, &sn).unwrap();
-        // Reuse same nonce — should panic
+        // Reuse same nonce — should return error
         getrandom::getrandom(&mut ce).unwrap();
         getrandom::getrandom(&mut se).unwrap();
-        m.advance_session(&s, &ce, &se, &sn).unwrap();
+        let result = m.advance_session(&s, &ce, &se, &sn);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("nonce reuse"));
     }
 
     #[test]

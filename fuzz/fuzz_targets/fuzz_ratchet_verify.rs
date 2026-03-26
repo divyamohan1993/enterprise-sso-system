@@ -13,7 +13,7 @@ fuzz_target!(|i: RI| {
         let ce_distinct = { let mut seen = [false; 256]; let mut d = 0usize; for &b in ce.iter() { if !seen[b as usize] { seen[b as usize] = true; d += 1; } } d };
         let se_distinct = { let mut seen = [false; 256]; let mut d = 0usize; for &b in se.iter() { if !seen[b as usize] { seen[b as usize] = true; d += 1; } } d };
         if ce_distinct < 4 || se_distinct < 4 || ce == [0u8; 32] || se == [0u8; 32] { continue; }
-        c.advance(&ce, &se, &sn);
+        c.advance(&ce, &se, &sn).unwrap();
     }
     let _ = c.verify_tag(&i.claims, &i.tag, i.epoch);
 });

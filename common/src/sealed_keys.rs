@@ -59,13 +59,13 @@ pub fn load_master_kek() -> [u8; 32] {
             let mut key = [0u8; 32];
             for (i, chunk) in hex_str.as_bytes().chunks(2).take(32).enumerate() {
                 let hex = std::str::from_utf8(chunk)
-                    .unwrap_or_else(|_| panic!("FATAL: MILNET_MASTER_KEK contains invalid UTF-8 at byte {}", i * 2));
+                    .unwrap_or_else(|_| { eprintln!("FATAL: MILNET_MASTER_KEK contains invalid UTF-8 at byte {}", i * 2); std::process::exit(1); });
                 key[i] = u8::from_str_radix(hex, 16)
-                    .unwrap_or_else(|_| panic!("FATAL: MILNET_MASTER_KEK contains invalid hex '{}' at position {}", hex, i * 2));
+                    .unwrap_or_else(|_| { eprintln!("FATAL: MILNET_MASTER_KEK contains invalid hex '{}' at position {}", hex, i * 2); std::process::exit(1); });
             }
             // Reject all-zero keys
             if key.iter().all(|&b| b == 0) {
-                panic!("FATAL: all-zero key detected in MILNET_MASTER_KEK");
+                eprintln!("FATAL: all-zero key detected in MILNET_MASTER_KEK"); std::process::exit(1);
             }
             // Zeroize the hex string in memory
             zeroize_string(&mut hex_str);
@@ -74,7 +74,7 @@ pub fn load_master_kek() -> [u8; 32] {
         }
         _ => {
             if is_production() {
-                panic!("FATAL: MILNET_MASTER_KEK not set in production mode. Refusing to start.");
+                eprintln!("FATAL: MILNET_MASTER_KEK not set in production mode. Refusing to start."); std::process::exit(1);
             }
             eprintln!("WARNING: MILNET_MASTER_KEK not set. Using deterministic dev KEK. NOT FOR PRODUCTION.");
             let mut key = [0u8; 32];
@@ -83,7 +83,7 @@ pub fn load_master_kek() -> [u8; 32] {
             key.copy_from_slice(&hash[..32]);
             // Reject all-zero keys even in dev mode
             if key.iter().all(|&b| b == 0) {
-                panic!("FATAL: all-zero key detected in dev master KEK derivation");
+                eprintln!("FATAL: all-zero key detected in dev master KEK derivation"); std::process::exit(1);
             }
             key
         }
@@ -152,7 +152,7 @@ fn load_key_hardened(var: &str, purpose: &str, dev_seed: &[u8]) -> [u8; 64] {
         if let Some(key) = result {
             // Reject all-zero keys
             if key.iter().all(|&b| b == 0) {
-                panic!("FATAL: all-zero key detected after unsealing {var}");
+                eprintln!("FATAL: all-zero key detected after unsealing {var}"); std::process::exit(1);
             }
             eprintln!("INFO: {var} loaded from sealed storage.");
             return key;
@@ -169,22 +169,23 @@ fn load_key_hardened(var: &str, purpose: &str, dev_seed: &[u8]) -> [u8; 64] {
             if is_production() {
                 zeroize_string(&mut hex_str);
                 hex_str.zeroize();
-                panic!(
+                eprintln!(
                     "FATAL: Raw (unencrypted) {var} detected in production mode. \
                      Use {sealed_var} with sealed keys instead."
                 );
+                std::process::exit(1);
             }
             eprintln!("WARNING: {var} loaded as raw plaintext. Use sealed keys in production.");
             let mut key = [0u8; 64];
             for (i, chunk) in hex_str.as_bytes().chunks(2).take(64).enumerate() {
                 let hex = std::str::from_utf8(chunk)
-                    .unwrap_or_else(|_| panic!("FATAL: {var} contains invalid UTF-8 at byte {}", i * 2));
+                    .unwrap_or_else(|_| { eprintln!("FATAL: {var} contains invalid UTF-8 at byte {}", i * 2); std::process::exit(1); });
                 key[i] = u8::from_str_radix(hex, 16)
-                    .unwrap_or_else(|_| panic!("FATAL: {var} contains invalid hex '{}' at position {}", hex, i * 2));
+                    .unwrap_or_else(|_| { eprintln!("FATAL: {var} contains invalid hex '{}' at position {}", hex, i * 2); std::process::exit(1); });
             }
             // Reject all-zero keys
             if key.iter().all(|&b| b == 0) {
-                panic!("FATAL: all-zero key detected in {var}");
+                eprintln!("FATAL: all-zero key detected in {var}"); std::process::exit(1);
             }
             zeroize_string(&mut hex_str);
             hex_str.zeroize();
@@ -196,10 +197,11 @@ fn load_key_hardened(var: &str, purpose: &str, dev_seed: &[u8]) -> [u8; 64] {
 
     // 3. Dev fallback
     if is_production() {
-        panic!(
-            "FATAL: {var} not set and no sealed key found. \
+        eprintln!(
+                    "FATAL: {var} not set and no sealed key found. \
              Cannot start in production mode without keys."
-        );
+                );
+                std::process::exit(1);
     }
 
     eprintln!(
@@ -269,7 +271,7 @@ fn deterministic_dev_key(seed: &[u8]) -> [u8; 64] {
     key.copy_from_slice(&hash);
     // Reject all-zero keys
     if key.iter().all(|&b| b == 0) {
-        panic!("FATAL: all-zero key detected in deterministic dev key derivation");
+        eprintln!("FATAL: all-zero key detected in deterministic dev key derivation"); std::process::exit(1);
     }
     key
 }
@@ -355,10 +357,11 @@ pub fn load_master_kek_hsm_aware() -> [u8; 32] {
         // Software HSM is forbidden in production — silent fallback would mask
         // a misconfiguration that leaves keys unprotected by hardware.
         if is_production() {
-            panic!(
-                "FATAL: Software HSM backend forbidden in production. \
+            eprintln!(
+                    "FATAL: Software HSM backend forbidden in production. \
                  Set MILNET_HSM_BACKEND to pkcs11/aws-kms/tpm2"
-            );
+                );
+                std::process::exit(1);
         }
         // Software backend (dev only): fall through to normal env var loading.
         eprintln!(

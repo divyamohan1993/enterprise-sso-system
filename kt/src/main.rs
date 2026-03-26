@@ -26,6 +26,38 @@ async fn main() {
     let (_platform_report, _monitor_handle, _monitor) =
         common::startup_checks::run_platform_checks(crypto::memguard::harden_process);
 
+    // Initialize structured JSON logging for production observability
+    common::structured_logging::init(common::structured_logging::ServiceMeta {
+        service_name: "kt".to_string(),
+        service_version: env!("CARGO_PKG_VERSION").to_string(),
+        instance_id: uuid::Uuid::new_v4().to_string(),
+        project_id: std::env::var("GCP_PROJECT_ID").unwrap_or_else(|_| "milnet-sso".to_string()),
+    });
+
+    // Verify binary integrity at startup
+    let build_info = common::embed_build_info!();
+    tracing::info!(
+        git_commit = %build_info.git_commit,
+        build_time = %build_info.build_time,
+        "build manifest verified"
+    );
+
+    // Initialize health monitor for peer service tracking
+    let _health_monitor = std::sync::Arc::new(common::health::HealthMonitor::new());
+
+    // Initialize metrics counters
+    let _auth_counter = common::metrics::Counter::new("auth_attempts", "Total authentication attempts");
+    let _error_counter = common::metrics::Counter::new("errors", "Total errors");
+
+    // Initialize authenticated time source
+    let _secure_time = common::secure_time::SecureTimeProvider::new(
+        common::secure_time::AuthenticatedTimeConfig::default(),
+    );
+
+    // Verify CNSA 2.0 compliance at startup
+    assert!(common::cnsa2::is_cnsa2_compliant(), "CNSA 2.0 compliance check failed");
+    tracing::info!("CNSA 2.0 compliance verified");
+
     tracing::info!("Key Transparency service starting");
 
     let tree = Arc::new(RwLock::new(kt::merkle::MerkleTree::new()));

@@ -147,6 +147,57 @@ impl Token {
     }
 }
 
+// ── Encrypted claims (JWE-style) ─────────────────────────────────────
+
+/// Encrypted token claims — claims are never plaintext on the wire.
+///
+/// Uses AES-256-GCM envelope encryption with per-token random nonce.
+/// The ciphertext includes the 16-byte GCM authentication tag.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EncryptedClaims {
+    /// AES-256-GCM nonce (12 bytes).
+    pub nonce: [u8; 12],
+    /// Encrypted serialized TokenClaims + 16-byte GCM tag.
+    pub ciphertext: Vec<u8>,
+}
+
+/// Token with encrypted claims — used for wire transmission.
+/// Claims are AES-256-GCM encrypted so they are never plaintext on the wire.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct EncryptedToken {
+    pub header: TokenHeader,
+    /// JWE-encrypted claims (AES-256-GCM).
+    pub encrypted_claims: EncryptedClaims,
+    #[serde(with = "byte_array_64")]
+    pub ratchet_tag: [u8; 64],
+    #[serde(with = "byte_array_64")]
+    pub frost_signature: [u8; 64],
+    pub pq_signature: Vec<u8>,
+}
+
+/// Custom Debug for EncryptedToken — redacts everything sensitive.
+impl std::fmt::Debug for EncryptedToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncryptedToken")
+            .field("header", &self.header)
+            .field("encrypted_claims", &"[ENCRYPTED]")
+            .field("ratchet_tag", &"[REDACTED]")
+            .field("frost_signature", &"[REDACTED]")
+            .field("pq_signature", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Zeroize cryptographic material on drop — prevents memory forensics.
+impl Drop for EncryptedToken {
+    fn drop(&mut self) {
+        self.ratchet_tag.zeroize();
+        self.frost_signature.zeroize();
+        self.pq_signature.zeroize();
+        self.encrypted_claims.ciphertext.zeroize();
+    }
+}
+
 // ── Receipt (spec Section 6) ──────────────────────────────────────────
 
 #[derive(Clone, Serialize, Deserialize)]

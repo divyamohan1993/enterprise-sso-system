@@ -626,6 +626,12 @@ pub struct AppState {
     pub developer_log_level: AtomicU8,
     /// Pending destructive admin actions awaiting multi-person approval.
     pub pending_admin_actions: RwLock<HashMap<Uuid, PendingAdminAction>>,
+    /// HA database pool with primary/replica routing and health tracking.
+    pub ha_pool: std::sync::Mutex<common::db_ha::HaPool>,
+    /// Envelope encryption for database fields (AES-256-GCM with HKDF-derived per-table KEKs).
+    pub encrypted_pool: common::encrypted_db::EncryptedPool,
+    /// Encrypted distributed session store for persistent, replicated sessions.
+    pub session_store: RwLock<common::distributed_session::DistributedSessionStore>,
 }
 
 /// Entry in the access_tokens map, pairing a user ID with a last-activity
@@ -1444,8 +1450,50 @@ pub fn api_router(state: Arc<AppState>) -> Router {
 // Handlers — System
 // ---------------------------------------------------------------------------
 
-async fn health_check() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"status": "ok"}))
+async fn health_check(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    // Check primary DB connectivity
+    let db_ok = sqlx::query("SELECT 1")
+        .fetch_one(&state.db)
+        .await
+        .is_ok();
+
+    // Check HA cluster health
+    let cluster_health = {
+        let mut ha = state.ha_pool.lock().unwrap();
+        ha.check_health()
+    };
+
+    // Check distributed session store health
+    let active_sessions = {
+        let store = state.session_store.read().await;
+        store.active_count()
+    };
+
+    let overall_status = if db_ok && cluster_health.primary_healthy {
+        "ok"
+    } else if db_ok {
+        "degraded"
+    } else {
+        "unhealthy"
+    };
+
+    Json(serde_json::json!({
+        "status": overall_status,
+        "database": {
+            "primary_reachable": db_ok,
+            "ha_cluster": {
+                "primary_healthy": cluster_health.primary_healthy,
+                "healthy_replicas": cluster_health.healthy_replicas,
+                "total_replicas": cluster_health.total_replicas,
+                "degraded": cluster_health.degraded,
+            }
+        },
+        "sessions": {
+            "active_count": active_sessions,
+        }
+    }))
 }
 
 async fn setup_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -5808,5 +5856,798 @@ mod tests {
         let fake_approver = Uuid::new_v4();
         let sig = compute_admin_action_approval_hmac(&action_id, &real_approver);
         assert!(!verify_admin_action_approval(&action_id, &fake_approver, &sig));
+    }
+
+    // ── HTML Escape / XSS Prevention Tests ───────────────────────────────
+
+    #[test]
+    fn html_escape_script_tag() {
+        let input = "<script>alert('xss')</script>";
+        let escaped = html_escape(input);
+        assert!(!escaped.contains('<'));
+        assert!(!escaped.contains('>'));
+        assert!(escaped.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn html_escape_all_special_chars() {
+        let input = r#"&<>"'"#;
+        let escaped = html_escape(input);
+        assert_eq!(escaped, "&amp;&lt;&gt;&quot;&#x27;");
+    }
+
+    #[test]
+    fn html_escape_preserves_safe_text() {
+        let input = "Hello, World! 123 abc";
+        assert_eq!(html_escape(input), input);
+    }
+
+    #[test]
+    fn html_escape_empty_string() {
+        assert_eq!(html_escape(""), "");
+    }
+
+    #[test]
+    fn html_escape_nested_tags() {
+        let input = r#"<img src=x onerror="alert(1)">"#;
+        let escaped = html_escape(input);
+        assert!(!escaped.contains('<'));
+        assert!(!escaped.contains('"'));
+    }
+
+    #[test]
+    fn html_escape_ampersand_first() {
+        // Ampersand must be escaped first to avoid double-escaping
+        let input = "&lt;";
+        let escaped = html_escape(input);
+        assert_eq!(escaped, "&amp;lt;");
+    }
+
+    // ── CSRF Token Tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn csrf_token_generation_produces_three_parts() {
+        let token = generate_csrf_token("session123", "secret-key");
+        let parts: Vec<&str> = token.splitn(3, ':').collect();
+        assert_eq!(parts.len(), 3, "CSRF token must have 3 colon-separated parts");
+    }
+
+    #[test]
+    fn csrf_token_generation_unique() {
+        let t1 = generate_csrf_token("session1", "key");
+        let t2 = generate_csrf_token("session1", "key");
+        assert_ne!(t1, t2, "two generated tokens must differ (random nonce)");
+    }
+
+    #[test]
+    fn csrf_token_validation_correct() {
+        let session = "my-session-state";
+        let key = "my-api-key";
+        let token = generate_csrf_token(session, key);
+        assert!(
+            validate_csrf_token(&token, session, key),
+            "freshly generated token must validate"
+        );
+    }
+
+    #[test]
+    fn csrf_token_validation_wrong_session() {
+        let key = "my-api-key";
+        let token = generate_csrf_token("session-A", key);
+        assert!(
+            !validate_csrf_token(&token, "session-B", key),
+            "token from different session must not validate"
+        );
+    }
+
+    #[test]
+    fn csrf_token_validation_wrong_key() {
+        let session = "my-session";
+        let token = generate_csrf_token(session, "key-A");
+        assert!(
+            !validate_csrf_token(&token, session, "key-B"),
+            "token validated with wrong key must fail"
+        );
+    }
+
+    #[test]
+    fn csrf_token_validation_tampered_hmac() {
+        let session = "my-session";
+        let key = "my-api-key";
+        let token = generate_csrf_token(session, key);
+        let parts: Vec<&str> = token.splitn(3, ':').collect();
+        // Tamper with the HMAC signature
+        let tampered = format!("{}:{}:deadbeef0000", parts[0], parts[1]);
+        assert!(
+            !validate_csrf_token(&tampered, session, key),
+            "tampered HMAC must not validate"
+        );
+    }
+
+    #[test]
+    fn csrf_token_validation_expired() {
+        let session = "my-session";
+        let key = "my-api-key";
+        // Construct a token with a timestamp from 120 seconds ago (beyond 60s TTL)
+        let old_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 120;
+        let nonce: [u8; 16] = rand::random();
+        let nonce_hex = hex::encode(nonce);
+
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        type HmacSha256 = Hmac<Sha256>;
+
+        let payload = format!("{}:{}:{}", session, old_ts, nonce_hex);
+        let mut mac = HmacSha256::new_from_slice(key.as_bytes()).expect("HMAC key");
+        mac.update(payload.as_bytes());
+        let sig = hex::encode(mac.finalize().into_bytes());
+        let expired_token = format!("{}:{}:{}", old_ts, nonce_hex, sig);
+
+        assert!(
+            !validate_csrf_token(&expired_token, session, key),
+            "expired CSRF token must not validate"
+        );
+    }
+
+    #[test]
+    fn csrf_token_validation_malformed_input() {
+        assert!(!validate_csrf_token("", "s", "k"));
+        assert!(!validate_csrf_token("no-colons", "s", "k"));
+        assert!(!validate_csrf_token("one:two", "s", "k"));
+        assert!(!validate_csrf_token("notanumber:nonce:sig", "s", "k"));
+    }
+
+    #[tokio::test]
+    async fn csrf_check_and_mark_used_first_use_succeeds() {
+        let used = RwLock::new(HashSet::new());
+        assert!(check_and_mark_csrf_used("token1", &used).await);
+    }
+
+    #[tokio::test]
+    async fn csrf_check_and_mark_used_replay_fails() {
+        let used = RwLock::new(HashSet::new());
+        assert!(check_and_mark_csrf_used("token1", &used).await);
+        assert!(
+            !check_and_mark_csrf_used("token1", &used).await,
+            "replayed CSRF token must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn csrf_used_set_clears_at_capacity() {
+        let used = RwLock::new(HashSet::new());
+        // Fill to capacity
+        for i in 0..MAX_USED_CSRF_TOKENS {
+            used.write().await.insert(format!("tok-{i}"));
+        }
+        assert_eq!(used.read().await.len(), MAX_USED_CSRF_TOKENS);
+        // Next insert should trigger clear + insert
+        assert!(check_and_mark_csrf_used("overflow-token", &used).await);
+        // Set was cleared then the new token was inserted
+        assert_eq!(used.read().await.len(), 1);
+    }
+
+    // ── RevocationList Tests ─────────────────────────────────────────────
+
+    #[test]
+    fn revocation_list_new_is_empty() {
+        let rl = RevocationList::new();
+        assert_eq!(rl.count(), 0);
+    }
+
+    #[test]
+    fn revocation_list_add_and_check() {
+        let mut rl = RevocationList::new();
+        let token_id = [1u8; 16];
+        assert!(rl.revoke(token_id));
+        assert_eq!(rl.count(), 1);
+        assert!(rl.entries.contains(&token_id));
+    }
+
+    #[test]
+    fn revocation_list_deduplication() {
+        let mut rl = RevocationList::new();
+        let token_id = [42u8; 16];
+        assert!(rl.revoke(token_id));
+        assert!(rl.revoke(token_id)); // duplicate
+        assert_eq!(rl.count(), 1, "duplicate revocations should not increase count");
+        assert_eq!(rl.timed_entries.len(), 1);
+    }
+
+    #[test]
+    fn revocation_list_capacity_limit() {
+        let mut rl = RevocationList::new();
+        // Fill to capacity
+        for i in 0..MAX_REVOCATION_ENTRIES {
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            assert!(rl.revoke(id));
+        }
+        assert_eq!(rl.count(), MAX_REVOCATION_ENTRIES);
+        // Next revocation should fail
+        let overflow_id = [0xFFu8; 16];
+        assert!(
+            !rl.revoke(overflow_id),
+            "revocation at capacity must return false"
+        );
+    }
+
+    #[test]
+    fn revocation_list_cleanup_expired() {
+        let mut rl = RevocationList::new();
+        let token_id = [7u8; 16];
+        rl.revoke(token_id);
+        // Manually backdate the entry so it appears expired
+        rl.timed_entries[0].revoked_at -= MAX_TOKEN_LIFETIME_SECS + 1;
+        rl.cleanup_expired();
+        assert_eq!(rl.count(), 0, "expired entries must be cleaned up");
+        assert!(rl.timed_entries.is_empty());
+    }
+
+    #[test]
+    fn revocation_list_cleanup_preserves_recent() {
+        let mut rl = RevocationList::new();
+        let old_id = [1u8; 16];
+        let new_id = [2u8; 16];
+        rl.revoke(old_id);
+        rl.revoke(new_id);
+        // Backdate only the first entry
+        rl.timed_entries[0].revoked_at -= MAX_TOKEN_LIFETIME_SECS + 1;
+        rl.cleanup_expired();
+        assert_eq!(rl.count(), 1);
+        assert!(rl.entries.contains(&new_id));
+        assert!(!rl.entries.contains(&old_id));
+    }
+
+    // ── check_tier Tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn check_tier_same_level_allowed() {
+        assert!(check_tier(2, 2).is_ok());
+    }
+
+    #[test]
+    fn check_tier_higher_privilege_allowed() {
+        // tier 1 is higher privilege than tier 2
+        assert!(check_tier(1, 2).is_ok());
+    }
+
+    #[test]
+    fn check_tier_lower_privilege_denied() {
+        assert!(check_tier(3, 2).is_err());
+    }
+
+    #[test]
+    fn check_tier_sovereign_accesses_all() {
+        assert!(check_tier(1, 1).is_ok());
+        assert!(check_tier(1, 2).is_ok());
+        assert!(check_tier(1, 3).is_ok());
+        assert!(check_tier(1, 4).is_ok());
+    }
+
+    // ── enforce_map_capacity Tests ───────────────────────────────────────
+
+    #[test]
+    fn enforce_map_capacity_under_limit_no_eviction() {
+        let mut map: HashMap<String, i32> = HashMap::new();
+        for i in 0..10 {
+            map.insert(format!("key-{i}"), i);
+        }
+        enforce_map_capacity(&mut map, 100);
+        assert_eq!(map.len(), 10, "should not evict when under capacity");
+    }
+
+    #[test]
+    fn enforce_map_capacity_at_limit_no_eviction() {
+        let mut map: HashMap<String, i32> = HashMap::new();
+        for i in 0..100 {
+            map.insert(format!("key-{i}"), i);
+        }
+        enforce_map_capacity(&mut map, 100);
+        assert_eq!(map.len(), 100, "should not evict when exactly at capacity");
+    }
+
+    #[test]
+    fn enforce_map_capacity_over_limit_evicts() {
+        let mut map: HashMap<String, i32> = HashMap::new();
+        for i in 0..110 {
+            map.insert(format!("key-{i}"), i);
+        }
+        enforce_map_capacity(&mut map, 100);
+        // target = 100 * 9 / 10 = 90; to_remove = 110 - 90 = 20
+        assert_eq!(map.len(), 90, "should evict to 90% of capacity");
+    }
+
+    // ── Rate Limiting / Lockout Tests ────────────────────────────────────
+
+    #[test]
+    fn is_locked_out_no_attempts_not_locked() {
+        let attempts: HashMap<String, LoginAttemptEntry> = HashMap::new();
+        assert!(!is_locked_out("alice", "1.2.3.4", &attempts));
+    }
+
+    #[test]
+    fn is_locked_out_below_threshold_not_locked() {
+        let mut attempts = HashMap::new();
+        let now = now_secs();
+        attempts.insert(
+            "alice".to_string(),
+            LoginAttemptEntry {
+                count: 4, // below first threshold of 5
+                first_attempt: now - 10,
+                last_attempt: now,
+            },
+        );
+        assert!(!is_locked_out("alice", "1.2.3.4", &attempts));
+    }
+
+    #[test]
+    fn is_locked_out_at_first_threshold_within_window() {
+        let mut attempts = HashMap::new();
+        let now = now_secs();
+        attempts.insert(
+            "alice".to_string(),
+            LoginAttemptEntry {
+                count: 5,
+                first_attempt: now - 20,
+                last_attempt: now - 10, // 10 seconds ago, within 30s window
+            },
+        );
+        assert!(is_locked_out("alice", "1.2.3.4", &attempts));
+    }
+
+    #[test]
+    fn is_locked_out_at_first_threshold_after_window() {
+        let mut attempts = HashMap::new();
+        let now = now_secs();
+        attempts.insert(
+            "alice".to_string(),
+            LoginAttemptEntry {
+                count: 5,
+                first_attempt: now - 60,
+                last_attempt: now - 31, // 31 seconds ago, past 30s window
+            },
+        );
+        assert!(!is_locked_out("alice", "1.2.3.4", &attempts));
+    }
+
+    #[test]
+    fn is_locked_out_ip_based_lockout() {
+        let mut attempts = HashMap::new();
+        let now = now_secs();
+        attempts.insert(
+            "ip:1.2.3.4".to_string(),
+            LoginAttemptEntry {
+                count: 10,
+                first_attempt: now - 60,
+                last_attempt: now - 10, // within 5-minute window
+            },
+        );
+        assert!(is_locked_out("unknown-user", "1.2.3.4", &attempts));
+    }
+
+    #[test]
+    fn record_failed_attempt_increments_count() {
+        let mut attempts = HashMap::new();
+        record_failed_attempt(&mut attempts, "alice", "1.2.3.4");
+        assert_eq!(attempts.get("alice").unwrap().count, 1);
+        assert_eq!(attempts.get("ip:1.2.3.4").unwrap().count, 1);
+        record_failed_attempt(&mut attempts, "alice", "1.2.3.4");
+        assert_eq!(attempts.get("alice").unwrap().count, 2);
+        assert_eq!(attempts.get("ip:1.2.3.4").unwrap().count, 2);
+    }
+
+    #[test]
+    fn record_failed_attempt_tracks_both_username_and_ip() {
+        let mut attempts = HashMap::new();
+        record_failed_attempt(&mut attempts, "alice", "10.0.0.1");
+        record_failed_attempt(&mut attempts, "bob", "10.0.0.1");
+        assert_eq!(attempts.get("alice").unwrap().count, 1);
+        assert_eq!(attempts.get("bob").unwrap().count, 1);
+        assert_eq!(attempts.get("ip:10.0.0.1").unwrap().count, 2);
+    }
+
+    // ── sign_audit_entry Tests ───────────────────────────────────────────
+
+    #[test]
+    fn sign_audit_entry_deterministic() {
+        let key = [0xABu8; 64];
+        let data = b"test audit entry";
+        let sig1 = sign_audit_entry(data, &key);
+        let sig2 = sign_audit_entry(data, &key);
+        assert_eq!(sig1, sig2, "same data + key must produce same signature");
+    }
+
+    #[test]
+    fn sign_audit_entry_different_data_different_sig() {
+        let key = [0xABu8; 64];
+        let sig1 = sign_audit_entry(b"entry-1", &key);
+        let sig2 = sign_audit_entry(b"entry-2", &key);
+        assert_ne!(sig1, sig2);
+    }
+
+    #[test]
+    fn sign_audit_entry_different_key_different_sig() {
+        let key1 = [0x01u8; 64];
+        let key2 = [0x02u8; 64];
+        let sig1 = sign_audit_entry(b"entry", &key1);
+        let sig2 = sign_audit_entry(b"entry", &key2);
+        assert_ne!(sig1, sig2);
+    }
+
+    #[test]
+    fn sign_audit_entry_output_is_64_bytes() {
+        let key = [0xCDu8; 64];
+        let sig = sign_audit_entry(b"data", &key);
+        assert_eq!(sig.len(), 64, "HMAC-SHA512 output must be 64 bytes");
+    }
+
+    // ── Pagination Tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn pagination_defaults() {
+        let p = PaginationParams {
+            limit: None,
+            offset: None,
+        };
+        assert_eq!(p.limit(), 100);
+        assert_eq!(p.offset(), 0);
+    }
+
+    #[test]
+    fn pagination_custom_values() {
+        let p = PaginationParams {
+            limit: Some(50),
+            offset: Some(10),
+        };
+        assert_eq!(p.limit(), 50);
+        assert_eq!(p.offset(), 10);
+    }
+
+    #[test]
+    fn pagination_limit_capped_at_1000() {
+        let p = PaginationParams {
+            limit: Some(5000),
+            offset: None,
+        };
+        assert_eq!(p.limit(), 1000);
+    }
+
+    // ── DestructiveAction Tests ──────────────────────────────────────────
+
+    #[test]
+    fn all_destructive_actions_require_superadmin_approver() {
+        let actions = [
+            DestructiveAction::UserDeletion,
+            DestructiveAction::TierChange,
+            DestructiveAction::KeyRotation,
+            DestructiveAction::BulkDeviceRevocation,
+            DestructiveAction::DeveloperModeToggle,
+        ];
+        for action in &actions {
+            assert!(
+                action.requires_superadmin_approver(),
+                "{action} should require SuperAdmin approver"
+            );
+        }
+    }
+
+    #[test]
+    fn developer_mode_toggle_requires_two_approvals() {
+        assert_eq!(DestructiveAction::DeveloperModeToggle.required_approvals(), 2);
+    }
+
+    // ── AdminRole Display Tests ──────────────────────────────────────────
+
+    #[test]
+    fn admin_role_display_matches_key_label() {
+        for role in &[
+            AdminRole::SuperAdmin,
+            AdminRole::UserManager,
+            AdminRole::DeviceManager,
+            AdminRole::Auditor,
+            AdminRole::ReadOnly,
+        ] {
+            assert_eq!(format!("{role}"), role.key_label());
+        }
+    }
+
+    // ── Route RBAC Policy Comprehensive Tests ────────────────────────────
+
+    #[test]
+    fn portal_creation_requires_user_manager() {
+        assert_eq!(
+            required_role_for_route("/api/portals", &Method::POST),
+            AdminRole::UserManager
+        );
+    }
+
+    #[test]
+    fn portal_listing_requires_auditor() {
+        assert_eq!(
+            required_role_for_route("/api/portals", &Method::GET),
+            AdminRole::Auditor
+        );
+    }
+
+    #[test]
+    fn portal_deletion_requires_user_manager() {
+        assert_eq!(
+            required_role_for_route("/api/portals/some-id", &Method::DELETE),
+            AdminRole::UserManager
+        );
+    }
+
+    #[test]
+    fn portal_check_access_allows_readonly() {
+        assert_eq!(
+            required_role_for_route("/api/portals/check-access", &Method::GET),
+            AdminRole::ReadOnly
+        );
+    }
+
+    #[test]
+    fn kt_endpoints_allow_readonly() {
+        assert_eq!(
+            required_role_for_route("/api/kt/root", &Method::GET),
+            AdminRole::ReadOnly
+        );
+        assert_eq!(
+            required_role_for_route("/api/kt/proof/someid", &Method::GET),
+            AdminRole::ReadOnly
+        );
+    }
+
+    #[test]
+    fn token_revocation_requires_user_manager() {
+        assert_eq!(
+            required_role_for_route("/api/tokens/revoke", &Method::POST),
+            AdminRole::UserManager
+        );
+    }
+
+    #[test]
+    fn revoked_token_count_requires_auditor() {
+        assert_eq!(
+            required_role_for_route("/api/tokens/revoked", &Method::GET),
+            AdminRole::Auditor
+        );
+    }
+
+    #[test]
+    fn siem_stream_requires_auditor() {
+        assert_eq!(
+            required_role_for_route("/api/admin/siem/stream", &Method::GET),
+            AdminRole::Auditor
+        );
+    }
+
+    #[test]
+    fn security_dashboard_requires_auditor() {
+        assert_eq!(
+            required_role_for_route("/api/security/dashboard", &Method::GET),
+            AdminRole::Auditor
+        );
+    }
+
+    #[test]
+    fn cac_enroll_requires_superadmin() {
+        assert_eq!(
+            required_role_for_route("/api/cac/enroll", &Method::POST),
+            AdminRole::SuperAdmin
+        );
+    }
+
+    #[test]
+    fn cac_authenticate_requires_auditor() {
+        assert_eq!(
+            required_role_for_route("/api/cac/authenticate", &Method::POST),
+            AdminRole::Auditor
+        );
+    }
+
+    #[test]
+    fn stig_audit_requires_auditor() {
+        assert_eq!(
+            required_role_for_route("/api/stig/audit", &Method::GET),
+            AdminRole::Auditor
+        );
+    }
+
+    #[test]
+    fn cmmc_assess_requires_auditor() {
+        assert_eq!(
+            required_role_for_route("/api/cmmc/assess", &Method::GET),
+            AdminRole::Auditor
+        );
+    }
+
+    #[test]
+    fn compliance_status_requires_auditor() {
+        assert_eq!(
+            required_role_for_route("/api/compliance/status", &Method::GET),
+            AdminRole::Auditor
+        );
+    }
+
+    #[test]
+    fn recovery_endpoints_require_user_manager() {
+        assert_eq!(
+            required_role_for_route("/api/recovery/generate", &Method::POST),
+            AdminRole::UserManager
+        );
+    }
+
+    #[test]
+    fn pending_admin_actions_require_superadmin() {
+        assert_eq!(
+            required_role_for_route("/api/admin/actions", &Method::GET),
+            AdminRole::SuperAdmin
+        );
+    }
+
+    #[test]
+    fn user_profile_allows_readonly() {
+        assert_eq!(
+            required_role_for_route("/api/user/profile", &Method::GET),
+            AdminRole::ReadOnly
+        );
+    }
+
+    #[test]
+    fn setup_status_allows_readonly() {
+        assert_eq!(
+            required_role_for_route("/api/setup/status", &Method::GET),
+            AdminRole::ReadOnly
+        );
+    }
+
+    // ── Ceremony Approval HMAC Tests ─────────────────────────────────────
+
+    #[test]
+    fn ceremony_approval_hmac_deterministic() {
+        let cid = Uuid::new_v4();
+        let aid = Uuid::new_v4();
+        let sig1 = compute_ceremony_approval_hmac(&cid, &aid);
+        let sig2 = compute_ceremony_approval_hmac(&cid, &aid);
+        assert_eq!(sig1, sig2);
+    }
+
+    #[test]
+    fn ceremony_approval_hmac_differs_per_ceremony() {
+        let c1 = Uuid::new_v4();
+        let c2 = Uuid::new_v4();
+        let approver = Uuid::new_v4();
+        assert_ne!(
+            compute_ceremony_approval_hmac(&c1, &approver),
+            compute_ceremony_approval_hmac(&c2, &approver)
+        );
+    }
+
+    #[test]
+    fn ceremony_approval_hmac_differs_per_approver() {
+        let cid = Uuid::new_v4();
+        let a1 = Uuid::new_v4();
+        let a2 = Uuid::new_v4();
+        assert_ne!(
+            compute_ceremony_approval_hmac(&cid, &a1),
+            compute_ceremony_approval_hmac(&cid, &a2)
+        );
+    }
+
+    #[test]
+    fn verify_ceremony_approval_valid() {
+        let cid = Uuid::new_v4();
+        let aid = Uuid::new_v4();
+        let sig = compute_ceremony_approval_hmac(&cid, &aid);
+        assert!(verify_ceremony_approval(&cid, &aid, &sig));
+    }
+
+    #[test]
+    fn verify_ceremony_approval_wrong_sig_rejected() {
+        let cid = Uuid::new_v4();
+        let aid = Uuid::new_v4();
+        assert!(!verify_ceremony_approval(&cid, &aid, &[0xFFu8; 64]));
+    }
+
+    #[test]
+    fn verify_ceremony_approval_wrong_approver_rejected() {
+        let cid = Uuid::new_v4();
+        let real = Uuid::new_v4();
+        let fake = Uuid::new_v4();
+        let sig = compute_ceremony_approval_hmac(&cid, &real);
+        assert!(!verify_ceremony_approval(&cid, &fake, &sig));
+    }
+
+    // ── Lockout Tier Escalation Tests ────────────────────────────────────
+
+    #[test]
+    fn lockout_escalates_through_tiers() {
+        let mut attempts = HashMap::new();
+        let now = now_secs();
+
+        // 5 attempts -> 30s lockout
+        attempts.insert("alice".to_string(), LoginAttemptEntry {
+            count: 5,
+            first_attempt: now - 20,
+            last_attempt: now,
+        });
+        assert!(is_locked_out("alice", "0.0.0.0", &attempts));
+
+        // 10 attempts -> 5m lockout
+        attempts.insert("alice".to_string(), LoginAttemptEntry {
+            count: 10,
+            first_attempt: now - 60,
+            last_attempt: now,
+        });
+        assert!(is_locked_out("alice", "0.0.0.0", &attempts));
+
+        // 20 attempts -> 30m lockout
+        attempts.insert("alice".to_string(), LoginAttemptEntry {
+            count: 20,
+            first_attempt: now - 120,
+            last_attempt: now,
+        });
+        assert!(is_locked_out("alice", "0.0.0.0", &attempts));
+    }
+
+    // ── Input Validation Constants Tests ─────────────────────────────────
+
+    #[test]
+    fn input_validation_constants_are_sane() {
+        assert!(MIN_PASSWORD_LEN >= 8, "minimum password must be at least 8");
+        assert!(MAX_PASSWORD_LEN >= MIN_PASSWORD_LEN);
+        assert!(MAX_USERNAME_LEN > 0);
+        assert!(MAX_PORTAL_NAME_LEN > 0);
+        assert!(MAX_CALLBACK_URL_LEN > 0);
+        assert!(INACTIVITY_TIMEOUT_SECS == 15 * 60, "AAL3 requires 15-minute timeout");
+    }
+
+    #[test]
+    fn csrf_token_ttl_is_reasonable() {
+        assert!(CSRF_TOKEN_TTL_SECS <= 300, "CSRF TTL should be short-lived");
+        assert!(CSRF_TOKEN_TTL_SECS >= 30, "CSRF TTL should allow form submission");
+    }
+
+    #[test]
+    fn revocation_constants_are_sane() {
+        assert!(MAX_REVOCATION_ENTRIES >= 1000);
+        assert!(MAX_TOKEN_LIFETIME_SECS > 0);
+    }
+
+    // ── derive_admin_audit_key Tests ─────────────────────────────────────
+
+    #[test]
+    fn derive_admin_audit_key_is_deterministic() {
+        let k1 = derive_admin_audit_key();
+        let k2 = derive_admin_audit_key();
+        assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn derive_admin_audit_key_is_64_bytes() {
+        let k = derive_admin_audit_key();
+        assert_eq!(k.len(), 64);
+    }
+
+    // ── DestructiveAction Display Tests ──────────────────────────────────
+
+    #[test]
+    fn destructive_action_display_format() {
+        assert_eq!(format!("{}", DestructiveAction::UserDeletion), "user_deletion");
+        assert_eq!(format!("{}", DestructiveAction::TierChange), "tier_change");
+        assert_eq!(format!("{}", DestructiveAction::KeyRotation), "key_rotation");
+        assert_eq!(
+            format!("{}", DestructiveAction::BulkDeviceRevocation),
+            "bulk_device_revocation"
+        );
+        assert_eq!(
+            format!("{}", DestructiveAction::DeveloperModeToggle),
+            "developer_mode_toggle"
+        );
     }
 }

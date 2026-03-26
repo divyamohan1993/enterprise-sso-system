@@ -83,3 +83,7 @@ pub mod physical_security;
 // ── Session recording & certificate lifecycle ──
 pub mod session_recording;
 pub mod cert_lifecycle;
+
+// ── Database HA and distributed sessions ──
+pub mod db_ha;
+pub mod distributed_session;

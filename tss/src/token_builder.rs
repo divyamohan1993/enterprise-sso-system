@@ -1,6 +1,7 @@
 use common::domain;
 use common::error::MilnetError;
-use common::types::{Token, TokenClaims, TokenHeader};
+use common::types::{EncryptedToken, Token, TokenClaims, TokenHeader};
+use crypto::jwe;
 use crypto::pq_sign::{pq_sign, PqSigningKey};
 use crypto::threshold::{threshold_sign, SignerShare, ThresholdGroup};
 use hmac::{Hmac, Mac};
@@ -86,6 +87,24 @@ pub fn build_token(
     })
 }
 
+/// Build a threshold-signed token with encrypted claims (monolithic, deprecated).
+///
+/// See [`build_encrypted_token_distributed`] for the preferred version.
+#[deprecated(note = "use build_encrypted_token_distributed — shares must not be co-located")]
+pub fn build_encrypted_token(
+    claims: &TokenClaims,
+    signers: &mut [SignerShare],
+    group: &ThresholdGroup,
+    ratchet_key: &[u8; 64],
+    pq_signing_key: &PqSigningKey,
+    audience: Option<String>,
+    claims_dek: &[u8; 32],
+) -> Result<EncryptedToken, MilnetError> {
+    #[allow(deprecated)]
+    let token = build_token(claims, signers, group, ratchet_key, pq_signing_key, audience)?;
+    jwe::encrypt_token(token, claims_dek).map_err(MilnetError::CryptoVerification)
+}
+
 /// Build a threshold-signed token using the distributed signing coordinator.
 ///
 /// Each `SignerNode` holds exactly ONE FROST key share and runs in its own
@@ -135,4 +154,29 @@ pub fn build_token_distributed(
         frost_signature,
         pq_signature,
     })
+}
+
+/// Build a threshold-signed token with encrypted claims for wire transmission.
+///
+/// The signing is performed over plaintext claims (for verifier-side decryption
+/// and verification), but the final token has claims encrypted so they are
+/// never plaintext on the wire.
+pub fn build_encrypted_token_distributed(
+    claims: &TokenClaims,
+    coordinator: &SigningCoordinator,
+    signers: &mut [&mut SignerNode],
+    ratchet_key: &[u8; 64],
+    pq_signing_key: &PqSigningKey,
+    audience: Option<String>,
+    claims_dek: &[u8; 32],
+) -> Result<EncryptedToken, MilnetError> {
+    let token = build_token_distributed(
+        claims,
+        coordinator,
+        signers,
+        ratchet_key,
+        pq_signing_key,
+        audience,
+    )?;
+    jwe::encrypt_token(token, claims_dek).map_err(MilnetError::CryptoVerification)
 }

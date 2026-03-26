@@ -204,7 +204,7 @@ fn ratchet_forward_secrecy() {
     for _ in 0..5 {
         let mut client_e = [0u8; 32]; let mut server_e = [0u8; 32]; let mut sn = [0u8; 32];
         getrandom::getrandom(&mut client_e).unwrap(); getrandom::getrandom(&mut server_e).unwrap(); getrandom::getrandom(&mut sn).unwrap();
-        chain.advance(&client_e, &server_e, &sn);
+        chain.advance(&client_e, &server_e, &sn).unwrap();
     }
 
     // Old tag should no longer verify — epoch 0 is outside the lookahead window

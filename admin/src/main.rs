@@ -40,6 +40,62 @@ async fn main() {
     let pool = common::db::init_database(&db_url).await;
     tracing::info!("Connected to PostgreSQL");
 
+    // ── HA pool with primary/replica routing ──
+    let replica_urls: Vec<String> = std::env::var("DATABASE_REPLICA_URLS")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+
+    let ha_config = {
+        let mut replicas = Vec::new();
+        for (i, url) in replica_urls.iter().enumerate() {
+            replicas.push(common::db_ha::NodeConfig {
+                node_id: format!("replica-{}", i + 1),
+                connection_url: url.clone(),
+                role: common::db_ha::NodeRole::Replica,
+                max_connections: 10,
+            });
+        }
+        common::db_ha::HaConfig {
+            primary: common::db_ha::NodeConfig {
+                node_id: "primary-1".into(),
+                connection_url: db_url.clone(),
+                role: common::db_ha::NodeRole::Primary,
+                max_connections: 20,
+            },
+            replicas,
+            ..common::db_ha::HaConfig::default()
+        }
+    };
+
+    if replica_urls.is_empty() {
+        tracing::warn!("No DATABASE_REPLICA_URLS configured — running without read replicas");
+    } else {
+        tracing::info!("HA pool configured with {} read replica(s)", replica_urls.len());
+    }
+
+    let ha_pool = common::db_ha::HaPool::new(ha_config);
+
+    // ── Envelope encryption for DB fields ──
+    let master_kek = common::sealed_keys::load_master_kek();
+    let encrypted_pool = common::encrypted_db::EncryptedPool::new(pool.clone(), master_kek);
+    tracing::info!("Envelope encryption initialized (AES-256-GCM, HKDF-SHA512 per-table KEKs)");
+
+    // ── Distributed session store (encrypted at rest) ──
+    let session_encryption_key = {
+        let encryptor = common::encrypted_db::FieldEncryptor::new(
+            common::sealed_keys::load_master_kek(),
+        );
+        encryptor.table_kek("sessions")
+    };
+    let session_store = common::distributed_session::DistributedSessionStore::new(
+        session_encryption_key,
+        common::distributed_session::SessionStoreConfig::default(),
+    );
+    tracing::info!("Distributed session store initialized (AES-256-GCM encrypted, tier-based TTLs)");
+
     // Pre-seed OAuth clients for known applications
     let mut oauth_clients = sso_protocol::clients::ClientRegistry::new();
 
@@ -48,11 +104,12 @@ async fn main() {
     let is_demo = std::env::var("MILNET_DEMO_MODE").is_ok();
     let is_production = std::env::var("MILNET_PRODUCTION").is_ok();
     if is_production && is_demo {
-        panic!(
+        tracing::error!(
             "FATAL: MILNET_PRODUCTION and MILNET_DEMO_MODE are both set. \
              Demo mode with hardcoded credentials is forbidden in production. \
              Unset MILNET_DEMO_MODE to proceed."
         );
+        std::process::exit(1);
     }
     if is_demo && !is_production {
         let demo_redirect = std::env::var("DEMO_REDIRECT_URI")
@@ -193,6 +250,9 @@ async fn main() {
         developer_mode: std::sync::atomic::AtomicBool::new(false),
         developer_log_level: std::sync::atomic::AtomicU8::new(common::config::LogLevel::Error as u8),
         pending_admin_actions: RwLock::new(std::collections::HashMap::new()),
+        ha_pool: std::sync::Mutex::new(ha_pool),
+        encrypted_pool,
+        session_store: RwLock::new(session_store),
     });
 
     // Start the key rotation monitor in the background
@@ -234,11 +294,12 @@ async fn main() {
 
     // In production, refuse to start without TLS — no exceptions.
     if is_production && !has_tls {
-        panic!(
+        tracing::error!(
             "FATAL: Admin API requires TLS in production. \
              Set ADMIN_TLS_CERT and ADMIN_TLS_KEY, or use a TLS-terminating reverse proxy \
              with REQUIRE_TLS=false and ADMIN_BIND_ADDR=127.0.0.1."
         );
+        std::process::exit(1);
     }
 
     if bind_addr == "0.0.0.0" && !has_tls {

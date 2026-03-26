@@ -2,7 +2,8 @@ use common::classification::{self, ClassificationLevel};
 use common::domain;
 use common::error::MilnetError;
 use common::revocation::{RevocationList, SharedRevocationList};
-use common::types::{Token, TokenClaims};
+use common::types::{EncryptedToken, Token, TokenClaims};
+use crypto::jwe;
 use crypto::pq_sign::{pq_verify, PqVerifyingKey};
 use frost_ristretto255::keys::PublicKeyPackage;
 use hmac::{Hmac, Mac};
@@ -33,19 +34,26 @@ const DPOP_REPLAY_CACHE_TTL_SECS: i64 = 60;
 // DPoP Replay Cache
 // ---------------------------------------------------------------------------
 
-/// Bounded DPoP proof replay cache with TTL-based eviction.
+/// Bounded DPoP proof replay cache with O(1) amortized operations.
 ///
-/// Prevents reuse of DPoP proofs within the tolerance window. Each proof is
-/// identified by its SHA-512 hash. Entries expire after `DPOP_REPLAY_CACHE_TTL_SECS`.
+/// Uses a two-generation approach: when the current generation fills up,
+/// swap it with the previous generation (which is discarded). This ensures
+/// O(1) amortized cleanup instead of O(n log n) emergency eviction.
 struct DpopReplayCache {
-    /// Map from proof hash -> timestamp when it was first seen.
-    seen: HashMap<[u8; 64], i64>,
+    /// Current generation of proof hashes.
+    current: HashMap<[u8; 64], i64>,
+    /// Previous generation — kept for overlap protection during rotation.
+    previous: HashMap<[u8; 64], i64>,
+    /// Timestamp of last rotation.
+    last_rotation: i64,
 }
 
 impl DpopReplayCache {
     fn new() -> Self {
         Self {
-            seen: HashMap::new(),
+            current: HashMap::new(),
+            previous: HashMap::new(),
+            last_rotation: 0,
         }
     }
 
@@ -64,25 +72,21 @@ impl DpopReplayCache {
             .unwrap()
             .as_secs() as i64;
 
-        // Cleanup if at capacity — TTL-based eviction first
-        if self.seen.len() >= DPOP_REPLAY_CACHE_MAX {
-            let cutoff = now - DPOP_REPLAY_CACHE_TTL_SECS;
-            self.seen.retain(|_, &mut ts| ts > cutoff);
-        }
-
-        // Hard cap: if TTL eviction wasn't enough (all entries are recent),
-        // perform emergency eviction of oldest entries to prevent unbounded growth.
-        if self.seen.len() > DPOP_REPLAY_CACHE_MAX {
-            let mut entries: Vec<_> = self.seen.drain().collect();
-            entries.sort_by_key(|(_, ts)| *ts);
-            entries.truncate(DPOP_REPLAY_CACHE_MAX / 2);
-            self.seen.extend(entries);
-        }
-
-        if self.seen.contains_key(proof_hash) {
+        // Check both generations — O(1)
+        if self.current.contains_key(proof_hash) || self.previous.contains_key(proof_hash) {
             return true; // Replay detected
         }
-        self.seen.insert(*proof_hash, now);
+
+        // Rotate generations when current is at capacity — O(1) amortized
+        if self.current.len() >= DPOP_REPLAY_CACHE_MAX / 2
+            && (now - self.last_rotation) > DPOP_REPLAY_CACHE_TTL_SECS
+        {
+            // Swap: old `previous` is dropped, old `current` becomes `previous`
+            self.previous = std::mem::take(&mut self.current);
+            self.last_rotation = now;
+        }
+
+        self.current.insert(*proof_hash, now);
         false
     }
 }
@@ -614,4 +618,199 @@ pub fn dpop_timestamp_tolerance_secs() -> i64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DPOP_TIMESTAMP_TOLERANCE_SECS)
+}
+
+// ---------------------------------------------------------------------------
+// Encrypted token verification
+// ---------------------------------------------------------------------------
+
+/// Verify an encrypted token: decrypt claims first, then run full verification.
+///
+/// This is the basic encrypted verification path. For production use, prefer
+/// [`verify_encrypted_token_full`] which includes revocation and DPoP checks.
+pub fn verify_encrypted_token(
+    encrypted_token: &EncryptedToken,
+    claims_dek: &[u8; 32],
+    public_key_package: &PublicKeyPackage,
+    pq_verifying_key: &PqVerifyingKey,
+) -> Result<TokenClaims, MilnetError> {
+    let token = jwe::decrypt_token(encrypted_token.clone(), claims_dek)
+        .map_err(MilnetError::CryptoVerification)?;
+    verify_token(&token, public_key_package, pq_verifying_key)
+}
+
+/// Full encrypted token verification: decrypt, then check revocation + DPoP + signatures.
+///
+/// This is the recommended entry point for production verification of encrypted
+/// tokens. It performs:
+/// 1. JWE decryption of claims (AES-256-GCM)
+/// 2. Fail-fast revocation check
+/// 3. Full signature + DPoP verification
+pub fn verify_encrypted_token_full(
+    encrypted_token: &EncryptedToken,
+    claims_dek: &[u8; 32],
+    public_key_package: &PublicKeyPackage,
+    pq_verifying_key: &PqVerifyingKey,
+    revocation_list: &RevocationList,
+    client_dpop_key: Option<&[u8]>,
+) -> Result<TokenClaims, MilnetError> {
+    let token = jwe::decrypt_token(encrypted_token.clone(), claims_dek)
+        .map_err(MilnetError::CryptoVerification)?;
+    verify_token_full(&token, public_key_package, pq_verifying_key, revocation_list, client_dpop_key)
+}
+
+/// Verify an encrypted token with shared revocation list (thread-safe).
+pub fn verify_encrypted_token_with_shared_revocation(
+    encrypted_token: &EncryptedToken,
+    claims_dek: &[u8; 32],
+    public_key_package: &PublicKeyPackage,
+    pq_verifying_key: &PqVerifyingKey,
+    revocation_list: &SharedRevocationList,
+    client_dpop_key: Option<&[u8]>,
+) -> Result<TokenClaims, MilnetError> {
+    let token = jwe::decrypt_token(encrypted_token.clone(), claims_dek)
+        .map_err(MilnetError::CryptoVerification)?;
+    verify_token_with_shared_revocation(
+        &token,
+        public_key_package,
+        pq_verifying_key,
+        revocation_list,
+        client_dpop_key,
+    )
+}
+
+/// Verify an encrypted token with audience validation.
+pub fn verify_encrypted_token_with_audience(
+    encrypted_token: &EncryptedToken,
+    claims_dek: &[u8; 32],
+    public_key_package: &PublicKeyPackage,
+    pq_verifying_key: &PqVerifyingKey,
+    revocation_list: &RevocationList,
+    client_dpop_key: Option<&[u8]>,
+    expected_audience: Option<&str>,
+) -> Result<TokenClaims, MilnetError> {
+    let token = jwe::decrypt_token(encrypted_token.clone(), claims_dek)
+        .map_err(MilnetError::CryptoVerification)?;
+    verify_token_with_audience(
+        &token,
+        public_key_package,
+        pq_verifying_key,
+        revocation_list,
+        client_dpop_key,
+        expected_audience,
+    )
+}
+
+/// Verify an encrypted token with classification enforcement (MAC).
+pub fn verify_encrypted_token_with_classification(
+    encrypted_token: &EncryptedToken,
+    claims_dek: &[u8; 32],
+    public_key_package: &PublicKeyPackage,
+    pq_verifying_key: &PqVerifyingKey,
+    revocation_list: &SharedRevocationList,
+    client_dpop_key: Option<&[u8]>,
+    required_classification: ClassificationLevel,
+) -> Result<TokenClaims, MilnetError> {
+    let token = jwe::decrypt_token(encrypted_token.clone(), claims_dek)
+        .map_err(MilnetError::CryptoVerification)?;
+    verify_token_with_classification(
+        &token,
+        public_key_package,
+        pq_verifying_key,
+        revocation_list,
+        client_dpop_key,
+        required_classification,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dpop_replay_cache_first_use() {
+        let mut hash = [0u8; 64];
+        getrandom::getrandom(&mut hash).unwrap();
+        // First use should NOT be a replay
+        assert!(!is_dpop_replay(&hash));
+    }
+
+    #[test]
+    fn test_dpop_replay_cache_second_use() {
+        let mut hash = [0u8; 64];
+        getrandom::getrandom(&mut hash).unwrap();
+        assert!(!is_dpop_replay(&hash));
+        // Second use SHOULD be a replay
+        assert!(is_dpop_replay(&hash));
+    }
+
+    #[test]
+    fn test_dpop_replay_cache_different_hashes() {
+        let mut hash1 = [0u8; 64];
+        let mut hash2 = [0u8; 64];
+        getrandom::getrandom(&mut hash1).unwrap();
+        getrandom::getrandom(&mut hash2).unwrap();
+        assert!(!is_dpop_replay(&hash1));
+        assert!(!is_dpop_replay(&hash2));
+        // Both should now be recorded
+        assert!(is_dpop_replay(&hash1));
+        assert!(is_dpop_replay(&hash2));
+    }
+
+    #[test]
+    fn test_dpop_timestamp_tolerance() {
+        // Default tolerance (no env var) should be 1 second
+        let tolerance = dpop_timestamp_tolerance_secs();
+        assert_eq!(tolerance, 1);
+    }
+
+    #[test]
+    fn test_compute_ratchet_tag_deterministic() {
+        let key = [0xAA; 64];
+        let claims_bytes = b"test claims data";
+        let epoch = 42u64;
+        let tag1 = compute_ratchet_tag(&key, claims_bytes, epoch);
+        let tag2 = compute_ratchet_tag(&key, claims_bytes, epoch);
+        assert_eq!(tag1, tag2, "same inputs must produce identical ratchet tags");
+    }
+
+    #[test]
+    fn test_compute_ratchet_tag_different_epochs() {
+        let key = [0xAA; 64];
+        let claims_bytes = b"test claims data";
+        let tag1 = compute_ratchet_tag(&key, claims_bytes, 1);
+        let tag2 = compute_ratchet_tag(&key, claims_bytes, 2);
+        assert_ne!(tag1, tag2, "different epochs must produce different tags");
+    }
+
+    #[test]
+    fn test_compute_ratchet_tag_different_keys() {
+        let key1 = [0xAA; 64];
+        let key2 = [0xBB; 64];
+        let claims_bytes = b"test claims data";
+        let tag1 = compute_ratchet_tag(&key1, claims_bytes, 1);
+        let tag2 = compute_ratchet_tag(&key2, claims_bytes, 1);
+        assert_ne!(tag1, tag2, "different keys must produce different tags");
+    }
+
+    #[test]
+    fn test_compute_ratchet_tag_different_claims() {
+        let key = [0xAA; 64];
+        let tag1 = compute_ratchet_tag(&key, b"claims A", 1);
+        let tag2 = compute_ratchet_tag(&key, b"claims B", 1);
+        assert_ne!(tag1, tag2, "different claims must produce different tags");
+    }
+
+    #[test]
+    fn test_compute_ratchet_tag_nonzero() {
+        let key = [0xAA; 64];
+        let tag = compute_ratchet_tag(&key, b"test", 1);
+        assert_ne!(tag, [0u8; 64], "ratchet tag should not be all zeros");
+    }
+
+    #[test]
+    fn test_dpop_required_always_true() {
+        // DPoP is always required (hardened policy)
+        assert!(dpop_required());
+    }
 }

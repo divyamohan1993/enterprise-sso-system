@@ -1171,7 +1171,7 @@ fn test_attack_ratchet_stolen_old_token_rejected() {
     for _ in 0..10 {
         let mut client_e = [0u8; 32]; let mut server_e = [0u8; 32]; let mut sn = [0u8; 32];
         getrandom::getrandom(&mut client_e).unwrap(); getrandom::getrandom(&mut server_e).unwrap(); getrandom::getrandom(&mut sn).unwrap();
-        chain.advance(&client_e, &server_e, &sn);
+        chain.advance(&client_e, &server_e, &sn).unwrap();
     }
     assert_eq!(chain.epoch(), 10);
 
@@ -1195,8 +1195,8 @@ fn test_attack_ratchet_cloned_server_detected() {
     for _ in 0..5 {
         let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];
         getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
-        original.advance(&ce, &se, &sn);
-        clone.advance(&ce, &se, &sn);
+        original.advance(&ce, &se, &sn).unwrap();
+        clone.advance(&ce, &se, &sn).unwrap();
     }
 
     let claims = b"test-claims";
@@ -1208,7 +1208,7 @@ fn test_attack_ratchet_cloned_server_detected() {
     {
         let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];
         getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
-        original.advance(&ce, &se, &sn);
+        original.advance(&ce, &se, &sn).unwrap();
     }
     assert_eq!(original.epoch(), 6);
     assert_eq!(clone.epoch(), 5);
@@ -1239,7 +1239,7 @@ fn test_attack_ratchet_cloned_server_detected() {
     {
         let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];
         getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
-        clone.advance(&ce, &se, &sn);
+        clone.advance(&ce, &se, &sn).unwrap();
     }
     let tag_clone_after_diverge = clone.generate_tag(claims);
     assert!(
@@ -1264,7 +1264,7 @@ fn test_attack_session_cannot_exceed_8_hours() {
     for _ in 0..2879 {
         let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];
         getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
-        chain.advance(&ce, &se, &sn);
+        chain.advance(&ce, &se, &sn).unwrap();
     }
     assert!(!chain.is_expired(), "epoch 2879 should not be expired");
 
@@ -1272,7 +1272,7 @@ fn test_attack_session_cannot_exceed_8_hours() {
     {
         let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];
         getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
-        chain.advance(&ce, &se, &sn);
+        chain.advance(&ce, &se, &sn).unwrap();
     }
     assert_eq!(chain.epoch(), 2880);
     assert!(
@@ -1284,7 +1284,7 @@ fn test_attack_session_cannot_exceed_8_hours() {
     {
         let mut ce = [0u8; 32]; let mut se = [0u8; 32]; let mut sn = [0u8; 32];
         getrandom::getrandom(&mut ce).unwrap(); getrandom::getrandom(&mut se).unwrap(); getrandom::getrandom(&mut sn).unwrap();
-        chain.advance(&ce, &se, &sn);
+        chain.advance(&ce, &se, &sn).unwrap();
     }
     assert!(chain.is_expired(), "epoch 2881 must still be expired");
 }

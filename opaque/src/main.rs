@@ -3,22 +3,100 @@
 //!
 //! SECURITY: This service is the SOLE holder of the receipt signing key.
 //! The key is generated (or loaded from HSM) inside `opaque::service::run()`
-//! and never leaves this process. The orchestrator forwards receipts to the
-//! TSS without re-signing.
+//! and never leaves this process.
+//!
+//! Supports two modes:
+//! - **threshold** (default): 2-of-3 distributed OPAQUE via Shamir secret sharing
+//! - **single**: Legacy single-server mode (dev/test only)
 
 use opaque::store::CredentialStore;
 
 #[tokio::main]
 async fn main() {
+    // Structured logging init
     tracing_subscriber::fmt::init();
 
     // Platform integrity: vTPM check, process hardening, self-attestation, monitor
     let (_platform_report, _monitor_handle, _monitor) =
         common::startup_checks::run_platform_checks(crypto::memguard::harden_process);
 
-    let store = CredentialStore::new();
-    if let Err(e) = opaque::service::run(store).await {
+    // STIG compliance audit (best-effort — log warnings, do not block startup)
+    match common::startup_checks::run_stig_audit() {
+        Ok(summary) => tracing::info!("STIG audit passed: {:?}", summary),
+        Err(failures) => tracing::warn!("STIG audit had {} failures", failures.len()),
+    }
+
+    let opaque_mode = std::env::var("MILNET_OPAQUE_MODE")
+        .unwrap_or_else(|_| "threshold".to_string());
+
+    let result = match opaque_mode.as_str() {
+        "threshold" => run_threshold_mode().await,
+        "single" => {
+            tracing::warn!("Running in SINGLE-SERVER mode (dev/test only — NOT for production)");
+            let store = CredentialStore::new();
+            opaque::service::run(store).await
+        }
+        other => {
+            eprintln!("Unknown MILNET_OPAQUE_MODE: '{other}' (expected 'threshold' or 'single')");
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = result {
         eprintln!("OPAQUE service error: {e}");
         std::process::exit(1);
     }
+}
+
+/// Run the OPAQUE service in threshold mode (2-of-3 distributed).
+///
+/// Generates an OPRF master key, splits it into Shamir shares, zeroizes the
+/// master key, and starts the threshold OPAQUE server with this node's share.
+async fn run_threshold_mode() -> Result<(), Box<dyn std::error::Error>> {
+    use opaque::threshold::{ThresholdOpaqueConfig, ThresholdOpaqueServer, generate_threshold_oprf_key};
+
+    let server_id: u8 = std::env::var("MILNET_OPAQUE_SERVER_ID")
+        .unwrap_or_else(|_| "1".to_string())
+        .parse()
+        .unwrap_or(1);
+
+    if server_id == 0 || server_id > 3 {
+        eprintln!("MILNET_OPAQUE_SERVER_ID must be 1, 2, or 3 (got {server_id})");
+        std::process::exit(1);
+    }
+
+    tracing::info!(
+        "Initializing threshold OPAQUE (2-of-3) as server {}",
+        server_id
+    );
+
+    // Generate OPRF master key and split into 3 Shamir shares.
+    // In production, shares would be pre-distributed from a key ceremony
+    // and loaded from an HSM or secure enclave — never generated at startup.
+    let keygen_result = generate_threshold_oprf_key(2, 3);
+
+    tracing::info!(
+        "OPRF key split into 3 shares (verification_key={:02x?}...)",
+        &keygen_result.verification_key[..8]
+    );
+
+    // Extract this server's share (1-indexed)
+    let my_share = keygen_result.shares[server_id as usize - 1].clone();
+
+    // The keygen_result (and its shares for other servers) will be dropped
+    // here. In production, the other shares would have been distributed to
+    // their respective servers during a key ceremony — they are never held
+    // by a single node at runtime.
+    drop(keygen_result);
+
+    let config = ThresholdOpaqueConfig {
+        threshold: 2,
+        total_servers: 3,
+        server_id,
+    };
+
+    let threshold_server = ThresholdOpaqueServer::new(config, my_share);
+
+    let store = CredentialStore::new();
+    opaque::service::run_threshold(store, server_id, threshold_server).await
 }
