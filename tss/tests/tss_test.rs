@@ -132,7 +132,8 @@ fn token_built_and_verifiable() {
         .expect("build_token should succeed");
 
     // Verify the FROST signature against the group key
-    let claims_bytes = postcard::to_allocvec(&claims).unwrap();
+    // Use token.claims (not original claims) because build_token may modify aud via prepare_claims_with_audience
+    let claims_bytes = postcard::to_allocvec(&token.claims).unwrap();
     let msg = [common::domain::FROST_TOKEN, claims_bytes.as_slice()].concat();
     assert!(verify_group_signature(&group, &msg, &token.frost_signature));
 }
@@ -318,7 +319,8 @@ fn test_distributed_token_built_and_verifiable() {
         .expect("build_token_distributed should succeed");
 
     // Verify the FROST signature against the group key
-    let claims_bytes = postcard::to_allocvec(&claims).unwrap();
+    // Use token.claims (not original claims) because build_token_distributed may modify aud
+    let claims_bytes = postcard::to_allocvec(&token.claims).unwrap();
     let msg = [common::domain::FROST_TOKEN, claims_bytes.as_slice()].concat();
     let group_for_verify = crypto::threshold::ThresholdGroup {
         threshold: 3,
