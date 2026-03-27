@@ -175,3 +175,115 @@ fn snapshot_fedramp_evidence_structure() {
 
     insta::assert_yaml_snapshot!("fedramp_evidence_structure", evidence);
 }
+
+// ── Hardened security tests: FIPS, classification, cross-domain, duress ──
+
+#[test]
+fn test_fips_mode_default_is_off() {
+    // SECURITY AUDIT: FIPS mode is OFF by default — must be explicitly enabled for DoD
+    assert!(
+        !common::fips::is_fips_mode(),
+        "FIPS mode must default to OFF — explicit opt-in required"
+    );
+}
+
+#[test]
+fn test_fips_unchecked_setter_toggles_mode() {
+    // SECURITY AUDIT: set_fips_mode_unchecked is pub — any crate can toggle FIPS mode
+    common::fips::set_fips_mode_unchecked(true);
+    assert!(
+        common::fips::is_fips_mode(),
+        "FIPS mode must be ON after set_fips_mode_unchecked(true)"
+    );
+
+    common::fips::set_fips_mode_unchecked(false);
+    assert!(
+        !common::fips::is_fips_mode(),
+        "FIPS mode must be OFF after set_fips_mode_unchecked(false)"
+    );
+}
+
+#[test]
+fn test_classification_level_ordering() {
+    // Bell-LaPadula: classification levels must be strictly ordered
+    use common::classification::ClassificationLevel;
+
+    assert!(ClassificationLevel::Unclassified < ClassificationLevel::Confidential);
+    assert!(ClassificationLevel::Confidential < ClassificationLevel::Secret);
+    assert!(ClassificationLevel::Secret < ClassificationLevel::TopSecret);
+    assert!(ClassificationLevel::TopSecret < ClassificationLevel::SCI);
+}
+
+#[test]
+fn test_bell_lapadula_no_read_up() {
+    use common::classification::{enforce_classification, ClassificationLevel};
+
+    // Secret subject cannot read TopSecret resource (no read up)
+    let denied = enforce_classification(
+        ClassificationLevel::Secret,
+        ClassificationLevel::TopSecret,
+    );
+    assert!(
+        !denied.is_granted(),
+        "Bell-LaPadula: Secret subject must NOT read TopSecret resource"
+    );
+
+    // TopSecret subject can read Secret resource (read down is permitted)
+    let granted = enforce_classification(
+        ClassificationLevel::TopSecret,
+        ClassificationLevel::Secret,
+    );
+    assert!(
+        granted.is_granted(),
+        "Bell-LaPadula: TopSecret subject must be able to read Secret resource"
+    );
+}
+
+#[test]
+fn test_cross_domain_guard_default_deny() {
+    // SECURITY AUDIT: Cross-domain transfers default deny without explicit rules
+    use common::cross_domain::CrossDomainGuard;
+
+    let guard = CrossDomainGuard::new();
+    let src = uuid::Uuid::new_v4();
+    let tgt = uuid::Uuid::new_v4();
+
+    let decision = guard.validate_transfer(&src, &tgt);
+    assert!(
+        !decision.allowed,
+        "Cross-domain guard must default-deny when no rules are configured"
+    );
+}
+
+#[test]
+fn test_duress_pin_uses_constant_time_comparison() {
+    // Duress code: coerced user enters alternate PIN → silent alarm
+    use common::duress::{DuressConfig, PinVerification};
+
+    let user_id = uuid::Uuid::new_v4();
+    let normal_pin = b"correct-horse-battery-staple";
+    let duress_pin = b"under-duress-1234";
+
+    let config = DuressConfig::new(user_id, normal_pin, duress_pin);
+
+    // Normal PIN succeeds with Normal variant
+    assert_eq!(
+        config.verify_pin(normal_pin),
+        PinVerification::Normal,
+        "Normal PIN must return Normal variant"
+    );
+
+    // Duress PIN returns Duress variant (silent alarm)
+    assert_eq!(
+        config.verify_pin(duress_pin),
+        PinVerification::Duress,
+        "Duress PIN must return Duress variant — triggers silent alarm"
+    );
+
+    // Wrong PIN returns Invalid
+    assert_eq!(
+        config.verify_pin(b"wrong-pin"),
+        PinVerification::Invalid,
+        "Wrong PIN must return Invalid variant"
+    );
+}

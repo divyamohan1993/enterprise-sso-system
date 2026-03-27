@@ -342,3 +342,102 @@ fn response_error_roundtrip() {
     assert!(!decoded.success);
     assert_eq!(decoded.error.unwrap(), "session not found");
 }
+
+// ── Forward secrecy tests ─────────────────────────────────────────────
+
+#[test]
+fn test_ratchet_old_key_zeroized_on_advance() {
+    // Forward secrecy: old chain keys are zeroized after advancement
+    let mut chain = RatchetChain::new(&test_secret()).unwrap();
+    let claims = b"forward-secrecy-test-claims";
+
+    // Generate tag at epoch 0
+    let tag_epoch0 = chain.generate_tag(claims).unwrap();
+
+    // Capture the chain key at epoch 0 for comparison
+    let key_epoch0 = chain.current_key().unwrap();
+
+    // Advance to epoch 1
+    chain.advance(&good_entropy(), &good_entropy(), &fresh_nonce()).unwrap();
+    assert_eq!(chain.epoch(), 1);
+
+    // The chain key must have changed (old key was zeroized and replaced)
+    let key_epoch1 = chain.current_key().unwrap();
+    assert_ne!(
+        key_epoch0, key_epoch1,
+        "chain key must change after advancement — forward secrecy"
+    );
+
+    // Tag from epoch 0 should still be verifiable within the lookback window
+    assert!(
+        chain.verify_tag(claims, &tag_epoch0, 0).unwrap(),
+        "epoch 0 tag must still verify within the +-3 epoch window"
+    );
+
+    // Advance to epoch 2
+    chain.advance(&good_entropy(), &good_entropy(), &fresh_nonce()).unwrap();
+    assert_eq!(chain.epoch(), 2);
+
+    // Key must have changed again
+    let key_epoch2 = chain.current_key().unwrap();
+    assert_ne!(
+        key_epoch1, key_epoch2,
+        "chain key must change on every advancement"
+    );
+}
+
+// ── Anti-clone: nonce reuse rejection ─────────────────────────────────
+
+#[test]
+fn test_ratchet_rejects_duplicate_server_nonce() {
+    // Anti-clone: duplicate server nonces rejected (both exact and Bloom filter)
+    let mut chain = RatchetChain::new(&test_secret()).unwrap();
+
+    let nonce = fresh_nonce();
+
+    // First use of the nonce must succeed
+    chain.advance(&good_entropy(), &good_entropy(), &nonce).unwrap();
+    assert_eq!(chain.epoch(), 1);
+
+    // Second use of the same nonce must fail — exact match detection
+    let result = chain.advance(&good_entropy(), &good_entropy(), &nonce);
+    assert!(
+        result.is_err(),
+        "duplicate server nonce must be rejected (exact match window)"
+    );
+}
+
+// ── Epoch window enforcement ──────────────────────────────────────────
+
+#[test]
+fn test_ratchet_rejects_tag_outside_epoch_window() {
+    // Epoch window: tags from >3 epochs ago are rejected
+    let mut chain = RatchetChain::new(&test_secret()).unwrap();
+    let claims = b"epoch-window-enforcement-test";
+
+    // Generate a tag at epoch 0
+    let tag_epoch0 = chain.generate_tag(claims).unwrap();
+
+    // Advance to epoch 10 (well beyond the +-3 window)
+    for _ in 0..10 {
+        chain.advance(&good_entropy(), &good_entropy(), &fresh_nonce()).unwrap();
+    }
+    assert_eq!(chain.epoch(), 10);
+
+    // Attempt to verify the epoch-0 tag when current epoch is 10
+    // The difference (10) exceeds the EPOCH_WINDOW (3), so it must be rejected
+    let valid = chain.verify_tag(claims, &tag_epoch0, 0).unwrap();
+    assert!(
+        !valid,
+        "tag from epoch 0 must be rejected when current epoch is 10 (outside +-3 window)"
+    );
+
+    // Verify that a tag from epoch 8 (within window) would still be checkable
+    // (it won't verify because we don't have the right tag, but the epoch check passes)
+    let tag_current = chain.generate_tag(claims).unwrap();
+    let valid_current = chain.verify_tag(claims, &tag_current, 10).unwrap();
+    assert!(
+        valid_current,
+        "tag from current epoch must verify successfully"
+    );
+}

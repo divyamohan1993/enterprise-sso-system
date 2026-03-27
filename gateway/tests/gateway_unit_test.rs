@@ -425,3 +425,47 @@ async fn test_rate_limit_config_from_defaults() {
     assert_eq!(config.burst_size, 20);
     assert!(config.redis_url.is_none());
 }
+
+// =========================================================================
+// Hardened Security Tests — Puzzle Replay & Adaptive Difficulty
+// =========================================================================
+
+#[test]
+fn test_consumed_puzzle_rejected_on_replay() {
+    // SECURITY AUDIT: Puzzle solutions must be single-use
+    let mut tracker = ConsumedPuzzles::new();
+    let nonce = [0xDE; 32];
+    let now = 5000i64;
+
+    // First use: not yet consumed
+    assert!(!tracker.is_consumed(&nonce), "fresh nonce must not be consumed");
+
+    // Mark as consumed
+    tracker.insert(nonce, now);
+
+    // Replay attempt: must be rejected
+    assert!(
+        tracker.is_consumed(&nonce),
+        "replayed nonce must be detected as consumed"
+    );
+}
+
+#[test]
+fn test_adaptive_difficulty_scales_with_connections() {
+    // DDoS protection: difficulty increases with connection count
+    let zero_load = get_adaptive_difficulty(0);
+    assert_eq!(zero_load, 0, "zero connections should yield difficulty 0");
+
+    let moderate_load = get_adaptive_difficulty(1000);
+    assert!(
+        moderate_load > 0,
+        "1000 connections should yield non-zero difficulty, got {}",
+        moderate_load
+    );
+
+    let extreme_load = get_adaptive_difficulty(5000);
+    assert_eq!(
+        extreme_load, 24,
+        "5000 connections should yield maximum difficulty (24)"
+    );
+}

@@ -144,3 +144,187 @@ fn test_jwt_tier_values_propagate() {
         }
     });
 }
+
+// ===========================================================================
+// Hardened security tests for authentication protocols
+// ===========================================================================
+
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+// SECURITY AUDIT: Empty JTI skips replay cache — tokens replayable until expiry
+#[test]
+fn test_empty_jti_bypasses_replay_protection() {
+    big(|| {
+        let user_id = Uuid::new_v4();
+
+        // Build a token with an empty JTI by manually constructing claims
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // Use raw keypair for manual token construction with empty JTI
+        let (sk, vk) = crypto::pq_sign::generate_pq_keypair();
+
+        let header = serde_json::json!({
+            "alg": "ML-DSA-87",
+            "typ": "JWT",
+            "kid": "milnet-mldsa87-v1"
+        });
+        let claims = serde_json::json!({
+            "iss": "https://iss",
+            "sub": user_id.to_string(),
+            "aud": "client",
+            "exp": now + 600,
+            "iat": now,
+            "nonce": null,
+            "auth_time": now,
+            "tier": 2,
+            "jti": ""
+        });
+
+        let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+        let claims_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+        let signing_input = format!("{header_b64}.{claims_b64}");
+
+        let signature = crypto::pq_sign::pq_sign_raw(&sk, signing_input.as_bytes());
+        let sig_b64 = URL_SAFE_NO_PAD.encode(&signature);
+        let token = format!("{signing_input}.{sig_b64}");
+
+        // First verification should succeed
+        let r1 = tokens::verify_id_token(&token, &vk);
+        assert!(r1.is_ok(), "first verify of empty-JTI token must succeed: {:?}", r1.err());
+
+        // Second verification of the SAME token should also succeed (no replay protection)
+        let r2 = tokens::verify_id_token(&token, &vk);
+        assert!(r2.is_ok(), "replay of empty-JTI token must succeed (no replay cache): {:?}", r2.err());
+    });
+}
+
+// Ensures only S256 is allowed per CNSA 2.0 requirements
+#[test]
+fn test_pkce_plain_method_rejected() {
+    assert!(pkce::validate_challenge_method(Some("plain")).is_err());
+    assert!(pkce::validate_challenge_method(Some("S256")).is_ok());
+}
+
+// Authorization codes must be single-use per RFC 6749
+#[test]
+fn test_auth_code_consumed_on_use() {
+    let mut store = AuthorizationStore::new();
+    let user_id = Uuid::new_v4();
+    let code = store
+        .create_code(
+            "client-1",
+            "https://app.example.com/cb",
+            user_id,
+            "openid",
+            Some("dummy-challenge".into()),
+            None,
+        )
+        .unwrap();
+
+    // First consumption must succeed
+    let first = store.consume_code(&code);
+    assert!(first.is_some(), "first consume must return the authorization code");
+
+    // Second consumption must return None — code is single-use
+    let second = store.consume_code(&code);
+    assert!(second.is_none(), "second consume must return None — code already used");
+}
+
+// Blocks alg confusion attacks (CVE-2022-21449 class)
+#[test]
+fn test_token_rejects_algorithm_confusion() {
+    big(|| {
+        let key = OidcSigningKey::generate();
+        let user_id = Uuid::new_v4();
+        let token = tokens::create_id_token("https://iss", &user_id, "c", None, &key);
+
+        // Tamper with the header: replace the algorithm with "HS256"
+        let parts: Vec<&str> = token.split('.').collect();
+        assert_eq!(parts.len(), 3);
+
+        let header_bytes = URL_SAFE_NO_PAD.decode(parts[0]).unwrap();
+        let mut header: serde_json::Value = serde_json::from_slice(&header_bytes).unwrap();
+        header["alg"] = serde_json::json!("HS256");
+
+        let tampered_header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+        let tampered_token = format!("{}.{}.{}", tampered_header_b64, parts[1], parts[2]);
+
+        // Verification must fail due to algorithm mismatch
+        let result = tokens::verify_id_token(&tampered_token, key.verifying_key());
+        assert!(result.is_err(), "algorithm confusion must be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("unsupported algorithm"),
+            "error must mention unsupported algorithm, got: {err}"
+        );
+    });
+}
+
+// Client secrets must be Argon2id hashed, never stored as plaintext
+#[test]
+fn test_client_secret_stored_as_argon2id_hash() {
+    let mut registry = ClientRegistry::new();
+    let client = registry.register_with_id(
+        "test-client-id",
+        "super-secret-value",
+        "Test App",
+        vec!["https://app.example.com/cb".into()],
+    );
+
+    // The stored secret must NOT be the plaintext
+    assert_ne!(
+        client.client_secret, "super-secret-value",
+        "client secret must not be stored as plaintext"
+    );
+
+    // The stored secret must be a hex-encoded hash (Argon2id output is 32 bytes = 64 hex chars)
+    assert_eq!(
+        client.client_secret.len(),
+        64,
+        "stored secret must be a 64-char hex-encoded Argon2id hash"
+    );
+    assert!(
+        client.client_secret.chars().all(|c| c.is_ascii_hexdigit()),
+        "stored secret must be valid hex (Argon2id hash)"
+    );
+
+    // Validation with the original plaintext must still succeed
+    assert!(
+        registry.validate("test-client-id", "super-secret-value").is_some(),
+        "plaintext secret must validate against the stored hash"
+    );
+
+    // Validation with wrong secret must fail
+    assert!(
+        registry.validate("test-client-id", "wrong-secret").is_none(),
+        "wrong secret must not validate"
+    );
+}
+
+// Implicit grant is banned for military deployments
+#[test]
+fn test_discovery_no_implicit_grant() {
+    let config = OpenIdConfiguration::new("https://sso.mil");
+
+    // response_types_supported must not contain "token" (implicit flow response type)
+    assert!(
+        !config.response_types_supported.contains(&"token".to_string()),
+        "implicit grant response type 'token' must not be advertised"
+    );
+
+    // Only "code" (authorization code flow) should be supported
+    assert!(
+        config.response_types_supported.contains(&"code".to_string()),
+        "authorization code response type must be supported"
+    );
+
+    // Verify the list contains exactly one entry to prevent future additions slipping through
+    assert_eq!(
+        config.response_types_supported.len(),
+        1,
+        "only 'code' response type should be supported — implicit and hybrid flows are banned"
+    );
+}

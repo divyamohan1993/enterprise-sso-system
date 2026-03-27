@@ -238,3 +238,104 @@ fn empty_sealed_share_rejected() {
     let result = unseal_signer_share("");
     assert!(result.is_err(), "empty sealed share must be rejected");
 }
+
+// ── Security hardening: trusted dealer DKG audit ─────────────────────────
+
+// SECURITY AUDIT: Trusted dealer DKG — full secret assembled in single process memory
+#[test]
+fn test_dkg_trusted_dealer_creates_all_shares_in_memory() {
+    let result = dkg(5, 3);
+
+    assert_eq!(
+        result.shares.len(),
+        5,
+        "trusted dealer DKG must produce exactly 5 shares"
+    );
+
+    // Verify all shares have distinct identifiers
+    let mut ids: Vec<_> = result.shares.iter().map(|s| s.identifier).collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(
+        ids.len(),
+        5,
+        "all 5 shares must have unique identifiers"
+    );
+
+    // Verify the group metadata is consistent
+    assert_eq!(result.group.total, 5);
+    assert_eq!(result.group.threshold, 3);
+}
+
+// ── Security hardening: below-threshold signing rejection ────────────────
+
+// FROST security: t-1 shares must not produce valid signature
+#[test]
+fn test_below_threshold_signing_rejected() {
+    let mut dkg_result = dkg(5, 3);
+
+    // Attempt to sign with only 2 shares (below threshold of 3)
+    let result = crypto::threshold::threshold_sign_with_indices(
+        &mut dkg_result.shares,
+        &dkg_result.group,
+        b"below-threshold-attempt",
+        3,
+        &[0, 1], // only 2 signers, need 3
+    );
+
+    assert!(
+        result.is_err(),
+        "signing with t-1 shares must be rejected by the protocol"
+    );
+
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("need at least 3 signers"),
+        "error must indicate insufficient signers, got: {err}"
+    );
+}
+
+// ── Security hardening: cross-group signature rejection ──────────────────
+
+#[test]
+fn test_frost_signature_rejects_wrong_group_key() {
+    // Generate two completely independent groups
+    let mut dkg1 = dkg(5, 3);
+    let mut dkg2 = dkg(5, 3);
+
+    // Sign a message with group1's shares
+    let message = b"cross-group-verification-test";
+    let sig = crypto::threshold::threshold_sign(
+        &mut dkg1.shares,
+        &dkg1.group,
+        message,
+        3,
+    )
+    .expect("signing with group1 must succeed");
+
+    // Verify against group1's key — must succeed
+    assert!(
+        verify_group_signature(&dkg1.group, message, &sig),
+        "signature must verify against the correct group key"
+    );
+
+    // Verify against group2's key — must fail
+    assert!(
+        !verify_group_signature(&dkg2.group, message, &sig),
+        "signature must NOT verify against a different group's key"
+    );
+
+    // Also sign with group2 and verify it doesn't cross-verify against group1
+    let sig2 = crypto::threshold::threshold_sign(
+        &mut dkg2.shares,
+        &dkg2.group,
+        message,
+        3,
+    )
+    .expect("signing with group2 must succeed");
+
+    assert!(
+        !verify_group_signature(&dkg1.group, message, &sig2),
+        "group2 signature must NOT verify against group1's key"
+    );
+}

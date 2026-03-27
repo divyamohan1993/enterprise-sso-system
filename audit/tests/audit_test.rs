@@ -354,3 +354,101 @@ fn test_unsigned_entries_rejected_during_verification() {
         );
     });
 }
+
+// ── Hardened security tests ───────────────────────────────────────────
+
+#[test]
+fn test_audit_chain_detects_tampered_entry() {
+    // SHA-512 hash chain detects retroactive tampering
+    run_with_large_stack(|| {
+        let (sk, _vk) = make_signing_key();
+        let mut log = AuditLog::new();
+        for _ in 0..5 {
+            log.append(
+                AuditEventType::AuthSuccess,
+                vec![Uuid::new_v4()],
+                vec![Uuid::new_v4()],
+                0.3,
+                Vec::new(),
+                &sk,
+            );
+        }
+        // Chain must verify before tampering
+        assert!(log.verify_chain(), "untampered chain must verify");
+
+        // Tamper with entry 2's event_type (retroactive modification)
+        let mut tampered_entries: Vec<common::types::AuditEntry> =
+            log.entries().to_vec();
+        tampered_entries[2].event_type = AuditEventType::ActionLevel4;
+
+        let tampered_log = AuditLog::from_entries(tampered_entries);
+        // Chain must fail because entry 3's prev_hash no longer matches
+        // the recomputed hash of the tampered entry 2
+        assert!(
+            !tampered_log.verify_chain(),
+            "tampered chain must fail verification"
+        );
+    });
+}
+
+#[test]
+fn test_audit_entry_signed_with_pq_signature() {
+    // Post-quantum audit signatures resist quantum cryptanalysis
+    run_with_large_stack(|| {
+        let (sk, _vk) = make_signing_key();
+        let mut log = AuditLog::new();
+        log.append(
+            AuditEventType::CredentialRegistered,
+            vec![Uuid::new_v4()],
+            vec![],
+            0.0,
+            Vec::new(),
+            &sk,
+        );
+        let entry = &log.entries()[0];
+        assert!(
+            !entry.signature.is_empty(),
+            "entry must have a non-empty pq_signature (ML-DSA-65 signed)"
+        );
+        // ML-DSA-65 signatures are 3309 bytes; verify it is substantial
+        assert!(
+            entry.signature.len() > 100,
+            "signature should be a full post-quantum signature, not a stub"
+        );
+    });
+}
+
+#[test]
+fn test_audit_log_append_only_ordering() {
+    // Append-only hash chain: each entry binds to its predecessor
+    run_with_large_stack(|| {
+        let (sk, _vk) = make_signing_key();
+        let mut log = AuditLog::new();
+        for _ in 0..3 {
+            log.append(
+                AuditEventType::KeyRotation,
+                vec![Uuid::new_v4()],
+                vec![],
+                0.0,
+                Vec::new(),
+                &sk,
+            );
+        }
+        let entries = log.entries();
+        assert_eq!(entries.len(), 3);
+
+        // Entry 0's prev_hash should be all zeros (genesis)
+        assert_eq!(entries[0].prev_hash, [0u8; 64], "first entry prev_hash must be zero");
+
+        // For entries 1 and 2: prev_hash must equal hash_entry of predecessor
+        for i in 1..entries.len() {
+            let expected = hash_entry(&entries[i - 1]);
+            assert_eq!(
+                entries[i].prev_hash, expected,
+                "entry {}'s prev_hash must equal hash_entry of entry {}",
+                i,
+                i - 1
+            );
+        }
+    });
+}

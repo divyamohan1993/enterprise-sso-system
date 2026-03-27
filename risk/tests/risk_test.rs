@@ -335,3 +335,110 @@ fn risk_request_end_to_end_with_engine() {
     assert!(decoded_resp.step_up_required);
     assert!(decoded_resp.session_terminate);
 }
+
+// ===========================================================================
+// Hardened security audit tests
+// ===========================================================================
+
+#[test]
+fn test_server_side_failed_attempts_override_client() {
+    // SECURITY AUDIT: Client-supplied failed_attempts is ignored; server tracks independently
+    let engine = RiskEngine::new();
+    let user = Uuid::new_v4();
+
+    // Client claims 100 failed attempts, but the server has recorded zero
+    let mut signals = clean_signals();
+    signals.recent_failed_attempts = 100;
+    // Set a non-zero field to avoid mimicry penalty conflating results
+    signals.device_attestation_age_secs = 1.0;
+
+    let score = engine.compute_score(&user, &signals);
+
+    // If the engine trusted the client's 100 failed attempts, the failed-attempt
+    // contribution alone would be min(100/5, 1.0) * 0.15 = 0.15. Since the
+    // server counter is 0 the contribution must be 0. Score should be only noise.
+    assert!(
+        score < 0.05,
+        "Client-supplied recent_failed_attempts=100 must be ignored; \
+         server counter is 0 so score should be < 0.05, got {score}"
+    );
+}
+
+#[test]
+fn test_all_zero_signals_triggers_mimicry_penalty() {
+    // SECURITY AUDIT: All-zero signals trigger mimicry detection (+0.05)
+    let engine = RiskEngine::new();
+    let user = Uuid::new_v4();
+
+    let signals = RiskSignals {
+        device_attestation_age_secs: 0.0,
+        geo_velocity_kmh: 0.0,
+        is_unusual_network: false,
+        is_unusual_time: false,
+        unusual_access_score: 0.0,
+        recent_failed_attempts: 0,
+        login_hour: None,
+        network_id: None,
+        session_duration_secs: None,
+    };
+
+    let score = engine.compute_score(&user, &signals);
+
+    // Mimicry penalty is +0.05 and CSPRNG noise adds [0.0, 0.03), so score > 0.0
+    assert!(
+        score > 0.0,
+        "All-zero signals must trigger mimicry penalty + CSPRNG noise; got {score}"
+    );
+    // More precisely, score should be in [0.05, 0.08)
+    assert!(
+        score >= 0.05,
+        "Mimicry penalty should contribute at least 0.05; got {score}"
+    );
+}
+
+#[test]
+fn test_orbital_speed_returns_max_risk() {
+    // Orbital speed check: > 10,000 km/h = immediate max risk
+    let engine = RiskEngine::new();
+    let user = Uuid::new_v4();
+
+    let mut signals = clean_signals();
+    signals.geo_velocity_kmh = 11000.0;
+
+    let score = engine.compute_score(&user, &signals);
+
+    assert!(
+        (score - 1.0).abs() < f64::EPSILON,
+        "Orbital speed (11,000 km/h) must return exactly 1.0; got {score}"
+    );
+}
+
+#[test]
+fn test_negative_signals_clamped_to_zero() {
+    // Negative signal values must be clamped — no panics, no negative scores
+    let engine = RiskEngine::new();
+    let user = Uuid::new_v4();
+
+    let signals = RiskSignals {
+        device_attestation_age_secs: -50.0,
+        geo_velocity_kmh: -100.0,
+        is_unusual_network: false,
+        is_unusual_time: false,
+        unusual_access_score: 0.0,
+        recent_failed_attempts: 0,
+        login_hour: None,
+        network_id: None,
+        session_duration_secs: None,
+    };
+
+    let score = engine.compute_score(&user, &signals);
+
+    assert!(
+        score >= 0.0,
+        "Negative signals must not produce a negative score; got {score}"
+    );
+    assert!(
+        score <= 1.0,
+        "Score must remain in [0.0, 1.0]; got {score}"
+    );
+}
