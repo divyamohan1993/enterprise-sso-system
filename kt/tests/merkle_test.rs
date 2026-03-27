@@ -112,13 +112,14 @@ fn test_merkle_inclusion_proof_verifies() {
 
     let root = tree.root();
 
-    // Verify inclusion proof for each leaf
+    // Verify inclusion proof for each leaf (must pass tree_size for odd-node promotion)
+    let tree_size = tree.len();
     for idx in 0..leaves.len() {
         let proof = tree
             .inclusion_proof(idx)
             .expect("proof must exist for valid index");
         assert!(
-            MerkleTree::verify_inclusion(&root, &leaves[idx], &proof, idx),
+            MerkleTree::verify_inclusion_with_size(&root, &leaves[idx], &proof, idx, tree_size),
             "inclusion proof for leaf {} must verify against root",
             idx
         );
