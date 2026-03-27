@@ -340,7 +340,7 @@ impl UebaStore {
             .as_secs() as i64;
 
         let last = *self.last_flush.lock().unwrap_or_else(|e| e.into_inner());
-        (now - last) as u64 >= self.flush_interval.as_secs()
+        (now - last).max(0) as u64 >= self.flush_interval.as_secs()
     }
 
     /// Flush all dirty baselines to encrypted records for DB persistence.

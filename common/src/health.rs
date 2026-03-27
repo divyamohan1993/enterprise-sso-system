@@ -125,3 +125,216 @@ impl Default for HealthMonitor {
         Self::new()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Structured health check endpoint support
+// ---------------------------------------------------------------------------
+
+/// Individual health check result.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HealthCheck {
+    /// Name of the check (e.g., "database", "peer_tss", "cert_validity").
+    pub name: String,
+    /// Whether this check passed.
+    pub ok: bool,
+    /// Human-readable detail (optional).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Latency of the check in milliseconds (optional).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+}
+
+/// Structured health response returned by `/healthz` endpoints.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HealthResponse {
+    /// Overall status: "healthy", "degraded", or "unhealthy".
+    pub status: String,
+    /// Individual check results.
+    pub checks: Vec<HealthCheck>,
+    /// Service name.
+    pub service: String,
+    /// Uptime in seconds.
+    pub uptime_secs: u64,
+}
+
+impl HealthResponse {
+    /// Compute overall status from individual checks.
+    pub fn from_checks(service: &str, checks: Vec<HealthCheck>, start_time: std::time::Instant) -> Self {
+        let all_ok = checks.iter().all(|c| c.ok);
+        let any_ok = checks.iter().any(|c| c.ok);
+        let status = if all_ok {
+            "healthy"
+        } else if any_ok {
+            "degraded"
+        } else {
+            "unhealthy"
+        };
+
+        Self {
+            status: status.to_string(),
+            checks,
+            service: service.to_string(),
+            uptime_secs: start_time.elapsed().as_secs(),
+        }
+    }
+
+    /// Serialize to JSON bytes.
+    pub fn to_json(&self) -> Vec<u8> {
+        serde_json::to_vec(self).unwrap_or_else(|_| b"{\"status\":\"unhealthy\"}".to_vec())
+    }
+}
+
+/// Check database connectivity by running `SELECT 1`.
+pub async fn check_db(pool: &sqlx::PgPool) -> HealthCheck {
+    let start = std::time::Instant::now();
+    match sqlx::query("SELECT 1").execute(pool).await {
+        Ok(_) => HealthCheck {
+            name: "database".to_string(),
+            ok: true,
+            detail: None,
+            latency_ms: Some(start.elapsed().as_millis() as u64),
+        },
+        Err(e) => HealthCheck {
+            name: "database".to_string(),
+            ok: false,
+            detail: Some(format!("connection failed: {e}")),
+            latency_ms: Some(start.elapsed().as_millis() as u64),
+        },
+    }
+}
+
+/// Check peer reachability from the HealthMonitor.
+pub fn check_peers(monitor: &HealthMonitor, required_peers: &[&str]) -> Vec<HealthCheck> {
+    required_peers
+        .iter()
+        .map(|peer| {
+            let status = monitor.peer_status(peer);
+            HealthCheck {
+                name: format!("peer_{}", peer),
+                ok: status == HealthStatus::Healthy || status == HealthStatus::Degraded,
+                detail: Some(format!("{:?}", status)),
+                latency_ms: None,
+            }
+        })
+        .collect()
+}
+
+/// Spawn a lightweight TCP-based `/healthz` endpoint on a dedicated port.
+///
+/// Each service should call this at startup with a closure that produces
+/// the current health checks.  The health port is `service_port + 1000`
+/// unless overridden by `MILNET_HEALTH_PORT`.
+///
+/// The server responds to any TCP connection with an HTTP/1.1 response
+/// containing the JSON health payload, then closes the connection.
+pub fn spawn_health_endpoint<F>(
+    service_name: String,
+    service_port: u16,
+    start_time: std::time::Instant,
+    check_fn: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: Fn() -> Vec<HealthCheck> + Send + Sync + 'static,
+{
+    let health_port = std::env::var("MILNET_HEALTH_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or_else(|| service_port.saturating_add(1000));
+
+    tokio::spawn(async move {
+        let addr = format!("0.0.0.0:{health_port}");
+        let listener = match tokio::net::TcpListener::bind(&addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(
+                    service = %service_name,
+                    port = health_port,
+                    error = %e,
+                    "Failed to bind health endpoint — health checks unavailable"
+                );
+                return;
+            }
+        };
+
+        tracing::info!(
+            service = %service_name,
+            addr = %addr,
+            "Health endpoint listening on /healthz"
+        );
+
+        loop {
+            let (mut stream, _peer) = match listener.accept().await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::debug!("Health endpoint accept error: {e}");
+                    continue;
+                }
+            };
+
+            let checks = check_fn();
+            let response = HealthResponse::from_checks(&service_name, checks, start_time);
+            let body = response.to_json();
+            let status_code = if response.status == "healthy" {
+                200
+            } else if response.status == "degraded" {
+                200
+            } else {
+                503
+            };
+
+            let http_response = format!(
+                "HTTP/1.1 {} OK\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\
+                 \r\n",
+                status_code,
+                body.len()
+            );
+
+            use tokio::io::AsyncWriteExt;
+            let _ = stream.write_all(http_response.as_bytes()).await;
+            let _ = stream.write_all(&body).await;
+            let _ = stream.shutdown().await;
+        }
+    })
+}
+
+/// Check mTLS certificate validity (time until rotation needed).
+pub fn check_cert_validity(
+    module_name: &str,
+    issued_at: std::time::Instant,
+    lifetime_hours: u64,
+) -> HealthCheck {
+    let age_secs = issued_at.elapsed().as_secs();
+    let lifetime_secs = lifetime_hours * 3600;
+    let remaining_secs = lifetime_secs.saturating_sub(age_secs);
+    let threshold_secs = (lifetime_secs as f64 * 0.8) as u64;
+
+    if age_secs < threshold_secs {
+        HealthCheck {
+            name: format!("cert_{}", module_name),
+            ok: true,
+            detail: Some(format!("{}h remaining", remaining_secs / 3600)),
+            latency_ms: None,
+        }
+    } else if remaining_secs > 0 {
+        HealthCheck {
+            name: format!("cert_{}", module_name),
+            ok: true,
+            detail: Some(format!(
+                "rotation threshold reached — {}h remaining",
+                remaining_secs / 3600
+            )),
+            latency_ms: None,
+        }
+    } else {
+        HealthCheck {
+            name: format!("cert_{}", module_name),
+            ok: false,
+            detail: Some("certificate EXPIRED".to_string()),
+            latency_ms: None,
+        }
+    }
+}

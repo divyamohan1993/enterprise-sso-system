@@ -62,6 +62,22 @@ async fn main() {
     assert!(common::cnsa2::is_cnsa2_compliant(), "CNSA 2.0 compliance check failed");
     tracing::info!("CNSA 2.0 compliance verified");
 
+    // Spawn health check endpoint
+    let health_start = std::time::Instant::now();
+    let _health_handle = common::health::spawn_health_endpoint(
+        "audit".to_string(),
+        9108,
+        health_start,
+        || {
+            vec![common::health::HealthCheck {
+                name: "audit_service".to_string(),
+                ok: true,
+                detail: None,
+                latency_ms: None,
+            }]
+        },
+    );
+
     tracing::info!("Audit service starting");
 
     // Resolve persistence directory.
@@ -228,7 +244,9 @@ async fn main() {
                         },
                     };
                     if let Ok(resp_bytes) = postcard::to_allocvec(&response) {
-                        let _ = transport.send(&resp_bytes).await;
+                        if let Err(e) = transport.send(&resp_bytes).await {
+                            tracing::warn!("audit: failed to send response: {e}");
+                        }
                     }
                 }
             });

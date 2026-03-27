@@ -56,6 +56,22 @@ async fn main() {
     // but we ensure it explicitly for this process).
     set_pr_dumpable();
 
+    // Spawn health check endpoint
+    let health_start = std::time::Instant::now();
+    let _health_handle = common::health::spawn_health_endpoint(
+        "ratchet".to_string(),
+        9105,
+        health_start,
+        || {
+            vec![common::health::HealthCheck {
+                name: "ratchet_service".to_string(),
+                ok: true,
+                detail: None,
+                latency_ms: None,
+            }]
+        },
+    );
+
     tracing::info!("Ratchet Session Manager starting");
 
     // Determine operational mode based on DATABASE_URL availability

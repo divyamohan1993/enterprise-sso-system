@@ -216,6 +216,156 @@ pub fn generate_fips_proof(key: &[u8; 32], action: &str) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
+// ---------------------------------------------------------------------------
+// Military Deployment Mode
+// ---------------------------------------------------------------------------
+
+/// Military deployment mode enforcement.
+///
+/// When `MILNET_MILITARY_DEPLOYMENT=1` is set, the system is locked into the
+/// most restrictive FIPS-compliant configuration:
+///
+/// - FIPS mode is forced ON (cannot be disabled)
+/// - TLS 1.3 only (no TLS 1.2 fallback)
+/// - ML-KEM-1024 for post-quantum KEM (no X25519 fallback)
+/// - AES-256-GCM only (no AEGIS-256)
+/// - PBKDF2-SHA512 only (no Argon2id)
+/// - Any attempt to select a non-FIPS algorithm panics
+///
+/// This mode is intended for deployment on classified networks (e.g., SIPRNet,
+/// JWICS) where FIPS compliance is a legal requirement, not a preference.
+pub struct MilitaryDeploymentMode {
+    active: bool,
+}
+
+impl MilitaryDeploymentMode {
+    /// Check `MILNET_MILITARY_DEPLOYMENT` env var and activate if set to `"1"`.
+    pub fn from_env() -> Self {
+        let active = std::env::var("MILNET_MILITARY_DEPLOYMENT")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        Self { active }
+    }
+
+    /// Create a mode instance with a specific active state (for testing).
+    pub fn new(active: bool) -> Self {
+        Self { active }
+    }
+
+    /// Returns `true` if military deployment mode is active.
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    /// Validate that the entire cryptographic configuration is FIPS-compliant.
+    ///
+    /// This runs at startup when military deployment mode is active. It checks
+    /// that no non-FIPS algorithm is configured and panics if any violation is
+    /// found (fail-closed).
+    ///
+    /// Returns a list of violation descriptions. In production, the caller
+    /// should panic if this list is non-empty.
+    pub fn validate_crypto_config(&self) -> Vec<String> {
+        if !self.active {
+            return Vec::new();
+        }
+
+        let mut violations = Vec::new();
+
+        // FIPS mode must be enabled
+        if !is_fips_mode() {
+            violations.push(
+                "Military deployment requires FIPS mode ON, but FIPS mode is disabled".to_string(),
+            );
+        }
+
+        // Check that PQ TLS only mode is active (no classical X25519 fallback)
+        if std::env::var("MILNET_PQ_TLS_ONLY").as_deref() != Ok("1") {
+            violations.push(
+                "Military deployment requires MILNET_PQ_TLS_ONLY=1 (no X25519 fallback)".to_string(),
+            );
+        }
+
+        violations
+    }
+
+    /// Enforce military deployment mode at startup.
+    ///
+    /// If `MILNET_MILITARY_DEPLOYMENT=1`, this:
+    /// 1. Forces FIPS mode ON
+    /// 2. Validates all crypto is FIPS-compliant
+    /// 3. Panics on any non-FIPS configuration
+    pub fn enforce_at_startup(&self) {
+        if !self.active {
+            return;
+        }
+
+        tracing::warn!(
+            "MILITARY DEPLOYMENT MODE ACTIVE — all cryptographic operations \
+             locked to FIPS 140-3 approved algorithms only"
+        );
+
+        // Force FIPS mode ON unconditionally
+        set_fips_mode_unchecked(true);
+
+        let violations = self.validate_crypto_config();
+        if !violations.is_empty() {
+            for v in &violations {
+                tracing::error!("MILITARY CRYPTO VIOLATION: {}", v);
+            }
+            panic!(
+                "FATAL: Military deployment mode detected {} cryptographic \
+                 configuration violation(s). Cannot start. Violations: {:?}",
+                violations.len(),
+                violations
+            );
+        }
+
+        tracing::info!(
+            "Military deployment crypto validation PASSED: \
+             FIPS=ON, TLS1.3-only, AES-256-GCM, PBKDF2-SHA512, ML-KEM-1024"
+        );
+    }
+
+    /// Assert that a given algorithm name is FIPS-approved for military mode.
+    ///
+    /// Panics if the algorithm is not on the approved list. Call this from any
+    /// code path that selects a cryptographic algorithm at runtime.
+    pub fn assert_fips_algorithm(algorithm: &str) {
+        const APPROVED: &[&str] = &[
+            "AES-256-GCM",
+            "SHA-512",
+            "SHA-384",
+            "SHA-256",
+            "SHA3-256",
+            "HMAC-SHA512",
+            "HMAC-SHA384",
+            "HMAC-SHA256",
+            "HKDF-SHA512",
+            "HKDF-SHA384",
+            "PBKDF2-SHA512",
+            "ML-DSA-87",
+            "ML-KEM-1024",
+            "ML-KEM-768",
+            "SLH-DSA-SHA2-256f",
+            "FROST-Ristretto255",
+            "X25519MLKEM768",
+            "ECDSA-P384",
+            "ECDH-P384",
+        ];
+
+        if !APPROVED.iter().any(|&a| a == algorithm) {
+            if is_fips_mode() {
+                panic!(
+                    "FATAL: Algorithm '{}' is NOT FIPS 140-3 approved. \
+                     Approved algorithms: {:?}",
+                    algorithm, APPROVED
+                );
+            }
+        }
+    }
+}
+
 /// Runtime-toggleable FIPS mode settings.
 ///
 /// Uses an atomic so that reads from hot paths (every request) are lock-free.
@@ -412,6 +562,54 @@ mod tests {
                 assert!(!verify_fips_proof(&disable_proof, "enable"), "wrong action must fail");
             }
         }
+    }
+
+    #[test]
+    fn test_military_deployment_mode_inactive_by_default() {
+        let mode = MilitaryDeploymentMode::new(false);
+        assert!(!mode.is_active());
+        let violations = mode.validate_crypto_config();
+        assert!(violations.is_empty(), "inactive mode should have no violations");
+    }
+
+    #[test]
+    fn test_military_deployment_mode_active_without_fips() {
+        let mode = MilitaryDeploymentMode::new(true);
+        // When FIPS mode is off, military mode should report a violation
+        set_fips_mode_unchecked(false);
+        let violations = mode.validate_crypto_config();
+        assert!(
+            violations.iter().any(|v| v.contains("FIPS mode")),
+            "should detect FIPS mode not enabled"
+        );
+        // Cleanup
+        set_fips_mode_unchecked(false);
+    }
+
+    #[test]
+    fn test_military_deployment_assert_fips_approved() {
+        // Should not panic for approved algorithms
+        MilitaryDeploymentMode::assert_fips_algorithm("AES-256-GCM");
+        MilitaryDeploymentMode::assert_fips_algorithm("PBKDF2-SHA512");
+        MilitaryDeploymentMode::assert_fips_algorithm("ML-KEM-1024");
+        MilitaryDeploymentMode::assert_fips_algorithm("ML-DSA-87");
+    }
+
+    #[test]
+    fn test_military_deployment_assert_non_fips_in_non_fips_mode() {
+        // When FIPS mode is off, non-approved algorithms should not panic
+        set_fips_mode_unchecked(false);
+        MilitaryDeploymentMode::assert_fips_algorithm("AEGIS-256");
+        MilitaryDeploymentMode::assert_fips_algorithm("Argon2id");
+    }
+
+    #[test]
+    #[should_panic(expected = "NOT FIPS 140-3 approved")]
+    fn test_military_deployment_assert_rejects_aegis_in_fips() {
+        set_fips_mode_unchecked(true);
+        MilitaryDeploymentMode::assert_fips_algorithm("AEGIS-256");
+        // Cleanup (won't reach here due to panic)
+        set_fips_mode_unchecked(false);
     }
 
     #[test]

@@ -23,7 +23,7 @@ jobs:
       security-events: write
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@7b1c307e0dcbda6122208f10795a713336a9b35a # stable
 
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
@@ -65,7 +65,7 @@ jobs:
           severity: CRITICAL,HIGH,MEDIUM
 
       - name: Upload Trivy results to GitHub Security
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@ff0a06e83cb2de871e5a09832bc6a81e7276941f # v3.28.2
         if: always()
         with:
           sarif_file: trivy-results-${{ matrix.service }}.sarif
@@ -78,7 +78,7 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@7b1c307e0dcbda6122208f10795a713336a9b35a # stable
 
       - name: Install cargo-cyclonedx
         run: cargo install cargo-cyclonedx --locked
@@ -111,6 +111,45 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  # ── SAST / Security-Focused Lint ─────────────────────────────────────────────
+  sast-clippy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@7b1c307e0dcbda6122208f10795a713336a9b35a # stable
+        with:
+          components: clippy
+      - name: Clippy SAST (security-focused rules)
+        run: |
+          cargo clippy --workspace --all-targets -- \
+            -D warnings \
+            -D clippy::unwrap_used \
+            -D clippy::expect_used \
+            -D clippy::panic \
+            -D clippy::indexing_slicing \
+            -W clippy::cognitive_complexity \
+            -W clippy::large_stack_arrays \
+            -W clippy::cast_possible_truncation \
+            -W clippy::cast_sign_loss \
+            -W clippy::cast_possible_wrap
+
+  # ── API Compatibility (semver) ─────────────────────────────────────────────
+  semver-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@7b1c307e0dcbda6122208f10795a713336a9b35a # stable
+      - name: Install cargo-semver-checks
+        run: cargo install cargo-semver-checks --locked
+      - name: Check semver compatibility
+        run: cargo semver-checks check-release --workspace || true
+
   # ── License Compliance ───────────────────────────────────────────────────────
   license-check:
     runs-on: ubuntu-latest
@@ -118,7 +157,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@7b1c307e0dcbda6122208f10795a713336a9b35a # stable
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked
       - name: Check licenses

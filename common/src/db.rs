@@ -6,7 +6,16 @@
 //! All data tables include a `tenant_id UUID NOT NULL` column and all queries
 //! are scoped through [`TenantAwarePool`] which enforces tenant isolation at
 //! both the application layer and via PostgreSQL Row-Level Security.
+//!
+//! ## Read-Only Fallback Mode
+//!
+//! When the primary database becomes unavailable, the system can degrade
+//! gracefully to read-only mode using `MILNET_DB_REPLICA_URL`.  In read-only
+//! mode, token verification and session lookups continue to work, while
+//! write operations (registration, password changes) return errors.
 
+use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use sqlx::postgres::PgPoolOptions;
@@ -14,6 +23,241 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::multi_tenancy::{TenantContext, TenantId};
+
+// ---------------------------------------------------------------------------
+// Database operating mode — graceful degradation
+// ---------------------------------------------------------------------------
+
+/// Operating mode of the database layer.
+///
+/// Transitions:
+/// - `ReadWrite` -> `ReadOnly`: primary health check fails, replica available
+/// - `ReadWrite` -> `Unavailable`: primary fails, no replica configured
+/// - `ReadOnly` -> `ReadWrite`: primary recovers
+/// - `Unavailable` -> `ReadWrite`: primary recovers
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DatabaseMode {
+    /// Full read-write access to the primary database.
+    ReadWrite = 0,
+    /// Primary is unreachable; reads are served from the async replica.
+    /// Writes (registration, password changes, new sessions) are rejected.
+    ReadOnly = 1,
+    /// Both primary and replica are unreachable.
+    Unavailable = 2,
+}
+
+impl DatabaseMode {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::ReadWrite,
+            1 => Self::ReadOnly,
+            _ => Self::Unavailable,
+        }
+    }
+
+    /// Returns `true` if write operations are allowed.
+    pub fn allows_writes(&self) -> bool {
+        matches!(self, Self::ReadWrite)
+    }
+
+    /// Returns `true` if read operations are allowed.
+    pub fn allows_reads(&self) -> bool {
+        matches!(self, Self::ReadWrite | Self::ReadOnly)
+    }
+}
+
+/// Thread-safe handle to the current database operating mode.
+///
+/// Shared across the application; the health check background task updates
+/// it, and request handlers read it to decide whether to accept writes.
+#[derive(Clone)]
+pub struct DatabaseModeHandle {
+    mode: Arc<AtomicU8>,
+}
+
+impl DatabaseModeHandle {
+    /// Create a new handle starting in `ReadWrite` mode.
+    pub fn new() -> Self {
+        Self {
+            mode: Arc::new(AtomicU8::new(DatabaseMode::ReadWrite as u8)),
+        }
+    }
+
+    /// Get the current database mode.
+    pub fn current(&self) -> DatabaseMode {
+        DatabaseMode::from_u8(self.mode.load(AtomicOrdering::SeqCst))
+    }
+
+    /// Set the database mode.  Logs transitions.
+    pub fn set(&self, new_mode: DatabaseMode) {
+        let old = DatabaseMode::from_u8(self.mode.swap(new_mode as u8, AtomicOrdering::SeqCst));
+        if old != new_mode {
+            match new_mode {
+                DatabaseMode::ReadWrite => {
+                    tracing::info!(
+                        target: "siem",
+                        old = ?old,
+                        new = ?new_mode,
+                        "Database mode RECOVERED to ReadWrite"
+                    );
+                }
+                DatabaseMode::ReadOnly => {
+                    tracing::warn!(
+                        target: "siem",
+                        old = ?old,
+                        new = ?new_mode,
+                        "Database DEGRADED to ReadOnly — writes will be rejected"
+                    );
+                }
+                DatabaseMode::Unavailable => {
+                    tracing::error!(
+                        target: "siem",
+                        old = ?old,
+                        new = ?new_mode,
+                        "Database UNAVAILABLE — all operations will fail"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Returns `true` if writes are currently allowed.
+    pub fn allows_writes(&self) -> bool {
+        self.current().allows_writes()
+    }
+
+    /// Returns `true` if reads are currently allowed.
+    pub fn allows_reads(&self) -> bool {
+        self.current().allows_reads()
+    }
+
+    /// Reject if writes are not allowed; returns a user-facing error string.
+    pub fn require_write(&self) -> Result<(), String> {
+        if self.allows_writes() {
+            Ok(())
+        } else {
+            Err("database is in read-only mode — write operations are temporarily unavailable".to_string())
+        }
+    }
+}
+
+impl Default for DatabaseModeHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Resilient database pool with primary + optional read replica.
+///
+/// The health check task periodically pings the primary; on failure it
+/// switches to `ReadOnly` mode (if a replica is configured) or `Unavailable`.
+pub struct ResilientPool {
+    /// Primary read-write pool.
+    pub primary: PgPool,
+    /// Optional read-replica pool (from `MILNET_DB_REPLICA_URL`).
+    pub replica: Option<PgPool>,
+    /// Current operating mode.
+    pub mode: DatabaseModeHandle,
+}
+
+impl ResilientPool {
+    /// Get the pool to use for read operations.
+    /// Returns the primary when healthy, falls back to the replica.
+    pub fn read_pool(&self) -> Option<&PgPool> {
+        match self.mode.current() {
+            DatabaseMode::ReadWrite => Some(&self.primary),
+            DatabaseMode::ReadOnly => self.replica.as_ref().or(Some(&self.primary)),
+            DatabaseMode::Unavailable => None,
+        }
+    }
+
+    /// Get the pool to use for write operations.
+    /// Returns `None` when not in `ReadWrite` mode.
+    pub fn write_pool(&self) -> Option<&PgPool> {
+        if self.mode.allows_writes() {
+            Some(&self.primary)
+        } else {
+            None
+        }
+    }
+
+    /// Run a periodic health check against the primary database.
+    /// If the primary fails, switch to ReadOnly (if replica available) or Unavailable.
+    /// If the primary recovers, switch back to ReadWrite.
+    pub async fn health_check(&self) {
+        let primary_ok = sqlx::query("SELECT 1")
+            .execute(&self.primary)
+            .await
+            .is_ok();
+
+        if primary_ok {
+            self.mode.set(DatabaseMode::ReadWrite);
+        } else if self.replica.is_some() {
+            let replica_ok = if let Some(ref replica) = self.replica {
+                sqlx::query("SELECT 1").execute(replica).await.is_ok()
+            } else {
+                false
+            };
+            if replica_ok {
+                self.mode.set(DatabaseMode::ReadOnly);
+            } else {
+                self.mode.set(DatabaseMode::Unavailable);
+            }
+        } else {
+            self.mode.set(DatabaseMode::Unavailable);
+        }
+    }
+
+    /// Spawn a background health check task that runs every `interval`.
+    pub fn spawn_health_check(self: &Arc<Self>, interval: Duration) -> tokio::task::JoinHandle<()> {
+        let pool = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            loop {
+                tick.tick().await;
+                pool.health_check().await;
+            }
+        })
+    }
+}
+
+/// Initialize a resilient pool with optional read replica.
+///
+/// Reads `MILNET_DB_REPLICA_URL` for the replica connection string.
+pub async fn init_resilient_pool(primary_pool: PgPool) -> Arc<ResilientPool> {
+    let replica = match std::env::var("MILNET_DB_REPLICA_URL") {
+        Ok(url) if !url.is_empty() => {
+            let ssl_url = enforce_ssl_in_url(&url);
+            match PgPoolOptions::new()
+                .max_connections(10)
+                .min_connections(1)
+                .acquire_timeout(Duration::from_secs(DEFAULT_ACQUIRE_TIMEOUT_SECS))
+                .max_lifetime(Duration::from_secs(MAX_LIFETIME_SECS))
+                .idle_timeout(Duration::from_secs(IDLE_TIMEOUT_SECS))
+                .test_before_acquire(true)
+                .connect(&ssl_url)
+                .await
+            {
+                Ok(pool) => {
+                    tracing::info!("Read replica pool initialized from MILNET_DB_REPLICA_URL");
+                    Some(pool)
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to connect to read replica: {e} — proceeding without replica");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
+    Arc::new(ResilientPool {
+        primary: primary_pool,
+        replica,
+        mode: DatabaseModeHandle::new(),
+    })
+}
 
 /// Default statement timeout in seconds.
 const DEFAULT_STATEMENT_TIMEOUT_SECS: u64 = 30;
@@ -256,7 +500,10 @@ pub async fn init_database(database_url: &str) -> PgPool {
         })
         .connect(connect_url)
         .await
-        .expect("Failed to connect to PostgreSQL");
+        .unwrap_or_else(|e| {
+            tracing::error!("FATAL: failed to connect to PostgreSQL: {e}");
+            panic!("database connection failed: {e}");
+        });
 
     // ── Tenants table (must exist before FK-constrained data tables) ──
     sqlx::query(r#"
@@ -1198,6 +1445,60 @@ pub struct TenantRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── DatabaseMode / DatabaseModeHandle tests ──────────────────────
+
+    #[test]
+    fn test_database_mode_from_u8() {
+        assert_eq!(DatabaseMode::from_u8(0), DatabaseMode::ReadWrite);
+        assert_eq!(DatabaseMode::from_u8(1), DatabaseMode::ReadOnly);
+        assert_eq!(DatabaseMode::from_u8(2), DatabaseMode::Unavailable);
+        assert_eq!(DatabaseMode::from_u8(255), DatabaseMode::Unavailable);
+    }
+
+    #[test]
+    fn test_database_mode_allows() {
+        assert!(DatabaseMode::ReadWrite.allows_writes());
+        assert!(DatabaseMode::ReadWrite.allows_reads());
+
+        assert!(!DatabaseMode::ReadOnly.allows_writes());
+        assert!(DatabaseMode::ReadOnly.allows_reads());
+
+        assert!(!DatabaseMode::Unavailable.allows_writes());
+        assert!(!DatabaseMode::Unavailable.allows_reads());
+    }
+
+    #[test]
+    fn test_database_mode_handle_transitions() {
+        let handle = DatabaseModeHandle::new();
+        assert_eq!(handle.current(), DatabaseMode::ReadWrite);
+        assert!(handle.allows_writes());
+        assert!(handle.allows_reads());
+
+        handle.set(DatabaseMode::ReadOnly);
+        assert_eq!(handle.current(), DatabaseMode::ReadOnly);
+        assert!(!handle.allows_writes());
+        assert!(handle.allows_reads());
+        assert!(handle.require_write().is_err());
+
+        handle.set(DatabaseMode::Unavailable);
+        assert_eq!(handle.current(), DatabaseMode::Unavailable);
+        assert!(!handle.allows_writes());
+        assert!(!handle.allows_reads());
+
+        handle.set(DatabaseMode::ReadWrite);
+        assert_eq!(handle.current(), DatabaseMode::ReadWrite);
+        assert!(handle.require_write().is_ok());
+    }
+
+    #[test]
+    fn test_database_mode_handle_clone_shares_state() {
+        let handle1 = DatabaseModeHandle::new();
+        let handle2 = handle1.clone();
+
+        handle1.set(DatabaseMode::ReadOnly);
+        assert_eq!(handle2.current(), DatabaseMode::ReadOnly);
+    }
 
     #[test]
     fn validate_user_ids_valid_array() {

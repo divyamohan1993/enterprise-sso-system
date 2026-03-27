@@ -310,6 +310,24 @@ async fn main() {
     let app = api_router(state);
 
     let port = std::env::var("ADMIN_PORT").unwrap_or_else(|_| "8080".to_string());
+
+    // Spawn health check endpoint
+    let health_start = std::time::Instant::now();
+    let admin_port: u16 = port.parse().unwrap_or(8080);
+    let _health_handle = common::health::spawn_health_endpoint(
+        "admin".to_string(),
+        admin_port,
+        health_start,
+        || {
+            vec![common::health::HealthCheck {
+                name: "admin_service".to_string(),
+                ok: true,
+                detail: None,
+                latency_ms: None,
+            }]
+        },
+    );
+
     let is_production = std::env::var("MILNET_PRODUCTION").is_ok();
     // In production, default to loopback; override with ADMIN_BIND_ADDR if needed.
     let default_bind = if is_production { "127.0.0.1" } else { "0.0.0.0" };

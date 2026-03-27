@@ -96,10 +96,13 @@ pub fn load_master_kek() -> [u8; 32] {
     use zeroize::Zeroize;
     match std::env::var("MILNET_MASTER_KEK") {
         Ok(mut hex_str) if hex_str.len() >= 64 => {
-            // Remove from process environment to prevent /proc/pid/environ leakage.
-            // Callers should cache the returned key.
+            // Remove from process environment IMMEDIATELY to minimize the
+            // race window where /proc/pid/environ exposes the KEK.
             #[cfg(not(test))]
             std::env::remove_var("MILNET_MASTER_KEK");
+            // Memory fence to ensure the remove_var write is visible to other
+            // threads before we proceed with key parsing.
+            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
             let mut key = [0u8; 32];
             for (i, chunk) in hex_str.as_bytes().chunks(2).take(32).enumerate() {
                 let hex = std::str::from_utf8(chunk)
@@ -256,7 +259,7 @@ fn load_key_hardened(var: &str, purpose: &str, dev_seed: &[u8]) -> [u8; 64] {
 
 /// Unseal a hex-encoded sealed key using the master KEK.
 fn unseal_key_from_hex(hex_str: &str, purpose: &str) -> Option<[u8; 64]> {
-    let sealed_bytes: Vec<u8> = (0..hex_str.len())
+    let mut sealed_bytes: Vec<u8> = (0..hex_str.len())
         .step_by(2)
         .filter_map(|i| {
             hex_str.get(i..i + 2).and_then(|s| u8::from_str_radix(s, 16).ok())
@@ -264,26 +267,33 @@ fn unseal_key_from_hex(hex_str: &str, purpose: &str) -> Option<[u8; 64]> {
         .collect();
 
     if sealed_bytes.len() < 12 + 16 + 64 {
+        sealed_bytes.zeroize();
         return None;
     }
 
     let master_kek = cached_master_kek();
-    let unseal_key = derive_unseal_key(master_kek, purpose);
+    let mut unseal_key = derive_unseal_key(master_kek, purpose);
 
     use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
     use aes_gcm::aead::Aead;
 
     let cipher = Aes256Gcm::new_from_slice(&unseal_key).ok()?;
+    // Zeroize derived key as soon as the cipher is initialized
+    unseal_key.zeroize();
     let nonce = Nonce::from_slice(&sealed_bytes[..12]);
     let aad = format!("MILNET-SEALED-KEY-v1:{purpose}");
-    let plaintext = cipher
+    let result = cipher
         .decrypt(nonce, aes_gcm::aead::Payload {
             msg: &sealed_bytes[12..],
             aad: aad.as_bytes(),
-        })
-        .ok()?;
+        });
+    // Zeroize sealed_bytes immediately after decryption attempt
+    sealed_bytes.zeroize();
+    let plaintext = result.ok()?;
 
     if plaintext.len() != 64 {
+        let mut plaintext = plaintext;
+        plaintext.zeroize();
         return None;
     }
 
@@ -291,7 +301,6 @@ fn unseal_key_from_hex(hex_str: &str, purpose: &str) -> Option<[u8; 64]> {
     key.copy_from_slice(&plaintext);
     // Zeroize the intermediate plaintext Vec to prevent heap fragment leakage
     let mut plaintext = plaintext;
-    use zeroize::Zeroize;
     plaintext.zeroize();
     Some(key)
 }

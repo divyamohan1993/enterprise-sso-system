@@ -83,11 +83,30 @@ async fn main() {
 
         // CNSA 2.0 compliant: TLS 1.3 only with AES-256-GCM-SHA384
         // Post-quantum hybrid key exchange: X25519MLKEM768 preferred, X25519 fallback.
-        // Set MILNET_PQ_TLS_ONLY=1 to remove classical fallback (CNSA 2.0 strict).
-        let pq_only = std::env::var("MILNET_PQ_TLS_ONLY")
+        // Set MILNET_PQ_TLS_ONLY=1 or MILNET_MILITARY_DEPLOYMENT=1 to remove
+        // classical fallback entirely (CNSA 2.0 strict / military mode).
+        //
+        // TODO(CNSA2-TLS): Upgrade to X25519MLKEM1024 when rustls/aws-lc-rs exposes it.
+        // The application layer uses ML-KEM-1024 (via crypto::xwing) but TLS is limited
+        // to ML-KEM-768 because rustls::crypto::aws_lc_rs::kx_group only exports
+        // X25519MLKEM768 as of rustls 0.23.x / aws-lc-rs 1.x. This is a known
+        // discrepancy: TLS uses ML-KEM-768 while application-layer key agreement
+        // uses ML-KEM-1024. Both provide post-quantum security; ML-KEM-1024 offers
+        // a larger security margin (NIST Level 5 vs Level 3). Track upstream:
+        //   - https://github.com/rustls/rustls/issues (X25519MLKEM1024 support)
+        //   - https://github.com/aws/aws-lc-rs/issues (ML-KEM-1024 kx group)
+        let military_mode = std::env::var("MILNET_MILITARY_DEPLOYMENT")
             .map(|v| v == "1")
             .unwrap_or(false);
+        let pq_only = military_mode
+            || std::env::var("MILNET_PQ_TLS_ONLY")
+                .map(|v| v == "1")
+                .unwrap_or(false);
         let kx_groups: Vec<&'static dyn rustls::crypto::SupportedKxGroup> = if pq_only {
+            tracing::info!(
+                military_mode = military_mode,
+                "PQ-only TLS mode: X25519 classical fallback REMOVED — only X25519MLKEM768 allowed"
+            );
             vec![
                 rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768,
             ]
@@ -97,6 +116,14 @@ async fn main() {
                 rustls::crypto::aws_lc_rs::kx_group::X25519,
             ]
         };
+
+        // Startup integrity check: in military mode, PANIC if classical fallback is present
+        if military_mode && kx_groups.len() > 1 {
+            panic!(
+                "FATAL: MILNET_MILITARY_DEPLOYMENT=1 but X25519 classical fallback is present \
+                 in TLS key exchange groups. This MUST NOT happen in military deployments."
+            );
+        }
         let provider = rustls::crypto::CryptoProvider {
             cipher_suites: vec![rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_256_GCM_SHA384],
             kx_groups,
@@ -128,6 +155,23 @@ async fn main() {
             .await
             .expect("failed to bind gateway")
     };
+
+    // Spawn health check endpoint on port+1000 (or MILNET_HEALTH_PORT)
+    let health_start = std::time::Instant::now();
+    let svc_port: u16 = port.parse().unwrap_or(9100);
+    let _health_handle = common::health::spawn_health_endpoint(
+        "gateway".to_string(),
+        svc_port,
+        health_start,
+        || {
+            vec![common::health::HealthCheck {
+                name: "gateway_listener".to_string(),
+                ok: true,
+                detail: None,
+                latency_ms: None,
+            }]
+        },
+    );
 
     tracing::info!("Gateway listening on {addr}");
     server.run().await.expect("gateway server error");

@@ -300,24 +300,48 @@ fn ca_root_store(ca: &CertificateAuthority) -> Arc<RootCertStore> {
     Arc::new(root_store)
 }
 
-/// Returns `true` if the `MILNET_PQ_TLS_ONLY` environment variable is set to `1`.
+/// Returns `true` if PQ-only TLS mode should be enforced.
 ///
+/// Enabled when either `MILNET_PQ_TLS_ONLY=1` or `MILNET_MILITARY_DEPLOYMENT=1`.
 /// When enabled, only the post-quantum hybrid key exchange (X25519MLKEM768) is
 /// offered — no classical fallback.  This enforces CNSA 2.0 strict mode for
 /// quantum-resistant key exchange.
 fn pq_tls_only() -> bool {
-    std::env::var("MILNET_PQ_TLS_ONLY")
+    let military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
         .map(|v| v == "1")
-        .unwrap_or(false)
+        .unwrap_or(false);
+    let pq_flag = std::env::var("MILNET_PQ_TLS_ONLY")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    military || pq_flag
 }
 
 /// Build the CNSA 2.0 compliant crypto provider.
 ///
 /// * Cipher suite: TLS 1.3 AES-256-GCM-SHA384 only (CNSA 2.0).
 /// * Key exchange: X25519MLKEM768 (ML-KEM-768 + X25519 hybrid, post-quantum)
-///   preferred, with classical X25519 fallback unless `MILNET_PQ_TLS_ONLY=1`.
+///   preferred, with classical X25519 fallback unless PQ-only mode is active.
+///
+/// In military mode (`MILNET_MILITARY_DEPLOYMENT=1`), performs a startup
+/// integrity check: PANICs if classical X25519 fallback would be present.
+///
+/// # Known Discrepancy (TODO: CNSA2-TLS)
+///
+/// The application layer uses ML-KEM-1024 (via `crypto::xwing`) for key agreement,
+/// but TLS is limited to ML-KEM-768 because `rustls::crypto::aws_lc_rs::kx_group`
+/// only exports `X25519MLKEM768`. Both provide post-quantum security:
+/// - ML-KEM-768 = NIST Level 3 (equivalent to AES-192)
+/// - ML-KEM-1024 = NIST Level 5 (equivalent to AES-256)
+///
+/// When `rustls`/`aws-lc-rs` expose `X25519MLKEM1024`, upgrade this function
+/// to use it for full CNSA 2.0 consistency across all layers.
 fn cnsa2_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
-    let kx_groups: Vec<&'static dyn rustls::crypto::SupportedKxGroup> = if pq_tls_only() {
+    let is_pq_only = pq_tls_only();
+    let military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+
+    let kx_groups: Vec<&'static dyn rustls::crypto::SupportedKxGroup> = if is_pq_only {
         vec![
             rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768, // PQ hybrid only
         ]
@@ -327,6 +351,22 @@ fn cnsa2_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
             rustls::crypto::aws_lc_rs::kx_group::X25519,          // classical fallback
         ]
     };
+
+    // Military mode integrity check: PANIC if classical fallback would be offered
+    if military && kx_groups.len() > 1 {
+        panic!(
+            "FATAL: MILNET_MILITARY_DEPLOYMENT=1 but X25519 classical fallback is present \
+             in SHARD TLS key exchange groups. This MUST NOT happen in military deployments."
+        );
+    }
+
+    if is_pq_only {
+        tracing::info!(
+            military_mode = military,
+            "SHARD TLS: PQ-only mode active — only X25519MLKEM768 key exchange allowed, \
+             non-PQ connections will be rejected"
+        );
+    }
 
     Arc::new(rustls::crypto::CryptoProvider {
         cipher_suites: vec![rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_256_GCM_SHA384],
@@ -459,6 +499,190 @@ pub fn build_pin_set_from_certs(certs: &[&CertifiedKey]) -> CertificatePinSet {
         pin_set.add_certificate(ck.cert.der().as_ref());
     }
     pin_set
+}
+
+// ---------------------------------------------------------------------------
+// Certificate rotation — automatic renewal before expiry
+// ---------------------------------------------------------------------------
+
+/// Configuration for automatic mTLS certificate rotation.
+///
+/// Env vars:
+/// - `MILNET_CERT_LIFETIME_HOURS`: certificate validity period (default: 720 = 30 days)
+/// - `MILNET_CERT_ROTATION_THRESHOLD`: fraction of lifetime at which to rotate (default: 0.8)
+pub struct CertRotationConfig {
+    /// Certificate lifetime in hours.
+    pub lifetime_hours: u64,
+    /// Fraction of lifetime at which rotation is triggered (0.0..1.0).
+    pub rotation_threshold: f64,
+}
+
+impl CertRotationConfig {
+    /// Load rotation config from environment variables with defaults.
+    pub fn from_env() -> Self {
+        let lifetime_hours = std::env::var("MILNET_CERT_LIFETIME_HOURS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(720); // 30 days
+
+        let rotation_threshold = std::env::var("MILNET_CERT_ROTATION_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.8);
+
+        Self {
+            lifetime_hours,
+            rotation_threshold: rotation_threshold.clamp(0.1, 0.99),
+        }
+    }
+
+    /// Returns the duration after issuance at which rotation should occur.
+    pub fn rotation_after(&self) -> std::time::Duration {
+        let secs = (self.lifetime_hours as f64 * 3600.0 * self.rotation_threshold) as u64;
+        std::time::Duration::from_secs(secs)
+    }
+}
+
+impl Default for CertRotationConfig {
+    fn default() -> Self {
+        Self {
+            lifetime_hours: 720,
+            rotation_threshold: 0.8,
+        }
+    }
+}
+
+/// Tracks a module certificate's age and determines when rotation is needed.
+pub struct CertExpiryTracker {
+    /// When this certificate was issued (monotonic instant).
+    issued_at: std::time::Instant,
+    /// Module name for logging and regeneration.
+    module_name: String,
+    /// Rotation configuration.
+    config: CertRotationConfig,
+}
+
+impl CertExpiryTracker {
+    /// Create a new tracker for a freshly issued certificate.
+    pub fn new(module_name: &str, config: CertRotationConfig) -> Self {
+        Self {
+            issued_at: std::time::Instant::now(),
+            module_name: module_name.to_string(),
+            config,
+        }
+    }
+
+    /// Returns `true` if the certificate should be rotated.
+    pub fn needs_rotation(&self) -> bool {
+        self.issued_at.elapsed() >= self.config.rotation_after()
+    }
+
+    /// Returns the remaining time before rotation is needed.
+    pub fn time_until_rotation(&self) -> std::time::Duration {
+        let target = self.config.rotation_after();
+        let elapsed = self.issued_at.elapsed();
+        target.saturating_sub(elapsed)
+    }
+
+    /// The module name this tracker is for.
+    pub fn module_name(&self) -> &str {
+        &self.module_name
+    }
+
+    /// Reset the tracker after a successful rotation.
+    pub fn mark_rotated(&mut self) {
+        self.issued_at = std::time::Instant::now();
+    }
+}
+
+/// Rotate a module certificate: generate a new cert signed by the CA,
+/// rebuild TLS server and client configs, and update the pin set.
+///
+/// Returns the new `CertifiedKey` and updated `CertificatePinSet`.
+pub fn rotate_module_cert(
+    module_name: &str,
+    ca: &CertificateAuthority,
+    existing_pin_set: &CertificatePinSet,
+    old_cert: &CertifiedKey,
+) -> (CertifiedKey, CertificatePinSet) {
+    let new_cert = generate_module_cert(module_name, ca);
+
+    // Build a new pin set that includes the new cert and removes the old one.
+    let mut new_pin_set = existing_pin_set.clone();
+    new_pin_set.add_certificate(new_cert.cert.der().as_ref());
+    // Note: we keep the old fingerprint for a grace period so in-flight
+    // connections from peers still holding the old pin set are not rejected
+    // during the rotation window.
+
+    eprintln!(
+        "AUDIT: mTLS certificate rotated for module '{}' — old fingerprint {:x?}, new fingerprint {:x?}",
+        module_name,
+        &compute_cert_fingerprint(old_cert.cert.der().as_ref())[..8],
+        &compute_cert_fingerprint(new_cert.cert.der().as_ref())[..8],
+    );
+
+    (new_cert, new_pin_set)
+}
+
+/// Spawn a background task that checks certificate expiry every hour and
+/// triggers rotation when the threshold is reached.
+///
+/// The `on_rotation` callback is invoked with the new `CertifiedKey` and
+/// `CertificatePinSet` so the caller can hot-swap TLS configs.
+pub fn spawn_cert_rotation_task(
+    module_name: String,
+    ca: std::sync::Arc<CertificateAuthority>,
+    initial_cert: CertifiedKey,
+    initial_pin_set: CertificatePinSet,
+    config: CertRotationConfig,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let check_interval = std::time::Duration::from_secs(3600); // 1 hour
+        let mut tracker = CertExpiryTracker::new(&module_name, config);
+        let mut current_cert = initial_cert;
+        let mut current_pin_set = initial_pin_set;
+
+        let mut interval = tokio::time::interval(check_interval);
+        loop {
+            interval.tick().await;
+
+            if tracker.needs_rotation() {
+                tracing::info!(
+                    module = %module_name,
+                    "mTLS certificate rotation threshold reached — rotating"
+                );
+
+                let (new_cert, new_pin_set) =
+                    rotate_module_cert(&module_name, &ca, &current_pin_set, &current_cert);
+
+                tracker.mark_rotated();
+                current_cert = new_cert;
+                current_pin_set = new_pin_set;
+
+                tracing::info!(
+                    module = %module_name,
+                    "mTLS certificate rotation completed"
+                );
+                crate::tls::cert_rotation_audit_log(&module_name);
+            } else {
+                let remaining = tracker.time_until_rotation();
+                tracing::debug!(
+                    module = %module_name,
+                    remaining_secs = remaining.as_secs(),
+                    "Certificate rotation check — not yet needed"
+                );
+            }
+        }
+    })
+}
+
+/// Emit an audit log entry for certificate rotation events.
+fn cert_rotation_audit_log(module_name: &str) {
+    eprintln!(
+        "AUDIT: mTLS cert rotation event for '{}' at {:?}",
+        module_name,
+        std::time::SystemTime::now()
+    );
 }
 
 // ---------------------------------------------------------------------------

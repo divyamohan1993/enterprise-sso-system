@@ -22,6 +22,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Mutex;
@@ -219,6 +220,9 @@ pub struct DistributedRateLimiter {
     /// the expected number of gateway instances (e.g., 10 for a 10-instance MIG).
     /// Default: 10 (conservative — better to over-restrict than under-restrict).
     pub degraded_limit_divisor: u64,
+    /// Counter for the number of times degraded mode has been activated.
+    /// Useful for monitoring/alerting on persistent Redis failures.
+    pub degraded_mode_activations: Arc<AtomicU64>,
 }
 
 /// Minimal Redis client wrapper.
@@ -334,6 +338,7 @@ impl DistributedRateLimiter {
             local_state: Arc::new(Mutex::new(HashMap::new())),
             redis_healthy,
             degraded_limit_divisor,
+            degraded_mode_activations: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -424,14 +429,21 @@ impl DistributedRateLimiter {
         // Local fallback: apply conservative divisor to prevent distributed bypass.
         // With N gateway instances each using limit/N, the aggregate across all
         // instances approximates the global limit even without coordination.
+        //
+        // SECURITY: In degraded mode we apply STRICTER limits — the divisor
+        // reduces the per-instance allowance to account for the lack of
+        // cross-instance coordination.
         let degraded_limit = (limit / self.degraded_limit_divisor).max(1);
-        if degraded_limit < limit {
-            debug!(
-                "rate limit degraded mode: {key} using {degraded_limit}/{limit} \
-                 (divisor={}, Redis unavailable)",
-                self.degraded_limit_divisor
-            );
-        }
+        let activations = self.degraded_mode_activations.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        warn!(
+            key = key,
+            degraded_limit = degraded_limit,
+            normal_limit = limit,
+            divisor = self.degraded_limit_divisor,
+            total_activations = activations,
+            "SIEM:SECURITY rate limit degraded mode activated — Redis unavailable, \
+             applying stricter local limits ({degraded_limit}/{limit})"
+        );
         self.check_local(key, degraded_limit).await
     }
 

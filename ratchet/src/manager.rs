@@ -316,6 +316,106 @@ fn decrypt_chain_key_uuid(kek: &[u8; 32], sealed: &[u8], session_id: &Uuid) -> R
     decrypt_chain_key(kek, &session_id.to_string(), sealed)
 }
 
+// ---------------------------------------------------------------------------
+// Epoch metadata envelope encryption
+// ---------------------------------------------------------------------------
+//
+// Epoch counters and chain metadata are sensitive — they reveal session
+// activity patterns and can aid replay attacks if tampered with. We encrypt
+// epoch metadata at rest using the same table-specific KEK that protects
+// chain keys, with a distinct AAD to prevent cross-field confusion.
+
+/// AAD prefix for epoch metadata encryption.
+const EPOCH_METADATA_AAD_PREFIX: &[u8] = b"MILNET-AAD-v1:ratchet:epoch_metadata:";
+
+/// Epoch metadata envelope: encrypted epoch counter + auxiliary chain metadata.
+///
+/// Stored as AES-256-GCM ciphertext in the database alongside the encrypted
+/// chain key. The plaintext is a postcard-serialized `EpochMetadata`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpochMetadata {
+    /// Current epoch counter.
+    pub epoch: u64,
+    /// Timestamp of last advancement (microseconds since UNIX epoch).
+    pub last_advanced_us: i64,
+    /// Number of advancements since session creation.
+    pub advancement_count: u64,
+}
+
+/// Encrypt epoch metadata using the table-specific KEK derived from the master KEK.
+/// AAD binds to the session ID to prevent cross-session confusion.
+pub fn encrypt_epoch_metadata(
+    kek: &[u8; 32],
+    session_id: &str,
+    metadata: &EpochMetadata,
+) -> Result<Vec<u8>, String> {
+    use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
+
+    let table_kek = derive_table_kek(kek);
+    let cipher = Aes256Gcm::new_from_slice(&table_kek).expect("32-byte key");
+
+    let plaintext = postcard::to_allocvec(metadata)
+        .map_err(|e| format!("epoch metadata serialization failed: {e}"))?;
+
+    let mut nb = [0u8; NONCE_LEN];
+    getrandom::getrandom(&mut nb)
+        .map_err(|e| format!("nonce generation failed: {e}"))?;
+    let nonce = Nonce::from_slice(&nb);
+
+    let mut aad = Vec::with_capacity(EPOCH_METADATA_AAD_PREFIX.len() + session_id.len());
+    aad.extend_from_slice(EPOCH_METADATA_AAD_PREFIX);
+    aad.extend_from_slice(session_id.as_bytes());
+
+    let ct = cipher
+        .encrypt(nonce, aes_gcm::aead::Payload { msg: &plaintext, aad: &aad })
+        .map_err(|e| format!("epoch metadata encryption failed: {e}"))?;
+
+    let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
+    out.extend_from_slice(&nb);
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+/// Decrypt epoch metadata using the table-specific KEK derived from the master KEK.
+/// AAD binds to the session ID.
+pub fn decrypt_epoch_metadata(
+    kek: &[u8; 32],
+    session_id: &str,
+    ciphertext: &[u8],
+) -> Result<EpochMetadata, String> {
+    use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
+
+    if ciphertext.len() < NONCE_LEN + 16 {
+        return Err("epoch metadata ciphertext too short".into());
+    }
+
+    let table_kek = derive_table_kek(kek);
+    let cipher = Aes256Gcm::new_from_slice(&table_kek).expect("32-byte key");
+
+    let mut aad = Vec::with_capacity(EPOCH_METADATA_AAD_PREFIX.len() + session_id.len());
+    aad.extend_from_slice(EPOCH_METADATA_AAD_PREFIX);
+    aad.extend_from_slice(session_id.as_bytes());
+
+    let pt = cipher
+        .decrypt(
+            Nonce::from_slice(&ciphertext[..NONCE_LEN]),
+            aes_gcm::aead::Payload {
+                msg: &ciphertext[NONCE_LEN..],
+                aad: &aad,
+            },
+        )
+        .map_err(|_| {
+            tracing::error!(
+                session_id = session_id,
+                "SIEM:CRITICAL epoch metadata decryption failed — possible tampering or KEK mismatch"
+            );
+            "epoch metadata decryption failed".to_string()
+        })?;
+
+    postcard::from_bytes(&pt)
+        .map_err(|e| format!("epoch metadata deserialization failed: {e}"))
+}
+
 fn now_us() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

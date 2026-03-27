@@ -118,8 +118,11 @@ fn test_client_register_with_id_preserves_fields() {
         vec!["https://app.com/cb".into()],
     );
     assert_eq!(client.client_id, "fixed-id");
-    assert_eq!(client.client_secret, "fixed-secret");
+    // client_secret is now an Argon2id hash, not the plaintext
+    assert_ne!(client.client_secret, "fixed-secret");
+    assert!(!client.client_secret.is_empty());
     assert_eq!(client.name, "My App");
+    // Validation with the original plaintext must still succeed
     assert!(registry.validate("fixed-id", "fixed-secret").is_some());
 }
 

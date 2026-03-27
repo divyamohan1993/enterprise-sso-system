@@ -524,7 +524,7 @@ fn xmss_root_from_sig(
         auth_node.copy_from_slice(&auth_path[auth_node_offset..auth_node_offset + N]);
 
         tree_adrs.tree_height = (height + 1) as u32;
-        tree_adrs.tree_index = (leaf_idx >> (height + 1)) as u32;
+        tree_adrs.tree_index = leaf_idx >> (height + 1);
 
         if (leaf_idx >> height) & 1 == 0 {
             node = hash_h(pk_seed, &tree_adrs, &node, &auth_node);
@@ -571,7 +571,7 @@ fn fors_tree_root(
 
     let mut nodes: Vec<[u8; N]> = Vec::with_capacity(leaves_count);
     for i in 0..leaves_count {
-        let sk = fors_sk_gen(sk_seed, pk_seed, adrs, (base + i) as u32);
+        let sk = fors_sk_gen(sk_seed, pk_seed, adrs, u32::try_from(base + i).expect("SLH-DSA: FORS leaf index exceeds u32 range"));
         let leaf = fors_leaf(pk_seed, adrs, &sk);
         nodes.push(leaf);
     }
@@ -583,7 +583,8 @@ fn fors_tree_root(
         let mut new_nodes = Vec::with_capacity(nodes.len() / 2);
         for j in 0..nodes.len() / 2 {
             tree_adrs.tree_height = (height + 1) as u32;
-            tree_adrs.tree_index = (base / (1 << (height + 1)) + j) as u32;
+            tree_adrs.tree_index = u32::try_from(base / (1 << (height + 1)) + j)
+                .expect("SLH-DSA: FORS tree index exceeds u32 range");
             let parent = hash_h(pk_seed, &tree_adrs, &nodes[2 * j], &nodes[2 * j + 1]);
             new_nodes.push(parent);
         }
@@ -607,13 +608,14 @@ fn fors_sign(
         let base = tree_idx * leaves_count;
 
         // Secret value
-        let sk = fors_sk_gen(sk_seed, pk_seed, adrs, (base + idx as usize) as u32);
+        let sk = fors_sk_gen(sk_seed, pk_seed, adrs,
+            u32::try_from(base + idx as usize).expect("SLH-DSA: FORS leaf index exceeds u32 range"));
         sig.extend_from_slice(&sk);
 
         // Build tree and get auth path
         let mut nodes: Vec<[u8; N]> = Vec::with_capacity(leaves_count);
         for i in 0..leaves_count {
-            let sk_i = fors_sk_gen(sk_seed, pk_seed, adrs, (base + i) as u32);
+            let sk_i = fors_sk_gen(sk_seed, pk_seed, adrs, u32::try_from(base + i).expect("SLH-DSA: FORS leaf index exceeds u32 range"));
             let leaf = fors_leaf(pk_seed, adrs, &sk_i);
             nodes.push(leaf);
         }
@@ -633,7 +635,8 @@ fn fors_sign(
             let mut new_nodes = Vec::with_capacity(current_nodes.len() / 2);
             for j in 0..current_nodes.len() / 2 {
                 tree_adrs.tree_height = (height + 1) as u32;
-                tree_adrs.tree_index = (base / (1 << (height + 1)) + j) as u32;
+                tree_adrs.tree_index = u32::try_from(base / (1 << (height + 1)) + j)
+                .expect("SLH-DSA: FORS tree index exceeds u32 range");
                 let parent = hash_h(
                     pk_seed,
                     &tree_adrs,
@@ -678,7 +681,8 @@ fn fors_pk_from_sig(
             auth_node.copy_from_slice(&sig[auth_offset..auth_offset + N]);
 
             tree_adrs.tree_height = (height + 1) as u32;
-            tree_adrs.tree_index = (base / (1 << (height + 1)) + ((idx as usize) >> (height + 1))) as u32;
+            tree_adrs.tree_index = u32::try_from(base / (1 << (height + 1)) + ((idx as usize) >> (height + 1)))
+                .expect("SLH-DSA: FORS tree index exceeds u32 range");
 
             if (idx >> height) & 1 == 0 {
                 node = hash_h(pk_seed, &tree_adrs, &node, &auth_node);
@@ -960,7 +964,8 @@ fn slh_dsa_sign_internal(
         );
 
         // Update tree and leaf index for next layer
-        current_leaf = (current_tree & ((1u64 << XMSS_HEIGHT) - 1)) as u32;
+        current_leaf = u32::try_from(current_tree & ((1u64 << XMSS_HEIGHT) - 1))
+            .expect("SLH-DSA: XMSS leaf index exceeds u32 range");
         current_tree >>= XMSS_HEIGHT;
     }
 
@@ -1028,7 +1033,8 @@ pub fn slh_dsa_verify(
         );
 
         ht_msg = computed_root;
-        current_leaf = (current_tree & ((1u64 << XMSS_HEIGHT) - 1)) as u32;
+        current_leaf = u32::try_from(current_tree & ((1u64 << XMSS_HEIGHT) - 1))
+            .expect("SLH-DSA: XMSS leaf index exceeds u32 range");
         current_tree >>= XMSS_HEIGHT;
     }
 

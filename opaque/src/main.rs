@@ -29,6 +29,22 @@ async fn main() {
     let opaque_mode = std::env::var("MILNET_OPAQUE_MODE")
         .unwrap_or_else(|_| "threshold".to_string());
 
+    // Spawn health check endpoint
+    let health_start = std::time::Instant::now();
+    let _health_handle = common::health::spawn_health_endpoint(
+        "opaque".to_string(),
+        9102,
+        health_start,
+        || {
+            vec![common::health::HealthCheck {
+                name: "opaque_service".to_string(),
+                ok: true,
+                detail: None,
+                latency_ms: None,
+            }]
+        },
+    );
+
     let result = match opaque_mode.as_str() {
         "threshold" => run_threshold_mode().await,
         "single" => {

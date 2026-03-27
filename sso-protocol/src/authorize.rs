@@ -1,9 +1,43 @@
 use crate::pkce;
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+
+/// HMAC key for blinding PKCE code_challenge values at rest.
+/// In production this MUST be loaded from a KMS / HSM — this static key is
+/// for the in-memory store only. The persistent store should use envelope
+/// encryption via the `crypto::seal` module.
+static PKCE_BLIND_KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+
+fn pkce_blind_key() -> &'static [u8; 32] {
+    PKCE_BLIND_KEY.get_or_init(|| {
+        let mut key = [0u8; 32];
+        getrandom::getrandom(&mut key).expect("OS CSPRNG failure");
+        key
+    })
+}
+
+/// Compute HMAC-SHA256 blind index of a code_challenge so it is never stored
+/// in plaintext. Verification recomputes the HMAC and uses constant-time
+/// comparison (HMAC equality).
+fn blind_code_challenge(code_challenge: &str) -> String {
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = HmacSha256::new_from_slice(pkce_blind_key())
+        .expect("HMAC key length is always valid");
+    mac.update(code_challenge.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
+/// Hash an authorization code with SHA-256 for storage keying.
+/// The raw code is never stored — only its hash is used as the map key.
+fn hash_code(code: &str) -> String {
+    let digest = Sha256::digest(code.as_bytes());
+    hex::encode(digest)
+}
 
 /// Authorization code expiry in seconds. Set to 30s for tighter security
 /// (OAuth 2.0 recommends a maximum of 10 minutes; 30s limits replay window).
@@ -102,19 +136,25 @@ impl AuthorizationStore {
         pkce::require_pkce(code_challenge.as_deref())?;
 
         let code = Uuid::new_v4().to_string();
+        let hashed_key = hash_code(&code);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
+
+        // Blind the code_challenge with HMAC-SHA256 so it is never stored
+        // in plaintext. PKCE verification recomputes the blind before comparing.
+        let blinded_challenge = code_challenge.as_deref().map(blind_code_challenge);
+
         self.codes.insert(
-            code.clone(),
+            hashed_key,
             AuthorizationCode {
-                code: code.clone(),
+                code: String::new(), // never store the raw code
                 client_id: client_id.to_string(),
                 redirect_uri: redirect_uri.to_string(),
                 user_id,
                 scope: scope.to_string(),
-                code_challenge,
+                code_challenge: blinded_challenge,
                 nonce,
                 tier,
                 consumed: false,
@@ -127,10 +167,13 @@ impl AuthorizationStore {
     pub fn consume_code(&mut self, code: &str) -> Option<AuthorizationCode> {
         self.consume_count.fetch_add(1, Ordering::SeqCst);
 
+        // Hash the incoming code to look up in the store (codes are stored by hash).
+        let hashed_key = hash_code(code);
+
         // Determine the client_id for rate limiting before mutating the code.
         // If the code exists, use its client_id; otherwise we cannot rate-limit
         // (the code is unknown and will return None anyway).
-        let client_id = self.codes.get(code).map(|c| c.client_id.clone());
+        let client_id = self.codes.get(&hashed_key).map(|c| c.client_id.clone());
 
         // Check rate limit for this client_id (if known).
         if let Some(ref cid) = client_id {
@@ -151,7 +194,7 @@ impl AuthorizationStore {
             self.code_attempt_tracker.retain(|_, (_, ts)| *ts > cutoff);
         }
 
-        let auth_code = self.codes.get_mut(code)?;
+        let auth_code = self.codes.get_mut(&hashed_key)?;
 
         // Reject already-consumed codes (replay detection)
         if auth_code.consumed {
@@ -164,7 +207,7 @@ impl AuthorizationStore {
             // Remove the code entirely on double-consumption attempt (per RFC 6749 sec 4.1.2:
             // "If an authorization code is used more than once, the authorization server MUST
             // deny the request and SHOULD revoke all tokens previously issued based on that code.")
-            self.codes.remove(code);
+            self.codes.remove(&hashed_key);
             return None;
         }
 
@@ -179,7 +222,7 @@ impl AuthorizationStore {
                     entry.0 += 1;
                 }
             }
-            self.codes.remove(code);
+            self.codes.remove(&hashed_key);
             return None;
         }
 
@@ -191,16 +234,30 @@ impl AuthorizationStore {
             self.cleanup_expired();
         }
 
-        self.codes.remove(code)
+        self.codes.remove(&hashed_key)
     }
 
     /// Check whether a code has already been consumed (redeemed).
     pub fn is_code_consumed(&self, code: &str) -> bool {
+        let hashed_key = hash_code(code);
         self.codes
-            .get(code)
+            .get(&hashed_key)
             .map(|c| c.consumed)
             // If the code is not in the store, treat it as consumed/invalid
             .unwrap_or(true)
+    }
+
+    /// Verify a PKCE code_verifier against the blinded code_challenge stored
+    /// for this authorization code. The stored value is an HMAC-SHA256 blind
+    /// index, so we recompute the blind of the S256(verifier) and compare.
+    pub fn verify_pkce_for_code(&self, code: &str, code_verifier: &str) -> bool {
+        let hashed_key = hash_code(code);
+        let Some(auth_code) = self.codes.get(&hashed_key) else { return false };
+        let Some(ref stored_blind) = auth_code.code_challenge else { return false };
+        // Compute the S256 challenge from the verifier, then blind it.
+        let challenge = crate::pkce::generate_challenge(code_verifier);
+        let recomputed_blind = blind_code_challenge(&challenge);
+        crypto::ct::ct_eq(stored_blind.as_bytes(), recomputed_blind.as_bytes())
     }
 
     /// Remove all expired codes older than 2x the expiry time.
@@ -234,29 +291,70 @@ impl PersistentAuthorizationStore {
     }
     async fn load_from_db(&mut self) -> Result<(), String> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        // DB stores hashed code keys and blinded code_challenges — load them directly.
         let rows: Vec<(String, String, String, Uuid, Option<String>, i32, Option<String>, i64, bool)> =
-            sqlx::query_as("SELECT code, client_id, redirect_uri, user_id, code_challenge, tier, nonce, created_at, consumed FROM authorization_codes WHERE created_at > $1")
+            sqlx::query_as("SELECT code_hash, client_id, redirect_uri, user_id, code_challenge_blind, tier, nonce, created_at, consumed FROM authorization_codes WHERE created_at > $1")
             .bind(now - (CODE_EXPIRY_SECS * 2)).fetch_all(&self.pool).await.map_err(|e| format!("load codes: {e}"))?;
-        for (code, cid, ruri, uid, cc, tier, nonce, cat, consumed) in rows {
-            self.memory.codes.insert(code.clone(), AuthorizationCode { code, client_id: cid, redirect_uri: ruri, user_id: uid, scope: String::new(), code_challenge: cc, nonce, tier: tier as u8, expires_at: cat + CODE_EXPIRY_SECS, consumed });
+        for (code_hash, cid, ruri, uid, cc_blind, tier, nonce, cat, consumed) in rows {
+            self.memory.codes.insert(code_hash, AuthorizationCode { code: String::new(), client_id: cid, redirect_uri: ruri, user_id: uid, scope: String::new(), code_challenge: cc_blind, nonce, tier: tier as u8, expires_at: cat + CODE_EXPIRY_SECS, consumed });
         }
         Ok(())
     }
     pub async fn create_code_with_tier(&mut self, client_id: &str, redirect_uri: &str, user_id: Uuid, scope: &str, code_challenge: Option<String>, nonce: Option<String>, tier: u8) -> Result<String, String> {
         let code = self.memory.create_code_with_tier(client_id, redirect_uri, user_id, scope, code_challenge.clone(), nonce.clone(), tier).map_err(|e| e.to_string())?;
+        let hashed_key = hash_code(&code);
+        let blinded_challenge = code_challenge.as_deref().map(blind_code_challenge);
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-        sqlx::query("INSERT INTO authorization_codes (code, client_id, redirect_uri, user_id, code_challenge, tier, nonce, created_at, consumed) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,FALSE)")
-            .bind(&code).bind(client_id).bind(redirect_uri).bind(user_id).bind(code_challenge.as_deref()).bind(tier as i32).bind(nonce.as_deref()).bind(now)
+        // Store hashed code and blinded challenge in DB — never plaintext.
+        sqlx::query("INSERT INTO authorization_codes (code_hash, client_id, redirect_uri, user_id, code_challenge_blind, tier, nonce, created_at, consumed) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,FALSE)")
+            .bind(&hashed_key).bind(client_id).bind(redirect_uri).bind(user_id).bind(blinded_challenge.as_deref()).bind(tier as i32).bind(nonce.as_deref()).bind(now)
             .execute(&self.pool).await.map_err(|e| format!("persist code: {e}"))?;
         Ok(code)
     }
     pub async fn create_code(&mut self, client_id: &str, redirect_uri: &str, user_id: Uuid, scope: &str, code_challenge: Option<String>, nonce: Option<String>) -> Result<String, String> {
         self.create_code_with_tier(client_id, redirect_uri, user_id, scope, code_challenge, nonce, 2).await
     }
+    /// Consume an authorization code with atomic database protection.
+    ///
+    /// Uses `UPDATE ... WHERE consumed = FALSE` to prevent cross-instance replay:
+    /// even if two instances race on the same code, only one will succeed because
+    /// the atomic UPDATE returns rows_affected=0 for the loser.
     pub async fn consume_code(&mut self, code: &str) -> Result<Option<AuthorizationCode>, String> {
+        let hashed_key = hash_code(code);
+
+        // Atomic DB update: only succeeds if the code has NOT been consumed yet.
+        // This is the source of truth for cross-instance replay prevention.
+        let result = sqlx::query(
+            "UPDATE authorization_codes SET consumed = TRUE \
+             WHERE code_hash = $1 AND consumed = FALSE"
+        )
+        .bind(&hashed_key)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("atomic consume: {e}"))?;
+
+        if result.rows_affected() == 0 {
+            // Either the code doesn't exist or was already consumed by another instance.
+            // Ensure the in-memory cache is consistent: try consuming (which will also
+            // fail if already consumed) and then clean up.
+            let _ = self.memory.consume_code(code);
+            sqlx::query("DELETE FROM authorization_codes WHERE code_hash = $1 AND consumed = TRUE")
+                .bind(&hashed_key)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| format!("cleanup consumed code: {e}"))?;
+            return Ok(None);
+        }
+
+        // DB confirmed this instance won the race — now consume from in-memory cache.
         let r = self.memory.consume_code(code);
-        if r.is_some() { sqlx::query("UPDATE authorization_codes SET consumed = TRUE WHERE code = $1").bind(code).execute(&self.pool).await.map_err(|e| format!("mark consumed: {e}"))?; }
-        else { sqlx::query("DELETE FROM authorization_codes WHERE code = $1").bind(code).execute(&self.pool).await.map_err(|e| format!("delete: {e}"))?; }
+        if r.is_none() {
+            // Edge case: in-memory cache was stale (e.g., code expired in cache but
+            // not in DB). The DB update already marked it consumed, which is correct.
+            tracing::warn!(
+                "Authorization code consumed in DB but not in memory cache — cache was stale"
+            );
+        }
         Ok(r)
     }
     pub fn is_code_consumed(&self, code: &str) -> bool { self.memory.is_code_consumed(code) }
@@ -275,4 +373,30 @@ mod tests {
     #[test] fn test_pkce_required() { let mut s = AuthorizationStore::new(); assert!(s.create_code("c1","https://ex.com/cb",Uuid::new_v4(),"openid",None,None).is_err()); }
     #[test] fn test_with_tier() { let mut s = AuthorizationStore::new(); let c = s.create_code_with_tier("c1","https://ex.com/cb",Uuid::new_v4(),"openid",Some("ch".into()),Some("n".into()),3).unwrap(); assert_eq!(s.consume_code(&c).unwrap().tier, 3); }
     #[test] fn test_unknown_consumed() { assert!(AuthorizationStore::new().is_code_consumed("nope")); }
+    #[test] fn test_code_not_stored_plaintext() {
+        let mut s = AuthorizationStore::new();
+        let code = s.create_code("c1","https://ex.com/cb",Uuid::new_v4(),"openid",Some("ch".into()),None).unwrap();
+        // The raw code must not appear as a key in the map (it is stored by SHA-256 hash).
+        assert!(!s.codes.contains_key(&code));
+        // The hashed key must exist.
+        assert!(s.codes.contains_key(&hash_code(&code)));
+    }
+    #[test] fn test_code_challenge_not_stored_plaintext() {
+        let mut s = AuthorizationStore::new();
+        let challenge = "test_challenge_value";
+        let code = s.create_code("c1","https://ex.com/cb",Uuid::new_v4(),"openid",Some(challenge.into()),None).unwrap();
+        let hashed_key = hash_code(&code);
+        let stored = s.codes.get(&hashed_key).unwrap();
+        // The stored code_challenge must be a blind (HMAC), not the original value.
+        assert_ne!(stored.code_challenge.as_deref(), Some(challenge));
+        assert!(stored.code_challenge.is_some());
+    }
+    #[test] fn test_pkce_blind_verification() {
+        let mut s = AuthorizationStore::new();
+        let verifier = "a".repeat(43);
+        let challenge = crate::pkce::generate_challenge(&verifier);
+        let code = s.create_code("c1","https://ex.com/cb",Uuid::new_v4(),"openid",Some(challenge),None).unwrap();
+        assert!(s.verify_pkce_for_code(&code, &verifier));
+        assert!(!s.verify_pkce_for_code(&code, "wrong_verifier_that_is_long_enough_43chars_padding"));
+    }
 }

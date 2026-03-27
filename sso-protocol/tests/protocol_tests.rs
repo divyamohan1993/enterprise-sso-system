@@ -74,7 +74,10 @@ fn test_authorization_code_create_and_consume() {
     assert_eq!(auth_code.client_id, "client-123");
     assert_eq!(auth_code.user_id, user_id);
     assert_eq!(auth_code.scope, "openid profile");
-    assert_eq!(auth_code.code_challenge.as_deref(), Some("challenge-value"));
+    // code_challenge is stored as an HMAC-SHA256 blind index, not plaintext.
+    assert!(auth_code.code_challenge.is_some(), "code_challenge must be present");
+    assert_ne!(auth_code.code_challenge.as_deref(), Some("challenge-value"),
+        "code_challenge must NOT be stored in plaintext");
     assert_eq!(auth_code.nonce.as_deref(), Some("nonce-value"));
 
     // Second consume should fail (code already used)
@@ -152,7 +155,7 @@ fn test_client_registration() {
 
     assert_eq!(client.name, "Test App");
     assert!(!client.client_id.is_empty());
-    assert!(!client.client_secret.is_empty());
+    assert!(!client.plaintext_secret.is_empty());
     assert_eq!(
         client.redirect_uris,
         vec!["https://app.example.com/callback"]
@@ -164,7 +167,7 @@ fn test_client_registration() {
     assert_eq!(found.unwrap().name, "Test App");
 
     // Validation with correct secret should work
-    let validated = registry.validate(&client.client_id, &client.client_secret);
+    let validated = registry.validate(&client.client_id, &client.plaintext_secret);
     assert!(validated.is_some());
 
     // Validation with wrong secret should fail
@@ -292,14 +295,14 @@ fn test_client_registration_produces_unique_ids() {
     let c1 = registry.register("App A", vec!["https://a.com/cb".into()]);
     let c2 = registry.register("App B", vec!["https://b.com/cb".into()]);
     assert_ne!(c1.client_id, c2.client_id);
-    assert_ne!(c1.client_secret, c2.client_secret);
+    assert_ne!(c1.plaintext_secret, c2.plaintext_secret);
 }
 
 #[test]
 fn test_client_validation_rejects_wrong_secret() {
     let mut registry = sso_protocol::clients::ClientRegistry::new();
     let client = registry.register("Secure App", vec!["https://s.com/cb".into()]);
-    assert!(registry.validate(&client.client_id, &client.client_secret).is_some());
+    assert!(registry.validate(&client.client_id, &client.plaintext_secret).is_some());
     assert!(registry.validate(&client.client_id, "totally-wrong-secret").is_none());
 }
 

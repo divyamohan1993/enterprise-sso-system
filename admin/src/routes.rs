@@ -7,6 +7,7 @@ use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -32,9 +33,17 @@ fn html_escape(input: &str) -> String {
 // CSRF protection utilities
 // ---------------------------------------------------------------------------
 
-/// Generate a CSRF token using HMAC-SHA256 over (session_state + timestamp + nonce).
+/// Generate a CSRF session cookie value — a random 32-byte hex token.
+/// This cookie is bound into the CSRF HMAC to prevent cross-session forgery.
+fn generate_csrf_session_cookie() -> String {
+    let bytes: [u8; 32] = rand::random();
+    hex::encode(bytes)
+}
+
+/// Generate a CSRF token using HMAC-SHA256 over (session_state + cookie_value + timestamp + nonce).
 /// The token encodes: timestamp:nonce:hmac_hex
-fn generate_csrf_token(session_state: &str, api_key: &str) -> String {
+/// `cookie_value` is the `__Host-csrf-session` cookie bound to this CSRF token.
+fn generate_csrf_token(session_state: &str, api_key: &str, cookie_value: &str) -> String {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
     type HmacSha256 = Hmac<Sha256>;
@@ -46,7 +55,7 @@ fn generate_csrf_token(session_state: &str, api_key: &str) -> String {
     let nonce: [u8; 16] = rand::random();
     let nonce_hex = hex::encode(nonce);
 
-    let payload = format!("{}:{}:{}", session_state, now, nonce_hex);
+    let payload = format!("{}:{}:{}:{}", session_state, cookie_value, now, nonce_hex);
     let mut mac = HmacSha256::new_from_slice(api_key.as_bytes()).expect("HMAC key");
     mac.update(payload.as_bytes());
     let sig = hex::encode(mac.finalize().into_bytes());
@@ -57,11 +66,12 @@ fn generate_csrf_token(session_state: &str, api_key: &str) -> String {
 /// CSRF token TTL in seconds (60 seconds).
 const CSRF_TOKEN_TTL_SECS: u64 = 60;
 
-/// Validate a CSRF token against the expected session_state and api_key.
+/// Validate a CSRF token against the expected session_state, api_key, and
+/// the `__Host-csrf-session` cookie value.
 /// Returns true if the token is valid and not expired.
 /// NOTE: This is the stateless check only. Callers must also check
 /// and mark the token as used via `check_and_mark_csrf_used()`.
-fn validate_csrf_token(token: &str, session_state: &str, api_key: &str) -> bool {
+fn validate_csrf_token(token: &str, session_state: &str, api_key: &str, cookie_value: &str) -> bool {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
     type HmacSha256 = Hmac<Sha256>;
@@ -71,6 +81,11 @@ fn validate_csrf_token(token: &str, session_state: &str, api_key: &str) -> bool 
         return false;
     }
     let (ts_str, nonce_hex, provided_sig) = (parts[0], parts[1], parts[2]);
+
+    // Reject if cookie value is empty (cookie must be present)
+    if cookie_value.is_empty() {
+        return false;
+    }
 
     // Check expiry
     let timestamp: u64 = match ts_str.parse() {
@@ -85,8 +100,8 @@ fn validate_csrf_token(token: &str, session_state: &str, api_key: &str) -> bool 
         return false;
     }
 
-    // Recompute HMAC
-    let payload = format!("{}:{}:{}", session_state, timestamp, nonce_hex);
+    // Recompute HMAC (includes cookie value for session binding)
+    let payload = format!("{}:{}:{}:{}", session_state, cookie_value, timestamp, nonce_hex);
     let mut mac = HmacSha256::new_from_slice(api_key.as_bytes()).expect("HMAC key");
     mac.update(payload.as_bytes());
     let expected_sig = hex::encode(mac.finalize().into_bytes());
@@ -649,6 +664,97 @@ pub struct OpaqueTokenEntry {
     pub expires_at: i64,
 }
 
+// ---------------------------------------------------------------------------
+// Opaque token DB persistence (write-through cache)
+// ---------------------------------------------------------------------------
+
+/// Persist an opaque token to the database (write-through on creation).
+async fn db_insert_opaque_token(db: &PgPool, token_handle: &str, entry: &OpaqueTokenEntry) {
+    let result = sqlx::query(
+        "INSERT INTO opaque_tokens (token_handle, user_id, created_at, expires_at) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (token_handle) DO UPDATE SET user_id = $2, created_at = $3, expires_at = $4"
+    )
+    .bind(token_handle)
+    .bind(entry.user_id)
+    .bind(entry.created_at)
+    .bind(entry.expires_at)
+    .execute(db)
+    .await;
+
+    if let Err(e) = result {
+        tracing::warn!(error = %e, "failed to persist opaque token to database");
+    }
+}
+
+/// Look up an opaque token from the database (L2 fallback after cache miss).
+async fn db_lookup_opaque_token(db: &PgPool, token_handle: &str) -> Option<OpaqueTokenEntry> {
+    let row = sqlx::query_as::<_, (Uuid, i64, i64)>(
+        "SELECT user_id, created_at, expires_at FROM opaque_tokens WHERE token_handle = $1 AND expires_at > $2"
+    )
+    .bind(token_handle)
+    .bind(now_secs())
+    .fetch_optional(db)
+    .await;
+
+    match row {
+        Ok(Some((user_id, created_at, expires_at))) => Some(OpaqueTokenEntry {
+            user_id,
+            created_at,
+            expires_at,
+        }),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to look up opaque token from database");
+            None
+        }
+    }
+}
+
+/// Delete an opaque token from the database (write-through on revocation).
+async fn db_delete_opaque_token(db: &PgPool, token_handle: &str) {
+    let result = sqlx::query("DELETE FROM opaque_tokens WHERE token_handle = $1")
+        .bind(token_handle)
+        .execute(db)
+        .await;
+
+    if let Err(e) = result {
+        tracing::warn!(error = %e, "failed to delete opaque token from database");
+    }
+}
+
+/// Warm the in-memory opaque token cache from the database on startup.
+/// Loads all non-expired tokens up to the capacity limit.
+pub async fn warm_opaque_token_cache(db: &PgPool, cache: &RwLock<HashMap<String, OpaqueTokenEntry>>) {
+    let now = now_secs();
+    let rows = sqlx::query_as::<_, (String, Uuid, i64, i64)>(
+        "SELECT token_handle, user_id, created_at, expires_at FROM opaque_tokens \
+         WHERE expires_at > $1 ORDER BY created_at DESC LIMIT $2"
+    )
+    .bind(now)
+    .bind(MAX_ACCESS_TOKENS as i64)
+    .fetch_all(db)
+    .await;
+
+    match rows {
+        Ok(entries) => {
+            let count = entries.len();
+            let mut cache = cache.write().await;
+            for (handle, user_id, created_at, expires_at) in entries {
+                cache.insert(handle, OpaqueTokenEntry {
+                    user_id,
+                    created_at,
+                    expires_at,
+                });
+            }
+            tracing::info!(count = count, "opaque token cache warmed from database");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to warm opaque token cache from database");
+        }
+    }
+}
+
 /// Maximum inactivity window before a session is considered expired (AAL3).
 const INACTIVITY_TIMEOUT_SECS: i64 = 15 * 60;
 
@@ -672,6 +778,127 @@ const MAX_LOGIN_ATTEMPTS: usize = 100_000;
 const MAX_PENDING_CEREMONIES: usize = 1_000;
 /// Maximum number of used CSRF tokens tracked.
 const MAX_USED_CSRF_TOKENS: usize = 100_000;
+
+// ---------------------------------------------------------------------------
+// Trusted proxy validation for X-Forwarded-For
+// ---------------------------------------------------------------------------
+
+/// Parse CIDR ranges from `MILNET_TRUSTED_PROXIES` env var.
+/// Returns a list of (network_ip, prefix_len) tuples.
+fn load_trusted_proxies() -> Vec<(IpAddr, u8)> {
+    match std::env::var("MILNET_TRUSTED_PROXIES") {
+        Ok(val) if !val.is_empty() => {
+            val.split(',')
+                .filter_map(|cidr| {
+                    let cidr = cidr.trim();
+                    if cidr.is_empty() {
+                        return None;
+                    }
+                    let parts: Vec<&str> = cidr.splitn(2, '/').collect();
+                    let ip: IpAddr = parts[0].parse().ok()?;
+                    let prefix: u8 = if parts.len() == 2 {
+                        parts[1].parse().ok()?
+                    } else {
+                        match ip {
+                            IpAddr::V4(_) => 32,
+                            IpAddr::V6(_) => 128,
+                        }
+                    };
+                    Some((ip, prefix))
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Check whether `addr` falls within any of the trusted proxy CIDR ranges.
+fn is_trusted_proxy(addr: &IpAddr, trusted: &[(IpAddr, u8)]) -> bool {
+    for &(ref network, prefix_len) in trusted {
+        match (addr, network) {
+            (IpAddr::V4(a), IpAddr::V4(n)) => {
+                if prefix_len == 0 {
+                    return true;
+                }
+                let mask = if prefix_len >= 32 {
+                    u32::MAX
+                } else {
+                    u32::MAX << (32 - prefix_len)
+                };
+                if u32::from_be_bytes(a.octets()) & mask
+                    == u32::from_be_bytes(n.octets()) & mask
+                {
+                    return true;
+                }
+            }
+            (IpAddr::V6(a), IpAddr::V6(n)) => {
+                if prefix_len == 0 {
+                    return true;
+                }
+                let mask = if prefix_len >= 128 {
+                    u128::MAX
+                } else {
+                    u128::MAX << (128 - prefix_len)
+                };
+                if u128::from_be_bytes(a.octets()) & mask
+                    == u128::from_be_bytes(n.octets()) & mask
+                {
+                    return true;
+                }
+            }
+            _ => {} // v4/v6 mismatch — skip
+        }
+    }
+    false
+}
+
+/// Extract the real client IP from a request, respecting X-Forwarded-For only
+/// when the direct connection comes from a trusted proxy.  Falls back to the
+/// connection IP (or "unknown") when there is no trusted proxy.
+fn extract_client_ip(request: &Request) -> String {
+    use std::net::SocketAddr;
+
+    // Determine the direct connection IP from ConnectInfo if available,
+    // otherwise fall back to "unknown".
+    let connection_ip: Option<IpAddr> = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip());
+
+    let trusted_proxies = load_trusted_proxies();
+
+    // Only honour X-Forwarded-For if the connection comes from a trusted proxy.
+    if let Some(forwarded) = request.headers().get("X-Forwarded-For").and_then(|v| v.to_str().ok()) {
+        if let Some(conn_ip) = connection_ip {
+            if !trusted_proxies.is_empty() && is_trusted_proxy(&conn_ip, &trusted_proxies) {
+                // Trusted proxy: use the left-most (client) IP from X-Forwarded-For.
+                if let Some(client) = forwarded.split(',').next() {
+                    return client.trim().to_string();
+                }
+            } else {
+                tracing::warn!(
+                    connection_ip = %conn_ip,
+                    x_forwarded_for = %forwarded,
+                    "X-Forwarded-For present but source IP is NOT a trusted proxy — ignoring header"
+                );
+            }
+        } else if !trusted_proxies.is_empty() {
+            tracing::warn!(
+                x_forwarded_for = %forwarded,
+                "X-Forwarded-For present but connection IP unavailable — ignoring header"
+            );
+        } else {
+            // No trusted proxies configured: legacy behaviour — accept header.
+            if let Some(client) = forwarded.split(',').next() {
+                return client.trim().to_string();
+            }
+        }
+    }
+
+    connection_ip
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
 
 /// TTL for session_activity entries (8 hours).
 const SESSION_ACTIVITY_TTL_SECS: i64 = 8 * 3600;
@@ -1107,8 +1334,24 @@ async fn security_headers_middleware(
     request: Request,
     next: Next,
 ) -> Response {
+    // Propagate or generate a request ID for distributed tracing.
+    let request_id = request
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
+
+    // X-Request-ID for end-to-end tracing
+    if let Ok(val) = axum::http::HeaderValue::from_str(&request_id) {
+        headers.insert(
+            axum::http::header::HeaderName::from_static("x-request-id"),
+            val,
+        );
+    }
 
     headers.insert(
         axum::http::header::HeaderName::from_static("x-content-type-options"),
@@ -1467,7 +1710,10 @@ async fn health_check(
 
     // Check HA cluster health
     let cluster_health = {
-        let mut ha = state.ha_pool.lock().unwrap();
+        let mut ha = state.ha_pool.lock().unwrap_or_else(|e| {
+            tracing::error!("ha_pool mutex poisoned: {e}");
+            e.into_inner()
+        });
         ha.check_health()
     };
 
@@ -2359,15 +2605,8 @@ async fn auth_login(
     State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Json<LoginResponse> {
-    // Extract client IP for per-IP rate limiting
-    let client_ip = request
-        .headers()
-        .get("X-Forwarded-For")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .unwrap_or("unknown")
-        .trim()
-        .to_string();
+    // Extract client IP for per-IP rate limiting (trusted proxy validation)
+    let client_ip = extract_client_ip(&request);
 
     let body = match axum::body::to_bytes(request.into_body(), 1024 * 64).await {
         Ok(b) => b,
@@ -2428,19 +2667,22 @@ async fn auth_login(
             let now = now_secs();
             let expires_at = now + 3600; // 1 hour
 
-            // Store opaque token mapping
+            // Store opaque token mapping (L1 cache + DB write-through)
+            let opaque_entry = OpaqueTokenEntry {
+                user_id: verified_user_id,
+                created_at: now,
+                expires_at,
+            };
             {
                 let mut opaque_tokens = state.opaque_tokens.write().await;
                 enforce_map_capacity(&mut *opaque_tokens, MAX_ACCESS_TOKENS);
-                opaque_tokens.insert(
-                    token.clone(),
-                    OpaqueTokenEntry {
-                        user_id: verified_user_id,
-                        created_at: now,
-                        expires_at,
-                    },
-                );
+                opaque_tokens.insert(token.clone(), OpaqueTokenEntry {
+                    user_id: opaque_entry.user_id,
+                    created_at: opaque_entry.created_at,
+                    expires_at: opaque_entry.expires_at,
+                });
             }
+            db_insert_opaque_token(&state.db, &token, &opaque_entry).await;
 
             // Persist session to PostgreSQL
             let session_id = Uuid::new_v4();
@@ -2512,6 +2754,7 @@ async fn auth_verify(
     Json(req): Json<VerifyRequest>,
 ) -> Json<VerifyResponse> {
     // Try opaque token format first (hex-encoded 32-byte handle)
+    // L1: in-memory cache, L2: database fallback
     {
         let now = now_secs();
         let tokens = state.opaque_tokens.read().await;
@@ -2530,6 +2773,25 @@ async fn auth_verify(
                 });
             }
         }
+    }
+
+    // L2 fallback: check database for tokens not in cache (e.g., after restart)
+    if let Some(db_entry) = db_lookup_opaque_token(&state.db, &req.token).await {
+        // Promote to L1 cache
+        {
+            let mut tokens = state.opaque_tokens.write().await;
+            enforce_map_capacity(&mut *tokens, MAX_ACCESS_TOKENS);
+            tokens.insert(req.token.clone(), OpaqueTokenEntry {
+                user_id: db_entry.user_id,
+                created_at: db_entry.created_at,
+                expires_at: db_entry.expires_at,
+            });
+        }
+        return Json(VerifyResponse {
+            valid: true,
+            user_id: Some(db_entry.user_id),
+            error: None,
+        });
     }
 
     // Legacy format backward-compat: "user_id:timestamp:hmac_hex"
@@ -2608,11 +2870,12 @@ async fn auth_logout(
         tokens.remove(&token);
     }
 
-    // Remove from opaque_tokens
+    // Remove from opaque_tokens (L1 cache + DB)
     {
         let mut opaque_tokens = state.opaque_tokens.write().await;
         opaque_tokens.remove(&token);
     }
+    db_delete_opaque_token(&state.db, &token).await;
 
     // Add token hash to revocation list
     {
@@ -2786,7 +3049,10 @@ async fn get_kt_proof(
                 index,
                 proof: proof.iter().map(|h| hex(h)).collect(),
             };
-            Json(serde_json::to_value(resp).unwrap())
+            Json(serde_json::to_value(resp).unwrap_or_else(|e| {
+                tracing::error!("KT proof serialization failed: {e}");
+                serde_json::json!({"error": "internal serialization error"})
+            }))
         }
         None => Json(serde_json::json!({"error": "index out of range"})),
     }
@@ -2843,8 +3109,9 @@ async fn oauth_authorize(
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid_redirect_uri"}))).into_response();
     }
 
-    // Generate CSRF token bound to this OAuth session state
-    let csrf_token = generate_csrf_token(&params.state, &state.admin_api_key);
+    // Generate CSRF session cookie and CSRF token bound to it
+    let csrf_cookie_value = generate_csrf_session_cookie();
+    let csrf_token = generate_csrf_token(&params.state, &state.admin_api_key, &csrf_cookie_value);
 
     // Show login page — user MUST authenticate before getting an auth code
     let login_html = format!(r#"<!DOCTYPE html>
@@ -2919,19 +3186,62 @@ button:hover{{background:#00cc33}}
         },
     );
 
-    Html(login_html).into_response()
+    // Set the CSRF session cookie: Secure, HttpOnly, SameSite=Strict, Path=/
+    let csrf_cookie = format!(
+        "__Host-csrf-session={}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age={}",
+        csrf_cookie_value, CSRF_TOKEN_TTL_SECS + 30
+    );
+    let mut response = Html(login_html).into_response();
+    if let Ok(cookie_val) = axum::http::HeaderValue::from_str(&csrf_cookie) {
+        response.headers_mut().insert(header::SET_COOKIE, cookie_val);
+    }
+    response
+}
+
+/// Extract the `__Host-csrf-session` cookie value from a request's Cookie header.
+fn extract_csrf_session_cookie(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(';'))
+        .find_map(|cookie| {
+            let cookie = cookie.trim();
+            if let Some(val) = cookie.strip_prefix("__Host-csrf-session=") {
+                Some(val.to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
 }
 
 /// Handle the login form POST from the OAuth authorize page
 async fn oauth_authorize_login(
     State(state): State<Arc<AppState>>,
-    axum::extract::Form(form): axum::extract::Form<OAuthLoginForm>,
+    request: Request,
 ) -> axum::response::Response {
     use axum::response::{IntoResponse, Html};
     use axum::http::header;
 
-    // Validate CSRF token (cryptographic check + single-use enforcement)
-    if !validate_csrf_token(&form.csrf_token, &form.state, &state.admin_api_key)
+    // Extract the CSRF session cookie before consuming the body
+    let csrf_cookie_value = extract_csrf_session_cookie(request.headers());
+
+    let body = match axum::body::to_bytes(request.into_body(), 1024 * 64).await {
+        Ok(b) => b,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, Html("bad request".to_string())).into_response();
+        }
+    };
+    let form: OAuthLoginForm = match serde_urlencoded::from_bytes(&body) {
+        Ok(f) => f,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, Html("bad request".to_string())).into_response();
+        }
+    };
+
+    // Validate CSRF token (cryptographic check + session cookie binding + single-use)
+    if !validate_csrf_token(&form.csrf_token, &form.state, &state.admin_api_key, &csrf_cookie_value)
         || !check_and_mark_csrf_used(&form.csrf_token, &state.used_csrf_tokens).await
     {
         return (StatusCode::FORBIDDEN, Html(r#"<!DOCTYPE html>
@@ -3756,6 +4066,7 @@ async fn oauth_token(
         expires_in: 3600,
         id_token,
         scope: auth_code.scope,
+        refresh_token: None, // TODO: issue refresh token from RefreshTokenStore
     };
 
     match serde_json::to_value(response) {
@@ -4031,7 +4342,10 @@ async fn fido_authenticate_begin(
         &creds,
     );
 
-    Ok(Json(serde_json::to_value(FidoAuthBeginResponse { options }).unwrap()))
+    Ok(Json(serde_json::to_value(FidoAuthBeginResponse { options }).unwrap_or_else(|e| {
+        tracing::error!("FIDO auth options serialization failed: {e}");
+        serde_json::json!({"error": "internal serialization error"})
+    })))
 }
 
 async fn fido_authenticate_complete(
@@ -4219,21 +4533,47 @@ async fn initiate_ceremony(
 
     let now = now_secs();
     let ceremony_id = Uuid::new_v4();
-    let ceremony = PendingCeremony {
-        action: req.action,
-        level: req.level,
-        initiator,
-        approvals: Vec::new(),
-        required_approvals,
-        created_at: now,
-        expires_at: now + 1800, // 30-minute expiry
-    };
 
-    state
-        .pending_ceremonies
-        .write()
-        .await
-        .insert(ceremony_id, ceremony);
+    // Enforce per-user ceremony limit: only 1 pending ceremony per initiator.
+    // If the user already has an active ceremony, cancel it before creating a new one.
+    {
+        let mut ceremonies = state.pending_ceremonies.write().await;
+
+        // System-wide cap (also enforced in TTL eviction, but check eagerly)
+        if ceremonies.len() >= MAX_PENDING_CEREMONIES {
+            tracing::error!(
+                total = ceremonies.len(),
+                limit = MAX_PENDING_CEREMONIES,
+                "ceremony creation rejected: system-wide limit reached"
+            );
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+
+        // Per-user: cancel any existing pending ceremony for this initiator
+        let existing: Vec<Uuid> = ceremonies.iter()
+            .filter(|(_, c)| c.initiator == initiator && now < c.expires_at)
+            .map(|(id, _)| *id)
+            .collect();
+        for old_id in existing {
+            tracing::warn!(
+                old_ceremony_id = %old_id,
+                initiator = %initiator,
+                "cancelling existing ceremony for user (replaced by new ceremony)"
+            );
+            ceremonies.remove(&old_id);
+        }
+
+        let ceremony = PendingCeremony {
+            action: req.action,
+            level: req.level,
+            initiator,
+            approvals: Vec::new(),
+            required_approvals,
+            created_at: now,
+            expires_at: now + 1800, // 30-minute expiry
+        };
+        ceremonies.insert(ceremony_id, ceremony);
+    }
 
     Ok(Json(InitiateCeremonyResponse {
         ceremony_id,
@@ -5913,15 +6253,15 @@ mod tests {
 
     #[test]
     fn csrf_token_generation_produces_three_parts() {
-        let token = generate_csrf_token("session123", "secret-key");
+        let token = generate_csrf_token("session123", "secret-key", "cookie-val");
         let parts: Vec<&str> = token.splitn(3, ':').collect();
         assert_eq!(parts.len(), 3, "CSRF token must have 3 colon-separated parts");
     }
 
     #[test]
     fn csrf_token_generation_unique() {
-        let t1 = generate_csrf_token("session1", "key");
-        let t2 = generate_csrf_token("session1", "key");
+        let t1 = generate_csrf_token("session1", "key", "cookie");
+        let t2 = generate_csrf_token("session1", "key", "cookie");
         assert_ne!(t1, t2, "two generated tokens must differ (random nonce)");
     }
 
@@ -5929,9 +6269,10 @@ mod tests {
     fn csrf_token_validation_correct() {
         let session = "my-session-state";
         let key = "my-api-key";
-        let token = generate_csrf_token(session, key);
+        let cookie = "csrf-session-cookie-value";
+        let token = generate_csrf_token(session, key, cookie);
         assert!(
-            validate_csrf_token(&token, session, key),
+            validate_csrf_token(&token, session, key, cookie),
             "freshly generated token must validate"
         );
     }
@@ -5939,9 +6280,10 @@ mod tests {
     #[test]
     fn csrf_token_validation_wrong_session() {
         let key = "my-api-key";
-        let token = generate_csrf_token("session-A", key);
+        let cookie = "csrf-cookie";
+        let token = generate_csrf_token("session-A", key, cookie);
         assert!(
-            !validate_csrf_token(&token, "session-B", key),
+            !validate_csrf_token(&token, "session-B", key, cookie),
             "token from different session must not validate"
         );
     }
@@ -5949,10 +6291,33 @@ mod tests {
     #[test]
     fn csrf_token_validation_wrong_key() {
         let session = "my-session";
-        let token = generate_csrf_token(session, "key-A");
+        let cookie = "csrf-cookie";
+        let token = generate_csrf_token(session, "key-A", cookie);
         assert!(
-            !validate_csrf_token(&token, session, "key-B"),
+            !validate_csrf_token(&token, session, "key-B", cookie),
             "token validated with wrong key must fail"
+        );
+    }
+
+    #[test]
+    fn csrf_token_validation_wrong_cookie() {
+        let session = "my-session";
+        let key = "my-api-key";
+        let token = generate_csrf_token(session, key, "cookie-A");
+        assert!(
+            !validate_csrf_token(&token, session, key, "cookie-B"),
+            "token with wrong session cookie must fail"
+        );
+    }
+
+    #[test]
+    fn csrf_token_validation_empty_cookie_rejected() {
+        let session = "my-session";
+        let key = "my-api-key";
+        let token = generate_csrf_token(session, key, "real-cookie");
+        assert!(
+            !validate_csrf_token(&token, session, key, ""),
+            "empty cookie value must be rejected"
         );
     }
 
@@ -5960,12 +6325,13 @@ mod tests {
     fn csrf_token_validation_tampered_hmac() {
         let session = "my-session";
         let key = "my-api-key";
-        let token = generate_csrf_token(session, key);
+        let cookie = "csrf-cookie";
+        let token = generate_csrf_token(session, key, cookie);
         let parts: Vec<&str> = token.splitn(3, ':').collect();
         // Tamper with the HMAC signature
         let tampered = format!("{}:{}:deadbeef0000", parts[0], parts[1]);
         assert!(
-            !validate_csrf_token(&tampered, session, key),
+            !validate_csrf_token(&tampered, session, key, cookie),
             "tampered HMAC must not validate"
         );
     }
@@ -5974,6 +6340,7 @@ mod tests {
     fn csrf_token_validation_expired() {
         let session = "my-session";
         let key = "my-api-key";
+        let cookie = "csrf-cookie";
         // Construct a token with a timestamp from 120 seconds ago (beyond 60s TTL)
         let old_ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -5987,24 +6354,24 @@ mod tests {
         use sha2::Sha256;
         type HmacSha256 = Hmac<Sha256>;
 
-        let payload = format!("{}:{}:{}", session, old_ts, nonce_hex);
+        let payload = format!("{}:{}:{}:{}", session, cookie, old_ts, nonce_hex);
         let mut mac = HmacSha256::new_from_slice(key.as_bytes()).expect("HMAC key");
         mac.update(payload.as_bytes());
         let sig = hex::encode(mac.finalize().into_bytes());
         let expired_token = format!("{}:{}:{}", old_ts, nonce_hex, sig);
 
         assert!(
-            !validate_csrf_token(&expired_token, session, key),
+            !validate_csrf_token(&expired_token, session, key, cookie),
             "expired CSRF token must not validate"
         );
     }
 
     #[test]
     fn csrf_token_validation_malformed_input() {
-        assert!(!validate_csrf_token("", "s", "k"));
-        assert!(!validate_csrf_token("no-colons", "s", "k"));
-        assert!(!validate_csrf_token("one:two", "s", "k"));
-        assert!(!validate_csrf_token("notanumber:nonce:sig", "s", "k"));
+        assert!(!validate_csrf_token("", "s", "k", "c"));
+        assert!(!validate_csrf_token("no-colons", "s", "k", "c"));
+        assert!(!validate_csrf_token("one:two", "s", "k", "c"));
+        assert!(!validate_csrf_token("notanumber:nonce:sig", "s", "k", "c"));
     }
 
     #[tokio::test]

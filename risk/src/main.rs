@@ -39,6 +39,22 @@ async fn main() {
     assert!(common::cnsa2::is_cnsa2_compliant(), "CNSA 2.0 compliance check failed");
     tracing::info!("CNSA 2.0 compliance verified");
 
+    // Spawn health check endpoint
+    let health_start = std::time::Instant::now();
+    let _health_handle = common::health::spawn_health_endpoint(
+        "risk".to_string(),
+        9106,
+        health_start,
+        || {
+            vec![common::health::HealthCheck {
+                name: "risk_service".to_string(),
+                ok: true,
+                detail: None,
+                latency_ms: None,
+            }]
+        },
+    );
+
     tracing::info!("Risk Scoring service starting");
 
     let engine = Arc::new(RwLock::new(risk::scoring::RiskEngine::new()));

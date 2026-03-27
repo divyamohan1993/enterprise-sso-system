@@ -23,7 +23,9 @@ rand.workspace = true
 aes-gcm.workspace = true
 getrandom.workspace = true
 hkdf.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 tokio-rustls.workspace = true
 rustls.workspace = true
+hex.workspace = true

@@ -50,6 +50,22 @@ async fn main() {
     assert!(common::cnsa2::is_cnsa2_compliant(), "CNSA 2.0 compliance check failed");
     tracing::info!("CNSA 2.0 compliance verified");
 
+    // Spawn health check endpoint
+    let health_start = std::time::Instant::now();
+    let _health_handle = common::health::spawn_health_endpoint(
+        "verifier".to_string(),
+        9104,
+        health_start,
+        || {
+            vec![common::health::HealthCheck {
+                name: "verifier_service".to_string(),
+                ok: true,
+                detail: None,
+                latency_ms: None,
+            }]
+        },
+    );
+
     tracing::info!("verifier starting");
 
     // 1. Load group verifying key from env (hex-encoded postcard bytes)

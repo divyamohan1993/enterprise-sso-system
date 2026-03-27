@@ -8,6 +8,7 @@ pub mod actions;
 pub mod config;
 pub mod db;
 pub mod domain;
+pub mod sync;
 pub mod duress;
 pub mod error;
 pub mod network;
@@ -125,6 +126,9 @@ pub mod fips_validation;
 
 // ── FIPS 140-3 CMVP submission tracker dashboard ──
 pub mod fips_tracker;
+
+// ── Common Criteria (ISO/IEC 15408) Security Target ──
+pub mod common_criteria;
 
 // ── Encrypted audit metadata ──
 pub mod encrypted_audit;

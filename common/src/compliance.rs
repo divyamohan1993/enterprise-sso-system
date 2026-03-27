@@ -5,6 +5,224 @@
 
 use std::collections::HashMap;
 
+// ---------------------------------------------------------------------------
+// NIST SP 800-63-3 Assurance Level Declarations
+// ---------------------------------------------------------------------------
+
+/// NIST SP 800-63-3 Identity Assurance Levels.
+///
+/// Defines the degree of confidence in identity proofing:
+/// - **IAL1**: Self-asserted identity (no proofing required).
+/// - **IAL2**: Remote or in-person proofing with evidence verification.
+/// - **IAL3**: In-person proofing with physical document verification and biometrics.
+///
+/// # Tier Mapping
+///
+/// | DeviceTier   | IAL | Rationale                                    |
+/// |-------------|-----|----------------------------------------------|
+/// | Sovereign   | IAL3 | Command-level: requires in-person proofing  |
+/// | Operational | IAL2 | Standard ops: remote proofing acceptable     |
+/// | Sensor      | IAL1 | Device identity only, no human proofing      |
+/// | Emergency   | IAL1 | Degraded mode, minimal proofing              |
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+pub enum IdentityAssuranceLevel {
+    /// IAL1: Self-asserted identity
+    Ial1,
+    /// IAL2: Remote or in-person proofing
+    Ial2,
+    /// IAL3: In-person proofing with physical verification
+    Ial3,
+}
+
+/// NIST SP 800-63-3 Authenticator Assurance Levels.
+///
+/// Defines the strength of the authentication process:
+/// - **AAL1**: Single-factor authentication (password or TOTP alone).
+/// - **AAL2**: Two-factor authentication; phishing-resistant optional.
+/// - **AAL3**: Hardware-based multi-factor, phishing-resistant required (FIDO2/CAC).
+///
+/// # Tier Mapping
+///
+/// | DeviceTier   | AAL | Authentication Methods Required               |
+/// |-------------|-----|------------------------------------------------|
+/// | Sovereign   | AAL3 | FIDO2 + CAC/PIV hardware token (phishing-resistant) |
+/// | Operational | AAL2 | OPAQUE + TOTP or FIDO2                         |
+/// | Sensor      | AAL1 | Device certificate or single-factor            |
+/// | Emergency   | AAL1 | Degraded authentication path                   |
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+pub enum AuthenticatorAssuranceLevel {
+    /// AAL1: Single-factor authentication
+    Aal1,
+    /// AAL2: Two-factor authentication (phishing-resistant optional)
+    Aal2,
+    /// AAL3: Hardware-based multi-factor, phishing-resistant
+    Aal3,
+}
+
+/// NIST SP 800-63-3 Federation Assurance Levels.
+///
+/// Defines the strength of federated identity assertions:
+/// - **FAL1**: Bearer assertion (e.g., signed SAML or JWT).
+/// - **FAL2**: Holder-of-key assertion (DPoP proof-of-possession).
+/// - **FAL3**: Holder-of-key + direct presentation (no intermediary).
+///
+/// # Tier Mapping
+///
+/// | DeviceTier   | FAL | Assertion Type                                |
+/// |-------------|-----|-----------------------------------------------|
+/// | Sovereign   | FAL3 | Direct presentation with DPoP + mTLS         |
+/// | Operational | FAL2 | DPoP holder-of-key assertion                  |
+/// | Sensor      | FAL1 | Bearer assertion (signed JWT)                 |
+/// | Emergency   | FAL1 | Bearer assertion (degraded mode)              |
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+pub enum FederationAssuranceLevel {
+    /// FAL1: Bearer assertion
+    Fal1,
+    /// FAL2: Holder-of-key assertion
+    Fal2,
+    /// FAL3: Holder-of-key + direct presentation
+    Fal3,
+}
+
+/// Combined NIST SP 800-63-3 assurance level binding for a given tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AssuranceLevelBinding {
+    pub ial: IdentityAssuranceLevel,
+    pub aal: AuthenticatorAssuranceLevel,
+    pub fal: FederationAssuranceLevel,
+}
+
+/// Map a `DeviceTier` numeric value to its required NIST SP 800-63-3 assurance levels.
+///
+/// Tier values follow `crate::types::DeviceTier`:
+/// - 1 = Sovereign, 2 = Operational, 3 = Sensor, 4 = Emergency
+///
+/// Returns `None` for unrecognized tier values.
+pub fn assurance_levels_for_tier(tier: u8) -> Option<AssuranceLevelBinding> {
+    match tier {
+        1 => Some(AssuranceLevelBinding {
+            ial: IdentityAssuranceLevel::Ial3,
+            aal: AuthenticatorAssuranceLevel::Aal3,
+            fal: FederationAssuranceLevel::Fal3,
+        }),
+        2 => Some(AssuranceLevelBinding {
+            ial: IdentityAssuranceLevel::Ial2,
+            aal: AuthenticatorAssuranceLevel::Aal2,
+            fal: FederationAssuranceLevel::Fal2,
+        }),
+        3 => Some(AssuranceLevelBinding {
+            ial: IdentityAssuranceLevel::Ial1,
+            aal: AuthenticatorAssuranceLevel::Aal1,
+            fal: FederationAssuranceLevel::Fal1,
+        }),
+        4 => Some(AssuranceLevelBinding {
+            ial: IdentityAssuranceLevel::Ial1,
+            aal: AuthenticatorAssuranceLevel::Aal1,
+            fal: FederationAssuranceLevel::Fal1,
+        }),
+        _ => None,
+    }
+}
+
+/// Validate that a deployment's authentication configuration meets the declared
+/// assurance level requirements.
+///
+/// # Parameters
+/// - `tier`: The `DeviceTier` numeric value (1-4).
+/// - `has_hardware_mfa`: Whether FIDO2/CAC hardware MFA is enforced.
+/// - `has_two_factor`: Whether any two-factor authentication is enforced.
+/// - `has_dpop`: Whether DPoP proof-of-possession is enforced on tokens.
+/// - `has_identity_proofing`: Whether in-person or remote identity proofing is performed.
+///
+/// # Returns
+/// A list of compliance violations (empty if fully compliant).
+pub fn validate_assurance_level(
+    tier: u8,
+    has_hardware_mfa: bool,
+    has_two_factor: bool,
+    has_dpop: bool,
+    has_identity_proofing: bool,
+) -> Vec<ComplianceViolation> {
+    let mut violations = Vec::new();
+
+    let binding = match assurance_levels_for_tier(tier) {
+        Some(b) => b,
+        None => {
+            violations.push(ComplianceViolation::new(
+                "ASSURANCE_LEVEL",
+                format!("Unknown device tier: {}", tier),
+                ComplianceSeverity::Critical,
+            ));
+            return violations;
+        }
+    };
+
+    // AAL validation
+    match binding.aal {
+        AuthenticatorAssuranceLevel::Aal3 => {
+            if !has_hardware_mfa {
+                violations.push(ComplianceViolation::new(
+                    "AAL3_HARDWARE_MFA",
+                    "AAL3 requires hardware-based phishing-resistant MFA (FIDO2/CAC) but it is not enforced".to_string(),
+                    ComplianceSeverity::Critical,
+                ));
+            }
+        }
+        AuthenticatorAssuranceLevel::Aal2 => {
+            if !has_two_factor {
+                violations.push(ComplianceViolation::new(
+                    "AAL2_TWO_FACTOR",
+                    "AAL2 requires two-factor authentication but it is not enforced".to_string(),
+                    ComplianceSeverity::High,
+                ));
+            }
+        }
+        AuthenticatorAssuranceLevel::Aal1 => {
+            // AAL1: single-factor is sufficient; no additional check needed.
+        }
+    }
+
+    // FAL validation
+    match binding.fal {
+        FederationAssuranceLevel::Fal3 | FederationAssuranceLevel::Fal2 => {
+            if !has_dpop {
+                violations.push(ComplianceViolation::new(
+                    "FAL_HOLDER_OF_KEY",
+                    format!(
+                        "{:?} requires DPoP holder-of-key assertions but DPoP is not enforced",
+                        binding.fal
+                    ),
+                    ComplianceSeverity::High,
+                ));
+            }
+        }
+        FederationAssuranceLevel::Fal1 => {}
+    }
+
+    // IAL validation
+    match binding.ial {
+        IdentityAssuranceLevel::Ial3 | IdentityAssuranceLevel::Ial2 => {
+            if !has_identity_proofing {
+                violations.push(ComplianceViolation::new(
+                    "IAL_IDENTITY_PROOFING",
+                    format!(
+                        "{:?} requires identity proofing but it is not configured",
+                        binding.ial
+                    ),
+                    ComplianceSeverity::High,
+                ));
+            }
+        }
+        IdentityAssuranceLevel::Ial1 => {}
+    }
+
+    violations
+}
+
+// ---------------------------------------------------------------------------
+// Regulatory Compliance
+// ---------------------------------------------------------------------------
+
 /// Regulatory compliance regime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ComplianceRegime {
@@ -540,5 +758,83 @@ mod tests {
         );
         assert!(violations.iter().any(|v| v.rule == "DEPLOYMENT_PII_ENCRYPTION"));
         assert!(violations.iter().any(|v| v.rule == "DEPLOYMENT_DATA_RESIDENCY"));
+    }
+
+    // ── NIST SP 800-63-3 Assurance Level Tests ──
+
+    #[test]
+    fn test_assurance_levels_sovereign_tier() {
+        let binding = assurance_levels_for_tier(1).expect("tier 1 must be valid");
+        assert_eq!(binding.ial, IdentityAssuranceLevel::Ial3);
+        assert_eq!(binding.aal, AuthenticatorAssuranceLevel::Aal3);
+        assert_eq!(binding.fal, FederationAssuranceLevel::Fal3);
+    }
+
+    #[test]
+    fn test_assurance_levels_operational_tier() {
+        let binding = assurance_levels_for_tier(2).expect("tier 2 must be valid");
+        assert_eq!(binding.ial, IdentityAssuranceLevel::Ial2);
+        assert_eq!(binding.aal, AuthenticatorAssuranceLevel::Aal2);
+        assert_eq!(binding.fal, FederationAssuranceLevel::Fal2);
+    }
+
+    #[test]
+    fn test_assurance_levels_sensor_tier() {
+        let binding = assurance_levels_for_tier(3).expect("tier 3 must be valid");
+        assert_eq!(binding.ial, IdentityAssuranceLevel::Ial1);
+        assert_eq!(binding.aal, AuthenticatorAssuranceLevel::Aal1);
+        assert_eq!(binding.fal, FederationAssuranceLevel::Fal1);
+    }
+
+    #[test]
+    fn test_assurance_levels_emergency_tier() {
+        let binding = assurance_levels_for_tier(4).expect("tier 4 must be valid");
+        assert_eq!(binding.ial, IdentityAssuranceLevel::Ial1);
+        assert_eq!(binding.aal, AuthenticatorAssuranceLevel::Aal1);
+        assert_eq!(binding.fal, FederationAssuranceLevel::Fal1);
+    }
+
+    #[test]
+    fn test_assurance_levels_unknown_tier() {
+        assert!(assurance_levels_for_tier(0).is_none());
+        assert!(assurance_levels_for_tier(5).is_none());
+        assert!(assurance_levels_for_tier(255).is_none());
+    }
+
+    #[test]
+    fn test_validate_assurance_sovereign_fully_compliant() {
+        let violations = validate_assurance_level(1, true, true, true, true);
+        assert!(violations.is_empty(), "fully configured Sovereign should have no violations");
+    }
+
+    #[test]
+    fn test_validate_assurance_sovereign_missing_hardware_mfa() {
+        let violations = validate_assurance_level(1, false, true, true, true);
+        assert!(violations.iter().any(|v| v.rule == "AAL3_HARDWARE_MFA"));
+    }
+
+    #[test]
+    fn test_validate_assurance_operational_missing_two_factor() {
+        let violations = validate_assurance_level(2, false, false, true, true);
+        assert!(violations.iter().any(|v| v.rule == "AAL2_TWO_FACTOR"));
+    }
+
+    #[test]
+    fn test_validate_assurance_operational_missing_dpop() {
+        let violations = validate_assurance_level(2, false, true, false, true);
+        assert!(violations.iter().any(|v| v.rule == "FAL_HOLDER_OF_KEY"));
+    }
+
+    #[test]
+    fn test_validate_assurance_sensor_minimal_ok() {
+        // Sensor tier (AAL1/FAL1/IAL1) requires nothing special
+        let violations = validate_assurance_level(3, false, false, false, false);
+        assert!(violations.is_empty(), "Sensor tier should pass with minimal config");
+    }
+
+    #[test]
+    fn test_validate_assurance_unknown_tier_violation() {
+        let violations = validate_assurance_level(99, false, false, false, false);
+        assert!(violations.iter().any(|v| v.rule == "ASSURANCE_LEVEL"));
     }
 }

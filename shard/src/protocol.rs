@@ -564,7 +564,9 @@ impl SequencePersistence {
             }
             #[cfg(not(unix))]
             {
-                let _ = ctrl_c.await;
+                if let Err(e) = ctrl_c.await {
+                    tracing::warn!("SHARD: ctrl-c signal error: {e}");
+                }
             }
 
             tracing::info!("SHARD: graceful shutdown — persisting sequences");
@@ -586,7 +588,9 @@ impl Drop for SequencePersistence {
     fn drop(&mut self) {
         // Signal background tasks to stop
         if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(true);
+            if let Err(e) = tx.send(true) {
+                tracing::warn!("SHARD: shutdown signal send failed: {e}");
+            }
         }
         // Best-effort final persistence
         if let Err(e) = Self::persist_to_disk(&self.protocol, &self.data_dir) {

@@ -28,8 +28,16 @@ use zeroize::Zeroize;
 use crate::puzzle::{generate_challenge, get_adaptive_difficulty, verify_solution, PuzzleSolution};
 use crate::wire::{AuthRequest, AuthResponse, OrchestratorRequest, OrchestratorResponse};
 
-/// Maximum wire frame payload size (1 MiB).
+/// Maximum wire frame payload size (1 MiB) — absolute upper bound.
 const MAX_FRAME_LEN: u32 = 1024 * 1024;
+
+/// Per-endpoint request size limits.
+/// Auth and token endpoints use a tighter limit to prevent abuse.
+/// Admin endpoints allow larger payloads for bulk operations.
+pub const MAX_AUTH_REQUEST_SIZE: u32 = 16 * 1024;      // 16 KiB
+pub const MAX_TOKEN_REQUEST_SIZE: u32 = 16 * 1024;     // 16 KiB
+pub const MAX_ADMIN_REQUEST_SIZE: u32 = 256 * 1024;    // 256 KiB
+pub const MAX_DEFAULT_REQUEST_SIZE: u32 = 64 * 1024;   // 64 KiB
 
 /// Maximum connections per IP within the rate-limit window.
 /// Override with MILNET_MAX_CONN_PER_IP for load testing (default: 10).
@@ -574,8 +582,19 @@ async fn handle_connection(
     common::error_response::log_crypto_operation("key_derive", "HKDF-SHA512", "session_key");
     debug!("X-Wing KEM: session key established (hybrid PQ + classical)");
 
-    // 6. Read encrypted auth request
-    let encrypted_auth = recv_raw_frame_with_timeout(&mut stream).await?;
+    // 6. Read encrypted auth request (enforce auth endpoint size limit)
+    let encrypted_auth = tokio::time::timeout(
+        IO_TIMEOUT,
+        recv_raw_frame_limited(&mut stream, MAX_AUTH_REQUEST_SIZE),
+    )
+    .await
+    .map_err(|_| "read timeout".to_string())?
+    .map_err(|e| {
+        if e.contains("payload too large") {
+            warn!("auth request rejected: {e}");
+        }
+        e
+    })?;
     let auth_plaintext = decrypt_frame(&enc_key, &encrypted_auth)?;
     let auth_req: AuthRequest = postcard::from_bytes(&auth_plaintext)
         .map_err(|e| format!("deserialize auth request: {e}"))?;
@@ -766,13 +785,33 @@ async fn recv_frame<T: serde::de::DeserializeOwned>(stream: &mut (impl AsyncRead
 }
 
 /// Read a raw length-prefixed frame (bytes without deserialization).
+///
+/// Enforces `MAX_FRAME_LEN` as the absolute upper bound.  Callers that
+/// need tighter per-endpoint limits should use `recv_raw_frame_limited`.
 async fn recv_raw_frame(stream: &mut (impl AsyncRead + AsyncWrite + Unpin)) -> Result<Vec<u8>, String> {
+    recv_raw_frame_limited(stream, MAX_FRAME_LEN).await
+}
+
+/// Read a raw length-prefixed frame with a caller-specified size limit.
+///
+/// Returns `Err("payload too large: … bytes (limit …)")` if the declared
+/// frame length exceeds `max_size`, which the gateway maps to 413 Payload
+/// Too Large when surfaced to HTTP clients.
+async fn recv_raw_frame_limited(
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    max_size: u32,
+) -> Result<Vec<u8>, String> {
     let mut len_buf = [0u8; 4];
     stream
         .read_exact(&mut len_buf)
         .await
         .map_err(|e| format!("read length: {e}"))?;
     let len = u32::from_be_bytes(len_buf);
+    if len > max_size {
+        return Err(format!(
+            "payload too large: {len} bytes (limit {max_size} bytes)"
+        ));
+    }
     if len > MAX_FRAME_LEN {
         return Err(format!("frame too large: {len} bytes"));
     }

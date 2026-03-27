@@ -81,21 +81,40 @@ const CHACHA_NONCE_LEN:   usize = 12;
 
 /// Adaptive cryptographic service that scales algorithm strength to the
 /// current threat level.
+///
+/// Features audit logging for every threat level change and hysteresis
+/// (debounce) to prevent rapid oscillation between threat levels.
 pub struct AdaptiveCrypto {
     current_level: AtomicU8,
     escalation_history: Mutex<Vec<(i64, CryptoThreatLevel)>>,
     /// Seconds that must pass at a lower threat level before de-escalation
     /// is allowed. Default: 900 (15 min).
     deescalation_cooldown_secs: u64,
+    /// Pending escalation: (requested_level, first_seen_timestamp).
+    /// The escalation only takes effect after the level is sustained for
+    /// `debounce_secs` seconds.  Protected by Mutex for thread safety.
+    pending_escalation: Mutex<Option<(CryptoThreatLevel, i64)>>,
+    /// Seconds a threat level must be sustained before escalation applies.
+    /// Configurable via `MILNET_ADAPTIVE_DEBOUNCE_SECS` env var (default: 10).
+    debounce_secs: u64,
 }
 
 impl AdaptiveCrypto {
     /// Construct with Normal threat level and 15-minute de-escalation cooldown.
+    ///
+    /// Reads `MILNET_ADAPTIVE_DEBOUNCE_SECS` env var for hysteresis period
+    /// (default: 10 seconds).
     pub fn new() -> Self {
+        let debounce = std::env::var("MILNET_ADAPTIVE_DEBOUNCE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(10);
         Self {
             current_level: AtomicU8::new(CryptoThreatLevel::Normal as u8),
             escalation_history: Mutex::new(Vec::new()),
             deescalation_cooldown_secs: 900,
+            pending_escalation: Mutex::new(None),
+            debounce_secs: debounce,
         }
     }
 
@@ -104,15 +123,95 @@ impl AdaptiveCrypto {
         CryptoThreatLevel::from_u8(self.current_level.load(Ordering::SeqCst))
     }
 
-    /// Escalate to `new_level` (no-op if current >= new_level).
+    /// Log a threat level change to the audit trail and SIEM channel.
+    fn audit_level_change(
+        previous: CryptoThreatLevel,
+        new: CryptoThreatLevel,
+        reason: &str,
+        timestamp: i64,
+    ) {
+        tracing::warn!(
+            previous_level = ?previous,
+            new_level = ?new,
+            reason = reason,
+            timestamp = timestamp,
+            "SIEM:AUDIT adaptive crypto threat level change: {:?} -> {:?} (reason: {}, ts: {})",
+            previous, new, reason, timestamp
+        );
+    }
+
+    /// Escalate to `new_level` with hysteresis (debounce).
+    ///
+    /// The escalation only takes effect if the same level (or higher) is
+    /// requested for at least `debounce_secs` consecutive seconds.
+    /// This prevents rapid oscillation from transient threat signals.
+    ///
+    /// To bypass debounce for immediate escalation (e.g., confirmed attack),
+    /// use `escalate_immediate`.
     pub fn escalate(&self, new_level: CryptoThreatLevel) {
         let now = unix_timestamp_secs();
+        let current = self.current_level();
+
+        if current >= new_level {
+            // Already at or above requested level — clear pending
+            let mut pending = self.pending_escalation.lock().unwrap_or_else(|e| e.into_inner());
+            *pending = None;
+            return;
+        }
+
+        // Check debounce: has this level been sustained long enough?
+        let mut pending = self.pending_escalation.lock().unwrap_or_else(|e| e.into_inner());
+        match *pending {
+            Some((pending_level, first_seen)) if pending_level <= new_level => {
+                let sustained_secs = now.saturating_sub(first_seen) as u64;
+                if sustained_secs >= self.debounce_secs {
+                    // Debounce period satisfied — apply escalation
+                    *pending = None;
+                    drop(pending);
+                    self.escalate_immediate_with_reason(
+                        new_level,
+                        &format!("sustained for {}s (debounce: {}s)", sustained_secs, self.debounce_secs),
+                    );
+                } else {
+                    // Update pending level if higher, keep original timestamp
+                    if new_level > pending_level {
+                        *pending = Some((new_level, first_seen));
+                    }
+                    // Still waiting for debounce period
+                }
+            }
+            _ => {
+                // No pending or pending is for a different (lower) level — start new debounce
+                *pending = Some((new_level, now));
+
+                // If debounce is 0, apply immediately
+                if self.debounce_secs == 0 {
+                    drop(pending);
+                    self.escalate_immediate_with_reason(new_level, "debounce=0, immediate");
+                }
+            }
+        }
+    }
+
+    /// Immediately escalate to `new_level` without debounce.
+    ///
+    /// Use for confirmed attacks or when debounce is inappropriate.
+    pub fn escalate_immediate(&self, new_level: CryptoThreatLevel) {
+        self.escalate_immediate_with_reason(new_level, "immediate escalation requested");
+    }
+
+    /// Internal: apply escalation with audit logging.
+    fn escalate_immediate_with_reason(&self, new_level: CryptoThreatLevel, reason: &str) {
+        let now = unix_timestamp_secs();
+        let previous = self.current_level();
+
         // Store the escalation event regardless — it resets cooldown tracking.
         {
             let mut hist = self.escalation_history.lock().unwrap_or_else(|e| e.into_inner());
             hist.push((now, new_level));
         }
         // CAS loop: only raise the level.
+        let mut did_change = false;
         loop {
             let cur = self.current_level.load(Ordering::SeqCst);
             if cur >= new_level as u8 {
@@ -123,15 +222,21 @@ impl AdaptiveCrypto {
                 .compare_exchange(cur, new_level as u8, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
+                did_change = true;
                 break;
             }
+        }
+
+        if did_change {
+            Self::audit_level_change(previous, new_level, reason, now);
         }
     }
 
     /// Attempt de-escalation by one level.
     ///
     /// Only succeeds when the most recent escalation occurred more than
-    /// `deescalation_cooldown_secs` ago.
+    /// `deescalation_cooldown_secs` ago. Logs the de-escalation to the
+    /// audit trail.
     pub fn deescalate(&self) {
         let now = unix_timestamp_secs();
         let hist = self.escalation_history.lock().unwrap_or_else(|e| e.into_inner());
@@ -142,7 +247,11 @@ impl AdaptiveCrypto {
             }
         }
         drop(hist);
+
+        let previous = self.current_level();
+
         // Decrement by one, bottom at Normal(0).
+        let mut did_change = false;
         loop {
             let cur = self.current_level.load(Ordering::SeqCst);
             if cur == 0 {
@@ -153,8 +262,14 @@ impl AdaptiveCrypto {
                 .compare_exchange(cur, cur - 1, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
+                did_change = true;
                 break;
             }
+        }
+
+        if did_change {
+            let new_level = self.current_level();
+            Self::audit_level_change(previous, new_level, "de-escalation after cooldown", now);
         }
     }
 
@@ -550,7 +665,7 @@ mod tests {
     #[test]
     fn test_adaptive_elevated_roundtrip() {
         let ac = AdaptiveCrypto::new();
-        ac.escalate(CryptoThreatLevel::Elevated);
+        ac.escalate_immediate(CryptoThreatLevel::Elevated);
         assert_eq!(ac.current_level(), CryptoThreatLevel::Elevated);
 
         let key = random_key();
@@ -573,7 +688,7 @@ mod tests {
     #[test]
     fn test_adaptive_high_triple_layer() {
         let ac = AdaptiveCrypto::new();
-        ac.escalate(CryptoThreatLevel::High);
+        ac.escalate_immediate(CryptoThreatLevel::High);
         assert_eq!(ac.current_level(), CryptoThreatLevel::High);
 
         let key = random_key();
@@ -589,7 +704,7 @@ mod tests {
     #[test]
     fn test_adaptive_critical_rekey() {
         let ac = AdaptiveCrypto::new();
-        ac.escalate(CryptoThreatLevel::Critical);
+        ac.escalate_immediate(CryptoThreatLevel::Critical);
         assert_eq!(ac.current_level(), CryptoThreatLevel::Critical);
 
         let key = random_key();
@@ -603,20 +718,48 @@ mod tests {
     }
 
     #[test]
-    fn test_adaptive_escalation() {
+    fn test_adaptive_escalation_immediate() {
         let ac = AdaptiveCrypto::new();
         assert_eq!(ac.current_level(), CryptoThreatLevel::Normal);
+        ac.escalate_immediate(CryptoThreatLevel::High);
+        assert_eq!(ac.current_level(), CryptoThreatLevel::High);
+        // Attempting to escalate to Elevated should be a no-op (already higher).
+        ac.escalate_immediate(CryptoThreatLevel::Elevated);
+        assert_eq!(ac.current_level(), CryptoThreatLevel::High);
+    }
+
+    #[test]
+    fn test_adaptive_escalation_debounce() {
+        // With default debounce (10s), a single escalate() call should NOT
+        // immediately change the level.
+        std::env::set_var("MILNET_ADAPTIVE_DEBOUNCE_SECS", "10");
+        let ac = AdaptiveCrypto::new();
+        std::env::remove_var("MILNET_ADAPTIVE_DEBOUNCE_SECS");
+
+        assert_eq!(ac.current_level(), CryptoThreatLevel::Normal);
         ac.escalate(CryptoThreatLevel::High);
+        // Level should still be Normal — debounce period not yet elapsed
+        assert_eq!(ac.current_level(), CryptoThreatLevel::Normal);
+
+        // escalate_immediate bypasses debounce
+        ac.escalate_immediate(CryptoThreatLevel::High);
         assert_eq!(ac.current_level(), CryptoThreatLevel::High);
-        // Attempting to escalate to Elevated should be a no-op.
+    }
+
+    #[test]
+    fn test_adaptive_zero_debounce_escalates_immediately() {
+        std::env::set_var("MILNET_ADAPTIVE_DEBOUNCE_SECS", "0");
+        let ac = AdaptiveCrypto::new();
+        std::env::remove_var("MILNET_ADAPTIVE_DEBOUNCE_SECS");
+
         ac.escalate(CryptoThreatLevel::Elevated);
-        assert_eq!(ac.current_level(), CryptoThreatLevel::High);
+        assert_eq!(ac.current_level(), CryptoThreatLevel::Elevated);
     }
 
     #[test]
     fn test_adaptive_deescalation_cooldown() {
         let ac = AdaptiveCrypto::new();
-        ac.escalate(CryptoThreatLevel::High);
+        ac.escalate_immediate(CryptoThreatLevel::High);
         // Immediately try to de-escalate — cooldown hasn't elapsed.
         ac.deescalate();
         // Level must remain High.
@@ -628,7 +771,7 @@ mod tests {
         // Encrypt at High, then decrypt with a *different* AdaptiveCrypto at Normal.
         // Must succeed because the level is embedded in the wire format.
         let ac_high = AdaptiveCrypto::new();
-        ac_high.escalate(CryptoThreatLevel::High);
+        ac_high.escalate_immediate(CryptoThreatLevel::High);
 
         let ac_normal = AdaptiveCrypto::new();
         assert_eq!(ac_normal.current_level(), CryptoThreatLevel::Normal);

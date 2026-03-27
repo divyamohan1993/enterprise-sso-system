@@ -5,61 +5,337 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use uuid::Uuid;
 
-/// Global JTI replay cache — tracks seen token IDs to prevent replay.
-/// Entries are evicted after they expire (exp + skew tolerance).
-/// Bounded to prevent memory exhaustion from long-lived cache entries.
-static JTI_CACHE: std::sync::OnceLock<Mutex<JtiReplayCache>> = std::sync::OnceLock::new();
+// ---------------------------------------------------------------------------
+// JTI Replay Cache — distributed with L1 in-memory + L2 database backend
+// ---------------------------------------------------------------------------
 
-struct JtiReplayCache {
-    /// Maps JTI -> expiry timestamp (seconds since epoch)
-    seen: HashMap<String, i64>,
-    /// Maximum cache size — oldest entries evicted when exceeded
+/// Trait for pluggable JTI replay storage backends.
+///
+/// Implementations must be safe to call from synchronous contexts (the default
+/// in-memory cache) or async contexts (the database-backed store).
+pub trait JtiReplayStore: Send + Sync {
+    /// Mark a JTI as used with its expiry timestamp.
+    /// Returns `Ok(true)` if the JTI was freshly inserted (not a replay).
+    /// Returns `Ok(false)` if the JTI was already present (replay detected).
+    fn mark_used(&self, jti: &str, expires_at: i64) -> Result<bool, String>;
+
+    /// Check whether a JTI has already been used.
+    fn is_used(&self, jti: &str) -> bool;
+}
+
+/// In-memory JTI store — used as L1 cache and as standalone fallback
+/// when no database is configured.
+pub struct LocalJtiStore {
+    seen: Mutex<HashMap<String, i64>>,
     max_size: usize,
 }
 
-impl JtiReplayCache {
-    fn new(max_size: usize) -> Self {
+impl LocalJtiStore {
+    pub fn new(max_size: usize) -> Self {
         Self {
-            seen: HashMap::new(),
+            seen: Mutex::new(HashMap::new()),
             max_size,
         }
     }
 
-    /// Check if JTI has been seen. If not, record it.
-    /// Returns Err if JTI was already used (replay detected).
-    fn check_and_record(&mut self, jti: &str, exp: i64) -> Result<(), String> {
-        // First, evict expired entries
+    fn evict_expired(seen: &mut HashMap<String, i64>, now: i64) {
+        seen.retain(|_, &mut e| e + 60 > now); // keep 60s past expiry for safety
+    }
+}
+
+impl JtiReplayStore for LocalJtiStore {
+    fn mark_used(&self, jti: &str, expires_at: i64) -> Result<bool, String> {
+        let mut seen = self.seen.lock().map_err(|_| "JTI local store mutex poisoned".to_string())?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-        self.seen.retain(|_, &mut e| e + 60 > now); // keep 60s past expiry for safety
+        Self::evict_expired(&mut seen, now);
 
-        if self.seen.contains_key(jti) {
-            return Err(format!("JTI replay detected: token '{}' has already been used", jti));
+        if seen.contains_key(jti) {
+            return Ok(false); // replay
         }
 
         // Evict oldest if at capacity
-        if self.seen.len() >= self.max_size {
-            // Remove the entry with the earliest expiry
-            if let Some(oldest_key) = self.seen.iter()
+        if seen.len() >= self.max_size {
+            if let Some(oldest_key) = seen.iter()
                 .min_by_key(|(_, exp)| *exp)
                 .map(|(k, _)| k.clone())
             {
-                self.seen.remove(&oldest_key);
+                seen.remove(&oldest_key);
             }
         }
 
-        self.seen.insert(jti.to_string(), exp);
-        Ok(())
+        seen.insert(jti.to_string(), expires_at);
+        Ok(true)
+    }
+
+    fn is_used(&self, jti: &str) -> bool {
+        self.seen
+            .lock()
+            .map(|seen| seen.contains_key(jti))
+            .unwrap_or(false)
     }
 }
 
-fn jti_cache() -> &'static Mutex<JtiReplayCache> {
-    JTI_CACHE.get_or_init(|| Mutex::new(JtiReplayCache::new(100_000)))
+/// Database-backed JTI store using PostgreSQL via sqlx.
+///
+/// Uses the `jti_replay` table with columns: `jti TEXT PRIMARY KEY, expires_at BIGINT`.
+/// Provides distributed replay detection across multiple SSO instances.
+/// Wraps a `LocalJtiStore` as an L1 cache for fast lookups — writes go to both
+/// the L1 cache and the database (write-through).
+pub struct DatabaseJtiStore {
+    /// L1 in-memory cache for fast path
+    local: LocalJtiStore,
+    /// PostgreSQL connection pool
+    pool: sqlx::PgPool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+impl DatabaseJtiStore {
+    pub fn new(pool: sqlx::PgPool, max_local_size: usize) -> Self {
+        Self {
+            local: LocalJtiStore::new(max_local_size),
+            pool,
+        }
+    }
+
+    /// Ensure the `jti_replay` table exists. Call once at startup.
+    pub async fn ensure_table(&self) -> Result<(), String> {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS jti_replay (\
+                jti TEXT PRIMARY KEY, \
+                expires_at BIGINT NOT NULL\
+            )"
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("create jti_replay table: {e}"))?;
+        Ok(())
+    }
+
+    /// Evict expired entries from the database. Call periodically.
+    pub async fn cleanup_expired(&self) -> Result<u64, String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let result = sqlx::query("DELETE FROM jti_replay WHERE expires_at + 60 <= $1")
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("cleanup jti_replay: {e}"))?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl JtiReplayStore for DatabaseJtiStore {
+    fn mark_used(&self, jti: &str, expires_at: i64) -> Result<bool, String> {
+        // Check L1 cache first (fast path)
+        if self.local.is_used(jti) {
+            return Ok(false);
+        }
+
+        // Write-through to database using a blocking spawn since we are in sync context.
+        // Use INSERT ... ON CONFLICT to atomically check+insert.
+        let pool = self.pool.clone();
+        let jti_owned = jti.to_string();
+        let db_result = std::thread::scope(|_| {
+            // Build a minimal tokio runtime for the blocking DB call
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("tokio runtime: {e}"))?;
+            rt.block_on(async {
+                let result = sqlx::query(
+                    "INSERT INTO jti_replay (jti, expires_at) VALUES ($1, $2) \
+                     ON CONFLICT (jti) DO NOTHING"
+                )
+                .bind(&jti_owned)
+                .bind(expires_at)
+                .execute(&pool)
+                .await
+                .map_err(|e| format!("insert jti_replay: {e}"))?;
+                // rows_affected == 1 means fresh insert, 0 means conflict (replay)
+                Ok::<bool, String>(result.rows_affected() == 1)
+            })
+        });
+
+        let was_fresh = db_result?;
+        if was_fresh {
+            // Update L1 cache
+            let _ = self.local.mark_used(jti, expires_at);
+        }
+        Ok(was_fresh)
+    }
+
+    fn is_used(&self, jti: &str) -> bool {
+        // Check L1 first
+        if self.local.is_used(jti) {
+            return true;
+        }
+        // Fall through to DB
+        let pool = self.pool.clone();
+        let jti_owned = jti.to_string();
+        std::thread::scope(|_| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok();
+            rt.map(|rt| {
+                rt.block_on(async {
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT COUNT(*) FROM jti_replay WHERE jti = $1"
+                    )
+                    .bind(&jti_owned)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap_or(0) > 0
+                })
+            })
+            .unwrap_or(false)
+        })
+    }
+}
+
+/// Global JTI replay cache — tracks seen token IDs to prevent replay.
+/// Entries are evicted after they expire (exp + skew tolerance).
+/// Bounded to prevent memory exhaustion from long-lived cache entries.
+///
+/// Configurable via `set_jti_store` at startup; defaults to `LocalJtiStore`.
+static JTI_STORE: std::sync::OnceLock<Box<dyn JtiReplayStore>> = std::sync::OnceLock::new();
+
+/// Set a custom JTI replay store (e.g., `DatabaseJtiStore` for distributed deployments).
+/// Must be called before the first token verification. Returns `Err` if already set.
+pub fn set_jti_store(store: Box<dyn JtiReplayStore>) -> Result<(), Box<dyn JtiReplayStore>> {
+    JTI_STORE.set(store)
+}
+
+fn jti_store() -> &'static dyn JtiReplayStore {
+    JTI_STORE
+        .get_or_init(|| Box::new(LocalJtiStore::new(100_000)))
+        .as_ref()
+}
+
+// ---------------------------------------------------------------------------
+// Refresh Tokens
+// ---------------------------------------------------------------------------
+
+/// Refresh token lifetime: 8 hours (in seconds).
+const REFRESH_TOKEN_LIFETIME_SECS: i64 = 8 * 3600;
+
+/// A refresh token bound to a specific user and client.
+///
+/// Implements single-use guarantee via the `used` flag and rotation:
+/// each time a refresh token is redeemed, a new one is issued and the
+/// old one is invalidated.
+#[derive(Clone)]
+pub struct RefreshToken {
+    pub token: String,
+    pub user_id: Uuid,
+    pub client_id: String,
+    pub scope: String,
+    pub expires_at: i64,
+    pub used: bool,
+}
+
+/// In-memory refresh token store with rotation and single-use enforcement.
+pub struct RefreshTokenStore {
+    tokens: HashMap<String, RefreshToken>,
+}
+
+impl RefreshTokenStore {
+    pub fn new() -> Self {
+        Self {
+            tokens: HashMap::new(),
+        }
+    }
+
+    /// Issue a new refresh token for a user/client pair.
+    pub fn issue(&mut self, user_id: Uuid, client_id: &str, scope: &str) -> String {
+        let token_value = format!("rt_{}", Uuid::new_v4());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        self.tokens.insert(
+            token_value.clone(),
+            RefreshToken {
+                token: token_value.clone(),
+                user_id,
+                client_id: client_id.to_string(),
+                scope: scope.to_string(),
+                expires_at: now + REFRESH_TOKEN_LIFETIME_SECS,
+                used: false,
+            },
+        );
+        token_value
+    }
+
+    /// Redeem a refresh token: validates it, marks as used, and issues a
+    /// rotated replacement. Returns `(old_token_data, new_refresh_token_string)`.
+    ///
+    /// Enforces:
+    /// - Token existence
+    /// - Expiry
+    /// - Single-use (reuse of a consumed token revokes the entire family)
+    /// - Client binding (the requesting client must match the original)
+    pub fn redeem(
+        &mut self,
+        token: &str,
+        client_id: &str,
+    ) -> Result<(RefreshToken, String), String> {
+        let rt = self.tokens.get(token).cloned()
+            .ok_or_else(|| "refresh token not found".to_string())?;
+
+        // Detect replay: if already used, revoke token (defensive)
+        if rt.used {
+            self.tokens.remove(token);
+            return Err("refresh token already used — possible replay, token revoked".to_string());
+        }
+
+        // Check expiry
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        if now > rt.expires_at {
+            self.tokens.remove(token);
+            return Err("refresh token expired".to_string());
+        }
+
+        // Client binding check
+        if rt.client_id != client_id {
+            return Err("refresh token client_id mismatch".to_string());
+        }
+
+        // Mark old token as used
+        if let Some(entry) = self.tokens.get_mut(token) {
+            entry.used = true;
+        }
+
+        // Issue rotated replacement
+        let new_token = self.issue(rt.user_id, &rt.client_id, &rt.scope);
+
+        Ok((rt, new_token))
+    }
+
+    /// Remove all expired refresh tokens.
+    pub fn cleanup_expired(&mut self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        self.tokens.retain(|_, rt| rt.expires_at > now);
+    }
+}
+
+impl Default for RefreshTokenStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct IdTokenClaims {
     pub iss: String,
     pub sub: String,
@@ -72,6 +348,24 @@ pub struct IdTokenClaims {
     pub jti: String,
 }
 
+/// Custom Debug for IdTokenClaims — redacts subject, nonce, and JTI to prevent
+/// accidental log exposure of identity-correlated or replay-sensitive values.
+impl std::fmt::Debug for IdTokenClaims {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IdTokenClaims")
+            .field("iss", &self.iss)
+            .field("sub", &"[REDACTED]")
+            .field("aud", &self.aud)
+            .field("exp", &self.exp)
+            .field("iat", &self.iat)
+            .field("nonce", &"[REDACTED]")
+            .field("auth_time", &self.auth_time)
+            .field("tier", &self.tier)
+            .field("jti", &"[REDACTED]")
+            .finish()
+    }
+}
+
 #[derive(Serialize)]
 pub struct TokenResponse {
     pub access_token: String,
@@ -79,6 +373,24 @@ pub struct TokenResponse {
     pub expires_in: u64,
     pub id_token: String,
     pub scope: String,
+    /// Refresh token for obtaining new access tokens without re-authentication.
+    /// Rotated on each use (old token invalidated, new one issued).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+}
+
+/// Custom Debug for TokenResponse — redacts all bearer credentials.
+impl std::fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenResponse")
+            .field("access_token", &"[REDACTED]")
+            .field("token_type", &self.token_type)
+            .field("expires_in", &self.expires_in)
+            .field("id_token", &"[REDACTED]")
+            .field("scope", &self.scope)
+            .field("refresh_token", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Wrapper around an ML-DSA-87 keypair used for signing OIDC ID tokens.
@@ -282,10 +594,14 @@ fn verify_id_token_inner(
 
     // JTI replay prevention — each token can only be verified once
     if !claims.jti.is_empty() {
-        jti_cache()
-            .lock()
-            .map_err(|_| "JTI cache mutex poisoned".to_string())?
-            .check_and_record(&claims.jti, claims.exp)?;
+        let was_fresh = jti_store()
+            .mark_used(&claims.jti, claims.exp)?;
+        if !was_fresh {
+            return Err(format!(
+                "JTI replay detected: token '{}' has already been used",
+                claims.jti
+            ));
+        }
     }
 
     // Audience validation

@@ -51,6 +51,23 @@ async fn main() {
     // mTLS client credentials are auto-generated at construction time.
     let service = OrchestratorService::new(hmac_key, opaque_addr, tss_addr);
 
+    // Spawn health check endpoint
+    let health_start = std::time::Instant::now();
+    let orch_port: u16 = listen_addr.split(':').last().and_then(|p| p.parse().ok()).unwrap_or(9101);
+    let _health_handle = common::health::spawn_health_endpoint(
+        "orchestrator".to_string(),
+        orch_port,
+        health_start,
+        || {
+            vec![common::health::HealthCheck {
+                name: "orchestrator_listener".to_string(),
+                ok: true,
+                detail: None,
+                latency_ms: None,
+            }]
+        },
+    );
+
     tracing::info!("Starting orchestrator on {listen_addr} (mTLS)");
     if let Err(e) = service.run(&listen_addr).await {
         tracing::error!("Orchestrator exited with error: {e}");

@@ -51,6 +51,22 @@ async fn main() {
 
     let is_production = common::sealed_keys::is_production();
 
+    // Spawn health check endpoint
+    let health_start = std::time::Instant::now();
+    let _health_handle = common::health::spawn_health_endpoint(
+        "tss".to_string(),
+        9103,
+        health_start,
+        || {
+            vec![common::health::HealthCheck {
+                name: "tss_service".to_string(),
+                ok: true,
+                detail: None,
+                latency_ms: None,
+            }]
+        },
+    );
+
     // --- Role-based dispatch ---
     match std::env::var("MILNET_TSS_ROLE").ok().as_deref() {
         Some("coordinator") => {
@@ -126,12 +142,12 @@ async fn run_coordinator_role() {
     }
 
     // Build the remote coordinator
-    let dist_coordinator = Arc::new(DistributedSigningCoordinator {
+    let dist_coordinator = Arc::new(DistributedSigningCoordinator::new(
         public_key_package,
         threshold,
         signer_addrs,
         hmac_key,
-    });
+    ));
 
     // Generate PQ signing key at startup (in production, loaded from HSM).
     let (pq_signing_key, _pq_verifying_key) = generate_pq_keypair();
@@ -173,7 +189,9 @@ async fn run_coordinator_role() {
                             )),
                         };
                         let resp_bytes = postcard::to_allocvec(&resp).unwrap();
-                        let _ = transport.send(&resp_bytes).await;
+                        if let Err(e) = transport.send(&resp_bytes).await {
+                            tracing::warn!("TSS: failed to send response: {e}");
+                        }
                         continue;
                     }
 
@@ -190,7 +208,9 @@ async fn run_coordinator_role() {
                                 error: Some(format!("deserialization error: {e}")),
                             };
                             let resp_bytes = postcard::to_allocvec(&resp).unwrap();
-                            let _ = transport.send(&resp_bytes).await;
+                            if let Err(e) = transport.send(&resp_bytes).await {
+                            tracing::warn!("TSS: failed to send response: {e}");
+                        }
                             continue;
                         }
                     };
@@ -206,7 +226,9 @@ async fn run_coordinator_role() {
                             error: Some(format!("receipt chain invalid: {e}")),
                         };
                         let resp_bytes = postcard::to_allocvec(&resp).unwrap();
-                        let _ = transport.send(&resp_bytes).await;
+                        if let Err(e) = transport.send(&resp_bytes).await {
+                            tracing::warn!("TSS: failed to send response: {e}");
+                        }
                         continue;
                     }
 
@@ -226,7 +248,9 @@ async fn run_coordinator_role() {
                                 error: Some(format!("claims serialization: {e}")),
                             };
                             let resp_bytes = postcard::to_allocvec(&resp).unwrap();
-                            let _ = transport.send(&resp_bytes).await;
+                            if let Err(e) = transport.send(&resp_bytes).await {
+                            tracing::warn!("TSS: failed to send response: {e}");
+                        }
                             continue;
                         }
                     };
@@ -453,12 +477,12 @@ async fn run_distributed_mode(
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // Build the remote coordinator (holds NO signing keys).
-    let dist_coordinator = Arc::new(DistributedSigningCoordinator {
-        public_key_package: coordinator.public_key_package.clone(),
-        threshold: coordinator.threshold,
+    let dist_coordinator = Arc::new(DistributedSigningCoordinator::new(
+        coordinator.public_key_package.clone(),
+        coordinator.threshold,
         signer_addrs,
-        hmac_key: signer_hmac_key,
-    });
+        signer_hmac_key,
+    ));
 
     // Coordinator listener (accepts signing requests from the Orchestrator).
     let addr = std::env::var("TSS_ADDR").unwrap_or_else(|_| "127.0.0.1:9103".to_string());
@@ -493,7 +517,9 @@ async fn run_distributed_mode(
                             )),
                         };
                         let resp_bytes = postcard::to_allocvec(&resp).unwrap();
-                        let _ = transport.send(&resp_bytes).await;
+                        if let Err(e) = transport.send(&resp_bytes).await {
+                            tracing::warn!("TSS: failed to send response: {e}");
+                        }
                         continue;
                     }
 
@@ -510,7 +536,9 @@ async fn run_distributed_mode(
                                 error: Some(format!("deserialization error: {e}")),
                             };
                             let resp_bytes = postcard::to_allocvec(&resp).unwrap();
-                            let _ = transport.send(&resp_bytes).await;
+                            if let Err(e) = transport.send(&resp_bytes).await {
+                            tracing::warn!("TSS: failed to send response: {e}");
+                        }
                             continue;
                         }
                     };
@@ -526,7 +554,9 @@ async fn run_distributed_mode(
                             error: Some(format!("receipt chain invalid: {e}")),
                         };
                         let resp_bytes = postcard::to_allocvec(&resp).unwrap();
-                        let _ = transport.send(&resp_bytes).await;
+                        if let Err(e) = transport.send(&resp_bytes).await {
+                            tracing::warn!("TSS: failed to send response: {e}");
+                        }
                         continue;
                     }
 
@@ -546,7 +576,9 @@ async fn run_distributed_mode(
                                 error: Some(format!("claims serialization: {e}")),
                             };
                             let resp_bytes = postcard::to_allocvec(&resp).unwrap();
-                            let _ = transport.send(&resp_bytes).await;
+                            if let Err(e) = transport.send(&resp_bytes).await {
+                            tracing::warn!("TSS: failed to send response: {e}");
+                        }
                             continue;
                         }
                     };
@@ -692,7 +724,9 @@ async fn run_single_process_mode(
                             )),
                         };
                         let resp_bytes = postcard::to_allocvec(&resp).unwrap();
-                        let _ = transport.send(&resp_bytes).await;
+                        if let Err(e) = transport.send(&resp_bytes).await {
+                            tracing::warn!("TSS: failed to send response: {e}");
+                        }
                         continue;
                     }
 
@@ -709,7 +743,9 @@ async fn run_single_process_mode(
                                 error: Some(format!("deserialization error: {e}")),
                             };
                             let resp_bytes = postcard::to_allocvec(&resp).unwrap();
-                            let _ = transport.send(&resp_bytes).await;
+                            if let Err(e) = transport.send(&resp_bytes).await {
+                            tracing::warn!("TSS: failed to send response: {e}");
+                        }
                             continue;
                         }
                     };
@@ -725,7 +761,9 @@ async fn run_single_process_mode(
                             error: Some(format!("receipt chain invalid: {e}")),
                         };
                         let resp_bytes = postcard::to_allocvec(&resp).unwrap();
-                        let _ = transport.send(&resp_bytes).await;
+                        if let Err(e) = transport.send(&resp_bytes).await {
+                            tracing::warn!("TSS: failed to send response: {e}");
+                        }
                         continue;
                     }
 

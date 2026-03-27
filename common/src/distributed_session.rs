@@ -7,9 +7,36 @@
 //! - Automatically expired based on tier-specific TTLs
 //! - Bound to device fingerprint for additional security
 
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
+
+/// HMAC key for computing device fingerprint blind indices.
+/// Initialized once from the OS CSPRNG. In production this MUST come from a KMS.
+static FP_BLIND_KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+
+fn fp_blind_key() -> &'static [u8; 32] {
+    FP_BLIND_KEY.get_or_init(|| {
+        let mut key = [0u8; 32];
+        getrandom::getrandom(&mut key).expect("OS CSPRNG failure");
+        key
+    })
+}
+
+/// Compute an HMAC-SHA256 blind index over a device fingerprint.
+/// This allows equality lookups without storing the raw fingerprint.
+pub fn blind_device_fingerprint(fp: &[u8; 32]) -> [u8; 32] {
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = HmacSha256::new_from_slice(fp_blind_key())
+        .expect("HMAC key length is always valid");
+    mac.update(fp);
+    let result = mac.finalize().into_bytes();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    out
+}
 
 /// Session state for distributed storage.
 #[derive(Clone, Serialize, Deserialize)]
@@ -30,12 +57,32 @@ pub struct DistributedSession {
     pub ratchet_epoch: u64,
     /// Encrypted ratchet chain key (AES-256-GCM sealed).
     pub encrypted_chain_key: Vec<u8>,
-    /// Device fingerprint for binding.
+    /// Device fingerprint for binding (HMAC-SHA256 blind index).
+    /// The raw fingerprint is never stored — only its HMAC blind index.
     pub device_fingerprint: [u8; 32],
     /// Classification level for MAC enforcement.
     pub classification: u8,
     /// Whether the session has been terminated.
     pub terminated: bool,
+}
+
+/// Custom Debug for DistributedSession — redacts sensitive cryptographic fields.
+impl std::fmt::Debug for DistributedSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DistributedSession")
+            .field("session_id", &self.session_id)
+            .field("user_id", &self.user_id)
+            .field("tier", &self.tier)
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .field("last_activity", &self.last_activity)
+            .field("ratchet_epoch", &self.ratchet_epoch)
+            .field("encrypted_chain_key", &"[ENCRYPTED]")
+            .field("device_fingerprint", &"[REDACTED]")
+            .field("classification", &self.classification)
+            .field("terminated", &self.terminated)
+            .finish()
+    }
 }
 
 /// Configuration for the distributed session store.
@@ -127,6 +174,9 @@ impl DistributedSessionStore {
         let encrypted_chain_key =
             encrypt_session_data(&self.encryption_key, &session_id, chain_key)?;
 
+        // Store the HMAC-SHA256 blind index of the fingerprint, not the raw value.
+        let fp_blind = blind_device_fingerprint(&device_fingerprint);
+
         let session = DistributedSession {
             session_id,
             user_id,
@@ -136,7 +186,7 @@ impl DistributedSessionStore {
             last_activity: now,
             ratchet_epoch: 1,
             encrypted_chain_key,
-            device_fingerprint,
+            device_fingerprint: fp_blind,
             classification,
             terminated: false,
         };
@@ -174,9 +224,12 @@ impl DistributedSessionStore {
             return None;
         }
 
-        // Enforce device binding — session MUST be used from the same device
+        // Enforce device binding — session MUST be used from the same device.
+        // The stored fingerprint is an HMAC blind index, so we blind the
+        // requesting fingerprint before constant-time comparison.
         if let Some(requesting_fp) = requesting_device_fingerprint {
-            if session.device_fingerprint.ct_eq(requesting_fp).unwrap_u8() == 0 {
+            let requesting_blind = blind_device_fingerprint(requesting_fp);
+            if session.device_fingerprint.ct_eq(&requesting_blind).unwrap_u8() == 0 {
                 tracing::warn!(
                     session_id = %session_id,
                     "SECURITY: device fingerprint mismatch — possible session theft"
@@ -462,7 +515,9 @@ mod tests {
         assert_eq!(session.user_id, user_id);
         assert_eq!(session.tier, 2);
         assert_eq!(session.classification, 1);
-        assert_eq!(session.device_fingerprint, fingerprint);
+        // The stored fingerprint is the HMAC blind index, not the raw value.
+        assert_ne!(session.device_fingerprint, fingerprint, "raw fingerprint must not be stored");
+        assert_eq!(session.device_fingerprint, blind_device_fingerprint(&fingerprint));
         assert!(!session.terminated);
         assert_eq!(session.ratchet_epoch, 1);
     }
