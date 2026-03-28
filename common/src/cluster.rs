@@ -141,7 +141,7 @@ impl ClusterState {
                 // No-op: leader authority commit, nothing to apply.
             }
             ClusterCommand::TamperDetected {
-                node_id,
+                ref node_id,
                 expected_hash: _,
                 actual_hash: _,
             } => {
@@ -163,7 +163,7 @@ impl ClusterState {
                     self.leader_id = None;
                 }
             }
-            ClusterCommand::TamperHealed { node_id } => {
+            ClusterCommand::TamperHealed { ref node_id } => {
                 // Restore the healed node to healthy status
                 if let Some(member) = self.members.get_mut(node_id) {
                     member.healthy = true;

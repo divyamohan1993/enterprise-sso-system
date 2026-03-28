@@ -110,10 +110,11 @@ pub enum ClusterCommand {
     /// Binary tampering detected on a node. The tampered node is stripped
     /// of leader role and flagged for healing. Other nodes will refuse to
     /// accept it as leader until the binary hash matches the golden hash.
+    /// Hashes stored as Vec<u8> because serde doesn't support [u8; 64].
     TamperDetected {
         node_id: NodeId,
-        expected_hash: [u8; 64],
-        actual_hash: [u8; 64],
+        expected_hash: Vec<u8>,
+        actual_hash: Vec<u8>,
     },
     /// Node has been healed (binary replaced and verified). It can rejoin
     /// the cluster and be eligible for leader election again.
