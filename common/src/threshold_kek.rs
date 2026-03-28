@@ -97,12 +97,23 @@ fn gf256_inv(a: u8) -> u8 {
     if a == 0 {
         panic!("division by zero in GF(256)");
     }
-    // Fermat's little theorem: a^(-1) = a^(254) in GF(256)
-    let mut result = a;
-    for _ in 0..6 {
-        result = gf256_mul(result, result);
-        result = gf256_mul(result, a);
-    }
+    // Fermat's little theorem: a^(-1) = a^(254) in GF(2^8)
+    // Compute a^254 using repeated squaring: 254 = 11111110 in binary
+    // a^254 = a^128 * a^64 * a^32 * a^16 * a^8 * a^4 * a^2
+    let a2 = gf256_mul(a, a);         // a^2
+    let a4 = gf256_mul(a2, a2);       // a^4
+    let a8 = gf256_mul(a4, a4);       // a^8
+    let a16 = gf256_mul(a8, a8);      // a^16
+    let a32 = gf256_mul(a16, a16);    // a^32
+    let a64 = gf256_mul(a32, a32);    // a^64
+    let a128 = gf256_mul(a64, a64);   // a^128
+    // a^254 = a^128 * a^64 * a^32 * a^16 * a^8 * a^4 * a^2
+    let mut result = gf256_mul(a128, a64);
+    result = gf256_mul(result, a32);
+    result = gf256_mul(result, a16);
+    result = gf256_mul(result, a8);
+    result = gf256_mul(result, a4);
+    result = gf256_mul(result, a2);
     result
 }
 
