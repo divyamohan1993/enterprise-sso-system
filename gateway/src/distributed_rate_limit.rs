@@ -979,15 +979,16 @@ mod tests {
     #[tokio::test]
     async fn redis_health_flag_transitions_on_failure() {
         // When Redis is unreachable, the health flag should reflect this.
-        let limiter = DistributedRateLimiter::new(RateLimitConfig {
-            per_ip_limit: 5,
-            per_user_limit: 5,
+        let mut limiter = DistributedRateLimiter::new(RateLimitConfig {
+            per_ip_limit: 50,
+            per_user_limit: 50,
             window_secs: 60,
-            burst_size: 10,
+            burst_size: 100,
             refill_rate: 1.0,
             redis_url: Some("redis://127.0.0.1:63799".to_string()), // non-existent
         })
         .await;
+        limiter.degraded_limit_divisor = 1; // no divisor for test
 
         // Connection failed, so redis_healthy should be false
         assert!(
