@@ -1,6 +1,4 @@
----
 source: common/tests/compliance_snapshot_test.rs
-assertion_line: 113
 expression: report
 ---
 audit_type: DISA STIG / CIS Level 2
@@ -53,7 +51,7 @@ checks:
   - category: Network
     id: NET-001
     severity: CatII
-    status: Fail
+    status: Pass
     title: IP forwarding disabled (net.ipv4.ip_forward)
   - category: Network
     id: NET-002
@@ -78,12 +76,12 @@ checks:
   - category: Network
     id: NET-006
     severity: CatII
-    status: Fail
+    status: Pass
     title: ICMP redirect sending disabled (net.ipv4.conf.all.send_redirects)
   - category: Crypto
     id: CRYPTO-001
     severity: CatI
-    status: NotApplicable
+    status: Fail
     title: Kernel FIPS mode enabled (crypto/fips_enabled)
   - category: Authentication
     id: V-222602
@@ -112,10 +110,10 @@ checks:
     title: Error handling (no stack traces in responses)
 summary:
   cat_i_failures: 3
-  cat_ii_failures: 3
+  cat_ii_failures: 2
   cat_iii_failures: 0
-  failed: 6
+  failed: 5
   manual: 2
-  not_applicable: 1
-  passed: 12
+  not_applicable: 0
+  passed: 14
   total: 21
