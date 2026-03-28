@@ -343,6 +343,97 @@ impl ShardProtocol {
         self.send_sequence > self.last_persisted_epoch
     }
 
+    /// Return the current send sequence number.
+    pub fn send_sequence(&self) -> u64 {
+        self.send_sequence
+    }
+
+    /// Export sequence state with HMAC-SHA512 authentication.
+    ///
+    /// Format: `[64-byte HMAC-SHA512 tag] [postcard-serialized state]`
+    ///
+    /// The HMAC tag covers the serialized state bytes, using `hmac_key` as the
+    /// authenticating key. Use [`import_sequences_authenticated`] to reload.
+    pub fn export_sequences_authenticated(
+        &mut self,
+        path: &std::path::Path,
+        hmac_key: &[u8; 64],
+    ) -> Result<(), common::error::MilnetError> {
+        let state = AuthenticatedSequenceState {
+            send_sequence: self.send_sequence,
+            recv_sequences: self.recv_sequences.clone(),
+        };
+        let data = postcard::to_allocvec(&state)
+            .map_err(|e| MilnetError::Shard(
+                format!("serialize sequence state: {e}")
+            ))?;
+
+        let mut mac = <HmacSha512 as Mac>::new_from_slice(hmac_key)
+            .expect("HMAC-SHA512 accepts any key length");
+        mac.update(&data);
+        let tag = mac.finalize().into_bytes();
+
+        let tmp = path.with_extension("tmp");
+        let mut out = Vec::with_capacity(64 + data.len());
+        out.extend_from_slice(&tag);
+        out.extend_from_slice(&data);
+        std::fs::write(&tmp, &out)
+            .map_err(|e| MilnetError::Shard(format!("write sequence tmp file: {e}")))?;
+        std::fs::rename(&tmp, path)
+            .map_err(|e| MilnetError::Shard(format!("rename sequence tmp file: {e}")))?;
+        self.last_persisted_epoch = self.send_sequence;
+        Ok(())
+    }
+
+    /// Import sequence state with HMAC-SHA512 verification.
+    ///
+    /// Rejects tampered, truncated, or wrong-key files with an error.
+    /// Sequences are only advanced, never rolled backward, to prevent
+    /// downgrade attacks.
+    pub fn import_sequences_authenticated(
+        &mut self,
+        path: &std::path::Path,
+        hmac_key: &[u8; 64],
+    ) -> Result<(), common::error::MilnetError> {
+        let raw = std::fs::read(path)
+            .map_err(|e| MilnetError::Shard(
+                format!("read sequence file {:?}: {e}", path)
+            ))?;
+
+        if raw.len() < 64 {
+            return Err(MilnetError::Shard(
+                format!("sequence file too short: {} bytes (need >= 64)", raw.len())
+            ));
+        }
+
+        let (tag_bytes, data) = raw.split_at(64);
+        let mut mac = <HmacSha512 as Mac>::new_from_slice(hmac_key)
+            .expect("HMAC-SHA512 accepts any key length");
+        mac.update(data);
+        mac.verify_slice(tag_bytes)
+            .map_err(|_| MilnetError::Shard(
+                "HMAC verification failed — sequence file tampered or wrong key".into()
+            ))?;
+
+        let state: AuthenticatedSequenceState = postcard::from_bytes(data)
+            .map_err(|e| MilnetError::Shard(
+                format!("deserialize sequence state: {e}")
+            ))?;
+
+        // Only advance, never go backward (prevent downgrade attack)
+        if state.send_sequence > self.send_sequence {
+            self.send_sequence = state.send_sequence;
+        }
+        for (module, seq) in state.recv_sequences {
+            let current = self.recv_sequences.entry(module).or_insert(0);
+            if seq > *current {
+                *current = seq;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Mark the current epoch as persisted. Call this after successfully
     /// writing [`export_sequences`] to durable storage.
     pub fn mark_persisted(&mut self) {
@@ -389,6 +480,15 @@ impl ShardProtocol {
 /// Internal serializable snapshot of sequence state.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SequenceState {
+    send_sequence: u64,
+    recv_sequences: HashMap<ModuleId, u64>,
+}
+
+/// Serializable snapshot of sequence state used by the authenticated
+/// export/import methods. Identical layout to [`SequenceState`] but kept
+/// separate so the two persistence paths are explicitly independent.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AuthenticatedSequenceState {
     send_sequence: u64,
     recv_sequences: HashMap<ModuleId, u64>,
 }
