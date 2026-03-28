@@ -17,6 +17,8 @@ use std::collections::BTreeMap;
 
 /// A participant in the distributed Pedersen DKG ceremony.
 pub struct DkgParticipant {
+    /// The u16 ID this participant was created with (for labelling output packages).
+    id: u16,
     identifier: frost::Identifier,
     threshold: u16,
     total: u16,
@@ -50,6 +52,7 @@ impl DkgParticipant {
         let identifier = frost::Identifier::try_from(id)
             .expect("valid participant ID (1-based, non-zero)");
         Self {
+            id,
             identifier,
             threshold,
             total,
@@ -74,7 +77,7 @@ impl DkgParticipant {
         self.round1_secret = Some(secret);
 
         DkgRound1 {
-            sender_id: u16::try_from(self.identifier).unwrap_or(0),
+            sender_id: self.id,
             package,
         }
     }
@@ -84,7 +87,7 @@ impl DkgParticipant {
         let round1_secret = self.round1_secret.take()
             .ok_or_else(|| "round1() must be called before round2()".to_string())?;
 
-        let mut round1_packages = BTreeMap::new();
+        let mut round1_packages: BTreeMap<frost::Identifier, dkg::round1::Package> = BTreeMap::new();
         for pkg in others_round1 {
             let id = frost::Identifier::try_from(pkg.sender_id)
                 .map_err(|e| format!("invalid sender ID {}: {e}", pkg.sender_id))?;
@@ -101,13 +104,27 @@ impl DkgParticipant {
 
         self.round2_secret = Some(round2_secret);
 
-        let result: Vec<DkgRound2> = round2_packages.into_iter().map(|(id, pkg)| {
-            DkgRound2 {
-                sender_id: u16::try_from(self.identifier).unwrap_or(0),
-                receiver_id: u16::try_from(id).unwrap_or(0),
-                package: pkg,
-            }
-        }).collect();
+        // frost::Identifier does not implement TryFrom<Identifier> for u16.
+        // Recover the receiver u16 ID by scanning 1..=total and comparing identifiers.
+        let my_sender_id = self.id;
+        let total = self.total;
+        let result: Vec<DkgRound2> = round2_packages
+            .into_iter()
+            .map(|(recipient_frost_id, pkg)| {
+                let receiver_id = (1..=total)
+                    .find(|&n| {
+                        frost::Identifier::try_from(n)
+                            .map(|id| id == recipient_frost_id)
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(0);
+                DkgRound2 {
+                    sender_id: my_sender_id,
+                    receiver_id,
+                    package: pkg,
+                }
+            })
+            .collect();
 
         Ok(result)
     }
@@ -117,7 +134,7 @@ impl DkgParticipant {
         let round2_secret = self.round2_secret.take()
             .ok_or_else(|| "round2() must be called before finalize()".to_string())?;
 
-        let mut round2_packages = BTreeMap::new();
+        let mut round2_packages: BTreeMap<frost::Identifier, dkg::round2::Package> = BTreeMap::new();
         for pkg in others_round2 {
             let sender_id = frost::Identifier::try_from(pkg.sender_id)
                 .map_err(|e| format!("invalid sender {}: {e}", pkg.sender_id))?;
