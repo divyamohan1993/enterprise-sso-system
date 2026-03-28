@@ -1,3 +1,4 @@
+---
 source: common/tests/compliance_snapshot_test.rs
 expression: report
 ---
