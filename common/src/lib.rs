@@ -168,3 +168,9 @@ pub mod lateral_movement_guard;
 // ── External witness cosigner and distributed CA ──
 pub mod external_witness;
 pub mod distributed_ca;
+
+// ── Secret ceremony, stealth detection, quarantine, and auto-response ──
+pub mod secret_ceremony;
+pub mod stealth_detection;
+pub mod quarantine;
+pub mod auto_response;
