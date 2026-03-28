@@ -943,23 +943,26 @@ mod tests {
 
     #[tokio::test]
     async fn redis_fallback_when_redis_url_provided_but_stub() {
-        // When a Redis URL is provided, the stub client connects but always
-        // returns errors on operations, triggering local fallback
+        // When a Redis URL is provided but Redis isn't running, the connection
+        // fails and the limiter falls back to local rate limiting.
         let mut limiter = DistributedRateLimiter::new(RateLimitConfig {
             per_ip_limit: 3,
             per_user_limit: 2,
             window_secs: 60,
             burst_size: 10,
             refill_rate: 1.0,
-            redis_url: Some("redis://localhost:6379".to_string()),
+            redis_url: Some("redis://127.0.0.1:63799".to_string()), // non-existent port
         })
         .await;
-        limiter.degraded_limit_divisor = 1; // test: no divisor for exact limit checking
+        limiter.degraded_limit_divisor = 1;
 
-        // Redis client should be created (stub connects successfully)
-        assert!(limiter.redis_client.is_some(), "Redis client should be created");
+        // Redis client should be None (connection failed to non-existent port)
+        assert!(
+            limiter.redis_client.is_none(),
+            "Redis client should be None when connection fails"
+        );
 
-        // But operations should fall back to local because stub returns errors
+        // Should fall back to local rate limiting
         let ip: IpAddr = "10.0.0.5".parse().unwrap();
 
         // All 3 should be allowed via local fallback
@@ -975,32 +978,27 @@ mod tests {
 
     #[tokio::test]
     async fn redis_health_flag_transitions_on_failure() {
-        let mut limiter = DistributedRateLimiter::new(RateLimitConfig {
+        // When Redis is unreachable, the health flag should reflect this.
+        let limiter = DistributedRateLimiter::new(RateLimitConfig {
             per_ip_limit: 5,
             per_user_limit: 5,
             window_secs: 60,
             burst_size: 10,
             refill_rate: 1.0,
-            redis_url: Some("redis://localhost:6379".to_string()),
+            redis_url: Some("redis://127.0.0.1:63799".to_string()), // non-existent
         })
         .await;
-        limiter.degraded_limit_divisor = 1;
 
-        // Initially healthy (stub connects ok)
-        assert!(
-            limiter.redis_healthy.load(std::sync::atomic::Ordering::Relaxed),
-            "should start healthy"
-        );
-
-        // First check_ip will try Redis, get error from stub, mark unhealthy
-        let ip: IpAddr = "10.0.0.6".parse().unwrap();
-        let _ = limiter.check_ip(ip).await;
-
-        // After the stub fails, redis_healthy should be false
+        // Connection failed, so redis_healthy should be false
         assert!(
             !limiter.redis_healthy.load(std::sync::atomic::Ordering::Relaxed),
-            "should be marked unhealthy after stub error"
+            "should be unhealthy when Redis connection fails"
         );
+
+        // Rate limiting still works via local fallback
+        let ip: IpAddr = "10.0.0.6".parse().unwrap();
+        let r = limiter.check_ip(ip).await;
+        assert!(r.allowed, "local fallback should still allow requests");
 
         // Subsequent calls should skip Redis entirely (go straight to local)
         // This is a performance optimization — no lock contention on Redis mutex
