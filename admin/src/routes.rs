@@ -1307,11 +1307,48 @@ async fn origin_and_content_type_middleware(
             if o_lower == "null" {
                 false
             } else {
-                !host.is_empty() && o_lower.contains(host)
+                // SECURITY: Extract the host from the Origin URL and compare
+                // exactly. Substring matching was vulnerable to crafted
+                // domains like "attacker.com.legit.com".
+                if host.is_empty() {
+                    false
+                } else {
+                    // Origin format: "scheme://host[:port]"
+                    let origin_host = o_lower
+                        .split("://")
+                        .nth(1)
+                        .unwrap_or(&o_lower)
+                        .split('/')
+                        .next()
+                        .unwrap_or("")
+                        .split(':')
+                        .next()
+                        .unwrap_or("");
+                    origin_host == host
+                }
             }
         }
-        // No Origin, Referer present: must reference our host
-        (None, Some(r)) => r.contains(host) || host.is_empty(),
+        // No Origin, Referer present: extract and match host exactly
+        (None, Some(r)) => {
+            if host.is_empty() {
+                true
+            } else {
+                let r_lower = r.to_lowercase();
+                let after_scheme = r_lower
+                    .split("://")
+                    .nth(1)
+                    .unwrap_or(&r_lower);
+                let before_path = after_scheme
+                    .split('/')
+                    .next()
+                    .unwrap_or("");
+                let ref_host = before_path
+                    .split(':')
+                    .next()
+                    .unwrap_or("");
+                ref_host == host
+            }
+        }
         // Neither: allow only Bearer-token API calls (non-browser clients)
         (None, None) => request.headers().get("Authorization").is_some(),
     };

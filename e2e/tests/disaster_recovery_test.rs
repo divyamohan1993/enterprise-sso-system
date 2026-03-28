@@ -229,7 +229,7 @@ fn deserialize_frost_shares(data: &[u8]) -> Result<DkgResult, String> {
         shares.push(SignerShare {
             identifier,
             key_package,
-            nonce_counter: 0,
+            nonce_counter: std::sync::atomic::AtomicU64::new(0),
         });
     }
 
@@ -432,7 +432,7 @@ fn test_partial_share_recovery() {
         restored_shares.push(crypto::threshold::SignerShare {
             identifier,
             key_package,
-            nonce_counter: 0,
+            nonce_counter: std::sync::atomic::AtomicU64::new(0),
         });
     }
 

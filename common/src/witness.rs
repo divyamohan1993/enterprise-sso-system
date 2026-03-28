@@ -115,17 +115,33 @@ impl WitnessLog {
 
     /// Add a signed checkpoint using a provided signing function.
     ///
-    /// The signing function receives the concatenation of `audit_root || kt_root`
-    /// and returns the ML-DSA-65 signature bytes.
+    /// The signing function receives the concatenation of `audit_root || kt_root ||
+    /// sequence_be || timestamp_be` and returns the ML-DSA-65 signature bytes.
+    /// Including sequence and timestamp in the signed data prevents replay and
+    /// ensures checkpoint ordering is cryptographically bound.
+    ///
+    /// SECURITY: The witness signing key SHOULD be stored in an HSM or separate
+    /// service, NOT in the same process as the audit log. If the audit service is
+    /// compromised and the signing key is local, an attacker can forge checkpoints.
+    /// For production military deployment, use an external witness cosigner.
     pub fn add_signed_checkpoint(
         &mut self,
         audit_root: [u8; 64],
         kt_root: [u8; 64],
         sign_fn: impl FnOnce(&[u8]) -> Vec<u8>,
     ) {
-        let mut data = Vec::with_capacity(128);
+        let seq = self.checkpoints.len() as u64;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64;
+        // Bind sequence and timestamp into the signed payload so that replayed
+        // or backdated checkpoints are detectable.
+        let mut data = Vec::with_capacity(128 + 16);
         data.extend_from_slice(&audit_root);
         data.extend_from_slice(&kt_root);
+        data.extend_from_slice(&seq.to_be_bytes());
+        data.extend_from_slice(&ts.to_be_bytes());
         let signature = sign_fn(&data);
         self.add_checkpoint(audit_root, kt_root, signature);
     }
@@ -140,6 +156,11 @@ impl WitnessLog {
 
     pub fn is_empty(&self) -> bool {
         self.checkpoints.is_empty()
+    }
+
+    /// Return a reference to all checkpoints for verification and auditing.
+    pub fn checkpoints(&self) -> &[WitnessCheckpoint] {
+        &self.checkpoints
     }
 }
 

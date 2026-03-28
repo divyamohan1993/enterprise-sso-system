@@ -150,7 +150,17 @@ async fn main() {
         GatewayServer::bind_tls(&addr, 16, tls_cfg)
             .await
             .expect("failed to bind gateway with TLS")
+    } else if is_production {
+        // SECURITY: Plain TCP is NEVER allowed in production. Nation-state
+        // attackers can intercept unencrypted authentication traffic.
+        panic!(
+            "FATAL: TLS is required in production but no certificate was configured. \
+             Set MILNET_GATEWAY_CERT_PATH and MILNET_GATEWAY_KEY_PATH."
+        );
     } else {
+        tracing::warn!(
+            "SECURITY WARNING: Gateway binding without TLS — acceptable ONLY in dev/test"
+        );
         GatewayServer::bind(&addr, 16)
             .await
             .expect("failed to bind gateway")

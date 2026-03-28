@@ -657,14 +657,23 @@ pub fn hash_entry(entry: &AuditEntry) -> [u8; 64] {
 }
 
 fn now_us() -> i64 {
-    // Use authenticated time source when available, fall back to system clock
-    common::secure_time::authenticated_now_us()
-        .unwrap_or_else(|| {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_micros() as i64
-        })
+    // SECURITY: Use monotonic time as primary source to prevent clock manipulation.
+    // Monotonic time is immune to NTP jumps and manual clock changes.
+    // Falls back to authenticated time, then system clock only in dev mode.
+    let monotonic = common::secure_time::monotonic_time_us();
+    if monotonic > 0 {
+        return monotonic;
+    }
+    if let Some(auth_us) = common::secure_time::authenticated_now_us() {
+        return auth_us;
+    }
+    if common::sealed_keys::is_production() {
+        tracing::error!("SECURITY: no trusted time source available in production — using system clock with warning");
+    }
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64
 }
 
 /// Encrypt archive data with AES-256-GCM and write to the given path.

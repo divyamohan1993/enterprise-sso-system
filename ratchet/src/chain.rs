@@ -137,9 +137,10 @@ impl Zeroize for NonceBloomFilter {
 }
 
 /// Minimum distinct byte values required in 32-byte entropy to pass quality check.
-/// 4 bits of randomness means at least 16 distinct values among 32 bytes, but we
-/// use a conservative threshold: at least 4 distinct byte values.
-const MIN_DISTINCT_BYTES: usize = 4;
+/// A truly random 32-byte sample has ~21 expected distinct values. We require at
+/// least 16 distinct bytes to reject degraded entropy from weak/compromised RNGs.
+/// Previous threshold of 4 was dangerously low — accepting 3.1 bits total entropy.
+const MIN_DISTINCT_BYTES: usize = 16;
 
 /// Generate random bytes with retry logic, returning an error instead of panicking
 /// on entropy exhaustion.

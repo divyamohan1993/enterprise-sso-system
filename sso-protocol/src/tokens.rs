@@ -592,16 +592,19 @@ fn verify_id_token_inner(
         ));
     }
 
-    // JTI replay prevention — each token can only be verified once
-    if !claims.jti.is_empty() {
-        let was_fresh = jti_store()
-            .mark_used(&claims.jti, claims.exp)?;
-        if !was_fresh {
-            return Err(format!(
-                "JTI replay detected: token '{}' has already been used",
-                claims.jti
-            ));
-        }
+    // JTI replay prevention — each token can only be verified once.
+    // SECURITY: Empty JTI is rejected unconditionally. Every token MUST carry
+    // a unique identifier to prevent replay attacks across instances.
+    if claims.jti.is_empty() {
+        return Err("token jti is required but empty — all tokens must carry a unique JTI".into());
+    }
+    let was_fresh = jti_store()
+        .mark_used(&claims.jti, claims.exp)?;
+    if !was_fresh {
+        return Err(format!(
+            "JTI replay detected: token '{}' has already been used",
+            claims.jti
+        ));
     }
 
     // Audience validation

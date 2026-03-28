@@ -27,14 +27,14 @@ fn nonce_counter_increments() {
 
     // First signing: counters go from 0 -> 1 for first 3 signers
     let _ = threshold_sign(&mut shares, &result.group, msg, 3).unwrap();
-    assert_eq!(shares[0].nonce_counter, 1);
-    assert_eq!(shares[1].nonce_counter, 1);
-    assert_eq!(shares[2].nonce_counter, 1);
+    assert_eq!(shares[0].nonce_counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(shares[1].nonce_counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(shares[2].nonce_counter.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     // Second signing: counters go from 1 -> 2
     let _ = threshold_sign(&mut shares, &result.group, msg, 3).unwrap();
-    assert_eq!(shares[0].nonce_counter, 2);
-    assert_eq!(shares[1].nonce_counter, 2);
+    assert_eq!(shares[0].nonce_counter.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(shares[1].nonce_counter.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
 #[test]

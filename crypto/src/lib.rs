@@ -44,3 +44,21 @@ pub mod verifiable_credentials;
 pub mod did;
 pub mod he_search;
 pub mod enclave;
+
+/// Run FIPS 140-3 startup KATs if FIPS mode is enabled.
+/// MUST be called before any cryptographic operation in production.
+/// Panics on KAT failure to prevent use of a compromised crypto module.
+pub fn enforce_fips_startup_kats() {
+    if common::fips::is_fips_mode() {
+        tracing::info!("FIPS mode enabled — running mandatory startup KATs");
+        match fips_kat::run_startup_kats() {
+            Ok(()) => tracing::info!("FIPS 140-3 startup KATs: ALL PASSED"),
+            Err(e) => panic!("FATAL: FIPS 140-3 KAT failure — crypto module compromised: {e}"),
+        }
+    } else if common::sealed_keys::is_production() {
+        tracing::warn!(
+            "SECURITY: FIPS mode is NOT enabled in production. \
+             Set MILNET_FIPS_MODE=1 for classified network deployment."
+        );
+    }
+}

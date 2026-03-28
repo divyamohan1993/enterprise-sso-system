@@ -176,7 +176,11 @@ pub struct Incident {
 // ---------------------------------------------------------------------------
 
 /// Configuration for the lockdown circuit breaker.
-const LOCKDOWN_THRESHOLD: usize = 5;
+/// SECURITY: Threshold raised from 5 to 20 to prevent attacker-triggered lockdown
+/// DoS. An attacker could trivially generate 5 DuressActivation incidents to force
+/// system-wide lockdown. 20 incidents in 1 hour is a more robust threshold that
+/// still catches genuine compromise while resisting weaponized incident flooding.
+const LOCKDOWN_THRESHOLD: usize = 20;
 const LOCKDOWN_WINDOW: Duration = Duration::from_secs(3600); // 1 hour
 
 /// The incident response engine. Tracks active incidents, determines automated

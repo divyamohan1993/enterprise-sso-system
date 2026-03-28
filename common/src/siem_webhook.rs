@@ -43,7 +43,12 @@ impl SiemWebhookConfig {
 
         let auth_token = std::env::var("MILNET_SIEM_AUTH_TOKEN")
             .unwrap_or_default();
-        // Remove sensitive auth token from environment immediately
+        // SECURITY: Remove sensitive auth token from environment immediately.
+        // Also overwrite the env var value with zeros before removal to reduce
+        // the window where it's visible in /proc/pid/environ.
+        if !auth_token.is_empty() {
+            std::env::set_var("MILNET_SIEM_AUTH_TOKEN", "0".repeat(auth_token.len()));
+        }
         std::env::remove_var("MILNET_SIEM_AUTH_TOKEN");
 
         let batch_size = std::env::var("MILNET_SIEM_BATCH_SIZE")

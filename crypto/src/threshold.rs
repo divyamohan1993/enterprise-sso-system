@@ -19,7 +19,9 @@ pub struct ThresholdGroup {
 pub struct SignerShare {
     pub identifier: Identifier,
     pub key_package: KeyPackage,
-    pub nonce_counter: u64,
+    /// Atomic nonce counter to prevent race-condition nonce reuse in concurrent
+    /// signing operations. Reusing a nonce in FROST leaks the private key.
+    pub nonce_counter: std::sync::atomic::AtomicU64,
 }
 
 /// Result of a DKG ceremony.
@@ -62,7 +64,7 @@ pub fn dkg(total: u16, threshold: u16) -> DkgResult {
         .map(|(id, secret_share)| SignerShare {
             identifier: id,
             key_package: KeyPackage::try_from(secret_share).unwrap(),
-            nonce_counter: 0,
+            nonce_counter: std::sync::atomic::AtomicU64::new(0),
         })
         .collect();
 
@@ -129,7 +131,7 @@ pub fn threshold_sign_with_indices(
 
     for &idx in selected_indices {
         let signer = &mut shares[idx];
-        signer.nonce_counter += 1;
+        signer.nonce_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let (nonces, commitments) =
             frost::round1::commit(signer.key_package.signing_share(), &mut rng);
         nonces_map.insert(signer.identifier, nonces);
@@ -271,7 +273,7 @@ impl ThresholdGroup {
                 SignerShare {
                     identifier: id,
                     key_package,
-                    nonce_counter: 0,
+                    nonce_counter: std::sync::atomic::AtomicU64::new(0),
                 }
             })
             .collect();

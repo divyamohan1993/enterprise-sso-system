@@ -79,9 +79,12 @@ impl Default for DeviceRegistry {
 /// 1. The device exists and is enrolled.
 /// 2. The device is active (not revoked).
 /// 3. The claimed tier matches the registered tier exactly.
+/// 4. The attestation hash is non-zero (device has been properly attested).
 ///
-/// This should be called by the orchestrator during authentication to prevent
-/// a client from claiming a higher-privilege tier than its device is enrolled at.
+/// SECURITY: This should be called by the orchestrator during authentication AND
+/// by the CAE engine on every heartbeat re-evaluation. Tier claims must be
+/// continuously validated — not just at login time — to prevent privilege
+/// persistence after device compromise or tier downgrade.
 pub fn validate_tier_claim(
     claimed_tier: u8,
     device_id: &uuid::Uuid,
@@ -91,6 +94,14 @@ pub fn validate_tier_claim(
         Some(enrollment) => {
             // Device must be active
             if !enrollment.is_active {
+                return false;
+            }
+            // Attestation hash must be non-zero (device properly attested)
+            if enrollment.attestation_hash == [0u8; 32] {
+                tracing::warn!(
+                    "tier validation rejected: device {} has zero attestation hash",
+                    device_id
+                );
                 return false;
             }
             // Claimed tier must match the registered tier exactly
