@@ -244,7 +244,9 @@ mod saml_tests {
     }
 
     #[test]
-    fn signed_request_passes_validation() {
+    fn signed_request_rejects_invalid_certificate() {
+        // A signed request with an invalid (non-PEM) certificate must be rejected.
+        // This validates that the system does NOT silently accept garbage certs.
         let authn_request = AuthnRequest {
             id: "_req_signed".to_string(),
             issuer: "sp-1".to_string(),
@@ -261,8 +263,8 @@ mod saml_tests {
         };
 
         assert!(
-            authn_request.validate_signature("dummy-cert").is_ok(),
-            "signed request with present signature element should pass"
+            authn_request.validate_signature("dummy-cert").is_err(),
+            "signed request with invalid certificate must be rejected"
         );
     }
 

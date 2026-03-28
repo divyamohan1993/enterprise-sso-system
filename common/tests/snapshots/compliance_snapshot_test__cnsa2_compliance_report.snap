@@ -1,0 +1,15 @@
+---
+source: common/tests/compliance_snapshot_test.rs
+assertion_line: 28
+expression: report
+---
+algorithms:
+  digital_signature: ML-DSA-87 (FIPS 204)
+  hash: SHA-512
+  key_derivation: HKDF-SHA512
+  key_exchange: ML-KEM-1024 (FIPS 203)
+  symmetric_encryption: AES-256
+cnsa2_compliant: true
+compliance_assertion: All primary hash operations use SHA-512 (64 bytes >= 48 byte CNSA 2.0 minimum)
+min_hash_output_bytes: 48
+sha512_output_bytes: 64

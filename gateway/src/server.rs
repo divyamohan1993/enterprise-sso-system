@@ -686,12 +686,18 @@ async fn forward_to_orchestrator(
         .map_err(|e| format!("serialize orchestrator request: {e}"))?;
 
     // Derive TLS SNI hostname from the orchestrator address.
-    // Use the actual hostname/IP — never hardcode "localhost" which defeats
-    // hostname verification in production deployments with real certificates.
-    let orch_hostname = config.addr
+    // Self-signed certs use DNS names (not IP SANs), so when connecting
+    // to a bare IP address like 127.0.0.1, fall back to "localhost" as SNI.
+    // For real hostnames (e.g., orchestrator.milnet.internal), use the actual hostname.
+    let raw_hostname = config.addr
         .split(':')
         .next()
         .unwrap_or(&config.addr);
+    let orch_hostname = if raw_hostname.parse::<std::net::IpAddr>().is_ok() {
+        "localhost"
+    } else {
+        raw_hostname
+    };
     let mut transport = tls_connect(
             &config.addr,
             ModuleId::Gateway,

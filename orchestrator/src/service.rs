@@ -187,7 +187,14 @@ impl OrchestratorService {
         if !self.opaque_breaker.allow_request() {
             return Err("OPAQUE service circuit breaker is open — service unavailable".into());
         }
-        let opaque_host = self.opaque_addr.split(':').next().unwrap_or(&self.opaque_addr);
+        // Self-signed certs use DNS names (not IP SANs), so when connecting
+        // to a bare IP address like 127.0.0.1, fall back to "localhost" as SNI.
+        let raw_host = self.opaque_addr.split(':').next().unwrap_or(&self.opaque_addr);
+        let opaque_host = if raw_host.parse::<std::net::IpAddr>().is_ok() {
+            "localhost"
+        } else {
+            raw_host
+        };
         match tls_connect(
             &self.opaque_addr,
             ModuleId::Orchestrator,
@@ -213,7 +220,14 @@ impl OrchestratorService {
         if !self.tss_breaker.allow_request() {
             return Err("TSS service circuit breaker is open — service unavailable".into());
         }
-        let tss_host = self.tss_addr.split(':').next().unwrap_or(&self.tss_addr);
+        // Self-signed certs use DNS names (not IP SANs), so when connecting
+        // to a bare IP address like 127.0.0.1, fall back to "localhost" as SNI.
+        let raw_host = self.tss_addr.split(':').next().unwrap_or(&self.tss_addr);
+        let tss_host = if raw_host.parse::<std::net::IpAddr>().is_ok() {
+            "localhost"
+        } else {
+            raw_host
+        };
         match tls_connect(
             &self.tss_addr,
             ModuleId::Orchestrator,

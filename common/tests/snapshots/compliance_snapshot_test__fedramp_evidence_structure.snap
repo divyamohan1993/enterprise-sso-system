@@ -1,0 +1,18 @@
+---
+source: common/tests/compliance_snapshot_test.rs
+assertion_line: 176
+expression: evidence
+---
+impact_level: High
+report_contains_controls: true
+report_contains_summary: true
+report_starts_with_header: true
+stats:
+  evidence_count: 0
+  implemented: 2
+  not_applicable: 0
+  open_poams: 0
+  partially_implemented: 0
+  planned: 0
+  total_controls: 2
+system_name: MILNET SSO System

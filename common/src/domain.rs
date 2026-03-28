@@ -9,10 +9,10 @@
 //!   or are constrained by external specifications (e.g., RFC 7636 PKCE, WebAuthn).
 
 pub const FROST_TOKEN: &[u8] = b"MILNET-SSO-v1-FROST-TOKEN";
-pub const RECEIPT_SIGN: &[u8] = b"MILNET-SSO-v2-RECEIPT";
+pub const RECEIPT_SIGN: &[u8] = b"MILNET-SSO-v2-RECEIPT-SIGN";
 pub const DPOP_PROOF: &[u8] = b"MILNET-SSO-v1-DPOP";
 pub const AUDIT_ENTRY: &[u8] = b"MILNET-SSO-v2-AUDIT";
-pub const MODULE_ATTEST: &[u8] = b"MILNET-SSO-v1-ATTEST";
+pub const MODULE_ATTEST: &[u8] = b"MILNET-SSO-v1-MODULE-ATTEST";
 pub const RATCHET_ADVANCE: &[u8] = b"MILNET-SSO-v1-RATCHET";
 pub const SHARD_AUTH: &[u8] = b"MILNET-SSO-v1-SHARD";
 pub const TOKEN_TAG: &[u8] = b"MILNET-SSO-v1-TOKEN-TAG";

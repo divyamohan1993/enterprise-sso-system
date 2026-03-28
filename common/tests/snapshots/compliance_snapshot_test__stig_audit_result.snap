@@ -1,0 +1,121 @@
+---
+source: common/tests/compliance_snapshot_test.rs
+assertion_line: 113
+expression: report
+---
+audit_type: DISA STIG / CIS Level 2
+checks:
+  - category: Kernel
+    id: KERNEL-001
+    severity: CatI
+    status: Pass
+    title: ASLR (kernel.randomize_va_space)
+  - category: Kernel
+    id: KERNEL-002
+    severity: CatI
+    status: Fail
+    title: ptrace scope (kernel.yama.ptrace_scope)
+  - category: Kernel
+    id: KERNEL-003
+    severity: CatII
+    status: Pass
+    title: Kernel pointer restriction (kernel.kptr_restrict)
+  - category: Kernel
+    id: KERNEL-004
+    severity: CatII
+    status: Pass
+    title: dmesg restriction (kernel.dmesg_restrict)
+  - category: Kernel
+    id: KERNEL-005
+    severity: CatII
+    status: Pass
+    title: perf event paranoia (kernel.perf_event_paranoid)
+  - category: Kernel
+    id: KERNEL-006
+    severity: CatI
+    status: Fail
+    title: Unprivileged BPF disabled (kernel.unprivileged_bpf_disabled)
+  - category: Kernel
+    id: KERNEL-007
+    severity: CatII
+    status: Pass
+    title: Core dump pattern (kernel.core_pattern)
+  - category: Kernel
+    id: KERNEL-008
+    severity: CatII
+    status: Fail
+    title: SUID core dump disabled (fs.suid_dumpable)
+  - category: Kernel
+    id: KERNEL-009
+    severity: CatII
+    status: Pass
+    title: Minimum mmap address (vm.mmap_min_addr)
+  - category: Network
+    id: NET-001
+    severity: CatII
+    status: Fail
+    title: IP forwarding disabled (net.ipv4.ip_forward)
+  - category: Network
+    id: NET-002
+    severity: CatII
+    status: Pass
+    title: Reverse-path filtering (net.ipv4.conf.all.rp_filter)
+  - category: Network
+    id: NET-003
+    severity: CatII
+    status: Pass
+    title: ICMP redirect acceptance disabled (net.ipv4.conf.all.accept_redirects)
+  - category: Network
+    id: NET-004
+    severity: CatII
+    status: Pass
+    title: TCP SYN cookies enabled (net.ipv4.tcp_syncookies)
+  - category: Network
+    id: NET-005
+    severity: CatII
+    status: Pass
+    title: Source routing disabled (net.ipv4.conf.all.accept_source_route)
+  - category: Network
+    id: NET-006
+    severity: CatII
+    status: Fail
+    title: ICMP redirect sending disabled (net.ipv4.conf.all.send_redirects)
+  - category: Crypto
+    id: CRYPTO-001
+    severity: CatI
+    status: NotApplicable
+    title: Kernel FIPS mode enabled (crypto/fips_enabled)
+  - category: Authentication
+    id: V-222602
+    severity: CatI
+    status: Pass
+    title: Application input validation (XSS prevention)
+  - category: Authentication
+    id: V-222658
+    severity: CatII
+    status: Pass
+    title: Session timeout enforcement
+  - category: Authentication
+    id: V-222596
+    severity: CatII
+    status: Pass
+    title: Authentication lockout policy
+  - category: Crypto
+    id: V-222603
+    severity: CatI
+    status: Manual
+    title: Cryptographic module FIPS 140-3 validation
+  - category: Authentication
+    id: V-222610
+    severity: CatII
+    status: Manual
+    title: Error handling (no stack traces in responses)
+summary:
+  cat_i_failures: 2
+  cat_ii_failures: 3
+  cat_iii_failures: 0
+  failed: 5
+  manual: 2
+  not_applicable: 1
+  passed: 13
+  total: 21

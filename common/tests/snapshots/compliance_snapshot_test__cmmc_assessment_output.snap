@@ -1,0 +1,38 @@
+---
+source: common/tests/compliance_snapshot_test.rs
+assertion_line: 69
+expression: report
+---
+assessment_type: CMMC 2.0 Level 3
+framework: NIST SP 800-171
+gaps:
+  - family: Audit and Accountability
+    gap: Automated audit correlation and alerting rules not yet configured in SIEM.
+    id: AU.L2-3.3.5
+    status: PartiallyMet
+    title: "Correlate audit record review, analysis, and reporting processes"
+  - family: System and Communications Protection
+    gap: Not all cryptographic modules have completed FIPS 140-3 laboratory validation; pending certification.
+    id: SC.L2-3.13.11
+    status: PartiallyMet
+    title: Employ FIPS-validated cryptography when used to protect the confidentiality of CUI
+  - family: System and Information Integrity
+    gap: Full SIEM with signature-based IDS rules and threat-intel feed integration not yet operational.
+    id: SI.L2-3.14.6
+    status: PartiallyMet
+    title: Monitor organizational systems to detect attacks and indicators of potential attacks
+  - family: System and Information Integrity
+    gap: Behavioral baseline and user-entity behavior analytics (UEBA) not yet deployed.
+    id: SI.L2-3.14.7
+    status: PartiallyMet
+    title: Identify unauthorized use of organizational systems
+  - family: Risk Assessment
+    gap: Formal annual risk assessment review with independent assessor not yet scheduled.
+    id: RA.L2-3.11.1
+    status: PartiallyMet
+    title: "Periodically assess the risk to organizational operations, assets, and individuals"
+score:
+  met: 19
+  not_met: 0
+  partially_met: 5
+total_practices: 24
