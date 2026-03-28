@@ -18,7 +18,7 @@ checks:
   - category: Kernel
     id: KERNEL-003
     severity: CatII
-    status: Pass
+    status: Fail
     title: Kernel pointer restriction (kernel.kptr_restrict)
   - category: Kernel
     id: KERNEL-004
@@ -112,10 +112,10 @@ checks:
     title: Error handling (no stack traces in responses)
 summary:
   cat_i_failures: 3
-  cat_ii_failures: 2
+  cat_ii_failures: 3
   cat_iii_failures: 0
-  failed: 5
+  failed: 6
   manual: 2
   not_applicable: 1
-  passed: 13
+  passed: 12
   total: 21
