@@ -97,6 +97,7 @@ pub mod cluster_roles;
 pub mod auto_heal;
 pub mod binary_attestation_mesh;
 pub mod code_healing;
+pub mod threshold_kek;
 
 // ── Privileged Identity Management (just-in-time elevation) ──
 pub mod pim;
