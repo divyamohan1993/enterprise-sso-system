@@ -463,17 +463,6 @@ impl ShardProtocol {
             .await
     }
 
-    /// Connect with TLS in production or plain TCP in development.
-    ///
-    /// Returns a unified [`crate::transport::ShardTransport`] that works
-    /// identically regardless of whether TLS is active.
-    pub async fn connect_auto(
-        self,
-        addr: &str,
-        tls_config: Option<&crate::transport::ClientTlsConfig>,
-    ) -> Result<crate::transport::ShardTransport, MilnetError> {
-        crate::transport::connect_auto(addr, self.module_id, self.shared_secret, tls_config).await
-    }
 }
 
 

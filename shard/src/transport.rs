@@ -1,18 +1,16 @@
 //! Async transport for SHARD messages with length-prefixed framing.
 //!
 //! Provides [`ShardTransport`] for sending/receiving authenticated SHARD
-//! messages over TCP or mTLS, and [`ShardListener`] for accepting inbound
+//! messages over mTLS, and [`ShardListener`] for accepting inbound
 //! connections.
 //!
-//! **TLS enforcement**: mTLS with certificate pinning is ALWAYS required for
-//! all inter-service communication, regardless of environment. Plain TCP is
-//! permanently disabled.
+//! **TLS enforcement**: mTLS with certificate pinning is UNCONDITIONALLY required
+//! for all inter-service communication. Plain TCP is permanently removed.
 
 use std::sync::Arc;
 
 use rustls::ServerConfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::server::TlsStream as ServerTlsStream;
@@ -199,13 +197,10 @@ impl ClientTlsConfig {
 // Unified stream type
 // ---------------------------------------------------------------------------
 
-/// Unified stream that can be either a plain TCP connection or a TLS connection.
+/// Unified stream that is always a TLS connection.
+///
+/// Plain TCP has been permanently removed — all SHARD connections require mTLS.
 enum TransportStream {
-    /// Plain TCP (test/development only).
-    Plain {
-        reader: OwnedReadHalf,
-        writer: OwnedWriteHalf,
-    },
     /// TLS server-side (accepted connection).
     TlsServer(ServerTlsStream<TcpStream>),
     /// TLS client-side (outgoing connection).
@@ -217,8 +212,7 @@ enum TransportStream {
 // ---------------------------------------------------------------------------
 
 /// A transport that sends and receives SHARD-authenticated messages
-/// using 4-byte big-endian length-prefixed framing over either plain TCP
-/// or mTLS.
+/// using 4-byte big-endian length-prefixed framing over mTLS.
 pub struct ShardTransport {
     stream: TransportStream,
     /// The underlying SHARD protocol instance (public for advanced use cases
@@ -230,28 +224,6 @@ pub struct ShardTransport {
 }
 
 impl ShardTransport {
-    /// Wrap an already-connected plain TCP stream with a [`ShardProtocol`] instance.
-    ///
-    /// # Security warning
-    /// Plain TCP is permanently disabled for security hardening.
-    /// All inter-service communication MUST use mTLS with certificate pinning.
-    /// This constructor logs a security violation error; prefer
-    /// [`ShardTransport::connect_tls()`] instead.
-    pub fn new(stream: TcpStream, protocol: ShardProtocol) -> Self {
-        // Plain TCP is permanently disabled for security hardening.
-        // All inter-service communication MUST use mTLS with certificate pinning.
-        tracing::error!(
-            "SECURITY: Plain TCP ShardTransport created — this is a security violation. \
-             All inter-service communication must use mTLS."
-        );
-        let (reader, writer) = stream.into_split();
-        Self {
-            stream: TransportStream::Plain { reader, writer },
-            protocol,
-            peer_module: None,
-        }
-    }
-
     /// Wrap a TLS server stream with a [`ShardProtocol`] instance.
     fn from_tls_server(stream: ServerTlsStream<TcpStream>, protocol: ShardProtocol) -> Self {
         Self {
@@ -284,8 +256,10 @@ impl ShardTransport {
     }
 
     /// Returns `true` if this transport is using TLS.
+    ///
+    /// Always returns `true` — plain TCP has been permanently removed.
     pub fn is_tls(&self) -> bool {
-        !matches!(self.stream, TransportStream::Plain { .. })
+        true
     }
 
     /// Create an authenticated SHARD message from `payload`, frame it with a
@@ -302,20 +276,6 @@ impl ShardTransport {
         let len_bytes = len.to_be_bytes();
 
         match &mut self.stream {
-            TransportStream::Plain { writer, .. } => {
-                writer
-                    .write_all(&len_bytes)
-                    .await
-                    .map_err(|e| MilnetError::Shard(format!("write length: {e}")))?;
-                writer
-                    .write_all(&msg)
-                    .await
-                    .map_err(|e| MilnetError::Shard(format!("write payload: {e}")))?;
-                writer
-                    .flush()
-                    .await
-                    .map_err(|e| MilnetError::Shard(format!("flush: {e}")))?;
-            }
             TransportStream::TlsServer(s) => {
                 s.write_all(&len_bytes)
                     .await
@@ -391,20 +351,6 @@ impl ShardTransport {
         let len_bytes = len.to_be_bytes();
 
         match &mut self.stream {
-            TransportStream::Plain { writer, .. } => {
-                writer
-                    .write_all(&len_bytes)
-                    .await
-                    .map_err(|e| MilnetError::Shard(format!("write length: {e}")))?;
-                writer
-                    .write_all(raw)
-                    .await
-                    .map_err(|e| MilnetError::Shard(format!("write payload: {e}")))?;
-                writer
-                    .flush()
-                    .await
-                    .map_err(|e| MilnetError::Shard(format!("flush: {e}")))?;
-            }
             TransportStream::TlsServer(s) => {
                 s.write_all(&len_bytes)
                     .await
@@ -434,12 +380,6 @@ impl ShardTransport {
     /// Internal helper: read exact bytes from the underlying stream.
     async fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), MilnetError> {
         match &mut self.stream {
-            TransportStream::Plain { reader, .. } => {
-                reader
-                    .read_exact(buf)
-                    .await
-                    .map_err(|e| MilnetError::Shard(format!("read: {e}")))?;
-            }
             TransportStream::TlsServer(s) => {
                 s.read_exact(buf)
                     .await
@@ -562,51 +502,16 @@ fn verify_client_side_peer(
 
 /// Accepts incoming connections and wraps them in [`ShardTransport`].
 ///
-/// In production mode (`MILNET_PRODUCTION` set), connections are always
-/// accepted over mTLS. In development/test mode, plain TCP is permitted
-/// when no TLS config is provided.
+/// All connections are accepted over mTLS. Plain TCP is permanently removed.
 pub struct ShardListener {
     listener: TcpListener,
     module_id: ModuleId,
     hmac_key: [u8; 64],
-    /// TLS configuration. `None` means plain TCP (only allowed outside production).
-    tls_config: Option<ServerTlsConfig>,
+    /// TLS configuration — always required.
+    tls_config: ServerTlsConfig,
 }
 
 impl ShardListener {
-    /// Bind to the given address and prepare to accept SHARD connections.
-    ///
-    /// This always returns an error because plain TCP is permanently disabled.
-    /// Use [`ShardListener::tls_bind`] instead, or provide a `ServerTlsConfig`
-    /// via [`ShardListener::bind_with_optional_tls`].
-    pub async fn bind(
-        addr: &str,
-        module_id: ModuleId,
-        hmac_key: [u8; 64],
-    ) -> Result<Self, MilnetError> {
-        if require_tls() {
-            return Err(MilnetError::Shard(
-                "Plain TCP bind permanently disabled — all inter-service \
-                 communication requires mTLS. Use ShardListener::tls_bind()."
-                    .into(),
-            ));
-        }
-        eprintln!(
-            "WARNING: ShardListener binding without TLS on {addr} (module {:?}). \
-             Non-TLS connections are only safe for testing.",
-            module_id
-        );
-        let listener = TcpListener::bind(addr)
-            .await
-            .map_err(|e| MilnetError::Shard(format!("bind {addr}: {e}")))?;
-        Ok(Self {
-            listener,
-            module_id,
-            hmac_key,
-            tls_config: None,
-        })
-    }
-
     /// Bind to the given address with mandatory mTLS.
     ///
     /// All accepted connections will be TLS-wrapped with mutual certificate
@@ -625,22 +530,8 @@ impl ShardListener {
             listener,
             module_id,
             hmac_key,
-            tls_config: Some(tls_config),
+            tls_config,
         })
-    }
-
-    /// Bind with optional TLS. If `tls_config` is `Some`, use mTLS.
-    /// If `None`, fall back to plain TCP (forbidden in production).
-    pub async fn bind_with_optional_tls(
-        addr: &str,
-        module_id: ModuleId,
-        hmac_key: [u8; 64],
-        tls_config: Option<ServerTlsConfig>,
-    ) -> Result<Self, MilnetError> {
-        match tls_config {
-            Some(cfg) => Self::tls_bind(addr, module_id, hmac_key, cfg).await,
-            None => Self::bind(addr, module_id, hmac_key).await,
-        }
     }
 
     /// Return the local address this listener is bound to.
@@ -650,16 +541,15 @@ impl ShardListener {
             .map_err(|e| MilnetError::Shard(format!("local_addr: {e}")))
     }
 
-    /// Returns `true` if this listener is configured with TLS.
+    /// Returns `true` — all listeners unconditionally use TLS.
     pub fn is_tls(&self) -> bool {
-        self.tls_config.is_some()
+        true
     }
 
     /// Accept a single inbound connection and return a [`ShardTransport`].
     ///
-    /// If TLS is configured, the connection is accepted over mTLS with
-    /// certificate pinning and module identity verification (if configured).
-    /// If TLS is not configured (test mode only), accepts a plain TCP connection.
+    /// The connection is accepted over mTLS with certificate pinning and
+    /// module identity verification (if configured).
     pub async fn accept(&self) -> Result<ShardTransport, MilnetError> {
         let (tcp_stream, _addr) = self
             .listener
@@ -667,34 +557,27 @@ impl ShardListener {
             .await
             .map_err(|e| MilnetError::Shard(format!("accept: {e}")))?;
 
-        match &self.tls_config {
-            Some(cfg) => {
-                let tls_stream = cfg
-                    .acceptor
-                    .accept(tcp_stream)
-                    .await
-                    .map_err(|e| MilnetError::Shard(format!("tls accept: {e}")))?;
+        let cfg = &self.tls_config;
+        let tls_stream = cfg
+            .acceptor
+            .accept(tcp_stream)
+            .await
+            .map_err(|e| MilnetError::Shard(format!("tls accept: {e}")))?;
 
-                // Post-handshake: verify peer certificate pinning and module identity.
-                let peer_module = verify_server_side_peer(
-                    &tls_stream,
-                    &cfg.pin_set,
-                    &cfg.identity_map,
-                    None,
-                )?;
+        // Post-handshake: verify peer certificate pinning and module identity.
+        let peer_module = verify_server_side_peer(
+            &tls_stream,
+            &cfg.pin_set,
+            &cfg.identity_map,
+            None,
+        )?;
 
-                let protocol = ShardProtocol::new(self.module_id, self.hmac_key);
-                let mut transport = ShardTransport::from_tls_server(tls_stream, protocol);
-                if let Some(module_id) = peer_module {
-                    transport.set_peer_module(module_id);
-                }
-                Ok(transport)
-            }
-            None => {
-                let protocol = ShardProtocol::new(self.module_id, self.hmac_key);
-                Ok(ShardTransport::new(tcp_stream, protocol))
-            }
+        let protocol = ShardProtocol::new(self.module_id, self.hmac_key);
+        let mut transport = ShardTransport::from_tls_server(tls_stream, protocol);
+        if let Some(module_id) = peer_module {
+            transport.set_peer_module(module_id);
         }
+        Ok(transport)
     }
 
     /// Accept a single inbound connection with communication matrix enforcement.
@@ -720,72 +603,33 @@ impl ShardListener {
             .await
             .map_err(|e| MilnetError::Shard(format!("accept: {e}")))?;
 
-        match &self.tls_config {
-            Some(cfg) => {
-                let tls_stream = cfg
-                    .acceptor
-                    .accept(tcp_stream)
-                    .await
-                    .map_err(|e| MilnetError::Shard(format!("tls accept: {e}")))?;
+        let cfg = &self.tls_config;
+        let tls_stream = cfg
+            .acceptor
+            .accept(tcp_stream)
+            .await
+            .map_err(|e| MilnetError::Shard(format!("tls accept: {e}")))?;
 
-                // Post-handshake: verify peer identity matches the expected sender.
-                let peer_module = verify_server_side_peer(
-                    &tls_stream,
-                    &cfg.pin_set,
-                    &cfg.identity_map,
-                    Some(sender_module),
-                )?;
+        // Post-handshake: verify peer identity matches the expected sender.
+        let peer_module = verify_server_side_peer(
+            &tls_stream,
+            &cfg.pin_set,
+            &cfg.identity_map,
+            Some(sender_module),
+        )?;
 
-                let protocol = ShardProtocol::new(self.module_id, self.hmac_key);
-                let mut transport = ShardTransport::from_tls_server(tls_stream, protocol);
-                if let Some(module_id) = peer_module {
-                    transport.set_peer_module(module_id);
-                }
-                Ok(transport)
-            }
-            None => {
-                let protocol = ShardProtocol::new(self.module_id, self.hmac_key);
-                Ok(ShardTransport::new(tcp_stream, protocol))
-            }
+        let protocol = ShardProtocol::new(self.module_id, self.hmac_key);
+        let mut transport = ShardTransport::from_tls_server(tls_stream, protocol);
+        if let Some(module_id) = peer_module {
+            transport.set_peer_module(module_id);
         }
+        Ok(transport)
     }
 }
 
 // ---------------------------------------------------------------------------
 // Client connect functions
 // ---------------------------------------------------------------------------
-
-/// Connect to a remote SHARD peer over plain TCP and return a [`ShardTransport`].
-///
-/// In production mode (`MILNET_PRODUCTION` set), this returns an error
-/// because TLS is mandatory. Use [`tls_connect`] instead.
-///
-/// Validates the communication channel against the module communication
-/// matrix before establishing the connection. `module_id` is the local
-/// (sender) module; `peer_module` is the remote (receiver) module.
-pub async fn connect(
-    addr: &str,
-    module_id: ModuleId,
-    hmac_key: [u8; 64],
-) -> Result<ShardTransport, MilnetError> {
-    if require_tls() {
-        return Err(MilnetError::Shard(
-            "MILNET_PRODUCTION is set: plain TCP connect refused. \
-             Use tls_connect() for mTLS connections."
-                .into(),
-        ));
-    }
-    eprintln!(
-        "WARNING: Plain TCP SHARD connection to {addr} (module {:?}). \
-         Non-TLS connections are only safe for testing.",
-        module_id
-    );
-    let stream = TcpStream::connect(addr)
-        .await
-        .map_err(|e| MilnetError::Shard(format!("connect {addr}: {e}")))?;
-    let protocol = ShardProtocol::new(module_id, hmac_key);
-    Ok(ShardTransport::new(stream, protocol))
-}
 
 /// Connect to a remote SHARD peer over mTLS and return a [`ShardTransport`].
 ///
@@ -841,27 +685,6 @@ pub async fn tls_connect_expecting(
     Ok(transport)
 }
 
-/// Connect to a remote SHARD peer with communication matrix enforcement.
-///
-/// Like [`connect`], but additionally validates that `sender_module` is
-/// permitted to communicate with `receiver_module` per the module
-/// communication matrix before establishing the TCP connection.
-///
-/// In production mode, returns an error (use [`tls_connect_checked`] instead).
-pub async fn connect_checked(
-    addr: &str,
-    sender_module: ModuleId,
-    receiver_module: ModuleId,
-    hmac_key: [u8; 64],
-) -> Result<ShardTransport, MilnetError> {
-    common::network::enforce_channel(sender_module, receiver_module).map_err(|e| {
-        MilnetError::Shard(format!(
-            "channel {sender_module:?} -> {receiver_module:?} denied: {e}"
-        ))
-    })?;
-    connect(addr, sender_module, hmac_key).await
-}
-
 /// Connect to a remote SHARD peer over mTLS with communication matrix enforcement.
 ///
 /// Validates the communication matrix, establishes mTLS, verifies certificate
@@ -881,17 +704,3 @@ pub async fn tls_connect_checked(
     tls_connect_expecting(addr, sender_module, hmac_key, tls_config, Some(receiver_module)).await
 }
 
-/// Connect with TLS if available, otherwise fall back to plain TCP (test only).
-///
-/// In production mode, `tls_config` must be `Some` or an error is returned.
-pub async fn connect_auto(
-    addr: &str,
-    module_id: ModuleId,
-    hmac_key: [u8; 64],
-    tls_config: Option<&ClientTlsConfig>,
-) -> Result<ShardTransport, MilnetError> {
-    match tls_config {
-        Some(cfg) => tls_connect(addr, module_id, hmac_key, cfg).await,
-        None => connect(addr, module_id, hmac_key).await,
-    }
-}
