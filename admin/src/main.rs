@@ -12,6 +12,13 @@ async fn main() {
     let (_platform_report, _monitor_handle, _monitor) =
         common::startup_checks::run_platform_checks(crypto::memguard::harden_process);
 
+    // Start runtime defense: stealth detection + auto-response pipeline
+    let _defense = common::runtime_defense::start_runtime_defense(
+        "admin",
+        8080,
+        _platform_report.binary_hash,
+    );
+
     // Derive admin API key deterministically from the master KEK via HKDF-SHA512.
     // This avoids printing secrets and ensures the key is stable across restarts.
     let api_key = std::env::var("ADMIN_API_KEY").unwrap_or_else(|_| {

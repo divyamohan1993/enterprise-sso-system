@@ -109,6 +109,8 @@ pub struct StealthDetector {
     expected_ports: Vec<u16>,
     /// Timing baseline for consistency checks.
     timing_baseline: Option<Instant>,
+    /// Baseline library map hash (captured at startup).
+    library_baseline: Option<[u8; 64]>,
 }
 
 /// Default minimum check interval (seconds).
@@ -138,6 +140,7 @@ impl StealthDetector {
             expected_binary_hash: None,
             expected_ports: Vec::new(),
             timing_baseline: None,
+            library_baseline: None,
         }
     }
 
@@ -227,6 +230,45 @@ impl StealthDetector {
         tracing::info!("stealth detection: suspicion score reset after heal");
     }
 
+    /// Add suspicion score directly (for external detection sources).
+    pub fn add_suspicion(&mut self, amount: f64) {
+        self.suspicion_score = (self.suspicion_score + amount).min(1.0);
+    }
+
+    /// Apply time-based decay to suspicion score.
+    /// Decays by 0.01 per minute elapsed.
+    pub fn apply_decay(&mut self, elapsed: std::time::Duration) {
+        let minutes = elapsed.as_secs_f64() / 60.0;
+        let decay = minutes * 0.01;
+        self.suspicion_score = (self.suspicion_score - decay).max(0.0);
+    }
+
+    /// Capture current library map as baseline for future comparisons.
+    pub fn capture_library_baseline(&mut self) {
+        match std::fs::read_to_string("/proc/self/maps") {
+            Ok(maps) => {
+                let mut hasher = Sha512::new();
+                for line in maps.lines() {
+                    if let Some(path) = extract_so_path(line) {
+                        hasher.update(path.as_bytes());
+                    }
+                }
+                let hash = hasher.finalize();
+                let mut baseline = [0u8; 64];
+                baseline.copy_from_slice(&hash);
+                self.library_baseline = Some(baseline);
+            }
+            Err(e) => {
+                tracing::warn!("failed to capture library baseline: {e}");
+            }
+        }
+    }
+
+    /// Whether a library baseline has been captured.
+    pub fn has_library_baseline(&self) -> bool {
+        self.library_baseline.is_some()
+    }
+
     /// Set expected binary hash.
     pub fn set_expected_hash(&mut self, hash: [u8; 64]) {
         self.expected_binary_hash = Some(hash);
@@ -285,6 +327,7 @@ impl StealthDetector {
     }
 
     /// Parse /proc/self/maps, hash each .so file path.
+    /// When a baseline has been captured, compares current hash against it.
     fn check_library_hash(&self) -> DetectionEvent {
         let now = Instant::now();
         match std::fs::read_to_string("/proc/self/maps") {
@@ -301,13 +344,33 @@ impl StealthDetector {
                 }
 
                 let hash = hasher.finalize();
+                let mut hash_arr = [0u8; 64];
+                hash_arr.copy_from_slice(&hash);
+
+                // If we have a baseline, compare current hash against it
+                if let Some(baseline) = &self.library_baseline {
+                    if hash_arr != *baseline {
+                        return DetectionEvent {
+                            layer: DetectionLayer::LibraryHash,
+                            timestamp: now,
+                            suspicious: true,
+                            detail: format!(
+                                "library map changed since baseline: current={}, baseline={} ({lib_count} libs)",
+                                hex::encode(&hash_arr[..8]),
+                                hex::encode(&baseline[..8]),
+                            ),
+                            score_contribution: DetectionLayer::LibraryHash.score_weight(),
+                        };
+                    }
+                }
+
                 DetectionEvent {
                     layer: DetectionLayer::LibraryHash,
                     timestamp: now,
                     suspicious: false,
                     detail: format!(
                         "library map hash: {} ({lib_count} libs)",
-                        hex::encode(&hash[..8])
+                        hex::encode(&hash_arr[..8])
                     ),
                     score_contribution: 0.0,
                 }

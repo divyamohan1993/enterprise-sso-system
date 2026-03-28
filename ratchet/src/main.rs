@@ -22,6 +22,13 @@ async fn main() {
     let (_platform_report, _monitor_handle, _monitor) =
         common::startup_checks::run_platform_checks(crypto::memguard::harden_process);
 
+    // Start runtime defense: stealth detection + auto-response pipeline
+    let _defense = common::runtime_defense::start_runtime_defense(
+        "ratchet",
+        9105,
+        _platform_report.binary_hash,
+    );
+
     // Initialize structured JSON logging for production observability
     common::structured_logging::init(common::structured_logging::ServiceMeta {
         service_name: "ratchet".to_string(),

@@ -49,6 +49,13 @@ async fn main() {
     let (_platform_report, _monitor_handle, _monitor) =
         common::startup_checks::run_platform_checks(crypto::memguard::harden_process);
 
+    // Start runtime defense: stealth detection + auto-response pipeline
+    let _defense = common::runtime_defense::start_runtime_defense(
+        "tss",
+        9103,
+        _platform_report.binary_hash,
+    );
+
     let is_production = common::sealed_keys::is_production();
 
     // Spawn health check endpoint

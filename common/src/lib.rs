@@ -174,3 +174,4 @@ pub mod secret_ceremony;
 pub mod stealth_detection;
 pub mod quarantine;
 pub mod auto_response;
+pub mod runtime_defense;

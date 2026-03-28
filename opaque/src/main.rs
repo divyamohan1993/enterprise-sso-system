@@ -20,6 +20,13 @@ async fn main() {
     let (_platform_report, _monitor_handle, _monitor) =
         common::startup_checks::run_platform_checks(crypto::memguard::harden_process);
 
+    // Start runtime defense: stealth detection + auto-response pipeline
+    let _defense = common::runtime_defense::start_runtime_defense(
+        "opaque",
+        9102,
+        _platform_report.binary_hash,
+    );
+
     // STIG compliance audit (best-effort — log warnings, do not block startup)
     match common::startup_checks::run_stig_audit() {
         Ok(summary) => tracing::info!("STIG audit passed: {:?}", summary),

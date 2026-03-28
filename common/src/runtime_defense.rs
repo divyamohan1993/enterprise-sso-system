@@ -1,0 +1,106 @@
+//! Runtime defense wiring — connects StealthDetector + AutoResponsePipeline
+//! to service main loops.
+
+use crate::auto_response::{AutoResponseConfig, AutoResponsePipeline};
+use crate::raft::NodeId;
+use crate::stealth_detection::StealthDetector;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex;
+
+/// Handle returned by `start_runtime_defense`.
+pub struct RuntimeDefenseHandle {
+    pub pipeline: Arc<Mutex<AutoResponsePipeline>>,
+    pub detector: Arc<Mutex<StealthDetector>>,
+    pub node_id: NodeId,
+}
+
+/// Start the runtime defense subsystem.
+///
+/// Spawns background tasks for:
+/// 1. Stealth detection on randomized intervals
+/// 2. Suspicion decay (prevents false-positive accumulation)
+/// 3. Auto-response pipeline advancement
+pub fn start_runtime_defense(
+    service_name: &str,
+    service_port: u16,
+    platform_binary_hash: [u8; 64],
+) -> RuntimeDefenseHandle {
+    let node_id = NodeId::random();
+
+    let mut detector = StealthDetector::new();
+    detector.set_expected_hash(platform_binary_hash);
+    detector.set_expected_ports(vec![service_port, service_port + 1000]);
+    detector.capture_library_baseline();
+
+    let detector = Arc::new(Mutex::new(detector));
+    let pipeline = Arc::new(Mutex::new(
+        AutoResponsePipeline::new(AutoResponseConfig::default()),
+    ));
+
+    // Detection + response loop
+    let det = detector.clone();
+    let pip = pipeline.clone();
+    let svc = service_name.to_string();
+    tokio::spawn(async move {
+        let mut check_interval = tokio::time::interval(Duration::from_secs(30));
+        let mut decay_interval = tokio::time::interval(Duration::from_secs(60));
+
+        loop {
+            tokio::select! {
+                _ = check_interval.tick() => {
+                    let mut d = det.lock().await;
+                    let events = d.run_due_checks();
+                    for event in &events {
+                        if event.suspicious {
+                            tracing::warn!(
+                                service = %svc,
+                                layer = ?event.layer,
+                                detail = %event.detail,
+                                score = event.score_contribution,
+                                total = d.suspicion_score(),
+                                "STEALTH DETECTION: suspicious activity detected"
+                            );
+                        }
+                    }
+                    if d.should_quarantine() {
+                        tracing::error!(
+                            target: "siem",
+                            service = %svc,
+                            suspicion = d.suspicion_score(),
+                            event = "self_quarantine",
+                            severity = 10,
+                            "QUARANTINE THRESHOLD EXCEEDED"
+                        );
+                        // Use the configured platform hash; fall back to zeros if not set
+                        let expected = platform_binary_hash;
+                        drop(d);
+                        let mut p = pip.lock().await;
+                        p.respond_to_tamper(node_id, expected, [0xFF; 64]);
+                    }
+                }
+                _ = decay_interval.tick() => {
+                    let mut d = det.lock().await;
+                    d.apply_decay(Duration::from_secs(60));
+                }
+            }
+        }
+    });
+
+    // Pipeline tick loop
+    let pip2 = pipeline.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            let mut p = pip2.lock().await;
+            let _events = p.tick();
+        }
+    });
+
+    RuntimeDefenseHandle {
+        pipeline,
+        detector,
+        node_id,
+    }
+}
