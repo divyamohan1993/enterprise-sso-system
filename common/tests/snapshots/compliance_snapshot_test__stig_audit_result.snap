@@ -111,8 +111,8 @@ checks:
     status: Manual
     title: Error handling (no stack traces in responses)
 summary:
-  cat_i_failures: 2
-  cat_ii_failures: 3
+  cat_i_failures: 3
+  cat_ii_failures: 2
   cat_iii_failures: 0
   failed: 5
   manual: 2

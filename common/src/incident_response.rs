@@ -626,8 +626,8 @@ mod tests {
         let engine = IncidentResponseEngine::new();
         assert!(!engine.is_lockdown());
 
-        // Report 5 critical incidents
-        for i in 0..5 {
+        // Report LOCKDOWN_THRESHOLD (20) critical incidents
+        for i in 0..20 {
             engine.report_incident(
                 IncidentType::TamperDetection,
                 None,
@@ -643,8 +643,8 @@ mod tests {
     fn test_lockdown_exit_requires_admin() {
         let engine = IncidentResponseEngine::new();
 
-        // Trigger lockdown
-        for i in 0..5 {
+        // Trigger lockdown with LOCKDOWN_THRESHOLD (20) critical incidents
+        for i in 0..20 {
             engine.report_incident(
                 IncidentType::DuressActivation,
                 Some(Uuid::new_v4()),
@@ -670,7 +670,7 @@ mod tests {
             "System must not start in lockdown"
         );
 
-        for i in 0..5 {
+        for i in 0..20 {
             engine.report_incident(
                 IncidentType::TamperDetection,
                 None,
