@@ -29,6 +29,9 @@ subtle.workspace = true
 zeroize = { version = "1", features = ["zeroize_derive"] }
 getrandom = "0.2"
 
+[features]
+production = ["common/production"]
+
 [dev-dependencies]
 opaque-ke.workspace = true
 rand.workspace = true

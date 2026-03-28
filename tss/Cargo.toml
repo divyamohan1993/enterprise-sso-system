@@ -25,6 +25,9 @@ getrandom.workspace = true
 hkdf.workspace = true
 zeroize.workspace = true
 
+[features]
+production = ["common/production"]
+
 [dev-dependencies]
 tokio-rustls.workspace = true
 rustls.workspace = true

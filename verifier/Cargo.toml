@@ -21,6 +21,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 hex.workspace = true
 
+[features]
+production = ["common/production"]
+
 [dev-dependencies]
 rand.workspace = true
 getrandom.workspace = true

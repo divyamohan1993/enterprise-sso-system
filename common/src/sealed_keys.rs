@@ -12,7 +12,7 @@
 //!    fall back to deterministic dev key (with loud warning)
 //!
 //! # Production Mode
-//! Set `MILNET_PRODUCTION=1` to enforce:
+//! Build with `--features production` to enforce:
 //! - No dev key fallbacks (hard fail)
 //! - Sealed keys required
 //! - Master KEK must come from env `MILNET_MASTER_KEK` (hex-encoded)
@@ -73,13 +73,13 @@ pub fn cached_master_kek() -> &'static [u8; 32] {
 }
 
 /// Whether the system is running in production mode.
-/// In production, dev key fallbacks are forbidden.
-/// Returns `true` only if `MILNET_PRODUCTION` is set to `"1"` or `"true"` (case-insensitive).
+/// This is a COMPILE-TIME decision via the `production` Cargo feature.
+/// An attacker with root access CANNOT downgrade this at runtime.
+///
+/// Build with: `cargo build --release --features production`
+#[inline]
 pub fn is_production() -> bool {
-    match std::env::var("MILNET_PRODUCTION") {
-        Ok(val) => val == "1" || val.eq_ignore_ascii_case("true"),
-        Err(_) => false,
-    }
+    cfg!(feature = "production")
 }
 
 /// Load the master KEK from environment.

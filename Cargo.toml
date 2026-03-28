@@ -20,6 +20,8 @@ members = [
 ]
 
 [workspace.package]
+# Production builds: cargo build --release --features production
+# This enables compile-time security enforcement across all crates.
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"

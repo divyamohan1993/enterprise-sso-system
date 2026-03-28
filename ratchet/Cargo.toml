@@ -25,5 +25,8 @@ hex.workspace = true
 libc.workspace = true
 subtle.workspace = true
 
+[features]
+production = ["common/production"]
+
 [dev-dependencies]
 proptest = "1"

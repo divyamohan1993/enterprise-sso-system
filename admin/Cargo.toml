@@ -39,3 +39,6 @@ urlencoding = "2"
 rsa.workspace = true
 aes-gcm.workspace = true
 getrandom.workspace = true
+
+[features]
+production = ["common/production"]

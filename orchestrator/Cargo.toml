@@ -25,3 +25,6 @@ tokio-rustls.workspace = true
 rcgen.workspace = true
 zeroize.workspace = true
 ml-dsa.workspace = true
+
+[features]
+production = ["common/production"]
