@@ -108,6 +108,8 @@ pub fn auto_detect_channels(registered_services: &[ModuleId]) -> Vec<(ModuleId, 
 }
 
 /// Return the known dependencies for a service type.
+/// This MUST match the `is_permitted_channel()` matrix exactly.
+/// Every service that initiates outbound connections lists its targets here.
 fn service_dependencies(module: ModuleId) -> Vec<ModuleId> {
     match module {
         ModuleId::Gateway => vec![ModuleId::Orchestrator],
@@ -121,8 +123,15 @@ fn service_dependencies(module: ModuleId) -> Vec<ModuleId> {
             ModuleId::Kt,
         ],
         ModuleId::Verifier => vec![ModuleId::Ratchet],
-        ModuleId::Audit => vec![ModuleId::Kt],
-        _ => vec![], // Leaf services have no outbound dependencies
+        ModuleId::Audit => vec![ModuleId::Kt, ModuleId::Tss],
+        // TSS coordinator connects to signers (same ModuleId, peer-to-peer)
+        ModuleId::Tss => vec![ModuleId::Audit],
+        // All modules can submit to Audit (handled by the wildcard in is_permitted_channel)
+        ModuleId::Opaque => vec![ModuleId::Audit],
+        ModuleId::Ratchet => vec![ModuleId::Audit],
+        ModuleId::Risk => vec![ModuleId::Audit],
+        ModuleId::Admin => vec![ModuleId::Audit],
+        ModuleId::Kt => vec![ModuleId::Audit],
     }
 }
 

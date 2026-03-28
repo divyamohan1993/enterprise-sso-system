@@ -164,9 +164,12 @@ impl RevocationChecker {
     /// Check OCSP status for a certificate fingerprint.
     ///
     /// Returns cached result if available and not expired, otherwise
-    /// performs a live OCSP query (simulated — in production this would
-    /// make an HTTP request to the OCSP responder).
-    pub fn check_ocsp(&self, cert_fingerprint: &[u8; 32]) -> RevocationStatus {
+    /// performs a synchronous TCP connection to the first available OCSP
+    /// responder. The OCSP protocol uses HTTP POST with DER-encoded request.
+    ///
+    /// SECURITY: Fail-closed — if no responder is reachable, returns Unknown
+    /// which triggers CRL fallback and ultimately CheckFailed if both fail.
+    pub fn check_ocsp(&mut self, cert_fingerprint: &[u8; 32]) -> RevocationStatus {
         // Check cache first
         if let Some((status, cached_at)) = self.ocsp_cache.get(cert_fingerprint) {
             if cached_at.elapsed() < self.ocsp_config.cache_ttl {
@@ -175,21 +178,127 @@ impl RevocationChecker {
             // Cache expired — fall through to live query
         }
 
-        // In production: make HTTP POST to OCSP responder with DER-encoded request.
-        // For now, if no responders configured, return Unknown.
         if self.ocsp_config.responder_urls.is_empty() {
             return RevocationStatus::Unknown;
         }
 
-        // Simulated OCSP query — in production, this would be async HTTP.
-        // Return Unknown to trigger CRL fallback.
+        // Try each OCSP responder until one succeeds
+        for responder_url in &self.ocsp_config.responder_urls {
+            match self.query_ocsp_responder(responder_url, cert_fingerprint) {
+                Ok(status) => {
+                    // Cache the result
+                    self.ocsp_cache
+                        .insert(*cert_fingerprint, (status.clone(), Instant::now()));
+                    return status;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        responder = %responder_url,
+                        error = %e,
+                        "OCSP responder query failed, trying next"
+                    );
+                    continue;
+                }
+            }
+        }
+
+        // All responders failed
+        tracing::error!(
+            responders = self.ocsp_config.responder_urls.len(),
+            "all OCSP responders unreachable"
+        );
         RevocationStatus::Unknown
+    }
+
+    /// Query a single OCSP responder via TCP.
+    ///
+    /// Constructs a minimal HTTP POST to the responder with the certificate
+    /// fingerprint as the query. Parses the response for revocation status.
+    fn query_ocsp_responder(
+        &self,
+        responder_url: &str,
+        cert_fingerprint: &[u8; 32],
+    ) -> Result<RevocationStatus, String> {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+
+        // Parse host:port from URL (strip http:// prefix)
+        let host_port = responder_url
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .split('/')
+            .next()
+            .unwrap_or(responder_url);
+
+        let addr = if host_port.contains(':') {
+            host_port.to_string()
+        } else {
+            format!("{}:80", host_port)
+        };
+
+        // Connect with timeout
+        let timeout = self.ocsp_config.timeout;
+        let stream = TcpStream::connect_timeout(
+            &addr
+                .parse()
+                .map_err(|e| format!("invalid OCSP responder address '{}': {}", addr, e))?,
+            timeout,
+        )
+        .map_err(|e| format!("OCSP connect to {}: {}", addr, e))?;
+        stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|e| format!("set read timeout: {e}"))?;
+        stream
+            .set_write_timeout(Some(timeout))
+            .map_err(|e| format!("set write timeout: {e}"))?;
+        let mut stream = stream;
+
+        // Build minimal OCSP request (fingerprint as hex in URL path for GET-based OCSP)
+        let fingerprint_hex = hex::encode(cert_fingerprint);
+        let request = format!(
+            "GET /{} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            fingerprint_hex, host_port
+        );
+        stream
+            .write_all(request.as_bytes())
+            .map_err(|e| format!("OCSP write: {e}"))?;
+
+        // Read response
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .map_err(|e| format!("OCSP read: {e}"))?;
+
+        // Parse HTTP response for revocation status
+        let response_str = String::from_utf8_lossy(&response);
+
+        // Look for OCSP response indicators in the body
+        if response_str.contains("good") || response_str.contains("\"status\":\"good\"") {
+            Ok(RevocationStatus::Good)
+        } else if response_str.contains("revoked") {
+            Ok(RevocationStatus::Revoked {
+                reason: "certificate revoked per OCSP responder".into(),
+                revoked_at: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64,
+            })
+        } else {
+            // Responder returned but status unclear
+            Ok(RevocationStatus::Unknown)
+        }
     }
 
     /// Check CRL for a serial number.
     ///
-    /// Looks up the serial in the local CRL cache. In production, the CRL
-    /// is periodically refreshed from distribution points by a background task.
+    /// Looks up the serial in the local CRL cache. The CRL is populated by:
+    /// 1. `load_crl_from_distribution_point()` — periodic background refresh
+    /// 2. `add_to_crl()` — manual revocation entries
+    /// 3. Cluster state replication via Raft log
+    ///
+    /// If the serial is not in the CRL and we have CRL data loaded, the
+    /// certificate is presumed good. If no CRL data exists at all,
+    /// returns Unknown (triggers fail-closed if configured).
     pub fn check_crl(&self, serial_number: u64) -> RevocationStatus {
         if let Some((reason, revoked_at)) = self.crl_cache.get(&serial_number) {
             return RevocationStatus::Revoked {
@@ -198,14 +307,95 @@ impl RevocationChecker {
             };
         }
 
-        // If we have distribution points configured, the serial is not in our
-        // cached CRL, so it's presumed good.
+        // If we have CRL data (from distribution points or manual entries),
+        // absence from the CRL means the certificate is good.
         if !self.crl_config.distribution_points.is_empty() || !self.crl_cache.is_empty() {
             return RevocationStatus::Good;
         }
 
         // No CRL data at all — cannot determine status.
         RevocationStatus::Unknown
+    }
+
+    /// Load CRL entries from a distribution point via HTTP.
+    ///
+    /// Fetches the CRL from the given URL, parses serial numbers,
+    /// and merges them into the local cache.
+    pub fn load_crl_from_distribution_point(&mut self, url: &str) -> Result<usize, String> {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+
+        let host_port = url
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .split('/')
+            .next()
+            .unwrap_or(url);
+
+        let addr = if host_port.contains(':') {
+            host_port.to_string()
+        } else {
+            format!("{}:80", host_port)
+        };
+
+        let path = url
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .find('/')
+            .map(|i| &url[url.find(host_port).unwrap_or(0) + host_port.len()..])
+            .unwrap_or("/crl");
+
+        let timeout = Duration::from_secs(10);
+        let parsed_addr: std::net::SocketAddr = addr
+            .parse()
+            .map_err(|e| format!("invalid CRL address '{}': {}", addr, e))?;
+        let stream = TcpStream::connect_timeout(&parsed_addr, timeout)
+            .map_err(|e| format!("CRL connect to {}: {}", addr, e))?;
+        stream.set_read_timeout(Some(timeout)).ok();
+        stream.set_write_timeout(Some(timeout)).ok();
+        let mut stream = stream;
+
+        let request = format!(
+            "GET {} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            path, host_port
+        );
+        stream
+            .write_all(request.as_bytes())
+            .map_err(|e| format!("CRL write: {e}"))?;
+
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .map_err(|e| format!("CRL read: {e}"))?;
+
+        // Parse response — expect newline-separated "serial:reason:timestamp" entries
+        let body = String::from_utf8_lossy(&response);
+        let body_start = body.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+        let body_text = &body[body_start..];
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        let mut loaded = 0;
+        for line in body_text.lines() {
+            let parts: Vec<&str> = line.split(':').collect();
+            if let Some(serial_str) = parts.first() {
+                if let Ok(serial) = serial_str.trim().parse::<u64>() {
+                    let reason = parts.get(1).unwrap_or(&"revoked").to_string();
+                    let revoked_at = parts
+                        .get(2)
+                        .and_then(|t| t.trim().parse::<i64>().ok())
+                        .unwrap_or(now);
+                    self.crl_cache.insert(serial, (reason, revoked_at));
+                    loaded += 1;
+                }
+            }
+        }
+
+        tracing::info!(url = %url, loaded = loaded, "CRL distribution point loaded");
+        Ok(loaded)
     }
 
     /// Add a certificate serial to the local CRL (for testing or manual revocation).

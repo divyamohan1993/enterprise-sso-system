@@ -232,25 +232,77 @@ pub struct DistributedRateLimiter {
 /// provide the atomic Lua script execution contract.
 pub struct RedisClient {
     url: String,
-    /// Simulated connection state. In production, replace with actual
-    /// `redis::aio::MultiplexedConnection`.
     connected: bool,
+    /// Raw TCP stream to Redis (RESP protocol).
+    stream: Option<tokio::net::TcpStream>,
 }
 
 impl RedisClient {
-    /// Attempt to connect to Redis.
+    /// Connect to Redis via raw TCP using RESP protocol.
+    /// No external Redis crate needed — we speak RESP directly.
     pub async fn connect(url: &str) -> Result<Self, String> {
-        // In production: redis::Client::open(url)?.get_multiplexed_async_connection().await
-        info!("connecting to Redis rate limit backend: {}", url);
-        Ok(Self {
+        use tokio::net::TcpStream;
+
+        // Parse redis://host:port or host:port
+        let addr = url
+            .trim_start_matches("redis://")
+            .trim_start_matches("rediss://")
+            .split('/')
+            .next()
+            .unwrap_or("127.0.0.1:6379");
+
+        info!("connecting to Redis rate limit backend: {}", addr);
+
+        let stream = TcpStream::connect(addr)
+            .await
+            .map_err(|e| format!("Redis connect to {}: {}", addr, e))?;
+
+        let mut client = Self {
             url: url.to_string(),
             connected: true,
-        })
+            stream: Some(stream),
+        };
+
+        // Verify connection with PING
+        client.ping().await?;
+        info!("Redis rate limit backend connected: {}", addr);
+
+        Ok(client)
     }
 
-    /// Execute the sliding window Lua script.
-    ///
-    /// In production, this calls `redis::Script::new(SLIDING_WINDOW_LUA).invoke_async()`.
+    /// Send a RESP command and read the response.
+    async fn resp_command(&mut self, args: &[&str]) -> Result<String, String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let stream = self.stream.as_mut().ok_or("Redis not connected")?;
+
+        // Build RESP array: *N\r\n$len\r\narg\r\n...
+        let mut cmd = format!("*{}\r\n", args.len());
+        for arg in args {
+            cmd.push_str(&format!("${}\r\n{}\r\n", arg.len(), arg));
+        }
+
+        stream
+            .write_all(cmd.as_bytes())
+            .await
+            .map_err(|e| format!("Redis write: {e}"))?;
+
+        // Read response (simple: read until we have a complete RESP value)
+        let mut buf = vec![0u8; 4096];
+        let n = stream
+            .read(&mut buf)
+            .await
+            .map_err(|e| format!("Redis read: {e}"))?;
+        if n == 0 {
+            self.connected = false;
+            return Err("Redis connection closed".into());
+        }
+
+        let response = String::from_utf8_lossy(&buf[..n]).to_string();
+        Ok(response)
+    }
+
+    /// Execute the sliding window rate limit check via EVAL.
     pub async fn sliding_window_check(
         &mut self,
         key: &str,
@@ -261,23 +313,38 @@ impl RedisClient {
         if !self.connected {
             return Err("Redis not connected".into());
         }
-        // Production implementation:
-        // let script = redis::Script::new(SLIDING_WINDOW_LUA);
-        // let result: (i64, i64, i64) = script
-        //     .key(key)
-        //     .arg(now_ms)
-        //     .arg(window_ms)
-        //     .arg(limit)
-        //     .invoke_async(&mut self.connection)
-        //     .await
-        //     .map_err(|e| format!("Redis script error: {e}"))?;
-        // Ok((result.0 == 1, result.1 as u64, result.2 as u64))
 
-        // Stub: always fall through to local limiter
-        Err("Redis client stub — falling back to local".into())
+        let now_str = now_ms.to_string();
+        let window_str = window_ms.to_string();
+        let limit_str = limit.to_string();
+
+        let response = self
+            .resp_command(&[
+                "EVAL",
+                SLIDING_WINDOW_LUA,
+                "1",
+                key,
+                &now_str,
+                &window_str,
+                &limit_str,
+            ])
+            .await?;
+
+        // Parse RESP array response: *3\r\n:allowed\r\n:count\r\n:remaining\r\n
+        let values: Vec<i64> = response
+            .lines()
+            .filter(|l| l.starts_with(':'))
+            .filter_map(|l| l[1..].trim().parse().ok())
+            .collect();
+
+        if values.len() >= 3 {
+            Ok((values[0] == 1, values[1] as u64, values[2] as u64))
+        } else {
+            Err(format!("unexpected Redis response: {}", response.trim()))
+        }
     }
 
-    /// Execute the token bucket Lua script.
+    /// Execute the token bucket rate limit check via EVAL.
     pub async fn token_bucket_check(
         &mut self,
         key: &str,
@@ -289,17 +356,46 @@ impl RedisClient {
         if !self.connected {
             return Err("Redis not connected".into());
         }
-        // Production implementation uses TOKEN_BUCKET_LUA
-        Err("Redis client stub — falling back to local".into())
+
+        let now_str = now_secs.to_string();
+        let burst_str = burst.to_string();
+        let rate_str = rate.to_string();
+        let consume_str = consume.to_string();
+
+        let response = self
+            .resp_command(&[
+                "EVAL",
+                TOKEN_BUCKET_LUA,
+                "1",
+                key,
+                &now_str,
+                &burst_str,
+                &rate_str,
+                &consume_str,
+            ])
+            .await?;
+
+        let values: Vec<i64> = response
+            .lines()
+            .filter(|l| l.starts_with(':'))
+            .filter_map(|l| l[1..].trim().parse().ok())
+            .collect();
+
+        if values.len() >= 2 {
+            Ok((values[0] == 1, values[1] as u64))
+        } else {
+            Err(format!("unexpected Redis response: {}", response.trim()))
+        }
     }
 
-    /// Health check ping.
+    /// Health check ping — sends PING, expects +PONG.
     pub async fn ping(&mut self) -> Result<(), String> {
-        if !self.connected {
-            return Err("Redis not connected".into());
+        let response = self.resp_command(&["PING"]).await?;
+        if response.contains("PONG") {
+            Ok(())
+        } else {
+            Err(format!("Redis PING failed: {}", response.trim()))
         }
-        // Production: redis::cmd("PING").query_async(&mut self.connection).await
-        Ok(())
     }
 }
 
