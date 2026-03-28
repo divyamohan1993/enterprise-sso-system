@@ -82,33 +82,33 @@ fn gf256_add(a: u8, b: u8) -> u8 {
 /// Log table for GF(256) with generator 0x03 and polynomial 0x11b.
 /// GF256_LOG[x] = discrete logarithm of x base 0x03, for x in 1..=255.
 /// GF256_LOG[0] is unused (0 has no logarithm).
+/// Generator 0x03 has order 255 and is primitive for this field.
 const GF256_LOG: [u8; 256] = {
     let mut log = [0u8; 256];
-    let mut exp = [0u8; 256];
     let mut val: u16 = 1;
     let mut i = 0u16;
     while i < 255 {
-        exp[i as usize] = val as u8;
         log[val as usize] = i as u8;
-        val = (val << 1) ^ (if val & 0x80 != 0 { 0x11b } else { 0 });
-        val &= 0xFF;
+        // Multiply val by 0x03 in GF(256): val * 3 = val XOR (val * 2)
+        let val2 = (val << 1) ^ (if val & 0x80 != 0 { 0x11b } else { 0 });
+        val = (val ^ val2) & 0xFF;
         i += 1;
     }
-    // suppress unused-variable warning for exp inside const block
-    let _ = exp;
     log
 };
 
 /// Exp (antilog) table for GF(256) — 512 entries for modular reduction without branching.
 /// GF256_EXP[i] = 0x03^i for i in 0..255, duplicated for i in 255..510.
+/// The duplication avoids a modular reduction branch in ct_gf256_mul.
 const GF256_EXP: [u8; 512] = {
     let mut exp = [0u8; 512];
     let mut val: u16 = 1;
     let mut i = 0u16;
     while i < 255 {
         exp[i as usize] = val as u8;
-        val = (val << 1) ^ (if val & 0x80 != 0 { 0x11b } else { 0 });
-        val &= 0xFF;
+        // Multiply val by 0x03 in GF(256): val * 3 = val XOR (val * 2)
+        let val2 = (val << 1) ^ (if val & 0x80 != 0 { 0x11b } else { 0 });
+        val = (val ^ val2) & 0xFF;
         i += 1;
     }
     let mut j = 0u16;
