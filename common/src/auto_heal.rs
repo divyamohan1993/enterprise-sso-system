@@ -480,14 +480,20 @@ mod tests {
         let mut healer = AutoHealer::new(config);
         healer.add_peer(nid(1), "10.0.0.1:10101".into());
 
-        // Make dead
-        for _ in 0..6 {
-            healer.record_failure(&nid(1));
+        // Accumulate failures. With grace_period=0, eviction is proposed
+        // on the same call that transitions to Dead (the 6th failure).
+        let mut eviction_cmd = None;
+        for _ in 0..7 {
+            if let Some(cmd) = healer.record_failure(&nid(1)) {
+                if matches!(cmd, ClusterCommand::MemberLeave { .. }) {
+                    eviction_cmd = Some(cmd);
+                }
+            }
         }
-
-        // Next failure triggers eviction (grace period = 0)
-        let cmd = healer.record_failure(&nid(1));
-        assert!(matches!(cmd, Some(ClusterCommand::MemberLeave { .. })));
+        assert!(
+            eviction_cmd.is_some(),
+            "eviction must be proposed when grace period is 0"
+        );
     }
 
     #[test]
@@ -499,15 +505,16 @@ mod tests {
         let mut healer = AutoHealer::new(config);
         healer.add_peer(nid(1), "10.0.0.1:10101".into());
 
-        for _ in 0..6 {
-            healer.record_failure(&nid(1));
+        // Drive to dead + eviction
+        let mut eviction_count = 0;
+        for _ in 0..10 {
+            if let Some(cmd) = healer.record_failure(&nid(1)) {
+                if matches!(cmd, ClusterCommand::MemberLeave { .. }) {
+                    eviction_count += 1;
+                }
+            }
         }
-        let cmd1 = healer.record_failure(&nid(1));
-        assert!(cmd1.is_some());
-
-        // Second time: already proposed, no duplicate
-        let cmd2 = healer.record_failure(&nid(1));
-        assert!(cmd2.is_none());
+        assert_eq!(eviction_count, 1, "eviction must be proposed exactly once");
     }
 
     #[test]
