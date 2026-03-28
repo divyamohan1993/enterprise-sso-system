@@ -38,12 +38,12 @@ checks:
   - category: Kernel
     id: KERNEL-007
     severity: CatII
-    status: Pass
+    status: Fail
     title: Core dump pattern (kernel.core_pattern)
   - category: Kernel
     id: KERNEL-008
     severity: CatII
-    status: Fail
+    status: Pass
     title: SUID core dump disabled (fs.suid_dumpable)
   - category: Kernel
     id: KERNEL-009
