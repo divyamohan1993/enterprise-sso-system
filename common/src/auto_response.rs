@@ -270,6 +270,7 @@ impl AutoResponsePipeline {
         let mut commands = Vec::new();
         let mut to_exclude: Vec<(NodeId, String)> = Vec::new();
         let mut to_remove: Vec<NodeId> = Vec::new();
+        let mut needs_key_rotation: Vec<NodeId> = Vec::new();
 
         for node_id in node_ids {
             let timeline = match self.timelines.get_mut(&node_id) {
@@ -287,14 +288,9 @@ impl AutoResponsePipeline {
                         timeline.current_phase = ResponsePhase::RotatingKeys;
                         timeline.phase_entered_at = now;
 
-                        // Rotate keys if enabled
+                        // Mark for key rotation (done after loop to avoid double borrow)
                         if config.rotate_keys_on_quarantine {
-                            let keys_rotated = self.rotate_keys_for_node(&node_id);
-                            timeline.keys_rotated = keys_rotated;
-                            new_events.push(ResponseEvent::KeysRotated {
-                                node_id,
-                                keys_rotated,
-                            });
+                            needs_key_rotation.push(node_id);
                         }
 
                         // Immediately transition to forensics capture
@@ -374,11 +370,6 @@ impl AutoResponsePipeline {
                                     timeline.verification_started_at = None;
                                     timeline.last_suspicion_score = None;
 
-                                    // Reset quarantine state for another healing round
-                                    if let Some(record) = self.quarantine.quarantine_manager_record_mut(&node_id) {
-                                        // This is handled internally -- we just emit the event
-                                    }
-
                                     new_events.push(ResponseEvent::HealingStarted {
                                         node_id,
                                         attempt: timeline.heal_attempts,
@@ -398,6 +389,18 @@ impl AutoResponsePipeline {
                     // Terminal failure state -- nothing to do
                 }
             }
+        }
+
+        // Process key rotations (deferred to avoid double borrow in main loop)
+        for node_id in needs_key_rotation {
+            let keys_rotated = self.rotate_keys_for_node(&node_id);
+            if let Some(timeline) = self.timelines.get_mut(&node_id) {
+                timeline.keys_rotated = keys_rotated;
+            }
+            new_events.push(ResponseEvent::KeysRotated {
+                node_id,
+                keys_rotated,
+            });
         }
 
         // Process exclusions
@@ -617,24 +620,6 @@ impl AutoResponsePipeline {
             timeline.current_phase = ResponsePhase::Excluded;
             timeline.phase_entered_at = Instant::now();
         }
-    }
-}
-
-/// Helper: The QuarantineManager does not expose mutable record access, so we
-/// use a no-op adapter here. The quarantine state transitions are managed
-/// through the public API of QuarantineManager.
-impl QuarantineManager {
-    /// Internal helper for auto_response -- does not exist in quarantine.rs,
-    /// so we provide a stub that returns None. The actual state management
-    /// goes through the public begin_healing / healing_complete API.
-    #[doc(hidden)]
-    fn quarantine_manager_record_mut(
-        &mut self,
-        _node_id: &NodeId,
-    ) -> Option<&mut crate::quarantine::QuarantineRecord> {
-        // We do not expose direct record mutation. The auto_response pipeline
-        // drives state transitions through the QuarantineManager public API.
-        None
     }
 }
 
