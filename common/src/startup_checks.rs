@@ -6,8 +6,8 @@
 //! 3. Self-attestation: SHA-512(/proc/self/exe) + boot_id logging
 //! 4. Start background integrity monitor (re-hash binary + tracer check)
 //!
-//! In production mode (`MILNET_PRODUCTION` set), failed checks are FATAL.
-//! In dev mode, they produce warnings.
+//! vTPM absence is FATAL in ALL modes (use swtpm for development).
+//! Other checks are fatal in production (`MILNET_PRODUCTION` set); warnings in dev.
 
 use crate::measured_boot::BootAttestation;
 use crate::platform_integrity::{self, RuntimeIntegrityMonitor, TpmInfo};
@@ -50,8 +50,9 @@ pub struct PlatformAttestationReport {
 /// `crypto::memguard::harden_process()`). It must return `true` on success.
 /// This indirection avoids a circular dependency (common cannot depend on crypto).
 ///
-/// In production mode (`MILNET_PRODUCTION` set), any critical failure
-/// causes an immediate panic. In dev mode, failures are logged as warnings.
+/// vTPM absence is fatal in ALL modes (use swtpm for development).
+/// In production mode (`MILNET_PRODUCTION` set), all critical failures cause
+/// an immediate panic. In dev mode, non-vTPM failures are logged as warnings.
 ///
 /// Returns:
 /// - `PlatformAttestationReport` with results of all checks
@@ -59,8 +60,8 @@ pub struct PlatformAttestationReport {
 /// - `Arc<RuntimeIntegrityMonitor>` for querying violation counts
 ///
 /// # Panics
-/// In production mode, panics if:
-/// - vTPM is not available
+/// Always panics if vTPM is not available.
+/// In production mode, also panics if:
 /// - Process hardening fails
 pub fn run_platform_checks<F: FnOnce() -> bool>(harden_fn: F) -> (
     PlatformAttestationReport,
@@ -90,11 +91,19 @@ pub fn run_platform_checks<F: FnOnce() -> bool>(harden_fn: F) -> (
                          Production deployment requires vTPM 2.0."
                     );
                 }
-                tracing::warn!(
-                    "platform check [1/4]: vTPM not available (dev mode — continuing)"
+                // vTPM is REQUIRED in all deployment modes — no exceptions.
+                // Even in development, we require a vTPM (or swtpm emulator)
+                // to ensure code paths are exercised and key sealing works.
+                //
+                // For development without hardware vTPM, install swtpm:
+                //   apt install swtpm swtpm-tools
+                //   mkdir -p /tmp/tpm && swtpm socket --tpmstate dir=/tmp/tpm --tpm2 --ctrl type=unixio,path=/tmp/tpm/sock
+                panic!(
+                    "FATAL: vTPM not available (/dev/tpmrm0, /dev/tpm0). \
+                     A vTPM 2.0 is required in ALL deployment modes. \
+                     For development, use swtpm (software TPM emulator). \
+                     See: https://github.com/stefanberger/swtpm"
                 );
-                summary_parts.push("vTPM=ABSENT(dev)".to_string());
-                all_passed = false;
             }
             info
         }
