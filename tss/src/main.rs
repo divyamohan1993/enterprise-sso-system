@@ -88,6 +88,7 @@ async fn main() {
             );
             match common::cluster::ClusterNode::start(config).await {
                 Ok(node) => {
+                    let node = std::sync::Arc::new(node);
                     let mut watcher = node.leader_watch();
                     tokio::spawn(async move {
                         while watcher.changed().await.is_ok() {
@@ -106,6 +107,11 @@ async fn main() {
         }
         Err(_) => None,
     };
+
+    // Wire auto-response pipeline to Raft for distributed quarantine enforcement
+    if let Some(ref c) = cluster {
+        _defense.connect_to_cluster(c.clone());
+    }
 
     // --- Role-based dispatch ---
     match std::env::var("MILNET_TSS_ROLE").ok().as_deref() {

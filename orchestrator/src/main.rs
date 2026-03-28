@@ -89,7 +89,7 @@ async fn main() {
                 "starting orchestrator cluster node"
             );
             match common::cluster::ClusterNode::start(config).await {
-                Ok(node) => Some(node),
+                Ok(node) => Some(std::sync::Arc::new(node)),
                 Err(e) => {
                     tracing::warn!("cluster start failed (running standalone): {e}");
                     None
@@ -101,6 +101,11 @@ async fn main() {
             None
         }
     };
+
+    // Wire auto-response pipeline to Raft for distributed quarantine enforcement
+    if let Some(ref c) = cluster {
+        _defense.connect_to_cluster(c.clone());
+    }
 
     // If clustered, log leader election result
     if let Some(ref c) = cluster {
