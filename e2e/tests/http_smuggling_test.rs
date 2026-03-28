@@ -263,7 +263,7 @@ fn test_shard_protocol_message_roundtrip() {
     );
     assert_eq!(
         decoded.as_bytes(),
-        payload.as_ref(),
+        payload.as_slice(),
         "decoded payload must exactly match original '{}'; \
          got '{}' ({} bytes)",
         String::from_utf8_lossy(payload),
@@ -279,9 +279,10 @@ fn test_shard_protocol_message_roundtrip() {
         let (_, body) = receiver
             .verify_message(&pkt)
             .expect("subsequent message must be accepted");
+        let expected = format!("msg-{}", i);
         assert_eq!(
             body.as_bytes(),
-            format!("msg-{}", i).as_bytes(),
+            expected.as_bytes(),
             "payload for message {} must match; got: '{}'",
             i,
             String::from_utf8_lossy(body.as_bytes())
