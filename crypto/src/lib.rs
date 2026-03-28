@@ -20,6 +20,7 @@ pub mod dpop;
 pub mod entropy;
 pub mod receipts;
 pub mod threshold;
+pub mod pedersen_dkg;
 pub mod pq_sign;
 #[allow(unsafe_code)]
 pub mod xwing;
