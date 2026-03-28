@@ -95,6 +95,8 @@ pub mod raft;
 pub mod cluster;
 pub mod cluster_roles;
 pub mod auto_heal;
+pub mod binary_attestation_mesh;
+pub mod code_healing;
 
 // ── Privileged Identity Management (just-in-time elevation) ──
 pub mod pim;

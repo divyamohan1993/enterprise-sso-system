@@ -1,0 +1,197 @@
+# MILNET SSO System — Pod Disruption Budgets
+# Ensures minimum availability during voluntary disruptions (node drain, upgrades).
+# Each PDB is tuned to the service's quorum or threshold requirements.
+---
+
+# Orchestrator: Raft requires majority (2 of 3). Allow max 1 unavailable.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: orchestrator-pdb
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: orchestrator
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: orchestrator
+
+---
+# Gateway: keep at least 2 of 3 running for capacity.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: gateway-pdb
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gateway
+
+---
+# OPAQUE: threshold 2-of-3 requires at least 2 available.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: opaque-pdb
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: opaque
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: opaque
+
+---
+# TSS Coordinator: Raft requires majority (2 of 3).
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: tss-coordinator-pdb
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: tss-coordinator
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tss-coordinator
+
+---
+# TSS Signer: FROST 3-of-5 threshold. Need at least 3 of 5 alive.
+# Allow max 2 unavailable.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: tss-signer-pdb
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: tss-signer
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  minAvailable: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tss-signer
+
+---
+# Verifier: stateless, keep at least 2 of 3 for capacity.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: verifier-pdb
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: verifier
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: verifier
+
+---
+# Ratchet: stateful (DB-backed), allow max 1 unavailable.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ratchet-pdb
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: ratchet
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ratchet
+
+---
+# Risk: stateless, keep at least 2 of 3.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: risk-pdb
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: risk
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: risk
+
+---
+# Audit: BFT with 7 nodes, tolerates f=2 Byzantine faults.
+# Must keep at least 5 (n - f = 7 - 2) available.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: audit-pdb
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: audit
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  minAvailable: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: audit
+
+---
+# KT: Merkle tree with persistence, allow max 1 unavailable.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: kt-pdb
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: kt
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kt
+
+---
+# PostgreSQL: 1 primary + 2 replicas. Never disrupt more than 1 at a time.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: postgres-pdb
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+
+---
+# Admin: 2 replicas, keep at least 1 available.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: admin-pdb
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: admin
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: admin

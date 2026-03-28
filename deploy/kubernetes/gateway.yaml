@@ -1,0 +1,130 @@
+# MILNET SSO System — Gateway Deployment
+# Public-facing TLS termination gateway. Stateless, so Deployment (not StatefulSet).
+# LoadBalancer service provides external ingress with MILNET_MILITARY_DEPLOYMENT=1.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/part-of: milnet-sso
+    app.kubernetes.io/component: ingress-gateway
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gateway
+        app.kubernetes.io/part-of: milnet-sso
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app.kubernetes.io/name
+                    operator: In
+                    values:
+                      - gateway
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: gateway
+          image: gcr.io/MILNET_PROJECT/milnet-sso:latest
+          ports:
+            - containerPort: 9100
+              name: service
+              protocol: TCP
+            - containerPort: 10100
+              name: health
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          envFrom:
+            - configMapRef:
+                name: milnet-common-config
+          env:
+            - name: GATEWAY_BIND_ADDR
+              value: "0.0.0.0:9100"
+            - name: MILNET_GATEWAY_CERT_PATH
+              value: "/etc/milnet/tls/tls.crt"
+            - name: MILNET_GATEWAY_KEY_PATH
+              value: "/etc/milnet/tls/tls.key"
+            - name: MILNET_GATEWAY_KEY_PINS
+              valueFrom:
+                secretKeyRef:
+                  name: milnet-gateway-config
+                  key: MILNET_GATEWAY_KEY_PINS
+            - name: MILNET_RATE_LIMIT_REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: milnet-gateway-config
+                  key: MILNET_RATE_LIMIT_REDIS_URL
+            - name: MILNET_MASTER_KEK
+              valueFrom:
+                secretKeyRef:
+                  name: milnet-master-kek
+                  key: MILNET_MASTER_KEK
+            # Orchestrator endpoint (load-balanced via K8s service)
+            - name: MILNET_ORCHESTRATOR_ENDPOINTS
+              value: "orchestrator.milnet.svc.cluster.local:9101"
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - IPC_LOCK
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          volumeMounts:
+            - name: tls-certs
+              mountPath: /etc/milnet/tls
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tls-certs
+          secret:
+            secretName: milnet-tls-certs
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi

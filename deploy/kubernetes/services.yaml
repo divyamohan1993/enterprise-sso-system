@@ -1,0 +1,352 @@
+# MILNET SSO System — Service Resources
+# Headless services for StatefulSets (stable DNS), ClusterIP for Deployments,
+# LoadBalancer for gateway (public-facing).
+---
+
+# ── Gateway LoadBalancer (external ingress) ────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/part-of: milnet-sso
+  annotations:
+    # GCP-specific: restrict to internal load balancer if desired
+    # networking.gke.io/load-balancer-type: "Internal"
+    cloud.google.com/neg: '{"ingress": true}'
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: gateway
+  ports:
+    - name: https
+      port: 443
+      targetPort: 9100
+      protocol: TCP
+    - name: health
+      port: 10100
+      targetPort: 10100
+      protocol: TCP
+  externalTrafficPolicy: Local
+  # Preserve client source IP for rate limiting
+  sessionAffinity: None
+
+---
+# ── Orchestrator Headless Service (Raft peer discovery) ───────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: orchestrator
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: orchestrator
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: orchestrator
+  ports:
+    - name: service
+      port: 9101
+      targetPort: 9101
+      protocol: TCP
+    - name: raft
+      port: 9090
+      targetPort: 9090
+      protocol: TCP
+    - name: health
+      port: 10101
+      targetPort: 10101
+      protocol: TCP
+  publishNotReadyAddresses: true
+
+---
+# ── OPAQUE Headless Service (threshold peer communication) ────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: opaque
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: opaque
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: opaque
+  ports:
+    - name: service
+      port: 9102
+      targetPort: 9102
+      protocol: TCP
+    - name: health
+      port: 10102
+      targetPort: 10102
+      protocol: TCP
+  publishNotReadyAddresses: true
+
+---
+# ── TSS Coordinator Headless Service (Raft peer discovery) ────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: tss-coordinator
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: tss-coordinator
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: tss-coordinator
+  ports:
+    - name: service
+      port: 9103
+      targetPort: 9103
+      protocol: TCP
+    - name: raft
+      port: 9090
+      targetPort: 9090
+      protocol: TCP
+    - name: health
+      port: 10103
+      targetPort: 10103
+      protocol: TCP
+  publishNotReadyAddresses: true
+
+---
+# ── TSS Signer Headless Service (stable per-pod DNS) ─────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: tss-signer
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: tss-signer
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: tss-signer
+  ports:
+    - name: signer-0
+      port: 9110
+      targetPort: 9110
+      protocol: TCP
+    - name: signer-1
+      port: 9111
+      targetPort: 9111
+      protocol: TCP
+    - name: signer-2
+      port: 9112
+      targetPort: 9112
+      protocol: TCP
+    - name: signer-3
+      port: 9113
+      targetPort: 9113
+      protocol: TCP
+    - name: signer-4
+      port: 9114
+      targetPort: 9114
+      protocol: TCP
+  publishNotReadyAddresses: true
+
+---
+# ── Verifier ClusterIP Service ────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: verifier
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: verifier
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: verifier
+  ports:
+    - name: service
+      port: 9104
+      targetPort: 9104
+      protocol: TCP
+    - name: health
+      port: 10104
+      targetPort: 10104
+      protocol: TCP
+
+---
+# ── Ratchet Headless Service ──────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: ratchet
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: ratchet
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: ratchet
+  ports:
+    - name: service
+      port: 9105
+      targetPort: 9105
+      protocol: TCP
+    - name: health
+      port: 10105
+      targetPort: 10105
+      protocol: TCP
+  publishNotReadyAddresses: true
+
+---
+# ── Risk ClusterIP Service ────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: risk
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: risk
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: risk
+  ports:
+    - name: service
+      port: 9106
+      targetPort: 9106
+      protocol: TCP
+    - name: health
+      port: 10106
+      targetPort: 10106
+      protocol: TCP
+
+---
+# ── Audit Headless Service (BFT peer communication) ──────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: audit
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: audit
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: audit
+  ports:
+    - name: service
+      port: 9108
+      targetPort: 9108
+      protocol: TCP
+    - name: health
+      port: 10108
+      targetPort: 10108
+      protocol: TCP
+  publishNotReadyAddresses: true
+
+---
+# ── KT Headless Service (Merkle tree replication) ────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: kt
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: kt
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: kt
+  ports:
+    - name: service
+      port: 9109
+      targetPort: 9109
+      protocol: TCP
+    - name: health
+      port: 10109
+      targetPort: 10109
+      protocol: TCP
+  publishNotReadyAddresses: true
+
+---
+# ── Admin ClusterIP Service (internal only) ───────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: admin
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: admin
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: admin
+  ports:
+    - name: service
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+    - name: health
+      port: 9080
+      targetPort: 9080
+      protocol: TCP
+
+---
+# ── PostgreSQL Service ────────────────────────────────────────────────────────
+# Non-headless service for read/write (routes to primary).
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: postgres
+    role: primary
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+      protocol: TCP
+
+---
+# Headless service for PostgreSQL StatefulSet DNS
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-headless
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+      protocol: TCP
+  publishNotReadyAddresses: true

@@ -1,0 +1,65 @@
+# MILNET SSO System — Shared Configuration
+# Non-secret environment variables shared across all services.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: milnet-common-config
+  namespace: milnet
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+data:
+  # ── Production mode ──────────────────────────────────────────────────────────
+  MILNET_PRODUCTION: "1"
+  MILNET_MILITARY_DEPLOYMENT: "1"
+  MILNET_FIPS_MODE: "1"
+  MILNET_PQ_TLS_ONLY: "1"
+
+  # ── Service discovery (K8s DNS) ──────────────────────────────────────────────
+  # Orchestrator uses headless service DNS for Raft peers
+  OPAQUE_ADDR: "opaque.milnet.svc.cluster.local:9102"
+  TSS_ADDR: "tss-coordinator.milnet.svc.cluster.local:9103"
+  VERIFIER_ADDR: "verifier.milnet.svc.cluster.local:9104"
+  RATCHET_ADDR: "ratchet.milnet.svc.cluster.local:9105"
+  RISK_ADDR: "risk.milnet.svc.cluster.local:9106"
+  AUDIT_ADDR: "audit.milnet.svc.cluster.local:9108"
+  KT_ADDR: "kt.milnet.svc.cluster.local:9109"
+
+  # ── TLS / Certificate rotation ───────────────────────────────────────────────
+  MILNET_CERT_LIFETIME_HOURS: "720"
+  MILNET_CERT_ROTATION_THRESHOLD: "0.8"
+
+  # ── Rate limiting ────────────────────────────────────────────────────────────
+  MILNET_RATE_LIMIT_PER_IP: "100"
+  MILNET_RATE_LIMIT_PER_USER: "50"
+  MILNET_RATE_LIMIT_WINDOW_SECS: "60"
+  MILNET_RATE_LIMIT_BURST: "20"
+
+  # ── TSS configuration ───────────────────────────────────────────────────────
+  MILNET_TSS_THRESHOLD: "3"
+  MILNET_TSS_MODE: "distributed"
+  MILNET_TSS_SIGNING_TIMEOUT_SECS: "10"
+
+  # ── OPAQUE configuration ────────────────────────────────────────────────────
+  MILNET_OPAQUE_MODE: "threshold"
+
+  # ── Adaptive crypto ─────────────────────────────────────────────────────────
+  MILNET_ADAPTIVE_DEBOUNCE_SECS: "10"
+
+  # ── Health checks ───────────────────────────────────────────────────────────
+  # Health port = service port + 1000 (convention used by the binary)
+  # e.g., gateway:9100 -> health:10100
+
+  # ── Audit persistence ───────────────────────────────────────────────────────
+  AUDIT_DATA_DIR: "/var/lib/milnet/audit"
+
+  # ── TSS nonce state ─────────────────────────────────────────────────────────
+  MILNET_TSS_NONCE_STATE_PATH: "/var/lib/milnet/tss_nonce_state"
+
+  # ── SIEM integration (optional) ─────────────────────────────────────────────
+  MILNET_SIEM_BATCH_SIZE: "25"
+  MILNET_SIEM_FLUSH_INTERVAL_SECS: "60"
+  MILNET_SIEM_ENABLED: "true"
+
+  # ── Logging ──────────────────────────────────────────────────────────────────
+  RUST_LOG: "info,milnet=debug"

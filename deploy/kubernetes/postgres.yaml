@@ -1,0 +1,212 @@
+# MILNET SSO System — PostgreSQL StatefulSet
+# 3 replicas: 1 primary + 2 streaming replicas for HA.
+# Uses PVCs for durable storage with encrypted SSDs.
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: milnet-sso
+    app.kubernetes.io/component: database
+spec:
+  serviceName: postgres-headless
+  replicas: 3
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/part-of: milnet-sso
+    spec:
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999       # postgres user
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app.kubernetes.io/name
+                    operator: In
+                    values:
+                      - postgres
+              topologyKey: kubernetes.io/hostname
+      initContainers:
+        # Determine role: pod ordinal 0 = primary, others = replica
+        - name: init-role
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              ORDINAL=$(echo $HOSTNAME | rev | cut -d'-' -f1 | rev)
+              if [ "$ORDINAL" = "0" ]; then
+                echo "primary" > /etc/postgres/role
+              else
+                echo "replica" > /etc/postgres/role
+              fi
+          volumeMounts:
+            - name: role-config
+              mountPath: /etc/postgres
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+      containers:
+        - name: postgres
+          image: postgres:16-bookworm
+          ports:
+            - containerPort: 5432
+              name: postgres
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          env:
+            - name: POSTGRES_DB
+              value: "milnet_sso"
+            - name: POSTGRES_USER
+              value: "milnet"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: milnet-database
+                  key: POSTGRES_PASSWORD
+            - name: PGDATA
+              value: "/var/lib/postgresql/data/pgdata"
+            # Streaming replication configuration
+            - name: POSTGRES_REPLICATION_USER
+              value: "replicator"
+            - name: POSTGRES_REPLICATION_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: milnet-database
+                  key: POSTGRES_REPLICATION_PASSWORD
+            # Primary address for replicas to connect to
+            - name: PRIMARY_HOST
+              value: "postgres-0.postgres-headless.milnet.svc.cluster.local"
+          # Custom entrypoint that configures replication based on role
+          command:
+            - bash
+            - -c
+            - |
+              ROLE=$(cat /etc/postgres/role)
+              if [ "$ROLE" = "primary" ]; then
+                # Primary: enable WAL streaming
+                cat >> /tmp/extra.conf << 'CONF'
+              wal_level = replica
+              max_wal_senders = 5
+              wal_keep_size = 256MB
+              synchronous_standby_names = '*'
+              ssl = on
+              ssl_cert_file = '/etc/milnet/tls/tls.crt'
+              ssl_key_file = '/etc/milnet/tls/tls.key'
+              max_connections = 200
+              shared_buffers = 1GB
+              effective_cache_size = 2GB
+              work_mem = 16MB
+              maintenance_work_mem = 256MB
+              CONF
+                # Create replication user via init script
+                mkdir -p /docker-entrypoint-initdb.d
+                cat > /docker-entrypoint-initdb.d/01-replication.sql << SQL
+              CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD '${POSTGRES_REPLICATION_PASSWORD}';
+              SQL
+                # Write pg_hba.conf entries for replication
+                cat >> /tmp/pg_hba_extra.conf << 'HBA'
+              host replication replicator 10.0.0.0/8 md5
+              host replication replicator 172.16.0.0/12 md5
+              hostssl all all 0.0.0.0/0 md5
+              HBA
+                exec docker-entrypoint.sh postgres \
+                  -c "include=/tmp/extra.conf" \
+                  -c "hba_file=/tmp/pg_hba_extra.conf"
+              else
+                # Replica: connect to primary for streaming replication
+                rm -rf "$PGDATA"
+                PGPASSWORD="$POSTGRES_REPLICATION_PASSWORD" pg_basebackup \
+                  -h "$PRIMARY_HOST" -U replicator -D "$PGDATA" -Fp -Xs -P -R
+                # Start in replica mode
+                exec postgres -D "$PGDATA" \
+                  -c "primary_conninfo=host=${PRIMARY_HOST} port=5432 user=replicator password=${POSTGRES_REPLICATION_PASSWORD}" \
+                  -c "hot_standby=on" \
+                  -c "max_connections=200" \
+                  -c "shared_buffers=1GB"
+              fi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - milnet
+                - -d
+                - milnet_sso
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - milnet
+                - -d
+                - milnet_sso
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: role-config
+              mountPath: /etc/postgres
+              readOnly: true
+            - name: tls-certs
+              mountPath: /etc/milnet/tls
+              readOnly: true
+      volumes:
+        - name: role-config
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        - name: tls-certs
+          secret:
+            secretName: milnet-tls-certs
+            defaultMode: 0640
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: postgres
+          app.kubernetes.io/part-of: milnet-sso
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: ssd-encrypted
+        resources:
+          requests:
+            storage: 50Gi

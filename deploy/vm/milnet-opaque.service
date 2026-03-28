@@ -1,0 +1,63 @@
+# MILNET SSO System — OPAQUE T-OPAQUE Password Service systemd unit
+# Threshold 2-of-3 OPAQUE protocol. Each instance holds one sealed share.
+
+[Unit]
+Description=MILNET SSO OPAQUE Password Service
+Documentation=https://github.com/milnet/enterprise-sso-system
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=milnet
+Group=milnet
+ExecStart=/opt/milnet/bin/opaque
+Restart=always
+RestartSec=3
+TimeoutStartSec=30
+TimeoutStopSec=15
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Environment configuration
+EnvironmentFile=/etc/milnet/env/opaque.env
+
+# Resource limits
+MemoryMax=2G
+CPUQuota=100%
+TasksMax=256
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+
+# Security hardening
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ReadOnlyPaths=/etc/milnet
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=milnet-opaque
+
+[Install]
+WantedBy=multi-user.target

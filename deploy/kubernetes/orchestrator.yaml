@@ -1,0 +1,152 @@
+# MILNET SSO System — Orchestrator StatefulSet
+# Auth orchestrator with Raft leader election. Requires stable pod identity
+# for cluster peer discovery via headless service DNS.
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: orchestrator
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: orchestrator
+    app.kubernetes.io/part-of: milnet-sso
+    app.kubernetes.io/component: auth-orchestrator
+spec:
+  serviceName: orchestrator
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: orchestrator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: orchestrator
+        app.kubernetes.io/part-of: milnet-sso
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app.kubernetes.io/name
+                    operator: In
+                    values:
+                      - orchestrator
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: orchestrator
+          image: gcr.io/MILNET_PROJECT/milnet-sso:latest
+          args: []
+          ports:
+            - containerPort: 9101
+              name: service
+              protocol: TCP
+            - containerPort: 9090
+              name: raft
+              protocol: TCP
+            - containerPort: 10101
+              name: health
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          envFrom:
+            - configMapRef:
+                name: milnet-common-config
+          env:
+            # Node ID derived from pod name (orchestrator-0, orchestrator-1, orchestrator-2)
+            - name: MILNET_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: MILNET_SERVICE_TYPE
+              value: "orchestrator"
+            - name: ORCH_LISTEN_ADDR
+              value: "0.0.0.0:9101"
+            - name: MILNET_SERVICE_ADDR
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: MILNET_RAFT_ADDR
+              value: "$(MILNET_SERVICE_ADDR):9090"
+            # Raft cluster peers using stable headless service DNS
+            - name: MILNET_CLUSTER_PEERS
+              value: >-
+                orchestrator-0.orchestrator.milnet.svc.cluster.local:9090,
+                orchestrator-1.orchestrator.milnet.svc.cluster.local:9090,
+                orchestrator-2.orchestrator.milnet.svc.cluster.local:9090
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: milnet-database
+                  key: DATABASE_URL
+            - name: MILNET_MASTER_KEK
+              valueFrom:
+                secretKeyRef:
+                  name: milnet-master-kek
+                  key: MILNET_MASTER_KEK
+          envFrom:
+            - configMapRef:
+                name: milnet-common-config
+            - secretRef:
+                name: milnet-hsm-config
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - IPC_LOCK  # Required for mlock (key material protection)
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/milnet
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+        labels:
+          app.kubernetes.io/name: orchestrator
+          app.kubernetes.io/part-of: milnet-sso
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: ssd-encrypted
+        resources:
+          requests:
+            storage: 10Gi

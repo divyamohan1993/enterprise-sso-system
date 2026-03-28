@@ -1,0 +1,16 @@
+# MILNET SSO System — Kubernetes Namespace
+# Isolates all MILNET workloads with security labels for NetworkPolicy enforcement.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: milnet
+  labels:
+    app.kubernetes.io/part-of: milnet-sso
+    security.milnet.io/classification: secret
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+  annotations:
+    scheduler.alpha.kubernetes.io/defaultTolerations: '[{"key":"milnet-dedicated","operator":"Equal","value":"true","effect":"NoSchedule"}]'

@@ -1,0 +1,549 @@
+# MILNET SSO System — Zero-Trust NetworkPolicies
+# Each service is restricted to communicating only with its required peers.
+# Default-deny ensures no lateral movement if a pod is compromised.
+---
+# Default deny all ingress and egress in the milnet namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: milnet
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+
+---
+# Allow DNS resolution for all pods (required for K8s service discovery)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: milnet
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to: []
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+---
+# Gateway: ingress from external (LoadBalancer), egress to orchestrator only
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-policy
+  namespace: milnet
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: gateway
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Accept traffic from external load balancer (any source)
+    - ports:
+        - protocol: TCP
+          port: 9100
+        - protocol: TCP
+          port: 10100  # health check port
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: orchestrator
+      ports:
+        - protocol: TCP
+          port: 9101
+
+---
+# Orchestrator: ingress from gateway, egress to opaque + tss-coordinator + verifier + ratchet + risk + audit + kt
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: orchestrator-policy
+  namespace: milnet
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: orchestrator
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: gateway
+      ports:
+        - protocol: TCP
+          port: 9101
+    # Raft peer traffic between orchestrator pods
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: orchestrator
+      ports:
+        - protocol: TCP
+          port: 9090  # Raft transport
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: opaque
+      ports:
+        - protocol: TCP
+          port: 9102
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: tss-coordinator
+      ports:
+        - protocol: TCP
+          port: 9103
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: verifier
+      ports:
+        - protocol: TCP
+          port: 9104
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ratchet
+      ports:
+        - protocol: TCP
+          port: 9105
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: risk
+      ports:
+        - protocol: TCP
+          port: 9106
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: audit
+      ports:
+        - protocol: TCP
+          port: 9108
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kt
+      ports:
+        - protocol: TCP
+          port: 9109
+    # Raft peer traffic
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: orchestrator
+      ports:
+        - protocol: TCP
+          port: 9090
+    # PostgreSQL
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+
+---
+# OPAQUE: ingress from orchestrator only
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: opaque-policy
+  namespace: milnet
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: opaque
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: orchestrator
+      ports:
+        - protocol: TCP
+          port: 9102
+    # Peer traffic for threshold protocol
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: opaque
+      ports:
+        - protocol: TCP
+          port: 9102
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: opaque
+      ports:
+        - protocol: TCP
+          port: 9102
+
+---
+# TSS Coordinator: ingress from orchestrator, egress to tss-signer
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: tss-coordinator-policy
+  namespace: milnet
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: tss-coordinator
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: orchestrator
+      ports:
+        - protocol: TCP
+          port: 9103
+    # Raft peer traffic between coordinator pods
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: tss-coordinator
+      ports:
+        - protocol: TCP
+          port: 9090
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: tss-signer
+      ports:
+        - protocol: TCP
+          port: 9110
+        - protocol: TCP
+          port: 9111
+        - protocol: TCP
+          port: 9112
+        - protocol: TCP
+          port: 9113
+        - protocol: TCP
+          port: 9114
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: tss-coordinator
+      ports:
+        - protocol: TCP
+          port: 9090
+
+---
+# TSS Signer: ingress from tss-coordinator only, no egress needed
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: tss-signer-policy
+  namespace: milnet
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: tss-signer
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: tss-coordinator
+      ports:
+        - protocol: TCP
+          port: 9110
+        - protocol: TCP
+          port: 9111
+        - protocol: TCP
+          port: 9112
+        - protocol: TCP
+          port: 9113
+        - protocol: TCP
+          port: 9114
+  egress: []
+
+---
+# Verifier: ingress from orchestrator, egress to ratchet (staleness heartbeat)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: verifier-policy
+  namespace: milnet
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: verifier
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: orchestrator
+      ports:
+        - protocol: TCP
+          port: 9104
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ratchet
+      ports:
+        - protocol: TCP
+          port: 9105
+
+---
+# Ratchet: ingress from orchestrator + verifier, egress to PostgreSQL
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ratchet-policy
+  namespace: milnet
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ratchet
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: orchestrator
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: verifier
+      ports:
+        - protocol: TCP
+          port: 9105
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+
+---
+# Risk: ingress from orchestrator only, stateless (no egress needed)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: risk-policy
+  namespace: milnet
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: risk
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: orchestrator
+      ports:
+        - protocol: TCP
+          port: 9106
+  egress: []
+
+---
+# Audit: ingress from orchestrator, egress to KT (cross-anchoring)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: audit-policy
+  namespace: milnet
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: audit
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: orchestrator
+      ports:
+        - protocol: TCP
+          port: 9108
+    # BFT peer traffic between audit nodes
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: audit
+      ports:
+        - protocol: TCP
+          port: 9108
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kt
+      ports:
+        - protocol: TCP
+          port: 9109
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: audit
+      ports:
+        - protocol: TCP
+          port: 9108
+
+---
+# KT: ingress from audit + orchestrator
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kt-policy
+  namespace: milnet
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: kt
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: audit
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: orchestrator
+      ports:
+        - protocol: TCP
+          port: 9109
+    # Peer traffic for Merkle tree replication
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kt
+      ports:
+        - protocol: TCP
+          port: 9109
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kt
+      ports:
+        - protocol: TCP
+          port: 9109
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+
+---
+# Admin: ingress restricted to cluster-internal only (not from external)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: admin-policy
+  namespace: milnet
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: admin
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: gateway
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+
+---
+# PostgreSQL: ingress from services that need DB access
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-policy
+  namespace: milnet
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: orchestrator
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ratchet
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kt
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: admin
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Streaming replication between PostgreSQL replicas
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+      ports:
+        - protocol: TCP
+          port: 5432

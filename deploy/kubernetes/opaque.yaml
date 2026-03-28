@@ -1,0 +1,156 @@
+# MILNET SSO System — OPAQUE T-OPAQUE StatefulSet
+# Threshold 2-of-3 OPAQUE password service. Each pod receives a unique
+# sealed share and server ID from its ordinal index.
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: opaque
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: opaque
+    app.kubernetes.io/part-of: milnet-sso
+    app.kubernetes.io/component: opaque-password
+spec:
+  serviceName: opaque
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: opaque
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: opaque
+        app.kubernetes.io/part-of: milnet-sso
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app.kubernetes.io/name
+                    operator: In
+                    values:
+                      - opaque
+              topologyKey: kubernetes.io/hostname
+      # Init container to compute MILNET_OPAQUE_SERVER_ID from pod ordinal.
+      # Pod ordinal is 0-based; OPAQUE server IDs are 1-based (1, 2, 3).
+      initContainers:
+        - name: compute-server-id
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              ORDINAL=$(echo $HOSTNAME | rev | cut -d'-' -f1 | rev)
+              SERVER_ID=$((ORDINAL + 1))
+              echo "MILNET_OPAQUE_SERVER_ID=${SERVER_ID}" > /etc/milnet/env/server-id
+          volumeMounts:
+            - name: env-config
+              mountPath: /etc/milnet/env
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+      containers:
+        - name: opaque
+          image: gcr.io/MILNET_PROJECT/milnet-sso:latest
+          ports:
+            - containerPort: 9102
+              name: service
+              protocol: TCP
+            - containerPort: 10102
+              name: health
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 1Gi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+          envFrom:
+            - configMapRef:
+                name: milnet-common-config
+          env:
+            - name: MILNET_OPAQUE_ADDR
+              value: "0.0.0.0:9102"
+            - name: MILNET_MASTER_KEK
+              valueFrom:
+                secretKeyRef:
+                  name: milnet-master-kek
+                  key: MILNET_MASTER_KEK
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - IPC_LOCK
+          # The server-id env file and per-pod share secret are injected below.
+          # The share secret is selected by an indexed volume projection
+          # based on the pod ordinal. See the shareSecretVolume comment.
+          command:
+            - sh
+            - -c
+            - |
+              # Source the computed server ID
+              export $(cat /etc/milnet/env/server-id)
+              # Source the per-pod sealed share
+              if [ -f /etc/milnet/share/MILNET_OPAQUE_SHARE_SEALED ]; then
+                export MILNET_OPAQUE_SHARE_SEALED=$(cat /etc/milnet/share/MILNET_OPAQUE_SHARE_SEALED)
+              fi
+              exec /service
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          volumeMounts:
+            - name: env-config
+              mountPath: /etc/milnet/env
+            - name: share
+              mountPath: /etc/milnet/share
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: env-config
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+        # Per-pod share injection: use a projected volume or external controller.
+        # For simplicity, each pod mounts its indexed secret.
+        # In production, use a mutating webhook or CSI secret store driver
+        # to inject the correct milnet-opaque-share-{1,2,3} based on ordinal.
+        - name: share
+          secret:
+            secretName: milnet-opaque-share-1
+            optional: true
