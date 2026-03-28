@@ -19,13 +19,13 @@ fn generate_random_bytes(buf: &mut [u8]) -> Result<(), String> {
     Err("OS CSPRNG unavailable after 3 retries".into())
 }
 
-fn generate_random_bytes_32() -> Result<[u8; 32], String> {
+pub fn generate_random_bytes_32() -> Result<[u8; 32], String> {
     let mut buf = [0u8; 32];
     generate_random_bytes(&mut buf)?;
     Ok(buf)
 }
 
-fn generate_random_bytes_64() -> Result<[u8; 64], String> {
+pub fn generate_random_bytes_64() -> Result<[u8; 64], String> {
     let mut buf = [0u8; 64];
     generate_random_bytes(&mut buf)?;
     Ok(buf)
@@ -268,8 +268,12 @@ pub async fn load_or_generate_key_64(pool: &PgPool, name: &str, master_kek: Opti
     let key = match generate_random_bytes_64() {
         Ok(k) => k,
         Err(e) => {
-            tracing::error!("CRITICAL: entropy failure generating key '{}': {}", name, e);
-            return [0u8; 64]; // caller must handle zero key
+            panic!(
+                "FATAL: entropy source failure generating key '{}': {}. \
+                 Cannot continue safely — a zero key would compromise all encryption. \
+                 File: {}:{}",
+                name, e, file!(), line!()
+            );
         }
     };
     if !store_key(pool, name, &key, master_kek).await {
@@ -289,8 +293,12 @@ pub async fn load_or_generate_key_32(pool: &PgPool, name: &str, master_kek: Opti
     let key = match generate_random_bytes_32() {
         Ok(k) => k,
         Err(e) => {
-            tracing::error!("CRITICAL: entropy failure generating key '{}': {}", name, e);
-            return [0u8; 32]; // caller must handle zero key
+            panic!(
+                "FATAL: entropy source failure generating key '{}': {}. \
+                 Cannot continue safely — a zero key would compromise all encryption. \
+                 File: {}:{}",
+                name, e, file!(), line!()
+            );
         }
     };
     if !store_key(pool, name, &key, master_kek).await {
