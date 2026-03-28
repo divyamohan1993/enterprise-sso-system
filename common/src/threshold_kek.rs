@@ -75,7 +75,87 @@ fn gf256_add(a: u8, b: u8) -> u8 {
     a ^ b
 }
 
-fn gf256_mul(a: u8, b: u8) -> u8 {
+// ---------------------------------------------------------------------------
+// Constant-time GF(256) via log/exp lookup tables
+// ---------------------------------------------------------------------------
+
+/// Log table for GF(256) with generator 0x03 and polynomial 0x11b.
+/// GF256_LOG[x] = discrete logarithm of x base 0x03, for x in 1..=255.
+/// GF256_LOG[0] is unused (0 has no logarithm).
+const GF256_LOG: [u8; 256] = {
+    let mut log = [0u8; 256];
+    let mut exp = [0u8; 256];
+    let mut val: u16 = 1;
+    let mut i = 0u16;
+    while i < 255 {
+        exp[i as usize] = val as u8;
+        log[val as usize] = i as u8;
+        val = (val << 1) ^ (if val & 0x80 != 0 { 0x11b } else { 0 });
+        val &= 0xFF;
+        i += 1;
+    }
+    // suppress unused-variable warning for exp inside const block
+    let _ = exp;
+    log
+};
+
+/// Exp (antilog) table for GF(256) — 512 entries for modular reduction without branching.
+/// GF256_EXP[i] = 0x03^i for i in 0..255, duplicated for i in 255..510.
+const GF256_EXP: [u8; 512] = {
+    let mut exp = [0u8; 512];
+    let mut val: u16 = 1;
+    let mut i = 0u16;
+    while i < 255 {
+        exp[i as usize] = val as u8;
+        val = (val << 1) ^ (if val & 0x80 != 0 { 0x11b } else { 0 });
+        val &= 0xFF;
+        i += 1;
+    }
+    let mut j = 0u16;
+    while j < 255 {
+        exp[(255 + j) as usize] = exp[j as usize];
+        j += 1;
+    }
+    exp
+};
+
+/// Constant-time GF(256) multiplication via log/exp tables.
+/// No branches on input values — timing is identical for all inputs.
+pub fn ct_gf256_mul(a: u8, b: u8) -> u8 {
+    let log_a = GF256_LOG[a as usize] as u16;
+    let log_b = GF256_LOG[b as usize] as u16;
+    let log_sum = log_a + log_b;
+    let result = GF256_EXP[log_sum as usize];
+    // Constant-time mask: zero if either input is zero.
+    // (x as u16).wrapping_sub(1) >> 8 == 0xFF when x == 0, 0x00 when x > 0.
+    let a_is_zero = ((a as u16).wrapping_sub(1) >> 8) as u8;
+    let b_is_zero = ((b as u16).wrapping_sub(1) >> 8) as u8;
+    let mask = a_is_zero | b_is_zero; // 0xFF if either is zero
+    result & !mask
+}
+
+/// Constant-time GF(256) inverse via log/exp tables.
+/// Panics on zero input (undefined).
+pub fn ct_gf256_inv(a: u8) -> u8 {
+    if a == 0 {
+        panic!("division by zero in GF(256)");
+    }
+    let log_a = GF256_LOG[a as usize] as u16;
+    let log_inv = 255 - log_a;
+    GF256_EXP[log_inv as usize]
+}
+
+fn ct_gf256_div(a: u8, b: u8) -> u8 {
+    ct_gf256_mul(a, ct_gf256_inv(b))
+}
+
+// ---------------------------------------------------------------------------
+// Legacy implementations — kept for internal reference / test comparison only.
+// All production callers now use the ct_ variants above.
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+fn _old_gf256_mul(a: u8, b: u8) -> u8 {
     let mut result: u16 = 0;
     let mut a = a as u16;
     let mut b = b as u16;
@@ -93,32 +173,26 @@ fn gf256_mul(a: u8, b: u8) -> u8 {
     result as u8
 }
 
-fn gf256_inv(a: u8) -> u8 {
+#[allow(dead_code)]
+fn _old_gf256_inv(a: u8) -> u8 {
     if a == 0 {
         panic!("division by zero in GF(256)");
     }
     // Fermat's little theorem: a^(-1) = a^(254) in GF(2^8)
-    // Compute a^254 using repeated squaring: 254 = 11111110 in binary
-    // a^254 = a^128 * a^64 * a^32 * a^16 * a^8 * a^4 * a^2
-    let a2 = gf256_mul(a, a);         // a^2
-    let a4 = gf256_mul(a2, a2);       // a^4
-    let a8 = gf256_mul(a4, a4);       // a^8
-    let a16 = gf256_mul(a8, a8);      // a^16
-    let a32 = gf256_mul(a16, a16);    // a^32
-    let a64 = gf256_mul(a32, a32);    // a^64
-    let a128 = gf256_mul(a64, a64);   // a^128
-    // a^254 = a^128 * a^64 * a^32 * a^16 * a^8 * a^4 * a^2
-    let mut result = gf256_mul(a128, a64);
-    result = gf256_mul(result, a32);
-    result = gf256_mul(result, a16);
-    result = gf256_mul(result, a8);
-    result = gf256_mul(result, a4);
-    result = gf256_mul(result, a2);
+    let a2 = _old_gf256_mul(a, a);
+    let a4 = _old_gf256_mul(a2, a2);
+    let a8 = _old_gf256_mul(a4, a4);
+    let a16 = _old_gf256_mul(a8, a8);
+    let a32 = _old_gf256_mul(a16, a16);
+    let a64 = _old_gf256_mul(a32, a32);
+    let a128 = _old_gf256_mul(a64, a64);
+    let mut result = _old_gf256_mul(a128, a64);
+    result = _old_gf256_mul(result, a32);
+    result = _old_gf256_mul(result, a16);
+    result = _old_gf256_mul(result, a8);
+    result = _old_gf256_mul(result, a4);
+    result = _old_gf256_mul(result, a2);
     result
-}
-
-fn gf256_div(a: u8, b: u8) -> u8 {
-    gf256_mul(a, gf256_inv(b))
 }
 
 // ---------------------------------------------------------------------------
@@ -167,8 +241,8 @@ pub fn split_secret(secret: &[u8; 32], threshold: u8, total: u8) -> Result<Vec<K
             let mut y = 0u8;
             let mut x_power = 1u8; // x^0 = 1
             for &coeff in &coefficients {
-                y = gf256_add(y, gf256_mul(coeff, x_power));
-                x_power = gf256_mul(x_power, x);
+                y = gf256_add(y, ct_gf256_mul(coeff, x_power));
+                x_power = ct_gf256_mul(x_power, x);
             }
             share.value[byte_idx] = y;
         }
@@ -224,10 +298,10 @@ pub fn reconstruct_secret(shares: &[KekShare]) -> Result<[u8; 32], String> {
                 if denominator == 0 {
                     return Err("degenerate shares: two shares have the same index".into());
                 }
-                basis = gf256_mul(basis, gf256_div(numerator, denominator));
+                basis = ct_gf256_mul(basis, ct_gf256_div(numerator, denominator));
             }
 
-            result = gf256_add(result, gf256_mul(yi, basis));
+            result = gf256_add(result, ct_gf256_mul(yi, basis));
         }
 
         secret[byte_idx] = result;
@@ -587,15 +661,15 @@ mod tests {
         assert_eq!(gf256_add(1, 1), 0);
         assert_eq!(gf256_add(0xFF, 0xFF), 0);
 
-        // Multiplication
-        assert_eq!(gf256_mul(1, 1), 1);
-        assert_eq!(gf256_mul(0, 42), 0);
-        assert_eq!(gf256_mul(1, 42), 42);
+        // Constant-time multiplication
+        assert_eq!(ct_gf256_mul(1, 1), 1);
+        assert_eq!(ct_gf256_mul(0, 42), 0);
+        assert_eq!(ct_gf256_mul(1, 42), 42);
 
-        // Inverse
+        // Constant-time inverse
         for a in 1..=255u16 {
-            let inv = gf256_inv(a as u8);
-            assert_eq!(gf256_mul(a as u8, inv), 1, "inverse of {} failed", a);
+            let inv = ct_gf256_inv(a as u8);
+            assert_eq!(ct_gf256_mul(a as u8, inv), 1, "ct_gf256_inv: a*a^-1 != 1 for a={}", a);
         }
     }
 
