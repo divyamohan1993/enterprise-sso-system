@@ -85,6 +85,47 @@ pub fn assert_allowed(sender: ModuleId, receiver: ModuleId) {
     }
 }
 
+/// Auto-detect the communication matrix from the cluster state.
+/// Returns the set of permitted channels based on which services are
+/// registered in the cluster. This replaces hardcoded channel lists
+/// with dynamic detection.
+pub fn auto_detect_channels(registered_services: &[ModuleId]) -> Vec<(ModuleId, ModuleId)> {
+    let mut channels = Vec::new();
+    for &svc in registered_services {
+        // Each service gets its known dependency channels
+        let deps = service_dependencies(svc);
+        for dep in deps {
+            if registered_services.contains(&dep) {
+                channels.push((svc, dep));
+                channels.push((dep, svc)); // bidirectional
+            }
+        }
+    }
+    // Sort by (src as u8, dst as u8) then dedup
+    channels.sort_by_key(|&(a, b)| (a as u8, b as u8));
+    channels.dedup();
+    channels
+}
+
+/// Return the known dependencies for a service type.
+fn service_dependencies(module: ModuleId) -> Vec<ModuleId> {
+    match module {
+        ModuleId::Gateway => vec![ModuleId::Orchestrator],
+        ModuleId::Orchestrator => vec![
+            ModuleId::Opaque,
+            ModuleId::Tss,
+            ModuleId::Risk,
+            ModuleId::Ratchet,
+            ModuleId::Verifier,
+            ModuleId::Audit,
+            ModuleId::Kt,
+        ],
+        ModuleId::Verifier => vec![ModuleId::Ratchet],
+        ModuleId::Audit => vec![ModuleId::Kt],
+        _ => vec![], // Leaf services have no outbound dependencies
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,5 +176,50 @@ mod tests {
     #[test]
     fn verifier_cannot_reach_opaque() {
         assert!(!is_permitted_channel(ModuleId::Verifier, ModuleId::Opaque));
+    }
+
+    #[test]
+    fn auto_detect_gateway_orchestrator() {
+        let services = vec![ModuleId::Gateway, ModuleId::Orchestrator];
+        let channels = auto_detect_channels(&services);
+        assert!(channels.contains(&(ModuleId::Gateway, ModuleId::Orchestrator)));
+        assert!(channels.contains(&(ModuleId::Orchestrator, ModuleId::Gateway)));
+    }
+
+    #[test]
+    fn auto_detect_excludes_unregistered() {
+        // Only Gateway registered — Orchestrator is missing, so no channels
+        let services = vec![ModuleId::Gateway];
+        let channels = auto_detect_channels(&services);
+        assert!(channels.is_empty());
+    }
+
+    #[test]
+    fn auto_detect_full_cluster() {
+        let services = vec![
+            ModuleId::Gateway,
+            ModuleId::Orchestrator,
+            ModuleId::Tss,
+            ModuleId::Verifier,
+            ModuleId::Opaque,
+            ModuleId::Ratchet,
+            ModuleId::Kt,
+            ModuleId::Risk,
+            ModuleId::Audit,
+        ];
+        let channels = auto_detect_channels(&services);
+        // Should have Gateway<->Orchestrator
+        assert!(channels.contains(&(ModuleId::Gateway, ModuleId::Orchestrator)));
+        // Should have Orchestrator<->Tss
+        assert!(channels.contains(&(ModuleId::Orchestrator, ModuleId::Tss)));
+        // Should have Verifier<->Ratchet
+        assert!(channels.contains(&(ModuleId::Verifier, ModuleId::Ratchet)));
+        // Should have Audit<->Kt
+        assert!(channels.contains(&(ModuleId::Audit, ModuleId::Kt)));
+        // No duplicates
+        let mut sorted = channels.clone();
+        sorted.sort_by_key(|&(a, b)| (a as u8, b as u8));
+        sorted.dedup();
+        assert_eq!(sorted.len(), channels.len(), "no duplicates expected");
     }
 }

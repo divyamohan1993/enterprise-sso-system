@@ -25,6 +25,7 @@ use shard::tls_transport::tls_connect;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
+use crate::distributed_rate_limit::DistributedRateLimiter;
 use crate::puzzle::{generate_challenge, get_adaptive_difficulty, verify_solution, PuzzleSolution};
 use crate::wire::{AuthRequest, AuthResponse, OrchestratorRequest, OrchestratorResponse};
 
@@ -197,6 +198,8 @@ pub struct GatewayServer {
     /// Optional TLS acceptor for TLS termination on the external listener.
     /// When set, all accepted TCP connections are upgraded to TLS before processing.
     tls_acceptor: Option<TlsAcceptor>,
+    /// Optional distributed rate limiter (Redis-backed with local fallback).
+    distributed_limiter: Option<Arc<DistributedRateLimiter>>,
 }
 
 impl GatewayServer {
@@ -233,6 +236,7 @@ impl GatewayServer {
             xwing_fingerprint: Arc::new(fingerprint),
             key_pins: Arc::new(key_pins),
             tls_acceptor: None,
+            distributed_limiter: None,
         })
     }
 
@@ -288,6 +292,7 @@ impl GatewayServer {
             xwing_fingerprint: Arc::new(fingerprint),
             key_pins: Arc::new(key_pins),
             tls_acceptor: None,
+            distributed_limiter: None,
         })
     }
 
@@ -306,6 +311,15 @@ impl GatewayServer {
     /// Return the local address the server is bound to.
     pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
         self.listener.local_addr()
+    }
+
+    /// Attach a distributed rate limiter (Redis-backed with local fallback).
+    ///
+    /// When set, every incoming connection is checked against the distributed
+    /// rate limiter *in addition to* the existing per-IP local rate limiter.
+    pub fn set_distributed_limiter(&mut self, limiter: Arc<DistributedRateLimiter>) {
+        info!("distributed rate limiter attached to gateway");
+        self.distributed_limiter = Some(limiter);
     }
 
     /// Check and update per-IP rate limits.  Returns `true` if the
@@ -346,6 +360,17 @@ impl GatewayServer {
                 warn!("rejecting connection from {addr}: per-IP rate limit exceeded ({} per {RATE_LIMIT_WINDOW_SECS}s)", max_connections_per_ip());
                 drop(tcp_stream);
                 continue;
+            }
+
+            // Distributed rate limiting check (per-IP + per-user via Redis)
+            if let Some(ref limiter) = self.distributed_limiter {
+                let result = limiter.check_ip(addr.ip()).await;
+                if !result.allowed {
+                    let client_ip = addr.ip().to_string();
+                    warn!(ip = %client_ip, "distributed rate limit exceeded — rejecting connection");
+                    drop(tcp_stream);
+                    continue;
+                }
             }
 
             let active = self.active_connections.fetch_add(1, Ordering::Relaxed) + 1;

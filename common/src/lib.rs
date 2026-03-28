@@ -157,3 +157,13 @@ pub mod self_service;
 pub mod service_discovery;
 pub mod distributed_lock;
 pub mod persistent_session;
+
+// ── OCSP/CRL revocation checking ──
+pub mod ocsp_crl;
+
+// ── Anti-lateral-movement guard ──
+pub mod lateral_movement_guard;
+
+// ── External witness cosigner and distributed CA ──
+pub mod external_witness;
+pub mod distributed_ca;
