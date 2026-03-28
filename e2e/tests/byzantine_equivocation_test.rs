@@ -5,8 +5,7 @@
 //! signatures are rejected by the audit pipeline.
 
 use audit::bft::{BftAuditCluster, BFT_QUORUM, MIN_BFT_NODES};
-use audit::log::hash_entry;
-use common::types::{AuditEntry, AuditEventType};
+use common::types::AuditEventType;
 use crypto::pq_sign::{
     generate_pq_keypair, pq_sign_raw, pq_verify_raw,
 };
@@ -17,25 +16,6 @@ use uuid::Uuid;
 const CLASSIFICATION_UNCLASSIFIED: u8 = 0;
 
 // ── Helpers ──────────────────────────────────────────────────────────────
-
-/// Build a minimal honest AuditEntry with a zero prev_hash (genesis).
-fn make_genesis_entry(event_type: AuditEventType) -> AuditEntry {
-    AuditEntry {
-        event_id: Uuid::new_v4(),
-        event_type,
-        user_ids: vec![Uuid::new_v4()],
-        device_ids: vec![Uuid::new_v4()],
-        ceremony_receipts: vec![],
-        risk_score: 0.1,
-        timestamp: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_micros() as i64,
-        prev_hash: [0u8; 64],
-        signature: Vec::new(),
-        classification: CLASSIFICATION_UNCLASSIFIED,
-    }
-}
 
 /// Spawn a thread with an 8 MB stack so ML-DSA-87 key generation does not
 /// overflow the default 2 MB Rust test thread stack.
@@ -277,18 +257,38 @@ fn test_verify_consistency_detects_divergence() {
         "honest cluster must be consistent after one accepted entry"
     );
 
-    // Directly corrupt a node's log to simulate chain divergence.
-    // We append an extra raw entry to node 3 to create a length mismatch.
-    let extra_entry = make_genesis_entry(AuditEventType::AuthFailure);
-    cluster.nodes[3]
-        .log
-        .append_raw(extra_entry)
-        .expect("direct log manipulation for test should succeed");
+    // Simulate divergence by marking nodes 1..6 as Byzantine (so only node 0
+    // acts as honest proposer) and then proposing a second entry.  Only node 0
+    // will accept the new entry (the others are Byzantine and refuse), but the
+    // length check in verify_consistency will see node 0 has 2 entries while
+    // the 5 still-honest-looking-but-Byzantine nodes have only 1, triggering
+    // a divergence report.
+    for id in 1u8..7 {
+        cluster.set_byzantine(id);
+    }
 
-    // Now verify_consistency must report divergence.
+    // propose_entry will fail quorum (only 1 honest acceptor), but node 0's
+    // log will grow to length 2 because accept_entry succeeds for honest nodes
+    // regardless of quorum. We accept the error.
+    let _ = cluster.propose_entry(
+        AuditEventType::AuthFailure,
+        vec![Uuid::new_v4()],
+        vec![],
+        0.9,
+        vec![],
+        CLASSIFICATION_UNCLASSIFIED,
+    );
+
+    // Restore nodes 1..6 as non-Byzantine so verify_consistency compares them
+    // (the function only compares non-Byzantine nodes internally).  We need at
+    // least two honest nodes with different lengths for the check to fire.
+    // Reset node 1 to honest so it has a different length than node 0.
+    cluster.nodes[1].is_byzantine = false;
+
+    // Now node 0 has 2 entries and node 1 has 1 entry — chains have diverged.
     assert!(
         !cluster.verify_consistency(),
-        "verify_consistency must return false when one node has a divergent chain \
-         (node 3 has 2 entries while others have 1)"
+        "verify_consistency must return false when honest nodes have different \
+         chain lengths (node 0 has 2 entries, node 1 has 1 entry)"
     );
 }
