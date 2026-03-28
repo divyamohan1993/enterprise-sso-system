@@ -140,6 +140,39 @@ impl ClusterState {
             ClusterCommand::Noop => {
                 // No-op: leader authority commit, nothing to apply.
             }
+            ClusterCommand::TamperDetected {
+                node_id,
+                expected_hash: _,
+                actual_hash: _,
+            } => {
+                // Mark the tampered node as unhealthy. If it was leader,
+                // the Raft engine handles step-down separately.
+                if let Some(member) = self.members.get_mut(node_id) {
+                    member.healthy = false;
+                    tracing::error!(
+                        node_id = %node_id,
+                        "TAMPER DETECTED: node marked unhealthy, ineligible for leader election"
+                    );
+                }
+                // If tampered node was leader, clear leader_id to force re-election
+                if self.leader_id == Some(*node_id) {
+                    tracing::error!(
+                        node_id = %node_id,
+                        "TAMPER DETECTED on LEADER: clearing leader, forcing re-election"
+                    );
+                    self.leader_id = None;
+                }
+            }
+            ClusterCommand::TamperHealed { node_id } => {
+                // Restore the healed node to healthy status
+                if let Some(member) = self.members.get_mut(node_id) {
+                    member.healthy = true;
+                    tracing::info!(
+                        node_id = %node_id,
+                        "node healed: binary integrity restored, eligible for leader election"
+                    );
+                }
+            }
         }
     }
 
@@ -401,15 +434,39 @@ impl ClusterNode {
 
         let standalone = config.peers.is_empty();
         if standalone {
+            // SECURITY: In production, standalone mode is FORBIDDEN.
+            // A single-node deployment has no redundancy, no failover, and no
+            // peer-to-peer binary attestation. The entire system becomes a SPOF.
+            if crate::sealed_keys::is_production() {
+                return Err(
+                    "FATAL: standalone mode (no cluster peers) is forbidden in production. \
+                     Set MILNET_CLUSTER_PEERS with at least 2 peers for a minimum 3-node cluster. \
+                     Single-node deployment provides zero redundancy and zero tamper detection."
+                        .to_string(),
+                );
+            }
             info!(
                 node_id = %config.node_id,
-                "starting in standalone mode — will elect self on first tick"
+                "starting in standalone mode (dev/test only) — will elect self on first tick"
             );
         } else {
+            // Enforce minimum 3-node cluster in production (tolerates 1 failure)
+            let cluster_size = config.peers.len() + 1; // peers + self
+            if crate::sealed_keys::is_production() && cluster_size < 3 {
+                return Err(format!(
+                    "FATAL: cluster size {} is too small for production. \
+                     Minimum 3 nodes required (tolerates 1 failure). \
+                     Add at least {} more peers to MILNET_CLUSTER_PEERS.",
+                    cluster_size,
+                    3 - cluster_size,
+                ));
+            }
             info!(
                 node_id = %config.node_id,
                 peers = config.peers.len(),
-                "starting cluster node"
+                cluster_size = cluster_size,
+                "starting cluster node (quorum = {})",
+                cluster_size / 2 + 1
             );
         }
 

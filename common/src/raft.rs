@@ -109,6 +109,17 @@ pub enum ClusterCommand {
     HealthUpdate { node_id: NodeId, healthy: bool },
     /// No-op entry committed by a new leader to establish its authority.
     Noop,
+    /// Binary tampering detected on a node. The tampered node is stripped
+    /// of leader role and flagged for healing. Other nodes will refuse to
+    /// accept it as leader until the binary hash matches the golden hash.
+    TamperDetected {
+        node_id: NodeId,
+        expected_hash: [u8; 64],
+        actual_hash: [u8; 64],
+    },
+    /// Node has been healed (binary replaced and verified). It can rejoin
+    /// the cluster and be eligible for leader election again.
+    TamperHealed { node_id: NodeId },
 }
 
 // ── Log entry ──────────────────────────────────────────────────────────────────
@@ -447,6 +458,35 @@ impl RaftState {
         self.votes_received.clear();
         self.votes_received.insert(self.node_id);
         self.become_leader();
+    }
+
+    /// Force this node to step down from leader if its binary is tampered.
+    /// Called by the attestation mesh when local binary hash doesn't match
+    /// the golden hash. The node becomes a follower and is ineligible for
+    /// leader election until healed.
+    pub fn step_down_tampered(&mut self) {
+        if self.role == RaftRole::Leader {
+            tracing::error!(
+                node_id = %self.node_id,
+                term = self.current_term.0,
+                "TAMPER DETECTED: stepping down from leader role"
+            );
+        }
+        self.role = RaftRole::Follower;
+        self.leader_id = None;
+        // Set voted_for to self to prevent voting in the current term
+        // (tampered node should not participate in elections)
+        self.voted_for = Some(self.node_id);
+        self.reset_election_timer();
+    }
+
+    /// Check if this node is marked as tampered (ineligible for election).
+    /// A tampered node has voted_for=self but is a follower, which prevents
+    /// it from starting elections or granting votes.
+    pub fn is_tampered_standby(&self) -> bool {
+        self.role == RaftRole::Follower
+            && self.voted_for == Some(self.node_id)
+            && self.leader_id.is_none()
     }
 
     // ── Private: election ──────────────────────────────────────────────────
