@@ -943,8 +943,8 @@ fn incident_response_auto_lockdown_at_threshold() {
         "System must not start in lockdown mode"
     );
 
-    // Report exactly 4 critical incidents -- should NOT trigger lockdown
-    for i in 0..4 {
+    // Report exactly 19 critical incidents -- should NOT trigger lockdown
+    for i in 0..19 {
         engine.report_incident(
             IncidentType::TamperDetection,
             None,
@@ -954,19 +954,19 @@ fn incident_response_auto_lockdown_at_threshold() {
     }
     assert!(
         !engine.is_lockdown(),
-        "4 critical incidents must NOT trigger lockdown (threshold is 5)"
+        "19 critical incidents must NOT trigger lockdown (threshold is 20)"
     );
 
-    // The 5th critical incident triggers lockdown
+    // The 20th critical incident triggers lockdown
     engine.report_incident(
         IncidentType::DuressActivation,
         Some(Uuid::new_v4()),
         None,
-        "5th critical incident -- this should trigger lockdown",
+        "20th critical incident -- this should trigger lockdown",
     );
     assert!(
         engine.is_lockdown(),
-        "5 critical incidents must trigger automatic lockdown. \
+        "20 critical incidents must trigger automatic lockdown. \
          On an exposed server, this prevents further damage during an active attack."
     );
 }
@@ -977,8 +977,8 @@ fn incident_response_auto_lockdown_at_threshold() {
 fn incident_response_lockdown_requires_admin_exit() {
     let engine = IncidentResponseEngine::new();
 
-    // Trigger lockdown
-    for i in 0..5 {
+    // Trigger lockdown (threshold=20)
+    for i in 0..20 {
         engine.report_incident(
             IncidentType::TamperDetection,
             None,

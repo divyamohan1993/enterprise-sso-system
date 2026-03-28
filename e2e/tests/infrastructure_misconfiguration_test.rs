@@ -1062,18 +1062,16 @@ fn incident_lockdown_triggers_at_5_critical() {
     let engine = IncidentResponseEngine::new();
     assert!(!engine.is_lockdown(), "system must not start in lockdown");
 
-    // Report 5 critical incidents (all within the same instant = within 1 hour).
-    let critical_types = [
-        IncidentType::DuressActivation,
-        IncidentType::TamperDetection,
-        IncidentType::EntropyFailure,
-        IncidentType::DuressActivation,
-        IncidentType::TamperDetection,
-    ];
-
-    for (i, incident_type) in critical_types.iter().enumerate() {
+    // Report 20 critical incidents (threshold raised from 5 to 20 to resist
+    // attacker-triggered DoS via incident flooding).
+    for i in 0..20 {
+        let incident_type = match i % 3 {
+            0 => IncidentType::DuressActivation,
+            1 => IncidentType::TamperDetection,
+            _ => IncidentType::EntropyFailure,
+        };
         engine.report_incident(
-            incident_type.clone(),
+            incident_type,
             Some(Uuid::new_v4()),
             Some(format!("203.0.113.{}", i)),
             format!("critical event #{}", i),
@@ -1082,7 +1080,7 @@ fn incident_lockdown_triggers_at_5_critical() {
 
     assert!(
         engine.is_lockdown(),
-        "lockdown must trigger after 5 critical incidents within 1 hour"
+        "lockdown must trigger after 20 critical incidents within 1 hour"
     );
 }
 
@@ -1115,8 +1113,8 @@ fn lockdown_exit_requires_admin() {
 
     let engine = IncidentResponseEngine::new();
 
-    // Trigger lockdown.
-    for i in 0..5 {
+    // Trigger lockdown (threshold=20).
+    for i in 0..20 {
         engine.report_incident(
             IncidentType::DuressActivation,
             Some(Uuid::new_v4()),
