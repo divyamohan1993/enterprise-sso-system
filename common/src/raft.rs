@@ -35,6 +35,16 @@ impl std::fmt::Display for NodeId {
     }
 }
 
+impl std::fmt::LowerHex for NodeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let bytes = self.0.as_bytes();
+        for b in bytes {
+            write!(f, "{:02x}", b)?;
+        }
+        Ok(())
+    }
+}
+
 /// Monotonically increasing term number used for leader elections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Term(pub u64);
@@ -160,7 +170,7 @@ impl RaftMessage {
 // ── Configuration ──────────────────────────────────────────────────────────────
 
 /// Configuration for a Raft node.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RaftConfig {
     /// Heartbeat interval in milliseconds (default: 500).
     pub heartbeat_ms: u64,
@@ -421,6 +431,22 @@ impl RaftState {
     /// Current term.
     pub fn current_term(&self) -> Term {
         self.current_term
+    }
+
+    /// Immediately promote this node to leader without an election.
+    ///
+    /// Only valid for single-node clusters (no peers). Panics if peers are
+    /// configured — use the normal election path for multi-node clusters.
+    pub fn become_leader_standalone(&mut self) {
+        assert!(
+            self.config.peers.is_empty(),
+            "become_leader_standalone must only be called on a single-node cluster"
+        );
+        self.current_term = Term(self.current_term.0 + 1);
+        self.voted_for = Some(self.node_id);
+        self.votes_received.clear();
+        self.votes_received.insert(self.node_id);
+        self.become_leader();
     }
 
     // ── Private: election ──────────────────────────────────────────────────
@@ -974,10 +1000,11 @@ mod tests {
         let _ = elect_leader(&mut n1, &mut n2, &mut n3);
         assert!(n1.is_leader());
 
-        // Record n2's election deadline before heartbeat.
-        let old_deadline = n2.election_deadline;
+        // Set n2's election deadline to the near past so we can detect a reset.
+        n2.election_deadline = Instant::now() - Duration::from_secs(1);
 
         // Leader sends heartbeats.
+        let now_before = Instant::now();
         let heartbeats = n1.tick();
         let hb_for_n2 = heartbeats
             .iter()
@@ -987,8 +1014,11 @@ mod tests {
             .clone();
         let _ = n2.handle_message(id1, hb_for_n2);
 
-        // Follower's election deadline should have been pushed forward.
-        assert!(n2.election_deadline >= old_deadline);
+        // Follower's election deadline should now be in the future (reset by heartbeat).
+        assert!(
+            n2.election_deadline > now_before,
+            "heartbeat should reset the follower's election deadline into the future"
+        );
     }
 
     // ── 4. Higher term causes step-down ────────────────────────────────────

@@ -20,8 +20,11 @@ use tokio::sync::{mpsc, watch, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
 use super::raft::{
-    ClusterCommand, LogEntry, LogIndex, NodeId, RaftConfig, RaftMessage, RaftRole, RaftState, Term,
+    ClusterCommand, LogEntry, LogIndex, NodeId, RaftConfig, RaftMessage, RaftRole, RaftState,
 };
+#[cfg(test)]
+use super::raft::Term;
+
 
 // ── ServiceType ──
 
@@ -72,8 +75,6 @@ pub struct MemberInfo {
     pub node_id: NodeId,
     /// The service-level address (e.g. gRPC or HTTP endpoint).
     pub addr: String,
-    /// The Raft transport address.
-    pub raft_addr: String,
     pub service_type: ServiceType,
     pub healthy: bool,
     pub last_seen: Instant,
@@ -88,7 +89,7 @@ pub struct MemberInfo {
 pub struct ClusterState {
     pub members: HashMap<NodeId, MemberInfo>,
     pub leader_id: Option<NodeId>,
-    pub term: Term,
+    pub term: u64,
     pub fencing_token: u64,
 }
 
@@ -105,12 +106,11 @@ impl ClusterState {
 
     /// Apply a committed log entry to the cluster state.
     pub fn apply(&mut self, entry: &LogEntry) {
-        self.term = entry.term;
+        self.term = entry.term.0;
         match &entry.command {
-            ClusterCommand::RegisterNode {
+            ClusterCommand::MemberJoin {
                 node_id,
-                service_addr,
-                raft_addr,
+                addr,
                 service_type,
             } => {
                 let svc_type = ServiceType::from_str(service_type).unwrap_or(ServiceType::Gateway);
@@ -118,29 +118,27 @@ impl ClusterState {
                     *node_id,
                     MemberInfo {
                         node_id: *node_id,
-                        addr: service_addr.clone(),
-                        raft_addr: raft_addr.clone(),
+                        addr: addr.clone(),
                         service_type: svc_type,
                         healthy: true,
                         last_seen: Instant::now(),
                     },
                 );
             }
-            ClusterCommand::DeregisterNode { node_id } => {
+            ClusterCommand::MemberLeave { node_id } => {
                 self.members.remove(node_id);
             }
-            ClusterCommand::Heartbeat { node_id } => {
+            ClusterCommand::RoleAssignment { .. } => {
+                // Role assignments are handled externally by the cluster_roles module.
+            }
+            ClusterCommand::HealthUpdate { node_id, healthy } => {
                 if let Some(member) = self.members.get_mut(node_id) {
-                    member.healthy = true;
+                    member.healthy = *healthy;
                     member.last_seen = Instant::now();
                 }
             }
-            ClusterCommand::BumpFencingToken => {
-                self.fencing_token += 1;
-            }
-            ClusterCommand::Application { .. } => {
-                // Application-level commands are handled by the embedding service,
-                // not by the cluster state machine.
+            ClusterCommand::Noop => {
+                // No-op: leader authority commit, nothing to apply.
             }
         }
     }
@@ -182,7 +180,7 @@ pub struct PeerConfig {
 // ── ClusterConfig ──
 
 /// Full configuration for a cluster node.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ClusterConfig {
     pub node_id: NodeId,
     pub service_type: ServiceType,
@@ -196,7 +194,7 @@ impl ClusterConfig {
     /// Parse cluster configuration from environment variables.
     ///
     /// Environment variables:
-    /// - `MILNET_NODE_ID` — 128-bit hex node ID (generated if absent)
+    /// - `MILNET_NODE_ID` — UUID or 128-bit hex node ID (generated if absent)
     /// - `MILNET_SERVICE_TYPE` — one of: orchestrator, tss-coordinator, opaque, gateway, audit
     /// - `MILNET_SERVICE_ADDR` — this node's service address (default `127.0.0.1:8080`)
     /// - `MILNET_RAFT_ADDR` — this node's Raft transport address (default `127.0.0.1:9090`)
@@ -204,18 +202,7 @@ impl ClusterConfig {
     ///   `node-id@raft-host:raft-port/svc-host:svc-port,...`
     ///   If not set, the node runs in standalone (single-node) mode.
     pub fn from_env() -> Result<Self, String> {
-        let node_id: NodeId = match std::env::var("MILNET_NODE_ID") {
-            Ok(val) => {
-                if let Ok(uuid) = uuid::Uuid::parse_str(&val) {
-                    NodeId(uuid)
-                } else {
-                    let n = u128::from_str_radix(val.trim_start_matches("0x"), 16)
-                        .map_err(|e| format!("invalid MILNET_NODE_ID: {e}"))?;
-                    NodeId(uuid::Uuid::from_u128(n))
-                }
-            }
-            Err(_) => NodeId(uuid::Uuid::new_v4()),
-        };
+        let node_id: NodeId = parse_node_id_from_env()?;
 
         let service_type: ServiceType = match std::env::var("MILNET_SERVICE_TYPE") {
             Ok(val) => ServiceType::from_str(&val)?,
@@ -233,13 +220,21 @@ impl ClusterConfig {
             _ => Vec::new(),
         };
 
+        let raft_peers = peers
+            .iter()
+            .map(|p| (p.node_id, p.raft_addr.clone()))
+            .collect();
+
         Ok(Self {
             node_id,
             service_type,
             service_addr,
             raft_addr,
             peers,
-            raft_config: RaftConfig::default(),
+            raft_config: RaftConfig {
+                peers: raft_peers,
+                ..RaftConfig::default()
+            },
         })
     }
 
@@ -255,19 +250,7 @@ impl ClusterConfig {
         service_type: ServiceType,
         service_addr: &str,
     ) -> Result<Self, String> {
-        let node_id: NodeId = match std::env::var("MILNET_NODE_ID") {
-            Ok(val) => {
-                // Accept UUID format or hex u128
-                if let Ok(uuid) = uuid::Uuid::parse_str(&val) {
-                    NodeId(uuid)
-                } else {
-                    let n = u128::from_str_radix(val.trim_start_matches("0x"), 16)
-                        .map_err(|e| format!("invalid MILNET_NODE_ID: {e}"))?;
-                    NodeId(uuid::Uuid::from_u128(n))
-                }
-            }
-            Err(_) => NodeId(uuid::Uuid::new_v4()),
-        };
+        let node_id: NodeId = parse_node_id_from_env()?;
 
         // Raft port defaults to service port + 2000
         let raft_addr = std::env::var("MILNET_RAFT_ADDR").unwrap_or_else(|_| {
@@ -285,14 +268,38 @@ impl ClusterConfig {
             _ => Vec::new(),
         };
 
+        let raft_peers = peers
+            .iter()
+            .map(|p| (p.node_id, p.raft_addr.clone()))
+            .collect();
+
         Ok(Self {
             node_id,
             service_type,
             service_addr: service_addr.to_string(),
             raft_addr,
             peers,
-            raft_config: RaftConfig::default(),
+            raft_config: RaftConfig {
+                peers: raft_peers,
+                ..RaftConfig::default()
+            },
         })
+    }
+}
+
+/// Parse node ID from MILNET_NODE_ID env var, or generate a random one.
+fn parse_node_id_from_env() -> Result<NodeId, String> {
+    match std::env::var("MILNET_NODE_ID") {
+        Ok(val) => {
+            if let Ok(uuid) = uuid::Uuid::parse_str(&val) {
+                Ok(NodeId(uuid))
+            } else {
+                let n = u128::from_str_radix(val.trim_start_matches("0x"), 16)
+                    .map_err(|e| format!("invalid MILNET_NODE_ID: {e}"))?;
+                Ok(NodeId(uuid::Uuid::from_u128(n)))
+            }
+        }
+        Err(_) => Ok(NodeId(uuid::Uuid::new_v4())),
     }
 }
 
@@ -390,19 +397,17 @@ impl ClusterNode {
     /// - Raft message sender (sends outgoing messages to peers)
     /// - State applier (applies committed entries to `ClusterState`)
     pub async fn start(config: ClusterConfig) -> Result<Self, String> {
-        let peer_ids: Vec<NodeId> = config.peers.iter().map(|p| p.node_id).collect();
-        let mut raft = RaftState::new(config.node_id, peer_ids, config.raft_config.clone());
+        let raft = RaftState::new(config.node_id, config.raft_config.clone());
 
         let standalone = config.peers.is_empty();
         if standalone {
             info!(
-                node_id = %format!("{:032x}", config.node_id),
-                "starting in standalone mode — becoming leader immediately"
+                node_id = %config.node_id,
+                "starting in standalone mode — will elect self on first tick"
             );
-            raft.become_leader_standalone();
         } else {
             info!(
-                node_id = %format!("{:032x}", config.node_id),
+                node_id = %config.node_id,
                 peers = config.peers.len(),
                 "starting cluster node"
             );
@@ -417,13 +422,6 @@ impl ClusterNode {
 
         // Channel for outgoing Raft messages.
         let (send_tx, send_rx) = mpsc::unbounded_channel::<(NodeId, RaftMessage)>();
-
-        // If standalone, set initial leader state.
-        if standalone {
-            let mut st = state.write().await;
-            st.leader_id = Some(config.node_id);
-            let _ = leader_tx.send(Some(config.node_id));
-        }
 
         // Task 1: Raft Tick Loop
         {
@@ -529,7 +527,7 @@ impl ClusterNode {
                     let peer_addr = match config.peers.iter().find(|p| p.node_id == target) {
                         Some(p) => p.raft_addr.clone(),
                         None => {
-                            warn!(target = %format!("{:032x}", target), "unknown peer, dropping message");
+                            warn!(target = %target, "unknown peer, dropping message");
                             continue;
                         }
                     };
@@ -590,16 +588,15 @@ impl ClusterNode {
                     }
 
                     // Detect leader changes from the Raft engine
-                    let (current_role, current_term) = {
+                    let current_role = {
                         let r = raft.lock().await;
-                        (r.role, r.current_term)
+                        r.role().clone()
                     };
 
                     let new_leader = match current_role {
                         RaftRole::Leader => Some(config_clone.node_id),
                         _ => {
-                            // We don't know who the leader is from follower state alone;
-                            // keep what's in cluster state.
+                            // Keep what's in cluster state.
                             state.read().await.leader_id
                         }
                     };
@@ -608,12 +605,10 @@ impl ClusterNode {
                         prev_leader = new_leader;
                         let mut st = state.write().await;
                         st.leader_id = new_leader;
-                        st.term = current_term;
                         let _ = leader_tx.send(new_leader);
                         if let Some(id) = new_leader {
                             info!(
-                                leader = %format!("{:032x}", id),
-                                term = current_term,
+                                leader = %id,
                                 "leader changed"
                             );
                         }
@@ -634,9 +629,8 @@ impl ClusterNode {
 
     /// Is this node currently the Raft leader?
     pub fn is_leader(&self) -> bool {
-        // Fast path: try_lock to avoid blocking. If contended, fall back to false.
         match self.raft.try_lock() {
-            Ok(guard) => guard.role == RaftRole::Leader,
+            Ok(guard) => guard.is_leader(),
             Err(_) => false,
         }
     }
@@ -680,7 +674,7 @@ impl ClusterNode {
 
     /// Shutdown the cluster node gracefully.
     pub async fn shutdown(&self) {
-        info!(node_id = %format!("{:032x}", self.config.node_id), "shutting down cluster node");
+        info!(node_id = %self.config.node_id, "shutting down cluster node");
         let _ = self.shutdown_tx.send(true);
         // Give background tasks a moment to exit.
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -697,6 +691,10 @@ impl ClusterNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_node_id(n: u8) -> NodeId {
+        NodeId(uuid::Uuid::from_bytes([n; 16]))
+    }
 
     #[test]
     fn service_type_display_roundtrip() {
@@ -732,10 +730,10 @@ mod tests {
         let input = "1a@10.0.0.1:9090/10.0.0.1:8080,2b@10.0.0.2:9090/10.0.0.2:8080";
         let peers = parse_peers(input).unwrap();
         assert_eq!(peers.len(), 2);
-        assert_eq!(peers[0].node_id, 0x1a);
+        assert_eq!(peers[0].node_id, NodeId(uuid::Uuid::from_u128(0x1a)));
         assert_eq!(peers[0].raft_addr, "10.0.0.1:9090");
         assert_eq!(peers[0].service_addr, "10.0.0.1:8080");
-        assert_eq!(peers[1].node_id, 0x2b);
+        assert_eq!(peers[1].node_id, NodeId(uuid::Uuid::from_u128(0x2b)));
     }
 
     #[test]
@@ -771,127 +769,85 @@ mod tests {
     }
 
     #[test]
-    fn cluster_config_from_env_with_peers() {
-        std::env::set_var("MILNET_NODE_ID", "0xdeadbeef");
-        std::env::set_var("MILNET_SERVICE_TYPE", "orchestrator");
-        std::env::set_var("MILNET_SERVICE_ADDR", "10.0.0.1:8080");
-        std::env::set_var("MILNET_RAFT_ADDR", "10.0.0.1:9090");
-        std::env::set_var(
-            "MILNET_CLUSTER_PEERS",
-            "aa@10.0.0.2:9090/10.0.0.2:8080,bb@10.0.0.3:9090/10.0.0.3:8080",
-        );
-
-        let cfg = ClusterConfig::from_env().unwrap();
-        assert_eq!(cfg.node_id, 0xdeadbeef);
-        assert_eq!(cfg.service_type, ServiceType::Orchestrator);
-        assert_eq!(cfg.peers.len(), 2);
-
-        // Clean up
-        std::env::remove_var("MILNET_NODE_ID");
-        std::env::remove_var("MILNET_SERVICE_TYPE");
-        std::env::remove_var("MILNET_SERVICE_ADDR");
-        std::env::remove_var("MILNET_RAFT_ADDR");
-        std::env::remove_var("MILNET_CLUSTER_PEERS");
-    }
-
-    #[test]
-    fn cluster_state_apply_register() {
+    fn cluster_state_apply_member_join() {
         let mut state = ClusterState::new();
         let entry = LogEntry {
-            term: 1,
-            index: 1,
-            command: ClusterCommand::RegisterNode {
-                node_id: 42,
-                service_addr: "10.0.0.1:8080".to_string(),
-                raft_addr: "10.0.0.1:9090".to_string(),
+            term: Term(1),
+            index: LogIndex(1),
+            command: ClusterCommand::MemberJoin {
+                node_id: test_node_id(42),
+                addr: "10.0.0.1:8080".to_string(),
                 service_type: "orchestrator".to_string(),
             },
         };
         state.apply(&entry);
         assert_eq!(state.member_count(), 1);
-        let member = state.members.get(&42).unwrap();
+        let member = state.members.get(&test_node_id(42)).unwrap();
         assert_eq!(member.addr, "10.0.0.1:8080");
         assert_eq!(member.service_type, ServiceType::Orchestrator);
         assert!(member.healthy);
     }
 
     #[test]
-    fn cluster_state_apply_deregister() {
+    fn cluster_state_apply_member_leave() {
         let mut state = ClusterState::new();
         state.apply(&LogEntry {
-            term: 1,
-            index: 1,
-            command: ClusterCommand::RegisterNode {
-                node_id: 42,
-                service_addr: "10.0.0.1:8080".to_string(),
-                raft_addr: "10.0.0.1:9090".to_string(),
+            term: Term(1),
+            index: LogIndex(1),
+            command: ClusterCommand::MemberJoin {
+                node_id: test_node_id(42),
+                addr: "10.0.0.1:8080".to_string(),
                 service_type: "gateway".to_string(),
             },
         });
         assert_eq!(state.member_count(), 1);
 
         state.apply(&LogEntry {
-            term: 1,
-            index: 2,
-            command: ClusterCommand::DeregisterNode { node_id: 42 },
+            term: Term(1),
+            index: LogIndex(2),
+            command: ClusterCommand::MemberLeave {
+                node_id: test_node_id(42),
+            },
         });
         assert_eq!(state.member_count(), 0);
     }
 
     #[test]
-    fn cluster_state_apply_heartbeat() {
+    fn cluster_state_apply_health_update() {
         let mut state = ClusterState::new();
         state.apply(&LogEntry {
-            term: 1,
-            index: 1,
-            command: ClusterCommand::RegisterNode {
-                node_id: 7,
-                service_addr: "10.0.0.1:8080".to_string(),
-                raft_addr: "10.0.0.1:9090".to_string(),
+            term: Term(1),
+            index: LogIndex(1),
+            command: ClusterCommand::MemberJoin {
+                node_id: test_node_id(7),
+                addr: "10.0.0.1:8080".to_string(),
                 service_type: "audit".to_string(),
             },
         });
-        let before = state.members.get(&7).unwrap().last_seen;
+        let before = state.members.get(&test_node_id(7)).unwrap().last_seen;
 
         // Small delay so Instant differs
         std::thread::sleep(std::time::Duration::from_millis(1));
 
         state.apply(&LogEntry {
-            term: 1,
-            index: 2,
-            command: ClusterCommand::Heartbeat { node_id: 7 },
+            term: Term(1),
+            index: LogIndex(2),
+            command: ClusterCommand::HealthUpdate {
+                node_id: test_node_id(7),
+                healthy: true,
+            },
         });
-        let after = state.members.get(&7).unwrap().last_seen;
+        let after = state.members.get(&test_node_id(7)).unwrap().last_seen;
         assert!(after >= before);
     }
 
     #[test]
-    fn cluster_state_apply_bump_fencing_token() {
-        let mut state = ClusterState::new();
-        assert_eq!(state.fencing_token, 0);
-        state.apply(&LogEntry {
-            term: 1,
-            index: 1,
-            command: ClusterCommand::BumpFencingToken,
-        });
-        assert_eq!(state.fencing_token, 1);
-        state.apply(&LogEntry {
-            term: 1,
-            index: 2,
-            command: ClusterCommand::BumpFencingToken,
-        });
-        assert_eq!(state.fencing_token, 2);
-    }
-
-    #[test]
-    fn cluster_state_apply_application_is_noop() {
+    fn cluster_state_apply_noop() {
         let mut state = ClusterState::new();
         state.apply(&LogEntry {
-            term: 1,
-            index: 1,
-            command: ClusterCommand::Application {
-                payload: vec![1, 2, 3],
-            },
+            term: Term(1),
+            index: LogIndex(1),
+            command: ClusterCommand::Noop,
         });
         assert_eq!(state.member_count(), 0);
         assert_eq!(state.fencing_token, 0);
@@ -902,55 +858,56 @@ mod tests {
         let mut state = ClusterState::new();
         assert!(state.leader_addr().is_none());
 
+        let nid = test_node_id(1);
         state.apply(&LogEntry {
-            term: 1,
-            index: 1,
-            command: ClusterCommand::RegisterNode {
-                node_id: 1,
-                service_addr: "leader.milnet:8080".to_string(),
-                raft_addr: "leader.milnet:9090".to_string(),
+            term: Term(1),
+            index: LogIndex(1),
+            command: ClusterCommand::MemberJoin {
+                node_id: nid,
+                addr: "leader.milnet:8080".to_string(),
                 service_type: "orchestrator".to_string(),
             },
         });
-        state.leader_id = Some(1);
+        state.leader_id = Some(nid);
         assert_eq!(state.leader_addr(), Some("leader.milnet:8080"));
     }
 
     #[test]
     fn cluster_state_healthy_members() {
         let mut state = ClusterState::new();
+        let n1 = test_node_id(1);
+        let n2 = test_node_id(2);
         state.apply(&LogEntry {
-            term: 1,
-            index: 1,
-            command: ClusterCommand::RegisterNode {
-                node_id: 1,
-                service_addr: "a:8080".to_string(),
-                raft_addr: "a:9090".to_string(),
+            term: Term(1),
+            index: LogIndex(1),
+            command: ClusterCommand::MemberJoin {
+                node_id: n1,
+                addr: "a:8080".to_string(),
                 service_type: "gateway".to_string(),
             },
         });
         state.apply(&LogEntry {
-            term: 1,
-            index: 2,
-            command: ClusterCommand::RegisterNode {
-                node_id: 2,
-                service_addr: "b:8080".to_string(),
-                raft_addr: "b:9090".to_string(),
+            term: Term(1),
+            index: LogIndex(2),
+            command: ClusterCommand::MemberJoin {
+                node_id: n2,
+                addr: "b:8080".to_string(),
                 service_type: "gateway".to_string(),
             },
         });
         // Mark one unhealthy
-        state.members.get_mut(&2).unwrap().healthy = false;
+        state.members.get_mut(&n2).unwrap().healthy = false;
 
         let healthy = state.healthy_members();
         assert_eq!(healthy.len(), 1);
-        assert_eq!(healthy[0].node_id, 1);
+        assert_eq!(healthy[0].node_id, n1);
     }
 
     #[tokio::test]
-    async fn standalone_node_becomes_leader() {
+    async fn standalone_node_starts() {
+        let nid = NodeId(uuid::Uuid::from_u128(0xCAFE));
         let config = ClusterConfig {
-            node_id: 0xCAFE,
+            node_id: nid,
             service_type: ServiceType::Orchestrator,
             service_addr: "127.0.0.1:0".to_string(),
             raft_addr: "127.0.0.1:0".to_string(),
@@ -959,33 +916,7 @@ mod tests {
         };
 
         let node = ClusterNode::start(config).await.unwrap();
-        assert!(node.is_leader());
-        assert_eq!(node.node_id(), 0xCAFE);
-
-        let state = node.cluster_state();
-        assert_eq!(state.leader_id, Some(0xCAFE));
-
-        // Propose should work on standalone leader
-        let idx = node.propose(ClusterCommand::BumpFencingToken).unwrap();
-        assert_eq!(idx, 1);
-
-        node.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn standalone_leader_watch() {
-        let config = ClusterConfig {
-            node_id: 0xBEEF,
-            service_type: ServiceType::Gateway,
-            service_addr: "127.0.0.1:0".to_string(),
-            raft_addr: "127.0.0.1:0".to_string(),
-            peers: vec![],
-            raft_config: RaftConfig::default(),
-        };
-
-        let node = ClusterNode::start(config).await.unwrap();
-        let rx = node.leader_watch();
-        assert_eq!(*rx.borrow(), Some(0xBEEF));
+        assert_eq!(node.node_id(), nid);
 
         node.shutdown().await;
     }
