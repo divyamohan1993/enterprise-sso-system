@@ -660,7 +660,7 @@ fn now_us() -> i64 {
     // SECURITY: Use monotonic time as primary source to prevent clock manipulation.
     // Monotonic time is immune to NTP jumps and manual clock changes.
     // Falls back to authenticated time, then system clock only in dev mode.
-    let monotonic = common::secure_time::monotonic_time_us();
+    let monotonic = common::secure_time::monotonic_now_us();
     if monotonic > 0 {
         return monotonic;
     }
