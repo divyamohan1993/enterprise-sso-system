@@ -1,0 +1,36 @@
+name: Continuous Fuzzing
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      matrix:
+        target:
+          - fuzz_shard_message
+          - fuzz_envelope_decrypt
+          - fuzz_token_verify
+          - fuzz_pkce_verify
+          - fuzz_receipt_chain
+          - fuzz_revocation
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+      - name: Run fuzzer (${{ matrix.target }})
+        run: |
+          cd fuzz
+          cargo +nightly fuzz run ${{ matrix.target }} -- \
+            -max_total_time=300 \
+            -max_len=65536
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/

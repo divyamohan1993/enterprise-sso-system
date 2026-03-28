@@ -909,8 +909,8 @@ async fn run_concurrent_logins(n: usize) {
 
 // ── Test 8: 10 concurrent logins ────────────────────────────────────────
 
+#[cfg(feature = "load-tests")]
 #[test]
-#[ignore]
 fn test_concurrent_logins_10() {
     let rt = build_pq_runtime();
     rt.block_on(rt.spawn(async { run_concurrent_logins(10).await }))
@@ -919,8 +919,8 @@ fn test_concurrent_logins_10() {
 
 // ── Test 9: 100 concurrent logins ───────────────────────────────────────
 
+#[cfg(feature = "load-tests")]
 #[test]
-#[ignore]
 fn test_concurrent_logins_100() {
     let rt = build_pq_runtime();
     rt.block_on(rt.spawn(async { run_concurrent_logins(100).await }))
@@ -929,8 +929,8 @@ fn test_concurrent_logins_100() {
 
 // ── Test 10: 500 concurrent logins ──────────────────────────────────────
 
+#[cfg(feature = "load-tests")]
 #[test]
-#[ignore]
 fn test_concurrent_logins_500() {
     let rt = build_pq_runtime();
     rt.block_on(rt.spawn(async { run_concurrent_logins(500).await }))
@@ -939,8 +939,8 @@ fn test_concurrent_logins_500() {
 
 // ── Test 11: 1000 concurrent logins ─────────────────────────────────────
 
+#[cfg(feature = "load-tests")]
 #[test]
-#[ignore]
 fn test_concurrent_logins_1000() {
     let rt = build_pq_runtime();
     rt.block_on(rt.spawn(async { run_concurrent_logins(1000).await }))
@@ -949,8 +949,8 @@ fn test_concurrent_logins_1000() {
 
 // ── Test 12: 5000 concurrent logins ─────────────────────────────────────
 
+#[cfg(feature = "load-tests")]
 #[test]
-#[ignore]
 fn test_concurrent_logins_5000() {
     let rt = build_pq_runtime();
     rt.block_on(rt.spawn(async { run_concurrent_logins(5000).await }))
