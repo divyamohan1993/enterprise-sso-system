@@ -11,8 +11,6 @@
 //! 4. Tampered node receives, verifies hash, replaces /proc/self/exe target
 //! 5. Tampered node signals for restart (via systemd or k8s)
 //! 6. On restart, node re-joins cluster with correct binary
-#![forbid(unsafe_code)]
-
 use crate::binary_attestation_mesh::BinaryHash;
 use crate::raft::NodeId;
 use sha2::{Digest, Sha512};

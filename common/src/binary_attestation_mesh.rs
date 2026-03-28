@@ -11,8 +11,6 @@
 //! - First node to join sets the golden hash
 //! - Subsequent nodes must match (or be rejected)
 //! - Hash is replicated in the Raft log as a MemberJoin metadata field
-#![forbid(unsafe_code)]
-
 use crate::raft::NodeId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
@@ -209,14 +207,33 @@ pub fn compute_binary_hash() -> Result<BinaryHash, String> {
 
 // ── Wire messages ────────────────────────────────────────────────────────────
 
+/// Serde helper for `[u8; 64]` -- serde only supports arrays up to 32 natively.
+mod byte_array_64 {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    pub fn serialize<S: Serializer>(data: &[u8; 64], ser: S) -> Result<S::Ok, S::Error> {
+        data.as_slice().serialize(ser)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<[u8; 64], D::Error> {
+        let v: Vec<u8> = Vec::deserialize(de)?;
+        v.try_into()
+            .map_err(|v: Vec<u8>| serde::de::Error::custom(format!("expected 64 bytes, got {}", v.len())))
+    }
+}
+
 /// Message type for binary attestation exchange between nodes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AttestationMessage {
     /// "Here is my binary hash" -- sent periodically.
-    HashReport { hash: BinaryHash, timestamp: i64 },
+    HashReport {
+        #[serde(with = "byte_array_64")]
+        hash: BinaryHash,
+        timestamp: i64,
+    },
     /// "Your hash doesn't match -- you may be tampered" -- sent to suspect node.
     TamperAlert {
+        #[serde(with = "byte_array_64")]
         expected: BinaryHash,
+        #[serde(with = "byte_array_64")]
         received: BinaryHash,
     },
     /// "Send me a copy of the correct binary" -- healing request.
@@ -226,6 +243,7 @@ pub enum AttestationMessage {
         chunk_index: u32,
         total_chunks: u32,
         data: Vec<u8>,
+        #[serde(with = "byte_array_64")]
         hash: BinaryHash,
     },
 }

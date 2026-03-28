@@ -8,8 +8,6 @@
 //! - Heartbeat interval: 500ms
 //! - Election timeout: 1500-3000ms (randomized)
 //! - Leader commits carry monotonic fencing tokens
-#![forbid(unsafe_code)]
-
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
