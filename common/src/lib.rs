@@ -90,6 +90,12 @@ pub mod cert_lifecycle;
 pub mod db_ha;
 pub mod distributed_session;
 
+// ── Distributed consensus, cluster coordination, and auto-healing ──
+pub mod raft;
+pub mod cluster;
+pub mod cluster_roles;
+pub mod auto_heal;
+
 // ── Privileged Identity Management (just-in-time elevation) ──
 pub mod pim;
 

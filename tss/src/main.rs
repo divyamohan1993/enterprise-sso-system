@@ -67,6 +67,39 @@ async fn main() {
         },
     );
 
+    // ── Distributed cluster coordination ──
+    let tss_addr = std::env::var("TSS_ADDR").unwrap_or_else(|_| "127.0.0.1:9103".into());
+    let cluster = match common::cluster::ClusterConfig::from_env_with_defaults(
+        common::cluster::ServiceType::TssCoordinator,
+        &tss_addr,
+    ) {
+        Ok(config) => {
+            tracing::info!(
+                node_id = %config.node_id,
+                peers = config.peers.len(),
+                "starting TSS cluster node"
+            );
+            match common::cluster::ClusterNode::start(config).await {
+                Ok(node) => {
+                    let mut watcher = node.leader_watch();
+                    tokio::spawn(async move {
+                        while watcher.changed().await.is_ok() {
+                            if let Some(lid) = *watcher.borrow() {
+                                tracing::info!(%lid, "TSS coordinator leader elected");
+                            }
+                        }
+                    });
+                    Some(node)
+                }
+                Err(e) => {
+                    tracing::warn!("TSS cluster start failed (standalone): {e}");
+                    None
+                }
+            }
+        }
+        Err(_) => None,
+    };
+
     // --- Role-based dispatch ---
     match std::env::var("MILNET_TSS_ROLE").ok().as_deref() {
         Some("coordinator") => {

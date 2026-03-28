@@ -68,9 +68,53 @@ async fn main() {
         },
     );
 
+    // ── Distributed cluster coordination ──
+    // Start Raft-based leader election. In standalone mode (no MILNET_CLUSTER_PEERS),
+    // this node becomes leader immediately for backward compatibility.
+    let cluster = match common::cluster::ClusterConfig::from_env_with_defaults(
+        common::cluster::ServiceType::Orchestrator,
+        &listen_addr,
+    ) {
+        Ok(config) => {
+            tracing::info!(
+                node_id = %config.node_id,
+                peers = config.peers.len(),
+                "starting orchestrator cluster node"
+            );
+            match common::cluster::ClusterNode::start(config).await {
+                Ok(node) => Some(node),
+                Err(e) => {
+                    tracing::warn!("cluster start failed (running standalone): {e}");
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            tracing::info!("no cluster config (standalone mode): {e}");
+            None
+        }
+    };
+
+    // If clustered, log leader election result
+    if let Some(ref c) = cluster {
+        let mut watcher = c.leader_watch();
+        let _leader_log = tokio::spawn(async move {
+            while watcher.changed().await.is_ok() {
+                let leader = *watcher.borrow();
+                match leader {
+                    Some(lid) => tracing::info!(%lid, "orchestrator leader elected"),
+                    None => tracing::warn!("orchestrator leader unknown"),
+                }
+            }
+        });
+    }
+
     tracing::info!("Starting orchestrator on {listen_addr} (mTLS)");
     if let Err(e) = service.run(&listen_addr).await {
         tracing::error!("Orchestrator exited with error: {e}");
+        if let Some(c) = cluster {
+            c.shutdown().await;
+        }
         std::process::exit(1);
     }
 }

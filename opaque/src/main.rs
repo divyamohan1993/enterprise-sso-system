@@ -45,6 +45,39 @@ async fn main() {
         },
     );
 
+    // ── Distributed cluster coordination ──
+    let opaque_addr = std::env::var("MILNET_OPAQUE_ADDR").unwrap_or_else(|_| "127.0.0.1:9102".into());
+    let _cluster = match common::cluster::ClusterConfig::from_env_with_defaults(
+        common::cluster::ServiceType::Opaque,
+        &opaque_addr,
+    ) {
+        Ok(config) => {
+            tracing::info!(
+                node_id = %config.node_id,
+                peers = config.peers.len(),
+                "starting OPAQUE cluster node"
+            );
+            match common::cluster::ClusterNode::start(config).await {
+                Ok(node) => {
+                    let mut watcher = node.leader_watch();
+                    tokio::spawn(async move {
+                        while watcher.changed().await.is_ok() {
+                            if let Some(lid) = *watcher.borrow() {
+                                tracing::info!(%lid, "OPAQUE leader elected — this node coordinates threshold fan-out");
+                            }
+                        }
+                    });
+                    Some(node)
+                }
+                Err(e) => {
+                    tracing::warn!("OPAQUE cluster start failed (standalone): {e}");
+                    None
+                }
+            }
+        }
+        Err(_) => None,
+    };
+
     let result = match opaque_mode.as_str() {
         "threshold" => run_threshold_mode().await,
         "single" => {
