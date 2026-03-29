@@ -24,8 +24,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd -r -u 65534 -s /usr/sbin/nologin svc
-USER 65534:65534
+# UID 65534 = nobody (already exists on Debian)
+USER nobody:nogroup
 
 COPY --from=builder --chown=65534:65534 /build/service-binary /service
 
