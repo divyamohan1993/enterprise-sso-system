@@ -15,6 +15,9 @@ err()  { echo -e "${RED}[✗]${NC} $*" >&2; }
 
 # ── Step 1: Install k3s ─────────────────────────────────────────────────────
 install_k3s() {
+    # Helm and kubectl need this
+    export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+
     if command -v k3s &>/dev/null; then
         log "k3s already installed: $(k3s --version)"
         return
