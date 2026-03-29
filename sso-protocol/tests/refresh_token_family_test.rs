@@ -99,7 +99,10 @@ fn double_consumption_revokes_entire_family() {
     // ATTACK: Replay the old token (e.g., stolen before rotation)
     let result = store.redeem(&token, "client-1");
     assert!(result.is_err(), "double-consumption MUST be rejected");
-    let err = result.unwrap_err();
+    let err = match result {
+        Err(e) => e,
+        Ok(_) => panic!("expected error for double-consumption"),
+    };
     assert!(
         err.contains("already used") || err.contains("theft"),
         "error must indicate token theft detection"
@@ -126,7 +129,10 @@ fn cross_client_refresh_token_usage_fails() {
 
     let result = store.redeem(&token, "client-2");
     assert!(result.is_err(), "cross-client token usage MUST fail");
-    let err = result.unwrap_err();
+    let err = match result {
+        Err(e) => e,
+        Ok(_) => panic!("expected error for cross-client usage"),
+    };
     assert!(
         err.contains("client_id mismatch"),
         "error must indicate client mismatch"
@@ -184,7 +190,11 @@ fn nonexistent_token_rejected() {
     let mut store = RefreshTokenStore::new();
     let result = store.redeem("rt_nonexistent", "client-1");
     assert!(result.is_err());
-    assert!(result.unwrap_err().contains("not found"));
+    let err = match result {
+        Err(e) => e,
+        Ok(_) => panic!("expected error for nonexistent token"),
+    };
+    assert!(err.contains("not found"));
 }
 
 // ── Cleanup ───────────────────────────────────────────────────────────────
