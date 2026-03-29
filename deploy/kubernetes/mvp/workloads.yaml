@@ -32,7 +32,7 @@ spec:
                 name: milnet-common-config
           env:
             - name: GATEWAY_BIND_ADDR
-              value: "0.0.0.0:9100"
+              value: "0.0.0.0"
             - name: MILNET_GATEWAY_CERT_PATH
               value: "/etc/milnet/tls/tls.crt"
             - name: MILNET_GATEWAY_KEY_PATH
