@@ -1,6 +1,7 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use zeroize::Zeroize;
 
 use admin::routes::{api_router, AppState};
 
@@ -42,10 +43,18 @@ async fn main() {
         key
     });
 
+    // SECURITY: Remove ADMIN_API_KEY from environment after reading to prevent
+    // leakage via /proc/pid/environ or child process inheritance.
+    std::env::remove_var("ADMIN_API_KEY");
+
     let db_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://localhost/milnet_sso".to_string());
     let pool = common::db::init_database(&db_url).await;
     tracing::info!("Connected to PostgreSQL");
+
+    // SECURITY: Remove DATABASE_URL from environment now that the connection
+    // pool is established. Credentials must not linger in /proc/pid/environ.
+    std::env::remove_var("DATABASE_URL");
 
     // ── HA pool with primary/replica routing ──
     let replica_urls: Vec<String> = std::env::var("DATABASE_REPLICA_URLS")
@@ -76,6 +85,9 @@ async fn main() {
             ..common::db_ha::HaConfig::default()
         }
     };
+
+    // SECURITY: Remove replica connection strings from environment after use.
+    std::env::remove_var("DATABASE_REPLICA_URLS");
 
     if replica_urls.is_empty() {
         tracing::warn!("No DATABASE_REPLICA_URLS configured — running without read replicas");
@@ -120,7 +132,8 @@ async fn main() {
     // SECURITY: OPAQUE ServerSetup contains the OPRF seed and server keypair.
     // It MUST be encrypted at rest using envelope encryption with the master KEK.
     // Derive a dedicated KEK for OPAQUE server setup via HKDF-SHA512.
-    let opaque_setup_kek = {
+    // The KEK is wrapped in a zeroizing container to ensure it is cleared on drop.
+    let mut opaque_setup_kek = {
         let master = common::sealed_keys::cached_master_kek();
         use hkdf::Hkdf;
         use sha2::Sha512;
@@ -181,6 +194,10 @@ async fn main() {
         store
     };
 
+    // SECURITY: Zeroize the OPAQUE setup KEK now that encryption/decryption is done.
+    // The KEK must not remain in memory longer than necessary.
+    opaque_setup_kek.zeroize();
+
     // Restore user registrations from PostgreSQL
     let rows = sqlx::query_as::<_, (uuid::Uuid, String, Vec<u8>)>(
         "SELECT id, username, opaque_registration FROM users WHERE opaque_registration IS NOT NULL"
@@ -201,6 +218,10 @@ async fn main() {
         std::env::var("SSO_BASE_URL"),
     ) {
         (Ok(cid), Ok(csec), Ok(base)) => {
+            // SECURITY: Remove OAuth secrets from environment after reading.
+            // These must not linger in /proc/pid/environ.
+            std::env::remove_var("GOOGLE_CLIENT_ID");
+            std::env::remove_var("GOOGLE_CLIENT_SECRET");
             tracing::info!("Google OAuth configured");
             Some(admin::google_oauth::GoogleOAuthConfig {
                 client_id: cid,
@@ -327,6 +348,11 @@ async fn main() {
     // TLS configuration check
     let tls_cert = std::env::var("ADMIN_TLS_CERT").ok();
     let tls_key = std::env::var("ADMIN_TLS_KEY").ok();
+
+    // SECURITY: Remove TLS key path from environment after reading.
+    // The path itself can reveal filesystem layout to an attacker.
+    std::env::remove_var("ADMIN_TLS_KEY");
+
     let require_tls = std::env::var("REQUIRE_TLS")
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);

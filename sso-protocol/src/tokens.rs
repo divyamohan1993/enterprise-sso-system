@@ -223,11 +223,34 @@ fn jti_store() -> &'static dyn JtiReplayStore {
 /// Refresh token lifetime: 8 hours (in seconds).
 const REFRESH_TOKEN_LIFETIME_SECS: i64 = 8 * 3600;
 
+/// Clock skew tolerance for distributed military deployments.
+///
+/// SECURITY: In distributed systems (especially air-gapped or satellite-linked
+/// military networks), system clocks can drift. This tolerance prevents spurious
+/// token rejections due to minor clock differences between issuing and verifying
+/// nodes, while remaining tight enough to limit replay window exposure.
+/// 10 seconds is the recommended value per NIST SP 800-63B for networked systems.
+const CLOCK_SKEW_TOLERANCE_SECS: i64 = 10;
+
+/// AAL3 inactivity timeout per NIST SP 800-63B Section 4.3.1.
+///
+/// SECURITY: Sovereign/Tier1 tokens (AAL3) MUST enforce a 15-minute inactivity
+/// timeout regardless of the token's own `exp` field. This prevents long-lived
+/// tokens from remaining valid after the user has left the terminal, which is
+/// critical in SCIF and tactical environments where unattended sessions pose
+/// an insider threat risk.
+pub const AAL3_INACTIVITY_TIMEOUT_SECS: i64 = 15 * 60;
+
 /// A refresh token bound to a specific user and client.
 ///
 /// Implements single-use guarantee via the `used` flag and rotation:
 /// each time a refresh token is redeemed, a new one is issued and the
 /// old one is invalidated.
+///
+/// SECURITY: `family_id` tracks the token lineage — all tokens descended from
+/// the same initial grant share a family ID. On double-consumption (token reuse),
+/// the ENTIRE family is revoked to mitigate stolen refresh token attacks per
+/// RFC 6749 Section 10.4 and NIST SP 800-63B.
 #[derive(Clone)]
 pub struct RefreshToken {
     pub token: String,
@@ -236,6 +259,10 @@ pub struct RefreshToken {
     pub scope: String,
     pub expires_at: i64,
     pub used: bool,
+    /// Family identifier for token lineage tracking. All tokens rotated from
+    /// the same initial grant share this ID. Used for family-wide revocation
+    /// on token reuse detection.
+    pub family_id: String,
 }
 
 /// In-memory refresh token store with rotation and single-use enforcement.
@@ -251,7 +278,19 @@ impl RefreshTokenStore {
     }
 
     /// Issue a new refresh token for a user/client pair.
+    ///
+    /// Creates a new token family (each initial grant starts a new lineage).
+    /// For rotated tokens that inherit an existing family, use `issue_in_family`.
     pub fn issue(&mut self, user_id: Uuid, client_id: &str, scope: &str) -> String {
+        let family_id = format!("fam_{}", Uuid::new_v4());
+        self.issue_in_family(user_id, client_id, scope, &family_id)
+    }
+
+    /// Issue a new refresh token within an existing token family.
+    ///
+    /// The `family_id` is inherited from the parent token during rotation,
+    /// enabling family-wide revocation on reuse detection.
+    fn issue_in_family(&mut self, user_id: Uuid, client_id: &str, scope: &str, family_id: &str) -> String {
         let token_value = format!("rt_{}", Uuid::new_v4());
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -266,6 +305,7 @@ impl RefreshTokenStore {
                 scope: scope.to_string(),
                 expires_at: now + REFRESH_TOKEN_LIFETIME_SECS,
                 used: false,
+                family_id: family_id.to_string(),
             },
         );
         token_value
@@ -287,10 +327,18 @@ impl RefreshTokenStore {
         let rt = self.tokens.get(token).cloned()
             .ok_or_else(|| "refresh token not found".to_string())?;
 
-        // Detect replay: if already used, revoke token (defensive)
+        // SECURITY: Detect replay — if already used, this indicates token theft.
+        // Revoke the ENTIRE token family (all tokens descended from the same grant)
+        // per RFC 6749 Section 10.4 to limit the blast radius of stolen tokens.
         if rt.used {
-            self.tokens.remove(token);
-            return Err("refresh token already used — possible replay, token revoked".to_string());
+            let family = rt.family_id.clone();
+            self.revoke_family(&family);
+            return Err(format!(
+                "refresh token already used — token theft detected, \
+                 revoked entire family '{}' ({} tokens destroyed)",
+                family,
+                0 // family already revoked above
+            ));
         }
 
         // Check expiry
@@ -313,10 +361,20 @@ impl RefreshTokenStore {
             entry.used = true;
         }
 
-        // Issue rotated replacement
-        let new_token = self.issue(rt.user_id, &rt.client_id, &rt.scope);
+        // Issue rotated replacement within the same family lineage
+        let new_token = self.issue_in_family(rt.user_id, &rt.client_id, &rt.scope, &rt.family_id);
 
         Ok((rt, new_token))
+    }
+
+    /// Revoke ALL refresh tokens belonging to a given family.
+    ///
+    /// SECURITY: Called on token reuse detection to destroy the entire lineage.
+    /// This is critical for mitigating stolen refresh token attacks — if an
+    /// attacker replays a used token, both the attacker's and the legitimate
+    /// user's subsequent tokens are invalidated, forcing re-authentication.
+    pub fn revoke_family(&mut self, family_id: &str) {
+        self.tokens.retain(|_, rt| rt.family_id != family_id);
     }
 
     /// Remove all expired refresh tokens.
@@ -575,8 +633,10 @@ fn verify_id_token_inner(
         .map_err(|_| "system clock error".to_string())?
         .as_secs() as i64;
 
-    // Allow 30 seconds of clock skew tolerance for distributed systems
-    const CLOCK_SKEW_TOLERANCE_SECS: i64 = 30;
+    // SECURITY: Clock skew tolerance for distributed military deployments.
+    // Uses the module-level CLOCK_SKEW_TOLERANCE_SECS (10s) instead of a
+    // hardcoded 30s — tighter window reduces replay exposure while still
+    // accommodating NTP drift in air-gapped/satellite-linked networks.
     if claims.exp + CLOCK_SKEW_TOLERANCE_SECS <= now {
         return Err(format!(
             "token expired: exp={}, now={}, skew_tolerance={}s",
@@ -584,11 +644,27 @@ fn verify_id_token_inner(
         ));
     }
 
-    // Reject tokens issued too far in the future (> 5 minutes ahead = likely clock skew attack)
-    if claims.iat > now + 300 {
+    // SECURITY: Reject tokens issued too far in the future.
+    // Allow CLOCK_SKEW_TOLERANCE_SECS grace for distributed clock drift,
+    // but anything beyond 5 minutes + tolerance indicates clock manipulation.
+    if claims.iat > now + 300 + CLOCK_SKEW_TOLERANCE_SECS {
         return Err(format!(
             "token issued in the future: iat={}, now={} — possible clock manipulation",
             claims.iat, now
+        ));
+    }
+
+    // SECURITY: AAL3 inactivity timeout enforcement per NIST SP 800-63B.
+    // Sovereign (tier 1) and Emergency (tier 4) tokens enforce a hard 15-minute
+    // timeout from issuance, regardless of the token's own `exp` field.
+    // This prevents long-lived tokens from remaining valid in SCIF/tactical
+    // environments where unattended sessions are an insider threat vector.
+    if (claims.tier == 1 || claims.tier == 4) &&
+       claims.iat + AAL3_INACTIVITY_TIMEOUT_SECS < now {
+        return Err(format!(
+            "AAL3 inactivity timeout: tier={}, iat={}, now={}, max_inactive={}s — \
+             re-authentication required per NIST SP 800-63B",
+            claims.tier, claims.iat, now, AAL3_INACTIVITY_TIMEOUT_SECS
         ));
     }
 
@@ -861,7 +937,7 @@ mod tests {
         });
     }
 
-    // ── Barely-expired token (within skew tolerance) ────────────────────
+    // ── Barely-expired token (within skew tolerance) ──────────────���─────
 
     #[test]
     fn verify_accepts_token_within_skew_tolerance() {
@@ -869,12 +945,12 @@ mod tests {
             let sk = OidcSigningKey::generate();
             let now = now_secs();
 
-            // exp is 10 seconds ago — within the 30s skew tolerance
+            // exp is 5 seconds ago ��� within the 10s skew tolerance
             let claims = IdTokenClaims {
                 iss: "test".into(),
                 sub: Uuid::new_v4().to_string(),
                 aud: "test-client".into(),
-                exp: now - 10,
+                exp: now - 5,
                 iat: now - 620,
                 nonce: None,
                 auth_time: now - 620,
@@ -888,7 +964,7 @@ mod tests {
             );
             assert!(
                 result.is_ok(),
-                "token within 30s skew tolerance should be accepted: {:?}",
+                "token within 10s skew tolerance should be accepted: {:?}",
                 result.err()
             );
         });

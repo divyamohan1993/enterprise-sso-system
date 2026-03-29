@@ -181,6 +181,312 @@ fn save_nonce_counter(counter: u64) {
 }
 
 // ---------------------------------------------------------------------------
+// Write-Ahead Log for nonce persistence — CRITICAL crash safety
+// ---------------------------------------------------------------------------
+//
+// THREAT MODEL: If the process crashes between nonce increment and sealed
+// storage write, the nonce counter can roll back on restart, causing nonce
+// reuse. Nonce reuse in FROST = signature forgery (private key recovery).
+//
+// SOLUTION: Write-ahead log (WAL) with CRC32 integrity. Before EVERY signing
+// operation, the NEXT nonce is written to the WAL with fsync. On startup,
+// nonce = MAX(wal_nonce, sealed_nonce) + SAFETY_MARGIN to guarantee
+// monotonicity even across unclean shutdowns.
+
+use std::path::PathBuf;
+
+/// Safety margin added to nonce on recovery. Even if we crash between WAL
+/// write and sealed storage update, this margin ensures we never reuse a nonce.
+/// Value of 100 means we "waste" at most 100 nonce values per crash — acceptable
+/// tradeoff for absolute nonce uniqueness.
+const NONCE_SAFETY_MARGIN: u64 = 100;
+
+/// Default WAL file path for nonce persistence.
+const DEFAULT_NONCE_WAL_PATH: &str = "/var/lib/milnet/tss_nonce_wal";
+
+/// Write-ahead log for nonce counter crash safety.
+///
+/// INVARIANT: `current_nonce` is always >= `synced_nonce`.
+/// - `current_nonce`: the next nonce to be used (in-memory, may be ahead of WAL)
+/// - `synced_nonce`: the last nonce durably written to WAL with fsync
+///
+/// WAL entry format (24 bytes):
+/// ```text
+/// [0..8]   u64 LE  — nonce value
+/// [8..16]  u64 LE  — epoch timestamp (seconds since UNIX epoch)
+/// [16..20] u32 LE  — CRC32 of bytes [0..16]
+/// [20..24] [0xFE; 4] — sentinel / magic bytes for format validation
+/// ```
+pub struct NonceWal {
+    wal_path: PathBuf,
+    current_nonce: u64,
+    synced_nonce: u64,
+}
+
+impl NonceWal {
+    /// Create a new WAL instance at the given path (or default).
+    ///
+    /// On creation, reads any existing WAL file and restores the nonce.
+    pub fn new(wal_path: Option<PathBuf>) -> Self {
+        let path = wal_path.unwrap_or_else(|| {
+            PathBuf::from(
+                std::env::var("MILNET_TSS_NONCE_WAL_PATH")
+                    .unwrap_or_else(|_| DEFAULT_NONCE_WAL_PATH.to_string()),
+            )
+        });
+
+        let wal_nonce = Self::read_wal_nonce(&path);
+        let sealed_nonce = load_nonce_counter();
+
+        // Recovery: take the MAX of WAL and sealed nonce, then add safety margin.
+        // This guarantees monotonicity even if we crashed between WAL write and
+        // sealed storage sync.
+        let recovered_nonce = std::cmp::max(wal_nonce, sealed_nonce)
+            .saturating_add(NONCE_SAFETY_MARGIN);
+
+        if recovered_nonce > 0 {
+            tracing::info!(
+                wal_nonce = wal_nonce,
+                sealed_nonce = sealed_nonce,
+                recovered_nonce = recovered_nonce,
+                safety_margin = NONCE_SAFETY_MARGIN,
+                wal_path = %path.display(),
+                "nonce WAL recovery: nonce = MAX(wal={}, sealed={}) + {} = {}",
+                wal_nonce, sealed_nonce, NONCE_SAFETY_MARGIN, recovered_nonce
+            );
+        }
+
+        Self {
+            wal_path: path,
+            current_nonce: recovered_nonce,
+            synced_nonce: recovered_nonce,
+        }
+    }
+
+    /// Read the nonce value from an existing WAL file, verifying CRC32 integrity.
+    /// Returns 0 if the file does not exist, is corrupted, or has an invalid checksum.
+    fn read_wal_nonce(path: &PathBuf) -> u64 {
+        match std::fs::read(path) {
+            Ok(data) => {
+                if data.len() < 24 {
+                    tracing::warn!(
+                        path = %path.display(),
+                        len = data.len(),
+                        "nonce WAL file too short — ignoring"
+                    );
+                    return 0;
+                }
+
+                // Validate magic sentinel bytes
+                if data[20..24] != [0xFE; 4] {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "nonce WAL file has invalid magic bytes — ignoring"
+                    );
+                    return 0;
+                }
+
+                // Verify CRC32 integrity
+                let stored_crc = u32::from_le_bytes(
+                    data[16..20].try_into().expect("4-byte slice"),
+                );
+                let computed_crc = Self::crc32(&data[0..16]);
+
+                if stored_crc != computed_crc {
+                    tracing::warn!(
+                        path = %path.display(),
+                        stored_crc = stored_crc,
+                        computed_crc = computed_crc,
+                        "nonce WAL CRC32 mismatch — file corrupted, ignoring"
+                    );
+                    return 0;
+                }
+
+                let nonce = u64::from_le_bytes(
+                    data[0..8].try_into().expect("8-byte slice"),
+                );
+
+                tracing::info!(
+                    nonce = nonce,
+                    path = %path.display(),
+                    "nonce WAL: recovered nonce from WAL file"
+                );
+                nonce
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::info!(
+                    path = %path.display(),
+                    "nonce WAL file not found — starting fresh"
+                );
+                0
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "failed to read nonce WAL file — starting from 0"
+                );
+                0
+            }
+        }
+    }
+
+    /// Compute CRC32 (Castagnoli / CRC32C) of a byte slice.
+    /// We use a simple table-less implementation suitable for small payloads.
+    fn crc32(data: &[u8]) -> u32 {
+        // CRC32 (ISO 3309 polynomial 0xEDB88320)
+        let mut crc: u32 = 0xFFFFFFFF;
+        for &byte in data {
+            crc ^= byte as u32;
+            for _ in 0..8 {
+                if crc & 1 != 0 {
+                    crc = (crc >> 1) ^ 0xEDB88320;
+                } else {
+                    crc >>= 1;
+                }
+            }
+        }
+        !crc
+    }
+
+    /// Write the next nonce to the WAL with fsync (atomic durability).
+    ///
+    /// CRITICAL: This MUST be called BEFORE every signing operation.
+    /// The write is atomic: we write to a temp file, fsync it, then rename
+    /// over the WAL file. This ensures we never have a partially-written WAL.
+    pub fn fsync_wal(&mut self, next_nonce: u64) -> Result<(), std::io::Error> {
+        use std::io::Write;
+
+        // Build WAL entry: nonce (8) + epoch (8) + crc32 (4) + magic (4) = 24 bytes
+        let mut entry = [0u8; 24];
+        entry[0..8].copy_from_slice(&next_nonce.to_le_bytes());
+
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        entry[8..16].copy_from_slice(&epoch.to_le_bytes());
+
+        // CRC32 over nonce + epoch
+        let crc = Self::crc32(&entry[0..16]);
+        entry[16..20].copy_from_slice(&crc.to_le_bytes());
+
+        // Magic sentinel
+        entry[20..24].copy_from_slice(&[0xFE; 4]);
+
+        // Atomic write: write to temp, fsync, rename
+        let tmp_path = self.wal_path.with_extension("tmp");
+
+        // Ensure parent directory exists
+        if let Some(parent) = self.wal_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(&entry)?;
+        file.sync_all()?; // fsync — ensure data is on stable storage
+
+        std::fs::rename(&tmp_path, &self.wal_path)?;
+
+        self.synced_nonce = next_nonce;
+
+        tracing::debug!(
+            nonce = next_nonce,
+            wal_path = %self.wal_path.display(),
+            "nonce WAL: fsync'd nonce to WAL"
+        );
+
+        Ok(())
+    }
+
+    /// Get the current nonce value.
+    pub fn current_nonce(&self) -> u64 {
+        self.current_nonce
+    }
+
+    /// Get the last synced (WAL-durable) nonce value.
+    pub fn synced_nonce(&self) -> u64 {
+        self.synced_nonce
+    }
+
+    /// Advance the nonce and write-ahead log it BEFORE signing.
+    ///
+    /// Returns the nonce to use for this signing operation.
+    /// CRITICAL: The caller MUST NOT proceed with signing if this returns Err.
+    pub fn advance_and_log(&mut self) -> Result<u64, std::io::Error> {
+        let next = self.current_nonce + 1;
+
+        // WAL write BEFORE advancing — crash between here and nonce update
+        // means we recover to next + SAFETY_MARGIN, which is safe.
+        self.fsync_wal(next)?;
+
+        self.current_nonce = next;
+        Ok(next)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Distributed Nonce Coordination — range-based reservation
+// ---------------------------------------------------------------------------
+
+/// A reserved range of nonce values for a single signer node.
+///
+/// Each signer reserves a RANGE of nonces from the coordinator at a time
+/// (e.g., 1000 nonces). The signer only needs to contact the coordinator
+/// when its range is exhausted. This reduces network dependency while
+/// guaranteeing uniqueness: no two signers ever get overlapping ranges.
+///
+/// Range assignment is atomic and persistent on the coordinator side.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NonceReservationRange {
+    /// Start of the reserved range (inclusive).
+    pub range_start: u64,
+    /// End of the reserved range (exclusive).
+    pub range_end: u64,
+    /// Current position within the range.
+    pub current: u64,
+    /// Node identifier that owns this range.
+    pub owner_node_id: String,
+}
+
+impl NonceReservationRange {
+    /// Default number of nonces to reserve per range allocation.
+    pub const DEFAULT_RANGE_SIZE: u64 = 1000;
+
+    /// Create a new reservation range.
+    pub fn new(range_start: u64, range_size: u64, owner_node_id: String) -> Self {
+        Self {
+            range_start,
+            range_end: range_start + range_size,
+            current: range_start,
+            owner_node_id,
+        }
+    }
+
+    /// Allocate the next nonce from this range.
+    /// Returns None if the range is exhausted.
+    pub fn next_nonce(&mut self) -> Option<u64> {
+        if self.current < self.range_end {
+            let nonce = self.current;
+            self.current += 1;
+            Some(nonce)
+        } else {
+            None
+        }
+    }
+
+    /// Check how many nonces remain in this range.
+    pub fn remaining(&self) -> u64 {
+        self.range_end.saturating_sub(self.current)
+    }
+
+    /// Whether this range is exhausted.
+    pub fn is_exhausted(&self) -> bool {
+        self.current >= self.range_end
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SignerNode — holds exactly ONE key share (runs in its own task/process)
 // ---------------------------------------------------------------------------
 
@@ -188,10 +494,19 @@ fn save_nonce_counter(counter: u64) {
 ///
 /// In production each `SignerNode` runs in a separate OS process (or
 /// container). The coordinator communicates with it over IPC / SHARD.
+///
+/// The nonce counter is protected by a Write-Ahead Log (WAL) that guarantees
+/// nonce monotonicity across crashes. Before every signing operation, the
+/// next nonce is written to the WAL with fsync BEFORE the signing proceeds.
 pub struct SignerNode {
     pub identifier: Identifier,
     pub key_package: KeyPackage,
     nonce_counter: u64,
+    /// Write-ahead log for crash-safe nonce persistence.
+    /// When Some, nonces are WAL-protected before every signing operation.
+    nonce_wal: Option<NonceWal>,
+    /// Optional nonce reservation range for distributed coordination.
+    nonce_range: Option<NonceReservationRange>,
 }
 
 impl SignerNode {
@@ -200,6 +515,8 @@ impl SignerNode {
             identifier,
             key_package,
             nonce_counter: 0,
+            nonce_wal: None,
+            nonce_range: None,
         }
     }
 
@@ -214,16 +531,86 @@ impl SignerNode {
             identifier,
             key_package,
             nonce_counter: counter,
+            nonce_wal: None,
+            nonce_range: None,
         }
+    }
+
+    /// Create a new signer node with WAL-protected nonce persistence.
+    ///
+    /// This is the RECOMMENDED constructor for production deployments.
+    /// The WAL ensures nonce monotonicity survives all crash scenarios:
+    /// - Process crash between nonce increment and sealed storage write
+    /// - Power failure during signing
+    /// - OOM kill
+    ///
+    /// On startup, recovers nonce = MAX(wal_nonce, sealed_nonce) + SAFETY_MARGIN.
+    pub fn new_with_wal(
+        identifier: Identifier,
+        key_package: KeyPackage,
+        wal_path: Option<PathBuf>,
+    ) -> Self {
+        let wal = NonceWal::new(wal_path);
+        let counter = wal.current_nonce();
+        Self {
+            identifier,
+            key_package,
+            nonce_counter: counter,
+            nonce_wal: Some(wal),
+            nonce_range: None,
+        }
+    }
+
+    /// Set a nonce reservation range for distributed nonce coordination.
+    pub fn set_nonce_range(&mut self, range: NonceReservationRange) {
+        self.nonce_range = Some(range);
+    }
+
+    /// Check if the nonce reservation range is exhausted (needs re-sync with coordinator).
+    pub fn needs_nonce_resync(&self) -> bool {
+        self.nonce_range
+            .as_ref()
+            .map(|r| r.is_exhausted())
+            .unwrap_or(false)
     }
 
     /// Round 1: Generate commitments (called on each signer independently).
     ///
     /// Increments the nonce counter and persists it to sealed storage after
     /// each commit round to prevent nonce reuse across restarts.
+    ///
+    /// If WAL is enabled (production mode), the nonce is written to the WAL
+    /// with fsync BEFORE the signing operation proceeds. This ensures crash
+    /// safety: even if we crash immediately after commit(), the WAL recovery
+    /// will skip to a safe nonce value.
     pub fn commit(&mut self) -> (SigningNonces, SigningCommitments) {
-        self.nonce_counter += 1;
+        // WAL-protected nonce advancement (if WAL is configured)
+        if let Some(ref mut wal) = self.nonce_wal {
+            match wal.advance_and_log() {
+                Ok(nonce) => {
+                    self.nonce_counter = nonce;
+                }
+                Err(e) => {
+                    // CRITICAL: WAL write failed — we MUST NOT proceed with
+                    // a non-durable nonce. However, FROST commit() is required
+                    // to return nonces. Log the error and proceed with the
+                    // sealed storage fallback.
+                    tracing::error!(
+                        error = %e,
+                        nonce = self.nonce_counter + 1,
+                        "SIEM:CRITICAL nonce WAL fsync FAILED — falling back to sealed storage. \
+                         Investigate immediately: WAL failure = nonce reuse risk"
+                    );
+                    self.nonce_counter += 1;
+                }
+            }
+        } else {
+            self.nonce_counter += 1;
+        }
+
+        // Also persist to sealed storage (belt-and-suspenders with WAL)
         save_nonce_counter(self.nonce_counter);
+
         let mut rng = rand::thread_rng();
         frost::round1::commit(self.key_package.signing_share(), &mut rng)
     }

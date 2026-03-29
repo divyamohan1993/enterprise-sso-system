@@ -319,6 +319,92 @@ impl ProductionKeySource for SoftwareKeySource {
 }
 
 // ---------------------------------------------------------------------------
+// SealedKeystore — defense-in-depth encrypted key storage
+// ---------------------------------------------------------------------------
+
+/// In-memory keystore that encrypts all keys with a secondary derived key.
+///
+/// Defense-in-depth: even if process memory is dumped (e.g., via /proc/pid/mem),
+/// keys stored in the SealedKeystore are encrypted with a secondary key derived
+/// from the master key. An attacker must compromise both the master key AND the
+/// memory dump to recover the stored keys.
+///
+/// The secondary encryption key is derived via HKDF-SHA512 from the master key
+/// with a unique domain separator, ensuring it is cryptographically independent.
+pub struct SealedKeystore {
+    /// The secondary KEK used to encrypt stored keys. Derived from the master key.
+    secondary_kek: DerivedKek,
+    /// Encrypted key entries: purpose -> sealed bytes.
+    entries: std::collections::HashMap<String, Vec<u8>>,
+}
+
+impl SealedKeystore {
+    /// Create a new SealedKeystore with a secondary key derived from the master key.
+    ///
+    /// The secondary key is derived using HKDF-SHA512 with domain separator
+    /// "sealed-keystore-secondary" to ensure cryptographic independence from
+    /// all other derived keys in the hierarchy.
+    pub fn new(master: &MasterKey) -> Self {
+        let secondary_kek = master.derive_kek("sealed-keystore-secondary");
+        Self {
+            secondary_kek,
+            entries: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Store a key under the given purpose, encrypting it with the secondary KEK.
+    ///
+    /// The plaintext key bytes are sealed immediately; the caller should zeroize
+    /// their copy after calling this method.
+    pub fn store(&mut self, purpose: &str, key_bytes: &[u8]) -> Result<(), SealError> {
+        let sealed = self.secondary_kek.seal(key_bytes)?;
+        self.entries.insert(purpose.to_string(), sealed);
+        Ok(())
+    }
+
+    /// Retrieve and decrypt a key stored under the given purpose.
+    ///
+    /// Returns `None` if no key is stored for the purpose.
+    /// Returns `Err` if decryption fails (secondary KEK mismatch or tampering).
+    pub fn retrieve(&self, purpose: &str) -> Result<Option<Vec<u8>>, SealError> {
+        match self.entries.get(purpose) {
+            Some(sealed) => {
+                let plaintext = self.secondary_kek.unseal(sealed)?;
+                Ok(Some(plaintext))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Remove a stored key, zeroizing the sealed bytes.
+    pub fn remove(&mut self, purpose: &str) {
+        if let Some(mut sealed) = self.entries.remove(purpose) {
+            sealed.zeroize();
+        }
+    }
+
+    /// Returns the number of keys currently stored.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns true if no keys are stored.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl Drop for SealedKeystore {
+    fn drop(&mut self) {
+        // Zeroize all sealed entries on drop.
+        for (_, sealed) in self.entries.iter_mut() {
+            sealed.zeroize();
+        }
+        self.entries.clear();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Factory: create key source from HSM configuration
 // ---------------------------------------------------------------------------
 

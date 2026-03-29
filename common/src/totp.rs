@@ -58,12 +58,34 @@ impl TotpAlgorithm {
 }
 
 /// Read the default TOTP algorithm from `MILNET_TOTP_ALGORITHM` env var.
-/// Defaults to SHA-256 if unset or unrecognized.
+///
+/// SECURITY: Defaults to SHA-512 (CNSA 2.0 compliant) if unset or unrecognized.
+/// SHA-1 is REJECTED for new enrollments even if explicitly configured — it is
+/// retained only for verification of legacy tokens during migration.
 pub fn default_totp_algorithm() -> TotpAlgorithm {
-    std::env::var("MILNET_TOTP_ALGORITHM")
+    let algo = std::env::var("MILNET_TOTP_ALGORITHM")
         .ok()
         .and_then(|v| TotpAlgorithm::from_str_loose(&v))
-        .unwrap_or(TotpAlgorithm::Sha256)
+        .unwrap_or(TotpAlgorithm::Sha512);
+
+    // SECURITY: Block SHA-1 for new enrollments — only SHA-256+ is acceptable.
+    if algo == TotpAlgorithm::Sha1 {
+        tracing::error!(
+            "SECURITY: MILNET_TOTP_ALGORITHM=SHA1 is PROHIBITED for new enrollments. \
+             Overriding to SHA-512 (CNSA 2.0). Remove SHA-1 configuration immediately."
+        );
+        return TotpAlgorithm::Sha512;
+    }
+
+    algo
+}
+
+/// Returns true if the given algorithm string represents a legacy/deprecated algorithm.
+///
+/// SECURITY: Legacy algorithms must not be used for new enrollments.
+/// Existing tokens using these algorithms should be migrated urgently.
+pub fn is_legacy_algorithm(algo: &str) -> bool {
+    matches!(algo.to_lowercase().as_str(), "sha1" | "sha-1")
 }
 
 /// Global TOTP used-code cache — prevents replay within a time window.
@@ -111,6 +133,13 @@ fn secret_fingerprint(secret: &[u8]) -> u64 {
     secret.hash(&mut hasher);
     hasher.finish()
 }
+
+/// Minimum acceptable algorithm for new TOTP enrollments.
+///
+/// SECURITY: SHA-1 is cryptographically weakened and MUST NOT be used for new
+/// enrollments. CNSA 2.0 mandates SHA-384+ but SHA-256 is the practical minimum
+/// for TOTP where collision resistance is less critical than HMAC security.
+pub const TOTP_MIN_ALGORITHM: &str = "SHA256";
 
 /// Time step in seconds (RFC 6238 default).
 const TIME_STEP: u64 = 30;
@@ -209,12 +238,15 @@ pub fn verify_totp_with_algorithm(
 ) -> bool {
     use subtle::ConstantTimeEq;
 
-    // Log deprecation warning for SHA-1
+    // SECURITY: Log CRITICAL deprecation warning for SHA-1 verification.
+    // SHA-1 is still accepted for EXISTING enrollments to avoid locking out
+    // users during migration, but every verification triggers an urgent alert.
     if algorithm == TotpAlgorithm::Sha1 {
-        tracing::warn!(
-            "TOTP verification using deprecated SHA-1 algorithm. \
-             Migrate to SHA-256 or SHA-512 for CNSA 2.0 compliance. \
-             Set MILNET_TOTP_ALGORITHM=sha256 for new enrollments."
+        tracing::error!(
+            "SECURITY: Legacy SHA-1 TOTP verified for user — migration required. \
+             SHA-1 is cryptographically weakened and prohibited for new enrollments. \
+             Migrate to SHA-512 (CNSA 2.0) immediately. \
+             Set MILNET_TOTP_ALGORITHM=sha512 for new enrollments."
         );
     }
 
@@ -258,7 +290,7 @@ pub fn verify_totp_with_algorithm(
     }
 }
 
-/// Migrate a user from SHA-1 TOTP to SHA-256 by generating a new secret.
+/// Migrate a user from a legacy TOTP algorithm to SHA-512 (CNSA 2.0).
 ///
 /// Returns the new secret. The caller is responsible for:
 /// 1. Storing the new secret in the user's record
@@ -267,16 +299,21 @@ pub fn verify_totp_with_algorithm(
 ///
 /// The old secret should be kept until the user confirms the new enrollment,
 /// then securely erased.
+///
+/// SECURITY: Upgraded from SHA-256 to SHA-512 target to comply with CNSA 2.0.
 pub fn migrate_to_sha256() -> (zeroize::Zeroizing<[u8; 32]>, TotpAlgorithm) {
     let secret = generate_secret();
-    tracing::info!("TOTP migration: generated new SHA-256 secret for re-enrollment");
-    (secret, TotpAlgorithm::Sha256)
+    tracing::info!("TOTP migration: generated new SHA-512 (CNSA 2.0) secret for re-enrollment");
+    (secret, TotpAlgorithm::Sha512)
 }
 
 /// Build an otpauth:// URI for QR code generation.
-/// Legacy variant — always encodes SHA1 algorithm.
+///
+/// SECURITY: Uses SHA-512 (CNSA 2.0) for new enrollments. SHA-1 is no longer
+/// available through this function. Use `secret_to_otpauth_uri_with_algorithm`
+/// directly only for legacy migration scenarios.
 pub fn secret_to_otpauth_uri(secret: &[u8], issuer: &str, account: &str) -> String {
-    secret_to_otpauth_uri_with_algorithm(secret, issuer, account, TotpAlgorithm::Sha1)
+    secret_to_otpauth_uri_with_algorithm(secret, issuer, account, TotpAlgorithm::Sha512)
 }
 
 /// Build an otpauth:// URI for QR code generation with specified algorithm.
@@ -391,7 +428,8 @@ mod tests {
         let secret = b"12345678901234567890";
         let uri = secret_to_otpauth_uri(secret, "MILNET", "user@example.com");
         assert!(uri.starts_with("otpauth://totp/MILNET:user@example.com?"));
-        assert!(uri.contains("algorithm=SHA1"));
+        // SECURITY: New enrollments use SHA-512 (CNSA 2.0), not SHA-1
+        assert!(uri.contains("algorithm=SHA512"));
         assert!(uri.contains("digits=6"));
         assert!(uri.contains("period=30"));
     }
@@ -443,17 +481,37 @@ mod tests {
     }
 
     #[test]
-    fn test_default_algorithm_is_sha256() {
-        // When env var is not set, default should be SHA-256
+    fn test_default_algorithm_is_sha512() {
+        // SECURITY: When env var is not set, default should be SHA-512 (CNSA 2.0)
         std::env::remove_var("MILNET_TOTP_ALGORITHM");
-        assert_eq!(default_totp_algorithm(), TotpAlgorithm::Sha256);
+        assert_eq!(default_totp_algorithm(), TotpAlgorithm::Sha512);
     }
 
     #[test]
-    fn test_migrate_to_sha256() {
+    fn test_migrate_to_sha512() {
         let (secret, algo) = migrate_to_sha256();
-        assert_eq!(algo, TotpAlgorithm::Sha256);
+        // SECURITY: Migration target is now SHA-512 (CNSA 2.0)
+        assert_eq!(algo, TotpAlgorithm::Sha512);
         assert_ne!(*secret, [0u8; 32], "migrated secret must not be all zeros");
+    }
+
+    #[test]
+    fn test_is_legacy_algorithm() {
+        assert!(is_legacy_algorithm("sha1"));
+        assert!(is_legacy_algorithm("SHA-1"));
+        assert!(is_legacy_algorithm("SHA1"));
+        assert!(!is_legacy_algorithm("sha256"));
+        assert!(!is_legacy_algorithm("SHA-512"));
+        assert!(!is_legacy_algorithm("md5")); // not legacy, just unsupported
+    }
+
+    #[test]
+    fn test_sha1_blocked_for_new_enrollments() {
+        // SECURITY: Even if explicitly configured, SHA-1 is overridden to SHA-512
+        std::env::set_var("MILNET_TOTP_ALGORITHM", "sha1");
+        let algo = default_totp_algorithm();
+        assert_eq!(algo, TotpAlgorithm::Sha512, "SHA-1 must be blocked for new enrollments");
+        std::env::remove_var("MILNET_TOTP_ALGORITHM");
     }
 
     #[test]

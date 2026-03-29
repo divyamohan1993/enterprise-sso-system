@@ -1,7 +1,130 @@
-#![forbid(unsafe_code)]
+#![allow(unsafe_code)]
 //! gateway binary entry point.
 
 use gateway::server::GatewayServer;
+
+// ---------------------------------------------------------------------------
+// PEM parsing helpers — replaces UNMAINTAINED rustls-pemfile (RUSTSEC-2025-0134)
+// ---------------------------------------------------------------------------
+
+/// Parse all PEM-encoded certificates from raw bytes.
+fn parse_pem_certs(
+    pem_bytes: &[u8],
+) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, String> {
+    let pem_str = std::str::from_utf8(pem_bytes)
+        .map_err(|e| format!("PEM is not valid UTF-8: {e}"))?;
+    let mut certs = Vec::new();
+    for section in pem_sections(pem_str) {
+        if section.label == "CERTIFICATE" {
+            certs.push(rustls::pki_types::CertificateDer::from(section.der));
+        }
+    }
+    if certs.is_empty() {
+        return Err("no CERTIFICATE sections found in PEM".into());
+    }
+    Ok(certs)
+}
+
+/// Parse the first PEM-encoded private key from raw bytes.
+fn parse_pem_private_key(
+    pem_bytes: &[u8],
+) -> Result<rustls::pki_types::PrivateKeyDer<'static>, String> {
+    let pem_str = std::str::from_utf8(pem_bytes)
+        .map_err(|e| format!("PEM is not valid UTF-8: {e}"))?;
+    for section in pem_sections(pem_str) {
+        match section.label.as_str() {
+            "PRIVATE KEY" => {
+                return Ok(rustls::pki_types::PrivateKeyDer::Pkcs8(
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(section.der),
+                ));
+            }
+            "RSA PRIVATE KEY" => {
+                return Ok(rustls::pki_types::PrivateKeyDer::Pkcs1(
+                    rustls::pki_types::PrivatePkcs1KeyDer::from(section.der),
+                ));
+            }
+            "EC PRIVATE KEY" => {
+                return Ok(rustls::pki_types::PrivateKeyDer::Sec1(
+                    rustls::pki_types::PrivateSec1KeyDer::from(section.der),
+                ));
+            }
+            _ => continue,
+        }
+    }
+    Err("no private key found in PEM file".into())
+}
+
+struct PemSection {
+    label: String,
+    der: Vec<u8>,
+}
+
+/// Minimal PEM decoder — extracts labelled base64 DER sections.
+fn pem_sections(input: &str) -> Vec<PemSection> {
+    let mut sections = Vec::new();
+    let mut label: Option<String> = None;
+    let mut b64 = String::new();
+
+    for line in input.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("-----BEGIN ") {
+            if let Some(lbl) = rest.strip_suffix("-----") {
+                label = Some(lbl.to_string());
+                b64.clear();
+            }
+        } else if trimmed.starts_with("-----END ") {
+            if let Some(lbl) = label.take() {
+                // Decode base64 (no padding required, ignore whitespace)
+                let clean: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
+                if let Ok(der) = base64_decode(&clean) {
+                    sections.push(PemSection { label: lbl, der });
+                }
+                b64.clear();
+            }
+        } else if label.is_some() {
+            b64.push_str(trimmed);
+        }
+    }
+    sections
+}
+
+/// Standard base64 decoder (RFC 4648).
+fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+    const TABLE: [u8; 256] = {
+        let mut t = [0xFFu8; 256];
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut i = 0;
+        while i < 64 {
+            t[alphabet[i] as usize] = i as u8;
+            i += 1;
+        }
+        t[b'=' as usize] = 0xFE; // padding marker
+        t
+    };
+
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    let mut buf: u32 = 0;
+    let mut bits: u32 = 0;
+
+    for &b in bytes {
+        let val = TABLE[b as usize];
+        if val == 0xFF {
+            return Err(format!("invalid base64 character: 0x{:02x}", b));
+        }
+        if val == 0xFE {
+            break; // padding — stop
+        }
+        buf = (buf << 6) | val as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    Ok(out)
+}
 
 #[tokio::main]
 async fn main() {
@@ -74,18 +197,43 @@ async fn main() {
     let tls_config = if let (Ok(cert_file), Ok(key_file)) = (cert_path, key_path) {
         tracing::info!("Loading TLS certificate from {cert_file} and key from {key_file}");
 
-        let cert_pem = std::fs::read(&cert_file)
-            .unwrap_or_else(|e| panic!("failed to read TLS cert {cert_file}: {e}"));
-        let key_pem = std::fs::read(&key_file)
-            .unwrap_or_else(|e| panic!("failed to read TLS key {key_file}: {e}"));
+        // SECURITY: Remove key/cert paths from environment immediately after reading.
+        // Prevents leakage via /proc/pid/environ or child process inheritance.
+        std::env::remove_var("MILNET_GATEWAY_KEY_PATH");
+        std::env::remove_var("MILNET_GATEWAY_CERT_PATH");
 
+        let cert_pem = std::fs::read(&cert_file).unwrap_or_else(|e| {
+            tracing::error!("Failed to read TLS cert {cert_file}: {e}");
+            std::process::exit(1);
+        });
+        let key_pem = std::fs::read(&key_file).unwrap_or_else(|e| {
+            tracing::error!("Failed to read TLS key {key_file}: {e}");
+            std::process::exit(1);
+        });
+
+        // SECURITY: mlock the TLS private key material into RAM and exclude
+        // from core dumps. This prevents the key from being swapped to disk
+        // or captured in a core dump by a nation-state attacker.
+        unsafe {
+            let key_ptr = key_pem.as_ptr() as *const libc::c_void;
+            let key_len = key_pem.len();
+            if libc::mlock(key_ptr, key_len) != 0 {
+                tracing::error!(
+                    "CRITICAL: mlock failed for TLS private key ({key_len} bytes). \
+                     Key material may be swappable to disk."
+                );
+            }
+            libc::madvise(key_ptr as *mut libc::c_void, key_len, libc::MADV_DONTDUMP);
+        }
+
+        // SECURITY: rustls-pemfile is UNMAINTAINED (RUSTSEC-2025-0134).
+        // PEM parsing inlined here to eliminate the dependency entirely.
         let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-            rustls_pemfile::certs(&mut &cert_pem[..])
-                .collect::<Result<Vec<_>, _>>()
+            parse_pem_certs(&cert_pem)
                 .expect("failed to parse TLS certificate PEM");
-        let key = rustls_pemfile::private_key(&mut &key_pem[..])
-            .expect("failed to parse TLS private key PEM")
-            .expect("no private key found in PEM file");
+        let key: rustls::pki_types::PrivateKeyDer<'static> =
+            parse_pem_private_key(&key_pem)
+                .expect("failed to parse TLS private key PEM");
 
         // CNSA 2.0 compliant: TLS 1.3 only with AES-256-GCM-SHA384
         // Post-quantum hybrid key exchange: X25519MLKEM768 preferred, X25519 fallback.

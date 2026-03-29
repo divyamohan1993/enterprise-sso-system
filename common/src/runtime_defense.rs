@@ -106,6 +106,168 @@ pub fn start_runtime_defense(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Runtime alerts and comprehensive sweep
+// ---------------------------------------------------------------------------
+
+/// Alert produced by a runtime defense sweep.
+#[derive(Debug, Clone)]
+pub struct RuntimeAlert {
+    /// Which check produced this alert.
+    pub check: &'static str,
+    /// Severity: "critical", "high", "medium", "low".
+    pub severity: &'static str,
+    /// Human-readable description.
+    pub detail: String,
+}
+
+/// Run all runtime defense checks synchronously and return any alerts.
+///
+/// This function performs:
+/// 1. Process self-integrity check (verify binary hash hasn't changed)
+/// 2. Memory canary monitoring (key material canary validation)
+/// 3. Connection anomaly detection (spike from single IP)
+/// 4. Debugger detection
+/// 5. Library injection detection
+/// 6. Capability escalation detection
+///
+/// Intended to be called periodically or on-demand by admin endpoints.
+pub fn runtime_defense_sweep(expected_binary_hash: &[u8; 64]) -> Vec<RuntimeAlert> {
+    let mut alerts = Vec::new();
+
+    // 1. Process self-integrity: verify binary hash hasn't changed
+    match std::fs::read("/proc/self/exe") {
+        Ok(binary) => {
+            use sha2::{Sha512, Digest};
+            let hash = Sha512::digest(&binary);
+            let mut current_hash = [0u8; 64];
+            current_hash.copy_from_slice(&hash);
+            if current_hash != *expected_binary_hash {
+                alerts.push(RuntimeAlert {
+                    check: "binary_integrity",
+                    severity: "critical",
+                    detail: format!(
+                        "Binary hash mismatch: expected {}, got {}",
+                        hex::encode(&expected_binary_hash[..8]),
+                        hex::encode(&current_hash[..8]),
+                    ),
+                });
+            }
+        }
+        Err(e) => {
+            alerts.push(RuntimeAlert {
+                check: "binary_integrity",
+                severity: "high",
+                detail: format!("Cannot read /proc/self/exe: {e}"),
+            });
+        }
+    }
+
+    // 2. Memory canary monitoring: check that mlock'd regions are intact
+    // Verify /proc/self/status for unexpected VmLck changes
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        let vmlck = status
+            .lines()
+            .find(|l| l.starts_with("VmLck:"))
+            .and_then(|l| {
+                l.split_whitespace()
+                    .nth(1)?
+                    .parse::<u64>()
+                    .ok()
+            });
+        if vmlck == Some(0) {
+            // If we expected locked memory but have none, something unlocked it
+            alerts.push(RuntimeAlert {
+                check: "memory_canary",
+                severity: "high",
+                detail: "VmLck is 0 — expected locked key material pages; possible munlock attack".into(),
+            });
+        }
+    }
+
+    // 3. Connection anomaly detection: check for single-IP connection spikes
+    if let Ok(tcp) = std::fs::read_to_string("/proc/self/net/tcp") {
+        let mut ip_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        for line in tcp.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if let Some(remote) = fields.get(2) {
+                // Remote address is in hex format: AABBCCDD:PORT
+                if let Some(addr) = remote.split(':').next() {
+                    *ip_counts.entry(addr.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+        const CONNECTION_SPIKE_THRESHOLD: u32 = 100;
+        for (ip, count) in &ip_counts {
+            if *count > CONNECTION_SPIKE_THRESHOLD {
+                alerts.push(RuntimeAlert {
+                    check: "connection_anomaly",
+                    severity: "high",
+                    detail: format!(
+                        "Connection spike: {} connections from remote IP {}",
+                        count, ip,
+                    ),
+                });
+            }
+        }
+    }
+
+    // 4. Debugger detection: TracerPid != 0
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if let Some(val) = line.strip_prefix("TracerPid:") {
+                if let Ok(pid) = val.trim().parse::<u32>() {
+                    if pid != 0 {
+                        alerts.push(RuntimeAlert {
+                            check: "debugger_detection",
+                            severity: "critical",
+                            detail: format!("Debugger attached: TracerPid={pid}"),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // 5. Library injection: check for LD_PRELOAD
+    if let Ok(val) = std::env::var("LD_PRELOAD") {
+        if !val.is_empty() {
+            alerts.push(RuntimeAlert {
+                check: "library_injection",
+                severity: "critical",
+                detail: format!("LD_PRELOAD is set: {val}"),
+            });
+        }
+    }
+
+    // 6. Capability escalation: check that no unexpected capabilities are set
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if let Some(val) = line.strip_prefix("CapEff:") {
+                let caps = val.trim();
+                // Full capabilities (0000003fffffffff) is suspicious for a non-root service
+                if caps == "0000003fffffffff" || caps == "000001ffffffffff" {
+                    alerts.push(RuntimeAlert {
+                        check: "capability_escalation",
+                        severity: "high",
+                        detail: format!("Process has full effective capabilities: {caps}"),
+                    });
+                }
+            }
+        }
+    }
+
+    if !alerts.is_empty() {
+        tracing::warn!(
+            alert_count = alerts.len(),
+            "Runtime defense sweep completed with {} alert(s)",
+            alerts.len(),
+        );
+    }
+
+    alerts
+}
+
 impl RuntimeDefenseHandle {
     /// Connect the defense pipeline to a Raft cluster node.
     ///

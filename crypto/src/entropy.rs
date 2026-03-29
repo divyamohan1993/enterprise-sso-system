@@ -18,6 +18,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use zeroize::Zeroize;
 
 /// Process-wide monotonic counter to ensure uniqueness across calls.
+///
+/// SAFETY (overflow): AtomicU64::fetch_add wraps on overflow (Rust atomics use
+/// wrapping arithmetic). This is safe for entropy nonce uniqueness because:
+/// 1. The counter is mixed into a SHA-512 hash with other entropy sources,
+///    so counter value collisions do not produce output collisions.
+/// 2. At 2^64 calls, wrapping would require ~584 years at 1 billion calls/sec.
+/// 3. Even in the astronomically unlikely event of a wrap, the OS CSPRNG and
+///    environmental noise sources provide independent uniqueness guarantees.
+/// We use Ordering::SeqCst to ensure strict monotonicity across all threads.
 static COMBINE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------

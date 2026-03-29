@@ -277,6 +277,210 @@ impl Default for CrossDomainGuard {
     }
 }
 
+// ── Bell-LaPadula Mandatory Access Control ─────────────────────────────────
+//
+// The Bell-LaPadula (BLP) model provides formal mandatory access control
+// enforcement for multi-level security (MLS) systems as required by
+// DISA STIG and CMMC Level 3 for DoD classified environments.
+//
+// Properties enforced:
+// - Simple Security Property (ss-property): No read up — a subject cannot
+//   read data at a classification level above their clearance.
+// - *-Property (Star Property): No write down — a subject cannot write data
+//   to a classification level below their clearance (prevents information
+//   leakage to lower classification levels).
+// - Strong Tranquility: Classification levels do not change during an
+//   operation (enforced by using immutable classification arguments).
+
+/// Bell-LaPadula mandatory access control guard.
+///
+/// Enforces the Simple Security Property and (optionally) the *-Property
+/// for all access decisions. When `strict_mode` is enabled, both properties
+/// are enforced; when disabled, only the Simple Security Property (no read up)
+/// is enforced.
+///
+/// All access decisions are audit-logged via `tracing` for SIEM integration.
+pub struct BellLaPadulaGuard {
+    /// If true, enforce both Simple Security and *-Property (Star Property).
+    /// If false, only enforce Simple Security Property (no read up).
+    strict_mode: bool,
+}
+
+impl BellLaPadulaGuard {
+    /// Create a new Bell-LaPadula guard.
+    ///
+    /// - `strict_mode = true`: Enforces both ss-property AND *-property.
+    ///   This is the REQUIRED setting for DoD classified environments.
+    /// - `strict_mode = false`: Enforces only ss-property (no read up).
+    ///   Suitable for environments where the star property is managed
+    ///   by other controls (e.g., application-level write policies).
+    pub fn new(strict_mode: bool) -> Self {
+        Self { strict_mode }
+    }
+
+    /// Check if a subject can READ a resource (Simple Security Property).
+    ///
+    /// The subject's clearance level must be greater than or equal to the
+    /// resource's classification level. A TOP SECRET cleared subject can
+    /// read SECRET documents, but a SECRET cleared subject cannot read
+    /// TOP SECRET documents.
+    ///
+    /// All decisions are audit-logged.
+    pub fn can_read(
+        &self,
+        subject_clearance: ClassificationLevel,
+        resource_classification: ClassificationLevel,
+    ) -> bool {
+        let allowed = subject_clearance >= resource_classification;
+        if allowed {
+            tracing::debug!(
+                "BLP READ GRANTED: subject clearance {} >= resource classification {}",
+                subject_clearance.label(),
+                resource_classification.label(),
+            );
+        } else {
+            tracing::warn!(
+                "BLP READ DENIED (ss-property): subject clearance {} < resource classification {}",
+                subject_clearance.label(),
+                resource_classification.label(),
+            );
+        }
+        allowed
+    }
+
+    /// Check if a subject can WRITE to a resource (*-Property / Star Property).
+    ///
+    /// In strict mode, the subject's clearance level must be less than or
+    /// equal to the resource's classification level (no write-down). This
+    /// prevents a TOP SECRET cleared subject from writing classified data
+    /// into an UNCLASSIFIED resource, which would leak information.
+    ///
+    /// In non-strict mode, writes are always permitted (the star property
+    /// is not enforced).
+    ///
+    /// All decisions are audit-logged.
+    pub fn can_write(
+        &self,
+        subject_clearance: ClassificationLevel,
+        resource_classification: ClassificationLevel,
+    ) -> bool {
+        if self.strict_mode {
+            let allowed = subject_clearance <= resource_classification;
+            if allowed {
+                tracing::debug!(
+                    "BLP WRITE GRANTED: subject clearance {} <= resource classification {}",
+                    subject_clearance.label(),
+                    resource_classification.label(),
+                );
+            } else {
+                tracing::warn!(
+                    "BLP WRITE DENIED (*-property): subject clearance {} > resource classification {} (no write-down)",
+                    subject_clearance.label(),
+                    resource_classification.label(),
+                );
+            }
+            allowed
+        } else {
+            tracing::debug!(
+                "BLP WRITE GRANTED (non-strict): *-property not enforced, subject={}, resource={}",
+                subject_clearance.label(),
+                resource_classification.label(),
+            );
+            true
+        }
+    }
+
+    /// Combined read-write check for modify operations.
+    ///
+    /// A modify operation requires both read access (to see existing data)
+    /// and write access (to change it). In strict mode, this means the
+    /// subject's clearance must EQUAL the resource's classification
+    /// (since can_read requires >= and can_write requires <=).
+    ///
+    /// All decisions are audit-logged.
+    pub fn can_modify(
+        &self,
+        subject_clearance: ClassificationLevel,
+        resource_classification: ClassificationLevel,
+    ) -> bool {
+        let read_ok = self.can_read(subject_clearance, resource_classification);
+        let write_ok = self.can_write(subject_clearance, resource_classification);
+        let allowed = read_ok && write_ok;
+        if !allowed {
+            tracing::warn!(
+                "BLP MODIFY DENIED: subject clearance {}, resource classification {} (read={}, write={})",
+                subject_clearance.label(),
+                resource_classification.label(),
+                read_ok,
+                write_ok,
+            );
+        }
+        allowed
+    }
+
+    /// Validate a data transfer between classification levels.
+    ///
+    /// Enforces all three checks:
+    /// 1. Subject must be able to read the source (ss-property).
+    /// 2. Subject must be able to write to the destination (*-property, if strict).
+    /// 3. Data cannot flow downward: source classification must be <= destination
+    ///    classification (information flow control).
+    ///
+    /// All decisions are audit-logged.
+    pub fn validate_transfer(
+        &self,
+        source_classification: ClassificationLevel,
+        destination_classification: ClassificationLevel,
+        subject_clearance: ClassificationLevel,
+    ) -> Result<(), String> {
+        // Subject must be able to read source
+        if !self.can_read(subject_clearance, source_classification) {
+            let msg = format!(
+                "Access denied: insufficient clearance ({}) to read source ({})",
+                subject_clearance.label(),
+                source_classification.label(),
+            );
+            tracing::warn!("BLP TRANSFER DENIED: {}", msg);
+            return Err("Access denied: insufficient clearance to read source".into());
+        }
+
+        // Subject must be able to write to destination
+        if !self.can_write(subject_clearance, destination_classification) {
+            let msg = format!(
+                "Access denied: *-property violation — clearance {} cannot write to {} (no write-down)",
+                subject_clearance.label(),
+                destination_classification.label(),
+            );
+            tracing::warn!("BLP TRANSFER DENIED: {}", msg);
+            return Err("Access denied: star property violation (no write-down)".into());
+        }
+
+        // Data cannot flow downward (information flow control)
+        if source_classification > destination_classification {
+            let msg = format!(
+                "Transfer denied: data at {} cannot flow to lower classification {}",
+                source_classification.label(),
+                destination_classification.label(),
+            );
+            tracing::warn!("BLP TRANSFER DENIED: {}", msg);
+            return Err("Transfer denied: data cannot flow to lower classification".into());
+        }
+
+        tracing::info!(
+            "BLP TRANSFER GRANTED: {} -> {}, subject clearance {}",
+            source_classification.label(),
+            destination_classification.label(),
+            subject_clearance.label(),
+        );
+        Ok(())
+    }
+
+    /// Returns whether strict mode (*-property enforcement) is enabled.
+    pub fn is_strict(&self) -> bool {
+        self.strict_mode
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,6 +615,96 @@ mod tests {
         assert!(!decision.allowed);
         assert!(decision.reason.contains("default deny"));
     }
+
+    // ── Bell-LaPadula Tests ────────────────────────────────────────────
+
+    #[test]
+    fn blp_read_up_denied() {
+        let guard = BellLaPadulaGuard::new(true);
+        // SECRET subject cannot read TOP SECRET resource
+        assert!(!guard.can_read(ClassificationLevel::Secret, ClassificationLevel::TopSecret));
+    }
+
+    #[test]
+    fn blp_read_same_level_allowed() {
+        let guard = BellLaPadulaGuard::new(true);
+        assert!(guard.can_read(ClassificationLevel::Secret, ClassificationLevel::Secret));
+    }
+
+    #[test]
+    fn blp_read_down_allowed() {
+        let guard = BellLaPadulaGuard::new(true);
+        // TOP SECRET subject can read SECRET resource
+        assert!(guard.can_read(ClassificationLevel::TopSecret, ClassificationLevel::Secret));
+    }
+
+    #[test]
+    fn blp_write_down_denied_strict() {
+        let guard = BellLaPadulaGuard::new(true);
+        // TOP SECRET subject cannot write to SECRET resource (no write-down)
+        assert!(!guard.can_write(ClassificationLevel::TopSecret, ClassificationLevel::Secret));
+    }
+
+    #[test]
+    fn blp_write_up_allowed_strict() {
+        let guard = BellLaPadulaGuard::new(true);
+        // SECRET subject can write to TOP SECRET resource
+        assert!(guard.can_write(ClassificationLevel::Secret, ClassificationLevel::TopSecret));
+    }
+
+    #[test]
+    fn blp_write_down_allowed_nonstrict() {
+        let guard = BellLaPadulaGuard::new(false);
+        // Non-strict mode: write-down is allowed
+        assert!(guard.can_write(ClassificationLevel::TopSecret, ClassificationLevel::Secret));
+    }
+
+    #[test]
+    fn blp_modify_requires_exact_level_in_strict() {
+        let guard = BellLaPadulaGuard::new(true);
+        // Modify requires read (>=) AND write (<=), so only exact match works
+        assert!(guard.can_modify(ClassificationLevel::Secret, ClassificationLevel::Secret));
+        assert!(!guard.can_modify(ClassificationLevel::TopSecret, ClassificationLevel::Secret));
+        assert!(!guard.can_modify(ClassificationLevel::Secret, ClassificationLevel::TopSecret));
+    }
+
+    #[test]
+    fn blp_transfer_upward_allowed() {
+        let guard = BellLaPadulaGuard::new(true);
+        // Transfer from SECRET to TOP SECRET by a TOP SECRET cleared subject
+        // Read source (TS >= S): OK. Write dest (TS <= TS): OK. Flow (S <= TS): OK.
+        assert!(guard.validate_transfer(
+            ClassificationLevel::Secret,
+            ClassificationLevel::TopSecret,
+            ClassificationLevel::TopSecret,
+        ).is_ok());
+    }
+
+    #[test]
+    fn blp_transfer_downward_denied() {
+        let guard = BellLaPadulaGuard::new(true);
+        // Transfer from TOP SECRET to SECRET: data flow downward denied
+        assert!(guard.validate_transfer(
+            ClassificationLevel::TopSecret,
+            ClassificationLevel::Secret,
+            ClassificationLevel::TopSecret,
+        ).is_err());
+    }
+
+    #[test]
+    fn blp_transfer_insufficient_clearance() {
+        let guard = BellLaPadulaGuard::new(true);
+        // SECRET subject cannot read TOP SECRET source
+        let result = guard.validate_transfer(
+            ClassificationLevel::TopSecret,
+            ClassificationLevel::TopSecret,
+            ClassificationLevel::Secret,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("insufficient clearance"));
+    }
+
+    // ── Original CrossDomainGuard Tests ──────────────────────────────
 
     #[test]
     fn remove_flow_rule() {

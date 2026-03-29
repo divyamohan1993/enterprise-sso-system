@@ -42,6 +42,20 @@ const COSE_LABEL_CRV: i64 = -1;
 const COSE_LABEL_X: i64 = -2;
 const COSE_LABEL_Y: i64 = -3;
 
+// ── DoS prevention bounds for CBOR/DER parsing ──────────────────────────
+// SECURITY: Untrusted CBOR input can claim arbitrarily large map/array lengths,
+// causing O(n) loops that exhaust CPU or memory. These bounds cap iteration to
+// sane maximums far above any legitimate WebAuthn/COSE structure.
+
+/// Maximum number of entries allowed in a CBOR map from untrusted input.
+const MAX_CBOR_MAP_LEN: u64 = 256;
+/// Maximum number of elements allowed in a CBOR array from untrusted input.
+const MAX_CBOR_ARRAY_LEN: u64 = 256;
+/// Maximum size of a single CBOR byte/text string from untrusted input (1 MB).
+const MAX_CBOR_STRING_LEN: u64 = 1_048_576;
+/// Maximum DER element length (64 KB — no legitimate X.509 cert exceeds this).
+const MAX_DER_LENGTH: usize = 65536;
+
 // ── Parsed structures ──────────────────────────────────────────────────
 
 /// Parsed representation of the authenticator data binary blob.
@@ -195,6 +209,12 @@ pub fn parse_cose_key_es256(cose_bytes: &[u8]) -> Result<CoseKeyEs256, &'static 
 
     let map_len = reader.read_map_len()
         .ok_or("COSE key: expected CBOR map")?;
+
+    // SECURITY: Bound CBOR map length to prevent DoS from malicious input
+    // claiming billions of entries, causing CPU exhaustion in the loop below.
+    if map_len > MAX_CBOR_MAP_LEN {
+        return Err("COSE key: CBOR map too large — potential DoS");
+    }
 
     let mut kty: Option<i64> = None;
     let mut alg: Option<i64> = None;
@@ -390,7 +410,13 @@ impl<'a> CborReader<'a> {
         if major != 2 {
             return None;
         }
-        let len = self.read_uint_arg(additional)? as usize;
+        let raw_len = self.read_uint_arg(additional)?;
+        // SECURITY: Bound byte string length to prevent memory exhaustion from
+        // malicious CBOR claiming multi-GB strings.
+        if raw_len > MAX_CBOR_STRING_LEN {
+            return None;
+        }
+        let len = raw_len as usize;
         let bytes = self.read_bytes(len)?;
         Some(bytes.to_vec())
     }
@@ -403,7 +429,12 @@ impl<'a> CborReader<'a> {
         if major != 3 {
             return None;
         }
-        let len = self.read_uint_arg(additional)? as usize;
+        let raw_len = self.read_uint_arg(additional)?;
+        // SECURITY: Bound text string length to prevent memory exhaustion.
+        if raw_len > MAX_CBOR_STRING_LEN {
+            return None;
+        }
+        let len = raw_len as usize;
         let bytes = self.read_bytes(len)?;
         String::from_utf8(bytes.to_vec()).ok()
     }
@@ -449,15 +480,21 @@ impl<'a> CborReader<'a> {
                 self.read_tstr()?;
             }
             4 => {
-                // Array
+                // Array — bound length to prevent DoS
                 let len = self.read_array_len()?;
+                if len > MAX_CBOR_ARRAY_LEN {
+                    return None; // reject oversized arrays
+                }
                 for _ in 0..len {
                     self.skip_value()?;
                 }
             }
             5 => {
-                // Map
+                // Map — bound length to prevent DoS
                 let len = self.read_map_len()?;
+                if len > MAX_CBOR_MAP_LEN {
+                    return None; // reject oversized maps
+                }
                 for _ in 0..len {
                     self.skip_value()?; // key
                     self.skip_value()?; // value
@@ -792,10 +829,13 @@ pub fn parse_attestation_auth_data(
     }
 
     let cred_id_len = u16::from_be_bytes([auth_data[53], auth_data[54]]) as usize;
-    let cred_id_start = 55;
-    let cred_id_end = cred_id_start + cred_id_len;
+    let cred_id_start: usize = 55;
+    // SECURITY: Use checked arithmetic to prevent integer overflow on crafted
+    // credential ID lengths that could wrap around and bypass bounds checks.
+    let cred_id_end = cred_id_start.checked_add(cred_id_len)
+        .ok_or("credential ID length overflow")?;
 
-    if auth_data.len() < cred_id_end + 1 {
+    if auth_data.len() < cred_id_end.checked_add(1).ok_or("credential ID end overflow")? {
         return Err("Authenticator data truncated before public key");
     }
 
@@ -910,6 +950,11 @@ pub fn verify_attestation_object(
     let map_len = reader.read_map_len()
         .ok_or("Attestation object: expected CBOR map")?;
 
+    // SECURITY: Bound attestation object map length to prevent DoS.
+    if map_len > MAX_CBOR_MAP_LEN {
+        return Err("Attestation object: CBOR map too large — potential DoS");
+    }
+
     let mut fmt: Option<String> = None;
     let mut auth_data_bytes: Option<Vec<u8>> = None;
     let mut att_stmt_alg: Option<i64> = None;
@@ -934,6 +979,11 @@ pub fn verify_attestation_object(
                 let stmt_map_len = reader.read_map_len()
                     .ok_or("Attestation object: attStmt is not a map")?;
 
+                // SECURITY: Bound attStmt map length to prevent DoS.
+                if stmt_map_len > MAX_CBOR_MAP_LEN {
+                    return Err("attStmt: CBOR map too large — potential DoS");
+                }
+
                 for _ in 0..stmt_map_len {
                     let stmt_key = reader.read_map_key()
                         .ok_or("attStmt: failed to read key")?;
@@ -950,6 +1000,10 @@ pub fn verify_attestation_object(
                         CborMapKey::Text(ref sk) if sk == "x5c" => {
                             let arr_len = reader.read_array_len()
                                 .ok_or("attStmt: x5c is not an array")?;
+                            // SECURITY: Bound x5c certificate array length to prevent DoS.
+                            if arr_len > MAX_CBOR_ARRAY_LEN {
+                                return Err("attStmt: x5c array too large — potential DoS");
+                            }
                             let mut certs = Vec::with_capacity(arr_len as usize);
                             for _ in 0..arr_len {
                                 let cert = reader.read_bstr()
@@ -1076,30 +1130,41 @@ pub fn extract_ec_public_key_from_der(cert_der: &[u8]) -> Result<Vec<u8>, &'stat
 }
 
 /// Read a DER length encoding. Returns (length, number_of_bytes_consumed).
+///
+/// SECURITY: Enforces MAX_DER_LENGTH (64 KB) to prevent DoS from maliciously
+/// crafted certificates claiming enormous element sizes.
 fn read_der_length(data: &[u8]) -> Result<(usize, usize), &'static str> {
     if data.is_empty() {
         return Err("DER length: unexpected end of data");
     }
 
     let first = data[0];
-    if first < 0x80 {
+    let (len, consumed) = if first < 0x80 {
         // Short form: length is the byte itself
-        Ok((first as usize, 1))
+        (first as usize, 1)
     } else if first == 0x81 {
         if data.len() < 2 {
             return Err("DER length: truncated");
         }
-        Ok((data[1] as usize, 2))
+        (data[1] as usize, 2)
     } else if first == 0x82 {
         if data.len() < 3 {
             return Err("DER length: truncated");
         }
-        let len = ((data[1] as usize) << 8) | (data[2] as usize);
-        Ok((len, 3))
+        let l = ((data[1] as usize) << 8) | (data[2] as usize);
+        (l, 3)
     } else {
         // Lengths > 65535 are not expected in WebAuthn certificates
-        Err("DER length: unsupported long form")
+        return Err("DER length: unsupported long form");
+    };
+
+    // SECURITY: Reject DER elements larger than 64 KB to prevent memory
+    // exhaustion from crafted attestation certificates.
+    if len > MAX_DER_LENGTH {
+        return Err("DER element too large: potential DoS");
     }
+
+    Ok((len, consumed))
 }
 
 /// Find the first occurrence of `needle` in `haystack`.

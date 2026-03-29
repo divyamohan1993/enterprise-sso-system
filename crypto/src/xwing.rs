@@ -5,6 +5,20 @@
 //! KEM, FIPS 203) to produce a shared secret resistant to both classical
 //! and quantum attacks.
 //!
+//! # KEM Agility (CNSA 2.0 / FIPS 140-3)
+//!
+//! This module supports runtime-selectable KEM algorithms:
+//!
+//! - **X-Wing** (ML-KEM-1024 + X25519): Default hybrid mode. Provides
+//!   security against both classical and quantum attackers.
+//! - **ML-KEM-1024 Only**: Pure post-quantum mode for deployments where
+//!   classical crypto is considered compromised (e.g., nation-state
+//!   quantum capability assumed). Skips X25519 entirely.
+//!
+//! The active KEM is selected via the `MILNET_PQ_KEM_ONLY` environment
+//! variable. Ciphertexts are self-describing: each encoded ciphertext
+//! begins with a 1-byte KEM tag.
+//!
 //! # Relationship to X-Wing (IETF draft-connolly-cfrg-xwing-kem)
 //!
 //! The standard X-Wing specification (draft-connolly-cfrg-xwing-kem) uses
@@ -372,6 +386,230 @@ pub fn xwing_decapsulate(
     Ok(combine(x25519_ss.as_bytes(), ml_kem_ss.as_slice()))
 }
 
+// ── KEM Agility: Runtime-Selectable KEM Algorithms ─────────────────────────
+//
+// CNSA 2.0 and FIPS 140-3 require crypto agility — the ability to switch
+// algorithms without code changes. This section adds:
+//
+// 1. An enum of supported KEM algorithms (X-Wing hybrid vs. pure ML-KEM-1024).
+// 2. Runtime algorithm selection via environment variable.
+// 3. Self-describing tagged ciphertext format (1-byte tag + ciphertext).
+// 4. Tagged encapsulate/decapsulate functions.
+
+/// KEM algorithm tag bytes for the self-describing ciphertext format.
+///
+/// Each tagged ciphertext is encoded as: `KEM_TAG(1 byte) || ciphertext_bytes`
+const KEM_TAG_XWING: u8 = 0x01;
+const KEM_TAG_ML_KEM_1024_ONLY: u8 = 0x02;
+
+/// HKDF salt for ML-KEM-1024-only mode.
+const MLKEM_ONLY_HKDF_SALT: &[u8] = b"MILNET-MLKEM1024-v1";
+
+/// HKDF info string for ML-KEM-1024-only shared secret extraction.
+const MLKEM_ONLY_HKDF_INFO: &[u8] = b"ML-KEM-1024-SharedSecret-v1";
+
+/// Supported KEM algorithms.
+///
+/// # Security Rationale
+///
+/// - **X-Wing (hybrid)**: Default. Combines classical (X25519) and post-quantum
+///   (ML-KEM-1024) security. If either algorithm is broken, the other still
+///   protects the shared secret. This is the conservative choice for most
+///   deployments.
+///
+/// - **ML-KEM-1024 Only**: Pure post-quantum mode. Use when classical crypto
+///   is considered compromised (e.g., operational intelligence indicates
+///   adversary has quantum capability). Eliminates the X25519 component
+///   entirely to remove all classical attack surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KemAlgorithm {
+    /// X-Wing hybrid: ML-KEM-1024 + X25519 (default).
+    XWing,
+    /// Pure ML-KEM-1024 only: no classical crypto component.
+    MlKem1024Only,
+}
+
+impl Default for KemAlgorithm {
+    fn default() -> Self {
+        Self::XWing
+    }
+}
+
+impl KemAlgorithm {
+    /// Return the 1-byte KEM tag for self-describing ciphertexts.
+    pub fn tag(self) -> u8 {
+        match self {
+            Self::XWing => KEM_TAG_XWING,
+            Self::MlKem1024Only => KEM_TAG_ML_KEM_1024_ONLY,
+        }
+    }
+
+    /// Decode a KEM algorithm from a 1-byte tag.
+    pub fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            KEM_TAG_XWING => Some(Self::XWing),
+            KEM_TAG_ML_KEM_1024_ONLY => Some(Self::MlKem1024Only),
+            _ => None,
+        }
+    }
+
+    /// Human-readable name for logging and diagnostics.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::XWing => "X-Wing (ML-KEM-1024 + X25519)",
+            Self::MlKem1024Only => "ML-KEM-1024 Only",
+        }
+    }
+}
+
+/// Select the active KEM algorithm based on environment configuration.
+///
+/// If the `MILNET_PQ_KEM_ONLY` environment variable is set (to any value),
+/// the pure ML-KEM-1024-only mode is activated. Otherwise, the default
+/// X-Wing hybrid mode is used.
+///
+/// SECURITY: Switching to ML-KEM-1024-only mode should be done only when
+/// there is a credible quantum threat to classical key exchange. The hybrid
+/// mode provides defense-in-depth against both classical and quantum attacks.
+pub fn active_kem_algorithm() -> KemAlgorithm {
+    if std::env::var("MILNET_PQ_KEM_ONLY").is_ok() {
+        KemAlgorithm::MlKem1024Only
+    } else {
+        KemAlgorithm::XWing
+    }
+}
+
+/// ML-KEM-1024-only combiner using HKDF-SHA512.
+///
+/// Derives a 32-byte shared secret from the ML-KEM-1024 shared secret only
+/// (no X25519 component). Uses a distinct HKDF salt to ensure domain separation
+/// from the X-Wing combiner.
+fn combine_mlkem_only(ml_kem_ss: &[u8]) -> SharedSecret {
+    let hk = Hkdf::<Sha512>::new(Some(MLKEM_ONLY_HKDF_SALT), ml_kem_ss);
+    let mut okm = [0u8; 32];
+    hk.expand(MLKEM_ONLY_HKDF_INFO, &mut okm)
+        .expect("32 bytes is within HKDF-SHA512 output limit");
+    SharedSecret(okm)
+}
+
+/// Tagged ciphertext that includes a KEM algorithm identifier.
+///
+/// Format: `KEM_TAG(1 byte) || ciphertext_bytes`
+///
+/// The tag enables the decapsulator to determine which algorithm was used
+/// without out-of-band negotiation.
+#[derive(Clone)]
+pub struct TaggedCiphertext {
+    /// The raw tagged bytes (tag + ciphertext).
+    bytes: Vec<u8>,
+}
+
+impl TaggedCiphertext {
+    /// Serialize the tagged ciphertext to bytes.
+    pub fn to_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Deserialize a tagged ciphertext from bytes.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.is_empty() {
+            return None;
+        }
+        // Verify the tag is known
+        KemAlgorithm::from_tag(bytes[0])?;
+        Some(Self {
+            bytes: bytes.to_vec(),
+        })
+    }
+
+    /// Return the KEM algorithm used.
+    pub fn algorithm(&self) -> KemAlgorithm {
+        KemAlgorithm::from_tag(self.bytes[0]).expect("TaggedCiphertext always has valid tag")
+    }
+
+    /// Return the raw ciphertext bytes (without the tag).
+    pub fn ciphertext_bytes(&self) -> &[u8] {
+        &self.bytes[1..]
+    }
+}
+
+/// Client-side encapsulation with KEM agility.
+///
+/// Selects the active KEM algorithm and produces a tagged ciphertext.
+/// The shared secret derivation differs based on the algorithm:
+///
+/// - **X-Wing**: Full hybrid (X25519 DH + ML-KEM-1024 encapsulation + HKDF combiner).
+/// - **ML-KEM-1024 Only**: Pure post-quantum (ML-KEM-1024 encapsulation + HKDF).
+pub fn xwing_encapsulate_tagged(
+    server_pk: &XWingPublicKey,
+) -> (SharedSecret, TaggedCiphertext) {
+    let algo = active_kem_algorithm();
+
+    match algo {
+        KemAlgorithm::XWing => {
+            // Full X-Wing hybrid encapsulation
+            let (ss, ct) = xwing_encapsulate(server_pk);
+            let ct_bytes = ct.to_bytes();
+            let mut tagged = Vec::with_capacity(1 + ct_bytes.len());
+            tagged.push(KEM_TAG_XWING);
+            tagged.extend_from_slice(&ct_bytes);
+            (ss, TaggedCiphertext { bytes: tagged })
+        }
+        KemAlgorithm::MlKem1024Only => {
+            // Pure ML-KEM-1024 encapsulation (no X25519)
+            let mut rng = rand::rngs::OsRng;
+            let (ml_kem_ct_arr, ml_kem_ss_arr) = server_pk
+                .ml_kem_ek
+                .encapsulate(&mut rng)
+                .expect("ML-KEM-1024 encapsulation should not fail");
+
+            let ml_kem_ss: &[u8] = ml_kem_ss_arr.as_slice();
+            let ml_kem_ct: &[u8] = ml_kem_ct_arr.as_slice();
+
+            // Derive shared secret using ML-KEM-only HKDF (distinct salt)
+            let ss = combine_mlkem_only(ml_kem_ss);
+
+            let mut tagged = Vec::with_capacity(1 + ml_kem_ct.len());
+            tagged.push(KEM_TAG_ML_KEM_1024_ONLY);
+            tagged.extend_from_slice(ml_kem_ct);
+            (ss, TaggedCiphertext { bytes: tagged })
+        }
+    }
+}
+
+/// Server-side decapsulation with KEM agility.
+///
+/// Reads the KEM tag from the tagged ciphertext and dispatches to the
+/// appropriate decapsulation algorithm.
+pub fn xwing_decapsulate_tagged(
+    server_kp: &XWingKeyPair,
+    tagged_ct: &TaggedCiphertext,
+) -> Result<SharedSecret, XWingError> {
+    let algo = tagged_ct.algorithm();
+    let ct_bytes = tagged_ct.ciphertext_bytes();
+
+    match algo {
+        KemAlgorithm::XWing => {
+            // Full X-Wing hybrid decapsulation
+            let ct = Ciphertext::from_bytes(ct_bytes)
+                .ok_or(XWingError::MlKemCiphertextInvalid)?;
+            xwing_decapsulate(server_kp, &ct)
+        }
+        KemAlgorithm::MlKem1024Only => {
+            // Pure ML-KEM-1024 decapsulation (no X25519)
+            let ml_kem_ct =
+                ml_kem::Ciphertext::<MlKem1024>::try_from(ct_bytes)
+                    .map_err(|_| XWingError::MlKemCiphertextInvalid)?;
+            let ml_kem_ss = server_kp
+                .ml_kem_dk
+                .decapsulate(&ml_kem_ct)
+                .map_err(|_| XWingError::MlKemDecapsulationFailed)?;
+
+            Ok(combine_mlkem_only(ml_kem_ss.as_slice()))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,5 +700,88 @@ mod tests {
 
         let pk2 = XWingPublicKey::from_bytes(&bytes).unwrap();
         assert_eq!(pk.x25519_bytes(), pk2.x25519_bytes());
+    }
+
+    // ── KEM Agility Tests ─────────────────────────────────────────────
+
+    #[test]
+    fn kem_algorithm_default_is_xwing() {
+        let algo = KemAlgorithm::default();
+        assert_eq!(algo, KemAlgorithm::XWing);
+        assert_eq!(algo.tag(), KEM_TAG_XWING);
+    }
+
+    #[test]
+    fn kem_algorithm_tag_roundtrip() {
+        for algo in [KemAlgorithm::XWing, KemAlgorithm::MlKem1024Only] {
+            let tag = algo.tag();
+            let decoded = KemAlgorithm::from_tag(tag).unwrap();
+            assert_eq!(algo, decoded);
+        }
+    }
+
+    #[test]
+    fn kem_unknown_tag_returns_none() {
+        assert!(KemAlgorithm::from_tag(0xFF).is_none());
+        assert!(KemAlgorithm::from_tag(0x00).is_none());
+    }
+
+    #[test]
+    fn tagged_ciphertext_from_invalid_empty() {
+        assert!(TaggedCiphertext::from_bytes(&[]).is_none());
+    }
+
+    #[test]
+    fn tagged_ciphertext_from_unknown_tag() {
+        assert!(TaggedCiphertext::from_bytes(&[0xFF, 0x01, 0x02]).is_none());
+    }
+
+    #[test]
+    fn tagged_xwing_round_trip() {
+        // Default mode (X-Wing hybrid) tagged encapsulate/decapsulate
+        let server_kp = XWingKeyPair::generate();
+        let server_pk = server_kp.public_key();
+
+        let (client_ss, tagged_ct) = xwing_encapsulate_tagged(&server_pk);
+        assert_eq!(tagged_ct.algorithm(), KemAlgorithm::XWing);
+
+        let server_ss = xwing_decapsulate_tagged(&server_kp, &tagged_ct)
+            .expect("tagged decapsulation should succeed");
+        assert_eq!(client_ss.as_bytes(), server_ss.as_bytes());
+    }
+
+    #[test]
+    fn tagged_ciphertext_serialization() {
+        let server_kp = XWingKeyPair::generate();
+        let server_pk = server_kp.public_key();
+
+        let (_ss, tagged_ct) = xwing_encapsulate_tagged(&server_pk);
+        let bytes = tagged_ct.to_bytes();
+        // First byte is the tag
+        assert_eq!(bytes[0], KEM_TAG_XWING);
+
+        let ct2 = TaggedCiphertext::from_bytes(bytes).unwrap();
+        assert_eq!(ct2.algorithm(), KemAlgorithm::XWing);
+    }
+
+    #[test]
+    fn mlkem_only_combiner_is_deterministic() {
+        let ss1 = combine_mlkem_only(&[0x42u8; 32]);
+        let ss2 = combine_mlkem_only(&[0x42u8; 32]);
+        assert_eq!(ss1.as_bytes(), ss2.as_bytes());
+    }
+
+    #[test]
+    fn mlkem_only_combiner_differs_from_xwing() {
+        // Same ML-KEM shared secret should produce different output
+        // when processed through ML-KEM-only vs X-Wing combiner
+        let ml_kem_ss = [0x42u8; 32];
+        let only_ss = combine_mlkem_only(&ml_kem_ss);
+        let xwing_ss = combine(&[0u8; 32], &ml_kem_ss);
+        assert_ne!(
+            only_ss.as_bytes(),
+            xwing_ss.as_bytes(),
+            "ML-KEM-only and X-Wing combiners must produce different secrets (domain separation)"
+        );
     }
 }

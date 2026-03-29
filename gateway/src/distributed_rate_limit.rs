@@ -72,6 +72,26 @@ impl Default for RateLimitConfig {
 }
 
 impl RateLimitConfig {
+    /// Validate configuration invariants. Panics on invalid config to
+    /// fail fast at startup rather than produce NaN/Infinity at runtime.
+    pub fn validate(&self) {
+        assert!(
+            self.refill_rate > 0.0 && self.refill_rate.is_finite(),
+            "SECURITY: refill_rate must be a positive finite number, got: {}",
+            self.refill_rate,
+        );
+        assert!(
+            self.window_secs > 0,
+            "SECURITY: window_secs must be > 0, got: {}",
+            self.window_secs,
+        );
+        assert!(
+            self.burst_size > 0,
+            "SECURITY: burst_size must be > 0, got: {}",
+            self.burst_size,
+        );
+    }
+
     /// Load configuration from environment variables.
     pub fn from_env() -> Self {
         let redis_url = std::env::var("MILNET_RATE_LIMIT_REDIS_URL").ok();
@@ -94,14 +114,16 @@ impl RateLimitConfig {
 
         let refill_rate = per_ip_limit as f64 / window_secs as f64;
 
-        Self {
+        let config = Self {
             per_ip_limit,
             per_user_limit,
             window_secs,
             burst_size,
             refill_rate,
             redis_url,
-        }
+        };
+        config.validate();
+        config
     }
 }
 
@@ -622,19 +644,17 @@ impl DistributedRateLimiter {
                     .await
                 {
                     Ok((allowed, remaining)) => {
+                        let burst_retry = if allowed {
+                            0u64
+                        } else {
+                            let v = (1.0 / self.config.refill_rate).ceil();
+                            if v.is_nan() || v.is_infinite() || v < 0.0 { 1 } else { v as u64 }
+                        };
                         return RateLimitResult {
                             allowed,
                             remaining,
-                            reset_after_secs: if allowed {
-                                0
-                            } else {
-                                (1.0 / self.config.refill_rate).ceil() as u64
-                            },
-                            retry_after_secs: if allowed {
-                                0
-                            } else {
-                                (1.0 / self.config.refill_rate).ceil() as u64
-                            },
+                            reset_after_secs: burst_retry,
+                            retry_after_secs: burst_retry,
                         };
                     }
                     Err(e) => {
@@ -675,7 +695,13 @@ impl DistributedRateLimiter {
                 retry_after_secs: 0,
             }
         } else {
-            let retry_after = ((1.0 - entry.tokens) / self.config.refill_rate).ceil() as u64;
+            // SECURITY: guard against NaN/Infinity from floating-point division.
+            // If refill_rate is somehow zero or denormal, default to 1 second.
+            let mut retry_after = ((1.0 - entry.tokens) / self.config.refill_rate).ceil();
+            if retry_after.is_nan() || retry_after.is_infinite() || retry_after < 0.0 {
+                retry_after = 1.0; // Safe default: 1 second
+            }
+            let retry_after = retry_after as u64;
             RateLimitResult {
                 allowed: false,
                 remaining: 0,

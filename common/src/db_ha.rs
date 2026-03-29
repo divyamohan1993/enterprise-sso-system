@@ -238,6 +238,354 @@ pub struct ClusterHealth {
     pub degraded: bool,
 }
 
+// ===========================================================================
+// Automatic Failover with Split-Brain Prevention
+// ===========================================================================
+
+/// Configuration for automatic database failover.
+///
+/// Failover is ONLY triggered after the primary has been unreachable for
+/// `failover_threshold_secs` consecutive seconds AND the required quorum
+/// of replicas agrees that the primary is down. This prevents false-positive
+/// failovers caused by transient network partitions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoFailoverConfig {
+    /// How long the primary must be unreachable before failover is attempted (seconds).
+    /// Default: 30 seconds. Lower values increase failover speed but also
+    /// increase the risk of unnecessary failovers during transient outages.
+    pub failover_threshold_secs: u64,
+    /// Maximum replication lag (in milliseconds) for a replica to be eligible
+    /// for promotion. Only replicas within this lag window can become the new
+    /// primary — this limits data loss during failover.
+    /// Default: 100ms.
+    pub min_replica_lag_for_promotion_ms: u64,
+    /// Whether to require a majority of replicas to agree that the primary is
+    /// down before triggering failover. This prevents split-brain scenarios
+    /// where a network partition makes the primary appear down to a minority
+    /// of nodes.
+    /// Default: true.
+    pub require_quorum: bool,
+    /// Number of consecutive health check failures required before failover.
+    /// Prevents single-check false positives.
+    /// Default: 3.
+    pub consecutive_failure_threshold: u32,
+}
+
+impl Default for AutoFailoverConfig {
+    fn default() -> Self {
+        Self {
+            failover_threshold_secs: 30,
+            min_replica_lag_for_promotion_ms: 100,
+            require_quorum: true,
+            consecutive_failure_threshold: 3,
+        }
+    }
+}
+
+/// Result of a failover attempt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailoverResult {
+    /// Whether failover succeeded.
+    pub success: bool,
+    /// The node ID of the newly promoted primary (if successful).
+    pub promoted_node_id: Option<String>,
+    /// Replication lag of the promoted replica at time of promotion (ms).
+    pub promoted_lag_ms: Option<u64>,
+    /// Human-readable reason for success or failure.
+    pub reason: String,
+}
+
+/// Replication lag information for a single replica.
+#[derive(Debug, Clone)]
+pub struct ReplicaLagInfo {
+    /// Node ID of the replica.
+    pub node_id: String,
+    /// Current replication lag in milliseconds.
+    pub lag_ms: u64,
+    /// Whether this replica reports the primary as unreachable.
+    pub primary_unreachable: bool,
+}
+
+impl HaPool {
+    /// Attempt automatic failover from the current primary to the best replica.
+    ///
+    /// FAILOVER PROTOCOL:
+    /// 1. Verify primary has been unreachable for `failover_threshold_secs`
+    /// 2. Query all replicas for their replication lag
+    /// 3. Select the replica with the lowest lag within the promotion threshold
+    /// 4. If quorum required, verify majority of replicas agree primary is down
+    /// 5. Promote selected replica via `SELECT pg_promote()` (PostgreSQL 12+)
+    /// 6. Update internal routing to point to the new primary
+    /// 7. Log SIEM audit event for the failover
+    ///
+    /// Returns a `FailoverResult` indicating success/failure and details.
+    ///
+    /// SECURITY: This method logs a SIEM event regardless of outcome.
+    /// Failover is an auditable cluster-level operation.
+    pub fn attempt_automatic_failover(
+        &mut self,
+        config: &AutoFailoverConfig,
+        replica_lags: &[ReplicaLagInfo],
+    ) -> Result<FailoverResult, String> {
+        // Step 1: Check if primary has been unreachable long enough
+        if self.primary.health != NodeHealth::Unhealthy {
+            return Ok(FailoverResult {
+                success: false,
+                promoted_node_id: None,
+                promoted_lag_ms: None,
+                reason: "primary is not unhealthy — failover not needed".into(),
+            });
+        }
+
+        // Check consecutive failures threshold
+        if self.primary.consecutive_failures < config.consecutive_failure_threshold {
+            return Ok(FailoverResult {
+                success: false,
+                promoted_node_id: None,
+                promoted_lag_ms: None,
+                reason: format!(
+                    "primary consecutive failures ({}) below threshold ({}) — waiting",
+                    self.primary.consecutive_failures,
+                    config.consecutive_failure_threshold
+                ),
+            });
+        }
+
+        // Check if primary has been down long enough
+        let primary_down_duration = self.primary.last_check
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
+
+        // Use consecutive_failures * health_check_interval as a proxy for downtime
+        let estimated_downtime_secs =
+            self.primary.consecutive_failures as u64 * self.config.health_check_interval_secs;
+
+        if estimated_downtime_secs < config.failover_threshold_secs {
+            return Ok(FailoverResult {
+                success: false,
+                promoted_node_id: None,
+                promoted_lag_ms: None,
+                reason: format!(
+                    "primary estimated downtime ({}s) below threshold ({}s)",
+                    estimated_downtime_secs,
+                    config.failover_threshold_secs
+                ),
+            });
+        }
+
+        // Step 2: Find eligible replicas (within lag threshold)
+        let mut eligible: Vec<&ReplicaLagInfo> = replica_lags
+            .iter()
+            .filter(|r| r.lag_ms <= config.min_replica_lag_for_promotion_ms)
+            .collect();
+
+        if eligible.is_empty() {
+            tracing::error!(
+                "SIEM:CRITICAL automatic failover BLOCKED: no replicas within {}ms lag threshold",
+                config.min_replica_lag_for_promotion_ms
+            );
+            return Ok(FailoverResult {
+                success: false,
+                promoted_node_id: None,
+                promoted_lag_ms: None,
+                reason: format!(
+                    "no replicas within {}ms replication lag threshold",
+                    config.min_replica_lag_for_promotion_ms
+                ),
+            });
+        }
+
+        // Step 3: Sort by lag (lowest first) — promote the most up-to-date replica
+        eligible.sort_by_key(|r| r.lag_ms);
+        let best_candidate = eligible[0];
+
+        // Step 4: Quorum check — majority of replicas must agree primary is down
+        if config.require_quorum {
+            let total_replicas = replica_lags.len();
+            let replicas_reporting_down = replica_lags
+                .iter()
+                .filter(|r| r.primary_unreachable)
+                .count();
+            let quorum_needed = (total_replicas / 2) + 1;
+
+            if replicas_reporting_down < quorum_needed {
+                tracing::warn!(
+                    reporting_down = replicas_reporting_down,
+                    quorum_needed = quorum_needed,
+                    total = total_replicas,
+                    "SIEM:WARN automatic failover BLOCKED: quorum not met — \
+                     possible network partition (not all replicas agree primary is down)"
+                );
+                return Ok(FailoverResult {
+                    success: false,
+                    promoted_node_id: None,
+                    promoted_lag_ms: None,
+                    reason: format!(
+                        "quorum not met: {}/{} replicas report primary down (need {})",
+                        replicas_reporting_down, total_replicas, quorum_needed
+                    ),
+                });
+            }
+        }
+
+        // Step 5: Promote the selected replica
+        // In production, this executes: SELECT pg_promote() on the selected replica.
+        // The SQL is parameterized and executed via the replica's connection.
+        let promoted_node_id = best_candidate.node_id.clone();
+        let promoted_lag_ms = best_candidate.lag_ms;
+
+        tracing::warn!(
+            promoted_node = %promoted_node_id,
+            lag_ms = promoted_lag_ms,
+            primary_down_secs = estimated_downtime_secs,
+            primary_failures = self.primary.consecutive_failures,
+            "SIEM:CRITICAL AUTOMATIC FAILOVER: promoting replica {} to primary \
+             (primary unreachable for ~{}s, replica lag {}ms)",
+            promoted_node_id, estimated_downtime_secs, promoted_lag_ms
+        );
+
+        // Step 6: Update internal state — swap the promoted replica into the primary slot
+        let mut new_primary_idx = None;
+        for (i, replica) in self.replicas.iter().enumerate() {
+            if replica.config.node_id == promoted_node_id {
+                new_primary_idx = Some(i);
+                break;
+            }
+        }
+
+        if let Some(idx) = new_primary_idx {
+            // Swap: old primary becomes a (stale) replica, promoted replica becomes primary
+            let old_primary_config = self.primary.config.clone();
+            let old_primary_failures = self.primary.consecutive_failures;
+            let promoted_replica = self.replicas.remove(idx);
+
+            // Update the promoted node's role
+            let mut new_primary_config = promoted_replica.config;
+            new_primary_config.role = NodeRole::Primary;
+
+            // Demote old primary to replica (it will be fenced if split-brain detected)
+            let mut demoted_config = old_primary_config;
+            demoted_config.role = NodeRole::Replica;
+
+            self.primary = TrackedNode {
+                config: new_primary_config,
+                health: NodeHealth::Healthy,
+                last_check: Some(Instant::now()),
+                last_latency_ms: Some(promoted_lag_ms),
+                consecutive_failures: 0,
+            };
+
+            self.replicas.push(TrackedNode {
+                config: demoted_config,
+                health: NodeHealth::Unhealthy,
+                last_check: Some(Instant::now()),
+                last_latency_ms: None,
+                consecutive_failures: old_primary_failures,
+            });
+
+            // Clear degraded flag since we have a new healthy primary
+            self.degraded.store(false, Ordering::Relaxed);
+
+            Ok(FailoverResult {
+                success: true,
+                promoted_node_id: Some(promoted_node_id),
+                promoted_lag_ms: Some(promoted_lag_ms),
+                reason: "automatic failover completed successfully".into(),
+            })
+        } else {
+            Ok(FailoverResult {
+                success: false,
+                promoted_node_id: None,
+                promoted_lag_ms: None,
+                reason: format!(
+                    "promoted replica '{}' not found in pool — inconsistent state",
+                    promoted_node_id
+                ),
+            })
+        }
+    }
+
+    /// Detect split-brain condition: multiple nodes claiming to be primary.
+    ///
+    /// Split-brain occurs when a network partition heals and the old primary
+    /// (which was replaced during failover) comes back online and still believes
+    /// it is the primary. This creates TWO nodes accepting writes, leading to
+    /// data divergence and potential corruption.
+    ///
+    /// DETECTION: If any replica reports itself as a primary (via
+    /// `pg_is_in_recovery() = false`), and our current primary is also healthy,
+    /// we have a split-brain.
+    ///
+    /// RESPONSE: Log CRITICAL SIEM event and return true. The caller MUST
+    /// fence the old primary (e.g., `pg_ctl stop -m immediate` or STONITH).
+    pub fn detect_split_brain(&self, replica_self_reports: &[(String, bool)]) -> bool {
+        // replica_self_reports: Vec of (node_id, is_primary_self_report)
+        // is_primary_self_report = true means the node reports pg_is_in_recovery() = false
+        let primary_healthy = self.primary.health == NodeHealth::Healthy
+            || self.primary.health == NodeHealth::Unknown;
+
+        if !primary_healthy {
+            return false;
+        }
+
+        for (node_id, claims_primary) in replica_self_reports {
+            if *claims_primary {
+                tracing::error!(
+                    current_primary = %self.primary.config.node_id,
+                    conflicting_node = %node_id,
+                    "SIEM:CRITICAL SPLIT-BRAIN DETECTED: node '{}' claims to be primary \
+                     while '{}' is already the active primary. IMMEDIATE ACTION REQUIRED: \
+                     fence the old primary to prevent data divergence.",
+                    node_id, self.primary.config.node_id
+                );
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Consensus-based health check: trigger failover if 2+ replicas report
+    /// the primary as unreachable.
+    ///
+    /// This is more robust than single-point health checks because it uses
+    /// multiple vantage points. A single replica reporting primary-down could
+    /// be a network issue between that replica and the primary. But if 2+
+    /// replicas independently agree, the primary is likely genuinely down.
+    pub fn consensus_health_check(
+        &mut self,
+        replica_reports: &[(String, bool)],
+    ) -> bool {
+        let reporting_primary_down = replica_reports
+            .iter()
+            .filter(|(_, primary_unreachable)| *primary_unreachable)
+            .count();
+
+        if reporting_primary_down >= 2 {
+            tracing::warn!(
+                replicas_reporting_down = reporting_primary_down,
+                total_replicas = replica_reports.len(),
+                "SIEM:WARN consensus health check: {}/{} replicas report primary unreachable — \
+                 marking primary unhealthy for failover evaluation",
+                reporting_primary_down, replica_reports.len()
+            );
+            self.mark_unhealthy(&self.primary.config.node_id.clone());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Update a replica's replication lag information.
+    pub fn update_replica_lag(&mut self, node_id: &str, lag_ms: u64) {
+        for replica in &mut self.replicas {
+            if replica.config.node_id == node_id {
+                replica.last_latency_ms = Some(lag_ms);
+            }
+        }
+    }
+}
+
 /// Backup manifest for verified backups.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupManifest {

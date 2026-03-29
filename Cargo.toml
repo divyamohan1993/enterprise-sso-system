@@ -55,7 +55,9 @@ ml-kem = "0.2"
 argon2 = "0.5"
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std"] }
 tokio-rustls = "0.26"
-rustls-pemfile = "2"
+# SECURITY: rustls-pemfile is UNMAINTAINED (RUSTSEC-2025-0134).
+# PEM parsing migrated to rustls-pki-types PemObject trait.
+rustls-pki-types = { version = "1.14", features = ["std", "alloc"] }
 rcgen = "0.13"
 hex = "0.4"
 rsa = { version = "0.9", features = ["sha2"] }

@@ -172,6 +172,138 @@ pub struct Incident {
 }
 
 // ---------------------------------------------------------------------------
+// Forensic Evidence Collection
+// ---------------------------------------------------------------------------
+
+/// Forensic evidence snapshot collected at time of incident.
+///
+/// Evidence is collected BEFORE any automated response actions to preserve
+/// the system state at the moment of detection. Each evidence entry is
+/// hash-chained to the previous entry for tamper-evident integrity.
+#[derive(Debug, Clone, Serialize)]
+pub struct ForensicEvidence {
+    /// Incident this evidence belongs to.
+    pub incident_id: String,
+    /// Unix timestamp (seconds) when evidence was collected.
+    pub collected_at: i64,
+    /// Snapshot of the current process state.
+    pub process_info: ProcessSnapshot,
+    /// Session IDs that were active at the time of the incident.
+    pub active_sessions: Vec<String>,
+    /// Recent auth event descriptions (last 100).
+    pub recent_auth_events: Vec<String>,
+    /// Active network connection descriptions.
+    pub network_connections: Vec<String>,
+    /// Current RSS memory usage in bytes.
+    pub memory_usage_bytes: u64,
+    /// SHA-512 hash of all evidence fields for integrity verification (hex-encoded).
+    pub evidence_hash: String,
+    /// SHA-512 hash of the previous evidence entry (hex-encoded, hash chain).
+    /// All zeros for the first entry in the chain.
+    pub prev_evidence_hash: String,
+}
+
+/// Snapshot of the current process at time of evidence collection.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcessSnapshot {
+    /// Process ID.
+    pub pid: u32,
+    /// Seconds since process start.
+    pub uptime_secs: u64,
+    /// Number of active threads.
+    pub thread_count: u32,
+    /// Number of open file descriptors.
+    pub open_file_descriptors: u32,
+}
+
+impl ProcessSnapshot {
+    /// Capture a snapshot of the current process.
+    fn capture() -> Self {
+        let pid = std::process::id();
+
+        // Read uptime from /proc/self/stat (field 22 = starttime in clock ticks)
+        let uptime_secs = std::fs::read_to_string("/proc/self/stat")
+            .ok()
+            .and_then(|stat| {
+                let fields: Vec<&str> = stat.split_whitespace().collect();
+                // Field index 21 (0-based) is starttime in clock ticks
+                fields.get(21)?.parse::<u64>().ok()
+            })
+            .map(|start_ticks| {
+                let clock_hz = 100u64; // sysconf(_SC_CLK_TCK) is typically 100
+                let system_uptime = std::fs::read_to_string("/proc/uptime")
+                    .ok()
+                    .and_then(|u| u.split_whitespace().next()?.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                let process_start_secs = start_ticks / clock_hz;
+                (system_uptime as u64).saturating_sub(process_start_secs)
+            })
+            .unwrap_or(0);
+
+        // Count threads from /proc/self/status
+        let thread_count = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                for line in status.lines() {
+                    if let Some(val) = line.strip_prefix("Threads:") {
+                        return val.trim().parse::<u32>().ok();
+                    }
+                }
+                None
+            })
+            .unwrap_or(1);
+
+        // Count open file descriptors from /proc/self/fd
+        let open_file_descriptors = std::fs::read_dir("/proc/self/fd")
+            .map(|entries| entries.count() as u32)
+            .unwrap_or(0);
+
+        Self {
+            pid,
+            uptime_secs,
+            thread_count,
+            open_file_descriptors,
+        }
+    }
+}
+
+impl ForensicEvidence {
+    /// Compute SHA-512 hash over all evidence fields for integrity verification.
+    /// Returns hex-encoded hash string.
+    fn compute_hash(
+        incident_id: &str,
+        collected_at: i64,
+        process_info: &ProcessSnapshot,
+        active_sessions: &[String],
+        recent_auth_events: &[String],
+        network_connections: &[String],
+        memory_usage_bytes: u64,
+        prev_hash: &str,
+    ) -> String {
+        use sha2::{Sha512, Digest};
+        let mut hasher = Sha512::new();
+        hasher.update(incident_id.as_bytes());
+        hasher.update(collected_at.to_le_bytes());
+        hasher.update(process_info.pid.to_le_bytes());
+        hasher.update(process_info.uptime_secs.to_le_bytes());
+        hasher.update(process_info.thread_count.to_le_bytes());
+        hasher.update(process_info.open_file_descriptors.to_le_bytes());
+        for s in active_sessions {
+            hasher.update(s.as_bytes());
+        }
+        for e in recent_auth_events {
+            hasher.update(e.as_bytes());
+        }
+        for c in network_connections {
+            hasher.update(c.as_bytes());
+        }
+        hasher.update(memory_usage_bytes.to_le_bytes());
+        hasher.update(prev_hash.as_bytes());
+        hex::encode(hasher.finalize())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Incident Response Engine
 // ---------------------------------------------------------------------------
 
@@ -194,6 +326,8 @@ pub struct IncidentResponseEngine {
     lockdown: std::sync::atomic::AtomicBool,
     /// Callback for executing response actions. Set at initialization.
     action_executor: Mutex<Option<Box<dyn Fn(&ResponseAction) + Send + Sync>>>,
+    /// Append-only forensic evidence log. Evidence entries are hash-chained.
+    evidence_log: Mutex<Vec<ForensicEvidence>>,
 }
 
 impl IncidentResponseEngine {
@@ -204,6 +338,7 @@ impl IncidentResponseEngine {
             critical_timestamps: Mutex::new(VecDeque::new()),
             lockdown: std::sync::atomic::AtomicBool::new(false),
             action_executor: Mutex::new(None),
+            evidence_log: Mutex::new(Vec::new()),
         }
     }
 
@@ -214,6 +349,99 @@ impl IncidentResponseEngine {
     ) {
         let mut exec = self.action_executor.lock().unwrap_or_else(|e| e.into_inner());
         *exec = Some(Box::new(executor));
+    }
+
+    /// Collect forensic evidence for an incident.
+    ///
+    /// Snapshots the current system state and appends to the append-only
+    /// evidence log. Each entry is hash-chained to the previous entry
+    /// for tamper-evident integrity. Evidence cannot be modified after
+    /// collection.
+    pub fn collect_evidence(&self, incident_id: &str) -> ForensicEvidence {
+        let collected_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        let process_info = ProcessSnapshot::capture();
+
+        // Read RSS memory from /proc/self/status
+        let memory_usage_bytes = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                for line in status.lines() {
+                    if let Some(val) = line.strip_prefix("VmRSS:") {
+                        let kb: u64 = val.trim().split_whitespace().next()?.parse().ok()?;
+                        return Some(kb * 1024);
+                    }
+                }
+                None
+            })
+            .unwrap_or(0);
+
+        // Read active TCP connections from /proc/self/net/tcp
+        let network_connections = std::fs::read_to_string("/proc/self/net/tcp")
+            .ok()
+            .map(|content| {
+                content
+                    .lines()
+                    .skip(1) // skip header
+                    .take(100)
+                    .map(|l| l.trim().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        // Get the previous evidence hash for the chain
+        let prev_evidence_hash = {
+            let log = self.evidence_log.lock().unwrap_or_else(|e| e.into_inner());
+            log.last()
+                .map(|e| e.evidence_hash.clone())
+                .unwrap_or_else(|| "0".repeat(128)) // 64 zero bytes hex-encoded
+        };
+
+        let evidence_hash = ForensicEvidence::compute_hash(
+            incident_id,
+            collected_at,
+            &process_info,
+            &[], // active_sessions populated by caller if available
+            &[], // recent_auth_events populated by caller if available
+            &network_connections,
+            memory_usage_bytes,
+            &prev_evidence_hash,
+        );
+
+        let evidence = ForensicEvidence {
+            incident_id: incident_id.to_string(),
+            collected_at,
+            process_info,
+            active_sessions: Vec::new(),
+            recent_auth_events: Vec::new(),
+            network_connections,
+            memory_usage_bytes,
+            evidence_hash: evidence_hash.clone(),
+            prev_evidence_hash,
+        };
+
+        // Append to the immutable evidence log
+        {
+            let mut log = self.evidence_log.lock().unwrap_or_else(|e| e.into_inner());
+            log.push(evidence.clone());
+        }
+
+        tracing::info!(
+            incident_id = %incident_id,
+            evidence_hash = %&evidence.evidence_hash[..32],
+            "Forensic evidence collected and hash-chained"
+        );
+
+        evidence
+    }
+
+    /// Return a copy of the full forensic evidence log (append-only, immutable).
+    pub fn evidence_log(&self) -> Vec<ForensicEvidence> {
+        let log = self.evidence_log.lock().unwrap_or_else(|e| e.into_inner());
+        log.clone()
     }
 
     /// Whether the system is currently in lockdown mode.
@@ -262,6 +490,10 @@ impl IncidentResponseEngine {
         };
 
         let incident_id = incident.id;
+
+        // SECURITY: Collect forensic evidence BEFORE any automated response
+        // actions, so the system state is preserved as-is at detection time.
+        let _evidence = self.collect_evidence(&incident_id.to_string());
 
         // Store the incident
         {

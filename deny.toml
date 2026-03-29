@@ -185,6 +185,7 @@ deny = [
     { crate = "openssl", reason = "Use rustls instead for TLS — openssl has a large C attack surface" },
     { crate = "openssl-sys", reason = "Use rustls instead — avoid linking to OpenSSL C library" },
     { crate = "cpython", reason = "Avoid embedding CPython — use pure-Rust alternatives" },
+    { crate = "rustls-pemfile", reason = "UNMAINTAINED (RUSTSEC-2025-0134) — use rustls-pki-types PemObject or inline PEM parsing" },
 ]
 
 # List of features to allow/deny
