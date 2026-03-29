@@ -983,7 +983,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn standalone_node_starts() {
+    async fn standalone_node_is_rejected() {
         let nid = NodeId(uuid::Uuid::from_u128(0xCAFE));
         let config = ClusterConfig {
             node_id: nid,
@@ -994,9 +994,12 @@ mod tests {
             raft_config: RaftConfig::default(),
         };
 
-        let node = ClusterNode::start(config).await.unwrap();
-        assert_eq!(node.node_id(), nid);
-
-        node.shutdown().await;
+        let result = ClusterNode::start(config).await;
+        assert!(result.is_err(), "standalone mode must be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("standalone mode") && err.contains("forbidden"),
+            "error must mention standalone mode is forbidden, got: {err}"
+        );
     }
 }

@@ -107,14 +107,14 @@ checks:
   - category: Authentication
     id: V-222610
     severity: CatII
-    status: Manual
+    status: Pass
     title: Error handling (no stack traces in responses)
 summary:
   cat_i_failures: 3
   cat_ii_failures: 2
   cat_iii_failures: 0
   failed: 5
-  manual: 2
+  manual: 1
   not_applicable: 0
-  passed: 14
+  passed: 15
   total: 21

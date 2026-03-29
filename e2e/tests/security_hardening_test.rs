@@ -39,24 +39,13 @@ fn encrypted_field_v2_tag_present() {
 // 2. STIG Category I halts in production
 // ---------------------------------------------------------------------------
 
-/// Verify the STIG auditor runs without panic in non-production mode.
-/// In production mode with Cat I failures, it would panic at startup.
+/// STIG Category I failures are always fatal (production mode is always
+/// active). Verify that `run_stig_audit` panics when Cat I checks fail
+/// (which they will in CI/test environments without hardened kernel settings).
 #[test]
+#[should_panic(expected = "STIG Category I failure")]
 fn stig_cat_i_failures_detected() {
-    let result = run_stig_audit();
-    // In non-production mode (test), run_stig_audit always returns Ok.
-    match result {
-        Ok(summary) => {
-            // Check the summary is populated
-            assert!(summary.total > 0, "STIG audit should check at least one item");
-        }
-        Err(failures) => {
-            // In non-prod, this branch should not be reached (panic path
-            // is production-only), but if the code changes, verify failures
-            // are reported.
-            assert!(!failures.is_empty());
-        }
-    }
+    let _result = run_stig_audit();
 }
 
 // ---------------------------------------------------------------------------

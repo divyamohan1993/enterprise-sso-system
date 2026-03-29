@@ -1633,11 +1633,12 @@ mod tests {
     }
 
     #[test]
-    fn validate_ssl_config_does_not_panic_dev_mode() {
-        // In dev mode (MILNET_PRODUCTION not set), should just warn, not panic
+    #[should_panic(expected = "FATAL: DATABASE_URL sslmode=")]
+    fn validate_ssl_config_panics_for_insecure_sslmode() {
+        // Production is always enforced — insecure sslmode must panic regardless
+        // of MILNET_PRODUCTION env var (there is no dev mode).
         std::env::remove_var("MILNET_PRODUCTION");
         validate_ssl_config("postgres://host/db?sslmode=disable");
-        // If we reach here, no panic occurred
     }
 
     #[test]

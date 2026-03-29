@@ -122,8 +122,9 @@ fn test_dod_retention_2555_days() {
 // 6. FIPS mode production enforcement
 // ---------------------------------------------------------------------------
 
-/// A `SecurityConfig` with `fips_mode=false` must be flagged as a production
-/// violation.
+/// FIPS mode is toggleable — disabling it is allowed (enables stronger
+/// algorithms like AEGIS-256, Argon2id, BLAKE3). Verify that
+/// `fips_mode=false` is NOT flagged as a production violation.
 #[test]
 fn test_fips_mode_production_enforcement() {
     let cfg = SecurityConfig {
@@ -132,8 +133,8 @@ fn test_fips_mode_production_enforcement() {
     };
     let violations = cfg.validate_production_config();
     assert!(
-        violations.iter().any(|v| v.contains("fips_mode")),
-        "production config must flag fips_mode=false as a violation"
+        !violations.iter().any(|v| v.contains("fips_mode")),
+        "fips_mode=false must NOT be a violation (FIPS is toggleable for stronger algorithms)"
     );
 }
 

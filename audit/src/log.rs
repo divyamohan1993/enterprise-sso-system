@@ -755,6 +755,11 @@ mod tests {
         let mut log = AuditLog::new_with_limits(100_000, Some(dir.to_str().unwrap().to_string()));
         log.retention_policy.max_age_days = 1; // 1 day retention
 
+        // Set encryption KEK (required in production mode for archival to succeed)
+        let mut kek = [0u8; 32];
+        getrandom::getrandom(&mut kek).unwrap();
+        log.retention_policy.archive_encryption_kek = Some(kek);
+
         // Add entries with a timestamp 2 days ago (expired)
         let two_days_ago = now_us() - 2 * MICROS_PER_DAY;
         append_entries_with_timestamp(&mut log, 5, two_days_ago, &signing_key);
@@ -1018,6 +1023,11 @@ mod tests {
         log.retention_policy.compliance_regime =
             Some(common::compliance::ComplianceRegime::IndianGovt);
         log.retention_policy.cert_in_min_retention_days = 365;
+
+        // Set encryption KEK (required in production mode for archival to succeed)
+        let mut kek = [0u8; 32];
+        getrandom::getrandom(&mut kek).unwrap();
+        log.retention_policy.archive_encryption_kek = Some(kek);
 
         // Entry timestamped 400 days ago — older than both max_age AND floor, must be deleted.
         let four_hundred_days_ago = now_us() - 400 * MICROS_PER_DAY;
