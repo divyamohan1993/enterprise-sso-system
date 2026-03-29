@@ -31,7 +31,7 @@ fn run_with_large_stack<F: FnOnce() + Send + 'static>(f: F) {
 #[test]
 fn encrypted_field_v2_tag_present() {
     let enc = FieldEncryptor::new([0x42; 32]);
-    let encrypted = enc.encrypt_field("users", "opaque_registration", b"row-1", b"sensitive data");
+    let encrypted = enc.encrypt_field("users", "opaque_registration", b"row-1", b"sensitive data").unwrap();
     assert_eq!(encrypted[0], 0x02, "must use V2 envelope format");
 }
 

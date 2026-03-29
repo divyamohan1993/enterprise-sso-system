@@ -869,17 +869,17 @@ fn decommission_lifecycle_transitions() {
 
     // Active -> Suspended.
     mgr.suspend_tenant(tid, "compliance review").unwrap();
-    let t = mgr.get_tenant(tid).unwrap();
+    let t = mgr.get_tenant(tid).unwrap().unwrap();
     assert_eq!(t.status, TenantStatus::Suspended);
 
     // Suspended -> Decommissioning.
     mgr.decommission_tenant(tid, "contract expired").unwrap();
-    let t = mgr.get_tenant(tid).unwrap();
+    let t = mgr.get_tenant(tid).unwrap().unwrap();
     assert_eq!(t.status, TenantStatus::Decommissioning);
 
     // Decommissioning -> Decommissioned.
     mgr.finalize_decommission(tid).unwrap();
-    let t = mgr.get_tenant(tid).unwrap();
+    let t = mgr.get_tenant(tid).unwrap().unwrap();
     assert_eq!(t.status, TenantStatus::Decommissioned);
 
     // Cannot transition from Decommissioned to anything.
@@ -897,7 +897,7 @@ fn decommission_from_active_also_works() {
 
     // Active -> Decommissioning directly.
     mgr.decommission_tenant(tid, "immediate removal").unwrap();
-    let t = mgr.get_tenant(tid).unwrap();
+    let t = mgr.get_tenant(tid).unwrap().unwrap();
     assert_eq!(t.status, TenantStatus::Decommissioning);
 }
 
@@ -911,19 +911,19 @@ fn tenant_kek_derivation_produces_unique_keys() {
     let tenant_a = TenantId::new();
     let tenant_b = TenantId::new();
 
-    let kek_a = derive_tenant_kek(tenant_a, &master_kek);
-    let kek_b = derive_tenant_kek(tenant_b, &master_kek);
+    let kek_a = derive_tenant_kek(tenant_a, &master_kek).unwrap();
+    let kek_b = derive_tenant_kek(tenant_b, &master_kek).unwrap();
 
     // Different tenants must produce different KEKs.
     assert_ne!(kek_a, kek_b, "different tenants must derive different KEKs");
 
     // Same tenant must produce the same KEK (deterministic).
-    let kek_a2 = derive_tenant_kek(tenant_a, &master_kek);
+    let kek_a2 = derive_tenant_kek(tenant_a, &master_kek).unwrap();
     assert_eq!(kek_a, kek_a2, "same tenant must produce the same KEK");
 
     // Different master KEKs produce different results.
     let other_master = [0xCDu8; 32];
-    let kek_a_other = derive_tenant_kek(tenant_a, &other_master);
+    let kek_a_other = derive_tenant_kek(tenant_a, &other_master).unwrap();
     assert_ne!(
         kek_a, kek_a_other,
         "different master KEKs must produce different tenant KEKs"
