@@ -1225,7 +1225,6 @@ impl LogoutRequest {
         }
         // SECURITY: XXE Prevention — reject DTDs and external entities.
         reject_xxe(xml)?;
-        }
 
         let id = extract_xml_attr(xml, "LogoutRequest", "ID")
             .ok_or("missing ID on LogoutRequest")?;
