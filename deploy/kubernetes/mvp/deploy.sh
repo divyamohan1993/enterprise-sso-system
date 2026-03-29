@@ -72,7 +72,7 @@ build_images() {
             --build-arg SERVICE_NAME="${svc}" \
             -t "milnet/${svc}:dev" \
             -f "$dockerfile" \
-            . 2>&1 | tail -10
+            . 2>&1 | tail -30
         log "  -> milnet/${svc}:dev built"
     done
 
