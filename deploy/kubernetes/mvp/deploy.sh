@@ -60,13 +60,16 @@ build_images() {
     # Services that have binaries
     local services=(gateway orchestrator tss opaque verifier ratchet risk audit kt admin)
 
+    # Use the MVP Dockerfile (no static linking, debian-slim runtime)
+    local dockerfile="$SCRIPT_DIR/Dockerfile"
+
     for svc in "${services[@]}"; do
         log "Building milnet/${svc}:dev ..."
         sudo docker build \
             --build-arg SERVICE_NAME="${svc}" \
             -t "milnet/${svc}:dev" \
-            -f Dockerfile \
-            . 2>&1 | tail -5
+            -f "$dockerfile" \
+            . 2>&1 | tail -10
         log "  -> milnet/${svc}:dev built"
     done
 
