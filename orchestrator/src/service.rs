@@ -24,15 +24,15 @@ fn verify_receipt_independently(
     _expected_user: &str,
     hmac_key: &[u8; 64],
     ceremony_session_id: &[u8; 32],
+    receipt_signing_seed: &[u8; 32],
 ) -> Result<(), String> {
     // 1. Verify receipt signature (ML-DSA-87 preferred, HMAC-SHA512 fallback).
     //    This proves the receipt was signed by the OPAQUE service and has not
     //    been tampered with in transit.
     let mldsa_ok = {
-        // Load the receipt signing seed from the same sealed source as OPAQUE,
-        // ensuring ML-DSA-87 verification uses the matching key pair.
-        let receipt_seed = common::sealed_keys::load_receipt_signing_seed_sealed();
-        let kp = ml_dsa::MlDsa87::from_seed(&receipt_seed.into());
+        // Use the receipt signing seed provided by the caller, which must match
+        // the seed used by the OPAQUE service's ReceiptSigner.
+        let kp = ml_dsa::MlDsa87::from_seed(&(*receipt_signing_seed).into());
         let vk_bytes = kp.verifying_key().encode();
         let data = crypto::receipts::receipt_signing_data(receipt);
         crypto::receipts::verify_receipt_asymmetric(vk_bytes.as_ref(), &data, &receipt.signature)
@@ -86,6 +86,11 @@ pub struct OrchestratorService {
     /// SECURITY: This is the same symmetric key held by the OPAQUE service.
     /// The orchestrator uses it ONLY for verification, never for signing.
     pub receipt_verification_key: [u8; 64],
+    /// ML-DSA-87 receipt signing seed used for independent receipt verification.
+    /// Must match the seed used by the OPAQUE service's ReceiptSigner.
+    /// Loaded from sealed storage in production, or derived from
+    /// `receipt_verification_key[..32]` when an explicit key is provided.
+    receipt_signing_seed: [u8; 32],
     pub opaque_addr: String,
     pub tss_addr: String,
     pub risk_engine: risk::scoring::RiskEngine,
@@ -108,10 +113,12 @@ impl OrchestratorService {
         tss_addr: String,
     ) -> Self {
         let receipt_verification_key = hmac_key;
+        let receipt_signing_seed = common::sealed_keys::load_receipt_signing_seed_sealed();
         let (tls_connector, _ca, _cert_key) = tls_client_setup("orchestrator");
         Self {
             hmac_key,
             receipt_verification_key,
+            receipt_signing_seed,
             opaque_addr,
             tss_addr,
             risk_engine: risk::scoring::RiskEngine::new(),
@@ -122,16 +129,22 @@ impl OrchestratorService {
     }
 
     /// Create with explicit receipt verification key for zero-trust receipt checking.
+    ///
+    /// The ML-DSA-87 receipt signing seed is derived from `receipt_verification_key[..32]`,
+    /// matching the derivation in `ReceiptSigner::new()`.
     pub fn new_with_receipt_key(
         hmac_key: [u8; 64],
         receipt_verification_key: [u8; 64],
         opaque_addr: String,
         tss_addr: String,
     ) -> Self {
+        let mut receipt_signing_seed = [0u8; 32];
+        receipt_signing_seed.copy_from_slice(&receipt_verification_key[..32]);
         let (tls_connector, _ca, _cert_key) = tls_client_setup("orchestrator");
         Self {
             hmac_key,
             receipt_verification_key,
+            receipt_signing_seed,
             opaque_addr,
             tss_addr,
             risk_engine: risk::scoring::RiskEngine::new(),
@@ -149,9 +162,11 @@ impl OrchestratorService {
         tls_connector: TlsConnector,
     ) -> Self {
         let receipt_verification_key = hmac_key;
+        let receipt_signing_seed = common::sealed_keys::load_receipt_signing_seed_sealed();
         Self {
             hmac_key,
             receipt_verification_key,
+            receipt_signing_seed,
             opaque_addr,
             tss_addr,
             risk_engine: risk::scoring::RiskEngine::new(),
@@ -162,6 +177,9 @@ impl OrchestratorService {
     }
 
     /// Create with explicit TLS connector AND receipt verification key.
+    ///
+    /// The ML-DSA-87 receipt signing seed is derived from `receipt_verification_key[..32]`,
+    /// matching the derivation in `ReceiptSigner::new()`.
     pub fn new_with_tls_and_receipt_key(
         hmac_key: [u8; 64],
         receipt_verification_key: [u8; 64],
@@ -169,9 +187,12 @@ impl OrchestratorService {
         tss_addr: String,
         tls_connector: TlsConnector,
     ) -> Self {
+        let mut receipt_signing_seed = [0u8; 32];
+        receipt_signing_seed.copy_from_slice(&receipt_verification_key[..32]);
         Self {
             hmac_key,
             receipt_verification_key,
+            receipt_signing_seed,
             opaque_addr,
             tss_addr,
             risk_engine: risk::scoring::RiskEngine::new(),
@@ -439,6 +460,7 @@ impl OrchestratorService {
             &request.username,
             &self.receipt_verification_key,
             &session_id,
+            &self.receipt_signing_seed,
         ) {
             common::siem::SecurityEvent::tamper_detected(
                 &format!("independent receipt verification failed: {e}"),

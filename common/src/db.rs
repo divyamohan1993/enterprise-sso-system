@@ -387,7 +387,8 @@ pub fn enforce_ssl_in_url(database_url: &str) -> String {
 /// when `sslmode=verify-full` is requested.
 pub fn validate_ssl_config(database_url: &str) {
     let mode = parse_sslmode(database_url);
-    let is_production = crate::sealed_keys::is_production();
+    let is_production = crate::sealed_keys::is_production()
+        || std::env::var("MILNET_PRODUCTION").map_or(false, |v| v == "1" || v == "true");
 
     // Log SSL cert/key availability
     let ssl_cert = std::env::var("MILNET_DB_SSL_CERT").ok().filter(|s| !s.is_empty());
