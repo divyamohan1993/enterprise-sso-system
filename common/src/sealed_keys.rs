@@ -608,17 +608,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn deterministic_dev_key_is_consistent() {
-        let key1 = deterministic_dev_key(b"test-seed");
-        let key2 = deterministic_dev_key(b"test-seed");
-        assert_eq!(key1, key2);
+    fn derive_unseal_key_is_consistent() {
+        let master = [0x42u8; 32];
+        let k1 = derive_unseal_key(&master, "test-purpose");
+        let k2 = derive_unseal_key(&master, "test-purpose");
+        assert_eq!(k1, k2);
     }
 
     #[test]
-    fn different_seeds_produce_different_keys() {
-        let key1 = deterministic_dev_key(b"seed-a");
-        let key2 = deterministic_dev_key(b"seed-b");
-        assert_ne!(key1, key2);
+    fn is_production_always_true() {
+        assert!(is_production(), "is_production() must always return true");
     }
 
     #[test]
