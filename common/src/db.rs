@@ -379,16 +379,13 @@ pub fn enforce_ssl_in_url(database_url: &str) -> String {
 
 /// Validate SSL configuration at startup.
 ///
-/// In production (`MILNET_PRODUCTION=1`), rejects connections that do not use
-/// `sslmode=require` or `sslmode=verify-full`. Logs a warning in dev mode
-/// if SSL is not configured.
+/// Rejects connections that do not use `sslmode=require` or
+/// `sslmode=verify-full`.
 ///
 /// Also validates `MILNET_DB_SSL_CERT` and `MILNET_DB_SSL_KEY` env vars
 /// when `sslmode=verify-full` is requested.
 pub fn validate_ssl_config(database_url: &str) {
     let mode = parse_sslmode(database_url);
-    let is_production = crate::sealed_keys::is_production()
-        || std::env::var("MILNET_PRODUCTION").map_or(false, |v| v == "1" || v == "true");
 
     // Log SSL cert/key availability
     let ssl_cert = std::env::var("MILNET_DB_SSL_CERT").ok().filter(|s| !s.is_empty());
@@ -405,16 +402,9 @@ pub fn validate_ssl_config(database_url: &str) {
     }
 
     if !mode.is_secure() {
-        if is_production {
-            panic!(
-                "FATAL: DATABASE_URL sslmode={:?} is not acceptable in production. \
-                 Set sslmode=require or sslmode=verify-full.",
-                mode
-            );
-        }
-        tracing::warn!(
-            "DB SSL WARNING: sslmode={:?} does not guarantee encryption. \
-             Set sslmode=require or sslmode=verify-full for production use.",
+        panic!(
+            "FATAL: DATABASE_URL sslmode={:?} is not acceptable. \
+             Set sslmode=require or sslmode=verify-full.",
             mode
         );
     }

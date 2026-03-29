@@ -191,7 +191,7 @@ fn test_destructive_action_approvals_at_least_two() {
         DestructiveAction::TierChange,
         DestructiveAction::KeyRotation,
         DestructiveAction::BulkDeviceRevocation,
-        DestructiveAction::DeveloperModeToggle,
+        DestructiveAction::ErrorLevelToggle,
     ];
     for action in &actions {
         assert!(
@@ -222,7 +222,7 @@ fn test_all_destructive_actions_require_superadmin_approver() {
         DestructiveAction::TierChange,
         DestructiveAction::KeyRotation,
         DestructiveAction::BulkDeviceRevocation,
-        DestructiveAction::DeveloperModeToggle,
+        DestructiveAction::ErrorLevelToggle,
     ];
     for action in &actions {
         assert!(

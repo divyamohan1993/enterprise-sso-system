@@ -1,31 +1,33 @@
-//! Error response sanitisation for the MILNET SSO system.
+//! Error response handling for the MILNET SSO system.
 //!
-//! In production (developer mode OFF), internal error details are replaced with
-//! generic messages to prevent information leakage.  In developer mode, full
-//! error context including file/line information is preserved for debugging.
+//! Error verbosity is controlled by `error_level()`:
+//! - `Verbose`: full error details including file/line exposed in responses
+//! - `Warn`: errors mapped to generic safe messages, no file/line
+//!
+//! Default is Verbose. The codebase is open-source — hiding line numbers
+//! provides no security benefit when source is already public.
 #![forbid(unsafe_code)]
 
-use crate::config::developer_mode;
+use crate::config::error_level;
 
 // ---------------------------------------------------------------------------
 // Error sanitisation
 // ---------------------------------------------------------------------------
 
-/// Strip internal details from an error message when developer mode is off.
+/// Strip internal details from an error message when error_level is Warn.
 ///
-/// When `developer_mode` is true, the full error string is returned verbatim.
-/// When false, the error is mapped to a safe, generic message that reveals
-/// nothing about internal state.
-pub fn sanitize_error(err: &str, dev_mode: bool) -> String {
-    if dev_mode {
+/// When `verbose` is true, the full error string is returned verbatim.
+/// When false, the error is mapped to a safe, generic message.
+pub fn sanitize_error(err: &str, verbose: bool) -> String {
+    if verbose {
         return err.to_string();
     }
     map_to_safe_message(err).to_string()
 }
 
-/// Convenience wrapper that reads developer mode from the global config.
+/// Convenience wrapper that reads error level from the global config.
 pub fn sanitize(err: &str) -> String {
-    sanitize_error(err, developer_mode().is_enabled())
+    sanitize_error(err, error_level().is_verbose())
 }
 
 /// Attach file and line information to an error message.
@@ -35,17 +37,17 @@ pub fn sanitize(err: &str) -> String {
 #[track_caller]
 pub fn error_with_location(err: &str) -> String {
     let loc = std::panic::Location::caller();
-    if developer_mode().is_enabled() {
+    if error_level().is_verbose() {
         format!("{err} [at {file}:{line}]", file = loc.file(), line = loc.line())
     } else {
-        // In production, never expose file/line — just return the safe message.
+        // Warn mode: never expose file/line — just return the safe message.
         map_to_safe_message(err).to_string()
     }
 }
 
 /// Build a full error context string suitable for logging internally.
 ///
-/// Always includes location regardless of developer mode — this is for the
+/// Always includes location regardless of error level — this is for the
 /// *log*, not the HTTP response.
 #[track_caller]
 pub fn log_error_with_location(err: &str) -> String {
@@ -59,12 +61,11 @@ pub fn log_error_with_location(err: &str) -> String {
 
 /// Create a structured error response payload.
 ///
-/// In developer mode returns `{ "error": "<full detail>", "location": "file:line" }`.
-/// In production returns `{ "error": "<safe message>" }`.
+/// In verbose mode returns `{ "error": "<full detail>", "location": "file:line" }`.
+/// In warn mode returns `{ "error": "<safe message>" }`.
 #[track_caller]
 pub fn error_json(err: &str) -> serde_json::Value {
-    let dev = developer_mode().is_enabled();
-    if dev {
+    if error_level().is_verbose() {
         let loc = std::panic::Location::caller();
         serde_json::json!({
             "error": err,
@@ -157,19 +158,16 @@ fn map_to_safe_message(err: &str) -> &'static str {
 // Verbose logging helpers
 // ---------------------------------------------------------------------------
 
-/// Log a verbose-level event.  Only emits if developer mode is enabled
-/// and log level is Verbose.
-///
-/// This is a macro-style helper; call it with a tracing-compatible format.
+/// Log a verbose-level event.  Only emits if error_level is Verbose.
 pub fn verbose_log(category: &str, message: &str) {
-    if developer_mode().is_verbose() {
+    if error_level().is_verbose() {
         tracing::debug!(category = category, "{}", message);
     }
 }
 
 /// Log a verbose-level event with structured fields.
 pub fn verbose_log_fields(category: &str, message: &str, fields: &[(&str, &str)]) {
-    if developer_mode().is_verbose() {
+    if error_level().is_verbose() {
         let field_str: String = fields
             .iter()
             .map(|(k, v)| format!("{}={}", k, v))
@@ -181,7 +179,7 @@ pub fn verbose_log_fields(category: &str, message: &str, fields: &[(&str, &str)]
 
 /// Log an incoming request when verbose logging is active.
 pub fn log_request(method: &str, path: &str, source_ip: &str) {
-    if developer_mode().is_verbose() {
+    if error_level().is_verbose() {
         tracing::info!(
             category = "request",
             method = method,
@@ -194,7 +192,7 @@ pub fn log_request(method: &str, path: &str, source_ip: &str) {
 
 /// Log a ceremony step with timing information.
 pub fn log_ceremony_step(ceremony_id: &str, step: &str, elapsed_ms: u64) {
-    if developer_mode().is_verbose() {
+    if error_level().is_verbose() {
         tracing::info!(
             category = "ceremony",
             ceremony_id = ceremony_id,
@@ -206,31 +204,30 @@ pub fn log_ceremony_step(ceremony_id: &str, step: &str, elapsed_ms: u64) {
 }
 
 /// Log a token operation (creation or verification).
-pub fn log_token_operation(operation: &str, user_id: &str, tier: u8, dev_mode: bool) {
-    if developer_mode().is_verbose() {
-        if dev_mode {
-            tracing::info!(
-                category = "token",
-                operation = operation,
-                user_id = user_id,
-                tier = tier,
-                "token operation"
-            );
-        } else {
-            tracing::info!(
-                category = "token",
-                operation = operation,
-                user_id = "[REDACTED]",
-                tier = tier,
-                "token operation"
-            );
-        }
+/// In verbose mode, logs real user_id. In warn mode, redacts.
+pub fn log_token_operation(operation: &str, user_id: &str, tier: u8, _dev_mode: bool) {
+    if error_level().is_verbose() {
+        tracing::info!(
+            category = "token",
+            operation = operation,
+            user_id = user_id,
+            tier = tier,
+            "token operation"
+        );
+    } else {
+        tracing::info!(
+            category = "token",
+            operation = operation,
+            user_id = "[REDACTED]",
+            tier = tier,
+            "token operation"
+        );
     }
 }
 
 /// Log a crypto operation (algorithm used, key ID — never actual keys).
 pub fn log_crypto_operation(operation: &str, algorithm: &str, key_id: &str) {
-    if developer_mode().is_verbose() {
+    if error_level().is_verbose() {
         tracing::info!(
             category = "crypto",
             operation = operation,
@@ -243,7 +240,7 @@ pub fn log_crypto_operation(operation: &str, algorithm: &str, key_id: &str) {
 
 /// Log risk scoring signal values and final score.
 pub fn log_risk_score(user_id: &str, signals: &[(&str, f64)], final_score: f64) {
-    if developer_mode().is_verbose() {
+    if error_level().is_verbose() {
         let signal_str: String = signals
             .iter()
             .map(|(k, v)| format!("{}={:.3}", k, v))
@@ -260,12 +257,12 @@ pub fn log_risk_score(user_id: &str, signals: &[(&str, f64)], final_score: f64) 
 }
 
 // ---------------------------------------------------------------------------
-// Display impl for MilnetError (enhanced for dev mode)
+// Display impl for MilnetError (enhanced for verbose mode)
 // ---------------------------------------------------------------------------
 
 /// Format a MilnetError for external consumption.
 ///
-/// In developer mode, includes the full error chain.  In production, maps
+/// In verbose mode, includes the full error chain.  In warn mode, maps
 /// to a generic safe message.
 pub fn format_error_for_response(err: &dyn std::fmt::Display) -> String {
     let msg = err.to_string();
@@ -313,29 +310,28 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_passes_through_in_dev_mode() {
+    fn sanitize_passes_through_in_verbose_mode() {
         let detail = "receipt verification failed: HMAC mismatch on step 3";
         assert_eq!(sanitize_error(detail, true), detail);
     }
 
     #[test]
-    fn error_with_location_includes_file_in_dev() {
-        // Temporarily enable dev mode for this test.
-        // Use a message that does not match any sensitive keyword pattern
-        // in map_to_safe_message, so it passes through verbatim in dev mode.
-        developer_mode().set_developer_mode_unchecked(true);
+    fn error_with_location_includes_file_in_verbose() {
+        // Set error_level to Verbose for this test.
+        error_level().set_level(crate::config::ErrorLevel::Verbose);
         let msg = error_with_location("validation check failed for input");
         assert!(msg.contains("validation check failed for input"));
         assert!(msg.contains("error_response.rs"));
-        developer_mode().set_developer_mode_unchecked(false);
     }
 
     #[test]
-    fn error_with_location_masks_in_prod() {
-        developer_mode().set_developer_mode_unchecked(false);
+    fn error_with_location_masks_in_warn() {
+        error_level().set_level(crate::config::ErrorLevel::Warn);
         let msg = error_with_location("AES-256-GCM decrypt failed");
         assert_eq!(msg, "internal error");
         assert!(!msg.contains("error_response.rs"));
+        // Restore default
+        error_level().set_level(crate::config::ErrorLevel::Verbose);
     }
 
     #[test]

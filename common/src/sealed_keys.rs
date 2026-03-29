@@ -74,9 +74,11 @@ pub fn cached_master_kek() -> &'static [u8; 32] {
 }
 
 /// Returns true when distributed (threshold) KEK mode should be used.
-/// This is the case when `MILNET_KEK_SHARE` is set OR when running in production mode.
+/// This is the case when `MILNET_KEK_SHARE` is set, indicating that
+/// threshold Shamir share reconstruction is configured for this node.
+/// Deployments MUST set `MILNET_KEK_SHARE` for distributed KEK.
 pub fn use_distributed_kek() -> bool {
-    std::env::var("MILNET_KEK_SHARE").is_ok() || is_production()
+    std::env::var("MILNET_KEK_SHARE").is_ok()
 }
 
 /// Reconstruct the master KEK from threshold Shamir shares collected via env vars.
@@ -98,23 +100,15 @@ pub fn cached_master_kek_distributed() -> &'static [u8; 32] {
             .unwrap_or(1);
         let peer_shares_csv = std::env::var("MILNET_KEK_PEER_SHARES").ok();
 
-        // If no share is configured, handle based on mode
+        // If no share is configured, fail hard — distributed KEK is mandatory.
         if my_share_hex.is_none() {
-            if is_production() {
-                eprintln!(
-                    "FATAL: MILNET_KEK_SHARE not set in production mode. \
-                     Distributed threshold KEK is required. Each node must hold \
-                     exactly one Shamir share. Set MILNET_KEK_SHARE, \
-                     MILNET_KEK_SHARE_INDEX, and MILNET_KEK_PEER_SHARES."
-                );
-                std::process::exit(1);
-            }
-            // Dev mode fallback: use single-key path
             eprintln!(
-                "WARNING: MILNET_KEK_SHARE not set. Falling back to single-key KEK. \
-                 NOT FOR PRODUCTION — use threshold shares for real deployments."
+                "FATAL: MILNET_KEK_SHARE not set. \
+                 Distributed threshold KEK is required. Each node must hold \
+                 exactly one Shamir share. Set MILNET_KEK_SHARE, \
+                 MILNET_KEK_SHARE_INDEX, and MILNET_KEK_PEER_SHARES."
             );
-            return ProtectedKek::new(load_master_kek());
+            std::process::exit(1);
         }
 
         let my_share_hex = my_share_hex.unwrap();
@@ -159,23 +153,15 @@ pub fn cached_master_kek_distributed() -> &'static [u8; 32] {
             std::env::remove_var("MILNET_KEK_PEER_SHARES");
         }
 
-        // Check if we have enough shares
+        // Check if we have enough shares — fail hard if not.
         if !mgr.has_threshold() {
-            if is_production() {
-                eprintln!(
-                    "FATAL: Insufficient KEK shares for reconstruction. \
-                     Have {} shares, need 3. Ensure MILNET_KEK_PEER_SHARES \
-                     contains at least 2 peer shares (comma-separated hex).",
-                    mgr.shares_collected()
-                );
-                std::process::exit(1);
-            }
             eprintln!(
-                "WARNING: Only {} KEK shares collected (need 3). \
-                 Falling back to single-key KEK. NOT FOR PRODUCTION.",
+                "FATAL: Insufficient KEK shares for reconstruction. \
+                 Have {} shares, need 3. Ensure MILNET_KEK_PEER_SHARES \
+                 contains at least 2 peer shares (comma-separated hex).",
                 mgr.shares_collected()
             );
-            return ProtectedKek::new(load_master_kek());
+            std::process::exit(1);
         }
 
         // Reconstruct
@@ -213,13 +199,14 @@ pub fn get_master_kek() -> &'static [u8; 32] {
 }
 
 /// Whether the system is running in production mode.
-/// This is a COMPILE-TIME decision via the `production` Cargo feature.
-/// An attacker with root access CANNOT downgrade this at runtime.
 ///
-/// Build with: `cargo build --release --features production`
+/// ALWAYS returns true. There is only ONE mode: production.
+/// Dev/staging/test environment distinctions have been removed.
+/// Error verbosity is controlled by `error_level` (Verbose/Warn), not
+/// by environment mode.
 #[inline]
 pub fn is_production() -> bool {
-    cfg!(feature = "production")
+    true
 }
 
 /// Load the master KEK from environment.
@@ -260,19 +247,7 @@ pub fn load_master_kek() -> [u8; 32] {
             key
         }
         _ => {
-            if is_production() {
-                eprintln!("FATAL: MILNET_MASTER_KEK not set in production mode. Refusing to start."); std::process::exit(1);
-            }
-            eprintln!("WARNING: MILNET_MASTER_KEK not set. Using deterministic dev KEK. NOT FOR PRODUCTION.");
-            let mut key = [0u8; 32];
-            use sha2::{Digest, Sha512};
-            let hash = Sha512::digest(b"MILNET-DEV-MASTER-KEK-NOT-FOR-PRODUCTION");
-            key.copy_from_slice(&hash[..32]);
-            // Reject all-zero keys even in dev mode
-            if key.iter().all(|&b| b == 0) {
-                eprintln!("FATAL: all-zero key detected in dev master KEK derivation"); std::process::exit(1);
-            }
-            key
+            eprintln!("FATAL: MILNET_MASTER_KEK not set. Refusing to start."); std::process::exit(1);
         }
     }
 }
@@ -355,66 +330,25 @@ pub fn load_receipt_signing_seed_sealed() -> [u8; 32] {
         eprintln!("WARNING: {sealed_var} present but unseal failed. Trying raw.");
     }
 
-    // 2. Try raw key (blocked in production)
+    // 2. Raw keys are not permitted — sealed keys only.
     if let Ok(mut hex_str) = std::env::var(raw_var) {
         #[cfg(not(test))]
         std::env::remove_var(raw_var);
-        if hex_str.len() >= 64 {
-            if is_production() {
-                zeroize_string(&mut hex_str);
-                hex_str.zeroize();
-                eprintln!(
-                    "FATAL: Raw (unencrypted) {raw_var} detected in production mode. \
-                     Use {sealed_var} with sealed keys instead."
-                );
-                std::process::exit(1);
-            }
-            eprintln!("WARNING: {raw_var} loaded as raw plaintext. Use sealed keys in production.");
-            let mut seed = [0u8; 32];
-            for (i, chunk) in hex_str.as_bytes().chunks(2).take(32).enumerate() {
-                let hex = std::str::from_utf8(chunk)
-                    .unwrap_or_else(|_| {
-                        eprintln!("FATAL: {raw_var} contains invalid UTF-8 at byte {}", i * 2);
-                        std::process::exit(1);
-                    });
-                seed[i] = u8::from_str_radix(hex, 16)
-                    .unwrap_or_else(|_| {
-                        eprintln!("FATAL: {raw_var} contains invalid hex '{}' at position {}", hex, i * 2);
-                        std::process::exit(1);
-                    });
-            }
-            if seed.iter().all(|&b| b == 0) {
-                eprintln!("FATAL: all-zero seed in {raw_var}");
-                std::process::exit(1);
-            }
-            zeroize_string(&mut hex_str);
-            hex_str.zeroize();
-            return seed;
-        }
         zeroize_string(&mut hex_str);
         hex_str.zeroize();
-    }
-
-    // 3. Dev fallback: derive deterministically from master KEK
-    if is_production() {
         eprintln!(
-            "FATAL: {raw_var} not set and no sealed seed found. \
-             Cannot start in production mode without receipt signing seed."
+            "FATAL: Raw (unencrypted) {raw_var} detected. \
+             Use {sealed_var} with sealed keys instead."
         );
         std::process::exit(1);
     }
 
+    // 3. No key found — fail hard.
     eprintln!(
-        "WARNING: {raw_var} not set. Deriving from master KEK. NOT FOR PRODUCTION."
+        "FATAL: {raw_var} not set and no sealed seed found. \
+         Cannot start without receipt signing seed."
     );
-    let master_kek = cached_master_kek();
-    use hkdf::Hkdf;
-    use sha2::Sha512;
-    let hk = Hkdf::<Sha512>::new(Some(b"MILNET-RECEIPT-SIGNING-SEED-v1"), master_kek);
-    let mut seed = [0u8; 32];
-    hk.expand(b"receipt-signing-seed", &mut seed)
-        .expect("32-byte HKDF expand must succeed");
-    seed
+    std::process::exit(1);
 }
 
 /// Unseal a 32-byte seed from hex-encoded sealed data.
@@ -466,7 +400,7 @@ fn unseal_seed_from_hex(hex_str: &str, purpose: &str) -> Option<[u8; 32]> {
 ///
 /// After reading, env vars are removed from the process environment and
 /// the in-memory Strings are zeroized to prevent leakage.
-fn load_key_hardened(var: &str, purpose: &str, dev_seed: &[u8]) -> [u8; 64] {
+fn load_key_hardened(var: &str, purpose: &str, _dev_seed: &[u8]) -> [u8; 64] {
     use zeroize::Zeroize;
     let sealed_var = format!("{var}_SEALED");
 
@@ -489,54 +423,25 @@ fn load_key_hardened(var: &str, purpose: &str, dev_seed: &[u8]) -> [u8; 64] {
         eprintln!("WARNING: {sealed_var} present but unseal failed. Trying raw.");
     }
 
-    // 2. Try raw key (blocked in production)
+    // 2. Raw keys are not permitted — sealed keys only.
     if let Ok(mut hex_str) = std::env::var(var) {
-        // Remove from process environment immediately
         #[cfg(not(test))]
         std::env::remove_var(var);
-        if hex_str.len() >= 128 {
-            if is_production() {
-                zeroize_string(&mut hex_str);
-                hex_str.zeroize();
-                eprintln!(
-                    "FATAL: Raw (unencrypted) {var} detected in production mode. \
-                     Use {sealed_var} with sealed keys instead."
-                );
-                std::process::exit(1);
-            }
-            eprintln!("WARNING: {var} loaded as raw plaintext. Use sealed keys in production.");
-            let mut key = [0u8; 64];
-            for (i, chunk) in hex_str.as_bytes().chunks(2).take(64).enumerate() {
-                let hex = std::str::from_utf8(chunk)
-                    .unwrap_or_else(|_| { eprintln!("FATAL: {var} contains invalid UTF-8 at byte {}", i * 2); std::process::exit(1); });
-                key[i] = u8::from_str_radix(hex, 16)
-                    .unwrap_or_else(|_| { eprintln!("FATAL: {var} contains invalid hex '{}' at position {}", hex, i * 2); std::process::exit(1); });
-            }
-            // Reject all-zero keys
-            if key.iter().all(|&b| b == 0) {
-                eprintln!("FATAL: all-zero key detected in {var}"); std::process::exit(1);
-            }
-            zeroize_string(&mut hex_str);
-            hex_str.zeroize();
-            return key;
-        }
         zeroize_string(&mut hex_str);
         hex_str.zeroize();
-    }
-
-    // 3. Dev fallback
-    if is_production() {
         eprintln!(
-                    "FATAL: {var} not set and no sealed key found. \
-             Cannot start in production mode without keys."
-                );
-                std::process::exit(1);
+            "FATAL: Raw (unencrypted) {var} detected. \
+             Use {sealed_var} with sealed keys instead."
+        );
+        std::process::exit(1);
     }
 
+    // 3. No key found — fail hard. No dev fallbacks.
     eprintln!(
-        "WARNING: {var} not set or invalid. Using deterministic dev key. NOT FOR PRODUCTION."
+        "FATAL: {var} not set and no sealed key found. \
+         Cannot start without keys."
     );
-    deterministic_dev_key(dev_seed)
+    std::process::exit(1)
 }
 
 /// Unseal a hex-encoded sealed key using the master KEK.
@@ -689,19 +594,12 @@ pub fn load_master_kek_hsm_aware() -> [u8; 32] {
             // Return sentinel — caller must use HsmKeyManager.
             return [0u8; 32];
         }
-        // Software HSM is forbidden in production — silent fallback would mask
-        // a misconfiguration that leaves keys unprotected by hardware.
-        if is_production() {
-            eprintln!(
-                    "FATAL: Software HSM backend forbidden in production. \
-                 Set MILNET_HSM_BACKEND to pkcs11/aws-kms/tpm2"
-                );
-                std::process::exit(1);
-        }
-        // Software backend (dev only): fall through to normal env var loading.
+        // Software HSM is forbidden — fail hard.
         eprintln!(
-            "INFO: Software HSM backend detected. Falling back to env var key loading."
+            "FATAL: Software HSM backend forbidden. \
+             Set MILNET_HSM_BACKEND to pkcs11/aws-kms/tpm2"
         );
+        std::process::exit(1);
     }
     load_master_kek()
 }

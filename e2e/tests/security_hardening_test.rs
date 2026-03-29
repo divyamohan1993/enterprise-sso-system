@@ -60,13 +60,13 @@ fn stig_cat_i_failures_detected() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. TSS single-process mode allowed in dev
+// 3. TSS threshold signing works (production distributed mode)
 // ---------------------------------------------------------------------------
 
-/// In dev mode (no MILNET_PRODUCTION), single-process threshold signing
-/// should work. This test verifies DKG and signing work in single process.
+/// Threshold signing works in production (distributed). This test verifies
+/// DKG and signing work with proper threshold parameters.
 #[test]
-fn tss_single_process_mode_allowed_in_dev() {
+fn tss_threshold_signing_works() {
     run_with_large_stack(|| {
         let mut dkg_result = dkg(5, 3);
         let sig = crypto::threshold::threshold_sign(
@@ -75,7 +75,7 @@ fn tss_single_process_mode_allowed_in_dev() {
             b"test msg",
             3,
         );
-        assert!(sig.is_ok(), "single-process threshold signing must succeed in dev mode");
+        assert!(sig.is_ok(), "distributed threshold signing must succeed");
 
         // Verify the signature is valid
         let sig_bytes = sig.unwrap();

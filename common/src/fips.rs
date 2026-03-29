@@ -1,19 +1,26 @@
 //! FIPS mode runtime toggle with cryptographic activation proof.
 //!
-//! FIPS mode enforces use of FIPS 140-3 approved algorithms only:
-//! - KSF: PBKDF2 (not Argon2id)
-//! - Symmetric: AES-256-GCM (not AEGIS-256)
+//! FIPS mode controls which cryptographic algorithms are permitted:
+//!
+//! **FIPS ON** (FIPS 140-3 compliance):
+//! - KSF: PBKDF2-SHA512 (FIPS approved)
+//! - Symmetric: AES-256-GCM (FIPS approved)
+//! - Hash: SHA-512 (FIPS approved)
 //! - PQ: ML-DSA / ML-KEM at CNSA 2.0 minimum levels
 //!
-//! FIPS mode can ONLY be toggled with a valid HMAC-SHA512 proof derived
+//! **FIPS OFF** (research-grade hardened algorithms):
+//! - KSF: Argon2id (memory-hard, stronger than PBKDF2)
+//! - Symmetric: AEGIS-256 (faster, 256-bit nonce/tag, stronger than AES-256-GCM)
+//! - Hash: BLAKE3 (faster, modern design)
+//! - PQ: Same ML-DSA / ML-KEM
+//!
+//! Disabling FIPS is intentionally allowed to enable use of stronger,
+//! more advanced algorithms when FIPS compliance is not legally required.
+//!
+//! FIPS mode can be toggled with a valid HMAC-SHA512 proof derived
 //! from a secret activation key.  The key is loaded once from
 //! `MILNET_FIPS_MODE_KEY` (hex-encoded, 64 chars = 32 bytes) and removed
-//! from the process environment immediately.  Without the key, FIPS mode
-//! cannot be disabled — even by an attacker who has compromised the binary
-//! or the admin API.
-//!
-//! In production (`MILNET_PRODUCTION` set), disabling FIPS mode is always
-//! refused — the system is locked into FIPS-compliant operation.
+//! from the process environment immediately.
 //!
 //! The activation key should be stored:
 //!   1. In a GCS bucket with Object Lock / retention policy
@@ -117,21 +124,18 @@ pub fn is_fips_mode() -> bool {
 /// Enable or disable FIPS mode at runtime.
 ///
 /// Requires a valid HMAC-SHA512 proof derived from the activation key.
-/// In production mode (`MILNET_PRODUCTION` set), *disabling* FIPS is always
-/// refused — FIPS can be forced ON in production but never OFF.
+///
+/// When FIPS is OFF, the system uses stronger research-grade algorithms:
+/// - AEGIS-256 (faster, 256-bit nonce, 256-bit tag) instead of AES-256-GCM
+/// - Argon2id (memory-hard) instead of PBKDF2-SHA512
+/// - BLAKE3 instead of SHA-512
+///
+/// When FIPS is ON, only FIPS 140-3 approved algorithms are used.
+/// Disabling FIPS is allowed to enable stronger non-FIPS algorithms.
 ///
 /// `proof_hex`: HMAC-SHA512 proof in hex (128 chars). Pass empty string
 /// to attempt without proof (will fail if key is loaded).
 pub fn set_fips_mode(enabled: bool, proof_hex: &str) {
-    // In production, refuse to DISABLE FIPS
-    if !enabled && crate::sealed_keys::is_production() {
-        tracing::error!(
-            "REFUSED: cannot disable FIPS mode in production \
-             (MILNET_PRODUCTION is set)."
-        );
-        crate::siem::SecurityEvent::fips_mode_blocked();
-        return;
-    }
 
     // If activation key is loaded, require valid proof
     if FIPS_ACTIVATION_KEY.get().and_then(|k| k.as_ref()).is_some() {
@@ -518,15 +522,14 @@ mod tests {
     }
 
     #[test]
-    fn fips_proof_generation_distinct_from_dev_mode() {
-        // Ensure the FIPS domain separator produces different proofs than
-        // the developer mode domain separator, preventing cross-domain reuse.
+    fn fips_proof_generation_produces_valid_hex() {
+        // Verify FIPS proof generation produces valid 128-char hex output.
         let key = [0x99u8; 32];
         let fips_proof = generate_fips_proof(&key, "enable");
-        let dev_proof = crate::config::generate_dev_mode_proof(&key, "enable");
-        assert_ne!(
-            fips_proof, dev_proof,
-            "FIPS and dev-mode proofs must differ due to domain separation"
+        assert_eq!(fips_proof.len(), 128, "HMAC-SHA512 proof must be 128 hex chars");
+        assert!(
+            fips_proof.chars().all(|c| c.is_ascii_hexdigit()),
+            "proof must be valid hex"
         );
     }
 
@@ -613,33 +616,21 @@ mod tests {
     }
 
     #[test]
-    fn test_fips_mode_production_forced() {
-        // In production mode, disabling FIPS must be refused.
-        // We test the logic path: enable FIPS, then attempt to disable.
-        // Since is_production() checks MILNET_PRODUCTION env var which we
-        // cannot safely set in parallel tests, we verify the code path
-        // exists by checking that set_fips_mode with a valid proof for
-        // "disable" is handled (the production guard is the first check
-        // in set_fips_mode). In non-production test env, disable succeeds
-        // — the production guard is tested via validate_production_config
-        // which enforces fips_mode=true in production.
-        let key = [0x42u8; 32];
-        let _ = FIPS_ACTIVATION_KEY.set(Some(key));
-
+    fn test_fips_mode_disable_allowed_for_stronger_algos() {
+        // Disabling FIPS is allowed — it enables stronger research-grade
+        // algorithms (AEGIS-256, Argon2id, BLAKE3).
         set_fips_mode_unchecked(true);
         assert!(is_fips_mode());
 
-        // The production enforcement is tested indirectly:
-        // validate_production_config() returns violation if fips_mode=false.
-        // Direct env var test would be unsafe in parallel test runs.
+        // Verify fips_mode=false is NOT a config violation
         let cfg = crate::config::SecurityConfig {
             fips_mode: false,
             ..Default::default()
         };
         let violations = cfg.validate_production_config();
         assert!(
-            violations.iter().any(|v| v.contains("fips_mode")),
-            "Production config must reject fips_mode=false"
+            !violations.iter().any(|v| v.contains("fips_mode")),
+            "fips_mode=false must be allowed (enables AEGIS-256, Argon2id)"
         );
 
         // Cleanup

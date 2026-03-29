@@ -106,46 +106,7 @@ async fn main() {
     // Pre-seed OAuth clients for known applications
     let mut oauth_clients = sso_protocol::clients::ClientRegistry::new();
 
-    // Register demo app as OAuth client only in demo mode.
-    // SECURITY: If MILNET_PRODUCTION is set, refuse demo mode entirely.
-    let is_demo = std::env::var("MILNET_DEMO_MODE").is_ok();
-    let is_production = std::env::var("MILNET_PRODUCTION").is_ok();
-    if is_production && is_demo {
-        tracing::error!(
-            "FATAL: MILNET_PRODUCTION and MILNET_DEMO_MODE are both set. \
-             Demo mode with hardcoded credentials is forbidden in production. \
-             Unset MILNET_DEMO_MODE to proceed."
-        );
-        std::process::exit(1);
-    }
-    if is_demo && !is_production {
-        let demo_redirect = std::env::var("DEMO_REDIRECT_URI")
-            .unwrap_or_else(|_| "https://sso-system-demo.dmj.one/callback".to_string());
-        // SECURITY: Never hardcode secrets. Derive the demo client secret from the
-        // master KEK via HKDF-SHA512 with a unique domain separator.
-        // This is only reachable when is_demo && !is_production, so get_master_kek
-        // will return a deterministic dev key if MILNET_MASTER_KEK is not set.
-        let demo_secret = {
-            let master_kek = common::sealed_keys::get_master_kek();
-            use hkdf::Hkdf;
-            use sha2::Sha512;
-            let hk = Hkdf::<Sha512>::new(
-                Some(b"MILNET-DEMO-CLIENT-SECRET-v1"),
-                master_kek.as_slice(),
-            );
-            let mut okm = [0u8; 32];
-            hk.expand(b"demo-app-client-secret", &mut okm)
-                .expect("HKDF expand");
-            hex::encode(okm)
-        };
-        oauth_clients.register_with_id(
-            "demo-app",
-            &demo_secret,
-            "Demo Application",
-            vec![demo_redirect],
-        );
-        tracing::warn!("Pre-seeded demo OAuth client: demo-app (MILNET_DEMO_MODE is set)");
-    }
+    // Demo mode is forbidden — system is always production.
 
     // Try to load existing ServerSetup from DB
     let server_setup_bytes: Option<Vec<u8>> = sqlx::query_scalar(
@@ -264,6 +225,29 @@ async fn main() {
         .expect("PQ keygen thread panicked");
     tracing::info!("Generated ML-DSA-87 signing key for audit log");
 
+    // ── Load super admin keys from DB (if any exist from prior setup) ──
+    let super_admin_keys = {
+        let mut map = std::collections::HashMap::new();
+        let rows: Vec<(uuid::Uuid, String, Vec<u8>, Option<String>)> = sqlx::query_as(
+            "SELECT id, label, key_hash, region FROM super_admins"
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+        for (id, label, key_hash, region) in rows {
+            map.insert(id, admin::routes::SuperAdminEntry {
+                id,
+                label: label.clone(),
+                key_hash,
+                region,
+            });
+        }
+        if !map.is_empty() {
+            tracing::info!("Loaded {} super admin(s) from database", map.len());
+        }
+        map
+    };
+
     let state = Arc::new(AppState {
         db: pool,
         credential_store: RwLock::new(store),
@@ -275,6 +259,7 @@ async fn main() {
         auth_codes: RwLock::new(sso_protocol::authorize::AuthorizationStore::new()),
         oidc_signing_key: sso_protocol::tokens::OidcSigningKey::generate(),
         admin_api_key: api_key,
+        super_admin_keys: RwLock::new(super_admin_keys),
         fido_store: RwLock::new(fido::registration::CredentialStore::new()),
         setup_complete: Arc::new(AtomicBool::new(false)),
         pending_ceremonies: RwLock::new(std::collections::HashMap::new()),
@@ -295,7 +280,7 @@ async fn main() {
         )),
         revocation_list: RwLock::new(admin::routes::RevocationList::new()),
         developer_mode: std::sync::atomic::AtomicBool::new(false),
-        developer_log_level: std::sync::atomic::AtomicU8::new(common::config::LogLevel::Error as u8),
+        developer_log_level: std::sync::atomic::AtomicU8::new(common::config::ErrorLevel::Verbose as u8),
         pending_admin_actions: RwLock::new(std::collections::HashMap::new()),
         ha_pool: std::sync::Mutex::new(ha_pool),
         encrypted_pool,
@@ -335,9 +320,8 @@ async fn main() {
         },
     );
 
-    let is_production = std::env::var("MILNET_PRODUCTION").is_ok();
-    // In production, default to loopback; override with ADMIN_BIND_ADDR if needed.
-    let default_bind = if is_production { "127.0.0.1" } else { "0.0.0.0" };
+    // Always production — default to loopback; override with ADMIN_BIND_ADDR if needed.
+    let default_bind = "127.0.0.1";
     let bind_addr = std::env::var("ADMIN_BIND_ADDR").unwrap_or_else(|_| default_bind.to_string());
 
     // TLS configuration check
@@ -348,37 +332,13 @@ async fn main() {
         .unwrap_or(false);
     let has_tls = tls_cert.is_some() && tls_key.is_some();
 
-    // If REQUIRE_TLS is set but no cert/key provided, refuse to start
-    if require_tls && !has_tls {
+    // TLS is always required — no exceptions.
+    if !has_tls {
         tracing::error!(
-            "REQUIRE_TLS=true but ADMIN_TLS_CERT and/or ADMIN_TLS_KEY not set. \
-             Refusing to start without TLS configuration."
+            "FATAL: Admin API requires TLS. \
+             Set ADMIN_TLS_CERT and ADMIN_TLS_KEY, or use a TLS-terminating reverse proxy."
         );
         std::process::exit(1);
-    }
-
-    // In production, refuse to start without TLS — no exceptions.
-    if is_production && !has_tls {
-        tracing::error!(
-            "FATAL: Admin API requires TLS in production. \
-             Set ADMIN_TLS_CERT and ADMIN_TLS_KEY, or use a TLS-terminating reverse proxy \
-             with REQUIRE_TLS=false and ADMIN_BIND_ADDR=127.0.0.1."
-        );
-        std::process::exit(1);
-    }
-
-    if bind_addr == "0.0.0.0" && !has_tls {
-        {
-            tracing::warn!(
-                "WARNING: Binding to all interfaces (0.0.0.0) without TLS. \
-                 Use a TLS-terminating reverse proxy in production."
-            );
-        }
-    } else if bind_addr == "127.0.0.1" && !has_tls {
-        tracing::warn!(
-            "Admin API running without TLS on loopback. \
-             Ensure a TLS-terminating reverse proxy is in front of this service."
-        );
     }
 
     // Add HSTS header middleware to all responses (signals to browsers/proxies

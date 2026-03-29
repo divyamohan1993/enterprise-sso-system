@@ -144,16 +144,10 @@ impl<const N: usize> SecretBuffer<N> {
             // Exclude from core dumps
             madv_dontdump(data_ptr, N);
         } else {
-            // In production mode, mlock failure is fatal — keys must not be swappable.
-            if common::sealed_keys::is_production() {
-                panic!(
-                    "FATAL: mlock failed for {N}-byte SecretBuffer in production mode. \
-                     Ensure RLIMIT_MEMLOCK is sufficient."
-                );
-            }
-            eprintln!(
-                "[memguard] WARNING: mlock failed for {N}-byte buffer — \
-                 data may be swappable"
+            // mlock failure is fatal — keys must not be swappable.
+            panic!(
+                "FATAL: mlock failed for {N}-byte SecretBuffer. \
+                 Ensure RLIMIT_MEMLOCK is sufficient."
             );
         }
 
@@ -303,16 +297,10 @@ impl SecretVec {
             // Exclude from core dumps
             madv_dontdump(ptr, len);
         } else {
-            // In production mode, mlock failure is fatal — keys must not be swappable.
-            if common::sealed_keys::is_production() {
-                panic!(
-                    "FATAL: mlock failed for {len}-byte SecretVec in production mode. \
-                     Ensure RLIMIT_MEMLOCK is sufficient."
-                );
-            }
-            eprintln!(
-                "[memguard] WARNING: mlock failed for {len}-byte SecretVec — \
-                 data may be swappable"
+            // mlock failure is fatal — keys must not be swappable.
+            panic!(
+                "FATAL: mlock failed for {len}-byte SecretVec. \
+                 Ensure RLIMIT_MEMLOCK is sufficient."
             );
         }
 

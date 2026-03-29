@@ -1902,7 +1902,7 @@ mod tests {
     #[test]
     fn sealed_share_round_trip() {
         // Ensure deterministic dev KEK is used
-        std::env::remove_var("MILNET_PRODUCTION");
+        // Production mode is always active — no env var override needed
         std::env::set_var("MILNET_MASTER_KEK", "ab".repeat(32));
 
         let (coordinator, nodes) = setup_dkg();
@@ -1949,7 +1949,7 @@ mod tests {
 
     #[test]
     fn sealed_share_tamper_detected() {
-        std::env::remove_var("MILNET_PRODUCTION");
+        // Production mode is always active — no env var override needed
         std::env::set_var("MILNET_MASTER_KEK", "ab".repeat(32));
 
         let (coordinator, nodes) = setup_dkg();
@@ -1972,7 +1972,7 @@ mod tests {
 
     #[test]
     fn seal_all_shares_produces_correct_count() {
-        std::env::remove_var("MILNET_PRODUCTION");
+        // Production mode is always active — no env var override needed
         std::env::set_var("MILNET_MASTER_KEK", "cd".repeat(32));
 
         let mut dkg_result = dkg(5, 3);
@@ -2005,7 +2005,7 @@ mod tests {
         // This test verifies that a coordinator can connect to signer
         // processes over SHARD/mTLS with a shared CA, perform the commit
         // and sign rounds, and produce a valid group signature.
-        std::env::remove_var("MILNET_PRODUCTION");
+        // Production mode is always active — no env var override needed
 
         let (coordinator, nodes) = setup_dkg();
         let threshold = coordinator.threshold;
@@ -2070,7 +2070,7 @@ mod tests {
     async fn signer_loads_sealed_share_and_serves() {
         // End-to-end: seal a share, unseal it, run as signer, coordinator
         // connects and signs.
-        std::env::remove_var("MILNET_PRODUCTION");
+        // Production mode is always active — no env var override needed
         std::env::set_var("MILNET_MASTER_KEK", "ef".repeat(32));
 
         let (coordinator, nodes) = setup_dkg();

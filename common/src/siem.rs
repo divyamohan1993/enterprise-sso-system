@@ -76,6 +76,12 @@ fn alert_webhook_url() -> &'static Option<String> {
 }
 
 /// Persist a critical/high event to the file-based alert sink.
+/// Public so that super admin access logging can use it directly.
+pub fn persist_critical_alert(json: &str) {
+    persist_alert_to_file(json);
+}
+
+/// Internal implementation of file-based alert persistence.
 fn persist_alert_to_file(json: &str) {
     if let Err(e) = std::fs::create_dir_all(ALERT_DIR) {
         tracing::warn!("failed to create alert directory {}: {}", ALERT_DIR, e);
@@ -630,7 +636,7 @@ impl SecurityEvent {
         event.emit();
     }
 
-    /// Emit a developer mode toggle blocked event (production protection).
+    /// Emit a configuration error level change blocked event (production protection).
     pub fn developer_mode_blocked() {
         let event = SecurityEvent {
             timestamp: Self::now_iso8601(),
@@ -640,7 +646,7 @@ impl SecurityEvent {
             outcome: "failure",
             user_id: None,
             source_ip: None,
-            detail: Some("runtime developer mode toggle blocked in production".into()),
+            detail: Some("runtime error_level configuration change blocked".into()),
         };
         event.emit();
     }

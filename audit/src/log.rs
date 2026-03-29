@@ -405,23 +405,8 @@ impl AuditLog {
                     // Encrypt archive if KEK is configured
                     let write_result = if let Some(ref kek) = self.retention_policy.archive_encryption_kek {
                         encrypt_and_write_archive(kek, &archive_path, &json_data)
-                    } else if common::sealed_keys::is_production() {
-                        Err("FATAL: Archive encryption KEK required in production".into())
                     } else {
-                        tracing::warn!("Writing UNENCRYPTED audit archive (dev mode only)");
-                        (|| -> Result<(), String> {
-                            #[cfg(unix)]
-                            use std::os::unix::fs::OpenOptionsExt;
-                            let mut f = OpenOptions::new()
-                                .create(true)
-                                .write(true)
-                                .truncate(true)
-                                .mode(0o600) // Owner read/write only
-                                .open(&archive_path)
-                                .map_err(|e| format!("write failed: {e}"))?;
-                            std::io::Write::write_all(&mut f, &json_data)
-                                .map_err(|e| format!("write failed: {e}"))
-                        })()
+                        Err("FATAL: Archive encryption KEK required in production".into())
                     };
 
                     match write_result {
@@ -448,12 +433,9 @@ impl AuditLog {
                         }
                     }
                 }
-            } else if common::sealed_keys::is_production() {
-                tracing::error!("FATAL: Cannot delete audit entries without archival in production");
-                // In production, refuse to delete entries without archiving them first
             } else {
-                tracing::warn!("Retention: deleted {} expired entries without archival (dev mode)", expired_count);
-                self.entries.drain(..expired_count);
+                tracing::error!("FATAL: Cannot delete audit entries without archival in production");
+                // Refuse to delete entries without archiving them first
             }
         }
 
@@ -671,9 +653,7 @@ fn now_us() -> i64 {
     if let Some(auth_us) = common::secure_time::authenticated_now_us() {
         return auth_us;
     }
-    if common::sealed_keys::is_production() {
-        tracing::error!("SECURITY: no trusted time source available in production — using system clock with warning");
-    }
+    tracing::error!("SECURITY: no trusted time source available in production — using system clock with warning");
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()

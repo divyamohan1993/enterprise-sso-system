@@ -213,10 +213,10 @@ impl BftAuditCluster {
     /// Create a new cluster. `node_count` should be >= 4 for meaningful BFT
     /// (3f + 1). For 7 nodes: f = 2, quorum = 2f + 1 = 5.
     pub fn new(node_count: usize) -> Self {
-        // Production safety: warn if BFT is running with fewer than 7 nodes
-        if std::env::var("MILNET_PRODUCTION").is_ok() && node_count < 7 {
+        // BFT requires minimum 7 nodes — fail hard if fewer
+        if node_count < 7 {
             tracing::error!(
-                "CRITICAL: BFT audit running with {} nodes in production (minimum 7 required). \
+                "CRITICAL: BFT audit running with {} nodes (minimum 7 required). \
                  Audit integrity cannot be guaranteed with fewer than 7 nodes (2f+1 = 5 quorum).",
                 node_count
             );
@@ -237,10 +237,10 @@ impl BftAuditCluster {
 
     /// Create a new cluster with an ML-DSA-65 signing key for entry signing.
     pub fn new_with_signing_key(node_count: usize, signing_key: pq_sign::PqSigningKey) -> Self {
-        // Production safety: warn if BFT is running with fewer than 7 nodes
-        if std::env::var("MILNET_PRODUCTION").is_ok() && node_count < 7 {
+        // BFT requires minimum 7 nodes — fail hard if fewer
+        if node_count < 7 {
             tracing::error!(
-                "CRITICAL: BFT audit running with {} nodes in production (minimum 7 required). \
+                "CRITICAL: BFT audit running with {} nodes (minimum 7 required). \
                  Audit integrity cannot be guaranteed with fewer than 7 nodes (2f+1 = 5 quorum).",
                 node_count
             );
@@ -270,10 +270,10 @@ impl BftAuditCluster {
         signing_key: pq_sign::PqSigningKey,
         persistence_dir: &std::path::Path,
     ) -> Self {
-        // Production safety: warn if BFT is running with fewer than 7 nodes
-        if std::env::var("MILNET_PRODUCTION").is_ok() && node_count < 7 {
+        // BFT requires minimum 7 nodes — fail hard if fewer
+        if node_count < 7 {
             tracing::error!(
-                "CRITICAL: BFT audit running with {} nodes in production (minimum 7 required). \
+                "CRITICAL: BFT audit running with {} nodes (minimum 7 required). \
                  Audit integrity cannot be guaranteed with fewer than 7 nodes (2f+1 = 5 quorum).",
                 node_count
             );
@@ -378,7 +378,7 @@ impl BftAuditCluster {
         }
 
         // Quorum enforcement: warn if cluster lacks BFT guarantees
-        if std::env::var("MILNET_PRODUCTION").is_ok() && !has_bft_quorum(self.nodes.len()) {
+        if !has_bft_quorum(self.nodes.len()) {
             tracing::error!(
                 "CRITICAL: committing audit entry with only {} nodes (minimum {} required for BFT). \
                  Byzantine fault tolerance is NOT guaranteed.",

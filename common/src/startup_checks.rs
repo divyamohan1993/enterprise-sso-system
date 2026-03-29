@@ -6,8 +6,7 @@
 //! 3. Self-attestation: SHA-512(/proc/self/exe) + boot_id logging
 //! 4. Start background integrity monitor (re-hash binary + tracer check)
 //!
-//! vTPM absence is FATAL in ALL modes (use swtpm for development).
-//! Other checks are fatal in production (`MILNET_PRODUCTION` set); warnings in dev.
+//! ALL checks are FATAL — this system is always in production mode.
 
 use crate::measured_boot::BootAttestation;
 use crate::platform_integrity::{self, RuntimeIntegrityMonitor, TpmInfo};
@@ -50,9 +49,7 @@ pub struct PlatformAttestationReport {
 /// `crypto::memguard::harden_process()`). It must return `true` on success.
 /// This indirection avoids a circular dependency (common cannot depend on crypto).
 ///
-/// vTPM absence is fatal in ALL modes (use swtpm for development).
-/// In production mode (`MILNET_PRODUCTION` set), all critical failures cause
-/// an immediate panic. In dev mode, non-vTPM failures are logged as warnings.
+/// ALL checks are fatal — any failure causes an immediate panic.
 ///
 /// Returns:
 /// - `PlatformAttestationReport` with results of all checks
@@ -60,15 +57,12 @@ pub struct PlatformAttestationReport {
 /// - `Arc<RuntimeIntegrityMonitor>` for querying violation counts
 ///
 /// # Panics
-/// Always panics if vTPM is not available.
-/// In production mode, also panics if:
-/// - Process hardening fails
+/// Panics if any check fails (vTPM, hardening, attestation, monitor).
 pub fn run_platform_checks<F: FnOnce() -> bool>(harden_fn: F) -> (
     PlatformAttestationReport,
     JoinHandle<()>,
     Arc<RuntimeIntegrityMonitor>,
 ) {
-    let production = crate::sealed_keys::is_production();
     let mut all_passed = true;
     let mut summary_parts: Vec<String> = Vec::new();
 
@@ -85,43 +79,15 @@ pub fn run_platform_checks<F: FnOnce() -> bool>(harden_fn: F) -> (
                 );
                 summary_parts.push(format!("vTPM=v{}", info.version));
             } else {
-                if production {
-                    panic!(
-                        "FATAL: vTPM not available (/dev/tpmrm0, /dev/tpm0). \
-                         Production deployment requires vTPM 2.0."
-                    );
-                }
-                // vTPM is REQUIRED in all deployment modes — no exceptions.
-                // Even in development, we require a vTPM (or swtpm emulator)
-                // to ensure code paths are exercised and key sealing works.
-                //
-                // For development without hardware vTPM, install swtpm:
-                //   apt install swtpm swtpm-tools
-                //   mkdir -p /tmp/tpm && swtpm socket --tpmstate dir=/tmp/tpm --tpm2 --ctrl type=unixio,path=/tmp/tpm/sock
                 panic!(
                     "FATAL: vTPM not available (/dev/tpmrm0, /dev/tpm0). \
-                     A vTPM 2.0 is required in ALL deployment modes. \
-                     For development, use swtpm (software TPM emulator). \
-                     See: https://github.com/stefanberger/swtpm"
+                     Production deployment requires vTPM 2.0."
                 );
             }
             info
         }
         Err(e) => {
-            if production {
-                panic!("FATAL: vTPM check error: {}", e);
-            }
-            tracing::warn!(
-                "platform check [1/4]: vTPM check error: {} (dev mode — continuing)",
-                e
-            );
-            summary_parts.push(format!("vTPM=ERROR({})", e));
-            all_passed = false;
-            TpmInfo {
-                available: false,
-                version: String::new(),
-                device_path: String::new(),
-            }
+            panic!("FATAL: vTPM check error: {}", e);
         }
     };
 
@@ -133,17 +99,10 @@ pub fn run_platform_checks<F: FnOnce() -> bool>(harden_fn: F) -> (
         tracing::info!("platform check [2/4]: process hardened (non-dumpable, no-new-privs)");
         summary_parts.push("hardened=OK".to_string());
     } else {
-        if production {
-            panic!(
-                "FATAL: process hardening failed. \
-                 Cannot disable core dumps or set no-new-privs in production."
-            );
-        }
-        tracing::warn!(
-            "platform check [2/4]: process hardening partially failed (dev mode — continuing)"
+        panic!(
+            "FATAL: process hardening failed. \
+             Cannot disable core dumps or set no-new-privs."
         );
-        summary_parts.push("hardened=PARTIAL(dev)".to_string());
-        all_passed = false;
     }
 
     // -----------------------------------------------------------------------
@@ -165,23 +124,11 @@ pub fn run_platform_checks<F: FnOnce() -> bool>(harden_fn: F) -> (
             att
         }
         Err(e) => {
-            if production {
-                panic!(
-                    "FATAL: self-attestation failed: {}. \
-                     Production deployment requires binary self-attestation.",
-                    e
-                );
-            }
-            tracing::warn!(
-                "platform check [3/4]: self-attestation failed: {} (dev mode — continuing)",
+            panic!(
+                "FATAL: self-attestation failed: {}. \
+                 Deployment requires binary self-attestation.",
                 e
             );
-            summary_parts.push("binary=UNREADABLE(dev)".to_string());
-            all_passed = false;
-            platform_integrity::SelfAttestation {
-                binary_hash: [0u8; 64],
-                boot_id: "unknown".to_string(),
-            }
         }
     };
 
@@ -194,17 +141,10 @@ pub fn run_platform_checks<F: FnOnce() -> bool>(harden_fn: F) -> (
 
     // Verify the monitor thread is actually running.
     if monitor_handle.is_finished() {
-        if production {
-            panic!(
-                "FATAL: runtime integrity monitor thread exited immediately. \
-                 Production deployment requires a running integrity monitor."
-            );
-        }
-        tracing::warn!(
-            "platform check [4/4]: runtime integrity monitor failed to start (dev mode — continuing)"
+        panic!(
+            "FATAL: runtime integrity monitor thread exited immediately. \
+             Deployment requires a running integrity monitor."
         );
-        summary_parts.push("monitor=FAILED(dev)".to_string());
-        all_passed = false;
     } else {
         tracing::info!(
             "platform check [4/4]: runtime integrity monitor started (interval={}s)",
@@ -244,30 +184,26 @@ pub fn run_platform_checks<F: FnOnce() -> bool>(harden_fn: F) -> (
 
 /// Run all STIG/CIS benchmark checks.
 ///
-/// In production mode (`MILNET_PRODUCTION` set) any Category I failure is
-/// treated as fatal and returned as `Err(failures)`.  In dev mode all
-/// failures are surfaced in the `Ok(StigSummary)` for logging/reporting.
+/// Any Category I failure is fatal and causes a panic.
 pub fn run_stig_audit() -> Result<crate::stig::StigSummary, Vec<crate::stig::StigCheck>> {
     let mut auditor = crate::stig::StigAuditor::new();
     auditor.run_all();
     let summary = auditor.summary();
 
-    if crate::sealed_keys::is_production() {
-        let cat_i = auditor.cat_i_failures();
-        if !cat_i.is_empty() {
-            for failure in &cat_i {
-                tracing::error!(
-                    "STIG Category I FAILURE: {} — {}",
-                    failure.id,
-                    failure.detail
-                );
-            }
-            panic!(
-                "FATAL: {} STIG Category I failure(s) detected in production. \
-                 System cannot start with critical security misconfigurations.",
-                cat_i.len()
+    let cat_i = auditor.cat_i_failures();
+    if !cat_i.is_empty() {
+        for failure in &cat_i {
+            tracing::error!(
+                "STIG Category I FAILURE: {} — {}",
+                failure.id,
+                failure.detail
             );
         }
+        panic!(
+            "FATAL: {} STIG Category I failure(s) detected. \
+             System cannot start with critical security misconfigurations.",
+            cat_i.len()
+        );
     }
     Ok(summary)
 }

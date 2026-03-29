@@ -60,7 +60,7 @@ impl std::error::Error for PlatformError {}
 // ---------------------------------------------------------------------------
 
 fn is_production() -> bool {
-    crate::sealed_keys::is_production()
+    true
 }
 
 /// Hardened TPM2-tools binary path.
@@ -136,7 +136,7 @@ pub fn verify_tpm_present() -> Result<TpmInfo, PlatformError> {
             version: String::new(),
             device_path: String::new(),
         };
-        if !tpm_info.available && crate::sealed_keys::is_production() {
+        if !tpm_info.available {
             panic!(
                 "FATAL: vTPM not available but MILNET_PRODUCTION is set. \
                  Production deployment requires vTPM 2.0 for measured boot and key sealing."

@@ -56,7 +56,7 @@ pub fn enforce_fips_startup_kats() {
             Ok(()) => tracing::info!("FIPS 140-3 startup KATs: ALL PASSED"),
             Err(e) => panic!("FATAL: FIPS 140-3 KAT failure — crypto module compromised: {e}"),
         }
-    } else if common::sealed_keys::is_production() {
+    } else {
         tracing::warn!(
             "SECURITY: FIPS mode is NOT enabled in production. \
              Set MILNET_FIPS_MODE=1 for classified network deployment."

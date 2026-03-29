@@ -49,16 +49,12 @@ async fn main() {
     tracing::info!("CNSA 2.0 compliance verified");
 
     let port = std::env::var("GATEWAY_PORT").unwrap_or_else(|_| "9100".into());
-    let is_production = std::env::var("MILNET_PRODUCTION").is_ok();
-    // In production, default to loopback; override with GATEWAY_BIND_ADDR if needed.
-    let default_bind = if is_production { "127.0.0.1" } else { "0.0.0.0" };
+    // Always default to loopback; override with GATEWAY_BIND_ADDR if needed.
+    let default_bind = "127.0.0.1";
     let bind_addr = std::env::var("GATEWAY_BIND_ADDR").unwrap_or_else(|_| default_bind.to_string());
 
     if bind_addr == "0.0.0.0" {
-        tracing::warn!("WARNING: Binding to all interfaces (0.0.0.0). Use a TLS-terminating reverse proxy in production.");
-        if is_production {
-            tracing::warn!("MILNET_PRODUCTION is set but binding to 0.0.0.0 — set GATEWAY_BIND_ADDR=127.0.0.1 for loopback-only.");
-        }
+        tracing::warn!("WARNING: Binding to all interfaces (0.0.0.0). Ensure a TLS-terminating reverse proxy is in front, or set GATEWAY_BIND_ADDR=127.0.0.1 for loopback-only.");
     }
 
     let addr = format!("{bind_addr}:{port}");
@@ -68,10 +64,10 @@ async fn main() {
     let cert_path = std::env::var("MILNET_GATEWAY_CERT_PATH");
     let key_path = std::env::var("MILNET_GATEWAY_KEY_PATH");
 
-    if is_production && (cert_path.is_err() || key_path.is_err()) {
+    if cert_path.is_err() || key_path.is_err() {
         panic!(
             "FATAL: MILNET_GATEWAY_CERT_PATH and MILNET_GATEWAY_KEY_PATH must be set \
-             in production mode for TLS termination."
+             for TLS termination."
         );
     }
 
@@ -149,31 +145,21 @@ async fn main() {
 
         Some(std::sync::Arc::new(config))
     } else {
-        tracing::warn!(
-            "TLS not configured — running without TLS termination. \
-             Set MILNET_GATEWAY_CERT_PATH and MILNET_GATEWAY_KEY_PATH for TLS."
-        );
-        None
+        // This branch is unreachable due to the panic above, but kept for type completeness.
+        unreachable!("TLS certificate check should have panicked above");
     };
 
     let server = if let Some(tls_cfg) = tls_config {
         GatewayServer::bind_tls(&addr, 16, tls_cfg)
             .await
             .expect("failed to bind gateway with TLS")
-    } else if is_production {
-        // SECURITY: Plain TCP is NEVER allowed in production. Nation-state
+    } else {
+        // SECURITY: Plain TCP is NEVER allowed. Nation-state
         // attackers can intercept unencrypted authentication traffic.
         panic!(
-            "FATAL: TLS is required in production but no certificate was configured. \
+            "FATAL: TLS is required but no certificate was configured. \
              Set MILNET_GATEWAY_CERT_PATH and MILNET_GATEWAY_KEY_PATH."
         );
-    } else {
-        tracing::warn!(
-            "SECURITY WARNING: Gateway binding without TLS — acceptable ONLY in dev/test"
-        );
-        GatewayServer::bind(&addr, 16)
-            .await
-            .expect("failed to bind gateway")
     };
 
     // Spawn health check endpoint on port+1000 (or MILNET_HEALTH_PORT)

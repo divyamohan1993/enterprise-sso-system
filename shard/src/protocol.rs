@@ -455,10 +455,7 @@ impl ShardProtocol {
         match self.import_sequences_authenticated(path, hmac_key) {
             Ok(()) => tracing::info!("loaded persisted SHARD sequences from {:?}", path),
             Err(e) => {
-                if common::sealed_keys::is_production() {
-                    panic!("FATAL: SHARD sequence file tampered or unreadable: {e}");
-                }
-                tracing::warn!("failed to load SHARD sequences (dev mode, ignoring): {e}");
+                panic!("FATAL: SHARD sequence file tampered or unreadable: {e}");
             }
         }
     }

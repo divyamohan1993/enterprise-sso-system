@@ -9,11 +9,15 @@ metadata:
   labels:
     app.kubernetes.io/part-of: milnet-sso
 data:
-  # ── Production mode ──────────────────────────────────────────────────────────
+  # ── Production mode (always on — single mode) ────────────────────────────────
+  # MILNET_PRODUCTION is kept for backwards compatibility with deployment scripts
+  # but is_production() always returns true regardless of this env var.
   MILNET_PRODUCTION: "1"
   MILNET_MILITARY_DEPLOYMENT: "1"
   MILNET_FIPS_MODE: "1"
   MILNET_PQ_TLS_ONLY: "1"
+  # Error level: "verbose" (show file:line, full errors) or "warn" (warnings/errors only)
+  MILNET_ERROR_LEVEL: "verbose"
 
   # ── Service discovery (K8s DNS) ──────────────────────────────────────────────
   # Orchestrator uses headless service DNS for Raft peers

@@ -480,22 +480,11 @@ pub fn require_enclave_or_warn(operation: &str) -> EnclaveBackend {
     let backend = detect_enclave_backend();
 
     if backend == EnclaveBackend::SoftwareFallback {
-        let is_production = std::env::var("MILNET_PRODUCTION")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-
-        if is_production {
-            tracing::warn!(
-                operation = operation,
-                "SECURITY: signing operation without hardware enclave in production. \
-                 Deploy on SGX/SEV-SNP/TrustZone-capable hardware for host compromise resilience."
-            );
-        } else {
-            tracing::debug!(
-                operation = operation,
-                "enclave not available — software fallback (acceptable in dev/CI)"
-            );
-        }
+        tracing::warn!(
+            operation = operation,
+            "SECURITY: signing operation without hardware enclave in production. \
+             Deploy on SGX/SEV-SNP/TrustZone-capable hardware for host compromise resilience."
+        );
     } else {
         tracing::info!(
             operation = operation,

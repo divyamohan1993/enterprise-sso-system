@@ -104,16 +104,16 @@ fn is_encrypted(data: &[u8]) -> bool {
 
 /// Enforce the encryption-at-rest policy.
 ///
-/// In production mode (`MILNET_PRODUCTION` is set), `require_encryption_at_rest`
-/// MUST be true. If it is false, this function panics immediately to prevent
-/// any possibility of storing or loading plaintext key material in production.
+/// `require_encryption_at_rest` MUST be true. If it is false, this function
+/// panics immediately to prevent any possibility of storing or loading
+/// plaintext key material. There is only one mode: production.
 ///
 /// This is called at the entry point of every store/load path.
 fn enforce_encryption_policy(config: &SecurityConfig) {
-    if crate::sealed_keys::is_production() && !config.require_encryption_at_rest {
+    if !config.require_encryption_at_rest {
         panic!(
-            "FATAL: require_encryption_at_rest is false while MILNET_PRODUCTION is set. \
-             Encryption at rest cannot be disabled in production."
+            "FATAL: require_encryption_at_rest is false. \
+             Encryption at rest cannot be disabled."
         );
     }
 }
@@ -124,19 +124,10 @@ fn enforce_encryption_policy(config: &SecurityConfig) {
 /// header. Data without the header is rejected unconditionally.
 fn validate_magic_header(data: &[u8], name: &str) -> Result<(), String> {
     if !is_encrypted(data) {
-        if crate::sealed_keys::is_production() {
-            return Err(format!(
-                "SECURITY VIOLATION: key '{}' loaded without encryption magic header in production mode",
-                name
-            ));
-        }
-        let config = SecurityConfig::default();
-        if config.require_encryption_at_rest {
-            return Err(format!(
-                "key '{}' missing encryption magic header and require_encryption_at_rest is true",
-                name
-            ));
-        }
+        return Err(format!(
+            "SECURITY VIOLATION: key '{}' loaded without encryption magic header",
+            name
+        ));
     }
     Ok(())
 }
@@ -161,22 +152,12 @@ pub async fn store_key(pool: &PgPool, name: &str, key_bytes: &[u8], master_kek: 
             }
         },
         None => {
-            if crate::sealed_keys::is_production() {
-                // Production mode: NEVER store plaintext key material
-                tracing::error!(
-                    "SECURITY VIOLATION: attempted to store key '{}' without KEK in production",
-                    name
-                );
-                return false;
-            }
-            if config.require_encryption_at_rest {
-                // Policy requires encryption at rest — check if already encrypted
-                if !is_encrypted(key_bytes) {
-                    // REFUSE to store plaintext key material
-                    return false;
-                }
-            }
-            key_bytes.to_vec()
+            // NEVER store plaintext key material without KEK
+            tracing::error!(
+                "SECURITY VIOLATION: attempted to store key '{}' without KEK",
+                name
+            );
+            return false;
         }
     };
 
@@ -220,9 +201,7 @@ pub async fn load_key(pool: &PgPool, name: &str, master_kek: Option<&[u8; 32]>) 
     // Validate magic header on ALL load paths
     if let Err(e) = validate_magic_header(&data, name) {
         tracing::error!("{}", e);
-        if crate::sealed_keys::is_production() || config.require_encryption_at_rest {
-            return None;
-        }
+        return None;
     }
 
     match master_kek {
@@ -230,29 +209,17 @@ pub async fn load_key(pool: &PgPool, name: &str, master_kek: Option<&[u8; 32]>) 
             if is_encrypted(&data) {
                 decrypt_key_bytes(kek, name, &data).ok()
             } else {
-                // Stored data is not encrypted but we have a KEK —
-                // reject in production or when policy requires encryption at rest
-                if crate::sealed_keys::is_production() || config.require_encryption_at_rest {
-                    None
-                } else {
-                    Some(data)
-                }
+                // Data is not encrypted — reject unconditionally
+                None
             }
         }
         None => {
-            if crate::sealed_keys::is_production() {
-                // Production mode: ALWAYS require KEK for loading
-                tracing::error!(
-                    "SECURITY VIOLATION: attempted to load key '{}' without KEK in production",
-                    name
-                );
-                None
-            } else if config.require_encryption_at_rest && !is_encrypted(&data) {
-                // Policy violation: plaintext key material in database
-                None
-            } else {
-                Some(data)
-            }
+            // ALWAYS require KEK for loading
+            tracing::error!(
+                "SECURITY VIOLATION: attempted to load key '{}' without KEK",
+                name
+            );
+            None
         }
     }
 }

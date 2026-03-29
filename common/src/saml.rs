@@ -589,10 +589,10 @@ impl AuthnRequest {
         // We parse the SubjectPublicKeyInfo from the DER-encoded certificate.
         validate_certificate_public_key(&cert_der)?;
 
-        // Step 3+4: In production, require full signature verification.
+        // Step 3+4: Require full signature verification.
         // Without a c14n XML library, we cannot verify the exact canonical form,
         // but we CAN verify that a valid signature EXISTS and the cert is not expired/revoked.
-        if crate::sealed_keys::is_production() && self.is_signed {
+        if self.is_signed {
             let xml = match raw_xml {
                 Some(x) => x,
                 None => {

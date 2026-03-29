@@ -19,7 +19,7 @@ impl Default for RotationSchedule {
     fn default() -> Self {
         Self {
             interval: Duration::from_secs(3600), // Check every hour
-            auto_rotate: crate::sealed_keys::is_production(), // Auto-rotate in production, log-only otherwise
+            auto_rotate: true, // Always auto-rotate — single production mode
         }
     }
 }

@@ -434,27 +434,21 @@ impl ClusterNode {
 
         let standalone = config.peers.is_empty();
         if standalone {
-            // SECURITY: In production, standalone mode is FORBIDDEN.
+            // Standalone mode is FORBIDDEN — no SPOF allowed.
             // A single-node deployment has no redundancy, no failover, and no
             // peer-to-peer binary attestation. The entire system becomes a SPOF.
-            if crate::sealed_keys::is_production() {
-                return Err(
-                    "FATAL: standalone mode (no cluster peers) is forbidden in production. \
-                     Set MILNET_CLUSTER_PEERS with at least 2 peers for a minimum 3-node cluster. \
-                     Single-node deployment provides zero redundancy and zero tamper detection."
-                        .to_string(),
-                );
-            }
-            info!(
-                node_id = %config.node_id,
-                "starting in standalone mode (dev/test only) — will elect self on first tick"
+            return Err(
+                "FATAL: standalone mode (no cluster peers) is forbidden. \
+                 Set MILNET_CLUSTER_PEERS with at least 2 peers for a minimum 3-node cluster. \
+                 Single-node deployment provides zero redundancy and zero tamper detection."
+                    .to_string(),
             );
         } else {
-            // Enforce minimum 3-node cluster in production (tolerates 1 failure)
+            // Enforce minimum 3-node cluster (tolerates 1 failure)
             let cluster_size = config.peers.len() + 1; // peers + self
-            if crate::sealed_keys::is_production() && cluster_size < 3 {
+            if cluster_size < 3 {
                 return Err(format!(
-                    "FATAL: cluster size {} is too small for production. \
+                    "FATAL: cluster size {} is too small. \
                      Minimum 3 nodes required (tolerates 1 failure). \
                      Add at least {} more peers to MILNET_CLUSTER_PEERS.",
                     cluster_size,
@@ -749,7 +743,6 @@ pub async fn require_cluster(
     service_type: ServiceType,
     listen_addr: &str,
 ) -> Option<std::sync::Arc<ClusterNode>> {
-    let is_prod = crate::sealed_keys::is_production();
     match ClusterConfig::from_env_with_defaults(service_type, listen_addr) {
         Ok(config) => {
             tracing::info!(
@@ -760,22 +753,14 @@ pub async fn require_cluster(
             match ClusterNode::start(config).await {
                 Ok(node) => Some(std::sync::Arc::new(node)),
                 Err(e) => {
-                    if is_prod {
-                        panic!("FATAL: cluster start failed in production mode: {e}. \
-                               Set MILNET_CLUSTER_PEERS for distributed operation.");
-                    }
-                    tracing::warn!("cluster start failed (running standalone): {e}");
-                    None
+                    panic!("FATAL: cluster start failed: {e}. \
+                           Set MILNET_CLUSTER_PEERS for distributed operation.");
                 }
             }
         }
         Err(e) => {
-            if is_prod {
-                panic!("FATAL: no cluster config in production mode: {e}. \
-                       Set MILNET_CLUSTER_PEERS for distributed operation.");
-            }
-            tracing::info!("no cluster config (standalone mode): {e}");
-            None
+            panic!("FATAL: no cluster config: {e}. \
+                   Set MILNET_CLUSTER_PEERS for distributed operation.");
         }
     }
 }

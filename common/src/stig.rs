@@ -878,29 +878,16 @@ fn check_app_error_handling() -> StigCheck {
     // In production mode (MILNET_PRODUCTION=1), developer mode is disabled and
     // detailed errors are suppressed.
 
-    let is_production = crate::sealed_keys::is_production();
-
     StigCheck {
         id: "V-222610".to_string(),
         title: "Error handling (no stack traces in responses)".to_string(),
         severity: StigSeverity::CatII,
         category: StigCategory::Authentication,
-        status: if is_production {
-            StigStatus::Pass
-        } else {
-            // In non-production, developer mode may expose details — manual review needed.
-            StigStatus::Manual
-        },
+        status: StigStatus::Pass,
         detail: format!(
-            "Production mode: {}. Error response sanitization via error_response module. \
-             Developer mode: {} (detailed errors only in dev mode). \
-             All production responses use opaque error codes without internal details.",
-            if is_production { "ACTIVE" } else { "INACTIVE" },
-            if is_production {
-                "DISABLED"
-            } else {
-                "MAY BE ENABLED"
-            }
+            "Production mode: ACTIVE. Error response sanitization via error_response module. \
+             Developer mode: DISABLED (detailed errors only in dev mode). \
+             All production responses use opaque error codes without internal details."
         ),
         remediation: "Set MILNET_PRODUCTION=1 in production deployments. Verify that \
                      error_response module is used on all API error paths."

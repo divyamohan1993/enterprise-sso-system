@@ -323,6 +323,17 @@ pub enum AuditEventType {
     AdminCeremonyRequired,
     /// DPoP proof replay detected.
     DpopReplayDetected,
+    /// Super admin access attempt (logged BEFORE auth, hash-chained, BFT-replicated).
+    /// Includes both granted and denied attempts.
+    SuperAdminAccess,
+    /// Super admin table modification (INSERT during setup, DELETE for decommission).
+    SuperAdminTableChange,
+    /// New super admin created via unanimous ceremony.
+    SuperAdminCeremonyCreate,
+    /// FIPS mode toggled via admin panel.
+    FipsModeToggle,
+    /// Error level changed via admin panel.
+    ErrorLevelChange,
 }
 
 // ── AuditEntry ────────────────────────────────────────────────────────

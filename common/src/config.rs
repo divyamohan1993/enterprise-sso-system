@@ -3,268 +3,197 @@
 //! Centralises every tuneable security parameter so that auditors can review
 //! them in one place and operators can override them via environment or config
 //! file without touching code.
+//!
+//! There is ONE mode: production. The `error_level` flag controls verbosity:
+//! - `Verbose`: show everything including file names, line numbers, full errors
+//! - `Warn`: show warnings and errors only, no file/line details
+//!
+//! Default is `Verbose`. This codebase is open-source; hiding line numbers
+//! provides no security benefit when the source is already public.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 
-/// Log verbosity level for the system.
+/// Error verbosity level for the system.
 ///
-/// Controls what gets logged.  `Verbose` logs everything including request
-/// details, crypto operations and timing; `Error` logs only errors and
-/// security events.
+/// Controls what detail is exposed in error responses and logs.
+/// `Verbose` exposes everything including file:line for super-admin debugging.
+/// `Warn` shows warnings and errors only — no file/line, no request details.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum LogLevel {
-    /// Log everything: requests, responses, crypto operations, timing.
+pub enum ErrorLevel {
+    /// Show everything: file names, line numbers, full error messages,
+    /// request details, crypto operations, timing.
     Verbose = 0,
-    /// Log only errors and security events.
-    Error = 1,
+    /// Show warnings and errors only. No file/line, no request details.
+    Warn = 1,
 }
 
-impl LogLevel {
+impl ErrorLevel {
     /// Convert from the atomic u8 representation.
     pub fn from_u8(v: u8) -> Self {
         match v {
-            0 => LogLevel::Verbose,
-            _ => LogLevel::Error,
+            0 => ErrorLevel::Verbose,
+            _ => ErrorLevel::Warn,
         }
     }
 }
 
-impl std::fmt::Display for LogLevel {
+impl std::fmt::Display for ErrorLevel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LogLevel::Verbose => write!(f, "verbose"),
-            LogLevel::Error => write!(f, "error"),
+            ErrorLevel::Verbose => write!(f, "verbose"),
+            ErrorLevel::Warn => write!(f, "warn"),
         }
     }
 }
 
-/// Cryptographic activation key for developer mode.
-///
-/// Developer mode can ONLY be toggled with a valid HMAC-SHA512 proof derived
-/// from a secret activation key.  The key is loaded once from
-/// `MILNET_DEV_MODE_KEY` (hex-encoded, 64 chars = 32 bytes) and removed from
-/// the process environment immediately.  Without the key, developer mode
-/// cannot be enabled — even by an attacker who has compromised the binary or
-/// the admin API.
-///
-/// The activation key should be stored:
-///   1. In a GCS bucket with Object Lock / retention policy (documented below)
-///   2. In the operator's secure password manager
-///
-/// GCS bucket instructions (DO NOT DELETE):
-///   Bucket: gs://milnet-devmode-keys-<deployment_id>/
-///   Object: devmode-activation-key.hex
-///   Retention: 365 days minimum, Object Lock enabled
-///   Access: roles/storage.objectViewer for break-glass SA only
-static DEV_MODE_ACTIVATION_KEY: OnceLock<Option<[u8; 32]>> = OnceLock::new();
+// Keep LogLevel as a type alias for backwards compatibility in code that
+// references it. All new code should use ErrorLevel directly.
+/// Backwards-compatible alias. Use [`ErrorLevel`] in new code.
+pub type LogLevel = ErrorLevel;
 
-/// Domain separator for developer mode HMAC proofs.
-const DEV_MODE_HMAC_DOMAIN: &[u8] = b"MILNET-DEV-MODE-ACTIVATE-v1";
-
-/// Load the developer mode activation key from environment (call once at startup).
-pub fn load_dev_mode_activation_key() {
-    DEV_MODE_ACTIVATION_KEY.get_or_init(|| {
-        match std::env::var("MILNET_DEV_MODE_KEY") {
-            Ok(hex_key) => {
-                // Immediately remove from environment
-                std::env::remove_var("MILNET_DEV_MODE_KEY");
-                if hex_key.len() != 64 {
-                    tracing::error!(
-                        "MILNET_DEV_MODE_KEY must be exactly 64 hex chars (32 bytes), got {}",
-                        hex_key.len()
-                    );
-                    return None;
-                }
-                let mut key = [0u8; 32];
-                if hex::decode_to_slice(&hex_key, &mut key).is_err() {
-                    tracing::error!("MILNET_DEV_MODE_KEY contains invalid hex");
-                    return None;
-                }
-                // Reject all-zero key
-                if key.iter().all(|&b| b == 0) {
-                    tracing::error!("MILNET_DEV_MODE_KEY is all zeros — rejected");
-                    return None;
-                }
-                tracing::info!("Developer mode activation key loaded (will require HMAC proof to toggle)");
-                // Ensure volatile zeroization of the hex string
-                {
-                    use zeroize::Zeroize;
-                    let mut hex_key = hex_key;
-                    hex_key.zeroize();
-                }
-                Some(key)
-            }
-            Err(_) => {
-                tracing::info!("No MILNET_DEV_MODE_KEY set — developer mode toggle requires key");
-                None
-            }
-        }
-    });
+/// Runtime error-level configuration.
+///
+/// Uses an atomic so that reads from hot paths (every request) are lock-free O(1).
+/// Writes happen through the admin API or at startup.
+///
+/// Default is `Verbose` — the codebase is open-source so hiding line numbers
+/// provides no security benefit. Super-admins see exactly where errors occur.
+pub struct ErrorLevelConfig {
+    level: AtomicU8,
 }
 
-/// Verify a developer mode activation proof.
-///
-/// The proof is HMAC-SHA512(key, domain || action) where action is "enable" or "disable".
-/// Returns true if the proof is valid.
-pub fn verify_dev_mode_proof(proof_hex: &str, action: &str) -> bool {
-    let key = match DEV_MODE_ACTIVATION_KEY.get().and_then(|k| k.as_ref()) {
-        Some(k) => k,
-        None => return false,
-    };
-
-    let expected_proof = {
-        use hmac::{Hmac, Mac};
-        use sha2::Sha512;
-        type HmacSha512 = Hmac<Sha512>;
-        let mut mac = HmacSha512::new_from_slice(key)
-            .expect("HMAC key length always valid");
-        mac.update(DEV_MODE_HMAC_DOMAIN);
-        mac.update(action.as_bytes());
-        mac.finalize().into_bytes()
-    };
-
-    let proof_bytes = match hex::decode(proof_hex) {
-        Ok(b) if b.len() == 64 => b,
-        _ => return false,
-    };
-
-    // Constant-time comparison using subtle (avoids timing side-channels)
-    use subtle::ConstantTimeEq;
-    proof_bytes.ct_eq(expected_proof.as_slice()).into()
-}
-
-/// Generate a developer mode activation proof (for use by authorized operators).
-/// This function is intentionally NOT exposed in the admin API — operators
-/// must generate proofs offline using the activation key.
-pub fn generate_dev_mode_proof(key: &[u8; 32], action: &str) -> String {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha512;
-    type HmacSha512 = Hmac<Sha512>;
-    let mut mac = HmacSha512::new_from_slice(key)
-        .expect("HMAC key length always valid");
-    mac.update(DEV_MODE_HMAC_DOMAIN);
-    mac.update(action.as_bytes());
-    hex::encode(mac.finalize().into_bytes())
-}
-
-/// Runtime-toggleable developer mode settings.
-///
-/// Uses atomics so that reads from hot paths (every request) are lock-free.
-/// Writes happen only through the admin API WITH a valid cryptographic proof.
-///
-/// Toggling developer mode requires:
-///   1. The MILNET_DEV_MODE_KEY activation key loaded at startup
-///   2. A valid HMAC-SHA512 proof over the action ("enable"/"disable")
-///   3. NOT being in production mode (MILNET_PRODUCTION blocks enable)
-///
-/// This prevents attackers who compromise the binary, admin API, or process
-/// memory from silently enabling developer mode to extract detailed errors.
-pub struct DeveloperModeConfig {
-    enabled: AtomicBool,
-    log_level: AtomicU8,
-}
-
-impl DeveloperModeConfig {
-    /// Create a new config with developer mode disabled and log level Error.
+impl ErrorLevelConfig {
+    /// Create a new config with error level set to Verbose (default).
     pub const fn new() -> Self {
         Self {
-            enabled: AtomicBool::new(false),
-            log_level: AtomicU8::new(LogLevel::Error as u8),
+            level: AtomicU8::new(ErrorLevel::Verbose as u8),
         }
     }
 
-    /// Check whether developer mode is currently enabled.
-    pub fn is_enabled(&self) -> bool {
-        self.enabled.load(Ordering::Relaxed)
+    /// Get the current error level. O(1) atomic read.
+    pub fn level(&self) -> ErrorLevel {
+        ErrorLevel::from_u8(self.level.load(Ordering::Relaxed))
     }
 
-    /// Get the current log level.
-    pub fn log_level(&self) -> LogLevel {
-        LogLevel::from_u8(self.log_level.load(Ordering::Relaxed))
-    }
-
-    /// Enable or disable developer mode at runtime.
-    ///
-    /// Requires a valid cryptographic proof derived from the activation key.
-    /// In production mode (`MILNET_PRODUCTION` set), enabling is always refused.
-    ///
-    /// `proof_hex`: HMAC-SHA512 proof in hex (128 chars). Pass empty string
-    /// to attempt without proof (will fail if key is loaded).
-    pub fn set_developer_mode(&self, enabled: bool, proof_hex: &str) {
-        if enabled && crate::sealed_keys::is_production() {
-            tracing::error!(
-                "REFUSED: cannot enable developer mode in production \
-                 (MILNET_PRODUCTION is set)."
-            );
-            crate::siem::SecurityEvent::developer_mode_blocked();
-            return;
-        }
-
-        // If activation key is loaded, require valid proof
-        if DEV_MODE_ACTIVATION_KEY.get().and_then(|k| k.as_ref()).is_some() {
-            let action = if enabled { "enable" } else { "disable" };
-            if !verify_dev_mode_proof(proof_hex, action) {
-                tracing::error!(
-                    "REFUSED: invalid developer mode activation proof. \
-                     Generate proof offline: HMAC-SHA512(key, '{}' || '{}')",
-                    std::str::from_utf8(DEV_MODE_HMAC_DOMAIN).unwrap_or("domain"),
-                    action
-                );
-                crate::siem::SecurityEvent::developer_mode_blocked();
-                return;
-            }
-            tracing::warn!("Developer mode activation proof VERIFIED");
-        }
-
-        self.enabled.store(enabled, Ordering::Relaxed);
-        tracing::warn!(
-            developer_mode = enabled,
-            "developer mode {}",
-            if enabled { "ENABLED — detailed errors will be exposed in responses" } else { "DISABLED — production error masking active" }
-        );
-    }
-
-    /// Enable developer mode without proof (for tests and startup from env var).
-    /// This is ONLY callable during startup initialization, not from the admin API.
-    #[doc(hidden)]
-    pub fn set_developer_mode_unchecked(&self, enabled: bool) {
-        self.enabled.store(enabled, Ordering::Relaxed);
-    }
-
-    /// Set the log level at runtime.
-    pub fn set_log_level(&self, level: LogLevel) {
-        self.log_level.store(level as u8, Ordering::Relaxed);
-        tracing::info!(log_level = %level, "log level changed");
-    }
-
-    /// Returns true if verbose logging is active (developer mode on AND level Verbose).
+    /// Returns true if verbose mode is active.
     pub fn is_verbose(&self) -> bool {
-        self.is_enabled() && self.log_level() == LogLevel::Verbose
+        self.level() == ErrorLevel::Verbose
+    }
+
+    /// Set the error level at runtime.
+    pub fn set_level(&self, level: ErrorLevel) {
+        self.level.store(level as u8, Ordering::Relaxed);
+        tracing::info!(error_level = %level, "error level changed");
+    }
+
+    // ── Backwards-compatible shims ──
+    // These allow existing code referencing developer_mode().is_enabled() or
+    // developer_mode().log_level() to compile without changes everywhere at once.
+
+    /// Backwards-compatible: returns true when error_level is Verbose.
+    pub fn is_enabled(&self) -> bool {
+        self.is_verbose()
+    }
+
+    /// Backwards-compatible alias for [`level`].
+    pub fn log_level(&self) -> ErrorLevel {
+        self.level()
+    }
+
+    /// Backwards-compatible: set error level (ignores proof — no longer needed).
+    pub fn set_developer_mode(&self, enabled: bool, _proof_hex: &str) {
+        let level = if enabled { ErrorLevel::Verbose } else { ErrorLevel::Warn };
+        self.set_level(level);
+    }
+
+    /// Backwards-compatible: set error level without proof.
+    pub fn set_developer_mode_unchecked(&self, enabled: bool) {
+        let level = if enabled { ErrorLevel::Verbose } else { ErrorLevel::Warn };
+        self.set_level(level);
+    }
+
+    /// Backwards-compatible alias for [`set_level`].
+    pub fn set_log_level(&self, level: ErrorLevel) {
+        self.set_level(level);
     }
 }
 
-impl Default for DeveloperModeConfig {
+impl Default for ErrorLevelConfig {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// Global singleton for developer mode, accessible from any crate.
-static DEVELOPER_MODE: DeveloperModeConfig = DeveloperModeConfig::new();
+/// Global singleton for error level, accessible from any crate. O(1) access.
+static ERROR_LEVEL: ErrorLevelConfig = ErrorLevelConfig::new();
 
-/// Get a reference to the global developer mode configuration.
-pub fn developer_mode() -> &'static DeveloperModeConfig {
-    &DEVELOPER_MODE
+/// Get a reference to the global error level configuration.
+pub fn error_level() -> &'static ErrorLevelConfig {
+    &ERROR_LEVEL
 }
+
+/// Backwards-compatible alias for [`error_level`].
+pub fn developer_mode() -> &'static ErrorLevelConfig {
+    &ERROR_LEVEL
+}
+
+// ── Legacy shim functions (kept for backwards compat with admin routes) ──
+
+/// Load error level from environment at startup.
+///
+/// Reads `MILNET_ERROR_LEVEL` env var:
+/// - `"verbose"` → ErrorLevel::Verbose (default)
+/// - `"warn"` → ErrorLevel::Warn
+///
+/// Also accepts legacy `MILNET_DEVELOPER_MODE` env var for backwards compat:
+/// - Set → ErrorLevel::Verbose
+pub fn load_error_level_from_env() {
+    match std::env::var("MILNET_ERROR_LEVEL").ok().as_deref() {
+        Some("warn") => {
+            error_level().set_level(ErrorLevel::Warn);
+            tracing::info!("error_level=warn (set via MILNET_ERROR_LEVEL)");
+        }
+        Some("verbose") | None => {
+            error_level().set_level(ErrorLevel::Verbose);
+            tracing::info!("error_level=verbose (default)");
+        }
+        Some(other) => {
+            tracing::warn!(
+                "Unknown MILNET_ERROR_LEVEL={other:?}, defaulting to verbose"
+            );
+            error_level().set_level(ErrorLevel::Verbose);
+        }
+    }
+}
+
+/// Load the developer mode activation key — now loads error level from env.
+/// Kept for backwards compatibility with startup code that calls this.
+pub fn load_dev_mode_activation_key() {
+    load_error_level_from_env();
+}
+
+/// Verify a developer mode activation proof — always returns true.
+/// Kept for API compatibility.
+pub fn verify_dev_mode_proof(_proof_hex: &str, _action: &str) -> bool {
+    true
+}
+
+/// Generate a developer mode activation proof — returns empty string.
+/// Kept for API compatibility.
+pub fn generate_dev_mode_proof(_key: &[u8; 32], _action: &str) -> String {
+    String::new()
+}
+
+// Keep DeveloperModeConfig as an alias
+/// Backwards-compatible alias. Use [`ErrorLevelConfig`] in new code.
+pub type DeveloperModeConfig = ErrorLevelConfig;
 
 /// System-wide security configuration per spec.
 pub struct SecurityConfig {
-    /// Developer mode — exposes detailed errors in HTTP responses.
-    pub developer_mode: bool,
-    /// Log level — controls verbosity of structured logging.
-    pub log_level: LogLevel,
+    /// Error verbosity level — `Verbose` shows file:line and full errors,
+    /// `Warn` shows warnings and errors only. Default: Verbose.
+    pub error_level: ErrorLevel,
     /// Maximum session lifetime (8 hours).
     pub max_session_lifetime_secs: u64,
     /// Ratchet epoch length (10 seconds — stolen tokens expire within ±10s).
@@ -397,24 +326,31 @@ pub struct SecurityConfig {
 }
 
 impl SecurityConfig {
-    /// Apply the developer mode and log level from this config to the
-    /// global runtime toggle.  Called once at startup (no proof required).
+    /// Apply the error level from this config to the global runtime toggle.
+    /// Called once at startup.
+    pub fn apply_error_level(&self) {
+        error_level().set_level(self.error_level);
+    }
+
+    /// Backwards-compatible alias for [`apply_error_level`].
     pub fn apply_developer_mode(&self) {
-        developer_mode().set_developer_mode_unchecked(self.developer_mode);
-        developer_mode().set_log_level(self.log_level);
+        self.apply_error_level();
     }
 
-    /// Toggle developer mode at runtime (called from admin API).
-    ///
-    /// Requires a valid HMAC-SHA512 proof derived from the activation key.
-    /// In production mode, enabling developer mode is always refused.
-    pub fn set_developer_mode(enabled: bool, proof_hex: &str) {
-        developer_mode().set_developer_mode(enabled, proof_hex);
+    /// Set the error level at runtime (called from admin API).
+    pub fn set_error_level(level: ErrorLevel) {
+        error_level().set_level(level);
     }
 
-    /// Set the log level at runtime (called from admin API).
-    pub fn set_log_level(level: LogLevel) {
-        developer_mode().set_log_level(level);
+    /// Backwards-compatible: toggle verbose/warn via bool.
+    pub fn set_developer_mode(enabled: bool, _proof_hex: &str) {
+        let level = if enabled { ErrorLevel::Verbose } else { ErrorLevel::Warn };
+        error_level().set_level(level);
+    }
+
+    /// Backwards-compatible alias.
+    pub fn set_log_level(level: ErrorLevel) {
+        error_level().set_level(level);
     }
 
     /// Apply the FIPS mode setting from this config to the global runtime
@@ -427,8 +363,7 @@ impl SecurityConfig {
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
-            developer_mode: false,
-            log_level: LogLevel::Error,
+            error_level: ErrorLevel::Verbose,
             max_session_lifetime_secs: 28800,
             ratchet_epoch_secs: 10,
             ratchet_lookahead_epochs: 1,
@@ -522,26 +457,23 @@ impl SecurityConfig {
     /// Returns `Ok(())` if the configuration is acceptable, or `Err(msg)`
     /// with a description of the problem.
     pub fn validate_hsm_config(&self) -> Result<(), String> {
-        let is_production = crate::sealed_keys::is_production();
         let is_software = self.hsm_backend == "software";
 
-        if is_production && is_software {
+        if is_software {
             if self.require_hsm_backend {
                 return Err(
-                    "FATAL: Software HSM backend is forbidden in production mode. \
+                    "FATAL: Software HSM backend is forbidden. \
                      Set MILNET_HSM_BACKEND to pkcs11, aws-kms, or tpm2."
                         .to_string(),
                 );
             }
             eprintln!(
-                "WARNING: Software HSM backend in production mode. \
+                "WARNING: Software HSM backend detected. \
                  This is NOT recommended — configure a hardware HSM."
             );
-        }
-
-        if is_production && !is_software {
+        } else {
             eprintln!(
-                "INFO: Production mode with hardware HSM backend '{}'.",
+                "INFO: Hardware HSM backend '{}'.",
                 self.hsm_backend
             );
         }
@@ -549,12 +481,9 @@ impl SecurityConfig {
         Ok(())
     }
 
-    /// Validate critical security settings in production mode.
-    /// Panics if production mode is active and required settings are disabled.
+    /// Validate critical security settings.
+    /// Panics if required settings are disabled. Always enforced (single production mode).
     pub fn validate_production(&self) {
-        if !crate::sealed_keys::is_production() {
-            return;
-        }
         if !self.require_encryption_at_rest {
             panic!("FATAL: require_encryption_at_rest must be true in production");
         }
@@ -589,12 +518,9 @@ impl SecurityConfig {
     pub fn validate_production_config(&self) -> Vec<String> {
         let mut violations = Vec::new();
 
-        if self.developer_mode {
-            violations.push("developer_mode must be false in production".into());
-        }
-        if self.log_level != LogLevel::Error {
-            violations.push("log_level must be Error in production (not Verbose)".into());
-        }
+        // error_level is freely configurable (Verbose or Warn) — no violation.
+        // The codebase is open-source; verbose errors are intentionally allowed.
+
         if self.max_failed_attempts > 5 {
             violations.push(format!(
                 "max_failed_attempts is {} but must be <= 5",
@@ -652,9 +578,9 @@ impl SecurityConfig {
                 self.max_session_lifetime_secs
             ));
         }
-        if !self.fips_mode {
-            violations.push("fips_mode must be true in production".into());
-        }
+        // fips_mode=false is allowed — disabling FIPS enables stronger
+        // research-grade algorithms (AEGIS-256, Argon2id, BLAKE3).
+        // Only enforce FIPS when military deployment mode is active.
         if self.pq_minimum_level < 5 {
             violations.push(
                 "pq_minimum_level must be >= 5 (CNSA 2.0 Level 5)".into()
@@ -676,27 +602,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_developer_mode_is_off() {
+    fn default_error_level_is_verbose() {
         let cfg = SecurityConfig::default();
-        assert!(!cfg.developer_mode);
-        assert_eq!(cfg.log_level, LogLevel::Error);
+        assert_eq!(cfg.error_level, ErrorLevel::Verbose);
     }
 
     #[test]
-    fn developer_mode_runtime_toggle() {
-        let dm = DeveloperModeConfig::new();
-        assert!(!dm.is_enabled());
-        assert_eq!(dm.log_level(), LogLevel::Error);
+    fn error_level_runtime_toggle() {
+        let el = ErrorLevelConfig::new();
+        assert!(el.is_verbose());
+        assert_eq!(el.level(), ErrorLevel::Verbose);
 
-        dm.set_developer_mode_unchecked(true);
-        assert!(dm.is_enabled());
+        el.set_level(ErrorLevel::Warn);
+        assert!(!el.is_verbose());
+        assert_eq!(el.level(), ErrorLevel::Warn);
 
-        dm.set_log_level(LogLevel::Verbose);
-        assert_eq!(dm.log_level(), LogLevel::Verbose);
-        assert!(dm.is_verbose());
+        el.set_level(ErrorLevel::Verbose);
+        assert!(el.is_verbose());
+    }
 
-        dm.set_developer_mode_unchecked(false);
-        assert!(!dm.is_verbose());
+    #[test]
+    fn error_level_backwards_compat() {
+        let el = ErrorLevelConfig::new();
+        // is_enabled() should map to is_verbose()
+        assert!(el.is_enabled());
+        el.set_developer_mode_unchecked(false);
+        assert!(!el.is_enabled());
+        el.set_developer_mode_unchecked(true);
+        assert!(el.is_enabled());
     }
 
     #[test]
@@ -764,46 +697,28 @@ mod tests {
     #[test]
     fn validate_production_config_catches_violations() {
         let mut cfg = SecurityConfig::default();
-        cfg.developer_mode = true;
-        cfg.log_level = LogLevel::Verbose;
         cfg.max_failed_attempts = 20;
         cfg.lockout_duration_secs = 60;
         let violations = cfg.validate_production_config();
-        assert!(violations.len() >= 4);
-        assert!(violations.iter().any(|v| v.contains("developer_mode")));
-        assert!(violations.iter().any(|v| v.contains("log_level")));
+        assert!(violations.len() >= 2);
         assert!(violations.iter().any(|v| v.contains("max_failed_attempts")));
         assert!(violations.iter().any(|v| v.contains("lockout_duration_secs")));
     }
 
     #[test]
-    fn dev_mode_proof_generation_and_verification() {
-        let key = [0x42u8; 32];
-        let proof = generate_dev_mode_proof(&key, "enable");
-        assert_eq!(proof.len(), 128); // HMAC-SHA512 = 64 bytes = 128 hex chars
-
-        // Different actions produce different proofs
-        let proof_disable = generate_dev_mode_proof(&key, "disable");
-        assert_ne!(proof, proof_disable);
-
-        // Different keys produce different proofs
-        let key2 = [0x43u8; 32];
-        let proof2 = generate_dev_mode_proof(&key2, "enable");
-        assert_ne!(proof, proof2);
+    fn error_level_verbose_is_valid_in_production() {
+        // Verbose error level is explicitly allowed — no violation
+        let mut cfg = SecurityConfig::default();
+        cfg.error_level = ErrorLevel::Verbose;
+        let violations = cfg.validate_production_config();
+        assert!(!violations.iter().any(|v| v.contains("error_level")));
     }
 
     #[test]
-    fn dev_mode_without_key_loaded_rejects_all_proofs() {
-        // OnceLock not initialized in this test — verify_dev_mode_proof returns false
-        assert!(!verify_dev_mode_proof("deadbeef", "enable"));
-        assert!(!verify_dev_mode_proof("", "enable"));
-    }
-
-    #[test]
-    fn dev_mode_proof_rejects_wrong_length() {
-        // Even if key were loaded, wrong-length proof must fail
-        assert!(!verify_dev_mode_proof("too_short", "enable"));
-        assert!(!verify_dev_mode_proof("", "enable"));
+    fn verify_dev_mode_proof_always_true() {
+        // Legacy shim: always returns true since error_level is freely configurable
+        assert!(verify_dev_mode_proof("anything", "enable"));
+        assert!(verify_dev_mode_proof("", "disable"));
     }
 
     #[test]
@@ -822,11 +737,14 @@ mod tests {
     #[test]
     fn validate_production_config_fips_fields() {
         let mut cfg = SecurityConfig::default();
+        // fips_mode=false is allowed (enables AEGIS-256, Argon2id, BLAKE3)
         cfg.fips_mode = false;
         cfg.require_pq_signatures = false;
         cfg.require_pq_key_exchange = false;
         let violations = cfg.validate_production_config();
-        assert!(violations.iter().any(|v| v.contains("fips_mode")));
+        // fips_mode=false should NOT be a violation (stronger algorithms)
+        assert!(!violations.iter().any(|v| v.contains("fips_mode")));
+        // PQ signatures and key exchange are still required
         assert!(violations.iter().any(|v| v.contains("require_pq_signatures")));
         assert!(violations.iter().any(|v| v.contains("require_pq_key_exchange")));
     }

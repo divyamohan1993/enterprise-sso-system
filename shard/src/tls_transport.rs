@@ -283,12 +283,10 @@ pub async fn tls_bind(
     // set of peer certificate fingerprints.
     let server_config = crate::tls::server_tls_config(&cert_key, &ca);
 
-    if common::sealed_keys::is_production() {
-        tracing::warn!(
-            module = module_name,
-            "mTLS without explicit certificate pinning — consider tls_bind_pinned() for CA compromise defense"
-        );
-    }
+    tracing::warn!(
+        module = module_name,
+        "mTLS without explicit certificate pinning — consider tls_bind_pinned() for CA compromise defense"
+    );
 
     let listener = TlsShardListener::bind(addr, module_id, hmac_key, server_config).await?;
     Ok((listener, ca, cert_key))

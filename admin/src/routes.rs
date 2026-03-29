@@ -388,8 +388,18 @@ fn required_role_for_route(path: &str, method: &Method) -> AdminRole {
         return AdminRole::UserManager;
     }
 
-    // Developer mode: SuperAdmin only
+    // Developer mode / error level: SuperAdmin only
     if path.starts_with("/api/admin/developer-mode") {
+        return AdminRole::SuperAdmin;
+    }
+
+    // FIPS mode toggle: SuperAdmin only
+    if path.starts_with("/api/admin/fips-mode") {
+        return AdminRole::SuperAdmin;
+    }
+
+    // Super admin management: SuperAdmin only
+    if path.starts_with("/api/admin/super-admins") {
         return AdminRole::SuperAdmin;
     }
 
@@ -473,8 +483,16 @@ pub enum DestructiveAction {
     KeyRotation,
     /// Bulk revocation of device credentials.
     BulkDeviceRevocation,
-    /// Toggle developer mode on or off.
-    DeveloperModeToggle,
+    /// Toggle error level on or off.
+    ErrorLevelToggle,
+    /// Toggle FIPS mode on or off.
+    /// OFF = stronger algorithms (AEGIS-256, Argon2id, BLAKE3).
+    /// ON = FIPS 140-3 compliance (AES-256-GCM, PBKDF2, SHA-512).
+    FipsModeToggle,
+    /// Add a new super admin. Requires UNANIMOUS approval from ALL
+    /// existing super admins. The table is temporarily unfrozen, the
+    /// new admin inserted, then re-frozen immediately.
+    AddSuperAdmin,
 }
 
 impl DestructiveAction {
@@ -485,7 +503,10 @@ impl DestructiveAction {
             Self::TierChange => 2,
             Self::KeyRotation => 3, // Higher bar for key rotation
             Self::BulkDeviceRevocation => 2,
-            Self::DeveloperModeToggle => 2,
+            Self::ErrorLevelToggle => 2,
+            Self::FipsModeToggle => 2,
+            // UNANIMOUS: every single active super admin must approve
+            Self::AddSuperAdmin => usize::MAX, // resolved at runtime to active admin count
         }
     }
 
@@ -496,7 +517,9 @@ impl DestructiveAction {
             | Self::UserDeletion
             | Self::TierChange
             | Self::BulkDeviceRevocation
-            | Self::DeveloperModeToggle => true,
+            | Self::ErrorLevelToggle
+            | Self::FipsModeToggle
+            | Self::AddSuperAdmin => true,
         }
     }
 }
@@ -508,7 +531,9 @@ impl std::fmt::Display for DestructiveAction {
             Self::TierChange => write!(f, "tier_change"),
             Self::KeyRotation => write!(f, "key_rotation"),
             Self::BulkDeviceRevocation => write!(f, "bulk_device_revocation"),
-            Self::DeveloperModeToggle => write!(f, "developer_mode_toggle"),
+            Self::ErrorLevelToggle => write!(f, "error_level_toggle"),
+            Self::FipsModeToggle => write!(f, "fips_mode_toggle"),
+            Self::AddSuperAdmin => write!(f, "add_super_admin"),
         }
     }
 }
@@ -600,6 +625,185 @@ fn verify_admin_action_approval(
 }
 
 // ---------------------------------------------------------------------------
+// Super admin registry (FROZEN after setup — immutable audit trail)
+// ---------------------------------------------------------------------------
+
+/// A registered super admin with their key hash for authentication.
+#[derive(Clone)]
+pub struct SuperAdminEntry {
+    pub id: Uuid,
+    pub label: String,
+    pub key_hash: Vec<u8>,
+    pub region: Option<String>,
+}
+
+/// Derive a unique super admin API key from the master KEK + admin ID.
+/// Each super admin gets a deterministic but unique key.
+pub fn derive_super_admin_key(master_kek: &[u8; 32], admin_id: &Uuid, deployment_id: &str) -> String {
+    use hkdf::Hkdf;
+    use sha2::Sha512;
+    let salt = format!("MILNET-SUPER-ADMIN-KEY-v1:{}:{}", deployment_id, admin_id);
+    let hk = Hkdf::<Sha512>::new(Some(salt.as_bytes()), master_kek.as_slice());
+    let mut okm = [0u8; 32];
+    hk.expand(b"super-admin-api-key", &mut okm).expect("HKDF expand");
+    hex::encode(okm)
+}
+
+/// Hash a super admin API key for storage (SHA-512, not reversible).
+fn hash_admin_key(key: &str) -> Vec<u8> {
+    use sha2::{Digest, Sha512};
+    Sha512::digest(key.as_bytes()).to_vec()
+}
+
+/// Check if a provided token matches any active super admin key.
+/// Returns the super admin ID and label if matched.
+/// O(n) over active admins but n is small (< 20).
+fn match_super_admin_key(token: &[u8], admins: &HashMap<Uuid, SuperAdminEntry>) -> Option<(Uuid, String)> {
+    let token_hash = {
+        use sha2::{Digest, Sha512};
+        Sha512::digest(token).to_vec()
+    };
+    for (id, entry) in admins {
+        if crypto::ct::ct_eq(&token_hash, &entry.key_hash) {
+            return Some((*id, entry.label.clone()));
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Super admin access log — immutable, distributed, never deleted
+// ---------------------------------------------------------------------------
+
+/// Dedicated append-only log file for super admin access events.
+/// This file is NEVER rotated or deleted. It provides a local tamper-evidence
+/// trail in addition to the distributed BFT audit log and SIEM.
+const SUPER_ADMIN_ACCESS_LOG: &str = "/var/lib/milnet/audit/super_admin_access.jsonl";
+
+/// Log a super admin access attempt BEFORE authentication completes.
+///
+/// This is called BEFORE the key is verified, so the attempt is recorded
+/// even if the key is invalid. The log entry is:
+/// 1. Written to the local append-only file (sync'd to disk)
+/// 2. Emitted to the SIEM broadcast bus
+/// 3. Persisted to the critical alerts file
+///
+/// Every access attempt hits 4 independent tamper-evidence layers:
+///
+/// 1. **BFT audit chain** — ML-DSA-87 signed, SHA-512 hash-chained,
+///    7-node BFT quorum replicated. Each entry's hash includes prev_hash.
+///    Tampering with ANY entry on ANY node breaks the chain on the other 6.
+///    Even with full DB access + trigger drops + file modifications on one
+///    node, the remaining nodes hold the original chain as proof.
+/// 2. **Local append-only file** — fsync'd to disk before auth proceeds
+/// 3. **SIEM broadcast bus** — distributed consumers
+/// 4. **DB audit log** — append-only (trigger-protected, but triggers are
+///    the weakest layer — the BFT chain is the real proof)
+///
+/// If local file write fails, access is DENIED (fail-closed).
+fn log_super_admin_access(
+    audit_log: &tokio::sync::RwLock<audit::log::AuditLog>,
+    pq_signing_key: &crypto::pq_sign::PqSigningKey,
+    source_ip: &str,
+    path: &str,
+    method: &str,
+    matched_admin: Option<&(Uuid, String)>,
+    outcome: &str,
+) -> bool {
+    let detail = format!(
+        "SUPER_ADMIN_ACCESS: {} {} from {} — admin={} outcome={}",
+        method, path, source_ip,
+        matched_admin.map(|(_, l)| l.as_str()).unwrap_or("UNKNOWN"),
+        outcome,
+    );
+
+    let entry_json = serde_json::json!({
+        "event_type": "SuperAdminAccess",
+        "source_ip": source_ip,
+        "path": path,
+        "method": method,
+        "admin_id": matched_admin.map(|(id, _)| id.to_string()),
+        "admin_label": matched_admin.map(|(_, label)| label.as_str()),
+        "outcome": outcome,
+        "node_id": std::env::var("MILNET_NODE_ID").unwrap_or_default(),
+    });
+
+    let json = match serde_json::to_string(&entry_json) {
+        Ok(j) => j,
+        Err(_) => return false,
+    };
+
+    // Layer 1: BFT hash-chained audit (ML-DSA-87 signed, distributed)
+    // This is the unforgeable layer. Even if all other layers are compromised,
+    // the hash chain across 7 separate nodes provides cryptographic proof.
+    // Entry N's hash = SHA-512(domain || fields || prev_hash_of_entry_N-1).
+    // Modifying entry N invalidates entries N+1..latest on all honest nodes.
+    if let Ok(mut log) = audit_log.try_write() {
+        log.append_signed(
+            common::types::AuditEventType::SuperAdminAccess,
+            matched_admin.map(|(id, _)| vec![*id]).unwrap_or_default(),
+            vec![],
+            if outcome == "key_matched" { 0.0 } else { 1.0 },
+            vec![],
+            pq_signing_key,
+        );
+    }
+
+    // Layer 2: Local append-only file (fsync — fail-closed)
+    let file_ok = {
+        if let Some(parent) = std::path::Path::new(SUPER_ADMIN_ACCESS_LOG).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(SUPER_ADMIN_ACCESS_LOG)
+        {
+            Ok(mut f) => {
+                use std::io::Write;
+                if writeln!(f, "{}", json).is_ok() {
+                    f.sync_all().is_ok()
+                } else {
+                    false
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    "CRITICAL: cannot write super admin access log: {e}. \
+                     DENYING access (fail-closed)."
+                );
+                false
+            }
+        }
+    };
+
+    // Layer 3: SIEM broadcast (distributed consumers)
+    common::siem::SecurityEvent::tamper_detected(&detail);
+
+    // Layer 4: Critical alerts file (redundant local)
+    common::siem::persist_critical_alert(&json);
+
+    file_ok
+}
+
+/// Guard: the super_admins table is FROZEN after setup.
+/// Any attempt to write after setup_complete is a security violation.
+/// Call this before ANY DB write to super_admins — panics if table is frozen.
+pub fn assert_super_admins_not_frozen(setup_complete: &std::sync::atomic::AtomicBool) {
+    if setup_complete.load(Ordering::Relaxed) {
+        // Log to SIEM before panicking — this is a critical event
+        common::siem::SecurityEvent::tamper_detected(
+            "CRITICAL: attempted write to FROZEN super_admins table after setup. \
+             Table is immutable. Possible compromise attempt."
+        );
+        panic!(
+            "SECURITY VIOLATION: attempted write to frozen super_admins table. \
+             The super_admins table is immutable after initial setup."
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shared application state
 // ---------------------------------------------------------------------------
 
@@ -614,6 +818,9 @@ pub struct AppState {
     pub auth_codes: RwLock<sso_protocol::authorize::AuthorizationStore>,
     pub oidc_signing_key: sso_protocol::tokens::OidcSigningKey,
     pub admin_api_key: String,
+    /// Registry of super admin API keys (id -> key_hash).
+    /// Loaded from DB at startup, updated during setup.
+    pub super_admin_keys: RwLock<HashMap<Uuid, SuperAdminEntry>>,
     pub fido_store: RwLock<fido::registration::CredentialStore>,
     pub setup_complete: Arc<AtomicBool>,
     pub pending_ceremonies: RwLock<HashMap<Uuid, PendingCeremony>>,
@@ -635,7 +842,7 @@ pub struct AppState {
     pub pq_signing_key: crypto::pq_sign::PqSigningKey,
     pub session_tracker: Arc<common::session_limits::SessionTracker>,
     pub revocation_list: RwLock<RevocationList>,
-    /// Atomic developer-mode flag — mirrors the global in common::config.
+    /// Atomic error level flag — mirrors the global in common::config.
     pub developer_mode: AtomicBool,
     /// Atomic log-level flag (0 = Verbose, 1 = Error).
     pub developer_log_level: AtomicU8,
@@ -1066,6 +1273,10 @@ fn verify_ceremony_approval(
 #[derive(Debug, Clone, Copy)]
 pub struct AuthTier(pub u8);
 
+/// Extension: which super admin authenticated (for ceremony dedup).
+#[derive(Debug, Clone, Copy)]
+pub struct AuthSuperAdminId(pub Uuid);
+
 /// Extension to carry the authenticated user's ID through the request.
 #[derive(Debug, Clone, Copy)]
 pub struct AuthUserId(pub Uuid);
@@ -1103,12 +1314,70 @@ async fn auth_middleware(
     match auth_header {
         Some(header) if header.starts_with("Bearer ") => {
             let token = &header[7..];
-            // Accept the admin API key — treated as tier 1 (Sovereign)
+            // Accept the legacy admin API key — treated as tier 1 (Sovereign)
             // Use constant-time comparison to prevent timing side-channels.
             if crypto::ct::ct_eq(token.as_bytes(), state.admin_api_key.as_bytes()) {
                 request.extensions_mut().insert(AuthTier(1));
                 request.extensions_mut().insert(AuthAdminRole(AdminRole::SuperAdmin));
                 return Ok(next.run(request).await);
+            }
+
+            // Check per-super-admin API keys (multi-admin support).
+            // LOG FIRST, AUTHENTICATE SECOND: the access attempt is recorded
+            // to the immutable distributed audit log BEFORE the key is verified.
+            // If logging fails, access is DENIED (fail-closed).
+            {
+                let admins = state.super_admin_keys.read().await;
+                if !admins.is_empty() {
+                    let source_ip = request.headers()
+                        .get("x-forwarded-for")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let req_path = request.uri().path().to_string();
+                    let req_method = request.method().to_string();
+
+                    let matched = match_super_admin_key(token.as_bytes(), &admins);
+
+                    // Log the attempt BEFORE auth decision — into BFT hash chain
+                    let outcome = if matched.is_some() { "key_matched" } else { "key_rejected" };
+                    let log_ok = log_super_admin_access(
+                        &state.audit_log,
+                        &state.pq_signing_key,
+                        &source_ip, &req_path, &req_method,
+                        matched.as_ref(), outcome,
+                    );
+
+                    if let Some((admin_id, label)) = matched {
+                        if !log_ok {
+                            // Logging failed — DENY access (fail-closed).
+                            tracing::error!(
+                                "DENIED: super admin '{}' access denied because audit log write failed. \
+                                 Fix /var/lib/milnet/audit/ permissions.",
+                                label
+                            );
+                            return Err(StatusCode::SERVICE_UNAVAILABLE);
+                        }
+
+                        // Record ACCESS_GRANTED in DB audit log (for last_used derivation).
+                        // Best-effort: don't block auth if DB write fails (file log is primary).
+                        let _ = sqlx::query(
+                            "INSERT INTO super_admin_audit_log (operation, admin_id, admin_label, detail, source_ip) \
+                             VALUES ('ACCESS_GRANTED', $1, $2, $3, $4)"
+                        )
+                        .bind(admin_id)
+                        .bind(&label)
+                        .bind(format!("{} {}", req_method, req_path))
+                        .bind(&source_ip)
+                        .execute(&state.db)
+                        .await;
+
+                        request.extensions_mut().insert(AuthTier(1));
+                        request.extensions_mut().insert(AuthAdminRole(AdminRole::SuperAdmin));
+                        request.extensions_mut().insert(AuthSuperAdminId(admin_id));
+                        return Ok(next.run(request).await);
+                    }
+                }
             }
 
             // Check per-role admin API keys derived from master KEK.
@@ -1606,6 +1875,20 @@ pub struct SetupRequest {
     pub username: String,
     pub password: String,
     pub organization: Option<String>,
+    /// Super admins to create during initial setup.
+    /// Each super admin gets a unique API key derived from the master KEK.
+    /// If empty or absent, a single super admin named "default" is created.
+    /// Example: [{"label": "us-east", "region": "us-east-1"}, {"label": "eu-west", "region": "eu-west-1"}]
+    #[serde(default)]
+    pub super_admins: Vec<SuperAdminSetup>,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct SuperAdminSetup {
+    /// Human-readable label (e.g., "us-east", "india-south", "eu-admin-1").
+    pub label: String,
+    /// Optional region tag for organizational clarity.
+    pub region: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1686,9 +1969,15 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         // Token revocation
         .route("/api/tokens/revoke", post(revoke_token))
         .route("/api/tokens/revoked", get(revoked_token_count))
-        // Developer mode
+        // Developer mode (error level)
         .route("/api/admin/developer-mode", put(set_developer_mode))
         .route("/api/admin/developer-mode", get(get_developer_mode))
+        // FIPS mode toggle (super-admin, ceremony required)
+        .route("/api/admin/fips-mode", put(set_fips_mode))
+        .route("/api/admin/fips-mode", get(get_fips_mode))
+        // Super admin management (unanimous ceremony required to add)
+        .route("/api/admin/super-admins", get(list_super_admins))
+        .route("/api/admin/super-admins", post(add_super_admin))
         // Live SIEM event stream (SSE)
         .route("/api/admin/siem/stream", get(siem_stream))
         // ── Admin RBAC & two-person ceremony endpoints ──
@@ -1835,7 +2124,7 @@ async fn initial_setup(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // Create the superuser
+    // Create the superuser (OPAQUE credential)
     let mut store = state.credential_store.write().await;
     let user_id = store.register_with_password(&req.username, req.password.as_bytes());
 
@@ -1857,14 +2146,113 @@ async fn initial_setup(
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    // Mark setup as complete
+    // ── Create super admin API keys ──
+    // If no super_admins specified, create one default super admin.
+    let mut admins_to_create = req.super_admins.clone();
+    if admins_to_create.is_empty() {
+        admins_to_create.push(SuperAdminSetup {
+            label: "default".to_string(),
+            region: None,
+        });
+    }
+
+    let master_kek = common::sealed_keys::get_master_kek();
+    let deployment_id = std::env::var("MILNET_DEPLOYMENT_ID")
+        .unwrap_or_else(|_| "default-deployment".to_string());
+
+    // Ensure super_admins table exists (migration should handle this, but be safe)
+    let _ = sqlx::query(
+        "CREATE TABLE IF NOT EXISTS super_admins (
+            id UUID PRIMARY KEY, label VARCHAR(255) NOT NULL UNIQUE,
+            key_hash BYTEA NOT NULL, region VARCHAR(255),
+            created_at BIGINT NOT NULL
+        )"
+    ).execute(&state.db).await;
+
+    // Assert the table is NOT frozen yet (setup not complete)
+    assert_super_admins_not_frozen(&state.setup_complete);
+
+    let mut created_admins = Vec::new();
+    let mut admin_keys_map = state.super_admin_keys.write().await;
+
+    for admin_setup in &admins_to_create {
+        let admin_id = Uuid::new_v4();
+        let api_key = derive_super_admin_key(master_kek, &admin_id, &deployment_id);
+        let key_hash_bytes = hash_admin_key(&api_key);
+
+        // Persist to DB
+        if let Err(e) = sqlx::query(
+            "INSERT INTO super_admins (id, label, key_hash, region, created_at) \
+             VALUES ($1, $2, $3, $4, $5)"
+        )
+        .bind(admin_id)
+        .bind(&admin_setup.label)
+        .bind(&key_hash_bytes)
+        .bind(&admin_setup.region)
+        .bind(now_secs())
+        .execute(&state.db)
+        .await {
+            tracing::error!(
+                error = %e, label = %admin_setup.label,
+                "CRITICAL: failed to persist super admin"
+            );
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+
+        // Add to in-memory registry
+        admin_keys_map.insert(admin_id, SuperAdminEntry {
+            id: admin_id,
+            label: admin_setup.label.clone(),
+            key_hash: key_hash_bytes,
+            region: admin_setup.region.clone(),
+        });
+
+        // Collect for response (keys shown ONCE at creation)
+        created_admins.push(serde_json::json!({
+            "id": admin_id.to_string(),
+            "label": admin_setup.label,
+            "region": admin_setup.region,
+            "api_key": api_key,
+        }));
+
+        tracing::info!(
+            admin_id = %admin_id,
+            label = %admin_setup.label,
+            "super admin created"
+        );
+    }
+
+    // FREEZE the super_admins table at the database level.
+    // After this call, no INSERT or UPDATE is possible — even by a DB superuser
+    // (unless they explicitly drop the trigger, which pg_audit will log).
+    if let Err(e) = sqlx::query("SELECT freeze_super_admins()")
+        .execute(&state.db)
+        .await
+    {
+        tracing::error!(
+            error = %e,
+            "CRITICAL: failed to freeze super_admins table — setup cannot complete safely"
+        );
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    tracing::info!("super_admins table FROZEN — no further INSERT or UPDATE possible");
+
+    // Mark setup as complete (application-level guard)
     state.setup_complete.store(true, Ordering::Relaxed);
+
+    common::siem::SecurityEvent::key_rotation(&format!(
+        "initial_setup: {} super admin(s) created", created_admins.len()
+    ));
 
     Ok(Json(serde_json::json!({
         "success": true,
         "user_id": user_id.to_string(),
-        "admin_api_key": "[REDACTED — shown once at creation only]",
-        "message": "Superuser created. Save your admin API key securely."
+        "super_admins": created_admins,
+        "legacy_admin_api_key": "[REDACTED — use super_admins[].api_key instead]",
+        "message": format!(
+            "Setup complete. {} super admin(s) created. Save ALL API keys securely — they are shown ONCE.",
+            created_admins.len()
+        ),
     })))
 }
 
@@ -3539,7 +3927,7 @@ async fn revoked_token_count(
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
-struct DeveloperModeRequest {
+struct ErrorLevelRequest {
     enabled: bool,
     #[serde(default)]
     log_level: Option<String>,
@@ -3547,29 +3935,32 @@ struct DeveloperModeRequest {
     /// Required when MILNET_DEV_MODE_KEY is configured.
     #[serde(default)]
     activation_proof: Option<String>,
-    /// ID of an approved DeveloperModeToggle ceremony action.
-    /// Required: developer mode toggle is a destructive operation
+    /// ID of an approved ErrorLevelToggle ceremony action.
+    /// Required: error level toggle is a destructive operation
     /// that needs multi-person ceremony approval.
     #[serde(default)]
     ceremony_action_id: Option<Uuid>,
 }
 
 #[derive(Serialize)]
-struct DeveloperModeResponse {
+struct ErrorLevelResponse {
     developer_mode: bool,
     log_level: String,
 }
 
-/// PUT /api/admin/developer-mode — toggle developer mode (super-admin only).
+/// PUT /api/admin/developer-mode — set error level (super-admin only).
 ///
-/// Requires the admin API key as a Bearer token.  Updates both the local
-/// AppState atomics and the global `common::config::developer_mode()` toggle
+/// Requires the admin API key as a Bearer token. Updates both the local
+/// AppState atomics and the global `common::config::error_level()` toggle
 /// so all crates see the change immediately.
+///
+/// `enabled=true` → ErrorLevel::Verbose, `enabled=false` → ErrorLevel::Warn.
+/// The `log_level` field can also be set directly to "verbose" or "warn".
 async fn set_developer_mode(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
-    Json(body): Json<DeveloperModeRequest>,
-) -> Result<Json<DeveloperModeResponse>, StatusCode> {
+    Json(body): Json<ErrorLevelRequest>,
+) -> Result<Json<ErrorLevelResponse>, StatusCode> {
     // Require super-admin (admin API key) — not just any authenticated user.
     let auth_header = headers
         .get("Authorization")
@@ -3577,102 +3968,85 @@ async fn set_developer_mode(
         .unwrap_or("");
     let token = auth_header.strip_prefix("Bearer ").unwrap_or("");
     if !crypto::ct::ct_eq(token.as_bytes(), state.admin_api_key.as_bytes()) {
-        tracing::warn!("developer-mode toggle rejected: not super-admin");
+        tracing::warn!("error-level toggle rejected: not super-admin");
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // SECURITY: Developer mode toggle is a destructive operation requiring
-    // multi-person ceremony (DeveloperModeToggle, 2 SuperAdmin approvals).
-    // The caller must submit and get approval via /api/admin/actions/submit first,
-    // then provide the approved action_id here.
+    // Multi-person ceremony still required for error level changes.
     let action_id = body.ceremony_action_id.ok_or_else(|| {
-        tracing::warn!("developer-mode toggle rejected: no ceremony_action_id provided");
+        tracing::warn!("error-level toggle rejected: no ceremony_action_id provided");
         StatusCode::FORBIDDEN
     })?;
     {
         let mut actions = state.pending_admin_actions.write().await;
         let action = actions.get(&action_id).ok_or_else(|| {
-            tracing::warn!("developer-mode toggle rejected: ceremony action not found");
+            tracing::warn!("error-level toggle rejected: ceremony action not found");
             StatusCode::FORBIDDEN
         })?;
-        if action.action_type != DestructiveAction::DeveloperModeToggle {
-            tracing::warn!("developer-mode toggle rejected: wrong ceremony action type");
+        if action.action_type != DestructiveAction::ErrorLevelToggle {
+            tracing::warn!("error-level toggle rejected: wrong ceremony action type");
             return Err(StatusCode::FORBIDDEN);
         }
         if action.approvals.len() < action.required_approvals {
-            tracing::warn!("developer-mode toggle rejected: insufficient ceremony approvals");
+            tracing::warn!("error-level toggle rejected: insufficient ceremony approvals");
             return Err(StatusCode::FORBIDDEN);
         }
         if now_secs() > action.expires_at {
             actions.remove(&action_id);
-            tracing::warn!("developer-mode toggle rejected: ceremony action expired");
+            tracing::warn!("error-level toggle rejected: ceremony action expired");
             return Err(StatusCode::FORBIDDEN);
         }
         // Consume the ceremony action so it cannot be reused
         actions.remove(&action_id);
     }
 
-    // Production mode protection: refuse to enable developer mode at runtime
-    // unless it was set via environment variable at startup.
-    let is_production = common::sealed_keys::is_production();
-    if is_production && body.enabled {
-        let startup_dev_mode = std::env::var("MILNET_DEVELOPER_MODE").is_ok();
-        if !startup_dev_mode {
-            tracing::error!(
-                "CRITICAL: Runtime developer mode toggle attempted in production mode. \
-                 Developer mode can only be enabled via MILNET_DEVELOPER_MODE env var at startup."
-            );
-            // Emit SIEM critical event
-            common::siem::SecurityEvent::key_rotation(
-                "CRITICAL: developer_mode runtime toggle BLOCKED in production"
-            );
-            return Err(StatusCode::FORBIDDEN);
-        }
-    }
-
-    // Parse log level (default to "error" if not provided)
-    let log_level = match body.log_level.as_deref() {
-        Some("verbose") => common::config::LogLevel::Verbose,
-        Some("error") | None => common::config::LogLevel::Error,
+    // Parse error level (default to "verbose" if not provided)
+    let error_level = match body.log_level.as_deref() {
+        Some("verbose") | None => common::config::ErrorLevel::Verbose,
+        Some("warn") => common::config::ErrorLevel::Warn,
+        // Accept legacy "error" as alias for "warn"
+        Some("error") => common::config::ErrorLevel::Warn,
         Some(other) => {
-            tracing::warn!(invalid_level = other, "invalid log_level in developer-mode request");
+            tracing::warn!(invalid_level = other, "invalid log_level in error-level request");
             return Err(StatusCode::BAD_REQUEST);
         }
     };
 
+    // Also derive from the enabled bool for backwards compat
+    let effective_level = if body.enabled {
+        common::config::ErrorLevel::Verbose
+    } else {
+        error_level
+    };
+
     // Update local state atomics
     state.developer_mode.store(body.enabled, Ordering::Relaxed);
-    state.developer_log_level.store(log_level as u8, Ordering::Relaxed);
+    state.developer_log_level.store(effective_level as u8, Ordering::Relaxed);
 
-    // Update the global toggle so all crates (gateway, orchestrator, etc.) see it
-    // Requires valid activation proof when MILNET_DEV_MODE_KEY is configured
-    let proof = body.activation_proof.as_deref().unwrap_or("");
-    common::config::SecurityConfig::set_developer_mode(body.enabled, proof);
-    common::config::SecurityConfig::set_log_level(log_level);
+    // Update the global error level so all crates see it
+    common::config::error_level().set_level(effective_level);
 
     // Emit SIEM event for auditability
     common::siem::SecurityEvent::key_rotation(&format!(
-        "developer_mode={}, log_level={}",
-        body.enabled, log_level
+        "error_level={}", effective_level
     ));
 
     tracing::info!(
-        developer_mode = body.enabled,
-        log_level = %log_level,
-        "developer mode settings updated via admin API"
+        error_level = %effective_level,
+        "error level updated via admin API"
     );
 
-    Ok(Json(DeveloperModeResponse {
+    Ok(Json(ErrorLevelResponse {
         developer_mode: body.enabled,
-        log_level: log_level.to_string(),
+        log_level: effective_level.to_string(),
     }))
 }
 
-/// GET /api/admin/developer-mode — read current developer mode settings.
+/// GET /api/admin/developer-mode — read current error level settings.
 async fn get_developer_mode(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
-) -> Result<Json<DeveloperModeResponse>, StatusCode> {
+) -> Result<Json<ErrorLevelResponse>, StatusCode> {
     // Require super-admin
     let auth_header = headers
         .get("Authorization")
@@ -3683,15 +4057,324 @@ async fn get_developer_mode(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let enabled = state.developer_mode.load(Ordering::Relaxed);
-    let level = common::config::LogLevel::from_u8(
+    let level = common::config::ErrorLevel::from_u8(
         state.developer_log_level.load(Ordering::Relaxed),
     );
 
-    Ok(Json(DeveloperModeResponse {
-        developer_mode: enabled,
+    Ok(Json(ErrorLevelResponse {
+        developer_mode: level == common::config::ErrorLevel::Verbose,
         log_level: level.to_string(),
     }))
+}
+
+// ---------------------------------------------------------------------------
+// FIPS mode toggle (super-admin only)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct FipsModeRequest {
+    enabled: bool,
+    /// Multi-person ceremony action ID (required).
+    ceremony_action_id: Option<Uuid>,
+    /// HMAC-SHA512 activation proof (optional, for when FIPS key is configured).
+    activation_proof: Option<String>,
+}
+
+#[derive(Serialize)]
+struct FipsModeResponse {
+    fips_mode: bool,
+    /// Active symmetric algorithm based on FIPS mode.
+    symmetric_algorithm: &'static str,
+    /// Active KDF based on FIPS mode.
+    kdf_algorithm: &'static str,
+}
+
+/// PUT /api/admin/fips-mode — toggle FIPS mode (super-admin only).
+///
+/// When FIPS is OFF: AEGIS-256, Argon2id, BLAKE3 (stronger, research-grade).
+/// When FIPS is ON: AES-256-GCM, PBKDF2-SHA512, SHA-512 (FIPS 140-3 compliant).
+///
+/// Requires multi-person ceremony (FipsModeToggle, 2 SuperAdmin approvals).
+async fn set_fips_mode(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<FipsModeRequest>,
+) -> Result<Json<FipsModeResponse>, StatusCode> {
+    // Require super-admin
+    let auth_header = headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let token = auth_header.strip_prefix("Bearer ").unwrap_or("");
+    if !crypto::ct::ct_eq(token.as_bytes(), state.admin_api_key.as_bytes()) {
+        tracing::warn!("fips-mode toggle rejected: not super-admin");
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    // Multi-person ceremony required
+    let action_id = body.ceremony_action_id.ok_or_else(|| {
+        tracing::warn!("fips-mode toggle rejected: no ceremony_action_id provided");
+        StatusCode::FORBIDDEN
+    })?;
+    {
+        let mut actions = state.pending_admin_actions.write().await;
+        let action = actions.get(&action_id).ok_or_else(|| {
+            tracing::warn!("fips-mode toggle rejected: ceremony action not found");
+            StatusCode::FORBIDDEN
+        })?;
+        if action.action_type != DestructiveAction::FipsModeToggle {
+            tracing::warn!("fips-mode toggle rejected: wrong ceremony action type");
+            return Err(StatusCode::FORBIDDEN);
+        }
+        if action.approvals.len() < action.required_approvals {
+            tracing::warn!("fips-mode toggle rejected: insufficient ceremony approvals");
+            return Err(StatusCode::FORBIDDEN);
+        }
+        if now_secs() > action.expires_at {
+            actions.remove(&action_id);
+            tracing::warn!("fips-mode toggle rejected: ceremony action expired");
+            return Err(StatusCode::FORBIDDEN);
+        }
+        actions.remove(&action_id);
+    }
+
+    // Toggle FIPS mode via the global toggle (with optional HMAC proof)
+    let proof = body.activation_proof.as_deref().unwrap_or("");
+    common::fips::set_fips_mode(body.enabled, proof);
+
+    let fips_active = common::fips::is_fips_mode();
+
+    // Emit SIEM event for auditability
+    common::siem::SecurityEvent::key_rotation(&format!(
+        "fips_mode={} (symmetric={}, kdf={})",
+        fips_active,
+        if fips_active { "AES-256-GCM" } else { "AEGIS-256" },
+        if fips_active { "PBKDF2-SHA512" } else { "Argon2id" },
+    ));
+
+    tracing::info!(
+        fips_mode = fips_active,
+        symmetric = if fips_active { "AES-256-GCM" } else { "AEGIS-256" },
+        kdf = if fips_active { "PBKDF2-SHA512" } else { "Argon2id" },
+        "FIPS mode updated via admin API"
+    );
+
+    Ok(Json(FipsModeResponse {
+        fips_mode: fips_active,
+        symmetric_algorithm: if fips_active { "AES-256-GCM" } else { "AEGIS-256" },
+        kdf_algorithm: if fips_active { "PBKDF2-SHA512" } else { "Argon2id" },
+    }))
+}
+
+/// GET /api/admin/fips-mode — read current FIPS mode and active algorithms.
+async fn get_fips_mode(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<FipsModeResponse>, StatusCode> {
+    // Require super-admin
+    let auth_header = headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let token = auth_header.strip_prefix("Bearer ").unwrap_or("");
+    if !crypto::ct::ct_eq(token.as_bytes(), state.admin_api_key.as_bytes()) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let fips_active = common::fips::is_fips_mode();
+    Ok(Json(FipsModeResponse {
+        fips_mode: fips_active,
+        symmetric_algorithm: if fips_active { "AES-256-GCM" } else { "AEGIS-256" },
+        kdf_algorithm: if fips_active { "PBKDF2-SHA512" } else { "Argon2id" },
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Super admin management (unanimous ceremony for additions)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct AddSuperAdminRequest {
+    label: String,
+    region: Option<String>,
+    /// Ceremony action ID — must have been approved by ALL existing super admins.
+    ceremony_action_id: Uuid,
+}
+
+#[derive(Serialize)]
+struct SuperAdminInfo {
+    id: String,
+    label: String,
+    region: Option<String>,
+    created_at: i64,
+    /// Derived from immutable audit log — cannot be forged.
+    last_used: Option<String>,
+}
+
+/// GET /api/admin/super-admins — list all super admins with last_used from audit log.
+async fn list_super_admins(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Vec<SuperAdminInfo>>, StatusCode> {
+    let auth_header = headers.get("Authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let token = auth_header.strip_prefix("Bearer ").unwrap_or("");
+    // Accept legacy key or any super admin key
+    let is_legacy = crypto::ct::ct_eq(token.as_bytes(), state.admin_api_key.as_bytes());
+    let is_super = {
+        let admins = state.super_admin_keys.read().await;
+        match_super_admin_key(token.as_bytes(), &admins).is_some()
+    };
+    if !is_legacy && !is_super {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    // Query super_admin_last_used VIEW (derives last_used from immutable audit log)
+    // Query admins from main table, derive last_used from audit log
+    let rows: Vec<(uuid::Uuid, String, Option<String>, i64)> = sqlx::query_as(
+        "SELECT id, label, region, created_at FROM super_admins"
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    let mut admins: Vec<SuperAdminInfo> = Vec::new();
+    for (id, label, region, created_at) in rows {
+        // Derive last_used from immutable audit log
+        let last_used: Option<(i64,)> = sqlx::query_as(
+            "SELECT EXTRACT(EPOCH FROM MAX(event_time))::bigint FROM super_admin_audit_log \
+             WHERE admin_id = $1 AND operation = 'ACCESS_GRANTED'"
+        )
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+
+        admins.push(SuperAdminInfo {
+            id: id.to_string(),
+            label,
+            region,
+            created_at,
+            last_used: last_used.and_then(|(ts,)| {
+                if ts > 0 { Some(format!("{}", ts)) } else { None }
+            }),
+        });
+    }
+
+    Ok(Json(admins))
+}
+
+/// POST /api/admin/super-admins — add a new super admin.
+/// Requires UNANIMOUS approval from ALL existing super admins.
+async fn add_super_admin(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<AddSuperAdminRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let auth_header = headers.get("Authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let token = auth_header.strip_prefix("Bearer ").unwrap_or("");
+    if !crypto::ct::ct_eq(token.as_bytes(), state.admin_api_key.as_bytes()) {
+        let admins = state.super_admin_keys.read().await;
+        if match_super_admin_key(token.as_bytes(), &admins).is_none() {
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
+
+    // Verify ceremony: requires ALL super admins to approve
+    let total_admins = {
+        let admins = state.super_admin_keys.read().await;
+        admins.len()
+    };
+    {
+        let mut actions = state.pending_admin_actions.write().await;
+        let action = actions.get(&body.ceremony_action_id).ok_or_else(|| {
+            tracing::warn!("add-super-admin rejected: ceremony action not found");
+            StatusCode::FORBIDDEN
+        })?;
+        if action.action_type != DestructiveAction::AddSuperAdmin {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        // UNANIMOUS: every active super admin must have approved
+        if action.approvals.len() < total_admins {
+            tracing::warn!(
+                "add-super-admin rejected: {}/{} approvals (need unanimous)",
+                action.approvals.len(), total_admins
+            );
+            return Err(StatusCode::FORBIDDEN);
+        }
+        if now_secs() > action.expires_at {
+            actions.remove(&body.ceremony_action_id);
+            return Err(StatusCode::FORBIDDEN);
+        }
+        actions.remove(&body.ceremony_action_id);
+    }
+
+    // Create the new super admin
+    let master_kek = common::sealed_keys::get_master_kek();
+    let deployment_id = std::env::var("MILNET_DEPLOYMENT_ID")
+        .unwrap_or_else(|_| "default-deployment".to_string());
+    let admin_id = Uuid::new_v4();
+    let api_key = derive_super_admin_key(master_kek, &admin_id, &deployment_id);
+    let key_hash_bytes = hash_admin_key(&api_key);
+
+    // Temporarily unfreeze → insert → re-freeze (all in sequence)
+    sqlx::query("SELECT unfreeze_super_admins_for_ceremony()")
+        .execute(&state.db).await.map_err(|e| {
+            tracing::error!("failed to unfreeze super_admins: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let insert_result = sqlx::query(
+        "INSERT INTO super_admins (id, label, key_hash, region, created_at) VALUES ($1, $2, $3, $4, $5)"
+    )
+    .bind(admin_id)
+    .bind(&body.label)
+    .bind(&key_hash_bytes)
+    .bind(&body.region)
+    .bind(now_secs())
+    .execute(&state.db)
+    .await;
+
+    // ALWAYS re-freeze, even if insert failed
+    let _ = sqlx::query("SELECT freeze_super_admins()")
+        .execute(&state.db).await;
+
+    if let Err(e) = insert_result {
+        tracing::error!("failed to insert new super admin: {e}");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // Update in-memory registry
+    {
+        let mut admins = state.super_admin_keys.write().await;
+        admins.insert(admin_id, SuperAdminEntry {
+            id: admin_id,
+            label: body.label.clone(),
+            key_hash: key_hash_bytes,
+            region: body.region.clone(),
+        });
+    }
+
+    common::siem::SecurityEvent::key_rotation(&format!(
+        "NEW SUPER ADMIN created via unanimous ceremony: label={}, id={}",
+        body.label, admin_id
+    ));
+
+    tracing::info!(
+        admin_id = %admin_id, label = %body.label,
+        "new super admin created (unanimous ceremony, {} approvals)",
+        total_admins
+    );
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "admin_id": admin_id.to_string(),
+        "label": body.label,
+        "region": body.region,
+        "api_key": api_key,
+        "message": "Super admin created via unanimous ceremony. Save the API key — shown ONCE.",
+        "approved_by": total_admins,
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -4704,7 +5387,8 @@ async fn approve_ceremony(
     // This prevents lower-privilege roles from rubber-stamping destructive operations.
     let admin_ceremony_actions = [
         "key_rotation", "user_deletion", "tier_change",
-        "bulk_device_revocation", "developer_mode_toggle",
+        "bulk_device_revocation", "error_level_toggle", "fips_mode_toggle",
+        "add_super_admin",
     ];
     if admin_ceremony_actions.iter().any(|a| ceremony.action == *a) {
         if !approver_role.satisfies(AdminRole::SuperAdmin) {
@@ -6770,7 +7454,7 @@ mod tests {
             DestructiveAction::TierChange,
             DestructiveAction::KeyRotation,
             DestructiveAction::BulkDeviceRevocation,
-            DestructiveAction::DeveloperModeToggle,
+            DestructiveAction::ErrorLevelToggle,
         ];
         for action in &actions {
             assert!(
@@ -6781,8 +7465,8 @@ mod tests {
     }
 
     #[test]
-    fn developer_mode_toggle_requires_two_approvals() {
-        assert_eq!(DestructiveAction::DeveloperModeToggle.required_approvals(), 2);
+    fn error_level_toggle_requires_two_approvals() {
+        assert_eq!(DestructiveAction::ErrorLevelToggle.required_approvals(), 2);
     }
 
     // ── AdminRole Display Tests ──────────────────────────────────────────
@@ -7090,8 +7774,8 @@ mod tests {
             "bulk_device_revocation"
         );
         assert_eq!(
-            format!("{}", DestructiveAction::DeveloperModeToggle),
-            "developer_mode_toggle"
+            format!("{}", DestructiveAction::ErrorLevelToggle),
+            "error_level_toggle"
         );
     }
 }

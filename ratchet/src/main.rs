@@ -186,18 +186,12 @@ fn verify_mlock_available() {
         }
         tracing::info!("mlock availability verified");
     } else {
-        if common::sealed_keys::is_production() {
-            tracing::error!(
-                "FATAL: mlock not available in production mode. \
-                 Ratchet chain keys require memory locking. \
-                 Ensure RLIMIT_MEMLOCK is sufficient."
-            );
-            std::process::exit(1);
-        }
-        tracing::warn!(
-            "mlock not available — chain keys may be swappable to disk. \
-             This is acceptable in development but FATAL in production."
+        tracing::error!(
+            "FATAL: mlock not available. \
+             Ratchet chain keys require memory locking. \
+             Ensure RLIMIT_MEMLOCK is sufficient."
         );
+        std::process::exit(1);
     }
 }
 

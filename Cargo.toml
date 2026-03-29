@@ -20,8 +20,10 @@ members = [
 ]
 
 [workspace.package]
-# Production builds: cargo build --release --features production
-# This enables compile-time security enforcement across all crates.
+# There is only ONE mode: production. is_production() always returns true.
+# The 'production' Cargo feature is kept for backwards compatibility but
+# is no longer required — production behavior is always active.
+# Build: cargo build --release
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"

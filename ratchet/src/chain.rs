@@ -303,15 +303,10 @@ impl RatchetChain {
             self.key_locked = true;
             madv_dontdump(ptr, len);
         } else {
-            if common::sealed_keys::is_production() {
-                return Err(RatchetError::MlockFailed(
-                    "mlock failed for RatchetChain chain_key in production mode. \
-                     Ensure RLIMIT_MEMLOCK is sufficient.".into(),
-                ));
-            }
-            tracing::warn!(
-                "mlock failed for RatchetChain chain_key — data may be swappable to disk"
-            );
+            return Err(RatchetError::MlockFailed(
+                "mlock failed for RatchetChain chain_key. \
+                 Ensure RLIMIT_MEMLOCK is sufficient.".into(),
+            ));
         }
         Ok(())
     }
