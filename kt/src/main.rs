@@ -176,7 +176,7 @@ fn load_or_generate_keypair(
 
     // Write encoded verifying key for external verification
     let encoded = verifying_key.encode();
-    if let Err(e) = std::fs::write(vk_path, encoded.as_ref()) {
+    if let Err(e) = std::fs::write(vk_path, AsRef::<[u8]>::as_ref(&encoded)) {
         tracing::warn!("Failed to write KT verifying key to {:?}: {}", vk_path, e);
     }
 
