@@ -479,7 +479,7 @@ fn test_totp_login_timing() {
 
     // Generate secret
     let secret_start = Instant::now();
-    let secret = totp::generate_secret();
+    let secret = totp::generate_secret().unwrap();
     let secret_ms = secret_start.elapsed().as_secs_f64() * 1000.0;
     println!("TOTP secret generation: {secret_ms:.4}ms");
 
