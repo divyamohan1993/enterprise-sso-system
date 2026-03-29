@@ -577,7 +577,7 @@ spec:
                 name: milnet-common-config
           env:
             - name: ADMIN_BIND_ADDR
-              value: "0.0.0.0:8080"
+              value: "0.0.0.0"
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
