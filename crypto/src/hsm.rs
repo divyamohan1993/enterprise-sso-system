@@ -2847,6 +2847,11 @@ pub fn create_hsm_backend() -> Box<dyn HsmKeyOps> {
                 );
             }
             eprintln!("WARNING: MILNET_DEV_MODE=1 — using software HSM backend (not for production)");
+            let mut config = HsmConfig::from_env();
+            config.backend = HsmBackend::Software;
+            let manager = HsmKeyManager::new(config)
+                .unwrap_or_else(|e| panic!("Failed to init software HSM: {e}"));
+            Box::new(manager)
         }
     }
 }
