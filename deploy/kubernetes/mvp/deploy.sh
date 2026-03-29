@@ -107,9 +107,18 @@ generate_secrets() {
     log "Generating MVP secrets..."
 
     local DB_PASSWORD="milnet-mvp-db"
-    local DB_URL="postgresql://milnet:${DB_PASSWORD}@postgres.milnet.svc.cluster.local:5432/milnet"
+    local DB_URL="postgresql://milnet:${DB_PASSWORD}@postgres.milnet.svc.cluster.local:5432/milnet?sslmode=disable"
     local MASTER_KEK
     MASTER_KEK=$(openssl rand -hex 32)
+
+    # Generate self-signed TLS cert for gateway
+    local TLS_DIR="/tmp/milnet-tls"
+    mkdir -p "$TLS_DIR"
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+        -keyout "$TLS_DIR/tls.key" -out "$TLS_DIR/tls.crt" \
+        -days 365 -nodes -subj "/CN=milnet-gateway" \
+        -addext "subjectAltName=DNS:gateway,DNS:gateway.milnet.svc.cluster.local,IP:0.0.0.0" 2>/dev/null
+    log "Self-signed TLS cert generated"
 
     sudo k3s kubectl apply -f - <<EOF
 apiVersion: v1
@@ -131,6 +140,13 @@ type: Opaque
 stringData:
   MILNET_MASTER_KEK: "${MASTER_KEK}"
 EOF
+
+    # Create TLS secret from generated cert
+    sudo k3s kubectl create secret tls milnet-tls-certs \
+        --cert="$TLS_DIR/tls.crt" --key="$TLS_DIR/tls.key" \
+        --namespace=milnet --dry-run=client -o yaml | sudo k3s kubectl apply -f -
+    rm -rf "$TLS_DIR"
+
     log "Secrets created (DB password: ${DB_PASSWORD})"
 }
 

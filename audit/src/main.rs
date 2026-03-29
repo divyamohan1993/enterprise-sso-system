@@ -192,7 +192,9 @@ async fn main() {
         });
     }
 
-    let addr = std::env::var("AUDIT_ADDR").unwrap_or_else(|_| "127.0.0.1:9108".to_string());
+    let addr = std::env::var("MILNET_AUDIT_LISTEN_ADDR")
+        .or_else(|_| std::env::var("AUDIT_ADDR"))
+        .unwrap_or_else(|_| "127.0.0.1:9108".to_string());
     let hmac_key = crypto::entropy::generate_key_64();
     let (listener, _ca, _cert_key) =
         shard::tls_transport::tls_bind(&addr, common::types::ModuleId::Audit, hmac_key, "audit")

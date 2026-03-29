@@ -136,7 +136,9 @@ async fn main() {
     }
 
     // 5. Bind SHARD TLS listener
-    let addr = std::env::var("VERIFIER_ADDR").unwrap_or_else(|_| "127.0.0.1:9104".to_string());
+    let addr = std::env::var("MILNET_VERIFIER_LISTEN_ADDR")
+        .or_else(|_| std::env::var("VERIFIER_ADDR"))
+        .unwrap_or_else(|_| "127.0.0.1:9104".to_string());
     // Load HMAC key from sealed storage (derived from master KEK via HKDF).
     // Previously this was crypto::entropy::generate_key_64() which generated a RANDOM
     // key at every startup, making cross-service HMAC verification impossible.

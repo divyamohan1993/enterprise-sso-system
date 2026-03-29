@@ -957,14 +957,29 @@ pub async fn require_cluster(
             match ClusterNode::start(config).await {
                 Ok(node) => Some(std::sync::Arc::new(node)),
                 Err(e) => {
-                    panic!("FATAL: cluster start failed: {e}. \
-                           Set MILNET_CLUSTER_PEERS for distributed operation.");
+                    if std::env::var("MILNET_DEV_MODE").unwrap_or_default() == "1" {
+                        tracing::warn!(
+                            "MILNET_DEV_MODE=1: cluster start failed ({e}), continuing in standalone mode"
+                        );
+                        None
+                    } else {
+                        panic!("FATAL: cluster start failed: {e}. \
+                               Set MILNET_CLUSTER_PEERS for distributed operation.");
+                    }
                 }
             }
         }
         Err(e) => {
-            panic!("FATAL: no cluster config: {e}. \
-                   Set MILNET_CLUSTER_PEERS for distributed operation.");
+            if std::env::var("MILNET_DEV_MODE").unwrap_or_default() == "1" {
+                tracing::warn!(
+                    "MILNET_DEV_MODE=1: allowing standalone mode (no cluster peers). \
+                     Error was: {e}"
+                );
+                None
+            } else {
+                panic!("FATAL: no cluster config: {e}. \
+                       Set MILNET_CLUSTER_PEERS for distributed operation.");
+            }
         }
     }
 }

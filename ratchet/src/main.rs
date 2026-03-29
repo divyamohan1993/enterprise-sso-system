@@ -101,13 +101,28 @@ async fn main() {
             .expect("Failed to connect to PostgreSQL for ratchet HA persistence");
 
         // Load KEK from environment (in production, from HSM / sealed storage)
-        let kek_hex = std::env::var("RATCHET_KEK")
-            .expect("RATCHET_KEK must be set in distributed HA mode (64 hex chars = 32 bytes)");
-        let kek_bytes = hex::decode(&kek_hex)
-            .expect("RATCHET_KEK must be valid hex");
-        assert_eq!(kek_bytes.len(), 32, "RATCHET_KEK must be exactly 32 bytes (64 hex chars)");
-        let mut kek = [0u8; 32];
-        kek.copy_from_slice(&kek_bytes);
+        let kek = if let Ok(kek_hex) = std::env::var("RATCHET_KEK") {
+            let kek_bytes = hex::decode(&kek_hex)
+                .expect("RATCHET_KEK must be valid hex");
+            assert_eq!(kek_bytes.len(), 32, "RATCHET_KEK must be exactly 32 bytes (64 hex chars)");
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&kek_bytes);
+            k
+        } else if std::env::var("MILNET_DEV_MODE").unwrap_or_default() == "1" {
+            tracing::warn!(
+                "MILNET_DEV_MODE=1: RATCHET_KEK not set, deriving from MILNET_MASTER_KEK"
+            );
+            let master = common::sealed_keys::cached_master_kek();
+            use hkdf::Hkdf;
+            use sha2::Sha512;
+            let hk = Hkdf::<Sha512>::new(Some(b"MILNET-DEV-KEY-v1"), master.as_slice());
+            let mut okm = [0u8; 32];
+            hk.expand(b"ratchet-kek", &mut okm)
+                .expect("HKDF-SHA512 32-byte derivation failed");
+            okm
+        } else {
+            panic!("RATCHET_KEK must be set in distributed HA mode (64 hex chars = 32 bytes)");
+        };
 
         // Initialize with startup recovery (loads all sessions from DB)
         let mgr = ratchet::manager::PersistentSessionManager::new(pool, kek)
@@ -130,7 +145,9 @@ async fn main() {
         standalone_manager = Some(Arc::new(RwLock::new(ratchet::manager::SessionManager::new())));
     }
 
-    let addr = std::env::var("RATCHET_ADDR").unwrap_or_else(|_| "127.0.0.1:9105".to_string());
+    let addr = std::env::var("MILNET_RATCHET_LISTEN_ADDR")
+        .or_else(|_| std::env::var("RATCHET_ADDR"))
+        .unwrap_or_else(|_| "127.0.0.1:9105".to_string());
     let hmac_key = crypto::entropy::generate_key_64();
     let (listener, _ca, _cert_key) =
         shard::tls_transport::tls_bind(&addr, common::types::ModuleId::Ratchet, hmac_key, "ratchet")

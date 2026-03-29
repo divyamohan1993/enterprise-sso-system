@@ -67,7 +67,9 @@ async fn main() {
     let engine = Arc::new(RwLock::new(risk::scoring::RiskEngine::new()));
     let registry = Arc::new(RwLock::new(risk::tiers::DeviceRegistry::new()));
 
-    let addr = std::env::var("RISK_ADDR").unwrap_or_else(|_| "127.0.0.1:9106".to_string());
+    let addr = std::env::var("MILNET_RISK_LISTEN_ADDR")
+        .or_else(|_| std::env::var("RISK_ADDR"))
+        .unwrap_or_else(|_| "127.0.0.1:9106".to_string());
     let hmac_key = crypto::entropy::generate_key_64();
     let (listener, _ca, _cert_key) =
         shard::tls_transport::tls_bind(&addr, common::types::ModuleId::Risk, hmac_key, "risk")

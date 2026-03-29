@@ -33,6 +33,10 @@ spec:
           env:
             - name: GATEWAY_BIND_ADDR
               value: "0.0.0.0:9100"
+            - name: MILNET_GATEWAY_CERT_PATH
+              value: "/etc/milnet/tls/tls.crt"
+            - name: MILNET_GATEWAY_KEY_PATH
+              value: "/etc/milnet/tls/tls.key"
             - name: MILNET_ORCHESTRATOR_ENDPOINTS
               value: "orchestrator.milnet.svc.cluster.local:9101"
             - name: MILNET_MASTER_KEK
@@ -50,9 +54,15 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            - name: tls-certs
+              mountPath: /etc/milnet/tls
+              readOnly: true
       volumes:
         - name: tmp
           emptyDir: {}
+        - name: tls-certs
+          secret:
+            secretName: milnet-tls-certs
 ---
 # ── Orchestrator ─────────────────────────────────────────────────────────────
 apiVersion: apps/v1
@@ -192,6 +202,8 @@ spec:
           env:
             - name: MILNET_TSS_ROLE
               value: "signer"
+            - name: MILNET_TSS_SIGNER_ADDR
+              value: "0.0.0.0:9110"
             - name: MILNET_MASTER_KEK
               valueFrom:
                 secretKeyRef:

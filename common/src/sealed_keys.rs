@@ -445,7 +445,7 @@ fn load_key_hardened(var: &str, purpose: &str, _dev_seed: &[u8]) -> [u8; 64] {
     // 3. Dev mode fallback: derive 64-byte key from master KEK + purpose
     if std::env::var("MILNET_DEV_MODE").unwrap_or_default() == "1" {
         eprintln!("WARNING: MILNET_DEV_MODE=1 — deriving {var} from master KEK (not for production)");
-        let master = load_master_kek();
+        let master = *cached_master_kek();
         use hkdf::Hkdf;
         use sha2::Sha512;
         let hk = Hkdf::<Sha512>::new(Some(b"MILNET-DEV-KEY-v1"), &master);

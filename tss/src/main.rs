@@ -199,7 +199,9 @@ async fn run_coordinator_role() {
     let receipt_signing_key = common::shared_keys::load_receipt_signing_key();
 
     // Coordinator listener (accepts signing requests from the Orchestrator)
-    let addr = std::env::var("TSS_ADDR").unwrap_or_else(|_| "127.0.0.1:9103".to_string());
+    let addr = std::env::var("MILNET_TSS_LISTEN_ADDR")
+        .or_else(|_| std::env::var("TSS_ADDR"))
+        .unwrap_or_else(|_| "127.0.0.1:9103".to_string());
     let coord_hmac_key = crypto::entropy::generate_key_64();
     let (listener, _ca, _cert_key) =
         shard::tls_transport::tls_bind(&addr, common::types::ModuleId::Tss, coord_hmac_key, "tss")
