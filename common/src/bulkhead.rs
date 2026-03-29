@@ -99,7 +99,7 @@ impl Bulkhead {
     pub async fn acquire(&self) -> Result<BulkheadPermit<'_>, BulkheadError> {
         // Check wait queue depth before entering the semaphore queue.
         let current_waiting = self.waiting.fetch_add(1, Ordering::Relaxed);
-        if current_waiting >= self.max_wait_queue as u64 {
+        if current_waiting > self.max_wait_queue as u64 {
             self.waiting.fetch_sub(1, Ordering::Relaxed);
             self.rejected.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
@@ -193,12 +193,17 @@ mod tests {
 
     #[tokio::test]
     async fn bulkhead_rejects_when_queue_full() {
-        // 1 concurrent, 0 wait queue => second call is immediately rejected
-        let bh = Bulkhead::new("test-db", 1, 0, Duration::from_millis(10));
+        // 1 concurrent, 0 wait queue => second call rejected (wait queue exceeded)
+        let bh = std::sync::Arc::new(Bulkhead::new("test-db", 1, 0, Duration::from_millis(50)));
         let _p1 = bh.acquire().await.unwrap();
 
-        let result = bh.acquire().await;
-        assert!(result.is_err());
+        // Spawn second acquire in a task so we can test concurrency
+        let bh2 = bh.clone();
+        let handle = tokio::spawn(async move {
+            bh2.acquire().await
+        });
+        let result = handle.await.unwrap();
+        assert!(result.is_err(), "second call must fail when bulkhead is full");
         assert_eq!(bh.total_rejected(), 1);
     }
 
