@@ -413,70 +413,51 @@ fn test_enclave_channel_symmetric_key_derivation() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Envelope Encryption Key Hierarchy Tests
+// Symmetric Encryption Tests (AAD binding prevents column/row swap attacks)
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn test_envelope_encrypt_decrypt_roundtrip() {
-    let result = crypto::envelope::encrypt_field(
-        b"sensitive-military-data",
-        &[0x42u8; 32], // KEK
-        "users:username",
-        "row-123",
-    );
-    assert!(result.is_ok(), "envelope encryption must succeed");
+fn test_symmetric_encrypt_decrypt_roundtrip() {
+    let key = [0x42u8; 32];
+    let aad = b"MILNET-AAD-v1:users:username:row-123";
+    let ct = crypto::symmetric::encrypt(&key, b"sensitive-military-data", aad)
+        .expect("encryption must succeed");
 
-    let ciphertext = result.unwrap();
-    assert_ne!(
-        ciphertext.as_slice(),
-        b"sensitive-military-data",
-        "ciphertext must differ from plaintext"
-    );
+    assert_ne!(ct.as_slice(), b"sensitive-military-data", "ciphertext must differ from plaintext");
 
-    let plaintext = crypto::envelope::decrypt_field(
-        &ciphertext,
-        &[0x42u8; 32],
-        "users:username",
-        "row-123",
-    );
-    assert!(plaintext.is_ok(), "decryption must succeed");
-    assert_eq!(plaintext.unwrap(), b"sensitive-military-data");
+    let pt = crypto::symmetric::decrypt(&key, &ct, aad)
+        .expect("decryption must succeed");
+    assert_eq!(pt, b"sensitive-military-data");
 }
 
 #[test]
-fn test_envelope_wrong_kek_fails() {
-    let ct = crypto::envelope::encrypt_field(
-        b"secret", &[0x01u8; 32], "ctx", "row",
+fn test_symmetric_wrong_key_fails() {
+    let ct = crypto::symmetric::encrypt(
+        &[0x01u8; 32], b"secret", b"aad",
     ).unwrap();
 
-    let result = crypto::envelope::decrypt_field(
-        &ct, &[0x02u8; 32], "ctx", "row",
-    );
-    assert!(result.is_err(), "wrong KEK must fail decryption");
+    let result = crypto::symmetric::decrypt(&[0x02u8; 32], &ct, b"aad");
+    assert!(result.is_err(), "wrong key must fail decryption");
 }
 
 #[test]
-fn test_envelope_wrong_aad_fails() {
-    let ct = crypto::envelope::encrypt_field(
-        b"secret", &[0x01u8; 32], "users:email", "row-1",
-    ).unwrap();
+fn test_symmetric_wrong_aad_fails() {
+    let key = [0x01u8; 32];
+    let ct = crypto::symmetric::encrypt(&key, b"secret", b"users:email:row-1")
+        .unwrap();
 
-    // Try decrypting with different AAD context (column swap attack)
-    let result = crypto::envelope::decrypt_field(
-        &ct, &[0x01u8; 32], "users:username", "row-1",
-    );
-    assert!(result.is_err(), "wrong AAD context must fail (column swap attack)");
+    // Column swap attack: try decrypting with different AAD
+    let result = crypto::symmetric::decrypt(&key, &ct, b"users:username:row-1");
+    assert!(result.is_err(), "wrong AAD must fail (column swap attack)");
 }
 
 #[test]
-fn test_envelope_wrong_row_id_fails() {
-    let ct = crypto::envelope::encrypt_field(
-        b"secret", &[0x01u8; 32], "users:email", "row-1",
-    ).unwrap();
+fn test_symmetric_aad_row_binding() {
+    let key = [0x01u8; 32];
+    let ct = crypto::symmetric::encrypt(&key, b"secret", b"users:email:row-1")
+        .unwrap();
 
-    // Try decrypting with different row ID (row swap attack)
-    let result = crypto::envelope::decrypt_field(
-        &ct, &[0x01u8; 32], "users:email", "row-2",
-    );
-    assert!(result.is_err(), "wrong row ID must fail (row swap attack)");
+    // Row swap attack: try decrypting with different row ID in AAD
+    let result = crypto::symmetric::decrypt(&key, &ct, b"users:email:row-2");
+    assert!(result.is_err(), "wrong row in AAD must fail (row swap attack)");
 }
