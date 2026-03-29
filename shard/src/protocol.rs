@@ -440,6 +440,40 @@ impl ShardProtocol {
         self.last_persisted_epoch = self.send_sequence;
     }
 
+    /// Load persisted sequences from disk if available, ignoring errors in dev mode.
+    ///
+    /// In production mode, a tampered sequence file causes a panic (fail-closed).
+    /// In dev mode, errors are logged as warnings and the service continues
+    /// with fresh sequences.
+    pub fn load_persisted_sequences(&mut self, service_name: &str, hmac_key: &[u8; 64]) {
+        let path = format!("/var/lib/milnet/{}_shard_sequences.dat", service_name);
+        let path = std::path::Path::new(&path);
+        if !path.exists() {
+            tracing::info!("no persisted SHARD sequences at {:?} (first start)", path);
+            return;
+        }
+        match self.import_sequences_authenticated(path, hmac_key) {
+            Ok(()) => tracing::info!("loaded persisted SHARD sequences from {:?}", path),
+            Err(e) => {
+                if common::sealed_keys::is_production() {
+                    panic!("FATAL: SHARD sequence file tampered or unreadable: {e}");
+                }
+                tracing::warn!("failed to load SHARD sequences (dev mode, ignoring): {e}");
+            }
+        }
+    }
+
+    /// Persist current sequences to disk with HMAC authentication.
+    ///
+    /// Uses atomic write (write to tmp + rename) to prevent partial writes.
+    /// Returns `Ok(())` on success, or an error description on failure.
+    pub fn save_sequences(&mut self, service_name: &str, hmac_key: &[u8; 64]) -> Result<(), String> {
+        let path = format!("/var/lib/milnet/{}_shard_sequences.dat", service_name);
+        let path = std::path::Path::new(&path);
+        self.export_sequences_authenticated(path, hmac_key)
+            .map_err(|e| format!("failed to persist SHARD sequences: {e}"))
+    }
+
     /// Connect to a remote SHARD peer over TLS using the unified transport.
     ///
     /// Returns a [`crate::transport::ShardTransport`] with mTLS active.
@@ -685,6 +719,15 @@ impl Drop for SequencePersistence {
         if let Err(e) = Self::persist_to_disk(&self.protocol, &self.data_dir) {
             tracing::warn!("SHARD: drop persistence failed: {}", e);
         }
+    }
+}
+
+impl Drop for ShardProtocol {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.shared_secret.zeroize();
+        self.hmac_key.zeroize();
+        self.enc_key.zeroize();
     }
 }
 

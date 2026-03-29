@@ -16,3 +16,6 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 hex.workspace = true
+
+[features]
+production = ["common/production"]

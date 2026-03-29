@@ -9,6 +9,7 @@ default = ["hbs", "fips-kat"]
 hbs = []
 fips-kat = []
 pkcs11-hw = ["dep:cryptoki"]
+production = ["common/production"]
 
 [dependencies]
 common = { path = "../common" }

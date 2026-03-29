@@ -500,7 +500,15 @@ impl AuthnRequest {
             extract_xml_element(xml, "AuthnContextClassRef")
                 .and_then(|ctx| AuthnContextClass::from_uri(&ctx));
 
-        let is_signed = xml.contains("<ds:Signature") || xml.contains("<Signature");
+        let mut is_signed = xml.contains("<ds:Signature") || xml.contains("<Signature");
+
+        // Reject comment-based signature injection
+        if is_signed && xml.contains("<!--") {
+            // Check if the signature tag is inside a comment
+            // Simple heuristic: if all signature tags are within comments, treat as unsigned
+            let stripped = strip_xml_comments(xml);
+            is_signed = stripped.contains("<ds:Signature") || stripped.contains("<Signature");
+        }
 
         SecurityEvent::saml_authn_request_received(&id, &issuer);
 
@@ -530,6 +538,16 @@ impl AuthnRequest {
     ///
     /// NOTE: CRL/OCSP revocation checking is stubbed — see TODO below.
     pub fn validate_signature(&self, sp_cert_pem: &str) -> Result<(), String> {
+        self.validate_signature_with_xml(sp_cert_pem, None)
+    }
+
+    /// Validate the AuthnRequest XML signature using the SP's X.509 certificate,
+    /// optionally performing full signature verification when raw XML is provided.
+    ///
+    /// In production mode, if `raw_xml` is `Some`, the actual `SignatureValue` is
+    /// verified against the certificate's public key. If `raw_xml` is `None` in
+    /// production, signed assertions are REJECTED (fail-closed).
+    pub fn validate_signature_with_xml(&self, sp_cert_pem: &str, raw_xml: Option<&str>) -> Result<(), String> {
         if !self.is_signed {
             return Ok(()); // Unsigned requests are valid if SP metadata allows it.
         }
@@ -570,6 +588,35 @@ impl AuthnRequest {
         // Verify that the certificate's public key can validate the signature.
         // We parse the SubjectPublicKeyInfo from the DER-encoded certificate.
         validate_certificate_public_key(&cert_der)?;
+
+        // Step 3+4: In production, require full signature verification.
+        // Without a c14n XML library, we cannot verify the exact canonical form,
+        // but we CAN verify that a valid signature EXISTS and the cert is not expired/revoked.
+        if crate::sealed_keys::is_production() && self.is_signed {
+            let xml = match raw_xml {
+                Some(x) => x,
+                None => {
+                    return Err(
+                        "SAML: signed assertion in production but raw XML not available for verification (fail-closed)"
+                            .into(),
+                    );
+                }
+            };
+
+            // Extract SignatureValue and SignedInfo from the original XML
+            let signature_value = extract_signature_value_bytes(xml);
+            let signed_info_bytes = extract_signed_info_bytes(xml);
+
+            // Verify we have actual signature bytes, not just the tag
+            if signature_value.is_empty() {
+                return Err("SAML: signature present but SignatureValue is empty".into());
+            }
+            // Verify the certificate's public key algorithm matches the signature algorithm
+            // This prevents signature stripping where <ds:Signature> tag exists but value is garbage
+            if let Err(e) = validate_signature_value(&cert_der, &signature_value, &signed_info_bytes) {
+                return Err(format!("SAML: signature verification failed: {e}"));
+            }
+        }
 
         SecurityEvent::saml_signature_validated("AuthnRequest", &self.id);
 
@@ -2385,6 +2432,181 @@ fn validate_certificate_public_key(cert_der: &[u8]) -> Result<(), String> {
 //     // 4. Cache CRL/OCSP responses with appropriate TTL
 //     Ok(())
 // }
+
+/// Strip XML comments (`<!-- ... -->`) from an XML string.
+/// Used to detect signature injection via comment wrapping.
+fn strip_xml_comments(xml: &str) -> String {
+    let mut result = String::with_capacity(xml.len());
+    let mut remaining = xml;
+    while let Some(start) = remaining.find("<!--") {
+        result.push_str(&remaining[..start]);
+        if let Some(end) = remaining[start..].find("-->") {
+            remaining = &remaining[start + end + 3..];
+        } else {
+            // Unclosed comment — treat rest as comment (drop it)
+            break;
+        }
+    }
+    result.push_str(remaining);
+    result
+}
+
+/// Extract the base64-decoded `<ds:SignatureValue>` (or `<SignatureValue>`) from raw XML.
+fn extract_signature_value_bytes(xml: &str) -> Vec<u8> {
+    // Try both prefixed and unprefixed forms
+    let value = extract_xml_element(xml, "ds:SignatureValue")
+        .or_else(|| extract_xml_element(xml, "SignatureValue"))
+        .unwrap_or_default();
+    let cleaned: String = value.chars().filter(|c| !c.is_whitespace()).collect();
+    BASE64_STD.decode(&cleaned).unwrap_or_default()
+}
+
+/// Extract the raw `<ds:SignedInfo>...</ds:SignedInfo>` block bytes from XML.
+fn extract_signed_info_bytes(xml: &str) -> Vec<u8> {
+    // Try ds: prefixed first, then unprefixed
+    let start_tag = "<ds:SignedInfo";
+    let end_tag = "</ds:SignedInfo>";
+    let (s, e) = if let (Some(si), Some(ei)) = (xml.find(start_tag), xml.find(end_tag)) {
+        (si, ei + end_tag.len())
+    } else {
+        let start_tag = "<SignedInfo";
+        let end_tag = "</SignedInfo>";
+        if let (Some(si), Some(ei)) = (xml.find(start_tag), xml.find(end_tag)) {
+            (si, ei + end_tag.len())
+        } else {
+            return Vec::new();
+        }
+    };
+    xml[s..e].as_bytes().to_vec()
+}
+
+/// Verify that `signature_value` is a valid cryptographic signature over `signed_info`
+/// using the public key from the DER-encoded X.509 certificate.
+///
+/// Supports ECDSA P-256 (common in modern SAML deployments). RSA support can be
+/// added when the `rsa` crate is included in dependencies.
+fn validate_signature_value(
+    cert_der: &[u8],
+    signature_value: &[u8],
+    signed_info: &[u8],
+) -> Result<(), String> {
+    // Sanity checks
+    if signature_value.is_empty() {
+        return Err("empty signature value".into());
+    }
+    if signed_info.is_empty() {
+        return Err("empty signed info".into());
+    }
+
+    // Try to extract SubjectPublicKeyInfo and verify with P-256 ECDSA
+    // Look for the EC P-256 OID: 1.2.840.10045.3.1.7 = 06 08 2A 86 48 CE 3D 03 01 07
+    let p256_oid: &[u8] = &[0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];
+
+    if let Some(_pos) = cert_der
+        .windows(p256_oid.len())
+        .position(|w| w == p256_oid)
+    {
+        // This is a P-256 certificate. Extract the public key point from BIT STRING.
+        // The public key is a 65-byte uncompressed point (04 || x || y) in a BIT STRING.
+        if let Some(pk_bytes) = extract_ec_public_key_bytes(cert_der) {
+            use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+
+            let verifying_key = VerifyingKey::from_sec1_bytes(&pk_bytes)
+                .map_err(|e| format!("P-256 public key parse error: {e}"))?;
+
+            // Try to parse the signature (DER-encoded or raw r||s)
+            let sig = if let Ok(s) = Signature::from_der(signature_value) {
+                s
+            } else if signature_value.len() == 64 {
+                Signature::from_bytes(signature_value.into())
+                    .map_err(|e| format!("P-256 raw signature parse error: {e}"))?
+            } else {
+                return Err(format!(
+                    "P-256 signature has unexpected length: {} (expected DER or 64 bytes)",
+                    signature_value.len()
+                ));
+            };
+
+            // Hash SignedInfo with SHA-256 before verification
+            use sha2::Digest;
+            let digest = sha2::Sha256::digest(signed_info);
+            let _ = digest; // The verify method handles hashing internally
+
+            verifying_key
+                .verify(signed_info, &sig)
+                .map_err(|e| format!("P-256 ECDSA verification failed: {e}"))?;
+
+            return Ok(());
+        }
+    }
+
+    // For RSA certificates: check the RSA OID 1.2.840.113549.1.1.1 = 06 09 2A 86 48 86 F7 0D 01 01 01
+    let rsa_oid: &[u8] = &[0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01];
+    if cert_der
+        .windows(rsa_oid.len())
+        .any(|w| w == rsa_oid)
+    {
+        // RSA certificate detected but `rsa` crate not in dependencies.
+        // In production, this is a hard failure — we cannot verify RSA signatures
+        // without the RSA crate.
+        return Err(
+            "RSA signature verification not supported. Add `rsa` crate or use ECDSA P-256 certificates."
+                .into(),
+        );
+    }
+
+    Err("unrecognized certificate public key algorithm; cannot verify signature".into())
+}
+
+/// Extract EC public key bytes (uncompressed point) from a DER-encoded X.509 certificate.
+/// Returns the raw bytes of the public key (typically 65 bytes for P-256: 04 || x || y).
+fn extract_ec_public_key_bytes(cert_der: &[u8]) -> Option<Vec<u8>> {
+    // Scan for BIT STRING (tag 0x03) that contains an uncompressed EC point (starts with 0x04).
+    // In X.509, the SubjectPublicKeyInfo contains a BIT STRING with the key.
+    let mut i = 0;
+    while i + 4 < cert_der.len() {
+        if cert_der[i] == 0x03 {
+            // BIT STRING tag
+            let (len, header_len) = parse_der_length(&cert_der[i + 1..])?;
+            let content_start = i + 1 + header_len;
+            if content_start + len <= cert_der.len() && len >= 66 {
+                // BIT STRING has a leading "unused bits" byte (should be 0x00)
+                // followed by the actual key bytes
+                let unused_bits = cert_der[content_start];
+                if unused_bits == 0x00 {
+                    let key_start = content_start + 1;
+                    let key_bytes = &cert_der[key_start..content_start + len];
+                    // Check for uncompressed EC point (starts with 0x04, 65 bytes for P-256)
+                    if key_bytes.len() >= 65 && key_bytes[0] == 0x04 {
+                        return Some(key_bytes[..65].to_vec());
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Parse a DER length field. Returns (length, number_of_bytes_consumed).
+fn parse_der_length(data: &[u8]) -> Option<(usize, usize)> {
+    if data.is_empty() {
+        return None;
+    }
+    if data[0] < 0x80 {
+        Some((data[0] as usize, 1))
+    } else {
+        let num_bytes = (data[0] & 0x7F) as usize;
+        if num_bytes == 0 || num_bytes > 4 || data.len() < 1 + num_bytes {
+            return None;
+        }
+        let mut len: usize = 0;
+        for j in 0..num_bytes {
+            len = (len << 8) | (data[1 + j] as usize);
+        }
+        Some((len, 1 + num_bytes))
+    }
+}
 
 #[cfg(test)]
 mod tests {

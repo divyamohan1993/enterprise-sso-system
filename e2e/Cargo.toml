@@ -6,6 +6,7 @@ license.workspace = true
 
 [features]
 load-tests = []
+production = ["common/production"]
 
 [dependencies]
 common = { path = "../common" }

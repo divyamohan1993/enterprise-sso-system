@@ -55,14 +55,14 @@ impl ReceiptSigner {
 }
 impl Drop for ReceiptSigner { fn drop(&mut self) { self.mldsa87_seed.zeroize(); } }
 
-/// Load receipt signing key: generate random key at startup with a warning.
-/// In production, this MUST be loaded from an HSM or secure key store.
+/// Load receipt signing seed from sealed storage (shared with orchestrator).
 ///
-/// SECURITY: This is the ONLY place in the system where the receipt signing
-/// key is generated/loaded. No other service should hold this key.
+/// SECURITY: Both OPAQUE (signer) and Orchestrator (verifier) load the same
+/// seed via `common::sealed_keys::load_receipt_signing_seed_sealed()`.
+/// This ensures ML-DSA-87 verification succeeds instead of silently falling
+/// back to HMAC-only.
 fn load_receipt_signing_seed() -> [u8; 32] {
-    eprintln!("WARNING: ML-DSA-87 seed generated randomly (NOT FOR PRODUCTION)");
-    let mut seed = [0u8; 32]; getrandom::getrandom(&mut seed).expect("entropy"); seed
+    common::sealed_keys::load_receipt_signing_seed_sealed()
 }
 #[allow(dead_code)]
 fn load_receipt_signing_key() -> [u8; 64] {
@@ -70,11 +70,11 @@ fn load_receipt_signing_key() -> [u8; 64] {
     crypto::entropy::generate_key_64()
 }
 
-/// Load SHARD HMAC key: generate random key at startup with a warning.
-/// In production, this MUST be loaded from a secure configuration store.
+/// Load SHARD HMAC key from sealed storage via the master KEK.
+/// Uses `common::sealed_keys::load_shard_hmac_key_sealed()` for deterministic
+/// key derivation, ensuring consistent keys across restarts.
 fn load_shard_hmac_key() -> [u8; 64] {
-    eprintln!("WARNING: SHARD_HMAC_KEY generated randomly at startup (NOT FOR PRODUCTION — use secure config)");
-    crypto::entropy::generate_key_64()
+    common::sealed_keys::load_shard_hmac_key_sealed()
 }
 
 /// Default listen address for the OPAQUE service.

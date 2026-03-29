@@ -721,6 +721,20 @@ impl SecurityEvent {
     }
 
     /// Emit a mutex poisoning recovery event.
+    pub fn database_operation_failed(detail: &str) {
+        let event = SecurityEvent {
+            timestamp: Self::now_iso8601(),
+            category: "database",
+            action: "database_operation_failed",
+            severity: Severity::Critical,
+            outcome: "failure",
+            user_id: None,
+            source_ip: None,
+            detail: Some(detail.to_string()),
+        };
+        event.emit();
+    }
+
     pub fn mutex_poisoning(detail: &str) {
         let event = SecurityEvent {
             timestamp: Self::now_iso8601(),

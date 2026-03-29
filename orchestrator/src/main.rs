@@ -1,7 +1,6 @@
 #![forbid(unsafe_code)]
 //! orchestrator: Auth Orchestrator entry point.
 
-use crypto::entropy::generate_key_64;
 use orchestrator::service::OrchestratorService;
 
 #[tokio::main]
@@ -50,8 +49,13 @@ async fn main() {
     let tss_addr = std::env::var("TSS_ADDR").unwrap_or_else(|_| "127.0.0.1:9103".into());
     let listen_addr = std::env::var("ORCH_LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:9101".into());
 
-    // In production these would be loaded from an HSM / sealed config.
-    let hmac_key = generate_key_64();
+    // Initialize master KEK via distributed threshold reconstruction (3-of-5 Shamir)
+    let _kek = common::sealed_keys::get_master_kek();
+
+    // Load HMAC key from sealed storage (derived from master KEK via HKDF).
+    // Previously this was generate_key_64() which generated a RANDOM key at every
+    // startup, making it impossible to verify receipts from OPAQUE (key mismatch).
+    let hmac_key = common::sealed_keys::load_shard_hmac_key_sealed();
 
     // SECURITY: No receipt_signing_key — receipts are signed solely by the
     // OPAQUE service and forwarded to the TSS without re-signing.
@@ -76,31 +80,12 @@ async fn main() {
     );
 
     // ── Distributed cluster coordination ──
-    // Start Raft-based leader election. In standalone mode (no MILNET_CLUSTER_PEERS),
-    // this node becomes leader immediately for backward compatibility.
-    let cluster = match common::cluster::ClusterConfig::from_env_with_defaults(
+    // Start Raft-based leader election. In production mode, cluster membership
+    // is MANDATORY — the service will panic if it cannot join the cluster.
+    let cluster = common::cluster::require_cluster(
         common::cluster::ServiceType::Orchestrator,
         &listen_addr,
-    ) {
-        Ok(config) => {
-            tracing::info!(
-                node_id = %config.node_id,
-                peers = config.peers.len(),
-                "starting orchestrator cluster node"
-            );
-            match common::cluster::ClusterNode::start(config).await {
-                Ok(node) => Some(std::sync::Arc::new(node)),
-                Err(e) => {
-                    tracing::warn!("cluster start failed (running standalone): {e}");
-                    None
-                }
-            }
-        }
-        Err(e) => {
-            tracing::info!("no cluster config (standalone mode): {e}");
-            None
-        }
-    };
+    ).await;
 
     // Wire auto-response pipeline to Raft for distributed quarantine enforcement
     if let Some(ref c) = cluster {

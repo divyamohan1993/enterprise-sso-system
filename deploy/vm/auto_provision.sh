@@ -48,16 +48,16 @@ SERVICES=(gateway orchestrator opaque tss verifier ratchet risk audit kt admin)
 
 # Service ports — must match systemd unit env files
 declare -A SERVICE_PORTS=(
-    [gateway]=8443
-    [orchestrator]=9000
-    [opaque]=9100
-    [tss]=9200
-    [verifier]=9300
-    [ratchet]=9400
-    [risk]=9500
-    [audit]=9600
-    [kt]=9700
-    [admin]=9800
+    [gateway]=9100
+    [orchestrator]=9101
+    [opaque]=9102
+    [tss]=9103
+    [verifier]=9104
+    [ratchet]=9105
+    [risk]=9106
+    [audit]=9108
+    [kt]=9109
+    [admin]=8080
 )
 
 # ── Argument Parsing ─────────────────────────────────────────────────────────

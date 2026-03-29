@@ -16,6 +16,9 @@ common = { path = "../common" }
 ratchet = { path = "../ratchet" }
 arbitrary = { version = "1", features = ["derive"] }
 
+[features]
+production = ["common/production"]
+
 [[bin]]
 name = "fuzz_shard_message"
 path = "fuzz_targets/fuzz_shard_message.rs"

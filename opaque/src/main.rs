@@ -27,6 +27,9 @@ async fn main() {
         _platform_report.binary_hash,
     );
 
+    // Initialize master KEK via distributed threshold reconstruction (3-of-5 Shamir)
+    let _kek = common::sealed_keys::get_master_kek();
+
     // STIG compliance audit (best-effort — log warnings, do not block startup)
     match common::startup_checks::run_stig_audit() {
         Ok(summary) => tracing::info!("STIG audit passed: {:?}", summary),
@@ -53,38 +56,24 @@ async fn main() {
     );
 
     // ── Distributed cluster coordination ──
+    // In production mode, cluster membership is MANDATORY — panics if unavailable.
     let opaque_addr = std::env::var("MILNET_OPAQUE_ADDR").unwrap_or_else(|_| "127.0.0.1:9102".into());
-    let _cluster = match common::cluster::ClusterConfig::from_env_with_defaults(
+    let _cluster = common::cluster::require_cluster(
         common::cluster::ServiceType::Opaque,
         &opaque_addr,
-    ) {
-        Ok(config) => {
-            tracing::info!(
-                node_id = %config.node_id,
-                peers = config.peers.len(),
-                "starting OPAQUE cluster node"
-            );
-            match common::cluster::ClusterNode::start(config).await {
-                Ok(node) => {
-                    let node = std::sync::Arc::new(node);
-                    let mut watcher = node.leader_watch();
-                    tokio::spawn(async move {
-                        while watcher.changed().await.is_ok() {
-                            if let Some(lid) = *watcher.borrow() {
-                                tracing::info!(%lid, "OPAQUE leader elected — this node coordinates threshold fan-out");
-                            }
-                        }
-                    });
-                    Some(node)
-                }
-                Err(e) => {
-                    tracing::warn!("OPAQUE cluster start failed (standalone): {e}");
-                    None
+    ).await;
+
+    // Log leader elections
+    if let Some(ref node) = _cluster {
+        let mut watcher = node.leader_watch();
+        tokio::spawn(async move {
+            while watcher.changed().await.is_ok() {
+                if let Some(lid) = *watcher.borrow() {
+                    tracing::info!(%lid, "OPAQUE leader elected — this node coordinates threshold fan-out");
                 }
             }
-        }
-        Err(_) => None,
-    };
+        });
+    }
 
     // Wire auto-response pipeline to Raft for distributed quarantine enforcement
     if let Some(ref c) = _cluster {

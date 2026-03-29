@@ -28,15 +28,14 @@ fn verify_receipt_independently(
     // 1. Verify receipt signature (ML-DSA-87 preferred, HMAC-SHA512 fallback).
     //    This proves the receipt was signed by the OPAQUE service and has not
     //    been tampered with in transit.
-    let mldsa_ok = if hmac_key.len() >= 32 {
-        // Derive ML-DSA-87 verifying key from the first 32 bytes (seed)
-        let seed: [u8; 32] = hmac_key[..32].try_into().unwrap();
-        let kp = ml_dsa::MlDsa87::from_seed(&seed.into());
+    let mldsa_ok = {
+        // Load the receipt signing seed from the same sealed source as OPAQUE,
+        // ensuring ML-DSA-87 verification uses the matching key pair.
+        let receipt_seed = common::sealed_keys::load_receipt_signing_seed_sealed();
+        let kp = ml_dsa::MlDsa87::from_seed(&receipt_seed.into());
         let vk_bytes = kp.verifying_key().encode();
         let data = crypto::receipts::receipt_signing_data(receipt);
         crypto::receipts::verify_receipt_asymmetric(vk_bytes.as_ref(), &data, &receipt.signature)
-    } else {
-        false
     };
     let hmac_ok = crypto::receipts::verify_receipt_signature(receipt, hmac_key);
     if !mldsa_ok && !hmac_ok {

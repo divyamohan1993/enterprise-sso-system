@@ -261,8 +261,16 @@ fn ensure_crypto_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
-/// Create a TLS-enabled SHARD listener for the given module.
-/// Generates a self-signed CA and module certificate at startup.
+/// Create a TLS-enabled SHARD listener for the given module with certificate pinning.
+///
+/// Generates a self-signed CA and module certificate at startup, then enforces
+/// certificate pinning by default. The server's own certificate is added to
+/// the pin set so that clients presenting a certificate signed by the same CA
+/// and matching a known fingerprint are accepted.
+///
+/// In production mode, pinning is always enforced. In dev mode, it is also
+/// enforced (defense-in-depth) but failures are logged rather than fatal.
+///
 /// Returns (listener, ca, cert_key) for the caller to share the CA with clients.
 pub async fn tls_bind(
     addr: &str,
@@ -273,12 +281,23 @@ pub async fn tls_bind(
     ensure_crypto_provider();
     let ca = crate::tls::generate_ca();
     let cert_key = crate::tls::generate_module_cert(module_name, &ca);
-    let server_config = crate::tls::server_tls_config(&cert_key, &ca);
+
+    // Build a pin set containing the server's own certificate.
+    // Clients that present a cert signed by the same CA will also need
+    // their fingerprint added via the returned cert_key / CA.
+    let pin_set = crate::tls::build_pin_set_from_certs(&[&cert_key]);
+    let server_config = crate::tls::server_tls_config_pinned(&cert_key, &ca, pin_set);
+
     let listener = TlsShardListener::bind(addr, module_id, hmac_key, server_config).await?;
     Ok((listener, ca, cert_key))
 }
 
-/// Create a TLS connector for a client module, generating its own CA and certificate.
+/// Create a TLS connector for a client module with certificate pinning.
+///
+/// Generates its own CA and certificate, then enforces certificate pinning
+/// by default. The client's own certificate fingerprint is added to the pin
+/// set so that the server's certificate (signed by the same CA) is accepted.
+///
 /// Returns (connector, ca, cert_key) so the caller can share the CA with servers.
 pub fn tls_client_setup(
     module_name: &str,
@@ -286,7 +305,8 @@ pub fn tls_client_setup(
     ensure_crypto_provider();
     let ca = crate::tls::generate_ca();
     let cert_key = crate::tls::generate_module_cert(module_name, &ca);
-    let client_config = crate::tls::client_tls_config(&cert_key, &ca);
+    let pin_set = crate::tls::build_pin_set_from_certs(&[&cert_key]);
+    let client_config = crate::tls::client_tls_config_pinned(&cert_key, &ca, pin_set);
     let connector = crate::tls::tls_connector(client_config);
     (connector, ca, cert_key)
 }

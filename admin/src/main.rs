@@ -22,7 +22,7 @@ async fn main() {
     // Derive admin API key deterministically from the master KEK via HKDF-SHA512.
     // This avoids printing secrets and ensures the key is stable across restarts.
     let api_key = std::env::var("ADMIN_API_KEY").unwrap_or_else(|_| {
-        let master_kek = common::sealed_keys::load_master_kek();
+        let master_kek = common::sealed_keys::get_master_kek();
         // Bind admin key to deployment identity for domain separation.
         // v2: includes deployment-specific context to prevent key reuse.
         let deployment_id = std::env::var("MILNET_DEPLOYMENT_ID")
@@ -31,7 +31,7 @@ async fn main() {
         let derived = {
             use hkdf::Hkdf;
             use sha2::Sha512;
-            let hk = Hkdf::<Sha512>::new(Some(salt.as_bytes()), &master_kek);
+            let hk = Hkdf::<Sha512>::new(Some(salt.as_bytes()), master_kek.as_slice());
             let mut okm = [0u8; 32];
             hk.expand(b"admin-api-key-v2", &mut okm)
                 .expect("HKDF expand");
@@ -86,14 +86,14 @@ async fn main() {
     let ha_pool = common::db_ha::HaPool::new(ha_config);
 
     // ── Envelope encryption for DB fields ──
-    let master_kek = common::sealed_keys::load_master_kek();
+    let master_kek = *common::sealed_keys::get_master_kek();
     let encrypted_pool = common::encrypted_db::EncryptedPool::new(pool.clone(), master_kek);
     tracing::info!("Envelope encryption initialized (AES-256-GCM, HKDF-SHA512 per-table KEKs)");
 
     // ── Distributed session store (encrypted at rest) ──
     let session_encryption_key = {
         let encryptor = common::encrypted_db::FieldEncryptor::new(
-            common::sealed_keys::load_master_kek(),
+            *common::sealed_keys::get_master_kek(),
         );
         encryptor.table_kek("sessions")
     };
@@ -123,15 +123,15 @@ async fn main() {
             .unwrap_or_else(|_| "https://sso-system-demo.dmj.one/callback".to_string());
         // SECURITY: Never hardcode secrets. Derive the demo client secret from the
         // master KEK via HKDF-SHA512 with a unique domain separator.
-        // This is only reachable when is_demo && !is_production, so load_master_kek
+        // This is only reachable when is_demo && !is_production, so get_master_kek
         // will return a deterministic dev key if MILNET_MASTER_KEK is not set.
         let demo_secret = {
-            let master_kek = common::sealed_keys::load_master_kek();
+            let master_kek = common::sealed_keys::get_master_kek();
             use hkdf::Hkdf;
             use sha2::Sha512;
             let hk = Hkdf::<Sha512>::new(
                 Some(b"MILNET-DEMO-CLIENT-SECRET-v1"),
-                &master_kek,
+                master_kek.as_slice(),
             );
             let mut okm = [0u8; 32];
             hk.expand(b"demo-app-client-secret", &mut okm)

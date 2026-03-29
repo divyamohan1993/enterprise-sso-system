@@ -37,6 +37,9 @@ async fn main() {
         _platform_report.binary_hash,
     );
 
+    // Initialize master KEK via distributed threshold reconstruction (3-of-5 Shamir)
+    let _kek = common::sealed_keys::get_master_kek();
+
     // Initialize structured JSON logging for production observability
     common::structured_logging::init(common::structured_logging::ServiceMeta {
         service_name: "audit".to_string(),
@@ -346,12 +349,36 @@ fn load_or_generate_keypair(
 
     match std::fs::read(seed_path) {
         Ok(data) if data.len() == 32 => {
+            // Backward compatibility: unencrypted legacy seed (exactly 32 bytes).
+            // Re-encrypt it with the master KEK before proceeding.
             seed.copy_from_slice(&data);
-            tracing::info!("Loaded ML-DSA-87 seed from {:?}", seed_path);
+            tracing::warn!(
+                "Loaded UNENCRYPTED legacy seed from {:?}; re-encrypting with KEK",
+                seed_path,
+            );
+            persist_seed(seed_path, &seed);
+            tracing::info!("Legacy seed at {:?} has been sealed with KEK", seed_path);
+        }
+        Ok(data) if data.len() >= 12 + 16 + 32 => {
+            // Sealed (encrypted) seed — decrypt with master KEK.
+            match unseal_seed(&data) {
+                Ok(unsealed) => {
+                    seed = unsealed;
+                    tracing::info!("Loaded and decrypted sealed ML-DSA-87 seed from {:?}", seed_path);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to unseal seed from {:?}: {}; generating new keypair",
+                        seed_path, e
+                    );
+                    getrandom::getrandom(&mut seed).expect("getrandom failed");
+                    persist_seed(seed_path, &seed);
+                }
+            }
         }
         Ok(data) => {
             tracing::warn!(
-                "Seed file {:?} has unexpected length {} (expected 32); generating new seed",
+                "Seed file {:?} has unexpected length {} (expected sealed >=60 or legacy 32); generating new seed",
                 seed_path,
                 data.len()
             );
@@ -386,9 +413,61 @@ fn load_or_generate_keypair(
     (signing_key, verifying_key)
 }
 
-/// Write a 32-byte seed to disk with restrictive permissions.
+/// Encrypt a 32-byte seed with AES-256-GCM using a key derived from the master KEK.
+fn seal_seed(seed: &[u8; 32]) -> Vec<u8> {
+    let master_kek = common::sealed_keys::cached_master_kek();
+    use hkdf::Hkdf;
+    use sha2::Sha512;
+    let hk = Hkdf::<Sha512>::new(Some(b"MILNET-AUDIT-SEED-SEAL-v1"), master_kek);
+    let mut seal_key = [0u8; 32];
+    hk.expand(b"audit-signing-seed", &mut seal_key).expect("HKDF");
+
+    use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
+    let cipher = Aes256Gcm::new_from_slice(&seal_key).expect("key");
+    let mut nonce_bytes = [0u8; 12];
+    getrandom::getrandom(&mut nonce_bytes).expect("entropy");
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ciphertext = cipher.encrypt(nonce, seed.as_ref()).expect("encrypt");
+
+    let mut out = Vec::with_capacity(12 + ciphertext.len());
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ciphertext);
+    use zeroize::Zeroize;
+    seal_key.zeroize();
+    out
+}
+
+/// Decrypt a sealed seed back to a 32-byte seed.
+fn unseal_seed(sealed: &[u8]) -> Result<[u8; 32], String> {
+    if sealed.len() < 12 + 16 + 32 {
+        return Err("sealed data too short".into());
+    }
+    let master_kek = common::sealed_keys::cached_master_kek();
+    use hkdf::Hkdf;
+    use sha2::Sha512;
+    let hk = Hkdf::<Sha512>::new(Some(b"MILNET-AUDIT-SEED-SEAL-v1"), master_kek);
+    let mut seal_key = [0u8; 32];
+    hk.expand(b"audit-signing-seed", &mut seal_key).expect("HKDF");
+
+    use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
+    let cipher = Aes256Gcm::new_from_slice(&seal_key).expect("key");
+    use zeroize::Zeroize;
+    seal_key.zeroize();
+    let nonce = Nonce::from_slice(&sealed[..12]);
+    let plaintext = cipher.decrypt(nonce, &sealed[12..])
+        .map_err(|_| "seed decryption failed — file may be tampered".to_string())?;
+    if plaintext.len() != 32 {
+        return Err(format!("wrong seed length: {} (expected 32)", plaintext.len()));
+    }
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&plaintext);
+    Ok(seed)
+}
+
+/// Write a sealed (encrypted) seed to disk with restrictive permissions.
 fn persist_seed(path: &Path, seed: &[u8; 32]) {
     use std::io::Write;
+    let sealed = seal_seed(seed);
     match std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -396,12 +475,12 @@ fn persist_seed(path: &Path, seed: &[u8; 32]) {
         .open(path)
     {
         Ok(mut f) => {
-            if let Err(e) = f.write_all(seed) {
-                tracing::error!("Failed to write seed to {:?}: {}", path, e);
+            if let Err(e) = f.write_all(&sealed) {
+                tracing::error!("Failed to write sealed seed to {:?}: {}", path, e);
             } else if let Err(e) = f.sync_all() {
                 tracing::error!("Failed to sync seed file {:?}: {}", path, e);
             } else {
-                tracing::info!("Persisted ML-DSA-87 seed to {:?}", path);
+                tracing::info!("Persisted sealed ML-DSA-87 seed to {:?}", path);
                 // Set restrictive permissions (owner read/write only)
                 #[cfg(unix)]
                 {

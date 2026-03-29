@@ -241,10 +241,8 @@ pub fn init_monotonic_baseline() {
 /// Immune to wall-clock manipulation (clock_settime, date -s, etc.)
 /// because it derives time from std::time::Instant offset from baseline.
 pub fn monotonic_now_us() -> i64 {
-    let (base_instant, base_wall_us) = MONOTONIC_BASELINE
-        .get()
-        .copied()
-        .unwrap_or_else(|| {
+    let (base_instant, base_wall_us) = *MONOTONIC_BASELINE
+        .get_or_init(|| {
             let now = Instant::now();
             let wall = SystemTime::now()
                 .duration_since(UNIX_EPOCH)

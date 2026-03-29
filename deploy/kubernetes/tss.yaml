@@ -201,7 +201,9 @@ spec:
                       values:
                         - tss-signer
                 topologyKey: kubernetes.io/hostname
-      # Init container computes signer-specific port and loads the correct share.
+      # Init containers:
+      #   1. compute-signer-env: sets per-pod signer port
+      #   2. share-selector: copies the correct per-ordinal share into the shared volume
       initContainers:
         - name: compute-signer-env
           image: busybox:1.36
@@ -216,6 +218,38 @@ spec:
           volumeMounts:
             - name: env-config
               mountPath: /etc/milnet/env
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+        - name: share-selector
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              ORDINAL=$(echo $HOSTNAME | rev | cut -d'-' -f1 | rev)
+              cp /shares/share-${ORDINAL}/MILNET_TSS_SHARE_SEALED /tss-share/MILNET_TSS_SHARE_SEALED
+          volumeMounts:
+            - name: tss-share-0
+              mountPath: /shares/share-0
+              readOnly: true
+            - name: tss-share-1
+              mountPath: /shares/share-1
+              readOnly: true
+            - name: tss-share-2
+              mountPath: /shares/share-2
+              readOnly: true
+            - name: tss-share-3
+              mountPath: /shares/share-3
+              readOnly: true
+            - name: tss-share-4
+              mountPath: /shares/share-4
+              readOnly: true
+            - name: share
+              mountPath: /tss-share
           securityContext:
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false
@@ -308,12 +342,32 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 64Mi
-        # Per-pod share: in production, use a CSI secret store driver or
-        # mutating webhook to inject milnet-tss-share-{ordinal}.
-        # This placeholder mounts share-0; override per pod via webhook.
+        # Per-pod share selection: the share-selector init container copies
+        # the correct share into this emptyDir based on the pod ordinal.
         - name: share
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        # Individual share secrets for each signer (0 through 4)
+        - name: tss-share-0
           secret:
             secretName: milnet-tss-share-0
+            optional: true
+        - name: tss-share-1
+          secret:
+            secretName: milnet-tss-share-1
+            optional: true
+        - name: tss-share-2
+          secret:
+            secretName: milnet-tss-share-2
+            optional: true
+        - name: tss-share-3
+          secret:
+            secretName: milnet-tss-share-3
+            optional: true
+        - name: tss-share-4
+          secret:
+            secretName: milnet-tss-share-4
             optional: true
   volumeClaimTemplates:
     - metadata:

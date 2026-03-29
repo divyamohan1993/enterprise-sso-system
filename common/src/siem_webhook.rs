@@ -243,11 +243,8 @@ impl SiemWebhook {
         request.push_str("Connection: close\r\n\r\n");
         request.push_str(&batch_json);
 
-        // Send via blocking TCP POST
-        // NOTE: TLS termination is expected at the infrastructure level (mTLS
-        // sidecar, service mesh, or load balancer). The HTTPS scheme enforcement
-        // above ensures the endpoint is correctly addressed. HMAC-SHA512
-        // signing provides payload authentication regardless of transport.
+        // Send via TLS-wrapped TCP POST.
+        // Uses rustls for application-level TLS to the SIEM endpoint.
         use std::io::{Read, Write};
         use std::net::TcpStream;
         use std::time::Duration;
@@ -256,19 +253,46 @@ impl SiemWebhook {
             .parse()
             .map_err(|e| format!("SIEM webhook: invalid endpoint address '{}': {}", host_port_with_default, e))?;
 
-        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+        let tcp_stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
             .map_err(|e| format!("SIEM webhook: TCP connect to {} failed: {}", addr, e))?;
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let _ = tcp_stream.set_write_timeout(Some(Duration::from_secs(5)));
+        let _ = tcp_stream.set_read_timeout(Some(Duration::from_secs(5)));
 
-        let mut stream = stream;
-        stream
+        // Establish TLS over the TCP connection using rustls
+        let root_store = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        };
+        let tls_config = std::sync::Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth(),
+        );
+
+        // Extract the hostname (without port) for SNI
+        let sni_host = if host_port.contains(':') {
+            &host_port[..host_port.rfind(':').unwrap_or(host_port.len())]
+        } else {
+            host_port
+        };
+
+        let server_name = rustls::pki_types::ServerName::try_from(sni_host.to_string())
+            .map_err(|e| format!("SIEM webhook: invalid SNI hostname '{}': {}", sni_host, e))?;
+
+        let tls_conn = rustls::ClientConnection::new(tls_config, server_name)
+            .map_err(|e| format!("SIEM webhook: TLS handshake setup failed: {}", e))?;
+
+        let mut tls_stream = rustls::StreamOwned::new(tls_conn, tcp_stream);
+
+        tls_stream
             .write_all(request.as_bytes())
-            .map_err(|e| format!("SIEM webhook: write to {} failed: {}", addr, e))?;
+            .map_err(|e| format!("SIEM webhook: TLS write to {} failed: {}", addr, e))?;
+        tls_stream
+            .flush()
+            .map_err(|e| format!("SIEM webhook: TLS flush to {} failed: {}", addr, e))?;
 
         // Read response status to detect server errors
         let mut response_buf = [0u8; 512];
-        let n = stream.read(&mut response_buf).unwrap_or(0);
+        let n = tls_stream.read(&mut response_buf).unwrap_or(0);
         if n > 0 {
             let response = String::from_utf8_lossy(&response_buf[..n]);
             if !response.contains("200")

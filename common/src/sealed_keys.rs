@@ -65,11 +65,151 @@ unsafe impl Sync for ProtectedKek {}
 unsafe impl Send for ProtectedKek {}
 
 static MASTER_KEK_CACHE: OnceLock<ProtectedKek> = OnceLock::new();
+static DISTRIBUTED_KEK_CACHE: OnceLock<ProtectedKek> = OnceLock::new();
 
 /// Returns a reference to the cached master KEK, loading it once on first call.
 /// The KEK is mlock'd into physical RAM and excluded from core dumps.
 pub fn cached_master_kek() -> &'static [u8; 32] {
     MASTER_KEK_CACHE.get_or_init(|| ProtectedKek::new(load_master_kek())).as_bytes()
+}
+
+/// Returns true when distributed (threshold) KEK mode should be used.
+/// This is the case when `MILNET_KEK_SHARE` is set OR when running in production mode.
+pub fn use_distributed_kek() -> bool {
+    std::env::var("MILNET_KEK_SHARE").is_ok() || is_production()
+}
+
+/// Reconstruct the master KEK from threshold Shamir shares collected via env vars.
+///
+/// - `MILNET_KEK_SHARE`: This node's share (hex-encoded via `KekShare::to_hex`)
+/// - `MILNET_KEK_SHARE_INDEX`: This node's share index (1-based)
+/// - `MILNET_KEK_PEER_SHARES`: Comma-separated hex shares from peers (received via mTLS at startup)
+///
+/// In production mode, panics if threshold (3) shares are not available.
+/// In dev mode, falls back to `cached_master_kek()` (single env var).
+pub fn cached_master_kek_distributed() -> &'static [u8; 32] {
+    DISTRIBUTED_KEK_CACHE.get_or_init(|| {
+        use crate::threshold_kek::{KekShare, ThresholdKekConfig, ThresholdKekManager};
+
+        let my_share_hex = std::env::var("MILNET_KEK_SHARE").ok();
+        let my_index: u8 = std::env::var("MILNET_KEK_SHARE_INDEX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+        let peer_shares_csv = std::env::var("MILNET_KEK_PEER_SHARES").ok();
+
+        // If no share is configured, handle based on mode
+        if my_share_hex.is_none() {
+            if is_production() {
+                eprintln!(
+                    "FATAL: MILNET_KEK_SHARE not set in production mode. \
+                     Distributed threshold KEK is required. Each node must hold \
+                     exactly one Shamir share. Set MILNET_KEK_SHARE, \
+                     MILNET_KEK_SHARE_INDEX, and MILNET_KEK_PEER_SHARES."
+                );
+                std::process::exit(1);
+            }
+            // Dev mode fallback: use single-key path
+            eprintln!(
+                "WARNING: MILNET_KEK_SHARE not set. Falling back to single-key KEK. \
+                 NOT FOR PRODUCTION — use threshold shares for real deployments."
+            );
+            return ProtectedKek::new(load_master_kek());
+        }
+
+        let my_share_hex = my_share_hex.unwrap();
+
+        let mut mgr = ThresholdKekManager::new(ThresholdKekConfig {
+            threshold: 3,
+            total_shares: 5,
+            collection_timeout: std::time::Duration::from_secs(30),
+            my_share_index: my_index,
+        });
+
+        // Load this node's share
+        if let Err(e) = mgr.load_my_share(&my_share_hex) {
+            eprintln!("FATAL: Failed to load KEK share from MILNET_KEK_SHARE: {e}");
+            std::process::exit(1);
+        }
+
+        // Remove share from environment immediately
+        #[cfg(not(test))]
+        std::env::remove_var("MILNET_KEK_SHARE");
+
+        // Collect peer shares from env
+        if let Some(csv) = peer_shares_csv {
+            for hex_share in csv.split(',') {
+                let hex_share = hex_share.trim();
+                if hex_share.is_empty() {
+                    continue;
+                }
+                match KekShare::from_hex(hex_share) {
+                    Ok(share) => {
+                        if let Err(e) = mgr.add_peer_share(share) {
+                            eprintln!("WARNING: Failed to add peer share: {e}");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("WARNING: Failed to parse peer share hex: {e}");
+                    }
+                }
+            }
+            // Remove peer shares from environment immediately
+            #[cfg(not(test))]
+            std::env::remove_var("MILNET_KEK_PEER_SHARES");
+        }
+
+        // Check if we have enough shares
+        if !mgr.has_threshold() {
+            if is_production() {
+                eprintln!(
+                    "FATAL: Insufficient KEK shares for reconstruction. \
+                     Have {} shares, need 3. Ensure MILNET_KEK_PEER_SHARES \
+                     contains at least 2 peer shares (comma-separated hex).",
+                    mgr.shares_collected()
+                );
+                std::process::exit(1);
+            }
+            eprintln!(
+                "WARNING: Only {} KEK shares collected (need 3). \
+                 Falling back to single-key KEK. NOT FOR PRODUCTION.",
+                mgr.shares_collected()
+            );
+            return ProtectedKek::new(load_master_kek());
+        }
+
+        // Reconstruct
+        let share_count = mgr.shares_collected();
+        match mgr.reconstruct() {
+            Ok(key) => {
+                eprintln!(
+                    "INFO: Master KEK reconstructed from {} threshold shares (3-of-5 Shamir).",
+                    share_count
+                );
+                ProtectedKek::new(*key)
+            }
+            Err(e) => {
+                eprintln!("FATAL: KEK reconstruction failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }).as_bytes()
+}
+
+/// Unified entry point for obtaining the master KEK.
+///
+/// If distributed (threshold) mode is active (via `MILNET_KEK_SHARE` env var
+/// or production mode), uses `cached_master_kek_distributed()` which reconstructs
+/// the KEK from Shamir shares. Otherwise, uses the single-key `cached_master_kek()`.
+///
+/// All services SHOULD use this function instead of calling `cached_master_kek()`
+/// or `load_master_kek()` directly.
+pub fn get_master_kek() -> &'static [u8; 32] {
+    if use_distributed_kek() {
+        cached_master_kek_distributed()
+    } else {
+        cached_master_kek()
+    }
 }
 
 /// Whether the system is running in production mode.
@@ -178,6 +318,148 @@ pub fn load_receipt_signing_key_sealed() -> [u8; 64] {
         "receipt-sign",
         b"MILNET-DEV-RECEIPT-KEY-NOT-FOR-PRODUCTION!!!!!!!!",
     )
+}
+
+/// Load the ML-DSA-87 receipt signing seed (32 bytes) from sealed storage
+/// or derive deterministically from the master KEK.
+///
+/// Both OPAQUE (signer) and Orchestrator (verifier) MUST call this function
+/// to ensure they use the same seed. This eliminates the key mismatch that
+/// caused ML-DSA verification to always fail.
+///
+/// Key loading order:
+/// 1. `RECEIPT_SIGNING_SEED_SEALED` env var (AES-256-GCM sealed, hex-encoded)
+/// 2. `RECEIPT_SIGNING_SEED` env var (raw hex, blocked in production)
+/// 3. Deterministic derivation from master KEK via HKDF-SHA512 (dev only)
+pub fn load_receipt_signing_seed_sealed() -> [u8; 32] {
+    use zeroize::Zeroize;
+
+    let sealed_var = "RECEIPT_SIGNING_SEED_SEALED";
+    let raw_var = "RECEIPT_SIGNING_SEED";
+
+    // 1. Try sealed key
+    if let Ok(mut hex_str) = std::env::var(sealed_var) {
+        #[cfg(not(test))]
+        std::env::remove_var(sealed_var);
+        let result = unseal_seed_from_hex(&hex_str, "receipt-sign-seed");
+        zeroize_string(&mut hex_str);
+        hex_str.zeroize();
+        if let Some(seed) = result {
+            if seed.iter().all(|&b| b == 0) {
+                eprintln!("FATAL: all-zero seed after unsealing {raw_var}");
+                std::process::exit(1);
+            }
+            eprintln!("INFO: {raw_var} loaded from sealed storage.");
+            return seed;
+        }
+        eprintln!("WARNING: {sealed_var} present but unseal failed. Trying raw.");
+    }
+
+    // 2. Try raw key (blocked in production)
+    if let Ok(mut hex_str) = std::env::var(raw_var) {
+        #[cfg(not(test))]
+        std::env::remove_var(raw_var);
+        if hex_str.len() >= 64 {
+            if is_production() {
+                zeroize_string(&mut hex_str);
+                hex_str.zeroize();
+                eprintln!(
+                    "FATAL: Raw (unencrypted) {raw_var} detected in production mode. \
+                     Use {sealed_var} with sealed keys instead."
+                );
+                std::process::exit(1);
+            }
+            eprintln!("WARNING: {raw_var} loaded as raw plaintext. Use sealed keys in production.");
+            let mut seed = [0u8; 32];
+            for (i, chunk) in hex_str.as_bytes().chunks(2).take(32).enumerate() {
+                let hex = std::str::from_utf8(chunk)
+                    .unwrap_or_else(|_| {
+                        eprintln!("FATAL: {raw_var} contains invalid UTF-8 at byte {}", i * 2);
+                        std::process::exit(1);
+                    });
+                seed[i] = u8::from_str_radix(hex, 16)
+                    .unwrap_or_else(|_| {
+                        eprintln!("FATAL: {raw_var} contains invalid hex '{}' at position {}", hex, i * 2);
+                        std::process::exit(1);
+                    });
+            }
+            if seed.iter().all(|&b| b == 0) {
+                eprintln!("FATAL: all-zero seed in {raw_var}");
+                std::process::exit(1);
+            }
+            zeroize_string(&mut hex_str);
+            hex_str.zeroize();
+            return seed;
+        }
+        zeroize_string(&mut hex_str);
+        hex_str.zeroize();
+    }
+
+    // 3. Dev fallback: derive deterministically from master KEK
+    if is_production() {
+        eprintln!(
+            "FATAL: {raw_var} not set and no sealed seed found. \
+             Cannot start in production mode without receipt signing seed."
+        );
+        std::process::exit(1);
+    }
+
+    eprintln!(
+        "WARNING: {raw_var} not set. Deriving from master KEK. NOT FOR PRODUCTION."
+    );
+    let master_kek = cached_master_kek();
+    use hkdf::Hkdf;
+    use sha2::Sha512;
+    let hk = Hkdf::<Sha512>::new(Some(b"MILNET-RECEIPT-SIGNING-SEED-v1"), master_kek);
+    let mut seed = [0u8; 32];
+    hk.expand(b"receipt-signing-seed", &mut seed)
+        .expect("32-byte HKDF expand must succeed");
+    seed
+}
+
+/// Unseal a 32-byte seed from hex-encoded sealed data.
+fn unseal_seed_from_hex(hex_str: &str, purpose: &str) -> Option<[u8; 32]> {
+    use zeroize::Zeroize;
+    let mut sealed_bytes: Vec<u8> = (0..hex_str.len())
+        .step_by(2)
+        .filter_map(|i| {
+            hex_str.get(i..i + 2).and_then(|s| u8::from_str_radix(s, 16).ok())
+        })
+        .collect();
+
+    if sealed_bytes.len() < 12 + 16 + 32 {
+        sealed_bytes.zeroize();
+        return None;
+    }
+
+    let master_kek = cached_master_kek();
+    let mut unseal_key = derive_unseal_key(master_kek, purpose);
+
+    use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+    use aes_gcm::aead::Aead;
+
+    let cipher = Aes256Gcm::new_from_slice(&unseal_key).ok()?;
+    unseal_key.zeroize();
+    let nonce = Nonce::from_slice(&sealed_bytes[..12]);
+    let aad = format!("MILNET-SEALED-KEY-v1:{purpose}");
+    let result = cipher.decrypt(nonce, aes_gcm::aead::Payload {
+        msg: &sealed_bytes[12..],
+        aad: aad.as_bytes(),
+    });
+    sealed_bytes.zeroize();
+    let plaintext = result.ok()?;
+
+    if plaintext.len() != 32 {
+        let mut plaintext = plaintext;
+        plaintext.zeroize();
+        return None;
+    }
+
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&plaintext);
+    let mut plaintext = plaintext;
+    plaintext.zeroize();
+    Some(seed)
 }
 
 /// Hardened key loading with sealed key support.

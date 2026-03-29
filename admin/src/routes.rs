@@ -1843,7 +1843,7 @@ async fn initial_setup(
     let reg_bytes = store.get_registration_bytes(&req.username);
 
     // Persist superuser to PostgreSQL with tier 1 (Sovereign)
-    let _ = sqlx::query(
+    if let Err(e) = sqlx::query(
         "INSERT INTO users (id, username, tier, opaque_registration, created_at, is_active) VALUES ($1, $2, 1, $3, $4, true) ON CONFLICT (username) DO UPDATE SET opaque_registration = $3"
     )
     .bind(user_id)
@@ -1851,7 +1851,11 @@ async fn initial_setup(
     .bind(&reg_bytes)
     .bind(now_secs())
     .execute(&state.db)
-    .await;
+    .await {
+        tracing::error!(error = %e, "CRITICAL: failed to persist superuser registration to database");
+        common::siem::SecurityEvent::database_operation_failed("superuser_registration_persist");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
     // Mark setup as complete
     state.setup_complete.store(true, Ordering::Relaxed);
@@ -2233,7 +2237,7 @@ async fn register_user(
     let reg_bytes = store.get_registration_bytes(&req.username);
 
     // Persist user to PostgreSQL (with tier and OPAQUE registration)
-    let _ = sqlx::query(
+    if let Err(e) = sqlx::query(
         "INSERT INTO users (id, username, tier, opaque_registration, created_at, is_active) VALUES ($1, $2, $3, $4, $5, true) ON CONFLICT (username) DO NOTHING"
     )
     .bind(user_id)
@@ -2242,7 +2246,11 @@ async fn register_user(
     .bind(&reg_bytes)
     .bind(now_secs())
     .execute(&state.db)
-    .await;
+    .await {
+        tracing::error!(error = %e, "CRITICAL: failed to persist user registration to database");
+        common::siem::SecurityEvent::database_operation_failed("user_registration_persist");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
     // Log to audit (in-memory chain + PostgreSQL), signed with ML-DSA-87 + admin HMAC-SHA512
     let mut audit = state.audit_log.write().await;
@@ -2262,7 +2270,7 @@ async fn register_user(
     combined_sig.extend_from_slice(&admin_sig);
 
     let user_ids_json = serde_json::to_string(&entry.user_ids).unwrap_or_default();
-    let _ = sqlx::query(
+    if let Err(e) = sqlx::query(
         "INSERT INTO audit_log (id, event_type, user_ids, timestamp, prev_hash, signature) VALUES ($1, $2, $3, $4, $5, $6)"
     )
     .bind(entry.event_id)
@@ -2272,7 +2280,10 @@ async fn register_user(
     .bind(entry.prev_hash.to_vec())
     .bind(combined_sig)
     .execute(&state.db)
-    .await;
+    .await {
+        tracing::error!(error = %e, "CRITICAL: failed to persist audit log entry for user registration");
+        common::siem::SecurityEvent::database_operation_failed("audit_log_user_registration");
+    }
 
     // Log to KT
     let mut kt = state.kt_tree.write().await;
@@ -2330,10 +2341,14 @@ async fn delete_user(
 
     // Cascade delete all user data (GDPR Article 17: right to erasure)
     // 1. Delete recovery codes
-    let _ = sqlx::query("DELETE FROM recovery_codes WHERE user_id = $1")
+    if let Err(e) = sqlx::query("DELETE FROM recovery_codes WHERE user_id = $1")
         .bind(user_id)
         .execute(&state.db)
-        .await;
+        .await {
+        tracing::error!(error = %e, user_id = %user_id, "CRITICAL: failed to delete recovery codes during user erasure");
+        common::siem::SecurityEvent::database_operation_failed("delete_user_recovery_codes");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
     // 2. Delete FIDO credentials
     {
@@ -2345,10 +2360,14 @@ async fn delete_user(
     state.session_tracker.remove_all_sessions(&user_id);
 
     // 4. Delete ratchet sessions
-    let _ = sqlx::query("DELETE FROM ratchet_sessions WHERE user_id = $1")
+    if let Err(e) = sqlx::query("DELETE FROM ratchet_sessions WHERE user_id = $1")
         .bind(user_id)
         .execute(&state.db)
-        .await;
+        .await {
+        tracing::error!(error = %e, user_id = %user_id, "CRITICAL: failed to delete ratchet sessions during user erasure");
+        common::siem::SecurityEvent::database_operation_failed("delete_user_ratchet_sessions");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
     // 5. Delete the user record itself
     let result = sqlx::query("DELETE FROM users WHERE id = $1")
@@ -2456,10 +2475,14 @@ async fn delete_portal(
     let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(4);
     check_tier(caller_tier, 1)?;
 
-    let _ = sqlx::query("UPDATE portals SET is_active = false WHERE id = $1")
+    if let Err(e) = sqlx::query("UPDATE portals SET is_active = false WHERE id = $1")
         .bind(id)
         .execute(&state.db)
-        .await;
+        .await {
+        tracing::error!(error = %e, portal_id = %id, "CRITICAL: failed to deactivate portal");
+        common::siem::SecurityEvent::database_operation_failed("portal_deactivation");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
     Ok(Json(serde_json::json!({"deleted": true})))
 }
 
@@ -3359,10 +3382,13 @@ a{color:#00ff41}</style></head><body>
                     );
                     drop(audit);
                     // Revoke all active sessions for this user
-                    let _ = sqlx::query("UPDATE sessions SET is_active = false WHERE user_id = $1")
+                    if let Err(e) = sqlx::query("UPDATE sessions SET is_active = false WHERE user_id = $1")
                         .bind(user_id)
                         .execute(&state.db)
-                        .await;
+                        .await {
+                        tracing::error!(error = %e, user_id = %user_id, "CRITICAL SECURITY: failed to revoke sessions during duress detection");
+                        common::siem::SecurityEvent::database_operation_failed("duress_session_revocation");
+                    }
                     user_tier = 4;
                 }
             }
@@ -4874,10 +4900,14 @@ async fn recovery_generate(
     }
 
     // Delete any existing unused recovery codes for this user (revoke old batch)
-    let _ = sqlx::query("DELETE FROM recovery_codes WHERE user_id = $1 AND is_used = false")
+    if let Err(e) = sqlx::query("DELETE FROM recovery_codes WHERE user_id = $1 AND is_used = false")
         .bind(req.user_id)
         .execute(&state.db)
-        .await;
+        .await {
+        tracing::error!(error = %e, user_id = %req.user_id, "CRITICAL: failed to revoke existing recovery codes before regeneration");
+        common::siem::SecurityEvent::database_operation_failed("revoke_old_recovery_codes");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
     // Generate 8 recovery codes
     let codes = common::recovery::generate_recovery_codes(8);
@@ -4889,7 +4919,7 @@ async fn recovery_generate(
 
     for (display, salt, hash) in &codes {
         let code_id = Uuid::new_v4();
-        let _ = sqlx::query(
+        if let Err(e) = sqlx::query(
             "INSERT INTO recovery_codes (id, user_id, code_hash, code_salt, is_used, created_at, expires_at) VALUES ($1, $2, $3, $4, false, $5, $6)"
         )
         .bind(code_id)
@@ -4899,7 +4929,11 @@ async fn recovery_generate(
         .bind(now)
         .bind(expires_at)
         .execute(&state.db)
-        .await;
+        .await {
+            tracing::error!(error = %e, user_id = %req.user_id, "CRITICAL: failed to insert recovery code into database");
+            common::siem::SecurityEvent::database_operation_failed("insert_recovery_code");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
 
         display_codes.push(display.clone());
     }

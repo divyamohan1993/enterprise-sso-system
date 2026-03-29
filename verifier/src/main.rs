@@ -25,6 +25,9 @@ async fn main() {
         _platform_report.binary_hash,
     );
 
+    // Initialize master KEK via distributed threshold reconstruction (3-of-5 Shamir)
+    let _kek = common::sealed_keys::get_master_kek();
+
     // Initialize structured JSON logging for production observability
     common::structured_logging::init(common::structured_logging::ServiceMeta {
         service_name: "verifier".to_string(),
@@ -134,7 +137,10 @@ async fn main() {
 
     // 5. Bind SHARD TLS listener
     let addr = std::env::var("VERIFIER_ADDR").unwrap_or_else(|_| "127.0.0.1:9104".to_string());
-    let hmac_key = crypto::entropy::generate_key_64();
+    // Load HMAC key from sealed storage (derived from master KEK via HKDF).
+    // Previously this was crypto::entropy::generate_key_64() which generated a RANDOM
+    // key at every startup, making cross-service HMAC verification impossible.
+    let hmac_key = common::sealed_keys::load_shard_hmac_key_sealed();
     let (listener, _ca, _cert_key) =
         shard::tls_transport::tls_bind(&addr, ModuleId::Verifier, hmac_key, "verifier")
             .await

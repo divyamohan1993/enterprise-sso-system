@@ -20,6 +20,9 @@ tracing.workspace = true
 sqlx = { workspace = true, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid"] }
 tokio = { workspace = true, features = ["full"] }
 
+[features]
+production = ["common/production"]
+
 [dev-dependencies]
 proptest = "1"
 ratchet = { path = "../ratchet" }

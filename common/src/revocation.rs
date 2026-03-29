@@ -119,13 +119,23 @@ impl RevocationList {
     // ------------------------------------------------------------------
 
     /// Compute HMAC-SHA512 over revocation data for integrity verification.
+    /// The HMAC key is derived from the master KEK via HKDF-SHA512, preventing
+    /// forgery by anyone who merely reads the source code.
     fn compute_revocation_hmac(data: &[u8]) -> [u8; 64] {
         use hmac::{Hmac, Mac};
         use sha2::Sha512;
+        use hkdf::Hkdf;
         type HmacSha512 = Hmac<Sha512>;
-        // Derive key from a fixed domain — in real deployment this would come from KEK
-        let domain = b"MILNET-REVOCATION-INTEGRITY-v1";
-        let mut mac = HmacSha512::new_from_slice(domain).expect("HMAC key");
+        // Derive HMAC key from master KEK — not a hardcoded string
+        let master_kek = crate::sealed_keys::cached_master_kek();
+        let hk = Hkdf::<Sha512>::new(Some(b"MILNET-REVOCATION-INTEGRITY-v2"), master_kek);
+        let mut derived_key = [0u8; 64];
+        hk.expand(b"revocation-file-hmac", &mut derived_key)
+            .expect("64-byte HKDF expand must succeed");
+        let mut mac = HmacSha512::new_from_slice(&derived_key).expect("HMAC key");
+        // Zeroize derived key after creating MAC
+        use zeroize::Zeroize;
+        derived_key.zeroize();
         mac.update(data);
         let result = mac.finalize().into_bytes();
         let mut out = [0u8; 64];

@@ -743,6 +743,43 @@ impl ClusterNode {
     }
 }
 
+/// Start a cluster node. In production mode, cluster membership is MANDATORY.
+/// The service will panic if it cannot join the cluster.
+pub async fn require_cluster(
+    service_type: ServiceType,
+    listen_addr: &str,
+) -> Option<std::sync::Arc<ClusterNode>> {
+    let is_prod = crate::sealed_keys::is_production();
+    match ClusterConfig::from_env_with_defaults(service_type, listen_addr) {
+        Ok(config) => {
+            tracing::info!(
+                node_id = %config.node_id,
+                peers = config.peers.len(),
+                "starting cluster node"
+            );
+            match ClusterNode::start(config).await {
+                Ok(node) => Some(std::sync::Arc::new(node)),
+                Err(e) => {
+                    if is_prod {
+                        panic!("FATAL: cluster start failed in production mode: {e}. \
+                               Set MILNET_CLUSTER_PEERS for distributed operation.");
+                    }
+                    tracing::warn!("cluster start failed (running standalone): {e}");
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            if is_prod {
+                panic!("FATAL: no cluster config in production mode: {e}. \
+                       Set MILNET_CLUSTER_PEERS for distributed operation.");
+            }
+            tracing::info!("no cluster config (standalone mode): {e}");
+            None
+        }
+    }
+}
+
 // ── Tests ──
 
 #[cfg(test)]

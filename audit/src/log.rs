@@ -441,8 +441,10 @@ impl AuditLog {
                             // Re-insert entries if archival failed (do not lose data)
                             // Note: this puts them at the end, but since they are expired,
                             // the next retention pass will try again.
-                            self.entries.extend(expired_entries);
-                            self.entries.sort_by_key(|e| e.timestamp);
+                            // Prepend to preserve original chain linkage order
+                            // (sorting by timestamp would break prev_hash chain integrity)
+                            expired_entries.extend(self.entries.drain(..));
+                            self.entries = expired_entries;
                         }
                     }
                 }
@@ -647,6 +649,8 @@ pub fn hash_entry(entry: &AuditEntry) -> [u8; 64] {
 
     // Include risk_score to prevent score tampering
     hasher.update(entry.risk_score.to_le_bytes());
+    // Include classification to prevent Bell-LaPadula level tampering
+    hasher.update([entry.classification]);
     hasher.update(entry.timestamp.to_le_bytes());
     hasher.update(entry.prev_hash);
 

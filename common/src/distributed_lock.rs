@@ -588,43 +588,42 @@ impl PgAdvisoryLockManager {
     ///
     /// The task renews at `ttl / 3` intervals (well before expiry) and
     /// stops when it can no longer renew (TTL expired or holder changed).
+    ///
+    /// NOTE: This method uses the local `LockManager` only. For full
+    /// distributed renewal (including PostgreSQL advisory lock verification),
+    /// use [`spawn_lock_renewal`] with an `Arc<PgAdvisoryLockManager>`.
     pub fn spawn_renewal(
-        &self,
+        self: &std::sync::Arc<Self>,
         name: String,
         holder_id: String,
         ttl: Duration,
     ) -> tokio::task::JoinHandle<()> {
-        let pool = self.pool.clone();
-        let local_locks = LockManager::new(); // We'll use the actual instance below.
-        // Clone what we need for the spawned task.
-        let _ = (pool, local_locks);
-
-        // We cannot move `self` into the task, so we re-create a minimal
-        // renewal loop using just the local lock manager reference.
-        // In practice, callers hold an Arc<PgAdvisoryLockManager>.
+        let manager = std::sync::Arc::clone(self);
         let renewal_interval = ttl / 3;
-        // Use the local lock manager directly.
-        let lock_manager_ptr = &self.local as *const LockManager as usize;
 
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(renewal_interval).await;
-
-                // SAFETY NOTE: This is NOT unsafe code — we're using the
-                // in-process LockManager which is behind a Mutex.
-                // In a real deployment, the caller would hold Arc<PgAdvisoryLockManager>
-                // and pass it to the renewal task. This placeholder demonstrates
-                // the renewal pattern.
-                tracing::debug!(
-                    "distributed_lock: renewal tick for '{}' by '{}' (manager={})",
-                    name,
-                    holder_id,
-                    lock_manager_ptr
-                );
-
-                // The actual renewal would call self.renew(&name, &holder_id).await
-                // In practice, wrap PgAdvisoryLockManager in Arc and clone it.
-                break; // Placeholder: break after first tick in non-Arc usage.
+                match manager.renew(&name, &holder_id).await {
+                    Ok(token) => {
+                        tracing::debug!(
+                            "distributed_lock: renewed '{}' for '{}' (token={})",
+                            name,
+                            holder_id,
+                            token
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "distributed_lock: renewal failed for '{}' by '{}': {}",
+                            name,
+                            holder_id,
+                            e
+                        );
+                        emit_lock_event("lock_renewal_failed", &name, &holder_id, 0);
+                        break;
+                    }
+                }
             }
         })
     }

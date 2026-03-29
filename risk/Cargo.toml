@@ -22,5 +22,8 @@ hmac.workspace = true
 sha2.workspace = true
 aes-gcm.workspace = true
 
+[features]
+production = ["common/production"]
+
 [dev-dependencies]
 proptest = "1"

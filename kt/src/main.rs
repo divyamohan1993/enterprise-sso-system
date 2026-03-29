@@ -33,6 +33,9 @@ async fn main() {
         _platform_report.binary_hash,
     );
 
+    // Initialize master KEK via distributed threshold reconstruction (3-of-5 Shamir)
+    let _kek = common::sealed_keys::get_master_kek();
+
     // Initialize structured JSON logging for production observability
     common::structured_logging::init(common::structured_logging::ServiceMeta {
         service_name: "kt".to_string(),
