@@ -261,15 +261,11 @@ fn ensure_crypto_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
-/// Create a TLS-enabled SHARD listener for the given module with certificate pinning.
+/// Create a TLS-enabled SHARD listener for the given module with mTLS.
 ///
-/// Generates a self-signed CA and module certificate at startup, then enforces
-/// certificate pinning by default. The server's own certificate is added to
-/// the pin set so that clients presenting a certificate signed by the same CA
-/// and matching a known fingerprint are accepted.
-///
-/// In production mode, pinning is always enforced. In dev mode, it is also
-/// enforced (defense-in-depth) but failures are logged rather than fatal.
+/// Generates a self-signed CA and module certificate at startup. The server
+/// enforces mutual TLS (client must present a valid certificate signed by the
+/// CA). For additional certificate pinning, use [`tls_bind_pinned`].
 ///
 /// Returns (listener, ca, cert_key) for the caller to share the CA with clients.
 pub async fn tls_bind(
@@ -282,21 +278,26 @@ pub async fn tls_bind(
     let ca = crate::tls::generate_ca();
     let cert_key = crate::tls::generate_module_cert(module_name, &ca);
 
-    // Build a pin set containing the server's own certificate.
-    // Clients that present a cert signed by the same CA will also need
-    // their fingerprint added via the returned cert_key / CA.
-    let pin_set = crate::tls::build_pin_set_from_certs(&[&cert_key]);
-    let server_config = crate::tls::server_tls_config_pinned(&cert_key, &ca, pin_set);
+    // Use mTLS with CA chain verification. For explicit certificate pinning
+    // (defense against CA compromise), use tls_bind_pinned() with a known
+    // set of peer certificate fingerprints.
+    let server_config = crate::tls::server_tls_config(&cert_key, &ca);
+
+    if common::sealed_keys::is_production() {
+        tracing::warn!(
+            module = module_name,
+            "mTLS without explicit certificate pinning — consider tls_bind_pinned() for CA compromise defense"
+        );
+    }
 
     let listener = TlsShardListener::bind(addr, module_id, hmac_key, server_config).await?;
     Ok((listener, ca, cert_key))
 }
 
-/// Create a TLS connector for a client module with certificate pinning.
+/// Create a TLS connector for a client module with mTLS.
 ///
-/// Generates its own CA and certificate, then enforces certificate pinning
-/// by default. The client's own certificate fingerprint is added to the pin
-/// set so that the server's certificate (signed by the same CA) is accepted.
+/// Generates its own CA and certificate. For additional certificate pinning,
+/// use [`tls_client_setup_pinned`].
 ///
 /// Returns (connector, ca, cert_key) so the caller can share the CA with servers.
 pub fn tls_client_setup(
@@ -305,8 +306,7 @@ pub fn tls_client_setup(
     ensure_crypto_provider();
     let ca = crate::tls::generate_ca();
     let cert_key = crate::tls::generate_module_cert(module_name, &ca);
-    let pin_set = crate::tls::build_pin_set_from_certs(&[&cert_key]);
-    let client_config = crate::tls::client_tls_config_pinned(&cert_key, &ca, pin_set);
+    let client_config = crate::tls::client_tls_config(&cert_key, &ca);
     let connector = crate::tls::tls_connector(client_config);
     (connector, ca, cert_key)
 }
