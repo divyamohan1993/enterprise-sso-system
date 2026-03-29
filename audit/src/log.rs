@@ -380,7 +380,7 @@ impl AuditLog {
             .count();
         if expired_count > 0 {
             if let Some(ref dir) = self.archive_dir.clone() {
-                let expired_entries: Vec<AuditEntry> = self.entries.drain(..expired_count).collect();
+                let mut expired_entries: Vec<AuditEntry> = self.entries.drain(..expired_count).collect();
 
                 // Build archive filename with timestamp
                 let ts = SystemTime::now()
