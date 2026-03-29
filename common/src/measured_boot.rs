@@ -45,6 +45,20 @@ pub struct BootAttestation {
 }
 
 impl BootAttestation {
+    /// Create a dummy attestation for dev mode (no vTPM, no real attestation).
+    pub fn dev_mode() -> Self {
+        Self {
+            tpm_available: false,
+            tpm_version: String::from("dev-mode"),
+            binary_hash: [0u8; 64],
+            boot_id: String::from("dev-mode"),
+            attestation_time: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
+        }
+    }
+
     /// Create a boot attestation from the platform checks already performed.
     pub fn from_checks(tpm_info: &TpmInfo, self_att: &SelfAttestation) -> Self {
         Self {

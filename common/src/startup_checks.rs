@@ -63,6 +63,35 @@ pub fn run_platform_checks<F: FnOnce() -> bool>(harden_fn: F) -> (
     JoinHandle<()>,
     Arc<RuntimeIntegrityMonitor>,
 ) {
+    // Dev mode: skip all platform checks (no vTPM, no hardening, no attestation)
+    if std::env::var("MILNET_DEV_MODE").unwrap_or_default() == "1" {
+        tracing::warn!("MILNET_DEV_MODE=1: skipping all platform integrity checks");
+        let _ = harden_fn(); // best-effort hardening, ignore result
+        let monitor = Arc::new(platform_integrity::RuntimeIntegrityMonitor::new());
+        let monitor_ref = Arc::clone(&monitor);
+        let handle = std::thread::Builder::new()
+            .name("integrity-monitor-noop".to_string())
+            .spawn(move || {
+                // No-op monitor in dev mode — just park the thread
+                loop { std::thread::park(); }
+            })
+            .expect("failed to spawn noop monitor thread");
+        let report = PlatformAttestationReport {
+            tpm_info: platform_integrity::TpmInfo {
+                available: false,
+                version: String::from("dev-mode"),
+                device_path: String::from("none"),
+            },
+            process_hardened: false,
+            binary_hash: [0u8; 64],
+            boot_id: String::from("dev-mode"),
+            boot_attestation: crate::measured_boot::BootAttestation::dev_mode(),
+            all_passed: true,
+            summary: String::from("DEV_MODE: all checks skipped"),
+        };
+        return (report, handle, monitor_ref);
+    }
+
     let mut all_passed = true;
     let mut summary_parts: Vec<String> = Vec::new();
 

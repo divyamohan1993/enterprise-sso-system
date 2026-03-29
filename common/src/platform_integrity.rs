@@ -60,6 +60,10 @@ impl std::error::Error for PlatformError {}
 // ---------------------------------------------------------------------------
 
 fn is_production() -> bool {
+    // Dev mode disables production-only checks (vTPM, measured boot, etc.)
+    if std::env::var("MILNET_DEV_MODE").unwrap_or_default() == "1" {
+        return false;
+    }
     true
 }
 

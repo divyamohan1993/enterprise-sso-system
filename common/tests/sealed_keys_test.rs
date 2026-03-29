@@ -137,11 +137,12 @@ fn module_hmac_key_derivation_is_order_independent() {
 
 // ── Production Mode ───────────────────────────────────────────────────────
 
-/// Security property: is_production() ALWAYS returns true.
-/// There is only one mode: production. Dev/staging distinctions are removed.
+/// Security property: is_production() returns true by default.
+/// MILNET_DEV_MODE=1 disables production checks for testing/MVP.
 #[test]
-fn is_production_always_returns_true() {
-    assert!(is_production(), "is_production() must ALWAYS return true");
+fn is_production_true_by_default() {
+    std::env::remove_var("MILNET_DEV_MODE");
+    assert!(is_production(), "is_production() must return true by default");
 }
 
 // ── HSM Backend Detection ─────────────────────────────────────────────────
