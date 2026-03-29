@@ -46,7 +46,7 @@ fn verify_receipt_independently(
     //    Prevents replay of old receipts and rejects future-dated forgeries.
     let now_us = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or(std::time::Duration::ZERO)
         .as_micros() as i64;
     let drift_us = (now_us - receipt.timestamp).abs();
     let max_drift_us: i64 = 10 * 1_000_000; // 10 seconds in microseconds
@@ -498,7 +498,8 @@ impl OrchestratorService {
 
         // 6. Build and send TSS signing request
         let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or(std::time::Duration::ZERO)
             .as_micros() as i64;
 
         let security_config = common::config::SecurityConfig::default();

@@ -156,10 +156,9 @@ impl<const N: usize> SecretBuffer<N> {
 
         // Attempt to mlock the data region.
         // SECURITY: mlock prevents key material from being swapped to disk.
-        // If mlock fails (e.g., RLIMIT_MEMLOCK too low), we log a CRITICAL
-        // warning and set the MLOCK_DEGRADED flag rather than panicking.
-        // This allows the system to continue in degraded mode while alerting
-        // operators that key material may be swappable.
+        // In military deployment mode (MILNET_MILITARY_DEPLOYMENT=1), mlock
+        // failure is FATAL — keys without mlock can be swapped to disk and
+        // recovered by a nation-state attacker with physical access.
         let data_ptr = buf.data.as_ptr();
         if mlock_slice(data_ptr, N) {
             buf.locked = true;
@@ -167,6 +166,23 @@ impl<const N: usize> SecretBuffer<N> {
             madv_dontdump(data_ptr, N);
         } else {
             MLOCK_DEGRADED.store(true, Ordering::SeqCst);
+
+            // SECURITY: In military/production deployment, mlock failure is
+            // UNACCEPTABLE. Sensitive keys without mlock can be swapped to
+            // disk and recovered via forensic analysis of swap partitions.
+            let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+
+            if is_military {
+                panic!(
+                    "FATAL: mlock failed for {N}-byte SecretBuffer in military deployment \
+                     (MILNET_MILITARY_DEPLOYMENT=1). Key material MUST be locked in RAM. \
+                     Ensure RLIMIT_MEMLOCK is sufficient (ulimit -l). Aborting to prevent \
+                     key material from being swapped to disk."
+                );
+            }
+
             tracing::error!(
                 buffer_size = N,
                 "CRITICAL SECURITY DEGRADATION: mlock failed for {N}-byte SecretBuffer. \
@@ -320,9 +336,22 @@ impl SecretVec {
             // Exclude from core dumps
             madv_dontdump(ptr, len);
         } else {
-            // SECURITY: Graceful degradation — log CRITICAL but continue.
-            // The MLOCK_DEGRADED flag is checked at startup to emit SIEM alerts.
+            // SECURITY: In military deployment, mlock failure is FATAL.
             MLOCK_DEGRADED.store(true, Ordering::SeqCst);
+
+            let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+
+            if is_military {
+                panic!(
+                    "FATAL: mlock failed for {len}-byte SecretVec in military deployment \
+                     (MILNET_MILITARY_DEPLOYMENT=1). Key material MUST be locked in RAM. \
+                     Ensure RLIMIT_MEMLOCK is sufficient (ulimit -l). Aborting to prevent \
+                     key material from being swapped to disk."
+                );
+            }
+
             tracing::error!(
                 buffer_size = len,
                 "CRITICAL SECURITY DEGRADATION: mlock failed for {len}-byte SecretVec. \

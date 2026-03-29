@@ -36,6 +36,7 @@ pub mod cross_domain;
 // ── Security infrastructure ──
 pub mod session_limits;
 pub mod circuit_breaker;
+pub mod bulkhead;
 pub mod siem;
 pub mod key_rotation;
 pub mod retry;
@@ -175,3 +176,6 @@ pub mod stealth_detection;
 pub mod quarantine;
 pub mod auto_response;
 pub mod runtime_defense;
+
+// ── Resilience: deadline propagation ──
+pub mod deadline;

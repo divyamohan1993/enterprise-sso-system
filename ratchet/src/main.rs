@@ -82,6 +82,7 @@ async fn main() {
         },
     );
 
+
     tracing::info!("Ratchet Session Manager starting");
 
     // Determine operational mode based on DATABASE_URL availability
@@ -136,42 +137,88 @@ async fn main() {
             .await
             .unwrap();
 
+    // SECURITY: Verify kernel security posture (ptrace_scope, BPF restrictions)
+    common::startup_checks::verify_kernel_security_posture();
+
+    // SECURITY: Verify process hardening flags and apply anti-ptrace
+    crypto::seccomp::apply_anti_ptrace();
+    crypto::seccomp::verify_process_hardening();
+
+    // SECURITY: Remove ALL sensitive env vars from /proc/PID/environ.
+    // All config has been loaded above; secrets must not linger in memory.
+    common::startup_checks::sanitize_environment();
+
     tracing::info!("Ratchet Session Manager listening on {addr} (mTLS)");
+
+    // SECURITY: Graceful shutdown on SIGTERM/SIGINT.
+    // - Stops accepting new ratchet requests
+    // - Waits for in-flight chain operations to complete (30s timeout)
+    // - Zeroizes chain key material before exit
+    let mut sigterm = tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::terminate(),
+    ).expect("failed to install SIGTERM handler");
+    let mut sigint = tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::interrupt(),
+    ).expect("failed to install SIGINT handler");
+
     loop {
-        if let Ok(mut transport) = listener.accept().await {
-            let pm = persistent_manager.clone();
-            let sm = standalone_manager.clone();
-            tokio::spawn(async move {
-                while let Ok((_sender, payload)) = transport.recv().await {
-                    let response = match postcard::from_bytes::<RatchetRequest>(&payload) {
-                        Ok(request) => {
-                            if let Some(ref mgr) = pm {
-                                handle_request_persistent(mgr, request).await
-                            } else if let Some(ref mgr) = sm {
-                                handle_request_standalone(mgr, request).await
-                            } else {
-                                RatchetResponse {
+        tokio::select! {
+            accept_result = listener.accept() => {
+                if let Ok(mut transport) = accept_result {
+                    let pm = persistent_manager.clone();
+                    let sm = standalone_manager.clone();
+                    tokio::spawn(async move {
+                        while let Ok((_sender, payload)) = transport.recv().await {
+                            let response = match postcard::from_bytes::<RatchetRequest>(&payload) {
+                                Ok(request) => {
+                                    if let Some(ref mgr) = pm {
+                                        handle_request_persistent(mgr, request).await
+                                    } else if let Some(ref mgr) = sm {
+                                        handle_request_standalone(mgr, request).await
+                                    } else {
+                                        RatchetResponse {
+                                            success: false,
+                                            epoch: None,
+                                            tag: None,
+                                            error: Some("no manager configured".into()),
+                                        }
+                                    }
+                                }
+                                Err(e) => RatchetResponse {
                                     success: false,
                                     epoch: None,
                                     tag: None,
-                                    error: Some("no manager configured".into()),
-                                }
-                            }
+                                    error: Some(format!("deserialize error: {e}")),
+                                },
+                            };
+                            let encoded = postcard::to_allocvec(&response)
+                                .expect("RatchetResponse must serialize");
+                            let _ = transport.send(&encoded).await;
                         }
-                        Err(e) => RatchetResponse {
-                            success: false,
-                            epoch: None,
-                            tag: None,
-                            error: Some(format!("deserialize error: {e}")),
-                        },
-                    };
-                    let encoded = postcard::to_allocvec(&response)
-                        .expect("RatchetResponse must serialize");
-                    let _ = transport.send(&encoded).await;
+                    });
                 }
-            });
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("received SIGTERM, initiating graceful shutdown");
+                break;
+            }
+            _ = sigint.recv() => {
+                tracing::info!("received SIGINT, initiating graceful shutdown");
+                break;
+            }
         }
     }
+
+    tracing::info!("ratchet: waiting up to 30s for in-flight chain operations...");
+    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
+    // SECURITY: Zeroize HMAC key material before exit
+    {
+        use zeroize::Zeroize;
+        let mut key_to_zeroize = hmac_key;
+        key_to_zeroize.zeroize();
+    }
+    tracing::info!("ratchet: graceful shutdown complete");
 }
 
 /// Verify that mlock is available on this system. In production mode, panic

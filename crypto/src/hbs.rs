@@ -410,10 +410,14 @@ fn lms_internal_node(
 /// Pass `None` to use the default LMS_H=20.
 pub fn lms_keygen_with_height(tree_height: usize) -> (LmsPrivateKey, LmsPublicKey) {
     let mut seed = [0u8; N];
-    getrandom::getrandom(&mut seed).expect("getrandom failed");
+    if getrandom::getrandom(&mut seed).is_err() {
+        panic!("FATAL: OS CSPRNG unavailable — cannot generate LMS seed safely");
+    }
 
     let mut identifier = [0u8; 16];
-    getrandom::getrandom(&mut identifier).expect("getrandom failed");
+    if getrandom::getrandom(&mut identifier).is_err() {
+        panic!("FATAL: OS CSPRNG unavailable — cannot generate LMS identifier safely");
+    }
 
     lms_keygen_from_seed(&seed, &identifier, tree_height)
 }
@@ -526,7 +530,9 @@ pub fn lms_sign(
 
     // Generate randomizer C
     let mut c = [0u8; N];
-    getrandom::getrandom(&mut c).expect("getrandom failed");
+    if getrandom::getrandom(&mut c).is_err() {
+        panic!("FATAL: OS CSPRNG unavailable — cannot generate LMS signature randomizer");
+    }
 
     // Compute LMOTS signature: hash message with C to get the checksum input
     let mut q_hash = Sha256::new();

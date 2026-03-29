@@ -296,6 +296,10 @@ pub enum TenantError {
         from: TenantStatus,
         to: TenantStatus,
     },
+
+    /// Internal error (e.g., lock poisoning).
+    #[error("internal error: {0}")]
+    InternalError(String),
 }
 
 // ── TenantAuditFilter ───────────────────────────────────────────────────────
@@ -371,13 +375,13 @@ pub fn assert_same_tenant(a: &TenantId, b: &TenantId) -> Result<(), TenantError>
 ///
 /// # Returns
 /// A 256-bit per-tenant KEK suitable for wrapping data encryption keys.
-pub fn derive_tenant_kek(tenant_id: TenantId, master_kek: &[u8; 32]) -> [u8; 32] {
+pub fn derive_tenant_kek(tenant_id: TenantId, master_kek: &[u8; 32]) -> Result<[u8; 32], String> {
     let hk = Hkdf::<Sha512>::new(Some(TENANT_KEK_DOMAIN.as_bytes()), master_kek);
     let info = format!("{}:{}", TENANT_KEK_DOMAIN, tenant_id);
     let mut okm = [0u8; 32];
     hk.expand(info.as_bytes(), &mut okm)
-        .expect("32-byte HKDF-SHA512 expand must succeed");
-    okm
+        .map_err(|_| "HKDF-SHA512 tenant KEK derivation failed".to_string())?;
+    Ok(okm)
 }
 
 // ── Resource usage tracking ─────────────────────────────────────────────────
@@ -427,7 +431,7 @@ impl TenantManager {
             return Err(TenantError::InvalidSlug(tenant.slug.clone()));
         }
 
-        let mut slugs = self.slugs.write().unwrap();
+        let mut slugs = self.slugs.write().map_err(|_| TenantError::InternalError("lock poisoned — potential state corruption".to_string()))?;
         if slugs.contains_key(&tenant.slug) {
             return Err(TenantError::DuplicateSlug(tenant.slug.clone()));
         }
@@ -438,22 +442,23 @@ impl TenantManager {
 
         self.usage
             .write()
-            .unwrap()
+            .map_err(|_| TenantError::InternalError("lock poisoned — potential state corruption".to_string()))?
             .insert(id, ResourceUsage::default());
-        self.tenants.write().unwrap().insert(id, tenant);
+        self.tenants.write().map_err(|_| TenantError::InternalError("lock poisoned — potential state corruption".to_string()))?.insert(id, tenant);
 
         tracing::info!(tenant_id = %id, "tenant created");
         Ok(id)
     }
 
     /// Look up a tenant by ID.
-    pub fn get_tenant(&self, id: TenantId) -> Option<Tenant> {
-        self.tenants.read().unwrap().get(&id).cloned()
+    pub fn get_tenant(&self, id: TenantId) -> Result<Option<Tenant>, TenantError> {
+        let guard = self.tenants.read().map_err(|_| TenantError::InternalError("lock poisoned — potential state corruption".to_string()))?;
+        Ok(guard.get(&id).cloned())
     }
 
     /// Suspend a tenant, blocking all authentication and data access.
     pub fn suspend_tenant(&self, id: TenantId, reason: &str) -> Result<(), TenantError> {
-        let mut tenants = self.tenants.write().unwrap();
+        let mut tenants = self.tenants.write().map_err(|_| TenantError::InternalError("lock poisoned — potential state corruption".to_string()))?;
         let tenant = tenants
             .get_mut(&id)
             .ok_or(TenantError::TenantNotFound(id))?;
@@ -477,7 +482,7 @@ impl TenantManager {
 
     /// Reactivate a previously suspended tenant.
     pub fn reactivate_tenant(&self, id: TenantId) -> Result<(), TenantError> {
-        let mut tenants = self.tenants.write().unwrap();
+        let mut tenants = self.tenants.write().map_err(|_| TenantError::InternalError("lock poisoned — potential state corruption".to_string()))?;
         let tenant = tenants
             .get_mut(&id)
             .ok_or(TenantError::TenantNotFound(id))?;
@@ -496,7 +501,7 @@ impl TenantManager {
 
     /// Begin decommissioning a tenant. This is a terminal transition.
     pub fn decommission_tenant(&self, id: TenantId, reason: &str) -> Result<(), TenantError> {
-        let mut tenants = self.tenants.write().unwrap();
+        let mut tenants = self.tenants.write().map_err(|_| TenantError::InternalError("lock poisoned — potential state corruption".to_string()))?;
         let tenant = tenants
             .get_mut(&id)
             .ok_or(TenantError::TenantNotFound(id))?;
@@ -521,7 +526,7 @@ impl TenantManager {
 
     /// Mark a decommissioning tenant as fully decommissioned.
     pub fn finalize_decommission(&self, id: TenantId) -> Result<(), TenantError> {
-        let mut tenants = self.tenants.write().unwrap();
+        let mut tenants = self.tenants.write().map_err(|_| TenantError::InternalError("lock poisoned — potential state corruption".to_string()))?;
         let tenant = tenants
             .get_mut(&id)
             .ok_or(TenantError::TenantNotFound(id))?;
@@ -543,8 +548,9 @@ impl TenantManager {
     }
 
     /// List all tenants.
-    pub fn list_tenants(&self) -> Vec<Tenant> {
-        self.tenants.read().unwrap().values().cloned().collect()
+    pub fn list_tenants(&self) -> Result<Vec<Tenant>, TenantError> {
+        let guard = self.tenants.read().map_err(|_| TenantError::InternalError("lock poisoned — potential state corruption".to_string()))?;
+        Ok(guard.values().cloned().collect())
     }
 
     /// Update the user and device quotas for a tenant.
@@ -554,7 +560,7 @@ impl TenantManager {
         max_users: u64,
         max_devices: u64,
     ) -> Result<(), TenantError> {
-        let mut tenants = self.tenants.write().unwrap();
+        let mut tenants = self.tenants.write().map_err(|_| TenantError::InternalError("lock poisoned — potential state corruption".to_string()))?;
         let tenant = tenants
             .get_mut(&id)
             .ok_or(TenantError::TenantNotFound(id))?;
@@ -574,9 +580,9 @@ impl TenantManager {
     /// Supported resources: `"users"`, `"devices"`.
     /// Returns `Ok(true)` if under quota, `Ok(false)` if at/over quota.
     pub fn check_quota(&self, id: TenantId, resource: &str) -> Result<bool, TenantError> {
-        let tenants = self.tenants.read().unwrap();
+        let tenants = self.tenants.read().map_err(|_| TenantError::InternalError("lock poisoned — potential state corruption".to_string()))?;
         let tenant = tenants.get(&id).ok_or(TenantError::TenantNotFound(id))?;
-        let usage = self.usage.read().unwrap();
+        let usage = self.usage.read().map_err(|_| TenantError::InternalError("lock poisoned — potential state corruption".to_string()))?;
         let counters = usage.get(&id).ok_or(TenantError::TenantNotFound(id))?;
 
         match resource {
@@ -592,7 +598,7 @@ impl TenantManager {
         id: TenantId,
         resource: &str,
     ) -> Result<(), TenantError> {
-        let tenants = self.tenants.read().unwrap();
+        let tenants = self.tenants.read().map_err(|_| TenantError::InternalError("lock poisoned — potential state corruption".to_string()))?;
         let tenant = tenants.get(&id).ok_or(TenantError::TenantNotFound(id))?;
 
         if !tenant.is_active() {
@@ -602,7 +608,7 @@ impl TenantManager {
             });
         }
 
-        let mut usage = self.usage.write().unwrap();
+        let mut usage = self.usage.write().map_err(|_| TenantError::InternalError("lock poisoned — potential state corruption".to_string()))?;
         let counters = usage.get_mut(&id).ok_or(TenantError::TenantNotFound(id))?;
 
         match resource {
@@ -640,7 +646,7 @@ impl TenantManager {
     /// After calling this method, the tenant status transitions to Decommissioned
     /// and all in-memory usage counters / slug mappings are purged.
     pub fn finalize_decommission_with_purge(&self, id: TenantId) -> Result<(), TenantError> {
-        let mut tenants = self.tenants.write().unwrap();
+        let mut tenants = self.tenants.write().map_err(|_| TenantError::InternalError("lock poisoned — potential state corruption".to_string()))?;
         let tenant = tenants
             .get_mut(&id)
             .ok_or(TenantError::TenantNotFound(id))?;
@@ -654,12 +660,12 @@ impl TenantManager {
 
         // Remove slug mapping
         let slug = tenant.slug.clone();
-        let mut slugs = self.slugs.write().unwrap();
+        let mut slugs = self.slugs.write().map_err(|_| TenantError::InternalError("lock poisoned — potential state corruption".to_string()))?;
         slugs.remove(&slug);
         drop(slugs);
 
         // Remove usage counters
-        let mut usage = self.usage.write().unwrap();
+        let mut usage = self.usage.write().map_err(|_| TenantError::InternalError("lock poisoned — potential state corruption".to_string()))?;
         usage.remove(&id);
         drop(usage);
 
@@ -695,7 +701,7 @@ impl TenantManager {
         &self,
         id: TenantId,
     ) -> Result<String, TenantError> {
-        let tenants = self.tenants.read().unwrap();
+        let tenants = self.tenants.read().map_err(|_| TenantError::InternalError("lock poisoned — potential state corruption".to_string()))?;
         let tenant = tenants.get(&id).ok_or(TenantError::TenantNotFound(id))?;
         Ok(tenant.encryption_key_id.clone())
     }

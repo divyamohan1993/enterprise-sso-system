@@ -14,7 +14,7 @@
 //! - SP metadata parsing and trust store
 //! - HTTP-POST, HTTP-Redirect, SOAP bindings
 //! - SIEM event integration
-//! - Configurable clock skew tolerance (default ±60s)
+//! - Configurable clock skew tolerance (default ±30s, hardened from ±60s)
 //! - DoD CAC integration: map CAC certificate to SAML NameID
 #![forbid(unsafe_code)]
 
@@ -23,15 +23,84 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 use crate::siem::SecurityEvent;
 
 // ── Clock skew tolerance ────────────────────────────────────────────────────
 
-/// Default clock skew tolerance in seconds (±60s).
-const DEFAULT_CLOCK_SKEW_SECS: i64 = 60;
+/// Default clock skew tolerance in seconds (±30s).
+///
+/// SECURITY: Reduced from 60s to 30s to narrow the SAML assertion replay
+/// window from 120s to 60s. Combined with assertion ID replay detection,
+/// this minimizes the window in which a captured assertion can be reused.
+/// For DoD/Pentagon deployments, NTP synchronization should keep clock
+/// drift well under 30s across all nodes.
+const DEFAULT_CLOCK_SKEW_SECS: i64 = 30;
+
+// ── SAML Assertion ID Replay Prevention ────────────────────────────────────
+static ASSERTION_ID_CACHE: std::sync::OnceLock<Mutex<AssertionIdCache>> = std::sync::OnceLock::new();
+
+struct AssertionIdCache {
+    seen: HashMap<String, i64>,
+    last_cleanup: i64,
+}
+
+impl AssertionIdCache {
+    fn new() -> Self {
+        Self { seen: HashMap::new(), last_cleanup: 0 }
+    }
+
+    fn check_and_record(&mut self, assertion_id: &str, retention_secs: i64) -> Result<(), String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        if now > self.last_cleanup + 60 {
+            self.seen.retain(|_, expiry| *expiry > now);
+            self.last_cleanup = now;
+        }
+        if self.seen.contains_key(assertion_id) {
+            SecurityEvent::saml_assertion_replay_detected(assertion_id);
+            return Err(format!(
+                "SECURITY: SAML assertion ID '{}' already used — replay attack detected",
+                assertion_id
+            ));
+        }
+        self.seen.insert(assertion_id.to_string(), now + retention_secs);
+        Ok(())
+    }
+}
+
+fn assertion_id_cache() -> &'static Mutex<AssertionIdCache> {
+    ASSERTION_ID_CACHE.get_or_init(|| Mutex::new(AssertionIdCache::new()))
+}
+
+/// Check a SAML assertion ID for replay and record it if new.
+///
+/// SECURITY: Must be called before accepting any SAML assertion. Uses the
+/// global assertion ID cache to detect and reject replayed assertions.
+/// `clock_skew_secs` is the configured clock skew tolerance; the ID is
+/// retained for 2x this value to cover the full assertion validity window.
+///
+/// In a distributed deployment, this should be backed by an atomic database
+/// operation: `INSERT INTO seen_assertion_ids (id, expiry) VALUES ($1, $2)
+/// ON CONFLICT DO NOTHING RETURNING id` — if no row is returned, the ID
+/// was already present (replay).
+pub fn check_assertion_id_replay(
+    assertion_id: &str,
+    clock_skew_secs: i64,
+) -> Result<(), String> {
+    if assertion_id.is_empty() {
+        return Err("SECURITY: SAML assertion ID is empty — rejected".to_string());
+    }
+    let retention_secs = clock_skew_secs * 2;
+    let mut cache = assertion_id_cache()
+        .lock()
+        .map_err(|_| "assertion ID cache lock poisoned".to_string())?;
+    cache.check_and_record(assertion_id, retention_secs)
+}
 
 // ── SAML NameID Formats ─────────────────────────────────────────────────────
 
@@ -473,6 +542,12 @@ impl AuthnRequest {
             return Err("AuthnRequest XML exceeds maximum allowed size (64KB)".to_string());
         }
 
+        // SECURITY: XXE Prevention — reject XML containing DTD declarations or
+        // external entity references. These can be used to read local files,
+        // perform SSRF, or cause denial of service (billion laughs attack).
+        // SAML XML must never contain DTDs or entity declarations.
+        reject_xxe(xml)?;
+
         let id = extract_xml_attr(xml, "AuthnRequest", "ID")
             .ok_or_else(|| "missing ID attribute on AuthnRequest".to_string())?;
         let issue_instant = extract_xml_attr(xml, "AuthnRequest", "IssueInstant")
@@ -901,15 +976,15 @@ pub struct SamlArtifact {
 
 impl SamlArtifact {
     /// Create a new artifact for the given entity ID.
-    pub fn new(entity_id: &str, endpoint_index: u16) -> Self {
+    pub fn new(entity_id: &str, endpoint_index: u16) -> Result<Self, String> {
         let source_id = sha1_hash(entity_id.as_bytes());
-        let message_handle: [u8; 20] = rand_bytes_20();
-        Self {
+        let message_handle: [u8; 20] = rand_bytes_20()?;
+        Ok(Self {
             type_code: 0x0004,
             endpoint_index,
             source_id,
             message_handle,
-        }
+        })
     }
 
     /// Encode the artifact as a base64 string for transmission.
@@ -1148,6 +1223,9 @@ impl LogoutRequest {
         if xml.len() > 64 * 1024 {
             return Err("LogoutRequest XML exceeds maximum allowed size".to_string());
         }
+        // SECURITY: XXE Prevention — reject DTDs and external entities.
+        reject_xxe(xml)?;
+        }
 
         let id = extract_xml_attr(xml, "LogoutRequest", "ID")
             .ok_or("missing ID on LogoutRequest")?;
@@ -1273,6 +1351,8 @@ impl SpMetadata {
         if xml.len() > 256 * 1024 {
             return Err("SP metadata XML exceeds maximum allowed size (256KB)".to_string());
         }
+        // SECURITY: XXE Prevention — reject DTDs and external entities.
+        reject_xxe(xml)?;
 
         let entity_id = extract_xml_attr(xml, "EntityDescriptor", "entityID")
             .ok_or("missing entityID in SP metadata")?;
@@ -1517,6 +1597,11 @@ impl SamlIdp {
         authn_request: &AuthnRequest,
         user: &AuthenticatedUser,
     ) -> Result<SamlResponse, String> {
+        // SECURITY: Check AuthnRequest ID for replay before processing.
+        // Prevents an attacker from replaying a captured AuthnRequest to
+        // obtain a fresh assertion for a user who has already authenticated.
+        check_assertion_id_replay(&authn_request.id, self.config.clock_skew_secs)?;
+
         // Look up SP in trust store
         let sp = self
             .trust_store
@@ -1753,7 +1838,7 @@ impl SamlIdp {
     ) -> Result<(SamlArtifact, String), String> {
         let response = self.handle_authn_request(authn_request, user)?;
         let response_xml = response.to_xml();
-        let artifact = SamlArtifact::new(&self.config.entity_id, 0);
+        let artifact = SamlArtifact::new(&self.config.entity_id, 0)?;
         self.artifact_store.store(&artifact, &response_xml)?;
         let relay_state = response.relay_state.clone();
         Ok((artifact, relay_state.unwrap_or_default()))
@@ -1850,8 +1935,8 @@ fn extract_cn_from_dn(dn: &str) -> Option<String> {
 /// For now, we generate the encrypted structure with a placeholder key transport.
 fn encrypt_assertion_aes256gcm(assertion_xml: &str) -> Result<String, String> {
     // Generate random 256-bit key and 96-bit nonce
-    let key: [u8; 32] = rand_bytes_32();
-    let nonce: [u8; 12] = rand_bytes_12();
+    let key: [u8; 32] = rand_bytes_32()?;
+    let nonce: [u8; 12] = rand_bytes_12()?;
 
     // AES-256-GCM encryption using the crypto crate's AES-GCM
     let ciphertext = aes_256_gcm_encrypt(&key, &nonce, assertion_xml.as_bytes())
@@ -1885,7 +1970,7 @@ pub fn sign_xml_enveloped(
     // - For ML-DSA-87: use crypto::pq_sign::pq_sign_raw
     // - For RSA-SHA256: use RSA PKCS#1 v1.5 signature
     // For now, generate a placeholder signature value using HMAC
-    let sig_value = hmac_sha256(_signing_key_bytes, xml.as_bytes());
+    let sig_value = hmac_sha256(_signing_key_bytes, xml.as_bytes())?;
     let sig_b64 = BASE64_STD.encode(sig_value);
 
     let signature_xml = format!(
@@ -2067,6 +2152,27 @@ impl SecurityEvent {
         };
         event.emit();
     }
+
+    /// Emit a SAML assertion replay detection event.
+    ///
+    /// SECURITY: This is a CRITICAL severity event — assertion replay indicates
+    /// an active attack. SOC/SIEM should trigger immediate investigation.
+    pub fn saml_assertion_replay_detected(assertion_id: &str) {
+        let event = SecurityEvent {
+            timestamp: Self::now_iso8601(),
+            category: "saml",
+            action: "assertion_replay_detected",
+            severity: crate::siem::Severity::Critical,
+            outcome: "failure",
+            user_id: None,
+            source_ip: None,
+            detail: Some(format!(
+                "SECURITY: SAML assertion replay detected: id={}",
+                assertion_id
+            )),
+        };
+        event.emit();
+    }
 }
 
 // ── Utility Functions ───────────────────────────────────────────────────────
@@ -2221,6 +2327,54 @@ fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+/// SECURITY: XXE (XML External Entity) Prevention.
+///
+/// Rejects XML documents containing DTD declarations, entity definitions, or
+/// external entity references. These are attack vectors for:
+/// - Local file disclosure (`<!ENTITY xxe SYSTEM "file:///etc/passwd">`)
+/// - Server-Side Request Forgery (`<!ENTITY xxe SYSTEM "http://internal/">`)
+/// - Denial of Service via entity expansion ("billion laughs" attack)
+/// - Remote code execution in some XML parser configurations
+///
+/// SAML XML MUST NOT contain DTDs or entity declarations per the SAML spec.
+/// This function performs case-insensitive pattern matching to catch all
+/// common XXE payload variants.
+fn reject_xxe(xml: &str) -> Result<(), String> {
+    // Convert to uppercase for case-insensitive matching of XML directives.
+    // DTD and ENTITY declarations are case-insensitive in XML.
+    let upper = xml.to_uppercase();
+
+    if upper.contains("<!DOCTYPE") {
+        return Err(
+            "SECURITY: XML contains <!DOCTYPE> declaration — rejected (XXE prevention)".to_string(),
+        );
+    }
+    if upper.contains("<!ENTITY") {
+        return Err(
+            "SECURITY: XML contains <!ENTITY> declaration — rejected (XXE prevention)".to_string(),
+        );
+    }
+    // Reject SYSTEM and PUBLIC identifiers in entity/DTD context
+    // (these are used for external entity resolution).
+    if upper.contains("SYSTEM \"") || upper.contains("SYSTEM '") {
+        return Err(
+            "SECURITY: XML contains SYSTEM identifier — rejected (XXE prevention)".to_string(),
+        );
+    }
+    if upper.contains("PUBLIC \"") || upper.contains("PUBLIC '") {
+        return Err(
+            "SECURITY: XML contains PUBLIC identifier — rejected (XXE prevention)".to_string(),
+        );
+    }
+    // Reject XML processing instructions that could trigger external parsing.
+    if xml.contains("<?xml-stylesheet") {
+        return Err(
+            "SECURITY: XML contains processing instruction — rejected (XXE prevention)".to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Simple DEFLATE decompression (raw, no zlib header).
 fn inflate_raw(data: &[u8]) -> Result<String, String> {
     // Minimal implementation: for production use miniz_oxide or flate2
@@ -2248,14 +2402,15 @@ fn sha256_hash(data: &[u8]) -> [u8; 32] {
 }
 
 /// HMAC-SHA256.
-fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Result<[u8; 32], String> {
     type HmacSha256 = Hmac<Sha256>;
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC key");
+    let mut mac = HmacSha256::new_from_slice(key)
+        .map_err(|_| "HMAC-SHA256 key initialization failed".to_string())?;
     mac.update(data);
     let result = mac.finalize().into_bytes();
     let mut output = [0u8; 32];
     output.copy_from_slice(&result);
-    output
+    Ok(output)
 }
 
 /// AES-256-GCM encryption.
@@ -2270,24 +2425,24 @@ fn aes_256_gcm_encrypt(key: &[u8; 32], nonce: &[u8; 12], plaintext: &[u8]) -> Re
 }
 
 /// Generate 20 random bytes.
-fn rand_bytes_20() -> [u8; 20] {
+fn rand_bytes_20() -> Result<[u8; 20], String> {
     let mut buf = [0u8; 20];
-    getrandom::getrandom(&mut buf).expect("getrandom failed");
-    buf
+    getrandom::getrandom(&mut buf).map_err(|e| format!("CSPRNG entropy failure: {e}"))?;
+    Ok(buf)
 }
 
 /// Generate 32 random bytes.
-fn rand_bytes_32() -> [u8; 32] {
+fn rand_bytes_32() -> Result<[u8; 32], String> {
     let mut buf = [0u8; 32];
-    getrandom::getrandom(&mut buf).expect("getrandom failed");
-    buf
+    getrandom::getrandom(&mut buf).map_err(|e| format!("CSPRNG entropy failure: {e}"))?;
+    Ok(buf)
 }
 
 /// Generate 12 random bytes.
-fn rand_bytes_12() -> [u8; 12] {
+fn rand_bytes_12() -> Result<[u8; 12], String> {
     let mut buf = [0u8; 12];
-    getrandom::getrandom(&mut buf).expect("getrandom failed");
-    buf
+    getrandom::getrandom(&mut buf).map_err(|e| format!("CSPRNG entropy failure: {e}"))?;
+    Ok(buf)
 }
 
 // ---------------------------------------------------------------------------
@@ -2505,7 +2660,7 @@ impl CrlCache {
     pub fn is_stale(&self) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs() as i64;
         (now - self.last_updated) > self.max_age_secs
     }
@@ -2560,7 +2715,7 @@ impl CrlCache {
         }
         self.last_updated = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs() as i64;
         Ok(())
     }
@@ -2975,7 +3130,7 @@ pub fn check_certificate_revocation(cert_der: &[u8]) -> Result<RevocationStatus,
                 hex_encode(&serial),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_secs() as i64
                     - cache.last_updated()
             );

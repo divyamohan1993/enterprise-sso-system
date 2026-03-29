@@ -43,14 +43,14 @@ impl EncryptedPool {
     }
 
     /// Derive a per-table KEK using HKDF-SHA512.
-    fn table_kek(&self, table: &str) -> [u8; 32] {
+    fn table_kek(&self, table: &str) -> Result<[u8; 32], String> {
         use hkdf::Hkdf;
         use sha2::Sha512;
         let hk = Hkdf::<Sha512>::new(Some(b"MILNET-TABLE-KEK-v1"), &self.master_kek);
         let mut okm = [0u8; 32];
         hk.expand(table.as_bytes(), &mut okm)
-            .expect("32-byte HKDF expand must succeed");
-        okm
+            .map_err(|_| "HKDF-SHA512 table KEK derivation failed".to_string())?;
+        Ok(okm)
     }
 
     /// Encrypt a plaintext value for a specific table/column/row.
@@ -60,33 +60,38 @@ impl EncryptedPool {
     ///
     /// Wire format (v2):
     /// `ENVELOPE_V2_TAG(1) || wrap_nonce(12) || wrapped_dek(48) || data_nonce(12) || ciphertext || tag(16)`
-    pub fn encrypt_field(&self, table: &str, column: &str, row_id: &[u8], plaintext: &[u8]) -> Vec<u8> {
+    pub fn encrypt_field(&self, table: &str, column: &str, row_id: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, String> {
         use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
         use aes_gcm::aead::Aead;
 
         // Generate per-operation DEK
         let mut dek = [0u8; 32];
-        getrandom::getrandom(&mut dek).expect("OS entropy: DEK generation");
+        getrandom::getrandom(&mut dek)
+            .map_err(|e| format!("OS entropy failure during DEK generation: {e}"))?;
 
         // Encrypt plaintext with DEK
-        let dek_cipher = Aes256Gcm::new_from_slice(&dek).expect("32-byte key");
+        let dek_cipher = Aes256Gcm::new_from_slice(&dek)
+            .map_err(|_| "AES-256-GCM cipher initialization failed".to_string())?;
         let mut data_nonce_bytes = [0u8; 12];
-        getrandom::getrandom(&mut data_nonce_bytes).expect("OS entropy: data nonce");
+        getrandom::getrandom(&mut data_nonce_bytes)
+            .map_err(|e| format!("OS entropy failure during nonce generation: {e}"))?;
         let data_nonce = Nonce::from_slice(&data_nonce_bytes);
         let aad = build_aad(table, column, row_id);
         let ciphertext = dek_cipher
             .encrypt(data_nonce, aes_gcm::aead::Payload { msg: plaintext, aad: &aad })
-            .expect("AES-256-GCM encryption must not fail with valid key");
+            .map_err(|_| "AES-256-GCM encryption failed".to_string())?;
 
         // Wrap DEK with table KEK
-        let kek = self.table_kek(table);
-        let kek_cipher = Aes256Gcm::new_from_slice(&kek).expect("32-byte key");
+        let kek = self.table_kek(table)?;
+        let kek_cipher = Aes256Gcm::new_from_slice(&kek)
+            .map_err(|_| "AES-256-GCM cipher initialization failed".to_string())?;
         let mut wrap_nonce_bytes = [0u8; 12];
-        getrandom::getrandom(&mut wrap_nonce_bytes).expect("OS entropy: wrap nonce");
+        getrandom::getrandom(&mut wrap_nonce_bytes)
+            .map_err(|e| format!("OS entropy failure during wrap nonce generation: {e}"))?;
         let wrap_nonce = Nonce::from_slice(&wrap_nonce_bytes);
         let wrapped_dek = kek_cipher
             .encrypt(wrap_nonce, aes_gcm::aead::Payload { msg: dek.as_ref(), aad: b"MILNET-KEK-WRAP-v1" })
-            .expect("AES-256-GCM DEK wrap must not fail");
+            .map_err(|_| "AES-256-GCM DEK wrap failed".to_string())?;
 
         // Zeroize DEK
         dek.zeroize();
@@ -98,7 +103,7 @@ impl EncryptedPool {
         out.extend_from_slice(&wrapped_dek);
         out.extend_from_slice(&data_nonce_bytes);
         out.extend_from_slice(&ciphertext);
-        out
+        Ok(out)
     }
 
     /// Decrypt a sealed field value. Returns plaintext or error.
@@ -129,8 +134,9 @@ impl EncryptedPool {
             let data_ct = &rest[WRAPPED_DEK_LEN + 12..];
 
             // Unwrap DEK
-            let kek = self.table_kek(table);
-            let kek_cipher = Aes256Gcm::new_from_slice(&kek).expect("32-byte key");
+            let kek = self.table_kek(table)?;
+            let kek_cipher = Aes256Gcm::new_from_slice(&kek)
+                .map_err(|_| "AES-256-GCM cipher initialization failed".to_string())?;
             let wrap_nonce = Nonce::from_slice(wrap_nonce_bytes);
             let mut dek_bytes = kek_cipher
                 .decrypt(wrap_nonce, aes_gcm::aead::Payload { msg: wrapped_dek_ct, aad: b"MILNET-KEK-WRAP-v1" })
@@ -142,7 +148,8 @@ impl EncryptedPool {
             }
 
             // Decrypt data with DEK
-            let dek_cipher = Aes256Gcm::new_from_slice(&dek_bytes).expect("32-byte key");
+            let dek_cipher = Aes256Gcm::new_from_slice(&dek_bytes)
+                .map_err(|_| "AES-256-GCM cipher initialization failed".to_string())?;
             let data_nonce = Nonce::from_slice(data_nonce_bytes);
             let aad = build_aad(table, column, row_id);
             let result = dek_cipher
@@ -159,8 +166,9 @@ impl EncryptedPool {
                 return Err("sealed data too short for nonce + tag".into());
             }
 
-            let kek = self.table_kek(table);
-            let cipher = Aes256Gcm::new_from_slice(&kek).expect("32-byte key");
+            let kek = self.table_kek(table)?;
+            let cipher = Aes256Gcm::new_from_slice(&kek)
+                .map_err(|_| "AES-256-GCM cipher initialization failed".to_string())?;
 
             let nonce = Nonce::from_slice(&sealed[..12]);
             let ciphertext = &sealed[12..];
@@ -173,8 +181,11 @@ impl EncryptedPool {
     }
 
     /// Encrypt an optional field (returns None if input is None).
-    pub fn encrypt_optional(&self, table: &str, column: &str, row_id: &[u8], plaintext: Option<&[u8]>) -> Option<Vec<u8>> {
-        plaintext.map(|pt| self.encrypt_field(table, column, row_id, pt))
+    pub fn encrypt_optional(&self, table: &str, column: &str, row_id: &[u8], plaintext: Option<&[u8]>) -> Result<Option<Vec<u8>>, String> {
+        match plaintext {
+            Some(pt) => self.encrypt_field(table, column, row_id, pt).map(Some),
+            None => Ok(None),
+        }
     }
 
     /// Decrypt an optional sealed field.
@@ -210,13 +221,15 @@ fn build_aad(table: &str, column: &str, row_id: &[u8]) -> Vec<u8> {
 }
 
 /// Store key material with envelope encryption.
-pub async fn store_key_encrypted(epool: &EncryptedPool, name: &str, key_bytes: &[u8]) {
+pub async fn store_key_encrypted(epool: &EncryptedPool, name: &str, key_bytes: &[u8]) -> Result<(), String> {
     let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
 
-    let encrypted = epool.encrypt_field("key_material", "key_bytes", name.as_bytes(), key_bytes);
+    let encrypted = epool.encrypt_field("key_material", "key_bytes", name.as_bytes(), key_bytes)?;
 
-    let _ = sqlx::query(
+    sqlx::query(
         "INSERT INTO key_material (key_name, key_bytes, created_at) VALUES ($1, $2, $3) \
          ON CONFLICT (key_name) DO UPDATE SET key_bytes = $2, rotated_at = $3"
     )
@@ -224,7 +237,9 @@ pub async fn store_key_encrypted(epool: &EncryptedPool, name: &str, key_bytes: &
     .bind(&encrypted)
     .bind(now)
     .execute(&epool.pool)
-    .await;
+    .await
+    .map_err(|e| format!("failed to store key material: {e}"))?;
+    Ok(())
 }
 
 /// Load and decrypt key material from the database.
@@ -247,33 +262,35 @@ pub async fn load_key_encrypted(epool: &EncryptedPool, name: &str) -> Option<Vec
 }
 
 /// Load or generate a 64-byte key with envelope encryption.
-pub async fn load_or_generate_key_64_encrypted(epool: &EncryptedPool, name: &str) -> [u8; 64] {
+pub async fn load_or_generate_key_64_encrypted(epool: &EncryptedPool, name: &str) -> Result<[u8; 64], String> {
     if let Some(existing) = load_key_encrypted(epool, name).await {
         if existing.len() == 64 {
             let mut key = [0u8; 64];
             key.copy_from_slice(&existing);
-            return key;
+            return Ok(key);
         }
     }
     let mut key = [0u8; 64];
-    getrandom::getrandom(&mut key).expect("OS entropy");
-    store_key_encrypted(epool, name, &key).await;
-    key
+    getrandom::getrandom(&mut key)
+        .map_err(|e| format!("OS entropy failure during key generation: {e}"))?;
+    store_key_encrypted(epool, name, &key).await?;
+    Ok(key)
 }
 
 /// Load or generate a 32-byte key with envelope encryption.
-pub async fn load_or_generate_key_32_encrypted(epool: &EncryptedPool, name: &str) -> [u8; 32] {
+pub async fn load_or_generate_key_32_encrypted(epool: &EncryptedPool, name: &str) -> Result<[u8; 32], String> {
     if let Some(existing) = load_key_encrypted(epool, name).await {
         if existing.len() == 32 {
             let mut key = [0u8; 32];
             key.copy_from_slice(&existing);
-            return key;
+            return Ok(key);
         }
     }
     let mut key = [0u8; 32];
-    getrandom::getrandom(&mut key).expect("OS entropy");
-    store_key_encrypted(epool, name, &key).await;
-    key
+    getrandom::getrandom(&mut key)
+        .map_err(|e| format!("OS entropy failure during key generation: {e}"))?;
+    store_key_encrypted(epool, name, &key).await?;
+    Ok(key)
 }
 
 /// Initialize an encrypted pool with the given master KEK.
@@ -287,7 +304,7 @@ pub fn wrap_pool(pool: PgPool, master_kek: [u8; 32]) -> EncryptedPool {
 /// the specific session ID: `MILNET-AAD-v1:ratchet_sessions:chain_key:{session_id}`.
 ///
 /// Returns `nonce(12) || ciphertext || tag(16)`.
-pub fn encrypt_ratchet_key(epool: &EncryptedPool, session_id: &uuid::Uuid, chain_key: &[u8]) -> Vec<u8> {
+pub fn encrypt_ratchet_key(epool: &EncryptedPool, session_id: &uuid::Uuid, chain_key: &[u8]) -> Result<Vec<u8>, String> {
     epool.encrypt_field("ratchet_sessions", "chain_key", session_id.as_bytes(), chain_key)
 }
 
@@ -360,7 +377,8 @@ fn pii_encrypt_aes256gcm(key: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Result
     getrandom::getrandom(&mut nonce_bytes)
         .map_err(|e| format!("AES-256-GCM nonce generation failed: {e}"))?;
 
-    let cipher = Aes256Gcm::new_from_slice(key).expect("32-byte key");
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|_| "AES-256-GCM cipher initialization failed".to_string())?;
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let ciphertext = cipher
@@ -409,10 +427,16 @@ fn pii_decrypt_aegis256(key: &[u8; 32], blob: &[u8], aad: &[u8]) -> Result<Vec<u
             "AEGIS-256 blob too short".to_string(),
         ));
     }
-    let nonce: &[u8; NONCE_LEN] = blob[..NONCE_LEN].try_into().expect("slice has NONCE_LEN bytes");
+    let nonce: &[u8; NONCE_LEN] = blob[..NONCE_LEN].try_into()
+        .map_err(|_| crate::error::MilnetError::CryptoVerification(
+            "AEGIS-256 nonce extraction failed".to_string(),
+        ))?;
     let rest = &blob[NONCE_LEN..];
     let (ciphertext, tag_slice) = rest.split_at(rest.len() - TAG_LEN);
-    let tag: [u8; TAG_LEN] = tag_slice.try_into().expect("tag is TAG_LEN bytes");
+    let tag: [u8; TAG_LEN] = tag_slice.try_into()
+        .map_err(|_| crate::error::MilnetError::CryptoVerification(
+            "AEGIS-256 tag extraction failed".to_string(),
+        ))?;
 
     Aegis256::<TAG_LEN>::new(key, nonce)
         .decrypt(ciphertext, &tag, aad)
@@ -431,7 +455,10 @@ fn pii_decrypt_aes256gcm(key: &[u8; 32], blob: &[u8], aad: &[u8]) -> Result<Vec<
             "AES-256-GCM PII blob too short".to_string(),
         ));
     }
-    let cipher = Aes256Gcm::new_from_slice(key).expect("32-byte key");
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|_| crate::error::MilnetError::CryptoVerification(
+            "AES-256-GCM cipher initialization failed".to_string(),
+        ))?;
     let nonce = Nonce::from_slice(&blob[..NONCE_LEN]);
     cipher
         .decrypt(nonce, aes_gcm::aead::Payload { msg: &blob[NONCE_LEN..], aad })
@@ -451,43 +478,48 @@ impl FieldEncryptor {
         Self { master_kek }
     }
 
-    pub fn table_kek(&self, table: &str) -> [u8; 32] {
+    pub fn table_kek(&self, table: &str) -> Result<[u8; 32], String> {
         use hkdf::Hkdf;
         use sha2::Sha512;
         let hk = Hkdf::<Sha512>::new(Some(b"MILNET-TABLE-KEK-v1"), &self.master_kek);
         let mut okm = [0u8; 32];
         hk.expand(table.as_bytes(), &mut okm)
-            .expect("32-byte HKDF expand must succeed");
-        okm
+            .map_err(|_| "HKDF-SHA512 table KEK derivation failed".to_string())?;
+        Ok(okm)
     }
 
-    pub fn encrypt_field(&self, table: &str, column: &str, row_id: &[u8], plaintext: &[u8]) -> Vec<u8> {
+    pub fn encrypt_field(&self, table: &str, column: &str, row_id: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, String> {
         use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
         use aes_gcm::aead::Aead;
 
         // Generate per-operation DEK
         let mut dek = [0u8; 32];
-        getrandom::getrandom(&mut dek).expect("OS entropy: DEK generation");
+        getrandom::getrandom(&mut dek)
+            .map_err(|e| format!("OS entropy failure during DEK generation: {e}"))?;
 
         // Encrypt plaintext with DEK
-        let dek_cipher = Aes256Gcm::new_from_slice(&dek).expect("32-byte key");
+        let dek_cipher = Aes256Gcm::new_from_slice(&dek)
+            .map_err(|_| "AES-256-GCM cipher initialization failed".to_string())?;
         let mut data_nonce_bytes = [0u8; 12];
-        getrandom::getrandom(&mut data_nonce_bytes).expect("OS entropy: data nonce");
+        getrandom::getrandom(&mut data_nonce_bytes)
+            .map_err(|e| format!("OS entropy failure during nonce generation: {e}"))?;
         let data_nonce = Nonce::from_slice(&data_nonce_bytes);
         let aad = build_aad(table, column, row_id);
         let ciphertext = dek_cipher
             .encrypt(data_nonce, aes_gcm::aead::Payload { msg: plaintext, aad: &aad })
-            .expect("encryption must not fail");
+            .map_err(|_| "AES-256-GCM encryption failed".to_string())?;
 
         // Wrap DEK with table KEK
-        let kek = self.table_kek(table);
-        let kek_cipher = Aes256Gcm::new_from_slice(&kek).expect("32-byte key");
+        let kek = self.table_kek(table)?;
+        let kek_cipher = Aes256Gcm::new_from_slice(&kek)
+            .map_err(|_| "AES-256-GCM cipher initialization failed".to_string())?;
         let mut wrap_nonce_bytes = [0u8; 12];
-        getrandom::getrandom(&mut wrap_nonce_bytes).expect("OS entropy: wrap nonce");
+        getrandom::getrandom(&mut wrap_nonce_bytes)
+            .map_err(|e| format!("OS entropy failure during wrap nonce generation: {e}"))?;
         let wrap_nonce = Nonce::from_slice(&wrap_nonce_bytes);
         let wrapped_dek = kek_cipher
             .encrypt(wrap_nonce, aes_gcm::aead::Payload { msg: dek.as_ref(), aad: b"MILNET-KEK-WRAP-v1" })
-            .expect("DEK wrap must not fail");
+            .map_err(|_| "AES-256-GCM DEK wrap failed".to_string())?;
 
         // Zeroize DEK
         dek.zeroize();
@@ -499,7 +531,7 @@ impl FieldEncryptor {
         out.extend_from_slice(&wrapped_dek);
         out.extend_from_slice(&data_nonce_bytes);
         out.extend_from_slice(&ciphertext);
-        out
+        Ok(out)
     }
 
     pub fn decrypt_field(&self, table: &str, column: &str, row_id: &[u8], sealed: &[u8]) -> Result<Vec<u8>, String> {
@@ -524,8 +556,9 @@ impl FieldEncryptor {
             let data_ct = &rest[WRAPPED_DEK_LEN + 12..];
 
             // Unwrap DEK
-            let kek = self.table_kek(table);
-            let kek_cipher = Aes256Gcm::new_from_slice(&kek).expect("32-byte key");
+            let kek = self.table_kek(table)?;
+            let kek_cipher = Aes256Gcm::new_from_slice(&kek)
+                .map_err(|_| "AES-256-GCM cipher initialization failed".to_string())?;
             let wrap_nonce = Nonce::from_slice(wrap_nonce_bytes);
             let mut dek_bytes = kek_cipher
                 .decrypt(wrap_nonce, aes_gcm::aead::Payload { msg: wrapped_dek_ct, aad: b"MILNET-KEK-WRAP-v1" })
@@ -537,7 +570,8 @@ impl FieldEncryptor {
             }
 
             // Decrypt data with DEK
-            let dek_cipher = Aes256Gcm::new_from_slice(&dek_bytes).expect("32-byte key");
+            let dek_cipher = Aes256Gcm::new_from_slice(&dek_bytes)
+                .map_err(|_| "AES-256-GCM cipher initialization failed".to_string())?;
             let data_nonce = Nonce::from_slice(data_nonce_bytes);
             let aad = build_aad(table, column, row_id);
             let result = dek_cipher
@@ -553,8 +587,9 @@ impl FieldEncryptor {
             if sealed.len() < 12 + 16 {
                 return Err("sealed data too short".into());
             }
-            let kek = self.table_kek(table);
-            let cipher = Aes256Gcm::new_from_slice(&kek).expect("32-byte key");
+            let kek = self.table_kek(table)?;
+            let cipher = Aes256Gcm::new_from_slice(&kek)
+                .map_err(|_| "AES-256-GCM cipher initialization failed".to_string())?;
             let nonce = Nonce::from_slice(&sealed[..12]);
             let aad = build_aad(table, column, row_id);
 

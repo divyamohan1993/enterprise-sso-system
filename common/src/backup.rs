@@ -172,21 +172,21 @@ const STREAMING_THRESHOLD: usize = 256 * 1024 * 1024;
 const STREAM_CHUNK_SIZE: usize = 1024 * 1024;
 
 /// Derive the AES-256-GCM encryption key from the master KEK.
-fn derive_backup_encryption_key(master_kek: &[u8; 32]) -> [u8; 32] {
+fn derive_backup_encryption_key(master_kek: &[u8; 32]) -> Result<[u8; 32], String> {
     let hk = Hkdf::<Sha512>::new(Some(BACKUP_ENCRYPT_DOMAIN), master_kek);
     let mut okm = [0u8; 32];
     hk.expand(b"backup-aes-key", &mut okm)
-        .expect("32-byte HKDF expand must succeed");
-    okm
+        .map_err(|_| "HKDF-SHA512 backup key derivation failed".to_string())?;
+    Ok(okm)
 }
 
 /// Derive the HMAC-SHA512 key from the master KEK (separate from encryption key).
-fn derive_backup_hmac_key(master_kek: &[u8; 32]) -> [u8; 64] {
+fn derive_backup_hmac_key(master_kek: &[u8; 32]) -> Result<[u8; 64], String> {
     let hk = Hkdf::<Sha512>::new(Some(BACKUP_HMAC_DOMAIN), master_kek);
     let mut okm = [0u8; 64];
     hk.expand(b"backup-hmac-key", &mut okm)
-        .expect("64-byte HKDF expand must succeed");
-    okm
+        .map_err(|_| "HKDF-SHA512 backup HMAC key derivation failed".to_string())?;
+    Ok(okm)
 }
 
 /// Encrypt and export backup data using the master KEK.
@@ -204,8 +204,8 @@ pub fn export_backup(master_kek: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>,
         );
     }
 
-    let enc_key = derive_backup_encryption_key(master_kek);
-    let hmac_key = derive_backup_hmac_key(master_kek);
+    let enc_key = derive_backup_encryption_key(master_kek)?;
+    let hmac_key = derive_backup_hmac_key(master_kek)?;
 
     // Encrypt with the active symmetric algorithm (AEGIS-256 or AES-256-GCM)
     let ciphertext = backup_encrypt(&enc_key, plaintext)
@@ -223,8 +223,10 @@ pub fn export_backup(master_kek: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>,
     backup.extend_from_slice(&ciphertext);
 
     // Compute HMAC over everything so far
-    let mut mac = <HmacSha512 as Mac>::new_from_slice(&hmac_key)
-        .expect("HMAC-SHA512 accepts any key size");
+    // HMAC-SHA512 accepts any key length per RFC 2104.
+    let Ok(mut mac) = <HmacSha512 as Mac>::new_from_slice(&hmac_key) else {
+        return Err("HMAC-SHA512 initialization failed".to_string());
+    };
     mac.update(&backup);
     let hmac_result = mac.finalize().into_bytes();
     backup.extend_from_slice(&hmac_result);
@@ -277,7 +279,7 @@ fn import_backup_v2(master_kek: &[u8; 32], backup: &[u8]) -> Result<Vec<u8>, Str
         ));
     }
 
-    let hmac_key = derive_backup_hmac_key(master_kek);
+    let hmac_key = derive_backup_hmac_key(master_kek)?;
 
     // Verify HMAC first
     let data_portion = backup.get(..backup.len() - HMAC_LEN)
@@ -285,8 +287,9 @@ fn import_backup_v2(master_kek: &[u8; 32], backup: &[u8]) -> Result<Vec<u8>, Str
     let stored_hmac = backup.get(backup.len() - HMAC_LEN..)
         .ok_or("backup too short for HMAC")?;
 
-    let mut mac = <HmacSha512 as Mac>::new_from_slice(&hmac_key)
-        .expect("HMAC-SHA512 accepts any key size");
+    let Ok(mut mac) = <HmacSha512 as Mac>::new_from_slice(&hmac_key) else {
+        return Err("HMAC-SHA512 initialization failed".to_string());
+    };
     mac.update(data_portion);
     let computed_hmac = mac.finalize().into_bytes();
 
@@ -352,7 +355,7 @@ fn import_backup_v1(master_kek: &[u8; 32], backup: &[u8]) -> Result<Vec<u8>, Str
         return Err(format!("unsupported v1 backup version: {version}"));
     }
 
-    let hmac_key = derive_backup_hmac_key(master_kek);
+    let hmac_key = derive_backup_hmac_key(master_kek)?;
 
     // Verify HMAC first
     let data_portion = backup.get(..backup.len() - HMAC_LEN)
@@ -360,8 +363,9 @@ fn import_backup_v1(master_kek: &[u8; 32], backup: &[u8]) -> Result<Vec<u8>, Str
     let stored_hmac = backup.get(backup.len() - HMAC_LEN..)
         .ok_or("backup too short for HMAC")?;
 
-    let mut mac = <HmacSha512 as Mac>::new_from_slice(&hmac_key)
-        .expect("HMAC-SHA512 accepts any key size");
+    let Ok(mut mac) = <HmacSha512 as Mac>::new_from_slice(&hmac_key) else {
+        return Err("HMAC-SHA512 initialization failed".to_string());
+    };
     mac.update(data_portion);
     let computed_hmac = mac.finalize().into_bytes();
 

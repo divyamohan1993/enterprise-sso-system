@@ -31,6 +31,8 @@ pub mod envelope;
 pub mod seal;
 #[allow(unsafe_code)]
 pub mod memguard;
+#[allow(unsafe_code)]
+pub mod seccomp;
 pub mod attest;
 pub mod hsm;
 pub mod tpm;

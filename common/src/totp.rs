@@ -151,30 +151,34 @@ const TOTP_DIGITS: u32 = 6;
 ///
 /// Returns a `Zeroizing<[u8; 32]>` — the secret is automatically erased
 /// from memory when dropped, preventing post-use forensic recovery.
-pub fn generate_secret() -> zeroize::Zeroizing<[u8; 32]> {
+pub fn generate_secret() -> Result<zeroize::Zeroizing<[u8; 32]>, String> {
     let mut secret = zeroize::Zeroizing::new([0u8; 32]);
-    getrandom::getrandom(secret.as_mut()).expect("getrandom failed");
-    secret
+    getrandom::getrandom(secret.as_mut())
+        .map_err(|e| format!("CSPRNG entropy failure during TOTP secret generation: {e}"))?;
+    Ok(secret)
 }
 
 /// Compute HMAC for TOTP using the specified algorithm.
 /// Returns the full HMAC output bytes.
-fn hmac_totp(algorithm: TotpAlgorithm, secret: &[u8], counter_bytes: &[u8; 8]) -> Vec<u8> {
+fn hmac_totp(algorithm: TotpAlgorithm, secret: &[u8], counter_bytes: &[u8; 8]) -> Result<Vec<u8>, String> {
     match algorithm {
         TotpAlgorithm::Sha1 => {
-            let mut mac = HmacSha1::new_from_slice(secret).expect("HMAC-SHA1 accepts any key length");
+            let mut mac = HmacSha1::new_from_slice(secret)
+                .map_err(|_| "HMAC-SHA1 key initialization failed".to_string())?;
             mac.update(counter_bytes);
-            mac.finalize().into_bytes().to_vec()
+            Ok(mac.finalize().into_bytes().to_vec())
         }
         TotpAlgorithm::Sha256 => {
-            let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC-SHA256 accepts any key length");
+            let mut mac = HmacSha256::new_from_slice(secret)
+                .map_err(|_| "HMAC-SHA256 key initialization failed".to_string())?;
             mac.update(counter_bytes);
-            mac.finalize().into_bytes().to_vec()
+            Ok(mac.finalize().into_bytes().to_vec())
         }
         TotpAlgorithm::Sha512 => {
-            let mut mac = HmacSha512::new_from_slice(secret).expect("HMAC-SHA512 accepts any key length");
+            let mut mac = HmacSha512::new_from_slice(secret)
+                .map_err(|_| "HMAC-SHA512 key initialization failed".to_string())?;
             mac.update(counter_bytes);
-            mac.finalize().into_bytes().to_vec()
+            Ok(mac.finalize().into_bytes().to_vec())
         }
     }
 }
@@ -197,7 +201,11 @@ pub fn generate_totp_with_algorithm(secret: &[u8], time: u64, algorithm: TotpAlg
     let counter = time / TIME_STEP;
     let counter_bytes = counter.to_be_bytes();
 
-    let result = hmac_totp(algorithm, secret, &counter_bytes);
+    // HMAC accepts any key length per RFC 2104; this should never fail.
+    let result = match hmac_totp(algorithm, secret, &counter_bytes) {
+        Ok(v) => v,
+        Err(_) => return "000000".to_string(),
+    };
 
     // Dynamic truncation per RFC 4226 Section 5.4
     // Offset is derived from the last byte of the HMAC output regardless of hash size.
@@ -301,10 +309,10 @@ pub fn verify_totp_with_algorithm(
 /// then securely erased.
 ///
 /// SECURITY: Upgraded from SHA-256 to SHA-512 target to comply with CNSA 2.0.
-pub fn migrate_to_sha256() -> (zeroize::Zeroizing<[u8; 32]>, TotpAlgorithm) {
-    let secret = generate_secret();
+pub fn migrate_to_sha256() -> Result<(zeroize::Zeroizing<[u8; 32]>, TotpAlgorithm), String> {
+    let secret = generate_secret()?;
     tracing::info!("TOTP migration: generated new SHA-512 (CNSA 2.0) secret for re-enrollment");
-    (secret, TotpAlgorithm::Sha512)
+    Ok((secret, TotpAlgorithm::Sha512))
 }
 
 /// Build an otpauth:// URI for QR code generation.

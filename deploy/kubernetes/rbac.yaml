@@ -1,0 +1,589 @@
+# MILNET SSO System — RBAC Configuration
+# Principle of least privilege: each service gets its own ServiceAccount with
+# access restricted to only the secrets it needs. No service can read another
+# service's secrets. automountServiceAccountToken is disabled by default to
+# prevent token theft from compromised containers.
+#
+# SECURITY RATIONALE: The default ServiceAccount in a namespace can read all
+# secrets if any RoleBinding grants it access. By creating per-service SAs
+# with narrow Roles, a compromised pod cannot pivot to other services' secrets.
+---
+
+# ── ServiceAccounts ──────────────────────────────────────────────────────────
+# automountServiceAccountToken: false prevents the SA token from being mounted
+# into the pod filesystem. Only enable where the pod needs K8s API access.
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gateway-sa
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/part-of: milnet-sso
+automountServiceAccountToken: false
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: orchestrator-sa
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: orchestrator
+    app.kubernetes.io/part-of: milnet-sso
+automountServiceAccountToken: false
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: opaque-sa
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: opaque
+    app.kubernetes.io/part-of: milnet-sso
+automountServiceAccountToken: false
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tss-coordinator-sa
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: tss-coordinator
+    app.kubernetes.io/part-of: milnet-sso
+automountServiceAccountToken: false
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tss-signer-sa
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: tss-signer
+    app.kubernetes.io/part-of: milnet-sso
+automountServiceAccountToken: false
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: verifier-sa
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: verifier
+    app.kubernetes.io/part-of: milnet-sso
+automountServiceAccountToken: false
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ratchet-sa
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: ratchet
+    app.kubernetes.io/part-of: milnet-sso
+automountServiceAccountToken: false
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: audit-sa
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: audit
+    app.kubernetes.io/part-of: milnet-sso
+automountServiceAccountToken: false
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: risk-sa
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: risk
+    app.kubernetes.io/part-of: milnet-sso
+automountServiceAccountToken: false
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: admin-sa
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: admin
+    app.kubernetes.io/part-of: milnet-sso
+automountServiceAccountToken: false
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: postgres-sa
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: milnet-sso
+automountServiceAccountToken: false
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kt-sa
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: kt
+    app.kubernetes.io/part-of: milnet-sso
+automountServiceAccountToken: false
+
+---
+# ── Roles (minimum privilege per service) ────────────────────────────────────
+# Each Role grants 'get' on specific named secrets only. No 'list' or 'watch'
+# permissions are granted — a compromised pod cannot enumerate secrets.
+
+# Gateway: needs TLS certs, gateway config, and master KEK
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gateway-secrets-reader
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/part-of: milnet-sso
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - milnet-tls-certs
+      - milnet-gateway-config
+      - milnet-master-kek
+    verbs: ["get"]
+
+---
+# Orchestrator: needs database URL, HSM config, and master KEK
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: orchestrator-secrets-reader
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: orchestrator
+    app.kubernetes.io/part-of: milnet-sso
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - milnet-database
+      - milnet-hsm-config
+      - milnet-master-kek
+    verbs: ["get"]
+
+---
+# OPAQUE: needs its share secrets and master KEK
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: opaque-secrets-reader
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: opaque
+    app.kubernetes.io/part-of: milnet-sso
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - milnet-opaque-share-1
+      - milnet-opaque-share-2
+      - milnet-opaque-share-3
+      - milnet-master-kek
+    verbs: ["get"]
+
+---
+# TSS Coordinator: needs TSS public key and master KEK
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: tss-coordinator-secrets-reader
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: tss-coordinator
+    app.kubernetes.io/part-of: milnet-sso
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - milnet-tss-public
+      - milnet-master-kek
+    verbs: ["get"]
+
+---
+# TSS Signer: needs its share secrets and master KEK
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: tss-signer-secrets-reader
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: tss-signer
+    app.kubernetes.io/part-of: milnet-sso
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - milnet-tss-share-0
+      - milnet-tss-share-1
+      - milnet-tss-share-2
+      - milnet-tss-share-3
+      - milnet-tss-share-4
+      - milnet-master-kek
+    verbs: ["get"]
+
+---
+# Verifier: needs TSS public key for signature verification
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: verifier-secrets-reader
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: verifier
+    app.kubernetes.io/part-of: milnet-sso
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - milnet-tss-public
+      - milnet-master-kek
+    verbs: ["get"]
+
+---
+# Ratchet: needs master KEK only (DB URL comes from orchestrator config)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ratchet-secrets-reader
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: ratchet
+    app.kubernetes.io/part-of: milnet-sso
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - milnet-master-kek
+    verbs: ["get"]
+
+---
+# Audit: needs SIEM integration secrets and master KEK
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: audit-secrets-reader
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: audit
+    app.kubernetes.io/part-of: milnet-sso
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - milnet-siem
+      - milnet-master-kek
+    verbs: ["get"]
+
+---
+# Risk: needs master KEK only
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: risk-secrets-reader
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: risk
+    app.kubernetes.io/part-of: milnet-sso
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - milnet-master-kek
+    verbs: ["get"]
+
+---
+# Admin: needs database secrets and master KEK
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: admin-secrets-reader
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: admin
+    app.kubernetes.io/part-of: milnet-sso
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - milnet-database
+      - milnet-master-kek
+    verbs: ["get"]
+
+---
+# PostgreSQL: needs database credentials and TLS certs
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: postgres-secrets-reader
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: milnet-sso
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - milnet-database
+      - milnet-tls-certs
+    verbs: ["get"]
+
+---
+# KT: needs master KEK only
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kt-secrets-reader
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: kt
+    app.kubernetes.io/part-of: milnet-sso
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - milnet-master-kek
+    verbs: ["get"]
+
+---
+# ── RoleBindings ─────────────────────────────────────────────────────────────
+# Bind each SA to its corresponding Role. No cross-service access.
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gateway-secrets-binding
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/part-of: milnet-sso
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gateway-secrets-reader
+subjects:
+  - kind: ServiceAccount
+    name: gateway-sa
+    namespace: milnet
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: orchestrator-secrets-binding
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: orchestrator
+    app.kubernetes.io/part-of: milnet-sso
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: orchestrator-secrets-reader
+subjects:
+  - kind: ServiceAccount
+    name: orchestrator-sa
+    namespace: milnet
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: opaque-secrets-binding
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: opaque
+    app.kubernetes.io/part-of: milnet-sso
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: opaque-secrets-reader
+subjects:
+  - kind: ServiceAccount
+    name: opaque-sa
+    namespace: milnet
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: tss-coordinator-secrets-binding
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: tss-coordinator
+    app.kubernetes.io/part-of: milnet-sso
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: tss-coordinator-secrets-reader
+subjects:
+  - kind: ServiceAccount
+    name: tss-coordinator-sa
+    namespace: milnet
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: tss-signer-secrets-binding
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: tss-signer
+    app.kubernetes.io/part-of: milnet-sso
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: tss-signer-secrets-reader
+subjects:
+  - kind: ServiceAccount
+    name: tss-signer-sa
+    namespace: milnet
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: verifier-secrets-binding
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: verifier
+    app.kubernetes.io/part-of: milnet-sso
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: verifier-secrets-reader
+subjects:
+  - kind: ServiceAccount
+    name: verifier-sa
+    namespace: milnet
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ratchet-secrets-binding
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: ratchet
+    app.kubernetes.io/part-of: milnet-sso
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ratchet-secrets-reader
+subjects:
+  - kind: ServiceAccount
+    name: ratchet-sa
+    namespace: milnet
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: audit-secrets-binding
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: audit
+    app.kubernetes.io/part-of: milnet-sso
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: audit-secrets-reader
+subjects:
+  - kind: ServiceAccount
+    name: audit-sa
+    namespace: milnet
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: risk-secrets-binding
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: risk
+    app.kubernetes.io/part-of: milnet-sso
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: risk-secrets-reader
+subjects:
+  - kind: ServiceAccount
+    name: risk-sa
+    namespace: milnet
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: admin-secrets-binding
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: admin
+    app.kubernetes.io/part-of: milnet-sso
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: admin-secrets-reader
+subjects:
+  - kind: ServiceAccount
+    name: admin-sa
+    namespace: milnet
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: postgres-secrets-binding
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: milnet-sso
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: postgres-secrets-reader
+subjects:
+  - kind: ServiceAccount
+    name: postgres-sa
+    namespace: milnet
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kt-secrets-binding
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: kt
+    app.kubernetes.io/part-of: milnet-sso
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kt-secrets-reader
+subjects:
+  - kind: ServiceAccount
+    name: kt-sa
+    namespace: milnet

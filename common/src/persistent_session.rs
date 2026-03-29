@@ -263,7 +263,7 @@ impl PersistentSessionStore {
                 "encrypted_chain_key",
                 session.session_id.as_bytes(),
                 &session.encrypted_chain_key,
-            ))
+            )?)
         };
 
         sqlx::query(
@@ -428,7 +428,7 @@ impl PersistentSessionStore {
 fn now_us() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_micros() as i64
 }
 

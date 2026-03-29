@@ -17,6 +17,9 @@ use std::sync::{Mutex, MutexGuard};
 /// # Panics
 ///
 /// Panics if the mutex is poisoned.
+/// SECURITY: Mutex poisoning indicates a thread panicked while holding a lock.
+/// In a military-grade system, this is treated as a compromise indicator.
+/// Panic prevents use of potentially corrupted state.
 pub fn lock_or_panic<'a, T>(mutex: &'a Mutex<T>, context: &str) -> MutexGuard<'a, T> {
     mutex.lock().unwrap_or_else(|e| {
         tracing::error!(

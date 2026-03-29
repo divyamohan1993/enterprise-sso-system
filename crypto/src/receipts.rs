@@ -56,14 +56,20 @@ fn mac_receipt_fields(mac: &mut HmacSha512, receipt: &Receipt) {
 
 /// Sign a receipt with HMAC-SHA512 (CNSA 2.0 compliant)
 pub fn sign_receipt(receipt: &mut Receipt, signing_key: &[u8; 64]) {
-    let mut mac = HmacSha512::new_from_slice(signing_key).expect("HMAC key length is always valid");
+    let mut mac = match HmacSha512::new_from_slice(signing_key) {
+        Ok(m) => m,
+        Err(_) => panic!("FATAL: HMAC-SHA512 key initialization failed for receipt signing"),
+    };
     mac_receipt_fields(&mut mac, receipt);
     receipt.signature = mac.finalize().into_bytes().to_vec();
 }
 
 /// Verify a receipt's signature (HMAC-SHA512)
 pub fn verify_receipt_signature(receipt: &Receipt, signing_key: &[u8; 64]) -> bool {
-    let mut mac = HmacSha512::new_from_slice(signing_key).expect("HMAC key length is always valid");
+    let mut mac = match HmacSha512::new_from_slice(signing_key) {
+        Ok(m) => m,
+        Err(_) => panic!("FATAL: HMAC-SHA512 key initialization failed for receipt verification"),
+    };
     mac_receipt_fields(&mut mac, receipt);
     let expected = mac.finalize().into_bytes();
     crate::ct::ct_eq(&receipt.signature, &expected)
@@ -97,7 +103,10 @@ impl ReceiptChain {
                 return Err("first receipt must have zero prev_hash".into());
             }
         } else {
-            let last = self.receipts.last().unwrap();
+            let last = match self.receipts.last() {
+                Some(r) => r,
+                None => return Err("internal error: receipts non-empty but last() returned None".into()),
+            };
             let expected_hash = hash_receipt(last);
             if !crate::ct::ct_eq(&receipt.prev_receipt_hash, &expected_hash) {
                 return Err("prev_receipt_hash does not match previous receipt".into());
@@ -147,7 +156,7 @@ impl ReceiptChain {
     pub fn check_ttl(&self) -> Result<(), String> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_micros() as i64;
 
         for receipt in &self.receipts {
@@ -189,7 +198,9 @@ impl ReceiptChain {
 /// Returns (signing_key, verifying_key) as ML-DSA-87 types.
 pub fn generate_receipt_keypair() -> (ReceiptSigningKey, ReceiptVerifyingKey) {
     let mut seed = [0u8; 32];
-    getrandom::getrandom(&mut seed).expect("getrandom failed");
+    if getrandom::getrandom(&mut seed).is_err() {
+        panic!("FATAL: OS CSPRNG unavailable — cannot generate receipt keypair safely");
+    }
     let kp = MlDsa87::from_seed(&seed.into());
     seed.zeroize();
     (kp.signing_key().clone(), kp.verifying_key().clone())
@@ -217,9 +228,10 @@ pub fn sign_receipt_asymmetric(signing_key: &[u8], data: &[u8]) -> Vec<u8> {
     // Reconstruct the signing key from a 32-byte seed
     // ML-DSA-87 signing keys are encoded, but we accept a 32-byte
     // seed for ergonomic parity with the old Ed25519 API.
-    let seed: [u8; 32] = signing_key
-        .try_into()
-        .expect("signing_key must be exactly 32 bytes (seed)");
+    let seed: [u8; 32] = match signing_key.try_into() {
+        Ok(s) => s,
+        Err(_) => panic!("FATAL: signing_key must be exactly 32 bytes (seed)"),
+    };
     let sk = SigningKey::<MlDsa87>::from_seed(&seed.into());
     let sig: ReceiptSignature = sk.sign(data);
     sig.encode().to_vec()

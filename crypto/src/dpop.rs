@@ -80,7 +80,9 @@ impl Drop for GuardedSigningKey {
 /// corresponding `DpopVerifyingKey`.
 pub fn generate_dpop_keypair() -> (GuardedSigningKey, DpopVerifyingKey) {
     let mut seed = [0u8; 32];
-    getrandom::getrandom(&mut seed).expect("getrandom failed");
+    if getrandom::getrandom(&mut seed).is_err() {
+        panic!("FATAL: OS CSPRNG unavailable — cannot generate DPoP keypair safely");
+    }
     let kp = MlDsa87::from_seed(&seed.into());
     seed.zeroize();
     let guarded = GuardedSigningKey::new(kp.signing_key().clone());
@@ -94,7 +96,9 @@ pub fn generate_dpop_keypair() -> (GuardedSigningKey, DpopVerifyingKey) {
 /// for long-lived keys.
 pub fn generate_dpop_keypair_raw() -> (DpopSigningKey, DpopVerifyingKey) {
     let mut seed = [0u8; 32];
-    getrandom::getrandom(&mut seed).expect("getrandom failed");
+    if getrandom::getrandom(&mut seed).is_err() {
+        panic!("FATAL: OS CSPRNG unavailable — cannot generate raw DPoP keypair safely");
+    }
     let kp = MlDsa87::from_seed(&seed.into());
     seed.zeroize();
     (kp.signing_key().clone(), kp.verifying_key().clone())

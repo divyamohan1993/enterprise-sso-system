@@ -248,10 +248,36 @@ impl ClusterConfig {
         let raft_addr =
             std::env::var("MILNET_RAFT_ADDR").unwrap_or_else(|_| "127.0.0.1:9090".to_string());
 
-        let peers = match std::env::var("MILNET_CLUSTER_PEERS") {
+        let mut peers = match std::env::var("MILNET_CLUSTER_PEERS") {
             Ok(val) if !val.trim().is_empty() => parse_peers(&val)?,
             _ => Vec::new(),
         };
+
+        // SECURITY: Static peer fallback eliminates DNS as a single point of failure.
+        // When DNS-based peer discovery fails or is unavailable (air-gapped networks),
+        // MILNET_STATIC_PEERS provides a hardcoded peer list for Raft cluster formation.
+        // Format: comma-separated list of node-id@raft-addr/svc-addr entries.
+        if peers.is_empty() {
+            if let Ok(static_val) = std::env::var("MILNET_STATIC_PEERS") {
+                if !static_val.trim().is_empty() {
+                    match parse_peers(&static_val) {
+                        Ok(static_peers) => {
+                            info!(
+                                count = static_peers.len(),
+                                "DNS peer discovery unavailable, using MILNET_STATIC_PEERS fallback"
+                            );
+                            peers = static_peers;
+                        }
+                        Err(e) => {
+                            warn!(
+                                err = %e,
+                                "failed to parse MILNET_STATIC_PEERS, continuing without static peers"
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         let raft_peers = peers
             .iter()
@@ -296,10 +322,35 @@ impl ClusterConfig {
             "127.0.0.1:11101".to_string()
         });
 
-        let peers = match std::env::var("MILNET_CLUSTER_PEERS") {
+        let mut peers = match std::env::var("MILNET_CLUSTER_PEERS") {
             Ok(val) if !val.trim().is_empty() => parse_peers(&val)?,
             _ => Vec::new(),
         };
+
+        // SECURITY: Static peer fallback eliminates DNS as a single point of failure.
+        // When DNS-based peer discovery fails or is unavailable (air-gapped networks),
+        // MILNET_STATIC_PEERS provides a hardcoded peer list for Raft cluster formation.
+        if peers.is_empty() {
+            if let Ok(static_val) = std::env::var("MILNET_STATIC_PEERS") {
+                if !static_val.trim().is_empty() {
+                    match parse_peers(&static_val) {
+                        Ok(static_peers) => {
+                            info!(
+                                count = static_peers.len(),
+                                "DNS peer discovery unavailable, using MILNET_STATIC_PEERS fallback"
+                            );
+                            peers = static_peers;
+                        }
+                        Err(e) => {
+                            warn!(
+                                err = %e,
+                                "failed to parse MILNET_STATIC_PEERS, continuing without static peers"
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         let raft_peers = peers
             .iter()

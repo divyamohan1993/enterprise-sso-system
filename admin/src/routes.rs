@@ -50,13 +50,14 @@ fn generate_csrf_token(session_state: &str, api_key: &str, cookie_value: &str) -
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or(std::time::Duration::ZERO)
         .as_secs();
     let nonce: [u8; 16] = rand::random();
     let nonce_hex = hex::encode(nonce);
 
     let payload = format!("{}:{}:{}:{}", session_state, cookie_value, now, nonce_hex);
-    let mut mac = HmacSha256::new_from_slice(api_key.as_bytes()).expect("HMAC key");
+    let mut mac = HmacSha256::new_from_slice(api_key.as_bytes())
+        .unwrap_or_else(|_| { tracing::error!("FATAL: HMAC-SHA256 key init failed"); std::process::exit(1) });
     mac.update(payload.as_bytes());
     let sig = hex::encode(mac.finalize().into_bytes());
 
@@ -94,7 +95,7 @@ fn validate_csrf_token(token: &str, session_state: &str, api_key: &str, cookie_v
     };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or(std::time::Duration::ZERO)
         .as_secs();
     if now.saturating_sub(timestamp) > CSRF_TOKEN_TTL_SECS {
         return false;
@@ -102,7 +103,8 @@ fn validate_csrf_token(token: &str, session_state: &str, api_key: &str, cookie_v
 
     // Recompute HMAC (includes cookie value for session binding)
     let payload = format!("{}:{}:{}:{}", session_state, cookie_value, timestamp, nonce_hex);
-    let mut mac = HmacSha256::new_from_slice(api_key.as_bytes()).expect("HMAC key");
+    let mut mac = HmacSha256::new_from_slice(api_key.as_bytes())
+        .unwrap_or_else(|_| { tracing::error!("FATAL: HMAC-SHA256 key init failed"); std::process::exit(1) });
     mac.update(payload.as_bytes());
     let expected_sig = hex::encode(mac.finalize().into_bytes());
 
@@ -160,7 +162,7 @@ impl RevocationList {
         }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or(std::time::Duration::ZERO)
             .as_secs() as i64;
         if self.entries.insert(token_id) {
             self.timed_entries.push(RevokedTokenEntry {
@@ -180,7 +182,7 @@ impl RevocationList {
     fn cleanup_expired(&mut self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or(std::time::Duration::ZERO)
             .as_secs() as i64;
         let cutoff = now - MAX_TOKEN_LIFETIME_SECS;
         let mut to_remove = Vec::new();
@@ -292,7 +294,7 @@ pub fn derive_admin_role_key(role: AdminRole) -> String {
     let hk = Hkdf::<Sha512>::new(Some(common::domain::ADMIN_ROLE_KEY_DERIVE), &master_kek);
     let mut okm = [0u8; 32];
     hk.expand(role.key_label().as_bytes(), &mut okm)
-        .expect("HKDF expand for admin role key");
+        .unwrap_or_else(|_| { tracing::error!("FATAL: HKDF expand for admin role key failed"); std::process::exit(1) });
     hex::encode(okm)
 }
 
@@ -606,10 +608,11 @@ fn compute_admin_action_approval_hmac(action_id: &Uuid, approver_id: &Uuid) -> V
         let hk = Hkdf::<Sha512>::new(Some(common::domain::PENDING_ADMIN_ACTION), &master_kek);
         let mut okm = [0u8; 64];
         hk.expand(approver_id.as_bytes(), &mut okm)
-            .expect("HKDF expand");
+            .unwrap_or_else(|_| { tracing::error!("FATAL: HKDF expand failed"); std::process::exit(1) });
         okm
     };
-    let mut mac = HmacSha512::new_from_slice(&derived).expect("HMAC key");
+    let mut mac = HmacSha512::new_from_slice(&derived)
+        .unwrap_or_else(|_| { tracing::error!("FATAL: HMAC-SHA512 key init failed"); std::process::exit(1) });
     mac.update(action_id.as_bytes());
     mac.finalize().into_bytes().to_vec()
 }
@@ -645,7 +648,7 @@ pub fn derive_super_admin_key(master_kek: &[u8; 32], admin_id: &Uuid, deployment
     let salt = format!("MILNET-SUPER-ADMIN-KEY-v1:{}:{}", deployment_id, admin_id);
     let hk = Hkdf::<Sha512>::new(Some(salt.as_bytes()), master_kek.as_slice());
     let mut okm = [0u8; 32];
-    hk.expand(b"super-admin-api-key", &mut okm).expect("HKDF expand");
+    hk.expand(b"super-admin-api-key", &mut okm).unwrap_or_else(|_| { tracing::error!("FATAL: HKDF expand failed"); std::process::exit(1) });
     hex::encode(okm)
 }
 
@@ -789,18 +792,20 @@ fn log_super_admin_access(
 /// Guard: the super_admins table is FROZEN after setup.
 /// Any attempt to write after setup_complete is a security violation.
 /// Call this before ANY DB write to super_admins — panics if table is frozen.
-pub fn assert_super_admins_not_frozen(setup_complete: &std::sync::atomic::AtomicBool) {
+pub fn assert_super_admins_not_frozen(setup_complete: &std::sync::atomic::AtomicBool) -> Result<(), StatusCode> {
     if setup_complete.load(Ordering::Relaxed) {
-        // Log to SIEM before panicking — this is a critical event
+        // Log to SIEM — this is a critical event
         common::siem::SecurityEvent::tamper_detected(
             "CRITICAL: attempted write to FROZEN super_admins table after setup. \
              Table is immutable. Possible compromise attempt."
         );
-        panic!(
+        tracing::error!(
             "SECURITY VIOLATION: attempted write to frozen super_admins table. \
              The super_admins table is immutable after initial setup."
         );
+        return Err(StatusCode::FORBIDDEN);
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1192,7 +1197,8 @@ fn sign_audit_entry(data: &[u8], signing_key: &[u8]) -> Vec<u8> {
     use sha2::Sha512;
     type HmacSha512 = Hmac<Sha512>;
 
-    let mut mac = HmacSha512::new_from_slice(signing_key).expect("HMAC key");
+    let mut mac = HmacSha512::new_from_slice(signing_key)
+        .unwrap_or_else(|_| { tracing::error!("FATAL: HMAC-SHA512 key init failed"); std::process::exit(1) });
     mac.update(ADMIN_AUDIT_DOMAIN_SEPARATOR);
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
@@ -1207,7 +1213,7 @@ fn derive_admin_audit_key() -> [u8; 64] {
     let hk = Hkdf::<Sha512>::new(Some(ADMIN_AUDIT_DOMAIN_SEPARATOR), &master_kek);
     let mut okm = [0u8; 64];
     hk.expand(b"admin-audit-signing-key", &mut okm)
-        .expect("HKDF expand");
+        .unwrap_or_else(|_| { tracing::error!("FATAL: HKDF expand failed"); std::process::exit(1) });
     okm
 }
 
@@ -1241,10 +1247,11 @@ fn compute_ceremony_approval_hmac(ceremony_id: &Uuid, approver_id: &Uuid) -> Vec
         let hk = Hkdf::<Sha512>::new(Some(b"MILNET-CEREMONY-APPROVAL-v1"), &master_kek);
         let mut okm = [0u8; 64];
         hk.expand(approver_id.as_bytes(), &mut okm)
-            .expect("HKDF expand");
+            .unwrap_or_else(|_| { tracing::error!("FATAL: HKDF expand failed"); std::process::exit(1) });
         okm
     };
-    let mut mac = HmacSha512::new_from_slice(&derived).expect("HMAC key");
+    let mut mac = HmacSha512::new_from_slice(&derived)
+        .unwrap_or_else(|_| { tracing::error!("FATAL: HMAC-SHA512 key init failed"); std::process::exit(1) });
     mac.update(ceremony_id.as_bytes());
     mac.finalize().into_bytes().to_vec()
 }
@@ -1492,10 +1499,11 @@ fn verify_user_token(token: &str) -> bool {
         let hk = Hkdf::<Sha512>::new(Some(b"MILNET-ADMIN-TOKEN-v3"), &master_kek);
         let mut okm = [0u8; 32];
         hk.expand(b"admin-token-hmac", &mut okm)
-            .expect("HKDF expand");
+            .unwrap_or_else(|_| { tracing::error!("FATAL: HKDF expand failed"); std::process::exit(1) });
         okm
     };
-    let mut mac = HmacSha512::new_from_slice(&derived).expect("HMAC key");
+    let mut mac = HmacSha512::new_from_slice(&derived)
+        .unwrap_or_else(|_| { tracing::error!("FATAL: HMAC-SHA512 key init failed"); std::process::exit(1) });
     mac.update(payload.as_bytes());
     let expected = hex(&mac.finalize().into_bytes());
 
@@ -1507,7 +1515,7 @@ fn verify_user_token(token: &str) -> bool {
     let timestamp: u64 = parts[1].parse().unwrap_or(0);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or(std::time::Duration::ZERO)
         .as_secs();
     if now - timestamp > 3600 {
         return false; // Token expired (1 hour)
@@ -1715,7 +1723,7 @@ fn check_tier(token_tier: u8, required_tier: u8) -> Result<(), StatusCode> {
 fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or(std::time::Duration::ZERO)
         .as_secs() as i64
 }
 
@@ -2170,7 +2178,7 @@ async fn initial_setup(
     ).execute(&state.db).await;
 
     // Assert the table is NOT frozen yet (setup not complete)
-    assert_super_admins_not_frozen(&state.setup_complete);
+    assert_super_admins_not_frozen(&state.setup_complete)?;
 
     let mut created_admins = Vec::new();
     let mut admin_keys_map = state.super_admin_keys.write().await;
@@ -2337,7 +2345,7 @@ async fn security_dashboard(
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or(std::time::Duration::ZERO)
         .as_secs() as i64;
 
     Json(serde_json::json!({
@@ -2397,7 +2405,7 @@ async fn list_sessions(
     let tokens = state.access_tokens.read().await;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or(std::time::Duration::ZERO)
         .as_secs() as i64;
 
     let sessions: Vec<serde_json::Value> = tokens.iter().map(|(token_prefix, entry)| {
@@ -2677,7 +2685,7 @@ async fn register_user(
     let mut kt = state.kt_tree.write().await;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or(std::time::Duration::ZERO)
         .as_micros() as i64;
     kt.append_credential_op(&user_id, "register", &[0u8; 32], now);
 
@@ -3276,10 +3284,11 @@ async fn auth_verify(
         let hk = Hkdf::<Sha512>::new(Some(b"MILNET-ADMIN-TOKEN-v3"), &master_kek);
         let mut okm = [0u8; 32];
         hk.expand(b"admin-token-hmac", &mut okm)
-            .expect("HKDF expand");
+            .unwrap_or_else(|_| { tracing::error!("FATAL: HKDF expand failed"); std::process::exit(1) });
         okm
     };
-    let mut mac = HmacSha512::new_from_slice(&derived).expect("HMAC key");
+    let mut mac = HmacSha512::new_from_slice(&derived)
+        .unwrap_or_else(|_| { tracing::error!("FATAL: HMAC-SHA512 key init failed"); std::process::exit(1) });
     mac.update(payload.as_bytes());
     let expected = hex(&mac.finalize().into_bytes());
 
@@ -4782,7 +4791,7 @@ async fn oauth_token(
     // Store access_token -> user_id mapping for userinfo endpoint
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or(std::time::Duration::ZERO)
         .as_secs() as i64;
     // Prevent unbounded growth: evict expired tokens before inserting
     {
@@ -4832,7 +4841,7 @@ async fn oauth_userinfo(
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or(std::time::Duration::ZERO)
         .as_secs() as i64;
 
     // Check inactivity timeout on OAuth access tokens (AAL3: 15 min)
@@ -4846,7 +4855,10 @@ async fn oauth_userinfo(
             }
             _ => {}
         }
-        let entry = tokens.get_mut(&token).unwrap();
+        let entry = match tokens.get_mut(&token) {
+            Some(e) => e,
+            None => return Err(StatusCode::UNAUTHORIZED),
+        };
         entry.last_activity = now;
         entry.user_id
     };
@@ -5752,7 +5764,7 @@ async fn recovery_verify(
 
             let now_ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or(std::time::Duration::ZERO)
                 .as_secs();
             let payload = format!("{}:{}", user_id, now_ts);
             let master_kek = common::sealed_keys::load_master_kek();
@@ -5761,10 +5773,11 @@ async fn recovery_verify(
                 let hk = Hkdf::<Sha512>::new(Some(b"MILNET-ADMIN-TOKEN-v3"), &master_kek);
                 let mut okm = [0u8; 32];
                 hk.expand(b"admin-token-hmac", &mut okm)
-                    .expect("HKDF expand");
+                    .unwrap_or_else(|_| { tracing::error!("FATAL: HKDF expand failed"); std::process::exit(1) });
                 okm
             };
-            let mut mac = HmacSha512::new_from_slice(&derived).expect("HMAC key");
+            let mut mac = HmacSha512::new_from_slice(&derived)
+        .unwrap_or_else(|_| { tracing::error!("FATAL: HMAC-SHA512 key init failed"); std::process::exit(1) });
             mac.update(payload.as_bytes());
             let sig = hex(&mac.finalize().into_bytes());
             let token = format!("{payload}:{sig}");

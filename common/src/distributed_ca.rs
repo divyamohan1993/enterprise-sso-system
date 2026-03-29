@@ -197,6 +197,222 @@ impl DistributedCa {
     }
 }
 
+// ── CA Redundancy: Primary/Secondary Failover ──
+//
+// SECURITY: The CA must NOT be a single point of failure. In a military
+// deployment, if the primary CA instance is compromised or unavailable,
+// a secondary CA must seamlessly take over certificate issuance using
+// the same FROST group verifying key (since the signing key is threshold-split
+// across all nodes, any quorum can sign regardless of which CA instance
+// coordinates the ceremony).
+
+/// Status of a CA instance in the redundant pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CaInstanceStatus {
+    /// Actively issuing certificates.
+    Primary,
+    /// Hot standby, ready to take over.
+    Secondary,
+    /// Instance is unreachable or failed health checks.
+    Unavailable,
+}
+
+/// A single CA instance in the redundant CA pool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaInstance {
+    pub instance_id: String,
+    pub node_id: NodeId,
+    pub status: CaInstanceStatus,
+    pub last_health_check: i64,
+    /// Number of consecutive failed health checks.
+    pub consecutive_failures: u32,
+}
+
+/// Configuration for the redundant CA pool.
+#[derive(Debug, Clone)]
+pub struct RedundantCaConfig {
+    /// Maximum consecutive health check failures before failover.
+    pub max_failures_before_failover: u32,
+    /// Health check interval in seconds.
+    pub health_check_interval_secs: u64,
+    /// Maximum age of a CA certificate before rotation (hours).
+    pub ca_cert_max_age_hours: u32,
+}
+
+impl Default for RedundantCaConfig {
+    fn default() -> Self {
+        Self {
+            max_failures_before_failover: 3,
+            health_check_interval_secs: 10,
+            ca_cert_max_age_hours: 8760, // 1 year
+        }
+    }
+}
+
+/// Manages a pool of CA instances with automatic failover.
+///
+/// The redundant CA pool ensures that certificate issuance continues
+/// even if the primary CA instance fails. Because the signing key is
+/// threshold-split (FROST), any CA instance coordinating a quorum of
+/// signers can issue valid certificates.
+pub struct RedundantCaPool {
+    config: RedundantCaConfig,
+    instances: Vec<CaInstance>,
+    /// The underlying distributed CA state (shared across instances).
+    ca: DistributedCa,
+    /// Timestamp of last CA certificate rotation.
+    last_ca_rotation: i64,
+}
+
+impl RedundantCaPool {
+    /// Create a new redundant CA pool with the given instances.
+    pub fn new(
+        config: RedundantCaConfig,
+        ca: DistributedCa,
+        instances: Vec<CaInstance>,
+    ) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        Self {
+            config,
+            instances,
+            ca,
+            last_ca_rotation: now,
+        }
+    }
+
+    /// Get the current primary CA instance, if any.
+    pub fn primary(&self) -> Option<&CaInstance> {
+        self.instances
+            .iter()
+            .find(|i| i.status == CaInstanceStatus::Primary)
+    }
+
+    /// Get all secondary (standby) instances.
+    pub fn secondaries(&self) -> Vec<&CaInstance> {
+        self.instances
+            .iter()
+            .filter(|i| i.status == CaInstanceStatus::Secondary)
+            .collect()
+    }
+
+    /// Record a health check result for a CA instance.
+    ///
+    /// If the primary exceeds `max_failures_before_failover`, the pool
+    /// automatically promotes a secondary to primary.
+    pub fn record_health_check(&mut self, instance_id: &str, healthy: bool) -> Option<String> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        let mut failover_target: Option<String> = None;
+
+        // Update the instance's health status.
+        if let Some(instance) = self.instances.iter_mut().find(|i| i.instance_id == instance_id) {
+            instance.last_health_check = now;
+            if healthy {
+                instance.consecutive_failures = 0;
+                if instance.status == CaInstanceStatus::Unavailable {
+                    // Recovered instance becomes a secondary.
+                    instance.status = CaInstanceStatus::Secondary;
+                    tracing::info!(
+                        instance_id = %instance_id,
+                        "CA instance recovered, demoted to secondary"
+                    );
+                }
+            } else {
+                instance.consecutive_failures += 1;
+                if instance.consecutive_failures >= self.config.max_failures_before_failover {
+                    let was_primary = instance.status == CaInstanceStatus::Primary;
+                    instance.status = CaInstanceStatus::Unavailable;
+                    tracing::error!(
+                        instance_id = %instance_id,
+                        failures = instance.consecutive_failures,
+                        "CA instance marked unavailable"
+                    );
+
+                    // If the primary failed, trigger failover.
+                    if was_primary {
+                        failover_target = self.promote_secondary();
+                    }
+                }
+            }
+        }
+
+        failover_target
+    }
+
+    /// Promote the first available secondary to primary.
+    ///
+    /// Returns the instance_id of the newly promoted primary, or None if
+    /// no secondaries are available (total CA failure -- SIEM critical alert).
+    fn promote_secondary(&mut self) -> Option<String> {
+        for instance in &mut self.instances {
+            if instance.status == CaInstanceStatus::Secondary {
+                instance.status = CaInstanceStatus::Primary;
+                tracing::warn!(
+                    instance_id = %instance.instance_id,
+                    "FAILOVER: secondary CA promoted to primary"
+                );
+                crate::siem::SecurityEvent::circuit_breaker_opened("distributed_ca_failover");
+                return Some(instance.instance_id.clone());
+            }
+        }
+
+        // No secondaries available -- critical failure.
+        tracing::error!(
+            "CRITICAL: No secondary CA instances available for failover. \
+             Certificate issuance is UNAVAILABLE."
+        );
+        None
+    }
+
+    /// Check if the CA certificate needs rotation based on age.
+    pub fn needs_ca_rotation(&self) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let age_hours = (now - self.last_ca_rotation) / 3600;
+        age_hours >= self.config.ca_cert_max_age_hours as i64
+    }
+
+    /// Record that a CA certificate rotation has been performed.
+    pub fn record_ca_rotation(&mut self) {
+        self.last_ca_rotation = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        tracing::info!("CA certificate rotation recorded");
+    }
+
+    /// Access the underlying distributed CA.
+    pub fn ca(&self) -> &DistributedCa {
+        &self.ca
+    }
+
+    /// Access the underlying distributed CA mutably.
+    pub fn ca_mut(&mut self) -> &mut DistributedCa {
+        &mut self.ca
+    }
+
+    /// Total number of CA instances in the pool.
+    pub fn instance_count(&self) -> usize {
+        self.instances.len()
+    }
+
+    /// Number of available (non-unavailable) instances.
+    pub fn available_count(&self) -> usize {
+        self.instances
+            .iter()
+            .filter(|i| i.status != CaInstanceStatus::Unavailable)
+            .count()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

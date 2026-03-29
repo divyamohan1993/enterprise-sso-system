@@ -20,7 +20,13 @@ static FP_BLIND_KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
 fn fp_blind_key() -> &'static [u8; 32] {
     FP_BLIND_KEY.get_or_init(|| {
         let mut key = [0u8; 32];
-        getrandom::getrandom(&mut key).expect("OS CSPRNG failure");
+        // SECURITY: CSPRNG failure at this point is unrecoverable — the system
+        // cannot generate secure key material. OnceLock prevents retry, so we
+        // must succeed or abort.
+        if let Err(e) = getrandom::getrandom(&mut key) {
+            tracing::error!("CRITICAL: OS CSPRNG failure during blind key init: {e}");
+            std::process::exit(1);
+        }
         key
     })
 }
@@ -29,8 +35,11 @@ fn fp_blind_key() -> &'static [u8; 32] {
 /// This allows equality lookups without storing the raw fingerprint.
 pub fn blind_device_fingerprint(fp: &[u8; 32]) -> [u8; 32] {
     type HmacSha256 = Hmac<Sha256>;
-    let mut mac = HmacSha256::new_from_slice(fp_blind_key())
-        .expect("HMAC key length is always valid");
+    // HMAC-SHA256 accepts any key length per RFC 2104; this cannot fail.
+    let Ok(mut mac) = HmacSha256::new_from_slice(fp_blind_key()) else {
+        // Unreachable: HMAC-SHA256 accepts any key length.
+        return [0u8; 32];
+    };
     mac.update(fp);
     let result = mac.finalize().into_bytes();
     let mut out = [0u8; 32];
@@ -416,7 +425,8 @@ fn encrypt_session_data(
     getrandom::getrandom(&mut nonce_bytes).map_err(|e| format!("nonce gen failed: {e}"))?;
 
     let aad = format!("MILNET-SESSION-v1:{}", session_id);
-    let cipher = Aes256Gcm::new_from_slice(key).expect("32-byte key");
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|_| "AES-256-GCM cipher initialization failed".to_string())?;
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let ciphertext = cipher
@@ -450,7 +460,8 @@ pub fn decrypt_session_data(
     }
 
     let aad = format!("MILNET-SESSION-v1:{}", session_id);
-    let cipher = Aes256Gcm::new_from_slice(key).expect("32-byte key");
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|_| "AES-256-GCM cipher initialization failed".to_string())?;
     let nonce = Nonce::from_slice(&sealed[..12]);
 
     cipher
@@ -467,7 +478,7 @@ pub fn decrypt_session_data(
 fn now_us() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_micros() as i64
 }
 

@@ -154,8 +154,10 @@ fn compute_manifest_hmac(
     hash_algorithm: &str,
     signing_key: &[u8; 64],
 ) -> Vec<u8> {
-    let mut mac =
-        HmacSha512::new_from_slice(signing_key).expect("HMAC-SHA512 accepts any key length");
+    let mut mac = match HmacSha512::new_from_slice(signing_key) {
+        Ok(m) => m,
+        Err(_) => panic!("FATAL: HMAC-SHA512 key initialization failed"),
+    };
 
     // Domain separation
     mac.update(HMAC_DOMAIN);
@@ -180,7 +182,7 @@ fn compute_manifest_hmac(
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("system clock before UNIX epoch")
+        .unwrap_or_default()
         .as_secs()
 }
 

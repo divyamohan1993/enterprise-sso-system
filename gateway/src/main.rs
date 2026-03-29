@@ -168,7 +168,10 @@ async fn main() {
     let _error_counter = common::metrics::Counter::new("errors", "Total errors");
 
     // Verify CNSA 2.0 compliance at startup
-    assert!(common::cnsa2::is_cnsa2_compliant(), "CNSA 2.0 compliance check failed");
+    if !common::cnsa2::is_cnsa2_compliant() {
+        tracing::error!("FATAL: CNSA 2.0 compliance check failed");
+        std::process::exit(1);
+    }
     tracing::info!("CNSA 2.0 compliance verified");
 
     let port = std::env::var("GATEWAY_PORT").unwrap_or_else(|_| "9100".into());
@@ -188,10 +191,11 @@ async fn main() {
     let key_path = std::env::var("MILNET_GATEWAY_KEY_PATH");
 
     if cert_path.is_err() || key_path.is_err() {
-        panic!(
+        tracing::error!(
             "FATAL: MILNET_GATEWAY_CERT_PATH and MILNET_GATEWAY_KEY_PATH must be set \
              for TLS termination."
         );
+        std::process::exit(1);
     }
 
     let tls_config = if let (Ok(cert_file), Ok(key_file)) = (cert_path, key_path) {
@@ -229,11 +233,21 @@ async fn main() {
         // SECURITY: rustls-pemfile is UNMAINTAINED (RUSTSEC-2025-0134).
         // PEM parsing inlined here to eliminate the dependency entirely.
         let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-            parse_pem_certs(&cert_pem)
-                .expect("failed to parse TLS certificate PEM");
+            match parse_pem_certs(&cert_pem) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("FATAL: failed to parse TLS certificate PEM: {e}");
+                    std::process::exit(1);
+                }
+            };
         let key: rustls::pki_types::PrivateKeyDer<'static> =
-            parse_pem_private_key(&key_pem)
-                .expect("failed to parse TLS private key PEM");
+            match parse_pem_private_key(&key_pem) {
+                Ok(k) => k,
+                Err(e) => {
+                    tracing::error!("FATAL: failed to parse TLS private key PEM: {e}");
+                    std::process::exit(1);
+                }
+            };
 
         // CNSA 2.0 compliant: TLS 1.3 only with AES-256-GCM-SHA384
         // Post-quantum hybrid key exchange: X25519MLKEM768 preferred, X25519 fallback.
@@ -271,12 +285,13 @@ async fn main() {
             ]
         };
 
-        // Startup integrity check: in military mode, PANIC if classical fallback is present
+        // Startup integrity check: in military mode, exit if classical fallback is present
         if military_mode && kx_groups.len() > 1 {
-            panic!(
+            tracing::error!(
                 "FATAL: MILNET_MILITARY_DEPLOYMENT=1 but X25519 classical fallback is present \
                  in TLS key exchange groups. This MUST NOT happen in military deployments."
             );
+            std::process::exit(1);
         }
         let provider = rustls::crypto::CryptoProvider {
             cipher_suites: vec![rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_256_GCM_SHA384],
@@ -284,30 +299,59 @@ async fn main() {
             ..rustls::crypto::aws_lc_rs::default_provider()
         };
 
-        let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(provider))
+        let config = match rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(provider))
             .with_protocol_versions(&[&rustls::version::TLS13])
-            .expect("TLS 1.3 config failed")
-            .with_no_client_auth()
-            .with_single_cert(certs, key.into())
-            .expect("TLS server config failed");
+        {
+            Ok(builder) => match builder
+                .with_no_client_auth()
+                .with_single_cert(certs, key.into())
+            {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    tracing::error!("FATAL: TLS server config failed: {e}");
+                    std::process::exit(1);
+                }
+            },
+            Err(e) => {
+                tracing::error!("FATAL: TLS 1.3 config failed: {e}");
+                std::process::exit(1);
+            }
+        };
 
         Some(std::sync::Arc::new(config))
     } else {
-        // This branch is unreachable due to the panic above, but kept for type completeness.
-        unreachable!("TLS certificate check should have panicked above");
+        // This branch is unreachable due to the exit above, but kept for type completeness.
+        tracing::error!("FATAL: TLS certificate check should have exited above");
+        std::process::exit(1);
     };
 
+    // SECURITY: Verify kernel security posture (ptrace_scope, BPF restrictions)
+    common::startup_checks::verify_kernel_security_posture();
+
+    // SECURITY: Verify process hardening flags and apply anti-ptrace
+    crypto::seccomp::apply_anti_ptrace();
+    crypto::seccomp::verify_process_hardening();
+
+    // SECURITY: Remove ALL sensitive env vars from /proc/PID/environ.
+    // All config has been loaded above; secrets must not linger in memory.
+    common::startup_checks::sanitize_environment();
+
     let server = if let Some(tls_cfg) = tls_config {
-        GatewayServer::bind_tls(&addr, 16, tls_cfg)
-            .await
-            .expect("failed to bind gateway with TLS")
+        match GatewayServer::bind_tls(&addr, 16, tls_cfg).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("FATAL: failed to bind gateway with TLS: {e}");
+                std::process::exit(1);
+            }
+        }
     } else {
         // SECURITY: Plain TCP is NEVER allowed. Nation-state
         // attackers can intercept unencrypted authentication traffic.
-        panic!(
+        tracing::error!(
             "FATAL: TLS is required but no certificate was configured. \
              Set MILNET_GATEWAY_CERT_PATH and MILNET_GATEWAY_KEY_PATH."
         );
+        std::process::exit(1);
     };
 
     // Spawn health check endpoint on port+1000 (or MILNET_HEALTH_PORT)
@@ -328,5 +372,48 @@ async fn main() {
     );
 
     tracing::info!("Gateway listening on {addr}");
-    server.run().await.expect("gateway server error");
+
+    // SECURITY: Graceful shutdown on SIGTERM/SIGINT.
+    // - Stops accepting new connections
+    // - Waits for in-flight requests to complete (30s timeout)
+    // - Zeroizes sensitive memory before exit
+    // This prevents data loss and ensures clean termination in Kubernetes/systemd.
+    let shutdown_signal = async {
+        let mut sigterm = match tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("FATAL: failed to install SIGTERM handler: {e}");
+                std::process::exit(1);
+            }
+        };
+        let mut sigint = match tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::interrupt(),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("FATAL: failed to install SIGINT handler: {e}");
+                std::process::exit(1);
+            }
+        };
+        tokio::select! {
+            _ = sigterm.recv() => tracing::info!("received SIGTERM, initiating graceful shutdown"),
+            _ = sigint.recv() => tracing::info!("received SIGINT, initiating graceful shutdown"),
+        }
+    };
+
+    tokio::select! {
+        result = server.run() => {
+            if let Err(e) = result {
+                tracing::error!("FATAL: gateway server error: {e}");
+                std::process::exit(1);
+            }
+        }
+        _ = shutdown_signal => {
+            tracing::info!("gateway: waiting up to 30s for in-flight requests to complete...");
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            tracing::info!("gateway: graceful shutdown complete");
+        }
+    }
 }

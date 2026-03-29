@@ -95,14 +95,18 @@ impl NonceBloomFilter {
         hasher.update(b"MILNET-BLOOM-H1");
         hasher.update(nonce);
         let h1_full = hasher.finalize();
-        let h1 = u64::from_le_bytes(h1_full[..8].try_into().unwrap()) as usize;
+        let h1_bytes: [u8; 8] = h1_full[..8].try_into()
+            .map_err(|_| ()).unwrap_or([0u8; 8]);
+        let h1 = u64::from_le_bytes(h1_bytes) as usize;
 
         // Second hash: SHA-256 of nonce with different domain
         let mut hasher = Sha256::new();
         hasher.update(b"MILNET-BLOOM-H2");
         hasher.update(nonce);
         let h2_full = hasher.finalize();
-        let h2 = u64::from_le_bytes(h2_full[..8].try_into().unwrap()) as usize;
+        let h2_bytes: [u8; 8] = h2_full[..8].try_into()
+            .map_err(|_| ()).unwrap_or([0u8; 8]);
+        let h2 = u64::from_le_bytes(h2_bytes) as usize;
 
         let mut positions = [0usize; BLOOM_FILTER_K];
         for i in 0..BLOOM_FILTER_K {
@@ -318,7 +322,7 @@ impl RatchetChain {
         let hk = Hkdf::<Sha512>::new(None, master_secret);
         let mut chain_key = [0u8; 64];
         hk.expand(domain::RATCHET_ADVANCE, &mut chain_key)
-            .expect("64-byte expand must succeed for HKDF-SHA512");
+            .map_err(|_| "HKDF-SHA512 expand failed for chain key derivation".to_string())?;
 
         let head = random_canary()?;
         let tail = random_canary()?;
@@ -462,7 +466,7 @@ impl RatchetChain {
         info.extend_from_slice(server_nonce);
         let mut new_key = [0u8; 64];
         hk.expand(&info, &mut new_key)
-            .expect("64-byte expand must succeed for HKDF-SHA512");
+            .map_err(|_| RatchetError::ZeroEntropy("HKDF-SHA512 expand failed during chain advance".into()))?;
 
         // Unlock old key region before overwrite (will re-lock new data)
         if self.key_locked {
@@ -493,7 +497,14 @@ impl RatchetChain {
 
     /// Generate a ratchet tag using an explicit key and epoch.
     fn generate_tag_with_key(key: &[u8; 64], claims_bytes: &[u8], epoch: u64) -> [u8; 64] {
-        let mut mac = HmacSha512::new_from_slice(key).expect("HMAC-SHA512 accepts any key length");
+        let mut mac = match HmacSha512::new_from_slice(key) {
+            Ok(m) => m,
+            Err(_) => {
+                // HMAC-SHA512 accepts any key length; this path is unreachable
+                // but we return a zeroed tag rather than panicking.
+                return [0u8; 64];
+            }
+        };
         mac.update(domain::TOKEN_TAG);
         mac.update(claims_bytes);
         mac.update(&epoch.to_le_bytes());
@@ -510,10 +521,12 @@ impl RatchetChain {
     /// means an attacker who captures only the forward-derived key cannot
     /// re-derive the actual session keys (which use real client/server
     /// entropy), limiting lookahead to epoch verification only.
-    fn derive_forward_key(starting_key: &[u8; 64], steps: u64) -> [u8; 64] {
+    fn derive_forward_key(starting_key: &[u8; 64], steps: u64) -> Result<[u8; 64], RatchetError> {
         /// Domain separator for forward-lookahead key derivation.
         /// Distinct from RATCHET_ADVANCE to prevent cross-context misuse.
         const FORWARD_LOOKAHEAD_DOMAIN: &[u8] = b"MILNET-SSO-v1-RATCHET-FORWARD-LOOKAHEAD";
+
+        let hkdf_err = || RatchetError::ZeroEntropy("HKDF-SHA512 expand failed in forward key derivation".into());
 
         let mut key = *starting_key;
         for step in 0..steps {
@@ -529,14 +542,14 @@ impl RatchetChain {
             client_info.extend_from_slice(&step_bytes);
             hk_entropy
                 .expand(&client_info, &mut forward_client_entropy)
-                .expect("32-byte expand must succeed for HKDF-SHA512");
+                .map_err(|_| hkdf_err())?;
             // Derive server-side forward entropy
             let mut server_info = Vec::with_capacity(40);
             server_info.extend_from_slice(b"server");
             server_info.extend_from_slice(&step_bytes);
             hk_entropy
                 .expand(&server_info, &mut forward_server_entropy)
-                .expect("32-byte expand must succeed for HKDF-SHA512");
+                .map_err(|_| hkdf_err())?;
             // Derive forward nonce
             let mut forward_nonce = [0u8; 32];
             let mut nonce_info = Vec::with_capacity(40);
@@ -544,7 +557,7 @@ impl RatchetChain {
             nonce_info.extend_from_slice(&step_bytes);
             hk_entropy
                 .expand(&nonce_info, &mut forward_nonce)
-                .expect("32-byte expand must succeed for HKDF-SHA512");
+                .map_err(|_| hkdf_err())?;
 
             // Now advance using the standard RATCHET_ADVANCE derivation
             // but with the derived forward entropy + nonce instead of real ones.
@@ -555,14 +568,14 @@ impl RatchetChain {
             info.extend_from_slice(&forward_nonce);
             let mut new_key = [0u8; 64];
             hk.expand(&info, &mut new_key)
-                .expect("64-byte expand must succeed for HKDF-SHA512");
+                .map_err(|_| hkdf_err())?;
             forward_client_entropy.zeroize();
             forward_server_entropy.zeroize();
             forward_nonce.zeroize();
             key.zeroize();
             key = new_key;
         }
-        key
+        Ok(key)
     }
 
     /// Verify a ratchet tag, checking +/-3 epoch lookahead window for
@@ -607,7 +620,7 @@ impl RatchetChain {
 
         // Future epoch: derive forward without advancing the real chain
         let steps = token_epoch - self.epoch;
-        let mut forward_key = Self::derive_forward_key(&self.chain_key, steps);
+        let mut forward_key = Self::derive_forward_key(&self.chain_key, steps)?;
         let expected = Self::generate_tag_with_key(&forward_key, claims_bytes, token_epoch);
         forward_key.zeroize();
         Ok(crypto::ct::ct_eq_64(tag, &expected))

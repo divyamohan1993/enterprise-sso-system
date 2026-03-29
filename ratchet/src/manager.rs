@@ -209,8 +209,10 @@ fn derive_chain_key_from_epoch(master: &[u8], epoch: u64) -> [u8; 32] {
     use sha2::Sha512;
     let hk = Hkdf::<Sha512>::new(Some(b"MILNET-RATCHET-DERIVE"), master);
     let mut key = [0u8; 32];
-    hk.expand(&epoch.to_le_bytes(), &mut key)
-        .expect("32 bytes within HKDF limit");
+    if hk.expand(&epoch.to_le_bytes(), &mut key).is_err() {
+        tracing::error!("SIEM:CRITICAL HKDF-SHA512 expand failed in chain key derivation from epoch");
+        // Return zeroed key — caller must validate
+    }
     key
 }
 
@@ -231,8 +233,10 @@ fn derive_table_kek(master_kek: &[u8; 32]) -> [u8; 32] {
     use sha2::Sha512;
     let hk = Hkdf::<Sha512>::new(Some(TABLE_KEK_SALT), master_kek);
     let mut table_kek = [0u8; 32];
-    hk.expand(TABLE_KEK_INFO, &mut table_kek)
-        .expect("32-byte expand must succeed for HKDF-SHA512");
+    if hk.expand(TABLE_KEK_INFO, &mut table_kek).is_err() {
+        tracing::error!("SIEM:CRITICAL HKDF-SHA512 expand failed in table KEK derivation");
+        // Return zeroed key — encryption/decryption will fail safely downstream
+    }
     table_kek
 }
 
@@ -241,7 +245,8 @@ fn derive_table_kek(master_kek: &[u8; 32]) -> [u8; 32] {
 pub fn encrypt_chain_key(kek: &[u8; 32], session_id: &str, key: &[u8]) -> Result<Vec<u8>, String> {
     use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
     let table_kek = derive_table_kek(kek);
-    let cipher = Aes256Gcm::new_from_slice(&table_kek).expect("32-byte key");
+    let cipher = Aes256Gcm::new_from_slice(&table_kek)
+        .map_err(|_| "failed to initialize AES-256-GCM cipher".to_string())?;
     let mut nb = [0u8; NONCE_LEN];
     for attempt in 0..3u8 {
         if getrandom::getrandom(&mut nb).is_ok() {
@@ -259,7 +264,7 @@ pub fn encrypt_chain_key(kek: &[u8; 32], session_id: &str, key: &[u8]) -> Result
     aad.extend_from_slice(session_id.as_bytes());
     let ct = cipher
         .encrypt(nonce, aes_gcm::aead::Payload { msg: key, aad: &aad })
-        .expect("AES-256-GCM encryption must succeed");
+        .map_err(|_| "AES-256-GCM encryption failed".to_string())?;
     let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
     out.extend_from_slice(&nb);
     out.extend_from_slice(&ct);
@@ -277,7 +282,8 @@ pub fn decrypt_chain_key(kek: &[u8; 32], session_id: &str, ciphertext: &[u8]) ->
         return Err("ciphertext too short".into());
     }
     let table_kek = derive_table_kek(kek);
-    let cipher = Aes256Gcm::new_from_slice(&table_kek).expect("32-byte key");
+    let cipher = Aes256Gcm::new_from_slice(&table_kek)
+        .map_err(|_| "failed to initialize AES-256-GCM cipher for decryption".to_string())?;
     let mut aad = Vec::with_capacity(CHAIN_KEY_AAD_PREFIX.len() + session_id.len());
     aad.extend_from_slice(CHAIN_KEY_AAD_PREFIX);
     aad.extend_from_slice(session_id.as_bytes());
@@ -352,7 +358,8 @@ pub fn encrypt_epoch_metadata(
     use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
 
     let table_kek = derive_table_kek(kek);
-    let cipher = Aes256Gcm::new_from_slice(&table_kek).expect("32-byte key");
+    let cipher = Aes256Gcm::new_from_slice(&table_kek)
+        .map_err(|_| "failed to initialize AES-256-GCM cipher for epoch metadata encryption".to_string())?;
 
     let plaintext = postcard::to_allocvec(metadata)
         .map_err(|e| format!("epoch metadata serialization failed: {e}"))?;
@@ -390,7 +397,8 @@ pub fn decrypt_epoch_metadata(
     }
 
     let table_kek = derive_table_kek(kek);
-    let cipher = Aes256Gcm::new_from_slice(&table_kek).expect("32-byte key");
+    let cipher = Aes256Gcm::new_from_slice(&table_kek)
+        .map_err(|_| "failed to initialize AES-256-GCM cipher for epoch metadata decryption".to_string())?;
 
     let mut aad = Vec::with_capacity(EPOCH_METADATA_AAD_PREFIX.len() + session_id.len());
     aad.extend_from_slice(EPOCH_METADATA_AAD_PREFIX);

@@ -614,7 +614,7 @@ pub fn create_backup_manifest(backup_id: &str, path: &str, data: &[u8]) -> Backu
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_micros() as i64;
 
     BackupManifest {

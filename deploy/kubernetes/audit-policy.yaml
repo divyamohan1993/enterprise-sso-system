@@ -1,0 +1,152 @@
+# MILNET SSO System — Kubernetes Audit Policy
+# Comprehensive audit logging for DoD/Pentagon compliance (NIST 800-53 AU controls).
+#
+# SECURITY RATIONALE: Full audit trail of all security-relevant API server
+# actions. Secrets access is logged at RequestResponse level to detect
+# unauthorized reads. RBAC changes and pod exec/attach are logged to detect
+# privilege escalation attempts.
+#
+# USAGE: Pass to kube-apiserver via:
+#   --audit-policy-file=/etc/kubernetes/audit-policy.yaml
+#   --audit-log-path=/var/log/kubernetes/audit.log
+#   --audit-log-maxage=365
+#   --audit-log-maxbackup=10
+#   --audit-log-maxsize=100
+---
+apiVersion: audit.k8s.io/v1
+kind: Policy
+rules:
+  # ── CRITICAL: Log ALL access to secrets at full request/response level ──────
+  # Any read, list, watch, create, update, or delete of secrets is a
+  # high-severity event. Full request and response bodies are captured
+  # for forensic analysis of secret exfiltration attempts.
+  - level: RequestResponse
+    resources:
+      - group: ""
+        resources: ["secrets"]
+    namespaces: ["milnet"]
+
+  # ── CRITICAL: Log all authentication and token events ──────────────────────
+  # TokenReviews and authentication decisions reveal brute-force attempts,
+  # stolen token usage, and service account impersonation.
+  - level: RequestResponse
+    resources:
+      - group: "authentication.k8s.io"
+        resources: ["tokenreviews"]
+
+  # ── CRITICAL: Log all RBAC changes ─────────────────────────────────────────
+  # Any modification to Roles, ClusterRoles, RoleBindings, or
+  # ClusterRoleBindings could indicate privilege escalation.
+  - level: RequestResponse
+    resources:
+      - group: "rbac.authorization.k8s.io"
+        resources:
+          - roles
+          - clusterroles
+          - rolebindings
+          - clusterrolebindings
+
+  # ── CRITICAL: Log all pod exec and attach (compromise indicator) ───────────
+  # Pod exec/attach bypasses normal application channels and is a common
+  # post-exploitation technique. Log at RequestResponse to capture commands.
+  - level: RequestResponse
+    resources:
+      - group: ""
+        resources: ["pods/exec", "pods/attach", "pods/portforward"]
+
+  # ── HIGH: Log all pod lifecycle events ─────────────────────────────────────
+  # Pod creation, deletion, and modification in the milnet namespace.
+  - level: RequestResponse
+    resources:
+      - group: ""
+        resources: ["pods"]
+    namespaces: ["milnet"]
+    verbs: ["create", "delete", "patch", "update"]
+
+  # ── HIGH: Log all service account token creation ───────────────────────────
+  # Detects creation of long-lived tokens that could be exfiltrated.
+  - level: RequestResponse
+    resources:
+      - group: ""
+        resources: ["serviceaccounts/token"]
+
+  # ── HIGH: Log all namespace changes ────────────────────────────────────────
+  # Namespace creation/deletion could indicate lateral movement setup.
+  - level: RequestResponse
+    resources:
+      - group: ""
+        resources: ["namespaces"]
+    verbs: ["create", "delete", "patch", "update"]
+
+  # ── HIGH: Log NetworkPolicy changes ────────────────────────────────────────
+  # NetworkPolicy modifications could open lateral movement paths.
+  - level: RequestResponse
+    resources:
+      - group: "networking.k8s.io"
+        resources: ["networkpolicies"]
+
+  # ── HIGH: Log all ConfigMap changes in milnet namespace ────────────────────
+  # ConfigMap tampering could alter service behavior or inject malicious config.
+  - level: RequestResponse
+    resources:
+      - group: ""
+        resources: ["configmaps"]
+    namespaces: ["milnet"]
+    verbs: ["create", "delete", "patch", "update"]
+
+  # ── HIGH: Log ValidatingWebhookConfiguration and MutatingWebhookConfiguration
+  # Webhook changes could intercept or modify all API requests.
+  - level: RequestResponse
+    resources:
+      - group: "admissionregistration.k8s.io"
+        resources:
+          - validatingwebhookconfigurations
+          - mutatingwebhookconfigurations
+
+  # ── MEDIUM: Log all deployment and statefulset changes ─────────────────────
+  - level: RequestResponse
+    resources:
+      - group: "apps"
+        resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
+    namespaces: ["milnet"]
+    verbs: ["create", "delete", "patch", "update"]
+
+  # ── LOW: Log read access to pods (metadata only) ──────────────────────────
+  # Reconnaissance detection — excessive pod listing may indicate enumeration.
+  - level: Metadata
+    resources:
+      - group: ""
+        resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+
+  # ── Skip noisy read-only endpoints that generate excessive logs ────────────
+  # Health checks, metrics, and status endpoints create noise without value.
+  - level: None
+    users: ["system:kube-proxy"]
+  - level: None
+    resources:
+      - group: ""
+        resources: ["endpoints", "services", "services/status"]
+    verbs: ["get", "list", "watch"]
+  - level: None
+    nonResourceURLs:
+      - "/healthz*"
+      - "/readyz*"
+      - "/livez*"
+      - "/metrics"
+      - "/version"
+      - "/openapi/*"
+
+  # ── Skip system:nodes and kubelet read-only operations ─────────────────────
+  - level: None
+    users: ["kubelet"]
+    verbs: ["get"]
+  - level: None
+    userGroups: ["system:nodes"]
+    verbs: ["get"]
+
+  # ── DEFAULT: Metadata level for everything else ────────────────────────────
+  # Captures who did what and when, without bulky request/response bodies.
+  - level: Metadata
+    omitStages:
+      - "RequestReceived"

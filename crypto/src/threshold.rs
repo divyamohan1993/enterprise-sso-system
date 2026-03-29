@@ -41,12 +41,12 @@ pub fn dkg(total: u16, threshold: u16) -> DkgResult {
         frost::keys::IdentifierList::Default,
         &mut rng,
     )
-    .expect("DKG failed");
+    .unwrap_or_else(|e| panic!("FATAL: FROST DKG ceremony failed: {e}"));
 
     // Verify each share is consistent with the group public key (Feldman VSS)
     for (id, secret_share) in &shares_map {
         let key_package = frost::keys::KeyPackage::try_from(secret_share.clone())
-            .expect("share-to-key-package conversion must succeed");
+            .unwrap_or_else(|e| panic!("FATAL: share-to-key-package conversion failed: {e}"));
         // Verify the share's verification key is consistent with the group key
         let share_vk = key_package.verifying_share();
         // The public key package contains all verifying shares — cross-check
@@ -63,7 +63,8 @@ pub fn dkg(total: u16, threshold: u16) -> DkgResult {
         .into_iter()
         .map(|(id, secret_share)| SignerShare {
             identifier: id,
-            key_package: KeyPackage::try_from(secret_share).unwrap(),
+            key_package: KeyPackage::try_from(secret_share)
+                .unwrap_or_else(|e| panic!("FATAL: key package creation failed during DKG: {e}")),
             nonce_counter: std::sync::atomic::AtomicU64::new(0),
         })
         .collect();
@@ -254,7 +255,7 @@ impl ThresholdGroup {
         // Verify each share is consistent with the group public key (Feldman VSS)
         for (id, secret_share) in &shares_map {
             let key_package = frost::keys::KeyPackage::try_from(secret_share.clone())
-                .expect("share-to-key-package conversion must succeed");
+                .unwrap_or_else(|e| panic!("FATAL: share-to-key-package conversion failed during refresh: {e}"));
             let share_vk = key_package.verifying_share();
             if let Some(expected_vk) = public_key_package.verifying_shares().get(id) {
                 assert_eq!(
@@ -269,7 +270,7 @@ impl ThresholdGroup {
             .into_iter()
             .map(|(id, secret_share)| {
                 let key_package = KeyPackage::try_from(secret_share)
-                    .expect("key package creation must succeed during refresh");
+                    .unwrap_or_else(|e| panic!("FATAL: key package creation failed during refresh: {e}"));
                 SignerShare {
                     identifier: id,
                     key_package,

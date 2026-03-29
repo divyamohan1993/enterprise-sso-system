@@ -111,7 +111,10 @@ pub fn cached_master_kek_distributed() -> &'static [u8; 32] {
             std::process::exit(1);
         }
 
-        let my_share_hex = my_share_hex.unwrap();
+        // Safe: we verified my_share_hex.is_some() above or called process::exit.
+        let Some(my_share_hex) = my_share_hex else {
+            std::process::exit(1);
+        };
 
         let mut mgr = ThresholdKekManager::new(ThresholdKekConfig {
             threshold: 3,
@@ -267,7 +270,7 @@ pub fn load_shard_hmac_key_sealed() -> [u8; 64] {
 /// as domain separator. This prevents one compromised module from impersonating
 /// another on the SHARD channel. Both endpoints of a channel must derive the
 /// same key by using a canonical channel name.
-pub fn derive_module_hmac_key(module_a: &str, module_b: &str) -> [u8; 64] {
+pub fn derive_module_hmac_key(module_a: &str, module_b: &str) -> Result<[u8; 64], String> {
     let master_kek = cached_master_kek();
     // Canonical ordering: alphabetically sort module names for consistent derivation
     let (first, second) = if module_a <= module_b {
@@ -282,8 +285,8 @@ pub fn derive_module_hmac_key(module_a: &str, module_b: &str) -> [u8; 64] {
     let hk = Hkdf::<Sha512>::new(Some(domain.as_bytes()), master_kek);
     let mut okm = [0u8; 64];
     hk.expand(b"shard-channel-hmac", &mut okm)
-        .expect("64-byte HKDF expand must succeed");
-    okm
+        .map_err(|_| "HKDF-SHA512 key derivation failed".to_string())?;
+    Ok(okm)
 }
 
 /// Load the shared receipt signing key with sealed key support.
@@ -367,7 +370,7 @@ fn unseal_seed_from_hex(hex_str: &str, purpose: &str) -> Option<[u8; 32]> {
     }
 
     let master_kek = cached_master_kek();
-    let mut unseal_key = derive_unseal_key(master_kek, purpose);
+    let mut unseal_key = derive_unseal_key(master_kek, purpose).ok()?;
 
     use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
     use aes_gcm::aead::Aead;
@@ -459,7 +462,7 @@ fn unseal_key_from_hex(hex_str: &str, purpose: &str) -> Option<[u8; 64]> {
     }
 
     let master_kek = cached_master_kek();
-    let mut unseal_key = derive_unseal_key(master_kek, purpose);
+    let mut unseal_key = derive_unseal_key(master_kek, purpose).ok()?;
 
     use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
     use aes_gcm::aead::Aead;
@@ -493,29 +496,31 @@ fn unseal_key_from_hex(hex_str: &str, purpose: &str) -> Option<[u8; 64]> {
 }
 
 /// Derive an unseal key for a specific purpose from the master KEK.
-fn derive_unseal_key(master_kek: &[u8; 32], purpose: &str) -> [u8; 32] {
+fn derive_unseal_key(master_kek: &[u8; 32], purpose: &str) -> Result<[u8; 32], String> {
     use hkdf::Hkdf;
     use sha2::Sha512;
     let hk = Hkdf::<Sha512>::new(Some(b"MILNET-UNSEAL-v1"), master_kek);
     let mut okm = [0u8; 32];
     hk.expand(purpose.as_bytes(), &mut okm)
-        .expect("32-byte HKDF expand must succeed");
-    okm
+        .map_err(|_| "HKDF-SHA512 key derivation failed".to_string())?;
+    Ok(okm)
 }
 
 /// Seal a 64-byte key for storage in env vars or files.
 /// Used by operators to prepare sealed keys for deployment.
-pub fn seal_key_for_storage(key: &[u8; 64], purpose: &str) -> Vec<u8> {
+pub fn seal_key_for_storage(key: &[u8; 64], purpose: &str) -> Result<Vec<u8>, String> {
     let master_kek = cached_master_kek();
-    let seal_key = derive_unseal_key(master_kek, purpose);
+    let seal_key = derive_unseal_key(master_kek, purpose)?;
 
     use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
     use aes_gcm::aead::Aead;
 
-    let cipher = Aes256Gcm::new_from_slice(&seal_key).expect("32-byte key");
+    let cipher = Aes256Gcm::new_from_slice(&seal_key)
+        .map_err(|_| "AES-256-GCM cipher initialization failed".to_string())?;
 
     let mut nonce_bytes = [0u8; 12];
-    getrandom::getrandom(&mut nonce_bytes).expect("OS entropy");
+    getrandom::getrandom(&mut nonce_bytes)
+        .map_err(|e| format!("OS entropy failure: {e}"))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let aad = format!("MILNET-SEALED-KEY-v1:{purpose}");
@@ -524,12 +529,12 @@ pub fn seal_key_for_storage(key: &[u8; 64], purpose: &str) -> Vec<u8> {
             msg: key.as_slice(),
             aad: aad.as_bytes(),
         })
-        .expect("AES-256-GCM encryption must not fail");
+        .map_err(|_| "AES-256-GCM encryption failed".to_string())?;
 
     let mut out = Vec::with_capacity(12 + ciphertext.len());
     out.extend_from_slice(&nonce_bytes);
     out.extend_from_slice(&ciphertext);
-    out
+    Ok(out)
 }
 
 /// Detect whether an HSM backend is configured via environment.
@@ -676,10 +681,10 @@ pub fn create_escrow_shares(kek: &[u8; 32], config: &KekEscrowConfig) -> Result<
         if config.escrow_encryption {
             // Derive a holder-specific encryption key via HKDF
             // Domain: "MILNET-KEK-ESCROW-v1:holder-{index}"
-            let holder_key = derive_escrow_holder_key(kek, share.index);
+            let holder_key = derive_escrow_holder_key(kek, share.index)?;
 
             // Encrypt the share with AES-256-GCM using the holder-specific key
-            let encrypted = encrypt_escrow_share(&share_bytes, &holder_key);
+            let encrypted = encrypt_escrow_share(&share_bytes, &holder_key)?;
             escrow_shares.push(encrypted);
         } else {
             escrow_shares.push(share_bytes);
@@ -818,26 +823,28 @@ pub fn verify_kek_integrity() -> bool {
 }
 
 /// Derive a holder-specific encryption key for escrow share encryption.
-fn derive_escrow_holder_key(kek: &[u8; 32], holder_index: u8) -> [u8; 32] {
+fn derive_escrow_holder_key(kek: &[u8; 32], holder_index: u8) -> Result<[u8; 32], String> {
     use hkdf::Hkdf;
     use sha2::Sha512;
     let info = format!("MILNET-KEK-ESCROW-v1:holder-{holder_index}");
     let hk = Hkdf::<Sha512>::new(Some(b"MILNET-KEK-ESCROW-SALT-v1"), kek);
     let mut key = [0u8; 32];
     hk.expand(info.as_bytes(), &mut key)
-        .expect("32-byte HKDF expand must succeed");
-    key
+        .map_err(|_| "HKDF-SHA512 key derivation failed".to_string())?;
+    Ok(key)
 }
 
 /// Encrypt an escrow share with a holder-specific key using AES-256-GCM.
-fn encrypt_escrow_share(plaintext: &[u8], key: &[u8; 32]) -> Vec<u8> {
+fn encrypt_escrow_share(plaintext: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, String> {
     use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
     use aes_gcm::aead::Aead;
 
-    let cipher = Aes256Gcm::new_from_slice(key).expect("32-byte key");
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|_| "AES-256-GCM cipher initialization failed".to_string())?;
 
     let mut nonce_bytes = [0u8; 12];
-    getrandom::getrandom(&mut nonce_bytes).expect("OS entropy");
+    getrandom::getrandom(&mut nonce_bytes)
+        .map_err(|e| format!("OS entropy failure: {e}"))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let aad = b"MILNET-KEK-ESCROW-SHARE-v1";
@@ -846,12 +853,12 @@ fn encrypt_escrow_share(plaintext: &[u8], key: &[u8; 32]) -> Vec<u8> {
             msg: plaintext,
             aad,
         })
-        .expect("AES-256-GCM encryption must not fail");
+        .map_err(|_| "AES-256-GCM encryption failed".to_string())?;
 
     let mut out = Vec::with_capacity(12 + ciphertext.len());
     out.extend_from_slice(&nonce_bytes);
     out.extend_from_slice(&ciphertext);
-    out
+    Ok(out)
 }
 
 /// Remove ALL MILNET_* environment variables from the process environment.

@@ -42,7 +42,10 @@ async fn main() {
     let _error_counter = common::metrics::Counter::new("errors", "Total errors");
 
     // Verify CNSA 2.0 compliance at startup
-    assert!(common::cnsa2::is_cnsa2_compliant(), "CNSA 2.0 compliance check failed");
+    if !common::cnsa2::is_cnsa2_compliant() {
+        tracing::error!("FATAL: CNSA 2.0 compliance check failed");
+        std::process::exit(1);
+    }
     tracing::info!("CNSA 2.0 compliance verified");
 
     let opaque_addr = std::env::var("OPAQUE_ADDR").unwrap_or_else(|_| "127.0.0.1:9102".into());
@@ -106,12 +109,70 @@ async fn main() {
         });
     }
 
+    // SECURITY: Verify kernel security posture (ptrace_scope, BPF restrictions)
+    common::startup_checks::verify_kernel_security_posture();
+
+    // SECURITY: Verify process hardening flags and apply anti-ptrace
+    crypto::seccomp::apply_anti_ptrace();
+    crypto::seccomp::verify_process_hardening();
+
+    // SECURITY: Remove ALL sensitive env vars from /proc/PID/environ.
+    // All config has been loaded above; secrets must not linger in memory.
+    common::startup_checks::sanitize_environment();
+
     tracing::info!("Starting orchestrator on {listen_addr} (mTLS)");
-    if let Err(e) = service.run(&listen_addr).await {
-        tracing::error!("Orchestrator exited with error: {e}");
-        if let Some(c) = cluster {
-            c.shutdown().await;
+
+    // SECURITY: Graceful shutdown on SIGTERM/SIGINT.
+    // - Stops accepting new connections
+    // - Waits for in-flight requests to complete (30s timeout)
+    // - Shuts down Raft cluster membership cleanly
+    // - Zeroizes sensitive HMAC key memory before exit
+    let shutdown_signal = async {
+        let mut sigterm = match tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("FATAL: failed to install SIGTERM handler: {e}");
+                std::process::exit(1);
+            }
+        };
+        let mut sigint = match tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::interrupt(),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("FATAL: failed to install SIGINT handler: {e}");
+                std::process::exit(1);
+            }
+        };
+        tokio::select! {
+            _ = sigterm.recv() => tracing::info!("received SIGTERM, initiating graceful shutdown"),
+            _ = sigint.recv() => tracing::info!("received SIGINT, initiating graceful shutdown"),
         }
-        std::process::exit(1);
+    };
+
+    tokio::select! {
+        result = service.run(&listen_addr) => {
+            if let Err(e) = result {
+                tracing::error!("Orchestrator exited with error: {e}");
+                if let Some(c) = cluster {
+                    c.shutdown().await;
+                }
+                std::process::exit(1);
+            }
+        }
+        _ = shutdown_signal => {
+            tracing::info!("orchestrator: waiting up to 30s for in-flight requests...");
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            if let Some(c) = cluster {
+                c.shutdown().await;
+            }
+            // SECURITY: Zeroize HMAC key material before exit
+            use zeroize::Zeroize;
+            let mut key_to_zeroize = hmac_key;
+            key_to_zeroize.zeroize();
+            tracing::info!("orchestrator: graceful shutdown complete");
+        }
     }
 }

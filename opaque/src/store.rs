@@ -196,25 +196,40 @@ impl CredentialStore {
         let mut rng = OsRng;
 
         // Step 1: Client starts registration
-        let client_start = ClientRegistration::<OpaqueCs>::start(&mut rng, password)
-            .expect("client registration start");
+        let client_start = match ClientRegistration::<OpaqueCs>::start(&mut rng, password) {
+            Ok(cs) => cs,
+            Err(e) => {
+                tracing::error!("OPAQUE client registration start failed: {e}");
+                return Uuid::nil();
+            }
+        };
 
         // Step 2: Server processes registration request
-        let server_start = ServerRegistration::<OpaqueCs>::start(
+        let server_start = match ServerRegistration::<OpaqueCs>::start(
             &self.server_setup,
             client_start.message,
             username.as_bytes(),
-        )
-        .expect("server registration start");
+        ) {
+            Ok(ss) => ss,
+            Err(e) => {
+                tracing::error!("OPAQUE server registration start failed: {e}");
+                return Uuid::nil();
+            }
+        };
 
         // Step 3: Client finishes registration
-        let client_finish = client_start.state.finish(
+        let client_finish = match client_start.state.finish(
             &mut rng,
             password,
             server_start.message,
             ClientRegistrationFinishParameters::default(),
-        )
-        .expect("client registration finish");
+        ) {
+            Ok(cf) => cf,
+            Err(e) => {
+                tracing::error!("OPAQUE client registration finish failed: {e}");
+                return Uuid::nil();
+            }
+        };
 
         // Step 4: Server finishes registration — produces the password file
         let server_registration = ServerRegistration::<OpaqueCs>::finish(client_finish.message);

@@ -314,7 +314,7 @@ impl RuntimeIntegrityMonitor {
 /// process exits with code 199.
 pub fn start_integrity_monitor(
     interval_secs: u64,
-) -> (JoinHandle<()>, Arc<RuntimeIntegrityMonitor>) {
+) -> Result<(JoinHandle<()>, Arc<RuntimeIntegrityMonitor>), String> {
     let monitor = Arc::new(RuntimeIntegrityMonitor::new());
     let monitor_ref = Arc::clone(&monitor);
     let production = is_production();
@@ -357,9 +357,9 @@ pub fn start_integrity_monitor(
                 }
             }
         })
-        .expect("failed to spawn integrity monitor thread");
+        .map_err(|e| format!("failed to spawn integrity monitor thread: {e}"))?;
 
-    (handle, monitor)
+    Ok((handle, monitor))
 }
 
 // ---------------------------------------------------------------------------

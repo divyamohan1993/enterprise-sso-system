@@ -168,7 +168,7 @@ pub fn handle_login_finish(
             // ever seeing it.
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or(std::time::Duration::ZERO)
                 .as_micros() as i64;
 
             let mut receipt = Receipt {

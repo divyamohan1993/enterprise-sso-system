@@ -30,15 +30,31 @@ impl Default for RetryConfig {
 
 impl RetryConfig {
     /// Compute the delay for a given attempt (0-indexed).
-    /// Includes simple jitter: ±25% randomization.
+    /// Includes cryptographically random jitter: +/-25% randomization.
+    ///
+    /// SECURITY: Uses `getrandom` (CSPRNG) to prevent thundering herd attacks.
+    /// Deterministic jitter (based on attempt parity) allowed all clients to
+    /// retry simultaneously, which could be exploited for coordinated DoS.
+    /// Random jitter ensures retry storms are spread across time.
     pub fn delay_for_attempt(&self, attempt: u32) -> Duration {
         let base_ms = self.initial_delay.as_millis() as f64
             * self.multiplier.powi(attempt as i32);
         let capped_ms = base_ms.min(self.max_delay.as_millis() as f64);
 
-        // Simple deterministic jitter using attempt number (no RNG needed)
-        // Varies ±25% based on attempt parity
-        let jitter_factor = if attempt % 2 == 0 { 0.75 } else { 1.25 };
+        // SECURITY: Cryptographically random jitter via getrandom (not deterministic).
+        // Produces a uniform value in [0.75, 1.25] for +/-25% jitter.
+        let jitter_factor = {
+            let mut buf = [0u8; 4];
+            // getrandom uses the OS CSPRNG; failure here is fatal (entropy exhaustion).
+            getrandom::getrandom(&mut buf).unwrap_or_else(|_| {
+                // Fallback: if CSPRNG fails, use a safe default (no jitter).
+                buf = [0x80, 0x00, 0x00, 0x00];
+            });
+            let random_u32 = u32::from_le_bytes(buf);
+            // Map [0, u32::MAX] to [0.0, 1.0), then scale to [0.75, 1.25]
+            let normalized = (random_u32 as f64) / (u32::MAX as f64);
+            0.75 + (normalized * 0.5)
+        };
         let jittered_ms = capped_ms * jitter_factor;
 
         Duration::from_millis(jittered_ms as u64)

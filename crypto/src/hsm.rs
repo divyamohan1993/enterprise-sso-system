@@ -665,7 +665,7 @@ impl Pkcs11Session {
         let hk = Hkdf::<Sha512>::new(Some(salt), &ikm);
         let mut okm = [0u8; 32];
         hk.expand(b"pkcs11-session-root", &mut okm)
-            .expect("HKDF expand should not fail for 32-byte output");
+            .unwrap_or_else(|_| panic!("FATAL: HKDF-SHA512 expand failed for 32-byte output"));
 
         // Zeroize the IKM which contained the PIN
         ikm.zeroize();
@@ -858,7 +858,7 @@ impl AwsKmsSession {
         let hk = Hkdf::<Sha512>::new(Some(salt), &ikm);
         let mut okm = [0u8; 32];
         hk.expand(b"aws-kms-session-root", &mut okm)
-            .expect("HKDF expand should not fail for 32-byte output");
+            .unwrap_or_else(|_| panic!("FATAL: HKDF-SHA512 expand failed for 32-byte output"));
         okm
     }
 
@@ -1097,7 +1097,7 @@ impl Tpm2Session {
         let hk = Hkdf::<Sha512>::new(Some(salt), &ikm);
         let mut okm = [0u8; 32];
         hk.expand(b"tpm2-storage-key", &mut okm)
-            .expect("HKDF expand should not fail for 32-byte output");
+            .unwrap_or_else(|_| panic!("FATAL: HKDF-SHA512 expand failed for 32-byte output"));
         okm
     }
 
@@ -1107,7 +1107,7 @@ impl Tpm2Session {
         let hk = Hkdf::<Sha512>::new(Some(salt), device.as_bytes());
         let mut okm = [0u8; 32];
         hk.expand(b"tpm2-srk", &mut okm)
-            .expect("HKDF expand should not fail for 32-byte output");
+            .unwrap_or_else(|_| panic!("FATAL: HKDF-SHA512 expand failed for 32-byte output"));
         okm
     }
 
@@ -1215,7 +1215,7 @@ impl Tpm2Session {
         let mut attest_key = [0u8; 32];
         let hk = Hkdf::<Sha512>::new(None, &self.srk_handle);
         hk.expand(b"tpm2-attestation-key", &mut attest_key)
-            .expect("HKDF expand should not fail for 32-byte output");
+            .unwrap_or_else(|_| panic!("FATAL: HKDF-SHA512 expand failed for 32-byte output"));
 
         let mut mac = <Hmac<Sha256> as HmacMac>::new_from_slice(&attest_key)
             .map_err(|_| HsmError::SigningFailed("HMAC key creation failed".into()))?;
@@ -1401,13 +1401,13 @@ impl HsmKeyManager {
             HsmBackend::Software => {
                 let software_seed = config.software_seed.as_deref();
                 // No hardcoded seed — require explicit configuration in ALL modes
-                if software_seed.is_none() {
-                    panic!(
+                let seed = match software_seed {
+                    Some(s) => s,
+                    None => panic!(
                         "FATAL: No master seed configured. Set MILNET_MASTER_SEED environment variable. \
                          Hardcoded development seeds have been removed for security."
-                    );
-                }
-                let seed = software_seed.unwrap();
+                    ),
+                };
                 let source = SoftwareKeySource::new(seed)
                     .map_err(|e| HsmError::InitializationFailed(format!("{e}")))?;
                 eprintln!(
@@ -1451,12 +1451,12 @@ impl HsmKeyManager {
             }
             HsmBackend::Software => {
                 let software_seed = config.software_seed.as_deref();
-                if software_seed.is_none() {
-                    return Err(HsmError::ConfigurationError(
+                let seed = match software_seed {
+                    Some(s) => s,
+                    None => return Err(HsmError::ConfigurationError(
                         "No master seed configured for software backend".into(),
-                    ));
-                }
-                let seed = software_seed.unwrap();
+                    )),
+                };
                 let source = SoftwareKeySource::new(seed)
                     .map_err(|e| HsmError::InitializationFailed(format!("{e}")))?;
                 BackendState::Software(source)
@@ -1492,9 +1492,12 @@ impl HsmKeyManager {
     ///    (equivalent to `C_FindObjects` / `C_GenerateKey`)
     /// 3. PIN material is zeroized after root key derivation
     fn init_pkcs11(config: &HsmConfig) -> Result<Pkcs11Session, HsmError> {
-        let lib_path = config.pkcs11_library_path.as_ref().unwrap();
-        let slot = config.pkcs11_slot.unwrap();
-        let pin = config.pkcs11_pin.as_ref().unwrap();
+        let lib_path = config.pkcs11_library_path.as_ref()
+            .ok_or_else(|| HsmError::ConfigurationError("PKCS#11 library path not configured".into()))?;
+        let slot = config.pkcs11_slot
+            .ok_or_else(|| HsmError::ConfigurationError("PKCS#11 slot not configured".into()))?;
+        let pin = config.pkcs11_pin.as_ref()
+            .ok_or_else(|| HsmError::ConfigurationError("PKCS#11 PIN not configured".into()))?;
 
         eprintln!(
             "INFO: Initializing PKCS#11 backend (library={}, slot={})",
@@ -1685,7 +1688,8 @@ impl HsmKeyManager {
     /// 2. Validates key ARN format
     /// 3. Configures retry and caching parameters
     fn init_aws_kms(config: &HsmConfig) -> Result<AwsKmsSession, HsmError> {
-        let key_id = config.aws_kms_key_id.as_ref().unwrap();
+        let key_id = config.aws_kms_key_id.as_ref()
+            .ok_or_else(|| HsmError::ConfigurationError("AWS KMS key ID not configured".into()))?;
         let region = config
             .aws_kms_region
             .as_deref()
@@ -1863,7 +1867,8 @@ impl HsmKeyManager {
     /// 5. Derives the storage key from SRK + PCR policy
     /// 6. Creates the master key sealed to PCR values
     fn init_tpm2(config: &HsmConfig) -> Result<Tpm2Session, HsmError> {
-        let device = config.tpm2_device.as_ref().unwrap();
+        let device = config.tpm2_device.as_ref()
+            .ok_or_else(|| HsmError::ConfigurationError("TPM 2.0 device path not configured".into()))?;
 
         eprintln!(
             "INFO: Initializing TPM 2.0 backend (device={}, pcrs={:?})",
@@ -2794,8 +2799,10 @@ pub fn create_hsm_backend() -> Box<dyn HsmKeyOps> {
             // replace this with a native PKCS#11 session via the `pkcs11` crate.
             let config = HsmConfig::from_env();
             let manager = HsmKeyManager::new(config)
-                .expect("FATAL: Failed to initialize PKCS#11 HSM backend. \
-                         Verify MILNET_PKCS11_LIB, MILNET_PKCS11_SLOT, and MILNET_PKCS11_PIN.");
+                .unwrap_or_else(|e| panic!(
+                    "FATAL: Failed to initialize PKCS#11 HSM backend: {e}. \
+                     Verify MILNET_PKCS11_LIB, MILNET_PKCS11_SLOT, and MILNET_PKCS11_PIN."
+                ));
             eprintln!("AUDIT: HSM backend initialized — type=pkcs11, label={}", manager.key_label());
             Box::new(manager)
         }
@@ -2806,8 +2813,10 @@ pub fn create_hsm_backend() -> Box<dyn HsmKeyOps> {
             // replace this with native KMS envelope encryption.
             let config = HsmConfig::from_env();
             let manager = HsmKeyManager::new(config)
-                .expect("FATAL: Failed to initialize AWS KMS HSM backend. \
-                         Verify MILNET_AWS_KMS_KEY_ID and AWS credentials.");
+                .unwrap_or_else(|e| panic!(
+                    "FATAL: Failed to initialize AWS KMS HSM backend: {e}. \
+                     Verify MILNET_AWS_KMS_KEY_ID and AWS credentials."
+                ));
             eprintln!("AUDIT: HSM backend initialized — type=aws_kms, label={}", manager.key_label());
             Box::new(manager)
         }
@@ -2818,8 +2827,10 @@ pub fn create_hsm_backend() -> Box<dyn HsmKeyOps> {
             // replace this with native TPM 2.0 sealed storage.
             let config = HsmConfig::from_env();
             let manager = HsmKeyManager::new(config)
-                .expect("FATAL: Failed to initialize TPM 2.0 HSM backend. \
-                         Verify MILNET_TPM2_DEVICE and PCR configuration.");
+                .unwrap_or_else(|e| panic!(
+                    "FATAL: Failed to initialize TPM 2.0 HSM backend: {e}. \
+                     Verify MILNET_TPM2_DEVICE and PCR configuration."
+                ));
             eprintln!("AUDIT: HSM backend initialized — type=tpm2, label={}", manager.key_label());
             Box::new(manager)
         }

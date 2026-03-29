@@ -1,7 +1,7 @@
 use crate::pkce;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -48,6 +48,119 @@ const MAX_CODE_ATTEMPTS_PER_CLIENT: u32 = 10;
 
 /// Rate limit window for code consumption attempts (60 seconds).
 const CODE_ATTEMPT_WINDOW_SECS: u64 = 60;
+
+// ── OAuth Redirect URI Validation (CRITICAL — prevents authorization code theft) ──
+
+/// Validate a redirect_uri against the set of registered redirect URIs for a client.
+///
+/// SECURITY: Uses EXACT STRING MATCH only. No wildcard matching, no partial
+/// matching, no path traversal, no open redirects. This prevents authorization
+/// code interception via manipulated redirect URIs (OAuth 2.0 mix-up attacks,
+/// open redirect chains).
+///
+/// Additionally enforces HTTPS requirement (except for localhost during
+/// development, per RFC 8252 Section 7.3).
+pub fn validate_redirect_uri(
+    redirect_uri: &str,
+    registered_uris: &[String],
+) -> Result<(), &'static str> {
+    // SECURITY: Reject empty redirect URIs immediately.
+    if redirect_uri.is_empty() {
+        return Err("redirect_uri must not be empty");
+    }
+
+    // SECURITY: Enforce HTTPS for all redirect URIs except localhost (dev only).
+    // Per OAuth 2.1 Section 1.4.1 and NIST SP 800-63B.
+    let is_localhost = redirect_uri.starts_with("http://localhost")
+        || redirect_uri.starts_with("http://127.0.0.1")
+        || redirect_uri.starts_with("http://[::1]");
+    if !redirect_uri.starts_with("https://") && !is_localhost {
+        return Err("redirect_uri must use https:// (except localhost for development)");
+    }
+
+    // SECURITY: EXACT STRING MATCH against registered redirect URIs.
+    // No normalization, no wildcard expansion, no subdomain matching.
+    // Constant-time comparison to prevent timing side-channels on URI values.
+    let matched = registered_uris
+        .iter()
+        .any(|registered| crypto::ct::ct_eq(redirect_uri.as_bytes(), registered.as_bytes()));
+
+    if matched {
+        Ok(())
+    } else {
+        Err("redirect_uri does not match any registered redirect URI (exact match required)")
+    }
+}
+
+// ── OAuth State Parameter CSRF Protection ──────────────────────────────────
+
+/// HMAC key for binding OAuth state parameters to sessions.
+/// In production this MUST be loaded from a KMS / HSM.
+static STATE_HMAC_KEY: std::sync::OnceLock<[u8; 64]> = std::sync::OnceLock::new();
+
+fn state_hmac_key() -> &'static [u8; 64] {
+    STATE_HMAC_KEY.get_or_init(|| {
+        let mut key = [0u8; 64];
+        getrandom::getrandom(&mut key).expect("OS CSPRNG failure");
+        key
+    })
+}
+
+/// Generate a cryptographically-bound OAuth state parameter.
+///
+/// SECURITY: The state parameter is HMAC-SHA512(session_id, random_nonce),
+/// which cryptographically binds it to the user's session. This prevents
+/// CSRF attacks on the authorization code exchange (an attacker cannot
+/// forge a valid state for a victim's session).
+///
+/// Returns (state_value, nonce) — the nonce must be stored server-side
+/// alongside the session to verify the state on callback.
+pub fn generate_oauth_state(session_id: &str) -> (String, String) {
+    let mut nonce_bytes = [0u8; 32];
+    getrandom::getrandom(&mut nonce_bytes).expect("OS CSPRNG failure");
+    let nonce = hex::encode(nonce_bytes);
+
+    type HmacSha512 = Hmac<Sha512>;
+    let mut mac = HmacSha512::new_from_slice(state_hmac_key())
+        .expect("HMAC key length is always valid");
+    mac.update(session_id.as_bytes());
+    mac.update(nonce.as_bytes());
+    let state = hex::encode(mac.finalize().into_bytes());
+
+    (state, nonce)
+}
+
+/// Verify an OAuth state parameter against the session and stored nonce.
+///
+/// SECURITY: Uses constant-time comparison to prevent timing attacks.
+/// Rejects missing or invalid state parameters immediately.
+pub fn verify_oauth_state(
+    state: &str,
+    session_id: &str,
+    stored_nonce: &str,
+) -> Result<(), &'static str> {
+    if state.is_empty() {
+        return Err("OAuth state parameter is missing (CSRF protection)");
+    }
+    if stored_nonce.is_empty() {
+        return Err("No stored nonce for state verification (session expired or invalid)");
+    }
+
+    // Recompute the expected state from session_id + stored nonce.
+    type HmacSha512 = Hmac<Sha512>;
+    let mut mac = HmacSha512::new_from_slice(state_hmac_key())
+        .expect("HMAC key length is always valid");
+    mac.update(session_id.as_bytes());
+    mac.update(stored_nonce.as_bytes());
+    let expected = hex::encode(mac.finalize().into_bytes());
+
+    // SECURITY: Constant-time comparison to prevent timing side-channels.
+    if crypto::ct::ct_eq(state.as_bytes(), expected.as_bytes()) {
+        Ok(())
+    } else {
+        Err("OAuth state parameter does not match session (possible CSRF attack)")
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct AuthorizationRequest {
@@ -116,6 +229,27 @@ impl AuthorizationStore {
         code_challenge: Option<String>,
         nonce: Option<String>,
     ) -> Result<String, &'static str> {
+        self.create_code_with_tier(client_id, redirect_uri, user_id, scope, code_challenge, nonce, 2)
+    }
+
+    /// Create an authorization code with redirect_uri validation against registered URIs.
+    ///
+    /// SECURITY: This is the preferred method — it validates the redirect_uri
+    /// against the client's registered URIs BEFORE issuing a code, preventing
+    /// authorization code theft via open redirects.
+    pub fn create_code_validated(
+        &mut self,
+        client_id: &str,
+        redirect_uri: &str,
+        registered_redirect_uris: &[String],
+        user_id: Uuid,
+        scope: &str,
+        code_challenge: Option<String>,
+        nonce: Option<String>,
+    ) -> Result<String, &'static str> {
+        // SECURITY: Validate redirect_uri BEFORE issuing any authorization code.
+        // This prevents authorization code interception via unregistered redirect URIs.
+        validate_redirect_uri(redirect_uri, registered_redirect_uris)?;
         self.create_code_with_tier(client_id, redirect_uri, user_id, scope, code_challenge, nonce, 2)
     }
 

@@ -39,7 +39,9 @@ pub type PqEncodedSignature = EncodedSignature<MlDsa87>;
 /// then derives the keypair deterministically via `from_seed`.
 pub fn generate_pq_keypair() -> (PqSigningKey, PqVerifyingKey) {
     let mut seed = [0u8; 32];
-    getrandom::getrandom(&mut seed).expect("getrandom failed");
+    if getrandom::getrandom(&mut seed).is_err() {
+        panic!("FATAL: OS CSPRNG unavailable — cannot generate PQ keypair safely");
+    }
     let kp = MlDsa87::from_seed(&seed.into());
     // Zeroize the seed on the stack
     seed.zeroize();

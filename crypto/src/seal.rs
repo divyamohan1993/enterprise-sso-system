@@ -108,7 +108,9 @@ impl MasterKey {
     /// Generate a master key from the OS CSPRNG (`getrandom`).
     pub fn generate() -> Self {
         let mut bytes = [0u8; 32];
-        getrandom::getrandom(&mut bytes).expect("OS CSPRNG unavailable");
+        if getrandom::getrandom(&mut bytes).is_err() {
+            panic!("FATAL: OS CSPRNG unavailable — cannot generate master key safely");
+        }
         let mk = Self { bytes };
         mlock_key_bytes(mk.bytes.as_ptr());
         mk
@@ -124,8 +126,9 @@ impl MasterKey {
         info.extend_from_slice(purpose.as_bytes());
 
         let mut okm = [0u8; 32];
-        hk.expand(&info, &mut okm)
-            .expect("HKDF expand should not fail for 32 byte output");
+        if hk.expand(&info, &mut okm).is_err() {
+            panic!("FATAL: HKDF-SHA512 expand failed for 32-byte KEK derivation");
+        }
         let kek = DerivedKek { bytes: okm };
         mlock_key_bytes(kek.bytes.as_ptr());
         kek

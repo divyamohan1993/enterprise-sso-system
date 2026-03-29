@@ -30,7 +30,7 @@ impl Default for RotationSchedule {
 pub fn start_rotation_monitor(
     schedule: RotationSchedule,
     rotation_callback: impl Fn() -> Result<(), String> + Send + 'static,
-) -> Arc<AtomicBool> {
+) -> Result<Arc<AtomicBool>, String> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = shutdown.clone();
 
@@ -69,7 +69,7 @@ pub fn start_rotation_monitor(
             }
             tracing::info!("Key rotation monitor stopped");
         })
-        .expect("failed to spawn key rotation monitor thread");
+        .map_err(|e| format!("failed to spawn key rotation monitor thread: {e}"))?;
 
-    shutdown
+    Ok(shutdown)
 }

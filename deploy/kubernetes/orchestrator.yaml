@@ -24,6 +24,8 @@ spec:
         app.kubernetes.io/name: orchestrator
         app.kubernetes.io/part-of: milnet-sso
     spec:
+      serviceAccountName: orchestrator-sa
+      automountServiceAccountToken: false  # No K8s API access needed
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
@@ -44,7 +46,7 @@ spec:
               topologyKey: kubernetes.io/hostname
       containers:
         - name: orchestrator
-          image: gcr.io/MILNET_PROJECT/milnet-sso:latest
+          image: gcr.io/MILNET_PROJECT/milnet-orchestrator:v1.0.0  # pinned version — never use :latest
           args: []
           ports:
             - containerPort: 9101

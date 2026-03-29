@@ -69,7 +69,7 @@ impl DpopReplayCache {
     fn check_and_record(&mut self, proof_hash: &[u8; 64]) -> bool {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs() as i64;
 
         // Check both generations — O(1)
@@ -209,7 +209,7 @@ fn verify_token_core(
     // 3. Check expiry
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_micros() as i64;
     if token.claims.exp <= now {
         return Err(MilnetError::CryptoVerification(
@@ -489,13 +489,14 @@ pub fn verify_token_with_dpop(
 }
 
 /// Compute an HMAC-SHA512 ratchet tag over (TOKEN_TAG || claims_bytes || epoch).
-fn compute_ratchet_tag(ratchet_key: &[u8; 64], claims_bytes: &[u8], epoch: u64) -> [u8; 64] {
+fn compute_ratchet_tag(ratchet_key: &[u8; 64], claims_bytes: &[u8], epoch: u64) -> Result<[u8; 64], MilnetError> {
     let mut mac =
-        HmacSha512::new_from_slice(ratchet_key).expect("HMAC-SHA512 accepts any key length");
+        HmacSha512::new_from_slice(ratchet_key)
+            .map_err(|_| MilnetError::CryptoVerification("HMAC-SHA512 initialization failed".into()))?;
     mac.update(domain::TOKEN_TAG);
     mac.update(claims_bytes);
     mac.update(&epoch.to_le_bytes());
-    mac.finalize().into_bytes().into()
+    Ok(mac.finalize().into_bytes().into())
 }
 
 /// Verify a token's signature, claims, AND ratchet tag.
@@ -547,7 +548,7 @@ fn verify_token_with_ratchet_inner(
     // 3. Verify ratchet tag
     let claims_bytes = postcard::to_allocvec(&token.claims)
         .map_err(|e| MilnetError::Serialization(e.to_string()))?;
-    let expected_tag = compute_ratchet_tag(ratchet_key, &claims_bytes, token.claims.ratchet_epoch);
+    let expected_tag = compute_ratchet_tag(ratchet_key, &claims_bytes, token.claims.ratchet_epoch)?;
     if !crypto::ct::ct_eq(&token.ratchet_tag, &expected_tag) {
         return Err(MilnetError::CryptoVerification(
             "ratchet tag invalid".into(),

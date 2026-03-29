@@ -27,6 +27,8 @@ spec:
         app.kubernetes.io/name: gateway
         app.kubernetes.io/part-of: milnet-sso
     spec:
+      serviceAccountName: gateway-sa
+      automountServiceAccountToken: false  # No K8s API access needed
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
@@ -47,7 +49,7 @@ spec:
               topologyKey: kubernetes.io/hostname
       containers:
         - name: gateway
-          image: gcr.io/MILNET_PROJECT/milnet-sso:latest
+          image: gcr.io/MILNET_PROJECT/milnet-gateway:v1.0.0  # pinned version — never use :latest
           ports:
             - containerPort: 9100
               name: service

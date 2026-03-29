@@ -308,7 +308,7 @@ impl DistributedSessionTracker {
     async fn load_from_db(&self) -> Result<(), String> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs() as i64;
 
         let rows: Vec<(Uuid, Uuid, i64, i64)> = sqlx::query_as(
@@ -459,7 +459,7 @@ impl DistributedSessionTracker {
                 tick.tick().await;
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_secs() as i64;
                 if let Err(e) = tracker.cleanup_expired(now).await {
                     tracing::warn!("Session cleanup error: {e}");

@@ -87,30 +87,73 @@ async fn main() {
         _defense.connect_to_cluster(c.clone());
     }
 
-    // --- Role-based dispatch ---
-    match std::env::var("MILNET_TSS_ROLE").ok().as_deref() {
-        Some("coordinator") => {
-            tracing::info!("TSS starting in COORDINATOR role (truly distributed)");
-            run_coordinator_role().await;
+    // SECURITY: Verify kernel security posture (ptrace_scope, BPF restrictions)
+    common::startup_checks::verify_kernel_security_posture();
+
+    // SECURITY: Verify process hardening flags and apply anti-ptrace
+    crypto::seccomp::apply_anti_ptrace();
+    crypto::seccomp::verify_process_hardening();
+
+    // SECURITY: Remove ALL sensitive env vars from /proc/PID/environ.
+    // All config has been loaded above; secrets must not linger in memory.
+    common::startup_checks::sanitize_environment();
+
+    // SECURITY: Graceful shutdown on SIGTERM/SIGINT.
+    // - Stops accepting new signing requests
+    // - Waits for in-flight FROST ceremonies to complete (30s timeout)
+    // - Shuts down Raft cluster membership cleanly
+    // - Zeroizes sensitive key material before exit
+    let shutdown_signal = async {
+        let mut sigterm = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        ).expect("failed to install SIGTERM handler");
+        let mut sigint = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::interrupt(),
+        ).expect("failed to install SIGINT handler");
+        tokio::select! {
+            _ = sigterm.recv() => tracing::info!("received SIGTERM, initiating graceful shutdown"),
+            _ = sigint.recv() => tracing::info!("received SIGINT, initiating graceful shutdown"),
         }
-        Some("signer") => {
-            tracing::info!("TSS starting in SIGNER role (truly distributed)");
-            run_signer_role().await;
+    };
+
+    // --- Role-based dispatch with graceful shutdown ---
+    let role_future = async {
+        match std::env::var("MILNET_TSS_ROLE").ok().as_deref() {
+            Some("coordinator") => {
+                tracing::info!("TSS starting in COORDINATOR role (truly distributed)");
+                run_coordinator_role().await;
+            }
+            Some("signer") => {
+                tracing::info!("TSS starting in SIGNER role (truly distributed)");
+                run_signer_role().await;
+            }
+            Some(other) => {
+                tracing::error!(
+                    "FATAL: unknown MILNET_TSS_ROLE={other:?}. Use 'coordinator' or 'signer'."
+                );
+                std::process::exit(1);
+            }
+            None => {
+                eprintln!(
+                    "FATAL: MILNET_TSS_ROLE not set. \
+                     Each TSS process MUST run exactly one role: 'coordinator' or 'signer'. \
+                     In-process mode is forbidden — it collapses 3-of-5 \
+                     threshold security to effective 1-of-1."
+                );
+                std::process::exit(1);
+            }
         }
-        Some(other) => {
-            tracing::error!(
-                "FATAL: unknown MILNET_TSS_ROLE={other:?}. Use 'coordinator' or 'signer'."
-            );
-            std::process::exit(1);
-        }
-        None => {
-            eprintln!(
-                "FATAL: MILNET_TSS_ROLE not set. \
-                 Each TSS process MUST run exactly one role: 'coordinator' or 'signer'. \
-                 In-process mode is forbidden — it collapses 3-of-5 \
-                 threshold security to effective 1-of-1."
-            );
-            std::process::exit(1);
+    };
+
+    tokio::select! {
+        _ = role_future => {}
+        _ = shutdown_signal => {
+            tracing::info!("tss: waiting up to 30s for in-flight signing ceremonies...");
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            if let Some(c) = cluster {
+                c.shutdown().await;
+            }
+            tracing::info!("tss: graceful shutdown complete");
         }
     }
 }

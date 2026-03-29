@@ -124,8 +124,9 @@ pub fn derive_session_key(
 ) -> [u8; SESSION_KEY_LEN] {
     let hk = Hkdf::<Sha512>::new(Some(context), shared_secret.as_bytes());
     let mut okm = [0u8; SESSION_KEY_LEN];
-    hk.expand(b"X-Wing-Session-Key-v1", &mut okm)
-        .expect("64 bytes is within HKDF-SHA512 output limit");
+    if hk.expand(b"X-Wing-Session-Key-v1", &mut okm).is_err() {
+        panic!("FATAL: HKDF-SHA512 expand failed for session key derivation");
+    }
     okm
 }
 
@@ -305,8 +306,9 @@ fn combine(
 
     let hk = Hkdf::<Sha512>::new(Some(XWING_HKDF_SALT), &ikm);
     let mut okm = [0u8; 32];
-    hk.expand(XWING_HKDF_INFO, &mut okm)
-        .expect("32 bytes is within HKDF-SHA512 output limit");
+    if hk.expand(XWING_HKDF_INFO, &mut okm).is_err() {
+        panic!("FATAL: HKDF-SHA512 expand failed for X-Wing shared secret derivation");
+    }
 
     // Zeroize the intermediate key material
     ikm.zeroize();
@@ -336,10 +338,13 @@ pub fn xwing_encapsulate(server_pk: &XWingPublicKey) -> (SharedSecret, Ciphertex
     let client_pk = *eph_public.as_bytes();
 
     // ML-KEM-1024 encapsulation against the server's encapsulation key.
-    let (ml_kem_ct_arr, ml_kem_ss_arr) = server_pk
+    let encaps_result = server_pk
         .ml_kem_ek
-        .encapsulate(&mut rng)
-        .expect("ML-KEM-1024 encapsulation should not fail");
+        .encapsulate(&mut rng);
+    let (ml_kem_ct_arr, ml_kem_ss_arr) = match encaps_result {
+        Ok(pair) => pair,
+        Err(_) => panic!("FATAL: ML-KEM-1024 encapsulation failed — cryptographic operation error"),
+    };
 
     let ml_kem_ss: &[u8] = ml_kem_ss_arr.as_slice();
     let ml_kem_ct: &[u8] = ml_kem_ct_arr.as_slice();
@@ -487,8 +492,9 @@ pub fn active_kem_algorithm() -> KemAlgorithm {
 fn combine_mlkem_only(ml_kem_ss: &[u8]) -> SharedSecret {
     let hk = Hkdf::<Sha512>::new(Some(MLKEM_ONLY_HKDF_SALT), ml_kem_ss);
     let mut okm = [0u8; 32];
-    hk.expand(MLKEM_ONLY_HKDF_INFO, &mut okm)
-        .expect("32 bytes is within HKDF-SHA512 output limit");
+    if hk.expand(MLKEM_ONLY_HKDF_INFO, &mut okm).is_err() {
+        panic!("FATAL: HKDF-SHA512 expand failed for ML-KEM-only shared secret derivation");
+    }
     SharedSecret(okm)
 }
 
@@ -524,7 +530,11 @@ impl TaggedCiphertext {
 
     /// Return the KEM algorithm used.
     pub fn algorithm(&self) -> KemAlgorithm {
-        KemAlgorithm::from_tag(self.bytes[0]).expect("TaggedCiphertext always has valid tag")
+        // SAFETY: TaggedCiphertext can only be constructed via from_bytes() which validates the tag.
+        match KemAlgorithm::from_tag(self.bytes[0]) {
+            Some(algo) => algo,
+            None => panic!("FATAL: TaggedCiphertext contains invalid KEM tag — internal invariant violation"),
+        }
     }
 
     /// Return the raw ciphertext bytes (without the tag).
@@ -558,10 +568,13 @@ pub fn xwing_encapsulate_tagged(
         KemAlgorithm::MlKem1024Only => {
             // Pure ML-KEM-1024 encapsulation (no X25519)
             let mut rng = rand::rngs::OsRng;
-            let (ml_kem_ct_arr, ml_kem_ss_arr) = server_pk
+            let (ml_kem_ct_arr, ml_kem_ss_arr) = match server_pk
                 .ml_kem_ek
                 .encapsulate(&mut rng)
-                .expect("ML-KEM-1024 encapsulation should not fail");
+            {
+                Ok(pair) => pair,
+                Err(_) => panic!("FATAL: ML-KEM-1024 encapsulation failed — cryptographic operation error"),
+            };
 
             let ml_kem_ss: &[u8] = ml_kem_ss_arr.as_slice();
             let ml_kem_ct: &[u8] = ml_kem_ct_arr.as_slice();

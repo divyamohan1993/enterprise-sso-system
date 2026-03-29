@@ -294,7 +294,7 @@ impl RefreshTokenStore {
         let token_value = format!("rt_{}", Uuid::new_v4());
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs() as i64;
         self.tokens.insert(
             token_value.clone(),
@@ -344,7 +344,7 @@ impl RefreshTokenStore {
         // Check expiry
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs() as i64;
         if now > rt.expires_at {
             self.tokens.remove(token);
@@ -381,7 +381,7 @@ impl RefreshTokenStore {
     pub fn cleanup_expired(&mut self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs() as i64;
         self.tokens.retain(|_, rt| rt.expires_at > now);
     }
@@ -529,7 +529,7 @@ pub fn create_id_token_with_tier(
 ) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs() as i64;
 
     let header = serde_json::json!({
@@ -549,8 +549,12 @@ pub fn create_id_token_with_tier(
         jti: Uuid::new_v4().to_string(),
     };
 
-    let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
-    let claims_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+    let header_b64 = URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&header).unwrap_or_else(|e| panic!("FATAL: JWT header serialization failed: {e}"))
+    );
+    let claims_b64 = URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&claims).unwrap_or_else(|e| panic!("FATAL: JWT claims serialization failed: {e}"))
+    );
     let signing_input = format!("{header_b64}.{claims_b64}");
 
     let signature = pq_sign_raw(&signing_key.signing_key, signing_input.as_bytes());

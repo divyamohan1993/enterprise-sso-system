@@ -15,7 +15,7 @@ fn hash_client_secret(client_id: &str, plaintext_secret: &str) -> String {
 
     // Use the crypto crate's Argon2id KSF (64MiB, 3 iterations, 4 threads, 32-byte output)
     let derived = crypto::kdf::stretch_password(plaintext_secret.as_bytes(), &salt[..16])
-        .expect("argon2id stretch must not fail for valid inputs");
+        .unwrap_or_else(|e| panic!("FATAL: argon2id stretch failed for client secret hashing: {e}"));
     hex::encode(derived)
 }
 

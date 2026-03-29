@@ -82,7 +82,9 @@ impl DataEncryptionKey {
     /// Generate a fresh DEK from the OS CSPRNG (`getrandom`).
     pub fn generate() -> Self {
         let mut key = [0u8; KEY_LEN];
-        getrandom::getrandom(&mut key).expect("OS CSPRNG failure");
+        if getrandom::getrandom(&mut key).is_err() {
+            panic!("FATAL: OS CSPRNG unavailable — cannot generate data encryption key safely");
+        }
         Self(key)
     }
 
@@ -109,7 +111,9 @@ impl KeyEncryptionKey {
     /// Generate a fresh KEK from the OS CSPRNG (`getrandom`).
     pub fn generate() -> Self {
         let mut key = [0u8; KEY_LEN];
-        getrandom::getrandom(&mut key).expect("OS CSPRNG failure");
+        if getrandom::getrandom(&mut key).is_err() {
+            panic!("FATAL: OS CSPRNG unavailable — cannot generate key encryption key safely");
+        }
         Self(key)
     }
 
@@ -217,7 +221,9 @@ pub fn wrap_key(
     dek: &DataEncryptionKey,
 ) -> Result<WrappedKey, EnvelopeError> {
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    getrandom::getrandom(&mut nonce_bytes).expect("OS CSPRNG failure");
+    if getrandom::getrandom(&mut nonce_bytes).is_err() {
+        panic!("FATAL: OS CSPRNG unavailable — cannot generate nonce for key wrapping");
+    }
 
     let cipher = Aes256Gcm::new(GenericArray::from_slice(&kek.0));
     let nonce = Nonce::from_slice(&nonce_bytes);

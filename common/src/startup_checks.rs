@@ -137,7 +137,13 @@ pub fn run_platform_checks<F: FnOnce() -> bool>(harden_fn: F) -> (
     // -----------------------------------------------------------------------
     let monitor_interval = 60; // seconds
     let (monitor_handle, monitor_ref) =
-        platform_integrity::start_integrity_monitor(monitor_interval);
+        match platform_integrity::start_integrity_monitor(monitor_interval) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("FATAL: failed to start integrity monitor: {e}");
+                std::process::exit(1);
+            }
+        };
 
     // Verify the monitor thread is actually running.
     if monitor_handle.is_finished() {
@@ -176,6 +182,146 @@ pub fn run_platform_checks<F: FnOnce() -> bool>(harden_fn: F) -> (
     };
 
     (report, monitor_handle, monitor_ref)
+}
+
+// ---------------------------------------------------------------------------
+// Environment sanitization — remove sensitive vars from /proc/PID/environ
+// ---------------------------------------------------------------------------
+
+/// SECURITY: List of sensitive environment variables that MUST be removed
+/// from the process environment after their values have been consumed.
+/// A root attacker can read /proc/PID/environ to exfiltrate these secrets.
+const SENSITIVE_ENV_VARS: &[&str] = &[
+    "MILNET_MASTER_KEK",
+    "MILNET_KEK_SHARE",
+    "MILNET_KEK_SHARE_INDEX",
+    "MILNET_KEK_PEER_SHARES",
+    "MILNET_PKCS11_PIN",
+    "MILNET_HSM_BACKEND",
+    "DATABASE_URL",
+    "POSTGRES_PASSWORD",
+    "MILNET_SIEM_WEBHOOK_URL",
+    "MILNET_SIEM_AUTH_TOKEN",
+    "MILNET_GATEWAY_CERT_PATH",
+    "MILNET_GATEWAY_KEY_PATH",
+    "MILNET_FIPS_MODE_KEY",
+    "MILNET_ADMIN_API_KEY",
+    "ADMIN_API_KEY",
+    "RATCHET_KEK",
+    "DATABASE_REPLICA_URLS",
+    "GOOGLE_CLIENT_ID",
+    "GOOGLE_CLIENT_SECRET",
+    "ADMIN_TLS_KEY",
+    "ADMIN_TLS_CERT",
+    "MILNET_TSS_SHARE_SEALED",
+];
+
+/// Remove ALL sensitive environment variables from the process environment.
+///
+/// **MUST** be called by every service's `main()` AFTER all configuration has
+/// been loaded from env vars. This prevents exfiltration of secrets via
+/// `/proc/PID/environ` by a root-level attacker or via child process
+/// inheritance.
+///
+/// Returns the number of variables that were actually present and removed.
+pub fn sanitize_environment() -> usize {
+    let mut count = 0;
+    for var_name in SENSITIVE_ENV_VARS {
+        if std::env::var_os(var_name).is_some() {
+            // SECURITY: remove_var deletes from the process environment block,
+            // preventing /proc/PID/environ exfiltration. The value has already
+            // been consumed by the caller's config loading code.
+            std::env::remove_var(var_name);
+            count += 1;
+        }
+    }
+
+    if count > 0 {
+        tracing::info!(
+            sanitized_count = count,
+            "SECURITY: sanitized {} sensitive environment variable(s) \
+             from process environment to prevent /proc/PID/environ exfiltration",
+            count,
+        );
+    } else {
+        tracing::info!(
+            "SECURITY: environment sanitization complete — \
+             no sensitive variables found (may have been removed earlier)"
+        );
+    }
+
+    count
+}
+
+// ---------------------------------------------------------------------------
+// Kernel security posture verification
+// ---------------------------------------------------------------------------
+
+/// Verify kernel security settings critical for anti-exfiltration.
+///
+/// Checks:
+/// - `/proc/sys/kernel/yama/ptrace_scope` >= 1 (restrict ptrace)
+/// - `/proc/sys/kernel/unprivileged_bpf_disabled` == 1 (restrict eBPF)
+///
+/// Logs CRITICAL warnings if settings are insufficient but does not panic,
+/// since the process may not have permissions to read these sysctl files.
+pub fn verify_kernel_security_posture() {
+    // Check Yama ptrace_scope
+    match std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope") {
+        Ok(val) => {
+            let scope: u32 = val.trim().parse().unwrap_or(0);
+            if scope >= 1 {
+                tracing::info!(
+                    ptrace_scope = scope,
+                    "kernel security: yama ptrace_scope={} (restricted)",
+                    scope,
+                );
+            } else {
+                tracing::error!(
+                    ptrace_scope = scope,
+                    "CRITICAL SECURITY: /proc/sys/kernel/yama/ptrace_scope={} — \
+                     ptrace is unrestricted! Any process can attach to this service \
+                     and read key material. Set ptrace_scope >= 1.",
+                    scope,
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "kernel security: cannot read /proc/sys/kernel/yama/ptrace_scope: {} \
+                 (Yama LSM may not be enabled)",
+                e,
+            );
+        }
+    }
+
+    // Check unprivileged_bpf_disabled
+    match std::fs::read_to_string("/proc/sys/kernel/unprivileged_bpf_disabled") {
+        Ok(val) => {
+            let disabled: u32 = val.trim().parse().unwrap_or(0);
+            if disabled >= 1 {
+                tracing::info!(
+                    unprivileged_bpf_disabled = disabled,
+                    "kernel security: unprivileged_bpf_disabled={} (restricted)",
+                    disabled,
+                );
+            } else {
+                tracing::error!(
+                    unprivileged_bpf_disabled = disabled,
+                    "CRITICAL SECURITY: /proc/sys/kernel/unprivileged_bpf_disabled={} — \
+                     unprivileged users can load BPF programs to intercept syscalls \
+                     and exfiltrate key material. Set unprivileged_bpf_disabled=1.",
+                    disabled,
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "kernel security: cannot read /proc/sys/kernel/unprivileged_bpf_disabled: {}",
+                e,
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

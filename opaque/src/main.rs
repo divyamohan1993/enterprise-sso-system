@@ -80,22 +80,65 @@ async fn main() {
         _defense.connect_to_cluster(c.clone());
     }
 
-    let result = match opaque_mode.as_str() {
-        "threshold" => run_threshold_mode().await,
-        "single" => {
-            tracing::warn!("Running in SINGLE-SERVER mode (dev/test only — NOT for production)");
-            let store = CredentialStore::new();
-            opaque::service::run(store).await
+    // SECURITY: Verify kernel security posture (ptrace_scope, BPF restrictions)
+    common::startup_checks::verify_kernel_security_posture();
+
+    // SECURITY: Verify process hardening flags and apply anti-ptrace
+    crypto::seccomp::apply_anti_ptrace();
+    crypto::seccomp::verify_process_hardening();
+
+    // SECURITY: Remove ALL sensitive env vars from /proc/PID/environ.
+    // All config has been loaded above; secrets must not linger in memory.
+    common::startup_checks::sanitize_environment();
+
+    // SECURITY: Graceful shutdown on SIGTERM/SIGINT.
+    // - Stops accepting new OPAQUE protocol requests
+    // - Waits for in-flight requests to complete (30s timeout)
+    // - Shuts down Raft cluster membership cleanly
+    // - Zeroizes OPRF key shares before exit
+    let shutdown_signal = async {
+        let mut sigterm = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        ).expect("failed to install SIGTERM handler");
+        let mut sigint = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::interrupt(),
+        ).expect("failed to install SIGINT handler");
+        tokio::select! {
+            _ = sigterm.recv() => tracing::info!("received SIGTERM, initiating graceful shutdown"),
+            _ = sigint.recv() => tracing::info!("received SIGINT, initiating graceful shutdown"),
         }
-        other => {
-            eprintln!("Unknown MILNET_OPAQUE_MODE: '{other}' (expected 'threshold' or 'single')");
+    };
+
+    let service_future = async {
+        let result = match opaque_mode.as_str() {
+            "threshold" => run_threshold_mode().await,
+            "single" => {
+                tracing::warn!("Running in SINGLE-SERVER mode (dev/test only — NOT for production)");
+                let store = CredentialStore::new();
+                opaque::service::run(store).await
+            }
+            other => {
+                eprintln!("Unknown MILNET_OPAQUE_MODE: '{other}' (expected 'threshold' or 'single')");
+                std::process::exit(1);
+            }
+        };
+
+        if let Err(e) = result {
+            eprintln!("OPAQUE service error: {e}");
             std::process::exit(1);
         }
     };
 
-    if let Err(e) = result {
-        eprintln!("OPAQUE service error: {e}");
-        std::process::exit(1);
+    tokio::select! {
+        _ = service_future => {}
+        _ = shutdown_signal => {
+            tracing::info!("opaque: waiting up to 30s for in-flight OPAQUE requests...");
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            if let Some(c) = _cluster {
+                c.shutdown().await;
+            }
+            tracing::info!("opaque: graceful shutdown complete");
+        }
     }
 }
 

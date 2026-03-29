@@ -571,7 +571,7 @@ fn fors_tree_root(
 
     let mut nodes: Vec<[u8; N]> = Vec::with_capacity(leaves_count);
     for i in 0..leaves_count {
-        let sk = fors_sk_gen(sk_seed, pk_seed, adrs, u32::try_from(base + i).expect("SLH-DSA: FORS leaf index exceeds u32 range"));
+        let sk = fors_sk_gen(sk_seed, pk_seed, adrs, u32::try_from(base + i).unwrap_or_else(|_| panic!("FATAL: SLH-DSA FORS leaf index exceeds u32 range")));
         let leaf = fors_leaf(pk_seed, adrs, &sk);
         nodes.push(leaf);
     }
@@ -584,7 +584,7 @@ fn fors_tree_root(
         for j in 0..nodes.len() / 2 {
             tree_adrs.tree_height = (height + 1) as u32;
             tree_adrs.tree_index = u32::try_from(base / (1 << (height + 1)) + j)
-                .expect("SLH-DSA: FORS tree index exceeds u32 range");
+                .unwrap_or_else(|_| panic!("FATAL: SLH-DSA FORS tree index exceeds u32 range"));
             let parent = hash_h(pk_seed, &tree_adrs, &nodes[2 * j], &nodes[2 * j + 1]);
             new_nodes.push(parent);
         }
@@ -609,13 +609,13 @@ fn fors_sign(
 
         // Secret value
         let sk = fors_sk_gen(sk_seed, pk_seed, adrs,
-            u32::try_from(base + idx as usize).expect("SLH-DSA: FORS leaf index exceeds u32 range"));
+            u32::try_from(base + idx as usize).unwrap_or_else(|_| panic!("FATAL: SLH-DSA FORS leaf index exceeds u32 range")));
         sig.extend_from_slice(&sk);
 
         // Build tree and get auth path
         let mut nodes: Vec<[u8; N]> = Vec::with_capacity(leaves_count);
         for i in 0..leaves_count {
-            let sk_i = fors_sk_gen(sk_seed, pk_seed, adrs, u32::try_from(base + i).expect("SLH-DSA: FORS leaf index exceeds u32 range"));
+            let sk_i = fors_sk_gen(sk_seed, pk_seed, adrs, u32::try_from(base + i).unwrap_or_else(|_| panic!("FATAL: SLH-DSA FORS leaf index exceeds u32 range")));
             let leaf = fors_leaf(pk_seed, adrs, &sk_i);
             nodes.push(leaf);
         }
@@ -636,7 +636,7 @@ fn fors_sign(
             for j in 0..current_nodes.len() / 2 {
                 tree_adrs.tree_height = (height + 1) as u32;
                 tree_adrs.tree_index = u32::try_from(base / (1 << (height + 1)) + j)
-                .expect("SLH-DSA: FORS tree index exceeds u32 range");
+                .unwrap_or_else(|_| panic!("FATAL: SLH-DSA FORS tree index exceeds u32 range"));
                 let parent = hash_h(
                     pk_seed,
                     &tree_adrs,
@@ -682,7 +682,7 @@ fn fors_pk_from_sig(
 
             tree_adrs.tree_height = (height + 1) as u32;
             tree_adrs.tree_index = u32::try_from(base / (1 << (height + 1)) + ((idx as usize) >> (height + 1)))
-                .expect("SLH-DSA: FORS tree index exceeds u32 range");
+                .unwrap_or_else(|_| panic!("FATAL: SLH-DSA FORS tree index exceeds u32 range"));
 
             if (idx >> height) & 1 == 0 {
                 node = hash_h(pk_seed, &tree_adrs, &node, &auth_node);
@@ -817,7 +817,9 @@ impl SlhDsaSignature {
 /// building the top-level XMSS tree.
 pub fn slh_dsa_keygen() -> (SlhDsaSigningKey, SlhDsaVerifyingKey) {
     let mut seed_material = [0u8; 3 * N];
-    getrandom::getrandom(&mut seed_material).expect("getrandom failed");
+    if getrandom::getrandom(&mut seed_material).is_err() {
+        panic!("FATAL: OS CSPRNG unavailable — cannot generate SLH-DSA key safely");
+    }
 
     let mut sk_seed = [0u8; N];
     let mut sk_prf = [0u8; N];
@@ -886,7 +888,9 @@ pub fn slh_dsa_keygen_from_seed(seed: &[u8]) -> Option<(SlhDsaSigningKey, SlhDsa
 pub fn slh_dsa_sign(signing_key: &SlhDsaSigningKey, message: &[u8]) -> SlhDsaSignature {
     // Generate randomizer
     let mut opt_rand = [0u8; N];
-    getrandom::getrandom(&mut opt_rand).expect("getrandom failed");
+    if getrandom::getrandom(&mut opt_rand).is_err() {
+        panic!("FATAL: OS CSPRNG unavailable — cannot generate SLH-DSA signature randomizer");
+    }
 
     slh_dsa_sign_internal(signing_key, message, &opt_rand)
 }
@@ -965,7 +969,7 @@ fn slh_dsa_sign_internal(
 
         // Update tree and leaf index for next layer
         current_leaf = u32::try_from(current_tree & ((1u64 << XMSS_HEIGHT) - 1))
-            .expect("SLH-DSA: XMSS leaf index exceeds u32 range");
+            .unwrap_or_else(|_| panic!("FATAL: SLH-DSA XMSS leaf index exceeds u32 range"));
         current_tree >>= XMSS_HEIGHT;
     }
 
@@ -1034,7 +1038,7 @@ pub fn slh_dsa_verify(
 
         ht_msg = computed_root;
         current_leaf = u32::try_from(current_tree & ((1u64 << XMSS_HEIGHT) - 1))
-            .expect("SLH-DSA: XMSS leaf index exceeds u32 range");
+            .unwrap_or_else(|_| panic!("FATAL: SLH-DSA XMSS leaf index exceeds u32 range"));
         current_tree >>= XMSS_HEIGHT;
     }
 

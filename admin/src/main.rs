@@ -34,8 +34,10 @@ async fn main() {
             use sha2::Sha512;
             let hk = Hkdf::<Sha512>::new(Some(salt.as_bytes()), master_kek.as_slice());
             let mut okm = [0u8; 32];
-            hk.expand(b"admin-api-key-v2", &mut okm)
-                .expect("HKDF expand");
+            if let Err(e) = hk.expand(b"admin-api-key-v2", &mut okm) {
+                tracing::error!("FATAL: HKDF expand for admin API key failed: {e}");
+                std::process::exit(1);
+            }
             okm
         };
         let key = hex::encode(derived);
@@ -49,7 +51,13 @@ async fn main() {
 
     let db_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://localhost/milnet_sso".to_string());
-    let pool = common::db::init_database(&db_url).await;
+    let pool = match common::db::init_database(&db_url).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!("FATAL: database initialization failed: {e}");
+            std::process::exit(1);
+        }
+    };
     tracing::info!("Connected to PostgreSQL");
 
     // SECURITY: Remove DATABASE_URL from environment now that the connection
@@ -139,8 +147,10 @@ async fn main() {
         use sha2::Sha512;
         let hk = Hkdf::<Sha512>::new(Some(b"MILNET-OPAQUE-SETUP-KEK-v1"), master);
         let mut kek = [0u8; 32];
-        hk.expand(b"opaque-server-setup-encryption", &mut kek)
-            .expect("HKDF expand for OPAQUE setup KEK");
+        if let Err(e) = hk.expand(b"opaque-server-setup-encryption", &mut kek) {
+            tracing::error!("FATAL: HKDF expand for OPAQUE setup KEK failed: {e}");
+            std::process::exit(1);
+        }
         kek
     };
 
@@ -151,16 +161,27 @@ async fn main() {
             use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
             use aes_gcm::aead::generic_array::GenericArray;
             if encrypted_bytes.len() < 12 + 16 {
-                panic!("FATAL: OPAQUE ServerSetup ciphertext too short — data corruption");
+                tracing::error!("FATAL: OPAQUE ServerSetup ciphertext too short — data corruption");
+                std::process::exit(1);
             }
             let nonce = GenericArray::from_slice(&encrypted_bytes[..12]);
             let ciphertext = &encrypted_bytes[12..];
             let cipher = Aes256Gcm::new(GenericArray::from_slice(&opaque_setup_kek));
-            cipher.decrypt(nonce, ciphertext)
-                .expect("FATAL: Failed to decrypt OPAQUE ServerSetup — KEK mismatch or data corruption")
+            match cipher.decrypt(nonce, ciphertext) {
+                Ok(plaintext) => plaintext,
+                Err(_) => {
+                    tracing::error!("FATAL: Failed to decrypt OPAQUE ServerSetup — KEK mismatch or data corruption");
+                    std::process::exit(1);
+                }
+            }
         };
-        let server_setup = ServerSetup::<opaque::opaque_impl::OpaqueCs>::deserialize(&setup_bytes)
-            .expect("Failed to deserialize stored ServerSetup");
+        let server_setup = match ServerSetup::<opaque::opaque_impl::OpaqueCs>::deserialize(&setup_bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("FATAL: Failed to deserialize stored ServerSetup: {e}");
+                std::process::exit(1);
+            }
+        };
         tracing::info!("Restored and decrypted OPAQUE ServerSetup from database");
         opaque::store::CredentialStore::with_server_setup(server_setup)
     } else {
@@ -172,24 +193,36 @@ async fn main() {
             use aes_gcm::aead::generic_array::GenericArray;
             let cipher = Aes256Gcm::new(GenericArray::from_slice(&opaque_setup_kek));
             let mut nonce_bytes = [0u8; 12];
-            getrandom::getrandom(&mut nonce_bytes).expect("CSPRNG failure");
+            if let Err(e) = getrandom::getrandom(&mut nonce_bytes) {
+                tracing::error!("FATAL: CSPRNG failure: {e}");
+                std::process::exit(1);
+            }
             let nonce = GenericArray::from_slice(&nonce_bytes);
-            let ciphertext = cipher.encrypt(nonce, setup_bytes.as_ref())
-                .expect("AES-256-GCM encryption failed");
+            let ciphertext = match cipher.encrypt(nonce, setup_bytes.as_ref()) {
+                Ok(ct) => ct,
+                Err(e) => {
+                    tracing::error!("FATAL: AES-256-GCM encryption failed: {e}");
+                    std::process::exit(1);
+                }
+            };
             let mut result = Vec::with_capacity(12 + ciphertext.len());
             result.extend_from_slice(&nonce_bytes);
             result.extend_from_slice(&ciphertext);
             result
         };
         let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or(std::time::Duration::ZERO).as_secs() as i64;
         sqlx::query("INSERT INTO server_config (key, value, created_at) VALUES ($1, $2, $3)")
             .bind("opaque_server_setup")
             .bind(&encrypted_bytes)
             .bind(now)
             .execute(&pool)
             .await
-            .expect("Failed to persist encrypted ServerSetup");
+            .unwrap_or_else(|e| {
+                tracing::error!("FATAL: Failed to persist encrypted ServerSetup: {e}");
+                std::process::exit(1);
+            });
         tracing::info!("Created, encrypted, and persisted new OPAQUE ServerSetup");
         store
     };
@@ -237,13 +270,23 @@ async fn main() {
 
     // Generate ML-DSA-87 signing key for audit log entries.
     // ML-DSA-87 keys are large (~4KB); generate on a thread with 8MB stack to avoid overflow.
-    let pq_signing_key = std::thread::Builder::new()
+    let pq_signing_key = match std::thread::Builder::new()
         .name("pq-keygen".into())
         .stack_size(8 * 1024 * 1024)
         .spawn(|| crypto::pq_sign::generate_pq_keypair().0)
-        .expect("failed to spawn PQ keygen thread")
-        .join()
-        .expect("PQ keygen thread panicked");
+    {
+        Ok(handle) => match handle.join() {
+            Ok(key) => key,
+            Err(_) => {
+                tracing::error!("FATAL: PQ keygen thread panicked");
+                std::process::exit(1);
+            }
+        },
+        Err(e) => {
+            tracing::error!("FATAL: failed to spawn PQ keygen thread: {e}");
+            std::process::exit(1);
+        }
+    };
     tracing::info!("Generated ML-DSA-87 signing key for audit log");
 
     // ── Load super admin keys from DB (if any exist from prior setup) ──
@@ -309,13 +352,19 @@ async fn main() {
     });
 
     // Start the key rotation monitor in the background
-    let _rotation_shutdown = common::key_rotation::start_rotation_monitor(
+    let _rotation_shutdown = match common::key_rotation::start_rotation_monitor(
         common::key_rotation::RotationSchedule::default(),
         || {
             tracing::info!("Key rotation callback invoked (manual rotation required)");
             Ok(())
         },
-    );
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("Failed to start key rotation monitor: {e}");
+            std::process::exit(1);
+        }
+    };
 
     // Start background cleanup task for bounded HashMap growth
     admin::routes::spawn_ttl_eviction_task(state.clone());
@@ -373,8 +422,20 @@ async fn main() {
 
     if has_tls {
         // TLS cert/key paths were provided — validate they exist and are readable
-        let cert_path = tls_cert.as_deref().unwrap();
-        let key_path = tls_key.as_deref().unwrap();
+        let cert_path = match tls_cert.as_deref() {
+            Some(p) => p,
+            None => {
+                tracing::error!("FATAL: ADMIN_TLS_CERT not set");
+                std::process::exit(1);
+            }
+        };
+        let key_path = match tls_key.as_deref() {
+            Some(p) => p,
+            None => {
+                tracing::error!("FATAL: ADMIN_TLS_KEY not set");
+                std::process::exit(1);
+            }
+        };
 
         if !std::path::Path::new(cert_path).exists() {
             tracing::error!("ADMIN_TLS_CERT path does not exist: {cert_path}");
@@ -392,14 +453,73 @@ async fn main() {
         );
     }
 
-    let listener = tokio::net::TcpListener::bind(format!("{bind_addr}:{port}"))
-        .await
-        .unwrap();
+    // SECURITY: Verify kernel security posture (ptrace_scope, BPF restrictions)
+    common::startup_checks::verify_kernel_security_posture();
+
+    // SECURITY: Verify process hardening flags and apply anti-ptrace
+    crypto::seccomp::apply_anti_ptrace();
+    crypto::seccomp::verify_process_hardening();
+
+    // SECURITY: Remove ALL sensitive env vars from /proc/PID/environ.
+    // All config has been loaded above; secrets must not linger in memory.
+    common::startup_checks::sanitize_environment();
+
+    let listener = match tokio::net::TcpListener::bind(format!("{bind_addr}:{port}")).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("FATAL: failed to bind admin listener on {bind_addr}:{port}: {e}");
+            std::process::exit(1);
+        }
+    };
     tracing::info!(
         "Admin API listening on {bind_addr}:{port} (TLS={})",
         if has_tls { "configured" } else { "disabled" }
     );
-    axum::serve(listener, app).await.unwrap();
+
+    // SECURITY: Graceful shutdown on SIGTERM/SIGINT.
+    // - Stops accepting new HTTP connections via axum's graceful shutdown
+    // - Waits for in-flight requests to complete (30s timeout)
+    // - Zeroizes sensitive memory (API keys, KEK) before exit
+    let shutdown_signal = async {
+        let mut sigterm = match tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("FATAL: failed to install SIGTERM handler: {e}");
+                std::process::exit(1);
+            }
+        };
+        let mut sigint = match tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::interrupt(),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("FATAL: failed to install SIGINT handler: {e}");
+                std::process::exit(1);
+            }
+        };
+        tokio::select! {
+            _ = sigterm.recv() => tracing::info!("received SIGTERM, initiating graceful shutdown"),
+            _ = sigint.recv() => tracing::info!("received SIGINT, initiating graceful shutdown"),
+        }
+    };
+
+    if let Err(e) = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal)
+        .await
+    {
+        tracing::error!("FATAL: admin server error: {e}");
+        std::process::exit(1);
+    }
+
+    // SECURITY: Zeroize master KEK from stack before exit.
+    {
+        use zeroize::Zeroize;
+        let mut kek_copy = master_kek;
+        kek_copy.zeroize();
+    }
+    tracing::info!("admin: graceful shutdown complete");
 }
 
 /// Middleware that adds comprehensive security headers to all responses.

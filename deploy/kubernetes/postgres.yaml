@@ -1,6 +1,10 @@
 # MILNET SSO System — PostgreSQL StatefulSet
 # 3 replicas: 1 primary + 2 streaming replicas for HA.
 # Uses PVCs for durable storage with encrypted SSDs.
+#
+# SECURITY: Init container logic (role determination) is inlined into the
+# main container entrypoint to eliminate busybox from the supply chain.
+# Image is pinned to postgres:16.6-bookworm (no :latest).
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -24,6 +28,8 @@ spec:
         app.kubernetes.io/name: postgres
         app.kubernetes.io/part-of: milnet-sso
     spec:
+      serviceAccountName: postgres-sa
+      automountServiceAccountToken: false  # No K8s API access needed
       terminationGracePeriodSeconds: 60
       securityContext:
         runAsNonRoot: true
@@ -42,32 +48,12 @@ spec:
                     values:
                       - postgres
               topologyKey: kubernetes.io/hostname
-      initContainers:
-        # Determine role: pod ordinal 0 = primary, others = replica
-        - name: init-role
-          image: busybox:1.36
-          command:
-            - sh
-            - -c
-            - |
-              ORDINAL=$(echo $HOSTNAME | rev | cut -d'-' -f1 | rev)
-              if [ "$ORDINAL" = "0" ]; then
-                echo "primary" > /etc/postgres/role
-              else
-                echo "replica" > /etc/postgres/role
-              fi
-          volumeMounts:
-            - name: role-config
-              mountPath: /etc/postgres
-          securityContext:
-            readOnlyRootFilesystem: true
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop:
-                - ALL
+      # SECURITY: No init containers — role determination (primary vs replica)
+      # is inlined into the main container entrypoint. This eliminates busybox
+      # from the image supply chain.
       containers:
         - name: postgres
-          image: postgres:16-bookworm
+          image: postgres:16.6-bookworm  # pinned minor version — never use :latest or unqualified tags
           ports:
             - containerPort: 5432
               name: postgres
@@ -102,12 +88,20 @@ spec:
             # Primary address for replicas to connect to
             - name: PRIMARY_HOST
               value: "postgres-0.postgres-headless.milnet.svc.cluster.local"
-          # Custom entrypoint that configures replication based on role
+          # Inline init logic: determine role from pod ordinal and configure
+          # replication — replaces busybox init-role container
           command:
             - bash
             - -c
             - |
-              ROLE=$(cat /etc/postgres/role)
+              # Determine role from pod ordinal (0 = primary, others = replica)
+              ORDINAL=$(echo $HOSTNAME | rev | cut -d'-' -f1 | rev)
+              if [ "$ORDINAL" = "0" ]; then
+                ROLE="primary"
+              else
+                ROLE="replica"
+              fi
+
               if [ "$ROLE" = "primary" ]; then
                 # Primary: enable WAL streaming
                 cat >> /tmp/extra.conf << 'CONF'
@@ -182,17 +176,10 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
-            - name: role-config
-              mountPath: /etc/postgres
-              readOnly: true
             - name: tls-certs
               mountPath: /etc/milnet/tls
               readOnly: true
       volumes:
-        - name: role-config
-          emptyDir:
-            medium: Memory
-            sizeLimit: 1Mi
         - name: tls-certs
           secret:
             secretName: milnet-tls-certs

@@ -443,7 +443,7 @@ pub fn validate_user_ids(ids: &str) -> Result<Vec<uuid::Uuid>, String> {
 ///
 /// SSL is enforced: in production, non-SSL connections are rejected at startup.
 /// In dev mode, `sslmode=require` is appended automatically if missing.
-pub async fn init_database(database_url: &str) -> PgPool {
+pub async fn init_database(database_url: &str) -> Result<PgPool, String> {
     // ── SSL enforcement ──
     validate_ssl_config(database_url);
     let ssl_url = enforce_ssl_in_url(database_url);
@@ -491,10 +491,7 @@ pub async fn init_database(database_url: &str) -> PgPool {
         })
         .connect(connect_url)
         .await
-        .unwrap_or_else(|e| {
-            tracing::error!("FATAL: failed to connect to PostgreSQL: {e}");
-            panic!("database connection failed: {e}");
-        });
+        .map_err(|e| format!("database connection failed: {e}"))?;
 
     // ── Tenants table (must exist before FK-constrained data tables) ──
     sqlx::query(r#"
@@ -518,7 +515,7 @@ pub async fn init_database(database_url: &str) -> PgPool {
             mfa_required            BOOLEAN NOT NULL DEFAULT true,
             allowed_auth_methods    TEXT    NOT NULL DEFAULT '["opaque","fido","cac"]'
         )
-    "#).execute(&pool).await.expect("Failed to create tenants table");
+    "#).execute(&pool).await.map_err(|e| format!("Failed to create tenants table: {e}"))?;
 
     // Insert default migration tenant for pre-existing data
     let _ = sqlx::query(
@@ -538,7 +535,7 @@ pub async fn init_database(database_url: &str) -> PgPool {
             created_at BIGINT NOT NULL,
             is_active BOOLEAN NOT NULL DEFAULT true
         )
-    "#).execute(&pool).await.expect("Failed to create users table");
+    "#).execute(&pool).await.map_err(|e| format!("Failed to create users table: {e}"))?;
 
     // Migration: add tier column to existing users tables that lack it
     let _ = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS tier INTEGER NOT NULL DEFAULT 2")
@@ -560,7 +557,7 @@ pub async fn init_database(database_url: &str) -> PgPool {
             is_active BOOLEAN NOT NULL DEFAULT true,
             created_at BIGINT NOT NULL
         )
-    "#).execute(&pool).await.expect("Failed to create devices table");
+    "#).execute(&pool).await.map_err(|e| format!("Failed to create devices table: {e}"))?;
 
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS portals (
@@ -575,7 +572,7 @@ pub async fn init_database(database_url: &str) -> PgPool {
             is_active BOOLEAN NOT NULL DEFAULT true,
             created_at BIGINT NOT NULL
         )
-    "#).execute(&pool).await.expect("Failed to create portals table");
+    "#).execute(&pool).await.map_err(|e| format!("Failed to create portals table: {e}"))?;
 
     // Migration: convert client_secret from VARCHAR to BYTEA for envelope encryption.
     // ALTER TYPE with USING handles existing plaintext values by casting to bytes.
@@ -594,7 +591,7 @@ pub async fn init_database(database_url: &str) -> PgPool {
             signature BYTEA,
             data TEXT
         )
-    "#).execute(&pool).await.expect("Failed to create audit_log table");
+    "#).execute(&pool).await.map_err(|e| format!("Failed to create audit_log table: {e}"))?;
 
     // Migration: make user_ids NOT NULL with default empty JSON array for existing rows
     let _ = sqlx::query(
@@ -617,7 +614,7 @@ pub async fn init_database(database_url: &str) -> PgPool {
             expires_at BIGINT NOT NULL,
             is_active BOOLEAN NOT NULL DEFAULT true
         )
-    "#).execute(&pool).await.expect("Failed to create sessions table");
+    "#).execute(&pool).await.map_err(|e| format!("Failed to create sessions table: {e}"))?;
 
 
     sqlx::query(r#"
@@ -630,7 +627,7 @@ pub async fn init_database(database_url: &str) -> PgPool {
             created_at BIGINT NOT NULL,
             last_advanced_at BIGINT NOT NULL
         )
-    "#).execute(&pool).await.expect("Failed to create ratchet_sessions table");
+    "#).execute(&pool).await.map_err(|e| format!("Failed to create ratchet_sessions table: {e}"))?;
 
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS authorization_codes (
@@ -645,7 +642,7 @@ pub async fn init_database(database_url: &str) -> PgPool {
             created_at BIGINT NOT NULL,
             consumed BOOLEAN DEFAULT FALSE
         )
-    "#).execute(&pool).await.expect("Failed to create authorization_codes table");
+    "#).execute(&pool).await.map_err(|e| format!("Failed to create authorization_codes table: {e}"))?;
 
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS revoked_tokens (
@@ -654,7 +651,7 @@ pub async fn init_database(database_url: &str) -> PgPool {
             revoked_at BIGINT NOT NULL,
             expires_at BIGINT NOT NULL
         )
-    "#).execute(&pool).await.expect("Failed to create revoked_tokens table");
+    "#).execute(&pool).await.map_err(|e| format!("Failed to create revoked_tokens table: {e}"))?;
 
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS oauth_codes (
@@ -668,7 +665,7 @@ pub async fn init_database(database_url: &str) -> PgPool {
             nonce TEXT,
             expires_at BIGINT NOT NULL
         )
-    "#).execute(&pool).await.expect("Failed to create oauth_codes table");
+    "#).execute(&pool).await.map_err(|e| format!("Failed to create oauth_codes table: {e}"))?;
 
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS server_config (
@@ -676,7 +673,7 @@ pub async fn init_database(database_url: &str) -> PgPool {
             value BYTEA NOT NULL,
             created_at BIGINT NOT NULL
         )
-    "#).execute(&pool).await.expect("Failed to create server_config table");
+    "#).execute(&pool).await.map_err(|e| format!("Failed to create server_config table: {e}"))?;
 
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS fido_credentials (
@@ -688,7 +685,7 @@ pub async fn init_database(database_url: &str) -> PgPool {
             authenticator_type VARCHAR(50) NOT NULL,
             created_at BIGINT NOT NULL
         )
-    "#).execute(&pool).await.expect("Failed to create fido_credentials table");
+    "#).execute(&pool).await.map_err(|e| format!("Failed to create fido_credentials table: {e}"))?;
 
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS key_material (
@@ -697,7 +694,7 @@ pub async fn init_database(database_url: &str) -> PgPool {
             created_at BIGINT NOT NULL,
             rotated_at BIGINT
         )
-    "#).execute(&pool).await.expect("Failed to create key_material table");
+    "#).execute(&pool).await.map_err(|e| format!("Failed to create key_material table: {e}"))?;
 
     // Migration: add email and auth_provider columns for Google OAuth
     let _ = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(255)")
@@ -721,7 +718,7 @@ pub async fn init_database(database_url: &str) -> PgPool {
             module_pair VARCHAR(100) PRIMARY KEY,
             sequence BIGINT NOT NULL DEFAULT 0
         )
-    "#).execute(&pool).await.expect("Failed to create shard_sequences table");
+    "#).execute(&pool).await.map_err(|e| format!("Failed to create shard_sequences table: {e}"))?;
 
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS witness_checkpoints (
@@ -731,7 +728,7 @@ pub async fn init_database(database_url: &str) -> PgPool {
             timestamp BIGINT NOT NULL,
             signature BYTEA NOT NULL
         )
-    "#).execute(&pool).await.expect("Failed to create witness_checkpoints table");
+    "#).execute(&pool).await.map_err(|e| format!("Failed to create witness_checkpoints table: {e}"))?;
 
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS recovery_codes (
@@ -745,11 +742,11 @@ pub async fn init_database(database_url: &str) -> PgPool {
             created_at BIGINT NOT NULL,
             expires_at BIGINT NOT NULL
         )
-    "#).execute(&pool).await.expect("Failed to create recovery_codes table");
+    "#).execute(&pool).await.map_err(|e| format!("Failed to create recovery_codes table: {e}"))?;
 
     sqlx::query(r#"
         CREATE INDEX IF NOT EXISTS idx_recovery_codes_user ON recovery_codes (user_id) WHERE NOT is_used
-    "#).execute(&pool).await.expect("Failed to create recovery_codes index");
+    "#).execute(&pool).await.map_err(|e| format!("Failed to create recovery_codes index: {e}"))?;
 
     // ── Multi-tenancy column migrations (idempotent) ──
     // Add tenant_id to tables that may have been created before multi-tenancy.
@@ -786,7 +783,7 @@ pub async fn init_database(database_url: &str) -> PgPool {
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_revoked_tokens_tenant_id ON revoked_tokens (tenant_id)").execute(&pool).await;
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_recovery_codes_tenant_id ON recovery_codes (tenant_id)").execute(&pool).await;
 
-    pool
+    Ok(pool)
 }
 
 // ---------------------------------------------------------------------------
@@ -823,10 +820,12 @@ impl TenantAwarePool {
     }
 
     /// Get the current tenant ID from thread-local context, or panic.
-    fn require_tenant_id() -> Uuid {
+    fn require_tenant_id() -> Result<Uuid, sqlx::Error> {
         let tid = TenantContext::require_tenant()
-            .expect("TenantAwarePool: no tenant context set — all queries require a tenant scope");
-        *tid.as_uuid()
+            .map_err(|_| sqlx::Error::Protocol(
+                "no tenant context set — all queries require a tenant scope".to_string(),
+            ))?;
+        Ok(*tid.as_uuid())
     }
 
     /// Set the PostgreSQL session variable for RLS enforcement.
@@ -843,7 +842,7 @@ impl TenantAwarePool {
     pub async fn begin_tenant_tx(
         &self,
     ) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, sqlx::Error> {
-        let tenant_id = Self::require_tenant_id();
+        let tenant_id = Self::require_tenant_id()?;
         let mut tx = self.pool.begin().await?;
         let stmt = format!("SET LOCAL app.current_tenant_id = '{}'", tenant_id);
         sqlx::query(&stmt).execute(&mut *tx).await?;
@@ -859,7 +858,7 @@ impl TenantAwarePool {
         tier: i32,
         created_at: i64,
     ) -> Result<(), sqlx::Error> {
-        let tenant_id = Self::require_tenant_id();
+        let tenant_id = Self::require_tenant_id()?;
         let mut tx = self.pool.begin().await?;
         let stmt = format!("SET LOCAL app.current_tenant_id = '{}'", tenant_id);
         sqlx::query(&stmt).execute(&mut *tx).await?;
@@ -886,7 +885,7 @@ impl TenantAwarePool {
         &self,
         username: &str,
     ) -> Result<Option<(Uuid, String, Option<Vec<u8>>, i32, i64, bool)>, sqlx::Error> {
-        let tenant_id = Self::require_tenant_id();
+        let tenant_id = Self::require_tenant_id()?;
         let row: Option<(Uuid, String, Option<Vec<u8>>, i32, i64, bool)> = sqlx::query_as(
             "SELECT id, username, opaque_registration, tier, created_at, is_active \
              FROM users WHERE tenant_id = $1 AND username = $2"
@@ -906,7 +905,7 @@ impl TenantAwarePool {
         created_at: i64,
         expires_at: i64,
     ) -> Result<(), sqlx::Error> {
-        let tenant_id = Self::require_tenant_id();
+        let tenant_id = Self::require_tenant_id()?;
         let mut tx = self.pool.begin().await?;
         let stmt = format!("SET LOCAL app.current_tenant_id = '{}'", tenant_id);
         sqlx::query(&stmt).execute(&mut *tx).await?;
@@ -932,7 +931,7 @@ impl TenantAwarePool {
         &self,
         user_id: Uuid,
     ) -> Result<Vec<(Uuid, i64, i64, bool)>, sqlx::Error> {
-        let tenant_id = Self::require_tenant_id();
+        let tenant_id = Self::require_tenant_id()?;
         let rows: Vec<(Uuid, i64, i64, bool)> = sqlx::query_as(
             "SELECT id, created_at, expires_at, is_active \
              FROM sessions WHERE tenant_id = $1 AND user_id = $2"
@@ -955,7 +954,7 @@ impl TenantAwarePool {
         signature: Option<&[u8]>,
         data: Option<&str>,
     ) -> Result<(), sqlx::Error> {
-        let tenant_id = Self::require_tenant_id();
+        let tenant_id = Self::require_tenant_id()?;
         let mut tx = self.pool.begin().await?;
         let stmt = format!("SET LOCAL app.current_tenant_id = '{}'", tenant_id);
         sqlx::query(&stmt).execute(&mut *tx).await?;
@@ -984,7 +983,7 @@ impl TenantAwarePool {
         &self,
         limit: i64,
     ) -> Result<Vec<(Uuid, String, String, i64, Option<String>)>, sqlx::Error> {
-        let tenant_id = Self::require_tenant_id();
+        let tenant_id = Self::require_tenant_id()?;
         let rows: Vec<(Uuid, String, String, i64, Option<String>)> = sqlx::query_as(
             "SELECT id, event_type, user_ids, timestamp, data \
              FROM audit_log WHERE tenant_id = $1 ORDER BY timestamp DESC LIMIT $2"
@@ -1005,7 +1004,7 @@ impl TenantAwarePool {
         enrolled_by: Option<Uuid>,
         created_at: i64,
     ) -> Result<(), sqlx::Error> {
-        let tenant_id = Self::require_tenant_id();
+        let tenant_id = Self::require_tenant_id()?;
         let mut tx = self.pool.begin().await?;
         let stmt = format!("SET LOCAL app.current_tenant_id = '{}'", tenant_id);
         sqlx::query(&stmt).execute(&mut *tx).await?;
@@ -1038,7 +1037,7 @@ impl TenantAwarePool {
         required_tier: i32,
         created_at: i64,
     ) -> Result<(), sqlx::Error> {
-        let tenant_id = Self::require_tenant_id();
+        let tenant_id = Self::require_tenant_id()?;
         let mut tx = self.pool.begin().await?;
         let stmt = format!("SET LOCAL app.current_tenant_id = '{}'", tenant_id);
         sqlx::query(&stmt).execute(&mut *tx).await?;
@@ -1071,7 +1070,7 @@ impl TenantAwarePool {
         authenticator_type: &str,
         created_at: i64,
     ) -> Result<(), sqlx::Error> {
-        let tenant_id = Self::require_tenant_id();
+        let tenant_id = Self::require_tenant_id()?;
         let mut tx = self.pool.begin().await?;
         let stmt = format!("SET LOCAL app.current_tenant_id = '{}'", tenant_id);
         sqlx::query(&stmt).execute(&mut *tx).await?;
@@ -1105,7 +1104,7 @@ impl TenantAwarePool {
         nonce: Option<&str>,
         created_at: i64,
     ) -> Result<(), sqlx::Error> {
-        let tenant_id = Self::require_tenant_id();
+        let tenant_id = Self::require_tenant_id()?;
         let mut tx = self.pool.begin().await?;
         let stmt = format!("SET LOCAL app.current_tenant_id = '{}'", tenant_id);
         sqlx::query(&stmt).execute(&mut *tx).await?;
@@ -1142,7 +1141,7 @@ impl TenantAwarePool {
         nonce: Option<&str>,
         expires_at: i64,
     ) -> Result<(), sqlx::Error> {
-        let tenant_id = Self::require_tenant_id();
+        let tenant_id = Self::require_tenant_id()?;
         let mut tx = self.pool.begin().await?;
         let stmt = format!("SET LOCAL app.current_tenant_id = '{}'", tenant_id);
         sqlx::query(&stmt).execute(&mut *tx).await?;
@@ -1174,7 +1173,7 @@ impl TenantAwarePool {
         revoked_at: i64,
         expires_at: i64,
     ) -> Result<(), sqlx::Error> {
-        let tenant_id = Self::require_tenant_id();
+        let tenant_id = Self::require_tenant_id()?;
         let mut tx = self.pool.begin().await?;
         let stmt = format!("SET LOCAL app.current_tenant_id = '{}'", tenant_id);
         sqlx::query(&stmt).execute(&mut *tx).await?;
@@ -1196,7 +1195,7 @@ impl TenantAwarePool {
 
     /// Check if a token is revoked, scoped to the current tenant.
     pub async fn is_token_revoked(&self, token_hash: &[u8]) -> Result<bool, sqlx::Error> {
-        let tenant_id = Self::require_tenant_id();
+        let tenant_id = Self::require_tenant_id()?;
         let row: Option<(i64,)> = sqlx::query_as(
             "SELECT revoked_at FROM revoked_tokens WHERE tenant_id = $1 AND token_hash = $2"
         )
@@ -1217,7 +1216,7 @@ impl TenantAwarePool {
         created_at: i64,
         expires_at: i64,
     ) -> Result<(), sqlx::Error> {
-        let tenant_id = Self::require_tenant_id();
+        let tenant_id = Self::require_tenant_id()?;
         let mut tx = self.pool.begin().await?;
         let stmt = format!("SET LOCAL app.current_tenant_id = '{}'", tenant_id);
         sqlx::query(&stmt).execute(&mut *tx).await?;
@@ -1242,7 +1241,7 @@ impl TenantAwarePool {
 
     /// Delete a user, scoped to the current tenant.
     pub async fn delete_user(&self, user_id: Uuid) -> Result<u64, sqlx::Error> {
-        let tenant_id = Self::require_tenant_id();
+        let tenant_id = Self::require_tenant_id()?;
         let mut tx = self.pool.begin().await?;
         let stmt = format!("SET LOCAL app.current_tenant_id = '{}'", tenant_id);
         sqlx::query(&stmt).execute(&mut *tx).await?;
@@ -1261,7 +1260,7 @@ impl TenantAwarePool {
 
     /// Deactivate all sessions for a user, scoped to the current tenant.
     pub async fn deactivate_user_sessions(&self, user_id: Uuid) -> Result<u64, sqlx::Error> {
-        let tenant_id = Self::require_tenant_id();
+        let tenant_id = Self::require_tenant_id()?;
         let mut tx = self.pool.begin().await?;
         let stmt = format!("SET LOCAL app.current_tenant_id = '{}'", tenant_id);
         sqlx::query(&stmt).execute(&mut *tx).await?;
@@ -1280,7 +1279,7 @@ impl TenantAwarePool {
 
     /// Count users for the current tenant (for quota enforcement).
     pub async fn count_tenant_users(&self) -> Result<i64, sqlx::Error> {
-        let tenant_id = Self::require_tenant_id();
+        let tenant_id = Self::require_tenant_id()?;
         let row: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM users WHERE tenant_id = $1"
         )
@@ -1292,7 +1291,7 @@ impl TenantAwarePool {
 
     /// Count devices for the current tenant (for quota enforcement).
     pub async fn count_tenant_devices(&self) -> Result<i64, sqlx::Error> {
-        let tenant_id = Self::require_tenant_id();
+        let tenant_id = Self::require_tenant_id()?;
         let row: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM devices WHERE tenant_id = $1"
         )

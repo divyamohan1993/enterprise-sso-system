@@ -314,7 +314,10 @@ pub fn combined_entropy_checked() -> Result<[u8; 32], EntropyError> {
         let healthy = {
             let mut health = global_entropy_health()
                 .lock()
-                .expect("entropy health mutex poisoned — loss of integrity");
+                .unwrap_or_else(|e| {
+                    tracing::error!("CRITICAL: entropy health mutex poisoned — resetting to inner value");
+                    e.into_inner()
+                });
             let rep_ok = health.check_repetition(&output);
             let prop_ok = health.check_proportion(&output);
             (rep_ok, prop_ok)

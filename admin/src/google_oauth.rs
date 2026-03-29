@@ -504,7 +504,7 @@ pub async fn extract_google_claims(
     // Validate expiry
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or(std::time::Duration::ZERO)
         .as_secs() as i64;
     // Allow 5 minutes of clock skew
     if claims.exp < now - 300 {
@@ -539,7 +539,7 @@ pub fn verify_google_id_token(
     // Token must not be expired
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or(std::time::Duration::ZERO)
         .as_secs() as i64;
     if claims.exp < now {
         return Err("id_token has expired".into());
