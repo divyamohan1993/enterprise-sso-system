@@ -317,11 +317,21 @@ mod tests {
 
     #[test]
     fn error_with_location_includes_file_in_verbose() {
+        // Remove env vars that force Warn level (may leak from parallel tests)
+        let prev_mil = std::env::var("MILNET_MILITARY_DEPLOYMENT").ok();
+        let prev_prod = std::env::var("MILNET_PRODUCTION").ok();
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        std::env::remove_var("MILNET_PRODUCTION");
+
         // Set error_level to Verbose for this test.
         error_level().set_level(crate::config::ErrorLevel::Verbose);
         let msg = error_with_location("validation check failed for input");
         assert!(msg.contains("validation check failed for input"));
         assert!(msg.contains("error_response.rs"));
+
+        // Restore env vars
+        if let Some(v) = prev_mil { std::env::set_var("MILNET_MILITARY_DEPLOYMENT", v); }
+        if let Some(v) = prev_prod { std::env::set_var("MILNET_PRODUCTION", v); }
     }
 
     #[test]

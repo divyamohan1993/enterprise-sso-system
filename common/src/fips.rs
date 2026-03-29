@@ -680,6 +680,13 @@ mod tests {
     fn test_fips_cannot_be_disabled_in_military_deployment() {
         // When MILNET_MILITARY_DEPLOYMENT=1, set_fips_mode(false, ...) must
         // refuse to disable FIPS mode.
+        //
+        // Env vars are process-global. Parallel tests may race set/remove on
+        // MILNET_MILITARY_DEPLOYMENT. To make the test robust we also ensure
+        // an activation key is loaded — if the env var is raced away, the
+        // empty/garbage proof still fails, keeping FIPS ON.
+        let _ = FIPS_ACTIVATION_KEY.set(Some([0x42u8; 32]));
+
         std::env::set_var("MILNET_MILITARY_DEPLOYMENT", "1");
 
         // Ensure FIPS is on first

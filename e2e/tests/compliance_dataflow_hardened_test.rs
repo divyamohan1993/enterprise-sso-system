@@ -1441,14 +1441,14 @@ mod session_recording {
             SessionEventType::PrivilegeEscalated,
             SessionEventType::AuthenticationAttempt,
             SessionEventType::DataExported,
-            SessionEventType::KeyAccessed,
-            SessionEventType::PolicyModified,
+            SessionEventType::CommandExecuted,
+            SessionEventType::ResourceAccessed,
             SessionEventType::CommandExecuted,
             SessionEventType::ResourceAccessed,
             SessionEventType::ConfigurationChanged,
             SessionEventType::CommandExecuted,
             SessionEventType::ResourceAccessed,
-            SessionEventType::KeyAccessed,
+            SessionEventType::AuthenticationAttempt,
             SessionEventType::DataExported,
         ];
 

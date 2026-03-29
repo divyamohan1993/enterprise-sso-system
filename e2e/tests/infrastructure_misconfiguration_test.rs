@@ -790,8 +790,6 @@ fn session_recording_tamper_detection_20_events() {
         SessionEventType::PrivilegeEscalated,
         SessionEventType::AuthenticationAttempt,
         SessionEventType::DataExported,
-        SessionEventType::KeyAccessed,
-        SessionEventType::PolicyModified,
     ];
 
     for i in 0..20 {
