@@ -3582,7 +3582,7 @@ mod tests {
 
     #[test]
     fn test_extract_reference_uris_single() {
-        let xml = r#"<ds:SignedInfo><ds:Reference URI="#_abc123"></ds:Reference></ds:SignedInfo>"#;
+        let xml = r##"<ds:SignedInfo><ds:Reference URI="#_abc123"></ds:Reference></ds:SignedInfo>"##;
         let uris = extract_reference_uris(xml);
         assert_eq!(uris.len(), 1);
         assert_eq!(uris[0], "#_abc123");
@@ -3590,7 +3590,7 @@ mod tests {
 
     #[test]
     fn test_extract_reference_uris_unprefixed() {
-        let xml = r#"<SignedInfo><Reference URI="#_def456"></Reference></SignedInfo>"#;
+        let xml = r##"<SignedInfo><Reference URI="#_def456"></Reference></SignedInfo>"##;
         let uris = extract_reference_uris(xml);
         assert_eq!(uris.len(), 1);
         assert_eq!(uris[0], "#_def456");
@@ -3599,10 +3599,10 @@ mod tests {
     #[test]
     fn test_extract_reference_uris_multiple_rejected() {
         // Two ds:Reference elements — indicates a potential wrapping attack.
-        let xml = r#"<ds:SignedInfo>
+        let xml = r##"<ds:SignedInfo>
             <ds:Reference URI="#_legit"></ds:Reference>
             <ds:Reference URI="#_evil"></ds:Reference>
-        </ds:SignedInfo>"#;
+        </ds:SignedInfo>"##;
         let uris = extract_reference_uris(xml);
         assert_eq!(uris.len(), 2, "must detect multiple Reference elements");
         // The validation logic in validate_authn_request_signature would reject
@@ -3611,7 +3611,7 @@ mod tests {
 
     #[test]
     fn test_extract_reference_uris_none() {
-        let xml = r#"<ds:SignedInfo><ds:DigestMethod/></ds:SignedInfo>"#;
+        let xml = r##"<ds:SignedInfo><ds:DigestMethod/></ds:SignedInfo>"##;
         let uris = extract_reference_uris(xml);
         assert!(uris.is_empty(), "no Reference elements should yield empty vec");
     }
@@ -3623,7 +3623,7 @@ mod tests {
         let expected_ref = format!("#{}", assertion_id);
 
         let good_xml = format!(
-            r#"<ds:SignedInfo><ds:Reference URI="{}"></ds:Reference></ds:SignedInfo>"#,
+            r##"<ds:SignedInfo><ds:Reference URI="{}"></ds:Reference></ds:SignedInfo>"##,
             expected_ref
         );
         let uris = extract_reference_uris(&good_xml);
@@ -3631,7 +3631,7 @@ mod tests {
         assert_eq!(uris[0], expected_ref, "URI must match assertion ID");
 
         // Mismatched URI — would be rejected by the validator.
-        let bad_xml = r#"<ds:SignedInfo><ds:Reference URI="#_wrong_id"></ds:Reference></ds:SignedInfo>"#;
+        let bad_xml = r##"<ds:SignedInfo><ds:Reference URI="#_wrong_id"></ds:Reference></ds:SignedInfo>"##;
         let bad_uris = extract_reference_uris(bad_xml);
         assert_eq!(bad_uris.len(), 1);
         assert_ne!(bad_uris[0], expected_ref, "mismatched URI must differ from expected");
