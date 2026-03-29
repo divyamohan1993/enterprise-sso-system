@@ -377,7 +377,13 @@ async fn main() {
 
     let app = api_router(state);
 
-    let port = std::env::var("ADMIN_PORT").unwrap_or_else(|_| "8080".to_string());
+    // Note: ADMIN_PORT is auto-set by K8s service discovery (e.g. "tcp://10.x.x.x:8080").
+    // Use MILNET_ADMIN_PORT to avoid collision.
+    let port = std::env::var("MILNET_ADMIN_PORT")
+        .or_else(|_| std::env::var("ADMIN_PORT").and_then(|v| {
+            if v.chars().all(|c| c.is_ascii_digit()) { Ok(v) } else { Err(std::env::VarError::NotPresent) }
+        }))
+        .unwrap_or_else(|_| "8080".to_string());
 
     // Spawn health check endpoint
     let health_start = std::time::Instant::now();
@@ -413,13 +419,17 @@ async fn main() {
         .unwrap_or(false);
     let has_tls = tls_cert.is_some() && tls_key.is_some();
 
-    // TLS is always required — no exceptions.
+    // TLS is always required — except in dev mode.
     if !has_tls {
-        tracing::error!(
-            "FATAL: Admin API requires TLS. \
-             Set ADMIN_TLS_CERT and ADMIN_TLS_KEY, or use a TLS-terminating reverse proxy."
-        );
-        std::process::exit(1);
+        if std::env::var("MILNET_DEV_MODE").unwrap_or_default() == "1" {
+            tracing::warn!("MILNET_DEV_MODE=1: running Admin API without TLS (plaintext HTTP)");
+        } else {
+            tracing::error!(
+                "FATAL: Admin API requires TLS. \
+                 Set ADMIN_TLS_CERT and ADMIN_TLS_KEY, or use a TLS-terminating reverse proxy."
+            );
+            std::process::exit(1);
+        }
     }
 
     // Add HSTS header middleware to all responses (signals to browsers/proxies
