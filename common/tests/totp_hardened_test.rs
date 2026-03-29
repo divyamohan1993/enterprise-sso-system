@@ -37,7 +37,7 @@ fn enrollment_with_sha512_env_var() {
 /// Security property: SHA-256 is accepted for new enrollments.
 #[test]
 fn sha256_enrollment_accepted() {
-    let secret = generate_secret();
+    let secret = generate_secret().unwrap();
     let time = 1_700_000_000u64;
     let code = generate_totp_with_algorithm(&*secret, time, TotpAlgorithm::Sha256);
     assert_eq!(code.len(), 6, "TOTP code must be 6 digits");
@@ -165,8 +165,8 @@ fn invalid_non_numeric_code_rejected() {
 /// Security property: Generated TOTP secrets are random and unique.
 #[test]
 fn generated_secrets_are_random() {
-    let s1 = generate_secret();
-    let s2 = generate_secret();
+    let s1 = generate_secret().unwrap();
+    let s2 = generate_secret().unwrap();
     assert_ne!(*s1, *s2, "two generated secrets must not be equal");
     assert_ne!(*s1, [0u8; 32], "generated secret must not be all zeros");
 }
@@ -206,7 +206,7 @@ fn algorithm_otpauth_names() {
 /// and returns the SHA-512 algorithm identifier (CNSA 2.0 upgrade).
 #[test]
 fn migrate_to_sha512_produces_new_secret() {
-    let (secret, algo) = migrate_to_sha256();
+    let (secret, algo) = migrate_to_sha256().unwrap();
     assert_eq!(algo, TotpAlgorithm::Sha512);
     assert_ne!(*secret, [0u8; 32], "migrated secret must not be all zeros");
 }

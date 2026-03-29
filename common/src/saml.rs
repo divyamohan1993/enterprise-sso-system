@@ -3429,7 +3429,7 @@ mod tests {
 
     #[test]
     fn test_artifact_encode_decode() {
-        let artifact = SamlArtifact::new("https://idp.example.com", 0);
+        let artifact = SamlArtifact::new("https://idp.example.com", 0).unwrap();
         let encoded = artifact.encode();
         let decoded = SamlArtifact::decode(&encoded).expect("decode failed");
         assert_eq!(decoded.type_code, 0x0004);

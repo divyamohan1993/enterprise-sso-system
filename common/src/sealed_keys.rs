@@ -935,7 +935,7 @@ mod tests {
         let mut original_key = [0u8; 64];
         getrandom::getrandom(&mut original_key).unwrap();
 
-        let sealed = seal_key_for_storage(&original_key, "test-purpose");
+        let sealed = seal_key_for_storage(&original_key, "test-purpose").unwrap();
         let hex_sealed = sealed_to_hex(&sealed);
 
         let recovered = unseal_key_from_hex(&hex_sealed, "test-purpose");
@@ -950,7 +950,7 @@ mod tests {
         std::env::set_var("MILNET_MASTER_KEK", "2a".repeat(32));
 
         let original_key = [99u8; 64];
-        let sealed = seal_key_for_storage(&original_key, "purpose-a");
+        let sealed = seal_key_for_storage(&original_key, "purpose-a").unwrap();
         let hex_sealed = sealed_to_hex(&sealed);
 
         let recovered = unseal_key_from_hex(&hex_sealed, "purpose-b");
@@ -964,7 +964,7 @@ mod tests {
         std::env::set_var("MILNET_MASTER_KEK", "2a".repeat(32));
 
         let original_key = [77u8; 64];
-        let mut sealed = seal_key_for_storage(&original_key, "test");
+        let mut sealed = seal_key_for_storage(&original_key, "test").unwrap();
         if sealed.len() > 20 {
             sealed[20] ^= 0xFF;
         }

@@ -320,7 +320,7 @@ fn import_backup_v2(master_kek: &[u8; 32], backup: &[u8]) -> Result<Vec<u8>, Str
         .ok_or("backup ciphertext slice out of bounds")?;
 
     // Decrypt using backup symmetric helper
-    let enc_key = derive_backup_encryption_key(master_kek);
+    let enc_key = derive_backup_encryption_key(master_kek)?;
     let plaintext = backup_decrypt(&enc_key, ciphertext)
         .map_err(|_| "v2 backup decryption failed: wrong KEK or tampered data".to_string())?;
 
@@ -399,7 +399,7 @@ fn import_backup_v1(master_kek: &[u8; 32], backup: &[u8]) -> Result<Vec<u8>, Str
         .ok_or("v1 backup ciphertext slice out of bounds")?;
 
     // Decrypt using legacy AES-256-GCM
-    let enc_key = derive_backup_encryption_key(master_kek);
+    let enc_key = derive_backup_encryption_key(master_kek)?;
     let cipher = Aes256Gcm::new_from_slice(&enc_key)
         .map_err(|e| format!("cipher init: {e}"))?;
     let nonce = Nonce::from_slice(nonce_bytes);
@@ -698,8 +698,8 @@ mod tests {
         let kek = test_kek();
         let data = b"v1-legacy-backup-plaintext";
 
-        let enc_key = derive_backup_encryption_key(&kek);
-        let hmac_key = derive_backup_hmac_key(&kek);
+        let enc_key = derive_backup_encryption_key(&kek).unwrap();
+        let hmac_key = derive_backup_hmac_key(&kek).unwrap();
 
         let mut nonce_bytes = [0u8; NONCE_LEN];
         getrandom::getrandom(&mut nonce_bytes).unwrap();

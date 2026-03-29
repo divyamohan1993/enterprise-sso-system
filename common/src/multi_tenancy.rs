@@ -945,7 +945,7 @@ mod tests {
         let id = tenant.tenant_id;
         mgr.create_tenant(tenant).unwrap();
 
-        let retrieved = mgr.get_tenant(id).unwrap();
+        let retrieved = mgr.get_tenant(id).unwrap().unwrap();
         assert_eq!(retrieved.slug, "alpha-team");
         assert_eq!(retrieved.status, TenantStatus::Active);
     }
@@ -977,10 +977,10 @@ mod tests {
         mgr.create_tenant(tenant).unwrap();
 
         mgr.suspend_tenant(id, "security review").unwrap();
-        assert_eq!(mgr.get_tenant(id).unwrap().status, TenantStatus::Suspended);
+        assert_eq!(mgr.get_tenant(id).unwrap().unwrap().status, TenantStatus::Suspended);
 
         mgr.reactivate_tenant(id).unwrap();
-        assert_eq!(mgr.get_tenant(id).unwrap().status, TenantStatus::Active);
+        assert_eq!(mgr.get_tenant(id).unwrap().unwrap().status, TenantStatus::Active);
     }
 
     #[test]
@@ -1007,13 +1007,13 @@ mod tests {
 
         mgr.decommission_tenant(id, "end of contract").unwrap();
         assert_eq!(
-            mgr.get_tenant(id).unwrap().status,
+            mgr.get_tenant(id).unwrap().unwrap().status,
             TenantStatus::Decommissioning
         );
 
         mgr.finalize_decommission(id).unwrap();
         assert_eq!(
-            mgr.get_tenant(id).unwrap().status,
+            mgr.get_tenant(id).unwrap().unwrap().status,
             TenantStatus::Decommissioned
         );
     }
@@ -1025,7 +1025,7 @@ mod tests {
         mgr.create_tenant(make_tenant("golf")).unwrap();
         mgr.create_tenant(make_tenant("hotel")).unwrap();
 
-        assert_eq!(mgr.list_tenants().len(), 3);
+        assert_eq!(mgr.list_tenants().unwrap().len(), 3);
     }
 
     // ── Quota tests ─────────────────────────────────────────────────────
@@ -1060,7 +1060,7 @@ mod tests {
         mgr.create_tenant(tenant).unwrap();
 
         mgr.update_quota(id, 200, 1000).unwrap();
-        let updated = mgr.get_tenant(id).unwrap();
+        let updated = mgr.get_tenant(id).unwrap().unwrap();
         assert_eq!(updated.max_users, 200);
         assert_eq!(updated.max_devices, 1000);
     }

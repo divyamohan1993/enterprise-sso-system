@@ -413,8 +413,8 @@ mod tests {
 
     #[test]
     fn test_generate_secret_is_random() {
-        let s1 = generate_secret();
-        let s2 = generate_secret();
+        let s1 = generate_secret().unwrap();
+        let s2 = generate_secret().unwrap();
         assert_ne!(*s1, *s2);
     }
 
@@ -497,7 +497,7 @@ mod tests {
 
     #[test]
     fn test_migrate_to_sha512() {
-        let (secret, algo) = migrate_to_sha256();
+        let (secret, algo) = migrate_to_sha256().unwrap();
         // SECURITY: Migration target is now SHA-512 (CNSA 2.0)
         assert_eq!(algo, TotpAlgorithm::Sha512);
         assert_ne!(*secret, [0u8; 32], "migrated secret must not be all zeros");

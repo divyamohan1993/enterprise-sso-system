@@ -1660,7 +1660,7 @@ mod tests {
     #[ignore = "requires running PostgreSQL — set DATABASE_URL"]
     async fn test_db_init_creates_tables() {
         let url = std::env::var("DATABASE_URL").unwrap();
-        let pool = init_database(&url).await;
+        let pool = init_database(&url).await.unwrap();
         // Verify tables exist by querying the information_schema (now includes tenants)
         let row: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ('tenants', 'users', 'devices', 'portals', 'audit_log', 'sessions', 'oauth_codes', 'fido_credentials')"
@@ -1675,7 +1675,7 @@ mod tests {
     #[ignore = "requires running PostgreSQL — set DATABASE_URL"]
     async fn test_db_insert_and_query_user() {
         let url = std::env::var("DATABASE_URL").unwrap();
-        let pool = init_database(&url).await;
+        let pool = init_database(&url).await.unwrap();
         let user_id = uuid::Uuid::new_v4();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

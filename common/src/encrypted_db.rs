@@ -637,7 +637,7 @@ mod tests {
         let plaintext = b"top secret opaque registration data";
         let row_id = b"550e8400-e29b-41d4-a716-446655440000";
 
-        let sealed = enc.encrypt_field("users", "opaque_registration", row_id, plaintext);
+        let sealed = enc.encrypt_field("users", "opaque_registration", row_id, plaintext).unwrap();
         assert_ne!(&sealed, plaintext.as_slice());
         // V2 format: version(1) + wrap_nonce(12) + wrapped_dek(48) + data_nonce(12) + plaintext + tag(16)
         assert!(sealed.len() >= 1 + 60 + 12 + plaintext.len() + 16);
@@ -654,7 +654,7 @@ mod tests {
         let plaintext = b"secret data";
         let row_id = b"row-1";
 
-        let sealed = enc.encrypt_field("users", "opaque_registration", row_id, plaintext);
+        let sealed = enc.encrypt_field("users", "opaque_registration", row_id, plaintext).unwrap();
 
         assert!(enc.decrypt_field("fido_credentials", "opaque_registration", row_id, &sealed).is_err());
         assert!(enc.decrypt_field("users", "duress_pin_hash", row_id, &sealed).is_err());
@@ -667,8 +667,8 @@ mod tests {
         let plaintext = b"same plaintext";
         let row_id = b"row-1";
 
-        let sealed1 = enc.encrypt_field("users", "opaque", row_id, plaintext);
-        let sealed2 = enc.encrypt_field("users", "opaque", row_id, plaintext);
+        let sealed1 = enc.encrypt_field("users", "opaque", row_id, plaintext).unwrap();
+        let sealed2 = enc.encrypt_field("users", "opaque", row_id, plaintext).unwrap();
         assert_ne!(sealed1, sealed2);
 
         let pt1 = enc.decrypt_field("users", "opaque", row_id, &sealed1).unwrap();
@@ -679,7 +679,7 @@ mod tests {
     #[test]
     fn tampered_ciphertext_fails_decrypt() {
         let enc = make_encryptor();
-        let mut sealed = enc.encrypt_field("users", "opaque", b"r1", b"sensitive data");
+        let mut sealed = enc.encrypt_field("users", "opaque", b"r1", b"sensitive data").unwrap();
         if sealed.len() > 15 { sealed[15] ^= 0xFF; }
         assert!(enc.decrypt_field("users", "opaque", b"r1", &sealed).is_err());
     }
@@ -717,7 +717,7 @@ mod tests {
         for i in 0..10 {
             let data = format!("sensitive-data-{}", i);
             let row_id = format!("row-{}", i);
-            let ct = enc.encrypt_field("users", "opaque", row_id.as_bytes(), data.as_bytes());
+            let ct = enc.encrypt_field("users", "opaque", row_id.as_bytes(), data.as_bytes()).unwrap();
             assert_eq!(ct[0], 0x02, "must use V2 envelope tag");
             let pt = enc.decrypt_field("users", "opaque", row_id.as_bytes(), &ct).unwrap();
             assert_eq!(pt, data.as_bytes());
@@ -727,8 +727,8 @@ mod tests {
     #[test]
     fn encrypt_different_plaintext_produces_different_ciphertext() {
         let enc = FieldEncryptor::new([0x42; 32]);
-        let ct1 = enc.encrypt_field("users", "opaque", b"r1", b"data-a");
-        let ct2 = enc.encrypt_field("users", "opaque", b"r1", b"data-b");
+        let ct1 = enc.encrypt_field("users", "opaque", b"r1", b"data-a").unwrap();
+        let ct2 = enc.encrypt_field("users", "opaque", b"r1", b"data-b").unwrap();
         assert_ne!(ct1, ct2);
     }
 
@@ -736,8 +736,8 @@ mod tests {
     fn encrypt_same_plaintext_produces_different_ciphertext_random_dek() {
         // Random DEK + random nonce = different ciphertext each time
         let enc = FieldEncryptor::new([0x42; 32]);
-        let ct1 = enc.encrypt_field("users", "opaque", b"r1", b"same data");
-        let ct2 = enc.encrypt_field("users", "opaque", b"r1", b"same data");
+        let ct1 = enc.encrypt_field("users", "opaque", b"r1", b"same data").unwrap();
+        let ct2 = enc.encrypt_field("users", "opaque", b"r1", b"same data").unwrap();
         assert_ne!(ct1, ct2, "same plaintext must produce different ciphertext (random DEK)");
     }
 
@@ -745,7 +745,7 @@ mod tests {
     fn decrypt_with_wrong_kek_fails() {
         let enc1 = FieldEncryptor::new([0x42; 32]);
         let enc2 = FieldEncryptor::new([0x43; 32]);
-        let ct = enc1.encrypt_field("users", "opaque", b"r1", b"secret");
+        let ct = enc1.encrypt_field("users", "opaque", b"r1", b"secret").unwrap();
         let result = enc2.decrypt_field("users", "opaque", b"r1", &ct);
         assert!(result.is_err(), "wrong KEK must fail decryption");
     }
@@ -753,7 +753,7 @@ mod tests {
     #[test]
     fn decrypt_truncated_v2_ciphertext_fails() {
         let enc = FieldEncryptor::new([0x42; 32]);
-        let ct = enc.encrypt_field("users", "opaque", b"r1", b"data");
+        let ct = enc.encrypt_field("users", "opaque", b"r1", b"data").unwrap();
         // Truncate to just the tag + wrap_nonce (13 bytes)
         let truncated = &ct[..13];
         let result = enc.decrypt_field("users", "opaque", b"r1", truncated);
@@ -763,7 +763,7 @@ mod tests {
     #[test]
     fn decrypt_corrupted_wrapped_dek_fails() {
         let enc = FieldEncryptor::new([0x42; 32]);
-        let mut ct = enc.encrypt_field("users", "opaque", b"r1", b"data");
+        let mut ct = enc.encrypt_field("users", "opaque", b"r1", b"data").unwrap();
         // Corrupt a byte in the wrapped DEK region (bytes 13..61)
         if ct.len() > 20 {
             ct[15] ^= 0xFF;

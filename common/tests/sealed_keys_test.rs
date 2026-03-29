@@ -22,7 +22,7 @@ fn seal_unseal_round_trip_recovers_original_key() {
     let mut original_key = [0u8; 64];
     getrandom::getrandom(&mut original_key).unwrap();
 
-    let sealed = seal_key_for_storage(&original_key, "test-roundtrip");
+    let sealed = seal_key_for_storage(&original_key, "test-roundtrip").unwrap();
     let hex_sealed = sealed_to_hex(&sealed);
 
     // Unseal from hex
@@ -40,7 +40,7 @@ fn wrong_purpose_fails_unseal() {
     std::env::set_var("MILNET_MASTER_KEK", "2a".repeat(32));
 
     let key = [0x99; 64];
-    let sealed = seal_key_for_storage(&key, "purpose-alpha");
+    let sealed = seal_key_for_storage(&key, "purpose-alpha").unwrap();
     let hex_sealed = sealed_to_hex(&sealed);
 
     let result = unseal_key_from_hex_for_test(&hex_sealed, "purpose-beta");
@@ -56,7 +56,7 @@ fn tampered_sealed_data_is_rejected() {
     std::env::set_var("MILNET_MASTER_KEK", "2a".repeat(32));
 
     let key = [0x77; 64];
-    let mut sealed = seal_key_for_storage(&key, "tamper-test");
+    let mut sealed = seal_key_for_storage(&key, "tamper-test").unwrap();
 
     // Flip a byte in the ciphertext
     if sealed.len() > 20 {
@@ -110,9 +110,9 @@ fn different_master_keks_produce_different_keys() {
 fn module_hmac_keys_are_unique_per_channel() {
     std::env::set_var("MILNET_MASTER_KEK", "2a".repeat(32));
 
-    let k1 = derive_module_hmac_key("gateway", "orchestrator");
-    let k2 = derive_module_hmac_key("gateway", "opaque");
-    let k3 = derive_module_hmac_key("orchestrator", "opaque");
+    let k1 = derive_module_hmac_key("gateway", "orchestrator").unwrap();
+    let k2 = derive_module_hmac_key("gateway", "opaque").unwrap();
+    let k3 = derive_module_hmac_key("orchestrator", "opaque").unwrap();
 
     assert_ne!(k1, k2, "gateway-orchestrator must differ from gateway-opaque");
     assert_ne!(k1, k3, "gateway-orchestrator must differ from orchestrator-opaque");
@@ -128,8 +128,8 @@ fn module_hmac_keys_are_unique_per_channel() {
 fn module_hmac_key_derivation_is_order_independent() {
     std::env::set_var("MILNET_MASTER_KEK", "2a".repeat(32));
 
-    let k1 = derive_module_hmac_key("gateway", "orchestrator");
-    let k2 = derive_module_hmac_key("orchestrator", "gateway");
+    let k1 = derive_module_hmac_key("gateway", "orchestrator").unwrap();
+    let k2 = derive_module_hmac_key("orchestrator", "gateway").unwrap();
     assert_eq!(k1, k2, "channel key must be order-independent");
 
     std::env::remove_var("MILNET_MASTER_KEK");
