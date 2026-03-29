@@ -214,21 +214,18 @@ impl<const N: usize> SecretBuffer<N> {
     /// that sensitive material is destroyed even if the panic is caught.
     pub fn as_bytes(&self) -> &[u8; N] {
         if !self.verify_canaries() {
-            tracing::error!(
-                "SECURITY: canary violation detected in SecretBuffer<{N}> — \
-                 possible buffer overflow or use-after-free. Zeroizing data before panic."
-            );
-            // SECURITY: Zeroize data before panicking using volatile writes
-            // to ensure the compiler cannot optimize away the zeroization.
-            // We use write_bytes instead of casting const-to-mut which is UB.
+            // SECURITY: Do NOT log sensitive details — attacker with ptrace could
+            // pause between log and exit to inspect memory. Zeroize first, then
+            // exit immediately without panic (panic unwind could leak via hooks).
             #[allow(unsafe_code)]
             unsafe {
                 core::ptr::write_bytes(self.data.as_ptr() as *mut u8, 0, N);
             }
-            panic!(
-                "SECURITY: canary violation detected — possible buffer overflow or \
-                 use-after-free"
-            );
+            // Use _exit(199) to skip destructors/panic hooks that could log secrets
+            #[allow(unsafe_code)]
+            unsafe {
+                libc::_exit(199);
+            }
         }
         &self.data
     }
@@ -240,15 +237,11 @@ impl<const N: usize> SecretBuffer<N> {
     /// violation is logged and all data is zeroized.
     pub fn as_bytes_mut(&mut self) -> &mut [u8; N] {
         if !self.verify_canaries() {
-            tracing::error!(
-                "SECURITY: canary violation detected in SecretBuffer<{N}> — \
-                 possible buffer overflow or use-after-free. Zeroizing data before panic."
-            );
             self.data.zeroize();
-            panic!(
-                "SECURITY: canary violation detected — possible buffer overflow or \
-                 use-after-free"
-            );
+            #[allow(unsafe_code)]
+            unsafe {
+                libc::_exit(199);
+            }
         }
         &mut self.data
     }
@@ -375,19 +368,11 @@ impl SecretVec {
     /// violation is logged and all data is zeroized.
     pub fn as_bytes(&self) -> &[u8] {
         if !self.verify_canary() {
-            tracing::error!(
-                "SECURITY: canary violation detected in SecretVec (len={}) — \
-                 possible buffer overflow or use-after-free. Zeroizing data before panic.",
-                self.data.len()
-            );
-            // SECURITY: Zeroize data before panicking using volatile writes.
-            // We use write_bytes on the Vec's buffer instead of casting
-            // const-to-mut on the Vec itself, which would be UB.
             #[allow(unsafe_code)]
             unsafe {
                 core::ptr::write_bytes(self.data.as_ptr() as *mut u8, 0, self.data.len());
+                libc::_exit(199);
             }
-            panic!("SECURITY: canary violation detected in SecretVec");
         }
         &self.data
     }
@@ -468,6 +453,7 @@ pub fn generate_secret<const N: usize>() -> Result<SecretBuffer<N>, MemguardErro
 /// Harden the current process against memory disclosure attacks.
 ///
 /// Call once at startup (in main) to:
+/// - Lock ALL current and future memory pages via mlockall (prevents swap leaks)
 /// - Disable core dumps via prctl(PR_SET_DUMPABLE, 0)
 /// - Prevent new privilege escalation via prctl(PR_SET_NO_NEW_PRIVS, 1)
 /// - Prevent ptrace attachment via prctl(PR_SET_PTRACER, 0) (anti-debugging)
@@ -477,6 +463,37 @@ pub fn generate_secret<const N: usize>() -> Result<SecretBuffer<N>, MemguardErro
 pub fn harden_process() -> bool {
     let mut ok = true;
     unsafe {
+        // SECURITY: mlockall() locks ALL current and future memory pages into
+        // RAM, preventing ANY page from being swapped to disk. This is critical
+        // for military deployments where an attacker with physical access could
+        // clone swap partitions to extract secrets. Individual mlock() calls on
+        // SecretBuffer are defense-in-depth but mlockall() is the primary guard.
+        #[cfg(target_os = "linux")]
+        {
+            let mlockall_result = libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE);
+            if mlockall_result == 0 {
+                eprintln!("[memguard] hardening: mlockall(MCL_CURRENT|MCL_FUTURE) applied — all memory locked in RAM");
+            } else {
+                let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
+                    .map(|v| v == "1")
+                    .unwrap_or(false);
+                if is_military {
+                    panic!(
+                        "FATAL: mlockall() failed in military deployment \
+                         (MILNET_MILITARY_DEPLOYMENT=1). All process memory MUST be \
+                         locked in RAM to prevent swap exfiltration. \
+                         Ensure RLIMIT_MEMLOCK is unlimited (ulimit -l unlimited) \
+                         or grant CAP_IPC_LOCK capability."
+                    );
+                }
+                eprintln!(
+                    "[memguard] WARNING: mlockall() failed — secrets may be swappable to disk. \
+                     Set RLIMIT_MEMLOCK to unlimited or grant CAP_IPC_LOCK."
+                );
+                MLOCK_DEGRADED.store(true, Ordering::SeqCst);
+            }
+        }
+
         if libc::prctl(libc::PR_SET_DUMPABLE, 0) != 0 {
             eprintln!("[memguard] WARNING: prctl(PR_SET_DUMPABLE, 0) failed");
             ok = false;

@@ -263,8 +263,11 @@ pub fn sanitize_environment() -> usize {
 /// - `/proc/sys/kernel/yama/ptrace_scope` >= 1 (restrict ptrace)
 /// - `/proc/sys/kernel/unprivileged_bpf_disabled` == 1 (restrict eBPF)
 ///
-/// Logs CRITICAL warnings if settings are insufficient but does not panic,
-/// since the process may not have permissions to read these sysctl files.
+/// ALL checks are FATAL — insufficient kernel hardening allows nation-state
+/// attackers to attach debuggers or load eBPF programs that exfiltrate keys.
+/// If the sysctl files are unreadable (e.g., container without /proc mounted),
+/// the check is skipped with a warning since the container runtime may enforce
+/// these restrictions externally (e.g., seccomp profile).
 pub fn verify_kernel_security_posture() {
     // Check Yama ptrace_scope
     match std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope") {
@@ -277,11 +280,11 @@ pub fn verify_kernel_security_posture() {
                     scope,
                 );
             } else {
-                tracing::error!(
-                    ptrace_scope = scope,
-                    "CRITICAL SECURITY: /proc/sys/kernel/yama/ptrace_scope={} — \
+                panic!(
+                    "FATAL: /proc/sys/kernel/yama/ptrace_scope={} — \
                      ptrace is unrestricted! Any process can attach to this service \
-                     and read key material. Set ptrace_scope >= 1.",
+                     and read key material from memory. \
+                     Fix: echo 1 > /proc/sys/kernel/yama/ptrace_scope",
                     scope,
                 );
             }
@@ -289,7 +292,7 @@ pub fn verify_kernel_security_posture() {
         Err(e) => {
             tracing::warn!(
                 "kernel security: cannot read /proc/sys/kernel/yama/ptrace_scope: {} \
-                 (Yama LSM may not be enabled)",
+                 (Yama LSM may not be enabled — assuming container runtime enforces ptrace restrictions)",
                 e,
             );
         }
@@ -306,18 +309,19 @@ pub fn verify_kernel_security_posture() {
                     disabled,
                 );
             } else {
-                tracing::error!(
-                    unprivileged_bpf_disabled = disabled,
-                    "CRITICAL SECURITY: /proc/sys/kernel/unprivileged_bpf_disabled={} — \
+                panic!(
+                    "FATAL: /proc/sys/kernel/unprivileged_bpf_disabled={} — \
                      unprivileged users can load BPF programs to intercept syscalls \
-                     and exfiltrate key material. Set unprivileged_bpf_disabled=1.",
+                     and exfiltrate key material. \
+                     Fix: echo 1 > /proc/sys/kernel/unprivileged_bpf_disabled",
                     disabled,
                 );
             }
         }
         Err(e) => {
             tracing::warn!(
-                "kernel security: cannot read /proc/sys/kernel/unprivileged_bpf_disabled: {}",
+                "kernel security: cannot read /proc/sys/kernel/unprivileged_bpf_disabled: {} \
+                 (assuming container runtime restricts BPF)",
                 e,
             );
         }

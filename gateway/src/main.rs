@@ -199,19 +199,43 @@ async fn main() {
     }
 
     let tls_config = if let (Ok(cert_file), Ok(key_file)) = (cert_path, key_path) {
-        tracing::info!("Loading TLS certificate from {cert_file} and key from {key_file}");
+        // SECURITY: Redact actual file paths from logs to prevent information
+        // disclosure about key material locations to an attacker reading logs.
+        tracing::info!("Loading TLS certificate and key from configured paths");
 
         // SECURITY: Remove key/cert paths from environment immediately after reading.
         // Prevents leakage via /proc/pid/environ or child process inheritance.
         std::env::remove_var("MILNET_GATEWAY_KEY_PATH");
         std::env::remove_var("MILNET_GATEWAY_CERT_PATH");
 
+        // SECURITY: Canonicalize and validate certificate/key paths to prevent
+        // path traversal attacks. Block /proc, /sys, /dev which could be used
+        // to read process memory or device files via certificate loading.
+        for (label, path) in [("cert", &cert_file), ("key", &key_file)] {
+            let canonical = std::fs::canonicalize(path).unwrap_or_else(|e| {
+                tracing::error!("FATAL: cannot canonicalize TLS {label} path: {e}");
+                std::process::exit(1);
+            });
+            let canon_str = canonical.to_string_lossy();
+            if canon_str.starts_with("/proc")
+                || canon_str.starts_with("/sys")
+                || canon_str.starts_with("/dev")
+            {
+                tracing::error!(
+                    "FATAL: TLS {label} path resolves to a forbidden location \
+                     (/proc, /sys, or /dev). Certificate and key files must be \
+                     regular files on disk."
+                );
+                std::process::exit(1);
+            }
+        }
+
         let cert_pem = std::fs::read(&cert_file).unwrap_or_else(|e| {
-            tracing::error!("Failed to read TLS cert {cert_file}: {e}");
+            tracing::error!("Failed to read TLS cert: {e}");
             std::process::exit(1);
         });
         let key_pem = std::fs::read(&key_file).unwrap_or_else(|e| {
-            tracing::error!("Failed to read TLS key {key_file}: {e}");
+            tracing::error!("Failed to read TLS key: {e}");
             std::process::exit(1);
         });
 

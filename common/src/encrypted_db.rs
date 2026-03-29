@@ -9,6 +9,7 @@
 //! |--------------------|---------------------|---------------------|
 //! | users              | opaque_registration | users:opaque        |
 //! | users              | email_encrypted     | users:email         |
+//! | users              | username_encrypted  | users:username      |
 //! | users              | duress_pin_hash     | users:duress        |
 //! | fido_credentials   | public_key          | fido:pubkey         |
 //! | portals            | client_secret       | portals:secret      |

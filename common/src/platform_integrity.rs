@@ -388,10 +388,23 @@ pub fn tpm_seal(
 ) -> Result<(), PlatformError> {
     let dir = sealed_dir.unwrap_or(DEFAULT_SEALED_DIR);
 
-    // Ensure sealed directory exists
+    // Ensure sealed directory exists with restrictive permissions
     std::fs::create_dir_all(dir).map_err(|e| {
         PlatformError::IoError(format!("cannot create sealed dir {}: {}", dir, e))
     })?;
+
+    // SECURITY: Set directory permissions to 0o700 (owner-only access).
+    // Default create_dir_all uses the process umask which may allow
+    // group/world access, enabling sidecar containers or other users to
+    // read sealed key blobs.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::Permissions::from_mode(0o700);
+        std::fs::set_permissions(dir, mode).map_err(|e| {
+            PlatformError::IoError(format!("cannot set sealed dir permissions to 0700: {}", e))
+        })?;
+    }
 
     let _ctx_path = format!("{}/{}.ctx", dir, name);
     let pub_path = format!("{}/{}.pub", dir, name);

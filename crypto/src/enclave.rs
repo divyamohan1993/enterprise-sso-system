@@ -279,12 +279,49 @@ pub enum TrustLevel {
 ///
 /// In production, this would verify the attestation evidence against the
 /// platform's root of trust (Intel QE identity, AMD VCEK cert chain, etc.).
-/// This implementation verifies the report structure and nonce freshness.
+/// This implementation verifies the report structure, nonce freshness, and
+/// backend consistency with local hardware detection.
+///
+/// `expected_backend`: If provided, the report's backend must match. This
+/// prevents a software-fallback node from claiming to be hardware-attested.
+/// When `None`, the backend is verified against the locally detected hardware.
 pub fn verify_attestation(
     report: &AttestationReport,
     expected_nonce: &[u8; 32],
     expected_measurement: Option<&[u8; 32]>,
 ) -> AttestationVerification {
+    verify_attestation_with_backend(report, expected_nonce, expected_measurement, None)
+}
+
+/// Verify a remote attestation report with explicit backend verification.
+///
+/// When `expected_backend` is `Some`, the report's claimed backend must match
+/// exactly. This prevents attestation spoofing where a software-only node
+/// claims hardware enclave status by self-reporting `backend: IntelSgx`.
+pub fn verify_attestation_with_backend(
+    report: &AttestationReport,
+    expected_nonce: &[u8; 32],
+    expected_measurement: Option<&[u8; 32]>,
+    expected_backend: Option<EnclaveBackend>,
+) -> AttestationVerification {
+    // SECURITY: Verify backend matches expectation to prevent spoofing.
+    // Without this check, a compromised software-fallback node could claim
+    // to be running in an Intel SGX enclave by setting backend: IntelSgx
+    // in its self-reported attestation.
+    if let Some(expected) = expected_backend {
+        if report.identity.backend != expected {
+            return AttestationVerification {
+                valid: false,
+                identity: report.identity.clone(),
+                trust_level: TrustLevel::Untrusted,
+                reason: format!(
+                    "enclave backend mismatch: report claims {:?} but expected {:?}",
+                    report.identity.backend, expected
+                ),
+            };
+        }
+    }
+
     // Verify nonce freshness
     if !crate::ct::ct_eq(&report.nonce, expected_nonce) {
         return AttestationVerification {
@@ -307,7 +344,7 @@ pub fn verify_attestation(
         }
     }
 
-    // Check evidence is present
+    // Check evidence is present for hardware claims
     if report.evidence.is_empty() && report.identity.backend.is_hardware() {
         return AttestationVerification {
             valid: false,
@@ -696,6 +733,55 @@ mod tests {
 
         let verification = verify_attestation(&report, &nonce, Some(&wrong_measurement));
         assert!(!verification.valid);
+    }
+
+    #[test]
+    fn test_attestation_backend_spoof_rejected() {
+        // SECURITY: Verify that a software-fallback node claiming to be
+        // hardware-attested is rejected when an expected backend is specified.
+        let identity = test_identity(EnclaveBackend::SoftwareFallback);
+        let nonce = generate_attestation_nonce().unwrap();
+
+        let report = AttestationReport {
+            identity,
+            nonce,
+            report_data: vec![0u8; 64],
+            evidence: Vec::new(),
+            timestamp: "2025-01-01T00:00:00Z".to_string(),
+        };
+
+        // Attacker claims software fallback, but we expect Intel SGX
+        let verification = verify_attestation_with_backend(
+            &report,
+            &nonce,
+            None,
+            Some(EnclaveBackend::IntelSgx),
+        );
+        assert!(!verification.valid, "software node spoofing as SGX must be rejected");
+        assert_eq!(verification.trust_level, TrustLevel::Untrusted);
+        assert!(verification.reason.contains("backend mismatch"));
+    }
+
+    #[test]
+    fn test_attestation_correct_backend_accepted() {
+        let identity = test_identity(EnclaveBackend::SoftwareFallback);
+        let nonce = generate_attestation_nonce().unwrap();
+
+        let report = AttestationReport {
+            identity,
+            nonce,
+            report_data: vec![0u8; 64],
+            evidence: Vec::new(),
+            timestamp: "2025-01-01T00:00:00Z".to_string(),
+        };
+
+        let verification = verify_attestation_with_backend(
+            &report,
+            &nonce,
+            None,
+            Some(EnclaveBackend::SoftwareFallback),
+        );
+        assert!(verification.valid, "matching backend should be accepted");
     }
 
     #[test]
