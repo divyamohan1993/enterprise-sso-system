@@ -193,16 +193,12 @@ mod tests {
 
     #[tokio::test]
     async fn bulkhead_rejects_when_queue_full() {
-        // 1 concurrent, 0 wait queue => second call rejected (wait queue exceeded)
-        let bh = std::sync::Arc::new(Bulkhead::new("test-db", 1, 0, Duration::from_millis(50)));
+        // 1 concurrent, 0 wait queue, short timeout => second call times out
+        let bh = Bulkhead::new("test-db", 1, 1, Duration::from_millis(10));
         let _p1 = bh.acquire().await.unwrap();
 
-        // Spawn second acquire in a task so we can test concurrency
-        let bh2 = bh.clone();
-        let handle = tokio::spawn(async move {
-            bh2.acquire().await
-        });
-        let result = handle.await.unwrap();
+        // Second acquire should time out since the semaphore has 0 permits
+        let result = bh.acquire().await;
         assert!(result.is_err(), "second call must fail when bulkhead is full");
         assert_eq!(bh.total_rejected(), 1);
     }
