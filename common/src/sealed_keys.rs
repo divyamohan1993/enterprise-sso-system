@@ -503,19 +503,6 @@ fn derive_unseal_key(master_kek: &[u8; 32], purpose: &str) -> [u8; 32] {
     okm
 }
 
-/// Generate a deterministic dev key from a seed (NOT FOR PRODUCTION).
-fn deterministic_dev_key(seed: &[u8]) -> [u8; 64] {
-    use sha2::{Digest, Sha512};
-    let hash = Sha512::digest(seed);
-    let mut key = [0u8; 64];
-    key.copy_from_slice(&hash);
-    // Reject all-zero keys
-    if key.iter().all(|&b| b == 0) {
-        eprintln!("FATAL: all-zero key detected in deterministic dev key derivation"); std::process::exit(1);
-    }
-    key
-}
-
 /// Seal a 64-byte key for storage in env vars or files.
 /// Used by operators to prepare sealed keys for deployment.
 pub fn seal_key_for_storage(key: &[u8; 64], purpose: &str) -> Vec<u8> {

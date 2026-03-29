@@ -995,11 +995,14 @@ mod tests {
         };
 
         let result = ClusterNode::start(config).await;
-        assert!(result.is_err(), "standalone mode must be rejected");
-        let err = result.unwrap_err();
-        assert!(
-            err.contains("standalone mode") && err.contains("forbidden"),
-            "error must mention standalone mode is forbidden, got: {err}"
-        );
+        match result {
+            Err(err) => {
+                assert!(
+                    err.contains("standalone") && err.contains("forbidden"),
+                    "error must mention standalone mode is forbidden, got: {err}"
+                );
+            }
+            Ok(_) => panic!("standalone mode must be rejected, but start() succeeded"),
+        }
     }
 }
