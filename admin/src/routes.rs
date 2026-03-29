@@ -1997,7 +1997,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         // CAC/PIV card management
         .route("/api/cac/enroll", post(cac_enroll))
         .route("/api/cac/authenticate", post(cac_authenticate))
-        .route("/api/cac/cards/{user_id}", get(cac_list_cards))
+        .route("/api/cac/cards/by-user/{user_id}", get(cac_list_cards))
         .route("/api/cac/cards/{card_id}", delete(cac_revoke_card))
         .route("/api/cac/verify-cert", post(cac_verify_cert))
         .route("/api/cac/readers", get(cac_list_readers))

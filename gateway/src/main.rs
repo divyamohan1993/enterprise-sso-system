@@ -174,7 +174,13 @@ async fn main() {
     }
     tracing::info!("CNSA 2.0 compliance verified");
 
-    let port = std::env::var("GATEWAY_PORT").unwrap_or_else(|_| "9100".into());
+    // Note: GATEWAY_PORT is auto-set by K8s service discovery (e.g. "tcp://10.x.x.x:9100").
+    // Use MILNET_GATEWAY_PORT to avoid collision, falling back to GATEWAY_PORT only if numeric.
+    let port = std::env::var("MILNET_GATEWAY_PORT")
+        .or_else(|_| std::env::var("GATEWAY_PORT").and_then(|v| {
+            if v.chars().all(|c| c.is_ascii_digit()) { Ok(v) } else { Err(std::env::VarError::NotPresent) }
+        }))
+        .unwrap_or_else(|_| "9100".into());
     // Always default to loopback; override with GATEWAY_BIND_ADDR if needed.
     let default_bind = "127.0.0.1";
     let bind_addr = std::env::var("GATEWAY_BIND_ADDR").unwrap_or_else(|_| default_bind.to_string());
