@@ -1,7 +1,7 @@
 //! Hardened TOTP tests.
 //!
 //! Verifies the TOTP implementation enforces:
-//!   - Default SHA-512 for new enrollments
+//!   - Default SHA-512 (CNSA 2.0) for new enrollments
 //!   - SHA-1 backward compatibility with deprecation warnings
 //!   - SHA-256 acceptance
 //!   - Correct TOTP code generation per RFC 6238
@@ -12,16 +12,16 @@ use common::totp::*;
 
 // ── Default Algorithm ─────────────────────────────────────────────────────
 
-/// Security property: New enrollments default to SHA-256 (or higher)
+/// Security property: New enrollments default to SHA-512 (CNSA 2.0)
 /// when MILNET_TOTP_ALGORITHM is not set.
 #[test]
-fn new_enrollment_defaults_to_sha256() {
+fn new_enrollment_defaults_to_sha512() {
     std::env::remove_var("MILNET_TOTP_ALGORITHM");
     let algo = default_totp_algorithm();
     assert_eq!(
         algo,
-        TotpAlgorithm::Sha256,
-        "Default TOTP algorithm must be SHA-256"
+        TotpAlgorithm::Sha512,
+        "Default TOTP algorithm must be SHA-512 (CNSA 2.0)"
     );
 }
 
@@ -202,12 +202,12 @@ fn algorithm_otpauth_names() {
 
 // ── Migration ─────────────────────────────────────────────────────────────
 
-/// Security property: Migration to SHA-256 generates a new random secret
-/// and returns the SHA-256 algorithm identifier.
+/// Security property: Migration generates a new random secret
+/// and returns the SHA-512 algorithm identifier (CNSA 2.0 upgrade).
 #[test]
-fn migrate_to_sha256_produces_new_secret() {
+fn migrate_to_sha512_produces_new_secret() {
     let (secret, algo) = migrate_to_sha256();
-    assert_eq!(algo, TotpAlgorithm::Sha256);
+    assert_eq!(algo, TotpAlgorithm::Sha512);
     assert_ne!(*secret, [0u8; 32], "migrated secret must not be all zeros");
 }
 
