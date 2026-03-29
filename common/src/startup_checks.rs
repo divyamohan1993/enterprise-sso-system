@@ -298,6 +298,10 @@ pub fn sanitize_environment() -> usize {
 /// the check is skipped with a warning since the container runtime may enforce
 /// these restrictions externally (e.g., seccomp profile).
 pub fn verify_kernel_security_posture() {
+    if std::env::var("MILNET_DEV_MODE").unwrap_or_default() == "1" {
+        tracing::warn!("MILNET_DEV_MODE=1: skipping kernel security posture checks");
+        return;
+    }
     // Check Yama ptrace_scope
     match std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope") {
         Ok(val) => {

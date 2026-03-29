@@ -349,7 +349,20 @@ pub fn load_receipt_signing_seed_sealed() -> [u8; 32] {
         std::process::exit(1);
     }
 
-    // 3. No key found — fail hard.
+    // 3. Dev mode fallback: derive seed from master KEK
+    if std::env::var("MILNET_DEV_MODE").unwrap_or_default() == "1" {
+        eprintln!("WARNING: MILNET_DEV_MODE=1 — deriving {raw_var} from master KEK (not for production)");
+        let master = *cached_master_kek();
+        use hkdf::Hkdf;
+        use sha2::Sha512;
+        let hk = Hkdf::<Sha512>::new(Some(b"MILNET-DEV-KEY-v1"), &master);
+        let mut okm = [0u8; 32];
+        hk.expand(b"receipt-sign-seed", &mut okm)
+            .expect("HKDF-SHA512 derivation failed");
+        return okm;
+    }
+
+    // 4. No key found — fail hard.
     eprintln!(
         "FATAL: {raw_var} not set and no sealed seed found. \
          Cannot start without receipt signing seed."

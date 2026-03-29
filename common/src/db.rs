@@ -342,6 +342,11 @@ pub fn enforce_ssl_in_url(database_url: &str) -> String {
     if mode.is_secure() {
         return database_url.to_string();
     }
+    // Dev mode: don't override sslmode=disable
+    if std::env::var("MILNET_DEV_MODE").unwrap_or_default() == "1" {
+        tracing::warn!("MILNET_DEV_MODE=1: keeping DB sslmode={:?} as-is", mode);
+        return database_url.to_string();
+    }
     // Append sslmode=require if missing or insecure
     if mode == SslMode::Unknown {
         // No sslmode param — append it

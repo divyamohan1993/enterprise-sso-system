@@ -175,6 +175,17 @@ deploy_sso() {
     log "Waiting for PostgreSQL to be ready..."
     sudo k3s kubectl wait --namespace=milnet --for=condition=Available deployment/postgres --timeout=120s || warn "PostgreSQL not ready yet, continuing..."
 
+    # Run database migrations
+    log "Running database migrations..."
+    local PG_POD
+    PG_POD=$(sudo k3s kubectl get pods -n milnet -l app.kubernetes.io/name=postgres -o jsonpath='{.items[0].metadata.name}')
+    for migration in "$REPO_ROOT"/migrations/*.sql; do
+        log "  Applying $(basename "$migration")..."
+        sudo k3s kubectl exec -n milnet "$PG_POD" -- \
+            psql -U milnet -d milnet -f - < "$migration" 2>&1 | tail -5
+    done
+    log "Migrations complete"
+
     # All workloads
     sudo k3s kubectl apply -f workloads.yaml
 
