@@ -459,7 +459,7 @@ mod saml_tests {
 
     #[test]
     fn artifact_encode_decode_roundtrip() {
-        let artifact = SamlArtifact::new("https://idp.milnet.mil", 0);
+        let artifact = SamlArtifact::new("https://idp.milnet.mil", 0).unwrap();
         let encoded = artifact.encode();
         let decoded = SamlArtifact::decode(&encoded).unwrap();
 
@@ -472,7 +472,7 @@ mod saml_tests {
     #[test]
     fn artifact_store_resolve_one_time_use() {
         let store = ArtifactStore::new(60);
-        let artifact = SamlArtifact::new("https://idp.milnet.mil", 0);
+        let artifact = SamlArtifact::new("https://idp.milnet.mil", 0).unwrap();
         let response_xml = "<samlp:Response>test</samlp:Response>";
 
         store.store(&artifact, response_xml).unwrap();

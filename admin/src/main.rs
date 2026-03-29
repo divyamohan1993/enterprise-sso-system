@@ -115,7 +115,13 @@ async fn main() {
         let encryptor = common::encrypted_db::FieldEncryptor::new(
             *common::sealed_keys::get_master_kek(),
         );
-        encryptor.table_kek("sessions")
+        match encryptor.table_kek("sessions") {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::error!("FATAL: failed to derive session encryption key: {e}");
+                std::process::exit(1);
+            }
+        }
     };
     let session_store = common::distributed_session::DistributedSessionStore::new(
         session_encryption_key,
