@@ -65,7 +65,7 @@ pub enum StigStatus {
 }
 
 /// Aggregate statistics over all checks that have been run.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StigSummary {
     pub total: usize,
     pub passed: usize,

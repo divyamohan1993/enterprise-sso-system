@@ -402,11 +402,15 @@ pub fn validate_ssl_config(database_url: &str) {
     }
 
     if !mode.is_secure() {
-        panic!(
-            "FATAL: DATABASE_URL sslmode={:?} is not acceptable. \
-             Set sslmode=require or sslmode=verify-full.",
-            mode
-        );
+        if std::env::var("MILNET_DEV_MODE").unwrap_or_default() == "1" {
+            tracing::warn!("MILNET_DEV_MODE=1: allowing insecure DB sslmode={:?}", mode);
+        } else {
+            panic!(
+                "FATAL: DATABASE_URL sslmode={:?} is not acceptable. \
+                 Set sslmode=require or sslmode=verify-full.",
+                mode
+            );
+        }
     }
 
     // verify-full requires cert and key

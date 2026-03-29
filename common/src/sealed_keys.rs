@@ -442,7 +442,14 @@ fn load_key_hardened(var: &str, purpose: &str, _dev_seed: &[u8]) -> [u8; 64] {
         std::process::exit(1);
     }
 
-    // 3. No key found — fail hard. No dev fallbacks.
+    // 3. Dev mode fallback: derive key from master KEK + purpose
+    if std::env::var("MILNET_DEV_MODE").unwrap_or_default() == "1" {
+        eprintln!("WARNING: MILNET_DEV_MODE=1 — deriving {var} from master KEK (not for production)");
+        let master = load_master_kek();
+        return derive_unseal_key(&master, purpose);
+    }
+
+    // 4. No key found — fail hard. No dev fallbacks.
     eprintln!(
         "FATAL: {var} not set and no sealed key found. \
          Cannot start without keys."

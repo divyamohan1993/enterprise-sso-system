@@ -1376,13 +1376,17 @@ impl HsmKeyManager {
     pub fn new(config: HsmConfig) -> Result<Self, HsmError> {
         config.validate()?;
 
-        // Fail-closed: reject software backend
+        // Fail-closed: reject software backend in production
         if config.backend == HsmBackend::Software {
-            panic!(
-                "FATAL: Software HSM backend is forbidden in production mode. \
-                 This is a security violation. \
-                 Configure MILNET_HSM_BACKEND=pkcs11|aws-kms|tpm2"
-            );
+            if std::env::var("MILNET_DEV_MODE").unwrap_or_default() == "1" {
+                tracing::warn!("MILNET_DEV_MODE=1: allowing software HSM backend");
+            } else {
+                panic!(
+                    "FATAL: Software HSM backend is forbidden in production mode. \
+                     This is a security violation. \
+                     Configure MILNET_HSM_BACKEND=pkcs11|aws-kms|tpm2"
+                );
+            }
         }
 
         let state = match &config.backend {
@@ -2835,11 +2839,14 @@ pub fn create_hsm_backend() -> Box<dyn HsmKeyOps> {
             Box::new(manager)
         }
         "software" | _ => {
-            panic!(
-                "FATAL: Software HSM backend is forbidden in production mode. \
-                 Set MILNET_HSM_BACKEND to pkcs11, aws_kms, or tpm2. \
-                 Hardware-backed key storage is required for classified deployments."
-            );
+            if std::env::var("MILNET_DEV_MODE").unwrap_or_default() != "1" {
+                panic!(
+                    "FATAL: Software HSM backend is forbidden in production mode. \
+                     Set MILNET_HSM_BACKEND to pkcs11, aws_kms, or tpm2. \
+                     Hardware-backed key storage is required for classified deployments."
+                );
+            }
+            eprintln!("WARNING: MILNET_DEV_MODE=1 — using software HSM backend (not for production)");
         }
     }
 }
