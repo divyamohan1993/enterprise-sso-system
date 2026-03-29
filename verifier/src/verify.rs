@@ -820,8 +820,8 @@ mod tests {
         let key = [0xAA; 64];
         let claims_bytes = b"test claims data";
         let epoch = 42u64;
-        let tag1 = compute_ratchet_tag(&key, claims_bytes, epoch);
-        let tag2 = compute_ratchet_tag(&key, claims_bytes, epoch);
+        let tag1 = compute_ratchet_tag(&key, claims_bytes, epoch).unwrap();
+        let tag2 = compute_ratchet_tag(&key, claims_bytes, epoch).unwrap();
         assert_eq!(tag1, tag2, "same inputs must produce identical ratchet tags");
     }
 
@@ -829,8 +829,8 @@ mod tests {
     fn test_compute_ratchet_tag_different_epochs() {
         let key = [0xAA; 64];
         let claims_bytes = b"test claims data";
-        let tag1 = compute_ratchet_tag(&key, claims_bytes, 1);
-        let tag2 = compute_ratchet_tag(&key, claims_bytes, 2);
+        let tag1 = compute_ratchet_tag(&key, claims_bytes, 1).unwrap();
+        let tag2 = compute_ratchet_tag(&key, claims_bytes, 2).unwrap();
         assert_ne!(tag1, tag2, "different epochs must produce different tags");
     }
 
@@ -839,23 +839,23 @@ mod tests {
         let key1 = [0xAA; 64];
         let key2 = [0xBB; 64];
         let claims_bytes = b"test claims data";
-        let tag1 = compute_ratchet_tag(&key1, claims_bytes, 1);
-        let tag2 = compute_ratchet_tag(&key2, claims_bytes, 1);
+        let tag1 = compute_ratchet_tag(&key1, claims_bytes, 1).unwrap();
+        let tag2 = compute_ratchet_tag(&key2, claims_bytes, 1).unwrap();
         assert_ne!(tag1, tag2, "different keys must produce different tags");
     }
 
     #[test]
     fn test_compute_ratchet_tag_different_claims() {
         let key = [0xAA; 64];
-        let tag1 = compute_ratchet_tag(&key, b"claims A", 1);
-        let tag2 = compute_ratchet_tag(&key, b"claims B", 1);
+        let tag1 = compute_ratchet_tag(&key, b"claims A", 1).unwrap();
+        let tag2 = compute_ratchet_tag(&key, b"claims B", 1).unwrap();
         assert_ne!(tag1, tag2, "different claims must produce different tags");
     }
 
     #[test]
     fn test_compute_ratchet_tag_nonzero() {
         let key = [0xAA; 64];
-        let tag = compute_ratchet_tag(&key, b"test", 1);
+        let tag = compute_ratchet_tag(&key, b"test", 1).unwrap();
         assert_ne!(tag, [0u8; 64], "ratchet tag should not be all zeros");
     }
 
