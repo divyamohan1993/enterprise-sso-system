@@ -66,17 +66,36 @@ build_images() {
     # Use the MVP Dockerfile (no static linking, debian-slim runtime)
     local dockerfile="$SCRIPT_DIR/Dockerfile"
 
+    # Check if images already exist
+    local need_build=false
     for svc in "${services[@]}"; do
-        log "Building milnet/${svc}:dev ..."
-        sudo docker build \
-            --build-arg SERVICE_NAME="${svc}" \
-            -t "milnet/${svc}:dev" \
-            -f "$dockerfile" \
-            . 2>&1 | tail -30
-        log "  -> milnet/${svc}:dev built"
+        if ! sudo docker image inspect "milnet/${svc}:dev" &>/dev/null; then
+            need_build=true
+            break
+        fi
     done
 
-    log "All images built. Importing into k3s containerd..."
+    if [ "$need_build" = "false" ]; then
+        log "All images already exist, skipping build"
+    else
+        for svc in "${services[@]}"; do
+            if sudo docker image inspect "milnet/${svc}:dev" &>/dev/null; then
+                log "  milnet/${svc}:dev already exists, skipping"
+                continue
+            fi
+            log "Building milnet/${svc}:dev ..."
+            sudo docker build \
+                --build-arg SERVICE_NAME="${svc}" \
+                -t "milnet/${svc}:dev" \
+                -f "$dockerfile" \
+                . 2>&1 | tail -30
+            log "  -> milnet/${svc}:dev built"
+        done
+        # Clean build cache to save disk (keep final images)
+        sudo docker builder prune -f 2>/dev/null || true
+    fi
+
+    log "Importing images into k3s containerd..."
     for svc in "${services[@]}"; do
         sudo docker save "milnet/${svc}:dev" | sudo k3s ctr images import -
         log "  -> milnet/${svc}:dev imported"
@@ -122,6 +141,9 @@ deploy_sso() {
 
     # Namespace first
     sudo k3s kubectl apply -f namespace.yaml
+
+    # Clean up evicted/failed pods from previous runs
+    sudo k3s kubectl delete pods -n milnet --field-selector=status.phase=Failed 2>/dev/null || true
 
     # ConfigMap
     sudo k3s kubectl apply -f configmap.yaml
