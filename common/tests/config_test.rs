@@ -1,4 +1,4 @@
-use common::config::SecurityConfig;
+use common::config::{SecurityConfig, ErrorLevel, ErrorLevelConfig};
 
 #[test]
 fn test_default_max_session_lifetime() {
@@ -124,4 +124,97 @@ fn test_session_covers_many_ratchet_epochs() {
     let c = SecurityConfig::default();
     // Session lifetime should cover significantly more than lookahead epochs
     assert!(c.max_ratchet_epochs() > c.ratchet_lookahead_epochs * 10);
+}
+
+// ── Error verbosity hardening tests ──
+
+#[test]
+fn test_default_error_level_is_warn_not_verbose() {
+    // The default error level MUST be Warn (not Verbose) to prevent
+    // information leakage in production deployments.
+    let cfg = SecurityConfig::default();
+    assert_eq!(cfg.error_level, ErrorLevel::Warn);
+    assert_ne!(cfg.error_level, ErrorLevel::Verbose);
+}
+
+#[test]
+fn test_error_level_config_defaults_to_warn() {
+    // The runtime ErrorLevelConfig singleton must default to Warn.
+    let elc = ErrorLevelConfig::new();
+    assert_eq!(elc.level(), ErrorLevel::Warn);
+    assert!(!elc.is_verbose());
+    assert!(!elc.is_enabled()); // backwards-compat alias
+}
+
+#[test]
+fn test_military_deployment_forces_warn_when_verbose_requested() {
+    // When MILNET_MILITARY_DEPLOYMENT=1, set_level(Verbose) must be
+    // silently downgraded to Warn to prevent information leakage.
+    // We set the env var, create a fresh config, try to set Verbose,
+    // and verify it remains Warn.
+    std::env::set_var("MILNET_MILITARY_DEPLOYMENT", "1");
+    let elc = ErrorLevelConfig::new();
+    elc.set_level(ErrorLevel::Verbose);
+    assert_eq!(elc.level(), ErrorLevel::Warn, "military deployment must force Warn");
+    assert!(!elc.is_verbose());
+    std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+}
+
+#[test]
+fn test_production_env_forces_warn_when_verbose_requested() {
+    // MILNET_PRODUCTION=1 also forces Warn.
+    std::env::set_var("MILNET_PRODUCTION", "1");
+    let elc = ErrorLevelConfig::new();
+    elc.set_level(ErrorLevel::Verbose);
+    assert_eq!(elc.level(), ErrorLevel::Warn, "production env must force Warn");
+    std::env::remove_var("MILNET_PRODUCTION");
+}
+
+#[test]
+fn test_non_military_can_set_verbose_explicitly() {
+    // When neither MILNET_MILITARY_DEPLOYMENT nor MILNET_PRODUCTION is set,
+    // Verbose error level should be allowed.
+    std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+    std::env::remove_var("MILNET_PRODUCTION");
+    let elc = ErrorLevelConfig::new();
+    elc.set_level(ErrorLevel::Verbose);
+    assert_eq!(elc.level(), ErrorLevel::Verbose);
+    assert!(elc.is_verbose());
+    // Cleanup: restore to Warn
+    elc.set_level(ErrorLevel::Warn);
+}
+
+#[test]
+fn test_military_allows_explicit_warn() {
+    // Setting Warn explicitly in military mode should succeed (it's already Warn).
+    std::env::set_var("MILNET_MILITARY_DEPLOYMENT", "1");
+    let elc = ErrorLevelConfig::new();
+    elc.set_level(ErrorLevel::Warn);
+    assert_eq!(elc.level(), ErrorLevel::Warn);
+    std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+}
+
+#[test]
+fn test_error_level_from_u8_edge_cases() {
+    // 0 -> Verbose, anything else -> Warn
+    assert_eq!(ErrorLevel::from_u8(0), ErrorLevel::Verbose);
+    assert_eq!(ErrorLevel::from_u8(1), ErrorLevel::Warn);
+    assert_eq!(ErrorLevel::from_u8(2), ErrorLevel::Warn);
+    assert_eq!(ErrorLevel::from_u8(u8::MAX), ErrorLevel::Warn);
+}
+
+#[test]
+fn test_error_level_display() {
+    assert_eq!(format!("{}", ErrorLevel::Verbose), "verbose");
+    assert_eq!(format!("{}", ErrorLevel::Warn), "warn");
+}
+
+#[test]
+fn test_backwards_compat_set_developer_mode_respects_military() {
+    // set_developer_mode(true, ...) should be blocked in military mode.
+    std::env::set_var("MILNET_MILITARY_DEPLOYMENT", "1");
+    let elc = ErrorLevelConfig::new();
+    elc.set_developer_mode(true, "irrelevant_proof");
+    assert_eq!(elc.level(), ErrorLevel::Warn, "developer mode must be blocked in military");
+    std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
 }

@@ -4,21 +4,21 @@ use uuid::Uuid;
 #[test]
 fn test_duress_normal_pin() {
     let user_id = Uuid::new_v4();
-    let config = DuressConfig::new(user_id, b"correct-pin-1234", b"duress-pin-5678");
+    let config = DuressConfig::new(user_id, b"correct-pin-1234", b"duress-pin-5678").unwrap();
     assert_eq!(config.verify_pin(b"correct-pin-1234"), PinVerification::Normal);
 }
 
 #[test]
 fn test_duress_pin_detected() {
     let user_id = Uuid::new_v4();
-    let config = DuressConfig::new(user_id, b"correct-pin-1234", b"duress-pin-5678");
+    let config = DuressConfig::new(user_id, b"correct-pin-1234", b"duress-pin-5678").unwrap();
     assert_eq!(config.verify_pin(b"duress-pin-5678"), PinVerification::Duress);
 }
 
 #[test]
 fn test_duress_wrong_pin() {
     let user_id = Uuid::new_v4();
-    let config = DuressConfig::new(user_id, b"correct-pin-1234", b"duress-pin-5678");
+    let config = DuressConfig::new(user_id, b"correct-pin-1234", b"duress-pin-5678").unwrap();
     assert_eq!(config.verify_pin(b"wrong-pin-9999"), PinVerification::Invalid);
 }
 
@@ -45,8 +45,8 @@ fn test_duress_different_user_id_different_hash() {
     // However, verify_pin must still work correctly for each user independently.
     let user_a = Uuid::new_v4();
     let user_b = Uuid::new_v4();
-    let config_a = DuressConfig::new(user_a, b"pin-1234", b"duress-5678");
-    let config_b = DuressConfig::new(user_b, b"pin-1234", b"duress-5678");
+    let config_a = DuressConfig::new(user_a, b"pin-1234", b"duress-5678").unwrap();
+    let config_b = DuressConfig::new(user_b, b"pin-1234", b"duress-5678").unwrap();
     // Both configs should verify the same PIN correctly
     assert_eq!(config_a.verify_pin(b"pin-1234"), PinVerification::Normal);
     assert_eq!(config_b.verify_pin(b"pin-1234"), PinVerification::Normal);
@@ -59,17 +59,59 @@ fn test_duress_constant_time_comparison_compiles() {
     // Verify that the duress module uses subtle::ConstantTimeEq
     // by exercising the code path — if it compiled, ct_eq is in use.
     let user_id = Uuid::new_v4();
-    let config = DuressConfig::new(user_id, b"aaa", b"bbb");
+    let config = DuressConfig::new(user_id, b"aaa", b"bbb").unwrap();
     // Exercise all three code paths (Normal, Duress, Invalid) which use ct_eq
     assert_eq!(config.verify_pin(b"aaa"), PinVerification::Normal);
     assert_eq!(config.verify_pin(b"bbb"), PinVerification::Duress);
     assert_eq!(config.verify_pin(b"ccc"), PinVerification::Invalid);
 }
 
+// ── TEST GROUP 6: Duress PIN distinctness tests ──────────────────────────
+
+#[test]
+fn test_duress_identical_pins_rejected() {
+    let user_id = Uuid::new_v4();
+    let result = DuressConfig::new(user_id, b"same-pin", b"same-pin");
+    assert!(result.is_err(), "identical normal and duress PINs must be rejected");
+    assert_eq!(
+        result.unwrap_err(),
+        "duress PIN must differ from normal PIN"
+    );
+}
+
+#[test]
+fn test_duress_different_pins_accepted() {
+    let user_id = Uuid::new_v4();
+    let result = DuressConfig::new(user_id, b"pin-alpha", b"pin-beta");
+    assert!(result.is_ok(), "different PINs must be accepted");
+    let config = result.unwrap();
+    assert_eq!(config.verify_pin(b"pin-alpha"), PinVerification::Normal);
+    assert_eq!(config.verify_pin(b"pin-beta"), PinVerification::Duress);
+}
+
+#[test]
+fn test_duress_similar_but_not_identical_pins_accepted() {
+    let user_id = Uuid::new_v4();
+    // PINs that are very similar (differ by 1 char) must still be accepted.
+    let result = DuressConfig::new(user_id, b"1234", b"1235");
+    assert!(result.is_ok(), "similar but not identical PINs must be accepted");
+    let config = result.unwrap();
+    assert_eq!(config.verify_pin(b"1234"), PinVerification::Normal);
+    assert_eq!(config.verify_pin(b"1235"), PinVerification::Duress);
+    assert_eq!(config.verify_pin(b"1236"), PinVerification::Invalid);
+}
+
+#[test]
+fn test_duress_identical_empty_pins_rejected() {
+    let user_id = Uuid::new_v4();
+    let result = DuressConfig::new(user_id, b"", b"");
+    assert!(result.is_err(), "identical empty PINs must be rejected");
+}
+
 #[test]
 fn test_duress_empty_pin() {
     let user_id = Uuid::new_v4();
-    let config = DuressConfig::new(user_id, b"", b"duress");
+    let config = DuressConfig::new(user_id, b"", b"duress").unwrap();
     assert_eq!(config.verify_pin(b""), PinVerification::Normal);
     assert_eq!(config.verify_pin(b"duress"), PinVerification::Duress);
     assert_eq!(config.verify_pin(b"other"), PinVerification::Invalid);

@@ -189,7 +189,7 @@ fn test_fips_mode_default_is_off() {
 
 #[test]
 fn test_fips_unchecked_setter_toggles_mode() {
-    // SECURITY AUDIT: set_fips_mode_unchecked is pub — any crate can toggle FIPS mode
+    // SECURITY: set_fips_mode_unchecked is pub but refuses disable in military mode (non-test builds)
     common::fips::set_fips_mode_unchecked(true);
     assert!(
         common::fips::is_fips_mode(),
@@ -264,7 +264,7 @@ fn test_duress_pin_uses_constant_time_comparison() {
     let normal_pin = b"correct-horse-battery-staple";
     let duress_pin = b"under-duress-1234";
 
-    let config = DuressConfig::new(user_id, normal_pin, duress_pin);
+    let config = DuressConfig::new(user_id, normal_pin, duress_pin).unwrap();
 
     // Normal PIN succeeds with Normal variant
     assert_eq!(

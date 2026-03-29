@@ -681,12 +681,34 @@ impl AuthnRequest {
             let xml = match raw_xml {
                 Some(x) => x,
                 None => {
+                    // SECURITY: fail-closed — never skip signature verification
+                    // when the assertion claims to be signed.
                     return Err(
                         "SAML: signed assertion in production but raw XML not available for verification (fail-closed)"
                             .into(),
                     );
                 }
             };
+
+            // SECURITY: Validate ds:Reference URI to prevent XML signature wrapping attacks.
+            // The Reference URI MUST match "#<assertion_id>" exactly. Any other URI
+            // allows an attacker to inject a second unsigned element and point the
+            // signature at the original, leaving the forged element unprotected.
+            let reference_uris = extract_reference_uris(xml);
+            if reference_uris.len() != 1 {
+                return Err(format!(
+                    "SAML: expected exactly 1 ds:Reference element, found {} — \
+                     possible signature wrapping attack",
+                    reference_uris.len()
+                ));
+            }
+            if reference_uris[0] != expected_ref {
+                return Err(format!(
+                    "SAML: ds:Reference URI mismatch: expected '{}', found '{}' — \
+                     possible signature wrapping attack",
+                    expected_ref, reference_uris[0]
+                ));
+            }
 
             // Extract SignatureValue and SignedInfo from the original XML
             let signature_value = extract_signature_value_bytes(xml);
@@ -704,9 +726,6 @@ impl AuthnRequest {
         }
 
         SecurityEvent::saml_signature_validated("AuthnRequest", &self.id);
-
-        // Log the expected reference for audit trail
-        let _ = expected_ref;
 
         Ok(())
     }
@@ -3222,6 +3241,35 @@ fn strip_xml_comments(xml: &str) -> String {
     result
 }
 
+/// Extract all ds:Reference URI attribute values from raw XML.
+///
+/// Returns a `Vec` of URI strings (e.g. `["#_abc123"]`). Used to verify that
+/// exactly one Reference exists and that it points at the expected assertion ID.
+fn extract_reference_uris(xml: &str) -> Vec<String> {
+    let mut uris = Vec::new();
+    // Match both prefixed (<ds:Reference) and unprefixed (<Reference) forms.
+    for tag_name in &["<ds:Reference", "<Reference"] {
+        let mut search_from = 0;
+        while let Some(start) = xml[search_from..].find(tag_name) {
+            let abs_start = search_from + start;
+            // Find the end of the opening tag (either /> or >)
+            let tag_end = xml[abs_start..].find('>').map(|i| abs_start + i);
+            if let Some(end) = tag_end {
+                let tag_content = &xml[abs_start..=end];
+                // Extract URI="..." attribute
+                if let Some(uri_start) = tag_content.find("URI=\"") {
+                    let value_start = uri_start + 5; // skip URI="
+                    if let Some(value_end) = tag_content[value_start..].find('"') {
+                        uris.push(tag_content[value_start..value_start + value_end].to_string());
+                    }
+                }
+            }
+            search_from = abs_start + tag_name.len();
+        }
+    }
+    uris
+}
+
 /// Extract the base64-decoded `<ds:SignatureValue>` (or `<SignatureValue>`) from raw XML.
 fn extract_signature_value_bytes(xml: &str) -> Vec<u8> {
     // Try both prefixed and unprefixed forms
@@ -3528,5 +3576,64 @@ mod tests {
         assert!(mapping.mappings.contains_key("email"));
         assert!(mapping.mappings.contains_key("display_name"));
         assert!(mapping.mappings.contains_key("groups"));
+    }
+
+    // ── TEST GROUP 3: SAML reference URI tests ────────────────────────────
+
+    #[test]
+    fn test_extract_reference_uris_single() {
+        let xml = r#"<ds:SignedInfo><ds:Reference URI="#_abc123"></ds:Reference></ds:SignedInfo>"#;
+        let uris = extract_reference_uris(xml);
+        assert_eq!(uris.len(), 1);
+        assert_eq!(uris[0], "#_abc123");
+    }
+
+    #[test]
+    fn test_extract_reference_uris_unprefixed() {
+        let xml = r#"<SignedInfo><Reference URI="#_def456"></Reference></SignedInfo>"#;
+        let uris = extract_reference_uris(xml);
+        assert_eq!(uris.len(), 1);
+        assert_eq!(uris[0], "#_def456");
+    }
+
+    #[test]
+    fn test_extract_reference_uris_multiple_rejected() {
+        // Two ds:Reference elements — indicates a potential wrapping attack.
+        let xml = r#"<ds:SignedInfo>
+            <ds:Reference URI="#_legit"></ds:Reference>
+            <ds:Reference URI="#_evil"></ds:Reference>
+        </ds:SignedInfo>"#;
+        let uris = extract_reference_uris(xml);
+        assert_eq!(uris.len(), 2, "must detect multiple Reference elements");
+        // The validation logic in validate_authn_request_signature would reject
+        // this because it expects exactly 1 ds:Reference element.
+    }
+
+    #[test]
+    fn test_extract_reference_uris_none() {
+        let xml = r#"<ds:SignedInfo><ds:DigestMethod/></ds:SignedInfo>"#;
+        let uris = extract_reference_uris(xml);
+        assert!(uris.is_empty(), "no Reference elements should yield empty vec");
+    }
+
+    #[test]
+    fn test_reference_uri_must_match_assertion_id() {
+        // Simulate the validation logic: the URI must match "#<assertion_id>".
+        let assertion_id = "_assertion_42";
+        let expected_ref = format!("#{}", assertion_id);
+
+        let good_xml = format!(
+            r#"<ds:SignedInfo><ds:Reference URI="{}"></ds:Reference></ds:SignedInfo>"#,
+            expected_ref
+        );
+        let uris = extract_reference_uris(&good_xml);
+        assert_eq!(uris.len(), 1);
+        assert_eq!(uris[0], expected_ref, "URI must match assertion ID");
+
+        // Mismatched URI — would be rejected by the validator.
+        let bad_xml = r#"<ds:SignedInfo><ds:Reference URI="#_wrong_id"></ds:Reference></ds:SignedInfo>"#;
+        let bad_uris = extract_reference_uris(bad_xml);
+        assert_eq!(bad_uris.len(), 1);
+        assert_ne!(bad_uris[0], expected_ref, "mismatched URI must differ from expected");
     }
 }

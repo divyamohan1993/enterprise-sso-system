@@ -49,11 +49,11 @@ impl CircuitBreaker {
 
     /// Get current circuit state.
     pub fn state(&self) -> CircuitState {
-        let failures = self.failure_count.load(Ordering::Relaxed);
+        let failures = self.failure_count.load(Ordering::Acquire);
         if failures < self.threshold {
             return CircuitState::Closed;
         }
-        let last = self.last_failure_epoch_ms.load(Ordering::Relaxed);
+        let last = self.last_failure_epoch_ms.load(Ordering::Acquire);
         let elapsed = self.now_ms().saturating_sub(last);
         if elapsed >= self.reset_timeout_ms {
             CircuitState::HalfOpen
@@ -69,20 +69,52 @@ impl CircuitBreaker {
 
     /// Record a successful call — resets the failure counter.
     pub fn record_success(&self) {
-        let was_open = self.failure_count.load(Ordering::Relaxed) >= self.threshold;
-        self.failure_count.store(0, Ordering::Relaxed);
+        let was_open = self.failure_count.load(Ordering::Acquire) >= self.threshold;
+        self.failure_count.store(0, Ordering::Release);
         if was_open {
             crate::siem::SecurityEvent::circuit_breaker_closed(&self.service_name);
         }
     }
 
     /// Record a failed call.
+    ///
+    /// Uses saturating addition to prevent u32 wraparound. When the counter
+    /// reaches `u32::MAX` it stays there and emits a SIEM saturation event.
     pub fn record_failure(&self) {
-        let prev = self.failure_count.fetch_add(1, Ordering::Relaxed);
-        self.last_failure_epoch_ms.store(self.now_ms(), Ordering::Relaxed);
+        // Saturating increment via compare-and-swap loop to prevent wraparound.
+        let prev = loop {
+            let current = self.failure_count.load(Ordering::Acquire);
+            if current == u32::MAX {
+                // Already saturated — nothing to do
+                return;
+            }
+            let new = current.saturating_add(1);
+            match self.failure_count.compare_exchange_weak(
+                current,
+                new,
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
+                Ok(prev) => break prev,
+                Err(_) => continue, // CAS failed, retry
+            }
+        };
+
+        self.last_failure_epoch_ms.store(self.now_ms(), Ordering::Release);
+
         // Emit SIEM event when we cross the threshold into Open state
         if prev + 1 == self.threshold {
             crate::siem::SecurityEvent::circuit_breaker_opened(&self.service_name);
+        }
+
+        // Emit SIEM event when failure count saturates at u32::MAX
+        if prev + 1 == u32::MAX {
+            tracing::error!(
+                service = %self.service_name,
+                "circuit breaker failure count SATURATED at u32::MAX — \
+                 sustained failure, possible attack or total service loss"
+            );
+            crate::siem::SecurityEvent::circuit_breaker_saturated(&self.service_name);
         }
     }
 }

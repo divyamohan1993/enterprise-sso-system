@@ -78,6 +78,8 @@ pub struct ElevationRequest {
     pub denial_reason: Option<String>,
     /// Who approved the request (if approved/activated).
     pub approved_by: Option<Uuid>,
+    /// All distinct approvers who have signed off on this request.
+    pub approvers: Vec<Uuid>,
     /// Whether this was a break-glass emergency request.
     pub break_glass: bool,
 }
@@ -145,6 +147,10 @@ pub struct ElevationConstraints {
     /// Minimum seconds between successive elevation requests from the same
     /// user (default 300).
     pub cooldown_secs: u64,
+    /// Number of distinct approvers required before an elevation is approved.
+    /// Defaults to 1, but sensitive roles (SuperAdmin, GlobalAdmin) should
+    /// require 2 via [`min_approvers_for_role`].
+    pub required_approvers: u32,
 }
 
 impl Default for ElevationConstraints {
@@ -156,7 +162,19 @@ impl Default for ElevationConstraints {
             require_different_approver: true,
             allowed_roles: Vec::new(),
             cooldown_secs: DEFAULT_COOLDOWN_SECS,
+            required_approvers: 1,
         }
+    }
+}
+
+/// Returns the minimum number of distinct approvers required for a given role.
+///
+/// SuperAdmin and GlobalAdmin require dual approval (2 approvers); all other
+/// roles require a single approver.
+pub fn min_approvers_for_role(role: &str) -> u32 {
+    match role {
+        "SuperAdmin" | "GlobalAdmin" => 2,
+        _ => 1,
     }
 }
 
@@ -355,15 +373,21 @@ impl PimManager {
 
     /// Approve a pending elevation request.
     ///
+    /// For roles that require multiple approvers (e.g. SuperAdmin requires 2),
+    /// the request stays in `Pending` status until enough distinct approvers
+    /// have signed off.  Only then does it transition to `Approved`.
+    ///
     /// # Errors
     ///
     /// - Request not found or not in `Pending` status.
     /// - Self-approval attempted (constant-time comparison).
+    /// - Duplicate approver (same person approving twice).
     pub fn approve_elevation(
         &mut self,
         request_id: Uuid,
         approver_id: Uuid,
     ) -> Result<(), MilnetError> {
+        let required = self.constraints.required_approvers;
         let req = self.requests.get_mut(&request_id).ok_or_else(|| {
             MilnetError::CryptoVerification("elevation request not found".into())
         })?;
@@ -391,19 +415,50 @@ impl PimManager {
             ));
         }
 
-        req.status = ElevationStatus::Approved;
-        req.approved_by = Some(approver_id);
+        // Reject duplicate approvers (constant-time check for each existing approver).
+        for existing in &req.approvers {
+            if uuids_equal_ct(existing, &approver_id) {
+                return Err(MilnetError::CryptoVerification(
+                    "duplicate approver — each approver may only sign once".into(),
+                ));
+            }
+        }
 
-        emit_pim_event(
-            "elevation_approved",
-            crate::siem::Severity::Medium,
-            "success",
-            Some(req.requester_id),
-            Some(format!(
-                "request_id={} approver={}",
-                request_id, approver_id
-            )),
-        );
+        req.approvers.push(approver_id);
+
+        // Determine how many approvers are needed: use the role-specific
+        // minimum or the constraint-configured value, whichever is greater.
+        let role_min = min_approvers_for_role(&req.target_role);
+        let needed = required.max(role_min);
+
+        let collected = req.approvers.len() as u32;
+
+        if collected >= needed {
+            req.status = ElevationStatus::Approved;
+            req.approved_by = Some(approver_id);
+
+            emit_pim_event(
+                "elevation_approved",
+                crate::siem::Severity::Medium,
+                "success",
+                Some(req.requester_id),
+                Some(format!(
+                    "request_id={} approver={} total_approvers={}/{}",
+                    request_id, approver_id, collected, needed
+                )),
+            );
+        } else {
+            emit_pim_event(
+                "elevation_partial_approval",
+                crate::siem::Severity::Medium,
+                "success",
+                Some(req.requester_id),
+                Some(format!(
+                    "request_id={} approver={} approvals_collected={}/{}",
+                    request_id, approver_id, collected, needed
+                )),
+            );
+        }
 
         Ok(())
     }
@@ -753,6 +808,7 @@ impl PimManager {
             status: ElevationStatus::Activated,
             denied_by: None,
             denial_reason: None,
+            approvers: vec![user_id], // self-approved under break-glass
             approved_by: Some(user_id), // self-approved under break-glass
             break_glass: true,
         };
@@ -813,8 +869,10 @@ mod tests {
                 "SuperAdmin".into(),
                 "UserManager".into(),
                 "DeviceManager".into(),
+                "GlobalAdmin".into(),
             ],
             cooldown_secs: 0, // disable cooldown for tests
+            required_approvers: 1,
         })
     }
 
@@ -830,6 +888,7 @@ mod tests {
             denied_by: None,
             denial_reason: None,
             approved_by: None,
+            approvers: Vec::new(),
             break_glass: false,
         }
     }
@@ -840,7 +899,8 @@ mod tests {
     fn test_full_lifecycle() {
         let mut mgr = test_manager();
         let user = Uuid::new_v4();
-        let approver = Uuid::new_v4();
+        let approver1 = Uuid::new_v4();
+        let approver2 = Uuid::new_v4();
 
         let req = make_request(user, "SuperAdmin", 3600);
         let rid = mgr.request_elevation(req).unwrap();
@@ -848,13 +908,58 @@ mod tests {
         assert!(!mgr.is_elevated(user));
         assert_eq!(mgr.list_pending_requests().len(), 1);
 
-        mgr.approve_elevation(rid, approver).unwrap();
+        // SuperAdmin requires dual approval — first approver keeps it Pending.
+        mgr.approve_elevation(rid, approver1).unwrap();
+        assert_eq!(mgr.list_pending_requests().len(), 1);
+
+        // Second approver transitions to Approved.
+        mgr.approve_elevation(rid, approver2).unwrap();
         assert_eq!(mgr.list_pending_requests().len(), 0);
 
         let elev = mgr.activate_elevation(rid).unwrap();
         assert_eq!(elev.elevated_role, "SuperAdmin");
         assert!(mgr.is_elevated(user));
         assert_eq!(mgr.list_active_elevations().len(), 1);
+    }
+
+    #[test]
+    fn test_single_approver_role_lifecycle() {
+        let mut mgr = test_manager();
+        let user = Uuid::new_v4();
+        let approver = Uuid::new_v4();
+
+        // UserManager only requires 1 approver.
+        let req = make_request(user, "UserManager", 3600);
+        let rid = mgr.request_elevation(req).unwrap();
+
+        mgr.approve_elevation(rid, approver).unwrap();
+        assert_eq!(mgr.list_pending_requests().len(), 0);
+
+        let elev = mgr.activate_elevation(rid).unwrap();
+        assert_eq!(elev.elevated_role, "UserManager");
+        assert!(mgr.is_elevated(user));
+    }
+
+    #[test]
+    fn test_duplicate_approver_rejected() {
+        let mut mgr = test_manager();
+        let user = Uuid::new_v4();
+        let approver = Uuid::new_v4();
+
+        let req = make_request(user, "SuperAdmin", 3600);
+        let rid = mgr.request_elevation(req).unwrap();
+
+        mgr.approve_elevation(rid, approver).unwrap();
+        // Same approver cannot approve twice.
+        assert!(mgr.approve_elevation(rid, approver).is_err());
+    }
+
+    #[test]
+    fn test_min_approvers_for_role() {
+        assert_eq!(min_approvers_for_role("SuperAdmin"), 2);
+        assert_eq!(min_approvers_for_role("GlobalAdmin"), 2);
+        assert_eq!(min_approvers_for_role("UserManager"), 1);
+        assert_eq!(min_approvers_for_role("DeviceManager"), 1);
     }
 
     // ── 2. Empty justification rejected ────────────────────────────────
@@ -914,7 +1019,8 @@ mod tests {
         });
         let user = Uuid::new_v4();
 
-        let req = make_request(user, "SuperAdmin", 3600);
+        // Use a non-sensitive role that only requires 1 approver.
+        let req = make_request(user, "UserManager", 3600);
         let rid = mgr.request_elevation(req).unwrap();
 
         assert!(mgr.approve_elevation(rid, user).is_ok());
@@ -960,11 +1066,13 @@ mod tests {
     fn test_concurrent_elevation_blocked() {
         let mut mgr = test_manager();
         let user = Uuid::new_v4();
-        let approver = Uuid::new_v4();
+        let approver1 = Uuid::new_v4();
+        let approver2 = Uuid::new_v4();
 
         let req = make_request(user, "SuperAdmin", 3600);
         let rid = mgr.request_elevation(req).unwrap();
-        mgr.approve_elevation(rid, approver).unwrap();
+        mgr.approve_elevation(rid, approver1).unwrap();
+        mgr.approve_elevation(rid, approver2).unwrap();
         mgr.activate_elevation(rid).unwrap();
 
         // Second request should fail
@@ -978,11 +1086,13 @@ mod tests {
     fn test_revoke_elevation() {
         let mut mgr = test_manager();
         let user = Uuid::new_v4();
-        let approver = Uuid::new_v4();
+        let approver1 = Uuid::new_v4();
+        let approver2 = Uuid::new_v4();
 
         let req = make_request(user, "SuperAdmin", 3600);
         let rid = mgr.request_elevation(req).unwrap();
-        mgr.approve_elevation(rid, approver).unwrap();
+        mgr.approve_elevation(rid, approver1).unwrap();
+        mgr.approve_elevation(rid, approver2).unwrap();
         mgr.activate_elevation(rid).unwrap();
         assert!(mgr.is_elevated(user));
 
@@ -1026,11 +1136,13 @@ mod tests {
     fn test_action_cap_revokes() {
         let mut mgr = test_manager();
         let user = Uuid::new_v4();
-        let approver = Uuid::new_v4();
+        let approver1 = Uuid::new_v4();
+        let approver2 = Uuid::new_v4();
 
         let req = make_request(user, "SuperAdmin", 3600);
         let rid = mgr.request_elevation(req).unwrap();
-        mgr.approve_elevation(rid, approver).unwrap();
+        mgr.approve_elevation(rid, approver1).unwrap();
+        mgr.approve_elevation(rid, approver2).unwrap();
         let mut elev = mgr.activate_elevation(rid).unwrap();
         // Set a low action cap
         elev.max_actions = Some(2);
@@ -1120,11 +1232,13 @@ mod tests {
             ..ElevationConstraints::default()
         });
         let user = Uuid::new_v4();
-        let approver = Uuid::new_v4();
+        let approver1 = Uuid::new_v4();
+        let approver2 = Uuid::new_v4();
 
         let req = make_request(user, "SuperAdmin", 7200); // asks for 2 hours
         let rid = mgr.request_elevation(req).unwrap();
-        mgr.approve_elevation(rid, approver).unwrap();
+        mgr.approve_elevation(rid, approver1).unwrap();
+        mgr.approve_elevation(rid, approver2).unwrap();
         let elev = mgr.activate_elevation(rid).unwrap();
 
         let actual_duration = elev.expires_at - elev.activated_at;
@@ -1175,7 +1289,8 @@ mod tests {
         let mut mgr = test_manager();
         let user1 = Uuid::new_v4();
         let user2 = Uuid::new_v4();
-        let approver = Uuid::new_v4();
+        let approver1 = Uuid::new_v4();
+        let approver2 = Uuid::new_v4();
 
         let req1 = make_request(user1, "SuperAdmin", 3600);
         let req2 = make_request(user2, "UserManager", 3600);
@@ -1184,7 +1299,8 @@ mod tests {
 
         assert_eq!(mgr.list_pending_requests().len(), 2);
 
-        mgr.approve_elevation(rid1, approver).unwrap();
+        mgr.approve_elevation(rid1, approver1).unwrap();
+        mgr.approve_elevation(rid1, approver2).unwrap();
         mgr.activate_elevation(rid1).unwrap();
 
         assert_eq!(mgr.list_pending_requests().len(), 1);
@@ -1215,6 +1331,7 @@ mod tests {
         assert!(c.require_different_approver);
         assert!(c.allowed_roles.is_empty());
         assert_eq!(c.cooldown_secs, DEFAULT_COOLDOWN_SECS);
+        assert_eq!(c.required_approvers, 1);
     }
 
     // ── 25. ActiveElevation helpers ────────────────────────────────────
@@ -1244,5 +1361,97 @@ mod tests {
             ..elev
         };
         assert!(!no_cap.is_action_cap_reached());
+    }
+
+    // ── TEST GROUP 5: PIM dual-approval tests ────────────────────────────
+
+    #[test]
+    fn test_superadmin_requires_two_approvers() {
+        assert_eq!(
+            min_approvers_for_role("SuperAdmin"),
+            2,
+            "SuperAdmin must require 2 approvers"
+        );
+        assert_eq!(
+            min_approvers_for_role("GlobalAdmin"),
+            2,
+            "GlobalAdmin must require 2 approvers"
+        );
+    }
+
+    #[test]
+    fn test_single_approval_for_superadmin_stays_pending() {
+        let mut mgr = test_manager();
+        let user = Uuid::new_v4();
+        let approver1 = Uuid::new_v4();
+
+        let req = make_request(user, "SuperAdmin", 3600);
+        let rid = mgr.request_elevation(req).unwrap();
+
+        // Single approval is not enough for SuperAdmin.
+        mgr.approve_elevation(rid, approver1).unwrap();
+
+        // Request must still be pending (not approved).
+        let pending = mgr.list_pending_requests();
+        assert_eq!(pending.len(), 1, "SuperAdmin with 1 approver must remain pending");
+        assert_eq!(pending[0].status, ElevationStatus::Pending);
+    }
+
+    #[test]
+    fn test_two_distinct_approvers_for_superadmin_succeeds() {
+        let mut mgr = test_manager();
+        let user = Uuid::new_v4();
+        let approver1 = Uuid::new_v4();
+        let approver2 = Uuid::new_v4();
+
+        let req = make_request(user, "SuperAdmin", 3600);
+        let rid = mgr.request_elevation(req).unwrap();
+
+        mgr.approve_elevation(rid, approver1).unwrap();
+        mgr.approve_elevation(rid, approver2).unwrap();
+
+        // After two distinct approvers, the request should be Approved.
+        let pending = mgr.list_pending_requests();
+        assert_eq!(pending.len(), 0, "SuperAdmin with 2 approvers must leave pending state");
+    }
+
+    #[test]
+    fn test_same_approver_twice_rejected_for_superadmin() {
+        let mut mgr = test_manager();
+        let user = Uuid::new_v4();
+        let approver = Uuid::new_v4();
+
+        let req = make_request(user, "SuperAdmin", 3600);
+        let rid = mgr.request_elevation(req).unwrap();
+
+        mgr.approve_elevation(rid, approver).unwrap();
+        // Same approver trying again must be rejected.
+        let result = mgr.approve_elevation(rid, approver);
+        assert!(result.is_err(), "same approver twice must be rejected");
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("duplicate approver"),
+            "error must mention duplicate approver, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_non_superadmin_works_with_single_approver() {
+        let mut mgr = test_manager();
+        let user = Uuid::new_v4();
+        let approver = Uuid::new_v4();
+
+        // UserManager requires only 1 approver.
+        let req = make_request(user, "UserManager", 3600);
+        let rid = mgr.request_elevation(req).unwrap();
+
+        mgr.approve_elevation(rid, approver).unwrap();
+
+        // Should be fully approved and activatable with just 1 approver.
+        let pending = mgr.list_pending_requests();
+        assert_eq!(pending.len(), 0, "UserManager should be approved with 1 approver");
+
+        let elev = mgr.activate_elevation(rid).unwrap();
+        assert_eq!(elev.elevated_role, "UserManager");
     }
 }

@@ -8,6 +8,13 @@
 use common::backup::{export_backup, import_backup};
 use crypto::threshold::{dkg, threshold_sign, verify_group_signature, DkgResult};
 
+/// DR safety margin for FROST nonce counters on disaster recovery restore.
+/// FROST nonce reuse enables private key extraction (two signatures with the
+/// same nonce reveal the signing share), so on DR restore we MUST advance
+/// every nonce counter by at least this margin to guarantee no nonce is ever
+/// reused from a pre-disaster signing session.
+const DR_SAFETY_MARGIN: u64 = 10_000;
+
 /// Generate a random 32-byte KEK for testing.
 fn random_kek() -> [u8; 32] {
     let mut kek = [0u8; 32];
@@ -226,10 +233,12 @@ fn deserialize_frost_shares(data: &[u8]) -> Result<DkgResult, String> {
         let key_package = KeyPackage::deserialize(key_bytes)
             .map_err(|e| format!("key deser: {e}"))?;
 
+        // DR restore: advance nonce counter by DR_SAFETY_MARGIN to prevent
+        // FROST nonce reuse. Nonce reuse = private key extraction.
         shares.push(SignerShare {
             identifier,
             key_package,
-            nonce_counter: std::sync::atomic::AtomicU64::new(0),
+            nonce_counter: std::sync::atomic::AtomicU64::new(DR_SAFETY_MARGIN),
         });
     }
 
@@ -429,10 +438,12 @@ fn test_partial_share_recovery() {
         let key_package = frost::keys::KeyPackage::deserialize(key_bytes)
             .expect("deserialize key package");
 
+        // DR restore: advance nonce counter by DR_SAFETY_MARGIN to prevent
+        // FROST nonce reuse. Nonce reuse = private key extraction.
         restored_shares.push(crypto::threshold::SignerShare {
             identifier,
             key_package,
-            nonce_counter: std::sync::atomic::AtomicU64::new(0),
+            nonce_counter: std::sync::atomic::AtomicU64::new(DR_SAFETY_MARGIN),
         });
     }
 

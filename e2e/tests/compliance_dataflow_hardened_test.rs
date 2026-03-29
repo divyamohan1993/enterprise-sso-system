@@ -1353,7 +1353,7 @@ mod duress_lockdown {
     #[test]
     fn normal_pin_returns_normal() {
         let user_id = Uuid::new_v4();
-        let config = DuressConfig::new(user_id, b"correct-pin-1234", b"duress-pin-5678");
+        let config = DuressConfig::new(user_id, b"correct-pin-1234", b"duress-pin-5678").unwrap();
 
         let result = config.verify_pin(b"correct-pin-1234");
         assert_eq!(result, PinVerification::Normal);
@@ -1362,7 +1362,7 @@ mod duress_lockdown {
     #[test]
     fn duress_pin_returns_duress() {
         let user_id = Uuid::new_v4();
-        let config = DuressConfig::new(user_id, b"correct-pin-1234", b"duress-pin-5678");
+        let config = DuressConfig::new(user_id, b"correct-pin-1234", b"duress-pin-5678").unwrap();
 
         let result = config.verify_pin(b"duress-pin-5678");
         assert_eq!(result, PinVerification::Duress);
@@ -1371,7 +1371,7 @@ mod duress_lockdown {
     #[test]
     fn wrong_pin_returns_invalid() {
         let user_id = Uuid::new_v4();
-        let config = DuressConfig::new(user_id, b"correct-pin-1234", b"duress-pin-5678");
+        let config = DuressConfig::new(user_id, b"correct-pin-1234", b"duress-pin-5678").unwrap();
 
         let result = config.verify_pin(b"wrong-pin-9999");
         assert_eq!(result, PinVerification::Invalid);
@@ -1380,7 +1380,7 @@ mod duress_lockdown {
     #[test]
     fn duress_alert_generation() {
         let user_id = Uuid::new_v4();
-        let config = DuressConfig::new(user_id, b"normal", b"duress");
+        let config = DuressConfig::new(user_id, b"normal", b"duress").unwrap();
 
         let result = config.verify_pin(b"duress");
         assert_eq!(result, PinVerification::Duress);
@@ -1403,7 +1403,7 @@ mod duress_lockdown {
         // Both normal and duress verification must take similar time
         // to prevent timing side-channel attacks on a public-facing system
         let user_id = Uuid::new_v4();
-        let config = DuressConfig::new(user_id, b"normal-pin", b"duress-pin");
+        let config = DuressConfig::new(user_id, b"normal-pin", b"duress-pin").unwrap();
 
         // Verify both paths execute (correctness, not timing)
         let normal = config.verify_pin(b"normal-pin");
@@ -1763,6 +1763,13 @@ mod dpop_binding {
     use super::*;
     use crypto::dpop::*;
 
+    fn now_secs() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
     #[test]
     fn dpop_proof_verifies_with_correct_key() {
         run_with_large_stack(|| {
@@ -1771,7 +1778,7 @@ mod dpop_binding {
             let expected_hash = dpop_key_hash(vk_bytes.as_ref());
 
             let claims = b"token-claims-data";
-            let timestamp = now_us();
+            let timestamp = now_secs();
             let proof = generate_dpop_proof(&sk, claims, timestamp);
 
             assert!(
@@ -1791,7 +1798,7 @@ mod dpop_binding {
             let hash_b = dpop_key_hash(vk_b_bytes.as_ref());
 
             let claims = b"stolen-token";
-            let timestamp = now_us();
+            let timestamp = now_secs();
             let proof = generate_dpop_proof(&sk_a, claims, timestamp);
 
             // Attacker has user A's token but uses user B's DPoP key

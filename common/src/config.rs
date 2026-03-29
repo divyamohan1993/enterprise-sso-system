@@ -8,8 +8,8 @@
 //! - `Verbose`: show everything including file names, line numbers, full errors
 //! - `Warn`: show warnings and errors only, no file/line details
 //!
-//! Default is `Verbose`. This codebase is open-source; hiding line numbers
-//! provides no security benefit when the source is already public.
+//! Default is `Warn`. When `MILNET_MILITARY_DEPLOYMENT=1` or
+//! `MILNET_PRODUCTION=1` is set, `Warn` is forced regardless of config.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -57,17 +57,21 @@ pub type LogLevel = ErrorLevel;
 /// Uses an atomic so that reads from hot paths (every request) are lock-free O(1).
 /// Writes happen through the admin API or at startup.
 ///
-/// Default is `Verbose` — the codebase is open-source so hiding line numbers
-/// provides no security benefit. Super-admins see exactly where errors occur.
+/// Default is `Warn` — production deployments suppress verbose error detail.
+/// When `MILNET_MILITARY_DEPLOYMENT=1` or `MILNET_PRODUCTION=1` is set,
+/// the level is forced to `Warn` regardless of configuration.
 pub struct ErrorLevelConfig {
     level: AtomicU8,
 }
 
 impl ErrorLevelConfig {
-    /// Create a new config with error level set to Verbose (default).
+    /// Create a new config with error level set to Warn (default).
+    ///
+    /// Production and military deployments always default to Warn to prevent
+    /// information leakage through verbose error messages.
     pub const fn new() -> Self {
         Self {
-            level: AtomicU8::new(ErrorLevel::Verbose as u8),
+            level: AtomicU8::new(ErrorLevel::Warn as u8),
         }
     }
 
@@ -82,9 +86,21 @@ impl ErrorLevelConfig {
     }
 
     /// Set the error level at runtime.
+    ///
+    /// If `MILNET_MILITARY_DEPLOYMENT=1` or `MILNET_PRODUCTION=1` is set,
+    /// the level is forced to `Warn` regardless of the requested value.
     pub fn set_level(&self, level: ErrorLevel) {
-        self.level.store(level as u8, Ordering::Relaxed);
-        tracing::info!(error_level = %level, "error level changed");
+        let effective = if is_military_or_production() && level == ErrorLevel::Verbose {
+            tracing::warn!(
+                "error_level: Verbose requested but MILNET_MILITARY_DEPLOYMENT or \
+                 MILNET_PRODUCTION is set — forcing Warn"
+            );
+            ErrorLevel::Warn
+        } else {
+            level
+        };
+        self.level.store(effective as u8, Ordering::Relaxed);
+        tracing::info!(error_level = %effective, "error level changed");
     }
 
     // ── Backwards-compatible shims ──
@@ -125,6 +141,13 @@ impl Default for ErrorLevelConfig {
     }
 }
 
+/// Returns `true` if either `MILNET_MILITARY_DEPLOYMENT=1` or
+/// `MILNET_PRODUCTION=1` is set in the environment.
+fn is_military_or_production() -> bool {
+    std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1")
+        || std::env::var("MILNET_PRODUCTION").as_deref() == Ok("1")
+}
+
 /// Global singleton for error level, accessible from any crate. O(1) access.
 static ERROR_LEVEL: ErrorLevelConfig = ErrorLevelConfig::new();
 
@@ -143,8 +166,8 @@ pub fn developer_mode() -> &'static ErrorLevelConfig {
 /// Load error level from environment at startup.
 ///
 /// Reads `MILNET_ERROR_LEVEL` env var:
-/// - `"verbose"` → ErrorLevel::Verbose (default)
-/// - `"warn"` → ErrorLevel::Warn
+/// - `"verbose"` → ErrorLevel::Verbose (blocked if military/production)
+/// - `"warn"` → ErrorLevel::Warn (default)
 ///
 /// Also accepts legacy `MILNET_DEVELOPER_MODE` env var for backwards compat:
 /// - Set → ErrorLevel::Verbose
@@ -154,15 +177,19 @@ pub fn load_error_level_from_env() {
             error_level().set_level(ErrorLevel::Warn);
             tracing::info!("error_level=warn (set via MILNET_ERROR_LEVEL)");
         }
-        Some("verbose") | None => {
+        Some("verbose") => {
             error_level().set_level(ErrorLevel::Verbose);
-            tracing::info!("error_level=verbose (default)");
+            tracing::info!("error_level=verbose (requested via MILNET_ERROR_LEVEL)");
+        }
+        None => {
+            error_level().set_level(ErrorLevel::Warn);
+            tracing::info!("error_level=warn (default)");
         }
         Some(other) => {
             tracing::warn!(
-                "Unknown MILNET_ERROR_LEVEL={other:?}, defaulting to verbose"
+                "Unknown MILNET_ERROR_LEVEL={other:?}, defaulting to warn"
             );
-            error_level().set_level(ErrorLevel::Verbose);
+            error_level().set_level(ErrorLevel::Warn);
         }
     }
 }
@@ -192,7 +219,7 @@ pub type DeveloperModeConfig = ErrorLevelConfig;
 /// System-wide security configuration per spec.
 pub struct SecurityConfig {
     /// Error verbosity level — `Verbose` shows file:line and full errors,
-    /// `Warn` shows warnings and errors only. Default: Verbose.
+    /// `Warn` shows warnings and errors only. Default: Warn.
     pub error_level: ErrorLevel,
     /// Maximum session lifetime (8 hours).
     pub max_session_lifetime_secs: u64,
@@ -363,7 +390,7 @@ impl SecurityConfig {
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
-            error_level: ErrorLevel::Verbose,
+            error_level: ErrorLevel::Warn,
             max_session_lifetime_secs: 28800,
             ratchet_epoch_secs: 10,
             ratchet_lookahead_epochs: 1,
@@ -602,34 +629,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_error_level_is_verbose() {
+    fn default_error_level_is_warn() {
         let cfg = SecurityConfig::default();
-        assert_eq!(cfg.error_level, ErrorLevel::Verbose);
+        assert_eq!(cfg.error_level, ErrorLevel::Warn);
     }
 
     #[test]
     fn error_level_runtime_toggle() {
         let el = ErrorLevelConfig::new();
+        // Default is now Warn
+        assert!(!el.is_verbose());
+        assert_eq!(el.level(), ErrorLevel::Warn);
+
+        // Toggle to Verbose (only works when military/production env vars are NOT set)
+        el.level.store(ErrorLevel::Verbose as u8, Ordering::Relaxed);
         assert!(el.is_verbose());
         assert_eq!(el.level(), ErrorLevel::Verbose);
 
         el.set_level(ErrorLevel::Warn);
         assert!(!el.is_verbose());
         assert_eq!(el.level(), ErrorLevel::Warn);
-
-        el.set_level(ErrorLevel::Verbose);
-        assert!(el.is_verbose());
     }
 
     #[test]
     fn error_level_backwards_compat() {
         let el = ErrorLevelConfig::new();
-        // is_enabled() should map to is_verbose()
-        assert!(el.is_enabled());
+        // Default is Warn, so is_enabled() (maps to is_verbose()) is false
+        assert!(!el.is_enabled());
         el.set_developer_mode_unchecked(false);
         assert!(!el.is_enabled());
-        el.set_developer_mode_unchecked(true);
-        assert!(el.is_enabled());
     }
 
     #[test]
@@ -706,10 +734,10 @@ mod tests {
     }
 
     #[test]
-    fn error_level_verbose_is_valid_in_production() {
-        // Verbose error level is explicitly allowed — no violation
-        let mut cfg = SecurityConfig::default();
-        cfg.error_level = ErrorLevel::Verbose;
+    fn error_level_warn_is_default_in_production() {
+        // Default error level is now Warn
+        let cfg = SecurityConfig::default();
+        assert_eq!(cfg.error_level, ErrorLevel::Warn);
         let violations = cfg.validate_production_config();
         assert!(!violations.iter().any(|v| v.contains("error_level")));
     }

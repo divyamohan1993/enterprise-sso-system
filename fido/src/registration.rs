@@ -1,7 +1,11 @@
 use crate::types::*;
 use crate::verification;
 use std::collections::HashMap;
+use std::time::Instant;
 use uuid::Uuid;
+
+/// Maximum age for a FIDO2 challenge before it is considered expired (seconds).
+const CHALLENGE_MAX_AGE_SECS: u64 = 60;
 
 /// Create registration options for a new FIDO2 credential.
 ///
@@ -91,7 +95,7 @@ pub fn create_registration_options_with_excludes(
 /// In-memory credential store for FIDO2 credentials.
 pub struct CredentialStore {
     credentials: HashMap<Vec<u8>, StoredCredential>,
-    challenges: HashMap<Vec<u8>, Uuid>,
+    challenges: HashMap<Vec<u8>, (Uuid, Instant)>,
 }
 
 impl CredentialStore {
@@ -103,21 +107,34 @@ impl CredentialStore {
     }
 
     /// Store a pending challenge associated with a user.
+    ///
+    /// Runs garbage collection of expired challenges before inserting.
     pub fn store_challenge(&mut self, challenge: &[u8], user_id: Uuid) {
-        self.challenges.insert(challenge.to_vec(), user_id);
+        self.cleanup_expired_challenges();
+        self.challenges.insert(challenge.to_vec(), (user_id, Instant::now()));
     }
 
     /// Consume and validate a challenge, returning the associated user ID.
+    ///
+    /// Rejects challenges older than `CHALLENGE_MAX_AGE_SECS` seconds.
     pub fn consume_challenge(&mut self, challenge: &[u8]) -> Option<Uuid> {
-        self.challenges.remove(challenge)
+        let (user_id, created_at) = self.challenges.remove(challenge)?;
+        if created_at.elapsed().as_secs() > CHALLENGE_MAX_AGE_SECS {
+            // Challenge expired — treat as if it never existed.
+            None
+        } else {
+            Some(user_id)
+        }
     }
 
     /// Consume a pending challenge for a specific user, returning true if one was found.
-    /// This removes the first challenge associated with the given user ID.
+    /// This removes the first non-expired challenge associated with the given user ID.
     pub fn consume_challenge_for_user(&mut self, user_id: &Uuid) -> bool {
         let key = self.challenges
             .iter()
-            .find(|(_, uid)| *uid == user_id)
+            .find(|(_, (uid, created_at))| {
+                *uid == *user_id && created_at.elapsed().as_secs() <= CHALLENGE_MAX_AGE_SECS
+            })
             .map(|(k, _)| k.clone());
         if let Some(k) = key {
             self.challenges.remove(&k);
@@ -127,9 +144,18 @@ impl CredentialStore {
         }
     }
 
-    /// Check whether a pending challenge exists for the given user.
+    /// Check whether a non-expired pending challenge exists for the given user.
     pub fn has_pending_challenge(&self, user_id: &Uuid) -> bool {
-        self.challenges.values().any(|uid| uid == user_id)
+        self.challenges.values().any(|(uid, created_at)| {
+            uid == user_id && created_at.elapsed().as_secs() <= CHALLENGE_MAX_AGE_SECS
+        })
+    }
+
+    /// Remove all expired challenges from the store.
+    pub fn cleanup_expired_challenges(&mut self) {
+        self.challenges.retain(|_, (_, created_at)| {
+            created_at.elapsed().as_secs() <= CHALLENGE_MAX_AGE_SECS
+        });
     }
 
     /// Store a completed credential registration.
@@ -169,7 +195,7 @@ impl CredentialStore {
     /// Used for GDPR Article 17 right-to-erasure compliance.
     pub fn remove_user_credentials(&mut self, user_id: &Uuid) {
         self.credentials.retain(|_, cred| cred.user_id != *user_id);
-        self.challenges.retain(|_, uid| uid != user_id);
+        self.challenges.retain(|_, (uid, _)| uid != user_id);
     }
 }
 

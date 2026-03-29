@@ -238,15 +238,20 @@ impl SessionRecorder {
             return Err(RecordingError::SessionExpired(session_id));
         }
 
-        // Dual-control check: event types that require 2-person approval are
-        // flagged here.  In a full deployment, this would block until a second
-        // approver signs off; for now we emit an alert.
+        // Dual-control enforcement: event types that require 2-person approval
+        // are BLOCKED until a second approver signs off.  The caller must
+        // obtain a second approver signature and retry via a dual-control-aware
+        // path before the operation can proceed.
         if self.policy.dual_control_actions.contains(&event_type) {
-            tracing::warn!(
+            tracing::error!(
                 session_id = %session_id,
                 event_type = ?event_type,
-                "PAM: dual-control action detected — requires second approver"
+                "PAM: dual-control action BLOCKED — requires second approver signature"
             );
+            crate::siem::SecurityEvent::tamper_detected(
+                &format!("dual-control action {:?} blocked in session {} — no second approver", event_type, session_id),
+            );
+            return Err(RecordingError::DualControlRequired(event_type));
         }
 
         // Privilege escalation alerting.
@@ -448,6 +453,8 @@ pub enum RecordingError {
     SessionExpired(Uuid),
     #[error("export failed: {0}")]
     ExportFailed(String),
+    #[error("dual-control required: action {0:?} requires a second approver signature before execution")]
+    DualControlRequired(SessionEventType),
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -607,6 +614,114 @@ mod tests {
             1061,
         );
         assert!(matches!(result, Err(RecordingError::SessionExpired(_))));
+    }
+
+    // ── TEST GROUP 4: Dual-control blocking tests ──────────────────────────
+
+    #[test]
+    fn test_dual_control_action_returns_error() {
+        let recorder = make_recorder();
+        let sid = Uuid::new_v4();
+        let uid = Uuid::new_v4();
+
+        recorder
+            .start_recording(sid, uid, RecordingType::Admin, 1000)
+            .unwrap();
+
+        // KeyAccessed is a dual-control action in the default policy.
+        let result = recorder.record_event(
+            sid,
+            SessionEventType::KeyAccessed,
+            "access HSM key".into(),
+            "10.0.0.1".into(),
+            1001,
+        );
+        assert!(
+            matches!(result, Err(RecordingError::DualControlRequired(SessionEventType::KeyAccessed))),
+            "KeyAccessed must be blocked as dual-control action"
+        );
+    }
+
+    #[test]
+    fn test_dual_control_policy_modified_blocked() {
+        let recorder = make_recorder();
+        let sid = Uuid::new_v4();
+        let uid = Uuid::new_v4();
+
+        recorder
+            .start_recording(sid, uid, RecordingType::Privileged, 1000)
+            .unwrap();
+
+        // PolicyModified is also a dual-control action in the default policy.
+        let result = recorder.record_event(
+            sid,
+            SessionEventType::PolicyModified,
+            "change firewall rules".into(),
+            "10.0.0.2".into(),
+            1001,
+        );
+        assert!(
+            matches!(result, Err(RecordingError::DualControlRequired(SessionEventType::PolicyModified))),
+            "PolicyModified must be blocked as dual-control action"
+        );
+    }
+
+    #[test]
+    fn test_non_dual_control_action_succeeds() {
+        let recorder = make_recorder();
+        let sid = Uuid::new_v4();
+        let uid = Uuid::new_v4();
+
+        recorder
+            .start_recording(sid, uid, RecordingType::Admin, 1000)
+            .unwrap();
+
+        // CommandExecuted is NOT a dual-control action — should succeed.
+        let result = recorder.record_event(
+            sid,
+            SessionEventType::CommandExecuted,
+            "ls -la".into(),
+            "10.0.0.1".into(),
+            1001,
+        );
+        assert!(result.is_ok(), "non-dual-control action must succeed");
+
+        // ResourceAccessed is also not dual-control.
+        let result2 = recorder.record_event(
+            sid,
+            SessionEventType::ResourceAccessed,
+            "read config".into(),
+            "10.0.0.1".into(),
+            1002,
+        );
+        assert!(result2.is_ok(), "ResourceAccessed must succeed");
+    }
+
+    #[test]
+    fn test_dual_control_error_carries_correct_event_type() {
+        let recorder = make_recorder();
+        let sid = Uuid::new_v4();
+        let uid = Uuid::new_v4();
+
+        recorder
+            .start_recording(sid, uid, RecordingType::Admin, 1000)
+            .unwrap();
+
+        let result = recorder.record_event(
+            sid,
+            SessionEventType::KeyAccessed,
+            "attempt key access".into(),
+            "10.0.0.1".into(),
+            1001,
+        );
+
+        match result {
+            Err(RecordingError::DualControlRequired(event_type)) => {
+                assert_eq!(event_type, SessionEventType::KeyAccessed,
+                    "error must carry the exact event type that was blocked");
+            }
+            other => panic!("expected DualControlRequired, got: {:?}", other),
+        }
     }
 
     #[test]

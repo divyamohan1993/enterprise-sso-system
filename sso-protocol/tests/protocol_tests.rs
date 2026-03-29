@@ -138,7 +138,7 @@ fn test_id_token_is_valid_jwt_mldsa87() {
         assert_eq!(claims.tier, 2); // default tier
 
         // Verify ML-DSA-87 signature using the verifying key
-        let verified_claims = tokens::verify_id_token(&token, signing_key.verifying_key())
+        let verified_claims = tokens::verify_id_token_with_audience(&token, signing_key.verifying_key(), "client-abc", true)
             .expect("ML-DSA-87 signature must be valid");
         assert_eq!(verified_claims.sub, user_id.to_string());
     });
@@ -196,7 +196,7 @@ fn test_tier_in_jwt() {
             1,
         );
 
-        let claims = tokens::verify_id_token(&token, signing_key.verifying_key()).unwrap();
+        let claims = tokens::verify_id_token_with_audience(&token, signing_key.verifying_key(), "client-abc", true).unwrap();
         assert_eq!(claims.tier, 1);
         assert_eq!(claims.sub, user_id.to_string());
     });
@@ -277,7 +277,7 @@ fn test_token_claims_include_required_fields() {
             Some("nonce-123".into()),
             &signing_key,
         );
-        let claims = tokens::verify_id_token(&token, signing_key.verifying_key()).unwrap();
+        let claims = tokens::verify_id_token_with_audience(&token, signing_key.verifying_key(), "client-id", true).unwrap();
         // All required OIDC fields present
         assert_eq!(claims.iss, "https://issuer.example.com");
         assert_eq!(claims.sub, user_id.to_string());
@@ -321,7 +321,7 @@ fn test_default_tier_is_2() {
             &signing_key,
         );
 
-        let claims = tokens::verify_id_token(&token, signing_key.verifying_key()).unwrap();
+        let claims = tokens::verify_id_token_with_audience(&token, signing_key.verifying_key(), "client-xyz", true).unwrap();
         assert_eq!(claims.tier, 2, "Default tier should be Operational (2)");
     });
 }
@@ -335,7 +335,7 @@ fn test_mldsa87_wrong_key_rejects() {
 
         let token = tokens::create_id_token("https://iss", &user_id, "c", None, &key1);
         // Verifying with a different key's verifying key must fail
-        let result = tokens::verify_id_token(&token, key2.verifying_key());
+        let result = tokens::verify_id_token_with_audience(&token, key2.verifying_key(), "c", true);
         assert!(result.is_err(), "ML-DSA-87 verification must fail with wrong verifying key");
     });
 }

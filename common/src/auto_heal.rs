@@ -5,8 +5,12 @@
 //! Follower recovery: auto-rejoin on restart, Raft log sync.
 
 use crate::raft::{ClusterCommand, NodeId};
+use crate::siem::SecurityEvent;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
+
+/// Number of consecutive quorum failures before escalating to incident response.
+const QUORUM_LOSS_ESCALATION_THRESHOLD: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -103,6 +107,8 @@ impl PeerState {
 pub struct AutoHealer {
     config: AutoHealConfig,
     peers: HashMap<NodeId, PeerState>,
+    /// Consecutive quorum check failures (resets on quorum recovery).
+    consecutive_quorum_failures: u32,
 }
 
 impl AutoHealer {
@@ -110,6 +116,7 @@ impl AutoHealer {
         Self {
             config,
             peers: HashMap::new(),
+            consecutive_quorum_failures: 0,
         }
     }
 
@@ -250,9 +257,75 @@ impl AutoHealer {
     }
 
     /// Check if we have quorum (majority of total peers + self are reachable).
-    pub fn has_quorum(&self, total_including_self: usize) -> bool {
+    ///
+    /// When quorum is lost, emits a CRITICAL SIEM event and increments the
+    /// consecutive-failure counter.  After [`QUORUM_LOSS_ESCALATION_THRESHOLD`]
+    /// consecutive failures, triggers incident-response escalation.
+    pub fn has_quorum(&mut self, total_including_self: usize) -> bool {
         let reachable = self.healthy_count() + 1; // +1 for self
-        reachable > total_including_self / 2
+        let quorum_ok = reachable > total_including_self / 2;
+
+        if quorum_ok {
+            if self.consecutive_quorum_failures > 0 {
+                tracing::info!(
+                    consecutive_failures = self.consecutive_quorum_failures,
+                    "quorum restored after {} consecutive failures",
+                    self.consecutive_quorum_failures
+                );
+            }
+            self.consecutive_quorum_failures = 0;
+        } else {
+            self.consecutive_quorum_failures += 1;
+
+            tracing::error!(
+                reachable = reachable,
+                total = total_including_self,
+                consecutive_failures = self.consecutive_quorum_failures,
+                "QUORUM LOST — cluster cannot reach majority"
+            );
+
+            // Emit CRITICAL SIEM event on every quorum loss.
+            let event = SecurityEvent {
+                timestamp: SecurityEvent::now_iso8601(),
+                category: "cluster",
+                action: "quorum_lost",
+                severity: crate::siem::Severity::Critical,
+                outcome: "failure",
+                user_id: None,
+                source_ip: None,
+                detail: Some(format!(
+                    "reachable={}/{} consecutive_failures={}",
+                    reachable, total_including_self, self.consecutive_quorum_failures
+                )),
+            };
+            event.emit();
+
+            // Escalate to incident response after threshold consecutive failures.
+            if self.consecutive_quorum_failures >= QUORUM_LOSS_ESCALATION_THRESHOLD {
+                tracing::error!(
+                    threshold = QUORUM_LOSS_ESCALATION_THRESHOLD,
+                    consecutive_failures = self.consecutive_quorum_failures,
+                    "INCIDENT RESPONSE ESCALATION — quorum lost for {} consecutive checks",
+                    self.consecutive_quorum_failures
+                );
+                let escalation = SecurityEvent {
+                    timestamp: SecurityEvent::now_iso8601(),
+                    category: "cluster",
+                    action: "quorum_loss_escalation",
+                    severity: crate::siem::Severity::Critical,
+                    outcome: "failure",
+                    user_id: None,
+                    source_ip: None,
+                    detail: Some(format!(
+                        "incident_response_triggered after {} consecutive quorum failures",
+                        self.consecutive_quorum_failures
+                    )),
+                };
+                escalation.emit();
+            }
+        }
+
+        quorum_ok
     }
 
     /// Get health addresses for all peers that need probing.

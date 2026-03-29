@@ -42,6 +42,13 @@ fn run_with_large_stack<F: FnOnce() + Send + 'static>(f: F) {
         .expect("thread panicked");
 }
 
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
 fn random_key_32() -> [u8; 32] {
     let mut k = [0u8; 32];
     getrandom::getrandom(&mut k).expect("getrandom failed");
@@ -564,7 +571,7 @@ fn dpop_proof_verify_correct_key() {
         let vk_bytes = vk.encode();
         let expected_hash = dpop_key_hash(vk_bytes.as_ref());
         let claims = b"POST /token";
-        let timestamp = 1_000_000i64;
+        let timestamp = now_secs();
 
         let proof = generate_dpop_proof(&sk, claims, timestamp);
         assert!(
@@ -582,7 +589,7 @@ fn dpop_proof_wrong_key_fails() {
         let vk2_bytes = vk2.encode();
         let hash2 = dpop_key_hash(vk2_bytes.as_ref());
         let claims = b"GET /resource";
-        let timestamp = 2_000_000i64;
+        let timestamp = now_secs();
 
         let proof = generate_dpop_proof(&sk1, claims, timestamp);
         assert!(
@@ -600,10 +607,11 @@ fn dpop_proof_expired_timestamp_fails() {
         let expected_hash = dpop_key_hash(vk_bytes.as_ref());
         let claims = b"POST /auth";
 
-        let proof = generate_dpop_proof(&sk, claims, 1000);
-        // Verify with a different timestamp (simulates expired proof)
+        let ts = now_secs();
+        let proof = generate_dpop_proof(&sk, claims, ts);
+        // Verify with a wildly different timestamp — signature won't match
         assert!(
-            !verify_dpop_proof(&vk, &proof, claims, 9999, &expected_hash),
+            !verify_dpop_proof(&vk, &proof, claims, ts + 9999, &expected_hash),
             "DPoP proof must fail with mismatched (expired) timestamp"
         );
     });
@@ -615,7 +623,7 @@ fn dpop_proof_wrong_claims_fails() {
         let (sk, vk) = generate_dpop_keypair_raw();
         let vk_bytes = vk.encode();
         let expected_hash = dpop_key_hash(vk_bytes.as_ref());
-        let timestamp = 3_000_000i64;
+        let timestamp = now_secs();
 
         let proof = generate_dpop_proof(&sk, b"original claims", timestamp);
         assert!(

@@ -140,19 +140,31 @@ fn verify_pin_hash(pin: &[u8], stored: &[u8], salt: &[u8; 32]) -> bool {
 
 impl DuressConfig {
     /// Create a new DuressConfig using HKDF-SHA512 (v2) PIN hashing.
-    pub fn new(user_id: Uuid, normal_pin: &[u8], duress_pin: &[u8]) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `normal_pin` and `duress_pin` produce the same
+    /// hash (i.e. the PINs are identical).  The duress PIN must be distinct
+    /// from the normal PIN to avoid accidental lockdown.
+    pub fn new(user_id: Uuid, normal_pin: &[u8], duress_pin: &[u8]) -> Result<Self, &'static str> {
         let mut salt = [0u8; 32];
         getrandom::getrandom(&mut salt).expect("OS entropy source must be available");
 
         let normal_pin_hash = hash_pin_v2(normal_pin, &salt);
         let duress_pin_hash = hash_pin_v2(duress_pin, &salt);
 
-        Self {
+        // Constant-time comparison to verify PINs produce different hashes.
+        use subtle::ConstantTimeEq;
+        if normal_pin_hash.ct_eq(&duress_pin_hash).into() {
+            return Err("duress PIN must differ from normal PIN");
+        }
+
+        Ok(Self {
             user_id,
             normal_pin_hash,
             duress_pin_hash,
             salt,
-        }
+        })
     }
 
     /// Verify a PIN against both normal and duress hashes.

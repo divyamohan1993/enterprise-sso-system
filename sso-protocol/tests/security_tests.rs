@@ -82,7 +82,7 @@ fn test_mldsa87_token_verifiable_with_verifying_key() {
         let key = OidcSigningKey::generate();
         let token = tokens::create_id_token("https://iss", &user_id, "c", None, &key);
         // Must verify with the matching verifying key
-        let claims = tokens::verify_id_token(&token, key.verifying_key()).unwrap();
+        let claims = tokens::verify_id_token_with_audience(&token, key.verifying_key(), "c", true).unwrap();
         assert_eq!(claims.sub, user_id.to_string());
     });
 }
@@ -95,7 +95,7 @@ fn test_mldsa87_token_rejected_with_wrong_verifying_key() {
         let key2 = OidcSigningKey::generate();
         let token = tokens::create_id_token("https://iss", &user_id, "c", None, &key1);
         // Must NOT verify with a different key's verifying key
-        assert!(tokens::verify_id_token(&token, key2.verifying_key()).is_err());
+        assert!(tokens::verify_id_token_with_audience(&token, key2.verifying_key(), "c", true).is_err());
     });
 }
 
@@ -139,7 +139,7 @@ fn test_jwt_tier_values_propagate() {
         let key = OidcSigningKey::generate();
         for tier in 1..=4u8 {
             let token = tokens::create_id_token_with_tier("https://iss", &user_id, "c", None, &key, tier);
-            let claims = tokens::verify_id_token(&token, key.verifying_key()).unwrap();
+            let claims = tokens::verify_id_token_with_audience(&token, key.verifying_key(), "c", true).unwrap();
             assert_eq!(claims.tier, tier, "tier {tier} should propagate into JWT claims");
         }
     });
@@ -191,13 +191,14 @@ fn test_empty_jti_bypasses_replay_protection() {
         let sig_b64 = URL_SAFE_NO_PAD.encode(&signature);
         let token = format!("{signing_input}.{sig_b64}");
 
-        // First verification should succeed
-        let r1 = tokens::verify_id_token(&token, &vk);
-        assert!(r1.is_ok(), "first verify of empty-JTI token must succeed: {:?}", r1.err());
-
-        // Second verification of the SAME token should also succeed (no replay protection)
-        let r2 = tokens::verify_id_token(&token, &vk);
-        assert!(r2.is_ok(), "replay of empty-JTI token must succeed (no replay cache): {:?}", r2.err());
+        // SECURITY: Empty JTI tokens are now rejected unconditionally.
+        // All tokens must carry a unique JTI for replay protection.
+        let r1 = tokens::verify_id_token_with_audience(&token, &vk, "client", true);
+        assert!(r1.is_err(), "empty-JTI token must be rejected");
+        assert!(
+            r1.unwrap_err().contains("jti is required"),
+            "error must mention JTI requirement"
+        );
     });
 }
 
@@ -253,7 +254,7 @@ fn test_token_rejects_algorithm_confusion() {
         let tampered_token = format!("{}.{}.{}", tampered_header_b64, parts[1], parts[2]);
 
         // Verification must fail due to algorithm mismatch
-        let result = tokens::verify_id_token(&tampered_token, key.verifying_key());
+        let result = tokens::verify_id_token_with_audience(&tampered_token, key.verifying_key(), "c", true);
         assert!(result.is_err(), "algorithm confusion must be rejected");
         let err = result.unwrap_err();
         assert!(
@@ -327,4 +328,78 @@ fn test_discovery_no_implicit_grant() {
         1,
         "only 'code' response type should be supported — implicit and hybrid flows are banned"
     );
+}
+
+// ===========================================================================
+// TEST GROUP 2: ID token audience enforcement
+// ===========================================================================
+
+#[test]
+fn test_verify_id_token_without_audience_always_fails() {
+    big(|| {
+        let user_id = Uuid::new_v4();
+        let key = OidcSigningKey::generate();
+        let token = tokens::create_id_token("https://iss", &user_id, "client-a", None, &key);
+
+        // verify_id_token (no audience) must always fail — audience enforcement is mandatory.
+        let result = tokens::verify_id_token(&token, key.verifying_key());
+        assert!(result.is_err(), "verify_id_token without audience must always fail");
+        let err = result.unwrap_err();
+        assert!(
+            err.to_lowercase().contains("audience"),
+            "error must mention audience requirement, got: {err}"
+        );
+    });
+}
+
+#[test]
+fn test_verify_id_token_with_correct_audience_succeeds() {
+    big(|| {
+        let user_id = Uuid::new_v4();
+        let key = OidcSigningKey::generate();
+        let token = tokens::create_id_token("https://iss", &user_id, "client-x", None, &key);
+
+        let result = tokens::verify_id_token_with_audience(&token, key.verifying_key(), "client-x", true);
+        assert!(result.is_ok(), "correct audience must verify successfully");
+        let claims = result.unwrap();
+        assert_eq!(claims.sub, user_id.to_string());
+        assert_eq!(claims.aud, "client-x");
+    });
+}
+
+#[test]
+fn test_verify_id_token_with_wrong_audience_fails() {
+    big(|| {
+        let user_id = Uuid::new_v4();
+        let key = OidcSigningKey::generate();
+        let token = tokens::create_id_token("https://iss", &user_id, "client-a", None, &key);
+
+        // Verify with wrong audience must fail.
+        let result = tokens::verify_id_token_with_audience(&token, key.verifying_key(), "client-b", true);
+        assert!(result.is_err(), "wrong audience must be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.to_lowercase().contains("audience"),
+            "error must mention audience mismatch, got: {err}"
+        );
+    });
+}
+
+#[test]
+fn test_token_confusion_client_a_rejected_by_client_b() {
+    big(|| {
+        let user_id = Uuid::new_v4();
+        let key = OidcSigningKey::generate();
+
+        // Issue token for client-alpha
+        let token_for_alpha = tokens::create_id_token("https://iss", &user_id, "client-alpha", None, &key);
+
+        // Client-alpha verifies successfully
+        let ok = tokens::verify_id_token_with_audience(&token_for_alpha, key.verifying_key(), "client-alpha", true);
+        assert!(ok.is_ok(), "token must verify for intended audience");
+
+        // Client-beta must reject the token — this is the token confusion attack.
+        let rejected = tokens::verify_id_token_with_audience(&token_for_alpha, key.verifying_key(), "client-beta", true);
+        assert!(rejected.is_err(), "token issued for client-alpha must be rejected by client-beta");
+    });
 }

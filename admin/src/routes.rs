@@ -3466,7 +3466,7 @@ async fn register_duress_pin(
         req.user_id,
         req.normal_pin.as_bytes(),
         req.duress_pin.as_bytes(),
-    );
+    ).map_err(|_| StatusCode::BAD_REQUEST)?;
     let serialized = postcard::to_allocvec(&config).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     sqlx::query("UPDATE users SET duress_pin_hash = $1 WHERE id = $2")

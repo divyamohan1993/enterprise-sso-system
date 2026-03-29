@@ -1421,3 +1421,88 @@ fn test_full_registration_and_authentication_flow() {
     let cred_mut = store.get_credential_mut(&cred_id).unwrap();
     assert!(update_sign_count(cred_mut, new_sign_count).is_ok());
 }
+
+// ── TEST GROUP 1: FIDO2 challenge expiry tests ────────────────────────────
+
+#[test]
+fn test_challenge_consumed_immediately_succeeds() {
+    let mut store = CredentialStore::new();
+    let user_id = Uuid::new_v4();
+    let challenge = vec![0xCA, 0xFE, 0xBA, 0xBE];
+
+    store.store_challenge(&challenge, user_id);
+    // Consuming immediately (well within 60s) must succeed.
+    let result = store.consume_challenge(&challenge);
+    assert_eq!(result, Some(user_id), "challenge consumed immediately must return the user ID");
+}
+
+#[test]
+fn test_challenge_consumed_only_once() {
+    let mut store = CredentialStore::new();
+    let user_id = Uuid::new_v4();
+    let challenge = vec![0xDE, 0xAD];
+
+    store.store_challenge(&challenge, user_id);
+    assert_eq!(store.consume_challenge(&challenge), Some(user_id));
+    // Second consume must return None — challenge is single-use.
+    assert_eq!(store.consume_challenge(&challenge), None, "challenge must be single-use");
+}
+
+#[test]
+fn test_cleanup_expired_challenges_removes_old_entries() {
+    let mut store = CredentialStore::new();
+    let user_id = Uuid::new_v4();
+
+    // Store a challenge that is fresh (just created).
+    let fresh_challenge = vec![0x01];
+    store.store_challenge(&fresh_challenge, user_id);
+
+    // The fresh challenge should survive cleanup.
+    store.cleanup_expired_challenges();
+    assert!(
+        store.has_pending_challenge(&user_id),
+        "freshly stored challenge must survive cleanup"
+    );
+
+    // Consume the fresh one to verify it still works.
+    assert_eq!(store.consume_challenge(&fresh_challenge), Some(user_id));
+}
+
+#[test]
+fn test_store_challenge_triggers_cleanup() {
+    let mut store = CredentialStore::new();
+    let user_a = Uuid::new_v4();
+    let user_b = Uuid::new_v4();
+
+    // Store a challenge for user A.
+    let challenge_a = vec![0xAA];
+    store.store_challenge(&challenge_a, user_a);
+
+    // Store another challenge for user B — this triggers cleanup internally.
+    let challenge_b = vec![0xBB];
+    store.store_challenge(&challenge_b, user_b);
+
+    // Both fresh challenges must still be consumable.
+    assert_eq!(store.consume_challenge(&challenge_a), Some(user_a));
+    assert_eq!(store.consume_challenge(&challenge_b), Some(user_b));
+}
+
+#[test]
+fn test_consume_challenge_for_user_works_for_fresh_challenge() {
+    let mut store = CredentialStore::new();
+    let user_id = Uuid::new_v4();
+    let challenge = vec![0xCC];
+
+    store.store_challenge(&challenge, user_id);
+    // consume_challenge_for_user should find and consume it.
+    assert!(store.consume_challenge_for_user(&user_id));
+    // After consumption, no pending challenge should remain.
+    assert!(!store.has_pending_challenge(&user_id));
+}
+
+#[test]
+fn test_has_pending_challenge_false_for_unknown_user() {
+    let store = CredentialStore::new();
+    let unknown = Uuid::new_v4();
+    assert!(!store.has_pending_challenge(&unknown));
+}

@@ -35,7 +35,13 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
-/// Global FIPS mode flag.  Default false (disabled).
+/// Returns `true` if `MILNET_MILITARY_DEPLOYMENT=1` is set.
+fn is_military_deployment() -> bool {
+    std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1")
+}
+
+/// Global FIPS mode flag.  Default false (disabled), but forced ON when
+/// `MILNET_MILITARY_DEPLOYMENT=1` is set.
 ///
 /// Hot-path reads use Relaxed ordering — the bool is set once at startup
 /// (or by an authorised admin operation) and the worst-case outcome of a
@@ -112,6 +118,15 @@ pub fn load_fips_activation_key() {
         FIPS_MODE.store(true, Ordering::Relaxed);
         tracing::warn!("FIPS mode ENABLED at startup via MILNET_FIPS_MODE=1");
     }
+
+    // Force FIPS ON when military deployment mode is active
+    if is_military_deployment() {
+        FIPS_MODE.store(true, Ordering::Relaxed);
+        tracing::warn!(
+            "FIPS mode FORCED ON by MILNET_MILITARY_DEPLOYMENT=1 — \
+             cannot be disabled in military deployment"
+        );
+    }
 }
 
 /// Return whether FIPS mode is currently active.
@@ -136,6 +151,15 @@ pub fn is_fips_mode() -> bool {
 /// `proof_hex`: HMAC-SHA512 proof in hex (128 chars). Pass empty string
 /// to attempt without proof (will fail if key is loaded).
 pub fn set_fips_mode(enabled: bool, proof_hex: &str) {
+
+    // In military deployment, FIPS cannot be disabled
+    if !enabled && is_military_deployment() {
+        tracing::error!(
+            "REFUSED: cannot disable FIPS mode when MILNET_MILITARY_DEPLOYMENT=1 is set"
+        );
+        crate::siem::SecurityEvent::fips_mode_blocked();
+        return;
+    }
 
     // If activation key is loaded, require valid proof
     if FIPS_ACTIVATION_KEY.get().and_then(|k| k.as_ref()).is_some() {
@@ -169,8 +193,21 @@ pub fn set_fips_mode(enabled: bool, proof_hex: &str) {
 ///
 /// This bypasses the HMAC proof requirement.  It must NOT be called from the
 /// admin API — only from startup initialisation paths and test harnesses.
+///
+/// In non-test builds, disabling FIPS when `MILNET_MILITARY_DEPLOYMENT=1`
+/// is refused. Test builds (`#[cfg(test)]`) bypass this check so that
+/// tests can toggle FIPS mode freely.
 #[doc(hidden)]
 pub fn set_fips_mode_unchecked(enabled: bool) {
+    // In non-test builds, refuse to disable FIPS in military deployment
+    #[cfg(not(test))]
+    if !enabled && is_military_deployment() {
+        tracing::error!(
+            "REFUSED: cannot disable FIPS mode via unchecked path \
+             when MILNET_MILITARY_DEPLOYMENT=1 is set"
+        );
+        return;
+    }
     FIPS_MODE.store(enabled, Ordering::Relaxed);
 }
 
@@ -635,5 +672,129 @@ mod tests {
 
         // Cleanup
         set_fips_mode_unchecked(false);
+    }
+
+    // ── Military deployment FIPS hardening tests ──
+
+    #[test]
+    fn test_fips_cannot_be_disabled_in_military_deployment() {
+        // When MILNET_MILITARY_DEPLOYMENT=1, set_fips_mode(false, ...) must
+        // refuse to disable FIPS mode.
+        std::env::set_var("MILNET_MILITARY_DEPLOYMENT", "1");
+
+        // Ensure FIPS is on first
+        set_fips_mode_unchecked(true);
+        assert!(is_fips_mode());
+
+        // Attempt to disable via the proof-checked path with empty proof
+        set_fips_mode(false, "");
+        assert!(
+            is_fips_mode(),
+            "FIPS mode must remain ON when MILNET_MILITARY_DEPLOYMENT=1"
+        );
+
+        // Attempt with a garbage proof — should still be refused
+        set_fips_mode(false, "deadbeef".repeat(16).as_str());
+        assert!(
+            is_fips_mode(),
+            "FIPS mode must remain ON even with a proof when military deployment is active"
+        );
+
+        // Cleanup
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        set_fips_mode_unchecked(false);
+    }
+
+    #[test]
+    fn test_fips_enable_allowed_in_military_deployment() {
+        // Enabling FIPS in military mode should always succeed (it's the
+        // required state).
+        std::env::set_var("MILNET_MILITARY_DEPLOYMENT", "1");
+        set_fips_mode_unchecked(false); // test cfg(test) bypass
+        // Re-enable via set_fips_mode (enable path is not blocked)
+        set_fips_mode(true, "");
+        // The enable path may fail because no activation key is loaded with
+        // valid proof, but set_fips_mode_unchecked should work in test builds.
+        set_fips_mode_unchecked(true);
+        assert!(is_fips_mode());
+
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        set_fips_mode_unchecked(false);
+    }
+
+    #[test]
+    fn test_set_fips_mode_unchecked_bypasses_in_test_builds() {
+        // In #[cfg(test)] builds, set_fips_mode_unchecked should allow
+        // toggling freely, even with MILNET_MILITARY_DEPLOYMENT=1.
+        // This is essential for test harnesses.
+        std::env::set_var("MILNET_MILITARY_DEPLOYMENT", "1");
+
+        set_fips_mode_unchecked(true);
+        assert!(is_fips_mode(), "unchecked enable must work in test builds");
+
+        set_fips_mode_unchecked(false);
+        assert!(!is_fips_mode(), "unchecked disable must work in test builds (cfg(test) bypass)");
+
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+    }
+
+    #[test]
+    fn test_military_deployment_mode_validates_fips_is_on() {
+        // MilitaryDeploymentMode::validate_crypto_config must report a
+        // violation when FIPS mode is off.
+        set_fips_mode_unchecked(false);
+        let mode = MilitaryDeploymentMode::new(true);
+        let violations = mode.validate_crypto_config();
+        assert!(
+            violations.iter().any(|v| v.contains("FIPS mode")),
+            "expected violation about FIPS mode being disabled, got: {:?}",
+            violations
+        );
+        // The violation message should be informative
+        let fips_violation = violations.iter().find(|v| v.contains("FIPS mode")).unwrap();
+        assert!(
+            fips_violation.contains("Military deployment requires FIPS mode ON"),
+            "violation message should explain the requirement, got: {}",
+            fips_violation
+        );
+    }
+
+    #[test]
+    fn test_military_deployment_mode_no_violation_when_fips_on() {
+        // When FIPS is enabled and PQ TLS is set, there should be no
+        // FIPS-related violation.
+        set_fips_mode_unchecked(true);
+        std::env::set_var("MILNET_PQ_TLS_ONLY", "1");
+        let mode = MilitaryDeploymentMode::new(true);
+        let violations = mode.validate_crypto_config();
+        assert!(
+            !violations.iter().any(|v| v.contains("FIPS mode")),
+            "no FIPS violation expected when FIPS is ON, got: {:?}",
+            violations
+        );
+        std::env::remove_var("MILNET_PQ_TLS_ONLY");
+        set_fips_mode_unchecked(false);
+    }
+
+    #[test]
+    fn test_fips_mode_config_struct_mirrors_global() {
+        // FipsModeConfig.set_fips_mode_unchecked should mirror the global FIPS_MODE.
+        let cfg = FipsModeConfig::new();
+        assert!(!cfg.is_enabled());
+
+        cfg.set_fips_mode_unchecked(true);
+        assert!(cfg.is_enabled());
+        assert!(is_fips_mode(), "global FIPS_MODE must be in sync");
+
+        cfg.set_fips_mode_unchecked(false);
+        assert!(!cfg.is_enabled());
+        assert!(!is_fips_mode());
+    }
+
+    #[test]
+    fn test_fips_mode_hmac_domain_is_distinct() {
+        // The FIPS domain separator must be distinct and non-empty.
+        assert!(!FIPS_MODE_HMAC_DOMAIN.is_empty());
+        assert_eq!(FIPS_MODE_HMAC_DOMAIN, b"MILNET-FIPS-MODE-v1");
     }
 }

@@ -201,6 +201,14 @@ use std::path::PathBuf;
 /// tradeoff for absolute nonce uniqueness.
 const NONCE_SAFETY_MARGIN: u64 = 100;
 
+/// Safety margin for disaster recovery restores. Much larger than the normal
+/// safety margin because DR restores may involve stale backups where the true
+/// nonce high-water mark is unknown. FROST nonce reuse enables private key
+/// extraction (two signatures with the same nonce reveal the signing share),
+/// so we must advance the counter by a large margin to eliminate any chance
+/// of reusing a nonce from a pre-disaster signing session.
+pub const DR_SAFETY_MARGIN: u64 = 10_000;
+
 /// Default WAL file path for nonce persistence.
 const DEFAULT_NONCE_WAL_PATH: &str = "/var/lib/milnet/tss_nonce_wal";
 
@@ -255,6 +263,49 @@ impl NonceWal {
                 wal_nonce, sealed_nonce, NONCE_SAFETY_MARGIN, recovered_nonce
             );
         }
+
+        Self {
+            wal_path: path,
+            current_nonce: recovered_nonce,
+            synced_nonce: recovered_nonce,
+        }
+    }
+
+    /// Create a new WAL instance for disaster recovery restore.
+    ///
+    /// Uses `DR_SAFETY_MARGIN` (10,000) instead of the normal `NONCE_SAFETY_MARGIN` (100)
+    /// because DR restores may involve stale backups where the true nonce high-water
+    /// mark is unknown. FROST nonce reuse enables private key extraction — two
+    /// signatures with the same nonce reveal the signing share — so the counter
+    /// MUST be advanced by at least DR_SAFETY_MARGIN on every DR restore.
+    pub fn new_dr_restore(wal_path: Option<PathBuf>) -> Self {
+        let path = wal_path.unwrap_or_else(|| {
+            PathBuf::from(
+                std::env::var("MILNET_TSS_NONCE_WAL_PATH")
+                    .unwrap_or_else(|_| DEFAULT_NONCE_WAL_PATH.to_string()),
+            )
+        });
+
+        let wal_nonce = Self::read_wal_nonce(&path);
+        let sealed_nonce = load_nonce_counter();
+
+        // DR restore: use the much larger DR_SAFETY_MARGIN to account for
+        // potentially stale backup state. The normal SAFETY_MARGIN of 100 is
+        // insufficient for DR because the backup may predate thousands of
+        // signing operations whose nonces were never persisted to the backup.
+        let recovered_nonce = std::cmp::max(wal_nonce, sealed_nonce)
+            .saturating_add(DR_SAFETY_MARGIN);
+
+        tracing::warn!(
+            wal_nonce = wal_nonce,
+            sealed_nonce = sealed_nonce,
+            recovered_nonce = recovered_nonce,
+            dr_safety_margin = DR_SAFETY_MARGIN,
+            wal_path = %path.display(),
+            "DR RESTORE nonce recovery: nonce = MAX(wal={}, sealed={}) + {} = {} \
+             (FROST nonce reuse = private key extraction)",
+            wal_nonce, sealed_nonce, DR_SAFETY_MARGIN, recovered_nonce
+        );
 
         Self {
             wal_path: path,
@@ -551,6 +602,28 @@ impl SignerNode {
         wal_path: Option<PathBuf>,
     ) -> Self {
         let wal = NonceWal::new(wal_path);
+        let counter = wal.current_nonce();
+        Self {
+            identifier,
+            key_package,
+            nonce_counter: counter,
+            nonce_wal: Some(wal),
+            nonce_range: None,
+        }
+    }
+
+    /// Create a new signer node with WAL-protected nonce persistence for
+    /// disaster recovery restore scenarios.
+    ///
+    /// Uses `DR_SAFETY_MARGIN` (10,000) instead of the normal margin (100) to
+    /// ensure FROST nonce reuse is impossible even when restoring from a stale
+    /// backup. FROST nonce reuse enables private key extraction.
+    pub fn new_with_wal_dr_restore(
+        identifier: Identifier,
+        key_package: KeyPackage,
+        wal_path: Option<PathBuf>,
+    ) -> Self {
+        let wal = NonceWal::new_dr_restore(wal_path);
         let counter = wal.current_nonce();
         Self {
             identifier,
@@ -2888,5 +2961,79 @@ mod tests {
             plan.scenarios.iter().all(|s| s.severity != "WARNING"),
             "2-of-2 group has no buffer for WARNING scenario"
         );
+    }
+
+    // ── TEST GROUP 8: FROST DR nonce safety tests ────────────────────────
+
+    #[test]
+    fn test_dr_safety_margin_constant_is_10000() {
+        assert_eq!(
+            DR_SAFETY_MARGIN,
+            10_000,
+            "DR_SAFETY_MARGIN must be 10,000 to prevent FROST nonce reuse after DR restore"
+        );
+    }
+
+    #[test]
+    fn test_nonce_safety_margin_is_100() {
+        assert_eq!(
+            NONCE_SAFETY_MARGIN,
+            100,
+            "normal NONCE_SAFETY_MARGIN must be 100"
+        );
+    }
+
+    #[test]
+    fn test_dr_safety_margin_greater_than_normal() {
+        assert!(
+            DR_SAFETY_MARGIN > NONCE_SAFETY_MARGIN,
+            "DR_SAFETY_MARGIN ({}) must be much larger than NONCE_SAFETY_MARGIN ({})",
+            DR_SAFETY_MARGIN,
+            NONCE_SAFETY_MARGIN
+        );
+    }
+
+    #[test]
+    fn test_nonce_wal_dr_restore_uses_larger_margin() {
+        // Set up env vars so that both WAL and sealed state files point to
+        // non-existent temp paths (both return nonce = 0).
+        let mut rand_bytes = [0u8; 8];
+        getrandom::getrandom(&mut rand_bytes).unwrap();
+        let rand_hex: String = rand_bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let tmp = std::env::temp_dir().join(format!("milnet_tss_test_dr_{}", rand_hex));
+        let wal_path = tmp.join("nonce_wal");
+        let state_path = tmp.join("nonce_state");
+
+        // Ensure no pre-existing files.
+        let _ = std::fs::remove_file(&wal_path);
+        let _ = std::fs::remove_file(&state_path);
+
+        // Temporarily override sealed state path for this test.
+        std::env::set_var("MILNET_TSS_NONCE_STATE_PATH", state_path.to_str().unwrap());
+
+        let normal_wal = NonceWal::new(Some(wal_path.clone()));
+        let dr_wal = NonceWal::new_dr_restore(Some(wal_path.clone()));
+
+        // Both start from nonce 0 (no files). Normal adds NONCE_SAFETY_MARGIN,
+        // DR adds DR_SAFETY_MARGIN.
+        assert_eq!(
+            normal_wal.current_nonce(),
+            NONCE_SAFETY_MARGIN,
+            "normal WAL nonce must be 0 + NONCE_SAFETY_MARGIN"
+        );
+        assert_eq!(
+            dr_wal.current_nonce(),
+            DR_SAFETY_MARGIN,
+            "DR WAL nonce must be 0 + DR_SAFETY_MARGIN"
+        );
+        assert!(
+            dr_wal.current_nonce() > normal_wal.current_nonce(),
+            "DR restore must produce a higher nonce than normal recovery"
+        );
+
+        // Clean up
+        let _ = std::fs::remove_file(&wal_path);
+        let _ = std::fs::remove_file(&state_path);
+        let _ = std::fs::remove_dir(&tmp);
     }
 }

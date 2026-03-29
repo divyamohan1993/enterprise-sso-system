@@ -1,6 +1,7 @@
 //! Service health checking with liveness probes and peer monitoring.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -220,11 +221,84 @@ pub fn check_peers(monitor: &HealthMonitor, required_peers: &[&str]) -> Vec<Heal
         .collect()
 }
 
+/// Rate limiter state for the health endpoint.
+///
+/// Uses a simple token-bucket approach: tracks request count per second
+/// and rejects requests exceeding the limit.
+struct HealthRateLimiter {
+    /// Request count in the current second window.
+    count: AtomicU32,
+    /// Epoch second of the current window (seconds since `start`).
+    window_epoch: AtomicU64,
+}
+
+impl HealthRateLimiter {
+    const MAX_REQUESTS_PER_SECOND: u32 = 100;
+
+    fn new() -> Self {
+        Self {
+            count: AtomicU32::new(0),
+            window_epoch: AtomicU64::new(0),
+        }
+    }
+
+    /// Try to acquire a rate-limit token. Returns `true` if allowed.
+    fn try_acquire(&self, now_secs: u64) -> bool {
+        let current_window = self.window_epoch.load(Ordering::Acquire);
+        if now_secs != current_window {
+            // New window — reset counter
+            self.window_epoch.store(now_secs, Ordering::Release);
+            self.count.store(1, Ordering::Release);
+            return true;
+        }
+        let prev = self.count.fetch_add(1, Ordering::Acquire);
+        prev < Self::MAX_REQUESTS_PER_SECOND
+    }
+}
+
+/// Cached health check result to avoid per-request DB queries.
+struct CachedHealth {
+    response: Mutex<Option<(Instant, Vec<u8>, u16)>>,
+}
+
+impl CachedHealth {
+    const CACHE_TTL: Duration = Duration::from_secs(5);
+
+    fn new() -> Self {
+        Self {
+            response: Mutex::new(None),
+        }
+    }
+
+    /// Get cached response if fresh, or None if stale/missing.
+    fn get(&self) -> Option<(Vec<u8>, u16)> {
+        let guard = self.response.lock().unwrap();
+        if let Some((ts, body, status)) = guard.as_ref() {
+            if ts.elapsed() < Self::CACHE_TTL {
+                return Some((body.clone(), *status));
+            }
+        }
+        None
+    }
+
+    /// Store a new cached response.
+    fn set(&self, body: Vec<u8>, status: u16) {
+        let mut guard = self.response.lock().unwrap();
+        *guard = Some((Instant::now(), body, status));
+    }
+}
+
 /// Spawn a lightweight TCP-based `/healthz` endpoint on a dedicated port.
 ///
 /// Each service should call this at startup with a closure that produces
 /// the current health checks.  The health port is `service_port + 1000`
 /// unless overridden by `MILNET_HEALTH_PORT`.
+///
+/// Hardening measures:
+/// - Rate limit: max 100 requests/second (across all IPs)
+/// - Caching: health check results cached for 5 seconds
+/// - HTTP 503 for degraded and unhealthy status
+/// - Concurrency limit: max 50 simultaneous connections
 ///
 /// The server responds to any TCP connection with an HTTP/1.1 response
 /// containing the JSON health payload, then closes the connection.
@@ -263,6 +337,11 @@ where
             "Health endpoint listening on /healthz"
         );
 
+        let rate_limiter = HealthRateLimiter::new();
+        let cache = CachedHealth::new();
+        let concurrent = AtomicU32::new(0);
+        const MAX_CONCURRENT: u32 = 50;
+
         loop {
             let (mut stream, _peer) = match listener.accept().await {
                 Ok(c) => c,
@@ -272,24 +351,67 @@ where
                 }
             };
 
-            let checks = check_fn();
-            let response = HealthResponse::from_checks(&service_name, checks, start_time);
-            let body = response.to_json();
-            let status_code = if response.status == "healthy" {
-                200
-            } else if response.status == "degraded" {
-                200
+            // Connection limit check
+            let current = concurrent.fetch_add(1, Ordering::Acquire);
+            if current >= MAX_CONCURRENT {
+                concurrent.fetch_sub(1, Ordering::Release);
+                // 503 with connection limit message
+                let msg = b"HTTP/1.1 503 Service Unavailable\r\n\
+                    Content-Type: text/plain\r\n\
+                    Content-Length: 25\r\n\
+                    Connection: close\r\n\
+                    \r\n\
+                    connection limit exceeded";
+                use tokio::io::AsyncWriteExt;
+                let _ = stream.write_all(msg).await;
+                let _ = stream.shutdown().await;
+                continue;
+            }
+
+            // Rate limit check
+            let now_secs = start_time.elapsed().as_secs();
+            if !rate_limiter.try_acquire(now_secs) {
+                concurrent.fetch_sub(1, Ordering::Release);
+                let msg = b"HTTP/1.1 429 Too Many Requests\r\n\
+                    Content-Type: text/plain\r\n\
+                    Content-Length: 19\r\n\
+                    Connection: close\r\n\
+                    Retry-After: 1\r\n\
+                    \r\n\
+                    rate limit exceeded";
+                use tokio::io::AsyncWriteExt;
+                let _ = stream.write_all(msg).await;
+                let _ = stream.shutdown().await;
+                continue;
+            }
+
+            // Serve from cache or compute fresh
+            let (body, status_code) = if let Some(cached) = cache.get() {
+                cached
             } else {
-                503
+                let checks = check_fn();
+                let response = HealthResponse::from_checks(&service_name, checks, start_time);
+                let body = response.to_json();
+                // Return 503 for degraded and unhealthy
+                let status_code: u16 = if response.status == "healthy" {
+                    200
+                } else {
+                    503
+                };
+                cache.set(body.clone(), status_code);
+                (body, status_code)
             };
 
+            let status_text = if status_code == 200 { "OK" } else { "Service Unavailable" };
             let http_response = format!(
-                "HTTP/1.1 {} OK\r\n\
+                "HTTP/1.1 {} {}\r\n\
                  Content-Type: application/json\r\n\
                  Content-Length: {}\r\n\
                  Connection: close\r\n\
+                 Cache-Control: no-store\r\n\
                  \r\n",
                 status_code,
+                status_text,
                 body.len()
             );
 
@@ -297,6 +419,8 @@ where
             let _ = stream.write_all(http_response.as_bytes()).await;
             let _ = stream.write_all(&body).await;
             let _ = stream.shutdown().await;
+
+            concurrent.fetch_sub(1, Ordering::Release);
         }
     })
 }

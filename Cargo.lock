@@ -1958,9 +1958,14 @@ dependencies = [
 name = "kt"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "common",
  "crypto",
+ "getrandom 0.2.17",
  "hex",
+ "hkdf",
+ "hmac",
+ "ml-dsa",
  "postcard",
  "serde",
  "sha2",
@@ -1969,6 +1974,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

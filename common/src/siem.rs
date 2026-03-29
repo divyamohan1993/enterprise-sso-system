@@ -509,6 +509,27 @@ impl SecurityEvent {
         event.emit();
     }
 
+    /// Emit a circuit breaker failure count saturation event.
+    ///
+    /// Indicates sustained service failure — the u32 failure counter reached
+    /// `u32::MAX`. This may indicate an attack or total downstream service loss.
+    pub fn circuit_breaker_saturated(service: &str) {
+        let event = SecurityEvent {
+            timestamp: Self::now_iso8601(),
+            category: "availability",
+            action: "circuit_breaker_saturated",
+            severity: Severity::Critical,
+            outcome: "failure",
+            user_id: None,
+            source_ip: None,
+            detail: Some(format!(
+                "service={} failure_count=SATURATED(u32::MAX)",
+                service
+            )),
+        };
+        event.emit();
+    }
+
     /// Emit a rate limit exceeded event.
     pub fn rate_limit_exceeded(source_ip: &str) {
         let event = SecurityEvent {

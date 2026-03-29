@@ -565,10 +565,15 @@ pub fn create_id_token_with_tier(
 
 /// Verify an ML-DSA-87-signed JWT using the verifying key.
 ///
-/// This performs signature verification only. Use `verify_id_token_with_audience`
-/// for full audience-bound verification in production.
+/// SECURITY: Audience-less verification is forbidden. All tokens MUST be
+/// verified with an explicit audience via `verify_id_token_with_audience`.
+/// This function exists only for backward API compatibility and always fails
+/// because skipping audience validation enables token misuse attacks.
 pub fn verify_id_token(token: &str, verifying_key: &PqVerifyingKey) -> Result<IdTokenClaims, String> {
-    verify_id_token_inner(token, verifying_key, None, false)
+    // SECURITY: require_audience = true and expected_audience = None will cause
+    // the inner function to reject any token — audience-less verification is
+    // forbidden for military-grade deployments.
+    verify_id_token_inner(token, verifying_key, None, true)
 }
 
 /// Verify an ML-DSA-87-signed JWT with mandatory audience binding.
@@ -687,16 +692,35 @@ fn verify_id_token_inner(
         ));
     }
 
-    // Audience validation
-    if let Some(expected) = expected_audience {
+    // SECURITY: Audience validation is mandatory. Verifying a token without an
+    // expected audience is forbidden — it allows token misuse across services.
+    if require_audience {
+        match expected_audience {
+            Some(expected) => {
+                if claims.aud != expected {
+                    return Err(format!(
+                        "audience mismatch: expected '{}', got '{}'",
+                        expected, claims.aud
+                    ));
+                }
+            }
+            None => {
+                // No expected audience was provided but audience checking is
+                // required — this is a caller error. Fail-closed.
+                return Err(
+                    "audience verification is required but no expected audience was provided \
+                     — audience-less token verification is forbidden".into()
+                );
+            }
+        }
+    } else if let Some(expected) = expected_audience {
+        // Even when not strictly required, if an audience was provided, enforce it.
         if claims.aud != expected {
             return Err(format!(
                 "audience mismatch: expected '{}', got '{}'",
                 expected, claims.aud
             ));
         }
-    } else if require_audience && claims.aud.is_empty() {
-        return Err("token audience (aud) is required but missing or empty".into());
     }
 
     Ok(claims)
@@ -842,11 +866,11 @@ mod tests {
             let token = create_id_token("test-iss", &Uuid::new_v4(), "test-aud", None, &sk);
 
             // First verification should succeed
-            let r1 = verify_id_token(&token, sk.verifying_key());
+            let r1 = verify_id_token_with_audience(&token, sk.verifying_key(), "test-aud", true);
             assert!(r1.is_ok(), "first verification must succeed");
 
             // Second verification of same token should fail (JTI replay)
-            let r2 = verify_id_token(&token, sk.verifying_key());
+            let r2 = verify_id_token_with_audience(&token, sk.verifying_key(), "test-aud", true);
             assert!(r2.is_err(), "JTI replay must be rejected");
             let err = r2.unwrap_err();
             assert!(
@@ -904,7 +928,7 @@ mod tests {
             let sig_b64 = URL_SAFE_NO_PAD.encode(&signature);
             let token = format!("{signing_input}.{sig_b64}");
 
-            let result = verify_id_token(&token, sk.verifying_key());
+            let result = verify_id_token_with_audience(&token, sk.verifying_key(), "test-client", true);
             assert!(result.is_err());
             assert!(result.unwrap_err().contains("unsupported algorithm"));
         });
@@ -913,7 +937,7 @@ mod tests {
     // ── Token with empty JTI ────────────────────────────────────────────
 
     #[test]
-    fn verify_accepts_empty_jti_but_no_replay_protection() {
+    fn verify_rejects_empty_jti() {
         big(|| {
             let sk = OidcSigningKey::generate();
             let now = now_secs();
@@ -931,13 +955,13 @@ mod tests {
             };
 
             let token = sign_claims_manually(&sk, &claims);
-            // Empty JTI tokens skip JTI cache — verification succeeds
+            // SECURITY: Empty JTI tokens are now rejected unconditionally.
             let r1 = verify_id_token_with_audience(&token, sk.verifying_key(), "test-client", true);
-            assert!(r1.is_ok(), "empty JTI token should still verify");
-
-            // Second verification also succeeds (no replay protection for empty JTI)
-            let r2 = verify_id_token_with_audience(&token, sk.verifying_key(), "test-client", true);
-            assert!(r2.is_ok(), "empty JTI skips replay detection");
+            assert!(r1.is_err(), "empty JTI token must be rejected");
+            assert!(
+                r1.unwrap_err().contains("jti is required"),
+                "error must mention JTI requirement"
+            );
         });
     }
 

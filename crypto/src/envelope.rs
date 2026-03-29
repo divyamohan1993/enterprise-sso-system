@@ -33,6 +33,12 @@ const MIN_SEALED_LEN: usize = NONCE_LEN + TAG_LEN;
 /// AAD used when wrapping/unwrapping DEKs under a KEK.
 const KEK_WRAP_AAD: &[u8] = b"MILNET-KEK-WRAP-v1";
 
+/// Length of the KEK version prefix in wrapped key output (4 bytes big-endian u32).
+const KEK_VERSION_LEN: usize = 4;
+
+/// Current KEK version. Increment this when rotating to a new KEK.
+pub const CURRENT_KEK_VERSION: u32 = 1;
+
 /// Prefix for field-level AAD construction.
 const AAD_PREFIX: &[u8] = b"MILNET-AAD-v1:";
 
@@ -157,10 +163,13 @@ impl SealedData {
 // WrappedKey
 // ---------------------------------------------------------------------------
 
-/// A DEK encrypted (wrapped) under a KEK: nonce (12) || encrypted_dek || tag (16).
+/// A DEK encrypted (wrapped) under a KEK.
+/// Wire format: kek_version (4 bytes BE) || nonce (12) || encrypted_dek || tag (16).
 #[derive(Clone, Debug)]
 pub struct WrappedKey {
     bytes: Vec<u8>,
+    /// The KEK version that was used to wrap this key.
+    pub kek_version: u32,
 }
 
 impl WrappedKey {
@@ -171,12 +180,18 @@ impl WrappedKey {
 
     /// Reconstruct from a byte vector, validating minimum length.
     ///
-    /// A wrapped 32-byte DEK must be at least `NONCE_LEN + KEY_LEN + TAG_LEN` bytes.
+    /// Expects wire format: kek_version (4 bytes BE) || nonce (12) || encrypted_dek || tag (16).
+    /// A wrapped 32-byte DEK must be at least `KEK_VERSION_LEN + NONCE_LEN + KEY_LEN + TAG_LEN` bytes.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, EnvelopeError> {
-        if bytes.len() < NONCE_LEN + KEY_LEN + TAG_LEN {
+        if bytes.len() < KEK_VERSION_LEN + NONCE_LEN + KEY_LEN + TAG_LEN {
             return Err(EnvelopeError::InvalidWrappedKey);
         }
-        Ok(Self { bytes })
+        let kek_version = u32::from_be_bytes(
+            bytes[..KEK_VERSION_LEN]
+                .try_into()
+                .map_err(|_| EnvelopeError::InvalidWrappedKey)?,
+        );
+        Ok(Self { bytes, kek_version })
     }
 }
 
@@ -216,6 +231,9 @@ pub fn decrypt(
 /// Wrap (encrypt) a DEK under a KEK for secure storage.
 ///
 /// Uses a fixed AAD (`MILNET-KEK-WRAP-v1`) to bind the ciphertext to its purpose.
+/// Wire format: kek_version (4 bytes BE) || nonce (12) || encrypted_dek || tag (16).
+/// The KEK version is prepended so that on unwrap, the correct KEK can be selected
+/// for decryption (critical for key rotation scenarios).
 pub fn wrap_key(
     kek: &KeyEncryptionKey,
     dek: &DataEncryptionKey,
@@ -238,21 +256,46 @@ pub fn wrap_key(
         )
         .map_err(|_| EnvelopeError::EncryptionFailed)?;
 
-    let mut wrapped = Vec::with_capacity(NONCE_LEN + ciphertext_with_tag.len());
+    let mut wrapped = Vec::with_capacity(KEK_VERSION_LEN + NONCE_LEN + ciphertext_with_tag.len());
+    wrapped.extend_from_slice(&CURRENT_KEK_VERSION.to_be_bytes());
     wrapped.extend_from_slice(&nonce_bytes);
     wrapped.extend_from_slice(&ciphertext_with_tag);
 
-    Ok(WrappedKey { bytes: wrapped })
+    Ok(WrappedKey {
+        bytes: wrapped,
+        kek_version: CURRENT_KEK_VERSION,
+    })
 }
 
 /// Unwrap (decrypt) a DEK that was previously wrapped under a KEK.
+///
+/// Extracts the KEK version from the wire format prefix and verifies it matches
+/// the expected version. In a multi-KEK deployment, the version would be used to
+/// select the correct KEK from a keyring; for now we verify it matches
+/// `CURRENT_KEK_VERSION` to detect data wrapped under an unknown/future KEK.
 pub fn unwrap_key(
     kek: &KeyEncryptionKey,
     wrapped: &WrappedKey,
 ) -> Result<DataEncryptionKey, EnvelopeError> {
     let raw = wrapped.to_bytes();
-    let nonce_bytes = &raw[..NONCE_LEN];
-    let ciphertext_with_tag = &raw[NONCE_LEN..];
+    if raw.len() < KEK_VERSION_LEN + NONCE_LEN + TAG_LEN {
+        return Err(EnvelopeError::InvalidWrappedKey);
+    }
+
+    // Extract and verify KEK version
+    let version = u32::from_be_bytes(
+        raw[..KEK_VERSION_LEN]
+            .try_into()
+            .map_err(|_| EnvelopeError::InvalidWrappedKey)?,
+    );
+    if version != CURRENT_KEK_VERSION {
+        // Future: look up the correct KEK by version from a keyring.
+        // For now, reject unknown versions to prevent silent misuse.
+        return Err(EnvelopeError::DecryptionFailed);
+    }
+
+    let nonce_bytes = &raw[KEK_VERSION_LEN..KEK_VERSION_LEN + NONCE_LEN];
+    let ciphertext_with_tag = &raw[KEK_VERSION_LEN + NONCE_LEN..];
 
     let cipher = Aes256Gcm::new(GenericArray::from_slice(&kek.0));
     let nonce = Nonce::from_slice(nonce_bytes);
@@ -409,8 +452,8 @@ mod tests {
 
     #[test]
     fn wrapped_key_min_length_validation() {
-        // Wrapped key must be at least NONCE_LEN + KEY_LEN + TAG_LEN = 60 bytes.
-        let min_len = NONCE_LEN + KEY_LEN + TAG_LEN;
+        // Wrapped key must be at least KEK_VERSION_LEN + NONCE_LEN + KEY_LEN + TAG_LEN = 64 bytes.
+        let min_len = KEK_VERSION_LEN + NONCE_LEN + KEY_LEN + TAG_LEN;
 
         let too_short = vec![0u8; min_len - 1];
         assert_eq!(
@@ -538,6 +581,73 @@ mod tests {
         let recovered = decrypt(&dek, &sealed, &aad).expect("decrypt");
         assert_eq!(recovered.as_slice(), plaintext);
         common::fips::set_fips_mode_unchecked(false);
+    }
+
+    // ── TEST GROUP 7: Key versioning tests ──────────────────────────────
+
+    #[test]
+    fn test_wrap_key_produces_version_prefix() {
+        let kek = KeyEncryptionKey::generate();
+        let dek = DataEncryptionKey::generate();
+
+        let wrapped = wrap_key(&kek, &dek).expect("wrap");
+        let raw = wrapped.to_bytes();
+
+        // First 4 bytes are the KEK version (big-endian u32).
+        assert!(raw.len() >= KEK_VERSION_LEN, "wrapped key must have version prefix");
+        let version = u32::from_be_bytes(raw[..KEK_VERSION_LEN].try_into().unwrap());
+        assert_eq!(version, CURRENT_KEK_VERSION, "version prefix must match CURRENT_KEK_VERSION");
+        assert_eq!(wrapped.kek_version, CURRENT_KEK_VERSION);
+    }
+
+    #[test]
+    fn test_unwrap_key_extracts_and_validates_version() {
+        let kek = KeyEncryptionKey::generate();
+        let dek = DataEncryptionKey::generate();
+
+        let wrapped = wrap_key(&kek, &dek).expect("wrap");
+        // unwrap_key must succeed and return the original DEK.
+        let recovered = unwrap_key(&kek, &wrapped).expect("unwrap");
+        assert_eq!(recovered.as_bytes(), dek.as_bytes());
+    }
+
+    #[test]
+    fn test_invalid_version_causes_unwrap_failure() {
+        let kek = KeyEncryptionKey::generate();
+        let dek = DataEncryptionKey::generate();
+
+        let wrapped = wrap_key(&kek, &dek).expect("wrap");
+        let mut raw = wrapped.to_bytes().to_vec();
+
+        // Tamper with the version prefix: set to version 99 (invalid).
+        let bad_version: u32 = 99;
+        raw[..KEK_VERSION_LEN].copy_from_slice(&bad_version.to_be_bytes());
+
+        let tampered = WrappedKey::from_bytes(raw).expect("from_bytes");
+        assert_eq!(tampered.kek_version, 99);
+
+        let result = unwrap_key(&kek, &tampered);
+        assert_eq!(
+            result.unwrap_err(),
+            EnvelopeError::DecryptionFailed,
+            "invalid version must cause unwrap to fail"
+        );
+    }
+
+    #[test]
+    fn test_wrap_unwrap_round_trip_preserves_key() {
+        let kek = KeyEncryptionKey::generate();
+        let dek = DataEncryptionKey::generate();
+        let original = *dek.as_bytes();
+
+        let wrapped = wrap_key(&kek, &dek).expect("wrap");
+        let recovered = unwrap_key(&kek, &wrapped).expect("unwrap");
+
+        assert_eq!(
+            recovered.as_bytes(),
+            &original,
+            "wrap-then-unwrap must preserve the original key material"
+        );
     }
 
     #[test]

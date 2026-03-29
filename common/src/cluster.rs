@@ -13,11 +13,21 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha512;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
+
+type HmacSha512 = Hmac<Sha512>;
+
+/// HKDF info string for deriving the Raft transport HMAC key from the master KEK.
+const RAFT_HMAC_INFO: &[u8] = b"MILNET-RAFT-HMAC-v1";
+
+/// Length of HMAC-SHA512 tag appended to each Raft message.
+const HMAC_TAG_LEN: usize = 64;
 
 use super::raft::{
     ClusterCommand, LogEntry, LogIndex, NodeId, RaftConfig, RaftMessage, RaftRole, RaftState,
@@ -458,6 +468,121 @@ async fn recv_framed(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
+/// Derive a 64-byte HMAC key from the master KEK via HKDF-SHA512.
+///
+/// If no master KEK is configured (e.g. in tests), returns `None` and
+/// HMAC authentication is skipped.
+fn derive_raft_hmac_key() -> Option<[u8; 64]> {
+    let kek_hex = std::env::var("MILNET_MASTER_KEK").ok()?;
+    let kek_bytes = hex::decode(kek_hex.trim()).ok()?;
+    if kek_bytes.is_empty() {
+        return None;
+    }
+
+    use hkdf::Hkdf;
+    let hk = Hkdf::<Sha512>::new(None, &kek_bytes);
+    let mut okm = [0u8; 64];
+    hk.expand(RAFT_HMAC_INFO, &mut okm)
+        .expect("64-byte HKDF-SHA512 expand must succeed");
+    Some(okm)
+}
+
+/// Send a length-prefixed, HMAC-authenticated frame over TCP.
+///
+/// Wire format: `len(4 bytes, big-endian)` || `payload` || `hmac_tag(64 bytes)`
+/// where `len` = `payload.len() + 64`.
+async fn send_authenticated(
+    stream: &mut TcpStream,
+    data: &[u8],
+    hmac_key: &[u8; 64],
+) -> Result<(), String> {
+    let mut mac = HmacSha512::new_from_slice(hmac_key)
+        .expect("HMAC-SHA512 accepts any key length");
+    mac.update(data);
+    let tag = mac.finalize().into_bytes();
+
+    let total_len = data.len() + HMAC_TAG_LEN;
+    let len_bytes = (total_len as u32).to_be_bytes();
+
+    stream
+        .write_all(&len_bytes)
+        .await
+        .map_err(|e| format!("failed to write frame length: {e}"))?;
+    stream
+        .write_all(data)
+        .await
+        .map_err(|e| format!("failed to write frame data: {e}"))?;
+    stream
+        .write_all(&tag)
+        .await
+        .map_err(|e| format!("failed to write HMAC tag: {e}"))?;
+    stream
+        .flush()
+        .await
+        .map_err(|e| format!("failed to flush stream: {e}"))?;
+    Ok(())
+}
+
+/// Receive a length-prefixed, HMAC-authenticated frame from TCP.
+///
+/// Verifies the HMAC-SHA512 tag before returning the payload.
+/// Rejects messages with invalid HMAC and emits a SIEM event.
+async fn recv_authenticated(
+    stream: &mut TcpStream,
+    hmac_key: &[u8; 64],
+) -> Result<Vec<u8>, String> {
+    let mut len_buf = [0u8; 4];
+    stream
+        .read_exact(&mut len_buf)
+        .await
+        .map_err(|e| format!("failed to read frame length: {e}"))?;
+    let total_len = u32::from_be_bytes(len_buf) as usize;
+
+    if total_len > 1_048_576 + HMAC_TAG_LEN {
+        return Err(format!(
+            "authenticated message too large: {total_len} bytes"
+        ));
+    }
+    if total_len < HMAC_TAG_LEN {
+        return Err("authenticated message too small to contain HMAC tag".into());
+    }
+
+    let payload_len = total_len - HMAC_TAG_LEN;
+    let mut payload = vec![0u8; payload_len];
+    stream
+        .read_exact(&mut payload)
+        .await
+        .map_err(|e| format!("failed to read frame payload: {e}"))?;
+
+    let mut tag_buf = [0u8; HMAC_TAG_LEN];
+    stream
+        .read_exact(&mut tag_buf)
+        .await
+        .map_err(|e| format!("failed to read HMAC tag: {e}"))?;
+
+    // Verify HMAC before deserializing.
+    let mut mac = HmacSha512::new_from_slice(hmac_key)
+        .expect("HMAC-SHA512 accepts any key length");
+    mac.update(&payload);
+    if mac.verify_slice(&tag_buf).is_err() {
+        // Emit SIEM event for failed authentication.
+        let event = crate::siem::SecurityEvent {
+            timestamp: crate::siem::SecurityEvent::now_iso8601(),
+            category: "cluster",
+            action: "raft_hmac_verification_failed",
+            severity: crate::siem::Severity::Critical,
+            outcome: "failure",
+            user_id: None,
+            source_ip: None,
+            detail: Some("rejected Raft message with invalid HMAC-SHA512 tag".into()),
+        };
+        event.emit();
+        return Err("HMAC verification failed — rejecting unauthenticated Raft message".into());
+    }
+
+    Ok(payload)
+}
+
 // ── ClusterNode ──
 
 /// The main async coordination handle.
@@ -522,6 +647,14 @@ impl ClusterNode {
         let (leader_tx, _leader_rx) = watch::channel::<Option<NodeId>>(None);
         let leader_tx = Arc::new(leader_tx);
 
+        // Derive HMAC key for Raft transport authentication.
+        let hmac_key: Option<Arc<[u8; 64]>> = derive_raft_hmac_key().map(Arc::new);
+        if hmac_key.is_some() {
+            info!("raft transport HMAC-SHA512 authentication enabled");
+        } else {
+            warn!("MILNET_MASTER_KEK not set — raft transport HMAC authentication DISABLED");
+        }
+
         // Channel for outgoing Raft messages.
         let (send_tx, send_rx) = mpsc::unbounded_channel::<(NodeId, RaftMessage)>();
 
@@ -554,6 +687,7 @@ impl ClusterNode {
             let send_tx = send_tx.clone();
             let raft_addr = config.raft_addr.clone();
             let mut shutdown_rx = shutdown_rx.clone();
+            let hmac_key = hmac_key.clone();
             tokio::spawn(async move {
                 let listener = match TcpListener::bind(&raft_addr).await {
                     Ok(l) => l,
@@ -580,12 +714,23 @@ impl ClusterNode {
 
                     let raft = Arc::clone(&raft);
                     let send_tx = send_tx.clone();
+                    let hmac_key = hmac_key.clone();
                     tokio::spawn(async move {
-                        let data = match recv_framed(&mut stream).await {
-                            Ok(d) => d,
-                            Err(e) => {
-                                warn!(err = %e, "failed to receive raft message");
-                                return;
+                        let data = if let Some(ref key) = hmac_key {
+                            match recv_authenticated(&mut stream, key).await {
+                                Ok(d) => d,
+                                Err(e) => {
+                                    warn!(peer = %peer_addr, err = %e, "failed to receive authenticated raft message");
+                                    return;
+                                }
+                            }
+                        } else {
+                            match recv_framed(&mut stream).await {
+                                Ok(d) => d,
+                                Err(e) => {
+                                    warn!(err = %e, "failed to receive raft message");
+                                    return;
+                                }
                             }
                         };
                         let (from, msg): (NodeId, RaftMessage) =
@@ -613,6 +758,7 @@ impl ClusterNode {
             let config = Arc::clone(&config);
             let mut send_rx = send_rx;
             let mut shutdown_rx = shutdown_rx.clone();
+            let hmac_key = hmac_key.clone();
             tokio::spawn(async move {
                 loop {
                     let (target, msg) = tokio::select! {
@@ -636,6 +782,7 @@ impl ClusterNode {
 
                     // Spawn a short-lived task so we don't block the sender loop
                     let node_id = config.node_id;
+                    let hmac_key = hmac_key.clone();
                     tokio::spawn(async move {
                         let mut stream = match TcpStream::connect(&peer_addr).await {
                             Ok(s) => s,
@@ -656,8 +803,14 @@ impl ClusterNode {
                                 return;
                             }
                         };
-                        if let Err(e) = send_framed(&mut stream, &data).await {
-                            debug!(addr = %peer_addr, err = %e, "failed to send raft message");
+                        if let Some(ref key) = hmac_key {
+                            if let Err(e) = send_authenticated(&mut stream, &data, key).await {
+                                debug!(addr = %peer_addr, err = %e, "failed to send authenticated raft message");
+                            }
+                        } else {
+                            if let Err(e) = send_framed(&mut stream, &data).await {
+                                debug!(addr = %peer_addr, err = %e, "failed to send raft message");
+                            }
                         }
                     });
                 }

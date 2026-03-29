@@ -16,6 +16,12 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 hex.workspace = true
+hmac.workspace = true
+hkdf.workspace = true
+zeroize.workspace = true
+getrandom.workspace = true
+ml-dsa.workspace = true
+aes-gcm.workspace = true
 
 [features]
 production = ["common/production"]

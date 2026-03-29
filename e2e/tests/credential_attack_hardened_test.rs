@@ -251,7 +251,7 @@ fn duress_pin_triggers_silent_alert_with_fake_success() {
     let normal_pin = b"7392";
     let duress_pin = b"1337";
 
-    let config = DuressConfig::new(user_id, normal_pin, duress_pin);
+    let config = DuressConfig::new(user_id, normal_pin, duress_pin).unwrap();
 
     // Normal PIN: legitimate auth
     assert_eq!(config.verify_pin(normal_pin), PinVerification::Normal);
@@ -286,7 +286,7 @@ fn duress_pin_constant_time_verification() {
     let normal_pin = b"1234";
     let duress_pin = b"5678";
 
-    let config = DuressConfig::new(user_id, normal_pin, duress_pin);
+    let config = DuressConfig::new(user_id, normal_pin, duress_pin).unwrap();
 
     // Verify all three code paths produce correct results.
     // The implementation uses subtle::ConstantTimeEq internally via
@@ -467,7 +467,10 @@ fn dpop_proof_replay_detected_via_hash_tracking() {
         let expected_hash = dpop_key_hash(vk_bytes.as_ref());
 
         let claims = b"token-claims-payload";
-        let timestamp = now_us();
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
         let proof = generate_dpop_proof(&sk, claims, timestamp);
 
         // First verification: must succeed

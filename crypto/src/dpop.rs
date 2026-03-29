@@ -132,10 +132,16 @@ pub fn generate_dpop_proof(
     sig.encode().to_vec()
 }
 
+/// Maximum allowed age (in seconds) for a DPoP proof timestamp.
+/// Proofs older than this are rejected to prevent replay attacks.
+const DPOP_MAX_AGE_SECS: i64 = 30;
+
 /// Verify a DPoP proof using ML-DSA-87 (CNSA 2.0 compliant, Level 5).
 ///
 /// Verifies the ML-DSA-87 signature over SHA-256(claims_bytes || timestamp_bytes)
-/// against the provided verifying key bytes. Also checks the key hash matches.
+/// against the provided verifying key bytes. Also checks the key hash matches
+/// and rejects proofs where the timestamp deviates more than `DPOP_MAX_AGE_SECS`
+/// seconds from the current system clock.
 pub fn verify_dpop_proof(
     verifying_key: &DpopVerifyingKey,
     proof: &[u8],
@@ -143,6 +149,15 @@ pub fn verify_dpop_proof(
     timestamp: i64,
     expected_key_hash: &[u8; 64],
 ) -> bool {
+    // 0. Timestamp freshness check — reject stale or future-dated proofs
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before UNIX epoch")
+        .as_secs() as i64;
+    if (now - timestamp).abs() > DPOP_MAX_AGE_SECS {
+        return false;
+    }
+
     // 1. Verify the key hash matches
     let vk_bytes = verifying_key.encode();
     let hash = dpop_key_hash(vk_bytes.as_ref());
@@ -178,6 +193,14 @@ mod tests {
             .expect("thread panicked");
     }
 
+    /// Return the current UNIX timestamp for use in tests that need fresh proofs.
+    fn now_secs() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
     #[test]
     fn test_dpop_key_hash_deterministic() {
         let key = [0x42u8; 32];
@@ -202,7 +225,7 @@ mod tests {
             let vk_bytes = vk.encode();
             let expected_hash = dpop_key_hash(vk_bytes.as_ref());
             let claims = b"claims";
-            let timestamp = 1000i64;
+            let timestamp = now_secs();
             let proof = generate_dpop_proof(guarded_sk.signing_key(), claims, timestamp);
             assert!(verify_dpop_proof(&vk, &proof, claims, timestamp, &expected_hash));
         });
@@ -215,7 +238,7 @@ mod tests {
             let vk_bytes = vk.encode();
             let expected_hash = dpop_key_hash(vk_bytes.as_ref());
             let claims = b"claims";
-            let timestamp = 1000i64;
+            let timestamp = now_secs();
             let proof = generate_dpop_proof(&sk, claims, timestamp);
             assert!(verify_dpop_proof(&vk, &proof, claims, timestamp, &expected_hash));
         });
@@ -229,7 +252,7 @@ mod tests {
             let vk2_bytes = vk2.encode();
             let expected_hash = dpop_key_hash(vk2_bytes.as_ref());
             let claims = b"claims";
-            let timestamp = 1000i64;
+            let timestamp = now_secs();
             let proof = generate_dpop_proof(&sk, claims, timestamp);
             // Signature was made with sk (whose vk != vk2), so verification fails
             assert!(!verify_dpop_proof(&vk2, &proof, claims, timestamp, &expected_hash));
@@ -243,7 +266,7 @@ mod tests {
             let vk_bytes = vk.encode();
             let expected_hash = dpop_key_hash(vk_bytes.as_ref());
             let bad_proof = vec![0u8; 64];
-            assert!(!verify_dpop_proof(&vk, &bad_proof, b"claims", 1000, &expected_hash));
+            assert!(!verify_dpop_proof(&vk, &bad_proof, b"claims", now_secs(), &expected_hash));
         });
     }
 
@@ -254,8 +277,38 @@ mod tests {
             let vk_bytes = vk.encode();
             let expected_hash = dpop_key_hash(vk_bytes.as_ref());
             let claims = b"claims";
-            let proof = generate_dpop_proof(&sk, claims, 1000);
-            assert!(!verify_dpop_proof(&vk, &proof, claims, 9999, &expected_hash));
+            let ts = now_secs();
+            let proof = generate_dpop_proof(&sk, claims, ts);
+            // Verify with a wildly different timestamp — signature won't match
+            assert!(!verify_dpop_proof(&vk, &proof, claims, ts + 9999, &expected_hash));
+        });
+    }
+
+    #[test]
+    fn test_dpop_stale_timestamp_rejected() {
+        run_with_large_stack(|| {
+            let (sk, vk) = generate_dpop_keypair_raw();
+            let vk_bytes = vk.encode();
+            let expected_hash = dpop_key_hash(vk_bytes.as_ref());
+            let claims = b"claims";
+            // Proof created 60 seconds ago — exceeds DPOP_MAX_AGE_SECS (30s)
+            let old_timestamp = now_secs() - 60;
+            let proof = generate_dpop_proof(&sk, claims, old_timestamp);
+            assert!(!verify_dpop_proof(&vk, &proof, claims, old_timestamp, &expected_hash));
+        });
+    }
+
+    #[test]
+    fn test_dpop_future_timestamp_rejected() {
+        run_with_large_stack(|| {
+            let (sk, vk) = generate_dpop_keypair_raw();
+            let vk_bytes = vk.encode();
+            let expected_hash = dpop_key_hash(vk_bytes.as_ref());
+            let claims = b"claims";
+            // Proof dated 60 seconds in the future — exceeds DPOP_MAX_AGE_SECS (30s)
+            let future_timestamp = now_secs() + 60;
+            let proof = generate_dpop_proof(&sk, claims, future_timestamp);
+            assert!(!verify_dpop_proof(&vk, &proof, claims, future_timestamp, &expected_hash));
         });
     }
 
@@ -264,7 +317,7 @@ mod tests {
         run_with_large_stack(|| {
             let (sk, vk) = generate_dpop_keypair_raw();
             let claims = b"claims";
-            let timestamp = 1000i64;
+            let timestamp = now_secs();
             let proof = generate_dpop_proof(&sk, claims, timestamp);
             let wrong_hash = [0xFFu8; 64];
             assert!(!verify_dpop_proof(&vk, &proof, claims, timestamp, &wrong_hash));
@@ -277,11 +330,12 @@ mod tests {
             let (guarded_sk, vk) = generate_dpop_keypair();
             let vk_bytes = vk.encode();
             let expected_hash = dpop_key_hash(vk_bytes.as_ref());
-            let proof = generate_dpop_proof(guarded_sk.signing_key(), b"test", 42);
+            let ts = now_secs();
+            let proof = generate_dpop_proof(guarded_sk.signing_key(), b"test", ts);
             // Explicitly drop — should zeroize without panic.
             drop(guarded_sk);
             // Proof generated before drop should still verify.
-            assert!(verify_dpop_proof(&vk, &proof, b"test", 42, &expected_hash));
+            assert!(verify_dpop_proof(&vk, &proof, b"test", ts, &expected_hash));
         });
     }
 }
