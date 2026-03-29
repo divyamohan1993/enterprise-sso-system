@@ -1,0 +1,231 @@
+# Gateway — NodePort for external access
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: milnet
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: gateway
+  ports:
+    - name: https
+      port: 9100
+      targetPort: 9100
+      nodePort: 30443
+    - name: health
+      port: 10100
+      targetPort: 10100
+---
+# Orchestrator
+apiVersion: v1
+kind: Service
+metadata:
+  name: orchestrator
+  namespace: milnet
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: orchestrator
+  ports:
+    - name: service
+      port: 9101
+      targetPort: 9101
+    - name: health
+      port: 10101
+      targetPort: 10101
+  publishNotReadyAddresses: true
+---
+# OPAQUE
+apiVersion: v1
+kind: Service
+metadata:
+  name: opaque
+  namespace: milnet
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: opaque
+  ports:
+    - name: service
+      port: 9102
+      targetPort: 9102
+    - name: health
+      port: 10102
+      targetPort: 10102
+  publishNotReadyAddresses: true
+---
+# TSS Coordinator
+apiVersion: v1
+kind: Service
+metadata:
+  name: tss-coordinator
+  namespace: milnet
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: tss-coordinator
+  ports:
+    - name: service
+      port: 9103
+      targetPort: 9103
+    - name: health
+      port: 10103
+      targetPort: 10103
+  publishNotReadyAddresses: true
+---
+# TSS Signer
+apiVersion: v1
+kind: Service
+metadata:
+  name: tss-signer
+  namespace: milnet
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: tss-signer
+  ports:
+    - name: signer-0
+      port: 9110
+      targetPort: 9110
+    - name: signer-1
+      port: 9111
+      targetPort: 9111
+    - name: signer-2
+      port: 9112
+      targetPort: 9112
+  publishNotReadyAddresses: true
+---
+# Verifier
+apiVersion: v1
+kind: Service
+metadata:
+  name: verifier
+  namespace: milnet
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: verifier
+  ports:
+    - name: service
+      port: 9104
+      targetPort: 9104
+    - name: health
+      port: 10104
+      targetPort: 10104
+---
+# Ratchet
+apiVersion: v1
+kind: Service
+metadata:
+  name: ratchet
+  namespace: milnet
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: ratchet
+  ports:
+    - name: service
+      port: 9105
+      targetPort: 9105
+    - name: health
+      port: 10105
+      targetPort: 10105
+  publishNotReadyAddresses: true
+---
+# Risk
+apiVersion: v1
+kind: Service
+metadata:
+  name: risk
+  namespace: milnet
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: risk
+  ports:
+    - name: service
+      port: 9106
+      targetPort: 9106
+    - name: health
+      port: 10106
+      targetPort: 10106
+---
+# Audit
+apiVersion: v1
+kind: Service
+metadata:
+  name: audit
+  namespace: milnet
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: audit
+  ports:
+    - name: service
+      port: 9108
+      targetPort: 9108
+    - name: health
+      port: 10108
+      targetPort: 10108
+  publishNotReadyAddresses: true
+---
+# KT
+apiVersion: v1
+kind: Service
+metadata:
+  name: kt
+  namespace: milnet
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: kt
+  ports:
+    - name: service
+      port: 9109
+      targetPort: 9109
+    - name: health
+      port: 10109
+      targetPort: 10109
+  publishNotReadyAddresses: true
+---
+# Admin — NodePort for external access
+apiVersion: v1
+kind: Service
+metadata:
+  name: admin
+  namespace: milnet
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: admin
+  ports:
+    - name: service
+      port: 8080
+      targetPort: 8080
+      nodePort: 30080
+    - name: health
+      port: 9080
+      targetPort: 9080
+---
+# PostgreSQL
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: milnet
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432

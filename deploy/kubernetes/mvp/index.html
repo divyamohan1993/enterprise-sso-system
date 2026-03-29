@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MILNET SSO — MVP Test Dashboard</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'Courier New', monospace; background: #0a0a0a; color: #00ff41; padding: 2rem; }
+    h1 { font-size: 1.8rem; margin-bottom: 0.5rem; border-bottom: 2px solid #00ff41; padding-bottom: 0.5rem; }
+    .subtitle { color: #888; font-size: 0.9rem; margin-bottom: 2rem; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 1.5rem; margin-bottom: 2rem; }
+    .card {
+      border: 1px solid #333; padding: 1.2rem; border-radius: 4px;
+      background: #111; transition: border-color 0.3s;
+    }
+    .card:hover { border-color: #00ff41; }
+    .card h2 { font-size: 1.1rem; margin-bottom: 0.5rem; }
+    .card .port { color: #888; font-size: 0.85rem; }
+    .card a { color: #00bfff; text-decoration: none; }
+    .card a:hover { text-decoration: underline; }
+    .status { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 8px; }
+    .status.up { background: #00ff41; }
+    .status.down { background: #ff4141; }
+    .status.unknown { background: #888; }
+    .creds {
+      border: 1px solid #ff4141; padding: 1rem; border-radius: 4px;
+      background: #1a0000; margin-bottom: 2rem;
+    }
+    .creds h2 { color: #ff4141; margin-bottom: 0.5rem; }
+    .creds code { color: #ffaa00; }
+    table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
+    th, td { text-align: left; padding: 0.5rem; border-bottom: 1px solid #222; }
+    th { color: #888; }
+    .section-title { font-size: 1.2rem; margin: 2rem 0 1rem; border-bottom: 1px solid #333; padding-bottom: 0.3rem; }
+    #pod-status { margin-top: 1rem; }
+    #pod-status pre { background: #111; padding: 1rem; border-radius: 4px; overflow-x: auto; font-size: 0.8rem; color: #ccc; }
+  </style>
+</head>
+<body>
+  <h1>&#9608; MILNET SSO — MVP Test Dashboard</h1>
+  <p class="subtitle">Single-node k3s cluster &bull; c2-standard-8 &bull; asia-south1-a &bull; DEV MODE</p>
+
+  <div class="creds">
+    <h2>&#9888; Public Test Credentials</h2>
+    <table>
+      <tr><th>Service</th><th>Username</th><th>Password</th></tr>
+      <tr><td>Grafana</td><td><code>admin</code></td><td><code>milnet-mvp-2026</code></td></tr>
+      <tr><td>PostgreSQL</td><td><code>milnet</code></td><td><code>milnet-mvp-db</code></td></tr>
+    </table>
+  </div>
+
+  <h3 class="section-title">Monitoring</h3>
+  <div class="grid">
+    <div class="card">
+      <h2><span class="status unknown" id="s-grafana"></span>Grafana</h2>
+      <p class="port">NodePort 30300</p>
+      <p><a href="/grafana/" id="link-grafana">Open Grafana Dashboard</a></p>
+    </div>
+    <div class="card">
+      <h2><span class="status unknown" id="s-prometheus"></span>Prometheus</h2>
+      <p class="port">NodePort 30900</p>
+      <p><a href="/prometheus/" id="link-prometheus">Open Prometheus UI</a></p>
+    </div>
+  </div>
+
+  <h3 class="section-title">SSO Services</h3>
+  <div class="grid">
+    <div class="card">
+      <h2><span class="status unknown" id="s-gateway"></span>Gateway</h2>
+      <p class="port">Port 9100 &rarr; NodePort 30443</p>
+      <p>TLS termination, external ingress</p>
+    </div>
+    <div class="card">
+      <h2><span class="status unknown" id="s-admin"></span>Admin Panel</h2>
+      <p class="port">Port 8080 &rarr; NodePort 30080</p>
+      <p><a href="http://HOST:30080" id="link-admin">Open Admin Panel</a></p>
+    </div>
+    <div class="card">
+      <h2><span class="status unknown" id="s-orchestrator"></span>Orchestrator</h2>
+      <p class="port">Port 9101 (ClusterIP)</p>
+      <p>Auth flow coordination, SHARD protocol</p>
+    </div>
+    <div class="card">
+      <h2><span class="status unknown" id="s-opaque"></span>OPAQUE</h2>
+      <p class="port">Port 9102 (ClusterIP)</p>
+      <p>Threshold OPAQUE password protocol</p>
+    </div>
+    <div class="card">
+      <h2><span class="status unknown" id="s-tss-coordinator"></span>TSS Coordinator</h2>
+      <p class="port">Port 9103 (ClusterIP)</p>
+      <p>Routes signing requests to signers</p>
+    </div>
+    <div class="card">
+      <h2><span class="status unknown" id="s-tss-signer"></span>TSS Signers (3x)</h2>
+      <p class="port">Ports 9110-9112 (ClusterIP)</p>
+      <p>FROST 2-of-3 threshold signing</p>
+    </div>
+    <div class="card">
+      <h2><span class="status unknown" id="s-verifier"></span>Verifier</h2>
+      <p class="port">Port 9104 (ClusterIP)</p>
+      <p>O(1) token verification</p>
+    </div>
+    <div class="card">
+      <h2><span class="status unknown" id="s-ratchet"></span>Ratchet</h2>
+      <p class="port">Port 9105 (ClusterIP)</p>
+      <p>Session ratcheting &amp; key rotation</p>
+    </div>
+    <div class="card">
+      <h2><span class="status unknown" id="s-risk"></span>Risk Engine</h2>
+      <p class="port">Port 9106 (ClusterIP)</p>
+      <p>Risk scoring for auth decisions</p>
+    </div>
+    <div class="card">
+      <h2><span class="status unknown" id="s-audit"></span>Audit Log</h2>
+      <p class="port">Port 9108 (ClusterIP)</p>
+      <p>BFT append-only audit trail</p>
+    </div>
+    <div class="card">
+      <h2><span class="status unknown" id="s-kt"></span>Key Transparency</h2>
+      <p class="port">Port 9109 (ClusterIP)</p>
+      <p>Merkle tree key transparency log</p>
+    </div>
+    <div class="card">
+      <h2><span class="status unknown" id="s-postgres"></span>PostgreSQL</h2>
+      <p class="port">Port 5432 (ClusterIP)</p>
+      <p>Single-instance, no replication</p>
+    </div>
+  </div>
+
+  <h3 class="section-title">Pod Status (auto-refresh)</h3>
+  <div id="pod-status"><pre>Loading...</pre></div>
+
+  <script>
+    // Replace HOST placeholder with actual hostname
+    const host = window.location.hostname;
+    document.querySelectorAll('a[href*="HOST"]').forEach(a => {
+      a.href = a.href.replace('HOST', host);
+    });
+    document.getElementById('link-grafana').href = 'http://' + host + ':30300';
+    document.getElementById('link-prometheus').href = 'http://' + host + ':30900';
+    document.getElementById('link-admin').href = 'http://' + host + ':30080';
+  </script>
+</body>
+</html>

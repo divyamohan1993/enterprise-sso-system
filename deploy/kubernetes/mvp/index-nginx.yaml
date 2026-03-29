@@ -1,0 +1,76 @@
+# Nginx serving the MVP dashboard index page on port 80
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: index-page
+  namespace: milnet
+data:
+  # index.html is mounted from the configmap — deploy.sh will create it
+  nginx.conf: |
+    server {
+        listen 80;
+        server_name _;
+        root /usr/share/nginx/html;
+        index index.html;
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: index-page
+  namespace: milnet
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: index-page
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: index-page
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.27-alpine
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          volumeMounts:
+            - name: html
+              mountPath: /usr/share/nginx/html
+            - name: conf
+              mountPath: /etc/nginx/conf.d
+      volumes:
+        - name: html
+          configMap:
+            name: index-html
+        - name: conf
+          configMap:
+            name: index-page
+            items:
+              - key: nginx.conf
+                path: default.conf
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: index-page
+  namespace: milnet
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: index-page
+  ports:
+    - port: 80
+      targetPort: 80
+      nodePort: 30000

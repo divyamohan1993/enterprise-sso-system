@@ -1,0 +1,55 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: milnet-common-config
+  namespace: milnet
+data:
+  # Dev mode — relaxes production security requirements
+  MILNET_DEV_MODE: "1"
+  MILNET_PRODUCTION: "0"
+  MILNET_MILITARY_DEPLOYMENT: "0"
+  MILNET_FIPS_MODE: "0"
+  MILNET_PQ_TLS_ONLY: "0"
+  MILNET_ERROR_LEVEL: "verbose"
+
+  # Service discovery (K8s DNS)
+  OPAQUE_ADDR: "opaque.milnet.svc.cluster.local:9102"
+  TSS_ADDR: "tss-coordinator.milnet.svc.cluster.local:9103"
+  VERIFIER_ADDR: "verifier.milnet.svc.cluster.local:9104"
+  RATCHET_ADDR: "ratchet.milnet.svc.cluster.local:9105"
+  RISK_ADDR: "risk.milnet.svc.cluster.local:9106"
+  AUDIT_ADDR: "audit.milnet.svc.cluster.local:9108"
+  KT_ADDR: "kt.milnet.svc.cluster.local:9109"
+
+  # TLS
+  MILNET_CERT_LIFETIME_HOURS: "8760"
+  MILNET_CERT_ROTATION_THRESHOLD: "0.8"
+
+  # Rate limiting (relaxed for dev)
+  MILNET_RATE_LIMIT_PER_IP: "1000"
+  MILNET_RATE_LIMIT_PER_USER: "500"
+  MILNET_RATE_LIMIT_WINDOW_SECS: "60"
+  MILNET_RATE_LIMIT_BURST: "200"
+
+  # TSS — 2-of-3 threshold for MVP
+  MILNET_TSS_THRESHOLD: "2"
+  MILNET_TSS_MODE: "distributed"
+  MILNET_TSS_SIGNING_TIMEOUT_SECS: "30"
+
+  # OPAQUE
+  MILNET_OPAQUE_MODE: "threshold"
+
+  # Adaptive crypto
+  MILNET_ADAPTIVE_DEBOUNCE_SECS: "10"
+
+  # Audit
+  AUDIT_DATA_DIR: "/var/lib/milnet/audit"
+
+  # TSS nonce
+  MILNET_TSS_NONCE_STATE_PATH: "/var/lib/milnet/tss_nonce_state"
+
+  # SIEM disabled for MVP
+  MILNET_SIEM_ENABLED: "false"
+
+  # Logging — verbose for debugging
+  RUST_LOG: "debug,milnet=trace"

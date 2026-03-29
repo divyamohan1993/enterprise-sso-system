@@ -1,0 +1,591 @@
+# MILNET SSO — MVP Workloads (all single-replica, dev mode)
+# All services use MILNET_DEV_MODE=1 which relaxes TLS/crypto requirements.
+---
+# ── Gateway ──────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: milnet
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gateway
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "10100"
+    spec:
+      containers:
+        - name: gateway
+          image: milnet/gateway:dev
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 9100
+            - containerPort: 10100
+          envFrom:
+            - configMapRef:
+                name: milnet-common-config
+          env:
+            - name: GATEWAY_BIND_ADDR
+              value: "0.0.0.0:9100"
+            - name: MILNET_ORCHESTRATOR_ENDPOINTS
+              value: "orchestrator.milnet.svc.cluster.local:9101"
+            - name: MILNET_MASTER_KEK
+              valueFrom:
+                secretKeyRef:
+                  name: milnet-master-kek
+                  key: MILNET_MASTER_KEK
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+# ── Orchestrator ─────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orchestrator
+  namespace: milnet
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: orchestrator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: orchestrator
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "10101"
+    spec:
+      containers:
+        - name: orchestrator
+          image: milnet/orchestrator:dev
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 9101
+            - containerPort: 10101
+          envFrom:
+            - configMapRef:
+                name: milnet-common-config
+          env:
+            - name: ORCH_LISTEN_ADDR
+              value: "0.0.0.0:9101"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: milnet-database
+                  key: DATABASE_URL
+            - name: MILNET_MASTER_KEK
+              valueFrom:
+                secretKeyRef:
+                  name: milnet-master-kek
+                  key: MILNET_MASTER_KEK
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+# ── TSS Coordinator ──────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tss-coordinator
+  namespace: milnet
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tss-coordinator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: tss-coordinator
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "10103"
+    spec:
+      containers:
+        - name: tss-coordinator
+          image: milnet/tss:dev
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 9103
+            - containerPort: 10103
+          envFrom:
+            - configMapRef:
+                name: milnet-common-config
+          env:
+            - name: MILNET_TSS_ROLE
+              value: "coordinator"
+            - name: MILNET_TSS_LISTEN_ADDR
+              value: "0.0.0.0:9103"
+            - name: MILNET_MASTER_KEK
+              valueFrom:
+                secretKeyRef:
+                  name: milnet-master-kek
+                  key: MILNET_MASTER_KEK
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+# ── TSS Signers (3 replicas for 2-of-3 threshold) ───────────────────────────
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: tss-signer
+  namespace: milnet
+spec:
+  replicas: 3
+  serviceName: tss-signer
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tss-signer
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: tss-signer
+      annotations:
+        prometheus.io/scrape: "true"
+    spec:
+      containers:
+        - name: tss-signer
+          image: milnet/tss:dev
+          imagePullPolicy: Never
+          envFrom:
+            - configMapRef:
+                name: milnet-common-config
+          env:
+            - name: MILNET_TSS_ROLE
+              value: "signer"
+            - name: MILNET_MASTER_KEK
+              valueFrom:
+                secretKeyRef:
+                  name: milnet-master-kek
+                  key: MILNET_MASTER_KEK
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: tss-state
+              mountPath: /var/lib/milnet
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: tss-state
+          emptyDir: {}
+---
+# ── OPAQUE ───────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opaque
+  namespace: milnet
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: opaque
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: opaque
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "10102"
+    spec:
+      containers:
+        - name: opaque
+          image: milnet/opaque:dev
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 9102
+            - containerPort: 10102
+          envFrom:
+            - configMapRef:
+                name: milnet-common-config
+          env:
+            - name: MILNET_OPAQUE_LISTEN_ADDR
+              value: "0.0.0.0:9102"
+            - name: MILNET_MASTER_KEK
+              valueFrom:
+                secretKeyRef:
+                  name: milnet-master-kek
+                  key: MILNET_MASTER_KEK
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+# ── Verifier ─────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: verifier
+  namespace: milnet
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: verifier
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: verifier
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "10104"
+    spec:
+      containers:
+        - name: verifier
+          image: milnet/verifier:dev
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 9104
+            - containerPort: 10104
+          envFrom:
+            - configMapRef:
+                name: milnet-common-config
+          env:
+            - name: MILNET_VERIFIER_LISTEN_ADDR
+              value: "0.0.0.0:9104"
+            - name: MILNET_MASTER_KEK
+              valueFrom:
+                secretKeyRef:
+                  name: milnet-master-kek
+                  key: MILNET_MASTER_KEK
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+# ── Ratchet ──────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ratchet
+  namespace: milnet
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ratchet
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ratchet
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "10105"
+    spec:
+      containers:
+        - name: ratchet
+          image: milnet/ratchet:dev
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 9105
+            - containerPort: 10105
+          envFrom:
+            - configMapRef:
+                name: milnet-common-config
+          env:
+            - name: MILNET_RATCHET_LISTEN_ADDR
+              value: "0.0.0.0:9105"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: milnet-database
+                  key: DATABASE_URL
+            - name: MILNET_MASTER_KEK
+              valueFrom:
+                secretKeyRef:
+                  name: milnet-master-kek
+                  key: MILNET_MASTER_KEK
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+# ── Risk ─────────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: risk
+  namespace: milnet
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: risk
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: risk
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "10106"
+    spec:
+      containers:
+        - name: risk
+          image: milnet/risk:dev
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 9106
+            - containerPort: 10106
+          envFrom:
+            - configMapRef:
+                name: milnet-common-config
+          env:
+            - name: MILNET_RISK_LISTEN_ADDR
+              value: "0.0.0.0:9106"
+            - name: MILNET_MASTER_KEK
+              valueFrom:
+                secretKeyRef:
+                  name: milnet-master-kek
+                  key: MILNET_MASTER_KEK
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+# ── Audit ────────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: audit
+  namespace: milnet
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: audit
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: audit
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "10108"
+    spec:
+      containers:
+        - name: audit
+          image: milnet/audit:dev
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 9108
+            - containerPort: 10108
+          envFrom:
+            - configMapRef:
+                name: milnet-common-config
+          env:
+            - name: MILNET_AUDIT_LISTEN_ADDR
+              value: "0.0.0.0:9108"
+            - name: MILNET_MASTER_KEK
+              valueFrom:
+                secretKeyRef:
+                  name: milnet-master-kek
+                  key: MILNET_MASTER_KEK
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: audit-data
+              mountPath: /var/lib/milnet/audit
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: audit-data
+          emptyDir: {}
+---
+# ── KT (Key Transparency) ───────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kt
+  namespace: milnet
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kt
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kt
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "10109"
+    spec:
+      containers:
+        - name: kt
+          image: milnet/kt:dev
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 9109
+            - containerPort: 10109
+          envFrom:
+            - configMapRef:
+                name: milnet-common-config
+          env:
+            - name: MILNET_KT_LISTEN_ADDR
+              value: "0.0.0.0:9109"
+            - name: MILNET_MASTER_KEK
+              valueFrom:
+                secretKeyRef:
+                  name: milnet-master-kek
+                  key: MILNET_MASTER_KEK
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: kt-data
+              mountPath: /var/lib/milnet/kt
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: kt-data
+          emptyDir: {}
+---
+# ── Admin ────────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: admin
+  namespace: milnet
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: admin
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: admin
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9080"
+    spec:
+      containers:
+        - name: admin
+          image: milnet/admin:dev
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8080
+            - containerPort: 9080
+          envFrom:
+            - configMapRef:
+                name: milnet-common-config
+          env:
+            - name: ADMIN_BIND_ADDR
+              value: "0.0.0.0:8080"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: milnet-database
+                  key: DATABASE_URL
+            - name: MILNET_MASTER_KEK
+              valueFrom:
+                secretKeyRef:
+                  name: milnet-master-kek
+                  key: MILNET_MASTER_KEK
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
