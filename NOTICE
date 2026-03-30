@@ -1,9 +1,10 @@
 MILNET SSO System
-Copyright (c) 2026 Divya Mohan (https://dmj.one)
+Copyright 2025-2026 Divya Mohan (https://dmj.one)
+Licensed under the Apache License, Version 2.0
 
 This software was designed and built through a human-AI collaboration:
 
-  Creator & Project Lead:
+  Creator, Architect & Project Lead:
     Divya Mohan (https://dmj.one)
     GitHub: @divyamohan1993
 
@@ -12,8 +13,8 @@ This software was designed and built through a human-AI collaboration:
     Role: Architecture design, security specification, red team analysis,
           implementation planning, code generation, and test development
 
-This notice must be preserved in all copies or substantial portions
-of the software, as required by the MIT License above.
+This NOTICE file must be preserved in all copies or substantial portions
+of the software, as required by the Apache License, Version 2.0.
 
 ---
 

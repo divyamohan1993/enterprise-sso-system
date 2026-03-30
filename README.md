@@ -83,8 +83,27 @@ cargo test --workspace
 
 190+ tests covering cryptographic correctness, end-to-end ceremony flows, attack simulations, chaos injection, and compliance validation.
 
+## Intellectual Property
+
+This system contains original cryptographic architecture, protocol designs, and security innovations created by [Divya Mohan](https://dmj.one). Key original contributions include:
+
+- **Threshold-wrapped post-quantum SSO** — FROST 3-of-5 + ML-DSA-87 combined signing (no known prior implementation in SSO)
+- **Server-blind threshold authentication** — OPAQUE 2-of-3 Shamir with post-quantum ceremony receipts
+- **30-second forward-secret ratcheting** — HKDF-SHA512 epoch-based key erasure with memory-locked canary protection
+- **Honey encryption with duress detection** — 5 plausible-distribution decoy outputs + silent lockdown PIN
+- **7-node BFT audit with ML-DSA-87 signatures** — Byzantine fault tolerant tamper-evident logging
+- **Moving Target Defense integration** — auto-mutating keys, ports, and certificates across 21 isolated VMs
+
+These designs represent trade secrets and proprietary innovations. The specific combination, architecture, and implementation are original work.
+
 ## License
 
-MIT — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+This license includes a **patent retaliation clause** (Section 3): if you use this software and then file a patent lawsuit claiming it infringes your patents, your license to use this software is automatically terminated.
 
 Created by [Divya Mohan](https://dmj.one). AI architecture partner: Claude (Anthropic).
+
+## Disclaimer
+
+This software is provided for evaluation and research purposes. The cryptographic implementations use pre-release libraries (ml-dsa 0.1.0-rc.7, ml-kem 0.2) and have not undergone FIPS 140-3 CMVP validation. Do not deploy in production without independent security audit and certification.

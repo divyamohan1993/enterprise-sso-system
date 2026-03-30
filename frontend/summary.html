@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MILNET SSO — Technical Summary Sheet</title>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://api.fontshare.com/v2/css?f[]=sentient@400,500,600,700&display=swap" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/geist@1/dist/fonts/geist-sans/style.css" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/geist@1/dist/fonts/geist-mono/style.css" rel="stylesheet">
+<style>
+  @page { size: A4 portrait; margin: 0; }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --fd: 'Instrument Serif', Georgia, serif;
+    --fh: 'Sentient', Georgia, serif;
+    --fl: 'Geist', system-ui, sans-serif;
+    --fu: 'Inter', system-ui, sans-serif;
+    --f:  'Times New Roman', Times, serif;
+    --fm: 'Geist Mono', monospace;
+    --s9: #0c0f1a; --s7: #2e3347; --s5: #6b7280; --s4: #9ca3af;
+    --s2: #e5e7eb; --s1: #f3f4f6;
+    --g: #059669; --b: #3b82f6; --a: #f59e0b; --p: #8b5cf6; --c: #06b6d4; --r: #ef4444;
+  }
+
+  html { font-size: 13.33px; }
+  body {
+    background: #fafafc;
+    color: var(--s9); font-family: var(--f);
+    width: 210mm; height: 297mm; margin: 0 auto;
+    padding: 0; overflow: hidden;
+    display: flex; flex-direction: column;
+    position: relative;
+  }
+
+  /* ── Ambient gradient mesh ──────────────────────────────────────────── */
+  body::before {
+    content: ''; position: absolute; inset: 0; z-index: 0; pointer-events: none;
+    background:
+      radial-gradient(ellipse 60% 50% at 15% 5%, rgba(5,150,105,0.07), transparent),
+      radial-gradient(ellipse 50% 40% at 85% 8%, rgba(59,130,246,0.07), transparent),
+      radial-gradient(ellipse 40% 35% at 50% 95%, rgba(139,92,246,0.05), transparent),
+      radial-gradient(ellipse 30% 30% at 75% 50%, rgba(6,182,212,0.03), transparent);
+  }
+  /* ── Subtle noise texture ───────────────────────────────────────────── */
+  body::after {
+    content: ''; position: absolute; inset: 0; z-index: 0; pointer-events: none;
+    opacity: 0.3;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.04'/%3E%3C/svg%3E");
+  }
+  body > * { position: relative; z-index: 1; }
+
+  .wm {
+    position: fixed; top: 50%; left: 50%;
+    transform: translate(-50%,-50%) rotate(-35deg);
+    font: 400 5rem var(--fd); color: rgba(0,0,0,0.015);
+    letter-spacing: 14px; text-transform: uppercase;
+    pointer-events: none; z-index: 0; white-space: nowrap; user-select: none;
+  }
+
+  /* ═══ HEADER ══════════════════════════════════════════════════════════ */
+  .hdr {
+    padding: 0.5rem 1.2rem;
+    display: flex; justify-content: space-between; align-items: center;
+    background: linear-gradient(135deg, #0c0f1a 0%, #131a2e 40%, #0e1a2d 100%);
+    position: relative; overflow: hidden;
+  }
+  /* Shimmer accent line */
+  .hdr::after {
+    content: ''; position: absolute; bottom: 0; left: 0; right: 0; height: 2px;
+    background: linear-gradient(90deg,
+      var(--g) 0%, var(--b) 25%, var(--p) 50%, var(--c) 75%, var(--g) 100%);
+  }
+  /* Ambient glow behind title */
+  .hdr::before {
+    content: ''; position: absolute; top: -20px; left: 30px;
+    width: 180px; height: 80px;
+    background: radial-gradient(ellipse, rgba(5,150,105,0.15), transparent 70%);
+    z-index: 0; pointer-events: none;
+  }
+  .hdr > * { position: relative; z-index: 1; }
+  .hdr h1 {
+    font: 400 1.8rem/1 var(--fd); color: #fff;
+    letter-spacing: 2px;
+    text-shadow: 0 0 30px rgba(5,150,105,0.3), 0 0 60px rgba(59,130,246,0.15);
+  }
+  .hdr .sub {
+    font: 400 0.88rem/1.3 var(--fu); color: #94a3b8;
+    margin-top: 0.1rem;
+  }
+  .hdr .rt { text-align: right; }
+  .hdr .badge {
+    display: inline-block; padding: 0.18rem 0.55rem; border-radius: 6px;
+    font: 600 0.75rem var(--fl); letter-spacing: 0.8px; text-transform: uppercase;
+    background: linear-gradient(135deg, rgba(250,204,21,0.15), rgba(250,204,21,0.05));
+    color: #facc15;
+    border: 1px solid rgba(250,204,21,0.25);
+    box-shadow: 0 0 12px rgba(250,204,21,0.1);
+  }
+  .hdr .meta { font: 400 0.78rem var(--fu); color: #64748b; margin-top: 0.12rem; }
+
+  /* ═══ CONTENT ════════════════════════════════════════════════════════ */
+  .ct {
+    flex: 1; padding: 0.4rem 1.1rem 0.2rem;
+    display: flex; flex-direction: column; gap: 0.45rem;
+  }
+
+  /* ═══ HERO ═══════════════════════════════════════════════════════════ */
+  .hero {
+    background: linear-gradient(135deg, #0c0f1a 0%, #162032 50%, #0f1729 100%);
+    border-radius: 12px; padding: 0.5rem 1rem 0.4rem;
+    text-align: center; color: #fff;
+    box-shadow:
+      0 4px 24px rgba(15,23,42,0.2),
+      0 1px 3px rgba(15,23,42,0.1),
+      inset 0 1px 0 rgba(255,255,255,0.05);
+  }
+  .hero .hook {
+    font: 400 1.05rem/1 var(--fd); color: var(--s4);
+    margin-bottom: 0.2rem;
+  }
+  .hero h2 { font: 400 1.3rem/1.3 var(--fd); }
+  .hero h2 em { font-style: italic; color: #facc15; }
+  .hero .nums {
+    display: flex; justify-content: center; gap: 0.35rem;
+    margin-top: 0.35rem;
+    padding-top: 0.3rem;
+    border-top: 1px solid rgba(255,255,255,0.08);
+  }
+  .hero .n { text-align: center; padding: 0 0.2rem; }
+  .hero .nv { font: 700 1.15rem/1 var(--fl); color: #fff; }
+  .hero .nl { font: 500 0.68rem/1.2 var(--fu); color: var(--s4); text-transform: uppercase; letter-spacing: 0.3px; margin-top: 0.04rem; }
+  .hero .dv { width: 1px; background: rgba(255,255,255,0.1); align-self: stretch; }
+
+  /* ═══ CARDS ══════════════════════════════════════════════════════════ */
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.45rem; }
+
+  .card {
+    background: rgba(255,255,255,0.55);
+    backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+    border: 1px solid rgba(255,255,255,0.6);
+    border-radius: 10px;
+    padding: 0.45rem 0.55rem;
+    box-shadow:
+      0 1px 3px rgba(0,0,0,0.04),
+      0 4px 12px rgba(0,0,0,0.02),
+      inset 0 1px 0 rgba(255,255,255,0.8);
+    position: relative;
+    overflow: hidden;
+  }
+  /* Colored top edge glow */
+  .card::before {
+    content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2.5px;
+    border-radius: 10px 10px 0 0;
+  }
+  .card h3 {
+    font: 600 1.05rem/1.2 var(--fh);
+    margin-bottom: 0.18rem;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .card .pill {
+    font: 600 0.72rem/1 var(--fl);
+    padding: 0.12rem 0.4rem; border-radius: 20px;
+    text-transform: uppercase; letter-spacing: 0.2px;
+    color: #fff;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.1);
+  }
+  .card ul { list-style: none; }
+  .card li {
+    font: 400 0.95rem/1.5 var(--f); color: var(--s7);
+    padding: 0.03rem 0; padding-left: 0.6rem; position: relative;
+  }
+  .card li::before {
+    content: ''; position: absolute; left: 0; top: 0.42rem;
+    width: 5px; height: 5px; border-radius: 50%;
+  }
+  .card li strong { font: 600 0.88rem/1 var(--fm); }
+
+  .card.wide { grid-column: 1 / -1; }
+  .card.wide ul { display: flex; flex-wrap: wrap; }
+  .card.wide li { width: 50%; }
+
+  /* ── Color themes ───────────────────────────────────────────────────── */
+  .card.green::before { background: linear-gradient(90deg, var(--g), #34d399); }
+  .card.green h3 { color: #047857; } .card.green li::before { background: var(--g); }
+  .card.green .pill { background: linear-gradient(135deg, #047857, var(--g)); }
+
+  .card.blue::before { background: linear-gradient(90deg, var(--b), #60a5fa); }
+  .card.blue h3 { color: #1d4ed8; } .card.blue li::before { background: var(--b); }
+  .card.blue .pill { background: linear-gradient(135deg, #1d4ed8, var(--b)); }
+
+  .card.amber::before { background: linear-gradient(90deg, #d97706, #fbbf24); }
+  .card.amber h3 { color: #b45309; } .card.amber li::before { background: #d97706; }
+  .card.amber .pill { background: linear-gradient(135deg, #b45309, #d97706); }
+
+  .card.purple::before { background: linear-gradient(90deg, var(--p), #a78bfa); }
+  .card.purple h3 { color: #6d28d9; } .card.purple li::before { background: var(--p); }
+  .card.purple .pill { background: linear-gradient(135deg, #6d28d9, var(--p)); }
+
+  .card.cyan::before { background: linear-gradient(90deg, var(--c), #22d3ee); }
+  .card.cyan h3 { color: #0e7490; } .card.cyan li::before { background: var(--c); }
+  .card.cyan .pill { background: linear-gradient(135deg, #0e7490, var(--c)); }
+
+  /* ═══ TABLE ═════════════════════════════════════════════════════════ */
+  .tbl-wrap {
+    background: rgba(255,255,255,0.5);
+    backdrop-filter: blur(16px);
+    border: 1px solid rgba(255,255,255,0.6);
+    border-radius: 10px; overflow: hidden;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04), 0 4px 12px rgba(0,0,0,0.02),
+      inset 0 1px 0 rgba(255,255,255,0.8);
+  }
+  .tbl { width: 100%; border-collapse: collapse; font: 400 0.88rem/1.3 var(--f); }
+  .tbl caption {
+    font: 600 1.05rem var(--fh); color: var(--s7);
+    letter-spacing: 0.5px; text-transform: uppercase;
+    text-align: left; padding: 0.25rem 0.45rem 0.12rem;
+  }
+  .tbl th {
+    font: 600 0.7rem/1 var(--fl); letter-spacing: 0.3px; text-transform: uppercase;
+    text-align: left; padding: 0.18rem 0.3rem;
+  }
+  .tbl thead tr {
+    background: linear-gradient(135deg, #0c0f1a, #1e293b);
+    color: #fff;
+  }
+  .tbl th:nth-child(2) {
+    background: linear-gradient(135deg, #047857, var(--g));
+    color: #fff;
+  }
+  .tbl td { padding: 0.14rem 0.3rem; border-top: 1px solid rgba(0,0,0,0.05); color: var(--s7); }
+  .tbl tbody tr { background: rgba(255,255,255,0.3); }
+  .tbl tbody tr:nth-child(even) { background: rgba(243,244,246,0.5); }
+  .tbl td:first-child { font: 600 0.88rem var(--fu); color: var(--s9); }
+  .tbl td:nth-child(2) { color: #047857; font-weight: 600; }
+  .ty { color: #b45309 !important; } .tr { color: var(--r) !important; }
+  .otag { font: 700 0.6rem var(--fl); color: var(--g); letter-spacing: 0.3px; display: block; }
+
+  /* ═══ FOOTER ════════════════════════════════════════════════════════ */
+  .foot {
+    padding: 0.3rem 1.1rem;
+    background: linear-gradient(135deg, #0c0f1a 0%, #162032 50%, #0f1729 100%);
+    color: rgba(255,255,255,0.5);
+    font: 400 0.85rem var(--fu);
+    display: flex; flex-direction: column; gap: 0.15rem;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.05);
+  }
+  .foot .foot-top {
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .foot .foot-top strong { color: #facc15; font-family: var(--fl); font-size: 0.9rem; }
+  .foot .foot-top .date { font: 500 0.9rem var(--fl); color: rgba(255,255,255,0.5); }
+  .foot .foot-tags {
+    display: flex; gap: 0.25rem; flex-wrap: wrap;
+    justify-content: center;
+  }
+  .foot .ft {
+    font: 500 0.72rem var(--fl); letter-spacing: 0.3px; text-transform: uppercase;
+    padding: 0.08rem 0.35rem; border-radius: 20px;
+  }
+  .foot .ft.fc { background: rgba(5,150,105,0.2); color: #6ee7b7; border: 1px solid rgba(5,150,105,0.3); }
+  .foot .ft.fa { background: rgba(139,92,246,0.2); color: #c4b5fd; border: 1px solid rgba(139,92,246,0.3); }
+  .foot .ft.fh { background: rgba(245,158,11,0.15); color: #fcd34d; border: 1px solid rgba(245,158,11,0.25); }
+  .foot .ft.fp { background: rgba(59,130,246,0.2); color: #93c5fd; border: 1px solid rgba(59,130,246,0.3); }
+  .foot .ft.fv { background: rgba(6,182,212,0.2); color: #67e8f9; border: 1px solid rgba(6,182,212,0.3); }
+  .foot-label {
+    font: 600 0.6rem var(--fl); color: rgba(255,255,255,0.35);
+    text-transform: uppercase; letter-spacing: 1px;
+    width: 100%; text-align: center; margin-top: 0.08rem;
+  }
+
+  /* ═══ PRINT ════════════════════════════════════════════════════════ */
+  @media print {
+    @page { size: A4 portrait; margin: 0; }
+    body { width: 210mm; height: 297mm; overflow: hidden; }
+    body::before, body::after { display: none; }
+    .card, .tbl-wrap { backdrop-filter: none; background: #fff; border: 1px solid #e5e7eb; }
+    .hdr { backdrop-filter: none; }
+    .foot { backdrop-filter: none; }
+    .hero { box-shadow: none; }
+    .card::before { height: 3px; }
+    .hdr, .hdr::after, .hdr .badge, .hero, .card, .tbl th, .tbl thead tr, .tbl tbody tr:nth-child(even),
+    .foot, .wm, .card .pill, .card::before, .tbl th:nth-child(2),
+    .foot .ft, .foot .ft.fc, .foot .ft.fa, .foot .ft.fh, .foot .ft.fp, .foot .ft.fv {
+      -webkit-print-color-adjust: exact; print-color-adjust: exact;
+    }
+    .card, .tbl-wrap, .hero { break-inside: avoid; }
+    a[href]::after { content: none !important; }
+  }
+  @media (forced-colors: active) { .card, .tbl-wrap { border: 2px solid CanvasText; } }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+
+<div class="wm" aria-hidden="true">CONFIDENTIAL</div>
+
+<header class="hdr" role="banner">
+  <div>
+    <h1>MILNET Single Sign-On</h1>
+    <div class="sub">One login. Zero secrets. Verified, yet invisible.</div>
+  </div>
+  <div class="rt">
+    <div class="badge">Technical Summary Sheet</div>
+    <div class="meta">CNSA 2.0 Algorithms · NIST Level 5 · Rust 1.88 · 211K LoC</div>
+  </div>
+</header>
+
+<main class="ct" role="main">
+
+  <section class="hero">
+    <p class="hook">Every SSO today trusts the server with your password. This one doesn't.</p>
+    <h2>Post-quantum threshold SSO with <em>server-blind authentication</em> and <em>30-second forward-secret key erasure</em></h2>
+    <div class="nums">
+      <div class="n"><div class="nv">21</div><div class="nl">Isolated VMs</div></div>
+      <div class="dv" role="presentation"></div>
+      <div class="n"><div class="nv">8</div><div class="nl">Security Zones</div></div>
+      <div class="dv" role="presentation"></div>
+      <div class="n"><div class="nv">3-of-5</div><div class="nl">FROST Threshold</div></div>
+      <div class="dv" role="presentation"></div>
+      <div class="n"><div class="nv">7</div><div class="nl">BFT Audit Nodes</div></div>
+      <div class="dv" role="presentation"></div>
+      <div class="n"><div class="nv">30s</div><div class="nl">Key Erasure</div></div>
+      <div class="dv" role="presentation"></div>
+      <div class="n"><div class="nv">1,808</div><div class="nl">Tests</div></div>
+      <div class="dv" role="presentation"></div>
+      <div class="n"><div class="nv">7</div><div class="nl">Fuzz Targets</div></div>
+      <div class="dv" role="presentation"></div>
+      <div class="n"><div class="nv">14</div><div class="nl">Algorithms</div></div>
+      <div class="dv" role="presentation"></div>
+      <div class="n"><div class="nv">84</div><div class="nl">Audit Score</div></div>
+    </div>
+  </section>
+
+  <div style="display:flex; justify-content:center; align-items:center; gap:0.2rem; padding:0.1rem 0; flex-wrap:nowrap;">
+    <span style="font:500 0.7rem var(--fl); color:var(--s5);">Internet</span><span style="color:var(--g);">→</span><span style="font:500 0.7rem var(--fl); color:var(--s7);">Gateway</span><span style="color:var(--g);">→</span><span style="font:500 0.7rem var(--fl); color:var(--s7);">Orchestrator</span><span style="color:var(--g);">→</span><span style="font:600 0.7rem var(--fl); color:var(--b);">OPAQUE</span><span style="color:var(--s4);">|</span><span style="font:600 0.7rem var(--fl); color:var(--b);">FROST</span><span style="color:var(--s4);">|</span><span style="font:600 0.7rem var(--fl); color:var(--b);">Verifier</span><span style="color:var(--g);">→</span><span style="font:500 0.7rem var(--fl); color:var(--s7);">Audit BFT</span><span style="color:var(--g);">→</span><span style="font:500 0.7rem var(--fl); color:var(--s5);">PostgreSQL</span>
+  </div>
+
+  <div class="grid">
+    <section class="card green">
+      <h3>Cryptographic Stack <span class="pill">FIPS 203 / 204 / 205</span></h3>
+      <ul>
+        <li><strong>X-Wing</strong> hybrid KEM: X25519 + ML-KEM-1024</li>
+        <li><strong>FROST 3-of-5</strong> Ed25519 + <strong>ML-DSA-87</strong> PQ wrap</li>
+        <li><strong>OPAQUE</strong> RFC 9497, Ristretto255 + Argon2id</li>
+        <li><strong>AEGIS-256</strong> / AES-256-GCM (runtime FIPS toggle)</li>
+        <li><strong>SLH-DSA</strong> + <strong>LMS/XMSS</strong> hash-based backup sigs</li>
+        <li><strong>HKDF-SHA512</strong> epoch ratchet with key zeroization</li>
+      </ul>
+    </section>
+    <section class="card blue">
+      <h3>Threshold Architecture <span class="pill">No Single Point of Failure</span></h3>
+      <ul>
+        <li><strong>Signing:</strong> FROST 3-of-5 across 5 Confidential VMs</li>
+        <li><strong>Auth:</strong> OPAQUE 2-of-3 Shamir across 3 VMs</li>
+        <li><strong>Audit:</strong> 7-node BFT with SHA-512 hash chain</li>
+        <li><strong>Master KEK:</strong> 3-of-5 Shamir, reconstruct at boot</li>
+        <li><strong>Database:</strong> 3-node PostgreSQL + CMEK + SEV-SNP</li>
+        <li><strong>Guarantee:</strong> N-1 compromised = zero secrets leaked</li>
+      </ul>
+    </section>
+    <section class="card amber">
+      <h3>Host Hardening <span class="pill">Root on VM = Nothing</span></h3>
+      <ul>
+        <li><strong>3-layer:</strong> mlock + DONTDUMP + RLIMIT_CORE=0</li>
+        <li><strong>Seccomp BPF:</strong> blocks ptrace, vm_readv, eBPF</li>
+        <li><strong>22 env vars</strong> sanitized post-init (/proc blocked)</li>
+        <li><strong>Canary:</strong> random u64 sentinels, instant _exit(199)</li>
+        <li><strong>HSM/TPM:</strong> PKCS#11, KMS, TPM 2.0 PCR-sealed</li>
+        <li><strong>Zeroize-on-drop</strong> on all keys, tokens, nonces</li>
+      </ul>
+    </section>
+    <section class="card purple">
+      <h3>Auth Protocols <span class="pill">PQ DPoP · CAC/PIV · AAL3</span></h3>
+      <ul>
+        <li><strong>OAuth 2.1</strong> PKCE S256, 30s auth code expiry</li>
+        <li><strong>SAML 2.0</strong> XXE + assertion replay prevention</li>
+        <li><strong>FIDO2/WebAuthn</strong> + CAC/PIV hardware MFA</li>
+        <li><strong>DPoP ML-DSA-87</strong> post-quantum possession proof</li>
+        <li><strong>Bell-LaPadula:</strong> Unclass → Secret → TS → SCI</li>
+        <li><strong>Constant-time</strong> comparisons + 5ms timing floor</li>
+      </ul>
+    </section>
+    <section class="card wide cyan">
+      <h3>World-First Exclusives &amp; Verification <span class="pill">1,808 Tests · TLA+ Formal Model</span></h3>
+      <ul>
+        <li><strong>Honey encryption:</strong> wrong key = plausible fake data</li>
+        <li><strong>29 E2E</strong> attack suites + 7 libFuzzer nightly</li>
+        <li><strong>Duress PIN:</strong> coerced login triggers lockdown</li>
+        <li><strong>14 NIST KAT</strong> + 40+ proptest properties</li>
+        <li><strong>Key Transparency:</strong> SHA-512 Merkle audit tree</li>
+        <li><strong>7 chaos suites:</strong> Byzantine, clock, crypto</li>
+        <li><strong>6-signal UEBA:</strong> EMA baselines, 4 threat levels</li>
+        <li><strong>9-stage CI/CD:</strong> SBOM + Cosign + SLSA 3</li>
+      </ul>
+    </section>
+  </div>
+
+  <div class="tbl-wrap">
+  <table class="tbl">
+    <caption>Competitive Analysis — Capabilities Only MILNET Has</caption>
+    <thead><tr>
+      <th scope="col">Capability</th><th scope="col">MILNET SSO</th>
+      <th scope="col">DoD CAC/PKI</th><th scope="col">AWS GovCloud</th>
+      <th scope="col">Okta FedRAMP</th><th scope="col">MS Entra</th>
+    </tr></thead>
+    <tbody>
+      <tr><td>Post-Quantum</td><td>ML-KEM-1024 + ML-DSA-87 <span class="otag">ONLY US</span></td><td class="tr">None</td><td class="tr">None</td><td class="tr">None</td><td class="tr">None</td></tr>
+      <tr><td>Server-Blind Auth</td><td>OPAQUE aPAKE <span class="otag">ONLY US</span></td><td class="ty">N/A (cert)</td><td class="tr">Std hash</td><td class="tr">Std hash</td><td class="tr">Std hash</td></tr>
+      <tr><td>Threshold Signing</td><td>FROST + PQ wrap <span class="otag">ONLY US</span></td><td class="tr">Single CA</td><td class="tr">Single KMS</td><td class="tr">Single HSM</td><td class="tr">Single HSM</td></tr>
+      <tr><td>Forward Secrecy</td><td>30s epoch ratchet <span class="otag">ONLY US</span></td><td class="ty">TLS session</td><td class="ty">TLS session</td><td class="tr">None</td><td class="tr">None</td></tr>
+      <tr><td>Tamper-Proof Audit</td><td>BFT hash chain <span class="otag">ONLY US</span></td><td class="ty">Central log</td><td class="ty">CloudTrail</td><td class="ty">Syslog</td><td class="ty">Azure Mon</td></tr>
+      <tr><td>Deception Defense</td><td>Honey encrypt + Duress <span class="otag">ONLY US</span></td><td class="tr">None</td><td class="tr">None</td><td class="tr">None</td><td class="tr">None</td></tr>
+      <tr><td>FIPS 140-3</td><td class="ty">Pending CMVP</td><td>Validated</td><td>Validated</td><td>Validated</td><td>Validated</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="grid">
+    <section class="card green">
+      <h3>Built For <span class="pill">Target Sectors</span></h3>
+      <ul>
+        <li>Defense, Intelligence &amp; Classified Networks</li>
+        <li>Critical Infrastructure &amp; Government SSO</li>
+        <li>Healthcare (HIPAA) &amp; Financial Services</li>
+      </ul>
+    </section>
+    <section class="card blue">
+      <h3>What It Replaces <span class="pill">Legacy Problems</span></h3>
+      <ul>
+        <li>Password-storing servers &amp; single-point signing</li>
+        <li>Static session keys &amp; tamperable audit logs</li>
+        <li>Classical-only crypto vulnerable to quantum attack</li>
+      </ul>
+    </section>
+  </div>
+  <div class="card wide cyan">
+    <h3 style="justify-content:center; border-bottom:none; margin-bottom:0;">
+      <span style="font:400 1.05rem/1.4 var(--fd); color:#0e7490; font-style:italic; text-transform:none; letter-spacing:0;">Your password never exists on any server. Your token can't be forged without breaching 3 of 5 isolated machines. Every session key self-destructs in 30 seconds. Even with root — memory is locked, dumps blocked, secrets gone.</span>
+    </h3>
+  </div>
+
+</main>
+
+<footer class="foot" role="contentinfo">
+  <div style="text-align:center; padding-bottom:0.15rem; border-bottom:1px solid rgba(255,255,255,0.08);">
+    <div style="font:400 1.2rem/1.3 var(--fd); color:rgba(255,255,255,0.85);">Built to outlast the algorithms that protect it.</div>
+  </div>
+  <div class="foot-label">Capabilities</div>
+  <div class="foot-tags">
+    <span class="ft fc">Post-Quantum</span><span class="ft fc">Threshold Crypto</span><span class="ft fc">Forward Secret</span><span class="ft fc">Ristretto255</span><span class="ft fc">Argon2id</span><span class="ft fa">Server-Blind</span><span class="ft fa">Bell-LaPadula</span><span class="ft fa">Honey Encryption</span><span class="ft fa">DPoP</span><span class="ft fa">PKCE</span><span class="ft fh">Seccomp</span><span class="ft fh">mlock</span><span class="ft fh">Zeroize</span><span class="ft fh">HSM/TPM</span><span class="ft fh">SEV-SNP</span><span class="ft fp">BFT Audit</span><span class="ft fp">CMEK</span><span class="ft fp">FIDO2/CAC</span><span class="ft fv">SLSA 3</span>
+  </div>
+  <div style="font:400 0.8rem var(--fu); color:#94a3b8; display:flex; justify-content:space-between;">
+    <span>Apache 2.0 with patent retaliation. Original work by Divya Mohan. © 2025–2026 dmj.one.</span>
+    <span>2026-03-30</span>
+  </div>
+</footer>
+
+</body>
+</html>
