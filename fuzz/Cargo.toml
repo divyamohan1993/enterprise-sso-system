@@ -14,6 +14,7 @@ shard = { path = "../shard" }
 sso-protocol = { path = "../sso-protocol" }
 common = { path = "../common" }
 ratchet = { path = "../ratchet" }
+opaque = { path = "../opaque" }
 arbitrary = { version = "1", features = ["derive"] }
 
 [features]
@@ -52,4 +53,44 @@ doc = false
 [[bin]]
 name = "fuzz_revocation"
 path = "fuzz_targets/fuzz_revocation.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_saml_parse"
+path = "fuzz_targets/fuzz_saml_parse.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_threshold_reconstruct"
+path = "fuzz_targets/fuzz_threshold_reconstruct.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_xwing_decapsulate"
+path = "fuzz_targets/fuzz_xwing_decapsulate.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_dpop_verify"
+path = "fuzz_targets/fuzz_dpop_verify.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_ct_eq"
+path = "fuzz_targets/fuzz_ct_eq.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_jwt_verify"
+path = "fuzz_targets/fuzz_jwt_verify.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_opaque_login"
+path = "fuzz_targets/fuzz_opaque_login.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_backup_restore"
+path = "fuzz_targets/fuzz_backup_restore.rs"
 doc = false

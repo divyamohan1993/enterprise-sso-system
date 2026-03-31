@@ -565,7 +565,7 @@ impl SelfServiceStore {
         let secret = generate_totp_secret();
         let account_name = session.user_id.to_string();
         let provisioning_uri = format!(
-            "otpauth://totp/{}:{}?secret={}&issuer={}&algorithm=SHA1&digits=6&period=30",
+            "otpauth://totp/{}:{}?secret={}&issuer={}&algorithm=SHA512&digits=6&period=30",
             url_encode(issuer),
             url_encode(&account_name),
             secret,

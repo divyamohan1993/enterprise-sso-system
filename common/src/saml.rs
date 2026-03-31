@@ -624,7 +624,9 @@ impl AuthnRequest {
     /// production, signed assertions are REJECTED (fail-closed).
     pub fn validate_signature_with_xml(&self, sp_cert_pem: &str, raw_xml: Option<&str>) -> Result<(), String> {
         if !self.is_signed {
-            return Ok(()); // Unsigned requests are valid if SP metadata allows it.
+            // SECURITY: ALL SAML assertions MUST be signed for MILNET deployment.
+            // Unsigned requests are never acceptable in a military-grade environment.
+            return Err("SAML assertions must be signed for MILNET deployment".to_string());
         }
 
         // --- Step 1: Parse and validate the X.509 certificate ---
@@ -3161,10 +3163,29 @@ pub fn check_certificate_revocation(cert_der: &[u8]) -> Result<RevocationStatus,
     // --- Tier 2: OCSP stapled response (if available) ---
     // In a real deployment, the OCSP staple would be provided by the TLS layer.
     // Here we check if an OCSP staple was provided via thread-local or context.
-    // For now, this tier is a placeholder that returns Unknown (triggering Tier 3).
     let ocsp_verifier = OcspStapleVerifier::new();
-    // No staple available in this context — empty staple triggers Unknown
-    let _ocsp_result = ocsp_verifier.verify_staple(cert_der, &[])?;
+    let ocsp_result = ocsp_verifier.verify_staple(cert_der, &[])?;
+
+    // SECURITY: Act on the OCSP result — do NOT discard it.
+    // If the staple gives a definitive answer (Good or Revoked), use it.
+    // If Unknown (empty staple, stale, or malformed), fall through to Tier 3.
+    match ocsp_result {
+        RevocationStatus::Good => {
+            tracing::debug!("OCSP staple confirms certificate is not revoked");
+            return Ok(RevocationStatus::Good);
+        }
+        RevocationStatus::Revoked { ref reason, .. } => {
+            tracing::error!(
+                "OCSP staple confirms certificate is REVOKED: {} — DENYING",
+                reason
+            );
+            return Ok(ocsp_result);
+        }
+        RevocationStatus::Unknown => {
+            // Empty or stale staple — fall through to CRL distribution point
+            tracing::debug!("OCSP staple unavailable or stale — checking CRL distribution point");
+        }
+    }
 
     // --- Tier 3: CRL distribution point fetch ---
     // In a production deployment, this would:
@@ -3177,7 +3198,8 @@ pub fn check_certificate_revocation(cert_der: &[u8]) -> Result<RevocationStatus,
     // we apply the fail-closed policy: if the CRL cache is stale and
     // no OCSP staple is available, revocation status is Unknown.
     tracing::warn!(
-        "CRL cache stale and no OCSP staple available — fail-closed for serial {:?}",
+        "SECURITY: CRL cache stale and no OCSP staple available — DENYING certificate \
+         (fail-closed) for serial {:?}. This is a HARD DENY, not a warning.",
         hex_encode(&serial)
     );
 

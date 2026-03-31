@@ -238,8 +238,8 @@ mod saml_tests {
         };
 
         assert!(
-            authn_request.validate_signature("").is_ok(),
-            "unsigned request should pass validation when not required"
+            authn_request.validate_signature("").is_err(),
+            "unsigned SAML assertions MUST be rejected for MILNET deployment"
         );
     }
 

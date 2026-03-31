@@ -547,7 +547,7 @@ async fn handle_connection(
     common::error_response::verbose_log("gateway", "puzzle challenge sent");
 
     // 2. Read puzzle solution (contains the client's KEM ciphertext)
-    let solution: PuzzleSolution = recv_frame_with_timeout(&mut stream).await?;
+    let solution: PuzzleSolution = recv_frame_with_timeout(&mut stream, MAX_AUTH_REQUEST_SIZE).await?;
 
     // 3. Verify puzzle solution.  All verification failures go through the
     //    timing floor to prevent distinguishing failure modes.
@@ -781,17 +781,22 @@ async fn send_frame_with_timeout<T: serde::Serialize>(
 }
 
 /// Read a length-prefixed frame and deserialize with postcard, with timeout.
+///
+/// `max_size` enforces the per-endpoint payload cap *before* any allocation.
 async fn recv_frame_with_timeout<T: serde::de::DeserializeOwned>(
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    max_size: u32,
 ) -> Result<T, String> {
-    tokio::time::timeout(IO_TIMEOUT, recv_frame(stream))
+    tokio::time::timeout(IO_TIMEOUT, recv_frame(stream, max_size))
         .await
         .map_err(|_| "read timeout".to_string())?
 }
 
 /// Read a raw length-prefixed frame (bytes only), with timeout.
-async fn recv_raw_frame_with_timeout(stream: &mut (impl AsyncRead + AsyncWrite + Unpin)) -> Result<Vec<u8>, String> {
-    tokio::time::timeout(IO_TIMEOUT, recv_raw_frame(stream))
+///
+/// `max_size` enforces the per-endpoint payload cap *before* any allocation.
+async fn recv_raw_frame_with_timeout(stream: &mut (impl AsyncRead + AsyncWrite + Unpin), max_size: u32) -> Result<Vec<u8>, String> {
+    tokio::time::timeout(IO_TIMEOUT, recv_raw_frame_limited(stream, max_size))
         .await
         .map_err(|_| "read timeout".to_string())?
 }
@@ -823,17 +828,11 @@ async fn send_frame<T: serde::Serialize>(stream: &mut (impl AsyncRead + AsyncWri
 }
 
 /// Read a length-prefixed frame and deserialize with postcard.
-async fn recv_frame<T: serde::de::DeserializeOwned>(stream: &mut (impl AsyncRead + AsyncWrite + Unpin)) -> Result<T, String> {
-    let buf = recv_raw_frame(stream).await?;
-    postcard::from_bytes(&buf).map_err(|e| format!("deserialize: {e}"))
-}
-
-/// Read a raw length-prefixed frame (bytes without deserialization).
 ///
-/// Enforces `MAX_FRAME_LEN` as the absolute upper bound.  Callers that
-/// need tighter per-endpoint limits should use `recv_raw_frame_limited`.
-async fn recv_raw_frame(stream: &mut (impl AsyncRead + AsyncWrite + Unpin)) -> Result<Vec<u8>, String> {
-    recv_raw_frame_limited(stream, MAX_FRAME_LEN).await
+/// `max_size` enforces the per-endpoint payload cap *before* any allocation.
+async fn recv_frame<T: serde::de::DeserializeOwned>(stream: &mut (impl AsyncRead + AsyncWrite + Unpin), max_size: u32) -> Result<T, String> {
+    let buf = recv_raw_frame_limited(stream, max_size).await?;
+    postcard::from_bytes(&buf).map_err(|e| format!("deserialize: {e}"))
 }
 
 /// Read a raw length-prefixed frame with a caller-specified size limit.

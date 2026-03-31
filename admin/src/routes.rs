@@ -859,6 +859,9 @@ pub struct AppState {
     pub encrypted_pool: common::encrypted_db::EncryptedPool,
     /// Encrypted distributed session store for persistent, replicated sessions.
     pub session_store: RwLock<common::distributed_session::DistributedSessionStore>,
+    /// Refresh token store for issuing and redeeming refresh tokens with
+    /// family-based revocation per RFC 6749 Section 10.4.
+    pub refresh_token_store: RwLock<sso_protocol::tokens::RefreshTokenStore>,
 }
 
 /// Entry in the access_tokens map, pairing a user ID with a last-activity
@@ -975,7 +978,8 @@ const MAX_USERNAME_LEN: usize = 255;
 /// Minimum length for passwords (NIST SP 800-63B minimum).
 const MIN_PASSWORD_LEN: usize = 12;
 /// Maximum length for passwords (prevents Argon2id DoS via huge inputs).
-const MAX_PASSWORD_LEN: usize = 1024;
+/// NIST SP 800-63B recommends accepting at least 64 characters; 128 is generous.
+const MAX_PASSWORD_LEN: usize = 128;
 /// Maximum length for portal names.
 const MAX_PORTAL_NAME_LEN: usize = 255;
 /// Maximum length for callback URLs.
@@ -4844,13 +4848,21 @@ async fn oauth_token(
         return Json(serde_json::json!({"error": e}));
     }
 
+    // Issue a refresh token bound to the user, client, and scope.
+    // The RefreshTokenStore tracks token families for replay detection and
+    // family-wide revocation per RFC 6749 Section 10.4.
+    let refresh_token = {
+        let mut rt_store = state.refresh_token_store.write().await;
+        rt_store.issue(auth_code.user_id, &req.client_id, &auth_code.scope)
+    };
+
     let response = sso_protocol::tokens::TokenResponse {
         access_token,
         token_type: "Bearer".into(),
         expires_in: 3600,
         id_token,
         scope: auth_code.scope,
-        refresh_token: None, // TODO: issue refresh token from RefreshTokenStore
+        refresh_token: Some(refresh_token),
     };
 
     match serde_json::to_value(response) {

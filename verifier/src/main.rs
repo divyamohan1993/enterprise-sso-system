@@ -293,13 +293,13 @@ async fn handle_verify(
         tracing::warn!(
             dpop_present = false,
             "DPoP client key MISSING from verification request — \
-             token will be rejected unless tier-exempt or MILNET_REQUIRE_DPOP=false"
+             token will be rejected (DPoP is mandatory for all tiers)"
         );
     }
 
     match postcard::from_bytes::<common::types::Token>(&req.token_bytes) {
         Ok(token) => {
-            // Audit: log token tier for DPoP exemption visibility.
+            // Audit: log token tier and DPoP binding status.
             tracing::info!(
                 token_id = ?token.claims.token_id,
                 tier = token.claims.tier,

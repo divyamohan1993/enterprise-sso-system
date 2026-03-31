@@ -355,6 +355,7 @@ async fn main() {
         ha_pool: std::sync::Mutex::new(ha_pool),
         encrypted_pool,
         session_store: RwLock::new(session_store),
+        refresh_token_store: RwLock::new(sso_protocol::tokens::RefreshTokenStore::new()),
     });
 
     // Start the key rotation monitor in the background
@@ -419,17 +420,13 @@ async fn main() {
         .unwrap_or(false);
     let has_tls = tls_cert.is_some() && tls_key.is_some();
 
-    // TLS is always required — except in dev mode.
+    // TLS is always required.
     if !has_tls {
-        if std::env::var("MILNET_DEV_MODE").unwrap_or_default() == "1" {
-            tracing::warn!("MILNET_DEV_MODE=1: running Admin API without TLS (plaintext HTTP)");
-        } else {
-            tracing::error!(
-                "FATAL: Admin API requires TLS. \
-                 Set ADMIN_TLS_CERT and ADMIN_TLS_KEY, or use a TLS-terminating reverse proxy."
-            );
-            std::process::exit(1);
-        }
+        tracing::error!(
+            "FATAL: Admin API requires TLS. \
+             Set ADMIN_TLS_CERT and ADMIN_TLS_KEY, or use a TLS-terminating reverse proxy."
+        );
+        std::process::exit(1);
     }
 
     // Add HSTS header middleware to all responses (signals to browsers/proxies

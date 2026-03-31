@@ -108,18 +108,6 @@ async fn main() {
             let mut k = [0u8; 32];
             k.copy_from_slice(&kek_bytes);
             k
-        } else if std::env::var("MILNET_DEV_MODE").unwrap_or_default() == "1" {
-            tracing::warn!(
-                "MILNET_DEV_MODE=1: RATCHET_KEK not set, deriving from MILNET_MASTER_KEK"
-            );
-            let master = common::sealed_keys::cached_master_kek();
-            use hkdf::Hkdf;
-            use sha2::Sha512;
-            let hk = Hkdf::<Sha512>::new(Some(b"MILNET-DEV-KEY-v1"), master.as_slice());
-            let mut okm = [0u8; 32];
-            hk.expand(b"ratchet-kek", &mut okm)
-                .expect("HKDF-SHA512 32-byte derivation failed");
-            okm
         } else {
             panic!("RATCHET_KEK must be set in distributed HA mode (64 hex chars = 32 bytes)");
         };

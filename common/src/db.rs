@@ -342,11 +342,6 @@ pub fn enforce_ssl_in_url(database_url: &str) -> String {
     if mode.is_secure() {
         return database_url.to_string();
     }
-    // Dev mode: don't override sslmode=disable
-    if std::env::var("MILNET_DEV_MODE").unwrap_or_default() == "1" {
-        tracing::warn!("MILNET_DEV_MODE=1: keeping DB sslmode={:?} as-is", mode);
-        return database_url.to_string();
-    }
     // Append sslmode=require if missing or insecure
     if mode == SslMode::Unknown {
         // No sslmode param — append it
@@ -407,15 +402,11 @@ pub fn validate_ssl_config(database_url: &str) {
     }
 
     if !mode.is_secure() {
-        if std::env::var("MILNET_DEV_MODE").unwrap_or_default() == "1" {
-            tracing::warn!("MILNET_DEV_MODE=1: allowing insecure DB sslmode={:?}", mode);
-        } else {
-            panic!(
-                "FATAL: DATABASE_URL sslmode={:?} is not acceptable. \
-                 Set sslmode=require or sslmode=verify-full.",
-                mode
-            );
-        }
+        panic!(
+            "FATAL: DATABASE_URL sslmode={:?} is not acceptable. \
+             Set sslmode=require or sslmode=verify-full.",
+            mode
+        );
     }
 
     // verify-full requires cert and key

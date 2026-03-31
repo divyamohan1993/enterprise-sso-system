@@ -2,11 +2,14 @@
 //!
 //! Verifies the TOTP implementation enforces:
 //!   - Default SHA-512 (CNSA 2.0) for new enrollments
-//!   - SHA-1 backward compatibility with deprecation warnings
+//!   - SHA-1 REJECTED (cryptographically broken, removed from MILNET)
 //!   - SHA-256 acceptance
 //!   - Correct TOTP code generation per RFC 6238
 //!   - Time window verification
 //!   - Replay prevention (RFC 6238 Section 5.2)
+
+// Tests reference the deprecated TotpAlgorithm::Sha1 variant to verify it is rejected.
+#![allow(deprecated)]
 
 use common::totp::*;
 
@@ -66,22 +69,28 @@ fn unsupported_algorithms_rejected() {
     assert_eq!(TotpAlgorithm::from_str_loose(""), None);
 }
 
-// ── SHA-1 Backward Compatibility ──────────────────────────────────────────
+// ── SHA-1 Rejection ──────────────────────────────────────────────────────
 
-/// Security property: Existing SHA-1 tokens can still be verified for
-/// backward compatibility during migration. The system logs a deprecation
-/// warning (tested via tracing capture in integration tests).
+/// Security property: SHA-1 TOTP is REJECTED unconditionally.
+/// SHA-1 is cryptographically broken and has been removed from MILNET.
 #[test]
-fn sha1_verification_backward_compatible() {
+fn sha1_generation_rejected() {
     let secret = b"12345678901234567890";
     let time = 59u64;
 
-    // RFC 6238 test vector
+    // SHA-1 generation must return the error fallback "000000"
     let code = generate_totp_with_algorithm(secret, time, TotpAlgorithm::Sha1);
-    assert_eq!(code, "287082", "SHA-1 TOTP must match RFC 6238 test vector");
+    assert_eq!(code, "000000", "SHA-1 TOTP generation must be rejected");
+}
 
-    // Verification with SHA-1 must succeed
-    assert!(verify_totp_with_algorithm(secret, "287082", time, 0, TotpAlgorithm::Sha1));
+#[test]
+fn sha1_verification_rejected() {
+    let secret = b"12345678901234567890";
+    let time = 59u64;
+
+    // Verification with SHA-1 must ALWAYS fail
+    assert!(!verify_totp_with_algorithm(secret, "287082", time, 0, TotpAlgorithm::Sha1),
+        "SHA-1 TOTP verification must be rejected");
 }
 
 // ── TOTP Code Generation ──────────────────────────────────────────────────
@@ -100,17 +109,16 @@ fn totp_code_generation_sha512() {
 /// same secret and time (with overwhelming probability).
 #[test]
 fn different_algorithms_produce_different_codes() {
-    let secret = b"12345678901234567890";
+    let secret = b"1234567890123456789012345678901234567890123456789012345678901234";
     let time = 59u64;
 
-    let sha1_code = generate_totp_with_algorithm(secret, time, TotpAlgorithm::Sha1);
+    // SHA-1 is rejected (returns "000000"), so only compare SHA-256 and SHA-512
     let sha256_code = generate_totp_with_algorithm(secret, time, TotpAlgorithm::Sha256);
     let sha512_code = generate_totp_with_algorithm(secret, time, TotpAlgorithm::Sha512);
 
-    // While there's a 1/1M chance any two match, all three matching is 1/1T
-    assert!(
-        sha1_code != sha256_code || sha256_code != sha512_code,
-        "At least two algorithms should produce different codes"
+    assert_ne!(
+        sha256_code, sha512_code,
+        "SHA-256 and SHA-512 should produce different codes (probabilistic)"
     );
 }
 
@@ -120,7 +128,7 @@ fn different_algorithms_produce_different_codes() {
 /// time window (drift tolerance).
 #[test]
 fn totp_verification_with_time_window() {
-    let secret = b"12345678901234567890";
+    let secret = b"1234567890123456789012345678901234567890123456789012345678901234";
     let time = 59u64; // step 1
     let code = generate_totp(secret, time);
 
@@ -131,7 +139,7 @@ fn totp_verification_with_time_window() {
 /// Security property: TOTP verification rejects codes outside the window.
 #[test]
 fn totp_verification_rejects_outside_window() {
-    let secret = b"12345678901234567890";
+    let secret = b"1234567890123456789012345678901234567890123456789012345678901234";
     // Code for step 1 (time=59)
     let code = generate_totp(secret, 59);
 
@@ -143,7 +151,7 @@ fn totp_verification_rejects_outside_window() {
 /// degrading security by passing a large window value.
 #[test]
 fn totp_window_capped_at_2() {
-    let secret = b"12345678901234567890";
+    let secret = b"1234567890123456789012345678901234567890123456789012345678901234";
     let code = generate_totp(secret, 59);
 
     // Even with window=100, the internal cap is 2.
@@ -154,7 +162,7 @@ fn totp_window_capped_at_2() {
 /// Security property: Invalid (non-numeric) TOTP codes are rejected.
 #[test]
 fn invalid_non_numeric_code_rejected() {
-    let secret = b"12345678901234567890";
+    let secret = b"1234567890123456789012345678901234567890123456789012345678901234";
     assert!(!verify_totp(secret, "abcdef", 59, 1));
     assert!(!verify_totp(secret, "", 59, 1));
     assert!(!verify_totp(secret, "12345a", 59, 1));
@@ -232,7 +240,7 @@ fn base32_encoding_rfc4648_vectors() {
 #[test]
 fn totp_replay_prevention_rejects_second_use() {
     // Use unique secret to avoid cache interference with other tests
-    let mut secret = [0u8; 20];
+    let mut secret = [0u8; 64];
     getrandom::getrandom(&mut secret).unwrap();
     let time = 1_800_000_000u64;
     let code = generate_totp(&secret, time);

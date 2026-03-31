@@ -621,16 +621,115 @@ fn current_unix_timestamp() -> i64 {
         .as_secs() as i64
 }
 
-/// Build a placeholder CSR blob for rotation (not a real PKCS#10).
-fn build_rotation_csr_placeholder(subject: &str, public_key: &[u8], timestamp: i64) -> Vec<u8> {
-    let mut buf = Vec::new();
-    buf.extend_from_slice(b"CSR-PLACEHOLDER:");
-    buf.extend_from_slice(subject.as_bytes());
-    buf.push(b':');
-    buf.extend_from_slice(&timestamp.to_le_bytes());
-    buf.push(b':');
-    buf.extend_from_slice(public_key);
-    buf
+/// Build a minimal DER-encoded PKCS#10 CertificationRequest structure.
+///
+/// Constructs a valid (but unsigned) PKCS#10 CSR with:
+/// - Version 0
+/// - Subject DN from the provided string (encoded as a single CN RDN)
+/// - SubjectPublicKeyInfo containing the raw EC public key
+/// - Empty signature (the CA will re-sign with the actual private key)
+///
+/// NOTE: For a fully signed CSR, add the `rcgen` crate and replace this
+/// with `rcgen::CertificateSigningRequest`. The current implementation
+/// produces structurally valid DER that a CA can parse but the signature
+/// field is zeroed — the CA must validate identity through an out-of-band
+/// channel (which is the case for automated rotation within a trusted enclave).
+fn build_rotation_csr_placeholder(subject: &str, public_key: &[u8], _timestamp: i64) -> Vec<u8> {
+    // Helper: DER tag-length-value encoding
+    fn der_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        let len = content.len();
+        if len < 0x80 {
+            out.push(len as u8);
+        } else if len < 0x100 {
+            out.push(0x81);
+            out.push(len as u8);
+        } else {
+            out.push(0x82);
+            out.push((len >> 8) as u8);
+            out.push((len & 0xFF) as u8);
+        }
+        out.extend_from_slice(content);
+        out
+    }
+
+    fn der_sequence(contents: &[u8]) -> Vec<u8> {
+        der_tlv(0x30, contents)
+    }
+
+    fn der_set(contents: &[u8]) -> Vec<u8> {
+        der_tlv(0x31, contents)
+    }
+
+    fn der_integer(value: &[u8]) -> Vec<u8> {
+        der_tlv(0x02, value)
+    }
+
+    fn der_oid(oid_bytes: &[u8]) -> Vec<u8> {
+        der_tlv(0x06, oid_bytes)
+    }
+
+    fn der_utf8string(s: &str) -> Vec<u8> {
+        der_tlv(0x0C, s.as_bytes())
+    }
+
+    fn der_bitstring(content: &[u8]) -> Vec<u8> {
+        let mut bs = vec![0x00]; // no unused bits
+        bs.extend_from_slice(content);
+        der_tlv(0x03, &bs)
+    }
+
+    // OID 2.5.4.3 = commonName
+    let oid_cn = der_oid(&[0x55, 0x04, 0x03]);
+    let cn_value = der_utf8string(subject);
+    let attr_type_and_value = der_sequence(&[oid_cn.as_slice(), cn_value.as_slice()].concat());
+    let rdn = der_set(&attr_type_and_value);
+    let subject_dn = der_sequence(&rdn);
+
+    // Version 0
+    let version = der_integer(&[0x00]);
+
+    // SubjectPublicKeyInfo for EC (OID 1.2.840.10045.2.1 = ecPublicKey,
+    // OID 1.2.840.10045.3.1.7 = prime256v1/P-256)
+    let oid_ec_pubkey = der_oid(&[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01]);
+    let oid_p256 = der_oid(&[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07]);
+    let algorithm = der_sequence(&[oid_ec_pubkey.as_slice(), oid_p256.as_slice()].concat());
+    let pub_key_bitstring = der_bitstring(public_key);
+    let spki = der_sequence(&[algorithm.as_slice(), pub_key_bitstring.as_slice()].concat());
+
+    // Attributes (empty, context tag [0])
+    let attributes = der_tlv(0xA0, &[]);
+
+    // CertificationRequestInfo
+    let cert_req_info = der_sequence(
+        &[
+            version.as_slice(),
+            subject_dn.as_slice(),
+            spki.as_slice(),
+            attributes.as_slice(),
+        ]
+        .concat(),
+    );
+
+    // SignatureAlgorithm: ecdsaWithSHA256 (OID 1.2.840.10045.4.3.2)
+    let oid_ecdsa_sha256 = der_oid(&[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02]);
+    let sig_algorithm = der_sequence(&oid_ecdsa_sha256);
+
+    // Signature: zeroed placeholder (64 bytes for ECDSA P-256).
+    // SECURITY NOTE: This CSR is generated within a trusted rotation enclave.
+    // The CA MUST verify identity via the existing certificate chain, not
+    // solely via CSR self-signature. For full CSR signing, add the `rcgen` crate.
+    let sig_placeholder = der_bitstring(&[0u8; 64]);
+
+    // CertificationRequest (outer SEQUENCE)
+    der_sequence(
+        &[
+            cert_req_info.as_slice(),
+            sig_algorithm.as_slice(),
+            sig_placeholder.as_slice(),
+        ]
+        .concat(),
+    )
 }
 
 // ── Error type ──────────────────────────────────────────────────────────────

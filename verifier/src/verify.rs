@@ -111,20 +111,18 @@ pub fn is_dpop_replay(proof_hash: &[u8; 64]) -> bool {
 /// Verify a token's signature and claims (spec C.11), enforcing DPoP channel
 /// binding.
 ///
-/// DPoP enforcement policy (controlled by `MILNET_REQUIRE_DPOP`, defaults to
-/// `true` in production):
+/// DPoP enforcement policy (mandatory, unconditional):
 /// - When `client_dpop_key` is `Some`, the token's `dpop_hash` MUST match
 ///   the hash of the provided key.
 /// - When `client_dpop_key` is `None` AND the token has a non-zero `dpop_hash`,
 ///   the token is rejected (DPoP-bound token presented without proof).
 /// - When `client_dpop_key` is `None` AND `dpop_hash` is all zeros, the token
-///   is rejected in production mode UNLESS the tier is 3 (Sensor) or 4
-///   (Emergency) which may lack DPoP capability.
+///   is rejected unconditionally. All tiers require DPoP.
 ///
 /// Verification order:
 /// 1. Check version and expiry
-/// 2. Enforce algorithm field (must be 1 — prevents downgrade attacks)
-/// 3. Enforce DPoP channel binding (mandatory in production)
+/// 2. Enforce algorithm field (must be 1 -- prevents downgrade attacks)
+/// 3. Enforce DPoP channel binding (mandatory for all tiers)
 /// 4. Validate ratchet_epoch is within reasonable bounds
 /// 5. Check pq_signature is NOT empty (reject if missing)
 /// 6. Verify ML-DSA-65 signature over (claims_msg || frost_signature)
@@ -150,14 +148,6 @@ pub fn verify_token_bound(
     client_dpop_key: &[u8],
 ) -> Result<TokenClaims, MilnetError> {
     verify_token_inner(token, public_key_package, pq_verifying_key, Some(client_dpop_key))
-}
-
-/// DPoP channel binding is ALWAYS required for Tier 1/2.
-/// Previous env var toggle (MILNET_REQUIRE_DPOP) has been removed
-/// for security hardening — stolen tokens cannot be replayed without
-/// the client's DPoP private key.
-fn dpop_required() -> bool {
-    true
 }
 
 /// DPoP is mandatory for ALL tiers — no exemptions.
@@ -217,7 +207,7 @@ fn verify_token_core(
         ));
     }
 
-    // 4. DPoP channel binding enforcement (MANDATORY in production):
+    // 4. DPoP channel binding enforcement (MANDATORY, unconditional):
     //
     //    Policy matrix:
     //    ┌──────────────────┬──────────────────┬──────────────────────────────┐
@@ -229,16 +219,15 @@ fn verify_token_core(
     //    │ None             │ all zeros        │ REJECT (mandatory for all)   │
     //    └──────────────────┴──────────────────┴──────────────────────────────┘
     //
-    //    DPoP is mandatory for ALL tiers — no exemptions.
+    //    DPoP is mandatory for ALL tiers — no exemptions, no env var overrides.
     // Warn if deprecated env var is set (no-op, just logs)
     warn_if_dpop_exempt_tiers_set();
 
     let all_zeros = [0u8; 64];
-    let require_dpop = dpop_required();
     let has_dpop_hash = token.claims.dpop_hash != all_zeros;
 
     if let Some(key) = client_dpop_key {
-        // Client provided a DPoP key — token MUST have a matching dpop_hash.
+        // Client provided a DPoP key -- token MUST have a matching dpop_hash.
         if !has_dpop_hash {
             return Err(MilnetError::CryptoVerification(
                 "DPoP key provided but token has no DPoP binding (dpop_hash is zero)".into(),
@@ -250,25 +239,16 @@ fn verify_token_core(
                 "DPoP key hash mismatch — token bound to different client".into(),
             ));
         }
-    } else if has_dpop_hash && require_dpop {
-        // Token has a DPoP binding but no client key was provided — reject.
+    } else if has_dpop_hash {
+        // Token has a DPoP binding but no client key was provided -- reject.
         // A DPoP-bound token MUST always be presented with its proof key.
-        // This check is gated on require_dpop so that test environments
-        // (MILNET_REQUIRE_DPOP=false) can verify tokens without DPoP keys.
         return Err(MilnetError::CryptoVerification(
             "token has DPoP binding but no client DPoP key was provided — \
              possible token theft"
                 .into(),
         ));
-    } else if has_dpop_hash && !require_dpop {
-        // DPoP hash present but enforcement disabled (test/dev mode) — warn
-        // but allow. This path should NEVER be reached in production.
-        tracing::warn!(
-            "DPoP binding present but no client key provided — \
-             allowed because MILNET_REQUIRE_DPOP=false (test mode)"
-        );
-    } else if require_dpop {
-        // No DPoP on either side, production mode — reject unconditionally.
+    } else {
+        // No DPoP on either side -- reject unconditionally.
         // DPoP is mandatory for ALL tiers (no exemptions).
         return Err(MilnetError::CryptoVerification(
             "DPoP binding is required — token has no dpop_hash and no client \
@@ -857,12 +837,6 @@ mod tests {
         let key = [0xAA; 64];
         let tag = compute_ratchet_tag(&key, b"test", 1).unwrap();
         assert_ne!(tag, [0u8; 64], "ratchet tag should not be all zeros");
-    }
-
-    #[test]
-    fn test_dpop_required_always_true() {
-        // DPoP is always required (hardened policy)
-        assert!(dpop_required());
     }
 
     #[test]

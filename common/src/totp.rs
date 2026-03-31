@@ -1,24 +1,24 @@
 //! TOTP (Time-based One-Time Password) implementation per RFC 6238.
 //!
-//! Supports SHA-1 (legacy), SHA-256 (recommended), and SHA-512 (CNSA 2.0).
-//! New enrollments default to SHA-256 via `MILNET_TOTP_ALGORITHM` env var.
-//! SHA-1 is retained for backward compatibility with existing enrollments
-//! but logs a deprecation warning on every verification.
+//! Supports SHA-256 (recommended) and SHA-512 (CNSA 2.0).
+//! New enrollments default to SHA-512 via `MILNET_TOTP_ALGORITHM` env var.
+//! SHA-1 has been REMOVED — it is cryptographically broken and prohibited
+//! for all MILNET operations. Any SHA-1 TOTP verification will fail with an error.
 
 use hmac::{Hmac, Mac};
-use sha1::Sha1;
 use sha2::{Sha256, Sha512};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-type HmacSha1 = Hmac<Sha1>;
 type HmacSha256 = Hmac<Sha256>;
 type HmacSha512 = Hmac<Sha512>;
 
 /// TOTP hash algorithm selection per RFC 6238.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TotpAlgorithm {
-    /// SHA-1 — legacy, for existing enrollments only. Deprecated.
+    /// SHA-1 — REMOVED. Any use returns an error. Retained only so legacy
+    /// configurations can be deserialized and rejected with a clear message.
+    #[deprecated(note = "SHA-1 is cryptographically broken and prohibited for MILNET. Use Sha512.")]
     Sha1,
     /// SHA-256 — recommended for new enrollments.
     Sha256,
@@ -28,6 +28,9 @@ pub enum TotpAlgorithm {
 
 impl TotpAlgorithm {
     /// Parse from string (case-insensitive). Returns None for unrecognized values.
+    /// SHA-1 is recognized but returns the deprecated Sha1 variant so callers
+    /// can detect and reject it with a clear error.
+    #[allow(deprecated)]
     pub fn from_str_loose(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "sha1" | "sha-1" => Some(Self::Sha1),
@@ -38,6 +41,7 @@ impl TotpAlgorithm {
     }
 
     /// Return the algorithm string for otpauth:// URIs.
+    #[allow(deprecated)]
     pub fn otpauth_name(&self) -> &'static str {
         match self {
             Self::Sha1 => "SHA1",
@@ -47,7 +51,7 @@ impl TotpAlgorithm {
     }
 
     /// HMAC output length in bytes for this algorithm.
-    #[allow(dead_code)]
+    #[allow(dead_code, deprecated)]
     fn hmac_output_len(&self) -> usize {
         match self {
             Self::Sha1 => 20,
@@ -60,8 +64,8 @@ impl TotpAlgorithm {
 /// Read the default TOTP algorithm from `MILNET_TOTP_ALGORITHM` env var.
 ///
 /// SECURITY: Defaults to SHA-512 (CNSA 2.0 compliant) if unset or unrecognized.
-/// SHA-1 is REJECTED for new enrollments even if explicitly configured — it is
-/// retained only for verification of legacy tokens during migration.
+/// SHA-1 is REJECTED unconditionally — it has been removed from MILNET.
+#[allow(deprecated)]
 pub fn default_totp_algorithm() -> TotpAlgorithm {
     let algo = std::env::var("MILNET_TOTP_ALGORITHM")
         .ok()
@@ -160,13 +164,19 @@ pub fn generate_secret() -> Result<zeroize::Zeroizing<[u8; 32]>, String> {
 
 /// Compute HMAC for TOTP using the specified algorithm.
 /// Returns the full HMAC output bytes.
+///
+/// SECURITY: SHA-1 is rejected unconditionally. It is cryptographically broken
+/// and prohibited for all MILNET operations.
+#[allow(deprecated)]
 fn hmac_totp(algorithm: TotpAlgorithm, secret: &[u8], counter_bytes: &[u8; 8]) -> Result<Vec<u8>, String> {
     match algorithm {
         TotpAlgorithm::Sha1 => {
-            let mut mac = HmacSha1::new_from_slice(secret)
-                .map_err(|_| "HMAC-SHA1 key initialization failed".to_string())?;
-            mac.update(counter_bytes);
-            Ok(mac.finalize().into_bytes().to_vec())
+            tracing::error!(
+                "SECURITY: SHA-1 TOTP computation REJECTED. SHA-1 is cryptographically \
+                 broken and has been removed from MILNET. Migrate all TOTP enrollments \
+                 to SHA-512 (CNSA 2.0) immediately."
+            );
+            Err("SHA-1 is prohibited for MILNET TOTP — migrate to SHA-512".to_string())
         }
         TotpAlgorithm::Sha256 => {
             let mut mac = HmacSha256::new_from_slice(secret)
@@ -187,9 +197,9 @@ fn hmac_totp(algorithm: TotpAlgorithm, secret: &[u8], counter_bytes: &[u8; 8]) -
 ///
 /// Implements HOTP (RFC 4226) with time-based counter per RFC 6238.
 /// Uses dynamic truncation to extract a 6-digit code from the HMAC result.
-/// Legacy variant — uses SHA-1 for backward compatibility.
+/// Uses SHA-512 (CNSA 2.0 compliant).
 pub fn generate_totp(secret: &[u8], time: u64) -> String {
-    generate_totp_with_algorithm(secret, time, TotpAlgorithm::Sha1)
+    generate_totp_with_algorithm(secret, time, TotpAlgorithm::Sha512)
 }
 
 /// Generate a 6-digit TOTP code using the specified hash algorithm.
@@ -197,6 +207,9 @@ pub fn generate_totp(secret: &[u8], time: u64) -> String {
 /// Implements HOTP (RFC 4226) with time-based counter per RFC 6238.
 /// Dynamic truncation offset is taken from the last byte of the HMAC output,
 /// which works correctly for all hash sizes per RFC 6238 Section 1.2.
+///
+/// SECURITY: SHA-1 is rejected and returns "000000".
+#[allow(deprecated)]
 pub fn generate_totp_with_algorithm(secret: &[u8], time: u64, algorithm: TotpAlgorithm) -> String {
     let counter = time / TIME_STEP;
     let counter_bytes = counter.to_be_bytes();
@@ -220,14 +233,14 @@ pub fn generate_totp_with_algorithm(secret: &[u8], time: u64, algorithm: TotpAlg
     format!("{:0width$}", otp, width = TOTP_DIGITS as usize)
 }
 
-/// Verify a TOTP code against the given secret and time, checking ± window steps.
-/// Legacy variant — uses SHA-1 for backward compatibility.
+/// Verify a TOTP code against the given secret and time, checking +/- window steps.
+/// Uses SHA-512 (CNSA 2.0 compliant).
 ///
 /// Uses constant-time comparison to prevent timing side-channels on the code value.
-/// Per RFC 6238 Section 5.2, each code can only be used once — replay within the
+/// Per RFC 6238 Section 5.2, each code can only be used once -- replay within the
 /// same time step is rejected via a global used-code cache.
 pub fn verify_totp(secret: &[u8], code: &str, time: u64, window: u32) -> bool {
-    verify_totp_with_algorithm(secret, code, time, window, TotpAlgorithm::Sha1)
+    verify_totp_with_algorithm(secret, code, time, window, TotpAlgorithm::Sha512)
 }
 
 /// Verify a TOTP code using the specified hash algorithm.
@@ -236,7 +249,8 @@ pub fn verify_totp(secret: &[u8], code: &str, time: u64, window: u32) -> bool {
 /// Per RFC 6238 Section 5.2, each code can only be used once — replay within the
 /// same time step is rejected via a global used-code cache.
 ///
-/// When `algorithm` is `Sha1`, a deprecation warning is logged via `tracing::warn!`.
+/// SECURITY: SHA-1 is REJECTED unconditionally -- returns `false` and logs an error.
+#[allow(deprecated)]
 pub fn verify_totp_with_algorithm(
     secret: &[u8],
     code: &str,
@@ -246,16 +260,15 @@ pub fn verify_totp_with_algorithm(
 ) -> bool {
     use subtle::ConstantTimeEq;
 
-    // SECURITY: Log CRITICAL deprecation warning for SHA-1 verification.
-    // SHA-1 is still accepted for EXISTING enrollments to avoid locking out
-    // users during migration, but every verification triggers an urgent alert.
+    // SECURITY: SHA-1 is cryptographically broken and REJECTED for all verification.
+    // Users with SHA-1 enrollments MUST re-enroll with SHA-512.
     if algorithm == TotpAlgorithm::Sha1 {
         tracing::error!(
-            "SECURITY: Legacy SHA-1 TOTP verified for user — migration required. \
-             SHA-1 is cryptographically weakened and prohibited for new enrollments. \
-             Migrate to SHA-512 (CNSA 2.0) immediately. \
-             Set MILNET_TOTP_ALGORITHM=sha512 for new enrollments."
+            "SECURITY: SHA-1 TOTP verification REFUSED. SHA-1 is cryptographically \
+             broken and has been removed from MILNET. The user MUST re-enroll with \
+             SHA-512 (CNSA 2.0). This is NOT a warning — the token is REJECTED."
         );
+        return false;
     }
 
     // Enforce maximum window to prevent callers from degrading security
@@ -362,52 +375,56 @@ pub fn encode_base32(data: &[u8]) -> String {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
-    /// RFC 6238 Appendix B test vector: SHA1, secret = "12345678901234567890", time = 59.
-    /// Expected TOTP: 287082
+    /// generate_totp now uses SHA-512. Verify round-trip works.
     #[test]
-    fn test_rfc6238_test_vector_time_59() {
-        let secret = b"12345678901234567890";
-        let code = generate_totp(secret, 59);
-        assert_eq!(code, "287082", "RFC 6238 test vector at time=59 failed");
+    fn test_generate_totp_sha512_roundtrip() {
+        let secret = b"1234567890123456789012345678901234567890123456789012345678901234";
+        let time = 59u64;
+        let code = generate_totp(secret, time);
+        assert_eq!(code.len(), 6);
+        assert!(verify_totp(secret, &code, time, 0));
     }
 
-    /// RFC 6238 Appendix B: time = 1111111109
-    /// Expected TOTP: 081804
+    /// SHA-1 TOTP is REJECTED — generate returns "000000" (HMAC error fallback).
     #[test]
-    fn test_rfc6238_test_vector_time_1111111109() {
+    fn test_sha1_generate_rejected() {
         let secret = b"12345678901234567890";
-        let code = generate_totp(secret, 1111111109);
-        assert_eq!(code, "081804");
+        let code = generate_totp_with_algorithm(secret, 59, TotpAlgorithm::Sha1);
+        assert_eq!(code, "000000", "SHA-1 TOTP must be rejected");
     }
 
-    /// RFC 6238 Appendix B: time = 1234567890
-    /// Expected TOTP: 005924
+    /// SHA-1 TOTP verification is REJECTED — always returns false.
     #[test]
-    fn test_rfc6238_test_vector_time_1234567890() {
+    fn test_sha1_verify_rejected() {
         let secret = b"12345678901234567890";
-        let code = generate_totp(secret, 1234567890);
-        assert_eq!(code, "005924");
+        // "287082" was the old RFC 6238 SHA-1 test vector — must be rejected now
+        assert!(!verify_totp_with_algorithm(secret, "287082", 59, 0, TotpAlgorithm::Sha1));
     }
 
     #[test]
     fn test_verify_totp_exact() {
-        let secret = b"12345678901234567890";
-        assert!(verify_totp(secret, "287082", 59, 0));
+        let secret = b"1234567890123456789012345678901234567890123456789012345678901234";
+        let time = 59u64;
+        let code = generate_totp(secret, time);
+        assert!(verify_totp(secret, &code, time, 0));
     }
 
     #[test]
     fn test_verify_totp_with_window() {
-        let secret = b"12345678901234567890";
-        // Code for time=59 (step 1), verify at time=89 (step 2) with window=1
-        assert!(verify_totp(secret, "287082", 89, 1));
+        let secret = b"1234567890123456789012345678901234567890123456789012345678901234";
+        let time = 59u64;
+        let code = generate_totp(secret, time);
+        // verify at time=89 (step 2) with window=1
+        assert!(verify_totp(secret, &code, 89, 1));
     }
 
     #[test]
     fn test_verify_totp_wrong_code() {
-        let secret = b"12345678901234567890";
+        let secret = b"1234567890123456789012345678901234567890123456789012345678901234";
         assert!(!verify_totp(secret, "000000", 59, 1));
     }
 
@@ -463,15 +480,13 @@ mod tests {
     }
 
     #[test]
-    fn test_sha256_differs_from_sha1() {
-        let secret = b"12345678901234567890";
+    fn test_sha256_differs_from_sha512() {
+        let secret = b"1234567890123456789012345678901234567890123456789012345678901234";
         let time = 59u64;
-        let sha1_code = generate_totp_with_algorithm(secret, time, TotpAlgorithm::Sha1);
         let sha256_code = generate_totp_with_algorithm(secret, time, TotpAlgorithm::Sha256);
+        let sha512_code = generate_totp_with_algorithm(secret, time, TotpAlgorithm::Sha512);
         // Different algorithms should (overwhelmingly likely) produce different codes
-        // Note: there's a 1-in-1M chance they match, so this test is probabilistic
-        // but acceptable for a 6-digit code space.
-        assert_ne!(sha1_code, sha256_code, "SHA-1 and SHA-256 TOTP codes should differ (probabilistic)");
+        assert_ne!(sha256_code, sha512_code, "SHA-256 and SHA-512 TOTP codes should differ (probabilistic)");
     }
 
     #[test]
@@ -524,6 +539,7 @@ mod tests {
 
     #[test]
     fn test_algorithm_from_str() {
+        // SHA-1 is still parseable (so configs can be detected and rejected)
         assert_eq!(TotpAlgorithm::from_str_loose("sha1"), Some(TotpAlgorithm::Sha1));
         assert_eq!(TotpAlgorithm::from_str_loose("SHA-256"), Some(TotpAlgorithm::Sha256));
         assert_eq!(TotpAlgorithm::from_str_loose("sha512"), Some(TotpAlgorithm::Sha512));
@@ -535,7 +551,7 @@ mod tests {
     #[test]
     fn test_totp_replay_prevention() {
         // Use a unique secret so the cache doesn't interfere with other tests
-        let mut secret = [0u8; 20];
+        let mut secret = [0u8; 64];
         getrandom::getrandom(&mut secret).unwrap();
         let time = 1_700_000_000u64; // fixed timestamp
         let code = generate_totp(&secret, time);
@@ -549,7 +565,7 @@ mod tests {
     #[test]
     fn test_totp_window_capped_at_2() {
         // Even if caller passes window=10, it should be capped at 2
-        let secret = b"12345678901234567890";
+        let secret = b"1234567890123456789012345678901234567890123456789012345678901234";
         // Code for time=59 (step 1), try to verify at a time far away with window=10
         // Window is capped at 2, so this should NOT match step 1 from step 10+
         let code = generate_totp(secret, 59);
@@ -559,8 +575,8 @@ mod tests {
 
     #[test]
     fn test_totp_different_secrets_independent_replay() {
-        let mut s1 = [0u8; 20];
-        let mut s2 = [0u8; 20];
+        let mut s1 = [0u8; 64];
+        let mut s2 = [0u8; 64];
         getrandom::getrandom(&mut s1).unwrap();
         getrandom::getrandom(&mut s2).unwrap();
         let time = 1_700_001_000u64;

@@ -58,8 +58,8 @@ const CODE_ATTEMPT_WINDOW_SECS: u64 = 60;
 /// code interception via manipulated redirect URIs (OAuth 2.0 mix-up attacks,
 /// open redirect chains).
 ///
-/// Additionally enforces HTTPS requirement (except for localhost during
-/// development, per RFC 8252 Section 7.3).
+/// Additionally enforces HTTPS requirement for all redirect URIs with no
+/// exceptions.  Military-grade systems must never allow plaintext redirects.
 pub fn validate_redirect_uri(
     redirect_uri: &str,
     registered_uris: &[String],
@@ -69,13 +69,10 @@ pub fn validate_redirect_uri(
         return Err("redirect_uri must not be empty");
     }
 
-    // SECURITY: Enforce HTTPS for all redirect URIs except localhost (dev only).
+    // SECURITY: Enforce HTTPS for ALL redirect URIs — no exceptions.
     // Per OAuth 2.1 Section 1.4.1 and NIST SP 800-63B.
-    let is_localhost = redirect_uri.starts_with("http://localhost")
-        || redirect_uri.starts_with("http://127.0.0.1")
-        || redirect_uri.starts_with("http://[::1]");
-    if !redirect_uri.starts_with("https://") && !is_localhost {
-        return Err("redirect_uri must use https:// (except localhost for development)");
+    if !redirect_uri.starts_with("https://") {
+        return Err("redirect_uri must use https://");
     }
 
     // SECURITY: EXACT STRING MATCH against registered redirect URIs.

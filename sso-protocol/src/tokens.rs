@@ -351,8 +351,8 @@ impl RefreshTokenStore {
             return Err("refresh token expired".to_string());
         }
 
-        // Client binding check
-        if rt.client_id != client_id {
+        // Client binding check — constant-time to prevent timing side-channels
+        if !crypto::ct::ct_eq(rt.client_id.as_bytes(), client_id.as_bytes()) {
             return Err("refresh token client_id mismatch".to_string());
         }
 
@@ -451,47 +451,122 @@ impl std::fmt::Debug for TokenResponse {
     }
 }
 
-/// Wrapper around an ML-DSA-87 keypair used for signing OIDC ID tokens.
-pub struct OidcSigningKey {
+/// A single OIDC signing keypair slot with its key ID and verifying key.
+struct KeySlot {
     signing_key: PqSigningKey,
     verifying_key: PqVerifyingKey,
     kid: String,
 }
 
+/// Wrapper around an ML-DSA-87 keypair used for signing OIDC ID tokens.
+///
+/// Supports key rotation: maintains a current key and an optional previous
+/// key. Both keys are served in the JWKS endpoint during the overlap window
+/// so that tokens signed with the previous key can still be verified while
+/// new tokens are signed with the current key.
+pub struct OidcSigningKey {
+    current: KeySlot,
+    /// Previous key retained for graceful rotation -- tokens signed before
+    /// the last rotation can still be verified against this key.
+    previous: Option<KeySlot>,
+    /// Monotonically increasing generation counter. Incremented on each
+    /// rotation and encoded in the `kid` to ensure key uniqueness.
+    generation: u64,
+}
+
 impl OidcSigningKey {
-    /// Generate a new ML-DSA-87 signing key for OIDC.
+    /// Generate a new ML-DSA-87 signing key for OIDC (generation 1).
     pub fn generate() -> Self {
         let (signing_key, verifying_key) = generate_pq_keypair();
+        let generation = 1u64;
         Self {
-            signing_key,
-            verifying_key,
-            kid: "milnet-mldsa87-v1".to_string(),
+            current: KeySlot {
+                signing_key,
+                verifying_key,
+                kid: format!("milnet-mldsa87-v{}", generation),
+            },
+            previous: None,
+            generation,
         }
     }
 
-    /// Return the verifying key for signature verification.
+    /// Rotate the signing key: generates a new keypair, moves the current
+    /// key to the previous slot, and increments the generation counter.
+    ///
+    /// The previous key is retained in the JWKS endpoint so tokens signed
+    /// before the rotation can still be verified until they expire. Only
+    /// one previous key is kept -- the key before that is discarded.
+    pub fn rotate_signing_key(&mut self) {
+        self.generation += 1;
+        let (signing_key, verifying_key) = generate_pq_keypair();
+        let new_slot = KeySlot {
+            signing_key,
+            verifying_key,
+            kid: format!("milnet-mldsa87-v{}", self.generation),
+        };
+        // Move current -> previous, discard old previous
+        let old_current = std::mem::replace(&mut self.current, new_slot);
+        self.previous = Some(old_current);
+    }
+
+    /// Return the current generation counter.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Return the verifying key for the current signing key.
     pub fn verifying_key(&self) -> &PqVerifyingKey {
-        &self.verifying_key
+        &self.current.verifying_key
     }
 
-    /// Key ID for JWK `kid` field.
+    /// Return the previous verifying key (if a rotation has occurred).
+    pub fn previous_verifying_key(&self) -> Option<&PqVerifyingKey> {
+        self.previous.as_ref().map(|slot| &slot.verifying_key)
+    }
+
+    /// Key ID for JWK `kid` field (current key).
     pub fn kid(&self) -> &str {
-        &self.kid
+        &self.current.kid
     }
 
-    /// Build the JWKS JSON value for this key.
+    /// Key ID for the previous key (if present).
+    pub fn previous_kid(&self) -> Option<&str> {
+        self.previous.as_ref().map(|slot| slot.kid.as_str())
+    }
+
+    /// Build the JWKS JSON value containing both current and previous keys.
+    ///
+    /// During a rotation window, both keys are served so verifiers can
+    /// validate tokens signed with either key. Once all old tokens expire,
+    /// the previous key can be dropped on the next rotation.
     pub fn jwks_json(&self) -> serde_json::Value {
-        let vk_bytes = self.verifying_key.encode();
+        let mut keys = Vec::with_capacity(2);
+
+        // Current key (always present)
+        let vk_bytes = self.current.verifying_key.encode();
         let vk_b64 = URL_SAFE_NO_PAD.encode(AsRef::<[u8]>::as_ref(&vk_bytes));
-        serde_json::json!({
-            "keys": [{
+        keys.push(serde_json::json!({
+            "kty": "ML-DSA",
+            "alg": "ML-DSA-87",
+            "use": "sig",
+            "kid": self.current.kid,
+            "pub": vk_b64
+        }));
+
+        // Previous key (present during rotation overlap window)
+        if let Some(ref prev) = self.previous {
+            let prev_vk_bytes = prev.verifying_key.encode();
+            let prev_vk_b64 = URL_SAFE_NO_PAD.encode(AsRef::<[u8]>::as_ref(&prev_vk_bytes));
+            keys.push(serde_json::json!({
                 "kty": "ML-DSA",
                 "alg": "ML-DSA-87",
                 "use": "sig",
-                "kid": self.kid,
-                "pub": vk_b64
-            }]
-        })
+                "kid": prev.kid,
+                "pub": prev_vk_b64
+            }));
+        }
+
+        serde_json::json!({ "keys": keys })
     }
 }
 
@@ -557,7 +632,7 @@ pub fn create_id_token_with_tier(
     );
     let signing_input = format!("{header_b64}.{claims_b64}");
 
-    let signature = pq_sign_raw(&signing_key.signing_key, signing_input.as_bytes());
+    let signature = pq_sign_raw(&signing_key.current.signing_key, signing_input.as_bytes());
     let sig_b64 = URL_SAFE_NO_PAD.encode(&signature);
 
     format!("{signing_input}.{sig_b64}")
@@ -697,7 +772,7 @@ fn verify_id_token_inner(
     if require_audience {
         match expected_audience {
             Some(expected) => {
-                if claims.aud != expected {
+                if !crypto::ct::ct_eq(claims.aud.as_bytes(), expected.as_bytes()) {
                     return Err(format!(
                         "audience mismatch: expected '{}', got '{}'",
                         expected, claims.aud
@@ -715,7 +790,7 @@ fn verify_id_token_inner(
         }
     } else if let Some(expected) = expected_audience {
         // Even when not strictly required, if an audience was provided, enforce it.
-        if claims.aud != expected {
+        if !crypto::ct::ct_eq(claims.aud.as_bytes(), expected.as_bytes()) {
             return Err(format!(
                 "audience mismatch: expected '{}', got '{}'",
                 expected, claims.aud
@@ -781,7 +856,7 @@ mod tests {
         let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
         let claims_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).unwrap());
         let signing_input = format!("{header_b64}.{claims_b64}");
-        let signature = pq_sign_raw(&sk.signing_key, signing_input.as_bytes());
+        let signature = pq_sign_raw(&sk.current.signing_key, signing_input.as_bytes());
         let sig_b64 = URL_SAFE_NO_PAD.encode(&signature);
         format!("{signing_input}.{sig_b64}")
     }
@@ -924,7 +999,7 @@ mod tests {
             let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
             let claims_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
             let signing_input = format!("{header_b64}.{claims_b64}");
-            let signature = pq_sign_raw(&sk.signing_key, signing_input.as_bytes());
+            let signature = pq_sign_raw(&sk.current.signing_key, signing_input.as_bytes());
             let sig_b64 = URL_SAFE_NO_PAD.encode(&signature);
             let token = format!("{signing_input}.{sig_b64}");
 
