@@ -26,12 +26,33 @@ static PSEUDONYM_KEY: OnceLock<[u8; 32]> = OnceLock::new();
 
 fn pseudonym_key() -> &'static [u8; 32] {
     PSEUDONYM_KEY.get_or_init(|| {
-        let kek = crate::sealed_keys::cached_master_kek();
+        // In test mode, the master KEK may not be available (it calls
+        // process::exit if MILNET_MASTER_KEK is not set).  Use a fixed
+        // test-only key so pseudonym tests can run without a real KEK.
+        let kek = if cfg!(test) || std::env::var("MILNET_DEV_MODE").as_deref() == Ok("1") {
+            match std::env::var("MILNET_MASTER_KEK") {
+                Ok(hex) if hex.len() >= 64 => {
+                    crate::sealed_keys::cached_master_kek()
+                }
+                _ => {
+                    // Dev/test fallback: deterministic key for log pseudonyms.
+                    // This is NOT used in production (KEK is always available).
+                    static DEV_KEY: [u8; 32] = [
+                        0x4D, 0x49, 0x4C, 0x4E, 0x45, 0x54, 0x2D, 0x4C,
+                        0x4F, 0x47, 0x2D, 0x50, 0x53, 0x45, 0x55, 0x44,
+                        0x4F, 0x4E, 0x59, 0x4D, 0x2D, 0x44, 0x45, 0x56,
+                        0x2D, 0x4B, 0x45, 0x59, 0x21, 0x21, 0x21, 0x21,
+                    ];
+                    &DEV_KEY
+                }
+            }
+        } else {
+            crate::sealed_keys::cached_master_kek()
+        };
         let hk = hkdf::Hkdf::<Sha256>::new(Some(LOG_PSEUDONYM_DOMAIN), kek);
         let mut okm = [0u8; 32];
         hk.expand(b"log-pseudonym-hmac-key", &mut okm)
             .unwrap_or_else(|_| {
-                // Fallback: use raw KEK bytes (still keyed, still irreversible)
                 okm.copy_from_slice(kek);
             });
         okm
