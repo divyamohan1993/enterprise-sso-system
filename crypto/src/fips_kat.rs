@@ -323,7 +323,8 @@ fn kat_xwing_combiner() -> Result<(), String> {
     let pk = kp.public_key();
 
     // Encapsulate: client produces (shared_secret, ciphertext)
-    let (ss_enc, ct) = xwing_encapsulate(&pk);
+    let (ss_enc, ct) = xwing_encapsulate(&pk)
+        .map_err(|e| format!("X-Wing KAT: encapsulation failed: {}", e))?;
 
     // Decapsulate: server recovers the same shared_secret
     let ss_dec = xwing_decapsulate(&kp, &ct)
@@ -341,8 +342,10 @@ fn kat_xwing_combiner() -> Result<(), String> {
 
     // Session key derivation must be deterministic
     let context = b"KAT-test-context";
-    let sk1 = derive_session_key(&ss_enc, context);
-    let sk2 = derive_session_key(&ss_enc, context);
+    let sk1 = derive_session_key(&ss_enc, context)
+        .map_err(|e| format!("X-Wing KAT: session key derivation failed: {}", e))?;
+    let sk2 = derive_session_key(&ss_enc, context)
+        .map_err(|e| format!("X-Wing KAT: session key derivation failed: {}", e))?;
     if sk1 != sk2 {
         return Err("X-Wing KAT: session key derivation is non-deterministic".into());
     }
@@ -353,7 +356,8 @@ fn kat_xwing_combiner() -> Result<(), String> {
     }
 
     // Different contexts must produce different session keys
-    let sk3 = derive_session_key(&ss_enc, b"different-context");
+    let sk3 = derive_session_key(&ss_enc, b"different-context")
+        .map_err(|e| format!("X-Wing KAT: session key derivation failed: {}", e))?;
     if sk1 == sk3 {
         return Err("X-Wing KAT: different contexts produced same session key".into());
     }
