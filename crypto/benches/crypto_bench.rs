@@ -41,7 +41,7 @@ fn bench_xwing_encap_decap(c: &mut Criterion) {
     c.bench_function("xwing_encap_decap", |b| {
         b.iter(|| {
             let (shared_secret, ciphertext) =
-                crypto::xwing::xwing_encapsulate(black_box(&pk));
+                crypto::xwing::xwing_encapsulate(black_box(&pk)).expect("encapsulate");
             let recovered = crypto::xwing::xwing_decapsulate(black_box(&kp), black_box(&ciphertext));
             assert!(recovered.is_ok());
             let _ = (shared_secret, recovered);

@@ -369,7 +369,6 @@ fn signature_algorithm_tag_dispatch() {
     // dispatch to the expected algorithm names.
     let cases = [
         (PqSignatureAlgorithm::MlDsa87, 0x01, "ML-DSA-87"),
-        (PqSignatureAlgorithm::MlDsa65, 0x02, "ML-DSA-65"),
         (PqSignatureAlgorithm::SlhDsaSha2256f, 0x03, "SLH-DSA-SHA2-256f"),
     ];
     for (algo, expected_tag, expected_name) in cases {

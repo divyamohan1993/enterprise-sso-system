@@ -107,7 +107,7 @@ pub async fn client_auth(
     })
     .await
     .expect("encapsulate task")
-    .map_err(|e| format!("X-Wing encapsulation failed: {e}"))?;
+    .expect("X-Wing encapsulation failed");
     let kem_ct_bytes = kem_ct.to_bytes();
 
     // 3. Solve puzzle and send solution with KEM ciphertext
@@ -127,9 +127,9 @@ pub async fn client_auth(
     // 4. Derive session key (both sides share the same secret)
     let session_key =
         crypto::xwing::derive_session_key(&shared_secret, &challenge.nonce)
-            .map_err(|e| format!("session key derivation failed: {e}"))?;
+            .expect("session key derivation failed");
     let enc_key: [u8; 32] = session_key[..32].try_into()
-        .map_err(|_| "session key too short".to_string())?;
+        .expect("session key too short");
 
     // 5. Encrypt and send auth request
     let auth_req = AuthRequest {
@@ -190,7 +190,7 @@ pub async fn client_auth_with_dpop(
     })
     .await
     .expect("encapsulate task")
-    .map_err(|e| format!("X-Wing encapsulation failed: {e}"))?;
+    .expect("X-Wing encapsulation failed");
     let kem_ct_bytes = kem_ct.to_bytes();
     let dpop_key = kem_ct_bytes.clone();
 
@@ -209,9 +209,9 @@ pub async fn client_auth_with_dpop(
 
     let session_key =
         crypto::xwing::derive_session_key(&shared_secret, &challenge.nonce)
-            .map_err(|e| format!("session key derivation failed: {e}"))?;
+            .expect("session key derivation failed");
     let enc_key: [u8; 32] = session_key[..32].try_into()
-        .map_err(|_| "session key too short".to_string())?;
+        .expect("session key too short");
 
     let auth_req = AuthRequest {
         username: username.to_string(),

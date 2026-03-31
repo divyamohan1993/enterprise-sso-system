@@ -700,7 +700,7 @@ fn cert_pinning_fingerprint_uniqueness() {
     // Non-zero
     assert_ne!(
         fp_a,
-        [0u8; 32],
+        [0u8; 64],
         "Certificate fingerprint must not be all zeros"
     );
 }
