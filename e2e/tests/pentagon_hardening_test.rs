@@ -193,7 +193,7 @@ fn audit_chain_integrity_with_mixed_event_types() {
 
     assert_eq!(log.entry_count(), 4);
     assert!(
-        log.verify_chain_with_key(&vk),
+        log.verify_chain_with_key(Some(&vk)),
         "hash chain must verify after mixed event types including failures and RBAC denials"
     );
 }
@@ -328,14 +328,20 @@ fn frost_2_of_5_insufficient_shares_fails() {
 }
 
 #[test]
-fn frost_different_messages_produce_different_signatures() {
+fn frost_threshold_signature_verifies_against_group_key() {
     let result = crypto::threshold::dkg(5, 3);
-    let mut shares = result.shares.clone();
+    let mut shares = result.shares;
 
-    let sig1 = crypto::threshold::threshold_sign(&mut shares[..3], &result.group, b"message-alpha", 3).unwrap();
-    let sig2 = crypto::threshold::threshold_sign(&mut result.shares[..3], &result.group, b"message-bravo", 3).unwrap();
-
-    assert_ne!(sig1, sig2, "different messages must produce different signatures");
+    let sig = crypto::threshold::threshold_sign(&mut shares[..3], &result.group, b"pentagon-clearance", 3).unwrap();
+    assert!(
+        crypto::threshold::verify_group_signature(&result.group, b"pentagon-clearance", &sig),
+        "threshold signature must verify against group public key"
+    );
+    // Wrong message must not verify.
+    assert!(
+        !crypto::threshold::verify_group_signature(&result.group, b"wrong-message", &sig),
+        "wrong message must not verify against threshold signature"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -506,7 +512,7 @@ fn combined_entropy_is_not_all_zeros() {
 
 #[test]
 fn opaque_server_registration_does_not_contain_password() {
-    let mut store = opaque::store::OpaqueStore::new();
+    let mut store = opaque::store::CredentialStore::new();
     let _user_id = store.register_with_password("testuser", b"SuperSecretPassword123!");
 
     if let Some(registration_bytes) = store.get_registration_bytes("testuser") {
@@ -537,14 +543,14 @@ fn audit_chain_entries_are_hash_linked() {
     }
 
     assert_eq!(log.entry_count(), 10);
-    assert!(log.verify_chain_with_key(&vk), "10-entry chain must verify");
+    assert!(log.verify_chain_with_key(Some(&vk)), "10-entry chain must verify");
 }
 
 #[test]
 fn audit_chain_empty_verifies() {
     let (_sk, vk) = crypto::pq_sign::generate_pq_keypair();
     let log = audit::log::AuditLog::new();
-    assert!(log.verify_chain_with_key(&vk), "empty chain must verify");
+    assert!(log.verify_chain_with_key(Some(&vk)), "empty chain must verify");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
