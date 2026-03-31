@@ -415,7 +415,7 @@ impl MultiRegionManager {
         &self,
         reachable_regions: &[String],
     ) -> Result<(), MultiRegionError> {
-        let regions = self.regions.read().unwrap();
+        let regions = crate::sync::siem_read(&self.regions, "multi_region::verify_multi_region");
         let total = regions.len();
         let reachable = reachable_regions.len();
 
@@ -466,7 +466,7 @@ impl MultiRegionManager {
     ) -> Result<RouteDecision, MultiRegionError> {
         // Check split-brain write restriction
         if request.requires_write && !self.writes_allowed.load(Ordering::Acquire) {
-            let regions = self.regions.read().unwrap();
+            let regions = crate::sync::siem_read(&self.regions, "multi_region::route_request");
             let total = regions.len();
             let healthy = regions
                 .iter()
@@ -486,7 +486,7 @@ impl MultiRegionManager {
             });
         }
 
-        let regions = self.regions.read().unwrap();
+        let regions = crate::sync::siem_read(&self.regions, "multi_region::route_request_select");
 
         // Check for region affinity
         if let Some(ref affinity) = request.region_affinity {
@@ -561,7 +561,7 @@ impl MultiRegionManager {
     ) -> Result<(StateReplicationEvent, Vec<(String, String)>), MultiRegionError> {
         // Check writes allowed (split-brain guard)
         if !self.writes_allowed.load(Ordering::Acquire) {
-            let regions = self.regions.read().unwrap();
+            let regions = crate::sync::siem_read(&self.regions, "multi_region::sync_state_split");
             let total = regions.len();
             let healthy = regions
                 .iter()
@@ -590,7 +590,7 @@ impl MultiRegionManager {
             sequence: seq,
         };
 
-        let regions = self.regions.read().unwrap();
+        let regions = crate::sync::siem_read(&self.regions, "multi_region::sync_state_targets");
         let targets: Vec<(String, String)> = regions
             .iter()
             .filter(|r| {
@@ -626,7 +626,7 @@ impl MultiRegionManager {
         &self,
         health_reports: &HashMap<String, (bool, u64)>,
     ) -> CrossRegionHealthReport {
-        let mut regions = self.regions.write().unwrap();
+        let mut regions = crate::sync::siem_write(&self.regions, "multi_region::cross_region_health");
         let total = regions.len();
         let majority = (total / 2) + 1;
 
@@ -720,7 +720,7 @@ impl MultiRegionManager {
     /// When a region fails, traffic is automatically redirected by `route_request`
     /// to the next-best region. This method handles the bookkeeping and SIEM logging.
     pub fn failover(&self, failed_region: &str) -> Result<(), MultiRegionError> {
-        let mut regions = self.regions.write().unwrap();
+        let mut regions = crate::sync::siem_write(&self.regions, "multi_region::failover");
 
         let region = regions
             .iter_mut()
@@ -824,7 +824,7 @@ impl MultiRegionManager {
         );
 
         // Store the verified distribution
-        *self.share_distribution.write().unwrap() = Some(distribution.clone());
+        *crate::sync::siem_write(&self.share_distribution, "multi_region::verify_share_distribution") = Some(distribution.clone());
 
         Ok(())
     }
@@ -835,7 +835,7 @@ impl MultiRegionManager {
         region_id: &str,
         lag_ms: u64,
     ) -> Result<(), MultiRegionError> {
-        let mut regions = self.regions.write().unwrap();
+        let mut regions = crate::sync::siem_write(&self.regions, "multi_region::update_replication_lag");
 
         if let Some(region) = regions.iter_mut().find(|r| r.config.region_id == region_id) {
             region.replication_lag_ms = lag_ms;
@@ -860,7 +860,7 @@ impl MultiRegionManager {
 
     /// Mark a region as healthy (e.g., after successful health check).
     pub fn mark_region_healthy(&self, region_id: &str) {
-        let mut regions = self.regions.write().unwrap();
+        let mut regions = crate::sync::siem_write(&self.regions, "multi_region::mark_region_healthy");
         if let Some(region) = regions.iter_mut().find(|r| r.config.region_id == region_id) {
             region.health = RegionHealth::Healthy;
             region.consecutive_failures = 0;
@@ -902,14 +902,12 @@ impl MultiRegionManager {
 
     /// Get the number of configured regions.
     pub fn region_count(&self) -> usize {
-        self.regions.read().unwrap().len()
+        crate::sync::siem_read(&self.regions, "multi_region::region_count").len()
     }
 
     /// Get IDs of all configured regions.
     pub fn region_ids(&self) -> Vec<String> {
-        self.regions
-            .read()
-            .unwrap()
+        crate::sync::siem_read(&self.regions, "multi_region::region_ids")
             .iter()
             .map(|r| r.config.region_id.clone())
             .collect()
@@ -917,9 +915,7 @@ impl MultiRegionManager {
 
     /// Get the current health of a specific region.
     pub fn get_region_health(&self, region_id: &str) -> Option<RegionHealth> {
-        self.regions
-            .read()
-            .unwrap()
+        crate::sync::siem_read(&self.regions, "multi_region::get_region_health")
             .iter()
             .find(|r| r.config.region_id == region_id)
             .map(|r| r.health)

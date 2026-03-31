@@ -98,24 +98,39 @@ async fn main() {
             .max_connections(10)
             .connect(&url)
             .await
-            .expect("Failed to connect to PostgreSQL for ratchet HA persistence");
+            .unwrap_or_else(|e| {
+                tracing::error!("FATAL: Failed to connect to PostgreSQL for ratchet HA persistence: {e}");
+                std::process::exit(1);
+            });
 
         // Load KEK from environment (in production, from HSM / sealed storage)
         let kek = if let Ok(kek_hex) = std::env::var("RATCHET_KEK") {
-            let kek_bytes = hex::decode(&kek_hex)
-                .expect("RATCHET_KEK must be valid hex");
-            assert_eq!(kek_bytes.len(), 32, "RATCHET_KEK must be exactly 32 bytes (64 hex chars)");
+            let kek_bytes = match hex::decode(&kek_hex) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::error!("FATAL: RATCHET_KEK must be valid hex: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if kek_bytes.len() != 32 {
+                tracing::error!("FATAL: RATCHET_KEK must be exactly 32 bytes (64 hex chars), got {} bytes", kek_bytes.len());
+                std::process::exit(1);
+            }
             let mut k = [0u8; 32];
             k.copy_from_slice(&kek_bytes);
             k
         } else {
-            panic!("RATCHET_KEK must be set in distributed HA mode (64 hex chars = 32 bytes)");
+            tracing::error!("FATAL: RATCHET_KEK must be set in distributed HA mode (64 hex chars = 32 bytes)");
+            std::process::exit(1);
         };
 
         // Initialize with startup recovery (loads all sessions from DB)
         let mgr = ratchet::manager::PersistentSessionManager::new(pool, kek)
             .await
-            .expect("Failed to initialize PersistentSessionManager with DB recovery");
+            .unwrap_or_else(|e| {
+                tracing::error!("FATAL: Failed to initialize PersistentSessionManager with DB recovery: {e}");
+                std::process::exit(1);
+            });
 
         tracing::info!(
             session_count = mgr.session_count(),
@@ -138,9 +153,15 @@ async fn main() {
         .unwrap_or_else(|_| "127.0.0.1:9105".to_string());
     let hmac_key = crypto::entropy::generate_key_64();
     let (listener, _ca, _cert_key) =
-        shard::tls_transport::tls_bind(&addr, common::types::ModuleId::Ratchet, hmac_key, "ratchet")
+        match shard::tls_transport::tls_bind(&addr, common::types::ModuleId::Ratchet, hmac_key, "ratchet")
             .await
-            .unwrap();
+        {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!("FATAL: Ratchet service failed to bind TLS listener: {e}");
+                std::process::exit(1);
+            }
+        };
 
     // SECURITY: Verify kernel security posture (ptrace_scope, BPF restrictions)
     common::startup_checks::verify_kernel_security_posture();
@@ -159,12 +180,24 @@ async fn main() {
     // - Stops accepting new ratchet requests
     // - Waits for in-flight chain operations to complete (30s timeout)
     // - Zeroizes chain key material before exit
-    let mut sigterm = tokio::signal::unix::signal(
+    let mut sigterm = match tokio::signal::unix::signal(
         tokio::signal::unix::SignalKind::terminate(),
-    ).expect("failed to install SIGTERM handler");
-    let mut sigint = tokio::signal::unix::signal(
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("FATAL: failed to install SIGTERM handler: {e}");
+            std::process::exit(1);
+        }
+    };
+    let mut sigint = match tokio::signal::unix::signal(
         tokio::signal::unix::SignalKind::interrupt(),
-    ).expect("failed to install SIGINT handler");
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("FATAL: failed to install SIGINT handler: {e}");
+            std::process::exit(1);
+        }
+    };
 
     loop {
         tokio::select! {
@@ -196,8 +229,13 @@ async fn main() {
                                     error: Some(format!("deserialize error: {e}")),
                                 },
                             };
-                            let encoded = postcard::to_allocvec(&response)
-                                .expect("RatchetResponse must serialize");
+                            let encoded = match postcard::to_allocvec(&response) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    tracing::error!("Ratchet: failed to serialize response: {e}");
+                                    continue;
+                                }
+                            };
                             let _ = transport.send(&encoded).await;
                         }
                     });

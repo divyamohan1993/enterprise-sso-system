@@ -587,7 +587,13 @@ impl ThreatIntelManager {
     fn compute_hmac(&self, data: &[u8]) -> String {
         type HmacSha512 = Hmac<Sha512>;
         let mut mac =
-            HmacSha512::new_from_slice(&self.hmac_key).expect("HMAC accepts any key length");
+            match HmacSha512::new_from_slice(&self.hmac_key) {
+                Ok(m) => m,
+                Err(_) => {
+                    tracing::error!("FATAL: HMAC-SHA512 key init failed for threat intel integrity");
+                    return String::new();
+                }
+            };
         mac.update(data);
         let result = mac.finalize();
         hex::encode(result.into_bytes())

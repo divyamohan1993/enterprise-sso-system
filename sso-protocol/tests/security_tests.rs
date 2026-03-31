@@ -116,7 +116,7 @@ fn test_client_register_with_id_preserves_fields() {
         "fixed-secret",
         "My App",
         vec!["https://app.com/cb".into()],
-    );
+    ).unwrap();
     assert_eq!(client.client_id, "fixed-id");
     // client_secret is now an Argon2id hash, not the plaintext
     assert_ne!(client.client_secret, "fixed-secret");
@@ -273,7 +273,7 @@ fn test_client_secret_stored_as_argon2id_hash() {
         "super-secret-value",
         "Test App",
         vec!["https://app.example.com/cb".into()],
-    );
+    ).unwrap();
 
     // The stored secret must NOT be the plaintext
     assert_ne!(

@@ -151,7 +151,7 @@ fn test_client_registration() {
     let client = registry.register(
         "Test App",
         vec!["https://app.example.com/callback".into()],
-    );
+    ).unwrap();
 
     assert_eq!(client.name, "Test App");
     assert!(!client.client_id.is_empty());
@@ -292,8 +292,8 @@ fn test_token_claims_include_required_fields() {
 #[test]
 fn test_client_registration_produces_unique_ids() {
     let mut registry = sso_protocol::clients::ClientRegistry::new();
-    let c1 = registry.register("App A", vec!["https://a.com/cb".into()]);
-    let c2 = registry.register("App B", vec!["https://b.com/cb".into()]);
+    let c1 = registry.register("App A", vec!["https://a.com/cb".into()]).unwrap();
+    let c2 = registry.register("App B", vec!["https://b.com/cb".into()]).unwrap();
     assert_ne!(c1.client_id, c2.client_id);
     assert_ne!(c1.plaintext_secret, c2.plaintext_secret);
 }
@@ -301,7 +301,7 @@ fn test_client_registration_produces_unique_ids() {
 #[test]
 fn test_client_validation_rejects_wrong_secret() {
     let mut registry = sso_protocol::clients::ClientRegistry::new();
-    let client = registry.register("Secure App", vec!["https://s.com/cb".into()]);
+    let client = registry.register("Secure App", vec!["https://s.com/cb".into()]).unwrap();
     assert!(registry.validate(&client.client_id, &client.plaintext_secret).is_some());
     assert!(registry.validate(&client.client_id, "totally-wrong-secret").is_none());
 }

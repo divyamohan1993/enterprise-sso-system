@@ -95,7 +95,10 @@ impl VectorClock {
 
     /// Serialize to bytes using postcard.
     pub fn to_bytes(&self) -> Vec<u8> {
-        postcard::to_allocvec(self).expect("VectorClock serialization cannot fail")
+        postcard::to_allocvec(self).unwrap_or_else(|e| {
+            tracing::error!("VectorClock serialization failed: {e}");
+            Vec::new()
+        })
     }
 
     /// Deserialize from bytes.
@@ -156,7 +159,10 @@ pub struct VectorClockSnapshot {
 impl VectorClockSnapshot {
     /// Serialize to bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
-        postcard::to_allocvec(self).expect("VectorClockSnapshot serialization cannot fail")
+        postcard::to_allocvec(self).unwrap_or_else(|e| {
+            tracing::error!("VectorClockSnapshot serialization failed: {e}");
+            Vec::new()
+        })
     }
 
     /// Deserialize from bytes.

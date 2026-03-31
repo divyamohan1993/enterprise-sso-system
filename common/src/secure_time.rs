@@ -231,7 +231,7 @@ pub fn init_monotonic_baseline() {
     let wall_us = authenticated_now_us().unwrap_or_else(|| {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_micros() as i64
     });
     MONOTONIC_BASELINE.get_or_init(|| (Instant::now(), wall_us));

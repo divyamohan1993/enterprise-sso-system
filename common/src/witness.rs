@@ -93,7 +93,7 @@ impl WitnessLog {
             kt_root,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_micros() as i64,
             sequence: seq,
             signature,
@@ -205,7 +205,10 @@ pub fn load_or_create_witness_seed(path: &Path) -> [u8; 32] {
                 path, e
             );
             let mut seed = [0u8; 32];
-            getrandom::getrandom(&mut seed).expect("getrandom failed");
+            getrandom::getrandom(&mut seed).unwrap_or_else(|e| {
+        tracing::error!("FATAL: CSPRNG failure in witness seed generation: {e}");
+        std::process::exit(1);
+    });
             seed
         }
     }
@@ -215,7 +218,10 @@ fn generate_and_persist_seed(path: &Path) -> [u8; 32] {
     use std::io::Write;
 
     let mut seed = [0u8; 32];
-    getrandom::getrandom(&mut seed).expect("getrandom failed");
+    getrandom::getrandom(&mut seed).unwrap_or_else(|e| {
+        tracing::error!("FATAL: CSPRNG failure in witness seed generation: {e}");
+        std::process::exit(1);
+    });
 
     match std::fs::OpenOptions::new()
         .create(true)

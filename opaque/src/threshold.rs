@@ -93,7 +93,10 @@ fn shamir_split(secret: &[u8; 32], threshold: u8, total: u8) -> Vec<OprfShare> {
         coefficients[0] = secret[byte_idx];
 
         // Random coefficients for degrees 1..threshold-1
-        getrandom::getrandom(&mut coefficients[1..]).expect("entropy");
+        getrandom::getrandom(&mut coefficients[1..]).unwrap_or_else(|e| {
+            tracing::error!("FATAL: CSPRNG failure in OPAQUE threshold sharing: {e}");
+            std::process::exit(1);
+        });
 
         // Evaluate polynomial at each server's x-coordinate
         for share in shares.iter_mut() {
@@ -228,11 +231,17 @@ pub struct ThresholdOprfKeygenResult {
 pub fn generate_threshold_oprf_key(threshold: u8, total: u8) -> ThresholdOprfKeygenResult {
     // Generate random master key
     let mut master_key = [0u8; 32];
-    getrandom::getrandom(&mut master_key).expect("entropy");
+    getrandom::getrandom(&mut master_key).unwrap_or_else(|e| {
+        tracing::error!("FATAL: CSPRNG failure in threshold OPRF keygen: {e}");
+        std::process::exit(1);
+    });
 
     // Derive a public verification key before splitting
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&master_key)
-        .expect("HMAC accepts any key size");
+        .unwrap_or_else(|e| {
+            tracing::error!("FATAL: HMAC-SHA256 key init failed in threshold OPRF: {e}");
+            std::process::exit(1);
+        });
     mac.update(b"threshold-opaque-verification");
     let verification_key: [u8; 32] = mac.finalize().into_bytes().into();
 
@@ -272,13 +281,19 @@ impl ThresholdOpaqueServer {
         // This ensures the raw share is NEVER transmitted — only the evaluation
         // output leaves this node. The coordinator combines evaluations, not shares.
         let mut eval_mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.oprf_share.share_value)
-            .expect("HMAC accepts any key size");
+            .unwrap_or_else(|e| {
+                tracing::error!("FATAL: HMAC-SHA256 key init failed in partial_evaluate: {e}");
+                std::process::exit(1);
+            });
         eval_mac.update(blinded_element);
         let evaluation: Vec<u8> = eval_mac.finalize().into_bytes().to_vec();
 
         // Authentication proof: HMAC(share, blinded_element || server_id)
         let mut proof_mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.oprf_share.share_value)
-            .expect("HMAC accepts any key size");
+            .unwrap_or_else(|e| {
+                tracing::error!("FATAL: HMAC-SHA256 key init failed in partial_evaluate proof: {e}");
+                std::process::exit(1);
+            });
         proof_mac.update(blinded_element);
         proof_mac.update(&[self.oprf_share.server_id]);
         let proof: [u8; 32] = proof_mac.finalize().into_bytes().into();

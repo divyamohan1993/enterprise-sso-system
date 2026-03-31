@@ -365,7 +365,7 @@ impl BftAuditCluster {
             risk_score,
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_micros() as i64,
             prev_hash,
             signature: Vec::new(),

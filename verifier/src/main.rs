@@ -81,8 +81,20 @@ async fn main() {
     // 1. Load group verifying key from env (hex-encoded postcard bytes)
     let group_key: PublicKeyPackage = match std::env::var("MILNET_GROUP_VERIFYING_KEY") {
         Ok(hex_str) => {
-            let bytes = hex::decode(hex_str.trim()).expect("MILNET_GROUP_VERIFYING_KEY: invalid hex");
-            postcard::from_bytes(&bytes).expect("MILNET_GROUP_VERIFYING_KEY: invalid PublicKeyPackage")
+            let bytes = match hex::decode(hex_str.trim()) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::error!("FATAL: MILNET_GROUP_VERIFYING_KEY: invalid hex: {e}");
+                    std::process::exit(1);
+                }
+            };
+            match postcard::from_bytes(&bytes) {
+                Ok(pk) => pk,
+                Err(e) => {
+                    tracing::error!("FATAL: MILNET_GROUP_VERIFYING_KEY: invalid PublicKeyPackage: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
         Err(_) => {
             tracing::warn!(
@@ -96,9 +108,20 @@ async fn main() {
     // 2. Load PQ verifying key from env (hex-encoded ML-DSA-65 encoded key bytes)
     let pq_key: crypto::pq_sign::PqVerifyingKey = match std::env::var("MILNET_PQ_VERIFYING_KEY") {
         Ok(hex_str) => {
-            let bytes = hex::decode(hex_str.trim()).expect("MILNET_PQ_VERIFYING_KEY: invalid hex");
-            let encoded = crypto::pq_sign::PqEncodedVerifyingKey::try_from(bytes.as_slice())
-                .expect("MILNET_PQ_VERIFYING_KEY: wrong length for ML-DSA-65 verifying key");
+            let bytes = match hex::decode(hex_str.trim()) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::error!("FATAL: MILNET_PQ_VERIFYING_KEY: invalid hex: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let encoded = match crypto::pq_sign::PqEncodedVerifyingKey::try_from(bytes.as_slice()) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::error!("FATAL: MILNET_PQ_VERIFYING_KEY: wrong length for ML-DSA-65 verifying key: {e}");
+                    std::process::exit(1);
+                }
+            };
             crypto::pq_sign::PqVerifyingKey::decode(&encoded)
         }
         Err(_) => {
@@ -146,7 +169,10 @@ async fn main() {
     let (listener, _ca, _cert_key) =
         shard::tls_transport::tls_bind(&addr, ModuleId::Verifier, hmac_key, "verifier")
             .await
-            .expect("failed to bind verifier SHARD TLS listener");
+            .unwrap_or_else(|e| {
+                tracing::error!("FATAL: failed to bind verifier SHARD TLS listener: {e}");
+                std::process::exit(1);
+            });
 
     tracing::info!("verifier listening on {addr} (mTLS)");
 

@@ -482,8 +482,10 @@ fn derive_raft_hmac_key() -> Option<[u8; 64]> {
     use hkdf::Hkdf;
     let hk = Hkdf::<Sha512>::new(None, &kek_bytes);
     let mut okm = [0u8; 64];
-    hk.expand(RAFT_HMAC_INFO, &mut okm)
-        .expect("64-byte HKDF-SHA512 expand must succeed");
+    if let Err(e) = hk.expand(RAFT_HMAC_INFO, &mut okm) {
+        tracing::error!("FATAL: HKDF-SHA512 expand failed for Raft HMAC key: {e}");
+        std::process::exit(1);
+    }
     Some(okm)
 }
 
@@ -496,8 +498,10 @@ async fn send_authenticated(
     data: &[u8],
     hmac_key: &[u8; 64],
 ) -> Result<(), String> {
-    let mut mac = HmacSha512::new_from_slice(hmac_key)
-        .expect("HMAC-SHA512 accepts any key length");
+    let mut mac = match HmacSha512::new_from_slice(hmac_key) {
+        Ok(m) => m,
+        Err(e) => return Err(format!("HMAC-SHA512 key init failed: {e}")),
+    };
     mac.update(data);
     let tag = mac.finalize().into_bytes();
 
@@ -561,8 +565,10 @@ async fn recv_authenticated(
         .map_err(|e| format!("failed to read HMAC tag: {e}"))?;
 
     // Verify HMAC before deserializing.
-    let mut mac = HmacSha512::new_from_slice(hmac_key)
-        .expect("HMAC-SHA512 accepts any key length");
+    let mut mac = match HmacSha512::new_from_slice(hmac_key) {
+        Ok(m) => m,
+        Err(e) => return Err(format!("HMAC-SHA512 key init failed: {e}")),
+    };
     mac.update(&payload);
     if mac.verify_slice(&tag_buf).is_err() {
         // Emit SIEM event for failed authentication.

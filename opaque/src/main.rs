@@ -97,12 +97,24 @@ async fn main() {
     // - Shuts down Raft cluster membership cleanly
     // - Zeroizes OPRF key shares before exit
     let shutdown_signal = async {
-        let mut sigterm = tokio::signal::unix::signal(
+        let mut sigterm = match tokio::signal::unix::signal(
             tokio::signal::unix::SignalKind::terminate(),
-        ).expect("failed to install SIGTERM handler");
-        let mut sigint = tokio::signal::unix::signal(
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("FATAL: failed to install SIGTERM handler: {e}");
+                std::process::exit(1);
+            }
+        };
+        let mut sigint = match tokio::signal::unix::signal(
             tokio::signal::unix::SignalKind::interrupt(),
-        ).expect("failed to install SIGINT handler");
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("FATAL: failed to install SIGINT handler: {e}");
+                std::process::exit(1);
+            }
+        };
         tokio::select! {
             _ = sigterm.recv() => tracing::info!("received SIGTERM, initiating graceful shutdown"),
             _ = sigint.recv() => tracing::info!("received SIGINT, initiating graceful shutdown"),

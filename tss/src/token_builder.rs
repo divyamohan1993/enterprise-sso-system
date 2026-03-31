@@ -14,7 +14,10 @@ type HmacSha512 = Hmac<Sha512>;
 /// Compute an HMAC-SHA512 ratchet tag over (TOKEN_TAG || claims_bytes || epoch).
 fn compute_ratchet_tag(ratchet_key: &[u8; 64], claims_bytes: &[u8], epoch: u64) -> [u8; 64] {
     let mut mac = HmacSha512::new_from_slice(ratchet_key)
-        .expect("HMAC-SHA512 accepts any key length");
+        .unwrap_or_else(|e| {
+            tracing::error!("FATAL: HMAC-SHA512 key init failed for ratchet tag: {e}");
+            std::process::exit(1);
+        });
     mac.update(domain::TOKEN_TAG);
     mac.update(claims_bytes);
     mac.update(&epoch.to_le_bytes());

@@ -60,7 +60,10 @@ impl OpeContext {
 
         // PRF the low bits to add randomness within the same high-order bucket
         let prf_input = high.to_le_bytes();
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.key).expect("HMAC key");
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.key).unwrap_or_else(|e| {
+            tracing::error!("FATAL: HMAC-SHA256 key init failed for HE search: {e}");
+            std::process::exit(1);
+        });
         mac.update(OPE_DOMAIN);
         mac.update(&prf_input);
         mac.update(&low.to_le_bytes());
@@ -121,7 +124,10 @@ impl DetEncContext {
     ///
     /// Returns a 32-byte ciphertext (HMAC-SHA256 tag).
     pub fn encrypt(&self, plaintext: &[u8]) -> [u8; 32] {
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.key).expect("HMAC key");
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.key).unwrap_or_else(|e| {
+            tracing::error!("FATAL: HMAC-SHA256 key init failed for HE search: {e}");
+            std::process::exit(1);
+        });
         mac.update(DET_ENC_DOMAIN);
         mac.update(plaintext);
         mac.finalize().into_bytes().into()
@@ -170,7 +176,10 @@ impl EncryptedAggContext {
 
     /// Derive a deterministic mask for a given index.
     fn derive_mask(&self, index: u64) -> u64 {
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.key).expect("HMAC key");
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.key).unwrap_or_else(|e| {
+            tracing::error!("FATAL: HMAC-SHA256 key init failed for HE search: {e}");
+            std::process::exit(1);
+        });
         mac.update(HE_AGG_DOMAIN);
         mac.update(&index.to_le_bytes());
         let tag = mac.finalize().into_bytes();

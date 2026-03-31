@@ -6,7 +6,7 @@ use uuid::Uuid;
 ///
 /// Uses the client_id as a domain-separated salt to avoid rainbow tables.
 /// Returns hex-encoded hash.
-fn hash_client_secret(client_id: &str, plaintext_secret: &str) -> String {
+fn hash_client_secret(client_id: &str, plaintext_secret: &str) -> Result<String, String> {
     // Domain-separated salt: SHA-256("milnet-client-secret:" || client_id)
     let mut salt_hasher = Sha256::new();
     salt_hasher.update(b"milnet-client-secret:");
@@ -14,14 +14,23 @@ fn hash_client_secret(client_id: &str, plaintext_secret: &str) -> String {
     let salt = salt_hasher.finalize();
 
     // Use the crypto crate's Argon2id KSF (64MiB, 3 iterations, 4 threads, 32-byte output)
-    let derived = crypto::kdf::stretch_password(plaintext_secret.as_bytes(), &salt[..16])
-        .unwrap_or_else(|e| panic!("FATAL: argon2id stretch failed for client secret hashing: {e}"));
-    hex::encode(derived)
+    let derived = common::siem_unwrap!(
+        crypto::kdf::stretch_password(plaintext_secret.as_bytes(), &salt[..16]),
+        "argon2id stretch for client secret hashing",
+        CRYPTO_FAILURE
+    );
+    Ok(hex::encode(derived))
 }
 
 /// Verify a plaintext secret against a stored Argon2id hash using constant-time comparison.
 fn verify_client_secret(client_id: &str, plaintext_secret: &str, stored_hash: &str) -> bool {
-    let candidate_hash = hash_client_secret(client_id, plaintext_secret);
+    let candidate_hash = match hash_client_secret(client_id, plaintext_secret) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!("client secret verification failed (argon2id error): {e}");
+            return false; // Fail-closed: deny access on crypto failure
+        }
+    };
     crypto::ct::ct_eq(candidate_hash.as_bytes(), stored_hash.as_bytes())
 }
 
@@ -82,10 +91,10 @@ impl ClientRegistry {
         }
     }
 
-    pub fn register(&mut self, name: &str, redirect_uris: Vec<String>) -> ClientRegistrationResult {
+    pub fn register(&mut self, name: &str, redirect_uris: Vec<String>) -> Result<ClientRegistrationResult, String> {
         let client_id = Uuid::new_v4().to_string();
         let plaintext_secret = hex::encode(crypto::entropy::generate_nonce());
-        let secret_hash = hash_client_secret(&client_id, &plaintext_secret);
+        let secret_hash = hash_client_secret(&client_id, &plaintext_secret)?;
         let client = OAuthClient {
             client_id: client_id.clone(),
             client_secret: secret_hash,
@@ -101,7 +110,7 @@ impl ClientRegistry {
             allowed_scopes: client.allowed_scopes.clone(),
         };
         self.clients.insert(client_id, client);
-        result
+        Ok(result)
     }
 
     /// Register a client with a specific client_id and secret (for pre-seeding).
@@ -112,8 +121,8 @@ impl ClientRegistry {
         client_secret: &str,
         name: &str,
         redirect_uris: Vec<String>,
-    ) -> OAuthClient {
-        let secret_hash = hash_client_secret(client_id, client_secret);
+    ) -> Result<OAuthClient, String> {
+        let secret_hash = hash_client_secret(client_id, client_secret)?;
         let client = OAuthClient {
             client_id: client_id.to_string(),
             client_secret: secret_hash,
@@ -122,7 +131,7 @@ impl ClientRegistry {
             allowed_scopes: vec!["openid".into(), "profile".into(), "email".into()],
         };
         self.clients.insert(client.client_id.clone(), client.clone());
-        client
+        Ok(client)
     }
 
     /// Validate a client's credentials by hashing the provided secret and
@@ -151,7 +160,7 @@ mod tests {
     #[test]
     fn test_register_stores_hash_not_plaintext() {
         let mut reg = ClientRegistry::new();
-        let result = reg.register("test", vec!["https://ex.com/cb".into()]);
+        let result = reg.register("test", vec!["https://ex.com/cb".into()]).unwrap();
         let stored = reg.get(&result.client_id).unwrap();
         // Stored secret must be the Argon2id hash, not the plaintext.
         assert_ne!(stored.client_secret, result.plaintext_secret);
@@ -162,14 +171,14 @@ mod tests {
     #[test]
     fn test_validate_rejects_wrong_secret() {
         let mut reg = ClientRegistry::new();
-        let result = reg.register("test", vec!["https://ex.com/cb".into()]);
+        let result = reg.register("test", vec!["https://ex.com/cb".into()]).unwrap();
         assert!(reg.validate(&result.client_id, "wrong-secret").is_none());
     }
 
     #[test]
     fn test_register_with_id_hashes_secret() {
         let mut reg = ClientRegistry::new();
-        let _client = reg.register_with_id("cid", "my-secret", "test", vec![]);
+        let _client = reg.register_with_id("cid", "my-secret", "test", vec![]).unwrap();
         assert!(reg.validate("cid", "my-secret").is_some());
         assert!(reg.validate("cid", "other").is_none());
     }
@@ -177,7 +186,7 @@ mod tests {
     #[test]
     fn test_debug_redacts_secret() {
         let mut reg = ClientRegistry::new();
-        let result = reg.register("test", vec![]);
+        let result = reg.register("test", vec![]).unwrap();
         let client = reg.get(&result.client_id).unwrap();
         let debug_output = format!("{:?}", client);
         assert!(debug_output.contains("[REDACTED]"));
@@ -187,7 +196,7 @@ mod tests {
     #[test]
     fn test_registration_result_debug_redacts() {
         let mut reg = ClientRegistry::new();
-        let result = reg.register("test", vec![]);
+        let result = reg.register("test", vec![]).unwrap();
         let debug_output = format!("{:?}", result);
         assert!(debug_output.contains("[REDACTED]"));
         assert!(!debug_output.contains(&result.plaintext_secret));

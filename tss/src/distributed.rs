@@ -44,8 +44,10 @@ fn nonce_seal_kek() -> [u8; 32] {
     let master_kek = common::sealed_keys::cached_master_kek();
     let hk = Hkdf::<Sha512>::new(Some(b"MILNET-UNSEAL-v1"), master_kek);
     let mut key = [0u8; 32];
-    hk.expand(b"tss-nonce-state", &mut key)
-        .expect("32-byte HKDF expand");
+    if let Err(e) = hk.expand(b"tss-nonce-state", &mut key) {
+        tracing::error!("FATAL: HKDF-SHA512 expand failed for TSS nonce seal KEK: {e}");
+        std::process::exit(1);
+    }
     key
 }
 
@@ -70,14 +72,26 @@ fn load_nonce_counter() -> u64 {
                 return 0;
             }
             let seal_key = nonce_seal_kek();
-            let cipher = Aes256Gcm::new_from_slice(&seal_key).expect("32-byte key");
+            let cipher = match Aes256Gcm::new_from_slice(&seal_key) {
+                Ok(c) => c,
+                Err(_) => {
+                    tracing::error!("FATAL: AES-256-GCM key init failed for TSS nonce state");
+                    return 0;
+                }
+            };
             let nonce = Nonce::from_slice(&sealed_bytes[..12]);
             let aad = b"MILNET-TSS-NONCE-STATE-v1";
             match cipher.decrypt(nonce, aes_gcm::aead::Payload { msg: &sealed_bytes[12..], aad: aad.as_slice() }) {
                 Ok(plaintext) => {
                     if plaintext.len() == 8 {
                         let counter = u64::from_le_bytes(
-                            plaintext[..8].try_into().expect("8-byte slice"),
+                            match plaintext[..8].try_into() {
+                                Ok(arr) => arr,
+                                Err(_) => {
+                                    tracing::warn!("TSS nonce state: 8-byte conversion failed, starting from 0");
+                                    return 0;
+                                }
+                            },
                         );
                         tracing::info!(
                             nonce_counter = counter,
@@ -133,7 +147,13 @@ fn save_nonce_counter(counter: u64) {
         .unwrap_or_else(|_| DEFAULT_NONCE_STATE_PATH.to_string());
 
     let seal_key = nonce_seal_kek();
-    let cipher = Aes256Gcm::new_from_slice(&seal_key).expect("32-byte key");
+    let cipher = match Aes256Gcm::new_from_slice(&seal_key) {
+        Ok(c) => c,
+        Err(_) => {
+            tracing::error!("FATAL: AES-256-GCM key init failed for TSS nonce state save");
+            return;
+        }
+    };
 
     let mut nonce_bytes = [0u8; 12];
     if getrandom::getrandom(&mut nonce_bytes).is_err() {
@@ -339,7 +359,13 @@ impl NonceWal {
 
                 // Verify CRC32 integrity
                 let stored_crc = u32::from_le_bytes(
-                    data[16..20].try_into().expect("4-byte slice"),
+                    match data[16..20].try_into() {
+                        Ok(arr) => arr,
+                        Err(_) => {
+                            tracing::warn!(path = %path.display(), "nonce WAL CRC slice conversion failed");
+                            return 0;
+                        }
+                    },
                 );
                 let computed_crc = Self::crc32(&data[0..16]);
 
@@ -354,7 +380,13 @@ impl NonceWal {
                 }
 
                 let nonce = u64::from_le_bytes(
-                    data[0..8].try_into().expect("8-byte slice"),
+                    match data[0..8].try_into() {
+                        Ok(arr) => arr,
+                        Err(_) => {
+                            tracing::warn!(path = %path.display(), "nonce WAL nonce slice conversion failed");
+                            return 0;
+                        }
+                    },
                 );
 
                 tracing::info!(
@@ -414,7 +446,7 @@ impl NonceWal {
 
         let epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         entry[8..16].copy_from_slice(&epoch.to_le_bytes());
 
@@ -923,7 +955,13 @@ async fn run_signer_process_inner(
                                 let resp = SignerMessage::Error {
                                     message: format!("deserialize error: {e}"),
                                 };
-                                let resp_bytes = postcard::to_allocvec(&resp).unwrap();
+                                let resp_bytes = match postcard::to_allocvec(&resp) {
+                                    Ok(b) => b,
+                                    Err(e) => {
+                                        tracing::error!("TSS signer: failed to serialize error response: {e}");
+                                        continue;
+                                    }
+                                };
                                 if let Err(e) = transport.send(&resp_bytes).await {
                                     tracing::warn!("TSS signer: failed to send response: {e}");
                                 }
@@ -945,7 +983,13 @@ async fn run_signer_process_inner(
                                     nonces_bytes,
                                     commitments_bytes,
                                 };
-                                let resp_bytes = postcard::to_allocvec(&resp).unwrap();
+                                let resp_bytes = match postcard::to_allocvec(&resp) {
+                                            Ok(b) => b,
+                                            Err(e) => {
+                                                tracing::error!("TSS signer: serialize response failed: {e}");
+                                                continue;
+                                            }
+                                        };
                                 if let Err(e) = transport.send(&resp_bytes).await {
                                     tracing::warn!("TSS signer: failed to send response: {e}");
                                 }
@@ -966,7 +1010,13 @@ async fn run_signer_process_inner(
                                                 ),
                                             };
                                             let resp_bytes =
-                                                postcard::to_allocvec(&resp).unwrap();
+                                                match postcard::to_allocvec(&resp) {
+                                            Ok(b) => b,
+                                            Err(e) => {
+                                                tracing::error!("TSS signer: serialize response failed: {e}");
+                                                continue;
+                                            }
+                                        };
                                             if let Err(e) = transport.send(&resp_bytes).await {
                                     tracing::warn!("TSS signer: failed to send response: {e}");
                                 }
@@ -980,7 +1030,13 @@ async fn run_signer_process_inner(
                                         let resp = SignerMessage::Error {
                                             message: format!("deserialize nonces: {e}"),
                                         };
-                                        let resp_bytes = postcard::to_allocvec(&resp).unwrap();
+                                        let resp_bytes = match postcard::to_allocvec(&resp) {
+                                            Ok(b) => b,
+                                            Err(e) => {
+                                                tracing::error!("TSS signer: serialize response failed: {e}");
+                                                continue;
+                                            }
+                                        };
                                         if let Err(e) = transport.send(&resp_bytes).await {
                                     tracing::warn!("TSS signer: failed to send response: {e}");
                                 }
@@ -996,7 +1052,13 @@ async fn run_signer_process_inner(
                                             identifier_bytes,
                                             share_bytes,
                                         };
-                                        let resp_bytes = postcard::to_allocvec(&resp).unwrap();
+                                        let resp_bytes = match postcard::to_allocvec(&resp) {
+                                            Ok(b) => b,
+                                            Err(e) => {
+                                                tracing::error!("TSS signer: serialize response failed: {e}");
+                                                continue;
+                                            }
+                                        };
                                         if let Err(e) = transport.send(&resp_bytes).await {
                                     tracing::warn!("TSS signer: failed to send response: {e}");
                                 }
@@ -1005,7 +1067,13 @@ async fn run_signer_process_inner(
                                         let resp = SignerMessage::Error {
                                             message: format!("sign failed: {e}"),
                                         };
-                                        let resp_bytes = postcard::to_allocvec(&resp).unwrap();
+                                        let resp_bytes = match postcard::to_allocvec(&resp) {
+                                            Ok(b) => b,
+                                            Err(e) => {
+                                                tracing::error!("TSS signer: serialize response failed: {e}");
+                                                continue;
+                                            }
+                                        };
                                         if let Err(e) = transport.send(&resp_bytes).await {
                                     tracing::warn!("TSS signer: failed to send response: {e}");
                                 }
@@ -1016,7 +1084,13 @@ async fn run_signer_process_inner(
                                 let resp = SignerMessage::Error {
                                     message: "unexpected message type".into(),
                                 };
-                                let resp_bytes = postcard::to_allocvec(&resp).unwrap();
+                                let resp_bytes = match postcard::to_allocvec(&resp) {
+                                            Ok(b) => b,
+                                            Err(e) => {
+                                                tracing::error!("TSS signer: serialize response failed: {e}");
+                                                continue;
+                                            }
+                                        };
                                 if let Err(e) = transport.send(&resp_bytes).await {
                                     tracing::warn!("TSS signer: failed to send response: {e}");
                                 }
@@ -1350,11 +1424,17 @@ pub fn seal_signer_share(
     let key_package_bytes = node
         .key_package
         .serialize()
-        .expect("KeyPackage serialization must succeed");
+        .unwrap_or_else(|e| {
+            tracing::error!("FATAL: KeyPackage serialization failed: {e}");
+            std::process::exit(1);
+        });
     let identifier_bytes = node.identifier.serialize();
     let public_key_package_bytes = public_key_package
         .serialize()
-        .expect("PublicKeyPackage serialization must succeed");
+        .unwrap_or_else(|e| {
+            tracing::error!("FATAL: PublicKeyPackage serialization failed: {e}");
+            std::process::exit(1);
+        });
 
     let payload = SealedSharePayload {
         key_package_bytes,
@@ -1364,7 +1444,10 @@ pub fn seal_signer_share(
     };
 
     let mut payload_bytes =
-        postcard::to_allocvec(&payload).expect("SealedSharePayload serialization must succeed");
+        postcard::to_allocvec(&payload).unwrap_or_else(|e| {
+            tracing::error!("FATAL: SealedSharePayload serialization failed: {e}");
+            std::process::exit(1);
+        });
 
     let sealed = seal_share_bytes(&payload_bytes);
     payload_bytes.zeroize();
@@ -1410,10 +1493,16 @@ fn seal_share_bytes(plaintext: &[u8]) -> Vec<u8> {
     let master_kek = common::sealed_keys::cached_master_kek();
     let seal_key = derive_share_seal_key(master_kek);
 
-    let cipher = Aes256Gcm::new_from_slice(&seal_key).expect("32-byte key");
+    let cipher = Aes256Gcm::new_from_slice(&seal_key).unwrap_or_else(|_| {
+        tracing::error!("FATAL: AES-256-GCM key init failed for TSS share seal");
+        std::process::exit(1);
+    });
 
     let mut nonce_bytes = [0u8; 12];
-    getrandom::getrandom(&mut nonce_bytes).expect("OS entropy");
+    getrandom::getrandom(&mut nonce_bytes).unwrap_or_else(|e| {
+        tracing::error!("FATAL: OS CSPRNG unavailable for TSS share seal: {e}");
+        std::process::exit(1);
+    });
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let aad = b"MILNET-SEALED-TSS-SHARE-v1";
@@ -1425,7 +1514,10 @@ fn seal_share_bytes(plaintext: &[u8]) -> Vec<u8> {
                 aad,
             },
         )
-        .expect("AES-256-GCM encryption must not fail");
+        .unwrap_or_else(|e| {
+            tracing::error!("FATAL: AES-256-GCM encryption failed for TSS share seal: {e}");
+            std::process::exit(1);
+        });
 
     let mut out = Vec::with_capacity(12 + ciphertext.len());
     out.extend_from_slice(&nonce_bytes);
@@ -1474,8 +1566,10 @@ fn derive_share_seal_key(master_kek: &[u8; 32]) -> [u8; 32] {
     use sha2::Sha512;
     let hk = Hkdf::<Sha512>::new(Some(b"MILNET-TSS-SHARE-SEAL-v1"), master_kek);
     let mut okm = [0u8; 32];
-    hk.expand(b"tss-share", &mut okm)
-        .expect("32-byte HKDF expand must succeed");
+    if let Err(e) = hk.expand(b"tss-share", &mut okm) {
+        tracing::error!("FATAL: HKDF-SHA512 expand failed for TSS share seal key: {e}");
+        std::process::exit(1);
+    }
     okm
 }
 
@@ -1937,7 +2031,7 @@ pub fn handle_dkg_round2(
         .into_iter()
         .map(|(id, pkg)| {
             let id_bytes = id.serialize();
-            let pkg_bytes = pkg.serialize().expect("serialize round2 package");
+            let pkg_bytes = pkg.serialize().map_err(|e| format!("serialize round2 package: {e}"))?;
             (id_bytes, pkg_bytes)
         })
         .collect();

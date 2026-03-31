@@ -1650,14 +1650,20 @@ fn now_epoch() -> i64 {
 /// Generate a secure random token (64 hex characters = 256 bits).
 fn generate_secure_token() -> String {
     let mut buf = [0u8; 32];
-    getrandom::getrandom(&mut buf).expect("getrandom failed");
+    getrandom::getrandom(&mut buf).unwrap_or_else(|e| {
+        tracing::error!("FATAL: CSPRNG failure in self-service token generation: {e}");
+        std::process::exit(1);
+    });
     hex::encode(buf)
 }
 
 /// Generate a TOTP secret (base32 encoded, 160 bits).
 fn generate_totp_secret() -> String {
     let mut buf = [0u8; 20];
-    getrandom::getrandom(&mut buf).expect("getrandom failed");
+    getrandom::getrandom(&mut buf).unwrap_or_else(|e| {
+        tracing::error!("FATAL: CSPRNG failure in self-service token generation: {e}");
+        std::process::exit(1);
+    });
     base32_encode(&buf)
 }
 
@@ -1665,7 +1671,10 @@ fn generate_totp_secret() -> String {
 fn generate_recovery_code() -> String {
     let len = RECOVERY_CODE_LENGTH / 2;
     let mut buf = vec![0u8; len];
-    getrandom::getrandom(&mut buf).expect("getrandom failed");
+    getrandom::getrandom(&mut buf).unwrap_or_else(|e| {
+        tracing::error!("FATAL: CSPRNG failure in self-service token generation: {e}");
+        std::process::exit(1);
+    });
     let hex = hex::encode(&buf);
     // Format as XXXX-XXXX for readability
     if hex.len() >= 8 {

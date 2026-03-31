@@ -40,14 +40,20 @@ fn argon2id_stretch(code: &[u8; 16], salt: &[u8]) -> [u8; ARGON2_OUTPUT_LEN] {
         ARGON2_P_COST,
         Some(ARGON2_OUTPUT_LEN),
     )
-    .expect("Argon2id params must be valid");
+    .unwrap_or_else(|e| {
+        tracing::error!("FATAL: Argon2id params invalid: {e}");
+        std::process::exit(1);
+    });
 
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
     let mut output = [0u8; ARGON2_OUTPUT_LEN];
     argon2
         .hash_password_into(code, salt, &mut output)
-        .expect("Argon2id hashing must not fail");
+        .unwrap_or_else(|e| {
+            tracing::error!("FATAL: Argon2id hashing failed: {e}");
+            std::process::exit(1);
+        });
     output
 }
 
@@ -58,7 +64,10 @@ pub fn generate_recovery_codes(count: usize) -> Vec<(String, Vec<u8>, Vec<u8>)> 
     let count = count.min(MAX_CODES_PER_USER);
     (0..count).map(|_| {
         let mut code_bytes = [0u8; RECOVERY_CODE_BYTES];
-        getrandom::getrandom(&mut code_bytes).expect("getrandom failed");
+        getrandom::getrandom(&mut code_bytes).unwrap_or_else(|e| {
+            tracing::error!("FATAL: CSPRNG failure in recovery code generation: {e}");
+            std::process::exit(1);
+        });
 
         let display = format_code(&code_bytes);
         let salt = generate_salt();
@@ -93,7 +102,10 @@ pub fn parse_code(display: &str) -> Result<[u8; 16], String> {
 /// Generate a random salt for code hashing
 fn generate_salt() -> Vec<u8> {
     let mut salt = vec![0u8; RECOVERY_CODE_SALT_BYTES];
-    getrandom::getrandom(&mut salt).expect("getrandom failed");
+    getrandom::getrandom(&mut salt).unwrap_or_else(|e| {
+        tracing::error!("FATAL: CSPRNG failure in recovery salt generation: {e}");
+        std::process::exit(1);
+    });
     salt
 }
 
@@ -108,7 +120,10 @@ fn hash_code(code: &[u8; 16], salt: &[u8]) -> Vec<u8> {
     let mut stretched = argon2id_stretch(code, salt);
 
     // Step 2: Finalize with HMAC-SHA512 for domain separation
-    let mut mac = HmacSha512::new_from_slice(salt).expect("HMAC key length valid");
+    let mut mac = HmacSha512::new_from_slice(salt).unwrap_or_else(|e| {
+        tracing::error!("FATAL: HMAC-SHA512 key init failed in recovery code hashing: {e}");
+        std::process::exit(1);
+    });
     mac.update(crate::domain::RECOVERY_CODE); // Domain separation
     mac.update(&stretched);
     let result = mac.finalize().into_bytes().to_vec();

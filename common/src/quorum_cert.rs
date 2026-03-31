@@ -64,7 +64,7 @@ impl QuorumCertificate {
     pub fn new(epoch: u64, value_hash: [u8; 64], quorum_size: usize) -> Self {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_micros() as i64;
         Self {
             epoch,
@@ -150,7 +150,10 @@ impl QuorumCertificate {
 
     /// Serialize to bytes using postcard.
     pub fn to_bytes(&self) -> Vec<u8> {
-        postcard::to_allocvec(self).expect("QuorumCertificate serialization cannot fail")
+        postcard::to_allocvec(self).unwrap_or_else(|e| {
+            tracing::error!("QuorumCertificate serialization failed: {e}");
+            Vec::new()
+        })
     }
 
     /// Deserialize from bytes.

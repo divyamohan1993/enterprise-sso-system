@@ -38,8 +38,10 @@ fn derive_key_material_kek(master_kek: &[u8; 32]) -> [u8; 32] {
     use sha2::Sha512;
     let hk = Hkdf::<Sha512>::new(Some(b"MILNET-KEY-MATERIAL-v1"), master_kek);
     let mut okm = [0u8; 32];
-    hk.expand(b"key_material:key_bytes", &mut okm)
-        .expect("32-byte HKDF expand must succeed");
+    if let Err(e) = hk.expand(b"key_material:key_bytes", &mut okm) {
+        tracing::error!("FATAL: HKDF-SHA512 expand failed for key material KEK: {e}");
+        std::process::exit(1);
+    }
     okm
 }
 
@@ -49,7 +51,10 @@ fn encrypt_key_bytes(master_kek: &[u8; 32], name: &str, key_bytes: &[u8]) -> Res
     use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
 
     let kek = derive_key_material_kek(master_kek);
-    let cipher = Aes256Gcm::new_from_slice(&kek).expect("32-byte key");
+    let cipher = match Aes256Gcm::new_from_slice(&kek) {
+        Ok(c) => c,
+        Err(_) => return Err("AES-256-GCM key init failed for key material".into()),
+    };
 
     let mut nonce_bytes = [0u8; 12];
     generate_random_bytes(&mut nonce_bytes)?;
@@ -62,7 +67,7 @@ fn encrypt_key_bytes(master_kek: &[u8; 32], name: &str, key_bytes: &[u8]) -> Res
 
     let ciphertext = cipher
         .encrypt(nonce, aes_gcm::aead::Payload { msg: key_bytes, aad: &aad })
-        .expect("AES-256-GCM encryption must not fail with valid key");
+        .map_err(|e| format!("AES-256-GCM encryption failed for key material: {e}"))?;
 
     let mut out = Vec::with_capacity(8 + 12 + ciphertext.len());
     out.extend_from_slice(ENCRYPTED_KEY_MAGIC);
@@ -83,7 +88,10 @@ fn decrypt_key_bytes(master_kek: &[u8; 32], name: &str, sealed: &[u8]) -> Result
     }
 
     let kek = derive_key_material_kek(master_kek);
-    let cipher = Aes256Gcm::new_from_slice(&kek).expect("32-byte key");
+    let cipher = match Aes256Gcm::new_from_slice(&kek) {
+        Ok(c) => c,
+        Err(_) => return Err("AES-256-GCM key init failed for key material".into()),
+    };
 
     let nonce = Nonce::from_slice(&sealed[8..20]);
     let ciphertext = &sealed[20..];
@@ -162,7 +170,7 @@ pub async fn store_key(pool: &PgPool, name: &str, key_bytes: &[u8], master_kek: 
     };
 
     let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
     match sqlx::query(
         "INSERT INTO key_material (key_name, key_bytes, created_at) VALUES ($1, $2, $3) ON CONFLICT (key_name) DO UPDATE SET key_bytes = $2, rotated_at = $3"
     )

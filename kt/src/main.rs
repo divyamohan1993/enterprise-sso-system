@@ -33,18 +33,26 @@ fn seal_seed(seed: &[u8; 32]) -> Vec<u8> {
     use sha2::Sha512;
     let hk = Hkdf::<Sha512>::new(Some(b"MILNET-KT-SEED-SEAL-v1"), master_kek);
     let mut seal_key = [0u8; 32];
-    hk.expand(b"kt-seed-aes-key", &mut seal_key)
-        .expect("32-byte HKDF expand must succeed");
+    if let Err(e) = hk.expand(b"kt-seed-aes-key", &mut seal_key) {
+        tracing::error!("FATAL: HKDF-SHA512 expand failed for KT seed seal key: {e}");
+        std::process::exit(1);
+    }
 
     use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
     use aes_gcm::aead::generic_array::GenericArray;
     let cipher = Aes256Gcm::new(GenericArray::from_slice(&seal_key));
     let mut nonce_bytes = [0u8; 12];
-    getrandom::getrandom(&mut nonce_bytes).expect("getrandom for nonce");
+    getrandom::getrandom(&mut nonce_bytes).unwrap_or_else(|e| {
+        tracing::error!("FATAL: CSPRNG failure for KT seed nonce: {e}");
+        std::process::exit(1);
+    });
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
         .encrypt(nonce, aes_gcm::aead::Payload { msg: &seed[..], aad: b"" })
-        .expect("AES-256-GCM seal seed");
+        .unwrap_or_else(|e| {
+            tracing::error!("FATAL: AES-256-GCM seal KT seed failed: {e}");
+            std::process::exit(1);
+        });
 
     use zeroize::Zeroize;
     seal_key.zeroize();
@@ -65,8 +73,9 @@ fn unseal_seed(sealed: &[u8]) -> Result<[u8; 32], String> {
     use sha2::Sha512;
     let hk = Hkdf::<Sha512>::new(Some(b"MILNET-KT-SEED-SEAL-v1"), master_kek);
     let mut seal_key = [0u8; 32];
-    hk.expand(b"kt-seed-aes-key", &mut seal_key)
-        .expect("32-byte HKDF expand must succeed");
+    if let Err(e) = hk.expand(b"kt-seed-aes-key", &mut seal_key) {
+        return Err(format!("HKDF-SHA512 expand for KT unseal key failed: {e}"));
+    }
 
     use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
     use aes_gcm::aead::generic_array::GenericArray;
@@ -141,7 +150,10 @@ fn load_or_generate_keypair(
                         "Failed to unseal KT seed from {:?}: {} — generating new keypair",
                         seed_path, e
                     );
-                    getrandom::getrandom(&mut seed).expect("getrandom failed");
+                    getrandom::getrandom(&mut seed).unwrap_or_else(|e| {
+                    tracing::error!("FATAL: CSPRNG failure for KT seed generation: {e}");
+                    std::process::exit(1);
+                });
                     persist_seed(seed_path, &seed);
                 }
             }
@@ -151,12 +163,18 @@ fn load_or_generate_keypair(
                 "KT seed file {:?} has unexpected size {} — generating new keypair",
                 seed_path, data.len()
             );
-            getrandom::getrandom(&mut seed).expect("getrandom failed");
+            getrandom::getrandom(&mut seed).unwrap_or_else(|e| {
+                    tracing::error!("FATAL: CSPRNG failure for KT seed generation: {e}");
+                    std::process::exit(1);
+                });
             persist_seed(seed_path, &seed);
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             tracing::info!("No seed file at {:?}; generating new ML-DSA-87 keypair", seed_path);
-            getrandom::getrandom(&mut seed).expect("getrandom failed");
+            getrandom::getrandom(&mut seed).unwrap_or_else(|e| {
+                    tracing::error!("FATAL: CSPRNG failure for KT seed generation: {e}");
+                    std::process::exit(1);
+                });
             persist_seed(seed_path, &seed);
         }
         Err(e) => {
@@ -164,7 +182,10 @@ fn load_or_generate_keypair(
                 "Failed to read KT seed from {:?}: {} — generating new keypair",
                 seed_path, e
             );
-            getrandom::getrandom(&mut seed).expect("getrandom failed");
+            getrandom::getrandom(&mut seed).unwrap_or_else(|e| {
+                    tracing::error!("FATAL: CSPRNG failure for KT seed generation: {e}");
+                    std::process::exit(1);
+                });
             persist_seed(seed_path, &seed);
         }
     }
@@ -207,9 +228,14 @@ fn compute_tree_hmac(data: &[u8]) -> [u8; 64] {
     let master_kek = common::sealed_keys::cached_master_kek();
     let hk = Hkdf::<Sha512>::new(Some(b"MILNET-KT-TREE-INTEGRITY-v1"), master_kek);
     let mut derived_key = [0u8; 64];
-    hk.expand(b"kt-tree-file-hmac", &mut derived_key)
-        .expect("64-byte HKDF expand must succeed");
-    let mut mac = HmacSha512::new_from_slice(&derived_key).expect("HMAC key");
+    if let Err(e) = hk.expand(b"kt-tree-file-hmac", &mut derived_key) {
+        tracing::error!("FATAL: HKDF-SHA512 expand failed for KT tree HMAC key: {e}");
+        std::process::exit(1);
+    }
+    let mut mac = HmacSha512::new_from_slice(&derived_key).unwrap_or_else(|e| {
+        tracing::error!("FATAL: HMAC-SHA512 key init failed for KT tree integrity: {e}");
+        std::process::exit(1);
+    });
     use zeroize::Zeroize;
     derived_key.zeroize();
     mac.update(data);
@@ -412,9 +438,15 @@ async fn main() {
     let addr = std::env::var("KT_ADDR").unwrap_or_else(|_| "127.0.0.1:9107".to_string());
     let hmac_key = crypto::entropy::generate_key_64();
     let (listener, _ca, _cert_key) =
-        shard::tls_transport::tls_bind(&addr, common::types::ModuleId::Kt, hmac_key, "kt")
+        match shard::tls_transport::tls_bind(&addr, common::types::ModuleId::Kt, hmac_key, "kt")
             .await
-            .unwrap();
+        {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!("FATAL: KT service failed to bind TLS listener: {e}");
+                std::process::exit(1);
+            }
+        };
 
     tracing::info!("Key Transparency service listening on {addr} (mTLS)");
     loop {

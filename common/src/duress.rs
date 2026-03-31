@@ -46,8 +46,10 @@ fn hash_pin_v2(pin: &[u8], salt: &[u8; 32]) -> Vec<u8> {
 
     let hk = Hkdf::<Sha512>::new(Some(salt), pin);
     let mut okm = [0u8; 64];
-    hk.expand(b"MILNET-DURESS-PIN-v2", &mut okm)
-        .expect("64-byte HKDF expand must succeed");
+    if let Err(e) = hk.expand(b"MILNET-DURESS-PIN-v2", &mut okm) {
+        tracing::error!("FATAL: HKDF-SHA512 expand failed for duress PIN hash: {e}");
+        std::process::exit(1);
+    }
 
     let mut result = Vec::with_capacity(1 + 64);
     result.push(HKDF_V2_TAG);
@@ -148,7 +150,10 @@ impl DuressConfig {
     /// from the normal PIN to avoid accidental lockdown.
     pub fn new(user_id: Uuid, normal_pin: &[u8], duress_pin: &[u8]) -> Result<Self, &'static str> {
         let mut salt = [0u8; 32];
-        getrandom::getrandom(&mut salt).expect("OS entropy source must be available");
+        getrandom::getrandom(&mut salt).unwrap_or_else(|e| {
+            tracing::error!("FATAL: CSPRNG failure in duress PIN salt generation: {e}");
+            std::process::exit(1);
+        });
 
         let normal_pin_hash = hash_pin_v2(normal_pin, &salt);
         let duress_pin_hash = hash_pin_v2(duress_pin, &salt);

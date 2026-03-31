@@ -182,7 +182,7 @@ impl CeremonyTracker {
     pub fn cleanup_expired(&mut self) -> usize {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs() as i64;
 
         let to_remove: Vec<String> = self.sessions.iter()
@@ -336,7 +336,7 @@ impl CeremonyPersistence for DatabaseCeremonyPersistence {
         let _failure_reason = state.failure_reason();
         let _now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs() as i64;
 
         tracing::debug!(
@@ -585,7 +585,7 @@ impl DistributedCeremonyTracker {
         // Clean L2 — remove ceremonies older than the timeout
         let cutoff = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs() as i64
             - CEREMONY_TIMEOUT_SECS;
 
@@ -650,7 +650,7 @@ impl CeremonySession {
     pub fn new(session_id: [u8; 32]) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs() as i64;
 
         tracing::info!(
@@ -671,7 +671,7 @@ impl CeremonySession {
     pub fn is_expired(&self) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs() as i64;
         let expired = (now - self.created_at) > CEREMONY_TIMEOUT_SECS;
         if expired {

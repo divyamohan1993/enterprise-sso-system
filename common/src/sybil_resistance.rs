@@ -114,20 +114,20 @@ impl NodeAdmissionProtocol {
 
     /// Set the golden binary hash (established during cluster formation).
     pub fn set_golden_hash(&self, hash: [u8; 64]) {
-        let mut gh = self.golden_binary_hash.write().unwrap();
+        let mut gh = crate::sync::siem_write(&self.golden_binary_hash, "sybil::set_golden_hash");
         *gh = Some(hash);
     }
 
     /// Register an initial/founding node (bypasses quorum check).
     /// Used during initial cluster formation only.
     pub fn register_founding_node(&self, identity: NodeIdentity) -> Result<(), String> {
-        let mut nodes = self.approved_nodes.write().unwrap();
+        let mut nodes = crate::sync::siem_write(&self.approved_nodes, "sybil::register_founding_node");
         if nodes.contains_key(&identity.node_id) {
             return Err(format!("node {} already registered", identity.node_id));
         }
 
         // First node sets the golden hash
-        let mut gh = self.golden_binary_hash.write().unwrap();
+        let mut gh = crate::sync::siem_write(&self.golden_binary_hash, "sybil::register_founding_node_hash");
         if gh.is_none() {
             *gh = Some(identity.binary_hash);
         } else {
@@ -174,7 +174,7 @@ impl NodeAdmissionProtocol {
         approver_node_id: &str,
         signature: Vec<u8>,
     ) -> Result<(), String> {
-        let nodes = self.approved_nodes.read().unwrap();
+        let nodes = crate::sync::siem_read(&self.approved_nodes, "sybil::approve_admission");
 
         // Approver must be an existing admitted node
         if !nodes.contains_key(approver_node_id) {
@@ -230,7 +230,7 @@ impl NodeAdmissionProtocol {
 
         // Verify all approvers are currently admitted nodes
         {
-            let nodes = self.approved_nodes.read().unwrap();
+            let nodes = crate::sync::siem_read(&self.approved_nodes, "sybil::finalize_admission_verify");
             for (approver_id, _sig) in &request.approvals {
                 if !nodes.contains_key(approver_id) {
                     return Err(format!("approver {approver_id} is not an admitted node"));
@@ -248,7 +248,7 @@ impl NodeAdmissionProtocol {
 
         // Verify binary hash matches golden hash
         {
-            let gh = self.golden_binary_hash.read().unwrap();
+            let gh = crate::sync::siem_read(&self.golden_binary_hash, "sybil::finalize_admission_hash");
             if let Some(golden) = *gh {
                 if request.candidate.binary_hash != golden {
                     PanelSiemEvent::new(
@@ -271,7 +271,7 @@ impl NodeAdmissionProtocol {
 
         // Verify no duplicate verifying keys
         {
-            let nodes = self.approved_nodes.read().unwrap();
+            let nodes = crate::sync::siem_read(&self.approved_nodes, "sybil::finalize_admission_dup_check");
             for existing in nodes.values() {
                 if existing.verifying_key == request.candidate.verifying_key {
                     return Err(format!(
@@ -294,13 +294,13 @@ impl NodeAdmissionProtocol {
         let approver_count = identity.admitted_by.len();
 
         {
-            let mut nodes = self.approved_nodes.write().unwrap();
+            let mut nodes = crate::sync::siem_write(&self.approved_nodes, "sybil::finalize_admission_insert");
             nodes.insert(identity.node_id.clone(), identity);
         }
 
         // Update rate limit
         {
-            let mut last = self.last_admission.write().unwrap();
+            let mut last = crate::sync::siem_write(&self.last_admission, "sybil::finalize_admission_rate");
             *last = Some(Instant::now());
         }
 
@@ -322,19 +322,19 @@ impl NodeAdmissionProtocol {
 
     /// Check if a node is currently admitted.
     pub fn verify_node(&self, node_id: &str) -> bool {
-        let nodes = self.approved_nodes.read().unwrap();
+        let nodes = crate::sync::siem_read(&self.approved_nodes, "sybil::verify_node");
         nodes.contains_key(node_id)
     }
 
     /// Get the identity of an admitted node.
     pub fn get_node_identity(&self, node_id: &str) -> Option<NodeIdentity> {
-        let nodes = self.approved_nodes.read().unwrap();
+        let nodes = crate::sync::siem_read(&self.approved_nodes, "sybil::get_node_identity");
         nodes.get(node_id).cloned()
     }
 
     /// Number of currently admitted nodes.
     pub fn node_count(&self) -> usize {
-        let nodes = self.approved_nodes.read().unwrap();
+        let nodes = crate::sync::siem_read(&self.approved_nodes, "sybil::node_count");
         nodes.len()
     }
 
@@ -343,7 +343,7 @@ impl NodeAdmissionProtocol {
     /// Requires evidence documenting the reason for eviction.
     /// The evicted node's identity is removed from the approved set.
     pub fn evict_node(&self, node_id: &str, evidence: EvictionEvidence) -> Result<(), String> {
-        let mut nodes = self.approved_nodes.write().unwrap();
+        let mut nodes = crate::sync::siem_write(&self.approved_nodes, "sybil::evict_node");
 
         if !nodes.contains_key(node_id) {
             return Err(format!("node {node_id} is not admitted"));
@@ -370,7 +370,7 @@ impl NodeAdmissionProtocol {
 
     /// Check if admission is currently rate-limited.
     pub fn is_rate_limited(&self) -> bool {
-        let last = self.last_admission.read().unwrap();
+        let last = crate::sync::siem_read(&self.last_admission, "sybil::is_rate_limited");
         match *last {
             Some(t) => t.elapsed() < self.admission_rate_limit,
             None => false,

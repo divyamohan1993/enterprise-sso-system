@@ -162,7 +162,10 @@ pub fn seal_key(
     use aes_gcm::aead::Aead;
     use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 
-    let cipher = Aes256Gcm::new_from_slice(&sealing_key).expect("32-byte key");
+    let cipher = match Aes256Gcm::new_from_slice(&sealing_key) {
+        Ok(c) => c,
+        Err(_) => return Err("AES-256-GCM key init failed for enclave sealing".into()),
+    };
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let aad = b"MILNET-ENCLAVE-SEALED-KEY-v1";
@@ -202,7 +205,10 @@ pub fn unseal_key(
     use aes_gcm::aead::Aead;
     use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 
-    let cipher = Aes256Gcm::new_from_slice(&sealing_key).expect("32-byte key");
+    let cipher = match Aes256Gcm::new_from_slice(&sealing_key) {
+        Ok(c) => c,
+        Err(_) => return Err("AES-256-GCM key init failed for enclave sealing".into()),
+    };
     let nonce = Nonce::from_slice(&blob.nonce);
 
     let aad = b"MILNET-ENCLAVE-SEALED-KEY-v1";

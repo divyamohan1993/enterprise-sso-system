@@ -70,7 +70,10 @@ impl FencingToken {
 
     /// Serialize to bytes using postcard.
     pub fn to_bytes(&self) -> Vec<u8> {
-        postcard::to_allocvec(self).expect("FencingToken serialization cannot fail")
+        postcard::to_allocvec(self).unwrap_or_else(|e| {
+            tracing::error!("FencingToken serialization failed: {e}");
+            Vec::new()
+        })
     }
 
     /// Deserialize from bytes.
@@ -156,7 +159,7 @@ impl FencingValidator {
         }
 
         // Record the leader for this epoch.
-        let mut leaders = self.known_leaders.write().unwrap();
+        let mut leaders = crate::sync::siem_write(&self.known_leaders, "fencing::validate");
         leaders.insert(token.epoch, token.leader_node_id.clone());
 
         Ok(())
@@ -174,9 +177,7 @@ impl FencingValidator {
 
     /// Look up which leader was recorded for a given epoch.
     pub fn leader_for_epoch(&self, epoch: u64) -> Option<String> {
-        self.known_leaders
-            .read()
-            .unwrap()
+        crate::sync::siem_read(&self.known_leaders, "fencing::leader_for_epoch")
             .get(&epoch)
             .cloned()
     }

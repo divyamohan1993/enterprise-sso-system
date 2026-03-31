@@ -25,7 +25,10 @@ pub fn encrypt_claims(
     getrandom::getrandom(&mut nonce_bytes)
         .map_err(|e| format!("nonce generation failed: {e}"))?;
 
-    let cipher = Aes256Gcm::new_from_slice(claims_dek).expect("32-byte key");
+    let cipher = match Aes256Gcm::new_from_slice(claims_dek) {
+        Ok(c) => c,
+        Err(_) => return Err("AES-256-GCM key init failed for JWE claims".into()),
+    };
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let ciphertext = cipher
@@ -49,7 +52,10 @@ pub fn decrypt_claims(
     encrypted: &EncryptedClaims,
     claims_dek: &[u8; 32],
 ) -> Result<TokenClaims, String> {
-    let cipher = Aes256Gcm::new_from_slice(claims_dek).expect("32-byte key");
+    let cipher = match Aes256Gcm::new_from_slice(claims_dek) {
+        Ok(c) => c,
+        Err(_) => return Err("AES-256-GCM key init failed for JWE claims".into()),
+    };
     let nonce = Nonce::from_slice(&encrypted.nonce);
 
     let plaintext = cipher

@@ -42,7 +42,7 @@ impl HealthMonitor {
 
     /// Record a successful interaction with a peer
     pub fn record_success(&self, peer: &str, response_time_ms: f64) {
-        let mut peers = self.peers.lock().unwrap();
+        let mut peers = crate::sync::siem_lock(&self.peers, "health::record_success");
         let health = peers.entry(peer.to_string()).or_insert_with(|| PeerHealth {
             last_seen: Instant::now(),
             consecutive_failures: 0,
@@ -61,7 +61,7 @@ impl HealthMonitor {
 
     /// Record a failed interaction with a peer
     pub fn record_failure(&self, peer: &str) {
-        let mut peers = self.peers.lock().unwrap();
+        let mut peers = crate::sync::siem_lock(&self.peers, "health::record_failure");
         let health = peers.entry(peer.to_string()).or_insert_with(|| PeerHealth {
             last_seen: Instant::now(),
             consecutive_failures: 0,
@@ -79,7 +79,7 @@ impl HealthMonitor {
 
     /// Get current health status of a peer
     pub fn peer_status(&self, peer: &str) -> HealthStatus {
-        let peers = self.peers.lock().unwrap();
+        let peers = crate::sync::siem_lock(&self.peers, "health::peer_status");
         match peers.get(peer) {
             Some(health) => {
                 let elapsed = health.last_seen.elapsed();
@@ -97,7 +97,7 @@ impl HealthMonitor {
 
     /// Get summary of all peers
     pub fn all_statuses(&self) -> HashMap<String, HealthStatus> {
-        let peers = self.peers.lock().unwrap();
+        let peers = crate::sync::siem_lock(&self.peers, "health::all_statuses");
         peers.iter().map(|(k, v)| {
             let elapsed = v.last_seen.elapsed();
             let status = if elapsed > self.unhealthy_threshold {
@@ -272,7 +272,7 @@ impl CachedHealth {
 
     /// Get cached response if fresh, or None if stale/missing.
     fn get(&self) -> Option<(Vec<u8>, u16)> {
-        let guard = self.response.lock().unwrap();
+        let guard = crate::sync::siem_lock(&self.response, "health::cached_get");
         if let Some((ts, body, status)) = guard.as_ref() {
             if ts.elapsed() < Self::CACHE_TTL {
                 return Some((body.clone(), *status));
@@ -283,7 +283,7 @@ impl CachedHealth {
 
     /// Store a new cached response.
     fn set(&self, body: Vec<u8>, status: u16) {
-        let mut guard = self.response.lock().unwrap();
+        let mut guard = crate::sync::siem_lock(&self.response, "health::cached_set");
         *guard = Some((Instant::now(), body, status));
     }
 }

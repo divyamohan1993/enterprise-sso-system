@@ -72,9 +72,15 @@ async fn main() {
         .unwrap_or_else(|_| "127.0.0.1:9106".to_string());
     let hmac_key = crypto::entropy::generate_key_64();
     let (listener, _ca, _cert_key) =
-        shard::tls_transport::tls_bind(&addr, common::types::ModuleId::Risk, hmac_key, "risk")
+        match shard::tls_transport::tls_bind(&addr, common::types::ModuleId::Risk, hmac_key, "risk")
             .await
-            .unwrap();
+        {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!("FATAL: Risk service failed to bind TLS listener: {e}");
+                std::process::exit(1);
+            }
+        };
 
     tracing::info!("Risk Scoring service listening on {addr} (mTLS)");
     loop {

@@ -197,9 +197,15 @@ async fn main() {
         .unwrap_or_else(|_| "127.0.0.1:9108".to_string());
     let hmac_key = crypto::entropy::generate_key_64();
     let (listener, _ca, _cert_key) =
-        shard::tls_transport::tls_bind(&addr, common::types::ModuleId::Audit, hmac_key, "audit")
+        match shard::tls_transport::tls_bind(&addr, common::types::ModuleId::Audit, hmac_key, "audit")
             .await
-            .unwrap();
+        {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!("FATAL: Audit service failed to bind TLS listener: {e}");
+                std::process::exit(1);
+            }
+        };
 
     tracing::info!("Audit service listening on {addr} (mTLS)");
     loop {
@@ -373,7 +379,10 @@ fn load_or_generate_keypair(
                         "Failed to unseal seed from {:?}: {}; generating new keypair",
                         seed_path, e
                     );
-                    getrandom::getrandom(&mut seed).expect("getrandom failed");
+                    getrandom::getrandom(&mut seed).unwrap_or_else(|e| {
+                    tracing::error!("FATAL: CSPRNG failure for audit seed generation: {e}");
+                    std::process::exit(1);
+                });
                     persist_seed(seed_path, &seed);
                 }
             }
@@ -384,12 +393,18 @@ fn load_or_generate_keypair(
                 seed_path,
                 data.len()
             );
-            getrandom::getrandom(&mut seed).expect("getrandom failed");
+            getrandom::getrandom(&mut seed).unwrap_or_else(|e| {
+                    tracing::error!("FATAL: CSPRNG failure for audit seed generation: {e}");
+                    std::process::exit(1);
+                });
             persist_seed(seed_path, &seed);
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             tracing::info!("No seed file at {:?}; generating new ML-DSA-87 keypair", seed_path);
-            getrandom::getrandom(&mut seed).expect("getrandom failed");
+            getrandom::getrandom(&mut seed).unwrap_or_else(|e| {
+                    tracing::error!("FATAL: CSPRNG failure for audit seed generation: {e}");
+                    std::process::exit(1);
+                });
             persist_seed(seed_path, &seed);
         }
         Err(e) => {
@@ -397,7 +412,10 @@ fn load_or_generate_keypair(
                 "Failed to read seed file {:?}: {}; generating ephemeral keypair",
                 seed_path, e
             );
-            getrandom::getrandom(&mut seed).expect("getrandom failed");
+            getrandom::getrandom(&mut seed).unwrap_or_else(|e| {
+                    tracing::error!("FATAL: CSPRNG failure for audit seed generation: {e}");
+                    std::process::exit(1);
+                });
             // Do not persist if we cannot read — might be a permission issue
             // that would also prevent writing.
         }
@@ -422,14 +440,26 @@ fn seal_seed(seed: &[u8; 32]) -> Vec<u8> {
     use sha2::Sha512;
     let hk = Hkdf::<Sha512>::new(Some(b"MILNET-AUDIT-SEED-SEAL-v1"), master_kek);
     let mut seal_key = [0u8; 32];
-    hk.expand(b"audit-signing-seed", &mut seal_key).expect("HKDF");
+    if let Err(e) = hk.expand(b"audit-signing-seed", &mut seal_key) {
+        tracing::error!("FATAL: HKDF-SHA512 expand failed for audit seed seal: {e}");
+        std::process::exit(1);
+    }
 
     use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
-    let cipher = Aes256Gcm::new_from_slice(&seal_key).expect("key");
+    let cipher = Aes256Gcm::new_from_slice(&seal_key).unwrap_or_else(|_| {
+        tracing::error!("FATAL: AES-256-GCM key init failed for audit seed seal");
+        std::process::exit(1);
+    });
     let mut nonce_bytes = [0u8; 12];
-    getrandom::getrandom(&mut nonce_bytes).expect("entropy");
+    getrandom::getrandom(&mut nonce_bytes).unwrap_or_else(|e| {
+        tracing::error!("FATAL: CSPRNG failure for audit seed seal nonce: {e}");
+        std::process::exit(1);
+    });
     let nonce = Nonce::from_slice(&nonce_bytes);
-    let ciphertext = cipher.encrypt(nonce, seed.as_ref()).expect("encrypt");
+    let ciphertext = cipher.encrypt(nonce, seed.as_ref()).unwrap_or_else(|e| {
+        tracing::error!("FATAL: AES-256-GCM encrypt failed for audit seed seal: {e}");
+        std::process::exit(1);
+    });
 
     let mut out = Vec::with_capacity(12 + ciphertext.len());
     out.extend_from_slice(&nonce_bytes);
@@ -449,10 +479,15 @@ fn unseal_seed(sealed: &[u8]) -> Result<[u8; 32], String> {
     use sha2::Sha512;
     let hk = Hkdf::<Sha512>::new(Some(b"MILNET-AUDIT-SEED-SEAL-v1"), master_kek);
     let mut seal_key = [0u8; 32];
-    hk.expand(b"audit-signing-seed", &mut seal_key).expect("HKDF");
+    if let Err(e) = hk.expand(b"audit-signing-seed", &mut seal_key) {
+        return Err(format!("HKDF-SHA512 expand failed for audit unseal: {e}"));
+    }
 
     use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
-    let cipher = Aes256Gcm::new_from_slice(&seal_key).expect("key");
+    let cipher = match Aes256Gcm::new_from_slice(&seal_key) {
+        Ok(c) => c,
+        Err(_) => return Err("AES-256-GCM key init failed for audit unseal".into()),
+    };
     use zeroize::Zeroize;
     seal_key.zeroize();
     let nonce = Nonce::from_slice(&sealed[..12]);

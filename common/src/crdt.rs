@@ -45,7 +45,10 @@ impl GCounter {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        postcard::to_allocvec(self).expect("GCounter serialization")
+        postcard::to_allocvec(self).unwrap_or_else(|e| {
+            tracing::error!("CRDT GCounter serialization failed: {e}");
+            Vec::new()
+        })
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self, postcard::Error> {
@@ -97,7 +100,10 @@ impl PNCounter {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        postcard::to_allocvec(self).expect("PNCounter serialization")
+        postcard::to_allocvec(self).unwrap_or_else(|e| {
+            tracing::error!("CRDT PNCounter serialization failed: {e}");
+            Vec::new()
+        })
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self, postcard::Error> {
@@ -150,7 +156,10 @@ impl<T: Eq + Hash + Clone> GSet<T> {
 
 impl<T: Eq + Hash + Clone + Serialize> GSet<T> {
     pub fn to_bytes(&self) -> Vec<u8> {
-        postcard::to_allocvec(self).expect("GSet serialization")
+        postcard::to_allocvec(self).unwrap_or_else(|e| {
+            tracing::error!("CRDT GSet serialization failed: {e}");
+            Vec::new()
+        })
     }
 }
 
@@ -260,7 +269,10 @@ impl<T: Eq + Hash + Clone> ORSet<T> {
 
 impl<T: Eq + Hash + Clone + Serialize> ORSet<T> {
     pub fn to_bytes(&self) -> Vec<u8> {
-        postcard::to_allocvec(self).expect("ORSet serialization")
+        postcard::to_allocvec(self).unwrap_or_else(|e| {
+            tracing::error!("CRDT ORSet serialization failed: {e}");
+            Vec::new()
+        })
     }
 }
 
@@ -331,7 +343,10 @@ impl<T: Clone> LWWRegister<T> {
 
 impl<T: Clone + Serialize> LWWRegister<T> {
     pub fn to_bytes(&self) -> Vec<u8> {
-        postcard::to_allocvec(self).expect("LWWRegister serialization")
+        postcard::to_allocvec(self).unwrap_or_else(|e| {
+            tracing::error!("CRDT LWWRegister serialization failed: {e}");
+            Vec::new()
+        })
     }
 }
 

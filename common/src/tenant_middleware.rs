@@ -82,7 +82,7 @@ impl TenantCache {
 
     /// Look up a tenant, returning `None` if not cached or expired.
     pub fn get(&self, tenant_id: &Uuid) -> Option<CachedTenant> {
-        let entries = self.entries.read().unwrap();
+        let entries = crate::sync::siem_read(&self.entries, "tenant_cache::get");
         entries.get(tenant_id).and_then(|entry| {
             if entry.fetched_at.elapsed() < self.ttl {
                 Some(entry.clone())
@@ -94,19 +94,19 @@ impl TenantCache {
 
     /// Insert or update a cached tenant entry.
     pub fn put(&self, entry: CachedTenant) {
-        let mut entries = self.entries.write().unwrap();
+        let mut entries = crate::sync::siem_write(&self.entries, "tenant_cache::put");
         entries.insert(entry.tenant_id, entry);
     }
 
     /// Remove a tenant from the cache (e.g. on status change).
     pub fn invalidate(&self, tenant_id: &Uuid) {
-        let mut entries = self.entries.write().unwrap();
+        let mut entries = crate::sync::siem_write(&self.entries, "tenant_cache::invalidate");
         entries.remove(tenant_id);
     }
 
     /// Purge all expired entries.
     pub fn purge_expired(&self) {
-        let mut entries = self.entries.write().unwrap();
+        let mut entries = crate::sync::siem_write(&self.entries, "tenant_cache::purge_expired");
         entries.retain(|_, v| v.fetched_at.elapsed() < self.ttl);
     }
 }
@@ -164,7 +164,7 @@ impl TenantRateLimiter {
     ///
     /// Returns `true` if the request is allowed, `false` if rate-limited.
     pub fn check_rate_limit(&self, tenant_id: &Uuid, rps: u32, burst: u32) -> bool {
-        let mut buckets = self.buckets.write().unwrap();
+        let mut buckets = crate::sync::siem_write(&self.buckets, "rate_limiter::check_rate_limit");
         let bucket = buckets
             .entry(*tenant_id)
             .or_insert_with(|| TokenBucket::new(rps, burst));
@@ -173,7 +173,7 @@ impl TenantRateLimiter {
 
     /// Remove the bucket for a decommissioned tenant.
     pub fn remove_tenant(&self, tenant_id: &Uuid) {
-        let mut buckets = self.buckets.write().unwrap();
+        let mut buckets = crate::sync::siem_write(&self.buckets, "rate_limiter::remove_tenant");
         buckets.remove(tenant_id);
     }
 }

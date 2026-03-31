@@ -161,7 +161,10 @@ impl LateralMovementDetector {
         hmac_key: &[u8; 64],
     ) -> ChannelBinding {
         let mut nonce = [0u8; 16];
-        getrandom::getrandom(&mut nonce).expect("RNG failure");
+        getrandom::getrandom(&mut nonce).unwrap_or_else(|e| {
+            tracing::error!("FATAL: CSPRNG failure in channel binding nonce: {e}");
+            std::process::exit(1);
+        });
 
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -230,7 +233,13 @@ fn compute_binding_mac(
     hmac_key: &[u8; 64],
 ) -> [u8; 32] {
     let mut mac =
-        HmacSha256::new_from_slice(hmac_key).expect("HMAC accepts any key length");
+        match HmacSha256::new_from_slice(hmac_key) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::error!("FATAL: HMAC-SHA256 key init failed for channel binding: {e}");
+                std::process::exit(1);
+            }
+        };
     mac.update(&[channel.0 as u8, channel.1 as u8]);
     mac.update(nonce);
     mac.update(&timestamp.to_le_bytes());

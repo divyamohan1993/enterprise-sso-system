@@ -120,8 +120,18 @@ pub struct ShardProtocol {
 fn derive_encryption_key(shared_secret: &[u8; 64]) -> [u8; 32] {
     let hk = Hkdf::<Sha512>::new(None, shared_secret);
     let mut okm = [0u8; 32];
-    hk.expand(ENCRYPT_DOMAIN, &mut okm)
-        .expect("32 bytes is a valid HKDF-SHA512 output length");
+    if let Err(e) = hk.expand(ENCRYPT_DOMAIN, &mut okm) {
+        common::siem::emit_runtime_error(
+            common::siem::category::CRYPTO_FAILURE,
+            "HKDF-SHA512 expand for encryption key derivation",
+            &format!("{e}"),
+            file!(),
+            line!(),
+            column!(),
+            module_path!(),
+        );
+        // Return zeroed key — encryption will fail safely downstream
+    }
     okm
 }
 
@@ -132,8 +142,18 @@ fn derive_encryption_key(shared_secret: &[u8; 64]) -> [u8; 32] {
 fn derive_hmac_key(shared_secret: &[u8; 64]) -> [u8; 64] {
     let hk = Hkdf::<Sha512>::new(None, shared_secret);
     let mut okm = [0u8; 64];
-    hk.expand(HMAC_DOMAIN, &mut okm)
-        .expect("64 bytes is a valid HKDF-SHA512 output length");
+    if let Err(e) = hk.expand(HMAC_DOMAIN, &mut okm) {
+        common::siem::emit_runtime_error(
+            common::siem::category::CRYPTO_FAILURE,
+            "HKDF-SHA512 expand for HMAC key derivation",
+            &format!("{e}"),
+            file!(),
+            line!(),
+            column!(),
+            module_path!(),
+        );
+        // Return zeroed key — HMAC verification will fail safely downstream
+    }
     okm
 }
 
@@ -170,7 +190,21 @@ impl ShardProtocol {
 
     /// Compute HMAC-SHA512 over the domain prefix and message fields (excluding the HMAC field).
     fn compute_hmac(key: &[u8; 64], msg: &ShardMessage) -> [u8; 64] {
-        let mut mac = <HmacSha512 as Mac>::new_from_slice(key).expect("HMAC-SHA512 accepts any key size");
+        let mut mac = match <HmacSha512 as Mac>::new_from_slice(key) {
+            Ok(m) => m,
+            Err(e) => {
+                common::siem::emit_runtime_error(
+                    common::siem::category::CRYPTO_FAILURE,
+                    "HMAC-SHA512 initialization from key slice",
+                    &format!("{e}"),
+                    file!(),
+                    line!(),
+                    column!(),
+                    module_path!(),
+                );
+                return [0u8; 64]; // Zeroed HMAC — verification will fail safely
+            }
+        };
 
         // Domain separation prefix
         mac.update(SHARD_AUTH);
@@ -305,12 +339,23 @@ impl ShardProtocol {
     ///
     /// Callers MUST persist these to durable storage and reload on restart
     /// to maintain replay protection across process restarts.
-    pub fn export_sequences(&self) -> Vec<u8> {
+    pub fn export_sequences(&self) -> Result<Vec<u8>, String> {
         let state = SequenceState {
             send_sequence: self.send_sequence,
             recv_sequences: self.recv_sequences.clone(),
         };
-        postcard::to_allocvec(&state).expect("sequence state serialization should not fail")
+        postcard::to_allocvec(&state).map_err(|e| {
+            common::siem::emit_runtime_error(
+                common::siem::category::INTEGRITY_VIOLATION,
+                "SHARD sequence state serialization",
+                &format!("{e}"),
+                file!(),
+                line!(),
+                column!(),
+                module_path!(),
+            );
+            format!("sequence state serialization failed: {e}")
+        })
     }
 
     /// Deserialize and restore previously exported sequence state.
@@ -369,7 +414,7 @@ impl ShardProtocol {
             ))?;
 
         let mut mac = <HmacSha512 as Mac>::new_from_slice(hmac_key)
-            .expect("HMAC-SHA512 accepts any key length");
+            .map_err(|e| MilnetError::Shard(format!("HMAC-SHA512 init failed: {e}")))?;
         mac.update(&data);
         let tag = mac.finalize().into_bytes();
 
@@ -408,7 +453,7 @@ impl ShardProtocol {
 
         let (tag_bytes, data) = raw.split_at(64);
         let mut mac = <HmacSha512 as Mac>::new_from_slice(hmac_key)
-            .expect("HMAC-SHA512 accepts any key length");
+            .map_err(|e| MilnetError::Shard(format!("HMAC-SHA512 init failed: {e}")))?;
         mac.update(data);
         mac.verify_slice(tag_bytes)
             .map_err(|_| MilnetError::Shard(
@@ -445,17 +490,29 @@ impl ShardProtocol {
     /// In production mode, a tampered sequence file causes a panic (fail-closed).
     /// In dev mode, errors are logged as warnings and the service continues
     /// with fresh sequences.
-    pub fn load_persisted_sequences(&mut self, service_name: &str, hmac_key: &[u8; 64]) {
+    pub fn load_persisted_sequences(&mut self, service_name: &str, hmac_key: &[u8; 64]) -> Result<(), String> {
         let path = format!("/var/lib/milnet/{}_shard_sequences.dat", service_name);
         let path = std::path::Path::new(&path);
         if !path.exists() {
             tracing::info!("no persisted SHARD sequences at {:?} (first start)", path);
-            return;
+            return Ok(());
         }
         match self.import_sequences_authenticated(path, hmac_key) {
-            Ok(()) => tracing::info!("loaded persisted SHARD sequences from {:?}", path),
+            Ok(()) => {
+                tracing::info!("loaded persisted SHARD sequences from {:?}", path);
+                Ok(())
+            }
             Err(e) => {
-                panic!("FATAL: SHARD sequence file tampered or unreadable: {e}");
+                common::siem::emit_runtime_error(
+                    common::siem::category::INTEGRITY_VIOLATION,
+                    "SHARD sequence file tampered or unreadable",
+                    &format!("{e}"),
+                    file!(),
+                    line!(),
+                    column!(),
+                    module_path!(),
+                );
+                Err(format!("SHARD sequence file tampered or unreadable: {e}"))
             }
         }
     }
@@ -606,7 +663,7 @@ impl SequencePersistence {
             if !proto.needs_persistence() {
                 return Ok(());
             }
-            proto.export_sequences()
+            proto.export_sequences()?
         };
 
         // Ensure directory exists
@@ -675,11 +732,26 @@ impl SequencePersistence {
             #[cfg(unix)]
             {
                 use tokio::signal::unix::{signal, SignalKind};
-                let mut sigterm = signal(SignalKind::terminate())
-                    .expect("failed to register SIGTERM handler");
-                tokio::select! {
-                    _ = ctrl_c => {},
-                    _ = sigterm.recv() => {},
+                match signal(SignalKind::terminate()) {
+                    Ok(mut sigterm) => {
+                        tokio::select! {
+                            _ = ctrl_c => {},
+                            _ = sigterm.recv() => {},
+                        }
+                    }
+                    Err(e) => {
+                        common::siem::emit_runtime_error(
+                            common::siem::category::RUNTIME_ERROR,
+                            "SHARD SIGTERM handler registration",
+                            &format!("{e}"),
+                            file!(),
+                            line!(),
+                            column!(),
+                            module_path!(),
+                        );
+                        // Fall back to ctrl-c only
+                        let _ = ctrl_c.await;
+                    }
                 }
             }
             #[cfg(not(unix))]
@@ -749,7 +821,7 @@ mod tests {
         assert_eq!(proto.send_sequence, 2);
 
         // Export
-        let data = proto.export_sequences();
+        let data = proto.export_sequences().unwrap();
 
         // Import into a fresh protocol
         let mut proto2 = ShardProtocol::new(ModuleId::Gateway, key);
@@ -767,7 +839,7 @@ mod tests {
         for _ in 0..5 {
             let _ = proto.create_message(b"msg").unwrap();
         }
-        let old_data = proto.export_sequences();
+        let old_data = proto.export_sequences().unwrap();
 
         // Advance further to 10
         for _ in 0..5 {
@@ -818,7 +890,7 @@ mod tests {
         receiver.verify_message(&msg2).unwrap();
 
         // Export receiver state
-        let state = receiver.export_sequences();
+        let state = receiver.export_sequences().unwrap();
 
         // Simulate restart: new receiver, import state
         let mut receiver2 = ShardProtocol::new(ModuleId::Audit, key);

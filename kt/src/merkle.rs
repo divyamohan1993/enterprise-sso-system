@@ -126,7 +126,7 @@ impl MerkleTree {
         let root = self.root();
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_micros() as i64;
         let mut data = Vec::new();
         data.extend_from_slice(&root);

@@ -351,7 +351,10 @@ impl IdmManager {
         }
 
         let now = self.now();
-        let req = self.requests.get_mut(&request_id).unwrap();
+        let req = match self.requests.get_mut(&request_id) {
+            Some(r) => r,
+            None => return Err(MilnetError::Serialization(format!("request {} disappeared during approval", request_id))),
+        };
         req.approval_chain.push(ApprovalDecision {
             approver_id,
             decision: ApprovalOutcome::Approved,
@@ -449,7 +452,11 @@ impl IdmManager {
         }
 
         // Mark as in-progress
-        self.requests.get_mut(&request_id).unwrap().status = RequestStatus::InProgress;
+        if let Some(r) = self.requests.get_mut(&request_id) {
+            r.status = RequestStatus::InProgress;
+        } else {
+            return Err(MilnetError::Serialization(format!("request {} disappeared during execution", request_id)));
+        }
 
         let now = self.now();
         let result = match req_type {
@@ -473,19 +480,19 @@ impl IdmManager {
                 Ok(())
             }
             ProvisioningRequestType::Deprovision => {
-                let user_id = target_user_id.unwrap();
+                let user_id = target_user_id.ok_or_else(|| MilnetError::Serialization("deprovision request missing target_user_id".into()))?;
                 self.execute_deprovision(user_id)
             }
             ProvisioningRequestType::Suspend => {
-                let user_id = target_user_id.unwrap();
+                let user_id = target_user_id.ok_or_else(|| MilnetError::Serialization("suspend request missing target_user_id".into()))?;
                 self.execute_suspend(user_id, "approved provisioning request")
             }
             ProvisioningRequestType::Reactivate => {
-                let user_id = target_user_id.unwrap();
+                let user_id = target_user_id.ok_or_else(|| MilnetError::Serialization("reactivate request missing target_user_id".into()))?;
                 self.execute_reactivate(user_id)
             }
             ProvisioningRequestType::ModifyAccess => {
-                let user_id = target_user_id.unwrap();
+                let user_id = target_user_id.ok_or_else(|| MilnetError::Serialization("modify_access request missing target_user_id".into()))?;
                 if let Some(user) = self.users.get_mut(&user_id) {
                     user.entitlements = target_attrs.entitlements;
                     user.groups = target_attrs.groups;
@@ -510,7 +517,10 @@ impl IdmManager {
         };
 
         let completed_at = self.now();
-        let req = self.requests.get_mut(&request_id).unwrap();
+        let req = match self.requests.get_mut(&request_id) {
+            Some(r) => r,
+            None => return Err(MilnetError::Serialization(format!("request {} disappeared during completion", request_id))),
+        };
         req.completed_at = Some(completed_at);
         match &result {
             Ok(()) => req.status = RequestStatus::Completed,

@@ -189,7 +189,7 @@ pub fn generate_challenge(difficulty: u8) -> PuzzleChallenge {
     let nonce = generate_nonce();
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("system clock before epoch")
+        .unwrap_or_default()
         .as_secs() as i64;
     PuzzleChallenge {
         nonce,
@@ -214,7 +214,7 @@ pub fn verify_solution(challenge: &PuzzleChallenge, solution: &[u8; 32]) -> bool
     // Check expiration
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("system clock before epoch")
+        .unwrap_or_default()
         .as_secs() as i64;
     if now - challenge.timestamp > PUZZLE_TTL_SECS {
         return false;

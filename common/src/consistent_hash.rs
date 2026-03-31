@@ -122,7 +122,12 @@ impl ConsistentHashRing {
     fn key_hash(&self, key: &[u8]) -> u64 {
         let digest = Sha512::digest(key);
         // Take the first 8 bytes as a u64 (big-endian for uniform distribution).
-        u64::from_be_bytes(digest[..8].try_into().unwrap())
+        u64::from_be_bytes(
+            match digest[..8].try_into() {
+                Ok(arr) => arr,
+                Err(_) => [0u8; 8], // SHA-512 always produces >= 8 bytes
+            }
+        )
     }
 
     /// Hash a virtual node to a ring position.
@@ -132,7 +137,12 @@ impl ConsistentHashRing {
         h.update(b":");
         h.update(vnode_index.to_le_bytes());
         let digest = h.finalize();
-        u64::from_be_bytes(digest[..8].try_into().unwrap())
+        u64::from_be_bytes(
+            match digest[..8].try_into() {
+                Ok(arr) => arr,
+                Err(_) => [0u8; 8], // SHA-512 always produces >= 8 bytes
+            }
+        )
     }
 }
 

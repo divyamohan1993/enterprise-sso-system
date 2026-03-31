@@ -104,12 +104,24 @@ async fn main() {
     // - Shuts down Raft cluster membership cleanly
     // - Zeroizes sensitive key material before exit
     let shutdown_signal = async {
-        let mut sigterm = tokio::signal::unix::signal(
+        let mut sigterm = match tokio::signal::unix::signal(
             tokio::signal::unix::SignalKind::terminate(),
-        ).expect("failed to install SIGTERM handler");
-        let mut sigint = tokio::signal::unix::signal(
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("FATAL: failed to install SIGTERM handler: {e}");
+                std::process::exit(1);
+            }
+        };
+        let mut sigint = match tokio::signal::unix::signal(
             tokio::signal::unix::SignalKind::interrupt(),
-        ).expect("failed to install SIGINT handler");
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("FATAL: failed to install SIGINT handler: {e}");
+                std::process::exit(1);
+            }
+        };
         tokio::select! {
             _ = sigterm.recv() => tracing::info!("received SIGTERM, initiating graceful shutdown"),
             _ = sigint.recv() => tracing::info!("received SIGINT, initiating graceful shutdown"),
@@ -204,9 +216,15 @@ async fn run_coordinator_role() {
         .unwrap_or_else(|_| "127.0.0.1:9103".to_string());
     let coord_hmac_key = crypto::entropy::generate_key_64();
     let (listener, _ca, _cert_key) =
-        shard::tls_transport::tls_bind(&addr, common::types::ModuleId::Tss, coord_hmac_key, "tss")
+        match shard::tls_transport::tls_bind(&addr, common::types::ModuleId::Tss, coord_hmac_key, "tss")
             .await
-            .unwrap();
+        {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!("FATAL: TSS service failed to bind TLS listener: {e}");
+                std::process::exit(1);
+            }
+        };
     tracing::info!("TSS coordinator listening on {addr} (mTLS, truly distributed mode)");
 
     loop {
@@ -232,7 +250,13 @@ async fn run_coordinator_role() {
                                 sender
                             )),
                         };
-                        let resp_bytes = postcard::to_allocvec(&resp).unwrap();
+                        let resp_bytes = match postcard::to_allocvec(&resp) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                tracing::error!("TSS: failed to serialize response: {e}");
+                                continue;
+                            }
+                        };
                         if let Err(e) = transport.send(&resp_bytes).await {
                             tracing::warn!("TSS: failed to send response: {e}");
                         }
@@ -251,7 +275,13 @@ async fn run_coordinator_role() {
                                 token: None,
                                 error: Some(format!("deserialization error: {e}")),
                             };
-                            let resp_bytes = postcard::to_allocvec(&resp).unwrap();
+                            let resp_bytes = match postcard::to_allocvec(&resp) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                tracing::error!("TSS: failed to serialize response: {e}");
+                                continue;
+                            }
+                        };
                             if let Err(e) = transport.send(&resp_bytes).await {
                             tracing::warn!("TSS: failed to send response: {e}");
                         }
@@ -269,7 +299,13 @@ async fn run_coordinator_role() {
                             token: None,
                             error: Some(format!("receipt chain invalid: {e}")),
                         };
-                        let resp_bytes = postcard::to_allocvec(&resp).unwrap();
+                        let resp_bytes = match postcard::to_allocvec(&resp) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                tracing::error!("TSS: failed to serialize response: {e}");
+                                continue;
+                            }
+                        };
                         if let Err(e) = transport.send(&resp_bytes).await {
                             tracing::warn!("TSS: failed to send response: {e}");
                         }
@@ -291,7 +327,13 @@ async fn run_coordinator_role() {
                                 token: None,
                                 error: Some(format!("claims serialization: {e}")),
                             };
-                            let resp_bytes = postcard::to_allocvec(&resp).unwrap();
+                            let resp_bytes = match postcard::to_allocvec(&resp) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                tracing::error!("TSS: failed to serialize response: {e}");
+                                continue;
+                            }
+                        };
                             if let Err(e) = transport.send(&resp_bytes).await {
                             tracing::warn!("TSS: failed to send response: {e}");
                         }
@@ -310,8 +352,13 @@ async fn run_coordinator_role() {
                             use sha2::Sha512;
                             type HmacSha512 = Hmac<Sha512>;
 
-                            let mut mac = HmacSha512::new_from_slice(&request.ratchet_key)
-                                .expect("HMAC-SHA512 accepts any key length");
+                            let mut mac = match HmacSha512::new_from_slice(&request.ratchet_key) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    tracing::error!("TSS: HMAC-SHA512 key init failed: {e}");
+                                    continue;
+                                }
+                            };
                             mac.update(common::domain::TOKEN_TAG);
                             mac.update(&claims_bytes);
                             mac.update(&claims.ratchet_epoch.to_le_bytes());
@@ -333,7 +380,13 @@ async fn run_coordinator_role() {
                                 pq_signature,
                             };
 
-                            let token_bytes = postcard::to_allocvec(&token).unwrap();
+                            let token_bytes = match postcard::to_allocvec(&token) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    tracing::error!("TSS: failed to serialize token: {e}");
+                                    continue;
+                                }
+                            };
                             tracing::info!(
                                 "token built successfully via distributed signing ({} bytes)",
                                 token_bytes.len()
@@ -355,7 +408,13 @@ async fn run_coordinator_role() {
                     };
 
                     // 5. Send response back
-                    let resp_bytes = postcard::to_allocvec(&resp).unwrap();
+                    let resp_bytes = match postcard::to_allocvec(&resp) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                tracing::error!("TSS: failed to serialize response: {e}");
+                                continue;
+                            }
+                        };
                     if let Err(e) = transport.send(&resp_bytes).await {
                         tracing::error!("failed to send signing response: {e}");
                         break;

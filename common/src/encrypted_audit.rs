@@ -72,7 +72,10 @@ pub fn encrypt_audit_metadata(
     getrandom::getrandom(&mut nonce_bytes)
         .map_err(|e| format!("nonce generation failed: {e}"))?;
 
-    let cipher = Aes256Gcm::new_from_slice(encryption_key).expect("32-byte key");
+    let cipher = match Aes256Gcm::new_from_slice(encryption_key) {
+        Ok(c) => c,
+        Err(_) => return Err("AES-256-GCM key init failed for encrypted audit".into()),
+    };
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let ciphertext = cipher
@@ -110,7 +113,10 @@ pub fn decrypt_audit_metadata(
     encrypted: &EncryptedAuditMetadata,
     encryption_key: &[u8; 32],
 ) -> Result<(AuditEventType, Vec<Uuid>, Vec<Uuid>, f64, Vec<Receipt>), String> {
-    let cipher = Aes256Gcm::new_from_slice(encryption_key).expect("32-byte key");
+    let cipher = match Aes256Gcm::new_from_slice(encryption_key) {
+        Ok(c) => c,
+        Err(_) => return Err("AES-256-GCM key init failed for encrypted audit".into()),
+    };
     let nonce = Nonce::from_slice(&encrypted.nonce);
 
     let plaintext = cipher
@@ -137,7 +143,10 @@ pub fn decrypt_audit_metadata(
 
 /// Compute a blind index using HMAC-SHA256.
 fn compute_blind_index(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC key");
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).unwrap_or_else(|e| {
+        tracing::error!("FATAL: HMAC-SHA256 key init failed for audit blind index: {e}");
+        std::process::exit(1);
+    });
     mac.update(AUDIT_BLIND_INDEX_KEY_DOMAIN);
     mac.update(data);
     mac.finalize().into_bytes().into()

@@ -116,13 +116,13 @@ impl AtomicBroadcast {
 
         // Integrity check: reject duplicate payload hashes
         {
-            let hashes = self.delivered_hashes.read().unwrap();
+            let hashes = crate::sync::siem_read(&self.delivered_hashes, "atomic_broadcast::propose_hashes");
             if hashes.contains(&payload_hash) {
                 return Err("duplicate payload: already delivered".into());
             }
         }
         {
-            let pending = self.pending.read().unwrap();
+            let pending = crate::sync::siem_read(&self.pending, "atomic_broadcast::propose_pending");
             for msg in pending.values() {
                 if msg.payload_hash == payload_hash {
                     return Err("duplicate payload: already pending".into());
@@ -143,7 +143,7 @@ impl AtomicBroadcast {
             acks: Vec::new(),
         };
 
-        let mut pending = self.pending.write().unwrap();
+        let mut pending = crate::sync::siem_write(&self.pending, "atomic_broadcast::propose_insert");
         pending.insert(sequence, message);
 
         Ok(sequence)
@@ -159,7 +159,7 @@ impl AtomicBroadcast {
         node_id: &str,
         signature: Vec<u8>,
     ) -> Result<(), String> {
-        let mut pending = self.pending.write().unwrap();
+        let mut pending = crate::sync::siem_write(&self.pending, "atomic_broadcast::receive_ack");
 
         let msg = pending.get_mut(&sequence).ok_or_else(|| {
             format!("no pending message with sequence {sequence}")
@@ -186,9 +186,9 @@ impl AtomicBroadcast {
     /// 1. They have >= quorum_size acks.
     /// 2. All prior sequence numbers have been delivered (gap-free).
     pub fn deliver(&self) -> Vec<BroadcastMessage> {
-        let mut pending = self.pending.write().unwrap();
-        let mut delivered = self.delivered.write().unwrap();
-        let mut hashes = self.delivered_hashes.write().unwrap();
+        let mut pending = crate::sync::siem_write(&self.pending, "atomic_broadcast::deliver_pending");
+        let mut delivered = crate::sync::siem_write(&self.delivered, "atomic_broadcast::deliver_delivered");
+        let mut hashes = crate::sync::siem_write(&self.delivered_hashes, "atomic_broadcast::deliver_hashes");
 
         let mut newly_delivered = Vec::new();
 
@@ -237,7 +237,7 @@ impl AtomicBroadcast {
     /// Returns Ok(()) if all delivered messages are in strictly increasing
     /// sequence order with no gaps, or Err with the violation.
     pub fn verify_order(&self) -> Result<(), String> {
-        let delivered = self.delivered.read().unwrap();
+        let delivered = crate::sync::siem_read(&self.delivered, "atomic_broadcast::verify_order");
         Self::verify_message_order(&delivered)
     }
 
@@ -276,13 +276,13 @@ impl AtomicBroadcast {
 
     /// Number of messages currently pending delivery.
     pub fn pending_count(&self) -> usize {
-        let pending = self.pending.read().unwrap();
+        let pending = crate::sync::siem_read(&self.pending, "atomic_broadcast::pending_count");
         pending.len()
     }
 
     /// Number of messages successfully delivered.
     pub fn delivered_count(&self) -> usize {
-        let delivered = self.delivered.read().unwrap();
+        let delivered = crate::sync::siem_read(&self.delivered, "atomic_broadcast::delivered_count");
         delivered.len()
     }
 
@@ -293,7 +293,7 @@ impl AtomicBroadcast {
 
     /// Get all delivered messages (clone).
     pub fn delivered_messages(&self) -> Vec<BroadcastMessage> {
-        let delivered = self.delivered.read().unwrap();
+        let delivered = crate::sync::siem_read(&self.delivered, "atomic_broadcast::delivered_messages");
         delivered.clone()
     }
 }

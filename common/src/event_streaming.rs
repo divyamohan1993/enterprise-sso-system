@@ -308,7 +308,10 @@ impl WebhookConfig {
     /// Compute HMAC-SHA512 signature for a payload.
     pub fn sign_payload(&self, payload: &[u8]) -> String {
         type HmacSha512 = Hmac<Sha512>;
-        let mut mac = HmacSha512::new_from_slice(self.secret.as_bytes()).expect("HMAC key");
+        let mut mac = HmacSha512::new_from_slice(self.secret.as_bytes()).unwrap_or_else(|e| {
+            tracing::error!("FATAL: HMAC-SHA512 key init failed for webhook signing: {e}");
+            std::process::exit(1);
+        });
         mac.update(payload);
         let result = mac.finalize().into_bytes();
         format!("sha512={}", hex::encode(result))
@@ -1126,7 +1129,10 @@ fn days_to_ymd(days: i64) -> (i64, i64, i64) {
 /// Generate a random webhook secret (64 hex characters = 256 bits).
 fn generate_webhook_secret() -> String {
     let mut buf = [0u8; 32];
-    getrandom::getrandom(&mut buf).expect("getrandom failed");
+    getrandom::getrandom(&mut buf).unwrap_or_else(|e| {
+        tracing::error!("FATAL: CSPRNG failure in webhook secret generation: {e}");
+        std::process::exit(1);
+    });
     hex::encode(buf)
 }
 

@@ -264,9 +264,15 @@ pub struct CertificateAuthority {
 pub fn generate_ca() -> CertificateAuthority {
     // Ensure rustls crypto provider is available (idempotent).
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let key_pair = KeyPair::generate().expect("CA key generation failed");
+    let key_pair = KeyPair::generate().unwrap_or_else(|e| {
+        tracing::error!("FATAL: CA key generation failed: {e}");
+        std::process::exit(1);
+    });
     let mut params = CertificateParams::new(Vec::<String>::new())
-        .expect("empty SAN list is valid for a CA");
+        .unwrap_or_else(|e| {
+            tracing::error!("FATAL: CA cert params creation failed: {e}");
+            std::process::exit(1);
+        });
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     params.key_usages = vec![
         KeyUsagePurpose::KeyCertSign,
@@ -277,19 +283,31 @@ pub fn generate_ca() -> CertificateAuthority {
         .push(rcgen::DnType::CommonName, "MILNET SHARD CA");
     let cert = params
         .self_signed(&key_pair)
-        .expect("CA self-sign failed");
+        .unwrap_or_else(|e| {
+            tracing::error!("FATAL: CA self-sign failed: {e}");
+            std::process::exit(1);
+        });
     CertificateAuthority { cert, key_pair }
 }
 
 /// Generate a module certificate signed by the given CA.
 pub fn generate_module_cert(module_name: &str, ca: &CertificateAuthority) -> CertifiedKey {
-    let key_pair = KeyPair::generate().expect("module key generation failed");
+    let key_pair = KeyPair::generate().unwrap_or_else(|e| {
+        tracing::error!("FATAL: module key generation failed: {e}");
+        std::process::exit(1);
+    });
     let subject_alt_names = vec![module_name.to_string(), "localhost".to_string()];
     let params =
-        CertificateParams::new(subject_alt_names).expect("module cert params creation failed");
+        CertificateParams::new(subject_alt_names).unwrap_or_else(|e| {
+            tracing::error!("FATAL: module cert params creation failed: {e}");
+            std::process::exit(1);
+        });
     let cert = params
         .signed_by(&key_pair, &ca.cert, &ca.key_pair)
-        .expect("module cert signing failed");
+        .unwrap_or_else(|e| {
+            tracing::error!("FATAL: module cert signing failed: {e}");
+            std::process::exit(1);
+        });
     CertifiedKey { cert, key_pair }
 }
 
@@ -302,7 +320,10 @@ fn ca_root_store(ca: &CertificateAuthority) -> Arc<RootCertStore> {
     let mut root_store = RootCertStore::empty();
     root_store
         .add(ca.cert.der().clone())
-        .expect("adding CA cert to root store failed");
+        .unwrap_or_else(|e| {
+            tracing::error!("FATAL: adding CA cert to root store failed: {e}");
+            std::process::exit(1);
+        });
     Arc::new(root_store)
 }
 
@@ -360,10 +381,11 @@ fn cnsa2_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
 
     // Military mode integrity check: PANIC if classical fallback would be offered
     if military && kx_groups.len() > 1 {
-        panic!(
+        tracing::error!(
             "FATAL: MILNET_MILITARY_DEPLOYMENT=1 but X25519 classical fallback is present \
              in SHARD TLS key exchange groups. This MUST NOT happen in military deployments."
         );
+        std::process::exit(1);
     }
 
     if is_pq_only {
@@ -392,14 +414,23 @@ pub fn server_tls_config(cert_key: &CertifiedKey, ca: &CertificateAuthority) -> 
     let roots = ca_root_store(ca);
     let client_verifier = WebPkiClientVerifier::builder(roots)
         .build()
-        .expect("building client verifier failed");
+        .unwrap_or_else(|e| {
+            tracing::error!("FATAL: building client verifier failed: {e}");
+            std::process::exit(1);
+        });
 
     let config = ServerConfig::builder_with_provider(cnsa2_crypto_provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
-        .expect("TLS 1.3 protocol version config failed")
+        .unwrap_or_else(|e| {
+            tracing::error!("FATAL: TLS 1.3 protocol version config failed: {e}");
+            std::process::exit(1);
+        })
         .with_client_cert_verifier(client_verifier)
         .with_single_cert(cert_chain, private_key)
-        .expect("server TLS config failed");
+        .unwrap_or_else(|e| {
+            tracing::error!("FATAL: server TLS config failed: {e}");
+            std::process::exit(1);
+        });
     Arc::new(config)
 }
 
@@ -417,10 +448,16 @@ pub fn client_tls_config(
 
     let config = ClientConfig::builder_with_provider(cnsa2_crypto_provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
-        .expect("TLS 1.3 protocol version config failed")
+        .unwrap_or_else(|e| {
+            tracing::error!("FATAL: TLS 1.3 protocol version config failed: {e}");
+            std::process::exit(1);
+        })
         .with_root_certificates((*roots).clone())
         .with_client_auth_cert(client_cert_chain, client_key)
-        .expect("client TLS config with cert failed");
+        .unwrap_or_else(|e| {
+            tracing::error!("FATAL: client TLS config with cert failed: {e}");
+            std::process::exit(1);
+        });
     Arc::new(config)
 }
 
@@ -443,7 +480,10 @@ pub fn server_tls_config_pinned(
     let roots = ca_root_store(ca);
     let webpki_verifier = WebPkiClientVerifier::builder(roots)
         .build()
-        .expect("building client verifier failed");
+        .unwrap_or_else(|e| {
+            tracing::error!("FATAL: building client verifier failed: {e}");
+            std::process::exit(1);
+        });
 
     let pinned_verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> =
         Arc::new(PinnedClientCertVerifier {
@@ -453,10 +493,16 @@ pub fn server_tls_config_pinned(
 
     let config = ServerConfig::builder_with_provider(cnsa2_crypto_provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
-        .expect("TLS 1.3 protocol version config failed")
+        .unwrap_or_else(|e| {
+            tracing::error!("FATAL: TLS 1.3 protocol version config failed: {e}");
+            std::process::exit(1);
+        })
         .with_client_cert_verifier(pinned_verifier)
         .with_single_cert(cert_chain, private_key)
-        .expect("server TLS config with pinning failed");
+        .unwrap_or_else(|e| {
+            tracing::error!("FATAL: server TLS config with pinning failed: {e}");
+            std::process::exit(1);
+        });
     Arc::new(config)
 }
 
@@ -477,7 +523,10 @@ pub fn client_tls_config_pinned(
     // Build the standard WebPKI server verifier, then wrap with pinning.
     let webpki_verifier = rustls::client::WebPkiServerVerifier::builder(roots)
         .build()
-        .expect("building server verifier failed");
+        .unwrap_or_else(|e| {
+            tracing::error!("FATAL: building server verifier failed: {e}");
+            std::process::exit(1);
+        });
 
     let pinned_verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
         Arc::new(PinnedServerCertVerifier {
@@ -487,11 +536,17 @@ pub fn client_tls_config_pinned(
 
     let config = ClientConfig::builder_with_provider(cnsa2_crypto_provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
-        .expect("TLS 1.3 protocol version config failed")
+        .unwrap_or_else(|e| {
+            tracing::error!("FATAL: TLS 1.3 protocol version config failed: {e}");
+            std::process::exit(1);
+        })
         .dangerous()
         .with_custom_certificate_verifier(pinned_verifier)
         .with_client_auth_cert(client_cert_chain, client_key)
-        .expect("client TLS config with pinning failed");
+        .unwrap_or_else(|e| {
+            tracing::error!("FATAL: client TLS config with pinning failed: {e}");
+            std::process::exit(1);
+        });
     Arc::new(config)
 }
 

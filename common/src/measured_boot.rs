@@ -83,7 +83,10 @@ impl BootAttestation {
     /// timestamp, keyed with `signing_key`.
     pub fn to_signed_report(&self, signing_key: &[u8]) -> Vec<u8> {
         let mut mac = HmacSha512::new_from_slice(signing_key)
-            .expect("HMAC-SHA512 accepts any key length");
+            .unwrap_or_else(|e| {
+                tracing::error!("FATAL: HMAC-SHA512 key init failed for measured boot report: {e}");
+                std::process::exit(1);
+            });
 
         mac.update(ATTEST_HMAC_DOMAIN);
         mac.update(&self.attestation_time.to_be_bytes());

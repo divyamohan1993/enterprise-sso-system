@@ -43,8 +43,10 @@ impl BlindIndex {
         let hk = Hkdf::<Sha512>::new(Some(BLIND_INDEX_DOMAIN), master);
         let mut key = [0u8; 64];
         // 64 ≤ 255 * HashLen(64) — always valid for HKDF-SHA512.
-        hk.expand(purpose.as_bytes(), &mut key)
-            .expect("64 bytes is valid for HKDF-SHA512");
+        if let Err(e) = hk.expand(purpose.as_bytes(), &mut key) {
+            tracing::error!("FATAL: HKDF-SHA512 expand failed for SSE blind index key: {e}");
+            std::process::exit(1);
+        }
         Self { blind_key: key }
     }
 
@@ -59,7 +61,10 @@ impl BlindIndex {
     /// Compute the full 64-byte HMAC-SHA512 blind index.
     pub fn compute_full(&self, plaintext: &[u8]) -> [u8; 64] {
         let mut mac = HmacSha512::new_from_slice(&self.blind_key)
-            .expect("HMAC accepts any key size");
+            .unwrap_or_else(|e| {
+                tracing::error!("FATAL: HMAC-SHA512 key init failed for SSE blind index: {e}");
+                std::process::exit(1);
+            });
         mac.update(BLIND_INDEX_DOMAIN);
         mac.update(plaintext);
         let result = mac.finalize().into_bytes();

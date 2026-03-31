@@ -5,7 +5,7 @@
 //! unknown (possibly corrupt) condition. Continuing with corrupt state
 //! is unacceptable, so we log an audit-level error and panic.
 
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// Acquire a mutex lock with military-grade poisoning policy.
 ///
@@ -40,6 +40,63 @@ pub fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, context: &str) -> MutexGuard<
         tracing::warn!(
             "mutex poisoned in {context} -- recovering with potentially stale state: {e}"
         );
+        e.into_inner()
+    })
+}
+
+// ── SIEM-reporting lock helpers ──────────────────────────────────────────────
+//
+// These helpers emit a SIEM event on lock poisoning, then recover by using the
+// inner guard. Every poisoning incident is visible in the SIEM dashboard while
+// the system remains available.
+
+/// Acquire a mutex lock with SIEM-reported poisoning recovery.
+pub fn siem_lock<'a, T>(mutex: &'a Mutex<T>, context: &str) -> MutexGuard<'a, T> {
+    mutex.lock().unwrap_or_else(|e| {
+        crate::siem::emit_runtime_error(
+            crate::siem::category::RUNTIME_ERROR,
+            context,
+            &format!("mutex poisoned: {e}"),
+            file!(),
+            line!(),
+            column!(),
+            module_path!(),
+        );
+        tracing::error!("SIEM: mutex poisoned in {context}, recovering: {e}");
+        e.into_inner()
+    })
+}
+
+/// Acquire an RwLock read guard with SIEM-reported poisoning recovery.
+pub fn siem_read<'a, T>(lock: &'a RwLock<T>, context: &str) -> RwLockReadGuard<'a, T> {
+    lock.read().unwrap_or_else(|e| {
+        crate::siem::emit_runtime_error(
+            crate::siem::category::RUNTIME_ERROR,
+            context,
+            &format!("rwlock read poisoned: {e}"),
+            file!(),
+            line!(),
+            column!(),
+            module_path!(),
+        );
+        tracing::error!("SIEM: rwlock read poisoned in {context}, recovering: {e}");
+        e.into_inner()
+    })
+}
+
+/// Acquire an RwLock write guard with SIEM-reported poisoning recovery.
+pub fn siem_write<'a, T>(lock: &'a RwLock<T>, context: &str) -> RwLockWriteGuard<'a, T> {
+    lock.write().unwrap_or_else(|e| {
+        crate::siem::emit_runtime_error(
+            crate::siem::category::RUNTIME_ERROR,
+            context,
+            &format!("rwlock write poisoned: {e}"),
+            file!(),
+            line!(),
+            column!(),
+            module_path!(),
+        );
+        tracing::error!("SIEM: rwlock write poisoned in {context}, recovering: {e}");
         e.into_inner()
     })
 }

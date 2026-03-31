@@ -191,7 +191,11 @@ impl AuditLog {
         self.incremental_verify();
         self.auto_archive();
         self.enforce_retention();
-        self.entries.last().unwrap()
+        // SAFETY: we just pushed an entry, so `last()` is always Some.
+        self.entries.last().unwrap_or_else(|| {
+            tracing::error!("BUG: audit log empty immediately after push");
+            std::process::exit(1);
+        })
     }
 
     pub fn verify_chain(&self) -> bool {
@@ -275,7 +279,10 @@ impl AuditLog {
         self.incremental_verify();
         self.auto_archive();
         self.enforce_retention();
-        self.entries.last().unwrap()
+        self.entries.last().unwrap_or_else(|| {
+            tracing::error!("BUG: audit log empty immediately after push");
+            std::process::exit(1);
+        })
     }
 
     /// Append a pre-built entry directly (used by BFT replication layer).
@@ -656,7 +663,7 @@ fn now_us() -> i64 {
     tracing::error!("SECURITY: no trusted time source available in production — using system clock with warning");
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_micros() as i64
 }
 

@@ -190,11 +190,11 @@ impl GossipProtocol {
     ///
     /// Returns PING actions that the caller should dispatch to each seed node.
     pub fn join(&self, seed_nodes: &[(String, NodeMetadata)]) -> Vec<GossipAction> {
-        let mut members = self.members.write().unwrap();
+        let mut members = crate::sync::siem_write(&self.members, "gossip::join_members");
         let mut actions = Vec::with_capacity(seed_nodes.len());
-        let incarnation = *self.incarnation.read().unwrap();
-        let mut period = self.protocol_period.write().unwrap();
-        let mut outstanding = self.outstanding_pings.write().unwrap();
+        let incarnation = *crate::sync::siem_read(&self.incarnation, "gossip::join_incarnation");
+        let mut period = crate::sync::siem_write(&self.protocol_period, "gossip::join_period");
+        let mut outstanding = crate::sync::siem_write(&self.outstanding_pings, "gossip::join_outstanding");
 
         for (node_id, metadata) in seed_nodes {
             if node_id == &self.node_id {
@@ -252,12 +252,12 @@ impl GossipProtocol {
 
         // 3. Pick a random alive peer and ping it
         if let Some(target) = self.pick_random_alive_peer() {
-            let incarnation = *self.incarnation.read().unwrap();
-            let mut period = self.protocol_period.write().unwrap();
+            let incarnation = *crate::sync::siem_read(&self.incarnation, "gossip::tick_incarnation");
+            let mut period = crate::sync::siem_write(&self.protocol_period, "gossip::tick_period");
             *period += 1;
             let seq = *period;
 
-            let mut outstanding = self.outstanding_pings.write().unwrap();
+            let mut outstanding = crate::sync::siem_write(&self.outstanding_pings, "gossip::tick_outstanding");
             outstanding.insert(seq, OutstandingPing {
                 target: target.clone(),
                 sent_at: Instant::now(),
@@ -293,7 +293,7 @@ impl GossipProtocol {
         // Update sender as alive
         self.mark_alive(&msg.sender, msg.incarnation);
 
-        let incarnation = *self.incarnation.read().unwrap();
+        let incarnation = *crate::sync::siem_read(&self.incarnation, "gossip::handle_message");
 
         match &msg.msg_type {
             GossipMessageType::Ping { sequence } => {
@@ -309,7 +309,7 @@ impl GossipProtocol {
                 });
             }
             GossipMessageType::Ack { sequence } => {
-                let mut outstanding = self.outstanding_pings.write().unwrap();
+                let mut outstanding = crate::sync::siem_write(&self.outstanding_pings, "gossip::handle_ack");
                 if let Some(ping) = outstanding.get_mut(sequence) {
                     ping.acked = true;
                 }
@@ -344,7 +344,7 @@ impl GossipProtocol {
 
     /// Transition a node to SUSPECT status.
     pub fn suspect_node(&self, node_id: &str) {
-        let mut members = self.members.write().unwrap();
+        let mut members = crate::sync::siem_write(&self.members, "gossip::suspect_node");
         if let Some(member) = members.get_mut(node_id) {
             if member.status.is_alive() {
                 let now_ms = epoch_ms();
@@ -367,7 +367,7 @@ impl GossipProtocol {
 
     /// Declare a node DEAD (should only be called after suspicion timeout expires).
     pub fn declare_dead(&self, node_id: &str) {
-        let mut members = self.members.write().unwrap();
+        let mut members = crate::sync::siem_write(&self.members, "gossip::declare_dead");
         if let Some(member) = members.get_mut(node_id) {
             if !member.status.is_dead() {
                 let now_ms = epoch_ms();
@@ -393,7 +393,7 @@ impl GossipProtocol {
     /// When a node learns it has been suspected, it bumps its incarnation and
     /// disseminates an ALIVE update that overrides the stale suspicion.
     pub fn refute_suspicion(&self) -> MembershipUpdate {
-        let mut incarnation = self.incarnation.write().unwrap();
+        let mut incarnation = crate::sync::siem_write(&self.incarnation, "gossip::refute_suspicion");
         *incarnation += 1;
         let new_incarnation = *incarnation;
 
@@ -417,7 +417,7 @@ impl GossipProtocol {
 
     /// Return the list of currently alive members (excluding self).
     pub fn alive_members(&self) -> Vec<String> {
-        let members = self.members.read().unwrap();
+        let members = crate::sync::siem_read(&self.members, "gossip::alive_members");
         members
             .values()
             .filter(|m| m.status.is_alive() && m.node_id != self.node_id)
@@ -427,13 +427,13 @@ impl GossipProtocol {
 
     /// Collect recent membership updates for piggybacking on outgoing messages.
     pub fn piggyback_updates(&self) -> Vec<MembershipUpdate> {
-        let mut pending = self.pending_updates.write().unwrap();
+        let mut pending = crate::sync::siem_write(&self.pending_updates, "gossip::piggyback_updates");
         pending.drain(..).collect()
     }
 
     /// Return the current incarnation number of this node.
     pub fn incarnation(&self) -> u64 {
-        *self.incarnation.read().unwrap()
+        *crate::sync::siem_read(&self.incarnation, "gossip::incarnation")
     }
 
     /// Return the node ID of this protocol instance.
@@ -443,13 +443,13 @@ impl GossipProtocol {
 
     /// Get the status of a specific member.
     pub fn member_status(&self, node_id: &str) -> Option<MemberStatus> {
-        let members = self.members.read().unwrap();
+        let members = crate::sync::siem_read(&self.members, "gossip::member_status");
         members.get(node_id).map(|m| m.status.clone())
     }
 
     /// Return count of all known members (any status).
     pub fn member_count(&self) -> usize {
-        self.members.read().unwrap().len()
+        crate::sync::siem_read(&self.members, "gossip::member_count").len()
     }
 
     // -----------------------------------------------------------------------
@@ -473,7 +473,7 @@ impl GossipProtocol {
     }
 
     fn mark_alive(&self, node_id: &str, incarnation: u64) {
-        let mut members = self.members.write().unwrap();
+        let mut members = crate::sync::siem_write(&self.members, "gossip::mark_alive");
         if let Some(member) = members.get_mut(node_id) {
             // Only accept if incarnation is >= what we know
             if incarnation >= member.incarnation {
@@ -492,7 +492,7 @@ impl GossipProtocol {
     }
 
     fn apply_membership_update(&self, update: &MembershipUpdate) {
-        let mut members = self.members.write().unwrap();
+        let mut members = crate::sync::siem_write(&self.members, "gossip::apply_membership_update");
         if let Some(member) = members.get_mut(&update.node_id) {
             // Updates with higher incarnation always win.
             // At same incarnation: Dead > Suspect > Alive.
@@ -511,7 +511,7 @@ impl GossipProtocol {
     fn expire_suspects(&self) {
         let mut to_declare_dead = Vec::new();
         {
-            let members = self.members.read().unwrap();
+            let members = crate::sync::siem_read(&self.members, "gossip::expire_suspects");
             let timeout = self.suspicion_timeout;
             for member in members.values() {
                 if let MemberStatus::Suspect { since_epoch_ms } = &member.status {
@@ -533,7 +533,7 @@ impl GossipProtocol {
         let mut need_indirect = Vec::new();
 
         {
-            let outstanding = self.outstanding_pings.read().unwrap();
+            let outstanding = crate::sync::siem_read(&self.outstanding_pings, "gossip::check_outstanding_pings");
             for (seq, ping) in outstanding.iter() {
                 if ping.acked {
                     continue;
@@ -551,7 +551,7 @@ impl GossipProtocol {
         // Send indirect probes (PING-REQ)
         for (seq, target) in &need_indirect {
             let peers = self.pick_k_random_peers(&target, self.indirect_ping_count);
-            let incarnation = *self.incarnation.read().unwrap();
+            let incarnation = *crate::sync::siem_read(&self.incarnation, "gossip::indirect_ping_incarnation");
             for peer in peers {
                 actions.push(GossipAction::Send {
                     target: peer,
@@ -566,7 +566,7 @@ impl GossipProtocol {
                     },
                 });
             }
-            let mut outstanding = self.outstanding_pings.write().unwrap();
+            let mut outstanding = crate::sync::siem_write(&self.outstanding_pings, "gossip::indirect_ping_mark");
             if let Some(ping) = outstanding.get_mut(seq) {
                 ping.indirect_sent = true;
             }
@@ -574,19 +574,19 @@ impl GossipProtocol {
 
         // Suspect timed-out nodes
         {
-            let mut outstanding = self.outstanding_pings.write().unwrap();
+            let mut outstanding = crate::sync::siem_write(&self.outstanding_pings, "gossip::suspect_timed_out");
             for (seq, target) in &timed_out {
                 outstanding.remove(seq);
                 // Drop lock before calling suspect_node which takes members lock
                 drop(outstanding);
                 self.suspect_node(target);
-                outstanding = self.outstanding_pings.write().unwrap();
+                outstanding = crate::sync::siem_write(&self.outstanding_pings, "gossip::suspect_timed_out_reacquire");
             }
         }
 
         // Clean up acked pings
         {
-            let mut outstanding = self.outstanding_pings.write().unwrap();
+            let mut outstanding = crate::sync::siem_write(&self.outstanding_pings, "gossip::cleanup_acked");
             outstanding.retain(|_, p| !p.acked);
         }
 
@@ -594,7 +594,7 @@ impl GossipProtocol {
     }
 
     fn pick_random_alive_peer(&self) -> Option<String> {
-        let members = self.members.read().unwrap();
+        let members = crate::sync::siem_read(&self.members, "gossip::pick_random_alive_peer");
         let alive: Vec<&String> = members
             .values()
             .filter(|m| m.status.is_alive() && m.node_id != self.node_id)
@@ -605,13 +605,13 @@ impl GossipProtocol {
         }
         // Deterministic-ish selection based on protocol period for reproducibility
         // in tests; in production, rand would be used via getrandom.
-        let period = *self.protocol_period.read().unwrap();
+        let period = *crate::sync::siem_read(&self.protocol_period, "gossip::pick_random_period");
         let idx = (period as usize) % alive.len();
         Some(alive[idx].clone())
     }
 
     fn pick_k_random_peers(&self, exclude: &str, k: usize) -> Vec<String> {
-        let members = self.members.read().unwrap();
+        let members = crate::sync::siem_read(&self.members, "gossip::pick_k_random_peers");
         let candidates: Vec<String> = members
             .values()
             .filter(|m| m.status.is_alive() && m.node_id != self.node_id && m.node_id != exclude)

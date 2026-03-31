@@ -225,8 +225,13 @@ pub fn verify_fips_proof(proof_hex: &str, action: &str) -> bool {
         use hmac::{Hmac, Mac};
         use sha2::Sha512;
         type HmacSha512 = Hmac<Sha512>;
-        let mut mac = HmacSha512::new_from_slice(key)
-            .expect("HMAC key length always valid");
+        let mut mac = match HmacSha512::new_from_slice(key) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::error!("FATAL: HMAC-SHA512 key init failed for FIPS mode proof: {e}");
+                std::process::exit(1);
+            }
+        };
         mac.update(FIPS_MODE_HMAC_DOMAIN);
         mac.update(action.as_bytes());
         mac.finalize().into_bytes()

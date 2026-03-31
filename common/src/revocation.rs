@@ -130,9 +130,14 @@ impl RevocationList {
         let master_kek = crate::sealed_keys::cached_master_kek();
         let hk = Hkdf::<Sha512>::new(Some(b"MILNET-REVOCATION-INTEGRITY-v2"), master_kek);
         let mut derived_key = [0u8; 64];
-        hk.expand(b"revocation-file-hmac", &mut derived_key)
-            .expect("64-byte HKDF expand must succeed");
-        let mut mac = HmacSha512::new_from_slice(&derived_key).expect("HMAC key");
+        if let Err(e) = hk.expand(b"revocation-file-hmac", &mut derived_key) {
+            tracing::error!("FATAL: HKDF-SHA512 expand failed for revocation HMAC key: {e}");
+            std::process::exit(1);
+        }
+        let mut mac = HmacSha512::new_from_slice(&derived_key).unwrap_or_else(|e| {
+            tracing::error!("FATAL: HMAC-SHA512 key init failed for revocation integrity: {e}");
+            std::process::exit(1);
+        });
         // Zeroize derived key after creating MAC
         use zeroize::Zeroize;
         derived_key.zeroize();
@@ -519,19 +524,19 @@ impl SharedRevocationList {
 
     /// Revoke a token. Returns `true` if newly revoked.
     pub fn revoke(&self, token_id: [u8; 16]) -> bool {
-        let mut list = self.inner.write().unwrap();
+        let mut list = crate::sync::siem_write(&self.inner, "revocation::revoke");
         list.revoke(token_id)
     }
 
     /// Check if a token has been revoked (O(1) lookup).
     pub fn is_revoked(&self, token_id: &[u8; 16]) -> bool {
-        let list = self.inner.read().unwrap();
+        let list = crate::sync::siem_read(&self.inner, "revocation::is_revoked");
         list.is_revoked(token_id)
     }
 
     /// Remove entries older than `max_token_lifetime_secs`.
     pub fn cleanup_expired(&self, max_token_lifetime_secs: i64) {
-        let mut list = self.inner.write().unwrap();
+        let mut list = crate::sync::siem_write(&self.inner, "revocation::cleanup_expired");
         list.cleanup_expired(max_token_lifetime_secs);
         // Update last cleanup timestamp
         if let Ok(mut ts) = self.last_cleanup.write() {
@@ -541,7 +546,7 @@ impl SharedRevocationList {
 
     /// Number of currently revoked tokens.
     pub fn revoked_count(&self) -> usize {
-        let list = self.inner.read().unwrap();
+        let list = crate::sync::siem_read(&self.inner, "revocation::revoked_count");
         list.revoked_count()
     }
 
@@ -552,7 +557,7 @@ impl SharedRevocationList {
     pub fn maybe_lazy_cleanup(&self, max_token_lifetime_secs: i64) {
         let now = RevocationList::now_us();
         let needs_cleanup = {
-            let last = self.last_cleanup.read().unwrap();
+            let last = crate::sync::siem_read(&self.last_cleanup, "revocation::maybe_lazy_cleanup");
             (now - *last) >= LAZY_CLEANUP_INTERVAL_US
         };
         if needs_cleanup {
@@ -562,7 +567,7 @@ impl SharedRevocationList {
 
     /// Run the default cleanup (8-hour window).
     pub fn cleanup(&self) {
-        let mut list = self.inner.write().unwrap();
+        let mut list = crate::sync::siem_write(&self.inner, "revocation::cleanup");
         list.cleanup();
         if let Ok(mut ts) = self.last_cleanup.write() {
             *ts = RevocationList::now_us();
