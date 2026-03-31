@@ -1,6 +1,24 @@
 //! Pentagon/DoD readiness hardening tests.
 //!
+//! Production-mode tests: MILNET_MASTER_KEK is set at module init to
+//! simulate a real deployment where the KEK is always available.
+//!
 //! Validates all critical fixes identified by the 10-team security audit:
+
+use std::sync::Once;
+
+/// Initialize production-mode test environment: sets MILNET_MASTER_KEK
+/// so that cached_master_kek() and all downstream consumers work exactly
+/// as they would in a real deployment. No bypasses, no dev mode.
+static INIT_KEK: Once = Once::new();
+fn ensure_prod_kek() {
+    INIT_KEK.call_once(|| {
+        // 32-byte hex-encoded KEK (64 hex chars) — simulates production sealed key.
+        if std::env::var("MILNET_MASTER_KEK").is_err() {
+            std::env::set_var("MILNET_MASTER_KEK", "2a".repeat(32));
+        }
+    });
+}
 //! - C1: TLS handshake timeout on gateway->orchestrator
 //! - C2: Chunked frame allocation (anti-OOM)
 //! - C4: Circuit breaker exponential backoff
@@ -241,6 +259,7 @@ fn master_key_derive_kek_produces_different_keys_for_different_purposes() {
 
 #[test]
 fn pseudonym_uuid_is_deterministic() {
+    ensure_prod_kek();
     let id = uuid::Uuid::new_v4();
     let p1 = common::log_pseudonym::pseudonym_uuid(id);
     let p2 = common::log_pseudonym::pseudonym_uuid(id);
@@ -249,6 +268,7 @@ fn pseudonym_uuid_is_deterministic() {
 
 #[test]
 fn pseudonym_uuid_different_ids_produce_different_pseudonyms() {
+    ensure_prod_kek();
     let id1 = uuid::Uuid::new_v4();
     let id2 = uuid::Uuid::new_v4();
     let p1 = common::log_pseudonym::pseudonym_uuid(id1);
@@ -258,6 +278,7 @@ fn pseudonym_uuid_different_ids_produce_different_pseudonyms() {
 
 #[test]
 fn pseudonym_uuid_does_not_contain_original_uuid() {
+    ensure_prod_kek();
     let id = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
         .expect("valid uuid");
     let pseudonym = common::log_pseudonym::pseudonym_uuid(id);
@@ -269,6 +290,7 @@ fn pseudonym_uuid_does_not_contain_original_uuid() {
 
 #[test]
 fn pseudonym_email_is_deterministic() {
+    ensure_prod_kek();
     let p1 = common::log_pseudonym::pseudonym_email("test@example.com");
     let p2 = common::log_pseudonym::pseudonym_email("test@example.com");
     assert_eq!(p1, p2);
@@ -276,6 +298,7 @@ fn pseudonym_email_is_deterministic() {
 
 #[test]
 fn pseudonym_email_does_not_contain_original_email() {
+    ensure_prod_kek();
     let pseudonym = common::log_pseudonym::pseudonym_email("alice@pentagon.mil");
     assert!(!pseudonym.contains("alice"), "pseudonym must not leak email username");
     assert!(!pseudonym.contains("pentagon"), "pseudonym must not leak email domain");
@@ -283,6 +306,7 @@ fn pseudonym_email_does_not_contain_original_email() {
 
 #[test]
 fn pseudonym_is_fixed_length_hex() {
+    ensure_prod_kek();
     let p = common::log_pseudonym::pseudonym_uuid(uuid::Uuid::new_v4());
     assert_eq!(p.len(), 16, "pseudonym must be 16 hex chars (8 bytes)");
     assert!(
@@ -293,6 +317,7 @@ fn pseudonym_is_fixed_length_hex() {
 
 #[test]
 fn pseudonym_str_domain_separation() {
+    ensure_prod_kek();
     // Same value with different tags must produce different pseudonyms.
     let p1 = common::log_pseudonym::pseudonym_str("user", "alice");
     let p2 = common::log_pseudonym::pseudonym_str("device", "alice");
