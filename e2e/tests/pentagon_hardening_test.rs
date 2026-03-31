@@ -19,16 +19,17 @@ fn ensure_prod_kek() {
         }
     });
 }
-//! - C1: TLS handshake timeout on gateway->orchestrator
-//! - C2: Chunked frame allocation (anti-OOM)
-//! - C4: Circuit breaker exponential backoff
-//! - C5/C6: Auth failure + RBAC denial audit chain logging
-//! - C7: SIEM webhook drop counter
-//! - C9: Military mode HSM enforcement
-//! - C10/C11: Log pseudonymization
-//! - Distributed trust: threshold signing, Shamir KEK, OPAQUE blindness
-//! - Forward secrecy: ratchet chain epoch advancement
-//! - Network segmentation: mTLS enforcement
+
+// C1: TLS handshake timeout on gateway->orchestrator
+// C2: Chunked frame allocation (anti-OOM)
+// C4: Circuit breaker exponential backoff
+// C5/C6: Auth failure + RBAC denial audit chain logging
+// C7: SIEM webhook drop counter
+// C9: Military mode HSM enforcement
+// C10/C11: Log pseudonymization
+// Distributed trust: threshold signing, Shamir KEK, OPAQUE blindness
+// Forward secrecy: ratchet chain epoch advancement
+// Network segmentation: mTLS enforcement
 
 // ═══════════════════════════════════════════════════════════════════════════
 // C2: Frame Size Limits Enforce Endpoint-Specific Bounds
