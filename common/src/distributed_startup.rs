@@ -528,7 +528,7 @@ impl DistributedStartupVerifier {
         own_hash: &BinaryHash,
         att: &PeerAttestation,
     ) -> Result<(), StartupError> {
-        let matches = own_hash.ct_eq(&att.binary_hash).into();
+        let matches: bool = own_hash.ct_eq(&att.binary_hash).into();
 
         if !matches {
             if self.rolling_update {
