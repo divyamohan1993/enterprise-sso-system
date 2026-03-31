@@ -212,6 +212,19 @@ pub struct MultiRegionManager {
     share_distribution: RwLock<Option<RegionShareDistribution>>,
 }
 
+impl std::fmt::Debug for MultiRegionManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MultiRegionManager")
+            .field("local_region", &self.local_region)
+            .field("min_regions", &self.min_regions)
+            .field("cross_region_timeout", &self.cross_region_timeout)
+            .field("max_replication_lag_ms", &self.max_replication_lag_ms)
+            .field("writes_allowed", &self.writes_allowed.load(Ordering::Relaxed))
+            .field("sequence_counter", &self.sequence_counter.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
 impl MultiRegionManager {
     /// Initialize from `MILNET_REGIONS` environment variable.
     ///

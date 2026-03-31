@@ -247,17 +247,16 @@ mod tests {
         ring.add_node("c");
 
         let n = 10000u32;
-        let mut before: Vec<Option<&str>> = Vec::new();
-        for i in 0..n {
-            before.push(ring.get_node(format!("k{i}").as_bytes()));
-        }
+        let before: Vec<Option<String>> = (0..n)
+            .map(|i| ring.get_node(format!("k{i}").as_bytes()).map(|s| s.to_owned()))
+            .collect();
 
         // Add a 4th node
         ring.add_node("d");
 
         let mut moved = 0u32;
         for i in 0..n {
-            let after = ring.get_node(format!("k{i}").as_bytes());
+            let after = ring.get_node(format!("k{i}").as_bytes()).map(|s| s.to_owned());
             if after != before[i as usize] {
                 moved += 1;
             }

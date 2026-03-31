@@ -280,6 +280,18 @@ pub struct DistributedKms {
     reachability: std::collections::HashMap<String, bool>,
 }
 
+impl fmt::Debug for DistributedKms {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DistributedKms")
+            .field("backends", &self.backends)
+            .field("threshold", &self.threshold)
+            .field("total", &self.total)
+            .field("share_store_len", &self.share_store.len())
+            .field("reachability", &self.reachability)
+            .finish()
+    }
+}
+
 impl DistributedKms {
     /// Create a new DistributedKms with the given backends.
     ///

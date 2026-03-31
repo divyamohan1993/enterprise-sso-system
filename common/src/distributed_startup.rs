@@ -24,6 +24,22 @@ use sha2::{Digest, Sha512};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 
+/// Serde helper for `[u8; 64]` fields.
+mod byte_array_64 {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(data: &[u8; 64], ser: S) -> Result<S::Ok, S::Error> {
+        data.as_slice().serialize(ser)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<[u8; 64], D::Error> {
+        let v: Vec<u8> = Vec::deserialize(de)?;
+        v.try_into().map_err(|v: Vec<u8>| {
+            serde::de::Error::custom(format!("expected 64 bytes, got {}", v.len()))
+        })
+    }
+}
+
 // ── SIEM category for all distributed startup events ────────────────────────
 
 /// SIEM event category for distributed startup verification.
@@ -82,6 +98,7 @@ pub struct PeerAttestation {
     /// Unique identifier of the attesting node.
     pub node_id: String,
     /// SHA-512 hash of the peer's running binary.
+    #[serde(with = "byte_array_64")]
     pub binary_hash: [u8; 64],
     /// Kernel boot_id from /proc/sys/kernel/random/boot_id.
     pub boot_id: String,

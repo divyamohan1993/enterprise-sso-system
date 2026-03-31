@@ -17,6 +17,22 @@ use sha2::{Digest, Sha512};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Serde helper for `[u8; 64]` fields.
+mod byte_array_64 {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(data: &[u8; 64], ser: S) -> Result<S::Ok, S::Error> {
+        data.as_slice().serialize(ser)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<[u8; 64], D::Error> {
+        let v: Vec<u8> = Vec::deserialize(de)?;
+        v.try_into().map_err(|v: Vec<u8>| {
+            serde::de::Error::custom(format!("expected 64 bytes, got {}", v.len()))
+        })
+    }
+}
+
 /// ML-DSA-87 type aliases local to this module.
 pub type QcSigningKey = SigningKey<MlDsa87>;
 pub type QcVerifyingKey = VerifyingKey<MlDsa87>;
@@ -29,6 +45,7 @@ pub struct QuorumCertificate {
     /// The epoch (consensus round) this certificate belongs to.
     pub epoch: u64,
     /// SHA-512 hash of the agreed-upon value.
+    #[serde(with = "byte_array_64")]
     pub value_hash: [u8; 64],
     /// Node IDs of the signers, in order of signature addition.
     pub signers: Vec<String>,
