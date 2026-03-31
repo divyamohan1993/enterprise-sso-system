@@ -53,10 +53,18 @@ fn max_connections_per_ip() -> u32 {
 const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 
 /// Global maximum concurrent connections.
-const MAX_CONCURRENT_CONNECTIONS: usize = 1000;
+pub const MAX_CONCURRENT_CONNECTIONS: usize = 1000;
 
 /// Read/write timeout for TCP operations (30 seconds).
 const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// TLS handshake timeout for outbound connections to the orchestrator.
+///
+/// Prevents a slow or unresponsive orchestrator from holding gateway connection
+/// slots indefinitely.  Without this, a degraded orchestrator can exhaust all
+/// `MAX_CONCURRENT_CONNECTIONS` slots via stalled TLS handshakes, causing a
+/// complete authentication blackout for legitimate users.
+pub const TLS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// AES-256-GCM nonce size (96 bits / 12 bytes).
 const AES_GCM_NONCE_LEN: usize = 12;
@@ -79,7 +87,7 @@ pub const MAX_HEADER_LIST_SIZE: u32 = 64 * 1024;
 /// Every authentication code path (success, failure, orchestrator error,
 /// username-not-found in OPAQUE) is padded to at least this duration to
 /// prevent timing-based username enumeration.
-const AUTH_RESPONSE_FLOOR: std::time::Duration = std::time::Duration::from_millis(100);
+pub const AUTH_RESPONSE_FLOOR: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Configuration for orchestrator forwarding.
 #[derive(Clone)]
@@ -724,14 +732,18 @@ async fn forward_to_orchestrator(
     } else {
         raw_hostname
     };
-    let mut transport = tls_connect(
-            &config.addr,
-            ModuleId::Gateway,
-            config.hmac_key,
-            &config.tls_connector,
-            orch_hostname,
+    let mut transport = tokio::time::timeout(
+            TLS_CONNECT_TIMEOUT,
+            tls_connect(
+                &config.addr,
+                ModuleId::Gateway,
+                config.hmac_key,
+                &config.tls_connector,
+                orch_hostname,
+            ),
         )
         .await
+        .map_err(|_| "TLS handshake to orchestrator timed out (5s limit)".to_string())?
         .map_err(|e| format!("connect to orchestrator: {e}"))?;
 
     transport
@@ -829,6 +841,10 @@ async fn recv_raw_frame(stream: &mut (impl AsyncRead + AsyncWrite + Unpin)) -> R
 /// Returns `Err("payload too large: … bytes (limit …)")` if the declared
 /// frame length exceeds `max_size`, which the gateway maps to 413 Payload
 /// Too Large when surfaced to HTTP clients.
+///
+/// Reads in chunks of up to 64 KiB to avoid allocating the full declared
+/// frame size upfront.  This prevents a slow-send attacker from exhausting
+/// heap memory: only the bytes actually received consume memory.
 async fn recv_raw_frame_limited(
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
     max_size: u32,
@@ -847,12 +863,25 @@ async fn recv_raw_frame_limited(
     if len > MAX_FRAME_LEN {
         return Err(format!("frame too large: {len} bytes"));
     }
-    let buf_len = usize::try_from(len).map_err(|_| "frame size overflows usize".to_string())?;
-    let mut buf = vec![0u8; buf_len];
-    stream
-        .read_exact(&mut buf)
-        .await
-        .map_err(|e| format!("read payload: {e}"))?;
+    let total = usize::try_from(len).map_err(|_| "frame size overflows usize".to_string())?;
+
+    // Chunked read: allocate incrementally in 64 KiB chunks instead of the
+    // full declared size.  A slow-send attacker declaring 1 MiB but sending
+    // 1 byte/sec will only cause 64 KiB of allocation, not 1 MiB.
+    const CHUNK: usize = 64 * 1024;
+    let initial_cap = total.min(CHUNK);
+    let mut buf = Vec::with_capacity(initial_cap);
+    let mut remaining = total;
+    while remaining > 0 {
+        let to_read = remaining.min(CHUNK);
+        let start = buf.len();
+        buf.resize(start + to_read, 0);
+        stream
+            .read_exact(&mut buf[start..start + to_read])
+            .await
+            .map_err(|e| format!("read payload: {e}"))?;
+        remaining -= to_read;
+    }
     Ok(buf)
 }
 

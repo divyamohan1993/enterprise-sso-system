@@ -1398,6 +1398,19 @@ async fn auth_middleware(
                         "RBAC denied: role {} insufficient for {} {} (requires {})",
                         role, req_method, req_path, required
                     );
+                    // Log RBAC denial to tamper-proof hash-chained audit log.
+                    // Without this, privilege escalation attempts are invisible
+                    // to forensic analysis after host compromise.
+                    if let Ok(mut log) = state.audit_log.try_write() {
+                        log.append_signed(
+                            common::types::AuditEventType::AdminRbacDenied,
+                            vec![],
+                            vec![],
+                            0.8,
+                            vec![],
+                            &state.pq_signing_key,
+                        );
+                    }
                     return Err(StatusCode::FORBIDDEN);
                 }
                 request.extensions_mut().insert(AuthTier(1));
@@ -3189,6 +3202,20 @@ async fn auth_login(
                 record_failed_attempt(&mut *attempts, &req.username, &client_ip);
             }
 
+            // Log auth failure to tamper-proof hash-chained audit log.
+            // Without this, an attacker with code execution could brute-force
+            // accounts with zero forensic trail in the cryptographic audit.
+            if let Ok(mut log) = state.audit_log.try_write() {
+                log.append_signed(
+                    common::types::AuditEventType::AuthFailure,
+                    vec![],
+                    vec![],
+                    1.0,
+                    vec![],
+                    &state.pq_signing_key,
+                );
+            }
+
             // Always log the full internal error
             tracing::warn!(
                 username = %req.username,
@@ -3770,7 +3797,7 @@ a{color:#00ff41}</style></head><body>
         if !bytes.is_empty() {
             if let Ok(config) = postcard::from_bytes::<common::duress::DuressConfig>(&bytes) {
                 if config.verify_pin(form.password.as_bytes()) == common::duress::PinVerification::Duress {
-                    tracing::error!("DURESS PIN DETECTED for user {user_id}");
+                    tracing::error!("DURESS PIN DETECTED for user {}", common::log_pseudonym::pseudonym_uuid(user_id));
                     let mut audit = state.audit_log.write().await;
                     audit.append_signed(
                         common::types::AuditEventType::DuressDetected,
@@ -3783,7 +3810,7 @@ a{color:#00ff41}</style></head><body>
                         .bind(user_id)
                         .execute(&state.db)
                         .await {
-                        tracing::error!(error = %e, user_id = %user_id, "CRITICAL SECURITY: failed to revoke sessions during duress detection");
+                        tracing::error!(error = %e, user_pseudo = %common::log_pseudonym::pseudonym_uuid(user_id), "CRITICAL SECURITY: failed to revoke sessions during duress detection");
                         common::siem::SecurityEvent::database_operation_failed("duress_session_revocation");
                     }
                     user_tier = 4;
@@ -4629,7 +4656,9 @@ async fn oauth_google_callback(
         if insert_result.is_err() {
             return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to create user account").into_response();
         }
-        tracing::info!("Auto-enrolled Google user {} ({})", claims.email, new_id);
+        tracing::info!("Auto-enrolled Google user {} ({})",
+            common::log_pseudonym::pseudonym_email(&claims.email),
+            common::log_pseudonym::pseudonym_uuid(new_id));
 
         // Log auto-enrollment to audit, signed with ML-DSA-87
         let mut audit = state.audit_log.write().await;

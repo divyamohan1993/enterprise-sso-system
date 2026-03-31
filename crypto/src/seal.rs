@@ -106,7 +106,24 @@ impl MasterKey {
     }
 
     /// Generate a master key from the OS CSPRNG (`getrandom`).
+    ///
+    /// # Panics
+    /// In military deployment mode (`MILNET_MILITARY_DEPLOYMENT=1`), software
+    /// key generation is forbidden — master keys MUST originate from an HSM
+    /// (PKCS#11, AWS KMS, or TPM 2.0).  This prevents plaintext master key
+    /// material from ever existing in process memory on a compromised host.
     pub fn generate() -> Self {
+        let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if is_military {
+            panic!(
+                "FATAL: MasterKey::generate() called in military deployment mode \
+                 (MILNET_MILITARY_DEPLOYMENT=1). Software key generation is FORBIDDEN. \
+                 Master keys MUST come from an HSM (set MILNET_HSM_BACKEND=pkcs11|aws_kms|tpm2). \
+                 Aborting to prevent plaintext key material in process memory."
+            );
+        }
         let mut bytes = [0u8; 32];
         if getrandom::getrandom(&mut bytes).is_err() {
             panic!("FATAL: OS CSPRNG unavailable — cannot generate master key safely");

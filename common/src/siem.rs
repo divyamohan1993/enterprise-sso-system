@@ -17,6 +17,17 @@ use uuid::Uuid;
 static ACTIVE_WEBHOOK_THREADS: AtomicUsize = AtomicUsize::new(0);
 const MAX_WEBHOOK_THREADS: usize = 8;
 
+/// Counter for dropped webhook events due to thread pool exhaustion.
+/// Enables monitoring — if this value is non-zero, critical alerts may
+/// have been lost.  Exposed via `/api/health` and SIEM metrics.
+static DROPPED_WEBHOOK_EVENTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Returns the number of SIEM webhook events dropped due to thread pool
+/// exhaustion since process start.  Non-zero values indicate alert loss.
+pub fn dropped_webhook_event_count() -> usize {
+    DROPPED_WEBHOOK_EVENTS.load(Ordering::Acquire)
+}
+
 // ── Alert file rotation ─────────────────────────────────────────────────────
 /// Maximum alert file size before rotation (100 MB).
 const MAX_ALERT_FILE_BYTES: u64 = 100 * 1024 * 1024;
@@ -144,9 +155,18 @@ fn send_webhook_alert(event: &SiemEvent) {
         Err(_) => return,
     };
 
-    // FIX 4: Thread pool limiter — refuse to spawn if at capacity
+    // Thread pool limiter — refuse to spawn if at capacity.
+    // Instead of silently dropping, increment a counter and persist the
+    // event to the file-based alert sink so it is never fully lost.
     if ACTIVE_WEBHOOK_THREADS.load(Ordering::Acquire) >= MAX_WEBHOOK_THREADS {
-        tracing::warn!(target: "siem", "SIEM webhook thread limit reached — dropping event");
+        let dropped = DROPPED_WEBHOOK_EVENTS.fetch_add(1, Ordering::Release) + 1;
+        tracing::error!(
+            target: "siem",
+            dropped_total = dropped,
+            "SIEM webhook thread pool exhausted — event persisted to file but webhook delivery skipped"
+        );
+        // Persist to file sink as fallback so the event is not lost entirely.
+        persist_alert_to_file(&body);
         return;
     }
     ACTIVE_WEBHOOK_THREADS.fetch_add(1, Ordering::Release);

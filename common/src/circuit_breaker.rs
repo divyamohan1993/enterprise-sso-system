@@ -13,9 +13,16 @@ pub enum CircuitState {
 }
 
 /// A thread-safe circuit breaker that tracks failures and prevents cascade.
+///
+/// Includes exponential backoff on HalfOpen probes: each consecutive probe
+/// failure doubles the wait before the next attempt (capped at 5 minutes).
+/// Without this, an attacker can keep auth in a permanent ~99.9% failure
+/// state by ensuring each HalfOpen probe fails.
 pub struct CircuitBreaker {
     failure_count: AtomicU32,
     last_failure_epoch_ms: AtomicU64,
+    /// Number of consecutive HalfOpen probe failures — drives backoff.
+    consecutive_open_cycles: AtomicU32,
     threshold: u32,
     reset_timeout_ms: u64,
     start: Instant,
@@ -36,6 +43,7 @@ impl CircuitBreaker {
         Self {
             failure_count: AtomicU32::new(0),
             last_failure_epoch_ms: AtomicU64::new(0),
+            consecutive_open_cycles: AtomicU32::new(0),
             threshold,
             reset_timeout_ms: reset_timeout.as_millis() as u64,
             start: Instant::now(),
@@ -48,6 +56,10 @@ impl CircuitBreaker {
     }
 
     /// Get current circuit state.
+    ///
+    /// Uses exponential backoff for HalfOpen transitions: each consecutive
+    /// probe failure doubles the wait before the next HalfOpen window.
+    /// Capped at 5 minutes (300_000 ms) to prevent indefinite lockout.
     pub fn state(&self) -> CircuitState {
         let failures = self.failure_count.load(Ordering::Acquire);
         if failures < self.threshold {
@@ -55,7 +67,15 @@ impl CircuitBreaker {
         }
         let last = self.last_failure_epoch_ms.load(Ordering::Acquire);
         let elapsed = self.now_ms().saturating_sub(last);
-        if elapsed >= self.reset_timeout_ms {
+
+        // Exponential backoff: base_timeout * 2^consecutive_open_cycles
+        // Capped at 5 minutes to prevent indefinite lockout.
+        let cycles = self.consecutive_open_cycles.load(Ordering::Acquire);
+        let backoff_factor = 1u64.checked_shl(cycles.min(10)).unwrap_or(1024);
+        let effective_timeout = (self.reset_timeout_ms.saturating_mul(backoff_factor))
+            .min(300_000); // Cap at 5 minutes
+
+        if elapsed >= effective_timeout {
             CircuitState::HalfOpen
         } else {
             CircuitState::Open
@@ -67,10 +87,11 @@ impl CircuitBreaker {
         matches!(self.state(), CircuitState::Closed | CircuitState::HalfOpen)
     }
 
-    /// Record a successful call — resets the failure counter.
+    /// Record a successful call — resets the failure counter and backoff.
     pub fn record_success(&self) {
         let was_open = self.failure_count.load(Ordering::Acquire) >= self.threshold;
         self.failure_count.store(0, Ordering::Release);
+        self.consecutive_open_cycles.store(0, Ordering::Release);
         if was_open {
             crate::siem::SecurityEvent::circuit_breaker_closed(&self.service_name);
         }
@@ -101,6 +122,12 @@ impl CircuitBreaker {
         };
 
         self.last_failure_epoch_ms.store(self.now_ms(), Ordering::Release);
+
+        // If we were already in Open/HalfOpen state, increment the backoff
+        // cycle counter so the next HalfOpen window takes longer to arrive.
+        if prev >= self.threshold {
+            let _ = self.consecutive_open_cycles.fetch_add(1, Ordering::Release);
+        }
 
         // Emit SIEM event when we cross the threshold into Open state
         if prev + 1 == self.threshold {

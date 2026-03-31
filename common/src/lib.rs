@@ -179,3 +179,6 @@ pub mod runtime_defense;
 
 // ── Resilience: deadline propagation ──
 pub mod deadline;
+
+// ── Log pseudonymization for sensitive identifiers ──
+pub mod log_pseudonym;

@@ -227,6 +227,17 @@ pub fn is_production() -> bool {
 /// cached by the caller. The env var is removed after first read.
 pub fn load_master_kek() -> [u8; 32] {
     use zeroize::Zeroize;
+
+    // Disable ptrace and core dumps BEFORE reading the KEK from the
+    // environment.  This prevents a compromised co-process from reading
+    // /proc/pid/environ during the race window between env::var() and
+    // env::remove_var().  PR_SET_DUMPABLE=0 makes /proc/pid/environ
+    // unreadable by non-root, and prevents ptrace attachment.
+    #[cfg(all(unix, not(test)))]
+    unsafe {
+        libc::prctl(libc::PR_SET_DUMPABLE, 0);
+    }
+
     match std::env::var("MILNET_MASTER_KEK") {
         Ok(mut hex_str) if hex_str.len() >= 64 => {
             // Remove from process environment IMMEDIATELY to minimize the
