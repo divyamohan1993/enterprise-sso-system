@@ -18,7 +18,7 @@ checks:
   - category: Kernel
     id: KERNEL-003
     severity: CatII
-    status: Pass
+    status: Fail
     title: Kernel pointer restriction (kernel.kptr_restrict)
   - category: Kernel
     id: KERNEL-004
@@ -38,12 +38,12 @@ checks:
   - category: Kernel
     id: KERNEL-007
     severity: CatII
-    status: Pass
+    status: Fail
     title: Core dump pattern (kernel.core_pattern)
   - category: Kernel
     id: KERNEL-008
     severity: CatII
-    status: Fail
+    status: Pass
     title: SUID core dump disabled (fs.suid_dumpable)
   - category: Kernel
     id: KERNEL-009
@@ -78,12 +78,12 @@ checks:
   - category: Network
     id: NET-006
     severity: CatII
-    status: Fail
+    status: Pass
     title: ICMP redirect sending disabled (net.ipv4.conf.all.send_redirects)
   - category: Crypto
     id: CRYPTO-001
     severity: CatI
-    status: NotApplicable
+    status: Fail
     title: Kernel FIPS mode enabled (crypto/fips_enabled)
   - category: Authentication
     id: V-222602
@@ -111,11 +111,11 @@ checks:
     status: Pass
     title: Error handling (no stack traces in responses)
 summary:
-  cat_i_failures: 2
+  cat_i_failures: 3
   cat_ii_failures: 3
   cat_iii_failures: 0
-  failed: 5
+  failed: 6
   manual: 1
-  not_applicable: 1
+  not_applicable: 0
   passed: 14
   total: 21
