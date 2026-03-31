@@ -972,6 +972,14 @@ mod tests {
         // First run: all due
         let _ = detector.run_due_checks();
 
+        // Refresh last_checked to now so elapsed time from the first batch
+        // (which may take many seconds for binary hashing) does not cause
+        // layers to appear due again immediately.
+        let now = Instant::now();
+        for layer in &detector.enabled_layers.clone() {
+            detector.last_checked.insert(*layer, now);
+        }
+
         // Immediately after: none should be due (all intervals >= 10s)
         let events = detector.run_due_checks();
         assert!(events.is_empty());

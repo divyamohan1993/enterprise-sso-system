@@ -925,8 +925,14 @@ mod tests {
             all_seeds.extend_from_slice(&ws);
             let vks = build_vks(&all_seeds);
 
+            // Create a single genesis so both chains share the same genesis entry.
+            let genesis_chain = StateChain::new("author0", &author_sk, 5);
+
             // Chain A: genesis + entry with hash [0x01; 64].
-            let mut chain_a = StateChain::new("author0", &author_sk, 5);
+            let mut chain_a = StateChain {
+                entries: genesis_chain.entries.clone(),
+                quorum_size: 5,
+            };
             add_committed_entry(
                 &mut chain_a,
                 StateType::RevocationList,
@@ -937,8 +943,11 @@ mod tests {
                 &vks,
             );
 
-            // Chain B: genesis + entry with hash [0x02; 64].
-            let mut chain_b = StateChain::new("author0", &author_sk, 5);
+            // Chain B: same genesis + entry with hash [0x02; 64].
+            let mut chain_b = StateChain {
+                entries: genesis_chain.entries.clone(),
+                quorum_size: 5,
+            };
             add_committed_entry(
                 &mut chain_b,
                 StateType::RevocationList,

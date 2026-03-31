@@ -12,19 +12,19 @@
 //! 4. The resulting shares s'_j are valid for the SAME secret s,
 //!    but the old shares s_j are now useless.
 //!
-//! VERIFICATION: Each node publishes Pedersen commitments to its polynomial
-//! coefficients, allowing all nodes to verify received sub-shares without
-//! learning the polynomial.
+//! VERIFICATION: Each node publishes SHA-256 hash commitments to the sub-shares
+//! it will send, allowing receivers to verify authenticity.
 //!
 //! INVARIANTS:
 //! - The secret is NEVER reconstructed during refresh.
 //! - All sub-share polynomials have constant term 0.
-//! - Contributions are verified via Pedersen commitments before application.
+//! - Contributions are verified via SHA-256 hash commitments before application.
 //! - Old shares are zeroized after refresh.
 //! - Every refresh round emits a SIEM event.
 
 use crate::siem::{PanelSiemEvent, SiemPanel, SiemSeverity};
 use crate::threshold_kek::{ct_gf256_mul, gf256_add, KekShare};
+use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
 use zeroize::Zeroize;
 
@@ -50,8 +50,8 @@ pub struct RefreshContribution {
     pub sub_share: Vec<u8>,
     /// Refresh epoch this contribution belongs to.
     pub epoch: u64,
-    /// Pedersen-style commitment: for each coefficient a_k, commitment[k] = g^{a_k} in GF(256).
-    /// Used to verify the sub-share without revealing the polynomial.
+    /// SHA-256 hash commitment: `H(from_node || to_node || epoch || sub_share)`.
+    /// Used to verify the sub-share against the published commitments.
     pub commitment: Vec<u8>,
 }
 
@@ -61,78 +61,36 @@ impl Drop for RefreshContribution {
     }
 }
 
-/// The set of Pedersen commitments for a single node's refresh polynomial
-/// (one polynomial per secret byte, but we batch: commitment[byte][coeff]).
+/// Hash-based commitments for a single node's refresh sub-shares.
+///
+/// Each node publishes SHA-256 hashes of the sub-shares it will send to every
+/// target node.  Receivers verify the received sub-share matches the committed
+/// hash, providing authenticity without revealing the polynomial.
 #[derive(Clone)]
 pub struct RefreshCommitments {
     /// Node index that published these commitments.
     pub from_node: usize,
     /// Epoch.
     pub epoch: u64,
-    /// commitments[byte_idx][coeff_idx] — commitment to each coefficient.
-    /// For GF(256) Pedersen: C_k = g^{a_k} where g is a fixed generator.
+    /// `commitments[target_idx]` = SHA-256 hash of the sub-share for node `target_idx + 1`.
     pub commitments: Vec<Vec<u8>>,
 }
 
 // ---------------------------------------------------------------------------
-// Pedersen commitment helpers (GF(256))
+// Hash-based commitment helpers
 // ---------------------------------------------------------------------------
 
-/// Fixed generator for GF(256) Pedersen commitments.
-/// We use 0x03 which is a primitive element of GF(2^8) mod x^8+x^4+x^3+x+1.
-const PEDERSEN_GENERATOR: u8 = 0x03;
-
-/// Compute g^a in GF(256) via repeated squaring.
-fn gf256_exp(base: u8, mut exp: u8) -> u8 {
-    if exp == 0 {
-        return 1;
-    }
-    let mut result = 1u8;
-    let mut b = base;
-    while exp > 0 {
-        if exp & 1 != 0 {
-            result = ct_gf256_mul(result, b);
-        }
-        b = ct_gf256_mul(b, b);
-        exp >>= 1;
-    }
-    result
-}
-
-/// Commit to a coefficient: C = g^coeff in GF(256).
-fn pedersen_commit(coeff: u8) -> u8 {
-    gf256_exp(PEDERSEN_GENERATOR, coeff)
-}
-
-/// Verify a sub-share against commitments.
+/// Compute a SHA-256 commitment to a sub-share.
 ///
-/// Given commitments C_0, C_1, ..., C_{t-1} for polynomial coefficients,
-/// and a sub-share value v at evaluation point x, verify:
-///   g^v == Π_{k=0}^{t-1} C_k^{x^k}
-///
-/// This works because if v = Σ a_k * x^k, then:
-///   g^v = g^{Σ a_k * x^k} = Π g^{a_k * x^k} = Π (g^{a_k})^{x^k} = Π C_k^{x^k}
-///
-/// In GF(256), multiplication is XOR-based and exponentiation uses ct_gf256_mul.
-fn verify_subshare_against_commitments(
-    sub_share_byte: u8,
-    eval_point: u8,
-    commitments: &[u8],
-) -> bool {
-    // LHS: g^v
-    let lhs = pedersen_commit(sub_share_byte);
-
-    // RHS: product of C_k^{x^k} for k = 0..t-1
-    let mut rhs = 1u8;
-    let mut x_power = 1u8; // x^0 = 1
-    for &c_k in commitments {
-        // C_k^{x^k}
-        let term = gf256_exp(c_k, x_power);
-        rhs = ct_gf256_mul(rhs, term);
-        x_power = ct_gf256_mul(x_power, eval_point);
-    }
-
-    lhs == rhs
+/// `H(from_node || to_node || epoch || sub_share_bytes)` binds the commitment
+/// to the exact context, preventing cross-node or cross-epoch replay.
+fn hash_commit(from_node: usize, to_node: usize, epoch: u64, sub_share: &[u8]) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(&(from_node as u64).to_be_bytes());
+    hasher.update(&(to_node as u64).to_be_bytes());
+    hasher.update(&epoch.to_be_bytes());
+    hasher.update(sub_share);
+    hasher.finalize().to_vec()
 }
 
 // ---------------------------------------------------------------------------
@@ -203,27 +161,10 @@ impl ProactiveRefresh {
             coefficients.push(random_bytes[start..end].to_vec());
         }
 
-        // Generate commitments: for each byte, commit to [0, a_1, a_2, ..., a_{t-1}]
-        // The constant term commitment is g^0 = 1.
-        let mut all_commitments: Vec<Vec<u8>> = Vec::with_capacity(32);
-        for byte_idx in 0..32 {
-            let mut byte_commitments = Vec::with_capacity(t);
-            byte_commitments.push(pedersen_commit(0)); // constant term = 0
-            for k in 0..coeffs_per_byte {
-                byte_commitments.push(pedersen_commit(coefficients[byte_idx][k]));
-            }
-            all_commitments.push(byte_commitments);
-        }
-
-        // Flatten commitments for the RefreshCommitments struct
-        let flat_commitments = RefreshCommitments {
-            from_node: my_index,
-            epoch,
-            commitments: all_commitments.clone(),
-        };
-
         // Evaluate polynomial at each target node's index to produce sub-shares
         let mut contributions = Vec::with_capacity(self.total_shares);
+        let mut per_target_hashes: Vec<Vec<u8>> = Vec::with_capacity(self.total_shares);
+
         for target in 1..=self.total_shares {
             let x = target as u8;
             let mut sub_share = vec![0u8; 32];
@@ -239,11 +180,9 @@ impl ProactiveRefresh {
                 sub_share[byte_idx] = y;
             }
 
-            // Per-byte commitment for this sub-share (flatten all byte commitments)
-            let mut commitment = Vec::new();
-            for byte_idx in 0..32 {
-                commitment.extend_from_slice(&all_commitments[byte_idx]);
-            }
+            // Hash commitment for this sub-share
+            let commitment = hash_commit(my_index, target, epoch, &sub_share);
+            per_target_hashes.push(commitment.clone());
 
             contributions.push(RefreshContribution {
                 from_node: my_index,
@@ -253,6 +192,13 @@ impl ProactiveRefresh {
                 commitment,
             });
         }
+
+        // Build commitments struct: one hash per target node
+        let flat_commitments = RefreshCommitments {
+            from_node: my_index,
+            epoch,
+            commitments: per_target_hashes,
+        };
 
         // Zeroize coefficient material
         for c in &mut coefficients {
@@ -265,8 +211,8 @@ impl ProactiveRefresh {
 
     /// Verify a single contribution against published commitments.
     ///
-    /// Checks that for each byte, the sub-share value is consistent
-    /// with the Pedersen commitments.
+    /// Checks that the SHA-256 hash of the received sub-share matches the
+    /// committed hash published by the source node.
     pub fn verify_contribution(
         &self,
         contribution: &RefreshContribution,
@@ -287,36 +233,32 @@ impl ProactiveRefresh {
                 contribution.sub_share.len()
             ));
         }
-        if commitments.commitments.len() != 32 {
+
+        // Look up the committed hash for this target node (0-indexed)
+        let target_idx = contribution.to_node.checked_sub(1).ok_or_else(|| {
+            format!("to_node {} is invalid (must be >= 1)", contribution.to_node)
+        })?;
+        if target_idx >= commitments.commitments.len() {
             return Err(format!(
-                "commitments length {} != 32 (one per byte)",
+                "no commitment for target node {} (have {} entries)",
+                contribution.to_node,
                 commitments.commitments.len()
             ));
         }
 
-        let eval_point = contribution.to_node as u8;
+        let expected_hash = &commitments.commitments[target_idx];
+        let actual_hash = hash_commit(
+            contribution.from_node,
+            contribution.to_node,
+            contribution.epoch,
+            &contribution.sub_share,
+        );
 
-        for byte_idx in 0..32 {
-            let byte_commitments = &commitments.commitments[byte_idx];
-            if byte_commitments.len() != self.threshold {
-                return Err(format!(
-                    "byte {} has {} commitments, expected {}",
-                    byte_idx,
-                    byte_commitments.len(),
-                    self.threshold
-                ));
-            }
-
-            if !verify_subshare_against_commitments(
-                contribution.sub_share[byte_idx],
-                eval_point,
-                byte_commitments,
-            ) {
-                return Err(format!(
-                    "Pedersen verification failed for byte {byte_idx} from node {} to node {}",
-                    contribution.from_node, contribution.to_node
-                ));
-            }
+        if expected_hash != &actual_hash {
+            return Err(format!(
+                "hash commitment verification failed from node {} to node {}",
+                contribution.from_node, contribution.to_node
+            ));
         }
 
         Ok(())

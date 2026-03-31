@@ -408,7 +408,9 @@ mod tests {
     #[test]
     fn test_verify_totp_exact() {
         let secret = b"1234567890123456789012345678901234567890123456789012345678901234";
-        let time = 59u64;
+        // Use a distinct time step from other tests so the replay-prevention cache
+        // does not reject the code when tests run in the same process.
+        let time = 1_000_059u64;
         let code = generate_totp(secret, time);
         assert!(verify_totp(secret, &code, time, 0));
     }

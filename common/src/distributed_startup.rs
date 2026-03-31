@@ -788,6 +788,12 @@ mod tests {
         h
     }
 
+    /// Returns the binary hash that `compute_own_binary_hash` will produce
+    /// at runtime — the real /proc/self/exe hash on Linux, or [0;64] fallback.
+    fn own_binary_hash() -> BinaryHash {
+        crate::binary_attestation_mesh::compute_binary_hash().unwrap_or([0u8; 64])
+    }
+
     /// Build a verifier with the given peer count for testing.
     fn make_verifier(num_peers: usize) -> DistributedStartupVerifier {
         let peers: Vec<String> = (0..num_peers)
@@ -856,9 +862,8 @@ mod tests {
     #[test]
     fn test_startup_two_peers_succeeds() {
         let verifier = make_verifier(2);
-        // Verifier's own hash will be [0;64] in test (no /proc/self/exe),
-        // so we use that as the common hash.
-        let hash = [0u8; 64]; // matches compute_own_binary_hash fallback
+        // Use the same hash that the verifier computes for its own binary.
+        let hash = own_binary_hash();
         let now = now_secs();
 
         let att1 = make_attestation("peer-1", &seed_b(), &hash, now);
@@ -878,7 +883,7 @@ mod tests {
     #[test]
     fn test_expired_attestation_rejected() {
         let verifier = make_verifier(2);
-        let hash = [0u8; 64];
+        let hash = own_binary_hash();
         let now = now_secs();
 
         // One fresh, one expired (200 seconds old > 60s max)
@@ -906,7 +911,7 @@ mod tests {
     #[test]
     fn test_tampered_signature_rejected() {
         let verifier = make_verifier(2);
-        let hash = [0u8; 64];
+        let hash = own_binary_hash();
         let now = now_secs();
 
         let att1 = make_attestation("peer-1", &seed_b(), &hash, now);
@@ -933,16 +938,16 @@ mod tests {
     #[test]
     fn test_binary_hash_mismatch_detected() {
         let verifier = make_verifier(2);
-        let own_hash = [0u8; 64]; // matches compute_own_binary_hash fallback
+        let own_hash = own_binary_hash();
         let now = now_secs();
 
         // peer-1 has matching hash
         let att1 = make_attestation("peer-1", &seed_b(), &own_hash, now);
 
         // peer-2 has DIFFERENT binary hash (simulating tampering)
-        let mut tampered_hash = [0u8; 64];
-        tampered_hash[0] = 0xFF;
-        tampered_hash[1] = 0xEE;
+        let mut tampered_hash = own_hash;
+        tampered_hash[0] ^= 0xFF;
+        tampered_hash[1] ^= 0xEE;
         let att2 = make_attestation("peer-2", &seed_c(), &tampered_hash, now);
 
         let result = verifier.verify_cluster(&[att1, att2]);
@@ -973,14 +978,14 @@ mod tests {
             true, // rolling_update = true
         );
 
-        let own_hash = [0u8; 64];
+        let own_hash = own_binary_hash();
         let now = now_secs();
 
         let att1 = make_attestation("peer-1", &seed_b(), &own_hash, now);
 
         // Different binary hash — should be allowed during rolling update
-        let mut different_hash = [0u8; 64];
-        different_hash[0] = 0xFF;
+        let mut different_hash = own_hash;
+        different_hash[0] ^= 0xFF;
         let att2 = make_attestation("peer-2", &seed_c(), &different_hash, now);
 
         let result = verifier.verify_cluster(&[att1, att2]);
@@ -993,7 +998,7 @@ mod tests {
     fn test_quorum_frost_3of5_insufficient() {
         // 2 peers configured but only 1 attestation verified → 2 total < 3 FROST
         let verifier = make_verifier(2);
-        let hash = [0u8; 64];
+        let hash = own_binary_hash();
         let now = now_secs();
 
         // Only provide 1 valid attestation (+ self = 2 nodes, below FROST threshold of 3)
@@ -1014,7 +1019,7 @@ mod tests {
     fn test_quorum_frost_3of5_sufficient() {
         // 4 peers configured, 4 valid attestations → 5 total, FROST 3-of-5 OK
         let verifier = make_verifier(4);
-        let hash = [0u8; 64];
+        let hash = own_binary_hash();
         let now = now_secs();
 
         let seed_d = {
@@ -1058,7 +1063,7 @@ mod tests {
             false,
         );
 
-        let hash = [0u8; 64];
+        let hash = own_binary_hash();
         let now = now_secs();
 
         let atts = vec![
@@ -1103,7 +1108,7 @@ mod tests {
             false,
         );
 
-        let hash = [0u8; 64];
+        let hash = own_binary_hash();
         let now = now_secs();
 
         let seeds: Vec<[u8; 32]> = (0..6)
