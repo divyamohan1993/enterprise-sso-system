@@ -36,5 +36,6 @@ fido = { path = "../fido" }
 sso-protocol = { version = "0.1.0", path = "../sso-protocol" }
 ml-dsa.workspace = true
 serde_json = "1"
+base64 = "0.22"
 ed25519-dalek.workspace = true
 x25519-dalek.workspace = true

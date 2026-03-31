@@ -146,9 +146,7 @@ fn platform_integrity_always_runs() {
     // PlatformIntegrityMonitor can always be constructed — platform checks
     // are never skippable. The monitor's run_checks method executes real
     // OS-level checks (dumpable, binary hash, etc.).
-    let monitor = common::platform_integrity::PlatformIntegrityMonitor::new(
-        std::time::Duration::from_secs(3600), // long interval — we just test construction
-    );
+    let monitor = common::platform_integrity::RuntimeIntegrityMonitor::new();
     // run_checks returns a Vec of errors found; on a CI/dev machine some
     // checks may fail (no vTPM, etc.), but the important thing is that the
     // checks EXECUTE — they are never skipped or short-circuited.
