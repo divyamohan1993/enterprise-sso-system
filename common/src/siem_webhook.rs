@@ -94,7 +94,13 @@ fn sign_payload(key: &[u8], timestamp: &str, payload: &[u8]) -> String {
     use hmac::{Hmac, Mac};
     use sha2::Sha512;
     type HmacSha512 = Hmac<Sha512>;
-    let mut mac = HmacSha512::new_from_slice(key).expect("HMAC key");
+    let mut mac = match HmacSha512::new_from_slice(key) {
+        Ok(m) => m,
+        Err(_) => {
+            tracing::error!(target: "siem", "HMAC-SHA512 key init failed for SIEM payload signing");
+            return String::from("HMAC_KEY_INIT_FAILED");
+        }
+    };
     mac.update(timestamp.as_bytes());
     mac.update(payload);
     let result = mac.finalize().into_bytes();

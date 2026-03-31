@@ -1,6 +1,28 @@
-// CNSA 2.0 exception: SHA-256 mandated by RFC 7636 S256 method;
-// CNSA 2.0 exception granted for OAuth interoperability.
-// Changing this hash would break all OAuth 2.0/2.1 PKCE clients.
+// ══════════════════════════════════════════════════════════════════════
+// CNSA 2.0 Level 5 EXCEPTION: SHA-256 (RFC 7636 S256 method)
+// ══════════════════════════════════════════════════════════════════════
+//
+// This module uses SHA-256 for PKCE code_challenge computation. This is
+// an APPROVED EXCEPTION to the CNSA 2.0 Level 5 policy (SHA-384+ minimum)
+// because:
+//
+// 1. RFC 7636 Section 4.2 defines the S256 method as:
+//    code_challenge = BASE64URL(SHA256(ASCII(code_verifier)))
+//    There is NO higher-hash variant in the specification.
+//
+// 2. Changing this hash would break interoperability with ALL OAuth 2.0/2.1
+//    clients, authorization servers, and PKCE libraries worldwide.
+//
+// 3. PKCE is a proof-of-possession mechanism, not a key derivation function.
+//    SHA-256 provides sufficient pre-image resistance (128-bit classical
+//    security) for this use case. The code_verifier has 256 bits of entropy
+//    minimum (43 chars * ~6 bits/char), so brute-force is infeasible.
+//
+// 4. This exception is documented in common/src/cnsa2.rs compliance table.
+//
+// See also: WebAuthn SHA-256 (W3C mandate), DPoP JWK Thumbprint SHA-256
+// (RFC 9449/7638) — same class of external protocol exceptions.
+// ══════════════════════════════════════════════════════════════════════
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;

@@ -1706,7 +1706,7 @@ fn test_attack_xwing_pq_kem_produces_real_shared_secrets() {
     let server_kp = XWingKeyPair::generate();
     let server_pk = server_kp.public_key();
 
-    let (client_secret, ciphertext) = xwing_encapsulate(&server_pk);
+    let (client_secret, ciphertext) = xwing_encapsulate(&server_pk).expect("encapsulate");
     let server_secret = xwing_decapsulate(&server_kp, &ciphertext).expect("decapsulate");
 
     // Both sides must derive the same shared secret
@@ -1722,7 +1722,7 @@ fn test_attack_xwing_pq_kem_produces_real_shared_secrets() {
     );
 
     // Secret must not be trivially predictable
-    let (client_secret2, _) = xwing_encapsulate(&server_pk);
+    let (client_secret2, _) = xwing_encapsulate(&server_pk).expect("encapsulate");
     assert_ne!(
         client_secret.as_bytes(), client_secret2.as_bytes(),
         "two encapsulations should produce different secrets"

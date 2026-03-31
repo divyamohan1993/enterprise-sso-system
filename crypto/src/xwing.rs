@@ -121,13 +121,22 @@ pub const SESSION_KEY_LEN: usize = 64;
 pub fn derive_session_key(
     shared_secret: &SharedSecret,
     context: &[u8],
-) -> [u8; SESSION_KEY_LEN] {
+) -> Result<[u8; SESSION_KEY_LEN], String> {
     let hk = Hkdf::<Sha512>::new(Some(context), shared_secret.as_bytes());
     let mut okm = [0u8; SESSION_KEY_LEN];
-    if hk.expand(b"X-Wing-Session-Key-v1", &mut okm).is_err() {
-        panic!("FATAL: HKDF-SHA512 expand failed for session key derivation");
-    }
-    okm
+    hk.expand(b"X-Wing-Session-Key-v1", &mut okm).map_err(|e| {
+        common::siem::emit_runtime_error(
+            common::siem::category::CRYPTO_FAILURE,
+            "HKDF-SHA512 expand failed for session key derivation",
+            &format!("{e}"),
+            file!(),
+            line!(),
+            column!(),
+            module_path!(),
+        );
+        format!("HKDF-SHA512 session key derivation failed: {e}")
+    })?;
+    Ok(okm)
 }
 
 /// The public portion of an X-Wing key pair, containing both an X25519 public
@@ -298,7 +307,7 @@ impl Drop for XWingKeyPair {
 fn combine(
     x25519_ss: &[u8],
     ml_kem_ss: &[u8],
-) -> SharedSecret {
+) -> Result<SharedSecret, XWingError> {
     // Concatenate: x25519_ss || ml_kem_ss
     let mut ikm = Vec::with_capacity(x25519_ss.len() + ml_kem_ss.len());
     ikm.extend_from_slice(x25519_ss);
@@ -307,13 +316,23 @@ fn combine(
     let hk = Hkdf::<Sha512>::new(Some(XWING_HKDF_SALT), &ikm);
     let mut okm = [0u8; 32];
     if hk.expand(XWING_HKDF_INFO, &mut okm).is_err() {
-        panic!("FATAL: HKDF-SHA512 expand failed for X-Wing shared secret derivation");
+        common::siem::emit_runtime_error(
+            common::siem::category::CRYPTO_FAILURE,
+            "HKDF-SHA512 expand failed for X-Wing shared secret derivation",
+            "InvalidPrkLength",
+            file!(),
+            line!(),
+            column!(),
+            module_path!(),
+        );
+        ikm.zeroize();
+        return Err(XWingError::MlKemDecapsulationFailed);
     }
 
     // Zeroize the intermediate key material
     ikm.zeroize();
 
-    SharedSecret(okm)
+    Ok(SharedSecret(okm))
 }
 
 /// Client-side encapsulation.
@@ -325,7 +344,7 @@ fn combine(
 ///
 /// Returns `(shared_secret, ciphertext)`. The ciphertext must be sent to
 /// the server so it can decapsulate and derive the same shared secret.
-pub fn xwing_encapsulate(server_pk: &XWingPublicKey) -> (SharedSecret, Ciphertext) {
+pub fn xwing_encapsulate(server_pk: &XWingPublicKey) -> Result<(SharedSecret, Ciphertext), XWingError> {
     let mut rng = rand::rngs::OsRng;
 
     // Ephemeral X25519 key pair for this session.
@@ -338,19 +357,27 @@ pub fn xwing_encapsulate(server_pk: &XWingPublicKey) -> (SharedSecret, Ciphertex
     let client_pk = *eph_public.as_bytes();
 
     // ML-KEM-1024 encapsulation against the server's encapsulation key.
-    let encaps_result = server_pk
+    let (ml_kem_ct_arr, ml_kem_ss_arr) = server_pk
         .ml_kem_ek
-        .encapsulate(&mut rng);
-    let (ml_kem_ct_arr, ml_kem_ss_arr) = match encaps_result {
-        Ok(pair) => pair,
-        Err(_) => panic!("FATAL: ML-KEM-1024 encapsulation failed — cryptographic operation error"),
-    };
+        .encapsulate(&mut rng)
+        .map_err(|_| {
+            common::siem::emit_runtime_error(
+                common::siem::category::CRYPTO_FAILURE,
+                "ML-KEM-1024 encapsulation failed",
+                "encapsulation error",
+                file!(),
+                line!(),
+                column!(),
+                module_path!(),
+            );
+            XWingError::MlKemCiphertextInvalid
+        })?;
 
     let ml_kem_ss: &[u8] = ml_kem_ss_arr.as_slice();
     let ml_kem_ct: &[u8] = ml_kem_ct_arr.as_slice();
 
     // Combine both shared secrets via HKDF-SHA512.
-    let ss = combine(x25519_ss.as_bytes(), ml_kem_ss);
+    let ss = combine(x25519_ss.as_bytes(), ml_kem_ss)?;
 
     let mut ct_bytes = [0u8; ML_KEM_CT_LEN];
     ct_bytes.copy_from_slice(ml_kem_ct);
@@ -360,7 +387,7 @@ pub fn xwing_encapsulate(server_pk: &XWingPublicKey) -> (SharedSecret, Ciphertex
         ml_kem_ct: ct_bytes,
     };
 
-    (ss, ct)
+    Ok((ss, ct))
 }
 
 /// Server-side decapsulation.
@@ -388,7 +415,7 @@ pub fn xwing_decapsulate(
         .map_err(|_| XWingError::MlKemDecapsulationFailed)?;
 
     // Combine both shared secrets via HKDF-SHA512.
-    Ok(combine(x25519_ss.as_bytes(), ml_kem_ss.as_slice()))
+    combine(x25519_ss.as_bytes(), ml_kem_ss.as_slice())
 }
 
 // ── KEM Agility: Runtime-Selectable KEM Algorithms ─────────────────────────
@@ -489,13 +516,22 @@ pub fn active_kem_algorithm() -> KemAlgorithm {
 /// Derives a 32-byte shared secret from the ML-KEM-1024 shared secret only
 /// (no X25519 component). Uses a distinct HKDF salt to ensure domain separation
 /// from the X-Wing combiner.
-fn combine_mlkem_only(ml_kem_ss: &[u8]) -> SharedSecret {
+fn combine_mlkem_only(ml_kem_ss: &[u8]) -> Result<SharedSecret, XWingError> {
     let hk = Hkdf::<Sha512>::new(Some(MLKEM_ONLY_HKDF_SALT), ml_kem_ss);
     let mut okm = [0u8; 32];
     if hk.expand(MLKEM_ONLY_HKDF_INFO, &mut okm).is_err() {
-        panic!("FATAL: HKDF-SHA512 expand failed for ML-KEM-only shared secret derivation");
+        common::siem::emit_runtime_error(
+            common::siem::category::CRYPTO_FAILURE,
+            "HKDF-SHA512 expand failed for ML-KEM-only shared secret derivation",
+            "InvalidPrkLength",
+            file!(),
+            line!(),
+            column!(),
+            module_path!(),
+        );
+        return Err(XWingError::MlKemDecapsulationFailed);
     }
-    SharedSecret(okm)
+    Ok(SharedSecret(okm))
 }
 
 /// Tagged ciphertext that includes a KEM algorithm identifier.
@@ -529,12 +565,22 @@ impl TaggedCiphertext {
     }
 
     /// Return the KEM algorithm used.
-    pub fn algorithm(&self) -> KemAlgorithm {
-        // SAFETY: TaggedCiphertext can only be constructed via from_bytes() which validates the tag.
-        match KemAlgorithm::from_tag(self.bytes[0]) {
-            Some(algo) => algo,
-            None => panic!("FATAL: TaggedCiphertext contains invalid KEM tag — internal invariant violation"),
-        }
+    ///
+    /// Returns `Err` if the tag byte is invalid (should not happen if
+    /// constructed via `from_bytes()`, but defends against memory corruption).
+    pub fn algorithm(&self) -> Result<KemAlgorithm, XWingError> {
+        KemAlgorithm::from_tag(self.bytes[0]).ok_or_else(|| {
+            common::siem::emit_runtime_error(
+                common::siem::category::INTEGRITY_VIOLATION,
+                "TaggedCiphertext contains invalid KEM tag — internal invariant violation",
+                &format!("tag=0x{:02x}", self.bytes[0]),
+                file!(),
+                line!(),
+                column!(),
+                module_path!(),
+            );
+            XWingError::MlKemCiphertextInvalid
+        })
     }
 
     /// Return the raw ciphertext bytes (without the tag).
@@ -552,40 +598,48 @@ impl TaggedCiphertext {
 /// - **ML-KEM-1024 Only**: Pure post-quantum (ML-KEM-1024 encapsulation + HKDF).
 pub fn xwing_encapsulate_tagged(
     server_pk: &XWingPublicKey,
-) -> (SharedSecret, TaggedCiphertext) {
+) -> Result<(SharedSecret, TaggedCiphertext), XWingError> {
     let algo = active_kem_algorithm();
 
     match algo {
         KemAlgorithm::XWing => {
             // Full X-Wing hybrid encapsulation
-            let (ss, ct) = xwing_encapsulate(server_pk);
+            let (ss, ct) = xwing_encapsulate(server_pk)?;
             let ct_bytes = ct.to_bytes();
             let mut tagged = Vec::with_capacity(1 + ct_bytes.len());
             tagged.push(KEM_TAG_XWING);
             tagged.extend_from_slice(&ct_bytes);
-            (ss, TaggedCiphertext { bytes: tagged })
+            Ok((ss, TaggedCiphertext { bytes: tagged }))
         }
         KemAlgorithm::MlKem1024Only => {
             // Pure ML-KEM-1024 encapsulation (no X25519)
             let mut rng = rand::rngs::OsRng;
-            let (ml_kem_ct_arr, ml_kem_ss_arr) = match server_pk
+            let (ml_kem_ct_arr, ml_kem_ss_arr) = server_pk
                 .ml_kem_ek
                 .encapsulate(&mut rng)
-            {
-                Ok(pair) => pair,
-                Err(_) => panic!("FATAL: ML-KEM-1024 encapsulation failed — cryptographic operation error"),
-            };
+                .map_err(|_| {
+                    common::siem::emit_runtime_error(
+                        common::siem::category::CRYPTO_FAILURE,
+                        "ML-KEM-1024 encapsulation failed (KEM-only mode)",
+                        "encapsulation error",
+                        file!(),
+                        line!(),
+                        column!(),
+                        module_path!(),
+                    );
+                    XWingError::MlKemCiphertextInvalid
+                })?;
 
             let ml_kem_ss: &[u8] = ml_kem_ss_arr.as_slice();
             let ml_kem_ct: &[u8] = ml_kem_ct_arr.as_slice();
 
             // Derive shared secret using ML-KEM-only HKDF (distinct salt)
-            let ss = combine_mlkem_only(ml_kem_ss);
+            let ss = combine_mlkem_only(ml_kem_ss)?;
 
             let mut tagged = Vec::with_capacity(1 + ml_kem_ct.len());
             tagged.push(KEM_TAG_ML_KEM_1024_ONLY);
             tagged.extend_from_slice(ml_kem_ct);
-            (ss, TaggedCiphertext { bytes: tagged })
+            Ok((ss, TaggedCiphertext { bytes: tagged }))
         }
     }
 }
@@ -598,7 +652,7 @@ pub fn xwing_decapsulate_tagged(
     server_kp: &XWingKeyPair,
     tagged_ct: &TaggedCiphertext,
 ) -> Result<SharedSecret, XWingError> {
-    let algo = tagged_ct.algorithm();
+    let algo = tagged_ct.algorithm()?;
     let ct_bytes = tagged_ct.ciphertext_bytes();
 
     match algo {
@@ -618,7 +672,7 @@ pub fn xwing_decapsulate_tagged(
                 .decapsulate(&ml_kem_ct)
                 .map_err(|_| XWingError::MlKemDecapsulationFailed)?;
 
-            Ok(combine_mlkem_only(ml_kem_ss.as_slice()))
+            combine_mlkem_only(ml_kem_ss.as_slice())
         }
     }
 }
@@ -629,15 +683,15 @@ mod tests {
 
     #[test]
     fn combine_is_deterministic() {
-        let ss1 = combine(&[1u8; 32], &[0u8; 32]);
-        let ss2 = combine(&[1u8; 32], &[0u8; 32]);
+        let ss1 = combine(&[1u8; 32], &[0u8; 32]).expect("combine");
+        let ss2 = combine(&[1u8; 32], &[0u8; 32]).expect("combine");
         assert_eq!(ss1.as_bytes(), ss2.as_bytes());
     }
 
     #[test]
     fn combine_differs_on_different_inputs() {
-        let ss1 = combine(&[1u8; 32], &[0u8; 32]);
-        let ss2 = combine(&[0u8; 32], &[1u8; 32]);
+        let ss1 = combine(&[1u8; 32], &[0u8; 32]).expect("combine");
+        let ss2 = combine(&[0u8; 32], &[1u8; 32]).expect("combine");
         assert_ne!(ss1.as_bytes(), ss2.as_bytes());
     }
 
@@ -652,7 +706,7 @@ mod tests {
         let server_kp = XWingKeyPair::generate();
         let server_pk = server_kp.public_key();
 
-        let (client_ss, ct) = xwing_encapsulate(&server_pk);
+        let (client_ss, ct) = xwing_encapsulate(&server_pk).expect("encapsulate");
         let server_ss = xwing_decapsulate(&server_kp, &ct).expect("decapsulation should succeed");
 
         assert_eq!(client_ss.as_bytes(), server_ss.as_bytes());
@@ -663,7 +717,7 @@ mod tests {
         let server_kp = XWingKeyPair::generate();
         let server_pk = server_kp.public_key();
 
-        let (client_ss, ct) = xwing_encapsulate(&server_pk);
+        let (client_ss, ct) = xwing_encapsulate(&server_pk).expect("encapsulate");
 
         // Decapsulate with a different keypair should yield a different secret
         // (ML-KEM implicit rejection returns a pseudorandom value).
@@ -682,7 +736,7 @@ mod tests {
         let server_kp = XWingKeyPair::generate();
         let server_pk = server_kp.public_key();
 
-        let (_ss, ct) = xwing_encapsulate(&server_pk);
+        let (_ss, ct) = xwing_encapsulate(&server_pk).expect("encapsulate");
         let bytes = ct.to_bytes();
         assert_eq!(bytes.len(), X25519_PK_LEN + ML_KEM_CT_LEN);
 
@@ -695,8 +749,8 @@ mod tests {
     fn xwing_different_sessions_produce_different_secrets() {
         let kp = XWingKeyPair::generate();
         let pk = kp.public_key();
-        let (ss1, _) = xwing_encapsulate(&pk);
-        let (ss2, _) = xwing_encapsulate(&pk);
+        let (ss1, _) = xwing_encapsulate(&pk).expect("encapsulate 1");
+        let (ss2, _) = xwing_encapsulate(&pk).expect("encapsulate 2");
         assert_ne!(
             ss1.as_bytes(),
             ss2.as_bytes(),
@@ -755,8 +809,8 @@ mod tests {
         let server_kp = XWingKeyPair::generate();
         let server_pk = server_kp.public_key();
 
-        let (client_ss, tagged_ct) = xwing_encapsulate_tagged(&server_pk);
-        assert_eq!(tagged_ct.algorithm(), KemAlgorithm::XWing);
+        let (client_ss, tagged_ct) = xwing_encapsulate_tagged(&server_pk).expect("tagged encapsulate");
+        assert_eq!(tagged_ct.algorithm().expect("algorithm"), KemAlgorithm::XWing);
 
         let server_ss = xwing_decapsulate_tagged(&server_kp, &tagged_ct)
             .expect("tagged decapsulation should succeed");
@@ -768,19 +822,19 @@ mod tests {
         let server_kp = XWingKeyPair::generate();
         let server_pk = server_kp.public_key();
 
-        let (_ss, tagged_ct) = xwing_encapsulate_tagged(&server_pk);
+        let (_ss, tagged_ct) = xwing_encapsulate_tagged(&server_pk).expect("tagged encapsulate");
         let bytes = tagged_ct.to_bytes();
         // First byte is the tag
         assert_eq!(bytes[0], KEM_TAG_XWING);
 
         let ct2 = TaggedCiphertext::from_bytes(bytes).unwrap();
-        assert_eq!(ct2.algorithm(), KemAlgorithm::XWing);
+        assert_eq!(ct2.algorithm().expect("algorithm"), KemAlgorithm::XWing);
     }
 
     #[test]
     fn mlkem_only_combiner_is_deterministic() {
-        let ss1 = combine_mlkem_only(&[0x42u8; 32]);
-        let ss2 = combine_mlkem_only(&[0x42u8; 32]);
+        let ss1 = combine_mlkem_only(&[0x42u8; 32]).expect("combine");
+        let ss2 = combine_mlkem_only(&[0x42u8; 32]).expect("combine");
         assert_eq!(ss1.as_bytes(), ss2.as_bytes());
     }
 
@@ -789,8 +843,8 @@ mod tests {
         // Same ML-KEM shared secret should produce different output
         // when processed through ML-KEM-only vs X-Wing combiner
         let ml_kem_ss = [0x42u8; 32];
-        let only_ss = combine_mlkem_only(&ml_kem_ss);
-        let xwing_ss = combine(&[0u8; 32], &ml_kem_ss);
+        let only_ss = combine_mlkem_only(&ml_kem_ss).expect("combine_mlkem_only");
+        let xwing_ss = combine(&[0u8; 32], &ml_kem_ss).expect("combine");
         assert_ne!(
             only_ss.as_bytes(),
             xwing_ss.as_bytes(),

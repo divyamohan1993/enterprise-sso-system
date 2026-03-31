@@ -100,7 +100,7 @@ async fn gateway_accepts_solved_puzzle() {
     let server_pk_bytes = challenge.xwing_server_pk.as_ref().expect("server PK in challenge");
     let server_pk = crypto::xwing::XWingPublicKey::from_bytes(server_pk_bytes)
         .expect("parse server X-Wing PK");
-    let (shared_secret, kem_ct) = crypto::xwing::xwing_encapsulate(&server_pk);
+    let (shared_secret, kem_ct) = crypto::xwing::xwing_encapsulate(&server_pk).expect("encapsulate");
     let kem_ct_bytes = kem_ct.to_bytes();
 
     // 3. Solve puzzle and send solution with KEM ciphertext
@@ -116,7 +116,7 @@ async fn gateway_accepts_solved_puzzle() {
     send_frame(&mut stream, &solution).await;
 
     // 4. Derive session key (both sides use the same shared secret)
-    let session_key = crypto::xwing::derive_session_key(&shared_secret, &challenge.nonce);
+    let session_key = crypto::xwing::derive_session_key(&shared_secret, &challenge.nonce).expect("derive_session_key");
     let enc_key: [u8; 32] = session_key[..32].try_into().unwrap();
 
     // 5. Encrypt and send auth request

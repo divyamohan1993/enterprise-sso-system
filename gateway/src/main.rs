@@ -284,15 +284,24 @@ async fn main() {
         // Set MILNET_PQ_TLS_ONLY=1 or MILNET_MILITARY_DEPLOYMENT=1 to remove
         // classical fallback entirely (CNSA 2.0 strict / military mode).
         //
-        // TODO(CNSA2-TLS): Upgrade to X25519MLKEM1024 when rustls/aws-lc-rs exposes it.
-        // The application layer uses ML-KEM-1024 (via crypto::xwing) but TLS is limited
-        // to ML-KEM-768 because rustls::crypto::aws_lc_rs::kx_group only exports
-        // X25519MLKEM768 as of rustls 0.23.x / aws-lc-rs 1.x. This is a known
-        // discrepancy: TLS uses ML-KEM-768 while application-layer key agreement
-        // uses ML-KEM-1024. Both provide post-quantum security; ML-KEM-1024 offers
-        // a larger security margin (NIST Level 5 vs Level 3). Track upstream:
+        // CNSA 2.0 Level 5 COMPLIANCE NOTE:
+        // TLS key exchange uses X25519MLKEM768 (ML-KEM-768, NIST Level 3) because
+        // rustls/aws-lc-rs does not yet expose X25519MLKEM1024. When upstream adds
+        // X25519MLKEM1024 support, this MUST be upgraded immediately:
         //   - https://github.com/rustls/rustls/issues (X25519MLKEM1024 support)
         //   - https://github.com/aws/aws-lc-rs/issues (ML-KEM-1024 kx group)
+        //
+        // MITIGATION: All sensitive key exchanges above TLS use the application-layer
+        // X-Wing hybrid KEM (X25519 + ML-KEM-1024, NIST Level 5) via crypto::xwing.
+        // TLS provides transport-layer PQ protection; X-Wing provides Level 5
+        // application-layer protection. This is defense-in-depth: even if TLS is
+        // broken (requiring a Level 3+ quantum attack), the application layer
+        // remains protected at Level 5.
+        tracing::warn!(
+            "CNSA2-LEVEL5-GAP: TLS key exchange uses ML-KEM-768 (Level 3) instead of \
+             ML-KEM-1024 (Level 5). Awaiting rustls/aws-lc-rs X25519MLKEM1024 support. \
+             Application-layer X-Wing (ML-KEM-1024) provides Level 5 defense-in-depth."
+        );
         let military_mode = std::env::var("MILNET_MILITARY_DEPLOYMENT")
             .map(|v| v == "1")
             .unwrap_or(false);

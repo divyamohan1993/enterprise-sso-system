@@ -441,8 +441,8 @@ fn envelope_key_version_validated() {
         EnvelopeError, CURRENT_KEK_VERSION,
     };
 
-    let kek = KeyEncryptionKey::generate();
-    let dek = DataEncryptionKey::generate();
+    let kek = KeyEncryptionKey::generate().expect("generate KEK");
+    let dek = DataEncryptionKey::generate().expect("generate DEK");
 
     // Wrap produces the current version.
     let wrapped = wrap_key(&kek, &dek).expect("wrap must succeed");

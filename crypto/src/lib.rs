@@ -47,6 +47,7 @@ pub mod verifiable_credentials;
 pub mod did;
 pub mod he_search;
 pub mod enclave;
+pub mod vrf;
 
 /// Run FIPS 140-3 startup KATs if FIPS mode is enabled.
 /// MUST be called before any cryptographic operation in production.

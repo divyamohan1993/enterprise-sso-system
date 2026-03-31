@@ -6,10 +6,12 @@
 //! the CA root.
 //!
 //! Certificate pinning is enforced on top of standard chain verification.
-//! After the CA chain is validated, the peer certificate's SHA-256 fingerprint
+//! After the CA chain is validated, the peer certificate's SHA-512 fingerprint
 //! is checked against a set of known-good pins. A valid chain but unknown
 //! fingerprint logs a CRITICAL warning (possible CA compromise) and rejects
 //! the connection.
+//!
+//! CNSA 2.0 Level 5: SHA-512 fingerprints (upgraded from SHA-256).
 
 use rcgen::{BasicConstraints, CertificateParams, CertifiedKey, IsCa, KeyPair, KeyUsagePurpose};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
@@ -18,7 +20,7 @@ use rustls::{
     ClientConfig, DigitallySignedStruct, DistinguishedName, Error, RootCertStore, ServerConfig,
     SignatureScheme,
 };
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha512};
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
@@ -28,24 +30,28 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 // Certificate fingerprint helpers
 // ---------------------------------------------------------------------------
 
-/// Compute the SHA-256 fingerprint of a DER-encoded certificate.
-pub fn compute_cert_fingerprint(cert_der: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
+/// Compute the SHA-512 fingerprint of a DER-encoded certificate.
+///
+/// CNSA 2.0 Level 5: SHA-512 (upgraded from SHA-256).
+pub fn compute_cert_fingerprint(cert_der: &[u8]) -> [u8; 64] {
+    let mut hasher = Sha512::new();
     hasher.update(cert_der);
     let result = hasher.finalize();
-    let mut fingerprint = [0u8; 32];
+    let mut fingerprint = [0u8; 64];
     fingerprint.copy_from_slice(&result);
     fingerprint
 }
 
-/// A set of pinned certificate SHA-256 fingerprints.
+/// A set of pinned certificate SHA-512 fingerprints.
 ///
 /// After standard CA chain verification succeeds, the peer certificate's
 /// fingerprint is checked against this set. If the fingerprint is not present,
 /// the connection is rejected with a CRITICAL log (indicates CA compromise).
+///
+/// CNSA 2.0 Level 5: SHA-512 fingerprints (64 bytes).
 #[derive(Clone)]
 pub struct CertificatePinSet {
-    pins: HashSet<[u8; 32]>,
+    pins: HashSet<[u8; 64]>,
 }
 
 impl fmt::Debug for CertificatePinSet {
@@ -64,8 +70,8 @@ impl CertificatePinSet {
         }
     }
 
-    /// Add a SHA-256 fingerprint to the pin set.
-    pub fn add_fingerprint(&mut self, fingerprint: [u8; 32]) {
+    /// Add a SHA-512 fingerprint to the pin set.
+    pub fn add_fingerprint(&mut self, fingerprint: [u8; 64]) {
         self.pins.insert(fingerprint);
     }
 
@@ -75,7 +81,7 @@ impl CertificatePinSet {
     }
 
     /// Check whether a certificate fingerprint is in the pin set.
-    pub fn contains(&self, fingerprint: &[u8; 32]) -> bool {
+    pub fn contains(&self, fingerprint: &[u8; 64]) -> bool {
         self.pins.contains(fingerprint)
     }
 
@@ -105,7 +111,7 @@ impl CertificatePinSet {
 /// Wraps a standard `WebPkiClientVerifier` and adds certificate pinning.
 ///
 /// After the inner verifier completes chain validation, the client certificate's
-/// SHA-256 fingerprint is checked against the `CertificatePinSet`.
+/// SHA-512 fingerprint is checked against the `CertificatePinSet`.
 struct PinnedClientCertVerifier {
     inner: Arc<dyn rustls::server::danger::ClientCertVerifier>,
     pin_set: CertificatePinSet,
@@ -180,7 +186,7 @@ impl rustls::server::danger::ClientCertVerifier for PinnedClientCertVerifier {
 /// Wraps a standard `WebPkiServerVerifier` and adds certificate pinning.
 ///
 /// After the inner verifier completes chain validation, the server certificate's
-/// SHA-256 fingerprint is checked against the `CertificatePinSet`.
+/// SHA-512 fingerprint is checked against the `CertificatePinSet`.
 struct PinnedServerCertVerifier {
     inner: Arc<dyn rustls::client::danger::ServerCertVerifier>,
     pin_set: CertificatePinSet,
@@ -425,7 +431,7 @@ pub fn client_tls_config(
 /// Create a TLS server config with mTLS and certificate pinning.
 ///
 /// The server will verify that clients present a certificate signed by `ca`
-/// **and** that the client certificate's SHA-256 fingerprint is in `pin_set`.
+/// **and** that the client certificate's SHA-512 fingerprint is in `pin_set`.
 pub fn server_tls_config_pinned(
     cert_key: &CertifiedKey,
     ca: &CertificateAuthority,
@@ -457,7 +463,7 @@ pub fn server_tls_config_pinned(
 /// Create a TLS client config with mTLS and certificate pinning.
 ///
 /// The client will verify that the server presents a certificate signed by `ca`
-/// **and** that the server certificate's SHA-256 fingerprint is in `pin_set`.
+/// **and** that the server certificate's SHA-512 fingerprint is in `pin_set`.
 pub fn client_tls_config_pinned(
     client_cert: &CertifiedKey,
     ca: &CertificateAuthority,

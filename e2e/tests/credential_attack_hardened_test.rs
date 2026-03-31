@@ -979,10 +979,10 @@ fn xwing_kem_different_keys_produce_different_shared_secrets() {
     let (pk_b, kp_b) = xwing_keygen();
 
     // Encapsulate against key pair A
-    let (ss_a, ct_a) = xwing_encapsulate(&pk_a);
+    let (ss_a, ct_a) = xwing_encapsulate(&pk_a).expect("encapsulate");
 
     // Encapsulate against key pair B
-    let (ss_b, _ct_b) = xwing_encapsulate(&pk_b);
+    let (ss_b, _ct_b) = xwing_encapsulate(&pk_b).expect("encapsulate");
 
     // Different key pairs must produce different shared secrets
     assert_ne!(
@@ -1019,7 +1019,7 @@ fn xwing_kem_different_keys_produce_different_shared_secrets() {
 
     // Two encapsulations against the same public key must produce different
     // shared secrets (ephemeral key randomness)
-    let (ss_a2, _ct_a2) = xwing_encapsulate(&pk_a);
+    let (ss_a2, _ct_a2) = xwing_encapsulate(&pk_a).expect("encapsulate");
     assert_ne!(
         ss_a.as_bytes(),
         ss_a2.as_bytes(),

@@ -6,12 +6,542 @@
 //! Also publishes events to an in-process broadcast channel so that SSE
 //! consumers (e.g. the admin `/api/admin/siem/stream` endpoint) can receive
 //! events in real time.
+//!
+//! # SIEM Macros for Unwrap/Expect Replacement
+//!
+//! The `siem_unwrap!` and `siem_expect!` macros replace `.unwrap()` and
+//! `.expect()` calls with SIEM-reporting error propagation. Instead of
+//! panicking, they emit a CRITICAL SIEM event with file:line context
+//! and propagate the error via `?`.
 #![forbid(unsafe_code)]
 
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{LazyLock, OnceLock};
+use std::sync::{LazyLock, Mutex, OnceLock};
 use uuid::Uuid;
+
+// ── SIEM Event Categories ──────────────────────────────────────────────────
+//
+// Machine-readable categories for filtering events in SIEM dashboards.
+
+/// SIEM event category constants for dashboard filtering.
+pub mod category {
+    /// Unwrap/panic replacement — runtime errors that would have crashed.
+    pub const RUNTIME_ERROR: &str = "RUNTIME_ERROR";
+    /// Cryptographic operation failures (encrypt, decrypt, sign, verify, KEM).
+    pub const CRYPTO_FAILURE: &str = "CRYPTO_FAILURE";
+    /// Authentication failures (login, token, OPAQUE, FIDO2).
+    pub const AUTH_FAILURE: &str = "AUTH_FAILURE";
+    /// Protocol-level violations (malformed messages, invalid state machines).
+    pub const PROTOCOL_VIOLATION: &str = "PROTOCOL_VIOLATION";
+    /// Quorum/threshold failures (FROST, Shamir, BFT).
+    pub const THRESHOLD_VIOLATION: &str = "THRESHOLD_VIOLATION";
+    /// Tamper detection / integrity check failures.
+    pub const INTEGRITY_VIOLATION: &str = "INTEGRITY_VIOLATION";
+    /// Network-level anomalies (connection failures, TLS errors, timeouts).
+    pub const NETWORK_ANOMALY: &str = "NETWORK_ANOMALY";
+    /// Authorization failures (forbidden, insufficient privilege).
+    pub const ACCESS_DENIED: &str = "ACCESS_DENIED";
+    /// Key lifecycle events (generation, rotation, destruction, compromise).
+    pub const KEY_MANAGEMENT: &str = "KEY_MANAGEMENT";
+    /// Compliance check failures (FIPS, STIG, CMMC, FedRAMP).
+    pub const COMPLIANCE_ALERT: &str = "COMPLIANCE_ALERT";
+}
+
+// ── SIEM Dashboard Panel ───────────────────────────────────────────────────
+
+/// Dashboard panel categories for grouping events in the SIEM UI.
+///
+/// Each panel corresponds to a logical section of the security operations
+/// dashboard, allowing operators to filter and triage events by domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SiemPanel {
+    /// Runtime errors (unwrap failures, unexpected states)
+    RuntimeErrors,
+    /// Cryptographic operation failures
+    CryptoFailures,
+    /// Authentication failures (login, token, ceremony)
+    AuthFailures,
+    /// Protocol violations (malformed requests, replay attempts)
+    ProtocolViolations,
+    /// Threshold/quorum violations
+    ThresholdViolations,
+    /// Integrity violations (tamper detection, canary)
+    IntegrityViolations,
+    /// Network anomalies (connection failures, timeouts)
+    NetworkAnomalies,
+    /// Access denied events
+    AccessDenied,
+    /// Key management events (rotation, derivation, destruction)
+    KeyManagement,
+    /// Compliance check results
+    ComplianceAlerts,
+    /// Signing witness events
+    SigningWitness,
+    /// Multi-region events
+    MultiRegion,
+    /// Distributed KMS events
+    DistributedKms,
+    /// Debug panel — all errors with file:line
+    DebugPanel,
+}
+
+impl SiemPanel {
+    /// Return a stable string identifier for dashboard filtering.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::RuntimeErrors => "runtime_errors",
+            Self::CryptoFailures => "crypto_failures",
+            Self::AuthFailures => "auth_failures",
+            Self::ProtocolViolations => "protocol_violations",
+            Self::ThresholdViolations => "threshold_violations",
+            Self::IntegrityViolations => "integrity_violations",
+            Self::NetworkAnomalies => "network_anomalies",
+            Self::AccessDenied => "access_denied",
+            Self::KeyManagement => "key_management",
+            Self::ComplianceAlerts => "compliance_alerts",
+            Self::SigningWitness => "signing_witness",
+            Self::MultiRegion => "multi_region",
+            Self::DistributedKms => "distributed_kms",
+            Self::DebugPanel => "debug_panel",
+        }
+    }
+
+    /// Return all panel variants (useful for dashboard enumeration).
+    pub fn all() -> &'static [SiemPanel] {
+        &[
+            SiemPanel::RuntimeErrors,
+            SiemPanel::CryptoFailures,
+            SiemPanel::AuthFailures,
+            SiemPanel::ProtocolViolations,
+            SiemPanel::ThresholdViolations,
+            SiemPanel::IntegrityViolations,
+            SiemPanel::NetworkAnomalies,
+            SiemPanel::AccessDenied,
+            SiemPanel::KeyManagement,
+            SiemPanel::ComplianceAlerts,
+            SiemPanel::SigningWitness,
+            SiemPanel::MultiRegion,
+            SiemPanel::DistributedKms,
+            SiemPanel::DebugPanel,
+        ]
+    }
+}
+
+// ── Severity levels for panel events ───────────────────────────────────────
+
+/// Severity level for SIEM panel events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum SiemSeverity {
+    Debug = 0,
+    Info = 1,
+    Warning = 2,
+    Error = 3,
+    Critical = 4,
+    Fatal = 5,
+}
+
+// ── Enhanced SIEM event with panel tagging ─────────────────────────────────
+
+/// A panel-tagged SIEM event carrying source location information.
+///
+/// Every event records the exact `file:line` and module path so that the
+/// debug panel can show operators where errors originate.
+#[derive(Debug, Clone, Serialize)]
+pub struct PanelSiemEvent {
+    /// Dashboard panel this event belongs to.
+    pub panel: SiemPanel,
+    /// Severity of the event.
+    pub severity: SiemSeverity,
+    /// Human-readable category string (e.g. "authentication", "crypto").
+    pub category: String,
+    /// Human-readable message describing the event.
+    pub message: String,
+    /// Source file where the event was emitted (from `file!()`).
+    pub source_file: &'static str,
+    /// Source line where the event was emitted (from `line!()`).
+    pub source_line: u32,
+    /// Module path where the event was emitted (from `module_path!()`).
+    pub source_module: &'static str,
+    /// Node identifier (hostname or configured node ID).
+    pub node_id: String,
+    /// Unix-epoch seconds when the event was created.
+    pub timestamp: i64,
+    /// Optional correlation ID for tracing across services.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    /// Optional structured details (arbitrary JSON).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+}
+
+/// Return the node ID for SIEM events (cached after first call).
+fn node_id() -> &'static str {
+    static NODE_ID: OnceLock<String> = OnceLock::new();
+    NODE_ID.get_or_init(|| {
+        std::env::var("MILNET_NODE_ID").unwrap_or_else(|_| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "unknown".to_string())
+        })
+    })
+}
+
+impl PanelSiemEvent {
+    /// Create a new panel SIEM event with automatic timestamp and node ID.
+    pub fn new(
+        panel: SiemPanel,
+        severity: SiemSeverity,
+        category: impl Into<String>,
+        message: impl Into<String>,
+        source_file: &'static str,
+        source_line: u32,
+        source_module: &'static str,
+    ) -> Self {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        Self {
+            panel,
+            severity,
+            category: category.into(),
+            message: message.into(),
+            source_file,
+            source_line,
+            source_module,
+            node_id: node_id().to_string(),
+            timestamp,
+            correlation_id: None,
+            details: None,
+        }
+    }
+
+    /// Set a correlation ID for distributed tracing.
+    pub fn with_correlation_id(mut self, id: impl Into<String>) -> Self {
+        self.correlation_id = Some(id.into());
+        self
+    }
+
+    /// Set structured JSON details.
+    pub fn with_details(mut self, details: serde_json::Value) -> Self {
+        self.details = Some(details);
+        self
+    }
+
+    /// Emit this panel event: broadcast on the SIEM bus, forward to webhook,
+    /// and log via tracing.  Respects per-panel rate limiting.
+    pub fn emit(self) {
+        // Rate-limit: deduplicate identical events within window
+        if !panel_rate_limiter_allow(&self) {
+            return;
+        }
+
+        let json = serde_json::to_string(&self).unwrap_or_else(|_| "{}".to_string());
+        tracing::info!(target: "siem", panel = %self.panel.as_str(), severity = ?self.severity, "{}", json);
+
+        // Bridge to the legacy SiemEvent broadcast bus
+        let legacy = SiemEvent {
+            timestamp: self.timestamp,
+            severity: match self.severity {
+                SiemSeverity::Debug => 0,
+                SiemSeverity::Info => 2,
+                SiemSeverity::Warning => 6,
+                SiemSeverity::Error => 7,
+                SiemSeverity::Critical => 10,
+                SiemSeverity::Fatal => 10,
+            },
+            event_type: format!("{}:{}", self.panel.as_str(), self.category),
+            json: json.clone(),
+        };
+
+        broadcast_event(&legacy);
+        crate::siem_webhook::queue_global_event(&json);
+
+        // Alert on high-severity events
+        if legacy.severity >= 7 {
+            process_alert(&legacy);
+        }
+    }
+}
+
+// ── Per-panel rate limiting / deduplication ─────────────────────────────────
+
+/// Deduplication window in seconds.  Events with the same panel + message
+/// within this window are suppressed after the first occurrence.
+const DEDUP_WINDOW_SECS: i64 = 60;
+
+/// Key for deduplication: (panel, message_hash).
+type DedupKey = (SiemPanel, u64);
+
+struct DedupEntry {
+    first_seen: i64,
+    count: u64,
+}
+
+static PANEL_DEDUP: LazyLock<Mutex<HashMap<DedupKey, DedupEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Hash a message string for dedup keying (fast, non-cryptographic FNV-1a).
+fn hash_message(msg: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in msg.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Check whether this event should be emitted (true) or suppressed (false).
+fn panel_rate_limiter_allow(event: &PanelSiemEvent) -> bool {
+    let key: DedupKey = (event.panel, hash_message(&event.message));
+    let now = event.timestamp;
+
+    let mut map = match PANEL_DEDUP.lock() {
+        Ok(m) => m,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    // GC expired entries when map grows large (amortised)
+    if map.len() > 1000 {
+        map.retain(|_, v| now - v.first_seen < DEDUP_WINDOW_SECS);
+    }
+
+    match map.get_mut(&key) {
+        Some(entry) if now - entry.first_seen < DEDUP_WINDOW_SECS => {
+            entry.count += 1;
+            false // suppress duplicate
+        }
+        _ => {
+            map.insert(key, DedupEntry { first_seen: now, count: 1 });
+            true
+        }
+    }
+}
+
+/// Reset the dedup state (for testing).
+#[cfg(test)]
+pub fn reset_panel_dedup() {
+    let mut map = PANEL_DEDUP.lock().unwrap_or_else(|p| p.into_inner());
+    map.clear();
+}
+
+// ── siem_event! macro ─────────────────────────────────────────────────────
+
+/// Emit a SIEM event with automatic source location capture.
+///
+/// # Usage
+/// ```ignore
+/// siem_event!(SiemPanel::AuthFailures, SiemSeverity::Error, "login failed");
+/// siem_event!(SiemPanel::CryptoFailures, SiemSeverity::Critical, "key derive failed", json!({"algo": "AES"}));
+/// ```
+#[macro_export]
+macro_rules! siem_event {
+    ($panel:expr, $severity:expr, $msg:expr) => {{
+        let event = $crate::siem::PanelSiemEvent::new(
+            $panel,
+            $severity,
+            stringify!($panel),
+            $msg,
+            file!(),
+            line!(),
+            module_path!(),
+        );
+        event.emit();
+    }};
+    ($panel:expr, $severity:expr, $msg:expr, $details:expr) => {{
+        let event = $crate::siem::PanelSiemEvent::new(
+            $panel,
+            $severity,
+            stringify!($panel),
+            $msg,
+            file!(),
+            line!(),
+            module_path!(),
+        )
+        .with_details($details);
+        event.emit();
+    }};
+}
+
+// ── SIEM error reporting helper ────────────────────────────────────────────
+
+/// Emit a SIEM event for a runtime error (unwrap/expect/panic replacement).
+///
+/// This is the backing function for `siem_unwrap!` and `siem_expect!`.
+/// It creates and emits a `SecurityEvent` with full source location context.
+pub fn emit_runtime_error(
+    siem_category: &'static str,
+    context: &str,
+    error_detail: &str,
+    file: &str,
+    line: u32,
+    column: u32,
+    module: &str,
+) {
+    let detail = format!(
+        "{}:{}: {} — {} [module={}, col={}]",
+        file, line, context, error_detail, module, column
+    );
+
+    let event = SecurityEvent {
+        timestamp: SecurityEvent::now_iso8601(),
+        category: siem_category,
+        action: "runtime_error",
+        severity: Severity::Critical,
+        outcome: "failure",
+        user_id: None,
+        source_ip: None,
+        detail: Some(detail),
+    };
+    event.emit();
+}
+
+// ── siem_unwrap! macro ─────────────────────────────────────────────────────
+
+/// Replace `.unwrap()` on `Result<T, E>` with SIEM-reported error propagation.
+///
+/// On `Err(e)`, emits a CRITICAL SIEM event with file:line:column context,
+/// then propagates via `?` (the enclosing function must return `Result`).
+///
+/// # Usage
+/// ```ignore
+/// let val = siem_unwrap!(some_result, "decrypting DEK");
+/// let val = siem_unwrap!(some_result, "signing JWT", CRYPTO_FAILURE);
+/// ```
+#[macro_export]
+macro_rules! siem_unwrap {
+    ($expr:expr, $context:expr) => {
+        match $expr {
+            Ok(v) => v,
+            Err(e) => {
+                let err_msg = format!("{}", e);
+                $crate::siem::emit_runtime_error(
+                    $crate::siem::category::RUNTIME_ERROR,
+                    $context,
+                    &err_msg,
+                    file!(),
+                    line!(),
+                    column!(),
+                    module_path!(),
+                );
+                // Also emit to panel system for dashboard visibility
+                let _panel_evt = $crate::siem::PanelSiemEvent::new(
+                    $crate::siem::SiemPanel::DebugPanel,
+                    $crate::siem::SiemSeverity::Error,
+                    "runtime_error",
+                    &format!("{}: {}", $context, err_msg),
+                    file!(),
+                    line!(),
+                    module_path!(),
+                );
+                _panel_evt.emit();
+                return Err(format!("{}:{}: {}: {}", file!(), line!(), $context, e));
+            }
+        }
+    };
+    ($expr:expr, $context:expr, $category:ident) => {
+        match $expr {
+            Ok(v) => v,
+            Err(e) => {
+                let err_msg = format!("{}", e);
+                $crate::siem::emit_runtime_error(
+                    $crate::siem::category::$category,
+                    $context,
+                    &err_msg,
+                    file!(),
+                    line!(),
+                    column!(),
+                    module_path!(),
+                );
+                let _panel_evt = $crate::siem::PanelSiemEvent::new(
+                    $crate::siem::SiemPanel::DebugPanel,
+                    $crate::siem::SiemSeverity::Error,
+                    "runtime_error",
+                    &format!("{}: {}", $context, err_msg),
+                    file!(),
+                    line!(),
+                    module_path!(),
+                );
+                _panel_evt.emit();
+                return Err(format!("{}:{}: {}: {}", file!(), line!(), $context, e));
+            }
+        }
+    };
+}
+
+/// Replace `.unwrap()` on `Option<T>` with SIEM-reported error propagation.
+///
+/// On `None`, emits a CRITICAL SIEM event with file:line:column context,
+/// then propagates via `?` (the enclosing function must return `Result`).
+///
+/// # Usage
+/// ```ignore
+/// let val = siem_expect!(some_option, "loading KEK from keyring");
+/// let val = siem_expect!(some_option, "parsing KEM ciphertext", CRYPTO_FAILURE);
+/// ```
+#[macro_export]
+macro_rules! siem_expect {
+    ($expr:expr, $context:expr) => {
+        match $expr {
+            Some(v) => v,
+            None => {
+                $crate::siem::emit_runtime_error(
+                    $crate::siem::category::RUNTIME_ERROR,
+                    $context,
+                    "None",
+                    file!(),
+                    line!(),
+                    column!(),
+                    module_path!(),
+                );
+                let _panel_evt = $crate::siem::PanelSiemEvent::new(
+                    $crate::siem::SiemPanel::DebugPanel,
+                    $crate::siem::SiemSeverity::Error,
+                    "runtime_error",
+                    &format!("{}: value was None", $context),
+                    file!(),
+                    line!(),
+                    module_path!(),
+                );
+                _panel_evt.emit();
+                return Err(format!("{}:{}: {}: None", file!(), line!(), $context));
+            }
+        }
+    };
+    ($expr:expr, $context:expr, $category:ident) => {
+        match $expr {
+            Some(v) => v,
+            None => {
+                $crate::siem::emit_runtime_error(
+                    $crate::siem::category::$category,
+                    $context,
+                    "None",
+                    file!(),
+                    line!(),
+                    column!(),
+                    module_path!(),
+                );
+                let _panel_evt = $crate::siem::PanelSiemEvent::new(
+                    $crate::siem::SiemPanel::DebugPanel,
+                    $crate::siem::SiemSeverity::Error,
+                    "runtime_error",
+                    &format!("{}: value was None", $context),
+                    file!(),
+                    line!(),
+                    module_path!(),
+                );
+                _panel_evt.emit();
+                return Err(format!("{}:{}: {}: None", file!(), line!(), $context));
+            }
+        }
+    };
+}
 
 // ── Webhook thread pool limiter ─────────────────────────────────────────────
 static ACTIVE_WEBHOOK_THREADS: AtomicUsize = AtomicUsize::new(0);
@@ -863,5 +1393,327 @@ impl SecurityEvent {
         if siem_event.severity >= 7 {
             process_alert(&siem_event);
         }
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── SiemPanel serialization ────────────────────────────────────────────
+
+    #[test]
+    fn test_siem_panel_serializes_all_variants() {
+        let panels = SiemPanel::all();
+        let expected = [
+            "runtime_errors",
+            "crypto_failures",
+            "auth_failures",
+            "protocol_violations",
+            "threshold_violations",
+            "integrity_violations",
+            "network_anomalies",
+            "access_denied",
+            "key_management",
+            "compliance_alerts",
+            "signing_witness",
+            "multi_region",
+            "distributed_kms",
+            "debug_panel",
+        ];
+        assert_eq!(panels.len(), expected.len(), "panel count mismatch");
+        for (panel, expect) in panels.iter().zip(expected.iter()) {
+            let json = serde_json::to_string(panel).unwrap();
+            assert_eq!(json, format!("\"{}\"", expect), "panel {:?} serialized wrong", panel);
+            assert_eq!(panel.as_str(), *expect);
+        }
+    }
+
+    #[test]
+    fn test_all_panel_variants_are_distinct() {
+        let panels = SiemPanel::all();
+        let mut seen = std::collections::HashSet::new();
+        for p in panels {
+            assert!(seen.insert(p), "duplicate panel: {:?}", p);
+        }
+        assert_eq!(seen.len(), 14);
+    }
+
+    // ── SiemSeverity serialization ─────────────────────────────────────────
+
+    #[test]
+    fn test_siem_severity_serializes() {
+        assert_eq!(serde_json::to_string(&SiemSeverity::Debug).unwrap(), "\"DEBUG\"");
+        assert_eq!(serde_json::to_string(&SiemSeverity::Info).unwrap(), "\"INFO\"");
+        assert_eq!(serde_json::to_string(&SiemSeverity::Warning).unwrap(), "\"WARNING\"");
+        assert_eq!(serde_json::to_string(&SiemSeverity::Error).unwrap(), "\"ERROR\"");
+        assert_eq!(serde_json::to_string(&SiemSeverity::Critical).unwrap(), "\"CRITICAL\"");
+        assert_eq!(serde_json::to_string(&SiemSeverity::Fatal).unwrap(), "\"FATAL\"");
+    }
+
+    #[test]
+    fn test_siem_severity_ordering() {
+        assert!(SiemSeverity::Debug < SiemSeverity::Info);
+        assert!(SiemSeverity::Info < SiemSeverity::Warning);
+        assert!(SiemSeverity::Warning < SiemSeverity::Error);
+        assert!(SiemSeverity::Error < SiemSeverity::Critical);
+        assert!(SiemSeverity::Critical < SiemSeverity::Fatal);
+    }
+
+    // ── siem_event! macro captures file:line ───────────────────────────────
+
+    #[test]
+    fn test_siem_event_macro_captures_source_location() {
+        reset_panel_dedup();
+
+        // Construct event manually with same mechanism as the macro
+        let event = PanelSiemEvent::new(
+            SiemPanel::AuthFailures,
+            SiemSeverity::Error,
+            "SiemPanel::AuthFailures",
+            "test login failed",
+            file!(),
+            line!(),
+            module_path!(),
+        );
+
+        assert_eq!(event.panel, SiemPanel::AuthFailures);
+        assert_eq!(event.severity, SiemSeverity::Error);
+        assert!(event.source_file.contains("siem.rs"), "file should contain siem.rs, got {}", event.source_file);
+        assert!(event.source_line > 0, "line should be non-zero");
+        assert!(event.source_module.contains("siem"), "module should contain siem, got {}", event.source_module);
+        assert_eq!(event.message, "test login failed");
+    }
+
+    #[test]
+    fn test_siem_event_macro_with_details() {
+        reset_panel_dedup();
+
+        let event = PanelSiemEvent::new(
+            SiemPanel::CryptoFailures,
+            SiemSeverity::Critical,
+            "SiemPanel::CryptoFailures",
+            "key derive failed",
+            file!(),
+            line!(),
+            module_path!(),
+        )
+        .with_details(serde_json::json!({"algo": "AES-256-GCM"}));
+
+        assert_eq!(event.panel, SiemPanel::CryptoFailures);
+        let details = event.details.unwrap();
+        assert_eq!(details["algo"], "AES-256-GCM");
+    }
+
+    // ── PanelSiemEvent serialization includes all fields ───────────────────
+
+    #[test]
+    fn test_panel_siem_event_serialization() {
+        let event = PanelSiemEvent {
+            panel: SiemPanel::NetworkAnomalies,
+            severity: SiemSeverity::Warning,
+            category: "network".to_string(),
+            message: "connection timeout".to_string(),
+            source_file: "src/net.rs",
+            source_line: 42,
+            source_module: "common::net",
+            node_id: "node-1".to_string(),
+            timestamp: 1700000000,
+            correlation_id: Some("corr-abc".to_string()),
+            details: Some(serde_json::json!({"peer": "10.0.0.1"})),
+        };
+
+        let json: serde_json::Value = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["panel"], "network_anomalies");
+        assert_eq!(json["severity"], "WARNING");
+        assert_eq!(json["source_file"], "src/net.rs");
+        assert_eq!(json["source_line"], 42);
+        assert_eq!(json["source_module"], "common::net");
+        assert_eq!(json["node_id"], "node-1");
+        assert_eq!(json["correlation_id"], "corr-abc");
+        assert_eq!(json["details"]["peer"], "10.0.0.1");
+    }
+
+    // ── siem_unwrap on Ok returns value ────────────────────────────────────
+
+    #[test]
+    fn test_siem_unwrap_ok_returns_value() {
+        reset_panel_dedup();
+
+        fn inner() -> Result<i32, String> {
+            let val: Result<i32, String> = Ok(42);
+            let v = siem_unwrap!(val, "test unwrap");
+            Ok(v)
+        }
+        assert_eq!(inner().unwrap(), 42);
+    }
+
+    // ── siem_unwrap on Err emits event ─────────────────────────────────────
+
+    #[test]
+    fn test_siem_unwrap_err_emits_event_and_returns_err() {
+        reset_panel_dedup();
+
+        fn inner() -> Result<i32, String> {
+            let val: Result<i32, &str> = Err("bad key");
+            let _v = siem_unwrap!(val, "decrypting DEK");
+            Ok(0)
+        }
+        let result = inner();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("decrypting DEK"), "error should contain context, got: {}", err);
+        assert!(err.contains("bad key"), "error should contain original error, got: {}", err);
+        // file:line is embedded in the error string
+        assert!(err.contains("siem.rs:"), "error should contain file:line, got: {}", err);
+    }
+
+    // ── siem_expect on Some returns value ──────────────────────────────────
+
+    #[test]
+    fn test_siem_expect_some_returns_value() {
+        reset_panel_dedup();
+
+        fn inner() -> Result<i32, String> {
+            let val: Option<i32> = Some(99);
+            let v = siem_expect!(val, "loading config");
+            Ok(v)
+        }
+        assert_eq!(inner().unwrap(), 99);
+    }
+
+    // ── siem_expect on None emits event ────────────────────────────────────
+
+    #[test]
+    fn test_siem_expect_none_emits_event_and_returns_err() {
+        reset_panel_dedup();
+
+        fn inner() -> Result<i32, String> {
+            let val: Option<i32> = None;
+            let _v = siem_expect!(val, "loading KEK");
+            Ok(0)
+        }
+        let result = inner();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("loading KEK"), "error should contain context, got: {}", err);
+        assert!(err.contains("None"), "error should contain None, got: {}", err);
+    }
+
+    // ── Event batching deduplicates within window ──────────────────────────
+
+    #[test]
+    fn test_event_batching_deduplicates_within_window() {
+        reset_panel_dedup();
+
+        // First event should be allowed
+        let e1 = PanelSiemEvent::new(
+            SiemPanel::RuntimeErrors,
+            SiemSeverity::Error,
+            "test",
+            "same message",
+            file!(),
+            line!(),
+            module_path!(),
+        );
+        assert!(panel_rate_limiter_allow(&e1), "first event should pass");
+
+        // Second identical event within window should be suppressed
+        let e2 = PanelSiemEvent::new(
+            SiemPanel::RuntimeErrors,
+            SiemSeverity::Error,
+            "test",
+            "same message",
+            file!(),
+            line!(),
+            module_path!(),
+        );
+        assert!(!panel_rate_limiter_allow(&e2), "duplicate event should be suppressed");
+
+        // Different message should pass
+        let e3 = PanelSiemEvent::new(
+            SiemPanel::RuntimeErrors,
+            SiemSeverity::Error,
+            "test",
+            "different message",
+            file!(),
+            line!(),
+            module_path!(),
+        );
+        assert!(panel_rate_limiter_allow(&e3), "different message should pass");
+
+        // Different panel with same message should pass
+        let e4 = PanelSiemEvent::new(
+            SiemPanel::CryptoFailures,
+            SiemSeverity::Error,
+            "test",
+            "same message",
+            file!(),
+            line!(),
+            module_path!(),
+        );
+        assert!(panel_rate_limiter_allow(&e4), "different panel should pass");
+    }
+
+    #[test]
+    fn test_event_batching_allows_after_window_expires() {
+        reset_panel_dedup();
+
+        let mut e1 = PanelSiemEvent::new(
+            SiemPanel::DebugPanel,
+            SiemSeverity::Error,
+            "test",
+            "expiry test msg",
+            file!(),
+            line!(),
+            module_path!(),
+        );
+        // Set timestamp in the past beyond the dedup window
+        e1.timestamp = 1000;
+        assert!(panel_rate_limiter_allow(&e1), "first event should pass");
+
+        // Second event with timestamp beyond window
+        let mut e2 = PanelSiemEvent::new(
+            SiemPanel::DebugPanel,
+            SiemSeverity::Error,
+            "test",
+            "expiry test msg",
+            file!(),
+            line!(),
+            module_path!(),
+        );
+        e2.timestamp = 1000 + DEDUP_WINDOW_SECS + 1;
+        assert!(panel_rate_limiter_allow(&e2), "event after window should pass");
+    }
+
+    // ── PanelSiemEvent with_correlation_id ─────────────────────────────────
+
+    #[test]
+    fn test_panel_event_correlation_id() {
+        let event = PanelSiemEvent::new(
+            SiemPanel::MultiRegion,
+            SiemSeverity::Info,
+            "multi_region",
+            "region sync",
+            file!(),
+            line!(),
+            module_path!(),
+        )
+        .with_correlation_id("req-12345");
+
+        assert_eq!(event.correlation_id.as_deref(), Some("req-12345"));
+    }
+
+    // ── hash_message produces different hashes ─────────────────────────────
+
+    #[test]
+    fn test_hash_message_distinct() {
+        let h1 = hash_message("alpha");
+        let h2 = hash_message("beta");
+        let h3 = hash_message("alpha");
+        assert_ne!(h1, h2);
+        assert_eq!(h1, h3);
     }
 }

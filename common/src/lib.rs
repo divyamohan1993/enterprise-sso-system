@@ -93,12 +93,16 @@ pub mod distributed_session;
 
 // ── Distributed consensus, cluster coordination, and auto-healing ──
 pub mod raft;
+pub mod vector_clock;
+pub mod quorum_cert;
+pub mod fencing;
 pub mod cluster;
 pub mod cluster_roles;
 pub mod auto_heal;
 pub mod binary_attestation_mesh;
 pub mod code_healing;
 pub mod threshold_kek;
+pub mod distributed_kms;
 
 // ── Privileged Identity Management (just-in-time elevation) ──
 pub mod pim;
@@ -182,3 +186,26 @@ pub mod deadline;
 
 // ── Log pseudonymization for sensitive identifiers ──
 pub mod log_pseudonym;
+
+// ── Distributed signing witness protocol ──
+pub mod signing_witness;
+
+// ── Distributed startup verification (mandatory cluster attestation) ──
+pub mod distributed_startup;
+
+// ── Distributed state chain for mutable state integrity ──
+pub mod state_chain;
+
+// ── Multi-region active-active deployment ──
+pub mod multi_region;
+
+// ── SWIM-style gossip protocol for failure detection ──
+pub mod gossip;
+
+// ── Distributed systems primitives ──
+pub mod crdt;
+pub mod anti_entropy;
+pub mod consistent_hash;
+pub mod proactive_sharing;
+pub mod sybil_resistance;
+pub mod atomic_broadcast;

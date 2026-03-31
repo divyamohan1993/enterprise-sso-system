@@ -566,7 +566,6 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "sha1",
  "sha2",
  "sqlx",
  "subtle",
@@ -994,6 +993,7 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "audit",
+ "base64",
  "common",
  "crypto",
  "ed25519-dalek",

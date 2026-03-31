@@ -86,12 +86,23 @@ impl core::fmt::Debug for DataEncryptionKey {
 
 impl DataEncryptionKey {
     /// Generate a fresh DEK from the OS CSPRNG (`getrandom`).
-    pub fn generate() -> Self {
+    ///
+    /// Returns `Err` with SIEM reporting if the OS CSPRNG is unavailable.
+    pub fn generate() -> Result<Self, EnvelopeError> {
         let mut key = [0u8; KEY_LEN];
-        if getrandom::getrandom(&mut key).is_err() {
-            panic!("FATAL: OS CSPRNG unavailable — cannot generate data encryption key safely");
-        }
-        Self(key)
+        getrandom::getrandom(&mut key).map_err(|e| {
+            common::siem::emit_runtime_error(
+                common::siem::category::CRYPTO_FAILURE,
+                "OS CSPRNG unavailable — cannot generate DEK",
+                &format!("{e}"),
+                file!(),
+                line!(),
+                column!(),
+                module_path!(),
+            );
+            EnvelopeError::EncryptionFailed
+        })?;
+        Ok(Self(key))
     }
 
     /// Construct from an existing 32-byte array.
@@ -115,12 +126,23 @@ pub struct KeyEncryptionKey([u8; KEY_LEN]);
 
 impl KeyEncryptionKey {
     /// Generate a fresh KEK from the OS CSPRNG (`getrandom`).
-    pub fn generate() -> Self {
+    ///
+    /// Returns `Err` with SIEM reporting if the OS CSPRNG is unavailable.
+    pub fn generate() -> Result<Self, EnvelopeError> {
         let mut key = [0u8; KEY_LEN];
-        if getrandom::getrandom(&mut key).is_err() {
-            panic!("FATAL: OS CSPRNG unavailable — cannot generate key encryption key safely");
-        }
-        Self(key)
+        getrandom::getrandom(&mut key).map_err(|e| {
+            common::siem::emit_runtime_error(
+                common::siem::category::CRYPTO_FAILURE,
+                "OS CSPRNG unavailable — cannot generate KEK",
+                &format!("{e}"),
+                file!(),
+                line!(),
+                column!(),
+                module_path!(),
+            );
+            EnvelopeError::EncryptionFailed
+        })?;
+        Ok(Self(key))
     }
 
     /// Construct from an existing 32-byte array.
@@ -239,9 +261,18 @@ pub fn wrap_key(
     dek: &DataEncryptionKey,
 ) -> Result<WrappedKey, EnvelopeError> {
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    if getrandom::getrandom(&mut nonce_bytes).is_err() {
-        panic!("FATAL: OS CSPRNG unavailable — cannot generate nonce for key wrapping");
-    }
+    getrandom::getrandom(&mut nonce_bytes).map_err(|e| {
+        common::siem::emit_runtime_error(
+            common::siem::category::CRYPTO_FAILURE,
+            "OS CSPRNG unavailable — cannot generate nonce for key wrapping",
+            &format!("{e}"),
+            file!(),
+            line!(),
+            column!(),
+            module_path!(),
+        );
+        EnvelopeError::EncryptionFailed
+    })?;
 
     let cipher = Aes256Gcm::new(GenericArray::from_slice(&kek.0));
     let nonce = Nonce::from_slice(&nonce_bytes);
@@ -346,7 +377,7 @@ mod tests {
     /// Helper: generate a DEK and encrypt/decrypt round-trip.
     #[test]
     fn round_trip_encrypt_decrypt() {
-        let dek = DataEncryptionKey::generate();
+        let dek = DataEncryptionKey::generate().expect("generate DEK");
         let plaintext = b"TOP SECRET: launch codes alpha-7";
         let aad = build_aad("credentials", "secret", b"row-42");
 
@@ -358,7 +389,7 @@ mod tests {
 
     #[test]
     fn round_trip_empty_plaintext() {
-        let dek = DataEncryptionKey::generate();
+        let dek = DataEncryptionKey::generate().expect("generate DEK");
         let aad = b"context";
 
         let sealed = encrypt(&dek, b"", aad).expect("encrypt");
@@ -369,7 +400,7 @@ mod tests {
 
     #[test]
     fn aad_mismatch_fails() {
-        let dek = DataEncryptionKey::generate();
+        let dek = DataEncryptionKey::generate().expect("generate DEK");
         let plaintext = b"sensitive payload";
         let aad_good = build_aad("users", "password_hash", b"u-1");
         let aad_bad = build_aad("users", "password_hash", b"u-2");
@@ -382,8 +413,8 @@ mod tests {
 
     #[test]
     fn wrong_key_fails() {
-        let dek1 = DataEncryptionKey::generate();
-        let dek2 = DataEncryptionKey::generate();
+        let dek1 = DataEncryptionKey::generate().expect("generate DEK");
+        let dek2 = DataEncryptionKey::generate().expect("generate DEK");
         let plaintext = b"classified data";
         let aad = b"context";
 
@@ -395,7 +426,7 @@ mod tests {
 
     #[test]
     fn nonce_uniqueness() {
-        let dek = DataEncryptionKey::generate();
+        let dek = DataEncryptionKey::generate().expect("generate DEK");
         let plaintext = b"same plaintext twice";
         let aad = b"same aad";
 
@@ -414,8 +445,8 @@ mod tests {
 
     #[test]
     fn key_wrap_unwrap_round_trip() {
-        let kek = KeyEncryptionKey::generate();
-        let dek = DataEncryptionKey::generate();
+        let kek = KeyEncryptionKey::generate().expect("generate KEK");
+        let dek = DataEncryptionKey::generate().expect("generate DEK");
         let original_bytes = *dek.as_bytes();
 
         let wrapped = wrap_key(&kek, &dek).expect("wrap");
@@ -426,9 +457,9 @@ mod tests {
 
     #[test]
     fn wrong_kek_fails() {
-        let kek1 = KeyEncryptionKey::generate();
-        let kek2 = KeyEncryptionKey::generate();
-        let dek = DataEncryptionKey::generate();
+        let kek1 = KeyEncryptionKey::generate().expect("generate KEK");
+        let kek2 = KeyEncryptionKey::generate().expect("generate KEK");
+        let dek = DataEncryptionKey::generate().expect("generate DEK");
 
         let wrapped = wrap_key(&kek1, &dek).expect("wrap");
         let result = unwrap_key(&kek2, &wrapped);
@@ -467,7 +498,7 @@ mod tests {
 
     #[test]
     fn sealed_data_round_trip_serialization() {
-        let dek = DataEncryptionKey::generate();
+        let dek = DataEncryptionKey::generate().expect("generate DEK");
         let plaintext = b"serialization test";
         let aad = b"ctx";
 
@@ -481,8 +512,8 @@ mod tests {
 
     #[test]
     fn wrapped_key_round_trip_serialization() {
-        let kek = KeyEncryptionKey::generate();
-        let dek = DataEncryptionKey::generate();
+        let kek = KeyEncryptionKey::generate().expect("generate KEK");
+        let dek = DataEncryptionKey::generate().expect("generate DEK");
         let original_bytes = *dek.as_bytes();
 
         let wrapped = wrap_key(&kek, &dek).expect("wrap");
@@ -502,7 +533,7 @@ mod tests {
 
     #[test]
     fn sealed_data_nonce_accessor() {
-        let dek = DataEncryptionKey::generate();
+        let dek = DataEncryptionKey::generate().expect("generate DEK");
         let sealed = encrypt(&dek, b"data", b"aad").expect("encrypt");
 
         let nonce = sealed.nonce();
@@ -523,7 +554,7 @@ mod tests {
         let raw = [0xCDu8; KEY_LEN];
         let kek = KeyEncryptionKey::from_bytes(raw);
         // Verify via wrap/unwrap that the key works.
-        let dek = DataEncryptionKey::generate();
+        let dek = DataEncryptionKey::generate().expect("generate DEK");
         let wrapped = wrap_key(&kek, &dek).expect("wrap");
         let recovered = unwrap_key(&kek, &wrapped).expect("unwrap");
         assert_eq!(recovered.as_bytes(), dek.as_bytes());
@@ -531,7 +562,7 @@ mod tests {
 
     #[test]
     fn tampered_ciphertext_fails() {
-        let dek = DataEncryptionKey::generate();
+        let dek = DataEncryptionKey::generate().expect("generate DEK");
         let aad = b"integrity check";
         let sealed = encrypt(&dek, b"tamper me", aad).expect("encrypt");
 
@@ -551,7 +582,7 @@ mod tests {
     #[test]
     fn test_envelope_aegis256_roundtrip() {
         common::fips::set_fips_mode_unchecked(false);
-        let dek = DataEncryptionKey::generate();
+        let dek = DataEncryptionKey::generate().expect("generate DEK");
         let plaintext = b"aegis-256-envelope-test-data";
         let aad = build_aad("users", "secret", b"u-aegis-1");
 
@@ -568,7 +599,7 @@ mod tests {
     #[test]
     fn test_envelope_fips_fallback() {
         common::fips::set_fips_mode_unchecked(true);
-        let dek = DataEncryptionKey::generate();
+        let dek = DataEncryptionKey::generate().expect("generate DEK");
         let plaintext = b"fips-envelope-test-data";
         let aad = build_aad("users", "secret", b"u-fips-1");
 
@@ -587,8 +618,8 @@ mod tests {
 
     #[test]
     fn test_wrap_key_produces_version_prefix() {
-        let kek = KeyEncryptionKey::generate();
-        let dek = DataEncryptionKey::generate();
+        let kek = KeyEncryptionKey::generate().expect("generate KEK");
+        let dek = DataEncryptionKey::generate().expect("generate DEK");
 
         let wrapped = wrap_key(&kek, &dek).expect("wrap");
         let raw = wrapped.to_bytes();
@@ -602,8 +633,8 @@ mod tests {
 
     #[test]
     fn test_unwrap_key_extracts_and_validates_version() {
-        let kek = KeyEncryptionKey::generate();
-        let dek = DataEncryptionKey::generate();
+        let kek = KeyEncryptionKey::generate().expect("generate KEK");
+        let dek = DataEncryptionKey::generate().expect("generate DEK");
 
         let wrapped = wrap_key(&kek, &dek).expect("wrap");
         // unwrap_key must succeed and return the original DEK.
@@ -613,8 +644,8 @@ mod tests {
 
     #[test]
     fn test_invalid_version_causes_unwrap_failure() {
-        let kek = KeyEncryptionKey::generate();
-        let dek = DataEncryptionKey::generate();
+        let kek = KeyEncryptionKey::generate().expect("generate KEK");
+        let dek = DataEncryptionKey::generate().expect("generate DEK");
 
         let wrapped = wrap_key(&kek, &dek).expect("wrap");
         let mut raw = wrapped.to_bytes().to_vec();
@@ -636,8 +667,8 @@ mod tests {
 
     #[test]
     fn test_wrap_unwrap_round_trip_preserves_key() {
-        let kek = KeyEncryptionKey::generate();
-        let dek = DataEncryptionKey::generate();
+        let kek = KeyEncryptionKey::generate().expect("generate KEK");
+        let dek = DataEncryptionKey::generate().expect("generate DEK");
         let original = *dek.as_bytes();
 
         let wrapped = wrap_key(&kek, &dek).expect("wrap");
@@ -655,7 +686,7 @@ mod tests {
         // Build a legacy AES-256-GCM blob (no algo_id prefix): nonce (12) || ct+tag
         // Legacy untagged ciphertext is no longer accepted after fallback removal.
         common::fips::set_fips_mode_unchecked(false);
-        let dek = DataEncryptionKey::generate();
+        let dek = DataEncryptionKey::generate().expect("generate DEK");
         let plaintext = b"legacy-envelope-data";
         let aad = build_aad("sessions", "token", b"s-legacy-1");
 

@@ -3,14 +3,18 @@
 //! Nested signing: PQ signature covers (payload || FROST_signature),
 //! providing post-quantum security on top of classical FROST.
 //!
-//! # Crypto Agility (CNSA 2.0 / FIPS 140-3)
+//! # Crypto Agility (CNSA 2.0 Level 5 / FIPS 140-3)
 //!
 //! This module supports runtime-selectable signature algorithms to enable
 //! algorithm migration without code changes:
 //!
-//! - **ML-DSA-87** (FIPS 204, Level 5): Default, CNSA 2.0 mandated.
-//! - **ML-DSA-65** (FIPS 204, Level 3): Faster, still post-quantum secure.
+//! - **ML-DSA-87** (FIPS 204, Level 5): Default, CNSA 2.0 Level 5 mandated.
 //! - **SLH-DSA-SHA2-256f** (FIPS 205): Hash-based, conservative fallback.
+//!   Security rests solely on hash function security (zero lattice assumptions).
+//!
+//! **ML-DSA-65 is REJECTED** — it is NIST Level 3 only, which does not meet
+//! CNSA 2.0 Level 5 requirements. Setting MILNET_PQ_SIGNATURE_ALG=ML-DSA-65
+//! will cause a FATAL error and refuse startup.
 //!
 //! The active algorithm is selected via the `MILNET_PQ_SIGNATURE_ALG`
 //! environment variable. Signatures are self-describing: each encoded
@@ -38,14 +42,39 @@ pub type PqEncodedSignature = EncodedSignature<MlDsa87>;
 /// Uses `getrandom` (via the workspace crate) to obtain 32 bytes of entropy,
 /// then derives the keypair deterministically via `from_seed`.
 pub fn generate_pq_keypair() -> (PqSigningKey, PqVerifyingKey) {
-    let mut seed = [0u8; 32];
-    if getrandom::getrandom(&mut seed).is_err() {
-        panic!("FATAL: OS CSPRNG unavailable — cannot generate PQ keypair safely");
+    match generate_pq_keypair_checked() {
+        Ok(kp) => kp,
+        Err(_) => {
+            // CSPRNG failure is unrecoverable — all crypto operations are unsafe.
+            // The SIEM event has already been emitted by the checked variant.
+            // Abort rather than continue with a system that cannot generate keys.
+            std::process::abort();
+        }
     }
+}
+
+/// Generate an ML-DSA-87 keypair with proper error handling and SIEM reporting.
+///
+/// Returns `Err` if the OS CSPRNG is unavailable. Prefer this over
+/// `generate_pq_keypair()` in code paths that can propagate errors.
+pub fn generate_pq_keypair_checked() -> Result<(PqSigningKey, PqVerifyingKey), String> {
+    let mut seed = [0u8; 32];
+    getrandom::getrandom(&mut seed).map_err(|e| {
+        common::siem::emit_runtime_error(
+            common::siem::category::CRYPTO_FAILURE,
+            "OS CSPRNG unavailable — cannot generate PQ keypair",
+            &format!("{e}"),
+            file!(),
+            line!(),
+            column!(),
+            module_path!(),
+        );
+        format!("OS CSPRNG failure: {e}")
+    })?;
     let kp = MlDsa87::from_seed(&seed.into());
     // Zeroize the seed on the stack
     seed.zeroize();
-    (kp.signing_key().clone(), kp.verifying_key().clone())
+    Ok((kp.signing_key().clone(), kp.verifying_key().clone()))
 }
 
 /// Sign with ML-DSA-87: signs `(message || frost_signature)`.
@@ -119,21 +148,24 @@ const ALGO_TAG_ML_DSA_87: u8 = 0x01;
 const ALGO_TAG_ML_DSA_65: u8 = 0x02;
 const ALGO_TAG_SLH_DSA_SHA2_256F: u8 = 0x03;
 
-/// Supported post-quantum signature algorithms.
+/// Supported post-quantum signature algorithms (CNSA 2.0 Level 5 only).
 ///
 /// Ordered by security level (highest first). The default is ML-DSA-87
 /// (FIPS 204, NIST Level 5) as mandated by CNSA 2.0 for classified systems.
+///
+/// **ML-DSA-65 is NOT included** — it provides only NIST Level 3 security,
+/// which does not meet CNSA 2.0 Level 5 requirements. The tag byte 0x02 is
+/// reserved so that signatures created by legacy systems can be identified
+/// and rejected with a clear error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PqSignatureAlgorithm {
-    /// ML-DSA-87 (FIPS 204, Level 5) — default, CNSA 2.0 mandated.
+    /// ML-DSA-87 (FIPS 204, Level 5) — default, CNSA 2.0 Level 5 mandated.
     /// Largest keys/signatures but highest security margin.
     MlDsa87,
-    /// ML-DSA-65 (FIPS 204, Level 3) — faster alternative.
-    /// Smaller keys/signatures, still post-quantum secure.
-    MlDsa65,
-    /// SLH-DSA-SHA2-256f (FIPS 205) — hash-based, conservative.
+    /// SLH-DSA-SHA2-256f (FIPS 205) — hash-based, conservative fallback.
     /// Security rests solely on hash function security (no lattice assumptions).
     /// Large signatures (~49KB) but maximum cryptographic diversity.
+    /// Acceptable for CNSA 2.0 Level 5 (hash-based, zero math assumptions).
     SlhDsaSha2256f,
 }
 
@@ -148,16 +180,24 @@ impl PqSignatureAlgorithm {
     pub fn tag(self) -> u8 {
         match self {
             Self::MlDsa87 => ALGO_TAG_ML_DSA_87,
-            Self::MlDsa65 => ALGO_TAG_ML_DSA_65,
             Self::SlhDsaSha2256f => ALGO_TAG_SLH_DSA_SHA2_256F,
         }
     }
 
     /// Decode an algorithm from a 1-byte tag.
+    ///
+    /// Returns `None` for unknown tags AND for the legacy ML-DSA-65 tag (0x02),
+    /// which is rejected under CNSA 2.0 Level 5 policy.
     pub fn from_tag(tag: u8) -> Option<Self> {
         match tag {
             ALGO_TAG_ML_DSA_87 => Some(Self::MlDsa87),
-            ALGO_TAG_ML_DSA_65 => Some(Self::MlDsa65),
+            ALGO_TAG_ML_DSA_65 => {
+                tracing::error!(
+                    "SIEM:FATAL ML-DSA-65 signature tag (0x02) rejected — \
+                     CNSA 2.0 Level 5 requires ML-DSA-87 minimum"
+                );
+                None
+            }
             ALGO_TAG_SLH_DSA_SHA2_256F => Some(Self::SlhDsaSha2256f),
             _ => None,
         }
@@ -167,7 +207,6 @@ impl PqSignatureAlgorithm {
     pub fn name(self) -> &'static str {
         match self {
             Self::MlDsa87 => "ML-DSA-87",
-            Self::MlDsa65 => "ML-DSA-65",
             Self::SlhDsaSha2256f => "SLH-DSA-SHA2-256f",
         }
     }
@@ -177,17 +216,24 @@ impl PqSignatureAlgorithm {
 /// configuration.
 ///
 /// Reads the `MILNET_PQ_SIGNATURE_ALG` environment variable:
-/// - `"ML-DSA-65"` -> `PqSignatureAlgorithm::MlDsa65`
 /// - `"SLH-DSA-SHA2-256f"` -> `PqSignatureAlgorithm::SlhDsaSha2256f`
-/// - Anything else (or unset) -> `PqSignatureAlgorithm::MlDsa87` (default, highest security)
+/// - `"ML-DSA-65"` -> **FATAL: rejected** (Level 3 only, does not meet CNSA 2.0 Level 5)
+/// - Anything else (or unset) -> `PqSignatureAlgorithm::MlDsa87` (default, Level 5)
 ///
 /// This enables algorithm migration by changing a single environment variable
 /// across all deployed services, without recompilation.
 pub fn active_pq_signature_algorithm() -> PqSignatureAlgorithm {
     match std::env::var("MILNET_PQ_SIGNATURE_ALG").as_deref() {
-        Ok("ML-DSA-65") => PqSignatureAlgorithm::MlDsa65,
+        Ok("ML-DSA-65") => {
+            tracing::error!(
+                "SIEM:FATAL MILNET_PQ_SIGNATURE_ALG=ML-DSA-65 is REJECTED — \
+                 ML-DSA-65 provides only NIST Level 3, which does not meet \
+                 CNSA 2.0 Level 5 requirements. Use ML-DSA-87 or SLH-DSA-SHA2-256f."
+            );
+            std::process::exit(1);
+        }
         Ok("SLH-DSA-SHA2-256f") => PqSignatureAlgorithm::SlhDsaSha2256f,
-        _ => PqSignatureAlgorithm::MlDsa87, // Default: highest security level
+        _ => PqSignatureAlgorithm::MlDsa87, // Default: CNSA 2.0 Level 5
     }
 }
 
@@ -208,29 +254,14 @@ pub fn pq_sign_tagged(signing_key: &PqSigningKey, data: &[u8]) -> Vec<u8> {
     let algo = active_pq_signature_algorithm();
     let raw_sig = match algo {
         PqSignatureAlgorithm::MlDsa87 => {
-            // Direct ML-DSA-87 signing
+            // Direct ML-DSA-87 signing (CNSA 2.0 Level 5)
             let sig: PqSignature = signing_key.sign(data);
             sig.encode().to_vec()
         }
-        PqSignatureAlgorithm::MlDsa65 => {
-            // ML-DSA-65 uses different key types; in a full deployment the key
-            // store would provide an ML-DSA-65 key. For agility framework
-            // purposes, we sign with the available ML-DSA-87 key and tag as
-            // ML-DSA-65 only when the caller explicitly provides an ML-DSA-65
-            // key. Here we fall back to ML-DSA-87 with an ML-DSA-87 tag.
-            tracing::warn!(
-                "ML-DSA-65 requested but only ML-DSA-87 key available; signing with ML-DSA-87"
-            );
-            let sig: PqSignature = signing_key.sign(data);
-            let mut tagged = Vec::with_capacity(1 + sig.encode().len());
-            tagged.push(ALGO_TAG_ML_DSA_87);
-            tagged.extend_from_slice(&sig.encode());
-            return tagged;
-        }
         PqSignatureAlgorithm::SlhDsaSha2256f => {
             // SLH-DSA uses a completely different key type from the slh_dsa module.
-            // Similar to ML-DSA-65, in a full deployment the key store provides
-            // the correct key. Fall back to ML-DSA-87.
+            // In a full deployment the key store provides the correct key.
+            // Fall back to ML-DSA-87 (both are CNSA 2.0 Level 5 acceptable).
             tracing::warn!(
                 "SLH-DSA-SHA2-256f requested but only ML-DSA-87 key available; signing with ML-DSA-87"
             );
@@ -274,15 +305,8 @@ pub fn pq_verify_tagged(verifying_key: &PqVerifyingKey, data: &[u8], tagged_sig:
 
     match algo {
         PqSignatureAlgorithm::MlDsa87 => {
-            // Verify with ML-DSA-87
+            // Verify with ML-DSA-87 (CNSA 2.0 Level 5)
             pq_verify_raw(verifying_key, data, sig_bytes)
-        }
-        PqSignatureAlgorithm::MlDsa65 => {
-            // ML-DSA-65 verification would require an ML-DSA-65 verifying key.
-            // If an ML-DSA-65 tagged signature arrives but we only have an
-            // ML-DSA-87 key, verification correctly fails.
-            tracing::warn!("ML-DSA-65 verification not available with ML-DSA-87 key");
-            false
         }
         PqSignatureAlgorithm::SlhDsaSha2256f => {
             // SLH-DSA verification would require an SLH-DSA verifying key.
@@ -371,13 +395,18 @@ mod tests {
     fn test_algorithm_tag_roundtrip() {
         for algo in [
             PqSignatureAlgorithm::MlDsa87,
-            PqSignatureAlgorithm::MlDsa65,
             PqSignatureAlgorithm::SlhDsaSha2256f,
         ] {
             let tag = algo.tag();
             let decoded = PqSignatureAlgorithm::from_tag(tag).unwrap();
             assert_eq!(algo, decoded);
         }
+    }
+
+    #[test]
+    fn test_ml_dsa_65_tag_rejected() {
+        // ML-DSA-65 (tag 0x02) MUST be rejected under CNSA 2.0 Level 5 policy
+        assert!(PqSignatureAlgorithm::from_tag(ALGO_TAG_ML_DSA_65).is_none());
     }
 
     #[test]

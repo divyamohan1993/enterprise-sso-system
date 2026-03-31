@@ -58,7 +58,7 @@ pub fn require_tls() -> bool {
 pub struct ServerTlsConfig {
     acceptor: TlsAcceptor,
     pin_set: Option<CertificatePinSet>,
-    /// Maps certificate SHA-256 fingerprints to expected `ModuleId` values.
+    /// Maps certificate SHA-512 fingerprints to expected `ModuleId` values.
     /// After TLS handshake, the peer certificate fingerprint is looked up
     /// in this map to verify the connecting module's identity.
     identity_map: Option<ModuleIdentityMap>,
@@ -72,20 +72,20 @@ pub struct ServerTlsConfig {
 pub struct ClientTlsConfig {
     connector: TlsConnector,
     pin_set: Option<CertificatePinSet>,
-    /// Maps certificate SHA-256 fingerprints to expected `ModuleId` values.
+    /// Maps certificate SHA-512 fingerprints to expected `ModuleId` values.
     identity_map: Option<ModuleIdentityMap>,
     /// The DNS name to use for the TLS handshake.
     server_name: String,
 }
 
-/// Maps certificate SHA-256 fingerprints to module identities.
+/// Maps certificate SHA-512 fingerprints to module identities.
 ///
 /// Used for post-handshake verification: after the TLS connection is
 /// established, the peer certificate's fingerprint is looked up in this map
 /// to verify that the peer is the expected module.
 #[derive(Clone, Debug)]
 pub struct ModuleIdentityMap {
-    entries: Vec<([u8; 32], ModuleId)>,
+    entries: Vec<([u8; 64], ModuleId)>,
 }
 
 impl ModuleIdentityMap {
@@ -96,19 +96,19 @@ impl ModuleIdentityMap {
         }
     }
 
-    /// Register a module's certificate fingerprint.
-    pub fn add(&mut self, fingerprint: [u8; 32], module_id: ModuleId) {
+    /// Register a module's certificate SHA-512 fingerprint.
+    pub fn add(&mut self, fingerprint: [u8; 64], module_id: ModuleId) {
         self.entries.push((fingerprint, module_id));
     }
 
-    /// Register a module's certificate (DER-encoded) by computing its fingerprint.
+    /// Register a module's certificate (DER-encoded) by computing its SHA-512 fingerprint.
     pub fn add_cert_der(&mut self, cert_der: &[u8], module_id: ModuleId) {
         let fingerprint = crate::tls::compute_cert_fingerprint(cert_der);
         self.entries.push((fingerprint, module_id));
     }
 
-    /// Look up the module identity for a given certificate fingerprint.
-    pub fn lookup(&self, fingerprint: &[u8; 32]) -> Option<ModuleId> {
+    /// Look up the module identity for a given certificate SHA-512 fingerprint.
+    pub fn lookup(&self, fingerprint: &[u8; 64]) -> Option<ModuleId> {
         self.entries
             .iter()
             .find(|(fp, _)| fp == fingerprint)

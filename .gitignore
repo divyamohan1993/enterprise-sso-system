@@ -53,6 +53,7 @@ temp/
 *.tmp
 *.bak
 *.backup
+CLAUDE.md
 
 # Docker
 .docker/

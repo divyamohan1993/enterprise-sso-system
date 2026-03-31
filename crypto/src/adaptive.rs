@@ -353,18 +353,39 @@ pub fn adaptive_crypto() -> &'static AdaptiveCrypto {
 // ---------------------------------------------------------------------------
 
 /// Derive three independent 32-byte subkeys from a master key via HKDF-SHA512.
-pub fn derive_layer_keys(master: &[u8; 32]) -> ([u8; 32], [u8; 32], [u8; 32]) {
+pub fn derive_layer_keys(master: &[u8; 32]) -> Result<([u8; 32], [u8; 32], [u8; 32]), String> {
     let hk = Hkdf::<Sha512>::new(None, master);
     let mut k1 = [0u8; 32];
     let mut k2 = [0u8; 32];
     let mut k3 = [0u8; 32];
-    hk.expand(b"MILNET-ADAPTIVE-LAYER1-v1", &mut k1)
-        .expect("HKDF-SHA512 expand layer1");
-    hk.expand(b"MILNET-ADAPTIVE-LAYER2-v1", &mut k2)
-        .expect("HKDF-SHA512 expand layer2");
-    hk.expand(b"MILNET-ADAPTIVE-LAYER3-v1", &mut k3)
-        .expect("HKDF-SHA512 expand layer3");
-    (k1, k2, k3)
+    hk.expand(b"MILNET-ADAPTIVE-LAYER1-v1", &mut k1).map_err(|e| {
+        common::siem::emit_runtime_error(
+            common::siem::category::CRYPTO_FAILURE,
+            "HKDF-SHA512 expand failed for adaptive layer1 key",
+            &format!("{e}"),
+            file!(), line!(), column!(), module_path!(),
+        );
+        format!("HKDF layer1: {e}")
+    })?;
+    hk.expand(b"MILNET-ADAPTIVE-LAYER2-v1", &mut k2).map_err(|e| {
+        common::siem::emit_runtime_error(
+            common::siem::category::CRYPTO_FAILURE,
+            "HKDF-SHA512 expand failed for adaptive layer2 key",
+            &format!("{e}"),
+            file!(), line!(), column!(), module_path!(),
+        );
+        format!("HKDF layer2: {e}")
+    })?;
+    hk.expand(b"MILNET-ADAPTIVE-LAYER3-v1", &mut k3).map_err(|e| {
+        common::siem::emit_runtime_error(
+            common::siem::category::CRYPTO_FAILURE,
+            "HKDF-SHA512 expand failed for adaptive layer3 key",
+            &format!("{e}"),
+            file!(), line!(), column!(), module_path!(),
+        );
+        format!("HKDF layer3: {e}")
+    })?;
+    Ok((k1, k2, k3))
 }
 
 // ---------------------------------------------------------------------------
@@ -422,7 +443,7 @@ fn decrypt_elevated(key: &[u8; 32], payload: &[u8], aad: &[u8]) -> Result<Vec<u8
 // ---------------------------------------------------------------------------
 
 fn encrypt_high(key: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, String> {
-    let (k1, k2, k3) = derive_layer_keys(key);
+    let (k1, k2, k3) = derive_layer_keys(key)?;
 
     // Layer 1 (inner): AES-256-GCM
     let layer1 = encrypt_aes256gcm(&k1, plaintext, aad)?;
@@ -435,7 +456,7 @@ fn encrypt_high(key: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>,
 }
 
 fn decrypt_high(key: &[u8; 32], payload: &[u8], aad: &[u8]) -> Result<Vec<u8>, String> {
-    let (k1, k2, k3) = derive_layer_keys(key);
+    let (k1, k2, k3) = derive_layer_keys(key)?;
 
     // Peel outer: AEGIS-256
     let layer2 = decrypt_aegis256(&k3, payload, aad)?;
@@ -796,7 +817,7 @@ mod tests {
     #[test]
     fn test_derive_layer_keys_distinct() {
         let master = random_key();
-        let (k1, k2, k3) = derive_layer_keys(&master);
+        let (k1, k2, k3) = derive_layer_keys(&master).expect("derive_layer_keys");
         assert_ne!(k1, k2, "layer keys must be distinct");
         assert_ne!(k1, k3, "layer keys must be distinct");
         assert_ne!(k2, k3, "layer keys must be distinct");

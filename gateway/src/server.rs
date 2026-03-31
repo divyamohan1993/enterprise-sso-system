@@ -610,7 +610,8 @@ async fn handle_connection(
     // 5. Derive session key via HKDF-SHA512
     //    Context binds to this specific handshake via the puzzle nonce.
     //    The derived key is 64 bytes; we use the first 32 bytes for AES-256-GCM.
-    let session_key = crypto::xwing::derive_session_key(&shared_secret, &challenge.nonce);
+    let session_key = crypto::xwing::derive_session_key(&shared_secret, &challenge.nonce)
+        .map_err(|e| format!("session key derivation failed: {e}"))?;
     let enc_key: [u8; 32] = session_key[..32].try_into()
         .map_err(|_| "session key derivation produced fewer than 32 bytes".to_string())?;
     common::error_response::log_crypto_operation("key_derive", "HKDF-SHA512", "session_key");

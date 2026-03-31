@@ -624,12 +624,39 @@ pub fn create_id_token_with_tier(
         jti: Uuid::new_v4().to_string(),
     };
 
-    let header_b64 = URL_SAFE_NO_PAD.encode(
-        serde_json::to_vec(&header).unwrap_or_else(|e| panic!("FATAL: JWT header serialization failed: {e}"))
-    );
-    let claims_b64 = URL_SAFE_NO_PAD.encode(
-        serde_json::to_vec(&claims).unwrap_or_else(|e| panic!("FATAL: JWT claims serialization failed: {e}"))
-    );
+    let header_bytes = match serde_json::to_vec(&header) {
+        Ok(b) => b,
+        Err(e) => {
+            common::siem::emit_runtime_error(
+                common::siem::category::AUTH_FAILURE,
+                "JWT header serialization failed",
+                &format!("{e}"),
+                file!(),
+                line!(),
+                column!(),
+                module_path!(),
+            );
+            // Return an empty token that will fail verification — never panic.
+            return String::new();
+        }
+    };
+    let claims_bytes = match serde_json::to_vec(&claims) {
+        Ok(b) => b,
+        Err(e) => {
+            common::siem::emit_runtime_error(
+                common::siem::category::AUTH_FAILURE,
+                "JWT claims serialization failed",
+                &format!("{e}"),
+                file!(),
+                line!(),
+                column!(),
+                module_path!(),
+            );
+            return String::new();
+        }
+    };
+    let header_b64 = URL_SAFE_NO_PAD.encode(&header_bytes);
+    let claims_b64 = URL_SAFE_NO_PAD.encode(&claims_bytes);
     let signing_input = format!("{header_b64}.{claims_b64}");
 
     let signature = pq_sign_raw(&signing_key.current.signing_key, signing_input.as_bytes());

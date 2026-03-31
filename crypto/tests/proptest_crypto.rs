@@ -7,14 +7,14 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
     #[test]
     fn aes256gcm_roundtrip(pt in prop::collection::vec(any::<u8>(), 0..4096), aad in prop::collection::vec(any::<u8>(), 0..256)) {
-        let dek = DataEncryptionKey::generate();
+        let dek = DataEncryptionKey::generate().expect("generate DEK");
         let sealed = encrypt(&dek, &pt, &aad).unwrap();
         prop_assert_eq!(decrypt(&dek, &sealed, &aad).unwrap(), pt);
     }
     #[test]
     fn aes256gcm_wrong_key(pt in prop::collection::vec(any::<u8>(), 1..512)) {
-        let d1 = DataEncryptionKey::generate();
-        let d2 = DataEncryptionKey::generate();
+        let d1 = DataEncryptionKey::generate().expect("generate DEK");
+        let d2 = DataEncryptionKey::generate().expect("generate DEK");
         let s = encrypt(&d1, &pt, b"a").unwrap();
         prop_assert!(decrypt(&d2, &s, b"a").is_err());
     }
@@ -37,14 +37,14 @@ proptest! {
     fn ct_eq32_ref(d in prop::array::uniform32(any::<u8>())) { prop_assert!(ct_eq_32(&d, &d)); }
     #[test]
     fn wrap_unwrap(kb in prop::array::uniform32(any::<u8>())) {
-        let kek = KeyEncryptionKey::generate();
+        let kek = KeyEncryptionKey::generate().expect("generate KEK");
         let dek = DataEncryptionKey::from_bytes(kb);
         let o = *dek.as_bytes();
         prop_assert_eq!(*unwrap_key(&kek, &wrap_key(&kek, &dek).unwrap()).unwrap().as_bytes(), o);
     }
     #[test]
     fn nonce_unique(_ in 0..100u32) {
-        let d = DataEncryptionKey::generate();
+        let d = DataEncryptionKey::generate().expect("generate DEK");
         let s1 = encrypt(&d, b"x", b"a").unwrap();
         let s2 = encrypt(&d, b"x", b"a").unwrap();
         prop_assert_ne!(s1.nonce(), s2.nonce());
@@ -53,15 +53,15 @@ proptest! {
 
 #[test]
 fn xwing_roundtrip() {
-    for _ in 0..3 { let kp = XWingKeyPair::generate(); let pk = kp.public_key(); let (cs,ct) = xwing_encapsulate(&pk); assert_eq!(cs.as_bytes(), xwing_decapsulate(&kp, &ct).expect("decapsulate").as_bytes()); }
+    for _ in 0..3 { let kp = XWingKeyPair::generate(); let pk = kp.public_key(); let (cs,ct) = xwing_encapsulate(&pk).expect("encapsulate"); assert_eq!(cs.as_bytes(), xwing_decapsulate(&kp, &ct).expect("decapsulate").as_bytes()); }
 }
 #[test]
 fn xwing_session_key_det() {
-    let kp = XWingKeyPair::generate(); let (ss,_) = xwing_encapsulate(&kp.public_key());
-    assert_eq!(derive_session_key(&ss, b"c"), derive_session_key(&ss, b"c"));
+    let kp = XWingKeyPair::generate(); let (ss,_) = xwing_encapsulate(&kp.public_key()).expect("encapsulate");
+    assert_eq!(derive_session_key(&ss, b"c").expect("derive_session_key"), derive_session_key(&ss, b"c").expect("derive_session_key"));
 }
 #[test]
 fn xwing_diff_ctx() {
-    let kp = XWingKeyPair::generate(); let (ss,_) = xwing_encapsulate(&kp.public_key());
-    assert_ne!(derive_session_key(&ss, b"a"), derive_session_key(&ss, b"b"));
+    let kp = XWingKeyPair::generate(); let (ss,_) = xwing_encapsulate(&kp.public_key()).expect("encapsulate");
+    assert_ne!(derive_session_key(&ss, b"a").expect("derive_session_key"), derive_session_key(&ss, b"b").expect("derive_session_key"));
 }

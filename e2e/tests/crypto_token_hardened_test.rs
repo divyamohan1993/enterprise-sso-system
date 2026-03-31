@@ -467,7 +467,7 @@ fn pq_sign_tampered_frost_sig_rejected() {
 #[test]
 fn xwing_encap_decap_matching_secret() {
     let (pk, kp) = xwing_keygen();
-    let (client_ss, ct) = xwing_encapsulate(&pk);
+    let (client_ss, ct) = xwing_encapsulate(&pk).expect("encapsulate");
     let server_ss = xwing_decapsulate(&kp, &ct).expect("decapsulation must succeed");
     assert_eq!(
         client_ss.as_bytes(),
@@ -479,7 +479,7 @@ fn xwing_encap_decap_matching_secret() {
 #[test]
 fn xwing_wrong_secret_key_different_secret() {
     let (pk, _kp) = xwing_keygen();
-    let (client_ss, ct) = xwing_encapsulate(&pk);
+    let (client_ss, ct) = xwing_encapsulate(&pk).expect("encapsulate");
 
     let (_pk2, wrong_kp) = xwing_keygen();
     match xwing_decapsulate(&wrong_kp, &ct) {
@@ -497,8 +497,8 @@ fn xwing_wrong_secret_key_different_secret() {
 #[test]
 fn xwing_two_encapsulations_differ() {
     let (pk, _kp) = xwing_keygen();
-    let (ss1, ct1) = xwing_encapsulate(&pk);
-    let (ss2, ct2) = xwing_encapsulate(&pk);
+    let (ss1, ct1) = xwing_encapsulate(&pk).expect("encapsulate");
+    let (ss2, ct2) = xwing_encapsulate(&pk).expect("encapsulate");
 
     assert_ne!(
         ct1.to_bytes(),
@@ -519,10 +519,10 @@ fn xwing_two_encapsulations_differ() {
 #[test]
 fn xwing_session_key_different_contexts() {
     let (pk, _kp) = xwing_keygen();
-    let (ss, _ct) = xwing_encapsulate(&pk);
+    let (ss, _ct) = xwing_encapsulate(&pk).expect("encapsulate");
 
-    let keys_ctx_a = derive_session_key(&ss, b"context-alpha");
-    let keys_ctx_b = derive_session_key(&ss, b"context-bravo");
+    let keys_ctx_a = derive_session_key(&ss, b"context-alpha").expect("derive_session_key");
+    let keys_ctx_b = derive_session_key(&ss, b"context-bravo").expect("derive_session_key");
 
     assert_ne!(
         keys_ctx_a, keys_ctx_b,
@@ -533,10 +533,10 @@ fn xwing_session_key_different_contexts() {
 #[test]
 fn xwing_session_key_same_context_deterministic() {
     let (pk, _kp) = xwing_keygen();
-    let (ss, _ct) = xwing_encapsulate(&pk);
+    let (ss, _ct) = xwing_encapsulate(&pk).expect("encapsulate");
 
-    let keys1 = derive_session_key(&ss, b"same-context");
-    let keys2 = derive_session_key(&ss, b"same-context");
+    let keys1 = derive_session_key(&ss, b"same-context").expect("derive_session_key");
+    let keys2 = derive_session_key(&ss, b"same-context").expect("derive_session_key");
 
     assert_eq!(
         keys1, keys2,
@@ -547,9 +547,9 @@ fn xwing_session_key_same_context_deterministic() {
 #[test]
 fn xwing_session_key_enc_mac_split() {
     let (pk, _kp) = xwing_keygen();
-    let (ss, _ct) = xwing_encapsulate(&pk);
+    let (ss, _ct) = xwing_encapsulate(&pk).expect("encapsulate");
 
-    let keys = derive_session_key(&ss, b"split-test");
+    let keys = derive_session_key(&ss, b"split-test").expect("derive_session_key");
     assert_eq!(keys.len(), 64, "session key must be 64 bytes (enc + mac)");
 
     let enc_key = &keys[..32];
@@ -1404,8 +1404,8 @@ fn witness_log_correct_content() {
 
 #[test]
 fn envelope_correct_kek_decrypts() {
-    let kek = KeyEncryptionKey::generate();
-    let dek = DataEncryptionKey::generate();
+    let kek = KeyEncryptionKey::generate().expect("generate KEK");
+    let dek = DataEncryptionKey::generate().expect("generate DEK");
 
     let wrapped = wrap_key(&kek, &dek).expect("wrap");
     let recovered_dek = unwrap_key(&kek, &wrapped).expect("unwrap");
@@ -1424,9 +1424,9 @@ fn envelope_correct_kek_decrypts() {
 
 #[test]
 fn envelope_wrong_kek_fails() {
-    let kek1 = KeyEncryptionKey::generate();
-    let kek2 = KeyEncryptionKey::generate();
-    let dek = DataEncryptionKey::generate();
+    let kek1 = KeyEncryptionKey::generate().expect("generate KEK");
+    let kek2 = KeyEncryptionKey::generate().expect("generate KEK");
+    let dek = DataEncryptionKey::generate().expect("generate DEK");
 
     let wrapped = wrap_key(&kek1, &dek).expect("wrap");
     let result = unwrap_key(&kek2, &wrapped);
@@ -1438,7 +1438,7 @@ fn envelope_wrong_kek_fails() {
 
 #[test]
 fn envelope_context_binding_prevents_cross_context() {
-    let dek = DataEncryptionKey::generate();
+    let dek = DataEncryptionKey::generate().expect("generate DEK");
     let aad_a = build_aad("sessions", "token", b"s-1");
     let aad_b = build_aad("sessions", "token", b"s-2");
 

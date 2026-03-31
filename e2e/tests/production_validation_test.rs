@@ -1700,7 +1700,7 @@ fn test_xwing_real_pq_kem() {
     let server_kp = XWingKeyPair::generate();
     let server_pk = server_kp.public_key();
 
-    let (client_ss, ct) = xwing_encapsulate(&server_pk);
+    let (client_ss, ct) = xwing_encapsulate(&server_pk).expect("encapsulate");
     let server_ss = xwing_decapsulate(&server_kp, &ct).expect("decapsulate");
 
     assert_eq!(
@@ -1710,7 +1710,7 @@ fn test_xwing_real_pq_kem() {
     );
 
     // Different session -> different shared secret
-    let (client_ss2, _ct2) = xwing_encapsulate(&server_pk);
+    let (client_ss2, _ct2) = xwing_encapsulate(&server_pk).expect("encapsulate");
     assert_ne!(
         client_ss.as_bytes(),
         client_ss2.as_bytes(),

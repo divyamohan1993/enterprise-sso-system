@@ -1034,7 +1034,7 @@ fn test_supply_chain_dependency_injection() {
 
     // Test 4: X-Wing KEM produces valid encapsulation/decapsulation round-trip
     let keypair = XWingKeyPair::generate();
-    let (shared_secret_enc, ciphertext) = xwing_encapsulate(&keypair.public_key());
+    let (shared_secret_enc, ciphertext) = xwing_encapsulate(&keypair.public_key().expect("encapsulate"));
     let shared_secret_dec = xwing_decapsulate(&keypair, &ciphertext)
         .expect("X-Wing decapsulation must succeed — PQ KEM dependency intact");
     assert_eq!(

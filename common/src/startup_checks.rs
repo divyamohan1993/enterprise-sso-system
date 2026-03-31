@@ -185,6 +185,55 @@ pub fn run_platform_checks<F: FnOnce() -> bool>(harden_fn: F) -> (
 }
 
 // ---------------------------------------------------------------------------
+// Distributed cluster verification — called after platform checks
+// ---------------------------------------------------------------------------
+
+/// Verify distributed cluster readiness before accepting requests.
+///
+/// This function MUST be called by every service's `main()` AFTER
+/// `run_platform_checks()` but BEFORE binding any network port.
+///
+/// Takes pre-collected peer attestations (gathered via mTLS during service
+/// discovery). If verification fails, the process exits with a FATAL error.
+///
+/// Returns the verification result on success for audit logging.
+pub fn verify_distributed_cluster(
+    peer_attestations: &[crate::distributed_startup::PeerAttestation],
+) -> crate::distributed_startup::StartupVerification {
+    let verifier = match crate::distributed_startup::DistributedStartupVerifier::new() {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(
+                "FATAL: distributed startup verifier initialization failed: {}",
+                e,
+            );
+            eprintln!("FATAL: distributed startup verifier initialization failed: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    match verifier.verify_cluster(peer_attestations) {
+        Ok(verification) => {
+            tracing::info!(
+                "distributed cluster verification PASSED: cluster_size={}, quorum={}, state_synced={}",
+                verification.cluster_size,
+                verification.quorum_achievable,
+                verification.state_chain_synced,
+            );
+            verification
+        }
+        Err(e) => {
+            tracing::error!(
+                "FATAL: distributed cluster verification FAILED: {}",
+                e,
+            );
+            eprintln!("FATAL: distributed cluster verification FAILED: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Environment sanitization — remove sensitive vars from /proc/PID/environ
 // ---------------------------------------------------------------------------
 

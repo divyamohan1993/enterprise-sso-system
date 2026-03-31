@@ -2510,12 +2510,16 @@ async fn test_crypto_health(request: Request) -> Result<Json<serde_json::Value>,
 
     // Test AES-256-GCM
     let aes_ok = {
-        let dek = crypto::envelope::DataEncryptionKey::generate();
-        let plaintext = b"MILNET security test payload";
-        match crypto::envelope::encrypt(&dek, plaintext, b"test-aad") {
-            Ok(sealed) => crypto::envelope::decrypt(&dek, &sealed, b"test-aad")
-                .map(|pt| pt == plaintext)
-                .unwrap_or(false),
+        match crypto::envelope::DataEncryptionKey::generate() {
+            Ok(dek) => {
+                let plaintext = b"MILNET security test payload";
+                match crypto::envelope::encrypt(&dek, plaintext, b"test-aad") {
+                    Ok(sealed) => crypto::envelope::decrypt(&dek, &sealed, b"test-aad")
+                        .map(|pt| pt == plaintext)
+                        .unwrap_or(false),
+                    Err(_) => false,
+                }
+            }
             Err(_) => false,
         }
     };

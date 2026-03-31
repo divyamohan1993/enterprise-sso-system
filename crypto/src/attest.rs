@@ -156,7 +156,19 @@ fn compute_manifest_hmac(
 ) -> Vec<u8> {
     let mut mac = match HmacSha512::new_from_slice(signing_key) {
         Ok(m) => m,
-        Err(_) => panic!("FATAL: HMAC-SHA512 key initialization failed"),
+        Err(_) => {
+            common::siem::emit_runtime_error(
+                common::siem::category::INTEGRITY_VIOLATION,
+                "HMAC-SHA512 key initialization failed for manifest signing",
+                "invalid key length",
+                file!(),
+                line!(),
+                column!(),
+                module_path!(),
+            );
+            // Return empty HMAC — verification will fail, which is safe.
+            return Vec::new();
+        }
     };
 
     // Domain separation

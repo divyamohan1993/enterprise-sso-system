@@ -5,7 +5,7 @@ fn xwing_key_exchange_produces_shared_secret() {
     let server_kp = XWingKeyPair::generate();
     let server_pk = server_kp.public_key();
 
-    let (client_ss, ciphertext) = xwing_encapsulate(&server_pk);
+    let (client_ss, ciphertext) = xwing_encapsulate(&server_pk).expect("encapsulate");
     let server_ss = xwing_decapsulate(&server_kp, &ciphertext)
         .expect("decapsulation should succeed");
 
@@ -21,8 +21,8 @@ fn xwing_different_sessions_different_secrets() {
     let server_kp = XWingKeyPair::generate();
     let server_pk = server_kp.public_key();
 
-    let (ss1, _ct1) = xwing_encapsulate(&server_pk);
-    let (ss2, _ct2) = xwing_encapsulate(&server_pk);
+    let (ss1, _ct1) = xwing_encapsulate(&server_pk).expect("encapsulate");
+    let (ss2, _ct2) = xwing_encapsulate(&server_pk).expect("encapsulate");
 
     assert_ne!(
         ss1.as_bytes(),
@@ -37,7 +37,7 @@ fn xwing_wrong_key_fails() {
     let wrong_kp = XWingKeyPair::generate();
     let server_pk = server_kp.public_key();
 
-    let (client_ss, ciphertext) = xwing_encapsulate(&server_pk);
+    let (client_ss, ciphertext) = xwing_encapsulate(&server_pk).expect("encapsulate");
     // Decapsulating with wrong key should either error or produce a different secret
     // (ML-KEM uses implicit rejection which returns a pseudorandom value).
     match xwing_decapsulate(&wrong_kp, &ciphertext) {

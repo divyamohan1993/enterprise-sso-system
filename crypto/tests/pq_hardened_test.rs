@@ -87,7 +87,7 @@ use crypto::xwing::{
 #[test]
 fn xwing_encapsulate_decapsulate_roundtrip() {
     let (pk, kp) = xwing_keygen();
-    let (client_ss, ct) = xwing_encapsulate(&pk);
+    let (client_ss, ct) = xwing_encapsulate(&pk).expect("encapsulate");
     let server_ss = xwing_decapsulate(&kp, &ct)
         .expect("X-Wing decapsulation must succeed");
     assert_eq!(
@@ -100,7 +100,7 @@ fn xwing_encapsulate_decapsulate_roundtrip() {
 #[test]
 fn xwing_wrong_key_decap_fails() {
     let (pk, _kp) = xwing_keygen();
-    let (client_ss, ct) = xwing_encapsulate(&pk);
+    let (client_ss, ct) = xwing_encapsulate(&pk).expect("encapsulate");
 
     // Decapsulate with a completely different keypair
     let wrong_kp = XWingKeyPair::generate();
@@ -117,7 +117,7 @@ fn xwing_wrong_key_decap_fails() {
 #[test]
 fn xwing_tampered_ciphertext_fails() {
     let (pk, kp) = xwing_keygen();
-    let (client_ss, ct) = xwing_encapsulate(&pk);
+    let (client_ss, ct) = xwing_encapsulate(&pk).expect("encapsulate");
 
     // Tamper with the ML-KEM portion of the ciphertext
     let mut ct_bytes = ct.to_bytes();
@@ -146,9 +146,9 @@ fn xwing_mlkem_only_mode_works() {
     let kp = XWingKeyPair::generate();
     let pk = kp.public_key();
 
-    let (client_ss, tagged_ct) = xwing_encapsulate_tagged(&pk);
+    let (client_ss, tagged_ct) = xwing_encapsulate_tagged(&pk).expect("tagged encapsulate");
     assert_eq!(
-        tagged_ct.algorithm(),
+        tagged_ct.algorithm().expect("algorithm"),
         KemAlgorithm::MlKem1024Only,
         "must use ML-KEM-1024-only mode when MILNET_PQ_KEM_ONLY is set"
     );
@@ -424,9 +424,9 @@ fn kem_algorithm_tag_dispatch() {
     std::env::remove_var("MILNET_PQ_KEM_ONLY");
     let kp = XWingKeyPair::generate();
     let pk = kp.public_key();
-    let (client_ss, tagged_ct) = xwing_encapsulate_tagged(&pk);
+    let (client_ss, tagged_ct) = xwing_encapsulate_tagged(&pk).expect("tagged encapsulate");
     assert_eq!(
-        tagged_ct.algorithm(),
+        tagged_ct.algorithm().expect("algorithm"),
         KemAlgorithm::XWing,
         "default tagged encapsulation must use X-Wing mode"
     );

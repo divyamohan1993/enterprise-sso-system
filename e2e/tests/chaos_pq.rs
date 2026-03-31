@@ -92,7 +92,7 @@ fn test_all_receipt_signatures_mldsa87() {
 fn test_xwing_kem_mlkem1024() {
     run_with_large_stack(|| {
         let (pk, kp) = xwing_keygen();
-        let (shared_enc, ciphertext) = xwing_encapsulate(&pk);
+        let (shared_enc, ciphertext) = xwing_encapsulate(&pk).expect("encapsulate");
         let shared_dec = xwing_decapsulate(&kp, &ciphertext)
             .expect("X-Wing decapsulation must succeed");
 

@@ -71,7 +71,7 @@ impl std::fmt::Debug for KekShare {
 }
 
 // GF(256) arithmetic for Shamir
-fn gf256_add(a: u8, b: u8) -> u8 {
+pub fn gf256_add(a: u8, b: u8) -> u8 {
     a ^ b
 }
 

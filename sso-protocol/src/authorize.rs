@@ -16,7 +16,20 @@ static PKCE_BLIND_KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new(
 fn pkce_blind_key() -> &'static [u8; 32] {
     PKCE_BLIND_KEY.get_or_init(|| {
         let mut key = [0u8; 32];
-        getrandom::getrandom(&mut key).expect("OS CSPRNG failure");
+        if getrandom::getrandom(&mut key).is_err() {
+            common::siem::emit_runtime_error(
+                common::siem::category::CRYPTO_FAILURE,
+                "OS CSPRNG unavailable — cannot generate PKCE blind key",
+                "getrandom failed",
+                file!(),
+                line!(),
+                column!(),
+                module_path!(),
+            );
+            // Abort: operating without a PKCE blind key would leave code
+            // challenges in plaintext, which is a security violation.
+            std::process::abort();
+        }
         key
     })
 }
@@ -26,8 +39,26 @@ fn pkce_blind_key() -> &'static [u8; 32] {
 /// comparison (HMAC equality).
 fn blind_code_challenge(code_challenge: &str) -> String {
     type HmacSha256 = Hmac<Sha256>;
-    let mut mac = HmacSha256::new_from_slice(pkce_blind_key())
-        .expect("HMAC key length is always valid");
+    // Key length is always 32 bytes which is valid for HMAC — unwrap is safe here,
+    // but we defend against it anyway for defense-in-depth.
+    let mac = match HmacSha256::new_from_slice(pkce_blind_key()) {
+        Ok(m) => m,
+        Err(_) => {
+            common::siem::emit_runtime_error(
+                common::siem::category::CRYPTO_FAILURE,
+                "HMAC-SHA256 key init failed for PKCE blind",
+                "invalid key length",
+                file!(),
+                line!(),
+                column!(),
+                module_path!(),
+            );
+            // Return a distinguishable error value rather than panicking.
+            // Verification will always fail since no real blind matches this.
+            return String::from("HMAC_KEY_INIT_FAILED");
+        }
+    };
+    let mut mac = mac;
     mac.update(code_challenge.as_bytes());
     hex::encode(mac.finalize().into_bytes())
 }
@@ -98,7 +129,18 @@ static STATE_HMAC_KEY: std::sync::OnceLock<[u8; 64]> = std::sync::OnceLock::new(
 fn state_hmac_key() -> &'static [u8; 64] {
     STATE_HMAC_KEY.get_or_init(|| {
         let mut key = [0u8; 64];
-        getrandom::getrandom(&mut key).expect("OS CSPRNG failure");
+        if getrandom::getrandom(&mut key).is_err() {
+            common::siem::emit_runtime_error(
+                common::siem::category::CRYPTO_FAILURE,
+                "OS CSPRNG unavailable — cannot generate OAuth state HMAC key",
+                "getrandom failed",
+                file!(),
+                line!(),
+                column!(),
+                module_path!(),
+            );
+            std::process::abort();
+        }
         key
     })
 }
@@ -112,19 +154,43 @@ fn state_hmac_key() -> &'static [u8; 64] {
 ///
 /// Returns (state_value, nonce) — the nonce must be stored server-side
 /// alongside the session to verify the state on callback.
-pub fn generate_oauth_state(session_id: &str) -> (String, String) {
+pub fn generate_oauth_state(session_id: &str) -> Result<(String, String), &'static str> {
     let mut nonce_bytes = [0u8; 32];
-    getrandom::getrandom(&mut nonce_bytes).expect("OS CSPRNG failure");
+    if getrandom::getrandom(&mut nonce_bytes).is_err() {
+        common::siem::emit_runtime_error(
+            common::siem::category::CRYPTO_FAILURE,
+            "OS CSPRNG unavailable — cannot generate OAuth state nonce",
+            "getrandom failed",
+            file!(),
+            line!(),
+            column!(),
+            module_path!(),
+        );
+        return Err("OS CSPRNG failure during state generation");
+    }
     let nonce = hex::encode(nonce_bytes);
 
     type HmacSha512 = Hmac<Sha512>;
-    let mut mac = HmacSha512::new_from_slice(state_hmac_key())
-        .expect("HMAC key length is always valid");
+    let mut mac = match HmacSha512::new_from_slice(state_hmac_key()) {
+        Ok(m) => m,
+        Err(_) => {
+            common::siem::emit_runtime_error(
+                common::siem::category::CRYPTO_FAILURE,
+                "HMAC-SHA512 key init failed for OAuth state",
+                "invalid key length",
+                file!(),
+                line!(),
+                column!(),
+                module_path!(),
+            );
+            return Err("HMAC key initialization failed");
+        }
+    };
     mac.update(session_id.as_bytes());
     mac.update(nonce.as_bytes());
     let state = hex::encode(mac.finalize().into_bytes());
 
-    (state, nonce)
+    Ok((state, nonce))
 }
 
 /// Verify an OAuth state parameter against the session and stored nonce.
@@ -145,8 +211,21 @@ pub fn verify_oauth_state(
 
     // Recompute the expected state from session_id + stored nonce.
     type HmacSha512 = Hmac<Sha512>;
-    let mut mac = HmacSha512::new_from_slice(state_hmac_key())
-        .expect("HMAC key length is always valid");
+    let mut mac = match HmacSha512::new_from_slice(state_hmac_key()) {
+        Ok(m) => m,
+        Err(_) => {
+            common::siem::emit_runtime_error(
+                common::siem::category::CRYPTO_FAILURE,
+                "HMAC-SHA512 key init failed for OAuth state verification",
+                "invalid key length",
+                file!(),
+                line!(),
+                column!(),
+                module_path!(),
+            );
+            return Err("HMAC key initialization failed during state verification");
+        }
+    };
     mac.update(session_id.as_bytes());
     mac.update(stored_nonce.as_bytes());
     let expected = hex::encode(mac.finalize().into_bytes());
@@ -270,7 +349,7 @@ impl AuthorizationStore {
         let hashed_key = hash_code(&code);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs() as i64;
 
         // Blind the code_challenge with HMAC-SHA256 so it is never stored
@@ -344,7 +423,7 @@ impl AuthorizationStore {
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs() as i64;
         if now > auth_code.expires_at {
             // Track failed attempt for rate limiting
@@ -396,7 +475,7 @@ impl AuthorizationStore {
     pub fn cleanup_expired(&mut self) {
         let now_sys = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs() as i64;
         let cutoff = now_sys - (CODE_EXPIRY_SECS * 2);
         self.codes.retain(|_, auth_code| auth_code.expires_at > cutoff);
@@ -421,7 +500,7 @@ impl PersistentAuthorizationStore {
         let mut s = Self { memory: AuthorizationStore::new(), pool }; s.load_from_db().await?; Ok(s)
     }
     async fn load_from_db(&mut self) -> Result<(), String> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
         // DB stores hashed code keys and blinded code_challenges — load them directly.
         let rows: Vec<(String, String, String, Uuid, Option<String>, i32, Option<String>, i64, bool)> =
             sqlx::query_as("SELECT code_hash, client_id, redirect_uri, user_id, code_challenge_blind, tier, nonce, created_at, consumed FROM authorization_codes WHERE created_at > $1")
@@ -435,7 +514,7 @@ impl PersistentAuthorizationStore {
         let code = self.memory.create_code_with_tier(client_id, redirect_uri, user_id, scope, code_challenge.clone(), nonce.clone(), tier).map_err(|e| e.to_string())?;
         let hashed_key = hash_code(&code);
         let blinded_challenge = code_challenge.as_deref().map(blind_code_challenge);
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
         // Store hashed code and blinded challenge in DB — never plaintext.
         sqlx::query("INSERT INTO authorization_codes (code_hash, client_id, redirect_uri, user_id, code_challenge_blind, tier, nonce, created_at, consumed) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,FALSE)")
             .bind(&hashed_key).bind(client_id).bind(redirect_uri).bind(user_id).bind(blinded_challenge.as_deref()).bind(tier as i32).bind(nonce.as_deref()).bind(now)
@@ -490,7 +569,7 @@ impl PersistentAuthorizationStore {
     }
     pub fn is_code_consumed(&self, code: &str) -> bool { self.memory.is_code_consumed(code) }
     pub async fn cleanup_expired(&mut self) -> Result<(), String> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
         sqlx::query("DELETE FROM authorization_codes WHERE created_at <= $1").bind(now - (CODE_EXPIRY_SECS * 2)).execute(&self.pool).await.map_err(|e| format!("cleanup: {e}"))?;
         self.memory.cleanup_expired(); Ok(())
     }

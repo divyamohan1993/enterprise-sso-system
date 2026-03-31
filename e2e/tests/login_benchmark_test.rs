@@ -701,7 +701,7 @@ fn test_xwing_puzzle_timing() {
 
             // Encapsulate (client side)
             let encap_start = Instant::now();
-            let (client_ss, ct) = crypto::xwing::xwing_encapsulate(&server_pk);
+            let (client_ss, ct) = crypto::xwing::xwing_encapsulate(&server_pk).expect("encapsulate");
             let encap_ms = encap_start.elapsed().as_secs_f64() * 1000.0;
             println!("X-Wing KEM encapsulate: {encap_ms:.2}ms");
 
@@ -717,7 +717,7 @@ fn test_xwing_puzzle_timing() {
             // Session key derivation
             let derive_start = Instant::now();
             let context = crypto::entropy::generate_nonce();
-            let _session_key = crypto::xwing::derive_session_key(&client_ss, &context);
+            let _session_key = crypto::xwing::derive_session_key(&client_ss, &context).expect("derive_session_key");
             let derive_ms = derive_start.elapsed().as_secs_f64() * 1000.0;
             println!("Session key derivation: {derive_ms:.4}ms");
 
@@ -790,8 +790,8 @@ fn test_encryption_timing() {
     }
 
     println!("\n--- Envelope Encryption (AES-256-GCM wrap/unwrap) ---");
-    let kek = crypto::envelope::KeyEncryptionKey::generate();
-    let dek = crypto::envelope::DataEncryptionKey::generate();
+    let kek = crypto::envelope::KeyEncryptionKey::generate().expect("generate KEK");
+    let dek = crypto::envelope::DataEncryptionKey::generate().expect("generate DEK");
 
     let wrap_start = Instant::now();
     let wrapped = crypto::envelope::wrap_key(&kek, &dek).expect("wrap key");

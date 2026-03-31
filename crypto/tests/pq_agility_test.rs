@@ -243,7 +243,7 @@ fn xwing_kem_roundtrip() {
     let (pk, kp) = xwing_keygen();
 
     // Encapsulate (client side)
-    let (client_ss, ct) = xwing_encapsulate(&pk);
+    let (client_ss, ct) = xwing_encapsulate(&pk).expect("encapsulate");
 
     // Decapsulate (server side)
     let server_ss = xwing_decapsulate(&kp, &ct).expect("decapsulation must succeed");
@@ -262,8 +262,8 @@ fn xwing_different_keypairs_different_secrets() {
     let (pk1, _kp1) = xwing_keygen();
     let (pk2, _kp2) = xwing_keygen();
 
-    let (ss1, _ct1) = xwing_encapsulate(&pk1);
-    let (ss2, _ct2) = xwing_encapsulate(&pk2);
+    let (ss1, _ct1) = xwing_encapsulate(&pk1).expect("encapsulate");
+    let (ss2, _ct2) = xwing_encapsulate(&pk2).expect("encapsulate");
 
     assert_ne!(
         ss1.as_bytes(),
@@ -276,12 +276,12 @@ fn xwing_different_keypairs_different_secrets() {
 #[test]
 fn xwing_session_key_derivation_deterministic() {
     let (pk, kp) = xwing_keygen();
-    let (ss, ct) = xwing_encapsulate(&pk);
+    let (ss, ct) = xwing_encapsulate(&pk).expect("encapsulate");
     let server_ss = xwing_decapsulate(&kp, &ct).unwrap();
 
     let context = b"session-nonce-12345";
-    let key1 = derive_session_key(&ss, context);
-    let key2 = derive_session_key(&server_ss, context);
+    let key1 = derive_session_key(&ss, context).expect("derive_session_key");
+    let key2 = derive_session_key(&server_ss, context).expect("derive_session_key");
 
     assert_eq!(key1, key2, "session keys from same shared secret must match");
     assert_eq!(key1.len(), SESSION_KEY_LEN, "session key must be {} bytes", SESSION_KEY_LEN);
@@ -291,10 +291,10 @@ fn xwing_session_key_derivation_deterministic() {
 #[test]
 fn xwing_different_contexts_different_session_keys() {
     let (pk, _kp) = xwing_keygen();
-    let (ss, _ct) = xwing_encapsulate(&pk);
+    let (ss, _ct) = xwing_encapsulate(&pk).expect("encapsulate");
 
-    let key1 = derive_session_key(&ss, b"context-1");
-    let key2 = derive_session_key(&ss, b"context-2");
+    let key1 = derive_session_key(&ss, b"context-1").expect("derive_session_key");
+    let key2 = derive_session_key(&ss, b"context-2").expect("derive_session_key");
 
     assert_ne!(key1, key2, "different contexts must produce different session keys");
 }
@@ -314,7 +314,7 @@ fn xwing_public_key_serialization_roundtrip() {
 #[test]
 fn xwing_ciphertext_serialization_roundtrip() {
     let (pk, kp) = xwing_keygen();
-    let (client_ss, ct) = xwing_encapsulate(&pk);
+    let (client_ss, ct) = xwing_encapsulate(&pk).expect("encapsulate");
 
     let ct_bytes = ct.to_bytes();
     let ct2 = Ciphertext::from_bytes(&ct_bytes).expect("ciphertext deserialization must succeed");

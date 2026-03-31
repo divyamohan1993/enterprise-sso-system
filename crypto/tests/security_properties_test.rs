@@ -468,7 +468,7 @@ fn test_envelope_encryption_binds_to_context() {
     // Envelope encryption AAD prevents ciphertext transplantation attacks
     use crypto::envelope::{encrypt, decrypt, DataEncryptionKey, build_aad};
 
-    let dek = DataEncryptionKey::generate();
+    let dek = DataEncryptionKey::generate().expect("generate DEK");
     let plaintext = b"secret data bound to specific context";
 
     let aad_original = build_aad("users", "password_hash", b"user-42");

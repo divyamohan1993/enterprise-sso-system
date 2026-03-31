@@ -39,7 +39,7 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use hkdf::Hkdf;
-use sha2::{Digest as _, Sha256};
+use sha2::{Digest as _, Sha256, Sha512};
 use zeroize::Zeroize;
 
 // ---------------------------------------------------------------------------
@@ -352,9 +352,9 @@ impl Tpm2Context {
     }
 
     /// Derive the AES-256-GCM sealing key from SRK seed + PCR policy digest
-    /// using HKDF-SHA256.
+    /// using HKDF-SHA512 (CNSA 2.0 Level 5).
     fn derive_seal_key(&self, policy_digest: &[u8; 32]) -> Result<[u8; 32], TpmError> {
-        let hk = Hkdf::<Sha256>::new(Some(policy_digest), &self.srk_seed);
+        let hk = Hkdf::<Sha512>::new(Some(policy_digest), &self.srk_seed);
         let mut okm = [0u8; 32];
         hk.expand(HKDF_INFO_SEAL, &mut okm)
             .map_err(|_| TpmError::SealFailed("HKDF expand failed".into()))?;
