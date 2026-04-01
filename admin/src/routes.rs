@@ -1421,10 +1421,8 @@ async fn auth_middleware(
                 // An insider who reads sensitive data without audit trail can
                 // silently exfiltrate classified information.
                 if req_method == Method::GET || req_method == Method::HEAD {
-                    common::siem::emit_security_event(
-                        common::siem::SecurityEvent::admin_data_access(
-                            &format!("ADMIN_READ: {} {} role={}", req_method, req_path, role),
-                        ),
+                    common::siem::SecurityEvent::admin_data_access(
+                        &format!("ADMIN_READ: {} {} role={}", req_method, req_path, role),
                     );
                     if let Ok(mut log) = state.audit_log.try_write() {
                         log.append_signed(
