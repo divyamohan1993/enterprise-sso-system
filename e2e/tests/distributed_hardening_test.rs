@@ -353,36 +353,36 @@ fn raft_election_timeout_randomized() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn bft_minimum_7_nodes() {
+fn bft_minimum_11_nodes() {
     use audit::bft::{has_bft_quorum, MIN_BFT_NODES};
 
-    assert_eq!(MIN_BFT_NODES, 7, "BFT minimum must be 7 nodes (f=2 Byzantine faults)");
+    assert_eq!(MIN_BFT_NODES, 11, "BFT minimum must be 11 nodes (f=3 Byzantine faults)");
 
-    // 7 nodes is the minimum for meaningful BFT (tolerates 2 faults).
-    assert!(has_bft_quorum(7), "7 nodes must satisfy BFT quorum");
-    assert!(has_bft_quorum(8), "8 nodes must satisfy BFT quorum");
+    // 11 nodes is the minimum for meaningful BFT (tolerates 3 faults).
+    assert!(has_bft_quorum(11), "11 nodes must satisfy BFT quorum");
+    assert!(has_bft_quorum(12), "12 nodes must satisfy BFT quorum");
     assert!(has_bft_quorum(100), "100 nodes must satisfy BFT quorum");
 }
 
 #[test]
-fn bft_quorum_is_5() {
+fn bft_quorum_is_7() {
     use audit::bft::{BftAuditCluster, BFT_QUORUM};
 
     // Constant verification.
-    assert_eq!(BFT_QUORUM, 5, "BFT quorum must be 5 for 7-node cluster (2f+1 where f=2)");
+    assert_eq!(BFT_QUORUM, 7, "BFT quorum must be 7 for 11-node cluster (2f+1 where f=3)");
 
     // Verify cluster computes quorum_size correctly via the formula.
-    let cluster = BftAuditCluster::new(7);
+    let cluster = BftAuditCluster::new(11);
     assert_eq!(
-        cluster.quorum_size, 5,
-        "7-node BFT cluster must have quorum_size=5"
+        cluster.quorum_size, 7,
+        "11-node BFT cluster must have quorum_size=7"
     );
 
-    // Verify with a larger cluster: 10 nodes -> f=3, quorum=7.
-    let cluster_10 = BftAuditCluster::new(10);
+    // Verify with a larger cluster: 13 nodes -> f=4, quorum=9.
+    let cluster_13 = BftAuditCluster::new(13);
     assert_eq!(
-        cluster_10.quorum_size, 7,
-        "10-node BFT cluster must have quorum_size=7 (f=3, 2f+1=7)"
+        cluster_13.quorum_size, 9,
+        "13-node BFT cluster must have quorum_size=9 (f=4, 2f+1=9)"
     );
 }
 
@@ -390,11 +390,11 @@ fn bft_quorum_is_5() {
 fn bft_rejects_insufficient_nodes() {
     use audit::bft::has_bft_quorum;
 
-    // Fewer than 7 nodes cannot provide Byzantine fault tolerance.
-    for n in 0..7 {
+    // Fewer than 11 nodes cannot provide Byzantine fault tolerance.
+    for n in 0..11 {
         assert!(
             !has_bft_quorum(n),
-            "has_bft_quorum({}) must return false (minimum is 7)",
+            "has_bft_quorum({}) must return false (minimum is 11)",
             n
         );
     }

@@ -30,7 +30,7 @@ pub trait KeyStretchingFunction: Send + Sync {
 
 /// Argon2id key stretching function.
 ///
-/// Parameters: memory = 64 MiB (65536 KiB), iterations = 3,
+/// Parameters: memory = 64 MiB (65536 KiB), iterations = 4,
 /// parallelism = 4, output = 32 bytes.  Not FIPS approved; use
 /// [`Pbkdf2Sha512Ksf`] in FIPS mode.
 pub struct Argon2idKsf;
@@ -39,7 +39,7 @@ impl KeyStretchingFunction for Argon2idKsf {
     fn stretch(&self, password: &[u8], salt: &[u8]) -> Result<Vec<u8>, String> {
         use argon2::{Algorithm, Argon2, Params, Version};
 
-        let params = Params::new(65536, 3, 4, Some(32))
+        let params = Params::new(65536, 4, 4, Some(32))
             .map_err(|e| format!("argon2 params error: {e}"))?;
         let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 

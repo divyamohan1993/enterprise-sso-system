@@ -1048,20 +1048,20 @@ fn incident_response_critical_produces_correct_actions() {
 // 13. Message size limit enforcement
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Verify the SHARD transport enforces a maximum frame size of 16 MiB.
-/// An attacker sending oversized payloads must be rejected to prevent
-/// allocation bombs.
+/// Verify the SHARD transport enforces a maximum frame size of 2 MiB.
+/// Hardened from 16 MiB to prevent OOM allocation bombs under DDoS.
+/// An attacker sending oversized payloads must be rejected.
 #[test]
-fn message_size_limit_max_frame_is_16mib() {
-    // The MAX_FRAME_LEN constant is 16 * 1024 * 1024 = 16_777_216 bytes.
+fn message_size_limit_max_frame_is_2mib() {
+    // The MAX_FRAME_LEN constant is 2 * 1024 * 1024 = 2_097_152 bytes.
     // We verify by checking that the transport module defines this limit.
     // (The actual enforcement happens in the async transport layer.)
-    let max_frame: u32 = 16 * 1024 * 1024;
+    let max_frame: u32 = 2 * 1024 * 1024;
 
     // Verify the constant value matches what's expected
     assert_eq!(
-        max_frame, 16_777_216,
-        "Maximum SHARD frame size must be exactly 16 MiB"
+        max_frame, 2_097_152,
+        "Maximum SHARD frame size must be exactly 2 MiB"
     );
 
     // A SHARD protocol message with a large payload can still be created

@@ -36,11 +36,11 @@ fn propose(cluster: &mut BftAuditCluster) -> Result<[u8; 64], String> {
 // 1. Honest quorum commits an entry
 // ---------------------------------------------------------------------------
 
-/// Create a 7-node cluster (all honest), propose an entry, verify all honest
+/// Create an 11-node cluster (all honest), propose an entry, verify all honest
 /// nodes have a consistent chain.
 #[test]
 fn test_bft_audit_honest_quorum() {
-    let mut cluster = BftAuditCluster::new(7);
+    let mut cluster = BftAuditCluster::new(11);
     let result = propose(&mut cluster);
     assert!(result.is_ok(), "honest quorum must commit the entry: {:?}", result);
     assert!(
@@ -53,11 +53,11 @@ fn test_bft_audit_honest_quorum() {
 // 2. One Byzantine node — cluster continues
 // ---------------------------------------------------------------------------
 
-/// Mark node 0 as Byzantine, propose an entry — the remaining 6 honest nodes
-/// maintain the chain and the quorum (BFT_QUORUM = 5) is still met.
+/// Mark node 0 as Byzantine, propose an entry -- the remaining 10 honest nodes
+/// maintain the chain and the quorum (BFT_QUORUM = 7) is still met.
 #[test]
 fn test_bft_audit_one_byzantine() {
-    let mut cluster = BftAuditCluster::new(7);
+    let mut cluster = BftAuditCluster::new(11);
     cluster.set_byzantine(0);
 
     let result = propose(&mut cluster);
@@ -67,7 +67,7 @@ fn test_bft_audit_one_byzantine() {
     );
     assert!(
         cluster.verify_consistency(),
-        "6 honest nodes must maintain consistent chains with 1 Byzantine"
+        "10 honest nodes must maintain consistent chains with 1 Byzantine"
     );
 }
 
@@ -75,23 +75,24 @@ fn test_bft_audit_one_byzantine() {
 // 3. Two Byzantine nodes — cluster continues
 // ---------------------------------------------------------------------------
 
-/// Mark nodes 0 and 1 as Byzantine, propose an entry — the 5 honest nodes
-/// still form the minimum quorum (2f+1 = 5 with f=2).
+/// Mark nodes 0, 1, and 2 as Byzantine, propose an entry -- the 8 honest nodes
+/// still form more than the minimum quorum (2f+1 = 7 with f=3).
 #[test]
-fn test_bft_audit_two_byzantine() {
-    let mut cluster = BftAuditCluster::new(7);
+fn test_bft_audit_three_byzantine() {
+    let mut cluster = BftAuditCluster::new(11);
     cluster.set_byzantine(0);
     cluster.set_byzantine(1);
+    cluster.set_byzantine(2);
 
     let result = propose(&mut cluster);
     assert!(
         result.is_ok(),
-        "two Byzantine nodes must not break the honest quorum (5 honest ≥ BFT_QUORUM={})",
+        "three Byzantine nodes must not break the honest quorum (8 honest >= BFT_QUORUM={})",
         BFT_QUORUM
     );
     assert!(
         cluster.verify_consistency(),
-        "5 honest nodes must maintain consistent chains with 2 Byzantine"
+        "8 honest nodes must maintain consistent chains with 3 Byzantine"
     );
 }
 
@@ -103,7 +104,7 @@ fn test_bft_audit_two_byzantine() {
 /// on all honest nodes.
 #[test]
 fn test_bft_audit_chain_integrity() {
-    let mut cluster = BftAuditCluster::new(7);
+    let mut cluster = BftAuditCluster::new(11);
 
     for _ in 0..10 {
         let r = propose(&mut cluster);

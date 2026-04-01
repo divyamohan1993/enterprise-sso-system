@@ -135,18 +135,18 @@ pub fn ct_gf256_mul(a: u8, b: u8) -> u8 {
 }
 
 /// Constant-time GF(256) inverse via log/exp tables.
-/// Panics on zero input (undefined).
-pub fn ct_gf256_inv(a: u8) -> u8 {
+/// Returns error on zero input instead of panicking (DoS prevention).
+pub fn ct_gf256_inv(a: u8) -> Result<u8, &'static str> {
     if a == 0 {
-        panic!("division by zero in GF(256)");
+        return Err("division by zero in GF(256): zero input to inverse");
     }
     let log_a = GF256_LOG[a as usize] as u16;
     let log_inv = 255 - log_a;
-    GF256_EXP[log_inv as usize]
+    Ok(GF256_EXP[log_inv as usize])
 }
 
-fn ct_gf256_div(a: u8, b: u8) -> u8 {
-    ct_gf256_mul(a, ct_gf256_inv(b))
+fn ct_gf256_div(a: u8, b: u8) -> Result<u8, &'static str> {
+    Ok(ct_gf256_mul(a, ct_gf256_inv(b)?))
 }
 
 // ---------------------------------------------------------------------------
@@ -298,7 +298,7 @@ pub fn reconstruct_secret(shares: &[KekShare]) -> Result<[u8; 32], String> {
                 if denominator == 0 {
                     return Err("degenerate shares: two shares have the same index".into());
                 }
-                basis = ct_gf256_mul(basis, ct_gf256_div(numerator, denominator));
+                basis = ct_gf256_mul(basis, ct_gf256_div(numerator, denominator)?);
             }
 
             result = gf256_add(result, ct_gf256_mul(yi, basis));
@@ -668,9 +668,11 @@ mod tests {
 
         // Constant-time inverse
         for a in 1..=255u16 {
-            let inv = ct_gf256_inv(a as u8);
+            let inv = ct_gf256_inv(a as u8).expect("inverse of nonzero must succeed");
             assert_eq!(ct_gf256_mul(a as u8, inv), 1, "ct_gf256_inv: a*a^-1 != 1 for a={}", a);
         }
+        // Verify zero input returns error instead of panicking
+        assert!(ct_gf256_inv(0).is_err(), "ct_gf256_inv(0) must return Err, not panic");
     }
 
     #[test]

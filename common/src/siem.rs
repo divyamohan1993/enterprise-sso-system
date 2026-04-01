@@ -1237,6 +1237,37 @@ impl SecurityEvent {
         event.emit();
     }
 
+    /// Emit an admin data access event (read operations).
+    /// SECURITY: Logs all admin read operations to detect silent data exfiltration.
+    pub fn admin_data_access(detail: &str) {
+        let event = SecurityEvent {
+            timestamp: Self::now_iso8601(),
+            category: "access",
+            action: "admin_data_access",
+            severity: Severity::Info,
+            outcome: "success",
+            user_id: None,
+            source_ip: None,
+            detail: Some(detail.to_string()),
+        };
+        event.emit();
+    }
+
+    /// Emit a cryptographic failure event.
+    pub fn crypto_failure(detail: &str) {
+        let event = SecurityEvent {
+            timestamp: Self::now_iso8601(),
+            category: "crypto",
+            action: "crypto_failure",
+            severity: Severity::Critical,
+            outcome: "failure",
+            user_id: None,
+            source_ip: None,
+            detail: Some(detail.to_string()),
+        };
+        event.emit();
+    }
+
     /// Emit an entropy quality check failure event.
     pub fn entropy_quality_failure(detail: &str) {
         let event = SecurityEvent {

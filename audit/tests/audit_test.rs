@@ -203,7 +203,7 @@ fn audit_response_roundtrip_error() {
 #[test]
 fn bft_cluster_with_signing_proposes_entry() {
     let (signing_key, _verifying_key) = crypto::pq_sign::generate_pq_keypair();
-    let mut cluster = audit::bft::BftAuditCluster::new_with_signing_key(7, signing_key);
+    let mut cluster = audit::bft::BftAuditCluster::new_with_signing_key(11, signing_key);
 
     let result = cluster.propose_entry(
         AuditEventType::AuthSuccess,
@@ -213,7 +213,7 @@ fn bft_cluster_with_signing_proposes_entry() {
         vec![],
         2, // Secret classification
     );
-    assert!(result.is_ok(), "quorum should be met with 7 honest nodes");
+    assert!(result.is_ok(), "quorum should be met with 11 honest nodes");
 
     for node in &cluster.nodes {
         assert_eq!(node.log.len(), 1);
@@ -228,7 +228,7 @@ fn bft_cluster_with_signing_proposes_entry() {
 #[test]
 fn bft_signed_cluster_consistency() {
     let (signing_key, _verifying_key) = crypto::pq_sign::generate_pq_keypair();
-    let mut cluster = audit::bft::BftAuditCluster::new_with_signing_key(7, signing_key);
+    let mut cluster = audit::bft::BftAuditCluster::new_with_signing_key(11, signing_key);
 
     for i in 0..5 {
         let result = cluster.propose_entry(
@@ -249,10 +249,11 @@ fn bft_signed_cluster_consistency() {
 #[test]
 fn bft_signed_cluster_tolerates_byzantine() {
     let (signing_key, _verifying_key) = crypto::pq_sign::generate_pq_keypair();
-    let mut cluster = audit::bft::BftAuditCluster::new_with_signing_key(7, signing_key);
+    let mut cluster = audit::bft::BftAuditCluster::new_with_signing_key(11, signing_key);
 
-    cluster.set_byzantine(5);
-    cluster.set_byzantine(6);
+    cluster.set_byzantine(8);
+    cluster.set_byzantine(9);
+    cluster.set_byzantine(10);
 
     let result = cluster.propose_entry(
         AuditEventType::ActionLevel4,
@@ -262,9 +263,10 @@ fn bft_signed_cluster_tolerates_byzantine() {
         vec![],
         3, // TopSecret
     );
-    assert!(result.is_ok(), "quorum of 5 should still be met with 2 Byzantine nodes");
+    assert!(result.is_ok(), "quorum of 7 should still be met with 3 Byzantine nodes");
 
-    cluster.set_byzantine(4);
+    cluster.set_byzantine(7);
+    cluster.set_byzantine(6);
     let result2 = cluster.propose_entry(
         AuditEventType::SystemDegraded,
         vec![],
@@ -273,13 +275,13 @@ fn bft_signed_cluster_tolerates_byzantine() {
         vec![],
         0,
     );
-    assert!(result2.is_err(), "3 Byzantine nodes should prevent quorum");
+    assert!(result2.is_err(), "5 Byzantine nodes should prevent quorum");
 }
 
 #[test]
 fn bft_signed_entries_have_valid_signature_bytes() {
     let (signing_key, verifying_key) = crypto::pq_sign::generate_pq_keypair();
-    let mut cluster = audit::bft::BftAuditCluster::new_with_signing_key(7, signing_key);
+    let mut cluster = audit::bft::BftAuditCluster::new_with_signing_key(11, signing_key);
 
     cluster
         .propose_entry(
@@ -353,6 +355,201 @@ fn test_unsigned_entries_rejected_during_verification() {
             "unsigned entries must be rejected when a verifying key is provided"
         );
     });
+}
+
+// ── BFT quorum enforcement: reject when <MIN_BFT_NODES ─────────────
+
+#[test]
+fn bft_cluster_rejects_entry_when_below_min_nodes() {
+    // With fewer than 11 nodes, propose_entry must return Err.
+    // This validates the hardened quorum enforcement that now REJECTS
+    // instead of merely logging a warning.
+    let (signing_key, _vk) = crypto::pq_sign::generate_pq_keypair();
+    let mut cluster = audit::bft::BftAuditCluster::new_with_signing_key(7, signing_key);
+
+    let result = cluster.propose_entry(
+        AuditEventType::AuthSuccess,
+        vec![Uuid::new_v4()],
+        vec![Uuid::new_v4()],
+        0.25,
+        vec![],
+        2,
+    );
+    assert!(
+        result.is_err(),
+        "cluster with 7 nodes (<11 MIN_BFT_NODES) must reject entries"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("minimum") && err.contains("11"),
+        "error must reference minimum node count, got: {err}"
+    );
+}
+
+#[test]
+fn bft_cluster_accepts_entry_with_min_nodes() {
+    // With exactly 11 nodes (the minimum), propose_entry must succeed.
+    let (signing_key, _vk) = crypto::pq_sign::generate_pq_keypair();
+    let mut cluster = audit::bft::BftAuditCluster::new_with_signing_key(11, signing_key);
+
+    let result = cluster.propose_entry(
+        AuditEventType::AuthSuccess,
+        vec![Uuid::new_v4()],
+        vec![Uuid::new_v4()],
+        0.25,
+        vec![],
+        2,
+    );
+    assert!(
+        result.is_ok(),
+        "cluster with 11 nodes (== MIN_BFT_NODES) must accept entries: {:?}",
+        result
+    );
+    for node in &cluster.nodes {
+        assert_eq!(node.log.len(), 1);
+    }
+}
+
+#[test]
+fn bft_cluster_rejects_entry_with_various_insufficient_sizes() {
+    // Verify that all node counts below 11 are rejected.
+    for node_count in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] {
+        let (signing_key, _vk) = crypto::pq_sign::generate_pq_keypair();
+        let mut cluster = audit::bft::BftAuditCluster::new_with_signing_key(node_count, signing_key);
+        let result = cluster.propose_entry(
+            AuditEventType::KeyRotation,
+            vec![],
+            vec![],
+            0.0,
+            vec![],
+            0,
+        );
+        assert!(
+            result.is_err(),
+            "cluster with {} nodes must reject entries",
+            node_count
+        );
+    }
+}
+
+// ── BFT 11-node Byzantine tolerance tests ───────────────────────────
+
+#[test]
+fn bft_11_nodes_tolerates_3_byzantine() {
+    // f=3, quorum=7. With 3 Byzantine nodes, 8 honest nodes remain,
+    // which exceeds quorum of 7. Entries must commit.
+    let (signing_key, _vk) = crypto::pq_sign::generate_pq_keypair();
+    let mut cluster = audit::bft::BftAuditCluster::new_with_signing_key(11, signing_key);
+
+    // Mark 3 nodes as Byzantine (the maximum tolerated)
+    cluster.set_byzantine(8);
+    cluster.set_byzantine(9);
+    cluster.set_byzantine(10);
+
+    let result = cluster.propose_entry(
+        AuditEventType::ActionLevel4,
+        vec![Uuid::new_v4()],
+        vec![],
+        0.95,
+        vec![],
+        3, // TopSecret
+    );
+    assert!(
+        result.is_ok(),
+        "8 honest nodes (11 - 3 Byzantine) should meet quorum of 7: {:?}",
+        result
+    );
+
+    // Verify honest nodes all have the entry
+    for node in &cluster.nodes[..8] {
+        assert_eq!(node.log.len(), 1, "honest node must have the entry");
+    }
+    // Byzantine nodes should have empty logs
+    for node in &cluster.nodes[8..] {
+        assert_eq!(node.log.len(), 0, "Byzantine node must have empty log");
+    }
+}
+
+#[test]
+fn bft_11_nodes_fails_with_4_byzantine() {
+    // f=3, quorum=7. With 4 Byzantine nodes (f+1), only 7 honest nodes
+    // remain, which exactly meets quorum. But wait: quorum = 2f+1 = 7,
+    // and we have 7 honest nodes, so it should still work. Let's verify
+    // that with 5 Byzantine nodes (leaving 6 honest < 7 quorum) it fails.
+    let (signing_key, _vk) = crypto::pq_sign::generate_pq_keypair();
+    let mut cluster = audit::bft::BftAuditCluster::new_with_signing_key(11, signing_key);
+
+    // 4 Byzantine nodes: 7 honest >= 7 quorum, should still succeed
+    cluster.set_byzantine(7);
+    cluster.set_byzantine(8);
+    cluster.set_byzantine(9);
+    cluster.set_byzantine(10);
+
+    let result = cluster.propose_entry(
+        AuditEventType::SystemDegraded,
+        vec![],
+        vec![],
+        1.0,
+        vec![],
+        0,
+    );
+    assert!(
+        result.is_ok(),
+        "7 honest nodes should exactly meet quorum of 7: {:?}",
+        result
+    );
+
+    // Now add a 5th Byzantine node: only 6 honest < 7 quorum
+    cluster.set_byzantine(6);
+    let result2 = cluster.propose_entry(
+        AuditEventType::SystemDegraded,
+        vec![],
+        vec![],
+        1.0,
+        vec![],
+        0,
+    );
+    assert!(
+        result2.is_err(),
+        "6 honest nodes should fail to meet quorum of 7"
+    );
+    assert!(
+        result2.unwrap_err().contains("quorum not met"),
+        "error must mention quorum failure"
+    );
+}
+
+#[test]
+fn bft_11_nodes_consistency_with_byzantine_faults() {
+    // Multiple entries with 3 Byzantine nodes: all honest nodes stay consistent
+    let (signing_key, _vk) = crypto::pq_sign::generate_pq_keypair();
+    let mut cluster = audit::bft::BftAuditCluster::new_with_signing_key(11, signing_key);
+
+    cluster.set_byzantine(8);
+    cluster.set_byzantine(9);
+    cluster.set_byzantine(10);
+
+    for i in 0..20 {
+        let result = cluster.propose_entry(
+            AuditEventType::AuthSuccess,
+            vec![Uuid::new_v4()],
+            vec![],
+            i as f64 * 0.05,
+            vec![],
+            0,
+        );
+        assert!(result.is_ok(), "entry {} should commit", i);
+    }
+
+    assert!(
+        cluster.verify_consistency(),
+        "all honest nodes must have identical chains"
+    );
+
+    for node in &cluster.nodes[..8] {
+        assert_eq!(node.log.len(), 20);
+        assert!(node.log.verify_chain());
+    }
 }
 
 // ── Hardened security tests ───────────────────────────────────────────

@@ -41,7 +41,8 @@ fn test_ct_gf256_mul_exhaustive() {
 #[test]
 fn test_ct_gf256_inv_all_nonzero() {
     for a in 1..=255u16 {
-        let inv = common::threshold_kek::ct_gf256_inv(a as u8);
+        let inv = common::threshold_kek::ct_gf256_inv(a as u8)
+            .expect("inverse of nonzero must succeed");
         let product = common::threshold_kek::ct_gf256_mul(a as u8, inv);
         assert_eq!(
             product, 1,
@@ -49,6 +50,11 @@ fn test_ct_gf256_inv_all_nonzero() {
             a, inv, product
         );
     }
+    // Verify zero returns error instead of panicking (DoS prevention)
+    assert!(
+        common::threshold_kek::ct_gf256_inv(0).is_err(),
+        "ct_gf256_inv(0) must return Err, not panic"
+    );
 }
 
 #[test]
@@ -77,6 +83,59 @@ fn test_ct_gf256_mul_one_identity() {
             a as u8,
             "a * 1 must be a, failed for a={}",
             a
+        );
+    }
+}
+
+/// Verify that GF(256) division by zero returns Err (not panic).
+/// This tests the hardened ct_gf256_div path through the public ct_gf256_inv.
+/// ct_gf256_div(a, b) = ct_gf256_mul(a, ct_gf256_inv(b)?), so dividing by
+/// zero propagates the Err from ct_gf256_inv(0).
+#[test]
+fn test_ct_gf256_div_by_zero_returns_err() {
+    // ct_gf256_inv(0) must return Err (the div-by-zero case)
+    let result = common::threshold_kek::ct_gf256_inv(0);
+    assert!(
+        result.is_err(),
+        "ct_gf256_inv(0) must return Err to prevent div-by-zero panic"
+    );
+    let err_msg = result.unwrap_err();
+    assert!(
+        err_msg.contains("zero"),
+        "error must mention zero, got: {err_msg}"
+    );
+}
+
+/// Verify GF(256) division: for all nonzero a and b, a/b * b == a.
+#[test]
+fn test_ct_gf256_div_roundtrip_all_nonzero() {
+    for a in 1..=255u16 {
+        for b in 1..=255u16 {
+            let inv_b = common::threshold_kek::ct_gf256_inv(b as u8)
+                .expect("inverse of nonzero must succeed");
+            let quotient = common::threshold_kek::ct_gf256_mul(a as u8, inv_b);
+            let product = common::threshold_kek::ct_gf256_mul(quotient, b as u8);
+            assert_eq!(
+                product, a as u8,
+                "(a/b)*b must equal a for a={}, b={}",
+                a, b
+            );
+        }
+    }
+}
+
+/// Verify that ct_gf256_div(0, b) == 0 for all nonzero b.
+/// 0 divided by anything is 0 in GF(256).
+#[test]
+fn test_ct_gf256_div_zero_numerator() {
+    for b in 1..=255u16 {
+        let inv_b = common::threshold_kek::ct_gf256_inv(b as u8)
+            .expect("inverse of nonzero must succeed");
+        let result = common::threshold_kek::ct_gf256_mul(0, inv_b);
+        assert_eq!(
+            result, 0,
+            "0/b must be 0 for b={}",
+            b
         );
     }
 }

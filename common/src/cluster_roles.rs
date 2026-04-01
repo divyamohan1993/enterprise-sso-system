@@ -110,8 +110,8 @@ impl RoleRegistry {
 // Request proxy (follower -> leader)
 // ---------------------------------------------------------------------------
 
-/// Maximum proxy payload size: 16 MB.
-const MAX_PROXY_PAYLOAD: usize = 16 * 1024 * 1024;
+/// Maximum proxy payload size: 2 MB (hardened from 16 MB to prevent OOM).
+const MAX_PROXY_PAYLOAD: usize = 2 * 1024 * 1024;
 
 /// Proxy a raw request to the current leader.
 ///

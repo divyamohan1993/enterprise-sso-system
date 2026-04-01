@@ -1616,7 +1616,7 @@ async fn test_shard_large_payload() {
             .await
             .expect("connect");
 
-    // ~1 MB payload (under the SHARD 16 MiB limit, and under Gateway 1 MiB limit)
+    // ~512 KB payload (under the SHARD 2 MiB limit, and under Gateway 1 MiB limit)
     let large_payload = vec![0xABu8; 512 * 1024];
     transport.send(&large_payload).await.expect("send large payload");
     let (_sender, received) = transport.recv().await.expect("recv large payload");
@@ -1644,12 +1644,12 @@ async fn test_shard_oversized_payload_rejected() {
 
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    // Connect via TLS and send an oversized frame header (> 16 MiB)
+    // Connect via TLS and send an oversized frame header (> 2 MiB)
     let mut transport =
         tls_transport::tls_connect(&addr, ModuleId::Gateway, SHARD_HMAC_KEY, &connector, "localhost")
             .await
             .expect("connect");
-    let huge_payload = vec![0u8; 17 * 1024 * 1024]; // 17 MiB
+    let huge_payload = vec![0u8; 3 * 1024 * 1024]; // 3 MiB (exceeds 2 MiB limit)
     // send_raw writes length prefix + payload; server's recv should reject the oversized frame
     let _result = transport.send_raw(&huge_payload).await;
     // The server should reject or close the connection before reading the full payload.

@@ -20,30 +20,28 @@ async fn main() {
         _platform_report.binary_hash,
     );
 
-    // Derive admin API key deterministically from the master KEK via HKDF-SHA512.
-    // This avoids printing secrets and ensures the key is stable across restarts.
-    let api_key = std::env::var("ADMIN_API_KEY").unwrap_or_else(|_| {
-        let master_kek = common::sealed_keys::get_master_kek();
-        // Bind admin key to deployment identity for domain separation.
-        // v2: includes deployment-specific context to prevent key reuse.
-        let deployment_id = std::env::var("MILNET_DEPLOYMENT_ID")
-            .unwrap_or_else(|_| "default-deployment".to_string());
-        let salt = format!("MILNET-ADMIN-API-KEY-v2:{}", deployment_id);
-        let derived = {
-            use hkdf::Hkdf;
-            use sha2::Sha512;
-            let hk = Hkdf::<Sha512>::new(Some(salt.as_bytes()), master_kek.as_slice());
-            let mut okm = [0u8; 32];
-            if let Err(e) = hk.expand(b"admin-api-key-v2", &mut okm) {
-                tracing::error!("FATAL: HKDF expand for admin API key failed: {e}");
-                std::process::exit(1);
-            }
-            okm
-        };
-        let key = hex::encode(derived);
-        tracing::info!("Admin API key derived from master KEK (HKDF-SHA512, deployment-bound)");
-        key
-    });
+    // SECURITY: Admin API key MUST be explicitly provisioned. No derivation fallback.
+    // Previous versions derived the key from master KEK, creating a single-point-of-
+    // compromise: if KEK leaks, attacker can regenerate the admin key offline.
+    let api_key = match std::env::var("ADMIN_API_KEY") {
+        Ok(key) if key.len() >= 32 => key,
+        Ok(key) => {
+            tracing::error!(
+                "FATAL: ADMIN_API_KEY is too short ({} chars, minimum 32). \
+                 Admin API key must be a high-entropy secret provisioned externally.",
+                key.len()
+            );
+            std::process::exit(1);
+        }
+        Err(_) => {
+            tracing::error!(
+                "FATAL: ADMIN_API_KEY environment variable not set. \
+                 Admin API key must be explicitly provisioned -- derivation from \
+                 master KEK is disabled to prevent single-point-of-compromise."
+            );
+            std::process::exit(1);
+        }
+    };
 
     // SECURITY: Remove ADMIN_API_KEY from environment after reading to prevent
     // leakage via /proc/pid/environ or child process inheritance.

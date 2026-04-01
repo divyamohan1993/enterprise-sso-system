@@ -1,7 +1,7 @@
 //! Byzantine equivocation detection test suite.
 //!
 //! Tests that Byzantine nodes sending conflicting data are detected, that
-//! 3-of-7 Byzantine nodes prevent consensus, and that forged ML-DSA-87
+//! 4+-of-11 Byzantine nodes prevent consensus, and that forged ML-DSA-87
 //! signatures are rejected by the audit pipeline.
 
 use audit::bft::{BftAuditCluster, BFT_QUORUM, MIN_BFT_NODES};
@@ -36,8 +36,8 @@ where
 
 #[test]
 fn test_byzantine_nodes_sending_conflicting_data_are_detected() {
-    // Create a 7-node cluster (f=2, quorum=5).
-    let mut cluster = BftAuditCluster::new(7);
+    // Create an 11-node cluster (f=3, quorum=7).
+    let mut cluster = BftAuditCluster::new(11);
 
     assert_eq!(
         cluster.nodes.len(),
@@ -47,11 +47,12 @@ fn test_byzantine_nodes_sending_conflicting_data_are_detected() {
         cluster.nodes.len()
     );
 
-    // Mark two nodes Byzantine — within f=2 tolerance.
+    // Mark three nodes Byzantine -- within f=3 tolerance.
     cluster.set_byzantine(0);
     cluster.set_byzantine(1);
+    cluster.set_byzantine(2);
 
-    // A quorum of 5 honest nodes should still reach consensus.
+    // A quorum of 7 honest nodes should still reach consensus.
     let result = cluster.propose_entry(
         AuditEventType::AuthSuccess,
         vec![Uuid::new_v4()],
@@ -63,7 +64,7 @@ fn test_byzantine_nodes_sending_conflicting_data_are_detected() {
 
     assert!(
         result.is_ok(),
-        "consensus should succeed with 2 Byzantine nodes (f=2 tolerated); got: {:?}",
+        "consensus should succeed with 3 Byzantine nodes (f=3 tolerated); got: {:?}",
         result.err()
     );
 
@@ -71,8 +72,8 @@ fn test_byzantine_nodes_sending_conflicting_data_are_detected() {
     // have one accepted entry. detect_byzantine() should identify them.
     let detected = cluster.detect_byzantine();
 
-    // We expect the 2 pre-marked Byzantine nodes to be flagged via chain
-    // divergence (they have empty logs diverging from the 5-node majority).
+    // We expect the 3 pre-marked Byzantine nodes to be flagged via chain
+    // divergence (they have empty logs diverging from the 8-node majority).
     assert!(
         !detected.is_empty(),
         "detect_byzantine() should identify diverged nodes after proposal; \
@@ -86,19 +87,21 @@ fn test_byzantine_nodes_sending_conflicting_data_are_detected() {
     );
 }
 
-// ── Test 2: 3 Byzantine of 7 nodes prevents consensus ───────────────────
+// ── Test 2: 5 Byzantine of 11 nodes prevents consensus ───────────────────
 
 #[test]
-fn test_three_byzantine_of_seven_prevents_consensus() {
-    // Create a standard 7-node cluster (f=2, quorum=5).
-    let mut cluster = BftAuditCluster::new(7);
+fn test_five_byzantine_of_eleven_prevents_consensus() {
+    // Create a standard 11-node cluster (f=3, quorum=7).
+    let mut cluster = BftAuditCluster::new(11);
 
-    // Mark 3 nodes Byzantine — one more than f=2, exceeding fault tolerance.
+    // Mark 5 nodes Byzantine -- two more than f=3, exceeding fault tolerance.
     cluster.set_byzantine(0);
     cluster.set_byzantine(1);
     cluster.set_byzantine(2);
+    cluster.set_byzantine(3);
+    cluster.set_byzantine(4);
 
-    // With only 4 honest nodes and quorum=5, consensus must fail.
+    // With only 6 honest nodes and quorum=7, consensus must fail.
     let result = cluster.propose_entry(
         AuditEventType::AuthFailure,
         vec![Uuid::new_v4()],
@@ -110,9 +113,9 @@ fn test_three_byzantine_of_seven_prevents_consensus() {
 
     assert!(
         result.is_err(),
-        "consensus must FAIL when 3 of 7 nodes are Byzantine (exceeds f=2 tolerance); \
+        "consensus must FAIL when 5 of 11 nodes are Byzantine (exceeds f=3 tolerance); \
          only {} honest nodes present but quorum requires {}",
-        4,
+        6,
         BFT_QUORUM
     );
 
@@ -197,7 +200,7 @@ fn test_forged_mldsa87_signatures_are_rejected() {
 fn test_cluster_with_signing_key_accepts_quorum_entries() {
     run_with_large_stack(|| {
         let (signing_key, _verifying_key) = generate_pq_keypair();
-        let mut cluster = BftAuditCluster::new_with_signing_key(7, signing_key);
+        let mut cluster = BftAuditCluster::new_with_signing_key(11, signing_key);
 
         // Propose three consecutive entries; each must succeed.
         for i in 0..3u32 {
@@ -211,7 +214,7 @@ fn test_cluster_with_signing_key_accepts_quorum_entries() {
             );
             assert!(
                 result.is_ok(),
-                "entry {} must be accepted by honest 7-node cluster; got: {:?}",
+                "entry {} must be accepted by honest 11-node cluster; got: {:?}",
                 i,
                 result.err()
             );
@@ -237,8 +240,8 @@ fn test_cluster_with_signing_key_accepts_quorum_entries() {
 
 #[test]
 fn test_verify_consistency_detects_divergence() {
-    // Build a 7-node cluster and accept one entry.
-    let mut cluster = BftAuditCluster::new(7);
+    // Build an 11-node cluster and accept one entry.
+    let mut cluster = BftAuditCluster::new(11);
 
     cluster
         .propose_entry(

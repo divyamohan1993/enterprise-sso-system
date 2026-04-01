@@ -115,7 +115,7 @@ async fn main() {
     let bft_dir = data_dir.join("bft_nodes");
     ensure_dir(&bft_dir);
     let audit_cluster =
-        audit::bft::BftAuditCluster::new_with_persistence(7, pq_signing_key, &bft_dir);
+        audit::bft::BftAuditCluster::new_with_persistence(11, pq_signing_key, &bft_dir);
     let cluster = Arc::new(RwLock::new(audit_cluster));
 
     // ── Witness checkpoint log with persistence ──────────────────────────

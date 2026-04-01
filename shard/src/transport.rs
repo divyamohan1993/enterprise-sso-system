@@ -22,8 +22,10 @@ use common::types::ModuleId;
 use crate::protocol::ShardProtocol;
 use crate::tls::CertificatePinSet;
 
-/// Maximum SHARD frame payload size (16 MiB). Prevents allocation bombs.
-const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
+/// Maximum SHARD frame payload size (2 MiB). Hardened from 16 MiB to limit
+/// OOM allocation surface while still accommodating ML-DSA-87 signatures,
+/// FROST threshold shares, and OPAQUE ceremony payloads.
+const MAX_FRAME_LEN: u32 = 2 * 1024 * 1024;
 
 /// Default timeout for SHARD transport recv operations (120 seconds).
 /// Set higher to accommodate Argon2id KSF and sequential request processing

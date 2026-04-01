@@ -1,8 +1,8 @@
 //! Simplified BFT audit replication with split-brain prevention and
 //! automatic Byzantine node detection.
 //!
-//! Models a cluster of 7 audit nodes that tolerates up to 2 Byzantine faults.
-//! An entry is considered committed when a quorum (2f + 1 = 5) of nodes accept it.
+//! Models a cluster of 11 audit nodes that tolerates up to 3 Byzantine faults.
+//! An entry is considered committed when a quorum (2f + 1 = 7) of nodes accept it.
 //! Byzantine nodes that produce conflicting entries are detectable via chain
 //! divergence checks.
 //!
@@ -23,10 +23,12 @@ use uuid::Uuid;
 /// within this window or it considers itself partitioned.
 const PARTITION_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Minimum BFT nodes for Byzantine fault tolerance (tolerates f=2 failures).
-pub const MIN_BFT_NODES: usize = 7;
-/// Quorum size: 2f+1 where f = floor((n-1)/3).
-pub const BFT_QUORUM: usize = 5;
+/// Minimum BFT nodes for Byzantine fault tolerance (tolerates f=3 failures).
+/// Increased from 7 to 11 to prevent 3 Byzantine nodes + 2 honest duped from
+/// forming quorum. With 11 nodes: f=3, quorum=7, so attacker needs 4+ nodes.
+pub const MIN_BFT_NODES: usize = 11;
+/// Quorum size: 2f+1 where f = floor((n-1)/3). With 11 nodes: f=3, quorum=7.
+pub const BFT_QUORUM: usize = 7;
 
 /// Returns true if the cluster has sufficient nodes for BFT guarantees.
 pub fn has_bft_quorum(node_count: usize) -> bool {
@@ -210,15 +212,15 @@ pub struct BftAuditCluster {
 }
 
 impl BftAuditCluster {
-    /// Create a new cluster. `node_count` should be >= 4 for meaningful BFT
-    /// (3f + 1). For 7 nodes: f = 2, quorum = 2f + 1 = 5.
+    /// Create a new cluster. `node_count` should be >= 11 for meaningful BFT
+    /// (3f + 1). For 11 nodes: f = 3, quorum = 2f + 1 = 7.
     pub fn new(node_count: usize) -> Self {
-        // BFT requires minimum 7 nodes — fail hard if fewer
-        if node_count < 7 {
+        // BFT requires minimum 11 nodes -- fail hard if fewer
+        if node_count < MIN_BFT_NODES {
             tracing::error!(
-                "CRITICAL: BFT audit running with {} nodes (minimum 7 required). \
-                 Audit integrity cannot be guaranteed with fewer than 7 nodes (2f+1 = 5 quorum).",
-                node_count
+                "CRITICAL: BFT audit running with {} nodes (minimum {} required). \
+                 Audit integrity cannot be guaranteed with fewer than {} nodes (2f+1 = {} quorum).",
+                node_count, MIN_BFT_NODES, MIN_BFT_NODES, BFT_QUORUM
             );
         }
 
@@ -235,14 +237,14 @@ impl BftAuditCluster {
         cluster
     }
 
-    /// Create a new cluster with an ML-DSA-65 signing key for entry signing.
+    /// Create a new cluster with an ML-DSA-87 signing key for entry signing.
     pub fn new_with_signing_key(node_count: usize, signing_key: pq_sign::PqSigningKey) -> Self {
-        // BFT requires minimum 7 nodes — fail hard if fewer
-        if node_count < 7 {
+        // BFT requires minimum 11 nodes -- fail hard if fewer
+        if node_count < MIN_BFT_NODES {
             tracing::error!(
-                "CRITICAL: BFT audit running with {} nodes (minimum 7 required). \
-                 Audit integrity cannot be guaranteed with fewer than 7 nodes (2f+1 = 5 quorum).",
-                node_count
+                "CRITICAL: BFT audit running with {} nodes (minimum {} required). \
+                 Audit integrity cannot be guaranteed with fewer than {} nodes (2f+1 = {} quorum).",
+                node_count, MIN_BFT_NODES, MIN_BFT_NODES, BFT_QUORUM
             );
         }
 
@@ -270,12 +272,12 @@ impl BftAuditCluster {
         signing_key: pq_sign::PqSigningKey,
         persistence_dir: &std::path::Path,
     ) -> Self {
-        // BFT requires minimum 7 nodes — fail hard if fewer
-        if node_count < 7 {
+        // BFT requires minimum 11 nodes -- fail hard if fewer
+        if node_count < MIN_BFT_NODES {
             tracing::error!(
-                "CRITICAL: BFT audit running with {} nodes (minimum 7 required). \
-                 Audit integrity cannot be guaranteed with fewer than 7 nodes (2f+1 = 5 quorum).",
-                node_count
+                "CRITICAL: BFT audit running with {} nodes (minimum {} required). \
+                 Audit integrity cannot be guaranteed with fewer than {} nodes (2f+1 = {} quorum).",
+                node_count, MIN_BFT_NODES, MIN_BFT_NODES, BFT_QUORUM
             );
         }
 
@@ -377,14 +379,24 @@ impl BftAuditCluster {
             entry.signature = pq_sign::pq_sign_raw(key, &hash);
         }
 
-        // Quorum enforcement: warn if cluster lacks BFT guarantees
+        // Quorum enforcement: REJECT if cluster lacks BFT guarantees.
+        // Previously this was log-only, which allowed audit corruption under
+        // Byzantine attack. Now fail-closed: no BFT guarantees = no commits.
         if !has_bft_quorum(self.nodes.len()) {
-            tracing::error!(
-                "CRITICAL: committing audit entry with only {} nodes (minimum {} required for BFT). \
-                 Byzantine fault tolerance is NOT guaranteed.",
+            common::siem::SecurityEvent::tamper_detected(
+                &format!(
+                    "BFT audit cluster has only {} nodes (minimum {} required). \
+                     Rejecting entry to prevent Byzantine corruption.",
+                    self.nodes.len(),
+                    MIN_BFT_NODES
+                ),
+            );
+            return Err(format!(
+                "BFT quorum enforcement: cluster has {} nodes but minimum {} required. \
+                 Cannot commit audit entries without Byzantine fault tolerance.",
                 self.nodes.len(),
                 MIN_BFT_NODES
-            );
+            ));
         }
 
         // Propose to all nodes, count acceptances.

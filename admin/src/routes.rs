@@ -1417,6 +1417,26 @@ async fn auth_middleware(
                     }
                     return Err(StatusCode::FORBIDDEN);
                 }
+                // SECURITY: Log ALL admin data access (reads), not just mutations.
+                // An insider who reads sensitive data without audit trail can
+                // silently exfiltrate classified information.
+                if req_method == Method::GET || req_method == Method::HEAD {
+                    common::siem::emit_security_event(
+                        common::siem::SecurityEvent::admin_data_access(
+                            &format!("ADMIN_READ: {} {} role={}", req_method, req_path, role),
+                        ),
+                    );
+                    if let Ok(mut log) = state.audit_log.try_write() {
+                        log.append_signed(
+                            common::types::AuditEventType::AdminRbacGranted,
+                            vec![],
+                            vec![],
+                            0.1,
+                            vec![],
+                            &state.pq_signing_key,
+                        );
+                    }
+                }
                 request.extensions_mut().insert(AuthTier(1));
                 request.extensions_mut().insert(AuthAdminRole(role));
                 return Ok(next.run(request).await);

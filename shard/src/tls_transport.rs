@@ -17,8 +17,14 @@ use common::types::ModuleId;
 
 use crate::protocol::ShardProtocol;
 
-/// Maximum SHARD frame payload size (16 MiB). Prevents allocation bombs.
-const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
+/// Maximum SHARD frame payload size (2 MiB). Hardened from 16 MiB to limit
+/// OOM allocation surface while still accommodating ML-DSA-87 signatures,
+/// FROST threshold shares, and OPAQUE ceremony payloads.
+const MAX_FRAME_LEN: u32 = 2 * 1024 * 1024;
+
+/// Timeout for a single recv operation. Prevents slowloris attacks where an
+/// attacker sends 1 byte/minute to hold connection slots indefinitely.
+const SHARD_TLS_RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------
 // Generic read/write helpers over AsyncRead + AsyncWrite
@@ -47,6 +53,16 @@ async fn send_on<W: AsyncWriteExt + Unpin>(
 }
 
 async fn recv_on<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    protocol: &mut ShardProtocol,
+) -> Result<(ModuleId, super::protocol::SecurePayload), MilnetError> {
+    // Wrap entire recv in timeout to prevent slowloris attacks.
+    tokio::time::timeout(SHARD_TLS_RECV_TIMEOUT, recv_on_inner(reader, protocol))
+        .await
+        .map_err(|_| MilnetError::Shard("SHARD TLS recv timed out after 30s".into()))?
+}
+
+async fn recv_on_inner<R: AsyncReadExt + Unpin>(
     reader: &mut R,
     protocol: &mut ShardProtocol,
 ) -> Result<(ModuleId, super::protocol::SecurePayload), MilnetError> {

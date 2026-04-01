@@ -44,14 +44,18 @@ fn verify_raw(verifying_key: &PqVerifyingKey, data: &[u8], sig_bytes: &[u8]) -> 
 }
 
 /// Generate an ML-DSA-87 keypair from OS randomness.
-pub fn generate_pq_keypair() -> (PqSigningKey, PqVerifyingKey) {
+/// Returns error instead of panicking on CSPRNG failure (DoS prevention).
+pub fn generate_pq_keypair() -> Result<(PqSigningKey, PqVerifyingKey), String> {
     let mut seed = [0u8; 32];
     if getrandom::getrandom(&mut seed).is_err() {
-        panic!("FATAL: OS CSPRNG unavailable — cannot generate PQ keypair safely");
+        crate::siem::SecurityEvent::crypto_failure(
+            "OS CSPRNG unavailable during PQ keypair generation",
+        );
+        return Err("FATAL: OS CSPRNG unavailable -- cannot generate PQ keypair safely".into());
     }
     let kp = MlDsa87::from_seed(&seed.into());
     seed.iter_mut().for_each(|b| *b = 0); // zeroize seed
-    (kp.signing_key().clone(), kp.verifying_key().clone())
+    Ok((kp.signing_key().clone(), kp.verifying_key().clone()))
 }
 
 /// Default minimum witnesses required.
@@ -492,7 +496,7 @@ mod tests {
         std::thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
             .name("pq-keygen".into())
-            .spawn(generate_pq_keypair)
+            .spawn(|| generate_pq_keypair().expect("CSPRNG must be available in tests"))
             .expect("failed to spawn keygen thread")
             .join()
             .expect("keygen thread panicked")

@@ -427,6 +427,79 @@ async fn test_rate_limit_config_from_defaults() {
 }
 
 // =========================================================================
+// Hardened Security Tests — Rate Limit Boundary (< vs <=)
+// =========================================================================
+
+#[tokio::test]
+async fn test_rate_limit_exact_boundary_allows_limit_minus_one() {
+    // The gateway's check_rate_limit uses `entry.0 < max_connections_per_ip()`,
+    // meaning the counter is incremented BEFORE the check. With limit=N,
+    // connections 1..N-1 are allowed (count < N), and the Nth is denied
+    // (count == N, which is NOT < N). This test verifies the distributed
+    // rate limiter boundary: exactly `per_ip_limit` requests are allowed.
+    let config = RateLimitConfig {
+        per_ip_limit: 5,
+        per_user_limit: 100,
+        window_secs: 60,
+        burst_size: 100,
+        refill_rate: 1.0,
+        redis_url: None,
+    };
+    let mut limiter = DistributedRateLimiter::new(config).await;
+    limiter.degraded_limit_divisor = 1;
+
+    let ip: std::net::IpAddr = "10.99.0.1".parse().unwrap();
+
+    // Exactly per_ip_limit requests should be allowed
+    for i in 0..5 {
+        let result = limiter.check_ip(ip).await;
+        assert!(
+            result.allowed,
+            "request {} of 5 should be allowed",
+            i + 1
+        );
+        assert_eq!(
+            result.remaining,
+            4 - i,
+            "remaining should count down correctly at request {}",
+            i + 1
+        );
+    }
+
+    // The (per_ip_limit + 1)th request must be denied
+    let result = limiter.check_ip(ip).await;
+    assert!(
+        !result.allowed,
+        "request 6 (limit+1) must be denied"
+    );
+    assert_eq!(result.remaining, 0);
+}
+
+#[tokio::test]
+async fn test_rate_limit_per_ip_limit_of_one() {
+    // Edge case: with per_ip_limit=1, exactly 1 request is allowed.
+    let config = RateLimitConfig {
+        per_ip_limit: 1,
+        per_user_limit: 100,
+        window_secs: 60,
+        burst_size: 100,
+        refill_rate: 1.0,
+        redis_url: None,
+    };
+    let mut limiter = DistributedRateLimiter::new(config).await;
+    limiter.degraded_limit_divisor = 1;
+
+    let ip: std::net::IpAddr = "10.99.0.2".parse().unwrap();
+
+    let first = limiter.check_ip(ip).await;
+    assert!(first.allowed, "first request with limit=1 must be allowed");
+    assert_eq!(first.remaining, 0, "no remaining after first request");
+
+    let second = limiter.check_ip(ip).await;
+    assert!(!second.allowed, "second request with limit=1 must be denied");
+}
+
+// =========================================================================
 // Hardened Security Tests — Puzzle Replay & Adaptive Difficulty
 // =========================================================================
 

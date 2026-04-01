@@ -343,7 +343,7 @@ impl GatewayServer {
         }
 
         entry.0 += 1;
-        entry.0 <= max_connections_per_ip()
+        entry.0 < max_connections_per_ip()
     }
 
     /// Run the server loop, accepting connections forever.

@@ -305,6 +305,61 @@ fn fips_kat_pq_algorithms_lack_hardcoded_vectors() {
     // with deterministic seeding, which is not implemented here.
 }
 
+// ── KSF Argon2id iteration count hardening ──────────────────────────────
+
+/// Verify that Argon2id KSF uses 4 iterations (hardened from 3).
+/// The test stretches a password with 4 iterations (current) and 3 iterations
+/// (old), and confirms the outputs differ. This proves the iteration count
+/// change took effect and passwords stretched with the old params produce
+/// different derived keys.
+#[test]
+fn ksf_argon2id_4_iterations_differs_from_3() {
+    use argon2::{Algorithm, Argon2, Params, Version};
+
+    let password = b"test-password-for-iteration-count";
+    let salt = b"fixed-salt-for-determinism-00000";
+
+    // Current production params: memory=65536 KiB, iterations=4, parallelism=4, output=32
+    let params_4 = Params::new(65536, 4, 4, Some(32)).expect("params_4");
+    let argon2_4 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params_4);
+    let mut output_4 = vec![0u8; 32];
+    argon2_4
+        .hash_password_into(password, salt, &mut output_4)
+        .expect("argon2id with 4 iterations");
+
+    // Old params: same but iterations=3
+    let params_3 = Params::new(65536, 3, 4, Some(32)).expect("params_3");
+    let argon2_3 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params_3);
+    let mut output_3 = vec![0u8; 32];
+    argon2_3
+        .hash_password_into(password, salt, &mut output_3)
+        .expect("argon2id with 3 iterations");
+
+    assert_ne!(
+        output_4, output_3,
+        "4-iteration Argon2id must produce different output from 3-iteration \
+         (proves the hardened iteration count took effect)"
+    );
+
+    // Also verify the production KSF API produces the same 4-iteration output
+    use crypto::kdf::{Argon2idKsf, KeyStretchingFunction};
+    let ksf = Argon2idKsf;
+    let ksf_output = ksf.stretch(password, salt).expect("KSF stretch");
+    assert_eq!(
+        ksf_output, output_4,
+        "Argon2idKsf must use exactly 4 iterations (matching params_4)"
+    );
+}
+
+/// Verify the KSF algorithm ID is correct.
+#[test]
+fn ksf_argon2id_algorithm_id() {
+    use crypto::kdf::{Argon2idKsf, KeyStretchingFunction};
+    let ksf = Argon2idKsf;
+    assert_eq!(ksf.algorithm_id(), "argon2id-v19");
+    assert!(!ksf.is_fips_approved(), "Argon2id is not FIPS approved");
+}
+
 // ── Entropy health audit tests ───────────────────────────────────────────
 
 use crypto::entropy::combined_entropy_checked;
