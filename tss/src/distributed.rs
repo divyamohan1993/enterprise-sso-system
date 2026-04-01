@@ -2031,7 +2031,13 @@ pub fn handle_dkg_round2(
         .into_iter()
         .map(|(id, pkg)| {
             let id_bytes = id.serialize();
-            let pkg_bytes = pkg.serialize().map_err(|e| format!("serialize round2 package: {e}"))?;
+            let pkg_bytes = match pkg.serialize() {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::error!("serialize round2 package failed: {e}");
+                    vec![]
+                }
+            };
             (id_bytes, pkg_bytes)
         })
         .collect();

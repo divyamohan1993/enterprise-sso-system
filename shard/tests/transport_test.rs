@@ -218,8 +218,8 @@ async fn transport_bidirectional() {
 
 #[tokio::test]
 async fn transport_rejects_oversized_frame() {
-    // MAX_FRAME_LEN was hardened from 16 MiB to 2 MiB.
-    // Verify that a frame larger than 2 MiB is rejected.
+    // MAX_FRAME_LEN is 16 MiB.
+    // Verify that a frame larger than 16 MiB is rejected.
     let ca = generate_ca();
     let server_cert = generate_module_cert("localhost", &ca);
     let client_cert = generate_module_cert("client", &ca);
@@ -238,13 +238,13 @@ async fn transport_rejects_oversized_frame() {
 
     let connector = tls_connector(client_cfg);
 
-    // Server: attempt to recv a frame that exceeds 2 MiB
+    // Server: attempt to recv a frame that exceeds 16 MiB
     let server_handle = tokio::spawn(async move {
         let mut server = listener.accept().await.unwrap();
         let result = server.recv().await;
         assert!(
             result.is_err(),
-            "receiving a frame > 2 MiB must fail"
+            "receiving a frame > 16 MiB must fail"
         );
         let err = result.unwrap_err().to_string();
         assert!(
@@ -264,8 +264,8 @@ async fn transport_rejects_oversized_frame() {
     .await
     .unwrap();
 
-    // Send a frame length of 3 MiB (exceeds 2 MiB limit)
-    let oversized_len: u32 = 3 * 1024 * 1024;
+    // Send a frame length of 17 MiB (exceeds 16 MiB limit)
+    let oversized_len: u32 = 17 * 1024 * 1024;
     let payload = vec![0xAA; oversized_len as usize];
     let _ = client.send_raw(&payload).await;
 
@@ -273,8 +273,8 @@ async fn transport_rejects_oversized_frame() {
 }
 
 #[tokio::test]
-async fn transport_accepts_frame_within_2mib_limit() {
-    // Verify that a moderate payload well within the 2 MiB limit is accepted.
+async fn transport_accepts_frame_within_limit() {
+    // Verify that a moderate payload well within the 16 MiB limit is accepted.
     let ca = generate_ca();
     let server_cert = generate_module_cert("localhost", &ca);
     let client_cert = generate_module_cert("client", &ca);
@@ -309,7 +309,7 @@ async fn transport_accepts_frame_within_2mib_limit() {
     )
     .await
     .unwrap();
-    // Send a moderate payload (1 KiB) that fits well within 2 MiB
+    // Send a moderate payload (1 KiB) that fits well within 16 MiB
     let payload = vec![0xBB; 1024];
     client.send(&payload).await.unwrap();
 

@@ -252,7 +252,7 @@ fn test_verify_consistency_detects_divergence() {
             vec![],
             CLASSIFICATION_UNCLASSIFIED,
         )
-        .expect("genesis proposal must succeed on honest 7-node cluster");
+        .expect("genesis proposal must succeed on honest 11-node cluster");
 
     // Before any manipulation all honest nodes must be consistent.
     assert!(
@@ -260,13 +260,12 @@ fn test_verify_consistency_detects_divergence() {
         "honest cluster must be consistent after one accepted entry"
     );
 
-    // Simulate divergence by marking nodes 1..6 as Byzantine (so only node 0
+    // Simulate divergence by marking nodes 1..10 as Byzantine (so only node 0
     // acts as honest proposer) and then proposing a second entry.  Only node 0
     // will accept the new entry (the others are Byzantine and refuse), but the
     // length check in verify_consistency will see node 0 has 2 entries while
-    // the 5 still-honest-looking-but-Byzantine nodes have only 1, triggering
-    // a divergence report.
-    for id in 1u8..7 {
+    // the rest have only 1, triggering a divergence report.
+    for id in 1u8..11 {
         cluster.set_byzantine(id);
     }
 
@@ -282,7 +281,7 @@ fn test_verify_consistency_detects_divergence() {
         CLASSIFICATION_UNCLASSIFIED,
     );
 
-    // Restore nodes 1..6 as non-Byzantine so verify_consistency compares them
+    // Restore nodes 1..10 as non-Byzantine so verify_consistency compares them
     // (the function only compares non-Byzantine nodes internally).  We need at
     // least two honest nodes with different lengths for the check to fire.
     // Reset node 1 to honest so it has a different length than node 0.

@@ -17,10 +17,9 @@ use common::types::ModuleId;
 
 use crate::protocol::ShardProtocol;
 
-/// Maximum SHARD frame payload size (2 MiB). Hardened from 16 MiB to limit
-/// OOM allocation surface while still accommodating ML-DSA-87 signatures,
-/// FROST threshold shares, and OPAQUE ceremony payloads.
-const MAX_FRAME_LEN: u32 = 2 * 1024 * 1024;
+/// Maximum SHARD frame payload size (16 MiB). Accommodates ML-DSA-87 signatures,
+/// FROST threshold shares, OPAQUE ceremony payloads, and concurrent e2e flows.
+const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
 
 /// Timeout for a single recv operation. Prevents slowloris attacks where an
 /// attacker sends 1 byte/minute to hold connection slots indefinitely.
