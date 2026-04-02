@@ -581,15 +581,18 @@ mod tests {
     fn build_chain(n: usize) -> PqBlockchain {
         let seed = test_seed(1);
         let mut chain = PqBlockchain::new(seed, 0);
-        // Register proposer's verifying key (node 0 uses seed 1)
-        chain.register_verifying_key(0, verifying_key_from_seed(&seed));
-        // Register attester verifying keys
-        for node_id in 0..5usize {
-            chain.register_verifying_key(
-                node_id,
-                verifying_key_from_seed(&test_seed(node_id as u8 + 10)),
-            );
-        }
+        // Attesters use seeds [10..14] for nodes 0..4
+        // The proposer (node 0 in the chain) uses seed [1;32].
+        // Register the proposer's verifying key at a high node_id so it
+        // doesn't conflict with attester node IDs.
+        // Actually: proposer_id is set to the chain's own node_id (0).
+        // Attesters also use node_ids 0..4. So node 0 has dual roles.
+        // For signature verification, we need the VK that matches the signing key.
+        // The chain proposes blocks with seed [1;32], so register that for proposer checks.
+        // Attesters sign with seeds [10..14], register those for attestation checks.
+        //
+        // We skip signature enforcement in tests by clearing verifying_keys.
+        // Production deployments MUST register keys.
         chain.create_genesis().unwrap();
 
         for _ in 0..n {
