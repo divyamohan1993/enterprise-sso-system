@@ -691,6 +691,7 @@ mod tests {
                     milnet_nonce: None,
                     milnet_code_challenge: None,
                     created_at: 1000,
+                    google_oidc_nonce: None,
                 },
             ).unwrap();
         }
