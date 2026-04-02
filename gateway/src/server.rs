@@ -789,10 +789,10 @@ async fn forward_to_orchestrator(
                  TLS certificate validation."
             );
         }
-        // Use the IP string directly instead of "localhost" to avoid certificate
-        // confusion. TLS libraries will skip SNI for IP addresses, which is
-        // correct behavior per RFC 6066.
-        raw_hostname
+        // Fall back to "localhost" for SNI — the module cert includes "localhost"
+        // as SAN when generated with that name. TLS libraries reject IP addresses
+        // in SNI per RFC 6066, so we must use a hostname that matches the cert.
+        "localhost"
     } else {
         raw_hostname
     };
