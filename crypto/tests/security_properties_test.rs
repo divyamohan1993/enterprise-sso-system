@@ -268,18 +268,11 @@ fn slh_dsa_parameters_deviate_from_fips205() {
     // FIPS 205 SLH-DSA-SHA2-256f mandates 49,856-byte signatures.
     const FIPS205_SHA2_256F_SIG_SIZE: usize = 49_856;
 
-    // SECURITY AUDIT: SLH-DSA uses non-standard params, not FIPS 205 compliant
-    // Actual signature size is 5,568 bytes (H=8,D=1,K=14,A=6), far smaller
-    // than the 49,856 bytes required by the standardized parameter set.
-    assert_ne!(
-        sig.as_bytes().len(),
-        FIPS205_SHA2_256F_SIG_SIZE,
-        "signature size must NOT match FIPS 205 SHA2-256f — impl uses non-standard params"
-    );
+    // Parameters now match FIPS 205 SLH-DSA-SHA2-256f (h=66, d=22, k=33, a=8).
     assert_eq!(
         sig.as_bytes().len(),
-        5568,
-        "actual signature size should be 5568 bytes (N=32 + FORS=3136 + HT=2400)"
+        FIPS205_SHA2_256F_SIG_SIZE,
+        "signature size must match FIPS 205 SHA2-256f standard parameters"
     );
 }
 
