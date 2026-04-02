@@ -24,7 +24,10 @@ pub type StateSigningKey = SigningKey<MlDsa87>;
 pub type StateVerifyingKey = VerifyingKey<MlDsa87>;
 
 /// Maximum clock skew tolerance in seconds for timestamp validation.
-const MAX_TIMESTAMP_SKEW_SECS: i64 = 30;
+/// Set to 5s -- all nodes MUST use NTP with secure time synchronization
+/// (NTS or authenticated NTP). Nodes exceeding this skew will have their
+/// state entries rejected.
+const MAX_TIMESTAMP_SKEW_SECS: i64 = 5;
 
 /// Domain separation prefix for state entry hashing.
 const STATE_ENTRY_DOMAIN: &[u8] = b"MILNET-STATE-CHAIN-ENTRY-v1";

@@ -174,10 +174,16 @@ pub fn enforce_cnsa2_level5() -> Cnsa2Level5Status {
     });
     checks.push(Cnsa2Check {
         component: "Key Exchange (TLS transport)",
-        required: "ML-KEM-1024 (Level 5) — PENDING upstream rustls support",
-        actual: "X25519MLKEM768 (Level 3) — mitigated by application-layer X-Wing".to_string(),
-        passed: true, // Accepted with documented mitigation
+        required: "ML-KEM-1024 (Level 5) -- PENDING upstream rustls support",
+        actual: "X25519MLKEM768 (Level 3) -- mitigated by application-layer X-Wing".to_string(),
+        passed: false, // Honest: ML-KEM-768 is Level 3, not Level 5
     });
+    if true {
+        tracing::warn!(
+            "CNSA2-LEVEL5: TLS transport uses X25519MLKEM768 (Level 3), not ML-KEM-1024 (Level 5). \
+             Application-layer X-Wing provides defense-in-depth, but TLS gap remains."
+        );
+    }
 
     // Check 5: KDF must be HKDF-SHA512
     checks.push(Cnsa2Check {
@@ -220,18 +226,26 @@ mod tests {
     }
 
     #[test]
-    fn cnsa2_level5_enforcement_passes_with_defaults() {
-        // With default config (no MILNET_PQ_SIGNATURE_ALG set), ML-DSA-87 is used
-        // and all checks should pass.
+    fn cnsa2_level5_enforcement_with_defaults() {
+        // With default config (no MILNET_PQ_SIGNATURE_ALG set), ML-DSA-87 is used.
+        // TLS transport uses ML-KEM-768 (Level 3) which is honestly reported as failing.
         let status = enforce_cnsa2_level5();
-        assert!(status.passed, "CNSA 2.0 Level 5 enforcement should pass with defaults");
+        assert!(!status.passed, "CNSA 2.0 Level 5 should report TLS gap honestly");
         assert!(!status.checks.is_empty());
+
+        // TLS transport check should be the only failure
+        let tls_check = status.checks.iter().find(|c| c.component == "Key Exchange (TLS transport)").unwrap();
+        assert!(!tls_check.passed, "TLS transport ML-KEM-768 gap should be reported as failing");
+
+        // All other checks should pass
         for check in &status.checks {
-            assert!(
-                check.passed,
-                "Check '{}' failed: required={}, actual={}",
-                check.component, check.required, check.actual
-            );
+            if check.component != "Key Exchange (TLS transport)" {
+                assert!(
+                    check.passed,
+                    "Check '{}' failed: required={}, actual={}",
+                    check.component, check.required, check.actual
+                );
+            }
         }
     }
 }

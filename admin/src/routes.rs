@@ -116,10 +116,22 @@ fn validate_csrf_token(token: &str, session_state: &str, api_key: &str, cookie_v
 /// Returns false if the token was already consumed (replay attempt).
 async fn check_and_mark_csrf_used(token: &str, used_tokens: &RwLock<HashSet<String>>) -> bool {
     let mut used = used_tokens.write().await;
-    // Enforce capacity on the used-token set
+    // Enforce capacity: evict tokens older than TTL instead of bulk-clearing.
+    // Bulk clear creates a replay window where recently-consumed tokens can be
+    // replayed. Instead, we parse the timestamp from each stored token and
+    // remove only those that have expired.
     if used.len() >= MAX_USED_CSRF_TOKENS {
-        // Clear the entire set; stale tokens are already expired by TTL check
-        used.clear();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or(std::time::Duration::ZERO)
+            .as_secs();
+        used.retain(|t| {
+            // CSRF tokens have format "timestamp:nonce:hmac"
+            t.split(':').next()
+                .and_then(|ts| ts.parse::<u64>().ok())
+                .map(|ts| now.saturating_sub(ts) <= CSRF_TOKEN_TTL_SECS)
+                .unwrap_or(false) // remove malformed entries
+        });
     }
     // insert() returns true if the value was newly inserted (not present before)
     used.insert(token.to_string())
@@ -309,13 +321,17 @@ fn resolve_admin_role(api_key: &str) -> Option<AdminRole> {
         AdminRole::Auditor,
         AdminRole::ReadOnly,
     ];
+    // SECURITY: Always iterate ALL roles to prevent timing side-channels
+    // that leak the role index of a valid key. A variable accumulates the
+    // match without early exit.
+    let mut matched: Option<AdminRole> = None;
     for role in &roles {
         let derived = derive_admin_role_key(*role);
         if crypto::ct::ct_eq(api_key.as_bytes(), derived.as_bytes()) {
-            return Some(*role);
+            matched = Some(*role);
         }
     }
-    None
+    matched
 }
 
 /// Determine the minimum required `AdminRole` for a given request path and method.
@@ -3468,13 +3484,18 @@ pub fn spawn_ttl_eviction_task(state: Arc<AppState>) {
                 enforce_map_capacity(&mut *tokens, MAX_ACCESS_TOKENS);
             }
 
-            // Clean used_csrf_tokens — tokens older than CSRF_TOKEN_TTL_SECS
-            // are already rejected by validate_csrf_token, so a periodic
-            // full clear is safe and prevents unbounded growth.
+            // Clean used_csrf_tokens — evict only tokens older than TTL.
+            // Bulk clear would create a replay window for recently-consumed tokens.
             {
                 let mut used = state.used_csrf_tokens.write().await;
                 if used.len() > MAX_USED_CSRF_TOKENS / 2 {
-                    used.clear();
+                    let now_u = now as u64;
+                    used.retain(|t| {
+                        t.split(':').next()
+                            .and_then(|ts| ts.parse::<u64>().ok())
+                            .map(|ts| now_u.saturating_sub(ts) <= CSRF_TOKEN_TTL_SECS)
+                            .unwrap_or(false)
+                    });
                 }
             }
 
@@ -4541,6 +4562,9 @@ async fn oauth_google_start(
     // Generate a random state token for the Google flow
     let state_token = hex::encode(crypto::entropy::generate_nonce());
 
+    // Generate OIDC nonce for replay prevention in ID token
+    let google_oidc_nonce = crate::google_oauth::generate_oidc_nonce();
+
     // Store pending auth so we can resume on callback
     let pending = crate::google_oauth::PendingGoogleAuth {
         milnet_client_id: params.client_id,
@@ -4550,6 +4574,7 @@ async fn oauth_google_start(
         milnet_nonce: params.nonce,
         milnet_code_challenge: params.code_challenge,
         created_at: now_secs(),
+        google_oidc_nonce: Some(google_oidc_nonce.clone()),
     };
     {
         let mut store = state.pending_google.write().await;
@@ -4559,7 +4584,7 @@ async fn oauth_google_start(
     }
 
     // Build Google auth URL and redirect
-    let google_url = crate::google_oauth::build_google_auth_url(google_config, &state_token);
+    let google_url = crate::google_oauth::build_google_auth_url(google_config, &state_token, &google_oidc_nonce);
     (StatusCode::FOUND, [(header::LOCATION, google_url)]).into_response()
 }
 
@@ -4643,6 +4668,21 @@ async fn oauth_google_callback(
             return (StatusCode::BAD_REQUEST, format!("invalid id_token: {e}")).into_response();
         }
     };
+    // Verify OIDC nonce matches what we sent in the auth request
+    if let Some(ref expected_nonce) = pending.google_oidc_nonce {
+        match &claims.nonce {
+            Some(returned_nonce) if crypto::ct::ct_eq(returned_nonce.as_bytes(), expected_nonce.as_bytes()) => {},
+            Some(_) => {
+                tracing::error!("Google OIDC nonce mismatch -- possible ID token replay attack");
+                return (StatusCode::BAD_REQUEST, "OIDC nonce mismatch -- possible replay attack").into_response();
+            }
+            None => {
+                tracing::error!("Google ID token missing nonce claim");
+                return (StatusCode::BAD_REQUEST, "ID token missing required nonce claim").into_response();
+            }
+        }
+    }
+
     // Additional verification (email_verified, etc.)
     if let Err(e) = crate::google_oauth::verify_google_id_token(&claims, &google_config.client_id) {
         tracing::error!("Google claim verification failed: {e}");

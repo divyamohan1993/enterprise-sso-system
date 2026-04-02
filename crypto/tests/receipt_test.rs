@@ -43,7 +43,8 @@ fn valid_chain_validates() {
     chain.add_receipt(r1).unwrap();
     chain.add_receipt(r2).unwrap();
     chain.add_receipt(r3).unwrap();
-    chain.validate().unwrap();
+    // validate() without key always returns Err (unsafe without signature check)
+    assert!(chain.validate().is_err());
     assert_eq!(chain.len(), 3);
 }
 
@@ -102,5 +103,6 @@ fn tampered_receipt_fails_verification() {
 fn empty_chain_fails() {
     let chain = ReceiptChain::new(TEST_SESSION_ID);
     let err = chain.validate().unwrap_err();
-    assert!(err.contains("empty receipt chain"));
+    // validate() now always returns Err (requires signing key)
+    assert!(err.contains("validate()") || err.contains("unsafe"));
 }

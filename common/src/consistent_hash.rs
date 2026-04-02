@@ -5,6 +5,16 @@
 use sha2::{Digest, Sha512};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+/// Certificate proving a node is authorized to join the ring.
+/// Must be signed by the cluster CA using ML-DSA-87.
+#[derive(Debug, Clone)]
+pub struct NodeCertificate {
+    /// The node ID this certificate authorizes.
+    pub node_id: String,
+    /// ML-DSA-87 signature from the cluster CA over the node_id.
+    pub ca_signature: Vec<u8>,
+}
+
 pub struct ConsistentHashRing {
     /// hash position -> node_id
     ring: BTreeMap<u64, String>,
@@ -12,6 +22,9 @@ pub struct ConsistentHashRing {
     virtual_nodes_per_real: usize,
     /// Set of real node IDs.
     nodes: HashSet<String>,
+    /// ML-DSA-87 verifying key of the cluster CA. If set, all add_node calls
+    /// must provide a valid NodeCertificate.
+    ca_verifying_key: Option<Vec<u8>>,
 }
 
 impl ConsistentHashRing {
@@ -22,10 +35,34 @@ impl ConsistentHashRing {
             ring: BTreeMap::new(),
             virtual_nodes_per_real,
             nodes: HashSet::new(),
+            ca_verifying_key: None,
         }
     }
 
+    /// Create a ring that requires node authentication via ML-DSA-87 certificates.
+    pub fn with_ca_key(virtual_nodes_per_real: usize, ca_verifying_key: Vec<u8>) -> Self {
+        Self {
+            ring: BTreeMap::new(),
+            virtual_nodes_per_real,
+            nodes: HashSet::new(),
+            ca_verifying_key: Some(ca_verifying_key),
+        }
+    }
+
+    /// Add an authenticated node with its virtual nodes to the ring.
+    /// If a CA key is configured, the certificate must be valid or the node is rejected.
+    pub fn add_node_authenticated(&mut self, cert: &NodeCertificate) -> Result<(), String> {
+        if let Some(ca_key) = &self.ca_verifying_key {
+            if !verify_node_certificate(&cert.node_id, &cert.ca_signature, ca_key) {
+                return Err(format!("node '{}' certificate verification failed", cert.node_id));
+            }
+        }
+        self.add_node(&cert.node_id);
+        Ok(())
+    }
+
     /// Add a node with its virtual nodes to the ring.
+    /// When a CA key is configured, prefer `add_node_authenticated` instead.
     pub fn add_node(&mut self, node_id: &str) {
         if !self.nodes.insert(node_id.to_owned()) {
             return; // already present
@@ -144,6 +181,20 @@ impl ConsistentHashRing {
             }
         )
     }
+}
+
+/// Verify an ML-DSA-87 node certificate against the cluster CA key.
+fn verify_node_certificate(node_id: &str, signature: &[u8], ca_key_bytes: &[u8]) -> bool {
+    use ml_dsa::{signature::Verifier, MlDsa87, VerifyingKey};
+    let vk = match VerifyingKey::<MlDsa87>::try_from(ca_key_bytes) {
+        Ok(k) => k,
+        Err(_) => return false,
+    };
+    let sig = match ml_dsa::Signature::<MlDsa87>::try_from(signature) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    vk.verify(node_id.as_bytes(), &sig).is_ok()
 }
 
 // ---------------------------------------------------------------------------

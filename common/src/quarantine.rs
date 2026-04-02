@@ -89,8 +89,10 @@ impl ForensicSnapshot {
         let network_connections = std::fs::read_to_string("/proc/net/tcp")
             .unwrap_or_else(|e| format!("error reading /proc/net/tcp: {e}"));
 
-        let loaded_libraries = std::fs::read_to_string("/proc/self/maps")
-            .unwrap_or_else(|e| format!("error reading /proc/self/maps: {e}"));
+        let loaded_libraries = match std::fs::read_to_string("/proc/self/maps") {
+            Ok(maps) => redact_aslr_addresses(&maps),
+            Err(e) => format!("error reading /proc/self/maps: {e}"),
+        };
 
         let environment = capture_sanitized_env();
 
@@ -409,6 +411,36 @@ fn capture_sanitized_env() -> String {
 
     entries.sort();
     entries.join("\n")
+}
+
+/// Redact ASLR addresses from /proc/self/maps content.
+/// Replaces hex address ranges (e.g., "7f1234560000-7f1234570000") with "REDACTED"
+/// while preserving the pathname column for library identification.
+fn redact_aslr_addresses(maps: &str) -> String {
+    maps.lines()
+        .map(|line| {
+            // /proc/self/maps format:
+            // address           perms offset  dev   inode   pathname
+            // 7f1234560000-7f1234570000 r-xp 00000000 08:01 12345 /usr/lib/libc.so
+            let parts: Vec<&str> = line.splitn(6, ' ').collect();
+            if parts.len() >= 6 {
+                // Keep permissions and pathname, redact addresses and offset
+                format!(
+                    "REDACTED {} REDACTED {} {} {}",
+                    parts.get(1).unwrap_or(&""),
+                    parts.get(3).unwrap_or(&""),
+                    parts.get(4).unwrap_or(&""),
+                    parts.get(5).unwrap_or(&"").trim()
+                )
+            } else if parts.len() >= 2 {
+                // Short line: redact the address portion
+                format!("REDACTED {}", parts[1..].join(" "))
+            } else {
+                "REDACTED".to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

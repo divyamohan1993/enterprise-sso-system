@@ -152,7 +152,8 @@ fn receipt_chain_valid_two_step() {
     chain.add_receipt(r2).unwrap();
 
     assert_eq!(chain.len(), 2);
-    assert!(chain.validate().is_ok());
+    // validate() without key always returns Err (unsafe without signature check)
+    assert!(chain.validate().is_err());
     assert!(chain.validate_with_key(&key).is_ok());
 }
 

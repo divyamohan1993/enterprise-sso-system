@@ -41,12 +41,18 @@ pub const MAX_ADMIN_REQUEST_SIZE: u32 = 256 * 1024;    // 256 KiB
 pub const MAX_DEFAULT_REQUEST_SIZE: u32 = 64 * 1024;   // 64 KiB
 
 /// Maximum connections per IP within the rate-limit window.
-/// Override with MILNET_MAX_CONN_PER_IP for load testing (default: 10).
-fn max_connections_per_ip() -> u32 {
+/// Read once at process init to prevent env mutation attacks and remove
+/// repeated syscall overhead. Override with MILNET_MAX_CONN_PER_IP for
+/// load testing (default: 10).
+static MAX_CONN_PER_IP: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
     std::env::var("MILNET_MAX_CONN_PER_IP")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(10)
+});
+
+fn max_connections_per_ip() -> u32 {
+    *MAX_CONN_PER_IP
 }
 
 /// Rate-limit window duration (60 seconds).
@@ -141,6 +147,20 @@ fn load_key_pins() -> Vec<String> {
             pins
         }
         _ => {
+            if std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok() {
+                error!(
+                    "SIEM:CRITICAL MILNET_GATEWAY_KEY_PINS is empty/absent in military deployment \
+                     — key pinning is MANDATORY. Refusing to start."
+                );
+                common::siem::SecurityEvent::tamper_detected(
+                    "Gateway startup blocked: MILNET_GATEWAY_KEY_PINS not configured in military \
+                     deployment. Key pinning is mandatory for DoD operations.",
+                );
+                // Return a sentinel that will cause verify_key_pin to fail and
+                // the server to refuse startup, but we also log the SIEM event.
+                // The caller checks pin verification and returns a fatal error.
+                return Vec::new(); // Empty pins + military mode = fatal in bind()
+            }
             warn!("X-Wing key pinning DISABLED — set MILNET_GATEWAY_KEY_PINS for production");
             Vec::new()
         }
@@ -226,6 +246,12 @@ impl GatewayServer {
             &fingerprint[..16]
         );
         let key_pins = load_key_pins();
+        if std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok() && key_pins.is_empty() {
+            return Err(std::io::Error::other(
+                "FATAL: MILNET_GATEWAY_KEY_PINS is mandatory in military deployment. \
+                 Configure key pins before starting the gateway.",
+            ));
+        }
         if !verify_key_pin(&fingerprint, &key_pins) {
             return Err(std::io::Error::other(
                 "FATAL: X-Wing server key fingerprint does not match any pinned value. \
@@ -282,6 +308,12 @@ impl GatewayServer {
             &fingerprint[..16]
         );
         let key_pins = load_key_pins();
+        if std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok() && key_pins.is_empty() {
+            return Err(std::io::Error::other(
+                "FATAL: MILNET_GATEWAY_KEY_PINS is mandatory in military deployment. \
+                 Configure key pins before starting the gateway.",
+            ));
+        }
         if !verify_key_pin(&fingerprint, &key_pins) {
             return Err(std::io::Error::other(
                 "FATAL: X-Wing server key fingerprint does not match any pinned value. \
@@ -352,6 +384,22 @@ impl GatewayServer {
     /// connections.  The per-instance `self.difficulty` field acts as the
     /// *minimum* difficulty; the adaptive function may raise it under load.
     pub async fn run(&self) -> std::io::Result<()> {
+        // In military deployment, TLS is mandatory. Refuse to accept any
+        // connections if TLS is not configured.
+        if std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok() && self.tls_acceptor.is_none() {
+            error!(
+                "SIEM:CRITICAL Military deployment requires TLS — tls_acceptor is None. \
+                 Refusing to accept connections."
+            );
+            common::siem::SecurityEvent::tamper_detected(
+                "Gateway refused to start: TLS not configured in military deployment. \
+                 Plaintext connections are forbidden in DoD environments.",
+            );
+            return Err(std::io::Error::other(
+                "FATAL: TLS is mandatory in military deployment (MILNET_MILITARY_DEPLOYMENT set). \
+                 Configure TLS before starting the gateway.",
+            ));
+        }
         loop {
             let (tcp_stream, addr) = self.listener.accept().await?;
 
@@ -728,8 +776,23 @@ async fn forward_to_orchestrator(
         .split(':')
         .next()
         .unwrap_or(&config.addr);
-    let orch_hostname = if raw_hostname.parse::<std::net::IpAddr>().is_ok() {
-        "localhost"
+    let is_raw_ip = raw_hostname.parse::<std::net::IpAddr>().is_ok();
+    let orch_hostname = if is_raw_ip {
+        // In military deployment, raw IP addresses for orchestrator are a SIEM warning:
+        // SNI cannot carry IP addresses per RFC 6066, and "localhost" fallback weakens
+        // certificate validation. Require hostname-based addressing.
+        if std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok() {
+            warn!(
+                orchestrator_addr = %config.addr,
+                "SIEM:WARNING Orchestrator addressed by raw IP in military deployment. \
+                 SNI cannot carry IP addresses (RFC 6066). Use a hostname for proper \
+                 TLS certificate validation."
+            );
+        }
+        // Use the IP string directly instead of "localhost" to avoid certificate
+        // confusion. TLS libraries will skip SNI for IP addresses, which is
+        // correct behavior per RFC 6066.
+        raw_hostname
     } else {
         raw_hostname
     };
@@ -856,12 +919,25 @@ async fn recv_raw_frame_limited(
         .map_err(|e| format!("read length: {e}"))?;
     let len = u32::from_be_bytes(len_buf);
     if len > max_size {
+        warn!(
+            frame_len = len,
+            max_size = max_size,
+            "SIEM:SECURITY payload exceeds endpoint size limit"
+        );
         return Err(format!(
             "payload too large: {len} bytes (limit {max_size} bytes)"
         ));
     }
     if len > MAX_FRAME_LEN {
-        return Err(format!("frame too large: {len} bytes"));
+        error!(
+            frame_len = len,
+            max_frame_len = MAX_FRAME_LEN,
+            "SIEM:SECURITY wire frame exceeds maximum size — possible memory exhaustion attack"
+        );
+        common::siem::SecurityEvent::rate_limit_exceeded(
+            &format!("wire frame rejected: {len} bytes exceeds {MAX_FRAME_LEN} byte limit"),
+        );
+        return Err(format!("frame too large: {len} bytes (max {MAX_FRAME_LEN})"));
     }
     let total = usize::try_from(len).map_err(|_| "frame size overflows usize".to_string())?;
 

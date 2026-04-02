@@ -99,6 +99,35 @@ fn munlock_slice(ptr: *const u8, len: usize) {
     }
 }
 
+/// Process-wide HMAC key for canary derivation.
+/// Expected canary values are derived from HMAC(process_key, buffer_addr)
+/// so they are NOT co-located with the secret in the same struct.
+fn process_canary_key() -> &'static [u8; 32] {
+    static KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| {
+        let mut k = [0u8; 32];
+        getrandom::getrandom(&mut k).expect("FATAL: cannot generate process canary key");
+        k
+    })
+}
+
+/// Derive a canary value from a buffer address using HMAC-SHA256 with the
+/// process-wide key. This ensures expected canary values are not stored
+/// alongside the secret they protect.
+fn derive_canary(addr: usize, salt: u8) -> u64 {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(process_canary_key())
+        .expect("HMAC key length is always valid");
+    mac.update(&addr.to_ne_bytes());
+    mac.update(&[salt]);
+    let result = mac.finalize().into_bytes();
+    u64::from_ne_bytes([
+        result[0], result[1], result[2], result[3],
+        result[4], result[5], result[6], result[7],
+    ])
+}
+
 /// Generate a random `u64` canary value from OS CSPRNG.
 fn random_canary() -> Result<u64, MemguardError> {
     let mut buf = [0u8; 8];
@@ -122,10 +151,6 @@ pub struct SecretBuffer<const N: usize> {
     data: [u8; N],
     /// Tail canary — mirrors `canary_head` with an independent random value.
     canary_tail: u64,
-    /// The expected head canary value (stored separately for comparison).
-    expected_head: u64,
-    /// The expected tail canary value (stored separately for comparison).
-    expected_tail: u64,
     /// Whether `mlock` succeeded for this buffer.
     locked: bool,
 }
@@ -142,17 +167,22 @@ impl<const N: usize> SecretBuffer<N> {
             return Err(MemguardError::InvalidSize);
         }
 
-        let head = random_canary()?;
-        let tail = random_canary()?;
-
+        // Canary values are set after construction using derive_canary()
+        // based on the buffer's heap address. This ensures expected values
+        // are derived from a process-wide HMAC key, not stored in the struct.
         let mut buf = Self {
-            canary_head: head,
+            canary_head: 0,
             data,
-            canary_tail: tail,
-            expected_head: head,
-            expected_tail: tail,
+            canary_tail: 0,
             locked: false,
         };
+
+        // Derive canaries from the buffer's address using the process-wide HMAC key.
+        let addr = buf.data.as_ptr() as usize;
+        let head = derive_canary(addr, 0x01);
+        let tail = derive_canary(addr, 0x02);
+        buf.canary_head = head;
+        buf.canary_tail = tail;
 
         // Attempt to mlock the data region.
         // SECURITY: mlock prevents key material from being swapped to disk.
@@ -196,12 +226,17 @@ impl<const N: usize> SecretBuffer<N> {
 
     /// Verify canary integrity using constant-time comparison.
     ///
-    /// Returns `true` if both canaries are intact.
+    /// Expected canary values are derived from a process-wide HMAC key
+    /// and the buffer's address, so they are NOT stored in this struct.
+    /// An attacker who overwrites the canary fields cannot also overwrite
+    /// the expected values (they live in a separate static).
     pub fn verify_canaries(&self) -> bool {
-        // Constant-time: XOR both pairs and OR the results.  Any non-zero
-        // bit means corruption.
-        let head_diff = self.canary_head ^ self.expected_head;
-        let tail_diff = self.canary_tail ^ self.expected_tail;
+        let addr = self.data.as_ptr() as usize;
+        let expected_head = derive_canary(addr, 0x01);
+        let expected_tail = derive_canary(addr, 0x02);
+        // Constant-time: XOR both pairs and OR the results.
+        let head_diff = self.canary_head ^ expected_head;
+        let tail_diff = self.canary_tail ^ expected_tail;
         (head_diff | tail_diff) == 0
     }
 
@@ -265,8 +300,6 @@ impl<const N: usize> Drop for SecretBuffer<N> {
         // 3. Zeroize canary material so it cannot be recovered.
         self.canary_head.zeroize();
         self.canary_tail.zeroize();
-        self.expected_head.zeroize();
-        self.expected_tail.zeroize();
     }
 }
 
@@ -293,10 +326,10 @@ pub struct SecretVec {
     data: Vec<u8>,
     /// Original length at construction time, used for munlock.
     original_len: usize,
-    /// Canary value set at construction.
+    /// Head canary value set at construction.
     canary: u64,
-    /// Expected canary value for verification.
-    expected_canary: u64,
+    /// Tail canary value set at construction.
+    canary_tail: u64,
     /// Whether `mlock` succeeded for this buffer.
     locked: bool,
 }
@@ -311,16 +344,19 @@ impl SecretVec {
             return Err(MemguardError::InvalidSize);
         }
 
-        let canary = random_canary()?;
-
         let original_len = data.len();
         let mut sv = Self {
             data,
             original_len,
-            canary,
-            expected_canary: canary,
+            canary: 0,
+            canary_tail: 0,
             locked: false,
         };
+
+        // Derive canaries from the buffer's heap address
+        let addr = sv.data.as_ptr() as usize;
+        sv.canary = derive_canary(addr, 0x03);
+        sv.canary_tail = derive_canary(addr, 0x04);
 
         let ptr = sv.data.as_ptr();
         let len = sv.data.len();
@@ -356,9 +392,14 @@ impl SecretVec {
         Ok(sv)
     }
 
-    /// Verify canary integrity using constant-time comparison.
+    /// Verify head and tail canary integrity using constant-time comparison.
     pub fn verify_canary(&self) -> bool {
-        (self.canary ^ self.expected_canary) == 0
+        let addr = self.data.as_ptr() as usize;
+        let expected_head = derive_canary(addr, 0x03);
+        let expected_tail = derive_canary(addr, 0x04);
+        let head_diff = self.canary ^ expected_head;
+        let tail_diff = self.canary_tail ^ expected_tail;
+        (head_diff | tail_diff) == 0
     }
 
     /// Borrow the protected data as a byte slice.
@@ -410,7 +451,7 @@ impl Drop for SecretVec {
 
         // 3. Zeroize canary material.
         self.canary.zeroize();
-        self.expected_canary.zeroize();
+        self.canary_tail.zeroize();
     }
 }
 
@@ -472,7 +513,7 @@ pub fn harden_process() -> bool {
         {
             let mlockall_result = libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE);
             if mlockall_result == 0 {
-                eprintln!("[memguard] hardening: mlockall(MCL_CURRENT|MCL_FUTURE) applied — all memory locked in RAM");
+                tracing::info!("[memguard] hardening: mlockall(MCL_CURRENT|MCL_FUTURE) applied — all memory locked in RAM");
             } else {
                 let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
                     .map(|v| v == "1")
@@ -486,7 +527,7 @@ pub fn harden_process() -> bool {
                          or grant CAP_IPC_LOCK capability."
                     );
                 }
-                eprintln!(
+                tracing::warn!(
                     "[memguard] WARNING: mlockall() failed — secrets may be swappable to disk. \
                      Set RLIMIT_MEMLOCK to unlimited or grant CAP_IPC_LOCK."
                 );
@@ -495,16 +536,16 @@ pub fn harden_process() -> bool {
         }
 
         if libc::prctl(libc::PR_SET_DUMPABLE, 0) != 0 {
-            eprintln!("[memguard] WARNING: prctl(PR_SET_DUMPABLE, 0) failed");
+            tracing::warn!("[memguard] prctl(PR_SET_DUMPABLE, 0) failed");
             ok = false;
         } else {
-            eprintln!("[memguard] hardening: PR_SET_DUMPABLE=0 applied (core dumps disabled)");
+            tracing::info!("[memguard] hardening: PR_SET_DUMPABLE=0 applied (core dumps disabled)");
         }
         if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
-            eprintln!("[memguard] WARNING: prctl(PR_SET_NO_NEW_PRIVS) failed");
+            tracing::warn!("[memguard] prctl(PR_SET_NO_NEW_PRIVS) failed");
             ok = false;
         } else {
-            eprintln!("[memguard] hardening: PR_SET_NO_NEW_PRIVS=1 applied");
+            tracing::info!("[memguard] hardening: PR_SET_NO_NEW_PRIVS=1 applied");
         }
 
         // Prevent ptrace attachment (anti-debugging)
@@ -514,9 +555,9 @@ pub fn harden_process() -> bool {
             if libc::prctl(libc::PR_SET_PTRACER, 0, 0, 0, 0) != 0 {
                 // PR_SET_PTRACER may not be available on all kernels (requires Yama LSM),
                 // so treat failure as non-fatal but log it.
-                eprintln!("[memguard] WARNING: prctl(PR_SET_PTRACER, 0) failed (Yama LSM may not be enabled)");
+                tracing::warn!("[memguard] prctl(PR_SET_PTRACER, 0) failed (Yama LSM may not be enabled)");
             } else {
-                eprintln!("[memguard] hardening: PR_SET_PTRACER=0 applied (ptrace attachment denied)");
+                tracing::info!("[memguard] hardening: PR_SET_PTRACER=0 applied (ptrace attachment denied)");
             }
         }
 
@@ -525,10 +566,10 @@ pub fn harden_process() -> bool {
         {
             let rlim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
             if libc::setrlimit(libc::RLIMIT_CORE, &rlim) != 0 {
-                eprintln!("[memguard] WARNING: setrlimit(RLIMIT_CORE, 0) failed");
+                tracing::warn!("[memguard] setrlimit(RLIMIT_CORE, 0) failed");
                 ok = false;
             } else {
-                eprintln!("[memguard] hardening: RLIMIT_CORE=0 applied (core dumps prevented at resource limit level)");
+                tracing::info!("[memguard] hardening: RLIMIT_CORE=0 applied (core dumps prevented at resource limit level)");
             }
         }
     }

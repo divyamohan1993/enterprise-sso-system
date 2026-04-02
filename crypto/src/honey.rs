@@ -156,7 +156,24 @@ pub fn honey_encrypt(
 /// The fake value is deterministic for a given (wrong_key, ciphertext) pair
 /// so an attacker consistently sees the same plausible answer for each guess.
 pub fn honey_decrypt(key: &[u8; 32], honey: &HoneyEncrypted) -> Vec<u8> {
-    match crate::symmetric::decrypt(key, &honey.ciphertext, b"MILNET-HONEY-v1") {
+    // SECURITY: Always execute BOTH the decryption path AND the fake-generation
+    // path, then select the result. This prevents timing side channels where
+    // an attacker could distinguish correct-key (AEAD success) from wrong-key
+    // (AEAD failure + hash) by measuring execution time.
+
+    // Always derive the fake seed (wrong-key path)
+    let mut hasher = Sha512::new();
+    hasher.update(key);
+    hasher.update(&honey.ciphertext);
+    let hash = hasher.finalize();
+    let mut fake_seed = [0u8; 32];
+    fake_seed.copy_from_slice(&hash[..32]);
+    let fake_result = honey.distribution.generate(&fake_seed);
+
+    // Attempt real decryption
+    let decrypt_result = crate::symmetric::decrypt(key, &honey.ciphertext, b"MILNET-HONEY-v1");
+
+    match decrypt_result {
         Ok(payload) => {
             // Try to parse the length-prefixed plaintext.
             if payload.len() >= 4 {
@@ -167,21 +184,12 @@ pub fn honey_decrypt(key: &[u8; 32], honey: &HoneyEncrypted) -> Vec<u8> {
                     return slice.to_vec();
                 }
             }
-            // Malformed payload — treat as wrong key.
-            let mut seed = [0u8; 32];
-            let copy_len = payload.len().min(32);
-            seed[..copy_len].copy_from_slice(&payload[..copy_len]);
-            honey.distribution.generate(&seed)
+            // Malformed payload — return the pre-computed fake
+            fake_result
         }
         Err(_) => {
-            // Wrong key — derive a stable seed from the attempted key + ciphertext.
-            let mut hasher = Sha512::new();
-            hasher.update(key);
-            hasher.update(&honey.ciphertext);
-            let hash = hasher.finalize();
-            let mut seed = [0u8; 32];
-            seed.copy_from_slice(&hash[..32]);
-            honey.distribution.generate(&seed)
+            // Wrong key — return the pre-computed fake
+            fake_result
         }
     }
 }

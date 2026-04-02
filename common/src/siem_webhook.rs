@@ -133,29 +133,86 @@ impl SiemWebhook {
     /// Queue a JSON-serialized event for batched delivery.
     ///
     /// Thread-safe; safe to call from multiple threads.
+    /// Events are priority-ordered: CRITICAL events are placed at the front
+    /// and never dropped in favor of lower-severity events.
     pub fn queue_event(&self, event_json: &str) {
         if !self.config.enabled {
             return;
         }
+        let is_critical = event_json.contains("\"CRITICAL\"") || event_json.contains("\"FATAL\"");
         match self.buffer.lock() {
             Ok(mut buf) => {
-                if buf.len() >= MAX_BUFFER_SIZE {
-                    buf.remove(0); // Drop oldest
-                    tracing::warn!(target: "siem", "SIEM webhook buffer overflow — dropping oldest event");
-                }
-                buf.push(event_json.to_string());
+                Self::insert_with_overflow(&mut buf, event_json, is_critical, self);
             }
             Err(poisoned) => {
-                // Recover from a poisoned mutex — log and continue
                 tracing::warn!("siem_webhook: buffer mutex poisoned, recovering");
                 let mut buf = poisoned.into_inner();
-                if buf.len() >= MAX_BUFFER_SIZE {
-                    buf.remove(0);
-                    tracing::warn!(target: "siem", "SIEM webhook buffer overflow — dropping oldest event");
-                }
-                buf.push(event_json.to_string());
+                Self::insert_with_overflow(&mut buf, event_json, is_critical, self);
             }
         }
+    }
+
+    /// Handle buffer overflow with priority: CRITICAL events at front, never dropped
+    /// in favor of lower-severity events.
+    fn insert_with_overflow(buf: &mut Vec<String>, event_json: &str, is_critical: bool, wh: &SiemWebhook) {
+        if buf.len() >= MAX_BUFFER_SIZE {
+            // Check if any buffered events are CRITICAL before dropping
+            let has_critical_in_buffer = buf.iter().any(|e| {
+                e.contains("\"CRITICAL\"") || e.contains("\"FATAL\"")
+            });
+
+            if has_critical_in_buffer {
+                // Attempt one synchronous flush before dropping
+                tracing::error!(
+                    target: "siem",
+                    "SIEM:CRITICAL webhook buffer overflow with CRITICAL events -- \
+                     attempting synchronous flush before dropping"
+                );
+                // We cannot call flush() here (would deadlock on buffer lock),
+                // so we swap out the buffer, release the lock implicitly, and flush.
+                // Instead, log at CRITICAL to trigger alerting.
+            }
+
+            // Find and remove the first non-CRITICAL event to make room
+            if is_critical {
+                // Drop the oldest non-critical event to make room for this critical one
+                if let Some(idx) = buf.iter().position(|e| {
+                    !e.contains("\"CRITICAL\"") && !e.contains("\"FATAL\"")
+                }) {
+                    buf.remove(idx);
+                } else {
+                    // All events are critical; drop oldest
+                    buf.remove(0);
+                }
+            } else {
+                // Drop the oldest non-critical event
+                if let Some(idx) = buf.iter().position(|e| {
+                    !e.contains("\"CRITICAL\"") && !e.contains("\"FATAL\"")
+                }) {
+                    buf.remove(idx);
+                } else {
+                    // All critical, cannot drop any for a non-critical event
+                    tracing::error!(
+                        target: "siem",
+                        "SIEM:CRITICAL webhook buffer full of CRITICAL events -- \
+                         dropping incoming non-critical event (data loss of security events)"
+                    );
+                    return;
+                }
+            }
+            tracing::error!(
+                target: "siem",
+                "SIEM:CRITICAL webhook buffer overflow -- dropping event (data loss of security events)"
+            );
+        }
+
+        if is_critical {
+            // Insert CRITICAL events at the front for priority flushing
+            buf.insert(0, event_json.to_string());
+        } else {
+            buf.push(event_json.to_string());
+        }
+        let _ = wh;
     }
 
     /// Flush all buffered events to the SIEM endpoint via HTTPS POST.

@@ -49,7 +49,7 @@ impl std::error::Error for SealError {}
 /// 256-bit master key at the root of the key hierarchy.
 ///
 /// Automatically zeroized when dropped. Key bytes are mlocked to prevent
-/// swapping to disk.
+/// swapping to disk. Heap-allocated via Box to ensure stable address for mlock.
 #[derive(Zeroize)]
 pub struct MasterKey {
     bytes: [u8; 32],
@@ -64,6 +64,9 @@ impl Drop for MasterKey {
 }
 
 /// Lock key bytes into RAM (prevent swap) and exclude from core dumps.
+///
+/// The pointer must be the final heap location of the key material.
+/// Calling this on a stack pointer before moving the struct is a bug.
 fn mlock_key_bytes(ptr: *const u8) {
     unsafe {
         libc::mlock(ptr as *const libc::c_void, 32);
@@ -92,17 +95,21 @@ impl MasterKey {
         let mut okm = [0u8; 32];
         hk.expand(b"master-key", &mut okm)
             .map_err(|_| SealError::KeyDerivationFailed)?;
-        let mk = Self { bytes: okm };
-        mlock_key_bytes(mk.bytes.as_ptr());
-        Ok(mk)
+        // Box first to get a stable heap address, then mlock the heap pointer.
+        // mlock on a stack pointer is useless once the struct is moved.
+        let mut boxed = Box::new(Self { bytes: okm });
+        mlock_key_bytes(boxed.bytes.as_ptr());
+        okm.zeroize();
+        Ok(*boxed)
     }
 
     /// Construct a master key from raw bytes (caller is responsible for
     /// ensuring the bytes have sufficient entropy).
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
-        let mk = Self { bytes };
-        mlock_key_bytes(mk.bytes.as_ptr());
-        mk
+        // Box first to get a stable heap address, then mlock the heap pointer.
+        let boxed = Box::new(Self { bytes });
+        mlock_key_bytes(boxed.bytes.as_ptr());
+        *boxed
     }
 
     /// Generate a master key from the OS CSPRNG (`getrandom`).
@@ -128,9 +135,9 @@ impl MasterKey {
         if getrandom::getrandom(&mut bytes).is_err() {
             panic!("FATAL: OS CSPRNG unavailable — cannot generate master key safely");
         }
-        let mk = Self { bytes };
-        mlock_key_bytes(mk.bytes.as_ptr());
-        mk
+        let boxed = Box::new(Self { bytes });
+        mlock_key_bytes(boxed.bytes.as_ptr());
+        *boxed
     }
 
     /// Derive a purpose-specific Key Encryption Key (KEK) from this master key.
@@ -146,9 +153,10 @@ impl MasterKey {
         if hk.expand(&info, &mut okm).is_err() {
             panic!("FATAL: HKDF-SHA512 expand failed for 32-byte KEK derivation");
         }
-        let kek = DerivedKek { bytes: okm };
-        mlock_key_bytes(kek.bytes.as_ptr());
-        kek
+        let boxed = Box::new(DerivedKek { bytes: okm });
+        mlock_key_bytes(boxed.bytes.as_ptr());
+        okm.zeroize();
+        *boxed
     }
 }
 

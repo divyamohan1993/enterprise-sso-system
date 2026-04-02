@@ -99,13 +99,29 @@ impl CrossDomainGuard {
 
     /// Add a flow rule authorizing data transfer between domains.
     pub fn add_flow_rule(&mut self, rule: FlowRule) {
+        crate::siem::SecurityEvent::admin_data_access(
+            &format!(
+                "flow_rule_added: source={}, target={}, direction={:?}, declass={}, authorized_by={}, justification={}",
+                rule.source_domain, rule.target_domain, rule.direction,
+                rule.declassification_authorized, rule.authorized_by, rule.justification,
+            ),
+        );
         self.rules
             .insert((rule.source_domain, rule.target_domain), rule);
     }
 
     /// Remove a flow rule.
-    pub fn remove_flow_rule(&mut self, source: &Uuid, target: &Uuid) -> bool {
-        self.rules.remove(&(*source, *target)).is_some()
+    pub fn remove_flow_rule(&mut self, source: &Uuid, target: &Uuid, authorized_by: Uuid) -> bool {
+        let removed = self.rules.remove(&(*source, *target)).is_some();
+        if removed {
+            crate::siem::SecurityEvent::admin_data_access(
+                &format!(
+                    "flow_rule_removed: source={}, target={}, authorized_by={}",
+                    source, target, authorized_by,
+                ),
+            );
+        }
+        removed
     }
 
     /// Return the number of registered domains.
@@ -314,8 +330,21 @@ impl BellLaPadulaGuard {
     /// - `strict_mode = false`: Enforces only ss-property (no read up).
     ///   Suitable for environments where the star property is managed
     ///   by other controls (e.g., application-level write policies).
-    pub fn new(strict_mode: bool) -> Self {
-        Self { strict_mode }
+    pub fn new(strict_mode: bool) -> Result<Self, String> {
+        if !strict_mode {
+            crate::siem::SecurityEvent::crypto_failure(
+                "CRITICAL: BellLaPadulaGuard created with strict_mode=false. \
+                 *-property (no write-down) is DISABLED. This violates DISA STIG \
+                 and CMMC Level 3 requirements for DoD classified environments.",
+            );
+            if std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok() {
+                return Err(
+                    "BLP non-strict mode rejected: MILNET_MILITARY_DEPLOYMENT is active. \
+                     *-property enforcement is mandatory in military deployments.".into()
+                );
+            }
+        }
+        Ok(Self { strict_mode })
     }
 
     /// Check if a subject can READ a resource (Simple Security Property).
@@ -620,48 +649,48 @@ mod tests {
 
     #[test]
     fn blp_read_up_denied() {
-        let guard = BellLaPadulaGuard::new(true);
+        let guard = BellLaPadulaGuard::new(true).unwrap();
         // SECRET subject cannot read TOP SECRET resource
         assert!(!guard.can_read(ClassificationLevel::Secret, ClassificationLevel::TopSecret));
     }
 
     #[test]
     fn blp_read_same_level_allowed() {
-        let guard = BellLaPadulaGuard::new(true);
+        let guard = BellLaPadulaGuard::new(true).unwrap();
         assert!(guard.can_read(ClassificationLevel::Secret, ClassificationLevel::Secret));
     }
 
     #[test]
     fn blp_read_down_allowed() {
-        let guard = BellLaPadulaGuard::new(true);
+        let guard = BellLaPadulaGuard::new(true).unwrap();
         // TOP SECRET subject can read SECRET resource
         assert!(guard.can_read(ClassificationLevel::TopSecret, ClassificationLevel::Secret));
     }
 
     #[test]
     fn blp_write_down_denied_strict() {
-        let guard = BellLaPadulaGuard::new(true);
+        let guard = BellLaPadulaGuard::new(true).unwrap();
         // TOP SECRET subject cannot write to SECRET resource (no write-down)
         assert!(!guard.can_write(ClassificationLevel::TopSecret, ClassificationLevel::Secret));
     }
 
     #[test]
     fn blp_write_up_allowed_strict() {
-        let guard = BellLaPadulaGuard::new(true);
+        let guard = BellLaPadulaGuard::new(true).unwrap();
         // SECRET subject can write to TOP SECRET resource
         assert!(guard.can_write(ClassificationLevel::Secret, ClassificationLevel::TopSecret));
     }
 
     #[test]
     fn blp_write_down_allowed_nonstrict() {
-        let guard = BellLaPadulaGuard::new(false);
+        let guard = BellLaPadulaGuard::new(false).unwrap();
         // Non-strict mode: write-down is allowed
         assert!(guard.can_write(ClassificationLevel::TopSecret, ClassificationLevel::Secret));
     }
 
     #[test]
     fn blp_modify_requires_exact_level_in_strict() {
-        let guard = BellLaPadulaGuard::new(true);
+        let guard = BellLaPadulaGuard::new(true).unwrap();
         // Modify requires read (>=) AND write (<=), so only exact match works
         assert!(guard.can_modify(ClassificationLevel::Secret, ClassificationLevel::Secret));
         assert!(!guard.can_modify(ClassificationLevel::TopSecret, ClassificationLevel::Secret));
@@ -670,7 +699,7 @@ mod tests {
 
     #[test]
     fn blp_transfer_upward_allowed() {
-        let guard = BellLaPadulaGuard::new(true);
+        let guard = BellLaPadulaGuard::new(true).unwrap();
         // Transfer from SECRET to TOP SECRET by a TOP SECRET cleared subject
         // Read source (TS >= S): OK. Write dest (TS <= TS): OK. Flow (S <= TS): OK.
         assert!(guard.validate_transfer(
@@ -682,7 +711,7 @@ mod tests {
 
     #[test]
     fn blp_transfer_downward_denied() {
-        let guard = BellLaPadulaGuard::new(true);
+        let guard = BellLaPadulaGuard::new(true).unwrap();
         // Transfer from TOP SECRET to SECRET: data flow downward denied
         assert!(guard.validate_transfer(
             ClassificationLevel::TopSecret,
@@ -693,7 +722,7 @@ mod tests {
 
     #[test]
     fn blp_transfer_insufficient_clearance() {
-        let guard = BellLaPadulaGuard::new(true);
+        let guard = BellLaPadulaGuard::new(true).unwrap();
         // SECRET subject cannot read TOP SECRET source
         let result = guard.validate_transfer(
             ClassificationLevel::TopSecret,
@@ -725,7 +754,7 @@ mod tests {
             created_at: 0,
         });
         assert!(guard.validate_transfer(&src_id, &tgt_id).allowed);
-        assert!(guard.remove_flow_rule(&src_id, &tgt_id));
+        assert!(guard.remove_flow_rule(&src_id, &tgt_id, Uuid::nil()));
         assert!(!guard.validate_transfer(&src_id, &tgt_id).allowed);
     }
 }

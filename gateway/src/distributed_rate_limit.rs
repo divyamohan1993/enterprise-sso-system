@@ -255,13 +255,24 @@ pub struct DistributedRateLimiter {
 pub struct RedisClient {
     url: String,
     connected: bool,
-    /// Raw TCP stream to Redis (RESP protocol).
-    stream: Option<tokio::net::TcpStream>,
+    /// Raw TCP stream to Redis (RESP protocol). When TLS is enabled
+    /// (MILNET_REDIS_TLS=1), this is wrapped in a TLS connector.
+    stream: Option<RedisStream>,
+    /// Last reconnection attempt time for exponential backoff.
+    last_reconnect_attempt: Option<Instant>,
+    /// Current backoff duration for reconnection (1s, 2s, 4s, ... max 30s).
+    reconnect_backoff: Duration,
+}
+
+/// Abstraction over plain TCP and TLS-wrapped TCP streams for Redis.
+pub enum RedisStream {
+    Plain(tokio::net::TcpStream),
+    Tls(tokio_rustls::client::TlsStream<tokio::net::TcpStream>),
 }
 
 impl RedisClient {
-    /// Connect to Redis via raw TCP using RESP protocol.
-    /// No external Redis crate needed — we speak RESP directly.
+    /// Connect to Redis via raw TCP (or TLS if MILNET_REDIS_TLS=1) using RESP protocol.
+    /// No external Redis crate needed -- we speak RESP directly.
     pub async fn connect(url: &str) -> Result<Self, String> {
         use tokio::net::TcpStream;
 
@@ -273,28 +284,112 @@ impl RedisClient {
             .next()
             .unwrap_or("127.0.0.1:6379");
 
+        let host = addr.split(':').next().unwrap_or("127.0.0.1");
+
         info!("connecting to Redis rate limit backend: {}", addr);
 
-        let stream = TcpStream::connect(addr)
+        let tcp_stream = TcpStream::connect(addr)
             .await
             .map_err(|e| format!("Redis connect to {}: {}", addr, e))?;
+
+        // Wrap in TLS if MILNET_REDIS_TLS=1
+        let use_tls = std::env::var("MILNET_REDIS_TLS")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+
+        let stream = if use_tls {
+            let mut root_store = rustls::RootCertStore::empty();
+            // Load CA cert from MILNET_REDIS_CA_CERT or MILNET_CA_CERT env var
+            let ca_path = std::env::var("MILNET_REDIS_CA_CERT")
+                .or_else(|_| std::env::var("MILNET_CA_CERT"))
+                .ok();
+            if let Some(ref path) = ca_path {
+                let ca_der = std::fs::read(path)
+                    .map_err(|e| format!("read Redis CA cert {}: {}", path, e))?;
+                let cert = rustls::pki_types::CertificateDer::from(ca_der);
+                root_store.add(cert)
+                    .map_err(|e| format!("add Redis CA cert: {e}"))?;
+                info!("Redis TLS: loaded CA from {}", path);
+            }
+            let tls_config = rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+            let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+                .map_err(|e| format!("invalid Redis TLS server name '{}': {}", host, e))?;
+            let tls_stream = connector
+                .connect(server_name, tcp_stream)
+                .await
+                .map_err(|e| format!("Redis TLS handshake to {}: {}", addr, e))?;
+            info!("Redis TLS connection established to {}", addr);
+            RedisStream::Tls(tls_stream)
+        } else {
+            RedisStream::Plain(tcp_stream)
+        };
 
         let mut client = Self {
             url: url.to_string(),
             connected: true,
             stream: Some(stream),
+            last_reconnect_attempt: None,
+            reconnect_backoff: Duration::from_secs(1),
         };
 
         // Verify connection with PING
         client.ping().await?;
+
+        // AUTH if MILNET_REDIS_PASSWORD is set
+        if let Ok(password) = std::env::var("MILNET_REDIS_PASSWORD") {
+            if !password.is_empty() {
+                let response = client.resp_command(&["AUTH", &password]).await?;
+                if !response.contains("+OK") {
+                    return Err(format!("Redis AUTH failed: {}", response.trim()));
+                }
+                info!("Redis AUTH successful");
+            }
+        }
+
         info!("Redis rate limit backend connected: {}", addr);
 
         Ok(client)
     }
 
-    /// Send a RESP command and read the response.
+    /// Attempt reconnection with exponential backoff (1s, 2s, 4s, ... max 30s).
+    /// Returns Ok(()) if reconnection succeeds, Err if too soon or failed.
+    pub async fn try_reconnect(&mut self) -> Result<(), String> {
+        let now = Instant::now();
+        if let Some(last) = self.last_reconnect_attempt {
+            if now.duration_since(last) < self.reconnect_backoff {
+                return Err("reconnect backoff not elapsed".into());
+            }
+        }
+        self.last_reconnect_attempt = Some(now);
+
+        let url = self.url.clone();
+        match Self::connect(&url).await {
+            Ok(new_client) => {
+                self.connected = new_client.connected;
+                self.stream = new_client.stream;
+                self.reconnect_backoff = Duration::from_secs(1); // Reset backoff on success
+                info!("Redis reconnection successful");
+                Ok(())
+            }
+            Err(e) => {
+                // Exponential backoff: double up to 30s
+                self.reconnect_backoff = (self.reconnect_backoff * 2).min(Duration::from_secs(30));
+                Err(format!("Redis reconnection failed: {e}"))
+            }
+        }
+    }
+
+    /// Send a RESP command and read a complete RESP response.
+    ///
+    /// Reads in a loop until a complete RESP response is received (terminated
+    /// by \r\n), with a max buffer of 64 KiB to prevent unbounded reads.
     async fn resp_command(&mut self, args: &[&str]) -> Result<String, String> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const MAX_RESP_BUFFER: usize = 64 * 1024;
 
         let stream = self.stream.as_mut().ok_or("Redis not connected")?;
 
@@ -304,23 +399,53 @@ impl RedisClient {
             cmd.push_str(&format!("${}\r\n{}\r\n", arg.len(), arg));
         }
 
-        stream
-            .write_all(cmd.as_bytes())
-            .await
-            .map_err(|e| format!("Redis write: {e}"))?;
-
-        // Read response (simple: read until we have a complete RESP value)
-        let mut buf = vec![0u8; 4096];
-        let n = stream
-            .read(&mut buf)
-            .await
-            .map_err(|e| format!("Redis read: {e}"))?;
-        if n == 0 {
-            self.connected = false;
-            return Err("Redis connection closed".into());
+        match stream {
+            RedisStream::Plain(s) => {
+                s.write_all(cmd.as_bytes())
+                    .await
+                    .map_err(|e| format!("Redis write: {e}"))?;
+            }
+            RedisStream::Tls(s) => {
+                s.write_all(cmd.as_bytes())
+                    .await
+                    .map_err(|e| format!("Redis TLS write: {e}"))?;
+            }
         }
 
-        let response = String::from_utf8_lossy(&buf[..n]).to_string();
+        // Read response in a loop until we have a complete RESP value
+        // (ends with \r\n). Cap at MAX_RESP_BUFFER to prevent unbounded reads.
+        let mut buf = Vec::with_capacity(4096);
+        let mut tmp = [0u8; 4096];
+        loop {
+            let n = match stream {
+                RedisStream::Plain(s) => s
+                    .read(&mut tmp)
+                    .await
+                    .map_err(|e| format!("Redis read: {e}"))?,
+                RedisStream::Tls(s) => s
+                    .read(&mut tmp)
+                    .await
+                    .map_err(|e| format!("Redis TLS read: {e}"))?,
+            };
+            if n == 0 {
+                self.connected = false;
+                return Err("Redis connection closed".into());
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.len() > MAX_RESP_BUFFER {
+                self.connected = false;
+                return Err(format!(
+                    "Redis response exceeded {} byte limit",
+                    MAX_RESP_BUFFER
+                ));
+            }
+            // A complete RESP response ends with \r\n
+            if buf.len() >= 2 && buf[buf.len() - 2] == b'\r' && buf[buf.len() - 1] == b'\n' {
+                break;
+            }
+        }
+
+        let response = String::from_utf8_lossy(&buf).to_string();
         Ok(response)
     }
 
@@ -527,16 +652,20 @@ impl DistributedRateLimiter {
                         warn!("Redis rate limit check failed, falling back to local: {e}");
                         self.redis_healthy
                             .store(false, std::sync::atomic::Ordering::Relaxed);
-                        // Spawn background reconnection task
+                        // Spawn background reconnection with exponential backoff
                         let redis_clone = redis.clone();
                         let healthy_clone = self.redis_healthy.clone();
                         tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_secs(5)).await;
                             let mut client = redis_clone.lock().await;
-                            if client.ping().await.is_ok() {
-                                healthy_clone
-                                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                                info!("Redis rate limit backend reconnected");
+                            match client.try_reconnect().await {
+                                Ok(()) => {
+                                    healthy_clone
+                                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                                    info!("Redis rate limit backend reconnected");
+                                }
+                                Err(e) => {
+                                    debug!("Redis reconnection deferred: {e}");
+                                }
                             }
                         });
                     }

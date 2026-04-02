@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 use common::domain;
 use common::error::MilnetError;
 use common::types::{Token, TokenClaims, TokenHeader};

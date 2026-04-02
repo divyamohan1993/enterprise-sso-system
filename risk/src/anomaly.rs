@@ -12,8 +12,23 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+/// Maximum distinct IPs tracked in the cross-user correlation tracker.
+/// Prevents unbounded memory growth under DDoS.
+const MAX_TRACKED_IPS: usize = 100_000;
+
+/// Maximum threshold adjustments per hour via feedback().
+const MAX_FEEDBACK_PER_HOUR: u32 = 5;
+
+/// Threshold value above which a CRITICAL SIEM event is emitted
+/// (possible threshold manipulation).
+const CRITICAL_THRESHOLD_LIMIT: f64 = 0.85;
+
+/// Baseline drift threshold for a single signal update. Exceeding this
+/// triggers a SIEM warning for possible baseline poisoning.
+const BASELINE_DRIFT_LIMIT: f64 = 0.3;
 
 // ---------------------------------------------------------------------------
 // Geographic types for impossible travel
@@ -227,6 +242,20 @@ impl IpUserTracker {
         self.ip_users
             .retain(|_, (_, first)| now.duration_since(*first) < self.window);
 
+        // Cap total distinct IPs to prevent unbounded memory under DDoS.
+        // Evict oldest entries when limit exceeded.
+        if self.ip_users.len() >= MAX_TRACKED_IPS && !self.ip_users.contains_key(ip) {
+            // Find and remove the oldest entry by first_seen timestamp
+            if let Some(oldest_ip) = self
+                .ip_users
+                .iter()
+                .min_by_key(|(_, (_, first))| *first)
+                .map(|(k, _)| k.clone())
+            {
+                self.ip_users.remove(&oldest_ip);
+            }
+        }
+
         let entry = self
             .ip_users
             .entry(ip.to_string())
@@ -287,6 +316,23 @@ fn impossible_travel_score(prev: &(GeoCoord, Instant), current: &(GeoCoord, Inst
 // Anomaly Detection Engine
 // ---------------------------------------------------------------------------
 
+/// Rate limiter state for feedback threshold adjustments.
+struct FeedbackRateLimiter {
+    /// Adjustments made in the current window.
+    count: u32,
+    /// Start of the current window.
+    window_start: Instant,
+}
+
+impl FeedbackRateLimiter {
+    fn new() -> Self {
+        Self {
+            count: 0,
+            window_start: Instant::now(),
+        }
+    }
+}
+
 /// The main anomaly detection engine. Thread-safe.
 pub struct AnomalyDetector {
     /// Per-user anomaly profiles.
@@ -298,6 +344,8 @@ pub struct AnomalyDetector {
     alert_threshold: Mutex<f64>,
     /// Historical anomaly scores for adaptive threshold tuning.
     score_history: Mutex<RunningStats>,
+    /// Rate limiter for feedback threshold adjustments.
+    feedback_limiter: Mutex<FeedbackRateLimiter>,
 }
 
 impl AnomalyDetector {
@@ -307,6 +355,7 @@ impl AnomalyDetector {
             ip_tracker: Mutex::new(IpUserTracker::new()),
             alert_threshold: Mutex::new(0.7),
             score_history: Mutex::new(RunningStats::new()),
+            feedback_limiter: Mutex::new(FeedbackRateLimiter::new()),
         }
     }
 
@@ -459,6 +508,29 @@ impl AnomalyDetector {
             .entry(*user_id)
             .or_insert_with(UserAnomalyProfile::new);
 
+        // Baseline drift detection: check if the new login hour deviates
+        // sharply from the existing EMA baseline. This detects slow baseline
+        // poisoning where an attacker gradually shifts a user's profile.
+        if profile.login_count > 10 {
+            let current_mean = profile.login_hour_stats.mean();
+            let delta = (login_hour - current_mean).abs();
+            // Normalize: login_hour range is 0-24, so max meaningful delta is 12
+            let normalized_delta = delta / 24.0;
+            if normalized_delta > BASELINE_DRIFT_LIMIT {
+                let siem_event = serde_json::json!({
+                    "event_type": "baseline_drift_detected",
+                    "severity": "WARNING",
+                    "source_module": "anomaly_detector",
+                    "user_id": user_id.to_string(),
+                    "detail": format!(
+                        "Rapid baseline drift detected for user: login_hour delta={:.3} (current_mean={:.1}, new_value={:.1})",
+                        normalized_delta, current_mean, login_hour
+                    )
+                });
+                tracing::warn!(target: "siem", "{}", siem_event);
+            }
+        }
+
         profile.login_hour_stats.update(login_hour);
         profile.login_count += 1;
 
@@ -542,13 +614,52 @@ impl AnomalyDetector {
     /// Adjust the adaptive alert threshold based on operator feedback.
     /// If `was_false_positive` is true, the threshold is raised (fewer alerts).
     /// If false, the threshold is lowered (more sensitive).
-    pub fn feedback(&self, was_false_positive: bool) {
+    ///
+    /// Rate-limited to MAX_FEEDBACK_PER_HOUR adjustments per hour.
+    /// Returns false if rate limit exceeded or threshold dangerously high.
+    pub fn feedback(&self, was_false_positive: bool) -> bool {
+        let now = Instant::now();
+        let mut limiter = self.feedback_limiter.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Reset window if an hour has passed
+        if now.duration_since(limiter.window_start) >= Duration::from_secs(3600) {
+            limiter.count = 0;
+            limiter.window_start = now;
+        }
+
+        if limiter.count >= MAX_FEEDBACK_PER_HOUR {
+            let siem_event = serde_json::json!({
+                "event_type": "anomaly_feedback_rate_limited",
+                "severity": "WARNING",
+                "source_module": "anomaly_detector",
+                "detail": "Threshold adjustment rate limit exceeded (max 5/hour)"
+            });
+            tracing::warn!(target: "siem", "{}", siem_event);
+            return false;
+        }
+
+        limiter.count += 1;
+        drop(limiter);
+
         let mut threshold = self.alert_threshold.lock().unwrap_or_else(|e| e.into_inner());
         if was_false_positive {
             *threshold = (*threshold + 0.02).min(0.95);
         } else {
             *threshold = (*threshold - 0.01).max(0.3);
         }
+
+        // Check if threshold has been pushed dangerously high
+        if *threshold > CRITICAL_THRESHOLD_LIMIT {
+            let siem_event = serde_json::json!({
+                "event_type": "anomaly_threshold_critical",
+                "severity": "CRITICAL",
+                "source_module": "anomaly_detector",
+                "detail": format!("Anomaly detection threshold dangerously high ({:.3}) - possible manipulation", *threshold)
+            });
+            tracing::error!(target: "siem", "{}", siem_event);
+        }
+
+        true
     }
 
     /// Get the current adaptive alert threshold.
@@ -745,14 +856,20 @@ mod tests {
         assert!((initial - 0.7).abs() < f64::EPSILON);
 
         // False positive feedback should raise threshold
-        detector.feedback(true);
+        assert!(detector.feedback(true));
         assert!(detector.current_threshold() > initial);
 
         // True positive feedback should lower threshold
-        detector.feedback(false);
-        detector.feedback(false);
-        detector.feedback(false);
+        assert!(detector.feedback(false));
+        assert!(detector.feedback(false));
+        assert!(detector.feedback(false));
         assert!(detector.current_threshold() < initial + 0.02);
+
+        // 5th adjustment should succeed (we've used 4 so far)
+        assert!(detector.feedback(false));
+
+        // 6th adjustment should be rate-limited (max 5 per hour)
+        assert!(!detector.feedback(false));
     }
 
     #[test]

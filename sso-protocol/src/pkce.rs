@@ -94,11 +94,16 @@ pub fn verify_pkce_mandatory(
 /// only the S256 method is accepted. The "plain" method is explicitly forbidden
 /// because it transmits the verifier in the clear, defeating PKCE's purpose.
 ///
-/// Returns `Ok(())` if the method is `"S256"` or `None` (defaults to S256).
-/// Returns `Err` for any other value, including `"plain"`.
+/// Returns `Ok(())` if the method is explicitly `"S256"`.
+/// Returns `Err` for any other value, including `None` and `"plain"`.
+///
+/// Per OAuth 2.1, the `code_challenge_method` parameter MUST be explicitly
+/// set to "S256". Implicit defaults are not accepted because they allow
+/// downgrade attacks where a client omits the method hoping for "plain".
 pub fn validate_challenge_method(method: Option<&str>) -> Result<(), &'static str> {
     match method {
-        None | Some("S256") => Ok(()),
+        Some("S256") => Ok(()),
+        None => Err("code_challenge_method is required and must be explicitly set to 'S256'"),
         Some("plain") => Err("code_challenge_method 'plain' is forbidden — only S256 is accepted"),
         Some(_) => Err("unsupported code_challenge_method — only S256 is accepted"),
     }
@@ -173,8 +178,9 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_challenge_method_none_defaults_s256() {
-        assert!(validate_challenge_method(None).is_ok());
+    fn test_validate_challenge_method_none_rejected() {
+        let err = validate_challenge_method(None).unwrap_err();
+        assert!(err.contains("required"));
     }
 
     #[test]

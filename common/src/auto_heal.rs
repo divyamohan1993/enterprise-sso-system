@@ -346,18 +346,82 @@ impl AutoHealer {
 // Health probe (async TCP check)
 // ---------------------------------------------------------------------------
 
-/// Probe a peer's health endpoint. Returns true if the peer responded.
-/// Uses a short timeout to avoid blocking the probe cycle.
+/// Probe a peer's health endpoint with challenge-response authentication.
+///
+/// After TCP connect succeeds, sends a 32-byte random nonce and expects
+/// back HMAC-SHA512(health_key, nonce). If `MILNET_HEALTH_HMAC_KEY` is
+/// not set, falls back to TCP-only connectivity check.
 pub async fn probe_peer_health(addr: &str) -> bool {
-    let timeout = Duration::from_secs(3);
-    match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await {
-        Ok(Ok(_stream)) => true,
+    let timeout = Duration::from_secs(5);
+    let stream = match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await {
+        Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             tracing::trace!(addr = addr, error = %e, "health probe connection failed");
-            false
+            return false;
         }
         Err(_) => {
             tracing::trace!(addr = addr, "health probe timed out");
+            return false;
+        }
+    };
+
+    // If HMAC key is configured, perform challenge-response verification.
+    let health_key = match std::env::var("MILNET_HEALTH_HMAC_KEY") {
+        Ok(k) if !k.is_empty() => k,
+        _ => return true, // No HMAC key: TCP connect is sufficient.
+    };
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Generate 32-byte random nonce.
+    let mut nonce = [0u8; 32];
+    if getrandom::getrandom(&mut nonce).is_err() {
+        tracing::warn!(addr = addr, "health probe: failed to generate nonce");
+        return false;
+    }
+
+    let mut stream = stream;
+
+    // Send nonce to peer.
+    if stream.write_all(&nonce).await.is_err() {
+        tracing::trace!(addr = addr, "health probe: failed to send nonce");
+        return false;
+    }
+
+    // Read HMAC-SHA512 response (64 bytes) within timeout.
+    let mut response = [0u8; 64];
+    let read_result = tokio::time::timeout(
+        Duration::from_secs(5),
+        stream.read_exact(&mut response),
+    )
+    .await;
+
+    match read_result {
+        Ok(Ok(())) => {}
+        _ => {
+            tracing::trace!(addr = addr, "health probe: HMAC response timeout or read error");
+            return false;
+        }
+    }
+
+    // Compute expected HMAC-SHA512(key, nonce) and verify (constant-time).
+    use hmac::{Hmac, Mac};
+    use sha2::Sha512;
+    type HmacSha512 = Hmac<Sha512>;
+
+    let mut mac = match HmacSha512::new_from_slice(health_key.as_bytes()) {
+        Ok(m) => m,
+        Err(_) => {
+            tracing::warn!(addr = addr, "health probe: invalid HMAC key length");
+            return false;
+        }
+    };
+    mac.update(&nonce);
+
+    match mac.verify_slice(&response) {
+        Ok(()) => true,
+        Err(_) => {
+            tracing::warn!(addr = addr, "health probe: HMAC verification failed");
             false
         }
     }

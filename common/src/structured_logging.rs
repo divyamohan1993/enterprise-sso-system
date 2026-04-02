@@ -277,12 +277,59 @@ impl LogEntry {
     }
 
     /// Emit this entry to stdout as a single JSON line.
+    /// If `MILNET_SYSLOG_ENDPOINT` is set, also sends via UDP to the remote
+    /// syslog endpoint as a secondary log sink surviving local compromise.
     pub fn emit(&self) {
         if let Ok(json) = serde_json::to_string(self) {
             // Use println! to ensure atomicity of the line write
             println!("{}", json);
+
+            // Send to remote syslog if configured
+            if let Some(endpoint) = syslog_endpoint() {
+                send_to_syslog(endpoint, &json);
+            }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Remote syslog support
+// ---------------------------------------------------------------------------
+
+/// Cached syslog endpoint from `MILNET_SYSLOG_ENDPOINT` env var.
+static SYSLOG_ENDPOINT: OnceLock<Option<String>> = OnceLock::new();
+
+/// Get the remote syslog endpoint, if configured.
+fn syslog_endpoint() -> Option<&'static str> {
+    SYSLOG_ENDPOINT
+        .get_or_init(|| {
+            std::env::var("MILNET_SYSLOG_ENDPOINT")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
+        .as_deref()
+}
+
+/// Send a log line to the remote syslog endpoint via UDP.
+/// Best-effort: failures are silently ignored to avoid blocking the log path.
+fn send_to_syslog(endpoint: &str, json_line: &str) {
+    use std::net::UdpSocket;
+
+    // Cache the socket in a thread-local to avoid repeated bind overhead
+    thread_local! {
+        static UDP_SOCKET: Option<UdpSocket> = {
+            UdpSocket::bind("0.0.0.0:0").ok().map(|s| {
+                let _ = s.set_nonblocking(true);
+                s
+            })
+        };
+    }
+
+    UDP_SOCKET.with(|sock| {
+        if let Some(ref s) = sock {
+            let _ = s.send_to(json_line.as_bytes(), endpoint);
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------

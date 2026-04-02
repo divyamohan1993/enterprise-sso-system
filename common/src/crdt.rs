@@ -289,12 +289,93 @@ impl<T: Eq + Hash + Clone> Default for ORSet<T> {
 }
 
 // ---------------------------------------------------------------------------
-// LWW-Register: Last-Writer-Wins register for single values
+// Hybrid Logical Clock (HLC) -- NTP-manipulation-resistant timestamps
+// ---------------------------------------------------------------------------
+
+/// Hybrid Logical Clock combining physical time with a logical counter.
+/// Prevents NTP manipulation from winning writes by ensuring the clock
+/// always moves forward, even if physical time goes backward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HybridTimestamp {
+    /// Physical time component (milliseconds since epoch).
+    pub wall_ms: u64,
+    /// Logical counter incremented when wall clock hasn't advanced.
+    pub logical: u32,
+}
+
+impl HybridTimestamp {
+    /// Create a new HLC timestamp from the current wall clock.
+    pub fn now(last: &HybridTimestamp) -> Self {
+        let wall_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        if wall_ms > last.wall_ms {
+            Self { wall_ms, logical: 0 }
+        } else {
+            // Physical time hasn't advanced: increment logical counter.
+            Self {
+                wall_ms: last.wall_ms,
+                logical: last.logical + 1,
+            }
+        }
+    }
+
+    /// Merge with a remote timestamp, taking the max and advancing.
+    pub fn recv(local: &HybridTimestamp, remote: &HybridTimestamp) -> Self {
+        let wall_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        if wall_ms > local.wall_ms && wall_ms > remote.wall_ms {
+            Self { wall_ms, logical: 0 }
+        } else if local.wall_ms == remote.wall_ms {
+            Self {
+                wall_ms: local.wall_ms,
+                logical: std::cmp::max(local.logical, remote.logical) + 1,
+            }
+        } else if local.wall_ms > remote.wall_ms {
+            Self {
+                wall_ms: local.wall_ms,
+                logical: local.logical + 1,
+            }
+        } else {
+            Self {
+                wall_ms: remote.wall_ms,
+                logical: remote.logical + 1,
+            }
+        }
+    }
+
+    pub fn zero() -> Self {
+        Self { wall_ms: 0, logical: 0 }
+    }
+}
+
+impl PartialOrd for HybridTimestamp {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HybridTimestamp {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.wall_ms
+            .cmp(&other.wall_ms)
+            .then(self.logical.cmp(&other.logical))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LWW-Register: Last-Writer-Wins register using Hybrid Logical Clocks
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LWWRegister<T: Clone> {
     value: T,
+    /// HLC timestamp that is resistant to NTP manipulation.
+    hlc_timestamp: HybridTimestamp,
+    /// Legacy wall-clock timestamp kept for serialization compatibility.
     timestamp: u64,
     node_id: String,
 }
@@ -303,19 +384,37 @@ impl<T: Clone> LWWRegister<T> {
     pub fn new(value: T, timestamp: u64, node_id: &str) -> Self {
         Self {
             value,
+            hlc_timestamp: HybridTimestamp { wall_ms: timestamp, logical: 0 },
             timestamp,
             node_id: node_id.to_owned(),
         }
     }
 
-    /// Set a new value. Only takes effect if the timestamp is newer,
+    /// Create a new register with an explicit HLC timestamp.
+    pub fn new_hlc(value: T, hlc: HybridTimestamp, node_id: &str) -> Self {
+        Self {
+            value,
+            hlc_timestamp: hlc,
+            timestamp: hlc.wall_ms,
+            node_id: node_id.to_owned(),
+        }
+    }
+
+    /// Set a new value. Only takes effect if the HLC timestamp is newer,
     /// or equal timestamp with a higher node_id (deterministic tiebreak).
     pub fn set(&mut self, value: T, timestamp: u64, node_id: &str) {
-        if timestamp > self.timestamp
-            || (timestamp == self.timestamp && node_id > self.node_id.as_str())
+        let hlc = HybridTimestamp { wall_ms: timestamp, logical: 0 };
+        self.set_hlc(value, hlc, node_id);
+    }
+
+    /// Set a new value using HLC timestamps.
+    pub fn set_hlc(&mut self, value: T, hlc: HybridTimestamp, node_id: &str) {
+        if hlc > self.hlc_timestamp
+            || (hlc == self.hlc_timestamp && node_id > self.node_id.as_str())
         {
             self.value = value;
-            self.timestamp = timestamp;
+            self.hlc_timestamp = hlc;
+            self.timestamp = hlc.wall_ms;
             self.node_id = node_id.to_owned();
         }
     }
@@ -329,12 +428,18 @@ impl<T: Clone> LWWRegister<T> {
         self.timestamp
     }
 
-    /// Merge another replica (last-writer-wins by timestamp, tiebreak by node_id).
+    /// Get the HLC timestamp.
+    pub fn hlc_timestamp(&self) -> HybridTimestamp {
+        self.hlc_timestamp
+    }
+
+    /// Merge another replica (last-writer-wins by HLC, tiebreak by node_id).
     pub fn merge(&mut self, other: &Self) {
-        if other.timestamp > self.timestamp
-            || (other.timestamp == self.timestamp && other.node_id > self.node_id)
+        if other.hlc_timestamp > self.hlc_timestamp
+            || (other.hlc_timestamp == self.hlc_timestamp && other.node_id > self.node_id)
         {
             self.value = other.value.clone();
+            self.hlc_timestamp = other.hlc_timestamp;
             self.timestamp = other.timestamp;
             self.node_id = other.node_id.clone();
         }

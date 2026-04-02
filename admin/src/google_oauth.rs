@@ -201,6 +201,9 @@ pub struct PendingGoogleAuth {
     pub milnet_nonce: Option<String>,
     pub milnet_code_challenge: Option<String>,
     pub created_at: i64,
+    /// OIDC nonce sent in the Google auth URL, must match the nonce claim
+    /// in the returned ID token to prevent replay attacks.
+    pub google_oidc_nonce: Option<String>,
 }
 
 /// In-memory store for pending Google OAuth flows keyed by a random state token.
@@ -326,20 +329,33 @@ pub struct GoogleIdTokenClaims {
     pub iss: String,
     pub aud: String,
     pub exp: i64,
+    /// OIDC nonce: must match the nonce sent in the authorization request.
+    #[serde(default)]
+    pub nonce: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
 // URL builder
 // ---------------------------------------------------------------------------
 
+/// Generate a random 32-byte OIDC nonce, hex-encoded.
+pub fn generate_oidc_nonce() -> String {
+    let mut nonce_bytes = [0u8; 32];
+    getrandom::getrandom(&mut nonce_bytes)
+        .expect("OS CSPRNG must be available for OIDC nonce generation");
+    hex::encode(nonce_bytes)
+}
+
 /// Build the Google authorization URL the browser should be redirected to.
-pub fn build_google_auth_url(config: &GoogleOAuthConfig, state_token: &str) -> String {
+/// Includes an OIDC nonce parameter to prevent ID token replay attacks.
+pub fn build_google_auth_url(config: &GoogleOAuthConfig, state_token: &str, nonce: &str) -> String {
     format!(
-        "https://accounts.google.com/o/oauth2/v2/auth?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&access_type=offline&prompt=consent",
+        "https://accounts.google.com/o/oauth2/v2/auth?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&nonce={}&access_type=offline&prompt=consent",
         urlencoding::encode(&config.client_id),
         urlencoding::encode(&config.redirect_uri),
         urlencoding::encode("openid email profile"),
         urlencoding::encode(state_token),
+        urlencoding::encode(nonce),
     )
 }
 
@@ -506,8 +522,8 @@ pub async fn extract_google_claims(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or(std::time::Duration::ZERO)
         .as_secs() as i64;
-    // Allow 5 minutes of clock skew
-    if claims.exp < now - 300 {
+    // Allow 60 seconds of clock skew (5 minutes was excessive)
+    if claims.exp < now - 60 {
         return Err("id_token has expired".into());
     }
 
@@ -568,10 +584,11 @@ mod tests {
             client_secret: "secret".into(),
             redirect_uri: "https://example.com/callback".into(),
         };
-        let url = build_google_auth_url(&config, "rand-state-123");
+        let url = build_google_auth_url(&config, "rand-state-123", "test-nonce-456");
         assert!(url.starts_with("https://accounts.google.com/o/oauth2/v2/auth?"));
         assert!(url.contains("client_id=my-client-id"));
         assert!(url.contains("state=rand-state-123"));
+        assert!(url.contains("nonce=test-nonce-456"));
         assert!(url.contains("redirect_uri=https%3A%2F%2Fexample.com%2Fcallback"));
     }
 
@@ -589,6 +606,7 @@ mod tests {
                 milnet_nonce: None,
                 milnet_code_challenge: None,
                 created_at: now,
+                google_oidc_nonce: None,
             },
         ).unwrap();
 
@@ -615,6 +633,7 @@ mod tests {
                 milnet_nonce: None,
                 milnet_code_challenge: None,
                 created_at: now,
+                google_oidc_nonce: None,
             },
         ).unwrap();
 
@@ -636,6 +655,7 @@ mod tests {
                 milnet_nonce: None,
                 milnet_code_challenge: None,
                 created_at: 100,
+                google_oidc_nonce: None,
             },
         ).unwrap();
         store.insert(
@@ -648,6 +668,7 @@ mod tests {
                 milnet_nonce: None,
                 milnet_code_challenge: None,
                 created_at: 1000,
+                google_oidc_nonce: None,
             },
         ).unwrap();
         store.cleanup_expired(1100);
@@ -685,6 +706,7 @@ mod tests {
                 milnet_nonce: None,
                 milnet_code_challenge: None,
                 created_at: 1000,
+                google_oidc_nonce: None,
             },
         );
         assert!(result.is_err());

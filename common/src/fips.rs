@@ -347,12 +347,15 @@ impl MilitaryDeploymentMode {
         }
 
         tracing::warn!(
-            "MILITARY DEPLOYMENT MODE ACTIVE — all cryptographic operations \
+            "MILITARY DEPLOYMENT MODE ACTIVE -- all cryptographic operations \
              locked to FIPS 140-3 approved algorithms only"
         );
 
         // Force FIPS mode ON unconditionally
         set_fips_mode_unchecked(true);
+
+        // Run Known Answer Tests (KATs) for FIPS-critical algorithms
+        run_startup_kats();
 
         let violations = self.validate_crypto_config();
         if !violations.is_empty() {
@@ -410,6 +413,105 @@ impl MilitaryDeploymentMode {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// FIPS Known Answer Tests (KATs)
+// ---------------------------------------------------------------------------
+
+/// Run Known Answer Tests for FIPS-critical algorithms at startup.
+///
+/// Verifies AES-256-GCM, SHA-512, and HMAC-SHA512 against known test vectors.
+/// On any failure, exits with code 199 (FIPS KAT failure).
+fn run_startup_kats() {
+    tracing::info!("Running FIPS Known Answer Tests (KATs)...");
+
+    // KAT 1: AES-256-GCM
+    {
+        use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
+        use aes_gcm::Nonce;
+
+        let key_bytes = [0x42u8; 32];
+        let nonce_bytes = [0x01u8; 12];
+        let plaintext = b"FIPS-KAT-AES256GCM-v1";
+
+        let cipher = match Aes256Gcm::new_from_slice(&key_bytes) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("FIPS KAT FATAL: AES-256-GCM key init failed: {e}");
+                std::process::exit(199);
+            }
+        };
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let ciphertext = match cipher.encrypt(nonce, plaintext.as_ref()) {
+            Ok(ct) => ct,
+            Err(e) => {
+                tracing::error!("FIPS KAT FATAL: AES-256-GCM encrypt failed: {e}");
+                std::process::exit(199);
+            }
+        };
+        let decrypted = match cipher.decrypt(nonce, ciphertext.as_ref()) {
+            Ok(pt) => pt,
+            Err(e) => {
+                tracing::error!("FIPS KAT FATAL: AES-256-GCM decrypt failed: {e}");
+                std::process::exit(199);
+            }
+        };
+        if decrypted != plaintext {
+            tracing::error!("FIPS KAT FATAL: AES-256-GCM round-trip mismatch");
+            std::process::exit(199);
+        }
+    }
+
+    // KAT 2: SHA-512
+    {
+        use sha2::{Sha512, Digest};
+
+        // Known test vector: SHA-512("abc")
+        let input = b"abc";
+        let expected_hex = "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f";
+        let hash = Sha512::digest(input);
+        let actual_hex = hex::encode(hash);
+        if actual_hex != expected_hex {
+            tracing::error!(
+                "FIPS KAT FATAL: SHA-512 mismatch. Expected: {}, Got: {}",
+                expected_hex, actual_hex
+            );
+            std::process::exit(199);
+        }
+    }
+
+    // KAT 3: HMAC-SHA512
+    {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha512;
+        type HmacSha512 = Hmac<Sha512>;
+
+        // RFC 4231 Test Case 2: HMAC-SHA512 with key="Jefe", data="what do ya want for nothing?"
+        let key = b"Jefe";
+        let data = b"what do ya want for nothing?";
+        let expected_hex = "164b7a7bfcf819e2e395fbe73b56e0a387bd64222e831fd610270cd7ea2505549758bf75c05a994a6d034f65f8f0e6fdcaeab1a34d4a6b4b636e070a38bce737";
+
+        let mut mac = match HmacSha512::new_from_slice(key) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::error!("FIPS KAT FATAL: HMAC-SHA512 key init failed: {e}");
+                std::process::exit(199);
+            }
+        };
+        mac.update(data);
+        let result = mac.finalize().into_bytes();
+        let actual_hex = hex::encode(result);
+        if actual_hex != expected_hex {
+            tracing::error!(
+                "FIPS KAT FATAL: HMAC-SHA512 mismatch. Expected: {}, Got: {}",
+                expected_hex, actual_hex
+            );
+            std::process::exit(199);
+        }
+    }
+
+    tracing::info!("FIPS KATs PASSED: AES-256-GCM, SHA-512, HMAC-SHA512");
 }
 
 /// Runtime-toggleable FIPS mode settings.

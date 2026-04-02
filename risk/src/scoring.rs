@@ -370,17 +370,19 @@ impl RiskEngine {
             && signals.unusual_access_score == 0.0
             && server_fails == 0;
         if all_perfect {
-            // Suspiciously clean — add a small penalty.
+            // Suspiciously clean — add a penalty.
             // Real users always have *some* attestation age and minor anomalies.
-            score += 0.05;
+            // A perfectly forged session gets +0.15, making it harder for
+            // adversaries to stay below the 0.3 Elevated threshold.
+            score += 0.15;
         }
 
         // Add small random noise to prevent attackers from computing exact
-        // threshold-crossing signal combinations. Noise range: [0.0, 0.03)
+        // threshold-crossing signal combinations. Noise range: [0.0, 0.08)
         let noise_byte = {
             let mut buf = [0u8; 1];
             getrandom::getrandom(&mut buf).unwrap_or_default();
-            (buf[0] as f64 / 255.0) * 0.03
+            (buf[0] as f64 / 255.0) * 0.08
         };
         score += noise_byte;
 
@@ -509,10 +511,10 @@ mod tests {
         let engine = RiskEngine::new();
         let user = Uuid::new_v4();
         let score = engine.compute_score(&user, &clean_signals());
-        // All-zero signals trigger the mimicry detection penalty (+0.05)
-        // plus random noise [0.0, 0.03), so score in [0.05, 0.08)
+        // All-zero signals trigger the mimicry detection penalty (+0.15)
+        // plus random noise [0.0, 0.08), so score in [0.15, 0.23)
         assert!(
-            score >= 0.05 && score < 0.08,
+            score >= 0.15 && score < 0.23,
             "clean signals should trigger mimicry penalty: got {score}"
         );
     }

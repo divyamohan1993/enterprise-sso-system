@@ -10,7 +10,7 @@
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -103,8 +103,8 @@ struct UserUebaState {
     confidence: f64,
     /// Whether the in-memory state is dirty (needs flush to DB).
     dirty: bool,
-    /// Historical anomaly scores (ring buffer).
-    anomaly_history: Vec<AnomalyScoreRecord>,
+    /// Historical anomaly scores (ring buffer, O(1) pop_front).
+    anomaly_history: VecDeque<AnomalyScoreRecord>,
 }
 
 /// Persistent UEBA store with in-memory cache and DB backing.
@@ -177,7 +177,7 @@ impl UebaStore {
                         tenant_id: record.tenant_id,
                         confidence,
                         dirty: false,
-                        anomaly_history: Vec::new(),
+                        anomaly_history: VecDeque::new(),
                     },
                 );
                 loaded += 1;
@@ -222,7 +222,7 @@ impl UebaStore {
             tenant_id,
             confidence: 1.0,
             dirty: true,
-            anomaly_history: Vec::new(),
+            anomaly_history: VecDeque::new(),
         });
 
         entry.baseline = baseline;
@@ -245,9 +245,9 @@ impl UebaStore {
 
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(user_state) = state.get_mut(user_id) {
-            // Ring buffer: drop oldest when at capacity
+            // Ring buffer: drop oldest when at capacity (O(1) with VecDeque)
             if user_state.anomaly_history.len() >= MAX_ANOMALY_HISTORY {
-                user_state.anomaly_history.remove(0);
+                user_state.anomaly_history.pop_front();
             }
 
             user_state.anomaly_history.push(AnomalyScoreRecord {
@@ -264,7 +264,7 @@ impl UebaStore {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state
             .get(user_id)
-            .map(|s| s.anomaly_history.clone())
+            .map(|s| s.anomaly_history.iter().cloned().collect())
             .unwrap_or_default()
     }
 

@@ -21,6 +21,7 @@ blake3.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 aes-gcm.workspace = true
+ml-dsa.workspace = true
 
 [features]
 production = ["common/production"]

@@ -111,6 +111,8 @@ pub struct StealthDetector {
     timing_baseline: Option<Instant>,
     /// Baseline library map hash (captured at startup).
     library_baseline: Option<[u8; 64]>,
+    /// Baseline VmLck value in kB (captured after startup mlock completes).
+    vmlck_baseline_kb: Option<u64>,
 }
 
 /// Default minimum check interval (seconds).
@@ -141,6 +143,7 @@ impl StealthDetector {
             expected_ports: Vec::new(),
             timing_baseline: None,
             library_baseline: None,
+            vmlck_baseline_kb: None,
         }
     }
 
@@ -475,13 +478,32 @@ impl StealthDetector {
                         // Format: "N kB" -- parse the number
                         let kb_str = trimmed.split_whitespace().next().unwrap_or("0");
                         let kb: u64 = kb_str.parse().unwrap_or(0);
-                        // We expect at least some locked memory if keys are mlock'd
-                        // A value of 0 means nothing is locked, which could mean
-                        // mlock was bypassed or munlock was called
+                        // After startup (timing_baseline is set), compare against
+                        // the stored VmLck baseline. If VmLck drops below baseline,
+                        // memory protections may have been bypassed (munlock called).
+                        if self.timing_baseline.is_some() {
+                            if let Some(baseline) = self.vmlck_baseline_kb {
+                                if kb < baseline {
+                                    return DetectionEvent {
+                                        layer: DetectionLayer::MemoryProtectionCheck,
+                                        timestamp: now,
+                                        suspicious: true,
+                                        detail: format!(
+                                            "VmLck dropped: current={kb} kB, baseline={baseline} kB \
+                                             (possible munlock attack)"
+                                        ),
+                                        score_contribution: 0.7,
+                                    };
+                                }
+                            } else {
+                                // First check after startup: record as baseline
+                                self.vmlck_baseline_kb = Some(kb);
+                            }
+                        }
                         return DetectionEvent {
                             layer: DetectionLayer::MemoryProtectionCheck,
                             timestamp: now,
-                            suspicious: false, // informational -- 0 is normal early in startup
+                            suspicious: false,
                             detail: format!("VmLck: {kb} kB"),
                             score_contribution: 0.0,
                         };

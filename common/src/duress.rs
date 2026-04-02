@@ -29,6 +29,10 @@ pub struct DuressConfig {
     pub duress_pin_hash: Vec<u8>,
     /// Random salt for HKDF-based PIN hashing (v2+).
     pub salt: [u8; 32],
+    /// Optional callback invoked when duress is detected. Enables automated
+    /// incident response (session revocation, account lockdown, SOC paging).
+    #[serde(skip)]
+    pub duress_response_callback: Option<Box<dyn Fn(&DuressAlert) + Send + Sync>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -169,12 +173,16 @@ impl DuressConfig {
             normal_pin_hash,
             duress_pin_hash,
             salt,
+            duress_response_callback: None,
         })
     }
 
     /// Verify a PIN against both normal and duress hashes.
     /// Supports legacy SHA-256 (v1), SHA-512 (v1b), and HKDF-SHA512 (v2) formats
     /// for backward compatibility.
+    ///
+    /// When duress is detected, a CRITICAL SIEM event is emitted automatically
+    /// and the `duress_response_callback` (if configured) is invoked.
     pub fn verify_pin(&self, pin: &[u8]) -> PinVerification {
         let is_normal = verify_pin_hash(pin, &self.normal_pin_hash, &self.salt);
         let is_duress = verify_pin_hash(pin, &self.duress_pin_hash, &self.salt);
@@ -182,6 +190,24 @@ impl DuressConfig {
         if is_normal {
             PinVerification::Normal
         } else if is_duress {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+
+            let alert = DuressAlert {
+                user_id: self.user_id,
+                timestamp: now,
+                fake_token_issued: true,
+                lockdown_triggered: true,
+            };
+
+            crate::siem::SecurityEvent::duress_detected(self.user_id);
+
+            if let Some(ref callback) = self.duress_response_callback {
+                callback(&alert);
+            }
+
             PinVerification::Duress
         } else {
             PinVerification::Invalid

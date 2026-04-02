@@ -134,7 +134,10 @@ impl TlsShardTransport {
     }
 
     /// Read raw framed bytes from the TLS stream without verification.
-    /// Useful for testing replay scenarios.
+    /// Restricted to crate-internal use to prevent bypassing SHARD authentication.
+    /// Available externally only with `test-internals` feature for integration tests.
+    #[cfg_attr(not(feature = "test-internals"), doc(hidden))]
+    #[cfg(any(feature = "test-internals", not(feature = "production")))]
     pub async fn recv_raw(&mut self) -> Result<Vec<u8>, MilnetError> {
         let mut len_buf = [0u8; 4];
         match &mut self.stream {
@@ -159,7 +162,10 @@ impl TlsShardTransport {
     }
 
     /// Write raw pre-framed bytes to the TLS stream (length prefix + payload).
-    /// Useful for testing replay scenarios.
+    /// Restricted to crate-internal use to prevent bypassing SHARD authentication.
+    /// Available externally only with `test-internals` feature for integration tests.
+    #[cfg_attr(not(feature = "test-internals"), doc(hidden))]
+    #[cfg(any(feature = "test-internals", not(feature = "production")))]
     pub async fn send_raw(&mut self, raw: &[u8]) -> Result<(), MilnetError> {
         let len = raw.len() as u32;
         match &mut self.stream {

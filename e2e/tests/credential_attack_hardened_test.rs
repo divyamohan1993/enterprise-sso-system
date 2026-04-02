@@ -538,11 +538,7 @@ fn session_fixation_cross_session_receipts_rejected() {
         "error must mention session ID mismatch"
     );
 
-    // Verify Session A's chain remains valid
-    assert!(
-        chain_a.validate().is_ok(),
-        "original chain must remain valid"
-    );
+    // Verify Session A's chain remains valid (validate_with_key is the safe path)
     assert!(
         chain_a.validate_with_key(&RECEIPT_SIGNING_KEY).is_ok(),
         "original chain signature must verify"

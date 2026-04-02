@@ -11,7 +11,7 @@ production = ["common/production"]
 [dependencies]
 common = { path = "../common" }
 crypto = { path = "../crypto" }
-shard = { path = "../shard" }
+shard = { path = "../shard", features = ["test-internals"] }
 gateway = { path = "../gateway" }
 orchestrator = { path = "../orchestrator" }
 opaque = { path = "../opaque" }

@@ -198,15 +198,37 @@ impl AuditLog {
         })
     }
 
+    /// Verify chain hash linkage only, without signature checks.
+    ///
+    /// DEPRECATED: Use `verify_chain_signatures()` for full verification
+    /// including ML-DSA-65 signature checks. This method is retained for
+    /// backward compatibility but renamed callers should prefer
+    /// `verify_chain_structure_only()` to make the lack of sig-check explicit.
     pub fn verify_chain(&self) -> bool {
         self.verify_chain_with_key(None)
+    }
+
+    /// Verify chain hash linkage only, without signature checks.
+    ///
+    /// Use this only when signature verification is not possible (e.g.,
+    /// verifying key unavailable during recovery). Prefer `verify_chain_signatures()`.
+    pub fn verify_chain_structure_only(&self) -> bool {
+        self.verify_chain_with_key(None)
+    }
+
+    /// Verify chain integrity: hash linkage AND ML-DSA-65 signatures.
+    ///
+    /// All entries MUST have valid signatures. Unsigned entries are rejected
+    /// to prevent log injection. This is the recommended verification method.
+    pub fn verify_chain_signatures(&self, verifying_key: &crypto::pq_sign::PqVerifyingKey) -> bool {
+        self.verify_chain_with_key(Some(verifying_key))
     }
 
     /// Verify chain integrity: hash linkage AND (optionally) ML-DSA-65 signatures.
     ///
     /// When a verifying key is provided, ALL entries MUST have valid signatures.
     /// Unsigned entries are rejected during verification to prevent log injection.
-    pub fn verify_chain_with_key(&self, verifying_key: Option<&crypto::pq_sign::PqVerifyingKey>) -> bool {
+    fn verify_chain_with_key(&self, verifying_key: Option<&crypto::pq_sign::PqVerifyingKey>) -> bool {
         let mut expected_prev = [0u8; 64];
         for entry in &self.entries {
             if entry.prev_hash != expected_prev {
@@ -299,16 +321,36 @@ impl AuditLog {
         Ok(())
     }
 
-    /// Archive old entries to a JSON lines file in the given directory.
+    /// Archive old entries to a file in the given directory.
     ///
     /// Keeps the last `max_entries` entries in memory and writes the rest
     /// to an archive file with a timestamp suffix.  The hash chain is
     /// preserved across archives by keeping `last_hash` intact.
     ///
+    /// In military deployment mode (`MILNET_MILITARY_DEPLOYMENT=1`), this
+    /// function refuses to write plaintext archives. An encryption KEK must
+    /// be configured in the retention policy.
+    ///
     /// Returns the count of archived entries.
     pub fn archive_old_entries(&mut self, archive_dir: &str) -> Result<usize, String> {
         if self.entries.len() <= self.max_entries {
             return Ok(0);
+        }
+
+        // In military deployment, refuse to archive without encryption.
+        let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if is_military && self.retention_policy.archive_encryption_kek.is_none() {
+            common::siem::SecurityEvent::tamper_detected(
+                "CRITICAL: archive_old_entries called in military deployment without encryption KEK. \
+                 Refusing to write plaintext audit data to disk. Entries retained in memory.",
+            );
+            return Err(
+                "archive encryption KEK required in military deployment; \
+                 refusing to write plaintext audit data to disk"
+                    .to_string(),
+            );
         }
 
         let archive_count = self.entries.len() - self.max_entries;
@@ -322,39 +364,59 @@ impl AuditLog {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_micros();
-        let archive_path =
-            std::path::Path::new(archive_dir).join(format!("audit_archive_{}.jsonl", timestamp));
 
-        // Write the old entries to the archive file.
         let entries_to_archive: Vec<AuditEntry> = self.entries.drain(..archive_count).collect();
 
-        #[cfg(unix)]
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600) // Owner read/write only
-            .open(&archive_path)
-            .map_err(|e| format!("failed to open archive file {:?}: {}", archive_path, e))?;
-
+        // Serialize entries to JSON lines.
+        let mut json_data = Vec::new();
         for entry in &entries_to_archive {
             let json = serde_json::to_string(entry)
                 .map_err(|e| format!("failed to serialize entry: {}", e))?;
-            writeln!(file, "{}", json)
-                .map_err(|e| format!("failed to write to archive: {}", e))?;
+            json_data.extend_from_slice(json.as_bytes());
+            json_data.push(b'\n');
         }
 
-        file.sync_data()
-            .map_err(|e| format!("failed to sync archive file: {}", e))?;
+        // Encrypt if KEK is available, otherwise write plaintext (non-military only).
+        let write_result = if let Some(ref kek) = self.retention_policy.archive_encryption_kek {
+            let archive_path = std::path::Path::new(archive_dir)
+                .join(format!("audit_archive_{}.enc", timestamp));
+            encrypt_and_write_archive(kek, &archive_path, &json_data).map(|()| archive_path)
+        } else {
+            let archive_path = std::path::Path::new(archive_dir)
+                .join(format!("audit_archive_{}.jsonl", timestamp));
+            #[cfg(unix)]
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(&archive_path)
+                .map_err(|e| format!("failed to open archive file {:?}: {}", archive_path, e))?;
+            std::io::Write::write_all(&mut file, &json_data)
+                .map_err(|e| format!("failed to write to archive: {}", e))?;
+            file.sync_data()
+                .map_err(|e| format!("failed to sync archive file: {}", e))?;
+            Ok(archive_path)
+        };
 
-        tracing::info!(
-            "Archived {} audit entries to {:?} ({} entries remain in memory)",
-            archive_count,
-            archive_path,
-            self.entries.len()
-        );
-
-        Ok(archive_count)
+        match write_result {
+            Ok(archive_path) => {
+                tracing::info!(
+                    "Archived {} audit entries to {:?} ({} entries remain in memory)",
+                    archive_count,
+                    archive_path,
+                    self.entries.len()
+                );
+                Ok(archive_count)
+            }
+            Err(e) => {
+                // Re-insert entries if archival failed (do not lose data).
+                let mut restored = entries_to_archive;
+                restored.extend(self.entries.drain(..));
+                self.entries = restored;
+                Err(e)
+            }
+        }
     }
 
     /// Enforce the retention policy:
@@ -386,7 +448,31 @@ impl AuditLog {
             })
             .count();
         if expired_count > 0 {
-            if let Some(ref dir) = self.archive_dir.clone() {
+            // In military deployment, refuse to archive without encryption KEK.
+            let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            if is_military && self.retention_policy.archive_encryption_kek.is_none() {
+                common::siem::SecurityEvent::tamper_detected(
+                    "CRITICAL: retention policy triggered archival but no encryption KEK configured \
+                     in military deployment. Refusing to write plaintext. Entries retained in memory.",
+                );
+                tracing::error!(
+                    "CRITICAL: {} expired entries cannot be archived without encryption KEK. \
+                     Entries retained in memory. Configure archive_encryption_kek immediately.",
+                    expired_count
+                );
+                // Emit size cap warning if memory is getting large
+                if self.max_entries > 0 {
+                    let pct = self.entries.len() * 100 / self.max_entries;
+                    if pct >= CAPACITY_WARNING_PCT {
+                        common::siem::SecurityEvent::capacity_warning(
+                            "audit_log_no_kek_retention", self.entries.len(), self.max_entries,
+                        );
+                    }
+                }
+                // Do NOT proceed with archival. Keep entries in memory.
+            } else if let Some(ref dir) = self.archive_dir.clone() {
                 let mut expired_entries: Vec<AuditEntry> = self.entries.drain(..expired_count).collect();
 
                 // Build archive filename with timestamp
@@ -394,8 +480,6 @@ impl AuditLog {
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
                     .as_micros();
-                let archive_path =
-                    std::path::Path::new(&dir).join(format!("audit_retention_{}.jsonl", ts));
 
                 if let Err(e) = std::fs::create_dir_all(&dir) {
                     tracing::error!("Retention: failed to create archive dir {:?}: {}", dir, e);
@@ -409,8 +493,10 @@ impl AuditLog {
                         }
                     }
 
-                    // Encrypt archive if KEK is configured
+                    // Encrypt archive if KEK is configured, otherwise reject in military mode.
                     let write_result = if let Some(ref kek) = self.retention_policy.archive_encryption_kek {
+                        let archive_path =
+                            std::path::Path::new(&dir).join(format!("audit_retention_{}.enc", ts));
                         encrypt_and_write_archive(kek, &archive_path, &json_data)
                     } else {
                         Err("FATAL: Archive encryption KEK required in production".into())
@@ -419,22 +505,19 @@ impl AuditLog {
                     match write_result {
                         Ok(()) => {
                             tracing::info!(
-                                "Retention: archived and deleted {} expired entries (older than {} days) to {:?}",
-                                expired_count, self.retention_policy.max_age_days, archive_path
+                                "Retention: archived and deleted {} expired entries (older than {} days)",
+                                expired_count, self.retention_policy.max_age_days,
                             );
-                            // SIEM event for archive creation
                             common::siem::SecurityEvent::key_rotation(&format!(
-                                "audit archive created: {} entries archived to {:?}",
-                                expired_count, archive_path
+                                "audit retention archive created: {} entries archived",
+                                expired_count,
                             ));
                         }
                         Err(e) => {
-                            tracing::error!("Retention: failed to write archive {:?}: {}", archive_path, e);
-                            // Re-insert entries if archival failed (do not lose data)
-                            // Note: this puts them at the end, but since they are expired,
-                            // the next retention pass will try again.
+                            tracing::error!("Retention: failed to write archive: {}", e);
+                            // Re-insert entries if archival failed (do not lose data).
                             // Prepend to preserve original chain linkage order
-                            // (sorting by timestamp would break prev_hash chain integrity)
+                            // (sorting by timestamp would break prev_hash chain integrity).
                             expired_entries.extend(self.entries.drain(..));
                             self.entries = expired_entries;
                         }
@@ -559,8 +642,10 @@ impl AuditLog {
 
     /// Full chain verification — intended for background/scheduled use, NOT hot path.
     /// Call this from a background tokio task every N minutes.
+    /// Uses structure-only check; callers with a verifying key should use
+    /// `verify_chain_signatures()` for full cryptographic verification.
     pub fn background_verify_chain(&mut self) -> bool {
-        let result = self.verify_chain();
+        let result = self.verify_chain_structure_only();
         if !result {
             self.tamper_detected = true;
         }

@@ -266,14 +266,30 @@ pub struct RefreshToken {
 }
 
 /// In-memory refresh token store with rotation and single-use enforcement.
+///
+/// WARNING: This store is volatile. All refresh tokens are lost on process
+/// restart. In production, set `persistence_backend` to a durable store.
 pub struct RefreshTokenStore {
     tokens: HashMap<String, RefreshToken>,
+    /// Optional persistence backend name for operational awareness.
+    /// When None, the store is purely in-memory (volatile).
+    pub persistence_backend: Option<String>,
 }
 
 impl RefreshTokenStore {
     pub fn new() -> Self {
+        common::siem::emit_runtime_error(
+            common::siem::category::RUNTIME_ERROR,
+            "RefreshTokenStore initialized with in-memory backend only. All refresh tokens will be lost on restart. Configure a persistent backend for production.",
+            "no persistence backend configured",
+            file!(),
+            line!(),
+            column!(),
+            module_path!(),
+        );
         Self {
             tokens: HashMap::new(),
+            persistence_backend: None,
         }
     }
 
@@ -332,9 +348,18 @@ impl RefreshTokenStore {
         // per RFC 6749 Section 10.4 to limit the blast radius of stolen tokens.
         if rt.used {
             let family = rt.family_id.clone();
+            common::siem::emit_runtime_error(
+                common::siem::category::AUTH_FAILURE,
+                &format!("Refresh token replay detected for family '{}', client '{}'. Revoking entire family.", family, rt.client_id),
+                "token reuse / theft indicator",
+                file!(),
+                line!(),
+                column!(),
+                module_path!(),
+            );
             self.revoke_family(&family);
             return Err(format!(
-                "refresh token already used — token theft detected, \
+                "refresh token already used -- token theft detected, \
                  revoked entire family '{}' ({} tokens destroyed)",
                 family,
                 0 // family already revoked above
@@ -374,7 +399,18 @@ impl RefreshTokenStore {
     /// attacker replays a used token, both the attacker's and the legitimate
     /// user's subsequent tokens are invalidated, forcing re-authentication.
     pub fn revoke_family(&mut self, family_id: &str) {
+        let count_before = self.tokens.len();
         self.tokens.retain(|_, rt| rt.family_id != family_id);
+        let revoked = count_before - self.tokens.len();
+        common::siem::emit_runtime_error(
+            common::siem::category::AUTH_FAILURE,
+            &format!("Revoked {} refresh tokens in family '{}'", revoked, family_id),
+            "family revocation",
+            file!(),
+            line!(),
+            column!(),
+            module_path!(),
+        );
     }
 
     /// Remove all expired refresh tokens.

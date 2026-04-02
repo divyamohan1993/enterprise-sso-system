@@ -33,7 +33,7 @@ pub struct VrfProof {
 impl VrfKeypair {
     /// Generate a new VRF keypair from OS entropy.
     pub fn generate() -> Self {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rngs::OsRng;
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rng);
         let verifying_key = signing_key.verifying_key();
         Self { signing_key, verifying_key }

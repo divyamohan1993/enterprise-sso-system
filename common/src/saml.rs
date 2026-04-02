@@ -102,6 +102,60 @@ pub fn check_assertion_id_replay(
     cache.check_and_record(assertion_id, retention_secs)
 }
 
+// ── Distributed Assertion Cache ────────────────────────────────────────────
+//
+// The in-memory AssertionIdCache above is process-local. In a multi-node
+// deployment, a replayed assertion could succeed on a different node.
+// This trait enables plugging in a database-backed cache at deployment.
+
+/// Trait for distributed SAML assertion ID replay detection.
+///
+/// Implementations MUST be atomic: `check_and_store` must test-and-set in a
+/// single operation to prevent TOCTOU races in concurrent requests.
+pub trait DistributedAssertionCache: Send + Sync {
+    /// Check if `assertion_id` has been seen before. If not, store it with the
+    /// given `retention_secs` TTL. Returns `Ok(true)` if the ID was already
+    /// present (replay detected), `Ok(false)` if freshly stored.
+    fn check_and_store(&self, assertion_id: &str, retention_secs: i64) -> Result<bool, String>;
+}
+
+/// In-memory implementation of `DistributedAssertionCache`. This is the default
+/// used when no distributed backend is configured. Suitable for single-node
+/// deployments only.
+pub struct InMemoryAssertionCache;
+
+impl DistributedAssertionCache for InMemoryAssertionCache {
+    fn check_and_store(&self, assertion_id: &str, retention_secs: i64) -> Result<bool, String> {
+        let mut cache = assertion_id_cache()
+            .lock()
+            .map_err(|_| "assertion ID cache lock poisoned".to_string())?;
+        // check_and_record returns Ok(()) if fresh, Err if replay
+        match cache.check_and_record(assertion_id, retention_secs) {
+            Ok(()) => Ok(false),  // not a replay
+            Err(_) => Ok(true),   // replay detected
+        }
+    }
+}
+
+static DISTRIBUTED_CACHE_WARNING_EMITTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Emit a one-time SIEM warning if no distributed assertion cache backend is configured.
+/// Call this at SAML IdP startup.
+pub fn warn_if_no_distributed_cache() {
+    if !DISTRIBUTED_CACHE_WARNING_EMITTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            "SECURITY: SAML assertion ID cache is process-local (in-memory). \
+             In multi-node deployments, configure a distributed backend via \
+             DistributedAssertionCache to prevent cross-node assertion replay."
+        );
+        SecurityEvent::crypto_failure(
+            "SAML assertion ID replay cache is process-local only. \
+             Distributed backend not configured. Cross-node replay attacks possible.",
+        );
+    }
+}
+
 // ── SAML NameID Formats ─────────────────────────────────────────────────────
 
 /// Supported SAML NameID format URIs.

@@ -530,11 +530,12 @@ fn pkce_plain_method_rejected() {
     assert!(result.unwrap_err().contains("forbidden"));
 }
 
-/// Verify that PKCE S256 and None (default to S256) are accepted.
+/// Verify that PKCE S256 is accepted and None is rejected (explicit S256 required per OAuth 2.1).
 #[test]
 fn pkce_s256_accepted() {
     assert!(sso_protocol::pkce::validate_challenge_method(Some("S256")).is_ok());
-    assert!(sso_protocol::pkce::validate_challenge_method(None).is_ok());
+    // OAuth 2.1: code_challenge_method must be explicitly set to S256, no implicit default.
+    assert!(sso_protocol::pkce::validate_challenge_method(None).is_err());
 }
 
 // ---------------------------------------------------------------------------

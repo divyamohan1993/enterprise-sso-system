@@ -37,7 +37,7 @@ fn pseudonym_key() -> &'static [u8; 32] {
     })
 }
 
-/// Produce a short hex pseudonym for a UUID (first 8 bytes of HMAC-SHA512 = 16 hex chars).
+/// Produce a hex pseudonym for a UUID (first 16 bytes of HMAC-SHA512 = 32 hex chars).
 /// Deterministic: same UUID always yields the same pseudonym.
 /// CNSA 2.0 Level 5: HMAC-SHA512 (upgraded from HMAC-SHA256).
 pub fn pseudonym_uuid(id: Uuid) -> String {
@@ -47,10 +47,10 @@ pub fn pseudonym_uuid(id: Uuid) -> String {
     mac.update(b"uuid:");
     mac.update(id.as_bytes());
     let result = mac.finalize().into_bytes();
-    hex::encode(&result[..8])
+    hex::encode(&result[..16])
 }
 
-/// Produce a short hex pseudonym for an email address.
+/// Produce a hex pseudonym for an email address (first 16 bytes = 32 hex chars).
 /// CNSA 2.0 Level 5: HMAC-SHA512 (upgraded from HMAC-SHA256).
 pub fn pseudonym_email(email: &str) -> String {
     let key = pseudonym_key();
@@ -59,10 +59,10 @@ pub fn pseudonym_email(email: &str) -> String {
     mac.update(b"email:");
     mac.update(email.as_bytes());
     let result = mac.finalize().into_bytes();
-    hex::encode(&result[..8])
+    hex::encode(&result[..16])
 }
 
-/// Produce a short hex pseudonym for an arbitrary string identifier.
+/// Produce a hex pseudonym for an arbitrary string identifier (first 16 bytes = 32 hex chars).
 /// CNSA 2.0 Level 5: HMAC-SHA512 (upgraded from HMAC-SHA256).
 pub fn pseudonym_str(tag: &str, value: &str) -> String {
     let key = pseudonym_key();
@@ -72,5 +72,5 @@ pub fn pseudonym_str(tag: &str, value: &str) -> String {
     mac.update(b":");
     mac.update(value.as_bytes());
     let result = mac.finalize().into_bytes();
-    hex::encode(&result[..8])
+    hex::encode(&result[..16])
 }

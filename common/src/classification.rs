@@ -76,6 +76,44 @@ impl Default for ClassificationLevel {
     }
 }
 
+/// Classified resource with both a classification level and SCI compartment tags.
+///
+/// While `ClassificationLevel` provides vertical access control (Unclassified through SCI),
+/// compartments provide horizontal access control within the same level. A user must hold
+/// ALL required compartments to access a compartmented resource.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClassifiedResource {
+    /// The vertical classification level.
+    pub level: ClassificationLevel,
+    /// SCI compartment tags (e.g., "TK", "SI", "HCS", "GAMMA").
+    /// Empty means no compartment restrictions beyond the classification level.
+    pub compartments: Vec<String>,
+}
+
+impl ClassifiedResource {
+    pub fn new(level: ClassificationLevel) -> Self {
+        Self {
+            level,
+            compartments: Vec::new(),
+        }
+    }
+
+    pub fn with_compartments(level: ClassificationLevel, compartments: Vec<String>) -> Self {
+        Self { level, compartments }
+    }
+}
+
+/// Check whether a user has access to all required compartments.
+///
+/// Returns `true` if `user_compartments` is a superset of `resource_compartments`.
+/// An empty `resource_compartments` always returns `true` (no compartment restriction).
+pub fn check_compartment_access(
+    user_compartments: &[String],
+    resource_compartments: &[String],
+) -> bool {
+    resource_compartments.iter().all(|rc| user_compartments.contains(rc))
+}
+
 /// Result of a classification enforcement check.
 #[derive(Debug, Clone)]
 pub enum ClassificationDecision {

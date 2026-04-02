@@ -316,8 +316,11 @@ where
         .and_then(|v| v.parse::<u16>().ok())
         .unwrap_or_else(|| service_port.saturating_add(1000));
 
+    // Read bearer token for health endpoint authentication at startup.
+    let health_token: Option<String> = std::env::var("MILNET_HEALTH_TOKEN").ok().filter(|t| !t.is_empty());
+
     tokio::spawn(async move {
-        let addr = format!("0.0.0.0:{health_port}");
+        let addr = format!("127.0.0.1:{health_port}");
         let listener = match tokio::net::TcpListener::bind(&addr).await {
             Ok(l) => l,
             Err(e) => {
@@ -334,7 +337,7 @@ where
         tracing::info!(
             service = %service_name,
             addr = %addr,
-            "Health endpoint listening on /healthz"
+            "Health endpoint listening on /healthz (localhost only)"
         );
 
         let rate_limiter = HealthRateLimiter::new();
@@ -343,7 +346,7 @@ where
         const MAX_CONCURRENT: u32 = 50;
 
         loop {
-            let (mut stream, _peer) = match listener.accept().await {
+            let (mut stream, peer) = match listener.accept().await {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::debug!("Health endpoint accept error: {e}");
@@ -366,6 +369,65 @@ where
                 let _ = stream.write_all(msg).await;
                 let _ = stream.shutdown().await;
                 continue;
+            }
+
+            // Bearer token authentication check.
+            // If MILNET_HEALTH_TOKEN is set, require it in the Authorization header.
+            // If not set, only loopback connections are allowed (already enforced by
+            // binding to 127.0.0.1, but we double-check the peer address).
+            if let Some(ref required_token) = health_token {
+                // Read the HTTP request to extract the Authorization header.
+                let mut req_buf = vec![0u8; 4096];
+                use tokio::io::AsyncReadExt;
+                let n = match tokio::time::timeout(
+                    Duration::from_secs(2),
+                    stream.read(&mut req_buf),
+                )
+                .await
+                {
+                    Ok(Ok(n)) => n,
+                    _ => {
+                        concurrent.fetch_sub(1, Ordering::Release);
+                        continue;
+                    }
+                };
+                let req_str = String::from_utf8_lossy(&req_buf[..n]);
+                let authorized = req_str.lines().any(|line| {
+                    if let Some(value) = line.strip_prefix("Authorization: Bearer ") {
+                        value.trim() == required_token.as_str()
+                    } else {
+                        false
+                    }
+                });
+                if !authorized {
+                    concurrent.fetch_sub(1, Ordering::Release);
+                    let msg = b"HTTP/1.1 401 Unauthorized\r\n\
+                        Content-Type: text/plain\r\n\
+                        Content-Length: 12\r\n\
+                        Connection: close\r\n\
+                        \r\n\
+                        unauthorized";
+                    use tokio::io::AsyncWriteExt;
+                    let _ = stream.write_all(msg).await;
+                    let _ = stream.shutdown().await;
+                    continue;
+                }
+            } else {
+                // No token configured. Verify peer is loopback (defense in depth).
+                let is_loopback = peer.ip().is_loopback();
+                if !is_loopback {
+                    concurrent.fetch_sub(1, Ordering::Release);
+                    let msg = b"HTTP/1.1 403 Forbidden\r\n\
+                        Content-Type: text/plain\r\n\
+                        Content-Length: 9\r\n\
+                        Connection: close\r\n\
+                        \r\n\
+                        forbidden";
+                    use tokio::io::AsyncWriteExt;
+                    let _ = stream.write_all(msg).await;
+                    let _ = stream.shutdown().await;
+                    continue;
+                }
             }
 
             // Rate limit check

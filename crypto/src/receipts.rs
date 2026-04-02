@@ -126,12 +126,17 @@ impl ReceiptChain {
         Ok(())
     }
 
-    /// Validate the complete chain (structural check only, no signature verification).
+    /// Validate the complete chain. Requires a signing key for signature verification.
+    /// Use `validate_with_key()` instead.
+    ///
+    /// This method always returns Err because structural validation without
+    /// signature verification is unsafe. A signing key is required.
     pub fn validate(&self) -> Result<(), String> {
-        if self.receipts.is_empty() {
-            return Err("empty receipt chain".into());
-        }
-        Ok(())
+        Err(
+            "validate() without signing key is unsafe. \
+             Use validate_with_key(&signing_key) for security-critical validation."
+                .into(),
+        )
     }
 
     /// Validate the complete chain including signature verification against the
@@ -190,7 +195,7 @@ impl ReceiptChain {
 }
 
 // ---------------------------------------------------------------------------
-// Asymmetric receipt signing (ML-DSA-65, CNSA 2.0 compliant)
+// Asymmetric receipt signing (ML-DSA-87, CNSA 2.0 compliant, Level 5)
 // ---------------------------------------------------------------------------
 
 /// Generate an ML-DSA-87 keypair for asymmetric receipt signing.

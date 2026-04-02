@@ -86,6 +86,10 @@ impl Default for ExternalWitnessConfig {
 ///
 /// Runs as a separate service/process. Holds its own ML-DSA-87 signing key.
 /// Never shares key material with the audit service.
+/// Callback for independent audit root verification before cosigning.
+/// Returns `true` if the proposed audit_root is valid per an independent view.
+pub type VerifyAuditRootFn = Box<dyn Fn(&[u8; 64], u64) -> bool + Send>;
+
 pub struct ExternalWitnessCosigner {
     config: ExternalWitnessConfig,
     /// ML-DSA-87 signing seed (32 bytes, generates deterministic keypair)
@@ -96,6 +100,10 @@ pub struct ExternalWitnessCosigner {
     request_timestamps: Vec<Instant>,
     /// Known audit roots (optional: for cross-verification)
     known_roots: HashMap<u64, [u8; 64]>,
+    /// Optional callback to independently verify the audit root before signing.
+    /// If set, the cosigner will reject requests where verification fails.
+    /// If not set, a WARNING SIEM event is emitted noting unverified cosigning.
+    verify_audit_root: Option<VerifyAuditRootFn>,
 }
 
 /// Sign raw bytes with ML-DSA-87 using a 32-byte seed.
@@ -136,7 +144,15 @@ impl ExternalWitnessCosigner {
             last_sequence: 0,
             request_timestamps: Vec::new(),
             known_roots: HashMap::new(),
+            verify_audit_root: None,
         }
+    }
+
+    /// Set a callback for independent audit root verification.
+    /// The callback receives the audit root and sequence number, and returns
+    /// true if the root is valid per an independent view of the cluster.
+    pub fn set_verify_audit_root(&mut self, cb: VerifyAuditRootFn) {
+        self.verify_audit_root = Some(cb);
     }
 
     /// Process a witness sign request.
@@ -186,6 +202,38 @@ impl ExternalWitnessCosigner {
                     req.sequence, self.last_sequence
                 )),
             };
+        }
+
+        // Verify audit root against independent view
+        match &self.verify_audit_root {
+            Some(verify_fn) => {
+                if !verify_fn(&req.audit_root, req.sequence) {
+                    tracing::error!(
+                        target: "siem",
+                        cosigner_id = %self.config.cosigner_id,
+                        sequence = req.sequence,
+                        "SIEM:CRITICAL external witness cosigner rejected audit_root: \
+                         independent verification FAILED"
+                    );
+                    return WitnessSignResponse {
+                        signature: Vec::new(),
+                        cosigner_id: self.config.cosigner_id.clone(),
+                        accepted: false,
+                        rejection_reason: Some(
+                            "audit_root failed independent verification".into()
+                        ),
+                    };
+                }
+            }
+            None => {
+                tracing::warn!(
+                    target: "siem",
+                    cosigner_id = %self.config.cosigner_id,
+                    sequence = req.sequence,
+                    "SIEM:WARNING external witness cosigner signing without \
+                     independent audit_root verification callback"
+                );
+            }
         }
 
         // Sign the checkpoint

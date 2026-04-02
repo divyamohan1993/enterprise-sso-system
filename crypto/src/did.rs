@@ -430,16 +430,25 @@ pub fn verify_did_auth(
 // Key Agreement
 // ---------------------------------------------------------------------------
 
-/// Derive a shared secret using X25519 Diffie-Hellman.
+/// Derive a shared secret using X25519 Diffie-Hellman with HKDF-SHA512.
 ///
-/// Used for establishing encrypted channels between DIDs.
+/// The raw DH output is passed through HKDF-SHA512 with a domain-specific
+/// info string to produce a uniformly distributed key. Raw X25519 output
+/// should never be used directly as key material.
 pub fn did_key_agreement(
     our_secret: &[u8; 32],
     their_public: &[u8; 32],
 ) -> [u8; 32] {
     let our_secret = x25519_dalek::StaticSecret::from(*our_secret);
     let their_public = x25519_dalek::PublicKey::from(*their_public);
-    *our_secret.diffie_hellman(&their_public).as_bytes()
+    let raw_dh = our_secret.diffie_hellman(&their_public);
+
+    // Apply HKDF-SHA512 to extract a uniformly distributed key
+    let hk = hkdf::Hkdf::<sha2::Sha512>::new(None, raw_dh.as_bytes());
+    let mut okm = [0u8; 32];
+    hk.expand(b"MILNET-DID-KEY-AGREEMENT-v1", &mut okm)
+        .expect("HKDF-SHA512 expand for 32 bytes cannot fail");
+    okm
 }
 
 // ---------------------------------------------------------------------------

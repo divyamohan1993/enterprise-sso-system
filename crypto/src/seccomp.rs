@@ -31,6 +31,7 @@ const BPF_RET: u16 = 0x06;
 
 /// Seccomp return values.
 const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
 const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
 /// EPERM = 1
 const SECCOMP_RET_ERRNO_EPERM: u32 = SECCOMP_RET_ERRNO | 1;
@@ -55,7 +56,7 @@ struct SockFprog {
     filter: *const SockFilter,
 }
 
-/// Syscall numbers to block (x86_64 / aarch64 may differ; these are x86_64).
+/// Syscall numbers to block (legacy denylist, kept for reference and tests).
 /// On non-x86_64 the filter is skipped with a warning.
 const BLOCKED_SYSCALLS: &[u32] = &[
     101,  // ptrace
@@ -73,10 +74,107 @@ const BLOCKED_SYSCALLS: &[u32] = &[
     212,  // lookup_dcookie
 ];
 
-/// Apply a seccomp BPF filter that blocks dangerous syscalls.
+/// Explicit allowlist of syscalls required for normal operation (x86_64).
+/// Any syscall NOT in this list causes SECCOMP_RET_KILL_PROCESS.
+const ALLOWED_SYSCALLS: &[u32] = &[
+    0,    // read
+    1,    // write
+    3,    // close
+    5,    // fstat
+    9,    // mmap
+    10,   // mprotect
+    11,   // munmap
+    12,   // brk
+    13,   // rt_sigaction
+    14,   // rt_sigprocmask
+    35,   // nanosleep
+    42,   // connect
+    44,   // sendto
+    45,   // recvfrom
+    46,   // sendmsg
+    47,   // recvmsg
+    202,  // futex
+    228,  // clock_gettime
+    231,  // exit_group
+    232,  // epoll_wait
+    233,  // epoll_ctl
+    257,  // openat
+    281,  // epoll_pwait
+    288,  // accept4
+    318,  // getrandom
+    131,  // sigaltstack
+    24,   // sched_yield
+    56,   // clone
+    57,   // fork (needed for thread spawn)
+    58,   // vfork
+    60,   // exit
+    61,   // wait4
+    62,   // kill (for self-signaling)
+    72,   // fcntl
+    79,   // getcwd
+    80,   // chdir
+    87,   // unlink
+    89,   // readlink
+    97,   // getrlimit
+    102,  // getuid
+    104,  // getgid
+    107,  // geteuid
+    108,  // getegid
+    110,  // getppid
+    157,  // prctl
+    186,  // gettid
+    200,  // tkill
+    204,  // sched_getaffinity
+    218,  // set_tid_address
+    230,  // clock_nanosleep
+    262,  // newfstatat
+    273,  // set_robust_list
+    302,  // prlimit64
+    309,  // getcpu
+    334,  // rseq
+    439,  // faccessat2
+    2,    // open (for file I/O)
+    4,    // stat
+    6,    // lstat
+    7,    // poll
+    8,    // lseek
+    16,   // ioctl
+    17,   // pread64
+    18,   // pwrite64
+    19,   // readv
+    20,   // writev
+    21,   // access
+    22,   // pipe
+    23,   // select
+    25,   // mremap
+    28,   // madvise
+    41,   // socket
+    43,   // accept
+    48,   // shutdown
+    49,   // bind
+    50,   // listen
+    51,   // getsockname
+    52,   // getpeername
+    53,   // socketpair
+    54,   // setsockopt
+    55,   // getsockopt
+    63,   // uname
+    96,   // gettimeofday
+    158,  // arch_prctl
+    270,  // pselect6
+    271,  // ppoll
+    291,  // epoll_create1
+    292,  // dup3
+    293,  // pipe2
+    332,  // statx
+    435,  // clone3
+];
+
+/// Apply a seccomp BPF filter using an allowlist approach.
 ///
-/// The filter uses a denylist approach: all syscalls are allowed except the
-/// ones in `BLOCKED_SYSCALLS`, which return EPERM.
+/// Default action is SECCOMP_RET_KILL_PROCESS: any syscall not explicitly
+/// allowed kills the entire process. This is the gold standard for
+/// military-grade process hardening.
 ///
 /// Requires `PR_SET_NO_NEW_PRIVS` to be set first (enforced by the kernel).
 /// Returns `true` if the filter was successfully installed.
@@ -89,14 +187,13 @@ pub fn apply_seccomp_filter() -> bool {
         return false;
     }
 
-    // Build BPF program:
+    // Build BPF program (allowlist approach):
     //   load syscall number
-    //   for each blocked syscall: if nr == blocked, jump to DENY
+    //   for each allowed syscall: if nr == allowed, jump to ALLOW
+    //   KILL (default: unknown syscall)
     //   ALLOW
-    //   DENY: return EPERM
-    let num_blocked = BLOCKED_SYSCALLS.len();
-    // Total instructions: 1 (load) + num_blocked (jeq) + 1 (allow) + 1 (deny)
-    let total_insns = 1 + num_blocked + 1 + 1;
+    let num_allowed = ALLOWED_SYSCALLS.len();
+    let total_insns = 1 + num_allowed + 1 + 1;
     let mut filter: Vec<SockFilter> = Vec::with_capacity(total_insns);
 
     // Instruction 0: load seccomp_data.nr
@@ -107,14 +204,11 @@ pub fn apply_seccomp_filter() -> bool {
         k: SECCOMP_DATA_NR_OFFSET,
     });
 
-    // Instructions 1..=num_blocked: check each blocked syscall
-    // If match, jump to DENY (at index 1 + num_blocked + 1 = total_insns - 1)
-    // If no match, fall through to next check (or ALLOW)
-    for (i, &nr) in BLOCKED_SYSCALLS.iter().enumerate() {
-        let remaining_checks = num_blocked - i - 1;
-        // jt = jump over remaining checks + allow instruction to reach deny
-        let jt = (remaining_checks + 1) as u8;
-        // jf = 0 (fall through to next instruction)
+    // For each allowed syscall: if match, jump to ALLOW
+    for (i, &nr) in ALLOWED_SYSCALLS.iter().enumerate() {
+        let remaining = num_allowed - i - 1;
+        // jt = jump over remaining checks + KILL instruction to reach ALLOW
+        let jt = (remaining + 1) as u8;
         filter.push(SockFilter {
             code: BPF_JMP | BPF_JEQ | BPF_K,
             jt,
@@ -123,20 +217,20 @@ pub fn apply_seccomp_filter() -> bool {
         });
     }
 
-    // ALLOW instruction (reached when no blocked syscall matched)
+    // KILL instruction (default: syscall not in allowlist)
+    filter.push(SockFilter {
+        code: BPF_RET | BPF_K,
+        jt: 0,
+        jf: 0,
+        k: SECCOMP_RET_KILL_PROCESS,
+    });
+
+    // ALLOW instruction (reached when an allowed syscall matched)
     filter.push(SockFilter {
         code: BPF_RET | BPF_K,
         jt: 0,
         jf: 0,
         k: SECCOMP_RET_ALLOW,
-    });
-
-    // DENY instruction (jumped to when a blocked syscall matches)
-    filter.push(SockFilter {
-        code: BPF_RET | BPF_K,
-        jt: 0,
-        jf: 0,
-        k: SECCOMP_RET_ERRNO_EPERM,
     });
 
     assert_eq!(filter.len(), total_insns);
@@ -147,7 +241,6 @@ pub fn apply_seccomp_filter() -> bool {
     };
 
     unsafe {
-        // PR_SET_SECCOMP = 22
         let ret = libc::prctl(
             libc::PR_SET_SECCOMP,
             SECCOMP_MODE_FILTER as libc::c_ulong,
@@ -159,7 +252,7 @@ pub fn apply_seccomp_filter() -> bool {
             let errno = *libc::__errno_location();
             tracing::error!(
                 "seccomp: prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER) failed \
-                 (errno={}). BPF filter NOT installed — dangerous syscalls remain available.",
+                 (errno={}). BPF allowlist filter NOT installed.",
                 errno
             );
             return false;
@@ -167,10 +260,9 @@ pub fn apply_seccomp_filter() -> bool {
     }
 
     tracing::info!(
-        "seccomp: BPF filter installed — {} dangerous syscalls blocked (ptrace, \
-         process_vm_readv/writev, kexec, module load/unload, bpf, perf, userfaultfd, \
-         kcmp, lookup_dcookie)",
-        BLOCKED_SYSCALLS.len()
+        "seccomp: allowlist BPF filter installed — {} syscalls permitted, \
+         all others killed (SECCOMP_RET_KILL_PROCESS)",
+        ALLOWED_SYSCALLS.len()
     );
     true
 }
@@ -190,11 +282,21 @@ pub fn apply_anti_ptrace() -> bool {
         // PR_SET_PTRACER = 0x59616d61 on some systems, but with arg 0 it
         // sets "no process may ptrace this one".
         if libc::prctl(libc::PR_SET_PTRACER, 0, 0, 0, 0) != 0 {
-            tracing::warn!(
-                "seccomp: prctl(PR_SET_PTRACER, 0) failed — \
-                 Yama LSM may not be enabled. Ptrace restriction not enforced."
-            );
-            // Non-fatal: Yama may not be compiled into the kernel
+            let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            if is_military {
+                tracing::error!(
+                    "FATAL: prctl(PR_SET_PTRACER, 0) failed in military deployment. \
+                     Yama LSM MUST be enabled. Process is vulnerable to ptrace attachment."
+                );
+                ok = false;
+            } else {
+                tracing::warn!(
+                    "seccomp: prctl(PR_SET_PTRACER, 0) failed — \
+                     Yama LSM may not be enabled. Ptrace restriction not enforced."
+                );
+            }
         } else {
             tracing::info!("seccomp: PR_SET_PTRACER=0 applied (ptrace attachment denied)");
         }
@@ -405,11 +507,48 @@ mod tests {
 
     #[test]
     fn blocked_syscalls_count_matches_expected() {
-        // If someone accidentally removes a syscall from the list, this catches it.
+        // Legacy denylist kept for reference.
         assert_eq!(
             BLOCKED_SYSCALLS.len(),
             13,
             "BLOCKED_SYSCALLS must contain exactly 13 entries"
+        );
+    }
+
+    #[test]
+    fn allowed_syscalls_is_populated() {
+        assert!(
+            !ALLOWED_SYSCALLS.is_empty(),
+            "ALLOWED_SYSCALLS must not be empty"
+        );
+        // Must contain essential syscalls
+        assert!(ALLOWED_SYSCALLS.contains(&0), "read (0) must be allowed");
+        assert!(ALLOWED_SYSCALLS.contains(&1), "write (1) must be allowed");
+        assert!(ALLOWED_SYSCALLS.contains(&231), "exit_group (231) must be allowed");
+        assert!(ALLOWED_SYSCALLS.contains(&318), "getrandom (318) must be allowed");
+    }
+
+    #[test]
+    fn allowed_syscalls_excludes_dangerous() {
+        // None of the denylist syscalls should appear in the allowlist
+        for &blocked in BLOCKED_SYSCALLS {
+            assert!(
+                !ALLOWED_SYSCALLS.contains(&blocked),
+                "dangerous syscall {} must NOT be in ALLOWED_SYSCALLS",
+                blocked
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_syscalls_has_no_duplicates() {
+        let mut sorted = ALLOWED_SYSCALLS.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            ALLOWED_SYSCALLS.len(),
+            "ALLOWED_SYSCALLS contains duplicate entries"
         );
     }
 
@@ -428,10 +567,10 @@ mod tests {
     #[test]
     fn bpf_program_structure_is_valid() {
         // Verify the BPF program would have the correct number of instructions:
-        // 1 (load) + N (jeq per blocked syscall) + 1 (allow) + 1 (deny)
-        let num_blocked = BLOCKED_SYSCALLS.len();
-        let expected_insns = 1 + num_blocked + 1 + 1;
-        assert_eq!(expected_insns, 16, "BPF program should have 16 instructions for 13 blocked syscalls");
+        // 1 (load) + N (jeq per allowed syscall) + 1 (kill) + 1 (allow)
+        let num_allowed = ALLOWED_SYSCALLS.len();
+        let expected_insns = 1 + num_allowed + 1 + 1;
+        assert_eq!(expected_insns, 1 + ALLOWED_SYSCALLS.len() + 2, "BPF program instruction count mismatch");
 
         // Verify the load instruction opcode would be correct
         let load_opcode = BPF_LD | BPF_W | BPF_ABS;

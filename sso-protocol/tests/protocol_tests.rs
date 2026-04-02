@@ -60,13 +60,14 @@ fn test_authorization_code_create_and_consume() {
     let mut store = AuthorizationStore::new();
     let user_id = Uuid::new_v4();
 
-    let code = store.create_code(
+    let code = store.create_code_with_tier(
         "client-123",
         "https://app.example.com/callback",
         user_id,
         "openid profile",
         Some("challenge-value".into()),
         Some("nonce-value".into()),
+        2,
     ).unwrap();
 
     // Code should be consumable exactly once
@@ -98,7 +99,7 @@ fn test_authorization_code_expires() {
     assert!(store.consume_code("nonexistent-code").is_none());
 
     // Create and immediately consume should work (not expired)
-    let code = store.create_code("c", "https://x.com/cb", user_id, "openid", Some("dummy-challenge".into()), None).unwrap();
+    let code = store.create_code_with_tier("c", "https://x.com/cb", user_id, "openid", Some("dummy-challenge".into()), None, 2).unwrap();
     assert!(store.consume_code(&code).is_some());
 }
 
@@ -258,7 +259,7 @@ fn test_pkce_wrong_verifier_fails() {
 fn test_authorization_code_single_use() {
     let mut store = AuthorizationStore::new();
     let user_id = Uuid::new_v4();
-    let code = store.create_code("c1", "https://x.com/cb", user_id, "openid", Some("dummy-challenge".into()), None).unwrap();
+    let code = store.create_code_with_tier("c1", "https://x.com/cb", user_id, "openid", Some("dummy-challenge".into()), None, 2).unwrap();
     // First consume succeeds
     assert!(store.consume_code(&code).is_some());
     // Second consume fails — code already consumed

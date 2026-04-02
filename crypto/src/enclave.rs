@@ -223,15 +223,12 @@ pub fn unseal_key(
         .map_err(|_| "key unsealing failed — identity mismatch or tampered blob".to_string())
 }
 
-/// Derive a sealing encryption key from master key + enclave identity.
+/// Derive a sealing encryption key from master key + enclave identity using HKDF-SHA512.
 fn derive_sealing_key(master: &[u8; 32], identity: &[u8; 32]) -> [u8; 32] {
-    let mut hasher = Sha512::new();
-    hasher.update(b"MILNET-SEALING-KEY-DERIVE-v1");
-    hasher.update(master);
-    hasher.update(identity);
-    let digest = hasher.finalize();
+    let hk = hkdf::Hkdf::<Sha512>::new(Some(identity), master);
     let mut key = [0u8; 32];
-    key.copy_from_slice(&digest[..32]);
+    hk.expand(b"MILNET-ENCLAVE-SEAL-v1", &mut key)
+        .expect("HKDF-SHA512 expand for 32 bytes cannot fail");
     key
 }
 
@@ -434,15 +431,17 @@ pub fn derive_channel_session_key(
         (remote_hash, local_hash)
     };
 
-    let mut hasher = Sha512::new();
-    hasher.update(b"MILNET-ENCLAVE-CHANNEL-v1");
-    hasher.update(dh_shared_secret);
-    hasher.update(&first);
-    hasher.update(&second);
-    hasher.update(session_id);
-    let digest = hasher.finalize();
+    // Construct IKM from DH shared secret, sorted identity hashes, and session ID
+    let mut ikm = Vec::with_capacity(32 + 32 + 32 + 16);
+    ikm.extend_from_slice(dh_shared_secret);
+    ikm.extend_from_slice(&first);
+    ikm.extend_from_slice(&second);
+    ikm.extend_from_slice(session_id);
+
+    let hk = hkdf::Hkdf::<Sha512>::new(None, &ikm);
     let mut key = [0u8; 32];
-    key.copy_from_slice(&digest[..32]);
+    hk.expand(b"MILNET-ENCLAVE-CHANNEL-v1", &mut key)
+        .expect("HKDF-SHA512 expand for 32 bytes cannot fail");
     key
 }
 
@@ -513,19 +512,41 @@ pub fn detect_enclave_backend() -> EnclaveBackend {
 /// Guard that verifies enclave availability before sensitive signing
 /// operations.
 ///
-/// In production (`MILNET_PRODUCTION=1`), if no hardware enclave is
-/// detected, this logs a HIGH-severity warning. The operation is still
-/// allowed to proceed (fail-open for availability), but the warning
-/// enables SOC teams to detect misconfigured deployments.
+/// In production (`MILNET_PRODUCTION=1` or `MILNET_MILITARY_DEPLOYMENT=1`),
+/// if no hardware enclave is detected, this returns Err (fail-closed).
+/// Signing without hardware enclave protection is not acceptable in
+/// military deployment.
+///
+/// In non-production environments, logs a warning and returns Ok with
+/// the SoftwareFallback backend.
 ///
 /// Returns the detected backend for caller use (e.g., attestation binding).
-pub fn require_enclave_or_warn(operation: &str) -> EnclaveBackend {
+pub fn require_enclave_or_warn(operation: &str) -> Result<EnclaveBackend, String> {
     let backend = detect_enclave_backend();
 
     if backend == EnclaveBackend::SoftwareFallback {
+        let is_production = std::env::var("MILNET_PRODUCTION")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+
+        if is_production || is_military {
+            tracing::error!(
+                operation = operation,
+                "FATAL: signing operation without hardware enclave in production/military mode. \
+                 Deploy on SGX/SEV-SNP/TrustZone-capable hardware. Operation denied (fail-closed)."
+            );
+            return Err(format!(
+                "hardware enclave required for operation '{}' in production mode",
+                operation
+            ));
+        }
+
         tracing::warn!(
             operation = operation,
-            "SECURITY: signing operation without hardware enclave in production. \
+            "SECURITY: signing operation without hardware enclave. \
              Deploy on SGX/SEV-SNP/TrustZone-capable hardware for host compromise resilience."
         );
     } else {
@@ -536,7 +557,7 @@ pub fn require_enclave_or_warn(operation: &str) -> EnclaveBackend {
         );
     }
 
-    backend
+    Ok(backend)
 }
 
 /// Verify that a signing operation is attested before producing a signature.
@@ -553,7 +574,7 @@ pub fn attest_signing_operation(
     operation: &str,
     _key_id: &str,
 ) -> Result<EnclaveBackend, String> {
-    let backend = require_enclave_or_warn(operation);
+    let backend = require_enclave_or_warn(operation)?;
 
     if backend.is_hardware() {
         // Future: generate local attestation report binding key_id to
@@ -563,6 +584,16 @@ pub fn attest_signing_operation(
             backend = ?backend,
             "attestation binding active for signing key"
         );
+    } else {
+        tracing::error!(
+            operation = operation,
+            "attestation NOT available: software fallback has no attestation capability. \
+             Signing key is NOT bound to enclave measurement."
+        );
+        return Err(format!(
+            "attestation not available for operation '{}': no hardware enclave detected",
+            operation
+        ));
     }
 
     Ok(backend)
@@ -870,14 +901,17 @@ mod tests {
 
     #[test]
     fn test_require_enclave_or_warn_does_not_panic() {
-        let backend = require_enclave_or_warn("test-signing");
-        // In CI this should be SoftwareFallback
-        assert!(!backend.is_hardware() || backend.is_hardware());
+        let result = require_enclave_or_warn("test-signing");
+        // In CI (non-production) this should return Ok(SoftwareFallback)
+        assert!(result.is_ok());
     }
 
     #[test]
-    fn test_attest_signing_operation_succeeds() {
+    fn test_attest_signing_operation_in_dev() {
+        // In CI without hardware enclave, attest_signing_operation returns Err
+        // because software fallback has no attestation capability.
         let result = attest_signing_operation("test-sign", "key-001");
-        assert!(result.is_ok());
+        // In CI this should be Err (no hardware enclave)
+        assert!(result.is_err() || result.unwrap().is_hardware());
     }
 }

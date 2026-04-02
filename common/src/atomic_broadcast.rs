@@ -21,7 +21,7 @@
 
 use crate::siem::{PanelSiemEvent, SiemPanel, SiemSeverity};
 use sha2::{Digest, Sha512};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
@@ -77,6 +77,8 @@ pub struct AtomicBroadcast {
     quorum_size: usize,
     /// Set of delivered payload hashes (integrity: no duplicates).
     delivered_hashes: RwLock<HashSet<[u8; 64]>>,
+    /// ML-DSA-87 verifying keys for ack signature verification, keyed by node_id.
+    verifying_keys: RwLock<HashMap<String, Vec<u8>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -97,7 +99,15 @@ impl AtomicBroadcast {
             next_deliver_seq: AtomicU64::new(1),
             quorum_size,
             delivered_hashes: RwLock::new(HashSet::new()),
+            verifying_keys: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Register an ML-DSA-87 verifying key for a node.
+    /// Ack signatures from this node will be verified against this key.
+    pub fn register_verifying_key(&self, node_id: &str, key_bytes: Vec<u8>) {
+        let mut keys = crate::sync::siem_write(&self.verifying_keys, "atomic_broadcast::register_key");
+        keys.insert(node_id.to_string(), key_bytes);
     }
 
     /// Broadcast a payload: assign a sequence number and create a pending message.
@@ -170,9 +180,30 @@ impl AtomicBroadcast {
             return Err(format!("{node_id} already acked sequence {sequence}"));
         }
 
-        // In production: verify ML-DSA-87 signature over ack_digest.
+        // Verify ML-DSA-87 signature over ack_digest.
         if signature.is_empty() {
             return Err("empty ack signature".into());
+        }
+
+        {
+            let keys = crate::sync::siem_read(&self.verifying_keys, "atomic_broadcast::verify_ack");
+            if let Some(key_bytes) = keys.get(node_id) {
+                let ack_digest = msg.ack_digest();
+                if !verify_ack_signature(node_id, &ack_digest, &signature, key_bytes) {
+                    PanelSiemEvent::new(
+                        SiemPanel::KeyManagement,
+                        SiemSeverity::Critical,
+                        "ack_signature_verification_failed",
+                        format!("ML-DSA-87 ack signature from {} failed verification for seq {}", node_id, sequence),
+                        file!(),
+                        line!(),
+                        module_path!(),
+                    )
+                    .emit();
+                    return Err(format!("ack signature verification failed for {node_id}"));
+                }
+            }
+            // If no key registered, accept (backward-compat during key rollout).
         }
 
         msg.acks.push((node_id.to_string(), signature));
@@ -296,6 +327,40 @@ impl AtomicBroadcast {
         let delivered = crate::sync::siem_read(&self.delivered, "atomic_broadcast::delivered_messages");
         delivered.clone()
     }
+}
+
+/// Verify an ML-DSA-87 ack signature.
+/// Returns true if the signature over ack_digest is valid for the given key bytes.
+fn verify_ack_signature(
+    node_id: &str,
+    ack_digest: &[u8; 64],
+    signature: &[u8],
+    verifying_key_bytes: &[u8],
+) -> bool {
+    use ml_dsa::{signature::Verifier, MlDsa87, VerifyingKey};
+    let vk = match VerifyingKey::<MlDsa87>::try_from(verifying_key_bytes) {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!(
+                node_id = node_id,
+                error = %e,
+                "failed to deserialize ML-DSA-87 verifying key for ack verification"
+            );
+            return false;
+        }
+    };
+    let sig = match ml_dsa::Signature::<MlDsa87>::try_from(signature) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                node_id = node_id,
+                error = %e,
+                "failed to deserialize ML-DSA-87 signature for ack verification"
+            );
+            return false;
+        }
+    };
+    vk.verify(ack_digest, &sig).is_ok()
 }
 
 // ---------------------------------------------------------------------------

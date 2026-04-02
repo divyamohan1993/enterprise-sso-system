@@ -273,7 +273,7 @@ pub fn generate_ca() -> CertificateAuthority {
             tracing::error!("FATAL: CA cert params creation failed: {e}");
             std::process::exit(1);
         });
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     params.key_usages = vec![
         KeyUsagePurpose::KeyCertSign,
         KeyUsagePurpose::CrlSign,
@@ -296,7 +296,7 @@ pub fn generate_module_cert(module_name: &str, ca: &CertificateAuthority) -> Cer
         tracing::error!("FATAL: module key generation failed: {e}");
         std::process::exit(1);
     });
-    let subject_alt_names = vec![module_name.to_string(), "localhost".to_string()];
+    let subject_alt_names = vec![module_name.to_string()];
     let params =
         CertificateParams::new(subject_alt_names).unwrap_or_else(|e| {
             tracing::error!("FATAL: module cert params creation failed: {e}");
@@ -352,7 +352,10 @@ fn pq_tls_only() -> bool {
 /// In military mode (`MILNET_MILITARY_DEPLOYMENT=1`), performs a startup
 /// integrity check: PANICs if classical X25519 fallback would be present.
 ///
-/// # Known Discrepancy (TODO: CNSA2-TLS)
+/// # CNSA 2.0 GAP: ML-KEM-768 vs ML-KEM-1024
+///
+/// WARNING: This function uses ML-KEM-768 (NIST Level 3) for TLS key exchange,
+/// NOT ML-KEM-1024 (NIST Level 5) as required by CNSA 2.0 for TOP SECRET.
 ///
 /// The application layer uses ML-KEM-1024 (via `crypto::xwing`) for key agreement,
 /// but TLS is limited to ML-KEM-768 because `rustls::crypto::aws_lc_rs::kx_group`
@@ -360,9 +363,23 @@ fn pq_tls_only() -> bool {
 /// - ML-KEM-768 = NIST Level 3 (equivalent to AES-192)
 /// - ML-KEM-1024 = NIST Level 5 (equivalent to AES-256)
 ///
-/// When `rustls`/`aws-lc-rs` expose `X25519MLKEM1024`, upgrade this function
-/// to use it for full CNSA 2.0 consistency across all layers.
+/// This is a KNOWN CNSA 2.0 COMPLIANCE GAP. Operators who require strict CNSA 2.0
+/// ML-KEM-1024 across ALL layers must set `MILNET_REQUIRE_MLKEM1024=1` to prevent
+/// startup with ML-KEM-768. The system will refuse to start until `rustls`/`aws-lc-rs`
+/// expose `X25519MLKEM1024` and this function is upgraded.
 fn cnsa2_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    // Enforce ML-KEM-1024 requirement if operator has set the env var.
+    // This blocks startup to force acknowledgement of the CNSA 2.0 gap.
+    if std::env::var("MILNET_REQUIRE_MLKEM1024").map(|v| v == "1").unwrap_or(false) {
+        tracing::error!(
+            "FATAL: MILNET_REQUIRE_MLKEM1024=1 is set but TLS layer only supports ML-KEM-768 \
+             (X25519MLKEM768). CNSA 2.0 requires ML-KEM-1024 for TOP SECRET. \
+             Refusing to start. Unset MILNET_REQUIRE_MLKEM1024 to acknowledge this gap, \
+             or wait for rustls/aws-lc-rs to expose X25519MLKEM1024."
+        );
+        std::process::exit(198);
+    }
+
     let is_pq_only = pq_tls_only();
     let military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
         .map(|v| v == "1")

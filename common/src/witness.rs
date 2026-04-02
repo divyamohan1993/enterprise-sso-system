@@ -181,10 +181,51 @@ impl Default for WitnessLog {
 pub fn load_or_create_witness_seed(path: &Path) -> [u8; 32] {
     match std::fs::read(path) {
         Ok(data) if data.len() == 32 => {
+            // Legacy unencrypted seed (32 bytes plaintext)
             let mut seed = [0u8; 32];
             seed.copy_from_slice(&data);
-            tracing::info!("Loaded witness seed from {:?}", path);
+            tracing::info!("Loaded plaintext witness seed from {:?} (legacy format)", path);
             seed
+        }
+        Ok(data) if data.len() > 12 => {
+            // Encrypted seed: nonce (12 bytes) || ciphertext+tag
+            use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead, Nonce};
+
+            let seal_key = derive_seed_seal_key();
+            let cipher = match Aes256Gcm::new_from_slice(&seal_key) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!(
+                        "SIEM:CRITICAL witness seed decryption key init failed: {e} -- TAMPER INDICATOR"
+                    );
+                    std::process::exit(199);
+                }
+            };
+            let nonce = Nonce::from_slice(&data[..12]);
+            match cipher.decrypt(nonce, &data[12..]) {
+                Ok(plaintext) if plaintext.len() == 32 => {
+                    let mut seed = [0u8; 32];
+                    seed.copy_from_slice(&plaintext);
+                    tracing::info!("Loaded and decrypted witness seed from {:?}", path);
+                    seed
+                }
+                Ok(plaintext) => {
+                    tracing::error!(
+                        "SIEM:CRITICAL witness seed decrypted to unexpected length {} -- \
+                         TAMPER INDICATOR",
+                        plaintext.len()
+                    );
+                    std::process::exit(199);
+                }
+                Err(_) => {
+                    tracing::error!(
+                        "SIEM:CRITICAL witness seed decryption FAILED for {:?} -- \
+                         TAMPER DETECTED, seed file may have been modified",
+                        path
+                    );
+                    std::process::exit(199);
+                }
+            }
         }
         Ok(data) => {
             tracing::warn!(
@@ -192,8 +233,7 @@ pub fn load_or_create_witness_seed(path: &Path) -> [u8; 32] {
                 path,
                 data.len()
             );
-            let seed = generate_and_persist_seed(path);
-            seed
+            generate_and_persist_seed(path)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             tracing::info!("No witness seed at {:?}; generating new seed", path);
@@ -206,15 +246,30 @@ pub fn load_or_create_witness_seed(path: &Path) -> [u8; 32] {
             );
             let mut seed = [0u8; 32];
             getrandom::getrandom(&mut seed).unwrap_or_else(|e| {
-        tracing::error!("FATAL: CSPRNG failure in witness seed generation: {e}");
-        std::process::exit(1);
-    });
+                tracing::error!("FATAL: CSPRNG failure in witness seed generation: {e}");
+                std::process::exit(1);
+            });
             seed
         }
     }
 }
 
+/// Derive an AES-256-GCM key from the master KEK for witness seed encryption.
+fn derive_seed_seal_key() -> [u8; 32] {
+    use sha2::Sha512;
+    let kek = crate::sealed_keys::cached_master_kek();
+    let hk = hkdf::Hkdf::<Sha512>::new(None, kek);
+    let mut okm = [0u8; 32];
+    hk.expand(b"MILNET-WITNESS-SEED-SEAL-v1", &mut okm)
+        .unwrap_or_else(|e| {
+            tracing::error!("FATAL: HKDF expansion failed for witness seed seal key: {e}");
+            std::process::exit(199);
+        });
+    okm
+}
+
 fn generate_and_persist_seed(path: &Path) -> [u8; 32] {
+    use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead, Nonce};
     use std::io::Write;
 
     let mut seed = [0u8; 32];
@@ -223,6 +278,26 @@ fn generate_and_persist_seed(path: &Path) -> [u8; 32] {
         std::process::exit(1);
     });
 
+    // Encrypt seed with AES-256-GCM using key derived from master KEK
+    let seal_key = derive_seed_seal_key();
+    let cipher = Aes256Gcm::new_from_slice(&seal_key).unwrap_or_else(|e| {
+        tracing::error!("FATAL: AES-256-GCM key init failed for witness seed seal: {e}");
+        std::process::exit(199);
+    });
+
+    let mut nonce_bytes = [0u8; 12];
+    getrandom::getrandom(&mut nonce_bytes).unwrap_or_else(|e| {
+        tracing::error!("FATAL: CSPRNG failure for witness seed nonce: {e}");
+        std::process::exit(1);
+    });
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let ciphertext = cipher.encrypt(nonce, seed.as_ref()).unwrap_or_else(|e| {
+        tracing::error!("FATAL: AES-256-GCM encryption failed for witness seed: {e}");
+        std::process::exit(199);
+    });
+
+    // Write format: nonce (12 bytes) || ciphertext+tag
     match std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -230,12 +305,15 @@ fn generate_and_persist_seed(path: &Path) -> [u8; 32] {
         .open(path)
     {
         Ok(mut f) => {
-            if let Err(e) = f.write_all(&seed) {
+            let mut sealed = Vec::with_capacity(12 + ciphertext.len());
+            sealed.extend_from_slice(&nonce_bytes);
+            sealed.extend_from_slice(&ciphertext);
+            if let Err(e) = f.write_all(&sealed) {
                 tracing::error!("Failed to write witness seed to {:?}: {}", path, e);
             } else if let Err(e) = f.sync_all() {
                 tracing::error!("Failed to sync witness seed file {:?}: {}", path, e);
             } else {
-                tracing::info!("Persisted witness seed to {:?}", path);
+                tracing::info!("Persisted encrypted witness seed to {:?}", path);
             }
         }
         Err(e) => {
@@ -267,11 +345,32 @@ fn append_checkpoint_to_file(path: &Path, cp: &WitnessCheckpoint) -> std::io::Re
     Ok(())
 }
 
-/// Load checkpoints and verify sequence + signature continuity.
+/// Load checkpoints and verify sequence, timestamp, and ML-DSA-87 signature continuity.
+///
+/// For each checkpoint, the signature is verified against the witness verifying key
+/// (derived from the seed at the standard seed path). If verification fails, a
+/// CRITICAL SIEM event is emitted and the checkpoint is skipped. If more than 1
+/// checkpoint fails verification, loading is aborted entirely (tamper detected).
 fn load_and_verify_checkpoints(path: &Path) -> Vec<WitnessCheckpoint> {
     let checkpoints = load_checkpoints_from_file(path);
 
-    // Verify sequence continuity
+    // Attempt to load the witness verifying key for signature verification.
+    // Derive from the seed file path (sibling of the checkpoint file).
+    let vk_bytes: Option<Vec<u8>> = path.parent().map(|dir| {
+        let seed_path = dir.join("witness_seed.bin");
+        match load_or_create_witness_seed(&seed_path) {
+            seed => {
+                use ml_dsa::{KeyGen, MlDsa87, EncodedVerifyingKey};
+                let kp = MlDsa87::from_seed(&seed.into());
+                let encoded: EncodedVerifyingKey<MlDsa87> = kp.verifying_key().encode();
+                AsRef::<[u8]>::as_ref(&encoded).to_vec()
+            }
+        }
+    });
+
+    let mut verified = Vec::new();
+    let mut sig_failures: u32 = 0;
+
     for (i, cp) in checkpoints.iter().enumerate() {
         let expected_seq = i as u64;
         if cp.sequence != expected_seq {
@@ -279,8 +378,7 @@ fn load_and_verify_checkpoints(path: &Path) -> Vec<WitnessCheckpoint> {
                 "WitnessLog: checkpoint sequence gap at index {}: expected {}, got {}",
                 i, expected_seq, cp.sequence
             );
-            // Return only verified checkpoints up to the gap
-            return checkpoints[..i].to_vec();
+            return verified;
         }
 
         // Verify timestamp ordering
@@ -289,11 +387,56 @@ fn load_and_verify_checkpoints(path: &Path) -> Vec<WitnessCheckpoint> {
                 "WitnessLog: checkpoint timestamp out of order at index {}",
                 i
             );
-            return checkpoints[..i].to_vec();
+            return verified;
         }
+
+        // Verify ML-DSA-87 signature
+        if let Some(ref vk) = vk_bytes {
+            let mut signed_data = Vec::with_capacity(128 + 16);
+            signed_data.extend_from_slice(&cp.audit_root);
+            signed_data.extend_from_slice(&cp.kt_root);
+            signed_data.extend_from_slice(&cp.sequence.to_be_bytes());
+            signed_data.extend_from_slice(&cp.timestamp.to_be_bytes());
+
+            if !verify_checkpoint_signature(vk, &signed_data, &cp.signature) {
+                sig_failures += 1;
+                tracing::error!(
+                    "SIEM:CRITICAL WitnessLog: ML-DSA-87 signature verification FAILED \
+                     for checkpoint seq={} -- possible tamper (failure count: {})",
+                    cp.sequence, sig_failures
+                );
+                if sig_failures > 1 {
+                    tracing::error!(
+                        "SIEM:CRITICAL WitnessLog: multiple signature failures detected -- \
+                         TAMPER DETECTED, aborting checkpoint loading entirely"
+                    );
+                    return verified;
+                }
+                // Skip this corrupted checkpoint but continue loading
+                continue;
+            }
+        }
+
+        verified.push(cp.clone());
     }
 
-    checkpoints
+    verified
+}
+
+/// Verify an ML-DSA-87 signature on checkpoint data.
+fn verify_checkpoint_signature(vk_bytes: &[u8], data: &[u8], sig_bytes: &[u8]) -> bool {
+    use ml_dsa::{signature::Verifier, EncodedVerifyingKey, MlDsa87, VerifyingKey};
+
+    let vk_enc = match EncodedVerifyingKey::<MlDsa87>::try_from(vk_bytes) {
+        Ok(enc) => enc,
+        Err(_) => return false,
+    };
+    let vk = VerifyingKey::<MlDsa87>::decode(&vk_enc);
+    let sig = match ml_dsa::Signature::<MlDsa87>::try_from(sig_bytes) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    vk.verify(data, &sig).is_ok()
 }
 
 /// Load all checkpoints from a length-prefixed postcard file.

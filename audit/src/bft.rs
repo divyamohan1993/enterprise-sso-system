@@ -86,7 +86,7 @@ impl AuditNode {
             AuditLog::new()
         } else {
             let log = AuditLog::from_entries(entries);
-            if !log.verify_chain() {
+            if !log.verify_chain_structure_only() { // explicit: no signing key available at reload
                 tracing::error!(
                     "CRITICAL: BFT node {}: persisted chain verification FAILED on reload from {:?}",
                     node_id, path
@@ -200,6 +200,33 @@ pub struct ByzantineDetectionState {
     pub confirmed_byzantine: Vec<usize>,
 }
 
+/// Startup check: in military deployment, BFT nodes must be separate processes/VMs.
+/// Single-process mode is only acceptable with explicit acknowledgment.
+fn check_single_process_military_deployment() {
+    let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if !is_military {
+        return;
+    }
+    common::siem::SecurityEvent::tamper_detected(
+        "CRITICAL: BFT audit cluster running in single-process mode. \
+         BFT nodes MUST be deployed as separate processes/VMs for actual \
+         Byzantine fault tolerance. Single-process mode provides NO protection \
+         against a compromised process.",
+    );
+    let ack = std::env::var("MILNET_BFT_SINGLE_PROCESS_ACK")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if !ack {
+        panic!(
+            "FATAL: BFT single-process mode not acknowledged in military deployment. \
+             Set MILNET_BFT_SINGLE_PROCESS_ACK=1 to explicitly accept reduced \
+             Byzantine fault tolerance, or deploy BFT nodes as separate processes."
+        );
+    }
+}
+
 /// BFT audit cluster.
 pub struct BftAuditCluster {
     pub nodes: Vec<AuditNode>,
@@ -209,6 +236,10 @@ pub struct BftAuditCluster {
     pq_signing_key: Option<pq_sign::PqSigningKey>,
     /// Maximum Byzantine faults tolerated.
     f: usize,
+    /// Monotonic sequence number for proposer rotation.
+    sequence_number: u64,
+    /// Single-process mode flag. True when BFT nodes run in one process.
+    single_process_mode: bool,
 }
 
 impl BftAuditCluster {
@@ -224,6 +255,8 @@ impl BftAuditCluster {
             );
         }
 
+        check_single_process_military_deployment();
+
         let f = (node_count - 1) / 3; // max Byzantine faults tolerated
         let quorum = 2 * f + 1; // minimum for consensus
         let nodes: Vec<AuditNode> = (0..node_count as u8).map(AuditNode::new).collect();
@@ -232,6 +265,8 @@ impl BftAuditCluster {
             quorum_size: quorum,
             pq_signing_key: None,
             f,
+            sequence_number: 0,
+            single_process_mode: true,
         };
         cluster.initialize_heartbeats();
         cluster
@@ -248,6 +283,8 @@ impl BftAuditCluster {
             );
         }
 
+        check_single_process_military_deployment();
+
         let f = (node_count - 1) / 3;
         let quorum = 2 * f + 1;
         let nodes: Vec<AuditNode> = (0..node_count as u8).map(AuditNode::new).collect();
@@ -256,6 +293,8 @@ impl BftAuditCluster {
             quorum_size: quorum,
             pq_signing_key: Some(signing_key),
             f,
+            sequence_number: 0,
+            single_process_mode: true,
         };
         cluster.initialize_heartbeats();
         cluster
@@ -289,11 +328,15 @@ impl BftAuditCluster {
                 AuditNode::new_with_persistence(id, path)
             })
             .collect();
+        check_single_process_military_deployment();
+
         let mut cluster = Self {
             nodes,
             quorum_size: quorum,
             pq_signing_key: Some(signing_key),
             f,
+            sequence_number: 0,
+            single_process_mode: true,
         };
         cluster.initialize_heartbeats();
         cluster
@@ -332,12 +375,18 @@ impl BftAuditCluster {
         ceremony_receipts: Vec<Receipt>,
         classification: u8,
     ) -> Result<[u8; 64], String> {
-        // Find the first honest node to act as proposer.
-        let proposer_idx = self
+        // Rotate proposer based on sequence number across honest nodes.
+        let honest_indices: Vec<usize> = self
             .nodes
             .iter()
-            .position(|n| !n.is_byzantine)
-            .ok_or_else(|| "no honest nodes available".to_string())?;
+            .enumerate()
+            .filter(|(_, n)| !n.is_byzantine)
+            .map(|(i, _)| i)
+            .collect();
+        if honest_indices.is_empty() {
+            return Err("no honest nodes available".to_string());
+        }
+        let proposer_idx = honest_indices[self.sequence_number as usize % honest_indices.len()];
 
         // Check partition status of the proposer.
         if self.nodes[proposer_idx].check_partition(self.nodes.len()) {
@@ -413,6 +462,7 @@ impl BftAuditCluster {
         if accept_count >= self.quorum_size {
             // Exchange heartbeats among all nodes that accepted.
             self.exchange_heartbeats();
+            self.sequence_number += 1;
             Ok(entry_hash)
         } else {
             Err(format!(

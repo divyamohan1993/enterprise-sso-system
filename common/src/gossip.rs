@@ -603,10 +603,22 @@ impl GossipProtocol {
         if alive.is_empty() {
             return None;
         }
-        // Deterministic-ish selection based on protocol period for reproducibility
-        // in tests; in production, rand would be used via getrandom.
-        let period = *crate::sync::siem_read(&self.protocol_period, "gossip::pick_random_period");
-        let idx = (period as usize) % alive.len();
+        // True random selection via getrandom with rejection sampling to avoid modulo bias.
+        let len = alive.len();
+        let idx = {
+            let bucket_size = u64::MAX / (len as u64);
+            let limit = bucket_size * (len as u64);
+            loop {
+                let mut buf = [0u8; 8];
+                getrandom::getrandom(&mut buf).unwrap_or_else(|_| {
+                    buf = [42; 8];
+                });
+                let sample = u64::from_le_bytes(buf);
+                if sample < limit {
+                    break (sample % (len as u64)) as usize;
+                }
+            }
+        };
         Some(alive[idx].clone())
     }
 

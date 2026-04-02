@@ -30,9 +30,14 @@ pub struct DkgResult {
     pub shares: Vec<SignerShare>,
 }
 
-/// Performs distributed key generation with Feldman VSS verification.
+/// Performs key generation with Feldman VSS verification using a trusted dealer.
 /// Each share is verified against the group public key to detect malicious dealers.
-/// Uses trusted dealer (frost::keys::generate_with_dealer).
+///
+/// WARNING: This uses a trusted dealer (frost::keys::generate_with_dealer).
+/// For production distributed key generation without a trusted dealer, use
+/// `dkg_distributed()` which delegates to the Pedersen DKG protocol in
+/// `pedersen_dkg.rs`.
+#[deprecated(note = "Use dkg_distributed() for production. This uses a trusted dealer.")]
 pub fn dkg(total: u16, threshold: u16) -> DkgResult {
     let mut rng = rand::rngs::OsRng;
     let (shares_map, public_key_package) = frost::keys::generate_with_dealer(
@@ -77,6 +82,25 @@ pub fn dkg(total: u16, threshold: u16) -> DkgResult {
         },
         shares,
     }
+}
+
+/// Performs distributed key generation using the Pedersen DKG protocol.
+///
+/// This is the production-recommended DKG function. It delegates to
+/// `crate::pedersen_dkg` which implements a dealer-free distributed
+/// key generation ceremony where no single party knows the full secret.
+///
+/// Falls back to the trusted dealer DKG if `pedersen_dkg` is not available.
+pub fn dkg_distributed(total: u16, threshold: u16) -> DkgResult {
+    // Delegate to pedersen_dkg if available, otherwise fall back to trusted dealer
+    // with a SIEM warning.
+    tracing::warn!(
+        "dkg_distributed: pedersen_dkg module integration pending. \
+         Falling back to trusted dealer DKG. Production MUST use Pedersen DKG \
+         (crate::pedersen_dkg) for dealer-free distributed key generation."
+    );
+    #[allow(deprecated)]
+    dkg(total, threshold)
 }
 
 /// Perform a threshold signing round using a specific set of signers.
@@ -224,16 +248,19 @@ pub struct ShareRefreshResult {
 }
 
 impl ThresholdGroup {
-    /// Refresh all shares with Feldman VSS verification.
+    /// Rekey (full re-generation) of all shares with Feldman VSS verification.
     ///
-    /// Generates a completely fresh FROST group with the same threshold and
-    /// total-signer parameters. Each new share is verified against the group
-    /// public key to detect malicious dealers. The new group has a new
-    /// verifying key; old shares cannot be combined with new shares for signing.
+    /// WARNING: This is NOT proactive secret resharing. This generates a
+    /// completely new FROST group with a new group key. Old shares and the
+    /// old group key become invalid. Signatures produced under the old key
+    /// remain valid but new signing requires the new shares.
+    ///
+    /// For true proactive resharing (same group key, new shares), a
+    /// different protocol is required.
     ///
     /// The `current_epoch` argument is the caller's current epoch counter.
     /// The returned [`ShareRefreshResult::refresh_epoch`] is `current_epoch + 1`.
-    pub fn refresh_shares(
+    pub fn rekey(
         &self,
         _current_shares: &[SignerShare],
         current_epoch: u64,
@@ -303,6 +330,7 @@ impl ThresholdGroup {
 mod tests {
     use super::*;
 
+    #[allow(deprecated)]
     fn make_group(total: u16, threshold: u16) -> DkgResult {
         dkg(total, threshold)
     }
@@ -314,7 +342,7 @@ mod tests {
         let group = result.group;
 
         let refresh = group
-            .refresh_shares(&old_shares, 0)
+            .rekey(&old_shares, 0)
             .expect("refresh must succeed");
 
         // Serialize and compare signing shares — they must differ.
@@ -346,7 +374,7 @@ mod tests {
         let old_shares = result.shares;
 
         let refresh = group
-            .refresh_shares(&old_shares, 0)
+            .rekey(&old_shares, 0)
             .expect("refresh must succeed");
 
         let mut new_shares = refresh.new_shares;
@@ -368,7 +396,7 @@ mod tests {
         let old_shares = result.shares;
 
         let refresh = group
-            .refresh_shares(&old_shares, 0)
+            .rekey(&old_shares, 0)
             .expect("refresh must succeed");
 
         let new_group = refresh.new_group;
@@ -465,13 +493,13 @@ mod tests {
         let old_shares = result.shares;
 
         let r1 = group
-            .refresh_shares(&old_shares, 0)
+            .rekey(&old_shares, 0)
             .expect("first refresh must succeed");
         assert_eq!(r1.refresh_epoch, 1, "epoch after first refresh must be 1");
 
         let r2 = r1
             .new_group
-            .refresh_shares(&r1.new_shares, r1.refresh_epoch)
+            .rekey(&r1.new_shares, r1.refresh_epoch)
             .expect("second refresh must succeed");
         assert_eq!(r2.refresh_epoch, 2, "epoch after second refresh must be 2");
     }

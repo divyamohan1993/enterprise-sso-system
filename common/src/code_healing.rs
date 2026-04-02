@@ -28,6 +28,8 @@ pub struct HealingSession {
     target_node: NodeId,
     /// The correct binary hash.
     expected_hash: BinaryHash,
+    /// ML-DSA-87 signature over expected_hash from cluster healing authority.
+    hash_signature: Vec<u8>,
     /// Binary chunks received so far.
     chunks: HashMap<u32, Vec<u8>>,
     /// Total expected chunks.
@@ -76,6 +78,9 @@ pub struct CodeHealer {
     chunk_size: usize,
     /// Healing timeout (default: 5 minutes).
     timeout: Duration,
+    /// ML-DSA-87 public key of the cluster healing authority.
+    /// When set, all chunks and expected hashes must be signed.
+    healing_authority_pk: Option<Vec<u8>>,
 }
 
 impl CodeHealer {
@@ -87,6 +92,7 @@ impl CodeHealer {
             sessions: HashMap::new(),
             chunk_size: DEFAULT_CHUNK_SIZE,
             timeout: DEFAULT_TIMEOUT,
+            healing_authority_pk: None,
         }
     }
 
@@ -107,7 +113,14 @@ impl CodeHealer {
                 chunk_size
             },
             timeout,
+            healing_authority_pk: None,
         }
+    }
+
+    /// Set the ML-DSA-87 public key of the cluster healing authority.
+    /// When set, all chunks and expected hashes must carry valid signatures.
+    pub fn set_healing_authority_pk(&mut self, pk: Vec<u8>) {
+        self.healing_authority_pk = Some(pk);
     }
 
     /// Read a binary, split it into chunks, and return the chunks plus the SHA-512 hash.
@@ -131,15 +144,78 @@ impl CodeHealer {
     }
 
     /// Start a healing session for the given target node.
+    ///
+    /// `hash_signature` is the ML-DSA-87 signature over `expected_hash` from the
+    /// cluster healing authority. When a healing authority public key is configured,
+    /// the signature is verified before the session is accepted.
     pub fn start_healing_session(
         &mut self,
         target: NodeId,
         expected_hash: BinaryHash,
         total_chunks: u32,
     ) {
+        self.start_healing_session_signed(target, expected_hash, Vec::new(), total_chunks);
+    }
+
+    /// Start a healing session with an explicit hash signature.
+    pub fn start_healing_session_signed(
+        &mut self,
+        target: NodeId,
+        expected_hash: BinaryHash,
+        hash_signature: Vec<u8>,
+        total_chunks: u32,
+    ) {
+        // Verify the expected_hash signature if authority key is configured.
+        if let Some(ref _pk) = self.healing_authority_pk {
+            if hash_signature.is_empty() {
+                error!(
+                    node = %target,
+                    "rejecting healing session: expected_hash has no signature \
+                     but healing authority is configured"
+                );
+                let event = crate::siem::SecurityEvent {
+                    timestamp: crate::siem::SecurityEvent::now_iso8601(),
+                    category: "code_healing",
+                    action: "unsigned_hash_rejected",
+                    severity: crate::siem::Severity::Critical,
+                    outcome: "failure",
+                    user_id: None,
+                    source_ip: None,
+                    detail: Some(format!(
+                        "node={target} unsigned expected_hash in healing session"
+                    )),
+                };
+                event.emit();
+                return;
+            }
+            // ML-DSA-87 signature verification against the authority public key.
+            // The signature covers the raw expected_hash bytes (64 bytes).
+            if !verify_ml_dsa_signature(_pk, &expected_hash, &hash_signature) {
+                error!(
+                    node = %target,
+                    "rejecting healing session: expected_hash signature verification failed"
+                );
+                let event = crate::siem::SecurityEvent {
+                    timestamp: crate::siem::SecurityEvent::now_iso8601(),
+                    category: "code_healing",
+                    action: "invalid_hash_signature",
+                    severity: crate::siem::Severity::Critical,
+                    outcome: "failure",
+                    user_id: None,
+                    source_ip: None,
+                    detail: Some(format!(
+                        "node={target} expected_hash signature verification failed"
+                    )),
+                };
+                event.emit();
+                return;
+            }
+        }
+
         info!(
             node = %target,
             total_chunks,
+            signed = !hash_signature.is_empty(),
             "starting healing session"
         );
         self.sessions.insert(
@@ -147,6 +223,7 @@ impl CodeHealer {
             HealingSession {
                 target_node: target,
                 expected_hash,
+                hash_signature,
                 chunks: HashMap::new(),
                 total_chunks,
                 started_at: Instant::now(),
@@ -159,12 +236,70 @@ impl CodeHealer {
     ///
     /// Returns `Ok(true)` when all chunks have been received and the session
     /// is complete. Returns `Ok(false)` when more chunks are still expected.
+    ///
+    /// When a healing authority public key is configured, each chunk must
+    /// carry a valid `chunk_signature` (ML-DSA-87 over chunk_index || data).
     pub fn receive_chunk(
         &mut self,
         target: &NodeId,
         chunk_index: u32,
         data: Vec<u8>,
     ) -> Result<bool, String> {
+        self.receive_chunk_signed(target, chunk_index, data, Vec::new())
+    }
+
+    /// Receive a chunk with an explicit ML-DSA-87 signature.
+    pub fn receive_chunk_signed(
+        &mut self,
+        target: &NodeId,
+        chunk_index: u32,
+        data: Vec<u8>,
+        chunk_signature: Vec<u8>,
+    ) -> Result<bool, String> {
+        // Verify chunk signature if authority key is configured.
+        if let Some(ref _pk) = self.healing_authority_pk {
+            if chunk_signature.is_empty() {
+                let event = crate::siem::SecurityEvent {
+                    timestamp: crate::siem::SecurityEvent::now_iso8601(),
+                    category: "code_healing",
+                    action: "unsigned_chunk_rejected",
+                    severity: crate::siem::Severity::Critical,
+                    outcome: "failure",
+                    user_id: None,
+                    source_ip: None,
+                    detail: Some(format!(
+                        "node={target} chunk_index={chunk_index} unsigned chunk rejected"
+                    )),
+                };
+                event.emit();
+                return Err(format!(
+                    "chunk {chunk_index} rejected: no signature and healing authority is configured"
+                ));
+            }
+            // Build signed message: chunk_index (4 bytes big-endian) || data
+            let mut signed_msg = Vec::with_capacity(4 + data.len());
+            signed_msg.extend_from_slice(&chunk_index.to_be_bytes());
+            signed_msg.extend_from_slice(&data);
+
+            if !verify_ml_dsa_signature(_pk, &signed_msg, &chunk_signature) {
+                let event = crate::siem::SecurityEvent {
+                    timestamp: crate::siem::SecurityEvent::now_iso8601(),
+                    category: "code_healing",
+                    action: "invalid_chunk_signature",
+                    severity: crate::siem::Severity::Critical,
+                    outcome: "failure",
+                    user_id: None,
+                    source_ip: None,
+                    detail: Some(format!(
+                        "node={target} chunk_index={chunk_index} signature verification failed"
+                    )),
+                };
+                event.emit();
+                return Err(format!(
+                    "chunk {chunk_index} rejected: signature verification failed"
+                ));
+            }
+        }
         let session = self
             .sessions
             .get_mut(target)
@@ -327,6 +462,31 @@ impl CodeHealer {
     pub fn has_session(&self, target: &NodeId) -> bool {
         self.sessions.contains_key(target)
     }
+}
+
+// ── ML-DSA-87 signature verification ────────────────────────────────────────
+
+/// Verify an ML-DSA-87 signature over `data` using the provided public key bytes.
+///
+/// The public key is the raw encoded ML-DSA-87 verifying key. Returns false
+/// on any error (malformed key, malformed signature, verification failure).
+fn verify_ml_dsa_signature(pk_bytes: &[u8], data: &[u8], sig_bytes: &[u8]) -> bool {
+    use ml_dsa::{
+        signature::Verifier,
+        MlDsa87, Signature, VerifyingKey,
+    };
+
+    let vk = match VerifyingKey::<MlDsa87>::try_from(pk_bytes) {
+        Ok(k) => k,
+        Err(_) => return false,
+    };
+
+    let sig = match Signature::<MlDsa87>::try_from(sig_bytes) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    vk.verify(data, &sig).is_ok()
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

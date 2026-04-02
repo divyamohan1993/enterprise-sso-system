@@ -64,19 +64,54 @@ fn load_nonce_counter() -> u64 {
     match std::fs::read(&path) {
         Ok(sealed_bytes) => {
             if sealed_bytes.len() < 12 + 16 {
-                tracing::warn!(
+                tracing::error!(
                     path = %path,
-                    "TSS nonce state file too short ({}), starting from 0",
+                    "CRITICAL: FROST nonce state file corrupted (too short: {} bytes) \
+                     -- possible tamper. Nonce reuse in FROST reveals the signing key. \
+                     Halting immediately.",
                     sealed_bytes.len()
                 );
-                return 0;
+                common::siem::SecurityEvent {
+                    timestamp: common::siem::SecurityEvent::now_iso8601(),
+                    category: "tss_nonce",
+                    action: "nonce_state_tamper_detected",
+                    severity: common::siem::Severity::Critical,
+                    outcome: "failure",
+                    user_id: None,
+                    source_ip: None,
+                    detail: Some(format!(
+                        "TSS nonce state file at {} too short ({} bytes). \
+                         Process halted to prevent catastrophic nonce reuse.",
+                        path, sealed_bytes.len()
+                    )),
+                }
+                .emit();
+                std::process::exit(199);
             }
             let seal_key = nonce_seal_kek();
             let cipher = match Aes256Gcm::new_from_slice(&seal_key) {
                 Ok(c) => c,
                 Err(_) => {
-                    tracing::error!("FATAL: AES-256-GCM key init failed for TSS nonce state");
-                    return 0;
+                    tracing::error!(
+                        "CRITICAL: AES-256-GCM key init failed for TSS nonce state \
+                         -- possible KEK tamper. Halting immediately."
+                    );
+                    common::siem::SecurityEvent {
+                        timestamp: common::siem::SecurityEvent::now_iso8601(),
+                        category: "tss_nonce",
+                        action: "nonce_state_tamper_detected",
+                        severity: common::siem::Severity::Critical,
+                        outcome: "failure",
+                        user_id: None,
+                        source_ip: None,
+                        detail: Some(format!(
+                            "AES-256-GCM key init failed for nonce state at {}. \
+                             Process halted to prevent catastrophic nonce reuse.",
+                            path
+                        )),
+                    }
+                    .emit();
+                    std::process::exit(199);
                 }
             };
             let nonce = Nonce::from_slice(&sealed_bytes[..12]);
@@ -88,8 +123,26 @@ fn load_nonce_counter() -> u64 {
                             match plaintext[..8].try_into() {
                                 Ok(arr) => arr,
                                 Err(_) => {
-                                    tracing::warn!("TSS nonce state: 8-byte conversion failed, starting from 0");
-                                    return 0;
+                                    tracing::error!(
+                                        "CRITICAL: FROST nonce state 8-byte conversion failed \
+                                         -- corrupted state. Halting to prevent nonce reuse."
+                                    );
+                                    common::siem::SecurityEvent {
+                                        timestamp: common::siem::SecurityEvent::now_iso8601(),
+                                        category: "tss_nonce",
+                                        action: "nonce_state_tamper_detected",
+                                        severity: common::siem::Severity::Critical,
+                                        outcome: "failure",
+                                        user_id: None,
+                                        source_ip: None,
+                                        detail: Some(format!(
+                                            "TSS nonce state 8-byte conversion failed at {}. \
+                                             Process halted to prevent catastrophic nonce reuse.",
+                                            path
+                                        )),
+                                    }
+                                    .emit();
+                                    std::process::exit(199);
                                 }
                             },
                         );
@@ -100,39 +153,91 @@ fn load_nonce_counter() -> u64 {
                         );
                         counter
                     } else {
-                        tracing::warn!(
+                        tracing::error!(
                             path = %path,
-                            "TSS nonce state file has invalid plaintext length ({}), starting from 0",
+                            "CRITICAL: FROST nonce state file has invalid plaintext length ({}) \
+                             -- possible tamper. Nonce reuse in FROST reveals the signing key. \
+                             Halting immediately.",
                             plaintext.len()
                         );
-                        0
+                        common::siem::SecurityEvent {
+                            timestamp: common::siem::SecurityEvent::now_iso8601(),
+                            category: "tss_nonce",
+                            action: "nonce_state_tamper_detected",
+                            severity: common::siem::Severity::Critical,
+                            outcome: "failure",
+                            user_id: None,
+                            source_ip: None,
+                            detail: Some(format!(
+                                "TSS nonce state file at {} has invalid plaintext length ({}). \
+                                 Process halted to prevent catastrophic nonce reuse.",
+                                path, plaintext.len()
+                            )),
+                        }
+                        .emit();
+                        std::process::exit(199);
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(
+                    // Decryption failure on an existing file is a tamper indicator.
+                    // CRITICAL: nonce reuse for FROST is catastrophic. Halt immediately.
+                    tracing::error!(
                         path = %path,
                         error = %e,
-                        "Failed to unseal TSS nonce state file, starting from 0"
+                        "CRITICAL: TSS nonce state file decryption failed -- possible tampering. \
+                         Refusing to continue to prevent nonce reuse."
                     );
-                    0
+                    common::siem::SecurityEvent {
+                        timestamp: common::siem::SecurityEvent::now_iso8601(),
+                        category: "tss_nonce",
+                        action: "nonce_state_tamper_detected",
+                        severity: common::siem::Severity::Critical,
+                        outcome: "failure",
+                        user_id: None,
+                        source_ip: None,
+                        detail: Some(format!(
+                            "TSS nonce state file at {} failed decryption: {}. \
+                             Process halted to prevent catastrophic nonce reuse.",
+                            path, e
+                        )),
+                    }
+                    .emit();
+                    std::process::exit(199);
                 }
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             tracing::warn!(
                 path = %path,
-                "TSS nonce state file not found — starting nonce counter from 0. \
+                "TSS nonce state file not found -- starting nonce counter from 0. \
                  This is expected on first startup."
             );
             0
         }
         Err(e) => {
-            tracing::warn!(
+            // File exists but cannot be read -- also a tamper/integrity concern.
+            tracing::error!(
                 path = %path,
                 error = %e,
-                "Failed to read TSS nonce state file, starting from 0"
+                "CRITICAL: Failed to read TSS nonce state file. \
+                 Refusing to continue to prevent nonce reuse."
             );
-            0
+            common::siem::SecurityEvent {
+                timestamp: common::siem::SecurityEvent::now_iso8601(),
+                category: "tss_nonce",
+                action: "nonce_state_read_failed",
+                severity: common::siem::Severity::Critical,
+                outcome: "failure",
+                user_id: None,
+                source_ip: None,
+                detail: Some(format!(
+                    "TSS nonce state file at {} unreadable: {}. \
+                     Process halted to prevent catastrophic nonce reuse.",
+                    path, e
+                )),
+            }
+            .emit();
+            std::process::exit(199);
         }
     }
 }

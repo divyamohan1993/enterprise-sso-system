@@ -19,7 +19,7 @@ pub type DpopSigningKey = SigningKey<MlDsa87>;
 pub type DpopVerifyingKey = VerifyingKey<MlDsa87>;
 pub type DpopSignature = ml_dsa::Signature<MlDsa87>;
 
-/// A guarded wrapper around an ML-DSA-65 signing key that ensures the key
+/// A guarded wrapper around an ML-DSA-87 signing key that ensures the key
 /// material is zeroized when dropped and optionally memory-locked to prevent
 /// swap exposure.
 ///
@@ -115,10 +115,10 @@ pub fn dpop_key_hash(client_public_key: &[u8]) -> [u8; 64] {
     hash
 }
 
-/// Generate a DPoP proof using ML-DSA-65 (CNSA 2.0 compliant).
+/// Generate a DPoP proof using ML-DSA-87 (CNSA 2.0 compliant, Level 5).
 ///
-/// Signs SHA-256(claims_bytes || timestamp_bytes) with the provided ML-DSA-65
-/// signing key. Returns the encoded ML-DSA-65 signature bytes.
+/// Signs SHA-256(claims_bytes || timestamp_bytes) with the provided ML-DSA-87
+/// signing key. Returns the encoded ML-DSA-87 signature bytes.
 pub fn generate_dpop_proof(
     signing_key: &DpopSigningKey,
     claims_bytes: &[u8],
@@ -165,7 +165,7 @@ pub fn verify_dpop_proof(
         return false;
     }
 
-    // 2. Parse the ML-DSA-65 signature
+    // 2. Parse the ML-DSA-87 signature
     let sig = match DpopSignature::try_from(proof) {
         Ok(s) => s,
         Err(_) => return false,

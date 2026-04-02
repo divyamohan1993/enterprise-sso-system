@@ -389,6 +389,7 @@ impl SecurityConfig {
 
 impl Default for SecurityConfig {
     fn default() -> Self {
+        let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1");
         Self {
             error_level: ErrorLevel::Warn,
             max_session_lifetime_secs: 28800,
@@ -449,7 +450,8 @@ impl Default for SecurityConfig {
             indian_dsc_enabled: false,
             indian_esign_enabled: false,
 
-            // FIPS / Post-Quantum defaults — maximum security
+            // FIPS / Post-Quantum defaults -- maximum security
+            // When MILNET_MILITARY_DEPLOYMENT is set, force FIPS and HSM requirement
             fips_mode: true,
             pq_minimum_level: 5,
             require_pq_signatures: true,
@@ -605,9 +607,21 @@ impl SecurityConfig {
                 self.max_session_lifetime_secs
             ));
         }
-        // fips_mode=false is allowed — disabling FIPS enables stronger
-        // research-grade algorithms (AEGIS-256, Argon2id, BLAKE3).
-        // Only enforce FIPS when military deployment mode is active.
+        // fips_mode=false is allowed in non-military deployments (enables
+        // stronger algorithms). When MILNET_MILITARY_DEPLOYMENT is set,
+        // FIPS mode and HSM backend are mandatory.
+        if std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1") {
+            if !self.fips_mode {
+                violations.push(
+                    "fips_mode must be true when MILNET_MILITARY_DEPLOYMENT=1".into()
+                );
+            }
+            if !self.require_hsm_backend {
+                violations.push(
+                    "require_hsm_backend must be true when MILNET_MILITARY_DEPLOYMENT=1".into()
+                );
+            }
+        }
         if self.pq_minimum_level < 5 {
             violations.push(
                 "pq_minimum_level must be >= 5 (CNSA 2.0 Level 5)".into()

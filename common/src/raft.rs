@@ -206,14 +206,104 @@ impl Default for RaftConfig {
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 /// Generate a random election timeout duration using `getrandom`.
+/// Uses rejection sampling to avoid modulo bias.
 fn random_election_timeout(min_ms: u64, max_ms: u64) -> Duration {
-    let mut buf = [0u8; 8];
-    getrandom::getrandom(&mut buf).unwrap_or_else(|_| {
-        buf = [42; 8];
-    });
     let range = max_ms - min_ms;
-    let random = u64::from_le_bytes(buf) % range;
-    Duration::from_millis(min_ms + random)
+    debug_assert!(range > 0, "election timeout range must be positive");
+    // Rejection sampling: find the largest multiple of `range` that fits in u64,
+    // reject samples above it, then take modulo. This eliminates modulo bias.
+    let bucket_size = u64::MAX / range;
+    let limit = bucket_size * range;
+    loop {
+        let mut buf = [0u8; 8];
+        getrandom::getrandom(&mut buf).unwrap_or_else(|_| {
+            buf = [42; 8];
+        });
+        let sample = u64::from_le_bytes(buf);
+        if sample < limit {
+            let random = sample % range;
+            return Duration::from_millis(min_ms + random);
+        }
+    }
+}
+
+// ── Raft state machine ────────────────────────────────────────────────────────
+
+// ── Persistence trait ─────────────────────────────────────────────────────────
+
+/// Trait for persisting safety-critical Raft state (current_term, voted_for).
+/// A Raft node MUST persist these before responding to any vote request or
+/// appending entries to guarantee that a node cannot vote twice per term
+/// after restart.
+pub trait RaftPersistence: Send + Sync {
+    /// Persist current_term and voted_for atomically. Must fsync.
+    fn persist_state(&self, term: Term, voted_for: Option<NodeId>) -> Result<(), String>;
+    /// Recover persisted state from disk. Returns (term, voted_for).
+    fn recover_state(&self) -> Result<(Term, Option<NodeId>), String>;
+}
+
+/// File-backed persistence for Raft safety-critical state.
+/// Writes to `{dir}/raft_state` with fsync.
+pub struct FileRaftPersistence {
+    path: std::path::PathBuf,
+}
+
+impl FileRaftPersistence {
+    pub fn new(dir: &std::path::Path) -> Self {
+        Self {
+            path: dir.join("raft_state"),
+        }
+    }
+}
+
+/// On-disk format for persisted Raft state.
+#[derive(Serialize, Deserialize)]
+struct PersistedRaftState {
+    term: u64,
+    voted_for: Option<[u8; 16]>, // UUID bytes
+}
+
+impl RaftPersistence for FileRaftPersistence {
+    fn persist_state(&self, term: Term, voted_for: Option<NodeId>) -> Result<(), String> {
+        use std::io::Write;
+        let state = PersistedRaftState {
+            term: term.0,
+            voted_for: voted_for.map(|n| *n.0.as_bytes()),
+        };
+        let data = postcard::to_allocvec(&state).map_err(|e| format!("serialize: {e}"))?;
+        let tmp = self.path.with_extension("tmp");
+        let mut f = std::fs::File::create(&tmp).map_err(|e| format!("create: {e}"))?;
+        f.write_all(&data).map_err(|e| format!("write: {e}"))?;
+        f.sync_all().map_err(|e| format!("fsync: {e}"))?;
+        drop(f);
+        std::fs::rename(&tmp, &self.path).map_err(|e| format!("rename: {e}"))?;
+        Ok(())
+    }
+
+    fn recover_state(&self) -> Result<(Term, Option<NodeId>), String> {
+        match std::fs::read(&self.path) {
+            Ok(data) => {
+                let state: PersistedRaftState =
+                    postcard::from_bytes(&data).map_err(|e| format!("deserialize: {e}"))?;
+                let voted_for = state.voted_for.map(|b| NodeId(Uuid::from_bytes(b)));
+                Ok((Term(state.term), voted_for))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((Term::zero(), None)),
+            Err(e) => Err(format!("read: {e}")),
+        }
+    }
+}
+
+/// No-op persistence for testing and single-process deployments.
+pub struct NullRaftPersistence;
+
+impl RaftPersistence for NullRaftPersistence {
+    fn persist_state(&self, _term: Term, _voted_for: Option<NodeId>) -> Result<(), String> {
+        Ok(())
+    }
+    fn recover_state(&self) -> Result<(Term, Option<NodeId>), String> {
+        Ok((Term::zero(), None))
+    }
 }
 
 // ── Raft state machine ────────────────────────────────────────────────────────
@@ -248,6 +338,11 @@ pub struct RaftState {
     /// For each peer, index of the next log entry to send (Leader state only).
     next_index: HashMap<NodeId, LogIndex>,
     /// For each peer, highest log index known to be replicated (Leader only).
+    /// Persistence backend for safety-critical state.
+    persistence: Box<dyn RaftPersistence>,
+    /// Guard against concurrent membership changes (joint consensus not yet
+    /// implemented). Only one config change may be in-flight at a time.
+    pending_config_change: bool,
     match_index: HashMap<NodeId, LogIndex>,
     /// Deadline for the next election timeout.
     election_deadline: Instant,
@@ -256,21 +351,44 @@ pub struct RaftState {
 }
 
 impl RaftState {
-    /// Create a new Raft node in the Follower state.
+    /// Create a new Raft node in the Follower state with no persistence.
     pub fn new(node_id: NodeId, config: RaftConfig) -> Self {
+        Self::with_persistence(node_id, config, Box::new(NullRaftPersistence))
+    }
+
+    /// Create a new Raft node with a persistence backend.
+    /// Recovers term and voted_for from disk if available.
+    pub fn with_persistence(
+        node_id: NodeId,
+        config: RaftConfig,
+        persistence: Box<dyn RaftPersistence>,
+    ) -> Self {
         let timeout = random_election_timeout(
             config.election_timeout_min_ms,
             config.election_timeout_max_ms,
         );
+
+        let (recovered_term, recovered_voted_for) = persistence
+            .recover_state()
+            .unwrap_or_else(|e| {
+                tracing::error!(
+                    node = %node_id,
+                    error = %e,
+                    "failed to recover raft state from disk, starting fresh"
+                );
+                (Term::zero(), None)
+            });
+
         tracing::info!(
             node = %node_id,
             peers = config.peers.len(),
+            recovered_term = recovered_term.0,
             "initialising raft node"
         );
         Self {
             node_id,
-            current_term: Term::zero(),
-            voted_for: None,
+            current_term: recovered_term,
+            voted_for: recovered_voted_for,
             log: Vec::new(),
             commit_index: LogIndex::zero(),
             last_applied: LogIndex::zero(),
@@ -282,6 +400,8 @@ impl RaftState {
             match_index: HashMap::new(),
             election_deadline: Instant::now() + timeout,
             config,
+            persistence,
+            pending_config_change: false,
         }
     }
 
@@ -360,9 +480,25 @@ impl RaftState {
     }
 
     /// Propose a new cluster command. Only succeeds if this node is the leader.
+    ///
+    /// LIMITATION: Membership changes (MemberJoin, MemberLeave) do not use
+    /// joint consensus (Raft Section 6). Only one membership change may be
+    /// in-flight at a time. Concurrent config changes are rejected until
+    /// the current one is committed.
     pub fn propose(&mut self, command: ClusterCommand) -> Result<LogIndex, String> {
         if self.role != RaftRole::Leader {
             return Err("not the leader".into());
+        }
+        // Guard against concurrent membership changes.
+        let is_config_change = matches!(
+            command,
+            ClusterCommand::MemberJoin { .. } | ClusterCommand::MemberLeave { .. }
+        );
+        if is_config_change {
+            if self.pending_config_change {
+                return Err("concurrent config change in progress; wait for commit".into());
+            }
+            self.pending_config_change = true;
         }
         let index = LogIndex(self.last_log_index().0 + 1);
         let entry = LogEntry {
@@ -504,6 +640,10 @@ impl RaftState {
         self.current_term = Term(self.current_term.0 + 1);
         self.role = RaftRole::Candidate;
         self.voted_for = Some(self.node_id);
+        // Persist before soliciting votes -- Raft safety.
+        if let Err(e) = self.persistence.persist_state(self.current_term, self.voted_for) {
+            tracing::error!(node = %self.node_id, error = %e, "failed to persist election state");
+        }
         self.leader_id = None;
         self.votes_received.clear();
         self.votes_received.insert(self.node_id);
@@ -579,10 +719,15 @@ impl RaftState {
         self.current_term = term;
         self.role = RaftRole::Follower;
         self.voted_for = None;
+        // Persist term change -- Raft safety.
+        if let Err(e) = self.persistence.persist_state(self.current_term, self.voted_for) {
+            tracing::error!(node = %self.node_id, error = %e, "failed to persist follower state");
+        }
         self.leader_id = leader;
         self.votes_received.clear();
         self.next_index.clear();
         self.match_index.clear();
+        self.pending_config_change = false;
         self.reset_election_timer();
     }
 
@@ -602,6 +747,10 @@ impl RaftState {
 
         if grant {
             self.voted_for = Some(candidate_id);
+            // Persist before responding -- Raft safety requires this.
+            if let Err(e) = self.persistence.persist_state(self.current_term, self.voted_for) {
+                tracing::error!(node = %self.node_id, error = %e, "failed to persist vote state");
+            }
             self.reset_election_timer();
             tracing::debug!(
                 node = %self.node_id,
@@ -674,6 +823,10 @@ impl RaftState {
         self.leader_id = Some(leader_id);
         if self.role != RaftRole::Follower {
             self.become_follower(term, Some(leader_id));
+        }
+        // Persist term before processing entries -- Raft safety.
+        if let Err(e) = self.persistence.persist_state(self.current_term, self.voted_for) {
+            tracing::error!(node = %self.node_id, error = %e, "failed to persist state on append_entries");
         }
         self.reset_election_timer();
 

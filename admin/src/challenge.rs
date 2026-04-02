@@ -88,8 +88,8 @@ footer .tagline{color:#00ff41;font-size:0.9rem;margin-bottom:0.5rem}
 </tr>
 <tr>
   <td>Admin API</td>
-  <td class="endpoint"><a href="http://34.180.37.102:8080">http://34.180.37.102:8080</a></td>
-  <td class="proto">HTTP/1.1 REST</td>
+  <td class="endpoint">https://&lt;ADMIN_API_HOST&gt;:8443</td>
+  <td class="proto">HTTPS/1.1 REST (mTLS)</td>
 </tr>
 <tr>
   <td>Gateway</td>

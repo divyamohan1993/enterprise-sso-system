@@ -21,9 +21,64 @@
 
 use serde::Serialize;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+// ── Distributed Lockdown Flag ─────────────────────────────────────────────
+//
+// Global lockdown state that any module can check. When active, all new
+// sessions MUST be blocked or require admin approval. The flag can only be
+// cleared with a valid HMAC proof to prevent unauthorized lockdown exit.
+
+static LOCKDOWN_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Returns `true` if the system is in global lockdown mode.
+///
+/// Any module that gates session creation or access decisions SHOULD check
+/// this flag and deny/queue requests when active.
+pub fn is_lockdown_active() -> bool {
+    LOCKDOWN_ACTIVE.load(Ordering::SeqCst)
+}
+
+/// Activate global lockdown. Emits a CRITICAL SIEM event and sets the
+/// distributed lockdown flag. All modules checking `is_lockdown_active()`
+/// will see the flag immediately.
+pub fn trigger_lockdown() {
+    LOCKDOWN_ACTIVE.store(true, Ordering::SeqCst);
+    crate::siem::SecurityEvent::tamper_detected(
+        "LOCKDOWN ACTIVATED: global lockdown flag set. All new sessions require admin approval.",
+    );
+    tracing::error!("LOCKDOWN ACTIVATED: distributed lockdown flag set");
+}
+
+/// Clear global lockdown. Requires an HMAC-SHA512 proof over the string
+/// "MILNET-LOCKDOWN-CLEAR" keyed with the master KEK. This prevents
+/// unauthorized lockdown exit by compromised components.
+///
+/// Returns `Ok(())` if the proof is valid and lockdown is cleared, or
+/// `Err` with a reason string if verification fails.
+pub fn clear_lockdown(authorization_proof: &[u8]) -> Result<(), String> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha512;
+
+    let kek = crate::sealed_keys::get_master_kek();
+    let mut mac = <Hmac<Sha512>>::new_from_slice(kek)
+        .map_err(|e| format!("HMAC init failed: {e}"))?;
+    mac.update(b"MILNET-LOCKDOWN-CLEAR");
+
+    mac.verify_slice(authorization_proof).map_err(|_| {
+        crate::siem::SecurityEvent::tamper_detected(
+            "LOCKDOWN CLEAR REJECTED: invalid HMAC authorization proof",
+        );
+        "invalid authorization proof for lockdown clear".to_string()
+    })?;
+
+    LOCKDOWN_ACTIVE.store(false, Ordering::SeqCst);
+    tracing::warn!("LOCKDOWN CLEARED: valid HMAC authorization proof verified");
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -323,7 +378,7 @@ pub struct IncidentResponseEngine {
     /// Timestamps of recent critical incidents (for lockdown threshold).
     critical_timestamps: Mutex<VecDeque<Instant>>,
     /// Whether the system is in lockdown mode.
-    lockdown: std::sync::atomic::AtomicBool,
+    lockdown: AtomicBool,
     /// Callback for executing response actions. Set at initialization.
     action_executor: Mutex<Option<Box<dyn Fn(&ResponseAction) + Send + Sync>>>,
     /// Append-only forensic evidence log. Evidence entries are hash-chained.
@@ -336,7 +391,7 @@ impl IncidentResponseEngine {
         Self {
             incidents: Mutex::new(Vec::new()),
             critical_timestamps: Mutex::new(VecDeque::new()),
-            lockdown: std::sync::atomic::AtomicBool::new(false),
+            lockdown: AtomicBool::new(false),
             action_executor: Mutex::new(None),
             evidence_log: Mutex::new(Vec::new()),
         }
@@ -446,12 +501,12 @@ impl IncidentResponseEngine {
 
     /// Whether the system is currently in lockdown mode.
     pub fn is_lockdown(&self) -> bool {
-        self.lockdown.load(std::sync::atomic::Ordering::Relaxed)
+        self.lockdown.load(Ordering::Relaxed)
     }
 
     /// Manually exit lockdown mode (admin action).
     pub fn exit_lockdown(&self) {
-        self.lockdown.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.lockdown.store(false, Ordering::Relaxed);
         tracing::warn!("LOCKDOWN MODE DEACTIVATED by admin action");
     }
 
@@ -731,7 +786,11 @@ impl IncidentResponseEngine {
         // Check threshold
         if timestamps.len() >= LOCKDOWN_THRESHOLD && !self.is_lockdown() {
             self.lockdown
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+                .store(true, Ordering::Relaxed);
+
+            // Set the global distributed lockdown flag so all modules see it.
+            trigger_lockdown();
+
             tracing::error!(
                 critical_count = timestamps.len(),
                 window_secs = LOCKDOWN_WINDOW.as_secs(),
@@ -741,11 +800,11 @@ impl IncidentResponseEngine {
                 LOCKDOWN_WINDOW.as_secs(),
             );
 
-            // Execute lockdown action
-            let executor = self.action_executor.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(ref exec) = *executor {
-                exec(&ResponseAction::EnterLockdown);
-                exec(&ResponseAction::PageOnCall {
+            // Run lockdown action callbacks
+            let action_fn = self.action_executor.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(ref run_action) = *action_fn {
+                run_action(&ResponseAction::EnterLockdown);
+                run_action(&ResponseAction::PageOnCall {
                     message: format!(
                         "LOCKDOWN ACTIVATED: {} critical incidents in 1 hour. \
                          Admin approval required for all new sessions.",

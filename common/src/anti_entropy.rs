@@ -268,18 +268,61 @@ impl MerkleSync {
 
     /// Reconcile differences by calling `fetch_fn` for each missing/divergent
     /// key to get the value hash, then inserting into the local tree.
-    pub fn reconcile<F>(&mut self, diff: &SyncDiff, mut fetch_fn: F)
-    where
-        F: FnMut(&[u8]) -> Option<Hash512>,
+    /// Each fetched value must pass `verify_fn` (ML-DSA-87 signature check)
+    /// before insertion. Unverified entries are skipped with a SIEM event.
+    ///
+    /// `verify_fn` takes (key, value_hash, signature) and returns true if valid.
+    pub fn reconcile<F, V>(
+        &mut self,
+        diff: &SyncDiff,
+        mut fetch_fn: F,
+        mut verify_fn: V,
+    ) where
+        F: FnMut(&[u8]) -> Option<(Hash512, Vec<u8>)>,
+        V: FnMut(&[u8], &Hash512, &[u8]) -> bool,
     {
         for key in &diff.missing_local {
-            if let Some(value_hash) = fetch_fn(key) {
-                self.tree.insert(key.clone(), value_hash);
+            if let Some((value_hash, signature)) = fetch_fn(key) {
+                if verify_fn(key, &value_hash, &signature) {
+                    self.tree.insert(key.clone(), value_hash);
+                } else {
+                    crate::siem::SecurityEvent {
+                        timestamp: crate::siem::SecurityEvent::now_iso8601(),
+                        category: "anti_entropy",
+                        action: "reconcile_signature_rejected",
+                        severity: crate::siem::Severity::High,
+                        outcome: "failure",
+                        user_id: None,
+                        source_ip: None,
+                        detail: Some(format!(
+                            "node={} rejected unverified key during reconciliation (missing_local)",
+                            self.node_id
+                        )),
+                    }
+                    .emit();
+                }
             }
         }
         for key in &diff.divergent {
-            if let Some(value_hash) = fetch_fn(key) {
-                self.tree.insert(key.clone(), value_hash);
+            if let Some((value_hash, signature)) = fetch_fn(key) {
+                if verify_fn(key, &value_hash, &signature) {
+                    self.tree.insert(key.clone(), value_hash);
+                } else {
+                    crate::siem::SecurityEvent {
+                        timestamp: crate::siem::SecurityEvent::now_iso8601(),
+                        category: "anti_entropy",
+                        action: "reconcile_signature_rejected",
+                        severity: crate::siem::Severity::High,
+                        outcome: "failure",
+                        user_id: None,
+                        source_ip: None,
+                        detail: Some(format!(
+                            "node={} rejected unverified key during reconciliation (divergent)",
+                            self.node_id
+                        )),
+                    }
+                    .emit();
+                }
             }
         }
     }
@@ -494,9 +537,13 @@ mod tests {
         let diff = MerkleSync::find_differences(&local.tree, &remote.tree);
         assert_eq!(diff.missing_local.len(), 1);
 
-        // Reconcile: fetch from remote
+        // Reconcile: fetch from remote with a permissive verify_fn (test mode)
         let remote_tree = &remote.tree;
-        local.reconcile(&diff, |key| remote_tree.get(key).copied());
+        local.reconcile(
+            &diff,
+            |key| remote_tree.get(key).map(|h| (*h, vec![0x01; 64])),
+            |_key, _hash, _sig| true,
+        );
 
         // After reconciliation, trees should match
         assert!(MerkleSync::compare_roots(
@@ -517,7 +564,11 @@ mod tests {
         assert_eq!(diff.divergent.len(), 1);
 
         let remote_tree = &remote.tree;
-        local.reconcile(&diff, |key| remote_tree.get(key).copied());
+        local.reconcile(
+            &diff,
+            |key| remote_tree.get(key).map(|h| (*h, vec![0x01; 64])),
+            |_key, _hash, _sig| true,
+        );
 
         assert!(MerkleSync::compare_roots(
             &local.tree.root_hash(),

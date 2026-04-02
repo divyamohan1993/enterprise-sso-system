@@ -158,9 +158,22 @@ impl Default for ServiceConfig {
             circuit_breaker_threshold: 5,
             circuit_breaker_reset: Duration::from_secs(30),
             max_pool_size: 10,
-            quorum_size: 1,
+            quorum_size: 3,
         }
     }
+}
+
+/// Validate that a ServiceConfig is safe for production use.
+/// Rejects quorum_size < 2 to prevent single-point-of-failure.
+pub fn validate_service_config(config: &ServiceConfig) -> Result<(), DiscoveryError> {
+    if config.quorum_size < 2 {
+        return Err(DiscoveryError::QuorumLost {
+            service: config.name.clone(),
+            healthy: 0,
+            required: 2,
+        });
+    }
+    Ok(())
 }
 
 // ── Endpoint state ──────────────────────────────────────────────────────────
@@ -1147,7 +1160,7 @@ mod tests {
     #[test]
     fn default_configs_are_sane() {
         let cfg = ServiceConfig::default();
-        assert_eq!(cfg.quorum_size, 1);
+        assert_eq!(cfg.quorum_size, 3);
         assert_eq!(cfg.unhealthy_threshold, 3);
         assert_eq!(cfg.max_pool_size, 10);
         assert_eq!(cfg.strategy, LoadBalanceStrategy::RoundRobin);

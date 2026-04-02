@@ -202,7 +202,7 @@ fn bench_receipt_chain(c: &mut Criterion) {
                 chain.add_receipt(receipt).expect("add receipt");
             }
 
-            chain.validate().expect("validate chain");
+            chain.validate_with_key(&signing_key).expect("validate chain");
         });
     });
 }

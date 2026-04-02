@@ -520,6 +520,14 @@ pub fn startup_entropy_health_check() {
 /// - Markov model test (Section 6.3.3)
 /// - Longest repeated substring test (Section 6.3.5)
 pub fn nist_800_90b_startup_test() -> Result<(), EntropyError> {
+    tracing::warn!(
+        "SIEM:COMPLIANCE nist_800_90b_startup_test is a PARTIAL implementation. \
+         Only chi-squared uniformity and basic sampling are performed. \
+         Full NIST SP 800-90B Section 4.3 tests (compression ratio, Markov model, \
+         longest repeated substring) are NOT YET IMPLEMENTED. \
+         This does NOT constitute full SP 800-90B compliance."
+    );
+
     // Phase 1: chi-squared uniformity (implemented above)
     // startup_entropy_health_check() panics on failure, so if we get here, it passed.
     // We call combined_entropy_checked a few times as a sanity check.

@@ -243,14 +243,14 @@ fn removing_rule_revokes_access() {
     guard.add_flow_rule(make_rule(a_id, b_id, FlowDirection::Unidirectional, false, "test"));
 
     assert!(guard.validate_transfer(&a_id, &b_id).allowed);
-    assert!(guard.remove_flow_rule(&a_id, &b_id));
+    assert!(guard.remove_flow_rule(&a_id, &b_id, Uuid::nil()));
     assert!(!guard.validate_transfer(&a_id, &b_id).allowed, "must be denied after rule removal");
 }
 
 #[test]
 fn removing_nonexistent_rule_returns_false() {
     let mut guard = CrossDomainGuard::new();
-    assert!(!guard.remove_flow_rule(&Uuid::new_v4(), &Uuid::new_v4()));
+    assert!(!guard.remove_flow_rule(&Uuid::new_v4(), &Uuid::new_v4(), Uuid::nil()));
 }
 
 // ── Decision Audit Logging ──────────────────────────────────────────────────

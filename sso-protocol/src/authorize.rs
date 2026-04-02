@@ -123,16 +123,47 @@ pub fn validate_redirect_uri(
 // ── OAuth State Parameter CSRF Protection ──────────────────────────────────
 
 /// HMAC key for binding OAuth state parameters to sessions.
-/// In production this MUST be loaded from a KMS / HSM.
+/// Derived from the master KEK via HKDF-SHA512 for cross-instance consistency.
+/// Falls back to random key if KEK is not yet available (startup race).
 static STATE_HMAC_KEY: std::sync::OnceLock<[u8; 64]> = std::sync::OnceLock::new();
 
 fn state_hmac_key() -> &'static [u8; 64] {
     STATE_HMAC_KEY.get_or_init(|| {
+        // Try to derive from master KEK for cross-instance consistency.
+        let result = std::panic::catch_unwind(|| {
+            common::sealed_keys::cached_master_kek()
+        });
+        if let Ok(master_kek) = result {
+            let hk = hkdf::Hkdf::<Sha512>::new(None, master_kek);
+            let mut key = [0u8; 64];
+            if hk.expand(b"MILNET-OAUTH-STATE-HMAC-v1", &mut key).is_ok() {
+                return key;
+            }
+            common::siem::emit_runtime_error(
+                common::siem::category::CRYPTO_FAILURE,
+                "HKDF expand failed for OAuth state HMAC key derivation from KEK",
+                "HKDF expand error",
+                file!(),
+                line!(),
+                column!(),
+                module_path!(),
+            );
+        }
+        // Fallback: KEK not available (startup race). Use random key but warn.
+        common::siem::emit_runtime_error(
+            common::siem::category::CRYPTO_FAILURE,
+            "Master KEK not available for OAuth state HMAC key derivation, falling back to random key. Cross-instance state verification will fail.",
+            "KEK unavailable at init",
+            file!(),
+            line!(),
+            column!(),
+            module_path!(),
+        );
         let mut key = [0u8; 64];
         if getrandom::getrandom(&mut key).is_err() {
             common::siem::emit_runtime_error(
                 common::siem::category::CRYPTO_FAILURE,
-                "OS CSPRNG unavailable — cannot generate OAuth state HMAC key",
+                "OS CSPRNG unavailable -- cannot generate OAuth state HMAC key",
                 "getrandom failed",
                 file!(),
                 line!(),
@@ -296,7 +327,11 @@ impl AuthorizationStore {
     /// Create an authorization code with the default tier (2).
     ///
     /// Returns `Err` if `code_challenge` is `None` — PKCE is mandatory per OAuth 2.1.
-    pub fn create_code(
+    ///
+    /// SECURITY: This method skips redirect_uri validation. Internal use only.
+    /// External callers MUST use `create_code_validated()` which validates the
+    /// redirect_uri against registered URIs before issuing a code.
+    pub(crate) fn create_code(
         &mut self,
         client_id: &str,
         redirect_uri: &str,

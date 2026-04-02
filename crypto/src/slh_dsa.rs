@@ -24,16 +24,16 @@
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-/// Number of FORS trees.
-const FORS_K: usize = 14;
-/// Height of each FORS tree.
-const FORS_A: usize = 6;
-/// Total hypertree height (h = d * h').
-const HYPERTREE_H: usize = 8;
-/// Number of layers in the hypertree.
-const HYPERTREE_D: usize = 1;
-/// Height of each XMSS tree within a layer (h' = H/D).
-const XMSS_HEIGHT: usize = HYPERTREE_H / HYPERTREE_D; // 8
+/// Number of FORS trees (FIPS 205 SLH-DSA-SHA2-256f: k=33).
+const FORS_K: usize = 33;
+/// Height of each FORS tree (FIPS 205 SLH-DSA-SHA2-256f: a=8).
+const FORS_A: usize = 8;
+/// Total hypertree height (FIPS 205 SLH-DSA-SHA2-256f: h=66).
+const HYPERTREE_H: usize = 66;
+/// Number of layers in the hypertree (FIPS 205 SLH-DSA-SHA2-256f: d=22).
+const HYPERTREE_D: usize = 22;
+/// Height of each XMSS tree within a layer (h' = H/D = 66/22 = 3).
+const XMSS_HEIGHT: usize = HYPERTREE_H / HYPERTREE_D; // 3
 /// Security parameter n in bytes.
 const N: usize = 32;
 /// Winternitz parameter w = 16 (log2(w) = 4).
@@ -45,16 +45,16 @@ const WOTS_LEN1: usize = 64;
 const WOTS_LEN2: usize = 3;
 const WOTS_LEN: usize = WOTS_LEN1 + WOTS_LEN2;
 
-/// FORS signature size: K * (A * N + N) = 22 * (6*32 + 32) = 22 * 224 = 4928
+/// FORS signature size: K * (A * N + N) = 33 * (8*32 + 32) = 33 * 288 = 9504
 const FORS_SIG_SIZE: usize = FORS_K * ((FORS_A * N) + N);
 /// WOTS+ signature size: LEN * N = 67 * 32 = 2144
 const WOTS_SIG_SIZE: usize = WOTS_LEN * N;
-/// XMSS signature size: WOTS sig + h' * N = 2144 + 4*32 = 2272
+/// XMSS signature size: WOTS sig + h' * N = 2144 + 3*32 = 2240
 const XMSS_SIG_SIZE: usize = WOTS_SIG_SIZE + XMSS_HEIGHT * N;
-/// Hypertree signature size: D * XMSS_SIG_SIZE = 17 * 2272 = 38624
+/// Hypertree signature size: D * XMSS_SIG_SIZE = 22 * 2240 = 49280
 const HT_SIG_SIZE: usize = HYPERTREE_D * XMSS_SIG_SIZE;
 /// Total SLH-DSA signature size: randomizer(N) + FORS sig + HT sig
-/// = 32 + 4928 + 38624 = 43584
+/// FIPS 205 SLH-DSA-SHA2-256f: 49,856 bytes
 const SIG_SIZE: usize = N + FORS_SIG_SIZE + HT_SIG_SIZE;
 /// Public key size: 2 * N = 64
 const PK_SIZE: usize = 2 * N;

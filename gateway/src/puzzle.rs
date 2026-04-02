@@ -146,8 +146,35 @@ impl Default for ConsumedPuzzles {
 }
 
 /// Global consumed-puzzles tracker, protected by a mutex.
+///
+/// WARNING: This is a per-process store. In a multi-instance deployment,
+/// a puzzle nonce consumed by one instance is not visible to others. For
+/// military deployments, wire a `DistributedPuzzleStore` implementation
+/// (e.g. Redis-backed) to provide cross-instance replay prevention.
 static CONSUMED_PUZZLES: std::sync::LazyLock<Mutex<ConsumedPuzzles>> =
-    std::sync::LazyLock::new(|| Mutex::new(ConsumedPuzzles::new()));
+    std::sync::LazyLock::new(|| {
+        if std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok() {
+            tracing::warn!(
+                "SIEM:WARNING Puzzle replay prevention is per-process only. \
+                 In multi-instance military deployments, a distributed puzzle store \
+                 (e.g. Redis-backed DistributedPuzzleStore) is required to prevent \
+                 cross-instance replay attacks."
+            );
+        }
+        Mutex::new(ConsumedPuzzles::new())
+    });
+
+/// Trait for distributed puzzle nonce replay prevention.
+///
+/// The default in-memory `ConsumedPuzzles` is per-process. For multi-instance
+/// deployments, implement this trait with a shared backend (e.g. Redis)
+/// to ensure nonces cannot be replayed across gateway instances.
+pub trait DistributedPuzzleStore: Send + Sync {
+    /// Check if a nonce has been consumed and, if not, atomically mark it as consumed.
+    /// Returns `Ok(true)` if the nonce was fresh and is now consumed.
+    /// Returns `Ok(false)` if the nonce was already consumed (replay detected).
+    fn check_and_consume(&self, nonce: &[u8; 32], timestamp: i64) -> Result<bool, String>;
+}
 
 /// A proof-of-work challenge sent by the gateway to connecting clients.
 #[derive(Debug, Clone, Serialize, Deserialize)]

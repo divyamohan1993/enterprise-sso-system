@@ -60,6 +60,7 @@ impl Default for AttestationMeshConfig {
 struct PeerAttestationState {
     last_reported_hash: Option<BinaryHash>,
     consecutive_mismatches: u32,
+    consecutive_matches: u32,
     tampered: bool,
 }
 
@@ -68,6 +69,7 @@ impl PeerAttestationState {
         Self {
             last_reported_hash: None,
             consecutive_mismatches: 0,
+            consecutive_matches: 0,
             tampered: false,
         }
     }
@@ -139,9 +141,27 @@ impl AttestationMesh {
 
         if matches {
             state.consecutive_mismatches = 0;
-            // Once a peer matches again, clear tampered flag (healed).
+            // After N consecutive successful verifications, clear the tampered flag.
+            // This allows a healed node to be re-admitted to the cluster.
+            if state.tampered {
+                // We track consecutive matches implicitly: if consecutive_mismatches
+                // is 0 and we just matched, check if we've had enough consecutive
+                // matches. We use consecutive_mismatches == 0 combined with a match
+                // counter. For simplicity, 3 consecutive matches clears tampered.
+                state.consecutive_matches += 1;
+                if state.consecutive_matches >= 3 {
+                    state.tampered = false;
+                    state.consecutive_matches = 0;
+                    tracing::info!(
+                        node = %node_id,
+                        "attestation mesh: node re-verified after 3 consecutive matches, \
+                         clearing tampered flag"
+                    );
+                }
+            }
         } else {
             state.consecutive_mismatches += 1;
+            state.consecutive_matches = 0;
             if state.consecutive_mismatches >= self.config.tamper_threshold {
                 state.tampered = true;
             }
@@ -192,11 +212,18 @@ impl AttestationMesh {
 // ── Standalone helper ────────────────────────────────────────────────────────
 
 /// Compute the SHA-512 hash of the running binary (/proc/self/exe).
+///
+/// Opens /proc/self/exe directly as a file descriptor instead of resolving
+/// the symlink first. This prevents a TOCTOU race where the binary on disk
+/// could be replaced between readlink and read. The kernel ensures
+/// /proc/self/exe refers to the mapped executable image.
 pub fn compute_binary_hash() -> Result<BinaryHash, String> {
-    let exe_path = std::fs::read_link("/proc/self/exe")
-        .map_err(|e| format!("failed to resolve /proc/self/exe: {e}"))?;
-    let data = std::fs::read(&exe_path)
-        .map_err(|e| format!("failed to read binary at {}: {e}", exe_path.display()))?;
+    use std::io::Read;
+    let mut file = std::fs::File::open("/proc/self/exe")
+        .map_err(|e| format!("failed to open /proc/self/exe: {e}"))?;
+    let mut data = Vec::new();
+    file.read_to_end(&mut data)
+        .map_err(|e| format!("failed to read /proc/self/exe: {e}"))?;
     let mut hasher = Sha512::new();
     hasher.update(&data);
     let result = hasher.finalize();

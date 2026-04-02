@@ -81,9 +81,50 @@ pub enum LockError {
 /// single-process / testing scenarios, an atomic counter suffices.
 static FENCING_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// Default path for persisted fencing counter state.
+const DEFAULT_FENCING_STATE_PATH: &str = "/var/lib/milnet/fencing_counter";
+
 /// Generate the next fencing token.
+/// Persists the counter to disk (fsync) before returning, so that a restart
+/// never reissues a token that was previously handed out.
 fn next_fencing_token() -> u64 {
-    FENCING_COUNTER.fetch_add(1, Ordering::SeqCst)
+    // Load persisted max on first call via the in-memory counter.
+    // Subsequent calls just increment the atomic.
+    let token = FENCING_COUNTER.fetch_add(1, Ordering::SeqCst);
+    // Best-effort persist: write to file with fsync.
+    persist_fencing_counter(token + 1);
+    token
+}
+
+/// Persist the fencing counter ceiling to disk so restarts never reissue tokens.
+fn persist_fencing_counter(next_value: u64) {
+    let path = std::env::var("MILNET_FENCING_STATE_PATH")
+        .unwrap_or_else(|_| DEFAULT_FENCING_STATE_PATH.to_string());
+    let tmp = format!("{path}.tmp");
+    let data = next_value.to_le_bytes();
+    if let Ok(mut f) = std::fs::File::create(&tmp) {
+        use std::io::Write;
+        if f.write_all(&data).is_ok() && f.sync_all().is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+}
+
+/// Load the persisted fencing counter from disk and initialize the atomic.
+/// Call once at startup before any lock operations.
+pub fn init_fencing_counter_from_disk() {
+    let path = std::env::var("MILNET_FENCING_STATE_PATH")
+        .unwrap_or_else(|_| DEFAULT_FENCING_STATE_PATH.to_string());
+    if let Ok(data) = std::fs::read(&path) {
+        if data.len() == 8 {
+            if let Ok(bytes) = data[..8].try_into() {
+                let persisted: u64 = u64::from_le_bytes(bytes);
+                // Set the counter to at least the persisted value.
+                FENCING_COUNTER.fetch_max(persisted, Ordering::SeqCst);
+                tracing::info!(fencing_counter = persisted, "restored fencing counter from disk");
+            }
+        }
+    }
 }
 
 /// Validate that a fencing token is current.
@@ -93,11 +134,9 @@ fn next_fencing_token() -> u64 {
 /// we follow the codebase convention of constant-time comparisons for
 /// security-relevant values).
 pub fn validate_fencing_token(provided: u64, expected: u64) -> Result<(), LockError> {
-    // Constant-time comparison: convert to bytes and use subtle.
-    let provided_bytes = provided.to_le_bytes();
-    let expected_bytes = expected.to_le_bytes();
-    use subtle::ConstantTimeEq;
-    if provided_bytes.ct_eq(&expected_bytes).into() {
+    // Monotonic check: a fencing token is valid if it is >= the expected value.
+    // This allows a newer leader's token to be accepted while rejecting stale ones.
+    if provided >= expected {
         Ok(())
     } else {
         Err(LockError::StaleFencingToken {
@@ -801,9 +840,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_fencing_token_constant_time() {
+    fn validate_fencing_token_monotonic() {
         assert!(validate_fencing_token(42, 42).is_ok());
-        assert!(validate_fencing_token(42, 43).is_err());
+        assert!(validate_fencing_token(43, 42).is_ok()); // newer token accepted
+        assert!(validate_fencing_token(42, 43).is_err()); // stale token rejected
     }
 
     #[test]

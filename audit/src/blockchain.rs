@@ -12,7 +12,9 @@ use crypto::pq_sign::{pq_sign_raw, pq_verify_raw, PqSigningKey, PqVerifyingKey};
 use ml_dsa::{KeyGen, MlDsa87};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
+use zeroize::Zeroize;
 
 // ── Helper: get current unix timestamp in seconds ──────────────────────────
 
@@ -184,6 +186,8 @@ pub struct PqBlockchain {
     block_interval_secs: u64,
     /// Maximum entries per block.
     max_entries_per_block: usize,
+    /// Maps node_id to their ML-DSA-87 verifying key for attestation verification.
+    verifying_keys: HashMap<usize, PqVerifyingKey>,
 }
 
 impl PqBlockchain {
@@ -197,7 +201,13 @@ impl PqBlockchain {
             quorum_size: 5,
             block_interval_secs: 10,
             max_entries_per_block: 100,
+            verifying_keys: HashMap::new(),
         }
+    }
+
+    /// Register a node's ML-DSA-87 verifying key for attestation verification.
+    pub fn register_verifying_key(&mut self, node_id: usize, vk: PqVerifyingKey) {
+        self.verifying_keys.insert(node_id, vk);
     }
 
     /// Create the genesis block (block 0, no entries, self-signed).
@@ -361,8 +371,10 @@ impl PqBlockchain {
 
     /// Finalize a block after receiving a quorum of valid attestations.
     ///
-    /// Requires at least `quorum_size` attestations with matching block hashes.
-    /// The block (with its embedded proposer signature) is appended to the chain.
+    /// Requires at least `quorum_size` attestations with matching block hashes
+    /// AND valid ML-DSA-87 signatures. The block's own proposer signature is
+    /// verified first. Only attestations that pass cryptographic verification
+    /// count toward quorum.
     pub fn finalize_block(
         &mut self,
         mut block: PqBlock,
@@ -380,17 +392,37 @@ impl PqBlockchain {
             ));
         }
 
+        // Verify the block's proposer signature before accepting attestations.
+        if let Some(proposer_vk) = self.verifying_keys.get(&block.proposer_id) {
+            if !Self::verify_block_signature(&block, proposer_vk) {
+                return Err(format!(
+                    "block proposer signature verification failed for node {}",
+                    block.proposer_id
+                ));
+            }
+        }
+
         let block_hash = Self::hash_block(&block);
 
-        // Count attestations whose block_hash field matches.
+        // Count attestations that match block_hash AND have valid ML-DSA-87 signatures.
         let valid_count = attestations
             .iter()
-            .filter(|a| a.block_hash == block_hash)
+            .filter(|a| {
+                if a.block_hash != block_hash {
+                    return false;
+                }
+                // If we have a verifying key for this attester, verify the signature.
+                // If no key is registered, the attestation cannot be verified and is rejected.
+                match self.verifying_keys.get(&a.node_id) {
+                    Some(vk) => Self::verify_attestation(a, &block_hash, vk),
+                    None => false,
+                }
+            })
             .count();
 
         if valid_count < self.quorum_size {
             return Err(format!(
-                "insufficient quorum: {}/{} attestations (need {})",
+                "insufficient quorum: {}/{} verified attestations (need {})",
                 valid_count,
                 attestations.len(),
                 self.quorum_size
@@ -495,6 +527,12 @@ impl PqBlockchain {
     }
 }
 
+impl Drop for PqBlockchain {
+    fn drop(&mut self) {
+        self.signing_key_seed.zeroize();
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -537,6 +575,15 @@ mod tests {
     fn build_chain(n: usize) -> PqBlockchain {
         let seed = test_seed(1);
         let mut chain = PqBlockchain::new(seed, 0);
+        // Register proposer's verifying key (node 0 uses seed 1)
+        chain.register_verifying_key(0, verifying_key_from_seed(&seed));
+        // Register attester verifying keys
+        for node_id in 0..5usize {
+            chain.register_verifying_key(
+                node_id,
+                verifying_key_from_seed(&test_seed(node_id as u8 + 10)),
+            );
+        }
         chain.create_genesis().unwrap();
 
         for _ in 0..n {
@@ -728,6 +775,15 @@ mod tests {
         run_pq(|| {
             let seed = test_seed(6);
             let mut chain = PqBlockchain::new(seed, 0);
+            // Register proposer key
+            chain.register_verifying_key(0, verifying_key_from_seed(&seed));
+            // Register attester keys
+            for node_id in 0..5usize {
+                chain.register_verifying_key(
+                    node_id,
+                    verifying_key_from_seed(&test_seed(node_id as u8 + 20)),
+                );
+            }
             chain.create_genesis().unwrap();
             assert_eq!(chain.height(), 1);
 
@@ -750,12 +806,20 @@ mod tests {
         run_pq(|| {
             let seed = test_seed(7);
             let mut chain = PqBlockchain::new(seed, 0);
+            // Register proposer key
+            chain.register_verifying_key(0, verifying_key_from_seed(&seed));
+            // Register attester keys (only 3, below quorum of 5)
+            for node_id in 0..3usize {
+                chain.register_verifying_key(
+                    node_id,
+                    verifying_key_from_seed(&test_seed(node_id as u8 + 30)),
+                );
+            }
             chain.create_genesis().unwrap();
 
             chain.submit_entry(make_entry([0u8; 64]));
             let block = chain.propose_block().unwrap();
 
-            // Only 3 attestations — below the quorum of 5.
             let mut attestations = Vec::new();
             for node_id in 0..3usize {
                 let attester = PqBlockchain::new(test_seed(node_id as u8 + 30), node_id);
@@ -809,7 +873,15 @@ mod tests {
     #[test]
     fn test_chain_height() {
         run_pq(|| {
-            let mut chain = PqBlockchain::new(test_seed(8), 0);
+            let seed = test_seed(8);
+            let mut chain = PqBlockchain::new(seed, 0);
+            chain.register_verifying_key(0, verifying_key_from_seed(&seed));
+            for node_id in 0..5usize {
+                chain.register_verifying_key(
+                    node_id,
+                    verifying_key_from_seed(&test_seed(node_id as u8 + 40)),
+                );
+            }
             assert_eq!(chain.height(), 0);
             chain.create_genesis().unwrap();
             assert_eq!(chain.height(), 1);
@@ -835,6 +907,13 @@ mod tests {
         run_pq(|| {
             let seed = test_seed(9);
             let mut chain = PqBlockchain::new(seed, 0);
+            chain.register_verifying_key(0, verifying_key_from_seed(&seed));
+            for node_id in 0..5usize {
+                chain.register_verifying_key(
+                    node_id,
+                    verifying_key_from_seed(&test_seed(node_id as u8 + 50)),
+                );
+            }
             chain.create_genesis().unwrap();
 
             for _ in 0..5 {

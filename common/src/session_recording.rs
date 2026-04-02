@@ -147,6 +147,20 @@ fn compute_chain_link(previous_hash: &[u8], event_data: &[u8]) -> [u8; 64] {
     out
 }
 
+// ── Persistence Backend ────────────────────────────────────────────────────
+
+/// Trait for durable persistence of session recording events.
+///
+/// Implementations write each event to a persistent store (database, append-only
+/// log, object storage) so that recordings survive process restarts. The in-memory
+/// recording is still maintained for fast access; the backend provides durability.
+pub trait PersistenceBackend: Send + Sync {
+    /// Persist a single recording event. Called synchronously on each `record_event()`.
+    /// Implementations MUST be idempotent: re-appending the same event (same session_id
+    /// and timestamp) should not create duplicates.
+    fn append_event(&self, session_id: Uuid, event: &SessionEvent) -> Result<(), String>;
+}
+
 // ── SessionRecorder ─────────────────────────────────────────────────────────
 
 /// The main recording engine that manages session recordings with tamper-evident
@@ -154,6 +168,9 @@ fn compute_chain_link(previous_hash: &[u8], event_data: &[u8]) -> [u8; 64] {
 pub struct SessionRecorder {
     recordings: Mutex<HashMap<Uuid, SessionRecording>>,
     policy: PamPolicy,
+    /// Optional persistent backend. When set, every recorded event is written
+    /// to both the in-memory store and the persistent backend.
+    persistence: Option<Box<dyn PersistenceBackend>>,
 }
 
 impl SessionRecorder {
@@ -162,12 +179,22 @@ impl SessionRecorder {
         Self {
             recordings: Mutex::new(HashMap::new()),
             policy,
+            persistence: None,
         }
     }
 
     /// Create a new recorder with the default PAM policy.
     pub fn with_defaults() -> Self {
         Self::new(PamPolicy::default())
+    }
+
+    /// Create a new recorder with a persistence backend.
+    pub fn with_persistence(policy: PamPolicy, backend: Box<dyn PersistenceBackend>) -> Self {
+        Self {
+            recordings: Mutex::new(HashMap::new()),
+            policy,
+            persistence: Some(backend),
+        }
     }
 
     /// Return a reference to the active policy.
@@ -282,7 +309,21 @@ impl SessionRecorder {
 
         // Update the running integrity hash.
         recording.integrity_hash = link.to_vec();
-        recording.events.push(event);
+        recording.events.push(event.clone());
+
+        // Persist to durable backend if configured.
+        if let Some(ref backend) = self.persistence {
+            if let Err(e) = backend.append_event(session_id, &event) {
+                tracing::error!(
+                    session_id = %session_id,
+                    error = %e,
+                    "PAM: persistence backend write failed for session event"
+                );
+                crate::siem::SecurityEvent::database_operation_failed(
+                    &format!("session recording persistence failed: session={}, error={}", session_id, e),
+                );
+            }
+        }
 
         Ok(())
     }

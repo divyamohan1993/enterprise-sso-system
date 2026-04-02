@@ -315,7 +315,7 @@ pub fn verify_files(manifest: &AttestationManifest) -> Result<(), AttestError> {
             *blake3::hash(&data).as_bytes()
         };
 
-        if current_hash != entry.blake3_hash {
+        if !crate::ct::ct_eq(&current_hash, &entry.blake3_hash) {
             return Err(AttestError::HashMismatch {
                 path: entry.path.clone(),
                 expected: hex_encode(&entry.blake3_hash),

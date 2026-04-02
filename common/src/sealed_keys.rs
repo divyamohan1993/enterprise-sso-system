@@ -134,6 +134,9 @@ pub fn cached_master_kek_distributed() -> &'static [u8; 32] {
         std::env::remove_var("MILNET_KEK_SHARE");
 
         // Collect peer shares from env
+        // NOTE: Feldman VSS commitments MUST be verified before accepting peer shares.
+        // Each share should be validated against public polynomial commitments to detect
+        // malicious or corrupted shares before they enter the reconstruction process.
         if let Some(csv) = peer_shares_csv {
             for hex_share in csv.split(',') {
                 let hex_share = hex_share.trim();
@@ -142,6 +145,12 @@ pub fn cached_master_kek_distributed() -> &'static [u8; 32] {
                 }
                 match KekShare::from_hex(hex_share) {
                     Ok(share) => {
+                        if !verify_share_commitment(&share) {
+                            tracing::warn!(
+                                "SECURITY: peer share accepted without Feldman VSS commitment verification. \
+                                 Deploy VSS public commitments to enable cryptographic share authentication."
+                            );
+                        }
                         if let Err(e) = mgr.add_peer_share(share) {
                             eprintln!("WARNING: Failed to add peer share: {e}");
                         }
@@ -185,6 +194,22 @@ pub fn cached_master_kek_distributed() -> &'static [u8; 32] {
     }).as_bytes()
 }
 
+/// Verify a Shamir share against Feldman VSS public commitments.
+///
+/// Returns `true` if the share passes verification, `false` if VSS commitments
+/// are not yet deployed (stub). When commitments are available, this function
+/// MUST verify: g^{share} == product(C_j^{index^j}) for all commitment points C_j.
+///
+/// SECURITY: Until VSS commitments are deployed, this returns `false` and callers
+/// MUST log a warning. A malicious share holder could provide an invalid share
+/// that corrupts the reconstructed KEK.
+fn verify_share_commitment(_share: &crate::threshold_kek::KekShare) -> bool {
+    // TODO: Implement Feldman VSS verification once public commitments are distributed.
+    // Verification formula: g^{s_i} == product_{j=0}^{t-1} C_j^{i^j} mod p
+    // where s_i is the share value, i is the share index, C_j are the commitments.
+    false
+}
+
 /// Unified entry point for obtaining the master KEK.
 ///
 /// If distributed (threshold) mode is active (via `MILNET_KEK_SHARE` env var
@@ -197,6 +222,19 @@ pub fn get_master_kek() -> &'static [u8; 32] {
     if use_distributed_kek() {
         cached_master_kek_distributed()
     } else {
+        // In military deployments, the single-key path is a security violation.
+        // Threshold Shamir reconstruction is mandatory.
+        if std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok() {
+            crate::siem::SecurityEvent::crypto_failure(
+                "CRITICAL: single-key KEK fallback attempted in military deployment. \
+                 MILNET_KEK_SHARE not set but MILNET_MILITARY_DEPLOYMENT is active. \
+                 Threshold Shamir reconstruction is mandatory.",
+            );
+            panic!(
+                "FATAL: single-key KEK path rejected in military deployment. \
+                 Set MILNET_KEK_SHARE for threshold reconstruction."
+            );
+        }
         cached_master_kek()
     }
 }

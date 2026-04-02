@@ -287,18 +287,38 @@ struct DedupEntry {
 static PANEL_DEDUP: LazyLock<Mutex<HashMap<DedupKey, DedupEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Hash a message string for dedup keying (fast, non-cryptographic FNV-1a).
+/// Random per-process HMAC key for dedup hashing (prevents collision crafting).
+static DEDUP_HMAC_KEY: LazyLock<[u8; 32]> = LazyLock::new(|| {
+    let mut key = [0u8; 32];
+    getrandom::getrandom(&mut key).unwrap_or_else(|e| {
+        tracing::error!("FATAL: CSPRNG failure for dedup HMAC key: {e}");
+        std::process::exit(1);
+    });
+    key
+});
+
+/// Hash a message string for dedup keying using keyed HMAC-SHA256 truncated to 64 bits.
+/// Prevents an attacker from crafting hash collisions to suppress tamper alerts.
 fn hash_message(msg: &str) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in msg.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+
+    let mut mac = HmacSha256::new_from_slice(&*DEDUP_HMAC_KEY)
+        .unwrap_or_else(|_| unreachable!("HMAC-SHA256 accepts any key length"));
+    mac.update(msg.as_bytes());
+    let result = mac.finalize().into_bytes();
+    u64::from_le_bytes(result[..8].try_into().unwrap_or([0u8; 8]))
 }
 
 /// Check whether this event should be emitted (true) or suppressed (false).
+/// CRITICAL severity events always bypass the rate limiter.
 fn panel_rate_limiter_allow(event: &PanelSiemEvent) -> bool {
+    // CRITICAL events must NEVER be suppressed
+    if matches!(event.severity, SiemSeverity::Critical | SiemSeverity::Fatal) {
+        return true;
+    }
+
     let key: DedupKey = (event.panel, hash_message(&event.message));
     let now = event.timestamp;
 

@@ -1295,7 +1295,7 @@ fn cross_domain_rule_removal_revokes_access() {
     });
 
     assert!(guard.validate_transfer(&src_id, &tgt_id).allowed);
-    assert!(guard.remove_flow_rule(&src_id, &tgt_id));
+    assert!(guard.remove_flow_rule(&src_id, &tgt_id, Uuid::nil()));
     assert!(
         !guard.validate_transfer(&src_id, &tgt_id).allowed,
         "removed rule must revoke access"

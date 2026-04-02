@@ -308,7 +308,7 @@ impl ShardTransport {
     pub async fn recv(&mut self) -> Result<(ModuleId, super::protocol::SecurePayload), MilnetError> {
         tokio::time::timeout(SHARD_RECV_TIMEOUT, self.recv_inner())
             .await
-            .map_err(|_| MilnetError::Shard("SHARD recv timed out after 30s".into()))?
+            .map_err(|_| MilnetError::Shard("SHARD recv timed out after 120s".into()))?
     }
 
     async fn recv_inner(&mut self) -> Result<(ModuleId, super::protocol::SecurePayload), MilnetError> {
@@ -328,7 +328,10 @@ impl ShardTransport {
     }
 
     /// Read raw framed bytes from the stream without verification.
-    /// Useful for testing replay scenarios.
+    /// Restricted to crate-internal use to prevent bypassing SHARD authentication.
+    /// Available externally only with `test-internals` feature for integration tests.
+    #[cfg_attr(not(feature = "test-internals"), doc(hidden))]
+    #[cfg(any(feature = "test-internals", not(feature = "production")))]
     pub async fn recv_raw(&mut self) -> Result<Vec<u8>, MilnetError> {
         let mut len_buf = [0u8; 4];
         self.read_exact(&mut len_buf).await?;
@@ -346,7 +349,10 @@ impl ShardTransport {
     }
 
     /// Write raw pre-framed bytes to the stream (length prefix + payload).
-    /// Useful for testing replay scenarios.
+    /// Restricted to crate-internal use to prevent bypassing SHARD authentication.
+    /// Available externally only with `test-internals` feature for integration tests.
+    #[cfg_attr(not(feature = "test-internals"), doc(hidden))]
+    #[cfg(any(feature = "test-internals", not(feature = "production")))]
     pub async fn send_raw(&mut self, raw: &[u8]) -> Result<(), MilnetError> {
         let len = raw.len() as u32;
         let len_bytes = len.to_be_bytes();

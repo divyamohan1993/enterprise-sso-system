@@ -343,15 +343,13 @@ impl EncryptedAuditSearch {
     }
 }
 
-/// Derive a 32-byte subkey from master key + label using SHA-512.
+/// Derive a 32-byte subkey from master key + label using HKDF-SHA512
+/// with proper domain separation.
 fn derive_subkey(master: &[u8; 32], label: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha512::new();
-    hasher.update(b"MILNET-HE-SUBKEY-v1");
-    hasher.update(master);
-    hasher.update(label);
-    let digest = hasher.finalize();
+    let hk = hkdf::Hkdf::<Sha512>::new(Some(b"MILNET-HE-SUBKEY-v1"), master);
     let mut key = [0u8; 32];
-    key.copy_from_slice(&digest[..32]);
+    hk.expand(label, &mut key)
+        .expect("HKDF-SHA512 expand for 32 bytes cannot fail");
     key
 }
 

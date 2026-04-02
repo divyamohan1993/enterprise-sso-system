@@ -454,7 +454,16 @@ pub struct ThreatIntelManager {
     /// Per-feed state, keyed by FeedType.
     state: Mutex<HashMap<FeedType, FeedState>>,
     /// HMAC key for feed integrity verification (operator-provisioned).
+    // NOTE: HMAC-SHA512 is used for feed integrity because the same operator
+    // controls both feed production and consumption. For third-party feeds
+    // where key sharing is undesirable, ML-DSA-87 asymmetric signatures would
+    // be more appropriate (the feed publisher signs with a private key, and
+    // consumers verify with the public key).
     hmac_key: Vec<u8>,
+    /// Optional ML-DSA-87 verification key for feeds that use asymmetric
+    /// signing instead of HMAC. When set, `verify_integrity_ml_dsa()` is
+    /// used in place of HMAC verification for feeds from third-party sources.
+    pub ml_dsa_verify_key: Option<Vec<u8>>,
     /// GeoIP lookup table (IP -> GeoIpInfo). In production this would be
     /// backed by a MaxMind DB or similar.
     geoip_table: Mutex<HashMap<String, GeoIpInfo>>,
@@ -469,8 +478,52 @@ impl ThreatIntelManager {
             feeds: Vec::new(),
             state: Mutex::new(HashMap::new()),
             hmac_key: hmac_key.to_vec(),
+            ml_dsa_verify_key: None,
             geoip_table: Mutex::new(HashMap::new()),
             domain_cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Set an ML-DSA-87 public verification key for third-party feed verification.
+    /// When set, feeds can be verified using asymmetric signatures instead of HMAC.
+    pub fn with_ml_dsa_verify_key(mut self, key: Vec<u8>) -> Self {
+        self.ml_dsa_verify_key = Some(key);
+        self
+    }
+
+    /// Verify feed integrity using ML-DSA-87 asymmetric signature.
+    /// Returns false if no ML-DSA key is configured.
+    pub fn verify_integrity_ml_dsa(&self, data: &[u8], signature: &[u8]) -> bool {
+        let Some(ref verify_key_bytes) = self.ml_dsa_verify_key else {
+            tracing::warn!(
+                target: "threat_intel",
+                "ML-DSA-87 verification requested but no verify key configured"
+            );
+            return false;
+        };
+
+        use ml_dsa::{signature::Verifier, MlDsa87, VerifyingKey};
+
+        let vk = match VerifyingKey::<MlDsa87>::try_from(verify_key_bytes.as_slice()) {
+            Ok(vk) => vk,
+            Err(_) => {
+                tracing::error!(
+                    target: "threat_intel",
+                    "Failed to deserialize ML-DSA-87 verifying key"
+                );
+                return false;
+            }
+        };
+
+        match ml_dsa::Signature::<MlDsa87>::try_from(signature) {
+            Ok(sig) => vk.verify(data, &sig).is_ok(),
+            Err(_) => {
+                tracing::error!(
+                    target: "threat_intel",
+                    "Failed to deserialize ML-DSA-87 signature"
+                );
+                false
+            }
         }
     }
 

@@ -188,6 +188,56 @@ macro_rules! embed_build_info {
     };
 }
 
+/// Validate that build manifest fields are not "unknown".
+///
+/// If the `MILNET_MILITARY_DEPLOYMENT` environment variable is set at runtime
+/// and any field in the embedded build info is "unknown", this emits a CRITICAL
+/// SIEM event. Call this at startup to catch misconfigured builds early.
+///
+/// Returns true if all fields are populated, false if any is "unknown".
+pub fn validate_build_manifest(info: &EmbeddedBuildInfo) -> bool {
+    let fields = [
+        ("git_commit", info.git_commit),
+        ("rustc_version", info.rustc_version),
+        ("cargo_version", info.cargo_version),
+        ("target", info.target),
+        ("build_time", info.build_time),
+    ];
+
+    let mut all_valid = true;
+    let mut unknown_fields = Vec::new();
+
+    for (name, value) in &fields {
+        if *value == "unknown" {
+            all_valid = false;
+            unknown_fields.push(*name);
+        }
+    }
+
+    if !all_valid {
+        if std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok() {
+            let siem_event = serde_json::json!({
+                "event_type": "build_manifest_incomplete",
+                "severity": "CRITICAL",
+                "source_module": "build_manifest",
+                "detail": format!(
+                    "Build manifest has unknown fields in military deployment: {:?}",
+                    unknown_fields
+                )
+            });
+            tracing::error!(target: "siem", "{}", siem_event);
+        } else {
+            tracing::warn!(
+                target: "build_manifest",
+                "Build manifest has unknown fields: {:?} (non-military deployment, continuing)",
+                unknown_fields
+            );
+        }
+    }
+
+    all_valid
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
