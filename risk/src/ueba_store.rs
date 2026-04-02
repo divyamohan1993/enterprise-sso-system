@@ -250,7 +250,7 @@ impl UebaStore {
                 user_state.anomaly_history.pop_front();
             }
 
-            user_state.anomaly_history.push(AnomalyScoreRecord {
+            user_state.anomaly_history.push_back(AnomalyScoreRecord {
                 timestamp: now,
                 score,
                 source: source.to_string(),
