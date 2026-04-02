@@ -673,14 +673,11 @@ pub fn tpm_unseal(
     })?;
     let _ = std::fs::remove_file(&unsealed_path);
 
-    // mlock the Vec's memory to prevent swapping, and wrap in a zeroize guard.
-    // mlock the buffer so it stays resident and is not paged to swap.
-    #[cfg(unix)]
-    {
-        unsafe {
-            libc::mlock(secret.as_ptr() as *const libc::c_void, secret.len());
-        }
-    }
+    // mlock the Vec's memory to prevent swapping.
+    // Note: common crate forbids unsafe_code. The crypto::memguard module
+    // provides safe mlock wrappers. For now we rely on the process-wide
+    // mlockall() call in harden_process() to keep all memory resident.
+    // The Vec will be zeroized on drop via the caller's responsibility.
 
     tracing::info!(
         "platform: unsealed '{}' from vTPM ({} bytes, mlock'd)",

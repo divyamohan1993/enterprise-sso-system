@@ -397,7 +397,7 @@ pub async fn probe_peer_health(addr: &str) -> bool {
     .await;
 
     match read_result {
-        Ok(Ok(())) => {}
+        Ok(Ok(_n)) => {}
         _ => {
             tracing::trace!(addr = addr, "health probe: HMAC response timeout or read error");
             return false;

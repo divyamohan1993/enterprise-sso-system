@@ -18,7 +18,7 @@ const SHA256_V1_TAG: u8 = 0x01;
 /// Version tag for upgraded legacy path using SHA-512 (CNSA 2.0 compliant).
 const SHA512_V1B_TAG: u8 = 0x03;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct DuressConfig {
     pub user_id: Uuid,
     /// PIN hash bytes. Format: version_tag(1) || hash_data(variable).
@@ -33,6 +33,27 @@ pub struct DuressConfig {
     /// incident response (session revocation, account lockdown, SOC paging).
     #[serde(skip)]
     pub duress_response_callback: Option<Box<dyn Fn(&DuressAlert) + Send + Sync>>,
+}
+
+impl std::fmt::Debug for DuressConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DuressConfig")
+            .field("user_id", &self.user_id)
+            .field("has_callback", &self.duress_response_callback.is_some())
+            .finish()
+    }
+}
+
+impl Clone for DuressConfig {
+    fn clone(&self) -> Self {
+        Self {
+            user_id: self.user_id,
+            normal_pin_hash: self.normal_pin_hash.clone(),
+            duress_pin_hash: self.duress_pin_hash.clone(),
+            salt: self.salt,
+            duress_response_callback: None, // Callbacks cannot be cloned
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
