@@ -786,8 +786,8 @@ mod tests {
             let mut chain = PqBlockchain::new(seed, 0);
             // Register proposer key
             chain.register_verifying_key(0, verifying_key_from_seed(&seed));
-            // Register attester keys
-            for node_id in 0..5usize {
+            // Register attester keys (nodes 1-5, avoiding overwrite of proposer node 0)
+            for node_id in 1..=5usize {
                 chain.register_verifying_key(
                     node_id,
                     verifying_key_from_seed(&test_seed(node_id as u8 + 20)),
@@ -800,7 +800,7 @@ mod tests {
             let block = chain.propose_block().unwrap();
 
             let mut attestations = Vec::new();
-            for node_id in 0..5usize {
+            for node_id in 1..=5usize {
                 let attester = PqBlockchain::new(test_seed(node_id as u8 + 20), node_id);
                 attestations.push(attester.attest_block(&block).unwrap());
             }
@@ -885,7 +885,7 @@ mod tests {
             let seed = test_seed(8);
             let mut chain = PqBlockchain::new(seed, 0);
             chain.register_verifying_key(0, verifying_key_from_seed(&seed));
-            for node_id in 0..5usize {
+            for node_id in 1..=5usize {
                 chain.register_verifying_key(
                     node_id,
                     verifying_key_from_seed(&test_seed(node_id as u8 + 40)),
@@ -899,7 +899,7 @@ mod tests {
                 chain.submit_entry(make_entry([0u8; 64]));
                 let block = chain.propose_block().unwrap();
                 let mut atts = Vec::new();
-                for node_id in 0..5usize {
+                for node_id in 1..=5usize {
                     let a = PqBlockchain::new(test_seed(node_id as u8 + 40), node_id);
                     atts.push(a.attest_block(&block).unwrap());
                 }
@@ -917,7 +917,7 @@ mod tests {
             let seed = test_seed(9);
             let mut chain = PqBlockchain::new(seed, 0);
             chain.register_verifying_key(0, verifying_key_from_seed(&seed));
-            for node_id in 0..5usize {
+            for node_id in 1..=5usize {
                 chain.register_verifying_key(
                     node_id,
                     verifying_key_from_seed(&test_seed(node_id as u8 + 50)),
@@ -936,7 +936,7 @@ mod tests {
 
             // Finalize to keep chain consistent.
             let mut atts = Vec::new();
-            for node_id in 0..5usize {
+            for node_id in 1..=5usize {
                 let a = PqBlockchain::new(test_seed(node_id as u8 + 50), node_id);
                 atts.push(a.attest_block(&block).unwrap());
             }

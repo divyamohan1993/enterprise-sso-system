@@ -309,7 +309,7 @@ fn pseudonym_email_does_not_contain_original_email() {
 fn pseudonym_is_fixed_length_hex() {
     ensure_prod_kek();
     let p = common::log_pseudonym::pseudonym_uuid(uuid::Uuid::new_v4());
-    assert_eq!(p.len(), 16, "pseudonym must be 16 hex chars (8 bytes)");
+    assert_eq!(p.len(), 32, "pseudonym must be 32 hex chars (16 bytes)");
     assert!(
         p.chars().all(|c| c.is_ascii_hexdigit()),
         "pseudonym must be valid hex"

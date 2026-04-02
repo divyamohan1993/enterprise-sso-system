@@ -420,12 +420,15 @@ async fn test_complete_tier2_auth_flow() {
 
     let token_bytes = resp.token.unwrap();
     let token: Token = postcard::from_bytes(&token_bytes).expect("deserialize token");
-    let claims = verify_token_bound(&token, &group_key, test_pq_vk(), &dpop_key).expect("token verification should succeed");
+    let token_header = token.header.clone();
+    let claims = tokio::task::spawn_blocking(move || {
+        verify_token_bound(&token, &group_key, test_pq_vk(), &dpop_key)
+    }).await.expect("verify task").expect("token verification should succeed");
 
     assert_eq!(claims.tier, 2, "token tier should be 2");
     assert!(claims.exp > now_us(), "token should not be expired");
-    assert_eq!(token.header.version, 1);
-    assert_eq!(token.header.tier, 2);
+    assert_eq!(token_header.version, 1);
+    assert_eq!(token_header.tier, 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -448,7 +451,9 @@ async fn test_multiple_users_concurrent_auth() {
             assert!(resp.success, "user{i} auth should succeed: {:?}", resp.error);
             let token_bytes = resp.token.unwrap();
             let token: Token = postcard::from_bytes(&token_bytes).expect("deserialize token");
-            let claims = verify_token_bound(&token, &gk, test_pq_vk(), &dpop_key).expect("token should verify");
+            let claims = tokio::task::spawn_blocking(move || {
+                verify_token_bound(&token, &gk, test_pq_vk(), &dpop_key)
+            }).await.expect("verify task").expect("token should verify");
             assert_eq!(claims.tier, 2);
             claims.sub
         }));
@@ -476,7 +481,10 @@ async fn test_sequential_auth_sessions() {
         assert!(resp.success);
         let token_bytes = resp.token.unwrap();
         let token: Token = postcard::from_bytes(&token_bytes).expect("deserialize token");
-        let claims = verify_token_bound(&token, &group_key, test_pq_vk(), &dpop_key).expect("token should verify");
+        let gk = group_key.clone();
+        let claims = tokio::task::spawn_blocking(move || {
+            verify_token_bound(&token, &gk, test_pq_vk(), &dpop_key)
+        }).await.expect("verify task").expect("token should verify");
         ceremony_ids.push(claims.ceremony_id);
     }
 
@@ -552,7 +560,9 @@ async fn test_unicode_username_works() {
     assert!(resp.success, "unicode username auth should succeed: {:?}", resp.error);
     let token_bytes = resp.token.unwrap();
     let token: Token = postcard::from_bytes(&token_bytes).expect("deserialize token");
-    let claims = verify_token_bound(&token, &group_key, test_pq_vk(), &dpop_key).expect("token should verify");
+    let claims = tokio::task::spawn_blocking(move || {
+        verify_token_bound(&token, &group_key, test_pq_vk(), &dpop_key)
+    }).await.expect("verify task").expect("token should verify");
     assert_eq!(claims.tier, 2);
 }
 
@@ -568,7 +578,9 @@ async fn test_very_long_password_works() {
     assert!(resp.success, "long password auth should succeed: {:?}", resp.error);
     let token_bytes = resp.token.unwrap();
     let token: Token = postcard::from_bytes(&token_bytes).expect("deserialize token");
-    verify_token_bound(&token, &group_key, test_pq_vk(), &dpop_key).expect("token should verify");
+    tokio::task::spawn_blocking(move || {
+        verify_token_bound(&token, &group_key, test_pq_vk(), &dpop_key)
+    }).await.expect("verify task").expect("token should verify");
 }
 
 #[tokio::test]

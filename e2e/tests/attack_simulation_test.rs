@@ -531,7 +531,10 @@ async fn test_attack_ddos_concurrent_legitimate_under_load() {
         );
         let token_bytes = resp.token.unwrap();
         let token: Token = postcard::from_bytes(&token_bytes).expect("deserialize token");
-        verify_token_bound(&token, &group_key, test_pq_vk(), &dpop_key).expect("token should verify");
+        let gk = group_key.clone();
+        tokio::task::spawn_blocking(move || {
+            verify_token_bound(&token, &gk, test_pq_vk(), &dpop_key)
+        }).await.expect("verify task").expect("token should verify");
     }
 }
 
@@ -566,7 +569,9 @@ async fn test_attack_credential_stuffing_attack() {
     );
     let token_bytes = resp.token.unwrap();
     let token: Token = postcard::from_bytes(&token_bytes).expect("deserialize token");
-    verify_token_bound(&token, &group_key, test_pq_vk(), &dpop_key).expect("token should verify after attack");
+    tokio::task::spawn_blocking(move || {
+        verify_token_bound(&token, &group_key, test_pq_vk(), &dpop_key)
+    }).await.expect("verify task").expect("token should verify after attack");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -598,7 +603,10 @@ async fn test_attack_password_spray_attack() {
         );
         let token_bytes = resp.token.unwrap();
         let token: Token = postcard::from_bytes(&token_bytes).expect("deserialize token");
-        verify_token_bound(&token, &group_key, test_pq_vk(), &dpop_key).expect("token should verify after spray");
+        let gk = group_key.clone();
+        tokio::task::spawn_blocking(move || {
+            verify_token_bound(&token, &gk, test_pq_vk(), &dpop_key)
+        }).await.expect("verify task").expect("token should verify after spray");
     }
 }
 

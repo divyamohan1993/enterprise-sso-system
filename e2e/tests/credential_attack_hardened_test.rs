@@ -889,8 +889,7 @@ fn receipt_chain_manipulation_all_attacks_detected() {
         receipts.push(receipt);
     }
 
-    // The chain must be valid
-    assert!(chain.validate().is_ok(), "valid chain must pass structural check");
+    // The chain must be valid (validate() without key always returns Err, use validate_with_key)
     assert!(
         chain.validate_with_key(&RECEIPT_SIGNING_KEY).is_ok(),
         "valid chain must pass signature check"

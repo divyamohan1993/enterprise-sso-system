@@ -1216,9 +1216,9 @@ mod tests {
 
     #[test]
     fn test_fors_indices_extraction() {
-        let digest = vec![0xFF; 32];
+        let digest = vec![0xFF; 64];
         let indices = msg_to_fors_indices(&digest);
-        // All bits set => each 6-bit index should be 63
+        // All bits set => each FORS_A-bit index should be (1 << FORS_A) - 1
         for &idx in &indices {
             assert_eq!(idx, (1 << FORS_A) - 1);
         }
