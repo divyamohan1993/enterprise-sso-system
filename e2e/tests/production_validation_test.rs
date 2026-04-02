@@ -73,17 +73,6 @@ fn test_pq_vk() -> &'static PqVerifyingKey { &TEST_PQ_KEYPAIR.1 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
-/// Build a tokio runtime with 8 MiB worker thread stacks for ML-DSA-87
-/// operations that overflow the default 2 MiB stack.
-fn build_pq_runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .thread_stack_size(16 * 1024 * 1024)
-        .enable_all()
-        .build()
-        .expect("build PQ test runtime")
-}
-
 fn now_us() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -418,10 +407,8 @@ fn make_valid_token_and_key() -> (Token, frost_ristretto255::keys::PublicKeyPack
 // Category 1: Full Ceremony Flow (Happy Paths)
 // ==========================================================================
 
-#[test]
-fn test_complete_tier2_auth_flow() {
-    let rt = build_pq_runtime();
-    rt.block_on(async {
+#[tokio::test]
+async fn test_complete_tier2_auth_flow() {
     let _pq_vk = test_pq_vk();
     let mut store = CredentialStore::new();
     store.register_with_password("alice", b"password123");
@@ -442,13 +429,10 @@ fn test_complete_tier2_auth_flow() {
     assert!(claims.exp > now_us(), "token should not be expired");
     assert_eq!(token_header.version, 1);
     assert_eq!(token_header.tier, 2);
-    });
 }
 
-#[test]
-fn test_multiple_users_concurrent_auth() {
-    let rt = build_pq_runtime();
-    rt.block_on(async {
+#[tokio::test]
+async fn test_multiple_users_concurrent_auth() {
     let mut store = CredentialStore::new();
     let mut user_ids = Vec::new();
     for i in 0..5 {
@@ -482,13 +466,10 @@ fn test_multiple_users_concurrent_auth() {
     // All subs should be unique
     let unique: std::collections::HashSet<_> = subs.iter().collect();
     assert_eq!(unique.len(), 5, "all 5 users should have unique sub claims");
-    });
 }
 
-#[test]
-fn test_sequential_auth_sessions() {
-    let rt = build_pq_runtime();
-    rt.block_on(async {
+#[tokio::test]
+async fn test_sequential_auth_sessions() {
     let _pq_vk = test_pq_vk();
     let mut store = CredentialStore::new();
     store.register_with_password("bob", b"bobpass");
@@ -516,17 +497,14 @@ fn test_sequential_auth_sessions() {
             );
         }
     }
-    });
 }
 
 // ==========================================================================
 // Category 2: Authentication Failures (Realistic Rejection Cases)
 // ==========================================================================
 
-#[test]
-fn test_wrong_password_rejected() {
-    let rt = build_pq_runtime();
-    rt.block_on(async {
+#[tokio::test]
+async fn test_wrong_password_rejected() {
     let mut store = CredentialStore::new();
     store.register_with_password("alice", b"password123");
     let (gateway_addr, _) = boot_full_system(store).await;
@@ -535,13 +513,10 @@ fn test_wrong_password_rejected() {
     assert!(!resp.success, "auth should fail with wrong password");
     assert!(resp.token.is_none(), "no token on failure");
     assert!(resp.error.is_some(), "error message should be present");
-    });
 }
 
-#[test]
-fn test_nonexistent_user_rejected() {
-    let rt = build_pq_runtime();
-    rt.block_on(async {
+#[tokio::test]
+async fn test_nonexistent_user_rejected() {
     let store = CredentialStore::new();
     let (gateway_addr, _) = boot_full_system(store).await;
 
@@ -549,13 +524,10 @@ fn test_nonexistent_user_rejected() {
     assert!(!resp.success, "auth should fail for nonexistent user");
     assert!(resp.token.is_none());
     assert!(resp.error.is_some());
-    });
 }
 
-#[test]
-fn test_empty_password_rejected() {
-    let rt = build_pq_runtime();
-    rt.block_on(async {
+#[tokio::test]
+async fn test_empty_password_rejected() {
     let mut store = CredentialStore::new();
     store.register_with_password("alice", b"password123");
     let (gateway_addr, _) = boot_full_system(store).await;
@@ -563,13 +535,10 @@ fn test_empty_password_rejected() {
     let resp = client_auth(&gateway_addr, "alice", b"").await;
     assert!(!resp.success, "auth should fail with empty password");
     assert!(resp.token.is_none());
-    });
 }
 
-#[test]
-fn test_empty_username_rejected() {
-    let rt = build_pq_runtime();
-    rt.block_on(async {
+#[tokio::test]
+async fn test_empty_username_rejected() {
     let mut store = CredentialStore::new();
     store.register_with_password("alice", b"password123");
     let (gateway_addr, _) = boot_full_system(store).await;
@@ -577,13 +546,10 @@ fn test_empty_username_rejected() {
     let resp = client_auth(&gateway_addr, "", b"password123").await;
     assert!(!resp.success, "auth should fail with empty username");
     assert!(resp.token.is_none());
-    });
 }
 
-#[test]
-fn test_unicode_username_works() {
-    let rt = build_pq_runtime();
-    rt.block_on(async {
+#[tokio::test]
+async fn test_unicode_username_works() {
     let _pq_vk = test_pq_vk();
     let mut store = CredentialStore::new();
     let username = "\u{7528}\u{6237}\u{03B1}\u{03B2}\u{03B3}";
@@ -598,13 +564,10 @@ fn test_unicode_username_works() {
         verify_token_bound(&token, &group_key, test_pq_vk(), &dpop_key)
     }).await.expect("verify task").expect("token should verify");
     assert_eq!(claims.tier, 2);
-    });
 }
 
-#[test]
-fn test_very_long_password_works() {
-    let rt = build_pq_runtime();
-    rt.block_on(async {
+#[tokio::test]
+async fn test_very_long_password_works() {
     let (_, _pq_vk) = crypto::pq_sign::generate_pq_keypair();
     let mut store = CredentialStore::new();
     let long_pass = vec![0x41u8; 1000];
@@ -618,13 +581,10 @@ fn test_very_long_password_works() {
     tokio::task::spawn_blocking(move || {
         verify_token_bound(&token, &group_key, test_pq_vk(), &dpop_key)
     }).await.expect("verify task").expect("token should verify");
-    });
 }
 
-#[test]
-fn test_puzzle_not_solved_rejected() {
-    let rt = build_pq_runtime();
-    rt.block_on(async {
+#[tokio::test]
+async fn test_puzzle_not_solved_rejected() {
     let mut store = CredentialStore::new();
     store.register_with_password("alice", b"password123");
     let (gateway_addr, _) = boot_full_system(store).await;
@@ -661,7 +621,6 @@ fn test_puzzle_not_solved_rejected() {
             // to prevent resource exhaustion from DDoS attempts.
         }
     }
-    });
 }
 
 // ==========================================================================

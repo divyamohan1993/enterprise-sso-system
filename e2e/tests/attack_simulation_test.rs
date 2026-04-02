@@ -68,17 +68,6 @@ fn test_pq_vk() -> &'static crypto::pq_sign::PqVerifyingKey { &TEST_PQ_KEYPAIR.1
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
-/// Build a tokio runtime with 8 MiB worker thread stacks for ML-DSA-87
-/// operations that overflow the default 2 MiB stack.
-fn build_pq_runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .thread_stack_size(16 * 1024 * 1024)
-        .enable_all()
-        .build()
-        .expect("build PQ test runtime")
-}
-
 fn now_us() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -418,10 +407,8 @@ fn make_valid_token_and_key() -> (Token, frost_ristretto255::keys::PublicKeyPack
 // Category 1: DDoS Attacks
 // ==========================================================================
 
-#[test]
-fn test_attack_ddos_puzzle_prevents_unauthenticated_flood() {
-    let rt = build_pq_runtime();
-    rt.block_on(async {
+#[tokio::test]
+async fn test_attack_ddos_puzzle_prevents_unauthenticated_flood() {
     // Spawn gateway. Send bogus connections that DON'T solve the puzzle.
     // Gateway must reject all without forwarding to orchestrator.
     let mut store = CredentialStore::new();
@@ -458,13 +445,10 @@ fn test_attack_ddos_puzzle_prevents_unauthenticated_flood() {
         assert!(!resp.success, "unsolved puzzle must be rejected");
         assert!(resp.token.is_none());
     }
-    });
 }
 
-#[test]
-fn test_attack_ddos_wrong_puzzle_flood() {
-    let rt = build_pq_runtime();
-    rt.block_on(async {
+#[tokio::test]
+async fn test_attack_ddos_wrong_puzzle_flood() {
     // Send connections with WRONG puzzle solutions. All must be rejected.
     let mut store = CredentialStore::new();
     store.register_with_password("admin", b"password123");
@@ -499,13 +483,10 @@ fn test_attack_ddos_wrong_puzzle_flood() {
         assert!(!resp.success, "wrong puzzle solution must be rejected");
         assert!(resp.token.is_none());
     }
-    });
 }
 
-#[test]
-fn test_attack_ddos_concurrent_legitimate_under_load() {
-    let rt = build_pq_runtime();
-    rt.block_on(async {
+#[tokio::test]
+async fn test_attack_ddos_concurrent_legitimate_under_load() {
     // Send bogus connections first, then legitimate ones. Total must
     // stay within the per-IP rate limit (10 connections per 60s window).
     // We send 4 bogus + 3 legitimate = 7 total connections.
@@ -555,17 +536,14 @@ fn test_attack_ddos_concurrent_legitimate_under_load() {
             verify_token_bound(&token, &gk, test_pq_vk(), &dpop_key)
         }).await.expect("verify task").expect("token should verify");
     }
-    });
 }
 
 // ==========================================================================
 // Category 2: Credential Attacks
 // ==========================================================================
 
-#[test]
-fn test_attack_credential_stuffing_attack() {
-    let rt = build_pq_runtime();
-    rt.block_on(async {
+#[tokio::test]
+async fn test_attack_credential_stuffing_attack() {
     // Register user "admin". Try wrong passwords in rapid succession.
     // All must fail. The correct password must still work after the attack.
     // Limited to stay within per-IP rate limit (10 connections per 60s)
@@ -594,13 +572,10 @@ fn test_attack_credential_stuffing_attack() {
     tokio::task::spawn_blocking(move || {
         verify_token_bound(&token, &group_key, test_pq_vk(), &dpop_key)
     }).await.expect("verify task").expect("token should verify after attack");
-    });
 }
 
-#[test]
-fn test_attack_password_spray_attack() {
-    let rt = build_pq_runtime();
-    rt.block_on(async {
+#[tokio::test]
+async fn test_attack_password_spray_attack() {
     // Register users. Try the same wrong password against several.
     // All must fail. Then try correct passwords — all must succeed.
     // Limited to stay within per-IP rate limit (10 connections per 60s).
@@ -633,13 +608,10 @@ fn test_attack_password_spray_attack() {
             verify_token_bound(&token, &gk, test_pq_vk(), &dpop_key)
         }).await.expect("verify task").expect("token should verify after spray");
     }
-    });
 }
 
-#[test]
-fn test_attack_timing_attack_on_password_verification() {
-    let rt = build_pq_runtime();
-    rt.block_on(async {
+#[tokio::test]
+async fn test_attack_timing_attack_on_password_verification() {
     // Register user "alice" with a known password.
     // Measure time for: correct password, wrong password, nonexistent user.
     // The times should be similar (within 20% variance) to prevent timing oracles.
@@ -715,7 +687,6 @@ fn test_attack_timing_attack_on_password_verification() {
         enumeration_ratio < 20.0,
         "wrong-password/nonexistent-user timing ratio {enumeration_ratio:.2} too large — username enumeration possible"
     );
-    });
 }
 
 // ==========================================================================
