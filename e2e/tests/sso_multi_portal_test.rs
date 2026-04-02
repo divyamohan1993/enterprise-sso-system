@@ -401,7 +401,7 @@ fn make_claims(user_id: Uuid, tier: u8, scope: u32, ttl_secs: u64) -> TokenClaim
 // Part 1: SSO Proof — Login Once, Access Multiple Services
 // ════════════════════════════════════════════════════════════════════════
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_sso_single_login_multiple_portals() {
     let _pq_vk = test_pq_vk();
     // 1. Boot full auth system
@@ -444,7 +444,7 @@ async fn test_sso_single_login_multiple_portals() {
     assert_eq!(access_count, 5, "must access all 5 portals with single token");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_sso_token_works_across_independent_verifiers() {
     // 1. Run DKG, get group key, distribute shares
     let mut dkg_result = dkg(5, 3);
@@ -476,7 +476,7 @@ async fn test_sso_token_works_across_independent_verifiers() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_sso_different_users_different_tokens_same_portals() {
     let _pq_vk = test_pq_vk();
     // 1. Register alice and bob
@@ -518,7 +518,7 @@ async fn test_sso_different_users_different_tokens_same_portals() {
 // Part 2: Scope-Based Access Control
 // ════════════════════════════════════════════════════════════════════════
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_sso_scope_restricts_portal_access() {
     let mut dkg_result = dkg(5, 3);
     let group_key = dkg_result.group.public_key_package.clone();
@@ -546,7 +546,7 @@ async fn test_sso_scope_restricts_portal_access() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_sso_tier_restricts_portal_access() {
     let mut dkg_result = dkg(5, 3);
     let group_key = dkg_result.group.public_key_package.clone();
@@ -580,7 +580,7 @@ async fn test_sso_tier_restricts_portal_access() {
 // Part 3: Cross-Portal Attack Simulation
 // ════════════════════════════════════════════════════════════════════════
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_attack_stolen_token_used_at_different_portal() {
     let _pq_vk = test_pq_vk();
     // Get token for alice via full ceremony
@@ -614,7 +614,7 @@ async fn test_attack_stolen_token_used_at_different_portal() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_attack_forged_scope_escalation() {
     let mut dkg_result = dkg(5, 3);
     let group_key = dkg_result.group.public_key_package.clone();
@@ -647,7 +647,7 @@ async fn test_attack_forged_scope_escalation() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_attack_forged_tier_escalation() {
     let mut dkg_result = dkg(5, 3);
     let group_key = dkg_result.group.public_key_package.clone();
@@ -672,7 +672,7 @@ async fn test_attack_forged_tier_escalation() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_attack_expired_token_at_portal() {
     let mut dkg_result = dkg(5, 3);
     let group_key = dkg_result.group.public_key_package.clone();
@@ -707,7 +707,7 @@ async fn test_attack_expired_token_at_portal() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_attack_token_from_rogue_sso_server() {
     let pq_vk = test_pq_vk();
     // Real SSO server DKG
@@ -733,7 +733,7 @@ async fn test_attack_token_from_rogue_sso_server() {
     // Proves: portal cryptographically binds to its trusted SSO server
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_attack_replay_same_token_after_ratchet_advance() {
     // Create a ratchet chain and generate a tag at epoch 0
     let master_secret = [0x55u8; 64];
@@ -767,7 +767,7 @@ async fn test_attack_replay_same_token_after_ratchet_advance() {
     assert!(valid_current, "current epoch tag should verify");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_attack_man_in_middle_modifies_token_in_transit() {
     let mut dkg_result = dkg(5, 3);
     let group_key = dkg_result.group.public_key_package.clone();
@@ -804,7 +804,7 @@ async fn test_attack_man_in_middle_modifies_token_in_transit() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_attack_null_token_at_portal() {
     let dkg_result = dkg(5, 3);
     let group_key = dkg_result.group.public_key_package.clone();
@@ -824,7 +824,7 @@ async fn test_attack_null_token_at_portal() {
     let _ = group_key; // used above conceptually
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_attack_oversized_token_at_portal() {
     let dkg_result = dkg(5, 3);
     let _group_key = dkg_result.group.public_key_package.clone();
@@ -842,7 +842,7 @@ async fn test_attack_oversized_token_at_portal() {
 // Part 4: Multi-User Session Isolation
 // ════════════════════════════════════════════════════════════════════════
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_sso_sessions_are_isolated() {
     // alice and bob both have active ratchet sessions
     let alice_secret = [0x11u8; 64];
@@ -880,7 +880,7 @@ async fn test_sso_sessions_are_isolated() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_sso_concurrent_portal_access() {
     // Setup: DKG and 5 users
     let mut dkg_result = dkg(5, 3);

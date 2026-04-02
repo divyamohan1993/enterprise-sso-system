@@ -407,7 +407,7 @@ fn make_valid_token_and_key() -> (Token, frost_ristretto255::keys::PublicKeyPack
 // Category 1: Full Ceremony Flow (Happy Paths)
 // ==========================================================================
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_complete_tier2_auth_flow() {
     let _pq_vk = test_pq_vk();
     let mut store = CredentialStore::new();
@@ -431,7 +431,7 @@ async fn test_complete_tier2_auth_flow() {
     assert_eq!(token_header.tier, 2);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_multiple_users_concurrent_auth() {
     let mut store = CredentialStore::new();
     let mut user_ids = Vec::new();
@@ -468,7 +468,7 @@ async fn test_multiple_users_concurrent_auth() {
     assert_eq!(unique.len(), 5, "all 5 users should have unique sub claims");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_sequential_auth_sessions() {
     let _pq_vk = test_pq_vk();
     let mut store = CredentialStore::new();
@@ -503,7 +503,7 @@ async fn test_sequential_auth_sessions() {
 // Category 2: Authentication Failures (Realistic Rejection Cases)
 // ==========================================================================
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_wrong_password_rejected() {
     let mut store = CredentialStore::new();
     store.register_with_password("alice", b"password123");
@@ -515,7 +515,7 @@ async fn test_wrong_password_rejected() {
     assert!(resp.error.is_some(), "error message should be present");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_nonexistent_user_rejected() {
     let store = CredentialStore::new();
     let (gateway_addr, _) = boot_full_system(store).await;
@@ -526,7 +526,7 @@ async fn test_nonexistent_user_rejected() {
     assert!(resp.error.is_some());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_empty_password_rejected() {
     let mut store = CredentialStore::new();
     store.register_with_password("alice", b"password123");
@@ -537,7 +537,7 @@ async fn test_empty_password_rejected() {
     assert!(resp.token.is_none());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_empty_username_rejected() {
     let mut store = CredentialStore::new();
     store.register_with_password("alice", b"password123");
@@ -548,7 +548,7 @@ async fn test_empty_username_rejected() {
     assert!(resp.token.is_none());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_unicode_username_works() {
     let _pq_vk = test_pq_vk();
     let mut store = CredentialStore::new();
@@ -566,7 +566,7 @@ async fn test_unicode_username_works() {
     assert_eq!(claims.tier, 2);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_very_long_password_works() {
     let (_, _pq_vk) = crypto::pq_sign::generate_pq_keypair();
     let mut store = CredentialStore::new();
@@ -583,7 +583,7 @@ async fn test_very_long_password_works() {
     }).await.expect("verify task").expect("token should verify");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_puzzle_not_solved_rejected() {
     let mut store = CredentialStore::new();
     store.register_with_password("alice", b"password123");
@@ -1515,7 +1515,7 @@ fn test_all_modules_can_send_to_audit() {
 // Category 11: SHARD Protocol Under Stress
 // ==========================================================================
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_shard_100_messages_sequential() {
     let (listener, ca, _cert_key) = tls_transport::tls_bind(
         "127.0.0.1:0", ModuleId::Orchestrator, SHARD_HMAC_KEY, "localhost"
@@ -1549,7 +1549,7 @@ async fn test_shard_100_messages_sequential() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_shard_replay_detected_even_under_load() {
     let (listener, ca, _cert_key) = tls_transport::tls_bind(
         "127.0.0.1:0", ModuleId::Orchestrator, SHARD_HMAC_KEY, "localhost"
@@ -1603,7 +1603,7 @@ async fn test_shard_replay_detected_even_under_load() {
     server.await.expect("server task");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_shard_large_payload() {
     let (listener, ca, _cert_key) = tls_transport::tls_bind(
         "127.0.0.1:0", ModuleId::Orchestrator, SHARD_HMAC_KEY, "localhost"
@@ -1636,7 +1636,7 @@ async fn test_shard_large_payload() {
     assert_eq!(received, large_payload, "payload content mismatch");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_shard_oversized_payload_rejected() {
     let (listener, ca, _cert_key) = tls_transport::tls_bind(
         "127.0.0.1:0", ModuleId::Orchestrator, SHARD_HMAC_KEY, "localhost"

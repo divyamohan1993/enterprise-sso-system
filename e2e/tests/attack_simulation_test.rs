@@ -407,7 +407,7 @@ fn make_valid_token_and_key() -> (Token, frost_ristretto255::keys::PublicKeyPack
 // Category 1: DDoS Attacks
 // ==========================================================================
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_attack_ddos_puzzle_prevents_unauthenticated_flood() {
     // Spawn gateway. Send bogus connections that DON'T solve the puzzle.
     // Gateway must reject all without forwarding to orchestrator.
@@ -447,7 +447,7 @@ async fn test_attack_ddos_puzzle_prevents_unauthenticated_flood() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_attack_ddos_wrong_puzzle_flood() {
     // Send connections with WRONG puzzle solutions. All must be rejected.
     let mut store = CredentialStore::new();
@@ -485,7 +485,7 @@ async fn test_attack_ddos_wrong_puzzle_flood() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_attack_ddos_concurrent_legitimate_under_load() {
     // Send bogus connections first, then legitimate ones. Total must
     // stay within the per-IP rate limit (10 connections per 60s window).
@@ -542,7 +542,7 @@ async fn test_attack_ddos_concurrent_legitimate_under_load() {
 // Category 2: Credential Attacks
 // ==========================================================================
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_attack_credential_stuffing_attack() {
     // Register user "admin". Try wrong passwords in rapid succession.
     // All must fail. The correct password must still work after the attack.
@@ -574,7 +574,7 @@ async fn test_attack_credential_stuffing_attack() {
     }).await.expect("verify task").expect("token should verify after attack");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_attack_password_spray_attack() {
     // Register users. Try the same wrong password against several.
     // All must fail. Then try correct passwords — all must succeed.
@@ -610,7 +610,7 @@ async fn test_attack_password_spray_attack() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_attack_timing_attack_on_password_verification() {
     // Register user "alice" with a known password.
     // Measure time for: correct password, wrong password, nonexistent user.
@@ -1079,7 +1079,7 @@ fn test_attack_receipt_with_future_timestamp_rejected() {
 // Category 5: SHARD Protocol Attacks
 // ==========================================================================
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_attack_shard_replay_attack() {
     // Capture raw SHARD message bytes. Replay them.
     // Replay detection (sequence number) must catch it.
@@ -1106,7 +1106,7 @@ async fn test_attack_shard_replay_attack() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_attack_shard_message_tampering() {
     // Intercept SHARD message, flip a byte in payload. HMAC verification must fail.
     let mut sender = ShardProtocol::new(ModuleId::Orchestrator, SHARD_HMAC_KEY);
@@ -1126,7 +1126,7 @@ async fn test_attack_shard_message_tampering() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_attack_shard_wrong_hmac_key() {
     // Create message with one HMAC key, verify with different key. Must fail.
     let key_a = [0x11u8; 64];
@@ -1149,7 +1149,7 @@ async fn test_attack_shard_wrong_hmac_key() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_attack_shard_sequence_number_manipulation() {
     // Send messages with sequence numbers 1, 2, 3. Then send with
     // sequence 2 again. Must be rejected (not just sequence 1 replay).
