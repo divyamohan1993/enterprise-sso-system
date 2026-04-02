@@ -228,7 +228,7 @@ impl AuditLog {
     ///
     /// When a verifying key is provided, ALL entries MUST have valid signatures.
     /// Unsigned entries are rejected during verification to prevent log injection.
-    fn verify_chain_with_key(&self, verifying_key: Option<&crypto::pq_sign::PqVerifyingKey>) -> bool {
+    pub fn verify_chain_with_key(&self, verifying_key: Option<&crypto::pq_sign::PqVerifyingKey>) -> bool {
         let mut expected_prev = [0u8; 64];
         for entry in &self.entries {
             if entry.prev_hash != expected_prev {
