@@ -264,9 +264,10 @@ pub fn pq_sign_tagged(signing_key: &PqSigningKey, data: &[u8]) -> Vec<u8> {
             // In production, the key store would provide the correct SLH-DSA key.
             let (slh_sk, _slh_pk) = crate::slh_dsa::slh_dsa_keygen();
             let slh_sig = crate::slh_dsa::slh_dsa_sign(&slh_sk, data);
-            let mut tagged = Vec::with_capacity(1 + slh_sig.len());
+            let sig_bytes = slh_sig.as_bytes();
+            let mut tagged = Vec::with_capacity(1 + sig_bytes.len());
             tagged.push(ALGO_TAG_SLH_DSA_SHA2_256F);
-            tagged.extend_from_slice(&slh_sig);
+            tagged.extend_from_slice(sig_bytes);
             return tagged;
         }
     };
