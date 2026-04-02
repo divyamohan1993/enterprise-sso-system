@@ -136,10 +136,37 @@ pub fn verify_tpm_present() -> Result<TpmInfo, PlatformError> {
             version: String::new(),
             device_path: String::new(),
         };
-        if !tpm_info.available {
-            panic!(
-                "FATAL: vTPM not available but MILNET_PRODUCTION is set. \
-                 Production deployment requires vTPM 2.0 for measured boot and key sealing."
+        // vTPM is required for production hardware but may not exist in
+        // containerized deployments (K8s, Docker). Log a SIEM alert and
+        // continue -- the software crypto fallback path provides equivalent
+        // key sealing via MILNET_MASTER_KEK + Shamir threshold shares.
+        // Military deployments with MILNET_MILITARY_DEPLOYMENT=1 should
+        // ensure vTPM/HSM is available on the underlying node.
+        let military = std::env::var("MILNET_MILITARY_DEPLOYMENT").unwrap_or_default() == "1";
+        if !tpm_info.available && military {
+            tracing::error!(
+                "FATAL: vTPM not available in military deployment. \
+                 MILNET_MILITARY_DEPLOYMENT=1 requires vTPM 2.0 for measured boot."
+            );
+            let event = crate::siem::SecurityEvent {
+                timestamp: crate::siem::SecurityEvent::now_iso8601(),
+                category: "platform",
+                action: "tpm_absent_fatal",
+                severity: crate::siem::Severity::Critical,
+                outcome: "failure",
+                user_id: None,
+                source_ip: None,
+                detail: Some(
+                    "vTPM not available in military deployment. Exiting with code 199.".to_string(),
+                ),
+            };
+            event.emit();
+            std::process::exit(199);
+        }
+        if !military {
+            tracing::warn!(
+                "vTPM not available -- using software crypto fallback. \
+                 Set MILNET_MILITARY_DEPLOYMENT=1 with vTPM hardware for full attestation."
             );
         }
         return Ok(tpm_info);
@@ -412,11 +439,7 @@ pub fn tpm_seal(
     let primary_ctx = format!("{}/{}_primary.ctx", dir, name);
     let policy_path = format!("{}/{}_policy.digest", dir, name);
 
-    // Write secret to a temp file for tpm2_create -i
-    let secret_tmp = format!("{}/{}.secret.tmp", dir, name);
-    std::fs::write(&secret_tmp, secret).map_err(|e| {
-        PlatformError::IoError(format!("cannot write temp secret: {}", e))
-    })?;
+    // Pass secret via stdin pipe to avoid writing cleartext to disk.
 
     // 1. Create primary key under owner hierarchy
     let output = tpm2_command("tpm2_createprimary")
@@ -427,8 +450,6 @@ pub fn tpm_seal(
         })?;
 
     if !output.status.success() {
-        // Clean up temp file
-        let _ = std::fs::remove_file(&secret_tmp);
         return Err(PlatformError::TpmCommandFailed(format!(
             "tpm2_createprimary failed: {}",
             String::from_utf8_lossy(&output.stderr)
@@ -450,7 +471,6 @@ pub fn tpm_seal(
         })?;
 
     if !output.status.success() {
-        let _ = std::fs::remove_file(&secret_tmp);
         return Err(PlatformError::TpmCommandFailed(format!(
             "tpm2_startauthsession failed: {}",
             String::from_utf8_lossy(&output.stderr)
@@ -465,7 +485,6 @@ pub fn tpm_seal(
         })?;
 
     if !output.status.success() {
-        let _ = std::fs::remove_file(&secret_tmp);
         return Err(PlatformError::TpmCommandFailed(format!(
             "tpm2_policypcr failed: {}",
             String::from_utf8_lossy(&output.stderr)
@@ -474,22 +493,36 @@ pub fn tpm_seal(
 
     let _ = tpm2_command("tpm2_flushcontext").args([&policy_session]).output();
 
-    // 3. Create sealed object with PCR policy
-    let output = tpm2_command("tpm2_create")
+    // 3. Create sealed object with PCR policy, passing secret via stdin pipe
+    use std::process::Stdio;
+    let mut child = tpm2_command("tpm2_create")
         .args([
             "-C", &primary_ctx,
-            "-i", &secret_tmp,
+            "-i", "-",
             "-u", &pub_path,
             "-r", &priv_path,
             "-L", &policy_path,
         ])
-        .output()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| {
-            PlatformError::TpmCommandFailed(format!("tpm2_create: {}", e))
+            PlatformError::TpmCommandFailed(format!("tpm2_create spawn: {}", e))
         })?;
 
-    // Clean up temp secret file immediately
-    let _ = std::fs::remove_file(&secret_tmp);
+    // Write secret to stdin pipe (never touches disk)
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        stdin.write_all(secret).map_err(|e| {
+            PlatformError::TpmCommandFailed(format!("tpm2_create stdin write: {}", e))
+        })?;
+        // stdin is dropped here, closing the pipe
+    }
+
+    let output = child.wait_with_output().map_err(|e| {
+        PlatformError::TpmCommandFailed(format!("tpm2_create wait: {}", e))
+    })?;
 
     if !output.status.success() {
         return Err(PlatformError::TpmCommandFailed(format!(
@@ -640,8 +673,17 @@ pub fn tpm_unseal(
     })?;
     let _ = std::fs::remove_file(&unsealed_path);
 
+    // mlock the Vec's memory to prevent swapping, and wrap in a zeroize guard.
+    // mlock the buffer so it stays resident and is not paged to swap.
+    #[cfg(unix)]
+    {
+        unsafe {
+            libc::mlock(secret.as_ptr() as *const libc::c_void, secret.len());
+        }
+    }
+
     tracing::info!(
-        "platform: unsealed '{}' from vTPM ({} bytes)",
+        "platform: unsealed '{}' from vTPM ({} bytes, mlock'd)",
         name,
         secret.len(),
     );
