@@ -875,7 +875,7 @@ pub struct SecurityEvent {
 }
 
 impl SecurityEvent {
-    pub(crate) fn now_iso8601() -> String {
+    pub fn now_iso8601() -> String {
         let d = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
@@ -1419,7 +1419,7 @@ impl SecurityEvent {
 
     /// Emit this event via structured logging (JSON to tracing) and broadcast
     /// it to the live SIEM event bus for SSE consumers.
-    pub(crate) fn emit(&self) {
+    pub fn emit(&self) {
         let json = self.to_json();
         tracing::info!(target: "siem", "{}", json);
 
