@@ -42,7 +42,7 @@ static RECEIPT_MLDSA87_VK: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::n
 fn build_pq_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(8)
-        .thread_stack_size(8 * 1024 * 1024)
+        .thread_stack_size(16 * 1024 * 1024)
         .enable_all()
         .build()
         .expect("build test runtime")

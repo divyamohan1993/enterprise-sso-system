@@ -73,7 +73,7 @@ fn test_pq_vk() -> &'static crypto::pq_sign::PqVerifyingKey { &TEST_PQ_KEYPAIR.1
 fn build_pq_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
-        .thread_stack_size(8 * 1024 * 1024)
+        .thread_stack_size(16 * 1024 * 1024)
         .enable_all()
         .build()
         .expect("build PQ test runtime")
