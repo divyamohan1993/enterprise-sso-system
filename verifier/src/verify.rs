@@ -236,7 +236,7 @@ fn verify_token_core(
         let expected_hash = crypto::dpop::dpop_key_hash(key);
         if !crypto::ct::ct_eq(&token.claims.dpop_hash, &expected_hash) {
             return Err(MilnetError::CryptoVerification(
-                "DPoP key hash mismatch — token bound to different client".into(),
+                "token verification failed".into(),
             ));
         }
     } else if has_dpop_hash {
@@ -461,7 +461,7 @@ pub fn verify_token_with_dpop(
     let expected_hash = crypto::dpop::dpop_key_hash(client_dpop_key);
     if !crypto::ct::ct_eq(&token.claims.dpop_hash, &expected_hash) {
         return Err(MilnetError::CryptoVerification(
-            "DPoP key hash mismatch — token bound to different client".into(),
+            "token verification failed".into(),
         ));
     }
 

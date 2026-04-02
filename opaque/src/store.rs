@@ -65,11 +65,20 @@ impl CredentialStore {
 
     /// Create a credential store with a provided ServerSetup (for testing or
     /// when restoring from persistent storage).
+    ///
+    /// If FIPS mode is active, automatically initializes the FIPS server setup
+    /// to prevent KSF mismatch between registration and login flows.
     pub fn with_server_setup(server_setup: ServerSetup<OpaqueCs>) -> Self {
+        let server_setup_fips = if common::fips::is_fips_mode() {
+            let mut rng = OsRng;
+            Some(ServerSetup::<OpaqueCsFips>::new(&mut rng))
+        } else {
+            None
+        };
         Self {
             users: HashMap::new(),
             server_setup,
-            server_setup_fips: None,
+            server_setup_fips,
         }
     }
 

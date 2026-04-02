@@ -189,8 +189,14 @@ async fn main() {
         tracing::info!("Restored and decrypted OPAQUE ServerSetup from database");
         opaque::store::CredentialStore::with_server_setup(server_setup)
     } else {
-        // First run — create new ServerSetup, encrypt, and persist it
-        let store = opaque::store::CredentialStore::new();
+        // First run — create new ServerSetup, encrypt, and persist it.
+        // Use dual mode if FIPS is active so both Argon2id and PBKDF2-SHA512
+        // cipher suites are available from the start (prevents KSF mismatch).
+        let store = if common::fips::is_fips_mode() {
+            opaque::store::CredentialStore::new_dual()
+        } else {
+            opaque::store::CredentialStore::new()
+        };
         let setup_bytes: Vec<u8> = store.server_setup().serialize().to_vec();
         let encrypted_bytes = {
             use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
