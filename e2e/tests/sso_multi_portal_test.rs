@@ -58,6 +58,17 @@ fn test_pq_vk() -> &'static PqVerifyingKey { &TEST_PQ_KEYPAIR.1 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
+/// Build a tokio runtime with 8 MiB worker thread stacks for ML-DSA-87
+/// operations that overflow the default 2 MiB stack.
+fn build_pq_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("build PQ test runtime")
+}
+
 fn now_us() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -401,8 +412,10 @@ fn make_claims(user_id: Uuid, tier: u8, scope: u32, ttl_secs: u64) -> TokenClaim
 // Part 1: SSO Proof — Login Once, Access Multiple Services
 // ════════════════════════════════════════════════════════════════════════
 
-#[tokio::test]
-async fn test_sso_single_login_multiple_portals() {
+#[test]
+fn test_sso_single_login_multiple_portals() {
+    let rt = build_pq_runtime();
+    rt.block_on(async {
     let _pq_vk = test_pq_vk();
     // 1. Boot full auth system
     let mut store = CredentialStore::new();
@@ -442,10 +455,13 @@ async fn test_sso_single_login_multiple_portals() {
 
     // 5. Authenticated ONCE, accessed 5 services
     assert_eq!(access_count, 5, "must access all 5 portals with single token");
+    });
 }
 
-#[tokio::test]
-async fn test_sso_token_works_across_independent_verifiers() {
+#[test]
+fn test_sso_token_works_across_independent_verifiers() {
+    let rt = build_pq_runtime();
+    rt.block_on(async {
     // 1. Run DKG, get group key, distribute shares
     let mut dkg_result = dkg(5, 3);
     let group_key = dkg_result.group.public_key_package.clone();
@@ -474,10 +490,13 @@ async fn test_sso_token_works_across_independent_verifiers() {
             result.err()
         );
     }
+    });
 }
 
-#[tokio::test]
-async fn test_sso_different_users_different_tokens_same_portals() {
+#[test]
+fn test_sso_different_users_different_tokens_same_portals() {
+    let rt = build_pq_runtime();
+    rt.block_on(async {
     let _pq_vk = test_pq_vk();
     // 1. Register alice and bob
     let mut store = CredentialStore::new();
@@ -512,14 +531,17 @@ async fn test_sso_different_users_different_tokens_same_portals() {
         token_alice.frost_signature, token_bob.frost_signature,
         "different users must have different signatures"
     );
+    });
 }
 
 // ════════════════════════════════════════════════════════════════════════
 // Part 2: Scope-Based Access Control
 // ════════════════════════════════════════════════════════════════════════
 
-#[tokio::test]
-async fn test_sso_scope_restricts_portal_access() {
+#[test]
+fn test_sso_scope_restricts_portal_access() {
+    let rt = build_pq_runtime();
+    rt.block_on(async {
     let mut dkg_result = dkg(5, 3);
     let group_key = dkg_result.group.public_key_package.clone();
     let pq_vk = test_pq_vk();
@@ -544,10 +566,13 @@ async fn test_sso_scope_restricts_portal_access() {
         result.unwrap_err().contains("insufficient scope"),
         "error should mention scope"
     );
+    });
 }
 
-#[tokio::test]
-async fn test_sso_tier_restricts_portal_access() {
+#[test]
+fn test_sso_tier_restricts_portal_access() {
+    let rt = build_pq_runtime();
+    rt.block_on(async {
     let mut dkg_result = dkg(5, 3);
     let group_key = dkg_result.group.public_key_package.clone();
     let pq_vk = test_pq_vk();
@@ -574,14 +599,17 @@ async fn test_sso_tier_restricts_portal_access() {
         result.unwrap_err().contains("insufficient tier"),
         "error should mention tier"
     );
+    });
 }
 
 // ════════════════════════════════════════════════════════════════════════
 // Part 3: Cross-Portal Attack Simulation
 // ════════════════════════════════════════════════════════════════════════
 
-#[tokio::test]
-async fn test_attack_stolen_token_used_at_different_portal() {
+#[test]
+fn test_attack_stolen_token_used_at_different_portal() {
+    let rt = build_pq_runtime();
+    rt.block_on(async {
     let _pq_vk = test_pq_vk();
     // Get token for alice via full ceremony
     let mut store = CredentialStore::new();
@@ -612,10 +640,13 @@ async fn test_attack_stolen_token_used_at_different_portal() {
         stolen_result.is_err(),
         "stolen token must be rejected when presented without correct DPoP key"
     );
+    });
 }
 
-#[tokio::test]
-async fn test_attack_forged_scope_escalation() {
+#[test]
+fn test_attack_forged_scope_escalation() {
+    let rt = build_pq_runtime();
+    rt.block_on(async {
     let mut dkg_result = dkg(5, 3);
     let group_key = dkg_result.group.public_key_package.clone();
     let pq_vk = test_pq_vk();
@@ -645,10 +676,13 @@ async fn test_attack_forged_scope_escalation() {
         },
         "rejection must be due to crypto verification failure"
     );
+    });
 }
 
-#[tokio::test]
-async fn test_attack_forged_tier_escalation() {
+#[test]
+fn test_attack_forged_tier_escalation() {
+    let rt = build_pq_runtime();
+    rt.block_on(async {
     let mut dkg_result = dkg(5, 3);
     let group_key = dkg_result.group.public_key_package.clone();
     let pq_vk = test_pq_vk();
@@ -670,10 +704,13 @@ async fn test_attack_forged_tier_escalation() {
         result.is_err(),
         "forged tier escalation must be rejected"
     );
+    });
 }
 
-#[tokio::test]
-async fn test_attack_expired_token_at_portal() {
+#[test]
+fn test_attack_expired_token_at_portal() {
+    let rt = build_pq_runtime();
+    rt.block_on(async {
     let mut dkg_result = dkg(5, 3);
     let group_key = dkg_result.group.public_key_package.clone();
     let pq_vk = test_pq_vk();
@@ -705,10 +742,13 @@ async fn test_attack_expired_token_at_portal() {
         result.unwrap_err().contains("token validation failed"),
         "error should indicate validation failure"
     );
+    });
 }
 
-#[tokio::test]
-async fn test_attack_token_from_rogue_sso_server() {
+#[test]
+fn test_attack_token_from_rogue_sso_server() {
+    let rt = build_pq_runtime();
+    rt.block_on(async {
     let pq_vk = test_pq_vk();
     // Real SSO server DKG
     let real_dkg = dkg(5, 3);
@@ -731,10 +771,13 @@ async fn test_attack_token_from_rogue_sso_server() {
         "token from rogue SSO server must be rejected"
     );
     // Proves: portal cryptographically binds to its trusted SSO server
+    });
 }
 
-#[tokio::test]
-async fn test_attack_replay_same_token_after_ratchet_advance() {
+#[test]
+fn test_attack_replay_same_token_after_ratchet_advance() {
+    let rt = build_pq_runtime();
+    rt.block_on(async {
     // Create a ratchet chain and generate a tag at epoch 0
     let master_secret = [0x55u8; 64];
     let mut chain = RatchetChain::new(&master_secret).unwrap();
@@ -765,10 +808,13 @@ async fn test_attack_replay_same_token_after_ratchet_advance() {
     let tag_epoch_5 = chain.generate_tag(claims_bytes).unwrap();
     let valid_current = chain.verify_tag(claims_bytes, &tag_epoch_5, 5).unwrap();
     assert!(valid_current, "current epoch tag should verify");
+    });
 }
 
-#[tokio::test]
-async fn test_attack_man_in_middle_modifies_token_in_transit() {
+#[test]
+fn test_attack_man_in_middle_modifies_token_in_transit() {
+    let rt = build_pq_runtime();
+    rt.block_on(async {
     let mut dkg_result = dkg(5, 3);
     let group_key = dkg_result.group.public_key_package.clone();
     let pq_vk = test_pq_vk();
@@ -802,10 +848,13 @@ async fn test_attack_man_in_middle_modifies_token_in_transit() {
             // Deserialization failure is also a valid rejection
         }
     }
+    });
 }
 
-#[tokio::test]
-async fn test_attack_null_token_at_portal() {
+#[test]
+fn test_attack_null_token_at_portal() {
+    let rt = build_pq_runtime();
+    rt.block_on(async {
     let dkg_result = dkg(5, 3);
     let group_key = dkg_result.group.public_key_package.clone();
 
@@ -822,10 +871,13 @@ async fn test_attack_null_token_at_portal() {
     // If somehow it deserializes, portal must still reject
     // (this is just defense-in-depth, not expected to succeed above)
     let _ = group_key; // used above conceptually
+    });
 }
 
-#[tokio::test]
-async fn test_attack_oversized_token_at_portal() {
+#[test]
+fn test_attack_oversized_token_at_portal() {
+    let rt = build_pq_runtime();
+    rt.block_on(async {
     let dkg_result = dkg(5, 3);
     let _group_key = dkg_result.group.public_key_package.clone();
 
@@ -836,14 +888,17 @@ async fn test_attack_oversized_token_at_portal() {
         result.is_err(),
         "oversized payload must fail deserialization, not OOM"
     );
+    });
 }
 
 // ════════════════════════════════════════════════════════════════════════
 // Part 4: Multi-User Session Isolation
 // ════════════════════════════════════════════════════════════════════════
 
-#[tokio::test]
-async fn test_sso_sessions_are_isolated() {
+#[test]
+fn test_sso_sessions_are_isolated() {
+    let rt = build_pq_runtime();
+    rt.block_on(async {
     // alice and bob both have active ratchet sessions
     let alice_secret = [0x11u8; 64];
     let bob_secret = [0x22u8; 64];
@@ -878,10 +933,13 @@ async fn test_sso_sessions_are_isolated() {
         !cross_verify2,
         "bob's tag must not verify against alice's chain"
     );
+    });
 }
 
-#[tokio::test]
-async fn test_sso_concurrent_portal_access() {
+#[test]
+fn test_sso_concurrent_portal_access() {
+    let rt = build_pq_runtime();
+    rt.block_on(async {
     // Setup: DKG and 5 users
     let mut dkg_result = dkg(5, 3);
     let group_key = dkg_result.group.public_key_package.clone();
@@ -951,4 +1009,5 @@ async fn test_sso_concurrent_portal_access() {
     let subs: Vec<Uuid> = tokens.iter().map(|t| t.claims.sub).collect();
     let unique_subs: std::collections::HashSet<Uuid> = subs.iter().copied().collect();
     assert_eq!(unique_subs.len(), 5, "all user identities must be distinct");
+    });
 }
