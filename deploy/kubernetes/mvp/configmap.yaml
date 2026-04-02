@@ -4,9 +4,7 @@ metadata:
   name: milnet-common-config
   namespace: milnet
 data:
-  # Dev mode — relaxes production security requirements
-  MILNET_DEV_MODE: "1"
-  MILNET_PRODUCTION: "0"
+  MILNET_PRODUCTION: "1"
   MILNET_MILITARY_DEPLOYMENT: "0"
   MILNET_FIPS_MODE: "0"
   MILNET_PQ_TLS_ONLY: "0"

@@ -118,30 +118,6 @@ fn ct_eq_one_empty() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn dev_mode_env_var_has_no_effect_on_production_checks() {
-    // Set the dev mode env var — it MUST have no effect.
-    // is_production() unconditionally returns true.
-    std::env::set_var("MILNET_DEV_MODE", "1");
-    assert!(
-        common::sealed_keys::is_production(),
-        "is_production() must return true even with MILNET_DEV_MODE=1"
-    );
-
-    std::env::set_var("MILNET_DEV_MODE", "true");
-    assert!(
-        common::sealed_keys::is_production(),
-        "is_production() must return true even with MILNET_DEV_MODE=true"
-    );
-
-    // Clean up
-    std::env::remove_var("MILNET_DEV_MODE");
-    assert!(
-        common::sealed_keys::is_production(),
-        "is_production() must return true with no env var"
-    );
-}
-
-#[test]
 fn platform_integrity_always_runs() {
     // PlatformIntegrityMonitor can always be constructed — platform checks
     // are never skippable. The monitor's run_checks method executes real

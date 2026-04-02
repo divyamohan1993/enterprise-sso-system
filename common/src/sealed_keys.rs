@@ -957,10 +957,9 @@ mod tests {
     }
 
     #[test]
-    fn is_production_true_by_default() {
-        // Without MILNET_DEV_MODE=1, production mode is the default
-        std::env::remove_var("MILNET_DEV_MODE");
-        assert!(is_production(), "is_production() must return true by default");
+    fn is_production_always_true() {
+        // Production mode is unconditionally active
+        assert!(is_production(), "is_production() must always return true");
     }
 
     #[test]

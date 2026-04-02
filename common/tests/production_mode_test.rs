@@ -1,19 +1,15 @@
-//! Tests that production mode is active by default but can be overridden
-//! with MILNET_DEV_MODE=1 for testing/MVP deployments.
+//! Tests that production mode is unconditionally active.
 
 #[test]
-fn test_is_production_true_by_default() {
-    std::env::remove_var("MILNET_DEV_MODE");
+fn test_is_production_always_true() {
     assert!(
         common::sealed_keys::is_production(),
-        "is_production() must return true by default"
+        "is_production() must always return true"
     );
 }
 
 #[test]
 fn test_is_production_ignores_milnet_production_env() {
-    // MILNET_PRODUCTION env var does not control is_production(); only MILNET_DEV_MODE does.
-    std::env::remove_var("MILNET_DEV_MODE");
     std::env::remove_var("MILNET_PRODUCTION");
     assert!(
         common::sealed_keys::is_production(),

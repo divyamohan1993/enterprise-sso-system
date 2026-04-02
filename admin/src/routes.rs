@@ -4015,7 +4015,7 @@ struct ErrorLevelRequest {
     #[serde(default)]
     log_level: Option<String>,
     /// HMAC-SHA512 activation proof (hex-encoded, 128 chars).
-    /// Required when MILNET_DEV_MODE_KEY is configured.
+    /// Required when activation key is configured.
     #[serde(default)]
     activation_proof: Option<String>,
     /// ID of an approved ErrorLevelToggle ceremony action.

@@ -4,7 +4,7 @@
 
 **Goal:** Deploy the entire MILNET SSO system on a single c2-standard-8 VM using k3s, with Prometheus + Grafana monitoring and an nginx index page, to verify inter-service connectivity.
 
-**Architecture:** Single-node k3s cluster. All services run as single-replica pods in dev mode (MILNET_DEV_MODE=1). Docker builds images locally, k3s imports them. Nginx reverse-proxies port 80 to an index page with links to all services.
+**Architecture:** Single-node k3s cluster. All services run as single-replica pods. Docker builds images locally, k3s imports them. Nginx reverse-proxies port 80 to an index page with links to all services.
 
 **Tech Stack:** k3s, Docker, Helm (kube-prometheus-stack), nginx, PostgreSQL 16
 
@@ -33,7 +33,6 @@
 
 Key differences from production manifests:
 - All replicas: 1 (except TSS signers: 3 for 2-of-3 threshold)
-- MILNET_DEV_MODE=1
 - No pod anti-affinity (single node)
 - Relaxed resource requests (100m CPU, 128Mi memory)
 - Self-signed TLS certs generated at deploy time

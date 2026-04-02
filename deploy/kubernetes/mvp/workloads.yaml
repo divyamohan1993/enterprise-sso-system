@@ -1,5 +1,4 @@
-# MILNET SSO — MVP Workloads (all single-replica, dev mode)
-# All services use MILNET_DEV_MODE=1 which relaxes TLS/crypto requirements.
+# MILNET SSO — MVP Workloads (all single-replica)
 ---
 # ── Gateway ──────────────────────────────────────────────────────────────────
 apiVersion: apps/v1
