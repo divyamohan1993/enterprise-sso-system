@@ -760,6 +760,7 @@ mod tests {
             iss: "https://accounts.google.com".into(),
             aud: "my-client-id".into(),
             exp: future_exp,
+            nonce: None,
         };
         assert!(verify_google_id_token(&claims, "my-client-id").is_ok());
     }
@@ -780,6 +781,7 @@ mod tests {
             iss: "https://evil.com".into(),
             aud: "my-client-id".into(),
             exp: future_exp,
+            nonce: None,
         };
         assert!(verify_google_id_token(&claims, "my-client-id").is_err());
     }
@@ -800,6 +802,7 @@ mod tests {
             iss: "https://accounts.google.com".into(),
             aud: "my-client-id".into(),
             exp: future_exp,
+            nonce: None,
         };
         assert!(verify_google_id_token(&claims, "my-client-id").is_err());
     }
