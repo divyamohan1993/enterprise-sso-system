@@ -185,11 +185,12 @@ impl ConsistentHashRing {
 
 /// Verify an ML-DSA-87 node certificate against the cluster CA key.
 fn verify_node_certificate(node_id: &str, signature: &[u8], ca_key_bytes: &[u8]) -> bool {
-    use ml_dsa::{signature::Verifier, MlDsa87, VerifyingKey};
-    let vk = match VerifyingKey::<MlDsa87>::try_from(ca_key_bytes) {
-        Ok(k) => k,
+    use ml_dsa::{signature::Verifier, EncodedVerifyingKey, MlDsa87, VerifyingKey};
+    let vk_enc = match EncodedVerifyingKey::<MlDsa87>::try_from(ca_key_bytes) {
+        Ok(e) => e,
         Err(_) => return false,
     };
+    let vk = VerifyingKey::<MlDsa87>::decode(&vk_enc);
     let sig = match ml_dsa::Signature::<MlDsa87>::try_from(signature) {
         Ok(s) => s,
         Err(_) => return false,

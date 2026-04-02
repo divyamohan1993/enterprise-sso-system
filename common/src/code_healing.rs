@@ -473,13 +473,14 @@ impl CodeHealer {
 fn verify_ml_dsa_signature(pk_bytes: &[u8], data: &[u8], sig_bytes: &[u8]) -> bool {
     use ml_dsa::{
         signature::Verifier,
-        MlDsa87, Signature, VerifyingKey,
+        EncodedVerifyingKey, MlDsa87, Signature, VerifyingKey,
     };
 
-    let vk = match VerifyingKey::<MlDsa87>::try_from(pk_bytes) {
-        Ok(k) => k,
+    let vk_enc = match EncodedVerifyingKey::<MlDsa87>::try_from(pk_bytes) {
+        Ok(e) => e,
         Err(_) => return false,
     };
+    let vk = VerifyingKey::<MlDsa87>::decode(&vk_enc);
 
     let sig = match Signature::<MlDsa87>::try_from(sig_bytes) {
         Ok(s) => s,

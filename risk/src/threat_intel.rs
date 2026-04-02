@@ -502,10 +502,10 @@ impl ThreatIntelManager {
             return false;
         };
 
-        use ml_dsa::{signature::Verifier, MlDsa87, VerifyingKey};
+        use ml_dsa::{signature::Verifier, EncodedVerifyingKey, MlDsa87, VerifyingKey};
 
-        let vk = match VerifyingKey::<MlDsa87>::try_from(verify_key_bytes.as_slice()) {
-            Ok(vk) => vk,
+        let vk_enc = match EncodedVerifyingKey::<MlDsa87>::try_from(verify_key_bytes.as_slice()) {
+            Ok(e) => e,
             Err(_) => {
                 tracing::error!(
                     target: "threat_intel",
@@ -514,6 +514,7 @@ impl ThreatIntelManager {
                 return false;
             }
         };
+        let vk = VerifyingKey::<MlDsa87>::decode(&vk_enc);
 
         match ml_dsa::Signature::<MlDsa87>::try_from(signature) {
             Ok(sig) => vk.verify(data, &sig).is_ok(),

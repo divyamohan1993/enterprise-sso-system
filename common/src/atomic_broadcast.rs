@@ -337,9 +337,9 @@ fn verify_ack_signature(
     signature: &[u8],
     verifying_key_bytes: &[u8],
 ) -> bool {
-    use ml_dsa::{signature::Verifier, MlDsa87, VerifyingKey};
-    let vk = match VerifyingKey::<MlDsa87>::try_from(verifying_key_bytes) {
-        Ok(k) => k,
+    use ml_dsa::{signature::Verifier, EncodedVerifyingKey, MlDsa87, VerifyingKey};
+    let vk_enc = match EncodedVerifyingKey::<MlDsa87>::try_from(verifying_key_bytes) {
+        Ok(e) => e,
         Err(e) => {
             tracing::error!(
                 node_id = node_id,
@@ -349,6 +349,7 @@ fn verify_ack_signature(
             return false;
         }
     };
+    let vk = VerifyingKey::<MlDsa87>::decode(&vk_enc);
     let sig = match ml_dsa::Signature::<MlDsa87>::try_from(signature) {
         Ok(s) => s,
         Err(e) => {

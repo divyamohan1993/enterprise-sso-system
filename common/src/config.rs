@@ -389,7 +389,7 @@ impl SecurityConfig {
 
 impl Default for SecurityConfig {
     fn default() -> Self {
-        let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1");
+        let _is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1");
         Self {
             error_level: ErrorLevel::Warn,
             max_session_lifetime_secs: 28800,

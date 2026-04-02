@@ -468,7 +468,7 @@ impl StealthDetector {
     }
 
     /// Read /proc/self/status, check VmLck field for locked memory.
-    fn check_memory_protection(&self) -> DetectionEvent {
+    fn check_memory_protection(&mut self) -> DetectionEvent {
         let now = Instant::now();
         match std::fs::read_to_string("/proc/self/status") {
             Ok(status) => {
