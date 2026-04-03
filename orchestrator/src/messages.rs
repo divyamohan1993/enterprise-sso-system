@@ -47,6 +47,12 @@ pub struct OrchestratorRequest {
     pub unusual_access_score: Option<f64>,
     #[serde(default)]
     pub recent_failed_attempts: Option<u32>,
+    /// Device fingerprint for anomaly detection (browser/OS/hardware hash).
+    #[serde(default)]
+    pub device_fingerprint: Option<String>,
+    /// Source IP address for impossible-travel and cross-user correlation.
+    #[serde(default)]
+    pub source_ip: Option<String>,
 }
 
 /// Response from the Orchestrator to the Gateway.
