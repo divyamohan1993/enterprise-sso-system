@@ -138,10 +138,10 @@ fn raft_authenticated_message_round_trip() {
     let transport_key = b"MILNET-RAFT-TRANSPORT-KEY-32BYTE!MILNET-RAFT-TRANSPORT-KEY-32BYTE!";
     let sender = NodeId::random();
     let msg = RaftMessage::RequestVote {
-        term: Term::new(1),
+        term: Term(1),
         candidate_id: sender,
         last_log_index: LogIndex::zero(),
-        last_log_term: Term::new(0),
+        last_log_term: Term(0),
     };
 
     let authenticated = AuthenticatedRaftMessage::sign(msg.clone(), sender, transport_key);
@@ -162,10 +162,10 @@ fn raft_authenticated_message_rejects_wrong_key() {
 
     let sender = NodeId::random();
     let msg = RaftMessage::AppendEntries {
-        term: Term::new(5),
+        term: Term(5),
         leader_id: sender,
         prev_log_index: LogIndex::zero(),
-        prev_log_term: Term::new(4),
+        prev_log_term: Term(4),
         entries: Vec::new(),
         leader_commit: LogIndex::zero(),
     };
@@ -186,14 +186,14 @@ fn raft_authenticated_message_detects_tampering() {
     let transport_key = b"MILNET-RAFT-TRANSPORT-KEY-32BYTE!MILNET-RAFT-TRANSPORT-KEY-32BYTE!";
     let sender = NodeId::random();
     let msg = RaftMessage::RequestVoteResponse {
-        term: Term::new(3),
+        term: Term(3),
         vote_granted: true,
     };
 
     let mut authenticated = AuthenticatedRaftMessage::sign(msg, sender, transport_key);
     // Tamper: flip the vote_granted field
     authenticated.message = RaftMessage::RequestVoteResponse {
-        term: Term::new(3),
+        term: Term(3),
         vote_granted: false,
     };
     let result = authenticated.verify(transport_key);
