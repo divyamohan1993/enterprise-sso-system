@@ -202,14 +202,16 @@ impl AtomicBroadcast {
                     .emit();
                     return Err(format!("ack signature verification failed for {node_id}"));
                 }
+                // Signature verified successfully — fall through to accept.
+            } else {
+                // SECURITY: Reject acks from nodes with no registered key.
+                // A missing key means the node has not completed key enrollment.
+                // Accepting unsigned acks would allow phantom nodes to forge quorum.
+                return Err(format!(
+                    "no verifying key registered for node '{node_id}'; \
+                     ack rejected — register key before participating in broadcast"
+                ));
             }
-            // SECURITY: Reject acks from nodes with no registered key.
-            // A missing key means the node has not completed key enrollment.
-            // Accepting unsigned acks would allow phantom nodes to forge quorum.
-            return Err(format!(
-                "no verifying key registered for node '{node_id}'; \
-                 ack rejected — register key before participating in broadcast"
-            ));
         }
 
         msg.acks.push((node_id.to_string(), signature));
