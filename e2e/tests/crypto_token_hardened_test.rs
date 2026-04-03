@@ -78,6 +78,7 @@ fn random_entropy() -> [u8; 32] {
 /// Verify legacy format (no tag) is rejected.
 #[test]
 fn crypto_downgrade_aegis_default_non_fips() {
+    let _guard = FIPS_TOGGLE_LOCK.lock().unwrap();
     common::fips::set_fips_mode_unchecked(false);
     assert_eq!(active_algorithm(), SymmetricAlgorithm::Aegis256);
 
