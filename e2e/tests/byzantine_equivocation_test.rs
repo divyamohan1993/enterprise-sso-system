@@ -267,8 +267,12 @@ fn test_verify_consistency_detects_divergence() {
     // attacker with disk access could do.
     //
     // Append a rogue entry directly to node 1's log (bypassing the protocol).
-    // This simulates an attacker who has compromised node 1's disk.
-    let rogue_entry = common::types::AuditEntry {
+    // Use the correct prev_hash so append_raw accepts it, but the content
+    // differs from what other nodes have, creating a length divergence.
+    let node1_last_hash = audit::log::hash_entry(
+        &cluster.nodes[1].log.entries()[cluster.nodes[1].log.len() - 1],
+    );
+    let rogue_entry = AuditEntry {
         event_id: Uuid::new_v4(),
         event_type: AuditEventType::AuthFailure,
         user_ids: vec![Uuid::new_v4()],
@@ -279,14 +283,17 @@ fn test_verify_consistency_detects_divergence() {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_micros() as i64,
-        prev_hash: [0xFFu8; 64], // Deliberately wrong prev_hash
+        prev_hash: node1_last_hash,
         signature: vec![],
         classification: CLASSIFICATION_UNCLASSIFIED,
     };
     // Force-append the rogue entry to node 1's log
-    let _ = cluster.nodes[1].log.append_raw(rogue_entry);
+    cluster.nodes[1]
+        .log
+        .append_raw(rogue_entry)
+        .expect("rogue append with correct prev_hash must succeed");
 
-    // Now node 0 has 1 entry and node 1 has 2 entries with a broken chain.
+    // Now node 0 has 1 entry and node 1 has 2 entries.
     assert!(
         !cluster.verify_consistency(),
         "verify_consistency must return false when honest nodes have different \
