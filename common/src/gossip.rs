@@ -378,6 +378,7 @@ impl GossipProtocol {
                         msg_type: GossipMessageType::Ack { sequence: *sequence },
                         piggyback: self.piggyback_updates(),
                         incarnation,
+                        hmac_signature: Vec::new(),
                     },
                 });
             }
@@ -396,6 +397,7 @@ impl GossipProtocol {
                         msg_type: GossipMessageType::Ping { sequence: *sequence },
                         piggyback: self.piggyback_updates(),
                         incarnation,
+                        hmac_signature: Vec::new(),
                     },
                 });
             }
