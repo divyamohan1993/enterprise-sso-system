@@ -48,8 +48,11 @@ impl std::error::Error for SealError {}
 
 /// 256-bit master key at the root of the key hierarchy.
 ///
-/// Automatically zeroized when dropped. Key bytes are mlocked to prevent
-/// swapping to disk. Heap-allocated via Box to ensure stable address for mlock.
+/// Automatically zeroized when dropped. Callers that store a `MasterKey` at a
+/// stable address (e.g. inside `OnceLock`, `ProtectedKek`, or a long-lived
+/// struct) should call [`mlock_key_bytes`] on the *final* location to prevent
+/// swapping to disk. The constructors intentionally do NOT mlock because the
+/// returned value may be moved, which would invalidate the mlocked address.
 #[derive(Zeroize)]
 pub struct MasterKey {
     bytes: [u8; 32],
@@ -65,16 +68,21 @@ impl Drop for MasterKey {
 
 /// Lock key bytes into RAM (prevent swap) and exclude from core dumps.
 ///
-/// The pointer must be the final heap location of the key material.
-/// Calling this on a stack pointer before moving the struct is a bug.
-fn mlock_key_bytes(ptr: *const u8) {
+/// # Safety contract
+/// The pointer **must** be the final resting location of the key material.
+/// Calling this before the struct is moved is a bug: the move copies the bytes
+/// to a new (unprotected) address and the old (mlocked) region is freed.
+/// Call this only after the key has been placed in its long-lived storage
+/// (e.g. inside a `OnceLock`, `ProtectedKek`, or heap-pinned container).
+pub(crate) fn mlock_key_bytes(ptr: *const u8) {
     unsafe {
         libc::mlock(ptr as *const libc::c_void, 32);
         libc::madvise(ptr as *mut libc::c_void, 32, libc::MADV_DONTDUMP);
     }
 }
 
-/// Unlock previously mlocked key bytes.
+/// Unlock previously mlocked key bytes. Harmless no-op if the region was
+/// never mlocked (the kernel silently ignores munlock on non-locked pages).
 fn munlock_key_bytes(ptr: *const u8) {
     unsafe {
         libc::munlock(ptr as *const libc::c_void, 32);
@@ -82,6 +90,15 @@ fn munlock_key_bytes(ptr: *const u8) {
 }
 
 impl MasterKey {
+    /// Lock the key bytes into RAM at their current address.
+    ///
+    /// Call this **only** after the `MasterKey` has reached its final storage
+    /// location (e.g. inside a `OnceLock`, `ProtectedKek`, or long-lived struct).
+    /// Calling before a move is a bug: the bytes will be copied to a new address.
+    pub fn mlock(&self) {
+        mlock_key_bytes(self.bytes.as_ptr());
+    }
+
     /// Derive a master key from an arbitrary-length seed using HKDF-SHA512.
     ///
     /// The seed should come from a hardware RNG, TPM, or key ceremony.
@@ -95,21 +112,21 @@ impl MasterKey {
         let mut okm = [0u8; 32];
         hk.expand(b"master-key", &mut okm)
             .map_err(|_| SealError::KeyDerivationFailed)?;
-        // Box first to get a stable heap address, then mlock the heap pointer.
-        // mlock on a stack pointer is useless once the struct is moved.
-        let mut boxed = Box::new(Self { bytes: okm });
-        mlock_key_bytes(boxed.bytes.as_ptr());
+        let key = Self { bytes: okm };
         okm.zeroize();
-        Ok(*boxed)
+        // NOTE: mlock is applied by the caller at the final storage location
+        // (e.g. ProtectedKek, OnceLock). Mlocking here is ineffective because
+        // the returned value will be moved, invalidating the address.
+        Ok(key)
     }
 
     /// Construct a master key from raw bytes (caller is responsible for
     /// ensuring the bytes have sufficient entropy).
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
-        // Box first to get a stable heap address, then mlock the heap pointer.
-        let boxed = Box::new(Self { bytes });
-        mlock_key_bytes(boxed.bytes.as_ptr());
-        *boxed
+        // NOTE: mlock is applied by the caller at the final storage location.
+        // The previous Box-then-deref pattern was a bug: the key was mlocked
+        // at a heap address, then moved out, leaving the final location unprotected.
+        Self { bytes }
     }
 
     /// Generate a master key from the OS CSPRNG (`getrandom`).
@@ -135,9 +152,8 @@ impl MasterKey {
         if getrandom::getrandom(&mut bytes).is_err() {
             panic!("FATAL: OS CSPRNG unavailable — cannot generate master key safely");
         }
-        let boxed = Box::new(Self { bytes });
-        mlock_key_bytes(boxed.bytes.as_ptr());
-        *boxed
+        // NOTE: mlock is applied by the caller at the final storage location.
+        Self { bytes }
     }
 
     /// Derive a purpose-specific Key Encryption Key (KEK) from this master key.
@@ -153,10 +169,10 @@ impl MasterKey {
         if hk.expand(&info, &mut okm).is_err() {
             panic!("FATAL: HKDF-SHA512 expand failed for 32-byte KEK derivation");
         }
-        let boxed = Box::new(DerivedKek { bytes: okm });
-        mlock_key_bytes(boxed.bytes.as_ptr());
+        let kek = DerivedKek { bytes: okm };
         okm.zeroize();
-        *boxed
+        // NOTE: mlock deferred to caller's final storage location.
+        kek
     }
 }
 
@@ -167,8 +183,8 @@ impl MasterKey {
 /// A purpose-bound Key Encryption Key derived from the master key.
 ///
 /// Used to seal (wrap) and unseal (unwrap) Data Encryption Keys.
-/// Automatically zeroized when dropped. Key bytes are mlocked to prevent
-/// swapping to disk.
+/// Automatically zeroized when dropped. Call [`DerivedKek::mlock`] after the
+/// value reaches its final storage location to prevent swapping to disk.
 #[derive(Zeroize)]
 pub struct DerivedKek {
     bytes: [u8; 32],
@@ -178,6 +194,16 @@ impl Drop for DerivedKek {
     fn drop(&mut self) {
         munlock_key_bytes(self.bytes.as_ptr());
         self.bytes.zeroize();
+    }
+}
+
+impl DerivedKek {
+    /// Lock the KEK bytes into RAM at their current address.
+    ///
+    /// Call this **only** after the `DerivedKek` has reached its final storage
+    /// location. See [`MasterKey::mlock`] for details.
+    pub fn mlock(&self) {
+        mlock_key_bytes(self.bytes.as_ptr());
     }
 }
 

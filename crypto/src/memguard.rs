@@ -445,12 +445,13 @@ impl SecretVec {
 
     /// Verify head and tail canary integrity using constant-time comparison.
     pub fn verify_canary(&self) -> bool {
+        use subtle::ConstantTimeEq;
         let addr = self.data.as_ptr() as usize;
         let expected_head = derive_canary(addr, 0x03);
         let expected_tail = derive_canary(addr, 0x04);
-        let head_diff = self.canary ^ expected_head;
-        let tail_diff = self.canary_tail ^ expected_tail;
-        (head_diff | tail_diff) == 0
+        let head_ok = self.canary.ct_eq(&expected_head);
+        let tail_ok = self.canary_tail.ct_eq(&expected_tail);
+        (head_ok & tail_ok).into()
     }
 
     /// Borrow the protected data as a byte slice.

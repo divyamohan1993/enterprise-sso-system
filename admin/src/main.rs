@@ -470,16 +470,18 @@ async fn main() {
         );
     }
 
+    // SECURITY: Remove ALL sensitive env vars from /proc/PID/environ IMMEDIATELY
+    // after the last env var read. Secrets must not linger in the process environment
+    // any longer than necessary to prevent leakage via /proc/PID/environ or
+    // child process inheritance.
+    common::startup_checks::sanitize_environment();
+
     // SECURITY: Verify kernel security posture (ptrace_scope, BPF restrictions)
     common::startup_checks::verify_kernel_security_posture();
 
     // SECURITY: Verify process hardening flags and apply anti-ptrace
     crypto::seccomp::apply_anti_ptrace();
     crypto::seccomp::verify_process_hardening();
-
-    // SECURITY: Remove ALL sensitive env vars from /proc/PID/environ.
-    // All config has been loaded above; secrets must not linger in memory.
-    common::startup_checks::sanitize_environment();
 
     let listener = match tokio::net::TcpListener::bind(format!("{bind_addr}:{port}")).await {
         Ok(l) => l,

@@ -74,3 +74,17 @@ pub fn pseudonym_str(tag: &str, value: &str) -> String {
     let result = mac.finalize().into_bytes();
     hex::encode(&result[..16])
 }
+
+/// Produce a hex pseudonym for an IP address (first 16 bytes = 32 hex chars).
+/// Preserves the ability to correlate log entries from the same IP without
+/// exposing the actual address.
+/// CNSA 2.0 Level 5: HMAC-SHA512.
+pub fn pseudonym_ip(ip: &str) -> String {
+    let key = pseudonym_key();
+    let mut mac = HmacSha512::new_from_slice(key)
+        .unwrap_or_else(|_| unreachable!("HMAC-SHA512 accepts any key length"));
+    mac.update(b"ip:");
+    mac.update(ip.as_bytes());
+    let result = mac.finalize().into_bytes();
+    hex::encode(&result[..16])
+}

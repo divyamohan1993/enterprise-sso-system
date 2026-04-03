@@ -50,6 +50,9 @@ pub struct AuditNode {
     pub peer_epochs: HashMap<usize, u64>,
     /// Per-node response times for Byzantine detection (in microseconds).
     response_times: HashMap<usize, Vec<u64>>,
+    /// Optional ML-DSA-87 verifying key for proposer signature verification.
+    /// When set, `accept_entry` rejects entries with missing or invalid signatures.
+    pq_verifying_key: Option<pq_sign::PqVerifyingKey>,
 }
 
 impl AuditNode {
@@ -63,6 +66,22 @@ impl AuditNode {
             last_seen: HashMap::new(),
             peer_epochs: HashMap::new(),
             response_times: HashMap::new(),
+            pq_verifying_key: None,
+        }
+    }
+
+    /// Create a node with an ML-DSA-87 verifying key for proposer signature verification.
+    pub fn new_with_verifying_key(node_id: u8, verifying_key: pq_sign::PqVerifyingKey) -> Self {
+        Self {
+            node_id,
+            log: AuditLog::new(),
+            is_byzantine: false,
+            persistence_path: None,
+            epoch: 0,
+            last_seen: HashMap::new(),
+            peer_epochs: HashMap::new(),
+            response_times: HashMap::new(),
+            pq_verifying_key: Some(verifying_key),
         }
     }
 
@@ -109,13 +128,16 @@ impl AuditNode {
             last_seen: HashMap::new(),
             peer_epochs: HashMap::new(),
             response_times: HashMap::new(),
+            pq_verifying_key: None,
         }
     }
 
     /// Accept an entry proposal. Returns the entry hash if accepted.
     ///
-    /// Before accepting, checks that the proposer epoch is not stale
-    /// (i.e., the proposer's epoch must be >= our own epoch).
+    /// Before accepting, checks that:
+    /// 1. The proposer epoch is not stale (>= our own epoch).
+    /// 2. The entry's prev_hash matches our chain tip.
+    /// 3. The entry's ML-DSA-87 signature is valid (when a verifying key is configured).
     pub fn accept_entry(&mut self, entry: &AuditEntry, proposer_epoch: u64) -> Option<[u8; 64]> {
         if self.is_byzantine {
             return None; // Byzantine node refuses
@@ -128,6 +150,26 @@ impl AuditNode {
                 self.node_id, proposer_epoch, self.epoch
             );
             return None;
+        }
+
+        // SECURITY: Verify proposer's ML-DSA-87 signature on the entry.
+        // Without this check, any node could inject unsigned entries into the chain.
+        if let Some(ref vk) = self.pq_verifying_key {
+            if entry.signature.is_empty() {
+                tracing::warn!(
+                    "BFT node {}: rejecting unsigned entry (event_id={})",
+                    self.node_id, entry.event_id
+                );
+                return None;
+            }
+            let entry_hash = hash_entry(entry);
+            if !pq_sign::pq_verify_raw(vk, &entry_hash, &entry.signature) {
+                tracing::warn!(
+                    "BFT node {}: rejecting entry with invalid proposer signature (event_id={})",
+                    self.node_id, entry.event_id
+                );
+                return None;
+            }
         }
 
         // Verify the entry's prev_hash matches our last hash
@@ -232,8 +274,10 @@ pub struct BftAuditCluster {
     pub nodes: Vec<AuditNode>,
     /// Minimum number of nodes that must accept for an entry to be committed.
     pub quorum_size: usize,
-    /// Optional ML-DSA-65 signing key for signing audit entries.
+    /// Optional ML-DSA-87 signing key for signing audit entries.
     pq_signing_key: Option<pq_sign::PqSigningKey>,
+    /// Optional ML-DSA-87 verifying key (derived from signing key) for signature verification.
+    pq_verifying_key: Option<pq_sign::PqVerifyingKey>,
     /// Maximum Byzantine faults tolerated.
     f: usize,
     /// Monotonic sequence number for proposer rotation.
@@ -264,6 +308,7 @@ impl BftAuditCluster {
             nodes,
             quorum_size: quorum,
             pq_signing_key: None,
+            pq_verifying_key: None,
             f,
             sequence_number: 0,
             single_process_mode: true,
@@ -287,11 +332,15 @@ impl BftAuditCluster {
 
         let f = (node_count - 1) / 3;
         let quorum = 2 * f + 1;
-        let nodes: Vec<AuditNode> = (0..node_count as u8).map(AuditNode::new).collect();
+        let verifying_key = signing_key.verifying_key().clone();
+        let nodes: Vec<AuditNode> = (0..node_count as u8)
+            .map(|id| AuditNode::new_with_verifying_key(id, verifying_key.clone()))
+            .collect();
         let mut cluster = Self {
             nodes,
             quorum_size: quorum,
             pq_signing_key: Some(signing_key),
+            pq_verifying_key: Some(verifying_key),
             f,
             sequence_number: 0,
             single_process_mode: true,
@@ -322,10 +371,13 @@ impl BftAuditCluster {
 
         let f = (node_count - 1) / 3;
         let quorum = 2 * f + 1;
+        let verifying_key = signing_key.verifying_key().clone();
         let nodes: Vec<AuditNode> = (0..node_count as u8)
             .map(|id| {
                 let path = persistence_dir.join(format!("node_{}.jsonl", id));
-                AuditNode::new_with_persistence(id, path)
+                let mut node = AuditNode::new_with_persistence(id, path);
+                node.pq_verifying_key = Some(verifying_key.clone());
+                node
             })
             .collect();
         check_single_process_military_deployment();
@@ -334,6 +386,7 @@ impl BftAuditCluster {
             nodes,
             quorum_size: quorum,
             pq_signing_key: Some(signing_key),
+            pq_verifying_key: Some(verifying_key),
             f,
             sequence_number: 0,
             single_process_mode: true,

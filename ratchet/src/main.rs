@@ -104,20 +104,25 @@ async fn main() {
             });
 
         // Load KEK from environment (in production, from HSM / sealed storage)
-        let kek = if let Ok(kek_hex) = std::env::var("RATCHET_KEK") {
-            let kek_bytes = match hex::decode(&kek_hex) {
+        use zeroize::Zeroize;
+        let kek = if let Ok(mut kek_hex) = std::env::var("RATCHET_KEK") {
+            let mut kek_bytes = match hex::decode(&kek_hex) {
                 Ok(b) => b,
                 Err(e) => {
+                    kek_hex.zeroize();
                     tracing::error!("FATAL: RATCHET_KEK must be valid hex: {e}");
                     std::process::exit(1);
                 }
             };
+            kek_hex.zeroize();
             if kek_bytes.len() != 32 {
+                kek_bytes.zeroize();
                 tracing::error!("FATAL: RATCHET_KEK must be exactly 32 bytes (64 hex chars), got {} bytes", kek_bytes.len());
                 std::process::exit(1);
             }
             let mut k = [0u8; 32];
             k.copy_from_slice(&kek_bytes);
+            kek_bytes.zeroize();
             k
         } else {
             tracing::error!("FATAL: RATCHET_KEK must be set in distributed HA mode (64 hex chars = 32 bytes)");
@@ -151,6 +156,13 @@ async fn main() {
     let addr = std::env::var("MILNET_RATCHET_LISTEN_ADDR")
         .or_else(|_| std::env::var("RATCHET_ADDR"))
         .unwrap_or_else(|_| "127.0.0.1:9105".to_string());
+
+    // SECURITY: Remove ALL sensitive env vars from /proc/PID/environ IMMEDIATELY
+    // after the last env var read. Secrets must not linger in the process environment
+    // any longer than necessary to prevent leakage via /proc/PID/environ or
+    // child process inheritance.
+    common::startup_checks::sanitize_environment();
+
     let hmac_key = crypto::entropy::generate_key_64();
     let (listener, _ca, _cert_key) =
         match shard::tls_transport::tls_bind(&addr, common::types::ModuleId::Ratchet, hmac_key, "ratchet")
@@ -169,10 +181,6 @@ async fn main() {
     // SECURITY: Verify process hardening flags and apply anti-ptrace
     crypto::seccomp::apply_anti_ptrace();
     crypto::seccomp::verify_process_hardening();
-
-    // SECURITY: Remove ALL sensitive env vars from /proc/PID/environ.
-    // All config has been loaded above; secrets must not linger in memory.
-    common::startup_checks::sanitize_environment();
 
     tracing::info!("Ratchet Session Manager listening on {addr} (mTLS)");
 

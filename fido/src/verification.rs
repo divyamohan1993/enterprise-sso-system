@@ -394,9 +394,10 @@ impl<'a> CborReader<'a> {
                 Some(val as i64)
             }
             1 => {
-                // Negative integer: -1 - val
+                // Negative integer: -1 - val (CBOR encoding)
                 let val = self.read_uint_arg(additional)?;
-                Some(-1 - val as i64)
+                let val_i64 = i64::try_from(val).ok()?;
+                Some(-1i64.checked_sub(val_i64)?)
             }
             _ => None,
         }

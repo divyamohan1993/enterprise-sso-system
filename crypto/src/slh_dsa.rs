@@ -24,16 +24,16 @@
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-/// Number of FORS trees (FIPS 205 SLH-DSA-SHA2-256f: k=33).
-const FORS_K: usize = 33;
-/// Height of each FORS tree (FIPS 205 SLH-DSA-SHA2-256f: a=8).
-const FORS_A: usize = 8;
-/// Total hypertree height (FIPS 205 SLH-DSA-SHA2-256f: h=66).
-const HYPERTREE_H: usize = 66;
-/// Number of layers in the hypertree (FIPS 205 SLH-DSA-SHA2-256f: d=22).
-const HYPERTREE_D: usize = 22;
-/// Height of each XMSS tree within a layer (h' = H/D = 66/22 = 3).
-const XMSS_HEIGHT: usize = HYPERTREE_H / HYPERTREE_D; // 3
+/// Number of FORS trees (FIPS 205 SLH-DSA-SHA2-256f: k=35).
+const FORS_K: usize = 35;
+/// Height of each FORS tree (FIPS 205 SLH-DSA-SHA2-256f: a=9).
+const FORS_A: usize = 9;
+/// Total hypertree height (FIPS 205 SLH-DSA-SHA2-256f: h=68).
+const HYPERTREE_H: usize = 68;
+/// Number of layers in the hypertree (FIPS 205 SLH-DSA-SHA2-256f: d=17).
+const HYPERTREE_D: usize = 17;
+/// Height of each XMSS tree within a layer (h' = H/D = 68/17 = 4).
+const XMSS_HEIGHT: usize = HYPERTREE_H / HYPERTREE_D; // 4
 /// Security parameter n in bytes.
 const N: usize = 32;
 /// Winternitz parameter w = 16 (log2(w) = 4).
@@ -45,13 +45,13 @@ const WOTS_LEN1: usize = 64;
 const WOTS_LEN2: usize = 3;
 const WOTS_LEN: usize = WOTS_LEN1 + WOTS_LEN2;
 
-/// FORS signature size: K * (A * N + N) = 33 * (8*32 + 32) = 33 * 288 = 9504
+/// FORS signature size: K * (A * N + N) = 35 * (9*32 + 32) = 35 * 320 = 11200
 const FORS_SIG_SIZE: usize = FORS_K * ((FORS_A * N) + N);
 /// WOTS+ signature size: LEN * N = 67 * 32 = 2144
 const WOTS_SIG_SIZE: usize = WOTS_LEN * N;
-/// XMSS signature size: WOTS sig + h' * N = 2144 + 3*32 = 2240
+/// XMSS signature size: WOTS sig + h' * N = 2144 + 4*32 = 2272
 const XMSS_SIG_SIZE: usize = WOTS_SIG_SIZE + XMSS_HEIGHT * N;
-/// Hypertree signature size: D * XMSS_SIG_SIZE = 22 * 2240 = 49280
+/// Hypertree signature size: D * XMSS_SIG_SIZE = 17 * 2272 = 38624
 const HT_SIG_SIZE: usize = HYPERTREE_D * XMSS_SIG_SIZE;
 /// Total SLH-DSA signature size: randomizer(N) + FORS sig + HT sig
 /// FIPS 205 SLH-DSA-SHA2-256f: 49,856 bytes

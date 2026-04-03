@@ -45,11 +45,17 @@ pub fn prepare_claims_with_audience(
 /// the purpose of threshold cryptography.  Use [`build_token_distributed`]
 /// instead.
 ///
+/// SECURITY: Gated behind `#[cfg(not(feature = "production"))]` to prevent
+/// accidental production use. Co-locating all signer shares in one process
+/// collapses 3-of-5 threshold security to effective 1-of-1. Stripped from
+/// production binaries built with `--features production`.
+///
 /// Steps:
 /// 1. Serialize claims with `FROST_TOKEN` domain prefix.
 /// 2. Compute ratchet tag via HMAC-SHA512 using the provided ratchet key.
 /// 3. Run FROST threshold signing ceremony.
 /// 4. Build the final [`Token`].
+#[cfg(not(feature = "production"))]
 #[deprecated(note = "use build_token_distributed — shares must not be co-located")]
 pub fn build_token(
     claims: &TokenClaims,
@@ -92,7 +98,10 @@ pub fn build_token(
 
 /// Build a threshold-signed token with encrypted claims (monolithic, deprecated).
 ///
+/// SECURITY: Gated behind `#[cfg(not(feature = "production"))]` to prevent
+/// accidental production use. Stripped from production binaries.
 /// See [`build_encrypted_token_distributed`] for the preferred version.
+#[cfg(not(feature = "production"))]
 #[deprecated(note = "use build_encrypted_token_distributed — shares must not be co-located")]
 pub fn build_encrypted_token(
     claims: &TokenClaims,

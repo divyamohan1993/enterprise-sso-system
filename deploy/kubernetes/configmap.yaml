@@ -17,7 +17,7 @@ data:
   MILNET_FIPS_MODE: "1"
   MILNET_PQ_TLS_ONLY: "1"
   # Error level: "verbose" (show file:line, full errors) or "warn" (warnings/errors only)
-  MILNET_ERROR_LEVEL: "verbose"
+  MILNET_ERROR_LEVEL: "standard"
 
   # ── Service discovery (K8s DNS) ──────────────────────────────────────────────
   # Orchestrator uses headless service DNS for Raft peers
@@ -66,4 +66,4 @@ data:
   MILNET_SIEM_ENABLED: "true"
 
   # ── Logging ──────────────────────────────────────────────────────────────────
-  RUST_LOG: "info,milnet=debug"
+  RUST_LOG: "info,milnet=info"

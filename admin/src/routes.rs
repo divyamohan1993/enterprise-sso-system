@@ -1513,7 +1513,7 @@ async fn auth_middleware(
                 {
                     Ok(tier) => tier,
                     Err(e) => {
-                        tracing::warn!("Failed to fetch tier for user {}: {}", user_id, e);
+                        tracing::warn!("Failed to fetch tier for user {}: {}", common::log_pseudonym::pseudonym_uuid(user_id), e);
                         return Err(StatusCode::UNAUTHORIZED);
                     }
                 };
@@ -2796,7 +2796,7 @@ async fn delete_user(
         .bind(user_id)
         .execute(&state.db)
         .await {
-        tracing::error!(error = %e, user_id = %user_id, "CRITICAL: failed to delete recovery codes during user erasure");
+        tracing::error!(error = %e, user_id = %common::log_pseudonym::pseudonym_uuid(user_id), "CRITICAL: failed to delete recovery codes during user erasure");
         common::siem::SecurityEvent::database_operation_failed("delete_user_recovery_codes");
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
@@ -2815,7 +2815,7 @@ async fn delete_user(
         .bind(user_id)
         .execute(&state.db)
         .await {
-        tracing::error!(error = %e, user_id = %user_id, "CRITICAL: failed to delete ratchet sessions during user erasure");
+        tracing::error!(error = %e, user_id = %common::log_pseudonym::pseudonym_uuid(user_id), "CRITICAL: failed to delete ratchet sessions during user erasure");
         common::siem::SecurityEvent::database_operation_failed("delete_user_ratchet_sessions");
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
@@ -2838,7 +2838,7 @@ async fn delete_user(
         &state.pq_signing_key,
     );
 
-    tracing::info!("User {} permanently deleted (GDPR Article 17)", user_id);
+    tracing::info!("User {} permanently deleted (GDPR Article 17)", common::log_pseudonym::pseudonym_uuid(user_id));
 
     Ok(Json(serde_json::json!({
         "deleted": true,
@@ -3877,7 +3877,7 @@ a{color:#00ff41}</style></head><body>
         // registered FIDO2 credentials, they must authenticate via the
         // /api/fido/authenticate/* endpoints before being granted access.
         // Password-only login is insufficient for Tier 1.
-        tracing::warn!("Tier 1 user {user_id} requires FIDO2 authentication (has_credentials={has_fido})");
+        tracing::warn!("Tier 1 user {} requires FIDO2 authentication (has_credentials={})", common::log_pseudonym::pseudonym_uuid(user_id), has_fido);
         return (StatusCode::FORBIDDEN, Html(format!(r#"<!DOCTYPE html>
 <html><head><title>MILNET SSO // FIDO2 Required</title>
 <style>body{{background:#0a0a0a;color:#ff3333;font-family:'JetBrains Mono',monospace;padding:60px;text-align:center}}
@@ -5100,7 +5100,7 @@ async fn fido_register_complete(
     // The challenge must have been issued by fido_register_begin and is single-use.
     // Consuming it here prevents replay attacks.
     if !fido_store.consume_challenge_for_user(&req.user_id) {
-        tracing::warn!("FIDO2 register complete: no pending challenge for user {}", req.user_id);
+        tracing::warn!("FIDO2 register complete: no pending challenge for user {}", common::log_pseudonym::pseudonym_uuid(req.user_id));
         return Err(StatusCode::BAD_REQUEST);
     }
 
@@ -5703,7 +5703,7 @@ async fn recovery_generate(
         .bind(req.user_id)
         .execute(&state.db)
         .await {
-        tracing::error!(error = %e, user_id = %req.user_id, "CRITICAL: failed to revoke existing recovery codes before regeneration");
+        tracing::error!(error = %e, user_id = %common::log_pseudonym::pseudonym_uuid(req.user_id), "CRITICAL: failed to revoke existing recovery codes before regeneration");
         common::siem::SecurityEvent::database_operation_failed("revoke_old_recovery_codes");
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
@@ -5729,7 +5729,7 @@ async fn recovery_generate(
         .bind(expires_at)
         .execute(&state.db)
         .await {
-            tracing::error!(error = %e, user_id = %req.user_id, "CRITICAL: failed to insert recovery code into database");
+            tracing::error!(error = %e, user_id = %common::log_pseudonym::pseudonym_uuid(req.user_id), "CRITICAL: failed to insert recovery code into database");
             common::siem::SecurityEvent::database_operation_failed("insert_recovery_code");
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
@@ -6415,12 +6415,13 @@ async fn cac_enroll(
     // SIEM audit: enrollment is a sensitive operation
     common::siem::SecurityEvent::key_rotation(&format!(
         "cac_enroll: user_id={} card_serial={}",
-        body.user_id, body.card_serial
+        common::log_pseudonym::pseudonym_uuid(body.user_id),
+        common::log_pseudonym::pseudonym_str("card_serial", &body.card_serial)
     ));
 
     tracing::info!(
-        user_id = %body.user_id,
-        card_serial = %body.card_serial,
+        user_id = %common::log_pseudonym::pseudonym_uuid(body.user_id),
+        card_serial = %common::log_pseudonym::pseudonym_str("card_serial", &body.card_serial),
         "CAC card enrolled via admin API"
     );
 
