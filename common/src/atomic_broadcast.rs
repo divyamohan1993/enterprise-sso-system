@@ -377,9 +377,32 @@ fn verify_ack_signature(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ml_dsa::{MlDsa87, SigningKey, signature::Signer, EncodedSigningKey};
 
-    fn make_sig() -> Vec<u8> {
-        vec![0x01; 64]
+    /// Test keypair: generate an ML-DSA-87 signing key once per test suite.
+    /// Returns (signing_key, verifying_key_bytes).
+    fn make_test_keypair() -> (SigningKey<MlDsa87>, Vec<u8>) {
+        let mut rng = rand::rngs::OsRng;
+        let sk = SigningKey::<MlDsa87>::generate(&mut rng);
+        let vk = sk.verifying_key();
+        let vk_bytes = vk.encode().as_ref().to_vec();
+        (sk, vk_bytes)
+    }
+
+    /// Sign an ack digest with the given signing key, returning the signature bytes.
+    fn sign_ack(sk: &SigningKey<MlDsa87>, ab: &AtomicBroadcast, seq: u64) -> Vec<u8> {
+        let pending = crate::sync::siem_read(&ab.pending, "test::sign_ack");
+        let msg = pending.get(&seq).expect("message must exist for signing");
+        let digest = msg.ack_digest();
+        let sig = sk.sign(&digest);
+        sig.to_bytes().to_vec()
+    }
+
+    /// Register a node's key and return its signing key for producing valid acks.
+    fn register_node(ab: &AtomicBroadcast, node_id: &str) -> SigningKey<MlDsa87> {
+        let (sk, vk_bytes) = make_test_keypair();
+        ab.register_verifying_key(node_id, vk_bytes);
+        sk
     }
 
     #[test]
@@ -396,21 +419,24 @@ mod tests {
     #[test]
     fn deliver_requires_quorum_acks() {
         let ab = AtomicBroadcast::new(3);
+        let sk2 = register_node(&ab, "node-2");
+        let sk3 = register_node(&ab, "node-3");
+        let sk4 = register_node(&ab, "node-4");
         let seq = ab.broadcast(b"hello", "node-1").unwrap();
 
         // No acks yet
         assert!(ab.deliver().is_empty());
 
         // 1 ack — still not enough
-        ab.receive_ack(seq, "node-2", make_sig()).unwrap();
+        ab.receive_ack(seq, "node-2", sign_ack(&sk2, &ab, seq)).unwrap();
         assert!(ab.deliver().is_empty());
 
         // 2 acks — still not enough
-        ab.receive_ack(seq, "node-3", make_sig()).unwrap();
+        ab.receive_ack(seq, "node-3", sign_ack(&sk3, &ab, seq)).unwrap();
         assert!(ab.deliver().is_empty());
 
         // 3 acks — quorum reached
-        ab.receive_ack(seq, "node-4", make_sig()).unwrap();
+        ab.receive_ack(seq, "node-4", sign_ack(&sk4, &ab, seq)).unwrap();
         let delivered = ab.deliver();
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].sequence, seq);
@@ -420,6 +446,7 @@ mod tests {
     #[test]
     fn deliver_respects_total_order() {
         let ab = AtomicBroadcast::new(1);
+        let sk1 = register_node(&ab, "node-1");
 
         // Broadcast 3 messages
         let s1 = ab.broadcast(b"first", "node-1").unwrap();
@@ -427,8 +454,8 @@ mod tests {
         let s3 = ab.broadcast(b"third", "node-1").unwrap();
 
         // Ack in reverse order: s3, s1, s2
-        ab.receive_ack(s3, "node-1", make_sig()).unwrap();
-        ab.receive_ack(s1, "node-1", make_sig()).unwrap();
+        ab.receive_ack(s3, "node-1", sign_ack(&sk1, &ab, s3)).unwrap();
+        ab.receive_ack(s1, "node-1", sign_ack(&sk1, &ab, s1)).unwrap();
 
         // Only s1 can deliver (s2 blocks s3)
         let d1 = ab.deliver();
@@ -436,7 +463,7 @@ mod tests {
         assert_eq!(d1[0].sequence, s1);
 
         // Ack s2
-        ab.receive_ack(s2, "node-1", make_sig()).unwrap();
+        ab.receive_ack(s2, "node-1", sign_ack(&sk1, &ab, s2)).unwrap();
 
         // Now s2 and s3 can deliver in order
         let d2 = ab.deliver();
@@ -448,12 +475,13 @@ mod tests {
     #[test]
     fn deliver_gap_blocks_later_messages() {
         let ab = AtomicBroadcast::new(1);
+        let sk1 = register_node(&ab, "node-1");
 
         let _s1 = ab.broadcast(b"one", "node-1").unwrap();
         let s2 = ab.broadcast(b"two", "node-1").unwrap();
 
         // Only ack s2, not s1
-        ab.receive_ack(s2, "node-1", make_sig()).unwrap();
+        ab.receive_ack(s2, "node-1", sign_ack(&sk1, &ab, s2)).unwrap();
 
         // Cannot deliver s2 because s1 hasn't been delivered yet
         assert!(ab.deliver().is_empty());
@@ -463,10 +491,12 @@ mod tests {
     #[test]
     fn duplicate_ack_rejected() {
         let ab = AtomicBroadcast::new(1);
+        let sk2 = register_node(&ab, "node-2");
         let seq = ab.broadcast(b"msg", "node-1").unwrap();
 
-        ab.receive_ack(seq, "node-2", make_sig()).unwrap();
-        assert!(ab.receive_ack(seq, "node-2", make_sig()).is_err());
+        let sig = sign_ack(&sk2, &ab, seq);
+        ab.receive_ack(seq, "node-2", sig.clone()).unwrap();
+        assert!(ab.receive_ack(seq, "node-2", sig).is_err());
     }
 
     #[test]
@@ -492,8 +522,9 @@ mod tests {
     #[test]
     fn duplicate_payload_rejected_after_delivery() {
         let ab = AtomicBroadcast::new(1);
+        let sk1 = register_node(&ab, "node-1");
         let seq = ab.broadcast(b"delivered-payload", "node-1").unwrap();
-        ab.receive_ack(seq, "node-1", make_sig()).unwrap();
+        ab.receive_ack(seq, "node-1", sign_ack(&sk1, &ab, seq)).unwrap();
         ab.deliver();
 
         // Try to broadcast same payload again
@@ -503,10 +534,11 @@ mod tests {
     #[test]
     fn verify_order_valid() {
         let ab = AtomicBroadcast::new(1);
+        let sk1 = register_node(&ab, "node-1");
 
         for i in 0..5 {
             let seq = ab.broadcast(format!("msg-{i}").as_bytes(), "node-1").unwrap();
-            ab.receive_ack(seq, "node-1", make_sig()).unwrap();
+            ab.receive_ack(seq, "node-1", sign_ack(&sk1, &ab, seq)).unwrap();
         }
         ab.deliver();
 
@@ -596,6 +628,7 @@ mod tests {
     #[test]
     fn delivered_count_and_pending_count() {
         let ab = AtomicBroadcast::new(1);
+        let sk1 = register_node(&ab, "n1");
         assert_eq!(ab.delivered_count(), 0);
         assert_eq!(ab.pending_count(), 0);
 
@@ -603,7 +636,7 @@ mod tests {
         let _s2 = ab.broadcast(b"b", "n1").unwrap();
         assert_eq!(ab.pending_count(), 2);
 
-        ab.receive_ack(s1, "n1", make_sig()).unwrap();
+        ab.receive_ack(s1, "n1", sign_ack(&sk1, &ab, s1)).unwrap();
         ab.deliver();
         assert_eq!(ab.delivered_count(), 1);
         assert_eq!(ab.pending_count(), 1);
@@ -612,9 +645,10 @@ mod tests {
     #[test]
     fn has_ack_from_works() {
         let ab = AtomicBroadcast::new(2);
+        let sk_a = register_node(&ab, "node-a");
         let seq = ab.broadcast(b"test", "sender").unwrap();
 
-        ab.receive_ack(seq, "node-a", make_sig()).unwrap();
+        ab.receive_ack(seq, "node-a", sign_ack(&sk_a, &ab, seq)).unwrap();
 
         let pending = ab.pending.read().unwrap();
         let msg = pending.get(&seq).unwrap();
@@ -625,6 +659,8 @@ mod tests {
     #[test]
     fn large_scale_ordering() {
         let ab = AtomicBroadcast::new(2);
+        let sk1 = register_node(&ab, "n1");
+        let sk2 = register_node(&ab, "n2");
         let node_ids = ["n1", "n2", "n3"];
 
         // Broadcast 100 messages
@@ -637,8 +673,8 @@ mod tests {
 
         // Ack all from 2 nodes (quorum)
         for &seq in &sequences {
-            ab.receive_ack(seq, "n1", make_sig()).unwrap();
-            ab.receive_ack(seq, "n2", make_sig()).unwrap();
+            ab.receive_ack(seq, "n1", sign_ack(&sk1, &ab, seq)).unwrap();
+            ab.receive_ack(seq, "n2", sign_ack(&sk2, &ab, seq)).unwrap();
         }
 
         let delivered = ab.deliver();

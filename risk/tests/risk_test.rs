@@ -36,11 +36,11 @@ fn zero_risk_signals_score_zero() {
     let engine = RiskEngine::new();
     let user = Uuid::new_v4();
     let score = engine.compute_score(&user, &clean_signals());
-    // All-zero signals trigger the mimicry detection penalty (+0.05)
-    // plus random noise in [0.0, 0.03), so score should be in [0.05, 0.08).
+    // All-zero signals trigger the epsilon-based mimicry detection penalty (+0.15)
+    // plus random noise in [0.0, 0.08), so score should be in [0.15, 0.23).
     assert!(
-        score >= 0.05 && score < 0.08,
-        "expected [0.05, 0.08) with mimicry penalty + noise, got {score}"
+        score >= 0.15 && score < 0.23,
+        "expected [0.15, 0.23) with mimicry penalty + noise, got {score}"
     );
 }
 
@@ -87,8 +87,8 @@ fn impossible_travel_high_risk() {
     let mut signals = clean_signals();
     signals.geo_velocity_kmh = 2000.0;
     let score = engine.compute_score(&user, &signals);
-    // 0.20 + noise [0.0, 0.03)
-    assert!(score >= 0.20 && score < 0.23, "expected [0.20, 0.23), got {score}");
+    // 0.20 + noise [0.0, 0.08). Mimicry does NOT fire (geo > epsilon).
+    assert!(score >= 0.20 && score < 0.28, "expected [0.20, 0.28), got {score}");
 }
 
 #[test]
@@ -241,8 +241,8 @@ fn unusual_network_adds_risk() {
     let mut signals = clean_signals();
     signals.is_unusual_network = true;
     let score = engine.compute_score(&user, &signals);
-    // 0.15 + noise [0.0, 0.03)
-    assert!(score >= 0.15 && score < 0.18, "unusual network should add 0.15 + noise, got {score}");
+    // 0.15 + noise [0.0, 0.08). Mimicry does NOT fire (is_unusual_network=true breaks AND).
+    assert!(score >= 0.15 && score < 0.23, "unusual network should add 0.15 + noise, got {score}");
 }
 
 #[test]
@@ -263,8 +263,8 @@ fn stale_device_attestation_moderate_risk() {
     let mut signals = clean_signals();
     signals.device_attestation_age_secs = 400.0; // > 300, < 3600
     let score = engine.compute_score(&user, &signals);
-    // 0.10 + noise [0.0, 0.03)
-    assert!(score >= 0.10 && score < 0.13, "stale attestation (400s) should add 0.10 + noise, got {score}");
+    // 0.10 + noise [0.0, 0.08). Mimicry does NOT fire (attestation_age > epsilon).
+    assert!(score >= 0.10 && score < 0.18, "stale attestation (400s) should add 0.10 + noise, got {score}");
 }
 
 #[test]
@@ -356,11 +356,11 @@ fn test_server_side_failed_attempts_override_client() {
 
     // If the engine trusted the client's 100 failed attempts, the failed-attempt
     // contribution alone would be min(100/5, 1.0) * 0.15 = 0.15. Since the
-    // server counter is 0 the contribution must be 0. Score should be only noise.
+    // server counter is 0 the contribution must be 0. Score should be only noise [0, 0.08).
     assert!(
-        score < 0.05,
+        score < 0.08,
         "Client-supplied recent_failed_attempts=100 must be ignored; \
-         server counter is 0 so score should be < 0.05, got {score}"
+         server counter is 0 so score should be < 0.08 (noise only), got {score}"
     );
 }
 
@@ -384,15 +384,15 @@ fn test_all_zero_signals_triggers_mimicry_penalty() {
 
     let score = engine.compute_score(&user, &signals);
 
-    // Mimicry penalty is +0.05 and CSPRNG noise adds [0.0, 0.03), so score > 0.0
+    // Epsilon-based mimicry penalty is +0.15 and CSPRNG noise adds [0.0, 0.08), so score > 0.0
     assert!(
         score > 0.0,
         "All-zero signals must trigger mimicry penalty + CSPRNG noise; got {score}"
     );
-    // More precisely, score should be in [0.05, 0.08)
+    // More precisely, score should be in [0.15, 0.23)
     assert!(
-        score >= 0.05,
-        "Mimicry penalty should contribute at least 0.05; got {score}"
+        score >= 0.15,
+        "Epsilon-based mimicry penalty should contribute at least 0.15; got {score}"
     );
 }
 
