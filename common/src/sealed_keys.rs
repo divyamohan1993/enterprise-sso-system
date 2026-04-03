@@ -155,7 +155,7 @@ pub fn cached_master_kek_distributed() -> &'static [u8; 32] {
                                          Rejecting share to prevent KEK corruption from malicious peer.",
                                         share.index
                                     );
-                                    common::siem::SecurityEvent::tamper_detected(
+                                    crate::siem::SecurityEvent::tamper_detected(
                                         &format!("Rejected peer share index {} due to VSS verification failure", share.index),
                                     );
                                     continue; // Skip this share
@@ -264,7 +264,7 @@ fn verify_share_commitment(share: &crate::threshold_kek::KekShare) -> bool {
             "VSS VERIFICATION FAILED: share index not found in commitments or commitment is zero. \
              Possible malicious share injection."
         );
-        common::siem::SecurityEvent::tamper_detected(
+        crate::siem::SecurityEvent::tamper_detected(
             &format!(
                 "VSS share verification failed for index {}. Share rejected.",
                 share.index

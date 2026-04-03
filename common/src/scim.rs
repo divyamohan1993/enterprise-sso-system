@@ -689,7 +689,16 @@ impl ScimServer {
         let now = self.now();
 
         for client in self.clients.values_mut() {
-            if crypto::ct::ct_eq(client.token_hash.as_bytes(), bearer_token.as_bytes()) {
+            if {
+                use subtle::ConstantTimeEq;
+                let a = client.token_hash.as_bytes();
+                let b = bearer_token.as_bytes();
+                // Constant-time comparison including length check
+                let len_eq: subtle::Choice = (a.len() as u64).ct_eq(&(b.len() as u64));
+                let min_len = std::cmp::min(a.len(), b.len());
+                let content_eq: subtle::Choice = a[..min_len].ct_eq(&b[..min_len]);
+                bool::from(len_eq & content_eq)
+            } {
                 // Rate limit check
                 if now - client.window_start >= 60 {
                     // Reset window

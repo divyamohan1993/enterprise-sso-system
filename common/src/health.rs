@@ -394,7 +394,13 @@ where
                 let req_str = String::from_utf8_lossy(&req_buf[..n]);
                 let authorized = req_str.lines().any(|line| {
                     if let Some(value) = line.strip_prefix("Authorization: Bearer ") {
-                        crypto::ct::ct_eq(value.trim().as_bytes(), required_token.as_bytes())
+                        use subtle::ConstantTimeEq;
+                        let a = value.trim().as_bytes();
+                        let b = required_token.as_bytes();
+                        let len_eq: subtle::Choice = (a.len() as u64).ct_eq(&(b.len() as u64));
+                        let min_len = std::cmp::min(a.len(), b.len());
+                        let content_eq: subtle::Choice = a[..min_len].ct_eq(&b[..min_len]);
+                        bool::from(len_eq & content_eq)
                     } else {
                         false
                     }
