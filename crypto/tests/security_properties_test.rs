@@ -264,14 +264,12 @@ fn zkp_classification_proof_hides_clearance_level() {
 
 use crypto::slh_dsa::{slh_dsa_keygen, slh_dsa_sign, slh_dsa_verify};
 
-/// SECURITY AUDIT: SLH-DSA parameter set (h=66, d=22, k=33, a=8)
+/// SECURITY AUDIT: SLH-DSA parameter set matches FIPS 205 SLH-DSA-SHA2-256f.
 ///
-/// FIPS 205 SLH-DSA-SHA2-256f specifies h=68, d=17, k=35, a=9, producing
-/// 49,856-byte signatures. This implementation uses h=66, d=22, k=33, a=8
-/// which yields 58,816-byte signatures. The parameters provide equivalent
-/// security but do not match the exact FIPS 205 parameter set.
+/// Parameters: h=68, d=17, k=35, a=9, n=32, w=16.
+/// Signature size: 49,856 bytes as specified by FIPS 205.
 #[test]
-fn slh_dsa_parameters_deviate_from_fips205() {
+fn slh_dsa_parameters_match_fips205() {
     let (sk, vk) = slh_dsa_keygen();
     let message = b"FIPS 205 parameter compliance test";
 
@@ -281,17 +279,17 @@ fn slh_dsa_parameters_deviate_from_fips205() {
         "sign/verify roundtrip must succeed"
     );
 
-    // Implementation uses h=66, d=22, k=33, a=8, w=16, n=32:
-    // FORS_SIG = 33 * (8*32 + 32) = 9504
+    // FIPS 205 SLH-DSA-SHA2-256f: h=68, d=17, k=35, a=9, w=16, n=32:
+    // FORS_SIG = 35 * (9*32 + 32) = 35 * 320 = 11200
     // WOTS_LEN = 64 + 3 = 67, WOTS_SIG = 67*32 = 2144
-    // XMSS_SIG = 2144 + 3*32 = 2240, HT_SIG = 22*2240 = 49280
-    // SIG = 32 + 9504 + 49280 = 58816
-    const IMPL_SIG_SIZE: usize = 58_816;
+    // XMSS_SIG = 2144 + 4*32 = 2272, HT_SIG = 17*2272 = 38624
+    // SIG = 32 + 11200 + 38624 = 49856
+    const FIPS205_SIG_SIZE: usize = 49_856;
 
     assert_eq!(
         sig.as_bytes().len(),
-        IMPL_SIG_SIZE,
-        "signature size must match implementation parameters (h=66, d=22, k=33, a=8)"
+        FIPS205_SIG_SIZE,
+        "signature size must match FIPS 205 SLH-DSA-SHA2-256f (49,856 bytes)"
     );
 }
 
