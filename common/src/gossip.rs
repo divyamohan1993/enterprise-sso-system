@@ -295,6 +295,7 @@ impl GossipProtocol {
                     msg_type: GossipMessageType::Ping { sequence: seq },
                     piggyback: self.collect_piggyback_unlocked(),
                     incarnation,
+                    hmac_signature: Vec::new(),
                 },
             });
         }
@@ -343,6 +344,7 @@ impl GossipProtocol {
                     msg_type: GossipMessageType::Ping { sequence: seq },
                     piggyback: self.piggyback_updates(),
                     incarnation,
+                    hmac_signature: Vec::new(),
                 },
             });
         }
@@ -404,6 +406,7 @@ impl GossipProtocol {
                         msg_type: sub.clone(),
                         piggyback: Vec::new(),
                         incarnation: msg.incarnation,
+                        hmac_signature: Vec::new(),
                     };
                     actions.extend(self.handle_message(sub_msg));
                 }
@@ -634,6 +637,7 @@ impl GossipProtocol {
                         },
                         piggyback: Vec::new(),
                         incarnation,
+                        hmac_signature: Vec::new(),
                     },
                 });
             }
@@ -849,6 +853,7 @@ mod tests {
             msg_type: GossipMessageType::Ping { sequence: 42 },
             piggyback: Vec::new(),
             incarnation: 0,
+            hmac_signature: Vec::new(),
         };
 
         let actions = proto.handle_message(ping);
@@ -875,6 +880,7 @@ mod tests {
             msg_type: GossipMessageType::Ack { sequence: 1 },
             piggyback: Vec::new(),
             incarnation: 0,
+            hmac_signature: Vec::new(),
         };
 
         let actions = proto.handle_message(ack);
@@ -896,6 +902,7 @@ mod tests {
             msg_type: GossipMessageType::Ping { sequence: 999 },
             piggyback: Vec::new(),
             incarnation: 5, // higher incarnation refutes suspicion
+            hmac_signature: Vec::new(),
         };
         proto.handle_message(msg);
 
