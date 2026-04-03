@@ -325,39 +325,75 @@ impl DatabaseCeremonyPersistence {
     }
 }
 
+/// File-based L2 persistence record, serializable with postcard.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct L2Record {
+    session_id: [u8; 32],
+    state_tag: String,
+    failure_reason: Option<String>,
+    updated_at: u64,
+}
+
+/// Convert a 32-byte ID to a hex filename string (no external hex crate needed).
+fn id_to_filename(id: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64 + 4);
+    for b in id {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s.push_str(".bin");
+    s
+}
+
+/// Decode a hex filename back to a 32-byte ID.
+fn filename_to_id(name: &str) -> Option<[u8; 32]> {
+    let hex_part = name.strip_suffix(".bin")?;
+    if hex_part.len() != 64 {
+        return None;
+    }
+    let mut id = [0u8; 32];
+    for (i, chunk) in hex_part.as_bytes().chunks(2).enumerate() {
+        let hi = match chunk[0] {
+            b'0'..=b'9' => chunk[0] - b'0',
+            b'a'..=b'f' => chunk[0] - b'a' + 10,
+            _ => return None,
+        };
+        let lo = match chunk[1] {
+            b'0'..=b'9' => chunk[1] - b'0',
+            b'a'..=b'f' => chunk[1] - b'a' + 10,
+            _ => return None,
+        };
+        id[i] = (hi << 4) | lo;
+    }
+    Some(id)
+}
+
 impl CeremonyPersistence for DatabaseCeremonyPersistence {
     fn store_ceremony(&self, id: &[u8; 32], state: &CeremonyState) -> Result<(), String> {
-        // File-based L2 persistence: each ceremony is stored as a JSON file
-        // in a directory derived from the connection_url (used as a path prefix).
-        // In production with PostgreSQL, this would use sqlx parameterized queries
-        // with the SQL methods defined above.
         let dir = std::path::Path::new(&self.connection_url);
         if let Err(e) = std::fs::create_dir_all(dir) {
             tracing::error!("L2 persistence: failed to create dir: {e}");
-            return Ok(()); // Degrade gracefully to L1 only
+            return Ok(());
         }
 
-        let filename = format!("{}.json", hex::encode(id));
-        let filepath = dir.join(&filename);
-        let state_tag = state.to_db_tag().to_string();
-        let failure_reason = state.failure_reason().map(|s| s.to_string());
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let record = L2Record {
+            session_id: *id,
+            state_tag: state.to_db_tag().to_string(),
+            failure_reason: state.failure_reason().map(|s| s.to_string()),
+            updated_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        };
 
-        let record = serde_json::json!({
-            "session_id": hex::encode(id),
-            "state_tag": state_tag,
-            "failure_reason": failure_reason,
-            "updated_at": now,
-        });
+        let bytes = postcard::to_allocvec(&record)
+            .map_err(|e| format!("L2 serialize: {e}"))?;
 
-        match std::fs::write(&filepath, record.to_string()) {
+        let filepath = dir.join(id_to_filename(id));
+        match std::fs::write(&filepath, &bytes) {
             Ok(()) => {
                 tracing::debug!(
                     session_id = %short_session_hex(id),
-                    state = %state_tag,
+                    state = %record.state_tag,
                     "L2 persistence: ceremony state stored"
                 );
             }
@@ -365,7 +401,7 @@ impl CeremonyPersistence for DatabaseCeremonyPersistence {
                 tracing::error!(
                     session_id = %short_session_hex(id),
                     error = %e,
-                    "L2 persistence: failed to store ceremony state"
+                    "L2 persistence: write failed"
                 );
             }
         }
@@ -374,41 +410,30 @@ impl CeremonyPersistence for DatabaseCeremonyPersistence {
 
     fn load_ceremony(&self, id: &[u8; 32]) -> Result<Option<CeremonyState>, String> {
         let dir = std::path::Path::new(&self.connection_url);
-        let filename = format!("{}.json", hex::encode(id));
-        let filepath = dir.join(&filename);
+        let filepath = dir.join(id_to_filename(id));
 
-        let data = match std::fs::read_to_string(&filepath) {
-            Ok(d) => d,
+        let bytes = match std::fs::read(&filepath) {
+            Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => {
-                tracing::error!("L2 persistence: failed to read {}: {e}", filepath.display());
+                tracing::error!("L2 persistence: read failed: {e}");
                 return Ok(None);
             }
         };
 
-        let parsed: serde_json::Value = serde_json::from_str(&data)
-            .map_err(|e| format!("L2 persistence: malformed JSON: {e}"))?;
+        let record: L2Record = postcard::from_bytes(&bytes)
+            .map_err(|e| format!("L2 deserialize: {e}"))?;
 
-        let state_tag = parsed["state_tag"].as_str().unwrap_or("unknown");
-        let failure_reason = parsed["failure_reason"].as_str().map(|s| s.to_string());
-
-        let state = CeremonyState::from_db_tag(state_tag, failure_reason);
-        tracing::debug!(
-            session_id = %short_session_hex(id),
-            "L2 persistence: ceremony state loaded"
+        let state = CeremonyState::from_db_tag(
+            &record.state_tag,
+            record.failure_reason,
         );
         Ok(state)
     }
 
     fn remove_ceremony(&self, id: &[u8; 32]) -> Result<(), String> {
         let dir = std::path::Path::new(&self.connection_url);
-        let filename = format!("{}.json", hex::encode(id));
-        let filepath = dir.join(&filename);
-        let _ = std::fs::remove_file(&filepath);
-        tracing::debug!(
-            session_id = %short_session_hex(id),
-            "L2 persistence: ceremony state removed"
-        );
+        let _ = std::fs::remove_file(dir.join(id_to_filename(id)));
         Ok(())
     }
 
@@ -424,30 +449,18 @@ impl CeremonyPersistence for DatabaseCeremonyPersistence {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if !name_str.ends_with(".json") {
-                continue;
-            }
-            let hex_part = &name_str[..name_str.len() - 5]; // strip .json
-            if let Ok(bytes) = hex::decode(hex_part) {
-                if bytes.len() == 32 {
-                    let mut id = [0u8; 32];
-                    id.copy_from_slice(&bytes);
-
-                    // Check if ceremony is still active (not complete/failed)
-                    let filepath = entry.path();
-                    if let Ok(data) = std::fs::read_to_string(&filepath) {
-                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
-                            let tag = parsed["state_tag"].as_str().unwrap_or("");
-                            if tag != "complete" && tag != "failed" {
-                                ids.push(id);
-                            }
+            if let Some(id) = filename_to_id(&name_str) {
+                // Check if active
+                if let Ok(bytes) = std::fs::read(entry.path()) {
+                    if let Ok(record) = postcard::from_bytes::<L2Record>(&bytes) {
+                        if record.state_tag != "complete" && record.state_tag != "failed" {
+                            ids.push(id);
                         }
                     }
                 }
             }
         }
 
-        tracing::debug!(count = ids.len(), "L2 persistence: listed active ceremonies");
         Ok(ids)
     }
 }
