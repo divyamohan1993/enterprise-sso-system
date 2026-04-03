@@ -228,6 +228,9 @@ pub struct GatewayServer {
     tls_acceptor: Option<TlsAcceptor>,
     /// Optional distributed rate limiter (Redis-backed with local fallback).
     distributed_limiter: Option<Arc<DistributedRateLimiter>>,
+    /// Circuit breaker for orchestrator connections.
+    /// Prevents gateway from exhausting all connection slots when orchestrator is degraded.
+    orchestrator_breaker: common::circuit_breaker::CircuitBreaker,
 }
 
 impl GatewayServer {
@@ -271,6 +274,10 @@ impl GatewayServer {
             key_pins: Arc::new(key_pins),
             tls_acceptor: None,
             distributed_limiter: None,
+            orchestrator_breaker: common::circuit_breaker::CircuitBreaker::new(
+                3,
+                std::time::Duration::from_secs(15),
+            ),
         })
     }
 
@@ -333,6 +340,10 @@ impl GatewayServer {
             key_pins: Arc::new(key_pins),
             tls_acceptor: None,
             distributed_limiter: None,
+            orchestrator_breaker: common::circuit_breaker::CircuitBreaker::new(
+                3,
+                std::time::Duration::from_secs(15),
+            ),
         })
     }
 
@@ -696,9 +707,21 @@ async fn handle_connection(
     let client_binding_hash = crypto::dpop::dpop_key_hash(&kem_ct_bytes);
 
     let resp = if let Some(orch) = orchestrator {
+        // Circuit breaker: fail fast when orchestrator is known to be down
+        if !self.orchestrator_breaker.allow_request() {
+            AuthResponse {
+                success: false,
+                token: None,
+                error: Some("service temporarily unavailable (circuit breaker open)".into()),
+            }
+        } else {
         match forward_to_orchestrator(&auth_req, &orch, client_binding_hash).await {
-            Ok(r) => r,
+            Ok(r) => {
+                self.orchestrator_breaker.record_success();
+                r
+            }
             Err(e) => {
+                self.orchestrator_breaker.record_failure();
                 let internal_msg = common::error_response::log_error_with_location(&e);
                 tracing::warn!("orchestrator error: {internal_msg}");
                 AuthResponse {
@@ -707,6 +730,7 @@ async fn handle_connection(
                     error: Some(common::error_response::sanitize(&e)),
                 }
             }
+        }
         }
     } else {
         // No orchestrator configured -- return error instead of placeholder token

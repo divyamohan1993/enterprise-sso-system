@@ -327,42 +327,136 @@ impl DatabaseCeremonyPersistence {
 
 impl CeremonyPersistence for DatabaseCeremonyPersistence {
     fn store_ceremony(&self, id: &[u8; 32], state: &CeremonyState) -> Result<(), String> {
-        // NOTE: In production, this executes via sqlx with parameterized binds.
-        // The SQL and bind parameters are prepared here; the actual async execution
-        // is handled by the caller's runtime (see DistributedCeremonyTracker).
-        let _sql = Self::upsert_sql();
-        let _session_id = id;
-        let _state_tag = state.to_db_tag();
-        let _failure_reason = state.failure_reason();
-        let _now = std::time::SystemTime::now()
+        // Execute synchronously via a blocking runtime handle.
+        // In production, the caller passes a shared sqlx::PgPool.
+        let sql = Self::upsert_sql();
+        let session_id = id.to_vec();
+        let state_tag = state.to_db_tag().to_string();
+        let failure_reason = state.failure_reason().map(|s| s.to_string());
+        let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
+        let epoch = 0i64; // Epoch is managed by the distributed tracker
 
-        tracing::debug!(
-            session_id = %short_session_hex(id),
-            state = _state_tag,
-            "L2 persistence: ceremony state stored"
-        );
+        let url = self.connection_url.clone();
+        // Use a dedicated blocking thread to run the async sqlx query.
+        // This avoids nesting async runtimes and ensures the store is durable.
+        let result = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("failed to create L2 runtime: {e}"))?;
+            rt.block_on(async {
+                let pool = sqlx::PgPool::connect(&url)
+                    .await
+                    .map_err(|e| format!("L2 DB connect: {e}"))?;
+                sqlx::query(sql)
+                    .bind(&session_id[..])
+                    .bind(&state_tag)
+                    .bind(&failure_reason)
+                    .bind(now)
+                    .bind(epoch)
+                    .execute(&pool)
+                    .await
+                    .map_err(|e| format!("L2 DB upsert: {e}"))?;
+                pool.close().await;
+                Ok::<(), String>(())
+            })
+        })
+        .join()
+        .map_err(|_| "L2 persistence thread panicked".to_string())?;
+
+        if let Err(ref e) = result {
+            tracing::error!(
+                session_id = %short_session_hex(id),
+                error = %e,
+                "L2 persistence: failed to store ceremony state (continuing with L1 only)"
+            );
+            common::siem::SecurityEvent::tamper_detected(
+                &format!("L2 ceremony persistence failure: {e}. Operating on L1 cache only."),
+            );
+        } else {
+            tracing::debug!(
+                session_id = %short_session_hex(id),
+                state = %state_tag,
+                "L2 persistence: ceremony state stored"
+            );
+        }
+
+        // Return Ok even on DB failure to maintain availability
+        // (L1 cache is the primary, L2 is durability insurance)
         Ok(())
     }
 
     fn load_ceremony(&self, id: &[u8; 32]) -> Result<Option<CeremonyState>, String> {
-        let _sql = Self::select_sql();
-        let _session_id = id;
+        let sql = Self::select_sql();
+        let session_id = id.to_vec();
+        let url = self.connection_url.clone();
 
-        tracing::debug!(
-            session_id = %short_session_hex(id),
-            "L2 persistence: ceremony state lookup"
-        );
-        // In production, sqlx::query(sql).bind(id).fetch_optional(&pool) is used.
-        // Returns CeremonyState::from_db_tag(row.state_tag, row.failure_reason).
-        Ok(None)
+        let result = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("failed to create L2 runtime: {e}"))?;
+            rt.block_on(async {
+                let pool = sqlx::PgPool::connect(&url)
+                    .await
+                    .map_err(|e| format!("L2 DB connect: {e}"))?;
+                let row: Option<(String, Option<String>)> = sqlx::query_as(sql)
+                    .bind(&session_id[..])
+                    .fetch_optional(&pool)
+                    .await
+                    .map_err(|e| format!("L2 DB select: {e}"))?;
+                pool.close().await;
+                Ok::<Option<(String, Option<String>)>, String>(row)
+            })
+        })
+        .join()
+        .map_err(|_| "L2 persistence thread panicked".to_string())??;
+
+        match result {
+            Some((state_tag, failure_reason)) => {
+                let state = CeremonyState::from_db_tag(&state_tag, failure_reason.as_deref());
+                tracing::debug!(
+                    session_id = %short_session_hex(id),
+                    state = %state_tag,
+                    "L2 persistence: ceremony state loaded"
+                );
+                Ok(state)
+            }
+            None => {
+                tracing::debug!(
+                    session_id = %short_session_hex(id),
+                    "L2 persistence: ceremony not found"
+                );
+                Ok(None)
+            }
+        }
     }
 
     fn remove_ceremony(&self, id: &[u8; 32]) -> Result<(), String> {
-        let _sql = Self::delete_sql();
-        let _session_id = id;
+        let sql = Self::delete_sql();
+        let session_id = id.to_vec();
+        let url = self.connection_url.clone();
+
+        let _ = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()?;
+            rt.block_on(async {
+                let pool = sqlx::PgPool::connect(&url).await.ok()?;
+                sqlx::query(sql)
+                    .bind(&session_id[..])
+                    .execute(&pool)
+                    .await
+                    .ok()?;
+                pool.close().await;
+                Some(())
+            })
+        })
+        .join();
 
         tracing::debug!(
             session_id = %short_session_hex(id),
@@ -372,9 +466,39 @@ impl CeremonyPersistence for DatabaseCeremonyPersistence {
     }
 
     fn list_active_ceremonies(&self) -> Result<Vec<[u8; 32]>, String> {
-        let _sql = Self::list_active_sql();
-        tracing::debug!("L2 persistence: listing active ceremonies");
-        Ok(Vec::new())
+        let sql = Self::list_active_sql();
+        let url = self.connection_url.clone();
+
+        let result = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("failed to create L2 runtime: {e}"))?;
+            rt.block_on(async {
+                let pool = sqlx::PgPool::connect(&url)
+                    .await
+                    .map_err(|e| format!("L2 DB connect: {e}"))?;
+                let rows: Vec<(Vec<u8>,)> = sqlx::query_as(sql)
+                    .fetch_all(&pool)
+                    .await
+                    .map_err(|e| format!("L2 DB list: {e}"))?;
+                pool.close().await;
+                let mut ids = Vec::new();
+                for (bytes,) in rows {
+                    if bytes.len() == 32 {
+                        let mut id = [0u8; 32];
+                        id.copy_from_slice(&bytes);
+                        ids.push(id);
+                    }
+                }
+                Ok::<Vec<[u8; 32]>, String>(ids)
+            })
+        })
+        .join()
+        .map_err(|_| "L2 persistence thread panicked".to_string())??;
+
+        tracing::debug!(count = result.len(), "L2 persistence: listed active ceremonies");
+        Ok(result)
     }
 }
 

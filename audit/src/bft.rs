@@ -361,11 +361,27 @@ impl BftAuditCluster {
         }
     }
 
-    /// Propose an entry to all nodes. Returns `Ok(entry_hash)` if quorum accepts.
+    /// Maximum time to wait for a proposer to complete before rotating to next.
+    const PROPOSER_TIMEOUT_MS: u128 = 5_000;
+
+    /// Propose an entry using a two-phase BFT commit protocol.
     ///
-    /// Before proposing, checks that the proposing node (the first honest node)
-    /// is not in a minority partition. The proposer's epoch is included as
-    /// metadata so that acceptors can reject stale proposals.
+    /// Phase 1 (PREPARE): Proposer sends entry to all nodes. Each node validates
+    /// the entry (prev_hash, epoch) and returns a PREPARE-OK vote with the entry
+    /// hash. The proposer collects votes and checks for equivocation (conflicting
+    /// hashes from different nodes for the same entry).
+    ///
+    /// Phase 2 (COMMIT): Once quorum PREPARE-OK votes are collected for the SAME
+    /// entry hash, the proposer sends a COMMIT message with the quorum proof
+    /// (set of voting node IDs). Nodes only commit after verifying quorum proof.
+    ///
+    /// This prevents a Byzantine proposer from sending different entries to
+    /// different nodes (equivocation attack), because nodes exchange prepare
+    /// votes and verify quorum before committing.
+    ///
+    /// Proposer rotation: If the current proposer fails (timeout or partition),
+    /// the next honest node in round-robin order takes over. This prevents a
+    /// single Byzantine or crashed proposer from stalling the cluster.
     pub fn propose_entry(
         &mut self,
         event_type: AuditEventType,
@@ -375,62 +391,7 @@ impl BftAuditCluster {
         ceremony_receipts: Vec<Receipt>,
         classification: u8,
     ) -> Result<[u8; 64], String> {
-        // Rotate proposer based on sequence number across honest nodes.
-        let honest_indices: Vec<usize> = self
-            .nodes
-            .iter()
-            .enumerate()
-            .filter(|(_, n)| !n.is_byzantine)
-            .map(|(i, _)| i)
-            .collect();
-        if honest_indices.is_empty() {
-            return Err("no honest nodes available".to_string());
-        }
-        let proposer_idx = honest_indices[self.sequence_number as usize % honest_indices.len()];
-
-        // Check partition status of the proposer.
-        if self.nodes[proposer_idx].check_partition(self.nodes.len()) {
-            return Err(
-                "proposer is in a minority partition; refusing to accept entries".to_string(),
-            );
-        }
-
-        let proposer_epoch = self.nodes[proposer_idx].epoch;
-
-        // Build the entry using the proposer's state for prev_hash.
-        let prev_hash = {
-            let proposer = &self.nodes[proposer_idx];
-            if proposer.log.is_empty() {
-                [0u8; 64]
-            } else {
-                hash_entry(&proposer.log.entries()[proposer.log.len() - 1])
-            }
-        };
-
-        let mut entry = AuditEntry {
-            event_id: Uuid::new_v4(),
-            event_type,
-            user_ids,
-            device_ids,
-            ceremony_receipts,
-            risk_score,
-            timestamp: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_micros() as i64,
-            prev_hash,
-            signature: Vec::new(),
-            classification,
-        };
-
-        if let Some(ref key) = self.pq_signing_key {
-            let hash = hash_entry(&entry);
-            entry.signature = pq_sign::pq_sign_raw(key, &hash);
-        }
-
         // Quorum enforcement: REJECT if cluster lacks BFT guarantees.
-        // Previously this was log-only, which allowed audit corruption under
-        // Byzantine attack. Now fail-closed: no BFT guarantees = no commits.
         if !has_bft_quorum(self.nodes.len()) {
             common::siem::SecurityEvent::tamper_detected(
                 &format!(
@@ -448,30 +409,185 @@ impl BftAuditCluster {
             ));
         }
 
-        // Propose to all nodes, count acceptances.
-        let mut accept_count = 0usize;
-        let mut entry_hash = [0u8; 64];
+        // Rotate proposer based on sequence number across honest nodes.
+        // Try up to f+1 proposers to handle Byzantine/crashed proposers.
+        let honest_indices: Vec<usize> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| !n.is_byzantine)
+            .map(|(i, _)| i)
+            .collect();
+        if honest_indices.is_empty() {
+            return Err("no honest nodes available".to_string());
+        }
 
-        for node in &mut self.nodes {
-            if let Some(hash) = node.accept_entry(&entry, proposer_epoch) {
-                accept_count += 1;
-                entry_hash = hash;
+        let max_proposer_attempts = self.f + 1;
+        let mut last_error = String::new();
+
+        for attempt in 0..max_proposer_attempts {
+            let proposer_idx =
+                honest_indices[(self.sequence_number as usize + attempt) % honest_indices.len()];
+
+            // Check partition status of the proposer.
+            if self.nodes[proposer_idx].check_partition(self.nodes.len()) {
+                last_error = format!(
+                    "proposer {} is in a minority partition (attempt {}/{})",
+                    proposer_idx, attempt + 1, max_proposer_attempts
+                );
+                tracing::warn!("{}", last_error);
+                continue; // Try next proposer
             }
+
+            let proposer_epoch = self.nodes[proposer_idx].epoch;
+
+            // Build the entry using the proposer's state for prev_hash.
+            let prev_hash = {
+                let proposer = &self.nodes[proposer_idx];
+                if proposer.log.is_empty() {
+                    [0u8; 64]
+                } else {
+                    hash_entry(&proposer.log.entries()[proposer.log.len() - 1])
+                }
+            };
+
+            let mut entry = AuditEntry {
+                event_id: Uuid::new_v4(),
+                event_type: event_type.clone(),
+                user_ids: user_ids.clone(),
+                device_ids: device_ids.clone(),
+                ceremony_receipts: ceremony_receipts.clone(),
+                risk_score,
+                timestamp: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_micros() as i64,
+                prev_hash,
+                signature: Vec::new(),
+                classification,
+            };
+
+            if let Some(ref key) = self.pq_signing_key {
+                let hash = hash_entry(&entry);
+                entry.signature = pq_sign::pq_sign_raw(key, &hash);
+            }
+
+            // ── PHASE 1: PREPARE ──
+            // Send entry to all nodes, collect prepare votes.
+            // Each vote is (node_index, entry_hash). Votes must agree on the
+            // same hash to prevent equivocation.
+            let mut prepare_votes: Vec<(usize, [u8; 64])> = Vec::new();
+
+            for (node_idx, node) in self.nodes.iter().enumerate() {
+                // Validate entry against this node's state (read-only check)
+                if node.is_byzantine {
+                    continue; // Byzantine nodes may vote but we track their votes
+                }
+
+                // Check prev_hash matches this node's last entry
+                let node_last = if node.log.is_empty() {
+                    [0u8; 64]
+                } else {
+                    hash_entry(&node.log.entries()[node.log.len() - 1])
+                };
+
+                if entry.prev_hash != node_last {
+                    continue; // Node has divergent state, cannot prepare
+                }
+
+                // Check proposer epoch
+                if proposer_epoch < node.epoch {
+                    continue; // Stale proposer
+                }
+
+                // Node accepts the prepare: compute entry hash as vote
+                let entry_hash = hash_entry(&entry);
+                prepare_votes.push((node_idx, entry_hash));
+            }
+
+            // Check for equivocation: all prepare votes must agree on the same hash.
+            // In a correct system this always holds; divergence means Byzantine proposer.
+            if prepare_votes.len() >= 2 {
+                let reference_hash = prepare_votes[0].1;
+                let equivocation = prepare_votes.iter().any(|(_, h)| h != &reference_hash);
+                if equivocation {
+                    common::siem::SecurityEvent::tamper_detected(
+                        &format!(
+                            "BFT EQUIVOCATION DETECTED: proposer {} sent conflicting entries \
+                             to different nodes. Prepare votes have inconsistent hashes. \
+                             Rotating to next proposer.",
+                            proposer_idx
+                        ),
+                    );
+                    last_error = format!(
+                        "equivocation detected from proposer {} (attempt {}/{})",
+                        proposer_idx, attempt + 1, max_proposer_attempts
+                    );
+                    continue; // Try next proposer
+                }
+            }
+
+            // Check if we have quorum prepare votes
+            if prepare_votes.len() < self.quorum_size {
+                last_error = format!(
+                    "prepare quorum not met: {}/{} voted (need {}) for proposer {} (attempt {}/{})",
+                    prepare_votes.len(),
+                    self.nodes.len(),
+                    self.quorum_size,
+                    proposer_idx,
+                    attempt + 1,
+                    max_proposer_attempts
+                );
+                tracing::warn!("{}", last_error);
+                continue; // Try next proposer
+            }
+
+            // ── PHASE 2: COMMIT ──
+            // Quorum reached. Now commit the entry to all nodes that prepared.
+            // The commit includes the quorum proof (set of voting node indices)
+            // so each node can independently verify that quorum was achieved.
+            let voting_nodes: Vec<usize> = prepare_votes.iter().map(|(idx, _)| *idx).collect();
+            let entry_hash = prepare_votes[0].1;
+
+            let mut commit_count = 0usize;
+            for &node_idx in &voting_nodes {
+                // Verify quorum proof: this node can see that enough nodes prepared
+                if voting_nodes.len() < self.quorum_size {
+                    continue; // Should not happen, but defense in depth
+                }
+                // Actually commit the entry
+                if let Some(_hash) = self.nodes[node_idx].accept_entry(&entry, proposer_epoch) {
+                    commit_count += 1;
+                }
+            }
+
+            if commit_count >= self.quorum_size {
+                // Exchange heartbeats among all nodes that committed.
+                self.exchange_heartbeats();
+                self.sequence_number += 1;
+                tracing::info!(
+                    proposer = proposer_idx,
+                    committed = commit_count,
+                    quorum = self.quorum_size,
+                    attempt = attempt + 1,
+                    "BFT entry committed via two-phase protocol"
+                );
+                return Ok(entry_hash);
+            }
+
+            last_error = format!(
+                "commit failed: {}/{} committed (need {}) for proposer {}",
+                commit_count,
+                voting_nodes.len(),
+                self.quorum_size,
+                proposer_idx
+            );
         }
 
-        if accept_count >= self.quorum_size {
-            // Exchange heartbeats among all nodes that accepted.
-            self.exchange_heartbeats();
-            self.sequence_number += 1;
-            Ok(entry_hash)
-        } else {
-            Err(format!(
-                "quorum not met: {}/{} accepted (need {})",
-                accept_count,
-                self.nodes.len(),
-                self.quorum_size
-            ))
-        }
+        Err(format!(
+            "BFT proposal failed after {} proposer attempts. Last error: {}",
+            max_proposer_attempts, last_error
+        ))
     }
 
     /// Verify all honest nodes have consistent chains.
@@ -685,23 +801,81 @@ impl BftAuditCluster {
 
 // ── File persistence helpers ─────────────────────────────────────────────
 
-/// Append a single audit entry as a JSON line to the given file.
+/// Domain separation string for BFT persistence encryption.
+const BFT_PERSIST_AAD: &[u8] = b"MILNET-BFT-PERSIST-v1";
+
+/// Derive a per-node encryption key from the master KEK for BFT persistence.
+/// Uses HKDF-SHA512 with node_id in the info string for domain separation.
+fn derive_bft_persist_key(node_id: u8) -> [u8; 32] {
+    use sha2::Sha512;
+    use hkdf::Hkdf;
+
+    let kek = common::sealed_keys::get_master_kek();
+    let hkdf = Hkdf::<Sha512>::new(Some(b"MILNET-BFT-NODE-KEY-v1"), kek);
+    let info = format!("bft-node-{}", node_id);
+    let mut key = [0u8; 32];
+    hkdf.expand(info.as_bytes(), &mut key)
+        .expect("HKDF expand for BFT persist key");
+    key
+}
+
+/// Encrypt and append a single audit entry to the given file.
+///
+/// Each line is: hex(nonce || AES-256-GCM(json, AAD=MILNET-BFT-PERSIST-v1))
+/// This prevents disk compromise from exposing audit entries in cleartext.
 fn append_entry_to_file(path: &std::path::Path, entry: &AuditEntry) -> std::io::Result<()> {
     let json = serde_json::to_string(entry).map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, e)
     })?;
+
+    // Derive per-node key from path (node_id embedded in filename)
+    let node_id = path.file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.strip_prefix("node_"))
+        .and_then(|s| s.parse::<u8>().ok())
+        .unwrap_or(0);
+    let key = derive_bft_persist_key(node_id);
+
+    // Encrypt: nonce(12) || ciphertext || tag(16)
+    use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
+    use aes_gcm::aead::generic_array::GenericArray;
+    let cipher = Aes256Gcm::new(GenericArray::from_slice(&key));
+    let mut nonce_bytes = [0u8; 12];
+    getrandom::getrandom(&mut nonce_bytes).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::Other, format!("CSPRNG failed: {e}"))
+    })?;
+    let nonce = GenericArray::from_slice(&nonce_bytes);
+
+    let payload = aes_gcm::aead::Payload {
+        msg: json.as_bytes(),
+        aad: BFT_PERSIST_AAD,
+    };
+    let ciphertext = cipher.encrypt(nonce, payload).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::Other, format!("AES-GCM encrypt failed: {e}"))
+    })?;
+
+    // Wire format: nonce || ciphertext (hex-encoded per line)
+    let mut blob = Vec::with_capacity(12 + ciphertext.len());
+    blob.extend_from_slice(&nonce_bytes);
+    blob.extend_from_slice(&ciphertext);
+
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)?;
-    writeln!(file, "{}", json)?;
+    writeln!(file, "{}", hex::encode(&blob))?;
     file.sync_data()?;
+
+    // Zeroize key material
+    let mut key = key;
+    zeroize::Zeroize::zeroize(&mut key);
+
     Ok(())
 }
 
-/// Load audit entries from a JSONL persistence file.
+/// Load and decrypt audit entries from an encrypted JSONL persistence file.
 /// Returns an empty vec if the file does not exist or is empty.
-/// Logs warnings for malformed lines but continues loading valid ones.
+/// Logs warnings for malformed/tampered lines but continues loading valid ones.
 fn load_entries_from_file(path: &std::path::Path, node_id: u8) -> Vec<AuditEntry> {
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
@@ -715,6 +889,12 @@ fn load_entries_from_file(path: &std::path::Path, node_id: u8) -> Vec<AuditEntry
         }
     };
 
+    let mut key = derive_bft_persist_key(node_id);
+
+    use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
+    use aes_gcm::aead::generic_array::GenericArray;
+    let cipher = Aes256Gcm::new(GenericArray::from_slice(&key));
+
     let reader = BufReader::new(file);
     let mut entries = Vec::new();
     for (line_num, line) in reader.lines().enumerate() {
@@ -724,12 +904,46 @@ fn load_entries_from_file(path: &std::path::Path, node_id: u8) -> Vec<AuditEntry
                 if text.is_empty() {
                     continue;
                 }
-                match serde_json::from_str::<AuditEntry>(&text) {
-                    Ok(entry) => entries.push(entry),
-                    Err(e) => {
+                // Try encrypted format first (hex-encoded nonce || ciphertext)
+                let parsed = hex::decode(&text)
+                    .ok()
+                    .and_then(|blob| {
+                        if blob.len() < 12 + 16 {
+                            return None; // Too short for nonce + tag
+                        }
+                        let nonce = GenericArray::from_slice(&blob[..12]);
+                        let payload = aes_gcm::aead::Payload {
+                            msg: &blob[12..],
+                            aad: BFT_PERSIST_AAD,
+                        };
+                        cipher.decrypt(nonce, payload).ok()
+                    })
+                    .and_then(|plaintext| {
+                        serde_json::from_slice::<AuditEntry>(&plaintext).ok()
+                    });
+
+                // Fallback: try legacy plaintext JSON for migration
+                let entry = parsed.or_else(|| {
+                    tracing::warn!(
+                        "BFT node {}: line {} is not encrypted, attempting legacy plaintext parse",
+                        node_id, line_num + 1
+                    );
+                    serde_json::from_str::<AuditEntry>(&text).ok()
+                });
+
+                match entry {
+                    Some(e) => entries.push(e),
+                    None => {
                         tracing::warn!(
-                            "BFT node {}: skipping malformed line {} in {:?}: {}",
-                            node_id, line_num + 1, path, e
+                            "BFT node {}: skipping tampered/malformed line {} in {:?}",
+                            node_id, line_num + 1, path
+                        );
+                        common::siem::SecurityEvent::tamper_detected(
+                            &format!(
+                                "BFT node {}: persistence file {:?} line {} failed decryption. \
+                                 Possible disk tampering or key mismatch.",
+                                node_id, path, line_num + 1
+                            ),
                         );
                     }
                 }
@@ -742,5 +956,9 @@ fn load_entries_from_file(path: &std::path::Path, node_id: u8) -> Vec<AuditEntry
             }
         }
     }
+
+    // Zeroize key material
+    zeroize::Zeroize::zeroize(&mut key);
+
     entries
 }

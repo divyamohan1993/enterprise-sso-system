@@ -689,7 +689,7 @@ impl ScimServer {
         let now = self.now();
 
         for client in self.clients.values_mut() {
-            if client.token_hash == bearer_token {
+            if crypto::ct::ct_eq(client.token_hash.as_bytes(), bearer_token.as_bytes()) {
                 // Rate limit check
                 if now - client.window_start >= 60 {
                     // Reset window

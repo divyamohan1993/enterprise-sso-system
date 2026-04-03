@@ -68,17 +68,50 @@ async fn main() {
     // Spawn health check endpoint
     let health_start = std::time::Instant::now();
     let orch_port: u16 = listen_addr.split(':').last().and_then(|p| p.parse().ok()).unwrap_or(9101);
+    let opaque_addr_health = service.opaque_addr.clone();
+    let tss_addr_health = service.tss_addr.clone();
     let _health_handle = common::health::spawn_health_endpoint(
         "orchestrator".to_string(),
         orch_port,
         health_start,
-        || {
-            vec![common::health::HealthCheck {
-                name: "orchestrator_listener".to_string(),
-                ok: true,
-                detail: None,
-                latency_ms: None,
-            }]
+        move || {
+            // Probe actual downstream dependencies instead of always returning ok
+            let opaque_ok = std::net::TcpStream::connect_timeout(
+                &opaque_addr_health.parse().unwrap_or_else(|_| {
+                    std::net::SocketAddr::from(([127, 0, 0, 1], 9102))
+                }),
+                std::time::Duration::from_secs(2),
+            )
+            .is_ok();
+
+            let tss_ok = std::net::TcpStream::connect_timeout(
+                &tss_addr_health.parse().unwrap_or_else(|_| {
+                    std::net::SocketAddr::from(([127, 0, 0, 1], 9103))
+                }),
+                std::time::Duration::from_secs(2),
+            )
+            .is_ok();
+
+            vec![
+                common::health::HealthCheck {
+                    name: "orchestrator_listener".to_string(),
+                    ok: true,
+                    detail: None,
+                    latency_ms: None,
+                },
+                common::health::HealthCheck {
+                    name: "opaque_reachable".to_string(),
+                    ok: opaque_ok,
+                    detail: if opaque_ok { None } else { Some("OPAQUE service unreachable".into()) },
+                    latency_ms: None,
+                },
+                common::health::HealthCheck {
+                    name: "tss_reachable".to_string(),
+                    ok: tss_ok,
+                    detail: if tss_ok { None } else { Some("TSS service unreachable".into()) },
+                    latency_ms: None,
+                },
+            ]
         },
     );
 

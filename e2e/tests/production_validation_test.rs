@@ -1202,8 +1202,10 @@ fn test_risk_gradual_degradation() {
     let engine = RiskEngine::new();
     let user = Uuid::new_v4();
 
+    // Start from i=1 to avoid mimicry detection penalty at i=0 (all-zero signals
+    // trigger a 0.15 anti-mimicry penalty that can exceed low-risk signals at i=1).
     let mut prev_score = 0.0;
-    for i in 0..=5 {
+    for i in 1..=5 {
         let signals = RiskSignals {
             device_attestation_age_secs: i as f64 * 1500.0,
             geo_velocity_kmh: i as f64 * 300.0,

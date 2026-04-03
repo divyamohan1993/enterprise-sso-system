@@ -202,7 +202,10 @@ impl OrchestratorService {
         }
     }
 
-    /// Connect to the OPAQUE service via SHARD over mTLS.
+    /// Timeout for inter-service connections (connect + first response).
+    const SERVICE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Connect to the OPAQUE service via SHARD over mTLS with timeout.
     async fn connect_opaque(&self) -> Result<TlsShardTransport, String> {
         if !self.opaque_breaker.allow_request() {
             return Err("OPAQUE service circuit breaker is open — service unavailable".into());
@@ -215,27 +218,37 @@ impl OrchestratorService {
         } else {
             raw_host
         };
-        match tls_connect(
-            &self.opaque_addr,
-            ModuleId::Orchestrator,
-            self.hmac_key,
-            &self.tls_connector,
-            opaque_host,
+        match tokio::time::timeout(
+            Self::SERVICE_CONNECT_TIMEOUT,
+            tls_connect(
+                &self.opaque_addr,
+                ModuleId::Orchestrator,
+                self.hmac_key,
+                &self.tls_connector,
+                opaque_host,
+            ),
         )
         .await
         {
-            Ok(transport) => {
+            Ok(Ok(transport)) => {
                 self.opaque_breaker.record_success();
                 Ok(transport)
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 self.opaque_breaker.record_failure();
                 Err(format!("connect to OPAQUE: {e}"))
+            }
+            Err(_elapsed) => {
+                self.opaque_breaker.record_failure();
+                Err(format!(
+                    "connect to OPAQUE: timeout after {:?}",
+                    Self::SERVICE_CONNECT_TIMEOUT
+                ))
             }
         }
     }
 
-    /// Connect to the TSS service via SHARD over mTLS.
+    /// Connect to the TSS service via SHARD over mTLS with timeout.
     async fn connect_tss(&self) -> Result<TlsShardTransport, String> {
         if !self.tss_breaker.allow_request() {
             return Err("TSS service circuit breaker is open — service unavailable".into());
@@ -248,22 +261,32 @@ impl OrchestratorService {
         } else {
             raw_host
         };
-        match tls_connect(
-            &self.tss_addr,
-            ModuleId::Orchestrator,
-            self.hmac_key,
-            &self.tls_connector,
-            tss_host,
+        match tokio::time::timeout(
+            Self::SERVICE_CONNECT_TIMEOUT,
+            tls_connect(
+                &self.tss_addr,
+                ModuleId::Orchestrator,
+                self.hmac_key,
+                &self.tls_connector,
+                tss_host,
+            ),
         )
         .await
         {
-            Ok(transport) => {
+            Ok(Ok(transport)) => {
                 self.tss_breaker.record_success();
                 Ok(transport)
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 self.tss_breaker.record_failure();
                 Err(format!("connect to TSS: {e}"))
+            }
+            Err(_elapsed) => {
+                self.tss_breaker.record_failure();
+                Err(format!(
+                    "connect to TSS: timeout after {:?}",
+                    Self::SERVICE_CONNECT_TIMEOUT
+                ))
             }
         }
     }
@@ -550,7 +573,13 @@ impl OrchestratorService {
         tss_resp.token.ok_or_else(|| "TSS success but no token".into())
     }
 
+    /// Overall request deadline for auth processing (5 seconds).
+    const AUTH_REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
     /// Start the orchestrator as a SHARD mTLS listener, processing auth requests.
+    ///
+    /// Each connection is handled in a separate task with a deadline timeout.
+    /// Individual connection failures do NOT terminate the listener loop.
     pub async fn run(&self, listen_addr: &str) -> Result<(), String> {
         let (listener, _ca, _cert_key) =
             tls_bind(listen_addr, ModuleId::Orchestrator, self.hmac_key, "orchestrator")
@@ -560,15 +589,45 @@ impl OrchestratorService {
         tracing::info!("Orchestrator listening on {} (mTLS)", listen_addr);
 
         loop {
-            let mut transport = listener.accept().await.map_err(|e| format!("accept: {e}"))?;
-            let (_sender, req_bytes) = transport.recv().await.map_err(|e| format!("recv from gateway: {e}"))?;
-            let request: OrchestratorRequest = match postcard::from_bytes(&req_bytes) {
-                Ok(r) => r,
-                Err(e) => { tracing::error!("bad request from gateway: {e}"); continue; }
+            // Accept errors are transient (e.g., fd exhaustion). Log and retry.
+            let mut transport = match listener.accept().await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!("accept error (continuing): {e}");
+                    continue;
+                }
             };
-            let response = self.process_auth(&request).await;
-            let resp_bytes = postcard::to_allocvec(&response).map_err(|e| format!("serialize response: {e}"))?;
-            transport.send(&resp_bytes).await.map_err(|e| format!("send to gateway: {e}"))?;
+
+            // Wrap the entire request processing in a deadline timeout.
+            let deadline_result = tokio::time::timeout(
+                Self::AUTH_REQUEST_DEADLINE,
+                async {
+                    let (_sender, req_bytes) = transport.recv().await
+                        .map_err(|e| format!("recv from gateway: {e}"))?;
+                    let request: OrchestratorRequest = postcard::from_bytes(&req_bytes)
+                        .map_err(|e| format!("bad request from gateway: {e}"))?;
+                    let response = self.process_auth(&request).await;
+                    let resp_bytes = postcard::to_allocvec(&response)
+                        .map_err(|e| format!("serialize response: {e}"))?;
+                    transport.send(&resp_bytes).await
+                        .map_err(|e| format!("send to gateway: {e}"))?;
+                    Ok::<(), String>(())
+                },
+            )
+            .await;
+
+            match deadline_result {
+                Ok(Ok(())) => {} // Success
+                Ok(Err(e)) => {
+                    tracing::error!("request processing error (continuing): {e}");
+                }
+                Err(_elapsed) => {
+                    tracing::error!(
+                        "request deadline exceeded ({:?}), dropping connection",
+                        Self::AUTH_REQUEST_DEADLINE
+                    );
+                }
+            }
         }
     }
 }

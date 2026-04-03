@@ -719,8 +719,9 @@ pub fn lms_verify(
         node_idx = parent_idx;
     }
 
-    // The computed root should match PK.root
-    node == pk.root
+    // The computed root should match PK.root (constant-time to prevent timing oracle)
+    use subtle::ConstantTimeEq;
+    node.ct_eq(&pk.root).into()
 }
 
 // ── Convenience: remaining signatures ───────────────────────────────

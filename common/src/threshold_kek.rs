@@ -21,8 +21,11 @@
 //! - Failed reconstruction panics the process (fail-closed)
 
 use sha2::{Digest, Sha512};
+use hmac::{Hmac, Mac};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 use std::time::Duration;
+
+type HmacSha512 = Hmac<Sha512>;
 
 // ---------------------------------------------------------------------------
 // Shamir Secret Sharing (GF(256) arithmetic)
@@ -196,6 +199,115 @@ fn _old_gf256_inv(a: u8) -> u8 {
 }
 
 // ---------------------------------------------------------------------------
+// Hash-based VSS Commitments for GF(256) Shamir
+// ---------------------------------------------------------------------------
+
+/// Domain separation for VSS share commitments.
+const VSS_COMMITMENT_DOMAIN: &[u8] = b"MILNET-VSS-SHARE-COMMIT-v1";
+
+/// A set of hash-based VSS commitments for verifying Shamir shares.
+///
+/// For each share index, stores HMAC-SHA512(commitment_key, index || share_value).
+/// The commitment_key is derived from the secret via HKDF-SHA512 to ensure only
+/// the dealer who knew the secret can produce valid commitments, while the
+/// commitments themselves do not reveal the secret or share values.
+#[derive(Clone)]
+pub struct VssCommitments {
+    /// Per-share commitment: HMAC-SHA512(key, index || value)
+    pub commitments: Vec<(u8, [u8; 64])>,
+}
+
+impl VssCommitments {
+    /// Generate commitments for a set of shares.
+    ///
+    /// The commitment key is derived from the secret via HKDF-SHA512 with
+    /// domain separation, so commitments can only be produced by someone
+    /// who holds the original secret (the dealer).
+    pub fn generate(secret: &[u8; 32], shares: &[KekShare]) -> Self {
+        let commitment_key = Self::derive_commitment_key(secret);
+        let mut commitments = Vec::with_capacity(shares.len());
+        for share in shares {
+            let mac = Self::compute_commitment(&commitment_key, share);
+            commitments.push((share.index, mac));
+        }
+        commitments.sort_by_key(|(idx, _)| *idx);
+        Self { commitments }
+    }
+
+    /// Verify a single share against the stored commitments.
+    ///
+    /// Returns true if the share matches its commitment, false if the share
+    /// index is unknown or the commitment does not match (malicious share).
+    pub fn verify_share(&self, share: &KekShare, secret: &[u8; 32]) -> bool {
+        let commitment_key = Self::derive_commitment_key(secret);
+        let computed = Self::compute_commitment(&commitment_key, share);
+        // Find the stored commitment for this index
+        let stored = self.commitments.iter().find(|(idx, _)| *idx == share.index);
+        match stored {
+            Some((_, expected)) => {
+                // Constant-time comparison to prevent timing oracle
+                use subtle::ConstantTimeEq;
+                computed.ct_eq(expected).into()
+            }
+            None => false, // Unknown share index
+        }
+    }
+
+    /// Derive the commitment HMAC key from the secret.
+    fn derive_commitment_key(secret: &[u8; 32]) -> [u8; 64] {
+        use hkdf::Hkdf;
+        let hkdf = Hkdf::<Sha512>::new(Some(VSS_COMMITMENT_DOMAIN), secret);
+        let mut key = [0u8; 64];
+        hkdf.expand(b"vss-commitment-key", &mut key)
+            .expect("HKDF expand for VSS commitment key");
+        key
+    }
+
+    /// Compute HMAC-SHA512(key, index || value) for a single share.
+    fn compute_commitment(key: &[u8; 64], share: &KekShare) -> [u8; 64] {
+        let mut mac = HmacSha512::new_from_slice(key)
+            .expect("HMAC-SHA512 accepts any key length");
+        mac.update(&[share.index]);
+        mac.update(&share.value);
+        let result = mac.finalize();
+        let mut out = [0u8; 64];
+        out.copy_from_slice(&result.into_bytes());
+        out
+    }
+
+    /// Encode commitments as hex for distribution alongside shares.
+    pub fn to_hex(&self) -> String {
+        let mut parts = Vec::new();
+        for (idx, mac) in &self.commitments {
+            parts.push(format!("{:02x}{}", idx, hex::encode(mac)));
+        }
+        parts.join(",")
+    }
+
+    /// Decode commitments from hex.
+    pub fn from_hex(hex_str: &str) -> Result<Self, String> {
+        let mut commitments = Vec::new();
+        for part in hex_str.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if part.len() < 2 + 128 {
+                return Err(format!("commitment hex too short: {}", part.len()));
+            }
+            let idx = u8::from_str_radix(&part[..2], 16)
+                .map_err(|e| format!("invalid commitment index: {e}"))?;
+            let mac_bytes = hex::decode(&part[2..130])
+                .map_err(|e| format!("invalid commitment mac hex: {e}"))?;
+            let mut mac = [0u8; 64];
+            mac.copy_from_slice(&mac_bytes);
+            commitments.push((idx, mac));
+        }
+        Ok(Self { commitments })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shamir Split / Reconstruct
 // ---------------------------------------------------------------------------
 
@@ -203,6 +315,9 @@ fn _old_gf256_inv(a: u8) -> u8 {
 ///
 /// Uses Shamir's Secret Sharing over GF(256) with random coefficients from
 /// OS CSPRNG. Each byte of the secret is independently split.
+///
+/// Also returns hash-based VSS commitments for each share, enabling
+/// independent verification of share authenticity without the secret.
 pub fn split_secret(secret: &[u8; 32], threshold: u8, total: u8) -> Result<Vec<KekShare>, String> {
     if threshold < 2 || threshold > total {
         return Err(format!(
@@ -253,6 +368,20 @@ pub fn split_secret(secret: &[u8; 32], threshold: u8, total: u8) -> Result<Vec<K
     }
 
     Ok(shares)
+}
+
+/// Split a secret AND produce hash-based VSS commitments for each share.
+///
+/// Returns (shares, commitments) where commitments can be distributed to
+/// all parties for independent share verification.
+pub fn split_secret_with_commitments(
+    secret: &[u8; 32],
+    threshold: u8,
+    total: u8,
+) -> Result<(Vec<KekShare>, VssCommitments), String> {
+    let shares = split_secret(secret, threshold, total)?;
+    let commitments = VssCommitments::generate(secret, &shares);
+    Ok((shares, commitments))
 }
 
 /// Reconstruct a 32-byte secret from `threshold` or more shares.

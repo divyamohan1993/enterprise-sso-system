@@ -394,7 +394,7 @@ where
                 let req_str = String::from_utf8_lossy(&req_buf[..n]);
                 let authorized = req_str.lines().any(|line| {
                     if let Some(value) = line.strip_prefix("Authorization: Bearer ") {
-                        value.trim() == required_token.as_str()
+                        crypto::ct::ct_eq(value.trim().as_bytes(), required_token.as_bytes())
                     } else {
                         false
                     }

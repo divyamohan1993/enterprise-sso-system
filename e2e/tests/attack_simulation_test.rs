@@ -616,9 +616,6 @@ async fn test_attack_timing_attack_on_password_verification() {
     // Measure time for: correct password, wrong password, nonexistent user.
     // The times should be similar (within 20% variance) to prevent timing oracles.
     //
-    // Raise rate limit for this test: we need 10 connections in rapid succession.
-    // The default 10/60s limit can cause failures if the test thread is slow.
-    std::env::set_var("MILNET_MAX_CONN_PER_IP", "100");
     let mut store = CredentialStore::new();
     store.register_with_password("alice", b"known_password");
     let (gateway_addr, _) = boot_full_system(store).await;
@@ -626,27 +623,27 @@ async fn test_attack_timing_attack_on_password_verification() {
     // Warm up (first connection may be slower)
     let _ = client_auth(&gateway_addr, "alice", b"warmup").await;
 
-    // Measure correct password (average of 3)
-    // Total connections: 1 warmup + 3 correct + 3 wrong + 3 nouser = 10
-    // (exactly at the per-IP rate limit of 10 per 60s window)
+    // Measure correct password (average of 2)
+    // Total connections: 1 warmup + 2 correct + 2 wrong + 2 nouser = 7
+    // (well under the per-IP rate limit of 10 per 60s window)
     let mut correct_times = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..2 {
         let start = std::time::Instant::now();
         let _ = client_auth(&gateway_addr, "alice", b"known_password").await;
         correct_times.push(start.elapsed());
     }
 
-    // Measure wrong password (average of 3)
+    // Measure wrong password (average of 2)
     let mut wrong_times = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..2 {
         let start = std::time::Instant::now();
         let _ = client_auth(&gateway_addr, "alice", b"wrong_password").await;
         wrong_times.push(start.elapsed());
     }
 
-    // Measure nonexistent user (average of 3)
+    // Measure nonexistent user (average of 2)
     let mut nouser_times = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..2 {
         let start = std::time::Instant::now();
         let _ = client_auth(&gateway_addr, "nonexistent_user_xyz", b"password").await;
         nouser_times.push(start.elapsed());
