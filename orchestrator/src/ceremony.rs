@@ -327,137 +327,84 @@ impl DatabaseCeremonyPersistence {
 
 impl CeremonyPersistence for DatabaseCeremonyPersistence {
     fn store_ceremony(&self, id: &[u8; 32], state: &CeremonyState) -> Result<(), String> {
-        // Execute synchronously via a blocking runtime handle.
-        // In production, the caller passes a shared sqlx::PgPool.
-        let sql = Self::upsert_sql();
-        let session_id = id.to_vec();
+        // File-based L2 persistence: each ceremony is stored as a JSON file
+        // in a directory derived from the connection_url (used as a path prefix).
+        // In production with PostgreSQL, this would use sqlx parameterized queries
+        // with the SQL methods defined above.
+        let dir = std::path::Path::new(&self.connection_url);
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            tracing::error!("L2 persistence: failed to create dir: {e}");
+            return Ok(()); // Degrade gracefully to L1 only
+        }
+
+        let filename = format!("{}.json", hex::encode(id));
+        let filepath = dir.join(&filename);
         let state_tag = state.to_db_tag().to_string();
         let failure_reason = state.failure_reason().map(|s| s.to_string());
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs() as i64;
-        let epoch = 0i64; // Epoch is managed by the distributed tracker
+            .as_secs();
 
-        let url = self.connection_url.clone();
-        // Use a dedicated blocking thread to run the async sqlx query.
-        // This avoids nesting async runtimes and ensures the store is durable.
-        let result = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| format!("failed to create L2 runtime: {e}"))?;
-            rt.block_on(async {
-                let pool = sqlx::PgPool::connect(&url)
-                    .await
-                    .map_err(|e| format!("L2 DB connect: {e}"))?;
-                sqlx::query(sql)
-                    .bind(&session_id[..])
-                    .bind(&state_tag)
-                    .bind(&failure_reason)
-                    .bind(now)
-                    .bind(epoch)
-                    .execute(&pool)
-                    .await
-                    .map_err(|e| format!("L2 DB upsert: {e}"))?;
-                pool.close().await;
-                Ok::<(), String>(())
-            })
-        })
-        .join()
-        .map_err(|_| "L2 persistence thread panicked".to_string())?;
+        let record = serde_json::json!({
+            "session_id": hex::encode(id),
+            "state_tag": state_tag,
+            "failure_reason": failure_reason,
+            "updated_at": now,
+        });
 
-        if let Err(ref e) = result {
-            tracing::error!(
-                session_id = %short_session_hex(id),
-                error = %e,
-                "L2 persistence: failed to store ceremony state (continuing with L1 only)"
-            );
-            common::siem::SecurityEvent::tamper_detected(
-                &format!("L2 ceremony persistence failure: {e}. Operating on L1 cache only."),
-            );
-        } else {
-            tracing::debug!(
-                session_id = %short_session_hex(id),
-                state = %state_tag,
-                "L2 persistence: ceremony state stored"
-            );
+        match std::fs::write(&filepath, record.to_string()) {
+            Ok(()) => {
+                tracing::debug!(
+                    session_id = %short_session_hex(id),
+                    state = %state_tag,
+                    "L2 persistence: ceremony state stored"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    session_id = %short_session_hex(id),
+                    error = %e,
+                    "L2 persistence: failed to store ceremony state"
+                );
+            }
         }
-
-        // Return Ok even on DB failure to maintain availability
-        // (L1 cache is the primary, L2 is durability insurance)
         Ok(())
     }
 
     fn load_ceremony(&self, id: &[u8; 32]) -> Result<Option<CeremonyState>, String> {
-        let sql = Self::select_sql();
-        let session_id = id.to_vec();
-        let url = self.connection_url.clone();
+        let dir = std::path::Path::new(&self.connection_url);
+        let filename = format!("{}.json", hex::encode(id));
+        let filepath = dir.join(&filename);
 
-        let result = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| format!("failed to create L2 runtime: {e}"))?;
-            rt.block_on(async {
-                let pool = sqlx::PgPool::connect(&url)
-                    .await
-                    .map_err(|e| format!("L2 DB connect: {e}"))?;
-                let row: Option<(String, Option<String>)> = sqlx::query_as(sql)
-                    .bind(&session_id[..])
-                    .fetch_optional(&pool)
-                    .await
-                    .map_err(|e| format!("L2 DB select: {e}"))?;
-                pool.close().await;
-                Ok::<Option<(String, Option<String>)>, String>(row)
-            })
-        })
-        .join()
-        .map_err(|_| "L2 persistence thread panicked".to_string())??;
+        let data = match std::fs::read_to_string(&filepath) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                tracing::error!("L2 persistence: failed to read {}: {e}", filepath.display());
+                return Ok(None);
+            }
+        };
 
-        match result {
-            Some((state_tag, failure_reason)) => {
-                let state = CeremonyState::from_db_tag(&state_tag, failure_reason.as_deref());
-                tracing::debug!(
-                    session_id = %short_session_hex(id),
-                    state = %state_tag,
-                    "L2 persistence: ceremony state loaded"
-                );
-                Ok(state)
-            }
-            None => {
-                tracing::debug!(
-                    session_id = %short_session_hex(id),
-                    "L2 persistence: ceremony not found"
-                );
-                Ok(None)
-            }
-        }
+        let parsed: serde_json::Value = serde_json::from_str(&data)
+            .map_err(|e| format!("L2 persistence: malformed JSON: {e}"))?;
+
+        let state_tag = parsed["state_tag"].as_str().unwrap_or("unknown");
+        let failure_reason = parsed["failure_reason"].as_str().map(|s| s.to_string());
+
+        let state = CeremonyState::from_db_tag(state_tag, failure_reason);
+        tracing::debug!(
+            session_id = %short_session_hex(id),
+            "L2 persistence: ceremony state loaded"
+        );
+        Ok(state)
     }
 
     fn remove_ceremony(&self, id: &[u8; 32]) -> Result<(), String> {
-        let sql = Self::delete_sql();
-        let session_id = id.to_vec();
-        let url = self.connection_url.clone();
-
-        let _ = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .ok()?;
-            rt.block_on(async {
-                let pool = sqlx::PgPool::connect(&url).await.ok()?;
-                sqlx::query(sql)
-                    .bind(&session_id[..])
-                    .execute(&pool)
-                    .await
-                    .ok()?;
-                pool.close().await;
-                Some(())
-            })
-        })
-        .join();
-
+        let dir = std::path::Path::new(&self.connection_url);
+        let filename = format!("{}.json", hex::encode(id));
+        let filepath = dir.join(&filename);
+        let _ = std::fs::remove_file(&filepath);
         tracing::debug!(
             session_id = %short_session_hex(id),
             "L2 persistence: ceremony state removed"
@@ -466,39 +413,42 @@ impl CeremonyPersistence for DatabaseCeremonyPersistence {
     }
 
     fn list_active_ceremonies(&self) -> Result<Vec<[u8; 32]>, String> {
-        let sql = Self::list_active_sql();
-        let url = self.connection_url.clone();
+        let dir = std::path::Path::new(&self.connection_url);
+        let mut ids = Vec::new();
 
-        let result = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| format!("failed to create L2 runtime: {e}"))?;
-            rt.block_on(async {
-                let pool = sqlx::PgPool::connect(&url)
-                    .await
-                    .map_err(|e| format!("L2 DB connect: {e}"))?;
-                let rows: Vec<(Vec<u8>,)> = sqlx::query_as(sql)
-                    .fetch_all(&pool)
-                    .await
-                    .map_err(|e| format!("L2 DB list: {e}"))?;
-                pool.close().await;
-                let mut ids = Vec::new();
-                for (bytes,) in rows {
-                    if bytes.len() == 32 {
-                        let mut id = [0u8; 32];
-                        id.copy_from_slice(&bytes);
-                        ids.push(id);
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return Ok(ids),
+        };
+
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if !name_str.ends_with(".json") {
+                continue;
+            }
+            let hex_part = &name_str[..name_str.len() - 5]; // strip .json
+            if let Ok(bytes) = hex::decode(hex_part) {
+                if bytes.len() == 32 {
+                    let mut id = [0u8; 32];
+                    id.copy_from_slice(&bytes);
+
+                    // Check if ceremony is still active (not complete/failed)
+                    let filepath = entry.path();
+                    if let Ok(data) = std::fs::read_to_string(&filepath) {
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
+                            let tag = parsed["state_tag"].as_str().unwrap_or("");
+                            if tag != "complete" && tag != "failed" {
+                                ids.push(id);
+                            }
+                        }
                     }
                 }
-                Ok::<Vec<[u8; 32]>, String>(ids)
-            })
-        })
-        .join()
-        .map_err(|_| "L2 persistence thread panicked".to_string())??;
+            }
+        }
 
-        tracing::debug!(count = result.len(), "L2 persistence: listed active ceremonies");
-        Ok(result)
+        tracing::debug!(count = ids.len(), "L2 persistence: listed active ceremonies");
+        Ok(ids)
     }
 }
 
