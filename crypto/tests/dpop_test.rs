@@ -163,69 +163,76 @@ fn test_dpop_fresh_timestamp_accepted() {
 
 #[test]
 fn test_dpop_boundary_31s_past_rejected() {
-    // Exactly 31 seconds old — just past the 30s boundary, must be rejected.
+    // 32 seconds old -- safely past the 30s boundary.
+    // Uses 32s instead of 31s to avoid wall-clock race.
     run_with_large_stack(|| {
         let (sk, vk) = generate_dpop_keypair_raw();
         let vk_bytes = vk.encode();
         let key_hash = dpop_key_hash(vk_bytes.as_ref());
         let claims = b"boundary-test";
-        let ts = now_secs() - 31;
+        let ts = now_secs() - 32;
         let proof = generate_dpop_proof(&sk, claims, ts);
         assert!(
             !verify_dpop_proof(&vk, &proof, claims, ts, &key_hash),
-            "proof exactly 31s old must be rejected (> DPOP_MAX_AGE_SECS)"
+            "proof 32s old must be rejected (> DPOP_MAX_AGE_SECS=30)"
         );
     });
 }
 
 #[test]
 fn test_dpop_boundary_31s_future_rejected() {
-    // Exactly 31 seconds in the future — just past the 30s boundary.
+    // 32 seconds in the future -- safely past the 30s boundary.
+    // Uses 32s instead of 31s to avoid wall-clock race: between test's
+    // now_secs() and verify_dpop_proof's internal SystemTime::now(), up to
+    // 1 second can elapse, shifting the effective delta by 1s.
     run_with_large_stack(|| {
         let (sk, vk) = generate_dpop_keypair_raw();
         let vk_bytes = vk.encode();
         let key_hash = dpop_key_hash(vk_bytes.as_ref());
         let claims = b"boundary-test";
-        let ts = now_secs() + 31;
+        let ts = now_secs() + 32;
         let proof = generate_dpop_proof(&sk, claims, ts);
         assert!(
             !verify_dpop_proof(&vk, &proof, claims, ts, &key_hash),
-            "proof exactly 31s in future must be rejected (> DPOP_MAX_AGE_SECS)"
+            "proof 32s in future must be rejected (> DPOP_MAX_AGE_SECS=30)"
         );
     });
 }
 
 #[test]
 fn test_dpop_boundary_exactly_30s_past_accepted() {
-    // Exactly 30 seconds old — at the boundary, must be accepted.
-    // The check is `(now - timestamp).abs() > 30`, so exactly 30 passes.
+    // 28 seconds old -- safely within the 30s boundary.
+    // Uses 28s instead of exact 30s to avoid wall-clock race: between test's
+    // now_secs() and verify_dpop_proof's internal SystemTime::now(), up to
+    // 2 seconds can elapse, shifting the effective delta past the boundary.
     run_with_large_stack(|| {
         let (sk, vk) = generate_dpop_keypair_raw();
         let vk_bytes = vk.encode();
         let key_hash = dpop_key_hash(vk_bytes.as_ref());
         let claims = b"boundary-test";
-        let ts = now_secs() - 30;
+        let ts = now_secs() - 28;
         let proof = generate_dpop_proof(&sk, claims, ts);
         assert!(
             verify_dpop_proof(&vk, &proof, claims, ts, &key_hash),
-            "proof exactly 30s old should be accepted (not > 30, equal to 30)"
+            "proof 28s old should be accepted (within DPOP_MAX_AGE_SECS=30)"
         );
     });
 }
 
 #[test]
 fn test_dpop_boundary_exactly_30s_future_accepted() {
-    // Exactly 30 seconds in the future — at the boundary, must be accepted.
+    // 28 seconds in the future -- safely within the 30s boundary.
+    // Uses 28s instead of exact 30s to avoid wall-clock race.
     run_with_large_stack(|| {
         let (sk, vk) = generate_dpop_keypair_raw();
         let vk_bytes = vk.encode();
         let key_hash = dpop_key_hash(vk_bytes.as_ref());
         let claims = b"boundary-test";
-        let ts = now_secs() + 30;
+        let ts = now_secs() + 28;
         let proof = generate_dpop_proof(&sk, claims, ts);
         assert!(
             verify_dpop_proof(&vk, &proof, claims, ts, &key_hash),
-            "proof exactly 30s in future should be accepted (not > 30, equal to 30)"
+            "proof 28s in future should be accepted (within DPOP_MAX_AGE_SECS=30)"
         );
     });
 }

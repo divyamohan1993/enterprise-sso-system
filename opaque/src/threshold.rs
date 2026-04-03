@@ -32,20 +32,22 @@ fn gf256_sub(a: u8, b: u8) -> u8 {
     a ^ b
 }
 
-/// Multiplication in GF(256) using Russian peasant (shift-and-add) method.
+/// Constant-time multiplication in GF(256).
 /// Irreducible polynomial: x^8 + x^4 + x^3 + x + 1 = 0x11B.
-fn gf256_mul(mut a: u8, mut b: u8) -> u8 {
+///
+/// SECURITY: Always iterates exactly 8 times and uses bitwise masking
+/// instead of data-dependent branches. Prevents timing side-channels
+/// that could leak Shamir share coefficients to an attacker with
+/// precise timing measurement (e.g., co-located VM, cache timing).
+fn gf256_mul(mut a: u8, b: u8) -> u8 {
     let mut result: u8 = 0;
-    while b != 0 {
-        if b & 1 != 0 {
-            result ^= a;
-        }
-        let high_bit = a & 0x80;
-        a <<= 1;
-        if high_bit != 0 {
-            a ^= 0x1B; // Reduce modulo x^8 + x^4 + x^3 + x + 1
-        }
-        b >>= 1;
+    for i in 0..8u8 {
+        // Constant-time conditional XOR: mask is 0xFF if bit i of b is set, else 0x00
+        let mask = 0u8.wrapping_sub((b >> i) & 1);
+        result ^= a & mask;
+        // Constant-time conditional reduction: mask is 0xFF if high bit of a is set
+        let reduce_mask = 0u8.wrapping_sub((a >> 7) & 1);
+        a = (a << 1) ^ (0x1B & reduce_mask);
     }
     result
 }
