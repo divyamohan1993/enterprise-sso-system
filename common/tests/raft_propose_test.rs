@@ -127,3 +127,150 @@ async fn test_connect_to_cluster_drains_pipeline_async() {
         commands_again.len()
     );
 }
+
+// ── Raft message authentication tests ────────────────────────────────────
+
+/// SECURITY: Raft messages with valid HMAC pass verification.
+#[test]
+fn raft_authenticated_message_round_trip() {
+    use common::raft::{AuthenticatedRaftMessage, NodeId, RaftMessage, Term, LogIndex};
+
+    let transport_key = b"MILNET-RAFT-TRANSPORT-KEY-32BYTE!MILNET-RAFT-TRANSPORT-KEY-32BYTE!";
+    let sender = NodeId::random();
+    let msg = RaftMessage::RequestVote {
+        term: Term::new(1),
+        candidate_id: sender,
+        last_log_index: LogIndex::zero(),
+        last_log_term: Term::new(0),
+    };
+
+    let authenticated = AuthenticatedRaftMessage::sign(msg.clone(), sender, transport_key);
+    let (verified_msg, verified_sender) = authenticated.verify(transport_key)
+        .expect("valid HMAC must pass verification");
+    assert_eq!(*verified_msg, msg);
+    assert_eq!(verified_sender, sender);
+}
+
+/// SECURITY: Raft messages with wrong key are REJECTED.
+/// A compromised node using a different transport key cannot forge messages.
+#[test]
+fn raft_authenticated_message_rejects_wrong_key() {
+    use common::raft::{AuthenticatedRaftMessage, NodeId, RaftMessage, Term, LogIndex};
+
+    let legit_key = b"MILNET-RAFT-TRANSPORT-KEY-LEGIT!!MILNET-RAFT-TRANSPORT-KEY-LEGIT!!";
+    let attacker_key = b"ATTACKER-FORGED-KEY-00000000000!!ATTACKER-FORGED-KEY-00000000000!!";
+
+    let sender = NodeId::random();
+    let msg = RaftMessage::AppendEntries {
+        term: Term::new(5),
+        leader_id: sender,
+        prev_log_index: LogIndex::zero(),
+        prev_log_term: Term::new(4),
+        entries: Vec::new(),
+        leader_commit: LogIndex::zero(),
+    };
+
+    let authenticated = AuthenticatedRaftMessage::sign(msg, sender, attacker_key);
+    let result = authenticated.verify(legit_key);
+    assert!(
+        result.is_err(),
+        "message signed with attacker's key MUST be rejected by legitimate transport key"
+    );
+}
+
+/// SECURITY: Raft message tampering (flipping a bit) is detected.
+#[test]
+fn raft_authenticated_message_detects_tampering() {
+    use common::raft::{AuthenticatedRaftMessage, NodeId, RaftMessage, Term, LogIndex};
+
+    let transport_key = b"MILNET-RAFT-TRANSPORT-KEY-32BYTE!MILNET-RAFT-TRANSPORT-KEY-32BYTE!";
+    let sender = NodeId::random();
+    let msg = RaftMessage::RequestVoteResponse {
+        term: Term::new(3),
+        vote_granted: true,
+    };
+
+    let mut authenticated = AuthenticatedRaftMessage::sign(msg, sender, transport_key);
+    // Tamper: flip the vote_granted field
+    authenticated.message = RaftMessage::RequestVoteResponse {
+        term: Term::new(3),
+        vote_granted: false,
+    };
+    let result = authenticated.verify(transport_key);
+    assert!(
+        result.is_err(),
+        "tampered Raft message MUST be rejected — Byzantine vote manipulation detected"
+    );
+}
+
+// ── Gossip message authentication tests ──────────────────────────────────
+
+/// SECURITY: Gossip messages with valid HMAC pass verification.
+#[test]
+fn gossip_message_sign_and_verify() {
+    use common::gossip::{GossipMessage, GossipMessageType};
+
+    let transport_key = b"MILNET-GOSSIP-KEY-64BYTES-ABCDEFGHIJKLMNOP0123456789abcdefghijklm";
+    let mut msg = GossipMessage {
+        sender: "node-1".into(),
+        msg_type: GossipMessageType::Ping { sequence: 42 },
+        piggyback: Vec::new(),
+        incarnation: 7,
+        hmac_signature: Vec::new(),
+    };
+
+    msg.sign(transport_key);
+    assert!(!msg.hmac_signature.is_empty(), "sign must produce a non-empty HMAC");
+    msg.verify_signature(transport_key)
+        .expect("valid signed gossip message must verify");
+}
+
+/// SECURITY: Gossip messages from a forged sender are REJECTED.
+/// Prevents incarnation spoofing and membership poisoning.
+#[test]
+fn gossip_message_rejects_wrong_key() {
+    use common::gossip::{GossipMessage, GossipMessageType};
+
+    let legit_key = b"MILNET-GOSSIP-LEGIT-KEY-64BYTES-0123456789abcdefghijklmnopqrstuv";
+    let attacker_key = b"ATTACKER-GOSSIP-FORGED-KEY-64BY-0123456789abcdefghijklmnopqrstuv";
+
+    let mut msg = GossipMessage {
+        sender: "node-1".into(),
+        msg_type: GossipMessageType::Ack { sequence: 99 },
+        piggyback: Vec::new(),
+        incarnation: u64::MAX, // Attacker tries max incarnation to kill nodes
+        hmac_signature: Vec::new(),
+    };
+
+    msg.sign(attacker_key);
+    let result = msg.verify_signature(legit_key);
+    assert!(
+        result.is_err(),
+        "gossip message signed with attacker key MUST be rejected — \
+         prevents incarnation spoofing and Byzantine membership poisoning"
+    );
+}
+
+/// SECURITY: Gossip message tampering (incarnation change) is detected.
+#[test]
+fn gossip_message_detects_incarnation_tampering() {
+    use common::gossip::{GossipMessage, GossipMessageType};
+
+    let transport_key = b"MILNET-GOSSIP-KEY-64BYTES-ABCDEFGHIJKLMNOP0123456789abcdefghijklm";
+    let mut msg = GossipMessage {
+        sender: "node-1".into(),
+        msg_type: GossipMessageType::Ping { sequence: 1 },
+        piggyback: Vec::new(),
+        incarnation: 5,
+        hmac_signature: Vec::new(),
+    };
+
+    msg.sign(transport_key);
+    // Attacker modifies incarnation after signing
+    msg.incarnation = u64::MAX;
+    let result = msg.verify_signature(transport_key);
+    assert!(
+        result.is_err(),
+        "tampered gossip incarnation MUST be detected — prevents node kill attacks"
+    );
+}

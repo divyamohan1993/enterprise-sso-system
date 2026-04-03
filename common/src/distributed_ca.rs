@@ -56,8 +56,8 @@ pub struct DistributedCaConfig {
 impl Default for DistributedCaConfig {
     fn default() -> Self {
         Self {
-            threshold: 2,
-            total_signers: 3,
+            threshold: 3,
+            total_signers: 5,
             default_validity_hours: 720,  // 30 days
             max_validity_hours: 8760,     // 1 year
             renewal_threshold_hours: 168, // 7 days

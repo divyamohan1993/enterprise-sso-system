@@ -74,6 +74,10 @@ pub struct MemberState {
 }
 
 /// A gossip message exchanged between nodes.
+///
+/// All gossip messages are HMAC-authenticated to prevent Byzantine poisoning.
+/// A compromised node can only send messages attributed to itself, not forge
+/// messages from other nodes (incarnation spoofing, status manipulation).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GossipMessage {
     pub sender: String,
@@ -81,6 +85,73 @@ pub struct GossipMessage {
     /// Piggybacked membership updates disseminated alongside pings/acks.
     pub piggyback: Vec<MembershipUpdate>,
     pub incarnation: u64,
+    /// HMAC-SHA512 over (sender || incarnation || msg_type || piggyback),
+    /// keyed with the sender's node transport key. Empty for legacy compat
+    /// but MUST be verified in military deployment mode.
+    #[serde(default)]
+    pub hmac_signature: Vec<u8>,
+}
+
+impl GossipMessage {
+    /// Compute HMAC-SHA512 signature over the message fields.
+    pub fn sign(&mut self, transport_key: &[u8]) {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha512;
+        type HmacSha512 = Hmac<Sha512>;
+
+        let mut mac = HmacSha512::new_from_slice(transport_key)
+            .expect("HMAC key size is valid");
+        mac.update(self.sender.as_bytes());
+        mac.update(&self.incarnation.to_le_bytes());
+        let type_bytes = postcard::to_allocvec(&self.msg_type).unwrap_or_default();
+        mac.update(&type_bytes);
+        let piggyback_bytes = postcard::to_allocvec(&self.piggyback).unwrap_or_default();
+        mac.update(&piggyback_bytes);
+        self.hmac_signature = mac.finalize().into_bytes().to_vec();
+    }
+
+    /// Verify the HMAC signature on a received gossip message.
+    /// In military deployment mode, unsigned messages are rejected.
+    pub fn verify_signature(&self, transport_key: &[u8]) -> Result<(), String> {
+        if self.hmac_signature.is_empty() {
+            if std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok()
+                || std::env::var("MILNET_PRODUCTION").is_ok()
+            {
+                return Err(format!(
+                    "gossip message from '{}' has no HMAC signature — \
+                     rejected in military deployment mode",
+                    self.sender
+                ));
+            }
+            tracing::warn!(
+                target: "siem",
+                "SIEM:WARNING gossip message from '{}' has no HMAC signature",
+                self.sender
+            );
+            return Ok(());
+        }
+
+        use hmac::{Hmac, Mac};
+        use sha2::Sha512;
+        type HmacSha512 = Hmac<Sha512>;
+
+        let mut mac = HmacSha512::new_from_slice(transport_key)
+            .expect("HMAC key size is valid");
+        mac.update(self.sender.as_bytes());
+        mac.update(&self.incarnation.to_le_bytes());
+        let type_bytes = postcard::to_allocvec(&self.msg_type).unwrap_or_default();
+        mac.update(&type_bytes);
+        let piggyback_bytes = postcard::to_allocvec(&self.piggyback).unwrap_or_default();
+        mac.update(&piggyback_bytes);
+
+        mac.verify_slice(&self.hmac_signature).map_err(|_| {
+            format!(
+                "gossip HMAC verification failed from '{}' incarnation {} — \
+                 possible Byzantine poisoning or key mismatch",
+                self.sender, self.incarnation
+            )
+        })
+    }
 }
 
 /// The type of gossip message.

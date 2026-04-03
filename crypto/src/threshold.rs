@@ -92,15 +92,73 @@ pub fn dkg(total: u16, threshold: u16) -> DkgResult {
 ///
 /// Falls back to the trusted dealer DKG if `pedersen_dkg` is not available.
 pub fn dkg_distributed(total: u16, threshold: u16) -> DkgResult {
-    // Delegate to pedersen_dkg if available, otherwise fall back to trusted dealer
-    // with a SIEM warning.
-    tracing::warn!(
-        "dkg_distributed: pedersen_dkg module integration pending. \
-         Falling back to trusted dealer DKG. Production MUST use Pedersen DKG \
-         (crate::pedersen_dkg) for dealer-free distributed key generation."
-    );
-    #[allow(deprecated)]
-    dkg(total, threshold)
+    // Perform a full Pedersen DKG ceremony where no single participant
+    // ever holds the complete signing key. Each participant generates
+    // their own secret polynomial and exchanges shares via VSS.
+    use crate::pedersen_dkg::DkgParticipant;
+
+    let n = total as usize;
+    let mut participants: Vec<DkgParticipant> = (1..=total)
+        .map(|id| DkgParticipant::new(id, threshold, total))
+        .collect();
+
+    // Round 1: Each participant generates commitments.
+    let round1_outputs: Vec<_> = participants.iter_mut().map(|p| p.round1()).collect();
+
+    // Round 2: Each participant receives others' round1 packages and generates shares.
+    let mut all_round2: Vec<Vec<crate::pedersen_dkg::DkgRound2>> = Vec::with_capacity(n);
+    for i in 0..n {
+        let others: Vec<&crate::pedersen_dkg::DkgRound1> = round1_outputs
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, r)| r)
+            .collect();
+        let r2 = participants[i]
+            .round2(&others)
+            .expect("FATAL: Pedersen DKG round 2 failed");
+        all_round2.push(r2);
+    }
+
+    // Finalize: Each participant combines received shares.
+    for i in 0..n {
+        let my_id = (i + 1) as u16;
+        let for_me: Vec<&crate::pedersen_dkg::DkgRound2> = all_round2
+            .iter()
+            .flat_map(|rounds| rounds.iter())
+            .filter(|pkg| pkg.receiver_id == my_id)
+            .collect();
+        participants[i]
+            .finalize(&for_me)
+            .expect("FATAL: Pedersen DKG finalize failed");
+    }
+
+    // Extract key packages and group public key.
+    let public_key_package = participants[0]
+        .group_public_key()
+        .expect("FATAL: group public key not available after DKG");
+
+    let shares: Vec<SignerShare> = participants
+        .iter()
+        .map(|p| {
+            let kp = p.key_package().expect("key package missing after DKG").clone();
+            let id = *kp.identifier();
+            SignerShare {
+                identifier: id,
+                key_package: kp,
+                nonce_counter: std::sync::atomic::AtomicU64::new(0),
+            }
+        })
+        .collect();
+
+    DkgResult {
+        group: ThresholdGroup {
+            threshold: threshold as usize,
+            total: total as usize,
+            public_key_package: public_key_package.clone(),
+        },
+        shares,
+    }
 }
 
 /// Perform a threshold signing round using a specific set of signers.

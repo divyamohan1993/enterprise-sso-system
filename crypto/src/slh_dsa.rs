@@ -1042,8 +1042,9 @@ pub fn slh_dsa_verify(
         current_tree >>= XMSS_HEIGHT;
     }
 
-    // The final root should match PK.root
-    ht_msg == verifying_key.pk_root
+    // The final root should match PK.root — constant-time to prevent timing oracles.
+    use subtle::ConstantTimeEq;
+    ht_msg.ct_eq(&verifying_key.pk_root).into()
 }
 
 #[cfg(test)]

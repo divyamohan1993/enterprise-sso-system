@@ -360,20 +360,26 @@ impl RiskEngine {
         let baseline_anomaly = self.baseline_store.compute_anomaly_score(user_id, &signals);
         score += baseline_anomaly * 0.10;
 
-        // Mimicry detection: flag sessions where ALL signals are simultaneously
-        // perfect (statistically improbable for real users). A legitimate user
-        // will have at least some non-zero signal noise.
-        let all_perfect = signals.device_attestation_age_secs == 0.0
-            && signals.geo_velocity_kmh == 0.0
+        // Mimicry detection: flag sessions where signals are suspiciously clean.
+        // A legitimate user always has *some* attestation age, network jitter,
+        // and minor anomalies. Nation-state attackers who craft perfect signals
+        // to avoid detection are caught here.
+        //
+        // Use epsilon thresholds instead of exact == 0.0 to prevent trivial bypass
+        // where an attacker sets values to 0.001 (above zero but below any penalty).
+        const ATTESTATION_EPSILON: f64 = 1.0; // < 1 second = suspiciously fresh
+        const GEO_EPSILON: f64 = 1.0;         // < 1 km/h = suspiciously static
+        const ACCESS_EPSILON: f64 = 0.01;      // near-zero access anomaly
+        let signals_too_clean = signals.device_attestation_age_secs < ATTESTATION_EPSILON
+            && signals.geo_velocity_kmh < GEO_EPSILON
             && !signals.is_unusual_network
             && !signals.is_unusual_time
-            && signals.unusual_access_score == 0.0
+            && signals.unusual_access_score < ACCESS_EPSILON
             && server_fails == 0;
-        if all_perfect {
-            // Suspiciously clean — add a penalty.
-            // Real users always have *some* attestation age and minor anomalies.
-            // A perfectly forged session gets +0.15, making it harder for
-            // adversaries to stay below the 0.3 Elevated threshold.
+        if signals_too_clean {
+            // Suspiciously clean signals get a penalty that scales with how
+            // perfectly clean they are. Minimum +0.15, prevents adversaries
+            // from staying below the 0.3 Elevated threshold.
             score += 0.15;
         }
 

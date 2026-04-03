@@ -62,8 +62,32 @@ impl ConsistentHashRing {
     }
 
     /// Add a node with its virtual nodes to the ring.
-    /// When a CA key is configured, prefer `add_node_authenticated` instead.
+    ///
+    /// # Security
+    /// When a CA verifying key is configured, this method is restricted to
+    /// internal use only (called from `add_node_authenticated` after cert
+    /// verification). Direct external callers MUST use `add_node_authenticated`.
+    /// Panics in military deployment if called directly when a CA key is set.
     pub fn add_node(&mut self, node_id: &str) {
+        if self.ca_verifying_key.is_some() {
+            // In authenticated mode, only add_node_authenticated should call us.
+            // If called directly, a rogue node could bypass certificate verification.
+            if std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok()
+                || std::env::var("MILNET_PRODUCTION").is_ok()
+            {
+                panic!(
+                    "SECURITY: add_node() called directly with CA key configured. \
+                     Use add_node_authenticated() to verify node certificates. \
+                     node_id='{node_id}'"
+                );
+            }
+            tracing::warn!(
+                target: "siem",
+                "SIEM:WARNING add_node() called directly with CA key configured for node '{}'. \
+                 Use add_node_authenticated() in production.",
+                node_id
+            );
+        }
         if !self.nodes.insert(node_id.to_owned()) {
             return; // already present
         }

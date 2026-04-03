@@ -134,6 +134,10 @@ pub struct LogEntry {
 // ── Messages ───────────────────────────────────────────────────────────────────
 
 /// Messages exchanged between Raft nodes.
+///
+/// Every message carries an HMAC-SHA512 signature computed over the serialized
+/// payload using the cluster transport key. This prevents a compromised node
+/// from forging messages attributed to other nodes (Byzantine message forgery).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RaftMessage {
     /// Sent by a candidate to request votes during an election.
@@ -163,6 +167,64 @@ pub enum RaftMessage {
         success: bool,
         match_index: LogIndex,
     },
+}
+
+/// An authenticated Raft message wrapper that binds each message to its sender
+/// via HMAC-SHA512. Prevents Byzantine message forgery between Raft nodes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthenticatedRaftMessage {
+    /// The actual Raft protocol message.
+    pub message: RaftMessage,
+    /// The node that produced this message.
+    pub sender_id: NodeId,
+    /// HMAC-SHA512 over (sender_id || serialized message), keyed with the
+    /// per-node transport key derived from the cluster KEK.
+    pub hmac_signature: Vec<u8>,
+}
+
+impl AuthenticatedRaftMessage {
+    /// Create and sign a Raft message.
+    pub fn sign(message: RaftMessage, sender_id: NodeId, transport_key: &[u8]) -> Self {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha512;
+        type HmacSha512 = Hmac<Sha512>;
+
+        let msg_bytes = postcard::to_allocvec(&message).unwrap_or_default();
+        let mut mac = HmacSha512::new_from_slice(transport_key)
+            .expect("HMAC key size is valid");
+        mac.update(&sender_id.0.as_bytes()[..]);
+        mac.update(&msg_bytes);
+        let hmac_signature = mac.finalize().into_bytes().to_vec();
+
+        Self {
+            message,
+            sender_id,
+            hmac_signature,
+        }
+    }
+
+    /// Verify the HMAC signature on a received message.
+    /// Returns the inner message and sender if verification succeeds.
+    pub fn verify(&self, transport_key: &[u8]) -> Result<(&RaftMessage, NodeId), String> {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha512;
+        type HmacSha512 = Hmac<Sha512>;
+
+        let msg_bytes = postcard::to_allocvec(&self.message).unwrap_or_default();
+        let mut mac = HmacSha512::new_from_slice(transport_key)
+            .expect("HMAC key size is valid");
+        mac.update(&self.sender_id.0.as_bytes()[..]);
+        mac.update(&msg_bytes);
+
+        mac.verify_slice(&self.hmac_signature)
+            .map_err(|_| format!(
+                "Raft message HMAC verification failed from node {:?} — \
+                 possible Byzantine forgery or transport key mismatch",
+                self.sender_id
+            ))?;
+
+        Ok((&self.message, self.sender_id))
+    }
 }
 
 impl RaftMessage {

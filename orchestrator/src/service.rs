@@ -94,6 +94,12 @@ pub struct OrchestratorService {
     pub opaque_addr: String,
     pub tss_addr: String,
     pub risk_engine: risk::scoring::RiskEngine,
+    /// Advanced anomaly detector for z-score based behavioral analysis,
+    /// impossible travel detection, and cross-user correlation.
+    pub anomaly_detector: risk::anomaly::AnomalyDetector,
+    /// SIEM correlation engine for detecting distributed attacks
+    /// (brute force, credential stuffing, lateral movement, etc.).
+    pub correlation_engine: risk::correlation::CorrelationEngine,
     /// TLS connector for outbound mTLS connections to peer services.
     pub tls_connector: TlsConnector,
     /// Circuit breaker for OPAQUE service connections.
@@ -122,6 +128,8 @@ impl OrchestratorService {
             opaque_addr,
             tss_addr,
             risk_engine: risk::scoring::RiskEngine::new(),
+            anomaly_detector: risk::anomaly::AnomalyDetector::new(),
+            correlation_engine: risk::correlation::CorrelationEngine::with_default_rules(),
             tls_connector,
             opaque_breaker: common::circuit_breaker::CircuitBreaker::new(3, std::time::Duration::from_secs(30)),
             tss_breaker: common::circuit_breaker::CircuitBreaker::new(3, std::time::Duration::from_secs(30)),
@@ -148,6 +156,8 @@ impl OrchestratorService {
             opaque_addr,
             tss_addr,
             risk_engine: risk::scoring::RiskEngine::new(),
+            anomaly_detector: risk::anomaly::AnomalyDetector::new(),
+            correlation_engine: risk::correlation::CorrelationEngine::with_default_rules(),
             tls_connector,
             opaque_breaker: common::circuit_breaker::CircuitBreaker::new(3, std::time::Duration::from_secs(30)),
             tss_breaker: common::circuit_breaker::CircuitBreaker::new(3, std::time::Duration::from_secs(30)),
@@ -170,6 +180,8 @@ impl OrchestratorService {
             opaque_addr,
             tss_addr,
             risk_engine: risk::scoring::RiskEngine::new(),
+            anomaly_detector: risk::anomaly::AnomalyDetector::new(),
+            correlation_engine: risk::correlation::CorrelationEngine::with_default_rules(),
             tls_connector,
             opaque_breaker: common::circuit_breaker::CircuitBreaker::new(3, std::time::Duration::from_secs(30)),
             tss_breaker: common::circuit_breaker::CircuitBreaker::new(3, std::time::Duration::from_secs(30)),
@@ -196,6 +208,8 @@ impl OrchestratorService {
             opaque_addr,
             tss_addr,
             risk_engine: risk::scoring::RiskEngine::new(),
+            anomaly_detector: risk::anomaly::AnomalyDetector::new(),
+            correlation_engine: risk::correlation::CorrelationEngine::with_default_rules(),
             tls_connector,
             opaque_breaker: common::circuit_breaker::CircuitBreaker::new(3, std::time::Duration::from_secs(30)),
             tss_breaker: common::circuit_breaker::CircuitBreaker::new(3, std::time::Duration::from_secs(30)),
@@ -511,12 +525,44 @@ impl OrchestratorService {
             session_duration_secs: None,
         };
         let risk_score = self.risk_engine.compute_score(&user_id, &risk_signals);
-        if self.risk_engine.requires_termination(risk_score) {
+
+        // Run advanced anomaly detection (z-score, impossible travel, cross-user correlation).
+        // This was previously disconnected — now integrated into the auth decision path.
+        let login_hour = {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or(std::time::Duration::ZERO)
+                .as_secs();
+            ((now % 86400) as f64) / 3600.0
+        };
+        let anomaly_result = self.anomaly_detector.analyze_login(
+            &user_id,
+            login_hour,
+            request.device_fingerprint.as_deref(),
+            request.source_ip.as_deref(),
+            None, // geo coordinates from request if available
+        );
+        // Combine risk score with anomaly score (weighted average).
+        let combined_score = risk_score * 0.6 + anomaly_result.composite_score * 0.4;
+
+        // Run SIEM correlation rules for distributed attack detection.
+        let correlation_alerts = self.correlation_engine.evaluate_all();
+        if !correlation_alerts.is_empty() {
+            for alert in &correlation_alerts {
+                tracing::warn!(
+                    target: "siem",
+                    "SIEM:CORRELATION rule='{}' severity={:?} — {}",
+                    alert.rule_name, alert.severity, alert.description
+                );
+            }
+        }
+
+        if self.risk_engine.requires_termination(combined_score) {
             return Err("risk: session terminated — critical risk score".into());
         }
-        if self.risk_engine.requires_step_up(risk_score) {
-            tracing::warn!("Risk score {risk_score} >= 0.6 — step-up re-auth required");
-            return Err(format!("risk: step-up re-authentication required (score={risk_score:.2})"));
+        if self.risk_engine.requires_step_up(combined_score) {
+            tracing::warn!("Combined risk score {combined_score:.2} >= 0.6 — step-up re-auth required");
+            return Err(format!("risk: step-up re-authentication required (score={combined_score:.2})"));
         }
 
         // 6. Build and send TSS signing request
