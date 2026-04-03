@@ -396,7 +396,10 @@ async fn main() {
     // Spawn health check endpoint on port+1000 (or MILNET_HEALTH_PORT)
     let health_start = std::time::Instant::now();
     let svc_port: u16 = port.parse().unwrap_or(9100);
-    let orch_addr_health = orch_addr.clone();
+    let orch_addr_health: std::net::SocketAddr = std::env::var("ORCH_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:9101".into())
+        .parse()
+        .unwrap_or_else(|_| std::net::SocketAddr::from(([127, 0, 0, 1], 9101)));
     let _health_handle = common::health::spawn_health_endpoint(
         "gateway".to_string(),
         svc_port,
@@ -404,9 +407,7 @@ async fn main() {
         move || {
             // Probe orchestrator reachability instead of always returning ok
             let orch_ok = std::net::TcpStream::connect_timeout(
-                &orch_addr_health.parse().unwrap_or_else(|_| {
-                    std::net::SocketAddr::from(([127, 0, 0, 1], 9101))
-                }),
+                &orch_addr_health,
                 std::time::Duration::from_secs(2),
             )
             .is_ok();
