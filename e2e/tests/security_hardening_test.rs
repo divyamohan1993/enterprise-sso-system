@@ -919,11 +919,12 @@ fn master_key_from_seed_valid() {
 
 #[test]
 fn master_key_from_seed_rejects_empty() {
-    assert_eq!(
-        MasterKey::from_seed(b"").unwrap_err(),
-        SealError::InvalidMasterKey,
-        "empty seed must return InvalidMasterKey"
-    );
+    let result = MasterKey::from_seed(b"");
+    assert!(result.is_err(), "empty seed must return Err");
+    match result {
+        Err(SealError::InvalidMasterKey) => {}
+        other => panic!("expected InvalidMasterKey, got {:?}", other.is_ok()),
+    }
 }
 
 #[test]
@@ -1063,7 +1064,7 @@ fn frost_two_compromised_cannot_forge() {
         // Attacker holds only 2 shares. Signing with 2 must fail or produce
         // invalid signature.
         let attack_msg = b"forged message";
-        let mut compromised = shares[..2].to_vec();
+        let mut compromised: Vec<_> = shares.drain(..2).collect();
         let attack_result = threshold_sign(&mut compromised, &group, attack_msg, 2);
         match attack_result {
             Err(_) => {} // below threshold, expected
