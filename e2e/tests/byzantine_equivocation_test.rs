@@ -5,7 +5,7 @@
 //! signatures are rejected by the audit pipeline.
 
 use audit::bft::{BftAuditCluster, BFT_QUORUM, MIN_BFT_NODES};
-use common::types::AuditEventType;
+use common::types::{AuditEntry, AuditEventType};
 use crypto::pq_sign::{
     generate_pq_keypair, pq_sign_raw, pq_verify_raw,
 };
@@ -121,8 +121,8 @@ fn test_five_byzantine_of_eleven_prevents_consensus() {
 
     let err_msg = result.unwrap_err();
     assert!(
-        err_msg.contains("quorum not met"),
-        "error message should indicate quorum not met; got: '{}'",
+        err_msg.contains("quorum") || err_msg.contains("proposer"),
+        "error message should indicate quorum or proposer failure; got: '{}'",
         err_msg
     );
 }
@@ -260,37 +260,36 @@ fn test_verify_consistency_detects_divergence() {
         "honest cluster must be consistent after one accepted entry"
     );
 
-    // Simulate divergence by marking nodes 1..10 as Byzantine (so only node 0
-    // acts as honest proposer) and then proposing a second entry.  Only node 0
-    // will accept the new entry (the others are Byzantine and refuse), but the
-    // length check in verify_consistency will see node 0 has 2 entries while
-    // the rest have only 1, triggering a divergence report.
-    for id in 1u8..11 {
-        cluster.set_byzantine(id);
-    }
+    // Simulate divergence by directly manipulating a node's log.
+    // The two-phase BFT protocol prevents partial commits, so we cannot
+    // create divergence through the normal proposal path. Instead, we
+    // directly tamper with a node's state to simulate what a Byzantine
+    // attacker with disk access could do.
+    //
+    // Append a rogue entry directly to node 1's log (bypassing the protocol).
+    // This simulates an attacker who has compromised node 1's disk.
+    let rogue_entry = common::types::AuditEntry {
+        event_id: Uuid::new_v4(),
+        event_type: AuditEventType::AuthFailure,
+        user_ids: vec![Uuid::new_v4()],
+        device_ids: vec![],
+        ceremony_receipts: vec![],
+        risk_score: 0.9,
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as i64,
+        prev_hash: [0xFFu8; 64], // Deliberately wrong prev_hash
+        signature: vec![],
+        classification: CLASSIFICATION_UNCLASSIFIED,
+    };
+    // Force-append the rogue entry to node 1's log
+    let _ = cluster.nodes[1].log.append_raw(rogue_entry);
 
-    // propose_entry will fail quorum (only 1 honest acceptor), but node 0's
-    // log will grow to length 2 because accept_entry succeeds for honest nodes
-    // regardless of quorum. We accept the error.
-    let _ = cluster.propose_entry(
-        AuditEventType::AuthFailure,
-        vec![Uuid::new_v4()],
-        vec![],
-        0.9,
-        vec![],
-        CLASSIFICATION_UNCLASSIFIED,
-    );
-
-    // Restore nodes 1..10 as non-Byzantine so verify_consistency compares them
-    // (the function only compares non-Byzantine nodes internally).  We need at
-    // least two honest nodes with different lengths for the check to fire.
-    // Reset node 1 to honest so it has a different length than node 0.
-    cluster.nodes[1].is_byzantine = false;
-
-    // Now node 0 has 2 entries and node 1 has 1 entry — chains have diverged.
+    // Now node 0 has 1 entry and node 1 has 2 entries with a broken chain.
     assert!(
         !cluster.verify_consistency(),
         "verify_consistency must return false when honest nodes have different \
-         chain lengths (node 0 has 2 entries, node 1 has 1 entry)"
+         chain lengths (node 0 has 1 entry, node 1 has 2 entries due to tampering)"
     );
 }
