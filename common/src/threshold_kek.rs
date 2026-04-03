@@ -811,4 +811,103 @@ mod tests {
         assert!(debug.contains("REDACTED"));
         assert!(!debug.contains("ab"));
     }
+
+    // ── VSS Commitment Tests ──────────────────────────────────────────────
+
+    #[test]
+    fn vss_commitments_verify_valid_shares() {
+        let secret = [0x42u8; 32];
+        let (shares, commitments) = split_secret_with_commitments(&secret, 3, 5).unwrap();
+        assert_eq!(commitments.commitments.len(), 5);
+        for share in &shares {
+            assert!(
+                commitments.verify_share(share, &secret),
+                "valid share {} must verify against its commitment",
+                share.index
+            );
+        }
+    }
+
+    #[test]
+    fn vss_commitments_reject_tampered_share() {
+        let secret = [0x42u8; 32];
+        let (shares, commitments) = split_secret_with_commitments(&secret, 3, 5).unwrap();
+        // Tamper with a share's value
+        let mut tampered = shares[2].clone();
+        tampered.value[0] ^= 0xFF;
+        assert!(
+            !commitments.verify_share(&tampered, &secret),
+            "tampered share must fail verification"
+        );
+    }
+
+    #[test]
+    fn vss_commitments_reject_wrong_index() {
+        let secret = [0x42u8; 32];
+        let (shares, commitments) = split_secret_with_commitments(&secret, 3, 5).unwrap();
+        // Use share value from index 1 but claim it's index 2
+        let forged = KekShare::new(2, shares[0].value);
+        assert!(
+            !commitments.verify_share(&forged, &secret),
+            "share with wrong index must fail verification"
+        );
+    }
+
+    #[test]
+    fn vss_commitments_hex_roundtrip() {
+        let secret = [0x42u8; 32];
+        let (_, commitments) = split_secret_with_commitments(&secret, 2, 3).unwrap();
+        let hex = commitments.to_hex();
+        let recovered = VssCommitments::from_hex(&hex).unwrap();
+        assert_eq!(recovered.commitments.len(), commitments.commitments.len());
+        for (a, b) in recovered.commitments.iter().zip(commitments.commitments.iter()) {
+            assert_eq!(a.0, b.0); // index
+            assert_eq!(a.1, b.1); // mac
+        }
+    }
+
+    #[test]
+    fn vss_commitments_different_secrets_different_macs() {
+        let secret1 = [0x11u8; 32];
+        let secret2 = [0x22u8; 32];
+        let (_, c1) = split_secret_with_commitments(&secret1, 2, 3).unwrap();
+        let (_, c2) = split_secret_with_commitments(&secret2, 2, 3).unwrap();
+        // At least some commitments must differ
+        let differ = c1.commitments.iter().zip(c2.commitments.iter())
+            .any(|(a, b)| a.1 != b.1);
+        assert!(differ, "different secrets must produce different commitments");
+    }
+
+    #[test]
+    fn split_with_commitments_reconstruction_works() {
+        let secret = [0xABu8; 32];
+        let (shares, _commitments) = split_secret_with_commitments(&secret, 3, 5).unwrap();
+        // Verify reconstruction still works with commitment-generated shares
+        let recovered = reconstruct_secret(&shares[1..4]).unwrap();
+        assert_eq!(recovered, secret);
+    }
+
+    #[test]
+    fn vss_commitments_reject_completely_fabricated_share() {
+        let secret = [0x42u8; 32];
+        let (_, commitments) = split_secret_with_commitments(&secret, 3, 5).unwrap();
+        // Fabricate a share with a valid index but random value
+        let fabricated = KekShare::new(1, [0xFF; 32]);
+        assert!(
+            !commitments.verify_share(&fabricated, &secret),
+            "fabricated share must fail verification"
+        );
+    }
+
+    #[test]
+    fn vss_commitments_reject_nonexistent_index() {
+        let secret = [0x42u8; 32];
+        let (_, commitments) = split_secret_with_commitments(&secret, 2, 3).unwrap();
+        // Index 4 doesn't exist in 3-share set
+        let bad = KekShare::new(4, [0x42; 32]);
+        assert!(
+            !commitments.verify_share(&bad, &secret),
+            "share with nonexistent index must fail verification"
+        );
+    }
 }
