@@ -503,7 +503,8 @@ mod tests {
     #[test]
     fn ack_nonexistent_sequence_rejected() {
         let ab = AtomicBroadcast::new(1);
-        assert!(ab.receive_ack(999, "node-1", make_sig()).is_err());
+        // Sequence 999 was never broadcast, so this must fail regardless of signature.
+        assert!(ab.receive_ack(999, "node-1", vec![0x01; 64]).is_err());
     }
 
     #[test]
