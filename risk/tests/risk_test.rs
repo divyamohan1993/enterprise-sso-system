@@ -73,11 +73,9 @@ fn failed_attempts_increase_risk() {
     }
     let signals = clean_signals();
     let score = engine.compute_score(&user, &signals);
-    // Server-side: 5/5 * 0.15 = 0.15, plus mimicry penalty (+0.05, since
-    // all signal fields are zero/false), plus noise [0.0, 0.03).
-    // But mimicry requires server_fails == 0, and here server_fails == 5,
-    // so no mimicry penalty. Score = 0.15 + noise [0.0, 0.03).
-    assert!(score >= 0.15 && score < 0.18, "expected [0.15, 0.18), got {score}");
+    // Server-side: 5/5 * 0.15 = 0.15. Mimicry does NOT fire (server_fails != 0).
+    // Score = 0.15 + noise [0.0, 0.08).
+    assert!(score >= 0.15 && score < 0.23, "expected [0.15, 0.23), got {score}");
 }
 
 #[test]
@@ -252,8 +250,8 @@ fn unusual_time_adds_risk() {
     let mut signals = clean_signals();
     signals.is_unusual_time = true;
     let score = engine.compute_score(&user, &signals);
-    // 0.10 + noise [0.0, 0.03)
-    assert!(score >= 0.10 && score < 0.13, "unusual time should add 0.10 + noise, got {score}");
+    // 0.10 + noise [0.0, 0.08). Mimicry does NOT fire (is_unusual_time=true breaks AND).
+    assert!(score >= 0.10 && score < 0.18, "unusual time should add 0.10 + noise, got {score}");
 }
 
 #[test]
@@ -281,8 +279,8 @@ fn combined_signals_additive() {
     signals.is_unusual_time = true;    // +0.10
     // recent_failed_attempts is ignored; server-side counter is used (+0.15)
     let score = engine.compute_score(&user, &signals);
-    // 0.15 + 0.10 + 0.15 + noise [0.0, 0.03) = [0.40, 0.43)
-    assert!(score >= 0.40 && score < 0.43, "combined signals should be 0.40 + noise, got {score}");
+    // 0.15 + 0.10 + 0.15 + noise [0.0, 0.08) = [0.40, 0.48). No mimicry (multiple flags true).
+    assert!(score >= 0.40 && score < 0.48, "combined signals should be 0.40 + noise, got {score}");
     assert!(matches!(engine.classify(score), RiskLevel::Elevated), "expected Elevated classification");
 }
 
