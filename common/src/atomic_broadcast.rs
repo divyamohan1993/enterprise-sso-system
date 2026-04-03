@@ -377,28 +377,29 @@ fn verify_ack_signature(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ml_dsa::{MlDsa87, SigningKey, signature::Signer, EncodedSigningKey};
+    use ml_dsa::{KeyGen, MlDsa87, SigningKey, signature::Signer};
 
-    /// Test keypair: generate an ML-DSA-87 signing key once per test suite.
-    /// Returns (signing_key, verifying_key_bytes).
+    /// Generate a real ML-DSA-87 keypair from a random seed.
+    /// Returns (signing_key, verifying_key_bytes) for test use.
     fn make_test_keypair() -> (SigningKey<MlDsa87>, Vec<u8>) {
-        let mut rng = rand::rngs::OsRng;
-        let sk = SigningKey::<MlDsa87>::generate(&mut rng);
-        let vk = sk.verifying_key();
-        let vk_bytes = vk.encode().as_ref().to_vec();
+        let mut seed = [0u8; 32];
+        getrandom::getrandom(&mut seed).expect("getrandom for test keypair");
+        let kp = MlDsa87::from_seed(&seed.into());
+        let sk = kp.signing_key().clone();
+        let vk_bytes = kp.verifying_key().encode().to_vec();
         (sk, vk_bytes)
     }
 
-    /// Sign an ack digest with the given signing key, returning the signature bytes.
+    /// Sign an ack digest with the given signing key, returning the encoded signature bytes.
     fn sign_ack(sk: &SigningKey<MlDsa87>, ab: &AtomicBroadcast, seq: u64) -> Vec<u8> {
         let pending = crate::sync::siem_read(&ab.pending, "test::sign_ack");
         let msg = pending.get(&seq).expect("message must exist for signing");
         let digest = msg.ack_digest();
-        let sig = sk.sign(&digest);
-        sig.to_bytes().to_vec()
+        let sig: ml_dsa::Signature<MlDsa87> = sk.sign(&digest);
+        sig.encode().to_vec()
     }
 
-    /// Register a node's key and return its signing key for producing valid acks.
+    /// Register a node's ML-DSA-87 key and return its signing key for producing valid acks.
     fn register_node(ab: &AtomicBroadcast, node_id: &str) -> SigningKey<MlDsa87> {
         let (sk, vk_bytes) = make_test_keypair();
         ab.register_verifying_key(node_id, vk_bytes);
