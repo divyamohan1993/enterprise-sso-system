@@ -90,8 +90,13 @@ fn crypto_downgrade_aegis_default_non_fips() {
     );
 }
 
+/// Mutex to serialize tests that toggle global FIPS mode, preventing races
+/// where one test enables FIPS while another test reads the global state.
+static FIPS_TOGGLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn crypto_downgrade_aes_gcm_in_fips() {
+    let _guard = FIPS_TOGGLE_LOCK.lock().unwrap();
     common::fips::set_fips_mode_unchecked(true);
     assert_eq!(active_algorithm(), SymmetricAlgorithm::Aes256Gcm);
 

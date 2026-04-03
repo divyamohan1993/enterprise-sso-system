@@ -615,6 +615,10 @@ async fn test_attack_timing_attack_on_password_verification() {
     // Register user "alice" with a known password.
     // Measure time for: correct password, wrong password, nonexistent user.
     // The times should be similar (within 20% variance) to prevent timing oracles.
+    //
+    // Raise rate limit for this test: we need 10 connections in rapid succession.
+    // The default 10/60s limit can cause failures if the test thread is slow.
+    std::env::set_var("MILNET_MAX_CONN_PER_IP", "100");
     let mut store = CredentialStore::new();
     store.register_with_password("alice", b"known_password");
     let (gateway_addr, _) = boot_full_system(store).await;

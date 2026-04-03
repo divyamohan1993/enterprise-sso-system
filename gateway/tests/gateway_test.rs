@@ -25,7 +25,9 @@ fn puzzle_generate_and_solve() {
 
 #[test]
 fn puzzle_wrong_solution_rejected() {
-    let challenge = generate_challenge(4);
+    // Use difficulty 16 (16 leading zero bits = 1/65536 chance of false pass)
+    // to eliminate flakiness. Difficulty 4 has 1/16 chance of random pass.
+    let challenge = generate_challenge(16);
     let bad_solution = [0xFFu8; 32];
     assert!(
         !verify_solution(&challenge, &bad_solution),
