@@ -233,6 +233,8 @@ async fn orchestrator_processes_auth() {
         is_unusual_time: None,
         unusual_access_score: None,
         recent_failed_attempts: None,
+        device_fingerprint: None,
+        source_ip: None,
     };
 
     let response = service.process_auth(&request).await;
@@ -371,6 +373,8 @@ async fn orchestrator_handles_opaque_failure() {
         is_unusual_time: None,
         unusual_access_score: None,
         recent_failed_attempts: None,
+        device_fingerprint: None,
+        source_ip: None,
     };
 
     let response = service.process_auth(&request).await;

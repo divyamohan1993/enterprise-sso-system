@@ -76,6 +76,10 @@ pub struct OrchestratorRequest {
     pub unusual_access_score: Option<f64>,
     #[serde(default)]
     pub recent_failed_attempts: Option<u32>,
+    #[serde(default)]
+    pub device_fingerprint: Option<String>,
+    #[serde(default)]
+    pub source_ip: Option<String>,
 }
 
 /// Response from the Orchestrator to the Gateway (mirrors orchestrator message type).

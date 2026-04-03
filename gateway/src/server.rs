@@ -791,6 +791,8 @@ async fn forward_to_orchestrator(
         is_unusual_time: None,
         unusual_access_score: None,
         recent_failed_attempts: None,
+        device_fingerprint: None,
+        source_ip: None,
     };
 
     let req_bytes = postcard::to_allocvec(&orch_req)
