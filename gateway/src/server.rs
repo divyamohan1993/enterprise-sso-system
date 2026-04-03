@@ -230,7 +230,7 @@ pub struct GatewayServer {
     distributed_limiter: Option<Arc<DistributedRateLimiter>>,
     /// Circuit breaker for orchestrator connections.
     /// Prevents gateway from exhausting all connection slots when orchestrator is degraded.
-    orchestrator_breaker: common::circuit_breaker::CircuitBreaker,
+    orchestrator_breaker: Arc<common::circuit_breaker::CircuitBreaker>,
 }
 
 impl GatewayServer {
@@ -274,10 +274,10 @@ impl GatewayServer {
             key_pins: Arc::new(key_pins),
             tls_acceptor: None,
             distributed_limiter: None,
-            orchestrator_breaker: common::circuit_breaker::CircuitBreaker::new(
+            orchestrator_breaker: Arc::new(common::circuit_breaker::CircuitBreaker::new(
                 3,
                 std::time::Duration::from_secs(15),
-            ),
+            )),
         })
     }
 
@@ -340,10 +340,10 @@ impl GatewayServer {
             key_pins: Arc::new(key_pins),
             tls_acceptor: None,
             distributed_limiter: None,
-            orchestrator_breaker: common::circuit_breaker::CircuitBreaker::new(
+            orchestrator_breaker: Arc::new(common::circuit_breaker::CircuitBreaker::new(
                 3,
                 std::time::Duration::from_secs(15),
-            ),
+            )),
         })
     }
 
@@ -448,6 +448,7 @@ impl GatewayServer {
             let server_kp = self.xwing_server_kp.clone();
             let fingerprint = self.xwing_fingerprint.clone();
             let tls_acceptor = self.tls_acceptor.clone();
+            let breaker = self.orchestrator_breaker.clone();
             // Verbose logging: log incoming connection details
             common::error_response::verbose_log_fields(
                 "gateway",
@@ -465,7 +466,7 @@ impl GatewayServer {
                     match acceptor.accept(tcp_stream).await {
                         Ok(tls_stream) => {
                             debug!("TLS handshake completed for {addr}");
-                            handle_connection(tls_stream, difficulty, orch, server_pk, server_kp, fingerprint).await
+                            handle_connection(tls_stream, difficulty, orch, server_pk, server_kp, fingerprint, &breaker).await
                         }
                         Err(e) => {
                             warn!("TLS handshake failed from {addr}: {e}");
@@ -473,7 +474,7 @@ impl GatewayServer {
                         }
                     }
                 } else {
-                    handle_connection(tcp_stream, difficulty, orch, server_pk, server_kp, fingerprint).await
+                    handle_connection(tcp_stream, difficulty, orch, server_pk, server_kp, fingerprint, &breaker).await
                 };
 
                 if let Err(e) = result {
@@ -502,6 +503,7 @@ impl GatewayServer {
                 self.xwing_server_pk.clone(),
                 self.xwing_server_kp.clone(),
                 self.xwing_fingerprint.clone(),
+                &self.orchestrator_breaker,
             )
             .await
             .map_err(|e| {
@@ -516,6 +518,7 @@ impl GatewayServer {
                 self.xwing_server_pk.clone(),
                 self.xwing_server_kp.clone(),
                 self.xwing_fingerprint.clone(),
+                &self.orchestrator_breaker,
             )
             .await
             .map_err(|e| {
@@ -592,6 +595,7 @@ async fn handle_connection(
     server_xwing_pk: Arc<Vec<u8>>,
     server_xwing_kp: Arc<crypto::xwing::XWingKeyPair>,
     server_xwing_fingerprint: Arc<String>,
+    orch_breaker: &common::circuit_breaker::CircuitBreaker,
 ) -> Result<(), String> {
     let conn_start = Instant::now();
 
@@ -708,7 +712,7 @@ async fn handle_connection(
 
     let resp = if let Some(orch) = orchestrator {
         // Circuit breaker: fail fast when orchestrator is known to be down
-        if !self.orchestrator_breaker.allow_request() {
+        if !orch_breaker.allow_request() {
             AuthResponse {
                 success: false,
                 token: None,
@@ -717,11 +721,11 @@ async fn handle_connection(
         } else {
         match forward_to_orchestrator(&auth_req, &orch, client_binding_hash).await {
             Ok(r) => {
-                self.orchestrator_breaker.record_success();
+                orch_breaker.record_success();
                 r
             }
             Err(e) => {
-                self.orchestrator_breaker.record_failure();
+                orch_breaker.record_failure();
                 let internal_msg = common::error_response::log_error_with_location(&e);
                 tracing::warn!("orchestrator error: {internal_msg}");
                 AuthResponse {
