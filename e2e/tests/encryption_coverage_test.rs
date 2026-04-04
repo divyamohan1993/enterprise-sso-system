@@ -123,7 +123,7 @@ fn audit_log_entries_are_envelope_encrypted() {
     let device_id = Uuid::new_v4();
 
     let encrypted = common::encrypted_audit::encrypt_audit_metadata(
-        common::types::AuditEventType::Login,
+        common::types::AuditEventType::AuthSuccess,
         &[user_id],
         &[device_id],
         0.5,
@@ -376,7 +376,7 @@ fn debug_impls_all_redacted() {
     // AuditEntry
     let entry = common::types::AuditEntry {
         event_id: Uuid::new_v4(),
-        event_type: common::types::AuditEventType::Login,
+        event_type: common::types::AuditEventType::AuthSuccess,
         user_ids: vec![Uuid::new_v4()],
         device_ids: vec![],
         ceremony_receipts: vec![],
