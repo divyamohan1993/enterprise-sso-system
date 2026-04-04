@@ -28,6 +28,19 @@ pub struct SignerShare {
     pub nonce_counter: std::sync::atomic::AtomicU64,
 }
 
+impl SignerShare {
+    /// Consume the share and return its parts without triggering Drop zeroization.
+    /// Use when transferring ownership to a `SignerNode` or other secure container
+    /// that will handle its own zeroization.
+    pub fn into_parts(self) -> (Identifier, KeyPackage) {
+        let id = self.identifier;
+        let kp = self.key_package;
+        // Skip the Drop impl since we're transferring ownership, not discarding
+        std::mem::forget(self);
+        (id, kp)
+    }
+}
+
 impl Drop for SignerShare {
     fn drop(&mut self) {
         // Zeroize the serialized key package bytes to prevent memory forensics.

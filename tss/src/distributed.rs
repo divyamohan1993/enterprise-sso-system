@@ -948,7 +948,10 @@ pub fn distribute_shares(
     let nodes: Vec<SignerNode> = dkg_result
         .shares
         .drain(..)
-        .map(|share| SignerNode::new(share.identifier, share.key_package))
+        .map(|share| {
+            let (id, kp) = share.into_parts();
+            SignerNode::new(id, kp)
+        })
         .collect();
 
     (coordinator, nodes)
