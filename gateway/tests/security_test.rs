@@ -340,28 +340,21 @@ fn tls_config_enforces_tls_13() {
     // Install the default crypto provider (aws-lc-rs) before using rustls
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    // Build a TLS ServerConfig using the same approach the gateway uses.
-    // Verify that it only supports TLS 1.3.
-    let server_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![generate_self_signed_cert()],
-            generate_private_key(),
-        )
-        .unwrap();
+    // Generate a single cert+key pair (both helpers generate independent certs,
+    // so we must use one rcgen call for a matching pair).
+    let generated = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert = rustls_pki_types::CertificateDer::from(generated.cert.der().to_vec());
+    let key = rustls_pki_types::PrivateKeyDer::from(
+        rustls_pki_types::PrivatePkcs8KeyDer::from(generated.key_pair.serialize_der()),
+    );
 
-    // rustls defaults to TLS 1.2 + 1.3. The gateway must override to TLS 1.3 only.
-    // We verify our test config builder here. In production, the gateway uses
-    // `.with_protocol_versions(&[&rustls::version::TLS13])`.
+    // Build a TLS 1.3-only ServerConfig using the same approach the gateway uses.
     let tls13_config = rustls::ServerConfig::builder_with_protocol_versions(
         &[&rustls::version::TLS13],
     )
     .with_no_client_auth()
-    .with_single_cert(
-        vec![generate_self_signed_cert()],
-        generate_private_key(),
-    )
-    .unwrap();
+    .with_single_cert(vec![cert], key)
+    .expect("TLS 1.3-only ServerConfig must build successfully with matching cert+key");
 
     // Verify the config was built successfully with TLS 1.3 only.
     // rustls::ServerConfig does not expose protocol_versions(), but
