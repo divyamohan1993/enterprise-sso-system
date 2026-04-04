@@ -160,7 +160,7 @@ fn circuit_breaker_half_open_allows_probe() {
     use common::circuit_breaker::{CircuitBreaker, CircuitState};
     use std::time::Duration;
 
-    let cb = CircuitBreaker::with_name("halfopen-test", 2, Duration::from_millis(1));
+    let cb = CircuitBreaker::with_name("halfopen-test", 2, Duration::from_millis(50));
 
     // Open the circuit.
     cb.record_failure();
@@ -168,7 +168,7 @@ fn circuit_breaker_half_open_allows_probe() {
     assert_eq!(cb.state(), CircuitState::Open);
 
     // Wait for the reset timeout to expire.
-    std::thread::sleep(Duration::from_millis(2));
+    std::thread::sleep(Duration::from_millis(100));
 
     // Should transition to HalfOpen, allowing a probe request.
     assert_eq!(
@@ -187,7 +187,7 @@ fn circuit_breaker_resets_on_success() {
     use common::circuit_breaker::{CircuitBreaker, CircuitState};
     use std::time::Duration;
 
-    let cb = CircuitBreaker::with_name("reset-success-test", 2, Duration::from_millis(1));
+    let cb = CircuitBreaker::with_name("reset-success-test", 2, Duration::from_millis(50));
 
     // Open the circuit.
     cb.record_failure();
@@ -195,7 +195,7 @@ fn circuit_breaker_resets_on_success() {
     assert_eq!(cb.state(), CircuitState::Open);
 
     // Wait for HalfOpen.
-    std::thread::sleep(Duration::from_millis(2));
+    std::thread::sleep(Duration::from_millis(100));
     assert_eq!(cb.state(), CircuitState::HalfOpen);
 
     // Successful probe closes the circuit.

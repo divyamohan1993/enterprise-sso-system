@@ -733,7 +733,7 @@ fn slh_dsa_tampered_message_rejected() {
 
 #[test]
 fn slh_dsa_deterministic_keygen_from_seed() {
-    let seed = b"deterministic-slh-dsa-seed-32byt";
+    let seed = b"deterministic-slh-dsa-seed-96bytes-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let (sk1, vk1) = slh_dsa_keygen_from_seed(seed).expect("keygen from seed");
     let (sk2, vk2) = slh_dsa_keygen_from_seed(seed).expect("keygen from seed");
     assert_eq!(sk1.to_bytes(), sk2.to_bytes(), "same seed = same signing key");

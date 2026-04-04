@@ -387,19 +387,17 @@ impl<'a> CborReader<'a> {
         let major = initial >> 5;
         let additional = initial & 0x1F;
 
-        match major {
-            0 => {
-                // Unsigned integer
-                let val = self.read_uint_arg(additional)?;
-                Some(val as i64)
-            }
-            1 => {
-                // Negative integer: -1 - val (CBOR encoding)
-                let val = self.read_uint_arg(additional)?;
-                let val_i64 = i64::try_from(val).ok()?;
-                Some(-1i64.checked_sub(val_i64)?)
-            }
-            _ => None,
+        if major == 0 {
+            // Unsigned integer
+            let val = self.read_uint_arg(additional)?;
+            Some(val as i64)
+        } else if major == 1 {
+            // Negative integer: -1 - val (CBOR encoding)
+            let val = self.read_uint_arg(additional)?;
+            let neg = -1i64 - (val as i64);
+            Some(neg)
+        } else {
+            None
         }
     }
 
