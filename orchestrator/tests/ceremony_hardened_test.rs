@@ -206,14 +206,19 @@ fn tracker_replaces_existing_ceremony_for_same_user() {
     let user = Uuid::new_v4();
 
     // First ceremony
-    let session1 = CeremonySession::new([0x01; 32]);
+    let mut session1 = CeremonySession::new([0x01; 32]);
+    session1.user_id = Some(user);
     tracker.create_ceremony(session1, Some(user)).unwrap();
+    assert_eq!(tracker.user_active_count(&user), 1);
 
-    // Second ceremony for same user replaces the first
-    let session2 = CeremonySession::new([0x02; 32]);
+    // Second ceremony for same user: the tracker cancels existing ceremonies
+    // when user_active_count >= MAX_CEREMONIES_PER_USER (1), but only if the
+    // session's user_id field is set (used by the is_terminal filter).
+    let mut session2 = CeremonySession::new([0x02; 32]);
+    session2.user_id = Some(user);
     tracker.create_ceremony(session2, Some(user)).unwrap();
 
-    // User should still have 1 active ceremony (old one cancelled)
+    // After replacement: old session removed, new session added, count = 1
     assert_eq!(tracker.user_active_count(&user), 1);
 }
 
@@ -239,17 +244,20 @@ fn tracker_different_users_independent_ceremonies() {
 fn tracker_finish_ceremony_decrements_count() {
     let mut tracker = CeremonyTracker::new();
     let user = Uuid::new_v4();
-    let session = CeremonySession::new([0x01; 32]);
+    let mut session = CeremonySession::new([0x01; 32]);
+    session.user_id = Some(user);
 
     tracker.create_ceremony(session, Some(user)).unwrap();
     assert_eq!(tracker.active_count(), 1);
+    assert_eq!(tracker.user_active_count(&user), 1);
 
-    // The session hex is the first 8 bytes of the session ID in hex
+    // short_session_hex formats the first 8 bytes of session_id as hex
     let hex = format!(
         "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
         0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01
     );
     tracker.finish_ceremony(&hex);
+    // After finishing, the session is removed and user count decremented
     assert_eq!(tracker.active_count(), 0);
     assert_eq!(tracker.user_active_count(&user), 0);
 }

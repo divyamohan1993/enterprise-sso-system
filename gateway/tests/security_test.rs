@@ -337,6 +337,9 @@ async fn rate_limit_per_user_enforced() {
 
 #[test]
 fn tls_config_enforces_tls_13() {
+    // Install the default crypto provider (aws-lc-rs) before using rustls
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     // Build a TLS ServerConfig using the same approach the gateway uses.
     // Verify that it only supports TLS 1.3.
     let server_config = rustls::ServerConfig::builder()
