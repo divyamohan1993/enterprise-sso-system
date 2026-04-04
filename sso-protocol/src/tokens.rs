@@ -629,27 +629,21 @@ impl OidcSigningKey {
 
 impl Drop for OidcSigningKey {
     fn drop(&mut self) {
-        // SECURITY: Zeroize the ML-DSA-87 signing key material in place to prevent
-        // memory forensics extraction. SigningKey<MlDsa87> does not expose a
-        // serialization method, so we zero the struct's memory directly.
-        //
-        // SAFETY: We are writing zeros over our own &mut self fields. The struct
-        // is being dropped, so no further reads will occur. This is the standard
-        // pattern for zeroizing opaque crypto types (same as memguard.rs).
-        let key_ptr = &mut self.current.signing_key as *mut _ as *mut u8;
-        let key_size = std::mem::size_of::<crypto::pq_sign::PqSigningKey>();
-        unsafe {
-            std::ptr::write_bytes(key_ptr, 0, key_size);
-        }
-        // Zeroize previous key slot if present
+        // SECURITY: Overwrite the ML-DSA-87 signing key material to prevent
+        // memory forensics extraction. Since sso-protocol forbids unsafe code
+        // and SigningKey<MlDsa87> has no Zeroize impl, we overwrite with a
+        // freshly generated throwaway keypair. This replaces the real key bytes
+        // in the struct's allocation with unrelated random key material.
+        let (throwaway_key, throwaway_vk) = generate_pq_keypair();
+        self.current.signing_key = throwaway_key;
+        self.current.verifying_key = throwaway_vk;
         if let Some(ref mut prev) = self.previous {
-            let prev_ptr = &mut prev.signing_key as *mut _ as *mut u8;
-            unsafe {
-                std::ptr::write_bytes(prev_ptr, 0, key_size);
-            }
+            let (tk2, tvk2) = generate_pq_keypair();
+            prev.signing_key = tk2;
+            prev.verifying_key = tvk2;
         }
         self.generation = 0;
-        // Compiler fence to prevent dead-store elimination
+        // Compiler fence to prevent dead-store elimination of the overwrites
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
     }
 }
