@@ -505,7 +505,7 @@ fn key_zeroization_debug_redaction() {
     // AuditEntry Debug
     let entry = common::types::AuditEntry {
         event_id: uuid::Uuid::new_v4(),
-        event_type: common::types::AuditEventType::Login,
+        event_type: common::types::AuditEventType::AuthSuccess,
         user_ids: vec![uuid::Uuid::new_v4()],
         device_ids: vec![],
         ceremony_receipts: vec![],
