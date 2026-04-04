@@ -62,8 +62,8 @@ fn generate_key_64_halves_differ() {
 fn receipt_signature_verified() {
     let key = [0x42u8; 64];
     let mut receipt = Receipt::test_fixture();
-    sign_receipt(&mut receipt, &key);
-    assert!(verify_receipt_signature(&receipt, &key));
+    sign_receipt(&mut receipt, &key).unwrap();
+    assert!(verify_receipt_signature(&receipt, &key).unwrap());
 }
 
 #[test]
@@ -71,18 +71,18 @@ fn receipt_signature_rejects_wrong_key() {
     let key = [0x42u8; 64];
     let wrong_key = [0x99u8; 64];
     let mut receipt = Receipt::test_fixture();
-    sign_receipt(&mut receipt, &key);
-    assert!(!verify_receipt_signature(&receipt, &wrong_key));
+    sign_receipt(&mut receipt, &key).unwrap();
+    assert!(!verify_receipt_signature(&receipt, &wrong_key).unwrap());
 }
 
 #[test]
 fn receipt_signature_rejects_tampered_data() {
     let key = [0x42u8; 64];
     let mut receipt = Receipt::test_fixture();
-    sign_receipt(&mut receipt, &key);
+    sign_receipt(&mut receipt, &key).unwrap();
     // Tamper with the step_id
     receipt.step_id = 99;
-    assert!(!verify_receipt_signature(&receipt, &key));
+    assert!(!verify_receipt_signature(&receipt, &key).unwrap());
 }
 
 #[test]
@@ -140,7 +140,7 @@ fn receipt_chain_valid_two_step() {
     r1.ceremony_session_id = session_id;
     r1.step_id = 1;
     r1.prev_receipt_hash = [0x00; 64];
-    sign_receipt(&mut r1, &key);
+    sign_receipt(&mut r1, &key).unwrap();
     chain.add_receipt(r1.clone()).unwrap();
 
     // Step 2
@@ -148,7 +148,7 @@ fn receipt_chain_valid_two_step() {
     r2.ceremony_session_id = session_id;
     r2.step_id = 2;
     r2.prev_receipt_hash = hash_receipt(&r1);
-    sign_receipt(&mut r2, &key);
+    sign_receipt(&mut r2, &key).unwrap();
     chain.add_receipt(r2).unwrap();
 
     assert_eq!(chain.len(), 2);
@@ -168,7 +168,7 @@ fn receipt_chain_rejects_invalid_signature() {
     r1.ceremony_session_id = session_id;
     r1.step_id = 1;
     r1.prev_receipt_hash = [0x00; 64];
-    sign_receipt(&mut r1, &wrong_key); // signed with wrong key
+    sign_receipt(&mut r1, &wrong_key).unwrap(); // signed with wrong key
     chain.add_receipt(r1).unwrap();
 
     assert!(chain.validate_with_key(&key).is_err());

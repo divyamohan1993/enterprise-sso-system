@@ -25,7 +25,7 @@ pub enum ReceiptVerificationKey<'a> {
 fn verify_receipt_with_key(receipt: &Receipt, key: &ReceiptVerificationKey<'_>) -> bool {
     match key {
         ReceiptVerificationKey::Hmac(hmac_key) => {
-            verify_receipt_signature(receipt, hmac_key)
+            verify_receipt_signature(receipt, hmac_key).unwrap_or(false)
         }
         ReceiptVerificationKey::MlDsa87(mldsa87_key) => {
             let data = crypto::receipts::receipt_signing_data(receipt);
@@ -38,7 +38,7 @@ fn verify_receipt_with_key(receipt: &Receipt, key: &ReceiptVerificationKey<'_>) 
             if crypto::receipts::verify_receipt_asymmetric(mldsa87_key, &data, &receipt.signature) {
                 true
             } else {
-                verify_receipt_signature(receipt, hmac_key)
+                verify_receipt_signature(receipt, hmac_key).unwrap_or(false)
             }
         }
     }

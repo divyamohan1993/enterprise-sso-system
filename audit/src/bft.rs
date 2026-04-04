@@ -178,7 +178,9 @@ impl AuditNode {
         } else {
             hash_entry(&self.log.entries()[self.log.len() - 1])
         };
-        if entry.prev_hash != our_last {
+        // SECURITY: constant-time comparison prevents Byzantine nodes from
+        // probing chain state via timing side-channel.
+        if !crypto::ct::ct_eq_64(&entry.prev_hash, &our_last) {
             return None; // Chain mismatch
         }
         if let Err(e) = self.log.append_raw(entry.clone()) {

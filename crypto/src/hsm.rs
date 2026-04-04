@@ -664,8 +664,10 @@ impl Pkcs11Session {
         let salt = b"MILNET-PKCS11-ROOT-KEY-v1";
         let hk = Hkdf::<Sha512>::new(Some(salt), &ikm);
         let mut okm = [0u8; 32];
+        // SECURITY: HKDF-SHA512 expand for 32 bytes (< 255*64) cannot fail.
+        // Use expect with invariant documentation rather than silent panic.
         hk.expand(b"pkcs11-session-root", &mut okm)
-            .unwrap_or_else(|_| panic!("FATAL: HKDF-SHA512 expand failed for 32-byte output"));
+            .expect("HKDF-SHA512 expand for 32 bytes is infallible (32 < 255*64=16320)");
 
         // Zeroize the IKM which contained the PIN
         ikm.zeroize();
@@ -858,7 +860,7 @@ impl AwsKmsSession {
         let hk = Hkdf::<Sha512>::new(Some(salt), &ikm);
         let mut okm = [0u8; 32];
         hk.expand(b"aws-kms-session-root", &mut okm)
-            .unwrap_or_else(|_| panic!("FATAL: HKDF-SHA512 expand failed for 32-byte output"));
+            .expect("HKDF-SHA512 expand for 32 bytes is infallible (32 < 255*64=16320)");
         okm
     }
 
@@ -1097,7 +1099,7 @@ impl Tpm2Session {
         let hk = Hkdf::<Sha512>::new(Some(salt), &ikm);
         let mut okm = [0u8; 32];
         hk.expand(b"tpm2-storage-key", &mut okm)
-            .unwrap_or_else(|_| panic!("FATAL: HKDF-SHA512 expand failed for 32-byte output"));
+            .expect("HKDF-SHA512 expand for 32 bytes is infallible (32 < 255*64=16320)");
         okm
     }
 
@@ -1107,7 +1109,7 @@ impl Tpm2Session {
         let hk = Hkdf::<Sha512>::new(Some(salt), device.as_bytes());
         let mut okm = [0u8; 32];
         hk.expand(b"tpm2-srk", &mut okm)
-            .unwrap_or_else(|_| panic!("FATAL: HKDF-SHA512 expand failed for 32-byte output"));
+            .expect("HKDF-SHA512 expand for 32 bytes is infallible (32 < 255*64=16320)");
         okm
     }
 
@@ -1215,7 +1217,7 @@ impl Tpm2Session {
         let mut attest_key = [0u8; 32];
         let hk = Hkdf::<Sha512>::new(None, &self.srk_handle);
         hk.expand(b"tpm2-attestation-key", &mut attest_key)
-            .unwrap_or_else(|_| panic!("FATAL: HKDF-SHA512 expand failed for 32-byte output"));
+            .expect("HKDF-SHA512 expand for 32 bytes is infallible (32 < 255*64=16320)");
 
         let mut mac = <Hmac<Sha256> as HmacMac>::new_from_slice(&attest_key)
             .map_err(|_| HsmError::SigningFailed("HMAC key creation failed".into()))?;

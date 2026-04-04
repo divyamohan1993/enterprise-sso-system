@@ -571,7 +571,7 @@ fn fors_tree_root(
 
     let mut nodes: Vec<[u8; N]> = Vec::with_capacity(leaves_count);
     for i in 0..leaves_count {
-        let sk = fors_sk_gen(sk_seed, pk_seed, adrs, u32::try_from(base + i).unwrap_or_else(|_| panic!("FATAL: SLH-DSA FORS leaf index exceeds u32 range")));
+        let sk = fors_sk_gen(sk_seed, pk_seed, adrs, u32::try_from(base + i).expect("SLH-DSA invariant: FORS leaf index fits u32 (max tree_idx * 2^FORS_A + 2^FORS_A < 2^32)"));
         let leaf = fors_leaf(pk_seed, adrs, &sk);
         nodes.push(leaf);
     }
@@ -584,7 +584,7 @@ fn fors_tree_root(
         for j in 0..nodes.len() / 2 {
             tree_adrs.tree_height = (height + 1) as u32;
             tree_adrs.tree_index = u32::try_from(base / (1 << (height + 1)) + j)
-                .unwrap_or_else(|_| panic!("FATAL: SLH-DSA FORS tree index exceeds u32 range"));
+                .expect("SLH-DSA invariant: FORS tree index fits u32");
             let parent = hash_h(pk_seed, &tree_adrs, &nodes[2 * j], &nodes[2 * j + 1]);
             new_nodes.push(parent);
         }
@@ -609,13 +609,13 @@ fn fors_sign(
 
         // Secret value
         let sk = fors_sk_gen(sk_seed, pk_seed, adrs,
-            u32::try_from(base + idx as usize).unwrap_or_else(|_| panic!("FATAL: SLH-DSA FORS leaf index exceeds u32 range")));
+            u32::try_from(base + idx as usize).expect("SLH-DSA invariant: FORS leaf index fits u32"));
         sig.extend_from_slice(&sk);
 
         // Build tree and get auth path
         let mut nodes: Vec<[u8; N]> = Vec::with_capacity(leaves_count);
         for i in 0..leaves_count {
-            let sk_i = fors_sk_gen(sk_seed, pk_seed, adrs, u32::try_from(base + i).unwrap_or_else(|_| panic!("FATAL: SLH-DSA FORS leaf index exceeds u32 range")));
+            let sk_i = fors_sk_gen(sk_seed, pk_seed, adrs, u32::try_from(base + i).expect("SLH-DSA invariant: FORS leaf index fits u32 (max tree_idx * 2^FORS_A + 2^FORS_A < 2^32)"));
             let leaf = fors_leaf(pk_seed, adrs, &sk_i);
             nodes.push(leaf);
         }
@@ -636,7 +636,7 @@ fn fors_sign(
             for j in 0..current_nodes.len() / 2 {
                 tree_adrs.tree_height = (height + 1) as u32;
                 tree_adrs.tree_index = u32::try_from(base / (1 << (height + 1)) + j)
-                .unwrap_or_else(|_| panic!("FATAL: SLH-DSA FORS tree index exceeds u32 range"));
+                .expect("SLH-DSA invariant: FORS tree index fits u32");
                 let parent = hash_h(
                     pk_seed,
                     &tree_adrs,
@@ -682,7 +682,7 @@ fn fors_pk_from_sig(
 
             tree_adrs.tree_height = (height + 1) as u32;
             tree_adrs.tree_index = u32::try_from(base / (1 << (height + 1)) + ((idx as usize) >> (height + 1)))
-                .unwrap_or_else(|_| panic!("FATAL: SLH-DSA FORS tree index exceeds u32 range"));
+                .expect("SLH-DSA invariant: FORS tree index fits u32");
 
             if (idx >> height) & 1 == 0 {
                 node = hash_h(pk_seed, &tree_adrs, &node, &auth_node);

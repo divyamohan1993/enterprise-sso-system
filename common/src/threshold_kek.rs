@@ -157,46 +157,14 @@ fn ct_gf256_div(a: u8, b: u8) -> Result<u8, &'static str> {
 // All production callers now use the ct_ variants above.
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
-fn _old_gf256_mul(a: u8, b: u8) -> u8 {
-    let mut result: u16 = 0;
-    let mut a = a as u16;
-    let mut b = b as u16;
-    for _ in 0..8 {
-        if b & 1 != 0 {
-            result ^= a;
-        }
-        let carry = a & 0x80;
-        a <<= 1;
-        if carry != 0 {
-            a ^= 0x11b; // AES irreducible polynomial
-        }
-        b >>= 1;
-    }
-    result as u8
-}
+// Legacy GF(256) implementations removed. All production callers use the
+// constant-time ct_gf256_mul / ct_gf256_inv variants above, which prevent
+// timing side-channels on share coefficients.
+//
+// The old implementations had data-dependent branching and a panic on
+// division by zero. Both are unacceptable for a military-grade system.
 
-#[allow(dead_code)]
-fn _old_gf256_inv(a: u8) -> u8 {
-    if a == 0 {
-        panic!("division by zero in GF(256)");
-    }
-    // Fermat's little theorem: a^(-1) = a^(254) in GF(2^8)
-    let a2 = _old_gf256_mul(a, a);
-    let a4 = _old_gf256_mul(a2, a2);
-    let a8 = _old_gf256_mul(a4, a4);
-    let a16 = _old_gf256_mul(a8, a8);
-    let a32 = _old_gf256_mul(a16, a16);
-    let a64 = _old_gf256_mul(a32, a32);
-    let a128 = _old_gf256_mul(a64, a64);
-    let mut result = _old_gf256_mul(a128, a64);
-    result = _old_gf256_mul(result, a32);
-    result = _old_gf256_mul(result, a16);
-    result = _old_gf256_mul(result, a8);
-    result = _old_gf256_mul(result, a4);
-    result = _old_gf256_mul(result, a2);
-    result
-}
+// Fermat's little theorem reference (for ct_gf256_inv above): a^(-1) = a^(254) in GF(2^8)
 
 // ---------------------------------------------------------------------------
 // Hash-based VSS Commitments for GF(256) Shamir

@@ -63,6 +63,16 @@ pub fn run_platform_checks<F: FnOnce() -> bool>(harden_fn: F) -> (
     JoinHandle<()>,
     Arc<RuntimeIntegrityMonitor>,
 ) {
+    // SECURITY: Install a custom panic hook that suppresses stack traces in
+    // production. Default Rust panic output includes file paths, line numbers,
+    // and function names which reveal internal architecture to an attacker who
+    // can observe stderr (e.g. via container logs).
+    install_military_panic_hook();
+
+    // SECURITY: Load FIPS activation key and auto-enable FIPS mode in military
+    // deployment. This MUST happen before any crypto operations.
+    crate::fips::load_fips_activation_key();
+
     let mut all_passed = true;
     let mut summary_parts: Vec<String> = Vec::new();
 
@@ -276,10 +286,15 @@ const SENSITIVE_ENV_VARS: &[&str] = &[
 pub fn sanitize_environment() -> usize {
     let mut count = 0;
     for var_name in SENSITIVE_ENV_VARS {
-        if std::env::var_os(var_name).is_some() {
-            // SECURITY: remove_var deletes from the process environment block,
-            // preventing /proc/PID/environ exfiltration. The value has already
-            // been consumed by the caller's config loading code.
+        if let Some(val) = std::env::var_os(var_name) {
+            // SECURITY: Overwrite the value with zeros before removing it.
+            // std::env::remove_var removes the pointer from environ but does NOT
+            // zero the original bytes in the process heap. A root attacker with
+            // /proc/PID/mem access could read residual key material. Setting the
+            // var to zeros first overwrites the libc environ buffer, then remove_var
+            // drops the entry from the environ array.
+            let zeros = "0".repeat(val.len());
+            std::env::set_var(var_name, &zeros);
             std::env::remove_var(var_name);
             count += 1;
         }
@@ -300,6 +315,50 @@ pub fn sanitize_environment() -> usize {
     }
 
     count
+}
+
+// ---------------------------------------------------------------------------
+// Panic hook — suppress stack traces in production
+// ---------------------------------------------------------------------------
+
+/// Install a custom panic hook that redacts file paths and stack traces.
+///
+/// In military deployment, the default Rust panic hook prints file:line and
+/// a full backtrace to stderr. This leaks internal code structure (module names,
+/// function names, line numbers) which aids reverse engineering. The custom hook
+/// logs only a generic "internal error" message with a correlation ID.
+fn install_military_panic_hook() {
+    use std::sync::Once;
+    static HOOK_INSTALLED: Once = Once::new();
+    HOOK_INSTALLED.call_once(|| {
+        std::panic::set_hook(Box::new(|info| {
+            // Generate a random correlation ID for incident response
+            let mut corr_id = [0u8; 8];
+            let _ = getrandom::getrandom(&mut corr_id);
+            let corr_hex: String = corr_id.iter().map(|b| format!("{b:02x}")).collect();
+
+            // In military deployment, suppress all location information
+            if std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1") {
+                eprintln!(
+                    "MILNET FATAL: internal error (correlation_id={corr_hex}). \
+                     Check SIEM for details."
+                );
+            } else {
+                // In dev/test, include location but not the payload (which might
+                // contain secret-adjacent data from format strings)
+                let location = info.location().map(|l| format!("{}:{}", l.file(), l.line()));
+                eprintln!(
+                    "MILNET FATAL: internal error at {} (correlation_id={corr_hex})",
+                    location.as_deref().unwrap_or("unknown")
+                );
+            }
+
+            // Emit SIEM event for all panics
+            crate::siem::SecurityEvent::tamper_detected(
+                &format!("process panic (correlation_id={corr_hex})")
+            );
+        }));
+    });
 }
 
 // ---------------------------------------------------------------------------

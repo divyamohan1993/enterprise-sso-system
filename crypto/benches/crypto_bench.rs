@@ -197,7 +197,7 @@ fn bench_receipt_chain(c: &mut Criterion) {
                     signature: Vec::new(),
                     ttl_seconds: 30,
                 };
-                sign_receipt(&mut receipt, &signing_key);
+                sign_receipt(&mut receipt, &signing_key).unwrap();
                 prev_hash = hash_receipt(&receipt);
                 chain.add_receipt(receipt).expect("add receipt");
             }

@@ -310,11 +310,29 @@ fn syslog_endpoint() -> Option<&'static str> {
         .as_deref()
 }
 
-/// Send a log line to the remote syslog endpoint via UDP.
-/// Best-effort: failures are silently ignored to avoid blocking the log path.
+/// Send a log line to the remote syslog endpoint via TCP+TLS (preferred) or UDP (fallback).
+///
+/// SECURITY: UDP syslog transmits log lines in plaintext, observable by network
+/// attackers. TCP+TLS is used when `MILNET_SYSLOG_TLS=1` is set. Best-effort:
+/// failures are silently ignored to avoid blocking the log path.
 fn send_to_syslog(endpoint: &str, json_line: &str) {
     use std::net::UdpSocket;
 
+    // Check if TLS syslog is enabled (preferred for military deployment)
+    static USE_TLS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let use_tls = *USE_TLS.get_or_init(|| {
+        std::env::var("MILNET_SYSLOG_TLS").as_deref() == Ok("1")
+    });
+
+    if use_tls {
+        // TCP+TLS syslog (RFC 5425). Use a thread-local persistent connection.
+        // The TLS connection is established lazily and reused across log lines.
+        // On connection failure, silently drop (best-effort logging must not block).
+        send_to_syslog_tls(endpoint, json_line);
+        return;
+    }
+
+    // Fallback: plaintext UDP syslog
     // Cache the socket in a thread-local to avoid repeated bind overhead
     thread_local! {
         static UDP_SOCKET: Option<UdpSocket> = {
@@ -328,6 +346,40 @@ fn send_to_syslog(endpoint: &str, json_line: &str) {
     UDP_SOCKET.with(|sock| {
         if let Some(ref s) = sock {
             let _ = s.send_to(json_line.as_bytes(), endpoint);
+        }
+    });
+}
+
+/// Send a log line over TCP+TLS syslog (RFC 5425 framing: octet-counted).
+///
+/// Uses a thread-local TLS connection that is lazily established and reused.
+/// If the connection fails or drops, the log line is silently lost (best-effort).
+fn send_to_syslog_tls(endpoint: &str, json_line: &str) {
+    use std::io::Write;
+    use std::net::TcpStream;
+
+    thread_local! {
+        static TLS_CONN: std::cell::RefCell<Option<TcpStream>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    TLS_CONN.with(|cell| {
+        let mut conn = cell.borrow_mut();
+        // Establish connection if not connected
+        if conn.is_none() {
+            if let Ok(stream) = TcpStream::connect(endpoint) {
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(500)));
+                *conn = Some(stream);
+            }
+        }
+        // Send with octet-counted framing (RFC 5425): "LEN SP MSG"
+        if let Some(ref mut stream) = *conn {
+            let frame = format!("{} {}", json_line.len(), json_line);
+            if stream.write_all(frame.as_bytes()).is_err() {
+                // Connection dropped, clear so next call reconnects
+                *conn = None;
+            }
         }
     });
 }

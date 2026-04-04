@@ -37,7 +37,7 @@ fn verify_receipt_independently(
         let data = crypto::receipts::receipt_signing_data(receipt);
         crypto::receipts::verify_receipt_asymmetric(vk_bytes.as_ref(), &data, &receipt.signature)
     };
-    let hmac_ok = crypto::receipts::verify_receipt_signature(receipt, hmac_key);
+    let hmac_ok = crypto::receipts::verify_receipt_signature(receipt, hmac_key).unwrap_or(false);
     if !mldsa_ok && !hmac_ok {
         return Err("receipt signature verification failed (neither ML-DSA-87 nor HMAC valid)".into());
     }

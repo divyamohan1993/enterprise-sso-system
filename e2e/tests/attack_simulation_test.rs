@@ -356,7 +356,7 @@ fn build_valid_receipt_chain(signing_key: &[u8; 64]) -> Vec<Receipt> {
         signature: Vec::new(),
         ttl_seconds: 30,
     };
-    sign_receipt(&mut r1, signing_key);
+    sign_receipt(&mut r1, signing_key).unwrap();
 
     let r1_hash = hash_receipt(&r1);
     let mut r2 = Receipt {
@@ -370,7 +370,7 @@ fn build_valid_receipt_chain(signing_key: &[u8; 64]) -> Vec<Receipt> {
         signature: Vec::new(),
         ttl_seconds: 30,
     };
-    sign_receipt(&mut r2, signing_key);
+    sign_receipt(&mut r2, signing_key).unwrap();
 
     vec![r1, r2]
 }
@@ -910,7 +910,7 @@ fn test_attack_receipt_from_different_ceremony_injected() {
         signature: Vec::new(),
         ttl_seconds: 30,
     };
-    sign_receipt(&mut r_a1, &RECEIPT_SIGNING_KEY);
+    sign_receipt(&mut r_a1, &RECEIPT_SIGNING_KEY).unwrap();
 
     // Ceremony B receipt
     let mut r_b1 = Receipt {
@@ -924,7 +924,7 @@ fn test_attack_receipt_from_different_ceremony_injected() {
         signature: Vec::new(),
         ttl_seconds: 30,
     };
-    sign_receipt(&mut r_b1, &RECEIPT_SIGNING_KEY);
+    sign_receipt(&mut r_b1, &RECEIPT_SIGNING_KEY).unwrap();
 
     // Inject ceremony A receipt into chain B using ReceiptChain
     let mut chain_b = ReceiptChain::new(session_b);
@@ -950,11 +950,11 @@ fn test_attack_receipt_signature_forgery() {
         signature: Vec::new(),
         ttl_seconds: 30,
     };
-    sign_receipt(&mut receipt, &RECEIPT_SIGNING_KEY);
+    sign_receipt(&mut receipt, &RECEIPT_SIGNING_KEY).unwrap();
 
     // Verify original is valid
     assert!(
-        verify_receipt_signature(&receipt, &RECEIPT_SIGNING_KEY),
+        verify_receipt_signature(&receipt, &RECEIPT_SIGNING_KEY).unwrap(),
         "original receipt signature must verify"
     );
 
@@ -962,7 +962,7 @@ fn test_attack_receipt_signature_forgery() {
     receipt.user_id = Uuid::from_u128(0xDEADBEEF);
 
     assert!(
-        !verify_receipt_signature(&receipt, &RECEIPT_SIGNING_KEY),
+        !verify_receipt_signature(&receipt, &RECEIPT_SIGNING_KEY).unwrap(),
         "receipt with tampered user_id must fail signature verification"
     );
 }
@@ -987,7 +987,7 @@ fn test_attack_receipt_hash_chain_splice() {
         signature: Vec::new(),
         ttl_seconds: 30,
     };
-    sign_receipt(&mut r1, &RECEIPT_SIGNING_KEY);
+    sign_receipt(&mut r1, &RECEIPT_SIGNING_KEY).unwrap();
 
     let r1_hash = hash_receipt(&r1);
     let mut r2 = Receipt {
@@ -1001,7 +1001,7 @@ fn test_attack_receipt_hash_chain_splice() {
         signature: Vec::new(),
         ttl_seconds: 30,
     };
-    sign_receipt(&mut r2, &RECEIPT_SIGNING_KEY);
+    sign_receipt(&mut r2, &RECEIPT_SIGNING_KEY).unwrap();
 
     let r2_hash = hash_receipt(&r2);
     let mut r3 = Receipt {
@@ -1015,14 +1015,14 @@ fn test_attack_receipt_hash_chain_splice() {
         signature: Vec::new(),
         ttl_seconds: 30,
     };
-    sign_receipt(&mut r3, &RECEIPT_SIGNING_KEY);
+    sign_receipt(&mut r3, &RECEIPT_SIGNING_KEY).unwrap();
 
     // Splice: remove step 2, relink step 3 to step 1
     let mut spliced_r3 = r3.clone();
     spliced_r3.prev_receipt_hash = r1_hash; // skip step 2
     spliced_r3.step_id = 2; // renumber to look sequential
     // Re-sign to fix the signature (attacker would need the key)
-    sign_receipt(&mut spliced_r3, &RECEIPT_SIGNING_KEY);
+    sign_receipt(&mut spliced_r3, &RECEIPT_SIGNING_KEY).unwrap();
 
     // Even with valid signatures, the hash chain is broken because
     // r3's content was for step 3 with r2_hash, not step 2 with r1_hash.
@@ -1037,7 +1037,7 @@ fn test_attack_receipt_hash_chain_splice() {
     r3_tampered.prev_receipt_hash = r1_hash; // tamper without re-signing
     // Signature is now invalid because prev_receipt_hash is included in the signed fields
     assert!(
-        !verify_receipt_signature(&r3_tampered, &RECEIPT_SIGNING_KEY),
+        !verify_receipt_signature(&r3_tampered, &RECEIPT_SIGNING_KEY).unwrap(),
         "receipt with tampered prev_hash must fail signature verification (splice detected)"
     );
     // Also verify the hash values differ
@@ -1064,7 +1064,7 @@ fn test_attack_receipt_with_future_timestamp_rejected() {
         signature: Vec::new(),
         ttl_seconds: 30,
     };
-    sign_receipt(&mut receipt, &RECEIPT_SIGNING_KEY);
+    sign_receipt(&mut receipt, &RECEIPT_SIGNING_KEY).unwrap();
 
     let mut chain = ReceiptChain::new(session_id);
     chain.add_receipt(receipt).expect("add receipt structurally");

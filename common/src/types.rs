@@ -119,6 +119,7 @@ impl Drop for Token {
 
 impl Token {
     /// Returns a deterministic fixture suitable for tests.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn test_fixture() -> Self {
         Token {
             header: TokenHeader {
@@ -241,6 +242,7 @@ impl Drop for Receipt {
 
 impl Receipt {
     /// Returns a deterministic fixture suitable for tests.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn test_fixture() -> Self {
         Receipt {
             ceremony_session_id: [0x01; 32],

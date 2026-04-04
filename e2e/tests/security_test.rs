@@ -54,7 +54,7 @@ fn build_valid_receipt_chain(signing_key: &[u8; 64]) -> Vec<Receipt> {
         signature: Vec::new(),
         ttl_seconds: 30,
     };
-    sign_receipt(&mut r1, signing_key);
+    sign_receipt(&mut r1, signing_key).unwrap();
 
     let r1_hash = hash_receipt(&r1);
     let mut r2 = Receipt {
@@ -68,7 +68,7 @@ fn build_valid_receipt_chain(signing_key: &[u8; 64]) -> Vec<Receipt> {
         signature: Vec::new(),
         ttl_seconds: 30,
     };
-    sign_receipt(&mut r2, signing_key);
+    sign_receipt(&mut r2, signing_key).unwrap();
 
     vec![r1, r2]
 }

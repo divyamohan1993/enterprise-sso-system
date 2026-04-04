@@ -224,7 +224,8 @@ fn verify_token_core(
     warn_if_dpop_exempt_tiers_set();
 
     let all_zeros = [0u8; 64];
-    let has_dpop_hash = token.claims.dpop_hash != all_zeros;
+    // SECURITY: constant-time zero check prevents timing leak on dpop_hash
+    let has_dpop_hash: bool = !crypto::ct::ct_eq_64(&token.claims.dpop_hash, &all_zeros);
 
     if let Some(key) = client_dpop_key {
         // Client provided a DPoP key -- token MUST have a matching dpop_hash.

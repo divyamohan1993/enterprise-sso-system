@@ -80,7 +80,7 @@ fn make_receipt(session_id: [u8; 32], step: u8, prev_hash: [u8; 64], user_id: Uu
         signature: Vec::new(),
         ttl_seconds: 120,
     };
-    sign_receipt(&mut receipt, &RECEIPT_SIGNING_KEY);
+    sign_receipt(&mut receipt, &RECEIPT_SIGNING_KEY).unwrap();
     receipt
 }
 

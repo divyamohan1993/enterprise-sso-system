@@ -44,7 +44,7 @@ fn build_signed_chain(len: usize, signing_key: &[u8; 64]) -> Vec<Receipt> {
             signature: Vec::new(),
             ttl_seconds: 30,
         };
-        sign_receipt(&mut receipt, signing_key);
+        sign_receipt(&mut receipt, signing_key).unwrap();
         chain.push(receipt);
     }
 
@@ -88,7 +88,7 @@ fn broken_chain_rejected() {
     // Tamper with the second receipt's prev_receipt_hash
     chain[1].prev_receipt_hash = [0xFF; 64];
     // Re-sign so signature is valid but chain linkage is broken
-    sign_receipt(&mut chain[1], &key);
+    sign_receipt(&mut chain[1], &key).unwrap();
 
     let result = validate_receipt_chain(&chain, &key);
     assert!(result.is_err());

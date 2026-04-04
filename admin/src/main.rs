@@ -563,7 +563,7 @@ async fn hsts_middleware(
     headers.insert(
         axum::http::header::CONTENT_SECURITY_POLICY,
         axum::http::HeaderValue::from_static(
-            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+            "default-src 'self'; script-src 'self'; style-src 'self'; \
              img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
         ),
     );

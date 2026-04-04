@@ -30,17 +30,31 @@ struct ProtectedKek {
 
 impl ProtectedKek {
     fn new(key: [u8; 32]) -> Self {
-        let kek = Self { key };
-        // Lock the key into physical RAM — prevent swap exposure
+        // NOTE: mlock is deferred to lock_in_place() because the struct may be
+        // moved after construction (e.g. into OnceLock's heap allocation).
+        // Calling mlock here would lock the stack address, not the final address.
+        Self { key }
+    }
+
+    /// Lock the key into physical RAM AFTER the struct has reached its final
+    /// resting place (e.g. inside a OnceLock/Box). Must be called on a &self
+    /// that will NOT be moved again.
+    fn lock_in_place(&self) {
         #[cfg(unix)]
         unsafe {
-            let ptr = kek.key.as_ptr() as *const libc::c_void;
-            let len = std::mem::size_of_val(&kek.key);
-            let _ = libc::mlock(ptr, len);
+            let ptr = self.key.as_ptr() as *const libc::c_void;
+            let len = std::mem::size_of_val(&self.key);
+            let ret = libc::mlock(ptr, len);
+            if ret != 0 {
+                // In military deployment, mlock failure is fatal
+                if std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1") {
+                    eprintln!("FATAL: mlock failed for master KEK — aborting");
+                    std::process::exit(199);
+                }
+            }
             // Exclude from core dumps
             let _ = libc::madvise(ptr as *mut libc::c_void, len, libc::MADV_DONTDUMP);
         }
-        kek
     }
 
     fn as_bytes(&self) -> &[u8; 32] {
@@ -70,7 +84,11 @@ static DISTRIBUTED_KEK_CACHE: OnceLock<ProtectedKek> = OnceLock::new();
 /// Returns a reference to the cached master KEK, loading it once on first call.
 /// The KEK is mlock'd into physical RAM and excluded from core dumps.
 pub fn cached_master_kek() -> &'static [u8; 32] {
-    MASTER_KEK_CACHE.get_or_init(|| ProtectedKek::new(load_master_kek())).as_bytes()
+    let kek = MASTER_KEK_CACHE.get_or_init(|| ProtectedKek::new(load_master_kek()));
+    // mlock AFTER OnceLock placement so we lock the final heap address, not a
+    // stale stack address. OnceLock guarantees the value will not move again.
+    kek.lock_in_place();
+    kek.as_bytes()
 }
 
 /// Returns true when distributed (threshold) KEK mode should be used.

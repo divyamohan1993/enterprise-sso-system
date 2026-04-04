@@ -29,13 +29,31 @@ pub struct KemCiphertext {
 }
 
 /// Authentication request sent by a client after solving the puzzle.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AuthRequest {
     pub username: String,
     pub password: Vec<u8>,
     /// Target audience for the token (e.g. a resource server identifier).
     #[serde(default)]
     pub audience: Option<String>,
+}
+
+/// SECURITY: Redact password from Debug output and zeroize on drop.
+impl std::fmt::Debug for AuthRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthRequest")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field("audience", &self.audience)
+            .finish()
+    }
+}
+
+impl Drop for AuthRequest {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.password.zeroize();
+    }
 }
 
 /// Authentication response returned by the gateway.
@@ -47,7 +65,7 @@ pub struct AuthResponse {
 }
 
 /// Request from the Gateway to the Orchestrator (mirrors orchestrator message type).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OrchestratorRequest {
     pub username: String,
     pub password: Vec<u8>,
@@ -80,6 +98,24 @@ pub struct OrchestratorRequest {
     pub device_fingerprint: Option<String>,
     #[serde(default)]
     pub source_ip: Option<String>,
+}
+
+/// SECURITY: Redact password and zeroize on drop.
+impl std::fmt::Debug for OrchestratorRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OrchestratorRequest")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field("tier", &self.tier)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for OrchestratorRequest {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.password.zeroize();
+    }
 }
 
 /// Response from the Orchestrator to the Gateway (mirrors orchestrator message type).

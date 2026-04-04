@@ -40,5 +40,6 @@ proptest = "1"
 
 [features]
 production = []
+test-support = []
 cac = ["cryptoki"]
 cac-hw = ["cac"]

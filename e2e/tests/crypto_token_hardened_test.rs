@@ -672,9 +672,9 @@ fn receipt_chain_10_step_integrity() {
             ttl_seconds: 30,
         };
 
-        sign_receipt(&mut receipt, &signing_key);
+        sign_receipt(&mut receipt, &signing_key).unwrap();
         assert!(
-            verify_receipt_signature(&receipt, &signing_key),
+            verify_receipt_signature(&receipt, &signing_key).unwrap(),
             "receipt step {} must verify",
             step
         );
@@ -715,7 +715,7 @@ fn receipt_chain_tamper_detected() {
             ttl_seconds: 30,
         };
 
-        sign_receipt(&mut receipt, &signing_key);
+        sign_receipt(&mut receipt, &signing_key).unwrap();
         prev_hash = hash_receipt(&receipt);
         receipts.push(receipt);
     }

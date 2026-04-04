@@ -1741,7 +1741,7 @@ async fn security_headers_middleware(
     headers.insert(
         axum::http::header::HeaderName::from_static("content-security-policy"),
         axum::http::HeaderValue::from_static(
-            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+            "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
         ),
     );
     headers.insert(

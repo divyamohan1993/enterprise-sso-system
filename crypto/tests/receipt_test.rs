@@ -84,19 +84,19 @@ fn wrong_step_order_rejected() {
 fn receipt_signature_roundtrip() {
     let signing_key: [u8; 64] = [0x42; 64];
     let mut receipt = make_receipt(1, [0u8; 64]);
-    sign_receipt(&mut receipt, &signing_key);
+    sign_receipt(&mut receipt, &signing_key).unwrap();
     assert!(!receipt.signature.is_empty());
-    assert!(verify_receipt_signature(&receipt, &signing_key));
+    assert!(verify_receipt_signature(&receipt, &signing_key).unwrap());
 }
 
 #[test]
 fn tampered_receipt_fails_verification() {
     let signing_key: [u8; 64] = [0x42; 64];
     let mut receipt = make_receipt(1, [0u8; 64]);
-    sign_receipt(&mut receipt, &signing_key);
+    sign_receipt(&mut receipt, &signing_key).unwrap();
     // Tamper with the nonce after signing
     receipt.nonce[0] ^= 0xFF;
-    assert!(!verify_receipt_signature(&receipt, &signing_key));
+    assert!(!verify_receipt_signature(&receipt, &signing_key).unwrap());
 }
 
 #[test]

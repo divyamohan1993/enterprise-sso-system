@@ -108,7 +108,7 @@ fn build_valid_receipt_chain(signing_key: &[u8; 64]) -> Vec<Receipt> {
         signature: Vec::new(),
         ttl_seconds: 30,
     };
-    sign_receipt(&mut r1, signing_key);
+    sign_receipt(&mut r1, signing_key).unwrap();
 
     let r1_hash = hash_receipt(&r1);
     let mut r2 = Receipt {
@@ -122,7 +122,7 @@ fn build_valid_receipt_chain(signing_key: &[u8; 64]) -> Vec<Receipt> {
         signature: Vec::new(),
         ttl_seconds: 30,
     };
-    sign_receipt(&mut r2, signing_key);
+    sign_receipt(&mut r2, signing_key).unwrap();
 
     vec![r1, r2]
 }
@@ -221,7 +221,7 @@ fn test_session_fixation_attack() {
 
     // Even if the attacker signs it with the correct key, the session ID
     // won't match any legitimate ceremony tracked by the orchestrator.
-    sign_receipt(&mut evil_receipt, &RECEIPT_SIGNING_KEY);
+    sign_receipt(&mut evil_receipt, &RECEIPT_SIGNING_KEY).unwrap();
 
     // Build a chain with mismatched session IDs — this must fail validation
     let mut legit_receipt = Receipt {
@@ -235,7 +235,7 @@ fn test_session_fixation_attack() {
         signature: Vec::new(),
         ttl_seconds: 30,
     };
-    sign_receipt(&mut legit_receipt, &RECEIPT_SIGNING_KEY);
+    sign_receipt(&mut legit_receipt, &RECEIPT_SIGNING_KEY).unwrap();
 
     let chain = vec![evil_receipt, legit_receipt];
     let vk = &*RECEIPT_MLDSA87_VK;
@@ -898,12 +898,12 @@ async fn test_race_condition_in_ceremony() {
                 signature: Vec::new(),
                 ttl_seconds: 30,
             };
-            sign_receipt(&mut r, &RECEIPT_SIGNING_KEY);
+            sign_receipt(&mut r, &RECEIPT_SIGNING_KEY).unwrap();
             rc.fetch_add(1, Ordering::SeqCst);
 
             // Each receipt must have a valid signature
             assert!(
-                verify_receipt_signature(&r, &RECEIPT_SIGNING_KEY),
+                verify_receipt_signature(&r, &RECEIPT_SIGNING_KEY).unwrap(),
                 "receipt from thread {thread_id} must have valid signature"
             );
             r
@@ -1102,7 +1102,7 @@ fn test_memory_scraping_resistance() {
         signature: Vec::new(),
         ttl_seconds: 30,
     };
-    sign_receipt(&mut receipt, &signing_key);
+    sign_receipt(&mut receipt, &signing_key).unwrap();
 
     // The signing key must NOT appear in the serialized receipt
     let receipt_bytes = postcard::to_allocvec(&receipt).expect("serialize receipt");

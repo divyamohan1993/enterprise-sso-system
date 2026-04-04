@@ -9,7 +9,7 @@ load-tests = []
 production = ["common/production"]
 
 [dependencies]
-common = { path = "../common" }
+common = { path = "../common", features = ["test-support"] }
 crypto = { path = "../crypto" }
 shard = { path = "../shard", features = ["test-internals"] }
 gateway = { path = "../gateway" }

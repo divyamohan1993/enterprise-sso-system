@@ -35,7 +35,7 @@ fn make_signed_receipt(step: u8, prev_hash: [u8; 64], session_id: [u8; 32]) -> R
         signature: Vec::new(),
         ttl_seconds: 30,
     };
-    sign_receipt(&mut receipt, &RECEIPT_SIGNING_KEY);
+    sign_receipt(&mut receipt, &RECEIPT_SIGNING_KEY).unwrap();
     receipt
 }
 

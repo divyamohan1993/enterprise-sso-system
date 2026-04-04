@@ -55,24 +55,21 @@ fn mac_receipt_fields(mac: &mut HmacSha512, receipt: &Receipt) {
 }
 
 /// Sign a receipt with HMAC-SHA512 (CNSA 2.0 compliant)
-pub fn sign_receipt(receipt: &mut Receipt, signing_key: &[u8; 64]) {
-    let mut mac = match HmacSha512::new_from_slice(signing_key) {
-        Ok(m) => m,
-        Err(_) => panic!("FATAL: HMAC-SHA512 key initialization failed for receipt signing"),
-    };
+pub fn sign_receipt(receipt: &mut Receipt, signing_key: &[u8; 64]) -> Result<(), String> {
+    let mut mac = HmacSha512::new_from_slice(signing_key)
+        .map_err(|e| format!("HMAC-SHA512 key init failed for receipt signing: {e}"))?;
     mac_receipt_fields(&mut mac, receipt);
     receipt.signature = mac.finalize().into_bytes().to_vec();
+    Ok(())
 }
 
 /// Verify a receipt's signature (HMAC-SHA512)
-pub fn verify_receipt_signature(receipt: &Receipt, signing_key: &[u8; 64]) -> bool {
-    let mut mac = match HmacSha512::new_from_slice(signing_key) {
-        Ok(m) => m,
-        Err(_) => panic!("FATAL: HMAC-SHA512 key initialization failed for receipt verification"),
-    };
+pub fn verify_receipt_signature(receipt: &Receipt, signing_key: &[u8; 64]) -> Result<bool, String> {
+    let mut mac = HmacSha512::new_from_slice(signing_key)
+        .map_err(|e| format!("HMAC-SHA512 key init failed for receipt verification: {e}"))?;
     mac_receipt_fields(&mut mac, receipt);
     let expected = mac.finalize().into_bytes();
-    crate::ct::ct_eq(&receipt.signature, &expected)
+    Ok(crate::ct::ct_eq(&receipt.signature, &expected))
 }
 
 /// A chain of receipts for one ceremony
@@ -147,7 +144,7 @@ impl ReceiptChain {
             return Err("empty receipt chain".into());
         }
         for receipt in &self.receipts {
-            if !verify_receipt_signature(receipt, signing_key) {
+            if !verify_receipt_signature(receipt, signing_key).unwrap_or(false) {
                 return Err(format!(
                     "receipt step {} has invalid signature",
                     receipt.step_id

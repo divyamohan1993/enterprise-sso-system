@@ -41,5 +41,8 @@ aes-gcm.workspace = true
 getrandom.workspace = true
 zeroize.workspace = true
 
+[dev-dependencies]
+common = { path = "../common", features = ["test-support"] }
+
 [features]
 production = ["common/production"]

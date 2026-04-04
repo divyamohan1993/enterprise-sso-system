@@ -617,7 +617,7 @@ fn make_signed_receipt_v2(step: u8, prev_hash: [u8; 64], session_id: [u8; 32]) -
         signature: Vec::new(),
         ttl_seconds: 30,
     };
-    sign_receipt(&mut receipt, &RECEIPT_KEY_V2);
+    sign_receipt(&mut receipt, &RECEIPT_KEY_V2).unwrap();
     receipt
 }
 

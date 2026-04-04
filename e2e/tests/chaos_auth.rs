@@ -42,7 +42,7 @@ fn make_receipt(
         signature: Vec::new(),
         ttl_seconds: 30,
     };
-    sign_receipt(&mut r, signing_key);
+    sign_receipt(&mut r, signing_key).unwrap();
     r
 }
 
@@ -117,7 +117,7 @@ fn test_receipt_forgery_detected() {
         receipt.signature.push(0xAD);
     }
 
-    let valid = verify_receipt_signature(&receipt, &signing_key);
+    let valid = verify_receipt_signature(&receipt, &signing_key).unwrap();
     assert!(!valid, "tampered receipt must fail signature verification");
 }
 

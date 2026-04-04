@@ -57,6 +57,13 @@ pub fn prepare_claims_with_audience(
 /// 4. Build the final [`Token`].
 #[cfg(not(feature = "production"))]
 #[deprecated(note = "use build_token_distributed — shares must not be co-located")]
+/// # Security Warning
+///
+/// This function co-locates all signing shares in one process, collapsing
+/// 3-of-5 threshold security to 1-of-1. It is stripped from production
+/// binaries via `#[cfg(not(feature = "production"))]`.
+///
+/// In production builds, attempting to use this function will fail to compile.
 pub fn build_token(
     claims: &TokenClaims,
     signers: &mut [SignerShare],

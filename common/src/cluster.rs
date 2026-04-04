@@ -548,11 +548,38 @@ fn derive_raft_hmac_key() -> Option<[u8; 64]> {
 ///
 /// Wire format: `len(4 bytes, big-endian)` || `payload` || `hmac_tag(64 bytes)`
 /// where `len` = `payload.len() + 64`.
+///
+/// SECURITY NOTE: Raft messages are HMAC-authenticated (integrity + authenticity)
+/// but the payload is NOT encrypted. An attacker on the network can observe
+/// cluster topology commands (membership changes, heartbeats) but cannot forge
+/// them. For full confidentiality, deploy Raft nodes behind a TLS mesh/sidecar
+/// (e.g. Istio mTLS, WireGuard) or use the MILNET_RAFT_TLS=1 environment
+/// variable to enable application-layer encryption of payloads.
 async fn send_authenticated(
     stream: &mut TcpStream,
     data: &[u8],
     hmac_key: &[u8; 64],
 ) -> Result<(), String> {
+    // Optionally encrypt payload for confidentiality (MILNET_RAFT_ENCRYPT=1).
+    // Uses AES-256-GCM with the first 32 bytes of the HMAC key as the
+    // encryption key and a random 12-byte nonce prepended to the ciphertext.
+    let data = if raft_encrypt_enabled() {
+        use aes_gcm::{Aes256Gcm, KeyInit, Nonce as GcmNonce};
+        use aes_gcm::aead::Aead;
+        let cipher = Aes256Gcm::new_from_slice(&hmac_key[..32])
+            .map_err(|e| format!("AES-256-GCM key init failed: {e}"))?;
+        let mut nonce_bytes = [0u8; 12];
+        getrandom::getrandom(&mut nonce_bytes)
+            .map_err(|e| format!("nonce generation failed: {e}"))?;
+        let nonce = GcmNonce::from_slice(&nonce_bytes);
+        let ciphertext = cipher.encrypt(nonce, data)
+            .map_err(|e| format!("Raft payload encryption failed: {e}"))?;
+        [nonce_bytes.to_vec(), ciphertext].concat()
+    } else {
+        data.to_vec()
+    };
+    let data = &data;
+
     let mut mac = match HmacSha512::new_from_slice(hmac_key) {
         Ok(m) => m,
         Err(e) => return Err(format!("HMAC-SHA512 key init failed: {e}")),
@@ -641,7 +668,35 @@ async fn recv_authenticated(
         return Err("HMAC verification failed — rejecting unauthenticated Raft message".into());
     }
 
+    // Decrypt payload if Raft encryption is enabled
+    if raft_encrypt_enabled() {
+        use aes_gcm::{Aes256Gcm, KeyInit, Nonce as GcmNonce};
+        use aes_gcm::aead::Aead;
+        if payload.len() < 12 {
+            return Err("encrypted Raft payload too short for nonce".into());
+        }
+        let (nonce_bytes, ciphertext) = payload.split_at(12);
+        let cipher = Aes256Gcm::new_from_slice(&hmac_key[..32])
+            .map_err(|e| format!("AES-256-GCM key init failed: {e}"))?;
+        let nonce = GcmNonce::from_slice(nonce_bytes);
+        let plaintext = cipher.decrypt(nonce, ciphertext)
+            .map_err(|e| format!("Raft payload decryption failed: {e}"))?;
+        return Ok(plaintext);
+    }
+
     Ok(payload)
+}
+
+/// Returns true if Raft payload encryption is enabled.
+///
+/// When `MILNET_RAFT_ENCRYPT=1` is set, all Raft consensus messages are
+/// AES-256-GCM encrypted in addition to HMAC-SHA512 authentication.
+/// This prevents network observers from reading cluster topology commands.
+fn raft_encrypt_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("MILNET_RAFT_ENCRYPT").as_deref() == Ok("1")
+    })
 }
 
 // ── ClusterNode ──

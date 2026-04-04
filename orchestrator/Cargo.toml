@@ -26,5 +26,8 @@ rcgen.workspace = true
 zeroize.workspace = true
 ml-dsa.workspace = true
 
+[dev-dependencies]
+common = { path = "../common", features = ["test-support"] }
+
 [features]
 production = ["common/production"]
