@@ -155,7 +155,8 @@ fn xwing_rejects_tampered_ciphertext() {
 
     // Tamper with the ciphertext bytes
     let mut ct_bytes = ct.to_bytes();
-    ct_bytes[ct_bytes.len() / 2] ^= 0xFF;
+    let mid = ct_bytes.len() / 2;
+    ct_bytes[mid] ^= 0xFF;
     let tampered_ct = crypto::xwing::Ciphertext::from_bytes(&ct_bytes)
         .expect("ciphertext reconstruction");
 
@@ -192,7 +193,8 @@ fn slhdsa_rejects_tampered_signature() {
 
     // Tamper by flipping a bit
     let mut sig_bytes = sig.as_bytes().to_vec();
-    sig_bytes[sig_bytes.len() / 2] ^= 0x01;
+    let mid = sig_bytes.len() / 2;
+    sig_bytes[mid] ^= 0x01;
     let tampered = crypto::slh_dsa::SlhDsaSignature::from_bytes(sig_bytes)
         .expect("signature reconstruction");
 
@@ -268,9 +270,11 @@ fn mldsa87_keygen_produces_different_keys_each_call() {
         let vk1_bytes = vk1.encode();
         let vk2_bytes = vk2.encode();
 
+        let vk1_slice: &[u8] = vk1_bytes.as_ref();
+        let vk2_slice: &[u8] = vk2_bytes.as_ref();
         assert_ne!(
-            vk1_bytes.as_ref(),
-            vk2_bytes.as_ref(),
+            vk1_slice,
+            vk2_slice,
             "ML-DSA-87 key generation must produce different keys on each call"
         );
     });
