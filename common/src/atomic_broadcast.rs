@@ -51,9 +51,30 @@ pub trait BroadcastPersistence: Send + Sync {
 #[derive(Serialize, Deserialize)]
 struct PersistedBroadcastEntry {
     sequence: u64,
-    payload_hash: [u8; 64],
+    payload_hash_vec: Vec<u8>,
     sender: String,
     timestamp: i64,
+}
+
+impl PersistedBroadcastEntry {
+    fn from_message(msg: &BroadcastMessage) -> Self {
+        Self {
+            sequence: msg.sequence,
+            payload_hash_vec: msg.payload_hash.to_vec(),
+            sender: msg.sender.clone(),
+            timestamp: msg.timestamp,
+        }
+    }
+
+    fn payload_hash_array(&self) -> Option<[u8; 64]> {
+        if self.payload_hash_vec.len() == 64 {
+            let mut arr = [0u8; 64];
+            arr.copy_from_slice(&self.payload_hash_vec);
+            Some(arr)
+        } else {
+            None
+        }
+    }
 }
 
 /// File-backed broadcast persistence.
@@ -91,12 +112,7 @@ impl FileBroadcastPersistence {
 
 impl BroadcastPersistence for FileBroadcastPersistence {
     fn save_delivered(&self, msg: &BroadcastMessage) -> Result<(), String> {
-        let entry = PersistedBroadcastEntry {
-            sequence: msg.sequence,
-            payload_hash: msg.payload_hash,
-            sender: msg.sender.clone(),
-            timestamp: msg.timestamp,
-        };
+        let entry = PersistedBroadcastEntry::from_message(msg);
         let data = postcard::to_allocvec(&entry)
             .map_err(|e| format!("serialize broadcast entry: {e}"))?;
         let path = self.dir.join("delivered").join(format!("{}.bin", msg.sequence));
@@ -124,7 +140,9 @@ impl BroadcastPersistence for FileBroadcastPersistence {
                         .map_err(|e| format!("read {}: {e}", path.display()))?;
                     let persisted: PersistedBroadcastEntry = postcard::from_bytes(&data)
                         .map_err(|e| format!("deserialize {}: {e}", path.display()))?;
-                    delivered_hashes.insert(persisted.payload_hash);
+                    if let Some(hash) = persisted.payload_hash_array() {
+                        delivered_hashes.insert(hash);
+                    }
                     if persisted.sequence >= max_sequence {
                         max_sequence = persisted.sequence;
                     }
