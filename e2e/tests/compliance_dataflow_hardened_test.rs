@@ -1044,6 +1044,8 @@ mod audit_immutability {
                 prev_hash: [0xAA; 64], // wrong hash
                 signature: vec![],
                 classification: 0,
+                correlation_id: None,
+                trace_id: None,
             };
             entries.insert(5, forged);
 

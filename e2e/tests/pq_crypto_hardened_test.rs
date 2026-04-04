@@ -514,6 +514,8 @@ fn key_zeroization_debug_redaction() {
         prev_hash: [0xFF; 64],
         signature: vec![0x11; 128],
         classification: 0,
+        correlation_id: None,
+        trace_id: None,
     };
     let entry_dbg = format!("{:?}", entry);
     assert!(

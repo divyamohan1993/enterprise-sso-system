@@ -356,6 +356,13 @@ pub struct AuditEntry {
     /// Default: 0 (Unclassified) for backward compatibility.
     #[serde(default)]
     pub classification: u8,
+    /// Correlation ID linking related audit events across the request lifecycle.
+    /// Threads through gateway -> orchestrator -> OPAQUE -> TSS for a single auth flow.
+    #[serde(default)]
+    pub correlation_id: Option<Uuid>,
+    /// Distributed trace ID for observability integration (OpenTelemetry compatible).
+    #[serde(default)]
+    pub trace_id: Option<String>,
 }
 
 /// Custom Debug for AuditEntry — redacts cryptographic material.
@@ -372,6 +379,8 @@ impl std::fmt::Debug for AuditEntry {
             .field("prev_hash", &"[REDACTED]")
             .field("signature", &"[REDACTED]")
             .field("classification", &self.classification)
+            .field("correlation_id", &self.correlation_id)
+            .field("trace_id", &self.trace_id)
             .finish()
     }
 }

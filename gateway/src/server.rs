@@ -178,8 +178,10 @@ fn verify_key_pin(server_fingerprint: &str, pinned: &[String]) -> bool {
         return true; // Pinning not configured
     }
 
+    // SECURITY: Use constant-time comparison to prevent timing side-channel
+    // that could reveal matching prefix length of pinned fingerprints.
     for pin in pinned {
-        if pin == server_fingerprint {
+        if crypto::ct::ct_eq(pin.as_bytes(), server_fingerprint.as_bytes()) {
             return true;
         }
     }

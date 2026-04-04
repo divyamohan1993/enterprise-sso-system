@@ -29,11 +29,21 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 // ---------------------------------------------------------------------------
 
 /// Google OAuth application credentials.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct GoogleOAuthConfig {
     pub client_id: String,
     pub client_secret: String,
     pub redirect_uri: String,
+}
+
+impl std::fmt::Debug for GoogleOAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GoogleOAuthConfig")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"[REDACTED]")
+            .field("redirect_uri", &self.redirect_uri)
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------

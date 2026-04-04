@@ -149,6 +149,11 @@ fn state_hmac_key() -> &'static [u8; 64] {
                 module_path!(),
             );
         }
+        // SECURITY: In military deployment, KEK MUST be available. Fail-closed.
+        if std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok() {
+            tracing::error!("FATAL: Master KEK unavailable for OAuth state HMAC -- cannot start in military mode");
+            std::process::exit(1);
+        }
         // Fallback: KEK not available (startup race). Use random key but warn.
         common::siem::emit_runtime_error(
             common::siem::category::CRYPTO_FAILURE,

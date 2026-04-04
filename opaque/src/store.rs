@@ -420,6 +420,22 @@ impl CredentialStore {
     }
 }
 
+impl Drop for CredentialStore {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        // Zeroize the OPRF seed and keypair by serializing and clearing
+        let mut setup_bytes = self.server_setup.serialize().to_vec();
+        setup_bytes.zeroize();
+        if let Some(ref fips_setup) = self.server_setup_fips {
+            let mut fips_bytes = fips_setup.serialize().to_vec();
+            fips_bytes.zeroize();
+        }
+        // Clear user records (registration blobs contain no passwords but
+        // are high-value for offline attacks)
+        self.users.clear();
+    }
+}
+
 impl Default for CredentialStore {
     fn default() -> Self {
         Self::new()

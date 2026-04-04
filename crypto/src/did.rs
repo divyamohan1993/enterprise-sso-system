@@ -377,6 +377,23 @@ pub fn sign_did_auth_ed25519(
     }
 }
 
+/// Sign a DIDAuth challenge with ML-DSA-87 (post-quantum).
+pub fn sign_did_auth_ml_dsa87(
+    challenge: &DidAuthChallenge,
+    prover_did: &str,
+    signing_key: &crate::pq_sign::PqSigningKey,
+) -> DidAuthResponse {
+    let digest = did_auth_challenge_digest(challenge);
+    let signature = crate::pq_sign::pq_sign_raw(signing_key, &digest);
+
+    DidAuthResponse {
+        challenge_nonce: challenge.nonce,
+        prover_did: prover_did.to_string(),
+        signature_hex: hex::encode(&signature),
+        key_type: KeyType::MlDsa87,
+    }
+}
+
 /// Verify a DIDAuth response using the public key from a DID Document.
 pub fn verify_did_auth(
     challenge: &DidAuthChallenge,
@@ -418,6 +435,17 @@ pub fn verify_did_auth(
             let signature = ed25519_dalek::Signature::from_bytes(&sig_arr);
             use ed25519_dalek::Verifier;
             Ok(verifying_key.verify(&digest, &signature).is_ok())
+        }
+        KeyType::MlDsa87 => {
+            let sig_bytes = hex::decode(&response.signature_hex)
+                .map_err(|e| format!("invalid signature hex: {e}"))?;
+
+            let vk_bytes = &vm.public_key_bytes;
+            let vk_enc = crate::pq_sign::PqEncodedVerifyingKey::try_from(vk_bytes.as_slice())
+                .map_err(|e| format!("invalid ML-DSA-87 verifying key encoding: {e}"))?;
+            let verifying_key = crate::pq_sign::PqVerifyingKey::decode(&vk_enc);
+
+            Ok(crate::pq_sign::pq_verify_raw(&verifying_key, &digest, &sig_bytes))
         }
         _ => Err(format!(
             "DIDAuth verification not implemented for {:?}",

@@ -332,7 +332,7 @@ async fn main() {
         oauth_clients: RwLock::new(oauth_clients),
         auth_codes: RwLock::new(sso_protocol::authorize::AuthorizationStore::new()),
         oidc_signing_key: sso_protocol::tokens::OidcSigningKey::generate(),
-        admin_api_key: api_key,
+        admin_api_key: zeroize::Zeroizing::new(api_key),
         super_admin_keys: RwLock::new(super_admin_keys),
         fido_store: RwLock::new(fido::registration::CredentialStore::new()),
         setup_complete: Arc::new(AtomicBool::new(false)),

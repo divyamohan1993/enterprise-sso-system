@@ -91,6 +91,8 @@ fn audit_entry_round_trip() {
         prev_hash: [0x00; 64],
         signature: vec![0x11; 64],
         classification: 0,
+        correlation_id: None,
+        trace_id: None,
     };
     let bytes = postcard::to_allocvec(&entry).expect("serialize audit entry");
     let decoded: AuditEntry = postcard::from_bytes(&bytes).expect("deserialize audit entry");
@@ -167,6 +169,8 @@ fn audit_entry_classification_default() {
         prev_hash: [0u8; 64],
         signature: vec![],
         classification: 0,
+        correlation_id: None,
+        trace_id: None,
     };
     assert_eq!(entry.classification, 0);
 }

@@ -8,7 +8,7 @@ FROM rust:1.88-bookworm AS builder
 
 ARG SERVICE_NAME=gateway
 ENV CARGO_TERM_COLOR=always \
-    RUSTFLAGS="-D warnings -C target-feature=+crt-static"
+    RUSTFLAGS="-D warnings -C target-feature=+crt-static -C link-arg=-Wl,-z,relro,-z,now -C link-arg=-Wl,-z,noexecstack"
 
 WORKDIR /build
 

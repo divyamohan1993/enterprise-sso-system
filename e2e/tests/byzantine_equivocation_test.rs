@@ -286,6 +286,8 @@ fn test_verify_consistency_detects_divergence() {
         prev_hash: node1_last_hash,
         signature: vec![],
         classification: CLASSIFICATION_UNCLASSIFIED,
+        correlation_id: None,
+        trace_id: None,
     };
     // Force-append the rogue entry to node 1's log
     cluster.nodes[1]

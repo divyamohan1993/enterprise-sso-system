@@ -573,6 +573,8 @@ mod tests {
             prev_hash: prev,
             signature: vec![],
             classification: 0,
+            correlation_id: None,
+            trace_id: None,
         }
     }
 

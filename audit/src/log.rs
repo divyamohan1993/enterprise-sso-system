@@ -183,6 +183,8 @@ impl AuditLog {
             prev_hash: self.last_hash,
             signature: Vec::new(),
             classification: 0,
+            correlation_id: None,
+            trace_id: None,
         };
         let hash = hash_entry(&entry);
         entry.signature = crypto::pq_sign::pq_sign_raw(signing_key, &hash);
@@ -293,6 +295,8 @@ impl AuditLog {
             prev_hash: self.last_hash,
             signature: Vec::new(),
             classification: 0,
+            correlation_id: None,
+            trace_id: None,
         };
         let hash = hash_entry(&entry);
         entry.signature = crypto::pq_sign::pq_sign_raw(signing_key, &hash);
@@ -830,6 +834,8 @@ mod tests {
                 prev_hash: log.last_hash,
                 signature: Vec::new(),
                 classification: 0,
+                correlation_id: None,
+                trace_id: None,
             };
             let hash = hash_entry(&entry);
             entry.signature = crypto::pq_sign::pq_sign_raw(signing_key, &hash);

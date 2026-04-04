@@ -838,7 +838,7 @@ pub struct AppState {
     pub oauth_clients: RwLock<sso_protocol::clients::ClientRegistry>,
     pub auth_codes: RwLock<sso_protocol::authorize::AuthorizationStore>,
     pub oidc_signing_key: sso_protocol::tokens::OidcSigningKey,
-    pub admin_api_key: String,
+    pub admin_api_key: zeroize::Zeroizing<String>,
     /// Registry of super admin API keys (id -> key_hash).
     /// Loaded from DB at startup, updated during setup.
     pub super_admin_keys: RwLock<HashMap<Uuid, SuperAdminEntry>>,

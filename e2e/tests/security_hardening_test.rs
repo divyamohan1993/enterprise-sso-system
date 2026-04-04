@@ -847,6 +847,8 @@ fn bft_unsigned_entry_rejected_with_verifying_key() {
             prev_hash: [0u8; 64],
             signature: vec![], // unsigned
             classification: 0,
+            correlation_id: None,
+            trace_id: None,
         };
 
         let mut rejections = 0;
@@ -877,6 +879,8 @@ fn bft_wrong_signature_rejected() {
             prev_hash: [0u8; 64],
             signature: pq_sign::pq_sign_raw(&wrong_sk, b"wrong-data"),
             classification: 0,
+            correlation_id: None,
+            trace_id: None,
         };
 
         let mut rejections = 0;

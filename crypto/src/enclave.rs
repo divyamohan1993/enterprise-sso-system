@@ -401,8 +401,8 @@ pub fn generate_attestation_nonce() -> Result<[u8; 32], String> {
 pub struct EnclaveChannelParams {
     /// Our enclave's attestation report.
     pub our_report: AttestationReport,
-    /// Our ephemeral X25519 public key.
-    pub our_ephemeral_public: [u8; 32],
+    /// Our X-Wing hybrid public key (X25519 + ML-KEM-1024).
+    pub our_xwing_public: Vec<u8>,
     /// Channel session identifier.
     pub session_id: [u8; 16],
 }
@@ -426,13 +426,13 @@ impl Drop for EnclaveChannel {
     }
 }
 
-/// Derive a session key from X25519 DH shared secret + attestation reports.
+/// Derive a session key from X-Wing shared secret + attestation reports.
 ///
 /// Binds the channel to both enclaves' identities, preventing MITM even if
-/// the DH exchange is intercepted. Identity hashes are sorted to ensure
+/// the key exchange is intercepted. Identity hashes are sorted to ensure
 /// both sides derive the same key regardless of who is "local" vs "remote".
 pub fn derive_channel_session_key(
-    dh_shared_secret: &[u8; 32],
+    shared_secret: &[u8; 32],
     local_identity: &EnclaveIdentity,
     remote_identity: &EnclaveIdentity,
     session_id: &[u8; 16],
@@ -447,15 +447,15 @@ pub fn derive_channel_session_key(
         (remote_hash, local_hash)
     };
 
-    // Construct IKM from DH shared secret, sorted identity hashes, and session ID
+    // Construct IKM from shared secret, sorted identity hashes, and session ID
     let mut ikm = Vec::with_capacity(32 + 32 + 32 + 16);
-    ikm.extend_from_slice(dh_shared_secret);
+    ikm.extend_from_slice(shared_secret);
     ikm.extend_from_slice(&first);
     ikm.extend_from_slice(&second);
     ikm.extend_from_slice(session_id);
 
     let hk = hkdf::Hkdf::<Sha512>::new(None, &ikm);
-    // Zeroize IKM immediately after HKDF extraction -- it contains the DH shared secret
+    // Zeroize IKM immediately after HKDF extraction -- it contains the shared secret
     ikm.zeroize();
     let mut key = [0u8; 32];
     hk.expand(b"MILNET-ENCLAVE-CHANNEL-v1", &mut key)
@@ -463,7 +463,74 @@ pub fn derive_channel_session_key(
     key
 }
 
-/// Establish an enclave-to-enclave secure channel (local side).
+/// Establish an enclave-to-enclave secure channel using X-Wing hybrid KEM.
+///
+/// Uses ML-KEM-1024 + X25519 (X-Wing) instead of raw X25519 DH to provide
+/// post-quantum resistance against harvest-now-decrypt-later attacks.
+///
+/// The initiator calls this with `is_initiator = true`, which performs
+/// encapsulation. The responder calls with `is_initiator = false`, which
+/// performs decapsulation.
+pub fn establish_channel_xwing(
+    _our_keypair: &crate::xwing::XWingKeyPair,
+    their_public: &crate::xwing::XWingPublicKey,
+    our_identity: &EnclaveIdentity,
+    their_identity: &EnclaveIdentity,
+    session_id: &[u8; 16],
+) -> Result<(EnclaveChannel, crate::xwing::Ciphertext), String> {
+    // X-Wing encapsulation (ML-KEM-1024 + X25519)
+    let (xwing_shared_secret, ciphertext) = crate::xwing::xwing_encapsulate(their_public)
+        .map_err(|e| format!("X-Wing encapsulation failed: {e}"))?;
+
+    let session_key = derive_channel_session_key(
+        xwing_shared_secret.as_bytes(),
+        our_identity,
+        their_identity,
+        session_id,
+    );
+
+    Ok((EnclaveChannel {
+        session_id: *session_id,
+        session_key,
+        local_identity: our_identity.clone(),
+        remote_identity: their_identity.clone(),
+    }, ciphertext))
+}
+
+/// Complete an enclave-to-enclave secure channel using X-Wing decapsulation.
+///
+/// Called by the responder after receiving the initiator's ciphertext.
+pub fn complete_channel_xwing(
+    our_keypair: &crate::xwing::XWingKeyPair,
+    ciphertext: &crate::xwing::Ciphertext,
+    our_identity: &EnclaveIdentity,
+    their_identity: &EnclaveIdentity,
+    session_id: &[u8; 16],
+) -> Result<EnclaveChannel, String> {
+    // X-Wing decapsulation (ML-KEM-1024 + X25519)
+    let xwing_shared_secret = crate::xwing::xwing_decapsulate(our_keypair, ciphertext)
+        .map_err(|e| format!("X-Wing decapsulation failed: {e}"))?;
+
+    let session_key = derive_channel_session_key(
+        xwing_shared_secret.as_bytes(),
+        our_identity,
+        their_identity,
+        session_id,
+    );
+
+    Ok(EnclaveChannel {
+        session_id: *session_id,
+        session_key,
+        local_identity: our_identity.clone(),
+        remote_identity: their_identity.clone(),
+    })
+}
+
+/// Legacy: Establish an enclave-to-enclave secure channel using X25519 only.
+///
+/// DEPRECATED: Use `establish_channel_xwing` / `complete_channel_xwing` for
+/// post-quantum resistance. This function is retained for backward compatibility
+/// with pre-PQ nodes during migration.
 pub fn establish_channel(
     our_secret: &[u8; 32],
     their_public: &[u8; 32],
@@ -471,7 +538,7 @@ pub fn establish_channel(
     their_identity: &EnclaveIdentity,
     session_id: &[u8; 16],
 ) -> EnclaveChannel {
-    // X25519 DH
+    // X25519 DH (legacy, not PQ-safe)
     let our_secret_key = x25519_dalek::StaticSecret::from(*our_secret);
     let their_public_key = x25519_dalek::PublicKey::from(*their_public);
     let shared_secret = our_secret_key.diffie_hellman(&their_public_key);

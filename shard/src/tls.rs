@@ -92,8 +92,8 @@ impl CertificatePinSet {
         if self.contains(&fingerprint) {
             Ok(())
         } else {
-            eprintln!(
-                "CRITICAL: Certificate passed CA chain verification but FAILED pin check \
+            tracing::error!(
+                "Certificate passed CA chain verification but FAILED pin check \
                  (fingerprint {:x?}). This may indicate CA compromise!",
                 &fingerprint[..8]
             );
@@ -692,8 +692,8 @@ pub fn rotate_module_cert(
     // connections from peers still holding the old pin set are not rejected
     // during the rotation window.
 
-    eprintln!(
-        "AUDIT: mTLS certificate rotated for module '{}' — old fingerprint {:x?}, new fingerprint {:x?}",
+    tracing::info!(
+        "mTLS certificate rotated for module '{}' — old fingerprint {:x?}, new fingerprint {:x?}",
         module_name,
         &compute_cert_fingerprint(old_cert.cert.der().as_ref())[..8],
         &compute_cert_fingerprint(new_cert.cert.der().as_ref())[..8],
@@ -756,8 +756,8 @@ pub fn spawn_cert_rotation_task(
 
 /// Emit an audit log entry for certificate rotation events.
 fn cert_rotation_audit_log(module_name: &str) {
-    eprintln!(
-        "AUDIT: mTLS cert rotation event for '{}' at {:?}",
+    tracing::info!(
+        "mTLS cert rotation event for '{}' at {:?}",
         module_name,
         std::time::SystemTime::now()
     );

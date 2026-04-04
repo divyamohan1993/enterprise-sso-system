@@ -48,7 +48,7 @@ impl ProtectedKek {
             if ret != 0 {
                 // In military deployment, mlock failure is fatal
                 if std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1") {
-                    eprintln!("FATAL: mlock failed for master KEK — aborting");
+                    tracing::error!("mlock failed for master KEK — aborting");
                     std::process::exit(199);
                 }
             }
@@ -120,8 +120,8 @@ pub fn cached_master_kek_distributed() -> &'static [u8; 32] {
 
         // If no share is configured, fail hard — distributed KEK is mandatory.
         if my_share_hex.is_none() {
-            eprintln!(
-                "FATAL: MILNET_KEK_SHARE not set. \
+            tracing::error!(
+                "MILNET_KEK_SHARE not set. \
                  Distributed threshold KEK is required. Each node must hold \
                  exactly one Shamir share. Set MILNET_KEK_SHARE, \
                  MILNET_KEK_SHARE_INDEX, and MILNET_KEK_PEER_SHARES."
@@ -143,7 +143,7 @@ pub fn cached_master_kek_distributed() -> &'static [u8; 32] {
 
         // Load this node's share
         if let Err(e) = mgr.load_my_share(&my_share_hex) {
-            eprintln!("FATAL: Failed to load KEK share from MILNET_KEK_SHARE: {e}");
+            tracing::error!("Failed to load KEK share from MILNET_KEK_SHARE: {e}");
             std::process::exit(1);
         }
 
@@ -185,11 +185,11 @@ pub fn cached_master_kek_distributed() -> &'static [u8; 32] {
                             );
                         }
                         if let Err(e) = mgr.add_peer_share(share) {
-                            eprintln!("WARNING: Failed to add peer share: {e}");
+                            tracing::warn!("Failed to add peer share: {e}");
                         }
                     }
                     Err(e) => {
-                        eprintln!("WARNING: Failed to parse peer share hex: {e}");
+                        tracing::warn!("Failed to parse peer share hex: {e}");
                     }
                 }
             }
@@ -200,8 +200,8 @@ pub fn cached_master_kek_distributed() -> &'static [u8; 32] {
 
         // Check if we have enough shares — fail hard if not.
         if !mgr.has_threshold() {
-            eprintln!(
-                "FATAL: Insufficient KEK shares for reconstruction. \
+            tracing::error!(
+                "Insufficient KEK shares for reconstruction. \
                  Have {} shares, need 3. Ensure MILNET_KEK_PEER_SHARES \
                  contains at least 2 peer shares (comma-separated hex).",
                 mgr.shares_collected()
@@ -213,14 +213,14 @@ pub fn cached_master_kek_distributed() -> &'static [u8; 32] {
         let share_count = mgr.shares_collected();
         match mgr.reconstruct() {
             Ok(key) => {
-                eprintln!(
-                    "INFO: Master KEK reconstructed from {} threshold shares (3-of-5 Shamir).",
+                tracing::info!(
+                    "Master KEK reconstructed from {} threshold shares (3-of-5 Shamir).",
                     share_count
                 );
                 ProtectedKek::new(*key)
             }
             Err(e) => {
-                eprintln!("FATAL: KEK reconstruction failed: {e}");
+                tracing::error!("KEK reconstruction failed: {e}");
                 std::process::exit(1);
             }
         }
@@ -369,13 +369,13 @@ pub fn load_master_kek() -> [u8; 32] {
             let mut key = [0u8; 32];
             for (i, chunk) in hex_str.as_bytes().chunks(2).take(32).enumerate() {
                 let hex = std::str::from_utf8(chunk)
-                    .unwrap_or_else(|_| { eprintln!("FATAL: MILNET_MASTER_KEK contains invalid UTF-8 at byte {}", i * 2); std::process::exit(1); });
+                    .unwrap_or_else(|_| { tracing::error!("MILNET_MASTER_KEK contains invalid UTF-8 at byte {}", i * 2); std::process::exit(1); });
                 key[i] = u8::from_str_radix(hex, 16)
-                    .unwrap_or_else(|_| { eprintln!("FATAL: MILNET_MASTER_KEK contains invalid hex '{}' at position {}", hex, i * 2); std::process::exit(1); });
+                    .unwrap_or_else(|_| { tracing::error!("MILNET_MASTER_KEK contains invalid hex '{}' at position {}", hex, i * 2); std::process::exit(1); });
             }
             // Reject all-zero keys
             if key.iter().all(|&b| b == 0) {
-                eprintln!("FATAL: all-zero key detected in MILNET_MASTER_KEK"); std::process::exit(1);
+                tracing::error!("all-zero key detected in MILNET_MASTER_KEK"); std::process::exit(1);
             }
             // Zeroize the hex string in memory
             zeroize_string(&mut hex_str);
@@ -383,7 +383,7 @@ pub fn load_master_kek() -> [u8; 32] {
             key
         }
         _ => {
-            eprintln!("FATAL: MILNET_MASTER_KEK not set. Refusing to start."); std::process::exit(1);
+            tracing::error!("MILNET_MASTER_KEK not set. Refusing to start."); std::process::exit(1);
         }
     }
 }
@@ -457,13 +457,13 @@ pub fn load_receipt_signing_seed_sealed() -> [u8; 32] {
         hex_str.zeroize();
         if let Some(seed) = result {
             if seed.iter().all(|&b| b == 0) {
-                eprintln!("FATAL: all-zero seed after unsealing {raw_var}");
+                tracing::error!("all-zero seed after unsealing {raw_var}");
                 std::process::exit(1);
             }
-            eprintln!("INFO: {raw_var} loaded from sealed storage.");
+            tracing::info!("{raw_var} loaded from sealed storage.");
             return seed;
         }
-        eprintln!("WARNING: {sealed_var} present but unseal failed. Trying raw.");
+        tracing::warn!("{sealed_var} present but unseal failed. Trying raw.");
     }
 
     // 2. Raw keys are not permitted — sealed keys only.
@@ -472,16 +472,16 @@ pub fn load_receipt_signing_seed_sealed() -> [u8; 32] {
         std::env::remove_var(raw_var);
         zeroize_string(&mut hex_str);
         hex_str.zeroize();
-        eprintln!(
-            "FATAL: Raw (unencrypted) {raw_var} detected. \
+        tracing::error!(
+            "Raw (unencrypted) {raw_var} detected. \
              Use {sealed_var} with sealed keys instead."
         );
         std::process::exit(1);
     }
 
     // 3. No key found — fail hard.
-    eprintln!(
-        "FATAL: {raw_var} not set and no sealed seed found. \
+    tracing::error!(
+        "{raw_var} not set and no sealed seed found. \
          Cannot start without receipt signing seed."
     );
     std::process::exit(1);
@@ -551,12 +551,12 @@ fn load_key_hardened(var: &str, purpose: &str, _dev_seed: &[u8]) -> [u8; 64] {
         if let Some(key) = result {
             // Reject all-zero keys
             if key.iter().all(|&b| b == 0) {
-                eprintln!("FATAL: all-zero key detected after unsealing {var}"); std::process::exit(1);
+                tracing::error!("all-zero key detected after unsealing {var}"); std::process::exit(1);
             }
-            eprintln!("INFO: {var} loaded from sealed storage.");
+            tracing::info!("{var} loaded from sealed storage.");
             return key;
         }
-        eprintln!("WARNING: {sealed_var} present but unseal failed. Trying raw.");
+        tracing::warn!("{sealed_var} present but unseal failed. Trying raw.");
     }
 
     // 2. Raw keys are not permitted — sealed keys only.
@@ -565,16 +565,16 @@ fn load_key_hardened(var: &str, purpose: &str, _dev_seed: &[u8]) -> [u8; 64] {
         std::env::remove_var(var);
         zeroize_string(&mut hex_str);
         hex_str.zeroize();
-        eprintln!(
-            "FATAL: Raw (unencrypted) {var} detected. \
+        tracing::error!(
+            "Raw (unencrypted) {var} detected. \
              Use {sealed_var} with sealed keys instead."
         );
         std::process::exit(1);
     }
 
     // 3. No key found — fail hard. No dev fallbacks.
-    eprintln!(
-        "FATAL: {var} not set and no sealed key found. \
+    tracing::error!(
+        "{var} not set and no sealed key found. \
          Cannot start without keys."
     );
     std::process::exit(1)
@@ -712,16 +712,16 @@ pub fn load_master_kek_hsm_aware() -> [u8; 32] {
             "software" | "soft" | "dev"
         );
         if !is_software {
-            eprintln!(
-                "INFO: HSM backend '{}' detected. Master KEK will be loaded from HSM.",
+            tracing::info!(
+                "HSM backend '{}' detected. Master KEK will be loaded from HSM.",
                 backend
             );
             // Return sentinel — caller must use HsmKeyManager.
             return [0u8; 32];
         }
         // Software HSM is forbidden — fail hard.
-        eprintln!(
-            "FATAL: Software HSM backend forbidden. \
+        tracing::error!(
+            "Software HSM backend forbidden. \
              Set MILNET_HSM_BACKEND to pkcs11/aws-kms/tpm2"
         );
         std::process::exit(1);

@@ -143,6 +143,8 @@ fn test_audit_hash_chain_tamper_detected() {
                 prev_hash: prev,
                 signature: vec![],
                 classification: 0,
+                correlation_id: None,
+                trace_id: None,
             };
             prev = hash_entry(&entry);
             entries.push(entry);

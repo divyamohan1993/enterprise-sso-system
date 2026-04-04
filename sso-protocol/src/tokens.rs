@@ -212,7 +212,19 @@ pub fn set_jti_store(store: Box<dyn JtiReplayStore>) -> Result<(), Box<dyn JtiRe
 
 fn jti_store() -> &'static dyn JtiReplayStore {
     JTI_STORE
-        .get_or_init(|| Box::new(LocalJtiStore::new(100_000)))
+        .get_or_init(|| {
+            // SECURITY: In military deployment, a distributed JTI store MUST be configured
+            // via set_jti_store() before first use. Per-process LocalJtiStore allows
+            // cross-instance token replay.
+            if std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok() {
+                tracing::error!(
+                    "FATAL: No distributed JTI store configured in military deployment mode. \
+                     Call set_jti_store() with a DatabaseJtiStore at startup."
+                );
+                std::process::exit(1);
+            }
+            Box::new(LocalJtiStore::new(100_000))
+        })
         .as_ref()
 }
 
@@ -232,7 +244,10 @@ const REFRESH_TOKEN_LIFETIME_SECS: i64 = 8 * 3600;
 /// 10 seconds is the recommended value per NIST SP 800-63B for networked systems.
 const CLOCK_SKEW_TOLERANCE_SECS: i64 = 10;
 
-/// AAL3 inactivity timeout per NIST SP 800-63B Section 4.3.1.
+/// Maximum token lifetime for AAL2 sessions (SP 800-63B: 12 hours).
+pub const AAL2_MAX_SESSION_SECS: i64 = 12 * 3600;
+
+/// AAL3 inactivity timeout per NIST SP 800-63B Section 4.3.1 / DISA STIG V-222977.
 ///
 /// SECURITY: Sovereign/Tier1 tokens (AAL3) MUST enforce a 15-minute inactivity
 /// timeout regardless of the token's own `exp` field. This prevents long-lived
@@ -240,6 +255,12 @@ const CLOCK_SKEW_TOLERANCE_SECS: i64 = 10;
 /// critical in SCIF and tactical environments where unattended sessions pose
 /// an insider threat risk.
 pub const AAL3_INACTIVITY_TIMEOUT_SECS: i64 = 15 * 60;
+
+/// Default token lifetime: 1 hour for access tokens.
+pub const ACCESS_TOKEN_LIFETIME_SECS: i64 = 3600;
+
+/// Maximum token lifetime ceiling -- no token may exceed 24 hours regardless of AAL.
+pub const MAX_TOKEN_LIFETIME_SECS: i64 = 24 * 3600;
 
 /// A refresh token bound to a specific user and client.
 ///
@@ -603,6 +624,21 @@ impl OidcSigningKey {
         }
 
         serde_json::json!({ "keys": keys })
+    }
+}
+
+impl Drop for OidcSigningKey {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        // Zeroize current key slot signing key bytes
+        let mut current_bytes = self.current.signing_key.encode();
+        current_bytes.as_mut().zeroize();
+        // Zeroize previous key slot if present
+        if let Some(ref prev) = self.previous {
+            let mut prev_bytes = prev.signing_key.encode();
+            prev_bytes.as_mut().zeroize();
+        }
+        self.generation = 0;
     }
 }
 

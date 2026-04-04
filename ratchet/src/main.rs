@@ -11,6 +11,7 @@
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use zeroize::Zeroize;
 
 use ratchet::manager::{RatchetAction, RatchetRequest, RatchetResponse};
 
@@ -321,6 +322,9 @@ async fn handle_request_standalone(
             }
             let mut secret = [0u8; 64];
             secret.copy_from_slice(&initial_key);
+            // SECURITY: Zeroize the deserialized initial_key Vec to prevent memory forensics
+            let mut initial_key = initial_key;
+            initial_key.zeroize();
             let mgr = manager.write().await;
             match mgr.create_session(session_id, &secret) {
                 Ok(epoch) => RatchetResponse {
@@ -407,6 +411,9 @@ async fn handle_request_persistent(
             }
             let mut secret = [0u8; 64];
             secret.copy_from_slice(&initial_key);
+            // SECURITY: Zeroize the deserialized initial_key Vec to prevent memory forensics
+            let mut initial_key = initial_key;
+            initial_key.zeroize();
             let mgr = manager.write().await;
             match mgr.create_session(session_id, &secret).await {
                 Ok(epoch) => RatchetResponse {

@@ -385,6 +385,8 @@ fn debug_impls_all_redacted() {
         prev_hash: [0x66; 64],
         signature: vec![0x77; 128],
         classification: 0,
+        correlation_id: None,
+        trace_id: None,
     };
     let entry_dbg = format!("{:?}", entry);
     assert!(entry_dbg.contains("[REDACTED]"), "AuditEntry Debug must contain [REDACTED]");

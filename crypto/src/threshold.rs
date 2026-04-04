@@ -49,14 +49,15 @@ impl SignerShare {
 
 impl Drop for SignerShare {
     fn drop(&mut self) {
-        // Zeroize the serialized key package bytes to prevent memory forensics.
-        // KeyPackage doesn't implement Zeroize, so we serialize and zeroize the
-        // identifier as a best-effort defense. The actual secret scalar lives
-        // inside frost-ristretto255's internal types which we cannot directly
-        // reach, but clearing our handle reduces the attack surface.
         use zeroize::Zeroize;
+        // Zeroize identifier
         let mut id_bytes = self.identifier.serialize();
         id_bytes.zeroize();
+        // Best-effort zeroize of KeyPackage: serialize to get bytes, then zero them.
+        // The actual secret scalar lives in frost-ristretto255 internals, but clearing
+        // the serialized form reduces attack surface for memory forensics.
+        let mut kp_bytes = self.key_package.serialize().expect("KeyPackage serialize for zeroization");
+        kp_bytes.zeroize();
     }
 }
 

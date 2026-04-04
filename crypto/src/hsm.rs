@@ -26,9 +26,9 @@
 //!
 //! ## Audit Logging
 //!
-//! All key operations emit structured audit events via `eprintln!` (and `tracing`
-//! when available). In production, these should be routed to a tamper-evident
-//! audit log (e.g., AWS CloudTrail, syslog with remote forwarding).
+//! All key operations emit structured audit events via `tracing` macros,
+//! routed through the SIEM pipeline. In production, these should be routed
+//! to a tamper-evident audit log (e.g., AWS CloudTrail, syslog with remote forwarding).
 //!
 //! # Backend Implementations
 //! Since this crate does not link against PKCS#11, AWS SDK, or tss-esapi
@@ -880,8 +880,8 @@ impl AwsKmsSession {
                 // Exponential backoff: base_delay * 2^(attempt-1)
                 let delay_ms = self.base_retry_delay_ms * (1u64 << (attempt - 1));
                 std::thread::sleep(Duration::from_millis(delay_ms));
-                eprintln!(
-                    "INFO: AWS KMS retry attempt {}/{} after {}ms delay (purpose={})",
+                tracing::info!(
+                    "AWS KMS retry attempt {}/{} after {}ms delay (purpose={})",
                     attempt, self.max_retries, delay_ms, purpose
                 );
             }
@@ -1412,15 +1412,15 @@ impl HsmKeyManager {
                 };
                 let source = SoftwareKeySource::new(seed)
                     .map_err(|e| HsmError::InitializationFailed(format!("{e}")))?;
-                eprintln!(
-                    "WARNING: Using software HSM backend. NOT FOR PRODUCTION."
+                tracing::warn!(
+                    "Using software HSM backend. NOT FOR PRODUCTION."
                 );
                 BackendState::Software(source)
             }
         };
 
-        eprintln!(
-            "INFO: HSM key manager initialized (backend={}, label={})",
+        tracing::info!(
+            "HSM key manager initialized (backend={}, label={})",
             config.backend, config.key_label
         );
 
@@ -1501,8 +1501,8 @@ impl HsmKeyManager {
         let pin = config.pkcs11_pin.as_ref()
             .ok_or_else(|| HsmError::ConfigurationError("PKCS#11 PIN not configured".into()))?;
 
-        eprintln!(
-            "INFO: Initializing PKCS#11 backend (library={}, slot={})",
+        tracing::info!(
+            "Initializing PKCS#11 backend (library={}, slot={})",
             lib_path, slot
         );
 
@@ -1542,8 +1542,8 @@ impl HsmKeyManager {
         master_key_material.zeroize();
         pin_copy.zeroize();
 
-        eprintln!(
-            "INFO: PKCS#11 session established (slot={}, key_label={}, authenticated=true)",
+        tracing::info!(
+            "PKCS#11 session established (slot={}, key_label={}, authenticated=true)",
             slot, config.key_label
         );
 
@@ -1578,8 +1578,8 @@ impl HsmKeyManager {
             return Err(SealError::InvalidMasterKey);
         }
 
-        eprintln!(
-            "INFO: PKCS#11 seal operation (purpose={}, plaintext_len={})",
+        tracing::info!(
+            "PKCS#11 seal operation (purpose={}, plaintext_len={})",
             purpose,
             plaintext.len()
         );
@@ -1636,8 +1636,8 @@ impl HsmKeyManager {
             return Err(SealError::InvalidMasterKey);
         }
 
-        eprintln!(
-            "INFO: PKCS#11 unseal operation (purpose={}, sealed_len={})",
+        tracing::info!(
+            "PKCS#11 unseal operation (purpose={}, sealed_len={})",
             purpose,
             sealed.len()
         );
@@ -1697,16 +1697,16 @@ impl HsmKeyManager {
             .as_deref()
             .unwrap_or("us-east-1");
 
-        eprintln!(
-            "INFO: Initializing AWS KMS backend (key_id={}..., region={})",
+        tracing::info!(
+            "Initializing AWS KMS backend (key_id={}..., region={})",
             &key_id[..key_id.len().min(20)],
             region
         );
 
         // Basic validation of key ARN format
         if !key_id.starts_with("arn:aws:kms:") && !key_id.starts_with("alias/") {
-            eprintln!(
-                "WARNING: AWS KMS key_id does not look like an ARN or alias: {}...",
+            tracing::warn!(
+                "AWS KMS key_id does not look like an ARN or alias: {}...",
                 &key_id[..key_id.len().min(20)]
             );
         }
@@ -1718,8 +1718,8 @@ impl HsmKeyManager {
         // Cache TTL: 5 minutes (AWS recommends caching data keys)
         let cache_ttl = Duration::from_secs(300);
 
-        eprintln!(
-            "INFO: AWS KMS session established (region={}, cache_ttl={}s, max_retries=3)",
+        tracing::info!(
+            "AWS KMS session established (region={}, cache_ttl={}s, max_retries=3)",
             region,
             cache_ttl.as_secs()
         );
@@ -1750,8 +1750,8 @@ impl HsmKeyManager {
             _ => return Err(SealError::SealFailed),
         };
 
-        eprintln!(
-            "INFO: AWS KMS seal operation (purpose={}, plaintext_len={})",
+        tracing::info!(
+            "AWS KMS seal operation (purpose={}, plaintext_len={})",
             purpose,
             plaintext.len()
         );
@@ -1805,8 +1805,8 @@ impl HsmKeyManager {
             _ => return Err(SealError::UnsealFailed),
         };
 
-        eprintln!(
-            "INFO: AWS KMS unseal operation (purpose={}, sealed_len={})",
+        tracing::info!(
+            "AWS KMS unseal operation (purpose={}, sealed_len={})",
             purpose,
             sealed.len()
         );
@@ -1872,8 +1872,8 @@ impl HsmKeyManager {
         let device = config.tpm2_device.as_ref()
             .ok_or_else(|| HsmError::ConfigurationError("TPM 2.0 device path not configured".into()))?;
 
-        eprintln!(
-            "INFO: Initializing TPM 2.0 backend (device={}, pcrs={:?})",
+        tracing::info!(
+            "Initializing TPM 2.0 backend (device={}, pcrs={:?})",
             device, config.tpm2_pcr_indices
         );
 
@@ -1924,8 +1924,8 @@ impl HsmKeyManager {
 
         master_key_material.zeroize();
 
-        eprintln!(
-            "INFO: TPM 2.0 session established (device={}, pcrs={:?}, srk=ok, storage_key=ok)",
+        tracing::info!(
+            "TPM 2.0 session established (device={}, pcrs={:?}, srk=ok, storage_key=ok)",
             device, config.tpm2_pcr_indices
         );
 
@@ -1952,8 +1952,8 @@ impl HsmKeyManager {
             _ => return Err(SealError::SealFailed),
         };
 
-        eprintln!(
-            "INFO: TPM2 seal operation (purpose={}, plaintext_len={})",
+        tracing::info!(
+            "TPM2 seal operation (purpose={}, plaintext_len={})",
             purpose,
             plaintext.len()
         );
@@ -2010,8 +2010,8 @@ impl HsmKeyManager {
             _ => return Err(SealError::UnsealFailed),
         };
 
-        eprintln!(
-            "INFO: TPM2 unseal operation (purpose={}, sealed_len={})",
+        tracing::info!(
+            "TPM2 unseal operation (purpose={}, sealed_len={})",
             purpose,
             sealed.len()
         );
@@ -2026,7 +2026,7 @@ impl HsmKeyManager {
         let current_digest = session.compute_pcr_policy_digest();
 
         if !constant_time_eq(stored_digest, &current_digest) {
-            eprintln!("ERROR: TPM2 PCR values have changed since sealing — platform integrity violation");
+            tracing::error!("TPM2 PCR values have changed since sealing — platform integrity violation");
             return Err(SealError::UnsealFailed);
         }
 
@@ -2084,8 +2084,8 @@ impl HsmKeyManager {
                 if !session.authenticated {
                     return Err(SealError::InvalidMasterKey);
                 }
-                eprintln!(
-                    "INFO: Rotating master key in PKCS#11 HSM (label={})",
+                tracing::info!(
+                    "Rotating master key in PKCS#11 HSM (label={})",
                     self.config.key_label
                 );
 
@@ -2106,7 +2106,7 @@ impl HsmKeyManager {
                 Ok(master)
             }
             BackendState::AwsKms(session) => {
-                eprintln!("INFO: Rotating master key in AWS KMS");
+                tracing::info!("Rotating master key in AWS KMS");
 
                 // Generate a new data key via KMS (simulated)
                 let mut new_material = [0u8; 32];
@@ -2127,7 +2127,7 @@ impl HsmKeyManager {
                 Ok(master)
             }
             BackendState::Tpm2(session) => {
-                eprintln!("INFO: Rotating master key in TPM 2.0");
+                tracing::info!("Rotating master key in TPM 2.0");
 
                 // Generate fresh key and re-seal under current PCR values
                 let mut new_material = [0u8; 32];
@@ -2144,7 +2144,7 @@ impl HsmKeyManager {
                 Ok(master)
             }
             BackendState::Software(source) => {
-                eprintln!("INFO: Rotating master key (software backend)");
+                tracing::info!("Rotating master key (software backend)");
                 source.rotate_master_key()
             }
         }
@@ -2163,8 +2163,8 @@ impl HsmKeyManager {
     /// This prevents share theft even if the server's disk is compromised,
     /// because the share is encrypted under a key that only the HSM holds.
     pub fn seal_frost_share(&self, share: &[u8]) -> Result<Vec<u8>, SealError> {
-        eprintln!(
-            "INFO: Sealing FROST share (len={}) to HSM",
+        tracing::info!(
+            "Sealing FROST share (len={}) to HSM",
             share.len()
         );
         self.seal_with_hardware(share, "frost-tss-share")
@@ -2176,8 +2176,8 @@ impl HsmKeyManager {
     /// Fails if the HSM is unavailable or (for TPM) PCR values have changed
     /// since the share was sealed.
     pub fn unseal_frost_share(&self, sealed: &[u8]) -> Result<Vec<u8>, SealError> {
-        eprintln!(
-            "INFO: Unsealing FROST share (sealed_len={}) from HSM",
+        tracing::info!(
+            "Unsealing FROST share (sealed_len={}) from HSM",
             sealed.len()
         );
         self.unseal_with_hardware(sealed, "frost-tss-share")
@@ -2209,8 +2209,8 @@ impl HsmKeyManager {
                 if !session.authenticated {
                     return Err(HsmError::AuthenticationFailed);
                 }
-                eprintln!(
-                    "INFO: PKCS#11 sign operation (data_len={}, key={})",
+                tracing::info!(
+                    "PKCS#11 sign operation (data_len={}, key={})",
                     data.len(),
                     signing_key_label
                 );
@@ -2231,8 +2231,8 @@ impl HsmKeyManager {
                 Ok(signature)
             }
             BackendState::AwsKms(session) => {
-                eprintln!(
-                    "INFO: AWS KMS sign operation (data_len={}, key={})",
+                tracing::info!(
+                    "AWS KMS sign operation (data_len={}, key={})",
                     data.len(),
                     signing_key_label
                 );
@@ -2253,8 +2253,8 @@ impl HsmKeyManager {
                 Ok(signature)
             }
             BackendState::Tpm2(session) => {
-                eprintln!(
-                    "INFO: TPM2 sign operation (data_len={}, key={})",
+                tracing::info!(
+                    "TPM2 sign operation (data_len={}, key={})",
                     data.len(),
                     signing_key_label
                 );
@@ -2293,7 +2293,7 @@ impl HsmKeyManager {
             HsmError::CommunicationError("mutex poisoned".into())
         })?;
 
-        eprintln!("INFO: Generating wrapped DEK (purpose={})", purpose);
+        tracing::info!("Generating wrapped DEK (purpose={})", purpose);
 
         match &*state {
             BackendState::Pkcs11(session) => {
@@ -2657,8 +2657,8 @@ impl ProductionKeySource for HsmKeyManager {
                 // key using a challenge-response pattern:
                 // 1. Load master key material from the key store
                 // 2. HKDF-expand with "local-master-key" info to get the local key
-                eprintln!(
-                    "INFO: Deriving local master key from PKCS#11 HSM (label={})",
+                tracing::info!(
+                    "Deriving local master key from PKCS#11 HSM (label={})",
                     self.config.key_label
                 );
 
@@ -2678,7 +2678,7 @@ impl ProductionKeySource for HsmKeyManager {
             BackendState::AwsKms(session) => {
                 // Derive local master key from KMS root.
                 // In real AWS KMS, this would call GenerateDataKey to get a DEK.
-                eprintln!("INFO: Deriving local master key from AWS KMS");
+                tracing::info!("Deriving local master key from AWS KMS");
 
                 let hk = Hkdf::<Sha512>::new(None, &session.key_store.root_key);
                 let mut local_key = [0u8; 32];
@@ -2690,7 +2690,7 @@ impl ProductionKeySource for HsmKeyManager {
             }
             BackendState::Tpm2(session) => {
                 // Unseal the master key from TPM, bound to PCR values.
-                eprintln!("INFO: Unsealing master key from TPM 2.0");
+                tracing::info!("Unsealing master key from TPM 2.0");
 
                 let (_key_type, mut master_material) = session
                     .key_store
@@ -2795,7 +2795,7 @@ pub fn create_hsm_backend() -> Box<dyn HsmKeyOps> {
 
     match backend_name.to_lowercase().as_str() {
         "pkcs11" => {
-            eprintln!("INFO: HSM backend: PKCS#11");
+            tracing::info!("HSM backend: PKCS#11");
             // Requires MILNET_PKCS11_LIB, MILNET_PKCS11_SLOT, MILNET_PKCS11_PIN
             // When a real PKCS#11 library is linked (build with --features pkcs11),
             // replace this with a native PKCS#11 session via the `pkcs11` crate.
@@ -2805,11 +2805,11 @@ pub fn create_hsm_backend() -> Box<dyn HsmKeyOps> {
                     "FATAL: Failed to initialize PKCS#11 HSM backend: {e}. \
                      Verify MILNET_PKCS11_LIB, MILNET_PKCS11_SLOT, and MILNET_PKCS11_PIN."
                 ));
-            eprintln!("AUDIT: HSM backend initialized — type=pkcs11, label={}", manager.key_label());
+            tracing::info!("HSM backend initialized — type=pkcs11, label={}", manager.key_label());
             Box::new(manager)
         }
         "aws_kms" | "aws-kms" | "awskms" | "kms" => {
-            eprintln!("INFO: HSM backend: AWS KMS");
+            tracing::info!("HSM backend: AWS KMS");
             // Requires MILNET_AWS_KMS_KEY_ID, optionally MILNET_AWS_KMS_REGION
             // When aws-sdk-kms is linked (build with --features aws-kms),
             // replace this with native KMS envelope encryption.
@@ -2819,11 +2819,11 @@ pub fn create_hsm_backend() -> Box<dyn HsmKeyOps> {
                     "FATAL: Failed to initialize AWS KMS HSM backend: {e}. \
                      Verify MILNET_AWS_KMS_KEY_ID and AWS credentials."
                 ));
-            eprintln!("AUDIT: HSM backend initialized — type=aws_kms, label={}", manager.key_label());
+            tracing::info!("HSM backend initialized — type=aws_kms, label={}", manager.key_label());
             Box::new(manager)
         }
         "tpm2" | "tpm" => {
-            eprintln!("INFO: HSM backend: TPM 2.0");
+            tracing::info!("HSM backend: TPM 2.0");
             // Requires MILNET_TPM2_DEVICE, optionally MILNET_TPM2_PCRS
             // When tss-esapi is linked (build with --features tpm2),
             // replace this with native TPM 2.0 sealed storage.
@@ -2833,7 +2833,7 @@ pub fn create_hsm_backend() -> Box<dyn HsmKeyOps> {
                     "FATAL: Failed to initialize TPM 2.0 HSM backend: {e}. \
                      Verify MILNET_TPM2_DEVICE and PCR configuration."
                 ));
-            eprintln!("AUDIT: HSM backend initialized — type=tpm2, label={}", manager.key_label());
+            tracing::info!("HSM backend initialized — type=tpm2, label={}", manager.key_label());
             Box::new(manager)
         }
         "software" | _ => {
@@ -2937,8 +2937,8 @@ mod pkcs11_hw {
 
             let ctx = Arc::new(ctx);
 
-            eprintln!(
-                "INFO: PKCS#11 HW session opened (lib={library_path}, slot={slot_index}, \
+            tracing::info!(
+                "PKCS#11 HW session opened (lib={library_path}, slot={slot_index}, \
                  label={key_label})"
             );
 
@@ -3039,8 +3039,8 @@ mod pkcs11_hw {
             let mut hasher = Sha256::new();
             hasher.update(key_id.as_bytes());
             let handle_bytes = hasher.finalize().to_vec();
-            eprintln!(
-                "AUDIT: C_GenerateKey label={key_id} type={key_type:?}"
+            tracing::info!(
+                "C_GenerateKey label={key_id} type={key_type:?}"
             );
             Ok(handle_bytes)
         }
@@ -3287,7 +3287,7 @@ mod pkcs11_hw {
                 HsmError::CommunicationError(format!("C_DestroyObject({key_id}): {e}"))
             })?;
 
-            eprintln!("AUDIT: C_DestroyObject label={key_id}");
+            tracing::info!("C_DestroyObject label={key_id}");
             Ok(())
         }
 
@@ -3328,8 +3328,8 @@ mod pkcs11_hw {
 
             // Ensure master key exists on token.
             if !hw.key_exists(key_label)? {
-                eprintln!(
-                    "INFO: Master key '{key_label}' not found on token; generating via C_GenerateKey"
+                tracing::info!(
+                    "Master key '{key_label}' not found on token; generating via C_GenerateKey"
                 );
                 hw.generate_key(key_label, KeyType::Aes256Wrap)?;
             }
@@ -3345,7 +3345,7 @@ mod pkcs11_hw {
             // material deterministically.
             let challenge = b"MILNET-PKCS11-HW-MASTER-KEY-DERIVATION-v1";
             let tag = self.hw.sign(&self.hw.key_label, challenge).map_err(|e| {
-                eprintln!("ERROR: PKCS#11 HW master key derivation failed: {e}");
+                tracing::error!("PKCS#11 HW master key derivation failed: {e}");
                 SealError::InvalidMasterKey
             })?;
 
@@ -3365,7 +3365,7 @@ mod pkcs11_hw {
             self.hw
                 .generate_key(label, KeyType::Aes256Wrap)
                 .map_err(|e| {
-                    eprintln!("ERROR: PKCS#11 HW master key rotation failed: {e}");
+                    tracing::error!("PKCS#11 HW master key rotation failed: {e}");
                     SealError::SealFailed
                 })?;
             self.load_master_key()
@@ -3379,7 +3379,7 @@ mod pkcs11_hw {
             self.hw
                 .encrypt(&self.hw.key_label, plaintext, purpose.as_bytes())
                 .map_err(|e| {
-                    eprintln!("ERROR: PKCS#11 HW seal failed: {e}");
+                    tracing::error!("PKCS#11 HW seal failed: {e}");
                     SealError::SealFailed
                 })
         }
@@ -3392,7 +3392,7 @@ mod pkcs11_hw {
             self.hw
                 .decrypt(&self.hw.key_label, sealed, purpose.as_bytes())
                 .map_err(|e| {
-                    eprintln!("ERROR: PKCS#11 HW unseal failed: {e}");
+                    tracing::error!("PKCS#11 HW unseal failed: {e}");
                     SealError::UnsealFailed
                 })
         }

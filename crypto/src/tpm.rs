@@ -311,8 +311,8 @@ impl Tpm2Context {
             return Err(TpmError::DeviceNotFound(device_path.to_string()));
         }
 
-        eprintln!(
-            "INFO: Opening TPM 2.0 context (device={}, pcrs={:?})",
+        tracing::info!(
+            "Opening TPM 2.0 context (device={}, pcrs={:?})",
             device_path, pcr_selection.indices
         );
 
@@ -395,8 +395,8 @@ impl Tpm2Context {
             return self.seal_large_to_pcrs(data, pcrs);
         }
 
-        eprintln!(
-            "INFO: TPM2 seal_to_pcrs (data_len={}, pcrs={:?})",
+        tracing::info!(
+            "TPM2 seal_to_pcrs (data_len={}, pcrs={:?})",
             data.len(),
             pcrs.indices
         );
@@ -446,8 +446,8 @@ impl Tpm2Context {
         data: &[u8],
         pcrs: &PcrSelection,
     ) -> Result<Vec<u8>, TpmError> {
-        eprintln!(
-            "INFO: TPM2 seal_large_to_pcrs (data_len={}, pcrs={:?}) — envelope encryption",
+        tracing::info!(
+            "TPM2 seal_large_to_pcrs (data_len={}, pcrs={:?}) — envelope encryption",
             data.len(),
             pcrs.indices
         );
@@ -495,8 +495,8 @@ impl Tpm2Context {
 
         let blob = SealedBlob::from_bytes(sealed)?;
 
-        eprintln!(
-            "INFO: TPM2 unseal_from_pcrs (pcr_mask={:02x}{:02x}{:02x})",
+        tracing::info!(
+            "TPM2 unseal_from_pcrs (pcr_mask={:02x}{:02x}{:02x})",
             blob.pcr_mask[0], blob.pcr_mask[1], blob.pcr_mask[2]
         );
 
@@ -562,7 +562,7 @@ impl Tpm2Context {
 
         let pcrs = pcr_selection.unwrap_or(&self.default_pcr_selection);
 
-        eprintln!("INFO: TPM2 read_pcrs (pcrs={:?})", pcrs.indices);
+        tracing::info!("TPM2 read_pcrs (pcrs={:?})", pcrs.indices);
 
         let bank = self.pcr_bank.borrow();
         let mut results = Vec::new();
@@ -604,15 +604,15 @@ impl Tpm2Context {
 
         // Application-level PCRs are typically 8-15; warn if extending boot PCRs
         if pcr_index < 8 {
-            eprintln!(
-                "WARNING: Extending boot-time PCR {} — this may prevent unsealing of \
+            tracing::warn!(
+                "Extending boot-time PCR {} — this may prevent unsealing of \
                  existing sealed objects",
                 pcr_index
             );
         }
 
-        eprintln!(
-            "INFO: TPM2 pcr_extend (pcr={}, measurement_prefix={:02x}{:02x}{:02x}{:02x}...)",
+        tracing::info!(
+            "TPM2 pcr_extend (pcr={}, measurement_prefix={:02x}{:02x}{:02x}{:02x}...)",
             pcr_index, measurement[0], measurement[1], measurement[2], measurement[3]
         );
 
@@ -644,8 +644,8 @@ impl Tpm2Context {
 
         let pcrs = pcr_selection.unwrap_or(&self.default_pcr_selection);
 
-        eprintln!(
-            "INFO: TPM2 compute_policy_digest (pcrs={:?})",
+        tracing::info!(
+            "TPM2 compute_policy_digest (pcrs={:?})",
             pcrs.indices
         );
 
@@ -658,7 +658,7 @@ impl Tpm2Context {
     /// This ties the server process to a specific binary, preventing
     /// replacement attacks.
     pub fn attest_binary(&self, binary_hash: &[u8; 32]) -> Result<(), TpmError> {
-        eprintln!("INFO: TPM2 binary attestation into PCR 8");
+        tracing::info!("TPM2 binary attestation into PCR 8");
         self.pcr_extend(8, binary_hash)
     }
 
@@ -666,7 +666,7 @@ impl Tpm2Context {
     ///
     /// Computes a hash of the security configuration and extends PCR 9.
     pub fn attest_config(&self, config_hash: &[u8; 32]) -> Result<(), TpmError> {
-        eprintln!("INFO: TPM2 configuration attestation into PCR 9");
+        tracing::info!("TPM2 configuration attestation into PCR 9");
         self.pcr_extend(9, config_hash)
     }
 }

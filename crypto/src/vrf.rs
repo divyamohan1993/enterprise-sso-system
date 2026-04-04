@@ -14,6 +14,7 @@
 //! - Verify: check Ed25519_Verify(pk, input, proof) then recompute output
 use ed25519_dalek::{Signer, Verifier};
 use sha2::{Digest, Sha512};
+use hkdf;
 
 /// A VRF keypair wrapping Ed25519 keys.
 pub struct VrfKeypair {
@@ -136,6 +137,58 @@ fn hash_proof_to_output(proof: &[u8]) -> [u8; 32] {
     let mut output = [0u8; 32];
     output.copy_from_slice(&hash[..32]);
     output
+}
+
+// ---------------------------------------------------------------------------
+// Post-Quantum VRF using ML-DSA-87
+// ---------------------------------------------------------------------------
+
+/// VRF output: a 32-byte pseudo-random value.
+pub type VrfOutput = [u8; 32];
+
+/// Prove a VRF output using ML-DSA-87 (post-quantum safe).
+///
+/// The VRF output is derived as HKDF-SHA512(ML-DSA-87_signature(input), "MILNET-PQ-VRF-v1").
+/// The proof is the ML-DSA-87 signature itself.
+pub fn pq_vrf_prove(
+    signing_key: &crate::pq_sign::PqSigningKey,
+    input: &[u8],
+) -> (VrfOutput, Vec<u8>) {
+    // Sign the input with ML-DSA-87
+    let proof = crate::pq_sign::pq_sign_raw(signing_key, input);
+
+    // Derive VRF output from the signature via HKDF-SHA512
+    let hk = hkdf::Hkdf::<Sha512>::new(Some(b"MILNET-PQ-VRF-v1"), &proof);
+    let mut output = [0u8; 32];
+    hk.expand(b"pq-vrf-output", &mut output)
+        .expect("HKDF-SHA512 expand for 32 bytes cannot fail");
+
+    (output, proof)
+}
+
+/// Verify a PQ-VRF proof and recover the output.
+///
+/// Returns `Some(output)` if the ML-DSA-87 signature is valid for the given
+/// input and verifying key, or `None` if verification fails.
+pub fn pq_vrf_verify(
+    verifying_key: &crate::pq_sign::PqVerifyingKey,
+    input: &[u8],
+    output: &VrfOutput,
+    proof: &[u8],
+) -> bool {
+    // Verify the ML-DSA-87 signature
+    if !crate::pq_sign::pq_verify_raw(verifying_key, input, proof) {
+        return false;
+    }
+
+    // Recompute the VRF output from the proof
+    let hk = hkdf::Hkdf::<Sha512>::new(Some(b"MILNET-PQ-VRF-v1"), proof);
+    let mut expected_output = [0u8; 32];
+    hk.expand(b"pq-vrf-output", &mut expected_output)
+        .expect("HKDF-SHA512 expand for 32 bytes cannot fail");
+
+    // Constant-time comparison
+    expected_output == *output
 }
 
 // ---------------------------------------------------------------------------

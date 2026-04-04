@@ -520,6 +520,8 @@ impl BftAuditCluster {
                 prev_hash,
                 signature: Vec::new(),
                 classification,
+                correlation_id: None,
+                trace_id: None,
             };
 
             if let Some(ref key) = self.pq_signing_key {
