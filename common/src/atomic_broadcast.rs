@@ -20,10 +20,154 @@
 //! - SIEM event on each delivery batch.
 
 use crate::siem::{PanelSiemEvent, SiemPanel, SiemSeverity};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
+
+// ── Broadcast Persistence ────────────────────────────────────────────────────
+
+/// Persisted snapshot of atomic broadcast state, loaded on startup.
+pub struct BroadcastPersistedState {
+    pub next_sequence: u64,
+    pub delivered_hashes: HashSet<[u8; 64]>,
+}
+
+/// Trait for persisting atomic broadcast state across restarts.
+///
+/// Delivered messages and the next sequence counter must survive restarts
+/// to maintain the integrity and total-order invariants.
+pub trait BroadcastPersistence: Send + Sync {
+    /// Persist a delivered message.
+    fn save_delivered(&self, msg: &BroadcastMessage) -> Result<(), String>;
+    /// Persist the next sequence number.
+    fn save_next_sequence(&self, seq: u64) -> Result<(), String>;
+    /// Load persisted broadcast state on startup.
+    fn load_state(&self) -> Result<BroadcastPersistedState, String>;
+}
+
+/// Serializable form of a delivered broadcast message for persistence.
+#[derive(Serialize, Deserialize)]
+struct PersistedBroadcastEntry {
+    sequence: u64,
+    payload_hash: [u8; 64],
+    sender: String,
+    timestamp: i64,
+}
+
+/// File-backed broadcast persistence.
+///
+/// Directory layout:
+///   delivered/<sequence>.bin  -- postcard-serialized PersistedBroadcastEntry
+///   next_seq.bin              -- u64 LE next sequence number
+pub struct FileBroadcastPersistence {
+    dir: std::path::PathBuf,
+}
+
+impl FileBroadcastPersistence {
+    pub fn new(dir: &std::path::Path) -> Result<Self, String> {
+        let delivered_dir = dir.join("delivered");
+        std::fs::create_dir_all(&delivered_dir)
+            .map_err(|e| format!("create broadcast persistence dir: {e}"))?;
+        Ok(Self { dir: dir.to_path_buf() })
+    }
+
+    fn atomic_write(&self, path: &std::path::Path, data: &[u8]) -> Result<(), String> {
+        use std::io::Write;
+        let tmp = path.with_extension("tmp");
+        let mut f = std::fs::File::create(&tmp)
+            .map_err(|e| format!("create {}: {e}", tmp.display()))?;
+        f.write_all(data)
+            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        f.sync_all()
+            .map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+            .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), path.display()))?;
+        Ok(())
+    }
+}
+
+impl BroadcastPersistence for FileBroadcastPersistence {
+    fn save_delivered(&self, msg: &BroadcastMessage) -> Result<(), String> {
+        let entry = PersistedBroadcastEntry {
+            sequence: msg.sequence,
+            payload_hash: msg.payload_hash,
+            sender: msg.sender.clone(),
+            timestamp: msg.timestamp,
+        };
+        let data = postcard::to_allocvec(&entry)
+            .map_err(|e| format!("serialize broadcast entry: {e}"))?;
+        let path = self.dir.join("delivered").join(format!("{}.bin", msg.sequence));
+        self.atomic_write(&path, &data)
+    }
+
+    fn save_next_sequence(&self, seq: u64) -> Result<(), String> {
+        let path = self.dir.join("next_seq.bin");
+        self.atomic_write(&path, &seq.to_le_bytes())
+    }
+
+    fn load_state(&self) -> Result<BroadcastPersistedState, String> {
+        let mut delivered_hashes = HashSet::new();
+        let mut max_sequence: u64 = 0;
+
+        let delivered_dir = self.dir.join("delivered");
+        if delivered_dir.exists() {
+            let entries = std::fs::read_dir(&delivered_dir)
+                .map_err(|e| format!("read delivered dir: {e}"))?;
+            for entry in entries {
+                let entry = entry.map_err(|e| format!("read dir entry: {e}"))?;
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("bin") {
+                    let data = std::fs::read(&path)
+                        .map_err(|e| format!("read {}: {e}", path.display()))?;
+                    let persisted: PersistedBroadcastEntry = postcard::from_bytes(&data)
+                        .map_err(|e| format!("deserialize {}: {e}", path.display()))?;
+                    delivered_hashes.insert(persisted.payload_hash);
+                    if persisted.sequence >= max_sequence {
+                        max_sequence = persisted.sequence;
+                    }
+                }
+            }
+        }
+
+        // Load next_sequence from file, or derive from max delivered sequence
+        let seq_path = self.dir.join("next_seq.bin");
+        let next_sequence = if seq_path.exists() {
+            let data = std::fs::read(&seq_path)
+                .map_err(|e| format!("read next_seq: {e}"))?;
+            if data.len() == 8 {
+                u64::from_le_bytes(data.try_into().unwrap())
+            } else {
+                max_sequence + 1
+            }
+        } else if max_sequence > 0 {
+            max_sequence + 1
+        } else {
+            1
+        };
+
+        Ok(BroadcastPersistedState {
+            next_sequence,
+            delivered_hashes,
+        })
+    }
+}
+
+/// No-op persistence for tests.
+pub struct NullBroadcastPersistence;
+
+impl BroadcastPersistence for NullBroadcastPersistence {
+    fn save_delivered(&self, _msg: &BroadcastMessage) -> Result<(), String> { Ok(()) }
+    fn save_next_sequence(&self, _seq: u64) -> Result<(), String> { Ok(()) }
+    fn load_state(&self) -> Result<BroadcastPersistedState, String> {
+        Ok(BroadcastPersistedState {
+            next_sequence: 1,
+            delivered_hashes: HashSet::new(),
+        })
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Core types
@@ -79,6 +223,8 @@ pub struct AtomicBroadcast {
     delivered_hashes: RwLock<HashSet<[u8; 64]>>,
     /// ML-DSA-87 verifying keys for ack signature verification, keyed by node_id.
     verifying_keys: RwLock<HashMap<String, Vec<u8>>>,
+    /// Persistence backend for delivered state.
+    persistence: Box<dyn BroadcastPersistence>,
 }
 
 // ---------------------------------------------------------------------------
@@ -86,20 +232,48 @@ pub struct AtomicBroadcast {
 // ---------------------------------------------------------------------------
 
 impl AtomicBroadcast {
-    /// Create a new atomic broadcast engine.
+    /// Create a new atomic broadcast engine with no persistence (for tests).
     ///
     /// `quorum_size` is the number of acks required before a message is deliverable.
     /// For BFT with n=3f+1 nodes, quorum_size = 2f+1.
     pub fn new(quorum_size: usize) -> Self {
+        Self::with_persistence(quorum_size, Box::new(NullBroadcastPersistence))
+    }
+
+    /// Create a new atomic broadcast engine with a persistence backend.
+    ///
+    /// On startup, loads persisted delivered hashes and next_sequence so that
+    /// the broadcast engine can resume without violating integrity invariants.
+    pub fn with_persistence(
+        quorum_size: usize,
+        persistence: Box<dyn BroadcastPersistence>,
+    ) -> Self {
         assert!(quorum_size >= 1, "quorum size must be >= 1");
+        let (next_seq, delivered_hashes) = match persistence.load_state() {
+            Ok(state) => (state.next_sequence, state.delivered_hashes),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "failed to load persisted broadcast state, starting fresh"
+                );
+                (1, HashSet::new())
+            }
+        };
+        let next_deliver_seq = next_seq;
+        tracing::info!(
+            next_sequence = next_seq,
+            recovered_hashes = delivered_hashes.len(),
+            "atomic broadcast initialized"
+        );
         Self {
-            next_sequence: AtomicU64::new(1),
+            next_sequence: AtomicU64::new(next_seq),
             pending: RwLock::new(BTreeMap::new()),
             delivered: RwLock::new(Vec::new()),
-            next_deliver_seq: AtomicU64::new(1),
+            next_deliver_seq: AtomicU64::new(next_deliver_seq),
             quorum_size,
-            delivered_hashes: RwLock::new(HashSet::new()),
+            delivered_hashes: RwLock::new(delivered_hashes),
             verifying_keys: RwLock::new(HashMap::new()),
+            persistence,
         }
     }
 
@@ -246,6 +420,15 @@ impl AtomicBroadcast {
             let msg = pending.remove(&next_seq).unwrap();
             hashes.insert(msg.payload_hash);
             self.next_deliver_seq.fetch_add(1, Ordering::SeqCst);
+            // Persist each delivered message and the updated sequence counter.
+            if let Err(e) = self.persistence.save_delivered(&msg) {
+                tracing::error!(error = %e, seq = msg.sequence, "failed to persist delivered message");
+            }
+            if let Err(e) = self.persistence.save_next_sequence(
+                self.next_deliver_seq.load(Ordering::SeqCst),
+            ) {
+                tracing::error!(error = %e, "failed to persist next_sequence");
+            }
             delivered.push(msg.clone());
             newly_delivered.push(msg);
         }

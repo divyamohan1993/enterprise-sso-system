@@ -15,7 +15,12 @@ sso-protocol = { path = "../sso-protocol" }
 common = { path = "../common" }
 ratchet = { path = "../ratchet" }
 opaque = { path = "../opaque" }
+fido = { path = "../fido" }
+gateway = { path = "../gateway" }
 arbitrary = { version = "1", features = ["derive"] }
+serde_json = "1"
+postcard = { version = "1", features = ["alloc"] }
+sha2 = "0.10"
 
 [features]
 production = ["common/production"]
@@ -93,4 +98,39 @@ doc = false
 [[bin]]
 name = "fuzz_backup_restore"
 path = "fuzz_targets/fuzz_backup_restore.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_fido2_auth"
+path = "fuzz_targets/fuzz_fido2_auth.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_ml_dsa_verify"
+path = "fuzz_targets/fuzz_ml_dsa_verify.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_slh_dsa_verify"
+path = "fuzz_targets/fuzz_slh_dsa_verify.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_scim_parse"
+path = "fuzz_targets/fuzz_scim_parse.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_raft_message"
+path = "fuzz_targets/fuzz_raft_message.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_wire_protocol"
+path = "fuzz_targets/fuzz_wire_protocol.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_jwe_decrypt"
+path = "fuzz_targets/fuzz_jwe_decrypt.rs"
 doc = false

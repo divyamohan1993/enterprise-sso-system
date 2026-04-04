@@ -289,6 +289,11 @@ impl ClusterConfig {
             }
         }
 
+        // SECURITY: Standalone mode is forbidden in production deployments.
+        // A single-node cluster has no redundancy, no failover, and no peer
+        // binary attestation. Reject immediately with a SIEM CRITICAL event.
+        reject_standalone_in_production(&peers)?;
+
         let raft_peers = peers
             .iter()
             .map(|p| (p.node_id, p.raft_addr.clone()))
@@ -362,6 +367,9 @@ impl ClusterConfig {
             }
         }
 
+        // SECURITY: Standalone mode is forbidden in production deployments.
+        reject_standalone_in_production(&peers)?;
+
         let raft_peers = peers
             .iter()
             .map(|p| (p.node_id, p.raft_addr.clone()))
@@ -379,6 +387,50 @@ impl ClusterConfig {
             },
         })
     }
+}
+
+/// Reject standalone (zero-peer) operation when production env vars are set.
+///
+/// If `MILNET_PRODUCTION=1` or `MILNET_MILITARY_DEPLOYMENT=1`, a node with no
+/// peers is a catastrophic misconfiguration. Emit a SIEM CRITICAL event and
+/// panic -- standalone mode must be impossible in production.
+fn reject_standalone_in_production(peers: &[PeerConfig]) -> Result<(), String> {
+    if !peers.is_empty() {
+        return Ok(());
+    }
+    let is_production = std::env::var("MILNET_PRODUCTION")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if is_production || is_military {
+        let event = crate::siem::SecurityEvent {
+            timestamp: crate::siem::SecurityEvent::now_iso8601(),
+            category: "cluster",
+            action: "standalone_mode_rejected",
+            severity: crate::siem::Severity::Critical,
+            outcome: "failure",
+            user_id: None,
+            source_ip: None,
+            detail: Some(
+                "FATAL: standalone mode (no cluster peers) attempted in production. \
+                 Set MILNET_CLUSTER_PEERS or MILNET_STATIC_PEERS with at least 2 peers \
+                 for a minimum 3-node cluster. Single-node deployment provides zero \
+                 redundancy and zero tamper detection."
+                    .into(),
+            ),
+        };
+        event.emit();
+        panic!(
+            "SIEM CRITICAL: standalone mode forbidden in production. \
+             MILNET_PRODUCTION={} MILNET_MILITARY_DEPLOYMENT={}. \
+             Configure cluster peers before starting.",
+            if is_production { "1" } else { "0" },
+            if is_military { "1" } else { "0" },
+        );
+    }
+    Ok(())
 }
 
 /// Parse node ID from MILNET_NODE_ID env var, or generate a random one.

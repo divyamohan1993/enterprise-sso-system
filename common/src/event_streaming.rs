@@ -707,8 +707,19 @@ impl EventStreamManager {
     }
 
     /// Deliver a CloudEvent to a specific webhook with retry logic.
+    ///
+    /// When `MILNET_SIEM_ENCRYPTION_KEY` is set, the payload is encrypted with
+    /// AES-256-GCM before signing and transmission. The HMAC signature covers
+    /// the encrypted payload (encrypt-then-sign).
     fn deliver_to_webhook(&self, webhook: &WebhookConfig, event: &CloudEvent) -> DeliveryRecord {
-        let payload = event.to_json_bytes();
+        let raw_payload = event.to_json_bytes();
+
+        // Optionally encrypt with AES-256-GCM if configured
+        let (payload, _is_encrypted) = match encrypt_event_payload(&raw_payload) {
+            Some(encrypted) => (encrypted.into_bytes(), true),
+            None => (raw_payload, false),
+        };
+
         let signature = webhook.sign_payload(&payload);
 
         let mut record = DeliveryRecord {
@@ -1083,6 +1094,71 @@ impl SecurityEvent {
             detail: Some(format!("webhook rate limited: id={}", webhook_id)),
         };
         event.emit();
+    }
+}
+
+// ── Webhook Payload Encryption ──────────────────────────────────────────────
+
+/// Encrypt a webhook event payload using AES-256-GCM when `MILNET_SIEM_ENCRYPTION_KEY`
+/// is set (64 hex chars = 256-bit key).
+///
+/// Returns `None` if no encryption key is configured or on any error.
+/// Output format: `base64(nonce) || "." || base64(ciphertext+tag)`.
+fn encrypt_event_payload(payload: &[u8]) -> Option<String> {
+    let key_hex = std::env::var("MILNET_SIEM_ENCRYPTION_KEY").ok()?;
+    if key_hex.is_empty() {
+        return None;
+    }
+
+    let key_bytes = match hex::decode(&key_hex) {
+        Ok(k) if k.len() == 32 => k,
+        Ok(k) => {
+            tracing::error!(
+                target: "siem",
+                "MILNET_SIEM_ENCRYPTION_KEY must be 64 hex chars (256 bits), got {} bytes",
+                k.len()
+            );
+            return None;
+        }
+        Err(e) => {
+            tracing::error!(
+                target: "siem",
+                "MILNET_SIEM_ENCRYPTION_KEY is not valid hex: {}",
+                e
+            );
+            return None;
+        }
+    };
+
+    use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
+    use aes_gcm::Nonce;
+
+    let cipher = match Aes256Gcm::new_from_slice(&key_bytes) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(target: "siem", "AES-256-GCM key init failed: {}", e);
+            return None;
+        }
+    };
+
+    let mut nonce_bytes = [0u8; 12];
+    if getrandom::getrandom(&mut nonce_bytes).is_err() {
+        tracing::error!(target: "siem", "CSPRNG failure generating nonce for event encryption");
+        return None;
+    }
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    match cipher.encrypt(nonce, payload) {
+        Ok(ciphertext) => {
+            use base64::{engine::general_purpose::STANDARD as B64, Engine};
+            let nonce_b64 = B64.encode(nonce_bytes);
+            let ct_b64 = B64.encode(&ciphertext);
+            Some(format!("{}.{}", nonce_b64, ct_b64))
+        }
+        Err(e) => {
+            tracing::error!(target: "siem", "AES-256-GCM encryption failed: {}", e);
+            None
+        }
     }
 }
 

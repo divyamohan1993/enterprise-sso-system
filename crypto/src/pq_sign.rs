@@ -259,9 +259,15 @@ pub fn pq_sign_tagged(signing_key: &PqSigningKey, data: &[u8]) -> Vec<u8> {
             sig.encode().to_vec()
         }
         PqSignatureAlgorithm::SlhDsaSha2256f => {
-            // SLH-DSA uses a completely different key type from the slh_dsa module.
-            // Generate an ephemeral SLH-DSA keypair and sign with it.
-            // In production, the key store would provide the correct SLH-DSA key.
+            // SIEM:CRITICAL Ephemeral SLH-DSA keys in use -- key store not configured.
+            // Signatures created with ephemeral keys cannot be verified after this
+            // function returns because the signing key is discarded. Use
+            // pq_sign_tagged_with_slh_key() with a persistent key instead.
+            tracing::error!(
+                "SIEM:CRITICAL SLH-DSA-SHA2-256f pq_sign_tagged called without persistent key store. \
+                 Ephemeral signing key generated and discarded -- signatures will be UNVERIFIABLE. \
+                 Configure SLH-DSA key store or call pq_sign_tagged_with_slh_key() instead."
+            );
             let (slh_sk, _slh_pk) = crate::slh_dsa::slh_dsa_keygen();
             let slh_sig = crate::slh_dsa::slh_dsa_sign(&slh_sk, data);
             let sig_bytes = slh_sig.as_bytes();
@@ -308,21 +314,74 @@ pub fn pq_verify_tagged(verifying_key: &PqVerifyingKey, data: &[u8], tagged_sig:
             pq_verify_raw(verifying_key, data, sig_bytes)
         }
         PqSignatureAlgorithm::SlhDsaSha2256f => {
-            // SLH-DSA verification: parse the signature to extract the embedded
-            // public key (SLH-DSA signatures are self-contained with the public key
-            // recoverable from the signature+message). For production use, the
-            // verifier must have the SLH-DSA public key from the key store.
-            // Here we attempt verification using the SLH-DSA verify function.
-            // The caller must provide the SLH-DSA public key out-of-band; this
-            // path returns false if only an ML-DSA-87 key is available.
+            // SLH-DSA uses a different key type. An ML-DSA-87 verifying key
+            // cannot verify SLH-DSA signatures. Callers must use
+            // pq_verify_tagged_with_slh_pk() with the correct SLH-DSA public key.
             tracing::warn!(
                 "SLH-DSA-SHA2-256f verification requires SLH-DSA public key; \
                  ML-DSA-87 verifying key cannot verify SLH-DSA signatures. \
-                 Use pq_verify_tagged_slh_dsa() with the correct SLH-DSA public key."
+                 Use pq_verify_tagged_with_slh_pk() with the correct SLH-DSA public key."
             );
             false
         }
     }
+}
+
+/// Sign raw data with a self-describing tagged format using a persistent SLH-DSA signing key.
+///
+/// Output format: `ALGO_TAG_SLH_DSA_SHA2_256F(1 byte) || signature_bytes`
+///
+/// Use this instead of `pq_sign_tagged` when SLH-DSA is the active algorithm.
+/// This accepts an existing SLH-DSA signing key from the key store, avoiding the
+/// ephemeral key problem in `pq_sign_tagged`.
+pub fn pq_sign_tagged_with_slh_key(
+    slh_signing_key: &crate::slh_dsa::SlhDsaSigningKey,
+    data: &[u8],
+) -> Vec<u8> {
+    let slh_sig = crate::slh_dsa::slh_dsa_sign(slh_signing_key, data);
+    let sig_bytes = slh_sig.as_bytes();
+    let mut tagged = Vec::with_capacity(1 + sig_bytes.len());
+    tagged.push(ALGO_TAG_SLH_DSA_SHA2_256F);
+    tagged.extend_from_slice(sig_bytes);
+    tagged
+}
+
+/// Verify a self-describing tagged SLH-DSA signature using an SLH-DSA public key.
+///
+/// Input format: `ALGO_TAG(1 byte) || signature_bytes`
+///
+/// Returns `true` if the tag is `ALGO_TAG_SLH_DSA_SHA2_256F` and the signature
+/// verifies against the provided SLH-DSA public key. Returns `false` for any
+/// other algorithm tag (use `pq_verify_tagged` for ML-DSA-87 signatures).
+pub fn pq_verify_tagged_with_slh_pk(
+    slh_verifying_key: &crate::slh_dsa::SlhDsaVerifyingKey,
+    data: &[u8],
+    tagged_sig: &[u8],
+) -> bool {
+    if tagged_sig.is_empty() {
+        return false;
+    }
+
+    let tag = tagged_sig[0];
+    let sig_bytes = &tagged_sig[1..];
+
+    if tag != ALGO_TAG_SLH_DSA_SHA2_256F {
+        tracing::warn!(
+            "pq_verify_tagged_with_slh_pk called with non-SLH-DSA tag: 0x{:02x}",
+            tag
+        );
+        return false;
+    }
+
+    let sig = match crate::slh_dsa::SlhDsaSignature::from_bytes(sig_bytes.to_vec()) {
+        Some(s) => s,
+        None => {
+            tracing::warn!("SLH-DSA signature decoding failed: invalid length");
+            return false;
+        }
+    };
+
+    crate::slh_dsa::slh_dsa_verify(slh_verifying_key, data, &sig)
 }
 
 #[cfg(test)]

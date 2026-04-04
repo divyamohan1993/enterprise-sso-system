@@ -86,6 +86,84 @@ impl Drop for SiemWebhookConfig {
     }
 }
 
+// ── JWE payload encryption (AES-256-GCM) ────────────────────────────────────
+
+/// Encrypt a payload using AES-256-GCM for SIEM webhook transport confidentiality.
+///
+/// When `MILNET_SIEM_ENCRYPTION_KEY` is set (64 hex chars = 256-bit key), webhook
+/// payloads are encrypted before transmission. The output is a compact JWE-like
+/// envelope: `base64(nonce) || "." || base64(ciphertext+tag)`.
+///
+/// Returns `None` if no encryption key is configured.
+fn encrypt_payload_if_configured(payload: &[u8]) -> Option<String> {
+    let key_hex = std::env::var("MILNET_SIEM_ENCRYPTION_KEY").ok()?;
+    if key_hex.is_empty() {
+        return None;
+    }
+
+    let key_bytes = match hex::decode(&key_hex) {
+        Ok(k) if k.len() == 32 => k,
+        Ok(k) => {
+            tracing::error!(
+                target: "siem",
+                "MILNET_SIEM_ENCRYPTION_KEY must be exactly 64 hex chars (256 bits), got {} bytes. \
+                 Skipping encryption.",
+                k.len()
+            );
+            return None;
+        }
+        Err(e) => {
+            tracing::error!(
+                target: "siem",
+                "MILNET_SIEM_ENCRYPTION_KEY is not valid hex: {}. Skipping encryption.",
+                e
+            );
+            return None;
+        }
+    };
+
+    use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
+    use aes_gcm::Nonce;
+
+    let cipher = match Aes256Gcm::new_from_slice(&key_bytes) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(
+                target: "siem",
+                "AES-256-GCM key init failed for SIEM payload encryption: {}",
+                e
+            );
+            return None;
+        }
+    };
+
+    // Generate a random 96-bit nonce
+    let mut nonce_bytes = [0u8; 12];
+    if getrandom::getrandom(&mut nonce_bytes).is_err() {
+        tracing::error!(target: "siem", "CSPRNG failure generating nonce for SIEM encryption");
+        return None;
+    }
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    match cipher.encrypt(nonce, payload) {
+        Ok(ciphertext) => {
+            // Compact JWE-like format: base64(nonce).base64(ciphertext||tag)
+            use base64::{engine::general_purpose::STANDARD as B64, Engine};
+            let nonce_b64 = B64.encode(nonce_bytes);
+            let ct_b64 = B64.encode(&ciphertext);
+            Some(format!("{}.{}", nonce_b64, ct_b64))
+        }
+        Err(e) => {
+            tracing::error!(
+                target: "siem",
+                "AES-256-GCM encryption failed for SIEM payload: {}",
+                e
+            );
+            None
+        }
+    }
+}
+
 // ── HMAC-SHA512 payload signing ──────────────────────────────────────────────
 
 /// Compute HMAC-SHA512 over `timestamp || payload` using the given key.
@@ -240,9 +318,18 @@ impl SiemWebhook {
         let count = events.len();
 
         // Build a JSON array of all buffered events for the batch POST body.
-        let batch_json = format!("[{}]", events.join(","));
+        let batch_json_raw = format!("[{}]", events.join(","));
 
-        // Compute HMAC-SHA512 signature for payload authentication
+        // Optionally encrypt the payload with AES-256-GCM if MILNET_SIEM_ENCRYPTION_KEY is set.
+        // When encrypted, the Content-Type changes to indicate JWE-wrapped content.
+        let (batch_json, is_encrypted) = match encrypt_payload_if_configured(batch_json_raw.as_bytes()) {
+            Some(encrypted) => (encrypted, true),
+            None => (batch_json_raw, false),
+        };
+
+        // Compute HMAC-SHA512 signature for payload authentication.
+        // The signature covers the (possibly encrypted) payload to provide
+        // authenticated encryption when both signing and encryption are active.
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -284,13 +371,22 @@ impl SiemWebhook {
         };
 
         // Build HTTP request with authentication headers
+        let content_type = if is_encrypted {
+            "application/jose"
+        } else {
+            "application/json"
+        };
         let mut request = format!(
             "POST {} HTTP/1.1\r\n\
              Host: {}\r\n\
-             Content-Type: application/json\r\n\
+             Content-Type: {}\r\n\
              Content-Length: {}\r\n",
-            path, host_port, batch_json.len()
+            path, host_port, content_type, batch_json.len()
         );
+
+        if is_encrypted {
+            request.push_str("X-MILNET-Encrypted: AES-256-GCM\r\n");
+        }
 
         if let Some(ref sig) = signature {
             request.push_str(&format!(

@@ -28,7 +28,7 @@ pub type DpopSignature = ml_dsa::Signature<MlDsa87>;
 /// On drop, the sentinel is zeroized and munlocked by `SecretVec`, and the
 /// parsed key is overwritten with a deterministic dummy.
 pub struct GuardedSigningKey {
-    /// The parsed ML-DSA-65 signing key used for actual signing operations.
+    /// The parsed ML-DSA-87 signing key used for actual signing operations.
     key: DpopSigningKey,
     /// Memory-locked sentinel — ensures the OS mlock covers the key's
     /// memory pages and the material is zeroized on drop.

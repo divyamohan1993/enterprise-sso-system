@@ -654,6 +654,44 @@ fn verify_ocsp_signature(response_der: &[u8], trusted_ca_certs: &[Vec<u8>]) -> b
 }
 
 // ---------------------------------------------------------------------------
+// Fail-closed revocation enforcement for military deployments
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if `MILNET_MILITARY_DEPLOYMENT=1` is set.
+fn is_military_deployment() -> bool {
+    std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1")
+}
+
+/// Enforce fail-closed revocation policy.
+///
+/// In military deployment mode (`MILNET_MILITARY_DEPLOYMENT=1`), an
+/// `OcspUnavailable` status is treated as a revocation failure. Access
+/// is denied because an attacker who compromises the OCSP responder or
+/// network path could suppress revocation information to use a stolen
+/// certificate.
+///
+/// In non-military mode, `OcspUnavailable` is passed through unchanged
+/// (fail-open) for availability.
+pub fn fail_closed_on_unavailable(status: RevocationStatus) -> Result<RevocationStatus, CacError> {
+    match status {
+        RevocationStatus::OcspUnavailable if is_military_deployment() => {
+            tracing::error!(
+                target: "siem",
+                "SIEM:CRITICAL CAC revocation check unavailable in military deployment mode. \
+                 Denying access (fail-closed policy). OCSP/CRL infrastructure must be reachable."
+            );
+            SecurityEvent::cac_auth_failure("ocsp_unavailable_military_fail_closed");
+            Err(CacError::RevocationCheckFailed(
+                "Revocation check unavailable in military deployment mode. \
+                 Access denied per fail-closed policy. Ensure OCSP/CRL infrastructure is reachable."
+                    .into(),
+            ))
+        }
+        other => Ok(other),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tier enforcement
 // ---------------------------------------------------------------------------
 
@@ -1122,6 +1160,40 @@ mod tests {
         match result.unwrap() {
             RevocationStatus::OcspUnavailable => {}
             _ => panic!("expected OcspUnavailable without network"),
+        }
+    }
+
+    #[test]
+    fn test_fail_closed_on_unavailable_non_military() {
+        // Without military deployment, OcspUnavailable passes through.
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        let result = fail_closed_on_unavailable(RevocationStatus::OcspUnavailable);
+        assert!(result.is_ok(), "non-military should pass OcspUnavailable through");
+        match result.unwrap() {
+            RevocationStatus::OcspUnavailable => {}
+            _ => panic!("expected OcspUnavailable passthrough"),
+        }
+    }
+
+    #[test]
+    fn test_fail_closed_on_unavailable_military() {
+        // With military deployment, OcspUnavailable becomes an error.
+        std::env::set_var("MILNET_MILITARY_DEPLOYMENT", "1");
+        let result = fail_closed_on_unavailable(RevocationStatus::OcspUnavailable);
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        assert!(result.is_err(), "military mode should reject OcspUnavailable");
+    }
+
+    #[test]
+    fn test_fail_closed_passes_good_status() {
+        // Good status should pass through regardless of mode.
+        std::env::set_var("MILNET_MILITARY_DEPLOYMENT", "1");
+        let result = fail_closed_on_unavailable(RevocationStatus::Good);
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        assert!(result.is_ok());
+        match result.unwrap() {
+            RevocationStatus::Good => {}
+            _ => panic!("expected Good passthrough"),
         }
     }
 

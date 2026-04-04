@@ -38,7 +38,7 @@ pub struct DkgResult {
 /// `dkg_distributed()` which delegates to the Pedersen DKG protocol in
 /// `pedersen_dkg.rs`.
 #[deprecated(note = "Use dkg_distributed() for production. This uses a trusted dealer.")]
-pub fn dkg(total: u16, threshold: u16) -> DkgResult {
+pub fn dkg(total: u16, threshold: u16) -> Result<DkgResult, String> {
     let mut rng = rand::rngs::OsRng;
     let (shares_map, public_key_package) = frost::keys::generate_with_dealer(
         total,
@@ -46,42 +46,44 @@ pub fn dkg(total: u16, threshold: u16) -> DkgResult {
         frost::keys::IdentifierList::Default,
         &mut rng,
     )
-    .unwrap_or_else(|e| panic!("FATAL: FROST DKG ceremony failed: {e}"));
+    .map_err(|e| format!("FROST DKG ceremony failed: {e}"))?;
 
     // Verify each share is consistent with the group public key (Feldman VSS)
     for (id, secret_share) in &shares_map {
         let key_package = frost::keys::KeyPackage::try_from(secret_share.clone())
-            .unwrap_or_else(|e| panic!("FATAL: share-to-key-package conversion failed: {e}"));
+            .map_err(|e| format!("share-to-key-package conversion failed: {e}"))?;
         // Verify the share's verification key is consistent with the group key
         let share_vk = key_package.verifying_share();
-        // The public key package contains all verifying shares — cross-check
+        // The public key package contains all verifying shares -- cross-check
         if let Some(expected_vk) = public_key_package.verifying_shares().get(id) {
-            assert_eq!(
-                share_vk, expected_vk,
-                "CRITICAL: DKG share verification failed for signer {id:?} — possible dealer compromise"
-            );
+            if share_vk != expected_vk {
+                return Err(format!(
+                    "DKG share verification failed for signer {id:?} -- possible dealer compromise"
+                ));
+            }
         }
     }
     tracing::info!("DKG Feldman VSS verification passed for all {} shares", shares_map.len());
 
-    let shares: Vec<SignerShare> = shares_map
-        .into_iter()
-        .map(|(id, secret_share)| SignerShare {
+    let mut shares: Vec<SignerShare> = Vec::with_capacity(shares_map.len());
+    for (id, secret_share) in shares_map {
+        let key_package = KeyPackage::try_from(secret_share)
+            .map_err(|e| format!("key package creation failed during DKG: {e}"))?;
+        shares.push(SignerShare {
             identifier: id,
-            key_package: KeyPackage::try_from(secret_share)
-                .unwrap_or_else(|e| panic!("FATAL: key package creation failed during DKG: {e}")),
+            key_package,
             nonce_counter: std::sync::atomic::AtomicU64::new(0),
-        })
-        .collect();
+        });
+    }
 
-    DkgResult {
+    Ok(DkgResult {
         group: ThresholdGroup {
             threshold: threshold as usize,
             total: total as usize,
             public_key_package,
         },
         shares,
-    }
+    })
 }
 
 /// Performs distributed key generation using the Pedersen DKG protocol.
@@ -340,29 +342,28 @@ impl ThresholdGroup {
         // Verify each share is consistent with the group public key (Feldman VSS)
         for (id, secret_share) in &shares_map {
             let key_package = frost::keys::KeyPackage::try_from(secret_share.clone())
-                .unwrap_or_else(|e| panic!("FATAL: share-to-key-package conversion failed during refresh: {e}"));
+                .map_err(|e| format!("share-to-key-package conversion failed during refresh: {e}"))?;
             let share_vk = key_package.verifying_share();
             if let Some(expected_vk) = public_key_package.verifying_shares().get(id) {
-                assert_eq!(
-                    share_vk, expected_vk,
-                    "CRITICAL: refresh share verification failed for signer {id:?} — possible dealer compromise"
-                );
+                if share_vk != expected_vk {
+                    return Err(format!(
+                        "refresh share verification failed for signer {id:?} -- possible dealer compromise"
+                    ));
+                }
             }
         }
         tracing::info!("Share refresh Feldman VSS verification passed for all {} shares", shares_map.len());
 
-        let new_shares: Vec<SignerShare> = shares_map
-            .into_iter()
-            .map(|(id, secret_share)| {
-                let key_package = KeyPackage::try_from(secret_share)
-                    .unwrap_or_else(|e| panic!("FATAL: key package creation failed during refresh: {e}"));
-                SignerShare {
-                    identifier: id,
-                    key_package,
-                    nonce_counter: std::sync::atomic::AtomicU64::new(0),
-                }
-            })
-            .collect();
+        let mut new_shares: Vec<SignerShare> = Vec::with_capacity(shares_map.len());
+        for (id, secret_share) in shares_map {
+            let key_package = KeyPackage::try_from(secret_share)
+                .map_err(|e| format!("key package creation failed during refresh: {e}"))?;
+            new_shares.push(SignerShare {
+                identifier: id,
+                key_package,
+                nonce_counter: std::sync::atomic::AtomicU64::new(0),
+            });
+        }
 
         let new_group = ThresholdGroup {
             threshold: self.threshold,
@@ -390,7 +391,7 @@ mod tests {
 
     #[allow(deprecated)]
     fn make_group(total: u16, threshold: u16) -> DkgResult {
-        dkg(total, threshold)
+        dkg(total, threshold).expect("DKG must succeed in tests")
     }
 
     #[test]

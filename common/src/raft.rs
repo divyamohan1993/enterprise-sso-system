@@ -368,6 +368,125 @@ impl RaftPersistence for NullRaftPersistence {
     }
 }
 
+// ── Raft log (WAL) persistence ──────────────────────────────────────────────
+
+/// Trait for persisting the Raft log (write-ahead log).
+///
+/// The Raft log must survive restarts so that a node can rejoin the cluster
+/// with its full history intact. Without WAL persistence, a restarted node
+/// has an empty log and must receive the entire log from the leader.
+pub trait RaftLogPersistence: Send + Sync {
+    /// Append entries to the persistent log. Must fsync before returning.
+    fn append_entries(&self, entries: &[LogEntry]) -> Result<(), String>;
+    /// Load the full log from persistent storage.
+    fn load_log(&self) -> Result<Vec<LogEntry>, String>;
+    /// Truncate the log from the given index onwards (inclusive).
+    /// Used when the leader overwrites conflicting entries.
+    fn truncate_from(&self, index: u64) -> Result<(), String>;
+}
+
+/// File-backed WAL for Raft log entries.
+///
+/// Each entry is appended as a length-prefixed postcard frame to a single
+/// WAL file at `{dir}/wal`. Truncation rewrites the file without the
+/// truncated entries. All writes are fsynced.
+pub struct FileRaftLogPersistence {
+    path: std::path::PathBuf,
+}
+
+impl FileRaftLogPersistence {
+    pub fn new(dir: &std::path::Path) -> Result<Self, String> {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("create WAL dir {}: {e}", dir.display()))?;
+        Ok(Self {
+            path: dir.join("wal"),
+        })
+    }
+}
+
+impl RaftLogPersistence for FileRaftLogPersistence {
+    fn append_entries(&self, entries: &[LogEntry]) -> Result<(), String> {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|e| format!("open WAL: {e}"))?;
+        for entry in entries {
+            let data = postcard::to_allocvec(entry)
+                .map_err(|e| format!("serialize log entry: {e}"))?;
+            let len = (data.len() as u32).to_le_bytes();
+            f.write_all(&len).map_err(|e| format!("write WAL len: {e}"))?;
+            f.write_all(&data).map_err(|e| format!("write WAL data: {e}"))?;
+        }
+        f.sync_all().map_err(|e| format!("fsync WAL: {e}"))?;
+        Ok(())
+    }
+
+    fn load_log(&self) -> Result<Vec<LogEntry>, String> {
+        use std::io::Read;
+        let data = match std::fs::read(&self.path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(format!("read WAL: {e}")),
+        };
+        let mut entries = Vec::new();
+        let mut cursor = &data[..];
+        while cursor.len() >= 4 {
+            let mut len_buf = [0u8; 4];
+            len_buf.copy_from_slice(&cursor[..4]);
+            let len = u32::from_le_bytes(len_buf) as usize;
+            cursor = &cursor[4..];
+            if cursor.len() < len {
+                tracing::warn!(
+                    expected = len,
+                    available = cursor.len(),
+                    "truncated WAL entry, stopping recovery"
+                );
+                break;
+            }
+            let entry: LogEntry = postcard::from_bytes(&cursor[..len])
+                .map_err(|e| format!("deserialize WAL entry: {e}"))?;
+            entries.push(entry);
+            cursor = &cursor[len..];
+        }
+        Ok(entries)
+    }
+
+    fn truncate_from(&self, index: u64) -> Result<(), String> {
+        // Load all entries, keep only those before the truncation point,
+        // then rewrite the WAL.
+        let entries = self.load_log()?;
+        let kept: Vec<&LogEntry> = entries.iter().filter(|e| e.index.0 < index).collect();
+
+        use std::io::Write;
+        let tmp = self.path.with_extension("tmp");
+        let mut f = std::fs::File::create(&tmp)
+            .map_err(|e| format!("create WAL tmp: {e}"))?;
+        for entry in &kept {
+            let data = postcard::to_allocvec(entry)
+                .map_err(|e| format!("serialize log entry: {e}"))?;
+            let len = (data.len() as u32).to_le_bytes();
+            f.write_all(&len).map_err(|e| format!("write WAL len: {e}"))?;
+            f.write_all(&data).map_err(|e| format!("write WAL data: {e}"))?;
+        }
+        f.sync_all().map_err(|e| format!("fsync WAL tmp: {e}"))?;
+        drop(f);
+        std::fs::rename(&tmp, &self.path)
+            .map_err(|e| format!("rename WAL: {e}"))?;
+        Ok(())
+    }
+}
+
+/// No-op WAL persistence for tests.
+pub struct NullRaftLogPersistence;
+
+impl RaftLogPersistence for NullRaftLogPersistence {
+    fn append_entries(&self, _entries: &[LogEntry]) -> Result<(), String> { Ok(()) }
+    fn load_log(&self) -> Result<Vec<LogEntry>, String> { Ok(Vec::new()) }
+    fn truncate_from(&self, _index: u64) -> Result<(), String> { Ok(()) }
+}
+
 // ── Raft state machine ────────────────────────────────────────────────────────
 
 /// Core Raft state machine.
@@ -406,6 +525,8 @@ pub struct RaftState {
     /// implemented). Only one config change may be in-flight at a time.
     pending_config_change: bool,
     match_index: HashMap<NodeId, LogIndex>,
+    /// WAL persistence for the replicated log.
+    log_persistence: Box<dyn RaftLogPersistence>,
     /// Deadline for the next election timeout.
     election_deadline: Instant,
     /// Node configuration.
@@ -425,6 +546,17 @@ impl RaftState {
         config: RaftConfig,
         persistence: Box<dyn RaftPersistence>,
     ) -> Self {
+        Self::with_full_persistence(node_id, config, persistence, Box::new(NullRaftLogPersistence))
+    }
+
+    /// Create a new Raft node with both state and log persistence.
+    /// Recovers term, voted_for, and the full log from disk.
+    pub fn with_full_persistence(
+        node_id: NodeId,
+        config: RaftConfig,
+        persistence: Box<dyn RaftPersistence>,
+        log_persistence: Box<dyn RaftLogPersistence>,
+    ) -> Self {
         let timeout = random_election_timeout(
             config.election_timeout_min_ms,
             config.election_timeout_max_ms,
@@ -441,17 +573,28 @@ impl RaftState {
                 (Term::zero(), None)
             });
 
+        // Recover log from WAL if available.
+        let recovered_log = log_persistence.load_log().unwrap_or_else(|e| {
+            tracing::error!(
+                node = %node_id,
+                error = %e,
+                "failed to recover raft log from WAL, starting with empty log"
+            );
+            Vec::new()
+        });
+
         tracing::info!(
             node = %node_id,
             peers = config.peers.len(),
             recovered_term = recovered_term.0,
+            recovered_log_entries = recovered_log.len(),
             "initialising raft node"
         );
         Self {
             node_id,
             current_term: recovered_term,
             voted_for: recovered_voted_for,
-            log: Vec::new(),
+            log: recovered_log,
             commit_index: LogIndex::zero(),
             last_applied: LogIndex::zero(),
             role: RaftRole::Follower,
@@ -463,6 +606,7 @@ impl RaftState {
             election_deadline: Instant::now() + timeout,
             config,
             persistence,
+            log_persistence,
             pending_config_change: false,
         }
     }
@@ -573,6 +717,10 @@ impl RaftState {
             index = index.0,
             "appending proposed entry to log"
         );
+        // Persist to WAL before appending to in-memory log.
+        if let Err(e) = self.log_persistence.append_entries(&[entry.clone()]) {
+            tracing::error!(node = %self.node_id, error = %e, "failed to persist log entry to WAL");
+        }
         self.log.push(entry);
 
         // Update our own match index.
@@ -762,11 +910,15 @@ impl RaftState {
 
         // Append a Noop entry to commit entries from the current term.
         let noop_index = LogIndex(self.last_log_index().0 + 1);
-        self.log.push(LogEntry {
+        let noop_entry = LogEntry {
             term: self.current_term,
             index: noop_index,
             command: ClusterCommand::Noop,
-        });
+        };
+        if let Err(e) = self.log_persistence.append_entries(&[noop_entry.clone()]) {
+            tracing::error!(node = %self.node_id, error = %e, "failed to persist noop to WAL");
+        }
+        self.log.push(noop_entry);
         self.match_index.insert(self.node_id, noop_index);
 
         // For single-node cluster, commit immediately.
@@ -914,17 +1066,28 @@ impl RaftState {
         }
 
         // Append new entries, handling conflicts.
+        let mut new_entries_to_persist = Vec::new();
         for entry in &entries {
             let vec_idx = (entry.index.0 as usize).saturating_sub(1);
             if vec_idx < self.log.len() {
                 if self.log[vec_idx].term != entry.term {
                     // Conflict: delete this and all following entries.
+                    if let Err(e) = self.log_persistence.truncate_from(entry.index.0) {
+                        tracing::error!(node = %self.node_id, error = %e, "failed to truncate WAL");
+                    }
                     self.log.truncate(vec_idx);
                     self.log.push(entry.clone());
+                    new_entries_to_persist.push(entry.clone());
                 }
                 // Otherwise entry already matches, skip.
             } else {
                 self.log.push(entry.clone());
+                new_entries_to_persist.push(entry.clone());
+            }
+        }
+        if !new_entries_to_persist.is_empty() {
+            if let Err(e) = self.log_persistence.append_entries(&new_entries_to_persist) {
+                tracing::error!(node = %self.node_id, error = %e, "failed to persist replicated entries to WAL");
             }
         }
 

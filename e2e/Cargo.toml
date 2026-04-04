@@ -39,3 +39,5 @@ serde_json = "1"
 base64 = "0.22"
 ed25519-dalek.workspace = true
 x25519-dalek.workspace = true
+hex.workspace = true
+ml-kem.workspace = true

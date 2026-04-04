@@ -15,6 +15,168 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// ── CA Persistence ───────────────────────────────────────────────────────────
+
+/// Persisted snapshot of CA state, loaded on startup.
+pub struct CaPersistedState {
+    pub issued: HashMap<u64, IssuedCert>,
+    pub next_serial: u64,
+    pub revoked: Vec<u64>,
+}
+
+/// Trait for persisting CA certificate state across restarts.
+///
+/// Every mutation (issue, revoke, serial bump) must be durable before the
+/// operation is considered complete. Implementations must fsync.
+pub trait CaPersistence: Send + Sync {
+    /// Persist a newly issued certificate.
+    fn save_issued(&self, cert: &IssuedCert) -> Result<(), String>;
+    /// Persist the next serial number before it is used (prevents reuse on crash).
+    fn save_serial(&self, serial: u64) -> Result<(), String>;
+    /// Persist a revocation event.
+    fn save_revocation(&self, serial: u64) -> Result<(), String>;
+    /// Load all persisted CA state on startup.
+    fn load_state(&self) -> Result<CaPersistedState, String>;
+}
+
+/// File-backed CA persistence. Writes to `{dir}/` with fsync + atomic rename.
+///
+/// Directory layout:
+///   issued/<serial>.bin   -- postcard-serialized IssuedCert
+///   serial.bin            -- current next_serial (u64 LE)
+///   revoked.bin           -- postcard-serialized Vec<u64>
+pub struct FileCaPersistence {
+    dir: std::path::PathBuf,
+}
+
+impl FileCaPersistence {
+    pub fn new(dir: &std::path::Path) -> Result<Self, String> {
+        let issued_dir = dir.join("issued");
+        std::fs::create_dir_all(&issued_dir)
+            .map_err(|e| format!("create CA persistence dir: {e}"))?;
+        Ok(Self { dir: dir.to_path_buf() })
+    }
+
+    /// Atomic write: write to .tmp, fsync, rename.
+    fn atomic_write(&self, path: &std::path::Path, data: &[u8]) -> Result<(), String> {
+        use std::io::Write;
+        let tmp = path.with_extension("tmp");
+        let mut f = std::fs::File::create(&tmp)
+            .map_err(|e| format!("create {}: {e}", tmp.display()))?;
+        f.write_all(data)
+            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        f.sync_all()
+            .map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+            .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), path.display()))?;
+        Ok(())
+    }
+}
+
+impl CaPersistence for FileCaPersistence {
+    fn save_issued(&self, cert: &IssuedCert) -> Result<(), String> {
+        let data = postcard::to_allocvec(cert).map_err(|e| format!("serialize issued: {e}"))?;
+        let path = self.dir.join("issued").join(format!("{}.bin", cert.serial));
+        self.atomic_write(&path, &data)
+    }
+
+    fn save_serial(&self, serial: u64) -> Result<(), String> {
+        let path = self.dir.join("serial.bin");
+        self.atomic_write(&path, &serial.to_le_bytes())
+    }
+
+    fn save_revocation(&self, _serial: u64) -> Result<(), String> {
+        // Re-read current revoked list from the issued certs (marked revoked=true)
+        // and persist the full revocation list. This is simpler and crash-safe.
+        // For the revocation list, we just append-persist the full list each time.
+        // Load all issued certs to find revoked ones.
+        let state = self.load_state()?;
+        let revoked: Vec<u64> = state.revoked;
+        let data = postcard::to_allocvec(&revoked).map_err(|e| format!("serialize revoked: {e}"))?;
+        let path = self.dir.join("revoked.bin");
+        self.atomic_write(&path, &data)
+    }
+
+    fn load_state(&self) -> Result<CaPersistedState, String> {
+        let mut issued = HashMap::new();
+        let mut revoked = Vec::new();
+
+        // Load issued certs
+        let issued_dir = self.dir.join("issued");
+        if issued_dir.exists() {
+            let entries = std::fs::read_dir(&issued_dir)
+                .map_err(|e| format!("read issued dir: {e}"))?;
+            for entry in entries {
+                let entry = entry.map_err(|e| format!("read dir entry: {e}"))?;
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("bin") {
+                    let data = std::fs::read(&path)
+                        .map_err(|e| format!("read {}: {e}", path.display()))?;
+                    let cert: IssuedCert = postcard::from_bytes(&data)
+                        .map_err(|e| format!("deserialize {}: {e}", path.display()))?;
+                    if cert.revoked {
+                        revoked.push(cert.serial);
+                    }
+                    issued.insert(cert.serial, cert);
+                }
+            }
+        }
+
+        // Load next_serial
+        let serial_path = self.dir.join("serial.bin");
+        let next_serial = if serial_path.exists() {
+            let data = std::fs::read(&serial_path)
+                .map_err(|e| format!("read serial: {e}"))?;
+            if data.len() == 8 {
+                u64::from_le_bytes(data.try_into().unwrap())
+            } else {
+                // Derive from issued certs
+                issued.keys().copied().max().unwrap_or(0) + 1
+            }
+        } else {
+            issued.keys().copied().max().unwrap_or(0) + 1
+        };
+
+        // Also load revoked list from revoked.bin if it exists (cross-check)
+        let revoked_path = self.dir.join("revoked.bin");
+        if revoked_path.exists() {
+            let data = std::fs::read(&revoked_path)
+                .map_err(|e| format!("read revoked: {e}"))?;
+            if let Ok(persisted_revoked) = postcard::from_bytes::<Vec<u64>>(&data) {
+                // Merge: union of cert-level revoked flags and explicit revocation list
+                for s in persisted_revoked {
+                    if !revoked.contains(&s) {
+                        revoked.push(s);
+                    }
+                }
+            }
+        }
+
+        Ok(CaPersistedState {
+            issued,
+            next_serial,
+            revoked,
+        })
+    }
+}
+
+/// No-op persistence for tests. State lives in memory only.
+pub struct NullCaPersistence;
+
+impl CaPersistence for NullCaPersistence {
+    fn save_issued(&self, _cert: &IssuedCert) -> Result<(), String> { Ok(()) }
+    fn save_serial(&self, _serial: u64) -> Result<(), String> { Ok(()) }
+    fn save_revocation(&self, _serial: u64) -> Result<(), String> { Ok(()) }
+    fn load_state(&self) -> Result<CaPersistedState, String> {
+        Ok(CaPersistedState {
+            issued: HashMap::new(),
+            next_serial: 1,
+            revoked: Vec::new(),
+        })
+    }
+}
+
 /// Certificate Signing Request for the distributed CA.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CertSigningRequest {
@@ -78,16 +240,46 @@ pub struct DistributedCa {
     revoked: Vec<u64>,
     /// CA public key fingerprint (SHA-512 of the FROST group verifying key)
     ca_fingerprint: Vec<u8>,
+    /// Persistence backend for CA state
+    persistence: Box<dyn CaPersistence>,
 }
 
 impl DistributedCa {
+    /// Create a new DistributedCa with no persistence (in-memory only, for tests).
     pub fn new(config: DistributedCaConfig, ca_fingerprint: Vec<u8>) -> Self {
+        Self::with_persistence(config, ca_fingerprint, Box::new(NullCaPersistence))
+    }
+
+    /// Create a new DistributedCa with a persistence backend.
+    /// Loads any previously persisted state from disk.
+    pub fn with_persistence(
+        config: DistributedCaConfig,
+        ca_fingerprint: Vec<u8>,
+        persistence: Box<dyn CaPersistence>,
+    ) -> Self {
+        let (issued, next_serial, revoked) = match persistence.load_state() {
+            Ok(state) => (state.issued, state.next_serial, state.revoked),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "failed to load persisted CA state, starting fresh"
+                );
+                (HashMap::new(), 1, Vec::new())
+            }
+        };
+        tracing::info!(
+            issued = issued.len(),
+            next_serial = next_serial,
+            revoked = revoked.len(),
+            "distributed CA initialized"
+        );
         Self {
             config,
-            issued: HashMap::new(),
-            next_serial: 1,
-            revoked: Vec::new(),
+            issued,
+            next_serial,
+            revoked,
             ca_fingerprint,
+            persistence,
         }
     }
 
@@ -119,7 +311,14 @@ impl DistributedCa {
         fingerprint: Vec<u8>,
     ) -> u64 {
         let serial = self.next_serial;
+        // Persist the next serial BEFORE using it. If we crash after persisting
+        // but before issuing, we skip a serial (safe). If we crash before
+        // persisting, we reuse the serial on restart (also safe, since the cert
+        // was never recorded). Belt-and-suspenders: persist serial+1 first.
         self.next_serial += 1;
+        if let Err(e) = self.persistence.save_serial(self.next_serial) {
+            tracing::error!(error = %e, serial = self.next_serial, "failed to persist next_serial");
+        }
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -137,7 +336,10 @@ impl DistributedCa {
             fingerprint,
             revoked: false,
         };
-        self.issued.insert(serial, cert);
+        self.issued.insert(serial, cert.clone());
+        if let Err(e) = self.persistence.save_issued(&cert) {
+            tracing::error!(error = %e, serial = serial, "failed to persist issued certificate");
+        }
         serial
     }
 
@@ -146,6 +348,13 @@ impl DistributedCa {
         if let Some(cert) = self.issued.get_mut(&serial) {
             cert.revoked = true;
             self.revoked.push(serial);
+            // Persist the revocation and the updated cert (revoked=true).
+            if let Err(e) = self.persistence.save_issued(cert) {
+                tracing::error!(error = %e, serial = serial, "failed to persist revoked cert");
+            }
+            if let Err(e) = self.persistence.save_revocation(serial) {
+                tracing::error!(error = %e, serial = serial, "failed to persist revocation");
+            }
             true
         } else {
             false

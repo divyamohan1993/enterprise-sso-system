@@ -23,6 +23,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
+use zeroize::Zeroize;
 
 // ---------------------------------------------------------------------------
 // Enclave Backend Types
@@ -224,6 +225,15 @@ pub fn unseal_key(
 }
 
 /// Derive a sealing encryption key from master key + enclave identity using HKDF-SHA512.
+///
+/// # Security Note
+///
+/// The returned `[u8; 32]` lives on the caller's stack. Callers MUST ensure
+/// the key is zeroized after use (e.g., by calling `key.zeroize()` or wrapping
+/// in a type that implements `ZeroizeOnDrop`). The `seal_key` and `unseal_key`
+/// functions in this module do not persist the derived key beyond their scope,
+/// so the stack frame reclamation provides a best-effort cleanup, but explicit
+/// zeroization is recommended for defense in depth.
 fn derive_sealing_key(master: &[u8; 32], identity: &[u8; 32]) -> [u8; 32] {
     let hk = hkdf::Hkdf::<Sha512>::new(Some(identity), master);
     let mut key = [0u8; 32];
@@ -410,6 +420,12 @@ pub struct EnclaveChannel {
     pub remote_identity: EnclaveIdentity,
 }
 
+impl Drop for EnclaveChannel {
+    fn drop(&mut self) {
+        self.session_key.zeroize();
+    }
+}
+
 /// Derive a session key from X25519 DH shared secret + attestation reports.
 ///
 /// Binds the channel to both enclaves' identities, preventing MITM even if
@@ -439,6 +455,8 @@ pub fn derive_channel_session_key(
     ikm.extend_from_slice(session_id);
 
     let hk = hkdf::Hkdf::<Sha512>::new(None, &ikm);
+    // Zeroize IKM immediately after HKDF extraction -- it contains the DH shared secret
+    ikm.zeroize();
     let mut key = [0u8; 32];
     hk.expand(b"MILNET-ENCLAVE-CHANNEL-v1", &mut key)
         .expect("HKDF-SHA512 expand for 32 bytes cannot fail");

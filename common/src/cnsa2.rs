@@ -26,10 +26,10 @@
 //! | `audit/src/log.rs`        | SHA-512 (chain) | PASS    | Upgraded from SHA-256                  |
 //! | `kt/src/merkle.rs`        | SHA-512         | PASS    | Upgraded from SHA3-256                 |
 //! | `crypto/src/entropy.rs`   | SHA-512         | PASS    | Already SHA-512 for combining          |
-//! | `crypto/src/dpop.rs`      | ML-DSA-65       | MIGRATE | Currently ML-DSA-65; upgrade to ML-DSA-87 pending |
+//! | `crypto/src/dpop.rs`      | ML-DSA-87       | PASS    | Upgraded from ML-DSA-65 to ML-DSA-87               |
 //! | `crypto/src/attest.rs`    | HMAC-SHA512     | PASS    | Manifest authentication                |
 //! | `common/src/duress.rs`    | HKDF-SHA512     | PASS    | v2 format; v1 upgraded to SHA-512      |
-//! | `crypto/src/receipts.rs`  | ML-DSA-65       | MIGRATE | Currently ML-DSA-65; upgrade to ML-DSA-87 pending |
+//! | `crypto/src/receipts.rs`  | ML-DSA-87       | PASS    | Upgraded from ML-DSA-65 to ML-DSA-87               |
 //! | `sso-protocol/src/tokens.rs` | ML-DSA-87   | PASS    | Upgraded from RSA-3072/RS256 to ML-DSA-87 |
 //! | `shard/src/protocol.rs`  | HKDF-SHA512     | PASS    | Upgraded from HKDF-SHA256              |
 //! | `crypto/src/puzzle.rs`   | SHA-512         | PASS    | Upgraded from SHA-256                  |
