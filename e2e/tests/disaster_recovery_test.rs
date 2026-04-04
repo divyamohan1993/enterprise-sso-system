@@ -274,7 +274,7 @@ fn test_full_backup_restore_cycle() {
     let master_kek = random_kek();
 
     // Step 2: Create FROST key shares (3-of-5 threshold)
-    let dkg_result = dkg(5, 3);
+    let dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let frost_bytes = serialize_frost_shares(&dkg_result);
 
     // Step 3: Create mock DB state
@@ -389,7 +389,7 @@ fn test_backup_restore_with_key_rotation() {
 #[test]
 fn test_partial_share_recovery() {
     // Create FROST group with 5 shares, threshold 3
-    let dkg_result = dkg(5, 3);
+    let dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let message = b"partial recovery signing test";
 
     // Back up all 5 shares individually (each encrypted with its own backup)

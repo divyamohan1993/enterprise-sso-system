@@ -301,7 +301,7 @@ async fn boot_full_system(
     // Run DKG and PQ keygen on a blocking thread (large stack usage in debug builds)
     let (group_verifying_key, coordinator, nodes, pq_sk, pq_vk) =
         tokio::task::spawn_blocking(|| {
-            let mut dkg_result = dkg(5, 3);
+            let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
             let group_verifying_key = dkg_result.group.public_key_package.clone();
             let (coordinator, nodes) = distribute_shares(&mut dkg_result);
             let (pq_sk, pq_vk) = crypto::pq_sign::generate_pq_keypair();

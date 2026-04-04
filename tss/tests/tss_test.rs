@@ -121,7 +121,7 @@ fn unsigned_receipt_rejected() {
 #[allow(deprecated)]
 #[test]
 fn token_built_and_verifiable() {
-    let dkg_result = dkg(5, 3);
+    let dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let mut shares = dkg_result.shares;
     let group = dkg_result.group;
     let claims = test_claims();
@@ -141,7 +141,7 @@ fn token_built_and_verifiable() {
 #[allow(deprecated)]
 #[test]
 fn token_claims_preserved() {
-    let dkg_result = dkg(5, 3);
+    let dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let mut shares = dkg_result.shares;
     let group = dkg_result.group;
     let claims = test_claims();
@@ -172,7 +172,7 @@ fn token_claims_preserved() {
 #[allow(deprecated)]
 #[test]
 fn test_ratchet_tag_is_real() {
-    let dkg_result = dkg(5, 3);
+    let dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let mut shares = dkg_result.shares;
     let group = dkg_result.group;
     let claims = test_claims();
@@ -193,7 +193,7 @@ fn test_ratchet_tag_is_real() {
 #[test]
 fn test_distributed_signing_works() {
     // DKG -> distribute into 5 separate SignerNodes
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let group = &dkg_result.group;
     let public_key_package = group.public_key_package.clone();
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
@@ -220,7 +220,7 @@ fn test_distributed_signing_works() {
 #[test]
 fn test_distributed_2_of_5_fails() {
     // Only 2 nodes -> coordinator rejects (below threshold)
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
 
     let message = b"should-fail";
@@ -238,7 +238,7 @@ fn test_distributed_different_subsets_produce_valid_sigs() {
     // Nodes {0,1,2} sign -> valid
     // Nodes {2,3,4} sign -> valid
     // Same group key verifies both
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let public_key_package = dkg_result.group.public_key_package.clone();
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
 
@@ -273,7 +273,7 @@ fn test_distributed_different_subsets_produce_valid_sigs() {
 fn test_each_node_holds_exactly_one_share() {
     // After distribute_shares, each SignerNode has one KeyPackage
     // The coordinator has NO signing capability (only PublicKeyPackage)
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let (coordinator, nodes) = distribute_shares(&mut dkg_result);
 
     // 5 nodes, each with a unique identifier
@@ -294,7 +294,7 @@ fn test_each_node_holds_exactly_one_share() {
 #[test]
 fn test_coordinator_cannot_sign_alone() {
     // Coordinator with 0 signers -> error
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let (coordinator, _nodes) = distribute_shares(&mut dkg_result);
 
     let message = b"coordinator-alone";
@@ -306,7 +306,7 @@ fn test_coordinator_cannot_sign_alone() {
 #[test]
 fn test_distributed_token_built_and_verifiable() {
     // Use the distributed path to build a token and verify it
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let public_key_package = dkg_result.group.public_key_package.clone();
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
 
@@ -411,7 +411,7 @@ fn test_full_signing_flow_with_valid_receipts() {
     assert!(validate_receipt_chain(&decoded.receipts, &receipt_key).is_ok());
 
     // Step 3: Build token with distributed signing
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
     let (pq_sk, _pq_vk) = generate_pq_keypair();
     let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();

@@ -292,7 +292,7 @@ async fn boot_full_system(
 ) -> (String, PublicKeyPackage, PqVerifyingKey) {
     let (group_verifying_key, coordinator, nodes, pq_sk) =
         tokio::task::spawn_blocking(|| {
-            let mut dkg_result = dkg(5, 3);
+            let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
             let group_verifying_key = dkg_result.group.public_key_package.clone();
             let (coordinator, nodes) = distribute_shares(&mut dkg_result);
             let pq_sk = Box::new(test_pq_sk().clone());
@@ -447,7 +447,7 @@ async fn test_sso_single_login_multiple_portals() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_sso_token_works_across_independent_verifiers() {
     // 1. Run DKG, get group key, distribute shares
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let group_key = dkg_result.group.public_key_package.clone();
     let pq_vk = test_pq_vk();
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
@@ -520,7 +520,7 @@ async fn test_sso_different_users_different_tokens_same_portals() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_sso_scope_restricts_portal_access() {
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let group_key = dkg_result.group.public_key_package.clone();
     let pq_vk = test_pq_vk();
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
@@ -548,7 +548,7 @@ async fn test_sso_scope_restricts_portal_access() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_sso_tier_restricts_portal_access() {
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let group_key = dkg_result.group.public_key_package.clone();
     let pq_vk = test_pq_vk();
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
@@ -616,7 +616,7 @@ async fn test_attack_stolen_token_used_at_different_portal() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_attack_forged_scope_escalation() {
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let group_key = dkg_result.group.public_key_package.clone();
     let pq_vk = test_pq_vk();
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
@@ -649,7 +649,7 @@ async fn test_attack_forged_scope_escalation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_attack_forged_tier_escalation() {
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let group_key = dkg_result.group.public_key_package.clone();
     let pq_vk = test_pq_vk();
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
@@ -674,7 +674,7 @@ async fn test_attack_forged_tier_escalation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_attack_expired_token_at_portal() {
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let group_key = dkg_result.group.public_key_package.clone();
     let pq_vk = test_pq_vk();
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
@@ -711,11 +711,11 @@ async fn test_attack_expired_token_at_portal() {
 async fn test_attack_token_from_rogue_sso_server() {
     let pq_vk = test_pq_vk();
     // Real SSO server DKG
-    let real_dkg = dkg(5, 3);
+    let real_dkg = dkg(5, 3).expect("DKG ceremony failed");
     let real_key = real_dkg.group.public_key_package.clone();
 
     // ROGUE SSO server: independent DKG (different group key)
-    let mut rogue_dkg = dkg(5, 3);
+    let mut rogue_dkg = dkg(5, 3).expect("DKG ceremony failed");
     let (rogue_coordinator, mut rogue_nodes) = distribute_shares(&mut rogue_dkg);
 
     // Sign a token with the rogue server's key
@@ -769,7 +769,7 @@ async fn test_attack_replay_same_token_after_ratchet_advance() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_attack_man_in_middle_modifies_token_in_transit() {
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let group_key = dkg_result.group.public_key_package.clone();
     let pq_vk = test_pq_vk();
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
@@ -806,7 +806,7 @@ async fn test_attack_man_in_middle_modifies_token_in_transit() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_attack_null_token_at_portal() {
-    let dkg_result = dkg(5, 3);
+    let dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let group_key = dkg_result.group.public_key_package.clone();
 
     // Send empty bytes — must fail deserialization, not crash
@@ -826,7 +826,7 @@ async fn test_attack_null_token_at_portal() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_attack_oversized_token_at_portal() {
-    let dkg_result = dkg(5, 3);
+    let dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let _group_key = dkg_result.group.public_key_package.clone();
 
     // Send 1 MB of random-ish bytes as "token" — must get error, not OOM
@@ -883,7 +883,7 @@ async fn test_sso_sessions_are_isolated() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_sso_concurrent_portal_access() {
     // Setup: DKG and 5 users
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let group_key = dkg_result.group.public_key_package.clone();
     let pq_vk = test_pq_vk();
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);

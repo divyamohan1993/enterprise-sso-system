@@ -2527,7 +2527,7 @@ mod tests {
 
     /// Helper: run DKG and distribute shares.
     fn setup_dkg() -> (SigningCoordinator, Vec<SignerNode>) {
-        let mut dkg_result = dkg(5, 3);
+        let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
         distribute_shares(&mut dkg_result)
     }
 
@@ -2640,7 +2640,7 @@ mod tests {
         // Production mode is always active — no env var override needed
         std::env::set_var("MILNET_MASTER_KEK", "cd".repeat(32));
 
-        let mut dkg_result = dkg(5, 3);
+        let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
         let sealed = seal_all_shares(&mut dkg_result);
 
         assert_eq!(sealed.len(), 5, "must produce exactly 5 sealed shares");

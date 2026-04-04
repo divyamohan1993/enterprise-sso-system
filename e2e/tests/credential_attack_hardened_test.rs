@@ -816,8 +816,8 @@ fn ksf_pbkdf2_and_argon2id_deterministic_and_available() {
 fn frost_token_forgery_with_wrong_group_key_rejected() {
     run_with_large_stack(|| {
         // Generate two independent FROST key groups
-        let mut dkg_a = dkg(5, 3);
-        let mut dkg_b = dkg(5, 3);
+        let mut dkg_a = dkg(5, 3).expect("DKG ceremony failed");
+        let mut dkg_b = dkg(5, 3).expect("DKG ceremony failed");
 
         let message = b"token-claims-to-sign";
 

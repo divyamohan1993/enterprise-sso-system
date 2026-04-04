@@ -67,7 +67,7 @@ fn now_us() -> i64 {
 }
 
 fn make_valid_token_and_key() -> (Token, frost_ristretto255::keys::PublicKeyPackage, [u8; 32]) {
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let group_key = dkg_result.group.public_key_package.clone();
     let dpop_hash = crypto::dpop::dpop_key_hash(&TEST_DPOP_KEY);
     let claims = TokenClaims {
@@ -260,7 +260,7 @@ fn test_session_fixation_attack() {
 /// Tokens with audience binding must be rejected by non-matching services.
 #[test]
 fn test_token_replay_across_services() {
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let group_key = dkg_result.group.public_key_package.clone();
     let dpop_hash = crypto::dpop::dpop_key_hash(&TEST_DPOP_KEY);
 
@@ -411,7 +411,7 @@ fn test_timing_side_channel_on_auth() {
 /// The system must detect the corruption and refuse to issue a token.
 #[test]
 fn test_hsm_fault_injection() {
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let group_key = dkg_result.group.public_key_package.clone();
 
     let dpop_hash = crypto::dpop::dpop_key_hash(&TEST_DPOP_KEY);
@@ -527,11 +527,11 @@ fn test_certificate_substitution_attack() {
 #[test]
 fn test_frost_share_forgery() {
     // Run legitimate DKG
-    let dkg_result = dkg(5, 3);
+    let dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let group_key = dkg_result.group.public_key_package.clone();
 
     // Run a SEPARATE DKG — the attacker's attempt to forge shares
-    let attacker_dkg = dkg(5, 3);
+    let attacker_dkg = dkg(5, 3).expect("DKG ceremony failed");
     let mut attacker_shares: Vec<_> = attacker_dkg.shares.into_iter().take(3).collect();
 
     // Sign a message with the attacker's forged shares
@@ -689,7 +689,7 @@ fn test_ratchet_state_manipulation() {
 /// access to information above the user's clearance level.
 #[test]
 fn test_cross_domain_label_injection() {
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let group_key = dkg_result.group.public_key_package.clone();
     let dpop_hash = crypto::dpop::dpop_key_hash(&TEST_DPOP_KEY);
 
@@ -848,7 +848,7 @@ async fn test_race_condition_in_ceremony() {
     for _ in 0..8 {
         let counter = Arc::clone(&counter);
         let handle = tokio::task::spawn_blocking(move || {
-            let result = dkg(5, 3);
+            let result = dkg(5, 3).expect("DKG ceremony failed");
             let group_key = result.group.public_key_package.clone();
             counter.fetch_add(1, Ordering::SeqCst);
             // Return the serialized group key to verify uniqueness
@@ -1010,7 +1010,7 @@ fn test_supply_chain_dependency_injection() {
     );
 
     // Test 2: DKG produces valid group key that can sign and verify
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let _group_key = dkg_result.group.public_key_package.clone();
     let message = b"integrity-verification-payload";
     let sig = threshold_sign(&mut dkg_result.shares[..3], &dkg_result.group, message, 3)

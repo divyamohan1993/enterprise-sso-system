@@ -114,10 +114,10 @@ fn test_fips_mode_forces_pbkdf2() {
 #[test]
 fn test_frost_share_corruption_detected() {
     run_with_large_stack(|| {
-        let mut result = dkg(3, 2);
+        let mut result = dkg(3, 2).expect("DKG ceremony failed");
         // Corrupt the first signer's key package by replacing it with a key
         // from a freshly generated independent group (wrong secret share).
-        let corrupt = dkg(3, 2);
+        let corrupt = dkg(3, 2).expect("DKG ceremony failed");
         result.shares[0].identifier = corrupt.shares[0].identifier;
         result.shares[0].key_package = corrupt.shares[0].key_package.clone();
 
@@ -148,7 +148,7 @@ fn test_frost_share_corruption_detected() {
 #[test]
 fn test_frost_below_threshold_fails() {
     run_with_large_stack(|| {
-        let mut result = dkg(5, 3);
+        let mut result = dkg(5, 3).expect("DKG ceremony failed");
         // threshold_sign takes the first `threshold` signers from the slice,
         // so pass only 2 signers while requesting threshold=3.
         let sign_result = threshold_sign(

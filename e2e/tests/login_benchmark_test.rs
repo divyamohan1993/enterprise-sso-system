@@ -348,7 +348,7 @@ async fn boot_gateway(
 /// Boot all services and return the gateway address.
 async fn boot_full_system(store: CredentialStore) -> String {
     let (coordinator, nodes, pq_sk) = tokio::task::spawn_blocking(|| {
-        let mut dkg_result = dkg(5, 3);
+        let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
         let (coordinator, nodes) = distribute_shares(&mut dkg_result);
         let (pq_sk, _pq_vk) = generate_pq_keypair();
         (coordinator, nodes, pq_sk)
@@ -594,7 +594,7 @@ fn test_full_ceremony_timing() {
 
             // 4. FROST 3-of-5 threshold signing
             let frost_start = Instant::now();
-            let mut dkg_result = dkg(5, 3);
+            let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
             let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
             let dkg_ms = frost_start.elapsed().as_secs_f64() * 1000.0;
             println!("  FROST DKG (5 shares, threshold 3): {dkg_ms:.2}ms");

@@ -50,7 +50,7 @@ fn run_with_large_stack<F: FnOnce() + Send + 'static>(f: F) {
 #[test]
 fn test_token_expired_rejected() {
     run_with_large_stack(|| {
-        let mut dkg_result = dkg(5, 3);
+        let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
         let group_key = dkg_result.group.public_key_package.clone();
 
         let claims = TokenClaims {
@@ -95,7 +95,7 @@ fn test_token_expired_rejected() {
 #[test]
 fn test_token_future_iat_suspicious() {
     run_with_large_stack(|| {
-        let mut dkg_result = dkg(5, 3);
+        let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
         let group_key = dkg_result.group.public_key_package.clone();
 
         let far_future_us = now_us() + 365_i64 * 24 * 3600 * 1_000_000; // 1 year ahead

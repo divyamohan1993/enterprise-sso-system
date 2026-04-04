@@ -60,7 +60,7 @@ fn pedersen_dkg_arbitrary_signer_subset() {
 #[test]
 fn frost_3_of_5_produces_valid_signature() {
     #[allow(deprecated)]
-    let result = dkg(5, 3);
+    let result = dkg(5, 3).expect("DKG ceremony failed");
     let mut shares = result.shares;
     let message = b"test message for threshold signing";
 
@@ -70,7 +70,7 @@ fn frost_3_of_5_produces_valid_signature() {
 
 #[test]
 fn frost_2_of_5_fails() {
-    let result = dkg(5, 3);
+    let result = dkg(5, 3).expect("DKG ceremony failed");
     let mut shares = result.shares;
     // Only provide 2 signers for a threshold of 3
     let combined = threshold_sign(&mut shares[..2], &result.group, b"test message", 3);
@@ -79,7 +79,7 @@ fn frost_2_of_5_fails() {
 
 #[test]
 fn nonce_counter_increments() {
-    let result = dkg(5, 3);
+    let result = dkg(5, 3).expect("DKG ceremony failed");
     let mut shares = result.shares;
     let msg = b"test";
 
@@ -97,7 +97,7 @@ fn nonce_counter_increments() {
 
 #[test]
 fn different_messages_different_signatures() {
-    let result = dkg(5, 3);
+    let result = dkg(5, 3).expect("DKG ceremony failed");
     let mut shares = result.shares;
 
     let sig_a = threshold_sign(&mut shares, &result.group, b"message A", 3).unwrap();

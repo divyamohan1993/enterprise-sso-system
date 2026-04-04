@@ -11,7 +11,7 @@ use tss::distributed::{distribute_shares, seal_signer_share, unseal_signer_share
 
 #[test]
 fn frost_exactly_threshold_signers() {
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let public_key_package = dkg_result.group.public_key_package.clone();
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
 
@@ -34,7 +34,7 @@ fn frost_exactly_threshold_signers() {
 
 #[test]
 fn frost_below_threshold_fails() {
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
 
     let message = b"below-threshold-test";
@@ -52,7 +52,7 @@ fn frost_below_threshold_fails() {
 
 #[test]
 fn frost_zero_signers_fails() {
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let (coordinator, _nodes) = distribute_shares(&mut dkg_result);
 
     let message = b"zero-signers-test";
@@ -64,7 +64,7 @@ fn frost_zero_signers_fails() {
 
 #[test]
 fn frost_one_signer_fails() {
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
 
     let message = b"one-signer-test";
@@ -84,7 +84,7 @@ fn coordinator_refuses_insufficient_commitments() {
     // This test validates that the coordinator's coordinate_signing method
     // correctly rejects requests where not enough signers are provided,
     // which is the in-process analog of an unresponsive signer timeout.
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
 
     // Simulate partial availability: only 2 of 5 nodes "respond"
@@ -97,7 +97,7 @@ fn coordinator_refuses_insufficient_commitments() {
 
 #[test]
 fn nonce_counter_increments_per_signing() {
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
 
     // All nodes start at counter 0
@@ -135,7 +135,7 @@ fn nonce_counter_increments_per_signing() {
 
 #[test]
 fn nonce_counter_independent_per_node() {
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
 
     // Use nodes {0,1,2} for first signing
@@ -166,7 +166,7 @@ fn nonce_counter_independent_per_node() {
 
 #[test]
 fn sealed_share_roundtrip() {
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let public_key_package = dkg_result.group.public_key_package.clone();
     let (_coordinator, nodes) = distribute_shares(&mut dkg_result);
 
@@ -184,7 +184,7 @@ fn sealed_share_roundtrip() {
 
     // Verify the recovered node can produce valid signatures
     // by using it with 2 other fresh nodes
-    let mut dkg2 = dkg(5, 3);
+    let mut dkg2 = dkg(5, 3).expect("DKG ceremony failed");
     let (_coord2, _nodes2) = distribute_shares(&mut dkg2);
 
     // The recovered public key package should match
@@ -201,7 +201,7 @@ fn sealed_share_roundtrip() {
 
 #[test]
 fn corrupted_sealed_share_rejected() {
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let public_key_package = dkg_result.group.public_key_package.clone();
     let (_coordinator, nodes) = distribute_shares(&mut dkg_result);
 
@@ -244,7 +244,7 @@ fn empty_sealed_share_rejected() {
 // SECURITY AUDIT: Trusted dealer DKG — full secret assembled in single process memory
 #[test]
 fn test_dkg_trusted_dealer_creates_all_shares_in_memory() {
-    let result = dkg(5, 3);
+    let result = dkg(5, 3).expect("DKG ceremony failed");
 
     assert_eq!(
         result.shares.len(),
@@ -272,7 +272,7 @@ fn test_dkg_trusted_dealer_creates_all_shares_in_memory() {
 // FROST security: t-1 shares must not produce valid signature
 #[test]
 fn test_below_threshold_signing_rejected() {
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
 
     // Attempt to sign with only 2 shares (below threshold of 3)
     let result = crypto::threshold::threshold_sign_with_indices(
@@ -300,8 +300,8 @@ fn test_below_threshold_signing_rejected() {
 #[test]
 fn test_frost_signature_rejects_wrong_group_key() {
     // Generate two completely independent groups
-    let mut dkg1 = dkg(5, 3);
-    let mut dkg2 = dkg(5, 3);
+    let mut dkg1 = dkg(5, 3).expect("DKG ceremony failed");
+    let mut dkg2 = dkg(5, 3).expect("DKG ceremony failed");
 
     // Sign a message with group1's shares
     let message = b"cross-group-verification-test";

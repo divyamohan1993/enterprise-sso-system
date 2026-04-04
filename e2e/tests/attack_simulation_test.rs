@@ -314,7 +314,7 @@ async fn boot_full_system(
     // stack space that exceeds the default 2MB test thread stack in debug).
     let (group_verifying_key, coordinator, nodes, pq_sk) =
         tokio::task::spawn_blocking(|| {
-            let mut dkg_result = dkg(5, 3);
+            let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
             let group_verifying_key = dkg_result.group.public_key_package.clone();
             let (coordinator, nodes) = distribute_shares(&mut dkg_result);
             let pq_sk = Box::new(test_pq_sk().clone());
@@ -379,7 +379,7 @@ fn build_valid_receipt_chain(signing_key: &[u8; 64]) -> Vec<Receipt> {
 const TEST_DPOP_KEY: [u8; 32] = [0xDD; 32];
 
 fn make_valid_token_and_key() -> (Token, frost_ristretto255::keys::PublicKeyPackage, [u8; 32]) {
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let group_key = dkg_result.group.public_key_package.clone();
     let dpop_hash = crypto::dpop::dpop_key_hash(&TEST_DPOP_KEY);
     let claims = TokenClaims {
@@ -698,7 +698,7 @@ async fn test_attack_timing_attack_on_password_verification() {
 fn test_attack_forged_token_random_signature_rejected() {
 
     // Create a token with valid claims but completely random signature bytes.
-    let dkg_result = dkg(5, 3);
+    let dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let group_key = dkg_result.group.public_key_package.clone();
 
     let claims = TokenClaims {
@@ -758,7 +758,7 @@ fn test_attack_forged_token_partial_signature_rejected() {
 fn test_attack_token_replay_across_sessions() {
     // Get a valid token from session 1. Try to use it in session 2
     // context (different DPoP key hash). Must fail because DPoP binding differs.
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let group_key = dkg_result.group.public_key_package.clone();
 
     // Session 1: token bound to DPoP key derived from session1_dpop_key
@@ -799,7 +799,7 @@ fn test_attack_token_replay_across_sessions() {
 fn test_attack_threshold_forgery_with_2_of_5_shares() {
     // Run DKG(5,3). Extract only 2 signer shares. Try to produce a valid
     // signature with only 2 shares (below threshold of 3). Must fail.
-    let dkg_result = dkg(5, 3);
+    let dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let mut only_two_shares: Vec<_> = dkg_result.shares.into_iter().take(2).collect();
 
     let message = b"forged-claims-data";
@@ -815,8 +815,8 @@ fn test_attack_cross_dkg_token_injection() {
 
     // Run two separate DKGs. Token signed by DKG-1 must fail verification
     // against DKG-2's public key. Proves cryptographic isolation.
-    let mut dkg1 = dkg(5, 3);
-    let dkg2 = dkg(5, 3);
+    let mut dkg1 = dkg(5, 3).expect("DKG ceremony failed");
+    let dkg2 = dkg(5, 3).expect("DKG ceremony failed");
     let group2_key = dkg2.group.public_key_package.clone();
 
     let claims = TokenClaims {

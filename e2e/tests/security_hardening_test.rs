@@ -71,7 +71,7 @@ fn stig_cat_i_failures_detected() {
 #[test]
 fn tss_threshold_signing_works() {
     run_with_large_stack(|| {
-        let mut dkg_result = dkg(5, 3);
+        let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
         let sig = crypto::threshold::threshold_sign(
             &mut dkg_result.shares,
             &dkg_result.group,
@@ -186,7 +186,7 @@ fn jti_replay_detection_works() {
 #[test]
 fn frost_nonce_counter_atomic_increment() {
     run_with_large_stack(|| {
-        let result = dkg(5, 3);
+        let result = dkg(5, 3).expect("DKG ceremony failed");
         let mut shares = result.shares;
 
         // Initial counters must be 0

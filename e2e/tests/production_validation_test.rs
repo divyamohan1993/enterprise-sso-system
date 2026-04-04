@@ -314,7 +314,7 @@ async fn boot_full_system(
     // stack space that exceeds the default test thread stack in debug builds).
     let (group_verifying_key, coordinator, nodes, pq_sk) =
         tokio::task::spawn_blocking(|| {
-            let mut dkg_result = dkg(5, 3);
+            let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
             let group_verifying_key = dkg_result.group.public_key_package.clone();
             let (coordinator, nodes) = distribute_shares(&mut dkg_result);
             let pq_sk = Box::new(test_pq_sk().clone());
@@ -379,7 +379,7 @@ fn build_valid_receipt_chain(signing_key: &[u8; 64]) -> Vec<Receipt> {
 const TEST_DPOP_KEY: [u8; 32] = [0xBB; 32];
 
 fn make_valid_token_and_key() -> (Token, frost_ristretto255::keys::PublicKeyPackage, [u8; 32]) {
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let group_key = dkg_result.group.public_key_package.clone();
     let dpop_hash = crypto::dpop::dpop_key_hash(&TEST_DPOP_KEY);
     let claims = TokenClaims {
@@ -645,7 +645,7 @@ fn test_token_cannot_be_modified() {
 #[test]
 fn test_token_signature_cannot_be_transplanted() {
     let _pq_vk = test_pq_vk();
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let group_key = dkg_result.group.public_key_package.clone();
 
     let dpop_key_a = [0xBB; 32];
@@ -707,7 +707,7 @@ fn test_expired_token_rejected() {
     std::thread::Builder::new()
         .stack_size(16 * 1024 * 1024)
         .spawn(|| {
-            let mut dkg_result = dkg(5, 3);
+            let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
             let group_key = dkg_result.group.public_key_package.clone();
 
             let claims = TokenClaims {
@@ -744,7 +744,7 @@ fn test_expired_token_rejected() {
 fn test_token_from_different_dkg_rejected() {
     let _pq_vk = test_pq_vk();
     // Group 1
-    let mut dkg1 = dkg(5, 3);
+    let mut dkg1 = dkg(5, 3).expect("DKG ceremony failed");
     let claims = TokenClaims {
         sub: Uuid::new_v4(),
         iss: [0xAA; 32],
@@ -766,7 +766,7 @@ fn test_token_from_different_dkg_rejected() {
         .expect("build token with group 1");
 
     // Group 2 (different DKG)
-    let dkg2 = dkg(5, 3);
+    let dkg2 = dkg(5, 3).expect("DKG ceremony failed");
     let group2_key = dkg2.group.public_key_package.clone();
 
     let result = verify_token(&token, &group2_key, test_pq_vk());
@@ -1683,7 +1683,7 @@ fn test_frost_3_of_5_different_signer_subsets() {
     let message = b"test message for signing";
 
     // Sign with signers {0,1,2}
-    let dkg1 = dkg(5, 3);
+    let dkg1 = dkg(5, 3).expect("DKG ceremony failed");
     let mut signers1: Vec<_> = dkg1.shares.into_iter().collect();
     let sig1 = threshold_sign(&mut signers1[0..3], &dkg1.group, message, 3)
         .expect("sign with {0,1,2}");
@@ -1705,7 +1705,7 @@ fn test_frost_3_of_5_different_signer_subsets() {
 
 #[test]
 fn test_frost_2_of_5_fails_threshold() {
-    let dkg_result = dkg(5, 3);
+    let dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let message = b"test message";
     let mut signers: Vec<_> = dkg_result.shares.into_iter().take(2).collect();
 

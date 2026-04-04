@@ -113,7 +113,7 @@ fn receipt_chain_forgery_rejected() {
 
 #[test]
 fn expired_token_rejected() {
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let group_key = dkg_result.group.public_key_package.clone();
 
     // Build a token that expired in the past
@@ -151,7 +151,7 @@ fn expired_token_rejected() {
 
 #[test]
 fn tampered_token_rejected() {
-    let mut dkg_result = dkg(5, 3);
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
     let group_key = dkg_result.group.public_key_package.clone();
 
     // Build a valid, non-expired token
