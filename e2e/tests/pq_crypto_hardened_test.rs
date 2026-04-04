@@ -407,7 +407,7 @@ fn crypto_agility_algorithm_enum_roundtrip() {
 fn pq_nesting_frost_inside_ml_dsa_87() {
     run_with_large_stack(|| {
         // Generate FROST threshold signature
-        let mut dkg_result = crypto::threshold::dkg(5, 3);
+        let mut dkg_result = crypto::threshold::dkg(5, 3).expect("DKG ceremony failed");
         let frost_sig = crypto::threshold::threshold_sign(
             &mut dkg_result.shares,
             &dkg_result.group,

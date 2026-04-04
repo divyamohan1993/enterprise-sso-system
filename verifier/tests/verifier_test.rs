@@ -144,7 +144,7 @@ fn future_claims_tier2() -> TokenClaims {
 
 #[test]
 fn valid_token_verifies() {
-    let mut dkg = threshold::dkg(5, 3);
+    let mut dkg = threshold::dkg(5, 3).expect("DKG ceremony failed");
     let (pq_sk, pq_vk) = test_pq_keypair();
     let claims = future_claims();
     let expected_sub = claims.sub;
@@ -163,7 +163,7 @@ fn valid_token_verifies() {
 
 #[test]
 fn expired_token_rejected() {
-    let mut dkg = threshold::dkg(5, 3);
+    let mut dkg = threshold::dkg(5, 3).expect("DKG ceremony failed");
     let (pq_sk, pq_vk) = test_pq_keypair();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -197,7 +197,7 @@ fn expired_token_rejected() {
 
 #[test]
 fn tampered_signature_rejected() {
-    let mut dkg = threshold::dkg(5, 3);
+    let mut dkg = threshold::dkg(5, 3).expect("DKG ceremony failed");
     let (pq_sk, pq_vk) = test_pq_keypair();
     let claims = future_claims();
     let mut token = build_signed_token_legacy(&mut dkg, claims, &pq_sk);
@@ -215,7 +215,7 @@ fn tampered_signature_rejected() {
 
 #[test]
 fn tampered_claims_rejected() {
-    let mut dkg = threshold::dkg(5, 3);
+    let mut dkg = threshold::dkg(5, 3).expect("DKG ceremony failed");
     let (pq_sk, pq_vk) = test_pq_keypair();
     let claims = future_claims();
     let mut token = build_signed_token_legacy(&mut dkg, claims, &pq_sk);
@@ -233,8 +233,8 @@ fn tampered_claims_rejected() {
 
 #[test]
 fn wrong_group_key_rejected() {
-    let mut dkg1 = threshold::dkg(5, 3);
-    let dkg2 = threshold::dkg(5, 3);
+    let mut dkg1 = threshold::dkg(5, 3).expect("DKG ceremony failed");
+    let dkg2 = threshold::dkg(5, 3).expect("DKG ceremony failed");
     let (pq_sk, pq_vk) = test_pq_keypair();
     let claims = future_claims();
     let token = build_signed_token_legacy(&mut dkg1, claims, &pq_sk);
@@ -252,7 +252,7 @@ fn wrong_group_key_rejected() {
 
 #[test]
 fn test_ratchet_tag_verifies() {
-    let mut dkg = threshold::dkg(5, 3);
+    let mut dkg = threshold::dkg(5, 3).expect("DKG ceremony failed");
     let (pq_sk, pq_vk) = test_pq_keypair();
     let ratchet_key = test_ratchet_key();
     let claims = future_claims();
@@ -277,7 +277,7 @@ fn test_ratchet_tag_verifies() {
 
 #[test]
 fn test_ratchet_tag_verifies_within_window() {
-    let mut dkg = threshold::dkg(5, 3);
+    let mut dkg = threshold::dkg(5, 3).expect("DKG ceremony failed");
     let (pq_sk, pq_vk) = test_pq_keypair();
     let ratchet_key = test_ratchet_key();
     let claims = future_claims(); // ratchet_epoch = 1
@@ -303,7 +303,7 @@ fn test_ratchet_tag_verifies_within_window() {
 
 #[test]
 fn test_wrong_ratchet_key_rejected() {
-    let mut dkg = threshold::dkg(5, 3);
+    let mut dkg = threshold::dkg(5, 3).expect("DKG ceremony failed");
     let (pq_sk, pq_vk) = test_pq_keypair();
     let ratchet_key = test_ratchet_key();
     let wrong_key = [0xEE; 64];
@@ -330,7 +330,7 @@ fn test_wrong_ratchet_key_rejected() {
 
 #[test]
 fn test_wrong_epoch_rejected() {
-    let mut dkg = threshold::dkg(5, 3);
+    let mut dkg = threshold::dkg(5, 3).expect("DKG ceremony failed");
     let (pq_sk, pq_vk) = test_pq_keypair();
     let ratchet_key = test_ratchet_key();
     let claims = future_claims(); // ratchet_epoch = 1
@@ -359,7 +359,7 @@ fn test_wrong_epoch_rejected() {
 
 #[test]
 fn test_token_with_pq_signature_verifies() {
-    let mut dkg = threshold::dkg(5, 3);
+    let mut dkg = threshold::dkg(5, 3).expect("DKG ceremony failed");
     let (pq_sk, pq_vk) = test_pq_keypair();
     let claims = future_claims();
 
@@ -374,7 +374,7 @@ fn test_token_with_pq_signature_verifies() {
 
 #[test]
 fn test_missing_pq_signature_rejected() {
-    let mut dkg = threshold::dkg(5, 3);
+    let mut dkg = threshold::dkg(5, 3).expect("DKG ceremony failed");
     let (pq_sk, pq_vk) = test_pq_keypair();
     let claims = future_claims();
 
@@ -399,7 +399,7 @@ fn test_wrong_pq_key_rejected() {
         .name("pq-key-test".into())
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
-            let mut dkg = threshold::dkg(5, 3);
+            let mut dkg = threshold::dkg(5, 3).expect("DKG ceremony failed");
             let (pq_sk, _pq_vk) = test_pq_keypair();
             let (_pq_sk2, pq_vk2) = test_pq_keypair();
             let claims = future_claims();
@@ -421,7 +421,7 @@ fn test_wrong_pq_key_rejected() {
 
 #[test]
 fn test_tampered_pq_signature_rejected() {
-    let mut dkg = threshold::dkg(5, 3);
+    let mut dkg = threshold::dkg(5, 3).expect("DKG ceremony failed");
     let (pq_sk, pq_vk) = test_pq_keypair();
     let claims = future_claims();
 
@@ -446,7 +446,7 @@ fn test_tier2_dpop_rejected_without_client_key_in_basic_verify() {
     // HARDENED: verify_token now rejects tokens with DPoP binding but no client key.
     // A DPoP-bound token MUST always be presented with its proof key to prevent
     // token theft. This is the corrected security posture.
-    let mut dkg = threshold::dkg(5, 3);
+    let mut dkg = threshold::dkg(5, 3).expect("DKG ceremony failed");
     let (pq_sk, pq_vk) = test_pq_keypair();
     let claims = future_claims_tier2();
     let token = build_signed_token_legacy(&mut dkg, claims, &pq_sk);
@@ -462,7 +462,7 @@ fn test_tier2_dpop_rejected_without_client_key_in_basic_verify() {
 
 #[test]
 fn test_tier2_dpop_rejects_with_wrong_client_key() {
-    let mut dkg = threshold::dkg(5, 3);
+    let mut dkg = threshold::dkg(5, 3).expect("DKG ceremony failed");
     let (pq_sk, pq_vk) = test_pq_keypair();
     let claims = future_claims_tier2();
     let token = build_signed_token_legacy(&mut dkg, claims, &pq_sk);
@@ -479,7 +479,7 @@ fn test_tier2_dpop_rejects_with_wrong_client_key() {
 
 #[test]
 fn test_tier2_dpop_mandatory_accepts_with_matching_key() {
-    let mut dkg = threshold::dkg(5, 3);
+    let mut dkg = threshold::dkg(5, 3).expect("DKG ceremony failed");
     let (pq_sk, pq_vk) = test_pq_keypair();
     let claims = future_claims_tier2();
     let token = build_signed_token_legacy(&mut dkg, claims, &pq_sk);
@@ -498,7 +498,7 @@ fn test_tier2_dpop_mandatory_accepts_with_matching_key() {
 fn test_tier3_dpop_mandatory_rejects_without_client_key() {
     // DPoP is now mandatory for ALL tiers including tier 3 (sensor).
     // MILNET_DPOP_EXEMPT_TIERS is deprecated and ignored.
-    let mut dkg = threshold::dkg(5, 3);
+    let mut dkg = threshold::dkg(5, 3).expect("DKG ceremony failed");
     let (pq_sk, pq_vk) = test_pq_keypair();
     let claims = future_claims(); // tier 3 with DPoP binding
     let token = build_signed_token_legacy(&mut dkg, claims, &pq_sk);
@@ -519,7 +519,7 @@ fn test_tier3_dpop_mandatory_rejects_without_client_key() {
 fn dpop_no_exemptions_for_any_tier() {
     // DPoP is mandatory for ALL tiers — no exemptions possible.
     // Build a tier 3 token with zero dpop_hash (no DPoP binding) — must be rejected.
-    let mut dkg = threshold::dkg(5, 3);
+    let mut dkg = threshold::dkg(5, 3).expect("DKG ceremony failed");
     let (pq_sk, pq_vk) = test_pq_keypair();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -582,7 +582,7 @@ fn classification_enforcement_denies_insufficient_level() {
     use common::classification::ClassificationLevel;
     use common::revocation::SharedRevocationList;
 
-    let mut dkg = threshold::dkg(5, 3);
+    let mut dkg = threshold::dkg(5, 3).expect("DKG ceremony failed");
     let (pq_sk, pq_vk) = test_pq_keypair();
 
     // Create a token with Unclassified classification (DPoP binding included)
@@ -611,7 +611,7 @@ fn classification_enforcement_grants_sufficient_level() {
     use common::classification::ClassificationLevel;
     use common::revocation::SharedRevocationList;
 
-    let mut dkg = threshold::dkg(5, 3);
+    let mut dkg = threshold::dkg(5, 3).expect("DKG ceremony failed");
     let (pq_sk, pq_vk) = test_pq_keypair();
 
     // Create a token with Secret classification (DPoP binding included)

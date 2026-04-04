@@ -265,7 +265,7 @@ fn ciphertext_bitflip_aes256gcm() {
 #[test]
 fn frost_3_of_5_signing_works() {
     run_with_large_stack(|| {
-        let mut dkg_result = crypto::threshold::dkg(5, 3);
+        let mut dkg_result = crypto::threshold::dkg(5, 3).expect("DKG ceremony failed");
         let msg = b"operational message";
 
         // 3-of-5 must succeed
@@ -288,7 +288,7 @@ fn frost_3_of_5_signing_works() {
 #[test]
 fn frost_2_of_5_signing_fails() {
     run_with_large_stack(|| {
-        let mut dkg_result = crypto::threshold::dkg(5, 3);
+        let mut dkg_result = crypto::threshold::dkg(5, 3).expect("DKG ceremony failed");
         let msg = b"operational message";
 
         // 2-of-5 must fail (below threshold)
@@ -306,7 +306,7 @@ fn frost_2_of_5_signing_fails() {
 #[test]
 fn frost_different_messages_different_signatures() {
     run_with_large_stack(|| {
-        let mut dkg_result = crypto::threshold::dkg(5, 3);
+        let mut dkg_result = crypto::threshold::dkg(5, 3).expect("DKG ceremony failed");
         let msg1 = b"message alpha";
         let msg2 = b"message bravo";
 
@@ -332,7 +332,7 @@ fn frost_different_messages_different_signatures() {
 #[test]
 fn frost_tampered_message_rejects() {
     run_with_large_stack(|| {
-        let mut dkg_result = crypto::threshold::dkg(5, 3);
+        let mut dkg_result = crypto::threshold::dkg(5, 3).expect("DKG ceremony failed");
         let msg = b"original message";
 
         let sig = crypto::threshold::threshold_sign(
@@ -361,7 +361,7 @@ fn frost_tampered_message_rejects() {
 #[test]
 fn frost_corrupted_share_produces_invalid_signature() {
     run_with_large_stack(|| {
-        let mut dkg_result = crypto::threshold::dkg(5, 3);
+        let mut dkg_result = crypto::threshold::dkg(5, 3).expect("DKG ceremony failed");
         let msg = b"share corruption test";
 
         // Sign successfully first to prove the shares work
@@ -375,7 +375,7 @@ fn frost_corrupted_share_produces_invalid_signature() {
         assert!(crypto::threshold::verify_group_signature(&dkg_result.group, msg, &good_sig));
 
         // Now generate a completely separate DKG to get a foreign share
-        let foreign_dkg = crypto::threshold::dkg(5, 3);
+        let foreign_dkg = crypto::threshold::dkg(5, 3).expect("DKG ceremony failed");
 
         // Replace share 0 with a foreign share from a different group
         dkg_result.shares[0] = foreign_dkg.shares.into_iter().next().unwrap();

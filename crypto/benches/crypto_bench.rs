@@ -108,7 +108,7 @@ fn bench_frost_3of5_sign(c: &mut Criterion) {
         // We need fresh shares each iteration because threshold_sign mutates nonce_counter
         b.iter_with_setup(
             || {
-                let r = crypto::threshold::dkg(5, 3);
+                let r = crypto::threshold::dkg(5, 3).expect("DKG ceremony failed");
                 (r.shares, r.group)
             },
             |(mut shares, group)| {
@@ -125,7 +125,7 @@ fn bench_frost_3of5_sign(c: &mut Criterion) {
     });
 
     // Also benchmark verification
-    let mut setup_result = crypto::threshold::dkg(5, 3);
+    let mut setup_result = crypto::threshold::dkg(5, 3).expect("DKG ceremony failed");
     let sig = crypto::threshold::threshold_sign(
         &mut setup_result.shares,
         &setup_result.group,

@@ -100,7 +100,7 @@ async fn main() {
             tracing::warn!(
                 "MILNET_GROUP_VERIFYING_KEY not set; generating ephemeral test key (NOT for production)"
             );
-            let dkg = crypto::threshold::dkg(5, 3);
+            let dkg = crypto::threshold::dkg(5, 3).expect("DKG ceremony failed");
             dkg.group.public_key_package
         }
     };

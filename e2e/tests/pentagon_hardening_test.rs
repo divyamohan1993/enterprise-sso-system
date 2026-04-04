@@ -331,7 +331,7 @@ fn pseudonym_str_domain_separation() {
 
 #[test]
 fn frost_3_of_5_requires_minimum_3_shares() {
-    let result = crypto::threshold::dkg(5, 3);
+    let result = crypto::threshold::dkg(5, 3).expect("DKG ceremony failed");
     let mut shares = result.shares;
 
     let sig = crypto::threshold::threshold_sign(&mut shares[..3], &result.group, b"test", 3);
@@ -346,7 +346,7 @@ fn frost_3_of_5_requires_minimum_3_shares() {
 
 #[test]
 fn frost_2_of_5_insufficient_shares_fails() {
-    let result = crypto::threshold::dkg(5, 3);
+    let result = crypto::threshold::dkg(5, 3).expect("DKG ceremony failed");
     let mut shares = result.shares;
 
     let sig = crypto::threshold::threshold_sign(&mut shares[..2], &result.group, b"test", 3);
@@ -355,7 +355,7 @@ fn frost_2_of_5_insufficient_shares_fails() {
 
 #[test]
 fn frost_threshold_signature_verifies_against_group_key() {
-    let result = crypto::threshold::dkg(5, 3);
+    let result = crypto::threshold::dkg(5, 3).expect("DKG ceremony failed");
     let mut shares = result.shares;
 
     let sig = crypto::threshold::threshold_sign(&mut shares[..3], &result.group, b"pentagon-clearance", 3).unwrap();

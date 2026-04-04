@@ -375,7 +375,7 @@ fn kat_frost_ristretto255() -> Result<(), String> {
     use crate::threshold;
 
     // Generate a 2-of-3 threshold group
-    let mut dkg_result = threshold::dkg(3, 2);
+    let mut dkg_result = threshold::dkg(3, 2)?;
 
     if dkg_result.shares.len() != 3 {
         return Err(format!(

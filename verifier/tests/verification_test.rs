@@ -79,7 +79,7 @@ fn future_claims() -> TokenClaims {
 
 #[test]
 fn expired_token_rejected() {
-    let mut dkg = threshold::dkg(5, 3);
+    let mut dkg = threshold::dkg(5, 3).expect("DKG ceremony failed");
     let (pq_sk, pq_vk) = test_pq_keypair();
     let now = now_us();
 
@@ -111,8 +111,8 @@ fn expired_token_rejected() {
 
 #[test]
 fn wrong_signing_key_rejected() {
-    let mut dkg1 = threshold::dkg(5, 3);
-    let dkg2 = threshold::dkg(5, 3);
+    let mut dkg1 = threshold::dkg(5, 3).expect("DKG ceremony failed");
+    let dkg2 = threshold::dkg(5, 3).expect("DKG ceremony failed");
     let (pq_sk, pq_vk) = test_pq_keypair();
     let claims = future_claims();
 
@@ -135,7 +135,7 @@ fn wrong_signing_key_rejected() {
 
 #[test]
 fn modified_claims_rejected() {
-    let mut dkg = threshold::dkg(5, 3);
+    let mut dkg = threshold::dkg(5, 3).expect("DKG ceremony failed");
     let (pq_sk, pq_vk) = test_pq_keypair();
     let claims = future_claims();
 
@@ -158,7 +158,7 @@ fn modified_claims_rejected() {
 
 #[test]
 fn modified_sub_rejected() {
-    let mut dkg = threshold::dkg(5, 3);
+    let mut dkg = threshold::dkg(5, 3).expect("DKG ceremony failed");
     let (pq_sk, pq_vk) = test_pq_keypair();
     let claims = future_claims();
 
@@ -176,7 +176,7 @@ fn modified_sub_rejected() {
 
 #[test]
 fn modified_tier_rejected() {
-    let mut dkg = threshold::dkg(5, 3);
+    let mut dkg = threshold::dkg(5, 3).expect("DKG ceremony failed");
     let (pq_sk, pq_vk) = test_pq_keypair();
     let claims = future_claims();
 
@@ -196,7 +196,7 @@ fn modified_tier_rejected() {
 
 #[test]
 fn future_iat_rejected() {
-    let mut dkg = threshold::dkg(5, 3);
+    let mut dkg = threshold::dkg(5, 3).expect("DKG ceremony failed");
     let (pq_sk, pq_vk) = test_pq_keypair();
     let now = now_us();
 
@@ -234,7 +234,7 @@ fn future_iat_rejected() {
 
 #[test]
 fn concurrent_token_verification_thread_safe() {
-    let mut dkg = threshold::dkg(5, 3);
+    let mut dkg = threshold::dkg(5, 3).expect("DKG ceremony failed");
     let (pq_sk, pq_vk) = test_pq_keypair();
     let pkp = dkg.group.public_key_package.clone();
     let claims = future_claims();
@@ -270,7 +270,7 @@ fn concurrent_token_verification_thread_safe() {
 
 #[test]
 fn token_verification_is_stateless() {
-    let mut dkg = threshold::dkg(5, 3);
+    let mut dkg = threshold::dkg(5, 3).expect("DKG ceremony failed");
     let (pq_sk, pq_vk) = test_pq_keypair();
     let claims = future_claims();
     let token = build_signed_token(&mut dkg, claims, &pq_sk);
