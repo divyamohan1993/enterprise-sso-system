@@ -116,7 +116,8 @@ fn xwing_enclave_tampered_ciphertext_produces_different_key() {
 
     // Tamper with the ciphertext
     let mut ct_bytes = ciphertext.to_bytes();
-    ct_bytes[ct_bytes.len() / 2] ^= 0xFF;
+    let mid = ct_bytes.len() / 2;
+    ct_bytes[mid] ^= 0xFF;
     let tampered_ct = crypto::xwing::Ciphertext::from_bytes(&ct_bytes)
         .expect("ciphertext reconstruction");
 

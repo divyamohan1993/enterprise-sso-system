@@ -72,7 +72,8 @@ fn pq_vrf_tampered_proof_fails_verification() {
 
         // Flip a bit in the proof
         if !proof.is_empty() {
-            proof[proof.len() / 2] ^= 0x01;
+            let mid = proof.len() / 2;
+            proof[mid] ^= 0x01;
         }
 
         assert!(
