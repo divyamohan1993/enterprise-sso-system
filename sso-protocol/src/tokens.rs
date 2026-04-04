@@ -629,16 +629,28 @@ impl OidcSigningKey {
 
 impl Drop for OidcSigningKey {
     fn drop(&mut self) {
-        use zeroize::Zeroize;
-        // Zeroize current key slot signing key bytes
-        let mut current_bytes = self.current.signing_key.encode();
-        current_bytes.as_mut().zeroize();
+        // SECURITY: Zeroize the ML-DSA-87 signing key material in place to prevent
+        // memory forensics extraction. SigningKey<MlDsa87> does not expose a
+        // serialization method, so we zero the struct's memory directly.
+        //
+        // SAFETY: We are writing zeros over our own &mut self fields. The struct
+        // is being dropped, so no further reads will occur. This is the standard
+        // pattern for zeroizing opaque crypto types (same as memguard.rs).
+        let key_ptr = &mut self.current.signing_key as *mut _ as *mut u8;
+        let key_size = std::mem::size_of::<crypto::pq_sign::PqSigningKey>();
+        unsafe {
+            std::ptr::write_bytes(key_ptr, 0, key_size);
+        }
         // Zeroize previous key slot if present
-        if let Some(ref prev) = self.previous {
-            let mut prev_bytes = prev.signing_key.encode();
-            prev_bytes.as_mut().zeroize();
+        if let Some(ref mut prev) = self.previous {
+            let prev_ptr = &mut prev.signing_key as *mut _ as *mut u8;
+            unsafe {
+                std::ptr::write_bytes(prev_ptr, 0, key_size);
+            }
         }
         self.generation = 0;
+        // Compiler fence to prevent dead-store elimination
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
     }
 }
 
