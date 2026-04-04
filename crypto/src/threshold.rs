@@ -33,11 +33,17 @@ impl SignerShare {
     /// Use when transferring ownership to a `SignerNode` or other secure container
     /// that will handle its own zeroization.
     pub fn into_parts(self) -> (Identifier, KeyPackage) {
-        let id = self.identifier;
-        let kp = self.key_package;
-        // Skip the Drop impl since we're transferring ownership, not discarding
-        std::mem::forget(self);
-        (id, kp)
+        // SAFETY: We wrap self in ManuallyDrop to prevent the Drop impl from
+        // running, then use ptr::read to move fields out. This is the standard
+        // pattern for consuming a Drop type's fields.
+        let mut md = std::mem::ManuallyDrop::new(self);
+        unsafe {
+            let id = std::ptr::read(&md.identifier);
+            let kp = std::ptr::read(&md.key_package);
+            // Zero the nonce counter field (primitive, no drop needed)
+            md.nonce_counter = std::sync::atomic::AtomicU64::new(0);
+            (id, kp)
+        }
     }
 }
 
