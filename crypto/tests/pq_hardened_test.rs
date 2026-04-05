@@ -387,7 +387,7 @@ fn signature_algorithm_tag_dispatch() {
     run_with_large_stack(|| {
         let (sk, vk) = generate_pq_keypair();
         let data = b"agility dispatch test";
-        let tagged_sig = pq_sign_tagged(&sk, data);
+        let tagged_sig = pq_sign_tagged(&sk, data).expect("ML-DSA-87 signing should succeed");
         assert_eq!(
             tagged_sig[0], 0x01,
             "default tagged signature must use ML-DSA-87 tag (0x01)"

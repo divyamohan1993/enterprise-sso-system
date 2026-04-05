@@ -63,6 +63,10 @@ fuzz_target!(|input: FuzzBftInput| {
             classification: fuzz_entry.classification,
             correlation_id: None,
             trace_id: None, // Option<String>
+            source_ip: None,
+            session_id: None,
+            request_id: None,
+            user_agent: None,
         };
 
         let _ = node.accept_entry(&entry, epoch as u64);

@@ -1046,6 +1046,10 @@ mod audit_immutability {
                 classification: 0,
                 correlation_id: None,
                 trace_id: None,
+                source_ip: None,
+                session_id: None,
+                request_id: None,
+                user_agent: None,
             };
             entries.insert(5, forged);
 

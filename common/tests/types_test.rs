@@ -93,6 +93,10 @@ fn audit_entry_round_trip() {
         classification: 0,
         correlation_id: None,
         trace_id: None,
+        source_ip: None,
+        session_id: None,
+        request_id: None,
+        user_agent: None,
     };
     let bytes = postcard::to_allocvec(&entry).expect("serialize audit entry");
     let decoded: AuditEntry = postcard::from_bytes(&bytes).expect("deserialize audit entry");
@@ -171,6 +175,10 @@ fn audit_entry_classification_default() {
         classification: 0,
         correlation_id: None,
         trace_id: None,
+        source_ip: None,
+        session_id: None,
+        request_id: None,
+        user_agent: None,
     };
     assert_eq!(entry.classification, 0);
 }

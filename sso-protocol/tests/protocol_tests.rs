@@ -168,7 +168,7 @@ fn test_client_registration() {
     assert_eq!(found.unwrap().name, "Test App");
 
     // Validation with correct secret should work
-    let validated = registry.validate(&client.client_id, &client.plaintext_secret);
+    let validated = registry.validate(&client.client_id, &*client.plaintext_secret);
     assert!(validated.is_some());
 
     // Validation with wrong secret should fail
@@ -296,14 +296,14 @@ fn test_client_registration_produces_unique_ids() {
     let c1 = registry.register("App A", vec!["https://a.com/cb".into()]).unwrap();
     let c2 = registry.register("App B", vec!["https://b.com/cb".into()]).unwrap();
     assert_ne!(c1.client_id, c2.client_id);
-    assert_ne!(c1.plaintext_secret, c2.plaintext_secret);
+    assert_ne!(*c1.plaintext_secret, *c2.plaintext_secret);
 }
 
 #[test]
 fn test_client_validation_rejects_wrong_secret() {
     let mut registry = sso_protocol::clients::ClientRegistry::new();
     let client = registry.register("Secure App", vec!["https://s.com/cb".into()]).unwrap();
-    assert!(registry.validate(&client.client_id, &client.plaintext_secret).is_some());
+    assert!(registry.validate(&client.client_id, &*client.plaintext_secret).is_some());
     assert!(registry.validate(&client.client_id, "totally-wrong-secret").is_none());
 }
 

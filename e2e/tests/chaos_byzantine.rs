@@ -145,6 +145,10 @@ fn test_audit_hash_chain_tamper_detected() {
                 classification: 0,
                 correlation_id: None,
                 trace_id: None,
+                source_ip: None,
+                session_id: None,
+                request_id: None,
+                user_agent: None,
             };
             prev = hash_entry(&entry);
             entries.push(entry);

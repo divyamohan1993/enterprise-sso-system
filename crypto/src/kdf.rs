@@ -106,22 +106,23 @@ pub fn active_ksf_id() -> &'static str {
 ///
 /// Automatically selects [`Pbkdf2Sha512Ksf`] in FIPS mode or
 /// [`Argon2idKsf`] otherwise.
-pub fn stretch_password(password: &[u8], salt: &[u8]) -> Result<Vec<u8>, String> {
-    if common::fips::is_fips_mode() {
-        Pbkdf2Sha512Ksf.stretch(password, salt)
+pub fn stretch_password(password: &[u8], salt: &[u8]) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+    let output = if common::fips::is_fips_mode() {
+        Pbkdf2Sha512Ksf.stretch(password, salt)?
     } else {
-        Argon2idKsf.stretch(password, salt)
-    }
+        Argon2idKsf.stretch(password, salt)?
+    };
+    Ok(zeroize::Zeroizing::new(output))
 }
 
 /// Stretch a password using a specific KSF identified by `algorithm_id`.
 ///
 /// Recognised values: `"argon2id-v19"`, `"pbkdf2-sha512"`.
 /// Returns `Err` for any unknown identifier.
-pub fn stretch_with(algorithm_id: &str, password: &[u8], salt: &[u8]) -> Result<Vec<u8>, String> {
+pub fn stretch_with(algorithm_id: &str, password: &[u8], salt: &[u8]) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
     match algorithm_id {
-        "argon2id-v19" => Argon2idKsf.stretch(password, salt),
-        "pbkdf2-sha512" => Pbkdf2Sha512Ksf.stretch(password, salt),
+        "argon2id-v19" => Argon2idKsf.stretch(password, salt).map(zeroize::Zeroizing::new),
+        "pbkdf2-sha512" => Pbkdf2Sha512Ksf.stretch(password, salt).map(zeroize::Zeroizing::new),
         other => Err(format!("unknown KSF algorithm: {other}")),
     }
 }

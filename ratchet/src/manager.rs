@@ -98,6 +98,9 @@ impl SessionManager {
         }
     }
 
+    /// Maximum number of concurrent ratchet sessions.
+    const MAX_SESSIONS: usize = 100_000;
+
     /// Create a new session and return its initial epoch (always 0).
     pub fn create_session(&self, session_id: Uuid, master_secret: &[u8; 64]) -> Result<u64, String> {
         let chain = RatchetChain::new(master_secret)?;
@@ -109,6 +112,12 @@ impl SessionManager {
                 poisoned.into_inner()
             }
         };
+        if sessions.len() >= Self::MAX_SESSIONS && !sessions.contains_key(&session_id) {
+            return Err(format!(
+                "MAX_SESSIONS ({}) reached — cannot create new ratchet session",
+                Self::MAX_SESSIONS
+            ));
+        }
         sessions.insert(session_id, chain);
         Ok(epoch)
     }
@@ -453,10 +462,7 @@ pub fn decrypt_epoch_metadata(
 }
 
 fn now_us() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as i64
+    common::secure_time::secure_now_us_i64()
 }
 
 /// Result of a replication health check.

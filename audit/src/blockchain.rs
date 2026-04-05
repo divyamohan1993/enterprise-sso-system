@@ -19,10 +19,7 @@ use zeroize::Zeroize;
 // ── Helper: get current unix timestamp in seconds ──────────────────────────
 
 fn now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    common::secure_time::secure_now_secs_i64()
 }
 
 // ── Block and attestation types ────────────────────────────────────────────
@@ -575,6 +572,10 @@ mod tests {
             classification: 0,
             correlation_id: None,
             trace_id: None,
+            source_ip: None,
+            session_id: None,
+            request_id: None,
+            user_agent: None,
         }
     }
 

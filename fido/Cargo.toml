@@ -18,4 +18,5 @@ p256 = { version = "0.13", features = ["ecdsa"] }
 signature = "2"
 
 [features]
+default = ["production"]
 production = ["common/production"]

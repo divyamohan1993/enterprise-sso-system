@@ -202,7 +202,7 @@ pub struct DeliveryRecord {
 // ── Webhook Configuration ───────────────────────────────────────────────────
 
 /// A registered webhook endpoint.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct WebhookConfig {
     /// Unique webhook ID.
     pub id: String,
@@ -229,6 +229,25 @@ pub struct WebhookConfig {
     pub updated_at: i64,
     /// Description.
     pub description: Option<String>,
+}
+
+/// SECURITY: Redact HMAC secret from Debug output.
+impl std::fmt::Debug for WebhookConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebhookConfig")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("url", &self.url)
+            .field("secret", &"[REDACTED]")
+            .field("event_filters", &self.event_filters)
+            .field("event_type_filters", &self.event_type_filters)
+            .field("active", &self.active)
+            .field("rate_limit_per_minute", &self.rate_limit_per_minute)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .field("description", &self.description)
+            .finish()
+    }
 }
 
 impl WebhookConfig {

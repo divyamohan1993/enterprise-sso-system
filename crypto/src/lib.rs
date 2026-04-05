@@ -17,6 +17,7 @@
 
 pub mod ct;
 pub mod dpop;
+pub mod drbg;
 pub mod entropy;
 pub mod receipts;
 pub mod threshold;

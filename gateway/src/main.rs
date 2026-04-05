@@ -130,6 +130,11 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
 async fn main() {
     tracing_subscriber::fmt::init();
 
+    // Anchor monotonic time before any crypto/auth operations.
+    // All secure_now_us()/secure_now_secs() calls use this anchor,
+    // making them immune to clock manipulation after process start.
+    common::secure_time::init_time_anchor();
+
     // Platform integrity: vTPM check, process hardening, self-attestation, monitor
     let (_platform_report, _monitor_handle, _monitor) =
         common::startup_checks::run_platform_checks(crypto::memguard::harden_process);

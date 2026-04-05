@@ -30,4 +30,5 @@ libc.workspace = true
 serial_test.workspace = true
 
 [features]
+default = ["production"]
 production = ["common/production"]

@@ -236,6 +236,16 @@ impl SessionRecorder {
         );
         crate::siem::SecurityEvent::session_created(&session_id.to_string(), "0.0.0.0");
 
+        // Bound active recordings to prevent memory exhaustion
+        const MAX_ACTIVE_RECORDINGS: usize = 10_000;
+        if map.len() >= MAX_ACTIVE_RECORDINGS {
+            tracing::error!(
+                "PAM: MAX_ACTIVE_RECORDINGS ({}) reached — rejecting new recording",
+                MAX_ACTIVE_RECORDINGS
+            );
+            return Err(RecordingError::SessionExpired(session_id));
+        }
+
         map.insert(session_id, recording);
         Ok(())
     }
@@ -254,6 +264,17 @@ impl SessionRecorder {
         let recording = map
             .get_mut(&session_id)
             .ok_or(RecordingError::NotFound(session_id))?;
+
+        // Bound events per session to prevent memory exhaustion
+        const MAX_EVENTS_PER_SESSION: usize = 100_000;
+        if recording.events.len() >= MAX_EVENTS_PER_SESSION {
+            tracing::error!(
+                session_id = %session_id,
+                "PAM: MAX_EVENTS_PER_SESSION ({}) reached — rejecting event",
+                MAX_EVENTS_PER_SESSION
+            );
+            return Err(RecordingError::SessionExpired(session_id));
+        }
 
         if recording.end_time.is_some() {
             return Err(RecordingError::AlreadyFinalized(session_id));

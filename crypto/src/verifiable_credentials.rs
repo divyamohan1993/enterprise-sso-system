@@ -11,14 +11,18 @@
 //! # Security Model
 //!
 //! All credentials are signed with ML-DSA-87 to provide quantum-resistant
-//! authenticity. Selective disclosure uses HMAC-SHA256 salted hashing so
+//! authenticity. Selective disclosure uses SHA-512 salted hashing so
 //! individual claims can be revealed without exposing the full credential.
 //! Revocation uses a compressed bitstring (StatusList2021) to enable
 //! privacy-preserving status checks.
+//!
+//! # CNSA 2.0
+//!
+//! All hash operations use SHA-512 for CNSA 2.0 compliance.
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha512};
 use std::collections::BTreeMap;
 
 // ---------------------------------------------------------------------------
@@ -192,10 +196,10 @@ impl VerifiableCredential {
     }
 
     /// Compute the canonical hash of this credential (excluding the proof).
-    /// This is the message that gets signed.
-    pub fn canonical_hash(&self) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        hasher.update(b"MILNET-VC-HASH-v1");
+    /// This is the message that gets signed. Uses SHA-512 for CNSA 2.0 compliance.
+    pub fn canonical_hash(&self) -> [u8; 64] {
+        let mut hasher = Sha512::new();
+        hasher.update(b"MILNET-VC-HASH-v2");
 
         // Hash the contexts
         for ctx in &self.contexts {
@@ -228,7 +232,7 @@ impl VerifiableCredential {
         }
 
         let result = hasher.finalize();
-        let mut hash = [0u8; 32];
+        let mut hash = [0u8; 64];
         hash.copy_from_slice(&result);
         hash
     }
@@ -314,8 +318,8 @@ pub fn verify_credential(
 /// reveal by providing the salt + value (disclosure).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SdClaim {
-    /// SHA-256 hash of (salt || claim_name || claim_value).
-    pub digest: [u8; 32],
+    /// SHA-512 hash of (salt || claim_name || claim_value). CNSA 2.0 compliant.
+    pub digest: [u8; 64],
     /// Claim name (always visible to the holder).
     pub claim_name: String,
 }
@@ -333,7 +337,7 @@ pub struct Disclosure {
 
 impl Disclosure {
     /// Compute the digest for this disclosure.
-    pub fn digest(&self) -> [u8; 32] {
+    pub fn digest(&self) -> [u8; 64] {
         compute_sd_digest(&self.salt, &self.claim_name, &self.claim_value)
     }
 
@@ -344,15 +348,16 @@ impl Disclosure {
     }
 }
 
-/// Compute the SD-JWT style digest: SHA-256(salt || claim_name || claim_value).
-fn compute_sd_digest(salt: &[u8; 16], name: &str, value: &str) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(b"MILNET-SD-JWT-v1");
+/// Compute the SD-JWT style digest: SHA-512(salt || claim_name || claim_value).
+/// Upgraded to SHA-512 for CNSA 2.0 compliance.
+fn compute_sd_digest(salt: &[u8; 16], name: &str, value: &str) -> [u8; 64] {
+    let mut hasher = Sha512::new();
+    hasher.update(b"MILNET-SD-JWT-v2");
     hasher.update(salt);
     hasher.update(name.as_bytes());
     hasher.update(value.as_bytes());
     let result = hasher.finalize();
-    let mut digest = [0u8; 32];
+    let mut digest = [0u8; 64];
     digest.copy_from_slice(&result);
     digest
 }

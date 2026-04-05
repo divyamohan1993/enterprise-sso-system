@@ -288,6 +288,10 @@ fn test_verify_consistency_detects_divergence() {
         classification: CLASSIFICATION_UNCLASSIFIED,
         correlation_id: None,
         trace_id: None,
+        source_ip: None,
+        session_id: None,
+        request_id: None,
+        user_agent: None,
     };
     // Force-append the rogue entry to node 1's log
     cluster.nodes[1]

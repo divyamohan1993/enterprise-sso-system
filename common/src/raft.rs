@@ -856,6 +856,10 @@ impl RaftState {
         while self.last_applied < self.commit_index {
             self.last_applied = LogIndex(self.last_applied.0 + 1);
             if let Some(entry) = self.log_entry_at(self.last_applied) {
+                // Clear pending_config_change when a membership change entry is committed.
+                if matches!(entry.command, ClusterCommand::MemberJoin { .. } | ClusterCommand::MemberLeave { .. }) {
+                    self.pending_config_change = false;
+                }
                 entries.push(entry.clone());
             }
         }

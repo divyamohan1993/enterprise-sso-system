@@ -473,9 +473,7 @@ fn reject_standalone_in_production(peers: &[PeerConfig]) -> Result<(), String> {
     if !peers.is_empty() {
         return Ok(());
     }
-    let is_production = std::env::var("MILNET_PRODUCTION")
-        .map(|v| v == "1")
-        .unwrap_or(false);
+    let is_production = crate::sealed_keys::is_production();
     let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
         .map(|v| v == "1")
         .unwrap_or(false);
@@ -780,6 +778,9 @@ fn raft_encrypt_enabled() -> bool {
 ///
 /// Embeds a Raft state machine and manages background tasks for network
 /// transport, periodic ticking, and state application.
+///
+/// LOCK ORDERING: Always acquire `raft` before `state` to prevent deadlock.
+/// All code paths that need both locks MUST follow this order.
 pub struct ClusterNode {
     raft: Arc<Mutex<RaftState>>,
     state: Arc<RwLock<ClusterState>>,

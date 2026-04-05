@@ -14,6 +14,9 @@ use verifier::{
 async fn main() {
     tracing_subscriber::fmt::init();
 
+    // Anchor monotonic time before any crypto/auth operations.
+    common::secure_time::init_time_anchor();
+
     // Platform integrity: vTPM check, process hardening, self-attestation, monitor
     let (_platform_report, _monitor_handle, _monitor) =
         common::startup_checks::run_platform_checks(crypto::memguard::harden_process);

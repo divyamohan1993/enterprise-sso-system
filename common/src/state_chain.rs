@@ -175,10 +175,7 @@ fn witness_message(entry_hash: &[u8; 64], witness_node_id: &str) -> [u8; 64] {
 }
 
 fn now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    crate::secure_time::secure_now_secs_i64()
 }
 
 /// Sign raw bytes with ML-DSA-87, returning the encoded signature.

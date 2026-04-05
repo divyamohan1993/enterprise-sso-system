@@ -517,6 +517,10 @@ impl BftAuditCluster {
                 classification,
                 correlation_id: None,
                 trace_id: None,
+                source_ip: None,
+                session_id: None,
+                request_id: None,
+                user_agent: None,
             };
 
             if let Some(ref key) = self.pq_signing_key {

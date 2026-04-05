@@ -183,8 +183,15 @@ impl AuditLog {
             prev_hash: self.last_hash,
             signature: Vec::new(),
             classification: 0,
+            // FIXME(H12): correlation_id and trace_id should be populated by callers
+            // (gateway/orchestrator) from the request context to enable end-to-end
+            // distributed tracing across the authentication pipeline.
             correlation_id: None,
             trace_id: None,
+            source_ip: None,
+            session_id: None,
+            request_id: None,
+            user_agent: None,
         };
         let hash = hash_entry(&entry);
         entry.signature = crypto::pq_sign::pq_sign_raw(signing_key, &hash);
@@ -295,8 +302,15 @@ impl AuditLog {
             prev_hash: self.last_hash,
             signature: Vec::new(),
             classification: 0,
+            // FIXME(H12): correlation_id and trace_id should be populated by callers
+            // (gateway/orchestrator) from the request context to enable end-to-end
+            // distributed tracing across the authentication pipeline.
             correlation_id: None,
             trace_id: None,
+            source_ip: None,
+            session_id: None,
+            request_id: None,
+            user_agent: None,
         };
         let hash = hash_entry(&entry);
         entry.signature = crypto::pq_sign::pq_sign_raw(signing_key, &hash);
@@ -738,21 +752,9 @@ pub fn hash_entry(entry: &AuditEntry) -> [u8; 64] {
 }
 
 fn now_us() -> i64 {
-    // SECURITY: Use monotonic time as primary source to prevent clock manipulation.
-    // Monotonic time is immune to NTP jumps and manual clock changes.
-    // Falls back to authenticated time, then system clock only in dev mode.
-    let monotonic = common::secure_time::monotonic_now_us();
-    if monotonic > 0 {
-        return monotonic;
-    }
-    if let Some(auth_us) = common::secure_time::authenticated_now_us() {
-        return auth_us;
-    }
-    tracing::error!("SECURITY: no trusted time source available in production — using system clock with warning");
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as i64
+    // SECURITY: Use monotonic-anchored time. Immune to clock manipulation
+    // after process start (NTP jumps, clock_settime, date -s).
+    common::secure_time::secure_now_us_i64()
 }
 
 /// Encrypt archive data with AES-256-GCM and write to the given path.
@@ -835,6 +837,10 @@ mod tests {
                 classification: 0,
                 correlation_id: None,
                 trace_id: None,
+                source_ip: None,
+                session_id: None,
+                request_id: None,
+                user_agent: None,
             };
             let hash = hash_entry(&entry);
             entry.signature = crypto::pq_sign::pq_sign_raw(signing_key, &hash);

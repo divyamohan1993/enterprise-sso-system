@@ -150,10 +150,8 @@ pub fn verify_dpop_proof(
     expected_key_hash: &[u8; 64],
 ) -> bool {
     // 0. Timestamp freshness check — reject stale or future-dated proofs
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock before UNIX epoch")
-        .as_secs() as i64;
+    // Uses monotonic-anchored secure time, immune to clock manipulation.
+    let now = common::secure_time::secure_now_secs_i64();
     if (now - timestamp).abs() > DPOP_MAX_AGE_SECS {
         return false;
     }

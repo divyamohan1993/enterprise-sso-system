@@ -13,6 +13,9 @@
 *.swo
 *~
 
+# Claude Files
+.claude/
+
 # OS
 .DS_Store
 Thumbs.db

@@ -376,6 +376,19 @@ pub struct AuditEntry {
     /// Distributed trace ID for observability integration (OpenTelemetry compatible).
     #[serde(default)]
     pub trace_id: Option<String>,
+    /// Source IP address of the request that triggered this audit event.
+    /// Populated by the gateway/orchestrator from the inbound connection.
+    #[serde(default)]
+    pub source_ip: Option<String>,
+    /// Session ID associated with the authentication ceremony.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Unique request ID for tracing individual requests through the pipeline.
+    #[serde(default)]
+    pub request_id: Option<String>,
+    /// User-Agent header from the originating HTTP request.
+    #[serde(default)]
+    pub user_agent: Option<String>,
 }
 
 /// Custom Debug for AuditEntry — redacts cryptographic material.
@@ -394,6 +407,10 @@ impl std::fmt::Debug for AuditEntry {
             .field("classification", &self.classification)
             .field("correlation_id", &self.correlation_id)
             .field("trace_id", &self.trace_id)
+            .field("source_ip", &self.source_ip)
+            .field("session_id", &self.session_id)
+            .field("request_id", &self.request_id)
+            .field("user_agent", &self.user_agent)
             .finish()
     }
 }

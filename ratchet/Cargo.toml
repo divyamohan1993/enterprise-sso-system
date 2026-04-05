@@ -26,6 +26,7 @@ libc.workspace = true
 subtle.workspace = true
 
 [features]
+default = ["production"]
 production = ["common/production"]
 
 [dev-dependencies]

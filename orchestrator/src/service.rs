@@ -420,8 +420,8 @@ impl OrchestratorService {
                 // Emit SIEM event for successful authentication
                 common::siem::SecurityEvent::auth_success(
                     {
-                        use sha2::{Digest, Sha256};
-                        let hash = Sha256::digest(request.username.as_bytes());
+                        use sha2::{Digest, Sha512};
+                        let hash = Sha512::digest(request.username.as_bytes());
                         let mut bytes = [0u8; 16];
                         bytes.copy_from_slice(&hash[..16]);
                         bytes[6] = (bytes[6] & 0x0f) | 0x40;
@@ -440,8 +440,8 @@ impl OrchestratorService {
                 // Record the failed attempt in the server-side counter.
                 // Derive deterministic user ID from username for rate limiting
                 let user_id = {
-                    use sha2::{Digest, Sha256};
-                    let hash = Sha256::digest(request.username.as_bytes());
+                    use sha2::{Digest, Sha512};
+                    let hash = Sha512::digest(request.username.as_bytes());
                     let mut bytes = [0u8; 16];
                     bytes.copy_from_slice(&hash[..16]);
                     bytes[6] = (bytes[6] & 0x0f) | 0x40;
@@ -476,8 +476,8 @@ impl OrchestratorService {
 
         // Account lockout check: reject if user has exceeded max failed attempts
         {
-            use sha2::{Digest, Sha256};
-            let hash = Sha256::digest(request.username.as_bytes());
+            use sha2::{Digest, Sha512};
+            let hash = Sha512::digest(request.username.as_bytes());
             let mut bytes = [0u8; 16];
             bytes.copy_from_slice(&hash[..16]);
             bytes[6] = (bytes[6] & 0x0f) | 0x40;

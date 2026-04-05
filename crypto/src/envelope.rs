@@ -176,8 +176,11 @@ impl SealedData {
     }
 
     /// The 12-byte nonce that was used for this encryption.
+    ///
+    /// Wire format: algo_id(1) || nonce(NONCE_LEN) || ciphertext || tag.
+    /// Skip the algorithm ID byte to get the actual nonce.
     pub fn nonce(&self) -> &[u8] {
-        &self.bytes[..NONCE_LEN]
+        &self.bytes[1..1 + NONCE_LEN]
     }
 }
 
@@ -538,8 +541,8 @@ mod tests {
 
         let nonce = sealed.nonce();
         assert_eq!(nonce.len(), NONCE_LEN);
-        // The nonce should match the first 12 bytes of the raw output.
-        assert_eq!(nonce, &sealed.to_bytes()[..NONCE_LEN]);
+        // The nonce should match bytes 1..13 of the raw output (after algo_id byte).
+        assert_eq!(nonce, &sealed.to_bytes()[1..1 + NONCE_LEN]);
     }
 
     #[test]

@@ -24,4 +24,5 @@ aes-gcm.workspace = true
 hkdf.workspace = true
 
 [features]
+default = ["production"]
 production = ["common/production"]

@@ -30,6 +30,7 @@ zeroize = { version = "1", features = ["zeroize_derive"] }
 getrandom = "0.2"
 
 [features]
+default = ["production"]
 production = ["common/production"]
 
 [dev-dependencies]

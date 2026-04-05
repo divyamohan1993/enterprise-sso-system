@@ -128,11 +128,10 @@ impl ReceiptChain {
     ///
     /// This method always returns Err because structural validation without
     /// signature verification is unsafe. A signing key is required.
+    #[deprecated(note = "use validate_with_key() - this method always fails for safety")]
     pub fn validate(&self) -> Result<(), String> {
         Err(
-            "validate() without signing key is unsafe. \
-             Use validate_with_key(&signing_key) for security-critical validation."
-                .into(),
+            "validate() without signing key is unsafe — use validate_with_key()".into(),
         )
     }
 

@@ -87,11 +87,12 @@ impl NonceBloomFilter {
 
     /// Compute k independent bit positions for a nonce using SipHash-style
     /// double hashing: h(i) = (h1 + i * h2) mod m
+    /// Uses SHA-512 for CNSA 2.0 compliance.
     fn positions(nonce: &[u8; 32]) -> [usize; BLOOM_FILTER_K] {
-        use sha2::{Digest, Sha256};
+        use sha2::{Digest, Sha512};
 
-        // First hash: SHA-256 of nonce
-        let mut hasher = Sha256::new();
+        // First hash: SHA-512 of nonce
+        let mut hasher = Sha512::new();
         hasher.update(b"MILNET-BLOOM-H1");
         hasher.update(nonce);
         let h1_full = hasher.finalize();
@@ -99,8 +100,8 @@ impl NonceBloomFilter {
             .map_err(|_| ()).unwrap_or([0u8; 8]);
         let h1 = u64::from_le_bytes(h1_bytes) as usize;
 
-        // Second hash: SHA-256 of nonce with different domain
-        let mut hasher = Sha256::new();
+        // Second hash: SHA-512 of nonce with different domain
+        let mut hasher = Sha512::new();
         hasher.update(b"MILNET-BLOOM-H2");
         hasher.update(nonce);
         let h2_full = hasher.finalize();

@@ -21,6 +21,7 @@
 //! signature begins with a 1-byte algorithm tag so the verifier can
 //! dispatch to the correct algorithm without out-of-band negotiation.
 
+use common::error::MilnetError;
 use ml_dsa::{
     signature::{Signer, Verifier},
     EncodedSignature, EncodedVerifyingKey, KeyGen, MlDsa87, SigningKey, VerifyingKey,
@@ -250,7 +251,7 @@ pub fn active_pq_signature_algorithm() -> PqSignatureAlgorithm {
 /// algorithm identification before verification. The signature itself
 /// covers only the data (not the tag), preventing tag-stripping from
 /// producing a valid signature under a different algorithm.
-pub fn pq_sign_tagged(signing_key: &PqSigningKey, data: &[u8]) -> Vec<u8> {
+pub fn pq_sign_tagged(signing_key: &PqSigningKey, data: &[u8]) -> Result<Vec<u8>, MilnetError> {
     let algo = active_pq_signature_algorithm();
     let raw_sig = match algo {
         PqSignatureAlgorithm::MlDsa87 => {
@@ -259,29 +260,19 @@ pub fn pq_sign_tagged(signing_key: &PqSigningKey, data: &[u8]) -> Vec<u8> {
             sig.encode().to_vec()
         }
         PqSignatureAlgorithm::SlhDsaSha2256f => {
-            // SIEM:CRITICAL Ephemeral SLH-DSA keys in use -- key store not configured.
-            // Signatures created with ephemeral keys cannot be verified after this
-            // function returns because the signing key is discarded. Use
-            // pq_sign_tagged_with_slh_key() with a persistent key instead.
-            tracing::error!(
-                "SIEM:CRITICAL SLH-DSA-SHA2-256f pq_sign_tagged called without persistent key store. \
-                 Ephemeral signing key generated and discarded -- signatures will be UNVERIFIABLE. \
-                 Configure SLH-DSA key store or call pq_sign_tagged_with_slh_key() instead."
-            );
-            let (slh_sk, _slh_pk) = crate::slh_dsa::slh_dsa_keygen();
-            let slh_sig = crate::slh_dsa::slh_dsa_sign(&slh_sk, data);
-            let sig_bytes = slh_sig.as_bytes();
-            let mut tagged = Vec::with_capacity(1 + sig_bytes.len());
-            tagged.push(ALGO_TAG_SLH_DSA_SHA2_256F);
-            tagged.extend_from_slice(sig_bytes);
-            return tagged;
+            return Err(MilnetError::CryptoVerification(
+                "SLH-DSA-SHA2-256f requires a persistent key store. \
+                 Cannot sign with ephemeral keys - signatures would be unverifiable. \
+                 Use ML-DSA-87 or provide a persistent SLH-DSA signing key."
+                    .to_string(),
+            ));
         }
     };
 
     let mut tagged = Vec::with_capacity(1 + raw_sig.len());
     tagged.push(algo.tag());
     tagged.extend_from_slice(&raw_sig);
-    tagged
+    Ok(tagged)
 }
 
 /// Verify a self-describing tagged signature.
@@ -489,7 +480,7 @@ mod tests {
             let (sk, vk) = generate_pq_keypair();
             let data = b"tagged signature test data";
 
-            let tagged_sig = pq_sign_tagged(&sk, data);
+            let tagged_sig = pq_sign_tagged(&sk, data).expect("ML-DSA-87 signing should succeed");
             // First byte should be the algorithm tag
             assert_eq!(tagged_sig[0], ALGO_TAG_ML_DSA_87);
             // Verification should succeed
@@ -501,7 +492,7 @@ mod tests {
     fn test_tagged_verify_wrong_data_fails() {
         run_with_large_stack(|| {
             let (sk, vk) = generate_pq_keypair();
-            let tagged_sig = pq_sign_tagged(&sk, b"original data");
+            let tagged_sig = pq_sign_tagged(&sk, b"original data").expect("signing should succeed");
             assert!(!pq_verify_tagged(&vk, b"tampered data", &tagged_sig));
         });
     }
@@ -518,7 +509,7 @@ mod tests {
     fn test_tagged_verify_unknown_tag_fails() {
         run_with_large_stack(|| {
             let (sk, vk) = generate_pq_keypair();
-            let mut tagged_sig = pq_sign_tagged(&sk, b"data");
+            let mut tagged_sig = pq_sign_tagged(&sk, b"data").expect("signing should succeed");
             // Corrupt the tag byte
             tagged_sig[0] = 0xFF;
             assert!(!pq_verify_tagged(&vk, b"data", &tagged_sig));

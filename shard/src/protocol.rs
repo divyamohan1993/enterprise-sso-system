@@ -183,11 +183,9 @@ impl ShardProtocol {
     }
 
     /// Returns the current time in microseconds since the UNIX epoch.
+    /// Uses monotonic-anchored secure time, immune to clock manipulation.
     fn now_us() -> Result<i64, MilnetError> {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_micros() as i64)
-            .map_err(|e| MilnetError::Shard(format!("system clock error: {e}")))
+        Ok(common::secure_time::secure_now_us_i64())
     }
 
     /// Compute HMAC-SHA512 over the domain prefix and message fields (excluding the HMAC field).

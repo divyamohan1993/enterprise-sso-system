@@ -25,6 +25,7 @@ postcard = { version = "1", features = ["alloc"] }
 sha2 = "0.10"
 
 [features]
+default = ["production"]
 production = ["common/production"]
 
 [[bin]]

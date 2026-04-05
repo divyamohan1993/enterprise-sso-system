@@ -352,36 +352,21 @@ fn send_to_syslog(endpoint: &str, json_line: &str) {
 
 /// Send a log line over TCP+TLS syslog (RFC 5425 framing: octet-counted).
 ///
-/// Uses a thread-local TLS connection that is lazily established and reused.
-/// If the connection fails or drops, the log line is silently lost (best-effort).
-fn send_to_syslog_tls(endpoint: &str, json_line: &str) {
-    use std::io::Write;
-    use std::net::TcpStream;
-
-    thread_local! {
-        static TLS_CONN: std::cell::RefCell<Option<TcpStream>> =
-            const { std::cell::RefCell::new(None) };
-    }
-
-    TLS_CONN.with(|cell| {
-        let mut conn = cell.borrow_mut();
-        // Establish connection if not connected
-        if conn.is_none() {
-            if let Ok(stream) = TcpStream::connect(endpoint) {
-                let _ = stream.set_nonblocking(false);
-                let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(500)));
-                *conn = Some(stream);
-            }
-        }
-        // Send with octet-counted framing (RFC 5425): "LEN SP MSG"
-        if let Some(ref mut stream) = *conn {
-            let frame = format!("{} {}", json_line.len(), json_line);
-            if stream.write_all(frame.as_bytes()).is_err() {
-                // Connection dropped, clear so next call reconnects
-                *conn = None;
-            }
-        }
-    });
+/// SECURITY: This function refuses to send logs over plaintext TCP.
+/// The common crate does not include tokio-rustls, so proper TLS wrapping
+/// is not available here. Use MILNET_SIEM_WEBHOOK or SHARD transport for
+/// secure log shipping instead.
+fn send_to_syslog_tls(endpoint: &str, _json_line: &str) {
+    // Refuse to send logs over plaintext TCP. The previous implementation
+    // used std::net::TcpStream without any TLS wrapping, silently sending
+    // structured logs (containing correlation IDs, severity, timestamps)
+    // in the clear. This is unacceptable for DoD/MILNET deployment.
+    tracing::error!(
+        endpoint = endpoint,
+        "syslog TLS transport not yet implemented with rustls. \
+         Use MILNET_SIEM_WEBHOOK for secure log shipping. \
+         Refusing to send logs over plaintext TCP."
+    );
 }
 
 // ---------------------------------------------------------------------------

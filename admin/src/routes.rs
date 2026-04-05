@@ -477,7 +477,17 @@ fn required_role_for_route(path: &str, method: &Method) -> AdminRole {
         return AdminRole::Auditor;
     }
 
-    // Auth, OAuth, FIDO, setup, and public endpoints are handled by auth_middleware
+    // FIDO2 — regular authenticated users can manage their own credentials
+    if path == "/api/fido/register/begin"
+        || path == "/api/fido/register/complete"
+        || path == "/api/fido/credentials"
+        || path == "/api/fido/authenticate/begin"
+        || path == "/api/fido/authenticate/complete"
+    {
+        return AdminRole::ReadOnly;
+    }
+
+    // Auth, OAuth, setup, and public endpoints are handled by auth_middleware
     // before RBAC is checked (they are exempt from admin RBAC).
     // For everything else: fail-closed to SuperAdmin.
     AdminRole::SuperAdmin
@@ -1127,10 +1137,12 @@ fn extract_client_ip(request: &Request) -> String {
                 "X-Forwarded-For present but connection IP unavailable — ignoring header"
             );
         } else {
-            // No trusted proxies configured: legacy behaviour — accept header.
-            if let Some(client) = forwarded.split(',').next() {
-                return client.trim().to_string();
-            }
+            // Fail-closed: no trusted proxies configured, use direct connection IP.
+            // Do NOT trust X-Forwarded-For from unknown sources.
+            tracing::warn!(
+                x_forwarded_for = %forwarded,
+                "X-Forwarded-For present but no trusted proxies configured — ignoring header"
+            );
         }
     }
 
@@ -1735,7 +1747,7 @@ async fn security_headers_middleware(
     );
     headers.insert(
         axum::http::header::HeaderName::from_static("x-xss-protection"),
-        axum::http::HeaderValue::from_static("1; mode=block"),
+        axum::http::HeaderValue::from_static("0"),
     );
     headers.insert(
         axum::http::header::HeaderName::from_static("referrer-policy"),
@@ -1779,10 +1791,7 @@ fn check_tier(token_tier: u8, required_tier: u8) -> Result<(), StatusCode> {
 
 // ---------------------------------------------------------------------------
 fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or(std::time::Duration::ZERO)
-        .as_secs() as i64
+    common::secure_time::secure_now_secs_i64()
 }
 
 // Pagination
@@ -2075,7 +2084,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .with_state(state)
         .layer(
             tower_http::cors::CorsLayer::new()
-                .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+                .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
                 .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION, header::ACCEPT])
                 .allow_origin(
                     std::env::var("CORS_ALLOWED_ORIGIN")
@@ -2654,6 +2663,15 @@ async fn register_user(
         .map_err(|_| StatusCode::BAD_REQUEST)?;
     let req: RegisterUserRequest = serde_json::from_slice(&body)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
+    // Reject control characters, null bytes, and non-printable characters
+    if req.username.chars().any(|c| c.is_control() || c == '\0') {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    // Reject non-ASCII to prevent Unicode homograph attacks
+    // (internationalized usernames should use a separate normalized field)
+    if !req.username.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     if req.username.len() > MAX_USERNAME_LEN {
         return Err(StatusCode::BAD_REQUEST);
     }

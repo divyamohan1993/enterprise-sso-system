@@ -30,4 +30,5 @@ ml-dsa.workspace = true
 common = { path = "../common", features = ["test-support"] }
 
 [features]
+default = ["production"]
 production = ["common/production"]

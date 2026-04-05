@@ -574,6 +574,14 @@ impl NonceWal {
         file.write_all(&entry)?;
         file.sync_all()?; // fsync — ensure data is on stable storage
 
+        // Set restrictive permissions on WAL file before rename
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600)) {
+                tracing::error!("SIEM:ERROR failed to set WAL permissions on {:?}: {e}", tmp_path);
+            }
+        }
+
         std::fs::rename(&tmp_path, &self.wal_path)?;
 
         self.synced_nonce = next_nonce;

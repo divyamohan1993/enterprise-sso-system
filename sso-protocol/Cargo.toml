@@ -18,10 +18,12 @@ hex = "0.4"
 subtle.workspace = true
 getrandom.workspace = true
 tracing.workspace = true
+zeroize.workspace = true
 sqlx = { workspace = true, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid"] }
 tokio = { workspace = true, features = ["full"] }
 
 [features]
+default = ["production"]
 production = ["common/production"]
 
 [dev-dependencies]

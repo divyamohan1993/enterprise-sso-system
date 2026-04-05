@@ -61,7 +61,7 @@ impl std::fmt::Debug for OAuthClient {
 /// exactly once. The registry only stores the Argon2id hash.
 pub struct ClientRegistrationResult {
     pub client_id: String,
-    pub plaintext_secret: String,
+    pub plaintext_secret: zeroize::Zeroizing<String>,
     pub redirect_uris: Vec<String>,
     pub name: String,
     pub allowed_scopes: Vec<String>,
@@ -104,7 +104,7 @@ impl ClientRegistry {
         };
         let result = ClientRegistrationResult {
             client_id: client_id.clone(),
-            plaintext_secret,
+            plaintext_secret: zeroize::Zeroizing::new(plaintext_secret),
             redirect_uris,
             name: name.to_string(),
             allowed_scopes: client.allowed_scopes.clone(),
@@ -163,9 +163,9 @@ mod tests {
         let result = reg.register("test", vec!["https://ex.com/cb".into()]).unwrap();
         let stored = reg.get(&result.client_id).unwrap();
         // Stored secret must be the Argon2id hash, not the plaintext.
-        assert_ne!(stored.client_secret, result.plaintext_secret);
+        assert_ne!(stored.client_secret, *result.plaintext_secret);
         // Validation with the correct plaintext must succeed.
-        assert!(reg.validate(&result.client_id, &result.plaintext_secret).is_some());
+        assert!(reg.validate(&result.client_id, &*result.plaintext_secret).is_some());
     }
 
     #[test]
@@ -199,6 +199,6 @@ mod tests {
         let result = reg.register("test", vec![]).unwrap();
         let debug_output = format!("{:?}", result);
         assert!(debug_output.contains("[REDACTED]"));
-        assert!(!debug_output.contains(&result.plaintext_secret));
+        assert!(!debug_output.contains(&*result.plaintext_secret));
     }
 }

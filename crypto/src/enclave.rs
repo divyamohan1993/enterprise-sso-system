@@ -628,9 +628,7 @@ pub fn require_enclave_or_warn(operation: &str) -> Result<EnclaveBackend, String
     let backend = detect_enclave_backend();
 
     if backend == EnclaveBackend::SoftwareFallback {
-        let is_production = std::env::var("MILNET_PRODUCTION")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+        let is_production = common::sealed_keys::is_production();
         let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
             .map(|v| v == "1")
             .unwrap_or(false);

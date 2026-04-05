@@ -497,14 +497,21 @@ impl GatewayServer {
             tokio::spawn(async move {
                 // If TLS is configured, upgrade the TCP stream before processing
                 let result = if let Some(acceptor) = tls_acceptor {
-                    match acceptor.accept(tcp_stream).await {
-                        Ok(tls_stream) => {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        acceptor.accept(tcp_stream),
+                    ).await {
+                        Ok(Ok(tls_stream)) => {
                             debug!("TLS handshake completed for {addr}");
                             handle_connection(tls_stream, difficulty, orch, server_pk, server_kp, fingerprint, &breaker).await
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             warn!("TLS handshake failed from {addr}: {e}");
                             Err(format!("TLS handshake failed: {e}"))
+                        }
+                        Err(_) => {
+                            warn!("TLS handshake timed out after 5s from {addr}");
+                            Err("TLS handshake timed out".to_string())
                         }
                     }
                 } else {

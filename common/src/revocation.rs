@@ -74,9 +74,7 @@ impl RevocationList {
     /// defaults to `/var/lib/milnet/revocations.dat`. The constructor will
     /// panic if it cannot establish a persistence path in production mode.
     pub fn new() -> Self {
-        let is_production = std::env::var("MILNET_PRODUCTION")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+        let is_production = crate::sealed_keys::is_production();
 
         let persistence_path = if is_production {
             Some(PathBuf::from(DEFAULT_PERSISTENCE_PATH))
@@ -107,11 +105,9 @@ impl RevocationList {
     }
 
     /// Returns the current timestamp in microseconds since UNIX epoch.
+    /// Uses monotonic-anchored secure time, immune to clock manipulation.
     fn now_us() -> i64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros() as i64
+        crate::secure_time::secure_now_us_i64()
     }
 
     // ------------------------------------------------------------------

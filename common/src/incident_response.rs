@@ -478,9 +478,17 @@ impl IncidentResponseEngine {
             prev_evidence_hash,
         };
 
-        // Append to the immutable evidence log
+        // Append to the immutable evidence log (with bounded capacity)
+        const MAX_EVIDENCE: usize = 100_000;
         {
             let mut log = self.evidence_log.lock().unwrap_or_else(|e| e.into_inner());
+            if log.len() >= MAX_EVIDENCE {
+                log.remove(0);
+                tracing::warn!(
+                    "Evidence log at capacity ({}) — evicted oldest entry",
+                    MAX_EVIDENCE
+                );
+            }
             log.push(evidence.clone());
         }
 
@@ -550,9 +558,22 @@ impl IncidentResponseEngine {
         // actions, so the system state is preserved as-is at detection time.
         let _evidence = self.collect_evidence(&incident_id.to_string());
 
-        // Store the incident
+        // Store the incident (with bounded capacity)
+        const MAX_INCIDENTS: usize = 100_000;
         {
             let mut incidents = self.incidents.lock().unwrap_or_else(|e| e.into_inner());
+            // Evict oldest resolved incidents first, then oldest unresolved
+            if incidents.len() >= MAX_INCIDENTS {
+                if let Some(pos) = incidents.iter().position(|i| i.resolved) {
+                    incidents.remove(pos);
+                } else {
+                    incidents.remove(0);
+                }
+                tracing::warn!(
+                    "Incident store at capacity ({}) — evicted oldest entry",
+                    MAX_INCIDENTS
+                );
+            }
             incidents.push(incident);
         }
 

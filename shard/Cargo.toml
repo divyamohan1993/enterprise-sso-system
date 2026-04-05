@@ -22,5 +22,6 @@ tracing.workspace = true
 zeroize.workspace = true
 
 [features]
+default = ["production"]
 production = ["common/production"]
 test-internals = []

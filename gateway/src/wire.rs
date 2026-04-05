@@ -57,11 +57,22 @@ impl Drop for AuthRequest {
 }
 
 /// Authentication response returned by the gateway.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AuthResponse {
     pub success: bool,
     pub token: Option<Vec<u8>>,
     pub error: Option<String>,
+}
+
+/// SECURITY: Redact token from Debug output.
+impl std::fmt::Debug for AuthResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthResponse")
+            .field("success", &self.success)
+            .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .field("error", &self.error)
+            .finish()
+    }
 }
 
 /// Request from the Gateway to the Orchestrator (mirrors orchestrator message type).
@@ -119,11 +130,22 @@ impl Drop for OrchestratorRequest {
 }
 
 /// Response from the Orchestrator to the Gateway (mirrors orchestrator message type).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OrchestratorResponse {
     pub success: bool,
     pub token_bytes: Option<Vec<u8>>,
     pub error: Option<String>,
+}
+
+/// SECURITY: Redact token bytes from Debug output.
+impl std::fmt::Debug for OrchestratorResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OrchestratorResponse")
+            .field("success", &self.success)
+            .field("token_bytes", &self.token_bytes.as_ref().map(|_| "[REDACTED]"))
+            .field("error", &self.error)
+            .finish()
+    }
 }
 
 #[cfg(test)]

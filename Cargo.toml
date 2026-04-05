@@ -21,8 +21,8 @@ members = [
 
 [workspace.package]
 # There is only ONE mode: production. is_production() always returns true.
-# The 'production' Cargo feature is kept for backwards compatibility but
-# is no longer required — production behavior is always active.
+# The 'production' Cargo feature is now DEFAULT-ENABLED in every crate.
+# Production behavior is always active both at runtime and compile time.
 # Build: cargo build --release
 edition = "2021"
 rust-version = "1.88"

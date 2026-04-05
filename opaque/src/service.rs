@@ -65,11 +65,6 @@ impl Drop for ReceiptSigner { fn drop(&mut self) { self.mldsa87_seed.zeroize(); 
 fn load_receipt_signing_seed() -> [u8; 32] {
     common::sealed_keys::load_receipt_signing_seed_sealed()
 }
-#[allow(dead_code)]
-fn load_receipt_signing_key() -> [u8; 64] {
-    eprintln!("WARNING: RECEIPT_SIGNING_KEY generated randomly at startup (NOT FOR PRODUCTION — use HSM)");
-    crypto::entropy::generate_key_64()
-}
 
 /// Load SHARD HMAC key from sealed storage via the master KEK.
 /// Uses `common::sealed_keys::load_shard_hmac_key_sealed()` for deterministic

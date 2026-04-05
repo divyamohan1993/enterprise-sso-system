@@ -476,10 +476,7 @@ pub fn decrypt_session_data(
 }
 
 fn now_us() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as i64
+    crate::secure_time::secure_now_us_i64()
 }
 
 #[cfg(test)]

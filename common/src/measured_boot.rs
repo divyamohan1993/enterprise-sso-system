@@ -46,6 +46,8 @@ pub struct BootAttestation {
 
 impl BootAttestation {
     /// Create a dummy attestation for dev mode (no vTPM, no real attestation).
+    /// Restricted to test builds only. Production code must use real attestation.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn dev_mode() -> Self {
         Self {
             tpm_available: false,

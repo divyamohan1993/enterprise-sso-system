@@ -15,7 +15,7 @@
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha512};
 use std::collections::BTreeMap;
 
 // ---------------------------------------------------------------------------
@@ -346,15 +346,16 @@ pub fn create_did_auth_challenge(
 }
 
 /// Compute the DIDAuth challenge digest (the message to sign).
-pub fn did_auth_challenge_digest(challenge: &DidAuthChallenge) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(b"MILNET-DIDAUTH-v1");
+/// Uses SHA-512 for CNSA 2.0 compliance.
+pub fn did_auth_challenge_digest(challenge: &DidAuthChallenge) -> [u8; 64] {
+    let mut hasher = Sha512::new();
+    hasher.update(b"MILNET-DIDAUTH-v2");
     hasher.update(&challenge.nonce);
     hasher.update(challenge.verifier_did.as_bytes());
     hasher.update(challenge.domain.as_bytes());
     hasher.update(challenge.created.as_bytes());
     let result = hasher.finalize();
-    let mut digest = [0u8; 32];
+    let mut digest = [0u8; 64];
     digest.copy_from_slice(&result);
     digest
 }

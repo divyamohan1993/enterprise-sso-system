@@ -355,8 +355,23 @@ impl GossipProtocol {
     /// Process an incoming gossip message.
     ///
     /// Returns actions (e.g. ACKs, forwarded PING-REQs) for the caller to send.
+    /// Maximum piggyback updates accepted per gossip message.
+    /// Reject messages with excessive piggyback vectors to prevent memory exhaustion.
+    const MAX_PIGGYBACK_UPDATES: usize = 100;
+
     pub fn handle_message(&self, msg: GossipMessage) -> Vec<GossipAction> {
         let mut actions = Vec::new();
+
+        // Reject oversized piggyback vectors to prevent memory exhaustion
+        if msg.piggyback.len() > Self::MAX_PIGGYBACK_UPDATES {
+            tracing::error!(
+                sender = %msg.sender,
+                piggyback_len = msg.piggyback.len(),
+                max = Self::MAX_PIGGYBACK_UPDATES,
+                "Gossip: rejecting message with oversized piggyback vector"
+            );
+            return actions;
+        }
 
         // Apply piggybacked membership updates
         for update in &msg.piggyback {

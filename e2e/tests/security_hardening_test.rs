@@ -849,6 +849,10 @@ fn bft_unsigned_entry_rejected_with_verifying_key() {
             classification: 0,
             correlation_id: None,
             trace_id: None,
+            source_ip: None,
+            session_id: None,
+            request_id: None,
+            user_agent: None,
         };
 
         let mut rejections = 0;
@@ -881,6 +885,10 @@ fn bft_wrong_signature_rejected() {
             classification: 0,
             correlation_id: None,
             trace_id: None,
+            source_ip: None,
+            session_id: None,
+            request_id: None,
+            user_agent: None,
         };
 
         let mut rejections = 0;

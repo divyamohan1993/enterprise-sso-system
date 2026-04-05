@@ -39,6 +39,7 @@ serde_json = "1"
 proptest = "1"
 
 [features]
+default = ["production"]
 production = []
 test-support = []
 cac = ["cryptoki"]

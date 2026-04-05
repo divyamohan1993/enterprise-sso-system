@@ -26,6 +26,7 @@ hkdf.workspace = true
 zeroize.workspace = true
 
 [features]
+default = ["production"]
 production = ["common/production"]
 
 [dev-dependencies]

@@ -53,20 +53,26 @@ impl AssertionIdCache {
     }
 
     fn check_and_record(&mut self, assertion_id: &str, retention_secs: i64) -> Result<(), String> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = crate::secure_time::secure_now_secs_i64();
         if now > self.last_cleanup + 60 {
             self.seen.retain(|_, expiry| *expiry > now);
             self.last_cleanup = now;
         }
+        // Bound the assertion ID cache to prevent memory exhaustion
+        const MAX_ASSERTION_IDS: usize = 100_000;
         if self.seen.contains_key(assertion_id) {
             SecurityEvent::saml_assertion_replay_detected(assertion_id);
             return Err(format!(
                 "SECURITY: SAML assertion ID '{}' already used — replay attack detected",
                 assertion_id
             ));
+        }
+        if self.seen.len() >= MAX_ASSERTION_IDS {
+            tracing::error!(
+                "SAML: MAX_ASSERTION_IDS ({}) reached — rejecting new assertion",
+                MAX_ASSERTION_IDS
+            );
+            return Err("SAML assertion ID cache at capacity".to_string());
         }
         self.seen.insert(assertion_id.to_string(), now + retention_secs);
         Ok(())
@@ -233,10 +239,7 @@ impl DistributedAssertionCache for PostgresAssertionCache {
         use std::io::{Read, Write};
         use std::net::TcpStream;
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = crate::secure_time::secure_now_secs_i64();
         let expires_at = now + retention_secs;
 
         // Parse the DB URL to extract host:port for the TCP connection.
@@ -2421,11 +2424,9 @@ impl SecurityEvent {
 // ── Utility Functions ───────────────────────────────────────────────────────
 
 /// Get the current time as Unix epoch seconds.
+/// Uses monotonic-anchored secure time, immune to clock manipulation.
 fn now_epoch() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
+    crate::secure_time::secure_now_secs_i64()
 }
 
 /// Convert Unix epoch seconds to ISO 8601 UTC timestamp.
@@ -2731,10 +2732,7 @@ fn validate_certificate_expiry(cert_der: &[u8]) -> Result<(), String> {
     // or GeneralizedTime (tag 0x18) pairs.
     let not_after = find_certificate_not_after(cert_der);
     if let Some(expiry_epoch) = not_after {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| "system clock error".to_string())?
-            .as_secs() as i64;
+        let now = crate::secure_time::secure_now_secs_i64();
         if now > expiry_epoch {
             return Err(format!(
                 "SP certificate expired: notAfter epoch={}, now={}",
@@ -2901,10 +2899,7 @@ impl CrlCache {
 
     /// Check whether the cache is stale (older than `max_age_secs`).
     pub fn is_stale(&self) -> bool {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = crate::secure_time::secure_now_secs_i64();
         (now - self.last_updated) > self.max_age_secs
     }
 
@@ -2956,10 +2951,7 @@ impl CrlCache {
         for entry in entries {
             self.entries.insert(entry.serial.clone(), entry);
         }
-        self.last_updated = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        self.last_updated = crate::secure_time::secure_now_secs_i64();
         Ok(())
     }
 
@@ -3371,10 +3363,7 @@ pub fn check_certificate_revocation(cert_der: &[u8]) -> Result<RevocationStatus,
             tracing::debug!(
                 "CRL cache hit (not revoked): serial {:?}, cache age {}s",
                 hex_encode(&serial),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64
+                crate::secure_time::secure_now_secs_i64()
                     - cache.last_updated()
             );
             return Ok(RevocationStatus::Good);

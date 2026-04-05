@@ -387,6 +387,10 @@ fn debug_impls_all_redacted() {
         classification: 0,
         correlation_id: None,
         trace_id: None,
+        source_ip: None,
+        session_id: None,
+        request_id: None,
+        user_agent: None,
     };
     let entry_dbg = format!("{:?}", entry);
     assert!(entry_dbg.contains("[REDACTED]"), "AuditEntry Debug must contain [REDACTED]");

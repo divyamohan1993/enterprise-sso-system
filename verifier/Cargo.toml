@@ -22,6 +22,7 @@ tracing-subscriber.workspace = true
 hex.workspace = true
 
 [features]
+default = ["production"]
 production = ["common/production"]
 
 [dev-dependencies]

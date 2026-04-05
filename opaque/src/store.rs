@@ -92,16 +92,28 @@ impl CredentialStore {
         self.server_setup_fips.as_ref()
     }
 
+    /// Maximum number of registered users before rejection.
+    const MAX_USERS: usize = 1_000_000;
+
     /// Store a completed registration for a user.
     ///
     /// This is called after the full OPAQUE registration flow completes
     /// (client_start -> server_start -> client_finish -> server_finish).
     /// The `registration` is a serialized `ServerRegistration<OpaqueCs>`.
+    /// Rejects if the store already holds `MAX_USERS` entries (unless updating existing).
     pub fn store_registration(
         &mut self,
         username: &str,
         registration_bytes: Vec<u8>,
     ) -> Uuid {
+        if !self.users.contains_key(username) && self.users.len() >= Self::MAX_USERS {
+            tracing::error!(
+                "OPAQUE: MAX_USERS ({}) reached — rejecting new registration",
+                Self::MAX_USERS
+            );
+            // Return a nil UUID to signal rejection without changing the API signature
+            return Uuid::nil();
+        }
         let user_id = Uuid::new_v4();
         self.users.insert(
             username.to_string(),
@@ -115,11 +127,19 @@ impl CredentialStore {
     }
 
     /// Store a completed FIPS registration for a user (PBKDF2-SHA512 KSF).
+    /// Rejects if the store already holds `MAX_USERS` entries (unless updating existing).
     pub fn store_registration_fips(
         &mut self,
         username: &str,
         registration_bytes: Vec<u8>,
     ) -> Uuid {
+        if !self.users.contains_key(username) && self.users.len() >= Self::MAX_USERS {
+            tracing::error!(
+                "OPAQUE: MAX_USERS ({}) reached — rejecting new FIPS registration",
+                Self::MAX_USERS
+            );
+            return Uuid::nil();
+        }
         let user_id = Uuid::new_v4();
         self.users.insert(
             username.to_string(),

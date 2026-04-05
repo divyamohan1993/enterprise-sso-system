@@ -24,4 +24,5 @@ ml-dsa.workspace = true
 aes-gcm.workspace = true
 
 [features]
+default = ["production"]
 production = ["common/production"]

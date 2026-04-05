@@ -110,7 +110,9 @@ fn persist_seed(path: &Path, seed: &[u8; 32]) {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+                if let Err(e) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+                    tracing::error!("SIEM:ERROR failed to set file permissions on {:?}: {e}", path);
+                }
             }
             if let Err(e) = file.write_all(&sealed) {
                 tracing::error!("Failed to write sealed seed to {:?}: {}", path, e);
@@ -279,7 +281,9 @@ fn persist_tree(tree: &kt::merkle::MerkleTree, path: &Path) {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+                if let Err(e) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+                    tracing::error!("SIEM:ERROR failed to set file permissions on {:?}: {e}", path);
+                }
             }
             if let Err(e) = file.write_all(&file_data) {
                 tracing::error!("Failed to persist Merkle tree to {:?}: {}", path, e);
@@ -343,6 +347,9 @@ fn load_tree_checkpoint(path: &Path) -> Option<(u64, [u8; 64])> {
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
+
+    // Anchor monotonic time before any crypto/auth operations.
+    common::secure_time::init_time_anchor();
 
     // Platform integrity: vTPM check, process hardening, self-attestation, monitor
     let (_platform_report, _monitor_handle, _monitor) =
@@ -469,7 +476,9 @@ async fn main() {
                             KtRequest::GetRoot => {
                                 let tree = tree.read().await;
                                 let root = tree.root();
-                                let _ = transport.send(&root).await;
+                                if let Err(e) = transport.send(&root).await {
+                                    tracing::error!("SIEM:ERROR failed to send tree root via transport: {e}");
+                                }
                             }
                         }
                     }

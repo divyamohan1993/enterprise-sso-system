@@ -46,10 +46,7 @@ impl LocalJtiStore {
 impl JtiReplayStore for LocalJtiStore {
     fn mark_used(&self, jti: &str, expires_at: i64) -> Result<bool, String> {
         let mut seen = self.seen.lock().map_err(|_| "JTI local store mutex poisoned".to_string())?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = common::secure_time::secure_now_secs_i64();
         Self::evict_expired(&mut seen, now);
 
         if seen.contains_key(jti) {
@@ -115,10 +112,7 @@ impl DatabaseJtiStore {
 
     /// Evict expired entries from the database. Call periodically.
     pub async fn cleanup_expired(&self) -> Result<u64, String> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = common::secure_time::secure_now_secs_i64();
         let result = sqlx::query("DELETE FROM jti_replay WHERE expires_at + 60 <= $1")
             .bind(now)
             .execute(&self.pool)
@@ -341,10 +335,7 @@ impl RefreshTokenStore {
     /// enabling family-wide revocation on reuse detection.
     fn issue_in_family(&mut self, user_id: Uuid, client_id: &str, scope: &str, family_id: &str) -> String {
         let token_value = format!("rt_{}", Uuid::new_v4());
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = common::secure_time::secure_now_secs_i64();
         self.tokens.insert(
             token_value.clone(),
             RefreshToken {
@@ -400,10 +391,7 @@ impl RefreshTokenStore {
         }
 
         // Check expiry
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = common::secure_time::secure_now_secs_i64();
         if now > rt.expires_at {
             self.tokens.remove(token);
             return Err("refresh token expired".to_string());
@@ -448,10 +436,7 @@ impl RefreshTokenStore {
 
     /// Remove all expired refresh tokens.
     pub fn cleanup_expired(&mut self) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = common::secure_time::secure_now_secs_i64();
         self.tokens.retain(|_, rt| rt.expires_at > now);
     }
 }
@@ -692,10 +677,7 @@ pub fn create_id_token_with_tier(
     signing_key: &OidcSigningKey,
     tier: u8,
 ) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
+    let now = common::secure_time::secure_now_secs_i64();
 
     let header = serde_json::json!({
         "alg": "ML-DSA-87",
@@ -829,10 +811,7 @@ fn verify_id_token_inner(
 
     // Token expiry enforcement — expired tokens MUST be rejected.
     // This is checked BEFORE audience to fail fast on expired tokens.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| "system clock error".to_string())?
-        .as_secs() as i64;
+    let now = common::secure_time::secure_now_secs_i64();
 
     // SECURITY: Clock skew tolerance for distributed military deployments.
     // Uses the module-level CLOCK_SKEW_TOLERANCE_SECS (10s) instead of a

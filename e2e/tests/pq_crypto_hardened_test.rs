@@ -289,7 +289,7 @@ fn tagged_ml_dsa_87_sign_verify_roundtrip() {
         let (sk, vk) = generate_pq_keypair();
         let data = b"tagged signature roundtrip test";
 
-        let tagged_sig = pq_sign_tagged(&sk, data);
+        let tagged_sig = pq_sign_tagged(&sk, data).expect("ML-DSA-87 signing should succeed");
 
         // First byte must be ML-DSA-87 tag (0x01)
         assert_eq!(tagged_sig[0], 0x01, "default tagged sig must use ML-DSA-87 tag");
@@ -309,7 +309,7 @@ fn tagged_signature_tag_corruption_detected() {
         let (sk, vk) = generate_pq_keypair();
         let data = b"tag corruption test";
 
-        let mut tagged_sig = pq_sign_tagged(&sk, data);
+        let mut tagged_sig = pq_sign_tagged(&sk, data).expect("signing should succeed");
         assert!(pq_verify_tagged(&vk, data, &tagged_sig));
 
         // Corrupt the tag byte
@@ -516,6 +516,10 @@ fn key_zeroization_debug_redaction() {
         classification: 0,
         correlation_id: None,
         trace_id: None,
+        source_ip: None,
+        session_id: None,
+        request_id: None,
+        user_agent: None,
     };
     let entry_dbg = format!("{:?}", entry);
     assert!(

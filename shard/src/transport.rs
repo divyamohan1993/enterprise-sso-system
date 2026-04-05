@@ -322,8 +322,18 @@ impl ShardTransport {
         }
         let buf_len = usize::try_from(len)
             .map_err(|_| MilnetError::Shard("frame size overflows usize".to_string()))?;
-        let mut buf = vec![0u8; buf_len];
-        self.read_exact(&mut buf).await?;
+
+        // Read in 64 KiB chunks to prevent upfront allocation of attacker-controlled size
+        const CHUNK_SIZE: usize = 64 * 1024;
+        let mut buf = Vec::with_capacity(buf_len.min(CHUNK_SIZE));
+        let mut remaining = buf_len;
+        while remaining > 0 {
+            let to_read = remaining.min(CHUNK_SIZE);
+            let start = buf.len();
+            buf.resize(start + to_read, 0);
+            self.read_exact(&mut buf[start..start + to_read]).await?;
+            remaining -= to_read;
+        }
         self.protocol.verify_message(&buf)
     }
 
@@ -331,7 +341,7 @@ impl ShardTransport {
     /// Restricted to crate-internal use to prevent bypassing SHARD authentication.
     /// Available externally only with `test-internals` feature for integration tests.
     #[cfg_attr(not(feature = "test-internals"), doc(hidden))]
-    #[cfg(any(feature = "test-internals", not(feature = "production")))]
+    #[cfg(feature = "test-internals")]
     pub async fn recv_raw(&mut self) -> Result<Vec<u8>, MilnetError> {
         let mut len_buf = [0u8; 4];
         self.read_exact(&mut len_buf).await?;
@@ -352,7 +362,7 @@ impl ShardTransport {
     /// Restricted to crate-internal use to prevent bypassing SHARD authentication.
     /// Available externally only with `test-internals` feature for integration tests.
     #[cfg_attr(not(feature = "test-internals"), doc(hidden))]
-    #[cfg(any(feature = "test-internals", not(feature = "production")))]
+    #[cfg(feature = "test-internals")]
     pub async fn send_raw(&mut self, raw: &[u8]) -> Result<(), MilnetError> {
         let len = raw.len() as u32;
         let len_bytes = len.to_be_bytes();

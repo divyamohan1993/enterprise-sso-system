@@ -106,11 +106,24 @@ impl CredentialStore {
         }
     }
 
+    /// Maximum number of stored credentials before rejection.
+    const MAX_CREDENTIALS: usize = 100_000;
+    /// Maximum number of pending challenges before rejection.
+    const MAX_CHALLENGES: usize = 10_000;
+
     /// Store a pending challenge associated with a user.
     ///
     /// Runs garbage collection of expired challenges before inserting.
+    /// Rejects if the store already holds `MAX_CHALLENGES` entries.
     pub fn store_challenge(&mut self, challenge: &[u8], user_id: Uuid) {
         self.cleanup_expired_challenges();
+        if self.challenges.len() >= Self::MAX_CHALLENGES {
+            tracing::error!(
+                "FIDO: MAX_CHALLENGES ({}) reached — rejecting new challenge",
+                Self::MAX_CHALLENGES
+            );
+            return;
+        }
         self.challenges.insert(challenge.to_vec(), (user_id, Instant::now()));
     }
 
@@ -159,7 +172,15 @@ impl CredentialStore {
     }
 
     /// Store a completed credential registration.
+    /// Rejects if the store already holds `MAX_CREDENTIALS` entries.
     pub fn store_credential(&mut self, cred: StoredCredential) {
+        if self.credentials.len() >= Self::MAX_CREDENTIALS {
+            tracing::error!(
+                "FIDO: MAX_CREDENTIALS ({}) reached — rejecting new credential",
+                Self::MAX_CREDENTIALS
+            );
+            return;
+        }
         self.credentials.insert(cred.credential_id.clone(), cred);
     }
 

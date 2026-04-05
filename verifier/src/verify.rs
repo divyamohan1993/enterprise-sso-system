@@ -72,10 +72,7 @@ impl DpopReplayCache {
     // The global DPOP_REPLAY_CACHE wraps this in a Mutex for additional
     // thread-safety, ensuring the entire check-cleanup-insert sequence is atomic.
     fn check_and_record(&mut self, proof_hash: &[u8; 64]) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = common::secure_time::secure_now_secs_i64();
 
         // Check both generations — O(1)
         if self.current.contains_key(proof_hash) || self.previous.contains_key(proof_hash) {
@@ -201,11 +198,8 @@ fn verify_token_core(
         ));
     }
 
-    // 3. Check expiry
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as i64;
+    // 3. Check expiry (monotonic-anchored, immune to clock manipulation)
+    let now = common::secure_time::secure_now_us_i64();
     if token.claims.exp <= now {
         return Err(MilnetError::CryptoVerification(
             "token validation failed".into(),

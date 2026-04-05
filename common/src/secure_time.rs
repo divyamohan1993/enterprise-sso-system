@@ -225,6 +225,71 @@ pub struct RoughtimeProof {
 /// Uses std::time::Instant which is immune to wall-clock manipulation.
 static MONOTONIC_BASELINE: OnceLock<(Instant, i64)> = OnceLock::new();
 
+/// Global time anchor for `secure_now_us()` / `secure_now_secs()`.
+/// Captures (wall_clock_us, monotonic_instant) at startup so all subsequent
+/// time queries use the monotonic clock offset from this anchor, making them
+/// immune to clock manipulation after process start.
+static TIME_ANCHOR: OnceLock<(u64, Instant)> = OnceLock::new();
+
+/// Initialize the time anchor. Call once at process startup, before any
+/// crypto, auth, or token operations. After this, `secure_now_us()` returns
+/// monotonic-anchored time that cannot go backward and cannot jump forward
+/// from NTP/clock_settime attacks.
+pub fn init_time_anchor() {
+    TIME_ANCHOR.get_or_init(|| {
+        let wall = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+        let mono = Instant::now();
+        (wall, mono)
+    });
+    // Also initialize the legacy monotonic baseline for callers that still
+    // use monotonic_now_us() / is_expired_monotonic().
+    init_monotonic_baseline();
+}
+
+/// Returns current time in microseconds since UNIX epoch, using a monotonic
+/// clock anchored to the wall-clock time captured at process startup.
+///
+/// This is immune to clock manipulation after startup:
+/// - Cannot go backward (monotonic guarantee)
+/// - Cannot jump forward from NTP/clock_settime attacks
+/// - Drift is bounded to the monotonic clock's accuracy (~ppm)
+pub fn secure_now_us() -> u64 {
+    match TIME_ANCHOR.get() {
+        Some(&(anchor_wall, ref anchor_mono)) => {
+            let elapsed = anchor_mono.elapsed().as_micros() as u64;
+            anchor_wall.saturating_add(elapsed)
+        }
+        None => {
+            // Fallback if anchor not initialized -- use wall clock but log warning
+            tracing::warn!("SIEM:WARNING secure_now_us called before init_time_anchor");
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros() as u64
+        }
+    }
+}
+
+/// Returns current time in seconds since UNIX epoch (monotonic-anchored).
+pub fn secure_now_secs() -> u64 {
+    secure_now_us() / 1_000_000
+}
+
+/// Returns current time in microseconds as i64 (monotonic-anchored).
+/// Convenience wrapper for callers that store timestamps as i64.
+pub fn secure_now_us_i64() -> i64 {
+    secure_now_us() as i64
+}
+
+/// Returns current time in seconds as i64 (monotonic-anchored).
+/// Convenience wrapper for callers that store timestamps as i64.
+pub fn secure_now_secs_i64() -> i64 {
+    secure_now_secs() as i64
+}
+
 /// Initialize the monotonic baseline by pairing Instant::now() with
 /// the current authenticated wall-clock time.
 pub fn init_monotonic_baseline() {
@@ -240,6 +305,9 @@ pub fn init_monotonic_baseline() {
 /// Returns a monotonic-safe timestamp in microseconds.
 /// Immune to wall-clock manipulation (clock_settime, date -s, etc.)
 /// because it derives time from std::time::Instant offset from baseline.
+///
+/// Prefer `secure_now_us()` for new code -- this is retained for backward
+/// compatibility with existing callers.
 pub fn monotonic_now_us() -> i64 {
     let (base_instant, base_wall_us) = *MONOTONIC_BASELINE
         .get_or_init(|| {

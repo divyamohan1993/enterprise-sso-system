@@ -140,8 +140,5 @@ impl SovereignCeremony {
 }
 
 fn now_us() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as i64
+    common::secure_time::secure_now_us_i64()
 }
