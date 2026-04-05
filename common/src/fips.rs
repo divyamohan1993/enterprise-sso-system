@@ -837,19 +837,23 @@ mod tests {
     }
 
     #[test]
-    fn test_set_fips_mode_unchecked_bypasses_in_test_builds() {
-        // In #[cfg(test)] builds, set_fips_mode_unchecked should allow
-        // toggling freely, even with MILNET_MILITARY_DEPLOYMENT=1.
-        // This is essential for test harnesses.
+    fn test_set_fips_mode_unchecked_refuses_disable_in_military() {
+        // In military deployment, disabling FIPS is REFUSED even via
+        // set_fips_mode_unchecked(). No bypass in any build. Production
+        // identical to test.
         std::env::set_var("MILNET_MILITARY_DEPLOYMENT", "1");
 
         set_fips_mode_unchecked(true);
-        assert!(is_fips_mode(), "unchecked enable must work in test builds");
+        assert!(is_fips_mode(), "enable must work in military mode");
 
+        // Attempt to disable — MUST be refused
         set_fips_mode_unchecked(false);
-        assert!(!is_fips_mode(), "unchecked disable must work in test builds (cfg(test) bypass)");
+        assert!(is_fips_mode(), "disabling FIPS MUST be refused in military deployment");
 
         std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        // Now without military mode, disable should work
+        set_fips_mode_unchecked(false);
+        assert!(!is_fips_mode(), "disable must work outside military mode");
     }
 
     #[test]

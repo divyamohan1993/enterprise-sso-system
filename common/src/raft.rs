@@ -1655,16 +1655,21 @@ mod tests {
         let idx = n1.propose(cmd).unwrap();
         assert!(idx.0 > 0);
 
-        // Send heartbeats carrying the entries.
-        let heartbeats = n1.tick();
-        for (peer_id, msg) in &heartbeats {
-            let responses = if *peer_id == id2 {
-                n2.handle_message(id1, msg.clone())
-            } else {
-                n3.handle_message(id1, msg.clone())
-            };
-            // Feed response back to the leader.
-            let _ = n1.handle_message(*peer_id, responses[0].1.clone());
+        // Send heartbeats carrying the entries. May need multiple rounds
+        // because the first heartbeat establishes the Noop entry and the
+        // second carries the MemberJoin after commit_index advances.
+        for _round in 0..2 {
+            let heartbeats = n1.tick();
+            for (peer_id, msg) in &heartbeats {
+                let responses = if *peer_id == id2 {
+                    n2.handle_message(id1, msg.clone())
+                } else {
+                    n3.handle_message(id1, msg.clone())
+                };
+                for (_resp_to, resp_msg) in responses {
+                    let _ = n1.handle_message(*peer_id, resp_msg);
+                }
+            }
         }
 
         // After replication to majority, entries should be committed.
