@@ -163,7 +163,14 @@ impl JtiReplayStore for DatabaseJtiStore {
         let was_fresh = db_result?;
         if was_fresh {
             // Update L1 cache
-            let _ = self.local.mark_used(jti, expires_at);
+            if let Err(e) = self.local.mark_used(jti, expires_at) {
+                tracing::error!(
+                    target: "siem",
+                    "SECURITY: JTI L1 cache mark_used failed for jti={}: {}. \
+                     Token replay via L1 cache bypass possible. DB L2 is authoritative.",
+                    jti, e
+                );
+            }
         }
         Ok(was_fresh)
     }

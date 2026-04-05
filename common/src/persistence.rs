@@ -281,3 +281,195 @@ pub async fn load_or_generate_key_32(pool: &PgPool, name: &str, master_kek: Opti
     }
     key
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generate_random_bytes_32_returns_non_zero() {
+        let buf = generate_random_bytes_32().expect("CSPRNG should succeed");
+        // Probability of all-zero 32 bytes from CSPRNG is 2^-256.
+        assert_ne!(buf, [0u8; 32], "random bytes must not be all zeros");
+    }
+
+    #[test]
+    fn generate_random_bytes_64_returns_non_zero() {
+        let buf = generate_random_bytes_64().expect("CSPRNG should succeed");
+        assert_ne!(buf, [0u8; 64], "random bytes must not be all zeros");
+    }
+
+    #[test]
+    fn generate_random_bytes_32_produces_unique_output() {
+        let a = generate_random_bytes_32().unwrap();
+        let b = generate_random_bytes_32().unwrap();
+        assert_ne!(a, b, "two consecutive calls must produce different output");
+    }
+
+    #[test]
+    fn generate_random_bytes_64_produces_unique_output() {
+        let a = generate_random_bytes_64().unwrap();
+        let b = generate_random_bytes_64().unwrap();
+        assert_ne!(a, b, "two consecutive calls must produce different output");
+    }
+
+    #[test]
+    fn encrypted_key_magic_header_is_8_bytes() {
+        assert_eq!(ENCRYPTED_KEY_MAGIC.len(), 8);
+        assert_eq!(ENCRYPTED_KEY_MAGIC, b"MENC0001");
+    }
+
+    #[test]
+    fn is_encrypted_detects_magic_header() {
+        let mut data = vec![0u8; 100];
+        data[..8].copy_from_slice(ENCRYPTED_KEY_MAGIC);
+        assert!(is_encrypted(&data));
+    }
+
+    #[test]
+    fn is_encrypted_rejects_missing_header() {
+        assert!(!is_encrypted(&[0u8; 100]));
+        assert!(!is_encrypted(&[]));
+        assert!(!is_encrypted(&[0u8; 7])); // too short
+    }
+
+    #[test]
+    fn derive_key_material_kek_is_deterministic() {
+        let master = [0x42u8; 32];
+        let k1 = derive_key_material_kek(&master);
+        let k2 = derive_key_material_kek(&master);
+        assert_eq!(k1, k2, "same master KEK must produce same derived key");
+    }
+
+    #[test]
+    fn derive_key_material_kek_different_inputs_differ() {
+        let k1 = derive_key_material_kek(&[0x01; 32]);
+        let k2 = derive_key_material_kek(&[0x02; 32]);
+        assert_ne!(k1, k2, "different master KEKs must produce different derived keys");
+    }
+
+    #[test]
+    fn encrypt_then_decrypt_roundtrips() {
+        let master_kek = [0xAA; 32];
+        let plaintext = b"secret key material for testing";
+        let name = "test-key";
+
+        let sealed = encrypt_key_bytes(&master_kek, name, plaintext)
+            .expect("encryption must succeed");
+
+        // Sealed must start with magic header.
+        assert_eq!(&sealed[..8], ENCRYPTED_KEY_MAGIC);
+        // Sealed must be longer than plaintext (magic + nonce + tag).
+        assert!(sealed.len() > plaintext.len() + 8 + 12);
+
+        let recovered = decrypt_key_bytes(&master_kek, name, &sealed)
+            .expect("decryption must succeed");
+        assert_eq!(recovered, plaintext);
+    }
+
+    #[test]
+    fn decrypt_rejects_wrong_key() {
+        let master_kek = [0xAA; 32];
+        let wrong_kek = [0xBB; 32];
+        let plaintext = b"sensitive material";
+        let name = "test-key";
+
+        let sealed = encrypt_key_bytes(&master_kek, name, plaintext).unwrap();
+        let result = decrypt_key_bytes(&wrong_kek, name, &sealed);
+        assert!(result.is_err(), "decryption with wrong KEK must fail");
+    }
+
+    #[test]
+    fn decrypt_rejects_wrong_name_aad() {
+        let master_kek = [0xAA; 32];
+        let plaintext = b"sensitive material";
+
+        let sealed = encrypt_key_bytes(&master_kek, "correct-name", plaintext).unwrap();
+        let result = decrypt_key_bytes(&master_kek, "wrong-name", &sealed);
+        assert!(result.is_err(), "decryption with wrong AAD (name) must fail");
+    }
+
+    #[test]
+    fn decrypt_rejects_truncated_data() {
+        let result = decrypt_key_bytes(&[0xAA; 32], "key", &[0u8; 10]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decrypt_rejects_missing_magic_header() {
+        // Correct length but no magic header.
+        let result = decrypt_key_bytes(&[0xAA; 32], "key", &[0u8; 100]);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("magic header"),
+            "error must mention missing magic header"
+        );
+    }
+
+    #[test]
+    fn decrypt_rejects_tampered_ciphertext() {
+        let master_kek = [0xCC; 32];
+        let plaintext = b"do not tamper";
+        let name = "integrity-test";
+
+        let mut sealed = encrypt_key_bytes(&master_kek, name, plaintext).unwrap();
+        // Flip a byte in the ciphertext portion (after magic + nonce).
+        let tamper_idx = 8 + 12 + 1;
+        if tamper_idx < sealed.len() {
+            sealed[tamper_idx] ^= 0xFF;
+        }
+        let result = decrypt_key_bytes(&master_kek, name, &sealed);
+        assert!(result.is_err(), "tampered ciphertext must be rejected");
+    }
+
+    #[test]
+    fn validate_magic_header_accepts_encrypted_data() {
+        let mut data = vec![0u8; 50];
+        data[..8].copy_from_slice(ENCRYPTED_KEY_MAGIC);
+        assert!(validate_magic_header(&data, "test").is_ok());
+    }
+
+    #[test]
+    fn validate_magic_header_rejects_plaintext() {
+        let data = vec![0u8; 50];
+        let result = validate_magic_header(&data, "test-key");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("SECURITY VIOLATION"));
+    }
+
+    #[test]
+    #[should_panic(expected = "require_encryption_at_rest")]
+    fn enforce_encryption_policy_panics_when_disabled() {
+        let mut config = SecurityConfig::default();
+        config.require_encryption_at_rest = false;
+        enforce_encryption_policy(&config);
+    }
+
+    #[test]
+    fn enforce_encryption_policy_passes_when_enabled() {
+        let config = SecurityConfig::default();
+        // Must not panic.
+        enforce_encryption_policy(&config);
+    }
+
+    #[test]
+    fn encrypt_key_bytes_produces_different_ciphertexts_for_same_plaintext() {
+        // Each encryption uses a fresh random nonce.
+        let master_kek = [0xDD; 32];
+        let plaintext = b"same input twice";
+        let name = "nonce-test";
+
+        let sealed1 = encrypt_key_bytes(&master_kek, name, plaintext).unwrap();
+        let sealed2 = encrypt_key_bytes(&master_kek, name, plaintext).unwrap();
+        assert_ne!(
+            sealed1, sealed2,
+            "same plaintext must produce different ciphertext (random nonce)"
+        );
+
+        // Both must decrypt to the same value.
+        let p1 = decrypt_key_bytes(&master_kek, name, &sealed1).unwrap();
+        let p2 = decrypt_key_bytes(&master_kek, name, &sealed2).unwrap();
+        assert_eq!(p1, p2);
+        assert_eq!(p1, plaintext);
+    }
+}

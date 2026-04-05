@@ -244,31 +244,26 @@ pub struct ByzantineDetectionState {
     pub confirmed_byzantine: Vec<usize>,
 }
 
-/// Startup check: in military deployment, BFT nodes must be separate processes/VMs.
-/// Single-process mode is only acceptable with explicit acknowledgment.
+/// Startup check: BFT single-process mode warning/enforcement.
+/// In military deployment, single-process mode is unconditionally fatal.
+/// In all other modes, a CRITICAL warning is logged.
 fn check_single_process_military_deployment() {
-    let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    if !is_military {
-        return;
-    }
-    common::siem::SecurityEvent::tamper_detected(
-        "CRITICAL: BFT audit cluster running in single-process mode. \
-         BFT nodes MUST be deployed as separate processes/VMs for actual \
-         Byzantine fault tolerance. Single-process mode provides NO protection \
-         against a compromised process.",
-    );
-    let ack = std::env::var("MILNET_BFT_SINGLE_PROCESS_ACK")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    if !ack {
+    // This check is called from new(), where single_process_mode is always true.
+    // The actual field is set after construction, but the default is true,
+    // so we always warn/enforce here.
+    if std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok() {
         panic!(
-            "FATAL: BFT single-process mode not acknowledged in military deployment. \
-             Set MILNET_BFT_SINGLE_PROCESS_ACK=1 to explicitly accept reduced \
-             Byzantine fault tolerance, or deploy BFT nodes as separate processes."
+            "FATAL: BFT audit running in single-process mode in military deployment. \
+             All 11 nodes share one address space -- zero actual Byzantine fault tolerance. \
+             Deploy BFT nodes as separate processes/VMs."
         );
     }
+    tracing::warn!(
+        target: "siem",
+        "SECURITY: BFT audit running in single-process mode. \
+         All nodes share one address space -- zero actual Byzantine fault tolerance. \
+         This is acceptable ONLY for development/testing."
+    );
 }
 
 /// BFT audit cluster.

@@ -190,6 +190,94 @@ done
 wait
 log "Prerequisites installed on all VMs"
 
+# ── Phase 1b: Configure nftables firewall on all VMs ─────────────────────────
+
+configure_firewall() {
+    local vm="$1"
+    local ROLE="$2"
+
+    log "[$vm] Configuring nftables firewall (role: $ROLE)..."
+
+    ssh_cmd "$vm" bash -s "$ROLE" << 'FIREWALL_SCRIPT'
+set -euo pipefail
+ROLE="$1"
+
+log_info() { echo "[FIREWALL] $*"; }
+
+log_info "Configuring nftables firewall..."
+
+apt-get install -y nftables >/dev/null 2>&1 || yum install -y nftables >/dev/null 2>&1
+
+cat > /etc/nftables.conf << 'NFTEOF'
+#!/usr/sbin/nft -f
+flush ruleset
+
+table inet milnet_filter {
+    chain input {
+        type filter hook input priority 0; policy drop;
+
+        # Allow established/related connections
+        ct state established,related accept
+
+        # Allow loopback
+        iif lo accept
+
+        # Allow SSH for management (restrict to bastion IP in production)
+        tcp dport 22 accept
+
+        # Allow ICMP for health checks
+        ip protocol icmp accept
+        ip6 nexthdr icmpv6 accept
+
+        # Service-specific rules added per role below
+        include "/etc/nftables.d/*.nft"
+
+        # Log and drop everything else
+        log prefix "MILNET_DROP: " drop
+    }
+
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+    }
+
+    chain output {
+        type filter hook output priority 0; policy accept;
+    }
+}
+NFTEOF
+
+mkdir -p /etc/nftables.d
+
+# Role-specific rules
+case "${ROLE}" in
+    gateway)
+        echo 'tcp dport 9100 accept comment "MILNET Gateway TLS"' > /etc/nftables.d/service.nft
+        echo 'tcp dport 10100 accept comment "MILNET Gateway Health"' >> /etc/nftables.d/service.nft
+        ;;
+    admin)
+        echo 'tcp dport 8080 ip saddr 127.0.0.1 accept comment "MILNET Admin localhost only"' > /etc/nftables.d/service.nft
+        ;;
+    *)
+        # Inter-service SHARD ports (9001-9020)
+        echo 'tcp dport 9001-9020 accept comment "MILNET SHARD inter-service"' > /etc/nftables.d/service.nft
+        ;;
+esac
+
+systemctl enable nftables
+nft -f /etc/nftables.conf
+log_info "Firewall configured with default-deny policy"
+FIREWALL_SCRIPT
+}
+
+# VM1 runs gateway + admin; gateway needs external access, admin is localhost-only
+configure_firewall "$VM1" "gateway" &
+configure_firewall "$VM2" "shard" &
+configure_firewall "$VM3" "shard" &
+configure_firewall "$VM4" "shard" &
+configure_firewall "$VM5" "shard" &
+wait
+log "Firewall configured on all VMs"
+
 # ── Phase 2: Copy binaries to all VMs ─────────────────────────────────────────
 
 copy_binaries() {

@@ -3223,7 +3223,7 @@ async fn auth_login(
 
             // Sign audit entry for login success
             let audit_key = derive_admin_audit_key();
-            let audit_data = format!("auth_login:success:{}:{}", verified_user_id, now);
+            let audit_data = format!("auth_login:success:{}:{}", common::log_pseudonym::pseudonym_uuid(verified_user_id), now);
             let _audit_sig = sign_audit_entry(audit_data.as_bytes(), &audit_key);
 
             let dashboard = if user_tier <= 1 { "admin" } else { "user" };

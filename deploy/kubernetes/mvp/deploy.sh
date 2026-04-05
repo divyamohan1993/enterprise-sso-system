@@ -106,7 +106,8 @@ build_images() {
 generate_secrets() {
     log "Generating MVP secrets..."
 
-    local DB_PASSWORD="milnet-mvp-db"
+    local DB_PASSWORD
+    DB_PASSWORD="$(openssl rand -base64 24)"
     local DB_URL="postgresql://milnet:${DB_PASSWORD}@postgres.milnet.svc.cluster.local:5432/milnet?sslmode=disable"
     local MASTER_KEK
     MASTER_KEK=$(openssl rand -hex 32)
@@ -120,7 +121,12 @@ generate_secrets() {
         -addext "subjectAltName=DNS:gateway,DNS:gateway.milnet.svc.cluster.local,IP:0.0.0.0" 2>/dev/null
     log "Self-signed TLS cert generated"
 
-    sudo k3s kubectl apply -f - <<EOF
+    # Write secrets to a tmpfile with restricted permissions to avoid
+    # leaking secrets through /proc/*/cmdline or shell heredoc expansion
+    local SECRET_TMPFILE
+    SECRET_TMPFILE=$(mktemp)
+    chmod 600 "$SECRET_TMPFILE"
+    cat > "$SECRET_TMPFILE" <<SECEOF
 apiVersion: v1
 kind: Secret
 metadata:
@@ -139,7 +145,9 @@ metadata:
 type: Opaque
 stringData:
   MILNET_MASTER_KEK: "${MASTER_KEK}"
-EOF
+SECEOF
+    sudo k3s kubectl apply -f "$SECRET_TMPFILE"
+    rm -f "$SECRET_TMPFILE"
 
     # Create TLS secret from generated cert
     sudo k3s kubectl create secret tls milnet-tls-certs \
@@ -147,7 +155,7 @@ EOF
         --namespace=milnet --dry-run=client -o yaml | sudo k3s kubectl apply -f -
     rm -rf "$TLS_DIR"
 
-    log "Secrets created (DB password: ${DB_PASSWORD})"
+    log "Secrets created (DB password: <redacted>)"
 }
 
 # ── Step 6: Deploy SSO services ─────────────────────────────────────────────

@@ -164,25 +164,16 @@ pub fn cached_master_kek_distributed() -> &'static [u8; 32] {
                 match KekShare::from_hex(hex_share) {
                     Ok(share) => {
                         if !verify_share_commitment(&share) {
-                            // In military deployment, reject unverified shares
-                            if std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok() {
-                                if std::env::var("MILNET_VSS_COMMITMENTS").is_ok() {
-                                    // Commitments exist but verification failed: reject
-                                    tracing::error!(
-                                        "FATAL: VSS commitment verification FAILED for peer share index {}. \
-                                         Rejecting share to prevent KEK corruption from malicious peer.",
-                                        share.index
-                                    );
-                                    crate::siem::SecurityEvent::tamper_detected(
-                                        &format!("Rejected peer share index {} due to VSS verification failure", share.index),
-                                    );
-                                    continue; // Skip this share
-                                }
-                            }
-                            tracing::warn!(
-                                "SECURITY: peer share accepted without VSS commitment verification. \
-                                 Set MILNET_VSS_COMMITMENTS to enable cryptographic share authentication."
+                            tracing::error!(
+                                "SECURITY: VSS commitment verification FAILED for peer share index {}. \
+                                 Share REJECTED to prevent KEK corruption from malicious peer. \
+                                 Ensure MILNET_VSS_COMMITMENTS is set with valid commitments.",
+                                share.index
                             );
+                            crate::siem::SecurityEvent::tamper_detected(
+                                &format!("Rejected peer share index {} due to VSS verification failure", share.index),
+                            );
+                            continue; // Skip this share in ALL modes
                         }
                         if let Err(e) = mgr.add_peer_share(share) {
                             tracing::warn!("Failed to add peer share: {e}");
@@ -855,7 +846,8 @@ pub fn create_escrow_shares(kek: &[u8; 32], config: &KekEscrowConfig) -> Result<
     let mut escrow_shares = Vec::with_capacity(shares.len());
 
     for share in &shares {
-        let share_bytes = share.to_hex().into_bytes();
+        let share_hex = share.to_hex();
+        let share_bytes = share_hex.as_bytes().to_vec();
 
         if config.escrow_encryption {
             // Derive a holder-specific encryption key via HKDF

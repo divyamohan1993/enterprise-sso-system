@@ -56,8 +56,8 @@ struct SockFprog {
     filter: *const SockFilter,
 }
 
-/// Syscall numbers to block (legacy denylist, kept for reference and tests).
-/// On non-x86_64 the filter is skipped with a warning.
+/// Syscall numbers to block (legacy denylist for x86_64, kept for reference and tests).
+#[cfg(target_arch = "x86_64")]
 const BLOCKED_SYSCALLS: &[u32] = &[
     101,  // ptrace
     310,  // process_vm_readv
@@ -74,8 +74,31 @@ const BLOCKED_SYSCALLS: &[u32] = &[
     212,  // lookup_dcookie
 ];
 
+/// aarch64 syscall numbers (from linux/include/uapi/asm-generic/unistd.h).
+#[cfg(target_arch = "aarch64")]
+const BLOCKED_SYSCALLS: &[u32] = &[
+    117,  // ptrace
+    270,  // process_vm_readv
+    271,  // process_vm_writev
+    104,  // kexec_load
+    294,  // kexec_file_load
+    105,  // init_module
+    273,  // finit_module
+    106,  // delete_module
+    280,  // bpf
+    241,  // perf_event_open
+    282,  // userfaultfd
+    272,  // kcmp
+    // lookup_dcookie not available on aarch64
+];
+
+/// Fallback for other architectures (empty, filter will be skipped).
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+const BLOCKED_SYSCALLS: &[u32] = &[];
+
 /// Explicit allowlist of syscalls required for normal operation (x86_64).
 /// Any syscall NOT in this list causes SECCOMP_RET_KILL_PROCESS.
+#[cfg(target_arch = "x86_64")]
 const ALLOWED_SYSCALLS: &[u32] = &[
     0,    // read
     1,    // write
@@ -170,6 +193,101 @@ const ALLOWED_SYSCALLS: &[u32] = &[
     435,  // clone3
 ];
 
+/// Explicit allowlist of syscalls required for normal operation (aarch64).
+/// aarch64 uses the generic syscall numbers from asm-generic/unistd.h.
+/// Any syscall NOT in this list causes SECCOMP_RET_KILL_PROCESS.
+#[cfg(target_arch = "aarch64")]
+const ALLOWED_SYSCALLS: &[u32] = &[
+    63,   // read
+    64,   // write
+    57,   // close
+    80,   // fstat
+    222,  // mmap
+    226,  // mprotect
+    215,  // munmap
+    214,  // brk
+    134,  // rt_sigaction
+    135,  // rt_sigprocmask
+    101,  // nanosleep
+    203,  // connect
+    206,  // sendto
+    207,  // recvfrom
+    211,  // sendmsg
+    212,  // recvmsg
+    98,   // futex
+    113,  // clock_gettime
+    94,   // exit_group
+    20,   // epoll_wait (epoll_pwait on aarch64)
+    21,   // epoll_ctl
+    56,   // openat
+    22,   // epoll_pwait
+    242,  // accept4
+    278,  // getrandom
+    132,  // sigaltstack
+    124,  // sched_yield
+    220,  // clone
+    93,   // exit
+    260,  // wait4
+    129,  // kill
+    25,   // fcntl
+    17,   // getcwd
+    49,   // chdir
+    35,   // unlinkat
+    78,   // readlinkat
+    163,  // getrlimit
+    174,  // getuid
+    176,  // getgid
+    175,  // geteuid
+    177,  // getegid
+    173,  // getppid
+    167,  // prctl
+    178,  // gettid
+    130,  // tkill
+    123,  // sched_getaffinity
+    96,   // set_tid_address
+    115,  // clock_nanosleep
+    79,   // newfstatat
+    99,   // set_robust_list
+    261,  // prlimit64
+    168,  // getcpu
+    293,  // rseq
+    439,  // faccessat2
+    48,   // faccessat
+    // aarch64 has no open/stat/lstat/poll -- uses openat/fstatat/ppoll
+    62,   // lseek
+    29,   // ioctl
+    67,   // pread64
+    68,   // pwrite64
+    65,   // readv
+    66,   // writev
+    23,   // select (pselect6 on aarch64)
+    216,  // mremap
+    233,  // madvise
+    198,  // socket
+    202,  // accept
+    210,  // shutdown
+    200,  // bind
+    201,  // listen
+    204,  // getsockname
+    205,  // getpeername
+    199,  // socketpair
+    208,  // setsockopt
+    209,  // getsockopt
+    160,  // uname
+    169,  // gettimeofday
+    72,   // pselect6
+    73,   // ppoll
+    20,   // epoll_create1
+    24,   // dup3
+    59,   // pipe2
+    291,  // statx
+    435,  // clone3
+];
+
+/// Fallback empty allowlist for unsupported architectures.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+const ALLOWED_SYSCALLS: &[u32] = &[];
+
 /// Apply a seccomp BPF filter using an allowlist approach.
 ///
 /// Default action is SECCOMP_RET_KILL_PROCESS: any syscall not explicitly
@@ -179,10 +297,10 @@ const ALLOWED_SYSCALLS: &[u32] = &[
 /// Requires `PR_SET_NO_NEW_PRIVS` to be set first (enforced by the kernel).
 /// Returns `true` if the filter was successfully installed.
 pub fn apply_seccomp_filter() -> bool {
-    // Only apply on x86_64 — syscall numbers are architecture-specific.
-    if cfg!(not(target_arch = "x86_64")) {
+    // Only apply on x86_64 and aarch64 -- syscall numbers are architecture-specific.
+    if cfg!(not(any(target_arch = "x86_64", target_arch = "aarch64"))) {
         tracing::warn!(
-            "seccomp: BPF filter only implemented for x86_64, skipping on this arch"
+            "seccomp: BPF filter only implemented for x86_64 and aarch64, skipping on this arch"
         );
         return false;
     }
@@ -413,9 +531,18 @@ mod tests {
     #[test]
     fn blocked_syscalls_list_is_populated() {
         // Ensure the blocked syscalls list is non-empty and contains ptrace.
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         assert!(!BLOCKED_SYSCALLS.is_empty());
-        assert!(BLOCKED_SYSCALLS.contains(&101), "ptrace (101) must be blocked");
-        assert!(BLOCKED_SYSCALLS.contains(&321), "bpf (321) must be blocked");
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert!(BLOCKED_SYSCALLS.contains(&101), "ptrace (101) must be blocked on x86_64");
+            assert!(BLOCKED_SYSCALLS.contains(&321), "bpf (321) must be blocked on x86_64");
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert!(BLOCKED_SYSCALLS.contains(&117), "ptrace (117) must be blocked on aarch64");
+            assert!(BLOCKED_SYSCALLS.contains(&280), "bpf (280) must be blocked on aarch64");
+        }
     }
 
     // ── Security hardening tests ──
@@ -480,7 +607,9 @@ mod tests {
     #[test]
     fn blocked_syscalls_contains_all_critical_syscalls() {
         // Verify all security-critical syscalls are in the deny list.
-        let expected = &[
+        // Syscall numbers are architecture-specific.
+        #[cfg(target_arch = "x86_64")]
+        let expected: &[(u32, &str)] = &[
             (101, "ptrace"),
             (310, "process_vm_readv"),
             (311, "process_vm_writev"),
@@ -495,6 +624,24 @@ mod tests {
             (312, "kcmp"),
             (212, "lookup_dcookie"),
         ];
+        #[cfg(target_arch = "aarch64")]
+        let expected: &[(u32, &str)] = &[
+            (117, "ptrace"),
+            (270, "process_vm_readv"),
+            (271, "process_vm_writev"),
+            (104, "kexec_load"),
+            (294, "kexec_file_load"),
+            (105, "init_module"),
+            (273, "finit_module"),
+            (106, "delete_module"),
+            (280, "bpf"),
+            (241, "perf_event_open"),
+            (282, "userfaultfd"),
+            (272, "kcmp"),
+        ];
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let expected: &[(u32, &str)] = &[];
+
         for &(nr, name) in expected {
             assert!(
                 BLOCKED_SYSCALLS.contains(&nr),
@@ -508,24 +655,42 @@ mod tests {
     #[test]
     fn blocked_syscalls_count_matches_expected() {
         // Legacy denylist kept for reference.
+        #[cfg(target_arch = "x86_64")]
         assert_eq!(
             BLOCKED_SYSCALLS.len(),
             13,
-            "BLOCKED_SYSCALLS must contain exactly 13 entries"
+            "BLOCKED_SYSCALLS must contain exactly 13 entries on x86_64"
+        );
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(
+            BLOCKED_SYSCALLS.len(),
+            12,
+            "BLOCKED_SYSCALLS must contain exactly 12 entries on aarch64 (no lookup_dcookie)"
         );
     }
 
     #[test]
     fn allowed_syscalls_is_populated() {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         assert!(
             !ALLOWED_SYSCALLS.is_empty(),
             "ALLOWED_SYSCALLS must not be empty"
         );
-        // Must contain essential syscalls
-        assert!(ALLOWED_SYSCALLS.contains(&0), "read (0) must be allowed");
-        assert!(ALLOWED_SYSCALLS.contains(&1), "write (1) must be allowed");
-        assert!(ALLOWED_SYSCALLS.contains(&231), "exit_group (231) must be allowed");
-        assert!(ALLOWED_SYSCALLS.contains(&318), "getrandom (318) must be allowed");
+        // Must contain essential syscalls (arch-specific numbers)
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert!(ALLOWED_SYSCALLS.contains(&0), "read (0) must be allowed on x86_64");
+            assert!(ALLOWED_SYSCALLS.contains(&1), "write (1) must be allowed on x86_64");
+            assert!(ALLOWED_SYSCALLS.contains(&231), "exit_group (231) must be allowed on x86_64");
+            assert!(ALLOWED_SYSCALLS.contains(&318), "getrandom (318) must be allowed on x86_64");
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert!(ALLOWED_SYSCALLS.contains(&63), "read (63) must be allowed on aarch64");
+            assert!(ALLOWED_SYSCALLS.contains(&64), "write (64) must be allowed on aarch64");
+            assert!(ALLOWED_SYSCALLS.contains(&94), "exit_group (94) must be allowed on aarch64");
+            assert!(ALLOWED_SYSCALLS.contains(&278), "getrandom (278) must be allowed on aarch64");
+        }
     }
 
     #[test]

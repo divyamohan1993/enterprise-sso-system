@@ -111,6 +111,18 @@ fn process_canary_key() -> &'static [u8; 32] {
     })
 }
 
+/// Process-wide HMAC-SHA512 key for SecretBuffer canary HMAC verification.
+/// Shared between the constructor and `verify_canaries()` so both compute
+/// the same HMAC value for a given (address, canary_head, canary_tail) tuple.
+fn canary_hmac_key() -> &'static [u8; 64] {
+    static KEY: std::sync::OnceLock<[u8; 64]> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| {
+        let mut k = [0u8; 64];
+        getrandom::getrandom(&mut k).expect("FATAL: getrandom failed for canary HMAC key");
+        k
+    })
+}
+
 /// Derive a canary value from a buffer address using HMAC-SHA256 with the
 /// process-wide key. This ensures expected canary values are not stored
 /// alongside the secret they protect.
@@ -151,6 +163,9 @@ pub struct SecretBuffer<const N: usize> {
     data: [u8; N],
     /// Tail canary — mirrors `canary_head` with an independent random value.
     canary_tail: u64,
+    /// HMAC over (address, canary_head, canary_tail) computed at construction.
+    /// Used by `verify_canaries()` to detect tampering.
+    canary_hmac: u64,
     /// Whether `mlock` succeeded for this buffer.
     locked: bool,
 }
@@ -174,6 +189,7 @@ impl<const N: usize> SecretBuffer<N> {
             canary_head: 0,
             data,
             canary_tail: 0,
+            canary_hmac: 0,
             locked: false,
         };
 
@@ -196,6 +212,21 @@ impl<const N: usize> SecretBuffer<N> {
         };
         buf.canary_head = head;
         buf.canary_tail = tail;
+
+        // Compute and store HMAC over (address, canary_head, canary_tail) for
+        // tamper detection in verify_canaries().
+        {
+            use hmac::{Hmac, Mac};
+            use sha2::Sha512;
+            type HmacSha512 = Hmac<Sha512>;
+            let addr = buf.data.as_ptr() as u64;
+            let mut mac = HmacSha512::new_from_slice(canary_hmac_key()).expect("HMAC key size");
+            mac.update(&addr.to_ne_bytes());
+            mac.update(&head.to_ne_bytes());
+            mac.update(&tail.to_ne_bytes());
+            let result = mac.finalize().into_bytes();
+            buf.canary_hmac = u64::from_ne_bytes(result[..8].try_into().unwrap());
+        }
 
         // Attempt to mlock the data region.
         // SECURITY: mlock prevents key material from being swapped to disk.
@@ -269,14 +300,7 @@ impl<const N: usize> SecretBuffer<N> {
             use hmac::{Hmac, Mac};
             use sha2::Sha512;
             type HmacSha512 = Hmac<Sha512>;
-            // Process-wide canary HMAC key seeded once from CSPRNG.
-            static CANARY_KEY: std::sync::OnceLock<[u8; 64]> = std::sync::OnceLock::new();
-            let key = CANARY_KEY.get_or_init(|| {
-                let mut k = [0u8; 64];
-                getrandom::getrandom(&mut k).expect("FATAL: getrandom failed for canary key");
-                k
-            });
-            let mut mac = HmacSha512::new_from_slice(key).expect("HMAC key size");
+            let mut mac = HmacSha512::new_from_slice(canary_hmac_key()).expect("HMAC key size");
             mac.update(&hmac_input);
             mac.update(&self.canary_head.to_ne_bytes());
             mac.update(&self.canary_tail.to_ne_bytes());
@@ -284,11 +308,9 @@ impl<const N: usize> SecretBuffer<N> {
             u64::from_ne_bytes(result[..8].try_into().unwrap())
         };
         // The HMAC check ensures the canary pair hasn't been tampered with.
-        // On first call after construction, we store the expected value.
-        // Subsequent calls verify against it. Since we can't store the expected
-        // value in a separate structure (the buffer may move), we use the head/tail
-        // non-zero check as the primary defense and the XOR non-zero as secondary.
-        (head_ok & tail_ok & xor_ok).into()
+        // Compare freshly computed HMAC against the value stored at construction.
+        let hmac_ok: subtle::Choice = expected_check.ct_eq(&self.canary_hmac);
+        (head_ok & tail_ok & xor_ok & hmac_ok).into()
     }
 
     /// Borrow the protected data as a byte slice.
@@ -351,6 +373,7 @@ impl<const N: usize> Drop for SecretBuffer<N> {
         // 3. Zeroize canary material so it cannot be recovered.
         self.canary_head.zeroize();
         self.canary_tail.zeroize();
+        self.canary_hmac.zeroize();
     }
 }
 

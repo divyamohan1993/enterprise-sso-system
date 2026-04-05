@@ -47,9 +47,10 @@ impl KekShare {
         Self { index, value }
     }
 
-    /// Encode as hex for sealed storage.
-    pub fn to_hex(&self) -> String {
-        format!("{:02x}{}", self.index, hex::encode(self.value))
+    /// Encode as hex for sealed storage. Returns `Zeroizing<String>` to ensure
+    /// the hex-encoded share value is zeroized when dropped.
+    pub fn to_hex(&self) -> zeroize::Zeroizing<String> {
+        zeroize::Zeroizing::new(format!("{:02x}{}", self.index, hex::encode(self.value)))
     }
 
     /// Decode from hex.

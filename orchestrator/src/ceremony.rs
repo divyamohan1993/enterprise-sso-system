@@ -385,8 +385,13 @@ impl CeremonyPersistence for DatabaseCeremonyPersistence {
                 .as_secs(),
         };
 
-        let bytes = postcard::to_allocvec(&record)
+        let serialized_data = postcard::to_allocvec(&record)
             .map_err(|e| format!("L2 serialize: {e}"))?;
+
+        // Encrypt ceremony state before writing to disk
+        let master_kek = common::sealed_keys::get_master_kek();
+        let bytes = crypto::symmetric::encrypt(master_kek, &serialized_data, b"ceremony-state")
+            .map_err(|e| format!("Failed to encrypt ceremony state: {e}"))?;
 
         let filepath = dir.join(id_to_filename(id));
         match std::fs::write(&filepath, &bytes) {
@@ -412,7 +417,7 @@ impl CeremonyPersistence for DatabaseCeremonyPersistence {
         let dir = std::path::Path::new(&self.connection_url);
         let filepath = dir.join(id_to_filename(id));
 
-        let bytes = match std::fs::read(&filepath) {
+        let encrypted_bytes = match std::fs::read(&filepath) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => {
@@ -420,6 +425,11 @@ impl CeremonyPersistence for DatabaseCeremonyPersistence {
                 return Ok(None);
             }
         };
+
+        // Decrypt ceremony state after reading from disk
+        let master_kek = common::sealed_keys::get_master_kek();
+        let bytes = crypto::symmetric::decrypt(master_kek, &encrypted_bytes, b"ceremony-state")
+            .map_err(|e| format!("Failed to decrypt ceremony state: {e}"))?;
 
         let record: L2Record = postcard::from_bytes(&bytes)
             .map_err(|e| format!("L2 deserialize: {e}"))?;
@@ -446,15 +456,18 @@ impl CeremonyPersistence for DatabaseCeremonyPersistence {
             Err(_) => return Ok(ids),
         };
 
+        let master_kek = common::sealed_keys::get_master_kek();
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             if let Some(id) = filename_to_id(&name_str) {
-                // Check if active
-                if let Ok(bytes) = std::fs::read(entry.path()) {
-                    if let Ok(record) = postcard::from_bytes::<L2Record>(&bytes) {
-                        if record.state_tag != "complete" && record.state_tag != "failed" {
-                            ids.push(id);
+                // Check if active: read, decrypt, deserialize
+                if let Ok(encrypted_bytes) = std::fs::read(entry.path()) {
+                    if let Ok(decrypted) = crypto::symmetric::decrypt(master_kek, &encrypted_bytes, b"ceremony-state") {
+                        if let Ok(record) = postcard::from_bytes::<L2Record>(&decrypted) {
+                            if record.state_tag != "complete" && record.state_tag != "failed" {
+                                ids.push(id);
+                            }
                         }
                     }
                 }

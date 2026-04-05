@@ -96,31 +96,46 @@ impl Drop for SiemWebhookConfig {
 ///
 /// Returns `None` if no encryption key is configured.
 fn encrypt_payload_if_configured(payload: &[u8]) -> Option<String> {
-    let key_hex = std::env::var("MILNET_SIEM_ENCRYPTION_KEY").ok()?;
-    if key_hex.is_empty() {
-        return None;
-    }
+    use std::sync::OnceLock;
+    static SIEM_KEY: OnceLock<Option<[u8; 32]>> = OnceLock::new();
 
-    let key_bytes = match hex::decode(&key_hex) {
-        Ok(k) if k.len() == 32 => k,
-        Ok(k) => {
-            tracing::error!(
-                target: "siem",
-                "MILNET_SIEM_ENCRYPTION_KEY must be exactly 64 hex chars (256 bits), got {} bytes. \
-                 Skipping encryption.",
-                k.len()
-            );
+    let key = SIEM_KEY.get_or_init(|| {
+        let key_hex = std::env::var("MILNET_SIEM_ENCRYPTION_KEY").ok()?;
+        if key_hex.is_empty() {
             return None;
         }
-        Err(e) => {
-            tracing::error!(
-                target: "siem",
-                "MILNET_SIEM_ENCRYPTION_KEY is not valid hex: {}. Skipping encryption.",
-                e
-            );
-            return None;
+        // Remove from environment immediately
+        // Overwrite with zeros first to clear libc environ buffer
+        let zeros = "0".repeat(key_hex.len());
+        std::env::set_var("MILNET_SIEM_ENCRYPTION_KEY", &zeros);
+        std::env::remove_var("MILNET_SIEM_ENCRYPTION_KEY");
+
+        match hex::decode(&key_hex) {
+            Ok(k) if k.len() == 32 => {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&k);
+                Some(arr)
+            }
+            Ok(k) => {
+                tracing::error!(
+                    target: "siem",
+                    "MILNET_SIEM_ENCRYPTION_KEY must be exactly 64 hex chars (256 bits), got {} bytes. \
+                     Skipping encryption.",
+                    k.len()
+                );
+                None
+            }
+            Err(e) => {
+                tracing::error!(
+                    target: "siem",
+                    "Failed to decode MILNET_SIEM_ENCRYPTION_KEY: {e}"
+                );
+                None
+            }
         }
-    };
+    });
+
+    let key_bytes = (*key)?;
 
     use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
     use aes_gcm::Nonce;

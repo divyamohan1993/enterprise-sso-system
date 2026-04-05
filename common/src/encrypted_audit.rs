@@ -2,14 +2,14 @@
 //!
 //! Encrypts sensitive fields (user_ids, device_ids, event_type, risk_score,
 //! ceremony_receipts) before storage. Provides blind indexes for searchability
-//! using HMAC-SHA256.
+//! using HMAC-SHA512 (truncated to 32 bytes for index size compatibility).
 
 use crate::types::{AuditEventType, Receipt};
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::Sha512;
 use uuid::Uuid;
 
 /// AAD for audit metadata encryption.
@@ -18,7 +18,7 @@ const AUDIT_METADATA_AAD: &[u8] = b"MILNET-AUDIT-META-v1";
 /// Domain separator for audit blind index derivation.
 const AUDIT_BLIND_INDEX_KEY_DOMAIN: &[u8] = b"MILNET-AUDIT-BLIND-v1";
 
-type HmacSha256 = Hmac<Sha256>;
+type HmacSha512 = Hmac<Sha512>;
 
 /// Encrypted audit metadata — stored alongside the hash-chain fields.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -27,9 +27,9 @@ pub struct EncryptedAuditMetadata {
     pub nonce: [u8; 12],
     /// Encrypted blob containing serialized AuditMetadataPlaintext.
     pub ciphertext: Vec<u8>,
-    /// HMAC-SHA256 blind indexes for each user_id (for search).
+    /// HMAC-SHA512 blind indexes (truncated to 32 bytes) for each user_id (for search).
     pub user_blind_indexes: Vec<[u8; 32]>,
-    /// HMAC-SHA256 blind index for event_type (for filtering).
+    /// HMAC-SHA512 blind index (truncated to 32 bytes) for event_type (for filtering).
     pub event_type_blind_index: [u8; 32],
 }
 
@@ -46,7 +46,7 @@ struct AuditMetadataPlaintext {
 /// Encrypt audit metadata for an entry.
 ///
 /// Sensitive fields are AES-256-GCM encrypted with the provided key. Blind
-/// indexes are computed using HMAC-SHA256 so that encrypted entries remain
+/// indexes are computed using HMAC-SHA512 (truncated to 32 bytes) so that encrypted entries remain
 /// searchable by user_id or event_type without exposing plaintext.
 pub fn encrypt_audit_metadata(
     event_type: AuditEventType,
@@ -141,15 +141,22 @@ pub fn decrypt_audit_metadata(
     ))
 }
 
-/// Compute a blind index using HMAC-SHA256.
+/// Compute a blind index using HMAC-SHA512, truncated to 32 bytes for index compatibility.
+///
+/// CNSA 2.0 requires SHA-512 as the minimum hash strength. The output is
+/// truncated to 32 bytes to maintain the same blind index size as the previous
+/// HMAC-SHA256 implementation, preserving storage layout and search compatibility.
 fn compute_blind_index(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).unwrap_or_else(|e| {
-        tracing::error!("FATAL: HMAC-SHA256 key init failed for audit blind index: {e}");
+    let mut mac = <HmacSha512 as Mac>::new_from_slice(key).unwrap_or_else(|e| {
+        tracing::error!("FATAL: HMAC-SHA512 key init failed for audit blind index: {e}");
         std::process::exit(1);
     });
     mac.update(AUDIT_BLIND_INDEX_KEY_DOMAIN);
     mac.update(data);
-    mac.finalize().into_bytes().into()
+    let full_hash = mac.finalize().into_bytes();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&full_hash[..32]);
+    out
 }
 
 /// Compute a blind index for searching by user ID.

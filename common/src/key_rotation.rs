@@ -73,3 +73,105 @@ pub fn start_rotation_monitor(
 
     Ok(shutdown)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU32;
+
+    #[test]
+    fn rotation_schedule_default_values() {
+        let schedule = RotationSchedule::default();
+        assert_eq!(schedule.interval, Duration::from_secs(3600));
+        assert!(schedule.auto_rotate, "auto_rotate must default to true (production mode)");
+    }
+
+    #[test]
+    fn shutdown_handle_stops_monitor() {
+        // Use a very short interval so the monitor thread loops quickly.
+        let schedule = RotationSchedule {
+            interval: Duration::from_millis(10),
+            auto_rotate: false, // Don't call callback, just test shutdown
+        };
+        let shutdown = start_rotation_monitor(schedule, || Ok(())).unwrap();
+
+        // Let it run briefly, then signal shutdown.
+        std::thread::sleep(Duration::from_millis(50));
+        shutdown.store(true, Ordering::Relaxed);
+
+        // Give the thread time to observe the flag and exit.
+        std::thread::sleep(Duration::from_millis(30));
+        // If we get here without hanging, the shutdown handle works.
+        assert!(shutdown.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn monitor_invokes_callback_on_auto_rotate() {
+        let call_count = Arc::new(AtomicU32::new(0));
+        let count_clone = call_count.clone();
+
+        let schedule = RotationSchedule {
+            interval: Duration::from_millis(10),
+            auto_rotate: true,
+        };
+        let shutdown = start_rotation_monitor(schedule, move || {
+            count_clone.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        })
+        .unwrap();
+
+        // Let a few rotation cycles run.
+        std::thread::sleep(Duration::from_millis(80));
+        shutdown.store(true, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(30));
+
+        assert!(
+            call_count.load(Ordering::Relaxed) >= 1,
+            "rotation callback must be invoked at least once"
+        );
+    }
+
+    #[test]
+    fn monitor_handles_callback_error_without_crashing() {
+        let schedule = RotationSchedule {
+            interval: Duration::from_millis(10),
+            auto_rotate: true,
+        };
+        let shutdown = start_rotation_monitor(schedule, || {
+            Err("simulated rotation failure".to_string())
+        })
+        .unwrap();
+
+        // Let it run a few cycles with the failing callback.
+        std::thread::sleep(Duration::from_millis(80));
+        shutdown.store(true, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(30));
+        // No panic means the error path is handled gracefully.
+    }
+
+    #[test]
+    fn monitor_skips_callback_when_auto_rotate_false() {
+        let call_count = Arc::new(AtomicU32::new(0));
+        let count_clone = call_count.clone();
+
+        let schedule = RotationSchedule {
+            interval: Duration::from_millis(10),
+            auto_rotate: false,
+        };
+        let shutdown = start_rotation_monitor(schedule, move || {
+            count_clone.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        })
+        .unwrap();
+
+        std::thread::sleep(Duration::from_millis(80));
+        shutdown.store(true, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(30));
+
+        assert_eq!(
+            call_count.load(Ordering::Relaxed),
+            0,
+            "callback must NOT be invoked when auto_rotate is false"
+        );
+    }
+}

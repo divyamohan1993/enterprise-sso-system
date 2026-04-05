@@ -40,7 +40,16 @@ pub struct EncryptedPool {
 impl EncryptedPool {
     /// Wrap a raw pool with envelope encryption using the given master KEK.
     pub fn new(pool: PgPool, master_kek: [u8; 32]) -> Self {
-        Self { pool, master_kek }
+        let s = Self { pool, master_kek };
+        // Prevent master KEK from being swapped to disk
+        #[cfg(unix)]
+        unsafe {
+            let ptr = s.master_kek.as_ptr();
+            let len = s.master_kek.len();
+            libc::mlock(ptr as *const libc::c_void, len);
+            libc::madvise(ptr as *mut libc::c_void, len, libc::MADV_DONTDUMP);
+        }
+        s
     }
 
     /// Derive a per-table KEK using HKDF-SHA512.
@@ -205,6 +214,10 @@ impl EncryptedPool {
 
 impl Drop for EncryptedPool {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            libc::munlock(self.master_kek.as_ptr() as *const libc::c_void, self.master_kek.len());
+        }
         self.master_kek.zeroize();
     }
 }

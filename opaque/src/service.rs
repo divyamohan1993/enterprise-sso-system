@@ -20,6 +20,7 @@ use opaque_ke::{
     RegistrationRequest, RegistrationUpload,
     ServerLogin, ServerLoginParameters, ServerRegistration,
 };
+use common::log_pseudonym::{pseudonym_str, pseudonym_uuid};
 use tracing::{error, info};
 
 use crate::messages::{OpaqueRequest, OpaqueResponse};
@@ -417,10 +418,10 @@ pub async fn run(mut store: CredentialStore) -> Result<(), Box<dyn std::error::E
 
                             match &response {
                                 OpaqueResponse::LoginSuccess { .. } => {
-                                    info!("Authentication succeeded for user '{username}'");
+                                    info!("Authentication succeeded for user '{}'", pseudonym_str("username", &username));
                                 }
                                 OpaqueResponse::Error { message } => {
-                                    error!("Authentication failed for user '{username}': {message}");
+                                    error!("Authentication failed for user '{}': {message}", pseudonym_str("username", &username));
                                 }
                                 _ => {}
                             }
@@ -452,7 +453,7 @@ pub async fn run(mut store: CredentialStore) -> Result<(), Box<dyn std::error::E
                         };
                         let resp_bytes = postcard::to_allocvec(&response)?;
                         transport.send(&resp_bytes).await?;
-                        info!("Registration start for user '{username}'");
+                        info!("Registration start for user '{}'", pseudonym_str("username", &username));
                     }
                     Err(e) => {
                         let response = OpaqueResponse::Error { message: e.clone() };
@@ -471,7 +472,7 @@ pub async fn run(mut store: CredentialStore) -> Result<(), Box<dyn std::error::E
                         let response = OpaqueResponse::RegisterComplete { user_id };
                         let resp_bytes = postcard::to_allocvec(&response)?;
                         transport.send(&resp_bytes).await?;
-                        info!("Registration complete for user '{username}' (id={user_id})");
+                        info!("Registration complete for user '{}' (id={})", pseudonym_str("username", &username), pseudonym_uuid(user_id));
                     }
                     Err(e) => {
                         let response = OpaqueResponse::Error { message: e.clone() };
@@ -572,7 +573,7 @@ pub async fn run_threshold(
                 let partial_eval = threshold_server.partial_evaluate(&credential_request);
                 info!(
                     "Threshold server {} produced partial evaluation for user '{}'",
-                    server_id, username
+                    server_id, pseudonym_str("username", &username)
                 );
 
                 // Save proof prefix for logging before moving fields into response
@@ -608,7 +609,7 @@ pub async fn run_threshold(
                     "Threshold partial eval sent (server_id={}, proof={:02x?}) for user '{}'",
                     eval_server_id,
                     &proof_prefix,
-                    username,
+                    pseudonym_str("username", &username),
                 );
             }
             OpaqueRequest::RegisterStart {
@@ -619,7 +620,7 @@ pub async fn run_threshold(
                 let partial_eval = threshold_server.partial_evaluate(&registration_request);
                 info!(
                     "Threshold server {} produced partial registration eval for user '{}' (proof={:02x?})",
-                    server_id, username, &partial_eval.proof[..8],
+                    server_id, pseudonym_str("username", &username), &partial_eval.proof[..8],
                 );
 
                 // Process registration using the standard OPAQUE flow
@@ -632,7 +633,7 @@ pub async fn run_threshold(
                         };
                         let resp_bytes = postcard::to_allocvec(&response)?;
                         transport.send(&resp_bytes).await?;
-                        info!("Threshold registration start for user '{}' (server {})", username, server_id);
+                        info!("Threshold registration start for user '{}' (server {})", pseudonym_str("username", &username), server_id);
                     }
                     Err(e) => {
                         let response = OpaqueResponse::Error { message: e.clone() };
@@ -653,7 +654,7 @@ pub async fn run_threshold(
                         transport.send(&resp_bytes).await?;
                         info!(
                             "Threshold registration complete for user '{}' (id={}, server {})",
-                            username, user_id, server_id
+                            pseudonym_str("username", &username), pseudonym_uuid(user_id), server_id
                         );
                     }
                     Err(e) => {

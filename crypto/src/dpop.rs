@@ -10,7 +10,7 @@ use ml_dsa::{
     signature::{Signer, Verifier},
     KeyGen, MlDsa87, SigningKey, VerifyingKey,
 };
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha512};
 use zeroize::Zeroize;
 use common::domain;
 
@@ -117,14 +117,14 @@ pub fn dpop_key_hash(client_public_key: &[u8]) -> [u8; 64] {
 
 /// Generate a DPoP proof using ML-DSA-87 (CNSA 2.0 compliant, Level 5).
 ///
-/// Signs SHA-256(claims_bytes || timestamp_bytes) with the provided ML-DSA-87
+/// Signs SHA-512(claims_bytes || timestamp_bytes) with the provided ML-DSA-87
 /// signing key. Returns the encoded ML-DSA-87 signature bytes.
 pub fn generate_dpop_proof(
     signing_key: &DpopSigningKey,
     claims_bytes: &[u8],
     timestamp: i64,
 ) -> Vec<u8> {
-    let mut hasher = Sha256::new();
+    let mut hasher = Sha512::new();
     hasher.update(claims_bytes);
     hasher.update(&timestamp.to_le_bytes());
     let digest = hasher.finalize();
@@ -138,7 +138,7 @@ const DPOP_MAX_AGE_SECS: i64 = 30;
 
 /// Verify a DPoP proof using ML-DSA-87 (CNSA 2.0 compliant, Level 5).
 ///
-/// Verifies the ML-DSA-87 signature over SHA-256(claims_bytes || timestamp_bytes)
+/// Verifies the ML-DSA-87 signature over SHA-512(claims_bytes || timestamp_bytes)
 /// against the provided verifying key bytes. Also checks the key hash matches
 /// and rejects proofs where the timestamp deviates more than `DPOP_MAX_AGE_SECS`
 /// seconds from the current system clock.
@@ -172,7 +172,7 @@ pub fn verify_dpop_proof(
     };
 
     // 3. Recompute the digest and verify
-    let mut hasher = Sha256::new();
+    let mut hasher = Sha512::new();
     hasher.update(claims_bytes);
     hasher.update(&timestamp.to_le_bytes());
     let digest = hasher.finalize();

@@ -38,6 +38,10 @@ fn verify_receipt_with_key(receipt: &Receipt, key: &ReceiptVerificationKey<'_>) 
             if crypto::receipts::verify_receipt_asymmetric(mldsa87_key, &data, &receipt.signature) {
                 true
             } else {
+                // If PQ-only mode is enforced, do not fall back to HMAC
+                if std::env::var("MILNET_RECEIPT_PQ_ONLY").is_ok() {
+                    return false;
+                }
                 verify_receipt_signature(receipt, hmac_key).unwrap_or(false)
             }
         }

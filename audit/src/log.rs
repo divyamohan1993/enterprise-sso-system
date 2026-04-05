@@ -386,21 +386,20 @@ impl AuditLog {
                 .join(format!("audit_archive_{}.enc", timestamp));
             encrypt_and_write_archive(kek, &archive_path, &json_data).map(|()| archive_path)
         } else {
+            // SECURITY: Never write plaintext audit archives. Derive an archive KEK
+            // from the master KEK if no explicit archive KEK is configured.
+            use zeroize::Zeroize;
+            let fallback_kek = common::sealed_keys::get_master_kek();
+            use hkdf::Hkdf;
+            let hk = Hkdf::<Sha512>::new(Some(b"MILNET-AUDIT-ARCHIVE-KEK-v1"), fallback_kek);
+            let mut derived_kek = [0u8; 32];
+            hk.expand(b"audit-archive", &mut derived_kek)
+                .map_err(|_| "HKDF-SHA512 audit archive KEK derivation failed".to_string())?;
             let archive_path = std::path::Path::new(archive_dir)
-                .join(format!("audit_archive_{}.jsonl", timestamp));
-            #[cfg(unix)]
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .mode(0o600)
-                .open(&archive_path)
-                .map_err(|e| format!("failed to open archive file {:?}: {}", archive_path, e))?;
-            std::io::Write::write_all(&mut file, &json_data)
-                .map_err(|e| format!("failed to write to archive: {}", e))?;
-            file.sync_data()
-                .map_err(|e| format!("failed to sync archive file: {}", e))?;
-            Ok(archive_path)
+                .join(format!("audit_archive_{}.enc", timestamp));
+            let result = encrypt_and_write_archive(&derived_kek, &archive_path, &json_data);
+            derived_kek.zeroize();
+            result.map(|()| archive_path)
         };
 
         match write_result {

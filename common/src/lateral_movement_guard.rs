@@ -10,11 +10,11 @@
 
 use crate::types::ModuleId;
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sha2::Sha512;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-type HmacSha256 = Hmac<Sha256>;
+type HmacSha512 = Hmac<Sha512>;
 
 /// A communication channel between two modules.
 /// Represented as an ordered pair `(source, destination)`.
@@ -33,8 +33,8 @@ pub struct ChannelBinding {
     pub nonce: [u8; 16],
     /// Unix timestamp (seconds) when the binding was created.
     pub timestamp: i64,
-    /// HMAC-SHA256 over (channel_id || nonce || timestamp).
-    pub hmac: [u8; 32],
+    /// HMAC-SHA512 over (channel_id || nonce || timestamp).
+    pub hmac: [u8; 64],
 }
 
 /// Alert level for lateral movement detection.
@@ -225,18 +225,18 @@ impl Default for LateralMovementDetector {
     }
 }
 
-/// Compute the HMAC-SHA256 for a channel binding.
+/// Compute the HMAC-SHA512 for a channel binding (CNSA 2.0 compliant).
 fn compute_binding_mac(
     channel: ChannelId,
     nonce: &[u8; 16],
     timestamp: i64,
     hmac_key: &[u8; 64],
-) -> [u8; 32] {
+) -> [u8; 64] {
     let mut mac =
-        match HmacSha256::new_from_slice(hmac_key) {
+        match HmacSha512::new_from_slice(hmac_key) {
             Ok(m) => m,
             Err(e) => {
-                tracing::error!("FATAL: HMAC-SHA256 key init failed for channel binding: {e}");
+                tracing::error!("FATAL: HMAC-SHA512 key init failed for channel binding: {e}");
                 std::process::exit(1);
             }
         };
@@ -244,7 +244,7 @@ fn compute_binding_mac(
     mac.update(nonce);
     mac.update(&timestamp.to_le_bytes());
     let result = mac.finalize().into_bytes();
-    let mut out = [0u8; 32];
+    let mut out = [0u8; 64];
     out.copy_from_slice(&result);
     out
 }

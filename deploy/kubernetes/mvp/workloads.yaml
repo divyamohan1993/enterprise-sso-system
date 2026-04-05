@@ -19,6 +19,7 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "10100"
     spec:
+      automountServiceAccountToken: false
       containers:
         - name: gateway
           image: milnet/gateway:dev
@@ -43,6 +44,15 @@ spec:
                 secretKeyRef:
                   name: milnet-master-kek
                   key: MILNET_MASTER_KEK
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - IPC_LOCK
           resources:
             requests:
               cpu: 100m
@@ -82,6 +92,7 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "10101"
     spec:
+      automountServiceAccountToken: false
       containers:
         - name: orchestrator
           image: milnet/orchestrator:dev
@@ -105,6 +116,15 @@ spec:
                 secretKeyRef:
                   name: milnet-master-kek
                   key: MILNET_MASTER_KEK
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - IPC_LOCK
           resources:
             requests:
               cpu: 100m
@@ -138,6 +158,7 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "10103"
     spec:
+      automountServiceAccountToken: false
       containers:
         - name: tss-coordinator
           image: milnet/tss:dev
@@ -158,6 +179,15 @@ spec:
                 secretKeyRef:
                   name: milnet-master-kek
                   key: MILNET_MASTER_KEK
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - IPC_LOCK
           resources:
             requests:
               cpu: 100m
@@ -191,6 +221,7 @@ spec:
       annotations:
         prometheus.io/scrape: "true"
     spec:
+      automountServiceAccountToken: false
       containers:
         - name: tss-signer
           image: milnet/tss:dev
@@ -208,6 +239,15 @@ spec:
                 secretKeyRef:
                   name: milnet-master-kek
                   key: MILNET_MASTER_KEK
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - IPC_LOCK
           resources:
             requests:
               cpu: 200m
@@ -245,6 +285,7 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "10102"
     spec:
+      automountServiceAccountToken: false
       containers:
         - name: opaque
           image: milnet/opaque:dev
@@ -263,6 +304,15 @@ spec:
                 secretKeyRef:
                   name: milnet-master-kek
                   key: MILNET_MASTER_KEK
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - IPC_LOCK
           resources:
             requests:
               cpu: 200m
@@ -296,6 +346,7 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "10104"
     spec:
+      automountServiceAccountToken: false
       containers:
         - name: verifier
           image: milnet/verifier:dev
@@ -314,6 +365,15 @@ spec:
                 secretKeyRef:
                   name: milnet-master-kek
                   key: MILNET_MASTER_KEK
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - IPC_LOCK
           resources:
             requests:
               cpu: 100m
@@ -347,6 +407,7 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "10105"
     spec:
+      automountServiceAccountToken: false
       containers:
         - name: ratchet
           image: milnet/ratchet:dev
@@ -370,6 +431,15 @@ spec:
                 secretKeyRef:
                   name: milnet-master-kek
                   key: MILNET_MASTER_KEK
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - IPC_LOCK
           resources:
             requests:
               cpu: 100m
@@ -403,6 +473,7 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "10106"
     spec:
+      automountServiceAccountToken: false
       containers:
         - name: risk
           image: milnet/risk:dev
@@ -421,6 +492,15 @@ spec:
                 secretKeyRef:
                   name: milnet-master-kek
                   key: MILNET_MASTER_KEK
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - IPC_LOCK
           resources:
             requests:
               cpu: 100m
@@ -454,6 +534,7 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "10108"
     spec:
+      automountServiceAccountToken: false
       containers:
         - name: audit
           image: milnet/audit:dev
@@ -472,6 +553,15 @@ spec:
                 secretKeyRef:
                   name: milnet-master-kek
                   key: MILNET_MASTER_KEK
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - IPC_LOCK
           resources:
             requests:
               cpu: 100m
@@ -509,6 +599,7 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "10109"
     spec:
+      automountServiceAccountToken: false
       containers:
         - name: kt
           image: milnet/kt:dev
@@ -527,6 +618,15 @@ spec:
                 secretKeyRef:
                   name: milnet-master-kek
                   key: MILNET_MASTER_KEK
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - IPC_LOCK
           resources:
             requests:
               cpu: 100m
@@ -564,6 +664,7 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "9080"
     spec:
+      automountServiceAccountToken: false
       containers:
         - name: admin
           image: milnet/admin:dev
@@ -587,6 +688,15 @@ spec:
                 secretKeyRef:
                   name: milnet-master-kek
                   key: MILNET_MASTER_KEK
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - IPC_LOCK
           resources:
             requests:
               cpu: 100m

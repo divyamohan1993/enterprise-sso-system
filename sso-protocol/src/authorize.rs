@@ -587,7 +587,12 @@ impl PersistentAuthorizationStore {
             // Either the code doesn't exist or was already consumed by another instance.
             // Ensure the in-memory cache is consistent: try consuming (which will also
             // fail if already consumed) and then clean up.
-            let _ = self.memory.consume_code(code);
+            if self.memory.consume_code(code).is_none() {
+                tracing::debug!(
+                    target: "siem",
+                    "Authorization code not found in memory cache during DB-authoritative consume — expected for cross-instance scenarios"
+                );
+            }
             sqlx::query("DELETE FROM authorization_codes WHERE code_hash = $1 AND consumed = TRUE")
                 .bind(&hashed_key)
                 .execute(&self.pool)

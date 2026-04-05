@@ -54,10 +54,16 @@ impl Drop for SignerShare {
         let mut id_bytes = self.identifier.serialize();
         id_bytes.zeroize();
         // Best-effort zeroize of KeyPackage: serialize to get bytes, then zero them.
-        // The actual secret scalar lives in frost-ristretto255 internals, but clearing
-        // the serialized form reduces attack surface for memory forensics.
         let mut kp_bytes = self.key_package.serialize().expect("KeyPackage serialize for zeroization");
         kp_bytes.zeroize();
+        // Defense-in-depth: volatile write zeros over the entire struct memory.
+        // This catches any internal scalar state that serialize() doesn't cover.
+        #[allow(unsafe_code)]
+        unsafe {
+            let ptr = self as *mut Self as *mut u8;
+            let len = std::mem::size_of::<Self>();
+            core::ptr::write_bytes(ptr, 0, len);
+        }
     }
 }
 

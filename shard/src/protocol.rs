@@ -28,11 +28,13 @@ impl SecurePayload {
         &self.0
     }
 
-    pub fn into_inner(mut self) -> Vec<u8> {
+    /// Returns the inner bytes, wrapping them in `Zeroizing<Vec<u8>>` to maintain
+    /// zeroize-on-drop guarantees. The caller receives owned data that will still
+    /// be zeroized when dropped.
+    pub fn into_inner(mut self) -> zeroize::Zeroizing<Vec<u8>> {
         let inner = std::mem::take(&mut self.0);
-        // self.0 is now empty, will be zeroized on drop (no-op)
-        std::mem::forget(self); // Don't double-zeroize
-        inner
+        std::mem::forget(self); // self.0 is now empty
+        zeroize::Zeroizing::new(inner)
     }
 }
 
@@ -1275,6 +1277,6 @@ mod tests {
     fn test_secure_payload_into_inner() {
         let payload = SecurePayload(vec![1, 2, 3]);
         let inner = payload.into_inner();
-        assert_eq!(inner, vec![1, 2, 3]);
+        assert_eq!(&*inner, &vec![1, 2, 3]);
     }
 }
