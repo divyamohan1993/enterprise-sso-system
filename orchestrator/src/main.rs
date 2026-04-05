@@ -188,7 +188,7 @@ async fn main() {
     };
 
     tokio::select! {
-        result = service.run(&listen_addr) => {
+        result = std::sync::Arc::new(service).run(&listen_addr) => {
             if let Err(e) = result {
                 tracing::error!("Orchestrator exited with error: {e}");
                 if let Some(c) = cluster {
