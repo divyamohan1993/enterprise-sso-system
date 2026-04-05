@@ -186,6 +186,7 @@ pub enum MfaEnrollmentStatus {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TotpEnrollment {
     /// TOTP secret (base32 encoded).
+    /// SECURITY: Zeroized on Drop to prevent memory forensics extraction.
     #[serde(skip_serializing)]
     pub secret: String,
     /// Provisioning URI for QR code generation.

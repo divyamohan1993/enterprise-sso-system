@@ -541,7 +541,13 @@ pub fn establish_channel(
     our_identity: &EnclaveIdentity,
     their_identity: &EnclaveIdentity,
     session_id: &[u8; 16],
-) -> EnclaveChannel {
+) -> Result<EnclaveChannel, String> {
+    // SECURITY: Block classical-only channel establishment in military deployment.
+    // Returns Err instead of panicking to allow graceful error handling upstream.
+    if std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok() {
+        return Err("classical X25519-only enclave channels are forbidden in military deployment -- use establish_channel_xwing()".into());
+    }
+
     // FATAL in production: quantum-vulnerable X25519-only channel
     if common::sealed_keys::is_production() {
         panic!(
@@ -562,12 +568,12 @@ pub fn establish_channel(
         session_id,
     );
 
-    EnclaveChannel {
+    Ok(EnclaveChannel {
         session_id: *session_id,
         session_key,
         local_identity: our_identity.clone(),
         remote_identity: their_identity.clone(),
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------

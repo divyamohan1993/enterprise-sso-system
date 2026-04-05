@@ -18,6 +18,11 @@ type HmacSha512 = Hmac<Sha512>;
 const MAX_SESSION_EPOCHS: u64 = 2880;
 
 /// Default max token lifetime for lazy cleanup (8 hours in seconds).
+///
+/// NOTE: This is the standard access token lifetime for regular users.
+/// Intentionally different from:
+///   - admin/src/routes.rs::MAX_TOKEN_LIFETIME_SECS (15m) -- admin session timeout
+///   - sso-protocol/src/tokens.rs::MAX_TOKEN_LIFETIME_SECS (24h) -- absolute ceiling
 const DEFAULT_MAX_TOKEN_LIFETIME_SECS: i64 = 8 * 60 * 60;
 
 /// Maximum DPoP timestamp tolerance (seconds). Proofs older than this are rejected.

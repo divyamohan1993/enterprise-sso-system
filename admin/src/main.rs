@@ -43,8 +43,12 @@ async fn main() {
         }
     };
 
-    // SECURITY: Remove ADMIN_API_KEY from environment after reading to prevent
-    // leakage via /proc/pid/environ or child process inheritance.
+    // SECURITY: Overwrite ADMIN_API_KEY with zeros before removing to prevent
+    // residual plaintext in process memory, then remove from environment to
+    // prevent leakage via /proc/pid/environ or child process inheritance.
+    if let Ok(val) = std::env::var("ADMIN_API_KEY") {
+        std::env::set_var("ADMIN_API_KEY", "0".repeat(val.len()));
+    }
     std::env::remove_var("ADMIN_API_KEY");
 
     let db_url = std::env::var("DATABASE_URL")
@@ -58,8 +62,11 @@ async fn main() {
     };
     tracing::info!("Connected to PostgreSQL");
 
-    // SECURITY: Remove DATABASE_URL from environment now that the connection
-    // pool is established. Credentials must not linger in /proc/pid/environ.
+    // SECURITY: Overwrite DATABASE_URL with zeros before removing to prevent
+    // residual plaintext in process memory. Credentials must not linger.
+    if let Ok(val) = std::env::var("DATABASE_URL") {
+        std::env::set_var("DATABASE_URL", "0".repeat(val.len()));
+    }
     std::env::remove_var("DATABASE_URL");
 
     // ── HA pool with primary/replica routing ──
@@ -92,7 +99,10 @@ async fn main() {
         }
     };
 
-    // SECURITY: Remove replica connection strings from environment after use.
+    // SECURITY: Overwrite replica connection strings with zeros before removing.
+    if let Ok(val) = std::env::var("DATABASE_REPLICA_URLS") {
+        std::env::set_var("DATABASE_REPLICA_URLS", "0".repeat(val.len()));
+    }
     std::env::remove_var("DATABASE_REPLICA_URLS");
 
     if replica_urls.is_empty() {
@@ -261,9 +271,15 @@ async fn main() {
         std::env::var("SSO_BASE_URL"),
     ) {
         (Ok(cid), Ok(csec), Ok(base)) => {
-            // SECURITY: Remove OAuth secrets from environment after reading.
+            // SECURITY: Overwrite OAuth secrets with zeros before removing.
             // These must not linger in /proc/pid/environ.
+            if let Ok(val) = std::env::var("GOOGLE_CLIENT_ID") {
+                std::env::set_var("GOOGLE_CLIENT_ID", "0".repeat(val.len()));
+            }
             std::env::remove_var("GOOGLE_CLIENT_ID");
+            if let Ok(val) = std::env::var("GOOGLE_CLIENT_SECRET") {
+                std::env::set_var("GOOGLE_CLIENT_SECRET", "0".repeat(val.len()));
+            }
             std::env::remove_var("GOOGLE_CLIENT_SECRET");
             tracing::info!("Google OAuth configured");
             Some(admin::google_oauth::GoogleOAuthConfig {
@@ -415,8 +431,11 @@ async fn main() {
     let tls_cert = std::env::var("ADMIN_TLS_CERT").ok();
     let tls_key = std::env::var("ADMIN_TLS_KEY").ok();
 
-    // SECURITY: Remove TLS key path from environment after reading.
+    // SECURITY: Overwrite TLS key path with zeros before removing.
     // The path itself can reveal filesystem layout to an attacker.
+    if let Ok(val) = std::env::var("ADMIN_TLS_KEY") {
+        std::env::set_var("ADMIN_TLS_KEY", "0".repeat(val.len()));
+    }
     std::env::remove_var("ADMIN_TLS_KEY");
 
     let require_tls = std::env::var("REQUIRE_TLS")

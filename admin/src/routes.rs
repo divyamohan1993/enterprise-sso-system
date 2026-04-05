@@ -144,7 +144,14 @@ async fn check_and_mark_csrf_used(token: &str, used_tokens: &RwLock<HashSet<Stri
 /// Maximum number of entries in the in-memory revocation set.
 const MAX_REVOCATION_ENTRIES: usize = 100_000;
 
-/// Maximum token lifetime — entries older than this are eligible for cleanup.
+/// Maximum token lifetime for admin revocation list cleanup (15 minutes).
+///
+/// NOTE: This is intentionally shorter than the verifier's 8-hour and the
+/// protocol's 24-hour ceilings. Admin sessions use short-lived tokens per
+/// NIST SP 800-63B AAL3 inactivity timeout. The revocation list only needs
+/// to retain entries for as long as an admin token could still be valid.
+/// See also: verifier/src/verify.rs::DEFAULT_MAX_TOKEN_LIFETIME_SECS (8h)
+///           sso-protocol/src/tokens.rs::MAX_TOKEN_LIFETIME_SECS (24h)
 const MAX_TOKEN_LIFETIME_SECS: i64 = 15 * 60;
 
 /// An entry in the revocation set, tracking when it was revoked for cleanup.

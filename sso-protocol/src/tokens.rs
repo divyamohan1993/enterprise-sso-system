@@ -267,6 +267,11 @@ pub const AAL3_INACTIVITY_TIMEOUT_SECS: i64 = 15 * 60;
 pub const ACCESS_TOKEN_LIFETIME_SECS: i64 = 3600;
 
 /// Maximum token lifetime ceiling -- no token may exceed 24 hours regardless of AAL.
+///
+/// NOTE: This is the absolute upper bound for any token in the system.
+/// Individual contexts enforce tighter limits:
+///   - admin/src/routes.rs::MAX_TOKEN_LIFETIME_SECS (15m) -- admin session timeout
+///   - verifier/src/verify.rs::DEFAULT_MAX_TOKEN_LIFETIME_SECS (8h) -- access tokens
 pub const MAX_TOKEN_LIFETIME_SECS: i64 = 24 * 3600;
 
 /// A refresh token bound to a specific user and client.
