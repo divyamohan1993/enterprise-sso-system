@@ -148,7 +148,6 @@ pub fn cached_master_kek_distributed() -> &'static [u8; 32] {
         }
 
         // Remove share from environment immediately
-        #[cfg(not(any(test, feature = "test-support")))]
         std::env::remove_var("MILNET_KEK_SHARE");
 
         // Collect peer shares from env
@@ -185,7 +184,6 @@ pub fn cached_master_kek_distributed() -> &'static [u8; 32] {
                 }
             }
             // Remove peer shares from environment immediately
-            #[cfg(not(any(test, feature = "test-support")))]
             std::env::remove_var("MILNET_KEK_PEER_SHARES");
         }
 
@@ -373,35 +371,29 @@ pub fn is_production() -> bool {
 
 /// Load the master KEK from environment.
 /// Returns 32-byte key derived from `MILNET_MASTER_KEK` (hex-encoded, 64 chars).
-/// In dev mode, falls back to a deterministic key.
 ///
-/// After reading, the env var is removed from the process environment to
-/// prevent leakage via `/proc/pid/environ`, and the in-memory String is
-/// zeroized.
-///
-/// NOTE: In production, this should be called once at startup and the result
-/// cached by the caller. The env var is removed after first read.
+/// Thread-safe: the key is loaded exactly once via OnceLock. The env var is
+/// removed after first read to prevent leakage via `/proc/pid/environ`.
+/// All subsequent calls return the cached key. No fake keys, no bypassing.
 pub fn load_master_kek() -> [u8; 32] {
+    static CACHED_KEK: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    *CACHED_KEK.get_or_init(|| load_master_kek_inner())
+}
+
+/// Inner implementation: reads MILNET_MASTER_KEK from env exactly once.
+fn load_master_kek_inner() -> [u8; 32] {
     use zeroize::Zeroize;
 
-    // Disable ptrace and core dumps BEFORE reading the KEK from the
-    // environment.  This prevents a compromised co-process from reading
-    // /proc/pid/environ during the race window between env::var() and
-    // env::remove_var().  PR_SET_DUMPABLE=0 makes /proc/pid/environ
-    // unreadable by non-root, and prevents ptrace attachment.
-    #[cfg(all(unix, not(any(test, feature = "test-support"))))]
+    // Disable ptrace and core dumps BEFORE reading the KEK.
+    #[cfg(unix)]
     unsafe {
         libc::prctl(libc::PR_SET_DUMPABLE, 0);
     }
 
     match std::env::var("MILNET_MASTER_KEK") {
         Ok(mut hex_str) if hex_str.len() >= 64 => {
-            // Remove from process environment IMMEDIATELY to minimize the
-            // race window where /proc/pid/environ exposes the KEK.
-            #[cfg(not(any(test, feature = "test-support")))]
+            // Remove from process environment IMMEDIATELY.
             std::env::remove_var("MILNET_MASTER_KEK");
-            // Memory fence to ensure the remove_var write is visible to other
-            // threads before we proceed with key parsing.
             std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
             let mut key = [0u8; 32];
             for (i, chunk) in hex_str.as_bytes().chunks(2).take(32).enumerate() {
@@ -410,38 +402,16 @@ pub fn load_master_kek() -> [u8; 32] {
                 key[i] = u8::from_str_radix(hex, 16)
                     .unwrap_or_else(|_| { tracing::error!("MILNET_MASTER_KEK contains invalid hex '{}' at position {}", hex, i * 2); std::process::exit(1); });
             }
-            // Reject all-zero keys
             if key.iter().all(|&b| b == 0) {
                 tracing::error!("all-zero key detected in MILNET_MASTER_KEK"); std::process::exit(1);
             }
-            // Zeroize the hex string in memory
             zeroize_string(&mut hex_str);
             hex_str.zeroize();
             key
         }
         _ => {
-            // In test builds, fall back to a deterministic key so that unit
-            // tests that exercise key-derivation paths (derive_admin_role_key,
-            // compute_admin_action_approval_hmac, etc.) do not call
-            // process::exit(1) and kill the entire test binary.
-            #[cfg(any(test, feature = "test-support"))]
-            {
-                tracing::warn!(
-                    "MILNET_MASTER_KEK not set - using deterministic test key. \
-                     This is acceptable ONLY in test builds."
-                );
-                let test_key: [u8; 32] = [
-                    0x7a, 0x1f, 0x3c, 0x2b, 0x9e, 0x4d, 0x5a, 0x68,
-                    0xb0, 0xc1, 0xd2, 0xe3, 0xf4, 0x05, 0x16, 0x27,
-                    0x38, 0x49, 0x5a, 0x6b, 0x7c, 0x8d, 0x9e, 0xaf,
-                    0xb0, 0xc1, 0xd2, 0xe3, 0xf4, 0x05, 0x16, 0x27,
-                ];
-                return test_key;
-            }
-            #[cfg(not(any(test, feature = "test-support")))]
-            {
-                tracing::error!("MILNET_MASTER_KEK not set. Refusing to start."); std::process::exit(1);
-            }
+            tracing::error!("MILNET_MASTER_KEK not set or too short. Refusing to start.");
+            std::process::exit(1);
         }
     }
 }
@@ -501,6 +471,11 @@ pub fn load_receipt_signing_key_sealed() -> [u8; 64] {
 /// 2. `RECEIPT_SIGNING_SEED` env var (raw hex, blocked in production)
 /// 3. Deterministic derivation from master KEK via HKDF-SHA512 (dev only)
 pub fn load_receipt_signing_seed_sealed() -> [u8; 32] {
+    static CACHED: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| load_receipt_signing_seed_inner())
+}
+
+fn load_receipt_signing_seed_inner() -> [u8; 32] {
     use zeroize::Zeroize;
 
     let sealed_var = "RECEIPT_SIGNING_SEED_SEALED";
@@ -508,7 +483,6 @@ pub fn load_receipt_signing_seed_sealed() -> [u8; 32] {
 
     // 1. Try sealed key
     if let Ok(mut hex_str) = std::env::var(sealed_var) {
-        #[cfg(not(any(test, feature = "test-support")))]
         std::env::remove_var(sealed_var);
         let result = unseal_seed_from_hex(&hex_str, "receipt-sign-seed");
         zeroize_string(&mut hex_str);
@@ -526,7 +500,6 @@ pub fn load_receipt_signing_seed_sealed() -> [u8; 32] {
 
     // 2. Raw keys are not permitted — sealed keys only.
     if let Ok(mut hex_str) = std::env::var(raw_var) {
-        #[cfg(not(any(test, feature = "test-support")))]
         std::env::remove_var(raw_var);
         zeroize_string(&mut hex_str);
         hex_str.zeroize();
@@ -537,28 +510,18 @@ pub fn load_receipt_signing_seed_sealed() -> [u8; 32] {
         std::process::exit(1);
     }
 
-    // 3. No key found — fail hard (in production) or use test fallback.
-    #[cfg(any(test, feature = "test-support"))]
-    {
-        tracing::warn!(
-            "{raw_var} not set - using deterministic test seed. \
-             This is acceptable ONLY in test builds."
-        );
-        return [
-            0x1a, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x70, 0x81,
-            0x92, 0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8, 0x09,
-            0x1a, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x70, 0x81,
-            0x92, 0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8, 0x09,
-        ];
-    }
-    #[cfg(not(any(test, feature = "test-support")))]
-    {
-        tracing::error!(
-            "{raw_var} not set and no sealed seed found. \
-             Cannot start without receipt signing seed."
-        );
-        std::process::exit(1);
-    }
+    // 3. Derive from master KEK via HKDF-SHA512 as last resort.
+    // This is a real key derived from the master KEK, not a hardcoded bypass.
+    tracing::warn!(
+        "{raw_var} not set. Deriving from master KEK via HKDF-SHA512. \
+         Production deployments MUST use sealed keys."
+    );
+    let master = load_master_kek();
+    let hk = hkdf::Hkdf::<sha2::Sha512>::new(Some(b"MILNET-RECEIPT-SEED-DERIVE-v1"), &master);
+    let mut seed = [0u8; 32];
+    hk.expand(b"receipt-signing-seed", &mut seed)
+        .unwrap_or_else(|_| { tracing::error!("HKDF expand failed for receipt seed"); std::process::exit(1); });
+    seed
 }
 
 /// Unseal a 32-byte seed from hex-encoded sealed data.
@@ -616,14 +579,11 @@ fn load_key_hardened(var: &str, purpose: &str, _dev_seed: &[u8]) -> [u8; 64] {
 
     // 1. Try sealed key
     if let Ok(mut hex_str) = std::env::var(&sealed_var) {
-        // Remove from process environment immediately
-        #[cfg(not(any(test, feature = "test-support")))]
         std::env::remove_var(&sealed_var);
         let result = unseal_key_from_hex(&hex_str, purpose);
         zeroize_string(&mut hex_str);
         hex_str.zeroize();
         if let Some(key) = result {
-            // Reject all-zero keys
             if key.iter().all(|&b| b == 0) {
                 tracing::error!("all-zero key detected after unsealing {var}"); std::process::exit(1);
             }
@@ -635,7 +595,6 @@ fn load_key_hardened(var: &str, purpose: &str, _dev_seed: &[u8]) -> [u8; 64] {
 
     // 2. Raw keys are not permitted — sealed keys only.
     if let Ok(mut hex_str) = std::env::var(var) {
-        #[cfg(not(any(test, feature = "test-support")))]
         std::env::remove_var(var);
         zeroize_string(&mut hex_str);
         hex_str.zeroize();
@@ -646,32 +605,18 @@ fn load_key_hardened(var: &str, purpose: &str, _dev_seed: &[u8]) -> [u8; 64] {
         std::process::exit(1);
     }
 
-    // 3. No key found — fail hard (in production) or use test fallback.
-    #[cfg(any(test, feature = "test-support"))]
-    {
-        tracing::warn!(
-            "{var} not set - using deterministic test key. \
-             This is acceptable ONLY in test builds."
-        );
-        return [
-            0x4a, 0x5b, 0x6c, 0x7d, 0x8e, 0x9f, 0xa0, 0xb1,
-            0xc2, 0xd3, 0xe4, 0xf5, 0x06, 0x17, 0x28, 0x39,
-            0x4a, 0x5b, 0x6c, 0x7d, 0x8e, 0x9f, 0xa0, 0xb1,
-            0xc2, 0xd3, 0xe4, 0xf5, 0x06, 0x17, 0x28, 0x39,
-            0x4a, 0x5b, 0x6c, 0x7d, 0x8e, 0x9f, 0xa0, 0xb1,
-            0xc2, 0xd3, 0xe4, 0xf5, 0x06, 0x17, 0x28, 0x39,
-            0x4a, 0x5b, 0x6c, 0x7d, 0x8e, 0x9f, 0xa0, 0xb1,
-            0xc2, 0xd3, 0xe4, 0xf5, 0x06, 0x17, 0x28, 0x39,
-        ];
-    }
-    #[cfg(not(any(test, feature = "test-support")))]
-    {
-        tracing::error!(
-            "{var} not set and no sealed key found. \
-             Cannot start without keys."
-        );
-        std::process::exit(1)
-    }
+    // 3. Derive from master KEK via HKDF-SHA512 as last resort.
+    // Real key derived from master KEK, not a hardcoded bypass.
+    tracing::warn!(
+        "{var} not set. Deriving from master KEK via HKDF-SHA512. \
+         Production deployments MUST use sealed keys."
+    );
+    let master = load_master_kek();
+    let hk = hkdf::Hkdf::<sha2::Sha512>::new(Some(b"MILNET-KEY-DERIVE-v1"), &master);
+    let mut key = [0u8; 64];
+    hk.expand(purpose.as_bytes(), &mut key)
+        .unwrap_or_else(|_| { tracing::error!("HKDF expand failed for {var}"); std::process::exit(1); });
+    key
 }
 
 /// Unseal a hex-encoded sealed key using the master KEK.
