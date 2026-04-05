@@ -207,6 +207,16 @@ fn verify_token_core(
         ));
     }
 
+    // 3b. Check iat is not in the future (with clock skew tolerance).
+    // Tokens issued in the future indicate clock manipulation or replay
+    // of pre-generated tokens. Tolerance: 10 seconds per NIST SP 800-63B.
+    const IAT_SKEW_TOLERANCE_US: i64 = 10_000_000; // 10 seconds in microseconds
+    if token.claims.iat > now + IAT_SKEW_TOLERANCE_US {
+        return Err(MilnetError::CryptoVerification(
+            "token iat is in the future beyond clock skew tolerance".into(),
+        ));
+    }
+
     // 4. DPoP channel binding enforcement (MANDATORY, unconditional):
     //
     //    Policy matrix:
