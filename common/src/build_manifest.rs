@@ -106,7 +106,10 @@ pub fn sha256_bytes(data: &[u8]) -> String {
 /// or `Err` if the file cannot be read.
 pub fn verify_binary_integrity(binary_path: &Path, manifest: &BuildManifest) -> Result<bool, String> {
     let actual_hash = sha256_file(binary_path)?;
-    Ok(crypto::ct::ct_eq(actual_hash.as_bytes(), manifest.binary_hash.as_bytes()))
+    Ok({
+        use subtle::ConstantTimeEq;
+        bool::from(actual_hash.as_bytes().ct_eq(manifest.binary_hash.as_bytes()))
+    })
 }
 
 /// Verify the integrity of the currently running binary against a manifest.

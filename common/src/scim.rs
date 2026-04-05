@@ -1252,7 +1252,7 @@ impl ScimServer {
                                     path: op.path.clone(),
                                     bulk_id: op.bulk_id.clone(),
                                     status: 201,
-                                    location: Some(created.meta.location),
+                                    location: Some(created.meta.location.clone()),
                                 },
                                 Err(e) => BulkOperationResult {
                                     method: BulkMethod::Post,
@@ -1308,7 +1308,7 @@ impl ScimServer {
                                     path: op.path.clone(),
                                     bulk_id: op.bulk_id.clone(),
                                     status: 201,
-                                    location: Some(created.meta.location),
+                                    location: Some(created.meta.location.clone()),
                                 },
                                 Err(e) => BulkOperationResult {
                                     method: BulkMethod::Post,

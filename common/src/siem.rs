@@ -622,7 +622,10 @@ pub fn broadcast_event(event: &SiemEvent) {
             );
             // Write to the alert directory as a durable fallback.
             if let Ok(json) = serde_json::to_string(event) {
-                let ts = chrono::Utc::now().format("%Y%m%d%H%M%S%f");
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
                 let path = format!("{}/siem_fallback_{}.json", ALERT_DIR, ts);
                 let _ = std::fs::create_dir_all(ALERT_DIR);
                 if let Err(e) = std::fs::write(&path, json.as_bytes()) {

@@ -146,7 +146,8 @@ impl QuorumCertificate {
     /// Verify that this QC certifies the expected value hash.
     /// Uses constant-time comparison to prevent timing side-channels.
     pub fn verify_value(&self, expected_hash: &[u8; 64]) -> bool {
-        crypto::ct::ct_eq_64(&self.value_hash, expected_hash)
+        use subtle::ConstantTimeEq;
+        bool::from(self.value_hash.ct_eq(expected_hash))
     }
 
     /// Serialize to bytes using postcard.
