@@ -12,6 +12,7 @@ use crypto::symmetric::{
 use crypto::threshold::{dkg, threshold_sign};
 use crypto::seal::MasterKey;
 use common::fips;
+use serial_test::serial;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -64,6 +65,7 @@ fn test_entropy_bias_detection() {
 /// Enable FIPS, verify that `active_algorithm()` returns AES-256-GCM and that
 /// data encrypted with the active algorithm can be decrypted.
 #[test]
+#[serial(fips)]
 fn test_fips_mode_blocks_aegis256() {
     fips::set_fips_mode_unchecked(true);
     let algo = active_algorithm();
@@ -83,6 +85,7 @@ fn test_fips_mode_blocks_aegis256() {
 /// Enable FIPS mode, register a user via the FIPS registration path, verify
 /// that the stored KSF algorithm is PBKDF2-SHA512.
 #[test]
+#[serial(fips)]
 fn test_fips_mode_forces_pbkdf2() {
     use opaque::store::CredentialStore;
 
@@ -192,6 +195,7 @@ fn test_key_rotation_seal_unseal() {
 
 /// Encrypt 10 MB of data with AEGIS-256, decrypt, verify the result matches.
 #[test]
+#[serial(fips)]
 fn test_aegis256_roundtrip_large_data() {
     fips::set_fips_mode_unchecked(false);
 
@@ -212,6 +216,7 @@ fn test_aegis256_roundtrip_large_data() {
 /// Uses `encrypt_with` to explicitly select AES-256-GCM, avoiding a race on
 /// the global FIPS flag when tests run in parallel.
 #[test]
+#[serial(fips)]
 fn test_aes256gcm_fips_roundtrip() {
     let key = random_key();
     let plaintext = b"fips roundtrip test";

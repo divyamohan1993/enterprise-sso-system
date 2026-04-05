@@ -371,16 +371,7 @@ fn test_constant_time_eq_different_lengths() {
 #[test]
 fn test_enclave_channel_symmetric_key_derivation() {
     use crypto::enclave::*;
-
-    let mut secret_a = [0u8; 32];
-    let mut secret_b = [0u8; 32];
-    getrandom::getrandom(&mut secret_a).unwrap();
-    getrandom::getrandom(&mut secret_b).unwrap();
-
-    let static_a = x25519_dalek::StaticSecret::from(secret_a);
-    let static_b = x25519_dalek::StaticSecret::from(secret_b);
-    let public_a = x25519_dalek::PublicKey::from(&static_a);
-    let public_b = x25519_dalek::PublicKey::from(&static_b);
+    use crypto::xwing::xwing_keygen;
 
     let mut m = [0u8; 32];
     let mut s = [0u8; 32];
@@ -401,15 +392,24 @@ fn test_enclave_channel_symmetric_key_derivation() {
         attributes: Vec::new(),
     };
 
+    // Generate X-Wing key pairs (post-quantum safe)
+    let (_pub_a, kp_a) = xwing_keygen();
+    let (pub_b, kp_b) = xwing_keygen();
+
     let mut session_id = [0u8; 16];
     getrandom::getrandom(&mut session_id).unwrap();
 
-    let ch_a = establish_channel(
-        &secret_a, public_b.as_bytes(), &id_a, &id_b, &session_id,
-    );
-    let ch_b = establish_channel(
-        &secret_b, public_a.as_bytes(), &id_b, &id_a, &session_id,
-    );
+    // Initiator (A) encapsulates toward B's public key
+    let (ch_a, ciphertext) = establish_channel_xwing(
+        &kp_a, &pub_b, &id_a, &id_b, &session_id,
+    )
+    .expect("establish_channel_xwing failed");
+
+    // Responder (B) decapsulates with their secret key
+    let ch_b = complete_channel_xwing(
+        &kp_b, &ciphertext, &id_b, &id_a, &session_id,
+    )
+    .expect("complete_channel_xwing failed");
 
     assert_eq!(
         ch_a.session_key, ch_b.session_key,

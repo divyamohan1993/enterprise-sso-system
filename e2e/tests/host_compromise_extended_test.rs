@@ -30,6 +30,7 @@ fn run_with_large_stack<F: FnOnce() + Send + 'static>(f: F) {
 #[test]
 fn enclave_channel_session_key_zeroized_on_drop() {
     use crypto::enclave::*;
+    use crypto::xwing::xwing_keygen;
 
     let mut m1 = [0u8; 32];
     let mut s1 = [0u8; 32];
@@ -57,26 +58,21 @@ fn enclave_channel_session_key_zeroized_on_drop() {
         attributes: Vec::new(),
     };
 
-    // Generate ephemeral DH keys
-    let mut secret1 = [0u8; 32];
-    let mut secret2 = [0u8; 32];
-    getrandom::getrandom(&mut secret1).unwrap();
-    getrandom::getrandom(&mut secret2).unwrap();
-
-    let sk1 = x25519_dalek::StaticSecret::from(secret1);
-    let pk1 = x25519_dalek::PublicKey::from(&sk1);
-    let sk2 = x25519_dalek::StaticSecret::from(secret2);
-    let pk2 = x25519_dalek::PublicKey::from(&sk2);
+    // Generate X-Wing key pairs (post-quantum safe)
+    let (_pub1, kp1) = xwing_keygen();
+    let (pub2, kp2) = xwing_keygen();
 
     let session_id = [0xAB; 16];
 
-    let channel = establish_channel(
-        &secret1,
-        pk2.as_bytes(),
+    // Initiator encapsulates toward responder's public key
+    let (channel, ciphertext) = establish_channel_xwing(
+        &kp1,
+        &pub2,
         &id1,
         &id2,
         &session_id,
-    );
+    )
+    .expect("establish_channel_xwing failed");
 
     // Session key must not be all zeros before drop
     assert!(
@@ -92,19 +88,20 @@ fn enclave_channel_session_key_zeroized_on_drop() {
 
     // The original variable is gone. We verify zeroization by testing that
     // EnclaveChannel's Drop impl calls zeroize (the impl exists in the source).
-    // We can also verify that a new channel with different inputs produces
-    // a different session key, confirming the derivation is not trivial.
-    let channel2 = establish_channel(
-        &secret2,
-        pk1.as_bytes(),
+    // We can also verify that the responder derives the same session key,
+    // confirming the derivation is correct.
+    let channel2 = complete_channel_xwing(
+        &kp2,
+        &ciphertext,
         &id2,
         &id1,
         &session_id,
-    );
-    // Both sides of the DH exchange must derive the same key
+    )
+    .expect("complete_channel_xwing failed");
+    // Both sides of the X-Wing KEM exchange must derive the same key
     assert_eq!(
         key_copy, channel2.session_key,
-        "both sides of DH must derive the same session key"
+        "both sides of X-Wing KEM must derive the same session key"
     );
 }
 

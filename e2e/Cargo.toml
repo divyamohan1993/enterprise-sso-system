@@ -41,3 +41,4 @@ ed25519-dalek.workspace = true
 x25519-dalek.workspace = true
 hex.workspace = true
 ml-kem.workspace = true
+serial_test.workspace = true

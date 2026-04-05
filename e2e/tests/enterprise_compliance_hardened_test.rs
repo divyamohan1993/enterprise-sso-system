@@ -2400,33 +2400,37 @@ mod advanced_crypto_tests {
 
         #[test]
         fn enclave_to_enclave_secure_channel() {
+            use crypto::xwing::xwing_keygen;
+
             let id_a = test_identity(EnclaveBackend::SoftwareFallback);
             let id_b = test_identity(EnclaveBackend::SoftwareFallback);
 
-            // Generate X25519 keys
-            let secret_a = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
-            let public_a = x25519_dalek::PublicKey::from(&secret_a);
-            let secret_b = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
-            let public_b = x25519_dalek::PublicKey::from(&secret_b);
+            // Generate X-Wing key pairs (post-quantum safe)
+            let (pub_a, kp_a) = xwing_keygen();
+            let (pub_b, kp_b) = xwing_keygen();
 
             let mut session_id = [0u8; 16];
             getrandom::getrandom(&mut session_id).unwrap();
 
-            // Establish from both sides
-            let channel_a = establish_channel(
-                &secret_a.to_bytes(),
-                public_b.as_bytes(),
+            // Initiator (A) encapsulates toward B's public key
+            let (channel_a, ciphertext) = establish_channel_xwing(
+                &kp_a,
+                &pub_b,
                 &id_a,
                 &id_b,
                 &session_id,
-            );
-            let channel_b = establish_channel(
-                &secret_b.to_bytes(),
-                public_a.as_bytes(),
+            )
+            .expect("establish_channel_xwing failed");
+
+            // Responder (B) decapsulates with their secret key
+            let channel_b = complete_channel_xwing(
+                &kp_b,
+                &ciphertext,
                 &id_b,
                 &id_a,
                 &session_id,
-            );
+            )
+            .expect("complete_channel_xwing failed");
 
             assert_eq!(
                 channel_a.session_key, channel_b.session_key,

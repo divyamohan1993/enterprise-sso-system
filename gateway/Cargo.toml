@@ -26,5 +26,8 @@ hex.workspace = true
 zeroize.workspace = true
 libc.workspace = true
 
+[dev-dependencies]
+serial_test.workspace = true
+
 [features]
 production = ["common/production"]

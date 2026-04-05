@@ -938,15 +938,10 @@ mod tests {
 
     #[test]
     fn test_enclave_channel_establishment() {
-        let mut secret_a = [0u8; 32];
-        let mut secret_b = [0u8; 32];
-        getrandom::getrandom(&mut secret_a).unwrap();
-        getrandom::getrandom(&mut secret_b).unwrap();
+        use crate::xwing::xwing_keygen;
 
-        let static_a = x25519_dalek::StaticSecret::from(secret_a);
-        let static_b = x25519_dalek::StaticSecret::from(secret_b);
-        let public_a = x25519_dalek::PublicKey::from(&static_a);
-        let public_b = x25519_dalek::PublicKey::from(&static_b);
+        let (pub_a, kp_a) = xwing_keygen();
+        let (pub_b, kp_b) = xwing_keygen();
 
         let identity_a = test_identity(EnclaveBackend::IntelSgx);
         let identity_b = test_identity(EnclaveBackend::AmdSevSnp);
@@ -954,21 +949,25 @@ mod tests {
         let mut session_id = [0u8; 16];
         getrandom::getrandom(&mut session_id).unwrap();
 
-        let channel_a = establish_channel(
-            &secret_a,
-            public_b.as_bytes(),
+        // Initiator (A) encapsulates toward B's public key
+        let (channel_a, ciphertext) = establish_channel_xwing(
+            &kp_a,
+            &pub_b,
             &identity_a,
             &identity_b,
             &session_id,
-        );
+        )
+        .expect("establish_channel_xwing failed");
 
-        let channel_b = establish_channel(
-            &secret_b,
-            public_a.as_bytes(),
+        // Responder (B) decapsulates with their secret key
+        let channel_b = complete_channel_xwing(
+            &kp_b,
+            &ciphertext,
             &identity_b,
             &identity_a,
             &session_id,
-        );
+        )
+        .expect("complete_channel_xwing failed");
 
         assert_eq!(
             channel_a.session_key, channel_b.session_key,

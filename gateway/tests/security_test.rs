@@ -12,6 +12,7 @@ use gateway::wire::{AuthRequest, AuthResponse, OrchestratorRequest, Orchestrator
 use gateway::server::GatewayServer;
 
 use sha2::{Digest, Sha256};
+use serial_test::serial;
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -114,6 +115,7 @@ fn puzzle_solution_replay_rejected_in_tracker() {
 }
 
 #[test]
+#[serial(puzzle_global)]
 fn puzzle_verify_solution_rejects_replay() {
     // Generate and solve a puzzle
     let challenge = generate_challenge(4);
@@ -163,6 +165,7 @@ fn consumed_puzzles_eviction_under_capacity() {
 // ── 3. Puzzle difficulty scaling under load ─────────────────────────────
 
 #[test]
+#[serial(puzzle_global)]
 fn adaptive_difficulty_scales_correctly() {
     // Normal load: difficulty 0
     assert_eq!(get_adaptive_difficulty(0), 0);
@@ -183,6 +186,7 @@ fn adaptive_difficulty_scales_correctly() {
 }
 
 #[test]
+#[serial(puzzle_global)]
 fn adaptive_difficulty_monotonically_increases_with_load() {
     let d0 = get_adaptive_difficulty(10);
     let d1 = get_adaptive_difficulty(200);
@@ -195,6 +199,7 @@ fn adaptive_difficulty_monotonically_increases_with_load() {
 }
 
 #[test]
+#[serial(puzzle_global)]
 fn current_difficulty_reflects_latest_update() {
     get_adaptive_difficulty(2000);
     assert_eq!(current_difficulty(), 24, "must reflect DDoS difficulty");
@@ -514,6 +519,7 @@ fn orchestrator_request_debug_redacts_password() {
 // ── Puzzle hash correctness ─────────────────────────────────────────────
 
 #[test]
+#[serial(puzzle_global)]
 fn puzzle_uses_sha512_not_sha256() {
     // The puzzle's proof-of-work uses SHA-512 for GPU resistance.
     // Verify that solve_challenge produces valid solutions under SHA-512.
@@ -540,6 +546,7 @@ fn puzzle_uses_sha512_not_sha256() {
 }
 
 #[test]
+#[serial(puzzle_global)]
 fn expired_puzzle_rejected_even_with_valid_solution() {
     let mut challenge = generate_challenge(4);
     challenge.timestamp -= 120; // 2 minutes in the past, well past 30s TTL

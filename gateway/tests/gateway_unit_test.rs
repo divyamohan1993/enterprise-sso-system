@@ -6,6 +6,7 @@ use gateway::puzzle::{
 };
 use gateway::wire::{AuthRequest, AuthResponse, KemCiphertext, OrchestratorRequest, OrchestratorResponse};
 use gateway::distributed_rate_limit::{DistributedRateLimiter, RateLimitConfig, RateLimitResult};
+use serial_test::serial;
 
 // =========================================================================
 // Hash Puzzle Tests
@@ -32,6 +33,7 @@ fn test_puzzle_generation_different_nonces() {
 }
 
 #[test]
+#[serial(puzzle_global)]
 fn test_puzzle_validation_correct_solution() {
     let challenge = generate_challenge(4);
     let solution = solve_challenge(&challenge);
@@ -42,9 +44,11 @@ fn test_puzzle_validation_correct_solution() {
 }
 
 #[test]
+#[serial(puzzle_global)]
 fn test_puzzle_validation_wrong_solution() {
-    let challenge = generate_challenge(4);
-    // All-0xFF is extremely unlikely to have 4 leading zero bits in SHA-512
+    // Use difficulty 64 so that SHA-512(nonce || 0xFF*32) having 64+ leading
+    // zero bits is astronomically unlikely (~2^-64), eliminating false passes.
+    let challenge = generate_challenge(64);
     let bad_solution = [0xFFu8; 32];
     assert!(
         !verify_solution(&challenge, &bad_solution),
@@ -53,6 +57,7 @@ fn test_puzzle_validation_wrong_solution() {
 }
 
 #[test]
+#[serial(puzzle_global)]
 fn test_puzzle_expired_challenge_rejected() {
     let mut challenge = generate_challenge(4);
     // Push timestamp 60 seconds into the past (well past 30s TTL)
@@ -65,6 +70,7 @@ fn test_puzzle_expired_challenge_rejected() {
 }
 
 #[test]
+#[serial(puzzle_global)]
 fn test_puzzle_ddos_mode_higher_difficulty() {
     // Normal load: < 100 connections -> difficulty 0
     let normal = get_adaptive_difficulty(50);
@@ -84,6 +90,7 @@ fn test_puzzle_ddos_mode_higher_difficulty() {
 }
 
 #[test]
+#[serial(puzzle_global)]
 fn test_adaptive_difficulty_updates_global() {
     let _ = get_adaptive_difficulty(1500);
     assert_eq!(current_difficulty(), 24);
