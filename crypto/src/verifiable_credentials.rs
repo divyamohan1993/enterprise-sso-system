@@ -319,7 +319,8 @@ pub fn verify_credential(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SdClaim {
     /// SHA-512 hash of (salt || claim_name || claim_value). CNSA 2.0 compliant.
-    pub digest: [u8; 64],
+    /// Stored as Vec<u8> (64 bytes) for serde compatibility ([u8; 64] lacks Serialize).
+    pub digest: Vec<u8>,
     /// Claim name (always visible to the holder).
     pub claim_name: String,
 }
@@ -380,7 +381,7 @@ pub fn create_sd_claims(
         let digest = compute_sd_digest(&salt, name, value);
 
         sd_claims.push(SdClaim {
-            digest,
+            digest: digest.to_vec(),
             claim_name: name.clone(),
         });
 
