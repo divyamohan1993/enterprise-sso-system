@@ -250,7 +250,7 @@ mod tests {
 
     #[test]
     fn token_round_trip() {
-        let token = Token::test_fixture();
+        let token = Token::test_fixture_unsigned();
         let dek = random_dek();
 
         let encrypted = encrypt_token(token.clone(), &dek).unwrap();

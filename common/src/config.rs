@@ -200,16 +200,113 @@ pub fn load_dev_mode_activation_key() {
     load_error_level_from_env();
 }
 
-/// Verify a developer mode activation proof — always returns true.
-/// Kept for API compatibility.
-pub fn verify_dev_mode_proof(_proof_hex: &str, _action: &str) -> bool {
-    true
+/// Domain separator for developer mode HMAC proofs.
+/// Distinct from the FIPS mode domain to prevent cross-domain proof reuse.
+const DEV_MODE_HMAC_DOMAIN: &[u8] = b"MILNET-DEV-MODE-v1";
+
+/// Verify a developer mode activation proof.
+///
+/// The proof is HMAC-SHA512(derived_key, action || timestamp_hex) where the
+/// key is derived from the master KEK via HKDF-SHA512. The timestamp (Unix
+/// seconds, hex-encoded) must be within 60 seconds of the current time to
+/// prevent replay attacks.
+///
+/// `proof_hex` format: `<hmac_hex>:<timestamp_hex>` (128 + 1 + variable chars).
+pub fn verify_dev_mode_proof(proof_hex: &str, action: &str) -> bool {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha512;
+    use subtle::ConstantTimeEq;
+
+    // Parse proof_hex as "hmac_hex:timestamp_hex"
+    let parts: Vec<&str> = proof_hex.splitn(2, ':').collect();
+    if parts.len() != 2 {
+        return false;
+    }
+    let (hmac_hex, ts_hex) = (parts[0], parts[1]);
+
+    // Decode HMAC (must be exactly 64 bytes = 128 hex chars)
+    let proof_bytes = match hex::decode(hmac_hex) {
+        Ok(b) if b.len() == 64 => b,
+        _ => return false,
+    };
+
+    // Decode and validate timestamp (Unix seconds)
+    let ts: u64 = match u64::from_str_radix(ts_hex, 16) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let diff = if now > ts { now - ts } else { ts - now };
+    if diff > 60 {
+        tracing::warn!(
+            "Developer mode proof rejected: timestamp drift {}s exceeds 60s window",
+            diff
+        );
+        return false;
+    }
+
+    // Derive key from master KEK via HKDF
+    let kek = crate::sealed_keys::load_master_kek();
+    let hk = hkdf::Hkdf::<Sha512>::new(Some(DEV_MODE_HMAC_DOMAIN), &kek);
+    let mut derived_key = [0u8; 64];
+    hk.expand(b"dev-mode-proof-key", &mut derived_key)
+        .expect("HKDF expand always valid for 64 bytes");
+
+    // Compute expected HMAC
+    type HmacSha512 = Hmac<Sha512>;
+    let mut mac = HmacSha512::new_from_slice(&derived_key)
+        .expect("HMAC key length always valid");
+    mac.update(action.as_bytes());
+    mac.update(ts_hex.as_bytes());
+    let expected = mac.finalize().into_bytes();
+
+    // Zeroize derived key
+    {
+        use zeroize::Zeroize;
+        derived_key.zeroize();
+    }
+
+    // Constant-time comparison
+    proof_bytes.ct_eq(expected.as_slice()).into()
 }
 
-/// Generate a developer mode activation proof — returns empty string.
-/// Kept for API compatibility.
-pub fn generate_dev_mode_proof(_key: &[u8; 32], _action: &str) -> String {
-    String::new()
+/// Generate a developer mode activation proof.
+///
+/// Produces an HMAC-SHA512 proof over `(action || timestamp_hex)` using a key
+/// derived from the master KEK via HKDF. Returns `"<hmac_hex>:<timestamp_hex>"`.
+pub fn generate_dev_mode_proof(key: &[u8; 32], action: &str) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha512;
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let ts_hex = format!("{:x}", ts);
+
+    // Derive key via HKDF
+    let hk = hkdf::Hkdf::<Sha512>::new(Some(DEV_MODE_HMAC_DOMAIN), key);
+    let mut derived_key = [0u8; 64];
+    hk.expand(b"dev-mode-proof-key", &mut derived_key)
+        .expect("HKDF expand always valid for 64 bytes");
+
+    type HmacSha512 = Hmac<Sha512>;
+    let mut mac = HmacSha512::new_from_slice(&derived_key)
+        .expect("HMAC key length always valid");
+    mac.update(action.as_bytes());
+    mac.update(ts_hex.as_bytes());
+    let hmac_hex = hex::encode(mac.finalize().into_bytes());
+
+    // Zeroize derived key
+    {
+        use zeroize::Zeroize;
+        derived_key.zeroize();
+    }
+
+    format!("{}:{}", hmac_hex, ts_hex)
 }
 
 // Keep DeveloperModeConfig as an alias
@@ -757,10 +854,106 @@ mod tests {
     }
 
     #[test]
-    fn verify_dev_mode_proof_always_true() {
-        // Legacy shim: always returns true since error_level is freely configurable
-        assert!(verify_dev_mode_proof("anything", "enable"));
-        assert!(verify_dev_mode_proof("", "disable"));
+    fn verify_dev_mode_proof_valid_passes() {
+        // Set up a known master KEK for this test
+        std::env::set_var("MILNET_MASTER_KEK", "ab".repeat(32));
+
+        let key_bytes: [u8; 32] = {
+            let hex_str = "ab".repeat(32);
+            let mut k = [0u8; 32];
+            hex::decode_to_slice(&hex_str, &mut k).unwrap();
+            k
+        };
+
+        let proof = generate_dev_mode_proof(&key_bytes, "enable");
+        assert!(
+            verify_dev_mode_proof(&proof, "enable"),
+            "valid proof must pass verification"
+        );
+
+        std::env::remove_var("MILNET_MASTER_KEK");
+    }
+
+    #[test]
+    fn verify_dev_mode_proof_invalid_fails() {
+        std::env::set_var("MILNET_MASTER_KEK", "ab".repeat(32));
+
+        // Wrong HMAC bytes
+        assert!(
+            !verify_dev_mode_proof("00".repeat(64).as_str(), "enable"),
+            "garbage proof without timestamp must fail"
+        );
+
+        // Valid format but wrong HMAC
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let fake_proof = format!("{}:{:x}", "00".repeat(64), ts);
+        assert!(
+            !verify_dev_mode_proof(&fake_proof, "enable"),
+            "wrong HMAC must fail"
+        );
+
+        // Valid proof for wrong action
+        let key_bytes: [u8; 32] = {
+            let hex_str = "ab".repeat(32);
+            let mut k = [0u8; 32];
+            hex::decode_to_slice(&hex_str, &mut k).unwrap();
+            k
+        };
+        let proof = generate_dev_mode_proof(&key_bytes, "enable");
+        assert!(
+            !verify_dev_mode_proof(&proof, "disable"),
+            "proof for 'enable' must not verify for 'disable'"
+        );
+
+        // Empty proof
+        assert!(
+            !verify_dev_mode_proof("", "enable"),
+            "empty proof must fail"
+        );
+
+        std::env::remove_var("MILNET_MASTER_KEK");
+    }
+
+    #[test]
+    fn verify_dev_mode_proof_rejects_expired_timestamp() {
+        std::env::set_var("MILNET_MASTER_KEK", "ab".repeat(32));
+
+        let key_bytes: [u8; 32] = {
+            let hex_str = "ab".repeat(32);
+            let mut k = [0u8; 32];
+            hex::decode_to_slice(&hex_str, &mut k).unwrap();
+            k
+        };
+
+        // Generate proof with a timestamp 120 seconds in the past
+        let old_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() - 120;
+        let ts_hex = format!("{:x}", old_ts);
+
+        use hmac::{Hmac, Mac};
+        use sha2::Sha512;
+        type HmacSha512 = Hmac<Sha512>;
+
+        let hk = hkdf::Hkdf::<Sha512>::new(Some(DEV_MODE_HMAC_DOMAIN), &key_bytes);
+        let mut derived_key = [0u8; 64];
+        hk.expand(b"dev-mode-proof-key", &mut derived_key).unwrap();
+        let mut mac = HmacSha512::new_from_slice(&derived_key).unwrap();
+        mac.update(b"enable");
+        mac.update(ts_hex.as_bytes());
+        let hmac_hex = hex::encode(mac.finalize().into_bytes());
+
+        let expired_proof = format!("{}:{}", hmac_hex, ts_hex);
+        assert!(
+            !verify_dev_mode_proof(&expired_proof, "enable"),
+            "expired proof (120s old) must be rejected"
+        );
+
+        std::env::remove_var("MILNET_MASTER_KEK");
     }
 
     #[test]

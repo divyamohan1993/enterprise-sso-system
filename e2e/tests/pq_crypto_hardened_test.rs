@@ -464,7 +464,7 @@ fn pq_nesting_frost_inside_ml_dsa_87() {
 #[test]
 fn key_zeroization_debug_redaction() {
     // Token Debug
-    let token = common::types::Token::test_fixture();
+    let token = common::types::Token::test_fixture_unsigned();
     let dbg = format!("{:?}", token);
     assert!(
         dbg.contains("[REDACTED]"),

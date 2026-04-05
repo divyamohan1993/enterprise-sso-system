@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 #[test]
 fn token_round_trip() {
-    let token = Token::test_fixture();
+    let token = Token::test_fixture_unsigned();
     let bytes = postcard::to_allocvec(&token).expect("serialize token");
     let decoded: Token = postcard::from_bytes(&bytes).expect("deserialize token");
 
@@ -27,7 +27,7 @@ fn token_round_trip() {
 
 #[test]
 fn receipt_round_trip() {
-    let receipt = Receipt::test_fixture();
+    let receipt = Receipt::test_fixture_unsigned();
     let bytes = postcard::to_allocvec(&receipt).expect("serialize receipt");
     let decoded: Receipt = postcard::from_bytes(&bytes).expect("deserialize receipt");
 
@@ -85,7 +85,7 @@ fn audit_entry_round_trip() {
         event_type: AuditEventType::AuthSuccess,
         user_ids: vec![uuid::Uuid::nil()],
         device_ids: vec![],
-        ceremony_receipts: vec![Receipt::test_fixture()],
+        ceremony_receipts: vec![Receipt::test_fixture_unsigned()],
         risk_score: 0.42,
         timestamp: 1_700_000_000_000_000,
         prev_hash: [0x00; 64],
@@ -152,7 +152,7 @@ fn new_domain_separators_unique() {
 
 #[test]
 fn token_claims_classification_default() {
-    let token = Token::test_fixture();
+    let token = Token::test_fixture_unsigned();
     assert_eq!(token.claims.classification, 0, "default classification must be Unclassified (0)");
 }
 

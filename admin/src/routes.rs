@@ -2487,7 +2487,7 @@ async fn test_token_tamper(request: Request) -> Result<Json<serde_json::Value>, 
     let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(4);
     check_tier(caller_tier, 1)?;
     use common::types::Token;
-    let mut token = Token::test_fixture();
+    let mut token = Token::test_fixture_unsigned();
     // Tamper with one byte of the FROST signature
     token.frost_signature[0] ^= 0xFF;
     let _serialized = postcard::to_allocvec(&token).unwrap_or_default();

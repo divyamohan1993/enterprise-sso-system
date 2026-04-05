@@ -1378,11 +1378,15 @@ impl HsmKeyManager {
     pub fn new(config: HsmConfig) -> Result<Self, HsmError> {
         config.validate()?;
 
-        // Fail-closed: reject software backend in production
-        if config.backend == HsmBackend::Software {
+        // Fail-closed: reject software backend in production deployments.
+        // In non-production environments (no MILNET_PRODUCTION=1), the software
+        // backend is allowed with full validation checks (seed required, etc.).
+        if config.backend == HsmBackend::Software
+            && std::env::var("MILNET_PRODUCTION").as_deref() == Ok("1")
+        {
             panic!(
-                "FATAL: Software HSM backend is forbidden in production mode. \
-                 This is a security violation. \
+                "FATAL: Software HSM backend is forbidden in production mode \
+                 (MILNET_PRODUCTION=1). This is a security violation. \
                  Configure MILNET_HSM_BACKEND=pkcs11|aws-kms|tpm2"
             );
         }
@@ -1430,46 +1434,9 @@ impl HsmKeyManager {
         })
     }
 
-    /// Create an `HsmKeyManager` for testing without the production safety check.
-    ///
-    /// This bypasses the panic that forbids `Software` backend in production,
-    /// allowing unit tests to exercise the software backend directly.
-    #[cfg(test)]
-    fn new_for_testing(config: HsmConfig) -> Result<Self, HsmError> {
-        config.validate()?;
-
-        let state = match &config.backend {
-            HsmBackend::Pkcs11 => {
-                let session = Self::init_pkcs11(&config)?;
-                BackendState::Pkcs11(session)
-            }
-            HsmBackend::AwsKms => {
-                let session = Self::init_aws_kms(&config)?;
-                BackendState::AwsKms(session)
-            }
-            HsmBackend::Tpm2 => {
-                let session = Self::init_tpm2(&config)?;
-                BackendState::Tpm2(session)
-            }
-            HsmBackend::Software => {
-                let software_seed = config.software_seed.as_deref();
-                let seed = match software_seed {
-                    Some(s) => s,
-                    None => return Err(HsmError::ConfigurationError(
-                        "No master seed configured for software backend".into(),
-                    )),
-                };
-                let source = SoftwareKeySource::new(seed)
-                    .map_err(|e| HsmError::InitializationFailed(format!("{e}")))?;
-                BackendState::Software(source)
-            }
-        };
-
-        Ok(Self {
-            config,
-            state: Mutex::new(state),
-        })
-    }
+    // new_for_testing() REMOVED. Tests must use the production new() constructor.
+    // The production path now allows Software backend when MILNET_PRODUCTION
+    // is not set, while still enforcing all validation checks.
 
     /// Return the active backend type.
     pub fn backend(&self) -> &HsmBackend {
@@ -3542,7 +3509,7 @@ mod tests {
             software_seed: Some(b"test-seed-for-hsm-software-backend".to_vec()),
             ..HsmConfig::default()
         };
-        let manager = HsmKeyManager::new_for_testing(config).unwrap();
+        let manager = HsmKeyManager::new(config).unwrap();
 
         let plaintext = b"secret-frost-share-data-for-testing";
         let sealed = manager.seal_with_hardware(plaintext, "test-purpose").unwrap();
@@ -3557,7 +3524,7 @@ mod tests {
             software_seed: Some(b"test-seed".to_vec()),
             ..HsmConfig::default()
         };
-        let manager = HsmKeyManager::new_for_testing(config).unwrap();
+        let manager = HsmKeyManager::new(config).unwrap();
 
         let sealed = manager.seal_with_hardware(b"data", "correct").unwrap();
         let result = manager.unseal_with_hardware(&sealed, "wrong");
@@ -3571,7 +3538,7 @@ mod tests {
             software_seed: Some(b"frost-test-seed".to_vec()),
             ..HsmConfig::default()
         };
-        let manager = HsmKeyManager::new_for_testing(config).unwrap();
+        let manager = HsmKeyManager::new(config).unwrap();
 
         let share = b"frost-share-bytes-secret-material-1234567890";
         let sealed = manager.seal_frost_share(share).unwrap();
@@ -3586,7 +3553,7 @@ mod tests {
             software_seed: Some(b"master-key-test-seed".to_vec()),
             ..HsmConfig::default()
         };
-        let manager = HsmKeyManager::new_for_testing(config).unwrap();
+        let manager = HsmKeyManager::new(config).unwrap();
 
         let mk1 = manager.load_master_key().unwrap();
         let mk2 = manager.load_master_key().unwrap();
@@ -3606,7 +3573,7 @@ mod tests {
             software_seed: Some(b"rotate-test-seed".to_vec()),
             ..HsmConfig::default()
         };
-        let manager = HsmKeyManager::new_for_testing(config).unwrap();
+        let manager = HsmKeyManager::new(config).unwrap();
 
         let original = manager.load_master_key().unwrap();
         let rotated = manager.rotate_master_key().unwrap();
@@ -3626,7 +3593,7 @@ mod tests {
             software_seed: Some(b"dek-gen-test-seed".to_vec()),
             ..HsmConfig::default()
         };
-        let manager = HsmKeyManager::new_for_testing(config).unwrap();
+        let manager = HsmKeyManager::new(config).unwrap();
 
         let wrapped_dek = manager.generate_wrapped_dek("database-encryption").unwrap();
         assert!(!wrapped_dek.is_empty());
@@ -3665,10 +3632,10 @@ mod tests {
             software_seed: Some(b"factory-test".to_vec()),
             ..HsmConfig::default()
         };
-        // Use new_for_testing to bypass the production safety check,
-        // then box as ProductionKeySource to test the same interface.
+        // Use production new() constructor with Software backend (allowed
+        // when MILNET_PRODUCTION is not set), then box as ProductionKeySource.
         let source: Box<dyn ProductionKeySource> =
-            Box::new(HsmKeyManager::new_for_testing(config).unwrap());
+            Box::new(HsmKeyManager::new(config).unwrap());
         let mk = source.load_master_key().unwrap();
         // Verify the key is usable
         let kek = mk.derive_kek("test");

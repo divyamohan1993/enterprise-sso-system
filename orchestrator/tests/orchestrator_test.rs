@@ -195,7 +195,7 @@ async fn orchestrator_processes_auth() {
             postcard::from_bytes(&req_bytes).expect("deserialize signing req");
 
         // Return a mock signed token
-        let token = Token::test_fixture();
+        let token = Token::test_fixture_unsigned();
         let token_bytes = postcard::to_allocvec(&token).expect("serialize token");
 
         let resp = SigningResponse {

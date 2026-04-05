@@ -118,9 +118,16 @@ impl Drop for Token {
 }
 
 impl Token {
-    /// Returns a deterministic fixture suitable for tests.
+    /// Returns a deterministic fixture with INVALID signatures for tests.
+    ///
+    /// **WARNING**: The `frost_signature` and `pq_signature` fields contain
+    /// dummy bytes (`0xEE` and `0xFF`). They are NOT real cryptographic
+    /// signatures. This fixture MUST NOT be used to test signature
+    /// verification, token validation, or any security property that depends
+    /// on signature correctness. Use it only for serialization, formatting,
+    /// and structural tests.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn test_fixture() -> Self {
+    pub fn test_fixture_unsigned() -> Self {
         Token {
             header: TokenHeader {
                 version: 0x01,
@@ -241,9 +248,15 @@ impl Drop for Receipt {
 }
 
 impl Receipt {
-    /// Returns a deterministic fixture suitable for tests.
+    /// Returns a deterministic fixture with an INVALID signature for tests.
+    ///
+    /// **WARNING**: The `signature` field contains dummy bytes (`0x04`).
+    /// It is NOT a real cryptographic signature. This fixture MUST NOT be
+    /// used to test signature verification or any security property that
+    /// depends on signature correctness. Use it only for serialization,
+    /// structural, and receipt-chain tests (which re-sign after construction).
     #[cfg(any(test, feature = "test-support"))]
-    pub fn test_fixture() -> Self {
+    pub fn test_fixture_unsigned() -> Self {
         Receipt {
             ceremony_session_id: [0x01; 32],
             step_id: 1,

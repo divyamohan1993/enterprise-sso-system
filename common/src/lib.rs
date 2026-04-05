@@ -211,3 +211,8 @@ pub mod consistent_hash;
 pub mod proactive_sharing;
 pub mod sybil_resistance;
 pub mod atomic_broadcast;
+
+// ── Autonomous emergency recovery ──
+pub mod emergency_mode;
+pub mod quorum_health;
+pub mod network_quarantine;

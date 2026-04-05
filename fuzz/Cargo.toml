@@ -156,3 +156,8 @@ doc = false
 name = "fuzz_bft_append"
 path = "fuzz_targets/fuzz_bft_append.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_totp"
+path = "fuzz_targets/fuzz_totp.rs"
+doc = false

@@ -61,7 +61,7 @@ fn generate_key_64_halves_differ() {
 #[test]
 fn receipt_signature_verified() {
     let key = [0x42u8; 64];
-    let mut receipt = Receipt::test_fixture();
+    let mut receipt = Receipt::test_fixture_unsigned();
     sign_receipt(&mut receipt, &key).unwrap();
     assert!(verify_receipt_signature(&receipt, &key).unwrap());
 }
@@ -70,7 +70,7 @@ fn receipt_signature_verified() {
 fn receipt_signature_rejects_wrong_key() {
     let key = [0x42u8; 64];
     let wrong_key = [0x99u8; 64];
-    let mut receipt = Receipt::test_fixture();
+    let mut receipt = Receipt::test_fixture_unsigned();
     sign_receipt(&mut receipt, &key).unwrap();
     assert!(!verify_receipt_signature(&receipt, &wrong_key).unwrap());
 }
@@ -78,7 +78,7 @@ fn receipt_signature_rejects_wrong_key() {
 #[test]
 fn receipt_signature_rejects_tampered_data() {
     let key = [0x42u8; 64];
-    let mut receipt = Receipt::test_fixture();
+    let mut receipt = Receipt::test_fixture_unsigned();
     sign_receipt(&mut receipt, &key).unwrap();
     // Tamper with the step_id
     receipt.step_id = 99;
@@ -87,7 +87,7 @@ fn receipt_signature_rejects_tampered_data() {
 
 #[test]
 fn receipt_hash_deterministic() {
-    let receipt = Receipt::test_fixture();
+    let receipt = Receipt::test_fixture_unsigned();
     let h1 = hash_receipt(&receipt);
     let h2 = hash_receipt(&receipt);
     assert_eq!(h1, h2);
@@ -95,8 +95,8 @@ fn receipt_hash_deterministic() {
 
 #[test]
 fn receipt_hash_differs_for_different_steps() {
-    let mut r1 = Receipt::test_fixture();
-    let mut r2 = Receipt::test_fixture();
+    let mut r1 = Receipt::test_fixture_unsigned();
+    let mut r2 = Receipt::test_fixture_unsigned();
     r1.step_id = 1;
     r2.step_id = 2;
     assert_ne!(hash_receipt(&r1), hash_receipt(&r2));
@@ -106,7 +106,7 @@ fn receipt_hash_differs_for_different_steps() {
 fn receipt_chain_rejects_wrong_session_id() {
     let session_id = [0x01; 32];
     let mut chain = ReceiptChain::new(session_id);
-    let mut receipt = Receipt::test_fixture();
+    let mut receipt = Receipt::test_fixture_unsigned();
     receipt.ceremony_session_id = [0x02; 32]; // wrong session
     receipt.prev_receipt_hash = [0x00; 64];
     receipt.step_id = 1;
@@ -117,7 +117,7 @@ fn receipt_chain_rejects_wrong_session_id() {
 fn receipt_chain_rejects_out_of_order_steps() {
     let session_id = [0x01; 32];
     let mut chain = ReceiptChain::new(session_id);
-    let mut receipt = Receipt::test_fixture();
+    let mut receipt = Receipt::test_fixture_unsigned();
     receipt.step_id = 2; // should be 1 for first receipt
     receipt.prev_receipt_hash = [0x00; 64];
     assert!(chain.add_receipt(receipt).is_err());
@@ -136,7 +136,7 @@ fn receipt_chain_valid_two_step() {
     let mut chain = ReceiptChain::new(session_id);
 
     // Step 1
-    let mut r1 = Receipt::test_fixture();
+    let mut r1 = Receipt::test_fixture_unsigned();
     r1.ceremony_session_id = session_id;
     r1.step_id = 1;
     r1.prev_receipt_hash = [0x00; 64];
@@ -144,7 +144,7 @@ fn receipt_chain_valid_two_step() {
     chain.add_receipt(r1.clone()).unwrap();
 
     // Step 2
-    let mut r2 = Receipt::test_fixture();
+    let mut r2 = Receipt::test_fixture_unsigned();
     r2.ceremony_session_id = session_id;
     r2.step_id = 2;
     r2.prev_receipt_hash = hash_receipt(&r1);
@@ -164,7 +164,7 @@ fn receipt_chain_rejects_invalid_signature() {
     let wrong_key = [0x99u8; 64];
     let mut chain = ReceiptChain::new(session_id);
 
-    let mut r1 = Receipt::test_fixture();
+    let mut r1 = Receipt::test_fixture_unsigned();
     r1.ceremony_session_id = session_id;
     r1.step_id = 1;
     r1.prev_receipt_hash = [0x00; 64];

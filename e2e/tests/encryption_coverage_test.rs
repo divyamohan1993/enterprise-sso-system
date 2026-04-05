@@ -88,7 +88,7 @@ fn token_claims_are_jwe_encrypted() {
 /// EncryptedToken on the wire has encrypted claims, not plaintext.
 #[test]
 fn encrypted_token_wire_format() {
-    let token = common::types::Token::test_fixture();
+    let token = common::types::Token::test_fixture_unsigned();
     let dek = [0x42u8; 32];
 
     let encrypted_token = crypto::jwe::encrypt_token(token.clone(), &dek)
@@ -347,7 +347,7 @@ fn log_pseudonymization_produces_opaque_output() {
 #[test]
 fn debug_impls_all_redacted() {
     // Token
-    let token = common::types::Token::test_fixture();
+    let token = common::types::Token::test_fixture_unsigned();
     let dbg = format!("{:?}", token);
     assert!(dbg.contains("[REDACTED]"), "Token Debug must contain [REDACTED]");
     assert!(!dbg.contains("0xEE"), "Token Debug must not leak frost_signature");

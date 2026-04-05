@@ -1930,7 +1930,7 @@ mod token_classification {
 
     #[test]
     fn unclassified_token_cannot_access_secret() {
-        let token = Token::test_fixture();
+        let token = Token::test_fixture_unsigned();
         // Default classification is 0 (Unclassified)
         assert_eq!(token.claims.classification, 0);
 

@@ -199,7 +199,7 @@ mod tests {
         let device_id = Uuid::new_v4();
         let event_type = AuditEventType::AuthSuccess;
         let risk_score = 0.42;
-        let receipts = vec![crate::types::Receipt::test_fixture()];
+        let receipts = vec![crate::types::Receipt::test_fixture_unsigned()];
 
         let encrypted = encrypt_audit_metadata(
             event_type,

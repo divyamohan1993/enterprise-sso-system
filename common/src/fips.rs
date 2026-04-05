@@ -192,15 +192,15 @@ pub fn set_fips_mode(enabled: bool, proof_hex: &str) {
 /// Enable or disable FIPS mode without a proof (for startup and tests only).
 ///
 /// This bypasses the HMAC proof requirement.  It must NOT be called from the
-/// admin API — only from startup initialisation paths and test harnesses.
+/// admin API -- only from startup initialisation paths and test harnesses.
 ///
-/// In non-test builds, disabling FIPS when `MILNET_MILITARY_DEPLOYMENT=1`
-/// is refused. Test builds (`#[cfg(test)]`) bypass this check so that
-/// tests can toggle FIPS mode freely.
+/// Disabling FIPS when `MILNET_MILITARY_DEPLOYMENT=1` is refused in ALL
+/// builds, including tests. Tests that need to toggle FIPS must NOT set
+/// `MILNET_MILITARY_DEPLOYMENT=1`.
 #[doc(hidden)]
 pub fn set_fips_mode_unchecked(enabled: bool) {
-    // In non-test builds, refuse to disable FIPS in military deployment
-    #[cfg(not(test))]
+    // Refuse to disable FIPS in military deployment in ALL builds (including tests).
+    // Tests that need to toggle FIPS must NOT set MILNET_MILITARY_DEPLOYMENT=1.
     if !enabled && is_military_deployment() {
         tracing::error!(
             "REFUSED: cannot disable FIPS mode via unchecked path \
