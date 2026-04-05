@@ -843,6 +843,24 @@ fn verify_id_token_inner(
         ));
     }
 
+    // SECURITY: AAL2 maximum session lifetime enforcement per NIST SP 800-63B.
+    // No session may exceed 12 hours from issuance regardless of exp field.
+    if now - claims.iat > AAL2_MAX_SESSION_SECS {
+        return Err(format!(
+            "AAL2 session lifetime exceeded: iat={}, now={}, max_session={}s (12 hours) -- \
+             re-authentication required per NIST SP 800-63B",
+            claims.iat, now, AAL2_MAX_SESSION_SECS
+        ));
+    }
+
+    // SECURITY: Absolute token lifetime ceiling -- no token may exceed 24 hours.
+    if now - claims.iat > MAX_TOKEN_LIFETIME_SECS {
+        return Err(format!(
+            "absolute token lifetime exceeded: iat={}, now={}, max_lifetime={}s (24 hours)",
+            claims.iat, now, MAX_TOKEN_LIFETIME_SECS
+        ));
+    }
+
     // SECURITY: AAL3 inactivity timeout enforcement per NIST SP 800-63B.
     // Sovereign (tier 1) and Emergency (tier 4) tokens enforce a hard 15-minute
     // timeout from issuance, regardless of the token's own `exp` field.

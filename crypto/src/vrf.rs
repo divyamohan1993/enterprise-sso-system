@@ -187,8 +187,34 @@ pub fn pq_vrf_verify(
     hk.expand(b"pq-vrf-output", &mut expected_output)
         .expect("HKDF-SHA512 expand for 32 bytes cannot fail");
 
-    // Constant-time comparison
-    expected_output == *output
+    // Constant-time comparison to prevent timing oracle attacks
+    crate::ct::ct_eq(&expected_output, output)
+}
+
+/// Post-quantum leader election using PQ-VRF (ML-DSA-87).
+///
+/// Derives a leader index deterministically from the VRF output for the given
+/// round. The proof can be verified by any participant holding the verifying key.
+///
+/// Returns `(leader_index, vrf_output, proof)`.
+pub fn pq_leader_election(
+    signing_key: &crate::pq_sign::PqSigningKey,
+    verifying_key: &crate::pq_sign::PqVerifyingKey,
+    round: u64,
+    participants: usize,
+) -> (usize, Vec<u8>, Vec<u8>) {
+    let input = format!("leader-election-round-{}", round);
+    let (output, proof) = pq_vrf_prove(signing_key, input.as_bytes());
+
+    // Verify our own proof to ensure correctness before publishing
+    debug_assert!(pq_vrf_verify(verifying_key, input.as_bytes(), &output, &proof));
+
+    // Derive leader index from VRF output (first 8 bytes as little-endian u64)
+    let leader_idx = u64::from_le_bytes(
+        output[..8].try_into().unwrap_or([0u8; 8]),
+    ) as usize % participants;
+
+    (leader_idx, output.to_vec(), proof)
 }
 
 // ---------------------------------------------------------------------------

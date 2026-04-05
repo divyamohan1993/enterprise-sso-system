@@ -32,7 +32,7 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Clone)]
 pub struct GoogleOAuthConfig {
     pub client_id: String,
-    pub client_secret: String,
+    pub client_secret: zeroize::Zeroizing<String>,
     pub redirect_uri: String,
 }
 
@@ -591,7 +591,7 @@ mod tests {
     fn test_build_google_auth_url() {
         let config = GoogleOAuthConfig {
             client_id: "my-client-id".into(),
-            client_secret: "secret".into(),
+            client_secret: zeroize::Zeroizing::new("secret".into()),
             redirect_uri: "https://example.com/callback".into(),
         };
         let url = build_google_auth_url(&config, "rand-state-123", "test-nonce-456");

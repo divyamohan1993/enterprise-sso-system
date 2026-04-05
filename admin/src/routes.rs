@@ -3962,6 +3962,13 @@ struct OAuthLoginForm {
     csrf_token: String,
 }
 
+impl Drop for OAuthLoginForm {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.password.zeroize();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Handlers — Token Revocation
 // ---------------------------------------------------------------------------

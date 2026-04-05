@@ -268,7 +268,7 @@ async fn main() {
             tracing::info!("Google OAuth configured");
             Some(admin::google_oauth::GoogleOAuthConfig {
                 client_id: cid,
-                client_secret: csec,
+                client_secret: zeroize::Zeroizing::new(csec),
                 redirect_uri: format!("{base}/oauth/google/callback"),
             })
         }

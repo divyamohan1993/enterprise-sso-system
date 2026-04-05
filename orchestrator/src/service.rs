@@ -3,6 +3,8 @@
 //! All inter-service connections use mTLS (mutual TLS) with auto-generated
 //! certificates. There is no plain-TCP fallback — this is military-grade.
 
+use std::sync::Arc;
+
 use common::types::{ModuleId, Receipt, TokenClaims};
 use crypto::entropy::{generate_key_64, generate_nonce};
 use ml_dsa::KeyGen;
@@ -106,6 +108,10 @@ pub struct OrchestratorService {
     pub opaque_breaker: common::circuit_breaker::CircuitBreaker,
     /// Circuit breaker for TSS service connections.
     pub tss_breaker: common::circuit_breaker::CircuitBreaker,
+    /// Bulkhead for OPAQUE service calls to prevent resource exhaustion cascades.
+    pub opaque_bulkhead: common::bulkhead::Bulkhead,
+    /// Bulkhead for TSS service calls to prevent resource exhaustion cascades.
+    pub tss_bulkhead: common::bulkhead::Bulkhead,
 }
 
 impl OrchestratorService {
@@ -133,6 +139,8 @@ impl OrchestratorService {
             tls_connector,
             opaque_breaker: common::circuit_breaker::CircuitBreaker::new(3, std::time::Duration::from_secs(30)),
             tss_breaker: common::circuit_breaker::CircuitBreaker::new(3, std::time::Duration::from_secs(30)),
+            opaque_bulkhead: common::bulkhead::Bulkhead::new("opaque", 50, 100, std::time::Duration::from_secs(5)),
+            tss_bulkhead: common::bulkhead::Bulkhead::new("tss", 30, 60, std::time::Duration::from_secs(5)),
         }
     }
 
@@ -161,6 +169,8 @@ impl OrchestratorService {
             tls_connector,
             opaque_breaker: common::circuit_breaker::CircuitBreaker::new(3, std::time::Duration::from_secs(30)),
             tss_breaker: common::circuit_breaker::CircuitBreaker::new(3, std::time::Duration::from_secs(30)),
+            opaque_bulkhead: common::bulkhead::Bulkhead::new("opaque", 50, 100, std::time::Duration::from_secs(5)),
+            tss_bulkhead: common::bulkhead::Bulkhead::new("tss", 30, 60, std::time::Duration::from_secs(5)),
         }
     }
 
@@ -185,6 +195,8 @@ impl OrchestratorService {
             tls_connector,
             opaque_breaker: common::circuit_breaker::CircuitBreaker::new(3, std::time::Duration::from_secs(30)),
             tss_breaker: common::circuit_breaker::CircuitBreaker::new(3, std::time::Duration::from_secs(30)),
+            opaque_bulkhead: common::bulkhead::Bulkhead::new("opaque", 50, 100, std::time::Duration::from_secs(5)),
+            tss_bulkhead: common::bulkhead::Bulkhead::new("tss", 30, 60, std::time::Duration::from_secs(5)),
         }
     }
 
@@ -213,6 +225,8 @@ impl OrchestratorService {
             tls_connector,
             opaque_breaker: common::circuit_breaker::CircuitBreaker::new(3, std::time::Duration::from_secs(30)),
             tss_breaker: common::circuit_breaker::CircuitBreaker::new(3, std::time::Duration::from_secs(30)),
+            opaque_bulkhead: common::bulkhead::Bulkhead::new("opaque", 50, 100, std::time::Duration::from_secs(5)),
+            tss_bulkhead: common::bulkhead::Bulkhead::new("tss", 30, 60, std::time::Duration::from_secs(5)),
         }
     }
 
@@ -410,6 +424,8 @@ impl OrchestratorService {
         let login_start_bytes = postcard::to_allocvec(&login_start_req)
             .map_err(|e| format!("serialize login start: {e}"))?;
 
+        let _opaque_permit = self.opaque_bulkhead.acquire().await
+            .map_err(|e| format!("OPAQUE bulkhead: {e}"))?;
         let mut opaque_transport = self.connect_opaque().await?;
         opaque_transport
             .send(&login_start_bytes)
@@ -603,6 +619,8 @@ impl OrchestratorService {
         let signing_req = SigningRequest { receipts: session.receipt_chain.receipts().to_vec(), claims, ratchet_key };
         let signing_bytes = postcard::to_allocvec(&signing_req).map_err(|e| format!("serialize signing request: {e}"))?;
 
+        let _tss_permit = self.tss_bulkhead.acquire().await
+            .map_err(|e| format!("TSS bulkhead: {e}"))?;
         let mut tss_transport = self.connect_tss().await?;
         tss_transport.send(&signing_bytes).await.map_err(|e| format!("send to TSS: {e}"))?;
         let (_sender, tss_resp_bytes) = tss_transport.recv().await.map_err(|e| format!("recv from TSS: {e}"))?;
@@ -624,9 +642,9 @@ impl OrchestratorService {
 
     /// Start the orchestrator as a SHARD mTLS listener, processing auth requests.
     ///
-    /// Each connection is handled in a separate task with a deadline timeout.
+    /// Each connection is handled in a separate spawned task with a deadline timeout.
     /// Individual connection failures do NOT terminate the listener loop.
-    pub async fn run(&self, listen_addr: &str) -> Result<(), String> {
+    pub async fn run(self: Arc<Self>, listen_addr: &str) -> Result<(), String> {
         let (listener, _ca, _cert_key) =
             tls_bind(listen_addr, ModuleId::Orchestrator, self.hmac_key, "orchestrator")
                 .await
@@ -644,36 +662,39 @@ impl OrchestratorService {
                 }
             };
 
-            // Wrap the entire request processing in a deadline timeout.
-            let deadline_result = tokio::time::timeout(
-                Self::AUTH_REQUEST_DEADLINE,
-                async {
-                    let (_sender, req_bytes) = transport.recv().await
-                        .map_err(|e| format!("recv from gateway: {e}"))?;
-                    let request: OrchestratorRequest = postcard::from_bytes(&req_bytes)
-                        .map_err(|e| format!("bad request from gateway: {e}"))?;
-                    let response = self.process_auth(&request).await;
-                    let resp_bytes = postcard::to_allocvec(&response)
-                        .map_err(|e| format!("serialize response: {e}"))?;
-                    transport.send(&resp_bytes).await
-                        .map_err(|e| format!("send to gateway: {e}"))?;
-                    Ok::<(), String>(())
-                },
-            )
-            .await;
+            let service = Arc::clone(&self);
+            tokio::spawn(async move {
+                // Wrap the entire request processing in a deadline timeout.
+                let deadline_result = tokio::time::timeout(
+                    OrchestratorService::AUTH_REQUEST_DEADLINE,
+                    async {
+                        let (_sender, req_bytes) = transport.recv().await
+                            .map_err(|e| format!("recv from gateway: {e}"))?;
+                        let request: OrchestratorRequest = postcard::from_bytes(&req_bytes)
+                            .map_err(|e| format!("bad request from gateway: {e}"))?;
+                        let response = service.process_auth(&request).await;
+                        let resp_bytes = postcard::to_allocvec(&response)
+                            .map_err(|e| format!("serialize response: {e}"))?;
+                        transport.send(&resp_bytes).await
+                            .map_err(|e| format!("send to gateway: {e}"))?;
+                        Ok::<(), String>(())
+                    },
+                )
+                .await;
 
-            match deadline_result {
-                Ok(Ok(())) => {} // Success
-                Ok(Err(e)) => {
-                    tracing::error!("request processing error (continuing): {e}");
+                match deadline_result {
+                    Ok(Ok(())) => {} // Success
+                    Ok(Err(e)) => {
+                        tracing::error!("request processing error (continuing): {e}");
+                    }
+                    Err(_elapsed) => {
+                        tracing::error!(
+                            "request deadline exceeded ({:?}), dropping connection",
+                            OrchestratorService::AUTH_REQUEST_DEADLINE
+                        );
+                    }
                 }
-                Err(_elapsed) => {
-                    tracing::error!(
-                        "request deadline exceeded ({:?}), dropping connection",
-                        Self::AUTH_REQUEST_DEADLINE
-                    );
-                }
-            }
+            });
         }
     }
 }

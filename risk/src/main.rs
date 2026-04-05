@@ -67,6 +67,12 @@ async fn main() {
     let engine = Arc::new(RwLock::new(risk::scoring::RiskEngine::new()));
     let registry = Arc::new(RwLock::new(risk::tiers::DeviceRegistry::new()));
 
+    // SECURITY: Remove ALL sensitive env vars from /proc/PID/environ IMMEDIATELY
+    // after the last env var read. Secrets must not linger in the process environment
+    // any longer than necessary to prevent leakage via /proc/PID/environ or
+    // child process inheritance.
+    common::startup_checks::sanitize_environment();
+
     let addr = std::env::var("MILNET_RISK_LISTEN_ADDR")
         .or_else(|_| std::env::var("RISK_ADDR"))
         .unwrap_or_else(|_| "127.0.0.1:9106".to_string());

@@ -158,6 +158,12 @@ async fn main() {
         });
     }
 
+    // SECURITY: Remove ALL sensitive env vars from /proc/PID/environ IMMEDIATELY
+    // after the last env var read. Secrets must not linger in the process environment
+    // any longer than necessary to prevent leakage via /proc/PID/environ or
+    // child process inheritance.
+    common::startup_checks::sanitize_environment();
+
     // 5. Bind SHARD TLS listener
     let addr = std::env::var("MILNET_VERIFIER_LISTEN_ADDR")
         .or_else(|_| std::env::var("VERIFIER_ADDR"))

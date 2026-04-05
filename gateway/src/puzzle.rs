@@ -154,12 +154,13 @@ impl Default for ConsumedPuzzles {
 static CONSUMED_PUZZLES: std::sync::LazyLock<Mutex<ConsumedPuzzles>> =
     std::sync::LazyLock::new(|| {
         if std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok() {
-            tracing::warn!(
-                "SIEM:WARNING Puzzle replay prevention is per-process only. \
-                 In multi-instance military deployments, a distributed puzzle store \
-                 (e.g. Redis-backed DistributedPuzzleStore) is required to prevent \
-                 cross-instance replay attacks."
+            tracing::error!(
+                "FATAL: Per-process puzzle store in military deployment mode. \
+                 Configure a DistributedPuzzleStore or set MILNET_ALLOW_LOCAL_PUZZLE_STORE=1."
             );
+            if std::env::var("MILNET_ALLOW_LOCAL_PUZZLE_STORE").is_err() {
+                std::process::exit(1);
+            }
         }
         Mutex::new(ConsumedPuzzles::new())
     });

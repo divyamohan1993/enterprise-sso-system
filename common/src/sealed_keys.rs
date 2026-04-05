@@ -209,18 +209,64 @@ pub fn cached_master_kek_distributed() -> &'static [u8; 32] {
             std::process::exit(1);
         }
 
-        // Reconstruct
-        let share_count = mgr.shares_collected();
-        match mgr.reconstruct() {
-            Ok(key) => {
-                tracing::info!(
-                    "Master KEK reconstructed from {} threshold shares (3-of-5 Shamir).",
-                    share_count
-                );
-                ProtectedKek::new(*key)
+        // Reconstruct with retry (3 attempts, exponential backoff with jitter).
+        // Transient failures (e.g. corrupted share from network glitch) may
+        // succeed on retry after re-collecting shares.
+        const MAX_RECONSTRUCTION_ATTEMPTS: u32 = 3;
+        let mut reconstructed_kek: Option<ProtectedKek> = None;
+        for attempt in 1..=MAX_RECONSTRUCTION_ATTEMPTS {
+            let share_count = mgr.shares_collected();
+            match mgr.reconstruct() {
+                Ok(key) => {
+                    tracing::info!(
+                        attempt = attempt,
+                        shares_used = share_count,
+                        "Master KEK reconstructed from {} threshold shares (3-of-5 Shamir).",
+                        share_count
+                    );
+                    reconstructed_kek = Some(ProtectedKek::new(*key));
+                    break;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        attempt = attempt,
+                        max_attempts = MAX_RECONSTRUCTION_ATTEMPTS,
+                        error = %e,
+                        "KEK reconstruction attempt {}/{} failed",
+                        attempt,
+                        MAX_RECONSTRUCTION_ATTEMPTS
+                    );
+                    if attempt < MAX_RECONSTRUCTION_ATTEMPTS {
+                        // Reset for retry: clear reconstruction_attempted flag and shares
+                        mgr.reset_for_retry();
+                        // Re-load shares for the next attempt
+                        if let Err(e2) = mgr.load_my_share(&my_share_hex) {
+                            tracing::error!("Failed to reload own share on retry: {e2}");
+                            std::process::exit(1);
+                        }
+                        if let Some(ref csv) = peer_shares_csv {
+                            for hex_share in csv.split(',') {
+                                let hex_share = hex_share.trim();
+                                if hex_share.is_empty() { continue; }
+                                if let Ok(share) = KekShare::from_hex(hex_share) {
+                                    let _ = mgr.add_peer_share(share);
+                                }
+                            }
+                        }
+                        // Exponential backoff with jitter: 500ms * 2^(attempt-1) + rand(0..250ms)
+                        let base_ms = 500u64 * (1u64 << (attempt - 1));
+                        let mut jitter_bytes = [0u8; 1];
+                        let _ = getrandom::getrandom(&mut jitter_bytes);
+                        let jitter_ms = jitter_bytes[0] as u64 % 250;
+                        std::thread::sleep(std::time::Duration::from_millis(base_ms + jitter_ms));
+                    }
+                }
             }
-            Err(e) => {
-                tracing::error!("KEK reconstruction failed: {e}");
+        }
+        match reconstructed_kek {
+            Some(kek) => kek,
+            None => {
+                tracing::error!("KEK reconstruction failed after {} attempts", MAX_RECONSTRUCTION_ATTEMPTS);
                 std::process::exit(1);
             }
         }

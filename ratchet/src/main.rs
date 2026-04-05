@@ -327,17 +327,24 @@ async fn handle_request_standalone(
             initial_key.zeroize();
             let mgr = manager.write().await;
             match mgr.create_session(session_id, &secret) {
-                Ok(epoch) => RatchetResponse {
-                    success: true,
-                    epoch: Some(epoch),
-                    tag: None,
-                    error: None,
+                Ok(epoch) => {
+                    // SECURITY: Zeroize the stack copy of the secret after session creation
+                    secret.zeroize();
+                    RatchetResponse {
+                        success: true,
+                        epoch: Some(epoch),
+                        tag: None,
+                        error: None,
+                    }
                 },
-                Err(e) => RatchetResponse {
-                    success: false,
-                    epoch: None,
-                    tag: None,
-                    error: Some(e),
+                Err(e) => {
+                    secret.zeroize();
+                    RatchetResponse {
+                        success: false,
+                        epoch: None,
+                        tag: None,
+                        error: Some(e),
+                    }
                 },
             }
         }
@@ -416,17 +423,24 @@ async fn handle_request_persistent(
             initial_key.zeroize();
             let mgr = manager.write().await;
             match mgr.create_session(session_id, &secret).await {
-                Ok(epoch) => RatchetResponse {
-                    success: true,
-                    epoch: Some(epoch),
-                    tag: None,
-                    error: None,
+                Ok(epoch) => {
+                    // SECURITY: Zeroize the stack copy of the secret after session creation
+                    secret.zeroize();
+                    RatchetResponse {
+                        success: true,
+                        epoch: Some(epoch),
+                        tag: None,
+                        error: None,
+                    }
                 },
-                Err(e) => RatchetResponse {
-                    success: false,
-                    epoch: None,
-                    tag: None,
-                    error: Some(e),
+                Err(e) => {
+                    secret.zeroize();
+                    RatchetResponse {
+                        success: false,
+                        epoch: None,
+                        tag: None,
+                        error: Some(e),
+                    }
                 },
             }
         }

@@ -20,7 +20,7 @@ pub struct RatchetRequest {
 ///
 /// Note: there is intentionally no `GetKey` variant — exposing raw chain
 /// keys would break forward secrecy per spec.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub enum RatchetAction {
     CreateSession {
         session_id: Uuid,
@@ -41,6 +41,34 @@ pub enum RatchetAction {
     Destroy {
         session_id: Uuid,
     },
+}
+
+// SECURITY: Manual Debug impl to redact initial_key from logs/traces.
+// The derived Debug would print the raw key bytes in plaintext.
+impl std::fmt::Debug for RatchetAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CreateSession { session_id, .. } => f.debug_struct("CreateSession")
+                .field("session_id", session_id)
+                .field("initial_key", &"[REDACTED]")
+                .finish(),
+            Self::Advance { session_id, client_entropy, server_entropy, server_nonce } => {
+                f.debug_struct("Advance")
+                    .field("session_id", session_id)
+                    .field("client_entropy", client_entropy)
+                    .field("server_entropy", server_entropy)
+                    .field("server_nonce", server_nonce)
+                    .finish()
+            }
+            Self::GetTag { session_id, claims_bytes } => f.debug_struct("GetTag")
+                .field("session_id", session_id)
+                .field("claims_bytes_len", &claims_bytes.len())
+                .finish(),
+            Self::Destroy { session_id } => f.debug_struct("Destroy")
+                .field("session_id", session_id)
+                .finish(),
+        }
+    }
 }
 
 /// Response returned by the Ratchet Session Manager.

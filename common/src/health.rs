@@ -320,7 +320,19 @@ where
     let health_token: Option<String> = std::env::var("MILNET_HEALTH_TOKEN").ok().filter(|t| !t.is_empty());
 
     tokio::spawn(async move {
-        let addr = format!("127.0.0.1:{health_port}");
+        // SECURITY: Bind to configurable address. When MILNET_HEALTH_TOKEN is set
+        // (authenticated health checks), default to 0.0.0.0 for K8s probe access.
+        // Otherwise default to 127.0.0.1 (localhost only) to prevent unauthenticated
+        // health info exposure.
+        let bind_addr = std::env::var("MILNET_HEALTH_BIND_ADDR")
+            .unwrap_or_else(|_| {
+                if std::env::var("MILNET_HEALTH_TOKEN").is_ok() {
+                    "0.0.0.0".to_string()
+                } else {
+                    "127.0.0.1".to_string()
+                }
+            });
+        let addr = format!("{bind_addr}:{health_port}");
         let listener = match tokio::net::TcpListener::bind(&addr).await {
             Ok(l) => l,
             Err(e) => {

@@ -273,6 +273,7 @@ const SENSITIVE_ENV_VARS: &[&str] = &[
     "ADMIN_TLS_KEY",
     "ADMIN_TLS_CERT",
     "MILNET_TSS_SHARE_SEALED",
+    "MILNET_SIEM_ENCRYPTION_KEY",
 ];
 
 /// Remove ALL sensitive environment variables from the process environment.

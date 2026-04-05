@@ -260,6 +260,10 @@ async fn main() {
             libc::madvise(key_ptr as *mut libc::c_void, key_len, libc::MADV_DONTDUMP);
         }
 
+        // SECURITY: Zeroize the raw PEM bytes after parsing into rustls types.
+        // The key material is now held only by rustls's PrivateKeyDer.
+        let mut key_pem = key_pem;
+
         // SECURITY: rustls-pemfile is UNMAINTAINED (RUSTSEC-2025-0134).
         // PEM parsing inlined here to eliminate the dependency entirely.
         let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
@@ -278,6 +282,13 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
+
+        // SECURITY: Zeroize raw PEM key bytes now that they've been parsed into rustls format.
+        // Prevents key material from lingering in process memory.
+        {
+            use zeroize::Zeroize;
+            key_pem.zeroize();
+        }
 
         // CNSA 2.0 compliant: TLS 1.3 only with AES-256-GCM-SHA384
         // Post-quantum hybrid key exchange: X25519MLKEM768 preferred, X25519 fallback.

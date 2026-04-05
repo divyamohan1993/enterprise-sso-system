@@ -435,6 +435,12 @@ async fn main() {
         }
     });
 
+    // SECURITY: Remove ALL sensitive env vars from /proc/PID/environ IMMEDIATELY
+    // after the last env var read. Secrets must not linger in the process environment
+    // any longer than necessary to prevent leakage via /proc/PID/environ or
+    // child process inheritance.
+    common::startup_checks::sanitize_environment();
+
     let addr = std::env::var("KT_ADDR").unwrap_or_else(|_| "127.0.0.1:9107".to_string());
     let hmac_key = crypto::entropy::generate_key_64();
     let (listener, _ca, _cert_key) =

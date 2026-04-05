@@ -574,6 +574,21 @@ impl ThresholdKekManager {
         self.reconstructed_kek.as_ref().map(|k| &k.key)
     }
 
+    /// Reset the manager state so reconstruction can be re-attempted with fresh shares.
+    ///
+    /// This clears the `reconstruction_attempted` flag and any collected shares,
+    /// allowing a retry after a transient failure (e.g. network partition during
+    /// share collection).
+    pub fn reset_for_retry(&mut self) {
+        // Zeroize any partially-collected shares before clearing
+        for share in &mut self.collected_shares {
+            share.value.zeroize();
+        }
+        self.collected_shares.clear();
+        self.reconstruction_attempted = false;
+        tracing::info!("ThresholdKekManager: reset for retry (shares cleared, reconstruction_attempted=false)");
+    }
+
     /// Emergency zeroize: destroy the KEK immediately.
     /// Called when tamper detection fires.
     pub fn emergency_zeroize(&mut self) {
