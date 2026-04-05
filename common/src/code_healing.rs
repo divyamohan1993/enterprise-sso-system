@@ -85,6 +85,11 @@ pub struct CodeHealer {
 
 impl CodeHealer {
     /// Create a new code healer.
+    ///
+    /// In military deployment (MILNET_MILITARY_DEPLOYMENT=1), the healing
+    /// authority public key MUST be set via `set_healing_authority_pk()` before
+    /// any healing session is started. This prevents a compromised node from
+    /// pushing unsigned binaries.
     pub fn new(binary_path: PathBuf, staging_path: PathBuf) -> Self {
         Self {
             binary_path,
@@ -165,6 +170,31 @@ impl CodeHealer {
         hash_signature: Vec<u8>,
         total_chunks: u32,
     ) {
+        // SECURITY: In military deployment, healing_authority_pk is mandatory.
+        // Without it, any compromised node could push unsigned malicious binaries.
+        if std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok() && self.healing_authority_pk.is_none() {
+            error!(
+                node = %target,
+                "FATAL: healing_authority_pk is mandatory in military deployment"
+            );
+            let event = crate::siem::SecurityEvent {
+                timestamp: crate::siem::SecurityEvent::now_iso8601(),
+                category: "code_healing",
+                action: "missing_healing_authority_pk",
+                severity: crate::siem::Severity::Critical,
+                outcome: "failure",
+                user_id: None,
+                source_ip: None,
+                detail: Some(
+                    "healing_authority_pk not configured in military deployment — \
+                     refusing to start healing session"
+                        .into(),
+                ),
+            };
+            event.emit();
+            return;
+        }
+
         // Verify the expected_hash signature if authority key is configured.
         if let Some(ref _pk) = self.healing_authority_pk {
             if hash_signature.is_empty() {

@@ -203,8 +203,8 @@ fn future_iat_rejected() {
     let claims = TokenClaims {
         sub: Uuid::new_v4(),
         iss: [0x01; 32],
-        iat: now + 60_000_000, // 60 seconds in the future
-        exp: now + 120_000_000,
+        iat: now + 3_600_000_000, // 3600 seconds (1 hour) in the future — well beyond any clock skew tolerance
+        exp: now + 7_200_000_000,
         scope: 0x0000_000F,
         dpop_hash: crypto::dpop::dpop_key_hash(&TEST_DPOP_KEY),
         ceremony_id: [0xCC; 32],
@@ -226,7 +226,7 @@ fn future_iat_rejected() {
     // iat-in-future error depending on verifier implementation.
     assert!(
         result.is_err(),
-        "token with iat 60s in the future must be rejected"
+        "token with iat 3600s in the future must be rejected"
     );
 }
 

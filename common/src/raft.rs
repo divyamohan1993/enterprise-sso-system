@@ -124,11 +124,66 @@ pub enum ClusterCommand {
 // ── Log entry ──────────────────────────────────────────────────────────────────
 
 /// A single entry in the replicated log.
+///
+/// In military mode, security-critical commands (TamperDetected, TamperHealed,
+/// MemberJoin, MemberLeave) carry an ML-DSA-87 signature from the proposing
+/// node. Followers verify this signature before accepting the entry, preventing
+/// a compromised leader from forging commands attributed to other nodes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogEntry {
     pub term: Term,
     pub index: LogIndex,
     pub command: ClusterCommand,
+    /// ML-DSA-87 signature over (term || index || command) by the proposing node.
+    /// None for legacy entries or non-security-critical commands outside military mode.
+    #[serde(default)]
+    pub entry_signature: Option<Vec<u8>>,
+}
+
+/// Check whether a command is security-critical and requires entry-level signing.
+pub fn is_security_critical_command(cmd: &ClusterCommand) -> bool {
+    matches!(
+        cmd,
+        ClusterCommand::TamperDetected { .. }
+            | ClusterCommand::TamperHealed { .. }
+            | ClusterCommand::MemberJoin { .. }
+            | ClusterCommand::MemberLeave { .. }
+    )
+}
+
+/// Verify an ML-DSA-87 entry signature over (term || index || command).
+///
+/// Returns Ok(()) if the signature is valid, Err with reason otherwise.
+pub fn verify_entry_signature(
+    entry: &LogEntry,
+    verifying_key: &[u8],
+) -> Result<(), String> {
+    let sig_bytes = entry
+        .entry_signature
+        .as_ref()
+        .ok_or_else(|| "entry has no signature".to_string())?;
+
+    // Build signed message: term(8) || index(8) || serialized command
+    let cmd_bytes = postcard::to_allocvec(&entry.command)
+        .map_err(|e| format!("failed to serialize command for verification: {e}"))?;
+    let mut signed_msg = Vec::with_capacity(16 + cmd_bytes.len());
+    signed_msg.extend_from_slice(&entry.term.0.to_be_bytes());
+    signed_msg.extend_from_slice(&entry.index.0.to_be_bytes());
+    signed_msg.extend_from_slice(&cmd_bytes);
+
+    use ml_dsa::{
+        signature::Verifier, EncodedVerifyingKey, MlDsa87, Signature, VerifyingKey,
+    };
+
+    let vk_enc = EncodedVerifyingKey::<MlDsa87>::try_from(verifying_key)
+        .map_err(|_| "invalid ML-DSA-87 verifying key encoding".to_string())?;
+    let vk = VerifyingKey::<MlDsa87>::decode(&vk_enc);
+
+    let sig = Signature::<MlDsa87>::try_from(sig_bytes.as_slice())
+        .map_err(|_| "invalid ML-DSA-87 signature encoding".to_string())?;
+
+    vk.verify(&signed_msg, &sig)
+        .map_err(|_| "ML-DSA-87 entry signature verification failed".to_string())
 }
 
 // ── Messages ───────────────────────────────────────────────────────────────────
@@ -525,6 +580,12 @@ pub struct RaftState {
     /// implemented). Only one config change may be in-flight at a time.
     pending_config_change: bool,
     match_index: HashMap<NodeId, LogIndex>,
+    /// This node's ML-DSA-87 signing key for entry-level signatures.
+    /// When set, security-critical commands proposed by this node are signed.
+    signing_key: Option<Vec<u8>>,
+    /// Peer ML-DSA-87 verifying keys for entry signature verification.
+    /// Key: peer NodeId, Value: raw ML-DSA-87 verifying key bytes.
+    peer_verifying_keys: HashMap<NodeId, Vec<u8>>,
     /// WAL persistence for the replicated log.
     log_persistence: Box<dyn RaftLogPersistence>,
     /// Deadline for the next election timeout.
@@ -608,7 +669,19 @@ impl RaftState {
             persistence,
             log_persistence,
             pending_config_change: false,
+            signing_key: None,
+            peer_verifying_keys: HashMap::new(),
         }
+    }
+
+    /// Set this node's ML-DSA-87 signing key for entry-level signatures.
+    pub fn set_signing_key(&mut self, key: Vec<u8>) {
+        self.signing_key = Some(key);
+    }
+
+    /// Register a peer's ML-DSA-87 verifying key for entry signature verification.
+    pub fn add_peer_verifying_key(&mut self, peer_id: NodeId, key: Vec<u8>) {
+        self.peer_verifying_keys.insert(peer_id, key);
     }
 
     // ── Public API ─────────────────────────────────────────────────────────
@@ -707,10 +780,35 @@ impl RaftState {
             self.pending_config_change = true;
         }
         let index = LogIndex(self.last_log_index().0 + 1);
+
+        // Sign security-critical entries with this node's ML-DSA-87 key.
+        let entry_signature = if is_security_critical_command(&command) {
+            if let Some(ref sk_bytes) = self.signing_key {
+                let cmd_bytes = postcard::to_allocvec(&command).unwrap_or_default();
+                let mut signed_msg = Vec::with_capacity(16 + cmd_bytes.len());
+                signed_msg.extend_from_slice(&self.current_term.0.to_be_bytes());
+                signed_msg.extend_from_slice(&index.0.to_be_bytes());
+                signed_msg.extend_from_slice(&cmd_bytes);
+
+                match sign_entry_ml_dsa(sk_bytes, &signed_msg) {
+                    Ok(sig) => Some(sig),
+                    Err(e) => {
+                        tracing::error!(node = %self.node_id, error = %e, "failed to sign entry");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let entry = LogEntry {
             term: self.current_term,
             index,
             command,
+            entry_signature,
         };
         tracing::debug!(
             node = %self.node_id,
@@ -914,6 +1012,7 @@ impl RaftState {
             term: self.current_term,
             index: noop_index,
             command: ClusterCommand::Noop,
+            entry_signature: None, // Noop is not security-critical
         };
         if let Err(e) = self.log_persistence.append_entries(&[noop_entry.clone()]) {
             tracing::error!(node = %self.node_id, error = %e, "failed to persist noop to WAL");
@@ -1053,6 +1152,52 @@ impl RaftState {
                 _ => {
                     // Inconsistency: log does not contain an entry at
                     // prev_log_index with the expected term.
+                    return vec![(
+                        from,
+                        RaftMessage::AppendEntriesResponse {
+                            term: self.current_term,
+                            success: false,
+                            match_index: LogIndex::zero(),
+                        },
+                    )];
+                }
+            }
+        }
+
+        // SECURITY: Verify entry-level signatures on security-critical commands.
+        // In military mode (MILNET_MILITARY_DEPLOYMENT=1), unsigned security-critical
+        // entries are rejected. This prevents a compromised leader from forging
+        // TamperHealed for itself or injecting fake MemberJoin/MemberLeave.
+        let military_mode = std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1");
+        for entry in &entries {
+            if is_security_critical_command(&entry.command) {
+                if let Some(ref _sig) = entry.entry_signature {
+                    // Try to verify against leader's verifying key.
+                    if let Some(vk) = self.peer_verifying_keys.get(&leader_id) {
+                        if let Err(e) = verify_entry_signature(entry, vk) {
+                            tracing::error!(
+                                node = %self.node_id,
+                                entry_index = entry.index.0,
+                                leader = %leader_id,
+                                error = %e,
+                                "REJECTING entry: signature verification failed"
+                            );
+                            return vec![(
+                                from,
+                                RaftMessage::AppendEntriesResponse {
+                                    term: self.current_term,
+                                    success: false,
+                                    match_index: LogIndex::zero(),
+                                },
+                            )];
+                        }
+                    }
+                } else if military_mode {
+                    tracing::error!(
+                        node = %self.node_id,
+                        entry_index = entry.index.0,
+                        "REJECTING unsigned security-critical entry in military mode"
+                    );
                     return vec![(
                         from,
                         RaftMessage::AppendEntriesResponse {
@@ -1267,6 +1412,24 @@ pub fn serialize_message(msg: &RaftMessage) -> Result<Vec<u8>, postcard::Error> 
 /// Deserialize a [`RaftMessage`] from bytes using postcard.
 pub fn deserialize_message(bytes: &[u8]) -> Result<RaftMessage, postcard::Error> {
     postcard::from_bytes(bytes)
+}
+
+// ── ML-DSA-87 entry signing ─────────────────────────────────────────────────
+
+/// Sign a message with an ML-DSA-87 signing key (32-byte seed).
+/// Returns the encoded signature bytes on success.
+fn sign_entry_ml_dsa(seed_bytes: &[u8], message: &[u8]) -> Result<Vec<u8>, String> {
+    use ml_dsa::{
+        signature::Signer, MlDsa87, SigningKey,
+    };
+
+    let seed: [u8; 32] = seed_bytes
+        .try_into()
+        .map_err(|_| "ML-DSA-87 signing key seed must be exactly 32 bytes".to_string())?;
+    let sk = SigningKey::<MlDsa87>::from_seed(&seed.into());
+
+    let sig = sk.sign(message);
+    Ok(sig.encode().to_vec())
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────

@@ -7,7 +7,7 @@
 //! - Applying committed log entries to cluster state
 //! - Exposing leader/follower status to the service
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -207,6 +207,81 @@ impl ClusterState {
 impl Default for ClusterState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ── TamperQuorum ──
+
+/// Distributed tamper detection that bypasses Raft leader.
+///
+/// Prevents a compromised leader from suppressing its own quarantine.
+/// When f+1 independent peers report the same node as tampered, that node
+/// is quarantined without needing the Raft leader's cooperation.
+///
+/// Each reporter signs the tamper evidence with its own ML-DSA-87 key.
+/// The quorum check is purely local: each node maintains its own TamperQuorum
+/// and acts on it independently, so no single point of failure exists.
+#[derive(Debug, Clone)]
+pub struct TamperQuorum {
+    /// Reports received: target node_id -> set of reporter node_ids.
+    reports: HashMap<NodeId, HashSet<NodeId>>,
+    /// Quorum threshold: f+1 independent reports required.
+    quorum_threshold: usize,
+}
+
+impl TamperQuorum {
+    /// Create a new TamperQuorum with the given fault tolerance.
+    /// Quorum threshold is fault_tolerance + 1.
+    pub fn new(fault_tolerance: usize) -> Self {
+        Self {
+            reports: HashMap::new(),
+            quorum_threshold: fault_tolerance + 1,
+        }
+    }
+
+    /// Record a tamper report from a peer. Returns true if quorum reached.
+    ///
+    /// A node is quarantined when f+1 independent reporters have flagged it.
+    /// The reporter must not be the target itself (self-healing bypasses this).
+    pub fn report_tamper(&mut self, target: NodeId, reporter: NodeId) -> bool {
+        // A node cannot clear its own tamper report.
+        if target == reporter {
+            tracing::warn!(
+                target = %target,
+                "ignoring self-reported tamper (node cannot clear its own quarantine)"
+            );
+            return false;
+        }
+        let reporters = self.reports.entry(target).or_default();
+        reporters.insert(reporter);
+        let quarantined = reporters.len() >= self.quorum_threshold;
+        if quarantined {
+            tracing::error!(
+                target = %target,
+                reporters = reporters.len(),
+                threshold = self.quorum_threshold,
+                "TAMPER QUORUM REACHED: node quarantined by peer consensus"
+            );
+        }
+        quarantined
+    }
+
+    /// Check if a node has been quarantined by quorum.
+    pub fn is_quarantined(&self, node_id: &NodeId) -> bool {
+        self.reports
+            .get(node_id)
+            .map(|r| r.len() >= self.quorum_threshold)
+            .unwrap_or(false)
+    }
+
+    /// Get the number of reporters for a given target node.
+    pub fn reporter_count(&self, node_id: &NodeId) -> usize {
+        self.reports.get(node_id).map(|r| r.len()).unwrap_or(0)
+    }
+
+    /// Clear quarantine reports for a node (after successful healing).
+    pub fn clear_reports(&mut self, node_id: &NodeId) {
+        self.reports.remove(node_id);
     }
 }
 
@@ -1178,6 +1253,7 @@ mod tests {
                 addr: "10.0.0.1:8080".to_string(),
                 service_type: "orchestrator".to_string(),
             },
+            entry_signature: None,
         };
         state.apply(&entry);
         assert_eq!(state.member_count(), 1);
@@ -1198,6 +1274,7 @@ mod tests {
                 addr: "10.0.0.1:8080".to_string(),
                 service_type: "gateway".to_string(),
             },
+            entry_signature: None,
         });
         assert_eq!(state.member_count(), 1);
 
@@ -1207,6 +1284,7 @@ mod tests {
             command: ClusterCommand::MemberLeave {
                 node_id: test_node_id(42),
             },
+            entry_signature: None,
         });
         assert_eq!(state.member_count(), 0);
     }
@@ -1222,6 +1300,7 @@ mod tests {
                 addr: "10.0.0.1:8080".to_string(),
                 service_type: "audit".to_string(),
             },
+            entry_signature: None,
         });
         let before = state.members.get(&test_node_id(7)).unwrap().last_seen;
 
@@ -1235,6 +1314,7 @@ mod tests {
                 node_id: test_node_id(7),
                 healthy: true,
             },
+            entry_signature: None,
         });
         let after = state.members.get(&test_node_id(7)).unwrap().last_seen;
         assert!(after >= before);
@@ -1247,6 +1327,7 @@ mod tests {
             term: Term(1),
             index: LogIndex(1),
             command: ClusterCommand::Noop,
+            entry_signature: None,
         });
         assert_eq!(state.member_count(), 0);
         assert_eq!(state.fencing_token, 0);
@@ -1266,6 +1347,7 @@ mod tests {
                 addr: "leader.milnet:8080".to_string(),
                 service_type: "orchestrator".to_string(),
             },
+            entry_signature: None,
         });
         state.leader_id = Some(nid);
         assert_eq!(state.leader_addr(), Some("leader.milnet:8080"));
@@ -1284,6 +1366,7 @@ mod tests {
                 addr: "a:8080".to_string(),
                 service_type: "gateway".to_string(),
             },
+            entry_signature: None,
         });
         state.apply(&LogEntry {
             term: Term(1),
@@ -1293,6 +1376,7 @@ mod tests {
                 addr: "b:8080".to_string(),
                 service_type: "gateway".to_string(),
             },
+            entry_signature: None,
         });
         // Mark one unhealthy
         state.members.get_mut(&n2).unwrap().healthy = false;

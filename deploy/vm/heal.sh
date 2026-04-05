@@ -23,7 +23,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BINARY_DIR="${BINARY_DIR:-$PROJECT_ROOT/target/release}"
 SSH_USER="${SSH_USER:-root}"
-SSH_OPTS="${SSH_OPTS:--o StrictHostKeyChecking=accept-new -o ConnectTimeout=10}"
+# SECURITY: StrictHostKeyChecking=yes requires pre-distributed host keys.
+# accept-new would allow MITM on first contact. In military deployment,
+# host keys are provisioned during node enrollment and stored in
+# /etc/milnet/ssh/known_hosts. A compromised network cannot redirect
+# heal.sh to a rogue node.
+SSH_OPTS="${SSH_OPTS:--o StrictHostKeyChecking=yes -o UserKnownHostsFile=/etc/milnet/ssh/known_hosts -o ConnectTimeout=10}"
 INSTALL_DIR="/opt/milnet/bin"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-30}"
 
@@ -62,9 +67,43 @@ LOCAL_BINARY="$BINARY_DIR/$BINARY_NAME"
 
 # ── Helper functions ───────────────────────────────────────────────────────────
 
+log_info() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] INFO: $*"
+}
+
+log_warn() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARN: $*" >&2
+}
+
+log_error() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $*" >&2
+}
+
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
 }
+
+# ── Script integrity verification ─────────────────────────────────────────────
+
+verify_heal_script_integrity() {
+    local expected_hash="${HEAL_SCRIPT_HASH:-}"
+    if [ -z "$expected_hash" ]; then
+        log_warn "HEAL_SCRIPT_HASH not set — cannot verify heal.sh integrity"
+        return 0
+    fi
+    local actual_hash
+    actual_hash=$(sha256sum "$0" | awk '{print $1}')
+    if [ "$actual_hash" != "$expected_hash" ]; then
+        log_error "FATAL: heal.sh integrity check FAILED. Script may be tampered."
+        log_error "Expected: $expected_hash"
+        log_error "Actual:   $actual_hash"
+        exit 199
+    fi
+    log_info "heal.sh integrity verified"
+}
+
+# Verify script integrity before any healing operations.
+verify_heal_script_integrity
 
 ssh_cmd() {
     ssh $SSH_OPTS "$SSH_USER@$TARGET_IP" "$@"

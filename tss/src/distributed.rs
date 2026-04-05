@@ -2689,9 +2689,10 @@ mod tests {
         for (i, node) in nodes.into_iter().take(threshold).enumerate() {
             let addr = format!("127.0.0.1:{}", base_port + i as u16);
             signer_addrs.push((node.identifier(), addr.clone()));
-            let signer_name = format!("tss-signer-{}", i);
+            // Use "localhost" as SAN so certs match the hostname the connector resolves
+            // (127.0.0.1 is an IP, so coordinate_signing_remote_with_connector uses "localhost").
             let listener =
-                bind_signer_with_shared_ca(&addr, hmac_key, &ca, &signer_name).await;
+                bind_signer_with_shared_ca(&addr, hmac_key, &ca, "localhost").await;
             tokio::spawn(async move {
                 let _ = run_signer_process_with_listener(node, &addr, listener).await;
             });
@@ -2765,9 +2766,9 @@ mod tests {
 
             let addr = format!("127.0.0.1:{}", base_port + i as u16);
             signer_addrs.push((unsealed_node.identifier(), addr.clone()));
-            let signer_name = format!("tss-signer-sealed-{}", i);
+            // Use "localhost" as SAN — see distributed_coordinator_signer_handshake.
             let listener =
-                bind_signer_with_shared_ca(&addr, hmac_key, &ca, &signer_name).await;
+                bind_signer_with_shared_ca(&addr, hmac_key, &ca, "localhost").await;
             tokio::spawn(async move {
                 let _ = run_signer_process_with_listener(unsealed_node, &addr, listener).await;
             });

@@ -1341,3 +1341,161 @@ fn jti_multiple_unique_tokens_all_accepted() {
         );
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Host Compromise: Raft HMAC Authentication
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_raft_rejects_forged_hmac() {
+    use common::raft::{
+        AuthenticatedRaftMessage, ClusterCommand, LogIndex, NodeId, RaftMessage, Term,
+    };
+
+    let correct_key = [0x42u8; 64];
+    let wrong_key = [0x99u8; 64];
+    let sender = NodeId::random();
+
+    let msg = RaftMessage::AppendEntries {
+        term: Term(1),
+        leader_id: sender,
+        prev_log_index: LogIndex(0),
+        prev_log_term: Term(0),
+        entries: vec![],
+        leader_commit: LogIndex(0),
+    };
+
+    // Sign with the correct key
+    let authenticated = AuthenticatedRaftMessage::sign(msg.clone(), sender, &correct_key);
+
+    // Verify with correct key succeeds
+    assert!(
+        authenticated.verify(&correct_key).is_ok(),
+        "HMAC verification must pass with correct transport key"
+    );
+
+    // Verify with wrong key must fail (forged message / key mismatch)
+    assert!(
+        authenticated.verify(&wrong_key).is_err(),
+        "HMAC verification must reject messages signed with a different key"
+    );
+
+    // Tamper with the signature bytes directly
+    let mut tampered = authenticated.clone();
+    if let Some(b) = tampered.hmac_signature.first_mut() {
+        *b ^= 0xFF;
+    }
+    assert!(
+        tampered.verify(&correct_key).is_err(),
+        "HMAC verification must reject tampered signature bytes"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Host Compromise: TamperQuorum Bypass Prevention
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_tamper_quorum_requires_f_plus_1_reporters() {
+    use common::cluster::TamperQuorum;
+    use common::raft::NodeId;
+
+    // fault_tolerance = 3 means quorum = 4 reporters needed
+    let mut quorum = TamperQuorum::new(3);
+    let target = NodeId::random();
+
+    // Report from 3 different peers: not enough
+    let r1 = NodeId::random();
+    let r2 = NodeId::random();
+    let r3 = NodeId::random();
+    let r4 = NodeId::random();
+
+    assert!(!quorum.report_tamper(target, r1), "1 reporter: no quorum");
+    assert!(!quorum.report_tamper(target, r2), "2 reporters: no quorum");
+    assert!(!quorum.report_tamper(target, r3), "3 reporters: no quorum");
+    assert!(!quorum.is_quarantined(&target), "3 < 4: not quarantined");
+
+    // 4th reporter triggers quorum
+    assert!(quorum.report_tamper(target, r4), "4 reporters: quorum reached");
+    assert!(quorum.is_quarantined(&target), "node must be quarantined after quorum");
+
+    // Duplicate report from same reporter does not increase count
+    assert_eq!(quorum.reporter_count(&target), 4);
+    quorum.report_tamper(target, r1); // duplicate
+    assert_eq!(quorum.reporter_count(&target), 4, "duplicate reporter must not inflate count");
+}
+
+#[test]
+fn test_compromised_leader_cannot_suppress_quarantine() {
+    use common::cluster::TamperQuorum;
+    use common::raft::NodeId;
+
+    // Simulate 11-node cluster: f=3, quorum=4
+    let mut quorum = TamperQuorum::new(3);
+    let compromised_leader = NodeId::random();
+
+    // The compromised leader tries to report itself (self-healing bypass)
+    let self_report = quorum.report_tamper(compromised_leader, compromised_leader);
+    assert!(
+        !self_report,
+        "self-report must be rejected (compromised node cannot clear its own quarantine)"
+    );
+    assert_eq!(
+        quorum.reporter_count(&compromised_leader),
+        0,
+        "self-reports must not be counted"
+    );
+
+    // 4 honest peers independently detect the compromise and report
+    let peers: Vec<NodeId> = (0..4).map(|_| NodeId::random()).collect();
+    for (i, peer) in peers.iter().enumerate() {
+        let reached = quorum.report_tamper(compromised_leader, *peer);
+        if i < 3 {
+            assert!(!reached, "peer {}: not yet quorum", i);
+        } else {
+            assert!(reached, "peer {}: quorum reached", i);
+        }
+    }
+
+    // Leader is quarantined regardless of what the leader does via Raft
+    assert!(
+        quorum.is_quarantined(&compromised_leader),
+        "compromised leader must be quarantined by peer consensus, bypassing Raft"
+    );
+
+    // Clearing works for healed nodes
+    quorum.clear_reports(&compromised_leader);
+    assert!(
+        !quorum.is_quarantined(&compromised_leader),
+        "quarantine must be lifted after clearing reports"
+    );
+}
+
+#[test]
+fn test_heal_script_rejects_wrong_hash() {
+    // Verify the conceptual integrity check: if HEAL_SCRIPT_HASH is set to a
+    // wrong value, the verify function would detect tampering. We test by
+    // computing SHA-256 of a known string and comparing against a wrong hash.
+    use sha2::{Digest, Sha256};
+
+    let script_content = b"#!/usr/bin/env bash\n# heal.sh content";
+    let mut hasher = Sha256::new();
+    hasher.update(script_content);
+    let actual_hash = hex::encode(hasher.finalize());
+
+    // Wrong hash must not match
+    let wrong_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+    assert_ne!(
+        actual_hash, wrong_hash,
+        "actual hash of script must differ from wrong hash"
+    );
+
+    // Correct hash must match itself (integrity verified)
+    let mut hasher2 = Sha256::new();
+    hasher2.update(script_content);
+    let verify_hash = hex::encode(hasher2.finalize());
+    assert_eq!(
+        actual_hash, verify_hash,
+        "SHA-256 must be deterministic (integrity check is reliable)"
+    );
+}

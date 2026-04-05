@@ -126,6 +126,7 @@ fuzz_target!(|input: FuzzInput| {
                                 term: Term(*term),
                                 index: LogIndex(*prev_log_index + i as u64 + 1),
                                 command: ClusterCommand::Noop,
+                                entry_signature: None,
                             })
                             .collect();
                         RaftMessage::AppendEntries {
