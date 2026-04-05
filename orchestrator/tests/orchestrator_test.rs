@@ -353,8 +353,10 @@ async fn orchestrator_handles_opaque_failure() {
     });
 
     let connector = tls_connector(orchestrator_client_cfg);
-    let service = OrchestratorService::new_with_tls(
+    let receipt_signing_key = crypto::entropy::generate_key_64();
+    let service = OrchestratorService::new_with_tls_and_receipt_key(
         hmac_key,
+        receipt_signing_key,
         opaque_addr,
         tss_addr,
         connector,
