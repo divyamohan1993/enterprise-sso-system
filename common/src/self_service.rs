@@ -106,7 +106,7 @@ impl std::fmt::Display for PasswordResetStatus {
 }
 
 /// A password reset request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PasswordResetRequest {
     /// Request ID.
     pub id: String,
@@ -125,6 +125,27 @@ pub struct PasswordResetRequest {
     pub expires_at: i64,
     /// Source IP that initiated the request.
     pub source_ip: Option<String>,
+}
+
+impl std::fmt::Debug for PasswordResetRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PasswordResetRequest")
+            .field("id", &self.id)
+            .field("user_id", &self.user_id)
+            .field("email", &"[REDACTED]")
+            .field("token", &"[REDACTED]")
+            .field("status", &self.status)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for PasswordResetRequest {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.email.zeroize();
+        self.token.zeroize();
+        self.source_ip.take();
+    }
 }
 
 // ── MFA Enrollment ──────────────────────────────────────────────────────────
@@ -162,7 +183,7 @@ pub enum MfaEnrollmentStatus {
 }
 
 /// TOTP enrollment data.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct TotpEnrollment {
     /// TOTP secret (base32 encoded).
     #[serde(skip_serializing)]
@@ -175,6 +196,25 @@ pub struct TotpEnrollment {
     pub account_name: String,
     /// Whether the enrollment has been verified with a valid code.
     pub verified: bool,
+}
+
+impl std::fmt::Debug for TotpEnrollment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TotpEnrollment")
+            .field("secret", &"[REDACTED]")
+            .field("issuer", &self.issuer)
+            .field("verified", &self.verified)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for TotpEnrollment {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.secret.zeroize();
+        self.provisioning_uri.zeroize();
+        self.account_name.zeroize();
+    }
 }
 
 /// FIDO2 enrollment data.
@@ -330,7 +370,7 @@ pub struct ProfileUpdate {
 }
 
 /// Email verification for profile updates.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct EmailVerification {
     /// Verification ID.
     pub id: String,
@@ -349,6 +389,26 @@ pub struct EmailVerification {
     pub expires_at: i64,
 }
 
+impl std::fmt::Debug for EmailVerification {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmailVerification")
+            .field("id", &self.id)
+            .field("user_id", &self.user_id)
+            .field("new_email", &"[REDACTED]")
+            .field("token", &"[REDACTED]")
+            .field("verified", &self.verified)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for EmailVerification {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.new_email.zeroize();
+        self.token.zeroize();
+    }
+}
+
 // ── Recovery Codes ──────────────────────────────────────────────────────────
 
 /// Recovery code set for a user.
@@ -363,7 +423,7 @@ pub struct RecoveryCodeSet {
 }
 
 /// A single recovery code.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RecoveryCode {
     /// The code (plaintext during generation, hash for storage).
     pub code: String,
@@ -371,6 +431,22 @@ pub struct RecoveryCode {
     pub used: bool,
     /// When used (if used).
     pub used_at: Option<i64>,
+}
+
+impl std::fmt::Debug for RecoveryCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecoveryCode")
+            .field("code", &"[REDACTED]")
+            .field("used", &self.used)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for RecoveryCode {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.code.zeroize();
+    }
 }
 
 // ── Active Session ──────────────────────────────────────────────────────────

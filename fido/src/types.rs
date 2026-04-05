@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PublicKeyCredentialCreationOptions {
@@ -60,7 +61,7 @@ pub struct AllowCredential {
 }
 
 /// Stored credential for a user.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct StoredCredential {
     pub credential_id: Vec<u8>,
     pub public_key: Vec<u8>,
@@ -70,8 +71,27 @@ pub struct StoredCredential {
     pub authenticator_type: String,
 }
 
+impl std::fmt::Debug for StoredCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredCredential")
+            .field("credential_id", &"[REDACTED]")
+            .field("public_key", &"[REDACTED]")
+            .field("user_id", &self.user_id)
+            .field("sign_count", &self.sign_count)
+            .field("authenticator_type", &self.authenticator_type)
+            .finish()
+    }
+}
+
+impl Drop for StoredCredential {
+    fn drop(&mut self) {
+        self.credential_id.zeroize();
+        self.public_key.zeroize();
+    }
+}
+
 /// Registration result returned by the client.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RegistrationResult {
     pub credential_id: Vec<u8>,
     pub public_key: Vec<u8>,
@@ -79,11 +99,51 @@ pub struct RegistrationResult {
     pub client_data: Vec<u8>,
 }
 
+impl std::fmt::Debug for RegistrationResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistrationResult")
+            .field("credential_id", &format!("[{} bytes]", self.credential_id.len()))
+            .field("public_key", &"[REDACTED]")
+            .field("attestation_object", &format!("[{} bytes]", self.attestation_object.len()))
+            .field("client_data", &format!("[{} bytes]", self.client_data.len()))
+            .finish()
+    }
+}
+
+impl Drop for RegistrationResult {
+    fn drop(&mut self) {
+        self.credential_id.zeroize();
+        self.public_key.zeroize();
+        self.attestation_object.zeroize();
+        self.client_data.zeroize();
+    }
+}
+
 /// Authentication result returned by the client.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AuthenticationResult {
     pub credential_id: Vec<u8>,
     pub authenticator_data: Vec<u8>,
     pub client_data: Vec<u8>,
     pub signature: Vec<u8>,
+}
+
+impl std::fmt::Debug for AuthenticationResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthenticationResult")
+            .field("credential_id", &format!("[{} bytes]", self.credential_id.len()))
+            .field("authenticator_data", &format!("[{} bytes]", self.authenticator_data.len()))
+            .field("client_data", &format!("[{} bytes]", self.client_data.len()))
+            .field("signature", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Drop for AuthenticationResult {
+    fn drop(&mut self) {
+        self.credential_id.zeroize();
+        self.authenticator_data.zeroize();
+        self.client_data.zeroize();
+        self.signature.zeroize();
+    }
 }

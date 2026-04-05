@@ -216,10 +216,18 @@ deploy_monitoring() {
     helm repo update
 
     # Install kube-prometheus-stack
+    # Generate a random Grafana admin password and store it in a K8s Secret
+    GRAFANA_ADMIN_PASSWORD=$(openssl rand -base64 24)
+    kubectl create namespace monitoring 2>/dev/null || true
+    kubectl -n monitoring create secret generic grafana-admin-credentials \
+        --from-literal=admin-password="$GRAFANA_ADMIN_PASSWORD" \
+        --dry-run=client -o yaml | kubectl apply -f -
+    log "Grafana admin password stored in Secret 'grafana-admin-credentials' in namespace 'monitoring'"
+
     helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
         --namespace monitoring \
         --create-namespace \
-        --set grafana.adminPassword="milnet-mvp-2026" \
+        --set grafana.adminPassword="$GRAFANA_ADMIN_PASSWORD" \
         --set grafana.service.type=NodePort \
         --set grafana.service.nodePort=30300 \
         --set prometheus.service.type=NodePort \

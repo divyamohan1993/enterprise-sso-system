@@ -5,6 +5,9 @@
 
 use std::sync::Arc;
 
+use common::service_discovery::{
+    DiscoveryBackend, EndpointConfig, LoadBalanceStrategy, ServiceConfig, ServiceRegistry,
+};
 use common::types::{ModuleId, Receipt, TokenClaims};
 use crypto::entropy::{generate_key_64, generate_nonce};
 use ml_dsa::KeyGen;
@@ -112,6 +115,67 @@ pub struct OrchestratorService {
     pub opaque_bulkhead: common::bulkhead::Bulkhead,
     /// Bulkhead for TSS service calls to prevent resource exhaustion cascades.
     pub tss_bulkhead: common::bulkhead::Bulkhead,
+    /// Service registry for health-aware endpoint selection and failover.
+    /// The env-var addresses are seeded as initial endpoints; additional
+    /// endpoints can be discovered via DNS or multi-address env vars
+    /// (e.g. OPAQUE_ADDRS=host1:port,host2:port).
+    pub service_registry: Arc<ServiceRegistry>,
+}
+
+/// Build a `ServiceRegistry` seeded with the given OPAQUE and TSS addresses.
+///
+/// Each address string may be a single `host:port` or a comma-separated list
+/// (e.g. from `OPAQUE_ADDRS=host1:port,host2:port`). The env vars
+/// `MILNET_OPAQUE_ADDRS` and `MILNET_TSS_ADDRS` are also checked for
+/// additional endpoints. All endpoints start with quorum_size=1 so that
+/// a single seed address is sufficient for bootstrap.
+fn build_service_registry(opaque_addr: &str, tss_addr: &str) -> Arc<ServiceRegistry> {
+    let registry = Arc::new(ServiceRegistry::new());
+
+    let parse_addrs = |primary: &str, env_key: &str, svc_name: &str| -> Vec<EndpointConfig> {
+        let mut addrs: Vec<String> = primary
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        // Merge additional endpoints from multi-address env var
+        if let Ok(extra) = std::env::var(env_key) {
+            for a in extra.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+                if !addrs.contains(&a) {
+                    addrs.push(a);
+                }
+            }
+        }
+        addrs
+            .into_iter()
+            .enumerate()
+            .map(|(i, addr)| EndpointConfig {
+                address: addr,
+                label: Some(format!("{svc_name}-{i}")),
+                weight: None,
+            })
+            .collect()
+    };
+
+    let opaque_endpoints = parse_addrs(opaque_addr, "MILNET_OPAQUE_ADDRS", "opaque");
+    let tss_endpoints = parse_addrs(tss_addr, "MILNET_TSS_ADDRS", "tss");
+
+    let make_config = |name: &str, endpoints: Vec<EndpointConfig>| ServiceConfig {
+        name: name.to_string(),
+        backend: DiscoveryBackend::Static { endpoints },
+        strategy: LoadBalanceStrategy::RoundRobin,
+        quorum_size: 1, // single seed is valid for bootstrap
+        ..ServiceConfig::default()
+    };
+
+    if let Err(e) = registry.register(make_config("opaque", opaque_endpoints)) {
+        tracing::warn!("failed to register OPAQUE service in discovery: {e}");
+    }
+    if let Err(e) = registry.register(make_config("tss", tss_endpoints)) {
+        tracing::warn!("failed to register TSS service in discovery: {e}");
+    }
+
+    registry
 }
 
 impl OrchestratorService {
@@ -127,6 +191,7 @@ impl OrchestratorService {
         let receipt_verification_key = hmac_key;
         let receipt_signing_seed = common::sealed_keys::load_receipt_signing_seed_sealed();
         let (tls_connector, _ca, _cert_key) = tls_client_setup("orchestrator");
+        let service_registry = build_service_registry(&opaque_addr, &tss_addr);
         Self {
             hmac_key,
             receipt_verification_key,
@@ -141,6 +206,7 @@ impl OrchestratorService {
             tss_breaker: common::circuit_breaker::CircuitBreaker::new(3, std::time::Duration::from_secs(30)),
             opaque_bulkhead: common::bulkhead::Bulkhead::new("opaque", 50, 100, std::time::Duration::from_secs(5)),
             tss_bulkhead: common::bulkhead::Bulkhead::new("tss", 30, 60, std::time::Duration::from_secs(5)),
+            service_registry,
         }
     }
 
@@ -157,6 +223,7 @@ impl OrchestratorService {
         let mut receipt_signing_seed = [0u8; 32];
         receipt_signing_seed.copy_from_slice(&receipt_verification_key[..32]);
         let (tls_connector, _ca, _cert_key) = tls_client_setup("orchestrator");
+        let service_registry = build_service_registry(&opaque_addr, &tss_addr);
         Self {
             hmac_key,
             receipt_verification_key,
@@ -171,6 +238,7 @@ impl OrchestratorService {
             tss_breaker: common::circuit_breaker::CircuitBreaker::new(3, std::time::Duration::from_secs(30)),
             opaque_bulkhead: common::bulkhead::Bulkhead::new("opaque", 50, 100, std::time::Duration::from_secs(5)),
             tss_bulkhead: common::bulkhead::Bulkhead::new("tss", 30, 60, std::time::Duration::from_secs(5)),
+            service_registry,
         }
     }
 
@@ -183,6 +251,7 @@ impl OrchestratorService {
     ) -> Self {
         let receipt_verification_key = hmac_key;
         let receipt_signing_seed = common::sealed_keys::load_receipt_signing_seed_sealed();
+        let service_registry = build_service_registry(&opaque_addr, &tss_addr);
         Self {
             hmac_key,
             receipt_verification_key,
@@ -197,6 +266,7 @@ impl OrchestratorService {
             tss_breaker: common::circuit_breaker::CircuitBreaker::new(3, std::time::Duration::from_secs(30)),
             opaque_bulkhead: common::bulkhead::Bulkhead::new("opaque", 50, 100, std::time::Duration::from_secs(5)),
             tss_bulkhead: common::bulkhead::Bulkhead::new("tss", 30, 60, std::time::Duration::from_secs(5)),
+            service_registry,
         }
     }
 
@@ -213,6 +283,7 @@ impl OrchestratorService {
     ) -> Self {
         let mut receipt_signing_seed = [0u8; 32];
         receipt_signing_seed.copy_from_slice(&receipt_verification_key[..32]);
+        let service_registry = build_service_registry(&opaque_addr, &tss_addr);
         Self {
             hmac_key,
             receipt_verification_key,
@@ -227,64 +298,89 @@ impl OrchestratorService {
             tss_breaker: common::circuit_breaker::CircuitBreaker::new(3, std::time::Duration::from_secs(30)),
             opaque_bulkhead: common::bulkhead::Bulkhead::new("opaque", 50, 100, std::time::Duration::from_secs(5)),
             tss_bulkhead: common::bulkhead::Bulkhead::new("tss", 30, 60, std::time::Duration::from_secs(5)),
+            service_registry,
         }
     }
 
     /// Timeout for inter-service connections (connect + first response).
     const SERVICE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-    /// Connect to the OPAQUE service via SHARD over mTLS with timeout.
-    async fn connect_opaque(&self) -> Result<TlsShardTransport, String> {
-        if !self.opaque_breaker.allow_request() {
-            return Err("OPAQUE service circuit breaker is open — service unavailable".into());
+    /// Resolve the address to use for a service, preferring service discovery.
+    /// Falls back to the static address if service discovery has no healthy endpoint.
+    fn resolve_addr(&self, service_name: &str, fallback: &str) -> String {
+        match self.service_registry.acquire_endpoint(service_name) {
+            Ok(guard) => {
+                let addr = guard.address.clone();
+                // ConnectionGuard's Drop decrements active_connections
+                addr
+            }
+            Err(_) => fallback.to_string(),
         }
-        // Self-signed certs use DNS names (not IP SANs), so when connecting
-        // to a bare IP address like 127.0.0.1, fall back to "localhost" as SNI.
-        let raw_host = self.opaque_addr.split(':').next().unwrap_or(&self.opaque_addr);
-        let opaque_host = if raw_host.parse::<std::net::IpAddr>().is_ok() {
-            "localhost"
-        } else {
-            raw_host
-        };
-        match tokio::time::timeout(
-            Self::SERVICE_CONNECT_TIMEOUT,
-            tls_connect(
-                &self.opaque_addr,
-                ModuleId::Orchestrator,
-                self.hmac_key,
-                &self.tls_connector,
-                opaque_host,
-            ),
-        )
-        .await
-        {
-            Ok(Ok(transport)) => {
-                self.opaque_breaker.record_success();
+    }
+
+    /// Connect to a backend service via SHARD over mTLS with timeout and
+    /// service-discovery failover. Tries the discovered endpoint first; on
+    /// failure, falls back to the static address from the env var seed.
+    async fn connect_service(
+        &self,
+        service_name: &str,
+        static_addr: &str,
+        breaker: &common::circuit_breaker::CircuitBreaker,
+    ) -> Result<TlsShardTransport, String> {
+        if !breaker.allow_request() {
+            return Err(format!(
+                "{} service circuit breaker is open -- service unavailable",
+                service_name.to_uppercase()
+            ));
+        }
+
+        let discovered_addr = self.resolve_addr(service_name, static_addr);
+
+        // Try discovered address first
+        let result = self.try_connect(&discovered_addr).await;
+        match &result {
+            Ok(_) => {
+                breaker.record_success();
+                self.service_registry.record_success(service_name, &discovered_addr);
+                return result;
+            }
+            Err(_) if discovered_addr != static_addr => {
+                // Discovery endpoint failed; record and try static fallback
+                breaker.record_failure();
+                self.service_registry.record_failure(service_name, &discovered_addr);
+                tracing::warn!(
+                    service = service_name,
+                    discovered = %discovered_addr,
+                    fallback = %static_addr,
+                    "service discovery endpoint failed, trying static fallback"
+                );
+            }
+            Err(e) => {
+                breaker.record_failure();
+                self.service_registry.record_failure(service_name, &discovered_addr);
+                return Err(format!("connect to {}: {e}", service_name.to_uppercase()));
+            }
+        }
+
+        // Fallback to static address
+        match self.try_connect(static_addr).await {
+            Ok(transport) => {
+                breaker.record_success();
+                self.service_registry.record_success(service_name, static_addr);
                 Ok(transport)
             }
-            Ok(Err(e)) => {
-                self.opaque_breaker.record_failure();
-                Err(format!("connect to OPAQUE: {e}"))
-            }
-            Err(_elapsed) => {
-                self.opaque_breaker.record_failure();
-                Err(format!(
-                    "connect to OPAQUE: timeout after {:?}",
-                    Self::SERVICE_CONNECT_TIMEOUT
-                ))
+            Err(e) => {
+                breaker.record_failure();
+                self.service_registry.record_failure(service_name, static_addr);
+                Err(format!("connect to {} (fallback): {e}", service_name.to_uppercase()))
             }
         }
     }
 
-    /// Connect to the TSS service via SHARD over mTLS with timeout.
-    async fn connect_tss(&self) -> Result<TlsShardTransport, String> {
-        if !self.tss_breaker.allow_request() {
-            return Err("TSS service circuit breaker is open — service unavailable".into());
-        }
-        // Self-signed certs use DNS names (not IP SANs), so when connecting
-        // to a bare IP address like 127.0.0.1, fall back to "localhost" as SNI.
-        let raw_host = self.tss_addr.split(':').next().unwrap_or(&self.tss_addr);
-        let tss_host = if raw_host.parse::<std::net::IpAddr>().is_ok() {
+    /// Low-level mTLS connect to a single address with timeout.
+    async fn try_connect(&self, addr: &str) -> Result<TlsShardTransport, String> {
+        let raw_host = addr.split(':').next().unwrap_or(addr);
+        let sni_host = if raw_host.parse::<std::net::IpAddr>().is_ok() {
             "localhost"
         } else {
             raw_host
@@ -292,31 +388,29 @@ impl OrchestratorService {
         match tokio::time::timeout(
             Self::SERVICE_CONNECT_TIMEOUT,
             tls_connect(
-                &self.tss_addr,
+                addr,
                 ModuleId::Orchestrator,
                 self.hmac_key,
                 &self.tls_connector,
-                tss_host,
+                sni_host,
             ),
         )
         .await
         {
-            Ok(Ok(transport)) => {
-                self.tss_breaker.record_success();
-                Ok(transport)
-            }
-            Ok(Err(e)) => {
-                self.tss_breaker.record_failure();
-                Err(format!("connect to TSS: {e}"))
-            }
-            Err(_elapsed) => {
-                self.tss_breaker.record_failure();
-                Err(format!(
-                    "connect to TSS: timeout after {:?}",
-                    Self::SERVICE_CONNECT_TIMEOUT
-                ))
-            }
+            Ok(Ok(transport)) => Ok(transport),
+            Ok(Err(e)) => Err(format!("{e}")),
+            Err(_elapsed) => Err(format!("timeout after {:?}", Self::SERVICE_CONNECT_TIMEOUT)),
         }
+    }
+
+    /// Connect to the OPAQUE service via SHARD over mTLS with timeout and failover.
+    async fn connect_opaque(&self) -> Result<TlsShardTransport, String> {
+        self.connect_service("opaque", &self.opaque_addr.clone(), &self.opaque_breaker).await
+    }
+
+    /// Connect to the TSS service via SHARD over mTLS with timeout and failover.
+    async fn connect_tss(&self) -> Result<TlsShardTransport, String> {
+        self.connect_service("tss", &self.tss_addr.clone(), &self.tss_breaker).await
     }
 
     /// Process a single authentication request end-to-end.
@@ -649,6 +743,9 @@ impl OrchestratorService {
             tls_bind(listen_addr, ModuleId::Orchestrator, self.hmac_key, "orchestrator")
                 .await
                 .map_err(|e| format!("bind orchestrator TLS listener: {e}"))?;
+
+        // Start background health checker for service discovery endpoints
+        let _health_handle = self.service_registry.spawn_health_checker();
 
         tracing::info!("Orchestrator listening on {} (mTLS)", listen_addr);
 

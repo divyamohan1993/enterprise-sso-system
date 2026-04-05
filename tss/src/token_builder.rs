@@ -87,7 +87,7 @@ pub fn build_token(
     let frost_signature = threshold_sign(signers, group, &msg, group.threshold)
         .map_err(MilnetError::CryptoVerification)?;
 
-    // Compute ML-DSA-65 post-quantum signature over (message || frost_signature)
+    // Compute ML-DSA-87 post-quantum signature over (message || frost_signature)
     let pq_signature = pq_sign(pq_signing_key, &msg, &frost_signature);
 
     Ok(Token {
@@ -159,7 +159,7 @@ pub fn build_token_distributed(
         .coordinate_signing(signers, &msg)
         .map_err(MilnetError::CryptoVerification)?;
 
-    // Compute ML-DSA-65 post-quantum signature over (message || frost_signature)
+    // Compute ML-DSA-87 post-quantum signature over (message || frost_signature)
     let pq_signature = pq_sign(pq_signing_key, &msg, &frost_signature);
 
     Ok(Token {

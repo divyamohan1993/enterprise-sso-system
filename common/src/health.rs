@@ -119,6 +119,43 @@ impl HealthMonitor {
             .count();
         healthy_count >= required
     }
+
+    /// Evict peers that haven't been seen within `max_idle`.
+    /// Returns the number of peers removed.
+    pub fn evict_dead_peers(&self, max_idle: Duration) -> usize {
+        let mut peers = crate::sync::siem_lock(&self.peers, "health::evict_dead_peers");
+        let before = peers.len();
+        peers.retain(|peer_name, health| {
+            let dominated = health.last_seen.elapsed() <= max_idle;
+            if !dominated {
+                tracing::warn!(
+                    peer = %peer_name,
+                    idle_secs = health.last_seen.elapsed().as_secs(),
+                    "evicting dead peer from health monitor"
+                );
+            }
+            dominated
+        });
+        before - peers.len()
+    }
+
+    /// Spawn a background task that periodically evicts peers not seen in 5 minutes.
+    pub fn spawn_peer_eviction_task(monitor: std::sync::Arc<Self>) {
+        tokio::spawn(async move {
+            const EVICTION_INTERVAL: Duration = Duration::from_secs(60);
+            const DEAD_PEER_THRESHOLD: Duration = Duration::from_secs(300); // 5 minutes
+            loop {
+                tokio::time::sleep(EVICTION_INTERVAL).await;
+                let removed = monitor.evict_dead_peers(DEAD_PEER_THRESHOLD);
+                if removed > 0 {
+                    tracing::info!(
+                        removed = removed,
+                        "health monitor: evicted dead peers"
+                    );
+                }
+            }
+        });
+    }
 }
 
 impl Default for HealthMonitor {

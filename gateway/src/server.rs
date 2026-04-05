@@ -375,11 +375,43 @@ impl GatewayServer {
         self.distributed_limiter = Some(limiter);
     }
 
+    /// Maximum distinct IPs tracked in the local rate limit map.
+    /// Beyond this, the oldest (least recently seen) entries are evicted.
+    const MAX_RATE_LIMIT_IPS: usize = 100_000;
+
     /// Check and update per-IP rate limits.  Returns `true` if the
     /// connection should be allowed, `false` if it exceeds the limit.
     async fn check_rate_limit(&self, ip: IpAddr) -> bool {
         let mut limits = self.rate_limits.lock().await;
         let now = Instant::now();
+
+        // Evict stale entries when we hit the IP cap. Remove entries whose
+        // window has expired first (cheap), then if still over cap evict the
+        // oldest entries by window_start (LRU).
+        if limits.len() >= Self::MAX_RATE_LIMIT_IPS && !limits.contains_key(&ip) {
+            limits.retain(|_, (_, window_start)| {
+                now.duration_since(*window_start).as_secs() < RATE_LIMIT_WINDOW_SECS
+            });
+            // If still over cap after expiry sweep, drop oldest entries
+            if limits.len() >= Self::MAX_RATE_LIMIT_IPS {
+                let mut entries: Vec<(IpAddr, Instant)> = limits
+                    .iter()
+                    .map(|(ip, (_, ws))| (*ip, *ws))
+                    .collect();
+                entries.sort_by_key(|(_, ws)| *ws);
+                let to_remove = limits.len() - Self::MAX_RATE_LIMIT_IPS + 1;
+                for (ip_to_evict, _) in entries.into_iter().take(to_remove) {
+                    limits.remove(&ip_to_evict);
+                }
+                warn!(
+                    evicted = to_remove,
+                    remaining = limits.len(),
+                    "SIEM:WARN rate limit map LRU eviction triggered ({}+ distinct IPs)",
+                    Self::MAX_RATE_LIMIT_IPS,
+                );
+            }
+        }
+
         let entry = limits.entry(ip).or_insert((0, now));
 
         // Reset the window if it has expired

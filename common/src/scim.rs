@@ -100,7 +100,7 @@ pub struct ScimGroupRef {
 }
 
 /// SCIM 2.0 User resource.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ScimUser {
     /// Schema URNs.
     pub schemas: Vec<String>,
@@ -132,6 +132,30 @@ pub struct ScimUser {
     pub department: Option<String>,
     /// Resource metadata.
     pub meta: ScimMeta,
+}
+
+impl std::fmt::Debug for ScimUser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScimUser")
+            .field("id", &self.id)
+            .field("user_name", &"[REDACTED]")
+            .field("display_name", &"[REDACTED]")
+            .field("emails", &format!("[{} entries]", self.emails.len()))
+            .field("active", &self.active)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for ScimUser {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.user_name.zeroize();
+        self.display_name.take();
+        self.external_id.take();
+        for email in &mut self.emails {
+            email.value.zeroize();
+        }
+    }
 }
 
 fn default_true() -> bool {

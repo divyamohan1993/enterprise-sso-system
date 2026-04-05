@@ -1,3 +1,5 @@
+// NOTE: `deny` not `forbid` because sealed_keys and encrypted_db require
+// #[allow(unsafe_code)] for mlock/mprotect of secret material.
 #![deny(unsafe_code)]
 //! common: Shared types for the MILNET SSO system.
 //!

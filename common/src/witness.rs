@@ -34,7 +34,7 @@ pub struct WitnessCheckpoint {
     pub kt_root: [u8; 64],
     pub timestamp: i64,
     pub sequence: u64,
-    pub signature: Vec<u8>, // ML-DSA-65
+    pub signature: Vec<u8>, // ML-DSA-87
 }
 
 pub struct WitnessLog {
@@ -116,7 +116,7 @@ impl WitnessLog {
     /// Add a signed checkpoint using a provided signing function.
     ///
     /// The signing function receives the concatenation of `audit_root || kt_root ||
-    /// sequence_be || timestamp_be` and returns the ML-DSA-65 signature bytes.
+    /// sequence_be || timestamp_be` and returns the ML-DSA-87 signature bytes.
     /// Including sequence and timestamp in the signed data prevents replay and
     /// ensures checkpoint ordering is cryptographically bound.
     ///

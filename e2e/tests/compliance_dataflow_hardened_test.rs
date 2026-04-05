@@ -1118,7 +1118,7 @@ mod witness_checkpoint {
 
         // Use add_signed_checkpoint with a signing function
         log.add_signed_checkpoint(audit_root, kt_root, |data| {
-            // In production this would be ML-DSA-65; for testing, hash the data
+            // In production this would be ML-DSA-87; for testing, hash the data
             use sha2::{Digest, Sha512};
             let sig = Sha512::digest(data);
             sig.to_vec()

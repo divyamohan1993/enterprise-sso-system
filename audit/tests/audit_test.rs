@@ -220,7 +220,7 @@ fn bft_cluster_with_signing_proposes_entry() {
         let entry = &node.log.entries()[0];
         assert!(
             !entry.signature.is_empty(),
-            "entry should be signed with ML-DSA-65"
+            "entry should be signed with ML-DSA-87"
         );
     }
 }
@@ -298,7 +298,7 @@ fn bft_signed_entries_have_valid_signature_bytes() {
     let entry_hash = hash_entry(entry);
 
     let valid = crypto::pq_sign::pq_verify_raw(&verifying_key, &entry_hash, &entry.signature);
-    assert!(valid, "ML-DSA-65 signature should verify");
+    assert!(valid, "ML-DSA-87 signature should verify");
 }
 
 // ── Signature verification tests ─────────────────────────────────────
@@ -607,9 +607,9 @@ fn test_audit_entry_signed_with_pq_signature() {
         let entry = &log.entries()[0];
         assert!(
             !entry.signature.is_empty(),
-            "entry must have a non-empty pq_signature (ML-DSA-65 signed)"
+            "entry must have a non-empty pq_signature (ML-DSA-87 signed)"
         );
-        // ML-DSA-65 signatures are 3309 bytes; verify it is substantial
+        // ML-DSA-87 signatures are 4627 bytes; verify it is substantial
         assert!(
             entry.signature.len() > 100,
             "signature should be a full post-quantum signature, not a stub"

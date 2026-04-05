@@ -159,7 +159,7 @@ impl AuditLog {
         self.max_entries = max;
     }
 
-    /// Append an audit entry, always signing it with ML-DSA-65.
+    /// Append an audit entry, always signing it with ML-DSA-87.
     ///
     /// Every audit entry MUST be signed. This prevents log entries from
     /// being forged or injected without possession of the signing key.
@@ -203,7 +203,7 @@ impl AuditLog {
     /// Verify chain hash linkage only, without signature checks.
     ///
     /// DEPRECATED: Use `verify_chain_signatures()` for full verification
-    /// including ML-DSA-65 signature checks. This method is retained for
+    /// including ML-DSA-87 signature checks. This method is retained for
     /// backward compatibility but renamed callers should prefer
     /// `verify_chain_structure_only()` to make the lack of sig-check explicit.
     pub fn verify_chain(&self) -> bool {
@@ -218,7 +218,7 @@ impl AuditLog {
         self.verify_chain_with_key(None)
     }
 
-    /// Verify chain integrity: hash linkage AND ML-DSA-65 signatures.
+    /// Verify chain integrity: hash linkage AND ML-DSA-87 signatures.
     ///
     /// All entries MUST have valid signatures. Unsigned entries are rejected
     /// to prevent log injection. This is the recommended verification method.
@@ -226,7 +226,7 @@ impl AuditLog {
         self.verify_chain_with_key(Some(verifying_key))
     }
 
-    /// Verify chain integrity: hash linkage AND (optionally) ML-DSA-65 signatures.
+    /// Verify chain integrity: hash linkage AND (optionally) ML-DSA-87 signatures.
     ///
     /// When a verifying key is provided, ALL entries MUST have valid signatures.
     /// Unsigned entries are rejected during verification to prevent log injection.
@@ -274,7 +274,7 @@ impl AuditLog {
         self.entries.len()
     }
 
-    /// Append an entry and sign it with ML-DSA-65.
+    /// Append an entry and sign it with ML-DSA-87.
     pub fn append_signed(
         &mut self,
         event_type: AuditEventType,

@@ -125,7 +125,7 @@ pub fn is_dpop_replay(proof_hash: &[u8; 64]) -> bool {
 /// 3. Enforce DPoP channel binding (mandatory for all tiers)
 /// 4. Validate ratchet_epoch is within reasonable bounds
 /// 5. Check pq_signature is NOT empty (reject if missing)
-/// 6. Verify ML-DSA-65 signature over (claims_msg || frost_signature)
+/// 6. Verify ML-DSA-87 signature over (claims_msg || frost_signature)
 /// 7. Verify FROST signature over claims_msg
 /// 8. Check tier validity
 ///
@@ -187,12 +187,12 @@ fn verify_token_core(
         ));
     }
 
-    // 2. Enforce algorithm field — must be 1 (FROST+ML-DSA-65).
+    // 2. Enforce algorithm field — must be 1 (FROST+ML-DSA-87).
     //    Prevents downgrade attacks where attacker specifies algorithm=0
     //    to use weaker crypto.
     if token.header.algorithm != 1 {
         return Err(MilnetError::CryptoVerification(
-            "unsupported algorithm: only algorithm 1 (FROST+ML-DSA-65) is permitted".into(),
+            "unsupported algorithm: only algorithm 1 (FROST+ML-DSA-87) is permitted".into(),
         ));
     }
 
@@ -296,7 +296,7 @@ fn verify_token_core(
         ));
     }
 
-    // 8. Verify ML-DSA-65 post-quantum signature over (message || frost_signature)
+    // 8. Verify ML-DSA-87 post-quantum signature over (message || frost_signature)
     if !pq_verify(
         pq_verifying_key,
         &message,
@@ -304,7 +304,7 @@ fn verify_token_core(
         &token.pq_signature,
     ) {
         return Err(MilnetError::CryptoVerification(
-            "ML-DSA-65 post-quantum signature invalid".into(),
+            "ML-DSA-87 post-quantum signature invalid".into(),
         ));
     }
 

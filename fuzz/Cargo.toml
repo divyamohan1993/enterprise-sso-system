@@ -15,9 +15,11 @@ sso-protocol = { path = "../sso-protocol" }
 common = { path = "../common" }
 ratchet = { path = "../ratchet" }
 opaque = { path = "../opaque" }
+audit = { path = "../audit" }
 fido = { path = "../fido" }
 gateway = { path = "../gateway" }
 arbitrary = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
 serde_json = "1"
 postcard = { version = "1", features = ["alloc"] }
 sha2 = "0.10"
@@ -133,4 +135,24 @@ doc = false
 [[bin]]
 name = "fuzz_jwe_decrypt"
 path = "fuzz_targets/fuzz_jwe_decrypt.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_opaque_register"
+path = "fuzz_targets/fuzz_opaque_register.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_totp_validate"
+path = "fuzz_targets/fuzz_totp_validate.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_raft_state"
+path = "fuzz_targets/fuzz_raft_state.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_bft_append"
+path = "fuzz_targets/fuzz_bft_append.rs"
 doc = false

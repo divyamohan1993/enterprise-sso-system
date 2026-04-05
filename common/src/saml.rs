@@ -943,7 +943,7 @@ impl AuthnRequest {
 // ── SAML NameID ─────────────────────────────────────────────────────────────
 
 /// A SAML NameID value.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SamlNameId {
     /// The NameID value (e.g., user ID, email, opaque identifier).
     pub value: String,
@@ -953,6 +953,22 @@ pub struct SamlNameId {
     pub sp_name_qualifier: Option<String>,
     /// Optional NameQualifier (IdP entity ID).
     pub name_qualifier: Option<String>,
+}
+
+impl std::fmt::Debug for SamlNameId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SamlNameId")
+            .field("value", &"[REDACTED]")
+            .field("format", &self.format)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for SamlNameId {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.value.zeroize();
+    }
 }
 
 impl SamlNameId {

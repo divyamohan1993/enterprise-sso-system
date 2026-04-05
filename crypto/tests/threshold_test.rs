@@ -104,3 +104,92 @@ fn different_messages_different_signatures() {
     let sig_b = threshold_sign(&mut shares, &result.group, b"message B", 3).unwrap();
     assert_ne!(sig_a, sig_b);
 }
+
+/// SECURITY: Exhaustive test of ALL C(5,3)=10 signer combinations for 3-of-5 FROST.
+/// Also tests above-threshold (4-of-5, 5-of-5) and below-threshold (2-of-5).
+#[test]
+fn test_all_frost_signer_combinations() {
+    let result = dkg_distributed(5, 3);
+    let mut shares = result.shares;
+    let message = b"exhaustive signer combination test";
+
+    // All C(5,3) = 10 combinations of 3 signers from 5
+    let combinations_3: [[usize; 3]; 10] = [
+        [0, 1, 2],
+        [0, 1, 3],
+        [0, 1, 4],
+        [0, 2, 3],
+        [0, 2, 4],
+        [0, 3, 4],
+        [1, 2, 3],
+        [1, 2, 4],
+        [1, 3, 4],
+        [2, 3, 4],
+    ];
+
+    for combo in &combinations_3 {
+        let combined = threshold_sign_with_indices(
+            &mut shares,
+            &result.group,
+            message,
+            3,
+            combo,
+        )
+        .unwrap_or_else(|e| panic!("3-of-5 signing failed for {:?}: {}", combo, e));
+        assert!(
+            verify_group_signature(&result.group, message, &combined),
+            "signature verification failed for signer combo {:?}",
+            combo
+        );
+    }
+
+    // Above threshold: all C(5,4)=5 combinations of 4-of-5
+    let combinations_4: [[usize; 4]; 5] = [
+        [0, 1, 2, 3],
+        [0, 1, 2, 4],
+        [0, 1, 3, 4],
+        [0, 2, 3, 4],
+        [1, 2, 3, 4],
+    ];
+    for combo in &combinations_4 {
+        let combined = threshold_sign_with_indices(
+            &mut shares,
+            &result.group,
+            message,
+            3,
+            combo,
+        )
+        .unwrap_or_else(|e| panic!("4-of-5 signing failed for {:?}: {}", combo, e));
+        assert!(
+            verify_group_signature(&result.group, message, &combined),
+            "4-of-5 verification failed for {:?}",
+            combo
+        );
+    }
+
+    // Above threshold: 5-of-5
+    let all_five: [usize; 5] = [0, 1, 2, 3, 4];
+    let combined = threshold_sign_with_indices(
+        &mut shares,
+        &result.group,
+        message,
+        3,
+        &all_five,
+    )
+    .unwrap();
+    assert!(verify_group_signature(&result.group, message, &combined));
+
+    // Below threshold: 2-of-5 must fail
+    let below: [usize; 2] = [0, 1];
+    let result_below = threshold_sign_with_indices(
+        &mut shares,
+        &result.group,
+        message,
+        3,
+        &below,
+    );
+    assert!(
+        result_below.is_err(),
+        "2-of-5 signing must fail (below threshold)"
+    );
+}

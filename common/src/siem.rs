@@ -607,9 +607,30 @@ static SIEM_BUS: LazyLock<tokio::sync::broadcast::Sender<SiemEvent>> = LazyLock:
 });
 
 /// Publish a `SiemEvent` to all current subscribers.
-/// Silently drops the event if there are no active receivers.
+/// Logs a warning if there are no active receivers -- audit events must never
+/// be silently dropped in a military-grade system.
 pub fn broadcast_event(event: &SiemEvent) {
-    let _ = SIEM_BUS.send(event.clone());
+    match SIEM_BUS.send(event.clone()) {
+        Ok(_) => {}
+        Err(_) => {
+            // No active receivers -- persist to file-based fallback so the
+            // event is never lost.  This is a CRITICAL audit guarantee.
+            tracing::warn!(
+                event_type = %event.event_type,
+                severity = %event.severity,
+                "SIEM broadcast has no receivers -- event persisted to fallback log"
+            );
+            // Write to the alert directory as a durable fallback.
+            if let Ok(json) = serde_json::to_string(event) {
+                let ts = chrono::Utc::now().format("%Y%m%d%H%M%S%f");
+                let path = format!("{}/siem_fallback_{}.json", ALERT_DIR, ts);
+                let _ = std::fs::create_dir_all(ALERT_DIR);
+                if let Err(e) = std::fs::write(&path, json.as_bytes()) {
+                    tracing::error!(path = %path, error = %e, "CRITICAL: failed to persist SIEM fallback event");
+                }
+            }
+        }
+    }
 }
 
 /// Obtain a new receiver handle for the global SIEM event bus.
@@ -851,6 +872,13 @@ pub enum Severity {
 }
 
 /// Structured security event for SIEM consumption.
+///
+/// SECURITY NOTE: `source_ip` is stored raw (not pseudonymized) by design.
+/// SIEM events require real IP addresses for incident response, correlation
+/// with firewall/IDS logs, and forensic investigation. The SIEM event bus
+/// is secured via mTLS transport and the webhook channel is encrypted.
+/// User IDs are pseudonymized via `log_pseudonym::pseudonym_uuid()` before
+/// being placed in the `detail` field where appropriate.
 #[derive(Debug, Serialize)]
 pub struct SecurityEvent {
     /// ISO 8601 timestamp
@@ -866,7 +894,7 @@ pub struct SecurityEvent {
     /// User ID (if applicable)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_id: Option<Uuid>,
-    /// Source IP (if applicable)
+    /// Source IP -- raw by design for SIEM incident response (see module doc).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_ip: Option<String>,
     /// Additional details

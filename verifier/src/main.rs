@@ -105,7 +105,7 @@ async fn main() {
         }
     };
 
-    // 2. Load PQ verifying key from env (hex-encoded ML-DSA-65 encoded key bytes)
+    // 2. Load PQ verifying key from env (hex-encoded ML-DSA-87 encoded key bytes)
     let pq_key: crypto::pq_sign::PqVerifyingKey = match std::env::var("MILNET_PQ_VERIFYING_KEY") {
         Ok(hex_str) => {
             let bytes = match hex::decode(hex_str.trim()) {
@@ -118,7 +118,7 @@ async fn main() {
             let encoded = match crypto::pq_sign::PqEncodedVerifyingKey::try_from(bytes.as_slice()) {
                 Ok(e) => e,
                 Err(e) => {
-                    tracing::error!("FATAL: MILNET_PQ_VERIFYING_KEY: wrong length for ML-DSA-65 verifying key: {e}");
+                    tracing::error!("FATAL: MILNET_PQ_VERIFYING_KEY: wrong length for ML-DSA-87 verifying key: {e}");
                     std::process::exit(1);
                 }
             };

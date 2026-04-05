@@ -279,19 +279,25 @@ impl DistributedSessionTracker {
         .await
         .map_err(|e| format!("create active_sessions table: {e}"))?;
 
-        let _ = sqlx::query(
+        if let Err(e) = sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_active_sessions_user \
              ON active_sessions (user_id)",
         )
         .execute(&pool)
-        .await;
+        .await
+        {
+            tracing::debug!("CREATE INDEX idx_active_sessions_user (may already exist): {e}");
+        }
 
-        let _ = sqlx::query(
+        if let Err(e) = sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_active_sessions_expires \
              ON active_sessions (expires_at)",
         )
         .execute(&pool)
-        .await;
+        .await
+        {
+            tracing::debug!("CREATE INDEX idx_active_sessions_expires (may already exist): {e}");
+        }
 
         let tracker = Self {
             cache: SessionTracker::new(max_per_user),

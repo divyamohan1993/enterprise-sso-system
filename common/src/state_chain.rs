@@ -586,7 +586,7 @@ impl StateChain {
     ) -> Result<bool, String> {
         for entry in self.entries.iter().rev() {
             if &entry.state_type == state_type {
-                return Ok(&entry.state_hash == expected_hash);
+                return Ok(crypto::ct::ct_eq_64(&entry.state_hash, expected_hash));
             }
         }
         Err(format!("no entries found for state type {:?}", state_type))

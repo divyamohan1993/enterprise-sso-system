@@ -528,9 +528,13 @@ pub fn complete_channel_xwing(
 
 /// Legacy: Establish an enclave-to-enclave secure channel using X25519 only.
 ///
-/// DEPRECATED: Use `establish_channel_xwing` / `complete_channel_xwing` for
-/// post-quantum resistance. This function is retained for backward compatibility
-/// with pre-PQ nodes during migration.
+/// **FATAL IN PRODUCTION**: This function uses classical-only X25519 which is
+/// quantum-vulnerable (Shor's algorithm). Use `establish_channel_xwing` /
+/// `complete_channel_xwing` for post-quantum resistance.
+///
+/// # Panics
+/// Panics in production builds. Only available for testing migration paths.
+#[deprecated(since = "0.1.0", note = "quantum-vulnerable: use establish_channel_xwing")]
 pub fn establish_channel(
     our_secret: &[u8; 32],
     their_public: &[u8; 32],
@@ -538,7 +542,15 @@ pub fn establish_channel(
     their_identity: &EnclaveIdentity,
     session_id: &[u8; 16],
 ) -> EnclaveChannel {
-    // X25519 DH (legacy, not PQ-safe)
+    // FATAL in production: quantum-vulnerable X25519-only channel
+    if common::sealed_keys::is_production() {
+        panic!(
+            "FATAL: establish_channel (X25519-only) is quantum-vulnerable and \
+             MUST NOT be used in production. Use establish_channel_xwing instead."
+        );
+    }
+
+    // X25519 DH (legacy, not PQ-safe -- test/migration only)
     let our_secret_key = x25519_dalek::StaticSecret::from(*our_secret);
     let their_public_key = x25519_dalek::PublicKey::from(*their_public);
     let shared_secret = our_secret_key.diffie_hellman(&their_public_key);

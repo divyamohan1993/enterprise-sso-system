@@ -45,7 +45,7 @@
     <h2>&#9888; Public Test Credentials</h2>
     <table>
       <tr><th>Service</th><th>Username</th><th>Password</th></tr>
-      <tr><td>Grafana</td><td><code>admin</code></td><td><code>milnet-mvp-2026</code></td></tr>
+      <tr><td>Grafana</td><td><code>admin</code></td><td><em>kubectl -n monitoring get secret grafana-admin-credentials -o jsonpath='{.data.admin-password}' | base64 -d</em></td></tr>
       <tr><td>PostgreSQL</td><td><code>milnet</code></td><td><code>milnet-mvp-db</code></td></tr>
     </table>
   </div>

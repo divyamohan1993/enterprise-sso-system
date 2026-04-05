@@ -394,7 +394,7 @@ fn test_missing_pq_signature_rejected() {
 
 #[test]
 fn test_wrong_pq_key_rejected() {
-    // ML-DSA-65 generates two full keypairs — needs extra stack space.
+    // ML-DSA-87 generates two full keypairs — needs extra stack space.
     std::thread::Builder::new()
         .name("pq-key-test".into())
         .stack_size(8 * 1024 * 1024)

@@ -3258,9 +3258,9 @@ async fn auth_login(
                 );
             }
 
-            // Always log the full internal error
+            // Always log the failure -- pseudonymize the username
             tracing::warn!(
-                username = %req.username,
+                username = %common::log_pseudonym::pseudonym_str("username", &req.username),
                 "login failed"
             );
 

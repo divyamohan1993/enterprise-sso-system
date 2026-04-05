@@ -209,7 +209,7 @@ async fn orchestrator_processes_auth() {
 
     // Create orchestrator service with the SAME CA trust for mTLS.
     // The receipt verification key must match the key used by the OPAQUE
-    // service's ReceiptSigner (which derives ML-DSA-65 from the first 32
+    // service's ReceiptSigner (which derives ML-DSA-87 from the first 32
     // bytes of the signing key).
     let connector = tls_connector(orchestrator_client_cfg);
     let service = OrchestratorService::new_with_tls_and_receipt_key(

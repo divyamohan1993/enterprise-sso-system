@@ -240,9 +240,9 @@ impl MerkleSync {
         }
     }
 
-    /// Quick equality check: compare root hashes.
+    /// Quick equality check: compare root hashes (constant-time).
     pub fn compare_roots(local_root: &Hash512, remote_root: &Hash512) -> bool {
-        local_root == remote_root
+        crypto::ct::ct_eq_64(local_root, remote_root)
     }
 
     /// Find all differences between two trees efficiently.
