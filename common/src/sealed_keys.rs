@@ -155,7 +155,7 @@ pub fn cached_master_kek_distributed() -> &'static [u8; 32] {
         // NOTE: Feldman VSS commitments MUST be verified before accepting peer shares.
         // Each share should be validated against public polynomial commitments to detect
         // malicious or corrupted shares before they enter the reconstruction process.
-        if let Some(csv) = peer_shares_csv {
+        if let Some(ref csv) = peer_shares_csv {
             for hex_share in csv.split(',') {
                 let hex_share = hex_share.trim();
                 if hex_share.is_empty() {
