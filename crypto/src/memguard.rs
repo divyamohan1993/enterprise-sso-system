@@ -163,9 +163,12 @@ pub struct SecretBuffer<const N: usize> {
     data: [u8; N],
     /// Tail canary — mirrors `canary_head` with an independent random value.
     canary_tail: u64,
-    /// HMAC over (address, canary_head, canary_tail) computed at construction.
+    /// HMAC over (nonce, canary_head, canary_tail) computed at construction.
     /// Used by `verify_canaries()` to detect tampering.
     canary_hmac: u64,
+    /// Random per-instance nonce used in HMAC computation. Address-independent
+    /// so the HMAC remains valid after Rust moves (memcpy) the struct.
+    canary_nonce: u64,
     /// Whether `mlock` succeeded for this buffer.
     locked: bool,
 }
@@ -185,11 +188,17 @@ impl<const N: usize> SecretBuffer<N> {
         // Canary values are set after construction using derive_canary()
         // based on the buffer's heap address. This ensures expected values
         // are derived from a process-wide HMAC key, not stored in the struct.
+        let nonce = {
+            let mut b = [0u8; 8];
+            getrandom::getrandom(&mut b).map_err(|_| MemguardError::AllocationFailed)?;
+            u64::from_ne_bytes(b)
+        };
         let mut buf = Self {
             canary_head: 0,
             data,
             canary_tail: 0,
             canary_hmac: 0,
+            canary_nonce: nonce,
             locked: false,
         };
 
@@ -213,15 +222,15 @@ impl<const N: usize> SecretBuffer<N> {
         buf.canary_head = head;
         buf.canary_tail = tail;
 
-        // Compute and store HMAC over (address, canary_head, canary_tail) for
-        // tamper detection in verify_canaries().
+        // Compute and store HMAC over (nonce, canary_head, canary_tail) for
+        // tamper detection in verify_canaries(). Uses a per-instance random nonce
+        // instead of the buffer address because Rust moves (memcpy) change addresses.
         {
             use hmac::{Hmac, Mac};
             use sha2::Sha512;
             type HmacSha512 = Hmac<Sha512>;
-            let addr = buf.data.as_ptr() as u64;
             let mut mac = HmacSha512::new_from_slice(canary_hmac_key()).expect("HMAC key size");
-            mac.update(&addr.to_ne_bytes());
+            mac.update(&nonce.to_ne_bytes());
             mac.update(&head.to_ne_bytes());
             mac.update(&tail.to_ne_bytes());
             let result = mac.finalize().into_bytes();
@@ -270,45 +279,29 @@ impl<const N: usize> SecretBuffer<N> {
 
     /// Verify canary integrity using constant-time comparison.
     ///
-    /// Expected canary values are derived from a process-wide HMAC key
-    /// and the buffer's address, so they are NOT stored in this struct.
-    /// An attacker who overwrites the canary fields cannot also overwrite
-    /// the expected values (they live in a separate static).
+    /// Canary values are verified via HMAC(process_key, nonce || head || tail).
+    /// The per-instance nonce is random and address-independent, so the HMAC
+    /// remains valid after Rust moves. An attacker who overwrites the canaries
+    /// cannot forge the HMAC without knowing the process-wide HMAC key.
     pub fn verify_canaries(&self) -> bool {
-        // Derive expected canary values from a process-wide HMAC key and the
-        // canary pair's XOR. We store head and tail as random values at
-        // construction. Verification checks that they are non-zero AND that
-        // they match the original values set at construction. The expected
-        // values are derived from the data pointer address and a process-wide
-        // secret, ensuring an attacker who overwrites canaries cannot also
-        // forge valid replacements without knowing the HMAC key.
-        //
-        // We verify: (1) both non-zero, (2) head XOR tail matches construction
-        // invariant (head ^ tail must be non-zero and stable), (3) constant-time
-        // comparison to prevent timing leaks on which canary was corrupted.
         use subtle::ConstantTimeEq;
         let head_ok: subtle::Choice = (!self.canary_head.ct_eq(&0u64)) & subtle::Choice::from(1u8);
         let tail_ok: subtle::Choice = (!self.canary_tail.ct_eq(&0u64)) & subtle::Choice::from(1u8);
         let xor_val = self.canary_head ^ self.canary_tail;
         let xor_ok: subtle::Choice = !xor_val.ct_eq(&0u64);
-        // Derive expected XOR from HMAC over the data pointer address.
-        // This binds canaries to their specific buffer instance.
-        let addr = self.data.as_ptr() as u64;
-        let mut hmac_input = [0u8; 8];
-        hmac_input.copy_from_slice(&addr.to_ne_bytes());
+        // Recompute HMAC over (nonce, canary_head, canary_tail) and compare
+        // against the value stored at construction.
         let expected_check = {
             use hmac::{Hmac, Mac};
             use sha2::Sha512;
             type HmacSha512 = Hmac<Sha512>;
             let mut mac = HmacSha512::new_from_slice(canary_hmac_key()).expect("HMAC key size");
-            mac.update(&hmac_input);
+            mac.update(&self.canary_nonce.to_ne_bytes());
             mac.update(&self.canary_head.to_ne_bytes());
             mac.update(&self.canary_tail.to_ne_bytes());
             let result = mac.finalize().into_bytes();
             u64::from_ne_bytes(result[..8].try_into().unwrap())
         };
-        // The HMAC check ensures the canary pair hasn't been tampered with.
-        // Compare freshly computed HMAC against the value stored at construction.
         let hmac_ok: subtle::Choice = expected_check.ct_eq(&self.canary_hmac);
         (head_ok & tail_ok & xor_ok & hmac_ok).into()
     }
@@ -374,6 +367,7 @@ impl<const N: usize> Drop for SecretBuffer<N> {
         self.canary_head.zeroize();
         self.canary_tail.zeroize();
         self.canary_hmac.zeroize();
+        self.canary_nonce.zeroize();
     }
 }
 
