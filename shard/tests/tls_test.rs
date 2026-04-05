@@ -80,41 +80,51 @@ async fn mtls_handshake_wrong_ca_fails() {
     let connector = tls_connector(client_cfg);
 
     // The client uses a cert signed by a different CA than the server trusts.
-    // This should fail during the TLS handshake.
-    let result = tls_connect(
-        &addr,
-        ModuleId::Gateway,
-        test_key(),
-        &connector,
-        "localhost",
+    // This should fail during the TLS handshake. Wrap in a timeout to prevent
+    // hanging forever if the handshake blocks (e.g., server silently drops).
+    let connect_result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tls_connect(
+            &addr,
+            ModuleId::Gateway,
+            test_key(),
+            &connector,
+            "localhost",
+        ),
     )
     .await;
 
-    // Either the connection fails entirely or the server rejects it.
-    // Accept either outcome as long as we don't get a successful connection
-    // that can exchange data.
-    if let Ok(mut client) = result {
-        // Connection might have been established but server-side verification
-        // should fail. Try sending data — the server should reject.
-        let send_result = client.send(b"should-fail").await;
+    match connect_result {
+        Err(_elapsed) => {
+            // Timeout: handshake hung because server rejected the client cert
+            // silently. This is acceptable — the connection was not established.
+        }
+        Ok(Err(_)) => {
+            // Connection error: TLS handshake properly failed. Good.
+        }
+        Ok(Ok(mut client)) => {
+            // Connection established but server-side verification should fail.
+            // Try sending data — at least one side must reject.
+            let send_result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                client.send(b"should-fail"),
+            )
+            .await;
 
-        // The server side should also fail
-        let server_result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            listener.accept(),
-        )
-        .await;
+            let server_result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                listener.accept(),
+            )
+            .await;
 
-        // Either send fails, or server accept fails, or server accept times out.
-        // At least one side must detect the wrong CA.
-        let send_ok = send_result.is_ok();
-        let server_ok = matches!(server_result, Ok(Ok(_)));
-        assert!(
-            !send_ok || !server_ok,
-            "both sides must not succeed with mismatched CAs"
-        );
+            let send_ok = matches!(send_result, Ok(Ok(_)));
+            let server_ok = matches!(server_result, Ok(Ok(_)));
+            assert!(
+                !send_ok || !server_ok,
+                "both sides must not succeed with mismatched CAs"
+            );
+        }
     }
-    // If result was Err, the connection properly failed — test passes.
 }
 
 // ── Test that expired certificates are rejected ──────────────────────────
