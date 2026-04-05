@@ -148,7 +148,7 @@ pub fn cached_master_kek_distributed() -> &'static [u8; 32] {
         }
 
         // Remove share from environment immediately
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-support")))]
         std::env::remove_var("MILNET_KEK_SHARE");
 
         // Collect peer shares from env
@@ -185,7 +185,7 @@ pub fn cached_master_kek_distributed() -> &'static [u8; 32] {
                 }
             }
             // Remove peer shares from environment immediately
-            #[cfg(not(test))]
+            #[cfg(not(any(test, feature = "test-support")))]
             std::env::remove_var("MILNET_KEK_PEER_SHARES");
         }
 
@@ -389,7 +389,7 @@ pub fn load_master_kek() -> [u8; 32] {
     // /proc/pid/environ during the race window between env::var() and
     // env::remove_var().  PR_SET_DUMPABLE=0 makes /proc/pid/environ
     // unreadable by non-root, and prevents ptrace attachment.
-    #[cfg(all(unix, not(test)))]
+    #[cfg(all(unix, not(any(test, feature = "test-support"))))]
     unsafe {
         libc::prctl(libc::PR_SET_DUMPABLE, 0);
     }
@@ -398,7 +398,7 @@ pub fn load_master_kek() -> [u8; 32] {
         Ok(mut hex_str) if hex_str.len() >= 64 => {
             // Remove from process environment IMMEDIATELY to minimize the
             // race window where /proc/pid/environ exposes the KEK.
-            #[cfg(not(test))]
+            #[cfg(not(any(test, feature = "test-support")))]
             std::env::remove_var("MILNET_MASTER_KEK");
             // Memory fence to ensure the remove_var write is visible to other
             // threads before we proceed with key parsing.
@@ -424,14 +424,12 @@ pub fn load_master_kek() -> [u8; 32] {
             // tests that exercise key-derivation paths (derive_admin_role_key,
             // compute_admin_action_approval_hmac, etc.) do not call
             // process::exit(1) and kill the entire test binary.
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             {
                 tracing::warn!(
                     "MILNET_MASTER_KEK not set - using deterministic test key. \
                      This is acceptable ONLY in test builds."
                 );
-                // SHA-256("MILNET_TEST_KEK") truncated to 32 bytes, deterministic,
-                // never used outside cfg(test).
                 let test_key: [u8; 32] = [
                     0x7a, 0x1f, 0x3c, 0x2b, 0x9e, 0x4d, 0x5a, 0x68,
                     0xb0, 0xc1, 0xd2, 0xe3, 0xf4, 0x05, 0x16, 0x27,
@@ -440,7 +438,7 @@ pub fn load_master_kek() -> [u8; 32] {
                 ];
                 return test_key;
             }
-            #[cfg(not(test))]
+            #[cfg(not(any(test, feature = "test-support")))]
             {
                 tracing::error!("MILNET_MASTER_KEK not set. Refusing to start."); std::process::exit(1);
             }
@@ -510,7 +508,7 @@ pub fn load_receipt_signing_seed_sealed() -> [u8; 32] {
 
     // 1. Try sealed key
     if let Ok(mut hex_str) = std::env::var(sealed_var) {
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-support")))]
         std::env::remove_var(sealed_var);
         let result = unseal_seed_from_hex(&hex_str, "receipt-sign-seed");
         zeroize_string(&mut hex_str);
@@ -528,7 +526,7 @@ pub fn load_receipt_signing_seed_sealed() -> [u8; 32] {
 
     // 2. Raw keys are not permitted — sealed keys only.
     if let Ok(mut hex_str) = std::env::var(raw_var) {
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-support")))]
         std::env::remove_var(raw_var);
         zeroize_string(&mut hex_str);
         hex_str.zeroize();
@@ -540,7 +538,7 @@ pub fn load_receipt_signing_seed_sealed() -> [u8; 32] {
     }
 
     // 3. No key found — fail hard (in production) or use test fallback.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
         tracing::warn!(
             "{raw_var} not set - using deterministic test seed. \
@@ -553,7 +551,7 @@ pub fn load_receipt_signing_seed_sealed() -> [u8; 32] {
             0x92, 0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8, 0x09,
         ];
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     {
         tracing::error!(
             "{raw_var} not set and no sealed seed found. \
@@ -619,7 +617,7 @@ fn load_key_hardened(var: &str, purpose: &str, _dev_seed: &[u8]) -> [u8; 64] {
     // 1. Try sealed key
     if let Ok(mut hex_str) = std::env::var(&sealed_var) {
         // Remove from process environment immediately
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-support")))]
         std::env::remove_var(&sealed_var);
         let result = unseal_key_from_hex(&hex_str, purpose);
         zeroize_string(&mut hex_str);
@@ -637,7 +635,7 @@ fn load_key_hardened(var: &str, purpose: &str, _dev_seed: &[u8]) -> [u8; 64] {
 
     // 2. Raw keys are not permitted — sealed keys only.
     if let Ok(mut hex_str) = std::env::var(var) {
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-support")))]
         std::env::remove_var(var);
         zeroize_string(&mut hex_str);
         hex_str.zeroize();
@@ -649,7 +647,7 @@ fn load_key_hardened(var: &str, purpose: &str, _dev_seed: &[u8]) -> [u8; 64] {
     }
 
     // 3. No key found — fail hard (in production) or use test fallback.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
         tracing::warn!(
             "{var} not set - using deterministic test key. \
@@ -666,7 +664,7 @@ fn load_key_hardened(var: &str, purpose: &str, _dev_seed: &[u8]) -> [u8; 64] {
             0xc2, 0xd3, 0xe4, 0xf5, 0x06, 0x17, 0x28, 0x39,
         ];
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     {
         tracing::error!(
             "{var} not set and no sealed key found. \
