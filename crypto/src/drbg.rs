@@ -26,6 +26,17 @@ pub struct HmacDrbg {
     reseed_counter: u64,
 }
 
+// SECURITY: Custom Debug redacts key/value material to prevent log leakage.
+impl std::fmt::Debug for HmacDrbg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HmacDrbg")
+            .field("key", &"[REDACTED]")
+            .field("value", &"[REDACTED]")
+            .field("reseed_counter", &self.reseed_counter)
+            .finish()
+    }
+}
+
 impl HmacDrbg {
     /// Instantiate with entropy from the multi-source combiner.
     pub fn new() -> Result<Self, String> {
