@@ -120,7 +120,7 @@ pub struct ShardProtocol {
 /// Derive an encryption key from the shared secret using HKDF-SHA512
 /// with domain separation.
 fn derive_encryption_key(shared_secret: &[u8; 64]) -> [u8; 32] {
-    let hk = Hkdf::<Sha512>::new(None, shared_secret);
+    let hk = Hkdf::<Sha512>::new(Some(b"MILNET-SHARD-KEY-SALT-v1"), shared_secret);
     let mut okm = [0u8; 32];
     if let Err(e) = hk.expand(ENCRYPT_DOMAIN, &mut okm) {
         common::siem::emit_runtime_error(
@@ -142,7 +142,7 @@ fn derive_encryption_key(shared_secret: &[u8; 64]) -> [u8; 32] {
 /// key are cryptographically independent, even though they share the
 /// same input keying material.
 fn derive_hmac_key(shared_secret: &[u8; 64]) -> [u8; 64] {
-    let hk = Hkdf::<Sha512>::new(None, shared_secret);
+    let hk = Hkdf::<Sha512>::new(Some(b"MILNET-SHARD-KEY-SALT-v1"), shared_secret);
     let mut okm = [0u8; 64];
     if let Err(e) = hk.expand(HMAC_DOMAIN, &mut okm) {
         common::siem::emit_runtime_error(

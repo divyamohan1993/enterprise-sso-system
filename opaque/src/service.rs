@@ -181,11 +181,32 @@ pub fn handle_login_finish(
 
             signer.sign(&mut receipt);
 
+            common::audit_bridge::buffer_audit_entry(
+                common::audit_bridge::create_audit_entry(
+                    common::types::AuditEventType::AuthSuccess,
+                    vec![user_id],
+                    Vec::new(),
+                    None,
+                    None,
+                ),
+            );
+
             OpaqueResponse::LoginSuccess { receipt }
         }
-        Err(_) => OpaqueResponse::Error {
-            message: "password verification failed".into(),
-        },
+        Err(_) => {
+            common::audit_bridge::buffer_audit_entry(
+                common::audit_bridge::create_audit_entry(
+                    common::types::AuditEventType::AuthFailure,
+                    vec![user_id],
+                    Vec::new(),
+                    None,
+                    None,
+                ),
+            );
+            OpaqueResponse::Error {
+                message: "password verification failed".into(),
+            }
+        }
     }
 }
 

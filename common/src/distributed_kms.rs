@@ -748,7 +748,7 @@ impl DistributedKms {
     /// simulation for testing.
     fn derive_backend_wrapping_key(&self, backend: &KmsBackend) -> [u8; 32] {
         let identity = backend.display_id();
-        let hk = hkdf::Hkdf::<sha2::Sha512>::new(None, identity.as_bytes());
+        let hk = hkdf::Hkdf::<sha2::Sha512>::new(Some(b"MILNET-DKMS-SALT-v1"), identity.as_bytes());
         let mut key = [0u8; 32];
         hk.expand(b"distributed-kms-dek-wrap-v1", &mut key)
             .expect("HKDF expand failed — output length is valid");

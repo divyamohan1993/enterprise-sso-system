@@ -418,17 +418,24 @@ impl OrchestratorService {
         match self.process_auth_inner(request).await {
             Ok(token_bytes) => {
                 // Emit SIEM event for successful authentication
-                common::siem::SecurityEvent::auth_success(
-                    {
-                        use sha2::{Digest, Sha512};
-                        let hash = Sha512::digest(request.username.as_bytes());
-                        let mut bytes = [0u8; 16];
-                        bytes.copy_from_slice(&hash[..16]);
-                        bytes[6] = (bytes[6] & 0x0f) | 0x40;
-                        bytes[8] = (bytes[8] & 0x3f) | 0x80;
-                        Uuid::from_bytes(bytes)
-                    },
-                    None,
+                let user_uuid = {
+                    use sha2::{Digest, Sha512};
+                    let hash = Sha512::digest(request.username.as_bytes());
+                    let mut bytes = [0u8; 16];
+                    bytes.copy_from_slice(&hash[..16]);
+                    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+                    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+                    Uuid::from_bytes(bytes)
+                };
+                common::siem::SecurityEvent::auth_success(user_uuid, None);
+                common::audit_bridge::buffer_audit_entry(
+                    common::audit_bridge::create_audit_entry(
+                        common::types::AuditEventType::AuthSuccess,
+                        vec![user_uuid],
+                        Vec::new(),
+                        None,
+                        None,
+                    ),
                 );
                 OrchestratorResponse {
                     success: true,
@@ -453,6 +460,15 @@ impl OrchestratorService {
                     Some(user_id),
                     None,
                     &e,
+                );
+                common::audit_bridge::buffer_audit_entry(
+                    common::audit_bridge::create_audit_entry(
+                        common::types::AuditEventType::AuthFailure,
+                        vec![user_id],
+                        Vec::new(),
+                        None,
+                        None,
+                    ),
                 );
 
                 OrchestratorResponse {

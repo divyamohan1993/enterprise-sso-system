@@ -1,7 +1,3 @@
-#[cfg(not(feature = "production"))]
-#[allow(deprecated)]
-use tss::token_builder::build_token;
-
 use common::types::{Receipt, TokenClaims};
 use crypto::pq_sign::generate_pq_keypair;
 use crypto::receipts::{hash_receipt, sign_receipt};
@@ -119,40 +115,42 @@ fn unsigned_receipt_rejected() {
     );
 }
 
-#[cfg(not(feature = "production"))]
-#[allow(deprecated)]
 #[test]
 fn token_built_and_verifiable() {
-    let dkg_result = dkg(5, 3).expect("DKG ceremony failed");
-    let mut shares = dkg_result.shares;
-    let group = dkg_result.group;
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
+    let public_key_package = dkg_result.group.public_key_package.clone();
+    let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
     let claims = test_claims();
     let ratchet_key = test_ratchet_key();
     let (pq_sk, _pq_vk) = generate_pq_keypair();
 
-    let token = build_token(&claims, &mut shares[..3], &group, &ratchet_key, &pq_sk, None)
-        .expect("build_token should succeed");
+    let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
+    let token = build_token_distributed(&claims, &coordinator, &mut signers, &ratchet_key, &pq_sk, None)
+        .expect("build_token_distributed should succeed");
 
     // Verify the FROST signature against the group key
-    // Use token.claims (not original claims) because build_token may modify aud via prepare_claims_with_audience
+    // Use token.claims (not original claims) because build_token_distributed may modify aud via prepare_claims_with_audience
     let claims_bytes = postcard::to_allocvec(&token.claims).unwrap();
     let msg = [common::domain::FROST_TOKEN, claims_bytes.as_slice()].concat();
-    assert!(verify_group_signature(&group, &msg, &token.frost_signature));
+    let group_for_verify = crypto::threshold::ThresholdGroup {
+        threshold: 3,
+        total: 5,
+        public_key_package,
+    };
+    assert!(verify_group_signature(&group_for_verify, &msg, &token.frost_signature));
 }
 
-#[cfg(not(feature = "production"))]
-#[allow(deprecated)]
 #[test]
 fn token_claims_preserved() {
-    let dkg_result = dkg(5, 3).expect("DKG ceremony failed");
-    let mut shares = dkg_result.shares;
-    let group = dkg_result.group;
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
+    let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
     let claims = test_claims();
     let ratchet_key = test_ratchet_key();
     let (pq_sk, _pq_vk) = generate_pq_keypair();
 
-    let token = build_token(&claims, &mut shares[..3], &group, &ratchet_key, &pq_sk, None)
-        .expect("build_token should succeed");
+    let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
+    let token = build_token_distributed(&claims, &coordinator, &mut signers, &ratchet_key, &pq_sk, None)
+        .expect("build_token_distributed should succeed");
 
     // Serialize and deserialize the token, verify claims match
     let serialized = postcard::to_allocvec(&token).unwrap();
@@ -172,19 +170,17 @@ fn token_claims_preserved() {
     assert_eq!(deserialized.header.tier, claims.tier);
 }
 
-#[cfg(not(feature = "production"))]
-#[allow(deprecated)]
 #[test]
 fn test_ratchet_tag_is_real() {
-    let dkg_result = dkg(5, 3).expect("DKG ceremony failed");
-    let mut shares = dkg_result.shares;
-    let group = dkg_result.group;
+    let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
+    let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
     let claims = test_claims();
     let ratchet_key = test_ratchet_key();
     let (pq_sk, _pq_vk) = generate_pq_keypair();
 
-    let token = build_token(&claims, &mut shares[..3], &group, &ratchet_key, &pq_sk, None)
-        .expect("build_token should succeed");
+    let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
+    let token = build_token_distributed(&claims, &coordinator, &mut signers, &ratchet_key, &pq_sk, None)
+        .expect("build_token_distributed should succeed");
 
     // The ratchet tag must NOT be all zeros (the old placeholder)
     assert_ne!(token.ratchet_tag, [0u8; 64], "ratchet tag must not be all zeros");

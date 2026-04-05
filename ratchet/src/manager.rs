@@ -119,6 +119,15 @@ impl SessionManager {
             ));
         }
         sessions.insert(session_id, chain);
+        common::audit_bridge::buffer_audit_entry(
+            common::audit_bridge::create_audit_entry(
+                common::types::AuditEventType::AuthSuccess,
+                Vec::new(),
+                Vec::new(),
+                None,
+                Some(session_id.to_string()),
+            ),
+        );
         Ok(epoch)
     }
 

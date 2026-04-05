@@ -4,9 +4,6 @@
 //! expiration enforcement, algorithm checks, JTI replay, message serde
 //! roundtrips, and malformed threshold signature rejection.
 
-#[allow(deprecated)]
-#[cfg(not(feature = "production"))]
-use tss::token_builder::build_token;
 use tss::token_builder::{build_token_distributed, prepare_claims_with_audience};
 use tss::validator::{validate_receipt_chain, validate_receipt_chain_with_key, ReceiptVerificationKey};
 use tss::messages::{SigningRequest, SigningResponse};
@@ -77,21 +74,19 @@ fn build_signed_chain(len: usize, signing_key: &[u8; 64]) -> Vec<Receipt> {
 
 // ── 1. Token construction produces valid structure with correct claims ──
 
-#[cfg(not(feature = "production"))]
-#[allow(deprecated)]
 #[test]
 fn token_structure_has_correct_header_and_claims() {
-    let dkg_result = dkg(5, 3).expect("DKG failed");
-    let mut shares = dkg_result.shares;
-    let group = dkg_result.group;
+    let mut dkg_result = dkg(5, 3).expect("DKG failed");
+    let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
     let claims = test_claims();
     let ratchet_key = test_ratchet_key();
     let (pq_sk, _) = generate_pq_keypair();
 
-    let token = build_token(
-        &claims, &mut shares[..3], &group, &ratchet_key, &pq_sk, Some("audience-1".into()),
+    let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
+    let token = build_token_distributed(
+        &claims, &coordinator, &mut signers, &ratchet_key, &pq_sk, Some("audience-1".into()),
     )
-    .expect("build_token must succeed");
+    .expect("build_token_distributed must succeed");
 
     assert_eq!(token.header.version, 1);
     assert_eq!(token.header.algorithm, 1);
@@ -131,24 +126,24 @@ fn distributed_token_structure_correct() {
 
 // ── 2. Token verification succeeds for correctly signed tokens ──────────
 
-#[cfg(not(feature = "production"))]
-#[allow(deprecated)]
 #[test]
 fn frost_signature_verifies_against_group_key() {
-    let dkg_result = dkg(5, 3).expect("DKG failed");
-    let mut shares = dkg_result.shares;
-    let group = dkg_result.group;
+    let mut dkg_result = dkg(5, 3).expect("DKG failed");
+    let pkp = dkg_result.group.public_key_package.clone();
+    let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
     let claims = test_claims();
     let ratchet_key = test_ratchet_key();
     let (pq_sk, _) = generate_pq_keypair();
 
-    let token = build_token(
-        &claims, &mut shares[..3], &group, &ratchet_key, &pq_sk, None,
+    let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
+    let token = build_token_distributed(
+        &claims, &coordinator, &mut signers, &ratchet_key, &pq_sk, None,
     )
-    .expect("build_token must succeed");
+    .expect("build_token_distributed must succeed");
 
     let claims_bytes = postcard::to_allocvec(&token.claims).unwrap();
     let msg = [common::domain::FROST_TOKEN, claims_bytes.as_slice()].concat();
+    let group = ThresholdGroup { threshold: 3, total: 5, public_key_package: pkp };
     assert!(
         verify_group_signature(&group, &msg, &token.frost_signature),
         "FROST signature must verify against the group key"
@@ -178,77 +173,75 @@ fn distributed_frost_signature_verifies() {
 
 // ── 3. Token verification REJECTS forged/tampered signatures ────────────
 
-#[cfg(not(feature = "production"))]
-#[allow(deprecated)]
 #[test]
 fn tampered_frost_signature_rejected() {
-    let dkg_result = dkg(5, 3).expect("DKG failed");
-    let mut shares = dkg_result.shares;
-    let group = dkg_result.group;
+    let mut dkg_result = dkg(5, 3).expect("DKG failed");
+    let pkp = dkg_result.group.public_key_package.clone();
+    let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
     let claims = test_claims();
     let ratchet_key = test_ratchet_key();
     let (pq_sk, _) = generate_pq_keypair();
 
-    let mut token = build_token(
-        &claims, &mut shares[..3], &group, &ratchet_key, &pq_sk, None,
+    let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
+    let mut token = build_token_distributed(
+        &claims, &coordinator, &mut signers, &ratchet_key, &pq_sk, None,
     )
-    .expect("build_token must succeed");
+    .expect("build_token_distributed must succeed");
 
     // Flip one byte in the FROST signature
     token.frost_signature[0] ^= 0xFF;
 
     let claims_bytes = postcard::to_allocvec(&token.claims).unwrap();
     let msg = [common::domain::FROST_TOKEN, claims_bytes.as_slice()].concat();
+    let group = ThresholdGroup { threshold: 3, total: 5, public_key_package: pkp };
     assert!(
         !verify_group_signature(&group, &msg, &token.frost_signature),
         "tampered FROST signature must be rejected"
     );
 }
 
-#[cfg(not(feature = "production"))]
-#[allow(deprecated)]
 #[test]
 fn tampered_claims_invalidate_signature() {
-    let dkg_result = dkg(5, 3).expect("DKG failed");
-    let mut shares = dkg_result.shares;
-    let group = dkg_result.group;
+    let mut dkg_result = dkg(5, 3).expect("DKG failed");
+    let pkp = dkg_result.group.public_key_package.clone();
+    let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
     let claims = test_claims();
     let ratchet_key = test_ratchet_key();
     let (pq_sk, _) = generate_pq_keypair();
 
-    let mut token = build_token(
-        &claims, &mut shares[..3], &group, &ratchet_key, &pq_sk, None,
+    let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
+    let mut token = build_token_distributed(
+        &claims, &coordinator, &mut signers, &ratchet_key, &pq_sk, None,
     )
-    .expect("build_token must succeed");
+    .expect("build_token_distributed must succeed");
 
     // Tamper with the claims (elevate tier)
     token.claims.tier = 4;
 
     let claims_bytes = postcard::to_allocvec(&token.claims).unwrap();
     let msg = [common::domain::FROST_TOKEN, claims_bytes.as_slice()].concat();
+    let group = ThresholdGroup { threshold: 3, total: 5, public_key_package: pkp };
     assert!(
         !verify_group_signature(&group, &msg, &token.frost_signature),
         "signature must fail after claims tampering"
     );
 }
 
-#[cfg(not(feature = "production"))]
-#[allow(deprecated)]
 #[test]
 fn wrong_group_key_rejects_valid_signature() {
-    let dkg1 = dkg(5, 3).expect("DKG failed");
+    let mut dkg1 = dkg(5, 3).expect("DKG failed");
     let dkg2 = dkg(5, 3).expect("DKG failed");
-    let mut shares1 = dkg1.shares;
-    let group1 = dkg1.group;
     let group2 = dkg2.group;
+    let (coordinator, mut nodes) = distribute_shares(&mut dkg1);
     let claims = test_claims();
     let ratchet_key = test_ratchet_key();
     let (pq_sk, _) = generate_pq_keypair();
 
-    let token = build_token(
-        &claims, &mut shares1[..3], &group1, &ratchet_key, &pq_sk, None,
+    let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
+    let token = build_token_distributed(
+        &claims, &coordinator, &mut signers, &ratchet_key, &pq_sk, None,
     )
-    .expect("build_token must succeed");
+    .expect("build_token_distributed must succeed");
 
     let claims_bytes = postcard::to_allocvec(&token.claims).unwrap();
     let msg = [common::domain::FROST_TOKEN, claims_bytes.as_slice()].concat();
@@ -260,13 +253,10 @@ fn wrong_group_key_rejects_valid_signature() {
 
 // ── 4. Token verification REJECTS expired tokens ────────────────────────
 
-#[cfg(not(feature = "production"))]
-#[allow(deprecated)]
 #[test]
 fn expired_token_claims_detectable() {
-    let dkg_result = dkg(5, 3).expect("DKG failed");
-    let mut shares = dkg_result.shares;
-    let group = dkg_result.group;
+    let mut dkg_result = dkg(5, 3).expect("DKG failed");
+    let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
     let ratchet_key = test_ratchet_key();
     let (pq_sk, _) = generate_pq_keypair();
 
@@ -274,10 +264,11 @@ fn expired_token_claims_detectable() {
     let mut claims = test_claims();
     claims.exp = 1_000_000_000_000_000; // well in the past
 
-    let token = build_token(
-        &claims, &mut shares[..3], &group, &ratchet_key, &pq_sk, None,
+    let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
+    let token = build_token_distributed(
+        &claims, &coordinator, &mut signers, &ratchet_key, &pq_sk, None,
     )
-    .expect("build_token must succeed");
+    .expect("build_token_distributed must succeed");
 
     // The verifier side checks: current_time > token.claims.exp
     let now_micros = std::time::SystemTime::now()
@@ -293,21 +284,19 @@ fn expired_token_claims_detectable() {
 
 // ── 5. Token verification REJECTS wrong algorithm identifier ────────────
 
-#[cfg(not(feature = "production"))]
-#[allow(deprecated)]
 #[test]
 fn wrong_algorithm_id_detectable() {
-    let dkg_result = dkg(5, 3).expect("DKG failed");
-    let mut shares = dkg_result.shares;
-    let group = dkg_result.group;
+    let mut dkg_result = dkg(5, 3).expect("DKG failed");
+    let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
     let claims = test_claims();
     let ratchet_key = test_ratchet_key();
     let (pq_sk, _) = generate_pq_keypair();
 
-    let mut token = build_token(
-        &claims, &mut shares[..3], &group, &ratchet_key, &pq_sk, None,
+    let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
+    let mut token = build_token_distributed(
+        &claims, &coordinator, &mut signers, &ratchet_key, &pq_sk, None,
     )
-    .expect("build_token must succeed");
+    .expect("build_token_distributed must succeed");
 
     // The token builder sets algorithm=1. A verifier should reject algorithm!=1.
     assert_eq!(token.header.algorithm, 1);
@@ -320,21 +309,19 @@ fn wrong_algorithm_id_detectable() {
 
 // ── 6. Token verification REJECTS replayed JTI ──────────────────────────
 
-#[cfg(not(feature = "production"))]
-#[allow(deprecated)]
 #[test]
 fn duplicate_token_id_detectable() {
-    let dkg_result = dkg(5, 3).expect("DKG failed");
-    let mut shares = dkg_result.shares;
-    let group = dkg_result.group;
+    let mut dkg_result = dkg(5, 3).expect("DKG failed");
+    let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
     let claims = test_claims();
     let ratchet_key = test_ratchet_key();
     let (pq_sk, _) = generate_pq_keypair();
 
-    let token1 = build_token(
-        &claims, &mut shares[..3], &group, &ratchet_key, &pq_sk, None,
+    let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
+    let token1 = build_token_distributed(
+        &claims, &coordinator, &mut signers, &ratchet_key, &pq_sk, None,
     )
-    .expect("build_token must succeed");
+    .expect("build_token_distributed must succeed");
 
     // Simulate JTI replay detection: a verifier maintains a set of seen token_ids.
     let mut seen_jti: std::collections::HashSet<[u8; 16]> = std::collections::HashSet::new();
@@ -578,29 +565,27 @@ fn prepare_claims_none_audience_clears_aud() {
 
 // ── Ratchet tag determinism ─────────────────────────────────────────────
 
-#[cfg(not(feature = "production"))]
-#[allow(deprecated)]
 #[test]
 fn same_inputs_produce_same_ratchet_tag() {
-    let dkg_result = dkg(5, 3).expect("DKG failed");
-    let mut shares = dkg_result.shares;
-    let group = dkg_result.group;
+    let mut dkg_result = dkg(5, 3).expect("DKG failed");
+    let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
     let claims = test_claims();
     let ratchet_key = test_ratchet_key();
     let (pq_sk, _) = generate_pq_keypair();
 
-    let token1 = build_token(
-        &claims, &mut shares[..3], &group, &ratchet_key, &pq_sk, None,
+    let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
+    let token1 = build_token_distributed(
+        &claims, &coordinator, &mut signers, &ratchet_key, &pq_sk, None,
     )
     .expect("first build must succeed");
 
     // Rebuild with a fresh DKG (different FROST sig) but same claims+ratchet_key
-    let dkg2 = dkg(5, 3).expect("DKG failed");
-    let mut shares2 = dkg2.shares;
-    let group2 = dkg2.group;
+    let mut dkg2 = dkg(5, 3).expect("DKG failed");
+    let (coordinator2, mut nodes2) = distribute_shares(&mut dkg2);
 
-    let token2 = build_token(
-        &claims, &mut shares2[..3], &group2, &ratchet_key, &pq_sk, None,
+    let mut signers2: Vec<&mut _> = nodes2.iter_mut().take(3).collect();
+    let token2 = build_token_distributed(
+        &claims, &coordinator2, &mut signers2, &ratchet_key, &pq_sk, None,
     )
     .expect("second build must succeed");
 
@@ -612,31 +597,29 @@ fn same_inputs_produce_same_ratchet_tag() {
     );
 }
 
-#[cfg(not(feature = "production"))]
-#[allow(deprecated)]
 #[test]
 fn different_ratchet_key_produces_different_tag() {
-    let dkg_result = dkg(5, 3).expect("DKG failed");
-    let mut shares = dkg_result.shares;
-    let group = dkg_result.group;
+    let mut dkg_result = dkg(5, 3).expect("DKG failed");
+    let (coordinator, mut nodes) = distribute_shares(&mut dkg_result);
     let claims = test_claims();
     let (pq_sk, _) = generate_pq_keypair();
 
     let key1 = [0xCD; 64];
     let key2 = [0xEF; 64];
 
-    let token1 = build_token(
-        &claims, &mut shares[..3], &group, &key1, &pq_sk, None,
+    let mut signers: Vec<&mut _> = nodes.iter_mut().take(3).collect();
+    let token1 = build_token_distributed(
+        &claims, &coordinator, &mut signers, &key1, &pq_sk, None,
     )
     .expect("build with key1");
 
-    // Need fresh shares because threshold_sign mutates them
-    let dkg2 = dkg(5, 3).expect("DKG failed");
-    let mut shares2 = dkg2.shares;
-    let group2 = dkg2.group;
+    // Need fresh DKG because distributed signing consumes node state
+    let mut dkg2 = dkg(5, 3).expect("DKG failed");
+    let (coordinator2, mut nodes2) = distribute_shares(&mut dkg2);
 
-    let token2 = build_token(
-        &claims, &mut shares2[..3], &group2, &key2, &pq_sk, None,
+    let mut signers2: Vec<&mut _> = nodes2.iter_mut().take(3).collect();
+    let token2 = build_token_distributed(
+        &claims, &coordinator2, &mut signers2, &key2, &pq_sk, None,
     )
     .expect("build with key2");
 

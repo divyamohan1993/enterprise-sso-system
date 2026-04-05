@@ -1000,10 +1000,20 @@ mod tests {
     }
 
     #[test]
-    fn test_require_enclave_or_warn_does_not_panic() {
+    fn test_require_enclave_rejects_software_fallback_in_production() {
         let result = require_enclave_or_warn("test-signing");
-        // In CI (non-production) this should return Ok(SoftwareFallback)
-        assert!(result.is_ok());
+        // Production mode correctly rejects software fallback — hardware
+        // enclave (SGX/SEV-SNP/TrustZone) is required for signing operations.
+        // In CI without enclave hardware, this MUST return Err.
+        assert!(
+            result.is_err(),
+            "production mode must reject software enclave fallback"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("hardware enclave required"),
+            "error must indicate hardware enclave requirement: {err}"
+        );
     }
 
     #[test]

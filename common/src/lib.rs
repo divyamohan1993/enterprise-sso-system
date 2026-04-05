@@ -40,6 +40,7 @@ pub mod session_limits;
 pub mod circuit_breaker;
 pub mod bulkhead;
 pub mod siem;
+pub mod audit_bridge;
 pub mod key_rotation;
 pub mod retry;
 pub mod health;

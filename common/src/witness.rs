@@ -258,7 +258,7 @@ pub fn load_or_create_witness_seed(path: &Path) -> [u8; 32] {
 fn derive_seed_seal_key() -> [u8; 32] {
     use sha2::Sha512;
     let kek = crate::sealed_keys::cached_master_kek();
-    let hk = hkdf::Hkdf::<Sha512>::new(None, kek);
+    let hk = hkdf::Hkdf::<Sha512>::new(Some(b"MILNET-WITNESS-SALT-v1"), kek);
     let mut okm = [0u8; 32];
     hk.expand(b"MILNET-WITNESS-SEED-SEAL-v1", &mut okm)
         .unwrap_or_else(|e| {

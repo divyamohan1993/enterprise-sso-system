@@ -160,7 +160,7 @@ impl MasterKey {
     ///
     /// Each unique `purpose` string yields a cryptographically independent KEK.
     pub fn derive_kek(&self, purpose: &str) -> DerivedKek {
-        let hk = Hkdf::<Sha512>::new(None, &self.bytes);
+        let hk = Hkdf::<Sha512>::new(Some(b"MILNET-KEK-DERIVE-SALT-v1"), &self.bytes);
         let mut info = Vec::with_capacity(11 + purpose.len());
         info.extend_from_slice(b"MILNET-KEK-");
         info.extend_from_slice(purpose.as_bytes());

@@ -320,7 +320,7 @@ impl RatchetChain {
     ///
     /// Returns an error if the OS CSPRNG is unavailable or mlock fails in production.
     pub fn new(master_secret: &[u8; 64]) -> Result<Self, String> {
-        let hk = Hkdf::<Sha512>::new(None, master_secret);
+        let hk = Hkdf::<Sha512>::new(Some(b"MILNET-RATCHET-SALT-v1"), master_secret);
         let mut chain_key = [0u8; 64];
         hk.expand(domain::RATCHET_ADVANCE, &mut chain_key)
             .map_err(|_| "HKDF-SHA512 expand failed for chain key derivation".to_string())?;

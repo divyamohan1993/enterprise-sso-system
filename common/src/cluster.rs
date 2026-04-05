@@ -607,7 +607,7 @@ fn derive_raft_hmac_key() -> Option<[u8; 64]> {
     }
 
     use hkdf::Hkdf;
-    let hk = Hkdf::<Sha512>::new(None, &kek_bytes);
+    let hk = Hkdf::<Sha512>::new(Some(b"MILNET-CLUSTER-SALT-v1"), &kek_bytes);
     kek_bytes.zeroize();
     let mut okm = [0u8; 64];
     if let Err(e) = hk.expand(RAFT_HMAC_INFO, &mut okm) {
@@ -1228,19 +1228,33 @@ mod tests {
     }
 
     #[test]
-    fn cluster_config_from_env_defaults() {
-        // Clear relevant env vars to ensure defaults
+    #[should_panic(expected = "standalone mode forbidden in production")]
+    fn cluster_config_from_env_rejects_standalone_in_production() {
+        // Production mode correctly rejects zero-peer (standalone) configuration.
+        // This is a security invariant: no single-node deployment in production.
         std::env::remove_var("MILNET_NODE_ID");
         std::env::remove_var("MILNET_SERVICE_TYPE");
         std::env::remove_var("MILNET_SERVICE_ADDR");
         std::env::remove_var("MILNET_RAFT_ADDR");
         std::env::remove_var("MILNET_CLUSTER_PEERS");
+        std::env::remove_var("MILNET_STATIC_PEERS");
+
+        let _ = ClusterConfig::from_env();
+    }
+
+    #[test]
+    fn cluster_config_from_env_with_peers() {
+        // Production mode accepts properly configured cluster peers.
+        std::env::set_var("MILNET_CLUSTER_PEERS", "node2@10.0.0.2:9090,node3@10.0.0.3:9090");
+        std::env::remove_var("MILNET_NODE_ID");
+        std::env::remove_var("MILNET_SERVICE_TYPE");
+        std::env::remove_var("MILNET_SERVICE_ADDR");
+        std::env::remove_var("MILNET_RAFT_ADDR");
 
         let cfg = ClusterConfig::from_env().unwrap();
         assert_eq!(cfg.service_type, ServiceType::Gateway);
-        assert_eq!(cfg.service_addr, "127.0.0.1:8080");
-        assert_eq!(cfg.raft_addr, "127.0.0.1:9090");
-        assert!(cfg.peers.is_empty());
+        assert!(!cfg.peers.is_empty(), "peers must be configured in production");
+        std::env::remove_var("MILNET_CLUSTER_PEERS");
     }
 
     #[test]

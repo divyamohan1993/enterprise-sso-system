@@ -368,12 +368,33 @@ pub fn verify_token_full(
 ) -> Result<TokenClaims, MilnetError> {
     // 1. Fail fast: check revocation
     if revocation_list.is_revoked(&token.claims.token_id) {
+        common::audit_bridge::buffer_audit_entry(
+            common::audit_bridge::create_audit_entry(
+                common::types::AuditEventType::AuthFailure,
+                vec![token.claims.sub],
+                Vec::new(),
+                None,
+                None,
+            ),
+        );
         return Err(MilnetError::CryptoVerification(
             "token has been revoked".into(),
         ));
     }
     // 2. Full signature + DPoP verification
-    verify_token_inner(token, public_key_package, pq_verifying_key, client_dpop_key)
+    let result = verify_token_inner(token, public_key_package, pq_verifying_key, client_dpop_key);
+    if result.is_err() {
+        common::audit_bridge::buffer_audit_entry(
+            common::audit_bridge::create_audit_entry(
+                common::types::AuditEventType::AuthFailure,
+                vec![token.claims.sub],
+                Vec::new(),
+                None,
+                None,
+            ),
+        );
+    }
+    result
 }
 
 /// Full token verification with ceremony binding enforcement.

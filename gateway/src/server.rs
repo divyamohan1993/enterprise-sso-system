@@ -459,6 +459,15 @@ impl GatewayServer {
             // Enforce per-IP rate limit
             if !self.check_rate_limit(addr.ip()).await {
                 warn!("rejecting connection from {addr}: per-IP rate limit exceeded ({} per {RATE_LIMIT_WINDOW_SECS}s)", max_connections_per_ip());
+                common::audit_bridge::buffer_audit_entry(
+                    common::audit_bridge::create_audit_entry(
+                        common::types::AuditEventType::AuthFailure,
+                        Vec::new(),
+                        Vec::new(),
+                        Some(addr.ip().to_string()),
+                        None,
+                    ),
+                );
                 drop(tcp_stream);
                 continue;
             }
