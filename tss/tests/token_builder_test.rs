@@ -5,7 +5,9 @@
 //! roundtrips, and malformed threshold signature rejection.
 
 #[allow(deprecated)]
-use tss::token_builder::{build_token, build_token_distributed, prepare_claims_with_audience};
+#[cfg(not(feature = "production"))]
+use tss::token_builder::build_token;
+use tss::token_builder::{build_token_distributed, prepare_claims_with_audience};
 use tss::validator::{validate_receipt_chain, validate_receipt_chain_with_key, ReceiptVerificationKey};
 use tss::messages::{SigningRequest, SigningResponse};
 use tss::distributed::distribute_shares;
@@ -75,6 +77,7 @@ fn build_signed_chain(len: usize, signing_key: &[u8; 64]) -> Vec<Receipt> {
 
 // ── 1. Token construction produces valid structure with correct claims ──
 
+#[cfg(not(feature = "production"))]
 #[allow(deprecated)]
 #[test]
 fn token_structure_has_correct_header_and_claims() {
@@ -128,6 +131,7 @@ fn distributed_token_structure_correct() {
 
 // ── 2. Token verification succeeds for correctly signed tokens ──────────
 
+#[cfg(not(feature = "production"))]
 #[allow(deprecated)]
 #[test]
 fn frost_signature_verifies_against_group_key() {
@@ -174,6 +178,7 @@ fn distributed_frost_signature_verifies() {
 
 // ── 3. Token verification REJECTS forged/tampered signatures ────────────
 
+#[cfg(not(feature = "production"))]
 #[allow(deprecated)]
 #[test]
 fn tampered_frost_signature_rejected() {
@@ -200,6 +205,7 @@ fn tampered_frost_signature_rejected() {
     );
 }
 
+#[cfg(not(feature = "production"))]
 #[allow(deprecated)]
 #[test]
 fn tampered_claims_invalidate_signature() {
@@ -226,6 +232,7 @@ fn tampered_claims_invalidate_signature() {
     );
 }
 
+#[cfg(not(feature = "production"))]
 #[allow(deprecated)]
 #[test]
 fn wrong_group_key_rejects_valid_signature() {
@@ -253,6 +260,7 @@ fn wrong_group_key_rejects_valid_signature() {
 
 // ── 4. Token verification REJECTS expired tokens ────────────────────────
 
+#[cfg(not(feature = "production"))]
 #[allow(deprecated)]
 #[test]
 fn expired_token_claims_detectable() {
@@ -285,6 +293,7 @@ fn expired_token_claims_detectable() {
 
 // ── 5. Token verification REJECTS wrong algorithm identifier ────────────
 
+#[cfg(not(feature = "production"))]
 #[allow(deprecated)]
 #[test]
 fn wrong_algorithm_id_detectable() {
@@ -311,6 +320,7 @@ fn wrong_algorithm_id_detectable() {
 
 // ── 6. Token verification REJECTS replayed JTI ──────────────────────────
 
+#[cfg(not(feature = "production"))]
 #[allow(deprecated)]
 #[test]
 fn duplicate_token_id_detectable() {
@@ -568,6 +578,7 @@ fn prepare_claims_none_audience_clears_aud() {
 
 // ── Ratchet tag determinism ─────────────────────────────────────────────
 
+#[cfg(not(feature = "production"))]
 #[allow(deprecated)]
 #[test]
 fn same_inputs_produce_same_ratchet_tag() {
@@ -601,6 +612,7 @@ fn same_inputs_produce_same_ratchet_tag() {
     );
 }
 
+#[cfg(not(feature = "production"))]
 #[allow(deprecated)]
 #[test]
 fn different_ratchet_key_produces_different_tag() {
