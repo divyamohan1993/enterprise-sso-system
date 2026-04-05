@@ -41,8 +41,12 @@ impl EncryptedPool {
     /// Wrap a raw pool with envelope encryption using the given master KEK.
     pub fn new(pool: PgPool, master_kek: [u8; 32]) -> Self {
         let s = Self { pool, master_kek };
-        // Prevent master KEK from being swapped to disk
+        // Prevent master KEK from being swapped to disk.
+        // SAFETY: mlock/madvise are memory-protection syscalls that do not
+        // violate memory safety. Required to prevent the root database
+        // encryption key from being written to swap or core dumps.
         #[cfg(unix)]
+        #[allow(unsafe_code)]
         unsafe {
             let ptr = s.master_kek.as_ptr();
             let len = s.master_kek.len();
@@ -214,7 +218,9 @@ impl EncryptedPool {
 
 impl Drop for EncryptedPool {
     fn drop(&mut self) {
+        // SAFETY: munlock is a memory-protection syscall, safe to call.
         #[cfg(unix)]
+        #[allow(unsafe_code)]
         unsafe {
             libc::munlock(self.master_kek.as_ptr() as *const libc::c_void, self.master_kek.len());
         }
