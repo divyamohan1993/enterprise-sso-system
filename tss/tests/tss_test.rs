@@ -1,3 +1,4 @@
+#[cfg(not(feature = "production"))]
 #[allow(deprecated)]
 use tss::token_builder::build_token;
 
@@ -118,6 +119,7 @@ fn unsigned_receipt_rejected() {
     );
 }
 
+#[cfg(not(feature = "production"))]
 #[allow(deprecated)]
 #[test]
 fn token_built_and_verifiable() {
@@ -138,6 +140,7 @@ fn token_built_and_verifiable() {
     assert!(verify_group_signature(&group, &msg, &token.frost_signature));
 }
 
+#[cfg(not(feature = "production"))]
 #[allow(deprecated)]
 #[test]
 fn token_claims_preserved() {
@@ -169,6 +172,7 @@ fn token_claims_preserved() {
     assert_eq!(deserialized.header.tier, claims.tier);
 }
 
+#[cfg(not(feature = "production"))]
 #[allow(deprecated)]
 #[test]
 fn test_ratchet_tag_is_real() {
