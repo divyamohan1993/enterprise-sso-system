@@ -19,7 +19,7 @@ opaque = { path = "../opaque" }
 tss = { path = "../tss" }
 verifier = { path = "../verifier" }
 ratchet = { path = "../ratchet" }
-audit = { path = "../audit" }
+audit = { path = "../audit", features = ["test-support"] }
 kt = { path = "../kt" }
 risk = { path = "../risk" }
 tokio.workspace = true

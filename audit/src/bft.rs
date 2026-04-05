@@ -245,12 +245,14 @@ pub struct ByzantineDetectionState {
 }
 
 /// Startup check: BFT single-process mode warning/enforcement.
+/// In production, single-process mode requires explicit acknowledgment.
 /// In military deployment, single-process mode is unconditionally fatal.
-/// In all other modes, a CRITICAL warning is logged.
+/// In test builds (cfg(test) or feature "test-support"), enforcement is skipped.
 fn check_single_process_military_deployment() {
-    // This check is called from new(), where single_process_mode is always true.
-    // The actual field is set after construction, but the default is true,
-    // so we always warn/enforce here.
+    // Test builds: allow single-process mode without ceremony.
+    if cfg!(test) || cfg!(feature = "test-support") {
+        return;
+    }
     if std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok() {
         panic!(
             "FATAL: BFT audit running in single-process mode in military deployment. \
@@ -258,12 +260,31 @@ fn check_single_process_military_deployment() {
              Deploy BFT nodes as separate processes/VMs."
         );
     }
+    // In production, single-process mode is rejected unless explicitly acknowledged.
+    if std::env::var("MILNET_BFT_SINGLE_PROCESS_ACK").as_deref() != Ok("1") {
+        panic!(
+            "FATAL: BFT audit running in single-process mode in production. \
+             All nodes share one address space -- zero actual Byzantine fault tolerance. \
+             Deploy BFT nodes as separate processes/VMs, or set \
+             MILNET_BFT_SINGLE_PROCESS_ACK=1 for test VMs without multiple hosts."
+        );
+    }
     tracing::warn!(
         target: "siem",
-        "SECURITY: BFT audit running in single-process mode. \
+        "SIEM:WARNING: BFT audit running in single-process mode with explicit ACK. \
          All nodes share one address space -- zero actual Byzantine fault tolerance. \
-         This is acceptable ONLY for development/testing."
+         This is acceptable ONLY for test VMs without multiple hosts."
     );
+}
+
+/// Determine if BFT should default to single-process mode.
+/// In production, defaults to false (distributed). Only true when
+/// MILNET_BFT_SINGLE_PROCESS_ACK=1 is explicitly set, or in test builds.
+fn default_single_process_mode() -> bool {
+    if cfg!(test) || cfg!(feature = "test-support") {
+        return true;
+    }
+    std::env::var("MILNET_BFT_SINGLE_PROCESS_ACK").as_deref() == Ok("1")
 }
 
 /// BFT audit cluster.
@@ -308,7 +329,7 @@ impl BftAuditCluster {
             pq_verifying_key: None,
             f,
             sequence_number: 0,
-            single_process_mode: true,
+            single_process_mode: default_single_process_mode(),
         };
         cluster.initialize_heartbeats();
         cluster
@@ -340,7 +361,7 @@ impl BftAuditCluster {
             pq_verifying_key: Some(verifying_key),
             f,
             sequence_number: 0,
-            single_process_mode: true,
+            single_process_mode: default_single_process_mode(),
         };
         cluster.initialize_heartbeats();
         cluster
@@ -386,7 +407,7 @@ impl BftAuditCluster {
             pq_verifying_key: Some(verifying_key),
             f,
             sequence_number: 0,
-            single_process_mode: true,
+            single_process_mode: default_single_process_mode(),
         };
         cluster.initialize_heartbeats();
         cluster

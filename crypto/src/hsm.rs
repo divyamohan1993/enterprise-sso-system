@@ -1417,7 +1417,11 @@ impl HsmKeyManager {
                 let source = SoftwareKeySource::new(seed)
                     .map_err(|e| HsmError::InitializationFailed(format!("{e}")))?;
                 tracing::warn!(
-                    "Using software HSM backend. NOT FOR PRODUCTION."
+                    target: "siem",
+                    "SIEM:WARNING: Software HSM backend initialized. \
+                     NOT FOR PRODUCTION. Hardware HSM (PKCS#11/AWS-KMS/TPM2) required \
+                     for production deployments. Software key operations provide \
+                     ZERO hardware isolation."
                 );
                 BackendState::Software(source)
             }

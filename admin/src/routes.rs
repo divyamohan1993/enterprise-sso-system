@@ -4151,6 +4151,32 @@ async fn set_developer_mode(
         "error level updated via admin API"
     );
 
+    // Auto-disable verbose mode after 15 minutes to prevent accidental
+    // information leakage. Spawn a background task that reverts to Warn.
+    if effective_level == common::config::ErrorLevel::Verbose {
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(15 * 60)).await;
+            // Only revert if still in verbose mode (may have been changed manually)
+            if state_clone.developer_log_level.load(Ordering::Relaxed) == common::config::ErrorLevel::Verbose as u8 {
+                state_clone.developer_mode.store(false, Ordering::Relaxed);
+                state_clone.developer_log_level.store(common::config::ErrorLevel::Warn as u8, Ordering::Relaxed);
+                common::config::error_level().set_level(common::config::ErrorLevel::Warn);
+                tracing::warn!(
+                    target: "siem",
+                    "SIEM:WARNING: verbose error mode auto-disabled after 15-minute timeout. \
+                     Error level reverted to Warn."
+                );
+                common::siem::SecurityEvent::key_rotation(
+                    "error_level=warn (auto-disabled after 15-minute verbose timeout)"
+                );
+            }
+        });
+        tracing::info!(
+            "verbose error mode will auto-disable in 15 minutes"
+        );
+    }
+
     Ok(Json(ErrorLevelResponse {
         developer_mode: body.enabled,
         log_level: effective_level.to_string(),

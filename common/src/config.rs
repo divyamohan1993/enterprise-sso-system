@@ -118,15 +118,25 @@ impl ErrorLevelConfig {
     }
 
     /// Backwards-compatible: set error level (ignores proof — no longer needed).
-    pub fn set_developer_mode(&self, enabled: bool, _proof_hex: &str) {
-        let level = if enabled { ErrorLevel::Verbose } else { ErrorLevel::Warn };
-        self.set_level(level);
+    /// Developer mode is permanently disabled. Always returns Warn.
+    pub fn set_developer_mode(&self, _enabled: bool, _proof_hex: &str) {
+        tracing::warn!(
+            target: "siem",
+            "SIEM:CRITICAL: developer mode activation attempted. \
+             Developer mode is permanently disabled in production deployment."
+        );
+        self.set_level(ErrorLevel::Warn);
     }
 
     /// Backwards-compatible: set error level without proof.
-    pub fn set_developer_mode_unchecked(&self, enabled: bool) {
-        let level = if enabled { ErrorLevel::Verbose } else { ErrorLevel::Warn };
-        self.set_level(level);
+    /// Developer mode is permanently disabled. Always returns Warn.
+    pub fn set_developer_mode_unchecked(&self, _enabled: bool) {
+        tracing::warn!(
+            target: "siem",
+            "SIEM:CRITICAL: developer mode unchecked activation attempted. \
+             Developer mode is permanently disabled in production deployment."
+        );
+        self.set_level(ErrorLevel::Warn);
     }
 
     /// Backwards-compatible alias for [`set_level`].
@@ -169,9 +179,21 @@ pub fn developer_mode() -> &'static ErrorLevelConfig {
 /// - `"verbose"` → ErrorLevel::Verbose (blocked if military/production)
 /// - `"warn"` → ErrorLevel::Warn (default)
 ///
-/// Also accepts legacy `MILNET_DEVELOPER_MODE` env var for backwards compat:
-/// - Set → ErrorLevel::Verbose
+/// Rejects `MILNET_DEV_MODE` and `MILNET_DEVELOPER_MODE` env vars with
+/// SIEM:CRITICAL alert. Developer mode is permanently disabled.
 pub fn load_error_level_from_env() {
+    // Reject any attempt to enable dev mode via env var.
+    if std::env::var("MILNET_DEV_MODE").is_ok() || std::env::var("MILNET_DEVELOPER_MODE").is_ok() {
+        tracing::error!(
+            target: "siem",
+            "SIEM:CRITICAL: MILNET_DEV_MODE or MILNET_DEVELOPER_MODE env var detected. \
+             Developer mode is permanently disabled in production. \
+             This is a security violation. Ignoring."
+        );
+        // Remove the offending env vars
+        std::env::remove_var("MILNET_DEV_MODE");
+        std::env::remove_var("MILNET_DEVELOPER_MODE");
+    }
     match std::env::var("MILNET_ERROR_LEVEL").ok().as_deref() {
         Some("warn") => {
             error_level().set_level(ErrorLevel::Warn);
@@ -194,9 +216,11 @@ pub fn load_error_level_from_env() {
     }
 }
 
-/// Load the developer mode activation key — now loads error level from env.
-/// Kept for backwards compatibility with startup code that calls this.
+/// Load the developer mode activation key — permanently disabled.
+/// Developer mode is permanently disabled in production deployment.
+/// This function only loads the error level from env for backwards compatibility.
 pub fn load_dev_mode_activation_key() {
+    tracing::info!("developer mode permanently disabled in production deployment");
     load_error_level_from_env();
 }
 

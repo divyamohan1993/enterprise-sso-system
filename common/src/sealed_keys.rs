@@ -341,17 +341,29 @@ pub fn get_master_kek() -> &'static [u8; 32] {
     if use_distributed_kek() {
         cached_master_kek_distributed()
     } else {
-        // In military deployments, the single-key path is a security violation.
-        // Threshold Shamir reconstruction is mandatory.
-        if std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok() {
+        // Production requires threshold mode. Single-key is only allowed
+        // when MILNET_TESTING_SINGLE_KEK_ACK=1 is explicitly set (test infra).
+        if is_production() {
+            if std::env::var("MILNET_MASTER_KEK").is_ok()
+                && std::env::var("MILNET_TESTING_SINGLE_KEK_ACK").as_deref() == Ok("1")
+            {
+                crate::siem::SecurityEvent::crypto_failure(
+                    "WARNING: single-key KEK fallback used with MILNET_TESTING_SINGLE_KEK_ACK=1. \
+                     This is acceptable ONLY for test infrastructure. \
+                     Production deployments MUST use threshold Shamir reconstruction.",
+                );
+                return cached_master_kek();
+            }
             crate::siem::SecurityEvent::crypto_failure(
-                "CRITICAL: single-key KEK fallback attempted in military deployment. \
-                 MILNET_KEK_SHARE not set but MILNET_MILITARY_DEPLOYMENT is active. \
-                 Threshold Shamir reconstruction is mandatory.",
+                "CRITICAL: single-key KEK fallback attempted in production. \
+                 Threshold Shamir reconstruction is mandatory. \
+                 Configure MILNET_KEK_SHARE env vars for 3-of-5 Shamir shares. \
+                 If this is test infrastructure, set MILNET_TESTING_SINGLE_KEK_ACK=1.",
             );
             panic!(
-                "FATAL: single-key KEK path rejected in military deployment. \
-                 Set MILNET_KEK_SHARE for threshold reconstruction."
+                "FATAL: single-key KEK path rejected in production. \
+                 Set MILNET_KEK_SHARE for threshold reconstruction, or \
+                 set MILNET_TESTING_SINGLE_KEK_ACK=1 for test infrastructure."
             );
         }
         cached_master_kek()
