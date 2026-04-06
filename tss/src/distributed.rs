@@ -705,6 +705,16 @@ pub struct SignerNode {
     nonce_range: Option<NonceReservationRange>,
 }
 
+impl std::fmt::Debug for SignerNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignerNode")
+            .field("identifier", &format!("{:?}", self.identifier))
+            .field("nonce_counter", &self.nonce_counter)
+            .field("key_package", &"[REDACTED]")
+            .finish()
+    }
+}
+
 impl SignerNode {
     pub fn new(identifier: Identifier, key_package: KeyPackage) -> Self {
         Self {
@@ -866,6 +876,15 @@ impl SignerNode {
 pub struct SigningCoordinator {
     pub public_key_package: PublicKeyPackage,
     pub threshold: usize,
+}
+
+impl std::fmt::Debug for SigningCoordinator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SigningCoordinator")
+            .field("threshold", &self.threshold)
+            .field("public_key_package", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl SigningCoordinator {
