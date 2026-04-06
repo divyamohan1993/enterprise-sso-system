@@ -38,7 +38,7 @@ use zeroize::Zeroize;
 const DEFAULT_NONCE_STATE_PATH: &str = "/var/lib/milnet/tss_nonce_state";
 
 /// Derive the KEK used for nonce counter sealing from the master KEK via HKDF-SHA512.
-fn nonce_seal_kek() -> [u8; 32] {
+fn nonce_seal_kek() -> zeroize::Zeroizing<[u8; 32]> {
     use hkdf::Hkdf;
     use sha2::Sha512;
     let master_kek = common::sealed_keys::cached_master_kek();
@@ -48,7 +48,7 @@ fn nonce_seal_kek() -> [u8; 32] {
         tracing::error!("FATAL: HKDF-SHA512 expand failed for TSS nonce seal KEK: {e}");
         std::process::exit(1);
     }
-    key
+    zeroize::Zeroizing::new(key)
 }
 
 /// Load the last known nonce counter from sealed storage.
