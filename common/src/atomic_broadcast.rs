@@ -435,7 +435,8 @@ impl AtomicBroadcast {
                 break;
             }
 
-            let msg = pending.remove(&next_seq).unwrap();
+            let msg = pending.remove(&next_seq)
+                .expect("BUG: ready flag set but key absent from pending map");
             hashes.insert(msg.payload_hash);
             self.next_deliver_seq.fetch_add(1, Ordering::SeqCst);
             // Persist each delivered message and the updated sequence counter.

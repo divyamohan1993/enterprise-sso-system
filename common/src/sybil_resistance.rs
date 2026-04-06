@@ -130,9 +130,9 @@ impl NodeAdmissionProtocol {
         let mut gh = crate::sync::siem_write(&self.golden_binary_hash, "sybil::register_founding_node_hash");
         if gh.is_none() {
             *gh = Some(identity.binary_hash);
-        } else {
+        } else if let Some(golden) = *gh {
             // Subsequent founding nodes must match golden hash
-            if identity.binary_hash != gh.unwrap() {
+            if identity.binary_hash != golden {
                 return Err("binary hash does not match golden hash".into());
             }
         }
