@@ -250,7 +250,11 @@ impl PersistentNetworkQuarantine {
 
         // Verify HMAC integrity
         let expected_hmac = self.compute_hmac(&state.blocked_nodes, &state.blocked_fingerprints);
-        if !crypto::ct::ct_eq(expected_hmac.as_bytes(), state.hmac_hex.as_bytes()) {
+        // Constant-time comparison to prevent timing side-channels on HMAC verification.
+        // Use subtle crate directly (crypto crate cannot be imported from common).
+        use subtle::ConstantTimeEq;
+        let hmac_match = expected_hmac.as_bytes().ct_eq(state.hmac_hex.as_bytes());
+        if !bool::from(hmac_match) {
             PanelSiemEvent::new(
                 SiemPanel::NetworkAnomalies,
                 SiemSeverity::Critical,
