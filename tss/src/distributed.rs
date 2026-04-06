@@ -89,7 +89,7 @@ fn load_nonce_counter() -> u64 {
                 std::process::exit(199);
             }
             let seal_key = nonce_seal_kek();
-            let cipher = match Aes256Gcm::new_from_slice(&seal_key) {
+            let cipher = match Aes256Gcm::new_from_slice(seal_key.as_ref()) {
                 Ok(c) => c,
                 Err(_) => {
                     tracing::error!(
@@ -252,7 +252,7 @@ fn save_nonce_counter(counter: u64) {
         .unwrap_or_else(|_| DEFAULT_NONCE_STATE_PATH.to_string());
 
     let seal_key = nonce_seal_kek();
-    let cipher = match Aes256Gcm::new_from_slice(&seal_key) {
+    let cipher = match Aes256Gcm::new_from_slice(seal_key.as_ref()) {
         Ok(c) => c,
         Err(_) => {
             tracing::error!("FATAL: AES-256-GCM key init failed for TSS nonce state save");
@@ -1791,7 +1791,7 @@ fn seal_share_bytes(plaintext: &[u8]) -> Vec<u8> {
     let master_kek = common::sealed_keys::cached_master_kek();
     let seal_key = derive_share_seal_key(master_kek);
 
-    let cipher = Aes256Gcm::new_from_slice(&seal_key).unwrap_or_else(|_| {
+    let cipher = Aes256Gcm::new_from_slice(seal_key.as_ref()).unwrap_or_else(|_| {
         tracing::error!("FATAL: AES-256-GCM key init failed for TSS share seal");
         std::process::exit(1);
     });
@@ -1841,7 +1841,7 @@ fn unseal_share_bytes(hex_str: &str) -> Result<Vec<u8>, String> {
     let seal_key = derive_share_seal_key(master_kek);
 
     let cipher =
-        Aes256Gcm::new_from_slice(&seal_key).map_err(|e| format!("cipher init: {e}"))?;
+        Aes256Gcm::new_from_slice(seal_key.as_ref()).map_err(|e| format!("cipher init: {e}"))?;
     let nonce = Nonce::from_slice(&sealed_bytes[..12]);
 
     let aad = b"MILNET-SEALED-TSS-SHARE-v1";
