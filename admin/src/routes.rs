@@ -2715,7 +2715,7 @@ async fn register_user(
         // Do NOT reveal that the account was pre-existing.
         return Ok(Json(RegisterUserResponse {
             user_id: existing_id,
-            username: req.username,
+            username: req.username.clone(),
             tier: existing_tier as u8,
         }));
     }
@@ -2785,7 +2785,7 @@ async fn register_user(
 
     Ok(Json(RegisterUserResponse {
         user_id,
-        username: req.username,
+        username: req.username.clone(),
         tier,
     }))
 }
