@@ -2736,6 +2736,7 @@ impl ProductionKeySource for HsmKeyManager {
                     HsmBackend::Software => {
                         return Err(SealError::UnsealFailed);
                     }
+                }
             }
         }
     }
