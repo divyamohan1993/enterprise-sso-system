@@ -394,7 +394,10 @@ impl<'a> CborReader<'a> {
         } else if major == 1 {
             // Negative integer: -1 - val (CBOR encoding)
             let val = self.read_uint_arg(additional)?;
-            let neg = -1i64 - (val as i64);
+            // Guard against overflow: CBOR negative integers encode as -1-val
+            // where val is u64. If val > i64::MAX, the result doesn't fit in i64.
+            let val_i64 = i64::try_from(val).ok()?;
+            let neg = (-1i64).checked_sub(val_i64)?;
             Some(neg)
         } else {
             None

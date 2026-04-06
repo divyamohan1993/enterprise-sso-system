@@ -59,7 +59,12 @@ impl Default for RetentionPolicy {
             max_age_days: 2555,         // ~7 years
             max_archive_size_mb: 10240, // 10 GB
             auto_archive: true,
-            archive_encryption_kek: None,
+            archive_encryption_kek: {
+                // SECURITY: Archives MUST be encrypted by default for DoD compliance.
+                // Derive archive KEK from master KEK using HKDF-SHA512.
+                // Falls back to None only if master KEK is not yet available (early init).
+                common::sealed_keys::try_derive_archive_kek()
+            },
             compliance_regime: None,
             cert_in_min_retention_days: 365,
             dod_min_retention_days: 2555,

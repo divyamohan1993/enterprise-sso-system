@@ -123,13 +123,13 @@ fn canary_hmac_key() -> &'static [u8; 64] {
     })
 }
 
-/// Derive a canary value from a buffer address using HMAC-SHA256 with the
-/// process-wide key. This ensures expected canary values are not stored
-/// alongside the secret they protect.
+/// Derive a canary value from a buffer address using HMAC-SHA512 with the
+/// process-wide key (CNSA 2.0 compliant). This ensures expected canary
+/// values are not stored alongside the secret they protect.
 fn derive_canary(addr: usize, salt: u8) -> u64 {
     use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(process_canary_key())
+    use sha2::Sha512;
+    let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(process_canary_key())
         .expect("HMAC key length is always valid");
     mac.update(&addr.to_ne_bytes());
     mac.update(&[salt]);

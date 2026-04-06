@@ -260,20 +260,24 @@ fn check_single_process_military_deployment() {
              Deploy BFT nodes as separate processes/VMs."
         );
     }
-    // In production, single-process mode is rejected unless explicitly acknowledged.
-    if std::env::var("MILNET_BFT_SINGLE_PROCESS_ACK").as_deref() != Ok("1") {
+    // In production, single-process mode is NEVER permitted.
+    // This was previously gated by MILNET_BFT_SINGLE_PROCESS_ACK=1 but that
+    // escape hatch has been removed. Deploy BFT nodes as separate processes/VMs.
+    if std::env::var("MILNET_PRODUCTION").is_ok()
+        || std::env::var("MILNET_BFT_SINGLE_PROCESS_ACK").is_err()
+    {
         panic!(
-            "FATAL: BFT audit running in single-process mode in production. \
+            "FATAL: BFT audit running in single-process mode. \
              All nodes share one address space -- zero actual Byzantine fault tolerance. \
-             Deploy BFT nodes as separate processes/VMs, or set \
-             MILNET_BFT_SINGLE_PROCESS_ACK=1 for test VMs without multiple hosts."
+             Deploy BFT nodes as separate processes/VMs."
         );
     }
+    // Non-production, non-military, with explicit ACK: allow for local dev/testing only
     tracing::warn!(
         target: "siem",
         "SIEM:WARNING: BFT audit running in single-process mode with explicit ACK. \
          All nodes share one address space -- zero actual Byzantine fault tolerance. \
-         This is acceptable ONLY for test VMs without multiple hosts."
+         This is acceptable ONLY for local development and testing."
     );
 }
 

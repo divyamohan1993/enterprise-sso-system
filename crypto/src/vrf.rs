@@ -16,6 +16,7 @@ use ed25519_dalek::{Signer, Verifier};
 use sha2::{Digest, Sha512};
 use hkdf;
 
+#[deprecated(note = "Use PqVrfKeypair for quantum-safe VRF")]
 /// A VRF keypair wrapping Ed25519 keys.
 pub struct VrfKeypair {
     signing_key: ed25519_dalek::SigningKey,
@@ -215,6 +216,99 @@ pub fn pq_leader_election(
     ) as usize % participants;
 
     (leader_idx, output.to_vec(), proof)
+}
+
+// ── Post-Quantum VRF (ML-DSA-87) — struct-based API ───────────────────────
+
+/// A PQ-VRF keypair using ML-DSA-87 (FIPS 204, NIST Level 5).
+/// This is the recommended VRF for all new deployments.
+pub struct PqVrfKeypair {
+    signing_key: crate::pq_sign::PqSigningKey,
+    verifying_key: crate::pq_sign::PqVerifyingKey,
+}
+
+/// The output of a PQ-VRF evaluation.
+#[derive(Debug, Clone)]
+pub struct PqVrfProof {
+    /// The pseudo-random output, uniformly distributed.
+    pub output: [u8; 32],
+    /// The ML-DSA-87 signature serving as the proof.
+    pub proof: Vec<u8>,
+}
+
+impl PqVrfKeypair {
+    /// Generate a new PQ-VRF keypair from OS entropy.
+    pub fn generate() -> Self {
+        let (sk, pk) = crate::pq_sign::generate_pq_keypair();
+        Self {
+            signing_key: sk,
+            verifying_key: pk,
+        }
+    }
+
+    /// Return the public verifying key.
+    pub fn verifying_key(&self) -> &crate::pq_sign::PqVerifyingKey {
+        &self.verifying_key
+    }
+
+    /// Evaluate the PQ-VRF on the given input.
+    pub fn evaluate(&self, input: &[u8]) -> PqVrfProof {
+        let proof = crate::pq_sign::pq_sign_raw(&self.signing_key, input);
+        let output = pq_hash_proof_to_output(&proof);
+        PqVrfProof { output, proof }
+    }
+}
+
+/// Verify a PQ-VRF proof and recover the output.
+pub fn pq_vrf_verify_proof(
+    verifying_key: &crate::pq_sign::PqVerifyingKey,
+    input: &[u8],
+    proof: &PqVrfProof,
+) -> Option<[u8; 32]> {
+    if !crate::pq_sign::pq_verify_raw(verifying_key, input, &proof.proof) {
+        return None;
+    }
+    let output = pq_hash_proof_to_output(&proof.proof);
+    if !crate::ct::ct_eq(&output, &proof.output) {
+        return None;
+    }
+    Some(output)
+}
+
+/// Hash a PQ-VRF proof to derive the uniform output using HKDF-SHA512.
+fn pq_hash_proof_to_output(proof: &[u8]) -> [u8; 32] {
+    let hkdf = hkdf::Hkdf::<Sha512>::new(
+        Some(b"MILNET-PQ-VRF-OUTPUT-v1"),
+        proof,
+    );
+    let mut output = [0u8; 32];
+    hkdf.expand(b"vrf-output", &mut output)
+        .expect("HKDF expand for 32 bytes always succeeds");
+    output
+}
+
+/// PQ leader election using ML-DSA-87 VRF.
+pub fn pq_leader_election_struct(
+    epoch: u64,
+    candidates: &[(PqVrfKeypair, String)],
+) -> Option<(usize, String, PqVrfProof)> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let epoch_bytes = epoch.to_le_bytes();
+    let mut best_idx = 0;
+    let mut best_output = [0xFFu8; 32];
+    let mut best_proof = None;
+
+    for (i, (keypair, _node_id)) in candidates.iter().enumerate() {
+        let proof = keypair.evaluate(&epoch_bytes);
+        if proof.output < best_output {
+            best_output = proof.output;
+            best_idx = i;
+            best_proof = Some(proof);
+        }
+    }
+    best_proof.map(|p| (best_idx, candidates[best_idx].1.clone(), p))
 }
 
 // ---------------------------------------------------------------------------

@@ -238,6 +238,23 @@ pub struct GatewayServer {
 impl GatewayServer {
     /// Bind the gateway to the given address.
     pub async fn bind(addr: &str, difficulty: u8) -> std::io::Result<Self> {
+        // SECURITY: In production and military deployments, TLS is mandatory.
+        // Use bind_tls() instead of bind() to enable TLS termination.
+        if std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok() {
+            return Err(std::io::Error::other(
+                "FATAL: Gateway bind() called without TLS in military deployment. \
+                 Use bind_tls() with a TLS configuration. Plaintext external listeners \
+                 are prohibited in military/production environments.",
+            ));
+        }
+        if std::env::var("MILNET_PRODUCTION").is_ok()
+            && std::env::var("MILNET_ALLOW_PLAINTEXT_GATEWAY").is_err()
+        {
+            return Err(std::io::Error::other(
+                "FATAL: Gateway bind() called without TLS in production. \
+                 Use bind_tls() or set MILNET_ALLOW_PLAINTEXT_GATEWAY=1 for testing.",
+            ));
+        }
         let listener = TcpListener::bind(addr).await?;
         info!("Gateway listening on {}", listener.local_addr()?);
         let xwing_kp = tokio::task::spawn_blocking(crypto::xwing::XWingKeyPair::generate)

@@ -1836,6 +1836,13 @@ pub struct RegisterUserRequest {
     pub tier: Option<u8>,  // 1=Sovereign, 2=Operational, 3=Sensor, 4=Emergency. Default: 2
 }
 
+impl Drop for RegisterUserRequest {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.password.zeroize();
+    }
+}
+
 #[derive(Serialize)]
 pub struct RegisterUserResponse {
     pub user_id: Uuid,
@@ -1913,6 +1920,13 @@ pub struct KtProofResponse {
 pub struct LoginRequest {
     pub username: String,
     pub password: String,
+}
+
+impl Drop for LoginRequest {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.password.zeroize();
+    }
 }
 
 #[derive(Serialize, Default)]

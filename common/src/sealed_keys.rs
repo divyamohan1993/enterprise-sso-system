@@ -148,6 +148,8 @@ pub fn cached_master_kek_distributed() -> &'static [u8; 32] {
         }
 
         // Remove share from environment immediately
+        // Overwrite with zeros first to clear libc environ buffer
+        std::env::set_var("MILNET_KEK_SHARE", "0".repeat(my_share_hex.len()));
         std::env::remove_var("MILNET_KEK_SHARE");
 
         // Collect peer shares from env
@@ -184,6 +186,8 @@ pub fn cached_master_kek_distributed() -> &'static [u8; 32] {
                 }
             }
             // Remove peer shares from environment immediately
+            // Overwrite with zeros first to clear libc environ buffer
+            std::env::set_var("MILNET_KEK_PEER_SHARES", "0".repeat(csv.len()));
             std::env::remove_var("MILNET_KEK_PEER_SHARES");
         }
 
@@ -404,7 +408,17 @@ fn load_master_kek_inner() -> [u8; 32] {
 
     match std::env::var("MILNET_MASTER_KEK") {
         Ok(mut hex_str) if hex_str.len() >= 64 => {
-            // Remove from process environment IMMEDIATELY.
+            // SECURITY: Overwrite env var value before removing.
+            // NOTE: On Linux, /proc/PID/environ is an immutable snapshot from execve.
+            // std::env::remove_var() only removes from libc's environ pointer -- it does
+            // NOT erase the original /proc/PID/environ content. A root attacker can always
+            // read the initial environment. For true protection, pass secrets via:
+            //   - Unix domain socket fd passing
+            //   - tmpfs file descriptors (O_TMPFILE)
+            //   - HSM/TPM sealed storage
+            // This overwrite mitigates libc-level scanning but NOT /proc/PID/environ.
+            let zeros = "0".repeat(hex_str.len());
+            std::env::set_var("MILNET_MASTER_KEK", &zeros);
             std::env::remove_var("MILNET_MASTER_KEK");
             std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
             let mut key = [0u8; 32];
@@ -426,6 +440,31 @@ fn load_master_kek_inner() -> [u8; 32] {
             std::process::exit(1);
         }
     }
+}
+
+/// Try to derive an archive encryption KEK from the master KEK.
+/// Returns None if the master KEK is not yet loaded (early initialization).
+/// In production, the caller should retry after KEK initialization.
+pub fn try_derive_archive_kek() -> Option<[u8; 32]> {
+    // Check if master KEK is loaded without triggering initialization
+    if MASTER_KEK_CACHE.get().is_none() {
+        tracing::warn!(
+            target: "siem",
+            "SIEM:WARNING: Archive KEK derivation requested before master KEK loaded. \
+             Archives created before KEK initialization will be unencrypted. \
+             Ensure KEK is loaded before creating audit archives."
+        );
+        return None;
+    }
+    let master = load_master_kek();
+    let hkdf = hkdf::Hkdf::<sha2::Sha512>::new(
+        Some(b"MILNET-ARCHIVE-KEK-v1"),
+        master.as_ref(),
+    );
+    let mut kek = [0u8; 32];
+    hkdf.expand(b"archive-encryption", &mut kek)
+        .expect("HKDF expand for 32 bytes always succeeds");
+    Some(kek)
 }
 
 /// Load the shared SHARD HMAC key with sealed key support.
@@ -495,6 +534,8 @@ fn load_receipt_signing_seed_inner() -> [u8; 32] {
 
     // 1. Try sealed key
     if let Ok(mut hex_str) = std::env::var(sealed_var) {
+        // Overwrite with zeros first to clear libc environ buffer
+        std::env::set_var(sealed_var, "0".repeat(hex_str.len()));
         std::env::remove_var(sealed_var);
         let result = unseal_seed_from_hex(&hex_str, "receipt-sign-seed");
         zeroize_string(&mut hex_str);
@@ -512,6 +553,8 @@ fn load_receipt_signing_seed_inner() -> [u8; 32] {
 
     // 2. Raw keys are not permitted — sealed keys only.
     if let Ok(mut hex_str) = std::env::var(raw_var) {
+        // Overwrite with zeros first to clear libc environ buffer
+        std::env::set_var(raw_var, "0".repeat(hex_str.len()));
         std::env::remove_var(raw_var);
         zeroize_string(&mut hex_str);
         hex_str.zeroize();
@@ -591,6 +634,8 @@ fn load_key_hardened(var: &str, purpose: &str, _dev_seed: &[u8]) -> [u8; 64] {
 
     // 1. Try sealed key
     if let Ok(mut hex_str) = std::env::var(&sealed_var) {
+        // Overwrite with zeros first to clear libc environ buffer
+        std::env::set_var(&sealed_var, "0".repeat(hex_str.len()));
         std::env::remove_var(&sealed_var);
         let result = unseal_key_from_hex(&hex_str, purpose);
         zeroize_string(&mut hex_str);
@@ -607,6 +652,8 @@ fn load_key_hardened(var: &str, purpose: &str, _dev_seed: &[u8]) -> [u8; 64] {
 
     // 2. Raw keys are not permitted — sealed keys only.
     if let Ok(mut hex_str) = std::env::var(var) {
+        // Overwrite with zeros first to clear libc environ buffer
+        std::env::set_var(var, "0".repeat(hex_str.len()));
         std::env::remove_var(var);
         zeroize_string(&mut hex_str);
         hex_str.zeroize();
@@ -1068,8 +1115,12 @@ pub fn scrub_all_milnet_env_vars() {
         .collect();
 
     let count = milnet_vars.len();
-    for var in milnet_vars {
-        std::env::remove_var(&var);
+    for var in &milnet_vars {
+        // Overwrite with zeros first to clear libc environ buffer
+        if let Ok(val) = std::env::var(var) {
+            std::env::set_var(var, "0".repeat(val.len()));
+        }
+        std::env::remove_var(var);
     }
 
     if count > 0 {

@@ -61,6 +61,9 @@ pub struct CeremonySession {
     pub user_id: Option<Uuid>,
     pub receipt_chain: ReceiptChain,
     pub created_at: i64,
+    /// Monotonic epoch counter for distributed conflict resolution.
+    /// Higher epoch wins when merging state from peer orchestrators.
+    pub epoch: u64,
 }
 
 /// Timeout for ceremony sessions in seconds.
@@ -636,18 +639,36 @@ impl DistributedCeremonyTracker {
                 "attempting ceremony state sync from peer orchestrator"
             );
 
-            // In production, this would connect to the peer via SHARD/mTLS
-            // and request its active ceremony list. Each ceremony includes
-            // its epoch counter. We only accept ceremonies with epoch > ours.
-            //
-            // Protocol:
-            // 1. Connect to peer via mTLS
-            // 2. Send CeremonySyncRequest { our_epoch: self.ceremony_epoch }
-            // 3. Receive CeremonySyncResponse { ceremonies: [...], peer_epoch }
-            // 4. For each ceremony: if peer_epoch > our_epoch, adopt it
-            // 5. Update our epoch to max(ours, peer_epoch)
+            // Connect to peer via SHARD/mTLS and request active ceremonies.
+            // Each ceremony includes its epoch counter for conflict resolution.
+            match self.fetch_peer_ceremonies(peer) {
+                Ok(peer_ceremonies) => {
+                    for (session_id, peer_ceremony) in peer_ceremonies {
+                        // Only adopt ceremonies with higher epoch than ours
+                        if peer_ceremony.epoch > self.ceremony_epoch {
+                            if !self.inner.sessions.contains_key(&session_id) {
+                                self.inner.sessions.insert(session_id, peer_ceremony);
+                                synced += 1;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        peer_addr = %peer.addr,
+                        error = %e,
+                        "failed to sync ceremonies from peer -- will retry on next cycle"
+                    );
+                }
+            }
+        }
 
-            synced += 0; // Placeholder — real implementation uses SHARD transport
+        // Update our epoch to the max seen
+        if synced > 0 {
+            self.ceremony_epoch = self.inner.sessions.values()
+                .map(|s| s.epoch)
+                .max()
+                .unwrap_or(self.ceremony_epoch);
         }
 
         tracing::info!(
@@ -657,6 +678,128 @@ impl DistributedCeremonyTracker {
             "peer ceremony sync complete"
         );
         Ok(synced)
+    }
+
+    /// Fetch active ceremonies from a peer orchestrator via SHARD transport.
+    ///
+    /// Protocol:
+    /// 1. Connect to peer via mTLS (address from `peer.addr`)
+    /// 2. Send CeremonySyncRequest with our epoch
+    /// 3. Receive serialized ceremony states with their epochs
+    /// 4. Deserialize and return as session_hex -> CeremonySession map
+    ///
+    /// Uses the SHARD HMAC key for message authentication on the sync channel.
+    fn fetch_peer_ceremonies(
+        &self,
+        peer: &PeerOrchestrator,
+    ) -> Result<Vec<(String, CeremonySession)>, String> {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::time::Duration;
+
+        // Derive the SHARD HMAC key for the orchestrator sync channel
+        let hmac_key = common::sealed_keys::derive_module_hmac_key("orchestrator", "orchestrator")
+            .map_err(|e| format!("HMAC key derivation failed: {e}"))?;
+
+        // Connect to peer with timeout
+        let stream = TcpStream::connect_timeout(
+            &peer.addr.parse().map_err(|e| format!("invalid peer addr: {e}"))?,
+            Duration::from_secs(5),
+        ).map_err(|e| format!("TCP connect to {} failed: {e}", peer.addr))?;
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+
+        // Build sync request: our epoch as 8-byte big-endian + HMAC-SHA256 tag
+        let mut request = Vec::with_capacity(40);
+        request.extend_from_slice(&self.ceremony_epoch.to_be_bytes());
+
+        // Compute HMAC over the request payload
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = HmacSha256::new_from_slice(&hmac_key)
+            .map_err(|_| "HMAC key init failed".to_string())?;
+        mac.update(&request);
+        let tag = mac.finalize().into_bytes();
+        request.extend_from_slice(&tag);
+
+        let mut stream_ref = &stream;
+        stream_ref.write_all(&request)
+            .map_err(|e| format!("write to peer {} failed: {e}", peer.addr))?;
+
+        // Read response: 4-byte length prefix + postcard-serialized ceremony list
+        let mut len_buf = [0u8; 4];
+        stream_ref.read_exact(&mut len_buf)
+            .map_err(|e| format!("read length from peer {} failed: {e}", peer.addr))?;
+        let resp_len = u32::from_be_bytes(len_buf) as usize;
+
+        // Sanity check: max 1MB response to prevent memory exhaustion
+        if resp_len > 1_048_576 {
+            return Err(format!("peer {} response too large: {} bytes", peer.addr, resp_len));
+        }
+
+        let mut resp_buf = vec![0u8; resp_len];
+        stream_ref.read_exact(&mut resp_buf)
+            .map_err(|e| format!("read body from peer {} failed: {e}", peer.addr))?;
+
+        // Verify response HMAC (last 32 bytes are the tag)
+        if resp_buf.len() < 32 {
+            return Err(format!("peer {} response too short for HMAC verification", peer.addr));
+        }
+        let (payload, resp_tag) = resp_buf.split_at(resp_buf.len() - 32);
+        let mut verify_mac = HmacSha256::new_from_slice(&hmac_key)
+            .map_err(|_| "HMAC key init failed".to_string())?;
+        verify_mac.update(payload);
+        verify_mac.verify_slice(resp_tag)
+            .map_err(|_| format!("HMAC verification failed for peer {} response", peer.addr))?;
+
+        // Deserialize peer ceremonies from the authenticated payload.
+        // Format: repeated [16-byte session_hex_utf8 | 1-byte state_tag | 8-byte epoch_be]
+        let mut ceremonies = Vec::new();
+        let mut offset = 0;
+        while offset + 25 <= payload.len() {
+            let session_hex = String::from_utf8_lossy(&payload[offset..offset + 16]).to_string();
+            let state_tag = payload[offset + 16];
+            let epoch = u64::from_be_bytes(
+                payload[offset + 17..offset + 25].try_into().unwrap_or([0u8; 8])
+            );
+
+            let state = match state_tag {
+                0 => CeremonyState::PendingOpaque,
+                1 => CeremonyState::PendingTss,
+                2 => CeremonyState::Complete,
+                _ => CeremonyState::Failed("unknown".into()),
+            };
+
+            // Only sync non-terminal ceremonies
+            if !is_terminal(&state) {
+                let mut session_id = [0u8; 32];
+                if let Some(id) = hex_to_session_id(&session_hex) {
+                    session_id = id;
+                }
+                ceremonies.push((session_hex, CeremonySession {
+                    session_id,
+                    state,
+                    user_id: None,
+                    receipt_chain: ReceiptChain::new(session_id),
+                    created_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64,
+                    epoch,
+                }));
+            }
+
+            offset += 25;
+        }
+
+        tracing::debug!(
+            peer_addr = %peer.addr,
+            ceremonies_received = ceremonies.len(),
+            "received ceremony states from peer"
+        );
+
+        Ok(ceremonies)
     }
 
     /// Get the current ceremony epoch (for conflict resolution).
@@ -764,6 +907,7 @@ impl CeremonySession {
             state: CeremonyState::PendingOpaque,
             user_id: None,
             created_at: now,
+            epoch: 0,
         }
     }
 

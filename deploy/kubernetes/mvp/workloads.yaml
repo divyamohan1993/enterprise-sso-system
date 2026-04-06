@@ -1,4 +1,4 @@
-# MILNET SSO — MVP Workloads (all single-replica)
+# MILNET SSO — MVP Workloads (multi-replica with anti-affinity)
 ---
 # ── Gateway ──────────────────────────────────────────────────────────────────
 apiVersion: apps/v1
@@ -7,7 +7,7 @@ metadata:
   name: gateway
   namespace: milnet
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app.kubernetes.io/name: gateway
@@ -19,6 +19,18 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "10100"
     spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - gateway
+                topologyKey: kubernetes.io/hostname
       automountServiceAccountToken: false
       containers:
         - name: gateway
@@ -80,7 +92,7 @@ metadata:
   name: orchestrator
   namespace: milnet
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app.kubernetes.io/name: orchestrator
@@ -92,6 +104,18 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "10101"
     spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - orchestrator
+                topologyKey: kubernetes.io/hostname
       automountServiceAccountToken: false
       containers:
         - name: orchestrator
@@ -146,7 +170,7 @@ metadata:
   name: tss-coordinator
   namespace: milnet
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app.kubernetes.io/name: tss-coordinator
@@ -158,6 +182,18 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "10103"
     spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - tss-coordinator
+                topologyKey: kubernetes.io/hostname
       automountServiceAccountToken: false
       containers:
         - name: tss-coordinator
@@ -221,6 +257,18 @@ spec:
       annotations:
         prometheus.io/scrape: "true"
     spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - tss-signer
+                topologyKey: kubernetes.io/hostname
       automountServiceAccountToken: false
       containers:
         - name: tss-signer
@@ -273,7 +321,7 @@ metadata:
   name: opaque
   namespace: milnet
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app.kubernetes.io/name: opaque
@@ -285,6 +333,18 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "10102"
     spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - opaque
+                topologyKey: kubernetes.io/hostname
       automountServiceAccountToken: false
       containers:
         - name: opaque
@@ -334,7 +394,7 @@ metadata:
   name: verifier
   namespace: milnet
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app.kubernetes.io/name: verifier
@@ -346,6 +406,18 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "10104"
     spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - verifier
+                topologyKey: kubernetes.io/hostname
       automountServiceAccountToken: false
       containers:
         - name: verifier
@@ -395,7 +467,7 @@ metadata:
   name: ratchet
   namespace: milnet
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app.kubernetes.io/name: ratchet
@@ -407,6 +479,18 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "10105"
     spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - ratchet
+                topologyKey: kubernetes.io/hostname
       automountServiceAccountToken: false
       containers:
         - name: ratchet
@@ -461,7 +545,7 @@ metadata:
   name: risk
   namespace: milnet
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app.kubernetes.io/name: risk
@@ -473,6 +557,18 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "10106"
     spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - risk
+                topologyKey: kubernetes.io/hostname
       automountServiceAccountToken: false
       containers:
         - name: risk
@@ -522,7 +618,7 @@ metadata:
   name: audit
   namespace: milnet
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app.kubernetes.io/name: audit
@@ -534,6 +630,18 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "10108"
     spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - audit
+                topologyKey: kubernetes.io/hostname
       automountServiceAccountToken: false
       containers:
         - name: audit
@@ -587,7 +695,7 @@ metadata:
   name: kt
   namespace: milnet
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app.kubernetes.io/name: kt
@@ -599,6 +707,18 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "10109"
     spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - kt
+                topologyKey: kubernetes.io/hostname
       automountServiceAccountToken: false
       containers:
         - name: kt
@@ -652,7 +772,7 @@ metadata:
   name: admin
   namespace: milnet
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app.kubernetes.io/name: admin
@@ -664,6 +784,18 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "9080"
     spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - admin
+                topologyKey: kubernetes.io/hostname
       automountServiceAccountToken: false
       containers:
         - name: admin

@@ -391,7 +391,14 @@ pub fn validate_ssl_config(database_url: &str) {
     let ssl_cert = std::env::var("MILNET_DB_SSL_CERT").ok().filter(|s| !s.is_empty());
     let ssl_key = std::env::var("MILNET_DB_SSL_KEY").ok().filter(|s| !s.is_empty());
     // Remove sensitive env vars after reading
+    // Overwrite with zeros first to clear libc environ buffer
+    if let Some(ref k) = ssl_key {
+        std::env::set_var("MILNET_DB_SSL_KEY", "0".repeat(k.len()));
+    }
     std::env::remove_var("MILNET_DB_SSL_KEY");
+    if let Some(ref c) = ssl_cert {
+        std::env::set_var("MILNET_DB_SSL_CERT", "0".repeat(c.len()));
+    }
     std::env::remove_var("MILNET_DB_SSL_CERT");
 
     if let Some(ref cert_path) = ssl_cert {

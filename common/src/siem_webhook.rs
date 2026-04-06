@@ -41,8 +41,10 @@ impl SiemWebhookConfig {
             .ok()
             .filter(|u| !u.is_empty())?;
 
-        // SECURITY: Remove endpoint URL from environment to prevent leakage
-        // via /proc/pid/environ or child process inheritance.
+        // SECURITY: Overwrite env var value before removing to clear libc environ buffer.
+        // NOTE: /proc/PID/environ is an immutable kernel snapshot -- this only mitigates
+        // libc-level scanning, not root access to /proc.
+        std::env::set_var("MILNET_SIEM_WEBHOOK_URL", "0".repeat(endpoint_url.len()));
         std::env::remove_var("MILNET_SIEM_WEBHOOK_URL");
 
         let auth_token = std::env::var("MILNET_SIEM_AUTH_TOKEN")

@@ -435,10 +435,10 @@ impl std::fmt::Debug for AuditEntry {
             .field("classification", &self.classification)
             .field("correlation_id", &self.correlation_id)
             .field("trace_id", &self.trace_id)
-            .field("source_ip", &self.source_ip)
+            .field("source_ip", &self.source_ip.as_ref().map(|_| "[PSEUDONYMIZED]"))
             .field("session_id", &self.session_id)
             .field("request_id", &self.request_id)
-            .field("user_agent", &self.user_agent)
+            .field("user_agent", &self.user_agent.as_ref().map(|_| "[REDACTED]"))
             .finish()
     }
 }

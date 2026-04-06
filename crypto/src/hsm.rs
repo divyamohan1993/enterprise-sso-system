@@ -272,6 +272,20 @@ impl Default for HsmConfig {
 }
 
 impl HsmConfig {
+    /// Validate that the HSM configuration is suitable for production deployment.
+    /// Software backend is PROHIBITED in production -- keys must be HSM-backed.
+    pub fn validate_for_production(&self) {
+        if std::env::var("MILNET_PRODUCTION").is_ok() || std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok() {
+            if matches!(self.backend, HsmBackend::Software) {
+                panic!(
+                    "FATAL: HSM backend is set to Software in production/military deployment. \
+                     Configure MILNET_HSM_BACKEND to pkcs11, aws-kms, or tpm2. \
+                     Software keys are prohibited in production environments."
+                );
+            }
+        }
+    }
+
     /// Load HSM configuration from environment variables.
     ///
     /// Environment variables:
@@ -301,7 +315,11 @@ impl HsmConfig {
         let pkcs11_pin = match std::env::var("MILNET_PKCS11_PIN") {
             Ok(pin) => {
                 #[cfg(not(test))]
-                std::env::remove_var("MILNET_PKCS11_PIN");
+                {
+                    // Overwrite with zeros first to clear libc environ buffer
+                    std::env::set_var("MILNET_PKCS11_PIN", "0".repeat(pin.len()));
+                    std::env::remove_var("MILNET_PKCS11_PIN");
+                }
                 Some(pin)
             }
             Err(_) => None,
@@ -2742,6 +2760,7 @@ pub fn create_key_source(config: &HsmConfig) -> Result<Box<dyn ProductionKeySour
 /// Falls back to the `Software` backend if `MILNET_HSM_BACKEND` is not set.
 pub fn create_key_source_from_env() -> Result<Box<dyn ProductionKeySource>, HsmError> {
     let config = HsmConfig::from_env();
+    config.validate_for_production();
     create_key_source(&config)
 }
 

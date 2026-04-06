@@ -225,25 +225,88 @@ rules:
     verbs: ["get"]
 
 ---
-# TSS Signer: needs its share secrets and master KEK
+# TSS Signer 0: can ONLY read its own share
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: tss-signer-secrets-reader
+  name: tss-signer-0-secrets-reader
   namespace: milnet
   labels:
-    app.kubernetes.io/name: tss-signer
+    app.kubernetes.io/name: tss-signer-0
     app.kubernetes.io/part-of: milnet-sso
 rules:
   - apiGroups: [""]
     resources: ["secrets"]
     resourceNames:
       - milnet-tss-share-0
+    verbs: ["get"]
+
+---
+# TSS Signer 1: can ONLY read its own share
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: tss-signer-1-secrets-reader
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: tss-signer-1
+    app.kubernetes.io/part-of: milnet-sso
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
       - milnet-tss-share-1
+    verbs: ["get"]
+
+---
+# TSS Signer 2: can ONLY read its own share
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: tss-signer-2-secrets-reader
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: tss-signer-2
+    app.kubernetes.io/part-of: milnet-sso
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
       - milnet-tss-share-2
+    verbs: ["get"]
+
+---
+# TSS Signer 3: can ONLY read its own share
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: tss-signer-3-secrets-reader
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: tss-signer-3
+    app.kubernetes.io/part-of: milnet-sso
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
       - milnet-tss-share-3
+    verbs: ["get"]
+
+---
+# TSS Signer 4: can ONLY read its own share
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: tss-signer-4-secrets-reader
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: tss-signer-4
+    app.kubernetes.io/part-of: milnet-sso
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
       - milnet-tss-share-4
-      - milnet-master-kek
     verbs: ["get"]
 
 ---
@@ -448,18 +511,90 @@ subjects:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: tss-signer-secrets-binding
+  name: tss-signer-0-secrets-binding
   namespace: milnet
   labels:
-    app.kubernetes.io/name: tss-signer
+    app.kubernetes.io/name: tss-signer-0
     app.kubernetes.io/part-of: milnet-sso
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: tss-signer-secrets-reader
+  name: tss-signer-0-secrets-reader
 subjects:
   - kind: ServiceAccount
-    name: tss-signer-sa
+    name: tss-signer-0-sa
+    namespace: milnet
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: tss-signer-1-secrets-binding
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: tss-signer-1
+    app.kubernetes.io/part-of: milnet-sso
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: tss-signer-1-secrets-reader
+subjects:
+  - kind: ServiceAccount
+    name: tss-signer-1-sa
+    namespace: milnet
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: tss-signer-2-secrets-binding
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: tss-signer-2
+    app.kubernetes.io/part-of: milnet-sso
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: tss-signer-2-secrets-reader
+subjects:
+  - kind: ServiceAccount
+    name: tss-signer-2-sa
+    namespace: milnet
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: tss-signer-3-secrets-binding
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: tss-signer-3
+    app.kubernetes.io/part-of: milnet-sso
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: tss-signer-3-secrets-reader
+subjects:
+  - kind: ServiceAccount
+    name: tss-signer-3-sa
+    namespace: milnet
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: tss-signer-4-secrets-binding
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: tss-signer-4
+    app.kubernetes.io/part-of: milnet-sso
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: tss-signer-4-secrets-reader
+subjects:
+  - kind: ServiceAccount
+    name: tss-signer-4-sa
     namespace: milnet
 
 ---
