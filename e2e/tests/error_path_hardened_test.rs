@@ -153,7 +153,7 @@ fn audit_chain_tampering_detected() {
 
         let mut log = AuditLog::new();
         log.append(
-            AuditEventType::LoginSuccess,
+            AuditEventType::AuthSuccess,
             vec![Uuid::nil()],
             vec![],
             0.1,
@@ -161,7 +161,7 @@ fn audit_chain_tampering_detected() {
             &signing_key,
         );
         log.append(
-            AuditEventType::LoginFailure,
+            AuditEventType::AuthFailure,
             vec![Uuid::nil()],
             vec![],
             0.5,
@@ -203,7 +203,7 @@ fn audit_archival_nonexistent_dir_fails_gracefully() {
         // Fill log to capacity.
         for _ in 0..3 {
             log.append(
-                AuditEventType::LoginSuccess,
+                AuditEventType::AuthSuccess,
                 vec![Uuid::nil()],
                 vec![],
                 0.1,
@@ -308,7 +308,7 @@ fn audit_chain_recovery_after_truncation() {
         // Append 3 valid entries.
         for i in 0..3 {
             log.append(
-                AuditEventType::LoginSuccess,
+                AuditEventType::AuthSuccess,
                 vec![Uuid::nil()],
                 vec![],
                 0.1 * (i as f64),
@@ -415,7 +415,7 @@ fn audit_single_entry_chain_verifies() {
         let (signing_key, _vk) = crypto::pq_sign::generate_pq_keypair();
         let mut log = AuditLog::new();
         log.append(
-            AuditEventType::LoginSuccess,
+            AuditEventType::AuthSuccess,
             vec![Uuid::nil()],
             vec![],
             0.0,
@@ -477,7 +477,7 @@ fn audit_archival_to_valid_dir_succeeds() {
         // Fill beyond capacity to trigger archival conditions.
         for _ in 0..10 {
             log.append(
-                AuditEventType::LoginSuccess,
+                AuditEventType::AuthSuccess,
                 vec![Uuid::nil()],
                 vec![],
                 0.1,
