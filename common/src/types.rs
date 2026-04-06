@@ -19,6 +19,34 @@ mod byte_array_64 {
     }
 }
 
+// ── Request context for distributed tracing ──────────────────────────
+
+/// Per-request context for distributed tracing across the auth pipeline.
+/// Generated at the gateway and threaded through orchestrator -> OPAQUE -> TSS.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestContext {
+    /// Unique ID for this request, linking all audit entries in a single auth flow.
+    pub correlation_id: Uuid,
+    /// OpenTelemetry-compatible trace ID (hex-encoded 128-bit).
+    pub trace_id: String,
+}
+
+impl RequestContext {
+    /// Generate a new request context with fresh IDs.
+    pub fn new() -> Self {
+        Self {
+            correlation_id: Uuid::new_v4(),
+            trace_id: format!("{:032x}", Uuid::new_v4().as_u128()),
+        }
+    }
+}
+
+impl Default for RequestContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ── Token types (spec B.14) ───────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -183,9 +183,6 @@ impl AuditLog {
             prev_hash: self.last_hash,
             signature: Vec::new(),
             classification: 0,
-            // FIXME(H12): correlation_id and trace_id should be populated by callers
-            // (gateway/orchestrator) from the request context to enable end-to-end
-            // distributed tracing across the authentication pipeline.
             correlation_id: None,
             trace_id: None,
             source_ip: None,
@@ -201,6 +198,51 @@ impl AuditLog {
         self.auto_archive();
         self.enforce_retention();
         // SAFETY: we just pushed an entry, so `last()` is always Some.
+        self.entries.last().unwrap_or_else(|| {
+            tracing::error!("BUG: audit log empty immediately after push");
+            std::process::exit(1);
+        })
+    }
+
+    /// Append an audit entry with distributed tracing context, signed with ML-DSA-87.
+    ///
+    /// Use this when a `RequestContext` is available (gateway/orchestrator paths)
+    /// to populate correlation_id and trace_id for end-to-end tracing.
+    pub fn append_with_context(
+        &mut self,
+        event_type: AuditEventType,
+        user_ids: Vec<Uuid>,
+        device_ids: Vec<Uuid>,
+        risk_score: f64,
+        ceremony_receipts: Vec<Receipt>,
+        signing_key: &crypto::pq_sign::PqSigningKey,
+        ctx: &common::types::RequestContext,
+    ) -> &AuditEntry {
+        let mut entry = AuditEntry {
+            event_id: Uuid::new_v4(),
+            event_type,
+            user_ids,
+            device_ids,
+            ceremony_receipts,
+            risk_score,
+            timestamp: now_us(),
+            prev_hash: self.last_hash,
+            signature: Vec::new(),
+            classification: 0,
+            correlation_id: Some(ctx.correlation_id),
+            trace_id: Some(ctx.trace_id.clone()),
+            source_ip: None,
+            session_id: None,
+            request_id: None,
+            user_agent: None,
+        };
+        let hash = hash_entry(&entry);
+        entry.signature = crypto::pq_sign::pq_sign_raw(signing_key, &hash);
+        self.last_hash = hash;
+        self.entries.push(entry);
+        self.incremental_verify();
+        self.auto_archive();
+        self.enforce_retention();
         self.entries.last().unwrap_or_else(|| {
             tracing::error!("BUG: audit log empty immediately after push");
             std::process::exit(1);
@@ -302,9 +344,6 @@ impl AuditLog {
             prev_hash: self.last_hash,
             signature: Vec::new(),
             classification: 0,
-            // FIXME(H12): correlation_id and trace_id should be populated by callers
-            // (gateway/orchestrator) from the request context to enable end-to-end
-            // distributed tracing across the authentication pipeline.
             correlation_id: None,
             trace_id: None,
             source_ip: None,

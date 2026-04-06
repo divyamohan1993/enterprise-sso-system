@@ -63,3 +63,36 @@ pub fn create_audit_entry(
         user_agent: None,
     }
 }
+
+/// Create an audit entry with distributed tracing context.
+///
+/// Use this from gateway/orchestrator paths where a `RequestContext` is available
+/// to populate correlation_id and trace_id for end-to-end tracing.
+pub fn create_audit_entry_with_context(
+    event_type: AuditEventType,
+    user_ids: Vec<uuid::Uuid>,
+    device_ids: Vec<uuid::Uuid>,
+    source_ip: Option<String>,
+    request_id: Option<String>,
+    ctx: &crate::types::RequestContext,
+) -> AuditEntry {
+    use crate::secure_time::secure_now_us_i64;
+    AuditEntry {
+        event_id: uuid::Uuid::new_v4(),
+        event_type,
+        user_ids,
+        device_ids,
+        ceremony_receipts: Vec::new(),
+        risk_score: 0.0,
+        classification: 0,
+        timestamp: secure_now_us_i64(),
+        prev_hash: [0u8; 64],
+        signature: Vec::new(),
+        correlation_id: Some(ctx.correlation_id),
+        trace_id: Some(ctx.trace_id.clone()),
+        source_ip,
+        session_id: None,
+        request_id,
+        user_agent: None,
+    }
+}

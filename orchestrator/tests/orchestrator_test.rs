@@ -235,6 +235,8 @@ async fn orchestrator_processes_auth() {
         recent_failed_attempts: None,
         device_fingerprint: None,
         source_ip: None,
+        correlation_id: None,
+        trace_id: None,
     };
 
     let response = service.process_auth(&request).await;
@@ -377,6 +379,8 @@ async fn orchestrator_handles_opaque_failure() {
         recent_failed_attempts: None,
         device_fingerprint: None,
         source_ip: None,
+        correlation_id: None,
+        trace_id: None,
     };
 
     let response = service.process_auth(&request).await;

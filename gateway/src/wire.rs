@@ -109,6 +109,12 @@ pub struct OrchestratorRequest {
     pub device_fingerprint: Option<String>,
     #[serde(default)]
     pub source_ip: Option<String>,
+    /// Correlation ID from the gateway's RequestContext for distributed tracing.
+    #[serde(default)]
+    pub correlation_id: Option<uuid::Uuid>,
+    /// OpenTelemetry-compatible trace ID (hex-encoded 128-bit) for distributed tracing.
+    #[serde(default)]
+    pub trace_id: Option<String>,
 }
 
 /// SECURITY: Redact password and zeroize on drop.
@@ -281,6 +287,8 @@ mod tests {
             recent_failed_attempts: None,
             device_fingerprint: None,
             source_ip: None,
+            correlation_id: None,
+            trace_id: None,
         };
         let debug_str = format!("{:?}", req);
         assert!(debug_str.contains("REDACTED"));
@@ -308,6 +316,8 @@ mod tests {
             recent_failed_attempts: None,
             device_fingerprint: None,
             source_ip: None,
+            correlation_id: None,
+            trace_id: None,
         };
         // Drop triggers zeroize. No panic = success.
         drop(req);
@@ -330,6 +340,8 @@ mod tests {
             recent_failed_attempts: Some(2),
             device_fingerprint: Some("fp-abc123".into()),
             source_ip: Some("10.0.0.1".into()),
+            correlation_id: None,
+            trace_id: None,
         };
         let bytes = postcard::to_allocvec(&req).expect("serialize OrchestratorRequest");
         let recovered: OrchestratorRequest =
@@ -381,6 +393,8 @@ mod tests {
             recent_failed_attempts: None,
             device_fingerprint: None,
             source_ip: None,
+            correlation_id: None,
+            trace_id: None,
         };
         let bytes = postcard::to_allocvec(&req).unwrap();
         let recovered: OrchestratorRequest = postcard::from_bytes(&bytes).unwrap();

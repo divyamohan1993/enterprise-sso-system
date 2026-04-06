@@ -750,6 +750,16 @@ async fn handle_connection(
     common::error_response::log_crypto_operation("decrypt_frame", "AES-256-GCM", "session_key");
     common::error_response::verbose_log("gateway", "auth request decrypted and deserialized");
 
+    // Generate distributed tracing context for this auth request.
+    // This correlation_id threads through orchestrator -> OPAQUE -> TSS
+    // and appears in all audit entries for end-to-end tracing.
+    let req_ctx = common::types::RequestContext::new();
+    tracing::info!(
+        correlation_id = %req_ctx.correlation_id,
+        trace_id = %req_ctx.trace_id,
+        "processing auth request"
+    );
+
     // 7. Forward to orchestrator via SHARD (or stub if not configured).
     //    The timing floor is measured from auth_start to cover the entire
     //    authentication path including username lookup, OPAQUE processing,
@@ -769,7 +779,7 @@ async fn handle_connection(
                 error: Some("service temporarily unavailable (circuit breaker open)".into()),
             }
         } else {
-        match forward_to_orchestrator(&auth_req, &orch, client_binding_hash).await {
+        match forward_to_orchestrator(&auth_req, &orch, client_binding_hash, &req_ctx).await {
             Ok(r) => {
                 orch_breaker.record_success();
                 r
@@ -827,6 +837,7 @@ async fn forward_to_orchestrator(
     auth_req: &AuthRequest,
     config: &OrchestratorConfig,
     client_binding_hash: [u8; 64],
+    req_ctx: &common::types::RequestContext,
 ) -> Result<AuthResponse, String> {
     let orch_req = OrchestratorRequest {
         username: auth_req.username.clone(),
@@ -843,6 +854,8 @@ async fn forward_to_orchestrator(
         recent_failed_attempts: None,
         device_fingerprint: None,
         source_ip: None,
+        correlation_id: Some(req_ctx.correlation_id),
+        trace_id: Some(req_ctx.trace_id.clone()),
     };
 
     let req_bytes = postcard::to_allocvec(&orch_req)

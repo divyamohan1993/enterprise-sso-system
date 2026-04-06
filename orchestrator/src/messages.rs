@@ -53,6 +53,12 @@ pub struct OrchestratorRequest {
     /// Source IP address for impossible-travel and cross-user correlation.
     #[serde(default)]
     pub source_ip: Option<String>,
+    /// Correlation ID from the gateway's RequestContext for distributed tracing.
+    #[serde(default)]
+    pub correlation_id: Option<uuid::Uuid>,
+    /// OpenTelemetry-compatible trace ID (hex-encoded 128-bit) for distributed tracing.
+    #[serde(default)]
+    pub trace_id: Option<String>,
 }
 
 /// Response from the Orchestrator to the Gateway.

@@ -415,6 +415,21 @@ impl OrchestratorService {
 
     /// Process a single authentication request end-to-end.
     pub async fn process_auth(&self, request: &OrchestratorRequest) -> OrchestratorResponse {
+        // Reconstruct tracing context from gateway-provided correlation/trace IDs,
+        // or generate a fresh one if the gateway didn't supply them.
+        let req_ctx = match (request.correlation_id, request.trace_id.as_ref()) {
+            (Some(cid), Some(tid)) => common::types::RequestContext {
+                correlation_id: cid,
+                trace_id: tid.clone(),
+            },
+            _ => common::types::RequestContext::new(),
+        };
+        tracing::info!(
+            correlation_id = %req_ctx.correlation_id,
+            trace_id = %req_ctx.trace_id,
+            "orchestrator processing auth request"
+        );
+
         match self.process_auth_inner(request).await {
             Ok(token_bytes) => {
                 // Emit SIEM event for successful authentication
@@ -429,12 +444,13 @@ impl OrchestratorService {
                 };
                 common::siem::SecurityEvent::auth_success(user_uuid, None);
                 common::audit_bridge::buffer_audit_entry(
-                    common::audit_bridge::create_audit_entry(
+                    common::audit_bridge::create_audit_entry_with_context(
                         common::types::AuditEventType::AuthSuccess,
                         vec![user_uuid],
                         Vec::new(),
                         None,
                         None,
+                        &req_ctx,
                     ),
                 );
                 OrchestratorResponse {
@@ -462,12 +478,13 @@ impl OrchestratorService {
                     &e,
                 );
                 common::audit_bridge::buffer_audit_entry(
-                    common::audit_bridge::create_audit_entry(
+                    common::audit_bridge::create_audit_entry_with_context(
                         common::types::AuditEventType::AuthFailure,
                         vec![user_id],
                         Vec::new(),
                         None,
                         None,
+                        &req_ctx,
                     ),
                 );
 

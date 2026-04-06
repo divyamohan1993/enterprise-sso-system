@@ -280,6 +280,8 @@ fn test_wire_orchestrator_request_serialization() {
         recent_failed_attempts: Some(3),
         device_fingerprint: Some("test-device-fp".into()),
         source_ip: Some("10.0.0.1".into()),
+        correlation_id: None,
+        trace_id: None,
     };
     let bytes = postcard::to_allocvec(&req).unwrap();
     let decoded: OrchestratorRequest = postcard::from_bytes(&bytes).unwrap();

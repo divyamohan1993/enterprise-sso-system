@@ -262,6 +262,8 @@ fn oversized_payload_in_orchestrator_request() {
         recent_failed_attempts: None,
         device_fingerprint: None,
         source_ip: None,
+        correlation_id: None,
+        trace_id: None,
     };
 
     // The request serializes fine, but the server should reject the username length
@@ -508,6 +510,8 @@ fn orchestrator_request_debug_redacts_password() {
         recent_failed_attempts: None,
         device_fingerprint: None,
         source_ip: None,
+        correlation_id: None,
+        trace_id: None,
     };
     let debug_str = format!("{:?}", req);
     assert!(

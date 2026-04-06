@@ -309,6 +309,8 @@ fn orchestrator_request_serialization_roundtrip() {
         recent_failed_attempts: Some(2),
         device_fingerprint: Some("chrome-linux-x64".into()),
         source_ip: Some("10.0.0.1".into()),
+        correlation_id: None,
+        trace_id: None,
     };
 
     let bytes = postcard::to_allocvec(&request).expect("serialize");
@@ -370,6 +372,8 @@ fn orchestrator_request_default_fields() {
         recent_failed_attempts: None,
         device_fingerprint: None,
         source_ip: None,
+        correlation_id: None,
+        trace_id: None,
     };
 
     let bytes = postcard::to_allocvec(&minimal).expect("serialize");

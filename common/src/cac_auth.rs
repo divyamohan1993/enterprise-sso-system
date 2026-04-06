@@ -324,7 +324,64 @@ impl CacAuthenticator {
         // Fall back to CRL check if OCSP is unavailable or not configured.
         if !self.config.crl_distribution_points.is_empty() {
             tracing::debug!("attempting CRL-based revocation check");
-            // CRL fetch not yet implemented; fall through to OcspUnavailable.
+            let mut checker = crate::ocsp_crl::RevocationChecker::new(
+                crate::ocsp_crl::OcspConfig::default(),
+                crate::ocsp_crl::CrlConfig {
+                    distribution_points: self.config.crl_distribution_points.clone(),
+                    fail_closed: is_military_deployment(),
+                    ..Default::default()
+                },
+            );
+            // Attempt to load CRL from each distribution point
+            let mut any_loaded = false;
+            for dp_url in &self.config.crl_distribution_points {
+                match checker.load_crl_from_distribution_point(dp_url) {
+                    Ok(count) => {
+                        tracing::info!(
+                            dp_url = %dp_url,
+                            loaded = count,
+                            "CRL distribution point loaded for CAC revocation check"
+                        );
+                        any_loaded = true;
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            dp_url = %dp_url,
+                            error = %e,
+                            "CRL distribution point fetch failed, trying next"
+                        );
+                    }
+                }
+            }
+            if any_loaded {
+                // Extract serial number from cert DER for CRL lookup.
+                // Serial is a u64 derived from the first 8 bytes of the cert hash
+                // (sufficient for CRL serial matching in the RevocationChecker).
+                let serial = extract_cert_serial_u64(cert_der);
+                let crl_status = checker.check_crl(serial);
+                match crl_status {
+                    crate::ocsp_crl::RevocationStatus::Good => {
+                        tracing::debug!("CRL check confirms certificate is not revoked");
+                        return Ok(RevocationStatus::Good);
+                    }
+                    crate::ocsp_crl::RevocationStatus::Revoked { reason, revoked_at } => {
+                        tracing::error!(
+                            reason = %reason,
+                            revoked_at = revoked_at,
+                            "CRL check confirms certificate is REVOKED"
+                        );
+                        SecurityEvent::certificate_validation_failed(
+                            "CRL",
+                            &format!("certificate revoked: {}", reason),
+                        );
+                        return Ok(RevocationStatus::Revoked { reason, revoked_at });
+                    }
+                    _ => {
+                        tracing::warn!("CRL check returned indeterminate status");
+                    }
+                }
+            }
         }
 
         Ok(RevocationStatus::OcspUnavailable)
@@ -660,6 +717,116 @@ fn verify_ocsp_signature(response_der: &[u8], trusted_ca_certs: &[Vec<u8>]) -> b
 /// Returns `true` if `MILNET_MILITARY_DEPLOYMENT=1` is set.
 fn is_military_deployment() -> bool {
     std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1")
+}
+
+/// Extract a u64 serial number from a DER-encoded X.509 certificate.
+///
+/// Parses the TBSCertificate to find the serialNumber INTEGER field.
+/// If parsing fails, falls back to a SHA-256 hash of the cert DER
+/// truncated to 8 bytes, which is collision-resistant enough for CRL lookup.
+fn extract_cert_serial_u64(cert_der: &[u8]) -> u64 {
+    // Try to parse the DER structure:
+    // Certificate SEQUENCE -> TBSCertificate SEQUENCE -> [version], serialNumber INTEGER
+    if cert_der.len() < 20 || cert_der[0] != 0x30 {
+        return hash_based_serial(cert_der);
+    }
+
+    // Skip outer SEQUENCE tag + length
+    let outer_skip = match der_skip_tag_length(cert_der) {
+        Some(s) => s,
+        None => return hash_based_serial(cert_der),
+    };
+
+    // TBSCertificate should start with SEQUENCE (0x30)
+    let tbs = &cert_der[outer_skip..];
+    if tbs.is_empty() || tbs[0] != 0x30 {
+        return hash_based_serial(cert_der);
+    }
+    let tbs_skip = match der_skip_tag_length(tbs) {
+        Some(s) => s,
+        None => return hash_based_serial(cert_der),
+    };
+    let tbs_content = &tbs[tbs_skip..];
+
+    let mut pos = 0;
+    // Skip optional version [0] EXPLICIT tag
+    if !tbs_content.is_empty() && tbs_content[0] == 0xA0 {
+        pos = match der_element_total_len(&tbs_content[pos..]) {
+            Some(len) => len,
+            None => return hash_based_serial(cert_der),
+        };
+    }
+
+    // Next should be INTEGER (tag 0x02) = serialNumber
+    if pos >= tbs_content.len() || tbs_content[pos] != 0x02 {
+        return hash_based_serial(cert_der);
+    }
+    let int_header = match der_skip_tag_length(&tbs_content[pos..]) {
+        Some(s) => s,
+        None => return hash_based_serial(cert_der),
+    };
+    let int_total = match der_element_total_len(&tbs_content[pos..]) {
+        Some(t) => t,
+        None => return hash_based_serial(cert_der),
+    };
+    let serial_bytes = &tbs_content[pos + int_header..pos + int_total];
+
+    // Convert serial bytes to u64 (take last 8 bytes if longer)
+    let mut result: u64 = 0;
+    let start = if serial_bytes.len() > 8 { serial_bytes.len() - 8 } else { 0 };
+    for &b in &serial_bytes[start..] {
+        result = (result << 8) | (b as u64);
+    }
+    result
+}
+
+/// Fallback serial: SHA-256 hash of cert DER truncated to u64.
+fn hash_based_serial(cert_der: &[u8]) -> u64 {
+    use sha2::{Sha256, Digest};
+    let hash = Sha256::digest(cert_der);
+    u64::from_be_bytes([hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7]])
+}
+
+/// Skip a DER tag + length, returning the offset where content starts.
+fn der_skip_tag_length(data: &[u8]) -> Option<usize> {
+    if data.len() < 2 {
+        return None;
+    }
+    let len_byte = data[1];
+    if len_byte < 0x80 {
+        Some(2)
+    } else if len_byte == 0x80 {
+        None // indefinite length not supported
+    } else {
+        let num_bytes = (len_byte & 0x7F) as usize;
+        if num_bytes > 4 || data.len() < 2 + num_bytes {
+            return None;
+        }
+        Some(2 + num_bytes)
+    }
+}
+
+/// Total length of a DER element (tag + length + content).
+fn der_element_total_len(data: &[u8]) -> Option<usize> {
+    if data.len() < 2 {
+        return None;
+    }
+    let len_byte = data[1];
+    if len_byte < 0x80 {
+        Some(2 + len_byte as usize)
+    } else if len_byte == 0x80 {
+        None
+    } else {
+        let num_bytes = (len_byte & 0x7F) as usize;
+        if num_bytes > 4 || data.len() < 2 + num_bytes {
+            return None;
+        }
+        let mut content_len: usize = 0;
+        for i in 0..num_bytes {
+            content_len = (content_len << 8) | (data[2 + i] as usize);
+        }
+        Some(2 + num_bytes + content_len)
+    }
 }
 
 /// Enforce fail-closed revocation policy.

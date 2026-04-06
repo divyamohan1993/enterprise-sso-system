@@ -821,7 +821,8 @@ impl AuthnRequest {
     /// 3. DigestValue verification over the referenced element
     /// 4. SignatureValue verification using the SP's public key
     ///
-    /// NOTE: CRL/OCSP revocation checking is stubbed — see TODO below.
+    /// Revocation checking: CRL cache (Tier 1), OCSP staple (Tier 2),
+    /// CRL distribution point fetch (Tier 3), fail-closed deny (Tier 4).
     pub fn validate_signature(&self, sp_cert_pem: &str) -> Result<(), String> {
         self.validate_signature_with_xml(sp_cert_pem, None)
     }
@@ -3400,22 +3401,64 @@ pub fn check_certificate_revocation(cert_der: &[u8]) -> Result<RevocationStatus,
     }
 
     // --- Tier 3: CRL distribution point fetch ---
-    // In a production deployment, this would:
-    //   1. Extract the CRL Distribution Points extension (OID 2.5.29.31)
-    //   2. HTTP GET the CRL from the distribution point URL
-    //   3. Parse the CRL and update the cache
-    //   4. Re-check the serial number
-    //
-    // Since network I/O is not available in this synchronous context,
-    // we apply the fail-closed policy: if the CRL cache is stale and
-    // no OCSP staple is available, revocation status is Unknown.
+    // Extract CRL Distribution Points from the certificate (OID 2.5.29.31),
+    // fetch the CRL over HTTP, parse it, update the cache, and re-check.
+    let dp_urls = extract_crl_distribution_points(cert_der);
+    if !dp_urls.is_empty() {
+        for dp_url in &dp_urls {
+            tracing::info!("Fetching CRL from distribution point: {}", dp_url);
+            match fetch_crl_from_distribution_point(dp_url) {
+                Ok(crl_der_bytes) => {
+                    let mut cache = CRL_CACHE.write().map_err(|e| format!("CRL cache write lock poisoned: {}", e))?;
+                    if let Err(e) = cache.update_from_crl_bytes(&crl_der_bytes) {
+                        tracing::warn!("Failed to parse CRL from {}: {}", dp_url, e);
+                        continue;
+                    }
+                    tracing::info!(
+                        "CRL updated from distribution point {}: {} revoked certs",
+                        dp_url,
+                        cache.revoked_count()
+                    );
+                    // Re-check the serial against the freshly updated cache
+                    if let Some(status) = cache.is_revoked(&serial) {
+                        tracing::error!(
+                            "Certificate serial {:?} found REVOKED in fresh CRL from {}",
+                            hex_encode(&serial),
+                            dp_url
+                        );
+                        return Ok(status);
+                    }
+                    // Serial not in fresh CRL = certificate is good
+                    tracing::debug!(
+                        "Certificate serial {:?} not in fresh CRL from {} -- GOOD",
+                        hex_encode(&serial),
+                        dp_url
+                    );
+                    return Ok(RevocationStatus::Good);
+                }
+                Err(e) => {
+                    tracing::warn!("CRL fetch from {} failed: {}", dp_url, e);
+                    continue;
+                }
+            }
+        }
+        // All distribution points failed
+        tracing::error!(
+            "All {} CRL distribution points unreachable for serial {:?}",
+            dp_urls.len(),
+            hex_encode(&serial)
+        );
+    } else {
+        tracing::debug!("No CRL distribution points found in certificate");
+    }
+
+    // --- Tier 4: Fail-closed ---
+    // CRL cache stale, no OCSP staple, CRL distribution points unreachable or absent.
     tracing::warn!(
-        "SECURITY: CRL cache stale and no OCSP staple available — DENYING certificate \
-         (fail-closed) for serial {:?}. This is a HARD DENY, not a warning.",
+        "SECURITY: CRL cache stale, OCSP unavailable, CRL DPs exhausted -- DENYING certificate \
+         (fail-closed) for serial {:?}. This is a HARD DENY.",
         hex_encode(&serial)
     );
-
-    // FAIL-CLOSED: Cannot determine revocation status = Unknown = DENY
     Ok(RevocationStatus::Unknown)
 }
 
@@ -3455,6 +3498,153 @@ fn extract_cert_serial(cert_der: &[u8]) -> Result<Vec<u8>, String> {
 /// Encode bytes as lowercase hex string (for logging).
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// CRL Distribution Points OID: 2.5.29.31
+/// DER encoding: 06 03 55 1D 1F
+const CRL_DP_OID: [u8; 5] = [0x06, 0x03, 0x55, 0x1D, 0x1F];
+
+/// Extract CRL Distribution Point URLs from a DER-encoded X.509 certificate.
+///
+/// Scans the certificate extensions for the CRL Distribution Points extension
+/// (OID 2.5.29.31) and extracts HTTP/HTTPS URLs from the DistributionPoint
+/// GeneralName entries.
+///
+/// Returns an empty Vec if no CRL distribution points are found.
+fn extract_crl_distribution_points(cert_der: &[u8]) -> Vec<String> {
+    let mut urls = Vec::new();
+
+    // Scan for the CRL DP OID in the certificate DER.
+    // When found, the value after the OID + OCTET STRING wrapper contains
+    // the CRLDistributionPoints SEQUENCE.
+    for i in 0..cert_der.len().saturating_sub(CRL_DP_OID.len()) {
+        if cert_der[i..].starts_with(&CRL_DP_OID) {
+            // Found the OID. Skip past it to find the extension value.
+            let after_oid = i + CRL_DP_OID.len();
+            // Walk forward looking for URLs in the extension value.
+            // URLs appear as context-tagged [6] IA5String (tag 0x86) in
+            // GeneralName within DistributionPointName.
+            let remaining = &cert_der[after_oid..];
+            extract_urls_from_dp_extension(remaining, &mut urls);
+            break;
+        }
+    }
+
+    urls
+}
+
+/// Extract HTTP/HTTPS URLs from a CRL Distribution Points extension value.
+///
+/// Scans for context-specific tag [6] (uniformResourceIdentifier) which
+/// encodes IA5String URLs within GeneralName entries.
+fn extract_urls_from_dp_extension(data: &[u8], urls: &mut Vec<String>) {
+    // Tag 0x86 = context-specific [6] IMPLICIT IA5String (uniformResourceIdentifier)
+    let mut pos = 0;
+    while pos < data.len().saturating_sub(2) {
+        if data[pos] == 0x86 {
+            // Parse length
+            let len_start = pos + 1;
+            if len_start >= data.len() {
+                break;
+            }
+            let (len_bytes, content_len) = match rev_parse_der_length(&data[len_start..]) {
+                Ok(v) => v,
+                Err(_) => { pos += 1; continue; }
+            };
+            let content_start = len_start + len_bytes;
+            let content_end = content_start + content_len;
+            if content_end > data.len() || content_len == 0 || content_len > 2048 {
+                pos += 1;
+                continue;
+            }
+            if let Ok(url) = std::str::from_utf8(&data[content_start..content_end]) {
+                let url = url.trim();
+                if url.starts_with("http://") || url.starts_with("https://") {
+                    urls.push(url.to_string());
+                }
+            }
+            pos = content_end;
+        } else {
+            pos += 1;
+        }
+    }
+}
+
+/// Fetch a CRL from a distribution point URL via HTTP.
+///
+/// Performs a synchronous HTTP GET with a 10-second timeout.
+/// Returns the raw CRL DER bytes from the response body.
+fn fetch_crl_from_distribution_point(url: &str) -> Result<Vec<u8>, String> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let host_port = url
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .split('/')
+        .next()
+        .unwrap_or(url);
+
+    let addr = if host_port.contains(':') {
+        host_port.to_string()
+    } else {
+        format!("{}:80", host_port)
+    };
+
+    let path_start = url
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .find('/')
+        .map(|i| {
+            let stripped = url.trim_start_matches("http://").trim_start_matches("https://");
+            &stripped[i..]
+        })
+        .unwrap_or("/");
+
+    let timeout = std::time::Duration::from_secs(10);
+    let parsed_addr: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|e| format!("invalid CRL DP address '{}': {}", addr, e))?;
+    let stream = TcpStream::connect_timeout(&parsed_addr, timeout)
+        .map_err(|e| format!("CRL DP connect to {}: {}", addr, e))?;
+    stream.set_read_timeout(Some(timeout)).ok();
+    stream.set_write_timeout(Some(timeout)).ok();
+    let mut stream = stream;
+
+    let request = format!(
+        "GET {} HTTP/1.0\r\nHost: {}\r\nAccept: application/pkix-crl\r\nConnection: close\r\n\r\n",
+        path_start, host_port
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("CRL DP write to {}: {}", url, e))?;
+
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .map_err(|e| format!("CRL DP read from {}: {}", url, e))?;
+
+    // Split HTTP headers from body
+    let header_end = response
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
+        .unwrap_or(0);
+
+    let body = &response[header_end..];
+    if body.is_empty() {
+        return Err(format!("CRL DP {} returned empty body", url));
+    }
+
+    // Validate the body starts with a DER SEQUENCE tag (0x30) for a CRL
+    if body[0] != 0x30 {
+        return Err(format!(
+            "CRL DP {} returned non-DER data (first byte 0x{:02X}, expected 0x30)",
+            url, body[0]
+        ));
+    }
+
+    Ok(body.to_vec())
 }
 
 /// Strip XML comments (`<!-- ... -->`) from an XML string.
