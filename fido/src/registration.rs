@@ -300,40 +300,41 @@ impl PersistentCredentialStore {
 
     /// Load all credentials from the database into the in-memory cache.
     async fn load_from_db(&mut self) -> Result<(), String> {
-        let rows: Vec<(Vec<u8>, Vec<u8>, Uuid, i32, String)> = sqlx::query_as(
+        let rows = sqlx::query(
             "SELECT credential_id, public_key, user_id, sign_count, authenticator_type \
              FROM fido_credentials"
         )
         .fetch_all(&self.pool.pool)
         .await
         .map_err(|e| {
-            common::siem::emit_runtime_error(
-                common::siem::category::RUNTIME_ERROR,
-                &format!("Failed to load FIDO credentials from DB: {e}. Degrading to in-memory only."),
-                "fido_credentials load failed",
-                file!(), line!(), column!(), module_path!(),
+            tracing::error!(
+                target: "siem",
+                "SIEM:ERROR Failed to load FIDO credentials from DB: {e}. Degrading to in-memory only."
             );
             format!("load fido_credentials: {e}")
         })?;
 
-        for (cred_id_enc, pubkey_enc, user_id, sign_count, auth_type) in rows {
-            // Decrypt credential_id (stored as-is, not sensitive)
-            // Public key is encrypted via EncryptedPool
+        for row in rows {
+            use sqlx::Row;
+            let cred_id_enc: Vec<u8> = row.get("credential_id");
+            let pubkey_enc: Vec<u8> = row.get("public_key");
+            let user_id: Uuid = row.get("user_id");
+            let sign_count: i32 = row.get("sign_count");
+            let auth_type: String = row.get("authenticator_type");
+
             let pubkey = self.pool.decrypt_field(
                 "fido_credentials", "public_key", &cred_id_enc, &pubkey_enc,
             ).unwrap_or_else(|e| {
-                common::siem::emit_runtime_error(
-                    common::siem::category::CRYPTO_FAILURE,
-                    &format!("Failed to decrypt FIDO credential public key: {e}"),
-                    "fido credential decryption failed",
-                    file!(), line!(), column!(), module_path!(),
+                tracing::error!(
+                    target: "siem",
+                    "SIEM:ERROR Failed to decrypt FIDO credential public key: {e}"
                 );
                 Vec::new()
             });
 
             if !pubkey.is_empty() {
                 self.memory.store_credential(StoredCredential {
-                    credential_id: cred_id_enc,
+                    credential_id: cred_id_enc.to_vec(),
                     public_key: pubkey,
                     user_id,
                     sign_count: sign_count as u32,

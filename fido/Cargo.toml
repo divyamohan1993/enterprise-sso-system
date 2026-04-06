@@ -17,6 +17,7 @@ rand.workspace = true
 p256 = { version = "0.13", features = ["ecdsa"] }
 signature = "2"
 tracing.workspace = true
+sqlx.workspace = true
 
 [features]
 default = ["production"]
