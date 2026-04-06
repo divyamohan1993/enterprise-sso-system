@@ -24,7 +24,7 @@ use crypto::envelope::{
 };
 use crypto::pq_sign::{generate_pq_keypair, pq_sign_raw, pq_verify_raw};
 use crypto::receipts::{hash_receipt, sign_receipt, ReceiptChain};
-use crypto::threshold::{dkg, threshold_sign};
+use crypto::threshold::{dkg, threshold_sign, verify_group_signature};
 use crypto::xwing::{xwing_decapsulate, xwing_encapsulate, xwing_keygen, Ciphertext, XWingKeyPair};
 use ratchet::chain::RatchetChain;
 use shard::protocol::ShardProtocol;
@@ -1374,10 +1374,9 @@ fn certificate_substitution_different_ca_rejected() {
 fn frost_signature_cannot_verify_as_mldsa87() {
     run_with_large_stack(|| {
         let mut dkg_result = dkg(5, 3).expect("DKG");
-        let shares = &mut dkg_result.shares[..3];
         let message = b"cross-algorithm confusion test";
 
-        let frost_sig = threshold_sign(&mut shares, &dkg_result.group, message, 3)
+        let frost_sig = threshold_sign(&mut dkg_result.shares[..3], &dkg_result.group, message, 3)
             .expect("FROST sign");
 
         // Try to verify the FROST signature as if it were ML-DSA-87
