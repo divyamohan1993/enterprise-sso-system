@@ -1003,12 +1003,14 @@ mod tests {
 
     #[test]
     fn overflow_archival_respects_max_entries() {
-        std::env::set_var("MILNET_TESTING_SINGLE_KEK_ACK", "1");
         let dir = std::env::temp_dir().join(format!("audit_overflow_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
 
         let signing_key = test_signing_key();
         let mut log = AuditLog::new_with_limits(5, Some(dir.to_str().unwrap().to_string()));
+        // Provide explicit archive KEK so archival never calls get_master_kek()
+        // (which requires threshold KEK infrastructure not available in unit tests).
+        log.retention_policy.archive_encryption_kek = Some([0xAB; 32]);
 
         // Add 10 entries — should trigger overflow archival at max_entries=5
         for _ in 0..10 {
