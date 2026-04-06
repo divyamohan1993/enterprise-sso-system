@@ -215,11 +215,11 @@ async fn gateway_challenge_contains_fingerprint() {
     let _ = server_handle.await;
 }
 
-/// Helper to compute X-Wing PK fingerprint (mirrors server implementation).
+/// Helper to compute X-Wing PK fingerprint (mirrors server implementation, CNSA 2.0: SHA-512).
 fn compute_fingerprint(pk_bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(b"MILNET-XWING-PIN-v1");
+    use sha2::{Digest, Sha512};
+    let mut hasher = Sha512::new();
+    hasher.update(b"MILNET-XWING-PIN-v2");
     hasher.update(pk_bytes);
     hex::encode(hasher.finalize())
 }

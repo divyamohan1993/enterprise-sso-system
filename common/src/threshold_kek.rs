@@ -561,13 +561,27 @@ impl ThresholdKekManager {
         // Store the reconstructed KEK
         self.reconstructed_kek = Some(ReconstructedKek { key });
 
+        // SECURITY: Use HMAC with a per-boot random key for fingerprinting instead of
+        // bare SHA-512(KEK). A bare hash enables brute-force verification and cross-boot
+        // KEK identity correlation from captured logs.
+        let fp = {
+            let mut boot_key = [0u8; 32];
+            let _ = getrandom::getrandom(&mut boot_key);
+            let mut mac = HmacSha512::new_from_slice(&boot_key)
+                .expect("HMAC accepts any key length");
+            mac.update(&key);
+            let result = mac.finalize().into_bytes();
+            boot_key.zeroize();
+            hex::encode(&result[..8])
+        };
         tracing::info!(
             shares_used = self.config.threshold,
-            fingerprint = %hex::encode(&Sha512::digest(&key)[..8]),
-            "MasterKEK reconstructed from threshold shares (shares zeroized)"
+            fingerprint = %fp,
+            "MasterKEK reconstructed from threshold shares (shares zeroized, fingerprint is per-boot HMAC)"
         );
 
-        Ok(&self.reconstructed_kek.as_ref().unwrap().key)
+        Ok(&self.reconstructed_kek.as_ref()
+            .expect("KEK reconstruction just succeeded above").key)
     }
 
     /// Get the reconstructed KEK (if available).

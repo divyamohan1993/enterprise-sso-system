@@ -519,8 +519,8 @@ impl PersistentRefreshTokenStore {
     pub async fn issue(&mut self, user_id: Uuid, client_id: &str, scope: &str) -> Result<String, String> {
         let token_value = self.memory.issue(user_id, client_id, scope);
         let token_hash = {
-            use sha2::{Digest, Sha256};
-            hex::encode(Sha256::digest(token_value.as_bytes()))
+            use sha2::{Digest, Sha512};
+            hex::encode(Sha512::digest(token_value.as_bytes()))
         };
 
         let rt = self.memory.tokens.get(&token_value).cloned()
@@ -554,8 +554,8 @@ impl PersistentRefreshTokenStore {
 
         // Mark old token as used in DB
         let old_hash = {
-            use sha2::{Digest, Sha256};
-            hex::encode(Sha256::digest(token.as_bytes()))
+            use sha2::{Digest, Sha512};
+            hex::encode(Sha512::digest(token.as_bytes()))
         };
         sqlx::query("UPDATE refresh_tokens SET used = TRUE WHERE token_hash = $1")
             .bind(&old_hash)
@@ -563,10 +563,10 @@ impl PersistentRefreshTokenStore {
             .await
             .map_err(|e| format!("mark token used in DB: {e}"))?;
 
-        // Insert new rotated token into DB
+        // Insert new rotated token into DB (CNSA 2.0: SHA-512)
         let new_hash = {
-            use sha2::{Digest, Sha256};
-            hex::encode(Sha256::digest(new_token.as_bytes()))
+            use sha2::{Digest, Sha512};
+            hex::encode(Sha512::digest(new_token.as_bytes()))
         };
         if let Some(new_rt) = self.memory.tokens.get(&new_token) {
             sqlx::query(

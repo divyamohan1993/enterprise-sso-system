@@ -40,13 +40,13 @@ fn generate_csrf_session_cookie() -> String {
     hex::encode(bytes)
 }
 
-/// Generate a CSRF token using HMAC-SHA256 over (session_state + cookie_value + timestamp + nonce).
+/// Generate a CSRF token using HMAC-SHA512 over (session_state + cookie_value + timestamp + nonce) (CNSA 2.0).
 /// The token encodes: timestamp:nonce:hmac_hex
 /// `cookie_value` is the `__Host-csrf-session` cookie bound to this CSRF token.
 fn generate_csrf_token(session_state: &str, api_key: &str, cookie_value: &str) -> String {
     use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-    type HmacSha256 = Hmac<Sha256>;
+    use sha2::Sha512;
+    type HmacSha512 = Hmac<Sha512>;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -56,8 +56,8 @@ fn generate_csrf_token(session_state: &str, api_key: &str, cookie_value: &str) -
     let nonce_hex = hex::encode(nonce);
 
     let payload = format!("{}:{}:{}:{}", session_state, cookie_value, now, nonce_hex);
-    let mut mac = HmacSha256::new_from_slice(api_key.as_bytes())
-        .unwrap_or_else(|_| { tracing::error!("FATAL: HMAC-SHA256 key init failed"); std::process::exit(1) });
+    let mut mac = HmacSha512::new_from_slice(api_key.as_bytes())
+        .unwrap_or_else(|_| { tracing::error!("FATAL: HMAC-SHA512 key init failed"); std::process::exit(1) });
     mac.update(payload.as_bytes());
     let sig = hex::encode(mac.finalize().into_bytes());
 
@@ -74,8 +74,8 @@ const CSRF_TOKEN_TTL_SECS: u64 = 60;
 /// and mark the token as used via `check_and_mark_csrf_used()`.
 fn validate_csrf_token(token: &str, session_state: &str, api_key: &str, cookie_value: &str) -> bool {
     use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-    type HmacSha256 = Hmac<Sha256>;
+    use sha2::Sha512;
+    type HmacSha512 = Hmac<Sha512>;
 
     let parts: Vec<&str> = token.splitn(3, ':').collect();
     if parts.len() != 3 {
@@ -101,10 +101,10 @@ fn validate_csrf_token(token: &str, session_state: &str, api_key: &str, cookie_v
         return false;
     }
 
-    // Recompute HMAC (includes cookie value for session binding)
+    // Recompute HMAC-SHA512 (includes cookie value for session binding, CNSA 2.0)
     let payload = format!("{}:{}:{}:{}", session_state, cookie_value, timestamp, nonce_hex);
-    let mut mac = HmacSha256::new_from_slice(api_key.as_bytes())
-        .unwrap_or_else(|_| { tracing::error!("FATAL: HMAC-SHA256 key init failed"); std::process::exit(1) });
+    let mut mac = HmacSha512::new_from_slice(api_key.as_bytes())
+        .unwrap_or_else(|_| { tracing::error!("FATAL: HMAC-SHA512 key init failed"); std::process::exit(1) });
     mac.update(payload.as_bytes());
     let expected_sig = hex::encode(mac.finalize().into_bytes());
 
@@ -1836,6 +1836,16 @@ pub struct RegisterUserRequest {
     pub tier: Option<u8>,  // 1=Sovereign, 2=Operational, 3=Sensor, 4=Emergency. Default: 2
 }
 
+impl std::fmt::Debug for RegisterUserRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegisterUserRequest")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field("tier", &self.tier)
+            .finish()
+    }
+}
+
 impl Drop for RegisterUserRequest {
     fn drop(&mut self) {
         use zeroize::Zeroize;
@@ -3442,10 +3452,10 @@ async fn auth_logout(
     }
     db_delete_opaque_token(&state.db, &token).await;
 
-    // Add token hash to revocation list
+    // Add token hash to revocation list (CNSA 2.0: SHA-512)
     {
         use sha2::Digest;
-        let hash = sha2::Sha256::digest(token.as_bytes());
+        let hash = sha2::Sha512::digest(token.as_bytes());
         let mut token_id = [0u8; 16];
         token_id.copy_from_slice(&hash[..16]);
         let mut revocation = state.revocation_list.write().await;
@@ -7310,11 +7320,11 @@ mod tests {
         let nonce_hex = hex::encode(nonce);
 
         use hmac::{Hmac, Mac};
-        use sha2::Sha256;
-        type HmacSha256 = Hmac<Sha256>;
+        use sha2::Sha512;
+        type HmacSha512 = Hmac<Sha512>;
 
         let payload = format!("{}:{}:{}:{}", session, cookie, old_ts, nonce_hex);
-        let mut mac = HmacSha256::new_from_slice(key.as_bytes()).expect("HMAC key");
+        let mut mac = HmacSha512::new_from_slice(key.as_bytes()).expect("HMAC key");
         mac.update(payload.as_bytes());
         let sig = hex::encode(mac.finalize().into_bytes());
         let expired_token = format!("{}:{}:{}", old_ts, nonce_hex, sig);

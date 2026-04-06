@@ -22,7 +22,7 @@ use tracing::{error, info, warn, debug};
 use common::types::ModuleId;
 use shard::tls_transport::tls_connect;
 
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha512};
 use zeroize::Zeroize;
 
 use crate::distributed_rate_limit::DistributedRateLimiter;
@@ -113,14 +113,14 @@ impl Drop for OrchestratorConfig {
 /// Per-IP rate-limit state: (connection count, window start).
 type RateLimitMap = HashMap<IpAddr, (u32, Instant)>;
 
-/// Compute the SHA-256 fingerprint of an X-Wing public key.
+/// Compute the SHA-512 fingerprint of an X-Wing public key (CNSA 2.0).
 ///
-/// The fingerprint is the first 32 bytes of SHA-256 over the full serialized
-/// public key, hex-encoded.  Clients pin this fingerprint and verify it
-/// against the value received in the puzzle challenge.
+/// The fingerprint is SHA-512 over the domain-separated serialized public key,
+/// hex-encoded. Clients pin this fingerprint and verify it against the value
+/// received in the puzzle challenge.
 fn xwing_pk_fingerprint(pk_bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"MILNET-XWING-PIN-v1");
+    let mut hasher = Sha512::new();
+    hasher.update(b"MILNET-XWING-PIN-v2");
     hasher.update(pk_bytes);
     let digest = hasher.finalize();
     hex::encode(digest)

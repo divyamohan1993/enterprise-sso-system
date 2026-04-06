@@ -5,7 +5,7 @@
 //! the reproducible build verification pipeline (`deploy/verify-reproducible-build.sh`).
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha512};
 use std::path::Path;
 
 /// Build metadata captured at compile time and embedded in the binary.
@@ -84,19 +84,19 @@ impl BuildManifest {
     }
 }
 
-/// Compute the SHA-256 hash of a file and return it as a hex string.
+/// Compute the SHA-512 hash of a file and return it as a hex string (CNSA 2.0).
 ///
 /// Used to hash compiled binaries for the build manifest.
 pub fn sha256_file(path: &Path) -> Result<String, String> {
     let data = std::fs::read(path)
         .map_err(|e| format!("Failed to read file '{}': {}", path.display(), e))?;
-    let hash = Sha256::digest(&data);
+    let hash = Sha512::digest(&data);
     Ok(hex::encode(hash))
 }
 
-/// Compute the SHA-256 hash of a byte slice and return it as a hex string.
+/// Compute the SHA-512 hash of a byte slice and return it as a hex string (CNSA 2.0).
 pub fn sha256_bytes(data: &[u8]) -> String {
-    let hash = Sha256::digest(data);
+    let hash = Sha512::digest(data);
     hex::encode(hash)
 }
 

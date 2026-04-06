@@ -16,7 +16,7 @@
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
-use sha2::{Digest, Sha256};
+use sha2::Digest;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -472,13 +472,14 @@ impl CeremonyEngine {
     }
 }
 
-/// Compute SHA-256 fingerprint of key material.
+/// Compute SHA-512 fingerprint of key material, truncated to 32 bytes (CNSA 2.0).
 fn sha256_fingerprint(data: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
+    use sha2::{Digest, Sha512};
+    let mut hasher = Sha512::new();
     hasher.update(data);
     let result = hasher.finalize();
     let mut out = [0u8; 32];
-    out.copy_from_slice(&result);
+    out.copy_from_slice(&result[..32]);
     out
 }
 

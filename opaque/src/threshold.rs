@@ -12,7 +12,7 @@
 //! - Tolerates 1 Byzantine/crashed server
 
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sha2::Sha512;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 use serde::{Serialize, Deserialize};
 
@@ -229,7 +229,7 @@ pub struct ThresholdOprfKeygenResult {
 /// Generate a random OPRF master key, split it via Shamir, and return shares.
 ///
 /// The master key is zeroized after splitting — it is NEVER persisted.
-/// The verification key is HMAC-SHA256(master_key, "threshold-opaque-verification").
+/// The verification key is HMAC-SHA512(master_key, "threshold-opaque-verification") truncated to 32 bytes (CNSA 2.0).
 pub fn generate_threshold_oprf_key(threshold: u8, total: u8) -> ThresholdOprfKeygenResult {
     // Generate random master key
     let mut master_key = [0u8; 32];
@@ -238,14 +238,16 @@ pub fn generate_threshold_oprf_key(threshold: u8, total: u8) -> ThresholdOprfKey
         std::process::exit(1);
     });
 
-    // Derive a public verification key before splitting
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&master_key)
+    // Derive a public verification key before splitting (CNSA 2.0: HMAC-SHA512)
+    let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(&master_key)
         .unwrap_or_else(|e| {
-            tracing::error!("FATAL: HMAC-SHA256 key init failed in threshold OPRF: {e}");
+            tracing::error!("FATAL: HMAC-SHA512 key init failed in threshold OPRF: {e}");
             std::process::exit(1);
         });
-    mac.update(b"threshold-opaque-verification");
-    let verification_key: [u8; 32] = mac.finalize().into_bytes().into();
+    mac.update(b"threshold-opaque-verification-v2");
+    let full = mac.finalize().into_bytes();
+    let mut verification_key = [0u8; 32];
+    verification_key.copy_from_slice(&full[..32]);
 
     // Split the master key into Shamir shares
     let shares = shamir_split(&master_key, threshold, total);
@@ -273,32 +275,34 @@ impl ThresholdOpaqueServer {
     ///
     /// The "evaluation" carries this server's Shamir share value so that the
     /// coordinator can reconstruct the OPRF key transiently. The proof is
-    /// HMAC-SHA256(share_value, blinded_element || server_id) — it binds the
+    /// HMAC-SHA512(share_value, blinded_element || server_id) — it binds the
     /// share to the specific request, proving the server actually holds the
-    /// share and processed this exact input.
+    /// share and processed this exact input (CNSA 2.0).
     ///
     /// In production, the share would be encrypted in transit via mTLS/SHARD.
     pub fn partial_evaluate(&self, blinded_element: &[u8]) -> PartialOprfEvaluation {
-        // Compute HMAC-SHA256(share_value, blinded_element) as the partial evaluation.
+        // Compute HMAC-SHA512(share_value, blinded_element) as the partial evaluation.
         // This ensures the raw share is NEVER transmitted — only the evaluation
         // output leaves this node. The coordinator combines evaluations, not shares.
-        let mut eval_mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.oprf_share.share_value)
+        let mut eval_mac = <Hmac<Sha512> as Mac>::new_from_slice(&self.oprf_share.share_value)
             .unwrap_or_else(|e| {
-                tracing::error!("FATAL: HMAC-SHA256 key init failed in partial_evaluate: {e}");
+                tracing::error!("FATAL: HMAC-SHA512 key init failed in partial_evaluate: {e}");
                 std::process::exit(1);
             });
         eval_mac.update(blinded_element);
         let evaluation: Vec<u8> = eval_mac.finalize().into_bytes().to_vec();
 
-        // Authentication proof: HMAC(share, blinded_element || server_id)
-        let mut proof_mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.oprf_share.share_value)
+        // Authentication proof: HMAC-SHA512(share, blinded_element || server_id)
+        let mut proof_mac = <Hmac<Sha512> as Mac>::new_from_slice(&self.oprf_share.share_value)
             .unwrap_or_else(|e| {
-                tracing::error!("FATAL: HMAC-SHA256 key init failed in partial_evaluate proof: {e}");
+                tracing::error!("FATAL: HMAC-SHA512 key init failed in partial_evaluate proof: {e}");
                 std::process::exit(1);
             });
         proof_mac.update(blinded_element);
         proof_mac.update(&[self.oprf_share.server_id]);
-        let proof: [u8; 32] = proof_mac.finalize().into_bytes().into();
+        let full_proof = proof_mac.finalize().into_bytes();
+        let mut proof = [0u8; 32];
+        proof.copy_from_slice(&full_proof[..32]);
 
         PartialOprfEvaluation {
             server_id: self.oprf_share.server_id,
@@ -622,10 +626,12 @@ mod tests {
         assert_eq!(mk1, mk2);
         assert_eq!(mk2, mk3);
 
-        // Verify the reconstructed key produces the same verification key
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&mk1).unwrap();
-        mac.update(b"threshold-opaque-verification");
-        let vk: [u8; 32] = mac.finalize().into_bytes().into();
+        // Verify the reconstructed key produces the same verification key (HMAC-SHA512)
+        let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(&mk1).unwrap();
+        mac.update(b"threshold-opaque-verification-v2");
+        let full = mac.finalize().into_bytes();
+        let mut vk = [0u8; 32];
+        vk.copy_from_slice(&full[..32]);
         assert_eq!(vk, result.verification_key);
     }
 
@@ -861,9 +867,11 @@ mod tests {
         // The struct has no master_key field — only shares and verification_key.
         // This is a compile-time guarantee. We just verify the shares are valid.
         let mk = shamir_reconstruct(&[&result.shares[0], &result.shares[1]], 2);
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&mk).unwrap();
-        mac.update(b"threshold-opaque-verification");
-        let vk: [u8; 32] = mac.finalize().into_bytes().into();
+        let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(&mk).unwrap();
+        mac.update(b"threshold-opaque-verification-v2");
+        let full = mac.finalize().into_bytes();
+        let mut vk = [0u8; 32];
+        vk.copy_from_slice(&full[..32]);
         assert_eq!(vk, result.verification_key, "shares must be consistent with verification key");
     }
 

@@ -1,7 +1,7 @@
 use crate::pkce;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha512};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -34,19 +34,19 @@ fn pkce_blind_key() -> &'static [u8; 32] {
     })
 }
 
-/// Compute HMAC-SHA256 blind index of a code_challenge so it is never stored
-/// in plaintext. Verification recomputes the HMAC and uses constant-time
-/// comparison (HMAC equality).
+/// Compute HMAC-SHA512 blind index of a code_challenge so it is never stored
+/// in plaintext (CNSA 2.0 Level 5). Verification recomputes the HMAC and
+/// uses constant-time comparison (HMAC equality).
 fn blind_code_challenge(code_challenge: &str) -> String {
-    type HmacSha256 = Hmac<Sha256>;
+    type HmacSha512 = Hmac<Sha512>;
     // Key length is always 32 bytes which is valid for HMAC — unwrap is safe here,
     // but we defend against it anyway for defense-in-depth.
-    let mac = match HmacSha256::new_from_slice(pkce_blind_key()) {
+    let mac = match HmacSha512::new_from_slice(pkce_blind_key()) {
         Ok(m) => m,
         Err(_) => {
             common::siem::emit_runtime_error(
                 common::siem::category::CRYPTO_FAILURE,
-                "HMAC-SHA256 key init failed for PKCE blind",
+                "HMAC-SHA512 key init failed for PKCE blind",
                 "invalid key length",
                 file!(),
                 line!(),
@@ -63,10 +63,10 @@ fn blind_code_challenge(code_challenge: &str) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
-/// Hash an authorization code with SHA-256 for storage keying.
+/// Hash an authorization code with SHA-512 for storage keying (CNSA 2.0).
 /// The raw code is never stored — only its hash is used as the map key.
 fn hash_code(code: &str) -> String {
-    let digest = Sha256::digest(code.as_bytes());
+    let digest = Sha512::digest(code.as_bytes());
     hex::encode(digest)
 }
 

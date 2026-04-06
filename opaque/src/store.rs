@@ -446,9 +446,24 @@ impl Drop for CredentialStore {
         // Zeroize the OPRF seed and keypair by serializing and clearing
         let mut setup_bytes = self.server_setup.serialize().to_vec();
         setup_bytes.zeroize();
+        // Defense-in-depth: volatile write zeros over the ServerSetup struct memory.
+        // ServerSetup from opaque-ke does not implement Zeroize, so we must zero
+        // the raw memory to prevent OPRF seed + server keypair from lingering.
+        #[allow(unsafe_code)]
+        unsafe {
+            let ptr = &self.server_setup as *const _ as *mut u8;
+            let len = std::mem::size_of_val(&self.server_setup);
+            core::ptr::write_bytes(ptr, 0, len);
+        }
         if let Some(ref fips_setup) = self.server_setup_fips {
             let mut fips_bytes = fips_setup.serialize().to_vec();
             fips_bytes.zeroize();
+            #[allow(unsafe_code)]
+            unsafe {
+                let ptr = fips_setup as *const _ as *mut u8;
+                let len = std::mem::size_of_val(fips_setup);
+                core::ptr::write_bytes(ptr, 0, len);
+            }
         }
         // Clear user records (registration blobs contain no passwords but
         // are high-value for offline attacks)

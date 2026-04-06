@@ -1475,27 +1475,27 @@ fn test_compromised_leader_cannot_suppress_quarantine() {
 fn test_heal_script_rejects_wrong_hash() {
     // Verify the conceptual integrity check: if HEAL_SCRIPT_HASH is set to a
     // wrong value, the verify function would detect tampering. We test by
-    // computing SHA-256 of a known string and comparing against a wrong hash.
-    use sha2::{Digest, Sha256};
+    // computing SHA-512 of a known string and comparing against a wrong hash (CNSA 2.0).
+    use sha2::{Digest, Sha512};
 
     let script_content = b"#!/usr/bin/env bash\n# heal.sh content";
-    let mut hasher = Sha256::new();
+    let mut hasher = Sha512::new();
     hasher.update(script_content);
     let actual_hash = hex::encode(hasher.finalize());
 
     // Wrong hash must not match
-    let wrong_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+    let wrong_hash = "0".repeat(128);
     assert_ne!(
         actual_hash, wrong_hash,
         "actual hash of script must differ from wrong hash"
     );
 
     // Correct hash must match itself (integrity verified)
-    let mut hasher2 = Sha256::new();
+    let mut hasher2 = Sha512::new();
     hasher2.update(script_content);
     let verify_hash = hex::encode(hasher2.finalize());
     assert_eq!(
         actual_hash, verify_hash,
-        "SHA-256 must be deterministic (integrity check is reliable)"
+        "SHA-512 must be deterministic (integrity check is reliable)"
     );
 }

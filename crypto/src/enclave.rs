@@ -22,7 +22,7 @@
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha512};
 use zeroize::Zeroize;
 
 // ---------------------------------------------------------------------------
@@ -85,15 +85,15 @@ impl EnclaveIdentity {
     ///
     /// This uniquely identifies the enclave instance for key sealing purposes.
     pub fn sealing_hash(&self) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        hasher.update(b"MILNET-ENCLAVE-SEAL-v1");
+        let mut hasher = Sha512::new();
+        hasher.update(b"MILNET-ENCLAVE-SEAL-v2");
         hasher.update(&self.measurement);
         hasher.update(&self.signer);
         hasher.update(self.product_id.to_le_bytes());
         hasher.update(self.security_version.to_le_bytes());
         let result = hasher.finalize();
         let mut hash = [0u8; 32];
-        hash.copy_from_slice(&result);
+        hash.copy_from_slice(&result[..32]);
         hash
     }
 

@@ -20,7 +20,7 @@
 #![forbid(unsafe_code)]
 
 use hmac::{Hmac, Mac};
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha512};
 
 // ---------------------------------------------------------------------------
 // Order-Preserving Encryption (OPE)
@@ -60,8 +60,8 @@ impl OpeContext {
 
         // PRF the low bits to add randomness within the same high-order bucket
         let prf_input = high.to_le_bytes();
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.key).unwrap_or_else(|e| {
-            tracing::error!("FATAL: HMAC-SHA256 key init failed for HE search: {e}");
+        let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(&self.key).unwrap_or_else(|e| {
+            tracing::error!("FATAL: HMAC-SHA512 key init failed for HE search: {e}");
             std::process::exit(1);
         });
         mac.update(OPE_DOMAIN);
@@ -122,15 +122,18 @@ impl DetEncContext {
 
     /// Deterministically encrypt a byte slice.
     ///
-    /// Returns a 32-byte ciphertext (HMAC-SHA256 tag).
+    /// Returns a 32-byte ciphertext (HMAC-SHA512 truncated to 32 bytes, CNSA 2.0).
     pub fn encrypt(&self, plaintext: &[u8]) -> [u8; 32] {
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.key).unwrap_or_else(|e| {
-            tracing::error!("FATAL: HMAC-SHA256 key init failed for HE search: {e}");
+        let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(&self.key).unwrap_or_else(|e| {
+            tracing::error!("FATAL: HMAC-SHA512 key init failed for HE search: {e}");
             std::process::exit(1);
         });
         mac.update(DET_ENC_DOMAIN);
         mac.update(plaintext);
-        mac.finalize().into_bytes().into()
+        let full = mac.finalize().into_bytes();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&full[..32]);
+        out
     }
 
     /// Deterministically encrypt a string value.
@@ -176,8 +179,8 @@ impl EncryptedAggContext {
 
     /// Derive a deterministic mask for a given index.
     fn derive_mask(&self, index: u64) -> u64 {
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.key).unwrap_or_else(|e| {
-            tracing::error!("FATAL: HMAC-SHA256 key init failed for HE search: {e}");
+        let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(&self.key).unwrap_or_else(|e| {
+            tracing::error!("FATAL: HMAC-SHA512 key init failed for HE search: {e}");
             std::process::exit(1);
         });
         mac.update(HE_AGG_DOMAIN);

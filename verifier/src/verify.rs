@@ -460,7 +460,7 @@ pub fn verify_token_with_audience(
     // 2. Audience validation — if expected audience is provided, token must match
     if let Some(expected) = expected_audience {
         match &token.claims.aud {
-            Some(aud) if aud == expected => {} // match
+            Some(aud) if crypto::ct::ct_eq(aud.as_bytes(), expected.as_bytes()) => {} // constant-time match
             Some(aud) => {
                 return Err(MilnetError::CryptoVerification(format!(
                     "audience mismatch: token bound to '{}', expected '{}'",
@@ -474,15 +474,14 @@ pub fn verify_token_with_audience(
             }
         }
     } else {
-        // No expected audience specified — enforce audience presence if configured.
-        // REQUIRE_TOKEN_AUDIENCE defaults to true; set to "false" to allow tokens without aud.
-        let require_aud = std::env::var("REQUIRE_TOKEN_AUDIENCE")
-            .map(|v| v != "false" && v != "0")
-            .unwrap_or(true);
-        if require_aud && token.claims.aud.is_none() {
+        // Audience binding is MANDATORY. No env var override allowed.
+        // SECURITY: Previously REQUIRE_TOKEN_AUDIENCE env var could disable this,
+        // creating an inconsistency with the OIDC path which hardcodes it.
+        // Removed env var bypass to prevent environment variable injection attacks.
+        if token.claims.aud.is_none() {
             return Err(MilnetError::CryptoVerification(
                 "token audience (aud) claim is required but missing — \
-                 set REQUIRE_TOKEN_AUDIENCE=false to allow tokens without audience binding"
+                 audience binding is mandatory for all token types"
                     .into(),
             ));
         }

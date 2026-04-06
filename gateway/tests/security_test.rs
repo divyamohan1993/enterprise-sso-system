@@ -11,15 +11,15 @@ use gateway::puzzle::{
 use gateway::wire::{AuthRequest, AuthResponse, OrchestratorRequest, OrchestratorResponse};
 use gateway::server::GatewayServer;
 
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha512};
 use serial_test::serial;
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
-/// Mirrors the server's xwing_pk_fingerprint() for test-side verification.
+/// Mirrors the server's xwing_pk_fingerprint() for test-side verification (CNSA 2.0: SHA-512).
 fn compute_fingerprint(pk_bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"MILNET-XWING-PIN-v1");
+    let mut hasher = Sha512::new();
+    hasher.update(b"MILNET-XWING-PIN-v2");
     hasher.update(pk_bytes);
     hex::encode(hasher.finalize())
 }
@@ -82,18 +82,18 @@ fn key_pin_constant_time_no_early_exit() {
 
 #[test]
 fn fingerprint_is_domain_separated() {
-    // The fingerprint uses "MILNET-XWING-PIN-v1" as a domain separator.
-    // A raw SHA-256 of the same key bytes must differ.
+    // The fingerprint uses "MILNET-XWING-PIN-v2" as a domain separator.
+    // A raw SHA-512 of the same key bytes must differ.
     let pk_bytes = vec![0xCD; 1216];
     let domain_fp = compute_fingerprint(&pk_bytes);
 
-    let mut raw_hasher = Sha256::new();
+    let mut raw_hasher = Sha512::new();
     raw_hasher.update(&pk_bytes);
     let raw_fp = hex::encode(raw_hasher.finalize());
 
     assert_ne!(
         domain_fp, raw_fp,
-        "domain-separated fingerprint must differ from raw SHA-256"
+        "domain-separated fingerprint must differ from raw SHA-512"
     );
 }
 

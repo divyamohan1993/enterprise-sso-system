@@ -2714,7 +2714,9 @@ impl ProductionKeySource for HsmKeyManager {
                     HsmBackend::Pkcs11 => self.pkcs11_wrap(plaintext, purpose),
                     HsmBackend::AwsKms => self.aws_kms_wrap(plaintext, purpose),
                     HsmBackend::Tpm2 => self.tpm2_wrap(plaintext, purpose),
-                    HsmBackend::Software => unreachable!(),
+                    HsmBackend::Software => {
+                        return Err(SealError::SealFailed);
+                    }
                 }
             }
         }
@@ -2731,8 +2733,9 @@ impl ProductionKeySource for HsmKeyManager {
                     HsmBackend::Pkcs11 => self.pkcs11_unwrap(sealed, purpose),
                     HsmBackend::AwsKms => self.aws_kms_unwrap(sealed, purpose),
                     HsmBackend::Tpm2 => self.tpm2_unwrap(sealed, purpose),
-                    HsmBackend::Software => unreachable!(),
-                }
+                    HsmBackend::Software => {
+                        return Err(SealError::UnsealFailed);
+                    }
             }
         }
     }

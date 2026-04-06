@@ -297,15 +297,15 @@ static DEDUP_HMAC_KEY: LazyLock<[u8; 32]> = LazyLock::new(|| {
     key
 });
 
-/// Hash a message string for dedup keying using keyed HMAC-SHA256 truncated to 64 bits.
+/// Hash a message string for dedup keying using keyed HMAC-SHA512 truncated to 64 bits (CNSA 2.0).
 /// Prevents an attacker from crafting hash collisions to suppress tamper alerts.
 fn hash_message(msg: &str) -> u64 {
     use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-    type HmacSha256 = Hmac<Sha256>;
+    use sha2::Sha512;
+    type HmacSha512 = Hmac<Sha512>;
 
-    let mut mac = HmacSha256::new_from_slice(&*DEDUP_HMAC_KEY)
-        .unwrap_or_else(|_| unreachable!("HMAC-SHA256 accepts any key length"));
+    let mut mac = HmacSha512::new_from_slice(&*DEDUP_HMAC_KEY)
+        .unwrap_or_else(|_| unreachable!("HMAC-SHA512 accepts any key length"));
     mac.update(msg.as_bytes());
     let result = mac.finalize().into_bytes();
     u64::from_le_bytes(result[..8].try_into().unwrap_or([0u8; 8]))

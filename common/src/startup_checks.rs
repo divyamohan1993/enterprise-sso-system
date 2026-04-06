@@ -278,6 +278,19 @@ const SENSITIVE_ENV_VARS: &[&str] = &[
     "MILNET_REDIS_URL",
     "MILNET_DB_SSL_KEY",
     "MILNET_DB_SSL_CERT",
+    // Added per security audit: previously missing secret-bearing env vars
+    "MILNET_VSS_COMMITMENTS",
+    "RECEIPT_SIGNING_SEED_SEALED",
+    "RECEIPT_SIGNING_KEY_SEALED",
+    "SHARD_HMAC_KEY_SEALED",
+    "MILNET_GROUP_VERIFYING_KEY",
+    "MILNET_PQ_VERIFYING_KEY",
+    "MILNET_TSS_PUBLIC_KEY_PACKAGE",
+    "MILNET_OPAQUE_SERVER_ID",
+    "MILNET_AWS_KMS_KEY_ID",
+    "MILNET_AWS_KMS_REGION",
+    "MILNET_TPM2_DEVICE",
+    "MILNET_TSS_NONCE_STATE_PATH",
 ];
 
 /// Remove ALL sensitive environment variables from the process environment.

@@ -183,10 +183,7 @@ impl CeremonyTracker {
     /// Remove all expired and timed-out ceremonies.
     /// Returns the number of ceremonies cleaned up.
     pub fn cleanup_expired(&mut self) -> usize {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = common::secure_time::secure_now_secs_i64();
 
         let to_remove: Vec<String> = self.sessions.iter()
             .filter(|(_, s)| (now - s.created_at) > CEREMONY_TIMEOUT_SECS)
@@ -709,15 +706,15 @@ impl DistributedCeremonyTracker {
         let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
         let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
 
-        // Build sync request: our epoch as 8-byte big-endian + HMAC-SHA256 tag
-        let mut request = Vec::with_capacity(40);
+        // Build sync request: our epoch as 8-byte big-endian + HMAC-SHA512 tag (CNSA 2.0)
+        let mut request = Vec::with_capacity(72);
         request.extend_from_slice(&self.ceremony_epoch.to_be_bytes());
 
         // Compute HMAC over the request payload
         use hmac::{Hmac, Mac};
-        use sha2::Sha256;
-        type HmacSha256 = Hmac<Sha256>;
-        let mut mac = HmacSha256::new_from_slice(&hmac_key)
+        use sha2::Sha512;
+        type HmacSha512 = Hmac<Sha512>;
+        let mut mac = HmacSha512::new_from_slice(&hmac_key)
             .map_err(|_| "HMAC key init failed".to_string())?;
         mac.update(&request);
         let tag = mac.finalize().into_bytes();
@@ -742,12 +739,12 @@ impl DistributedCeremonyTracker {
         stream_ref.read_exact(&mut resp_buf)
             .map_err(|e| format!("read body from peer {} failed: {e}", peer.addr))?;
 
-        // Verify response HMAC (last 32 bytes are the tag)
-        if resp_buf.len() < 32 {
+        // Verify response HMAC (last 64 bytes are the SHA-512 tag)
+        if resp_buf.len() < 64 {
             return Err(format!("peer {} response too short for HMAC verification", peer.addr));
         }
-        let (payload, resp_tag) = resp_buf.split_at(resp_buf.len() - 32);
-        let mut verify_mac = HmacSha256::new_from_slice(&hmac_key)
+        let (payload, resp_tag) = resp_buf.split_at(resp_buf.len() - 64);
+        let mut verify_mac = HmacSha512::new_from_slice(&hmac_key)
             .map_err(|_| "HMAC key init failed".to_string())?;
         verify_mac.update(payload);
         verify_mac.verify_slice(resp_tag)

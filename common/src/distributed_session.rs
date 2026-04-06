@@ -9,7 +9,7 @@
 
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::Sha512;
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
@@ -31,19 +31,20 @@ fn fp_blind_key() -> &'static [u8; 32] {
     })
 }
 
-/// Compute an HMAC-SHA256 blind index over a device fingerprint.
+/// Compute an HMAC-SHA512 blind index over a device fingerprint (CNSA 2.0).
 /// This allows equality lookups without storing the raw fingerprint.
+/// Returns the first 32 bytes of HMAC-SHA512 output for DB column compatibility.
 pub fn blind_device_fingerprint(fp: &[u8; 32]) -> [u8; 32] {
-    type HmacSha256 = Hmac<Sha256>;
-    // HMAC-SHA256 accepts any key length per RFC 2104; this cannot fail.
-    let Ok(mut mac) = HmacSha256::new_from_slice(fp_blind_key()) else {
-        // Unreachable: HMAC-SHA256 accepts any key length.
+    type HmacSha512 = Hmac<Sha512>;
+    // HMAC-SHA512 accepts any key length per RFC 2104; this cannot fail.
+    let Ok(mut mac) = HmacSha512::new_from_slice(fp_blind_key()) else {
+        // Unreachable: HMAC-SHA512 accepts any key length.
         return [0u8; 32];
     };
     mac.update(fp);
     let result = mac.finalize().into_bytes();
     let mut out = [0u8; 32];
-    out.copy_from_slice(&result);
+    out.copy_from_slice(&result[..32]);
     out
 }
 
@@ -66,7 +67,7 @@ pub struct DistributedSession {
     pub ratchet_epoch: u64,
     /// Encrypted ratchet chain key (AES-256-GCM sealed).
     pub encrypted_chain_key: Vec<u8>,
-    /// Device fingerprint for binding (HMAC-SHA256 blind index).
+    /// Device fingerprint for binding (HMAC-SHA512 blind index, truncated to 32 bytes).
     /// The raw fingerprint is never stored — only its HMAC blind index.
     pub device_fingerprint: [u8; 32],
     /// Classification level for MAC enforcement.

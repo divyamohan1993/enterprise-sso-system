@@ -678,6 +678,11 @@ impl EventStreamManager {
             .ok_or_else(|| format!("webhook '{}' not found", webhook_id))?;
 
         let new_secret = generate_webhook_secret();
+        // SECURITY: Zeroize old secret before replacing to prevent lingering in memory
+        {
+            use zeroize::Zeroize;
+            webhook.secret.zeroize();
+        }
         webhook.secret = new_secret.clone();
         webhook.updated_at = now_epoch();
 

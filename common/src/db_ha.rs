@@ -697,10 +697,12 @@ pub struct BackupManifest {
 
 /// Create a backup manifest (the actual pg_dump would be an external command).
 pub fn create_backup_manifest(backup_id: &str, path: &str, data: &[u8]) -> BackupManifest {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
+    use sha2::{Digest, Sha512};
+    let mut hasher = Sha512::new();
     hasher.update(data);
-    let hash: [u8; 32] = hasher.finalize().into();
+    let full_hash = hasher.finalize();
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&full_hash[..32]);
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -718,12 +720,14 @@ pub fn create_backup_manifest(backup_id: &str, path: &str, data: &[u8]) -> Backu
     }
 }
 
-/// Verify a backup's integrity by checking its hash.
+/// Verify a backup's integrity by checking its hash (CNSA 2.0: SHA-512).
 pub fn verify_backup(manifest: &BackupManifest, data: &[u8]) -> bool {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
+    use sha2::{Digest, Sha512};
+    let mut hasher = Sha512::new();
     hasher.update(data);
-    let actual_hash: [u8; 32] = hasher.finalize().into();
+    let full_hash = hasher.finalize();
+    let mut actual_hash = [0u8; 32];
+    actual_hash.copy_from_slice(&full_hash[..32]);
 
     // Constant-time comparison
     use subtle::ConstantTimeEq;

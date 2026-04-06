@@ -110,6 +110,11 @@ async fn main() {
         // Load KEK from environment (in production, from HSM / sealed storage)
         use zeroize::Zeroize;
         let kek = if let Ok(mut kek_hex) = std::env::var("RATCHET_KEK") {
+            // SECURITY: Remove KEK from environment IMMEDIATELY to minimize
+            // exposure window. Overwrite with zeros first to clear libc environ buffer.
+            std::env::set_var("RATCHET_KEK", "0".repeat(kek_hex.len()));
+            std::env::remove_var("RATCHET_KEK");
+
             let mut kek_bytes = match hex::decode(&kek_hex) {
                 Ok(b) => b,
                 Err(e) => {

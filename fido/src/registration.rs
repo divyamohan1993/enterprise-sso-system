@@ -359,7 +359,7 @@ impl PersistentCredentialStore {
         .bind(&cred.credential_id)
         .bind(&pubkey_enc)
         .bind(cred.user_id)
-        .bind(cred.sign_count as i32)
+        .bind(cred.sign_count as i64)
         .bind(&cred.authenticator_type)
         .execute(&self.pool.pool)
         .await
@@ -402,7 +402,7 @@ impl PersistentCredentialStore {
     /// Update sign count in both DB and memory after successful authentication.
     pub async fn update_sign_count(&mut self, credential_id: &[u8], new_count: u32) -> Result<(), String> {
         sqlx::query("UPDATE fido_credentials SET sign_count = $1 WHERE credential_id = $2")
-            .bind(new_count as i32)
+            .bind(new_count as i64)
             .bind(credential_id)
             .execute(&self.pool.pool)
             .await

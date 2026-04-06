@@ -12,19 +12,19 @@
 //! 4. The resulting shares s'_j are valid for the SAME secret s,
 //!    but the old shares s_j are now useless.
 //!
-//! VERIFICATION: Each node publishes SHA-256 hash commitments to the sub-shares
-//! it will send, allowing receivers to verify authenticity.
+//! VERIFICATION: Each node publishes SHA-512 hash commitments to the sub-shares
+//! it will send, allowing receivers to verify authenticity (CNSA 2.0 Level 5).
 //!
 //! INVARIANTS:
 //! - The secret is NEVER reconstructed during refresh.
 //! - All sub-share polynomials have constant term 0.
-//! - Contributions are verified via SHA-256 hash commitments before application.
+//! - Contributions are verified via SHA-512 hash commitments before application.
 //! - Old shares are zeroized after refresh.
 //! - Every refresh round emits a SIEM event.
 
 use crate::siem::{PanelSiemEvent, SiemPanel, SiemSeverity};
 use crate::threshold_kek::{ct_gf256_mul, gf256_add, KekShare};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha512};
 use std::sync::atomic::{AtomicU64, Ordering};
 use zeroize::Zeroize;
 
@@ -50,8 +50,8 @@ pub struct RefreshContribution {
     pub sub_share: Vec<u8>,
     /// Refresh epoch this contribution belongs to.
     pub epoch: u64,
-    /// SHA-256 hash commitment: `H(from_node || to_node || epoch || sub_share)`.
-    /// Used to verify the sub-share against the published commitments.
+    /// SHA-512 hash commitment: `H(from_node || to_node || epoch || sub_share)`.
+    /// Used to verify the sub-share against the published commitments (CNSA 2.0).
     pub commitment: Vec<u8>,
 }
 
@@ -63,16 +63,16 @@ impl Drop for RefreshContribution {
 
 /// Hash-based commitments for a single node's refresh sub-shares.
 ///
-/// Each node publishes SHA-256 hashes of the sub-shares it will send to every
+/// Each node publishes SHA-512 hashes of the sub-shares it will send to every
 /// target node.  Receivers verify the received sub-share matches the committed
-/// hash, providing authenticity without revealing the polynomial.
+/// hash, providing authenticity without revealing the polynomial (CNSA 2.0).
 #[derive(Clone)]
 pub struct RefreshCommitments {
     /// Node index that published these commitments.
     pub from_node: usize,
     /// Epoch.
     pub epoch: u64,
-    /// `commitments[target_idx]` = SHA-256 hash of the sub-share for node `target_idx + 1`.
+    /// `commitments[target_idx]` = SHA-512 hash of the sub-share for node `target_idx + 1`.
     pub commitments: Vec<Vec<u8>>,
 }
 
@@ -80,12 +80,12 @@ pub struct RefreshCommitments {
 // Hash-based commitment helpers
 // ---------------------------------------------------------------------------
 
-/// Compute a SHA-256 commitment to a sub-share.
+/// Compute a SHA-512 commitment to a sub-share (CNSA 2.0 Level 5).
 ///
 /// `H(from_node || to_node || epoch || sub_share_bytes)` binds the commitment
 /// to the exact context, preventing cross-node or cross-epoch replay.
 fn hash_commit(from_node: usize, to_node: usize, epoch: u64, sub_share: &[u8]) -> Vec<u8> {
-    let mut hasher = Sha256::new();
+    let mut hasher = Sha512::new();
     hasher.update(&(from_node as u64).to_be_bytes());
     hasher.update(&(to_node as u64).to_be_bytes());
     hasher.update(&epoch.to_be_bytes());

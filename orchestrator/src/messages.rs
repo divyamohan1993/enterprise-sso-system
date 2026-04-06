@@ -61,6 +61,25 @@ pub struct OrchestratorRequest {
     pub trace_id: Option<String>,
 }
 
+impl std::fmt::Debug for OrchestratorRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OrchestratorRequest")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field("tier", &self.tier)
+            .field("audience", &self.audience)
+            .field("correlation_id", &self.correlation_id)
+            .finish()
+    }
+}
+
+impl Drop for OrchestratorRequest {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.password.zeroize();
+    }
+}
+
 /// Response from the Orchestrator to the Gateway.
 #[derive(Serialize, Deserialize)]
 pub struct OrchestratorResponse {

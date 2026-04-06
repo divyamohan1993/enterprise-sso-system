@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha512};
 use uuid::Uuid;
 
 /// Hash a client secret with Argon2id for storage at rest.
@@ -7,8 +7,8 @@ use uuid::Uuid;
 /// Uses the client_id as a domain-separated salt to avoid rainbow tables.
 /// Returns hex-encoded hash.
 fn hash_client_secret(client_id: &str, plaintext_secret: &str) -> Result<String, String> {
-    // Domain-separated salt: SHA-256("milnet-client-secret:" || client_id)
-    let mut salt_hasher = Sha256::new();
+    // Domain-separated salt: SHA-512("milnet-client-secret:" || client_id) (CNSA 2.0)
+    let mut salt_hasher = Sha512::new();
     salt_hasher.update(b"milnet-client-secret:");
     salt_hasher.update(client_id.as_bytes());
     let salt = salt_hasher.finalize();
