@@ -48,7 +48,10 @@ impl Counter {
     /// Increment the counter by a specific amount.
     pub fn inc_by(&self, labels: &[(&'static str, &str)], n: u64) {
         let key: Vec<_> = labels.iter().map(|(k, v)| (*k, v.to_string())).collect();
-        let mut map = self.values.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self.values.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in metrics - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         map.entry(key)
             .or_insert_with(|| AtomicU64Wrapper(AtomicU64::new(0)))
             .0
@@ -57,7 +60,10 @@ impl Counter {
 
     /// Render in Prometheus text format.
     pub fn render(&self) -> String {
-        let map = self.values.lock().unwrap_or_else(|e| e.into_inner());
+        let map = self.values.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in metrics - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         let mut out = format!("# HELP {} {}\n# TYPE {} counter\n", self.name, self.help, self.name);
         for (labels, value) in map.iter() {
             let label_str = render_labels(labels);
@@ -93,7 +99,10 @@ impl Gauge {
     /// Set the gauge to a specific value.
     pub fn set(&self, labels: &[(&'static str, &str)], value: i64) {
         let key: Vec<_> = labels.iter().map(|(k, v)| (*k, v.to_string())).collect();
-        let mut map = self.values.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self.values.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in metrics - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         map.entry(key)
             .or_insert_with(|| AtomicI64Wrapper(AtomicI64::new(0)))
             .0
@@ -103,7 +112,10 @@ impl Gauge {
     /// Increment the gauge by 1.
     pub fn inc(&self, labels: &[(&'static str, &str)]) {
         let key: Vec<_> = labels.iter().map(|(k, v)| (*k, v.to_string())).collect();
-        let mut map = self.values.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self.values.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in metrics - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         map.entry(key)
             .or_insert_with(|| AtomicI64Wrapper(AtomicI64::new(0)))
             .0
@@ -113,7 +125,10 @@ impl Gauge {
     /// Decrement the gauge by 1.
     pub fn dec(&self, labels: &[(&'static str, &str)]) {
         let key: Vec<_> = labels.iter().map(|(k, v)| (*k, v.to_string())).collect();
-        let mut map = self.values.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self.values.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in metrics - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         map.entry(key)
             .or_insert_with(|| AtomicI64Wrapper(AtomicI64::new(0)))
             .0
@@ -121,7 +136,10 @@ impl Gauge {
     }
 
     pub fn render(&self) -> String {
-        let map = self.values.lock().unwrap_or_else(|e| e.into_inner());
+        let map = self.values.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in metrics - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         let mut out = format!("# HELP {} {}\n# TYPE {} gauge\n", self.name, self.help, self.name);
         for (labels, value) in map.iter() {
             let label_str = render_labels(labels);
@@ -174,7 +192,10 @@ impl Histogram {
     /// Observe a value (e.g. a latency measurement in seconds).
     pub fn observe(&self, labels: &[(&'static str, &str)], value: f64) {
         let key: Vec<_> = labels.iter().map(|(k, v)| (*k, v.to_string())).collect();
-        let mut map = self.values.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self.values.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in metrics - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         let data = map.entry(key).or_insert_with(|| HistogramData {
             bucket_counts: self.buckets.iter().map(|_| AtomicU64::new(0)).collect(),
             sum: AtomicU64::new(0),
@@ -208,7 +229,10 @@ impl Histogram {
     }
 
     pub fn render(&self) -> String {
-        let map = self.values.lock().unwrap_or_else(|e| e.into_inner());
+        let map = self.values.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in metrics - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         let mut out = format!(
             "# HELP {} {}\n# TYPE {} histogram\n",
             self.name, self.help, self.name
@@ -262,13 +286,19 @@ impl MetricsRegistry {
 
     /// Register a render function that will be called on `/metrics`.
     pub fn register(&self, renderer: impl Fn() -> String + Send + Sync + 'static) {
-        let mut renderers = self.renderers.lock().unwrap_or_else(|e| e.into_inner());
+        let mut renderers = self.renderers.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in metrics - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         renderers.push(Box::new(renderer));
     }
 
     /// Render all registered metrics in Prometheus text exposition format.
     pub fn render_all(&self) -> String {
-        let renderers = self.renderers.lock().unwrap_or_else(|e| e.into_inner());
+        let renderers = self.renderers.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in metrics - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         let mut output = String::with_capacity(4096);
         for r in renderers.iter() {
             output.push_str(&r());

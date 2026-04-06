@@ -442,7 +442,10 @@ pub async fn run_auto_heal_loop(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let probe_interval = {
-        let h = healer.lock().unwrap_or_else(|e| e.into_inner());
+        let h = healer.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in auto_heal - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         h.config.probe_interval
     };
 
@@ -452,7 +455,10 @@ pub async fn run_auto_heal_loop(
             _ = interval.tick() => {
                 // Collect peers to probe
                 let peers_to_probe = {
-                    let h = healer.lock().unwrap_or_else(|e| e.into_inner());
+                    let h = healer.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in auto_heal - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
                     h.peers_to_probe()
                 };
 
@@ -469,7 +475,10 @@ pub async fn run_auto_heal_loop(
                 for handle in handles {
                     if let Ok((node_id, ok)) = handle.await {
                         let cmd = {
-                            let mut h = healer.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut h = healer.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in auto_heal - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
                             if ok {
                                 h.record_success(&node_id)
                             } else {

@@ -155,7 +155,10 @@ impl UebaStore {
     /// WHERE tenant_id = $1
     /// ```
     pub fn load_baselines(&self, records: Vec<EncryptedBaselineRecord>) -> usize {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in ueba_store - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         let mut loaded = 0;
 
         for record in records {
@@ -196,13 +199,19 @@ impl UebaStore {
 
     /// Get a baseline for a user (if it exists).
     pub fn get_baseline(&self, user_id: &Uuid) -> Option<UserBaseline> {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in ueba_store - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         state.get(user_id).map(|s| s.baseline.clone())
     }
 
     /// Get a baseline with its confidence score.
     pub fn get_baseline_with_confidence(&self, user_id: &Uuid) -> Option<(UserBaseline, f64)> {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in ueba_store - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         state
             .get(user_id)
             .map(|s| (s.baseline.clone(), s.confidence))
@@ -215,7 +224,10 @@ impl UebaStore {
         tenant_id: Uuid,
         baseline: UserBaseline,
     ) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in ueba_store - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
 
         let entry = state.entry(user_id).or_insert_with(|| UserUebaState {
             baseline: baseline.clone(),
@@ -243,7 +255,10 @@ impl UebaStore {
             .unwrap_or_default()
             .as_secs() as i64;
 
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in ueba_store - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         if let Some(user_state) = state.get_mut(user_id) {
             // Ring buffer: drop oldest when at capacity (O(1) with VecDeque)
             if user_state.anomaly_history.len() >= MAX_ANOMALY_HISTORY {
@@ -261,7 +276,10 @@ impl UebaStore {
 
     /// Get historical anomaly scores for a user.
     pub fn get_anomaly_history(&self, user_id: &Uuid) -> Vec<AnomalyScoreRecord> {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in ueba_store - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         state
             .get(user_id)
             .map(|s| s.anomaly_history.iter().cloned().collect())
@@ -270,7 +288,10 @@ impl UebaStore {
 
     /// Get anomaly trend: average score over the last N records.
     pub fn anomaly_trend(&self, user_id: &Uuid, last_n: usize) -> Option<f64> {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in ueba_store - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         let history = state.get(user_id).map(|s| &s.anomaly_history)?;
 
         if history.is_empty() {
@@ -293,7 +314,10 @@ impl UebaStore {
             .unwrap_or_default()
             .as_secs() as i64;
 
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in ueba_store - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         let mut aged_count = 0;
 
         for user_state in state.values_mut() {
@@ -318,7 +342,10 @@ impl UebaStore {
 
     /// Get all baselines for a specific tenant.
     pub fn get_tenant_baselines(&self, tenant_id: &Uuid) -> Vec<(Uuid, UserBaseline, f64)> {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in ueba_store - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         state
             .iter()
             .filter(|(_, v)| &v.tenant_id == tenant_id)
@@ -328,7 +355,10 @@ impl UebaStore {
 
     /// Count of baselines per tenant.
     pub fn tenant_baseline_count(&self, tenant_id: &Uuid) -> usize {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in ueba_store - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         state.values().filter(|v| &v.tenant_id == tenant_id).count()
     }
 
@@ -339,7 +369,10 @@ impl UebaStore {
             .unwrap_or_default()
             .as_secs() as i64;
 
-        let last = *self.last_flush.lock().unwrap_or_else(|e| e.into_inner());
+        let last = *self.last_flush.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in ueba_store - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         (now - last).max(0) as u64 >= self.flush_interval.as_secs()
     }
 
@@ -362,7 +395,10 @@ impl UebaStore {
             .unwrap_or_default()
             .as_secs() as i64;
 
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in ueba_store - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         let mut records = Vec::new();
 
         for (user_id, user_state) in state.iter_mut() {
@@ -385,7 +421,10 @@ impl UebaStore {
         }
 
         // Update last flush timestamp
-        *self.last_flush.lock().unwrap_or_else(|e| e.into_inner()) = now;
+        *self.last_flush.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in ueba_store - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                }) = now;
 
         if !records.is_empty() {
             tracing::info!(
@@ -400,14 +439,20 @@ impl UebaStore {
 
     /// Get the total number of baselines in memory.
     pub fn baseline_count(&self) -> usize {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.state.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in ueba_store - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                }).len()
     }
 
     /// Get the number of dirty (unflushed) baselines.
     pub fn dirty_count(&self) -> usize {
         self.state
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in ueba_store - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                })
             .values()
             .filter(|s| s.dirty)
             .count()

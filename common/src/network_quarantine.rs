@@ -46,14 +46,20 @@ impl NetworkQuarantine {
     /// identity (the cert fingerprint still matches).
     pub fn block_node(&self, node_id: &str, cert_fingerprint: &[u8; 64]) {
         {
-            let mut nodes = self.blocked_nodes.lock().unwrap_or_else(|e| e.into_inner());
+            let mut nodes = self.blocked_nodes.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in network_quarantine - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
             nodes.insert(node_id.to_string());
         }
         {
             let mut fps = self
                 .blocked_fingerprints
                 .lock()
-                .unwrap_or_else(|e| e.into_inner());
+                .unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in network_quarantine - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
             fps.insert(*cert_fingerprint);
         }
 
@@ -80,7 +86,10 @@ impl NetworkQuarantine {
 
     /// Check if a node ID is blocked.
     pub fn is_blocked(&self, node_id: &str) -> bool {
-        let nodes = self.blocked_nodes.lock().unwrap_or_else(|e| e.into_inner());
+        let nodes = self.blocked_nodes.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in network_quarantine - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         nodes.contains(node_id)
     }
 
@@ -89,19 +98,28 @@ impl NetworkQuarantine {
         let fps = self
             .blocked_fingerprints
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in network_quarantine - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         fps.contains(fingerprint)
     }
 
     /// Number of blocked nodes.
     pub fn blocked_count(&self) -> usize {
-        let nodes = self.blocked_nodes.lock().unwrap_or_else(|e| e.into_inner());
+        let nodes = self.blocked_nodes.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in network_quarantine - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         nodes.len()
     }
 
     /// List all blocked node IDs (for admin dashboard).
     pub fn blocked_node_ids(&self) -> Vec<String> {
-        let nodes = self.blocked_nodes.lock().unwrap_or_else(|e| e.into_inner());
+        let nodes = self.blocked_nodes.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in network_quarantine - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         nodes.iter().cloned().collect()
     }
 
@@ -110,7 +128,10 @@ impl NetworkQuarantine {
     /// Only removes the node ID. The certificate fingerprint stays blocked
     /// permanently, forcing the remediated node to use a new certificate.
     pub fn unblock_node(&self, node_id: &str) {
-        let mut nodes = self.blocked_nodes.lock().unwrap_or_else(|e| e.into_inner());
+        let mut nodes = self.blocked_nodes.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in network_quarantine - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         nodes.remove(node_id);
 
         PanelSiemEvent::new(

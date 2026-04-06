@@ -598,17 +598,12 @@ async fn recv_framed(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
 /// If no master KEK is configured (e.g. in tests), returns `None` and
 /// HMAC authentication is skipped.
 fn derive_raft_hmac_key() -> Option<[u8; 64]> {
-    use zeroize::Zeroize;
-    let mut kek_hex = std::env::var("MILNET_MASTER_KEK").ok()?;
-    let mut kek_bytes = hex::decode(kek_hex.trim()).ok()?;
-    kek_hex.zeroize();
-    if kek_bytes.is_empty() {
-        return None;
-    }
+    // Use the threshold-reconstructed master KEK, not raw env var.
+    // get_master_kek() enforces 3-of-5 Shamir reconstruction in production.
+    let kek = crate::sealed_keys::get_master_kek();
 
     use hkdf::Hkdf;
-    let hk = Hkdf::<Sha512>::new(Some(b"MILNET-CLUSTER-SALT-v1"), &kek_bytes);
-    kek_bytes.zeroize();
+    let hk = Hkdf::<Sha512>::new(Some(b"MILNET-CLUSTER-SALT-v1"), kek);
     let mut okm = [0u8; 64];
     if let Err(e) = hk.expand(RAFT_HMAC_INFO, &mut okm) {
         tracing::error!("FATAL: HKDF-SHA512 expand failed for Raft HMAC key: {e}");

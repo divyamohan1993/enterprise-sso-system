@@ -234,29 +234,18 @@ impl DistributedStartupVerifier {
             }
             seed
         } else {
-            // Derive from MILNET_MASTER_KEK if attestation seed not set
-            use zeroize::Zeroize;
-            let mut kek_hex = std::env::var("MILNET_MASTER_KEK").unwrap_or_default();
-            if kek_hex.len() >= 64 {
+            // Derive from threshold-reconstructed master KEK (not raw env var).
+            // get_master_kek() enforces 3-of-5 Shamir reconstruction in production.
+            {
+                let kek_bytes = crate::sealed_keys::get_master_kek();
                 let mut seed = [0u8; 32];
-                if let Ok(mut bytes) = hex::decode(&kek_hex[..64]) {
-                    kek_hex.zeroize();
-                    if bytes.len() == 32 {
-                        // Use HKDF-like derivation: SHA-512(KEK || "MILNET-ATTESTATION-SEED")
-                        let mut hasher = Sha512::new();
-                        hasher.update(&bytes);
-                        hasher.update(b"MILNET-ATTESTATION-SEED-v1");
-                        let result = hasher.finalize();
-                        seed.copy_from_slice(&result[..32]);
-                    }
-                    bytes.zeroize();
-                } else {
-                    kek_hex.zeroize();
-                }
+                // Use HKDF-like derivation: SHA-512(KEK || "MILNET-ATTESTATION-SEED")
+                let mut hasher = Sha512::new();
+                hasher.update(kek_bytes);
+                hasher.update(b"MILNET-ATTESTATION-SEED-v1");
+                let result = hasher.finalize();
+                seed.copy_from_slice(&result[..32]);
                 seed
-            } else {
-                kek_hex.zeroize();
-                [0u8; 32] // Will be rejected if actually used
             }
         };
 

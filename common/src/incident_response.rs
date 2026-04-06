@@ -402,7 +402,10 @@ impl IncidentResponseEngine {
         &self,
         executor: impl Fn(&ResponseAction) + Send + Sync + 'static,
     ) {
-        let mut exec = self.action_executor.lock().unwrap_or_else(|e| e.into_inner());
+        let mut exec = self.action_executor.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in incident_response - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         *exec = Some(Box::new(executor));
     }
 
@@ -449,7 +452,10 @@ impl IncidentResponseEngine {
 
         // Get the previous evidence hash for the chain
         let prev_evidence_hash = {
-            let log = self.evidence_log.lock().unwrap_or_else(|e| e.into_inner());
+            let log = self.evidence_log.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in incident_response - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
             log.last()
                 .map(|e| e.evidence_hash.clone())
                 .unwrap_or_else(|| "0".repeat(128)) // 64 zero bytes hex-encoded
@@ -481,7 +487,10 @@ impl IncidentResponseEngine {
         // Append to the immutable evidence log (with bounded capacity)
         const MAX_EVIDENCE: usize = 100_000;
         {
-            let mut log = self.evidence_log.lock().unwrap_or_else(|e| e.into_inner());
+            let mut log = self.evidence_log.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in incident_response - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
             if log.len() >= MAX_EVIDENCE {
                 log.remove(0);
                 tracing::warn!(
@@ -503,7 +512,10 @@ impl IncidentResponseEngine {
 
     /// Return a copy of the full forensic evidence log (append-only, immutable).
     pub fn evidence_log(&self) -> Vec<ForensicEvidence> {
-        let log = self.evidence_log.lock().unwrap_or_else(|e| e.into_inner());
+        let log = self.evidence_log.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in incident_response - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         log.clone()
     }
 
@@ -561,7 +573,10 @@ impl IncidentResponseEngine {
         // Store the incident (with bounded capacity)
         const MAX_INCIDENTS: usize = 100_000;
         {
-            let mut incidents = self.incidents.lock().unwrap_or_else(|e| e.into_inner());
+            let mut incidents = self.incidents.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in incident_response - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
             // Evict oldest resolved incidents first, then oldest unresolved
             if incidents.len() >= MAX_INCIDENTS {
                 if let Some(pos) = incidents.iter().position(|i| i.resolved) {
@@ -605,7 +620,10 @@ impl IncidentResponseEngine {
 
     /// Acknowledge an incident (stops escalation timer).
     pub fn acknowledge(&self, incident_id: &Uuid) -> bool {
-        let mut incidents = self.incidents.lock().unwrap_or_else(|e| e.into_inner());
+        let mut incidents = self.incidents.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in incident_response - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         if let Some(incident) = incidents.iter_mut().find(|i| i.id == *incident_id) {
             incident.acknowledged = true;
             tracing::info!(incident_id = %incident_id, "Incident acknowledged");
@@ -617,7 +635,10 @@ impl IncidentResponseEngine {
 
     /// Resolve an incident.
     pub fn resolve(&self, incident_id: &Uuid) -> bool {
-        let mut incidents = self.incidents.lock().unwrap_or_else(|e| e.into_inner());
+        let mut incidents = self.incidents.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in incident_response - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         if let Some(incident) = incidents.iter_mut().find(|i| i.id == *incident_id) {
             incident.resolved = true;
             crate::metrics::INCIDENTS_ACTIVE.dec(&[
@@ -634,7 +655,10 @@ impl IncidentResponseEngine {
     /// Check all active incidents for SLA violations and escalate as needed.
     /// This should be called periodically (e.g. every 60 seconds).
     pub fn check_escalations(&self) {
-        let mut incidents = self.incidents.lock().unwrap_or_else(|e| e.into_inner());
+        let mut incidents = self.incidents.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in incident_response - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         let now = Instant::now();
 
         for incident in incidents.iter_mut() {
@@ -676,13 +700,19 @@ impl IncidentResponseEngine {
 
     /// Get all active (unresolved) incidents.
     pub fn active_incidents(&self) -> Vec<Incident> {
-        let incidents = self.incidents.lock().unwrap_or_else(|e| e.into_inner());
+        let incidents = self.incidents.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in incident_response - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         incidents.iter().filter(|i| !i.resolved).cloned().collect()
     }
 
     /// Get incident count by severity.
     pub fn incident_counts(&self) -> std::collections::HashMap<IncidentSeverity, usize> {
-        let incidents = self.incidents.lock().unwrap_or_else(|e| e.into_inner());
+        let incidents = self.incidents.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in incident_response - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         let mut counts = std::collections::HashMap::new();
         for i in incidents.iter().filter(|i| !i.resolved) {
             *counts.entry(i.severity).or_insert(0) += 1;
@@ -779,7 +809,10 @@ impl IncidentResponseEngine {
 
     /// Execute a list of response actions.
     fn execute_actions(&self, actions: &[ResponseAction]) {
-        let executor = self.action_executor.lock().unwrap_or_else(|e| e.into_inner());
+        let executor = self.action_executor.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in incident_response - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         for action in actions {
             tracing::info!(action = ?action, "Executing incident response action");
             if let Some(ref exec) = *executor {
@@ -790,7 +823,10 @@ impl IncidentResponseEngine {
 
     /// Track a critical incident and check if lockdown threshold is reached.
     fn track_critical_incident(&self) {
-        let mut timestamps = self.critical_timestamps.lock().unwrap_or_else(|e| e.into_inner());
+        let mut timestamps = self.critical_timestamps.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in incident_response - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         let now = Instant::now();
 
         // Prune old timestamps outside the window
@@ -822,7 +858,10 @@ impl IncidentResponseEngine {
             );
 
             // Run lockdown action callbacks
-            let action_fn = self.action_executor.lock().unwrap_or_else(|e| e.into_inner());
+            let action_fn = self.action_executor.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in incident_response - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
             if let Some(ref run_action) = *action_fn {
                 run_action(&ResponseAction::EnterLockdown);
                 run_action(&ResponseAction::PageOnCall {

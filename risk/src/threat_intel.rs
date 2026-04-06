@@ -611,7 +611,10 @@ impl ThreatIntelManager {
 
         let entries_loaded = bloom.len();
 
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in threat_intel - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         state.insert(
             feed_type,
             FeedState {
@@ -672,7 +675,10 @@ impl ThreatIntelManager {
     /// Returns true if the IP is *probably* in at least one feed.
     /// False positives are possible (~1%) but false negatives are not.
     pub fn is_known_threat_ip(&self, ip: &str) -> bool {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in threat_intel - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         for feed_state in state.values() {
             if feed_state.bloom.contains(ip.as_bytes()) {
                 return true;
@@ -687,7 +693,10 @@ impl ThreatIntelManager {
     /// maximally malicious. Scores from multiple feeds are combined
     /// using a "noisy-OR" model: `1 - product(1 - score_i)`.
     pub fn ip_reputation_score(&self, ip: &str) -> f64 {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in threat_intel - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         let mut product_clean = 1.0f64;
         let mut any_hit = false;
 
@@ -721,7 +730,10 @@ impl ThreatIntelManager {
 
     /// Get detailed IP reputation entries from all feeds that flagged this IP.
     pub fn ip_reputation_details(&self, ip: &str) -> Vec<IpReputationEntry> {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in threat_intel - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         let mut entries = Vec::new();
 
         for (feed_type, feed_state) in state.iter() {
@@ -747,7 +759,10 @@ impl ThreatIntelManager {
 
     /// Check domain reputation.
     pub fn domain_reputation(&self, domain: &str) -> DomainReputation {
-        let cache = self.domain_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = self.domain_cache.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in threat_intel - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         if let Some(cached) = cache.get(domain) {
             return cached.clone();
         }
@@ -763,7 +778,10 @@ impl ThreatIntelManager {
 
     /// Register a known-malicious domain.
     pub fn add_malicious_domain(&self, domain: &str, score: f64, categories: Vec<String>) {
-        let mut cache = self.domain_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = self.domain_cache.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in threat_intel - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         cache.insert(
             domain.to_string(),
             DomainReputation {
@@ -777,13 +795,19 @@ impl ThreatIntelManager {
 
     /// Enrich an IP with GeoIP data for impossible travel detection.
     pub fn geoip_lookup(&self, ip: &str) -> Option<GeoIpInfo> {
-        let table = self.geoip_table.lock().unwrap_or_else(|e| e.into_inner());
+        let table = self.geoip_table.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in threat_intel - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         table.get(ip).cloned()
     }
 
     /// Add a GeoIP entry (for pre-loading or testing).
     pub fn add_geoip_entry(&self, info: GeoIpInfo) {
-        let mut table = self.geoip_table.lock().unwrap_or_else(|e| e.into_inner());
+        let mut table = self.geoip_table.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in threat_intel - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         table.insert(info.ip.clone(), info);
     }
 
@@ -797,7 +821,10 @@ impl ThreatIntelManager {
             .unwrap_or_default()
             .as_secs() as i64;
 
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in threat_intel - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         let mut stale_feeds = Vec::new();
 
         for (feed_type, feed_state) in state.iter() {
@@ -843,7 +870,10 @@ impl ThreatIntelManager {
 
     /// Get metadata for all ingested feeds.
     pub fn feed_metadata(&self) -> Vec<FeedMetadata> {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in threat_intel - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         state.values().map(|s| s.metadata.clone()).collect()
     }
 

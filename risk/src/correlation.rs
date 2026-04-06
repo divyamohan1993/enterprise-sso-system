@@ -1083,7 +1083,10 @@ impl CorrelationEngine {
 
     /// Ingest a security event into the correlation engine.
     pub fn ingest_event(&self, event: SecurityEventRecord) {
-        let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        let mut events = self.events.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in correlation - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
 
         // Prune if buffer is at capacity
         if events.len() >= self.max_buffer_size {
@@ -1100,7 +1103,10 @@ impl CorrelationEngine {
     /// Returns all alerts that fired. Also checks rule chains for
     /// escalation opportunities and emits SIEM events for each alert.
     pub fn evaluate_all(&self) -> Vec<CorrelationAlert> {
-        let events = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        let events = self.events.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in correlation - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         let mut all_alerts = Vec::new();
 
         for rule in &self.rules {
@@ -1113,7 +1119,10 @@ impl CorrelationEngine {
 
         // Record alerts for chain evaluation
         {
-            let mut history = self.alert_history.lock().unwrap_or_else(|e| e.into_inner());
+            let mut history = self.alert_history.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in correlation - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
             let now = unix_now();
             for alert in &all_alerts {
                 history
@@ -1138,7 +1147,10 @@ impl CorrelationEngine {
 
     /// Evaluate rule chains for escalation.
     fn evaluate_chains(&self) -> Vec<CorrelationAlert> {
-        let history = self.alert_history.lock().unwrap_or_else(|e| e.into_inner());
+        let history = self.alert_history.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in correlation - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         let now = unix_now();
         let mut alerts = Vec::new();
 
@@ -1191,13 +1203,19 @@ impl CorrelationEngine {
             .unwrap_or(Duration::from_secs(3600));
 
         let now = Instant::now();
-        let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        let mut events = self.events.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in correlation - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         events.retain(|e| now.duration_since(e.timestamp) <= max_window);
     }
 
     /// Get the current event buffer size.
     pub fn event_count(&self) -> usize {
-        self.events.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.events.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in correlation - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                }).len()
     }
 
     /// Get the number of registered rules.

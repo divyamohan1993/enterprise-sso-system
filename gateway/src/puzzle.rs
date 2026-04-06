@@ -250,7 +250,10 @@ pub fn verify_solution(challenge: &PuzzleChallenge, solution: &[u8; 32]) -> bool
 
     // Check replay: reject already-consumed nonces
     {
-        let mut consumed = CONSUMED_PUZZLES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut consumed = CONSUMED_PUZZLES.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in puzzle - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         // Periodically clean up expired entries
         consumed.cleanup_expired(now);
         if consumed.is_consumed(&challenge.nonce) {
@@ -265,7 +268,10 @@ pub fn verify_solution(challenge: &PuzzleChallenge, solution: &[u8; 32]) -> bool
 
     // Mark nonce as consumed after successful verification
     {
-        let mut consumed = CONSUMED_PUZZLES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut consumed = CONSUMED_PUZZLES.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in puzzle - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         consumed.insert(challenge.nonce, now);
     }
 

@@ -116,7 +116,10 @@ impl BaselineStore {
     /// Numeric fields are updated via exponential moving average so the
     /// baseline drifts smoothly rather than snapping to the latest value.
     pub fn update_baseline(&self, user_id: Uuid, signals: &RiskSignals) {
-        let mut store = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut store = self.inner.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in scoring - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -163,7 +166,10 @@ impl BaselineStore {
     /// Returns `0.0` if no baseline exists yet (benefit of the doubt for new
     /// users — other risk signals still apply).
     pub fn compute_anomaly_score(&self, user_id: &Uuid, signals: &RiskSignals) -> f64 {
-        let store = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let store = self.inner.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in scoring - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         let baseline = match store.get(user_id) {
             Some(b) => b,
             None => return 0.0, // no baseline yet — no anomaly signal
@@ -221,7 +227,10 @@ impl BaselineStore {
 
     /// Get a snapshot of the baseline for a user (if it exists).
     pub fn get_baseline(&self, user_id: &Uuid) -> Option<UserBaseline> {
-        let store = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let store = self.inner.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in scoring - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         store.get(user_id).cloned()
     }
 }
@@ -262,7 +271,10 @@ impl RiskEngine {
     /// so it can be called from the orchestrator's `&self` methods.
     pub fn record_failed_attempt(&self, user_id: &Uuid) {
         let now = Instant::now();
-        let mut counter = self.failed_attempt_counter.lock().unwrap_or_else(|e| e.into_inner());
+        let mut counter = self.failed_attempt_counter.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in scoring - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         let entry = counter.entry(*user_id).or_insert((0, now));
 
         // Reset counter if the window has expired
@@ -275,7 +287,10 @@ impl RiskEngine {
 
     /// Get the server-side failed attempt count for a user.
     fn server_failed_attempts(&self, user_id: &Uuid) -> u32 {
-        let counter = self.failed_attempt_counter.lock().unwrap_or_else(|e| e.into_inner());
+        let counter = self.failed_attempt_counter.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in scoring - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         match counter.get(user_id) {
             Some((count, start)) => {
                 let elapsed = Instant::now().duration_since(*start).as_secs();
@@ -420,7 +435,10 @@ impl RiskEngine {
     /// Check if a user is currently locked out due to too many failed attempts.
     /// Returns true if the user has exceeded `max_attempts` within the tracking window.
     pub fn is_locked_out(&self, user_id: &Uuid, max_attempts: u32) -> bool {
-        let counter = self.failed_attempt_counter.lock().unwrap_or_else(|e| e.into_inner());
+        let counter = self.failed_attempt_counter.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in scoring - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         match counter.get(user_id) {
             Some((count, first_attempt)) => {
                 // Check if still within the lockout window

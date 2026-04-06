@@ -187,11 +187,17 @@ impl SharedRoleRegistry {
     }
 
     pub fn read(&self) -> std::sync::RwLockReadGuard<'_, RoleRegistry> {
-        self.inner.read().unwrap_or_else(|e| e.into_inner())
+        self.inner.read().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in cluster_roles - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                })
     }
 
     pub fn write(&self) -> std::sync::RwLockWriteGuard<'_, RoleRegistry> {
-        self.inner.write().unwrap_or_else(|e| e.into_inner())
+        self.inner.write().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in cluster_roles - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                })
     }
 
     pub fn is_leader(&self) -> bool {

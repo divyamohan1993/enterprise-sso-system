@@ -154,13 +154,19 @@ impl AdaptiveCrypto {
 
         if current >= new_level {
             // Already at or above requested level — clear pending
-            let mut pending = self.pending_escalation.lock().unwrap_or_else(|e| e.into_inner());
+            let mut pending = self.pending_escalation.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in adaptive - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
             *pending = None;
             return;
         }
 
         // Check debounce: has this level been sustained long enough?
-        let mut pending = self.pending_escalation.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pending = self.pending_escalation.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in adaptive - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         match *pending {
             Some((pending_level, first_seen)) if pending_level <= new_level => {
                 let sustained_secs = now.saturating_sub(first_seen) as u64;
@@ -207,7 +213,10 @@ impl AdaptiveCrypto {
 
         // Store the escalation event regardless — it resets cooldown tracking.
         {
-            let mut hist = self.escalation_history.lock().unwrap_or_else(|e| e.into_inner());
+            let mut hist = self.escalation_history.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in adaptive - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
             hist.push((now, new_level));
         }
         // CAS loop: only raise the level.
@@ -239,7 +248,10 @@ impl AdaptiveCrypto {
     /// audit trail.
     pub fn deescalate(&self) {
         let now = unix_timestamp_secs();
-        let hist = self.escalation_history.lock().unwrap_or_else(|e| e.into_inner());
+        let hist = self.escalation_history.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in adaptive - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         if let Some(&(last_ts, _)) = hist.last() {
             let elapsed = now.saturating_sub(last_ts) as u64;
             if elapsed < self.deescalation_cooldown_secs {

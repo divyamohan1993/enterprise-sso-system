@@ -369,7 +369,10 @@ impl AnomalyDetector {
         location: Option<GeoCoord>,
     ) -> AnomalyResult {
         let now = Instant::now();
-        let mut profiles = self.profiles.lock().unwrap_or_else(|e| e.into_inner());
+        let mut profiles = self.profiles.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in anomaly - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         let profile = profiles
             .entry(*user_id)
             .or_insert_with(UserAnomalyProfile::new);
@@ -421,7 +424,10 @@ impl AnomalyDetector {
 
         // --- Cross-user correlation ---
         let cross_user_anomaly = if let Some(ip) = source_ip {
-            let mut tracker = self.ip_tracker.lock().unwrap_or_else(|e| e.into_inner());
+            let mut tracker = self.ip_tracker.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in anomaly - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
             tracker.record(ip, user_id);
             let distinct = tracker.distinct_users_for_ip(ip);
             if distinct > 20 {
@@ -447,12 +453,18 @@ impl AnomalyDetector {
             .min(1.0);
 
         // Check against adaptive threshold
-        let threshold = *self.alert_threshold.lock().unwrap_or_else(|e| e.into_inner());
+        let threshold = *self.alert_threshold.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in anomaly - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         let alert_triggered = composite >= threshold;
 
         // Track score for adaptive threshold tuning
         {
-            let mut history = self.score_history.lock().unwrap_or_else(|e| e.into_inner());
+            let mut history = self.score_history.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in anomaly - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
             history.update(composite);
         }
 
@@ -503,7 +515,10 @@ impl AnomalyDetector {
         location: Option<GeoCoord>,
     ) {
         let now = Instant::now();
-        let mut profiles = self.profiles.lock().unwrap_or_else(|e| e.into_inner());
+        let mut profiles = self.profiles.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in anomaly - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         let profile = profiles
             .entry(*user_id)
             .or_insert_with(UserAnomalyProfile::new);
@@ -554,7 +569,10 @@ impl AnomalyDetector {
 
     /// Record a completed session's duration for the user's profile.
     pub fn record_session_duration(&self, user_id: &Uuid, duration_secs: f64) {
-        let mut profiles = self.profiles.lock().unwrap_or_else(|e| e.into_inner());
+        let mut profiles = self.profiles.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in anomaly - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         if let Some(profile) = profiles.get_mut(user_id) {
             profile.session_duration_stats.update(duration_secs);
         }
@@ -562,7 +580,10 @@ impl AnomalyDetector {
 
     /// Record resource access for session pattern analysis.
     pub fn record_resource_access(&self, user_id: &Uuid, resource: &str) {
-        let mut profiles = self.profiles.lock().unwrap_or_else(|e| e.into_inner());
+        let mut profiles = self.profiles.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in anomaly - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         if let Some(profile) = profiles.get_mut(user_id) {
             let count = profile
                 .resource_access
@@ -580,7 +601,10 @@ impl AnomalyDetector {
         user_id: &Uuid,
         session_resources: &[String],
     ) -> f64 {
-        let profiles = self.profiles.lock().unwrap_or_else(|e| e.into_inner());
+        let profiles = self.profiles.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in anomaly - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         let profile = match profiles.get(user_id) {
             Some(p) => p,
             None => return 0.0, // No history
@@ -619,7 +643,10 @@ impl AnomalyDetector {
     /// Returns false if rate limit exceeded or threshold dangerously high.
     pub fn feedback(&self, was_false_positive: bool) -> bool {
         let now = Instant::now();
-        let mut limiter = self.feedback_limiter.lock().unwrap_or_else(|e| e.into_inner());
+        let mut limiter = self.feedback_limiter.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in anomaly - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
 
         // Reset window if an hour has passed
         if now.duration_since(limiter.window_start) >= Duration::from_secs(3600) {
@@ -641,7 +668,10 @@ impl AnomalyDetector {
         limiter.count += 1;
         drop(limiter);
 
-        let mut threshold = self.alert_threshold.lock().unwrap_or_else(|e| e.into_inner());
+        let mut threshold = self.alert_threshold.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in anomaly - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
         if was_false_positive {
             *threshold = (*threshold + 0.02).min(0.95);
         } else {
@@ -664,7 +694,10 @@ impl AnomalyDetector {
 
     /// Get the current adaptive alert threshold.
     pub fn current_threshold(&self) -> f64 {
-        *self.alert_threshold.lock().unwrap_or_else(|e| e.into_inner())
+        *self.alert_threshold.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in anomaly - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                })
     }
 
     /// Export the anomaly result as a SIEM-compatible JSON value.

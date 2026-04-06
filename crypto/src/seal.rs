@@ -582,7 +582,10 @@ impl KeyRotationScheduler {
                 interval.tick().await;
 
                 let (due, rotation_interval) = {
-                    let sched = scheduler.lock().unwrap_or_else(|e| e.into_inner());
+                    let sched = scheduler.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in seal - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
                     (sched.check_rotation_due(), sched.rotation_interval)
                 };
 
@@ -602,7 +605,10 @@ impl KeyRotationScheduler {
                     );
 
                     // Invoke optional callback
-                    let sched = scheduler.lock().unwrap_or_else(|e| e.into_inner());
+                    let sched = scheduler.lock().unwrap_or_else(|e| {
+                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in seal - recovering: thread panicked while holding lock");
+                    e.into_inner()
+                });
                     if let Some(ref cb) = sched.rotation_callback {
                         cb();
                     }
