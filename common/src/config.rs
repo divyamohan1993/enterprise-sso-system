@@ -5,11 +5,13 @@
 //! file without touching code.
 //!
 //! There is ONE mode: production. The `error_level` flag controls verbosity:
-//! - `Verbose`: show everything including file names, line numbers, full errors
+//! - `Verbose`: show everything including file names, line numbers, full errors.
+//!   All verbose errors are also emitted to the SIEM panel so super admins
+//!   can track and report issues with exact file:line locations.
 //! - `Warn`: show warnings and errors only, no file/line details
 //!
-//! Default is `Warn`. When `MILNET_MILITARY_DEPLOYMENT=1` or
-//! `MILNET_PRODUCTION=1` is set, `Warn` is forced regardless of config.
+//! Default is `Verbose`. Super admins see full error detail on the SIEM
+//! dashboard for active troubleshooting. End users see safe error messages.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -65,13 +67,14 @@ pub struct ErrorLevelConfig {
 }
 
 impl ErrorLevelConfig {
-    /// Create a new config with error level set to Warn (default).
+    /// Create a new config with error level set to Verbose (default).
     ///
-    /// Production and military deployments always default to Warn to prevent
-    /// information leakage through verbose error messages.
+    /// Verbose errors are reported to the SIEM panel for super admin
+    /// troubleshooting with exact file:line locations. End users still
+    /// see safe error messages via the error_response sanitization layer.
     pub const fn new() -> Self {
         Self {
-            level: AtomicU8::new(ErrorLevel::Warn as u8),
+            level: AtomicU8::new(ErrorLevel::Verbose as u8),
         }
     }
 
@@ -87,20 +90,11 @@ impl ErrorLevelConfig {
 
     /// Set the error level at runtime.
     ///
-    /// If `MILNET_MILITARY_DEPLOYMENT=1` or `MILNET_PRODUCTION=1` is set,
-    /// the level is forced to `Warn` regardless of the requested value.
+    /// Verbose errors are always allowed. They are reported to the SIEM
+    /// panel for super admin visibility. End users see sanitized messages.
     pub fn set_level(&self, level: ErrorLevel) {
-        let effective = if is_military_or_production() && level == ErrorLevel::Verbose {
-            tracing::warn!(
-                "error_level: Verbose requested but MILNET_MILITARY_DEPLOYMENT or \
-                 MILNET_PRODUCTION is set — forcing Warn"
-            );
-            ErrorLevel::Warn
-        } else {
-            level
-        };
-        self.level.store(effective as u8, Ordering::Relaxed);
-        tracing::info!(error_level = %effective, "error level changed");
+        self.level.store(level as u8, Ordering::Relaxed);
+        tracing::info!(error_level = %level, "error level changed");
     }
 
     // ── Backwards-compatible shims ──
@@ -117,26 +111,17 @@ impl ErrorLevelConfig {
         self.level()
     }
 
-    /// Backwards-compatible: set error level (ignores proof — no longer needed).
-    /// Developer mode is permanently disabled. Always returns Warn.
-    pub fn set_developer_mode(&self, _enabled: bool, _proof_hex: &str) {
-        tracing::warn!(
-            target: "siem",
-            "SIEM:CRITICAL: developer mode activation attempted. \
-             Developer mode is permanently disabled in production deployment."
-        );
-        self.set_level(ErrorLevel::Warn);
+    /// Backwards-compatible: set error level.
+    /// Maps enabled=true to Verbose, enabled=false to Warn.
+    pub fn set_developer_mode(&self, enabled: bool, _proof_hex: &str) {
+        let level = if enabled { ErrorLevel::Verbose } else { ErrorLevel::Warn };
+        self.set_level(level);
     }
 
     /// Backwards-compatible: set error level without proof.
-    /// Developer mode is permanently disabled. Always returns Warn.
-    pub fn set_developer_mode_unchecked(&self, _enabled: bool) {
-        tracing::warn!(
-            target: "siem",
-            "SIEM:CRITICAL: developer mode unchecked activation attempted. \
-             Developer mode is permanently disabled in production deployment."
-        );
-        self.set_level(ErrorLevel::Warn);
+    pub fn set_developer_mode_unchecked(&self, enabled: bool) {
+        let level = if enabled { ErrorLevel::Verbose } else { ErrorLevel::Warn };
+        self.set_level(level);
     }
 
     /// Backwards-compatible alias for [`set_level`].
@@ -204,8 +189,8 @@ pub fn load_error_level_from_env() {
             tracing::info!("error_level=verbose (requested via MILNET_ERROR_LEVEL)");
         }
         None => {
-            error_level().set_level(ErrorLevel::Warn);
-            tracing::info!("error_level=warn (default)");
+            error_level().set_level(ErrorLevel::Verbose);
+            tracing::info!("error_level=verbose (default -- SIEM panel receives all errors with file:line)");
         }
         Some(other) => {
             tracing::warn!(

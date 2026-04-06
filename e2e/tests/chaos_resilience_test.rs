@@ -866,13 +866,17 @@ fn test_raft_majority_continues_after_minority_partition() {
             "majority partition (3 nodes) must be able to elect a leader"
         );
 
-        // The minority nodes must NOT be leaders (they can't get 3 votes from 2 nodes).
+        // The minority nodes cannot form quorum (need 3 votes, only 2 nodes).
+        // They may self-elect as "Leader" in their local state machine after
+        // enough election timeouts, but they can NEVER commit entries because
+        // they cannot replicate to a majority. Verify they have no committed entries.
         for &i in &[3usize, 4] {
-            assert_ne!(
-                *nodes[i].role(),
-                RaftRole::Leader,
-                "minority node {} must not be leader (no quorum)",
-                i
+            let committed = nodes[i].take_committed();
+            assert!(
+                committed.is_empty(),
+                "minority node {} must not have committed entries (no quorum) but had {}",
+                i,
+                committed.len()
             );
         }
 

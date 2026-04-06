@@ -63,13 +63,24 @@ pub fn log_error_with_location(err: &str) -> String {
 ///
 /// In verbose mode returns `{ "error": "<full detail>", "location": "file:line" }`.
 /// In warn mode returns `{ "error": "<safe message>" }`.
+///
+/// All verbose errors are emitted to SIEM so super admins can track
+/// issues with exact file:line on the dashboard.
 #[track_caller]
 pub fn error_json(err: &str) -> serde_json::Value {
     if error_level().is_verbose() {
         let loc = std::panic::Location::caller();
+        let location = format!("{}:{}", loc.file(), loc.line());
+        // Emit to SIEM panel for super admin visibility
+        tracing::error!(
+            target: "siem",
+            error = err,
+            location = %location,
+            "SIEM:ERROR verbose error report"
+        );
         serde_json::json!({
             "error": err,
-            "location": format!("{}:{}", loc.file(), loc.line()),
+            "location": location,
         })
     } else {
         serde_json::json!({
