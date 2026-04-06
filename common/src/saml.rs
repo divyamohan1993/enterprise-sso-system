@@ -1071,7 +1071,23 @@ impl SamlAssertion {
         };
 
         format!(
-            r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="{id}" IssueInstant="{instant}" Version="2.0"><saml:Issuer>{issuer}</saml:Issuer><saml:Subject>{name_id}<saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer"><saml:SubjectConfirmationData{irt} NotOnOrAfter="{not_on_or_after}" Recipient="{recipient}"/></saml:SubjectConfirmation></saml:Subject>{conditions}<saml:AuthnStatement AuthnInstant="{authn_instant}" SessionIndex="{session_index}"><saml:AuthnContext><saml:AuthnContextClassRef>{authn_context}</saml:AuthnContextClassRef></saml:AuthnContext></saml:AuthnStatement>{attr_statement}</saml:Assertion>"#,
+            concat!(
+                r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" "#,
+                r#"ID="{id}" IssueInstant="{instant}" Version="2.0">"#,
+                r#"<saml:Issuer>{issuer}</saml:Issuer>"#,
+                r#"<saml:Subject>{name_id}"#,
+                r#"<saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">"#,
+                r#"<saml:SubjectConfirmationData{irt} "#,
+                r#"NotOnOrAfter="{not_on_or_after}" Recipient="{recipient}"/>"#,
+                r#"</saml:SubjectConfirmation></saml:Subject>"#,
+                r#"{conditions}"#,
+                r#"<saml:AuthnStatement AuthnInstant="{authn_instant}" "#,
+                r#"SessionIndex="{session_index}">"#,
+                r#"<saml:AuthnContext>"#,
+                r#"<saml:AuthnContextClassRef>{authn_context}</saml:AuthnContextClassRef>"#,
+                r#"</saml:AuthnContext></saml:AuthnStatement>"#,
+                r#"{attr_statement}</saml:Assertion>"#,
+            ),
             id = xml_escape(&self.id),
             instant = xml_escape(&self.issue_instant),
             issuer = xml_escape(&self.issuer),
@@ -1171,7 +1187,16 @@ impl SamlResponse {
         };
 
         format!(
-            r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="{id}" Version="2.0"{irt} IssueInstant="{instant}" Destination="{dest}"><saml:Issuer>{issuer}</saml:Issuer><samlp:Status><samlp:StatusCode Value="{status}"/>{status_msg}</samlp:Status>{assertion}</samlp:Response>"#,
+            concat!(
+                r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" "#,
+                r#"xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" "#,
+                r#"ID="{id}" Version="2.0"{irt} IssueInstant="{instant}" "#,
+                r#"Destination="{dest}">"#,
+                r#"<saml:Issuer>{issuer}</saml:Issuer>"#,
+                r#"<samlp:Status><samlp:StatusCode Value="{status}"/>"#,
+                r#"{status_msg}</samlp:Status>"#,
+                r#"{assertion}</samlp:Response>"#,
+            ),
             id = xml_escape(&self.id),
             irt = in_response_to_attr,
             instant = xml_escape(&self.issue_instant),
@@ -1199,7 +1224,14 @@ impl SamlResponse {
             None => String::new(),
         };
         format!(
-            r#"<!DOCTYPE html><html><body onload="document.forms[0].submit()"><form method="post" action="{acs}"><input type="hidden" name="SAMLResponse" value="{resp}"/>{relay}<noscript><input type="submit" value="Continue"/></noscript></form></body></html>"#,
+            concat!(
+                r#"<!DOCTYPE html><html><body onload="document.forms[0].submit()">"#,
+                r#"<form method="post" action="{acs}">"#,
+                r#"<input type="hidden" name="SAMLResponse" value="{resp}"/>"#,
+                r#"{relay}"#,
+                r#"<noscript><input type="submit" value="Continue"/></noscript>"#,
+                r#"</form></body></html>"#,
+            ),
             acs = xml_escape(acs_url),
             resp = encoded,
             relay = relay,
@@ -1346,7 +1378,17 @@ pub fn build_artifact_resolve_request(
     let request_id = format!("_art_{}", Uuid::new_v4());
     let instant = epoch_to_iso8601(now_epoch());
     format!(
-        r#"<?xml version="1.0"?><SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/"><SOAP-ENV:Body><samlp:ArtifactResolve xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="{id}" Version="2.0" IssueInstant="{instant}"><saml:Issuer>{issuer}</saml:Issuer><samlp:Artifact>{artifact}</samlp:Artifact></samlp:ArtifactResolve></SOAP-ENV:Body></SOAP-ENV:Envelope>"#,
+        concat!(
+            r#"<?xml version="1.0"?>"#,
+            r#"<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/">"#,
+            r#"<SOAP-ENV:Body>"#,
+            r#"<samlp:ArtifactResolve xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" "#,
+            r#"xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" "#,
+            r#"ID="{id}" Version="2.0" IssueInstant="{instant}">"#,
+            r#"<saml:Issuer>{issuer}</saml:Issuer>"#,
+            r#"<samlp:Artifact>{artifact}</samlp:Artifact>"#,
+            r#"</samlp:ArtifactResolve></SOAP-ENV:Body></SOAP-ENV:Envelope>"#,
+        ),
         id = xml_escape(&request_id),
         instant = xml_escape(&instant),
         issuer = xml_escape(idp_entity_id),
@@ -1363,7 +1405,19 @@ pub fn build_artifact_response(
     let response_id = format!("_artresp_{}", Uuid::new_v4());
     let instant = epoch_to_iso8601(now_epoch());
     format!(
-        r#"<?xml version="1.0"?><SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/"><SOAP-ENV:Body><samlp:ArtifactResponse xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="{id}" Version="2.0" IssueInstant="{instant}" InResponseTo="{irt}"><saml:Issuer>{issuer}</saml:Issuer><samlp:Status><samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/></samlp:Status>{response}</samlp:ArtifactResponse></SOAP-ENV:Body></SOAP-ENV:Envelope>"#,
+        concat!(
+            r#"<?xml version="1.0"?>"#,
+            r#"<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/">"#,
+            r#"<SOAP-ENV:Body>"#,
+            r#"<samlp:ArtifactResponse xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" "#,
+            r#"xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" "#,
+            r#"ID="{id}" Version="2.0" IssueInstant="{instant}" InResponseTo="{irt}">"#,
+            r#"<saml:Issuer>{issuer}</saml:Issuer>"#,
+            r#"<samlp:Status><samlp:StatusCode "#,
+            r#"Value="urn:oasis:names:tc:SAML:2.0:status:Success"/></samlp:Status>"#,
+            r#"{response}"#,
+            r#"</samlp:ArtifactResponse></SOAP-ENV:Body></SOAP-ENV:Envelope>"#,
+        ),
         id = xml_escape(&response_id),
         instant = xml_escape(&instant),
         irt = xml_escape(in_response_to),
@@ -1454,7 +1508,14 @@ impl LogoutRequest {
             .collect();
 
         format!(
-            r#"<samlp:LogoutRequest xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="{id}" Version="2.0" IssueInstant="{instant}" Destination="{dest}" Reason="{reason}" NotOnOrAfter="{noa}"><saml:Issuer>{issuer}</saml:Issuer>{name_id}{sessions}</samlp:LogoutRequest>"#,
+            concat!(
+                r#"<samlp:LogoutRequest xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" "#,
+                r#"xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" "#,
+                r#"ID="{id}" Version="2.0" IssueInstant="{instant}" "#,
+                r#"Destination="{dest}" Reason="{reason}" NotOnOrAfter="{noa}">"#,
+                r#"<saml:Issuer>{issuer}</saml:Issuer>"#,
+                r#"{name_id}{sessions}</samlp:LogoutRequest>"#,
+            ),
             id = xml_escape(&self.id),
             instant = xml_escape(&self.issue_instant),
             dest = xml_escape(&self.destination),
@@ -1555,7 +1616,15 @@ impl LogoutResponse {
     /// Generate the LogoutResponse XML.
     pub fn to_xml(&self) -> String {
         format!(
-            r#"<samlp:LogoutResponse xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="{id}" Version="2.0" IssueInstant="{instant}" Destination="{dest}" InResponseTo="{irt}"><saml:Issuer>{issuer}</saml:Issuer><samlp:Status><samlp:StatusCode Value="{status}"/></samlp:Status></samlp:LogoutResponse>"#,
+            concat!(
+                r#"<samlp:LogoutResponse xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" "#,
+                r#"xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" "#,
+                r#"ID="{id}" Version="2.0" IssueInstant="{instant}" "#,
+                r#"Destination="{dest}" InResponseTo="{irt}">"#,
+                r#"<saml:Issuer>{issuer}</saml:Issuer>"#,
+                r#"<samlp:Status><samlp:StatusCode Value="{status}"/></samlp:Status>"#,
+                r#"</samlp:LogoutResponse>"#,
+            ),
             id = xml_escape(&self.id),
             instant = xml_escape(&self.issue_instant),
             dest = xml_escape(&self.destination),
@@ -1822,7 +1891,31 @@ impl SamlIdp {
     /// Generate IdP metadata XML (EntityDescriptor).
     pub fn generate_metadata(&self) -> String {
         format!(
-            r#"<?xml version="1.0"?><md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" entityID="{entity_id}"><md:IDPSSODescriptor WantAuthnRequestsSigned="true" protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol"><md:NameIDFormat>{nid_persistent}</md:NameIDFormat><md:NameIDFormat>{nid_transient}</md:NameIDFormat><md:NameIDFormat>{nid_email}</md:NameIDFormat><md:SingleSignOnService Binding="{bind_redirect}" Location="{sso_url}"/><md:SingleSignOnService Binding="{bind_post}" Location="{sso_url}"/><md:SingleLogoutService Binding="{bind_redirect}" Location="{slo_url}"/><md:SingleLogoutService Binding="{bind_post}" Location="{slo_url}"/><md:ArtifactResolutionService Binding="{bind_soap}" Location="{art_url}" index="0" isDefault="true"/></md:IDPSSODescriptor><md:Organization><md:OrganizationName xml:lang="en">{org_name}</md:OrganizationName><md:OrganizationDisplayName xml:lang="en">{org_name}</md:OrganizationDisplayName><md:OrganizationURL xml:lang="en">{entity_id}</md:OrganizationURL></md:Organization><md:ContactPerson contactType="technical"><md:EmailAddress>{contact}</md:EmailAddress></md:ContactPerson></md:EntityDescriptor>"#,
+            concat!(
+                r#"<?xml version="1.0"?>"#,
+                r#"<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" "#,
+                r#"entityID="{entity_id}">"#,
+                r#"<md:IDPSSODescriptor WantAuthnRequestsSigned="true" "#,
+                r#"protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">"#,
+                r#"<md:NameIDFormat>{nid_persistent}</md:NameIDFormat>"#,
+                r#"<md:NameIDFormat>{nid_transient}</md:NameIDFormat>"#,
+                r#"<md:NameIDFormat>{nid_email}</md:NameIDFormat>"#,
+                r#"<md:SingleSignOnService Binding="{bind_redirect}" Location="{sso_url}"/>"#,
+                r#"<md:SingleSignOnService Binding="{bind_post}" Location="{sso_url}"/>"#,
+                r#"<md:SingleLogoutService Binding="{bind_redirect}" Location="{slo_url}"/>"#,
+                r#"<md:SingleLogoutService Binding="{bind_post}" Location="{slo_url}"/>"#,
+                r#"<md:ArtifactResolutionService Binding="{bind_soap}" "#,
+                r#"Location="{art_url}" index="0" isDefault="true"/>"#,
+                r#"</md:IDPSSODescriptor>"#,
+                r#"<md:Organization>"#,
+                r#"<md:OrganizationName xml:lang="en">{org_name}</md:OrganizationName>"#,
+                r#"<md:OrganizationDisplayName xml:lang="en">{org_name}</md:OrganizationDisplayName>"#,
+                r#"<md:OrganizationURL xml:lang="en">{entity_id}</md:OrganizationURL>"#,
+                r#"</md:Organization>"#,
+                r#"<md:ContactPerson contactType="technical">"#,
+                r#"<md:EmailAddress>{contact}</md:EmailAddress>"#,
+                r#"</md:ContactPerson></md:EntityDescriptor>"#,
+            ),
             entity_id = xml_escape(&self.config.entity_id),
             nid_persistent = NameIdFormat::Persistent.as_uri(),
             nid_transient = NameIdFormat::Transient.as_uri(),
@@ -2193,7 +2286,14 @@ fn encrypt_assertion_aes256gcm(assertion_xml: &str) -> Result<String, String> {
     let nonce_b64 = BASE64_STD.encode(nonce);
 
     Ok(format!(
-        r#"<xenc:EncryptedData xmlns:xenc="http://www.w3.org/2001/04/xmlenc#" Type="http://www.w3.org/2001/04/xmlenc#Element"><xenc:EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes256-gcm"/><xenc:CipherData><xenc:CipherValue>{nonce}:{ct}</xenc:CipherValue></xenc:CipherData></xenc:EncryptedData>"#,
+        concat!(
+            r#"<xenc:EncryptedData xmlns:xenc="http://www.w3.org/2001/04/xmlenc#" "#,
+            r#"Type="http://www.w3.org/2001/04/xmlenc#Element">"#,
+            r#"<xenc:EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes256-gcm"/>"#,
+            r#"<xenc:CipherData>"#,
+            r#"<xenc:CipherValue>{nonce}:{ct}</xenc:CipherValue>"#,
+            r#"</xenc:CipherData></xenc:EncryptedData>"#,
+        ),
         nonce = nonce_b64,
         ct = ct_b64,
     ))
@@ -2221,7 +2321,22 @@ pub fn sign_xml_enveloped(
     let sig_b64 = BASE64_STD.encode(sig_value);
 
     let signature_xml = format!(
-        r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="{alg}"/><ds:Reference URI=""><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>{sig}</ds:SignatureValue></ds:Signature>"#,
+        concat!(
+            r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">"#,
+            r#"<ds:SignedInfo>"#,
+            r#"<ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#,
+            r#"<ds:SignatureMethod Algorithm="{alg}"/>"#,
+            r#"<ds:Reference URI="">"#,
+            r#"<ds:Transforms>"#,
+            r#"<ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/>"#,
+            r#"<ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#,
+            r#"</ds:Transforms>"#,
+            r#"<ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>"#,
+            r#"<ds:DigestValue>{digest}</ds:DigestValue>"#,
+            r#"</ds:Reference></ds:SignedInfo>"#,
+            r#"<ds:SignatureValue>{sig}</ds:SignatureValue>"#,
+            r#"</ds:Signature>"#,
+        ),
         alg = algorithm.as_uri(),
         digest = digest_b64,
         sig = sig_b64,

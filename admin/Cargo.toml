@@ -43,6 +43,7 @@ zeroize.workspace = true
 
 [dev-dependencies]
 common = { path = "../common", features = ["test-support"] }
+http-body-util = "0.1"
 
 [features]
 default = ["production"]

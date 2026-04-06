@@ -23,6 +23,8 @@ uuid = { version = "1", features = ["v4"] }
 serde_json = "1"
 postcard = { version = "1", features = ["alloc"] }
 sha2 = "0.10"
+risk = { path = "../risk" }
+kt = { path = "../kt" }
 
 [features]
 default = ["production"]
@@ -161,4 +163,44 @@ doc = false
 [[bin]]
 name = "fuzz_totp"
 path = "fuzz_targets/fuzz_totp.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_admin_challenge"
+path = "fuzz_targets/fuzz_admin_challenge.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_risk_scoring"
+path = "fuzz_targets/fuzz_risk_scoring.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_merkle_proof"
+path = "fuzz_targets/fuzz_merkle_proof.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_gossip_message"
+path = "fuzz_targets/fuzz_gossip_message.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_crdt_merge"
+path = "fuzz_targets/fuzz_crdt_merge.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_vector_clock"
+path = "fuzz_targets/fuzz_vector_clock.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_session_token"
+path = "fuzz_targets/fuzz_session_token.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_tls_handshake"
+path = "fuzz_targets/fuzz_tls_handshake.rs"
 doc = false

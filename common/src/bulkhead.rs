@@ -181,6 +181,7 @@ pub struct BulkheadPermit<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn bulkhead_allows_within_limit() {
@@ -214,5 +215,258 @@ mod tests {
         assert_eq!(bh.available_permits(), 1);
         let _p2 = bh.acquire().await.unwrap();
         assert_eq!(bh.total_accepted(), 2);
+    }
+
+    // ── 4. Concurrent acquire up to limit ────────────────────────────────
+
+    #[tokio::test]
+    async fn concurrent_acquire_up_to_limit() {
+        let bh = Arc::new(Bulkhead::new("test-concurrent", 5, 10, Duration::from_secs(1)));
+        let mut permits = Vec::new();
+        for _ in 0..5 {
+            permits.push(bh.acquire().await.unwrap());
+        }
+        assert_eq!(bh.available_permits(), 0);
+        assert_eq!(bh.total_accepted(), 5);
+    }
+
+    // ── 5. Wait queue respects depth limit ───────────────────────────────
+
+    #[tokio::test]
+    async fn wait_queue_depth_limit_rejects_overflow() {
+        // 1 permit, max 1 waiter
+        let bh = Arc::new(Bulkhead::new("test-depth", 1, 1, Duration::from_millis(50)));
+
+        // Take the only permit
+        let _p1 = bh.acquire().await.unwrap();
+
+        // First waiter enters queue (queue depth = 1)
+        let bh2 = bh.clone();
+        let waiter = tokio::spawn(async move {
+            bh2.acquire().await
+        });
+
+        // Give waiter time to enter queue
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        // Second waiter should be rejected (queue full: 1 waiting > max_wait_queue=1)
+        let bh3 = bh.clone();
+        let result = bh3.acquire().await;
+        assert!(result.is_err());
+        if let Err(BulkheadError::Rejected { service, .. }) = result {
+            assert_eq!(service, "test-depth");
+        }
+
+        // Clean up: drop first permit so waiter can proceed
+        drop(_p1);
+        let _ = waiter.await;
+    }
+
+    // ── 6. Wait queue FIFO ordering (via timing) ─────────────────────────
+
+    #[tokio::test]
+    async fn wait_queue_fifo_ordering() {
+        let bh = Arc::new(Bulkhead::new("test-fifo", 1, 10, Duration::from_secs(2)));
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // Take the permit
+        let permit = bh.acquire().await.unwrap();
+
+        // Spawn two waiters
+        let mut handles = Vec::new();
+        for i in 0..2 {
+            let bh_c = bh.clone();
+            let order_c = order.clone();
+            handles.push(tokio::spawn(async move {
+                let _p = bh_c.acquire().await.unwrap();
+                order_c.lock().unwrap().push(i);
+                // Hold briefly so next waiter can acquire after us
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }));
+            // Stagger spawns so ordering is deterministic
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Release permit
+        drop(permit);
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let acquired_order = order.lock().unwrap().clone();
+        assert_eq!(acquired_order, vec![0, 1], "FIFO: waiter 0 should acquire before waiter 1");
+    }
+
+    // ── 7. Bulkhead isolation ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn bulkhead_isolation_separate_pools() {
+        let auth_bh = Bulkhead::new("auth", 1, 0, Duration::from_millis(10));
+        let db_bh = Bulkhead::new("db", 2, 5, Duration::from_secs(1));
+
+        // Exhaust auth bulkhead
+        let _auth_p = auth_bh.acquire().await.unwrap();
+        assert_eq!(auth_bh.available_permits(), 0);
+
+        // DB bulkhead should still be fully available
+        let _db_p1 = db_bh.acquire().await.unwrap();
+        let _db_p2 = db_bh.acquire().await.unwrap();
+        assert_eq!(db_bh.total_accepted(), 2);
+    }
+
+    // ── 8. Metrics: accepted count, rejected count ───────────────────────
+
+    #[tokio::test]
+    async fn metrics_accepted_and_rejected_counts() {
+        let bh = Bulkhead::new("test-metrics", 1, 0, Duration::from_millis(10));
+
+        assert_eq!(bh.total_accepted(), 0);
+        assert_eq!(bh.total_rejected(), 0);
+
+        let _p = bh.acquire().await.unwrap();
+        assert_eq!(bh.total_accepted(), 1);
+
+        // With 0 wait queue and permit taken, next call rejected immediately
+        let _ = bh.acquire().await;
+        assert_eq!(bh.total_rejected(), 1);
+
+        drop(_p);
+        let _p2 = bh.acquire().await.unwrap();
+        assert_eq!(bh.total_accepted(), 2);
+    }
+
+    // ── 9. Timeout on wait queue ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn wait_timeout_returns_timeout_error() {
+        let bh = Arc::new(Bulkhead::new("test-timeout", 1, 10, Duration::from_millis(50)));
+        let _p = bh.acquire().await.unwrap();
+
+        let bh2 = bh.clone();
+        let result = tokio::spawn(async move {
+            bh2.acquire().await
+        }).await.unwrap();
+
+        match result {
+            Err(BulkheadError::WaitTimeout { service, waited }) => {
+                assert_eq!(service, "test-timeout");
+                assert!(waited.as_millis() >= 40, "should have waited ~50ms");
+            }
+            other => panic!("expected WaitTimeout, got {:?}", other.is_ok()),
+        }
+    }
+
+    // ── 10. Zero-capacity bulkhead rejects everything ────────────────────
+
+    #[tokio::test]
+    async fn zero_capacity_rejects_all() {
+        let bh = Bulkhead::new("test-zero", 0, 0, Duration::from_millis(10));
+
+        // With 0 permits and 0 wait queue, should reject or timeout
+        let result = bh.acquire().await;
+        assert!(result.is_err());
+        assert_eq!(bh.total_rejected(), 1);
+    }
+
+    // ── 11. Single-capacity bulkhead serializes ──────────────────────────
+
+    #[tokio::test]
+    async fn single_capacity_serializes() {
+        let bh = Arc::new(Bulkhead::new("test-serial", 1, 10, Duration::from_secs(1)));
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let max_concurrent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let bh_c = bh.clone();
+            let ctr = counter.clone();
+            let max_c = max_concurrent.clone();
+            handles.push(tokio::spawn(async move {
+                let _p = bh_c.acquire().await.unwrap();
+                let current = ctr.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                max_c.fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                ctr.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        assert!(
+            max_concurrent.load(std::sync::atomic::Ordering::SeqCst) <= 1,
+            "single-capacity bulkhead should never have >1 concurrent"
+        );
+    }
+
+    // ── 12. Rapid acquire/release cycle (no leaks) ───────────────────────
+
+    #[tokio::test]
+    async fn rapid_acquire_release_no_leaks() {
+        let bh = Bulkhead::new("test-rapid", 2, 5, Duration::from_secs(1));
+
+        for _ in 0..100 {
+            let _p = bh.acquire().await.unwrap();
+            // Permit drops here
+        }
+
+        assert_eq!(bh.available_permits(), 2, "all permits should be released");
+        assert_eq!(bh.total_accepted(), 100);
+        assert_eq!(bh.total_rejected(), 0);
+    }
+
+    // ── 13. Drop guard releases permit automatically ─────────────────────
+
+    #[tokio::test]
+    async fn drop_guard_releases_permit() {
+        let bh = Bulkhead::new("test-drop", 1, 5, Duration::from_secs(1));
+
+        {
+            let permit = bh.acquire().await.unwrap();
+            assert_eq!(bh.available_permits(), 0);
+            drop(permit);
+        }
+
+        assert_eq!(bh.available_permits(), 1);
+
+        // Should be able to acquire again
+        let _p = bh.acquire().await.unwrap();
+        assert_eq!(bh.available_permits(), 0);
+    }
+
+    // ── Extra: service_name accessor ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn service_name_accessor() {
+        let bh = Bulkhead::new("my-service", 5, 10, Duration::from_secs(1));
+        assert_eq!(bh.service_name(), "my-service");
+    }
+
+    // ── Extra: error display formatting ──────────────────────────────────
+
+    #[test]
+    fn error_display_rejected() {
+        let err = BulkheadError::Rejected {
+            service: "auth".into(),
+            max_concurrent: 5,
+            max_wait_queue: 10,
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("auth"));
+        assert!(msg.contains("5"));
+        assert!(msg.contains("10"));
+    }
+
+    #[test]
+    fn error_display_timeout() {
+        let err = BulkheadError::WaitTimeout {
+            service: "db".into(),
+            waited: Duration::from_millis(500),
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("db"));
+        assert!(msg.contains("500"));
     }
 }

@@ -50,7 +50,11 @@ uuid.workspace = true
 criterion.workspace = true
 aes-gcm.workspace = true
 sha2.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+opaque = { path = "../opaque" }
 common = { path = "../common", features = ["test-support"] }
+serial_test.workspace = true
 
 [[bench]]
 name = "crypto_bench"

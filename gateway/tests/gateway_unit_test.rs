@@ -155,6 +155,7 @@ fn test_puzzle_challenge_serialization_roundtrip() {
         timestamp: 1700000000,
         xwing_server_pk: Some(vec![0xAA; 100]),
         xwing_server_pk_fingerprint: Some("abcdef".to_string()),
+        dod_banner: Some(gateway::puzzle::DOD_BANNER.to_string()),
     };
     let bytes = postcard::to_allocvec(&challenge).unwrap();
     let decoded: PuzzleChallenge = postcard::from_bytes(&bytes).unwrap();

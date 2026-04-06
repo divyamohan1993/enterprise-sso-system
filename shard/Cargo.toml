@@ -21,6 +21,9 @@ rcgen.workspace = true
 tracing.workspace = true
 zeroize.workspace = true
 
+[dev-dependencies]
+serial_test.workspace = true
+
 [features]
 default = ["production"]
 production = ["common/production"]

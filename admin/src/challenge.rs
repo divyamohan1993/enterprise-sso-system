@@ -13,6 +13,99 @@ pub async fn challenge_page() -> Response {
         .into_response()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    async fn get_challenge_response() -> axum::http::Response<Body> {
+        let app = axum::Router::new().route("/challenge", axum::routing::get(challenge_page));
+        let request = Request::builder()
+            .uri("/challenge")
+            .body(Body::empty())
+            .unwrap();
+        app.oneshot(request).await.unwrap()
+    }
+
+    // ── 1. Returns 200 OK ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn challenge_page_returns_200() {
+        let resp = get_challenge_response().await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── 2. Content-Type is text/html ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn challenge_page_content_type_html() {
+        let resp = get_challenge_response().await;
+        let ct = resp.headers().get(header::CONTENT_TYPE).unwrap();
+        assert_eq!(ct, "text/html; charset=utf-8");
+    }
+
+    // ── 3. Contains required security challenge fields ───────────────────
+
+    #[tokio::test]
+    async fn challenge_html_contains_required_sections() {
+        let html = CHALLENGE_HTML;
+        assert!(html.contains("MILNET SSO Security Challenge"));
+        assert!(html.contains("Live Endpoints"));
+        assert!(html.contains("Cryptographic Stack"));
+        assert!(html.contains("Rules of Engagement"));
+        assert!(html.contains("ML-DSA-87"));
+        assert!(html.contains("FROST 3-of-5"));
+        assert!(html.contains("OPAQUE"));
+        assert!(html.contains("AES-256-GCM"));
+    }
+
+    // ── 4. HTML is valid DOCTYPE ─────────────────────────────────────────
+
+    #[test]
+    fn challenge_html_starts_with_doctype() {
+        assert!(CHALLENGE_HTML.starts_with("<!DOCTYPE html>"));
+    }
+
+    // ── 5. Contains accessibility meta tags ──────────────────────────────
+
+    #[test]
+    fn challenge_html_has_viewport_meta() {
+        assert!(CHALLENGE_HTML.contains("viewport"));
+        assert!(CHALLENGE_HTML.contains("charset"));
+    }
+
+    // ── 6. Contains architecture diagram ─────────────────────────────────
+
+    #[test]
+    fn challenge_html_contains_architecture() {
+        assert!(CHALLENGE_HTML.contains("GATEWAY VM"));
+        assert!(CHALLENGE_HTML.contains("CORE VM"));
+        assert!(CHALLENGE_HTML.contains("TSS VM"));
+    }
+
+    // ── 7. Two calls return identical HTML (deterministic) ───────────────
+
+    #[tokio::test]
+    async fn challenge_page_is_deterministic() {
+        use http_body_util::BodyExt;
+        let resp1 = get_challenge_response().await;
+        let resp2 = get_challenge_response().await;
+
+        let body1 = resp1.into_body().collect().await.unwrap().to_bytes();
+        let body2 = resp2.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body1, body2);
+    }
+
+    // ── 8. Classification banner present ─────────────────────────────────
+
+    #[test]
+    fn challenge_html_has_classification_banner() {
+        assert!(CHALLENGE_HTML.contains("UNCLASSIFIED // PUBLIC CHALLENGE"));
+    }
+}
+
 const CHALLENGE_HTML: &str = r#"<!DOCTYPE html>
 <html lang="en">
 <head>

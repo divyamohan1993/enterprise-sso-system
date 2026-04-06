@@ -1,6 +1,83 @@
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use uuid::Uuid;
 use zeroize::Zeroize;
+
+// ── UUID Newtype Wrappers ────────────────────────────────────────────
+//
+// Strongly-typed ID wrappers prevent accidental mix-up of user/tenant/session/portal UUIDs.
+// New code should use these instead of raw Uuid for domain identifiers.
+// Existing code will be migrated gradually.
+
+macro_rules! uuid_newtype {
+    ($(#[$meta:meta])* $Name:ident) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[serde(transparent)]
+        pub struct $Name(pub Uuid);
+
+        impl $Name {
+            /// Generate a new random identifier.
+            pub fn new() -> Self {
+                Self(Uuid::new_v4())
+            }
+
+            /// Wrap an existing UUID.
+            pub fn from_uuid(uuid: Uuid) -> Self {
+                Self(uuid)
+            }
+
+            /// Borrow the inner UUID.
+            pub fn as_uuid(&self) -> &Uuid {
+                &self.0
+            }
+        }
+
+        impl Default for $Name {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
+        impl fmt::Display for $Name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                self.0.fmt(f)
+            }
+        }
+
+        impl From<Uuid> for $Name {
+            fn from(uuid: Uuid) -> Self {
+                Self(uuid)
+            }
+        }
+
+        impl From<$Name> for Uuid {
+            fn from(id: $Name) -> Self {
+                id.0
+            }
+        }
+    };
+}
+
+uuid_newtype!(
+    /// Strongly-typed user identifier. Prevents accidental mix-up with other UUID types.
+    UserId
+);
+
+uuid_newtype!(
+    /// Strongly-typed tenant identifier.
+    TenantId
+);
+
+uuid_newtype!(
+    /// Strongly-typed session identifier.
+    SessionId
+);
+
+uuid_newtype!(
+    /// Strongly-typed portal/client identifier.
+    PortalId
+);
 
 /// Serde helper for `[u8; 64]` — serde only supports arrays up to 32 natively.
 mod byte_array_64 {
@@ -499,4 +576,98 @@ impl std::fmt::Debug for StoredRecoveryCode {
             .field("expires_at", &self.expires_at)
             .finish()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    macro_rules! test_uuid_newtype {
+        ($Name:ident, $mod_name:ident) => {
+            mod $mod_name {
+                use super::*;
+
+                #[test]
+                fn new_generates_unique() {
+                    let a = $Name::new();
+                    let b = $Name::new();
+                    assert_ne!(a, b);
+                }
+
+                #[test]
+                fn from_uuid_roundtrip() {
+                    let raw = Uuid::new_v4();
+                    let typed = $Name::from_uuid(raw);
+                    assert_eq!(*typed.as_uuid(), raw);
+                    let back: Uuid = typed.into();
+                    assert_eq!(back, raw);
+                }
+
+                #[test]
+                fn from_trait() {
+                    let raw = Uuid::new_v4();
+                    let typed: $Name = raw.into();
+                    assert_eq!(typed.0, raw);
+                }
+
+                #[test]
+                fn display_matches_inner() {
+                    let raw = Uuid::new_v4();
+                    let typed = $Name::from_uuid(raw);
+                    assert_eq!(typed.to_string(), raw.to_string());
+                }
+
+                #[test]
+                fn serde_roundtrip() {
+                    let original = $Name::new();
+                    let json = serde_json::to_string(&original).unwrap();
+                    let deserialized: $Name = serde_json::from_str(&json).unwrap();
+                    assert_eq!(original, deserialized);
+                }
+
+                #[test]
+                fn serde_transparent() {
+                    let raw = Uuid::new_v4();
+                    let typed = $Name::from_uuid(raw);
+                    let typed_json = serde_json::to_string(&typed).unwrap();
+                    let raw_json = serde_json::to_string(&raw).unwrap();
+                    assert_eq!(typed_json, raw_json);
+                }
+
+                #[test]
+                fn hash_consistency() {
+                    let raw = Uuid::new_v4();
+                    let a = $Name::from_uuid(raw);
+                    let b = $Name::from_uuid(raw);
+                    let mut set = HashSet::new();
+                    set.insert(a);
+                    assert!(set.contains(&b));
+                }
+
+                #[test]
+                fn equality() {
+                    let raw = Uuid::new_v4();
+                    let a = $Name::from_uuid(raw);
+                    let b = $Name::from_uuid(raw);
+                    assert_eq!(a, b);
+
+                    let c = $Name::new();
+                    assert_ne!(a, c);
+                }
+
+                #[test]
+                fn copy_semantics() {
+                    let a = $Name::new();
+                    let b = a;
+                    assert_eq!(a, b);
+                }
+            }
+        };
+    }
+
+    test_uuid_newtype!(UserId, user_id);
+    test_uuid_newtype!(TenantId, tenant_id);
+    test_uuid_newtype!(SessionId, session_id);
+    test_uuid_newtype!(PortalId, portal_id);
 }

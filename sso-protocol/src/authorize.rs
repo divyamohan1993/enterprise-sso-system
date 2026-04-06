@@ -543,10 +543,22 @@ impl PersistentAuthorizationStore {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
         // DB stores hashed code keys and blinded code_challenges — load them directly.
         let rows: Vec<(String, String, String, Uuid, Option<String>, i32, Option<String>, i64, bool)> =
-            sqlx::query_as("SELECT code_hash, client_id, redirect_uri, user_id, code_challenge_blind, tier, nonce, created_at, consumed FROM authorization_codes WHERE created_at > $1")
-            .bind(now - (CODE_EXPIRY_SECS * 2)).fetch_all(&self.pool).await.map_err(|e| format!("load codes: {e}"))?;
+            sqlx::query_as(
+                "SELECT code_hash, client_id, redirect_uri, user_id, \
+                 code_challenge_blind, tier, nonce, created_at, consumed \
+                 FROM authorization_codes WHERE created_at > $1",
+            )
+            .bind(now - (CODE_EXPIRY_SECS * 2))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| format!("load codes: {e}"))?;
         for (code_hash, cid, ruri, uid, cc_blind, tier, nonce, cat, consumed) in rows {
-            self.memory.codes.insert(code_hash, AuthorizationCode { code: String::new(), client_id: cid, redirect_uri: ruri, user_id: uid, scope: String::new(), code_challenge: cc_blind, nonce, tier: tier as u8, expires_at: cat + CODE_EXPIRY_SECS, consumed });
+            self.memory.codes.insert(code_hash, AuthorizationCode {
+                code: String::new(), client_id: cid, redirect_uri: ruri,
+                user_id: uid, scope: String::new(), code_challenge: cc_blind,
+                nonce, tier: tier as u8, expires_at: cat + CODE_EXPIRY_SECS,
+                consumed,
+            });
         }
         Ok(())
     }
@@ -623,10 +635,46 @@ impl PersistentAuthorizationStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test] fn test_create_and_consume() { let mut s = AuthorizationStore::new(); let uid = Uuid::new_v4(); let c = s.create_code("c1","https://ex.com/cb",uid,"openid",Some("ch".into()),None).unwrap(); assert!(!s.is_code_consumed(&c)); let r = s.consume_code(&c).unwrap(); assert_eq!(r.client_id,"c1"); }
-    #[test] fn test_double_consume() { let mut s = AuthorizationStore::new(); let c = s.create_code("c1","https://ex.com/cb",Uuid::new_v4(),"openid",Some("ch".into()),None).unwrap(); assert!(s.consume_code(&c).is_some()); assert!(s.consume_code(&c).is_none()); }
-    #[test] fn test_pkce_required() { let mut s = AuthorizationStore::new(); assert!(s.create_code("c1","https://ex.com/cb",Uuid::new_v4(),"openid",None,None).is_err()); }
-    #[test] fn test_with_tier() { let mut s = AuthorizationStore::new(); let c = s.create_code_with_tier("c1","https://ex.com/cb",Uuid::new_v4(),"openid",Some("ch".into()),Some("n".into()),3).unwrap(); assert_eq!(s.consume_code(&c).unwrap().tier, 3); }
+    #[test]
+    fn test_create_and_consume() {
+        let mut s = AuthorizationStore::new();
+        let uid = Uuid::new_v4();
+        let c = s.create_code(
+            "c1", "https://ex.com/cb", uid, "openid", Some("ch".into()), None,
+        ).unwrap();
+        assert!(!s.is_code_consumed(&c));
+        let r = s.consume_code(&c).unwrap();
+        assert_eq!(r.client_id, "c1");
+    }
+
+    #[test]
+    fn test_double_consume() {
+        let mut s = AuthorizationStore::new();
+        let c = s.create_code(
+            "c1", "https://ex.com/cb", Uuid::new_v4(), "openid",
+            Some("ch".into()), None,
+        ).unwrap();
+        assert!(s.consume_code(&c).is_some());
+        assert!(s.consume_code(&c).is_none());
+    }
+
+    #[test]
+    fn test_pkce_required() {
+        let mut s = AuthorizationStore::new();
+        assert!(s.create_code(
+            "c1", "https://ex.com/cb", Uuid::new_v4(), "openid", None, None,
+        ).is_err());
+    }
+
+    #[test]
+    fn test_with_tier() {
+        let mut s = AuthorizationStore::new();
+        let c = s.create_code_with_tier(
+            "c1", "https://ex.com/cb", Uuid::new_v4(), "openid",
+            Some("ch".into()), Some("n".into()), 3,
+        ).unwrap();
+        assert_eq!(s.consume_code(&c).unwrap().tier, 3);
+    }
     #[test] fn test_unknown_consumed() { assert!(AuthorizationStore::new().is_code_consumed("nope")); }
     #[test] fn test_code_not_stored_plaintext() {
         let mut s = AuthorizationStore::new();

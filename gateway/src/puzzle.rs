@@ -193,6 +193,30 @@ pub trait DistributedPuzzleStore: Send + Sync {
     fn check_and_consume(&self, nonce: &[u8; 32], timestamp: i64) -> Result<bool, String>;
 }
 
+/// DoD Standard Notice and Consent Banner (DISA STIG V-222396).
+/// Must be displayed before any authentication interaction.
+pub const DOD_BANNER: &str = "\
+You are accessing a U.S. Government (USG) Information System (IS) that is \
+provided for USG-authorized use only.\n\n\
+By using this IS (which includes any device attached to this IS), you consent \
+to the following conditions:\n\
+- The USG routinely intercepts and monitors communications on this IS for \
+purposes including, but not limited to, penetration testing, COMSEC monitoring, \
+network operations and defense, personnel misconduct (PM), law enforcement (LE), \
+and counterintelligence (CI) investigations.\n\
+- At any time, the USG may inspect and seize data stored on this IS.\n\
+- Communications using, or data stored on, this IS are not private, are subject \
+to routine monitoring, interception, and search, and may be disclosed or used \
+for any USG-authorized purpose.\n\
+- This IS includes security measures (e.g., authentication and access controls) \
+to protect USG interests -- not for your personal benefit or privacy.\n\
+- Notwithstanding the above, using this IS does not constitute consent to PM, \
+LE or CI investigative searching or monitoring of the content of privileged \
+communications, or work product, related to personal representation or services \
+by attorneys, psychotherapists, or clergy, and their assistants. Such \
+communications and work product are private and confidential. See User Agreement \
+for details.";
+
 /// A proof-of-work challenge sent by the gateway to connecting clients.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PuzzleChallenge {
@@ -207,10 +231,14 @@ pub struct PuzzleChallenge {
     /// SHA-256 fingerprint of the server's X-Wing public key (hex-encoded).
     /// Clients SHOULD verify this against a pinned set of trusted fingerprints
     /// before encapsulating.  If the fingerprint does not match, the client
-    /// MUST abort the connection — a mismatch indicates a potential key
+    /// MUST abort the connection -- a mismatch indicates a potential key
     /// substitution or man-in-the-middle attack.
     #[serde(default)]
     pub xwing_server_pk_fingerprint: Option<String>,
+    /// DoD Standard Notice and Consent Banner (DISA STIG V-222396).
+    /// Always present in the puzzle challenge so clients display it before auth.
+    #[serde(default)]
+    pub dod_banner: Option<String>,
 }
 
 /// A client's solution to a [`PuzzleChallenge`].
@@ -241,6 +269,7 @@ pub fn generate_challenge(difficulty: u8) -> PuzzleChallenge {
         timestamp,
         xwing_server_pk: None,
         xwing_server_pk_fingerprint: None,
+        dod_banner: Some(DOD_BANNER.to_string()),
     }
 }
 

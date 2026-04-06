@@ -207,6 +207,21 @@ pub enum RaftMessage {
         term: Term,
         vote_granted: bool,
     },
+    /// Pre-vote request (Raft dissertation Section 9.6).
+    /// Sent before a real election to avoid disrupting the cluster.
+    /// The candidate does NOT increment its term; it proposes term+1.
+    PreVoteRequest {
+        candidate_id: NodeId,
+        proposed_term: Term,
+        last_log_index: LogIndex,
+        last_log_term: Term,
+    },
+    /// Response to a pre-vote request.
+    PreVoteResponse {
+        voter_id: NodeId,
+        proposed_term: Term,
+        vote_granted: bool,
+    },
     /// Sent by the leader to replicate entries and as heartbeats.
     AppendEntries {
         term: Term,
@@ -290,6 +305,9 @@ impl RaftMessage {
             | Self::RequestVoteResponse { term, .. }
             | Self::AppendEntries { term, .. }
             | Self::AppendEntriesResponse { term, .. } => *term,
+            // Pre-vote messages use proposed_term but don't affect real term.
+            Self::PreVoteRequest { proposed_term, .. }
+            | Self::PreVoteResponse { proposed_term, .. } => *proposed_term,
         }
     }
 }
@@ -592,6 +610,10 @@ pub struct RaftState {
     election_deadline: Instant,
     /// Node configuration.
     config: RaftConfig,
+    /// Pre-vote responses received during a pre-vote phase.
+    pre_votes_received: HashSet<NodeId>,
+    /// Whether we are currently in the pre-vote phase (before real election).
+    in_pre_vote: bool,
 }
 
 impl RaftState {
@@ -671,6 +693,8 @@ impl RaftState {
             pending_config_change: false,
             signing_key: None,
             peer_verifying_keys: HashMap::new(),
+            pre_votes_received: HashSet::new(),
+            in_pre_vote: false,
         }
     }
 
@@ -692,6 +716,18 @@ impl RaftState {
         from: NodeId,
         msg: RaftMessage,
     ) -> Vec<(NodeId, RaftMessage)> {
+        // Pre-vote messages do NOT trigger term step-down (they use proposed
+        // terms that haven't been committed). Handle them separately.
+        match msg {
+            RaftMessage::PreVoteRequest { .. } => {
+                return self.handle_pre_vote_request(from, &msg);
+            }
+            RaftMessage::PreVoteResponse { .. } => {
+                return self.handle_pre_vote_response(from, &msg);
+            }
+            _ => {}
+        }
+
         // Rule: if any RPC contains a term > currentTerm, step down.
         let msg_term = msg.term();
         if msg_term > self.current_term {
@@ -735,11 +771,21 @@ impl RaftState {
                 success,
                 match_index,
             } => self.handle_append_entries_response(from, term, success, match_index),
+            // Already handled above, but satisfy exhaustive match.
+            RaftMessage::PreVoteRequest { .. } | RaftMessage::PreVoteResponse { .. } => {
+                unreachable!()
+            }
         }
     }
 
-    /// Called on timer tick. Returns heartbeats (if leader) or starts an
-    /// election (if follower/candidate and the election timer has expired).
+    /// Called on timer tick. Returns heartbeats (if leader) or starts a
+    /// pre-vote (if follower/candidate and the election timer has expired).
+    ///
+    /// Pre-vote protocol (Raft dissertation Section 9.6): instead of
+    /// immediately starting a real election (which increments term and can
+    /// disrupt a healthy cluster), the node first sends PreVoteRequests.
+    /// Only if a majority grants the pre-vote does it proceed with a real
+    /// election. This prevents partitioned nodes from bumping terms.
     pub fn tick(&mut self) -> Vec<(NodeId, RaftMessage)> {
         match self.role {
             RaftRole::Leader => self.send_heartbeats(),
@@ -748,9 +794,9 @@ impl RaftState {
                     tracing::info!(
                         node = %self.node_id,
                         term = self.current_term.0,
-                        "election timeout, starting election"
+                        "election timeout, starting pre-vote"
                     );
-                    self.start_election()
+                    self.start_pre_vote()
                 } else {
                     Vec::new()
                 }
@@ -941,6 +987,133 @@ impl RaftState {
             && self.leader_id.is_none()
     }
 
+    // ── Private: pre-vote ──────────────────────────────────────────────────
+
+    /// Start the pre-vote phase: propose term+1 without actually incrementing.
+    fn start_pre_vote(&mut self) -> Vec<(NodeId, RaftMessage)> {
+        self.in_pre_vote = true;
+        self.pre_votes_received.clear();
+        // Count our own pre-vote.
+        self.pre_votes_received.insert(self.node_id);
+        self.reset_election_timer();
+
+        let proposed_term = Term(self.current_term.0 + 1);
+
+        tracing::info!(
+            node = %self.node_id,
+            proposed_term = proposed_term.0,
+            "started pre-vote"
+        );
+
+        // Single-node cluster: pre-vote succeeds immediately.
+        if self.pre_votes_received.len() >= self.quorum_size() {
+            self.in_pre_vote = false;
+            return self.start_election();
+        }
+
+        let msg = RaftMessage::PreVoteRequest {
+            candidate_id: self.node_id,
+            proposed_term,
+            last_log_index: self.last_log_index(),
+            last_log_term: self.last_log_term(),
+        };
+
+        self.config
+            .peers
+            .iter()
+            .map(|(id, _)| (*id, msg.clone()))
+            .collect()
+    }
+
+    /// Handle an incoming PreVoteRequest. Grant the pre-vote if:
+    /// 1. The proposed term is greater than our current term.
+    /// 2. The candidate's log is at least as up-to-date as ours.
+    /// No state changes occur (no term bump, no voted_for change).
+    fn handle_pre_vote_request(
+        &self,
+        from: NodeId,
+        msg: &RaftMessage,
+    ) -> Vec<(NodeId, RaftMessage)> {
+        if let RaftMessage::PreVoteRequest {
+            candidate_id,
+            proposed_term,
+            last_log_index,
+            last_log_term,
+        } = msg
+        {
+            // Only grant if the proposed term is ahead of ours and log is
+            // at least as up-to-date. We also grant if we have no leader
+            // (election timeout would have fired anyway).
+            let grant = *proposed_term > self.current_term
+                && self.candidate_log_is_up_to_date(*last_log_term, *last_log_index);
+
+            tracing::debug!(
+                node = %self.node_id,
+                candidate = %candidate_id,
+                proposed_term = proposed_term.0,
+                granted = grant,
+                "pre-vote request"
+            );
+
+            vec![(
+                from,
+                RaftMessage::PreVoteResponse {
+                    voter_id: self.node_id,
+                    proposed_term: *proposed_term,
+                    vote_granted: grant,
+                },
+            )]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Handle an incoming PreVoteResponse. If we have a majority of pre-votes,
+    /// proceed to a real election.
+    fn handle_pre_vote_response(
+        &mut self,
+        from: NodeId,
+        msg: &RaftMessage,
+    ) -> Vec<(NodeId, RaftMessage)> {
+        if let RaftMessage::PreVoteResponse {
+            vote_granted,
+            proposed_term,
+            ..
+        } = msg
+        {
+            if !self.in_pre_vote {
+                return Vec::new();
+            }
+
+            // Ignore stale pre-vote responses.
+            if *proposed_term != Term(self.current_term.0 + 1) {
+                return Vec::new();
+            }
+
+            if *vote_granted {
+                self.pre_votes_received.insert(from);
+                tracing::debug!(
+                    node = %self.node_id,
+                    from = %from,
+                    pre_votes = self.pre_votes_received.len(),
+                    quorum = self.quorum_size(),
+                    "received pre-vote"
+                );
+
+                if self.pre_votes_received.len() >= self.quorum_size() {
+                    self.in_pre_vote = false;
+                    tracing::info!(
+                        node = %self.node_id,
+                        "pre-vote majority achieved, starting real election"
+                    );
+                    return self.start_election();
+                }
+            }
+        }
+
+        Vec::new()
+    }
+
     // ── Private: election ──────────────────────────────────────────────────
 
     /// Reset election timer to a new random deadline.
@@ -1047,6 +1220,8 @@ impl RaftState {
         }
         self.leader_id = leader;
         self.votes_received.clear();
+        self.pre_votes_received.clear();
+        self.in_pre_vote = false;
         self.next_index.clear();
         self.match_index.clear();
         self.pending_config_change = false;
@@ -1483,8 +1658,9 @@ mod tests {
         (n1, n2, n3)
     }
 
-    /// Elect n1 as leader in a three-node cluster by driving the election
-    /// protocol to completion. Returns the heartbeats sent after becoming leader.
+    /// Elect n1 as leader in a three-node cluster by driving the pre-vote
+    /// and election protocol to completion. Returns the heartbeats sent after
+    /// becoming leader.
     fn elect_leader(
         n1: &mut RaftState,
         n2: &mut RaftState,
@@ -1493,15 +1669,27 @@ mod tests {
         let id1 = n1.node_id();
         let id2 = n2.node_id();
 
+        // Phase 1: Pre-vote
         n1.election_deadline = Instant::now() - Duration::from_secs(1);
-        let vote_reqs = n1.tick();
-        let req_for_n2 = vote_reqs
+        let pre_vote_reqs = n1.tick();
+        let pv_for_n2 = pre_vote_reqs
             .iter()
             .find(|(id, _)| *id == id2)
             .unwrap()
             .1
             .clone();
-        let resp = n2.handle_message(id1, req_for_n2);
+        let pv_resp = n2.handle_message(id1, pv_for_n2);
+        // Delivering the pre-vote response triggers real election.
+        let real_vote_reqs = n1.handle_message(id2, pv_resp[0].1.clone());
+
+        // Phase 2: Real election (RequestVote messages from start_election)
+        let vote_for_n2 = real_vote_reqs
+            .iter()
+            .find(|(id, _)| *id == id2)
+            .unwrap()
+            .1
+            .clone();
+        let resp = n2.handle_message(id1, vote_for_n2);
         n1.handle_message(id2, resp[0].1.clone())
     }
 
@@ -1537,13 +1725,32 @@ mod tests {
         let id2 = n2.node_id();
         let id3 = n3.node_id();
 
-        // Node 1 starts election.
+        // Node 1 starts pre-vote (not a real election yet).
         n1.election_deadline = Instant::now() - Duration::from_secs(1);
-        let vote_requests = n1.tick();
-        assert_eq!(*n1.role(), RaftRole::Candidate);
-        assert_eq!(vote_requests.len(), 2);
+        let pre_vote_reqs = n1.tick();
+        assert!(n1.in_pre_vote);
+        assert_eq!(pre_vote_reqs.len(), 2);
 
-        // Deliver vote request to node 2.
+        // Deliver pre-vote request to node 2.
+        let pv_for_n2 = pre_vote_reqs
+            .iter()
+            .find(|(id, _)| *id == id2)
+            .unwrap()
+            .1
+            .clone();
+        let pv_responses = n2.handle_message(id1, pv_for_n2);
+        assert_eq!(pv_responses.len(), 1);
+        match &pv_responses[0].1 {
+            RaftMessage::PreVoteResponse { vote_granted, .. } => assert!(vote_granted),
+            _ => panic!("expected PreVoteResponse"),
+        }
+
+        // Deliver pre-vote grant back => triggers real election.
+        let vote_requests = n1.handle_message(id2, pv_responses[0].1.clone());
+        assert!(!n1.in_pre_vote);
+        assert_eq!(*n1.role(), RaftRole::Candidate);
+
+        // Now deliver real vote request to node 2.
         let req_for_n2 = vote_requests
             .iter()
             .find(|(id, _)| *id == id2)
@@ -1564,7 +1771,7 @@ mod tests {
         // Leader sends heartbeats to both peers.
         assert_eq!(become_leader_msgs.len(), 2);
 
-        // Node 3 also grants vote (already decided but still valid).
+        // Node 3 also grants the real vote (already decided but still valid).
         let req_for_n3 = vote_requests
             .iter()
             .find(|(id, _)| *id == id3)
@@ -1642,17 +1849,8 @@ mod tests {
         let id2 = n2.node_id();
         let id3 = n3.node_id();
 
-        // Elect n1 as leader (go through all peers to get full replication).
-        n1.election_deadline = Instant::now() - Duration::from_secs(1);
-        let vote_reqs = n1.tick();
-        for (peer_id, msg) in &vote_reqs {
-            let responses = if *peer_id == id2 {
-                n2.handle_message(id1, msg.clone())
-            } else {
-                n3.handle_message(id1, msg.clone())
-            };
-            let _ = n1.handle_message(*peer_id, responses[0].1.clone());
-        }
+        // Elect n1 as leader via pre-vote + real election.
+        let _ = elect_leader(&mut n1, &mut n2, &mut n3);
         assert!(n1.is_leader());
 
         // Leader proposes a command.
@@ -1731,22 +1929,39 @@ mod tests {
         let id2 = n2.node_id();
         let id3 = n3.node_id();
 
-        // Both n1 and n2 start elections simultaneously.
+        // Both n1 and n2 start pre-votes simultaneously.
         n1.election_deadline = Instant::now() - Duration::from_secs(1);
         n2.election_deadline = Instant::now() - Duration::from_secs(1);
-        let msgs1 = n1.tick();
-        let msgs2 = n2.tick();
+        let pv1 = n1.tick();
+        let pv2 = n2.tick();
+        assert!(n1.in_pre_vote);
+        assert!(n2.in_pre_vote);
+
+        // n3 grants n1's pre-vote first.
+        let pv1_for_n3 = pv1.iter().find(|(id, _)| *id == id3).unwrap().1.clone();
+        let pv1_resp3 = n3.handle_message(id1, pv1_for_n3);
+        match &pv1_resp3[0].1 {
+            RaftMessage::PreVoteResponse { vote_granted, .. } => assert!(vote_granted),
+            _ => panic!("expected PreVoteResponse"),
+        }
+
+        // n3 also grants n2's pre-vote (pre-votes don't lock in a candidate).
+        let pv2_for_n3 = pv2.iter().find(|(id, _)| *id == id3).unwrap().1.clone();
+        let pv2_resp3 = n3.handle_message(id2, pv2_for_n3);
+        match &pv2_resp3[0].1 {
+            RaftMessage::PreVoteResponse { vote_granted, .. } => assert!(vote_granted),
+            _ => panic!("expected PreVoteResponse"),
+        }
+
+        // Deliver pre-vote grants => both proceed to real election.
+        let real1 = n1.handle_message(id3, pv1_resp3[0].1.clone());
+        let real2 = n2.handle_message(id3, pv2_resp3[0].1.clone());
         assert_eq!(*n1.role(), RaftRole::Candidate);
         assert_eq!(*n2.role(), RaftRole::Candidate);
         assert_eq!(n1.current_term(), n2.current_term());
 
-        // n3 receives n1's request first and votes for n1.
-        let req1_for_n3 = msgs1
-            .iter()
-            .find(|(id, _)| *id == id3)
-            .unwrap()
-            .1
-            .clone();
+        // n3 receives n1's RequestVote first and votes for n1.
+        let req1_for_n3 = real1.iter().find(|(id, _)| *id == id3).unwrap().1.clone();
         let resp3 = n3.handle_message(id1, req1_for_n3);
         match &resp3[0].1 {
             RaftMessage::RequestVoteResponse { vote_granted, .. } => assert!(vote_granted),
@@ -1754,27 +1969,9 @@ mod tests {
         }
 
         // n3 rejects n2's request (already voted for n1 this term).
-        let req2_for_n3 = msgs2
-            .iter()
-            .find(|(id, _)| *id == id3)
-            .unwrap()
-            .1
-            .clone();
+        let req2_for_n3 = real2.iter().find(|(id, _)| *id == id3).unwrap().1.clone();
         let resp3_to_n2 = n3.handle_message(id2, req2_for_n3);
         match &resp3_to_n2[0].1 {
-            RaftMessage::RequestVoteResponse { vote_granted, .. } => assert!(!vote_granted),
-            _ => panic!("expected vote response"),
-        }
-
-        // n2 rejects n1's request (voted for itself).
-        let req1_for_n2 = msgs1
-            .iter()
-            .find(|(id, _)| *id == id2)
-            .unwrap()
-            .1
-            .clone();
-        let resp2 = n2.handle_message(id1, req1_for_n2);
-        match &resp2[0].1 {
             RaftMessage::RequestVoteResponse { vote_granted, .. } => assert!(!vote_granted),
             _ => panic!("expected vote response"),
         }
@@ -1787,12 +1984,12 @@ mod tests {
         let _ = n2.handle_message(id3, resp3_to_n2[0].1.clone());
         assert_eq!(*n2.role(), RaftRole::Candidate);
 
-        // n2 must start a new election at a higher term.
+        // n2 must start a new pre-vote at a higher proposed term.
         n2.election_deadline = Instant::now() - Duration::from_secs(1);
-        let msgs2_retry = n2.tick();
-        assert_eq!(*n2.role(), RaftRole::Candidate);
-        assert_eq!(n2.current_term(), Term(2));
-        assert_eq!(msgs2_retry.len(), 2);
+        let pv2_retry = n2.tick();
+        // n2 is now in pre-vote phase again.
+        assert!(n2.in_pre_vote);
+        assert_eq!(pv2_retry.len(), 2);
     }
 
     // ── Additional: propose fails when not leader ──────────────────────────
@@ -1818,5 +2015,189 @@ mod tests {
         let bytes = serialize_message(&msg).unwrap();
         let decoded = deserialize_message(&bytes).unwrap();
         assert_eq!(msg, decoded);
+    }
+
+    // ── Pre-vote tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn pre_vote_succeeds_when_log_up_to_date() {
+        let (mut n1, mut n2, mut n3) = make_three_nodes();
+        let id1 = n1.node_id();
+        let id2 = n2.node_id();
+        let id3 = n3.node_id();
+
+        // Trigger pre-vote on n1.
+        n1.election_deadline = Instant::now() - Duration::from_secs(1);
+        let pre_vote_reqs = n1.tick();
+        assert!(n1.in_pre_vote, "node should be in pre-vote phase");
+        assert_eq!(pre_vote_reqs.len(), 2, "should send pre-vote to both peers");
+
+        // All messages should be PreVoteRequest with proposed_term = 1.
+        for (_, msg) in &pre_vote_reqs {
+            match msg {
+                RaftMessage::PreVoteRequest { proposed_term, .. } => {
+                    assert_eq!(*proposed_term, Term(1));
+                }
+                _ => panic!("expected PreVoteRequest"),
+            }
+        }
+
+        // n2 grants the pre-vote (logs are equally empty).
+        let req_for_n2 = pre_vote_reqs.iter().find(|(id, _)| *id == id2).unwrap().1.clone();
+        let resp = n2.handle_message(id1, req_for_n2);
+        assert_eq!(resp.len(), 1);
+        match &resp[0].1 {
+            RaftMessage::PreVoteResponse { vote_granted, .. } => assert!(vote_granted),
+            _ => panic!("expected PreVoteResponse"),
+        }
+
+        // Deliver the granted pre-vote to n1 => majority => real election starts.
+        let result = n1.handle_message(id2, resp[0].1.clone());
+        assert!(!n1.in_pre_vote, "pre-vote phase should be over");
+        // After real election, n1 becomes candidate and sends RequestVote.
+        assert_eq!(*n1.role(), RaftRole::Candidate);
+        assert_eq!(n1.current_term(), Term(1), "term incremented by real election");
+
+        // The result should be RequestVote messages.
+        for (_, msg) in &result {
+            match msg {
+                RaftMessage::RequestVote { term, .. } => {
+                    assert_eq!(*term, Term(1));
+                }
+                _ => {} // Might also get heartbeats if became leader
+            }
+        }
+    }
+
+    #[test]
+    fn pre_vote_fails_when_log_behind() {
+        let (mut n1, mut n2, _n3) = make_three_nodes();
+        let id1 = n1.node_id();
+        let id2 = n2.node_id();
+
+        // Give n2 a more up-to-date log (higher term entry).
+        n2.log.push(LogEntry {
+            term: Term(5),
+            index: LogIndex(1),
+            command: ClusterCommand::Noop,
+            entry_signature: None,
+        });
+        n2.current_term = Term(5);
+
+        // n1 starts pre-vote with empty log at term 0.
+        n1.election_deadline = Instant::now() - Duration::from_secs(1);
+        let pre_vote_reqs = n1.tick();
+
+        let req_for_n2 = pre_vote_reqs.iter().find(|(id, _)| *id == id2).unwrap().1.clone();
+        let resp = n2.handle_message(id1, req_for_n2);
+
+        // n2 should deny: n1's proposed_term(1) <= n2's current_term(5).
+        match &resp[0].1 {
+            RaftMessage::PreVoteResponse { vote_granted, .. } => {
+                assert!(!vote_granted, "pre-vote should be denied when log is behind");
+            }
+            _ => panic!("expected PreVoteResponse"),
+        }
+    }
+
+    #[test]
+    fn partitioned_node_returning_does_not_disrupt_cluster() {
+        let (mut n1, mut n2, mut n3) = make_three_nodes();
+        let id1 = n1.node_id();
+        let id2 = n2.node_id();
+        let id3 = n3.node_id();
+
+        // Elect n1 as leader via the pre-vote path.
+        n1.election_deadline = Instant::now() - Duration::from_secs(1);
+        let pre_vote_reqs = n1.tick();
+        let req_for_n2 = pre_vote_reqs.iter().find(|(id, _)| *id == id2).unwrap().1.clone();
+        let resp = n2.handle_message(id1, req_for_n2);
+        let real_election_msgs = n1.handle_message(id2, resp[0].1.clone());
+        // n1 is now candidate, deliver real votes.
+        let vote_for_n2 = real_election_msgs.iter().find(|(id, _)| *id == id2).unwrap().1.clone();
+        let vote_resp = n2.handle_message(id1, vote_for_n2);
+        let _leader_hb = n1.handle_message(id2, vote_resp[0].1.clone());
+        assert!(n1.is_leader());
+        let leader_term = n1.current_term();
+
+        // n3 was "partitioned" and tries to start an election.
+        // With pre-vote, it sends PreVoteRequest first.
+        n3.election_deadline = Instant::now() - Duration::from_secs(1);
+        let n3_pre_votes = n3.tick();
+        assert!(n3.in_pre_vote);
+
+        // n2 (which knows about the leader) denies the pre-vote because
+        // n3's proposed_term(1) is not > n2's current_term (which was updated
+        // when it voted for n1's real election at term 1).
+        // If n3's proposed_term == n2's current_term, the pre-vote is denied.
+        let n3_req_for_n2 = n3_pre_votes.iter().find(|(id, _)| *id == id2).unwrap().1.clone();
+        let n2_resp = n2.handle_message(n3.node_id(), n3_req_for_n2);
+
+        // n1 (the leader) also denies.
+        let n3_req_for_n1 = n3_pre_votes.iter().find(|(id, _)| *id == id1).unwrap().1.clone();
+        let n1_resp = n1.handle_message(n3.node_id(), n3_req_for_n1);
+
+        // The leader's term should NOT have changed (pre-vote doesn't disrupt).
+        assert!(n1.is_leader(), "leader should remain leader");
+        assert_eq!(n1.current_term(), leader_term, "leader term should not change");
+
+        // n3 should not have progressed to a real election.
+        let _ = n3.handle_message(id2, n2_resp[0].1.clone());
+        let _ = n3.handle_message(id1, n1_resp[0].1.clone());
+        // n3's term should still be 0 (never incremented by pre-vote).
+        assert_eq!(n3.current_term(), Term(0), "partitioned node's term should not increment");
+    }
+
+    #[test]
+    fn pre_vote_majority_required_before_real_election() {
+        let (mut n1, mut n2, mut n3) = make_three_nodes();
+        let id1 = n1.node_id();
+        let id2 = n2.node_id();
+        let id3 = n3.node_id();
+
+        // Trigger pre-vote on n1.
+        n1.election_deadline = Instant::now() - Duration::from_secs(1);
+        let pre_vote_reqs = n1.tick();
+        assert!(n1.in_pre_vote);
+
+        // Both peers deny the pre-vote.
+        let deny_resp = RaftMessage::PreVoteResponse {
+            voter_id: id2,
+            proposed_term: Term(1),
+            vote_granted: false,
+        };
+        let _ = n1.handle_message(id2, deny_resp);
+        assert!(n1.in_pre_vote, "should still be in pre-vote without majority");
+        assert_eq!(n1.current_term(), Term(0), "term should not change");
+        assert_ne!(*n1.role(), RaftRole::Candidate, "should not become candidate");
+
+        let deny_resp2 = RaftMessage::PreVoteResponse {
+            voter_id: id3,
+            proposed_term: Term(1),
+            vote_granted: false,
+        };
+        let _ = n1.handle_message(id3, deny_resp2);
+        // Still in pre-vote, no real election started.
+        assert_eq!(n1.current_term(), Term(0));
+    }
+
+    #[test]
+    fn pre_vote_does_not_increment_term() {
+        let (mut n1, _n2, _n3) = make_three_nodes();
+
+        let term_before = n1.current_term();
+
+        // Trigger pre-vote.
+        n1.election_deadline = Instant::now() - Duration::from_secs(1);
+        let _pre_vote_reqs = n1.tick();
+
+        // Term must NOT have changed.
+        assert_eq!(
+            n1.current_term(),
+            term_before,
+            "pre-vote must not increment term"
+        );
+        assert!(n1.in_pre_vote);
+        assert_eq!(*n1.role(), RaftRole::Follower, "role should not change during pre-vote");
     }
 }

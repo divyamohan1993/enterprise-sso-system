@@ -3739,11 +3739,26 @@ button:hover{{background:#00cc33}}
         code_challenge = html_escape(params.code_challenge.as_deref().unwrap_or("")),
         csrf_token = html_escape(&csrf_token),
         google_btn = if state.google_config.is_some() {
-            format!(r#"<div style="margin-top:20px;text-align:center">
-<div style="color:#555;font-size:0.7rem;margin-bottom:12px">or</div>
-<a href="/oauth/google/start?client_id={cid}&redirect_uri={ruri}&scope={sc}&state={st}&nonce={nc}&code_challenge={cc}" style="display:inline-block;padding:12px 24px;background:#111;border:1px solid #333;border-radius:4px;text-decoration:none;font-family:inherit;font-size:0.85rem;cursor:pointer">
-<span style="color:#4285F4">G</span><span style="color:#EA4335">o</span><span style="color:#FBBC05">o</span><span style="color:#4285F4">g</span><span style="color:#34A853">l</span><span style="color:#EA4335">e</span><span style="color:#888"> &nbsp;Sign In</span>
-</a></div>"#,
+            format!(
+                concat!(
+                    r#"<div style="margin-top:20px;text-align:center">"#,
+                    r#"<div style="color:#555;font-size:0.7rem;margin-bottom:12px">or</div>"#,
+                    r#"<a href="/oauth/google/start?client_id={cid}"#,
+                    r#"&redirect_uri={ruri}&scope={sc}&state={st}"#,
+                    r#"&nonce={nc}&code_challenge={cc}" "#,
+                    r#"style="display:inline-block;padding:12px 24px;"#,
+                    r#"background:#111;border:1px solid #333;"#,
+                    r#"border-radius:4px;text-decoration:none;"#,
+                    r#"font-family:inherit;font-size:0.85rem;cursor:pointer">"#,
+                    r#"<span style="color:#4285F4">G</span>"#,
+                    r#"<span style="color:#EA4335">o</span>"#,
+                    r#"<span style="color:#FBBC05">o</span>"#,
+                    r#"<span style="color:#4285F4">g</span>"#,
+                    r#"<span style="color:#34A853">l</span>"#,
+                    r#"<span style="color:#EA4335">e</span>"#,
+                    r#"<span style="color:#888"> &nbsp;Sign In</span>"#,
+                    r#"</a></div>"#,
+                ),
                 cid = html_escape(&params.client_id),
                 ruri = html_escape(&urlencoding::encode(&params.redirect_uri)),
                 sc = html_escape(&urlencoding::encode(&params.scope)),

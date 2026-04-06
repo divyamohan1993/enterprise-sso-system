@@ -965,6 +965,169 @@ pub fn distribute_shares(
     (coordinator, nodes)
 }
 
+// ---------------------------------------------------------------------------
+// Threshold Reconfiguration — dynamic FROST group changes
+// ---------------------------------------------------------------------------
+
+/// Reconfigure the FROST threshold group.
+/// Performs a new DKG ceremony with new threshold/total parameters.
+/// All existing signing keys are invalidated -- new keys are generated.
+///
+/// SECURITY: Requires unanimous consent from all currently active signers.
+/// This is a heavyweight operation for permanent topology changes only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThresholdReconfiguration {
+    pub old_threshold: u16,
+    pub old_total: u16,
+    pub new_threshold: u16,
+    pub new_total: u16,
+    pub initiated_by: String,
+    pub consents: Vec<String>,
+    pub timestamp: i64,
+    pub executed: bool,
+}
+
+impl ThresholdReconfiguration {
+    /// Propose a reconfiguration. Returns a proposal awaiting consents.
+    pub fn propose(
+        old_threshold: u16,
+        old_total: u16,
+        new_threshold: u16,
+        new_total: u16,
+        initiated_by: String,
+    ) -> Result<Self, String> {
+        if new_threshold < 2 {
+            return Err("new_threshold must be >= 2".to_string());
+        }
+        if new_threshold > new_total {
+            return Err("new_threshold must be <= new_total".to_string());
+        }
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        tracing::info!(
+            old_threshold,
+            old_total,
+            new_threshold,
+            new_total,
+            initiated_by = %initiated_by,
+            "SIEM:INFO threshold reconfiguration proposed"
+        );
+
+        common::siem::SecurityEvent {
+            timestamp: common::siem::SecurityEvent::now_iso8601(),
+            category: "tss_reconfig",
+            action: "reconfiguration_proposed",
+            severity: common::siem::Severity::Warning,
+            outcome: "pending",
+            user_id: None,
+            source_ip: None,
+            detail: Some(format!(
+                "FROST threshold reconfiguration proposed: {}-of-{} -> {}-of-{} by {}",
+                old_threshold, old_total, new_threshold, new_total, initiated_by
+            )),
+        }
+        .emit();
+
+        Ok(Self {
+            old_threshold,
+            old_total,
+            new_threshold,
+            new_total,
+            initiated_by,
+            consents: Vec::new(),
+            timestamp,
+            executed: false,
+        })
+    }
+
+    /// Add a signer's consent to the reconfiguration.
+    /// Returns true if this consent was new (not a duplicate).
+    pub fn add_consent(&mut self, node_id: &str) -> bool {
+        if self.executed {
+            tracing::warn!("attempt to consent to already-executed reconfiguration");
+            return false;
+        }
+        if self.consents.contains(&node_id.to_string()) {
+            return false; // Duplicate consent.
+        }
+        self.consents.push(node_id.to_string());
+
+        tracing::info!(
+            node_id = node_id,
+            consents = self.consents.len(),
+            required = self.old_total,
+            "SIEM:INFO reconfiguration consent received"
+        );
+
+        true
+    }
+
+    /// Check if all required consents have been received.
+    pub fn has_unanimous_consent(&self) -> bool {
+        self.consents.len() >= self.old_total as usize
+    }
+
+    /// Execute the reconfiguration by running a new DKG ceremony.
+    /// Returns new coordinator and signer nodes. Old keys are invalidated.
+    ///
+    /// Requires unanimous consent from all current signers.
+    pub fn execute(
+        &mut self,
+    ) -> Result<(SigningCoordinator, Vec<SignerNode>), String> {
+        if self.executed {
+            return Err("reconfiguration already executed".to_string());
+        }
+        if !self.has_unanimous_consent() {
+            return Err(format!(
+                "unanimous consent required: have {}/{} consents",
+                self.consents.len(),
+                self.old_total
+            ));
+        }
+
+        tracing::info!(
+            new_threshold = self.new_threshold,
+            new_total = self.new_total,
+            "SIEM:CRITICAL executing FROST threshold reconfiguration (new DKG ceremony)"
+        );
+
+        // Run new DKG with the new parameters.
+        #[allow(deprecated)]
+        let mut dkg_result = crypto::threshold::dkg(
+            self.new_total,
+            self.new_threshold,
+        )
+        .map_err(|e| format!("DKG ceremony failed during reconfiguration: {e}"))?;
+
+        let (coordinator, nodes) = distribute_shares(&mut dkg_result);
+
+        self.executed = true;
+
+        common::siem::SecurityEvent {
+            timestamp: common::siem::SecurityEvent::now_iso8601(),
+            category: "tss_reconfig",
+            action: "reconfiguration_executed",
+            severity: common::siem::Severity::Critical,
+            outcome: "success",
+            user_id: None,
+            source_ip: None,
+            detail: Some(format!(
+                "FROST threshold reconfigured: {}-of-{} -> {}-of-{}. \
+                 All previous signing keys invalidated. New DKG ceremony completed.",
+                self.old_threshold, self.old_total,
+                self.new_threshold, self.new_total,
+            )),
+        }
+        .emit();
+
+        Ok((coordinator, nodes))
+    }
+}
+
 // ===========================================================================
 // Remote / Distributed signing over SHARD
 // ===========================================================================
@@ -3252,5 +3415,152 @@ mod tests {
         let _ = std::fs::remove_file(&wal_path);
         let _ = std::fs::remove_file(&state_path);
         let _ = std::fs::remove_dir(&tmp);
+    }
+
+    // ── Threshold reconfiguration tests ─────────────────────────────────
+
+    #[test]
+    fn reconfiguration_3of5_to_2of4() {
+        std::env::set_var("MILNET_MASTER_KEK", "ab".repeat(32));
+
+        let mut reconfig = ThresholdReconfiguration::propose(3, 5, 2, 4, "admin".into())
+            .expect("proposal must succeed");
+
+        // Add all 5 consents.
+        for i in 0..5 {
+            assert!(reconfig.add_consent(&format!("node-{}", i)));
+        }
+        assert!(reconfig.has_unanimous_consent());
+
+        let (coordinator, nodes) = reconfig.execute().expect("execute must succeed");
+        assert_eq!(coordinator.threshold, 2);
+        assert_eq!(nodes.len(), 4);
+        assert!(reconfig.executed);
+
+        // Verify new keys work: sign with 2 of 4 nodes.
+        let mut node0 = SignerNode::new(nodes[0].identifier, nodes[0].key_package.clone());
+        let mut node1 = SignerNode::new(nodes[1].identifier, nodes[1].key_package.clone());
+        let mut signers: Vec<&mut SignerNode> = vec![&mut node0, &mut node1];
+
+        let sig = coordinator
+            .coordinate_signing(&mut signers, b"reconfigured signing test")
+            .expect("signing with new keys must work");
+
+        let frost_sig = frost::Signature::deserialize(&sig).expect("deserialize signature");
+        assert!(coordinator
+            .public_key_package
+            .verifying_key()
+            .verify(b"reconfigured signing test", &frost_sig)
+            .is_ok());
+
+        std::env::remove_var("MILNET_MASTER_KEK");
+    }
+
+    #[test]
+    fn reconfiguration_requires_unanimous_consent() {
+        let mut reconfig = ThresholdReconfiguration::propose(3, 5, 2, 4, "admin".into())
+            .expect("proposal must succeed");
+
+        // Add only 3 of 5 consents.
+        for i in 0..3 {
+            reconfig.add_consent(&format!("node-{}", i));
+        }
+
+        assert!(!reconfig.has_unanimous_consent());
+        let result = reconfig.execute();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unanimous consent required"));
+    }
+
+    #[test]
+    fn partial_consent_does_not_execute() {
+        let mut reconfig = ThresholdReconfiguration::propose(3, 5, 2, 3, "admin".into())
+            .expect("proposal must succeed");
+
+        reconfig.add_consent("node-0");
+        reconfig.add_consent("node-1");
+        // 2 of 5 -- not enough.
+        assert!(!reconfig.has_unanimous_consent());
+
+        let result = reconfig.execute();
+        assert!(result.is_err());
+        assert!(!reconfig.executed);
+    }
+
+    #[test]
+    fn new_keys_work_after_reconfiguration() {
+        std::env::set_var("MILNET_MASTER_KEK", "cd".repeat(32));
+
+        let mut reconfig = ThresholdReconfiguration::propose(3, 5, 3, 5, "admin".into())
+            .expect("proposal must succeed");
+
+        for i in 0..5 {
+            reconfig.add_consent(&format!("node-{}", i));
+        }
+
+        let (new_coord, new_nodes) = reconfig.execute().expect("execute must succeed");
+
+        // Sign with 3 of 5 new nodes.
+        let mut n0 = SignerNode::new(new_nodes[0].identifier, new_nodes[0].key_package.clone());
+        let mut n1 = SignerNode::new(new_nodes[1].identifier, new_nodes[1].key_package.clone());
+        let mut n2 = SignerNode::new(new_nodes[2].identifier, new_nodes[2].key_package.clone());
+        let mut signers: Vec<&mut SignerNode> = vec![&mut n0, &mut n1, &mut n2];
+
+        let sig = new_coord
+            .coordinate_signing(&mut signers, b"new key test")
+            .expect("signing must succeed");
+
+        let frost_sig = frost::Signature::deserialize(&sig).expect("deserialize");
+        assert!(new_coord
+            .public_key_package
+            .verifying_key()
+            .verify(b"new key test", &frost_sig)
+            .is_ok());
+
+        std::env::remove_var("MILNET_MASTER_KEK");
+    }
+
+    #[test]
+    fn old_keys_invalidated_after_reconfiguration() {
+        std::env::set_var("MILNET_MASTER_KEK", "ef".repeat(32));
+
+        // Create original 3-of-5 group.
+        let (old_coord, old_nodes) = setup_dkg();
+        let old_vk = *old_coord.public_key_package.verifying_key();
+
+        // Reconfigure to 2-of-3.
+        let mut reconfig = ThresholdReconfiguration::propose(3, 5, 2, 3, "admin".into())
+            .expect("proposal must succeed");
+        for i in 0..5 {
+            reconfig.add_consent(&format!("node-{}", i));
+        }
+        let (new_coord, new_nodes) = reconfig.execute().expect("execute must succeed");
+        let new_vk = *new_coord.public_key_package.verifying_key();
+
+        // Old and new verifying keys must differ (new DKG = new keys).
+        assert_ne!(
+            old_vk, new_vk,
+            "reconfiguration must produce new keys (old keys invalidated)"
+        );
+
+        // Sign with new keys, verify fails with old verifying key.
+        let mut n0 = SignerNode::new(new_nodes[0].identifier, new_nodes[0].key_package.clone());
+        let mut n1 = SignerNode::new(new_nodes[1].identifier, new_nodes[1].key_package.clone());
+        let mut signers: Vec<&mut SignerNode> = vec![&mut n0, &mut n1];
+
+        let sig = new_coord
+            .coordinate_signing(&mut signers, b"invalidation test")
+            .expect("signing must succeed");
+
+        let frost_sig = frost::Signature::deserialize(&sig).expect("deserialize");
+        // Verification with old verifying key should fail.
+        assert!(
+            old_vk.verify(b"invalidation test", &frost_sig).is_err(),
+            "old verifying key must not validate signatures from new group"
+        );
+        // Verification with new verifying key should succeed.
+        assert!(new_vk.verify(b"invalidation test", &frost_sig).is_ok());
+
+        std::env::remove_var("MILNET_MASTER_KEK");
     }
 }

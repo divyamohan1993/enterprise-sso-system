@@ -705,9 +705,70 @@ mod tests {
         Receipt { ceremony_session_id: [1; 32], step_id: 1, prev_receipt_hash: [0; 64], user_id: Uuid::new_v4(), dpop_key_hash: [2; 64],
             timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as i64, nonce: [3; 32], signature: Vec::new(), ttl_seconds: 30 }
     }
-    #[test] fn test_mldsa_sign_verify() { run_with_large_stack(|| { let mut s = [0u8; 32]; getrandom::getrandom(&mut s).unwrap(); let signer = ReceiptSigner::new_mldsa(s); let mut r = make_receipt(); signer.sign(&mut r); assert!(!r.signature.is_empty()); assert!(signer.verify(&r)); }); }
-    #[test] fn test_backward_compat() { run_with_large_stack(|| { let signer = ReceiptSigner::new([0x42u8; 64]); let mut r = make_receipt(); signer.sign(&mut r); assert!(signer.verify(&r)); }); }
-    #[test] fn test_wrong_key() { run_with_large_stack(|| { let mut s1 = [0u8; 32]; getrandom::getrandom(&mut s1).unwrap(); let mut s2 = [0u8; 32]; getrandom::getrandom(&mut s2).unwrap(); let sg1 = ReceiptSigner::new_mldsa(s1); let sg2 = ReceiptSigner::new_mldsa(s2); let mut r = make_receipt(); sg1.sign(&mut r); assert!(!sg2.verify(&r)); }); }
-    #[test] fn test_tampered() { run_with_large_stack(|| { let mut s = [0u8; 32]; getrandom::getrandom(&mut s).unwrap(); let signer = ReceiptSigner::new_mldsa(s); let mut r = make_receipt(); signer.sign(&mut r); r.step_id = 99; assert!(!signer.verify(&r)); }); }
-    #[test] fn test_vk_export() { run_with_large_stack(|| { let mut s = [0u8; 32]; getrandom::getrandom(&mut s).unwrap(); let signer = ReceiptSigner::new_mldsa(s); assert_eq!(signer.verifying_key().len(), 2592); let mut r = make_receipt(); signer.sign(&mut r); let d = crypto::receipts::receipt_signing_data(&r); assert!(crypto::receipts::verify_receipt_asymmetric(signer.verifying_key(), &d, &r.signature)); }); }
+    #[test]
+    fn test_mldsa_sign_verify() {
+        run_with_large_stack(|| {
+            let mut s = [0u8; 32];
+            getrandom::getrandom(&mut s).unwrap();
+            let signer = ReceiptSigner::new_mldsa(s);
+            let mut r = make_receipt();
+            signer.sign(&mut r);
+            assert!(!r.signature.is_empty());
+            assert!(signer.verify(&r));
+        });
+    }
+
+    #[test]
+    fn test_backward_compat() {
+        run_with_large_stack(|| {
+            let signer = ReceiptSigner::new([0x42u8; 64]);
+            let mut r = make_receipt();
+            signer.sign(&mut r);
+            assert!(signer.verify(&r));
+        });
+    }
+
+    #[test]
+    fn test_wrong_key() {
+        run_with_large_stack(|| {
+            let mut s1 = [0u8; 32];
+            getrandom::getrandom(&mut s1).unwrap();
+            let mut s2 = [0u8; 32];
+            getrandom::getrandom(&mut s2).unwrap();
+            let sg1 = ReceiptSigner::new_mldsa(s1);
+            let sg2 = ReceiptSigner::new_mldsa(s2);
+            let mut r = make_receipt();
+            sg1.sign(&mut r);
+            assert!(!sg2.verify(&r));
+        });
+    }
+
+    #[test]
+    fn test_tampered() {
+        run_with_large_stack(|| {
+            let mut s = [0u8; 32];
+            getrandom::getrandom(&mut s).unwrap();
+            let signer = ReceiptSigner::new_mldsa(s);
+            let mut r = make_receipt();
+            signer.sign(&mut r);
+            r.step_id = 99;
+            assert!(!signer.verify(&r));
+        });
+    }
+
+    #[test]
+    fn test_vk_export() {
+        run_with_large_stack(|| {
+            let mut s = [0u8; 32];
+            getrandom::getrandom(&mut s).unwrap();
+            let signer = ReceiptSigner::new_mldsa(s);
+            assert_eq!(signer.verifying_key().len(), 2592);
+            let mut r = make_receipt();
+            signer.sign(&mut r);
+            let d = crypto::receipts::receipt_signing_data(&r);
+            assert!(crypto::receipts::verify_receipt_asymmetric(
+                signer.verifying_key(), &d, &r.signature,
+            ));
+        });
+    }
 }

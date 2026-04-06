@@ -1,0 +1,105 @@
+name: Benchmark Regression Gate
+on:
+  pull_request:
+    branches: [master, main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  RUST_MIN_STACK: "8388608"
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: dtolnay/rust-toolchain@7b1c307e0dcbda6122208f10795a713336a9b35a # stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: bench-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            bench-${{ runner.os }}-
+
+      - name: Run benchmarks
+        run: |
+          cargo bench --workspace -- --output-format bencher 2>&1 | tee bench-output.txt
+        env:
+          MILNET_MASTER_KEK: "abababababababababababababababababababababababababababababababababab"
+
+      - name: Parse benchmark results
+        run: |
+          echo "=== Benchmark Results ==="
+          python3 -c "
+          results = []
+          for line in open('bench-output.txt'):
+              line = line.strip()
+              if 'ns/iter' in line:
+                  results.append(line)
+                  print(line)
+          if not results:
+              print('WARNING: No benchmark results found in output')
+          print(f'Total benchmarks: {len(results)}')
+          "
+
+      - name: Check for catastrophic regressions
+        run: |
+          python3 -c "
+          import re, sys
+
+          pattern = re.compile(r'bench:\s+([\d,]+)\s+ns/iter')
+          results = {}
+          for line in open('bench-output.txt'):
+              if 'ns/iter' in line:
+                  parts = line.split('...')
+                  if len(parts) >= 2:
+                      name = parts[0].strip().replace('test ', '')
+                      match = pattern.search(parts[1])
+                      if match:
+                          ns = int(match.group(1).replace(',', ''))
+                          results[name] = ns
+
+          THRESHOLDS = {
+              'aes256gcm_encrypt_decrypt_1kb': 50_000_000,
+              'aegis256_encrypt_decrypt_1kb': 50_000_000,
+              'hkdf_sha512_derive_32bytes': 10_000_000,
+              'ct_eq_32': 5_000_000,
+              'ct_eq_64': 5_000_000,
+              'ct_eq_256': 10_000_000,
+          }
+
+          violations = []
+          for name, ns in results.items():
+              for threshold_name, max_ns in THRESHOLDS.items():
+                  if threshold_name in name and ns > max_ns:
+                      violations.append(
+                          f'REGRESSION: {name} = {ns}ns exceeds {max_ns}ns threshold'
+                      )
+
+          if violations:
+              print('=== BENCHMARK REGRESSIONS DETECTED ===')
+              for v in violations:
+                  print(v)
+              sys.exit(1)
+          else:
+              print('All benchmarks within acceptable thresholds.')
+          "
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: benchmark-results
+          path: bench-output.txt
+          retention-days: 30

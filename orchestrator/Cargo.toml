@@ -29,6 +29,7 @@ ml-dsa.workspace = true
 
 [dev-dependencies]
 common = { path = "../common", features = ["test-support"] }
+serial_test.workspace = true
 
 [features]
 default = ["production"]

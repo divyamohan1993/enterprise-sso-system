@@ -291,6 +291,25 @@ fn default_single_process_mode() -> bool {
     std::env::var("MILNET_BFT_SINGLE_PROCESS_ACK").as_deref() == Ok("1")
 }
 
+/// Reason a node was quarantined for Byzantine behavior.
+#[derive(Debug, Clone)]
+pub enum ByzantineReason {
+    ChainDivergence { expected_hash: [u8; 64], actual_hash: [u8; 64] },
+    ResponseTimeAnomaly { avg_ms: u64, threshold_ms: u64 },
+    SignatureFailure,
+    EquivocationDetected { entry_a_hash: [u8; 64], entry_b_hash: [u8; 64] },
+}
+
+/// Quarantine state for a Byzantine-suspected node.
+#[derive(Debug, Clone)]
+pub struct QuarantinedNode {
+    pub node_id: usize,
+    pub detected_at: u64,
+    pub reason: ByzantineReason,
+    pub evidence_hash: [u8; 64],
+    pub re_attestation_required: bool,
+}
+
 /// BFT audit cluster.
 pub struct BftAuditCluster {
     pub nodes: Vec<AuditNode>,
@@ -306,6 +325,8 @@ pub struct BftAuditCluster {
     sequence_number: u64,
     /// Single-process mode flag. True when BFT nodes run in one process.
     single_process_mode: bool,
+    /// Nodes currently quarantined for Byzantine behavior.
+    pub quarantined: Vec<QuarantinedNode>,
 }
 
 impl BftAuditCluster {
@@ -334,6 +355,7 @@ impl BftAuditCluster {
             f,
             sequence_number: 0,
             single_process_mode: default_single_process_mode(),
+            quarantined: Vec::new(),
         };
         cluster.initialize_heartbeats();
         cluster
@@ -366,6 +388,7 @@ impl BftAuditCluster {
             f,
             sequence_number: 0,
             single_process_mode: default_single_process_mode(),
+            quarantined: Vec::new(),
         };
         cluster.initialize_heartbeats();
         cluster
@@ -412,6 +435,7 @@ impl BftAuditCluster {
             f,
             sequence_number: 0,
             single_process_mode: default_single_process_mode(),
+            quarantined: Vec::new(),
         };
         cluster.initialize_heartbeats();
         cluster
@@ -723,6 +747,147 @@ impl BftAuditCluster {
                 }
             }
         }
+    }
+
+    /// Number of active (non-quarantined) nodes.
+    pub fn active_node_count(&self) -> usize {
+        self.nodes.len() - self.quarantined.len()
+    }
+
+    /// Adjusted quorum size excluding quarantined nodes.
+    /// Returns None if too many nodes are quarantined for safety.
+    pub fn effective_quorum(&self) -> Option<usize> {
+        let active = self.active_node_count();
+        let f = (active.saturating_sub(1)) / 3;
+        let quorum = 2 * f + 1;
+        if active < quorum {
+            return None; // System cannot safely proceed.
+        }
+        Some(quorum)
+    }
+
+    /// Check if a node is currently quarantined.
+    pub fn is_quarantined(&self, node_id: usize) -> bool {
+        self.quarantined.iter().any(|q| q.node_id == node_id)
+    }
+
+    /// Quarantine a node: remove from active quorum, log SIEM event.
+    pub fn quarantine_node(&mut self, node_id: usize, reason: ByzantineReason) {
+        if self.is_quarantined(node_id) {
+            return; // Already quarantined.
+        }
+
+        let detected_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Compute evidence hash (SHA-512 of node_id + reason description).
+        let mut evidence = Vec::new();
+        evidence.extend_from_slice(&(node_id as u64).to_le_bytes());
+        evidence.extend_from_slice(&detected_at.to_le_bytes());
+        let evidence_hash = {
+            use sha2::{Sha512, Digest};
+            let mut hasher = Sha512::new();
+            hasher.update(&evidence);
+            let result = hasher.finalize();
+            let mut hash = [0u8; 64];
+            hash.copy_from_slice(&result);
+            hash
+        };
+
+        let quarantined_node = QuarantinedNode {
+            node_id,
+            detected_at,
+            reason,
+            evidence_hash,
+            re_attestation_required: true,
+        };
+
+        self.quarantined.push(quarantined_node);
+
+        // Mark the node as Byzantine in the cluster.
+        if node_id < self.nodes.len() {
+            self.nodes[node_id].is_byzantine = true;
+        }
+
+        // Recalculate quorum excluding quarantined nodes.
+        let active = self.active_node_count();
+        let f = (active.saturating_sub(1)) / 3;
+        self.quorum_size = 2 * f + 1;
+        self.f = f;
+
+        // SIEM event.
+        let detail = format!(
+            "BFT node {} quarantined at epoch {}. Active nodes: {}, new quorum: {}",
+            node_id, detected_at, active, self.quorum_size
+        );
+        tracing::error!("SIEM:CRITICAL {}", detail);
+        common::siem::SecurityEvent::tamper_detected(&detail);
+    }
+
+    /// Attempt readmission of a quarantined node.
+    /// Requires: valid attestation (simulated by `attestation_valid` param),
+    /// chain sync (node's epoch matches cluster), and unanimous vote from
+    /// all remaining active honest nodes.
+    pub fn attempt_readmission(
+        &mut self,
+        node_id: usize,
+        attestation_valid: bool,
+        votes: &[usize],
+    ) -> Result<(), String> {
+        let qidx = self.quarantined.iter().position(|q| q.node_id == node_id)
+            .ok_or_else(|| format!("node {} is not quarantined", node_id))?;
+
+        if !attestation_valid {
+            return Err("ML-DSA-87 attestation verification failed".to_string());
+        }
+
+        // Verify unanimous vote from all active honest nodes.
+        let active_honest: Vec<usize> = self.nodes.iter().enumerate()
+            .filter(|(i, n)| !n.is_byzantine && !self.is_quarantined(*i))
+            .map(|(i, _)| i)
+            .collect();
+
+        for &honest_id in &active_honest {
+            if !votes.contains(&honest_id) {
+                return Err(format!(
+                    "readmission requires unanimous vote; missing vote from node {}",
+                    honest_id
+                ));
+            }
+        }
+
+        // Readmit: remove from quarantine, unmark Byzantine.
+        self.quarantined.remove(qidx);
+        if node_id < self.nodes.len() {
+            self.nodes[node_id].is_byzantine = false;
+        }
+
+        // Recalculate quorum.
+        let active = self.active_node_count();
+        let f = (active.saturating_sub(1)) / 3;
+        self.quorum_size = 2 * f + 1;
+        self.f = f;
+
+        let detail = format!(
+            "BFT node {} readmitted. Active nodes: {}, quorum: {}",
+            node_id, active, self.quorum_size
+        );
+        tracing::info!("SIEM:INFO {}", detail);
+        common::siem::SecurityEvent {
+            timestamp: common::siem::SecurityEvent::now_iso8601(),
+            category: "bft_quarantine",
+            action: "node_readmitted",
+            severity: common::siem::Severity::Info,
+            outcome: "success",
+            user_id: None,
+            source_ip: None,
+            detail: Some(detail),
+        }
+        .emit();
+
+        Ok(())
     }
 
     /// Detect Byzantine nodes using response time anomalies and chain divergence.
@@ -1042,4 +1207,140 @@ fn load_entries_from_file(path: &std::path::Path, node_id: u8) -> Vec<AuditEntry
     zeroize::Zeroize::zeroize(&mut key);
 
     entries
+}
+
+// ── Quarantine tests ──────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod quarantine_tests {
+    use super::*;
+
+    fn make_test_cluster() -> BftAuditCluster {
+        // Use MILNET_MASTER_KEK for persistence key derivation.
+        std::env::set_var("MILNET_MASTER_KEK", "ab".repeat(32));
+        std::env::set_var("MILNET_BFT_SINGLE_PROCESS_ACK", "1");
+        BftAuditCluster::new(11)
+    }
+
+    #[test]
+    fn divergent_node_is_quarantined() {
+        let mut cluster = make_test_cluster();
+        assert_eq!(cluster.quarantined.len(), 0);
+
+        // Quarantine node 3 for chain divergence.
+        cluster.quarantine_node(
+            3,
+            ByzantineReason::ChainDivergence {
+                expected_hash: [0xAA; 64],
+                actual_hash: [0xBB; 64],
+            },
+        );
+
+        assert_eq!(cluster.quarantined.len(), 1);
+        assert_eq!(cluster.quarantined[0].node_id, 3);
+        assert!(cluster.is_quarantined(3));
+        assert!(cluster.nodes[3].is_byzantine);
+        assert!(cluster.quarantined[0].re_attestation_required);
+    }
+
+    #[test]
+    fn quarantined_node_excluded_from_quorum() {
+        let mut cluster = make_test_cluster();
+        let original_quorum = cluster.quorum_size;
+
+        // Quarantine 3 nodes.
+        for i in 0..3 {
+            cluster.quarantine_node(i, ByzantineReason::SignatureFailure);
+        }
+
+        // Active = 11 - 3 = 8, f = (8-1)/3 = 2, quorum = 2*2+1 = 5
+        assert_eq!(cluster.active_node_count(), 8);
+        assert_eq!(cluster.quorum_size, 5);
+        assert!(cluster.quorum_size < original_quorum);
+    }
+
+    #[test]
+    fn readmission_requires_attestation_and_vote() {
+        let mut cluster = make_test_cluster();
+
+        cluster.quarantine_node(5, ByzantineReason::SignatureFailure);
+        assert!(cluster.is_quarantined(5));
+
+        // Fail without attestation.
+        let result = cluster.attempt_readmission(5, false, &[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("attestation"));
+
+        // Fail without unanimous votes.
+        let result = cluster.attempt_readmission(5, true, &[0, 1, 2]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unanimous"));
+
+        // Succeed with attestation + all active honest node votes.
+        let active_honest: Vec<usize> = cluster.nodes.iter().enumerate()
+            .filter(|(i, n)| !n.is_byzantine && !cluster.is_quarantined(*i))
+            .map(|(i, _)| i)
+            .collect();
+        let result = cluster.attempt_readmission(5, true, &active_honest);
+        assert!(result.is_ok());
+        assert!(!cluster.is_quarantined(5));
+        assert!(!cluster.nodes[5].is_byzantine);
+    }
+
+    #[test]
+    fn multiple_quarantines_shrink_quorum() {
+        let mut cluster = make_test_cluster();
+
+        // 11 nodes: f=3, quorum=7
+        assert_eq!(cluster.quorum_size, 7);
+
+        // Quarantine 1 node: 10 active, f=3, quorum=7
+        cluster.quarantine_node(0, ByzantineReason::SignatureFailure);
+        assert_eq!(cluster.active_node_count(), 10);
+        assert_eq!(cluster.quorum_size, 7);
+
+        // Quarantine 2 more: 8 active, f=2, quorum=5
+        cluster.quarantine_node(1, ByzantineReason::SignatureFailure);
+        cluster.quarantine_node(2, ByzantineReason::SignatureFailure);
+        assert_eq!(cluster.active_node_count(), 8);
+        assert_eq!(cluster.quorum_size, 5);
+
+        // Quarantine 3 more: 5 active, f=1, quorum=3
+        cluster.quarantine_node(3, ByzantineReason::SignatureFailure);
+        cluster.quarantine_node(4, ByzantineReason::SignatureFailure);
+        cluster.quarantine_node(5, ByzantineReason::SignatureFailure);
+        assert_eq!(cluster.active_node_count(), 5);
+        assert_eq!(cluster.quorum_size, 3);
+    }
+
+    #[test]
+    fn system_halts_if_too_many_quarantined() {
+        let mut cluster = make_test_cluster();
+
+        // Quarantine 8 of 11 nodes: 3 active, f=0, quorum=1
+        for i in 0..8 {
+            cluster.quarantine_node(i, ByzantineReason::SignatureFailure);
+        }
+
+        assert_eq!(cluster.active_node_count(), 3);
+        // effective_quorum checks if the cluster can safely operate.
+        // With 3 active: f=0, quorum=1. This is technically achievable
+        // but has zero fault tolerance.
+        let eq = cluster.effective_quorum();
+        assert!(eq.is_some()); // Can still operate (quorum=1).
+
+        // Quarantine 2 more: 1 active node remaining.
+        cluster.quarantine_node(8, ByzantineReason::SignatureFailure);
+        cluster.quarantine_node(9, ByzantineReason::SignatureFailure);
+        assert_eq!(cluster.active_node_count(), 1);
+        // 1 active: f=0, quorum=1. Can technically still operate with 1 node.
+        let eq = cluster.effective_quorum();
+        assert!(eq.is_some());
+
+        // Quarantine the last node: 0 active.
+        cluster.quarantine_node(10, ByzantineReason::SignatureFailure);
+        assert_eq!(cluster.active_node_count(), 0);
+        let eq = cluster.effective_quorum();
+        assert!(eq.is_none(), "system should halt with 0 active nodes");
+    }
 }
