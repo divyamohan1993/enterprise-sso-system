@@ -413,15 +413,15 @@ impl KekKeyring {
 
     /// Get the KEK for a specific version (for unwrapping).
     pub fn get_kek(&self, version: u32) -> Option<&[u8; KEY_LEN]> {
-        self.keys.get(&version).map(|z| z.as_ref())
+        self.keys.get(&version).map(|z| &**z)
     }
 
     /// Get the current KEK (for wrapping new data).
     pub fn current_kek(&self) -> &[u8; KEY_LEN] {
-        self.keys
+        &**self
+            .keys
             .get(&self.current_version)
             .expect("current KEK must exist in keyring")
-            .as_ref()
     }
 
     /// Current version number.
