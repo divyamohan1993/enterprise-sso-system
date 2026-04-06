@@ -123,7 +123,15 @@ impl SessionTracker {
     /// Check if a session has exceeded the idle timeout without being touched.
     /// Returns true if the session is idle (last activity > 30 minutes ago) or unknown.
     pub fn is_session_idle(&self, user_id: &Uuid, session_id: &Uuid, now: i64) -> bool {
-        let active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        let active = self.active.lock().unwrap_or_else(|e| {
+            tracing::warn!(
+                target: "siem",
+                category = "security",
+                action = "mutex_poisoning_recovered",
+                "SIEM:WARNING mutex poisoned in session_limits::is_session_idle - recovering"
+            );
+            e.into_inner()
+        });
         if let Some(sessions) = active.get(user_id) {
             for entry in sessions {
                 if &entry.session_id == session_id {
@@ -136,7 +144,15 @@ impl SessionTracker {
 
     /// Update the last-activity timestamp for a session (call on each API request).
     pub fn touch_session(&self, user_id: &Uuid, session_id: &Uuid, now: i64) {
-        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        let mut active = self.active.lock().unwrap_or_else(|e| {
+            tracing::warn!(
+                target: "siem",
+                category = "security",
+                action = "mutex_poisoning_recovered",
+                "SIEM:WARNING mutex poisoned in session_limits::touch_session - recovering"
+            );
+            e.into_inner()
+        });
         if let Some(sessions) = active.get_mut(user_id) {
             for entry in sessions.iter_mut() {
                 if &entry.session_id == session_id {
@@ -149,20 +165,44 @@ impl SessionTracker {
 
     /// Returns the total number of active sessions across all users.
     pub fn total_active_count(&self) -> usize {
-        let active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        let active = self.active.lock().unwrap_or_else(|e| {
+            tracing::warn!(
+                target: "siem",
+                category = "security",
+                action = "mutex_poisoning_recovered",
+                "SIEM:WARNING mutex poisoned in session_limits::total_active_count - recovering"
+            );
+            e.into_inner()
+        });
         active.values().map(|v| v.len()).sum()
     }
 
     /// Remove all sessions for a user. Used for account deletion (GDPR Article 17).
     pub fn remove_all_sessions(&self, user_id: &Uuid) {
-        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        let mut active = self.active.lock().unwrap_or_else(|e| {
+            tracing::warn!(
+                target: "siem",
+                category = "security",
+                action = "mutex_poisoning_recovered",
+                "SIEM:WARNING mutex poisoned in session_limits::remove_all_sessions - recovering"
+            );
+            e.into_inner()
+        });
         active.remove(user_id);
     }
 
     /// Persist all active sessions to a JSONL file for crash recovery.
     /// Called periodically or on graceful shutdown.
     pub fn persist_to_file(&self, path: &std::path::Path) -> Result<(), String> {
-        let active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        let active = self.active.lock().unwrap_or_else(|e| {
+            tracing::warn!(
+                target: "siem",
+                category = "security",
+                action = "mutex_poisoning_recovered",
+                "SIEM:WARNING mutex poisoned in session_limits::persist_to_file - recovering"
+            );
+            e.into_inner()
+        });
         let file = std::fs::File::create(path)
             .map_err(|e| format!("failed to create session file: {e}"))?;
         let mut writer = std::io::BufWriter::new(file);

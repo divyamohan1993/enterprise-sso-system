@@ -57,6 +57,10 @@ pub enum EnvelopeError {
     InvalidSealedData,
     /// The byte slice provided to `WrappedKey::from_bytes` is too short.
     InvalidWrappedKey,
+    /// The KEK version in the wrapped key is not present in the keyring.
+    UnknownKekVersion(u32),
+    /// Attempted to remove the current KEK version from the keyring.
+    CannotRemoveCurrentVersion,
 }
 
 impl core::fmt::Display for EnvelopeError {
@@ -66,6 +70,10 @@ impl core::fmt::Display for EnvelopeError {
             Self::DecryptionFailed => write!(f, "AES-256-GCM decryption failed"),
             Self::InvalidSealedData => write!(f, "sealed data too short or malformed"),
             Self::InvalidWrappedKey => write!(f, "wrapped key too short or malformed"),
+            Self::UnknownKekVersion(v) => write!(f, "KEK version {} not in keyring", v),
+            Self::CannotRemoveCurrentVersion => {
+                write!(f, "cannot remove the current KEK version from keyring")
+            }
         }
     }
 }
@@ -367,6 +375,186 @@ pub fn build_aad(table: &str, column: &str, row_id: &[u8]) -> Vec<u8> {
     aad.push(b':');
     aad.extend_from_slice(row_id);
     aad
+}
+
+// ---------------------------------------------------------------------------
+// KekKeyring -- multi-version KEK support for seamless rotation
+// ---------------------------------------------------------------------------
+
+/// Multi-version KEK keyring for seamless key rotation.
+///
+/// During rotation, both old and new KEKs are available. Old KEKs can
+/// only decrypt (unwrap). Only the current KEK can encrypt (wrap).
+/// Old KEKs are removed after all data is re-encrypted.
+pub struct KekKeyring {
+    /// Map of version -> KEK bytes. All zeroized on drop.
+    keys: std::collections::HashMap<u32, zeroize::Zeroizing<[u8; KEY_LEN]>>,
+    /// Current version used for new wrapping operations.
+    current_version: u32,
+}
+
+impl KekKeyring {
+    /// Create a new keyring with the given current KEK and version.
+    pub fn new(current_kek: [u8; KEY_LEN], current_version: u32) -> Self {
+        let mut keys = std::collections::HashMap::new();
+        keys.insert(current_version, zeroize::Zeroizing::new(current_kek));
+        Self {
+            keys,
+            current_version,
+        }
+    }
+
+    /// Add a previous KEK version (for unwrapping old data during rotation).
+    ///
+    /// Panics if `version` equals `current_version` (use the constructor for that).
+    pub fn add_previous_version(&mut self, version: u32, kek: [u8; KEY_LEN]) {
+        self.keys.insert(version, zeroize::Zeroizing::new(kek));
+    }
+
+    /// Get the KEK for a specific version (for unwrapping).
+    pub fn get_kek(&self, version: u32) -> Option<&[u8; KEY_LEN]> {
+        self.keys.get(&version).map(|z| z.as_ref())
+    }
+
+    /// Get the current KEK (for wrapping new data).
+    pub fn current_kek(&self) -> &[u8; KEY_LEN] {
+        self.keys
+            .get(&self.current_version)
+            .expect("current KEK must exist in keyring")
+            .as_ref()
+    }
+
+    /// Current version number.
+    pub fn current_version(&self) -> u32 {
+        self.current_version
+    }
+
+    /// Remove an old version after re-encryption is complete.
+    ///
+    /// Returns `Err` if attempting to remove the current version.
+    pub fn remove_version(&mut self, version: u32) -> Result<(), EnvelopeError> {
+        if version == self.current_version {
+            return Err(EnvelopeError::CannotRemoveCurrentVersion);
+        }
+        self.keys.remove(&version);
+        Ok(())
+    }
+
+    /// Number of KEK versions in the keyring.
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// Whether the keyring is empty (should never be true after construction).
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+}
+
+impl Drop for KekKeyring {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        for (_, key) in self.keys.iter_mut() {
+            key.zeroize();
+        }
+    }
+}
+
+/// Wrap (encrypt) a DEK using the current KEK from the keyring.
+///
+/// The wrapped output carries the keyring's current version so that
+/// `unwrap_key_with_keyring` can select the right KEK later.
+pub fn wrap_key_with_keyring(
+    keyring: &KekKeyring,
+    dek: &DataEncryptionKey,
+) -> Result<WrappedKey, EnvelopeError> {
+    let mut nonce_bytes = [0u8; NONCE_LEN];
+    getrandom::getrandom(&mut nonce_bytes).map_err(|e| {
+        common::siem::emit_runtime_error(
+            common::siem::category::CRYPTO_FAILURE,
+            "OS CSPRNG unavailable -- cannot generate nonce for key wrapping",
+            &format!("{e}"),
+            file!(),
+            line!(),
+            column!(),
+            module_path!(),
+        );
+        EnvelopeError::EncryptionFailed
+    })?;
+
+    let current_kek = keyring.current_kek();
+    let version = keyring.current_version();
+
+    let cipher = Aes256Gcm::new(GenericArray::from_slice(current_kek));
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let ciphertext_with_tag = cipher
+        .encrypt(
+            nonce,
+            aes_gcm::aead::Payload {
+                msg: dek.as_bytes(),
+                aad: KEK_WRAP_AAD,
+            },
+        )
+        .map_err(|_| EnvelopeError::EncryptionFailed)?;
+
+    let mut wrapped = Vec::with_capacity(KEK_VERSION_LEN + NONCE_LEN + ciphertext_with_tag.len());
+    wrapped.extend_from_slice(&version.to_be_bytes());
+    wrapped.extend_from_slice(&nonce_bytes);
+    wrapped.extend_from_slice(&ciphertext_with_tag);
+
+    Ok(WrappedKey {
+        bytes: wrapped,
+        kek_version: version,
+    })
+}
+
+/// Unwrap (decrypt) a DEK using the keyring to look up the correct KEK by version.
+///
+/// Unlike `unwrap_key`, this function supports multiple KEK versions.
+/// The version prefix in the wrapped key selects the right KEK from the keyring.
+pub fn unwrap_key_with_keyring(
+    keyring: &KekKeyring,
+    wrapped: &WrappedKey,
+) -> Result<DataEncryptionKey, EnvelopeError> {
+    let raw = wrapped.to_bytes();
+    if raw.len() < KEK_VERSION_LEN + NONCE_LEN + TAG_LEN {
+        return Err(EnvelopeError::InvalidWrappedKey);
+    }
+
+    let version = u32::from_be_bytes(
+        raw[..KEK_VERSION_LEN]
+            .try_into()
+            .map_err(|_| EnvelopeError::InvalidWrappedKey)?,
+    );
+
+    let kek = keyring
+        .get_kek(version)
+        .ok_or(EnvelopeError::UnknownKekVersion(version))?;
+
+    let nonce_bytes = &raw[KEK_VERSION_LEN..KEK_VERSION_LEN + NONCE_LEN];
+    let ciphertext_with_tag = &raw[KEK_VERSION_LEN + NONCE_LEN..];
+
+    let cipher = Aes256Gcm::new(GenericArray::from_slice(kek));
+    let nonce = Nonce::from_slice(nonce_bytes);
+
+    let plaintext = cipher
+        .decrypt(
+            nonce,
+            aes_gcm::aead::Payload {
+                msg: ciphertext_with_tag,
+                aad: KEK_WRAP_AAD,
+            },
+        )
+        .map_err(|_| EnvelopeError::DecryptionFailed)?;
+
+    if plaintext.len() != KEY_LEN {
+        return Err(EnvelopeError::DecryptionFailed);
+    }
+
+    let mut key_bytes = [0u8; KEY_LEN];
+    key_bytes.copy_from_slice(&plaintext);
+    Ok(DataEncryptionKey::from_bytes(key_bytes))
 }
 
 // ---------------------------------------------------------------------------
@@ -682,6 +870,126 @@ mod tests {
             &original,
             "wrap-then-unwrap must preserve the original key material"
         );
+    }
+
+    // ── TEST GROUP 8: KekKeyring multi-version tests ─────────────────
+
+    #[test]
+    fn keyring_wrap_v1_unwrap_with_keyring_containing_v1() {
+        let kek_bytes = [0xAAu8; KEY_LEN];
+        let keyring = KekKeyring::new(kek_bytes, 1);
+        let dek = DataEncryptionKey::generate().expect("generate DEK");
+        let original = *dek.as_bytes();
+
+        let wrapped = wrap_key_with_keyring(&keyring, &dek).expect("wrap");
+        assert_eq!(wrapped.kek_version, 1);
+
+        let recovered = unwrap_key_with_keyring(&keyring, &wrapped).expect("unwrap");
+        assert_eq!(recovered.as_bytes(), &original);
+    }
+
+    #[test]
+    fn keyring_wrap_v1_unwrap_with_keyring_containing_only_v2_fails() {
+        let kek_v1 = [0xAAu8; KEY_LEN];
+        let kek_v2 = [0xBBu8; KEY_LEN];
+
+        // Wrap under v1
+        let keyring_v1 = KekKeyring::new(kek_v1, 1);
+        let dek = DataEncryptionKey::generate().expect("generate DEK");
+        let wrapped = wrap_key_with_keyring(&keyring_v1, &dek).expect("wrap");
+        assert_eq!(wrapped.kek_version, 1);
+
+        // Try unwrap with keyring that only has v2
+        let keyring_v2_only = KekKeyring::new(kek_v2, 2);
+        let result = unwrap_key_with_keyring(&keyring_v2_only, &wrapped);
+        assert_eq!(result.unwrap_err(), EnvelopeError::UnknownKekVersion(1));
+    }
+
+    #[test]
+    fn keyring_rotate_v1_to_v2_unwrap_old_data_with_both() {
+        let kek_v1 = [0xAAu8; KEY_LEN];
+        let kek_v2 = [0xBBu8; KEY_LEN];
+
+        // Wrap under v1
+        let keyring_v1 = KekKeyring::new(kek_v1, 1);
+        let dek = DataEncryptionKey::generate().expect("generate DEK");
+        let original = *dek.as_bytes();
+        let wrapped_v1 = wrap_key_with_keyring(&keyring_v1, &dek).expect("wrap v1");
+        assert_eq!(wrapped_v1.kek_version, 1);
+
+        // Rotate: create v2 keyring with v1 as previous
+        let mut keyring_v2 = KekKeyring::new(kek_v2, 2);
+        keyring_v2.add_previous_version(1, kek_v1);
+        assert_eq!(keyring_v2.len(), 2);
+
+        // Unwrap old v1 data with the new keyring
+        let recovered = unwrap_key_with_keyring(&keyring_v2, &wrapped_v1).expect("unwrap v1 data");
+        assert_eq!(recovered.as_bytes(), &original);
+    }
+
+    #[test]
+    fn keyring_wrap_new_data_with_v2_produces_version_2_prefix() {
+        let kek_v1 = [0xAAu8; KEY_LEN];
+        let kek_v2 = [0xBBu8; KEY_LEN];
+
+        let mut keyring = KekKeyring::new(kek_v2, 2);
+        keyring.add_previous_version(1, kek_v1);
+
+        let dek = DataEncryptionKey::generate().expect("generate DEK");
+        let original = *dek.as_bytes();
+        let wrapped = wrap_key_with_keyring(&keyring, &dek).expect("wrap v2");
+
+        // Version prefix must be 2
+        let raw = wrapped.to_bytes();
+        let version = u32::from_be_bytes(raw[..KEK_VERSION_LEN].try_into().unwrap());
+        assert_eq!(version, 2);
+        assert_eq!(wrapped.kek_version, 2);
+
+        // Round-trip succeeds
+        let recovered = unwrap_key_with_keyring(&keyring, &wrapped).expect("unwrap v2");
+        assert_eq!(recovered.as_bytes(), &original);
+    }
+
+    #[test]
+    fn keyring_remove_old_version_after_reencryption() {
+        let kek_v1 = [0xAAu8; KEY_LEN];
+        let kek_v2 = [0xBBu8; KEY_LEN];
+
+        let mut keyring = KekKeyring::new(kek_v2, 2);
+        keyring.add_previous_version(1, kek_v1);
+        assert_eq!(keyring.len(), 2);
+
+        // Remove v1
+        keyring.remove_version(1).expect("remove v1");
+        assert_eq!(keyring.len(), 1);
+        assert!(keyring.get_kek(1).is_none());
+        assert!(keyring.get_kek(2).is_some());
+    }
+
+    #[test]
+    fn keyring_cannot_remove_current_version() {
+        let kek = [0xAAu8; KEY_LEN];
+        let mut keyring = KekKeyring::new(kek, 1);
+
+        let result = keyring.remove_version(1);
+        assert_eq!(result.unwrap_err(), EnvelopeError::CannotRemoveCurrentVersion);
+    }
+
+    #[test]
+    fn keyring_backward_compat_with_single_kek_unwrap() {
+        // Verify that wrap_key (original) produces data that unwrap_key_with_keyring can handle
+        let kek_bytes = [0xCDu8; KEY_LEN];
+        let kek = KeyEncryptionKey::from_bytes(kek_bytes);
+        let dek = DataEncryptionKey::generate().expect("generate DEK");
+        let original = *dek.as_bytes();
+
+        // Wrap with the original single-KEK function
+        let wrapped = wrap_key(&kek, &dek).expect("wrap");
+
+        // Unwrap with keyring
+        let keyring = KekKeyring::new(kek_bytes, CURRENT_KEK_VERSION);
+        let recovered = unwrap_key_with_keyring(&keyring, &wrapped).expect("unwrap via keyring");
+        assert_eq!(recovered.as_bytes(), &original);
     }
 
     #[test]

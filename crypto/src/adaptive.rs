@@ -366,7 +366,7 @@ pub fn adaptive_crypto() -> &'static AdaptiveCrypto {
 
 /// Derive three independent 32-byte subkeys from a master key via HKDF-SHA512.
 pub fn derive_layer_keys(master: &[u8; 32]) -> Result<([u8; 32], [u8; 32], [u8; 32]), String> {
-    let hk = Hkdf::<Sha512>::new(None, master);
+    let hk = Hkdf::<Sha512>::new(Some(b"MILNET-ADAPTIVE-LAYER-SALT-v1"), master);
     let mut k1 = [0u8; 32];
     let mut k2 = [0u8; 32];
     let mut k3 = [0u8; 32];

@@ -257,7 +257,14 @@ impl LogEntry {
     }
 
     /// Attach HTTP request context.
-    pub fn with_http(mut self, req: HttpRequestContext) -> Self {
+    /// PRIVACY: The `remote_ip` field is pseudonymized before storage to prevent
+    /// raw IP addresses from appearing in log output. Uses HMAC-SHA512 keyed by
+    /// the master KEK when available, otherwise falls back to SHA-512 hash
+    /// truncated to 8 bytes for KEK-independent unlinkability.
+    pub fn with_http(mut self, mut req: HttpRequestContext) -> Self {
+        if let Some(ref ip) = req.remote_ip {
+            req.remote_ip = Some(pseudonymize_ip(ip));
+        }
         self.http_request = Some(req);
         self
     }
@@ -367,6 +374,32 @@ fn send_to_syslog_tls(endpoint: &str, _json_line: &str) {
          Use MILNET_SIEM_WEBHOOK for secure log shipping. \
          Refusing to send logs over plaintext TCP."
     );
+}
+
+// ---------------------------------------------------------------------------
+// IP pseudonymization for log output
+// ---------------------------------------------------------------------------
+
+/// Pseudonymize an IP address for log output.
+/// Tries HMAC-SHA512 keyed by master KEK (via `log_pseudonym::pseudonym_ip`).
+/// If the KEK is unavailable (e.g. during early startup), falls back to a
+/// plain SHA-512 hash truncated to 8 bytes, providing unlinkability without
+/// requiring the KEK.
+fn pseudonymize_ip(ip: &str) -> String {
+    // Try KEK-backed pseudonymization (production path)
+    let result = std::panic::catch_unwind(|| {
+        crate::log_pseudonym::pseudonym_ip(ip)
+    });
+    if let Ok(pseudonym) = result {
+        return pseudonym;
+    }
+    // Fallback: SHA-512 hash when KEK is not available (early startup / tests)
+    use sha2::{Sha512, Digest};
+    let mut hasher = Sha512::new();
+    hasher.update(b"MILNET-LOG-IP-PSEUDO:");
+    hasher.update(ip.as_bytes());
+    let hash = hasher.finalize();
+    format!("ip-{}", hex::encode(&hash[..8]))
 }
 
 // ---------------------------------------------------------------------------

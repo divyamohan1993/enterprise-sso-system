@@ -473,7 +473,7 @@ pub fn did_key_agreement(
     let raw_dh = our_secret.diffie_hellman(&their_public);
 
     // Apply HKDF-SHA512 to extract a uniformly distributed key
-    let hk = hkdf::Hkdf::<sha2::Sha512>::new(None, raw_dh.as_bytes());
+    let hk = hkdf::Hkdf::<sha2::Sha512>::new(Some(b"MILNET-DID-KEYAGREE-SALT-v1"), raw_dh.as_bytes());
     let mut okm = [0u8; 32];
     hk.expand(b"MILNET-DID-KEY-AGREEMENT-v1", &mut okm)
         .expect("HKDF-SHA512 expand for 32 bytes cannot fail");
@@ -499,8 +499,18 @@ pub struct DidRotationEvent {
     pub authorization_signature_hex: String,
 }
 
-/// DID registry — in-memory store for DID documents (production would use
-/// a persistent store).
+/// DID registry -- in-memory store for DID documents.
+///
+/// PERSISTENCE STATUS: In-memory only. A `PersistentDidRegistry` trait is
+/// defined below for future database-backed implementations. This in-memory
+/// registry emits a SIEM warning on construction to flag the lack of
+/// persistence in operational dashboards.
+///
+/// BOUNDED RISK: DID documents are self-certifying (did:key) or domain-bound
+/// (did:web). Loss of the registry on restart means DIDs must be re-registered,
+/// but no security keys are lost (keys live in the DID itself or on the
+/// domain's well-known endpoint). The primary impact is temporary inability
+/// to resolve previously-registered DIDs until they are re-registered.
 #[derive(Debug, Default)]
 pub struct DidRegistry {
     documents: BTreeMap<String, DidDocument>,
@@ -509,7 +519,17 @@ pub struct DidRegistry {
 
 impl DidRegistry {
     /// Create a new empty registry.
+    ///
+    /// Emits a SIEM warning that the DID registry is in-memory only and will
+    /// not survive process restart. Production deployments should implement
+    /// `PersistentDidRegistry` with a database backend.
     pub fn new() -> Self {
+        tracing::warn!(
+            target: "siem",
+            "SIEM:WARNING DID registry initialized with in-memory backend only. \
+             DID registrations will be lost on restart. Implement PersistentDidRegistry \
+             with PostgreSQL backing for production deployments."
+        );
         Self::default()
     }
 
@@ -553,6 +573,34 @@ impl DidRegistry {
     pub fn count(&self) -> usize {
         self.documents.len()
     }
+}
+
+// ---------------------------------------------------------------------------
+// PersistentDidRegistry trait -- for future database-backed implementations
+// ---------------------------------------------------------------------------
+
+/// Trait for persistent DID registry backends.
+///
+/// Implementations should back the DID document store with PostgreSQL (or
+/// equivalent persistent storage) and keep an in-memory cache for fast
+/// resolution. The `DidRegistry` struct above serves as the in-memory
+/// implementation; production deployments should wrap it with a persistent
+/// backend that:
+///   1. Loads all DID documents from DB on construction.
+///   2. Writes through to DB on register/deactivate/rotate.
+///   3. Uses `EncryptedPool` if DID documents contain sensitive metadata.
+///   4. Emits SIEM events on DB unavailability (degrade to cache-only).
+pub trait PersistentDidRegistry: Send + Sync {
+    /// Register a new DID document, persisting to the backend.
+    fn register(&mut self, document: DidDocument) -> Result<(), String>;
+    /// Resolve a DID to its document.
+    fn resolve(&self, did: &str) -> Option<&DidDocument>;
+    /// Deactivate a DID.
+    fn deactivate(&mut self, did: &str) -> Result<(), String>;
+    /// Record a key rotation event.
+    fn record_rotation(&mut self, event: DidRotationEvent);
+    /// Return the total number of registered DIDs.
+    fn count(&self) -> usize;
 }
 
 // ---------------------------------------------------------------------------

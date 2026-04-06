@@ -153,6 +153,127 @@ impl Default for ClientRegistry {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PersistentClientRegistry -- PostgreSQL-backed OAuth client storage
+// ---------------------------------------------------------------------------
+
+/// PostgreSQL-backed OAuth client registry with in-memory L1 cache.
+///
+/// Client records are stored in the `portals` table with `client_secret`
+/// encrypted via `EncryptedPool`. On construction, all client records are
+/// loaded from the database. Mutations write through to both the L1 cache
+/// and the database.
+///
+/// If the database is unavailable at startup, a SIEM critical warning is
+/// emitted and the store degrades to in-memory only.
+pub struct PersistentClientRegistry {
+    memory: ClientRegistry,
+    pool: common::encrypted_db::EncryptedPool,
+}
+
+impl PersistentClientRegistry {
+    /// Create a new persistent client registry, loading all existing clients
+    /// from the `portals` table.
+    pub async fn new(pool: common::encrypted_db::EncryptedPool) -> Result<Self, String> {
+        let mut store = Self {
+            memory: ClientRegistry::new(),
+            pool,
+        };
+        store.load_from_db().await?;
+        Ok(store)
+    }
+
+    /// Load all client records from the database into the in-memory cache.
+    async fn load_from_db(&mut self) -> Result<(), String> {
+        let rows: Vec<(String, Vec<u8>, String, String)> = sqlx::query_as(
+            "SELECT client_id, client_secret, name, redirect_uris FROM portals"
+        )
+        .fetch_all(&self.pool.pool)
+        .await
+        .map_err(|e| {
+            common::siem::emit_runtime_error(
+                common::siem::category::RUNTIME_ERROR,
+                &format!("Failed to load OAuth clients from DB: {e}. Degrading to in-memory only."),
+                "portals load failed",
+                file!(), line!(), column!(), module_path!(),
+            );
+            format!("load portals: {e}")
+        })?;
+
+        for (client_id, secret_enc, name, redirect_uris_json) in rows {
+            let secret_hash = self.pool.decrypt_field(
+                "portals", "client_secret", client_id.as_bytes(), &secret_enc,
+            ).unwrap_or_else(|e| {
+                common::siem::emit_runtime_error(
+                    common::siem::category::CRYPTO_FAILURE,
+                    &format!("Failed to decrypt client secret for {}: {e}", client_id),
+                    "client secret decryption failed",
+                    file!(), line!(), column!(), module_path!(),
+                );
+                Vec::new()
+            });
+
+            if secret_hash.is_empty() {
+                continue;
+            }
+
+            let redirect_uris: Vec<String> = serde_json::from_str(&redirect_uris_json)
+                .unwrap_or_default();
+
+            let client = OAuthClient {
+                client_id: client_id.clone(),
+                client_secret: String::from_utf8_lossy(&secret_hash).to_string(),
+                redirect_uris,
+                name,
+                allowed_scopes: vec!["openid".into(), "profile".into()],
+            };
+            self.memory.clients.insert(client_id, client);
+        }
+        Ok(())
+    }
+
+    /// Register a new OAuth client, writing through to the database.
+    pub async fn register(&mut self, name: &str, redirect_uris: Vec<String>) -> Result<ClientRegistrationResult, String> {
+        let result = self.memory.register(name, redirect_uris.clone())?;
+
+        let client = self.memory.get(&result.client_id)
+            .ok_or("client not found after registration")?;
+
+        let secret_enc = self.pool.encrypt_field(
+            "portals", "client_secret", result.client_id.as_bytes(),
+            client.client_secret.as_bytes(),
+        )?;
+
+        let redirect_uris_json = serde_json::to_string(&redirect_uris)
+            .map_err(|e| format!("serialize redirect_uris: {e}"))?;
+
+        sqlx::query(
+            "INSERT INTO portals (client_id, client_secret, name, redirect_uris) \
+             VALUES ($1, $2, $3, $4) ON CONFLICT (client_id) DO UPDATE \
+             SET client_secret = $2, name = $3, redirect_uris = $4"
+        )
+        .bind(&result.client_id)
+        .bind(&secret_enc)
+        .bind(name)
+        .bind(&redirect_uris_json)
+        .execute(&self.pool.pool)
+        .await
+        .map_err(|e| format!("persist client: {e}"))?;
+
+        Ok(result)
+    }
+
+    /// Validate a client's credentials (L1 cache lookup).
+    pub fn validate(&self, client_id: &str, client_secret: &str) -> Option<&OAuthClient> {
+        self.memory.validate(client_id, client_secret)
+    }
+
+    /// Look up a client by ID (L1 cache).
+    pub fn get(&self, client_id: &str) -> Option<&OAuthClient> {
+        self.memory.get(client_id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

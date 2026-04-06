@@ -134,7 +134,7 @@ fn state_hmac_key() -> &'static [u8; 64] {
             common::sealed_keys::cached_master_kek()
         });
         if let Ok(master_kek) = result {
-            let hk = hkdf::Hkdf::<Sha512>::new(None, master_kek);
+            let hk = hkdf::Hkdf::<Sha512>::new(Some(b"MILNET-OAUTH-STATE-SALT-v1"), master_kek);
             let mut key = [0u8; 64];
             if hk.expand(b"MILNET-OAUTH-STATE-HMAC-v1", &mut key).is_ok() {
                 return key;

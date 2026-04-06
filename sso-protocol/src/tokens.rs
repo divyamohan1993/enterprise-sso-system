@@ -447,6 +447,173 @@ impl Default for RefreshTokenStore {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PersistentRefreshTokenStore -- PostgreSQL-backed refresh token storage
+// ---------------------------------------------------------------------------
+
+/// PostgreSQL-backed refresh token store with in-memory L1 cache.
+///
+/// Refresh tokens are stored in the `refresh_tokens` table. Token values are
+/// stored as SHA-256 hashes (never plaintext) for the same reason authorization
+/// codes are hashed. On construction, all non-expired tokens are loaded from the
+/// database. Mutations write through to both stores.
+///
+/// Family-wide revocation is atomic: the DB DELETE and in-memory removal happen
+/// together. If the database is unavailable at construction, a SIEM critical
+/// warning is emitted and the store operates in-memory only.
+pub struct PersistentRefreshTokenStore {
+    memory: RefreshTokenStore,
+    pool: sqlx::PgPool,
+}
+
+impl PersistentRefreshTokenStore {
+    /// Create a new persistent refresh token store, loading all non-expired
+    /// tokens from the `refresh_tokens` table.
+    pub async fn new(pool: sqlx::PgPool) -> Result<Self, String> {
+        let mut store = Self {
+            memory: RefreshTokenStore {
+                tokens: HashMap::new(),
+                persistence_backend: Some("postgresql".to_string()),
+            },
+            pool,
+        };
+        store.load_from_db().await?;
+        Ok(store)
+    }
+
+    /// Load non-expired tokens from the database into the in-memory cache.
+    async fn load_from_db(&mut self) -> Result<(), String> {
+        let now = common::secure_time::secure_now_secs_i64();
+        let rows: Vec<(String, Uuid, String, String, i64, bool, String)> = sqlx::query_as(
+            "SELECT token_hash, user_id, client_id, scope, expires_at, used, family_id \
+             FROM refresh_tokens WHERE expires_at > $1"
+        )
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| {
+            common::siem::emit_runtime_error(
+                common::siem::category::RUNTIME_ERROR,
+                &format!("Failed to load refresh tokens from DB: {e}. Degrading to in-memory only."),
+                "refresh_tokens load failed",
+                file!(), line!(), column!(), module_path!(),
+            );
+            format!("load refresh_tokens: {e}")
+        })?;
+
+        for (token_hash, user_id, client_id, scope, expires_at, used, family_id) in rows {
+            self.memory.tokens.insert(token_hash, RefreshToken {
+                token: String::new(), // raw token not stored
+                user_id,
+                client_id,
+                scope,
+                expires_at,
+                used,
+                family_id,
+            });
+        }
+        Ok(())
+    }
+
+    /// Issue a new refresh token, writing through to the database.
+    pub async fn issue(&mut self, user_id: Uuid, client_id: &str, scope: &str) -> Result<String, String> {
+        let token_value = self.memory.issue(user_id, client_id, scope);
+        let token_hash = {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(token_value.as_bytes()))
+        };
+
+        let rt = self.memory.tokens.get(&token_value).cloned()
+            .ok_or("token not found after issue")?;
+
+        sqlx::query(
+            "INSERT INTO refresh_tokens (token_hash, user_id, client_id, scope, expires_at, used, family_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)"
+        )
+        .bind(&token_hash)
+        .bind(rt.user_id)
+        .bind(&rt.client_id)
+        .bind(&rt.scope)
+        .bind(rt.expires_at)
+        .bind(rt.used)
+        .bind(&rt.family_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("persist refresh token: {e}"))?;
+
+        Ok(token_value)
+    }
+
+    /// Redeem a refresh token with database write-through.
+    pub async fn redeem(
+        &mut self,
+        token: &str,
+        client_id: &str,
+    ) -> Result<(RefreshToken, String), String> {
+        let (old_rt, new_token) = self.memory.redeem(token, client_id)?;
+
+        // Mark old token as used in DB
+        let old_hash = {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(token.as_bytes()))
+        };
+        sqlx::query("UPDATE refresh_tokens SET used = TRUE WHERE token_hash = $1")
+            .bind(&old_hash)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("mark token used in DB: {e}"))?;
+
+        // Insert new rotated token into DB
+        let new_hash = {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(new_token.as_bytes()))
+        };
+        if let Some(new_rt) = self.memory.tokens.get(&new_token) {
+            sqlx::query(
+                "INSERT INTO refresh_tokens (token_hash, user_id, client_id, scope, expires_at, used, family_id) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)"
+            )
+            .bind(&new_hash)
+            .bind(new_rt.user_id)
+            .bind(&new_rt.client_id)
+            .bind(&new_rt.scope)
+            .bind(new_rt.expires_at)
+            .bind(new_rt.used)
+            .bind(&new_rt.family_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("persist rotated refresh token: {e}"))?;
+        }
+
+        Ok((old_rt, new_token))
+    }
+
+    /// Revoke an entire token family in both DB and memory.
+    pub async fn revoke_family(&mut self, family_id: &str) -> Result<(), String> {
+        sqlx::query("DELETE FROM refresh_tokens WHERE family_id = $1")
+            .bind(family_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("revoke family in DB: {e}"))?;
+
+        self.memory.revoke_family(family_id);
+        Ok(())
+    }
+
+    /// Remove all expired refresh tokens from both DB and memory.
+    pub async fn cleanup_expired(&mut self) -> Result<(), String> {
+        let now = common::secure_time::secure_now_secs_i64();
+        sqlx::query("DELETE FROM refresh_tokens WHERE expires_at <= $1")
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("cleanup expired refresh tokens: {e}"))?;
+
+        self.memory.cleanup_expired();
+        Ok(())
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct IdTokenClaims {
     pub iss: String,

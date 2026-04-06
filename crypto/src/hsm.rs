@@ -1215,7 +1215,7 @@ impl Tpm2Session {
 
         // Sign with the SRK-derived attestation key
         let mut attest_key = [0u8; 32];
-        let hk = Hkdf::<Sha512>::new(None, &self.srk_handle);
+        let hk = Hkdf::<Sha512>::new(Some(b"MILNET-HSM-SESSION-SALT-v1"), &self.srk_handle);
         hk.expand(b"tpm2-attestation-key", &mut attest_key)
             .expect("HKDF-SHA512 expand for 32 bytes is infallible (32 < 255*64=16320)");
 
@@ -1498,7 +1498,7 @@ impl HsmKeyManager {
         //             CKA_WRAP=true, CKA_UNWRAP=true, CKA_ENCRYPT=true, CKA_DECRYPT=true
         let mut master_key_material = [0u8; 32];
         // Derive master key deterministically from root so it is stable across sessions
-        let hk = Hkdf::<Sha512>::new(None, &root_key);
+        let hk = Hkdf::<Sha512>::new(Some(b"MILNET-HSM-ROOT-SALT-v1"), &root_key);
         hk.expand(config.key_label.as_bytes(), &mut master_key_material)
             .map_err(|_| {
                 HsmError::KeyGenerationFailed("HKDF expansion failed for master key".into())
@@ -1562,7 +1562,7 @@ impl HsmKeyManager {
             .map_err(|_| SealError::InvalidMasterKey)?;
 
         // Derive a purpose-specific wrapping key (HKDF from master + purpose)
-        let hk = Hkdf::<Sha512>::new(None, &master_material);
+        let hk = Hkdf::<Sha512>::new(Some(b"MILNET-HSM-WRAP-SALT-v1"), &master_material);
         let mut wrap_key = [0u8; 32];
         let info = format!("pkcs11-wrap:{}", purpose);
         hk.expand(info.as_bytes(), &mut wrap_key)
@@ -1623,7 +1623,7 @@ impl HsmKeyManager {
             .load_key(&session.key_label)
             .map_err(|_| SealError::InvalidMasterKey)?;
 
-        let hk = Hkdf::<Sha512>::new(None, &master_material);
+        let hk = Hkdf::<Sha512>::new(Some(b"MILNET-HSM-WRAP-SALT-v1"), &master_material);
         let mut wrap_key = [0u8; 32];
         let info = format!("pkcs11-wrap:{}", purpose);
         hk.expand(info.as_bytes(), &mut wrap_key)
@@ -1879,7 +1879,7 @@ impl HsmKeyManager {
 
         // Generate the master key sealed to PCR values
         let mut master_key_material = [0u8; 32];
-        let hk = Hkdf::<Sha512>::new(None, &storage_key);
+        let hk = Hkdf::<Sha512>::new(Some(b"MILNET-HSM-ROOT-SALT-v1"), &storage_key);
         hk.expand(config.key_label.as_bytes(), &mut master_key_material)
             .map_err(|_| {
                 HsmError::KeyGenerationFailed(
@@ -1935,7 +1935,7 @@ impl HsmKeyManager {
             .load_key(&self.config.key_label)
             .map_err(|_| SealError::InvalidMasterKey)?;
 
-        let hk = Hkdf::<Sha512>::new(None, &master_material);
+        let hk = Hkdf::<Sha512>::new(Some(b"MILNET-HSM-WRAP-SALT-v1"), &master_material);
         let mut wrap_key = [0u8; 32];
         let info = format!("tpm2-wrap:{}", purpose);
         hk.expand(info.as_bytes(), &mut wrap_key)
@@ -2010,7 +2010,7 @@ impl HsmKeyManager {
             .load_key(&self.config.key_label)
             .map_err(|_| SealError::InvalidMasterKey)?;
 
-        let hk = Hkdf::<Sha512>::new(None, &master_material);
+        let hk = Hkdf::<Sha512>::new(Some(b"MILNET-HSM-WRAP-SALT-v1"), &master_material);
         let mut wrap_key = [0u8; 32];
         let info = format!("tpm2-wrap:{}", purpose);
         hk.expand(info.as_bytes(), &mut wrap_key)
@@ -2210,7 +2210,7 @@ impl HsmKeyManager {
 
                 // Derive a signing key from the KMS root
                 let mut signing_key = [0u8; 32];
-                let hk = Hkdf::<Sha512>::new(None, &session.key_store.root_key);
+                let hk = Hkdf::<Sha512>::new(Some(b"MILNET-HSM-SESSION-SALT-v1"), &session.key_store.root_key);
                 let info = format!("aws-kms-sign:{}", signing_key_label);
                 hk.expand(info.as_bytes(), &mut signing_key)
                     .map_err(|_| HsmError::SigningFailed("HKDF expansion failed".into()))?;
@@ -2232,7 +2232,7 @@ impl HsmKeyManager {
 
                 // Derive a signing key from the SRK
                 let mut signing_key = [0u8; 32];
-                let hk = Hkdf::<Sha512>::new(None, &session.srk_handle);
+                let hk = Hkdf::<Sha512>::new(Some(b"MILNET-HSM-SESSION-SALT-v1"), &session.srk_handle);
                 let info = format!("tpm2-sign:{}", signing_key_label);
                 hk.expand(info.as_bytes(), &mut signing_key)
                     .map_err(|_| HsmError::SigningFailed("HKDF expansion failed".into()))?;
@@ -2638,7 +2638,7 @@ impl ProductionKeySource for HsmKeyManager {
                     .load_key(&session.key_label)
                     .map_err(|_| SealError::InvalidMasterKey)?;
 
-                let hk = Hkdf::<Sha512>::new(None, &master_material);
+                let hk = Hkdf::<Sha512>::new(Some(b"MILNET-HSM-SEAL-SALT-v1"), &master_material);
                 let mut local_key = [0u8; 32];
                 hk.expand(b"pkcs11-local-master-key", &mut local_key)
                     .map_err(|_| SealError::KeyDerivationFailed)?;
@@ -2651,7 +2651,7 @@ impl ProductionKeySource for HsmKeyManager {
                 // In real AWS KMS, this would call GenerateDataKey to get a DEK.
                 tracing::info!("Deriving local master key from AWS KMS");
 
-                let hk = Hkdf::<Sha512>::new(None, &session.key_store.root_key);
+                let hk = Hkdf::<Sha512>::new(Some(b"MILNET-HSM-SEAL-SALT-v1"), &session.key_store.root_key);
                 let mut local_key = [0u8; 32];
                 let info = format!("aws-kms-local-master:{}", session.key_id);
                 hk.expand(info.as_bytes(), &mut local_key)

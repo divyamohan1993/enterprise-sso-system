@@ -72,6 +72,22 @@ const PUZZLE_TTL_SECS: i64 = 30;
 /// Entries older than `PUZZLE_TTL_SECS` are automatically purged during
 /// cleanup, and the set is hard-bounded by `MAX_CONSUMED_ENTRIES`.
 ///
+/// PERSISTENCE DECISION: Intentionally ephemeral (in-memory only).
+///
+/// Puzzle nonces have a 30-second TTL (`PUZZLE_TTL_SECS`). After a process
+/// restart, the replay window is bounded to at most 30 seconds of previously-
+/// solved puzzles that could be replayed. This is acceptable because:
+///   1. Puzzles are proof-of-work challenges, not authentication tokens.
+///      Replaying a solved puzzle only skips the PoW computation; it does not
+///      grant access or bypass authentication.
+///   2. The 30-second TTL means the attacker must replay within 30 seconds
+///      of the restart AND possess a valid solution from before the restart.
+///   3. The adaptive difficulty system (`get_adaptive_difficulty`) will
+///      increase puzzle difficulty under load regardless of replay cache state.
+///   4. For military deployments, the `DistributedPuzzleStore` trait provides
+///      cross-instance replay prevention via Redis, which also survives
+///      single-instance restarts.
+///
 /// When the hard limit is reached and no expired entries can be purged,
 /// the oldest entries are forcibly evicted (LRU-style) to guarantee the
 /// bound is never exceeded.

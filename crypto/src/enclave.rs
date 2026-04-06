@@ -454,7 +454,7 @@ pub fn derive_channel_session_key(
     ikm.extend_from_slice(&second);
     ikm.extend_from_slice(session_id);
 
-    let hk = hkdf::Hkdf::<Sha512>::new(None, &ikm);
+    let hk = hkdf::Hkdf::<Sha512>::new(Some(b"MILNET-ENCLAVE-CHANNEL-SALT-v1"), &ikm);
     // Zeroize IKM immediately after HKDF extraction -- it contains the shared secret
     ikm.zeroize();
     let mut key = [0u8; 32];

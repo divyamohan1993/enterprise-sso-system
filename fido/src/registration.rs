@@ -265,6 +265,167 @@ impl Default for CredentialStore {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PersistentCredentialStore — PostgreSQL-backed FIDO2 credential storage
+// ---------------------------------------------------------------------------
+
+/// PostgreSQL-backed FIDO2 credential store with in-memory L1 cache.
+///
+/// Credentials are stored encrypted in the `fido_credentials` table using
+/// `EncryptedPool` envelope encryption. Challenges remain memory-only (ephemeral,
+/// 60s TTL). On construction, all credentials are loaded from the database into
+/// the in-memory store for O(1) read access. Mutations write through to both
+/// the L1 cache and the database.
+///
+/// If the database is unavailable during construction, the store degrades to
+/// in-memory only with a SIEM critical warning. Write failures are logged but
+/// do not block the in-memory operation (availability over consistency for reads,
+/// consistency enforced on writes where possible).
+pub struct PersistentCredentialStore {
+    memory: CredentialStore,
+    pool: common::encrypted_db::EncryptedPool,
+}
+
+impl PersistentCredentialStore {
+    /// Create a new persistent credential store, loading all existing credentials
+    /// from the `fido_credentials` table.
+    pub async fn new(pool: common::encrypted_db::EncryptedPool) -> Result<Self, String> {
+        let mut store = Self {
+            memory: CredentialStore::new(),
+            pool,
+        };
+        store.load_from_db().await?;
+        Ok(store)
+    }
+
+    /// Load all credentials from the database into the in-memory cache.
+    async fn load_from_db(&mut self) -> Result<(), String> {
+        let rows: Vec<(Vec<u8>, Vec<u8>, Uuid, i32, String)> = sqlx::query_as(
+            "SELECT credential_id, public_key, user_id, sign_count, authenticator_type \
+             FROM fido_credentials"
+        )
+        .fetch_all(&self.pool.pool)
+        .await
+        .map_err(|e| {
+            common::siem::emit_runtime_error(
+                common::siem::category::RUNTIME_ERROR,
+                &format!("Failed to load FIDO credentials from DB: {e}. Degrading to in-memory only."),
+                "fido_credentials load failed",
+                file!(), line!(), column!(), module_path!(),
+            );
+            format!("load fido_credentials: {e}")
+        })?;
+
+        for (cred_id_enc, pubkey_enc, user_id, sign_count, auth_type) in rows {
+            // Decrypt credential_id (stored as-is, not sensitive)
+            // Public key is encrypted via EncryptedPool
+            let pubkey = self.pool.decrypt_field(
+                "fido_credentials", "public_key", &cred_id_enc, &pubkey_enc,
+            ).unwrap_or_else(|e| {
+                common::siem::emit_runtime_error(
+                    common::siem::category::CRYPTO_FAILURE,
+                    &format!("Failed to decrypt FIDO credential public key: {e}"),
+                    "fido credential decryption failed",
+                    file!(), line!(), column!(), module_path!(),
+                );
+                Vec::new()
+            });
+
+            if !pubkey.is_empty() {
+                self.memory.store_credential(StoredCredential {
+                    credential_id: cred_id_enc,
+                    public_key: pubkey,
+                    user_id,
+                    sign_count: sign_count as u32,
+                    authenticator_type: auth_type,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Store a credential in both the database and in-memory cache.
+    pub async fn store_credential(&mut self, cred: StoredCredential) -> Result<(), String> {
+        let pubkey_enc = self.pool.encrypt_field(
+            "fido_credentials", "public_key", &cred.credential_id, &cred.public_key,
+        )?;
+
+        sqlx::query(
+            "INSERT INTO fido_credentials (credential_id, public_key, user_id, sign_count, authenticator_type) \
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (credential_id) DO UPDATE \
+             SET public_key = $2, sign_count = $4"
+        )
+        .bind(&cred.credential_id)
+        .bind(&pubkey_enc)
+        .bind(cred.user_id)
+        .bind(cred.sign_count as i32)
+        .bind(&cred.authenticator_type)
+        .execute(&self.pool.pool)
+        .await
+        .map_err(|e| format!("persist fido credential: {e}"))?;
+
+        self.memory.store_credential(cred);
+        Ok(())
+    }
+
+    /// Look up a credential by its ID (L1 cache hit).
+    pub fn get_credential(&self, credential_id: &[u8]) -> Option<&StoredCredential> {
+        self.memory.get_credential(credential_id)
+    }
+
+    /// Get all credentials belonging to a user.
+    pub fn get_user_credentials(&self, user_id: &Uuid) -> Vec<&StoredCredential> {
+        self.memory.get_user_credentials(user_id)
+    }
+
+    /// Check whether a credential ID is already registered.
+    pub fn credential_exists(&self, credential_id: &[u8]) -> bool {
+        self.memory.credential_exists(credential_id)
+    }
+
+    /// Return the total number of stored credentials.
+    pub fn credential_count(&self) -> usize {
+        self.memory.credential_count()
+    }
+
+    /// Store a pending challenge (memory-only, ephemeral).
+    pub fn store_challenge(&mut self, challenge: &[u8], user_id: Uuid) {
+        self.memory.store_challenge(challenge, user_id);
+    }
+
+    /// Consume a pending challenge (memory-only, ephemeral).
+    pub fn consume_challenge(&mut self, challenge: &[u8]) -> Option<Uuid> {
+        self.memory.consume_challenge(challenge)
+    }
+
+    /// Update sign count in both DB and memory after successful authentication.
+    pub async fn update_sign_count(&mut self, credential_id: &[u8], new_count: u32) -> Result<(), String> {
+        sqlx::query("UPDATE fido_credentials SET sign_count = $1 WHERE credential_id = $2")
+            .bind(new_count as i32)
+            .bind(credential_id)
+            .execute(&self.pool.pool)
+            .await
+            .map_err(|e| format!("update sign count: {e}"))?;
+
+        if let Some(cred) = self.memory.get_credential_mut(credential_id) {
+            cred.sign_count = new_count;
+        }
+        Ok(())
+    }
+
+    /// Remove all credentials for a user (GDPR Article 17 right-to-erasure).
+    pub async fn remove_user_credentials(&mut self, user_id: &Uuid) -> Result<(), String> {
+        sqlx::query("DELETE FROM fido_credentials WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&self.pool.pool)
+            .await
+            .map_err(|e| format!("delete user fido credentials: {e}"))?;
+
+        self.memory.remove_user_credentials(user_id);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

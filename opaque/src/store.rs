@@ -461,3 +461,134 @@ impl Default for CredentialStore {
         Self::new()
     }
 }
+
+// ---------------------------------------------------------------------------
+// PersistentOpaqueStore -- PostgreSQL-backed OPAQUE credential storage
+// ---------------------------------------------------------------------------
+
+/// PostgreSQL-backed OPAQUE credential store with in-memory L1 cache.
+///
+/// User records (serialized `ServerRegistration` blobs) are stored encrypted
+/// in the `users` table's `opaque_registration` column via `EncryptedPool`.
+/// On construction, all user records are loaded from the database. Mutations
+/// write through to both the in-memory cache and the database.
+///
+/// The `ServerSetup` (OPRF seed + keypair) must also be persisted separately
+/// to survive restarts. This store handles only user registration records.
+pub struct PersistentOpaqueStore {
+    memory: CredentialStore,
+    pool: common::encrypted_db::EncryptedPool,
+}
+
+impl PersistentOpaqueStore {
+    /// Create a new persistent OPAQUE store, loading all existing user records
+    /// from the `users` table.
+    pub async fn new(pool: common::encrypted_db::EncryptedPool, server_setup: opaque_ke::ServerSetup<crate::opaque_impl::OpaqueCs>) -> Result<Self, String> {
+        let mut store = Self {
+            memory: CredentialStore::with_server_setup(server_setup),
+            pool,
+        };
+        store.load_from_db().await?;
+        Ok(store)
+    }
+
+    /// Load all user records from the database into the in-memory cache.
+    async fn load_from_db(&mut self) -> Result<(), String> {
+        let rows: Vec<(String, Uuid, Vec<u8>)> = sqlx::query_as(
+            "SELECT username, user_id, opaque_registration FROM users \
+             WHERE opaque_registration IS NOT NULL"
+        )
+        .fetch_all(&self.pool.pool)
+        .await
+        .map_err(|e| {
+            common::siem::emit_runtime_error(
+                common::siem::category::RUNTIME_ERROR,
+                &format!("Failed to load OPAQUE users from DB: {e}. Degrading to in-memory only."),
+                "opaque users load failed",
+                file!(), line!(), column!(), module_path!(),
+            );
+            format!("load users: {e}")
+        })?;
+
+        for (username, user_id, reg_enc) in rows {
+            let reg_bytes = self.pool.decrypt_field(
+                "users", "opaque_registration", username.as_bytes(), &reg_enc,
+            ).unwrap_or_else(|e| {
+                common::siem::emit_runtime_error(
+                    common::siem::category::CRYPTO_FAILURE,
+                    &format!("Failed to decrypt OPAQUE registration for user: {e}"),
+                    "opaque registration decryption failed",
+                    file!(), line!(), column!(), module_path!(),
+                );
+                Vec::new()
+            });
+
+            if !reg_bytes.is_empty() {
+                self.memory.restore_user(&username, user_id, reg_bytes);
+            }
+        }
+        Ok(())
+    }
+
+    /// Store a completed registration, writing through to the database.
+    pub async fn store_registration(
+        &mut self,
+        username: &str,
+        registration_bytes: Vec<u8>,
+    ) -> Result<Uuid, String> {
+        let user_id = self.memory.store_registration(username, registration_bytes.clone());
+        if user_id.is_nil() {
+            return Err("MAX_USERS reached or registration failed".to_string());
+        }
+
+        let reg_enc = self.pool.encrypt_field(
+            "users", "opaque_registration", username.as_bytes(), &registration_bytes,
+        )?;
+
+        sqlx::query(
+            "INSERT INTO users (username, user_id, opaque_registration) VALUES ($1, $2, $3) \
+             ON CONFLICT (username) DO UPDATE SET opaque_registration = $3, user_id = $2"
+        )
+        .bind(username)
+        .bind(user_id)
+        .bind(&reg_enc)
+        .execute(&self.pool.pool)
+        .await
+        .map_err(|e| format!("persist opaque registration: {e}"))?;
+
+        Ok(user_id)
+    }
+
+    /// Look up a user's OPAQUE registration record (L1 cache).
+    pub fn get_registration(
+        &self,
+        username: &str,
+    ) -> Result<(opaque_ke::ServerRegistration<crate::opaque_impl::OpaqueCs>, Uuid), common::error::MilnetError> {
+        self.memory.get_registration(username)
+    }
+
+    /// Returns a reference to the server setup.
+    pub fn server_setup(&self) -> &opaque_ke::ServerSetup<crate::opaque_impl::OpaqueCs> {
+        self.memory.server_setup()
+    }
+
+    /// Check if a user exists.
+    pub fn user_exists(&self, username: &str) -> bool {
+        self.memory.user_exists(username)
+    }
+
+    /// Get user_id for a username.
+    pub fn get_user_id(&self, username: &str) -> Option<Uuid> {
+        self.memory.get_user_id(username)
+    }
+
+    /// Return the number of registered users.
+    pub fn user_count(&self) -> usize {
+        self.memory.user_count()
+    }
+
+    /// Verify a password using the in-memory store.
+    pub fn verify_password(&self, username: &str, password: &[u8]) -> Result<Uuid, common::error::MilnetError> {
+        self.memory.verify_password(username, password)
+    }
+}

@@ -44,6 +44,22 @@ const DPOP_REPLAY_CACHE_TTL_SECS: i64 = 60;
 /// Uses a two-generation approach: when the current generation fills up,
 /// swap it with the previous generation (which is discarded). This ensures
 /// O(1) amortized cleanup instead of O(n log n) emergency eviction.
+///
+/// PERSISTENCE DECISION: Intentionally ephemeral (in-memory only).
+///
+/// DPoP proofs have a 1-second timestamp tolerance (`DPOP_TIMESTAMP_TOLERANCE_SECS`)
+/// and the replay cache TTL is 60 seconds. After a process restart, the replay
+/// window is bounded to at most 60 seconds of previously-seen proofs that could
+/// be replayed. This is acceptable because:
+///   1. DPoP proofs are bound to a specific HTTP method and URL, limiting
+///      replay scope even if the cache is lost.
+///   2. The 1-second timestamp tolerance means proofs expire almost immediately
+///      regardless of cache state.
+///   3. Persisting 100K+ hash entries with sub-millisecond write latency would
+///      require Redis or similar, adding a failure dependency to every token
+///      verification. The bounded replay window does not justify this cost.
+///   4. Token JTI replay detection (which IS persisted via DatabaseJtiStore)
+///      provides a second layer of replay protection at the token level.
 struct DpopReplayCache {
     /// Current generation of proof hashes.
     current: HashMap<[u8; 64], i64>,
