@@ -647,7 +647,7 @@ mod tests {
         let eval = server.partial_evaluate(b"test-blinded-element");
         assert_eq!(eval.server_id, 1);
         assert!(!eval.evaluation.is_empty());
-        assert_eq!(eval.evaluation.len(), 32); // HMAC-SHA256 output
+        assert_eq!(eval.evaluation.len(), 64); // HMAC-SHA512 output (CNSA 2.0)
     }
 
     #[test]

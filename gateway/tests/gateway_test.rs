@@ -159,8 +159,8 @@ fn xwing_fingerprint_is_deterministic() {
     let fp2 = compute_fingerprint(&pk_bytes);
     assert_eq!(fp1, fp2, "fingerprint must be deterministic");
     assert!(!fp1.is_empty());
-    // Must be hex-encoded SHA-256 (64 hex chars)
-    assert_eq!(fp1.len(), 64, "fingerprint must be 64 hex chars (SHA-256)");
+    // Must be hex-encoded SHA-512 (128 hex chars, CNSA 2.0)
+    assert_eq!(fp1.len(), 128, "fingerprint must be 128 hex chars (SHA-512)");
 }
 
 #[test]
@@ -204,7 +204,7 @@ async fn gateway_challenge_contains_fingerprint() {
         "puzzle challenge must include X-Wing public key fingerprint"
     );
     let fingerprint = challenge.xwing_server_pk_fingerprint.unwrap();
-    assert_eq!(fingerprint.len(), 64, "fingerprint must be 64 hex chars");
+    assert_eq!(fingerprint.len(), 128, "fingerprint must be 128 hex chars (SHA-512)");
 
     // The fingerprint must match the included public key
     let pk_bytes = challenge.xwing_server_pk.as_ref().unwrap();
