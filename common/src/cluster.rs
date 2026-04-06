@@ -1240,7 +1240,12 @@ mod tests {
     #[test]
     fn cluster_config_from_env_with_peers() {
         // Production mode accepts properly configured cluster peers.
-        std::env::set_var("MILNET_CLUSTER_PEERS", "node2@10.0.0.2:9090,node3@10.0.0.3:9090");
+        // Peer format: UUID@raft_addr/service_addr
+        std::env::set_var(
+            "MILNET_CLUSTER_PEERS",
+            "00000000-0000-0000-0000-000000000002@10.0.0.2:9090/10.0.0.2:8080,\
+             00000000-0000-0000-0000-000000000003@10.0.0.3:9090/10.0.0.3:8080",
+        );
         std::env::remove_var("MILNET_NODE_ID");
         std::env::remove_var("MILNET_SERVICE_TYPE");
         std::env::remove_var("MILNET_SERVICE_ADDR");

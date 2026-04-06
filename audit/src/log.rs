@@ -1003,6 +1003,7 @@ mod tests {
 
     #[test]
     fn overflow_archival_respects_max_entries() {
+        std::env::set_var("MILNET_TESTING_SINGLE_KEK_ACK", "1");
         let dir = std::env::temp_dir().join(format!("audit_overflow_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
 
@@ -1021,6 +1022,7 @@ mod tests {
         assert!(log.len() <= 5, "entries should be <= max_entries after archival");
 
         let _ = std::fs::remove_dir_all(&dir);
+        std::env::remove_var("MILNET_TESTING_SINGLE_KEK_ACK");
     }
 
     #[test]

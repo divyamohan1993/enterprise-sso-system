@@ -138,35 +138,34 @@ fn test_default_error_level_is_warn_not_verbose() {
 }
 
 #[test]
-fn test_error_level_config_defaults_to_warn() {
-    // The runtime ErrorLevelConfig singleton must default to Warn.
+fn test_error_level_config_defaults_to_verbose() {
+    // The runtime ErrorLevelConfig singleton defaults to Verbose.
     let elc = ErrorLevelConfig::new();
-    assert_eq!(elc.level(), ErrorLevel::Warn);
-    assert!(!elc.is_verbose());
-    assert!(!elc.is_enabled()); // backwards-compat alias
+    assert_eq!(elc.level(), ErrorLevel::Verbose);
+    assert!(elc.is_verbose());
+    assert!(elc.is_enabled()); // backwards-compat alias
 }
 
 #[test]
-fn test_military_deployment_forces_warn_when_verbose_requested() {
-    // When MILNET_MILITARY_DEPLOYMENT=1, set_level(Verbose) must be
-    // silently downgraded to Warn to prevent information leakage.
-    // We set the env var, create a fresh config, try to set Verbose,
-    // and verify it remains Warn.
+fn test_military_deployment_allows_verbose() {
+    // Verbose is always allowed. Verbose errors go to the SIEM panel
+    // for super admin visibility; end users see sanitized messages.
     std::env::set_var("MILNET_MILITARY_DEPLOYMENT", "1");
     let elc = ErrorLevelConfig::new();
     elc.set_level(ErrorLevel::Verbose);
-    assert_eq!(elc.level(), ErrorLevel::Warn, "military deployment must force Warn");
-    assert!(!elc.is_verbose());
+    assert_eq!(elc.level(), ErrorLevel::Verbose, "verbose must be allowed in military deployment");
+    assert!(elc.is_verbose());
     std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
 }
 
 #[test]
-fn test_production_env_forces_warn_when_verbose_requested() {
-    // MILNET_PRODUCTION=1 also forces Warn.
+fn test_production_env_allows_verbose() {
+    // Verbose is always allowed. Verbose errors go to the SIEM panel
+    // for super admin visibility; end users see sanitized messages.
     std::env::set_var("MILNET_PRODUCTION", "1");
     let elc = ErrorLevelConfig::new();
     elc.set_level(ErrorLevel::Verbose);
-    assert_eq!(elc.level(), ErrorLevel::Warn, "production env must force Warn");
+    assert_eq!(elc.level(), ErrorLevel::Verbose, "verbose must be allowed in production");
     std::env::remove_var("MILNET_PRODUCTION");
 }
 
@@ -210,11 +209,11 @@ fn test_error_level_display() {
 }
 
 #[test]
-fn test_backwards_compat_set_developer_mode_respects_military() {
-    // set_developer_mode(true, ...) should be blocked in military mode.
+fn test_backwards_compat_set_developer_mode_sets_verbose() {
+    // set_developer_mode(true, ...) sets Verbose regardless of env.
     std::env::set_var("MILNET_MILITARY_DEPLOYMENT", "1");
     let elc = ErrorLevelConfig::new();
     elc.set_developer_mode(true, "irrelevant_proof");
-    assert_eq!(elc.level(), ErrorLevel::Warn, "developer mode must be blocked in military");
+    assert_eq!(elc.level(), ErrorLevel::Verbose, "developer mode must set Verbose");
     std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
 }

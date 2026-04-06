@@ -757,25 +757,26 @@ mod tests {
     #[test]
     fn error_level_runtime_toggle() {
         let el = ErrorLevelConfig::new();
-        // Default is now Warn
-        assert!(!el.is_verbose());
-        assert_eq!(el.level(), ErrorLevel::Warn);
-
-        // Toggle to Verbose (only works when military/production env vars are NOT set)
-        el.level.store(ErrorLevel::Verbose as u8, Ordering::Relaxed);
+        // Default is now Verbose
         assert!(el.is_verbose());
         assert_eq!(el.level(), ErrorLevel::Verbose);
 
+        // Toggle to Warn
         el.set_level(ErrorLevel::Warn);
         assert!(!el.is_verbose());
         assert_eq!(el.level(), ErrorLevel::Warn);
+
+        // Toggle back to Verbose
+        el.set_level(ErrorLevel::Verbose);
+        assert!(el.is_verbose());
+        assert_eq!(el.level(), ErrorLevel::Verbose);
     }
 
     #[test]
     fn error_level_backwards_compat() {
         let el = ErrorLevelConfig::new();
-        // Default is Warn, so is_enabled() (maps to is_verbose()) is false
-        assert!(!el.is_enabled());
+        // Default is Verbose, so is_enabled() (maps to is_verbose()) is true
+        assert!(el.is_enabled());
         el.set_developer_mode_unchecked(false);
         assert!(!el.is_enabled());
     }

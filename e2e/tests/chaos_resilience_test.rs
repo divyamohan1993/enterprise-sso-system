@@ -831,6 +831,12 @@ fn test_raft_majority_continues_after_minority_partition() {
         // Now create a partition: nodes 3 and 4 are the minority.
         let minority: std::collections::HashSet<usize> = [3, 4].into_iter().collect();
 
+        // Drain any pre-partition committed entries from minority nodes
+        // so we only check for NEW commits that occur during the partition.
+        for &i in &[3usize, 4] {
+            let _ = nodes[i].take_committed();
+        }
+
         // Ensure the leader is in the majority (nodes 0, 1, 2).
         // If the leader happens to be in the minority, that's fine -- the majority
         // will elect a new leader. Either way, test the invariant.
