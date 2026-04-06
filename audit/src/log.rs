@@ -1022,7 +1022,8 @@ mod tests {
         assert!(log.len() <= 5, "entries should be <= max_entries after archival");
 
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::remove_var("MILNET_TESTING_SINGLE_KEK_ACK");
+        // NOTE: do NOT remove MILNET_TESTING_SINGLE_KEK_ACK — it's set by
+        // the test harness and removing it races with parallel tests.
     }
 
     #[test]
