@@ -42,6 +42,9 @@ logs/
 # Build artifacts
 /dist/
 /build/
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
 *.o
 *.so
 *.dylib
