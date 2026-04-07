@@ -44,11 +44,16 @@ pub const MAX_DEFAULT_REQUEST_SIZE: u32 = 64 * 1024;   // 64 KiB
 /// Read once at process init to prevent env mutation attacks and remove
 /// repeated syscall overhead. Override with MILNET_MAX_CONN_PER_IP for
 /// load testing (default: 10).
+/// Hard ceiling for per-IP connection limit. Prevents env var injection from
+/// disabling rate limiting entirely.
+const MAX_CONN_PER_IP_CEILING: u32 = 1000;
+
 static MAX_CONN_PER_IP: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
-    std::env::var("MILNET_MAX_CONN_PER_IP")
+    let parsed = std::env::var("MILNET_MAX_CONN_PER_IP")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(10)
+        .unwrap_or(10);
+    parsed.min(MAX_CONN_PER_IP_CEILING)
 });
 
 fn max_connections_per_ip() -> u32 {
@@ -988,6 +993,9 @@ async fn send_raw_frame_with_timeout(
 /// Send a postcard-serialized value with 4-byte BE length prefix.
 async fn send_frame<T: serde::Serialize>(stream: &mut (impl AsyncRead + AsyncWrite + Unpin), value: &T) -> Result<(), String> {
     let payload = postcard::to_allocvec(value).map_err(|e| format!("serialize: {e}"))?;
+    if payload.len() > u32::MAX as usize {
+        return Err(format!("payload too large: {} bytes exceeds u32 max", payload.len()));
+    }
     let len = payload.len() as u32;
     stream
         .write_all(&len.to_be_bytes())

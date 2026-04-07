@@ -5,10 +5,11 @@ metadata:
   namespace: milnet
 data:
   MILNET_PRODUCTION: "1"
-  MILNET_MILITARY_DEPLOYMENT: "0"
-  MILNET_FIPS_MODE: "0"
-  MILNET_PQ_TLS_ONLY: "0"
-  MILNET_ERROR_LEVEL: "verbose"
+  MILNET_MILITARY_DEPLOYMENT: "1"
+  MILNET_FIPS_MODE: "1"
+  MILNET_PQ_TLS_ONLY: "1"
+  MILNET_RECEIPT_PQ_ONLY: "1"
+  MILNET_ERROR_LEVEL: "warn"
 
   # Service discovery (K8s DNS)
   OPAQUE_ADDR: "opaque.milnet.svc.cluster.local:9102"

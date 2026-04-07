@@ -293,7 +293,9 @@ pub fn verify_solution(challenge: &PuzzleChallenge, solution: &[u8; 32]) -> bool
         return false;
     }
 
-    // Check replay: reject already-consumed nonces
+    // SECURITY: Hold the mutex across check + verify + insert to prevent
+    // TOCTOU race where two concurrent requests with the same solved puzzle
+    // both pass the replay check before either marks the nonce consumed.
     {
         let mut consumed = CONSUMED_PUZZLES.lock().unwrap_or_else(|e| {
                     tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in puzzle - recovering: thread panicked while holding lock");
@@ -304,19 +306,14 @@ pub fn verify_solution(challenge: &PuzzleChallenge, solution: &[u8; 32]) -> bool
         if consumed.is_consumed(&challenge.nonce) {
             return false;
         }
-    }
 
-    // Verify the proof-of-work using SHA-512 (GPU/ASIC resistant).
-    if !has_leading_zero_bits(challenge, solution) {
-        return false;
-    }
+        // Verify the proof-of-work using SHA-512 (GPU/ASIC resistant).
+        // Done inside the lock to close the TOCTOU window.
+        if !has_leading_zero_bits(challenge, solution) {
+            return false;
+        }
 
-    // Mark nonce as consumed after successful verification
-    {
-        let mut consumed = CONSUMED_PUZZLES.lock().unwrap_or_else(|e| {
-                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in puzzle - recovering: thread panicked while holding lock");
-                    e.into_inner()
-                });
+        // Mark nonce as consumed atomically with the check
         consumed.insert(challenge.nonce, now);
     }
 

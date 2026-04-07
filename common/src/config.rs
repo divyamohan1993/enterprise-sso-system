@@ -67,14 +67,14 @@ pub struct ErrorLevelConfig {
 }
 
 impl ErrorLevelConfig {
-    /// Create a new config with error level set to Verbose (default).
+    /// Create a new config with error level defaulting to Warn (safe).
     ///
-    /// Verbose errors are reported to the SIEM panel for super admin
-    /// troubleshooting with exact file:line locations. End users still
-    /// see safe error messages via the error_response sanitization layer.
+    /// SECURITY: Default to Warn to prevent information disclosure if
+    /// MILNET_MILITARY_DEPLOYMENT or MILNET_PRODUCTION env vars are not set.
+    /// Verbose mode must be explicitly enabled via `set_level(ErrorLevel::Verbose)`.
     pub const fn new() -> Self {
         Self {
-            level: AtomicU8::new(ErrorLevel::Verbose as u8),
+            level: AtomicU8::new(ErrorLevel::Warn as u8),
         }
     }
 
