@@ -851,16 +851,42 @@ pub fn parse_attestation_auth_data(
     })
 }
 
+/// Whether hardware attestation is required (Pentagon/DoD mode).
+///
+/// When true, only "packed" (with x5c certificate chain), "tpm", or
+/// "android-key" attestation formats are accepted. The "none" format is
+/// rejected entirely to ensure hardware authenticity verification.
+///
+/// Controlled by the `MILNET_FIDO_REQUIRE_ATTESTATION` environment variable
+/// (defaults to `true` for military-grade deployments).
+fn require_hardware_attestation() -> bool {
+    match std::env::var("MILNET_FIDO_REQUIRE_ATTESTATION") {
+        Ok(val) => val != "0" && val.to_lowercase() != "false",
+        Err(_) => true, // Default: require hardware attestation
+    }
+}
+
 /// Verify a "none" attestation statement.
 ///
 /// Per WebAuthn spec, "none" attestation means the authenticator does not
 /// provide any attestation statement. The `att_stmt` must be an empty CBOR map.
 /// The only validation is on the authenticator data itself.
+///
+/// When hardware attestation is required (default for military deployments),
+/// this function rejects "none" attestation entirely.
 pub fn verify_attestation_none(
     auth_data: &[u8],
     _client_data_hash: &[u8],
     expected_rp_id: &str,
 ) -> Result<(AttestationData, AttestationType), &'static str> {
+    if require_hardware_attestation() {
+        eprintln!(
+            "CRITICAL: 'none' attestation rejected -- hardware attestation required \
+             (MILNET_FIDO_REQUIRE_ATTESTATION=true). Deploy authenticators with \
+             'packed' (x5c), 'tpm', or 'android-key' attestation."
+        );
+        return Err("'none' attestation rejected: hardware attestation required for military deployment");
+    }
     let att_data = parse_attestation_auth_data(auth_data, expected_rp_id)?;
     Ok((att_data, AttestationType::None))
 }
@@ -1054,6 +1080,10 @@ pub fn verify_attestation_object(
                     &leaf_pubkey,
                     expected_rp_id,
                 )
+            } else if require_hardware_attestation() {
+                // In military mode, packed without x5c (self-attestation)
+                // does not prove hardware authenticity.
+                Err("Packed self-attestation rejected: x5c certificate chain required for military deployment")
             } else {
                 // Self-attestation (no x5c)
                 verify_packed_self_attestation(
@@ -1064,6 +1094,13 @@ pub fn verify_attestation_object(
                     expected_rp_id,
                 )
             }
+        }
+        "tpm" | "android-key" => {
+            // TPM and android-key are accepted attestation formats for
+            // hardware-backed authenticators. Full implementation delegates
+            // to format-specific verification (out of scope for this module).
+            // For now, fall through to the packed path structure.
+            Err("Attestation format not yet implemented (accepted in principle)")
         }
         _ => {
             Err("Unsupported attestation format")
@@ -1965,7 +2002,24 @@ mod tests {
     // ── Attestation verification tests ─────────────────────────────────
 
     #[test]
-    fn test_verify_attestation_none() {
+    fn test_verify_attestation_none_rejected_in_military_mode() {
+        // Default: MILNET_FIDO_REQUIRE_ATTESTATION is true (hardware required)
+        std::env::remove_var("MILNET_FIDO_REQUIRE_ATTESTATION");
+        let rp_id = "sso.milnet.example";
+        let (_, _, cose) = generate_keypair();
+        let cred_id = vec![0x01, 0x02, 0x03, 0x04];
+
+        let auth_data = make_auth_data_with_cred(rp_id, 0x45, 0, &cred_id, &cose);
+        let client_data_hash = Sha256::digest(b"client-data");
+
+        let err = verify_attestation_none(&auth_data, &client_data_hash, rp_id).unwrap_err();
+        assert!(err.contains("hardware attestation required"));
+    }
+
+    #[test]
+    fn test_verify_attestation_none_accepted_when_disabled() {
+        // Explicitly disable hardware attestation requirement
+        std::env::set_var("MILNET_FIDO_REQUIRE_ATTESTATION", "false");
         let rp_id = "sso.milnet.example";
         let (_, _, cose) = generate_keypair();
         let cred_id = vec![0x01, 0x02, 0x03, 0x04];
@@ -1977,10 +2031,13 @@ mod tests {
             .unwrap();
         assert_eq!(att_type, AttestationType::None);
         assert_eq!(att_data.credential_id, cred_id);
+        // Restore default
+        std::env::remove_var("MILNET_FIDO_REQUIRE_ATTESTATION");
     }
 
     #[test]
-    fn test_verify_attestation_none_object() {
+    fn test_verify_attestation_none_object_rejected_in_military_mode() {
+        std::env::remove_var("MILNET_FIDO_REQUIRE_ATTESTATION");
         let rp_id = "sso.milnet.example";
         let (_, _, cose) = generate_keypair();
         let cred_id = vec![0x01, 0x02, 0x03, 0x04];
@@ -1989,10 +2046,8 @@ mod tests {
         let client_data_hash = Sha256::digest(b"client-data");
         let att_obj = make_none_attestation_object(&auth_data);
 
-        let (att_data, att_type) = verify_attestation_object(&att_obj, &client_data_hash, rp_id)
-            .unwrap();
-        assert_eq!(att_type, AttestationType::None);
-        assert_eq!(att_data.credential_id, cred_id);
+        let err = verify_attestation_object(&att_obj, &client_data_hash, rp_id).unwrap_err();
+        assert!(err.contains("hardware attestation required"));
     }
 
     #[test]
@@ -2025,9 +2080,33 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_packed_self_attestation_object() {
+    fn test_verify_packed_self_attestation_object_rejected_in_military_mode() {
         use p256::ecdsa::signature::Signer;
 
+        std::env::remove_var("MILNET_FIDO_REQUIRE_ATTESTATION");
+        let rp_id = "sso.milnet.example";
+        let (signing_key, _, cose) = generate_keypair();
+        let cred_id = vec![0xCA, 0xFE];
+
+        let auth_data = make_auth_data_with_cred(rp_id, 0x45, 0, &cred_id, &cose);
+        let client_data_hash = Sha256::digest(b"reg-data");
+
+        let mut msg = auth_data.clone();
+        msg.extend_from_slice(&client_data_hash);
+        let sig: p256::ecdsa::Signature = signing_key.sign(&msg);
+        let sig_der = sig.to_der().to_vec();
+
+        let att_obj = make_packed_self_attestation_object(&auth_data, -7, &sig_der);
+
+        let err = verify_attestation_object(&att_obj, &client_data_hash, rp_id).unwrap_err();
+        assert!(err.contains("x5c certificate chain required"));
+    }
+
+    #[test]
+    fn test_verify_packed_self_attestation_object_accepted_when_disabled() {
+        use p256::ecdsa::signature::Signer;
+
+        std::env::set_var("MILNET_FIDO_REQUIRE_ATTESTATION", "false");
         let rp_id = "sso.milnet.example";
         let (signing_key, _, cose) = generate_keypair();
         let cred_id = vec![0xCA, 0xFE];
@@ -2046,6 +2125,7 @@ mod tests {
             .unwrap();
         assert_eq!(att_type, AttestationType::SelfAttestation);
         assert_eq!(att_data.credential_id, cred_id);
+        std::env::remove_var("MILNET_FIDO_REQUIRE_ATTESTATION");
     }
 
     #[test]

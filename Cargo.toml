@@ -18,6 +18,7 @@ members = [
     "sso-protocol",
     "fido",
 ]
+exclude = ["fuzz"]
 
 [workspace.package]
 # There is only ONE mode: production. is_production() always returns true.

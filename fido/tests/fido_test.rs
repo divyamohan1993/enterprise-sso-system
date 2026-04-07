@@ -1018,13 +1018,29 @@ fn test_validate_client_data_not_object() {
 // ── Attestation verification tests ──────────────────────────────────────
 
 #[test]
-fn test_attestation_none_valid() {
+fn test_attestation_none_rejected_in_military_mode() {
+    std::env::remove_var("MILNET_FIDO_REQUIRE_ATTESTATION");
     let rp_id = "sso.milnet.gov";
     let cred_id = vec![0xAA, 0xBB, 0xCC];
     let (_, sec1_pubkey) = generate_p256_keypair();
     let cose_key = sec1_to_cose(&sec1_pubkey);
 
-    // flags: UP | UV | AT = 0x45
+    let auth_data = make_attestation_auth_data(rp_id, 0x45, 0, &cred_id, &cose_key);
+    let client_data_hash = Sha256::digest(b"client data");
+
+    let result = verification::verify_attestation_none(&auth_data, &client_data_hash, rp_id);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("hardware attestation required"));
+}
+
+#[test]
+fn test_attestation_none_valid_when_disabled() {
+    std::env::set_var("MILNET_FIDO_REQUIRE_ATTESTATION", "false");
+    let rp_id = "sso.milnet.gov";
+    let cred_id = vec![0xAA, 0xBB, 0xCC];
+    let (_, sec1_pubkey) = generate_p256_keypair();
+    let cose_key = sec1_to_cose(&sec1_pubkey);
+
     let auth_data = make_attestation_auth_data(rp_id, 0x45, 0, &cred_id, &cose_key);
     let client_data_hash = Sha256::digest(b"client data");
 
@@ -1035,6 +1051,7 @@ fn test_attestation_none_valid() {
     assert_eq!(att_type, verification::AttestationType::None);
     assert_eq!(att_data.credential_id, cred_id);
     assert_eq!(att_data.sign_count, 0);
+    std::env::remove_var("MILNET_FIDO_REQUIRE_ATTESTATION");
 }
 
 #[test]

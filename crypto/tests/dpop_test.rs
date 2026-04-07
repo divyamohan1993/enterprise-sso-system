@@ -16,6 +16,9 @@ fn now_secs() -> i64 {
         .as_secs() as i64
 }
 
+const TEST_HTM: &[u8] = b"POST";
+const TEST_HTU: &[u8] = b"https://sso.milnet.example/token";
+
 #[test]
 fn test_dpop_key_hash_deterministic() {
     let key = [42u8; 32];
@@ -37,10 +40,10 @@ fn test_dpop_proof_generation_and_verification() {
         let (sk, vk) = generate_dpop_keypair_raw();
         let claims = b"test-claims";
         let timestamp = now_secs();
-        let proof = generate_dpop_proof(&sk, claims, timestamp);
+        let proof = generate_dpop_proof(&sk, claims, timestamp, TEST_HTM, TEST_HTU, None);
         let vk_bytes = vk.encode();
         let key_hash = dpop_key_hash(vk_bytes.as_ref());
-        assert!(verify_dpop_proof(&vk, &proof, claims, timestamp, &key_hash));
+        assert!(verify_dpop_proof(&vk, &proof, claims, timestamp, &key_hash, TEST_HTM, TEST_HTU, None));
     });
 }
 
@@ -51,11 +54,10 @@ fn test_dpop_proof_rejects_wrong_key() {
         let (_sk2, vk2) = generate_dpop_keypair_raw();
         let claims = b"test-claims";
         let timestamp = now_secs();
-        let proof = generate_dpop_proof(&sk1, claims, timestamp);
+        let proof = generate_dpop_proof(&sk1, claims, timestamp, TEST_HTM, TEST_HTU, None);
         let vk2_bytes = vk2.encode();
         let key_hash = dpop_key_hash(vk2_bytes.as_ref());
-        // vk2 won't match the signature made with sk1
-        assert!(!verify_dpop_proof(&vk2, &proof, claims, timestamp, &key_hash));
+        assert!(!verify_dpop_proof(&vk2, &proof, claims, timestamp, &key_hash, TEST_HTM, TEST_HTU, None));
     });
 }
 
@@ -64,10 +66,10 @@ fn test_dpop_proof_rejects_wrong_claims() {
     run_with_large_stack(|| {
         let (sk, vk) = generate_dpop_keypair_raw();
         let timestamp = now_secs();
-        let proof = generate_dpop_proof(&sk, b"original", timestamp);
+        let proof = generate_dpop_proof(&sk, b"original", timestamp, TEST_HTM, TEST_HTU, None);
         let vk_bytes = vk.encode();
         let key_hash = dpop_key_hash(vk_bytes.as_ref());
-        assert!(!verify_dpop_proof(&vk, &proof, b"tampered", timestamp, &key_hash));
+        assert!(!verify_dpop_proof(&vk, &proof, b"tampered", timestamp, &key_hash, TEST_HTM, TEST_HTU, None));
     });
 }
 
@@ -84,11 +86,10 @@ fn test_dpop_proof_rejects_wrong_timestamp() {
         let (sk, vk) = generate_dpop_keypair_raw();
         let claims = b"claims-data";
         let ts = now_secs();
-        let proof = generate_dpop_proof(&sk, claims, ts);
+        let proof = generate_dpop_proof(&sk, claims, ts, TEST_HTM, TEST_HTU, None);
         let vk_bytes = vk.encode();
         let key_hash = dpop_key_hash(vk_bytes.as_ref());
-        // Verify with a wildly different timestamp — signature won't match
-        assert!(!verify_dpop_proof(&vk, &proof, claims, ts + 9999, &key_hash));
+        assert!(!verify_dpop_proof(&vk, &proof, claims, ts + 9999, &key_hash, TEST_HTM, TEST_HTU, None));
     });
 }
 
@@ -98,10 +99,10 @@ fn test_guarded_keypair_sign_and_verify() {
         let (guarded_sk, vk) = generate_dpop_keypair();
         let claims = b"guarded-test";
         let timestamp = now_secs();
-        let proof = generate_dpop_proof(guarded_sk.signing_key(), claims, timestamp);
+        let proof = generate_dpop_proof(guarded_sk.signing_key(), claims, timestamp, TEST_HTM, TEST_HTU, None);
         let vk_bytes = vk.encode();
         let key_hash = dpop_key_hash(vk_bytes.as_ref());
-        assert!(verify_dpop_proof(&vk, &proof, claims, timestamp, &key_hash));
+        assert!(verify_dpop_proof(&vk, &proof, claims, timestamp, &key_hash, TEST_HTM, TEST_HTU, None));
     });
 }
 
@@ -109,17 +110,15 @@ fn test_guarded_keypair_sign_and_verify() {
 
 #[test]
 fn test_dpop_stale_timestamp_rejected() {
-    // A proof with a timestamp >30s in the past must be rejected.
     run_with_large_stack(|| {
         let (sk, vk) = generate_dpop_keypair_raw();
         let vk_bytes = vk.encode();
         let key_hash = dpop_key_hash(vk_bytes.as_ref());
         let claims = b"freshness-test";
-        // 60 seconds ago — well beyond the 30s window
         let stale_ts = now_secs() - 60;
-        let proof = generate_dpop_proof(&sk, claims, stale_ts);
+        let proof = generate_dpop_proof(&sk, claims, stale_ts, TEST_HTM, TEST_HTU, None);
         assert!(
-            !verify_dpop_proof(&vk, &proof, claims, stale_ts, &key_hash),
+            !verify_dpop_proof(&vk, &proof, claims, stale_ts, &key_hash, TEST_HTM, TEST_HTU, None),
             "proof with 60s-old timestamp must be rejected (DPOP_MAX_AGE_SECS=30)"
         );
     });
@@ -127,17 +126,15 @@ fn test_dpop_stale_timestamp_rejected() {
 
 #[test]
 fn test_dpop_future_timestamp_rejected() {
-    // A proof with a timestamp >30s in the future must be rejected.
     run_with_large_stack(|| {
         let (sk, vk) = generate_dpop_keypair_raw();
         let vk_bytes = vk.encode();
         let key_hash = dpop_key_hash(vk_bytes.as_ref());
         let claims = b"freshness-test";
-        // 60 seconds in the future — well beyond the 30s window
         let future_ts = now_secs() + 60;
-        let proof = generate_dpop_proof(&sk, claims, future_ts);
+        let proof = generate_dpop_proof(&sk, claims, future_ts, TEST_HTM, TEST_HTU, None);
         assert!(
-            !verify_dpop_proof(&vk, &proof, claims, future_ts, &key_hash),
+            !verify_dpop_proof(&vk, &proof, claims, future_ts, &key_hash, TEST_HTM, TEST_HTU, None),
             "proof with 60s-future timestamp must be rejected (DPOP_MAX_AGE_SECS=30)"
         );
     });
@@ -145,17 +142,15 @@ fn test_dpop_future_timestamp_rejected() {
 
 #[test]
 fn test_dpop_fresh_timestamp_accepted() {
-    // A proof with a timestamp within the 30s window must be accepted.
     run_with_large_stack(|| {
         let (sk, vk) = generate_dpop_keypair_raw();
         let vk_bytes = vk.encode();
         let key_hash = dpop_key_hash(vk_bytes.as_ref());
         let claims = b"freshness-test";
-        // Current time — well within the 30s window
         let fresh_ts = now_secs();
-        let proof = generate_dpop_proof(&sk, claims, fresh_ts);
+        let proof = generate_dpop_proof(&sk, claims, fresh_ts, TEST_HTM, TEST_HTU, None);
         assert!(
-            verify_dpop_proof(&vk, &proof, claims, fresh_ts, &key_hash),
+            verify_dpop_proof(&vk, &proof, claims, fresh_ts, &key_hash, TEST_HTM, TEST_HTU, None),
             "proof with current timestamp must be accepted"
         );
     });
@@ -163,17 +158,15 @@ fn test_dpop_fresh_timestamp_accepted() {
 
 #[test]
 fn test_dpop_boundary_31s_past_rejected() {
-    // 32 seconds old -- safely past the 30s boundary.
-    // Uses 32s instead of 31s to avoid wall-clock race.
     run_with_large_stack(|| {
         let (sk, vk) = generate_dpop_keypair_raw();
         let vk_bytes = vk.encode();
         let key_hash = dpop_key_hash(vk_bytes.as_ref());
         let claims = b"boundary-test";
         let ts = now_secs() - 32;
-        let proof = generate_dpop_proof(&sk, claims, ts);
+        let proof = generate_dpop_proof(&sk, claims, ts, TEST_HTM, TEST_HTU, None);
         assert!(
-            !verify_dpop_proof(&vk, &proof, claims, ts, &key_hash),
+            !verify_dpop_proof(&vk, &proof, claims, ts, &key_hash, TEST_HTM, TEST_HTU, None),
             "proof 32s old must be rejected (> DPOP_MAX_AGE_SECS=30)"
         );
     });
@@ -181,8 +174,7 @@ fn test_dpop_boundary_31s_past_rejected() {
 
 #[test]
 fn test_dpop_boundary_31s_future_rejected() {
-    // 32 seconds in the future -- safely past the 30s boundary.
-    // Uses 32s instead of 31s to avoid wall-clock race: between test's
+    // Uses 32s instead of 31s to avoid wall-clock race between test's
     // now_secs() and verify_dpop_proof's internal SystemTime::now(), up to
     // 1 second can elapse, shifting the effective delta by 1s.
     run_with_large_stack(|| {
@@ -191,9 +183,9 @@ fn test_dpop_boundary_31s_future_rejected() {
         let key_hash = dpop_key_hash(vk_bytes.as_ref());
         let claims = b"boundary-test";
         let ts = now_secs() + 32;
-        let proof = generate_dpop_proof(&sk, claims, ts);
+        let proof = generate_dpop_proof(&sk, claims, ts, TEST_HTM, TEST_HTU, None);
         assert!(
-            !verify_dpop_proof(&vk, &proof, claims, ts, &key_hash),
+            !verify_dpop_proof(&vk, &proof, claims, ts, &key_hash, TEST_HTM, TEST_HTU, None),
             "proof 32s in future must be rejected (> DPOP_MAX_AGE_SECS=30)"
         );
     });
@@ -201,7 +193,6 @@ fn test_dpop_boundary_31s_future_rejected() {
 
 #[test]
 fn test_dpop_boundary_exactly_30s_past_accepted() {
-    // 28 seconds old -- safely within the 30s boundary.
     // Uses 28s instead of exact 30s to avoid wall-clock race: between test's
     // now_secs() and verify_dpop_proof's internal SystemTime::now(), up to
     // 2 seconds can elapse, shifting the effective delta past the boundary.
@@ -211,9 +202,9 @@ fn test_dpop_boundary_exactly_30s_past_accepted() {
         let key_hash = dpop_key_hash(vk_bytes.as_ref());
         let claims = b"boundary-test";
         let ts = now_secs() - 28;
-        let proof = generate_dpop_proof(&sk, claims, ts);
+        let proof = generate_dpop_proof(&sk, claims, ts, TEST_HTM, TEST_HTU, None);
         assert!(
-            verify_dpop_proof(&vk, &proof, claims, ts, &key_hash),
+            verify_dpop_proof(&vk, &proof, claims, ts, &key_hash, TEST_HTM, TEST_HTU, None),
             "proof 28s old should be accepted (within DPOP_MAX_AGE_SECS=30)"
         );
     });
@@ -221,7 +212,6 @@ fn test_dpop_boundary_exactly_30s_past_accepted() {
 
 #[test]
 fn test_dpop_boundary_exactly_30s_future_accepted() {
-    // 28 seconds in the future -- safely within the 30s boundary.
     // Uses 28s instead of exact 30s to avoid wall-clock race.
     run_with_large_stack(|| {
         let (sk, vk) = generate_dpop_keypair_raw();
@@ -229,9 +219,9 @@ fn test_dpop_boundary_exactly_30s_future_accepted() {
         let key_hash = dpop_key_hash(vk_bytes.as_ref());
         let claims = b"boundary-test";
         let ts = now_secs() + 28;
-        let proof = generate_dpop_proof(&sk, claims, ts);
+        let proof = generate_dpop_proof(&sk, claims, ts, TEST_HTM, TEST_HTU, None);
         assert!(
-            verify_dpop_proof(&vk, &proof, claims, ts, &key_hash),
+            verify_dpop_proof(&vk, &proof, claims, ts, &key_hash, TEST_HTM, TEST_HTU, None),
             "proof 28s in future should be accepted (within DPOP_MAX_AGE_SECS=30)"
         );
     });
@@ -239,16 +229,15 @@ fn test_dpop_boundary_exactly_30s_future_accepted() {
 
 #[test]
 fn test_dpop_very_old_timestamp_rejected() {
-    // Timestamp from a year ago — must be rejected.
     run_with_large_stack(|| {
         let (sk, vk) = generate_dpop_keypair_raw();
         let vk_bytes = vk.encode();
         let key_hash = dpop_key_hash(vk_bytes.as_ref());
         let claims = b"replay-test";
         let ancient_ts = now_secs() - 365 * 24 * 3600;
-        let proof = generate_dpop_proof(&sk, claims, ancient_ts);
+        let proof = generate_dpop_proof(&sk, claims, ancient_ts, TEST_HTM, TEST_HTU, None);
         assert!(
-            !verify_dpop_proof(&vk, &proof, claims, ancient_ts, &key_hash),
+            !verify_dpop_proof(&vk, &proof, claims, ancient_ts, &key_hash, TEST_HTM, TEST_HTU, None),
             "proof from a year ago must be rejected"
         );
     });

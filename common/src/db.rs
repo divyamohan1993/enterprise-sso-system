@@ -638,7 +638,7 @@ pub async fn init_database(database_url: &str) -> Result<PgPool, String> {
 
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS authorization_codes (
-            code VARCHAR(255) PRIMARY KEY,
+            code_hash VARCHAR(255) PRIMARY KEY,
             tenant_id UUID NOT NULL REFERENCES tenants(tenant_id),
             client_id VARCHAR(255) NOT NULL,
             redirect_uri TEXT NOT NULL,
@@ -662,7 +662,7 @@ pub async fn init_database(database_url: &str) -> Result<PgPool, String> {
 
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS oauth_codes (
-            code VARCHAR(255) PRIMARY KEY,
+            code_hash VARCHAR(255) PRIMARY KEY,
             tenant_id UUID NOT NULL REFERENCES tenants(tenant_id),
             client_id VARCHAR(255) NOT NULL,
             user_id UUID NOT NULL,
@@ -1100,6 +1100,9 @@ impl TenantAwarePool {
     }
 
     /// Insert an authorization code scoped to the current tenant.
+    ///
+    /// The `code` is hashed with SHA-512 before storage. Only the hash is
+    /// persisted -- the raw code is never written to the database.
     pub async fn insert_authorization_code(
         &self,
         code: &str,
@@ -1111,16 +1114,19 @@ impl TenantAwarePool {
         nonce: Option<&str>,
         created_at: i64,
     ) -> Result<(), sqlx::Error> {
+        use sha2::{Digest, Sha512};
+        let code_hash = hex::encode(Sha512::digest(code.as_bytes()));
+
         let tenant_id = Self::require_tenant_id()?;
         let mut tx = self.pool.begin().await?;
         let stmt = format!("SET LOCAL app.current_tenant_id = '{}'", tenant_id);
         sqlx::query(&stmt).execute(&mut *tx).await?;
 
         sqlx::query(
-            "INSERT INTO authorization_codes (code, tenant_id, client_id, redirect_uri, user_id, code_challenge, tier, nonce, created_at) \
+            "INSERT INTO authorization_codes (code_hash, tenant_id, client_id, redirect_uri, user_id, code_challenge, tier, nonce, created_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
         )
-        .bind(code)
+        .bind(&code_hash)
         .bind(tenant_id)
         .bind(client_id)
         .bind(redirect_uri)
@@ -1137,6 +1143,9 @@ impl TenantAwarePool {
     }
 
     /// Insert an OAuth code scoped to the current tenant.
+    ///
+    /// The `code` is hashed with SHA-512 before storage. Only the hash is
+    /// persisted -- the raw code is never written to the database.
     pub async fn insert_oauth_code(
         &self,
         code: &str,
@@ -1148,16 +1157,19 @@ impl TenantAwarePool {
         nonce: Option<&str>,
         expires_at: i64,
     ) -> Result<(), sqlx::Error> {
+        use sha2::{Digest, Sha512};
+        let code_hash = hex::encode(Sha512::digest(code.as_bytes()));
+
         let tenant_id = Self::require_tenant_id()?;
         let mut tx = self.pool.begin().await?;
         let stmt = format!("SET LOCAL app.current_tenant_id = '{}'", tenant_id);
         sqlx::query(&stmt).execute(&mut *tx).await?;
 
         sqlx::query(
-            "INSERT INTO oauth_codes (code, tenant_id, client_id, user_id, redirect_uri, scope, code_challenge, nonce, expires_at) \
+            "INSERT INTO oauth_codes (code_hash, tenant_id, client_id, user_id, redirect_uri, scope, code_challenge, nonce, expires_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
         )
-        .bind(code)
+        .bind(&code_hash)
         .bind(tenant_id)
         .bind(client_id)
         .bind(user_id)

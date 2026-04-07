@@ -405,23 +405,23 @@ fn dpop_is_mandatory() {
         // Empty proof must be rejected
         let empty_proof: &[u8] = &[];
         assert!(
-            !crypto::dpop::verify_dpop_proof(&vk, empty_proof, claims, timestamp, &expected_hash),
+            !crypto::dpop::verify_dpop_proof(&vk, empty_proof, claims, timestamp, &expected_hash, b"POST", b"https://sso.milnet.example/token", None),
             "empty DPoP proof must be rejected"
         );
 
         // Random garbage must be rejected
         let garbage = vec![0xFFu8; 128];
         assert!(
-            !crypto::dpop::verify_dpop_proof(&vk, &garbage, claims, timestamp, &expected_hash),
+            !crypto::dpop::verify_dpop_proof(&vk, &garbage, claims, timestamp, &expected_hash, b"POST", b"https://sso.milnet.example/token", None),
             "garbage DPoP proof must be rejected"
         );
 
         // Proof with wrong key hash must be rejected
         let (sk, vk2) = crypto::dpop::generate_dpop_keypair_raw();
-        let proof = crypto::dpop::generate_dpop_proof(&sk, claims, timestamp);
+        let proof = crypto::dpop::generate_dpop_proof(&sk, claims, timestamp, b"POST", b"https://sso.milnet.example/token", None);
         let wrong_hash = [0x00u8; 64];
         assert!(
-            !crypto::dpop::verify_dpop_proof(&vk2, &proof, claims, timestamp, &wrong_hash),
+            !crypto::dpop::verify_dpop_proof(&vk2, &proof, claims, timestamp, &wrong_hash, b"POST", b"https://sso.milnet.example/token", None),
             "DPoP proof with wrong key hash must be rejected"
         );
     });

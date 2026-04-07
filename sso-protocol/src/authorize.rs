@@ -385,7 +385,21 @@ impl AuthorizationStore {
         // PKCE is mandatory per OAuth 2.1 — reject requests without code_challenge.
         pkce::require_pkce(code_challenge.as_deref())?;
 
-        let code = Uuid::new_v4().to_string();
+        // CNSA 2.0: 256-bit random code (32 bytes, hex-encoded = 64 chars).
+        // Replaces UUID4 (122 bits) for post-quantum security margin.
+        let code = {
+            let mut buf = [0u8; 32];
+            if getrandom::getrandom(&mut buf).is_err() {
+                common::siem::emit_runtime_error(
+                    common::siem::category::CRYPTO_FAILURE,
+                    "OS CSPRNG unavailable for authorization code generation",
+                    "getrandom failed",
+                    file!(), line!(), column!(), module_path!(),
+                );
+                return Err("OS CSPRNG failure during code generation");
+            }
+            hex::encode(buf)
+        };
         let hashed_key = hash_code(&code);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -679,7 +693,7 @@ mod tests {
     #[test] fn test_code_not_stored_plaintext() {
         let mut s = AuthorizationStore::new();
         let code = s.create_code("c1","https://ex.com/cb",Uuid::new_v4(),"openid",Some("ch".into()),None).unwrap();
-        // The raw code must not appear as a key in the map (it is stored by SHA-256 hash).
+        // The raw code must not appear as a key in the map (it is stored by SHA-512 hash).
         assert!(!s.codes.contains_key(&code));
         // The hashed key must exist.
         assert!(s.codes.contains_key(&hash_code(&code)));

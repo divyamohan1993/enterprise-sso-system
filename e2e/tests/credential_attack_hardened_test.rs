@@ -471,11 +471,11 @@ fn dpop_proof_replay_detected_via_hash_tracking() {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        let proof = generate_dpop_proof(&sk, claims, timestamp);
+        let proof = generate_dpop_proof(&sk, claims, timestamp, b"POST", b"https://sso.milnet.example/token", None);
 
         // First verification: must succeed
         assert!(
-            verify_dpop_proof(&vk, &proof, claims, timestamp, &expected_hash),
+            verify_dpop_proof(&vk, &proof, claims, timestamp, &expected_hash, b"POST", b"https://sso.milnet.example/token", None),
             "first DPoP proof verification must succeed"
         );
 
@@ -489,7 +489,7 @@ fn dpop_proof_replay_detected_via_hash_tracking() {
         assert!(is_replay, "replayed proof must be detected via HashSet");
 
         // Verify a different proof (different timestamp) is NOT flagged as replay
-        let proof2 = generate_dpop_proof(&sk, claims, timestamp + 1);
+        let proof2 = generate_dpop_proof(&sk, claims, timestamp + 1, b"POST", b"https://sso.milnet.example/token", None);
         let is_new2 = seen_proofs.insert(proof2.clone());
         assert!(is_new2, "different proof must not be flagged as replay");
 
@@ -497,11 +497,11 @@ fn dpop_proof_replay_detected_via_hash_tracking() {
         let (_, wrong_vk) = generate_dpop_keypair_raw();
         let wrong_hash = dpop_key_hash(wrong_vk.encode().as_ref());
         assert!(
-            !verify_dpop_proof(&wrong_vk, &proof, claims, timestamp, &expected_hash),
+            !verify_dpop_proof(&wrong_vk, &proof, claims, timestamp, &expected_hash, b"POST", b"https://sso.milnet.example/token", None),
             "proof verified with wrong key hash must fail"
         );
         assert!(
-            !verify_dpop_proof(&vk, &proof, claims, timestamp, &wrong_hash),
+            !verify_dpop_proof(&vk, &proof, claims, timestamp, &wrong_hash, b"POST", b"https://sso.milnet.example/token", None),
             "proof verified with mismatched key hash must fail"
         );
     });

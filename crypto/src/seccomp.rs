@@ -405,10 +405,11 @@ pub fn apply_anti_ptrace() -> bool {
                 .unwrap_or(false);
             if is_military {
                 tracing::error!(
-                    "FATAL: prctl(PR_SET_PTRACER, 0) failed in military deployment. \
-                     Yama LSM MUST be enabled. Process is vulnerable to ptrace attachment."
+                    "CRITICAL: prctl(PR_SET_PTRACER, 0) failed in military deployment. \
+                     Yama LSM MUST be enabled. Process is vulnerable to ptrace attachment. \
+                     Terminating."
                 );
-                ok = false;
+                std::process::exit(1);
             } else {
                 tracing::warn!(
                     "seccomp: prctl(PR_SET_PTRACER, 0) failed — \
@@ -444,13 +445,22 @@ pub fn apply_anti_ptrace() -> bool {
     }
 
     // Install seccomp BPF filter to block dangerous syscalls.
-    // This is non-fatal: even without the filter, PR_SET_PTRACER provides
-    // partial protection. Log but do not fail the overall hardening.
     if !apply_seccomp_filter() {
-        tracing::warn!(
-            "seccomp: BPF filter installation failed — falling back to \
-             PR_SET_PTRACER-only protection"
-        );
+        let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if is_military {
+            tracing::error!(
+                "CRITICAL: seccomp BPF filter installation failed in military deployment. \
+                 Process CANNOT operate without syscall restriction. Terminating."
+            );
+            std::process::exit(1);
+        } else {
+            tracing::warn!(
+                "seccomp: BPF filter installation failed -- falling back to \
+                 PR_SET_PTRACER-only protection"
+            );
+        }
     }
 
     ok

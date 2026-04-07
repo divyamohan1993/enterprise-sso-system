@@ -112,6 +112,7 @@ spec:
               ssl = on
               ssl_cert_file = '/etc/milnet/tls/tls.crt'
               ssl_key_file = '/etc/milnet/tls/tls.key'
+              password_encryption = scram-sha-256
               max_connections = 200
               shared_buffers = 1GB
               effective_cache_size = 2GB
@@ -125,9 +126,9 @@ spec:
               SQL
                 # Write pg_hba.conf entries for replication
                 cat >> /tmp/pg_hba_extra.conf << 'HBA'
-              host replication replicator 10.0.0.0/8 md5
-              host replication replicator 172.16.0.0/12 md5
-              hostssl all all 0.0.0.0/0 md5
+              host replication replicator 10.0.0.0/8 scram-sha-256
+              host replication replicator 172.16.0.0/12 scram-sha-256
+              hostssl all all 0.0.0.0/0 scram-sha-256
               HBA
                 exec docker-entrypoint.sh postgres \
                   -c "include=/tmp/extra.conf" \

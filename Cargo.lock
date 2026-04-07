@@ -18,6 +18,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "http-body-util",
  "kt",
  "opaque",
  "opaque-ke",
@@ -562,10 +563,12 @@ dependencies = [
  "ml-dsa",
  "p256",
  "postcard",
+ "proptest",
  "rand 0.8.5",
  "rustls",
  "serde",
  "serde_json",
+ "serial_test",
  "sha2",
  "sqlx",
  "subtle",
@@ -766,12 +769,14 @@ dependencies = [
  "libc",
  "ml-dsa",
  "ml-kem",
+ "opaque",
  "p256",
  "pbkdf2",
  "postcard",
  "proptest",
  "rand 0.8.5",
  "serde",
+ "serial_test",
  "sha2",
  "sha3 0.10.8",
  "subtle",
@@ -1001,22 +1006,30 @@ dependencies = [
  "frost-ristretto255",
  "gateway",
  "getrandom 0.2.17",
+ "hex",
  "hkdf",
  "hmac",
  "kt",
+ "libc",
  "ml-dsa",
+ "ml-kem",
  "opaque",
  "orchestrator",
  "postcard",
  "rand 0.8.5",
  "ratchet",
+ "rcgen",
  "risk",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
+ "serial_test",
  "sha2",
  "shard",
  "sso-protocol",
  "tokio",
+ "tokio-rustls",
  "tss",
  "uuid",
  "verifier",
@@ -1186,7 +1199,10 @@ dependencies = [
  "serde_json",
  "sha2",
  "signature 2.2.0",
+ "sqlx",
+ "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -1369,6 +1385,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "serde",
+ "serial_test",
  "sha2",
  "shard",
  "tokio",
@@ -2300,6 +2317,7 @@ dependencies = [
  "common",
  "crypto",
  "gateway",
+ "hmac",
  "ml-dsa",
  "opaque",
  "opaque-ke",
@@ -2308,6 +2326,7 @@ dependencies = [
  "rcgen",
  "risk",
  "serde",
+ "serial_test",
  "sha2",
  "shard",
  "tokio",
@@ -2937,6 +2956,7 @@ dependencies = [
  "getrandom 0.2.17",
  "hex",
  "hmac",
+ "ml-dsa",
  "postcard",
  "proptest",
  "serde",
@@ -3070,10 +3090,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "scc"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46e6f046b7fef48e2660c57ed794263155d713de679057f2d0c169bfc6e756cc"
+dependencies = [
+ "sdd",
+]
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "sdd"
+version = "3.0.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "490dcfcbfef26be6800d11870ff2df8774fa6e86d047e3e8c8a76b25655e41ca"
 
 [[package]]
 name = "sec1"
@@ -3182,6 +3217,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "serial_test"
+version = "3.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "911bd979bf1070a3f3aa7b691a3b3e9968f339ceeec89e08c280a8a22207a32f"
+dependencies = [
+ "futures-executor",
+ "futures-util",
+ "log",
+ "once_cell",
+ "parking_lot",
+ "scc",
+ "serial_test_derive",
+]
+
+[[package]]
+name = "serial_test_derive"
+version = "3.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0a7d91949b85b0d2fb687445e448b40d322b6b3e4af6b44a29b21d9a5f33e6d9"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "sha1"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3237,6 +3298,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "serde",
+ "serial_test",
  "sha2",
  "tokio",
  "tokio-rustls",
@@ -3562,6 +3624,7 @@ dependencies = [
  "crypto",
  "getrandom 0.2.17",
  "hex",
+ "hkdf",
  "hmac",
  "proptest",
  "ratchet",
@@ -3573,6 +3636,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

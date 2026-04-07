@@ -579,9 +579,9 @@ fn dpop_proof_verify_correct_key() {
         let claims = b"POST /token";
         let timestamp = now_secs();
 
-        let proof = generate_dpop_proof(&sk, claims, timestamp);
+        let proof = generate_dpop_proof(&sk, claims, timestamp, b"POST", b"https://sso.milnet.example/token", None);
         assert!(
-            verify_dpop_proof(&vk, &proof, claims, timestamp, &expected_hash),
+            verify_dpop_proof(&vk, &proof, claims, timestamp, &expected_hash, b"POST", b"https://sso.milnet.example/token", None),
             "DPoP proof must verify with correct key"
         );
     });
@@ -597,9 +597,9 @@ fn dpop_proof_wrong_key_fails() {
         let claims = b"GET /resource";
         let timestamp = now_secs();
 
-        let proof = generate_dpop_proof(&sk1, claims, timestamp);
+        let proof = generate_dpop_proof(&sk1, claims, timestamp, b"GET", b"https://sso.milnet.example/resource", None);
         assert!(
-            !verify_dpop_proof(&vk2, &proof, claims, timestamp, &hash2),
+            !verify_dpop_proof(&vk2, &proof, claims, timestamp, &hash2, b"GET", b"https://sso.milnet.example/resource", None),
             "DPoP proof must fail with wrong public key"
         );
     });
@@ -614,10 +614,9 @@ fn dpop_proof_expired_timestamp_fails() {
         let claims = b"POST /auth";
 
         let ts = now_secs();
-        let proof = generate_dpop_proof(&sk, claims, ts);
-        // Verify with a wildly different timestamp — signature won't match
+        let proof = generate_dpop_proof(&sk, claims, ts, b"POST", b"https://sso.milnet.example/auth", None);
         assert!(
-            !verify_dpop_proof(&vk, &proof, claims, ts + 9999, &expected_hash),
+            !verify_dpop_proof(&vk, &proof, claims, ts + 9999, &expected_hash, b"POST", b"https://sso.milnet.example/auth", None),
             "DPoP proof must fail with mismatched (expired) timestamp"
         );
     });
@@ -631,9 +630,9 @@ fn dpop_proof_wrong_claims_fails() {
         let expected_hash = dpop_key_hash(vk_bytes.as_ref());
         let timestamp = now_secs();
 
-        let proof = generate_dpop_proof(&sk, b"original claims", timestamp);
+        let proof = generate_dpop_proof(&sk, b"original claims", timestamp, b"POST", b"https://sso.milnet.example/token", None);
         assert!(
-            !verify_dpop_proof(&vk, &proof, b"tampered claims", timestamp, &expected_hash),
+            !verify_dpop_proof(&vk, &proof, b"tampered claims", timestamp, &expected_hash, b"POST", b"https://sso.milnet.example/token", None),
             "DPoP proof must fail with tampered claims"
         );
     });

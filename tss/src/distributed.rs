@@ -28,7 +28,7 @@ use frost::round2::SignatureShare;
 use frost::{Identifier, SigningPackage};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 // ---------------------------------------------------------------------------
 // Nonce counter persistence — sealed storage
@@ -1859,7 +1859,8 @@ fn unseal_share_bytes(hex_str: &str) -> Result<Vec<u8>, String> {
 }
 
 /// Derive a 32-byte seal key from the master KEK for TSS share sealing.
-fn derive_share_seal_key(master_kek: &[u8; 32]) -> [u8; 32] {
+/// Returns `Zeroizing<[u8; 32]>` so the key is wiped from the stack on drop.
+fn derive_share_seal_key(master_kek: &[u8; 32]) -> Zeroizing<[u8; 32]> {
     use hkdf::Hkdf;
     use sha2::Sha512;
     let hk = Hkdf::<Sha512>::new(Some(b"MILNET-TSS-SHARE-SEAL-v1"), master_kek);
@@ -1868,7 +1869,7 @@ fn derive_share_seal_key(master_kek: &[u8; 32]) -> [u8; 32] {
         tracing::error!("FATAL: HKDF-SHA512 expand failed for TSS share seal key: {e}");
         std::process::exit(1);
     }
-    okm
+    Zeroizing::new(okm)
 }
 
 /// Load a signer's share from the `MILNET_TSS_SHARE_SEALED` env var.

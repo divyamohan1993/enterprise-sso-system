@@ -156,6 +156,7 @@ impl DidDocument {
 /// Generate a did:key identifier from Ed25519 public key bytes.
 ///
 /// Format: did:key:z<base58btc(multicodec_prefix + public_key)>
+#[deprecated(note = "Use PQ-hybrid DID functions for quantum resistance")]
 pub fn generate_did_key_ed25519(public_key: &[u8; 32]) -> String {
     let mut prefixed = Vec::with_capacity(2 + 32);
     prefixed.extend_from_slice(&[0xed, 0x01]);
@@ -361,6 +362,7 @@ pub fn did_auth_challenge_digest(challenge: &DidAuthChallenge) -> [u8; 64] {
 }
 
 /// Sign a DIDAuth challenge with Ed25519.
+#[deprecated(note = "Use PQ-hybrid sign_did_auth_hybrid for quantum resistance")]
 pub fn sign_did_auth_ed25519(
     challenge: &DidAuthChallenge,
     prover_did: &str,
@@ -393,6 +395,92 @@ pub fn sign_did_auth_ml_dsa87(
         signature_hex: hex::encode(&signature),
         key_type: KeyType::MlDsa87,
     }
+}
+
+/// A PQ-hybrid DIDAuth response containing both Ed25519 and ML-DSA-87 signatures.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DidAuthHybridResponse {
+    /// The original challenge nonce.
+    pub challenge_nonce: [u8; 32],
+    /// DID of the prover (authenticated party).
+    pub prover_did: String,
+    /// Ed25519 signature over the challenge digest (hex-encoded).
+    pub ed25519_signature_hex: String,
+    /// ML-DSA-87 signature over (challenge_digest || ed25519_signature) (hex-encoded).
+    pub ml_dsa87_signature_hex: String,
+}
+
+/// Sign a DIDAuth challenge with PQ-hybrid (Ed25519 + ML-DSA-87).
+///
+/// The ML-DSA-87 signature covers both the message and the Ed25519 signature,
+/// binding the classical and post-quantum signatures together.
+pub fn sign_did_auth_hybrid(
+    challenge: &DidAuthChallenge,
+    prover_did: &str,
+    ed25519_key: &ed25519_dalek::SigningKey,
+    pq_key: &crate::pq_sign::PqSigningKey,
+) -> DidAuthHybridResponse {
+    use ed25519_dalek::Signer;
+    let digest = did_auth_challenge_digest(challenge);
+
+    // Classical Ed25519 signature
+    let ed25519_sig = ed25519_key.sign(&digest);
+    let ed25519_sig_bytes = ed25519_sig.to_bytes();
+
+    // PQ signature covers digest || ed25519_signature
+    let mut pq_message = Vec::with_capacity(digest.len() + ed25519_sig_bytes.len());
+    pq_message.extend_from_slice(&digest);
+    pq_message.extend_from_slice(&ed25519_sig_bytes);
+    let pq_sig = crate::pq_sign::pq_sign_raw(pq_key, &pq_message);
+
+    DidAuthHybridResponse {
+        challenge_nonce: challenge.nonce,
+        prover_did: prover_did.to_string(),
+        ed25519_signature_hex: hex::encode(ed25519_sig_bytes),
+        ml_dsa87_signature_hex: hex::encode(&pq_sig),
+    }
+}
+
+/// Verify a PQ-hybrid DIDAuth response. Both signatures must pass.
+pub fn verify_did_auth_hybrid(
+    challenge: &DidAuthChallenge,
+    response: &DidAuthHybridResponse,
+    ed25519_public_key: &[u8; 32],
+    pq_verifying_key: &crate::pq_sign::PqVerifyingKey,
+) -> Result<bool, String> {
+    // Verify nonce matches
+    if !crate::ct::ct_eq(&challenge.nonce, &response.challenge_nonce) {
+        return Ok(false);
+    }
+
+    let digest = did_auth_challenge_digest(challenge);
+
+    // Verify Ed25519 signature
+    let ed25519_sig_bytes = hex::decode(&response.ed25519_signature_hex)
+        .map_err(|e| format!("invalid Ed25519 signature hex: {e}"))?;
+    if ed25519_sig_bytes.len() != 64 {
+        return Err("invalid Ed25519 signature length".to_string());
+    }
+    let mut sig_arr = [0u8; 64];
+    sig_arr.copy_from_slice(&ed25519_sig_bytes);
+
+    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(ed25519_public_key)
+        .map_err(|e| format!("invalid Ed25519 key: {e}"))?;
+    let ed25519_sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+    use ed25519_dalek::Verifier;
+    if verifying_key.verify(&digest, &ed25519_sig).is_err() {
+        return Ok(false);
+    }
+
+    // Verify ML-DSA-87 signature over (digest || ed25519_signature)
+    let pq_sig_bytes = hex::decode(&response.ml_dsa87_signature_hex)
+        .map_err(|e| format!("invalid ML-DSA-87 signature hex: {e}"))?;
+
+    let mut pq_message = Vec::with_capacity(digest.len() + ed25519_sig_bytes.len());
+    pq_message.extend_from_slice(&digest);
+    pq_message.extend_from_slice(&ed25519_sig_bytes);
+
+    Ok(crate::pq_sign::pq_verify_raw(pq_verifying_key, &pq_message, &pq_sig_bytes))
 }
 
 /// Verify a DIDAuth response using the public key from a DID Document.
@@ -619,6 +707,7 @@ fn now_iso8601() -> String {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
@@ -758,5 +847,54 @@ mod tests {
     fn test_resolve_invalid_did_fails() {
         assert!(resolve_did_key("not-a-did").is_err());
         assert!(resolve_did_key("did:web:example.com").is_err());
+    }
+
+    #[test]
+    fn test_did_auth_pq_hybrid_sign_verify() {
+        use ed25519_dalek::SigningKey;
+
+        let mut secret = [0u8; 32];
+        getrandom::getrandom(&mut secret).unwrap();
+        let ed25519_key = SigningKey::from_bytes(&secret);
+        let ed25519_vk = ed25519_key.verifying_key();
+
+        let (pq_sk, pq_vk) = crate::pq_sign::generate_pq_keypair();
+
+        let prover_did = generate_did_key_ed25519(ed25519_vk.as_bytes());
+
+        let challenge = create_did_auth_challenge("did:web:verifier:example", "milnet.mil")
+            .expect("challenge creation must succeed");
+
+        let response = sign_did_auth_hybrid(&challenge, &prover_did, &ed25519_key, &pq_sk);
+
+        let verified = verify_did_auth_hybrid(
+            &challenge,
+            &response,
+            ed25519_vk.as_bytes(),
+            &pq_vk,
+        )
+        .expect("verification must not error");
+        assert!(verified, "valid PQ-hybrid DIDAuth response must verify");
+    }
+
+    #[test]
+    fn test_did_auth_pq_hybrid_wrong_nonce_fails() {
+        use ed25519_dalek::SigningKey;
+
+        let mut secret = [0u8; 32];
+        getrandom::getrandom(&mut secret).unwrap();
+        let ed25519_key = SigningKey::from_bytes(&secret);
+        let ed25519_vk = ed25519_key.verifying_key();
+
+        let (pq_sk, pq_vk) = crate::pq_sign::generate_pq_keypair();
+
+        let prover_did = generate_did_key_ed25519(ed25519_vk.as_bytes());
+
+        let challenge = create_did_auth_challenge("did:web:verifier:example", "milnet.mil").unwrap();
+        let response = sign_did_auth_hybrid(&challenge, &prover_did, &ed25519_key, &pq_sk);
+
+        let challenge2 = create_did_auth_challenge("did:web:verifier:example", "milnet.mil").unwrap();
+        let verified = verify_did_auth_hybrid(&challenge2, &response, ed25519_vk.as_bytes(), &pq_vk).unwrap();
+        assert!(!verified, "mismatched nonce must fail PQ-hybrid verification");
     }
 }

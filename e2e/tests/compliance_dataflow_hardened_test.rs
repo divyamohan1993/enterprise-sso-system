@@ -1785,10 +1785,10 @@ mod dpop_binding {
 
             let claims = b"token-claims-data";
             let timestamp = now_secs();
-            let proof = generate_dpop_proof(&sk, claims, timestamp);
+            let proof = generate_dpop_proof(&sk, claims, timestamp, b"POST", b"https://sso.milnet.example/token", None);
 
             assert!(
-                verify_dpop_proof(&vk, &proof, claims, timestamp, &expected_hash),
+                verify_dpop_proof(&vk, &proof, claims, timestamp, &expected_hash, b"POST", b"https://sso.milnet.example/token", None),
                 "DPoP proof must verify with correct key"
             );
         });
@@ -1805,11 +1805,11 @@ mod dpop_binding {
 
             let claims = b"stolen-token";
             let timestamp = now_secs();
-            let proof = generate_dpop_proof(&sk_a, claims, timestamp);
+            let proof = generate_dpop_proof(&sk_a, claims, timestamp, b"POST", b"https://sso.milnet.example/token", None);
 
             // Attacker has user A's token but uses user B's DPoP key
             assert!(
-                !verify_dpop_proof(&vk_b, &proof, claims, timestamp, &hash_b),
+                !verify_dpop_proof(&vk_b, &proof, claims, timestamp, &hash_b, b"POST", b"https://sso.milnet.example/token", None),
                 "DPoP proof must be rejected when key doesn't match"
             );
         });

@@ -240,6 +240,17 @@ pub struct HsmConfig {
     pub software_seed: Option<Vec<u8>>,
 }
 
+impl Drop for HsmConfig {
+    fn drop(&mut self) {
+        if let Some(ref mut pin) = self.pkcs11_pin {
+            pin.zeroize();
+        }
+        if let Some(ref mut seed) = self.software_seed {
+            seed.zeroize();
+        }
+    }
+}
+
 impl std::fmt::Debug for HsmConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HsmConfig")

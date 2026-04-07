@@ -11,9 +11,9 @@
 //! - The node enters read-only mode with degraded but safe operation
 
 use crate::siem::{PanelSiemEvent, SiemPanel, SiemSeverity};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -32,6 +32,9 @@ const MIN_HEALTHY_PEERS: u32 = 3;
 /// Dead man switch timeout: 5 minutes with no valid peer heartbeat.
 const DEAD_MAN_SWITCH_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Minimum time emergency mode must be active before deactivation (prevent flip-flop).
+const DEACTIVATION_COOLDOWN: Duration = Duration::from_secs(30);
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -47,6 +50,27 @@ pub enum EmergencyReason {
     ManualTrigger,
     /// Dead man switch fired (no peer heartbeat for 5 minutes).
     DeadManSwitch,
+}
+
+impl EmergencyReason {
+    fn to_u8(self) -> u8 {
+        match self {
+            Self::QuorumLoss => 1,
+            Self::MassCompromise => 2,
+            Self::ManualTrigger => 3,
+            Self::DeadManSwitch => 4,
+        }
+    }
+
+    fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            1 => Some(Self::QuorumLoss),
+            2 => Some(Self::MassCompromise),
+            3 => Some(Self::ManualTrigger),
+            4 => Some(Self::DeadManSwitch),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for EmergencyReason {
@@ -67,15 +91,15 @@ impl std::fmt::Display for EmergencyReason {
 /// Emergency mode state for a single node operating sub-quorum.
 ///
 /// All fields use atomics so that any thread can check/update state without
-/// locks. The `OnceLock` fields capture the moment of activation and never
-/// change after that.
+/// locks. Activation time and reason are stored as atomics to support
+/// deactivation and re-activation without requiring process restart.
 pub struct EmergencyMode {
     /// Whether emergency mode is currently active.
     active: AtomicBool,
-    /// Instant when emergency mode was activated (set once).
-    activated_at: OnceLock<Instant>,
-    /// Reason for activation (set once).
-    reason: OnceLock<EmergencyReason>,
+    /// Microseconds since UNIX_EPOCH when emergency mode was activated (0 = not activated).
+    activated_at_micros: AtomicU64,
+    /// Reason for activation as u8 (0 = None, 1-4 = reason variants).
+    reason: AtomicU8,
     /// Rolling count of consecutive Raft election failures.
     pub consecutive_election_failures: AtomicU32,
     /// Rolling count of consecutive FROST signing failures.
@@ -93,8 +117,8 @@ impl EmergencyMode {
         let deadline = Self::micros_from_now(DEAD_MAN_SWITCH_TIMEOUT);
         Self {
             active: AtomicBool::new(false),
-            activated_at: OnceLock::new(),
-            reason: OnceLock::new(),
+            activated_at_micros: AtomicU64::new(0),
+            reason: AtomicU8::new(0),
             consecutive_election_failures: AtomicU32::new(0),
             consecutive_signing_failures: AtomicU32::new(0),
             healthy_peer_count: AtomicU32::new(MIN_HEALTHY_PEERS),
@@ -142,11 +166,13 @@ impl EmergencyMode {
         self.activate(EmergencyReason::ManualTrigger);
     }
 
-    /// Core activation logic. Idempotent: only the first call sets the reason/time.
+    /// Core activation logic. Idempotent if already active: does not overwrite reason/time.
     fn activate(&self, reason: EmergencyReason) {
         let was_active = self.active.swap(true, Ordering::SeqCst);
-        let _ = self.activated_at.set(Instant::now());
-        let _ = self.reason.set(reason);
+        if !was_active {
+            self.activated_at_micros.store(Self::now_micros(), Ordering::SeqCst);
+            self.reason.store(reason.to_u8(), Ordering::SeqCst);
+        }
 
         if !was_active {
             PanelSiemEvent::new(
@@ -244,12 +270,119 @@ impl EmergencyMode {
 
     /// Get the activation reason (None if not activated).
     pub fn reason(&self) -> Option<EmergencyReason> {
-        self.reason.get().copied()
+        EmergencyReason::from_u8(self.reason.load(Ordering::SeqCst))
     }
 
-    /// Get the activation instant (None if not activated).
-    pub fn activated_at(&self) -> Option<Instant> {
-        self.activated_at.get().copied()
+    /// Get the activation time as microseconds since UNIX_EPOCH (0 = not activated).
+    pub fn activated_at_micros(&self) -> u64 {
+        self.activated_at_micros.load(Ordering::SeqCst)
+    }
+
+    /// Try to deactivate emergency mode.
+    ///
+    /// Succeeds only when ALL of the following hold:
+    /// - Emergency mode is currently active
+    /// - Reason is NOT `ManualTrigger` (use `manual_deactivate` for that)
+    /// - All conditions are resolved: election_failures == 0, signing_failures == 0,
+    ///   healthy_peers >= MIN_HEALTHY_PEERS
+    /// - Emergency has been active for at least 30 seconds (cooldown)
+    ///
+    /// Returns `true` if deactivation succeeded.
+    pub fn try_deactivate(&self) -> bool {
+        if !self.active.load(Ordering::SeqCst) {
+            return false;
+        }
+
+        // ManualTrigger requires explicit manual_deactivate
+        let reason_val = self.reason.load(Ordering::SeqCst);
+        if reason_val == EmergencyReason::ManualTrigger.to_u8() {
+            return false;
+        }
+
+        // Check all conditions resolved
+        let election_fails = self.consecutive_election_failures.load(Ordering::SeqCst);
+        let signing_fails = self.consecutive_signing_failures.load(Ordering::SeqCst);
+        let peers = self.healthy_peer_count.load(Ordering::SeqCst);
+
+        if election_fails != 0 || signing_fails != 0 || peers < MIN_HEALTHY_PEERS {
+            return false;
+        }
+
+        // Cooldown: must be active for at least DEACTIVATION_COOLDOWN
+        let activated = self.activated_at_micros.load(Ordering::SeqCst);
+        let now = Self::now_micros();
+        let cooldown_micros = DEACTIVATION_COOLDOWN.as_micros() as u64;
+        if now.saturating_sub(activated) < cooldown_micros {
+            return false;
+        }
+
+        self.do_deactivate();
+        true
+    }
+
+    /// Explicitly deactivate a `ManualTrigger` emergency (or any reason).
+    /// Bypasses condition checks but still enforces the 30s cooldown.
+    pub fn manual_deactivate(&self) -> bool {
+        if !self.active.load(Ordering::SeqCst) {
+            return false;
+        }
+
+        let activated = self.activated_at_micros.load(Ordering::SeqCst);
+        let now = Self::now_micros();
+        let cooldown_micros = DEACTIVATION_COOLDOWN.as_micros() as u64;
+        if now.saturating_sub(activated) < cooldown_micros {
+            return false;
+        }
+
+        self.do_deactivate();
+        true
+    }
+
+    /// Check conditions and deactivate if possible.
+    /// Returns `true` if emergency mode was deactivated.
+    pub fn check_and_maybe_deactivate(&self) -> bool {
+        if !self.active.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.try_deactivate()
+    }
+
+    /// Internal deactivation: reset all state and emit SIEM event.
+    fn do_deactivate(&self) {
+        let reason_val = self.reason.load(Ordering::SeqCst);
+        let reason_name = EmergencyReason::from_u8(reason_val)
+            .map(|r| r.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        self.active.store(false, Ordering::SeqCst);
+        self.activated_at_micros.store(0, Ordering::SeqCst);
+        self.reason.store(0, Ordering::SeqCst);
+
+        // Reset dead man switch deadline
+        let new_deadline = Self::micros_from_now(DEAD_MAN_SWITCH_TIMEOUT);
+        self.dead_man_switch_deadline.store(new_deadline, Ordering::SeqCst);
+
+        PanelSiemEvent::new(
+            SiemPanel::ThresholdViolations,
+            SiemSeverity::Critical,
+            "emergency_mode_deactivated",
+            format!(
+                "EMERGENCY MODE DEACTIVATED: previous_reason={}, election_fails={}, signing_fails={}, healthy_peers={}",
+                reason_name,
+                self.consecutive_election_failures.load(Ordering::SeqCst),
+                self.consecutive_signing_failures.load(Ordering::SeqCst),
+                self.healthy_peer_count.load(Ordering::SeqCst),
+            ),
+            file!(),
+            line!(),
+            module_path!(),
+        )
+        .emit();
+
+        tracing::info!(
+            previous_reason = %reason_name,
+            "EMERGENCY MODE DEACTIVATED: node resuming normal operation"
+        );
     }
 
     // -- Time helpers --
@@ -299,7 +432,7 @@ mod tests {
         assert!(em.can_issue_tokens());
         assert!(em.can_validate_tokens());
         assert!(em.reason().is_none());
-        assert!(em.activated_at().is_none());
+        assert_eq!(em.activated_at_micros(), 0);
     }
 
     #[test]
@@ -475,6 +608,181 @@ mod tests {
     #[test]
     fn default_impl() {
         let em: EmergencyMode = Default::default();
+        assert!(!em.is_active());
+    }
+
+    // -- Deactivation tests --
+
+    #[test]
+    fn deactivation_succeeds_when_conditions_resolved() {
+        let em = EmergencyMode::new();
+        // Activate via low peers
+        em.update_healthy_peers(1);
+        assert!(em.check_and_activate());
+        assert!(em.is_active());
+
+        // Resolve all conditions
+        em.consecutive_election_failures.store(0, Ordering::SeqCst);
+        em.consecutive_signing_failures.store(0, Ordering::SeqCst);
+        em.update_healthy_peers(MIN_HEALTHY_PEERS);
+
+        // Simulate cooldown elapsed: set activated_at to 31 seconds ago
+        let past = EmergencyMode::now_micros()
+            .saturating_sub(Duration::from_secs(31).as_micros() as u64);
+        em.activated_at_micros.store(past, Ordering::SeqCst);
+
+        assert!(em.try_deactivate());
+        assert!(!em.is_active());
+        assert!(em.can_issue_tokens());
+        assert!(em.reason().is_none());
+        assert_eq!(em.activated_at_micros(), 0);
+    }
+
+    #[test]
+    fn deactivation_fails_when_conditions_not_resolved() {
+        let em = EmergencyMode::new();
+        em.update_healthy_peers(1);
+        assert!(em.check_and_activate());
+
+        // Conditions NOT resolved: still low peers
+        let past = EmergencyMode::now_micros()
+            .saturating_sub(Duration::from_secs(31).as_micros() as u64);
+        em.activated_at_micros.store(past, Ordering::SeqCst);
+
+        assert!(!em.try_deactivate());
+        assert!(em.is_active());
+
+        // Fix peers but leave election failures
+        em.update_healthy_peers(MIN_HEALTHY_PEERS);
+        em.consecutive_election_failures.store(1, Ordering::SeqCst);
+        assert!(!em.try_deactivate());
+        assert!(em.is_active());
+
+        // Fix election failures but leave signing failures
+        em.consecutive_election_failures.store(0, Ordering::SeqCst);
+        em.consecutive_signing_failures.store(1, Ordering::SeqCst);
+        assert!(!em.try_deactivate());
+        assert!(em.is_active());
+    }
+
+    #[test]
+    fn deactivation_fails_within_cooldown() {
+        let em = EmergencyMode::new();
+        em.update_healthy_peers(1);
+        assert!(em.check_and_activate());
+
+        // Resolve conditions but do NOT bypass cooldown
+        em.consecutive_election_failures.store(0, Ordering::SeqCst);
+        em.consecutive_signing_failures.store(0, Ordering::SeqCst);
+        em.update_healthy_peers(MIN_HEALTHY_PEERS);
+
+        // activated_at is "now", so cooldown has not elapsed
+        assert!(!em.try_deactivate());
+        assert!(em.is_active());
+    }
+
+    #[test]
+    fn reactivation_after_deactivation() {
+        let em = EmergencyMode::new();
+        // First activation
+        em.update_healthy_peers(1);
+        assert!(em.check_and_activate());
+        assert_eq!(em.reason(), Some(EmergencyReason::QuorumLoss));
+
+        // Resolve and deactivate
+        em.consecutive_election_failures.store(0, Ordering::SeqCst);
+        em.consecutive_signing_failures.store(0, Ordering::SeqCst);
+        em.update_healthy_peers(MIN_HEALTHY_PEERS);
+        let past = EmergencyMode::now_micros()
+            .saturating_sub(Duration::from_secs(31).as_micros() as u64);
+        em.activated_at_micros.store(past, Ordering::SeqCst);
+        assert!(em.try_deactivate());
+        assert!(!em.is_active());
+
+        // Re-activate with a different trigger
+        em.consecutive_signing_failures.store(4, Ordering::SeqCst);
+        assert!(em.check_and_activate());
+        assert!(em.is_active());
+        assert_eq!(em.reason(), Some(EmergencyReason::QuorumLoss));
+        assert_ne!(em.activated_at_micros(), 0);
+    }
+
+    #[test]
+    fn cannot_deactivate_manual_trigger() {
+        let em = EmergencyMode::new();
+        em.manual_activate();
+        assert!(em.is_active());
+        assert_eq!(em.reason(), Some(EmergencyReason::ManualTrigger));
+
+        // Resolve all conditions and bypass cooldown
+        em.consecutive_election_failures.store(0, Ordering::SeqCst);
+        em.consecutive_signing_failures.store(0, Ordering::SeqCst);
+        em.update_healthy_peers(MIN_HEALTHY_PEERS);
+        let past = EmergencyMode::now_micros()
+            .saturating_sub(Duration::from_secs(31).as_micros() as u64);
+        em.activated_at_micros.store(past, Ordering::SeqCst);
+
+        // try_deactivate must refuse ManualTrigger
+        assert!(!em.try_deactivate());
+        assert!(em.is_active());
+
+        // check_and_maybe_deactivate also refuses
+        assert!(!em.check_and_maybe_deactivate());
+        assert!(em.is_active());
+    }
+
+    #[test]
+    fn manual_deactivate_works() {
+        let em = EmergencyMode::new();
+        em.manual_activate();
+        assert!(em.is_active());
+
+        // Bypass cooldown
+        let past = EmergencyMode::now_micros()
+            .saturating_sub(Duration::from_secs(31).as_micros() as u64);
+        em.activated_at_micros.store(past, Ordering::SeqCst);
+
+        assert!(em.manual_deactivate());
+        assert!(!em.is_active());
+        assert!(em.can_issue_tokens());
+        assert!(em.reason().is_none());
+    }
+
+    #[test]
+    fn manual_deactivate_respects_cooldown() {
+        let em = EmergencyMode::new();
+        em.manual_activate();
+        // No cooldown bypass - should fail
+        assert!(!em.manual_deactivate());
+        assert!(em.is_active());
+    }
+
+    #[test]
+    fn check_and_maybe_deactivate_when_inactive() {
+        let em = EmergencyMode::new();
+        assert!(!em.check_and_maybe_deactivate());
+    }
+
+    #[test]
+    fn deactivation_resets_dead_man_switch() {
+        let em = EmergencyMode::new();
+        em.update_healthy_peers(1);
+        assert!(em.check_and_activate());
+
+        // Set dead man switch to past
+        em.dead_man_switch_deadline.store(0, Ordering::SeqCst);
+
+        // Resolve and deactivate
+        em.consecutive_election_failures.store(0, Ordering::SeqCst);
+        em.consecutive_signing_failures.store(0, Ordering::SeqCst);
+        em.update_healthy_peers(MIN_HEALTHY_PEERS);
+        let past = EmergencyMode::now_micros()
+            .saturating_sub(Duration::from_secs(31).as_micros() as u64);
+        em.activated_at_micros.store(past, Ordering::SeqCst);
+        assert!(em.try_deactivate());
+
+        // Dead man switch should be reset to future, so tick should NOT fire
+        em.dead_man_switch_tick();
         assert!(!em.is_active());
     }
 }

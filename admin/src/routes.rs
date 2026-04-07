@@ -826,7 +826,7 @@ fn log_super_admin_access(
 /// Any attempt to write after setup_complete is a security violation.
 /// Call this before ANY DB write to super_admins — panics if table is frozen.
 pub fn assert_super_admins_not_frozen(setup_complete: &std::sync::atomic::AtomicBool) -> Result<(), StatusCode> {
-    if setup_complete.load(Ordering::Relaxed) {
+    if setup_complete.load(Ordering::SeqCst) {
         // Log to SIEM — this is a critical event
         common::siem::SecurityEvent::tamper_detected(
             "CRITICAL: attempted write to FROZEN super_admins table after setup. \
@@ -1407,7 +1407,7 @@ async fn auth_middleware(
 
                         // Record ACCESS_GRANTED in DB audit log (for last_used derivation).
                         // Best-effort: don't block auth if DB write fails (file log is primary).
-                        let _ = sqlx::query(
+                        if let Err(e) = sqlx::query(
                             "INSERT INTO super_admin_audit_log (operation, admin_id, admin_label, detail, source_ip) \
                              VALUES ('ACCESS_GRANTED', $1, $2, $3, $4)"
                         )
@@ -1416,7 +1416,9 @@ async fn auth_middleware(
                         .bind(format!("{} {}", req_method, req_path))
                         .bind(&source_ip)
                         .execute(&state.db)
-                        .await;
+                        .await {
+                            tracing::error!(error = %e, admin_id = %admin_id, "AUDIT_WRITE_FAILURE: failed to persist ACCESS_GRANTED to super_admin_audit_log");
+                        }
 
                         request.extensions_mut().insert(AuthTier(1));
                         request.extensions_mut().insert(AuthAdminRole(AdminRole::SuperAdmin));
@@ -2175,7 +2177,7 @@ async fn health_check(
 
 async fn setup_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     // Check in-memory flag first, then fall back to database
-    if state.setup_complete.load(Ordering::Relaxed) {
+    if state.setup_complete.load(Ordering::SeqCst) {
         return Json(serde_json::json!({"setup_complete": true}));
     }
     // Check if any users exist in the database (survives restarts)
@@ -2184,7 +2186,7 @@ async fn setup_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Va
         .await
         .unwrap_or(0);
     if user_count > 0 {
-        state.setup_complete.store(true, Ordering::Relaxed);
+        state.setup_complete.store(true, Ordering::SeqCst);
         return Json(serde_json::json!({"setup_complete": true}));
     }
     Json(serde_json::json!({"setup_complete": false}))
@@ -2211,15 +2213,7 @@ async fn initial_setup(
     }
 
     // Only allow if no users exist yet (check both memory and DB)
-    if state.setup_complete.load(Ordering::Relaxed) {
-        return Err(StatusCode::FORBIDDEN);
-    }
-    let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
-        .fetch_one(&state.db)
-        .await
-        .unwrap_or(0);
-    if user_count > 0 {
-        state.setup_complete.store(true, Ordering::Relaxed);
+    if state.setup_complete.load(Ordering::SeqCst) {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -2230,19 +2224,34 @@ async fn initial_setup(
     // Get the OPAQUE registration bytes for persistence
     let reg_bytes = store.get_registration_bytes(&req.username);
 
-    // Persist superuser to PostgreSQL with tier 1 (Sovereign)
-    if let Err(e) = sqlx::query(
-        "INSERT INTO users (id, username, tier, opaque_registration, created_at, is_active) VALUES ($1, $2, 1, $3, $4, true) ON CONFLICT (username) DO UPDATE SET opaque_registration = $3"
+    // Persist superuser to PostgreSQL with tier 1 (Sovereign).
+    // SECURITY: Atomic check-and-insert prevents TOCTOU race — if any user already
+    // exists, the INSERT is a no-op (0 rows affected) and we reject the request.
+    let insert_result = sqlx::query(
+        "INSERT INTO users (id, username, tier, opaque_registration, created_at, is_active) \
+         SELECT $1, $2, 1, $3, $4, true \
+         WHERE NOT EXISTS (SELECT 1 FROM users LIMIT 1)"
     )
     .bind(user_id)
     .bind(&req.username)
     .bind(&reg_bytes)
     .bind(now_secs())
     .execute(&state.db)
-    .await {
-        tracing::error!(error = %e, "CRITICAL: failed to persist superuser registration to database");
-        common::siem::SecurityEvent::database_operation_failed("superuser_registration_persist");
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    .await;
+
+    match insert_result {
+        Ok(result) if result.rows_affected() == 0 => {
+            // Another request already created a superuser — reject this one
+            tracing::warn!("initial_setup race: another superuser was created concurrently");
+            state.setup_complete.store(true, Ordering::SeqCst);
+            return Err(StatusCode::FORBIDDEN);
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "CRITICAL: failed to persist superuser registration to database");
+            common::siem::SecurityEvent::database_operation_failed("superuser_registration_persist");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        Ok(_) => { /* success — exactly one superuser created */ }
     }
 
     // ── Create super admin API keys ──
@@ -2260,13 +2269,15 @@ async fn initial_setup(
         .unwrap_or_else(|_| "default-deployment".to_string());
 
     // Ensure super_admins table exists (migration should handle this, but be safe)
-    let _ = sqlx::query(
+    if let Err(e) = sqlx::query(
         "CREATE TABLE IF NOT EXISTS super_admins (
             id UUID PRIMARY KEY, label VARCHAR(255) NOT NULL UNIQUE,
             key_hash BYTEA NOT NULL, region VARCHAR(255),
             created_at BIGINT NOT NULL
         )"
-    ).execute(&state.db).await;
+    ).execute(&state.db).await {
+        tracing::error!(error = %e, "AUDIT_WRITE_FAILURE: failed to ensure super_admins table exists");
+    }
 
     // Assert the table is NOT frozen yet (setup not complete)
     assert_super_admins_not_frozen(&state.setup_complete)?;
@@ -2337,7 +2348,7 @@ async fn initial_setup(
     tracing::info!("super_admins table FROZEN — no further INSERT or UPDATE possible");
 
     // Mark setup as complete (application-level guard)
-    state.setup_complete.store(true, Ordering::Relaxed);
+    state.setup_complete.store(true, Ordering::SeqCst);
 
     common::siem::SecurityEvent::key_rotation(&format!(
         "initial_setup: {} super admin(s) created", created_admins.len()
@@ -2920,7 +2931,7 @@ async fn register_portal(
     }
     let portal_id = Uuid::new_v4();
 
-    let _ = sqlx::query(
+    if let Err(e) = sqlx::query(
         "INSERT INTO portals (id, name, callback_url, required_tier, required_scope, is_active, created_at) VALUES ($1, $2, $3, $4, $5, true, $6)"
     )
     .bind(portal_id)
@@ -2930,7 +2941,9 @@ async fn register_portal(
     .bind(req.required_scope as i32)
     .bind(now_secs())
     .execute(&state.db)
-    .await;
+    .await {
+        tracing::error!(error = %e, portal_id = %portal_id, "AUDIT_WRITE_FAILURE: failed to persist portal creation");
+    }
 
     Ok(Json(PortalResponse {
         id: portal_id,
@@ -3046,7 +3059,7 @@ async fn enroll_device(
     let attestation = req.attestation_hash.unwrap_or_default();
     let enrolled_by = req.enrolled_by.unwrap_or_else(Uuid::new_v4);
 
-    let _ = sqlx::query(
+    if let Err(e) = sqlx::query(
         "INSERT INTO devices (id, tier, attestation_hash, enrolled_by, is_active, created_at) VALUES ($1, $2, $3, $4, true, $5)"
     )
     .bind(device_id)
@@ -3055,7 +3068,9 @@ async fn enroll_device(
     .bind(enrolled_by)
     .bind(now_secs())
     .execute(&state.db)
-    .await;
+    .await {
+        tracing::error!(error = %e, device_id = %device_id, "AUDIT_WRITE_FAILURE: failed to persist device enrollment");
+    }
 
     // Mirror enrollment into the in-memory DeviceRegistry
     {
@@ -3246,7 +3261,7 @@ async fn auth_login(
 
             // Persist session to PostgreSQL
             let session_id = Uuid::new_v4();
-            let _ = sqlx::query(
+            if let Err(e) = sqlx::query(
                 "INSERT INTO sessions (id, user_id, created_at, expires_at, is_active) VALUES ($1, $2, $3, $4, true)"
             )
             .bind(session_id)
@@ -3254,7 +3269,9 @@ async fn auth_login(
             .bind(now)
             .bind(expires_at)
             .execute(&state.db)
-            .await;
+            .await {
+                tracing::error!(error = %e, user_id = %verified_user_id, "AUDIT_WRITE_FAILURE: failed to persist session");
+            }
 
             // Look up user tier
             let user_tier: i32 = sqlx::query_scalar("SELECT tier FROM users WHERE id = $1")
@@ -4174,8 +4191,8 @@ async fn set_developer_mode(
     };
 
     // Update local state atomics
-    state.developer_mode.store(body.enabled, Ordering::Relaxed);
-    state.developer_log_level.store(effective_level as u8, Ordering::Relaxed);
+    state.developer_mode.store(body.enabled, Ordering::SeqCst);
+    state.developer_log_level.store(effective_level as u8, Ordering::SeqCst);
 
     // Update the global error level so all crates see it
     common::config::error_level().set_level(effective_level);
@@ -4197,9 +4214,9 @@ async fn set_developer_mode(
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(15 * 60)).await;
             // Only revert if still in verbose mode (may have been changed manually)
-            if state_clone.developer_log_level.load(Ordering::Relaxed) == common::config::ErrorLevel::Verbose as u8 {
-                state_clone.developer_mode.store(false, Ordering::Relaxed);
-                state_clone.developer_log_level.store(common::config::ErrorLevel::Warn as u8, Ordering::Relaxed);
+            if state_clone.developer_log_level.load(Ordering::SeqCst) == common::config::ErrorLevel::Verbose as u8 {
+                state_clone.developer_mode.store(false, Ordering::SeqCst);
+                state_clone.developer_log_level.store(common::config::ErrorLevel::Warn as u8, Ordering::SeqCst);
                 common::config::error_level().set_level(common::config::ErrorLevel::Warn);
                 tracing::warn!(
                     target: "siem",
@@ -4238,7 +4255,7 @@ async fn get_developer_mode(
     }
 
     let level = common::config::ErrorLevel::from_u8(
-        state.developer_log_level.load(Ordering::Relaxed),
+        state.developer_log_level.load(Ordering::SeqCst),
     );
 
     Ok(Json(ErrorLevelResponse {
@@ -4516,8 +4533,10 @@ async fn add_super_admin(
     .await;
 
     // ALWAYS re-freeze, even if insert failed
-    let _ = sqlx::query("SELECT freeze_super_admins()")
-        .execute(&state.db).await;
+    if let Err(e) = sqlx::query("SELECT freeze_super_admins()")
+        .execute(&state.db).await {
+        tracing::error!(error = %e, "AUDIT_WRITE_FAILURE: failed to re-freeze super_admins table");
+    }
 
     if let Err(e) = insert_result {
         tracing::error!("failed to insert new super admin: {e}");
@@ -5851,7 +5870,7 @@ async fn recovery_generate(
     combined_sig.extend_from_slice(&admin_sig);
 
     let user_ids_json = serde_json::to_string(&entry.user_ids).unwrap_or_default();
-    let _ = sqlx::query(
+    if let Err(e) = sqlx::query(
         "INSERT INTO audit_log (id, event_type, user_ids, timestamp, prev_hash, signature) VALUES ($1, $2, $3, $4, $5, $6)"
     )
     .bind(entry.event_id)
@@ -5861,7 +5880,9 @@ async fn recovery_generate(
     .bind(entry.prev_hash.to_vec())
     .bind(combined_sig)
     .execute(&state.db)
-    .await;
+    .await {
+        tracing::error!(error = %e, event_id = %entry.event_id, "AUDIT_WRITE_FAILURE: failed to persist recovery code generation audit log");
+    }
 
     let count = display_codes.len();
     Ok(Json(RecoveryGenerateResponse {
@@ -5949,13 +5970,15 @@ async fn recovery_verify(
     match matched_code_id {
         Some(code_id) => {
             // Mark code as used
-            let _ = sqlx::query(
+            if let Err(e) = sqlx::query(
                 "UPDATE recovery_codes SET is_used = true, used_at = $1 WHERE id = $2"
             )
             .bind(now)
             .bind(code_id)
             .execute(&state.db)
-            .await;
+            .await {
+                tracing::error!(error = %e, "AUDIT_WRITE_FAILURE: failed to mark recovery code as used");
+            }
 
             // Issue a Tier 4 (Emergency) token — short-lived, 2 minutes
             use hmac::{Hmac, Mac};
@@ -5985,7 +6008,7 @@ async fn recovery_verify(
             // Persist emergency session (2-minute expiry)
             let session_id = Uuid::new_v4();
             let expires_at = now_ts as i64 + 120;
-            let _ = sqlx::query(
+            if let Err(e) = sqlx::query(
                 "INSERT INTO sessions (id, user_id, created_at, expires_at, is_active) VALUES ($1, $2, $3, $4, true)"
             )
             .bind(session_id)
@@ -5993,7 +6016,9 @@ async fn recovery_verify(
             .bind(now_ts as i64)
             .bind(expires_at)
             .execute(&state.db)
-            .await;
+            .await {
+                tracing::error!(error = %e, user_id = %user_id, "AUDIT_WRITE_FAILURE: failed to persist emergency session");
+            }
 
             // Log audit event with elevated risk, signed with admin HMAC
             let mut audit = state.audit_log.write().await;
@@ -6012,7 +6037,7 @@ async fn recovery_verify(
             combined_sig.extend_from_slice(&admin_sig);
 
             let user_ids_json = serde_json::to_string(&entry.user_ids).unwrap_or_default();
-            let _ = sqlx::query(
+            if let Err(e) = sqlx::query(
                 "INSERT INTO audit_log (id, event_type, user_ids, timestamp, prev_hash, signature) VALUES ($1, $2, $3, $4, $5, $6)"
             )
             .bind(entry.event_id)
@@ -6022,7 +6047,9 @@ async fn recovery_verify(
             .bind(entry.prev_hash.to_vec())
             .bind(combined_sig)
             .execute(&state.db)
-            .await;
+            .await {
+                tracing::error!(error = %e, event_id = %entry.event_id, "AUDIT_WRITE_FAILURE: failed to persist recovery code usage audit log");
+            }
             drop(audit);
 
             // Emit SIEM event
@@ -6154,7 +6181,7 @@ async fn recovery_revoke_all(
     combined_sig.extend_from_slice(&admin_sig);
 
     let user_ids_json = serde_json::to_string(&entry.user_ids).unwrap_or_default();
-    let _ = sqlx::query(
+    if let Err(e) = sqlx::query(
         "INSERT INTO audit_log (id, event_type, user_ids, timestamp, prev_hash, signature) VALUES ($1, $2, $3, $4, $5, $6)"
     )
     .bind(entry.event_id)
@@ -6164,7 +6191,9 @@ async fn recovery_revoke_all(
     .bind(entry.prev_hash.to_vec())
     .bind(combined_sig)
     .execute(&state.db)
-    .await;
+    .await {
+        tracing::error!(error = %e, event_id = %entry.event_id, "AUDIT_WRITE_FAILURE: failed to persist revocation audit log");
+    }
 
     Ok(Json(serde_json::json!({
         "revoked": true,

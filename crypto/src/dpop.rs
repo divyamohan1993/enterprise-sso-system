@@ -117,16 +117,29 @@ pub fn dpop_key_hash(client_public_key: &[u8]) -> [u8; 64] {
 
 /// Generate a DPoP proof using ML-DSA-87 (CNSA 2.0 compliant, Level 5).
 ///
-/// Signs SHA-512(claims_bytes || timestamp_bytes) with the provided ML-DSA-87
-/// signing key. Returns the encoded ML-DSA-87 signature bytes.
+/// Signs SHA-512(claims_bytes || timestamp_bytes || htm || htu || server_nonce)
+/// with the provided ML-DSA-87 signing key. The `htm` (HTTP method) and `htu`
+/// (HTTP target URI) parameters bind the proof to a specific request per RFC 9449.
+/// An optional `server_nonce` binds the proof to a server-issued nonce to prevent
+/// replay within the timestamp window.
+///
+/// Returns the encoded ML-DSA-87 signature bytes.
 pub fn generate_dpop_proof(
     signing_key: &DpopSigningKey,
     claims_bytes: &[u8],
     timestamp: i64,
+    htm: &[u8],
+    htu: &[u8],
+    server_nonce: Option<&[u8]>,
 ) -> Vec<u8> {
     let mut hasher = Sha512::new();
     hasher.update(claims_bytes);
     hasher.update(&timestamp.to_le_bytes());
+    hasher.update(htm);
+    hasher.update(htu);
+    if let Some(nonce) = server_nonce {
+        hasher.update(nonce);
+    }
     let digest = hasher.finalize();
     let sig: DpopSignature = signing_key.sign(&digest);
     sig.encode().to_vec()
@@ -138,16 +151,25 @@ const DPOP_MAX_AGE_SECS: i64 = 30;
 
 /// Verify a DPoP proof using ML-DSA-87 (CNSA 2.0 compliant, Level 5).
 ///
-/// Verifies the ML-DSA-87 signature over SHA-512(claims_bytes || timestamp_bytes)
+/// Verifies the ML-DSA-87 signature over
+/// SHA-512(claims_bytes || timestamp_bytes || htm || htu || server_nonce)
 /// against the provided verifying key bytes. Also checks the key hash matches
 /// and rejects proofs where the timestamp deviates more than `DPOP_MAX_AGE_SECS`
 /// seconds from the current system clock.
+///
+/// The `htm` and `htu` parameters are the expected HTTP method and target URI
+/// for this request. If they don't match what was signed, verification fails.
+/// The `expected_server_nonce` parameter, when `Some`, requires the proof to
+/// have been generated with the matching server nonce.
 pub fn verify_dpop_proof(
     verifying_key: &DpopVerifyingKey,
     proof: &[u8],
     claims_bytes: &[u8],
     timestamp: i64,
     expected_key_hash: &[u8; 64],
+    htm: &[u8],
+    htu: &[u8],
+    expected_server_nonce: Option<&[u8]>,
 ) -> bool {
     // 0. Timestamp freshness check — reject stale or future-dated proofs
     // Uses monotonic-anchored secure time, immune to clock manipulation.
@@ -169,10 +191,15 @@ pub fn verify_dpop_proof(
         Err(_) => return false,
     };
 
-    // 3. Recompute the digest and verify
+    // 3. Recompute the digest (including htm, htu, server_nonce) and verify
     let mut hasher = Sha512::new();
     hasher.update(claims_bytes);
     hasher.update(&timestamp.to_le_bytes());
+    hasher.update(htm);
+    hasher.update(htu);
+    if let Some(nonce) = expected_server_nonce {
+        hasher.update(nonce);
+    }
     let digest = hasher.finalize();
 
     verifying_key.verify(&digest, &sig).is_ok()
@@ -216,6 +243,10 @@ mod tests {
         assert_ne!(ha, hb);
     }
 
+    // Default htm/htu used in tests
+    const TEST_HTM: &[u8] = b"POST";
+    const TEST_HTU: &[u8] = b"https://sso.milnet.example/token";
+
     #[test]
     fn test_dpop_sign_and_verify() {
         run_with_large_stack(|| {
@@ -224,8 +255,8 @@ mod tests {
             let expected_hash = dpop_key_hash(vk_bytes.as_ref());
             let claims = b"claims";
             let timestamp = now_secs();
-            let proof = generate_dpop_proof(guarded_sk.signing_key(), claims, timestamp);
-            assert!(verify_dpop_proof(&vk, &proof, claims, timestamp, &expected_hash));
+            let proof = generate_dpop_proof(guarded_sk.signing_key(), claims, timestamp, TEST_HTM, TEST_HTU, None);
+            assert!(verify_dpop_proof(&vk, &proof, claims, timestamp, &expected_hash, TEST_HTM, TEST_HTU, None));
         });
     }
 
@@ -237,8 +268,8 @@ mod tests {
             let expected_hash = dpop_key_hash(vk_bytes.as_ref());
             let claims = b"claims";
             let timestamp = now_secs();
-            let proof = generate_dpop_proof(&sk, claims, timestamp);
-            assert!(verify_dpop_proof(&vk, &proof, claims, timestamp, &expected_hash));
+            let proof = generate_dpop_proof(&sk, claims, timestamp, TEST_HTM, TEST_HTU, None);
+            assert!(verify_dpop_proof(&vk, &proof, claims, timestamp, &expected_hash, TEST_HTM, TEST_HTU, None));
         });
     }
 
@@ -251,9 +282,8 @@ mod tests {
             let expected_hash = dpop_key_hash(vk2_bytes.as_ref());
             let claims = b"claims";
             let timestamp = now_secs();
-            let proof = generate_dpop_proof(&sk, claims, timestamp);
-            // Signature was made with sk (whose vk != vk2), so verification fails
-            assert!(!verify_dpop_proof(&vk2, &proof, claims, timestamp, &expected_hash));
+            let proof = generate_dpop_proof(&sk, claims, timestamp, TEST_HTM, TEST_HTU, None);
+            assert!(!verify_dpop_proof(&vk2, &proof, claims, timestamp, &expected_hash, TEST_HTM, TEST_HTU, None));
         });
     }
 
@@ -264,7 +294,7 @@ mod tests {
             let vk_bytes = vk.encode();
             let expected_hash = dpop_key_hash(vk_bytes.as_ref());
             let bad_proof = vec![0u8; 64];
-            assert!(!verify_dpop_proof(&vk, &bad_proof, b"claims", now_secs(), &expected_hash));
+            assert!(!verify_dpop_proof(&vk, &bad_proof, b"claims", now_secs(), &expected_hash, TEST_HTM, TEST_HTU, None));
         });
     }
 
@@ -276,9 +306,8 @@ mod tests {
             let expected_hash = dpop_key_hash(vk_bytes.as_ref());
             let claims = b"claims";
             let ts = now_secs();
-            let proof = generate_dpop_proof(&sk, claims, ts);
-            // Verify with a wildly different timestamp — signature won't match
-            assert!(!verify_dpop_proof(&vk, &proof, claims, ts + 9999, &expected_hash));
+            let proof = generate_dpop_proof(&sk, claims, ts, TEST_HTM, TEST_HTU, None);
+            assert!(!verify_dpop_proof(&vk, &proof, claims, ts + 9999, &expected_hash, TEST_HTM, TEST_HTU, None));
         });
     }
 
@@ -289,10 +318,9 @@ mod tests {
             let vk_bytes = vk.encode();
             let expected_hash = dpop_key_hash(vk_bytes.as_ref());
             let claims = b"claims";
-            // Proof created 60 seconds ago — exceeds DPOP_MAX_AGE_SECS (30s)
             let old_timestamp = now_secs() - 60;
-            let proof = generate_dpop_proof(&sk, claims, old_timestamp);
-            assert!(!verify_dpop_proof(&vk, &proof, claims, old_timestamp, &expected_hash));
+            let proof = generate_dpop_proof(&sk, claims, old_timestamp, TEST_HTM, TEST_HTU, None);
+            assert!(!verify_dpop_proof(&vk, &proof, claims, old_timestamp, &expected_hash, TEST_HTM, TEST_HTU, None));
         });
     }
 
@@ -303,10 +331,9 @@ mod tests {
             let vk_bytes = vk.encode();
             let expected_hash = dpop_key_hash(vk_bytes.as_ref());
             let claims = b"claims";
-            // Proof dated 60 seconds in the future — exceeds DPOP_MAX_AGE_SECS (30s)
             let future_timestamp = now_secs() + 60;
-            let proof = generate_dpop_proof(&sk, claims, future_timestamp);
-            assert!(!verify_dpop_proof(&vk, &proof, claims, future_timestamp, &expected_hash));
+            let proof = generate_dpop_proof(&sk, claims, future_timestamp, TEST_HTM, TEST_HTU, None);
+            assert!(!verify_dpop_proof(&vk, &proof, claims, future_timestamp, &expected_hash, TEST_HTM, TEST_HTU, None));
         });
     }
 
@@ -316,9 +343,9 @@ mod tests {
             let (sk, vk) = generate_dpop_keypair_raw();
             let claims = b"claims";
             let timestamp = now_secs();
-            let proof = generate_dpop_proof(&sk, claims, timestamp);
+            let proof = generate_dpop_proof(&sk, claims, timestamp, TEST_HTM, TEST_HTU, None);
             let wrong_hash = [0xFFu8; 64];
-            assert!(!verify_dpop_proof(&vk, &proof, claims, timestamp, &wrong_hash));
+            assert!(!verify_dpop_proof(&vk, &proof, claims, timestamp, &wrong_hash, TEST_HTM, TEST_HTU, None));
         });
     }
 
@@ -329,11 +356,76 @@ mod tests {
             let vk_bytes = vk.encode();
             let expected_hash = dpop_key_hash(vk_bytes.as_ref());
             let ts = now_secs();
-            let proof = generate_dpop_proof(guarded_sk.signing_key(), b"test", ts);
-            // Explicitly drop — should zeroize without panic.
+            let proof = generate_dpop_proof(guarded_sk.signing_key(), b"test", ts, TEST_HTM, TEST_HTU, None);
             drop(guarded_sk);
-            // Proof generated before drop should still verify.
-            assert!(verify_dpop_proof(&vk, &proof, b"test", ts, &expected_hash));
+            assert!(verify_dpop_proof(&vk, &proof, b"test", ts, &expected_hash, TEST_HTM, TEST_HTU, None));
+        });
+    }
+
+    #[test]
+    fn test_dpop_wrong_method_rejected() {
+        run_with_large_stack(|| {
+            let (sk, vk) = generate_dpop_keypair_raw();
+            let vk_bytes = vk.encode();
+            let expected_hash = dpop_key_hash(vk_bytes.as_ref());
+            let claims = b"claims";
+            let ts = now_secs();
+            let proof = generate_dpop_proof(&sk, claims, ts, b"POST", TEST_HTU, None);
+            assert!(!verify_dpop_proof(&vk, &proof, claims, ts, &expected_hash, b"GET", TEST_HTU, None));
+        });
+    }
+
+    #[test]
+    fn test_dpop_wrong_uri_rejected() {
+        run_with_large_stack(|| {
+            let (sk, vk) = generate_dpop_keypair_raw();
+            let vk_bytes = vk.encode();
+            let expected_hash = dpop_key_hash(vk_bytes.as_ref());
+            let claims = b"claims";
+            let ts = now_secs();
+            let proof = generate_dpop_proof(&sk, claims, ts, TEST_HTM, b"https://sso.milnet.example/token", None);
+            assert!(!verify_dpop_proof(&vk, &proof, claims, ts, &expected_hash, TEST_HTM, b"https://sso.milnet.example/revoke", None));
+        });
+    }
+
+    #[test]
+    fn test_dpop_valid_server_nonce() {
+        run_with_large_stack(|| {
+            let (sk, vk) = generate_dpop_keypair_raw();
+            let vk_bytes = vk.encode();
+            let expected_hash = dpop_key_hash(vk_bytes.as_ref());
+            let claims = b"claims";
+            let ts = now_secs();
+            let nonce = b"server-nonce-abc123";
+            let proof = generate_dpop_proof(&sk, claims, ts, TEST_HTM, TEST_HTU, Some(nonce));
+            assert!(verify_dpop_proof(&vk, &proof, claims, ts, &expected_hash, TEST_HTM, TEST_HTU, Some(nonce)));
+        });
+    }
+
+    #[test]
+    fn test_dpop_wrong_server_nonce_rejected() {
+        run_with_large_stack(|| {
+            let (sk, vk) = generate_dpop_keypair_raw();
+            let vk_bytes = vk.encode();
+            let expected_hash = dpop_key_hash(vk_bytes.as_ref());
+            let claims = b"claims";
+            let ts = now_secs();
+            let proof = generate_dpop_proof(&sk, claims, ts, TEST_HTM, TEST_HTU, Some(b"nonce-a"));
+            assert!(!verify_dpop_proof(&vk, &proof, claims, ts, &expected_hash, TEST_HTM, TEST_HTU, Some(b"nonce-b")));
+        });
+    }
+
+    #[test]
+    fn test_dpop_nonce_present_but_not_expected_rejected() {
+        run_with_large_stack(|| {
+            let (sk, vk) = generate_dpop_keypair_raw();
+            let vk_bytes = vk.encode();
+            let expected_hash = dpop_key_hash(vk_bytes.as_ref());
+            let claims = b"claims";
+            let ts = now_secs();
+            // Proof was generated WITH a nonce, but verifier expects none
+            let proof = generate_dpop_proof(&sk, claims, ts, TEST_HTM, TEST_HTU, Some(b"surprise-nonce"));
+            assert!(!verify_dpop_proof(&vk, &proof, claims, ts, &expected_hash, TEST_HTM, TEST_HTU, None));
         });
     }
 }

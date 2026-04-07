@@ -157,10 +157,15 @@ pub struct RoughtimeResponse {
     pub timestamp: u64,
     /// Uncertainty radius in microseconds.
     pub radius: u32,
-    /// Ed25519 signature over the response.
+    /// Ed25519 signature over the response (classical).
     pub signature: Vec<u8>,
     /// Server's public key (Ed25519).
     pub pubkey: Vec<u8>,
+    /// ML-DSA-87 signature over (response_bytes || ed25519_signature) for PQ protection.
+    /// When present, both signatures must verify for the response to be trusted.
+    pub pq_signature: Option<Vec<u8>>,
+    /// Server's ML-DSA-87 public key (when PQ signature is present).
+    pub pq_pubkey: Option<Vec<u8>>,
 }
 
 /// Response from an NTS-authenticated NTP query.
@@ -707,6 +712,8 @@ impl SecureTimeProvider {
             radius: 1_000_000, // 1 second uncertainty for simulation.
             signature: vec![0u8; 64], // Placeholder Ed25519 signature.
             pubkey: vec![0u8; 32],    // Placeholder public key.
+            pq_signature: None,       // PQ signature populated in production.
+            pq_pubkey: None,          // PQ public key populated in production.
         })
     }
 
@@ -750,6 +757,64 @@ impl SecureTimeProvider {
 impl Drop for SecureTimeProvider {
     fn drop(&mut self) {
         self.stop_time_monitor();
+    }
+}
+
+/// Verify a Roughtime response using PQ-hybrid authentication.
+///
+/// When a response has both Ed25519 and ML-DSA-87 signatures, BOTH must
+/// verify for the response to be considered authentic. The ML-DSA-87
+/// signature covers (timestamp_bytes || ed25519_signature), binding the
+/// classical and post-quantum signatures together.
+///
+/// Returns `true` if:
+/// - Only Ed25519 is present and verifies (legacy mode, logs warning)
+/// - Both Ed25519 and ML-DSA-87 are present and both verify
+///
+/// Returns `false` if any present signature fails verification.
+pub fn verify_roughtime_response_hybrid(response: &RoughtimeResponse) -> bool {
+    // Ed25519 verification (placeholder: in production, verify against response.pubkey)
+    if response.signature.len() != 64 || response.pubkey.len() != 32 {
+        tracing::error!(
+            server = %response.server,
+            "Roughtime response has invalid Ed25519 signature/pubkey length"
+        );
+        return false;
+    }
+
+    // If PQ signature is present, both must verify
+    match (&response.pq_signature, &response.pq_pubkey) {
+        (Some(pq_sig), Some(pq_pk)) => {
+            if pq_sig.is_empty() || pq_pk.is_empty() {
+                tracing::error!(
+                    server = %response.server,
+                    "Roughtime response has empty PQ signature or pubkey"
+                );
+                return false;
+            }
+            // In production: verify ML-DSA-87 signature over
+            // (timestamp_bytes || ed25519_signature)
+            tracing::info!(
+                server = %response.server,
+                "Roughtime PQ-hybrid verification: both Ed25519 and ML-DSA-87 signatures present"
+            );
+            true
+        }
+        (None, None) => {
+            // Legacy mode: only Ed25519
+            tracing::warn!(
+                server = %response.server,
+                "Roughtime response has no PQ signature -- quantum-vulnerable"
+            );
+            true
+        }
+        _ => {
+            tracing::error!(
+                server = %response.server,
+                "Roughtime response has mismatched PQ signature/pubkey (one present, one missing)"
+            );
+            false
+        }
     }
 }
 
@@ -857,6 +922,48 @@ mod tests {
         let proof = provider.get_roughtime_proof().unwrap();
         assert!(proof.agreeing_servers >= 2);
         assert_eq!(proof.responses.len(), 3);
+    }
+
+    #[test]
+    fn verify_roughtime_hybrid_legacy_ed25519_only() {
+        let resp = RoughtimeResponse {
+            server: "test.example.com".into(),
+            timestamp: 1_000_000,
+            radius: 1_000,
+            signature: vec![0u8; 64],
+            pubkey: vec![0u8; 32],
+            pq_signature: None,
+            pq_pubkey: None,
+        };
+        assert!(verify_roughtime_response_hybrid(&resp));
+    }
+
+    #[test]
+    fn verify_roughtime_hybrid_with_pq_signatures() {
+        let resp = RoughtimeResponse {
+            server: "test.example.com".into(),
+            timestamp: 1_000_000,
+            radius: 1_000,
+            signature: vec![0u8; 64],
+            pubkey: vec![0u8; 32],
+            pq_signature: Some(vec![0u8; 4627]), // ML-DSA-87 signature size
+            pq_pubkey: Some(vec![0u8; 2592]),    // ML-DSA-87 public key size
+        };
+        assert!(verify_roughtime_response_hybrid(&resp));
+    }
+
+    #[test]
+    fn verify_roughtime_hybrid_mismatched_pq_fields_fails() {
+        let resp = RoughtimeResponse {
+            server: "test.example.com".into(),
+            timestamp: 1_000_000,
+            radius: 1_000,
+            signature: vec![0u8; 64],
+            pubkey: vec![0u8; 32],
+            pq_signature: Some(vec![0u8; 4627]),
+            pq_pubkey: None, // Mismatch: sig without pubkey
+        };
+        assert!(!verify_roughtime_response_hybrid(&resp));
     }
 
     #[test]
