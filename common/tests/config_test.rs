@@ -139,11 +139,11 @@ fn test_default_error_level_is_warn_not_verbose() {
 
 #[test]
 fn test_error_level_config_defaults_to_verbose() {
-    // The runtime ErrorLevelConfig singleton defaults to Verbose.
+    // The runtime ErrorLevelConfig singleton defaults to Warn (security-safe default).
     let elc = ErrorLevelConfig::new();
-    assert_eq!(elc.level(), ErrorLevel::Verbose);
-    assert!(elc.is_verbose());
-    assert!(elc.is_enabled()); // backwards-compat alias
+    assert_eq!(elc.level(), ErrorLevel::Warn);
+    assert!(!elc.is_verbose());
+    assert!(!elc.is_enabled()); // backwards-compat alias — Warn is not developer-verbose
 }
 
 #[test]
