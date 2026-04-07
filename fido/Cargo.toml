@@ -19,6 +19,9 @@ signature = "2"
 tracing.workspace = true
 sqlx.workspace = true
 
+[dev-dependencies]
+serial_test.workspace = true
+
 [features]
 default = ["production"]
 production = ["common/production"]

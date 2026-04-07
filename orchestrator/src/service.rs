@@ -1116,6 +1116,12 @@ mod tests {
     #[test]
     fn registry_single_endpoints() {
         let registry = build_service_registry("127.0.0.1:9000", "127.0.0.1:9001");
+        // Endpoints start as Unknown health; warm them up to Healthy
+        // (healthy_threshold defaults to 2, so 2 record_success calls needed)
+        for _ in 0..2 {
+            registry.record_success("opaque", "127.0.0.1:9000");
+            registry.record_success("tss", "127.0.0.1:9001");
+        }
         // Should be able to acquire endpoints for both services
         let opaque = registry.acquire_endpoint("opaque");
         assert!(opaque.is_ok(), "opaque endpoint should be available");
@@ -1132,7 +1138,12 @@ mod tests {
             "host1:9000,host2:9000",
             "host3:9001, host4:9001",
         );
-        // Both services should be registered
+        // Endpoints start as Unknown; warm up at least one per service to pass quorum
+        for _ in 0..2 {
+            registry.record_success("opaque", "host1:9000");
+            registry.record_success("tss", "host3:9001");
+        }
+        // Both services should be registered and acquirable
         let opaque = registry.acquire_endpoint("opaque");
         assert!(opaque.is_ok(), "opaque should have endpoints");
 
@@ -1144,6 +1155,11 @@ mod tests {
     fn registry_empty_trailing_comma() {
         // Trailing comma should not create empty endpoints
         let registry = build_service_registry("host1:9000,", "host2:9001,");
+        // Warm up endpoints to Healthy status
+        for _ in 0..2 {
+            registry.record_success("opaque", "host1:9000");
+            registry.record_success("tss", "host2:9001");
+        }
         let opaque = registry.acquire_endpoint("opaque");
         assert!(opaque.is_ok());
     }
@@ -1212,6 +1228,10 @@ mod tests {
             "10.0.0.1:9000".into(),
             "10.0.0.2:9001".into(),
         );
+        // Endpoints start as Unknown health; warm up to Healthy so acquire_endpoint succeeds
+        for _ in 0..2 {
+            svc.service_registry.record_success("opaque", "10.0.0.1:9000");
+        }
         let addr = svc.resolve_addr("opaque", "fallback:1234");
         // Should return the registered address, not the fallback
         assert_eq!(addr, "10.0.0.1:9000");

@@ -13,6 +13,7 @@ use fido::types::*;
 use fido::verification;
 
 use p256::ecdsa::{signature::Signer, SigningKey};
+use serial_test::serial;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -1018,6 +1019,7 @@ fn test_validate_client_data_not_object() {
 // ── Attestation verification tests ──────────────────────────────────────
 
 #[test]
+#[serial]
 fn test_attestation_none_rejected_in_military_mode() {
     std::env::remove_var("MILNET_FIDO_REQUIRE_ATTESTATION");
     let rp_id = "sso.milnet.gov";
@@ -1034,6 +1036,7 @@ fn test_attestation_none_rejected_in_military_mode() {
 }
 
 #[test]
+#[serial]
 fn test_attestation_none_valid_when_disabled() {
     std::env::set_var("MILNET_FIDO_REQUIRE_ATTESTATION", "false");
     let rp_id = "sso.milnet.gov";

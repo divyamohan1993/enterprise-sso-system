@@ -757,25 +757,27 @@ mod tests {
     #[test]
     fn error_level_runtime_toggle() {
         let el = ErrorLevelConfig::new();
-        // Default is now Verbose
-        assert!(el.is_verbose());
-        assert_eq!(el.level(), ErrorLevel::Verbose);
-
-        // Toggle to Warn
-        el.set_level(ErrorLevel::Warn);
+        // Default is Warn (safe default — prevents information disclosure)
         assert!(!el.is_verbose());
         assert_eq!(el.level(), ErrorLevel::Warn);
 
-        // Toggle back to Verbose
+        // Toggle to Verbose
         el.set_level(ErrorLevel::Verbose);
         assert!(el.is_verbose());
         assert_eq!(el.level(), ErrorLevel::Verbose);
+
+        // Toggle back to Warn
+        el.set_level(ErrorLevel::Warn);
+        assert!(!el.is_verbose());
+        assert_eq!(el.level(), ErrorLevel::Warn);
     }
 
     #[test]
     fn error_level_backwards_compat() {
         let el = ErrorLevelConfig::new();
-        // Default is Verbose, so is_enabled() (maps to is_verbose()) is true
+        // Default is Warn (safe), so is_enabled() is false
+        assert!(!el.is_enabled());
+        el.set_developer_mode_unchecked(true);
         assert!(el.is_enabled());
         el.set_developer_mode_unchecked(false);
         assert!(!el.is_enabled());

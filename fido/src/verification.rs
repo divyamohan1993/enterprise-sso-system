@@ -1221,6 +1221,7 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
     use p256::ecdsa::signature::SignatureEncoding;
+    use serial_test::serial;
 
     /// Helper: generate a P-256 keypair and sign authenticator_data || client_data_hash
     fn sign_auth_data(auth_data: &[u8], client_data: &[u8]) -> (Vec<u8>, Vec<u8>) {
@@ -2002,6 +2003,7 @@ mod tests {
     // ── Attestation verification tests ─────────────────────────────────
 
     #[test]
+    #[serial]
     fn test_verify_attestation_none_rejected_in_military_mode() {
         // Default: MILNET_FIDO_REQUIRE_ATTESTATION is true (hardware required)
         std::env::remove_var("MILNET_FIDO_REQUIRE_ATTESTATION");
@@ -2017,6 +2019,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_verify_attestation_none_accepted_when_disabled() {
         // Explicitly disable hardware attestation requirement
         std::env::set_var("MILNET_FIDO_REQUIRE_ATTESTATION", "false");
@@ -2036,6 +2039,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_verify_attestation_none_object_rejected_in_military_mode() {
         std::env::remove_var("MILNET_FIDO_REQUIRE_ATTESTATION");
         let rp_id = "sso.milnet.example";
@@ -2080,6 +2084,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_verify_packed_self_attestation_object_rejected_in_military_mode() {
         use p256::ecdsa::signature::Signer;
 
@@ -2103,6 +2108,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_verify_packed_self_attestation_object_accepted_when_disabled() {
         use p256::ecdsa::signature::Signer;
 
