@@ -283,6 +283,51 @@ impl Default for HsmConfig {
 }
 
 impl HsmConfig {
+    /// Builder: set backend.
+    pub fn with_backend(mut self, backend: HsmBackend) -> Self {
+        self.backend = backend;
+        self
+    }
+    /// Builder: set PKCS#11 library path.
+    pub fn with_pkcs11_library_path(mut self, path: &str) -> Self {
+        self.pkcs11_library_path = Some(path.to_string());
+        self
+    }
+    /// Builder: set PKCS#11 slot.
+    pub fn with_pkcs11_slot(mut self, slot: u64) -> Self {
+        self.pkcs11_slot = Some(slot);
+        self
+    }
+    /// Builder: set PKCS#11 PIN.
+    pub fn with_pkcs11_pin(mut self, pin: &str) -> Self {
+        self.pkcs11_pin = Some(pin.to_string());
+        self
+    }
+    /// Builder: set AWS KMS key ID.
+    pub fn with_aws_kms_key_id(mut self, key_id: &str) -> Self {
+        self.aws_kms_key_id = Some(key_id.to_string());
+        self
+    }
+    /// Builder: set AWS KMS region.
+    pub fn with_aws_kms_region(mut self, region: &str) -> Self {
+        self.aws_kms_region = Some(region.to_string());
+        self
+    }
+    /// Builder: set TPM2 device path.
+    pub fn with_tpm2_device(mut self, device: &str) -> Self {
+        self.tpm2_device = Some(device.to_string());
+        self
+    }
+    /// Builder: set TPM2 PCR indices.
+    pub fn with_tpm2_pcr_indices(mut self, indices: Vec<u8>) -> Self {
+        self.tpm2_pcr_indices = indices;
+        self
+    }
+    /// Builder: set software seed.
+    pub fn with_software_seed(mut self, seed: Vec<u8>) -> Self {
+        self.software_seed = Some(seed);
+        self
+    }
     /// Validate that the HSM configuration is suitable for production deployment.
     /// Software backend is PROHIBITED in production -- keys must be HSM-backed.
     pub fn validate_for_production(&self) {
@@ -3500,53 +3545,39 @@ mod tests {
 
     #[test]
     fn hsm_config_validate_pkcs11_missing_fields() {
-        let config = HsmConfig {
-            backend: HsmBackend::Pkcs11,
-            ..HsmConfig::default()
-        };
+        let config = HsmConfig::default().with_backend(HsmBackend::Pkcs11);
         let err = config.validate().unwrap_err();
         assert!(matches!(err, HsmError::ConfigurationError(_)));
     }
 
     #[test]
     fn hsm_config_validate_pkcs11_complete() {
-        let config = HsmConfig {
-            backend: HsmBackend::Pkcs11,
-            pkcs11_library_path: Some("/usr/lib/softhsm/libsofthsm2.so".into()),
-            pkcs11_slot: Some(0),
-            pkcs11_pin: Some("1234".into()),
-            ..HsmConfig::default()
-        };
+        let config = HsmConfig::default()
+            .with_backend(HsmBackend::Pkcs11)
+            .with_pkcs11_library_path("/usr/lib/softhsm/libsofthsm2.so")
+            .with_pkcs11_slot(0)
+            .with_pkcs11_pin("1234");
         assert!(config.validate().is_ok());
     }
 
     #[test]
     fn hsm_config_validate_aws_kms_missing_key() {
-        let config = HsmConfig {
-            backend: HsmBackend::AwsKms,
-            ..HsmConfig::default()
-        };
+        let config = HsmConfig::default().with_backend(HsmBackend::AwsKms);
         let err = config.validate().unwrap_err();
         assert!(matches!(err, HsmError::ConfigurationError(_)));
     }
 
     #[test]
     fn hsm_config_validate_tpm2_missing_device() {
-        let config = HsmConfig {
-            backend: HsmBackend::Tpm2,
-            ..HsmConfig::default()
-        };
+        let config = HsmConfig::default().with_backend(HsmBackend::Tpm2);
         let err = config.validate().unwrap_err();
         assert!(matches!(err, HsmError::ConfigurationError(_)));
     }
 
     #[test]
     fn software_backend_seal_unseal_roundtrip() {
-        let config = HsmConfig {
-            backend: HsmBackend::Software,
-            software_seed: Some(b"test-seed-for-hsm-software-backend".to_vec()),
-            ..HsmConfig::default()
-        };
+        let config = HsmConfig::default()
+            .with_software_seed(b"test-seed-for-hsm-software-backend".to_vec());
         let manager = HsmKeyManager::new(config).unwrap();
 
         let plaintext = b"secret-frost-share-data-for-testing";
@@ -3557,11 +3588,8 @@ mod tests {
 
     #[test]
     fn software_backend_wrong_purpose_fails() {
-        let config = HsmConfig {
-            backend: HsmBackend::Software,
-            software_seed: Some(b"test-seed".to_vec()),
-            ..HsmConfig::default()
-        };
+        let config = HsmConfig::default()
+            .with_software_seed(b"test-seed".to_vec());
         let manager = HsmKeyManager::new(config).unwrap();
 
         let sealed = manager.seal_with_hardware(b"data", "correct").unwrap();
@@ -3571,11 +3599,8 @@ mod tests {
 
     #[test]
     fn software_backend_frost_share_roundtrip() {
-        let config = HsmConfig {
-            backend: HsmBackend::Software,
-            software_seed: Some(b"frost-test-seed".to_vec()),
-            ..HsmConfig::default()
-        };
+        let config = HsmConfig::default()
+            .with_software_seed(b"frost-test-seed".to_vec());
         let manager = HsmKeyManager::new(config).unwrap();
 
         let share = b"frost-share-bytes-secret-material-1234567890";
@@ -3586,11 +3611,8 @@ mod tests {
 
     #[test]
     fn software_backend_load_master_key() {
-        let config = HsmConfig {
-            backend: HsmBackend::Software,
-            software_seed: Some(b"master-key-test-seed".to_vec()),
-            ..HsmConfig::default()
-        };
+        let config = HsmConfig::default()
+            .with_software_seed(b"master-key-test-seed".to_vec());
         let manager = HsmKeyManager::new(config).unwrap();
 
         let mk1 = manager.load_master_key().unwrap();
@@ -3606,11 +3628,8 @@ mod tests {
 
     #[test]
     fn software_backend_rotate_produces_new_key() {
-        let config = HsmConfig {
-            backend: HsmBackend::Software,
-            software_seed: Some(b"rotate-test-seed".to_vec()),
-            ..HsmConfig::default()
-        };
+        let config = HsmConfig::default()
+            .with_software_seed(b"rotate-test-seed".to_vec());
         let manager = HsmKeyManager::new(config).unwrap();
 
         let original = manager.load_master_key().unwrap();
@@ -3626,11 +3645,8 @@ mod tests {
 
     #[test]
     fn software_backend_generate_wrapped_dek() {
-        let config = HsmConfig {
-            backend: HsmBackend::Software,
-            software_seed: Some(b"dek-gen-test-seed".to_vec()),
-            ..HsmConfig::default()
-        };
+        let config = HsmConfig::default()
+            .with_software_seed(b"dek-gen-test-seed".to_vec());
         let manager = HsmKeyManager::new(config).unwrap();
 
         let wrapped_dek = manager.generate_wrapped_dek("database-encryption").unwrap();
@@ -3665,11 +3681,8 @@ mod tests {
 
     #[test]
     fn create_key_source_software() {
-        let config = HsmConfig {
-            backend: HsmBackend::Software,
-            software_seed: Some(b"factory-test".to_vec()),
-            ..HsmConfig::default()
-        };
+        let config = HsmConfig::default()
+            .with_software_seed(b"factory-test".to_vec());
         // Use production new() constructor with Software backend (allowed
         // when MILNET_PRODUCTION is not set), then box as ProductionKeySource.
         let source: Box<dyn ProductionKeySource> =
@@ -3690,13 +3703,11 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn make_pkcs11_manager() -> HsmKeyManager {
-        let config = HsmConfig {
-            backend: HsmBackend::Pkcs11,
-            pkcs11_library_path: Some("/usr/lib/softhsm/libsofthsm2.so".into()),
-            pkcs11_slot: Some(0),
-            pkcs11_pin: Some("test-pin-1234".into()),
-            ..HsmConfig::default()
-        };
+        let config = HsmConfig::default()
+            .with_backend(HsmBackend::Pkcs11)
+            .with_pkcs11_library_path("/usr/lib/softhsm/libsofthsm2.so")
+            .with_pkcs11_slot(0)
+            .with_pkcs11_pin("test-pin-1234");
         HsmKeyManager::new(config).unwrap()
     }
 
@@ -3783,12 +3794,10 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn make_aws_kms_manager() -> HsmKeyManager {
-        let config = HsmConfig {
-            backend: HsmBackend::AwsKms,
-            aws_kms_key_id: Some("arn:aws:kms:us-east-1:123456789012:key/test-key-id".into()),
-            aws_kms_region: Some("us-east-1".into()),
-            ..HsmConfig::default()
-        };
+        let config = HsmConfig::default()
+            .with_backend(HsmBackend::AwsKms)
+            .with_aws_kms_key_id("arn:aws:kms:us-east-1:123456789012:key/test-key-id")
+            .with_aws_kms_region("us-east-1");
         HsmKeyManager::new(config).unwrap()
     }
 
@@ -3857,12 +3866,10 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn make_tpm2_manager() -> HsmKeyManager {
-        let config = HsmConfig {
-            backend: HsmBackend::Tpm2,
-            tpm2_device: Some("/dev/tpmrm0".into()),
-            tpm2_pcr_indices: vec![0, 2, 4, 7],
-            ..HsmConfig::default()
-        };
+        let config = HsmConfig::default()
+            .with_backend(HsmBackend::Tpm2)
+            .with_tpm2_device("/dev/tpmrm0")
+            .with_tpm2_pcr_indices(vec![0, 2, 4, 7]);
         HsmKeyManager::new(config).unwrap()
     }
 
@@ -4038,12 +4045,10 @@ mod tests {
 
     #[test]
     fn tpm2_attestation_quote_contains_nonce_and_pcrs() {
-        let config = HsmConfig {
-            backend: HsmBackend::Tpm2,
-            tpm2_device: Some("/dev/tpmrm0".into()),
-            tpm2_pcr_indices: vec![0, 2, 4, 7],
-            ..HsmConfig::default()
-        };
+        let config = HsmConfig::default()
+            .with_backend(HsmBackend::Tpm2)
+            .with_tpm2_device("/dev/tpmrm0")
+            .with_tpm2_pcr_indices(vec![0, 2, 4, 7]);
         let manager = HsmKeyManager::new(config).unwrap();
         let nonce = [0x42u8; 32];
         let quote = manager.generate_attestation_quote(&nonce).unwrap();
@@ -4060,18 +4065,14 @@ mod tests {
 
     #[test]
     fn tpm2_different_pcr_sets_produce_different_keys() {
-        let config1 = HsmConfig {
-            backend: HsmBackend::Tpm2,
-            tpm2_device: Some("/dev/tpmrm0".into()),
-            tpm2_pcr_indices: vec![0, 2, 4, 7],
-            ..HsmConfig::default()
-        };
-        let config2 = HsmConfig {
-            backend: HsmBackend::Tpm2,
-            tpm2_device: Some("/dev/tpmrm0".into()),
-            tpm2_pcr_indices: vec![0, 1, 3, 7], // different PCRs
-            ..HsmConfig::default()
-        };
+        let config1 = HsmConfig::default()
+            .with_backend(HsmBackend::Tpm2)
+            .with_tpm2_device("/dev/tpmrm0")
+            .with_tpm2_pcr_indices(vec![0, 2, 4, 7]);
+        let config2 = HsmConfig::default()
+            .with_backend(HsmBackend::Tpm2)
+            .with_tpm2_device("/dev/tpmrm0")
+            .with_tpm2_pcr_indices(vec![0, 1, 3, 7]);
         let manager1 = HsmKeyManager::new(config1).unwrap();
         let manager2 = HsmKeyManager::new(config2).unwrap();
 
