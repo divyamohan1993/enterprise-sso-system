@@ -101,7 +101,7 @@ fn scim_user(username: &str) -> ScimUser {
 /// The system must treat these as distinct identities (no silent conflation).
 #[test]
 fn opaque_cyrillic_latin_confusable_usernames_are_distinct() {
-    let store = CredentialStore::new();
+    let mut store = CredentialStore::new();
     let latin = "admin";
     let cyrillic = "\u{0430}dmin"; // Cyrillic а followed by Latin dmin
 
@@ -111,8 +111,8 @@ fn opaque_cyrillic_latin_confusable_usernames_are_distinct() {
     // Must be two distinct users
     assert_ne!(uid_latin, uid_cyrillic, "Cyrillic/Latin confusable must not map to same user");
     // Each credential must exist independently
-    assert!(store.get_registration(latin).is_some());
-    assert!(store.get_registration(cyrillic).is_some());
+    assert!(store.get_registration(latin).is_ok());
+    assert!(store.get_registration(cyrillic).is_ok());
 }
 
 /// SCIM: Cyrillic/Latin confusable usernames should be treated as distinct.
@@ -127,7 +127,7 @@ fn scim_cyrillic_latin_confusable_distinct() {
 /// Zero-width joiner (U+200D) in username should not silently collapse.
 #[test]
 fn zero_width_joiner_in_username() {
-    let store = CredentialStore::new();
+    let mut store = CredentialStore::new();
     let plain = "alice";
     let zwj = "ali\u{200D}ce"; // zero-width joiner between 'i' and 'c'
 
@@ -140,7 +140,7 @@ fn zero_width_joiner_in_username() {
 /// Must not silently reverse display or match a different identity.
 #[test]
 fn rtl_override_in_username() {
-    let store = CredentialStore::new();
+    let mut store = CredentialStore::new();
     let normal = "alice";
     let rtl = "\u{202E}ecila"; // RTL override + reversed chars
 
@@ -152,7 +152,7 @@ fn rtl_override_in_username() {
 /// Combining diacriticals: 'a' + combining acute (U+0301) vs 'á' (U+00E1).
 #[test]
 fn combining_diacritical_vs_precomposed() {
-    let store = CredentialStore::new();
+    let mut store = CredentialStore::new();
     let precomposed = "\u{00E1}lice"; // á (precomposed)
     let combining = "a\u{0301}lice"; // a + combining acute accent
 
@@ -167,11 +167,11 @@ fn combining_diacritical_vs_precomposed() {
 /// Mixed-script username with Cyrillic, Latin, and Greek characters.
 #[test]
 fn mixed_script_username() {
-    let store = CredentialStore::new();
+    let mut store = CredentialStore::new();
     // Mix of Latin 'a', Cyrillic 'б', Greek 'γ'
     let mixed = "a\u{0431}\u{03B3}user";
     let uid = store.register_with_password(mixed, b"pw1");
-    assert!(store.get_registration(mixed).is_some());
+    assert!(store.get_registration(mixed).is_ok());
     let _ = uid;
 }
 
@@ -196,7 +196,7 @@ fn scim_zero_width_characters() {
 /// Username consisting entirely of Unicode control characters.
 #[test]
 fn control_character_only_username() {
-    let store = CredentialStore::new();
+    let mut store = CredentialStore::new();
     // Bell, backspace, delete
     let ctrl_name = "\x07\x08\x7F";
     // Must not panic
@@ -211,7 +211,7 @@ fn control_character_only_username() {
 /// Null byte in OPAQUE username must not truncate or cause undefined behavior.
 #[test]
 fn null_byte_in_opaque_username() {
-    let store = CredentialStore::new();
+    let mut store = CredentialStore::new();
     let normal = "admin";
     let with_null = "admin\0evil";
 
@@ -303,12 +303,12 @@ fn null_bytes_in_redirect_uri_positions() {
 /// 1MB username in OPAQUE credential store.
 #[test]
 fn oversized_username_1mb_opaque() {
-    let store = CredentialStore::new();
+    let mut store = CredentialStore::new();
     let huge_name: String = "A".repeat(1_000_000);
     // Must not panic or OOM. Registration may succeed or fail gracefully.
     let uid = store.register_with_password(&huge_name, b"pw");
     // If it succeeded, lookup should work
-    if store.get_registration(&huge_name).is_some() {
+    if store.get_registration(&huge_name).is_ok() {
         let _ = uid;
     }
 }
@@ -375,7 +375,7 @@ fn oversized_scim_json_body() {
     let result: Result<ScimUser, _> = serde_json::from_str(&json);
     // Must not panic. May succeed (large but valid JSON) or fail.
     match result {
-        Ok(u) => assert_eq!(u.display_name.unwrap().len(), 1_000_000),
+        Ok(u) => assert_eq!(u.display_name.clone().unwrap().len(), 1_000_000),
         Err(_) => {} // rejection also acceptable
     }
 }
