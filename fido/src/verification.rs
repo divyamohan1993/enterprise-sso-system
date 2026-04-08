@@ -16,6 +16,7 @@
 use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
 use sha2::{Digest, Sha256};
 use rsa::pkcs1v15::VerifyingKey as RsaVerifyingKey;
+use rsa::traits::PublicKeyParts;
 use rsa::RsaPublicKey;
 use ed25519_dalek::{VerifyingKey as Ed25519VerifyingKey, Signature as Ed25519Signature};
 
