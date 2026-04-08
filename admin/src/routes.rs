@@ -2223,7 +2223,7 @@ async fn initial_setup(
         Ok(uid) => uid,
         Err(e) => {
             tracing::error!("Superuser registration failed: {e}");
-            return (StatusCode::CONFLICT, format!("registration failed: {e}")).into_response();
+            return Err(StatusCode::CONFLICT);
         }
     };
 
@@ -2752,7 +2752,7 @@ async fn register_user(
         Ok(uid) => uid,
         Err(e) => {
             tracing::error!("User registration failed: {e}");
-            return (StatusCode::CONFLICT, format!("registration failed: {e}")).into_response();
+            return Err(StatusCode::CONFLICT);
         }
     };
 
