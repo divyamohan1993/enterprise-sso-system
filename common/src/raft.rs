@@ -3119,7 +3119,7 @@ mod tests {
         // take_committed depending on timing of match_index advancement.
         let committed = n1.take_committed();
         // Verify the system is operational after snapshot by checking log is non-empty
-        assert!(n1.last_log_index() > 0, "system should still accept entries after snapshot");
+        assert!(n1.last_log_index().0 > 0, "system should still accept entries after snapshot");
         std::env::remove_var("MILNET_RAFT_SNAPSHOT_THRESHOLD");
     }
 
