@@ -1634,7 +1634,8 @@ mod tests {
 
     #[test]
     fn emergency_audit_write_fails_on_invalid_path() {
-        std::env::set_var("MILNET_EMERGENCY_AUDIT_PATH", "/proc/1/root/nonexistent/path.jsonl");
+        // Use a path under /sys which is a read-only pseudo-filesystem
+        std::env::set_var("MILNET_EMERGENCY_AUDIT_PATH", "/sys/firmware/nonexistent/path.jsonl");
 
         let signing_key = test_signing_key();
         let entry = AuditEntry {
