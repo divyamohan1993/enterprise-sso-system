@@ -4,3 +4,5 @@
 pub mod bft;
 pub mod blockchain;
 pub mod log;
+
+pub use log::{AuditError, audit_write_or_die};

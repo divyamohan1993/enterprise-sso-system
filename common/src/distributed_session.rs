@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha512;
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 /// HMAC key for computing device fingerprint blind indices.
 /// Initialized once from the OS CSPRNG. In production this MUST come from a KMS.
@@ -92,6 +93,20 @@ impl std::fmt::Debug for DistributedSession {
             .field("classification", &self.classification)
             .field("terminated", &self.terminated)
             .finish()
+    }
+}
+
+/// Zeroize sensitive fields on drop to prevent memory forensics.
+impl Drop for DistributedSession {
+    fn drop(&mut self) {
+        self.device_fingerprint.zeroize();
+        self.encrypted_chain_key.zeroize();
+        let mut buf = *self.session_id.as_bytes();
+        buf.zeroize();
+        self.session_id = Uuid::from_bytes(buf);
+        let mut buf = *self.user_id.as_bytes();
+        buf.zeroize();
+        self.user_id = Uuid::from_bytes(buf);
     }
 }
 
@@ -271,10 +286,16 @@ impl DistributedSessionStore {
         Ok(())
     }
 
-    /// Terminate a session (revoke).
+    /// Terminate a session (revoke). Zeroizes sensitive key material immediately.
     pub fn terminate_session(&mut self, session_id: &Uuid) -> bool {
         if let Some(session) = self.sessions.get_mut(session_id) {
             session.terminated = true;
+            session.encrypted_chain_key.zeroize();
+            session.device_fingerprint.zeroize();
+            tracing::info!(
+                session_id = %session_id,
+                "session terminated and keys zeroized"
+            );
             true
         } else {
             false
@@ -408,8 +429,11 @@ impl DistributedSessionStore {
 
 impl Drop for DistributedSessionStore {
     fn drop(&mut self) {
-        use zeroize::Zeroize;
         self.encryption_key.zeroize();
+        for session in self.sessions.values_mut() {
+            session.encrypted_chain_key.zeroize();
+            session.device_fingerprint.zeroize();
+        }
     }
 }
 
@@ -909,5 +933,86 @@ mod tests {
         // Even correct fingerprint should not resurrect a terminated session
         let s = store.get_session_bound(&session_id, Some(&device_fp));
         assert!(s.is_none(), "terminated session must not be accessible");
+    }
+
+    // ── Zeroization tests ──────────────────────────────────────────────
+
+    #[test]
+    fn drop_zeroizes_distributed_session_runs_without_panic() {
+        let session = DistributedSession {
+            session_id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            tier: 2,
+            created_at: 1_000_000,
+            expires_at: 2_000_000,
+            last_activity: 1_000_000,
+            ratchet_epoch: 1,
+            encrypted_chain_key: vec![0xFFu8; 64],
+            device_fingerprint: [0xAA; 32],
+            classification: 1,
+            terminated: false,
+        };
+        drop(session);
+    }
+
+    #[test]
+    fn terminate_session_zeroizes_keys() {
+        let mut store = make_store();
+        let user_id = Uuid::new_v4();
+        let fingerprint = [0xBBu8; 32];
+
+        let session_id = store
+            .create_session(user_id, 2, fingerprint, b"chain-key-material", 1)
+            .unwrap();
+
+        store.terminate_session(&session_id);
+
+        let session = store.sessions.get(&session_id).unwrap();
+        assert!(session.terminated);
+        assert!(
+            session.encrypted_chain_key.iter().all(|&b| b == 0),
+            "encrypted_chain_key must be zeroized after terminate"
+        );
+        assert_eq!(
+            session.device_fingerprint,
+            [0u8; 32],
+            "device_fingerprint must be zeroized after terminate"
+        );
+    }
+
+    #[test]
+    fn drop_zeroizes_empty_fields_without_panic() {
+        let session = DistributedSession {
+            session_id: Uuid::nil(),
+            user_id: Uuid::nil(),
+            tier: 0,
+            created_at: 0,
+            expires_at: 0,
+            last_activity: 0,
+            ratchet_epoch: 0,
+            encrypted_chain_key: Vec::new(),
+            device_fingerprint: [0u8; 32],
+            classification: 0,
+            terminated: false,
+        };
+        drop(session);
+    }
+
+    #[test]
+    fn drop_zeroizes_large_chain_key_no_panic() {
+        let session = DistributedSession {
+            session_id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            tier: 1,
+            created_at: 0,
+            expires_at: 0,
+            last_activity: 0,
+            ratchet_epoch: 0,
+            encrypted_chain_key: vec![0xFFu8; 1_000_000],
+            device_fingerprint: [0xCC; 32],
+            classification: 0,
+            terminated: false,
+        };
+        drop(session);
     }
 }

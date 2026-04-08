@@ -25,9 +25,42 @@ const ELECTION_FAILURE_THRESHOLD: u32 = 5;
 /// Consecutive FROST signing failures before emergency activation.
 const SIGNING_FAILURE_THRESHOLD: u32 = 3;
 
+/// Default minimum healthy peers required (below this = emergency).
+/// Configurable via `MILNET_MIN_HEALTHY_PEERS` environment variable.
+const DEFAULT_MIN_HEALTHY_PEERS: u32 = 3;
+
 /// Minimum healthy peers required (below this = emergency).
-/// For a 5-node cluster with 3-of-5 threshold, need at least 3.
-const MIN_HEALTHY_PEERS: u32 = 3;
+/// Configurable via `MILNET_MIN_HEALTHY_PEERS` environment variable at startup.
+fn min_healthy_peers() -> u32 {
+    static CACHED: OnceLock<u32> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        match std::env::var("MILNET_MIN_HEALTHY_PEERS") {
+            Ok(val) => match val.parse::<u32>() {
+                Ok(v) if v >= 1 => {
+                    tracing::info!(
+                        min_healthy_peers = v,
+                        "MIN_HEALTHY_PEERS configured from environment"
+                    );
+                    v
+                }
+                Ok(0) => {
+                    tracing::error!(
+                        "MILNET_MIN_HEALTHY_PEERS=0 is invalid (must be >= 1), using default 3"
+                    );
+                    DEFAULT_MIN_HEALTHY_PEERS
+                }
+                _ => {
+                    tracing::error!(
+                        value = %val,
+                        "MILNET_MIN_HEALTHY_PEERS invalid, using default 3"
+                    );
+                    DEFAULT_MIN_HEALTHY_PEERS
+                }
+            },
+            Err(_) => DEFAULT_MIN_HEALTHY_PEERS,
+        }
+    })
+}
 
 /// Dead man switch timeout: 5 minutes with no valid peer heartbeat.
 const DEAD_MAN_SWITCH_TIMEOUT: Duration = Duration::from_secs(300);
@@ -121,7 +154,7 @@ impl EmergencyMode {
             reason: AtomicU8::new(0),
             consecutive_election_failures: AtomicU32::new(0),
             consecutive_signing_failures: AtomicU32::new(0),
-            healthy_peer_count: AtomicU32::new(MIN_HEALTHY_PEERS),
+            healthy_peer_count: AtomicU32::new(min_healthy_peers()),
             dead_man_switch_deadline: AtomicU64::new(deadline),
         }
     }
@@ -143,7 +176,7 @@ impl EmergencyMode {
             Some(EmergencyReason::QuorumLoss)
         } else if signing_fails > SIGNING_FAILURE_THRESHOLD {
             Some(EmergencyReason::QuorumLoss)
-        } else if peers < MIN_HEALTHY_PEERS {
+        } else if peers < min_healthy_peers() {
             if election_fails > 2 && signing_fails > 1 {
                 Some(EmergencyReason::MassCompromise)
             } else {
@@ -284,7 +317,7 @@ impl EmergencyMode {
     /// - Emergency mode is currently active
     /// - Reason is NOT `ManualTrigger` (use `manual_deactivate` for that)
     /// - All conditions are resolved: election_failures == 0, signing_failures == 0,
-    ///   healthy_peers >= MIN_HEALTHY_PEERS
+    ///   healthy_peers >= min_healthy_peers()
     /// - Emergency has been active for at least 30 seconds (cooldown)
     ///
     /// Returns `true` if deactivation succeeded.
@@ -304,7 +337,7 @@ impl EmergencyMode {
         let signing_fails = self.consecutive_signing_failures.load(Ordering::SeqCst);
         let peers = self.healthy_peer_count.load(Ordering::SeqCst);
 
-        if election_fails != 0 || signing_fails != 0 || peers < MIN_HEALTHY_PEERS {
+        if election_fails != 0 || signing_fails != 0 || peers < min_healthy_peers() {
             return false;
         }
 
@@ -468,7 +501,7 @@ mod tests {
     #[test]
     fn low_peer_count_triggers_emergency() {
         let em = EmergencyMode::new();
-        em.update_healthy_peers(2); // below MIN_HEALTHY_PEERS (3)
+        em.update_healthy_peers(2); // below DEFAULT_MIN_HEALTHY_PEERS (3)
         assert!(em.check_and_activate());
         assert!(em.is_active());
     }
@@ -624,7 +657,7 @@ mod tests {
         // Resolve all conditions
         em.consecutive_election_failures.store(0, Ordering::SeqCst);
         em.consecutive_signing_failures.store(0, Ordering::SeqCst);
-        em.update_healthy_peers(MIN_HEALTHY_PEERS);
+        em.update_healthy_peers(DEFAULT_MIN_HEALTHY_PEERS);
 
         // Simulate cooldown elapsed: set activated_at to 31 seconds ago
         let past = EmergencyMode::now_micros()
@@ -653,7 +686,7 @@ mod tests {
         assert!(em.is_active());
 
         // Fix peers but leave election failures
-        em.update_healthy_peers(MIN_HEALTHY_PEERS);
+        em.update_healthy_peers(DEFAULT_MIN_HEALTHY_PEERS);
         em.consecutive_election_failures.store(1, Ordering::SeqCst);
         assert!(!em.try_deactivate());
         assert!(em.is_active());
@@ -674,7 +707,7 @@ mod tests {
         // Resolve conditions but do NOT bypass cooldown
         em.consecutive_election_failures.store(0, Ordering::SeqCst);
         em.consecutive_signing_failures.store(0, Ordering::SeqCst);
-        em.update_healthy_peers(MIN_HEALTHY_PEERS);
+        em.update_healthy_peers(DEFAULT_MIN_HEALTHY_PEERS);
 
         // activated_at is "now", so cooldown has not elapsed
         assert!(!em.try_deactivate());
@@ -692,7 +725,7 @@ mod tests {
         // Resolve and deactivate
         em.consecutive_election_failures.store(0, Ordering::SeqCst);
         em.consecutive_signing_failures.store(0, Ordering::SeqCst);
-        em.update_healthy_peers(MIN_HEALTHY_PEERS);
+        em.update_healthy_peers(DEFAULT_MIN_HEALTHY_PEERS);
         let past = EmergencyMode::now_micros()
             .saturating_sub(Duration::from_secs(31).as_micros() as u64);
         em.activated_at_micros.store(past, Ordering::SeqCst);
@@ -717,7 +750,7 @@ mod tests {
         // Resolve all conditions and bypass cooldown
         em.consecutive_election_failures.store(0, Ordering::SeqCst);
         em.consecutive_signing_failures.store(0, Ordering::SeqCst);
-        em.update_healthy_peers(MIN_HEALTHY_PEERS);
+        em.update_healthy_peers(DEFAULT_MIN_HEALTHY_PEERS);
         let past = EmergencyMode::now_micros()
             .saturating_sub(Duration::from_secs(31).as_micros() as u64);
         em.activated_at_micros.store(past, Ordering::SeqCst);
@@ -775,7 +808,7 @@ mod tests {
         // Resolve and deactivate
         em.consecutive_election_failures.store(0, Ordering::SeqCst);
         em.consecutive_signing_failures.store(0, Ordering::SeqCst);
-        em.update_healthy_peers(MIN_HEALTHY_PEERS);
+        em.update_healthy_peers(DEFAULT_MIN_HEALTHY_PEERS);
         let past = EmergencyMode::now_micros()
             .saturating_sub(Duration::from_secs(31).as_micros() as u64);
         em.activated_at_micros.store(past, Ordering::SeqCst);
@@ -784,5 +817,20 @@ mod tests {
         // Dead man switch should be reset to future, so tick should NOT fire
         em.dead_man_switch_tick();
         assert!(!em.is_active());
+    }
+
+    #[test]
+    fn min_healthy_peers_default_is_three() {
+        assert_eq!(DEFAULT_MIN_HEALTHY_PEERS, 3);
+    }
+
+    #[test]
+    fn emergency_mode_respects_default_min_peers() {
+        let em = EmergencyMode::new();
+        em.update_healthy_peers(DEFAULT_MIN_HEALTHY_PEERS);
+        assert!(!em.check_and_activate());
+
+        em.update_healthy_peers(DEFAULT_MIN_HEALTHY_PEERS - 1);
+        assert!(em.check_and_activate());
     }
 }

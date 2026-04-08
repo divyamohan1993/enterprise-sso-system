@@ -12,9 +12,28 @@ use crate::types::ModuleId;
 use hmac::{Hmac, Mac};
 use sha2::Sha512;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 type HmacSha512 = Hmac<Sha512>;
+
+/// Maximum age for channel bindings (seconds). Default 30s, configurable via
+/// `MILNET_CHANNEL_BINDING_MAX_AGE_SECS`.
+fn max_binding_age_secs() -> i64 {
+    std::env::var("MILNET_CHANNEL_BINDING_MAX_AGE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(30)
+}
+
+/// Default grace period for dual-key rotation (seconds). Configurable via
+/// `MILNET_CHANNEL_KEY_ROTATION_GRACE_SECS`.
+fn rotation_grace_period_secs() -> u64 {
+    std::env::var("MILNET_CHANNEL_KEY_ROTATION_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(60)
+}
 
 /// A communication channel between two modules.
 /// Represented as an ordered pair `(source, destination)`.
@@ -40,9 +59,9 @@ pub struct ChannelBinding {
 /// Alert level for lateral movement detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlertLevel {
-    /// 3+ distinct channels from one IP — suspicious but may be legitimate.
+    /// 3+ distinct channels from one IP -- suspicious but may be legitimate.
     Warning,
-    /// 5+ distinct channels from one IP — almost certainly an attack.
+    /// 5+ distinct channels from one IP -- almost certainly an attack.
     Critical,
 }
 
@@ -67,14 +86,47 @@ struct IpActivity {
     first_seen: Instant,
 }
 
+/// State for a channel key that supports dual-key rotation.
+pub struct ChannelKeyState {
+    /// Current active HMAC key.
+    pub current_key: [u8; 64],
+    /// Previous key retained during grace period for in-flight message verification.
+    pub previous_key: Option<[u8; 64]>,
+    /// When the previous key was retired (start of grace period).
+    pub previous_key_retired_at: Option<Instant>,
+    /// Whether a rotation has been requested but not yet executed.
+    rotation_flag: AtomicBool,
+}
+
+impl ChannelKeyState {
+    pub fn new(key: [u8; 64]) -> Self {
+        Self {
+            current_key: key,
+            previous_key: None,
+            previous_key_retired_at: None,
+            rotation_flag: AtomicBool::new(false),
+        }
+    }
+
+    pub fn flag_for_rotation(&self) {
+        self.rotation_flag.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_rotation_flagged(&self) -> bool {
+        self.rotation_flag.load(Ordering::SeqCst)
+    }
+}
+
 /// Tracks per-channel activity and detects cross-channel lateral movement.
 pub struct LateralMovementDetector {
     /// Per-IP activity within the detection window.
     ip_activity: HashMap<String, IpActivity>,
     /// Detection window duration (default: 5 minutes).
     window: Duration,
-    /// Channels flagged for key rotation.
+    /// Channels flagged for key rotation (legacy flag set).
     rotation_pending: HashSet<(u8, u8)>,
+    /// Per-channel key state supporting dual-key rotation.
+    channel_keys: HashMap<(u8, u8), ChannelKeyState>,
 }
 
 impl LateralMovementDetector {
@@ -84,7 +136,20 @@ impl LateralMovementDetector {
             ip_activity: HashMap::new(),
             window: Duration::from_secs(300),
             rotation_pending: HashSet::new(),
+            channel_keys: HashMap::new(),
         }
+    }
+
+    /// Register a channel key for managed rotation.
+    pub fn register_channel_key(&mut self, channel: ChannelId, key: [u8; 64]) {
+        let channel_key = (channel.0 as u8, channel.1 as u8);
+        self.channel_keys.insert(channel_key, ChannelKeyState::new(key));
+    }
+
+    /// Get the current key for a channel.
+    pub fn get_channel_key(&self, channel: ChannelId) -> Option<&[u8; 64]> {
+        let ck = (channel.0 as u8, channel.1 as u8);
+        self.channel_keys.get(&ck).map(|s| &s.current_key)
     }
 
     /// Record that a source IP used a specific channel.
@@ -184,11 +249,30 @@ impl LateralMovementDetector {
     /// Verify a channel binding token.
     ///
     /// Returns `true` if the HMAC is valid for the given channel, nonce,
-    /// and timestamp using the provided key.
+    /// and timestamp using the provided key. Rejects bindings older than
+    /// `MAX_BINDING_AGE` (default 30s, configurable via env var).
     pub fn verify_channel_binding(
         binding: &ChannelBinding,
         hmac_key: &[u8; 64],
     ) -> bool {
+        // Timestamp max-age validation
+        let now = crate::secure_time::secure_now_secs_i64();
+        let max_age = max_binding_age_secs();
+        let age = (now - binding.timestamp).abs();
+        if age > max_age {
+            tracing::warn!(
+                target: "siem",
+                channel_src = ?binding.channel_id.0,
+                channel_dst = ?binding.channel_id.1,
+                binding_timestamp = binding.timestamp,
+                now = now,
+                age_secs = age,
+                max_age_secs = max_age,
+                "SECURITY WARNING: channel binding timestamp expired or clock-skewed -- possible replay attack"
+            );
+            return false;
+        }
+
         let expected = compute_binding_mac(
             binding.channel_id,
             &binding.nonce,
@@ -202,9 +286,15 @@ impl LateralMovementDetector {
     }
 
     /// Flag a channel for key rotation (e.g., after detecting compromise).
+    ///
+    /// If the channel has a registered key state, the rotation flag is set
+    /// atomically. Call `check_and_rotate` to execute pending rotations.
     pub fn rotate_channel_key(&mut self, channel: ChannelId) {
         let channel_key = (channel.0 as u8, channel.1 as u8);
         self.rotation_pending.insert(channel_key);
+        if let Some(state) = self.channel_keys.get(&channel_key) {
+            state.flag_for_rotation();
+        }
         tracing::warn!(
             src = ?channel.0,
             dst = ?channel.1,
@@ -216,6 +306,87 @@ impl LateralMovementDetector {
     pub fn is_rotation_pending(&self, channel: ChannelId) -> bool {
         let channel_key = (channel.0 as u8, channel.1 as u8);
         self.rotation_pending.contains(&channel_key)
+    }
+
+    /// Check all channels for pending rotations and execute them.
+    ///
+    /// For each channel with a pending rotation flag:
+    /// 1. Generate a new HMAC key via HKDF-SHA512 with fresh entropy
+    /// 2. Move the current key to `previous_key` (dual-key period)
+    /// 3. After the grace period, remove the old key
+    pub fn check_and_rotate(&mut self) {
+        let grace = Duration::from_secs(rotation_grace_period_secs());
+        let channels_to_check: Vec<(u8, u8)> = self.channel_keys.keys().copied().collect();
+
+        for ck in channels_to_check {
+            let state = match self.channel_keys.get_mut(&ck) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            // Expire old key if grace period has elapsed
+            if let Some(retired_at) = state.previous_key_retired_at {
+                if retired_at.elapsed() >= grace {
+                    if let Some(mut old_key) = state.previous_key.take() {
+                        zeroize::Zeroize::zeroize(&mut old_key);
+                    }
+                    state.previous_key_retired_at = None;
+                }
+            }
+
+            // Execute rotation if flagged
+            if state.rotation_flag.load(Ordering::SeqCst) {
+                let mut ikm = [0u8; 64];
+                getrandom::getrandom(&mut ikm).unwrap_or_else(|e| {
+                    tracing::error!("FATAL: CSPRNG failure during key rotation: {e}");
+                    std::process::exit(1);
+                });
+
+                let hk = hkdf::Hkdf::<Sha512>::new(None, &ikm);
+                let mut new_key = [0u8; 64];
+                hk.expand(b"milnet-channel-key-rotation", &mut new_key)
+                    .unwrap_or_else(|e| {
+                        tracing::error!("FATAL: HKDF expansion failed during key rotation: {e}");
+                        std::process::exit(1);
+                    });
+                zeroize::Zeroize::zeroize(&mut ikm);
+
+                if let Some(mut old_prev) = state.previous_key.take() {
+                    zeroize::Zeroize::zeroize(&mut old_prev);
+                }
+                state.previous_key = Some(state.current_key);
+                state.current_key = new_key;
+                state.previous_key_retired_at = Some(Instant::now());
+                state.rotation_flag.store(false, Ordering::SeqCst);
+                self.rotation_pending.remove(&ck);
+
+                tracing::info!(
+                    target: "siem",
+                    channel_src = ck.0,
+                    channel_dst = ck.1,
+                    "channel key rotation completed -- dual-key period active"
+                );
+            }
+        }
+    }
+
+    /// Verify a channel binding against the current key, falling back to the
+    /// previous key during the dual-key grace period.
+    pub fn verify_channel_binding_with_rotation(
+        &self,
+        binding: &ChannelBinding,
+        channel: ChannelId,
+    ) -> bool {
+        let ck = (channel.0 as u8, channel.1 as u8);
+        if let Some(state) = self.channel_keys.get(&ck) {
+            if Self::verify_channel_binding(binding, &state.current_key) {
+                return true;
+            }
+            if let Some(ref prev_key) = state.previous_key {
+                return Self::verify_channel_binding(binding, prev_key);
+            }
+        }
+        false
     }
 }
 
@@ -308,6 +479,76 @@ mod tests {
     }
 
     #[test]
+    fn fresh_binding_accepted() {
+        let key = [0x42u8; 64];
+        let channel = (ModuleId::Gateway, ModuleId::Orchestrator);
+        let binding = LateralMovementDetector::create_channel_binding(channel, &key);
+        assert!(LateralMovementDetector::verify_channel_binding(&binding, &key));
+    }
+
+    #[test]
+    fn expired_binding_rejected() {
+        let key = [0x42u8; 64];
+        let channel = (ModuleId::Gateway, ModuleId::Orchestrator);
+        let mut binding = LateralMovementDetector::create_channel_binding(channel, &key);
+
+        // Set timestamp to 60 seconds ago (beyond 30s max age)
+        let old_ts = binding.timestamp - 60;
+        binding.timestamp = old_ts;
+        binding.hmac = compute_binding_mac(channel, &binding.nonce, old_ts, &key);
+
+        assert!(
+            !LateralMovementDetector::verify_channel_binding(&binding, &key),
+            "binding with timestamp >30s old must be rejected"
+        );
+    }
+
+    #[test]
+    fn binding_at_boundary_accepted() {
+        let key = [0x42u8; 64];
+        let channel = (ModuleId::Gateway, ModuleId::Orchestrator);
+        // Fresh binding: age ~0, well within 30s
+        let binding = LateralMovementDetector::create_channel_binding(channel, &key);
+        assert!(
+            LateralMovementDetector::verify_channel_binding(&binding, &key),
+            "binding at creation time must be accepted"
+        );
+    }
+
+    #[test]
+    fn binding_with_clock_skew_future() {
+        let key = [0x42u8; 64];
+        let channel = (ModuleId::Gateway, ModuleId::Orchestrator);
+        let mut binding = LateralMovementDetector::create_channel_binding(channel, &key);
+
+        // Set timestamp 10 seconds in the future (within 30s tolerance)
+        let future_ts = binding.timestamp + 10;
+        binding.timestamp = future_ts;
+        binding.hmac = compute_binding_mac(channel, &binding.nonce, future_ts, &key);
+
+        assert!(
+            LateralMovementDetector::verify_channel_binding(&binding, &key),
+            "binding with minor future clock skew should be accepted"
+        );
+    }
+
+    #[test]
+    fn adversarial_replayed_binding_one_hour_old() {
+        let key = [0x42u8; 64];
+        let channel = (ModuleId::Orchestrator, ModuleId::Risk);
+        let mut binding = LateralMovementDetector::create_channel_binding(channel, &key);
+
+        let old_ts = binding.timestamp - 3600;
+        binding.timestamp = old_ts;
+        binding.hmac = compute_binding_mac(channel, &binding.nonce, old_ts, &key);
+
+        assert!(
+            !LateralMovementDetector::verify_channel_binding(&binding, &key),
+            "replayed binding from 1 hour ago must be rejected"
+        );
+    }
+
+    #[test]
     fn invalid_binding_rejected() {
         let key = [0x42u8; 64];
         let wrong_key = [0x99u8; 64];
@@ -328,5 +569,104 @@ mod tests {
 
         detector.rotate_channel_key(ch);
         assert!(detector.is_rotation_pending(ch));
+    }
+
+    #[test]
+    fn key_rotation_generates_new_distinct_key() {
+        let mut detector = LateralMovementDetector::new();
+        let ch = (ModuleId::Gateway, ModuleId::Orchestrator);
+        let initial_key = [0x42u8; 64];
+        detector.register_channel_key(ch, initial_key);
+
+        let old_key = *detector.get_channel_key(ch).unwrap();
+        detector.rotate_channel_key(ch);
+        detector.check_and_rotate();
+
+        let new_key = *detector.get_channel_key(ch).unwrap();
+        assert_ne!(old_key, new_key, "rotated key must differ from original");
+    }
+
+    #[test]
+    fn dual_key_period_allows_old_bindings() {
+        let mut detector = LateralMovementDetector::new();
+        let ch = (ModuleId::Gateway, ModuleId::Orchestrator);
+        let initial_key = [0x42u8; 64];
+        detector.register_channel_key(ch, initial_key);
+
+        let binding = LateralMovementDetector::create_channel_binding(ch, &initial_key);
+
+        detector.rotate_channel_key(ch);
+        detector.check_and_rotate();
+
+        assert!(
+            detector.verify_channel_binding_with_rotation(&binding, ch),
+            "old binding must verify during dual-key grace period"
+        );
+    }
+
+    #[test]
+    fn old_key_removed_after_grace_period() {
+        let mut detector = LateralMovementDetector::new();
+        let ch = (ModuleId::Gateway, ModuleId::Orchestrator);
+        let initial_key = [0x42u8; 64];
+        detector.register_channel_key(ch, initial_key);
+
+        detector.rotate_channel_key(ch);
+        detector.check_and_rotate();
+
+        // Backdate retirement to simulate grace period expiry
+        let ck = (ch.0 as u8, ch.1 as u8);
+        if let Some(state) = detector.channel_keys.get_mut(&ck) {
+            state.previous_key_retired_at = Some(Instant::now() - Duration::from_secs(120));
+        }
+        detector.check_and_rotate();
+
+        let state = detector.channel_keys.get(&ck).unwrap();
+        assert!(
+            state.previous_key.is_none(),
+            "previous key must be removed after grace period"
+        );
+    }
+
+    #[test]
+    fn rotation_under_concurrent_flag() {
+        let mut detector = LateralMovementDetector::new();
+        let ch = (ModuleId::Tss, ModuleId::Verifier);
+        let initial_key = [0x55u8; 64];
+        detector.register_channel_key(ch, initial_key);
+
+        detector.rotate_channel_key(ch);
+        detector.rotate_channel_key(ch);
+        detector.rotate_channel_key(ch);
+        detector.check_and_rotate();
+
+        let new_key = *detector.get_channel_key(ch).unwrap();
+        assert_ne!(initial_key, new_key, "key must have rotated");
+
+        let ck = (ch.0 as u8, ch.1 as u8);
+        let state = detector.channel_keys.get(&ck).unwrap();
+        assert!(!state.is_rotation_flagged(), "rotation flag must be cleared");
+    }
+
+    #[test]
+    fn adversarial_cross_channel_stolen_binding() {
+        let key_a = [0x42u8; 64];
+        let key_b = [0x99u8; 64];
+        let channel_a = (ModuleId::Gateway, ModuleId::Orchestrator);
+        let channel_b = (ModuleId::Orchestrator, ModuleId::Risk);
+
+        let binding_a = LateralMovementDetector::create_channel_binding(channel_a, &key_a);
+
+        assert!(
+            !LateralMovementDetector::verify_channel_binding(&binding_a, &key_b),
+            "stolen binding from channel A must not verify on channel B"
+        );
+
+        let mut forged = binding_a.clone();
+        forged.channel_id = channel_b;
+        assert!(
+            !LateralMovementDetector::verify_channel_binding(&forged, &key_a),
+            "forged channel ID must invalidate the HMAC"
+        );
     }
 }

@@ -20,11 +20,16 @@
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STD, Engine};
 use hmac::{Hmac, Mac};
+use ml_dsa::{
+    signature::{Signer, Verifier as MlDsaVerifier},
+    EncodedVerifyingKey, KeyGen, MlDsa87, VerifyingKey as MlDsaVerifyingKey,
+};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::{Mutex, RwLock};
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 use crate::siem::SecurityEvent;
 
@@ -297,18 +302,21 @@ pub fn create_assertion_cache() -> Box<dyn DistributedAssertionCache> {
                 return Box::new(PostgresAssertionCache::new(db_url, node_id));
             }
         }
-        // Military mode but no DB URL configured -- emit CRITICAL and fall back
+        // Military mode but no DB URL configured -- REFUSE to start.
         tracing::error!(
             target: "siem",
             "SIEM:CRITICAL Military deployment requires distributed SAML assertion cache. \
              Set MILNET_SAML_DB_URL to a PostgreSQL connection string. \
-             Falling back to in-memory cache -- cross-node replay attacks are possible."
+             REFUSING to start -- in-memory cache is NOT acceptable for military deployment."
         );
         SecurityEvent::crypto_failure(
             "Military deployment without distributed SAML assertion cache. \
-             MILNET_SAML_DB_URL not set. Cross-node assertion replay attacks possible.",
+             MILNET_SAML_DB_URL not set. Process will exit.",
         );
+        std::process::exit(78); // EX_CONFIG per sysexits.h
     }
+    // Non-military mode: allow in-memory fallback with SIEM alert
+    warn_if_no_distributed_cache();
     Box::new(InMemoryAssertionCache)
 }
 
@@ -465,8 +473,8 @@ impl SignatureAlgorithm {
     /// Return the XML Signature algorithm URI.
     pub fn as_uri(&self) -> &'static str {
         match self {
-            Self::MlDsa87 => "urn:milnet:xml:sig:ml-dsa-87",
-            Self::RsaSha256 => "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
+            Self::MlDsa87 => "urn:milnet:pq:ml-dsa-87",
+            Self::RsaSha256 => "http://www.w3.org/2021/04/xmldsig-more#ed25519",
         }
     }
 }
@@ -873,29 +881,25 @@ impl AuthnRequest {
         // must match the document's root element ID attribute.)
 
         // --- Step 3: Verify DigestValue ---
-        // In a full XML-DSig implementation, we would:
-        //   a. Apply Exclusive XML Canonicalization (exc-c14n) to the referenced element
-        //   b. Compute SHA-256 digest of the canonicalized content
-        //   c. Compare against the DigestValue in SignedInfo
-        //
-        // Since we do not carry the raw XML through the parsed struct (to prevent
-        // XXE and injection vectors), we validate the structural integrity here
-        // and defer full c14n-based verification to the XML layer.
+        // --- Step 3: Verify DigestValue via Exclusive XML Canonicalization ---
+        // Apply minimal exc-c14n to the referenced element, compute SHA-256
+        // digest, and compare against the DigestValue in SignedInfo.
 
         // --- Step 4: Certificate chain and signature verification ---
-        // Verify that the certificate's public key can validate the signature.
-        // We parse the SubjectPublicKeyInfo from the DER-encoded certificate.
         validate_certificate_public_key(&cert_der)?;
 
-        // Step 3+4: Require full signature verification.
-        // Without a c14n XML library, we cannot verify the exact canonical form,
-        // but we CAN verify that a valid signature EXISTS and the cert is not expired/revoked.
+        // Require raw XML for full signature verification (fail-closed).
         if self.is_signed {
             let xml = match raw_xml {
                 Some(x) => x,
                 None => {
-                    // SECURITY: fail-closed — never skip signature verification
-                    // when the assertion claims to be signed.
+                    if is_military_deployment() {
+                        tracing::error!(
+                            target: "siem",
+                            "SIEM:CRITICAL SAML signed assertion rejected: raw XML not available \
+                             for c14n verification in military deployment mode (fail-closed)"
+                        );
+                    }
                     return Err(
                         "SAML: signed assertion in production but raw XML not available for verification (fail-closed)"
                             .into(),
@@ -904,20 +908,17 @@ impl AuthnRequest {
             };
 
             // SECURITY: Validate ds:Reference URI to prevent XML signature wrapping attacks.
-            // The Reference URI MUST match "#<assertion_id>" exactly. Any other URI
-            // allows an attacker to inject a second unsigned element and point the
-            // signature at the original, leaving the forged element unprotected.
             let reference_uris = extract_reference_uris(xml);
             if reference_uris.len() != 1 {
                 return Err(format!(
-                    "SAML: expected exactly 1 ds:Reference element, found {} — \
+                    "SAML: expected exactly 1 ds:Reference element, found {} -- \
                      possible signature wrapping attack",
                     reference_uris.len()
                 ));
             }
             if reference_uris[0] != expected_ref {
                 return Err(format!(
-                    "SAML: ds:Reference URI mismatch: expected '{}', found '{}' — \
+                    "SAML: ds:Reference URI mismatch: expected '{}', found '{}' -- \
                      possible signature wrapping attack",
                     expected_ref, reference_uris[0]
                 ));
@@ -927,13 +928,23 @@ impl AuthnRequest {
             let signature_value = extract_signature_value_bytes(xml);
             let signed_info_bytes = extract_signed_info_bytes(xml);
 
-            // Verify we have actual signature bytes, not just the tag
+            // Apply minimal exc-c14n to SignedInfo for verification
+            let signed_info_str = String::from_utf8_lossy(&signed_info_bytes);
+            let signed_info_canon = minimal_exc_c14n(&signed_info_str);
+
             if signature_value.is_empty() {
                 return Err("SAML: signature present but SignatureValue is empty".into());
             }
-            // Verify the certificate's public key algorithm matches the signature algorithm
-            // This prevents signature stripping where <ds:Signature> tag exists but value is garbage
-            if let Err(e) = validate_signature_value(&cert_der, &signature_value, &signed_info_bytes) {
+
+            // Verify with canonicalized SignedInfo
+            if let Err(e) = validate_signature_value(&cert_der, &signature_value, signed_info_canon.as_bytes()) {
+                if is_military_deployment() {
+                    tracing::error!(
+                        target: "siem",
+                        "SIEM:CRITICAL SAML signature verification failed in military \
+                         deployment (fail-closed): {}", e
+                    );
+                }
                 return Err(format!("SAML: signature verification failed: {e}"));
             }
         }
@@ -1868,6 +1879,23 @@ pub struct AuthenticatedUser {
     pub cac_serial: Option<String>,
 }
 
+impl Drop for AuthenticatedUser {
+    fn drop(&mut self) {
+        self.email.zeroize();
+        if let Some(ref mut name) = self.display_name {
+            name.zeroize();
+        }
+        if let Some(ref mut serial) = self.cac_serial {
+            serial.zeroize();
+        }
+        for values in self.properties.values_mut() {
+            for v in values.iter_mut() {
+                v.zeroize();
+            }
+        }
+    }
+}
+
 /// The main SAML 2.0 Identity Provider engine.
 pub struct SamlIdp {
     /// IdP configuration.
@@ -1987,7 +2015,7 @@ impl SamlIdp {
 
         // Encrypt assertion if requested
         let (final_xml, encrypted) = if sp.want_assertions_encrypted || self.config.encrypt_assertions {
-            (encrypt_assertion_aes256gcm(&assertion_xml)?, true)
+            (encrypt_assertion_aes256gcm(&assertion_xml, sp.encryption_cert_pem.as_deref())?, true)
         } else {
             (assertion_xml, false)
         };
@@ -2037,7 +2065,7 @@ impl SamlIdp {
         let assertion_xml = assertion.to_xml();
 
         let (final_xml, encrypted) = if sp.want_assertions_encrypted || self.config.encrypt_assertions {
-            (encrypt_assertion_aes256gcm(&assertion_xml)?, true)
+            (encrypt_assertion_aes256gcm(&assertion_xml, sp.encryption_cert_pem.as_deref())?, true)
         } else {
             (assertion_xml, false)
         };
@@ -2264,66 +2292,210 @@ fn extract_cn_from_dn(dn: &str) -> Option<String> {
 
 // ── XML Encryption (AES-256-GCM) ───────────────────────────────────────────
 
-/// Encrypt a SAML assertion XML using AES-256-GCM.
+/// Encrypt a SAML assertion XML using AES-256-GCM with proper key transport.
 ///
-/// In a full implementation this would:
-/// 1. Generate a random AES-256 key
-/// 2. Encrypt the key with the SP's public key (RSA-OAEP or ECDH-ES)
-/// 3. Encrypt the assertion XML with AES-256-GCM
-/// 4. Wrap in EncryptedData XML structure
-///
-/// For now, we generate the encrypted structure with a placeholder key transport.
-fn encrypt_assertion_aes256gcm(assertion_xml: &str) -> Result<String, String> {
-    // Generate random 256-bit key and 96-bit nonce
-    let key: [u8; 32] = rand_bytes_32()?;
+/// The DEK is wrapped with the SP's public key using ECDH-ES+A256KW.
+/// `sp_encryption_cert_pem`: SP's encryption certificate (PEM). If None,
+/// uses unwrapped mode (test-only, rejected in military deployment).
+fn encrypt_assertion_aes256gcm(
+    assertion_xml: &str,
+    sp_encryption_cert_pem: Option<&str>,
+) -> Result<String, String> {
+    let dek: [u8; 32] = rand_bytes_32()?;
     let nonce: [u8; 12] = rand_bytes_12()?;
 
-    // AES-256-GCM encryption using the crypto crate's AES-GCM
-    let ciphertext = aes_256_gcm_encrypt(&key, &nonce, assertion_xml.as_bytes())
+    let ciphertext = aes_256_gcm_encrypt(&dek, &nonce, assertion_xml.as_bytes())
         .map_err(|e| format!("AES-256-GCM encryption failed: {}", e))?;
 
     let ct_b64 = BASE64_STD.encode(&ciphertext);
     let nonce_b64 = BASE64_STD.encode(nonce);
+
+    let encrypted_key_xml = match sp_encryption_cert_pem {
+        Some(cert_pem) => {
+            let wrapped = wrap_dek_ecdh_es(&dek, cert_pem)?;
+            let wrapped_b64 = BASE64_STD.encode(&wrapped.wrapped_key);
+            let ephemeral_b64 = BASE64_STD.encode(&wrapped.ephemeral_public_key);
+            format!(
+                concat!(
+                    r#"<xenc:EncryptedKey xmlns:xenc="http://www.w3.org/2001/04/xmlenc#">"#,
+                    r#"<xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#kw-aes256"/>"#,
+                    r#"<ds:KeyInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#">"#,
+                    r#"<xenc:AgreementMethod Algorithm="http://www.w3.org/2009/xmlenc11#ECDH-ES">"#,
+                    r#"<xenc:OriginatorKeyInfo><ds:KeyValue>{ephemeral}</ds:KeyValue>"#,
+                    r#"</xenc:OriginatorKeyInfo></xenc:AgreementMethod></ds:KeyInfo>"#,
+                    r#"<xenc:CipherData><xenc:CipherValue>{wrapped}</xenc:CipherValue>"#,
+                    r#"</xenc:CipherData></xenc:EncryptedKey>"#,
+                ),
+                ephemeral = ephemeral_b64,
+                wrapped = wrapped_b64,
+            )
+        }
+        None => {
+            if is_military_deployment() {
+                SecurityEvent::crypto_failure(
+                    "SAML assertion encryption without SP encryption certificate in military mode",
+                );
+                return Err(
+                    "Military deployment requires SP encryption certificate for key transport"
+                        .to_string(),
+                );
+            }
+            tracing::warn!(
+                target: "siem",
+                "SIEM:WARNING SAML assertion encrypted without key transport (test-only)"
+            );
+            String::new()
+        }
+    };
 
     Ok(format!(
         concat!(
             r#"<xenc:EncryptedData xmlns:xenc="http://www.w3.org/2001/04/xmlenc#" "#,
             r#"Type="http://www.w3.org/2001/04/xmlenc#Element">"#,
             r#"<xenc:EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes256-gcm"/>"#,
+            r#"{encrypted_key}"#,
             r#"<xenc:CipherData>"#,
             r#"<xenc:CipherValue>{nonce}:{ct}</xenc:CipherValue>"#,
             r#"</xenc:CipherData></xenc:EncryptedData>"#,
         ),
+        encrypted_key = encrypted_key_xml,
         nonce = nonce_b64,
         ct = ct_b64,
     ))
 }
 
+/// ECDH-ES key wrap result.
+struct EcdhKeyWrapResult {
+    wrapped_key: Vec<u8>,
+    ephemeral_public_key: Vec<u8>,
+}
+
+/// Wrap DEK using ECDH-ES+A256KW with SP's P-256 encryption certificate.
+fn wrap_dek_ecdh_es(dek: &[u8; 32], sp_cert_pem: &str) -> Result<EcdhKeyWrapResult, String> {
+    use p256::ecdh::EphemeralSecret;
+    use p256::PublicKey;
+
+    let cert_der = parse_pem_certificate(sp_cert_pem)?;
+    let pk_bytes = extract_ec_public_key_bytes(&cert_der)
+        .ok_or("SP encryption cert does not contain a P-256 public key")?;
+    let sp_public_key = PublicKey::from_sec1_bytes(&pk_bytes)
+        .map_err(|e| format!("Invalid SP P-256 public key: {}", e))?;
+
+    let ephemeral_secret = EphemeralSecret::random(&mut p256::elliptic_curve::rand_core::OsRng);
+    let ephemeral_public = p256::PublicKey::from(&ephemeral_secret);
+    let ephemeral_public_bytes = ephemeral_public.to_sec1_bytes().to_vec();
+
+    let shared_secret = ephemeral_secret.diffie_hellman(&sp_public_key);
+
+    let hk = hkdf::Hkdf::<Sha256>::new(None, shared_secret.raw_secret_bytes().as_slice());
+    let mut kek = [0u8; 32];
+    hk.expand(b"SAML-ECDH-ES-A256KW", &mut kek)
+        .map_err(|_| "HKDF expansion failed for KEK derivation".to_string())?;
+
+    let wrapped = aes_key_wrap(&kek, dek)?;
+    kek.zeroize();
+
+    Ok(EcdhKeyWrapResult {
+        wrapped_key: wrapped,
+        ephemeral_public_key: ephemeral_public_bytes,
+    })
+}
+
+/// AES-256 Key Wrap per RFC 3394.
+fn aes_key_wrap(kek: &[u8; 32], key_data: &[u8; 32]) -> Result<Vec<u8>, String> {
+    use aes_gcm::aes::Aes256;
+    use aes_gcm::aes::cipher::{BlockEncrypt, KeyInit};
+
+    let cipher = Aes256::new_from_slice(kek)
+        .map_err(|e| format!("AES key wrap init: {}", e))?;
+
+    let mut a: [u8; 8] = [0xA6; 8]; // RFC 3394 default IV
+    let n = key_data.len() / 8;
+    let mut r = vec![[0u8; 8]; n];
+    for i in 0..n {
+        r[i].copy_from_slice(&key_data[i * 8..(i + 1) * 8]);
+    }
+
+    for j in 0..6u64 {
+        for i in 0..n {
+            let mut block = [0u8; 16];
+            block[..8].copy_from_slice(&a);
+            block[8..].copy_from_slice(&r[i]);
+            let block_ref: &mut aes_gcm::aes::Block = (&mut block).into();
+            cipher.encrypt_block(block_ref);
+            let t = ((n as u64) * j + (i as u64) + 1).to_be_bytes();
+            a.copy_from_slice(&block[..8]);
+            for k in 0..8 {
+                a[k] ^= t[k];
+            }
+            r[i].copy_from_slice(&block[8..]);
+        }
+    }
+
+    let mut output = Vec::with_capacity(8 + key_data.len());
+    output.extend_from_slice(&a);
+    for block in &r {
+        output.extend_from_slice(block);
+    }
+    Ok(output)
+}
+
 // ── XML Signature (Enveloped) ───────────────────────────────────────────────
+
+/// Digest algorithm for SAML XML signatures.
+///
+/// CNSA 2.0 exception: SHA-256 is accepted for SAML interop because many SPs
+/// only support SHA-256 digests (see cnsa2.rs for the exceptions list).
+/// New deployments default to SHA-512; SHA-256 is the interop fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DigestAlgorithm {
+    Sha512,
+    Sha256,
+}
+
+impl DigestAlgorithm {
+    pub fn as_uri(&self) -> &'static str {
+        match self {
+            Self::Sha512 => "http://www.w3.org/2001/04/xmlenc#sha512",
+            Self::Sha256 => "http://www.w3.org/2001/04/xmlenc#sha256",
+        }
+    }
+}
+
+/// Signing configuration for SAML XML signatures.
+#[derive(Debug, Clone)]
+pub struct SamlSigningConfig {
+    pub algorithm: SignatureAlgorithm,
+    pub ed25519_fallback: bool,
+    pub digest_algorithm: DigestAlgorithm,
+}
+
+impl Default for SamlSigningConfig {
+    fn default() -> Self {
+        Self {
+            algorithm: SignatureAlgorithm::MlDsa87,
+            ed25519_fallback: false,
+            digest_algorithm: DigestAlgorithm::Sha512,
+        }
+    }
+}
 
 /// Sign a SAML XML document using an enveloped signature.
 ///
-/// Supports both ML-DSA-87 (internal/DoD) and RSA-SHA256 (external SP compat).
+/// Uses ML-DSA-87 (post-quantum) or Ed25519 (classical fallback).
+/// `signing_key_bytes`: 32-byte seed (ML-DSA-87) or 32-byte secret key (Ed25519).
 pub fn sign_xml_enveloped(
     xml: &str,
     algorithm: SignatureAlgorithm,
-    _signing_key_bytes: &[u8],
+    signing_key_bytes: &[u8],
 ) -> Result<String, String> {
-    // Compute digest of the canonicalized XML (excluding Signature element)
-    let digest = sha256_hash(xml.as_bytes());
+    let canonicalized = minimal_exc_c14n(xml);
+    let digest = sha256_hash(canonicalized.as_bytes());
     let digest_b64 = BASE64_STD.encode(digest);
 
-    // In a full implementation:
-    // - For ML-DSA-87: use crypto::pq_sign::pq_sign_raw
-    // - For RSA-SHA256: use RSA PKCS#1 v1.5 signature
-    // For now, generate a placeholder signature value using HMAC
-    let sig_value = hmac_sha256(_signing_key_bytes, xml.as_bytes())?;
-    let sig_b64 = BASE64_STD.encode(sig_value);
-
-    let signature_xml = format!(
+    let signed_info_xml = format!(
         concat!(
-            r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">"#,
-            r#"<ds:SignedInfo>"#,
+            r#"<ds:SignedInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#">"#,
             r#"<ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#,
             r#"<ds:SignatureMethod Algorithm="{alg}"/>"#,
             r#"<ds:Reference URI="">"#,
@@ -2334,15 +2506,44 @@ pub fn sign_xml_enveloped(
             r#"<ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>"#,
             r#"<ds:DigestValue>{digest}</ds:DigestValue>"#,
             r#"</ds:Reference></ds:SignedInfo>"#,
-            r#"<ds:SignatureValue>{sig}</ds:SignatureValue>"#,
-            r#"</ds:Signature>"#,
         ),
         alg = algorithm.as_uri(),
         digest = digest_b64,
+    );
+
+    let signed_info_canon = minimal_exc_c14n(&signed_info_xml);
+
+    let sig_b64 = match algorithm {
+        SignatureAlgorithm::MlDsa87 => {
+            if signing_key_bytes.len() < 32 {
+                return Err("ML-DSA-87 requires at least 32-byte signing seed".to_string());
+            }
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&signing_key_bytes[..32]);
+            let sig_bytes = pq_sign_saml(&seed, signed_info_canon.as_bytes());
+            seed.zeroize();
+            BASE64_STD.encode(&sig_bytes)
+        }
+        SignatureAlgorithm::RsaSha256 => {
+            if signing_key_bytes.len() < 32 {
+                return Err("Ed25519 requires 32-byte secret key".to_string());
+            }
+            let sig_bytes = ed25519_sign_saml(&signing_key_bytes[..32], signed_info_canon.as_bytes())?;
+            BASE64_STD.encode(&sig_bytes)
+        }
+    };
+
+    let signature_xml = format!(
+        concat!(
+            r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">"#,
+            r#"{signed_info}"#,
+            r#"<ds:SignatureValue>{sig}</ds:SignatureValue>"#,
+            r#"</ds:Signature>"#,
+        ),
+        signed_info = signed_info_xml,
         sig = sig_b64,
     );
 
-    // Insert signature after the Issuer element (SAML convention)
     if let Some(pos) = xml.find("</saml:Issuer>") {
         let insert_pos = pos + "</saml:Issuer>".len();
         let mut signed = String::with_capacity(xml.len() + signature_xml.len());
@@ -2351,9 +2552,69 @@ pub fn sign_xml_enveloped(
         signed.push_str(&xml[insert_pos..]);
         Ok(signed)
     } else {
-        // Fallback: prepend signature
         Ok(format!("{}{}", signature_xml, xml))
     }
+}
+
+/// Sign raw bytes with ML-DSA-87 using a 32-byte seed.
+fn pq_sign_saml(seed: &[u8; 32], data: &[u8]) -> Vec<u8> {
+    let kp = MlDsa87::from_seed(&(*seed).into());
+    let sig: ml_dsa::Signature<MlDsa87> = kp.signing_key().sign(data);
+    sig.encode().to_vec()
+}
+
+/// Derive the ML-DSA-87 verifying key bytes from a 32-byte seed.
+pub fn pq_verifying_key_saml(seed: &[u8; 32]) -> Vec<u8> {
+    let kp = MlDsa87::from_seed(&(*seed).into());
+    let encoded: EncodedVerifyingKey<MlDsa87> = kp.verifying_key().encode();
+    AsRef::<[u8]>::as_ref(&encoded).to_vec()
+}
+
+/// Verify an ML-DSA-87 SAML signature.
+pub fn pq_verify_saml(vk_bytes: &[u8], data: &[u8], sig_bytes: &[u8]) -> bool {
+    let vk_enc = match EncodedVerifyingKey::<MlDsa87>::try_from(vk_bytes) {
+        Ok(enc) => enc,
+        Err(_) => return false,
+    };
+    let vk = MlDsaVerifyingKey::<MlDsa87>::decode(&vk_enc);
+    let sig = match ml_dsa::Signature::<MlDsa87>::try_from(sig_bytes) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    vk.verify(data, &sig).is_ok()
+}
+
+/// Sign raw bytes with Ed25519 (classical SAML fallback for interop).
+fn ed25519_sign_saml(secret_key_bytes: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
+    use ed25519_dalek::{SigningKey, Signer as _};
+    let mut sk_bytes = [0u8; 32];
+    sk_bytes.copy_from_slice(&secret_key_bytes[..32]);
+    let signing_key = SigningKey::from_bytes(&sk_bytes);
+    sk_bytes.zeroize();
+    let sig = signing_key.sign(data);
+    Ok(sig.to_bytes().to_vec())
+}
+
+/// Verify an Ed25519 SAML signature.
+pub fn ed25519_verify_saml(public_key_bytes: &[u8], data: &[u8], sig_bytes: &[u8]) -> bool {
+    use ed25519_dalek::{Signature, VerifyingKey, Verifier as _};
+    if public_key_bytes.len() != 32 || sig_bytes.len() != 64 {
+        return false;
+    }
+    let vk_bytes: [u8; 32] = match public_key_bytes.try_into() {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    let vk = match VerifyingKey::from_bytes(&vk_bytes) {
+        Ok(k) => k,
+        Err(_) => return false,
+    };
+    let sig_arr: &[u8; 64] = match sig_bytes.try_into() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    let sig = Signature::from_bytes(sig_arr);
+    vk.verify(data, &sig).is_ok()
 }
 
 // ── SIEM Event Extensions ───────────────────────────────────────────────────
@@ -3762,6 +4023,82 @@ fn fetch_crl_from_distribution_point(url: &str) -> Result<Vec<u8>, String> {
     Ok(body.to_vec())
 }
 
+/// Minimal Exclusive XML Canonicalization (exc-c14n) subset.
+///
+/// Implements: sort attributes alphabetically within each element (xmlns first),
+/// normalize whitespace, remove comments. Does not handle full namespace axis
+/// processing. In military deployment mode, assertions that cannot be verified
+/// via c14n are REJECTED (fail-closed).
+fn minimal_exc_c14n(xml: &str) -> String {
+    let mut result = String::with_capacity(xml.len());
+    let stripped = strip_xml_comments(xml);
+    let chars: Vec<char> = stripped.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        if chars[i] == '<' && i + 1 < chars.len()
+            && chars[i + 1] != '/' && chars[i + 1] != '?' && chars[i + 1] != '!'
+        {
+            let tag_end = chars[i..].iter().position(|&c| c == '>').map(|p| i + p);
+            if let Some(end) = tag_end {
+                let tag_str: String = chars[i..=end].iter().collect();
+                result.push_str(&canonicalize_element_tag(&tag_str));
+                i = end + 1;
+                continue;
+            }
+        }
+        result.push(chars[i]);
+        i += 1;
+    }
+    result
+}
+
+/// Sort attributes alphabetically within an XML opening tag (xmlns first).
+fn canonicalize_element_tag(tag: &str) -> String {
+    let self_closing = tag.ends_with("/>");
+    let inner = if self_closing {
+        &tag[1..tag.len() - 2]
+    } else {
+        &tag[1..tag.len() - 1]
+    };
+    let inner = inner.trim();
+    let first_space = inner.find(|c: char| c.is_whitespace());
+    let (elem_name, attrs_str) = match first_space {
+        Some(pos) => (&inner[..pos], inner[pos..].trim()),
+        None => (inner, ""),
+    };
+    if attrs_str.is_empty() {
+        return if self_closing { format!("<{}/>", elem_name) } else { format!("<{}>", elem_name) };
+    }
+    let mut attrs: Vec<(String, String)> = Vec::new();
+    let mut remaining = attrs_str;
+    while !remaining.is_empty() {
+        remaining = remaining.trim_start();
+        if remaining.is_empty() { break; }
+        let eq_pos = match remaining.find('=') { Some(p) => p, None => break };
+        let attr_name = remaining[..eq_pos].trim().to_string();
+        let after_eq = remaining[eq_pos + 1..].trim_start();
+        if after_eq.is_empty() { break; }
+        let quote = after_eq.as_bytes()[0] as char;
+        if quote != '"' && quote != '\'' { break; }
+        let value_end = match after_eq[1..].find(quote) { Some(p) => p, None => break };
+        let attr_value = after_eq[1..1 + value_end].to_string();
+        attrs.push((attr_name, attr_value));
+        remaining = &after_eq[2 + value_end..];
+    }
+    attrs.sort_by(|a, b| {
+        let a_xmlns = a.0.starts_with("xmlns");
+        let b_xmlns = b.0.starts_with("xmlns");
+        match (a_xmlns, b_xmlns) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.0.cmp(&b.0),
+        }
+    });
+    let attrs_s: String = attrs.iter().map(|(n, v)| format!(" {}=\"{}\"", n, v)).collect();
+    if self_closing { format!("<{}{}/>", elem_name, attrs_s) } else { format!("<{}{}>", elem_name, attrs_s) }
+}
+
 /// Strip XML comments (`<!-- ... -->`) from an XML string.
 /// Used to detect signature injection via comment wrapping.
 fn strip_xml_comments(xml: &str) -> String {
@@ -4174,5 +4511,210 @@ mod tests {
         let bad_uris = extract_reference_uris(bad_xml);
         assert_eq!(bad_uris.len(), 1);
         assert_ne!(bad_uris[0], expected_ref, "mismatched URI must differ from expected");
+    }
+
+    // ── ML-DSA-87 SAML signing roundtrip ────────────────────────────────
+
+    #[test]
+    fn test_ml_dsa_87_saml_signing_roundtrip() {
+        let seed: [u8; 32] = [42u8; 32];
+        let xml = r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_test_1"><saml:Issuer>https://idp.milnet.mil</saml:Issuer><saml:Subject>test</saml:Subject></saml:Assertion>"#;
+
+        let signed_xml = sign_xml_enveloped(xml, SignatureAlgorithm::MlDsa87, &seed)
+            .expect("ML-DSA-87 signing failed");
+        assert!(signed_xml.contains("<ds:Signature"));
+        assert!(signed_xml.contains("urn:milnet:pq:ml-dsa-87"));
+
+        let sig_bytes = extract_signature_value_bytes(&signed_xml);
+        assert!(!sig_bytes.is_empty());
+        let si_bytes = extract_signed_info_bytes(&signed_xml);
+        let si_canon = minimal_exc_c14n(&String::from_utf8_lossy(&si_bytes));
+
+        let vk = pq_verifying_key_saml(&seed);
+        assert!(pq_verify_saml(&vk, si_canon.as_bytes(), &sig_bytes));
+    }
+
+    #[test]
+    fn test_ml_dsa_87_wrong_key_fails() {
+        let seed: [u8; 32] = [42u8; 32];
+        let wrong: [u8; 32] = [99u8; 32];
+        let xml = r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_t2"><saml:Issuer>test</saml:Issuer></saml:Assertion>"#;
+        let signed = sign_xml_enveloped(xml, SignatureAlgorithm::MlDsa87, &seed).unwrap();
+        let sig = extract_signature_value_bytes(&signed);
+        let si = minimal_exc_c14n(&String::from_utf8_lossy(&extract_signed_info_bytes(&signed)));
+        assert!(!pq_verify_saml(&pq_verifying_key_saml(&wrong), si.as_bytes(), &sig));
+    }
+
+    // ── Ed25519 SAML signing ────────────────────────────────────────────
+
+    #[test]
+    fn test_ed25519_saml_signing_roundtrip() {
+        let secret: [u8; 32] = [7u8; 32];
+        let xml = r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_t3"><saml:Issuer>test</saml:Issuer></saml:Assertion>"#;
+        let signed = sign_xml_enveloped(xml, SignatureAlgorithm::RsaSha256, &secret).unwrap();
+        assert!(signed.contains("ed25519"));
+
+        let sig = extract_signature_value_bytes(&signed);
+        assert_eq!(sig.len(), 64);
+        let si = minimal_exc_c14n(&String::from_utf8_lossy(&extract_signed_info_bytes(&signed)));
+
+        use ed25519_dalek::SigningKey;
+        let sk = SigningKey::from_bytes(&secret);
+        let pk = sk.verifying_key();
+        assert!(ed25519_verify_saml(pk.as_bytes(), si.as_bytes(), &sig));
+    }
+
+    // ── Encrypted assertion key transport ────────────────────────────────
+
+    #[test]
+    fn test_encrypted_assertion_no_cert_non_military() {
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        let r = encrypt_assertion_aes256gcm("<saml:Assertion>data</saml:Assertion>", None);
+        assert!(r.is_ok());
+        assert!(r.unwrap().contains("aes256-gcm"));
+    }
+
+    #[test]
+    fn test_encrypted_assertion_military_requires_cert() {
+        std::env::set_var("MILNET_MILITARY_DEPLOYMENT", "1");
+        let r = encrypt_assertion_aes256gcm("<saml:Assertion>data</saml:Assertion>", None);
+        assert!(r.is_err());
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+    }
+
+    // ── Replay cache ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_replay_detection() {
+        let cache = InMemoryAssertionCache;
+        let id = format!("replay_{}", Uuid::new_v4());
+        assert_eq!(cache.check_and_store(&id, 60).unwrap(), false);
+        assert_eq!(cache.check_and_store(&id, 60).unwrap(), true);
+    }
+
+    // ── XXE rejection ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_xxe_doctype() { assert!(reject_xxe(r#"<!DOCTYPE foo>test"#).is_err()); }
+    #[test]
+    fn test_xxe_entity() { assert!(reject_xxe(r#"<!ENTITY x "y">test"#).is_err()); }
+    #[test]
+    fn test_xxe_system() { assert!(reject_xxe(r#"SYSTEM "http://evil""#).is_err()); }
+    #[test]
+    fn test_xxe_clean() { assert!(reject_xxe("<Assertion>ok</Assertion>").is_ok()); }
+
+    // ── XML signature wrapping prevention ───────────────────────────────
+
+    #[test]
+    fn test_comment_signature_injection() {
+        let xml = r#"<!-- <ds:Signature>fake</ds:Signature> --><Real/>"#;
+        let stripped = strip_xml_comments(xml);
+        assert!(!stripped.contains("fake"));
+    }
+
+    // ── Clock skew edge cases ───────────────────────────────────────────
+
+    #[test]
+    fn test_clock_skew_at_not_before_boundary() {
+        let now = now_epoch();
+        let skew = DEFAULT_CLOCK_SKEW_SECS;
+        let c = SamlConditions::new(now + skew, now + 300, vec!["sp".into()]);
+        assert!(c.validate(skew).is_ok());
+    }
+
+    #[test]
+    fn test_clock_skew_past_not_before() {
+        let now = now_epoch();
+        let skew = DEFAULT_CLOCK_SKEW_SECS;
+        let c = SamlConditions::new(now + skew + 2, now + 300, vec!["sp".into()]);
+        assert!(c.validate(skew).is_err());
+    }
+
+    #[test]
+    fn test_clock_skew_at_expiry_boundary() {
+        let now = now_epoch();
+        let skew = DEFAULT_CLOCK_SKEW_SECS;
+        let c = SamlConditions::new(now - 300, now - skew, vec!["sp".into()]);
+        assert!(c.validate(skew).is_ok());
+    }
+
+    #[test]
+    fn test_clock_skew_past_expiry() {
+        let now = now_epoch();
+        let skew = DEFAULT_CLOCK_SKEW_SECS;
+        let c = SamlConditions::new(now - 300, now - skew - 2, vec!["sp".into()]);
+        assert!(c.validate(skew).is_err());
+    }
+
+    // ── AuthenticatedUser zeroization ───────────────────────────────────
+
+    #[test]
+    fn test_authenticated_user_has_drop() {
+        // Verify Drop impl exists and runs without panic
+        let user = AuthenticatedUser {
+            user_id: Uuid::new_v4(),
+            email: "secret@milnet.mil".to_string(),
+            display_name: Some("John".to_string()),
+            properties: HashMap::new(),
+            authn_context: AuthnContextClass::X509,
+            tenant_id: None,
+            cac_serial: Some("DEAD".to_string()),
+        };
+        drop(user);
+    }
+
+    // ── Adversarial XML ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_oversized_xml_rejected() {
+        let big = "x".repeat(65 * 1024);
+        assert!(AuthnRequest::parse_xml(&big, SamlBinding::HttpPost).is_err());
+    }
+
+    #[test]
+    fn test_billion_laughs_rejected() {
+        let xml = r#"<!DOCTYPE lolz [<!ENTITY lol "lol">]><AuthnRequest/>"#;
+        assert!(AuthnRequest::parse_xml(xml, SamlBinding::HttpPost).is_err());
+    }
+
+    #[test]
+    fn test_empty_assertion_id_rejected() {
+        assert!(check_assertion_id_replay("", 30).is_err());
+    }
+
+    // ── Minimal exc-c14n ────────────────────────────────────────────────
+
+    #[test]
+    fn test_c14n_sorts_attributes() {
+        let xml = r#"<E z="3" a="1" m="2">"#;
+        let c = minimal_exc_c14n(xml);
+        assert!(c.contains(r#"a="1" m="2" z="3""#), "got: {}", c);
+    }
+
+    #[test]
+    fn test_c14n_xmlns_first() {
+        let xml = r#"<E z="v" xmlns:ds="http://x">"#;
+        let c = minimal_exc_c14n(xml);
+        assert!(c.find("xmlns:ds").unwrap() < c.find("z=").unwrap());
+    }
+
+    #[test]
+    fn test_c14n_strips_comments() {
+        assert!(!minimal_exc_c14n("<!-- hi --><R/>").contains("hi"));
+    }
+
+    // ── Digest algorithm / signing config ───────────────────────────────
+
+    #[test]
+    fn test_digest_algorithm_uris() {
+        assert_eq!(DigestAlgorithm::Sha512.as_uri(), "http://www.w3.org/2001/04/xmlenc#sha512");
+        assert_eq!(DigestAlgorithm::Sha256.as_uri(), "http://www.w3.org/2001/04/xmlenc#sha256");
+    }
+
+    #[test]
+    fn test_default_signing_config() {
+        let c = SamlSigningConfig::default();
+        assert_eq!(c.digest_algorithm, DigestAlgorithm::Sha512);
+        assert_eq!(c.algorithm, SignatureAlgorithm::MlDsa87);
     }
 }

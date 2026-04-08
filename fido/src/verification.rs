@@ -15,6 +15,9 @@
 
 use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
 use sha2::{Digest, Sha256};
+use rsa::pkcs1v15::VerifyingKey as RsaVerifyingKey;
+use rsa::RsaPublicKey;
+use ed25519_dalek::{VerifyingKey as Ed25519VerifyingKey, Signature as Ed25519Signature};
 
 /// Minimum authenticator data length:
 ///   32 bytes (RP ID hash) + 1 byte (flags) + 4 bytes (sign count) = 37
@@ -34,6 +37,16 @@ const COSE_KTY_EC2: i64 = 2;
 const COSE_ALG_ES256: i64 = -7;
 /// COSE EC2 curve identifier for P-256.
 const COSE_CRV_P256: i64 = 1;
+/// COSE key type for RSA.
+const COSE_KTY_RSA: i64 = 3;
+/// COSE algorithm identifier for RS256 (RSASSA-PKCS1-v1_5 w/ SHA-256).
+const COSE_ALG_RS256: i64 = -257;
+/// COSE key type for OKP (Octet Key Pair, e.g. Ed25519).
+const COSE_KTY_OKP: i64 = 1;
+/// COSE algorithm identifier for EdDSA.
+const COSE_ALG_EDDSA: i64 = -8;
+/// COSE OKP curve identifier for Ed25519.
+const COSE_CRV_ED25519: i64 = 6;
 
 // COSE key map labels
 const COSE_LABEL_KTY: i64 = 1;
@@ -715,6 +728,308 @@ pub fn verify_signature_es256_cose(
     verify_signature_es256(authenticator_data, client_data_hash, signature, &sec1_key)
 }
 
+// ── COSE key algorithm detection ──────────────────────────────────────
+
+/// Detected algorithm from a COSE key's `alg` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoseAlgorithm {
+    Es256,
+    Rs256,
+    EdDsa,
+}
+
+/// Detect the algorithm from a COSE-encoded public key without fully parsing it.
+pub fn detect_cose_algorithm(cose_bytes: &[u8]) -> Result<CoseAlgorithm, &'static str> {
+    let mut reader = CborReader::new(cose_bytes);
+    let map_len = reader.read_map_len()
+        .ok_or("COSE key: expected CBOR map")?;
+    if map_len > MAX_CBOR_MAP_LEN {
+        return Err("COSE key: CBOR map too large");
+    }
+    for _ in 0..map_len {
+        let label = reader.read_int()
+            .ok_or("COSE key: failed to read map label")?;
+        if label == COSE_LABEL_ALG {
+            let alg = reader.read_int()
+                .ok_or("COSE key: failed to read alg value")?;
+            return match alg {
+                COSE_ALG_ES256 => Ok(CoseAlgorithm::Es256),
+                COSE_ALG_RS256 => Ok(CoseAlgorithm::Rs256),
+                COSE_ALG_EDDSA => Ok(CoseAlgorithm::EdDsa),
+                _ => Err("COSE key: unsupported algorithm"),
+            };
+        }
+        reader.skip_value().ok_or("COSE key: failed to skip value")?;
+    }
+    Err("COSE key: missing alg (label 3)")
+}
+
+// ── RS256 (RSASSA-PKCS1-v1_5 with SHA-256) ───────────────────────────
+
+/// A parsed COSE public key for RS256.
+#[derive(Debug, Clone)]
+pub struct CoseKeyRs256 {
+    pub n: Vec<u8>,
+    pub e: Vec<u8>,
+}
+
+/// Parse a COSE key for RS256 (algorithm -257, kty 3).
+pub fn parse_cose_key_rs256(cose_bytes: &[u8]) -> Result<CoseKeyRs256, &'static str> {
+    let mut reader = CborReader::new(cose_bytes);
+    let map_len = reader.read_map_len()
+        .ok_or("COSE key: expected CBOR map")?;
+    if map_len > MAX_CBOR_MAP_LEN {
+        return Err("COSE key: CBOR map too large");
+    }
+    let mut kty: Option<i64> = None;
+    let mut alg: Option<i64> = None;
+    let mut n_bytes: Option<Vec<u8>> = None;
+    let mut e_bytes: Option<Vec<u8>> = None;
+    for _ in 0..map_len {
+        let label = reader.read_int()
+            .ok_or("COSE key: failed to read map label")?;
+        // RSA COSE keys: label -1 = n (modulus), label -2 = e (exponent)
+        match label {
+            COSE_LABEL_KTY => {
+                kty = Some(reader.read_int().ok_or("COSE key: failed to read kty")?);
+            }
+            COSE_LABEL_ALG => {
+                alg = Some(reader.read_int().ok_or("COSE key: failed to read alg")?);
+            }
+            COSE_LABEL_CRV => { // label -1 = n for RSA
+                n_bytes = Some(reader.read_bstr().ok_or("COSE key: failed to read n")?);
+            }
+            COSE_LABEL_X => { // label -2 = e for RSA
+                e_bytes = Some(reader.read_bstr().ok_or("COSE key: failed to read e")?);
+            }
+            _ => {
+                reader.skip_value().ok_or("COSE key: failed to skip unknown value")?;
+            }
+        }
+    }
+    let kty_val = kty.ok_or("COSE key: missing kty (label 1)")?;
+    if kty_val != COSE_KTY_RSA {
+        return Err("COSE key: kty must be 3 (RSA)");
+    }
+    let alg_val = alg.ok_or("COSE key: missing alg (label 3)")?;
+    if alg_val != COSE_ALG_RS256 {
+        return Err("COSE key: alg must be -257 (RS256)");
+    }
+    let n = n_bytes.ok_or("COSE key: missing n (label -1)")?;
+    if n.is_empty() || n.len() > 1024 {
+        return Err("COSE key: RSA modulus size out of range");
+    }
+    let e = e_bytes.ok_or("COSE key: missing e (label -2)")?;
+    if e.is_empty() || e.len() > 16 {
+        return Err("COSE key: RSA exponent size out of range");
+    }
+    Ok(CoseKeyRs256 { n, e })
+}
+
+/// Build a CBOR-encoded COSE key map for RS256.
+pub fn encode_cose_key_rs256(n: &[u8], e: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 + n.len() + e.len());
+    out.push(0xA4); // map(4)
+    out.push(0x01); out.push(0x03); // kty=3 (RSA)
+    out.push(0x03); out.push(0x39); out.push(0x01); out.push(0x00); // alg=-257
+    out.push(0x20); // label -1 (n)
+    encode_cbor_bstr(&mut out, n);
+    out.push(0x21); // label -2 (e)
+    encode_cbor_bstr(&mut out, e);
+    out
+}
+
+/// Verify an RS256 signature with a 50ms timing floor (Marvin attack mitigation).
+pub fn verify_signature_rs256(
+    authenticator_data: &[u8],
+    client_data_hash: &[u8],
+    signature: &[u8],
+    cose_public_key: &[u8],
+) -> Result<(), &'static str> {
+    if authenticator_data.len() < MIN_AUTH_DATA_LEN {
+        return Err("Authenticator data too short for signature verification");
+    }
+    if client_data_hash.len() != 32 {
+        return Err("Client data hash must be 32 bytes (SHA-256)");
+    }
+    if signature.is_empty() {
+        return Err("Signature is empty");
+    }
+    let start = std::time::Instant::now();
+    let cose_key = parse_cose_key_rs256(cose_public_key)?;
+    let n = rsa::BigUint::from_bytes_be(&cose_key.n);
+    let e = rsa::BigUint::from_bytes_be(&cose_key.e);
+    let rsa_pub = RsaPublicKey::new(n, e)
+        .map_err(|_| "Invalid RSA public key")?;
+    let verifying_key = RsaVerifyingKey::<Sha256>::new(rsa_pub);
+    let rsa_sig = rsa::pkcs1v15::Signature::try_from(signature)
+        .map_err(|_| "Invalid PKCS#1 v1.5 signature encoding")?;
+    let mut msg = authenticator_data.to_vec();
+    msg.extend_from_slice(client_data_hash);
+    use signature::Verifier as _;
+    let result = verifying_key.verify(&msg, &rsa_sig)
+        .map_err(|_| "RS256 signature verification failed");
+    // Timing floor: mitigate Marvin attack side channels on RSA
+    let elapsed = start.elapsed();
+    let floor = std::time::Duration::from_millis(50);
+    if elapsed < floor {
+        std::thread::sleep(floor - elapsed);
+    }
+    result
+}
+
+// ── EdDSA (Ed25519) ───────────────────────────────────────────────────
+
+/// A parsed COSE public key for EdDSA (Ed25519).
+#[derive(Debug, Clone)]
+pub struct CoseKeyEdDsa {
+    pub x: [u8; 32],
+}
+
+/// Parse a COSE key for EdDSA/Ed25519 (algorithm -8, kty 1, crv 6).
+pub fn parse_cose_key_eddsa(cose_bytes: &[u8]) -> Result<CoseKeyEdDsa, &'static str> {
+    let mut reader = CborReader::new(cose_bytes);
+    let map_len = reader.read_map_len()
+        .ok_or("COSE key: expected CBOR map")?;
+    if map_len > MAX_CBOR_MAP_LEN {
+        return Err("COSE key: CBOR map too large");
+    }
+    let mut kty: Option<i64> = None;
+    let mut alg: Option<i64> = None;
+    let mut crv: Option<i64> = None;
+    let mut x_bytes: Option<Vec<u8>> = None;
+    for _ in 0..map_len {
+        let label = reader.read_int()
+            .ok_or("COSE key: failed to read map label")?;
+        match label {
+            COSE_LABEL_KTY => {
+                kty = Some(reader.read_int().ok_or("COSE key: failed to read kty")?);
+            }
+            COSE_LABEL_ALG => {
+                alg = Some(reader.read_int().ok_or("COSE key: failed to read alg")?);
+            }
+            COSE_LABEL_CRV => {
+                crv = Some(reader.read_int().ok_or("COSE key: failed to read crv")?);
+            }
+            COSE_LABEL_X => {
+                x_bytes = Some(reader.read_bstr().ok_or("COSE key: failed to read x")?);
+            }
+            _ => {
+                reader.skip_value().ok_or("COSE key: failed to skip unknown value")?;
+            }
+        }
+    }
+    let kty_val = kty.ok_or("COSE key: missing kty (label 1)")?;
+    if kty_val != COSE_KTY_OKP {
+        return Err("COSE key: kty must be 1 (OKP) for EdDSA");
+    }
+    let alg_val = alg.ok_or("COSE key: missing alg (label 3)")?;
+    if alg_val != COSE_ALG_EDDSA {
+        return Err("COSE key: alg must be -8 (EdDSA)");
+    }
+    let crv_val = crv.ok_or("COSE key: missing crv (label -1)")?;
+    if crv_val != COSE_CRV_ED25519 {
+        return Err("COSE key: crv must be 6 (Ed25519)");
+    }
+    let x = x_bytes.ok_or("COSE key: missing x (label -2)")?;
+    if x.len() != 32 {
+        return Err("COSE key: Ed25519 public key must be 32 bytes");
+    }
+    let mut x_arr = [0u8; 32];
+    x_arr.copy_from_slice(&x);
+    Ok(CoseKeyEdDsa { x: x_arr })
+}
+
+/// Build a CBOR-encoded COSE key map for EdDSA/Ed25519.
+pub fn encode_cose_key_eddsa(public_key: &[u8; 32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(48);
+    out.push(0xA4); // map(4)
+    out.push(0x01); out.push(0x01); // kty=1 (OKP)
+    out.push(0x03); out.push(0x27); // alg=-8 (EdDSA)
+    out.push(0x20); out.push(0x06); // crv=6 (Ed25519)
+    out.push(0x21); // label -2 (x)
+    out.push(0x58); out.push(0x20); // bstr(32)
+    out.extend_from_slice(public_key);
+    out
+}
+
+/// Verify an EdDSA (Ed25519) signature.
+pub fn verify_signature_eddsa(
+    authenticator_data: &[u8],
+    client_data_hash: &[u8],
+    signature: &[u8],
+    cose_public_key: &[u8],
+) -> Result<(), &'static str> {
+    if authenticator_data.len() < MIN_AUTH_DATA_LEN {
+        return Err("Authenticator data too short for signature verification");
+    }
+    if client_data_hash.len() != 32 {
+        return Err("Client data hash must be 32 bytes (SHA-256)");
+    }
+    if signature.is_empty() {
+        return Err("Signature is empty");
+    }
+    if signature.len() != 64 {
+        return Err("Ed25519 signature must be 64 bytes");
+    }
+    let cose_key = parse_cose_key_eddsa(cose_public_key)?;
+    let vk = Ed25519VerifyingKey::from_bytes(&cose_key.x)
+        .map_err(|_| "Invalid Ed25519 public key")?;
+    let sig = Ed25519Signature::from_bytes(
+        signature.try_into().map_err(|_| "Ed25519 signature must be 64 bytes")?
+    );
+    let mut msg = authenticator_data.to_vec();
+    msg.extend_from_slice(client_data_hash);
+    use ed25519_dalek::Verifier as _;
+    vk.verify(&msg, &sig)
+        .map_err(|_| "EdDSA signature verification failed")
+}
+
+/// Verify a signature using the algorithm detected from the COSE public key.
+pub fn verify_signature_cose(
+    authenticator_data: &[u8],
+    client_data_hash: &[u8],
+    signature: &[u8],
+    cose_public_key: &[u8],
+) -> Result<(), &'static str> {
+    let alg = detect_cose_algorithm(cose_public_key)?;
+    match alg {
+        CoseAlgorithm::Es256 => {
+            let cose_key = parse_cose_key_es256(cose_public_key)?;
+            let sec1_key = cose_key.to_sec1_uncompressed();
+            verify_signature_es256(authenticator_data, client_data_hash, signature, &sec1_key)
+        }
+        CoseAlgorithm::Rs256 => {
+            verify_signature_rs256(authenticator_data, client_data_hash, signature, cose_public_key)
+        }
+        CoseAlgorithm::EdDsa => {
+            verify_signature_eddsa(authenticator_data, client_data_hash, signature, cose_public_key)
+        }
+    }
+}
+
+/// Helper: encode a byte string in CBOR format.
+fn encode_cbor_bstr(out: &mut Vec<u8>, data: &[u8]) {
+    let len = data.len();
+    if len < 24 {
+        out.push(0x40 | len as u8);
+    } else if len < 256 {
+        out.push(0x58);
+        out.push(len as u8);
+    } else if len < 65536 {
+        out.push(0x59);
+        out.push((len >> 8) as u8);
+        out.push((len & 0xFF) as u8);
+    } else {
+        out.push(0x5A);
+        out.push((len >> 24) as u8);
+        out.push((len >> 16) as u8);
+        out.push((len >> 8) as u8);
+        out.push((len & 0xFF) as u8);
+    }
+    out.extend_from_slice(data);
+}
+
 // ── Full authentication response verification ──────────────────────────
 
 /// Full authentication response verification pipeline.
@@ -758,13 +1073,25 @@ pub fn verify_authentication_response(
     // 6. Compute client data hash
     let client_data_hash = Sha256::digest(&auth_result.client_data);
 
-    // 7. Verify signature over (authenticator_data || client_data_hash)
-    verify_signature_es256(
-        &auth_result.authenticator_data,
-        &client_data_hash,
-        &auth_result.signature,
-        &stored_credential.public_key,
-    )?;
+    // 7. Verify signature: dispatch based on stored COSE key algorithm.
+    //    For backwards compat, 65-byte keys starting with 0x04 are legacy
+    //    SEC1 uncompressed EC points (ES256).
+    let pubkey = &stored_credential.public_key;
+    if pubkey.len() == 65 && pubkey[0] == 0x04 {
+        verify_signature_es256(
+            &auth_result.authenticator_data,
+            &client_data_hash,
+            &auth_result.signature,
+            pubkey,
+        )?;
+    } else {
+        verify_signature_cose(
+            &auth_result.authenticator_data,
+            &client_data_hash,
+            &auth_result.signature,
+            pubkey,
+        )?;
+    }
 
     Ok(parsed.sign_count)
 }
@@ -960,6 +1287,137 @@ pub fn verify_packed_basic_attestation(
     verify_signature_es256(auth_data, client_data_hash, sig, leaf_cert_public_key)?;
 
     Ok((att_data, AttestationType::Basic))
+}
+
+// ── FIDO Metadata Service (MDS) trust store ──────────────────────────
+
+/// FIDO Metadata Service trust store for attestation certificate chain validation.
+///
+/// Holds trusted authenticator root certificates. In military mode,
+/// only authenticators whose attestation chains root to a certificate
+/// in this store are accepted.
+pub struct FidoMdsStore {
+    trusted_roots: Vec<Vec<u8>>,
+}
+
+impl FidoMdsStore {
+    pub fn new() -> Self {
+        Self { trusted_roots: Vec::new() }
+    }
+
+    /// Load trusted roots from the `MILNET_FIDO_MDS_PATH` directory.
+    pub fn load_from_env() -> Self {
+        let mut store = Self::new();
+        if let Ok(path) = std::env::var("MILNET_FIDO_MDS_PATH") {
+            let dir = std::path::Path::new(&path);
+            if dir.is_dir() {
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for entry in entries.flatten() {
+                        let file_path = entry.path();
+                        if file_path.extension().map_or(false, |e| e == "pem" || e == "crt" || e == "cer") {
+                            if let Ok(pem_data) = std::fs::read(&file_path) {
+                                if let Some(der) = pem_to_der(&pem_data) {
+                                    store.trusted_roots.push(der);
+                                } else {
+                                    tracing::warn!(
+                                        target: "siem",
+                                        "SIEM:WARN Failed to parse MDS root certificate: {}",
+                                        file_path.display()
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            tracing::info!(
+                target: "siem",
+                "SIEM:INFO Loaded {} FIDO MDS trusted roots from {}",
+                store.trusted_roots.len(), path,
+            );
+        }
+        store
+    }
+
+    pub fn add_trusted_root(&mut self, der_cert: Vec<u8>) {
+        self.trusted_roots.push(der_cert);
+    }
+
+    pub fn root_count(&self) -> usize {
+        self.trusted_roots.len()
+    }
+
+    /// Check if any certificate in the chain matches a trusted root.
+    pub fn validate_chain(&self, x5c: &[Vec<u8>]) -> Result<bool, &'static str> {
+        if x5c.is_empty() {
+            return Err("Empty certificate chain");
+        }
+        for cert in x5c {
+            for root in &self.trusted_roots {
+                if cert == root {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+}
+
+impl Default for FidoMdsStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn require_military_mds() -> bool {
+    match std::env::var("MILNET_MILITARY_DEPLOYMENT") {
+        Ok(val) => val != "0" && val.to_lowercase() != "false",
+        Err(_) => true,
+    }
+}
+
+/// Validate an attestation certificate chain against the MDS trust store.
+pub fn validate_attestation_chain(
+    mds_store: &FidoMdsStore,
+    x5c: &[Vec<u8>],
+    attestation_type: &AttestationType,
+) -> Result<(), &'static str> {
+    match attestation_type {
+        AttestationType::None | AttestationType::SelfAttestation => Ok(()),
+        AttestationType::Basic => {
+            if x5c.is_empty() {
+                return Err("Basic attestation requires certificate chain");
+            }
+            match mds_store.validate_chain(x5c)? {
+                true => Ok(()),
+                false => {
+                    if require_military_mds() {
+                        tracing::error!(
+                            target: "siem",
+                            "SIEM:ERROR Attestation certificate chain not found in FIDO MDS trust store"
+                        );
+                        Err("Attestation chain not trusted: authenticator not in MDS trust store")
+                    } else {
+                        tracing::warn!(
+                            target: "siem",
+                            "SIEM:WARN Attestation chain not in MDS trust store, allowing in non-military mode"
+                        );
+                        Ok(())
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Minimal PEM to DER conversion.
+fn pem_to_der(pem: &[u8]) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(pem).ok()?;
+    let start = text.find("-----BEGIN CERTIFICATE-----")? + "-----BEGIN CERTIFICATE-----".len();
+    let end = text.find("-----END CERTIFICATE-----")?;
+    let b64: String = text[start..end].chars().filter(|c| !c.is_whitespace()).collect();
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.decode(&b64).ok()
 }
 
 /// Parse a CBOR-encoded attestation object and verify it.
@@ -2196,6 +2654,481 @@ mod tests {
         assert!(!encoded.contains('='));
         let decoded = base64_url_decode(&encoded).unwrap();
         assert_eq!(decoded, vec![0, 1, 2]);
+    }
+
+    // ── RS256 signature verification tests ────────────────────────────
+
+    #[test]
+    fn test_verify_signature_rs256_real() {
+        use rsa::pkcs1v15::SigningKey as RsaSigningKey;
+        use rsa::RsaPrivateKey;
+        use signature::Signer as _;
+
+        let mut rng = rand::thread_rng();
+        let private_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let public_key = private_key.to_public_key();
+        let cose = encode_cose_key_rs256(
+            &public_key.n().to_bytes_be(), &public_key.e().to_bytes_be(),
+        );
+        let auth_data = make_auth_data("sso.milnet.example", 0x05, 1);
+        let client_data_hash = Sha256::digest(b"rs256-test-data");
+        let mut msg = auth_data.clone();
+        msg.extend_from_slice(&client_data_hash);
+        let signing_key = RsaSigningKey::<Sha256>::new(private_key);
+        let sig = signing_key.sign(&msg);
+        assert!(verify_signature_rs256(&auth_data, &client_data_hash, &sig.to_vec(), &cose).is_ok());
+    }
+
+    #[test]
+    fn test_verify_signature_rs256_wrong_sig() {
+        use rsa::pkcs1v15::SigningKey as RsaSigningKey;
+        use rsa::RsaPrivateKey;
+        use signature::Signer as _;
+
+        let mut rng = rand::thread_rng();
+        let private_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let public_key = private_key.to_public_key();
+        let cose = encode_cose_key_rs256(
+            &public_key.n().to_bytes_be(), &public_key.e().to_bytes_be(),
+        );
+        let auth_data = make_auth_data("sso.milnet.example", 0x05, 1);
+        let client_data_hash = Sha256::digest(b"rs256-test-data");
+        let signing_key = RsaSigningKey::<Sha256>::new(private_key);
+        let sig = signing_key.sign(b"wrong message");
+        let err = verify_signature_rs256(&auth_data, &client_data_hash, &sig.to_vec(), &cose).unwrap_err();
+        assert_eq!(err, "RS256 signature verification failed");
+    }
+
+    #[test]
+    fn test_rs256_cose_key_roundtrip() {
+        use rsa::RsaPrivateKey;
+        let mut rng = rand::thread_rng();
+        let private_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let public_key = private_key.to_public_key();
+        let n = public_key.n().to_bytes_be();
+        let e = public_key.e().to_bytes_be();
+        let cose = encode_cose_key_rs256(&n, &e);
+        let parsed = parse_cose_key_rs256(&cose).unwrap();
+        assert_eq!(parsed.n, n);
+        assert_eq!(parsed.e, e);
+    }
+
+    #[test]
+    fn test_rs256_cose_key_wrong_kty() {
+        let mut out = Vec::new();
+        out.push(0xA4);
+        out.push(0x01); out.push(0x02); // kty=2 (wrong for RSA)
+        out.push(0x03); out.push(0x39); out.push(0x01); out.push(0x00); // alg=-257
+        out.push(0x20); out.push(0x41); out.push(0xFF); // n
+        out.push(0x21); out.push(0x41); out.push(0x01); // e
+        let err = parse_cose_key_rs256(&out).unwrap_err();
+        assert_eq!(err, "COSE key: kty must be 3 (RSA)");
+    }
+
+    // ── EdDSA signature verification tests ────────────────────────────
+
+    #[test]
+    fn test_verify_signature_eddsa_real() {
+        use ed25519_dalek::{SigningKey, Signer};
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+        let public_key = signing_key.verifying_key();
+        let cose = encode_cose_key_eddsa(&public_key.to_bytes());
+        let auth_data = make_auth_data("sso.milnet.example", 0x05, 1);
+        let client_data_hash = Sha256::digest(b"eddsa-test-data");
+        let mut msg = auth_data.clone();
+        msg.extend_from_slice(&client_data_hash);
+        let sig = signing_key.sign(&msg);
+        assert!(verify_signature_eddsa(&auth_data, &client_data_hash, &sig.to_bytes(), &cose).is_ok());
+    }
+
+    #[test]
+    fn test_verify_signature_eddsa_wrong_sig() {
+        use ed25519_dalek::{SigningKey, Signer};
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+        let public_key = signing_key.verifying_key();
+        let cose = encode_cose_key_eddsa(&public_key.to_bytes());
+        let auth_data = make_auth_data("sso.milnet.example", 0x05, 1);
+        let client_data_hash = Sha256::digest(b"eddsa-test-data");
+        let sig = signing_key.sign(b"wrong message");
+        let err = verify_signature_eddsa(&auth_data, &client_data_hash, &sig.to_bytes(), &cose).unwrap_err();
+        assert_eq!(err, "EdDSA signature verification failed");
+    }
+
+    #[test]
+    fn test_eddsa_cose_key_roundtrip() {
+        use ed25519_dalek::SigningKey;
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+        let public_key = signing_key.verifying_key();
+        let cose = encode_cose_key_eddsa(&public_key.to_bytes());
+        let parsed = parse_cose_key_eddsa(&cose).unwrap();
+        assert_eq!(parsed.x, public_key.to_bytes());
+    }
+
+    #[test]
+    fn test_eddsa_cose_key_wrong_crv() {
+        let mut out = Vec::new();
+        out.push(0xA4);
+        out.push(0x01); out.push(0x01); // kty=1
+        out.push(0x03); out.push(0x27); // alg=-8
+        out.push(0x20); out.push(0x01); // crv=1 (wrong for Ed25519!)
+        out.push(0x21); out.push(0x58); out.push(0x20);
+        out.extend_from_slice(&[0xAA; 32]);
+        let err = parse_cose_key_eddsa(&out).unwrap_err();
+        assert_eq!(err, "COSE key: crv must be 6 (Ed25519)");
+    }
+
+    #[test]
+    fn test_eddsa_signature_wrong_length() {
+        let auth_data = make_auth_data("x", 0x05, 1);
+        let hash = [0u8; 32];
+        let cose = encode_cose_key_eddsa(&[0xAA; 32]);
+        let err = verify_signature_eddsa(&auth_data, &hash, &[0u8; 63], &cose).unwrap_err();
+        assert_eq!(err, "Ed25519 signature must be 64 bytes");
+    }
+
+    // ── Algorithm detection tests ─────────────────────────────────────
+
+    #[test]
+    fn test_detect_cose_algorithm_es256() {
+        let (_, _, cose) = generate_keypair();
+        assert_eq!(detect_cose_algorithm(&cose).unwrap(), CoseAlgorithm::Es256);
+    }
+
+    #[test]
+    fn test_detect_cose_algorithm_rs256() {
+        use rsa::RsaPrivateKey;
+        let mut rng = rand::thread_rng();
+        let priv_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let pub_key = priv_key.to_public_key();
+        let cose = encode_cose_key_rs256(&pub_key.n().to_bytes_be(), &pub_key.e().to_bytes_be());
+        assert_eq!(detect_cose_algorithm(&cose).unwrap(), CoseAlgorithm::Rs256);
+    }
+
+    #[test]
+    fn test_detect_cose_algorithm_eddsa() {
+        let cose = encode_cose_key_eddsa(&[0xAA; 32]);
+        assert_eq!(detect_cose_algorithm(&cose).unwrap(), CoseAlgorithm::EdDsa);
+    }
+
+    #[test]
+    fn test_detect_cose_algorithm_unsupported() {
+        let mut out = Vec::new();
+        out.push(0xA2);
+        out.push(0x01); out.push(0x02); // kty=2
+        out.push(0x03); out.push(0x38); out.push(0x62); // alg=-99
+        let err = detect_cose_algorithm(&out).unwrap_err();
+        assert_eq!(err, "COSE key: unsupported algorithm");
+    }
+
+    // ── Multi-algorithm dispatch tests ────────────────────────────────
+
+    #[test]
+    fn test_verify_authentication_response_with_cose_es256() {
+        use crate::types::{AuthenticationResult, StoredCredential};
+        use p256::ecdsa::signature::Signer;
+        use uuid::Uuid;
+
+        let rp_id = "sso.milnet.example";
+        let (signing_key, _, cose) = generate_keypair();
+        let auth_data = make_auth_data(rp_id, 0x05, 1);
+        let client_data = b"test-cose-es256".to_vec();
+        let client_data_hash = Sha256::digest(&client_data);
+        let mut msg = auth_data.clone();
+        msg.extend_from_slice(&client_data_hash);
+        let sig: p256::ecdsa::Signature = signing_key.sign(&msg);
+
+        let auth_result = AuthenticationResult {
+            credential_id: vec![1, 2, 3],
+            authenticator_data: auth_data,
+            client_data,
+            signature: sig.to_der().to_vec(),
+        };
+        let stored = StoredCredential {
+            credential_id: vec![1, 2, 3],
+            public_key: cose,
+            user_id: Uuid::new_v4(),
+            sign_count: 0,
+            authenticator_type: "cross-platform".into(),
+        };
+        let result = verify_authentication_response(&auth_result, &stored, rp_id, true);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 1);
+    }
+
+    #[test]
+    fn test_verify_authentication_response_with_rs256() {
+        use crate::types::{AuthenticationResult, StoredCredential};
+        use rsa::pkcs1v15::SigningKey as RsaSigningKey;
+        use rsa::RsaPrivateKey;
+        use signature::Signer as _;
+        use uuid::Uuid;
+
+        let rp_id = "sso.milnet.example";
+        let mut rng = rand::thread_rng();
+        let private_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let public_key = private_key.to_public_key();
+        let cose = encode_cose_key_rs256(&public_key.n().to_bytes_be(), &public_key.e().to_bytes_be());
+        let auth_data = make_auth_data(rp_id, 0x05, 1);
+        let client_data = b"test-rs256-auth".to_vec();
+        let client_data_hash = Sha256::digest(&client_data);
+        let mut msg = auth_data.clone();
+        msg.extend_from_slice(&client_data_hash);
+        let signing_key = RsaSigningKey::<Sha256>::new(private_key);
+        let sig = signing_key.sign(&msg);
+
+        let auth_result = AuthenticationResult {
+            credential_id: vec![1, 2, 3],
+            authenticator_data: auth_data,
+            client_data,
+            signature: sig.to_vec(),
+        };
+        let stored = StoredCredential {
+            credential_id: vec![1, 2, 3],
+            public_key: cose,
+            user_id: Uuid::new_v4(),
+            sign_count: 0,
+            authenticator_type: "cross-platform".into(),
+        };
+        let result = verify_authentication_response(&auth_result, &stored, rp_id, true);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 1);
+    }
+
+    #[test]
+    fn test_verify_authentication_response_with_eddsa() {
+        use crate::types::{AuthenticationResult, StoredCredential};
+        use ed25519_dalek::{SigningKey, Signer};
+        use uuid::Uuid;
+
+        let rp_id = "sso.milnet.example";
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+        let public_key = signing_key.verifying_key();
+        let cose = encode_cose_key_eddsa(&public_key.to_bytes());
+        let auth_data = make_auth_data(rp_id, 0x05, 1);
+        let client_data = b"test-eddsa-auth".to_vec();
+        let client_data_hash = Sha256::digest(&client_data);
+        let mut msg = auth_data.clone();
+        msg.extend_from_slice(&client_data_hash);
+        let sig = signing_key.sign(&msg);
+
+        let auth_result = AuthenticationResult {
+            credential_id: vec![1, 2, 3],
+            authenticator_data: auth_data,
+            client_data,
+            signature: sig.to_bytes().to_vec(),
+        };
+        let stored = StoredCredential {
+            credential_id: vec![1, 2, 3],
+            public_key: cose,
+            user_id: Uuid::new_v4(),
+            sign_count: 0,
+            authenticator_type: "cross-platform".into(),
+        };
+        let result = verify_authentication_response(&auth_result, &stored, rp_id, true);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 1);
+    }
+
+    #[test]
+    fn test_cross_algorithm_es256_registered_rs256_verify_fails() {
+        use crate::types::{AuthenticationResult, StoredCredential};
+        use rsa::pkcs1v15::SigningKey as RsaSigningKey;
+        use rsa::RsaPrivateKey;
+        use signature::Signer as _;
+        use uuid::Uuid;
+
+        let rp_id = "sso.milnet.example";
+        let (_, _, es256_cose) = generate_keypair();
+        let mut rng = rand::thread_rng();
+        let rsa_private = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let auth_data = make_auth_data(rp_id, 0x05, 1);
+        let client_data = b"cross-algo-test".to_vec();
+        let client_data_hash = Sha256::digest(&client_data);
+        let mut msg = auth_data.clone();
+        msg.extend_from_slice(&client_data_hash);
+        let rsa_signing = RsaSigningKey::<Sha256>::new(rsa_private);
+        let sig = rsa_signing.sign(&msg);
+
+        let auth_result = AuthenticationResult {
+            credential_id: vec![1, 2, 3],
+            authenticator_data: auth_data,
+            client_data,
+            signature: sig.to_vec(),
+        };
+        let stored = StoredCredential {
+            credential_id: vec![1, 2, 3],
+            public_key: es256_cose,
+            user_id: Uuid::new_v4(),
+            sign_count: 0,
+            authenticator_type: "cross-platform".into(),
+        };
+        // ES256 key can't verify RS256 signature
+        assert!(verify_authentication_response(&auth_result, &stored, rp_id, true).is_err());
+    }
+
+    // ── FIDO MDS trust store tests ────────────────────────────────────
+
+    #[test]
+    fn test_mds_store_empty() {
+        let store = FidoMdsStore::new();
+        assert_eq!(store.root_count(), 0);
+    }
+
+    #[test]
+    fn test_mds_store_add_and_validate() {
+        let mut store = FidoMdsStore::new();
+        let root_cert = vec![0x30, 0x82, 0x01, 0x00];
+        store.add_trusted_root(root_cert.clone());
+        assert_eq!(store.root_count(), 1);
+        assert!(store.validate_chain(&[root_cert.clone()]).unwrap());
+        assert!(!store.validate_chain(&[vec![0xFF, 0xFF]]).unwrap());
+    }
+
+    #[test]
+    fn test_mds_store_empty_chain_rejected() {
+        let store = FidoMdsStore::new();
+        assert!(store.validate_chain(&[]).is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn test_validate_attestation_chain_military_rejects_unknown() {
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        let store = FidoMdsStore::new();
+        let x5c = vec![vec![0x30, 0x82, 0x01, 0x00]];
+        let err = validate_attestation_chain(&store, &x5c, &AttestationType::Basic).unwrap_err();
+        assert!(err.contains("not in MDS trust store"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_validate_attestation_chain_non_military_allows_unknown() {
+        std::env::set_var("MILNET_MILITARY_DEPLOYMENT", "false");
+        let store = FidoMdsStore::new();
+        let x5c = vec![vec![0x30, 0x82, 0x01, 0x00]];
+        assert!(validate_attestation_chain(&store, &x5c, &AttestationType::Basic).is_ok());
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+    }
+
+    #[test]
+    fn test_validate_attestation_chain_none_type_ok() {
+        let store = FidoMdsStore::new();
+        assert!(validate_attestation_chain(&store, &[], &AttestationType::None).is_ok());
+    }
+
+    #[test]
+    fn test_validate_attestation_chain_self_type_ok() {
+        let store = FidoMdsStore::new();
+        assert!(validate_attestation_chain(&store, &[], &AttestationType::SelfAttestation).is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn test_validate_attestation_chain_trusted_root_accepted() {
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        let mut store = FidoMdsStore::new();
+        let root = vec![0x30, 0x82, 0x02, 0x00, 0xAA, 0xBB];
+        store.add_trusted_root(root.clone());
+        let x5c = vec![vec![0x30, 0x01], root];
+        assert!(validate_attestation_chain(&store, &x5c, &AttestationType::Basic).is_ok());
+    }
+
+    // ── Adversarial / hardening tests ─────────────────────────────────
+
+    #[test]
+    fn test_malformed_cose_key_wrong_kty_for_es256() {
+        let mut out = Vec::new();
+        out.push(0xA5);
+        out.push(0x01); out.push(0x03); // kty=3 (RSA, wrong for ES256)
+        out.push(0x03); out.push(0x26); // alg=-7
+        out.push(0x20); out.push(0x01);
+        out.push(0x21); out.push(0x58); out.push(0x20);
+        out.extend_from_slice(&[0xAA; 32]);
+        out.push(0x22); out.push(0x58); out.push(0x20);
+        out.extend_from_slice(&[0xBB; 32]);
+        assert_eq!(parse_cose_key_es256(&out).unwrap_err(), "COSE key: kty must be 2 (EC2)");
+    }
+
+    #[test]
+    fn test_malformed_cose_key_wrong_kty_for_eddsa() {
+        let mut out = Vec::new();
+        out.push(0xA4);
+        out.push(0x01); out.push(0x02); // kty=2 (EC2, wrong for EdDSA)
+        out.push(0x03); out.push(0x27);
+        out.push(0x20); out.push(0x06);
+        out.push(0x21); out.push(0x58); out.push(0x20);
+        out.extend_from_slice(&[0xAA; 32]);
+        assert_eq!(parse_cose_key_eddsa(&out).unwrap_err(), "COSE key: kty must be 1 (OKP) for EdDSA");
+    }
+
+    #[test]
+    fn test_truncated_es256_signature() {
+        let (_, sec1, _) = generate_keypair();
+        let auth_data = make_auth_data("x", 0x05, 1);
+        let hash = [0u8; 32];
+        assert_eq!(verify_signature_es256(&auth_data, &hash, &[0x30, 0x06, 0x02], &sec1).unwrap_err(),
+            "Invalid DER signature encoding");
+    }
+
+    #[test]
+    fn test_signature_with_wrong_algorithm_key() {
+        use ed25519_dalek::{SigningKey, Signer};
+        let mut rng = rand::thread_rng();
+        let ed_signing = SigningKey::generate(&mut rng);
+        let auth_data = make_auth_data("x", 0x05, 1);
+        let hash = [0u8; 32];
+        let mut msg = auth_data.clone();
+        msg.extend_from_slice(&hash);
+        let sig = ed_signing.sign(&msg);
+        let (_, sec1, _) = generate_keypair();
+        assert_eq!(verify_signature_es256(&auth_data, &hash, &sig.to_bytes(), &sec1).unwrap_err(),
+            "Invalid DER signature encoding");
+    }
+
+    #[test]
+    fn test_oversized_authenticator_data_parsed() {
+        let rp_id = "sso.milnet.example";
+        let rp_hash = Sha256::digest(rp_id.as_bytes());
+        let mut auth_data = Vec::new();
+        auth_data.extend_from_slice(&rp_hash);
+        auth_data.push(0x45); // UP | UV | AT
+        auth_data.extend_from_slice(&0u32.to_be_bytes());
+        auth_data.extend_from_slice(&[0u8; 16]); // AAGUID
+        auth_data.push(0xFF); auth_data.push(0xFF); // cred ID len = 65535
+        auth_data.extend_from_slice(&[0xAA; 10]);
+        assert_eq!(parse_attestation_auth_data(&auth_data, rp_id).unwrap_err(),
+            "Authenticator data truncated before public key");
+    }
+
+    #[test]
+    fn test_authenticator_data_wrong_rp_id_hash() {
+        let auth_data = make_auth_data("attacker.example.com", 0x05, 1);
+        let parsed = parse_authenticator_data(&auth_data).unwrap();
+        assert_eq!(validate_rp_id_hash(&parsed, "sso.milnet.example").unwrap_err(), "RP ID hash mismatch");
+    }
+
+    #[test]
+    fn test_eddsa_truncated_public_key() {
+        let mut out = Vec::new();
+        out.push(0xA4);
+        out.push(0x01); out.push(0x01);
+        out.push(0x03); out.push(0x27);
+        out.push(0x20); out.push(0x06);
+        out.push(0x21); out.push(0x58); out.push(0x10); // 16 bytes, needs 32
+        out.extend_from_slice(&[0xAA; 16]);
+        assert_eq!(parse_cose_key_eddsa(&out).unwrap_err(), "COSE key: Ed25519 public key must be 32 bytes");
+    }
+
+    #[test]
+    fn test_rs256_empty_signature() {
+        let auth_data = make_auth_data("x", 0x05, 1);
+        let hash = [0u8; 32];
+        let cose = encode_cose_key_rs256(&[0xFF; 128], &[0x01, 0x00, 0x01]);
+        assert_eq!(verify_signature_rs256(&auth_data, &hash, &[], &cose).unwrap_err(), "Signature is empty");
     }
 
     // ── Minimal CBOR reader tests ──────────────────────────────────────

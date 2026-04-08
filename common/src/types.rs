@@ -520,6 +520,29 @@ impl std::fmt::Debug for AuditEntry {
     }
 }
 
+/// Zeroize PII and cryptographic material on drop to prevent memory forensics.
+impl Drop for AuditEntry {
+    fn drop(&mut self) {
+        self.signature.zeroize();
+        self.prev_hash.zeroize();
+        if let Some(ref mut ip) = self.source_ip {
+            ip.zeroize();
+        }
+        if let Some(ref mut ua) = self.user_agent {
+            ua.zeroize();
+        }
+        if let Some(ref mut sid) = self.session_id {
+            sid.zeroize();
+        }
+        if let Some(ref mut rid) = self.request_id {
+            rid.zeroize();
+        }
+        if let Some(ref mut tid) = self.trace_id {
+            tid.zeroize();
+        }
+    }
+}
+
 // ── ShardMessage (spec Section 11) ────────────────────────────────────
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -575,6 +598,22 @@ impl std::fmt::Debug for StoredRecoveryCode {
             .field("created_at", &self.created_at)
             .field("expires_at", &self.expires_at)
             .finish()
+    }
+}
+
+/// Zeroize cryptographic material on drop.
+impl Drop for StoredRecoveryCode {
+    fn drop(&mut self) {
+        self.code_hash.zeroize();
+        self.code_salt.zeroize();
+    }
+}
+
+/// Zeroize sensitive payload and HMAC on drop.
+impl Drop for ShardMessage {
+    fn drop(&mut self) {
+        self.payload.zeroize();
+        self.hmac.zeroize();
     }
 }
 
@@ -670,4 +709,103 @@ mod tests {
     test_uuid_newtype!(TenantId, tenant_id);
     test_uuid_newtype!(SessionId, session_id);
     test_uuid_newtype!(PortalId, portal_id);
+
+    // ── Zeroization tests ──────────────────────────────────────────────
+
+    #[test]
+    fn audit_entry_drop_runs_without_panic() {
+        let entry = AuditEntry {
+            event_id: Uuid::new_v4(),
+            event_type: AuditEventType::AuthSuccess,
+            user_ids: vec![Uuid::new_v4()],
+            device_ids: vec![],
+            ceremony_receipts: vec![],
+            risk_score: 0.5,
+            timestamp: 1_000_000,
+            prev_hash: [0xAA; 64],
+            signature: vec![0xBB; 64],
+            classification: 0,
+            correlation_id: None,
+            trace_id: Some("trace-123".to_string()),
+            source_ip: Some("10.0.0.1".to_string()),
+            session_id: Some("sess-abc".to_string()),
+            request_id: Some("req-xyz".to_string()),
+            user_agent: Some("TestAgent/1.0".to_string()),
+        };
+        drop(entry);
+    }
+
+    #[test]
+    fn audit_entry_drop_handles_none_fields() {
+        let entry = AuditEntry {
+            event_id: Uuid::new_v4(),
+            event_type: AuditEventType::AuthFailure,
+            user_ids: vec![],
+            device_ids: vec![],
+            ceremony_receipts: vec![],
+            risk_score: 0.0,
+            timestamp: 0,
+            prev_hash: [0; 64],
+            signature: vec![],
+            classification: 0,
+            correlation_id: None,
+            trace_id: None,
+            source_ip: None,
+            session_id: None,
+            request_id: None,
+            user_agent: None,
+        };
+        drop(entry);
+    }
+
+    #[test]
+    fn audit_entry_drop_large_signature_no_panic() {
+        let entry = AuditEntry {
+            event_id: Uuid::new_v4(),
+            event_type: AuditEventType::AuthSuccess,
+            user_ids: vec![],
+            device_ids: vec![],
+            ceremony_receipts: vec![],
+            risk_score: 0.0,
+            timestamp: 0,
+            prev_hash: [0; 64],
+            signature: vec![0xFFu8; 1_000_000],
+            classification: 0,
+            correlation_id: None,
+            trace_id: None,
+            source_ip: None,
+            session_id: None,
+            request_id: None,
+            user_agent: None,
+        };
+        drop(entry);
+    }
+
+    #[test]
+    fn shard_message_drop_runs_without_panic() {
+        let msg = ShardMessage {
+            version: 1,
+            sender_module: ModuleId::Gateway,
+            sequence: 42,
+            timestamp: 1_000_000,
+            payload: vec![0xDD; 128],
+            hmac: [0xEE; 64],
+        };
+        drop(msg);
+    }
+
+    #[test]
+    fn stored_recovery_code_drop_runs_without_panic() {
+        let code = StoredRecoveryCode {
+            id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            code_hash: vec![0xAA; 32],
+            code_salt: vec![0xBB; 16],
+            is_used: false,
+            used_at: None,
+            created_at: 1_000_000,
+            expires_at: 2_000_000,
+        };
+        drop(code);
+    }
 }

@@ -16,7 +16,11 @@
 //! - Failover events are audit-logged
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 
 /// Health status of a database node.
@@ -95,6 +99,192 @@ pub struct TrackedNode {
     pub consecutive_failures: u32,
 }
 
+// ===========================================================================
+// PgExecutor trait for testability
+// ===========================================================================
+
+/// Trait abstracting PostgreSQL operations for testability.
+/// Production uses real connections; tests use a mock.
+pub trait PgExecutor: Send + Sync {
+    /// Execute `SELECT pg_promote(true, 30)` on the given connection URL.
+    fn pg_promote(
+        &self,
+        connection_url: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>>;
+
+    /// Check if the node is still in recovery mode.
+    fn pg_is_in_recovery(
+        &self,
+        connection_url: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>>;
+
+    /// Verify the node accepts writes.
+    fn verify_writable(
+        &self,
+        connection_url: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>;
+
+    /// Terminate all connections on the given node (STONITH).
+    fn pg_terminate_all(
+        &self,
+        connection_url: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, String>> + Send + '_>>;
+
+    /// Check the current WAL LSN position.
+    fn pg_current_wal_lsn(
+        &self,
+        connection_url: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, String>> + Send + '_>>;
+}
+
+/// Production PostgreSQL executor using sqlx.
+pub struct SqlxPgExecutor {
+    pub connect_timeout_secs: u64,
+}
+
+impl SqlxPgExecutor {
+    pub fn new(connect_timeout_secs: u64) -> Self {
+        Self {
+            connect_timeout_secs,
+        }
+    }
+}
+
+impl PgExecutor for SqlxPgExecutor {
+    fn pg_promote(
+        &self,
+        connection_url: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
+        let url = connection_url.to_string();
+        let timeout_secs = self.connect_timeout_secs;
+        Box::pin(async move {
+            use sqlx::Connection;
+            let mut conn = tokio::time::timeout(
+                std::time::Duration::from_secs(timeout_secs),
+                sqlx::postgres::PgConnection::connect(&url),
+            )
+            .await
+            .map_err(|_| "connect timeout during pg_promote".to_string())?
+            .map_err(|e| format!("connect error during pg_promote: {e}"))?;
+
+            let result: (bool,) = sqlx::query_as("SELECT pg_promote(true, 30)")
+                .fetch_one(&mut conn)
+                .await
+                .map_err(|e| format!("pg_promote() SQL error: {e}"))?;
+            Ok(result.0)
+        })
+    }
+
+    fn pg_is_in_recovery(
+        &self,
+        connection_url: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
+        let url = connection_url.to_string();
+        let timeout_secs = self.connect_timeout_secs;
+        Box::pin(async move {
+            use sqlx::Connection;
+            let mut conn = tokio::time::timeout(
+                std::time::Duration::from_secs(timeout_secs),
+                sqlx::postgres::PgConnection::connect(&url),
+            )
+            .await
+            .map_err(|_| "connect timeout during pg_is_in_recovery".to_string())?
+            .map_err(|e| format!("connect error during pg_is_in_recovery: {e}"))?;
+
+            let result: (bool,) = sqlx::query_as("SELECT pg_is_in_recovery()")
+                .fetch_one(&mut conn)
+                .await
+                .map_err(|e| format!("pg_is_in_recovery() SQL error: {e}"))?;
+            Ok(result.0)
+        })
+    }
+
+    fn verify_writable(
+        &self,
+        connection_url: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        let url = connection_url.to_string();
+        let timeout_secs = self.connect_timeout_secs;
+        Box::pin(async move {
+            use sqlx::Connection;
+            let mut conn = tokio::time::timeout(
+                std::time::Duration::from_secs(timeout_secs),
+                sqlx::postgres::PgConnection::connect(&url),
+            )
+            .await
+            .map_err(|_| "connect timeout during verify_writable".to_string())?
+            .map_err(|e| format!("connect error during verify_writable: {e}"))?;
+
+            sqlx::query("CREATE TEMP TABLE _failover_test(id int)")
+                .execute(&mut conn)
+                .await
+                .map_err(|e| format!("write verification failed: {e}"))?;
+            let _ = sqlx::query("DROP TABLE IF EXISTS _failover_test")
+                .execute(&mut conn)
+                .await;
+            Ok(())
+        })
+    }
+
+    fn pg_terminate_all(
+        &self,
+        connection_url: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, String>> + Send + '_>> {
+        let url = connection_url.to_string();
+        let timeout_secs = self.connect_timeout_secs;
+        Box::pin(async move {
+            use sqlx::Connection;
+            let mut conn = tokio::time::timeout(
+                std::time::Duration::from_secs(timeout_secs),
+                sqlx::postgres::PgConnection::connect(&url),
+            )
+            .await
+            .map_err(|_| "connect timeout during pg_terminate_all".to_string())?
+            .map_err(|e| format!("connect error during pg_terminate_all: {e}"))?;
+
+            let result = sqlx::query_as::<_, (i64,)>(
+                "SELECT count(*) FROM (SELECT pg_terminate_backend(pid) \
+                 FROM pg_stat_activity \
+                 WHERE datname = current_database() AND pid != pg_backend_pid()) t",
+            )
+            .fetch_one(&mut conn)
+            .await
+            .map_err(|e| format!("pg_terminate_backend failed: {e}"))?;
+            Ok(result.0 as u64)
+        })
+    }
+
+    fn pg_current_wal_lsn(
+        &self,
+        connection_url: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, String>> + Send + '_>> {
+        let url = connection_url.to_string();
+        let timeout_secs = self.connect_timeout_secs;
+        Box::pin(async move {
+            use sqlx::Connection;
+            let mut conn = tokio::time::timeout(
+                std::time::Duration::from_secs(timeout_secs),
+                sqlx::postgres::PgConnection::connect(&url),
+            )
+            .await
+            .map_err(|_| "connect timeout during pg_current_wal_lsn".to_string())?
+            .map_err(|e| format!("connect error during pg_current_wal_lsn: {e}"))?;
+
+            let result: (i64,) = sqlx::query_as(
+                "SELECT CAST(pg_catalog.pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0') AS bigint)",
+            )
+            .fetch_one(&mut conn)
+            .await
+            .map_err(|e| format!("pg_current_wal_lsn query failed: {e}"))?;
+            Ok(result.0 as u64)
+        })
+    }
+}
+
+// ===========================================================================
+// HaPool
+// ===========================================================================
+
 /// High-Availability database pool with read/write routing.
 pub struct HaPool {
     primary: TrackedNode,
@@ -107,6 +297,8 @@ pub struct HaPool {
     /// checker can verify the promoted node is accepting writes.
     last_promotion_target: AtomicBool,
     config: HaConfig,
+    /// Blocklist of node IDs fenced via STONITH.
+    stonith_blocklist: Mutex<HashSet<String>>,
 }
 
 impl HaPool {
@@ -138,6 +330,7 @@ impl HaPool {
             degraded: AtomicBool::new(false),
             last_promotion_target: AtomicBool::new(false),
             config,
+            stonith_blocklist: Mutex::new(HashSet::new()),
         }
     }
 
@@ -247,31 +440,15 @@ pub struct ClusterHealth {
 // ===========================================================================
 
 /// Configuration for automatic database failover.
-///
-/// Failover is ONLY triggered after the primary has been unreachable for
-/// `failover_threshold_secs` consecutive seconds AND the required quorum
-/// of replicas agrees that the primary is down. This prevents false-positive
-/// failovers caused by transient network partitions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutoFailoverConfig {
     /// How long the primary must be unreachable before failover is attempted (seconds).
-    /// Default: 30 seconds. Lower values increase failover speed but also
-    /// increase the risk of unnecessary failovers during transient outages.
     pub failover_threshold_secs: u64,
-    /// Maximum replication lag (in milliseconds) for a replica to be eligible
-    /// for promotion. Only replicas within this lag window can become the new
-    /// primary — this limits data loss during failover.
-    /// Default: 100ms.
+    /// Maximum replication lag (in milliseconds) for a replica to be eligible for promotion.
     pub min_replica_lag_for_promotion_ms: u64,
-    /// Whether to require a majority of replicas to agree that the primary is
-    /// down before triggering failover. This prevents split-brain scenarios
-    /// where a network partition makes the primary appear down to a minority
-    /// of nodes.
-    /// Default: true.
+    /// Whether to require a majority of replicas to agree that the primary is down.
     pub require_quorum: bool,
     /// Number of consecutive health check failures required before failover.
-    /// Prevents single-check false positives.
-    /// Default: 3.
     pub consecutive_failure_threshold: u32,
 }
 
@@ -318,14 +495,9 @@ impl HaPool {
     /// 2. Query all replicas for their replication lag
     /// 3. Select the replica with the lowest lag within the promotion threshold
     /// 4. If quorum required, verify majority of replicas agree primary is down
-    /// 5. Promote selected replica via `SELECT pg_promote()` (PostgreSQL 12+)
+    /// 5. Schedule promotion via PgExecutor (caller must follow up with execute_pg_promote_async)
     /// 6. Update internal routing to point to the new primary
     /// 7. Log SIEM audit event for the failover
-    ///
-    /// Returns a `FailoverResult` indicating success/failure and details.
-    ///
-    /// SECURITY: This method logs a SIEM event regardless of outcome.
-    /// Failover is an auditable cluster-level operation.
     pub fn attempt_automatic_failover(
         &mut self,
         config: &AutoFailoverConfig,
@@ -337,7 +509,7 @@ impl HaPool {
                 success: false,
                 promoted_node_id: None,
                 promoted_lag_ms: None,
-                reason: "primary is not unhealthy — failover not needed".into(),
+                reason: "primary is not unhealthy -- failover not needed".into(),
             });
         }
 
@@ -348,18 +520,13 @@ impl HaPool {
                 promoted_node_id: None,
                 promoted_lag_ms: None,
                 reason: format!(
-                    "primary consecutive failures ({}) below threshold ({}) — waiting",
-                    self.primary.consecutive_failures,
-                    config.consecutive_failure_threshold
+                    "primary consecutive failures ({}) below threshold ({}) -- waiting",
+                    self.primary.consecutive_failures, config.consecutive_failure_threshold
                 ),
             });
         }
 
-        // Check if primary has been down long enough
-        let primary_down_duration = self.primary.last_check
-            .map(|t| t.elapsed().as_secs())
-            .unwrap_or(0);
-
+        // Check if primary has been down long enough.
         // Use consecutive_failures * health_check_interval as a proxy for downtime
         let estimated_downtime_secs =
             self.primary.consecutive_failures as u64 * self.config.health_check_interval_secs;
@@ -371,8 +538,7 @@ impl HaPool {
                 promoted_lag_ms: None,
                 reason: format!(
                     "primary estimated downtime ({}s) below threshold ({}s)",
-                    estimated_downtime_secs,
-                    config.failover_threshold_secs
+                    estimated_downtime_secs, config.failover_threshold_secs
                 ),
             });
         }
@@ -399,11 +565,11 @@ impl HaPool {
             });
         }
 
-        // Step 3: Sort by lag (lowest first) — promote the most up-to-date replica
+        // Step 3: Sort by lag (lowest first)
         eligible.sort_by_key(|r| r.lag_ms);
         let best_candidate = eligible[0];
 
-        // Step 4: Quorum check — majority of replicas must agree primary is down
+        // Step 4: Quorum check
         if config.require_quorum {
             let total_replicas = replica_lags.len();
             let replicas_reporting_down = replica_lags
@@ -417,8 +583,7 @@ impl HaPool {
                     reporting_down = replicas_reporting_down,
                     quorum_needed = quorum_needed,
                     total = total_replicas,
-                    "SIEM:WARN automatic failover BLOCKED: quorum not met — \
-                     possible network partition (not all replicas agree primary is down)"
+                    "SIEM:WARN automatic failover BLOCKED: quorum not met"
                 );
                 return Ok(FailoverResult {
                     success: false,
@@ -433,8 +598,6 @@ impl HaPool {
         }
 
         // Step 5: Promote the selected replica
-        // In production, this executes: SELECT pg_promote() on the selected replica.
-        // The SQL is parameterized and executed via the replica's connection.
         let promoted_node_id = best_candidate.node_id.clone();
         let promoted_lag_ms = best_candidate.lag_ms;
 
@@ -445,56 +608,31 @@ impl HaPool {
             primary_failures = self.primary.consecutive_failures,
             "SIEM:CRITICAL AUTOMATIC FAILOVER: promoting replica {} to primary \
              (primary unreachable for ~{}s, replica lag {}ms)",
-            promoted_node_id, estimated_downtime_secs, promoted_lag_ms
+            promoted_node_id,
+            estimated_downtime_secs,
+            promoted_lag_ms
         );
 
-        // Step 5b: Execute pg_promote() on the selected replica.
-        // This is the actual PostgreSQL promotion command (PostgreSQL 12+).
-        // The replica will disconnect from the old primary, enter read-write mode,
-        // and begin accepting writes as the new primary.
-        tracing::info!(
-            target: "siem",
-            promoted_node = %promoted_node_id,
-            "SIEM:CRITICAL Executing pg_promote() on replica {}",
-            promoted_node_id
-        );
-
-        // Find the promoted replica's connection URL
-        let promoted_url = self.replicas.iter()
+        // Verify the promoted replica exists in our pool
+        let _promoted_url = self
+            .replicas
+            .iter()
             .find(|r| r.config.node_id == promoted_node_id)
             .map(|r| r.config.connection_url.clone())
             .ok_or_else(|| format!("promoted replica {} not found in pool", promoted_node_id))?;
 
-        // Execute the promotion SQL. This is a blocking operation that must succeed
-        // for failover to be valid. If it fails, we abort the failover.
-        // NOTE: In production, this would use the actual sqlx pool connection.
-        // The promotion is a PostgreSQL built-in function that transitions a
-        // standby server to primary mode.
-        let promote_result = self.execute_pg_promote(&promoted_url);
-        if let Err(ref e) = promote_result {
-            tracing::error!(
-                target: "siem",
-                error = %e,
-                promoted_node = %promoted_node_id,
-                "SIEM:CRITICAL pg_promote() FAILED on replica {}. Failover aborted.",
-                promoted_node_id
-            );
-            return Ok(FailoverResult {
-                success: false,
-                promoted_node_id: Some(promoted_node_id),
-                promoted_lag_ms: Some(promoted_lag_ms),
-                reason: format!("pg_promote() failed: {}", e),
-            });
-        }
+        // Store promotion intent. The caller must follow up with
+        // execute_pg_promote_async() to complete the actual SQL promotion.
+        self.last_promotion_target.store(true, Ordering::SeqCst);
 
         tracing::info!(
             target: "siem",
             promoted_node = %promoted_node_id,
-            "pg_promote() succeeded on replica {}",
+            "SIEM:CRITICAL pg_promote() scheduled on replica {} (async execution via PgExecutor)",
             promoted_node_id
         );
 
-        // Step 6: Update internal state — swap the promoted replica into the primary slot
+        // Step 6: Update internal state
         let mut new_primary_idx = None;
         for (i, replica) in self.replicas.iter().enumerate() {
             if replica.config.node_id == promoted_node_id {
@@ -504,16 +642,13 @@ impl HaPool {
         }
 
         if let Some(idx) = new_primary_idx {
-            // Swap: old primary becomes a (stale) replica, promoted replica becomes primary
             let old_primary_config = self.primary.config.clone();
             let old_primary_failures = self.primary.consecutive_failures;
             let promoted_replica = self.replicas.remove(idx);
 
-            // Update the promoted node's role
             let mut new_primary_config = promoted_replica.config;
             new_primary_config.role = NodeRole::Primary;
 
-            // Demote old primary to replica (it will be fenced if split-brain detected)
             let mut demoted_config = old_primary_config;
             demoted_config.role = NodeRole::Replica;
 
@@ -533,7 +668,6 @@ impl HaPool {
                 consecutive_failures: old_primary_failures,
             });
 
-            // Clear degraded flag since we have a new healthy primary
             self.degraded.store(false, Ordering::Relaxed);
 
             Ok(FailoverResult {
@@ -548,7 +682,7 @@ impl HaPool {
                 promoted_node_id: None,
                 promoted_lag_ms: None,
                 reason: format!(
-                    "promoted replica '{}' not found in pool — inconsistent state",
+                    "promoted replica '{}' not found in pool -- inconsistent state",
                     promoted_node_id
                 ),
             })
@@ -557,55 +691,269 @@ impl HaPool {
 
     /// Detect split-brain condition: multiple nodes claiming to be primary.
     ///
-    /// Split-brain occurs when a network partition heals and the old primary
-    /// (which was replaced during failover) comes back online and still believes
-    /// it is the primary. This creates TWO nodes accepting writes, leading to
-    /// data divergence and potential corruption.
-    ///
-    /// DETECTION: If any replica reports itself as a primary (via
-    /// `pg_is_in_recovery() = false`), and our current primary is also healthy,
-    /// we have a split-brain.
-    ///
-    /// RESPONSE: Log CRITICAL SIEM event and return true. The caller MUST
-    /// fence the old primary (e.g., `pg_ctl stop -m immediate` or STONITH).
-    pub fn detect_split_brain(&self, replica_self_reports: &[(String, bool)]) -> bool {
-        // replica_self_reports: Vec of (node_id, is_primary_self_report)
-        // is_primary_self_report = true means the node reports pg_is_in_recovery() = false
+    /// Returns the list of conflicting node IDs that claim primary status.
+    /// The caller MUST pass these to `stonith_fence_node()` for automated fencing.
+    pub fn detect_split_brain(&self, replica_self_reports: &[(String, bool)]) -> Vec<String> {
         let primary_healthy = self.primary.health == NodeHealth::Healthy
             || self.primary.health == NodeHealth::Unknown;
 
         if !primary_healthy {
-            return false;
+            return vec![];
         }
 
+        let mut conflicting = vec![];
         for (node_id, claims_primary) in replica_self_reports {
             if *claims_primary {
                 tracing::error!(
                     current_primary = %self.primary.config.node_id,
                     conflicting_node = %node_id,
                     "SIEM:CRITICAL SPLIT-BRAIN DETECTED: node '{}' claims to be primary \
-                     while '{}' is already the active primary. IMMEDIATE ACTION REQUIRED: \
-                     fence the old primary to prevent data divergence.",
-                    node_id, self.primary.config.node_id
+                     while '{}' is already the active primary. STONITH fencing required.",
+                    node_id,
+                    self.primary.config.node_id
                 );
-                return true;
+                conflicting.push(node_id.clone());
             }
         }
 
-        false
+        if !conflicting.is_empty() {
+            let event = crate::siem::SecurityEvent {
+                timestamp: crate::siem::SecurityEvent::now_iso8601(),
+                category: "db_ha",
+                action: "split_brain_detected",
+                severity: crate::siem::Severity::Critical,
+                outcome: "failure",
+                user_id: None,
+                source_ip: None,
+                detail: Some(format!(
+                    "current_primary={} conflicting_nodes={:?}",
+                    self.primary.config.node_id, conflicting
+                )),
+            };
+            event.emit();
+        }
+
+        conflicting
+    }
+
+    /// STONITH (Shoot The Other Node In The Head): fence a stale primary.
+    ///
+    /// Terminates all connections on the stale node, adds it to the blocklist,
+    /// and emits a SIEM CRITICAL event.
+    pub async fn stonith_fence_node(
+        &self,
+        stale_node_id: &str,
+        executor: &dyn PgExecutor,
+    ) -> Result<(), String> {
+        let stale_url = self
+            .replicas
+            .iter()
+            .find(|r| r.config.node_id == stale_node_id)
+            .map(|r| r.config.connection_url.clone())
+            .or_else(|| {
+                if self.primary.config.node_id == stale_node_id {
+                    Some(self.primary.config.connection_url.clone())
+                } else {
+                    None
+                }
+            });
+
+        let mut terminated = 0u64;
+        if let Some(ref url) = stale_url {
+            match executor.pg_terminate_all(url).await {
+                Ok(count) => {
+                    terminated = count;
+                    tracing::warn!(
+                        stale_node = %stale_node_id,
+                        terminated_connections = count,
+                        "SIEM:CRITICAL STONITH: terminated {} connections on stale primary {}",
+                        count,
+                        stale_node_id
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        stale_node = %stale_node_id,
+                        error = %e,
+                        "SIEM:CRITICAL STONITH: failed to terminate connections on {}. \
+                         Adding to blocklist as fallback.",
+                        stale_node_id
+                    );
+                }
+            }
+        }
+
+        {
+            let mut blocklist = self.stonith_blocklist.lock().unwrap_or_else(|p| p.into_inner());
+            blocklist.insert(stale_node_id.to_string());
+        }
+
+        let event = crate::siem::SecurityEvent {
+            timestamp: crate::siem::SecurityEvent::now_iso8601(),
+            category: "db_ha",
+            action: "stonith_fence",
+            severity: crate::siem::Severity::Critical,
+            outcome: "success",
+            user_id: None,
+            source_ip: None,
+            detail: Some(format!(
+                "fenced_node={} terminated_connections={} blocklisted=true",
+                stale_node_id, terminated
+            )),
+        };
+        event.emit();
+
+        Ok(())
+    }
+
+    /// Check if a node is blocklisted (fenced via STONITH).
+    pub fn is_stonith_blocklisted(&self, node_id: &str) -> bool {
+        let blocklist = self.stonith_blocklist.lock().unwrap_or_else(|p| p.into_inner());
+        blocklist.contains(node_id)
+    }
+
+    /// Execute the full async failover promotion sequence with retry.
+    ///
+    /// 1. Execute `SELECT pg_promote(true, 30)` on the replica
+    /// 2. Poll `SELECT pg_is_in_recovery()` until false (with timeout)
+    /// 3. Verify writes with a temp table
+    ///
+    /// Retries up to 3 times with exponential backoff.
+    pub async fn execute_pg_promote_async(
+        &self,
+        connection_url: &str,
+        promoted_node_id: &str,
+        executor: &dyn PgExecutor,
+    ) -> Result<(), String> {
+        const MAX_ATTEMPTS: u32 = 3;
+        const RECOVERY_POLL_INTERVAL_MS: u64 = 500;
+        const RECOVERY_POLL_TIMEOUT_SECS: u64 = 60;
+
+        let mut last_err = String::new();
+
+        for attempt in 1..=MAX_ATTEMPTS {
+            if attempt > 1 {
+                let backoff_ms = 100 * (1u64 << (attempt - 1));
+                tracing::warn!(
+                    attempt = attempt,
+                    promoted_node = %promoted_node_id,
+                    "SIEM:WARN Retrying pg_promote() (attempt {}/{})",
+                    attempt,
+                    MAX_ATTEMPTS
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+            }
+
+            match executor.pg_promote(connection_url).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    last_err = "pg_promote() returned false".to_string();
+                    continue;
+                }
+                Err(e) => {
+                    last_err = e;
+                    continue;
+                }
+            }
+
+            // Poll pg_is_in_recovery() until false
+            let poll_start = std::time::Instant::now();
+            let mut promoted = false;
+            while poll_start.elapsed().as_secs() < RECOVERY_POLL_TIMEOUT_SECS {
+                match executor.pg_is_in_recovery(connection_url).await {
+                    Ok(false) => {
+                        promoted = true;
+                        break;
+                    }
+                    Ok(true) | Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            RECOVERY_POLL_INTERVAL_MS,
+                        ))
+                        .await;
+                    }
+                }
+            }
+
+            if !promoted {
+                last_err = format!(
+                    "replica did not exit recovery within {}s",
+                    RECOVERY_POLL_TIMEOUT_SECS
+                );
+                continue;
+            }
+
+            // Verify the new primary accepts writes
+            match executor.verify_writable(connection_url).await {
+                Ok(()) => {}
+                Err(e) => {
+                    last_err = format!("write verification failed: {e}");
+                    continue;
+                }
+            }
+
+            // Success
+            let event = crate::siem::SecurityEvent {
+                timestamp: crate::siem::SecurityEvent::now_iso8601(),
+                category: "db_ha",
+                action: "failover_promoted",
+                severity: crate::siem::Severity::Critical,
+                outcome: "success",
+                user_id: None,
+                source_ip: None,
+                detail: Some(format!(
+                    "promoted_node={} attempts={}",
+                    promoted_node_id, attempt
+                )),
+            };
+            event.emit();
+
+            self.last_promotion_target.store(false, Ordering::SeqCst);
+            return Ok(());
+        }
+
+        // All retries exhausted
+        let event = crate::siem::SecurityEvent {
+            timestamp: crate::siem::SecurityEvent::now_iso8601(),
+            category: "db_ha",
+            action: "failover_promotion_failed",
+            severity: crate::siem::Severity::Critical,
+            outcome: "failure",
+            user_id: None,
+            source_ip: None,
+            detail: Some(format!(
+                "promoted_node={} error={}",
+                promoted_node_id, last_err
+            )),
+        };
+        event.emit();
+
+        Err(format!(
+            "pg_promote() failed after {} attempts: {}",
+            MAX_ATTEMPTS, last_err
+        ))
+    }
+
+    /// Verify the new primary has the latest WAL position.
+    pub async fn verify_wal_position(
+        &self,
+        connection_url: &str,
+        min_wal_lsn: u64,
+        executor: &dyn PgExecutor,
+    ) -> Result<(), String> {
+        let current_lsn = executor.pg_current_wal_lsn(connection_url).await?;
+        if current_lsn >= min_wal_lsn {
+            Ok(())
+        } else {
+            Err(format!(
+                "WAL position {} is behind minimum {}, data loss risk",
+                current_lsn, min_wal_lsn
+            ))
+        }
     }
 
     /// Consensus-based health check: trigger failover if 2+ replicas report
     /// the primary as unreachable.
-    ///
-    /// This is more robust than single-point health checks because it uses
-    /// multiple vantage points. A single replica reporting primary-down could
-    /// be a network issue between that replica and the primary. But if 2+
-    /// replicas independently agree, the primary is likely genuinely down.
-    pub fn consensus_health_check(
-        &mut self,
-        replica_reports: &[(String, bool)],
-    ) -> bool {
+    pub fn consensus_health_check(&mut self, replica_reports: &[(String, bool)]) -> bool {
         let reporting_primary_down = replica_reports
             .iter()
             .filter(|(_, primary_unreachable)| *primary_unreachable)
@@ -615,55 +963,15 @@ impl HaPool {
             tracing::warn!(
                 replicas_reporting_down = reporting_primary_down,
                 total_replicas = replica_reports.len(),
-                "SIEM:WARN consensus health check: {}/{} replicas report primary unreachable — \
-                 marking primary unhealthy for failover evaluation",
-                reporting_primary_down, replica_reports.len()
+                "SIEM:WARN consensus health check: {}/{} replicas report primary unreachable",
+                reporting_primary_down,
+                replica_reports.len()
             );
             self.mark_unhealthy(&self.primary.config.node_id.clone());
             true
         } else {
             false
         }
-    }
-
-    /// Execute `SELECT pg_promote(true, 60)` on the given replica to promote it to primary.
-    /// The `true` parameter requests a fast promotion, and `60` is the timeout in seconds.
-    /// This is a PostgreSQL 12+ built-in function.
-    fn execute_pg_promote(&self, connection_url: &str) -> Result<(), String> {
-        // Use a synchronous connection for the promotion command since this
-        // is a critical one-shot operation that must complete before proceeding.
-        // In production, this connects to the replica's admin endpoint.
-        //
-        // The pg_promote() function:
-        // - Stops WAL replay on the standby
-        // - Promotes it to read-write mode
-        // - Creates a timeline history file
-        // - Returns true on success
-        //
-        // We use `pg_promote(true, 60)`:
-        //   - true = fast promote (don't wait for checkpoint)
-        //   - 60 = timeout in seconds
-        tracing::info!(
-            target: "siem",
-            connection_url = %connection_url.split('@').last().unwrap_or("unknown"),
-            "Connecting to replica for pg_promote()"
-        );
-
-        // Store the promotion intent for verification by the health checker.
-        // The next health check will verify the promoted node is accepting writes.
-        self.last_promotion_target.store(true, Ordering::SeqCst);
-
-        // NOTE: The actual SQL execution requires an async runtime context.
-        // In the synchronous failover path, we record the promotion intent
-        // and the async health checker executes and verifies the promotion.
-        // This is because attempt_automatic_failover is called from the
-        // synchronous health check loop.
-        //
-        // The promotion SQL that the async health checker will execute:
-        //   SELECT pg_promote(true, 60);
-        //   -- Verify: SELECT pg_is_in_recovery(); -- should return false after promotion
-
-        Ok(())
     }
 
     /// Update a replica's replication lag information.
@@ -927,5 +1235,254 @@ mod tests {
         assert_eq!(config.health_check_interval_secs, 10);
         assert_eq!(config.connect_timeout_secs, 5);
         assert_eq!(config.max_replication_lag_ms, 1000);
+    }
+
+    // -- Mock PgExecutor for testing --
+
+    struct MockPgExecutor {
+        promote_results: Mutex<Vec<Result<bool, String>>>,
+        recovery_results: Mutex<Vec<Result<bool, String>>>,
+        writable_results: Mutex<Vec<Result<(), String>>>,
+        terminate_results: Mutex<Vec<Result<u64, String>>>,
+        wal_lsn_results: Mutex<Vec<Result<u64, String>>>,
+    }
+
+    impl MockPgExecutor {
+        fn success() -> Self {
+            Self {
+                promote_results: Mutex::new(vec![Ok(true)]),
+                recovery_results: Mutex::new(vec![Ok(false)]),
+                writable_results: Mutex::new(vec![Ok(())]),
+                terminate_results: Mutex::new(vec![Ok(5)]),
+                wal_lsn_results: Mutex::new(vec![Ok(1000)]),
+            }
+        }
+
+        fn failing_promote() -> Self {
+            Self {
+                promote_results: Mutex::new(vec![
+                    Err("connection refused".into()),
+                    Err("timeout".into()),
+                    Err("still failing".into()),
+                ]),
+                recovery_results: Mutex::new(vec![Ok(true)]),
+                writable_results: Mutex::new(vec![Ok(())]),
+                terminate_results: Mutex::new(vec![Ok(0)]),
+                wal_lsn_results: Mutex::new(vec![Ok(0)]),
+            }
+        }
+
+        fn pop_or_last<T: Clone>(v: &Mutex<Vec<T>>) -> T {
+            let mut guard = v.lock().unwrap();
+            if guard.len() > 1 {
+                guard.remove(0)
+            } else {
+                guard[0].clone()
+            }
+        }
+    }
+
+    impl PgExecutor for MockPgExecutor {
+        fn pg_promote(
+            &self,
+            _url: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
+            Box::pin(async { Self::pop_or_last(&self.promote_results) })
+        }
+        fn pg_is_in_recovery(
+            &self,
+            _url: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
+            Box::pin(async { Self::pop_or_last(&self.recovery_results) })
+        }
+        fn verify_writable(
+            &self,
+            _url: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+            Box::pin(async { Self::pop_or_last(&self.writable_results) })
+        }
+        fn pg_terminate_all(
+            &self,
+            _url: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<u64, String>> + Send + '_>> {
+            Box::pin(async { Self::pop_or_last(&self.terminate_results) })
+        }
+        fn pg_current_wal_lsn(
+            &self,
+            _url: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<u64, String>> + Send + '_>> {
+            Box::pin(async { Self::pop_or_last(&self.wal_lsn_results) })
+        }
+    }
+
+    #[test]
+    fn split_brain_detection_returns_conflicting_nodes() {
+        let config = make_ha_config(3);
+        let mut pool = HaPool::new(config);
+        pool.mark_healthy("primary-1");
+
+        let reports = vec![
+            ("replica-1".to_string(), false),
+            ("replica-2".to_string(), true),
+            ("replica-3".to_string(), false),
+        ];
+        let conflicts = pool.detect_split_brain(&reports);
+        assert_eq!(conflicts, vec!["replica-2"]);
+    }
+
+    #[test]
+    fn split_brain_no_conflict_when_primary_unhealthy() {
+        let config = make_ha_config(2);
+        let mut pool = HaPool::new(config);
+        pool.mark_unhealthy("primary-1");
+
+        let reports = vec![("replica-1".to_string(), true)];
+        let conflicts = pool.detect_split_brain(&reports);
+        assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    fn split_brain_multiple_conflicts() {
+        let config = make_ha_config(3);
+        let mut pool = HaPool::new(config);
+        pool.mark_healthy("primary-1");
+
+        let reports = vec![
+            ("replica-1".to_string(), true),
+            ("replica-2".to_string(), true),
+            ("replica-3".to_string(), false),
+        ];
+        let conflicts = pool.detect_split_brain(&reports);
+        assert_eq!(conflicts.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn stonith_fence_node_adds_to_blocklist() {
+        let config = make_ha_config(2);
+        let pool = HaPool::new(config);
+        let executor = MockPgExecutor::success();
+
+        assert!(!pool.is_stonith_blocklisted("replica-1"));
+        pool.stonith_fence_node("replica-1", &executor)
+            .await
+            .unwrap();
+        assert!(pool.is_stonith_blocklisted("replica-1"));
+        assert!(!pool.is_stonith_blocklisted("replica-2"));
+    }
+
+    #[tokio::test]
+    async fn stonith_fence_blocklists_even_on_terminate_failure() {
+        let config = make_ha_config(1);
+        let pool = HaPool::new(config);
+        let executor = MockPgExecutor {
+            terminate_results: Mutex::new(vec![Err("unreachable".into())]),
+            ..MockPgExecutor::success()
+        };
+
+        pool.stonith_fence_node("replica-1", &executor)
+            .await
+            .unwrap();
+        assert!(pool.is_stonith_blocklisted("replica-1"));
+    }
+
+    #[tokio::test]
+    async fn execute_pg_promote_async_succeeds() {
+        let config = make_ha_config(1);
+        let pool = HaPool::new(config);
+        let executor = MockPgExecutor::success();
+
+        let result = pool
+            .execute_pg_promote_async("postgres://replica1:5432/db", "replica-1", &executor)
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn execute_pg_promote_async_retries_on_failure() {
+        let config = make_ha_config(1);
+        let pool = HaPool::new(config);
+        let executor = MockPgExecutor {
+            promote_results: Mutex::new(vec![Err("transient".into()), Ok(true)]),
+            recovery_results: Mutex::new(vec![Ok(false)]),
+            writable_results: Mutex::new(vec![Ok(())]),
+            ..MockPgExecutor::success()
+        };
+
+        let result = pool
+            .execute_pg_promote_async("postgres://replica1:5432/db", "replica-1", &executor)
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn execute_pg_promote_async_fails_after_max_retries() {
+        let config = make_ha_config(1);
+        let pool = HaPool::new(config);
+        let executor = MockPgExecutor::failing_promote();
+
+        let result = pool
+            .execute_pg_promote_async("postgres://replica1:5432/db", "replica-1", &executor)
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("3 attempts"));
+    }
+
+    #[tokio::test]
+    async fn verify_wal_position_passes_when_ahead() {
+        let config = make_ha_config(1);
+        let pool = HaPool::new(config);
+        let executor = MockPgExecutor {
+            wal_lsn_results: Mutex::new(vec![Ok(2000)]),
+            ..MockPgExecutor::success()
+        };
+
+        let result = pool
+            .verify_wal_position("postgres://p:5432/db", 1000, &executor)
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn verify_wal_position_fails_when_behind() {
+        let config = make_ha_config(1);
+        let pool = HaPool::new(config);
+        let executor = MockPgExecutor {
+            wal_lsn_results: Mutex::new(vec![Ok(500)]),
+            ..MockPgExecutor::success()
+        };
+
+        let result = pool
+            .verify_wal_position("postgres://p:5432/db", 1000, &executor)
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("data loss risk"));
+    }
+
+    #[tokio::test]
+    async fn failover_rapid_cycling_stress() {
+        let config = make_ha_config(3);
+        let mut pool = HaPool::new(config);
+        let failover_config = AutoFailoverConfig {
+            failover_threshold_secs: 0,
+            min_replica_lag_for_promotion_ms: 100,
+            require_quorum: false,
+            consecutive_failure_threshold: 1,
+        };
+
+        for cycle in 0..5 {
+            pool.mark_unhealthy("primary-1");
+
+            let lags = vec![ReplicaLagInfo {
+                node_id: format!("replica-{}", (cycle % 3) + 1),
+                lag_ms: 10,
+                primary_unreachable: true,
+            }];
+
+            let result = pool.attempt_automatic_failover(&failover_config, &lags);
+            assert!(result.is_ok());
+
+            let primary_id = pool.primary.config.node_id.clone();
+            pool.mark_healthy(&primary_id);
+        }
     }
 }

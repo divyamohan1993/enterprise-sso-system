@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 use crate::siem::{self, SecurityEvent, SiemEvent};
 
@@ -247,6 +248,14 @@ impl std::fmt::Debug for WebhookConfig {
             .field("updated_at", &self.updated_at)
             .field("description", &self.description)
             .finish()
+    }
+}
+
+/// Zeroize HMAC secret and URL on drop to prevent credential extraction via memory forensics.
+impl Drop for WebhookConfig {
+    fn drop(&mut self) {
+        self.secret.zeroize();
+        self.url.zeroize();
     }
 }
 
@@ -569,10 +578,8 @@ impl EventStreamManager {
             webhook.name = name;
         }
         if let Some(url) = update.url {
-            let test_config = WebhookConfig {
-                url: url.clone(),
-                ..webhook.clone()
-            };
+            let mut test_config = webhook.clone();
+            test_config.url = url.clone();
             test_config.validate_url(self.is_production)?;
             webhook.url = url;
         }
@@ -679,10 +686,7 @@ impl EventStreamManager {
 
         let new_secret = generate_webhook_secret();
         // SECURITY: Zeroize old secret before replacing to prevent lingering in memory
-        {
-            use zeroize::Zeroize;
-            webhook.secret.zeroize();
-        }
+        webhook.secret.zeroize();
         webhook.secret = new_secret.clone();
         webhook.updated_at = now_epoch();
 
@@ -1417,5 +1421,28 @@ mod tests {
         let s2 = generate_webhook_secret();
         assert_eq!(s1.len(), 64); // 32 bytes = 64 hex chars
         assert_ne!(s1, s2);
+    }
+
+    #[test]
+    fn webhook_config_drop_runs_without_panic() {
+        let wh = WebhookConfig::new("test-zeroize", "https://example.com/hook");
+        assert!(!wh.secret.is_empty());
+        assert!(!wh.url.is_empty());
+        drop(wh);
+    }
+
+    #[test]
+    fn webhook_config_drop_empty_secret_no_panic() {
+        let mut wh = WebhookConfig::new("test", "https://example.com/hook");
+        wh.secret = String::new();
+        wh.url = String::new();
+        drop(wh);
+    }
+
+    #[test]
+    fn webhook_config_drop_large_secret_no_panic() {
+        let mut wh = WebhookConfig::new("test", "https://example.com/hook");
+        wh.secret = "A".repeat(1_000_000);
+        drop(wh);
     }
 }

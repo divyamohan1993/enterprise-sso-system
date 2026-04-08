@@ -237,6 +237,22 @@ pub enum RaftMessage {
         success: bool,
         match_index: LogIndex,
     },
+    /// Leader sends a snapshot to a slow follower that has fallen behind the
+    /// snapshot point. The follower verifies the ML-DSA-87 signature, applies
+    /// the snapshot, and resets its log to the snapshot point.
+    InstallSnapshot {
+        term: Term,
+        leader_id: NodeId,
+        last_included_index: u64,
+        last_included_term: u64,
+        data: Vec<u8>,
+        signature: Vec<u8>,
+    },
+    /// Response to an InstallSnapshot RPC.
+    InstallSnapshotResponse {
+        term: Term,
+        success: bool,
+    },
 }
 
 /// An authenticated Raft message wrapper that binds each message to its sender
@@ -304,7 +320,9 @@ impl RaftMessage {
             Self::RequestVote { term, .. }
             | Self::RequestVoteResponse { term, .. }
             | Self::AppendEntries { term, .. }
-            | Self::AppendEntriesResponse { term, .. } => *term,
+            | Self::AppendEntriesResponse { term, .. }
+            | Self::InstallSnapshot { term, .. }
+            | Self::InstallSnapshotResponse { term, .. } => *term,
             // Pre-vote messages use proposed_term but don't affect real term.
             Self::PreVoteRequest { proposed_term, .. }
             | Self::PreVoteResponse { proposed_term, .. } => *proposed_term,
@@ -560,6 +578,159 @@ impl RaftLogPersistence for NullRaftLogPersistence {
     fn truncate_from(&self, _index: u64) -> Result<(), String> { Ok(()) }
 }
 
+// ── Snapshot constants ────────────────────────────────────────────────────────
+
+/// Number of committed log entries before triggering a snapshot.
+/// Configurable via `MILNET_RAFT_SNAPSHOT_THRESHOLD` environment variable.
+pub fn snapshot_threshold() -> u64 {
+    std::env::var("MILNET_RAFT_SNAPSHOT_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000)
+}
+
+/// Maximum snapshot data size in bytes (64 MB).
+pub const MAX_SNAPSHOT_SIZE: usize = 64 * 1024 * 1024;
+
+// ── Snapshot types ────────────────────────────────────────────────────────────
+
+/// A point-in-time snapshot of the state machine, used for log compaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RaftSnapshot {
+    /// Last log entry index included in this snapshot.
+    pub last_included_index: u64,
+    /// Term of the last included entry.
+    pub last_included_term: u64,
+    /// Serialized state machine data.
+    pub data: Vec<u8>,
+    /// ML-DSA-87 signature over (last_included_index || last_included_term || SHA-512(data)).
+    pub signature: Vec<u8>,
+    /// Unix timestamp (seconds) when the snapshot was taken.
+    pub timestamp: u64,
+}
+
+/// Trait for obtaining a snapshot of the replicated state machine.
+pub trait StateMachine: Send + Sync {
+    /// Produce a serialized snapshot of the current state.
+    fn snapshot(&self) -> Vec<u8>;
+    /// Restore state from a snapshot produced by [`snapshot`].
+    fn restore(&mut self, data: &[u8]) -> Result<(), String>;
+}
+
+/// No-op state machine for tests.
+pub struct NullStateMachine;
+
+impl StateMachine for NullStateMachine {
+    fn snapshot(&self) -> Vec<u8> { Vec::new() }
+    fn restore(&mut self, _data: &[u8]) -> Result<(), String> { Ok(()) }
+}
+
+// ── Snapshot persistence ──────────────────────────────────────────────────────
+
+/// Trait for persisting and loading Raft snapshots.
+pub trait RaftSnapshotPersistence: Send + Sync {
+    /// Persist a snapshot atomically (write tmp + fsync + rename).
+    fn save_snapshot(&self, snapshot: &RaftSnapshot) -> Result<(), String>;
+    /// Load the most recent snapshot, if any.
+    fn load_snapshot(&self) -> Result<Option<RaftSnapshot>, String>;
+}
+
+/// File-backed snapshot persistence with atomic writes.
+pub struct FileRaftSnapshotPersistence {
+    path: std::path::PathBuf,
+}
+
+impl FileRaftSnapshotPersistence {
+    pub fn new(dir: &std::path::Path) -> Self {
+        Self {
+            path: dir.join("raft_snapshot"),
+        }
+    }
+}
+
+impl RaftSnapshotPersistence for FileRaftSnapshotPersistence {
+    fn save_snapshot(&self, snapshot: &RaftSnapshot) -> Result<(), String> {
+        use std::io::Write;
+        let data = postcard::to_allocvec(snapshot).map_err(|e| format!("serialize snapshot: {e}"))?;
+        let tmp = self.path.with_extension("tmp");
+        let mut f = std::fs::File::create(&tmp).map_err(|e| format!("create snapshot tmp: {e}"))?;
+        f.write_all(&data).map_err(|e| format!("write snapshot: {e}"))?;
+        f.sync_all().map_err(|e| format!("fsync snapshot: {e}"))?;
+        drop(f);
+        std::fs::rename(&tmp, &self.path).map_err(|e| format!("rename snapshot: {e}"))?;
+        Ok(())
+    }
+
+    fn load_snapshot(&self) -> Result<Option<RaftSnapshot>, String> {
+        match std::fs::read(&self.path) {
+            Ok(data) => {
+                let snap: RaftSnapshot =
+                    postcard::from_bytes(&data).map_err(|e| format!("deserialize snapshot: {e}"))?;
+                Ok(Some(snap))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("read snapshot: {e}")),
+        }
+    }
+}
+
+/// No-op snapshot persistence for tests.
+pub struct NullRaftSnapshotPersistence;
+
+impl RaftSnapshotPersistence for NullRaftSnapshotPersistence {
+    fn save_snapshot(&self, _snapshot: &RaftSnapshot) -> Result<(), String> { Ok(()) }
+    fn load_snapshot(&self) -> Result<Option<RaftSnapshot>, String> { Ok(None) }
+}
+
+/// Compute the signed message for snapshot signing/verification:
+/// last_included_index(8 bytes) || last_included_term(8 bytes) || SHA-512(data).
+fn snapshot_sign_message(last_included_index: u64, last_included_term: u64, data: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha512};
+    let data_hash = Sha512::digest(data);
+    let mut msg = Vec::with_capacity(16 + 64);
+    msg.extend_from_slice(&last_included_index.to_be_bytes());
+    msg.extend_from_slice(&last_included_term.to_be_bytes());
+    msg.extend_from_slice(&data_hash);
+    msg
+}
+
+/// Sign a snapshot with ML-DSA-87. Returns the signature bytes.
+fn sign_snapshot_ml_dsa(
+    seed_bytes: &[u8],
+    last_included_index: u64,
+    last_included_term: u64,
+    data: &[u8],
+) -> Result<Vec<u8>, String> {
+    let msg = snapshot_sign_message(last_included_index, last_included_term, data);
+    sign_entry_ml_dsa(seed_bytes, &msg)
+}
+
+/// Verify a snapshot's ML-DSA-87 signature.
+pub fn verify_snapshot_signature(
+    snapshot: &RaftSnapshot,
+    verifying_key: &[u8],
+) -> Result<(), String> {
+    use ml_dsa::{
+        signature::Verifier, EncodedVerifyingKey, MlDsa87, Signature, VerifyingKey,
+    };
+
+    let msg = snapshot_sign_message(
+        snapshot.last_included_index,
+        snapshot.last_included_term,
+        &snapshot.data,
+    );
+
+    let vk_enc = EncodedVerifyingKey::<MlDsa87>::try_from(verifying_key)
+        .map_err(|_| "invalid ML-DSA-87 verifying key encoding".to_string())?;
+    let vk = VerifyingKey::<MlDsa87>::decode(&vk_enc);
+
+    let sig = Signature::<MlDsa87>::try_from(snapshot.signature.as_slice())
+        .map_err(|_| "invalid ML-DSA-87 snapshot signature encoding".to_string())?;
+
+    vk.verify(&msg, &sig)
+        .map_err(|_| "ML-DSA-87 snapshot signature verification failed".to_string())
+}
+
 // ── Raft state machine ────────────────────────────────────────────────────────
 
 /// Core Raft state machine.
@@ -614,6 +785,14 @@ pub struct RaftState {
     pre_votes_received: HashSet<NodeId>,
     /// Whether we are currently in the pre-vote phase (before real election).
     in_pre_vote: bool,
+    /// Snapshot persistence backend.
+    snapshot_persistence: Box<dyn RaftSnapshotPersistence>,
+    /// The most recent snapshot, if any.
+    last_snapshot: Option<RaftSnapshot>,
+    /// Index of the last entry included in the most recent snapshot.
+    snapshot_last_included_index: u64,
+    /// Term of the last entry included in the most recent snapshot.
+    snapshot_last_included_term: u64,
 }
 
 impl RaftState {
@@ -623,7 +802,6 @@ impl RaftState {
     }
 
     /// Create a new Raft node with a persistence backend.
-    /// Recovers term and voted_for from disk if available.
     pub fn with_persistence(
         node_id: NodeId,
         config: RaftConfig,
@@ -633,12 +811,25 @@ impl RaftState {
     }
 
     /// Create a new Raft node with both state and log persistence.
-    /// Recovers term, voted_for, and the full log from disk.
     pub fn with_full_persistence(
         node_id: NodeId,
         config: RaftConfig,
         persistence: Box<dyn RaftPersistence>,
         log_persistence: Box<dyn RaftLogPersistence>,
+    ) -> Self {
+        Self::with_all_persistence(
+            node_id, config, persistence, log_persistence,
+            Box::new(NullRaftSnapshotPersistence),
+        )
+    }
+
+    /// Create a new Raft node with state, log, and snapshot persistence.
+    pub fn with_all_persistence(
+        node_id: NodeId,
+        config: RaftConfig,
+        persistence: Box<dyn RaftPersistence>,
+        log_persistence: Box<dyn RaftLogPersistence>,
+        snapshot_persistence: Box<dyn RaftSnapshotPersistence>,
     ) -> Self {
         let timeout = random_election_timeout(
             config.election_timeout_min_ms,
@@ -666,11 +857,26 @@ impl RaftState {
             Vec::new()
         });
 
+        // Recover snapshot if available.
+        let recovered_snapshot = snapshot_persistence.load_snapshot().unwrap_or_else(|e| {
+            tracing::error!(
+                node = %node_id,
+                error = %e,
+                "failed to recover snapshot, starting without snapshot"
+            );
+            None
+        });
+        let (snap_index, snap_term) = recovered_snapshot
+            .as_ref()
+            .map(|s| (s.last_included_index, s.last_included_term))
+            .unwrap_or((0, 0));
+
         tracing::info!(
             node = %node_id,
             peers = config.peers.len(),
             recovered_term = recovered_term.0,
             recovered_log_entries = recovered_log.len(),
+            snapshot_index = snap_index,
             "initialising raft node"
         );
         Self {
@@ -695,6 +901,10 @@ impl RaftState {
             peer_verifying_keys: HashMap::new(),
             pre_votes_received: HashSet::new(),
             in_pre_vote: false,
+            snapshot_persistence,
+            last_snapshot: recovered_snapshot,
+            snapshot_last_included_index: snap_index,
+            snapshot_last_included_term: snap_term,
         }
     }
 
@@ -771,6 +981,20 @@ impl RaftState {
                 success,
                 match_index,
             } => self.handle_append_entries_response(from, term, success, match_index),
+            RaftMessage::InstallSnapshot {
+                term,
+                leader_id,
+                last_included_index,
+                last_included_term,
+                data,
+                signature,
+            } => self.handle_install_snapshot(
+                from, term, leader_id, last_included_index,
+                last_included_term, data, signature,
+            ),
+            RaftMessage::InstallSnapshotResponse { term, success } => {
+                self.handle_install_snapshot_response(from, term, success)
+            }
             // Already handled above, but satisfy exhaustive match.
             RaftMessage::PreVoteRequest { .. } | RaftMessage::PreVoteResponse { .. } => {
                 unreachable!()
@@ -1329,21 +1553,35 @@ impl RaftState {
 
         // Check log consistency at prev_log_index.
         if prev_log_index.0 > 0 {
-            match self.log_entry_at(prev_log_index) {
-                Some(entry) if entry.term == prev_log_term => {
-                    // OK, consistent.
-                }
-                _ => {
-                    // Inconsistency: log does not contain an entry at
-                    // prev_log_index with the expected term.
-                    return vec![(
-                        from,
-                        RaftMessage::AppendEntriesResponse {
-                            term: self.current_term,
-                            success: false,
-                            match_index: LogIndex::zero(),
-                        },
-                    )];
+            if prev_log_index.0 == self.snapshot_last_included_index
+                && prev_log_term.0 == self.snapshot_last_included_term
+            {
+                // Consistent with snapshot boundary.
+            } else if prev_log_index.0 < self.snapshot_last_included_index {
+                // prev_log_index is inside the compacted region.
+                return vec![(
+                    from,
+                    RaftMessage::AppendEntriesResponse {
+                        term: self.current_term,
+                        success: false,
+                        match_index: LogIndex::zero(),
+                    },
+                )];
+            } else {
+                match self.log_entry_at(prev_log_index) {
+                    Some(entry) if entry.term == prev_log_term => {
+                        // OK, consistent.
+                    }
+                    _ => {
+                        return vec![(
+                            from,
+                            RaftMessage::AppendEntriesResponse {
+                                term: self.current_term,
+                                success: false,
+                                match_index: LogIndex::zero(),
+                            },
+                        )];
+                    }
                 }
             }
         }
@@ -1397,7 +1635,11 @@ impl RaftState {
         // Append new entries, handling conflicts.
         let mut new_entries_to_persist = Vec::new();
         for entry in &entries {
-            let vec_idx = (entry.index.0 as usize).saturating_sub(1);
+            // Skip entries covered by the snapshot.
+            if entry.index.0 <= self.snapshot_last_included_index {
+                continue;
+            }
+            let vec_idx = (entry.index.0 - self.snapshot_last_included_index - 1) as usize;
             if vec_idx < self.log.len() {
                 if self.log[vec_idx].term != entry.term {
                     // Conflict: delete this and all following entries.
@@ -1471,21 +1713,35 @@ impl RaftState {
     // ── Private: log helpers ───────────────────────────────────────────────
 
     /// Get the log entry at the given 1-based index.
+    /// After snapshot compaction, entries at or below snapshot_last_included_index
+    /// have been removed from the in-memory log.
     fn log_entry_at(&self, index: LogIndex) -> Option<&LogEntry> {
-        if index.0 == 0 {
+        if index.0 == 0 || index.0 <= self.snapshot_last_included_index {
             return None;
         }
-        self.log.get((index.0 - 1) as usize)
+        let vec_idx = (index.0 - self.snapshot_last_included_index - 1) as usize;
+        self.log.get(vec_idx)
     }
 
     /// Index of the last log entry, or 0 if empty.
+    /// Accounts for snapshot offset.
     fn last_log_index(&self) -> LogIndex {
-        LogIndex(self.log.len() as u64)
+        LogIndex(self.snapshot_last_included_index + self.log.len() as u64)
     }
 
     /// Term of the last log entry, or Term(0) if empty.
+    /// If the log is empty but a snapshot exists, returns the snapshot's term.
     fn last_log_term(&self) -> Term {
-        self.log.last().map(|e| e.term).unwrap_or(Term::zero())
+        self.log
+            .last()
+            .map(|e| e.term)
+            .unwrap_or_else(|| {
+                if self.snapshot_last_included_index > 0 {
+                    Term(self.snapshot_last_included_term)
+                } else {
+                    Term::zero()
+                }
+            })
     }
 
     /// Check if a candidate's log is at least as up-to-date as ours.
@@ -1508,10 +1764,37 @@ impl RaftState {
     // ── Private: heartbeats & commit ───────────────────────────────────────
 
     /// Send AppendEntries (heartbeats / replication) to all peers.
+    /// If a peer needs entries that have been compacted, send InstallSnapshot.
     fn send_heartbeats(&self) -> Vec<(NodeId, RaftMessage)> {
         let mut msgs = Vec::new();
         for (peer_id, _) in &self.config.peers {
             let next = self.next_index.get(peer_id).copied().unwrap_or(LogIndex(1));
+
+            // If the peer needs entries that have been compacted, send snapshot.
+            if next.0 <= self.snapshot_last_included_index {
+                if let Some(ref snap) = self.last_snapshot {
+                    tracing::info!(
+                        node = %self.node_id,
+                        peer = %peer_id,
+                        next_index = next.0,
+                        snapshot_index = self.snapshot_last_included_index,
+                        "peer behind snapshot point, sending InstallSnapshot"
+                    );
+                    msgs.push((
+                        *peer_id,
+                        RaftMessage::InstallSnapshot {
+                            term: self.current_term,
+                            leader_id: self.node_id,
+                            last_included_index: snap.last_included_index,
+                            last_included_term: snap.last_included_term,
+                            data: snap.data.clone(),
+                            signature: snap.signature.clone(),
+                        },
+                    ));
+                    continue;
+                }
+            }
+
             let prev_log_index = LogIndex(next.0.saturating_sub(1));
             let prev_log_term = if prev_log_index.0 > 0 {
                 self.log_entry_at(prev_log_index)
@@ -1549,6 +1832,237 @@ impl RaftState {
     /// A log entry is committed when a majority of nodes (tracked via
     /// match_index) have replicated it AND the entry was written in the
     /// current term (Raft safety property).
+    // ── Snapshot methods ───────────────────────────────────────────────────
+
+    /// Create a snapshot at the current commit point, then compact the log.
+    /// Returns `Ok(true)` if a snapshot was created, `Ok(false)` if below threshold.
+    pub fn maybe_snapshot(&mut self, state_machine: &dyn StateMachine) -> Result<bool, String> {
+        let threshold = snapshot_threshold();
+        if (self.log.len() as u64) < threshold {
+            return Ok(false);
+        }
+        if self.commit_index.0 <= self.snapshot_last_included_index {
+            return Ok(false);
+        }
+
+        let snap_index = self.commit_index.0;
+        let snap_term = self
+            .log_entry_at(self.commit_index)
+            .map(|e| e.term.0)
+            .unwrap_or(self.snapshot_last_included_term);
+
+        let data = state_machine.snapshot();
+        if data.len() > MAX_SNAPSHOT_SIZE {
+            return Err(format!(
+                "snapshot data size {} exceeds maximum {}",
+                data.len(), MAX_SNAPSHOT_SIZE
+            ));
+        }
+
+        let signature = if let Some(ref sk_bytes) = self.signing_key {
+            sign_snapshot_ml_dsa(sk_bytes, snap_index, snap_term, &data)?
+        } else {
+            Vec::new()
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let snapshot = RaftSnapshot {
+            last_included_index: snap_index,
+            last_included_term: snap_term,
+            data,
+            signature,
+            timestamp: now,
+        };
+
+        self.snapshot_persistence.save_snapshot(&snapshot)?;
+
+        // Truncate log: remove all entries with index <= snap_index.
+        let entries_to_remove = (snap_index - self.snapshot_last_included_index) as usize;
+        if entries_to_remove <= self.log.len() {
+            self.log.drain(..entries_to_remove);
+        }
+
+        // Rewrite WAL with remaining entries.
+        let _ = self.log_persistence.truncate_from(1);
+        if !self.log.is_empty() {
+            let _ = self.log_persistence.append_entries(&self.log);
+        }
+
+        tracing::info!(
+            node = %self.node_id,
+            snapshot_index = snap_index,
+            snapshot_term = snap_term,
+            log_remaining = self.log.len(),
+            "snapshot created and log compacted"
+        );
+
+        self.snapshot_last_included_index = snap_index;
+        self.snapshot_last_included_term = snap_term;
+        self.last_snapshot = Some(snapshot);
+
+        Ok(true)
+    }
+
+    /// Handle an InstallSnapshot RPC from the leader.
+    #[allow(clippy::too_many_arguments)]
+    fn handle_install_snapshot(
+        &mut self,
+        from: NodeId,
+        term: Term,
+        leader_id: NodeId,
+        last_included_index: u64,
+        last_included_term: u64,
+        data: Vec<u8>,
+        signature: Vec<u8>,
+    ) -> Vec<(NodeId, RaftMessage)> {
+        if term < self.current_term {
+            return vec![(from, RaftMessage::InstallSnapshotResponse {
+                term: self.current_term, success: false,
+            })];
+        }
+
+        self.leader_id = Some(leader_id);
+        if self.role != RaftRole::Follower {
+            self.become_follower(term, Some(leader_id));
+        }
+        self.reset_election_timer();
+
+        if data.len() > MAX_SNAPSHOT_SIZE {
+            tracing::error!(node = %self.node_id, size = data.len(), "rejecting oversized snapshot");
+            return vec![(from, RaftMessage::InstallSnapshotResponse {
+                term: self.current_term, success: false,
+            })];
+        }
+
+        // Verify ML-DSA-87 signature if available.
+        if !signature.is_empty() {
+            if let Some(vk) = self.peer_verifying_keys.get(&leader_id) {
+                let snap = RaftSnapshot {
+                    last_included_index, last_included_term,
+                    data: data.clone(), signature: signature.clone(), timestamp: 0,
+                };
+                if let Err(e) = verify_snapshot_signature(&snap, vk) {
+                    tracing::error!(
+                        node = %self.node_id, leader = %leader_id, error = %e,
+                        "REJECTING snapshot: signature verification failed"
+                    );
+                    return vec![(from, RaftMessage::InstallSnapshotResponse {
+                        term: self.current_term, success: false,
+                    })];
+                }
+            }
+        } else {
+            let military_mode = std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1");
+            if military_mode {
+                tracing::error!(node = %self.node_id, "REJECTING unsigned snapshot in military mode");
+                return vec![(from, RaftMessage::InstallSnapshotResponse {
+                    term: self.current_term, success: false,
+                })];
+            }
+        }
+
+        // Reject if not newer than current snapshot.
+        if last_included_index <= self.snapshot_last_included_index {
+            return vec![(from, RaftMessage::InstallSnapshotResponse {
+                term: self.current_term, success: true,
+            })];
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let snapshot = RaftSnapshot {
+            last_included_index, last_included_term,
+            data, signature, timestamp: now,
+        };
+
+        if let Err(e) = self.snapshot_persistence.save_snapshot(&snapshot) {
+            tracing::error!(node = %self.node_id, error = %e, "failed to persist installed snapshot");
+            return vec![(from, RaftMessage::InstallSnapshotResponse {
+                term: self.current_term, success: false,
+            })];
+        }
+
+        // Discard log entries covered by the snapshot.
+        let old_offset = self.snapshot_last_included_index;
+        if last_included_index >= self.last_log_index().0 {
+            self.log.clear();
+        } else {
+            let entries_to_remove = (last_included_index - old_offset) as usize;
+            if entries_to_remove <= self.log.len() {
+                self.log.drain(..entries_to_remove);
+            }
+        }
+
+        let _ = self.log_persistence.truncate_from(1);
+        if !self.log.is_empty() {
+            let _ = self.log_persistence.append_entries(&self.log);
+        }
+
+        self.snapshot_last_included_index = last_included_index;
+        self.snapshot_last_included_term = last_included_term;
+        self.last_snapshot = Some(snapshot);
+
+        if last_included_index > self.commit_index.0 {
+            self.commit_index = LogIndex(last_included_index);
+        }
+        if last_included_index > self.last_applied.0 {
+            self.last_applied = LogIndex(last_included_index);
+        }
+
+        tracing::info!(
+            node = %self.node_id,
+            snapshot_index = last_included_index,
+            snapshot_term = last_included_term,
+            log_remaining = self.log.len(),
+            "installed snapshot from leader"
+        );
+
+        vec![(from, RaftMessage::InstallSnapshotResponse {
+            term: self.current_term, success: true,
+        })]
+    }
+
+    /// Handle response to an InstallSnapshot RPC.
+    fn handle_install_snapshot_response(
+        &mut self,
+        from: NodeId,
+        _term: Term,
+        success: bool,
+    ) -> Vec<(NodeId, RaftMessage)> {
+        if self.role != RaftRole::Leader {
+            return Vec::new();
+        }
+        if success {
+            let snap_idx = self.snapshot_last_included_index;
+            self.next_index.insert(from, LogIndex(snap_idx + 1));
+            self.match_index.insert(from, LogIndex(snap_idx));
+            self.advance_commit_index();
+        }
+        Vec::new()
+    }
+
+    /// Get a reference to the current snapshot, if any.
+    pub fn last_snapshot(&self) -> Option<&RaftSnapshot> {
+        self.last_snapshot.as_ref()
+    }
+
+    /// Get the snapshot's last included index.
+    pub fn snapshot_last_included_index(&self) -> u64 {
+        self.snapshot_last_included_index
+    }
+
+    /// Get the log length (in-memory entries after compaction).
+    pub fn log_len(&self) -> usize {
+        self.log.len()
+    }
+
     fn advance_commit_index(&mut self) {
         let quorum = self.quorum_size();
 
@@ -2199,5 +2713,505 @@ mod tests {
         );
         assert!(n1.in_pre_vote);
         assert_eq!(*n1.role(), RaftRole::Follower, "role should not change during pre-vote");
+    }
+
+    // ── Snapshot / compaction tests ───────────────────────────────────────
+
+    struct TestStateMachine { state: Vec<u8> }
+    impl TestStateMachine {
+        fn new(data: Vec<u8>) -> Self { Self { state: data } }
+    }
+    impl StateMachine for TestStateMachine {
+        fn snapshot(&self) -> Vec<u8> { self.state.clone() }
+        fn restore(&mut self, data: &[u8]) -> Result<(), String> {
+            self.state = data.to_vec();
+            Ok(())
+        }
+    }
+
+    /// Helper: get ML-DSA-87 verifying key bytes from a seed.
+    fn ml_dsa_vk_bytes(seed: &[u8; 32]) -> Vec<u8> {
+        use ml_dsa::{MlDsa87, SigningKey, EncodedVerifyingKey};
+        let sk = SigningKey::<MlDsa87>::from_seed(&(*seed).into());
+        let vk = sk.verifying_key();
+        let enc: EncodedVerifyingKey<MlDsa87> = vk.encode();
+        enc.as_ref().to_vec()
+    }
+
+    /// Helper: create a single-node leader with N committed entries.
+    fn make_leader_with_entries(n: u64) -> RaftState {
+        let id = NodeId::random();
+        let config = RaftConfig {
+            heartbeat_ms: 500,
+            election_timeout_min_ms: 1500,
+            election_timeout_max_ms: 3000,
+            peers: Vec::new(),
+        };
+        let mut node = RaftState::new(id, config);
+        node.become_leader_standalone();
+        let _ = node.take_committed();
+        for _i in 0..n {
+            let cmd = ClusterCommand::HealthUpdate {
+                node_id: NodeId::random(),
+                healthy: true,
+            };
+            node.propose(cmd).unwrap();
+        }
+        let _ = node.take_committed();
+        node
+    }
+
+    #[test]
+    fn snapshot_creation_after_threshold() {
+        std::env::set_var("MILNET_RAFT_SNAPSHOT_THRESHOLD", "5");
+        let mut node = make_leader_with_entries(10);
+        let sm = TestStateMachine::new(b"state_at_10".to_vec());
+        let result = node.maybe_snapshot(&sm);
+        assert!(result.is_ok());
+        assert!(result.unwrap(), "snapshot should have been created");
+        let snap = node.last_snapshot().expect("snapshot should exist");
+        assert!(snap.last_included_index > 0);
+        assert_eq!(snap.data, b"state_at_10");
+        assert!((node.log_len() as u64) < 10, "log should be compacted");
+        std::env::remove_var("MILNET_RAFT_SNAPSHOT_THRESHOLD");
+    }
+
+    #[test]
+    fn snapshot_below_threshold_noop() {
+        std::env::set_var("MILNET_RAFT_SNAPSHOT_THRESHOLD", "100");
+        let mut node = make_leader_with_entries(5);
+        let sm = TestStateMachine::new(b"small".to_vec());
+        let result = node.maybe_snapshot(&sm);
+        assert!(result.is_ok());
+        assert!(!result.unwrap(), "should not snapshot below threshold");
+        assert!(node.last_snapshot().is_none());
+        std::env::remove_var("MILNET_RAFT_SNAPSHOT_THRESHOLD");
+    }
+
+    #[test]
+    fn log_truncation_after_snapshot() {
+        std::env::set_var("MILNET_RAFT_SNAPSHOT_THRESHOLD", "5");
+        let mut node = make_leader_with_entries(20);
+        let log_before = node.log_len();
+        let sm = TestStateMachine::new(b"state".to_vec());
+        node.maybe_snapshot(&sm).unwrap();
+        assert!(node.log_len() < log_before, "log should shrink after snapshot");
+        let last_idx = node.last_log_index();
+        assert!(last_idx.0 >= 20, "last_log_index should still reflect all entries");
+        std::env::remove_var("MILNET_RAFT_SNAPSHOT_THRESHOLD");
+    }
+
+    #[test]
+    fn snapshot_persistence_save_and_reload() {
+        let dir = std::env::temp_dir().join(format!("raft_snap_test_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let persistence = FileRaftSnapshotPersistence::new(&dir);
+        let snap = RaftSnapshot {
+            last_included_index: 42,
+            last_included_term: 3,
+            data: b"hello world".to_vec(),
+            signature: vec![1, 2, 3],
+            timestamp: 1000,
+        };
+        persistence.save_snapshot(&snap).unwrap();
+        let loaded = persistence.load_snapshot().unwrap();
+        assert_eq!(loaded, Some(snap));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_persistence_no_file_returns_none() {
+        let dir = std::env::temp_dir().join(format!("raft_snap_test_empty_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let persistence = FileRaftSnapshotPersistence::new(&dir);
+        let loaded = persistence.load_snapshot().unwrap();
+        assert!(loaded.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn install_snapshot_rpc_handling() {
+        let (mut n1, mut n2, mut n3) = make_three_nodes();
+        let id1 = n1.node_id();
+        let _ = elect_leader(&mut n1, &mut n2, &mut n3);
+        assert!(n1.is_leader());
+
+        let msg = RaftMessage::InstallSnapshot {
+            term: n1.current_term(),
+            leader_id: id1,
+            last_included_index: 5,
+            last_included_term: 1,
+            data: b"snapshot_state".to_vec(),
+            signature: Vec::new(),
+        };
+        let responses = n2.handle_message(id1, msg);
+        assert_eq!(responses.len(), 1);
+        match &responses[0].1 {
+            RaftMessage::InstallSnapshotResponse { success, .. } => {
+                assert!(success, "follower should accept valid snapshot");
+            }
+            other => panic!("expected InstallSnapshotResponse, got {:?}", other),
+        }
+        assert_eq!(n2.snapshot_last_included_index, 5);
+        assert_eq!(n2.snapshot_last_included_term, 1);
+    }
+
+    #[test]
+    fn install_snapshot_rejected_with_old_term() {
+        let (mut n1, mut n2, mut n3) = make_three_nodes();
+        let id1 = n1.node_id();
+        let _ = elect_leader(&mut n1, &mut n2, &mut n3);
+
+        let msg = RaftMessage::InstallSnapshot {
+            term: Term(0),
+            leader_id: id1,
+            last_included_index: 5,
+            last_included_term: 0,
+            data: vec![],
+            signature: vec![],
+        };
+        let responses = n2.handle_message(id1, msg);
+        match &responses[0].1 {
+            RaftMessage::InstallSnapshotResponse { success, .. } => {
+                assert!(!success, "should reject snapshot with old term");
+            }
+            other => panic!("expected InstallSnapshotResponse, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn slow_follower_catches_up_via_snapshot() {
+        std::env::set_var("MILNET_RAFT_SNAPSHOT_THRESHOLD", "5");
+        let (mut n1, mut n2, mut n3) = make_three_nodes();
+        let id1 = n1.node_id();
+        let id2 = n2.node_id();
+        let id3 = n3.node_id();
+
+        let _ = elect_leader(&mut n1, &mut n2, &mut n3);
+        assert!(n1.is_leader());
+
+        for _ in 0..10 {
+            n1.propose(ClusterCommand::HealthUpdate {
+                node_id: NodeId::random(), healthy: true,
+            }).unwrap();
+        }
+
+        // Replicate to n2 only (simulate n3 partition).
+        for _ in 0..3 {
+            let heartbeats = n1.tick();
+            for (peer_id, msg) in &heartbeats {
+                if *peer_id == id2 {
+                    let responses = n2.handle_message(id1, msg.clone());
+                    for (_, resp_msg) in responses {
+                        let _ = n1.handle_message(id2, resp_msg);
+                    }
+                }
+            }
+        }
+        let _ = n1.take_committed();
+
+        let sm = TestStateMachine::new(b"leader_state".to_vec());
+        n1.maybe_snapshot(&sm).unwrap();
+        n1.next_index.insert(id3, LogIndex(1));
+
+        let heartbeats = n1.tick();
+        let msg_for_n3 = heartbeats.iter().find(|(id, _)| *id == id3);
+        assert!(msg_for_n3.is_some(), "should have message for n3");
+
+        match &msg_for_n3.unwrap().1 {
+            RaftMessage::InstallSnapshot { data, .. } => {
+                assert_eq!(data, b"leader_state");
+            }
+            other => panic!("expected InstallSnapshot for slow follower, got {:?}", other),
+        }
+
+        let (_, msg) = msg_for_n3.unwrap();
+        let responses = n3.handle_message(id1, msg.clone());
+        match &responses[0].1 {
+            RaftMessage::InstallSnapshotResponse { success, .. } => {
+                assert!(success, "n3 should accept the snapshot");
+            }
+            other => panic!("expected InstallSnapshotResponse, got {:?}", other),
+        }
+        assert!(n3.snapshot_last_included_index > 0);
+        std::env::remove_var("MILNET_RAFT_SNAPSHOT_THRESHOLD");
+    }
+
+    #[test]
+    fn snapshot_with_ml_dsa_signature() {
+        let seed: [u8; 32] = [42u8; 32];
+        let vk_bytes = ml_dsa_vk_bytes(&seed);
+
+        let data = b"signed_state".to_vec();
+        let sig = sign_snapshot_ml_dsa(&seed, 100, 5, &data).unwrap();
+        let snap = RaftSnapshot {
+            last_included_index: 100,
+            last_included_term: 5,
+            data,
+            signature: sig,
+            timestamp: 1000,
+        };
+        let result = verify_snapshot_signature(&snap, &vk_bytes);
+        assert!(result.is_ok(), "valid signature should verify: {:?}", result);
+    }
+
+    #[test]
+    fn corrupted_snapshot_rejected() {
+        let seed: [u8; 32] = [42u8; 32];
+        let vk_bytes = ml_dsa_vk_bytes(&seed);
+
+        let data = b"original_state".to_vec();
+        let sig = sign_snapshot_ml_dsa(&seed, 100, 5, &data).unwrap();
+
+        // Tamper with data.
+        let tampered = RaftSnapshot {
+            last_included_index: 100,
+            last_included_term: 5,
+            data: b"tampered_state".to_vec(),
+            signature: sig.clone(),
+            timestamp: 1000,
+        };
+        assert!(verify_snapshot_signature(&tampered, &vk_bytes).is_err());
+
+        // Tamper with index.
+        let tampered2 = RaftSnapshot {
+            last_included_index: 101,
+            last_included_term: 5,
+            data: b"original_state".to_vec(),
+            signature: sig.clone(),
+            timestamp: 1000,
+        };
+        assert!(verify_snapshot_signature(&tampered2, &vk_bytes).is_err());
+
+        // Tamper with term.
+        let tampered3 = RaftSnapshot {
+            last_included_index: 100,
+            last_included_term: 6,
+            data: b"original_state".to_vec(),
+            signature: sig,
+            timestamp: 1000,
+        };
+        assert!(verify_snapshot_signature(&tampered3, &vk_bytes).is_err());
+    }
+
+    #[test]
+    fn replayed_old_snapshot_ignored() {
+        let (mut n1, mut n2, mut n3) = make_three_nodes();
+        let id1 = n1.node_id();
+        let _ = elect_leader(&mut n1, &mut n2, &mut n3);
+
+        // Install snapshot at index 10.
+        let msg1 = RaftMessage::InstallSnapshot {
+            term: n1.current_term(), leader_id: id1,
+            last_included_index: 10, last_included_term: 1,
+            data: b"state_10".to_vec(), signature: Vec::new(),
+        };
+        let _ = n2.handle_message(id1, msg1);
+        assert_eq!(n2.snapshot_last_included_index, 10);
+
+        // Try older snapshot (index 5).
+        let msg2 = RaftMessage::InstallSnapshot {
+            term: n1.current_term(), leader_id: id1,
+            last_included_index: 5, last_included_term: 1,
+            data: b"state_5".to_vec(), signature: Vec::new(),
+        };
+        let responses = n2.handle_message(id1, msg2);
+        match &responses[0].1 {
+            RaftMessage::InstallSnapshotResponse { success, .. } => assert!(success),
+            other => panic!("expected InstallSnapshotResponse, got {:?}", other),
+        }
+        assert_eq!(n2.snapshot_last_included_index, 10);
+    }
+
+    #[test]
+    fn snapshot_size_limit_enforced() {
+        std::env::set_var("MILNET_RAFT_SNAPSHOT_THRESHOLD", "5");
+        let mut node = make_leader_with_entries(10);
+
+        struct OversizedSM;
+        impl StateMachine for OversizedSM {
+            fn snapshot(&self) -> Vec<u8> { vec![0u8; MAX_SNAPSHOT_SIZE + 1] }
+            fn restore(&mut self, _: &[u8]) -> Result<(), String> { Ok(()) }
+        }
+
+        let result = node.maybe_snapshot(&OversizedSM);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("exceeds maximum"));
+        std::env::remove_var("MILNET_RAFT_SNAPSHOT_THRESHOLD");
+    }
+
+    #[test]
+    fn install_snapshot_oversized_rejected() {
+        let (mut n1, mut n2, mut n3) = make_three_nodes();
+        let id1 = n1.node_id();
+        let _ = elect_leader(&mut n1, &mut n2, &mut n3);
+
+        let msg = RaftMessage::InstallSnapshot {
+            term: n1.current_term(), leader_id: id1,
+            last_included_index: 5, last_included_term: 1,
+            data: vec![0u8; MAX_SNAPSHOT_SIZE + 1], signature: Vec::new(),
+        };
+        let responses = n2.handle_message(id1, msg);
+        match &responses[0].1 {
+            RaftMessage::InstallSnapshotResponse { success, .. } => {
+                assert!(!success, "oversized snapshot should be rejected");
+            }
+            other => panic!("expected InstallSnapshotResponse, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn concurrent_snapshot_and_replication() {
+        std::env::set_var("MILNET_RAFT_SNAPSHOT_THRESHOLD", "5");
+        let (mut n1, mut n2, mut n3) = make_three_nodes();
+        let id1 = n1.node_id();
+        let id2 = n2.node_id();
+
+        let _ = elect_leader(&mut n1, &mut n2, &mut n3);
+
+        for _ in 0..10 {
+            n1.propose(ClusterCommand::HealthUpdate {
+                node_id: NodeId::random(), healthy: true,
+            }).unwrap();
+        }
+
+        // Replicate to n2.
+        for _ in 0..3 {
+            let heartbeats = n1.tick();
+            for (peer_id, msg) in &heartbeats {
+                if *peer_id == id2 {
+                    let responses = n2.handle_message(id1, msg.clone());
+                    for (_, resp_msg) in responses {
+                        let _ = n1.handle_message(id2, resp_msg);
+                    }
+                }
+            }
+        }
+        let _ = n1.take_committed();
+
+        let sm = TestStateMachine::new(b"concurrent_state".to_vec());
+        n1.maybe_snapshot(&sm).unwrap();
+
+        // Continue proposing after snapshot.
+        for _ in 0..5 {
+            n1.propose(ClusterCommand::HealthUpdate {
+                node_id: NodeId::random(), healthy: true,
+            }).unwrap();
+        }
+
+        // Replicate new entries to n2 (should work despite snapshot).
+        for _ in 0..3 {
+            let heartbeats = n1.tick();
+            for (peer_id, msg) in &heartbeats {
+                if *peer_id == id2 {
+                    let responses = n2.handle_message(id1, msg.clone());
+                    for (_, resp_msg) in responses {
+                        let _ = n1.handle_message(id2, resp_msg);
+                    }
+                }
+            }
+        }
+
+        let committed = n1.take_committed();
+        assert!(!committed.is_empty(), "entries after snapshot should be committed");
+        std::env::remove_var("MILNET_RAFT_SNAPSHOT_THRESHOLD");
+    }
+
+    #[test]
+    fn snapshot_atomic_file_operations() {
+        let dir = std::env::temp_dir().join(format!("raft_snap_atomic_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let persistence = FileRaftSnapshotPersistence::new(&dir);
+
+        let snap = RaftSnapshot {
+            last_included_index: 10, last_included_term: 2,
+            data: b"atomic_test".to_vec(), signature: vec![], timestamp: 500,
+        };
+        persistence.save_snapshot(&snap).unwrap();
+
+        assert!(dir.join("raft_snapshot").exists());
+        assert!(!dir.join("raft_snapshot.tmp").exists());
+
+        let loaded = persistence.load_snapshot().unwrap().unwrap();
+        assert_eq!(loaded.last_included_index, 10);
+        assert_eq!(loaded.data, b"atomic_test");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_wrong_term_adversarial() {
+        let seed: [u8; 32] = [7u8; 32];
+        let vk_bytes = ml_dsa_vk_bytes(&seed);
+
+        let data = b"legit_state".to_vec();
+        let sig = sign_snapshot_ml_dsa(&seed, 50, 3, &data).unwrap();
+
+        // Replay with different term.
+        let snap = RaftSnapshot {
+            last_included_index: 50,
+            last_included_term: 2, // Wrong! Was signed with term 3.
+            data, signature: sig, timestamp: 999,
+        };
+        assert!(verify_snapshot_signature(&snap, &vk_bytes).is_err());
+    }
+
+    #[test]
+    fn install_snapshot_unsigned_rejected_in_military_mode() {
+        let (mut n1, mut n2, mut n3) = make_three_nodes();
+        let id1 = n1.node_id();
+        let _ = elect_leader(&mut n1, &mut n2, &mut n3);
+
+        std::env::set_var("MILNET_MILITARY_DEPLOYMENT", "1");
+        let msg = RaftMessage::InstallSnapshot {
+            term: n1.current_term(), leader_id: id1,
+            last_included_index: 5, last_included_term: 1,
+            data: b"unsigned".to_vec(), signature: Vec::new(),
+        };
+        let responses = n2.handle_message(id1, msg);
+        match &responses[0].1 {
+            RaftMessage::InstallSnapshotResponse { success, .. } => {
+                assert!(!success, "unsigned snapshot should be rejected in military mode");
+            }
+            other => panic!("expected InstallSnapshotResponse, got {:?}", other),
+        }
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+    }
+
+    #[test]
+    fn snapshot_env_var_threshold_config() {
+        std::env::set_var("MILNET_RAFT_SNAPSHOT_THRESHOLD", "42");
+        assert_eq!(snapshot_threshold(), 42);
+        std::env::set_var("MILNET_RAFT_SNAPSHOT_THRESHOLD", "invalid");
+        assert_eq!(snapshot_threshold(), 10_000);
+        std::env::remove_var("MILNET_RAFT_SNAPSHOT_THRESHOLD");
+        assert_eq!(snapshot_threshold(), 10_000);
+    }
+
+    #[test]
+    fn last_log_index_correct_after_snapshot() {
+        std::env::set_var("MILNET_RAFT_SNAPSHOT_THRESHOLD", "5");
+        let mut node = make_leader_with_entries(15);
+        let total_before = node.last_log_index();
+        let sm = TestStateMachine::new(b"test".to_vec());
+        node.maybe_snapshot(&sm).unwrap();
+        assert_eq!(node.last_log_index(), total_before);
+        std::env::remove_var("MILNET_RAFT_SNAPSHOT_THRESHOLD");
+    }
+
+    #[test]
+    fn propose_after_snapshot_works() {
+        std::env::set_var("MILNET_RAFT_SNAPSHOT_THRESHOLD", "5");
+        let mut node = make_leader_with_entries(10);
+        let sm = TestStateMachine::new(b"pre".to_vec());
+        node.maybe_snapshot(&sm).unwrap();
+
+        let idx_before = node.last_log_index();
+        let new_idx = node.propose(ClusterCommand::HealthUpdate {
+            node_id: NodeId::random(), healthy: false,
+        }).unwrap();
+        assert_eq!(new_idx.0, idx_before.0 + 1);
+        let committed = node.take_committed();
+        assert_eq!(committed.len(), 1);
+        std::env::remove_var("MILNET_RAFT_SNAPSHOT_THRESHOLD");
     }
 }

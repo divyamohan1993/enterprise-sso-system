@@ -17,7 +17,7 @@ use uuid::Uuid;
 /// The family_id tracks token lineage for family-wide revocation.
 #[test]
 fn refresh_token_creation_assigns_family_id() {
-    let mut store = RefreshTokenStore::new();
+    let mut store = RefreshTokenStore::new().expect("test store creation");
     let user_id = Uuid::new_v4();
 
     let token = store.issue(user_id, "client-1", "openid profile");
@@ -32,7 +32,7 @@ fn refresh_token_creation_assigns_family_id() {
 /// Security property: Each initial grant creates a unique family.
 #[test]
 fn each_grant_creates_unique_family() {
-    let mut store = RefreshTokenStore::new();
+    let mut store = RefreshTokenStore::new().expect("test store creation");
     let user_id = Uuid::new_v4();
 
     let token1 = store.issue(user_id, "client-1", "openid");
@@ -53,7 +53,7 @@ fn each_grant_creates_unique_family() {
 /// The rotated token inherits the family lineage from its parent.
 #[test]
 fn token_rotation_preserves_family_id() {
-    let mut store = RefreshTokenStore::new();
+    let mut store = RefreshTokenStore::new().expect("test store creation");
     let user_id = Uuid::new_v4();
 
     let token = store.issue(user_id, "client-1", "openid");
@@ -71,7 +71,7 @@ fn token_rotation_preserves_family_id() {
 /// Security property: Token rotation generates a new token value.
 #[test]
 fn token_rotation_generates_new_value() {
-    let mut store = RefreshTokenStore::new();
+    let mut store = RefreshTokenStore::new().expect("test store creation");
     let user_id = Uuid::new_v4();
 
     let token = store.issue(user_id, "client-1", "openid");
@@ -88,7 +88,7 @@ fn token_rotation_generates_new_value() {
 /// primary defense against stolen refresh token attacks per RFC 6749 10.4.
 #[test]
 fn double_consumption_revokes_entire_family() {
-    let mut store = RefreshTokenStore::new();
+    let mut store = RefreshTokenStore::new().expect("test store creation");
     let user_id = Uuid::new_v4();
 
     let token = store.issue(user_id, "client-1", "openid");
@@ -122,7 +122,7 @@ fn double_consumption_revokes_entire_family() {
 /// redeemable by client-2. This prevents cross-client token theft.
 #[test]
 fn cross_client_refresh_token_usage_fails() {
-    let mut store = RefreshTokenStore::new();
+    let mut store = RefreshTokenStore::new().expect("test store creation");
     let user_id = Uuid::new_v4();
 
     let token = store.issue(user_id, "client-1", "openid");
@@ -147,7 +147,7 @@ fn cross_client_refresh_token_usage_fails() {
 /// non-expired state) and that the cleanup path handles expiry.
 #[test]
 fn token_expiry_behavior() {
-    let mut store = RefreshTokenStore::new();
+    let mut store = RefreshTokenStore::new().expect("test store creation");
     let user_id = Uuid::new_v4();
 
     let token = store.issue(user_id, "client-1", "openid");
@@ -164,7 +164,7 @@ fn token_expiry_behavior() {
 /// automatic family revocation.
 #[test]
 fn family_revocation_removes_all_tokens_via_double_consumption() {
-    let mut store = RefreshTokenStore::new();
+    let mut store = RefreshTokenStore::new().expect("test store creation");
     let user_id = Uuid::new_v4();
 
     let t1 = store.issue(user_id, "client-1", "openid");
@@ -187,7 +187,7 @@ fn family_revocation_removes_all_tokens_via_double_consumption() {
 /// Security property: Redeeming a nonexistent token returns an error.
 #[test]
 fn nonexistent_token_rejected() {
-    let mut store = RefreshTokenStore::new();
+    let mut store = RefreshTokenStore::new().expect("test store creation");
     let result = store.redeem("rt_nonexistent", "client-1");
     assert!(result.is_err());
     let err = match result {
@@ -202,7 +202,7 @@ fn nonexistent_token_rejected() {
 /// Security property: Cleanup does not remove valid tokens.
 #[test]
 fn cleanup_preserves_valid_tokens() {
-    let mut store = RefreshTokenStore::new();
+    let mut store = RefreshTokenStore::new().expect("test store creation");
     let user_id = Uuid::new_v4();
 
     let valid_token = store.issue(user_id, "client-1", "openid");
@@ -220,7 +220,7 @@ fn cleanup_preserves_valid_tokens() {
 /// Security property: Tokens preserve user_id, client_id, and scope.
 #[test]
 fn token_preserves_metadata() {
-    let mut store = RefreshTokenStore::new();
+    let mut store = RefreshTokenStore::new().expect("test store creation");
     let user_id = Uuid::new_v4();
 
     let token = store.issue(user_id, "my-client", "openid profile email");
@@ -234,7 +234,7 @@ fn token_preserves_metadata() {
 /// Security property: Tokens have a positive expiry time in the future.
 #[test]
 fn token_has_future_expiry() {
-    let mut store = RefreshTokenStore::new();
+    let mut store = RefreshTokenStore::new().expect("test store creation");
     let user_id = Uuid::new_v4();
 
     let token = store.issue(user_id, "client-1", "openid");

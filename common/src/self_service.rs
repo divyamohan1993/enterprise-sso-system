@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::RwLock;
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 use crate::siem::SecurityEvent;
 
@@ -64,6 +65,22 @@ pub struct VerifiedSession {
     pub user_agent: Option<String>,
     /// Tenant ID for multi-tenant scoping.
     pub tenant_id: Option<String>,
+}
+
+/// Zeroize PII fields on drop to prevent memory forensics extraction.
+impl Drop for VerifiedSession {
+    fn drop(&mut self) {
+        self.session_id.zeroize();
+        if let Some(ref mut ip) = self.source_ip {
+            ip.zeroize();
+        }
+        if let Some(ref mut ua) = self.user_agent {
+            ua.zeroize();
+        }
+        if let Some(ref mut tid) = self.tenant_id {
+            tid.zeroize();
+        }
+    }
 }
 
 impl VerifiedSession {
@@ -141,10 +158,11 @@ impl std::fmt::Debug for PasswordResetRequest {
 
 impl Drop for PasswordResetRequest {
     fn drop(&mut self) {
-        use zeroize::Zeroize;
         self.email.zeroize();
         self.token.zeroize();
-        self.source_ip.take();
+        if let Some(ref mut ip) = self.source_ip {
+            ip.zeroize();
+        }
     }
 }
 
@@ -211,7 +229,6 @@ impl std::fmt::Debug for TotpEnrollment {
 
 impl Drop for TotpEnrollment {
     fn drop(&mut self) {
-        use zeroize::Zeroize;
         self.secret.zeroize();
         self.provisioning_uri.zeroize();
         self.account_name.zeroize();
@@ -404,7 +421,6 @@ impl std::fmt::Debug for EmailVerification {
 
 impl Drop for EmailVerification {
     fn drop(&mut self) {
-        use zeroize::Zeroize;
         self.new_email.zeroize();
         self.token.zeroize();
     }
@@ -445,8 +461,17 @@ impl std::fmt::Debug for RecoveryCode {
 
 impl Drop for RecoveryCode {
     fn drop(&mut self) {
-        use zeroize::Zeroize;
         self.code.zeroize();
+    }
+}
+
+/// Zeroize device fingerprint on drop.
+impl Drop for RegisteredDevice {
+    fn drop(&mut self) {
+        self.fingerprint.zeroize();
+        if let Some(ref mut ua) = self.user_agent {
+            ua.zeroize();
+        }
     }
 }
 
@@ -473,6 +498,17 @@ pub struct ActiveSession {
     pub device_name: Option<String>,
     /// Location (derived from IP).
     pub location: Option<String>,
+}
+
+/// Zeroize PII fields on drop.
+impl Drop for ActiveSession {
+    fn drop(&mut self) {
+        self.session_id.zeroize();
+        self.source_ip.zeroize();
+        if let Some(ref mut ua) = self.user_agent {
+            ua.zeroize();
+        }
+    }
 }
 
 // ── Self-Service Portal Store ───────────────────────────────────────────────
@@ -509,6 +545,13 @@ pub struct UserProfile {
     pub email: String,
     /// Last profile update time.
     pub updated_at: i64,
+}
+
+/// Zeroize email (PII) on drop.
+impl Drop for UserProfile {
+    fn drop(&mut self) {
+        self.email.zeroize();
+    }
 }
 
 impl SelfServiceStore {
@@ -2143,5 +2186,67 @@ mod tests {
             .unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].session_id, current.session_id);
+    }
+
+    // ── Zeroization tests ──────────────────────────────────────────────
+
+    #[test]
+    fn verified_session_drop_runs_without_panic() {
+        let session = make_session(Uuid::new_v4());
+        assert!(session.source_ip.is_some());
+        assert!(session.user_agent.is_some());
+        drop(session);
+    }
+
+    #[test]
+    fn verified_session_drop_none_fields_no_panic() {
+        let session = make_unverified_session(Uuid::new_v4());
+        assert!(session.source_ip.is_none());
+        assert!(session.user_agent.is_none());
+        drop(session);
+    }
+
+    #[test]
+    fn active_session_drop_runs_without_panic() {
+        let session = ActiveSession {
+            session_id: "sess-123".to_string(),
+            user_id: Uuid::new_v4(),
+            source_ip: "10.0.0.1".to_string(),
+            user_agent: Some("Agent/1.0".to_string()),
+            created_at: now_epoch(),
+            last_active_at: now_epoch(),
+            is_current: true,
+            device_name: None,
+            location: None,
+        };
+        drop(session);
+    }
+
+    #[test]
+    fn registered_device_drop_runs_without_panic() {
+        let device = RegisteredDevice {
+            id: "dev-1".to_string(),
+            user_id: Uuid::new_v4(),
+            name: "Test Device".to_string(),
+            device_type: "laptop".to_string(),
+            fingerprint: "abc123def456".to_string(),
+            status: DeviceStatus::Active,
+            registered_at: now_epoch(),
+            last_seen_at: None,
+            os_info: None,
+            user_agent: Some("TestAgent".to_string()),
+        };
+        drop(device);
+    }
+
+    #[test]
+    fn user_profile_drop_runs_without_panic() {
+        let profile = UserProfile {
+            user_id: Uuid::new_v4(),
+            display_name: "Test User".to_string(),
+            email: "user@milnet.mil".to_string(),
+            updated_at: now_epoch(),
+        };
+        drop(profile);
     }
 }

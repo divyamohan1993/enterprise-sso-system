@@ -32,6 +32,19 @@ pub fn create_registration_options(
     )
 }
 
+/// Whether military deployment mode is active.
+///
+/// When true, discoverable credentials (resident keys) are required for
+/// CAC/PIV-based usernameless authentication flows per DoD policy.
+/// Controlled by the `MILNET_MILITARY_DEPLOYMENT` environment variable
+/// (defaults to `true`).
+fn is_military_deployment() -> bool {
+    match std::env::var("MILNET_MILITARY_DEPLOYMENT") {
+        Ok(val) => val != "0" && val.to_lowercase() != "false",
+        Err(_) => true,
+    }
+}
+
 /// Like [`create_registration_options`] but allows passing existing credential
 /// IDs to populate the `excludeCredentials` list.
 pub fn create_registration_options_with_excludes(
@@ -85,7 +98,7 @@ pub fn create_registration_options_with_excludes(
             } else {
                 None
             },
-            resident_key: "preferred".into(),
+            resident_key: if is_military_deployment() { "required" } else { "preferred" }.into(),
             user_verification: "required".into(),
         },
         exclude_credentials,
@@ -430,6 +443,7 @@ impl PersistentCredentialStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use sha2::{Digest, Sha256};
 
     /// Helper: build auth data with attested credential data.
@@ -458,6 +472,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_registration_options_created() {
         let user_id = Uuid::new_v4();
         let opts = create_registration_options(
@@ -630,5 +645,40 @@ mod tests {
             authenticator_type: "platform".into(),
         });
         assert!(store.credential_exists(&cred_id));
+    }
+
+    #[test]
+    #[serial]
+    fn test_military_mode_resident_key_required() {
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        let user_id = Uuid::new_v4();
+        let opts = create_registration_options(
+            "MILNET SSO", "sso.milnet.example", &user_id, "alice", false,
+        );
+        assert_eq!(opts.authenticator_selection.resident_key, "required");
+    }
+
+    #[test]
+    #[serial]
+    fn test_military_mode_explicit_true() {
+        std::env::set_var("MILNET_MILITARY_DEPLOYMENT", "true");
+        let user_id = Uuid::new_v4();
+        let opts = create_registration_options(
+            "MILNET SSO", "sso.milnet.example", &user_id, "alice", false,
+        );
+        assert_eq!(opts.authenticator_selection.resident_key, "required");
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+    }
+
+    #[test]
+    #[serial]
+    fn test_non_military_mode_resident_key_preferred() {
+        std::env::set_var("MILNET_MILITARY_DEPLOYMENT", "false");
+        let user_id = Uuid::new_v4();
+        let opts = create_registration_options(
+            "MILNET SSO", "sso.milnet.example", &user_id, "alice", false,
+        );
+        assert_eq!(opts.authenticator_selection.resident_key, "preferred");
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
     }
 }

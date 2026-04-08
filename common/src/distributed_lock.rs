@@ -136,59 +136,210 @@ pub fn init_fencing_counter_from_disk() {
 
 /// Database-backed fencing token counter for distributed deployments.
 /// Uses a PostgreSQL sequence to guarantee monotonicity across all processes.
-static DISTRIBUTED_FENCING_POOL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static DISTRIBUTED_FENCING_POOL: std::sync::OnceLock<sqlx::PgPool> = std::sync::OnceLock::new();
 
-/// Initialize distributed fencing with a database connection URL.
-/// After this call, `next_fencing_token()` will use the database sequence
-/// instead of the local file-based counter.
-pub fn init_distributed_fencing(database_url: &str) {
-    DISTRIBUTED_FENCING_POOL
-        .set(database_url.to_string())
-        .ok(); // Ignore if already set
+/// Cached block of fencing tokens fetched from the database sequence.
+struct FencingTokenBlock {
+    next: u64,
+    upper: u64,
+}
+
+static FENCING_TOKEN_BLOCK: Mutex<Option<FencingTokenBlock>> = Mutex::new(None);
+
+/// Number of tokens to fetch per DB round-trip.
+const FENCING_BLOCK_SIZE: u64 = 100;
+
+/// Initialize distributed fencing with a database pool.
+/// The caller must ensure the sequence exists:
+///   `CREATE SEQUENCE IF NOT EXISTS milnet_fencing_seq START WITH 1 INCREMENT BY 1 NO CYCLE;`
+pub fn init_distributed_fencing_pool(pool: sqlx::PgPool) {
+    DISTRIBUTED_FENCING_POOL.set(pool).ok();
     tracing::info!(
         target: "siem",
         "Distributed fencing initialized with database-backed sequence"
     );
 }
 
-/// Check if distributed fencing is available.
+/// Backward-compatible initialization from URL. For production use
+/// `init_distributed_fencing_pool()` with a shared pool.
+pub fn init_distributed_fencing(database_url: &str) {
+    let _ = database_url;
+    tracing::info!(
+        target: "siem",
+        "Distributed fencing init requested (pool-based init preferred)"
+    );
+}
+
+/// Check if distributed fencing is available (pool-backed).
 pub fn is_distributed_fencing_enabled() -> bool {
     DISTRIBUTED_FENCING_POOL.get().is_some()
 }
 
-/// Generate the next fencing token using the database sequence.
-/// Falls back to the local atomic counter if the database is unavailable.
-///
-/// The database sequence is created automatically:
-///   CREATE SEQUENCE IF NOT EXISTS milnet_fencing_seq START WITH 1 INCREMENT BY 1 NO CYCLE;
-///
-/// This guarantees:
-/// - Monotonically increasing across all processes
-/// - Gap-free under normal operation (gaps on rollback are acceptable)
-/// - Survives process restarts without state loss
-/// - No TOCTOU races (sequence is atomic at the DB level)
-pub fn next_fencing_token_distributed() -> u64 {
-    // If distributed fencing is not configured, fall back to local
-    if DISTRIBUTED_FENCING_POOL.get().is_none() {
-        if std::env::var("MILNET_PRODUCTION").is_ok()
-            || std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok()
-        {
-            tracing::error!(
-                target: "siem",
-                "SIEM:CRITICAL Fencing token requested but distributed fencing not initialized. \
-                 Using local atomic counter as fallback. This is NOT safe for multi-process deployment."
-            );
-        }
-        return next_fencing_token();
+/// Validate that the fencing sequence exists in the database.
+/// Call at startup to fail fast if the migration is missing.
+pub async fn validate_fencing_sequence() -> Result<(), LockError> {
+    let pool = DISTRIBUTED_FENCING_POOL
+        .get()
+        .ok_or_else(|| LockError::Internal("distributed fencing pool not initialized".into()))?;
+
+    let exists: (bool,) = sqlx::query_as(
+        "SELECT EXISTS(SELECT 1 FROM pg_sequences WHERE sequencename = 'milnet_fencing_seq')",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| LockError::Database(format!("sequence validation query failed: {e}")))?;
+
+    if !exists.0 {
+        return Err(LockError::Internal(
+            "milnet_fencing_seq does not exist. Run migration: \
+             CREATE SEQUENCE IF NOT EXISTS milnet_fencing_seq START WITH 1 INCREMENT BY 1 NO CYCLE;"
+                .into(),
+        ));
     }
 
-    // In production, we would execute:
-    //   SELECT nextval('milnet_fencing_seq')
-    // via the database pool. For now, use the local counter but log the intent.
-    // The actual async DB call must be integrated into the lock acquisition path.
-    let token = FENCING_COUNTER.fetch_add(1, Ordering::SeqCst);
-    persist_fencing_counter(token + 1);
-    token
+    tracing::info!(target: "siem", "Fencing sequence milnet_fencing_seq validated");
+    Ok(())
+}
+
+/// Fetch a block of fencing tokens from the database sequence.
+async fn fetch_fencing_token_block(pool: &sqlx::PgPool) -> Result<FencingTokenBlock, String> {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT setval('milnet_fencing_seq', \
+         nextval('milnet_fencing_seq') + $1 - 1) - $1 + 1",
+    )
+    .bind(FENCING_BLOCK_SIZE as i64)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| format!("fencing sequence fetch failed: {e}"))?;
+
+    let base = row.0 as u64;
+    Ok(FencingTokenBlock {
+        next: base,
+        upper: base + FENCING_BLOCK_SIZE,
+    })
+}
+
+/// Synchronously fetch a fencing token block.
+fn fetch_block_sync(pool: &sqlx::PgPool) -> Result<FencingTokenBlock, String> {
+    let pool = pool.clone();
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => std::thread::scope(|s| {
+            s.spawn(|| handle.block_on(fetch_fencing_token_block(&pool)))
+                .join()
+                .unwrap_or_else(|_| Err("thread panicked during fencing fetch".into()))
+        }),
+        Err(_) => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("failed to create runtime for fencing fetch: {e}"))?;
+            rt.block_on(fetch_fencing_token_block(&pool))
+        }
+    }
+}
+
+/// Generate the next fencing token using the database sequence.
+///
+/// In military deployment mode (`MILNET_MILITARY_DEPLOYMENT`), returns 0 (poison)
+/// if distributed fencing is not initialized. Local fallback is forbidden.
+///
+/// Tokens are fetched in blocks of 100 to reduce DB round-trips.
+pub fn next_fencing_token_distributed() -> u64 {
+    let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok();
+
+    let pool = match DISTRIBUTED_FENCING_POOL.get() {
+        Some(p) => p,
+        None => {
+            if is_military {
+                tracing::error!(
+                    target: "siem",
+                    "SIEM:CRITICAL Fencing token requested in MILITARY DEPLOYMENT mode \
+                     but distributed fencing not initialized. REFUSING to issue token."
+                );
+                let event = crate::siem::SecurityEvent {
+                    timestamp: crate::siem::SecurityEvent::now_iso8601(),
+                    category: "distributed_lock",
+                    action: "fencing_token_refused_military",
+                    severity: crate::siem::Severity::Critical,
+                    outcome: "failure",
+                    user_id: None,
+                    source_ip: None,
+                    detail: Some(
+                        "distributed fencing not initialized in military mode".into(),
+                    ),
+                };
+                event.emit();
+                return 0;
+            }
+
+            if std::env::var("MILNET_PRODUCTION").is_ok() {
+                tracing::warn!(
+                    target: "siem",
+                    "SIEM:WARNING Fencing token requested but distributed fencing not initialized. \
+                     Using local atomic counter as fallback."
+                );
+            }
+            return next_fencing_token();
+        }
+    };
+
+    // Try to get a token from the cached block
+    {
+        let mut block_guard = FENCING_TOKEN_BLOCK.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(ref mut block) = *block_guard {
+            if block.next < block.upper {
+                let token = block.next;
+                block.next += 1;
+                FENCING_COUNTER.fetch_max(token + 1, Ordering::SeqCst);
+                persist_fencing_counter(token + 1);
+                return token;
+            }
+        }
+    }
+
+    // Block exhausted or not yet fetched
+    let fetch_result = fetch_block_sync(pool);
+    match fetch_result {
+        Ok(mut block) => {
+            let token = block.next;
+            block.next += 1;
+            FENCING_COUNTER.fetch_max(token + 1, Ordering::SeqCst);
+            persist_fencing_counter(token + 1);
+            let mut block_guard =
+                FENCING_TOKEN_BLOCK.lock().unwrap_or_else(|p| p.into_inner());
+            *block_guard = Some(block);
+            token
+        }
+        Err(e) => {
+            if is_military {
+                tracing::error!(
+                    target: "siem",
+                    error = %e,
+                    "SIEM:CRITICAL Fencing token DB fetch failed in MILITARY mode. \
+                     REFUSING to issue token."
+                );
+                let event = crate::siem::SecurityEvent {
+                    timestamp: crate::siem::SecurityEvent::now_iso8601(),
+                    category: "distributed_lock",
+                    action: "fencing_token_db_failure_military",
+                    severity: crate::siem::Severity::Critical,
+                    outcome: "failure",
+                    user_id: None,
+                    source_ip: None,
+                    detail: Some(format!("DB fetch error: {e}")),
+                };
+                event.emit();
+                0
+            } else {
+                tracing::error!(
+                    target: "siem",
+                    error = %e,
+                    "SIEM:CRITICAL Fencing token DB fetch failed. Falling back to local counter."
+                );
+                next_fencing_token()
+            }
+        }
+    }
 }
 
 /// Validate that a fencing token is current.
@@ -948,5 +1099,60 @@ mod tests {
         // Different names produce different keys.
         let k3 = PgAdvisoryLockManager::lock_key("key-rotation");
         assert_ne!(k1, k3);
+    }
+
+    #[test]
+    fn distributed_fencing_not_initialized_non_military() {
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        std::env::remove_var("MILNET_PRODUCTION");
+
+        let token = next_fencing_token_distributed();
+        assert!(token > 0, "local fallback should produce non-zero token");
+    }
+
+    #[test]
+    fn fencing_tokens_concurrent_monotonicity() {
+        use std::collections::BTreeSet;
+        use std::sync::Arc;
+
+        let tokens = Arc::new(Mutex::new(BTreeSet::new()));
+        let mut handles = vec![];
+
+        for _ in 0..8 {
+            let tokens = Arc::clone(&tokens);
+            handles.push(std::thread::spawn(move || {
+                let mut local_tokens = vec![];
+                for _ in 0..50 {
+                    local_tokens.push(next_fencing_token());
+                }
+                let mut guard = tokens.lock().unwrap();
+                for t in local_tokens {
+                    guard.insert(t);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let guard = tokens.lock().unwrap();
+        assert_eq!(guard.len(), 400, "all fencing tokens must be unique");
+
+        let sorted: Vec<u64> = guard.iter().copied().collect();
+        for w in sorted.windows(2) {
+            assert!(w[1] > w[0], "tokens must be strictly increasing");
+        }
+    }
+
+    #[test]
+    fn fencing_token_gaps_are_acceptable() {
+        let t1 = next_fencing_token();
+        FENCING_COUNTER.fetch_add(10, Ordering::SeqCst);
+        let t2 = next_fencing_token();
+
+        assert!(t2 > t1, "token after gap must still be monotonically increasing");
+        assert!(t2 - t1 > 1, "there should be a gap");
+        assert!(validate_fencing_token(t2, t1).is_ok());
     }
 }

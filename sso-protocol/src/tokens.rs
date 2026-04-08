@@ -304,20 +304,37 @@ pub struct RefreshTokenStore {
 }
 
 impl RefreshTokenStore {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self, String> {
+        if std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok() {
+            common::siem::emit_runtime_error(
+                common::siem::category::COMPLIANCE_ALERT,
+                "CRITICAL: RefreshTokenStore in-memory-only instantiation attempted in military deployment mode. Configure a persistent backend.",
+                "volatile refresh token store in military mode",
+                file!(),
+                line!(),
+                column!(),
+                module_path!(),
+            );
+            return Err(
+                "RefreshTokenStore: in-memory-only storage is forbidden in military deployment mode \
+                 (MILNET_MILITARY_DEPLOYMENT is set). Configure a persistent backend."
+                    .to_string(),
+            );
+        }
+
         common::siem::emit_runtime_error(
             common::siem::category::RUNTIME_ERROR,
-            "RefreshTokenStore initialized with in-memory backend only. All refresh tokens will be lost on restart. Configure a persistent backend for production.",
+            "WARNING: RefreshTokenStore initialized with in-memory backend only. All refresh tokens will be lost on restart. Configure a persistent backend for production.",
             "no persistence backend configured",
             file!(),
             line!(),
             column!(),
             module_path!(),
         );
-        Self {
+        Ok(Self {
             tokens: HashMap::new(),
             persistence_backend: None,
-        }
+        })
     }
 
     /// Issue a new refresh token for a user/client pair.
@@ -334,7 +351,13 @@ impl RefreshTokenStore {
     /// The `family_id` is inherited from the parent token during rotation,
     /// enabling family-wide revocation on reuse detection.
     fn issue_in_family(&mut self, user_id: Uuid, client_id: &str, scope: &str, family_id: &str) -> String {
-        let token_value = format!("rt_{}", Uuid::new_v4());
+        let mut token_bytes = [0u8; 32];
+        getrandom::getrandom(&mut token_bytes).unwrap_or_else(|e| {
+            tracing::error!("FATAL: CSPRNG failure in refresh token generation: {e}");
+            std::process::exit(1);
+        });
+        let token_value = format!("rt_{}", hex::encode(token_bytes));
+        zeroize::Zeroize::zeroize(&mut token_bytes);
         let now = common::secure_time::secure_now_secs_i64();
         self.tokens.insert(
             token_value.clone(),
@@ -443,7 +466,7 @@ impl RefreshTokenStore {
 
 impl Default for RefreshTokenStore {
     fn default() -> Self {
-        Self::new()
+        Self::new().expect("RefreshTokenStore::default() failed — check MILNET_MILITARY_DEPLOYMENT")
     }
 }
 
@@ -1352,5 +1375,94 @@ mod tests {
                 result.err()
             );
         });
+    }
+
+    // ── Refresh token military mode check (FIX 3) ──────────────────────
+
+    #[test]
+    fn refresh_token_store_non_military_succeeds() {
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        let store = RefreshTokenStore::new();
+        assert!(store.is_ok(), "non-military mode should allow in-memory store");
+    }
+
+    #[test]
+    fn refresh_token_store_military_mode_rejects_volatile() {
+        std::env::set_var("MILNET_MILITARY_DEPLOYMENT", "true");
+        let store = RefreshTokenStore::new();
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        assert!(store.is_err(), "military mode must reject in-memory-only store");
+        let err = store.unwrap_err();
+        assert!(
+            err.contains("military") || err.contains("MILNET"),
+            "error must reference military deployment: {err}"
+        );
+    }
+
+    // ── Refresh token entropy (FIX 4) ──────────────────────────────────
+
+    #[test]
+    fn refresh_token_has_256_bit_entropy() {
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        let mut store = RefreshTokenStore::new().expect("store creation");
+        let token = store.issue(Uuid::new_v4(), "client-1", "openid");
+        // Format: "rt_" + 64 hex chars = 67 chars total (256 bits = 32 bytes = 64 hex)
+        assert_eq!(token.len(), 67, "token must be rt_ + 64 hex chars (256 bits), got len={}", token.len());
+        assert!(token.starts_with("rt_"), "token must start with rt_");
+        let hex_part = &token[3..];
+        assert!(hex_part.chars().all(|c| c.is_ascii_hexdigit()), "token body must be valid hex");
+    }
+
+    #[test]
+    fn refresh_tokens_are_unique() {
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        let mut store = RefreshTokenStore::new().expect("store creation");
+        let mut tokens = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let token = store.issue(Uuid::new_v4(), "client-1", "openid");
+            assert!(tokens.insert(token), "duplicate token generated");
+        }
+        assert_eq!(tokens.len(), 1000, "all 1000 tokens must be unique");
+    }
+
+    #[test]
+    fn two_consecutive_tokens_differ() {
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        let mut store = RefreshTokenStore::new().expect("store creation");
+        let t1 = store.issue(Uuid::new_v4(), "client-1", "openid");
+        let t2 = store.issue(Uuid::new_v4(), "client-1", "openid");
+        assert_ne!(t1, t2, "consecutive tokens must differ");
+    }
+
+    // ── Adversarial refresh token tests ────────────────────────────────
+
+    #[test]
+    fn adversarial_refresh_with_expired_token() {
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        let mut store = RefreshTokenStore::new().expect("store creation");
+        let user = Uuid::new_v4();
+        let token = store.issue(user, "client-1", "openid");
+
+        if let Some(rt) = store.tokens.get_mut(&token) {
+            rt.expires_at = 0;
+        }
+
+        let result = store.redeem(&token, "client-1");
+        assert!(result.is_err(), "expired refresh token must be rejected");
+        assert!(result.unwrap_err().contains("expired"));
+    }
+
+    #[test]
+    fn adversarial_refresh_with_revoked_family() {
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        let mut store = RefreshTokenStore::new().expect("store creation");
+        let user = Uuid::new_v4();
+        let token = store.issue(user, "client-1", "openid");
+
+        let family_id = store.tokens.get(&token).unwrap().family_id.clone();
+        store.revoke_family(&family_id);
+
+        let result = store.redeem(&token, "client-1");
+        assert!(result.is_err(), "revoked family token must be rejected");
     }
 }

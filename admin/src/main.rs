@@ -378,7 +378,8 @@ async fn main() {
         ha_pool: std::sync::Mutex::new(ha_pool),
         encrypted_pool,
         session_store: RwLock::new(session_store),
-        refresh_token_store: RwLock::new(sso_protocol::tokens::RefreshTokenStore::new()),
+        refresh_token_store: RwLock::new(sso_protocol::tokens::RefreshTokenStore::new()
+            .expect("RefreshTokenStore initialization failed")),
     });
 
     // Start the key rotation monitor in the background
