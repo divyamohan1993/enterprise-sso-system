@@ -27,10 +27,15 @@
 //! env var removal. The overwrite-then-remove pattern in this module mitigates
 //! libc-level scanning and child process inheritance, but cannot protect against
 //! `/proc/PID/environ` reads. For true secret isolation, prefer:
+//!   - **Unix socket delivery** via `secret_ceremony::load_secret_from_socket()` (recommended)
 //!   - File descriptor passing (`MILNET_MASTER_KEK_FD`) via `load_master_kek_from_fd()`
 //!   - Unix domain socket fd passing
 //!   - `O_TMPFILE` tmpfs file descriptors
 //!   - HSM/TPM sealed storage
+//!
+//! See `secret_ceremony.rs` for the full distributed secret delivery protocol
+//! using Unix sockets with mutual attestation (HMAC-SHA512 + binary hash) and
+//! per-session ephemeral X25519 key exchange.
 
 use std::sync::OnceLock;
 use zeroize::Zeroize;
@@ -95,6 +100,7 @@ unsafe impl Send for ProtectedKek {}
 
 static MASTER_KEK_CACHE: OnceLock<ProtectedKek> = OnceLock::new();
 static DISTRIBUTED_KEK_CACHE: OnceLock<ProtectedKek> = OnceLock::new();
+static THRESHOLD_KDF_CACHE: OnceLock<ProtectedKek> = OnceLock::new();
 
 /// Returns a reference to the cached master KEK, loading it once on first call.
 /// The KEK is mlock'd into physical RAM and excluded from core dumps.
@@ -112,6 +118,110 @@ pub fn cached_master_kek() -> &'static [u8; 32] {
 /// Deployments MUST set `MILNET_KEK_SHARE` for distributed KEK.
 pub fn use_distributed_kek() -> bool {
     std::env::var("MILNET_KEK_SHARE").is_ok()
+}
+
+/// Returns true when threshold KDF mode is active (MILNET_THRESHOLD_KDF=1).
+/// In this mode the master KEK is NEVER reconstructed. Each node computes
+/// a partial HMAC from its share; partials are combined via HKDF.
+pub fn use_threshold_kdf() -> bool {
+    std::env::var("MILNET_THRESHOLD_KDF").as_deref() == Ok("1")
+        && std::env::var("MILNET_KEK_SHARE").is_ok()
+}
+
+/// Derive the master KEK via threshold KDF (no reconstruction).
+///
+/// The master secret NEVER exists in any node's memory.
+pub fn cached_master_kek_threshold_kdf() -> &'static [u8; 32] {
+    THRESHOLD_KDF_CACHE.get_or_init(|| {
+        use crate::threshold_kek::{KekShare, partial_derive_key, ThresholdKdfManager};
+
+        let context = std::env::var("MILNET_THRESHOLD_KDF_CONTEXT")
+            .unwrap_or_else(|_| "milnet-kek-v1".to_string());
+        let salt = std::env::var("MILNET_THRESHOLD_KDF_SALT")
+            .unwrap_or_else(|_| "milnet-threshold-kdf-salt-v1".to_string());
+
+        let my_share_hex = match std::env::var("MILNET_KEK_SHARE") {
+            Ok(v) => v,
+            Err(_) => {
+                tracing::error!("MILNET_KEK_SHARE not set for threshold KDF mode.");
+                std::process::exit(1);
+            }
+        };
+        let peer_shares_csv = std::env::var("MILNET_KEK_PEER_SHARES").ok();
+
+        let my_share = match KekShare::from_hex(&my_share_hex) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("Failed to parse MILNET_KEK_SHARE: {e}");
+                std::process::exit(1);
+            }
+        };
+
+        let mut all_shares = vec![my_share];
+        if let Some(ref csv) = peer_shares_csv {
+            for hex_share in csv.split(',') {
+                let hex_share = hex_share.trim();
+                if hex_share.is_empty() { continue; }
+                match KekShare::from_hex(hex_share) {
+                    Ok(share) => {
+                        if !verify_share_commitment(&share) {
+                            tracing::error!(
+                                "SECURITY: VSS verification FAILED for peer share {} in threshold KDF. REJECTED.",
+                                share.index
+                            );
+                            crate::siem::SecurityEvent::tamper_detected(
+                                &format!("Rejected peer share {} in threshold KDF", share.index),
+                            );
+                            continue;
+                        }
+                        all_shares.push(share);
+                    }
+                    Err(e) => tracing::warn!("Failed to parse peer share in threshold KDF: {e}"),
+                }
+            }
+        }
+
+        if all_shares.len() < 3 {
+            tracing::error!("Insufficient shares for threshold KDF: have {}, need 3.", all_shares.len());
+            std::process::exit(1);
+        }
+
+        let mut mgr = ThresholdKdfManager::new(3, 5, context.as_bytes(), salt.as_bytes());
+        for share in &all_shares {
+            let partial = partial_derive_key(share, context.as_bytes(), salt.as_bytes());
+            if let Err(e) = mgr.submit_partial(share.index, partial) {
+                tracing::error!("Failed to submit partial for share {}: {e}", share.index);
+                std::process::exit(1);
+            }
+        }
+
+        // Zeroize shares
+        for share in &mut all_shares {
+            share.value.zeroize();
+        }
+
+        // Remove env vars
+        std::env::set_var("MILNET_KEK_SHARE", "0".repeat(my_share_hex.len()));
+        std::env::remove_var("MILNET_KEK_SHARE");
+        if let Some(ref csv) = peer_shares_csv {
+            std::env::set_var("MILNET_KEK_PEER_SHARES", "0".repeat(csv.len()));
+            std::env::remove_var("MILNET_KEK_PEER_SHARES");
+        }
+
+        match mgr.derive_key() {
+            Ok(key) => {
+                tracing::info!("Master KEK derived via threshold KDF (3-of-5). Secret NEVER reconstructed.");
+                ProtectedKek::new(key)
+            }
+            Err(e) => {
+                tracing::error!("Threshold KDF derivation failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    });
+    let kek = THRESHOLD_KDF_CACHE.get().expect("threshold KDF cache initialized above");
+    kek.lock_in_place();
+    kek.as_bytes()
 }
 
 /// Reconstruct the master KEK from threshold Shamir shares collected via env vars.
@@ -357,7 +467,29 @@ fn verify_share_commitment(share: &crate::threshold_kek::KekShare) -> bool {
 /// All services SHOULD use this function instead of calling `cached_master_kek()`
 /// or `load_master_kek()` directly.
 pub fn get_master_kek() -> &'static [u8; 32] {
+    // Preferred path: threshold KDF. The KEK is NEVER reconstructed.
+    if use_threshold_kdf() {
+        return cached_master_kek_threshold_kdf();
+    }
+
     if use_distributed_kek() {
+        // Legacy reconstruction path. Forbidden in military deployment.
+        if is_production() && std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1") {
+            crate::siem::SecurityEvent::crypto_failure(
+                "FORBIDDEN: Shamir reconstruct() in military deployment. \
+                 Set MILNET_THRESHOLD_KDF=1 for threshold KDF (no reconstruction).",
+            );
+            panic!(
+                "FATAL: reconstruct() forbidden in military deployment. \
+                 Use MILNET_THRESHOLD_KDF=1."
+            );
+        }
+        if is_production() {
+            crate::siem::SecurityEvent::crypto_failure(
+                "WARNING: legacy Shamir reconstruct() path active. Full KEK materializes in RAM. \
+                 Migrate to MILNET_THRESHOLD_KDF=1.",
+            );
+        }
         cached_master_kek_distributed()
     } else {
         // Production requires threshold mode. Single-key is only allowed

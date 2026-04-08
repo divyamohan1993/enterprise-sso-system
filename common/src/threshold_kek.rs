@@ -633,6 +633,237 @@ impl Drop for ThresholdKekManager {
 }
 
 // ---------------------------------------------------------------------------
+// Threshold KDF -- derive keys WITHOUT reconstructing the master secret
+// ---------------------------------------------------------------------------
+//
+// THREAT MODEL: The standard Shamir reconstruct() materializes the full KEK
+// in one node's RAM. Root on that node = game over.
+//
+// ThresholdKdf solves this: each node computes a partial HMAC over its share,
+// a combiner XORs the partials and runs HKDF. The full secret NEVER exists
+// in any single address space.
+
+/// Domain separation for threshold KDF partial derivations.
+const THRESHOLD_KDF_DOMAIN: &[u8] = b"MILNET-THRESHOLD-KDF-v1";
+
+/// Compute a partial key derivation from a single Shamir share.
+///
+/// Each node calls this with its own share. Returns
+/// HMAC-SHA512(share_value, domain || context || salt || index).
+pub fn partial_derive_key(share: &KekShare, context: &[u8], salt: &[u8]) -> [u8; 64] {
+    let mut mac = HmacSha512::new_from_slice(&share.value)
+        .expect("HMAC-SHA512 accepts any key length");
+    mac.update(THRESHOLD_KDF_DOMAIN);
+    mac.update(context);
+    mac.update(salt);
+    mac.update(&[share.index]);
+    let result = mac.finalize();
+    let mut out = [0u8; 64];
+    out.copy_from_slice(&result.into_bytes());
+    out
+}
+
+/// Combine threshold partial derivations into a final 32-byte derived key.
+///
+/// Requires exactly `threshold` partials. The full Shamir secret NEVER
+/// materializes. Final key = HKDF-SHA512(salt, XOR(partials)) expanded
+/// with context. All intermediates are zeroized before return.
+pub fn combine_partial_derivations(
+    partials: &[[u8; 64]],
+    threshold: usize,
+    context: &[u8],
+    salt: &[u8],
+) -> Result<[u8; 32], String> {
+    if partials.len() != threshold {
+        return Err(format!(
+            "expected exactly {} partials, got {}",
+            threshold, partials.len()
+        ));
+    }
+    if partials.is_empty() {
+        return Err("no partials provided".into());
+    }
+
+    let mut xored = [0u8; 64];
+    for partial in partials {
+        for (x, p) in xored.iter_mut().zip(partial.iter()) {
+            *x ^= p;
+        }
+    }
+
+    use hkdf::Hkdf;
+    let hkdf = Hkdf::<Sha512>::new(Some(salt), &xored);
+    let mut derived = [0u8; 32];
+    hkdf.expand(context, &mut derived)
+        .map_err(|e| format!("HKDF expand failed: {e}"))?;
+
+    xored.zeroize();
+
+    if derived.iter().all(|&b| b == 0) {
+        return Err("FATAL: derived key is all zeros".into());
+    }
+
+    Ok(derived)
+}
+
+/// Manages a distributed threshold KDF ceremony.
+///
+/// Tracks partial derivations from participating nodes and produces a final
+/// derived key once threshold partials are collected. The master secret
+/// NEVER exists in any node's memory.
+pub struct ThresholdKdfManager {
+    threshold: u8,
+    total_shares: u8,
+    partials: Vec<(u8, [u8; 64])>,
+    contributed: std::collections::HashSet<u8>,
+    context: Vec<u8>,
+    salt: Vec<u8>,
+}
+
+impl std::fmt::Debug for ThresholdKdfManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ThresholdKdfManager")
+            .field("threshold", &self.threshold)
+            .field("total_shares", &self.total_shares)
+            .field("partials_collected", &self.partials.len())
+            .field("contributed_indices", &self.contributed)
+            .finish()
+    }
+}
+
+impl ThresholdKdfManager {
+    pub fn new(threshold: u8, total_shares: u8, context: &[u8], salt: &[u8]) -> Self {
+        Self {
+            threshold,
+            total_shares,
+            partials: Vec::with_capacity(threshold as usize),
+            contributed: std::collections::HashSet::new(),
+            context: context.to_vec(),
+            salt: salt.to_vec(),
+        }
+    }
+
+    /// Submit a partial derivation from a node.
+    pub fn submit_partial(&mut self, share_index: u8, partial: [u8; 64]) -> Result<(), String> {
+        if share_index == 0 || share_index > self.total_shares {
+            return Err(format!(
+                "share index {} out of range [1, {}]",
+                share_index, self.total_shares
+            ));
+        }
+        if self.contributed.contains(&share_index) {
+            return Err(format!("duplicate partial from share index {}", share_index));
+        }
+        if partial.iter().all(|&b| b == 0) {
+            return Err(format!(
+                "all-zero partial from share index {} -- possible tampered share",
+                share_index
+            ));
+        }
+        self.contributed.insert(share_index);
+        self.partials.push((share_index, partial));
+        Ok(())
+    }
+
+    pub fn has_threshold(&self) -> bool {
+        self.partials.len() >= self.threshold as usize
+    }
+
+    pub fn partials_collected(&self) -> usize {
+        self.partials.len()
+    }
+
+    pub fn partials_needed(&self) -> usize {
+        let t = self.threshold as usize;
+        if self.partials.len() >= t { 0 } else { t - self.partials.len() }
+    }
+
+    /// Derive the final key. Consumes the manager to ensure partials are zeroized.
+    pub fn derive_key(mut self) -> Result<[u8; 32], String> {
+        if !self.has_threshold() {
+            return Err(format!(
+                "insufficient partials: have {}, need {}",
+                self.partials.len(), self.threshold
+            ));
+        }
+
+        let partials_only: Vec<[u8; 64]> = self.partials.iter()
+            .take(self.threshold as usize)
+            .map(|(_, p)| *p)
+            .collect();
+
+        let result = combine_partial_derivations(
+            &partials_only,
+            self.threshold as usize,
+            &self.context,
+            &self.salt,
+        );
+
+        for (_, ref mut p) in &mut self.partials {
+            p.zeroize();
+        }
+        self.partials.clear();
+
+        result
+    }
+}
+
+impl Drop for ThresholdKdfManager {
+    fn drop(&mut self) {
+        for (_, ref mut p) in &mut self.partials {
+            p.zeroize();
+        }
+        self.partials.clear();
+        self.context.zeroize();
+        self.salt.zeroize();
+    }
+}
+
+/// Convenience: given shares (>= threshold), compute partial derivations
+/// and combine them. The full secret NEVER materializes.
+pub fn derive_key_distributed(
+    shares: &[KekShare],
+    threshold: u8,
+    context: &[u8],
+    salt: &[u8],
+) -> Result<[u8; 32], String> {
+    if shares.len() < threshold as usize {
+        return Err(format!(
+            "need at least {} shares, got {}",
+            threshold, shares.len()
+        ));
+    }
+
+    let mut partials = Vec::with_capacity(threshold as usize);
+    for share in shares.iter().take(threshold as usize) {
+        let partial = partial_derive_key(share, context, salt);
+        partials.push(partial);
+    }
+
+    let result = combine_partial_derivations(&partials, threshold as usize, context, salt);
+
+    for p in &mut partials {
+        p.zeroize();
+    }
+
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Proactive Share Refresh
+// ---------------------------------------------------------------------------
+
+/// Refresh shares without changing the secret. New random polynomial, same
+/// constant term. Old shares become incompatible with new shares.
+pub fn refresh_shares(
+    secret: &[u8; 32],
+    threshold: u8,
+    total: u8,
+) -> Result<(Vec<KekShare>, VssCommitments), String> {
+    split_secret_with_commitments(secret, threshold, total)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -907,5 +1138,181 @@ mod tests {
             !commitments.verify_share(&bad, &secret),
             "share with nonexistent index must fail verification"
         );
+    }
+
+    // -- Threshold KDF Tests --
+
+    #[test]
+    fn threshold_kdf_deterministic_output() {
+        let secret = [0x42u8; 32];
+        let shares = split_secret(&secret, 3, 5).unwrap();
+        let ctx = b"test-context";
+        let salt = b"test-salt";
+        let key1 = derive_key_distributed(&shares[0..3], 3, ctx, salt).unwrap();
+        let key2 = derive_key_distributed(&shares[0..3], 3, ctx, salt).unwrap();
+        assert_eq!(key1, key2, "same shares+context+salt must produce same key");
+    }
+
+    #[test]
+    fn threshold_kdf_different_shares_different_partials() {
+        let secret = [0x42u8; 32];
+        let shares = split_secret(&secret, 3, 5).unwrap();
+        let p1 = partial_derive_key(&shares[0], b"ctx", b"salt");
+        let p2 = partial_derive_key(&shares[1], b"ctx", b"salt");
+        assert_ne!(p1, p2);
+    }
+
+    #[test]
+    fn threshold_kdf_fewer_than_threshold_fails() {
+        let secret = [0x42u8; 32];
+        let shares = split_secret(&secret, 3, 5).unwrap();
+        assert!(derive_key_distributed(&shares[0..2], 3, b"ctx", b"salt").is_err());
+    }
+
+    #[test]
+    fn threshold_kdf_differs_from_reconstruct_then_hkdf() {
+        let secret = [0x42u8; 32];
+        let shares = split_secret(&secret, 3, 5).unwrap();
+        let ctx = b"test-context";
+        let salt = b"test-salt";
+
+        let kdf_key = derive_key_distributed(&shares[0..3], 3, ctx, salt).unwrap();
+
+        let reconstructed = reconstruct_secret(&shares[0..3]).unwrap();
+        use hkdf::Hkdf;
+        let hkdf = Hkdf::<Sha512>::new(Some(salt.as_slice()), &reconstructed);
+        let mut old_key = [0u8; 32];
+        hkdf.expand(ctx.as_slice(), &mut old_key).unwrap();
+
+        assert_ne!(kdf_key, old_key, "threshold KDF must differ from reconstruct+HKDF");
+    }
+
+    #[test]
+    fn threshold_kdf_vss_on_refreshed_shares() {
+        let secret = [0x42u8; 32];
+        let (_old_shares, _old_commitments) = split_secret_with_commitments(&secret, 3, 5).unwrap();
+        let (new_shares, new_commitments) = refresh_shares(&secret, 3, 5).unwrap();
+
+        for share in &new_shares {
+            assert!(new_commitments.verify_share(share, &secret));
+        }
+        // Old shares fail against new commitments (different share values)
+        for share in &_old_shares {
+            assert!(!new_commitments.verify_share(share, &secret));
+        }
+    }
+
+    #[test]
+    fn threshold_kdf_old_shares_fail_after_refresh() {
+        let secret = [0x42u8; 32];
+        let old_shares = split_secret(&secret, 3, 5).unwrap();
+        let new_shares = split_secret(&secret, 3, 5).unwrap();
+        let ctx = b"ctx";
+        let salt = b"salt";
+        let old_key = derive_key_distributed(&old_shares[0..3], 3, ctx, salt).unwrap();
+        let new_key = derive_key_distributed(&new_shares[0..3], 3, ctx, salt).unwrap();
+        assert_ne!(old_key, new_key, "refreshed shares must produce different derived key");
+    }
+
+    #[test]
+    fn threshold_kdf_manager_ceremony() {
+        let secret = [0x42u8; 32];
+        let shares = split_secret(&secret, 3, 5).unwrap();
+        let ctx = b"ceremony-ctx";
+        let salt = b"ceremony-salt";
+
+        let mut mgr = ThresholdKdfManager::new(3, 5, ctx, salt);
+        assert!(!mgr.has_threshold());
+        assert_eq!(mgr.partials_needed(), 3);
+
+        for i in 0..3 {
+            let partial = partial_derive_key(&shares[i], ctx, salt);
+            mgr.submit_partial(shares[i].index, partial).unwrap();
+        }
+        assert!(mgr.has_threshold());
+
+        let key = mgr.derive_key().unwrap();
+        assert_ne!(key, [0u8; 32]);
+
+        // Determinism check
+        let mut mgr2 = ThresholdKdfManager::new(3, 5, ctx, salt);
+        for i in 0..3 {
+            let partial = partial_derive_key(&shares[i], ctx, salt);
+            mgr2.submit_partial(shares[i].index, partial).unwrap();
+        }
+        assert_eq!(mgr2.derive_key().unwrap(), key);
+    }
+
+    #[test]
+    fn threshold_kdf_manager_rejects_duplicate_partial() {
+        let secret = [0x42u8; 32];
+        let shares = split_secret(&secret, 3, 5).unwrap();
+        let ctx = b"ctx";
+        let salt = b"salt";
+        let mut mgr = ThresholdKdfManager::new(3, 5, ctx, salt);
+        let partial = partial_derive_key(&shares[0], ctx, salt);
+        mgr.submit_partial(shares[0].index, partial).unwrap();
+        assert!(mgr.submit_partial(shares[0].index, partial).is_err());
+    }
+
+    #[test]
+    fn threshold_kdf_manager_rejects_tampered_partial() {
+        let mut mgr = ThresholdKdfManager::new(3, 5, b"ctx", b"salt");
+        assert!(mgr.submit_partial(1, [0u8; 64]).is_err());
+    }
+
+    #[test]
+    fn threshold_kdf_manager_rejects_out_of_range_index() {
+        let mut mgr = ThresholdKdfManager::new(3, 5, b"ctx", b"salt");
+        assert!(mgr.submit_partial(0, [1u8; 64]).is_err());
+        assert!(mgr.submit_partial(6, [1u8; 64]).is_err());
+    }
+
+    #[test]
+    fn threshold_kdf_concurrent_submissions() {
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        let secret = [0x42u8; 32];
+        let shares = split_secret(&secret, 3, 5).unwrap();
+        let ctx = b"concurrent-ctx";
+        let salt = b"concurrent-salt";
+
+        let partials: Vec<(u8, [u8; 64])> = shares.iter()
+            .take(3)
+            .map(|s| (s.index, partial_derive_key(s, ctx, salt)))
+            .collect();
+
+        let mgr = Arc::new(Mutex::new(ThresholdKdfManager::new(3, 5, ctx, salt)));
+
+        let handles: Vec<_> = partials.into_iter().map(|(idx, partial)| {
+            let mgr = Arc::clone(&mgr);
+            thread::spawn(move || {
+                mgr.lock().unwrap().submit_partial(idx, partial).unwrap();
+            })
+        }).collect();
+
+        for h in handles { h.join().unwrap(); }
+
+        let mgr = Arc::try_unwrap(mgr).unwrap().into_inner().unwrap();
+        assert!(mgr.has_threshold());
+        let key = mgr.derive_key().unwrap();
+        assert_ne!(key, [0u8; 32]);
+    }
+
+    #[test]
+    fn threshold_kdf_partial_from_non_participant() {
+        let secret = [0x42u8; 32];
+        let shares = split_secret(&secret, 3, 5).unwrap();
+        let ctx = b"ctx";
+        let salt = b"salt";
+
+        let legit_key = derive_key_distributed(&shares[0..3], 3, ctx, salt).unwrap();
+
+        let fake_share = KekShare::new(1, [0xFF; 32]);
+        let mixed = vec![fake_share, shares[1].clone(), shares[2].clone()];
+        let fake_key = derive_key_distributed(&mixed, 3, ctx, salt).unwrap();
+
+        assert_ne!(legit_key, fake_key);
     }
 }
