@@ -497,7 +497,8 @@ fn audit_archival_to_valid_dir_succeeds() {
         );
 
         let _ = std::fs::remove_dir_all(&archive_dir);
-        std::env::remove_var("MILNET_TESTING_SINGLE_KEK_ACK");
+        // Do NOT remove MILNET_TESTING_SINGLE_KEK_ACK here — parallel tests
+        // in this binary depend on it being set for the entire test run.
     });
 }
 
