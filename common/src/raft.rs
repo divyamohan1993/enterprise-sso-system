@@ -2735,7 +2735,8 @@ mod tests {
         let sk = SigningKey::<MlDsa87>::from_seed(&(*seed).into());
         let vk = sk.verifying_key();
         let enc: EncodedVerifyingKey<MlDsa87> = vk.encode();
-        enc.as_ref().to_vec()
+        let bytes: &[u8] = enc.as_ref();
+        bytes.to_vec()
     }
 
     /// Helper: create a single-node leader with N committed entries.
