@@ -1619,11 +1619,13 @@ mod tests {
             user_agent: None,
         };
 
+        // Clear any content from parallel test contamination
+        std::fs::write(&emergency_path, "").unwrap_or_default();
         emergency_audit_write(&make_entry(), "first error").unwrap();
         emergency_audit_write(&make_entry(), "second error").unwrap();
 
         let contents = std::fs::read_to_string(&emergency_path).unwrap();
-        let lines: Vec<&str> = contents.lines().collect();
+        let lines: Vec<&str> = contents.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(lines.len(), 2, "should have two lines (append-only)");
 
         std::env::remove_var("MILNET_EMERGENCY_AUDIT_PATH");
@@ -1632,7 +1634,7 @@ mod tests {
 
     #[test]
     fn emergency_audit_write_fails_on_invalid_path() {
-        std::env::set_var("MILNET_EMERGENCY_AUDIT_PATH", "/dev/null/impossible/path.jsonl");
+        std::env::set_var("MILNET_EMERGENCY_AUDIT_PATH", "/proc/1/root/nonexistent/path.jsonl");
 
         let signing_key = test_signing_key();
         let entry = AuditEntry {

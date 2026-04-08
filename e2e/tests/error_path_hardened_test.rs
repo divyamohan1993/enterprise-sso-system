@@ -469,8 +469,8 @@ fn fencing_counter_corrupted_state_recovery() {
 
 #[test]
 fn audit_archival_to_valid_dir_succeeds() {
+    std::env::set_var("MILNET_TESTING_SINGLE_KEK_ACK", "1");
     run_with_large_stack(|| {
-        std::env::set_var("MILNET_TESTING_SINGLE_KEK_ACK", "1");
         let (signing_key, _vk) = crypto::pq_sign::generate_pq_keypair();
         let archive_dir = temp_dir("audit-archive");
 
