@@ -882,8 +882,8 @@ mod tests {
         assert!(err.is_err());
         assert!(err.unwrap_err().contains("locked out"));
 
-        // After lockout expires
-        assert!(rl.check_allowed("user1", now + 901).is_ok());
+        // After lockout expires (lockout_until = last_failure_time + lockout_secs = now+4+900 = now+904)
+        assert!(rl.check_allowed("user1", now + 905).is_ok());
     }
 
     #[test]
@@ -912,8 +912,8 @@ mod tests {
         let err = rl.check_allowed("user2", now + 1000);
         assert!(err.is_err());
 
-        // Unlocked after 3600s
-        assert!(rl.check_allowed("user2", now + 3601).is_ok());
+        // Unlocked after 3600s (lockout_until = last_failure_time + lockout_secs = now+9+3600 = now+3609)
+        assert!(rl.check_allowed("user2", now + 3610).is_ok());
     }
 
     #[test]

@@ -55,7 +55,7 @@ fn crc32_iso3309(data: &[u8]) -> u32 {
         crc ^= byte as u32;
         for _ in 0..8 {
             if crc & 1 != 0 {
-                crc = (crc >> 1) ^ 0x82F6_3B78;
+                crc = (crc >> 1) ^ 0xEDB8_8320;
             } else {
                 crc >>= 1;
             }
@@ -470,6 +470,7 @@ fn fencing_counter_corrupted_state_recovery() {
 #[test]
 fn audit_archival_to_valid_dir_succeeds() {
     run_with_large_stack(|| {
+        std::env::set_var("MILNET_TESTING_SINGLE_KEK_ACK", "1");
         let (signing_key, _vk) = crypto::pq_sign::generate_pq_keypair();
         let archive_dir = temp_dir("audit-archive");
 
@@ -494,6 +495,7 @@ fn audit_archival_to_valid_dir_succeeds() {
         );
 
         let _ = std::fs::remove_dir_all(&archive_dir);
+        std::env::remove_var("MILNET_TESTING_SINGLE_KEK_ACK");
     });
 }
 

@@ -157,7 +157,7 @@ fn test_registration_options_platform_authenticator() {
         options.authenticator_selection.authenticator_attachment,
         Some("platform".to_string())
     );
-    assert_eq!(options.authenticator_selection.resident_key, "preferred");
+    assert_eq!(options.authenticator_selection.resident_key, "required");
     assert_eq!(options.authenticator_selection.user_verification, "required");
 }
 

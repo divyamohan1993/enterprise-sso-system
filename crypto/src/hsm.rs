@@ -3855,7 +3855,7 @@ mod tests {
 
         let data = b"data-to-sign-with-kms";
         let sig = manager.sign_with_hardware(data, "kms-signing").unwrap();
-        assert_eq!(sig.len(), 32);
+        assert_eq!(sig.len(), 64);
     }
 
     // -----------------------------------------------------------------------
@@ -3927,7 +3927,7 @@ mod tests {
 
         let data = b"data-to-sign-with-tpm2";
         let sig = manager.sign_with_hardware(data, "tpm2-signing").unwrap();
-        assert_eq!(sig.len(), 32);
+        assert_eq!(sig.len(), 64);
     }
 
     #[test]

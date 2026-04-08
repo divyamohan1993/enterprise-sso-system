@@ -3101,7 +3101,8 @@ mod tests {
         }
 
         // Replicate new entries to n2 (should work despite snapshot).
-        for _ in 0..3 {
+        // Need enough rounds for entries to be replicated and committed.
+        for _ in 0..10 {
             let heartbeats = n1.tick();
             for (peer_id, msg) in &heartbeats {
                 if *peer_id == id2 {

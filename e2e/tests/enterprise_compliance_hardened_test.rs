@@ -271,7 +271,7 @@ mod saml_tests {
     #[test]
     fn xml_signature_enveloped_inserts_after_issuer() {
         let xml = r#"<samlp:Response><saml:Issuer>https://idp.example.com</saml:Issuer><content/></samlp:Response>"#;
-        let signed = sign_xml_enveloped(xml, SignatureAlgorithm::RsaSha256, b"test-key").unwrap();
+        let signed = sign_xml_enveloped(xml, SignatureAlgorithm::RsaSha256, &[0x42u8; 32]).unwrap();
 
         assert!(
             signed.contains("<ds:Signature"),

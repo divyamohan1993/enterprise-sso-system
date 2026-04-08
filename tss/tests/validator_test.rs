@@ -7,6 +7,7 @@
 
 use common::types::Receipt;
 use crypto::receipts::{hash_receipt, sign_receipt};
+use serial_test::serial;
 use tss::validator::{validate_receipt_chain, validate_receipt_chain_with_key, ReceiptVerificationKey};
 use uuid::Uuid;
 
@@ -155,6 +156,7 @@ fn hmac_key_variant_wrong_key_rejected() {
 }
 
 #[test]
+#[serial]
 fn both_key_variant_hmac_fallback() {
     // Receipts signed with HMAC only. When Both is provided with a bogus
     // ML-DSA-87 key, HMAC fallback should still validate (unless PQ-only).
@@ -170,6 +172,7 @@ fn both_key_variant_hmac_fallback() {
 }
 
 #[test]
+#[serial]
 fn both_key_pq_only_blocks_hmac_fallback() {
     // When MILNET_RECEIPT_PQ_ONLY is set, HMAC fallback is blocked.
     let chain = build_chain(1, &SIGNING_KEY_A);

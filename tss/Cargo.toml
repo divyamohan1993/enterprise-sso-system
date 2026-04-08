@@ -33,3 +33,4 @@ production = ["common/production"]
 tokio-rustls.workspace = true
 rustls.workspace = true
 hex.workspace = true
+serial_test.workspace = true
