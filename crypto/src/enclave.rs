@@ -634,15 +634,23 @@ pub fn require_enclave_or_warn(operation: &str) -> Result<EnclaveBackend, String
             .unwrap_or(false);
 
         if is_production || is_military {
-            tracing::error!(
-                operation = operation,
-                "FATAL: signing operation without hardware enclave in production/military mode. \
-                 Deploy on SGX/SEV-SNP/TrustZone-capable hardware. Operation denied (fail-closed)."
-            );
-            return Err(format!(
-                "hardware enclave required for operation '{}' in production mode",
-                operation
-            ));
+            // MLP mode: allow software fallback with SIEM warning
+            if common::config::is_mlp_mode() {
+                common::config::emit_mlp_siem_event(
+                    "enclave",
+                    &format!("software_fallback_allowed_for_{}", operation),
+                );
+            } else {
+                tracing::error!(
+                    operation = operation,
+                    "FATAL: signing operation without hardware enclave in production/military mode. \
+                     Deploy on SGX/SEV-SNP/TrustZone-capable hardware. Operation denied (fail-closed)."
+                );
+                return Err(format!(
+                    "hardware enclave required for operation '{}' in production mode",
+                    operation
+                ));
+            }
         }
 
         tracing::warn!(
@@ -659,6 +667,29 @@ pub fn require_enclave_or_warn(operation: &str) -> Result<EnclaveBackend, String
     }
 
     Ok(backend)
+}
+
+/// Validate the deployment mode for enclave operations.
+/// Returns a [`common::config::DeploymentValidation`] describing the state.
+pub fn validate_deployment_mode() -> common::config::DeploymentValidation {
+    let backend = detect_enclave_backend();
+    let hw = backend.is_hardware();
+    let mlp = !hw && common::config::is_mlp_mode();
+    if mlp {
+        common::config::emit_mlp_siem_event("enclave", "validate_deployment_mode");
+    }
+    common::config::DeploymentValidation {
+        component: "enclave".into(),
+        hardware_backed: hw,
+        mlp_relaxed: mlp,
+        summary: if hw {
+            format!("Enclave backend {:?} is hardware-backed", backend)
+        } else if mlp {
+            "Software enclave fallback (MLP mode -- not for production)".into()
+        } else {
+            "Software enclave fallback (production requires hardware enclave)".into()
+        },
+    }
 }
 
 /// Verify that a signing operation is attested before producing a signature.

@@ -330,15 +330,52 @@ impl HsmConfig {
     }
     /// Validate that the HSM configuration is suitable for production deployment.
     /// Software backend is PROHIBITED in production -- keys must be HSM-backed.
+    ///
+    /// In MLP mode, software backends are allowed with a SIEM warning.
     pub fn validate_for_production(&self) {
         if std::env::var("MILNET_PRODUCTION").is_ok() || std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok() {
             if matches!(self.backend, HsmBackend::Software) {
+                if common::config::is_mlp_mode() {
+                    common::config::emit_mlp_siem_event(
+                        "hsm",
+                        "software_backend_allowed_in_mlp_mode",
+                    );
+                    return;
+                }
                 panic!(
                     "FATAL: HSM backend is set to Software in production/military deployment. \
                      Configure MILNET_HSM_BACKEND to pkcs11, aws-kms, or tpm2. \
                      Software keys are prohibited in production environments."
                 );
             }
+        }
+    }
+
+    /// Validate the deployment mode for this HSM configuration.
+    /// Returns a [`common::config::DeploymentValidation`] describing the state.
+    pub fn validate_deployment_mode(&self) -> common::config::DeploymentValidation {
+        let hw = self.backend.is_hardware_backed();
+        let mlp = !hw && common::config::is_mlp_mode();
+        if mlp {
+            common::config::emit_mlp_siem_event("hsm", "validate_deployment_mode");
+        }
+        common::config::DeploymentValidation {
+            component: "hsm".into(),
+            hardware_backed: hw,
+            mlp_relaxed: mlp,
+            summary: if hw {
+                format!("HSM backend '{}' is hardware-backed", self.backend)
+            } else if mlp {
+                format!(
+                    "HSM backend '{}' is software-only (MLP mode -- not for production)",
+                    self.backend
+                )
+            } else {
+                format!(
+                    "HSM backend '{}' is software-only (production requires hardware)",
+                    self.backend
+                )
+            },
         }
     }
 
@@ -1450,16 +1487,24 @@ impl HsmKeyManager {
         config.validate()?;
 
         // Fail-closed: reject software backend in production deployments.
+        // In MLP mode, software backend is allowed with SIEM warning.
         // In non-production environments (no MILNET_PRODUCTION=1), the software
         // backend is allowed with full validation checks (seed required, etc.).
         if config.backend == HsmBackend::Software
             && std::env::var("MILNET_PRODUCTION").as_deref() == Ok("1")
         {
-            panic!(
-                "FATAL: Software HSM backend is forbidden in production mode \
-                 (MILNET_PRODUCTION=1). This is a security violation. \
-                 Configure MILNET_HSM_BACKEND=pkcs11|aws-kms|tpm2"
-            );
+            if common::config::is_mlp_mode() {
+                common::config::emit_mlp_siem_event(
+                    "hsm",
+                    "software_backend_allowed_in_production_mlp",
+                );
+            } else {
+                panic!(
+                    "FATAL: Software HSM backend is forbidden in production mode \
+                     (MILNET_PRODUCTION=1). This is a security violation. \
+                     Configure MILNET_HSM_BACKEND=pkcs11|aws-kms|tpm2"
+                );
+            }
         }
 
         let state = match &config.backend {

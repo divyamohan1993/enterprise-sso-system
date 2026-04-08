@@ -322,6 +322,63 @@ pub fn generate_dev_mode_proof(key: &[u8; 32], action: &str) -> String {
 /// Backwards-compatible alias. Use [`ErrorLevelConfig`] in new code.
 pub type DeveloperModeConfig = ErrorLevelConfig;
 
+// ── MLP (Minimum Lovable Product) Mode ──
+//
+// MLP mode relaxes hardware security requirements so the system can run in
+// software-simulated mode for development, demos, and CI. Activating MLP
+// requires TWO env vars to prevent accidental production use:
+//   MILNET_MLP_MODE=1
+//   MILNET_MLP_ACK="I-ACKNOWLEDGE-SOFTWARE-SIMULATION-NOT-FOR-PRODUCTION"
+//
+// Every MLP relaxation emits a SIEM warning so audit trails are never silent.
+
+/// Returns `true` when MLP mode is active (both env vars present and correct).
+pub fn is_mlp_mode() -> bool {
+    std::env::var("MILNET_MLP_MODE").as_deref() == Ok("1")
+        && std::env::var("MILNET_MLP_ACK").as_deref()
+            == Ok("I-ACKNOWLEDGE-SOFTWARE-SIMULATION-NOT-FOR-PRODUCTION")
+}
+
+/// Returns `true` when real hardware security backends are required.
+/// This is the inverse of MLP mode: if MLP is off, hardware is required
+/// in production/military environments.
+pub fn require_hardware_security() -> bool {
+    !is_mlp_mode()
+        && (std::env::var("MILNET_PRODUCTION").as_deref() == Ok("1")
+            || std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1"))
+}
+
+/// Emit a SIEM warning event for an MLP-mode relaxation.
+///
+/// Every time a hardware requirement is bypassed under MLP mode, this
+/// function logs a structured SIEM event so the audit trail captures it.
+pub fn emit_mlp_siem_event(component: &str, action: &str) {
+    tracing::warn!(
+        target: "siem",
+        category = "MLP_SIMULATION",
+        component = component,
+        action = action,
+        "SIEM:WARNING [MLP_SIMULATION] component={} action={} -- \
+         hardware security requirement bypassed in MLP mode. \
+         NOT FOR PRODUCTION USE.",
+        component,
+        action,
+    );
+}
+
+/// Result of validating a component's deployment mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentValidation {
+    /// The component that was validated (e.g. "hsm", "enclave", "tpm").
+    pub component: String,
+    /// Whether the component is running with real hardware.
+    pub hardware_backed: bool,
+    /// Whether MLP mode relaxed a requirement.
+    pub mlp_relaxed: bool,
+    /// Human-readable summary.
+    pub summary: String,
+}
+
 /// System-wide security configuration per spec.
 pub struct SecurityConfig {
     /// Error verbosity level — `Verbose` shows file:line and full errors,
@@ -966,6 +1023,79 @@ mod tests {
         );
 
         std::env::remove_var("MILNET_MASTER_KEK");
+    }
+
+    #[test]
+    fn mlp_mode_requires_both_env_vars() {
+        // Neither set -> false
+        std::env::remove_var("MILNET_MLP_MODE");
+        std::env::remove_var("MILNET_MLP_ACK");
+        assert!(!is_mlp_mode());
+
+        // Only mode -> false
+        std::env::set_var("MILNET_MLP_MODE", "1");
+        assert!(!is_mlp_mode());
+
+        // Only ack -> false
+        std::env::remove_var("MILNET_MLP_MODE");
+        std::env::set_var(
+            "MILNET_MLP_ACK",
+            "I-ACKNOWLEDGE-SOFTWARE-SIMULATION-NOT-FOR-PRODUCTION",
+        );
+        assert!(!is_mlp_mode());
+
+        // Both set -> true
+        std::env::set_var("MILNET_MLP_MODE", "1");
+        assert!(is_mlp_mode());
+
+        // Wrong ack -> false
+        std::env::set_var("MILNET_MLP_ACK", "wrong");
+        assert!(!is_mlp_mode());
+
+        // Cleanup
+        std::env::remove_var("MILNET_MLP_MODE");
+        std::env::remove_var("MILNET_MLP_ACK");
+    }
+
+    #[test]
+    fn require_hardware_security_respects_mlp() {
+        std::env::remove_var("MILNET_MLP_MODE");
+        std::env::remove_var("MILNET_MLP_ACK");
+        std::env::remove_var("MILNET_PRODUCTION");
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+
+        // No production env -> false regardless
+        assert!(!require_hardware_security());
+
+        // Production set, no MLP -> true
+        std::env::set_var("MILNET_PRODUCTION", "1");
+        assert!(require_hardware_security());
+
+        // Production set, MLP active -> false (relaxed)
+        std::env::set_var("MILNET_MLP_MODE", "1");
+        std::env::set_var(
+            "MILNET_MLP_ACK",
+            "I-ACKNOWLEDGE-SOFTWARE-SIMULATION-NOT-FOR-PRODUCTION",
+        );
+        assert!(!require_hardware_security());
+
+        // Cleanup
+        std::env::remove_var("MILNET_MLP_MODE");
+        std::env::remove_var("MILNET_MLP_ACK");
+        std::env::remove_var("MILNET_PRODUCTION");
+    }
+
+    #[test]
+    fn deployment_validation_struct_fields() {
+        let v = DeploymentValidation {
+            component: "test".into(),
+            hardware_backed: false,
+            mlp_relaxed: true,
+            summary: "test summary".into(),
+        };
+        assert_eq!(v.component, "test");
+        assert!(!v.hardware_backed);
+        assert!(v.mlp_relaxed);
     }
 
     #[test]

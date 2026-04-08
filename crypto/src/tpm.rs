@@ -672,6 +672,43 @@ impl Tpm2Context {
 }
 
 // ---------------------------------------------------------------------------
+// MLP / Deployment validation
+// ---------------------------------------------------------------------------
+
+/// Check whether a real TPM device is available on this host.
+///
+/// Looks for `/dev/tpmrm0` (resource manager, preferred) and `/dev/tpm0`
+/// (direct access). Returns `true` if at least one exists.
+pub fn verify_real_tpm() -> bool {
+    std::path::Path::new("/dev/tpmrm0").exists() || std::path::Path::new("/dev/tpm0").exists()
+}
+
+/// Validate the deployment mode for TPM operations.
+///
+/// - If a real TPM device is present, reports hardware-backed.
+/// - If no real TPM and MLP mode is active, allows simulated with SIEM warning.
+/// - If no real TPM and MLP mode is off, reports that production requires real TPM.
+pub fn validate_deployment_mode() -> common::config::DeploymentValidation {
+    let hw = verify_real_tpm();
+    let mlp = !hw && common::config::is_mlp_mode();
+    if mlp {
+        common::config::emit_mlp_siem_event("tpm", "simulated_tpm_allowed_in_mlp_mode");
+    }
+    common::config::DeploymentValidation {
+        component: "tpm".into(),
+        hardware_backed: hw,
+        mlp_relaxed: mlp,
+        summary: if hw {
+            "Real TPM device detected".into()
+        } else if mlp {
+            "Simulated TPM (MLP mode -- not for production)".into()
+        } else {
+            "No TPM device found (production requires /dev/tpmrm0 or /dev/tpm0)".into()
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Convenience functions (stateless)
 // ---------------------------------------------------------------------------
 
@@ -709,6 +746,24 @@ pub fn unseal_from_pcrs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_deployment_mode_without_mlp() {
+        // No MLP env vars set -> not mlp_relaxed
+        std::env::remove_var("MILNET_MLP_MODE");
+        std::env::remove_var("MILNET_MLP_ACK");
+        let v = super::validate_deployment_mode();
+        assert_eq!(v.component, "tpm");
+        // hardware_backed depends on whether CI has a real TPM (unlikely)
+        // but mlp_relaxed should be false when MLP vars are unset
+        assert!(!v.mlp_relaxed);
+    }
+
+    #[test]
+    fn verify_real_tpm_returns_bool() {
+        // Just ensure it doesn't panic
+        let _ = super::verify_real_tpm();
+    }
 
     #[test]
     fn pcr_selection_sha256() {

@@ -29,6 +29,7 @@ ed25519-dalek = { workspace = true }
 cryptoki = { workspace = true, optional = true }
 serde_json = "1"
 rand.workspace = true
+x25519-dalek.workspace = true
 base64 = "0.22"
 rustls.workspace = true
 libc.workspace = true

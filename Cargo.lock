@@ -578,6 +578,7 @@ dependencies = [
  "tracing",
  "uuid",
  "webpki-roots 1.0.6",
+ "x25519-dalek",
  "zeroize",
 ]
 
