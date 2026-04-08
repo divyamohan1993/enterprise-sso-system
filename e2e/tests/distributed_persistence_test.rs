@@ -256,7 +256,7 @@ fn atomic_broadcast_sequence_and_delivery() {
     use common::atomic_broadcast::{AtomicBroadcast, BroadcastMessage};
     use sha2::{Digest, Sha512};
 
-    let ab = AtomicBroadcast::new(1); // quorum=1 for test
+    let ab = AtomicBroadcast::new(1).expect("create broadcast"); // quorum=1 for test
 
     // Broadcast 3 messages
     let seq1 = ab.broadcast(b"message-1", "node-a").expect("broadcast 1");
@@ -277,7 +277,7 @@ fn atomic_broadcast_sequence_and_delivery() {
 fn atomic_broadcast_rejects_duplicate_payloads() {
     use common::atomic_broadcast::AtomicBroadcast;
 
-    let ab = AtomicBroadcast::new(1);
+    let ab = AtomicBroadcast::new(1).expect("create broadcast");
 
     let result1 = ab.broadcast(b"unique-payload", "node-a");
     assert!(result1.is_ok(), "first broadcast must succeed");

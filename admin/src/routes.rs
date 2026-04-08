@@ -2219,7 +2219,13 @@ async fn initial_setup(
 
     // Create the superuser (OPAQUE credential)
     let mut store = state.credential_store.write().await;
-    let user_id = store.register_with_password(&req.username, req.password.as_bytes());
+    let user_id = match store.register_with_password(&req.username, req.password.as_bytes()) {
+        Ok(uid) => uid,
+        Err(e) => {
+            tracing::error!("Superuser registration failed: {e}");
+            return (StatusCode::CONFLICT, format!("registration failed: {e}")).into_response();
+        }
+    };
 
     // Get the OPAQUE registration bytes for persistence
     let reg_bytes = store.get_registration_bytes(&req.username);
@@ -2742,7 +2748,13 @@ async fn register_user(
     }
 
     let mut store = state.credential_store.write().await;
-    let user_id = store.register_with_password(&req.username, req.password.as_bytes());
+    let user_id = match store.register_with_password(&req.username, req.password.as_bytes()) {
+        Ok(uid) => uid,
+        Err(e) => {
+            tracing::error!("User registration failed: {e}");
+            return (StatusCode::CONFLICT, format!("registration failed: {e}")).into_response();
+        }
+    };
 
     // Get the OPAQUE registration bytes for persistence
     let reg_bytes = store.get_registration_bytes(&req.username);
@@ -4777,6 +4789,7 @@ async fn oauth_google_callback(
         &google_config.client_id,
         &state.google_jwks_cache,
         &state.http_client,
+        pending.google_oidc_nonce.as_deref(),
     ).await {
         Ok(c) => c,
         Err(e) => {
@@ -4784,20 +4797,7 @@ async fn oauth_google_callback(
             return (StatusCode::BAD_REQUEST, format!("invalid id_token: {e}")).into_response();
         }
     };
-    // Verify OIDC nonce matches what we sent in the auth request
-    if let Some(ref expected_nonce) = pending.google_oidc_nonce {
-        match &claims.nonce {
-            Some(returned_nonce) if crypto::ct::ct_eq(returned_nonce.as_bytes(), expected_nonce.as_bytes()) => {},
-            Some(_) => {
-                tracing::error!("Google OIDC nonce mismatch -- possible ID token replay attack");
-                return (StatusCode::BAD_REQUEST, "OIDC nonce mismatch -- possible replay attack").into_response();
-            }
-            None => {
-                tracing::error!("Google ID token missing nonce claim");
-                return (StatusCode::BAD_REQUEST, "ID token missing required nonce claim").into_response();
-            }
-        }
-    }
+    // OIDC nonce validation is now performed inside extract_google_claims
 
     // Additional verification (email_verified, etc.)
     if let Err(e) = crate::google_oauth::verify_google_id_token(&claims, &google_config.client_id) {

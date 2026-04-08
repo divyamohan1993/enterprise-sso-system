@@ -1164,7 +1164,7 @@ fn threshold_kek_gf256_constant_time_operations() {
 fn opaque_registration_blob_contains_no_password() {
     let mut store = opaque::store::CredentialStore::new();
     let password = b"super-secret-military-password-123!";
-    let user_id = store.register_with_password("alice", password);
+    let user_id = store.register_with_password("alice", password).unwrap();
     assert_ne!(user_id, Uuid::nil(), "registration must succeed");
 
     // Get the stored registration blob
@@ -1191,7 +1191,7 @@ fn opaque_registration_blob_contains_no_password() {
 #[test]
 fn opaque_wrong_password_fails_authentication() {
     let mut store = opaque::store::CredentialStore::new();
-    store.register_with_password("bob", b"correct-password");
+    store.register_with_password("bob", b"correct-password").unwrap();
 
     let result = store.verify_password("bob", b"wrong-password");
     assert!(
@@ -1203,7 +1203,7 @@ fn opaque_wrong_password_fails_authentication() {
 #[test]
 fn opaque_correct_password_succeeds() {
     let mut store = opaque::store::CredentialStore::new();
-    let user_id = store.register_with_password("carol", b"right-password");
+    let user_id = store.register_with_password("carol", b"right-password").unwrap();
 
     let result = store.verify_password("carol", b"right-password");
     assert!(result.is_ok(), "correct password must succeed");

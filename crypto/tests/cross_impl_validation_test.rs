@@ -331,7 +331,7 @@ fn opaque_register_then_authenticate_roundtrip() {
     let password = b"TopSecretPassword!2024#MILNET";
 
     // Register
-    let user_id = store.register_with_password(username, password);
+    let user_id = store.register_with_password(username, password).unwrap();
     assert!(!user_id.is_nil(), "registration must return a valid UUID");
 
     // Authenticate with correct password
@@ -346,7 +346,7 @@ fn opaque_wrong_password_rejected() {
     let username = "test-operator";
     let password = b"CorrectPassword!";
 
-    store.register_with_password(username, password);
+    store.register_with_password(username, password).unwrap();
 
     // Wrong password must fail
     let result = store.verify_password(username, b"WrongPassword!");
@@ -365,8 +365,8 @@ fn opaque_unknown_user_rejected() {
 fn opaque_multiple_users_independent() {
     let mut store = opaque::store::CredentialStore::new();
 
-    let id1 = store.register_with_password("alice", b"alice-pass");
-    let id2 = store.register_with_password("bob", b"bob-pass");
+    let id1 = store.register_with_password("alice", b"alice-pass").unwrap();
+    let id2 = store.register_with_password("bob", b"bob-pass").unwrap();
 
     assert_ne!(id1, id2, "different users must get different IDs");
 

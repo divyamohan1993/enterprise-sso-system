@@ -1,4 +1,4 @@
-//! Verifiable Random Function (VRF) using Ed25519.
+//! Post-Quantum Verifiable Random Function (VRF) using ML-DSA-87.
 //!
 //! Provides unpredictable but verifiable random output for fair leader election
 //! where no node can predict or bias the outcome.
@@ -8,137 +8,12 @@
 //! - Anyone with public key pk can verify the output
 //! - Output is uniformly distributed and unpredictable without sk
 //!
-//! Construction:
-//! - Proof = Ed25519_Sign(sk, input)
-//! - Output = SHA-512(proof)[0..32]  (hash the signature to get uniform output)
-//! - Verify: check Ed25519_Verify(pk, input, proof) then recompute output
-use ed25519_dalek::{Signer, Verifier};
-use sha2::{Digest, Sha512};
+//! Construction (PQ-safe):
+//! - Proof = ML-DSA-87_Sign(sk, input)
+//! - Output = HKDF-SHA512(proof, "MILNET-PQ-VRF-v1")[0..32]
+//! - Verify: check ML-DSA-87_Verify(pk, input, proof) then recompute output
+use sha2::Sha512;
 use hkdf;
-
-#[deprecated(note = "Use PqVrfKeypair for quantum-safe VRF")]
-/// A VRF keypair wrapping Ed25519 keys.
-pub struct VrfKeypair {
-    signing_key: ed25519_dalek::SigningKey,
-    verifying_key: ed25519_dalek::VerifyingKey,
-}
-
-/// The output of a VRF evaluation: a 32-byte random value plus a proof.
-#[derive(Debug, Clone)]
-pub struct VrfProof {
-    /// The pseudo-random output, uniformly distributed.
-    pub output: [u8; 32],
-    /// The proof that `output` was correctly derived (an Ed25519 signature).
-    pub proof: Vec<u8>,
-}
-
-impl VrfKeypair {
-    /// Generate a new VRF keypair from OS entropy.
-    pub fn generate() -> Self {
-        let mut rng = rand::rngs::OsRng;
-        let signing_key = ed25519_dalek::SigningKey::generate(&mut rng);
-        let verifying_key = signing_key.verifying_key();
-        Self { signing_key, verifying_key }
-    }
-
-    /// Construct from an existing Ed25519 signing key.
-    pub fn from_signing_key(signing_key: ed25519_dalek::SigningKey) -> Self {
-        let verifying_key = signing_key.verifying_key();
-        Self { signing_key, verifying_key }
-    }
-
-    /// Return the public verifying key.
-    pub fn verifying_key(&self) -> &ed25519_dalek::VerifyingKey {
-        &self.verifying_key
-    }
-
-    /// Evaluate the VRF on the given input.
-    ///
-    /// Returns a `VrfProof` containing the pseudo-random output and its proof.
-    pub fn evaluate(&self, input: &[u8]) -> VrfProof {
-        // Sign the input to produce the proof
-        let signature = self.signing_key.sign(input);
-        let proof_bytes = signature.to_bytes().to_vec();
-
-        // Hash the proof to derive the uniform output
-        let output = hash_proof_to_output(&proof_bytes);
-
-        VrfProof {
-            output,
-            proof: proof_bytes,
-        }
-    }
-}
-
-/// Verify a VRF proof and recover the output.
-///
-/// Returns `Some(output)` if the proof is valid for the given input and
-/// verifying key, or `None` if verification fails.
-pub fn verify(
-    verifying_key: &ed25519_dalek::VerifyingKey,
-    input: &[u8],
-    proof: &VrfProof,
-) -> Option<[u8; 32]> {
-    // Reconstruct the Ed25519 signature from the proof bytes
-    if proof.proof.len() != 64 {
-        return None;
-    }
-    let mut sig_bytes = [0u8; 64];
-    sig_bytes.copy_from_slice(&proof.proof);
-    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-
-    // Verify the signature
-    if verifying_key.verify(input, &signature).is_err() {
-        return None;
-    }
-
-    // Recompute the output from the proof
-    let output = hash_proof_to_output(&proof.proof);
-
-    // The recomputed output must match what was claimed
-    if output != proof.output {
-        return None;
-    }
-
-    Some(output)
-}
-
-/// Run a leader election for the given epoch.
-///
-/// Each candidate evaluates VRF(sk, epoch_bytes) and the candidate with the
-/// lowest output wins.  Returns `(winner_index, winner_proof)`.
-///
-/// The `candidates` slice contains `(keypair, node_id)` pairs.
-pub fn leader_election(epoch: u64, candidates: &[(VrfKeypair, String)]) -> Option<(usize, String, VrfProof)> {
-    if candidates.is_empty() {
-        return None;
-    }
-
-    let epoch_bytes = epoch.to_le_bytes();
-
-    let mut best_idx = 0;
-    let mut best_output = [0xFFu8; 32];
-    let mut best_proof = None;
-
-    for (i, (keypair, _node_id)) in candidates.iter().enumerate() {
-        let proof = keypair.evaluate(&epoch_bytes);
-        if proof.output < best_output {
-            best_output = proof.output;
-            best_idx = i;
-            best_proof = Some(proof);
-        }
-    }
-
-    best_proof.map(|proof| (best_idx, candidates[best_idx].1.clone(), proof))
-}
-
-/// Hash proof bytes to a 32-byte uniform output using SHA-512 (truncated).
-fn hash_proof_to_output(proof: &[u8]) -> [u8; 32] {
-    let hash = Sha512::digest(proof);
-    let mut output = [0u8; 32];
-    output.copy_from_slice(&hash[..32]);
-    output
-}
 
 // ---------------------------------------------------------------------------
 // Post-Quantum VRF using ML-DSA-87
@@ -320,41 +195,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_evaluate_verify_roundtrip() {
-        let keypair = VrfKeypair::generate();
+    fn test_pq_vrf_evaluate_verify_roundtrip() {
+        let keypair = PqVrfKeypair::generate();
         let input = b"epoch-42";
 
         let proof = keypair.evaluate(input);
-        let result = verify(keypair.verifying_key(), input, &proof);
+        let result = pq_vrf_verify_proof(keypair.verifying_key(), input, &proof);
         assert!(result.is_some());
         assert_eq!(result.unwrap(), proof.output);
     }
 
     #[test]
-    fn test_wrong_key_rejects() {
-        let keypair1 = VrfKeypair::generate();
-        let keypair2 = VrfKeypair::generate();
+    fn test_pq_vrf_wrong_key_rejects() {
+        let keypair1 = PqVrfKeypair::generate();
+        let keypair2 = PqVrfKeypair::generate();
         let input = b"epoch-42";
 
         let proof = keypair1.evaluate(input);
-        // Verify with wrong key should fail
-        let result = verify(keypair2.verifying_key(), input, &proof);
+        let result = pq_vrf_verify_proof(keypair2.verifying_key(), input, &proof);
         assert!(result.is_none());
     }
 
     #[test]
-    fn test_wrong_input_rejects() {
-        let keypair = VrfKeypair::generate();
+    fn test_pq_vrf_wrong_input_rejects() {
+        let keypair = PqVrfKeypair::generate();
 
         let proof = keypair.evaluate(b"epoch-42");
-        // Verify with wrong input should fail
-        let result = verify(keypair.verifying_key(), b"epoch-99", &proof);
+        let result = pq_vrf_verify_proof(keypair.verifying_key(), b"epoch-99", &proof);
         assert!(result.is_none());
     }
 
     #[test]
-    fn test_different_inputs_different_outputs() {
-        let keypair = VrfKeypair::generate();
+    fn test_pq_vrf_different_inputs_different_outputs() {
+        let keypair = PqVrfKeypair::generate();
 
         let proof1 = keypair.evaluate(b"input-1");
         let proof2 = keypair.evaluate(b"input-2");
@@ -362,86 +235,78 @@ mod tests {
     }
 
     #[test]
-    fn test_same_input_same_output() {
-        let keypair = VrfKeypair::generate();
-        let input = b"deterministic-input";
-
-        let proof1 = keypair.evaluate(input);
-        let proof2 = keypair.evaluate(input);
-        // Ed25519 signing is deterministic (RFC 8032), so same input -> same output
-        assert_eq!(proof1.output, proof2.output);
+    fn test_pq_vrf_prove_verify_roundtrip() {
+        let (sk, pk) = crate::pq_sign::generate_pq_keypair();
+        let input = b"pq-vrf-test-input";
+        let (output, proof) = pq_vrf_prove(&sk, input);
+        assert!(pq_vrf_verify(&pk, input, &output, &proof));
     }
 
     #[test]
-    fn test_leader_election_deterministic_for_same_epoch() {
-        // Build candidates with fixed keys
-        let candidates: Vec<(VrfKeypair, String)> = (0..5)
-            .map(|i| {
-                let keypair = VrfKeypair::generate();
-                (keypair, format!("node-{}", i))
-            })
+    fn test_pq_vrf_prove_wrong_key_rejects() {
+        let (sk, _pk) = crate::pq_sign::generate_pq_keypair();
+        let (_sk2, pk2) = crate::pq_sign::generate_pq_keypair();
+        let input = b"pq-vrf-test-input";
+        let (output, proof) = pq_vrf_prove(&sk, input);
+        assert!(!pq_vrf_verify(&pk2, input, &output, &proof));
+    }
+
+    #[test]
+    fn test_pq_leader_election_struct_roundtrip() {
+        let candidates: Vec<(PqVrfKeypair, String)> = (0..3)
+            .map(|i| (PqVrfKeypair::generate(), format!("node-{}", i)))
             .collect();
 
-        let epoch = 100u64;
-        let result1 = leader_election(epoch, &candidates);
-        let result2 = leader_election(epoch, &candidates);
+        let result = pq_leader_election_struct(42, &candidates);
+        assert!(result.is_some());
 
-        assert!(result1.is_some());
-        assert!(result2.is_some());
-
-        let (idx1, name1, proof1) = result1.unwrap();
-        let (idx2, name2, proof2) = result2.unwrap();
-
-        // Same candidates + same epoch = same winner (deterministic)
-        assert_eq!(idx1, idx2);
-        assert_eq!(name1, name2);
-        assert_eq!(proof1.output, proof2.output);
-    }
-
-    #[test]
-    fn test_leader_election_empty_candidates() {
-        let result = leader_election(1, &[]);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_leader_election_winner_is_verifiable() {
-        let candidates: Vec<(VrfKeypair, String)> = (0..3)
-            .map(|i| (VrfKeypair::generate(), format!("node-{}", i)))
-            .collect();
-
-        let epoch = 42u64;
-        let (winner_idx, _name, proof) = leader_election(epoch, &candidates).unwrap();
-
-        // Anyone can verify the winner's proof
+        let (winner_idx, _name, proof) = result.unwrap();
         let winner_vk = candidates[winner_idx].0.verifying_key();
-        let verified = verify(winner_vk, &epoch.to_le_bytes(), &proof);
+        let verified = pq_vrf_verify_proof(winner_vk, &42u64.to_le_bytes(), &proof);
         assert!(verified.is_some());
     }
 
     #[test]
-    fn test_tampered_proof_rejected() {
-        let keypair = VrfKeypair::generate();
-        let input = b"test-input";
-
-        let mut proof = keypair.evaluate(input);
-        // Tamper with the output
-        proof.output[0] ^= 0xFF;
-
-        let result = verify(keypair.verifying_key(), input, &proof);
+    fn test_pq_leader_election_struct_empty() {
+        let result = pq_leader_election_struct(1, &[]);
         assert!(result.is_none());
     }
 
     #[test]
-    fn test_tampered_proof_bytes_rejected() {
-        let keypair = VrfKeypair::generate();
+    fn test_pq_vrf_tampered_output_rejected() {
+        let keypair = PqVrfKeypair::generate();
         let input = b"test-input";
 
         let mut proof = keypair.evaluate(input);
-        // Tamper with the proof signature bytes
+        proof.output[0] ^= 0xFF;
+
+        let result = pq_vrf_verify_proof(keypair.verifying_key(), input, &proof);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_pq_vrf_tampered_proof_bytes_rejected() {
+        let keypair = PqVrfKeypair::generate();
+        let input = b"test-input";
+
+        let mut proof = keypair.evaluate(input);
         proof.proof[0] ^= 0xFF;
 
-        let result = verify(keypair.verifying_key(), input, &proof);
+        let result = pq_vrf_verify_proof(keypair.verifying_key(), input, &proof);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_pq_leader_election_functional() {
+        let (sk, pk) = crate::pq_sign::generate_pq_keypair();
+        let (idx, output, proof) = pq_leader_election(&sk, &pk, 99, 10);
+        assert!(idx < 10);
+        assert!(!output.is_empty());
+        assert!(!proof.is_empty());
+        // Verify the proof
+        let input = format!("leader-election-round-{}", 99);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&output);
+        assert!(pq_vrf_verify(&pk, input.as_bytes(), &out, &proof));
     }
 }

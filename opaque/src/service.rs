@@ -244,7 +244,8 @@ pub fn handle_register_finish(
     let server_registration = ServerRegistration::<OpaqueCs>::finish(registration_upload);
     let registration_bytes = server_registration.serialize().to_vec();
 
-    let user_id = store.store_registration(username, registration_bytes);
+    let user_id = store.store_registration(username, registration_bytes)
+        .map_err(|e| format!("{e}"))?;
     Ok(user_id)
 }
 
@@ -291,7 +292,8 @@ pub fn handle_register_finish_fips(
     let server_registration = ServerRegistration::<OpaqueCsFips>::finish(registration_upload);
     let registration_bytes = server_registration.serialize().to_vec();
 
-    let user_id = store.store_registration_fips(username, registration_bytes);
+    let user_id = store.store_registration_fips(username, registration_bytes)
+        .map_err(|e| format!("{e}"))?;
     Ok(user_id)
 }
 

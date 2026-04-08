@@ -182,7 +182,7 @@ fn opaque_registration_no_password_material() {
         let username = "alice-opaque-test";
 
         // Register a user (internally performs full OPAQUE registration)
-        let user_id = store.register_with_password(username, password);
+        let user_id = store.register_with_password(username, password).unwrap();
         assert_ne!(user_id, Uuid::nil(), "registration must succeed");
 
         // Retrieve the server-side registration blob

@@ -488,10 +488,16 @@ pub async fn init_database(database_url: &str) -> Result<PgPool, String> {
                 }
 
                 // Enable audit logging for security compliance.
-                // Use .ok() since these may fail if PG doesn't grant SET permission.
-                let _ = sqlx::Executor::execute(&mut *conn, "SET log_statement = 'mod'").await.ok();
-                let _ = sqlx::Executor::execute(&mut *conn, "SET log_connections = 'on'").await.ok();
-                let _ = sqlx::Executor::execute(&mut *conn, "SET log_disconnections = 'on'").await.ok();
+                // Best-effort: may fail if PG doesn't grant SET permission.
+                if let Err(e) = sqlx::Executor::execute(&mut *conn, "SET log_statement = 'mod'").await {
+                    tracing::debug!("db: SET log_statement failed (non-fatal): {}", e);
+                }
+                if let Err(e) = sqlx::Executor::execute(&mut *conn, "SET log_connections = 'on'").await {
+                    tracing::debug!("db: SET log_connections failed (non-fatal): {}", e);
+                }
+                if let Err(e) = sqlx::Executor::execute(&mut *conn, "SET log_disconnections = 'on'").await {
+                    tracing::debug!("db: SET log_disconnections failed (non-fatal): {}", e);
+                }
 
                 Ok(())
             })
@@ -524,12 +530,12 @@ pub async fn init_database(database_url: &str) -> Result<PgPool, String> {
         )
     "#).execute(&pool).await.map_err(|e| format!("Failed to create tenants table: {e}"))?;
 
-    // Insert default migration tenant for pre-existing data
-    let _ = sqlx::query(
+    // Insert default migration tenant for pre-existing data (critical for FK constraints)
+    sqlx::query(
         "INSERT INTO tenants (tenant_id, name, slug, status, created_at) \
          VALUES ('00000000-0000-0000-0000-000000000000', 'Default Migration Tenant', 'default-migration', 'Active', \
          EXTRACT(EPOCH FROM NOW())::BIGINT) ON CONFLICT (tenant_id) DO NOTHING"
-    ).execute(&pool).await;
+    ).execute(&pool).await.map_err(|e| format!("Failed to insert default migration tenant: {e}"))?;
 
     // Run migrations
     sqlx::query(r#"
@@ -545,14 +551,18 @@ pub async fn init_database(database_url: &str) -> Result<PgPool, String> {
     "#).execute(&pool).await.map_err(|e| format!("Failed to create users table: {e}"))?;
 
     // Migration: add tier column to existing users tables that lack it
-    let _ = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS tier INTEGER NOT NULL DEFAULT 2")
+    if let Err(e) = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS tier INTEGER NOT NULL DEFAULT 2")
         .execute(&pool)
-        .await;
+        .await {
+        tracing::warn!("migration: add tier column failed: {}", e);
+    }
 
     // Migration: add duress_pin_hash column for duress PIN system
-    let _ = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS duress_pin_hash BYTEA")
+    if let Err(e) = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS duress_pin_hash BYTEA")
         .execute(&pool)
-        .await;
+        .await {
+        tracing::warn!("migration: add duress_pin_hash column failed: {}", e);
+    }
 
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS devices (
@@ -583,9 +593,11 @@ pub async fn init_database(database_url: &str) -> Result<PgPool, String> {
 
     // Migration: convert client_secret from VARCHAR to BYTEA for envelope encryption.
     // ALTER TYPE with USING handles existing plaintext values by casting to bytes.
-    let _ = sqlx::query(
+    if let Err(e) = sqlx::query(
         "ALTER TABLE portals ALTER COLUMN client_secret TYPE BYTEA USING client_secret::BYTEA"
-    ).execute(&pool).await;
+    ).execute(&pool).await {
+        tracing::warn!("migration: convert client_secret to BYTEA failed: {}", e);
+    }
 
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS audit_log (
@@ -601,15 +613,21 @@ pub async fn init_database(database_url: &str) -> Result<PgPool, String> {
     "#).execute(&pool).await.map_err(|e| format!("Failed to create audit_log table: {e}"))?;
 
     // Migration: make user_ids NOT NULL with default empty JSON array for existing rows
-    let _ = sqlx::query(
+    if let Err(e) = sqlx::query(
         "UPDATE audit_log SET user_ids = '[]' WHERE user_ids IS NULL"
-    ).execute(&pool).await;
-    let _ = sqlx::query(
+    ).execute(&pool).await {
+        tracing::warn!("migration: backfill audit_log user_ids failed: {}", e);
+    }
+    if let Err(e) = sqlx::query(
         "ALTER TABLE audit_log ALTER COLUMN user_ids SET NOT NULL"
-    ).execute(&pool).await;
-    let _ = sqlx::query(
+    ).execute(&pool).await {
+        tracing::warn!("migration: audit_log user_ids SET NOT NULL failed: {}", e);
+    }
+    if let Err(e) = sqlx::query(
         "ALTER TABLE audit_log ALTER COLUMN user_ids SET DEFAULT '[]'"
-    ).execute(&pool).await;
+    ).execute(&pool).await {
+        tracing::warn!("migration: audit_log user_ids SET DEFAULT failed: {}", e);
+    }
 
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS sessions (
@@ -704,21 +722,33 @@ pub async fn init_database(database_url: &str) -> Result<PgPool, String> {
     "#).execute(&pool).await.map_err(|e| format!("Failed to create key_material table: {e}"))?;
 
     // Migration: add email and auth_provider columns for Google OAuth
-    let _ = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(255)")
-        .execute(&pool).await;
-    let _ = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_provider VARCHAR(50) NOT NULL DEFAULT 'opaque'")
-        .execute(&pool).await;
-    let _ = sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS users_email_unique ON users (email) WHERE email IS NOT NULL")
-        .execute(&pool).await;
+    if let Err(e) = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(255)")
+        .execute(&pool).await {
+        tracing::warn!("migration: add email column failed: {}", e);
+    }
+    if let Err(e) = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_provider VARCHAR(50) NOT NULL DEFAULT 'opaque'")
+        .execute(&pool).await {
+        tracing::warn!("migration: add auth_provider column failed: {}", e);
+    }
+    if let Err(e) = sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS users_email_unique ON users (email) WHERE email IS NOT NULL")
+        .execute(&pool).await {
+        tracing::warn!("migration: create users_email_unique index failed: {}", e);
+    }
 
     // Migration: add encrypted email column for PII protection at rest
-    let _ = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS email_encrypted BYTEA")
-        .execute(&pool).await;
+    if let Err(e) = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS email_encrypted BYTEA")
+        .execute(&pool).await {
+        tracing::warn!("migration: add email_encrypted column failed: {}", e);
+    }
     // Migration: add email_hash column for lookups without decrypting
-    let _ = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS email_hash BYTEA")
-        .execute(&pool).await;
-    let _ = sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS users_email_hash_unique ON users (email_hash) WHERE email_hash IS NOT NULL")
-        .execute(&pool).await;
+    if let Err(e) = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS email_hash BYTEA")
+        .execute(&pool).await {
+        tracing::warn!("migration: add email_hash column failed: {}", e);
+    }
+    if let Err(e) = sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS users_email_hash_unique ON users (email_hash) WHERE email_hash IS NOT NULL")
+        .execute(&pool).await {
+        tracing::warn!("migration: create users_email_hash_unique index failed: {}", e);
+    }
 
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS shard_sequences (
@@ -756,39 +786,34 @@ pub async fn init_database(database_url: &str) -> Result<PgPool, String> {
     "#).execute(&pool).await.map_err(|e| format!("Failed to create recovery_codes index: {e}"))?;
 
     // ── Multi-tenancy column migrations (idempotent) ──
-    // Add tenant_id to tables that may have been created before multi-tenancy.
-    let _ = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS tenant_id UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'")
-        .execute(&pool).await;
-    let _ = sqlx::query("ALTER TABLE devices ADD COLUMN IF NOT EXISTS tenant_id UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'")
-        .execute(&pool).await;
-    let _ = sqlx::query("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS tenant_id UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'")
-        .execute(&pool).await;
-    let _ = sqlx::query("ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS tenant_id UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'")
-        .execute(&pool).await;
-    let _ = sqlx::query("ALTER TABLE portals ADD COLUMN IF NOT EXISTS tenant_id UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'")
-        .execute(&pool).await;
-    let _ = sqlx::query("ALTER TABLE fido_credentials ADD COLUMN IF NOT EXISTS tenant_id UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'")
-        .execute(&pool).await;
-    let _ = sqlx::query("ALTER TABLE authorization_codes ADD COLUMN IF NOT EXISTS tenant_id UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'")
-        .execute(&pool).await;
-    let _ = sqlx::query("ALTER TABLE oauth_codes ADD COLUMN IF NOT EXISTS tenant_id UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'")
-        .execute(&pool).await;
-    let _ = sqlx::query("ALTER TABLE revoked_tokens ADD COLUMN IF NOT EXISTS tenant_id UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'")
-        .execute(&pool).await;
-    let _ = sqlx::query("ALTER TABLE recovery_codes ADD COLUMN IF NOT EXISTS tenant_id UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'")
-        .execute(&pool).await;
+    // CRITICAL: tenant_id columns are required for tenant isolation / RLS.
+    // Failures here must be propagated to prevent running without tenant scoping.
+    let tenant_tables = [
+        "users", "devices", "sessions", "audit_log", "portals",
+        "fido_credentials", "authorization_codes", "oauth_codes",
+        "revoked_tokens", "recovery_codes",
+    ];
+    for table in &tenant_tables {
+        let sql = format!(
+            "ALTER TABLE {} ADD COLUMN IF NOT EXISTS tenant_id UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'",
+            table
+        );
+        sqlx::query(&sql)
+            .execute(&pool)
+            .await
+            .map_err(|e| format!("CRITICAL: tenant isolation migration failed for {}: {}", table, e))?;
+    }
 
-    // ── Tenant-scoped indexes ──
-    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_users_tenant_id ON users (tenant_id)").execute(&pool).await;
-    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_devices_tenant_id ON devices (tenant_id)").execute(&pool).await;
-    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sessions_tenant_id ON sessions (tenant_id)").execute(&pool).await;
-    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_log_tenant_id ON audit_log (tenant_id)").execute(&pool).await;
-    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_portals_tenant_id ON portals (tenant_id)").execute(&pool).await;
-    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_fido_credentials_tenant_id ON fido_credentials (tenant_id)").execute(&pool).await;
-    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_authorization_codes_tenant_id ON authorization_codes (tenant_id)").execute(&pool).await;
-    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_oauth_codes_tenant_id ON oauth_codes (tenant_id)").execute(&pool).await;
-    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_revoked_tokens_tenant_id ON revoked_tokens (tenant_id)").execute(&pool).await;
-    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_recovery_codes_tenant_id ON recovery_codes (tenant_id)").execute(&pool).await;
+    // ── Tenant-scoped indexes (required for RLS performance) ──
+    for table in &tenant_tables {
+        let sql = format!(
+            "CREATE INDEX IF NOT EXISTS idx_{}_tenant_id ON {} (tenant_id)",
+            table, table
+        );
+        if let Err(e) = sqlx::query(&sql).execute(&pool).await {
+            tracing::warn!("migration: create tenant index on {} failed: {}", table, e);
+        }
+    }
 
     Ok(pool)
 }

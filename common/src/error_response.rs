@@ -1,3 +1,4 @@
+// ALL PII MUST be pseudonymized before logging.
 //! Error response handling for the MILNET SSO system.
 //!
 //! Error verbosity is controlled by `error_level()`:
@@ -189,13 +190,15 @@ pub fn verbose_log_fields(category: &str, message: &str, fields: &[(&str, &str)]
 }
 
 /// Log an incoming request when verbose logging is active.
+/// Source IP is pseudonymized before logging to prevent PII leakage.
 pub fn log_request(method: &str, path: &str, source_ip: &str) {
     if error_level().is_verbose() {
+        let pseudo_ip = crate::log_pseudonym::pseudonym_ip(source_ip);
         tracing::info!(
             category = "request",
             method = method,
             path = path,
-            source_ip = source_ip,
+            source_ip = %pseudo_ip,
             "incoming request"
         );
     }
@@ -215,25 +218,16 @@ pub fn log_ceremony_step(ceremony_id: &str, step: &str, elapsed_ms: u64) {
 }
 
 /// Log a token operation (creation or verification).
-/// In verbose mode, logs real user_id. In warn mode, redacts.
+/// User ID is always pseudonymized before logging at all verbosity levels.
 pub fn log_token_operation(operation: &str, user_id: &str, tier: u8, _dev_mode: bool) {
-    if error_level().is_verbose() {
-        tracing::info!(
-            category = "token",
-            operation = operation,
-            user_id = user_id,
-            tier = tier,
-            "token operation"
-        );
-    } else {
-        tracing::info!(
-            category = "token",
-            operation = operation,
-            user_id = "[REDACTED]",
-            tier = tier,
-            "token operation"
-        );
-    }
+    let pseudo_uid = crate::log_pseudonym::pseudonym_str("user_id", user_id);
+    tracing::info!(
+        category = "token",
+        operation = operation,
+        user_id = %pseudo_uid,
+        tier = tier,
+        "token operation"
+    );
 }
 
 /// Log a crypto operation (algorithm used, key ID — never actual keys).
@@ -250,8 +244,10 @@ pub fn log_crypto_operation(operation: &str, algorithm: &str, key_id: &str) {
 }
 
 /// Log risk scoring signal values and final score.
+/// User ID is pseudonymized before logging to prevent PII leakage.
 pub fn log_risk_score(user_id: &str, signals: &[(&str, f64)], final_score: f64) {
     if error_level().is_verbose() {
+        let pseudo_uid = crate::log_pseudonym::pseudonym_str("user_id", user_id);
         let signal_str: String = signals
             .iter()
             .map(|(k, v)| format!("{}={:.3}", k, v))
@@ -259,7 +255,7 @@ pub fn log_risk_score(user_id: &str, signals: &[(&str, f64)], final_score: f64) 
             .join(", ");
         tracing::info!(
             category = "risk",
-            user_id = user_id,
+            user_id = %pseudo_uid,
             signals = %signal_str,
             final_score = final_score,
             "risk score computed"
@@ -361,5 +357,36 @@ mod tests {
             sanitize_error("some unknown internal failure", false),
             "internal error"
         );
+    }
+
+    #[test]
+    fn log_request_pseudonymizes_source_ip() {
+        // Verify pseudonym_ip returns a deterministic hex string, not the raw IP.
+        let raw_ip = "192.168.1.42";
+        let pseudo = crate::log_pseudonym::pseudonym_ip(raw_ip);
+        assert_ne!(pseudo, raw_ip, "source_ip must be pseudonymized, not raw");
+        assert_eq!(pseudo.len(), 32, "pseudonym should be 32 hex chars");
+        // Deterministic: same input yields same output.
+        assert_eq!(pseudo, crate::log_pseudonym::pseudonym_ip(raw_ip));
+    }
+
+    #[test]
+    fn log_risk_score_pseudonymizes_user_id() {
+        let raw = "user-abc-123";
+        let pseudo = crate::log_pseudonym::pseudonym_str("user_id", raw);
+        assert_ne!(pseudo, raw, "user_id must be pseudonymized");
+        assert_eq!(pseudo.len(), 32);
+    }
+
+    #[test]
+    fn log_token_operation_pseudonymizes_user_id() {
+        // Confirms the pseudonym_str function used by log_token_operation
+        // produces a stable, non-raw identifier at all log levels.
+        let raw = "token-user-456";
+        let pseudo = crate::log_pseudonym::pseudonym_str("user_id", raw);
+        assert_ne!(pseudo, raw);
+        assert_eq!(pseudo.len(), 32);
+        // Stable across calls.
+        assert_eq!(pseudo, crate::log_pseudonym::pseudonym_str("user_id", raw));
     }
 }

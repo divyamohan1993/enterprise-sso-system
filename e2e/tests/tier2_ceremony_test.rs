@@ -346,7 +346,7 @@ fn tier2_full_ceremony_success() {
     rt.block_on(rt.spawn(async {
         // 1. Boot all services
         let mut store = CredentialStore::new();
-        store.register_with_password("alice", b"password123");
+        store.register_with_password("alice", b"password123").unwrap();
         let (gateway_addr, group_verifying_key, pq_vk) = boot_full_system(store).await;
 
         // 2. Run the client flow using encrypted X-Wing channel
@@ -394,7 +394,7 @@ fn tier2_wrong_password_fails() {
     rt.block_on(rt.spawn(async {
         // 1. Boot all services
         let mut store = CredentialStore::new();
-        store.register_with_password("alice", b"password123");
+        store.register_with_password("alice", b"password123").unwrap();
         let (gateway_addr, _group_verifying_key, _pq_vk) = boot_full_system(store).await;
 
         // 2. Run the client flow with WRONG password using encrypted X-Wing channel

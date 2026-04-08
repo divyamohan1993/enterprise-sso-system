@@ -341,7 +341,7 @@ fn full_ceremony_happy_path() {
     let rt = build_pq_runtime();
     rt.block_on(rt.spawn(async {
         let mut store = CredentialStore::new();
-        store.register_with_password("alice", b"correct-password");
+        store.register_with_password("alice", b"correct-password").unwrap();
         let (gateway_addr, group_vk, pq_vk) = boot_full_system(store).await;
 
         let (auth_resp, dpop_key) =
@@ -376,7 +376,7 @@ fn wrong_password_rejected() {
     let rt = build_pq_runtime();
     rt.block_on(rt.spawn(async {
         let mut store = CredentialStore::new();
-        store.register_with_password("bob", b"real-password");
+        store.register_with_password("bob", b"real-password").unwrap();
         let (gateway_addr, _gvk, _pvk) = boot_full_system(store).await;
 
         let auth_resp = client_auth(&gateway_addr, "bob", b"wrong-password").await;
@@ -416,8 +416,8 @@ fn concurrent_ceremonies() {
     let rt = build_pq_runtime();
     rt.block_on(rt.spawn(async {
         let mut store = CredentialStore::new();
-        store.register_with_password("user_a", b"password_a");
-        store.register_with_password("user_b", b"password_b");
+        store.register_with_password("user_a", b"password_a").unwrap();
+        store.register_with_password("user_b", b"password_b").unwrap();
         let (gateway_addr, group_vk, pq_vk) = boot_full_system(store).await;
 
         let addr1 = gateway_addr.clone();
@@ -603,7 +603,7 @@ fn full_ceremony_token_claims_structure() {
     let rt = build_pq_runtime();
     rt.block_on(rt.spawn(async {
         let mut store = CredentialStore::new();
-        store.register_with_password("charlie", b"charlie-pass");
+        store.register_with_password("charlie", b"charlie-pass").unwrap();
         let (gateway_addr, group_vk, pq_vk) = boot_full_system(store).await;
 
         let (auth_resp, dpop_key) =

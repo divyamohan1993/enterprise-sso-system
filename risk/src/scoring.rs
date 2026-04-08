@@ -1,8 +1,216 @@
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha512;
 use std::collections::HashMap;
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Instant;
 use uuid::Uuid;
+
+type HmacSha512 = Hmac<Sha512>;
+
+// ---------------------------------------------------------------------------
+// Baseline persistence (Fix 1)
+// ---------------------------------------------------------------------------
+
+/// Trait for persisting baselines across restarts.
+pub trait BaselinePersistence: Send + Sync {
+    /// Save all baselines to durable storage.
+    fn save(&self, baselines: &HashMap<Uuid, UserBaseline>) -> Result<(), String>;
+    /// Load baselines from durable storage.
+    fn load(&self) -> Result<HashMap<Uuid, UserBaseline>, String>;
+}
+
+/// Serializable wrapper for UserBaseline (needed because UserBaseline uses
+/// non-serializable fields by default).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SerializableBaseline {
+    pub typical_login_hours: (u8, u8),
+    pub known_networks: Vec<String>,
+    pub avg_session_duration_secs: f64,
+    pub last_updated: i64,
+    pub avg_login_hour: f64,
+}
+
+impl From<&UserBaseline> for SerializableBaseline {
+    fn from(b: &UserBaseline) -> Self {
+        Self {
+            typical_login_hours: b.typical_login_hours,
+            known_networks: b.known_networks.clone(),
+            avg_session_duration_secs: b.avg_session_duration_secs,
+            last_updated: b.last_updated,
+            avg_login_hour: b.avg_login_hour,
+        }
+    }
+}
+
+impl From<SerializableBaseline> for UserBaseline {
+    fn from(s: SerializableBaseline) -> Self {
+        Self {
+            typical_login_hours: s.typical_login_hours,
+            known_networks: s.known_networks,
+            avg_session_duration_secs: s.avg_session_duration_secs,
+            last_updated: s.last_updated,
+            avg_login_hour: s.avg_login_hour,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HMAC tamper detection (Fix 2)
+// ---------------------------------------------------------------------------
+
+/// Signed envelope wrapping serialized baselines with HMAC-SHA512.
+#[derive(Serialize, Deserialize)]
+pub struct SignedBaselineEnvelope {
+    /// JSON-serialized baseline map.
+    pub payload: Vec<u8>,
+    /// HMAC-SHA512 over `payload`.
+    pub hmac: Vec<u8>,
+}
+
+impl SignedBaselineEnvelope {
+    /// Create a signed envelope from baselines using the given key.
+    pub fn seal(baselines: &HashMap<Uuid, UserBaseline>, key: &[u8]) -> Result<Vec<u8>, String> {
+        let serializable: HashMap<String, SerializableBaseline> = baselines
+            .iter()
+            .map(|(k, v)| (k.to_string(), SerializableBaseline::from(v)))
+            .collect();
+        let payload = serde_json::to_vec(&serializable)
+            .map_err(|e| format!("serialize baselines: {e}"))?;
+        let mut mac = HmacSha512::new_from_slice(key)
+            .map_err(|e| format!("hmac init: {e}"))?;
+        mac.update(&payload);
+        let hmac = mac.finalize().into_bytes().to_vec();
+        let envelope = SignedBaselineEnvelope { payload, hmac };
+        serde_json::to_vec(&envelope).map_err(|e| format!("serialize envelope: {e}"))
+    }
+
+    /// Verify and deserialize baselines from a signed envelope.
+    pub fn unseal(data: &[u8], key: &[u8]) -> Result<HashMap<Uuid, UserBaseline>, String> {
+        let envelope: SignedBaselineEnvelope = serde_json::from_slice(data)
+            .map_err(|e| format!("deserialize envelope: {e}"))?;
+        let mut mac = HmacSha512::new_from_slice(key)
+            .map_err(|e| format!("hmac init: {e}"))?;
+        mac.update(&envelope.payload);
+        mac.verify_slice(&envelope.hmac).map_err(|_| {
+            tracing::error!(target: "siem", "SIEM:CRITICAL baseline file HMAC verification failed — possible tampering detected");
+            "HMAC verification failed: baseline tampered".to_string()
+        })?;
+        let serializable: HashMap<String, SerializableBaseline> =
+            serde_json::from_slice(&envelope.payload)
+                .map_err(|e| format!("deserialize baselines: {e}"))?;
+        let mut baselines = HashMap::new();
+        for (k, v) in serializable {
+            let uuid = Uuid::parse_str(&k).map_err(|e| format!("parse uuid: {e}"))?;
+            baselines.insert(uuid, UserBaseline::from(v));
+        }
+        Ok(baselines)
+    }
+}
+
+/// File-based persistence with atomic writes (tmp + fsync + rename) and
+/// HMAC-SHA512 tamper detection.
+pub struct FileBaselinePersistence {
+    path: PathBuf,
+    hmac_key: Vec<u8>,
+}
+
+impl FileBaselinePersistence {
+    pub fn new(path: PathBuf, hmac_key: Vec<u8>) -> Self {
+        Self { path, hmac_key }
+    }
+}
+
+impl BaselinePersistence for FileBaselinePersistence {
+    fn save(&self, baselines: &HashMap<Uuid, UserBaseline>) -> Result<(), String> {
+        let data = SignedBaselineEnvelope::seal(baselines, &self.hmac_key)?;
+        let tmp_path = self.path.with_extension("tmp");
+        let mut file = std::fs::File::create(&tmp_path)
+            .map_err(|e| format!("create tmp file: {e}"))?;
+        file.write_all(&data)
+            .map_err(|e| format!("write tmp file: {e}"))?;
+        file.sync_all()
+            .map_err(|e| format!("fsync tmp file: {e}"))?;
+        std::fs::rename(&tmp_path, &self.path)
+            .map_err(|e| format!("rename to final: {e}"))?;
+        Ok(())
+    }
+
+    fn load(&self) -> Result<HashMap<Uuid, UserBaseline>, String> {
+        if !self.path.exists() {
+            return Ok(HashMap::new());
+        }
+        let data = std::fs::read(&self.path)
+            .map_err(|e| format!("read baseline file: {e}"))?;
+        SignedBaselineEnvelope::unseal(&data, &self.hmac_key)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-node sync with LWW register (Fix 3)
+// ---------------------------------------------------------------------------
+
+/// Last-Writer-Wins register entry for cross-node baseline sync.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LwwEntry {
+    pub baseline: SerializableBaseline,
+    /// Unix timestamp (seconds) of last write.
+    pub timestamp: i64,
+    /// Node identifier for tiebreaking when timestamps are equal.
+    pub node_id: String,
+}
+
+/// Trait for syncing baselines across nodes.
+pub trait BaselineSync: Send + Sync {
+    /// Merge remote baselines into the local store.
+    /// Uses LWW semantics: highest timestamp wins, node_id breaks ties
+    /// (lexicographically greater node_id wins).
+    fn merge(
+        &self,
+        local: &mut HashMap<Uuid, LwwEntry>,
+        remote: &HashMap<Uuid, LwwEntry>,
+    );
+}
+
+/// Default LWW merge implementation.
+pub struct LwwBaselineSync;
+
+impl BaselineSync for LwwBaselineSync {
+    fn merge(
+        &self,
+        local: &mut HashMap<Uuid, LwwEntry>,
+        remote: &HashMap<Uuid, LwwEntry>,
+    ) {
+        for (user_id, remote_entry) in remote {
+            match local.get(user_id) {
+                Some(local_entry) => {
+                    let take_remote = remote_entry.timestamp > local_entry.timestamp
+                        || (remote_entry.timestamp == local_entry.timestamp
+                            && remote_entry.node_id > local_entry.node_id);
+                    if take_remote {
+                        local.insert(*user_id, remote_entry.clone());
+                    }
+                }
+                None => {
+                    local.insert(*user_id, remote_entry.clone());
+                }
+            }
+        }
+    }
+}
+
+/// Check if military mode is active (MILNET environment).
+pub fn is_military_mode() -> bool {
+    std::env::var("MILNET_RISK_BASELINE_PATH").is_ok()
+        || std::env::var("MILNET_MODE").map(|v| v == "1" || v.to_lowercase() == "true").unwrap_or(false)
+}
+
+/// Get the configured baseline persistence path.
+pub fn baseline_persistence_path() -> Option<PathBuf> {
+    std::env::var("MILNET_RISK_BASELINE_PATH").ok().map(PathBuf::from)
+}
 
 /// Risk signal types
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,18 +305,107 @@ impl UserBaseline {
 
 /// Thread-safe store for per-user behavioral baselines.
 ///
-/// All access is serialized through a `Mutex`. In a production deployment
-/// this would be backed by a persistent store; the in-memory version is
-/// suitable for single-instance deployments and testing.
+/// Supports optional durable persistence via `BaselinePersistence` and
+/// cross-node sync via LWW registers.
 pub struct BaselineStore {
     inner: Mutex<HashMap<Uuid, UserBaseline>>,
+    persistence: Option<Box<dyn BaselinePersistence>>,
+    /// LWW entries for cross-node sync.
+    lww_entries: Mutex<HashMap<Uuid, LwwEntry>>,
+    node_id: String,
 }
 
 impl BaselineStore {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
+            persistence: None,
+            lww_entries: Mutex::new(HashMap::new()),
+            node_id: Uuid::new_v4().to_string(),
         }
+    }
+
+    /// Create a new store with persistence. Loads existing baselines on
+    /// construction. In military mode, `persistence` is required.
+    pub fn with_persistence(persistence: Box<dyn BaselinePersistence>) -> Result<Self, String> {
+        let baselines = persistence.load()?;
+        let node_id = Uuid::new_v4().to_string();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let lww: HashMap<Uuid, LwwEntry> = baselines
+            .iter()
+            .map(|(k, v)| {
+                (
+                    *k,
+                    LwwEntry {
+                        baseline: SerializableBaseline::from(v),
+                        timestamp: now,
+                        node_id: node_id.clone(),
+                    },
+                )
+            })
+            .collect();
+        Ok(Self {
+            inner: Mutex::new(baselines),
+            persistence: Some(persistence),
+            lww_entries: Mutex::new(lww),
+            node_id,
+        })
+    }
+
+    /// Create a store enforcing military mode requirements.
+    /// Panics / returns error if no persistence path is configured.
+    pub fn new_military() -> Result<Self, String> {
+        let path = baseline_persistence_path().ok_or_else(|| {
+            "MILNET_RISK_BASELINE_PATH must be set in military mode".to_string()
+        })?;
+        let key = std::env::var("MILNET_BASELINE_HMAC_KEY")
+            .unwrap_or_else(|_| "default-milnet-hmac-key-replace-in-prod".to_string());
+        let persistence = Box::new(FileBaselinePersistence::new(path, key.into_bytes()));
+        Self::with_persistence(persistence)
+    }
+
+    /// Persist current baselines to durable storage (if configured).
+    pub fn persist(&self) -> Result<(), String> {
+        if let Some(ref p) = self.persistence {
+            let store = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            p.save(&store)?;
+        }
+        Ok(())
+    }
+
+    /// Merge remote LWW entries into this store.
+    pub fn merge_remote(&self, remote: &HashMap<Uuid, LwwEntry>) {
+        let sync = LwwBaselineSync;
+        let mut lww = self.lww_entries.lock().unwrap_or_else(|e| e.into_inner());
+        sync.merge(&mut lww, remote);
+        // Apply merged LWW entries back to the inner store.
+        let mut store = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        for (uid, entry) in lww.iter() {
+            store.insert(*uid, UserBaseline::from(entry.baseline.clone()));
+        }
+    }
+
+    /// Get LWW entries snapshot for sending to other nodes.
+    pub fn lww_snapshot(&self) -> HashMap<Uuid, LwwEntry> {
+        self.lww_entries.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Zeroize in-memory baselines (for secure shutdown).
+    pub fn zeroize(&self) {
+        let mut store = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        for (_, baseline) in store.iter_mut() {
+            baseline.known_networks.clear();
+            baseline.avg_session_duration_secs = 0.0;
+            baseline.avg_login_hour = 0.0;
+            baseline.last_updated = 0;
+            baseline.typical_login_hours = (0, 0);
+        }
+        store.clear();
+        let mut lww = self.lww_entries.lock().unwrap_or_else(|e| e.into_inner());
+        lww.clear();
     }
 
     /// Update (or create) the baseline for `user_id` after a successful auth.
@@ -158,6 +455,21 @@ impl BaselineStore {
         }
 
         baseline.last_updated = now;
+
+        // Update LWW entry for cross-node sync
+        if let Ok(mut lww) = self.lww_entries.lock() {
+            lww.insert(user_id, LwwEntry {
+                baseline: SerializableBaseline::from(baseline as &UserBaseline),
+                timestamp: now,
+                node_id: self.node_id.clone(),
+            });
+        }
+
+        // Persist after update (best-effort; log failure but don't block)
+        drop(store);
+        if let Err(e) = self.persist() {
+            tracing::warn!(target: "siem", "SIEM:WARNING baseline persistence failed: {}", e);
+        }
     }
 
     /// Compute an anomaly score in `[0.0, 1.0]` by comparing the current
@@ -798,5 +1110,270 @@ mod tests {
         };
         let anomaly = store.compute_anomaly_score(&user, &new_signals);
         assert!(anomaly > 0.0, "unknown network should produce anomaly, got {anomaly}");
+    }
+
+    // -- Persistence roundtrip tests --
+
+    #[test]
+    fn test_file_persistence_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("baseline_test_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("baselines.dat");
+        let key = b"test-hmac-key-for-persistence".to_vec();
+
+        let persistence = FileBaselinePersistence::new(path.clone(), key.clone());
+        let user = Uuid::new_v4();
+        let mut baselines = HashMap::new();
+        baselines.insert(user, UserBaseline {
+            typical_login_hours: (8, 18),
+            known_networks: vec!["AS1234".to_string()],
+            avg_session_duration_secs: 300.0,
+            last_updated: 1000,
+            avg_login_hour: 12.0,
+        });
+
+        persistence.save(&baselines).unwrap();
+        let loaded = persistence.load().unwrap();
+        assert!(loaded.contains_key(&user));
+        let b = loaded.get(&user).unwrap();
+        assert_eq!(b.typical_login_hours, (8, 18));
+        assert_eq!(b.known_networks, vec!["AS1234".to_string()]);
+        assert!((b.avg_session_duration_secs - 300.0).abs() < f64::EPSILON);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_hmac_verification_valid() {
+        let key = b"test-key-hmac-verify".to_vec();
+        let user = Uuid::new_v4();
+        let mut baselines = HashMap::new();
+        baselines.insert(user, UserBaseline {
+            typical_login_hours: (9, 17),
+            known_networks: vec![],
+            avg_session_duration_secs: 600.0,
+            last_updated: 2000,
+            avg_login_hour: 13.0,
+        });
+
+        let sealed = SignedBaselineEnvelope::seal(&baselines, &key).unwrap();
+        let unsealed = SignedBaselineEnvelope::unseal(&sealed, &key).unwrap();
+        assert!(unsealed.contains_key(&user));
+    }
+
+    #[test]
+    fn test_hmac_tamper_detection() {
+        let key = b"test-key-tamper".to_vec();
+        let user = Uuid::new_v4();
+        let mut baselines = HashMap::new();
+        baselines.insert(user, UserBaseline {
+            typical_login_hours: (9, 17),
+            known_networks: vec![],
+            avg_session_duration_secs: 600.0,
+            last_updated: 2000,
+            avg_login_hour: 13.0,
+        });
+
+        let mut sealed = SignedBaselineEnvelope::seal(&baselines, &key).unwrap();
+        // Tamper with the payload
+        if sealed.len() > 20 {
+            sealed[20] ^= 0xFF;
+        }
+        let result = SignedBaselineEnvelope::unseal(&sealed, &key);
+        assert!(result.is_err(), "tampered data should fail HMAC verification");
+    }
+
+    #[test]
+    fn test_hmac_wrong_key_rejected() {
+        let key = b"correct-key".to_vec();
+        let wrong_key = b"wrong-key".to_vec();
+        let user = Uuid::new_v4();
+        let mut baselines = HashMap::new();
+        baselines.insert(user, UserBaseline {
+            typical_login_hours: (9, 17),
+            known_networks: vec![],
+            avg_session_duration_secs: 600.0,
+            last_updated: 2000,
+            avg_login_hour: 13.0,
+        });
+
+        let sealed = SignedBaselineEnvelope::seal(&baselines, &key).unwrap();
+        let result = SignedBaselineEnvelope::unseal(&sealed, &wrong_key);
+        assert!(result.is_err(), "wrong key should fail HMAC verification");
+    }
+
+    // -- Cross-node LWW merge tests --
+
+    #[test]
+    fn test_lww_merge_newer_timestamp_wins() {
+        let sync = LwwBaselineSync;
+        let user = Uuid::new_v4();
+        let baseline = SerializableBaseline {
+            typical_login_hours: (8, 18),
+            known_networks: vec![],
+            avg_session_duration_secs: 300.0,
+            last_updated: 1000,
+            avg_login_hour: 12.0,
+        };
+
+        let mut local = HashMap::new();
+        local.insert(user, LwwEntry {
+            baseline: baseline.clone(),
+            timestamp: 100,
+            node_id: "node-a".to_string(),
+        });
+
+        let mut remote = HashMap::new();
+        let mut updated_baseline = baseline.clone();
+        updated_baseline.avg_session_duration_secs = 600.0;
+        remote.insert(user, LwwEntry {
+            baseline: updated_baseline,
+            timestamp: 200, // newer
+            node_id: "node-b".to_string(),
+        });
+
+        sync.merge(&mut local, &remote);
+        assert!((local[&user].baseline.avg_session_duration_secs - 600.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_lww_merge_tiebreak_by_node_id() {
+        let sync = LwwBaselineSync;
+        let user = Uuid::new_v4();
+        let baseline = SerializableBaseline {
+            typical_login_hours: (8, 18),
+            known_networks: vec![],
+            avg_session_duration_secs: 300.0,
+            last_updated: 1000,
+            avg_login_hour: 12.0,
+        };
+
+        let mut local = HashMap::new();
+        local.insert(user, LwwEntry {
+            baseline: baseline.clone(),
+            timestamp: 100,
+            node_id: "node-a".to_string(),
+        });
+
+        let mut remote = HashMap::new();
+        let mut updated = baseline.clone();
+        updated.avg_session_duration_secs = 999.0;
+        remote.insert(user, LwwEntry {
+            baseline: updated,
+            timestamp: 100, // same timestamp
+            node_id: "node-z".to_string(), // lexicographically greater
+        });
+
+        sync.merge(&mut local, &remote);
+        assert!((local[&user].baseline.avg_session_duration_secs - 999.0).abs() < f64::EPSILON);
+        assert_eq!(local[&user].node_id, "node-z");
+    }
+
+    #[test]
+    fn test_lww_merge_older_remote_ignored() {
+        let sync = LwwBaselineSync;
+        let user = Uuid::new_v4();
+        let baseline = SerializableBaseline {
+            typical_login_hours: (8, 18),
+            known_networks: vec![],
+            avg_session_duration_secs: 300.0,
+            last_updated: 1000,
+            avg_login_hour: 12.0,
+        };
+
+        let mut local = HashMap::new();
+        local.insert(user, LwwEntry {
+            baseline: baseline.clone(),
+            timestamp: 200,
+            node_id: "node-a".to_string(),
+        });
+
+        let mut remote = HashMap::new();
+        let mut old = baseline.clone();
+        old.avg_session_duration_secs = 1.0;
+        remote.insert(user, LwwEntry {
+            baseline: old,
+            timestamp: 100, // older
+            node_id: "node-z".to_string(),
+        });
+
+        sync.merge(&mut local, &remote);
+        assert!((local[&user].baseline.avg_session_duration_secs - 300.0).abs() < f64::EPSILON);
+    }
+
+    // -- Military mode tests --
+
+    #[test]
+    fn test_military_mode_requires_persistence_path() {
+        // Ensure env var is NOT set for this test
+        std::env::remove_var("MILNET_RISK_BASELINE_PATH");
+        std::env::remove_var("MILNET_MODE");
+        let result = BaselineStore::new_military();
+        assert!(result.is_err(), "military mode without path should fail");
+    }
+
+    #[test]
+    fn test_military_mode_with_path() {
+        let dir = std::env::temp_dir().join(format!("milnet_test_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("baselines.dat");
+        std::env::set_var("MILNET_RISK_BASELINE_PATH", path.to_str().unwrap());
+        std::env::set_var("MILNET_BASELINE_HMAC_KEY", "test-milnet-key");
+
+        let result = BaselineStore::new_military();
+        assert!(result.is_ok(), "military mode with path should succeed");
+
+        std::env::remove_var("MILNET_RISK_BASELINE_PATH");
+        std::env::remove_var("MILNET_BASELINE_HMAC_KEY");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- Corrupted file handling --
+
+    #[test]
+    fn test_corrupted_file_returns_error() {
+        let dir = std::env::temp_dir().join(format!("corrupt_test_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("baselines.dat");
+        std::fs::write(&path, b"this is not valid json").unwrap();
+
+        let persistence = FileBaselinePersistence::new(path, b"key".to_vec());
+        let result = persistence.load();
+        assert!(result.is_err(), "corrupted file should return error");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_missing_file_returns_empty() {
+        let path = std::env::temp_dir().join(format!("nonexistent_{}.dat", Uuid::new_v4()));
+        let persistence = FileBaselinePersistence::new(path, b"key".to_vec());
+        let result = persistence.load().unwrap();
+        assert!(result.is_empty(), "missing file should return empty map");
+    }
+
+    // -- Zeroize on shutdown --
+
+    #[test]
+    fn test_zeroize_clears_all_data() {
+        let store = BaselineStore::new();
+        let user = Uuid::new_v4();
+        let signals = RiskSignals {
+            device_attestation_age_secs: 0.0,
+            geo_velocity_kmh: 0.0,
+            is_unusual_network: false,
+            is_unusual_time: false,
+            unusual_access_score: 0.0,
+            recent_failed_attempts: 0,
+            login_hour: Some(10),
+            network_id: Some("AS1234".to_string()),
+            session_duration_secs: Some(300.0),
+        };
+        store.update_baseline(user, &signals);
+        assert!(store.get_baseline(&user).is_some());
+
+        store.zeroize();
+        assert!(store.get_baseline(&user).is_none());
+        assert!(store.lww_snapshot().is_empty());
     }
 }

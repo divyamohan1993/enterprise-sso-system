@@ -406,7 +406,7 @@ async fn test_sso_single_login_multiple_portals() {
     let _pq_vk = test_pq_vk();
     // 1. Boot full auth system
     let mut store = CredentialStore::new();
-    store.register_with_password("alice", b"password123");
+    store.register_with_password("alice", b"password123").unwrap();
     let (gateway_addr, group_key, pq_vk) = boot_full_system(store).await;
 
     // 2. Alice authenticates ONCE (with DPoP key return)
@@ -481,8 +481,8 @@ async fn test_sso_different_users_different_tokens_same_portals() {
     let _pq_vk = test_pq_vk();
     // 1. Register alice and bob
     let mut store = CredentialStore::new();
-    store.register_with_password("alice", b"alice_pass");
-    store.register_with_password("bob", b"bob_pass");
+    store.register_with_password("alice", b"alice_pass").unwrap();
+    store.register_with_password("bob", b"bob_pass").unwrap();
     let (gateway_addr, group_key, pq_vk) = boot_full_system(store).await;
 
     // 2. Both authenticate (separate ceremonies) with DPoP keys
@@ -585,7 +585,7 @@ async fn test_attack_stolen_token_used_at_different_portal() {
     let _pq_vk = test_pq_vk();
     // Get token for alice via full ceremony
     let mut store = CredentialStore::new();
-    store.register_with_password("alice", b"password123");
+    store.register_with_password("alice", b"password123").unwrap();
     let (gateway_addr, group_key, pq_vk) = boot_full_system(store).await;
 
     let (resp, dpop_key) = client_auth_with_dpop(&gateway_addr, "alice", b"password123").await;

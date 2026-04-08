@@ -416,11 +416,24 @@ fn decrypt_normal(key: &[u8; 32], payload: &[u8], aad: &[u8]) -> Result<Vec<u8>,
 // Elevated (level 1): AEGIS-256 + HMAC-SHA512 double-auth tag
 // ---------------------------------------------------------------------------
 
+/// Derive a dedicated HMAC key from the encryption key via HKDF-SHA512.
+///
+/// This ensures the HMAC key is domain-separated from the encryption key,
+/// preventing key reuse across different cryptographic operations.
+fn derive_hmac_key(encryption_key: &[u8; 32]) -> Result<[u8; 64], String> {
+    let hk = Hkdf::<Sha512>::new(None, encryption_key);
+    let mut hmac_key = [0u8; 64];
+    hk.expand(b"MILNET-ADAPTIVE-HMAC-v1", &mut hmac_key)
+        .map_err(|e| format!("HKDF-SHA512 HMAC key derivation failed: {e}"))?;
+    Ok(hmac_key)
+}
+
 fn encrypt_elevated(key: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, String> {
     let ciphertext = encrypt_aegis256(key, plaintext, aad)?;
 
-    // Append HMAC-SHA512(key, ciphertext) as an extra authentication tag.
-    let mut mac = <Hmac::<Sha512> as Mac>::new_from_slice(key)
+    // Derive a separate HMAC key instead of reusing the encryption key.
+    let hmac_key = derive_hmac_key(key)?;
+    let mut mac = <Hmac::<Sha512> as Mac>::new_from_slice(&hmac_key)
         .map_err(|e| format!("HMAC-SHA512 key error: {e}"))?;
     mac.update(&ciphertext);
     let hmac_tag = mac.finalize().into_bytes();
@@ -440,8 +453,9 @@ fn decrypt_elevated(key: &[u8; 32], payload: &[u8], aad: &[u8]) -> Result<Vec<u8
     let ciphertext = payload.get(..split).ok_or("elevated: ciphertext slice OOB")?;
     let stored_tag = payload.get(split..).ok_or("elevated: tag slice OOB")?;
 
-    // Verify HMAC before decryption (encrypt-then-MAC).
-    let mut mac = <Hmac::<Sha512> as Mac>::new_from_slice(key)
+    // Derive the same separate HMAC key for verification.
+    let hmac_key = derive_hmac_key(key)?;
+    let mut mac = <Hmac::<Sha512> as Mac>::new_from_slice(&hmac_key)
         .map_err(|e| format!("HMAC-SHA512 key error: {e}"))?;
     mac.update(ciphertext);
     mac.verify_slice(stored_tag)
@@ -833,5 +847,33 @@ mod tests {
         assert_ne!(k1, k2, "layer keys must be distinct");
         assert_ne!(k1, k3, "layer keys must be distinct");
         assert_ne!(k2, k3, "layer keys must be distinct");
+    }
+
+    #[test]
+    fn test_derive_hmac_key_differs_from_encryption_key() {
+        let enc_key = random_key();
+        let hmac_key = derive_hmac_key(&enc_key).expect("derive_hmac_key");
+        // HMAC key (64 bytes) must not be a prefix of/equal to the encryption key
+        assert_ne!(&hmac_key[..32], &enc_key[..], "HMAC key must differ from encryption key");
+    }
+
+    #[test]
+    fn test_derive_hmac_key_deterministic() {
+        let enc_key = random_key();
+        let k1 = derive_hmac_key(&enc_key).expect("derive_hmac_key");
+        let k2 = derive_hmac_key(&enc_key).expect("derive_hmac_key");
+        assert_eq!(k1, k2, "same input must produce same HMAC key");
+    }
+
+    #[test]
+    fn test_elevated_separate_hmac_key_roundtrip() {
+        let ac = AdaptiveCrypto::new();
+        ac.escalate_immediate(CryptoThreatLevel::Elevated);
+        let key = random_key();
+        let pt = b"separate hmac key test payload";
+        let aad = b"aad-hmac-sep";
+        let sealed = ac.encrypt_adaptive(&key, pt, aad).expect("encrypt");
+        let recovered = ac.decrypt_adaptive(&key, &sealed, aad).expect("decrypt");
+        assert_eq!(recovered.as_slice(), pt);
     }
 }

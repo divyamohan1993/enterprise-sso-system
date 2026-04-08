@@ -139,8 +139,8 @@ fn test_credential_stuffing_defense() {
     // Simulate a breached credential list with various usernames.
     // The system must not leak which usernames are valid.
     let mut store = opaque::store::CredentialStore::new();
-    store.register_with_password("real_user_alpha", b"correct_alpha_pass");
-    store.register_with_password("real_user_beta", b"correct_beta_pass");
+    store.register_with_password("real_user_alpha", b"correct_alpha_pass").unwrap();
+    store.register_with_password("real_user_beta", b"correct_beta_pass").unwrap();
 
     // Breached credential list — mix of valid and invalid usernames
     let breached_usernames: Vec<&str> = vec![

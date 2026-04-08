@@ -20,7 +20,7 @@ const SIGNING_KEY: [u8; 64] = [0x42u8; 64];
 #[test]
 fn register_with_password_creates_valid_record() {
     let mut store = CredentialStore::new();
-    let user_id = store.register_with_password("alice", b"correct-horse-battery-staple");
+    let user_id = store.register_with_password("alice", b"correct-horse-battery-staple").unwrap();
 
     // The store should have the user
     assert!(store.user_exists("alice"));
@@ -37,7 +37,7 @@ fn register_with_password_creates_valid_record() {
 fn stored_registration_contains_no_password_info() {
     let mut store = CredentialStore::new();
     let password = b"super-secret-password-12345";
-    store.register_with_password("alice", password);
+    store.register_with_password("alice", password).unwrap();
 
     // Get the raw registration bytes
     let (reg, _) = store.get_registration("alice").unwrap();
@@ -99,7 +99,7 @@ fn full_registration_flow_step_by_step() {
 fn full_login_flow_succeeds_with_correct_password() {
     let mut store = CredentialStore::new();
     let password = b"correct-horse-battery-staple";
-    let user_id = store.register_with_password("alice", password);
+    let user_id = store.register_with_password("alice", password).unwrap();
 
     let mut rng = OsRng;
     let ceremony_session_id = [0xAA; 32];
@@ -165,7 +165,7 @@ fn full_login_flow_succeeds_with_correct_password() {
 #[test]
 fn login_fails_with_wrong_password() {
     let mut store = CredentialStore::new();
-    store.register_with_password("bob", b"real-password");
+    store.register_with_password("bob", b"real-password").unwrap();
 
     let mut rng = OsRng;
 
@@ -223,7 +223,7 @@ fn login_unknown_user_does_not_leak_existence() {
 fn receipt_has_correct_fields() {
     let mut store = CredentialStore::new();
     let password = b"field-test-pw";
-    let user_id = store.register_with_password("diana", password);
+    let user_id = store.register_with_password("diana", password).unwrap();
 
     let mut rng = OsRng;
     let session_id = [0xCC; 32];
@@ -278,7 +278,7 @@ fn receipt_has_correct_fields() {
 fn client_and_server_agree_on_session_key() {
     let mut store = CredentialStore::new();
     let password = b"session-key-test";
-    let _user_id = store.register_with_password("eve", password);
+    let _user_id = store.register_with_password("eve", password).unwrap();
 
     let mut rng = OsRng;
 
@@ -383,7 +383,7 @@ fn test_opaque_ksf_migration() {
         let password = b"migration-test-password";
 
         // Register under Argon2id (non-FIPS)
-        let user_id = store.register_with_password("legacy_bob", password);
+        let user_id = store.register_with_password("legacy_bob", password).unwrap();
 
         assert_eq!(
             store.get_ksf_algorithm("legacy_bob"),
@@ -418,7 +418,7 @@ fn test_opaque_adaptive_verify() {
         let mut store = CredentialStore::new_dual();
 
         // Register two users under different cipher suites
-        store.register_with_password("argon2_user", b"pw1");
+        store.register_with_password("argon2_user", b"pw1").unwrap();
         store
             .register_with_password_fips("fips_user", b"pw2")
             .expect("FIPS registration");

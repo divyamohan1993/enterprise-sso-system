@@ -143,7 +143,12 @@ jobs:
       # Validate SBOMs against known vulnerability databases
       - name: Install grype for SBOM vulnerability scanning
         run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+          GRYPE_VERSION="0.87.0"
+          GRYPE_SHA256="3622b817440ec21d54b8a4e89ad11703937cb0e0e09c2e2a40f6a861939b3072"
+          curl -sSfL -o grype.tar.gz "https://github.com/anchore/grype/releases/download/v${GRYPE_VERSION}/grype_${GRYPE_VERSION}_linux_amd64.tar.gz"
+          echo "${GRYPE_SHA256}  grype.tar.gz" | sha256sum -c -
+          tar -xzf grype.tar.gz -C /usr/local/bin grype
+          rm grype.tar.gz
       - name: Scan CycloneDX SBOM for vulnerabilities
         run: grype sbom:sbom-cyclonedx.json --fail-on critical
       - name: Scan SPDX SBOM for vulnerabilities
@@ -206,6 +211,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: [check, security, sbom]
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
     permissions:
       contents: read
       packages: write
@@ -274,7 +281,12 @@ jobs:
       # Generate SBOM for container image and attach it
       - name: Install syft for container SBOM
         run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          SYFT_VERSION="1.19.0"
+          SYFT_SHA256="b9fee431b498e389173c7202e98f83e839a5c191c498738771b1af0e36e7ade3"
+          curl -sSfL -o syft.tar.gz "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_amd64.tar.gz"
+          echo "${SYFT_SHA256}  syft.tar.gz" | sha256sum -c -
+          tar -xzf syft.tar.gz -C /usr/local/bin syft
+          rm syft.tar.gz
       - name: Generate and attach container SBOM
         run: |
           IMAGE_REF="ghcr.io/${{ github.repository }}/${{ matrix.service }}@${{ steps.build.outputs.digest }}"

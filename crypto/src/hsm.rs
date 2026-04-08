@@ -34,7 +34,7 @@
 //! Since this crate does not link against PKCS#11, AWS SDK, or tss-esapi
 //! at compile time, the backends implement a complete trait-based abstraction
 //! (`HsmKeyOps`) that performs real cryptographic operations using the
-//! primitives available in this crate (AES-256-GCM, HKDF-SHA512, HMAC-SHA256).
+//! primitives available in this crate (AES-256-GCM, HKDF-SHA512, HMAC-SHA512).
 //!
 //! - **PKCS#11**: Derives a session-bound root key from the library path + slot +
 //!   PIN via HKDF, then stores all generated keys sealed under that root.
@@ -692,7 +692,7 @@ impl KeyStore {
 ///   (mirroring `C_Initialize` + `C_OpenSession` + `C_Login`)
 /// - Key generation stores keys sealed under the session root
 ///   (mirroring `C_GenerateKey` with `CKA_SENSITIVE=true, CKA_EXTRACTABLE=false`)
-/// - Sign/verify use HMAC-SHA256 (mirroring `CKM_SHA256_HMAC`)
+/// - Sign/verify use HMAC-SHA512 (mirroring `CKM_SHA512_HMAC`)
 /// - Encrypt/decrypt use AES-256-GCM (mirroring `CKM_AES_GCM`)
 /// - Wrap/unwrap use AES-256-GCM with key-specific AAD (mirroring `CKM_AES_KEY_WRAP_KWP`)
 ///
@@ -1263,7 +1263,7 @@ impl Tpm2Session {
     /// - Nonce (32 bytes, caller-provided or random)
     /// - PCR selection (sorted indices, 1 byte each, terminated by 0xFF)
     /// - PCR values (32 bytes each, in index order)
-    /// - HMAC-SHA256 signature over all above fields
+    /// - HMAC-SHA512 signature over all above fields
     fn generate_attestation_quote(&self, nonce: &[u8; 32]) -> Result<Vec<u8>, HsmError> {
         let mut quote_data = Vec::new();
 
@@ -1288,12 +1288,12 @@ impl Tpm2Session {
         }
 
         // Sign with the SRK-derived attestation key
-        let mut attest_key = [0u8; 32];
+        let mut attest_key = [0u8; 64];
         let hk = Hkdf::<Sha512>::new(Some(b"MILNET-HSM-SESSION-SALT-v1"), &self.srk_handle);
         hk.expand(b"tpm2-attestation-key", &mut attest_key)
-            .expect("HKDF-SHA512 expand for 32 bytes is infallible (32 < 255*64=16320)");
+            .expect("HKDF-SHA512 expand for 64 bytes is infallible (64 < 255*64=16320)");
 
-        let mut mac = <Hmac<Sha256> as HmacMac>::new_from_slice(&attest_key)
+        let mut mac = <Hmac<Sha512> as HmacMac>::new_from_slice(&attest_key)
             .map_err(|_| HsmError::SigningFailed("HMAC key creation failed".into()))?;
         mac.update(&quote_data);
         let signature = mac.finalize().into_bytes();
@@ -1368,15 +1368,12 @@ impl HsmKeyOps for Tpm2Session {
 // ---------------------------------------------------------------------------
 
 /// Constant-time byte slice comparison to prevent timing side channels.
+///
+/// Delegates to `crate::ct::ct_eq` which never short-circuits on length
+/// mismatch, closing the timing oracle that the previous hand-rolled
+/// implementation exposed.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    crate::ct::ct_eq(a, b)
 }
 
 // ---------------------------------------------------------------------------
@@ -2235,9 +2232,9 @@ impl HsmKeyManager {
     /// Sign data using an HSM-resident signing key.
     ///
     /// The private key never leaves the HSM. The HSM performs the signature
-    /// operation internally using HMAC-SHA256.
+    /// operation internally using HMAC-SHA512.
     ///
-    /// For PKCS#11: `C_Sign` with `CKM_SHA256_HMAC`
+    /// For PKCS#11: `C_Sign` with `CKM_SHA512_HMAC`
     /// For AWS KMS: `kms.sign(KeyId, Message, SigningAlgorithm)`
     /// For TPM2: `TPM2_Sign` with the SRK-derived signing key
     pub fn sign_with_hardware(
@@ -2266,8 +2263,8 @@ impl HsmKeyManager {
                     .load_key(signing_key_label)
                     .or_else(|_| session.key_store.load_key(&session.key_label))?;
 
-                // HMAC-SHA256 sign (mirrors CKM_SHA256_HMAC)
-                let mut mac = <Hmac<Sha256> as HmacMac>::new_from_slice(&key_material)
+                // HMAC-SHA512 sign (mirrors CKM_SHA512_HMAC)
+                let mut mac = <Hmac<Sha512> as HmacMac>::new_from_slice(&key_material)
                     .map_err(|_| HsmError::SigningFailed("HMAC key creation failed".into()))?;
                 mac.update(data);
                 let signature = mac.finalize().into_bytes().to_vec();
@@ -2283,13 +2280,13 @@ impl HsmKeyManager {
                 );
 
                 // Derive a signing key from the KMS root
-                let mut signing_key = [0u8; 32];
+                let mut signing_key = [0u8; 64];
                 let hk = Hkdf::<Sha512>::new(Some(b"MILNET-HSM-SESSION-SALT-v1"), &session.key_store.root_key);
                 let info = format!("aws-kms-sign:{}", signing_key_label);
                 hk.expand(info.as_bytes(), &mut signing_key)
                     .map_err(|_| HsmError::SigningFailed("HKDF expansion failed".into()))?;
 
-                let mut mac = <Hmac<Sha256> as HmacMac>::new_from_slice(&signing_key)
+                let mut mac = <Hmac<Sha512> as HmacMac>::new_from_slice(&signing_key)
                     .map_err(|_| HsmError::SigningFailed("HMAC key creation failed".into()))?;
                 mac.update(data);
                 let signature = mac.finalize().into_bytes().to_vec();
@@ -2305,13 +2302,13 @@ impl HsmKeyManager {
                 );
 
                 // Derive a signing key from the SRK
-                let mut signing_key = [0u8; 32];
+                let mut signing_key = [0u8; 64];
                 let hk = Hkdf::<Sha512>::new(Some(b"MILNET-HSM-SESSION-SALT-v1"), &session.srk_handle);
                 let info = format!("tpm2-sign:{}", signing_key_label);
                 hk.expand(info.as_bytes(), &mut signing_key)
                     .map_err(|_| HsmError::SigningFailed("HKDF expansion failed".into()))?;
 
-                let mut mac = <Hmac<Sha256> as HmacMac>::new_from_slice(&signing_key)
+                let mut mac = <Hmac<Sha512> as HmacMac>::new_from_slice(&signing_key)
                     .map_err(|_| HsmError::SigningFailed("HMAC key creation failed".into()))?;
                 mac.update(data);
                 let signature = mac.finalize().into_bytes().to_vec();
@@ -2480,7 +2477,7 @@ impl HsmKeyOps for HsmKeyManager {
 
         let (_key_type, mut key_material) = key_store.load_key(key_id)?;
 
-        let mut mac = <Hmac<Sha256> as HmacMac>::new_from_slice(&key_material)
+        let mut mac = <Hmac<Sha512> as HmacMac>::new_from_slice(&key_material)
             .map_err(|_| HsmError::SigningFailed("HMAC key creation failed".into()))?;
         mac.update(data);
         let signature = mac.finalize().into_bytes().to_vec();
@@ -2510,7 +2507,7 @@ impl HsmKeyOps for HsmKeyManager {
 
         let (_key_type, mut key_material) = key_store.load_key(key_id)?;
 
-        let mut mac = <Hmac<Sha256> as HmacMac>::new_from_slice(&key_material)
+        let mut mac = <Hmac<Sha512> as HmacMac>::new_from_slice(&key_material)
             .map_err(|_| HsmError::SigningFailed("HMAC verification key creation failed".into()))?;
         mac.update(data);
 
@@ -3095,7 +3092,7 @@ mod pkcs11_hw {
             Ok(handle_bytes)
         }
 
-        /// C_SignInit(CKM_SHA256_HMAC) + C_Sign.
+        /// C_SignInit(CKM_SHA512_HMAC) + C_Sign.
         fn sign(&self, key_id: &str, data: &[u8]) -> Result<Vec<u8>, HsmError> {
             let handle = self
                 .find_key_by_label(key_id)?
@@ -3106,13 +3103,13 @@ mod pkcs11_hw {
             })?;
 
             let signature = session
-                .sign(&Mechanism::Sha256Hmac, handle, data)
+                .sign(&Mechanism::Sha512Hmac, handle, data)
                 .map_err(|e| HsmError::SigningFailed(format!("C_Sign({key_id}): {e}")))?;
 
             Ok(signature)
         }
 
-        /// C_VerifyInit(CKM_SHA256_HMAC) + C_Verify.
+        /// C_VerifyInit(CKM_SHA512_HMAC) + C_Verify.
         fn verify(
             &self,
             key_id: &str,
@@ -3127,7 +3124,7 @@ mod pkcs11_hw {
                 HsmError::CommunicationError("session mutex poisoned".into())
             })?;
 
-            match session.verify(&Mechanism::Sha256Hmac, handle, data, signature) {
+            match session.verify(&Mechanism::Sha512Hmac, handle, data, signature) {
                 Ok(()) => Ok(true),
                 Err(cryptoki::error::Error::Pkcs11(
                     cryptoki::error::RvError::SignatureInvalid, _,
@@ -3769,7 +3766,7 @@ mod tests {
 
         let data = b"data-to-sign-with-pkcs11";
         let sig = manager.sign_with_hardware(data, "signing-key").unwrap();
-        assert_eq!(sig.len(), 32); // HMAC-SHA256 output
+        assert_eq!(sig.len(), 64); // HMAC-SHA512 output
     }
 
     #[test]
@@ -3940,7 +3937,7 @@ mod tests {
         let nonce = [42u8; 32];
         let quote = manager.generate_attestation_quote(&nonce).unwrap();
         // Quote should contain: nonce(32) + pcr_selection(5 bytes: 4 indices + 0xFF terminator)
-        // + pcr_values(4 * 32 = 128) + hmac_signature(32) = 197 bytes
+        // + pcr_values(4 * 32 = 128) + hmac_signature(64) = 229 bytes
         assert!(quote.len() > 100);
         // Verify nonce is at the start
         assert_eq!(&quote[..32], &nonce);
@@ -3964,7 +3961,7 @@ mod tests {
         // Sign data
         let data = b"hello, world!";
         let sig = manager.sign("test-hmac-key", data).unwrap();
-        assert_eq!(sig.len(), 32);
+        assert_eq!(sig.len(), 64);
 
         // Verify should succeed with correct data
         assert!(manager.verify("test-hmac-key", data, &sig).unwrap());
@@ -4110,6 +4107,23 @@ mod tests {
         assert!(HsmBackend::AwsKms.is_hardware_backed());
         assert!(HsmBackend::Tpm2.is_hardware_backed());
         assert!(!HsmBackend::Software.is_hardware_backed());
+    }
+
+    #[test]
+    fn constant_time_eq_delegates_to_ct_module() {
+        // Length mismatch must not leak via early return timing
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(constant_time_eq(b"same", b"same"));
+        assert!(!constant_time_eq(b"aaaa", b"aaab"));
+    }
+
+    #[test]
+    fn hmac_sha512_signature_length() {
+        let manager = make_pkcs11_manager();
+        let data = b"hmac-sha512-length-check";
+        let sig = manager.sign_with_hardware(data, "hmac512-key").unwrap();
+        assert_eq!(sig.len(), 64, "HMAC-SHA512 must produce 64-byte signatures");
     }
 
     #[test]

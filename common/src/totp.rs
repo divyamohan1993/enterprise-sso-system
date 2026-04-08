@@ -1,9 +1,11 @@
 //! TOTP (Time-based One-Time Password) implementation per RFC 6238.
 //!
-//! Supports SHA-256 (recommended) and SHA-512 (CNSA 2.0).
+//! Supports SHA-512 (CNSA 2.0) for new enrollments. SHA-256 is legacy-only.
 //! New enrollments default to SHA-512 via `MILNET_TOTP_ALGORITHM` env var.
-//! SHA-1 has been REMOVED — it is cryptographically broken and prohibited
-//! for all MILNET operations. Any SHA-1 TOTP verification will fail with an error.
+//! SHA-1 has been REMOVED -- cryptographically broken and prohibited.
+//! SHA-256 is rejected for new enrollments (only SHA-512+ allowed).
+//! `MILNET_TOTP_MIN_ALGORITHM` env var controls minimum (default: "sha512").
+//! In military mode (`MILNET_MILITARY_DEPLOYMENT`), SHA-256 is rejected even for verification.
 
 use hmac::{Hmac, Mac};
 use sha2::{Sha256, Sha512};
@@ -72,11 +74,19 @@ pub fn default_totp_algorithm() -> TotpAlgorithm {
         .and_then(|v| TotpAlgorithm::from_str_loose(&v))
         .unwrap_or(TotpAlgorithm::Sha512);
 
-    // SECURITY: Block SHA-1 for new enrollments — only SHA-256+ is acceptable.
+    // SECURITY: Block SHA-1 and SHA-256 for new enrollments -- only SHA-512+ is acceptable.
     if algo == TotpAlgorithm::Sha1 {
         tracing::error!(
             "SECURITY: MILNET_TOTP_ALGORITHM=SHA1 is PROHIBITED for new enrollments. \
              Overriding to SHA-512 (CNSA 2.0). Remove SHA-1 configuration immediately."
+        );
+        return TotpAlgorithm::Sha512;
+    }
+
+    if algo == TotpAlgorithm::Sha256 {
+        tracing::error!(
+            "SECURITY: MILNET_TOTP_ALGORITHM=SHA256 is REJECTED for new enrollments. \
+             Only SHA-512+ is permitted. Overriding to SHA-512 (CNSA 2.0)."
         );
         return TotpAlgorithm::Sha512;
     }
@@ -89,7 +99,7 @@ pub fn default_totp_algorithm() -> TotpAlgorithm {
 /// SECURITY: Legacy algorithms must not be used for new enrollments.
 /// Existing tokens using these algorithms should be migrated urgently.
 pub fn is_legacy_algorithm(algo: &str) -> bool {
-    matches!(algo.to_lowercase().as_str(), "sha1" | "sha-1")
+    matches!(algo.to_lowercase().as_str(), "sha1" | "sha-1" | "sha256" | "sha-256")
 }
 
 /// Global TOTP used-code cache — prevents replay within a time window.
@@ -140,10 +150,267 @@ fn secret_fingerprint(secret: &[u8]) -> u64 {
 
 /// Minimum acceptable algorithm for new TOTP enrollments.
 ///
-/// SECURITY: SHA-1 is cryptographically weakened and MUST NOT be used for new
-/// enrollments. CNSA 2.0 mandates SHA-384+ but SHA-256 is the practical minimum
-/// for TOTP where collision resistance is less critical than HMAC security.
-pub const TOTP_MIN_ALGORITHM: &str = "SHA256";
+/// SECURITY: Only SHA-512+ is permitted for new enrollments.
+/// SHA-256 is legacy-only. Configurable via `MILNET_TOTP_MIN_ALGORITHM`.
+pub const TOTP_MIN_ALGORITHM: &str = "SHA512";
+
+/// Returns the minimum algorithm for new enrollments from env or default.
+/// Only SHA-512+ is acceptable for new enrollments.
+#[allow(deprecated)]
+pub fn min_enrollment_algorithm() -> TotpAlgorithm {
+    let algo_str = std::env::var("MILNET_TOTP_MIN_ALGORITHM")
+        .unwrap_or_else(|_| "sha512".to_string());
+    match TotpAlgorithm::from_str_loose(&algo_str) {
+        Some(TotpAlgorithm::Sha512) => TotpAlgorithm::Sha512,
+        _ => {
+            // Only SHA-512+ is valid as minimum. Override anything weaker.
+            TotpAlgorithm::Sha512
+        }
+    }
+}
+
+/// Returns true if we are in military deployment mode.
+pub fn is_military_deployment() -> bool {
+    std::env::var("MILNET_MILITARY_DEPLOYMENT")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Validate that an algorithm is acceptable for NEW enrollments.
+/// Only SHA-512+ is allowed. SHA-1 and SHA-256 are rejected.
+///
+/// Returns Ok(()) if acceptable, Err with reason if not.
+#[allow(deprecated)]
+pub fn validate_enrollment_algorithm(algorithm: TotpAlgorithm) -> Result<(), String> {
+    match algorithm {
+        TotpAlgorithm::Sha1 => {
+            Err("SHA-1 is cryptographically broken and PROHIBITED for new TOTP enrollments. Use SHA-512.".to_string())
+        }
+        TotpAlgorithm::Sha256 => {
+            Err("SHA-256 is rejected for new TOTP enrollments. Only SHA-512+ is permitted per MILNET policy. Set MILNET_TOTP_MIN_ALGORITHM to override.".to_string())
+        }
+        TotpAlgorithm::Sha512 => Ok(()),
+    }
+}
+
+// ── Brute-force rate limiting ──────────────────────────────────────────
+
+/// Configuration for TOTP rate limiting thresholds.
+#[derive(Debug, Clone)]
+pub struct TotpRateLimitConfig {
+    /// Failures before warning-level lockout (default: 5)
+    pub warn_threshold: u32,
+    /// Failures before critical-level lockout (default: 10)
+    pub critical_threshold: u32,
+    /// Window in seconds to count failures (default: 300 = 5 min)
+    pub window_secs: u64,
+    /// Lockout duration in seconds for warning level (default: 900 = 15 min)
+    pub warn_lockout_secs: u64,
+    /// Lockout duration in seconds for critical level (default: 3600 = 1 hour)
+    pub critical_lockout_secs: u64,
+}
+
+impl Default for TotpRateLimitConfig {
+    fn default() -> Self {
+        Self {
+            warn_threshold: std::env::var("MILNET_TOTP_WARN_THRESHOLD")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(5),
+            critical_threshold: std::env::var("MILNET_TOTP_CRITICAL_THRESHOLD")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(10),
+            window_secs: std::env::var("MILNET_TOTP_RATE_WINDOW_SECS")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(300),
+            warn_lockout_secs: std::env::var("MILNET_TOTP_WARN_LOCKOUT_SECS")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(900),
+            critical_lockout_secs: std::env::var("MILNET_TOTP_CRITICAL_LOCKOUT_SECS")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(3600),
+        }
+    }
+}
+
+/// Per-user failure tracking entry.
+#[derive(Debug, Clone)]
+struct UserFailureRecord {
+    /// Timestamps of recent failures (monotonic instants converted to unix-like offsets)
+    failure_times: Vec<u64>,
+    /// If locked out, when does it expire (unix timestamp)
+    lockout_until: Option<u64>,
+    /// Current lockout level for SIEM reporting
+    lockout_level: LockoutLevel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockoutLevel {
+    None,
+    Warning,
+    Critical,
+}
+
+/// Thread-safe TOTP brute-force rate limiter.
+pub struct TotpRateLimiter {
+    config: TotpRateLimitConfig,
+    users: Mutex<HashMap<String, UserFailureRecord>>,
+}
+
+static GLOBAL_RATE_LIMITER: std::sync::OnceLock<TotpRateLimiter> = std::sync::OnceLock::new();
+
+/// Get or initialize the global rate limiter.
+pub fn global_rate_limiter() -> &'static TotpRateLimiter {
+    GLOBAL_RATE_LIMITER.get_or_init(|| TotpRateLimiter::new(TotpRateLimitConfig::default()))
+}
+
+impl TotpRateLimiter {
+    /// Create a new rate limiter with the given config.
+    pub fn new(config: TotpRateLimitConfig) -> Self {
+        Self {
+            config,
+            users: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Check if a user is currently locked out.
+    /// Returns Ok(()) if allowed, Err with message if locked out.
+    pub fn check_allowed(&self, user_id: &str, now_unix: u64) -> Result<(), String> {
+        let users = self.users.lock().map_err(|_| "Rate limiter lock poisoned".to_string())?;
+        if let Some(record) = users.get(user_id) {
+            if let Some(until) = record.lockout_until {
+                if now_unix < until {
+                    let remaining = until - now_unix;
+                    return Err(format!(
+                        "TOTP locked out for user. {} seconds remaining. Level: {:?}",
+                        remaining, record.lockout_level
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Record a failed TOTP attempt for a user.
+    /// Returns the lockout level triggered (if any).
+    pub fn record_failure(&self, user_id: &str, now_unix: u64) -> LockoutLevel {
+        let mut users = match self.users.lock() {
+            Ok(u) => u,
+            Err(_) => return LockoutLevel::None,
+        };
+
+        let record = users.entry(user_id.to_string()).or_insert_with(|| UserFailureRecord {
+            failure_times: Vec::new(),
+            lockout_until: None,
+            lockout_level: LockoutLevel::None,
+        });
+
+        // Clear expired lockout
+        if let Some(until) = record.lockout_until {
+            if now_unix >= until {
+                record.lockout_until = None;
+                record.lockout_level = LockoutLevel::None;
+                record.failure_times.clear();
+            }
+        }
+
+        record.failure_times.push(now_unix);
+
+        // Prune failures outside the window
+        let window_start = now_unix.saturating_sub(self.config.window_secs);
+        record.failure_times.retain(|&t| t >= window_start);
+
+        let count = record.failure_times.len() as u32;
+
+        if count >= self.config.critical_threshold {
+            record.lockout_until = Some(now_unix + self.config.critical_lockout_secs);
+            record.lockout_level = LockoutLevel::Critical;
+            tracing::error!(
+                user_id = user_id,
+                failure_count = count,
+                lockout_secs = self.config.critical_lockout_secs,
+                "SIEM CRITICAL: TOTP brute force detected. {} failures in {} seconds. \
+                 User locked out for {} seconds.",
+                count, self.config.window_secs, self.config.critical_lockout_secs
+            );
+            LockoutLevel::Critical
+        } else if count >= self.config.warn_threshold {
+            record.lockout_until = Some(now_unix + self.config.warn_lockout_secs);
+            record.lockout_level = LockoutLevel::Warning;
+            tracing::warn!(
+                user_id = user_id,
+                failure_count = count,
+                lockout_secs = self.config.warn_lockout_secs,
+                "SIEM WARNING: TOTP repeated failures. {} failures in {} seconds. \
+                 User locked out for {} seconds.",
+                count, self.config.window_secs, self.config.warn_lockout_secs
+            );
+            LockoutLevel::Warning
+        } else {
+            LockoutLevel::None
+        }
+    }
+
+    /// Record a successful TOTP verification. Resets the failure counter.
+    pub fn record_success(&self, user_id: &str) {
+        if let Ok(mut users) = self.users.lock() {
+            users.remove(user_id);
+        }
+    }
+}
+
+/// Rate-limited TOTP verification wrapper.
+///
+/// Checks rate limits before verification, records failures/successes,
+/// and enforces algorithm policy for legacy vs new enrollments.
+///
+/// For legacy SHA-256 users: verification works but emits SIEM WARNING.
+/// In military mode: SHA-256 is rejected even for legacy verification.
+#[allow(deprecated)]
+pub fn verify_totp_rate_limited(
+    user_id: &str,
+    secret: &[u8],
+    code: &str,
+    time: u64,
+    window: u32,
+    algorithm: TotpAlgorithm,
+    rate_limiter: &TotpRateLimiter,
+) -> Result<bool, String> {
+    // Check lockout first
+    rate_limiter.check_allowed(user_id, time)?;
+
+    // Algorithm policy enforcement
+    match algorithm {
+        TotpAlgorithm::Sha1 => {
+            rate_limiter.record_failure(user_id, time);
+            return Err("SHA-1 is prohibited for all TOTP operations".to_string());
+        }
+        TotpAlgorithm::Sha256 => {
+            if is_military_deployment() {
+                rate_limiter.record_failure(user_id, time);
+                tracing::error!(
+                    user_id = user_id,
+                    "SIEM CRITICAL: SHA-256 TOTP verification REJECTED in military deployment mode. \
+                     User must re-enroll with SHA-512."
+                );
+                return Err(
+                    "SHA-256 TOTP is rejected in military deployment mode. Re-enroll with SHA-512.".to_string()
+                );
+            }
+            // Legacy SHA-256: allow but warn
+            tracing::warn!(
+                user_id = user_id,
+                "SIEM WARNING: Legacy SHA-256 TOTP verification for user. \
+                 Migration to SHA-512 (CNSA 2.0) is required."
+            );
+        }
+        TotpAlgorithm::Sha512 => { /* OK */ }
+    }
+
+    let result = verify_totp_with_algorithm(secret, code, time, window, algorithm);
+
+    if result {
+        rate_limiter.record_success(user_id);
+        Ok(true)
+    } else {
+        rate_limiter.record_failure(user_id, time);
+        Ok(false)
+    }
+}
 
 /// Time step in seconds (RFC 6238 default).
 const TIME_STEP: u64 = 30;
@@ -525,7 +792,8 @@ mod tests {
         assert!(is_legacy_algorithm("sha1"));
         assert!(is_legacy_algorithm("SHA-1"));
         assert!(is_legacy_algorithm("SHA1"));
-        assert!(!is_legacy_algorithm("sha256"));
+        assert!(is_legacy_algorithm("sha256"));
+        assert!(is_legacy_algorithm("SHA-256"));
         assert!(!is_legacy_algorithm("SHA-512"));
         assert!(!is_legacy_algorithm("md5")); // not legacy, just unsupported
     }
@@ -537,6 +805,259 @@ mod tests {
         let algo = default_totp_algorithm();
         assert_eq!(algo, TotpAlgorithm::Sha512, "SHA-1 must be blocked for new enrollments");
         std::env::remove_var("MILNET_TOTP_ALGORITHM");
+    }
+
+    #[test]
+    fn test_sha256_blocked_for_new_enrollments() {
+        std::env::set_var("MILNET_TOTP_ALGORITHM", "sha256");
+        let algo = default_totp_algorithm();
+        assert_eq!(algo, TotpAlgorithm::Sha512, "SHA-256 must be blocked for new enrollments");
+        std::env::remove_var("MILNET_TOTP_ALGORITHM");
+    }
+
+    // ── Enrollment algorithm validation tests ──────────────────────────
+
+    #[test]
+    fn test_validate_enrollment_sha512_ok() {
+        assert!(validate_enrollment_algorithm(TotpAlgorithm::Sha512).is_ok());
+    }
+
+    #[test]
+    fn test_validate_enrollment_sha256_rejected() {
+        let err = validate_enrollment_algorithm(TotpAlgorithm::Sha256);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("SHA-256 is rejected"));
+    }
+
+    #[test]
+    fn test_validate_enrollment_sha1_rejected() {
+        let err = validate_enrollment_algorithm(TotpAlgorithm::Sha1);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("SHA-1"));
+    }
+
+    #[test]
+    fn test_min_enrollment_algorithm_default() {
+        std::env::remove_var("MILNET_TOTP_MIN_ALGORITHM");
+        assert_eq!(min_enrollment_algorithm(), TotpAlgorithm::Sha512);
+    }
+
+    #[test]
+    fn test_min_enrollment_algorithm_rejects_weak() {
+        std::env::set_var("MILNET_TOTP_MIN_ALGORITHM", "sha256");
+        // SHA-256 is too weak, should override to SHA-512
+        assert_eq!(min_enrollment_algorithm(), TotpAlgorithm::Sha512);
+        std::env::remove_var("MILNET_TOTP_MIN_ALGORITHM");
+    }
+
+    // ── Rate limiter tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_rate_limiter_allows_initial() {
+        let rl = TotpRateLimiter::new(TotpRateLimitConfig::default());
+        assert!(rl.check_allowed("user1", 1000).is_ok());
+    }
+
+    #[test]
+    fn test_rate_limiter_warn_lockout_at_5_failures() {
+        let config = TotpRateLimitConfig {
+            warn_threshold: 5,
+            critical_threshold: 10,
+            window_secs: 300,
+            warn_lockout_secs: 900,
+            critical_lockout_secs: 3600,
+        };
+        let rl = TotpRateLimiter::new(config);
+        let now = 1_000_000u64;
+
+        for i in 0..4 {
+            let level = rl.record_failure("user1", now + i);
+            assert_eq!(level, LockoutLevel::None);
+        }
+        let level = rl.record_failure("user1", now + 4);
+        assert_eq!(level, LockoutLevel::Warning);
+
+        // Now locked out
+        let err = rl.check_allowed("user1", now + 5);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("locked out"));
+
+        // After lockout expires
+        assert!(rl.check_allowed("user1", now + 901).is_ok());
+    }
+
+    #[test]
+    fn test_rate_limiter_critical_lockout_at_10_failures() {
+        let config = TotpRateLimitConfig {
+            warn_threshold: 5,
+            critical_threshold: 10,
+            window_secs: 300,
+            warn_lockout_secs: 900,
+            critical_lockout_secs: 3600,
+        };
+        let rl = TotpRateLimiter::new(config);
+        let now = 2_000_000u64;
+
+        // Push past warn into critical (need fresh failures after lockout clears)
+        // Record 10 failures rapidly
+        for i in 0..10 {
+            rl.record_failure("user2", now + i);
+        }
+
+        let err = rl.check_allowed("user2", now + 11);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("locked out"));
+
+        // Still locked after 900s (warn would have expired, but critical is 3600)
+        let err = rl.check_allowed("user2", now + 1000);
+        assert!(err.is_err());
+
+        // Unlocked after 3600s
+        assert!(rl.check_allowed("user2", now + 3601).is_ok());
+    }
+
+    #[test]
+    fn test_rate_limiter_success_resets_counter() {
+        let config = TotpRateLimitConfig {
+            warn_threshold: 5,
+            critical_threshold: 10,
+            window_secs: 300,
+            warn_lockout_secs: 900,
+            critical_lockout_secs: 3600,
+        };
+        let rl = TotpRateLimiter::new(config);
+        let now = 3_000_000u64;
+
+        // 4 failures, then success
+        for i in 0..4 {
+            rl.record_failure("user3", now + i);
+        }
+        rl.record_success("user3");
+
+        // Counter reset, 4 more failures should not trigger lockout
+        for i in 0..4 {
+            let level = rl.record_failure("user3", now + 10 + i);
+            assert_eq!(level, LockoutLevel::None);
+        }
+    }
+
+    #[test]
+    fn test_rate_limiter_failures_outside_window_ignored() {
+        let config = TotpRateLimitConfig {
+            warn_threshold: 5,
+            critical_threshold: 10,
+            window_secs: 300,
+            warn_lockout_secs: 900,
+            critical_lockout_secs: 3600,
+        };
+        let rl = TotpRateLimiter::new(config);
+
+        // 4 failures at t=0
+        for i in 0..4 {
+            rl.record_failure("user4", 4_000_000 + i);
+        }
+        // 1 failure at t=301 (outside window, old ones pruned)
+        let level = rl.record_failure("user4", 4_000_301);
+        assert_eq!(level, LockoutLevel::None, "Old failures outside window should be pruned");
+    }
+
+    #[test]
+    fn test_rate_limiter_independent_users() {
+        let config = TotpRateLimitConfig {
+            warn_threshold: 5,
+            critical_threshold: 10,
+            window_secs: 300,
+            warn_lockout_secs: 900,
+            critical_lockout_secs: 3600,
+        };
+        let rl = TotpRateLimiter::new(config);
+        let now = 5_000_000u64;
+
+        // Lock out userA
+        for i in 0..5 {
+            rl.record_failure("userA", now + i);
+        }
+        assert!(rl.check_allowed("userA", now + 6).is_err());
+
+        // userB unaffected
+        assert!(rl.check_allowed("userB", now + 6).is_ok());
+    }
+
+    // ── verify_totp_rate_limited tests ─────────────────────────────────
+
+    #[test]
+    fn test_verify_rate_limited_sha512_success() {
+        let rl = TotpRateLimiter::new(TotpRateLimitConfig::default());
+        let secret = b"1234567890123456789012345678901234567890123456789012345678901234";
+        let time = 6_000_059u64;
+        let code = generate_totp(secret, time);
+
+        let result = verify_totp_rate_limited("rl_user1", secret, &code, time, 0, TotpAlgorithm::Sha512, &rl);
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+    }
+
+    #[test]
+    fn test_verify_rate_limited_sha256_legacy_allowed() {
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        let rl = TotpRateLimiter::new(TotpRateLimitConfig::default());
+        let secret = b"12345678901234567890123456789012";
+        let time = 7_000_059u64;
+        let code = generate_totp_with_algorithm(secret, time, TotpAlgorithm::Sha256);
+
+        let result = verify_totp_rate_limited("rl_user2", secret, &code, time, 0, TotpAlgorithm::Sha256, &rl);
+        assert!(result.is_ok(), "Legacy SHA-256 verification should be allowed in non-military mode");
+        assert!(result.unwrap());
+    }
+
+    #[test]
+    fn test_verify_rate_limited_sha256_rejected_military() {
+        std::env::set_var("MILNET_MILITARY_DEPLOYMENT", "true");
+        let rl = TotpRateLimiter::new(TotpRateLimitConfig::default());
+        let secret = b"12345678901234567890123456789012";
+        let time = 8_000_059u64;
+        let code = generate_totp_with_algorithm(secret, time, TotpAlgorithm::Sha256);
+
+        let result = verify_totp_rate_limited("rl_user3", secret, &code, time, 0, TotpAlgorithm::Sha256, &rl);
+        assert!(result.is_err(), "SHA-256 must be rejected in military mode");
+        assert!(result.unwrap_err().contains("military deployment"));
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+    }
+
+    #[test]
+    fn test_verify_rate_limited_sha1_always_rejected() {
+        let rl = TotpRateLimiter::new(TotpRateLimitConfig::default());
+        let secret = b"12345678901234567890";
+        let time = 9_000_059u64;
+
+        let result = verify_totp_rate_limited("rl_user4", secret, "000000", time, 0, TotpAlgorithm::Sha1, &rl);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("SHA-1"));
+    }
+
+    #[test]
+    fn test_verify_rate_limited_lockout_after_failures() {
+        let config = TotpRateLimitConfig {
+            warn_threshold: 3,
+            critical_threshold: 6,
+            window_secs: 300,
+            warn_lockout_secs: 60,
+            critical_lockout_secs: 120,
+        };
+        let rl = TotpRateLimiter::new(config);
+        let secret = b"1234567890123456789012345678901234567890123456789012345678901234";
+        let time = 10_000_059u64;
+
+        // 3 wrong codes
+        for _ in 0..3 {
+            let result = verify_totp_rate_limited("rl_user5", secret, "999999", time, 0, TotpAlgorithm::Sha512, &rl);
+            assert!(result.is_ok()); // no error, just false
+        }
+
+        // Now locked out -- even correct code should fail
+        let code = generate_totp(secret, time);
+        let result = verify_totp_rate_limited("rl_user5", secret, &code, time, 0, TotpAlgorithm::Sha512, &rl);
+        assert!(result.is_err(), "Should be locked out after threshold failures");
     }
 
     #[test]

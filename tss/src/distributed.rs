@@ -1879,6 +1879,15 @@ pub fn load_signer_share_from_env() -> Result<(SignerNode, PublicKeyPackage, usi
     let hex_sealed = std::env::var("MILNET_TSS_SHARE_SEALED")
         .map_err(|_| "MILNET_TSS_SHARE_SEALED env var not set".to_string())?;
 
+    // SECURITY: Overwrite env var with zeros then remove IMMEDIATELY after reading.
+    // NOTE: On Linux, /proc/PID/environ is an immutable snapshot from execve.
+    // std::env::remove_var() only removes from libc's environ pointer -- it does
+    // NOT erase the original /proc/PID/environ content. A root attacker can always
+    // read the initial environment. For true protection, pass secrets via fd passing.
+    let zeros = "0".repeat(hex_sealed.len());
+    std::env::set_var("MILNET_TSS_SHARE_SEALED", &zeros);
+    std::env::remove_var("MILNET_TSS_SHARE_SEALED");
+
     if hex_sealed.is_empty() {
         return Err("MILNET_TSS_SHARE_SEALED is empty".into());
     }
@@ -2512,6 +2521,15 @@ pub fn validate_share_availability(
 pub fn verify_local_share_unseal() -> Result<(), String> {
     let hex_sealed = std::env::var("MILNET_TSS_SHARE_SEALED")
         .map_err(|_| "MILNET_TSS_SHARE_SEALED not set — signer cannot start".to_string())?;
+
+    // SECURITY: Overwrite env var with zeros then remove IMMEDIATELY after reading.
+    // NOTE: On Linux, /proc/PID/environ is an immutable snapshot from execve.
+    // std::env::remove_var() only removes from libc's environ pointer -- it does
+    // NOT erase the original /proc/PID/environ content. A root attacker can always
+    // read the initial environment. For true protection, pass secrets via fd passing.
+    let zeros = "0".repeat(hex_sealed.len());
+    std::env::set_var("MILNET_TSS_SHARE_SEALED", &zeros);
+    std::env::remove_var("MILNET_TSS_SHARE_SEALED");
 
     if hex_sealed.is_empty() {
         return Err("MILNET_TSS_SHARE_SEALED is empty — signer has no share".to_string());

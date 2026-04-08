@@ -71,7 +71,7 @@ fn full_registration_and_login_succeeds() {
     run_with_large_stack(|| {
         let mut store = CredentialStore::new();
         let password = b"correct-horse-battery-staple";
-        let user_id = store.register_with_password("alice", password);
+        let user_id = store.register_with_password("alice", password).unwrap();
 
         assert!(store.user_exists("alice"));
         assert_eq!(store.user_count(), 1);
@@ -96,7 +96,7 @@ fn full_registration_and_login_succeeds() {
 #[test]
 fn login_with_wrong_password_fails() {
     let mut store = CredentialStore::new();
-    store.register_with_password("bob", b"real-password");
+    store.register_with_password("bob", b"real-password").unwrap();
 
     let mut rng = OsRng;
 
@@ -147,7 +147,7 @@ fn verify_password_nonexistent_user_returns_error() {
 #[test]
 fn registration_bytes_roundtrip() {
     let mut store = CredentialStore::new();
-    store.register_with_password("charlie", b"test-pw");
+    store.register_with_password("charlie", b"test-pw").unwrap();
 
     // Extract raw registration bytes
     let reg_bytes = store.get_registration_bytes("charlie").unwrap();
@@ -169,7 +169,7 @@ fn registration_bytes_roundtrip() {
 fn restore_user_preserves_login_capability() {
     let mut store1 = CredentialStore::new();
     let password = b"restore-test-pw";
-    let user_id = store1.register_with_password("dave", password);
+    let user_id = store1.register_with_password("dave", password).unwrap();
     let reg_bytes = store1.get_registration_bytes("dave").unwrap();
 
     // Create a new store and restore the user
@@ -340,16 +340,25 @@ fn opaque_response_error_roundtrip() {
     }
 }
 
-// ── 6. Double registration with same username behavior ──────────────────
+// ── 6. Double registration with same username is rejected ─────────────────
 
 #[test]
-fn double_registration_overwrites_previous() {
+fn double_registration_is_rejected() {
     let mut store = CredentialStore::new();
-    let uid1 = store.register_with_password("eve", b"password-1");
-    let uid2 = store.register_with_password("eve", b"password-2");
+    let uid1 = store.register_with_password("eve", b"password-1").unwrap();
+    let result = store.register_with_password("eve", b"password-2");
+    assert!(result.is_err(), "duplicate registration must be rejected");
+    assert_eq!(store.user_count(), 1, "store should still have one user");
+    assert_eq!(store.get_user_id("eve"), Some(uid1), "original UUID preserved");
+}
 
-    // Second registration should overwrite the first
-    assert_ne!(uid1, uid2, "new registration generates a new user_id");
+#[test]
+fn re_register_overwrites_previous() {
+    let mut store = CredentialStore::new();
+    let uid1 = store.register_with_password("eve", b"password-1").unwrap();
+    let uid2 = store.re_register_with_password("eve", b"password-2").unwrap();
+
+    assert_ne!(uid1, uid2, "re-registration generates a new user_id");
     assert_eq!(store.user_count(), 1, "store should still have one user");
     assert_eq!(store.get_user_id("eve"), Some(uid2));
 
@@ -368,13 +377,13 @@ fn double_registration_overwrites_previous() {
 #[test]
 fn login_after_password_change() {
     let mut store = CredentialStore::new();
-    let _old_uid = store.register_with_password("frank", b"old-password");
+    let _old_uid = store.register_with_password("frank", b"old-password").unwrap();
 
     // Verify old password works
     assert!(store.verify_password("frank", b"old-password").is_ok());
 
     // Re-register with new password (simulates password change)
-    let new_uid = store.register_with_password("frank", b"new-password");
+    let new_uid = store.re_register_with_password("frank", b"new-password").unwrap();
 
     // New password works
     assert!(store.verify_password("frank", b"new-password").is_ok());
@@ -433,7 +442,7 @@ fn argon2id_user_flagged_for_rereg_in_fips_mode() {
     run_with_large_stack(|| {
         let mut store = CredentialStore::new_dual();
         let password = b"argon2-test-pw";
-        store.register_with_password("legacy", password);
+        store.register_with_password("legacy", password).unwrap();
 
         assert_eq!(store.get_ksf_algorithm("legacy"), Some(KSF_ARGON2ID));
 
@@ -460,8 +469,8 @@ fn credential_store_drop_clears_users() {
     // We cannot directly inspect zeroized memory after Drop, but we can verify
     // the store clears its user map as part of the Drop impl.
     let mut store = CredentialStore::new();
-    store.register_with_password("user1", b"pw1");
-    store.register_with_password("user2", b"pw2");
+    store.register_with_password("user1", b"pw1").unwrap();
+    store.register_with_password("user2", b"pw2").unwrap();
     assert_eq!(store.user_count(), 2);
 
     // Get the registration bytes before drop for later comparison
@@ -516,7 +525,7 @@ fn handle_request_login_finish_without_state_returns_error() {
 #[test]
 fn empty_password_registration_and_login() {
     let mut store = CredentialStore::new();
-    let user_id = store.register_with_password("empty_pw", b"");
+    let user_id = store.register_with_password("empty_pw", b"").unwrap();
 
     // Login with empty password should succeed
     let result = store.verify_password("empty_pw", b"");
@@ -531,7 +540,7 @@ fn empty_password_registration_and_login() {
 #[test]
 fn unicode_username_works() {
     let mut store = CredentialStore::new();
-    let user_id = store.register_with_password("\u{0939}\u{093F}\u{0928}\u{094D}\u{0926}\u{0940}", b"hindi-pw");
+    let user_id = store.register_with_password("\u{0939}\u{093F}\u{0928}\u{094D}\u{0926}\u{0940}", b"hindi-pw").unwrap();
     assert!(store.user_exists("\u{0939}\u{093F}\u{0928}\u{094D}\u{0926}\u{0940}"));
     let result = store.verify_password("\u{0939}\u{093F}\u{0928}\u{094D}\u{0926}\u{0940}", b"hindi-pw");
     assert!(result.is_ok());
@@ -542,7 +551,7 @@ fn unicode_username_works() {
 fn long_password_works() {
     let mut store = CredentialStore::new();
     let long_pw = vec![0x61u8; 1024]; // 1 KiB password
-    let user_id = store.register_with_password("longpw", &long_pw);
+    let user_id = store.register_with_password("longpw", &long_pw).unwrap();
     let result = store.verify_password("longpw", &long_pw);
     assert!(result.is_ok());
     assert_eq!(result.unwrap(), user_id);
@@ -551,8 +560,8 @@ fn long_password_works() {
 #[test]
 fn multiple_users_independent() {
     let mut store = CredentialStore::new();
-    let uid1 = store.register_with_password("user_a", b"pw_a");
-    let uid2 = store.register_with_password("user_b", b"pw_b");
+    let uid1 = store.register_with_password("user_a", b"pw_a").unwrap();
+    let uid2 = store.register_with_password("user_b", b"pw_b").unwrap();
 
     assert_ne!(uid1, uid2);
     assert_eq!(store.user_count(), 2);
@@ -567,9 +576,9 @@ fn multiple_users_independent() {
 #[test]
 fn usernames_returns_all_registered() {
     let mut store = CredentialStore::new();
-    store.register_with_password("alpha", b"pw");
-    store.register_with_password("beta", b"pw");
-    store.register_with_password("gamma", b"pw");
+    store.register_with_password("alpha", b"pw").unwrap();
+    store.register_with_password("beta", b"pw").unwrap();
+    store.register_with_password("gamma", b"pw").unwrap();
 
     let mut names = store.usernames();
     names.sort();

@@ -107,6 +107,15 @@ async fn main() {
                 std::process::exit(1);
             });
 
+        // SECURITY: Overwrite DATABASE_URL with zeros then remove IMMEDIATELY after pool creation.
+        // NOTE: On Linux, /proc/PID/environ is an immutable snapshot from execve.
+        // std::env::remove_var() only removes from libc's environ pointer -- it does
+        // NOT erase the original /proc/PID/environ content. A root attacker can always
+        // read the initial environment. For true protection, pass secrets via fd passing.
+        let zeros = "0".repeat(url.len());
+        std::env::set_var("DATABASE_URL", &zeros);
+        std::env::remove_var("DATABASE_URL");
+
         // Load KEK from environment (in production, from HSM / sealed storage)
         use zeroize::Zeroize;
         let kek = if let Ok(mut kek_hex) = std::env::var("RATCHET_KEK") {

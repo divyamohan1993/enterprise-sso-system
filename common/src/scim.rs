@@ -1,3 +1,4 @@
+// ALL PII MUST be pseudonymized before logging.
 //! SCIM 2.0 Server Implementation (RFC 7643/7644) for the MILNET SSO system.
 //!
 //! Provides a full SCIM 2.0 server for automated identity provisioning and
@@ -701,7 +702,7 @@ impl ScimServer {
             Severity::Info,
             "success",
             None,
-            Some(format!("client_id={}", client.client_id)),
+            Some(format!("client_id={}", crate::log_pseudonym::pseudonym_str("client_id", &client.client_id))),
         );
         self.clients.insert(client.client_id.clone(), client);
     }
@@ -736,7 +737,7 @@ impl ScimServer {
                         Severity::Warning,
                         "failure",
                         None,
-                        Some(format!("client_id={}", client.client_id)),
+                        Some(format!("client_id={}", crate::log_pseudonym::pseudonym_str("client_id", &client.client_id))),
                     );
                     return Err(ScimError::too_many_requests());
                 }
@@ -798,7 +799,8 @@ impl ScimServer {
             None,
             Some(format!(
                 "user_id={} userName={}",
-                user.id, user.user_name
+                crate::log_pseudonym::pseudonym_str("user_id", &user.id),
+                crate::log_pseudonym::pseudonym_str("userName", &user.user_name),
             )),
         );
 
@@ -855,7 +857,7 @@ impl ScimServer {
             Severity::Info,
             "success",
             None,
-            Some(format!("user_id={}", id)),
+            Some(format!("user_id={}", crate::log_pseudonym::pseudonym_str("user_id", id))),
         );
 
         self.users.insert(id.to_string(), user.clone());
@@ -878,7 +880,7 @@ impl ScimServer {
             Severity::Medium,
             "success",
             None,
-            Some(format!("user_id={}", id)),
+            Some(format!("user_id={}", crate::log_pseudonym::pseudonym_str("user_id", id))),
         );
 
         Ok(())
@@ -960,7 +962,7 @@ impl ScimServer {
             Severity::Info,
             "success",
             None,
-            Some(format!("user_id={}", id)),
+            Some(format!("user_id={}", crate::log_pseudonym::pseudonym_str("user_id", id))),
         );
 
         self.users.insert(id.to_string(), user.clone());
@@ -1033,7 +1035,8 @@ impl ScimServer {
             None,
             Some(format!(
                 "group_id={} displayName={}",
-                group.id, group.display_name
+                crate::log_pseudonym::pseudonym_str("group_id", &group.id),
+                crate::log_pseudonym::pseudonym_str("displayName", &group.display_name),
             )),
         );
 
@@ -1089,7 +1092,7 @@ impl ScimServer {
             Severity::Info,
             "success",
             None,
-            Some(format!("group_id={}", id)),
+            Some(format!("group_id={}", crate::log_pseudonym::pseudonym_str("group_id", id))),
         );
 
         self.groups.insert(id.to_string(), group.clone());
@@ -1107,7 +1110,7 @@ impl ScimServer {
             Severity::Medium,
             "success",
             None,
-            Some(format!("group_id={}", id)),
+            Some(format!("group_id={}", crate::log_pseudonym::pseudonym_str("group_id", id))),
         );
 
         Ok(())
@@ -1174,7 +1177,7 @@ impl ScimServer {
             Severity::Info,
             "success",
             None,
-            Some(format!("group_id={}", id)),
+            Some(format!("group_id={}", crate::log_pseudonym::pseudonym_str("group_id", id))),
         );
 
         self.groups.insert(id.to_string(), group.clone());

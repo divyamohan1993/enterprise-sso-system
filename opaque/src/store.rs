@@ -105,14 +105,24 @@ impl CredentialStore {
         &mut self,
         username: &str,
         registration_bytes: Vec<u8>,
-    ) -> Uuid {
-        if !self.users.contains_key(username) && self.users.len() >= Self::MAX_USERS {
+    ) -> Result<Uuid, MilnetError> {
+        if self.users.contains_key(username) {
             tracing::error!(
-                "OPAQUE: MAX_USERS ({}) reached — rejecting new registration",
+                "OPAQUE: registration overwrite attempt for existing user"
+            );
+            return Err(MilnetError::AlreadyRegistered(
+                "use re_register_user for authorized re-registration".into(),
+            ));
+        }
+        if self.users.len() >= Self::MAX_USERS {
+            tracing::error!(
+                "OPAQUE: MAX_USERS ({}) reached -- rejecting new registration",
                 Self::MAX_USERS
             );
-            // Return a nil UUID to signal rejection without changing the API signature
-            return Uuid::nil();
+            return Err(MilnetError::CapacityExceeded(format!(
+                "maximum {} users reached",
+                Self::MAX_USERS
+            )));
         }
         let user_id = Uuid::new_v4();
         self.users.insert(
@@ -123,7 +133,32 @@ impl CredentialStore {
                 ksf_algorithm: KSF_ARGON2ID.to_string(),
             },
         );
-        user_id
+        Ok(user_id)
+    }
+
+    /// Re-register an existing user (authorized re-registration).
+    /// Overwrites the existing registration with a new one and assigns a new UUID.
+    /// Returns error if the user does not already exist.
+    pub fn re_register_user(
+        &mut self,
+        username: &str,
+        registration_bytes: Vec<u8>,
+    ) -> Result<Uuid, MilnetError> {
+        if !self.users.contains_key(username) {
+            return Err(MilnetError::CryptoVerification(
+                "cannot re-register non-existent user".into(),
+            ));
+        }
+        let user_id = Uuid::new_v4();
+        self.users.insert(
+            username.to_string(),
+            UserRecord {
+                user_id,
+                registration: registration_bytes,
+                ksf_algorithm: KSF_ARGON2ID.to_string(),
+            },
+        );
+        Ok(user_id)
     }
 
     /// Store a completed FIPS registration for a user (PBKDF2-SHA512 KSF).
@@ -132,13 +167,24 @@ impl CredentialStore {
         &mut self,
         username: &str,
         registration_bytes: Vec<u8>,
-    ) -> Uuid {
-        if !self.users.contains_key(username) && self.users.len() >= Self::MAX_USERS {
+    ) -> Result<Uuid, MilnetError> {
+        if self.users.contains_key(username) {
             tracing::error!(
-                "OPAQUE: MAX_USERS ({}) reached — rejecting new FIPS registration",
+                "OPAQUE: FIPS registration overwrite attempt for existing user"
+            );
+            return Err(MilnetError::AlreadyRegistered(
+                "use re_register_user for authorized re-registration".into(),
+            ));
+        }
+        if self.users.len() >= Self::MAX_USERS {
+            tracing::error!(
+                "OPAQUE: MAX_USERS ({}) reached -- rejecting new FIPS registration",
                 Self::MAX_USERS
             );
-            return Uuid::nil();
+            return Err(MilnetError::CapacityExceeded(format!(
+                "maximum {} users reached",
+                Self::MAX_USERS
+            )));
         }
         let user_id = Uuid::new_v4();
         self.users.insert(
@@ -149,7 +195,7 @@ impl CredentialStore {
                 ksf_algorithm: KSF_PBKDF2_SHA512.to_string(),
             },
         );
-        user_id
+        Ok(user_id)
     }
 
     /// Look up a user's OPAQUE registration record.
@@ -217,7 +263,7 @@ impl CredentialStore {
     /// the server side never sees it. After registration, the stored record
     /// contains no password-derived information that could be used to
     /// recover the password.
-    pub fn register_with_password(&mut self, username: &str, password: &[u8]) -> Uuid {
+    pub fn register_with_password(&mut self, username: &str, password: &[u8]) -> Result<Uuid, MilnetError> {
         use opaque_ke::{
             ClientRegistration, ClientRegistrationFinishParameters,
         };
@@ -229,7 +275,7 @@ impl CredentialStore {
             Ok(cs) => cs,
             Err(e) => {
                 tracing::error!("OPAQUE client registration start failed: {e}");
-                return Uuid::nil();
+                return Err(MilnetError::CryptoVerification(format!("client reg start: {e}")));
             }
         };
 
@@ -242,7 +288,7 @@ impl CredentialStore {
             Ok(ss) => ss,
             Err(e) => {
                 tracing::error!("OPAQUE server registration start failed: {e}");
-                return Uuid::nil();
+                return Err(MilnetError::CryptoVerification(format!("server reg start: {e}")));
             }
         };
 
@@ -256,7 +302,7 @@ impl CredentialStore {
             Ok(cf) => cf,
             Err(e) => {
                 tracing::error!("OPAQUE client registration finish failed: {e}");
-                return Uuid::nil();
+                return Err(MilnetError::CryptoVerification(format!("client reg finish: {e}")));
             }
         };
 
@@ -265,6 +311,37 @@ impl CredentialStore {
         let registration_bytes = server_registration.serialize().to_vec();
 
         self.store_registration(username, registration_bytes)
+    }
+
+    /// Authorized re-registration with password. Runs the full OPAQUE protocol
+    /// and overwrites the existing user record. Fails if user does not exist.
+    pub fn re_register_with_password(&mut self, username: &str, password: &[u8]) -> Result<Uuid, MilnetError> {
+        use opaque_ke::{ClientRegistration, ClientRegistrationFinishParameters};
+
+        let mut rng = OsRng;
+
+        let client_start = ClientRegistration::<OpaqueCs>::start(&mut rng, password)
+            .map_err(|e| MilnetError::CryptoVerification(format!("client reg start: {e}")))?;
+
+        let server_start = ServerRegistration::<OpaqueCs>::start(
+            &self.server_setup,
+            client_start.message,
+            username.as_bytes(),
+        )
+        .map_err(|e| MilnetError::CryptoVerification(format!("server reg start: {e}")))?;
+
+        let client_finish = client_start.state.finish(
+            &mut rng,
+            password,
+            server_start.message,
+            ClientRegistrationFinishParameters::default(),
+        )
+        .map_err(|e| MilnetError::CryptoVerification(format!("client reg finish: {e}")))?;
+
+        let server_registration = ServerRegistration::<OpaqueCs>::finish(client_finish.message);
+        let registration_bytes = server_registration.serialize().to_vec();
+
+        self.re_register_user(username, registration_bytes)
     }
 
     /// Perform OPAQUE registration using the FIPS cipher suite (PBKDF2-SHA512).
@@ -310,7 +387,7 @@ impl CredentialStore {
         let server_registration = ServerRegistration::<OpaqueCsFips>::finish(client_finish.message);
         let registration_bytes = server_registration.serialize().to_vec();
 
-        Ok(self.store_registration_fips(username, registration_bytes))
+        self.store_registration_fips(username, registration_bytes)
     }
 
     /// Verify a password adaptively, routing to the correct cipher suite based
@@ -531,7 +608,7 @@ mod tests {
     #[test]
     fn register_with_password_returns_valid_uuid() {
         let mut store = CredentialStore::new();
-        let uid = store.register_with_password("alice", b"pw123");
+        let uid = store.register_with_password("alice", b"pw123").unwrap();
         assert!(!uid.is_nil(), "registration must return non-nil UUID");
     }
 
@@ -539,7 +616,7 @@ mod tests {
     fn register_with_password_makes_user_exist() {
         let mut store = CredentialStore::new();
         assert!(!store.user_exists("alice"));
-        store.register_with_password("alice", b"pw");
+        store.register_with_password("alice", b"pw").unwrap();
         assert!(store.user_exists("alice"));
         assert_eq!(store.user_count(), 1);
     }
@@ -547,7 +624,7 @@ mod tests {
     #[test]
     fn register_sets_argon2id_ksf() {
         let mut store = CredentialStore::new();
-        store.register_with_password("alice", b"pw");
+        store.register_with_password("alice", b"pw").unwrap();
         assert_eq!(store.get_ksf_algorithm("alice"), Some(KSF_ARGON2ID));
     }
 
@@ -568,51 +645,57 @@ mod tests {
     // ── Duplicate username handling ────────────────────────────────────
 
     #[test]
-    fn duplicate_username_overwrites_with_new_uuid() {
+    fn duplicate_username_is_rejected() {
         let mut store = CredentialStore::new();
-        let uid1 = store.register_with_password("alice", b"pw1");
-        let uid2 = store.register_with_password("alice", b"pw2");
+        let uid1 = store.register_with_password("alice", b"pw1").unwrap();
+        let result = store.register_with_password("alice", b"pw2");
+        assert!(result.is_err(), "duplicate registration must be rejected");
+        assert_eq!(store.user_count(), 1);
+        assert_eq!(store.get_user_id("alice"), Some(uid1), "original UUID preserved");
+    }
+
+    #[test]
+    fn re_register_user_overwrites_existing() {
+        let mut store = CredentialStore::new();
+        let uid1 = store.register_with_password("alice", b"pw1").unwrap();
+        let uid2 = store.re_register_user("alice", store.get_registration_bytes("alice").unwrap()).unwrap();
         assert_ne!(uid1, uid2);
         assert_eq!(store.user_count(), 1);
         assert_eq!(store.get_user_id("alice"), Some(uid2));
     }
 
     #[test]
-    fn duplicate_does_not_increment_count() {
+    fn re_register_nonexistent_user_fails() {
         let mut store = CredentialStore::new();
-        store.register_with_password("a", b"pw");
-        store.register_with_password("a", b"pw2");
-        store.register_with_password("a", b"pw3");
-        assert_eq!(store.user_count(), 1);
+        let result = store.re_register_user("ghost", vec![0xAA; 32]);
+        assert!(result.is_err());
     }
 
     // ── MAX_USERS limit ───────────────────────────────────────────────
 
     #[test]
-    fn store_registration_rejects_at_max_users() {
+    fn store_registration_rejects_duplicate() {
         let mut store = CredentialStore::new();
-        // Fill with MAX_USERS entries using store_registration directly
-        // (register_with_password is too slow for 1M entries).
-        // Instead, test the guard logic: insert entries into the map directly,
-        // then attempt one more.
         for i in 0..10 {
-            store.store_registration(&format!("user{i}"), vec![0xAA; 32]);
+            store.store_registration(&format!("user{i}"), vec![0xAA; 32]).unwrap();
         }
         assert_eq!(store.user_count(), 10);
 
-        // Overwrite an existing user should still work even at capacity
-        // (the guard only blocks NEW users)
-        let uid = store.store_registration("user0", vec![0xBB; 32]);
-        assert!(!uid.is_nil(), "overwriting existing user at capacity must succeed");
+        // Duplicate should be rejected
+        let result = store.store_registration("user0", vec![0xBB; 32]);
+        assert!(result.is_err(), "duplicate store_registration must fail");
+
+        // Re-register should work for existing user
+        let uid = store.re_register_user("user0", vec![0xBB; 32]);
+        assert!(uid.is_ok(), "re_register_user for existing user must succeed");
     }
 
     #[test]
-    fn store_registration_fips_rejects_at_max_users() {
+    fn store_registration_fips_rejects_duplicate() {
         let mut store = CredentialStore::new_dual();
-        // Insert a user, then overwrite should succeed
-        store.store_registration_fips("existing", vec![0xAA; 32]);
-        let uid = store.store_registration_fips("existing", vec![0xBB; 32]);
-        assert!(!uid.is_nil(), "overwriting existing FIPS user must succeed");
+        store.store_registration_fips("existing", vec![0xAA; 32]).unwrap();
+        let result = store.store_registration_fips("existing", vec![0xBB; 32]);
+        assert!(result.is_err(), "duplicate FIPS registration must fail");
         assert_eq!(store.get_ksf_algorithm("existing"), Some(KSF_PBKDF2_SHA512));
     }
 
@@ -621,7 +704,7 @@ mod tests {
     #[test]
     fn get_registration_bytes_returns_stored_bytes() {
         let mut store = CredentialStore::new();
-        store.register_with_password("alice", b"pw");
+        store.register_with_password("alice", b"pw").unwrap();
 
         let bytes = store.get_registration_bytes("alice");
         assert!(bytes.is_some());
@@ -637,7 +720,7 @@ mod tests {
     #[test]
     fn get_registration_bytes_roundtrips_through_deserialization() {
         let mut store = CredentialStore::new();
-        store.register_with_password("bob", b"password");
+        store.register_with_password("bob", b"password").unwrap();
 
         let bytes = store.get_registration_bytes("bob").unwrap();
         let reg = ServerRegistration::<OpaqueCs>::deserialize(&bytes);
@@ -649,7 +732,7 @@ mod tests {
     #[test]
     fn get_registration_returns_correct_user_id() {
         let mut store = CredentialStore::new();
-        let uid = store.register_with_password("charlie", b"pw");
+        let uid = store.register_with_password("charlie", b"pw").unwrap();
         let (_, stored_uid) = store.get_registration("charlie").unwrap();
         assert_eq!(uid, stored_uid);
     }
@@ -663,7 +746,7 @@ mod tests {
     #[test]
     fn get_registration_corrupt_bytes_is_error() {
         let mut store = CredentialStore::new();
-        store.store_registration("corrupt", vec![0xFF; 3]);
+        store.store_registration("corrupt", vec![0xFF; 3]).unwrap();
         assert!(store.get_registration("corrupt").is_err());
     }
 
@@ -672,7 +755,7 @@ mod tests {
     #[test]
     fn verify_password_succeeds_with_correct_password() {
         let mut store = CredentialStore::new();
-        let uid = store.register_with_password("dave", b"correct");
+        let uid = store.register_with_password("dave", b"correct").unwrap();
         let result = store.verify_password("dave", b"correct");
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), uid);
@@ -681,7 +764,7 @@ mod tests {
     #[test]
     fn verify_password_fails_with_wrong_password() {
         let mut store = CredentialStore::new();
-        store.register_with_password("dave", b"correct");
+        store.register_with_password("dave", b"correct").unwrap();
         let result = store.verify_password("dave", b"wrong");
         assert!(result.is_err());
     }
@@ -695,7 +778,7 @@ mod tests {
     #[test]
     fn verify_password_adaptive_routes_argon2id() {
         let mut store = CredentialStore::new();
-        let uid = store.register_with_password("user", b"pw");
+        let uid = store.register_with_password("user", b"pw").unwrap();
         let (verified_uid, needs_rereg) = store
             .verify_password_adaptive("user", b"pw")
             .unwrap();
@@ -725,8 +808,8 @@ mod tests {
     #[test]
     fn usernames_returns_all_registered() {
         let mut store = CredentialStore::new();
-        store.register_with_password("z", b"pw");
-        store.register_with_password("a", b"pw");
+        store.register_with_password("z", b"pw").unwrap();
+        store.register_with_password("a", b"pw").unwrap();
         let mut names = store.usernames();
         names.sort();
         assert_eq!(names, vec!["a", "z"]);
@@ -749,7 +832,7 @@ mod tests {
     #[test]
     fn restore_user_makes_user_accessible() {
         let mut store = CredentialStore::new();
-        let uid = store.register_with_password("orig", b"pw");
+        let uid = store.register_with_password("orig", b"pw").unwrap();
         let bytes = store.get_registration_bytes("orig").unwrap();
 
         let mut store2 = CredentialStore::with_server_setup(store.server_setup().clone());
@@ -763,7 +846,7 @@ mod tests {
     #[test]
     fn restore_user_can_verify_password() {
         let mut store = CredentialStore::new();
-        let uid = store.register_with_password("orig", b"pw");
+        let uid = store.register_with_password("orig", b"pw").unwrap();
         let bytes = store.get_registration_bytes("orig").unwrap();
 
         let mut store2 = CredentialStore::with_server_setup(store.server_setup().clone());
@@ -779,8 +862,8 @@ mod tests {
     #[test]
     fn drop_does_not_panic() {
         let mut store = CredentialStore::new();
-        store.register_with_password("u1", b"pw1");
-        store.register_with_password("u2", b"pw2");
+        store.register_with_password("u1", b"pw1").unwrap();
+        store.register_with_password("u2", b"pw2").unwrap();
         drop(store);
         // reaching here means Drop ran without panic
     }
@@ -788,7 +871,7 @@ mod tests {
     #[test]
     fn drop_dual_does_not_panic() {
         let mut store = CredentialStore::new_dual();
-        store.register_with_password("u1", b"pw1");
+        store.register_with_password("u1", b"pw1").unwrap();
         store.register_with_password_fips("u2", b"pw2").unwrap();
         drop(store);
     }
@@ -893,10 +976,8 @@ impl PersistentOpaqueStore {
         username: &str,
         registration_bytes: Vec<u8>,
     ) -> Result<Uuid, String> {
-        let user_id = self.memory.store_registration(username, registration_bytes.clone());
-        if user_id.is_nil() {
-            return Err("MAX_USERS reached or registration failed".to_string());
-        }
+        let user_id = self.memory.store_registration(username, registration_bytes.clone())
+            .map_err(|e| format!("{e}"))?;
 
         let reg_enc = self.pool.encrypt_field(
             "users", "opaque_registration", username.as_bytes(), &registration_bytes,

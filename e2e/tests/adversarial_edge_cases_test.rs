@@ -105,8 +105,8 @@ fn opaque_cyrillic_latin_confusable_usernames_are_distinct() {
     let latin = "admin";
     let cyrillic = "\u{0430}dmin"; // Cyrillic а followed by Latin dmin
 
-    let uid_latin = store.register_with_password(latin, b"password1");
-    let uid_cyrillic = store.register_with_password(cyrillic, b"password2");
+    let uid_latin = store.register_with_password(latin, b"password1").unwrap();
+    let uid_cyrillic = store.register_with_password(cyrillic, b"password2").unwrap();
 
     // Must be two distinct users
     assert_ne!(uid_latin, uid_cyrillic, "Cyrillic/Latin confusable must not map to same user");
@@ -131,8 +131,8 @@ fn zero_width_joiner_in_username() {
     let plain = "alice";
     let zwj = "ali\u{200D}ce"; // zero-width joiner between 'i' and 'c'
 
-    let uid_plain = store.register_with_password(plain, b"pw1");
-    let uid_zwj = store.register_with_password(zwj, b"pw2");
+    let uid_plain = store.register_with_password(plain, b"pw1").unwrap();
+    let uid_zwj = store.register_with_password(zwj, b"pw2").unwrap();
     assert_ne!(uid_plain, uid_zwj, "ZWJ-laced username must not silently match plain username");
 }
 
@@ -144,8 +144,8 @@ fn rtl_override_in_username() {
     let normal = "alice";
     let rtl = "\u{202E}ecila"; // RTL override + reversed chars
 
-    let uid_normal = store.register_with_password(normal, b"pw1");
-    let uid_rtl = store.register_with_password(rtl, b"pw2");
+    let uid_normal = store.register_with_password(normal, b"pw1").unwrap();
+    let uid_rtl = store.register_with_password(rtl, b"pw2").unwrap();
     assert_ne!(uid_normal, uid_rtl, "RTL override username must not match normal username");
 }
 
@@ -156,8 +156,8 @@ fn combining_diacritical_vs_precomposed() {
     let precomposed = "\u{00E1}lice"; // á (precomposed)
     let combining = "a\u{0301}lice"; // a + combining acute accent
 
-    let uid1 = store.register_with_password(precomposed, b"pw1");
-    let uid2 = store.register_with_password(combining, b"pw2");
+    let uid1 = store.register_with_password(precomposed, b"pw1").unwrap();
+    let uid2 = store.register_with_password(combining, b"pw2").unwrap();
     // These are canonically equivalent under NFC but byte-different.
     // The system must handle this consistently (either normalize or treat as distinct).
     // What matters is it doesn't crash or silently overwrite.
@@ -170,7 +170,7 @@ fn mixed_script_username() {
     let mut store = CredentialStore::new();
     // Mix of Latin 'a', Cyrillic 'б', Greek 'γ'
     let mixed = "a\u{0431}\u{03B3}user";
-    let uid = store.register_with_password(mixed, b"pw1");
+    let uid = store.register_with_password(mixed, b"pw1").unwrap();
     assert!(store.get_registration(mixed).is_ok());
     let _ = uid;
 }
@@ -200,7 +200,7 @@ fn control_character_only_username() {
     // Bell, backspace, delete
     let ctrl_name = "\x07\x08\x7F";
     // Must not panic
-    let uid = store.register_with_password(ctrl_name, b"pw1");
+    let uid = store.register_with_password(ctrl_name, b"pw1").unwrap();
     let _ = uid;
 }
 
@@ -215,8 +215,8 @@ fn null_byte_in_opaque_username() {
     let normal = "admin";
     let with_null = "admin\0evil";
 
-    let uid_normal = store.register_with_password(normal, b"pw1");
-    let uid_null = store.register_with_password(with_null, b"pw2");
+    let uid_normal = store.register_with_password(normal, b"pw1").unwrap();
+    let uid_null = store.register_with_password(with_null, b"pw2").unwrap();
     // Must be distinct (null byte must not truncate "admin\0evil" to "admin")
     assert_ne!(uid_normal, uid_null, "Null byte must not truncate username");
 }
@@ -306,7 +306,7 @@ fn oversized_username_1mb_opaque() {
     let mut store = CredentialStore::new();
     let huge_name: String = "A".repeat(1_000_000);
     // Must not panic or OOM. Registration may succeed or fail gracefully.
-    let uid = store.register_with_password(&huge_name, b"pw");
+    let uid = store.register_with_password(&huge_name, b"pw").unwrap();
     // If it succeeded, lookup should work
     if store.get_registration(&huge_name).is_ok() {
         let _ = uid;

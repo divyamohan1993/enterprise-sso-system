@@ -411,7 +411,7 @@ fn make_valid_token_and_key() -> (Token, frost_ristretto255::keys::PublicKeyPack
 async fn test_complete_tier2_auth_flow() {
     let _pq_vk = test_pq_vk();
     let mut store = CredentialStore::new();
-    store.register_with_password("alice", b"password123");
+    store.register_with_password("alice", b"password123").unwrap();
     let (gateway_addr, group_key) = boot_full_system(store).await;
 
     let (resp, dpop_key) = client_auth_with_dpop(&gateway_addr, "alice", b"password123").await;
@@ -436,7 +436,7 @@ async fn test_multiple_users_concurrent_auth() {
     let mut store = CredentialStore::new();
     let mut user_ids = Vec::new();
     for i in 0..5 {
-        let uid = store.register_with_password(&format!("user{i}"), format!("pass{i}").as_bytes());
+        let uid = store.register_with_password(&format!("user{i}"), format!("pass{i}").as_bytes()).unwrap();
         user_ids.push(uid);
     }
     let (gateway_addr, group_key) = boot_full_system(store).await;
@@ -472,7 +472,7 @@ async fn test_multiple_users_concurrent_auth() {
 async fn test_sequential_auth_sessions() {
     let _pq_vk = test_pq_vk();
     let mut store = CredentialStore::new();
-    store.register_with_password("bob", b"bobpass");
+    store.register_with_password("bob", b"bobpass").unwrap();
     let (gateway_addr, group_key) = boot_full_system(store).await;
 
     let mut ceremony_ids = Vec::new();
@@ -506,7 +506,7 @@ async fn test_sequential_auth_sessions() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_wrong_password_rejected() {
     let mut store = CredentialStore::new();
-    store.register_with_password("alice", b"password123");
+    store.register_with_password("alice", b"password123").unwrap();
     let (gateway_addr, _) = boot_full_system(store).await;
 
     let resp = client_auth(&gateway_addr, "alice", b"wrong_password").await;
@@ -529,7 +529,7 @@ async fn test_nonexistent_user_rejected() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_empty_password_rejected() {
     let mut store = CredentialStore::new();
-    store.register_with_password("alice", b"password123");
+    store.register_with_password("alice", b"password123").unwrap();
     let (gateway_addr, _) = boot_full_system(store).await;
 
     let resp = client_auth(&gateway_addr, "alice", b"").await;
@@ -540,7 +540,7 @@ async fn test_empty_password_rejected() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_empty_username_rejected() {
     let mut store = CredentialStore::new();
-    store.register_with_password("alice", b"password123");
+    store.register_with_password("alice", b"password123").unwrap();
     let (gateway_addr, _) = boot_full_system(store).await;
 
     let resp = client_auth(&gateway_addr, "", b"password123").await;
@@ -553,7 +553,7 @@ async fn test_unicode_username_works() {
     let _pq_vk = test_pq_vk();
     let mut store = CredentialStore::new();
     let username = "\u{7528}\u{6237}\u{03B1}\u{03B2}\u{03B3}";
-    store.register_with_password(username, b"unicodepass");
+    store.register_with_password(username, b"unicodepass").unwrap();
     let (gateway_addr, group_key) = boot_full_system(store).await;
 
     let (resp, dpop_key) = client_auth_with_dpop(&gateway_addr, username, b"unicodepass").await;
@@ -571,7 +571,7 @@ async fn test_very_long_password_works() {
     let (_, _pq_vk) = crypto::pq_sign::generate_pq_keypair();
     let mut store = CredentialStore::new();
     let long_pass = vec![0x41u8; 1000];
-    store.register_with_password("longpass_user", &long_pass);
+    store.register_with_password("longpass_user", &long_pass).unwrap();
     let (gateway_addr, group_key) = boot_full_system(store).await;
 
     let (resp, dpop_key) = client_auth_with_dpop(&gateway_addr, "longpass_user", &long_pass).await;
@@ -586,7 +586,7 @@ async fn test_very_long_password_works() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_puzzle_not_solved_rejected() {
     let mut store = CredentialStore::new();
-    store.register_with_password("alice", b"password123");
+    store.register_with_password("alice", b"password123").unwrap();
     let (gateway_addr, _) = boot_full_system(store).await;
 
     let mut stream = TcpStream::connect(&gateway_addr)

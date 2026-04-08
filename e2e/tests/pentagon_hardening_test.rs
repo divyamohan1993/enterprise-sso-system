@@ -539,7 +539,7 @@ fn combined_entropy_is_not_all_zeros() {
 #[test]
 fn opaque_server_registration_does_not_contain_password() {
     let mut store = opaque::store::CredentialStore::new();
-    let _user_id = store.register_with_password("testuser", b"SuperSecretPassword123!");
+    let _user_id = store.register_with_password("testuser", b"SuperSecretPassword123!").unwrap();
 
     if let Some(registration_bytes) = store.get_registration_bytes("testuser") {
         let password = b"SuperSecretPassword123!";

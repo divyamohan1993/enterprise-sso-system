@@ -441,6 +441,7 @@ pub async fn extract_google_claims(
     expected_client_id: &str,
     jwks_cache: &GoogleJwksCache,
     http_client: &reqwest::Client,
+    expected_nonce: Option<&str>,
 ) -> Result<GoogleIdTokenClaims, String> {
     let parts: Vec<&str> = id_token.split('.').collect();
     if parts.len() != 3 {
@@ -535,6 +536,30 @@ pub async fn extract_google_claims(
     // Allow 60 seconds of clock skew (5 minutes was excessive)
     if claims.exp < now - 60 {
         return Err("id_token has expired".into());
+    }
+
+    // Validate OIDC nonce if expected (constant-time comparison to prevent timing attacks)
+    if let Some(expected) = expected_nonce {
+        match &claims.nonce {
+            Some(returned_nonce) => {
+                if !crypto::ct::ct_eq(returned_nonce.as_bytes(), expected.as_bytes()) {
+                    tracing::warn!(
+                        target: "siem",
+                        event_type = "oidc_nonce_mismatch",
+                        "WARNING: OIDC nonce mismatch in ID token -- possible replay attack"
+                    );
+                    return Err("OIDC nonce mismatch -- possible replay attack".into());
+                }
+            }
+            None => {
+                tracing::warn!(
+                    target: "siem",
+                    event_type = "oidc_nonce_missing",
+                    "WARNING: ID token missing nonce claim when nonce was expected"
+                );
+                return Err("ID token missing required nonce claim".into());
+            }
+        }
     }
 
     Ok(claims)
@@ -878,7 +903,7 @@ mod tests {
 
         // The HTTP client won't be used since the cache is populated
         let http_client = reqwest::Client::new();
-        let claims = extract_google_claims(&jwt, "my-client-id", &cache, &http_client)
+        let claims = extract_google_claims(&jwt, "my-client-id", &cache, &http_client, None)
             .await
             .unwrap();
         assert_eq!(claims.sub, "12345");
@@ -926,7 +951,7 @@ mod tests {
         }
 
         let http_client = reqwest::Client::new();
-        let result = extract_google_claims(&jwt, "my-client-id", &cache, &http_client).await;
+        let result = extract_google_claims(&jwt, "my-client-id", &cache, &http_client, None).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -951,7 +976,7 @@ mod tests {
 
         let cache = GoogleJwksCache::new();
         let http_client = reqwest::Client::new();
-        let result = extract_google_claims(&jwt, "my-client-id", &cache, &http_client).await;
+        let result = extract_google_claims(&jwt, "my-client-id", &cache, &http_client, None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("RS256"));
     }
@@ -972,8 +997,103 @@ mod tests {
 
         let cache = GoogleJwksCache::new();
         let http_client = reqwest::Client::new();
-        let result = extract_google_claims(&jwt, "my-client-id", &cache, &http_client).await;
+        let result = extract_google_claims(&jwt, "my-client-id", &cache, &http_client, None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("kid"));
+    }
+
+    /// Verify nonce mismatch is rejected when expected_nonce is provided.
+    #[tokio::test]
+    async fn test_extract_google_claims_rejects_nonce_mismatch() {
+        use rsa::pkcs1v15::SigningKey;
+
+        let mut rng = rand::thread_rng();
+        let private_key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let public_key = RsaPublicKey::from(&private_key);
+
+        let kid = "test-kid-nonce";
+
+        let header_json = serde_json::json!({"alg": "RS256", "typ": "JWT", "kid": kid});
+        let header_b64 = URL_SAFE_NO_PAD.encode(header_json.to_string().as_bytes());
+
+        let claims_json = serde_json::json!({
+            "sub": "12345",
+            "email": "user@example.com",
+            "email_verified": true,
+            "name": "Test User",
+            "iss": "https://accounts.google.com",
+            "aud": "my-client-id",
+            "exp": 9999999999i64,
+            "nonce": "wrong-nonce",
+        });
+        let payload_b64 = URL_SAFE_NO_PAD.encode(claims_json.to_string().as_bytes());
+
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        let mut signing_key = SigningKey::<Sha256>::new(private_key);
+        let sig = rsa::signature::SignerMut::sign(&mut signing_key, signing_input.as_bytes());
+        use rsa::signature::SignatureEncoding;
+        let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes());
+
+        let jwt = format!("{header_b64}.{payload_b64}.{sig_b64}");
+
+        let cache = GoogleJwksCache::new();
+        {
+            let mut inner = cache.inner.write().await;
+            inner.keys.insert(kid.to_string(), CachedRsaKey { key: public_key });
+            inner.fetched_at = Some(Instant::now());
+        }
+
+        let http_client = reqwest::Client::new();
+        let result = extract_google_claims(&jwt, "my-client-id", &cache, &http_client, Some("expected-nonce")).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("nonce mismatch"));
+    }
+
+    /// Verify nonce validation passes when nonces match.
+    #[tokio::test]
+    async fn test_extract_google_claims_accepts_matching_nonce() {
+        use rsa::pkcs1v15::SigningKey;
+
+        let mut rng = rand::thread_rng();
+        let private_key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let public_key = RsaPublicKey::from(&private_key);
+
+        let kid = "test-kid-nonce-ok";
+
+        let header_json = serde_json::json!({"alg": "RS256", "typ": "JWT", "kid": kid});
+        let header_b64 = URL_SAFE_NO_PAD.encode(header_json.to_string().as_bytes());
+
+        let claims_json = serde_json::json!({
+            "sub": "12345",
+            "email": "user@example.com",
+            "email_verified": true,
+            "name": "Test User",
+            "iss": "https://accounts.google.com",
+            "aud": "my-client-id",
+            "exp": 9999999999i64,
+            "nonce": "correct-nonce",
+        });
+        let payload_b64 = URL_SAFE_NO_PAD.encode(claims_json.to_string().as_bytes());
+
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        let mut signing_key = SigningKey::<Sha256>::new(private_key);
+        let sig = rsa::signature::SignerMut::sign(&mut signing_key, signing_input.as_bytes());
+        use rsa::signature::SignatureEncoding;
+        let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes());
+
+        let jwt = format!("{header_b64}.{payload_b64}.{sig_b64}");
+
+        let cache = GoogleJwksCache::new();
+        {
+            let mut inner = cache.inner.write().await;
+            inner.keys.insert(kid.to_string(), CachedRsaKey { key: public_key });
+            inner.fetched_at = Some(Instant::now());
+        }
+
+        let http_client = reqwest::Client::new();
+        let claims = extract_google_claims(&jwt, "my-client-id", &cache, &http_client, Some("correct-nonce"))
+            .await
+            .unwrap();
+        assert_eq!(claims.nonce.as_deref(), Some("correct-nonce"));
     }
 }

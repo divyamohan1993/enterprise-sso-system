@@ -139,7 +139,7 @@ fn event_canonical_bytes(event_type: SessionEventType, timestamp: i64, details: 
 /// Compute HMAC-SHA512(key = previous_hash, msg = event_data).
 fn compute_chain_link(previous_hash: &[u8], event_data: &[u8]) -> [u8; 64] {
     let mut mac = HmacSha512::new_from_slice(previous_hash)
-        .expect("HMAC-SHA512 accepts any key length");
+        .expect("invariant: HMAC-SHA512 accepts any key length per RFC 2104");
     mac.update(event_data);
     let result = mac.finalize().into_bytes();
     let mut out = [0u8; 64];

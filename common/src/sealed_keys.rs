@@ -16,6 +16,21 @@
 //! - No dev key fallbacks (hard fail)
 //! - Sealed keys required
 //! - Master KEK must come from env `MILNET_MASTER_KEK` (hex-encoded)
+//!
+//! # /proc/PID/environ Limitation
+//!
+//! On Linux, `/proc/PID/environ` is an immutable snapshot created at `execve(2)`.
+//! Calling `std::env::remove_var()` only removes the variable from libc's in-process
+//! `environ` pointer array -- it does NOT erase the original `/proc/PID/environ`
+//! kernel-mapped page. A root-level attacker (or any process with `CAP_SYS_PTRACE`)
+//! can always read the initial environment from `/proc/PID/environ` regardless of
+//! env var removal. The overwrite-then-remove pattern in this module mitigates
+//! libc-level scanning and child process inheritance, but cannot protect against
+//! `/proc/PID/environ` reads. For true secret isolation, prefer:
+//!   - File descriptor passing (`MILNET_MASTER_KEK_FD`) via `load_master_kek_from_fd()`
+//!   - Unix domain socket fd passing
+//!   - `O_TMPFILE` tmpfs file descriptors
+//!   - HSM/TPM sealed storage
 
 use std::sync::OnceLock;
 use zeroize::Zeroize;
@@ -438,6 +453,85 @@ fn load_master_kek_inner() -> [u8; 32] {
         _ => {
             tracing::error!("MILNET_MASTER_KEK not set or too short. Refusing to start.");
             std::process::exit(1);
+        }
+    }
+}
+
+/// Load the master KEK from a file descriptor number specified by `MILNET_MASTER_KEK_FD`.
+///
+/// This is the preferred method for secret delivery because file descriptors are NOT
+/// visible in `/proc/PID/environ`. The parent process (systemd, container runtime, or
+/// init script) opens a pipe/tmpfs fd, writes the 64-char hex KEK, and passes the fd
+/// number via `MILNET_MASTER_KEK_FD`.
+///
+/// Falls back to `MILNET_MASTER_KEK` env var with a SIEM WARNING if the fd var is unset.
+pub fn load_master_kek_from_fd() -> [u8; 32] {
+    use std::io::Read;
+    use zeroize::Zeroize;
+
+    match std::env::var("MILNET_MASTER_KEK_FD") {
+        Ok(fd_str) => {
+            // Remove fd env var immediately (less sensitive than key, but still metadata)
+            std::env::remove_var("MILNET_MASTER_KEK_FD");
+
+            let fd: i32 = fd_str.parse().unwrap_or_else(|_| {
+                tracing::error!("MILNET_MASTER_KEK_FD is not a valid integer: {fd_str}");
+                std::process::exit(1);
+            });
+
+            // SAFETY: We trust the parent process to pass a valid, open fd.
+            let mut file = unsafe { std::os::unix::io::FromRawFd::from_raw_fd(fd) };
+            let file_ref: &mut std::fs::File = &mut file;
+            let mut hex_buf = String::with_capacity(64);
+            if let Err(e) = file_ref.read_to_string(&mut hex_buf) {
+                tracing::error!("Failed to read KEK from fd {fd}: {e}");
+                std::process::exit(1);
+            }
+
+            let hex_str = hex_buf.trim();
+            if hex_str.len() < 64 {
+                tracing::error!(
+                    "KEK from fd {fd} too short: expected 64 hex chars, got {}",
+                    hex_str.len()
+                );
+                std::process::exit(1);
+            }
+
+            let mut key = [0u8; 32];
+            for (i, chunk) in hex_str.as_bytes().chunks(2).take(32).enumerate() {
+                let hex = std::str::from_utf8(chunk).unwrap_or_else(|_| {
+                    tracing::error!("KEK from fd contains invalid UTF-8 at byte {}", i * 2);
+                    std::process::exit(1);
+                });
+                key[i] = u8::from_str_radix(hex, 16).unwrap_or_else(|_| {
+                    tracing::error!("KEK from fd contains invalid hex '{}' at position {}", hex, i * 2);
+                    std::process::exit(1);
+                });
+            }
+
+            if key.iter().all(|&b| b == 0) {
+                tracing::error!("all-zero key detected from fd {fd}");
+                std::process::exit(1);
+            }
+
+            hex_buf.zeroize();
+            tracing::info!("Master KEK loaded from fd {fd} (no env var exposure)");
+            key
+        }
+        Err(_) => {
+            // SIEM WARNING: falling back to env var delivery which is visible in /proc/PID/environ
+            tracing::warn!(
+                "SECURITY WARNING: MILNET_MASTER_KEK_FD not set. \
+                 Falling back to MILNET_MASTER_KEK env var. \
+                 The KEK will be visible in /proc/PID/environ to root-level attackers. \
+                 Production deployments MUST use fd-based delivery."
+            );
+            crate::siem::SecurityEvent::tamper_detected(
+                "SECURITY: Master KEK loaded from env var instead of fd. \
+                 /proc/PID/environ exposes the initial value to root. \
+                 Set MILNET_MASTER_KEK_FD for fd-based secret delivery.",
+            );
+            load_master_kek()
         }
     }
 }

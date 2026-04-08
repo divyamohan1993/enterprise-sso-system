@@ -457,9 +457,18 @@ pub fn tpm_seal(
     }
 
     // 2. Create PCR policy
-    let _output = tpm2_command("tpm2_pcrread")
+    let pcr_output = tpm2_command("tpm2_pcrread")
         .args(["-o", &policy_path, SEAL_PCR_LIST])
-        .output();
+        .output()
+        .map_err(|e| {
+            PlatformError::TpmCommandFailed(format!("tpm2_pcrread: {}", e))
+        })?;
+    if !pcr_output.status.success() {
+        return Err(PlatformError::TpmCommandFailed(format!(
+            "tpm2_pcrread failed: {}",
+            String::from_utf8_lossy(&pcr_output.stderr)
+        )));
+    }
 
     // Build a policy session for PCR binding
     let policy_session = format!("{}/{}_session.ctx", dir, name);
@@ -491,7 +500,10 @@ pub fn tpm_seal(
         )));
     }
 
-    let _ = tpm2_command("tpm2_flushcontext").args([&policy_session]).output();
+    // Best-effort: flush the policy session context (non-critical cleanup)
+    if let Err(e) = tpm2_command("tpm2_flushcontext").args([&policy_session]).output() {
+        tracing::warn!("tpm2_flushcontext (seal policy session) failed: {}", e);
+    }
 
     // 3. Create sealed object with PCR policy, passing secret via stdin pipe
     use std::process::Stdio;
@@ -531,9 +543,13 @@ pub fn tpm_seal(
         )));
     }
 
-    // Clean up intermediate files
-    let _ = std::fs::remove_file(&primary_ctx);
-    let _ = std::fs::remove_file(&policy_path);
+    // Clean up intermediate files (best-effort: temp file removal)
+    if let Err(e) = std::fs::remove_file(&primary_ctx) {
+        tracing::warn!("failed to clean up TPM primary context {}: {}", primary_ctx, e);
+    }
+    if let Err(e) = std::fs::remove_file(&policy_path) {
+        tracing::warn!("failed to clean up TPM policy digest {}: {}", policy_path, e);
+    }
 
     tracing::info!(
         "platform: sealed '{}' to vTPM (PCR policy {}) at {}",
@@ -600,7 +616,10 @@ pub fn tpm_unseal(
         })?;
 
     if !output.status.success() {
-        let _ = std::fs::remove_file(&primary_ctx);
+        // Best-effort cleanup on error path
+        std::fs::remove_file(&primary_ctx).unwrap_or_else(|e| {
+            tracing::warn!("cleanup: failed to remove {}: {}", primary_ctx, e);
+        });
         return Err(PlatformError::TpmCommandFailed(format!(
             "tpm2_load failed: {}",
             String::from_utf8_lossy(&output.stderr)
@@ -617,8 +636,13 @@ pub fn tpm_unseal(
         })?;
 
     if !output.status.success() {
-        let _ = std::fs::remove_file(&primary_ctx);
-        let _ = std::fs::remove_file(&loaded_ctx);
+        // Best-effort cleanup on error path
+        std::fs::remove_file(&primary_ctx).unwrap_or_else(|e| {
+            tracing::warn!("cleanup: failed to remove {}: {}", primary_ctx, e);
+        });
+        std::fs::remove_file(&loaded_ctx).unwrap_or_else(|e| {
+            tracing::warn!("cleanup: failed to remove {}: {}", loaded_ctx, e);
+        });
         return Err(PlatformError::TpmCommandFailed(format!(
             "tpm2_startauthsession failed: {}",
             String::from_utf8_lossy(&output.stderr)
@@ -633,9 +657,16 @@ pub fn tpm_unseal(
         })?;
 
     if !output.status.success() {
-        let _ = std::fs::remove_file(&primary_ctx);
-        let _ = std::fs::remove_file(&loaded_ctx);
-        let _ = tpm2_command("tpm2_flushcontext").args([&policy_session]).output();
+        // Best-effort cleanup on error path
+        std::fs::remove_file(&primary_ctx).unwrap_or_else(|e| {
+            tracing::warn!("cleanup: failed to remove {}: {}", primary_ctx, e);
+        });
+        std::fs::remove_file(&loaded_ctx).unwrap_or_else(|e| {
+            tracing::warn!("cleanup: failed to remove {}: {}", loaded_ctx, e);
+        });
+        if let Err(e) = tpm2_command("tpm2_flushcontext").args([&policy_session]).output() {
+            tracing::warn!("cleanup: tpm2_flushcontext failed: {}", e);
+        }
         return Err(PlatformError::TpmCommandFailed(format!(
             "tpm2_policypcr (unseal) failed — PCR values may have changed: {}",
             String::from_utf8_lossy(&output.stderr)
@@ -654,13 +685,21 @@ pub fn tpm_unseal(
             PlatformError::TpmCommandFailed(format!("tpm2_unseal: {}", e))
         })?;
 
-    // Clean up contexts
-    let _ = std::fs::remove_file(&primary_ctx);
-    let _ = std::fs::remove_file(&loaded_ctx);
-    let _ = tpm2_command("tpm2_flushcontext").args([&policy_session]).output();
+    // Clean up contexts (best-effort: temp file removal)
+    std::fs::remove_file(&primary_ctx).unwrap_or_else(|e| {
+        tracing::warn!("cleanup: failed to remove {}: {}", primary_ctx, e);
+    });
+    std::fs::remove_file(&loaded_ctx).unwrap_or_else(|e| {
+        tracing::warn!("cleanup: failed to remove {}: {}", loaded_ctx, e);
+    });
+    if let Err(e) = tpm2_command("tpm2_flushcontext").args([&policy_session]).output() {
+        tracing::warn!("cleanup: tpm2_flushcontext failed: {}", e);
+    }
 
     if !output.status.success() {
-        let _ = std::fs::remove_file(&unsealed_path);
+        std::fs::remove_file(&unsealed_path).unwrap_or_else(|e| {
+            tracing::warn!("cleanup: failed to remove unsealed temp {}: {}", unsealed_path, e);
+        });
         return Err(PlatformError::TpmCommandFailed(format!(
             "tpm2_unseal failed — boot chain may have changed (PCR mismatch): {}",
             String::from_utf8_lossy(&output.stderr)
@@ -671,7 +710,9 @@ pub fn tpm_unseal(
     let secret = std::fs::read(&unsealed_path).map_err(|e| {
         PlatformError::IoError(format!("cannot read unsealed data: {}", e))
     })?;
-    let _ = std::fs::remove_file(&unsealed_path);
+    std::fs::remove_file(&unsealed_path).unwrap_or_else(|e| {
+        tracing::warn!("cleanup: failed to remove unsealed temp {}: {}", unsealed_path, e);
+    });
 
     // mlock the Vec's memory to prevent swapping.
     // Note: common crate forbids unsafe_code. The crypto::memguard module

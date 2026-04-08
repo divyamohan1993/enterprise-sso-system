@@ -87,7 +87,7 @@ impl BuildManifest {
 /// Compute the SHA-512 hash of a file and return it as a hex string (CNSA 2.0).
 ///
 /// Used to hash compiled binaries for the build manifest.
-pub fn sha256_file(path: &Path) -> Result<String, String> {
+pub fn sha512_file(path: &Path) -> Result<String, String> {
     let data = std::fs::read(path)
         .map_err(|e| format!("Failed to read file '{}': {}", path.display(), e))?;
     let hash = Sha512::digest(&data);
@@ -95,9 +95,21 @@ pub fn sha256_file(path: &Path) -> Result<String, String> {
 }
 
 /// Compute the SHA-512 hash of a byte slice and return it as a hex string (CNSA 2.0).
-pub fn sha256_bytes(data: &[u8]) -> String {
+pub fn sha512_bytes(data: &[u8]) -> String {
     let hash = Sha512::digest(data);
     hex::encode(hash)
+}
+
+/// Deprecated: use [`sha512_file`] instead. This was misnamed; it computes SHA-512.
+#[deprecated(since = "0.2.0", note = "renamed to sha512_file (computes SHA-512, not SHA-256)")]
+pub fn sha256_file(path: &Path) -> Result<String, String> {
+    sha512_file(path)
+}
+
+/// Deprecated: use [`sha512_bytes`] instead. This was misnamed; it computes SHA-512.
+#[deprecated(since = "0.2.0", note = "renamed to sha512_bytes (computes SHA-512, not SHA-256)")]
+pub fn sha256_bytes(data: &[u8]) -> String {
+    sha512_bytes(data)
 }
 
 /// Verify that a binary file on disk matches the hash recorded in a manifest.
@@ -105,7 +117,7 @@ pub fn sha256_bytes(data: &[u8]) -> String {
 /// Returns `Ok(true)` if the hash matches, `Ok(false)` if it does not,
 /// or `Err` if the file cannot be read.
 pub fn verify_binary_integrity(binary_path: &Path, manifest: &BuildManifest) -> Result<bool, String> {
-    let actual_hash = sha256_file(binary_path)?;
+    let actual_hash = sha512_file(binary_path)?;
     Ok({
         use subtle::ConstantTimeEq;
         bool::from(actual_hash.as_bytes().ct_eq(manifest.binary_hash.as_bytes()))
@@ -289,8 +301,8 @@ mod tests {
     }
 
     #[test]
-    fn test_sha256_bytes() {
-        let hash = sha256_bytes(b"hello world");
+    fn test_sha512_bytes() {
+        let hash = sha512_bytes(b"hello world");
         assert_eq!(
             hash,
             "309ecc489c12d6eb4cc40f50c902f2b4d0ed77ee511a7c7a9bcd3ca86d4cd86f989dd35bc5ff499670da34255b45b0cfd830e81f605dcf7dc5542e93ae9cd76f"
@@ -298,8 +310,8 @@ mod tests {
     }
 
     #[test]
-    fn test_sha256_file() {
-        let dir = std::env::temp_dir().join("sha256_file_test");
+    fn test_sha512_file() {
+        let dir = std::env::temp_dir().join("sha512_file_test");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("testfile.bin");
 
@@ -307,7 +319,7 @@ mod tests {
         f.write_all(b"hello world").unwrap();
         drop(f);
 
-        let hash = sha256_file(&path).unwrap();
+        let hash = sha512_file(&path).unwrap();
         assert_eq!(
             hash,
             "309ecc489c12d6eb4cc40f50c902f2b4d0ed77ee511a7c7a9bcd3ca86d4cd86f989dd35bc5ff499670da34255b45b0cfd830e81f605dcf7dc5542e93ae9cd76f"
@@ -326,7 +338,7 @@ mod tests {
         f.write_all(b"test binary content").unwrap();
         drop(f);
 
-        let expected_hash = sha256_file(&path).unwrap();
+        let expected_hash = sha512_file(&path).unwrap();
         let manifest = BuildManifest::new(
             "abc", "rustc 1.75.0", "cargo 1.75.0",
             "x86_64-unknown-linux-gnu", "",
@@ -396,5 +408,13 @@ mod tests {
     fn test_build_manifest_from_nonexistent_file() {
         let result = BuildManifest::from_file(Path::new("/nonexistent/manifest.json"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sha512_output_length_is_64_bytes() {
+        let hash = sha512_bytes(b"test data");
+        // SHA-512 produces 64 bytes = 128 hex characters
+        let raw_bytes = hex::decode(&hash).expect("hash should be valid hex");
+        assert_eq!(raw_bytes.len(), 64, "SHA-512 output must be 64 bytes");
     }
 }

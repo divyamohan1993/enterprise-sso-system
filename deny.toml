@@ -186,6 +186,8 @@ deny = [
     { crate = "openssl-sys", reason = "Use rustls instead — avoid linking to OpenSSL C library" },
     { crate = "cpython", reason = "Avoid embedding CPython — use pure-Rust alternatives" },
     { crate = "rustls-pemfile", reason = "UNMAINTAINED (RUSTSEC-2025-0134) — use rustls-pki-types PemObject or inline PEM parsing" },
+    { crate = "ring", reason = "Use aws-lc-rs instead — ring lacks FIPS certification and post-quantum readiness required for CNSA 2.0" },
+    { crate = "libsqlite3-sys", reason = "Avoid native SQLite C dependency — use rusqlite with bundled feature or pure-Rust alternative" },
 ]
 
 # List of features to allow/deny

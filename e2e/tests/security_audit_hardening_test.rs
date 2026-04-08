@@ -179,7 +179,7 @@ fn password_max_length_capped() {
     // 128-byte password must work
     let pwd_128 = vec![b'A'; 128];
     let mut store_mut = store;
-    let _uid = store_mut.register_with_password("user128", &pwd_128);
+    let _uid = store_mut.register_with_password("user128", &pwd_128).unwrap();
 
     // Verify the property that passwords over 128 bytes should NOT be
     // accepted in a real deployment (admin HTTP layer enforces this).

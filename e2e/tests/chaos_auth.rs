@@ -87,7 +87,7 @@ fn test_opaque_correct_password_after_registration() {
     use opaque::store::CredentialStore;
 
     let mut store = CredentialStore::new();
-    let _uid = store.register_with_password("chaos_user", b"correct_password");
+    let _uid = store.register_with_password("chaos_user", b"correct_password").unwrap();
 
     // Verify the correct password.
     let result = store.verify_password("chaos_user", b"correct_password");

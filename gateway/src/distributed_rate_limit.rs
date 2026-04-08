@@ -340,6 +340,15 @@ impl RedisClient {
 
         // AUTH if MILNET_REDIS_PASSWORD is set
         if let Ok(password) = std::env::var("MILNET_REDIS_PASSWORD") {
+            // SECURITY: Overwrite env var with zeros then remove IMMEDIATELY after reading.
+            // NOTE: On Linux, /proc/PID/environ is an immutable snapshot from execve.
+            // std::env::remove_var() only removes from libc's environ pointer -- it does
+            // NOT erase the original /proc/PID/environ content. A root attacker can always
+            // read the initial environment. For true protection, pass secrets via fd passing.
+            let zeros = "0".repeat(password.len());
+            std::env::set_var("MILNET_REDIS_PASSWORD", &zeros);
+            std::env::remove_var("MILNET_REDIS_PASSWORD");
+
             if !password.is_empty() {
                 let response = client.resp_command(&["AUTH", &password]).await?;
                 if !response.contains("+OK") {

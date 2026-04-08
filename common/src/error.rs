@@ -61,6 +61,15 @@ pub enum MilnetError {
 
     #[error("canary violation — possible memory corruption")]
     CanaryViolation,
+
+    #[error("capacity exceeded: {0}")]
+    CapacityExceeded(String),
+
+    #[error("user already registered: {0}")]
+    AlreadyRegistered(String),
+
+    #[error("OIDC nonce mismatch")]
+    OidcNonceMismatch,
 }
 
 impl MilnetError {
@@ -131,6 +140,15 @@ impl MilnetError {
             }
             MilnetError::CanaryViolation => {
                 "Memory integrity check failed. Contact your administrator immediately."
+            }
+            MilnetError::CapacityExceeded(_) => {
+                "The system has reached its user capacity. Contact your administrator."
+            }
+            MilnetError::AlreadyRegistered(_) => {
+                "This username is already registered. Use re-registration if authorized."
+            }
+            MilnetError::OidcNonceMismatch => {
+                "Authentication failed due to a security check. Please try again."
             }
         }
     }

@@ -93,7 +93,7 @@ async fn orchestrator_processes_auth() {
 
     // Create a real OPAQUE credential store with a registered user
     let mut store = CredentialStore::new();
-    let user_id = store.register_with_password("alice", b"password123");
+    let user_id = store.register_with_password("alice", b"password123").unwrap();
     let _server_setup_bytes = store.server_setup().serialize().to_vec();
 
     // Generate shared CA and certs for mTLS — all parties trust the same CA
@@ -267,7 +267,7 @@ async fn orchestrator_handles_opaque_failure() {
 
     // Create store with a registered user
     let mut store = CredentialStore::new();
-    store.register_with_password("alice", b"password123");
+    store.register_with_password("alice", b"password123").unwrap();
 
     // Generate shared CA and certs for mTLS
     let ca = generate_ca();

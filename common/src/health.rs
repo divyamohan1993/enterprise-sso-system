@@ -415,8 +415,11 @@ where
                     \r\n\
                     connection limit exceeded";
                 use tokio::io::AsyncWriteExt;
-                let _ = stream.write_all(msg).await;
-                let _ = stream.shutdown().await;
+                // Best-effort: error response on overloaded connection
+                if let Err(e) = stream.write_all(msg).await {
+                    tracing::debug!("health: failed to write 503 to peer: {}", e);
+                }
+                let _intentional_shutdown = stream.shutdown().await;
                 continue;
             }
 
@@ -463,8 +466,11 @@ where
                         \r\n\
                         unauthorized";
                     use tokio::io::AsyncWriteExt;
-                    let _ = stream.write_all(msg).await;
-                    let _ = stream.shutdown().await;
+                    // Best-effort: error response to unauthorized client
+                    if let Err(e) = stream.write_all(msg).await {
+                        tracing::debug!("health: failed to write 401 to peer: {}", e);
+                    }
+                    let _intentional_shutdown = stream.shutdown().await;
                     continue;
                 }
             } else {
@@ -479,8 +485,11 @@ where
                         \r\n\
                         forbidden";
                     use tokio::io::AsyncWriteExt;
-                    let _ = stream.write_all(msg).await;
-                    let _ = stream.shutdown().await;
+                    // Best-effort: error response to non-loopback client
+                    if let Err(e) = stream.write_all(msg).await {
+                        tracing::debug!("health: failed to write 403 to peer: {}", e);
+                    }
+                    let _intentional_shutdown = stream.shutdown().await;
                     continue;
                 }
             }
@@ -497,8 +506,11 @@ where
                     \r\n\
                     rate limit exceeded";
                 use tokio::io::AsyncWriteExt;
-                let _ = stream.write_all(msg).await;
-                let _ = stream.shutdown().await;
+                // Best-effort: error response to rate-limited client
+                if let Err(e) = stream.write_all(msg).await {
+                    tracing::debug!("health: failed to write 429 to peer: {}", e);
+                }
+                let _intentional_shutdown = stream.shutdown().await;
                 continue;
             }
 
@@ -533,9 +545,13 @@ where
             );
 
             use tokio::io::AsyncWriteExt;
-            let _ = stream.write_all(http_response.as_bytes()).await;
-            let _ = stream.write_all(&body).await;
-            let _ = stream.shutdown().await;
+            // Best-effort: health response write to client
+            if let Err(e) = stream.write_all(http_response.as_bytes()).await {
+                tracing::debug!("health: failed to write response header: {}", e);
+            } else if let Err(e) = stream.write_all(&body).await {
+                tracing::debug!("health: failed to write response body: {}", e);
+            }
+            let _intentional_shutdown = stream.shutdown().await;
 
             concurrent.fetch_sub(1, Ordering::Release);
         }

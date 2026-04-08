@@ -412,7 +412,7 @@ async fn test_attack_ddos_puzzle_prevents_unauthenticated_flood() {
     // Spawn gateway. Send bogus connections that DON'T solve the puzzle.
     // Gateway must reject all without forwarding to orchestrator.
     let mut store = CredentialStore::new();
-    store.register_with_password("admin", b"password123");
+    store.register_with_password("admin", b"password123").unwrap();
     let (gateway_addr, _) = boot_full_system(store).await;
 
     // Send 8 unsolved puzzle connections sequentially (within per-IP
@@ -451,7 +451,7 @@ async fn test_attack_ddos_puzzle_prevents_unauthenticated_flood() {
 async fn test_attack_ddos_wrong_puzzle_flood() {
     // Send connections with WRONG puzzle solutions. All must be rejected.
     let mut store = CredentialStore::new();
-    store.register_with_password("admin", b"password123");
+    store.register_with_password("admin", b"password123").unwrap();
     let (gateway_addr, _) = boot_full_system(store).await;
 
     // Send sequentially to avoid overwhelming the test gateway.
@@ -492,7 +492,7 @@ async fn test_attack_ddos_concurrent_legitimate_under_load() {
     // We send 4 bogus + 3 legitimate = 7 total connections.
     let mut store = CredentialStore::new();
     for i in 0..20 {
-        store.register_with_password(&format!("user{i}"), format!("pass{i}").as_bytes());
+        store.register_with_password(&format!("user{i}"), format!("pass{i}").as_bytes()).unwrap();
     }
     let (gateway_addr, group_key) = boot_full_system(store).await;
 
@@ -550,7 +550,7 @@ async fn test_attack_credential_stuffing_attack() {
     // and account lockout threshold (5 failed attempts).
     // We use 4 wrong + 1 correct = 5 total connections (under lockout limit).
     let mut store = CredentialStore::new();
-    store.register_with_password("admin", b"correct_password");
+    store.register_with_password("admin", b"correct_password").unwrap();
     let (gateway_addr, group_key) = boot_full_system(store).await;
 
     // 4 wrong passwords — stays under the 5-attempt lockout threshold
@@ -582,7 +582,7 @@ async fn test_attack_password_spray_attack() {
     // We use 4 wrong + 4 correct = 8 total connections.
     let mut store = CredentialStore::new();
     for i in 0..10 {
-        store.register_with_password(&format!("user{i}"), format!("correct{i}").as_bytes());
+        store.register_with_password(&format!("user{i}"), format!("correct{i}").as_bytes()).unwrap();
     }
     let (gateway_addr, group_key) = boot_full_system(store).await;
 
@@ -617,7 +617,7 @@ async fn test_attack_timing_attack_on_password_verification() {
     // The times should be similar (within 20% variance) to prevent timing oracles.
     //
     let mut store = CredentialStore::new();
-    store.register_with_password("alice", b"known_password");
+    store.register_with_password("alice", b"known_password").unwrap();
     let (gateway_addr, _) = boot_full_system(store).await;
 
     // Warm up (first connection may be slower)

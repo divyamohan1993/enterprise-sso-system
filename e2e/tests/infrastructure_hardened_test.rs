@@ -946,7 +946,7 @@ fn opaque_credential_store_write_through() {
     let mut store = opaque::store::CredentialStore::new();
 
     // Store a registration.
-    let user_id = store.store_registration("alice", vec![1, 2, 3, 4]);
+    let user_id = store.store_registration("alice", vec![1, 2, 3, 4]).unwrap();
     assert!(store.user_exists("alice"));
     assert!(!store.user_exists("bob"));
 
@@ -954,14 +954,18 @@ fn opaque_credential_store_write_through() {
     assert_eq!(store.get_user_id("alice"), Some(user_id));
 
     // Store another user.
-    let bob_id = store.store_registration("bob", vec![5, 6, 7, 8]);
+    let bob_id = store.store_registration("bob", vec![5, 6, 7, 8]).unwrap();
     assert!(store.user_exists("bob"));
     assert_ne!(user_id, bob_id);
 
-    // Overwrite alice's registration (simulating re-enrollment).
-    let alice_id2 = store.store_registration("alice", vec![10, 20, 30]);
+    // Duplicate registration is rejected (use re_register_user for re-enrollment).
+    let dup_result = store.store_registration("alice", vec![10, 20, 30]);
+    assert!(dup_result.is_err(), "duplicate store_registration must fail");
+
+    // Authorized re-registration works.
+    let alice_id2 = store.re_register_user("alice", vec![10, 20, 30]).unwrap();
     assert!(store.user_exists("alice"));
-    // New user_id is generated on overwrite.
+    // New user_id is generated on re-registration.
     assert_ne!(user_id, alice_id2);
 }
 

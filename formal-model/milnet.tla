@@ -28,7 +28,8 @@ CONSTANTS
     DKGParticipants,    \* Set of DKG participant identifiers
     ShamirNodes,        \* Set of Shamir secret sharing nodes (13 for Tier 4)
     ShamirThreshold,    \* Minimum Shamir shares for emergency recovery (7)
-    MaxEpochs           \* Bound on ratchet epochs for model checking
+    MaxEpochs,          \* Bound on ratchet epochs for model checking
+    MaxElevationDuration \* Maximum steps a token elevation can last
 
 VARIABLES
     \* ── Tier 2 Ceremony (original) ──
@@ -71,7 +72,11 @@ VARIABLES
     \* ── Key Rotation ──
     activeKeyId,        \* Current active signing key generation ID
     keyTransition,      \* [old_key, new_key, phase] or NULL
-    keysInService       \* Set of key IDs accepted by verifiers
+    keysInService,      \* Set of key IDs accepted by verifiers
+
+    \* ── Adversary Model ──
+    compromisedServers,        \* Set of servers where adversary attempted password extraction
+    compromisedDKGParticipants \* Set of compromised DKG participants
 
 \* All variables grouped
 vars == <<ceremonies, tokens, verified, compromised, nextSessionId, nonceCtr,
@@ -81,7 +86,8 @@ vars == <<ceremonies, tokens, verified, compromised, nextSessionId, nonceCtr,
           ratchetEpoch, ratchetHistory,
           userClearance, dataClassification, accessLog,
           revokedTokens, globalStep,
-          activeKeyId, keyTransition, keysInService>>
+          activeKeyId, keyTransition, keysInService,
+          compromisedServers, compromisedDKGParticipants>>
 
 (**************************************************************************)
 (* Type invariant                                                         *)
@@ -100,6 +106,8 @@ TypeOK ==
     /\ nextDKGId \in Nat
     /\ globalStep \in Nat
     /\ activeKeyId \in Nat
+    /\ compromisedServers \subseteq TSSNodes
+    /\ compromisedDKGParticipants \subseteq DKGParticipants
 
 (**************************************************************************)
 (* Initial state                                                          *)
@@ -136,6 +144,9 @@ Init ==
     /\ activeKeyId = 1
     /\ keyTransition = [old_key |-> 0, new_key |-> 0, phase |-> "none"]
     /\ keysInService = {1}
+    \* Adversary Model
+    /\ compromisedServers = {}
+    /\ compromisedDKGParticipants = {}
 
 (**************************************************************************)
 (* Helpers                                                                *)
@@ -165,7 +176,8 @@ StartCeremony(user) ==
                    ratchetEpoch, ratchetHistory,
                    userClearance, dataClassification, accessLog,
                    revokedTokens, globalStep,
-                   activeKeyId, keyTransition, keysInService>>
+                   activeKeyId, keyTransition, keysInService,
+                   compromisedServers, compromisedDKGParticipants>>
 
 OpaqueAuth(sid) ==
     /\ sid \in ActiveCeremonies
@@ -178,7 +190,8 @@ OpaqueAuth(sid) ==
                    ratchetEpoch, ratchetHistory,
                    userClearance, dataClassification, accessLog,
                    revokedTokens, globalStep,
-                   activeKeyId, keyTransition, keysInService>>
+                   activeKeyId, keyTransition, keysInService,
+                   compromisedServers, compromisedDKGParticipants>>
 
 CollectReceipts(sid) ==
     /\ sid \in ActiveCeremonies
@@ -190,7 +203,8 @@ CollectReceipts(sid) ==
                    ratchetEpoch, ratchetHistory,
                    userClearance, dataClassification, accessLog,
                    revokedTokens, globalStep,
-                   activeKeyId, keyTransition, keysInService>>
+                   activeKeyId, keyTransition, keysInService,
+                   compromisedServers, compromisedDKGParticipants>>
 
 ThresholdSign(sid) ==
     /\ sid \in ActiveCeremonies
@@ -203,7 +217,7 @@ ThresholdSign(sid) ==
                     tier |-> 2, classification |-> 0,
                     audience |-> "default", epoch |-> 0,
                     revoked |-> FALSE, expiry_step |-> globalStep + 10,
-                    key_id |-> activeKeyId]
+                    key_id |-> activeKeyId, issued_step |-> globalStep]
        IN tokens' = tokens \union {tok}
     /\ nonceCtr' = [n \in TSSNodes |->
                         IF n \in HonestNodes
@@ -215,7 +229,8 @@ ThresholdSign(sid) ==
                    ratchetEpoch, ratchetHistory,
                    userClearance, dataClassification, accessLog,
                    revokedTokens, globalStep,
-                   activeKeyId, keyTransition, keysInService>>
+                   activeKeyId, keyTransition, keysInService,
+                   compromisedServers, compromisedDKGParticipants>>
 
 VerifyToken(tok) ==
     /\ tok \in tokens
@@ -231,7 +246,8 @@ VerifyToken(tok) ==
                    ratchetEpoch, ratchetHistory,
                    userClearance, dataClassification, accessLog,
                    revokedTokens, globalStep,
-                   activeKeyId, keyTransition, keysInService>>
+                   activeKeyId, keyTransition, keysInService,
+                   compromisedServers, compromisedDKGParticipants>>
 
 CompromiseNode(node) ==
     /\ node \in TSSNodes
@@ -243,7 +259,8 @@ CompromiseNode(node) ==
                    ratchetEpoch, ratchetHistory,
                    userClearance, dataClassification, accessLog,
                    revokedTokens, globalStep,
-                   activeKeyId, keyTransition, keysInService>>
+                   activeKeyId, keyTransition, keysInService,
+                   compromisedServers, compromisedDKGParticipants>>
 
 ForgeAttempt(user) ==
     /\ user \in Users
@@ -252,7 +269,7 @@ ForgeAttempt(user) ==
                    tier |-> 2, classification |-> 0,
                    audience |-> "default", epoch |-> 0,
                    revoked |-> FALSE, expiry_step |-> globalStep + 10,
-                   key_id |-> activeKeyId]
+                   key_id |-> activeKeyId, issued_step |-> globalStep]
        IN tokens' = tokens \union {tok}
     /\ UNCHANGED <<ceremonies, verified, compromised, nextSessionId, nonceCtr,
                    tier1Ceremonies, tier3Ceremonies, tier4Ceremonies,
@@ -260,7 +277,8 @@ ForgeAttempt(user) ==
                    ratchetEpoch, ratchetHistory,
                    userClearance, dataClassification, accessLog,
                    revokedTokens, globalStep,
-                   activeKeyId, keyTransition, keysInService>>
+                   activeKeyId, keyTransition, keysInService,
+                   compromisedServers, compromisedDKGParticipants>>
 
 (**************************************************************************)
 (* ═══════════════════════════════════════════════════════════════════════ *)
@@ -283,7 +301,8 @@ Tier1Start(user) ==
                    ratchetEpoch, ratchetHistory,
                    userClearance, dataClassification, accessLog,
                    revokedTokens, globalStep,
-                   activeKeyId, keyTransition, keysInService>>
+                   activeKeyId, keyTransition, keysInService,
+                   compromisedServers, compromisedDKGParticipants>>
 
 \* 3-person ceremony: FIDO2 authenticator verification
 Tier1FIDO2(sid) ==
@@ -297,7 +316,8 @@ Tier1FIDO2(sid) ==
                    ratchetEpoch, ratchetHistory,
                    userClearance, dataClassification, accessLog,
                    revokedTokens, globalStep,
-                   activeKeyId, keyTransition, keysInService>>
+                   activeKeyId, keyTransition, keysInService,
+                   compromisedServers, compromisedDKGParticipants>>
 
 \* Risk scoring: compute and evaluate risk before issuing token
 Tier1RiskEval(sid) ==
@@ -313,7 +333,8 @@ Tier1RiskEval(sid) ==
                    ratchetEpoch, ratchetHistory,
                    userClearance, dataClassification, accessLog,
                    revokedTokens, globalStep,
-                   activeKeyId, keyTransition, keysInService>>
+                   activeKeyId, keyTransition, keysInService,
+                   compromisedServers, compromisedDKGParticipants>>
 
 Tier1IssueToken(sid) ==
     /\ sid \in DOMAIN tier1Ceremonies
@@ -327,7 +348,7 @@ Tier1IssueToken(sid) ==
                     tier |-> 1, classification |-> 3,
                     audience |-> "sovereign", epoch |-> 0,
                     revoked |-> FALSE, expiry_step |-> globalStep + 10,
-                    key_id |-> activeKeyId]
+                    key_id |-> activeKeyId, issued_step |-> globalStep]
        IN tokens' = tokens \union {tok}
     /\ UNCHANGED <<ceremonies, verified, compromised, nextSessionId, nonceCtr,
                    tier3Ceremonies, tier4Ceremonies,
@@ -335,7 +356,8 @@ Tier1IssueToken(sid) ==
                    ratchetEpoch, ratchetHistory,
                    userClearance, dataClassification, accessLog,
                    revokedTokens, globalStep,
-                   activeKeyId, keyTransition, keysInService>>
+                   activeKeyId, keyTransition, keysInService,
+                   compromisedServers, compromisedDKGParticipants>>
 
 (**************************************************************************)
 (* ═══════════════════════════════════════════════════════════════════════ *)
@@ -357,7 +379,8 @@ Tier3Start(user) ==
                    ratchetEpoch, ratchetHistory,
                    userClearance, dataClassification, accessLog,
                    revokedTokens, globalStep,
-                   activeKeyId, keyTransition, keysInService>>
+                   activeKeyId, keyTransition, keysInService,
+                   compromisedServers, compromisedDKGParticipants>>
 
 \* Device attestation verification (TPM/secure element)
 Tier3Attestation(sid) ==
@@ -371,7 +394,8 @@ Tier3Attestation(sid) ==
                    ratchetEpoch, ratchetHistory,
                    userClearance, dataClassification, accessLog,
                    revokedTokens, globalStep,
-                   activeKeyId, keyTransition, keysInService>>
+                   activeKeyId, keyTransition, keysInService,
+                   compromisedServers, compromisedDKGParticipants>>
 
 Tier3IssueToken(sid) ==
     /\ sid \in DOMAIN tier3Ceremonies
@@ -385,7 +409,7 @@ Tier3IssueToken(sid) ==
                     tier |-> 3, classification |-> 0,
                     audience |-> "sensor", epoch |-> 0,
                     revoked |-> FALSE, expiry_step |-> globalStep + 5,
-                    key_id |-> activeKeyId]
+                    key_id |-> activeKeyId, issued_step |-> globalStep]
        IN tokens' = tokens \union {tok}
     /\ UNCHANGED <<ceremonies, verified, compromised, nextSessionId, nonceCtr,
                    tier1Ceremonies, tier4Ceremonies,
@@ -393,7 +417,8 @@ Tier3IssueToken(sid) ==
                    ratchetEpoch, ratchetHistory,
                    userClearance, dataClassification, accessLog,
                    revokedTokens, globalStep,
-                   activeKeyId, keyTransition, keysInService>>
+                   activeKeyId, keyTransition, keysInService,
+                   compromisedServers, compromisedDKGParticipants>>
 
 (**************************************************************************)
 (* ═══════════════════════════════════════════════════════════════════════ *)
@@ -416,7 +441,8 @@ Tier4Start(user) ==
                    ratchetEpoch, ratchetHistory,
                    userClearance, dataClassification, accessLog,
                    revokedTokens, globalStep,
-                   activeKeyId, keyTransition, keysInService>>
+                   activeKeyId, keyTransition, keysInService,
+                   compromisedServers, compromisedDKGParticipants>>
 
 \* Collect Shamir shares (one at a time, needs 7-of-13)
 Tier4CollectShare(sid) ==
@@ -434,7 +460,8 @@ Tier4CollectShare(sid) ==
                    ratchetEpoch, ratchetHistory,
                    userClearance, dataClassification, accessLog,
                    revokedTokens, globalStep,
-                   activeKeyId, keyTransition, keysInService>>
+                   activeKeyId, keyTransition, keysInService,
+                   compromisedServers, compromisedDKGParticipants>>
 
 \* Out-of-band verification (phone call, in-person, etc.)
 Tier4OOBVerify(sid) ==
@@ -448,7 +475,8 @@ Tier4OOBVerify(sid) ==
                    ratchetEpoch, ratchetHistory,
                    userClearance, dataClassification, accessLog,
                    revokedTokens, globalStep,
-                   activeKeyId, keyTransition, keysInService>>
+                   activeKeyId, keyTransition, keysInService,
+                   compromisedServers, compromisedDKGParticipants>>
 
 Tier4IssueToken(sid) ==
     /\ sid \in DOMAIN tier4Ceremonies
@@ -462,7 +490,7 @@ Tier4IssueToken(sid) ==
                     tier |-> 4, classification |-> 3,
                     audience |-> "emergency", epoch |-> 0,
                     revoked |-> FALSE, expiry_step |-> globalStep + 3,
-                    key_id |-> activeKeyId]
+                    key_id |-> activeKeyId, issued_step |-> globalStep]
        IN tokens' = tokens \union {tok}
     /\ UNCHANGED <<ceremonies, verified, compromised, nextSessionId, nonceCtr,
                    tier1Ceremonies, tier3Ceremonies,
@@ -470,7 +498,8 @@ Tier4IssueToken(sid) ==
                    ratchetEpoch, ratchetHistory,
                    userClearance, dataClassification, accessLog,
                    revokedTokens, globalStep,
-                   activeKeyId, keyTransition, keysInService>>
+                   activeKeyId, keyTransition, keysInService,
+                   compromisedServers, compromisedDKGParticipants>>
 
 (**************************************************************************)
 (* ═══════════════════════════════════════════════════════════════════════ *)
@@ -494,7 +523,8 @@ DKGStart ==
                    opaqueState, ratchetEpoch, ratchetHistory,
                    userClearance, dataClassification, accessLog,
                    revokedTokens, globalStep,
-                   activeKeyId, keyTransition, keysInService>>
+                   activeKeyId, keyTransition, keysInService,
+                   compromisedServers, compromisedDKGParticipants>>
 
 DKGRound1Complete(did, participant) ==
     /\ did \in DOMAIN dkgSessions
@@ -512,7 +542,8 @@ DKGRound1Complete(did, participant) ==
                    opaqueState, ratchetEpoch, ratchetHistory,
                    userClearance, dataClassification, accessLog,
                    revokedTokens, globalStep,
-                   activeKeyId, keyTransition, keysInService>>
+                   activeKeyId, keyTransition, keysInService,
+                   compromisedServers, compromisedDKGParticipants>>
 
 DKGRound2Complete(did, participant) ==
     /\ did \in DOMAIN dkgSessions
@@ -531,7 +562,8 @@ DKGRound2Complete(did, participant) ==
                    opaqueState, ratchetEpoch, ratchetHistory,
                    userClearance, dataClassification, accessLog,
                    revokedTokens, globalStep,
-                   activeKeyId, keyTransition, keysInService>>
+                   activeKeyId, keyTransition, keysInService,
+                   compromisedServers, compromisedDKGParticipants>>
 
 (**************************************************************************)
 (* ═══════════════════════════════════════════════════════════════════════ *)
@@ -551,7 +583,8 @@ OPAQUEStart(user) ==
                    ratchetEpoch, ratchetHistory,
                    userClearance, dataClassification, accessLog,
                    revokedTokens, globalStep,
-                   activeKeyId, keyTransition, keysInService>>
+                   activeKeyId, keyTransition, keysInService,
+                   compromisedServers, compromisedDKGParticipants>>
 
 OPAQUEFinish(user) ==
     /\ user \in Users
@@ -565,7 +598,8 @@ OPAQUEFinish(user) ==
                    ratchetEpoch, ratchetHistory,
                    userClearance, dataClassification, accessLog,
                    revokedTokens, globalStep,
-                   activeKeyId, keyTransition, keysInService>>
+                   activeKeyId, keyTransition, keysInService,
+                   compromisedServers, compromisedDKGParticipants>>
 
 OPAQUEReset(user) ==
     /\ user \in Users
@@ -577,7 +611,8 @@ OPAQUEReset(user) ==
                    ratchetEpoch, ratchetHistory,
                    userClearance, dataClassification, accessLog,
                    revokedTokens, globalStep,
-                   activeKeyId, keyTransition, keysInService>>
+                   activeKeyId, keyTransition, keysInService,
+                   compromisedServers, compromisedDKGParticipants>>
 
 (**************************************************************************)
 (* ═══════════════════════════════════════════════════════════════════════ *)
@@ -597,7 +632,8 @@ RatchetInit(sid) ==
                    dkgSessions, nextDKGId, opaqueState,
                    userClearance, dataClassification, accessLog,
                    revokedTokens, globalStep,
-                   activeKeyId, keyTransition, keysInService>>
+                   activeKeyId, keyTransition, keysInService,
+                   compromisedServers, compromisedDKGParticipants>>
 
 RatchetAdvance(sid) ==
     /\ sid \in DOMAIN ratchetEpoch
@@ -612,7 +648,8 @@ RatchetAdvance(sid) ==
                    dkgSessions, nextDKGId, opaqueState,
                    userClearance, dataClassification, accessLog,
                    revokedTokens, globalStep,
-                   activeKeyId, keyTransition, keysInService>>
+                   activeKeyId, keyTransition, keysInService,
+                   compromisedServers, compromisedDKGParticipants>>
 
 (**************************************************************************)
 (* ═══════════════════════════════════════════════════════════════════════ *)
@@ -628,14 +665,15 @@ CrossDomainRead(user, resource) ==
     /\ LET uLevel == userClearance[user]
            dLevel == dataClassification[resource]
            allowed == uLevel >= dLevel    \* No read-up: user clearance >= data level
-       IN accessLog' = accessLog \union {[user |-> user, resource |-> resource, allowed |-> allowed]}
+       IN accessLog' = accessLog \union {[user |-> user, resource |-> resource, op |-> "read", allowed |-> allowed]}
     /\ UNCHANGED <<ceremonies, tokens, verified, compromised, nextSessionId, nonceCtr,
                    tier1Ceremonies, tier3Ceremonies, tier4Ceremonies,
                    dkgSessions, nextDKGId, opaqueState,
                    ratchetEpoch, ratchetHistory,
                    userClearance, dataClassification,
                    revokedTokens, globalStep,
-                   activeKeyId, keyTransition, keysInService>>
+                   activeKeyId, keyTransition, keysInService,
+                   compromisedServers, compromisedDKGParticipants>>
 
 \* Model write access: user writes to resource
 CrossDomainWrite(user, resource) ==
@@ -644,14 +682,15 @@ CrossDomainWrite(user, resource) ==
     /\ LET uLevel == userClearance[user]
            dLevel == dataClassification[resource]
            allowed == uLevel <= dLevel    \* No write-down: user clearance <= data level
-       IN accessLog' = accessLog \union {[user |-> user, resource |-> resource, allowed |-> allowed]}
+       IN accessLog' = accessLog \union {[user |-> user, resource |-> resource, op |-> "write", allowed |-> allowed]}
     /\ UNCHANGED <<ceremonies, tokens, verified, compromised, nextSessionId, nonceCtr,
                    tier1Ceremonies, tier3Ceremonies, tier4Ceremonies,
                    dkgSessions, nextDKGId, opaqueState,
                    ratchetEpoch, ratchetHistory,
                    userClearance, dataClassification,
                    revokedTokens, globalStep,
-                   activeKeyId, keyTransition, keysInService>>
+                   activeKeyId, keyTransition, keysInService,
+                   compromisedServers, compromisedDKGParticipants>>
 
 (**************************************************************************)
 (* ═══════════════════════════════════════════════════════════════════════ *)
@@ -671,7 +710,8 @@ RevokeToken(tok) ==
                    ratchetEpoch, ratchetHistory,
                    userClearance, dataClassification, accessLog,
                    globalStep,
-                   activeKeyId, keyTransition, keysInService>>
+                   activeKeyId, keyTransition, keysInService,
+                   compromisedServers, compromisedDKGParticipants>>
 
 \* Global clock tick (for token expiry)
 Tick ==
@@ -682,7 +722,8 @@ Tick ==
                    ratchetEpoch, ratchetHistory,
                    userClearance, dataClassification, accessLog,
                    revokedTokens,
-                   activeKeyId, keyTransition, keysInService>>
+                   activeKeyId, keyTransition, keysInService,
+                   compromisedServers, compromisedDKGParticipants>>
 
 (**************************************************************************)
 (* ═══════════════════════════════════════════════════════════════════════ *)
@@ -702,7 +743,8 @@ KeyRotationStart ==
                    ratchetEpoch, ratchetHistory,
                    userClearance, dataClassification, accessLog,
                    revokedTokens, globalStep,
-                   activeKeyId>>
+                   activeKeyId,
+                   compromisedServers, compromisedDKGParticipants>>
 
 \* Switch to new key for signing
 KeyRotationSwitch ==
@@ -715,7 +757,8 @@ KeyRotationSwitch ==
                    ratchetEpoch, ratchetHistory,
                    userClearance, dataClassification, accessLog,
                    revokedTokens, globalStep,
-                   keysInService>>
+                   keysInService,
+                   compromisedServers, compromisedDKGParticipants>>
 
 \* Complete rotation: remove old key from service
 KeyRotationComplete ==
@@ -732,7 +775,52 @@ KeyRotationComplete ==
                    ratchetEpoch, ratchetHistory,
                    userClearance, dataClassification, accessLog,
                    revokedTokens, globalStep,
-                   activeKeyId>>
+                   activeKeyId,
+                   compromisedServers, compromisedDKGParticipants>>
+
+(**************************************************************************)
+(* ═══════════════════════════════════════════════════════════════════════ *)
+(* ADVERSARY ACTIONS                                                       *)
+(* ═══════════════════════════════════════════════════════════════════════ *)
+(**************************************************************************)
+
+\* Adversary compromises a server and attempts password extraction.
+\* OPAQUE blindness ensures server_saw_password stays FALSE.
+ServerCompromise(node) ==
+    /\ node \in TSSNodes
+    /\ node \notin compromisedServers
+    /\ compromisedServers' = compromisedServers \union {node}
+    \* OPAQUE protocol guarantees: even with server compromise,
+    \* the server never sees the plaintext password.
+    \* server_saw_password remains FALSE for all users.
+    /\ UNCHANGED <<ceremonies, tokens, verified, compromised, nextSessionId, nonceCtr,
+                   tier1Ceremonies, tier3Ceremonies, tier4Ceremonies,
+                   dkgSessions, nextDKGId, opaqueState,
+                   ratchetEpoch, ratchetHistory,
+                   userClearance, dataClassification, accessLog,
+                   revokedTokens, globalStep,
+                   activeKeyId, keyTransition, keysInService,
+                   compromisedDKGParticipants>>
+
+\* Adversary compromises a DKG participant.
+\* Secret is only exposed when compromised count >= Threshold.
+CompromiseDKGParticipant(p) ==
+    /\ p \in DKGParticipants
+    /\ p \notin compromisedDKGParticipants
+    /\ compromisedDKGParticipants' = compromisedDKGParticipants \union {p}
+    /\ LET newCompromised == compromisedDKGParticipants \union {p}
+       IN IF Cardinality(newCompromised) >= Threshold
+          THEN dkgSessions' = [did \in DOMAIN dkgSessions |->
+                    [dkgSessions[did] EXCEPT !.secret_exposed = TRUE]]
+          ELSE UNCHANGED dkgSessions
+    /\ UNCHANGED <<ceremonies, tokens, verified, compromised, nextSessionId, nonceCtr,
+                   tier1Ceremonies, tier3Ceremonies, tier4Ceremonies,
+                   nextDKGId, opaqueState,
+                   ratchetEpoch, ratchetHistory,
+                   userClearance, dataClassification, accessLog,
+                   revokedTokens, globalStep,
+                   activeKeyId, keyTransition, keysInService,
+                   compromisedServers>>
 
 (**************************************************************************)
 (* Next-state relation                                                    *)
@@ -781,6 +869,9 @@ Next ==
     \/ KeyRotationStart
     \/ KeyRotationSwitch
     \/ KeyRotationComplete
+    \* Adversary
+    \/ \E n \in TSSNodes : ServerCompromise(n)
+    \/ \E p \in DKGParticipants : CompromiseDKGParticipant(p)
 
 Spec == Init /\ [][Next]_vars
 
@@ -929,7 +1020,7 @@ PIMNoSelfApproval ==
 \* in the future from *any* global step at which it could have been issued.
 PIMTimeBoundedElevation ==
     \A tok \in tokens :
-        tok.expiry_step <= tok.issued_step + 10
+        tok.expiry_step <= tok.issued_step + MaxElevationDuration
 
 \* SAFETY 18: Continuous Access Evaluation (CAE) — session re-evaluated on
 \* risk change.

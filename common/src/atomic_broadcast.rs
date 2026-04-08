@@ -156,7 +156,7 @@ impl BroadcastPersistence for FileBroadcastPersistence {
             let data = std::fs::read(&seq_path)
                 .map_err(|e| format!("read next_seq: {e}"))?;
             if data.len() == 8 {
-                u64::from_le_bytes(data.try_into().unwrap())
+                u64::from_le_bytes(data.try_into().expect("invariant: length checked on preceding line"))
             } else {
                 max_sequence + 1
             }
@@ -254,7 +254,7 @@ impl AtomicBroadcast {
     ///
     /// `quorum_size` is the number of acks required before a message is deliverable.
     /// For BFT with n=3f+1 nodes, quorum_size = 2f+1.
-    pub fn new(quorum_size: usize) -> Self {
+    pub fn new(quorum_size: usize) -> Result<Self, String> {
         Self::with_persistence(quorum_size, Box::new(NullBroadcastPersistence))
     }
 
@@ -265,8 +265,10 @@ impl AtomicBroadcast {
     pub fn with_persistence(
         quorum_size: usize,
         persistence: Box<dyn BroadcastPersistence>,
-    ) -> Self {
-        assert!(quorum_size >= 1, "quorum size must be >= 1");
+    ) -> Result<Self, String> {
+        if quorum_size < 1 {
+            return Err("quorum size must be >= 1".into());
+        }
         let (next_seq, delivered_hashes) = match persistence.load_state() {
             Ok(state) => (state.next_sequence, state.delivered_hashes),
             Err(e) => {
@@ -283,7 +285,7 @@ impl AtomicBroadcast {
             recovered_hashes = delivered_hashes.len(),
             "atomic broadcast initialized"
         );
-        Self {
+        Ok(Self {
             next_sequence: AtomicU64::new(next_seq),
             pending: RwLock::new(BTreeMap::new()),
             delivered: RwLock::new(Vec::new()),
@@ -292,7 +294,7 @@ impl AtomicBroadcast {
             delivered_hashes: RwLock::new(delivered_hashes),
             verifying_keys: RwLock::new(HashMap::new()),
             persistence,
-        }
+        })
     }
 
     /// Register an ML-DSA-87 verifying key for a node.
@@ -435,8 +437,13 @@ impl AtomicBroadcast {
                 break;
             }
 
-            let msg = pending.remove(&next_seq)
-                .expect("BUG: ready flag set but key absent from pending map");
+            let msg = match pending.remove(&next_seq) {
+                Some(m) => m,
+                None => {
+                    tracing::error!(seq = next_seq, "BUG: ready flag set but key absent from pending map");
+                    break;
+                }
+            };
             hashes.insert(msg.payload_hash);
             self.next_deliver_seq.fetch_add(1, Ordering::SeqCst);
             // Persist each delivered message and the updated sequence counter.
@@ -452,7 +459,7 @@ impl AtomicBroadcast {
             newly_delivered.push(msg);
         }
 
-        if !newly_delivered.is_empty() {
+        if let (Some(first), Some(last)) = (newly_delivered.first(), newly_delivered.last()) {
             PanelSiemEvent::new(
                 SiemPanel::KeyManagement,
                 SiemSeverity::Info,
@@ -460,8 +467,8 @@ impl AtomicBroadcast {
                 format!(
                     "Delivered {} messages (sequences {}-{})",
                     newly_delivered.len(),
-                    newly_delivered.first().unwrap().sequence,
-                    newly_delivered.last().unwrap().sequence,
+                    first.sequence,
+                    last.sequence,
                 ),
                 file!(),
                 line!(),
@@ -612,7 +619,7 @@ mod tests {
 
     #[test]
     fn broadcast_assigns_sequential_numbers() {
-        let ab = AtomicBroadcast::new(1);
+        let ab = AtomicBroadcast::new(1).unwrap();
         let s1 = ab.broadcast(b"msg1", "node-1").unwrap();
         let s2 = ab.broadcast(b"msg2", "node-1").unwrap();
         let s3 = ab.broadcast(b"msg3", "node-1").unwrap();
@@ -623,7 +630,7 @@ mod tests {
 
     #[test]
     fn deliver_requires_quorum_acks() {
-        let ab = AtomicBroadcast::new(3);
+        let ab = AtomicBroadcast::new(3).unwrap();
         let sk2 = register_node(&ab, "node-2");
         let sk3 = register_node(&ab, "node-3");
         let sk4 = register_node(&ab, "node-4");
@@ -650,7 +657,7 @@ mod tests {
 
     #[test]
     fn deliver_respects_total_order() {
-        let ab = AtomicBroadcast::new(1);
+        let ab = AtomicBroadcast::new(1).unwrap();
         let sk1 = register_node(&ab, "node-1");
 
         // Broadcast 3 messages
@@ -679,7 +686,7 @@ mod tests {
 
     #[test]
     fn deliver_gap_blocks_later_messages() {
-        let ab = AtomicBroadcast::new(1);
+        let ab = AtomicBroadcast::new(1).unwrap();
         let sk1 = register_node(&ab, "node-1");
 
         let _s1 = ab.broadcast(b"one", "node-1").unwrap();
@@ -695,7 +702,7 @@ mod tests {
 
     #[test]
     fn duplicate_ack_rejected() {
-        let ab = AtomicBroadcast::new(1);
+        let ab = AtomicBroadcast::new(1).unwrap();
         let sk2 = register_node(&ab, "node-2");
         let seq = ab.broadcast(b"msg", "node-1").unwrap();
 
@@ -706,28 +713,28 @@ mod tests {
 
     #[test]
     fn ack_nonexistent_sequence_rejected() {
-        let ab = AtomicBroadcast::new(1);
+        let ab = AtomicBroadcast::new(1).unwrap();
         // Sequence 999 was never broadcast, so this must fail regardless of signature.
         assert!(ab.receive_ack(999, "node-1", vec![0x01; 64]).is_err());
     }
 
     #[test]
     fn empty_ack_signature_rejected() {
-        let ab = AtomicBroadcast::new(1);
+        let ab = AtomicBroadcast::new(1).unwrap();
         let seq = ab.broadcast(b"msg", "node-1").unwrap();
         assert!(ab.receive_ack(seq, "node-2", Vec::new()).is_err());
     }
 
     #[test]
     fn duplicate_payload_rejected() {
-        let ab = AtomicBroadcast::new(1);
+        let ab = AtomicBroadcast::new(1).unwrap();
         ab.broadcast(b"same-payload", "node-1").unwrap();
         assert!(ab.broadcast(b"same-payload", "node-2").is_err());
     }
 
     #[test]
     fn duplicate_payload_rejected_after_delivery() {
-        let ab = AtomicBroadcast::new(1);
+        let ab = AtomicBroadcast::new(1).unwrap();
         let sk1 = register_node(&ab, "node-1");
         let seq = ab.broadcast(b"delivered-payload", "node-1").unwrap();
         ab.receive_ack(seq, "node-1", sign_ack(&sk1, &ab, seq)).unwrap();
@@ -739,7 +746,7 @@ mod tests {
 
     #[test]
     fn verify_order_valid() {
-        let ab = AtomicBroadcast::new(1);
+        let ab = AtomicBroadcast::new(1).unwrap();
         let sk1 = register_node(&ab, "node-1");
 
         for i in 0..5 {
@@ -833,7 +840,7 @@ mod tests {
 
     #[test]
     fn delivered_count_and_pending_count() {
-        let ab = AtomicBroadcast::new(1);
+        let ab = AtomicBroadcast::new(1).unwrap();
         let sk1 = register_node(&ab, "n1");
         assert_eq!(ab.delivered_count(), 0);
         assert_eq!(ab.pending_count(), 0);
@@ -850,7 +857,7 @@ mod tests {
 
     #[test]
     fn has_ack_from_works() {
-        let ab = AtomicBroadcast::new(2);
+        let ab = AtomicBroadcast::new(2).unwrap();
         let sk_a = register_node(&ab, "node-a");
         let seq = ab.broadcast(b"test", "sender").unwrap();
 
@@ -864,7 +871,7 @@ mod tests {
 
     #[test]
     fn large_scale_ordering() {
-        let ab = AtomicBroadcast::new(2);
+        let ab = AtomicBroadcast::new(2).unwrap();
         let sk1 = register_node(&ab, "n1");
         let sk2 = register_node(&ab, "n2");
         let node_ids = ["n1", "n2", "n3"];

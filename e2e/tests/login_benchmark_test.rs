@@ -386,7 +386,7 @@ fn test_opaque_password_login_timing() {
             // Setup
             let mut store = CredentialStore::new();
             let setup_start = Instant::now();
-            store.register_with_password("bench_user", b"S3cure!Pass#2024");
+            store.register_with_password("bench_user", b"S3cure!Pass#2024").unwrap();
             let reg_ms = setup_start.elapsed().as_secs_f64() * 1000.0;
             println!("OPAQUE registration: {reg_ms:.2}ms");
 
@@ -557,7 +557,7 @@ fn test_full_ceremony_timing() {
             // 1. OPAQUE auth
             let opaque_start = Instant::now();
             let mut store = CredentialStore::new();
-            store.register_with_password("ceremony_user", b"CeremonyPass!99");
+            store.register_with_password("ceremony_user", b"CeremonyPass!99").unwrap();
             let user_id = store
                 .verify_password("ceremony_user", b"CeremonyPass!99")
                 .expect("OPAQUE login");
@@ -828,7 +828,7 @@ async fn run_concurrent_logins(n: usize) {
     let mut store = CredentialStore::new();
     let reg_start = Instant::now();
     for i in 0..n {
-        store.register_with_password(&format!("user_{i}"), b"BenchPass!2024");
+        store.register_with_password(&format!("user_{i}"), b"BenchPass!2024").unwrap();
     }
     let reg_ms = reg_start.elapsed().as_secs_f64() * 1000.0;
     println!("Registered {n} users in {reg_ms:.1}ms ({:.1}ms/user)", reg_ms / n as f64);
