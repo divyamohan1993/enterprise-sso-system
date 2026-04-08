@@ -278,7 +278,7 @@ pub const MAX_TOKEN_LIFETIME_SECS: i64 = 24 * 3600;
 /// the same initial grant share a family ID. On double-consumption (token reuse),
 /// the ENTIRE family is revoked to mitigate stolen refresh token attacks per
 /// RFC 6749 Section 10.4 and NIST SP 800-63B.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RefreshToken {
     pub token: String,
     pub user_id: Uuid,
@@ -296,6 +296,7 @@ pub struct RefreshToken {
 ///
 /// WARNING: This store is volatile. All refresh tokens are lost on process
 /// restart. In production, set `persistence_backend` to a durable store.
+#[derive(Debug)]
 pub struct RefreshTokenStore {
     tokens: HashMap<String, RefreshToken>,
     /// Optional persistence backend name for operational awareness.
