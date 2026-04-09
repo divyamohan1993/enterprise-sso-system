@@ -120,12 +120,26 @@ pub fn use_distributed_kek() -> bool {
     std::env::var("MILNET_KEK_SHARE").is_ok()
 }
 
-/// Returns true when threshold KDF mode is active (MILNET_THRESHOLD_KDF=1).
-/// In this mode the master KEK is NEVER reconstructed. Each node computes
-/// a partial HMAC from its share; partials are combined via HKDF.
+/// Returns true when threshold KDF mode is active.
+///
+/// Threshold KDF is now the DEFAULT in production and military mode.
+/// The KEK is NEVER reconstructed. Each node computes a partial HMAC
+/// from its share; partials are combined via HKDF.
+///
+/// To explicitly DISABLE threshold KDF (MLP only), set both:
+///   MILNET_ALLOW_SINGLE_KEK=1
+///   MILNET_MLP_MODE_ACK=1
 pub fn use_threshold_kdf() -> bool {
-    std::env::var("MILNET_THRESHOLD_KDF").as_deref() == Ok("1")
-        && std::env::var("MILNET_KEK_SHARE").is_ok()
+    // Threshold KDF requires shares to be configured
+    if std::env::var("MILNET_KEK_SHARE").is_err() {
+        return false;
+    }
+    // Explicit opt-out: only allowed in MLP mode
+    if std::env::var("MILNET_THRESHOLD_KDF").as_deref() == Ok("0") {
+        return false;
+    }
+    // Default: ON when shares are available
+    true
 }
 
 /// Derive the master KEK via threshold KDF (no reconstruction).
@@ -460,67 +474,98 @@ fn verify_share_commitment(share: &crate::threshold_kek::KekShare) -> bool {
 
 /// Unified entry point for obtaining the master KEK.
 ///
-/// If distributed (threshold) mode is active (via `MILNET_KEK_SHARE` env var
-/// or production mode), uses `cached_master_kek_distributed()` which reconstructs
-/// the KEK from Shamir shares. Otherwise, uses the single-key `cached_master_kek()`.
+/// Load hierarchy (most secure first):
+/// 1. Threshold KDF (distributed, KEK never in RAM) -- DEFAULT
+/// 2. Threshold reconstruction (distributed, KEK materializes briefly)
+/// 3. Single env var ONLY if MLP mode acknowledged
+///
+/// In military mode: threshold KDF is MANDATORY, no bypass.
+/// In production without MLP: single env var is rejected.
 ///
 /// All services SHOULD use this function instead of calling `cached_master_kek()`
 /// or `load_master_kek()` directly.
 pub fn get_master_kek() -> &'static [u8; 32] {
-    // Preferred path: threshold KDF. The KEK is NEVER reconstructed.
+    let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1");
+    let is_mlp_ack = std::env::var("MILNET_MLP_MODE_ACK").as_deref() == Ok("1");
+    let allow_single_kek = std::env::var("MILNET_ALLOW_SINGLE_KEK").as_deref() == Ok("1");
+    let has_shares = std::env::var("MILNET_KEK_SHARE").is_ok();
+
+    // Path 1: Threshold KDF (preferred, KEK never reconstructed)
     if use_threshold_kdf() {
         return cached_master_kek_threshold_kdf();
     }
 
+    // Path 2: Threshold reconstruction (legacy, KEK briefly in RAM)
     if use_distributed_kek() {
-        // Legacy reconstruction path. Forbidden in military deployment.
-        if is_production() && std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1") {
+        if is_military {
             crate::siem::SecurityEvent::crypto_failure(
                 "FORBIDDEN: Shamir reconstruct() in military deployment. \
-                 Set MILNET_THRESHOLD_KDF=1 for threshold KDF (no reconstruction).",
+                 Threshold KDF is mandatory. Ensure MILNET_KEK_SHARE is set \
+                 and MILNET_THRESHOLD_KDF is not explicitly disabled.",
             );
             panic!(
                 "FATAL: reconstruct() forbidden in military deployment. \
-                 Use MILNET_THRESHOLD_KDF=1."
+                 Threshold KDF is mandatory."
             );
         }
         if is_production() {
             crate::siem::SecurityEvent::crypto_failure(
                 "WARNING: legacy Shamir reconstruct() path active. Full KEK materializes in RAM. \
-                 Migrate to MILNET_THRESHOLD_KDF=1.",
+                 Migrate to threshold KDF (default when shares are configured).",
             );
         }
-        cached_master_kek_distributed()
-    } else {
-        // Production requires threshold mode. Single-key is only allowed
-        // when MILNET_TESTING_SINGLE_KEK_ACK=1 is explicitly set (test infra).
-        if is_production() {
-            // Allow single-key fallback when the test-infrastructure ACK is set.
-            // Check ACK first (stable env var, never removed) before checking
-            // MILNET_MASTER_KEK (which may be consumed by a concurrent thread's
-            // load_master_kek_inner call, creating a TOCTOU race on OnceLock init).
-            if std::env::var("MILNET_TESTING_SINGLE_KEK_ACK").as_deref() == Ok("1") {
-                crate::siem::SecurityEvent::crypto_failure(
-                    "WARNING: single-key KEK fallback used with MILNET_TESTING_SINGLE_KEK_ACK=1. \
-                     This is acceptable ONLY for test infrastructure. \
-                     Production deployments MUST use threshold Shamir reconstruction.",
-                );
-                return cached_master_kek();
-            }
-            crate::siem::SecurityEvent::crypto_failure(
-                "CRITICAL: single-key KEK fallback attempted in production. \
-                 Threshold Shamir reconstruction is mandatory. \
-                 Configure MILNET_KEK_SHARE env vars for 3-of-5 Shamir shares. \
-                 If this is test infrastructure, set MILNET_TESTING_SINGLE_KEK_ACK=1.",
-            );
-            panic!(
-                "FATAL: single-key KEK path rejected in production. \
-                 Set MILNET_KEK_SHARE for threshold reconstruction, or \
-                 set MILNET_TESTING_SINGLE_KEK_ACK=1 for test infrastructure."
-            );
-        }
-        cached_master_kek()
+        return cached_master_kek_distributed();
     }
+
+    // Path 3: Single env var KEK -- MLP only
+    // In production without MLP: if MILNET_MASTER_KEK is set but threshold
+    // shares are not, this is a critical misconfiguration.
+    if is_military {
+        // Military mode: threshold KDF is MANDATORY, no fallback
+        crate::siem::SecurityEvent::crypto_failure(
+            "CRITICAL: military deployment requires threshold KDF. \
+             No KEK shares (MILNET_KEK_SHARE) configured. Cannot proceed.",
+        );
+        tracing::error!(
+            target: "siem",
+            "SIEM:CRITICAL military deployment without threshold KDF shares. Process exiting."
+        );
+        std::process::exit(199);
+    }
+
+    if is_production() && !has_shares && std::env::var("MILNET_MASTER_KEK").is_ok() {
+        // Single env var KEK in production: only with explicit MLP + allow_single_kek
+        if is_mlp_ack && allow_single_kek {
+            crate::siem::SecurityEvent::crypto_failure(
+                "WARNING: single-key KEK in MLP mode (MILNET_ALLOW_SINGLE_KEK=1). \
+                 Acceptable for MLP/demo only. NOT for production.",
+            );
+            return cached_master_kek();
+        }
+
+        // Allow legacy test infrastructure ACK
+        if std::env::var("MILNET_TESTING_SINGLE_KEK_ACK").as_deref() == Ok("1") {
+            crate::siem::SecurityEvent::crypto_failure(
+                "WARNING: single-key KEK fallback used with MILNET_TESTING_SINGLE_KEK_ACK=1. \
+                 This is acceptable ONLY for test infrastructure.",
+            );
+            return cached_master_kek();
+        }
+
+        crate::siem::SecurityEvent::crypto_failure(
+            "CRITICAL: single-key KEK (MILNET_MASTER_KEK) set without threshold shares. \
+             Threshold KDF is the default. Configure MILNET_KEK_SHARE for distributed KEK. \
+             For MLP mode, set MILNET_MLP_MODE_ACK=1 and MILNET_ALLOW_SINGLE_KEK=1.",
+        );
+        tracing::error!(
+            target: "siem",
+            "SIEM:CRITICAL single-key KEK in production without MLP acknowledgment. Process exiting."
+        );
+        std::process::exit(199);
+    }
+
+    // Non-production or legacy fallback
+    cached_master_kek()
 }
 
 /// Whether the system is running in production mode.

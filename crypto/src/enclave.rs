@@ -482,8 +482,17 @@ pub fn establish_channel_xwing(
     let (xwing_shared_secret, ciphertext) = crate::xwing::xwing_encapsulate(their_public)
         .map_err(|e| format!("X-Wing encapsulation failed: {e}"))?;
 
+    // Derive a 32-byte key from the 64-byte X-Wing shared secret via HKDF
+    let ss_32 = {
+        let hk = hkdf::Hkdf::<Sha512>::new(Some(b"MILNET-XWING-CHANNEL-v1"), xwing_shared_secret.as_ref());
+        let mut k = [0u8; 32];
+        hk.expand(b"enclave-channel-shared-secret", &mut k)
+            .expect("HKDF-SHA512 expand for 32 bytes cannot fail");
+        k
+    };
+
     let session_key = derive_channel_session_key(
-        xwing_shared_secret.as_bytes(),
+        &ss_32,
         our_identity,
         their_identity,
         session_id,
@@ -511,8 +520,17 @@ pub fn complete_channel_xwing(
     let xwing_shared_secret = crate::xwing::xwing_decapsulate(our_keypair, ciphertext)
         .map_err(|e| format!("X-Wing decapsulation failed: {e}"))?;
 
+    // Derive a 32-byte key from the 64-byte X-Wing shared secret via HKDF
+    let ss_32 = {
+        let hk = hkdf::Hkdf::<Sha512>::new(Some(b"MILNET-XWING-CHANNEL-v1"), xwing_shared_secret.as_ref());
+        let mut k = [0u8; 32];
+        hk.expand(b"enclave-channel-shared-secret", &mut k)
+            .expect("HKDF-SHA512 expand for 32 bytes cannot fail");
+        k
+    };
+
     let session_key = derive_channel_session_key(
-        xwing_shared_secret.as_bytes(),
+        &ss_32,
         our_identity,
         their_identity,
         session_id,
@@ -580,6 +598,73 @@ pub fn establish_channel(
 // Runtime Enclave Detection & Attestation Guard
 // ---------------------------------------------------------------------------
 
+/// Detected confidential compute hardware capabilities.
+#[derive(Debug, Clone)]
+pub struct ConfidentialComputeCapabilities {
+    /// Primary enclave backend (the first hardware backend detected).
+    pub primary_backend: EnclaveBackend,
+    /// Intel SGX available.
+    pub sgx_available: bool,
+    /// AMD SEV-SNP available.
+    pub sev_snp_available: bool,
+    /// ARM TrustZone available.
+    pub trustzone_available: bool,
+    /// vTPM available via `/dev/tpmrm0`.
+    pub vtpm_available: bool,
+}
+
+impl ConfidentialComputeCapabilities {
+    /// Returns true if any hardware-backed confidential compute is available.
+    pub fn has_hardware(&self) -> bool {
+        self.sgx_available || self.sev_snp_available || self.trustzone_available
+    }
+}
+
+/// Probe all confidential compute hardware and return detected capabilities.
+///
+/// Checks for:
+/// - SGX via `/dev/sgx_enclave` or `/dev/sgx/enclave`
+/// - SEV-SNP via `/dev/sev-guest` or `/sys/firmware/sev`
+/// - TrustZone via `/dev/trustzone`
+/// - vTPM via `/dev/tpmrm0`
+pub fn detect_confidential_compute() -> ConfidentialComputeCapabilities {
+    let sgx = std::path::Path::new("/dev/sgx_enclave").exists()
+        || std::path::Path::new("/dev/sgx/enclave").exists();
+    let sev_snp = std::path::Path::new("/dev/sev-guest").exists()
+        || std::path::Path::new("/sys/firmware/sev").exists();
+    let trustzone = std::path::Path::new("/dev/trustzone").exists();
+    let vtpm = std::path::Path::new("/dev/tpmrm0").exists();
+
+    let primary = if sgx {
+        EnclaveBackend::IntelSgx
+    } else if sev_snp {
+        EnclaveBackend::AmdSevSnp
+    } else if trustzone {
+        EnclaveBackend::ArmTrustZone
+    } else {
+        EnclaveBackend::SoftwareFallback
+    };
+
+    let caps = ConfidentialComputeCapabilities {
+        primary_backend: primary,
+        sgx_available: sgx,
+        sev_snp_available: sev_snp,
+        trustzone_available: trustzone,
+        vtpm_available: vtpm,
+    };
+
+    tracing::info!(
+        sgx = sgx,
+        sev_snp = sev_snp,
+        trustzone = trustzone,
+        vtpm = vtpm,
+        primary_backend = ?primary,
+        "confidential compute hardware probe complete"
+    );
+
+    caps
+}
+
 /// Detect whether the current process is running inside a hardware enclave.
 ///
 /// Checks for platform-specific indicators:
@@ -590,26 +675,86 @@ pub fn establish_channel(
 /// Returns the detected backend, or `SoftwareFallback` if no hardware
 /// enclave is detected.
 pub fn detect_enclave_backend() -> EnclaveBackend {
-    // Intel SGX
-    if std::path::Path::new("/dev/sgx_enclave").exists()
-        || std::path::Path::new("/dev/sgx/enclave").exists()
-    {
-        return EnclaveBackend::IntelSgx;
+    detect_confidential_compute().primary_backend
+}
+
+/// Activate enclave-backed key sealing based on detected hardware.
+///
+/// When hardware IS detected: automatically use hardware-backed key sealing.
+/// When hardware is NOT detected: software fallback with MLP acknowledgment
+/// and SIEM WARNING.
+/// Military mode: hardware REQUIRED, no fallback (process exits).
+pub fn activate_enclave(operation: &str) -> Result<ConfidentialComputeCapabilities, String> {
+    let caps = detect_confidential_compute();
+
+    if caps.has_hardware() {
+        tracing::info!(
+            operation = operation,
+            backend = ?caps.primary_backend,
+            sgx = caps.sgx_available,
+            sev_snp = caps.sev_snp_available,
+            vtpm = caps.vtpm_available,
+            "hardware enclave activated for key sealing"
+        );
+        return Ok(caps);
     }
 
-    // AMD SEV-SNP
-    if std::path::Path::new("/dev/sev-guest").exists()
-        || std::path::Path::new("/sys/firmware/sev").exists()
-    {
-        return EnclaveBackend::AmdSevSnp;
+    // No hardware detected
+    let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+
+    if is_military {
+        tracing::error!(
+            operation = operation,
+            "SIEM:CRITICAL military deployment requires hardware enclave (SGX/SEV-SNP/TrustZone). \
+             No hardware detected. Process exiting."
+        );
+        common::siem::SecurityEvent {
+            timestamp: common::siem::SecurityEvent::now_iso8601(),
+            category: "enclave",
+            action: "hardware_enclave_required",
+            severity: common::siem::Severity::Critical,
+            outcome: "failure",
+            user_id: None,
+            source_ip: None,
+            detail: Some(format!(
+                "Military deployment requires hardware enclave for '{}'. None detected.",
+                operation
+            )),
+        }
+        .emit();
+        std::process::exit(199);
     }
 
-    // ARM TrustZone
-    if std::path::Path::new("/dev/trustzone").exists() {
-        return EnclaveBackend::ArmTrustZone;
+    // Production: require MLP acknowledgment for software fallback
+    if common::sealed_keys::is_production() {
+        if common::config::is_mlp_mode() {
+            common::config::emit_mlp_siem_event(
+                "enclave",
+                &format!("software_fallback_for_{}", operation),
+            );
+            tracing::warn!(
+                target: "siem",
+                operation = operation,
+                "SIEM:WARNING software enclave fallback activated under MLP mode for '{}'",
+                operation
+            );
+            return Ok(caps);
+        }
+        return Err(format!(
+            "hardware enclave required for '{}' in production. \
+             Enable MLP mode for software fallback.",
+            operation
+        ));
     }
 
-    EnclaveBackend::SoftwareFallback
+    // Non-production: allow with warning
+    tracing::warn!(
+        operation = operation,
+        "software enclave fallback -- no hardware enclave detected"
+    );
+    Ok(caps)
 }
 
 /// Guard that verifies enclave availability before sensitive signing

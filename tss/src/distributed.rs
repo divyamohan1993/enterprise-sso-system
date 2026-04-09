@@ -51,6 +51,21 @@ fn nonce_seal_kek() -> zeroize::Zeroizing<[u8; 32]> {
     zeroize::Zeroizing::new(key)
 }
 
+/// Derive the HMAC-SHA512 integrity key for the nonce WAL from the master KEK.
+/// This key is distinct from the sealing KEK to prevent cross-purpose key reuse.
+fn nonce_wal_integrity_key() -> zeroize::Zeroizing<[u8; 64]> {
+    use hkdf::Hkdf;
+    use sha2::Sha512;
+    let master_kek = common::sealed_keys::cached_master_kek();
+    let hk = Hkdf::<Sha512>::new(Some(b"MILNET-NONCE-WAL-INTEGRITY-v1"), master_kek);
+    let mut key = [0u8; 64];
+    if let Err(e) = hk.expand(b"nonce-wal-hmac-key", &mut key) {
+        tracing::error!("FATAL: HKDF-SHA512 expand failed for nonce WAL integrity key: {e}");
+        std::process::exit(1);
+    }
+    zeroize::Zeroizing::new(key)
+}
+
 /// Load the last known nonce counter from sealed storage.
 ///
 /// The file format is: 12-byte nonce || AES-256-GCM(u64-LE, AAD="MILNET-TSS-NONCE-STATE-v1").
@@ -439,8 +454,15 @@ impl NonceWal {
         }
     }
 
-    /// Read the nonce value from an existing WAL file, verifying CRC32 integrity.
-    /// Returns 0 if the file does not exist, is corrupted, or has an invalid checksum.
+    /// Read the nonce value from an existing WAL file, verifying CRC32 and
+    /// HMAC-SHA512 integrity.
+    ///
+    /// If the HMAC verification fails, this indicates tampering. The signer
+    /// HALTS immediately with a SIEM CRITICAL alert to prevent FROST key
+    /// recovery via nonce reuse.
+    ///
+    /// Legacy 24-byte WAL files (without HMAC) are accepted only on first
+    /// migration, but a SIEM WARNING is emitted.
     fn read_wal_nonce(path: &PathBuf) -> u64 {
         match std::fs::read(path) {
             Ok(data) => {
@@ -448,7 +470,7 @@ impl NonceWal {
                     tracing::warn!(
                         path = %path.display(),
                         len = data.len(),
-                        "nonce WAL file too short — ignoring"
+                        "nonce WAL file too short -- ignoring"
                     );
                     return 0;
                 }
@@ -457,7 +479,7 @@ impl NonceWal {
                 if data[20..24] != [0xFE; 4] {
                     tracing::warn!(
                         path = %path.display(),
-                        "nonce WAL file has invalid magic bytes — ignoring"
+                        "nonce WAL file has invalid magic bytes -- ignoring"
                     );
                     return 0;
                 }
@@ -475,13 +497,100 @@ impl NonceWal {
                 let computed_crc = Self::crc32(&data[0..16]);
 
                 if stored_crc != computed_crc {
-                    tracing::warn!(
+                    tracing::error!(
                         path = %path.display(),
                         stored_crc = stored_crc,
                         computed_crc = computed_crc,
-                        "nonce WAL CRC32 mismatch — file corrupted, ignoring"
+                        "SIEM:CRITICAL nonce WAL CRC32 mismatch -- possible tamper. \
+                         Halting signer to prevent FROST key recovery via nonce reuse."
                     );
-                    return 0;
+                    common::siem::SecurityEvent {
+                        timestamp: common::siem::SecurityEvent::now_iso8601(),
+                        category: "tss_nonce",
+                        action: "nonce_wal_tamper_detected",
+                        severity: common::siem::Severity::Critical,
+                        outcome: "failure",
+                        user_id: None,
+                        source_ip: None,
+                        detail: Some(format!(
+                            "Nonce WAL CRC32 mismatch at {}. Signer halted.", path.display()
+                        )),
+                    }
+                    .emit();
+                    std::process::exit(199);
+                }
+
+                // Verify HMAC-SHA512 integrity (88-byte format)
+                if data.len() >= 88 {
+                    let integrity_key = nonce_wal_integrity_key();
+                    let stored_hmac = &data[24..88];
+                    let computed_hmac = {
+                        use hmac::{Hmac, Mac};
+                        use sha2::Sha512;
+                        type HmacSha512 = Hmac<Sha512>;
+                        let mut mac = HmacSha512::new_from_slice(integrity_key.as_ref())
+                            .expect("HMAC-SHA512 key length always valid");
+                        mac.update(&data[0..24]);
+                        mac.finalize().into_bytes()
+                    };
+
+                    let hmac_valid: bool = subtle::ConstantTimeEq::ct_eq(stored_hmac, computed_hmac.as_slice()).into();
+                    if !hmac_valid {
+                        tracing::error!(
+                            path = %path.display(),
+                            "SIEM:CRITICAL nonce WAL HMAC-SHA512 verification FAILED -- \
+                             root-level tamper detected. A modified nonce file can force nonce \
+                             reuse, enabling FROST private signing key recovery. \
+                             Halting signer immediately."
+                        );
+                        common::siem::SecurityEvent {
+                            timestamp: common::siem::SecurityEvent::now_iso8601(),
+                            category: "tss_nonce",
+                            action: "nonce_wal_hmac_tamper_detected",
+                            severity: common::siem::Severity::Critical,
+                            outcome: "failure",
+                            user_id: None,
+                            source_ip: None,
+                            detail: Some(format!(
+                                "Nonce WAL HMAC-SHA512 verification failed at {}. \
+                                 Signer halted to prevent catastrophic FROST key recovery.",
+                                path.display()
+                            )),
+                        }
+                        .emit();
+                        std::process::exit(199);
+                    }
+                    tracing::debug!(path = %path.display(), "nonce WAL HMAC-SHA512 integrity verified");
+                } else if data.len() == 24 {
+                    // Legacy 24-byte format without HMAC. Accept but warn.
+                    tracing::warn!(
+                        target: "siem",
+                        path = %path.display(),
+                        "SIEM:WARNING nonce WAL file is legacy 24-byte format without HMAC-SHA512. \
+                         Next write will upgrade to 88-byte HMAC-protected format."
+                    );
+                } else {
+                    tracing::error!(
+                        path = %path.display(),
+                        len = data.len(),
+                        "SIEM:CRITICAL nonce WAL file has unexpected size -- possible tamper. \
+                         Halting signer."
+                    );
+                    common::siem::SecurityEvent {
+                        timestamp: common::siem::SecurityEvent::now_iso8601(),
+                        category: "tss_nonce",
+                        action: "nonce_wal_tamper_detected",
+                        severity: common::siem::Severity::Critical,
+                        outcome: "failure",
+                        user_id: None,
+                        source_ip: None,
+                        detail: Some(format!(
+                            "Nonce WAL unexpected size {} at {}. Signer halted.",
+                            data.len(), path.display()
+                        )),
+                    }
+                    .emit();
+                    std::process::exit(199);
                 }
 
                 let nonce = u64::from_le_bytes(
@@ -497,14 +606,14 @@ impl NonceWal {
                 tracing::info!(
                     nonce = nonce,
                     path = %path.display(),
-                    "nonce WAL: recovered nonce from WAL file"
+                    "nonce WAL: recovered nonce from WAL file (integrity verified)"
                 );
                 nonce
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 tracing::info!(
                     path = %path.display(),
-                    "nonce WAL file not found — starting fresh"
+                    "nonce WAL file not found -- starting fresh"
                 );
                 0
             }
@@ -512,7 +621,7 @@ impl NonceWal {
                 tracing::warn!(
                     path = %path.display(),
                     error = %e,
-                    "failed to read nonce WAL file — starting from 0"
+                    "failed to read nonce WAL file -- starting from 0"
                 );
                 0
             }
@@ -537,15 +646,52 @@ impl NonceWal {
         !crc
     }
 
-    /// Write the next nonce to the WAL with fsync (atomic durability).
+    /// Write the next nonce to the WAL with fsync (atomic durability) and
+    /// HMAC-SHA512 integrity protection.
     ///
     /// CRITICAL: This MUST be called BEFORE every signing operation.
     /// The write is atomic: we write to a temp file, fsync it, then rename
     /// over the WAL file. This ensures we never have a partially-written WAL.
+    ///
+    /// WAL entry format (88 bytes):
+    /// ```text
+    /// [0..8]   u64 LE  - nonce value
+    /// [8..16]  u64 LE  - epoch timestamp (seconds since UNIX epoch)
+    /// [16..20] u32 LE  - CRC32 of bytes [0..16]
+    /// [20..24] [0xFE; 4] - sentinel / magic bytes
+    /// [24..88] HMAC-SHA512 of bytes [0..24] (64 bytes)
+    /// ```
     pub fn fsync_wal(&mut self, next_nonce: u64) -> Result<(), std::io::Error> {
         use std::io::Write;
 
-        // Build WAL entry: nonce (8) + epoch (8) + crc32 (4) + magic (4) = 24 bytes
+        // Monotonicity check: new nonce must be strictly greater than synced.
+        // Prevents rollback attacks where an attacker replays an older WAL file.
+        if next_nonce <= self.synced_nonce && self.synced_nonce > 0 {
+            tracing::error!(
+                next_nonce = next_nonce,
+                synced_nonce = self.synced_nonce,
+                "SIEM:CRITICAL nonce WAL monotonicity violation: attempted rollback from {} to {}. \
+                 Halting signer to prevent FROST key recovery via nonce reuse.",
+                self.synced_nonce, next_nonce
+            );
+            common::siem::SecurityEvent {
+                timestamp: common::siem::SecurityEvent::now_iso8601(),
+                category: "tss_nonce",
+                action: "nonce_wal_rollback_rejected",
+                severity: common::siem::Severity::Critical,
+                outcome: "failure",
+                user_id: None,
+                source_ip: None,
+                detail: Some(format!(
+                    "Nonce WAL monotonicity violation: attempted {} -> {}. Signer halted.",
+                    self.synced_nonce, next_nonce
+                )),
+            }
+            .emit();
+            std::process::exit(199);
+        }
+
+        // Build WAL entry: nonce (8) + epoch (8) + crc32 (4) + magic (4) = 24 bytes header
         let mut entry = [0u8; 24];
         entry[0..8].copy_from_slice(&next_nonce.to_le_bytes());
 
@@ -562,6 +708,23 @@ impl NonceWal {
         // Magic sentinel
         entry[20..24].copy_from_slice(&[0xFE; 4]);
 
+        // HMAC-SHA512 integrity tag over the entire 24-byte header
+        let integrity_key = nonce_wal_integrity_key();
+        let hmac_tag = {
+            use hmac::{Hmac, Mac};
+            use sha2::Sha512;
+            type HmacSha512 = Hmac<Sha512>;
+            let mut mac = HmacSha512::new_from_slice(integrity_key.as_ref())
+                .expect("HMAC-SHA512 key length always valid");
+            mac.update(&entry);
+            mac.finalize().into_bytes()
+        };
+
+        // Full WAL entry: 24-byte header + 64-byte HMAC = 88 bytes
+        let mut full_entry = [0u8; 88];
+        full_entry[0..24].copy_from_slice(&entry);
+        full_entry[24..88].copy_from_slice(&hmac_tag);
+
         // Atomic write: write to temp, fsync, rename
         let tmp_path = self.wal_path.with_extension("tmp");
 
@@ -571,8 +734,8 @@ impl NonceWal {
         }
 
         let mut file = std::fs::File::create(&tmp_path)?;
-        file.write_all(&entry)?;
-        file.sync_all()?; // fsync — ensure data is on stable storage
+        file.write_all(&full_entry)?;
+        file.sync_all()?; // fsync -- ensure data is on stable storage
 
         // Set restrictive permissions on WAL file before rename
         {
@@ -589,7 +752,7 @@ impl NonceWal {
         tracing::debug!(
             nonce = next_nonce,
             wal_path = %self.wal_path.display(),
-            "nonce WAL: fsync'd nonce to WAL"
+            "nonce WAL: fsync'd nonce with HMAC-SHA512 integrity to WAL"
         );
 
         Ok(())

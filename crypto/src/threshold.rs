@@ -349,15 +349,15 @@ pub struct ShareRefreshResult {
 }
 
 impl ThresholdGroup {
-    /// Rekey (full re-generation) of all shares with Feldman VSS verification.
+    /// Rekey (full re-generation) via distributed Pedersen DKG.
     ///
-    /// WARNING: This is NOT proactive secret resharing. This generates a
-    /// completely new FROST group with a new group key. Old shares and the
-    /// old group key become invalid. Signatures produced under the old key
-    /// remain valid but new signing requires the new shares.
+    /// No single party holds the complete signing key at any point during rekey.
+    /// This is the production-safe rekey method that uses the existing Pedersen
+    /// DKG infrastructure (`dkg_distributed()`).
     ///
-    /// For true proactive resharing (same group key, new shares), a
-    /// different protocol is required.
+    /// WARNING: This generates a completely new FROST group with a new group key.
+    /// Old shares and the old group key become invalid. Signatures produced
+    /// under the old key remain valid but new signing requires the new shares.
     ///
     /// The `current_epoch` argument is the caller's current epoch counter.
     /// The returned [`ShareRefreshResult::refresh_epoch`] is `current_epoch + 1`.
@@ -366,6 +366,58 @@ impl ThresholdGroup {
         _current_shares: &[SignerShare],
         current_epoch: u64,
     ) -> Result<ShareRefreshResult, String> {
+        let total = u16::try_from(self.total)
+            .map_err(|_| format!("total {} overflows u16", self.total))?;
+        let threshold = u16::try_from(self.threshold)
+            .map_err(|_| format!("threshold {} overflows u16", self.threshold))?;
+
+        tracing::info!(
+            total = total,
+            threshold = threshold,
+            epoch = current_epoch,
+            "initiating distributed rekey via Pedersen DKG (no trusted dealer)"
+        );
+
+        let dkg_result = dkg_distributed(total, threshold);
+
+        let new_group = ThresholdGroup {
+            threshold: self.threshold,
+            total: self.total,
+            public_key_package: dkg_result.group.public_key_package,
+        };
+
+        tracing::info!(
+            shares = dkg_result.shares.len(),
+            "distributed rekey complete: {} new shares generated without trusted dealer",
+            dkg_result.shares.len()
+        );
+
+        Ok(ShareRefreshResult {
+            new_shares: dkg_result.shares,
+            new_group,
+            refresh_epoch: current_epoch
+                .checked_add(1)
+                .ok_or_else(|| "epoch overflow".to_string())?,
+        })
+    }
+
+    /// INSECURE: Rekey using a trusted dealer. ONE process holds the complete
+    /// signing key during rekey, violating the distributed trust model.
+    ///
+    /// This method exists ONLY for testing and non-production environments.
+    /// In production builds, this function is not compiled. Any attempt to
+    /// call a dealer-based rekey in production is a security incident.
+    #[cfg(not(feature = "production"))]
+    pub fn rekey_dealer_insecure(
+        &self,
+        _current_shares: &[SignerShare],
+        current_epoch: u64,
+    ) -> Result<ShareRefreshResult, String> {
+        tracing::warn!(
+            "SIEM:WARNING rekey_dealer_INSECURE called -- trusted dealer holds full signing key. \
+             This MUST NOT be used in production."
+        );
+
         let total = u16::try_from(self.total)
             .map_err(|_| format!("total {} overflows u16", self.total))?;
         let threshold = u16::try_from(self.threshold)
@@ -393,7 +445,6 @@ impl ThresholdGroup {
                 }
             }
         }
-        tracing::info!("Share refresh Feldman VSS verification passed for all {} shares", shares_map.len());
 
         let mut new_shares: Vec<SignerShare> = Vec::with_capacity(shares_map.len());
         for (id, secret_share) in shares_map {

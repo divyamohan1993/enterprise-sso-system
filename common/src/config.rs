@@ -801,6 +801,147 @@ impl SecurityConfig {
     }
 }
 
+/// Result of the distributed secrets enforcement check.
+#[derive(Debug, Clone)]
+pub struct DistributedSecretsStatus {
+    /// Threshold KDF is active (KEK never fully in RAM on any node).
+    pub threshold_kdf_active: bool,
+    /// FROST signing is distributed (not monolithic).
+    pub frost_distributed: bool,
+    /// Number of nodes detected in the cluster.
+    pub cluster_node_count: usize,
+    /// Violations found.
+    pub violations: Vec<String>,
+}
+
+/// Startup check that verifies distributed secret management is properly
+/// configured.
+///
+/// Verifies:
+/// - Threshold KDF is active (KEK never fully in RAM on any node)
+/// - FROST signing is distributed (not monolithic)
+/// - At least 3 nodes are in the cluster
+///
+/// In production: warn if any of these are not met.
+/// In military: exit if any of these are not met.
+/// MLP: allow degraded with acknowledgment.
+pub fn enforce_distributed_secrets() -> DistributedSecretsStatus {
+    let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1");
+    let mlp = is_mlp_mode();
+
+    let threshold_kdf_active = crate::sealed_keys::use_threshold_kdf();
+
+    // Check if FROST signing is distributed by looking for the distributed
+    // signer configuration env vars
+    let frost_distributed = std::env::var("MILNET_TSS_SHARE_SEALED").is_ok()
+        || std::env::var("MILNET_TSS_DISTRIBUTED").as_deref() == Ok("1");
+
+    // Cluster node count: read from MILNET_CLUSTER_NODES (comma-separated)
+    // or MILNET_CLUSTER_NODE_COUNT
+    let cluster_node_count = std::env::var("MILNET_CLUSTER_NODES")
+        .ok()
+        .map(|v| v.split(',').filter(|s| !s.trim().is_empty()).count())
+        .or_else(|| {
+            std::env::var("MILNET_CLUSTER_NODE_COUNT")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+        })
+        .unwrap_or(1);
+
+    let mut violations = Vec::new();
+
+    if !threshold_kdf_active {
+        violations.push(
+            "threshold KDF not active -- KEK may materialize fully in RAM. \
+             Set MILNET_KEK_SHARE for distributed key derivation."
+                .to_string(),
+        );
+    }
+
+    if !frost_distributed {
+        violations.push(
+            "FROST signing not distributed -- set MILNET_TSS_SHARE_SEALED or \
+             MILNET_TSS_DISTRIBUTED=1 for distributed signing."
+                .to_string(),
+        );
+    }
+
+    if cluster_node_count < 3 {
+        violations.push(format!(
+            "cluster has {} node(s), need at least 3 for distributed security. \
+             Set MILNET_CLUSTER_NODES or MILNET_CLUSTER_NODE_COUNT.",
+            cluster_node_count
+        ));
+    }
+
+    let status = DistributedSecretsStatus {
+        threshold_kdf_active,
+        frost_distributed,
+        cluster_node_count,
+        violations: violations.clone(),
+    };
+
+    if violations.is_empty() {
+        tracing::info!(
+            threshold_kdf = threshold_kdf_active,
+            frost_distributed = frost_distributed,
+            cluster_nodes = cluster_node_count,
+            "distributed secrets enforcement: all checks passed"
+        );
+        return status;
+    }
+
+    // Report violations
+    for v in &violations {
+        tracing::warn!(target: "siem", "SIEM:WARNING distributed_secrets: {}", v);
+    }
+
+    if is_military {
+        tracing::error!(
+            target: "siem",
+            violations = ?violations,
+            "SIEM:CRITICAL military deployment requires fully distributed secrets. \
+             {} violation(s) found. Process exiting.",
+            violations.len()
+        );
+        for v in &violations {
+            crate::siem::SecurityEvent {
+                timestamp: crate::siem::SecurityEvent::now_iso8601(),
+                category: "distributed_secrets",
+                action: "enforcement_failed",
+                severity: crate::siem::Severity::Critical,
+                outcome: "failure",
+                user_id: None,
+                source_ip: None,
+                detail: Some(v.clone()),
+            }
+            .emit();
+        }
+        std::process::exit(199);
+    }
+
+    if mlp {
+        tracing::warn!(
+            target: "siem",
+            violations = ?violations,
+            "SIEM:WARNING distributed secrets degraded in MLP mode ({} violation(s)). \
+             Accepted with MLP acknowledgment.",
+            violations.len()
+        );
+        emit_mlp_siem_event("distributed_secrets", "degraded_mode_accepted");
+    } else {
+        tracing::warn!(
+            target: "siem",
+            violations = ?violations,
+            "SIEM:WARNING distributed secrets not fully configured ({} violation(s)). \
+             Production deployments should fix these.",
+            violations.len()
+        );
+    }
+
+    status
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
