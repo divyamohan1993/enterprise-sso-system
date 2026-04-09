@@ -58,8 +58,22 @@ impl std::error::Error for AuditError {}
 /// The file is opened in append-only mode. Each line contains a JSON object
 /// with timestamp, error context, and the original audit entry.
 pub fn emergency_audit_write(entry: &AuditEntry, error_context: &str) -> Result<(), String> {
-    let path = std::env::var("MILNET_EMERGENCY_AUDIT_PATH")
-        .unwrap_or_else(|_| "/var/lib/milnet/emergency_audit.jsonl".to_string());
+    emergency_audit_write_to(entry, error_context, None)
+}
+
+/// Emergency audit write with an explicit path override.
+/// When `path_override` is `Some`, that path is used instead of the env var.
+/// This avoids env-var races in parallel tests.
+pub fn emergency_audit_write_to(
+    entry: &AuditEntry,
+    error_context: &str,
+    path_override: Option<&str>,
+) -> Result<(), String> {
+    let path = match path_override {
+        Some(p) => p.to_string(),
+        None => std::env::var("MILNET_EMERGENCY_AUDIT_PATH")
+            .unwrap_or_else(|_| "/var/lib/milnet/emergency_audit.jsonl".to_string()),
+    };
 
     if let Some(parent) = std::path::Path::new(&path).parent() {
         std::fs::create_dir_all(parent)
@@ -1553,11 +1567,10 @@ mod tests {
 
     #[test]
     fn emergency_audit_write_creates_file() {
-        let dir = std::env::temp_dir().join(format!("audit_emerg_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("audit_emerg_creates_{}_{}", std::process::id(), Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("test: failed to create temp dir");
         let emergency_path = dir.join("emergency_audit.jsonl");
-
-        std::env::set_var("MILNET_EMERGENCY_AUDIT_PATH", emergency_path.to_str().unwrap());
+        let path_str = emergency_path.to_str().unwrap();
 
         let signing_key = test_signing_key();
         let entry = AuditEntry {
@@ -1579,7 +1592,7 @@ mod tests {
             user_agent: None,
         };
 
-        let result = emergency_audit_write(&entry, "test error context");
+        let result = emergency_audit_write_to(&entry, "test error context", Some(path_str));
         assert!(result.is_ok(), "emergency write should succeed: {:?}", result.err());
 
         let contents = std::fs::read_to_string(&emergency_path).unwrap();
@@ -1587,7 +1600,6 @@ mod tests {
         assert!(contents.contains("test error context"), "should contain error context");
         assert!(contents.contains(&entry.event_id.to_string()), "should contain event ID");
 
-        std::env::remove_var("MILNET_EMERGENCY_AUDIT_PATH");
         drop(std::fs::remove_dir_all(&dir));
     }
 
@@ -1596,8 +1608,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("audit_emerg_append_{}_{}", std::process::id(), Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("test: failed to create temp dir");
         let emergency_path = dir.join("emergency_audit.jsonl");
-
-        std::env::set_var("MILNET_EMERGENCY_AUDIT_PATH", emergency_path.to_str().unwrap());
+        let path_str = emergency_path.to_str().unwrap();
 
         let signing_key = test_signing_key();
         let make_entry = || AuditEntry {
@@ -1619,24 +1630,18 @@ mod tests {
             user_agent: None,
         };
 
-        // Clear any content from parallel test contamination
-        std::fs::write(&emergency_path, "").unwrap_or_default();
-        emergency_audit_write(&make_entry(), "first error").unwrap();
-        emergency_audit_write(&make_entry(), "second error").unwrap();
+        emergency_audit_write_to(&make_entry(), "first error", Some(path_str)).unwrap();
+        emergency_audit_write_to(&make_entry(), "second error", Some(path_str)).unwrap();
 
         let contents = std::fs::read_to_string(&emergency_path).unwrap();
         let lines: Vec<&str> = contents.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(lines.len(), 2, "should have two lines (append-only)");
 
-        std::env::remove_var("MILNET_EMERGENCY_AUDIT_PATH");
         drop(std::fs::remove_dir_all(&dir));
     }
 
     #[test]
     fn emergency_audit_write_fails_on_invalid_path() {
-        // Use a path under /sys which is a read-only pseudo-filesystem
-        std::env::set_var("MILNET_EMERGENCY_AUDIT_PATH", "/sys/firmware/nonexistent/path.jsonl");
-
         let signing_key = test_signing_key();
         let entry = AuditEntry {
             event_id: Uuid::new_v4(),
@@ -1657,10 +1662,8 @@ mod tests {
             user_agent: None,
         };
 
-        let result = emergency_audit_write(&entry, "test");
+        let result = emergency_audit_write_to(&entry, "test", Some("/sys/firmware/nonexistent/path.jsonl"));
         assert!(result.is_err(), "should fail on invalid path");
-
-        std::env::remove_var("MILNET_EMERGENCY_AUDIT_PATH");
     }
 
     #[test]

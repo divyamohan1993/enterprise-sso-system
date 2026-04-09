@@ -495,7 +495,12 @@ pub fn get_master_kek() -> &'static [u8; 32] {
         // Production requires threshold mode. Single-key is only allowed
         // when MILNET_TESTING_SINGLE_KEK_ACK=1 is explicitly set (test infra).
         if is_production() {
-            if std::env::var("MILNET_MASTER_KEK").is_ok()
+            // Allow single-key fallback when the test-infrastructure ACK is set.
+            // Note: MILNET_MASTER_KEK may already have been consumed and removed
+            // by load_master_kek_inner on a prior call, but the cached value
+            // in MASTER_KEK_CACHE is still valid. Check both the env var and the
+            // OnceLock cache.
+            if (std::env::var("MILNET_MASTER_KEK").is_ok() || MASTER_KEK_CACHE.get().is_some())
                 && std::env::var("MILNET_TESTING_SINGLE_KEK_ACK").as_deref() == Ok("1")
             {
                 crate::siem::SecurityEvent::crypto_failure(

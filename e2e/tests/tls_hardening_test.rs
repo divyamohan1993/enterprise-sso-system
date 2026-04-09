@@ -171,10 +171,21 @@ fn mtls_rejects_client_without_cert() {
         let tcp = tokio::net::TcpStream::connect(&addr).await.expect("connect");
         let server_name = ServerName::try_from("localhost").expect("server name");
 
-        // The handshake should fail because the server requires client certs.
-        let result = connector.connect(server_name, tcp).await;
+        // In TLS 1.3 the client handshake may complete before the server
+        // processes the client's (empty) Certificate message. The rejection
+        // surfaces either during connect() or on the first read/write.
+        let handshake = connector.connect(server_name, tcp).await;
+        let rejected = match handshake {
+            Err(_) => true,
+            Ok(mut tls) => {
+                // Handshake appeared to succeed -- try reading; the server
+                // will abort because no client cert was presented.
+                let mut buf = [0u8; 2];
+                tls.read_exact(&mut buf).await.is_err()
+            }
+        };
         assert!(
-            result.is_err(),
+            rejected,
             "connection without client certificate must be rejected"
         );
 
@@ -223,9 +234,18 @@ fn expired_cert_rejected() {
         let tcp = tokio::net::TcpStream::connect(&addr).await.expect("connect");
         let server_name = ServerName::try_from("localhost").expect("server name");
 
-        let result = connector.connect(server_name, tcp).await;
+        // In TLS 1.3 the client handshake may complete before the server
+        // rejects the rogue certificate. The error surfaces on first I/O.
+        let handshake = connector.connect(server_name, tcp).await;
+        let rejected = match handshake {
+            Err(_) => true,
+            Ok(mut tls) => {
+                let mut buf = [0u8; 2];
+                tls.read_exact(&mut buf).await.is_err()
+            }
+        };
         assert!(
-            result.is_err(),
+            rejected,
             "rogue CA-signed client certificate must be rejected"
         );
 

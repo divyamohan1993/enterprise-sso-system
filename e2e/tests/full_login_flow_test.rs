@@ -423,9 +423,9 @@ fn concurrent_ceremonies() {
         let addr1 = gateway_addr.clone();
         let addr2 = gateway_addr.clone();
 
-        let (result_a, result_b) = tokio::join!(
-            client_auth(&addr1, "user_a", b"password_a"),
-            client_auth(&addr2, "user_b", b"password_b"),
+        let ((result_a, dpop_key_a), (result_b, dpop_key_b)) = tokio::join!(
+            client_auth_with_dpop(&addr1, "user_a", b"password_a"),
+            client_auth_with_dpop(&addr2, "user_b", b"password_b"),
         );
 
         assert!(result_a.success, "user_a must succeed: {:?}", result_a.error);
@@ -440,14 +440,14 @@ fn concurrent_ceremonies() {
         let gvk_a = group_vk.clone();
         let pvk_a = pq_vk.clone();
         let claims_a = tokio::task::spawn_blocking(move || {
-            verify_token(&token_a, &gvk_a, &pvk_a)
+            verify_token_bound(&token_a, &gvk_a, &pvk_a, &dpop_key_a)
         })
         .await
         .expect("verify A task")
         .expect("token A must verify");
 
         let claims_b = tokio::task::spawn_blocking(move || {
-            verify_token(&token_b, &group_vk, &pq_vk)
+            verify_token_bound(&token_b, &group_vk, &pq_vk, &dpop_key_b)
         })
         .await
         .expect("verify B task")
