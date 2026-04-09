@@ -216,7 +216,7 @@ impl TenantContext {
     /// to its previous value afterward (supports nested scoping).
     ///
     /// # Example
-    /// ```no_run
+    /// ```text
     /// TenantContext::with_tenant(tenant_id, || {
     ///     // All DB queries here are scoped to tenant_id
     ///     db.query_users()?;

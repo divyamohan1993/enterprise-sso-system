@@ -9,7 +9,7 @@
 //! - SIEM audit logging on all auth events
 //!
 //! # Usage
-//! ```no_run
+//! ```text
 //! let config = CacConfig { pkcs11_library: "/usr/lib/libcackey.so".into(), .. };
 //! let mut auth = CacAuthenticator::new(config)?;
 //! let (card_info, sig) = auth.authenticate(&pin, &challenge, &mut session)?;

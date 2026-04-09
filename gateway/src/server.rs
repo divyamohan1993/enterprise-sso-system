@@ -374,7 +374,7 @@ impl GatewayServer {
     /// Set a TLS acceptor on an existing server instance.
     ///
     /// This allows combining TLS with orchestrator forwarding:
-    /// ```no_run
+    /// ```text
     /// let mut server = GatewayServer::bind_with_orchestrator(addr, difficulty, orch).await?;
     /// server.set_tls(tls_config);
     /// ```
