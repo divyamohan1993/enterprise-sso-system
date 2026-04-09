@@ -496,13 +496,10 @@ pub fn get_master_kek() -> &'static [u8; 32] {
         // when MILNET_TESTING_SINGLE_KEK_ACK=1 is explicitly set (test infra).
         if is_production() {
             // Allow single-key fallback when the test-infrastructure ACK is set.
-            // Note: MILNET_MASTER_KEK may already have been consumed and removed
-            // by load_master_kek_inner on a prior call, but the cached value
-            // in MASTER_KEK_CACHE is still valid. Check both the env var and the
-            // OnceLock cache.
-            if (std::env::var("MILNET_MASTER_KEK").is_ok() || MASTER_KEK_CACHE.get().is_some())
-                && std::env::var("MILNET_TESTING_SINGLE_KEK_ACK").as_deref() == Ok("1")
-            {
+            // Check ACK first (stable env var, never removed) before checking
+            // MILNET_MASTER_KEK (which may be consumed by a concurrent thread's
+            // load_master_kek_inner call, creating a TOCTOU race on OnceLock init).
+            if std::env::var("MILNET_TESTING_SINGLE_KEK_ACK").as_deref() == Ok("1") {
                 crate::siem::SecurityEvent::crypto_failure(
                     "WARNING: single-key KEK fallback used with MILNET_TESTING_SINGLE_KEK_ACK=1. \
                      This is acceptable ONLY for test infrastructure. \
