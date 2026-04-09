@@ -60,6 +60,7 @@ jobs:
           cargo bench --workspace -- --output-format bencher 2>&1 | tee bench-output.txt
         env:
           RUST_MIN_STACK: "8388608"
+          # TEST-ONLY: deterministic KEK for CI benchmarks, not a production key
           MILNET_MASTER_KEK: "abababababababababababababababababababababababababababababababababab"
       - name: Verify benchmark output
         run: |

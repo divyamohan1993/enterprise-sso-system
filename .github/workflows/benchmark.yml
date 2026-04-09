@@ -36,6 +36,7 @@ jobs:
         run: |
           cargo bench --workspace -- --output-format bencher 2>&1 | tee bench-output.txt
         env:
+          # TEST-ONLY: deterministic KEK for CI benchmarks, not a production key
           MILNET_MASTER_KEK: "abababababababababababababababababababababababababababababababababab"
 
       - name: Parse benchmark results
