@@ -466,10 +466,17 @@ pub struct ThreatIntelManager {
     pub ml_dsa_verify_key: Option<Vec<u8>>,
     /// GeoIP lookup table (IP -> GeoIpInfo). In production this would be
     /// backed by a MaxMind DB or similar.
+    /// Bounded to MAX_GEOIP_ENTRIES; evicts to 80% when full.
     geoip_table: Mutex<HashMap<String, GeoIpInfo>>,
     /// Domain reputation cache.
+    /// Bounded to MAX_DOMAIN_CACHE; evicts to 80% when full.
     domain_cache: Mutex<HashMap<String, DomainReputation>>,
 }
+
+/// Maximum entries in the GeoIP lookup table before eviction.
+const MAX_GEOIP_ENTRIES: usize = 100_000;
+/// Maximum entries in the domain reputation cache before eviction.
+const MAX_DOMAIN_CACHE: usize = 50_000;
 
 impl ThreatIntelManager {
     /// Create a new manager with the given HMAC key for integrity verification.
@@ -782,6 +789,15 @@ impl ThreatIntelManager {
                     tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in threat_intel - recovering: thread panicked while holding lock");
                     e.into_inner()
                 });
+        // Evict to 80% capacity when the cache exceeds the bound
+        if cache.len() >= MAX_DOMAIN_CACHE {
+            let target = MAX_DOMAIN_CACHE * 4 / 5;
+            let to_remove: Vec<String> = cache.keys().take(cache.len() - target).cloned().collect();
+            for k in to_remove {
+                cache.remove(&k);
+            }
+            tracing::warn!(target: "siem", "SIEM:WARNING domain_cache exceeded {} entries, evicted to {}", MAX_DOMAIN_CACHE, target);
+        }
         cache.insert(
             domain.to_string(),
             DomainReputation {
@@ -808,6 +824,15 @@ impl ThreatIntelManager {
                     tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in threat_intel - recovering: thread panicked while holding lock");
                     e.into_inner()
                 });
+        // Evict to 80% capacity when the table exceeds the bound
+        if table.len() >= MAX_GEOIP_ENTRIES {
+            let target = MAX_GEOIP_ENTRIES * 4 / 5;
+            let to_remove: Vec<String> = table.keys().take(table.len() - target).cloned().collect();
+            for k in to_remove {
+                table.remove(&k);
+            }
+            tracing::warn!(target: "siem", "SIEM:WARNING geoip_table exceeded {} entries, evicted to {}", MAX_GEOIP_ENTRIES, target);
+        }
         table.insert(info.ip.clone(), info);
     }
 

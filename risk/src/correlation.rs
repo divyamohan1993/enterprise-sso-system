@@ -1131,10 +1131,24 @@ impl CorrelationEngine {
                     .push(now);
             }
 
-            // Prune old entries (older than 1 hour)
+            // Prune old entries (older than 1 hour) and cap each Vec to 1000
             let cutoff = now - 3600;
-            for timestamps in history.values_mut() {
+            let twenty_four_hours_ago = now - 86_400;
+            history.retain(|_rule_id, timestamps| {
                 timestamps.retain(|t| *t > cutoff);
+                // Remove entries with no alerts in 24 hours
+                if let Some(&latest) = timestamps.last() {
+                    latest > twenty_four_hours_ago
+                } else {
+                    false
+                }
+            });
+            // Cap each Vec to the last 1000 timestamps
+            for timestamps in history.values_mut() {
+                if timestamps.len() > 1000 {
+                    let start = timestamps.len() - 1000;
+                    *timestamps = timestamps[start..].to_vec();
+                }
             }
         }
 

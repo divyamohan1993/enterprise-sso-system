@@ -272,10 +272,16 @@ fn check_single_process_military_deployment() {
              Deploy BFT nodes as separate processes/VMs."
         );
     }
-    // Non-production, non-military, with explicit ACK: allow for local dev/testing only
+    // Non-production, non-military, with explicit ACK: require MLP mode
+    if !common::config::is_mlp_mode() {
+        panic!(
+            "FATAL: BFT single-process mode requires MLP mode. \
+             Set MILNET_MLP_MODE=1 and MILNET_MLP_ACK=1, or deploy BFT nodes as separate processes/VMs."
+        );
+    }
     tracing::warn!(
         target: "siem",
-        "SIEM:WARNING: BFT audit running in single-process mode with explicit ACK. \
+        "SIEM:WARNING: BFT audit running in single-process mode with explicit ACK in MLP mode. \
          All nodes share one address space -- zero actual Byzantine fault tolerance. \
          This is acceptable ONLY for local development and testing."
     );

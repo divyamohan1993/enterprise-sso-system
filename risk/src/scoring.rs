@@ -307,6 +307,9 @@ impl UserBaseline {
 ///
 /// Supports optional durable persistence via `BaselinePersistence` and
 /// cross-node sync via LWW registers.
+/// Maximum number of user baselines before eviction.
+const MAX_USER_BASELINES: usize = 500_000;
+
 pub struct BaselineStore {
     inner: Mutex<HashMap<Uuid, UserBaseline>>,
     persistence: Option<Box<dyn BaselinePersistence>>,
@@ -421,6 +424,17 @@ impl BaselineStore {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
+
+        // Evict oldest baselines when exceeding the bound
+        if store.len() >= MAX_USER_BASELINES && !store.contains_key(&user_id) {
+            let target = MAX_USER_BASELINES * 4 / 5;
+            let mut by_time: Vec<(Uuid, i64)> = store.iter().map(|(k, v)| (*k, v.last_updated)).collect();
+            by_time.sort_by_key(|&(_, t)| t);
+            for (uid, _) in by_time.iter().take(store.len() - target) {
+                store.remove(uid);
+            }
+            tracing::warn!(target: "siem", "SIEM:WARNING baseline store exceeded {} entries, evicted to {}", MAX_USER_BASELINES, target);
+        }
 
         let baseline = store
             .entry(user_id)
@@ -553,6 +567,9 @@ impl Default for BaselineStore {
     }
 }
 
+/// Maximum number of failed attempt counter entries before eviction.
+const MAX_FAILED_COUNTERS: usize = 100_000;
+
 pub struct RiskEngine {
     /// Per-user behavioral baselines for anomaly detection.
     pub baseline_store: BaselineStore,
@@ -587,6 +604,16 @@ impl RiskEngine {
                     tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in scoring - recovering: thread panicked while holding lock");
                     e.into_inner()
                 });
+        // Evict oldest (expired) entries when exceeding the bound
+        if counter.len() >= MAX_FAILED_COUNTERS && !counter.contains_key(user_id) {
+            let target = MAX_FAILED_COUNTERS * 4 / 5;
+            let mut by_time: Vec<(Uuid, Instant)> = counter.iter().map(|(k, v)| (*k, v.1)).collect();
+            by_time.sort_by_key(|&(_, t)| t);
+            for (uid, _) in by_time.iter().take(counter.len() - target) {
+                counter.remove(uid);
+            }
+            tracing::warn!(target: "siem", "SIEM:WARNING failed_attempt_counter exceeded {} entries, evicted to {}", MAX_FAILED_COUNTERS, target);
+        }
         let entry = counter.entry(*user_id).or_insert((0, now));
 
         // Reset counter if the window has expired

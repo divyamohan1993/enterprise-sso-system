@@ -148,6 +148,7 @@ pub fn is_security_critical_command(cmd: &ClusterCommand) -> bool {
             | ClusterCommand::TamperHealed { .. }
             | ClusterCommand::MemberJoin { .. }
             | ClusterCommand::MemberLeave { .. }
+            | ClusterCommand::RoleAssignment { .. }
     )
 }
 
