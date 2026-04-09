@@ -829,7 +829,7 @@ pub async fn init_database(database_url: &str) -> Result<PgPool, String> {
 /// active, and also injects `tenant_id` into application-level queries.
 ///
 /// # Usage
-/// ```ignore
+/// ```no_run
 /// let pool = TenantAwarePool::new(pg_pool);
 /// // Within a request scoped to a tenant:
 /// TenantContext::with_tenant(tenant_id, || async {
@@ -1701,9 +1701,14 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires running PostgreSQL — set DATABASE_URL"]
     async fn test_db_init_creates_tables() {
-        let url = std::env::var("DATABASE_URL").unwrap();
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(u) => u,
+            Err(_) => {
+                eprintln!("DATABASE_URL not set, skipping test_db_init_creates_tables");
+                return;
+            }
+        };
         let pool = init_database(&url).await.unwrap();
         // Verify tables exist by querying the information_schema (now includes tenants)
         let row: (i64,) = sqlx::query_as(
@@ -1716,9 +1721,14 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires running PostgreSQL — set DATABASE_URL"]
     async fn test_db_insert_and_query_user() {
-        let url = std::env::var("DATABASE_URL").unwrap();
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(u) => u,
+            Err(_) => {
+                eprintln!("DATABASE_URL not set, skipping test_db_insert_and_query_user");
+                return;
+            }
+        };
         let pool = init_database(&url).await.unwrap();
         let user_id = uuid::Uuid::new_v4();
         let now = std::time::SystemTime::now()

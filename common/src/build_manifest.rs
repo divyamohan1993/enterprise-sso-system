@@ -184,7 +184,7 @@ pub struct EmbeddedBuildInfo {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```no_run
 /// use common::build_manifest::embed_build_info;
 ///
 /// let info = embed_build_info!();

@@ -356,7 +356,7 @@ pub fn reset_panel_dedup() {
 /// Emit a SIEM event with automatic source location capture.
 ///
 /// # Usage
-/// ```ignore
+/// ```no_run
 /// siem_event!(SiemPanel::AuthFailures, SiemSeverity::Error, "login failed");
 /// siem_event!(SiemPanel::CryptoFailures, SiemSeverity::Critical, "key derive failed", json!({"algo": "AES"}));
 /// ```
@@ -430,7 +430,7 @@ pub fn emit_runtime_error(
 /// then propagates via `?` (the enclosing function must return `Result`).
 ///
 /// # Usage
-/// ```ignore
+/// ```no_run
 /// let val = siem_unwrap!(some_result, "decrypting DEK");
 /// let val = siem_unwrap!(some_result, "signing JWT", CRYPTO_FAILURE);
 /// ```
@@ -501,7 +501,7 @@ macro_rules! siem_unwrap {
 /// then propagates via `?` (the enclosing function must return `Result`).
 ///
 /// # Usage
-/// ```ignore
+/// ```no_run
 /// let val = siem_expect!(some_option, "loading KEK from keyring");
 /// let val = siem_expect!(some_option, "parsing KEM ciphertext", CRYPTO_FAILURE);
 /// ```

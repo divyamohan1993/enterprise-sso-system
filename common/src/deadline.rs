@@ -79,7 +79,7 @@ impl RequestDeadline {
     /// `Err(DeadlineExceeded)` if the deadline has passed.
     ///
     /// Usage:
-    /// ```ignore
+    /// ```no_run
     /// let remaining = deadline.check("database_query")?;
     /// // Only proceed if enough time remains for the operation.
     /// ```

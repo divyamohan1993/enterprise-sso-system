@@ -591,7 +591,7 @@ const PERSIST_INTERVAL_SECS: u64 = 60;
 /// - Graceful shutdown persistence via tokio signal handler (SIGTERM/SIGINT)
 ///
 /// # Usage
-/// ```ignore
+/// ```no_run
 /// let persistence = SequencePersistence::new(protocol, "/var/lib/milnet/shard");
 /// persistence.start();
 /// // ... use persistence.protocol() to access the inner ShardProtocol ...

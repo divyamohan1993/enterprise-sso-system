@@ -1019,7 +1019,7 @@ pub fn hsm_backend_from_env() -> Option<String> {
 /// If `MILNET_HSM_BACKEND` is not set, falls back to [`load_master_kek`].
 ///
 /// # Usage
-/// ```ignore
+/// ```no_run
 /// let kek = load_master_kek_hsm_aware();
 /// if kek == [0u8; 32] {
 ///     // HSM backend configured — use HsmKeyManager
