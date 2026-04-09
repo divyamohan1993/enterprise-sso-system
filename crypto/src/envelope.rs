@@ -358,6 +358,10 @@ pub fn unwrap_key(
 
     let mut key_bytes = [0u8; KEY_LEN];
     key_bytes.copy_from_slice(&plaintext);
+    // Zeroize the intermediate plaintext Vec to prevent key material
+    // lingering in heap memory after extraction.
+    let mut plaintext = plaintext;
+    plaintext.zeroize();
     Ok(DataEncryptionKey::from_bytes(key_bytes))
 }
 
@@ -554,6 +558,9 @@ pub fn unwrap_key_with_keyring(
 
     let mut key_bytes = [0u8; KEY_LEN];
     key_bytes.copy_from_slice(&plaintext);
+    // Zeroize intermediate plaintext buffer containing key material.
+    let mut plaintext = plaintext;
+    plaintext.zeroize();
     Ok(DataEncryptionKey::from_bytes(key_bytes))
 }
 

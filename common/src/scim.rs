@@ -17,10 +17,20 @@
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha512};
 use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::siem::{SecurityEvent, Severity};
+
+// ── SCIM Token Hashing ─────────────────────────────────────────────
+
+/// Hash a SCIM bearer token using SHA-512 for secure storage.
+fn hash_scim_token(token: &str) -> String {
+    let mut hasher = Sha512::new();
+    hasher.update(token.as_bytes());
+    hex::encode(hasher.finalize())
+}
 
 // ── SCIM Schema Constants ────────────────────────────────────────────
 
@@ -696,7 +706,10 @@ impl ScimServer {
     // ── Client Management ────────────────────────────────────────────
 
     /// Register a SCIM client with a bearer token.
-    pub fn register_client(&mut self, client: ScimClient) {
+    ///
+    /// The bearer token is SHA-512 hashed before storage.
+    pub fn register_client(&mut self, mut client: ScimClient) {
+        client.token_hash = hash_scim_token(&client.token_hash);
         emit_scim_siem_event(
             "scim_client_registered",
             Severity::Info,
@@ -712,12 +725,13 @@ impl ScimServer {
     /// Returns the client_id if authenticated, or a SCIM error.
     pub fn authenticate(&mut self, bearer_token: &str) -> Result<String, ScimError> {
         let now = self.now();
+        let incoming_hash = hash_scim_token(bearer_token);
 
         for client in self.clients.values_mut() {
             if {
                 use subtle::ConstantTimeEq;
                 let a = client.token_hash.as_bytes();
-                let b = bearer_token.as_bytes();
+                let b = incoming_hash.as_bytes();
                 // Constant-time comparison including length check
                 let len_eq: subtle::Choice = (a.len() as u64).ct_eq(&(b.len() as u64));
                 let min_len = std::cmp::min(a.len(), b.len());

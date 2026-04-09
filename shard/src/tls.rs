@@ -426,7 +426,10 @@ fn cnsa2_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
 /// Enforces TLS 1.3 only with AES-256-GCM-SHA384 cipher suite (CNSA 2.0).
 pub fn server_tls_config(cert_key: &CertifiedKey, ca: &CertificateAuthority) -> Arc<ServerConfig> {
     let cert_chain = vec![cert_key.cert.der().clone()];
-    let private_key = PrivatePkcs8KeyDer::from(cert_key.key_pair.serialize_der()).into();
+    let mut der_bytes = cert_key.key_pair.serialize_der();
+    let private_key = PrivatePkcs8KeyDer::from(der_bytes.clone()).into();
+    // Zeroize the source DER bytes after rustls has parsed them.
+    zeroize::Zeroize::zeroize(&mut der_bytes);
 
     let roots = ca_root_store(ca);
     let client_verifier = WebPkiClientVerifier::builder(roots)
@@ -461,7 +464,9 @@ pub fn client_tls_config(
     let roots = ca_root_store(ca);
 
     let client_cert_chain = vec![client_cert.cert.der().clone()];
-    let client_key = PrivatePkcs8KeyDer::from(client_cert.key_pair.serialize_der()).into();
+    let mut der_bytes = client_cert.key_pair.serialize_der();
+    let client_key = PrivatePkcs8KeyDer::from(der_bytes.clone()).into();
+    zeroize::Zeroize::zeroize(&mut der_bytes);
 
     let config = ClientConfig::builder_with_provider(cnsa2_crypto_provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -492,7 +497,9 @@ pub fn server_tls_config_pinned(
     pin_set: CertificatePinSet,
 ) -> Arc<ServerConfig> {
     let cert_chain = vec![cert_key.cert.der().clone()];
-    let private_key = PrivatePkcs8KeyDer::from(cert_key.key_pair.serialize_der()).into();
+    let mut der_bytes = cert_key.key_pair.serialize_der();
+    let private_key = PrivatePkcs8KeyDer::from(der_bytes.clone()).into();
+    zeroize::Zeroize::zeroize(&mut der_bytes);
 
     let roots = ca_root_store(ca);
     let webpki_verifier = WebPkiClientVerifier::builder(roots)
@@ -535,7 +542,9 @@ pub fn client_tls_config_pinned(
     let roots = ca_root_store(ca);
 
     let client_cert_chain = vec![client_cert.cert.der().clone()];
-    let client_key = PrivatePkcs8KeyDer::from(client_cert.key_pair.serialize_der()).into();
+    let mut der_bytes = client_cert.key_pair.serialize_der();
+    let client_key = PrivatePkcs8KeyDer::from(der_bytes.clone()).into();
+    zeroize::Zeroize::zeroize(&mut der_bytes);
 
     // Build the standard WebPKI server verifier, then wrap with pinning.
     let webpki_verifier = rustls::client::WebPkiServerVerifier::builder(roots)

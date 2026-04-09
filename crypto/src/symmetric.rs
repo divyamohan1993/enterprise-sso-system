@@ -12,6 +12,7 @@ use aes_gcm::aead::generic_array::GenericArray;
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce as GcmNonce};
 use aegis::aegis256::Aegis256;
+use chacha20poly1305::ChaCha20Poly1305;
 
 // ---------------------------------------------------------------------------
 // Algorithm identifier constants
@@ -19,6 +20,7 @@ use aegis::aegis256::Aegis256;
 
 pub const ALGO_ID_AEGIS256: u8 = 0x01;
 pub const ALGO_ID_AES256GCM: u8 = 0x02;
+pub const ALGO_ID_CHACHA20POLY1305: u8 = 0x03;
 
 // ---------------------------------------------------------------------------
 // Nonce / tag length constants
@@ -36,6 +38,12 @@ pub const AES_GCM_NONCE_LEN: usize = 12;
 /// AES-256-GCM tag length: 128 bits.
 pub const AES_GCM_TAG_LEN: usize = 16;
 
+/// ChaCha20-Poly1305 nonce length: 96 bits.
+pub const CHACHA_NONCE_LEN: usize = 12;
+
+/// ChaCha20-Poly1305 tag length: 128 bits.
+pub const CHACHA_TAG_LEN: usize = 16;
+
 // ---------------------------------------------------------------------------
 // Algorithm enum
 // ---------------------------------------------------------------------------
@@ -48,22 +56,38 @@ pub enum SymmetricAlgorithm {
     Aegis256 = ALGO_ID_AEGIS256,
     /// AES-256-GCM with 96-bit nonce and 128-bit tag. FIPS fallback.
     Aes256Gcm = ALGO_ID_AES256GCM,
+    /// ChaCha20-Poly1305 with 96-bit nonce and 128-bit tag. ARM fallback.
+    ChaCha20Poly1305 = ALGO_ID_CHACHA20POLY1305,
 }
 
 // ---------------------------------------------------------------------------
 // Algorithm selection
 // ---------------------------------------------------------------------------
 
-/// Returns the active algorithm based on the FIPS mode flag.
-///
-/// When FIPS mode is enabled, AES-256-GCM is used.
-/// Otherwise, AEGIS-256 is used.
-pub fn active_algorithm() -> SymmetricAlgorithm {
+/// Cached envelope cipher from `MILNET_ENVELOPE_CIPHER` env var.
+static ENVELOPE_CIPHER: std::sync::LazyLock<SymmetricAlgorithm> = std::sync::LazyLock::new(|| {
     if common::fips::is_fips_mode() {
-        SymmetricAlgorithm::Aes256Gcm
-    } else {
-        SymmetricAlgorithm::Aegis256
+        return SymmetricAlgorithm::Aes256Gcm;
     }
+    match std::env::var("MILNET_ENVELOPE_CIPHER").as_deref() {
+        Ok("aes-256-gcm") => SymmetricAlgorithm::Aes256Gcm,
+        Ok("chacha20-poly1305") => SymmetricAlgorithm::ChaCha20Poly1305,
+        Ok("aegis-256") | Err(_) => SymmetricAlgorithm::Aegis256,
+        Ok(other) => {
+            tracing::error!(
+                "MILNET_ENVELOPE_CIPHER unknown value '{}', defaulting to aegis-256", other
+            );
+            SymmetricAlgorithm::Aegis256
+        }
+    }
+});
+
+/// Returns the active algorithm for new encryptions.
+///
+/// FIPS mode overrides to AES-256-GCM. Otherwise reads MILNET_ENVELOPE_CIPHER.
+/// Decryption always supports all algorithms via the algo_id wire format byte.
+pub fn active_algorithm() -> SymmetricAlgorithm {
+    *ENVELOPE_CIPHER
 }
 
 // ---------------------------------------------------------------------------
@@ -89,6 +113,7 @@ pub fn encrypt_with(
     match algo {
         SymmetricAlgorithm::Aegis256 => encrypt_aegis256(key, plaintext, aad),
         SymmetricAlgorithm::Aes256Gcm => encrypt_aes256gcm(key, plaintext, aad),
+        SymmetricAlgorithm::ChaCha20Poly1305 => encrypt_chacha20poly1305(key, plaintext, aad),
     }
 }
 
@@ -131,14 +156,34 @@ fn encrypt_aes256gcm(key: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Result<Vec
     Ok(out)
 }
 
+fn encrypt_chacha20poly1305(key: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, String> {
+    use chacha20poly1305::aead::Aead as _;
+
+    let mut nonce_bytes = [0u8; CHACHA_NONCE_LEN];
+    getrandom::getrandom(&mut nonce_bytes)
+        .map_err(|e| format!("ChaCha20-Poly1305 nonce generation failed: {e}"))?;
+
+    let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(key));
+    let nonce = chacha20poly1305::Nonce::from_slice(&nonce_bytes);
+
+    let ciphertext_with_tag = cipher
+        .encrypt(nonce, chacha20poly1305::aead::Payload { msg: plaintext, aad })
+        .map_err(|e| format!("ChaCha20-Poly1305 encryption failed: {e}"))?;
+
+    let mut out = Vec::with_capacity(1 + CHACHA_NONCE_LEN + ciphertext_with_tag.len());
+    out.push(ALGO_ID_CHACHA20POLY1305);
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ciphertext_with_tag);
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Decryption
 // ---------------------------------------------------------------------------
 
 /// Decrypt a sealed blob, reading the algorithm from the first byte.
 ///
-/// Only tagged formats are accepted. Legacy untagged AES-256-GCM blobs
-/// are no longer supported and will return an error.
+/// Supports all cipher algorithms regardless of the active encryption cipher.
 ///
 /// Wire format: `algo_id (1) || nonce || ciphertext || tag`
 pub fn decrypt(key: &[u8; 32], sealed: &[u8], aad: &[u8]) -> Result<Vec<u8>, String> {
@@ -153,13 +198,16 @@ pub fn decrypt(key: &[u8; 32], sealed: &[u8], aad: &[u8]) -> Result<Vec<u8>, Str
             let payload = sealed.get(1..).ok_or_else(|| "truncated AES-256-GCM blob".to_string())?;
             decrypt_aes256gcm_payload(key, payload, aad)
         }
+        ALGO_ID_CHACHA20POLY1305 => {
+            let payload = sealed.get(1..).ok_or_else(|| "truncated ChaCha20-Poly1305 blob".to_string())?;
+            decrypt_chacha20poly1305_payload(key, payload, aad)
+        }
         _ => {
-            return Err(format!(
+            Err(format!(
                 "decrypt: unknown algorithm tag 0x{:02x}. \
-                 Only AEGIS-256 (0x01) and AES-256-GCM (0x02) are supported. \
-                 Legacy untagged ciphertext is no longer accepted.",
+                 Supported: AEGIS-256 (0x01), AES-256-GCM (0x02), ChaCha20-Poly1305 (0x03).",
                 first
-            ));
+            ))
         }
     }
 }
@@ -189,6 +237,30 @@ fn decrypt_aegis256(key: &[u8; 32], payload: &[u8], aad: &[u8]) -> Result<Vec<u8
     Aegis256::<AEGIS256_TAG_LEN>::new(key, &nonce)
         .decrypt(ciphertext, &tag, aad)
         .map_err(|e| format!("AEGIS-256 decryption failed: {e}"))
+}
+
+fn decrypt_chacha20poly1305_payload(key: &[u8; 32], payload: &[u8], aad: &[u8]) -> Result<Vec<u8>, String> {
+    use chacha20poly1305::aead::Aead as _;
+
+    let min_len = CHACHA_NONCE_LEN + CHACHA_TAG_LEN;
+    if payload.len() < min_len {
+        return Err(format!(
+            "ChaCha20-Poly1305 payload too short: {} bytes (need at least {})",
+            payload.len(), min_len
+        ));
+    }
+
+    let nonce_slice = payload.get(..CHACHA_NONCE_LEN)
+        .ok_or_else(|| "ChaCha20-Poly1305: nonce slice out of bounds".to_string())?;
+    let ciphertext_with_tag = payload.get(CHACHA_NONCE_LEN..)
+        .ok_or_else(|| "ChaCha20-Poly1305: ciphertext slice out of bounds".to_string())?;
+
+    let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(key));
+    let nonce = chacha20poly1305::Nonce::from_slice(nonce_slice);
+
+    cipher
+        .decrypt(nonce, chacha20poly1305::aead::Payload { msg: ciphertext_with_tag, aad })
+        .map_err(|e| format!("ChaCha20-Poly1305 decryption failed: {e}"))
 }
 
 /// Decrypt an AES-256-GCM payload that is `nonce (12) || ciphertext+tag`.

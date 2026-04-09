@@ -367,6 +367,10 @@ impl SiemWebhook {
         // not be transmitted in cleartext.
         let endpoint = &self.config.endpoint_url;
         if !endpoint.starts_with("https://") {
+            // Persist events to disk before returning error
+            for ev in &events {
+                persist_event_to_disk(ev);
+            }
             return Err(format!(
                 "SIEM webhook: endpoint must use HTTPS, got: {}. \
                  Plaintext HTTP is not permitted for security event transport.",
@@ -429,12 +433,25 @@ impl SiemWebhook {
         use std::net::TcpStream;
         use std::time::Duration;
 
-        let addr: std::net::SocketAddr = host_port_with_default
-            .parse()
-            .map_err(|e| format!("SIEM webhook: invalid endpoint address '{}': {}", host_port_with_default, e))?;
+        let addr: std::net::SocketAddr = match host_port_with_default.parse() {
+            Ok(a) => a,
+            Err(e) => {
+                for ev in &events {
+                    persist_event_to_disk(ev);
+                }
+                return Err(format!("SIEM webhook: invalid endpoint address '{}': {}", host_port_with_default, e));
+            }
+        };
 
-        let tcp_stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
-            .map_err(|e| format!("SIEM webhook: TCP connect to {} failed: {}", addr, e))?;
+        let tcp_stream = match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
+            Ok(s) => s,
+            Err(e) => {
+                for ev in &events {
+                    persist_event_to_disk(ev);
+                }
+                return Err(format!("SIEM webhook: TCP connect to {} failed: {}", addr, e));
+            }
+        };
         let _ = tcp_stream.set_write_timeout(Some(Duration::from_secs(5)));
         let _ = tcp_stream.set_read_timeout(Some(Duration::from_secs(5)));
 
@@ -455,20 +472,32 @@ impl SiemWebhook {
             host_port
         };
 
-        let server_name = rustls::pki_types::ServerName::try_from(sni_host.to_string())
-            .map_err(|e| format!("SIEM webhook: invalid SNI hostname '{}': {}", sni_host, e))?;
+        let server_name = match rustls::pki_types::ServerName::try_from(sni_host.to_string()) {
+            Ok(s) => s,
+            Err(e) => {
+                for ev in &events { persist_event_to_disk(ev); }
+                return Err(format!("SIEM webhook: invalid SNI hostname '{}': {}", sni_host, e));
+            }
+        };
 
-        let tls_conn = rustls::ClientConnection::new(tls_config, server_name)
-            .map_err(|e| format!("SIEM webhook: TLS handshake setup failed: {}", e))?;
+        let tls_conn = match rustls::ClientConnection::new(tls_config, server_name) {
+            Ok(c) => c,
+            Err(e) => {
+                for ev in &events { persist_event_to_disk(ev); }
+                return Err(format!("SIEM webhook: TLS handshake setup failed: {}", e));
+            }
+        };
 
         let mut tls_stream = rustls::StreamOwned::new(tls_conn, tcp_stream);
 
-        tls_stream
-            .write_all(request.as_bytes())
-            .map_err(|e| format!("SIEM webhook: TLS write to {} failed: {}", addr, e))?;
-        tls_stream
-            .flush()
-            .map_err(|e| format!("SIEM webhook: TLS flush to {} failed: {}", addr, e))?;
+        if let Err(e) = tls_stream.write_all(request.as_bytes()) {
+            for ev in &events { persist_event_to_disk(ev); }
+            return Err(format!("SIEM webhook: TLS write to {} failed: {}", addr, e));
+        }
+        if let Err(e) = tls_stream.flush() {
+            for ev in &events { persist_event_to_disk(ev); }
+            return Err(format!("SIEM webhook: TLS flush to {} failed: {}", addr, e));
+        }
 
         // Read response status to detect server errors
         let mut response_buf = [0u8; 512];
@@ -485,6 +514,7 @@ impl SiemWebhook {
                     response = %response,
                     "SIEM webhook: non-2xx response"
                 );
+                for ev in &events { persist_event_to_disk(ev); }
                 return Err(format!(
                     "SIEM webhook: endpoint returned non-2xx: {}",
                     &response[..response.len().min(100)]
@@ -522,6 +552,140 @@ impl SiemWebhook {
     pub fn config(&self) -> &SiemWebhookConfig {
         &self.config
     }
+}
+
+// ── File-backed SIEM event queue ─────────────────────────────────────────────
+//
+// On flush failure, events are persisted to disk so they survive process restarts.
+// A background thread retries every 30 seconds. Capped at 10,000 files; oldest evicted.
+
+/// Maximum number of queued event files on disk.
+const MAX_QUEUED_FILES: usize = 10_000;
+
+/// Directory for file-backed SIEM event queue. Defaults to /var/lib/milnet/siem-queue.
+fn siem_queue_dir() -> &'static std::path::Path {
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::var("MILNET_SIEM_QUEUE_DIR")
+            .unwrap_or_else(|_| "/var/lib/milnet/siem-queue".to_string());
+        let path = std::path::PathBuf::from(dir);
+        if let Err(e) = std::fs::create_dir_all(&path) {
+            tracing::warn!(
+                target: "siem",
+                "SIEM file queue: cannot create directory {:?}: {}. File-backed queue disabled.",
+                path, e
+            );
+        }
+        path
+    })
+}
+
+/// Persist a failed event to disk for later retry.
+fn persist_event_to_disk(event_json: &str) {
+    let dir = siem_queue_dir();
+    if !dir.exists() {
+        return;
+    }
+
+    // Evict oldest files if at capacity
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        let mut files: Vec<std::path::PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|x| x == "json").unwrap_or(false))
+            .map(|e| e.path())
+            .collect();
+
+        if files.len() >= MAX_QUEUED_FILES {
+            files.sort();
+            let to_remove = files.len() - MAX_QUEUED_FILES + 1;
+            for f in files.iter().take(to_remove) {
+                let _ = std::fs::remove_file(f);
+            }
+            tracing::error!(
+                target: "siem",
+                "SIEM file queue: evicted {} oldest events (cap={})",
+                to_remove, MAX_QUEUED_FILES
+            );
+        }
+    }
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let id = uuid::Uuid::new_v4();
+    let filename = dir.join(format!("event_{}_{}.json", ts, id));
+
+    if let Err(e) = std::fs::write(&filename, event_json) {
+        tracing::error!(
+            target: "siem",
+            "SIEM file queue: failed to write event to {:?}: {}",
+            filename, e
+        );
+    }
+}
+
+/// Retry sending queued events from disk. Called by the background retry thread.
+fn retry_queued_events() {
+    let dir = siem_queue_dir();
+    if !dir.exists() {
+        return;
+    }
+
+    let entries: Vec<std::path::PathBuf> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|x| x == "json").unwrap_or(false))
+            .map(|e| e.path())
+            .collect(),
+        Err(_) => return,
+    };
+
+    if entries.is_empty() {
+        return;
+    }
+
+    // Try to re-queue each event through the global webhook
+    for path in &entries {
+        match std::fs::read_to_string(path) {
+            Ok(json) => {
+                if let Some(Some(webhook)) = SIEM_WEBHOOK.get() {
+                    webhook.queue_event(&json);
+                    // Attempt flush; on success delete the file
+                    match webhook.flush() {
+                        Ok(n) if n > 0 => {
+                            let _ = std::fs::remove_file(path);
+                        }
+                        _ => {
+                            // Flush failed, leave file for next retry
+                            return;
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                // Corrupted file, remove it
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
+/// Start the background retry thread for file-backed SIEM events.
+/// Retries every 30 seconds. Safe to call multiple times; only first call starts the thread.
+fn start_siem_retry_thread() {
+    static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    STARTED.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("siem-queue-retry".to_string())
+            .spawn(|| {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                    retry_queued_events();
+                }
+            })
+            .ok();
+    });
 }
 
 // ── Global webhook singleton ──────────────────────────────────────────────────
@@ -604,13 +768,28 @@ pub fn validate_siem_encryption_key() {
 pub fn init_siem_webhook(config: SiemWebhookConfig) {
     validate_siem_encryption_key();
     let _ = SIEM_WEBHOOK.set(Some(SiemWebhook::new(config)));
+    start_siem_retry_thread();
 }
 
 /// Queue an event on the global SIEM webhook, if one has been initialised.
-/// This is a no-op if `init_siem_webhook` has not been called.
+///
+/// If the webhook is not initialised or the in-memory queue is full, the
+/// event is persisted to the file-backed queue for later retry.
 pub fn queue_global_event(event_json: &str) {
-    if let Some(Some(webhook)) = SIEM_WEBHOOK.get() {
-        webhook.queue_event(event_json);
+    match SIEM_WEBHOOK.get() {
+        Some(Some(webhook)) => {
+            webhook.queue_event(event_json);
+        }
+        _ => {
+            // No webhook configured. In MLP mode, log locally.
+            if crate::config::is_mlp_mode() {
+                tracing::warn!(
+                    target: "siem",
+                    "SIEM:WARNING no webhook configured, persisting event to file queue"
+                );
+            }
+            persist_event_to_disk(event_json);
+        }
     }
 }
 

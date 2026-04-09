@@ -93,13 +93,18 @@ impl std::fmt::Display for XWingError {
 
 impl std::error::Error for XWingError {}
 
-/// A shared secret produced by the X-Wing HKDF-SHA512 combiner (32 bytes).
+/// A shared secret produced by the X-Wing HKDF-SHA512 combiner (64 bytes).
+///
+/// CNSA 2.0 Level 5 requires 256-bit security margin. The HKDF-SHA512
+/// combiner naturally produces 64 bytes; storing the full output avoids
+/// truncation and provides a 512-bit shared secret suitable for splitting
+/// into encryption + MAC keys without an additional derivation step.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
-pub struct SharedSecret([u8; 32]);
+pub struct SharedSecret([u8; 64]);
 
 impl SharedSecret {
-    /// Return the raw bytes of the shared secret.
-    pub fn as_bytes(&self) -> &[u8; 32] {
+    /// Return the raw bytes of the shared secret (64 bytes).
+    pub fn as_bytes(&self) -> &[u8; 64] {
         &self.0
     }
 }
@@ -295,7 +300,7 @@ impl Drop for XWingKeyPair {
 
 /// Core X-Wing combiner using HKDF-SHA512.
 ///
-/// Extracts a 32-byte shared secret from the concatenated X25519 and ML-KEM
+/// Extracts a 64-byte shared secret from the concatenated X25519 and ML-KEM
 /// shared secrets via:
 ///
 /// ```text
@@ -314,7 +319,7 @@ fn combine(
     ikm.extend_from_slice(ml_kem_ss);
 
     let hk = Hkdf::<Sha512>::new(Some(XWING_HKDF_SALT), &ikm);
-    let mut okm = [0u8; 32];
+    let mut okm = [0u8; 64];
     if hk.expand(XWING_HKDF_INFO, &mut okm).is_err() {
         common::siem::emit_runtime_error(
             common::siem::category::CRYPTO_FAILURE,
@@ -513,12 +518,12 @@ pub fn active_kem_algorithm() -> KemAlgorithm {
 
 /// ML-KEM-1024-only combiner using HKDF-SHA512.
 ///
-/// Derives a 32-byte shared secret from the ML-KEM-1024 shared secret only
+/// Derives a 64-byte shared secret from the ML-KEM-1024 shared secret only
 /// (no X25519 component). Uses a distinct HKDF salt to ensure domain separation
-/// from the X-Wing combiner.
+/// from the X-Wing combiner. Full 64-byte output for CNSA 2.0 Level 5.
 fn combine_mlkem_only(ml_kem_ss: &[u8]) -> Result<SharedSecret, XWingError> {
     let hk = Hkdf::<Sha512>::new(Some(MLKEM_ONLY_HKDF_SALT), ml_kem_ss);
-    let mut okm = [0u8; 32];
+    let mut okm = [0u8; 64];
     if hk.expand(MLKEM_ONLY_HKDF_INFO, &mut okm).is_err() {
         common::siem::emit_runtime_error(
             common::siem::category::CRYPTO_FAILURE,

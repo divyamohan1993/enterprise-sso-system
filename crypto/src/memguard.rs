@@ -394,10 +394,14 @@ pub struct SecretVec {
     data: Vec<u8>,
     /// Original length at construction time, used for munlock.
     original_len: usize,
-    /// Head canary value set at construction.
+    /// Head canary value set at construction (random).
     canary: u64,
-    /// Tail canary value set at construction.
+    /// Tail canary value set at construction (random).
     canary_tail: u64,
+    /// HMAC over (nonce, canary, canary_tail) computed at construction.
+    canary_hmac: u64,
+    /// Random per-instance nonce used in HMAC computation.
+    canary_nonce: u64,
     /// Whether `mlock` succeeded for this buffer.
     locked: bool,
 }
@@ -413,18 +417,43 @@ impl SecretVec {
         }
 
         let original_len = data.len();
+        let nonce = {
+            let mut b = [0u8; 8];
+            getrandom::getrandom(&mut b).map_err(|_| MemguardError::AllocationFailed)?;
+            u64::from_ne_bytes(b)
+        };
+        let head = {
+            let mut b = [0u8; 8];
+            getrandom::getrandom(&mut b).map_err(|_| MemguardError::AllocationFailed)?;
+            u64::from_ne_bytes(b)
+        };
+        let tail = {
+            let mut b = [0u8; 8];
+            getrandom::getrandom(&mut b).map_err(|_| MemguardError::AllocationFailed)?;
+            u64::from_ne_bytes(b)
+        };
+
+        let canary_hmac_val = {
+            use hmac::{Hmac, Mac};
+            use sha2::Sha512;
+            type HmacSha512 = Hmac<Sha512>;
+            let mut mac = HmacSha512::new_from_slice(canary_hmac_key()).expect("HMAC key size");
+            mac.update(&nonce.to_ne_bytes());
+            mac.update(&head.to_ne_bytes());
+            mac.update(&tail.to_ne_bytes());
+            let result = mac.finalize().into_bytes();
+            u64::from_ne_bytes(result[..8].try_into().unwrap())
+        };
+
         let mut sv = Self {
             data,
             original_len,
-            canary: 0,
-            canary_tail: 0,
+            canary: head,
+            canary_tail: tail,
+            canary_hmac: canary_hmac_val,
+            canary_nonce: nonce,
             locked: false,
         };
-
-        // Derive canaries from the buffer's heap address
-        let addr = sv.data.as_ptr() as usize;
-        sv.canary = derive_canary(addr, 0x03);
-        sv.canary_tail = derive_canary(addr, 0x04);
 
         let ptr = sv.data.as_ptr();
         let len = sv.data.len();
@@ -460,15 +489,26 @@ impl SecretVec {
         Ok(sv)
     }
 
-    /// Verify head and tail canary integrity using constant-time comparison.
+    /// Verify canary integrity using HMAC-SHA512 and constant-time comparison.
     pub fn verify_canary(&self) -> bool {
         use subtle::ConstantTimeEq;
-        let addr = self.data.as_ptr() as usize;
-        let expected_head = derive_canary(addr, 0x03);
-        let expected_tail = derive_canary(addr, 0x04);
-        let head_ok = self.canary.ct_eq(&expected_head);
-        let tail_ok = self.canary_tail.ct_eq(&expected_tail);
-        (head_ok & tail_ok).into()
+        let head_ok: subtle::Choice = (!self.canary.ct_eq(&0u64)) & subtle::Choice::from(1u8);
+        let tail_ok: subtle::Choice = (!self.canary_tail.ct_eq(&0u64)) & subtle::Choice::from(1u8);
+        let xor_val = self.canary ^ self.canary_tail;
+        let xor_ok: subtle::Choice = !xor_val.ct_eq(&0u64);
+        let expected_check = {
+            use hmac::{Hmac, Mac};
+            use sha2::Sha512;
+            type HmacSha512 = Hmac<Sha512>;
+            let mut mac = HmacSha512::new_from_slice(canary_hmac_key()).expect("HMAC key size");
+            mac.update(&self.canary_nonce.to_ne_bytes());
+            mac.update(&self.canary.to_ne_bytes());
+            mac.update(&self.canary_tail.to_ne_bytes());
+            let result = mac.finalize().into_bytes();
+            u64::from_ne_bytes(result[..8].try_into().unwrap())
+        };
+        let hmac_ok: subtle::Choice = expected_check.ct_eq(&self.canary_hmac);
+        (head_ok & tail_ok & xor_ok & hmac_ok).into()
     }
 
     /// Borrow the protected data as a byte slice.
@@ -521,6 +561,8 @@ impl Drop for SecretVec {
         // 3. Zeroize canary material.
         self.canary.zeroize();
         self.canary_tail.zeroize();
+        self.canary_hmac.zeroize();
+        self.canary_nonce.zeroize();
     }
 }
 
