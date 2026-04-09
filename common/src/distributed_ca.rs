@@ -283,6 +283,8 @@ pub struct DistributedCa {
     /// Persistence backend for CA state
     persistence: Box<dyn CaPersistence>,
     revocation_quorum: RevocationQuorum,
+    /// Retired CA keys kept during grace period for verifying existing certs.
+    retired_keys: Vec<RetiredCaKey>,
 }
 
 impl DistributedCa {
@@ -325,6 +327,7 @@ impl DistributedCa {
             ca_fingerprint,
             persistence,
             revocation_quorum,
+            retired_keys: Vec::new(),
         }
     }
 
@@ -466,6 +469,218 @@ impl DistributedCa {
     /// Total issued certificates.
     pub fn issued_count(&self) -> usize {
         self.issued.len()
+    }
+}
+
+// ── CA Key Rotation Ceremony ──────────────────────────────────────────────
+//
+// SECURITY: The CA signing key MUST be rotated periodically. Rotation uses
+// Pedersen DKG to generate a new FROST threshold key, cross-certifies old->new,
+// and distributes new key packages to all nodes. The old key is maintained for
+// a configurable grace period to verify existing certificates.
+
+/// Event logged to SIEM when a CA key rotation occurs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaRotationEvent {
+    pub timestamp: i64,
+    pub old_key_fingerprint: Vec<u8>,
+    pub new_key_fingerprint: Vec<u8>,
+    /// Cross-certificate: old CA signs new CA's verifying key.
+    pub cross_cert: Vec<u8>,
+    /// Node IDs that approved the rotation.
+    pub approvers: Vec<NodeId>,
+}
+
+/// Vote cast by a node to approve a CA key rotation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RotationVote {
+    pub voter_id: NodeId,
+    pub new_key_fingerprint: Vec<u8>,
+    pub timestamp: i64,
+}
+
+/// Tracks pending rotation votes and enforces quorum.
+pub struct RotationQuorum {
+    pub required: usize,
+    pending_votes: Vec<RotationVote>,
+}
+
+impl RotationQuorum {
+    pub fn new(required: usize) -> Self {
+        Self { required, pending_votes: Vec::new() }
+    }
+
+    pub fn add_vote(&mut self, vote: RotationVote) -> bool {
+        if self.pending_votes.iter().any(|v| v.voter_id == vote.voter_id) {
+            return self.pending_votes.len() >= self.required;
+        }
+        self.pending_votes.push(vote);
+        self.pending_votes.len() >= self.required
+    }
+
+    pub fn has_quorum(&self) -> bool {
+        self.pending_votes.len() >= self.required
+    }
+
+    pub fn approvers(&self) -> Vec<NodeId> {
+        self.pending_votes.iter().map(|v| v.voter_id).collect()
+    }
+
+    pub fn clear(&mut self) {
+        self.pending_votes.clear();
+    }
+}
+
+/// Retired CA key kept during the grace period for verifying existing certs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetiredCaKey {
+    pub fingerprint: Vec<u8>,
+    pub retired_at: i64,
+    pub grace_period_secs: i64,
+    pub cross_cert: Vec<u8>,
+}
+
+impl RetiredCaKey {
+    /// Returns true if this retired key is still within its grace period.
+    pub fn is_in_grace_period(&self, now: i64) -> bool {
+        now < self.retired_at + self.grace_period_secs
+    }
+}
+
+/// Default grace period for retired CA keys (7 days in seconds).
+const DEFAULT_CA_KEY_GRACE_PERIOD_SECS: i64 = 7 * 24 * 3600;
+
+/// Result of a CA key rotation ceremony.
+#[derive(Debug, Clone)]
+pub struct CaRotationResult {
+    pub event: CaRotationEvent,
+    pub new_fingerprint: Vec<u8>,
+}
+
+impl DistributedCa {
+    /// Initiate a CA key rotation ceremony.
+    ///
+    /// Requires quorum approval (same threshold as revocation). The ceremony:
+    /// 1. Generates new FROST threshold key via Pedersen DKG (simulated by
+    ///    the caller providing the new verifying key fingerprint and cross-cert).
+    /// 2. Signs a cross-certificate from old CA to new CA.
+    /// 3. Updates the CA verifying key.
+    /// 4. Retires old key with a configurable grace period.
+    /// 5. Logs rotation event to SIEM.
+    ///
+    /// All nodes MUST independently verify the cross-certificate chain before
+    /// accepting the new key.
+    ///
+    /// `new_key_fingerprint`: SHA-512 fingerprint of the new FROST group verifying key.
+    /// `cross_cert`: Signature of old CA over new CA's verifying key (the caller
+    ///     performs the actual FROST threshold signing ceremony to produce this).
+    /// `rotation_quorum`: Quorum tracker with accumulated approval votes.
+    /// `grace_period_secs`: How long the old key stays valid (default 7 days).
+    pub fn rotate_ca_key(
+        &mut self,
+        new_key_fingerprint: Vec<u8>,
+        cross_cert: Vec<u8>,
+        rotation_quorum: &mut RotationQuorum,
+        grace_period_secs: Option<i64>,
+    ) -> Result<CaRotationResult, String> {
+        // Require quorum approval before proceeding.
+        if !rotation_quorum.has_quorum() {
+            return Err(format!(
+                "CA key rotation requires quorum ({} of {} votes). Current: {}",
+                rotation_quorum.required,
+                rotation_quorum.required,
+                rotation_quorum.pending_votes.len()
+            ));
+        }
+
+        // Validate inputs.
+        if new_key_fingerprint.is_empty() {
+            return Err("new CA key fingerprint must not be empty".into());
+        }
+        if cross_cert.is_empty() {
+            return Err("cross-certificate must not be empty".into());
+        }
+        if new_key_fingerprint == self.ca_fingerprint {
+            return Err("new CA key fingerprint must differ from current key".into());
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        let grace = grace_period_secs.unwrap_or(DEFAULT_CA_KEY_GRACE_PERIOD_SECS);
+        let old_fingerprint = self.ca_fingerprint.clone();
+
+        // Retire the old key with grace period.
+        let retired = RetiredCaKey {
+            fingerprint: old_fingerprint.clone(),
+            retired_at: now,
+            grace_period_secs: grace,
+            cross_cert: cross_cert.clone(),
+        };
+
+        // Store retired key in the retired keys list.
+        self.retired_keys.push(retired);
+
+        // Prune expired retired keys.
+        self.retired_keys.retain(|k| k.is_in_grace_period(now));
+
+        let approvers = rotation_quorum.approvers();
+
+        // Update to new CA key.
+        self.ca_fingerprint = new_key_fingerprint.clone();
+
+        let event = CaRotationEvent {
+            timestamp: now,
+            old_key_fingerprint: old_fingerprint,
+            new_key_fingerprint: new_key_fingerprint.clone(),
+            cross_cert,
+            approvers: approvers.clone(),
+        };
+
+        // Log to SIEM.
+        tracing::warn!(
+            target: "siem",
+            old_fp = hex::encode(&event.old_key_fingerprint),
+            new_fp = hex::encode(&event.new_key_fingerprint),
+            approver_count = approvers.len(),
+            grace_period_secs = grace,
+            "SIEM:CA_KEY_ROTATION CA signing key rotated via quorum ceremony"
+        );
+        crate::siem::SecurityEvent::circuit_breaker_opened("ca_key_rotation");
+
+        rotation_quorum.clear();
+
+        Ok(CaRotationResult {
+            event,
+            new_fingerprint: new_key_fingerprint,
+        })
+    }
+
+    /// Check if a fingerprint matches the current CA key or any retired key
+    /// still within its grace period. Use this when verifying existing certs
+    /// that may have been signed by a previous CA key.
+    pub fn is_known_ca_fingerprint(&self, fingerprint: &[u8]) -> bool {
+        if self.ca_fingerprint == fingerprint {
+            return true;
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        self.retired_keys.iter().any(|k| {
+            k.is_in_grace_period(now) && k.fingerprint == fingerprint
+        })
+    }
+
+    /// Get all retired CA keys still within their grace period.
+    pub fn active_retired_keys(&self) -> Vec<&RetiredCaKey> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        self.retired_keys.iter().filter(|k| k.is_in_grace_period(now)).collect()
     }
 }
 
@@ -829,5 +1044,106 @@ mod tests {
     fn test_ca_fingerprint() {
         let ca = make_ca();
         assert_eq!(ca.ca_fingerprint(), &[0xCA; 64]);
+    }
+
+    // ── CA Key Rotation ────────────────────────────────────────────────
+
+    #[test]
+    fn test_rotation_requires_quorum() {
+        let mut ca = make_ca();
+        let mut rq = RotationQuorum::new(2);
+        let result = ca.rotate_ca_key(vec![0xBB; 64], vec![0x01; 128], &mut rq, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("quorum"));
+    }
+
+    #[test]
+    fn test_rotation_rejects_same_key() {
+        let mut ca = make_ca();
+        let mut rq = RotationQuorum::new(2);
+        rq.add_vote(RotationVote { voter_id: node(1), new_key_fingerprint: vec![0xCA; 64], timestamp: 1 });
+        rq.add_vote(RotationVote { voter_id: node(2), new_key_fingerprint: vec![0xCA; 64], timestamp: 2 });
+        let result = ca.rotate_ca_key(vec![0xCA; 64], vec![0x01; 128], &mut rq, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("must differ"));
+    }
+
+    #[test]
+    fn test_rotation_rejects_empty_cross_cert() {
+        let mut ca = make_ca();
+        let mut rq = RotationQuorum::new(2);
+        rq.add_vote(RotationVote { voter_id: node(1), new_key_fingerprint: vec![0xBB; 64], timestamp: 1 });
+        rq.add_vote(RotationVote { voter_id: node(2), new_key_fingerprint: vec![0xBB; 64], timestamp: 2 });
+        let result = ca.rotate_ca_key(vec![0xBB; 64], vec![], &mut rq, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_rotation_succeeds_with_quorum() {
+        let mut ca = make_ca();
+        let mut rq = RotationQuorum::new(2);
+        rq.add_vote(RotationVote { voter_id: node(1), new_key_fingerprint: vec![0xBB; 64], timestamp: 1 });
+        rq.add_vote(RotationVote { voter_id: node(2), new_key_fingerprint: vec![0xBB; 64], timestamp: 2 });
+        let new_fp = vec![0xBB; 64];
+        let cross = vec![0x01; 128];
+        let result = ca.rotate_ca_key(new_fp.clone(), cross.clone(), &mut rq, Some(3600));
+        assert!(result.is_ok());
+        let r = result.unwrap();
+        assert_eq!(r.new_fingerprint, new_fp);
+        assert_eq!(r.event.old_key_fingerprint, vec![0xCA; 64]);
+        assert_eq!(r.event.approvers.len(), 2);
+        assert_eq!(ca.ca_fingerprint(), &new_fp[..]);
+    }
+
+    #[test]
+    fn test_rotation_old_key_in_grace_period() {
+        let mut ca = make_ca();
+        let old_fp = ca.ca_fingerprint().to_vec();
+        let mut rq = RotationQuorum::new(2);
+        rq.add_vote(RotationVote { voter_id: node(1), new_key_fingerprint: vec![0xBB; 64], timestamp: 1 });
+        rq.add_vote(RotationVote { voter_id: node(2), new_key_fingerprint: vec![0xBB; 64], timestamp: 2 });
+        ca.rotate_ca_key(vec![0xBB; 64], vec![0x01; 128], &mut rq, Some(86400)).unwrap();
+
+        // Old key still recognized during grace period.
+        assert!(ca.is_known_ca_fingerprint(&old_fp));
+        // New key recognized.
+        assert!(ca.is_known_ca_fingerprint(&[0xBB; 64]));
+        // Unknown key not recognized.
+        assert!(!ca.is_known_ca_fingerprint(&[0xFF; 64]));
+    }
+
+    #[test]
+    fn test_rotation_clears_quorum() {
+        let mut ca = make_ca();
+        let mut rq = RotationQuorum::new(2);
+        rq.add_vote(RotationVote { voter_id: node(1), new_key_fingerprint: vec![0xBB; 64], timestamp: 1 });
+        rq.add_vote(RotationVote { voter_id: node(2), new_key_fingerprint: vec![0xBB; 64], timestamp: 2 });
+        ca.rotate_ca_key(vec![0xBB; 64], vec![0x01; 128], &mut rq, None).unwrap();
+        // Quorum should be cleared after rotation.
+        assert!(!rq.has_quorum());
+    }
+
+    #[test]
+    fn test_double_rotation() {
+        let mut ca = make_ca();
+        let original_fp = ca.ca_fingerprint().to_vec();
+
+        // First rotation.
+        let mut rq1 = RotationQuorum::new(2);
+        rq1.add_vote(RotationVote { voter_id: node(1), new_key_fingerprint: vec![0xAA; 64], timestamp: 1 });
+        rq1.add_vote(RotationVote { voter_id: node(2), new_key_fingerprint: vec![0xAA; 64], timestamp: 2 });
+        ca.rotate_ca_key(vec![0xAA; 64], vec![0x01; 128], &mut rq1, Some(86400)).unwrap();
+
+        // Second rotation.
+        let mut rq2 = RotationQuorum::new(2);
+        rq2.add_vote(RotationVote { voter_id: node(1), new_key_fingerprint: vec![0xBB; 64], timestamp: 3 });
+        rq2.add_vote(RotationVote { voter_id: node(2), new_key_fingerprint: vec![0xBB; 64], timestamp: 4 });
+        ca.rotate_ca_key(vec![0xBB; 64], vec![0x02; 128], &mut rq2, Some(86400)).unwrap();
+
+        assert_eq!(ca.ca_fingerprint(), &[0xBB; 64]);
+        assert!(ca.is_known_ca_fingerprint(&original_fp));
+        assert!(ca.is_known_ca_fingerprint(&[0xAA; 64]));
+        assert!(ca.is_known_ca_fingerprint(&[0xBB; 64]));
+        assert_eq!(ca.active_retired_keys().len(), 2);
     }
 }

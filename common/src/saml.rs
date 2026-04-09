@@ -1025,6 +1025,61 @@ impl AuthnRequest {
                 return Err("SAML: signature present but SignatureValue is empty".into());
             }
 
+            // --- Step 3 (actual): Verify DigestValue over canonicalized referenced element ---
+            // Extract the DigestValue from SignedInfo, canonicalize the referenced
+            // element (the assertion body), compute the digest, and compare with
+            // constant-time equality to prevent timing side-channels.
+            if let Some(claimed_digest_b64) = extract_digest_value_from_signed_info(&signed_info_str) {
+                let cleaned: String = claimed_digest_b64.chars().filter(|c| !c.is_whitespace()).collect();
+                let claimed_digest = BASE64_STD.decode(&cleaned).map_err(|e| {
+                    format!("SAML: DigestValue base64 decode error: {e}")
+                })?;
+
+                // Determine digest algorithm from SignedInfo
+                let use_sha512 = signed_info_str.contains("sha512");
+
+                // Extract the referenced element and canonicalize it.
+                // For enveloped signatures, remove the Signature element first.
+                let without_sig = strip_signature_element(xml);
+                let canon_body = minimal_exc_c14n(&without_sig);
+
+                let computed_digest: Vec<u8> = if use_sha512 {
+                    use sha2::Digest;
+                    sha2::Sha512::digest(canon_body.as_bytes()).to_vec()
+                } else {
+                    sha256_hash(canon_body.as_bytes()).to_vec()
+                };
+
+                // Constant-time comparison to prevent timing attacks.
+                use subtle::ConstantTimeEq;
+                if claimed_digest.len() != computed_digest.len()
+                    || claimed_digest.ct_eq(&computed_digest).unwrap_u8() != 1
+                {
+                    if is_military_deployment() {
+                        tracing::error!(
+                            target: "siem",
+                            "SIEM:CRITICAL SAML DigestValue mismatch over canonicalized \
+                             referenced element in military deployment (fail-closed)"
+                        );
+                    }
+                    return Err(
+                        "SAML: DigestValue mismatch: computed digest over canonicalized \
+                         referenced element does not match claimed DigestValue in SignedInfo"
+                            .into(),
+                    );
+                }
+            } else if is_military_deployment() {
+                // Military mode: DigestValue MUST be present and verified.
+                tracing::error!(
+                    target: "siem",
+                    "SIEM:CRITICAL SAML SignedInfo missing DigestValue in military deployment"
+                );
+                return Err(
+                    "SAML: SignedInfo contains no DigestValue (required in military deployment)"
+                        .into(),
+                );
+            }
+
             // Verify with canonicalized SignedInfo
             if let Err(e) = validate_signature_value(&cert_der, &signature_value, signed_info_canon.as_bytes()) {
                 if is_military_deployment() {
@@ -4243,6 +4298,49 @@ fn extract_signature_value_bytes(xml: &str) -> Vec<u8> {
         .unwrap_or_default();
     let cleaned: String = value.chars().filter(|c| !c.is_whitespace()).collect();
     BASE64_STD.decode(&cleaned).unwrap_or_default()
+}
+
+/// Extract the base64-encoded DigestValue from a SignedInfo XML block.
+///
+/// Searches for `<ds:DigestValue>` or `<DigestValue>` inside the SignedInfo
+/// and returns the text content (still base64-encoded).
+fn extract_digest_value_from_signed_info(signed_info: &str) -> Option<String> {
+    for (open, close) in &[
+        ("<ds:DigestValue>", "</ds:DigestValue>"),
+        ("<DigestValue>", "</DigestValue>"),
+    ] {
+        if let Some(start) = signed_info.find(open) {
+            let content_start = start + open.len();
+            if let Some(end) = signed_info[content_start..].find(close) {
+                return Some(signed_info[content_start..content_start + end].to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Strip the `<ds:Signature>...</ds:Signature>` (or `<Signature>...</Signature>`)
+/// element from XML for enveloped signature digest computation.
+///
+/// Per the XML DSIG spec, enveloped signature transforms require removing
+/// the Signature element before computing the digest over the parent element.
+fn strip_signature_element(xml: &str) -> String {
+    // Try ds: prefixed first, then unprefixed.
+    for (start_tag, end_tag) in &[
+        ("<ds:Signature", "</ds:Signature>"),
+        ("<Signature", "</Signature>"),
+    ] {
+        if let Some(sig_start) = xml.find(start_tag) {
+            if let Some(sig_end_offset) = xml[sig_start..].find(end_tag) {
+                let sig_end = sig_start + sig_end_offset + end_tag.len();
+                let mut result = String::with_capacity(xml.len());
+                result.push_str(&xml[..sig_start]);
+                result.push_str(&xml[sig_end..]);
+                return result;
+            }
+        }
+    }
+    xml.to_string()
 }
 
 /// Extract the raw `<ds:SignedInfo>...</ds:SignedInfo>` block bytes from XML.
