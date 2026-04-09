@@ -463,6 +463,96 @@ impl Default for AutoFailoverConfig {
     }
 }
 
+/// Configuration for automatic database promotion with witness verification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoPromoteConfig {
+    pub enabled: bool,
+    pub safety_delay_secs: u64,
+    pub require_witness: bool,
+    pub min_replica_lag_bytes: i64,
+}
+
+impl AutoPromoteConfig {
+    pub fn from_env() -> Self {
+        let manual_only = std::env::var("MILNET_DB_MANUAL_FAILOVER").map(|v| v == "1").unwrap_or(false);
+        let military_mode = std::env::var("MILNET_MILITARY_DEPLOYMENT").map(|v| v == "1").unwrap_or(false);
+        if manual_only {
+            return Self { enabled: false, safety_delay_secs: 30, require_witness: true, min_replica_lag_bytes: 0 };
+        }
+        if military_mode {
+            return Self { enabled: true, safety_delay_secs: 10, require_witness: true, min_replica_lag_bytes: 0 };
+        }
+        Self::default()
+    }
+}
+
+impl Default for AutoPromoteConfig {
+    fn default() -> Self {
+        Self { enabled: true, safety_delay_secs: 30, require_witness: true, min_replica_lag_bytes: 0 }
+    }
+}
+
+/// A witness attestation for a database promotion event, signed with HMAC-SHA512.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromotionWitness {
+    pub witness_node_id: String,
+    pub promoted_node_id: String,
+    pub failed_primary_id: String,
+    pub timestamp_secs: u64,
+    pub hmac_signature: Vec<u8>,
+}
+
+impl PromotionWitness {
+    pub fn sign(witness_node_id: &str, promoted_node_id: &str, failed_primary_id: &str, witness_key: &[u8]) -> Self {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha512;
+        type HmacSha512 = Hmac<Sha512>;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let mut mac = HmacSha512::new_from_slice(witness_key).expect("HMAC key size is valid");
+        mac.update(witness_node_id.as_bytes());
+        mac.update(promoted_node_id.as_bytes());
+        mac.update(failed_primary_id.as_bytes());
+        mac.update(&now.to_be_bytes());
+        Self {
+            witness_node_id: witness_node_id.to_string(),
+            promoted_node_id: promoted_node_id.to_string(),
+            failed_primary_id: failed_primary_id.to_string(),
+            timestamp_secs: now,
+            hmac_signature: mac.finalize().into_bytes().to_vec(),
+        }
+    }
+
+    pub fn verify(&self, witness_key: &[u8]) -> Result<(), String> {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha512;
+        type HmacSha512 = Hmac<Sha512>;
+        let mut mac = HmacSha512::new_from_slice(witness_key).expect("HMAC key size is valid");
+        mac.update(self.witness_node_id.as_bytes());
+        mac.update(self.promoted_node_id.as_bytes());
+        mac.update(self.failed_primary_id.as_bytes());
+        mac.update(&self.timestamp_secs.to_be_bytes());
+        mac.verify_slice(&self.hmac_signature).map_err(|_| "witness HMAC-SHA512 verification failed".to_string())
+    }
+}
+
+/// Result of a witnessed automatic promotion.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WitnessedPromotionResult {
+    pub approved: bool,
+    pub witness: Option<PromotionWitness>,
+    pub reason: String,
+}
+
+/// Verify old primary is truly unreachable from multiple vantage points (split-brain prevention).
+pub fn verify_primary_unreachable(primary_reports: &[(String, bool)], required_confirmations: usize) -> Result<usize, String> {
+    let confirmed = primary_reports.iter().filter(|(_, unreachable)| *unreachable).count();
+    if confirmed >= required_confirmations {
+        Ok(confirmed)
+    } else {
+        Err(format!("split-brain prevention: only {}/{} vantage points confirm primary unreachable (need {})", confirmed, primary_reports.len(), required_confirmations))
+    }
+}
+
 /// Result of a failover attempt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FailoverResult {

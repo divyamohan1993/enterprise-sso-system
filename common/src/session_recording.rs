@@ -62,7 +62,7 @@ pub struct SessionEvent {
     pub event_type: SessionEventType,
     /// Human-readable description of what happened.
     pub details: String,
-    /// Source IP address of the actor.
+    /// Source IP of the actor (HMAC-pseudonymized for GDPR/DPDP compliance).
     pub source_ip: String,
     /// HMAC-SHA512 hash-chain link binding this event to its predecessor.
     #[serde(
@@ -252,6 +252,7 @@ impl SessionRecorder {
 
     /// Append an event to an active recording.  The hash chain link is computed
     /// automatically from the previous chain tail.
+    /// The source_ip is pseudonymized via HMAC-SHA512 before storage (GDPR/DPDP).
     pub fn record_event(
         &self,
         session_id: Uuid,
@@ -260,6 +261,9 @@ impl SessionRecorder {
         source_ip: String,
         timestamp: i64,
     ) -> Result<(), RecordingError> {
+        // Pseudonymize IP before storage (one-way HMAC, non-reversible, GDPR/DPDP)
+        let source_ip = crate::log_pseudonym::pseudonym_ip(&source_ip);
+
         let mut map = self.lock_recordings();
         let recording = map
             .get_mut(&session_id)

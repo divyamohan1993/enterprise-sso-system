@@ -1,7 +1,7 @@
-//! Circuit breaker pattern — prevents cascade failures between services.
+//! Circuit breaker pattern -- prevents cascade failures between services.
 #![forbid(unsafe_code)]
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Circuit breaker states.
@@ -18,16 +18,23 @@ pub enum CircuitState {
 /// failure doubles the wait before the next attempt (capped at 5 minutes).
 /// Without this, an attacker can keep auth in a permanent ~99.9% failure
 /// state by ensuring each HalfOpen probe fails.
+///
+/// Single-flight probing: when the circuit transitions to HalfOpen, only ONE
+/// request is allowed to probe the recovering service. All other concurrent
+/// requests see the circuit as Open.
 pub struct CircuitBreaker {
     failure_count: AtomicU32,
     last_failure_epoch_ms: AtomicU64,
-    /// Number of consecutive HalfOpen probe failures — drives backoff.
+    /// Number of consecutive HalfOpen probe failures -- drives backoff.
     consecutive_open_cycles: AtomicU32,
     threshold: u32,
     reset_timeout_ms: u64,
     start: Instant,
     /// Service name for SIEM event reporting.
     service_name: String,
+    /// Single-flight probe guard: true when a HalfOpen probe is in progress.
+    /// Only one request at a time may probe the recovering service.
+    probe_in_flight: AtomicBool,
 }
 
 impl CircuitBreaker {
@@ -48,6 +55,7 @@ impl CircuitBreaker {
             reset_timeout_ms: reset_timeout.as_millis() as u64,
             start: Instant::now(),
             service_name: service_name.to_string(),
+            probe_in_flight: AtomicBool::new(false),
         }
     }
 
@@ -72,8 +80,8 @@ impl CircuitBreaker {
         // Capped at 5 minutes to prevent indefinite lockout.
         let cycles = self.consecutive_open_cycles.load(Ordering::Acquire);
         let backoff_factor = 1u64.checked_shl(cycles.min(10)).unwrap_or(1024);
-        let effective_timeout = (self.reset_timeout_ms.saturating_mul(backoff_factor))
-            .min(300_000); // Cap at 5 minutes
+        let effective_timeout =
+            (self.reset_timeout_ms.saturating_mul(backoff_factor)).min(300_000); // Cap at 5 minutes
 
         if elapsed >= effective_timeout {
             CircuitState::HalfOpen
@@ -83,15 +91,30 @@ impl CircuitBreaker {
     }
 
     /// Check if a request should be allowed through.
+    ///
+    /// When the circuit is HalfOpen, only one request at a time is allowed to
+    /// probe the recovering service (single-flight). All other concurrent
+    /// requests see the circuit as Open and are rejected.
     pub fn allow_request(&self) -> bool {
-        matches!(self.state(), CircuitState::Closed | CircuitState::HalfOpen)
+        match self.state() {
+            CircuitState::Closed => true,
+            CircuitState::HalfOpen => {
+                // CAS: only the first caller flips false -> true and becomes the probe.
+                self.probe_in_flight
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            }
+            CircuitState::Open => false,
+        }
     }
 
-    /// Record a successful call — resets the failure counter and backoff.
+    /// Record a successful call -- resets the failure counter, backoff, and probe flag.
     pub fn record_success(&self) {
         let was_open = self.failure_count.load(Ordering::Acquire) >= self.threshold;
         self.failure_count.store(0, Ordering::Release);
         self.consecutive_open_cycles.store(0, Ordering::Release);
+        // Release the probe lock so future HalfOpen transitions can probe again.
+        self.probe_in_flight.store(false, Ordering::Release);
         if was_open {
             crate::siem::SecurityEvent::circuit_breaker_closed(&self.service_name);
         }
@@ -106,7 +129,7 @@ impl CircuitBreaker {
         let prev = loop {
             let current = self.failure_count.load(Ordering::Acquire);
             if current == u32::MAX {
-                // Already saturated — nothing to do
+                // Already saturated -- nothing to do
                 return;
             }
             let new = current.saturating_add(1);
@@ -121,12 +144,16 @@ impl CircuitBreaker {
             }
         };
 
-        self.last_failure_epoch_ms.store(self.now_ms(), Ordering::Release);
+        self.last_failure_epoch_ms
+            .store(self.now_ms(), Ordering::Release);
 
         // If we were already in Open/HalfOpen state, increment the backoff
-        // cycle counter so the next HalfOpen window takes longer to arrive.
+        // cycle counter and release the single-flight probe lock.
         if prev >= self.threshold {
-            let _ = self.consecutive_open_cycles.fetch_add(1, Ordering::Release);
+            let _ = self
+                .consecutive_open_cycles
+                .fetch_add(1, Ordering::Release);
+            self.probe_in_flight.store(false, Ordering::Release);
         }
 
         // Emit SIEM event when we cross the threshold into Open state
@@ -138,7 +165,7 @@ impl CircuitBreaker {
         if prev + 1 == u32::MAX {
             tracing::error!(
                 service = %self.service_name,
-                "circuit breaker failure count SATURATED at u32::MAX — \
+                "circuit breaker failure count SATURATED at u32::MAX -- \
                  sustained failure, possible attack or total service loss"
             );
             crate::siem::SecurityEvent::circuit_breaker_saturated(&self.service_name);

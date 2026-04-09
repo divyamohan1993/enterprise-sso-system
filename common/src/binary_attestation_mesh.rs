@@ -75,6 +75,38 @@ impl PeerAttestationState {
     }
 }
 
+// ── Bootstrap Attestation ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootstrapPhase { Collecting, Committed }
+
+pub struct BootstrapAttestation {
+    pub node_hashes: HashMap<NodeId, BinaryHash>,
+    pub quorum_size: usize,
+    pub phase: BootstrapPhase,
+}
+
+impl BootstrapAttestation {
+    pub fn new(quorum_size: usize) -> Self {
+        Self { node_hashes: HashMap::new(), quorum_size, phase: BootstrapPhase::Collecting }
+    }
+
+    pub fn add_node_hash(&mut self, node_id: NodeId, hash: BinaryHash) -> Result<Option<BinaryHash>, String> {
+        if self.phase == BootstrapPhase::Committed { return Err("bootstrap already committed".into()); }
+        self.node_hashes.insert(node_id, hash);
+        if self.node_hashes.len() >= self.quorum_size {
+            let first = self.node_hashes.values().next().copied().unwrap();
+            if self.node_hashes.values().all(|h| h.as_slice().ct_eq(first.as_slice()).into()) {
+                self.phase = BootstrapPhase::Committed;
+                tracing::info!(nodes = self.node_hashes.len(), "bootstrap attestation: quorum committed");
+                Ok(Some(first))
+            } else { Err("bootstrap attestation FAILED: hashes disagree".into()) }
+        } else { Ok(None) }
+    }
+
+    pub fn participating_nodes(&self) -> Vec<NodeId> { self.node_hashes.keys().copied().collect() }
+}
+
 // ── Attestation mesh ─────────────────────────────────────────────────────────
 
 /// The attestation mesh state.
@@ -86,6 +118,7 @@ pub struct AttestationMesh {
     golden_hash: Option<BinaryHash>,
     /// Per-peer attestation state.
     peer_state: HashMap<NodeId, PeerAttestationState>,
+    bootstrap: BootstrapAttestation,
 }
 
 impl AttestationMesh {
@@ -97,23 +130,43 @@ impl AttestationMesh {
             own_hash,
             golden_hash: None,
             peer_state: HashMap::new(),
+            bootstrap: BootstrapAttestation::new(3),
         })
     }
 
-    /// Create an attestation mesh with a pre-computed hash (useful for testing).
     pub fn with_hash(config: AttestationMeshConfig, own_hash: BinaryHash) -> Self {
-        Self {
-            config,
-            own_hash,
-            golden_hash: None,
-            peer_state: HashMap::new(),
+        Self { config, own_hash, golden_hash: None, peer_state: HashMap::new(), bootstrap: BootstrapAttestation::new(3) }
+    }
+
+    pub fn set_golden_hash(&mut self, hash: BinaryHash) {
+        self.golden_hash = Some(hash);
+        self.bootstrap.phase = BootstrapPhase::Committed;
+    }
+
+    pub fn bootstrap_golden_hash(&mut self, node_id: NodeId, hash: BinaryHash) -> Result<Option<BinaryHash>, String> {
+        match self.bootstrap.add_node_hash(node_id, hash) {
+            Ok(Some(golden)) => { self.golden_hash = Some(golden); Ok(Some(golden)) }
+            Ok(None) => Ok(None),
+            Err(e) => Err(e),
         }
     }
 
-    /// Set the expected golden hash (from Raft log).
-    pub fn set_golden_hash(&mut self, hash: BinaryHash) {
-        self.golden_hash = Some(hash);
+    pub fn force_single_node_bootstrap(&mut self, node_id: NodeId) -> Result<(), String> {
+        if std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok() {
+            return Err("FATAL: single-node bootstrap rejected in MILNET_MILITARY_DEPLOYMENT".into());
+        }
+        if std::env::var("MILNET_MLP_MODE_ACK").ok().as_deref() != Some("1") {
+            return Err("single-node bootstrap requires MILNET_MLP_MODE_ACK=1".into());
+        }
+        tracing::warn!(target: "siem", node = %node_id, "SIEM:WARNING single-node bootstrap MLP mode");
+        crate::siem::SecurityEvent::circuit_breaker_opened("single_node_bootstrap_mlp_mode");
+        self.golden_hash = Some(self.own_hash);
+        self.bootstrap.phase = BootstrapPhase::Committed;
+        self.bootstrap.node_hashes.insert(node_id, self.own_hash);
+        Ok(())
     }
+
+    pub fn bootstrap(&self) -> &BootstrapAttestation { &self.bootstrap }
 
     /// Verify a peer's reported hash against the golden hash.
     ///

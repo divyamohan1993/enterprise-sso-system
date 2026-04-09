@@ -50,20 +50,18 @@ impl SignerShare {
 impl Drop for SignerShare {
     fn drop(&mut self) {
         use zeroize::Zeroize;
-        // Zeroize identifier
+        // Zeroize identifier: serialize to get owned bytes, then zero them.
         let mut id_bytes = self.identifier.serialize();
         id_bytes.zeroize();
         // Best-effort zeroize of KeyPackage: serialize to get bytes, then zero them.
-        let mut kp_bytes = self.key_package.serialize().expect("KeyPackage serialize for zeroization");
-        kp_bytes.zeroize();
-        // Defense-in-depth: volatile write zeros over the entire struct memory.
-        // This catches any internal scalar state that serialize() doesn't cover.
-        #[allow(unsafe_code)]
-        unsafe {
-            let ptr = self as *mut Self as *mut u8;
-            let len = std::mem::size_of::<Self>();
-            core::ptr::write_bytes(ptr, 0, len);
+        if let Ok(mut kp_bytes) = self.key_package.serialize() {
+            kp_bytes.zeroize();
         }
+        // Zero the nonce counter (atomic, no drop concerns).
+        self.nonce_counter.store(0, std::sync::atomic::Ordering::Relaxed);
+        // NOTE: Previous defense-in-depth write_bytes over entire struct was UB
+        // (zeroing partially-dropped fields with heap allocations). The per-field
+        // serialization above is the sound alternative.
     }
 }
 

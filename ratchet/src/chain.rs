@@ -10,6 +10,7 @@ use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::Sha512;
 use subtle::ConstantTimeEq;
+use std::cell::UnsafeCell;
 use std::collections::{HashSet, VecDeque};
 use zeroize::Zeroize;
 
@@ -220,10 +221,12 @@ fn is_all_zero(entropy: &[u8; 32]) -> bool {
 /// - chain_key region is mlocked (non-swappable) and MADV_DONTDUMP
 /// - Canaries are verified on every access and on drop
 pub struct RatchetChain {
-    /// Head canary — set once at construction, verified on every access.
+    /// Head canary -- set once at construction, verified on every access.
     canary_head: u64,
-    chain_key: [u8; 64],
-    /// Tail canary — independent random value, verified alongside head.
+    /// Wrapped in UnsafeCell to allow emergency zeroization through &self
+    /// (check_canaries) without violating aliasing rules. !Sync via UnsafeCell.
+    chain_key: UnsafeCell<[u8; 64]>,
+    /// Tail canary -- independent random value, verified alongside head.
     canary_tail: u64,
     /// Expected head canary value (stored separately for comparison).
     expected_head: u64,
@@ -249,10 +252,19 @@ pub struct RatchetChain {
     nonce_bloom: NonceBloomFilter,
 }
 
+// SAFETY: RatchetChain is only mutated through &mut self (advance, lock_chain_key, etc.)
+// or through the UnsafeCell in check_canaries (emergency zeroization on corruption).
+// The UnsafeCell is only accessed from a single thread at a time because all callers
+// hold either an exclusive lock (RwLock::write) or the chain is thread-local.
+// The emergency zeroization path (check_canaries) is a fire-and-forget operation
+// that occurs only on memory corruption -- no data races are possible because the
+// chain is being destroyed.
+unsafe impl Sync for RatchetChain {}
+
 // Manual Zeroize implementation since we have custom fields
 impl Zeroize for RatchetChain {
     fn zeroize(&mut self) {
-        self.chain_key.zeroize();
+        self.chain_key.get_mut().zeroize();
         self.epoch.zeroize();
         for entry in self.recent_keys.iter_mut() {
             entry.1.zeroize();
@@ -272,6 +284,18 @@ impl Zeroize for RatchetChain {
 }
 
 impl RatchetChain {
+    /// Safe accessor for chain_key through UnsafeCell (shared reference).
+    #[inline]
+    fn chain_key_ref(&self) -> &[u8; 64] {
+        unsafe { &*self.chain_key.get() }
+    }
+
+    /// Safe mutable accessor for chain_key through UnsafeCell.
+    #[inline]
+    fn chain_key_mut(&mut self) -> &mut [u8; 64] {
+        self.chain_key.get_mut()
+    }
+
     /// Verify canary integrity. Returns true if both canaries are intact.
     /// Uses constant-time comparison to prevent timing side-channels.
     fn verify_canaries(&self) -> bool {
@@ -289,11 +313,9 @@ impl RatchetChain {
                  possible buffer overflow or use-after-free. Zeroizing key material.",
                 self.epoch
             );
-            // Zeroize before returning — we need unsafe to mutate through shared ref
-            // because key material MUST be cleared on corruption detection.
+            // Zeroize via UnsafeCell -- sound because UnsafeCell permits interior mutability.
             unsafe {
-                let key_ptr = &self.chain_key as *const [u8; 64] as *mut [u8; 64];
-                (*key_ptr).zeroize();
+                (*self.chain_key.get()).zeroize();
             }
             return Err(RatchetError::CanaryViolation);
         }
@@ -302,8 +324,8 @@ impl RatchetChain {
 
     /// Apply mlock and MADV_DONTDUMP to the chain_key region.
     fn lock_chain_key(&mut self) -> Result<(), RatchetError> {
-        let ptr = self.chain_key.as_ptr();
-        let len = self.chain_key.len();
+        let ptr = self.chain_key_ref().as_ptr();
+        let len = self.chain_key_ref().len();
         if mlock_region(ptr, len) {
             self.key_locked = true;
             madv_dontdump(ptr, len);
@@ -330,7 +352,7 @@ impl RatchetChain {
 
         let mut chain = Self {
             canary_head: head,
-            chain_key,
+            chain_key: UnsafeCell::new(chain_key),
             canary_tail: tail,
             expected_head: head,
             expected_tail: tail,
@@ -453,14 +475,15 @@ impl RatchetChain {
         self.recent_nonces_set.insert(*server_nonce);
 
         // --- Store current key in recent_keys before overwriting ---
-        self.recent_keys.push((self.epoch, self.chain_key));
+        let key_copy = *self.chain_key_ref();
+        self.recent_keys.push((self.epoch, key_copy));
         while self.recent_keys.len() > EPOCH_WINDOW as usize {
             self.recent_keys[0].1.zeroize();
             self.recent_keys.remove(0);
         }
 
         // --- Derive new chain key, mixing server_nonce into info ---
-        let hk = Hkdf::<Sha512>::new(Some(&self.chain_key), domain::RATCHET_ADVANCE);
+        let hk = Hkdf::<Sha512>::new(Some(self.chain_key_ref()), domain::RATCHET_ADVANCE);
         let mut info = Vec::with_capacity(96);
         info.extend_from_slice(client_entropy);
         info.extend_from_slice(server_entropy);
@@ -471,12 +494,12 @@ impl RatchetChain {
 
         // Unlock old key region before overwrite (will re-lock new data)
         if self.key_locked {
-            munlock_region(self.chain_key.as_ptr(), self.chain_key.len());
+            munlock_region(self.chain_key_ref().as_ptr(), self.chain_key_ref().len());
             self.key_locked = false;
         }
 
-        self.chain_key.zeroize(); // securely erase old key
-        self.chain_key = new_key;
+        self.chain_key_mut().zeroize(); // securely erase old key
+        *self.chain_key_mut() = new_key;
         self.epoch += 1;
 
         // Re-lock the new key
@@ -493,7 +516,7 @@ impl RatchetChain {
     /// Returns `RatchetError::CanaryViolation` if memory corruption is detected.
     pub fn generate_tag(&self, claims_bytes: &[u8]) -> Result<[u8; 64], RatchetError> {
         self.check_canaries()?;
-        Ok(Self::generate_tag_with_key(&self.chain_key, claims_bytes, self.epoch))
+        Ok(Self::generate_tag_with_key(self.chain_key_ref(), claims_bytes, self.epoch))
     }
 
     /// Generate a ratchet tag using an explicit key and epoch.
@@ -621,7 +644,7 @@ impl RatchetChain {
 
         // Future epoch: derive forward without advancing the real chain
         let steps = token_epoch - self.epoch;
-        let mut forward_key = Self::derive_forward_key(&self.chain_key, steps)?;
+        let mut forward_key = Self::derive_forward_key(self.chain_key_ref(), steps)?;
         let expected = Self::generate_tag_with_key(&forward_key, claims_bytes, token_epoch);
         forward_key.zeroize();
         Ok(crypto::ct::ct_eq_64(tag, &expected))
@@ -647,7 +670,7 @@ impl RatchetChain {
         let tail = random_canary()?;
         let mut chain = Self {
             canary_head: head,
-            chain_key,
+            chain_key: UnsafeCell::new(chain_key),
             canary_tail: tail,
             expected_head: head,
             expected_tail: tail,
@@ -669,14 +692,14 @@ impl RatchetChain {
     /// Returns `RatchetError::CanaryViolation` if memory corruption is detected.
     pub fn current_key(&self) -> Result<[u8; 64], RatchetError> {
         self.check_canaries()?;
-        Ok(self.chain_key)
+        Ok(*self.chain_key_ref())
     }
 }
 
 impl Drop for RatchetChain {
     fn drop(&mut self) {
         // 1. Zeroize chain key
-        self.chain_key.zeroize();
+        self.chain_key_mut().zeroize();
 
         // 2. Zeroize recent keys
         for entry in self.recent_keys.iter_mut() {
@@ -694,7 +717,7 @@ impl Drop for RatchetChain {
 
         // 4. Unlock if locked
         if self.key_locked {
-            munlock_region(self.chain_key.as_ptr(), self.chain_key.len());
+            munlock_region(self.chain_key_ref().as_ptr(), self.chain_key_ref().len());
         }
 
         // 5. Zeroize canary material

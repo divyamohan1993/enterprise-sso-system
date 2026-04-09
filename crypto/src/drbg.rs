@@ -5,7 +5,7 @@
 
 use hmac::{Hmac, Mac};
 use sha2::Sha512;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::Zeroize;
 
 type HmacSha512 = Hmac<Sha512>;
 
@@ -13,11 +13,28 @@ const SEED_LEN: usize = 64;
 const MAX_REQUESTS_BEFORE_RESEED: u64 = 10_000;
 const MAX_BYTES_PER_REQUEST: usize = 440;
 
-#[derive(Zeroize, ZeroizeOnDrop)]
+#[derive(Zeroize)]
 pub struct HmacDrbg {
     key: [u8; 64],
     value: [u8; 64],
     reseed_counter: u64,
+    #[zeroize(skip)]
+    state_locked: bool,
+}
+
+impl Drop for HmacDrbg {
+    fn drop(&mut self) {
+        self.key.zeroize();
+        self.value.zeroize();
+        self.reseed_counter = 0;
+        if self.state_locked {
+            #[allow(unsafe_code)]
+            unsafe {
+                libc::munlock(self.key.as_ptr() as *const libc::c_void, self.key.len());
+                libc::munlock(self.value.as_ptr() as *const libc::c_void, self.value.len());
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for HmacDrbg {
@@ -53,8 +70,24 @@ impl HmacDrbg {
             key: [0u8; 64],
             value: [0x01; 64],
             reseed_counter: 1,
+            state_locked: false,
         };
         drbg.update(seed);
+        #[allow(unsafe_code)]
+        unsafe {
+            let key_ok = libc::mlock(drbg.key.as_ptr() as *const libc::c_void, drbg.key.len()) == 0;
+            let val_ok = libc::mlock(drbg.value.as_ptr() as *const libc::c_void, drbg.value.len()) == 0;
+            if key_ok && val_ok {
+                drbg.state_locked = true;
+                libc::madvise(drbg.key.as_ptr() as *mut libc::c_void, drbg.key.len(), libc::MADV_DONTDUMP);
+                libc::madvise(drbg.value.as_ptr() as *mut libc::c_void, drbg.value.len(), libc::MADV_DONTDUMP);
+            } else {
+                tracing::warn!(
+                    "HMAC_DRBG: mlock failed for internal state. \
+                     DRBG key/value may be swappable to disk."
+                );
+            }
+        }
         Ok(drbg)
     }
 

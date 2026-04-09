@@ -237,6 +237,8 @@ pub struct DistributedRateLimiter {
     local_state: Arc<Mutex<HashMap<String, LocalEntry>>>,
     /// Whether Redis is currently healthy.
     redis_healthy: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether Redis is required in this deployment mode.
+    pub redis_required: bool,
     /// Conservative divisor for local fallback limits. Each gateway instance
     /// gets `limit / degraded_limit_divisor` when Redis is down. Set to
     /// the expected number of gateway instances (e.g., 10 for a 10-instance MIG).
@@ -558,6 +560,11 @@ impl RedisClient {
 impl DistributedRateLimiter {
     /// Create a new distributed rate limiter from configuration.
     pub async fn new(config: RateLimitConfig) -> Self {
+        let mlp_mode = std::env::var("MILNET_MLP_MODE_ACK").map(|v| v == "1").unwrap_or(false);
+        let redis_required = std::env::var("MILNET_RATE_LIMIT_REDIS_REQUIRED")
+            .map(|v| v == "1")
+            .unwrap_or(!mlp_mode);
+
         let redis_client = if let Some(ref url) = config.redis_url {
             match RedisClient::connect(url).await {
                 Ok(client) => {
@@ -565,12 +572,22 @@ impl DistributedRateLimiter {
                     Some(Arc::new(Mutex::new(client)))
                 }
                 Err(e) => {
-                    warn!("Redis rate limit backend unavailable, using local fallback: {e}");
+                    if redis_required && !mlp_mode {
+                        error!("SIEM:CRITICAL Redis rate limit backend REQUIRED but unavailable: {e}");
+                    } else {
+                        warn!("Redis rate limit backend unavailable, using local fallback: {e}");
+                    }
                     None
                 }
             }
         } else {
-            debug!("No Redis URL configured, using local-only rate limiting");
+            if redis_required && !mlp_mode {
+                error!("SIEM:CRITICAL No Redis URL configured but redis required");
+            } else if mlp_mode {
+                warn!("SIEM:SECURITY MLP mode: local-only rate limiting enabled without Redis");
+            } else {
+                debug!("No Redis URL configured, using local-only rate limiting");
+            }
             None
         };
 
@@ -582,13 +599,14 @@ impl DistributedRateLimiter {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(10u64)
-            .max(1); // never divide by zero
+            .max(1);
 
         Self {
             config,
             redis_client,
             local_state: Arc::new(Mutex::new(HashMap::new())),
             redis_healthy,
+            redis_required,
             degraded_limit_divisor,
             degraded_mode_activations: Arc::new(AtomicU64::new(0)),
         }
@@ -682,23 +700,22 @@ impl DistributedRateLimiter {
             }
         }
 
-        // Local fallback: apply conservative divisor to prevent distributed bypass.
-        // With N gateway instances each using limit/N, the aggregate across all
-        // instances approximates the global limit even without coordination.
-        //
-        // SECURITY: In degraded mode we apply STRICTER limits — the divisor
-        // reduces the per-instance allowance to account for the lack of
-        // cross-instance coordination.
-        let degraded_limit = (limit / self.degraded_limit_divisor).max(1);
+        // SECURITY: In degraded mode, apply stricter limits. Production: 50% of normal.
+        let degraded_limit = if self.redis_required {
+            (limit / 2).max(1)
+        } else {
+            (limit / self.degraded_limit_divisor).max(1)
+        };
         let activations = self.degraded_mode_activations.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let severity = if self.redis_required { "CRITICAL" } else { "SECURITY" };
         warn!(
             key = key,
             degraded_limit = degraded_limit,
             normal_limit = limit,
-            divisor = self.degraded_limit_divisor,
+            redis_required = self.redis_required,
             total_activations = activations,
-            "SIEM:SECURITY rate limit degraded mode activated — Redis unavailable, \
-             applying stricter local limits ({degraded_limit}/{limit})"
+            "SIEM:{} rate limit degraded mode -- Redis unavailable, stricter local limits ({}/{})",
+            severity, degraded_limit, limit
         );
         self.check_local(key, degraded_limit).await
     }
@@ -888,6 +905,33 @@ impl DistributedRateLimiter {
             }
         }
     }
+
+    pub fn is_redis_required(&self) -> bool { self.redis_required }
+    pub fn is_redis_healthy(&self) -> bool { self.redis_healthy.load(std::sync::atomic::Ordering::Relaxed) }
+
+    /// Export local counters for gossip-based sync when Redis is unavailable.
+    pub async fn export_local_counters(&self) -> Vec<(String, u64)> {
+        let state = self.local_state.lock().await;
+        let now = Instant::now();
+        let window = Duration::from_secs(self.config.window_secs);
+        state.iter()
+            .filter(|(_, entry)| now.duration_since(entry.window_start) < window)
+            .map(|(key, entry)| (key.clone(), entry.count))
+            .collect()
+    }
+
+    /// Merge peer counters received via gossip (uses max to prevent bypass).
+    pub async fn merge_peer_counters(&self, peer_counters: &[(String, u64)]) {
+        let mut state = self.local_state.lock().await;
+        let now = Instant::now();
+        for (key, peer_count) in peer_counters {
+            let entry = state.entry(key.clone()).or_insert_with(|| LocalEntry {
+                count: 0, window_start: now,
+                tokens: self.config.burst_size as f64, last_refill: now,
+            });
+            entry.count = entry.count.max(*peer_count);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -907,8 +951,8 @@ mod tests {
             redis_url: None,
         })
         .await;
-        // In tests, set divisor to 1 so local limits match expected values
         limiter.degraded_limit_divisor = 1;
+        limiter.redis_required = false;
         limiter
     }
 

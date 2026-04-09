@@ -204,35 +204,38 @@ impl ExternalWitnessCosigner {
             };
         }
 
-        // Verify audit root against independent view
+        // Verify audit root against independent view.
+        // Verification callback is MANDATORY. Without it, refuse to sign.
         match &self.verify_audit_root {
             Some(verify_fn) => {
                 if !verify_fn(&req.audit_root, req.sequence) {
-                    tracing::error!(
-                        target: "siem",
-                        cosigner_id = %self.config.cosigner_id,
-                        sequence = req.sequence,
-                        "SIEM:CRITICAL external witness cosigner rejected audit_root: \
-                         independent verification FAILED"
-                    );
+                    tracing::error!(target: "siem", cosigner_id = %self.config.cosigner_id, sequence = req.sequence,
+                        "SIEM:CRITICAL external witness cosigner rejected audit_root: independent verification FAILED");
                     return WitnessSignResponse {
-                        signature: Vec::new(),
-                        cosigner_id: self.config.cosigner_id.clone(),
-                        accepted: false,
-                        rejection_reason: Some(
-                            "audit_root failed independent verification".into()
-                        ),
+                        signature: Vec::new(), cosigner_id: self.config.cosigner_id.clone(),
+                        accepted: false, rejection_reason: Some("audit_root failed independent verification".into()),
                     };
                 }
             }
             None => {
-                tracing::warn!(
-                    target: "siem",
-                    cosigner_id = %self.config.cosigner_id,
-                    sequence = req.sequence,
-                    "SIEM:WARNING external witness cosigner signing without \
-                     independent audit_root verification callback"
-                );
+                let mlp_ack = std::env::var("MILNET_MLP_MODE_ACK").ok().as_deref() == Some("1");
+                let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok();
+                if is_military {
+                    tracing::error!(target: "siem", cosigner_id = %self.config.cosigner_id,
+                        "SIEM:CRITICAL no verification callback in military mode");
+                    return WitnessSignResponse { signature: Vec::new(), cosigner_id: self.config.cosigner_id.clone(),
+                        accepted: false, rejection_reason: Some("verification callback mandatory in military mode".into()) };
+                }
+                if mlp_ack {
+                    tracing::warn!(target: "siem", cosigner_id = %self.config.cosigner_id, sequence = req.sequence,
+                        "SIEM:WARNING signing without verification (MLP bypass)");
+                } else {
+                    tracing::error!(target: "siem", cosigner_id = %self.config.cosigner_id, sequence = req.sequence,
+                        "SIEM:CRITICAL refusing to sign: no verify_audit_root callback");
+                    return WitnessSignResponse { signature: Vec::new(), cosigner_id: self.config.cosigner_id.clone(),
+                        accepted: false, rejection_reason: Some(
+                            "verify_audit_root callback is mandatory (set callback or MILNET_MLP_MODE_ACK=1 to bypass)".into()) };
+                }
             }
         }
 
@@ -316,6 +319,18 @@ mod tests {
     }
 
     #[test]
+    fn test_no_verification_callback_rejects() {
+        run_with_large_stack(|| {
+            let seed = [42u8; 32];
+            let mut cosigner = ExternalWitnessCosigner::new(ExternalWitnessConfig::default(), seed);
+            let req = make_request(1);
+            let resp = cosigner.process_request(&req);
+            assert!(!resp.accepted, "should reject without verification callback");
+            assert!(resp.rejection_reason.as_deref().unwrap().contains("mandatory"));
+        });
+    }
+
+    #[test]
     fn test_normal_signing_succeeds() {
         run_with_large_stack(|| {
             let seed = [42u8; 32];
@@ -323,6 +338,7 @@ mod tests {
                 ExternalWitnessConfig::default(),
                 seed,
             );
+            cosigner.set_verify_audit_root(Box::new(|_root, _seq| true));
             let req = make_request(1);
             let resp = cosigner.process_request(&req);
             assert!(resp.accepted, "signing should succeed: {:?}", resp.rejection_reason);
@@ -349,6 +365,7 @@ mod tests {
                 ..Default::default()
             };
             let mut cosigner = ExternalWitnessCosigner::new(config, seed);
+            cosigner.set_verify_audit_root(Box::new(|_root, _seq| true));
 
             // First two should succeed
             let resp1 = cosigner.process_request(&make_request(1));
@@ -371,6 +388,7 @@ mod tests {
                 ExternalWitnessConfig::default(),
                 seed,
             );
+            cosigner.set_verify_audit_root(Box::new(|_root, _seq| true));
 
             // Accept sequence 5
             let resp = cosigner.process_request(&make_request(5));
@@ -393,6 +411,7 @@ mod tests {
                 ..Default::default()
             };
             let mut cosigner = ExternalWitnessCosigner::new(config, seed);
+            cosigner.set_verify_audit_root(Box::new(|_root, _seq| true));
 
             // Create a request with a very old timestamp (2 minutes ago)
             let mut req = make_request(1);

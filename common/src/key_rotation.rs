@@ -83,6 +83,7 @@ pub fn start_rotation_monitor(
 // ── Distributed Key Rotation with Mutual Verification ──────────────────────────
 
 use hmac::{Hmac, Mac};
+use ml_dsa::{signature::{Signer, Verifier}, KeyGen, MlDsa87};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 use std::collections::HashMap;
@@ -149,9 +150,10 @@ pub struct RotationEvent {
     pub timestamp: u64,
     /// SHA-512 hash of the new key material (64 bytes).
     pub new_key_hash: Vec<u8>,
-    /// ML-DSA-87 signature over canonical event bytes (HMAC-SHA512 stand-in;
-    /// production replaces with real ML-DSA-87 via the cnsa2 module).
+    /// ML-DSA-87 signature over canonical event bytes (primary, non-repudiation).
     pub signature: Vec<u8>,
+    /// HMAC-SHA512 secondary integrity check (belt and suspenders).
+    pub hmac_tag: Vec<u8>,
 }
 
 impl RotationEvent {
@@ -194,43 +196,42 @@ impl RotationEvent {
     }
 
     fn build(
-        node_id: RotationNodeId,
-        key_type: KeyType,
-        epoch: u64,
-        timestamp: u64,
-        new_key_material: &[u8],
-        signing_key: &[u8],
+        node_id: RotationNodeId, key_type: KeyType, epoch: u64, timestamp: u64,
+        new_key_material: &[u8], signing_key: &[u8],
     ) -> Self {
-        let new_key_hash = {
-            let mut h = Sha512::new();
-            h.update(new_key_material);
-            h.finalize().to_vec()
-        };
-        let mut evt = Self {
-            node_id,
-            key_type,
-            epoch,
-            timestamp,
-            new_key_hash,
-            signature: Vec::new(),
-        };
+        let new_key_hash = { let mut h = Sha512::new(); h.update(new_key_material); h.finalize().to_vec() };
+        let mut evt = Self { node_id, key_type, epoch, timestamp, new_key_hash, signature: Vec::new(), hmac_tag: Vec::new() };
         let canonical = evt.canonical_bytes();
-        let mut mac =
-            HmacSha512::new_from_slice(signing_key).expect("HMAC accepts any key length");
+        // Primary: ML-DSA-87 signature (32-byte seed).
+        if signing_key.len() == 32 {
+            let seed: [u8; 32] = signing_key.try_into().unwrap();
+            let kp = MlDsa87::from_seed(&seed.into());
+            let sig: ml_dsa::Signature<MlDsa87> = kp.signing_key().sign(&canonical);
+            evt.signature = sig.encode().to_vec();
+        }
+        // Secondary: HMAC-SHA512 integrity.
+        let mut mac = HmacSha512::new_from_slice(signing_key).expect("HMAC accepts any key length");
         mac.update(&canonical);
-        evt.signature = mac.finalize().into_bytes().to_vec();
+        evt.hmac_tag = mac.finalize().into_bytes().to_vec();
         evt
     }
 
-    /// Verify the signature on this event. O(1).
+    /// Verify ML-DSA-87 signature and HMAC tag. O(1).
     pub fn verify_signature(&self, verifying_key: &[u8]) -> bool {
         let canonical = self.canonical_bytes();
-        let mut mac = match HmacSha512::new_from_slice(verifying_key) {
-            Ok(m) => m,
-            Err(_) => return false,
-        };
-        mac.update(&canonical);
-        mac.verify_slice(&self.signature).is_ok()
+        if !self.signature.is_empty() && verifying_key.len() == 32 {
+            let seed: [u8; 32] = match verifying_key.try_into() { Ok(s) => s, Err(_) => return false };
+            let kp = MlDsa87::from_seed(&seed.into());
+            let vk = kp.verifying_key();
+            let sig = match ml_dsa::Signature::<MlDsa87>::try_from(self.signature.as_slice()) { Ok(s) => s, Err(_) => return false };
+            if vk.verify(&canonical, &sig).is_err() { return false; }
+        }
+        if !self.hmac_tag.is_empty() {
+            let mut mac = match HmacSha512::new_from_slice(verifying_key) { Ok(m) => m, Err(_) => return false };
+            mac.update(&canonical);
+            if mac.verify_slice(&self.hmac_tag).is_err() { return false; }
+        }
+        !self.signature.is_empty() || !self.hmac_tag.is_empty()
     }
 }
 

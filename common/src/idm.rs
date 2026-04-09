@@ -215,21 +215,52 @@ pub struct DeprovisioningRecord {
 
 // ── IDM Manager ──────────────────────────────────────────────────────
 
+/// Configurable approval quorum per operation type.
+///
+/// Different operation types can require different numbers of approvals.
+/// Military mode enforces a minimum of 3; standard mode defaults to 2.
+#[derive(Debug, Clone)]
+pub struct ApprovalQuorum {
+    /// Minimum approvals per request type. Default: 2 for all types.
+    pub required: HashMap<ProvisioningRequestType, usize>,
+}
+
+impl Default for ApprovalQuorum {
+    fn default() -> Self {
+        let mut required = HashMap::new();
+        let default_min = if std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok() { 3 } else { 2 };
+        required.insert(ProvisioningRequestType::Provision, default_min);
+        required.insert(ProvisioningRequestType::ModifyAccess, default_min);
+        required.insert(ProvisioningRequestType::Deprovision, default_min);
+        required.insert(ProvisioningRequestType::Suspend, default_min);
+        required.insert(ProvisioningRequestType::Reactivate, default_min);
+        Self { required }
+    }
+}
+
+impl ApprovalQuorum {
+    pub fn min_approvals(&self, req_type: ProvisioningRequestType) -> usize {
+        self.required.get(&req_type).copied().unwrap_or(2)
+    }
+
+    pub fn set_min_approvals(&mut self, req_type: ProvisioningRequestType, min: usize) {
+        if min < 2 {
+            emit_siem_event(
+                "identity_lifecycle", "approval_quorum_reduced_below_minimum",
+                Severity::Critical, "alert", None,
+                Some(format!("CRITICAL: approval quorum for {:?} reduced to {} (below minimum 2)", req_type, min)),
+            );
+        }
+        self.required.insert(req_type, min);
+    }
+}
+
 /// Identity Lifecycle Manager.
-///
-/// Manages the complete lifecycle of user identities from provisioning
-/// through deprovisioning, including approval workflows, entitlement
-/// management, and audit trail preservation.
-///
-/// All state mutations emit SIEM events and are recorded in the
-/// provisioning request history for compliance.
 pub struct IdmManager {
-    /// User identity store, keyed by user_id.
     users: HashMap<Uuid, UserAttributes>,
-    /// All provisioning requests, keyed by request_id.
     requests: HashMap<Uuid, ProvisioningRequest>,
-    /// Current unix timestamp provider (seconds). Overridable for testing.
     now_fn: fn() -> i64,
+    approval_quorum: ApprovalQuorum,
 }
 
 /// Returns the current Unix timestamp in seconds.
@@ -243,22 +274,24 @@ fn system_now() -> i64 {
 impl IdmManager {
     /// Create a new IDM manager with an empty identity store.
     pub fn new() -> Self {
-        Self {
-            users: HashMap::new(),
-            requests: HashMap::new(),
-            now_fn: system_now,
-        }
+        Self { users: HashMap::new(), requests: HashMap::new(), now_fn: system_now, approval_quorum: ApprovalQuorum::default() }
     }
 
-    /// Create a new IDM manager with a custom time source (for testing).
+    pub fn with_quorum(quorum: ApprovalQuorum) -> Self {
+        Self { users: HashMap::new(), requests: HashMap::new(), now_fn: system_now, approval_quorum: quorum }
+    }
+
     #[cfg(test)]
     fn with_clock(now_fn: fn() -> i64) -> Self {
-        Self {
-            users: HashMap::new(),
-            requests: HashMap::new(),
-            now_fn,
-        }
+        Self { users: HashMap::new(), requests: HashMap::new(), now_fn, approval_quorum: ApprovalQuorum::default() }
     }
+
+    #[cfg(test)]
+    fn with_clock_and_quorum(now_fn: fn() -> i64, quorum: ApprovalQuorum) -> Self {
+        Self { users: HashMap::new(), requests: HashMap::new(), now_fn, approval_quorum: quorum }
+    }
+
+    pub fn approval_quorum(&self) -> &ApprovalQuorum { &self.approval_quorum }
 
     /// Returns the current timestamp from the configured clock.
     fn now(&self) -> i64 {
@@ -968,17 +1001,28 @@ mod tests {
         }
     }
 
-    /// Helper: provision a user through the full workflow, returns user_id.
+    fn test_quorum(min: usize) -> ApprovalQuorum {
+        let mut q = ApprovalQuorum { required: HashMap::new() };
+        for rt in [ProvisioningRequestType::Provision, ProvisioningRequestType::ModifyAccess,
+                   ProvisioningRequestType::Deprovision, ProvisioningRequestType::Suspend,
+                   ProvisioningRequestType::Reactivate] {
+            q.required.insert(rt, min);
+        }
+        q
+    }
+
     fn provision_user(mgr: &mut IdmManager) -> (Uuid, Uuid, Uuid) {
         let user_id = Uuid::new_v4();
         let requester = Uuid::new_v4();
-        let approver = Uuid::new_v4();
+        let approver1 = Uuid::new_v4();
+        let approver2 = Uuid::new_v4();
         let req = provision_request(user_id, requester);
         let req_id = mgr.submit_request(req).unwrap();
-        mgr.approve_request(req_id, approver, Some("approved".into()))
-            .unwrap();
+        let min = mgr.approval_quorum().min_approvals(ProvisioningRequestType::Provision);
+        mgr.approve_request(req_id, approver1, Some("approved".into())).unwrap();
+        if min >= 2 { mgr.approve_request(req_id, approver2, Some("second".into())).unwrap(); }
         mgr.execute_request(req_id).unwrap();
-        (user_id, requester, approver)
+        (user_id, requester, approver1)
     }
 
     #[test]
@@ -986,16 +1030,42 @@ mod tests {
         let mut mgr = IdmManager::with_clock(fixed_clock);
         let user_id = Uuid::new_v4();
         let requester = Uuid::new_v4();
-        let approver = Uuid::new_v4();
-
+        let a1 = Uuid::new_v4();
+        let a2 = Uuid::new_v4();
         let req = provision_request(user_id, requester);
         let req_id = mgr.submit_request(req).unwrap();
-
-        // Should be pending
         assert_eq!(mgr.requests[&req_id].status, RequestStatus::Pending);
+        mgr.approve_request(req_id, a1, None).unwrap();
+        assert_eq!(mgr.requests[&req_id].status, RequestStatus::Pending);
+        mgr.approve_request(req_id, a2, None).unwrap();
+        assert_eq!(mgr.requests[&req_id].status, RequestStatus::Approved);
+    }
 
-        // Approve
+    #[test]
+    fn test_duplicate_approver_rejected() {
+        let mut mgr = IdmManager::with_clock(fixed_clock);
+        let user_id = Uuid::new_v4();
+        let requester = Uuid::new_v4();
+        let approver = Uuid::new_v4();
+        let req = provision_request(user_id, requester);
+        let req_id = mgr.submit_request(req).unwrap();
         mgr.approve_request(req_id, approver, None).unwrap();
+        assert!(mgr.approve_request(req_id, approver, None).is_err());
+    }
+
+    #[test]
+    fn test_quorum_configurable() {
+        let mut mgr = IdmManager::with_clock_and_quorum(fixed_clock, test_quorum(3));
+        let user_id = Uuid::new_v4();
+        let requester = Uuid::new_v4();
+        let (a1, a2, a3) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let req = provision_request(user_id, requester);
+        let req_id = mgr.submit_request(req).unwrap();
+        mgr.approve_request(req_id, a1, None).unwrap();
+        assert_eq!(mgr.requests[&req_id].status, RequestStatus::Pending);
+        mgr.approve_request(req_id, a2, None).unwrap();
+        assert_eq!(mgr.requests[&req_id].status, RequestStatus::Pending);
+        mgr.approve_request(req_id, a3, None).unwrap();
         assert_eq!(mgr.requests[&req_id].status, RequestStatus::Approved);
     }
 
@@ -1274,7 +1344,9 @@ mod tests {
         };
 
         let req_id = mgr.submit_request(req).unwrap();
+        let ab = Uuid::new_v4();
         mgr.approve_request(req_id, approver2, None).unwrap();
+        mgr.approve_request(req_id, ab, None).unwrap();
         mgr.execute_request(req_id).unwrap();
 
         assert_eq!(
@@ -1289,7 +1361,8 @@ mod tests {
         let mut mgr = IdmManager::with_clock(fixed_clock);
         let (user_id, _, approver) = provision_user(&mut mgr);
         let requester = Uuid::new_v4();
-        let approver2 = Uuid::new_v4();
+        let approver_a = Uuid::new_v4();
+        let approver_b = Uuid::new_v4();
 
         let mut desired = mgr.get_user(user_id).unwrap().clone();
         desired.groups = vec!["ops-team".into(), "sigint-analysts".into()];
@@ -1309,7 +1382,8 @@ mod tests {
         };
 
         let req_id = mgr.submit_request(req).unwrap();
-        mgr.approve_request(req_id, approver2, None).unwrap();
+        mgr.approve_request(req_id, approver_a, None).unwrap();
+        mgr.approve_request(req_id, approver_b, None).unwrap();
         mgr.execute_request(req_id).unwrap();
 
         let user = mgr.get_user(user_id).unwrap();

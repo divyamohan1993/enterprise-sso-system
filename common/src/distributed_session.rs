@@ -437,6 +437,188 @@ impl Drop for DistributedSessionStore {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Distributed Session Invalidation Events
+// ---------------------------------------------------------------------------
+
+/// Reason for session invalidation, propagated across cluster nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InvalidationReason {
+    PasswordChanged,
+    RoleChanged,
+    PermissionEscalation,
+    SecurityIncident,
+    AdminAction,
+}
+
+impl InvalidationReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::PasswordChanged => "password_changed",
+            Self::RoleChanged => "role_changed",
+            Self::PermissionEscalation => "permission_escalation",
+            Self::SecurityIncident => "security_incident",
+            Self::AdminAction => "admin_action",
+        }
+    }
+}
+
+/// A signed session invalidation event for cross-node propagation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionInvalidationEvent {
+    pub user_id: Uuid,
+    pub reason: InvalidationReason,
+    pub timestamp: i64,
+    pub node_id: String,
+    pub signature: Vec<u8>,
+}
+
+/// Processes invalidation events with signature verification and replay protection.
+pub struct InvalidationEventProcessor {
+    hmac_key: Vec<u8>,
+    seen_events: std::collections::HashMap<String, Vec<i64>>,
+    replay_window_us: i64,
+}
+
+impl InvalidationEventProcessor {
+    const DEFAULT_REPLAY_WINDOW_US: i64 = 60 * 1_000_000;
+
+    pub fn new(hmac_key: [u8; 64]) -> Self {
+        Self {
+            hmac_key: hmac_key.to_vec(),
+            seen_events: std::collections::HashMap::new(),
+            replay_window_us: Self::DEFAULT_REPLAY_WINDOW_US,
+        }
+    }
+
+    /// Create and sign an invalidation event for broadcast.
+    pub fn create_event(
+        &self,
+        user_id: Uuid,
+        reason: InvalidationReason,
+        node_id: &str,
+    ) -> SessionInvalidationEvent {
+        let timestamp = now_us();
+        let signature = self.compute_signature(&user_id, reason, timestamp, node_id);
+        SessionInvalidationEvent {
+            user_id,
+            reason,
+            timestamp,
+            node_id: node_id.to_string(),
+            signature,
+        }
+    }
+
+    /// Verify and process an incoming invalidation event.
+    pub fn verify_and_accept(
+        &mut self,
+        event: &SessionInvalidationEvent,
+    ) -> Result<Uuid, String> {
+        let now = now_us();
+
+        if (now - event.timestamp).abs() > self.replay_window_us {
+            tracing::warn!(
+                target: "siem",
+                node_id = %event.node_id,
+                user_id = %event.user_id,
+                "SIEM:WARNING Invalidation event outside replay window"
+            );
+            return Err("invalidation event outside replay window".to_string());
+        }
+
+        let expected = self.compute_signature(
+            &event.user_id,
+            event.reason,
+            event.timestamp,
+            &event.node_id,
+        );
+        if expected.ct_eq(&event.signature).unwrap_u8() == 0 {
+            tracing::error!(
+                target: "siem",
+                node_id = %event.node_id,
+                user_id = %event.user_id,
+                "SIEM:CRITICAL Invalidation event signature mismatch"
+            );
+            return Err("invalidation event signature invalid".to_string());
+        }
+
+        let node_events = self.seen_events.entry(event.node_id.clone()).or_default();
+        if node_events.contains(&event.timestamp) {
+            tracing::warn!(
+                target: "siem",
+                node_id = %event.node_id,
+                "SIEM:WARNING Duplicate invalidation event rejected"
+            );
+            return Err("duplicate invalidation event".to_string());
+        }
+        node_events.push(event.timestamp);
+        node_events.retain(|ts| (now - ts).abs() <= self.replay_window_us);
+
+        tracing::info!(
+            target: "siem",
+            user_id = %event.user_id,
+            reason = event.reason.as_str(),
+            source_node = %event.node_id,
+            "SIEM:INFO Verified invalidation event accepted"
+        );
+
+        Ok(event.user_id)
+    }
+
+    fn compute_signature(
+        &self,
+        user_id: &Uuid,
+        reason: InvalidationReason,
+        timestamp: i64,
+        node_id: &str,
+    ) -> Vec<u8> {
+        type HmacSha512 = Hmac<Sha512>;
+        let mut mac = HmacSha512::new_from_slice(&self.hmac_key)
+            .expect("HMAC-SHA512 accepts any key length");
+        mac.update(user_id.as_bytes());
+        mac.update(reason.as_str().as_bytes());
+        mac.update(&timestamp.to_be_bytes());
+        mac.update(node_id.as_bytes());
+        mac.finalize().into_bytes().to_vec()
+    }
+
+    /// Prune replay-protection state older than the window.
+    pub fn cleanup_replay_state(&mut self) {
+        let now = now_us();
+        self.seen_events.retain(|_, timestamps| {
+            timestamps.retain(|ts| (now - ts).abs() <= self.replay_window_us);
+            !timestamps.is_empty()
+        });
+    }
+}
+
+impl Drop for InvalidationEventProcessor {
+    fn drop(&mut self) {
+        self.hmac_key.zeroize();
+    }
+}
+
+impl DistributedSessionStore {
+    /// Handle a verified invalidation event: terminate all sessions for the user.
+    pub fn apply_invalidation_event(
+        &mut self,
+        event: &SessionInvalidationEvent,
+    ) -> usize {
+        let count = self.terminate_user_sessions(&event.user_id);
+        if count > 0 {
+            tracing::info!(
+                target: "siem",
+                user_id = %event.user_id,
+                reason = event.reason.as_str(),
+                sessions_terminated = count,
+                source_node = %event.node_id,
+                "SIEM:INFO Sessions terminated via distributed invalidation"
+            );
+        }
+        count
+    }
+}
+
 /// Encrypt session data (chain key) for at-rest storage.
 fn encrypt_session_data(
     key: &[u8; 32],
@@ -1014,5 +1196,79 @@ mod tests {
             terminated: false,
         };
         drop(session);
+    }
+
+    fn make_processor() -> InvalidationEventProcessor {
+        let mut key = [0u8; 64];
+        getrandom::getrandom(&mut key).unwrap();
+        InvalidationEventProcessor::new(key)
+    }
+
+    #[test]
+    fn create_and_verify_invalidation_event() {
+        let mut proc = make_processor();
+        let user_id = Uuid::new_v4();
+        let event = proc.create_event(user_id, InvalidationReason::PasswordChanged, "node-1");
+        let result = proc.verify_and_accept(&event);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), user_id);
+    }
+
+    #[test]
+    fn reject_tampered_signature() {
+        let mut proc = make_processor();
+        let user_id = Uuid::new_v4();
+        let mut event = proc.create_event(user_id, InvalidationReason::RoleChanged, "node-1");
+        if let Some(byte) = event.signature.first_mut() {
+            *byte ^= 0xFF;
+        }
+        let result = proc.verify_and_accept(&event);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("signature invalid"));
+    }
+
+    #[test]
+    fn reject_replay_same_event() {
+        let mut proc = make_processor();
+        let user_id = Uuid::new_v4();
+        let event = proc.create_event(user_id, InvalidationReason::SecurityIncident, "node-1");
+        assert!(proc.verify_and_accept(&event).is_ok());
+        let result = proc.verify_and_accept(&event);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("duplicate"));
+    }
+
+    #[test]
+    fn reject_event_from_different_key() {
+        let proc1 = make_processor();
+        let mut proc2 = make_processor();
+        let user_id = Uuid::new_v4();
+        let event = proc1.create_event(user_id, InvalidationReason::AdminAction, "node-1");
+        let result = proc2.verify_and_accept(&event);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn apply_invalidation_event_terminates_sessions() {
+        let mut store = make_store();
+        let user_id = Uuid::new_v4();
+        store.create_session(user_id, 2, [0u8; 32], b"k1", 0).unwrap();
+        store.create_session(user_id, 2, [1u8; 32], b"k2", 0).unwrap();
+        assert_eq!(store.active_count(), 2);
+
+        let proc = make_processor();
+        let event = proc.create_event(user_id, InvalidationReason::PasswordChanged, "node-2");
+        let terminated = store.apply_invalidation_event(&event);
+        assert_eq!(terminated, 2);
+        assert_eq!(store.active_count(), 0);
+    }
+
+    #[test]
+    fn invalidation_reason_as_str() {
+        assert_eq!(InvalidationReason::PasswordChanged.as_str(), "password_changed");
+        assert_eq!(InvalidationReason::RoleChanged.as_str(), "role_changed");
+        assert_eq!(InvalidationReason::PermissionEscalation.as_str(), "permission_escalation");
+        assert_eq!(InvalidationReason::SecurityIncident.as_str(), "security_incident");
+        assert_eq!(InvalidationReason::AdminAction.as_str(), "admin_action");
     }
 }

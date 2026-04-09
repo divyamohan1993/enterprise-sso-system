@@ -33,18 +33,40 @@ type HmacSha512 = Hmac<Sha512>;
 
 /// A single Shamir share: (index, 32-byte value).
 /// Index is 1-based (0 is reserved for the secret).
-#[derive(Clone, ZeroizeOnDrop)]
+/// The share value is mlock'd to prevent swap exposure.
+#[derive(Clone, Zeroize)]
 pub struct KekShare {
     pub index: u8,
-    #[zeroize(drop)]
     pub value: [u8; 32],
+    #[zeroize(skip)]
+    value_locked: bool,
+}
+
+impl Drop for KekShare {
+    fn drop(&mut self) {
+        if self.value_locked {
+            #[allow(unsafe_code)]
+            unsafe {
+                libc::munlock(self.value.as_ptr() as *const libc::c_void, self.value.len());
+            }
+        }
+        self.value.zeroize();
+    }
 }
 
 impl KekShare {
     /// Create a share from raw bytes.
     pub fn new(index: u8, value: [u8; 32]) -> Self {
         assert!(index > 0, "share index must be 1-based (0 is the secret)");
-        Self { index, value }
+        let mut share = Self { index, value, value_locked: false };
+        #[allow(unsafe_code)]
+        unsafe {
+            if libc::mlock(share.value.as_ptr() as *const libc::c_void, share.value.len()) == 0 {
+                share.value_locked = true;
+                libc::madvise(share.value.as_ptr() as *mut libc::c_void, share.value.len(), libc::MADV_DONTDUMP);
+            }
+        }
+        share
     }
 
     /// Encode as hex for sealed storage. Returns `Zeroizing<String>` to ensure
@@ -64,7 +86,7 @@ impl KekShare {
             .map_err(|e| format!("invalid share value hex: {e}"))?;
         let mut value = [0u8; 32];
         value.copy_from_slice(&value_bytes);
-        Ok(Self { index, value })
+        Ok(Self::new(index, value))
     }
 }
 
@@ -299,10 +321,7 @@ pub fn split_secret(secret: &[u8; 32], threshold: u8, total: u8) -> Result<Vec<K
     }
 
     let mut shares: Vec<KekShare> = (1..=total)
-        .map(|i| KekShare {
-            index: i,
-            value: [0u8; 32],
-        })
+        .map(|i| KekShare::new(i, [0u8; 32]))
         .collect();
 
     // For each byte of the secret, create a random polynomial

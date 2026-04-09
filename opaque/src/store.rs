@@ -1,6 +1,6 @@
 //! In-memory credential store with real OPAQUE ServerRegistration records.
 //!
-//! The store holds serialized `ServerRegistration` blobs — these contain NO
+//! The store holds serialized `ServerRegistration` blobs -- these contain NO
 //! password information. The server never sees the plaintext password at any
 //! point during registration or login.
 
@@ -18,10 +18,78 @@ use crate::opaque_impl::{OpaqueCs, OpaqueCsFips};
 pub const KSF_ARGON2ID: &str = "argon2id-v19";
 pub const KSF_PBKDF2_SHA512: &str = "pbkdf2-sha512";
 
+/// Number of pre-computed fake registrations for timing-safe user-not-found handling.
+const FAKE_REGISTRATION_COUNT: usize = 64;
+
+/// Pre-computed pool of fake OPAQUE registrations used to prevent timing oracles.
+/// When verify_password or verify_password_adaptive is called for a non-existent user,
+/// the full OPAQUE login protocol runs against one of these fake registrations so that
+/// both code paths (user exists vs. not) take approximately equal time.
+struct FakeRegistrationPool {
+    registrations: Vec<Vec<u8>>,
+}
+
+impl FakeRegistrationPool {
+    fn generate(server_setup: &ServerSetup<OpaqueCs>, count: usize) -> Self {
+        use opaque_ke::{ClientRegistration, ClientRegistrationFinishParameters};
+
+        let mut rng = OsRng;
+        let mut registrations = Vec::with_capacity(count);
+
+        for i in 0..count {
+            let fake_password = format!("__fake_timing_pad_{i}__");
+            let fake_username = format!("__nonexistent_timing_pad_{i}__");
+
+            let client_start =
+                ClientRegistration::<OpaqueCs>::start(&mut rng, fake_password.as_bytes())
+                    .expect("fake registration client start must succeed");
+            let server_start = ServerRegistration::<OpaqueCs>::start(
+                server_setup,
+                client_start.message,
+                fake_username.as_bytes(),
+            )
+            .expect("fake registration server start must succeed");
+            let client_finish = client_start
+                .state
+                .finish(
+                    &mut rng,
+                    fake_password.as_bytes(),
+                    server_start.message,
+                    ClientRegistrationFinishParameters::default(),
+                )
+                .expect("fake registration client finish must succeed");
+            let server_reg = ServerRegistration::<OpaqueCs>::finish(client_finish.message);
+            registrations.push(server_reg.serialize().to_vec());
+        }
+
+        Self { registrations }
+    }
+
+    /// Select a fake registration deterministically based on username.
+    /// Uses HMAC-SHA512 so repeated queries for the same non-existent username
+    /// produce identical timing profiles (prevents variance-based oracles).
+    fn select_for_username(&self, username: &str) -> &[u8] {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha512;
+
+        const SELECTION_KEY: &[u8; 32] = b"MILNET_FAKE_REG_SELECT_KEY_V1\x00\x00\x00";
+
+        let mut mac =
+            <Hmac<Sha512>>::new_from_slice(SELECTION_KEY).expect("HMAC key length is valid");
+        mac.update(username.as_bytes());
+        let result = mac.finalize().into_bytes();
+
+        let idx_bytes: [u8; 8] = result[..8].try_into().expect("8 bytes");
+        let idx = u64::from_le_bytes(idx_bytes) as usize % self.registrations.len();
+
+        &self.registrations[idx]
+    }
+}
+
 /// A stored user credential record.
 pub struct UserRecord {
     pub user_id: Uuid,
-    /// Serialized `ServerRegistration<OpaqueCs>` — contains NO password info.
+    /// Serialized `ServerRegistration<OpaqueCs>` -- contains NO password info.
     pub registration: Vec<u8>,
     /// Key stretching function algorithm used during registration.
     /// Defaults to "argon2id-v19".
@@ -36,6 +104,8 @@ pub struct CredentialStore {
     server_setup: ServerSetup<OpaqueCs>,
     /// Optional FIPS-compliant server setup using PBKDF2-SHA512 KSF.
     server_setup_fips: Option<ServerSetup<OpaqueCsFips>>,
+    /// Pre-computed fake registrations for timing-safe user-not-found handling.
+    fake_registrations: FakeRegistrationPool,
 }
 
 impl CredentialStore {
@@ -43,10 +113,13 @@ impl CredentialStore {
     pub fn new() -> Self {
         let mut rng = OsRng;
         let server_setup = ServerSetup::<OpaqueCs>::new(&mut rng);
+        let fake_registrations =
+            FakeRegistrationPool::generate(&server_setup, FAKE_REGISTRATION_COUNT);
         Self {
             users: HashMap::new(),
             server_setup,
             server_setup_fips: None,
+            fake_registrations,
         }
     }
 
@@ -56,10 +129,13 @@ impl CredentialStore {
         let mut rng = OsRng;
         let server_setup = ServerSetup::<OpaqueCs>::new(&mut rng);
         let server_setup_fips = ServerSetup::<OpaqueCsFips>::new(&mut rng);
+        let fake_registrations =
+            FakeRegistrationPool::generate(&server_setup, FAKE_REGISTRATION_COUNT);
         Self {
             users: HashMap::new(),
             server_setup,
             server_setup_fips: Some(server_setup_fips),
+            fake_registrations,
         }
     }
 
@@ -75,10 +151,13 @@ impl CredentialStore {
         } else {
             None
         };
+        let fake_registrations =
+            FakeRegistrationPool::generate(&server_setup, FAKE_REGISTRATION_COUNT);
         Self {
             users: HashMap::new(),
             server_setup,
             server_setup_fips,
+            fake_registrations,
         }
     }
 
@@ -306,7 +385,7 @@ impl CredentialStore {
             }
         };
 
-        // Step 4: Server finishes registration — produces the password file
+        // Step 4: Server finishes registration -- produces the password file
         let server_registration = ServerRegistration::<OpaqueCs>::finish(client_finish.message);
         let registration_bytes = server_registration.serialize().to_vec();
 
@@ -357,7 +436,7 @@ impl CredentialStore {
 
         let server_setup = self.server_setup_fips.as_ref()
             .ok_or_else(|| MilnetError::CryptoVerification(
-                "FIPS server setup not initialised — use new_dual()".into(),
+                "FIPS server setup not initialised -- use new_dual()".into(),
             ))?;
 
         let mut rng = OsRng;
@@ -399,13 +478,24 @@ impl CredentialStore {
     /// should be asked to re-register under the FIPS cipher suite.
     ///
     /// Returns `(user_id, needs_reregistration)`.
+    ///
+    /// SECURITY: When the user does not exist, the full OPAQUE protocol is still
+    /// executed against a pre-computed fake registration via verify_password().
+    /// This prevents timing oracles that would reveal username existence.
     pub fn verify_password_adaptive(
         &self,
         username: &str,
         password: &[u8],
     ) -> Result<(Uuid, bool), MilnetError> {
-        let record = self.users.get(username)
-            .ok_or_else(|| MilnetError::CryptoVerification("user not found".into()))?;
+        let record = match self.users.get(username) {
+            Some(r) => r,
+            None => {
+                // User not found: delegate to verify_password which runs the
+                // full OPAQUE protocol against a fake registration, producing
+                // an indistinguishable "authentication failed" error and timing.
+                return self.verify_password(username, password).map(|uid| (uid, false));
+            }
+        };
 
         let fips_active = common::fips::is_fips_mode();
 
@@ -472,16 +562,33 @@ impl CredentialStore {
     }
 
     /// Verify a password using the full OPAQUE login protocol internally.
-    /// Runs both client and server sides — the password is only used on the
+    /// Runs both client and server sides -- the password is only used on the
     /// client side. Returns Ok(user_id) on success.
+    ///
+    /// SECURITY: When the user does not exist, the full OPAQUE protocol is
+    /// executed against a pre-computed fake registration. This prevents timing
+    /// oracles that would reveal whether a username is registered.
     pub fn verify_password(&self, username: &str, password: &[u8]) -> Result<Uuid, MilnetError> {
-        use opaque_ke::{ClientLogin, ClientLoginFinishParameters, ServerLogin, ServerLoginParameters};
+        use opaque_ke::{
+            ClientLogin, ClientLoginFinishParameters, ServerLogin, ServerLoginParameters,
+        };
 
-        let record = self.users.get(username)
-            .ok_or_else(|| MilnetError::CryptoVerification("user not found".into()))?;
-
-        let server_registration = ServerRegistration::<OpaqueCs>::deserialize(&record.registration)
-            .map_err(|_| MilnetError::CryptoVerification("corrupt registration".into()))?;
+        // Look up user. If not found, use a fake registration to prevent timing oracle.
+        let (server_registration, user_id, is_fake) = match self.users.get(username) {
+            Some(record) => {
+                let reg = ServerRegistration::<OpaqueCs>::deserialize(&record.registration)
+                    .map_err(|_| {
+                        MilnetError::CryptoVerification("corrupt registration".into())
+                    })?;
+                (reg, record.user_id, false)
+            }
+            None => {
+                let fake_bytes = self.fake_registrations.select_for_username(username);
+                let reg = ServerRegistration::<OpaqueCs>::deserialize(fake_bytes)
+                    .map_err(|_| MilnetError::CryptoVerification("internal error".into()))?;
+                (reg, Uuid::nil(), true)
+            }
+        };
 
         let mut rng = OsRng;
 
@@ -489,7 +596,7 @@ impl CredentialStore {
         let client_start = ClientLogin::<OpaqueCs>::start(&mut rng, password)
             .map_err(|_| MilnetError::CryptoVerification("login start failed".into()))?;
 
-        // Server processes login request
+        // Server processes login request (full OPAQUE OPRF regardless of user existence)
         let server_start = ServerLogin::<OpaqueCs>::start(
             &mut rng,
             &self.server_setup,
@@ -498,22 +605,34 @@ impl CredentialStore {
             username.as_bytes(),
             ServerLoginParameters::default(),
         )
-        .map_err(|_| MilnetError::CryptoVerification("server login failed".into()))?;
+        .map_err(|_| MilnetError::CryptoVerification("authentication failed".into()))?;
 
         // Client finishes login
-        let client_finish = client_start.state.finish(
-            &mut rng,
-            password,
-            server_start.message,
-            ClientLoginFinishParameters::default(),
-        )
-        .map_err(|_| MilnetError::CryptoVerification("invalid password".into()))?;
-
-        // Server verifies finalization
-        server_start.state.finish(client_finish.message, ServerLoginParameters::default())
+        let client_finish = client_start
+            .state
+            .finish(
+                &mut rng,
+                password,
+                server_start.message,
+                ClientLoginFinishParameters::default(),
+            )
             .map_err(|_| MilnetError::CryptoVerification("authentication failed".into()))?;
 
-        Ok(record.user_id)
+        // Server verifies finalization
+        server_start
+            .state
+            .finish(client_finish.message, ServerLoginParameters::default())
+            .map_err(|_| MilnetError::CryptoVerification("authentication failed".into()))?;
+
+        // Defensive guard: fake registrations should always fail above, but
+        // if somehow they don't, never return a valid user_id.
+        if is_fake {
+            return Err(MilnetError::CryptoVerification(
+                "authentication failed".into(),
+            ));
+        }
+
+        Ok(user_id)
     }
 }
 
@@ -531,7 +650,7 @@ impl Drop for CredentialStore {
         let setup_size = std::mem::size_of_val(&self.server_setup);
         tracing::debug!(
             setup_bytes_size = setup_size,
-            "CredentialStore::drop — zeroizing serialized ServerSetup ({setup_size} bytes struct)"
+            "CredentialStore::drop -- zeroizing serialized ServerSetup ({setup_size} bytes struct)"
         );
 
         let mut setup_bytes = self.server_setup.serialize().to_vec();
@@ -541,7 +660,7 @@ impl Drop for CredentialStore {
             let fips_size = std::mem::size_of_val(fips_setup);
             tracing::debug!(
                 fips_setup_bytes_size = fips_size,
-                "CredentialStore::drop — zeroizing serialized FIPS ServerSetup ({fips_size} bytes struct)"
+                "CredentialStore::drop -- zeroizing serialized FIPS ServerSetup ({fips_size} bytes struct)"
             );
             let mut fips_bytes = fips_setup.serialize().to_vec();
             fips_bytes.zeroize();
@@ -563,7 +682,7 @@ impl Default for CredentialStore {
 mod tests {
     use super::*;
 
-    // ── Construction ───────────────────────────────────────────────────
+    // -- Construction -----------------------------------------------------------
 
     #[test]
     fn new_creates_empty_store() {
@@ -603,7 +722,7 @@ mod tests {
         assert_eq!(setup_bytes_1, setup_bytes_2, "server setup must be preserved");
     }
 
-    // ── Registration flow ──────────────────────────────────────────────
+    // -- Registration flow ------------------------------------------------------
 
     #[test]
     fn register_with_password_returns_valid_uuid() {
@@ -642,7 +761,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ── Duplicate username handling ────────────────────────────────────
+    // -- Duplicate username handling --------------------------------------------
 
     #[test]
     fn duplicate_username_is_rejected() {
@@ -671,7 +790,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ── MAX_USERS limit ───────────────────────────────────────────────
+    // -- MAX_USERS limit -------------------------------------------------------
 
     #[test]
     fn store_registration_rejects_duplicate() {
@@ -699,7 +818,7 @@ mod tests {
         assert_eq!(store.get_ksf_algorithm("existing"), Some(KSF_PBKDF2_SHA512));
     }
 
-    // ── get_registration_bytes ─────────────────────────────────────────
+    // -- get_registration_bytes -------------------------------------------------
 
     #[test]
     fn get_registration_bytes_returns_stored_bytes() {
@@ -727,7 +846,7 @@ mod tests {
         assert!(reg.is_ok(), "stored bytes must deserialize to ServerRegistration");
     }
 
-    // ── get_registration ───────────────────────────────────────────────
+    // -- get_registration -------------------------------------------------------
 
     #[test]
     fn get_registration_returns_correct_user_id() {
@@ -750,7 +869,7 @@ mod tests {
         assert!(store.get_registration("corrupt").is_err());
     }
 
-    // ── Login flow ────────────────────────────────────────────────────
+    // -- Login flow ------------------------------------------------------------
 
     #[test]
     fn verify_password_succeeds_with_correct_password() {
@@ -803,7 +922,7 @@ mod tests {
         assert!(store.verify_password_adaptive("ghost", b"pw").is_err());
     }
 
-    // ── Utility methods ───────────────────────────────────────────────
+    // -- Utility methods -------------------------------------------------------
 
     #[test]
     fn usernames_returns_all_registered() {
@@ -827,7 +946,7 @@ mod tests {
         assert!(store.get_ksf_algorithm("missing").is_none());
     }
 
-    // ── restore_user ──────────────────────────────────────────────────
+    // -- restore_user ----------------------------------------------------------
 
     #[test]
     fn restore_user_makes_user_accessible() {
@@ -857,7 +976,7 @@ mod tests {
         assert_eq!(result.unwrap(), uid);
     }
 
-    // ── Drop/zeroization ──────────────────────────────────────────────
+    // -- Drop/zeroization ------------------------------------------------------
 
     #[test]
     fn drop_does_not_panic() {
@@ -876,7 +995,7 @@ mod tests {
         drop(store);
     }
 
-    // ── Thread safety ─────────────────────────────────────────────────
+    // -- Thread safety ---------------------------------------------------------
 
     #[test]
     fn store_is_send() {
@@ -884,7 +1003,7 @@ mod tests {
         assert_send::<CredentialStore>();
     }
 
-    // ── KSF constant values ───────────────────────────────────────────
+    // -- KSF constant values ---------------------------------------------------
 
     #[test]
     fn ksf_constants_are_distinct() {

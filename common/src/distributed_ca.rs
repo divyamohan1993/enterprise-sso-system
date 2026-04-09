@@ -15,6 +15,46 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// ── Revocation Quorum ───────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevocationRequest {
+    pub serial: u64,
+    pub requester_id: NodeId,
+    pub reason: String,
+    pub timestamp: i64,
+    pub signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevocationVote {
+    pub serial: u64,
+    pub voter_id: NodeId,
+    pub timestamp: i64,
+}
+
+pub struct RevocationQuorum {
+    pub required: usize,
+    pending: HashMap<u64, Vec<RevocationVote>>,
+}
+
+impl RevocationQuorum {
+    pub fn new(required: usize) -> Self { Self { required, pending: HashMap::new() } }
+
+    pub fn add_vote(&mut self, vote: RevocationVote) -> bool {
+        let votes = self.pending.entry(vote.serial).or_default();
+        if votes.iter().any(|v| v.voter_id == vote.voter_id) { return votes.len() >= self.required; }
+        votes.push(vote);
+        votes.len() >= self.required
+    }
+
+    pub fn has_quorum(&self, serial: u64) -> bool {
+        self.pending.get(&serial).map(|v| v.len() >= self.required).unwrap_or(false)
+    }
+
+    pub fn clear(&mut self, serial: u64) { self.pending.remove(&serial); }
+}
+
 // ── CA Persistence ───────────────────────────────────────────────────────────
 
 /// Persisted snapshot of CA state, loaded on startup.
@@ -242,6 +282,7 @@ pub struct DistributedCa {
     ca_fingerprint: Vec<u8>,
     /// Persistence backend for CA state
     persistence: Box<dyn CaPersistence>,
+    revocation_quorum: RevocationQuorum,
 }
 
 impl DistributedCa {
@@ -249,6 +290,8 @@ impl DistributedCa {
     pub fn new(config: DistributedCaConfig, ca_fingerprint: Vec<u8>) -> Self {
         Self::with_persistence(config, ca_fingerprint, Box::new(NullCaPersistence))
     }
+
+    pub fn revocation_quorum_mut(&mut self) -> &mut RevocationQuorum { &mut self.revocation_quorum }
 
     /// Create a new DistributedCa with a persistence backend.
     /// Loads any previously persisted state from disk.
@@ -273,6 +316,7 @@ impl DistributedCa {
             revoked = revoked.len(),
             "distributed CA initialized"
         );
+        let revocation_quorum = RevocationQuorum::new(2);
         Self {
             config,
             issued,
@@ -280,6 +324,7 @@ impl DistributedCa {
             revoked,
             ca_fingerprint,
             persistence,
+            revocation_quorum,
         }
     }
 
@@ -343,21 +388,39 @@ impl DistributedCa {
         serial
     }
 
-    /// Revoke a certificate by serial number.
-    pub fn revoke(&mut self, serial: u64) -> bool {
+    /// Submit a revocation vote. Requires quorum (2 of N coordinators).
+    pub fn revoke(&mut self, serial: u64, voter_id: NodeId) -> bool {
+        if !self.issued.contains_key(&serial) { return false; }
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+        let vote = RevocationVote { serial, voter_id, timestamp: now };
+        let quorum_reached = self.revocation_quorum.add_vote(vote);
+        let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok();
+        let is_mlp_ack = std::env::var("MILNET_MLP_MODE_ACK").ok().as_deref() == Some("1");
+        let emergency_bypass = is_military && is_mlp_ack && !quorum_reached;
+        if emergency_bypass {
+            tracing::error!(target: "siem", serial = serial, "SIEM:CRITICAL emergency single-entity revocation");
+            crate::siem::SecurityEvent::circuit_breaker_opened("emergency_single_entity_revocation");
+        }
+        if quorum_reached || emergency_bypass {
+            self.execute_revocation(serial);
+            self.revocation_quorum.clear(serial);
+            true
+        } else {
+            tracing::info!(serial = serial, "revocation vote recorded, awaiting quorum");
+            false
+        }
+    }
+
+    fn execute_revocation(&mut self, serial: u64) {
         if let Some(cert) = self.issued.get_mut(&serial) {
             cert.revoked = true;
             self.revoked.push(serial);
-            // Persist the revocation and the updated cert (revoked=true).
             if let Err(e) = self.persistence.save_issued(cert) {
                 tracing::error!(error = %e, serial = serial, "failed to persist revoked cert");
             }
             if let Err(e) = self.persistence.save_revocation(serial) {
                 tracing::error!(error = %e, serial = serial, "failed to persist revocation");
             }
-            true
-        } else {
-            false
         }
     }
 
@@ -673,19 +736,16 @@ mod tests {
     }
 
     #[test]
-    fn test_certificate_revocation() {
+    fn test_certificate_revocation_requires_quorum() {
         let mut ca = make_ca();
         let csr = ca.create_csr("tss", vec![], node(1));
         let serial = ca.record_issued(&csr, vec![node(1), node(2)], vec![0xAB; 32]);
-
         assert!(ca.is_valid(serial));
-
-        // Revoke it
-        assert!(ca.revoke(serial));
+        assert!(!ca.revoke(serial, node(1)));
+        assert!(ca.is_valid(serial));
+        assert!(ca.revoke(serial, node(2)));
         assert!(!ca.is_valid(serial));
-
-        // Revoking a non-existent cert returns false
-        assert!(!ca.revoke(999));
+        assert!(!ca.revoke(999, node(1)));
     }
 
     #[test]
@@ -700,8 +760,9 @@ mod tests {
         // Non-existent serial is not valid
         assert!(!ca.is_valid(42));
 
-        // Revoked cert is not valid
-        ca.revoke(serial);
+        // Revoked cert is not valid (two votes for quorum)
+        ca.revoke(serial, node(1));
+        ca.revoke(serial, node(2));
         assert!(!ca.is_valid(serial));
     }
 
@@ -756,8 +817,10 @@ mod tests {
 
         assert!(ca.revocation_list().is_empty());
 
-        ca.revoke(s1);
-        ca.revoke(s2);
+        ca.revoke(s1, node(1));
+        ca.revoke(s1, node(2));
+        ca.revoke(s2, node(1));
+        ca.revoke(s2, node(2));
 
         assert_eq!(ca.revocation_list(), &[s1, s2]);
     }

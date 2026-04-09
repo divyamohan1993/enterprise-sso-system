@@ -531,10 +531,78 @@ use std::sync::OnceLock;
 /// Global SIEM webhook instance.  Set once at startup via `init_siem_webhook`.
 static SIEM_WEBHOOK: OnceLock<Option<SiemWebhook>> = OnceLock::new();
 
-/// Initialise the global SIEM webhook.  Must be called before any events are
-/// emitted if webhook forwarding is desired.  Safe to call multiple times —
-/// only the first call takes effect.
+/// Validate SIEM encryption key is present and sufficient for production/military mode.
+///
+/// Production/military: MILNET_SIEM_ENCRYPTION_KEY MUST be set (>= 32 bytes / 64 hex).
+/// Missing or insufficient key logs SIEM CRITICAL and panics.
+/// MLP mode: allows unencrypted with SIEM WARNING.
+pub fn validate_siem_encryption_key() {
+    let is_production = std::env::var("MILNET_PRODUCTION").as_deref() == Ok("1")
+        || std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1");
+    let is_mlp = crate::config::is_mlp_mode();
+
+    let key_hex = std::env::var("MILNET_SIEM_ENCRYPTION_KEY").unwrap_or_default();
+
+    if key_hex.is_empty() {
+        if is_production && !is_mlp {
+            tracing::error!(
+                target: "siem",
+                "SIEM:CRITICAL MILNET_SIEM_ENCRYPTION_KEY is not set. \
+                 Encrypted SIEM transport is MANDATORY in production/military mode."
+            );
+            crate::siem::SecurityEvent::tamper_detected(
+                "SIEM CRITICAL: MILNET_SIEM_ENCRYPTION_KEY missing in production mode"
+            );
+            panic!(
+                "FATAL: MILNET_SIEM_ENCRYPTION_KEY is required in production/military mode. \
+                 Set a 64 hex-char (256-bit) key or enable MLP mode."
+            );
+        } else if is_mlp {
+            tracing::warn!(
+                target: "siem",
+                "SIEM:WARNING MLP mode active: SIEM payloads will be transmitted UNENCRYPTED. \
+                 This is acceptable only for software simulation, NOT production."
+            );
+        }
+        return;
+    }
+
+    match hex::decode(&key_hex) {
+        Ok(k) if k.len() >= 32 => {
+            tracing::info!(target: "siem", "SIEM encryption key validated: {} bytes", k.len());
+        }
+        Ok(k) => {
+            if is_production && !is_mlp {
+                panic!(
+                    "FATAL: MILNET_SIEM_ENCRYPTION_KEY too short: {} bytes (minimum 32).",
+                    k.len()
+                );
+            } else {
+                tracing::warn!(
+                    target: "siem",
+                    "SIEM encryption key too short: {} bytes (minimum 32). Encryption skipped.",
+                    k.len()
+                );
+            }
+        }
+        Err(e) => {
+            if is_production && !is_mlp {
+                panic!("FATAL: MILNET_SIEM_ENCRYPTION_KEY is not valid hex: {}", e);
+            } else {
+                tracing::warn!(
+                    target: "siem",
+                    "SIEM encryption key is not valid hex: {}. Encryption skipped.", e
+                );
+            }
+        }
+    }
+}
+
+/// Initialise the global SIEM webhook. Must be called before any events are
+/// emitted if webhook forwarding is desired. Safe to call multiple times;
+/// only the first call takes effect. Validates SIEM encryption key first.
 pub fn init_siem_webhook(config: SiemWebhookConfig) {
+    validate_siem_encryption_key();
     let _ = SIEM_WEBHOOK.set(Some(SiemWebhook::new(config)));
 }
 

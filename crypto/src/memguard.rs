@@ -645,6 +645,62 @@ pub fn harden_process() -> bool {
     ok
 }
 
+// ---------------------------------------------------------------------------
+// SecureString -- zeroize-on-drop String wrapper for sensitive tokens
+// ---------------------------------------------------------------------------
+
+/// A `String` wrapper that overwrites its bytes on drop, preventing sensitive
+/// values (refresh tokens, session IDs) from lingering in heap after dealloc.
+pub struct SecureString {
+    inner: String,
+}
+
+impl SecureString {
+    pub fn new(s: String) -> Self { Self { inner: s } }
+    pub fn from_str(s: &str) -> Self { Self { inner: s.to_owned() } }
+    pub fn as_str(&self) -> &str { &self.inner }
+    pub fn into_inner(self) -> String {
+        let s = unsafe { std::ptr::read(&self.inner) };
+        std::mem::forget(self);
+        s
+    }
+}
+
+impl Drop for SecureString {
+    fn drop(&mut self) {
+        let bytes = unsafe { self.inner.as_mut_vec() };
+        for b in bytes.iter_mut() {
+            unsafe { core::ptr::write_volatile(b, 0) };
+        }
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl core::fmt::Debug for SecureString {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "SecureString([REDACTED, {} bytes])", self.inner.len())
+    }
+}
+
+impl core::fmt::Display for SecureString {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "[REDACTED]")
+    }
+}
+
+impl Clone for SecureString {
+    fn clone(&self) -> Self { Self { inner: self.inner.clone() } }
+}
+
+impl PartialEq for SecureString {
+    fn eq(&self, other: &Self) -> bool {
+        use subtle::ConstantTimeEq;
+        self.inner.as_bytes().ct_eq(other.inner.as_bytes()).into()
+    }
+}
+
+impl Eq for SecureString {}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -776,9 +832,31 @@ mod tests {
     fn debug_does_not_leak_secret() {
         let buf = SecretBuffer::<32>::new([0xCC; 32]).unwrap();
         let dbg = format!("{:?}", buf);
-        // The debug output must NOT contain the secret byte.
         assert!(!dbg.contains("0xCC"), "Debug output must not leak secrets");
         assert!(!dbg.contains("204"), "Debug output must not leak secrets");
         assert!(dbg.contains("SecretBuffer"));
+    }
+
+    #[test]
+    fn secure_string_debug_does_not_leak() {
+        let ss = SecureString::new("super-secret-token".to_string());
+        let dbg = format!("{:?}", ss);
+        assert!(!dbg.contains("super-secret"), "Debug must not leak");
+        assert!(dbg.contains("REDACTED"));
+    }
+
+    #[test]
+    fn secure_string_as_str() {
+        let ss = SecureString::new("test-value".to_string());
+        assert_eq!(ss.as_str(), "test-value");
+    }
+
+    #[test]
+    fn secure_string_ct_eq() {
+        let a = SecureString::new("same".to_string());
+        let b = SecureString::new("same".to_string());
+        let c = SecureString::new("diff".to_string());
+        assert_eq!(a, b);
+        assert_ne!(a, c);
     }
 }

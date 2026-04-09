@@ -746,16 +746,18 @@ fn log_super_admin_access(
     matched_admin: Option<&(Uuid, String)>,
     outcome: &str,
 ) -> bool {
+    // Pseudonymize IP for storage (defense-in-depth: caller may already pseudonymize)
+    let pseudonymized_ip = common::log_pseudonym::pseudonym_ip(source_ip);
     let detail = format!(
-        "SUPER_ADMIN_ACCESS: {} {} from {} — admin={} outcome={}",
-        method, path, source_ip,
+        "SUPER_ADMIN_ACCESS: {} {} from {} - admin={} outcome={}",
+        method, path, pseudonymized_ip,
         matched_admin.map(|(_, l)| l.as_str()).unwrap_or("UNKNOWN"),
         outcome,
     );
 
     let entry_json = serde_json::json!({
         "event_type": "SuperAdminAccess",
-        "source_ip": source_ip,
+        "source_ip": pseudonymized_ip,
         "path": path,
         "method": method,
         "admin_id": matched_admin.map(|(id, _)| id.to_string()),
@@ -1375,11 +1377,15 @@ async fn auth_middleware(
             {
                 let admins = state.super_admin_keys.read().await;
                 if !admins.is_empty() {
-                    let source_ip = request.headers()
-                        .get("x-forwarded-for")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("unknown")
-                        .to_string();
+                    let source_ip = {
+                        let raw_ip = request.headers()
+                            .get("x-forwarded-for")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        // Pseudonymize IP before any storage (GDPR/DPDP compliance)
+                        common::log_pseudonym::pseudonym_ip(&raw_ip)
+                    };
                     let req_path = request.uri().path().to_string();
                     let req_method = request.method().to_string();
 

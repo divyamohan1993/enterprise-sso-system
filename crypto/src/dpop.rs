@@ -43,16 +43,20 @@ impl GuardedSigningKey {
     /// non-production environment, the key is still usable but a warning
     /// is emitted.
     pub fn new(key: DpopSigningKey) -> Self {
-        // Use a sentinel buffer to trigger mlock on the process's key pages.
-        // The sentinel contains random bytes (not the actual key) — it serves
-        // only to ensure mlock coverage and trigger zeroization on drop.
         let mut sentinel = vec![0u8; 64];
         let _ = getrandom::getrandom(&mut sentinel);
         let locked = crate::memguard::SecretVec::new(sentinel).ok();
-        Self {
-            key,
-            _locked_sentinel: locked,
+        let guarded = Self { key, _locked_sentinel: locked };
+        // Best-effort mlock of the actual ML-DSA-87 signing key struct memory.
+        let ptr = &guarded.key as *const DpopSigningKey as *const u8;
+        let len = std::mem::size_of::<DpopSigningKey>();
+        #[allow(unsafe_code)]
+        unsafe {
+            if libc::mlock(ptr as *const libc::c_void, len) == 0 {
+                libc::madvise(ptr as *mut libc::c_void, len, libc::MADV_DONTDUMP);
+            }
         }
+        guarded
     }
 
     /// Borrow the inner signing key for use in signing operations.
@@ -63,14 +67,15 @@ impl GuardedSigningKey {
 
 impl Drop for GuardedSigningKey {
     fn drop(&mut self) {
-        // Overwrite the in-memory signing key with a deterministic dummy.
-        // ML-DSA SigningKey does not implement Zeroize, so we replace it with
-        // a key derived from a zeroed seed.  The `_locked_bytes` field's
-        // SecretVec handles zeroization + munlock of the encoded copy.
+        // munlock signing key region before overwriting.
+        let ptr = &self.key as *const DpopSigningKey as *const u8;
+        let len = std::mem::size_of::<DpopSigningKey>();
+        #[allow(unsafe_code)]
+        unsafe { libc::munlock(ptr as *const libc::c_void, len); }
+        // Overwrite with deterministic dummy.
         let zero_seed = [0u8; 32];
         let dummy_kp = MlDsa87::from_seed(&zero_seed.into());
         self.key = dummy_kp.signing_key().clone();
-        // _locked_bytes is dropped automatically — SecretVec zeroizes + munlocks.
     }
 }
 

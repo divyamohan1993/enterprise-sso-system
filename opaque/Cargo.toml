@@ -37,3 +37,4 @@ production = ["common/production"]
 opaque-ke.workspace = true
 rand.workspace = true
 crypto = { path = "../crypto" }
+proptest = "1"

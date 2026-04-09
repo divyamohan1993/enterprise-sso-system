@@ -24,6 +24,9 @@
 
 use crate::siem::{PanelSiemEvent, SiemPanel, SiemSeverity};
 use crate::threshold_kek::{ct_gf256_mul, gf256_add, KekShare};
+use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
+use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
+use curve25519_dalek::scalar::Scalar;
 use sha2::{Digest, Sha512};
 use std::sync::atomic::{AtomicU64, Ordering};
 use zeroize::Zeroize;
@@ -61,19 +64,22 @@ impl Drop for RefreshContribution {
     }
 }
 
-/// Hash-based commitments for a single node's refresh sub-shares.
-///
-/// Each node publishes SHA-512 hashes of the sub-shares it will send to every
-/// target node.  Receivers verify the received sub-share matches the committed
-/// hash, providing authenticity without revealing the polynomial (CNSA 2.0).
+/// Feldman VSS commitments: g^coefficient for each polynomial coefficient.
+#[derive(Clone)]
+pub struct FeldmanCommitments {
+    pub from_node: usize,
+    pub epoch: u64,
+    pub commitments: Vec<[u8; 32]>,
+    pub feldman_shares: Vec<[u8; 32]>,
+}
+
+/// Hash-based commitments (secondary) + Feldman VSS commitments (primary).
 #[derive(Clone)]
 pub struct RefreshCommitments {
-    /// Node index that published these commitments.
     pub from_node: usize,
-    /// Epoch.
     pub epoch: u64,
-    /// `commitments[target_idx]` = SHA-512 hash of the sub-share for node `target_idx + 1`.
     pub commitments: Vec<Vec<u8>>,
+    pub feldman: FeldmanCommitments,
 }
 
 // ---------------------------------------------------------------------------
@@ -91,6 +97,29 @@ fn hash_commit(from_node: usize, to_node: usize, epoch: u64, sub_share: &[u8]) -
     hasher.update(&epoch.to_be_bytes());
     hasher.update(sub_share);
     hasher.finalize().to_vec()
+}
+
+// ---------------------------------------------------------------------------
+// Feldman VSS helpers (Ristretto255 group)
+// ---------------------------------------------------------------------------
+
+fn bytes_to_scalar(data: &[u8]) -> Scalar { Scalar::hash_from_bytes::<Sha512>(data) }
+
+fn feldman_commit(scalar: &Scalar) -> CompressedRistretto {
+    (RISTRETTO_BASEPOINT_POINT * scalar).compress()
+}
+
+fn feldman_verify(commitments: &[[u8; 32]], target_index: usize, share_scalar: &Scalar) -> bool {
+    let lhs: RistrettoPoint = RISTRETTO_BASEPOINT_POINT * share_scalar;
+    let i_scalar = Scalar::from(target_index as u64);
+    let mut rhs = RistrettoPoint::default();
+    let mut i_power = Scalar::ONE;
+    for cb in commitments {
+        let point = match CompressedRistretto(*cb).decompress() { Some(p) => p, None => return false };
+        rhs += point * i_power;
+        i_power *= i_scalar;
+    }
+    lhs == rhs
 }
 
 // ---------------------------------------------------------------------------
@@ -193,11 +222,27 @@ impl ProactiveRefresh {
             });
         }
 
-        // Build commitments struct: one hash per target node
+        // Build Feldman VSS commitments (primary verification layer).
+        let mut feldman_coeff_commitments: Vec<[u8; 32]> = Vec::with_capacity(t);
+        let c0_scalar = bytes_to_scalar(&[0u8; 32]);
+        feldman_coeff_commitments.push(feldman_commit(&c0_scalar).to_bytes());
+        for k in 0..coeffs_per_byte {
+            let mut coeff_vec = [0u8; 32];
+            for byte_idx in 0..32 { coeff_vec[byte_idx] = coefficients[byte_idx][k]; }
+            feldman_coeff_commitments.push(feldman_commit(&bytes_to_scalar(&coeff_vec)).to_bytes());
+        }
+        let mut feldman_shares: Vec<[u8; 32]> = Vec::with_capacity(self.total_shares);
+        for contrib in &contributions { feldman_shares.push(bytes_to_scalar(&contrib.sub_share).to_bytes()); }
+
+        let feldman = FeldmanCommitments {
+            from_node: my_index, epoch,
+            commitments: feldman_coeff_commitments,
+            feldman_shares,
+        };
         let flat_commitments = RefreshCommitments {
-            from_node: my_index,
-            epoch,
+            from_node: my_index, epoch,
             commitments: per_target_hashes,
+            feldman,
         };
 
         // Zeroize coefficient material
@@ -261,6 +306,16 @@ impl ProactiveRefresh {
             ));
         }
 
+        // Primary: Feldman VSS verification over Ristretto255.
+        if target_idx >= commitments.feldman.feldman_shares.len() {
+            return Err(format!("no Feldman share for target node {}", contribution.to_node));
+        }
+        let share_scalar = Scalar::from_canonical_bytes(commitments.feldman.feldman_shares[target_idx]);
+        let share_scalar = if share_scalar.is_some().into() { share_scalar.unwrap() } else { bytes_to_scalar(&contribution.sub_share) };
+        if !feldman_verify(&commitments.feldman.commitments, contribution.to_node, &share_scalar) {
+            return Err(format!("Feldman VSS verification failed from node {} to node {}", contribution.from_node, contribution.to_node));
+        }
+
         Ok(())
     }
 
@@ -313,10 +368,7 @@ impl ProactiveRefresh {
         // Zeroize old share
         my_share.value.zeroize();
 
-        Ok(KekShare {
-            index: my_share.index,
-            value: new_value,
-        })
+        Ok(KekShare::new(my_share.index, new_value))
     }
 
     /// Orchestrate a complete refresh round across all nodes.
@@ -375,7 +427,7 @@ impl ProactiveRefresh {
             // Step 4: Apply refresh
             let old_share = std::mem::replace(
                 &mut shares[target_idx - 1],
-                KekShare { index: target_idx as u8, value: [0u8; 32] },
+                KekShare::new(target_idx as u8, [0u8; 32]),
             );
             let new_share = self.apply_refresh(old_share, &target_contributions)?;
             new_shares.push(new_share);
@@ -565,13 +617,10 @@ mod tests {
         // Create KekShares from sub-shares
         let sub_shares: Vec<KekShare> = contributions
             .iter()
-            .map(|c| KekShare {
-                index: c.to_node as u8,
-                value: {
-                    let mut v = [0u8; 32];
-                    v.copy_from_slice(&c.sub_share);
-                    v
-                },
+            .map(|c| {
+                let mut v = [0u8; 32];
+                v.copy_from_slice(&c.sub_share);
+                KekShare::new(c.to_node as u8, v)
             })
             .collect();
 

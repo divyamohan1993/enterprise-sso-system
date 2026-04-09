@@ -23,6 +23,9 @@ zeroize.workspace = true
 aes-gcm.workspace = true
 hkdf.workspace = true
 
+[dev-dependencies]
+proptest = "1"
+
 [features]
 default = ["production"]
 production = ["common/production"]

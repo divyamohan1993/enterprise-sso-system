@@ -417,7 +417,9 @@ fn ca_revocation_persists_across_restart() {
 
             let csr = ca.create_csr("revoke-test", vec!["r.milnet".into()], node);
             serial = ca.record_issued(&csr, vec![node], vec![0xEE; 32]);
-            assert!(ca.revoke(serial), "revocation must succeed");
+            let node2 = NodeId::random();
+            ca.revoke(serial, node);
+            assert!(ca.revoke(serial, node2), "revocation must succeed after quorum");
         }
 
         // Phase 2: Recover and check revocation

@@ -213,96 +213,185 @@ pub struct PostgresAssertionCache {
     pub db_url: String,
     /// Identifier for this node (for audit/debugging).
     pub node_id: String,
+    /// PostgreSQL connection pool for distributed assertion checks.
+    pool: Option<sqlx::PgPool>,
 }
 
 impl PostgresAssertionCache {
     /// Create a new PostgreSQL-backed assertion cache.
-    ///
-    /// `db_url` is a PostgreSQL connection string (e.g., `postgres://user:pass@host/db`).
-    /// `node_id` identifies this cluster node in the assertion table.
     pub fn new(db_url: String, node_id: String) -> Self {
-        Self { db_url, node_id }
+        let pool = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => match handle.block_on(Self::init_pool(&db_url)) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    tracing::error!(
+                        target: "siem",
+                        error = %e,
+                        "SIEM:CRITICAL PostgresAssertionCache: failed to init pool"
+                    );
+                    None
+                }
+            },
+            Err(_) => {
+                tracing::error!(
+                    target: "siem",
+                    "SIEM:CRITICAL PostgresAssertionCache: no tokio runtime for pool init"
+                );
+                None
+            }
+        };
+        Self { db_url, node_id, pool }
+    }
+
+    async fn init_pool(db_url: &str) -> Result<sqlx::PgPool, String> {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .connect(db_url)
+            .await
+            .map_err(|e| format!("PostgresAssertionCache pool connect: {e}"))?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS saml_assertion_ids (\
+                assertion_id TEXT PRIMARY KEY,\
+                expires_at   BIGINT NOT NULL,\
+                node_id      TEXT NOT NULL,\
+                inserted_at  BIGINT NOT NULL DEFAULT (EXTRACT(EPOCH FROM NOW())::BIGINT)\
+            )"
+        )
+        .execute(&pool)
+        .await
+        .map_err(|e| format!("create saml_assertion_ids table: {e}"))?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_saml_assertion_ids_expiry \
+             ON saml_assertion_ids (expires_at)"
+        )
+        .execute(&pool)
+        .await
+        .map_err(|e| format!("create expiry index: {e}"))?;
+
+        Ok(pool)
     }
 }
 
 impl DistributedAssertionCache for PostgresAssertionCache {
-    /// Atomically check if `assertion_id` exists, insert if not.
-    ///
-    /// Uses the SQL pattern:
-    /// ```sql
-    /// INSERT INTO saml_assertion_ids (assertion_id, expires_at, node_id)
-    /// VALUES ($1, $2, $3)
-    /// ON CONFLICT (assertion_id) DO NOTHING
-    /// RETURNING assertion_id
-    /// ```
-    /// If a row is returned, the ID was freshly inserted (not a replay).
-    /// If no row is returned, the ID already existed (replay detected).
+    /// L1 in-memory fast path + L2 PostgreSQL atomic INSERT ON CONFLICT.
     fn check_and_store(&self, assertion_id: &str, retention_secs: i64) -> Result<bool, String> {
-        // Database connection and query execution.
-        // This uses synchronous I/O to match the trait's synchronous signature.
-        // In production, the connection should come from a pool (e.g., r2d2 + postgres).
-        use std::io::{Read, Write};
-        use std::net::TcpStream;
-
         let now = crate::secure_time::secure_now_secs_i64();
         let expires_at = now + retention_secs;
 
-        // Parse the DB URL to extract host:port for the TCP connection.
-        // Full PostgreSQL wire protocol implementation is beyond scope here;
-        // in production, use the `postgres` crate with a connection pool.
-        //
-        // For now, we use the in-memory cache as a local fallback and log
-        // that the PostgreSQL backend needs the `postgres` crate wired in.
-        //
-        // The atomic SQL query that MUST be used when wired:
-        // INSERT INTO saml_assertion_ids (assertion_id, expires_at, node_id)
-        // VALUES ($1, $2, $3) ON CONFLICT (assertion_id) DO NOTHING RETURNING assertion_id
-        //
-        // rows_affected == 1 => freshly inserted (not replay) => return Ok(false)
-        // rows_affected == 0 => already existed (replay)       => return Ok(true)
+        // L1: in-memory check (same-node replay fast path).
+        {
+            let cache = assertion_id_cache()
+                .lock()
+                .map_err(|_| "assertion ID cache lock poisoned".to_string())?;
+            if cache.seen.contains_key(assertion_id) {
+                SecurityEvent::saml_assertion_replay_detected(assertion_id);
+                return Ok(true);
+            }
+        }
+
+        // L2: PostgreSQL distributed check.
+        let Some(ref pool) = self.pool else {
+            tracing::warn!(
+                target: "siem",
+                "SIEM:WARNING PostgresAssertionCache: no pool, in-memory fallback"
+            );
+            let mut cache = assertion_id_cache()
+                .lock()
+                .map_err(|_| "assertion ID cache lock poisoned".to_string())?;
+            return match cache.check_and_record(assertion_id, retention_secs) {
+                Ok(()) => Ok(false),
+                Err(_) => Ok(true),
+            };
+        };
+
+        let pool = pool.clone();
+        let aid = assertion_id.to_string();
+        let nid = self.node_id.clone();
+
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "no tokio runtime for PostgresAssertionCache".to_string())?;
+
+        let is_replay: bool = handle.block_on(async {
+            let res = sqlx::query(
+                "INSERT INTO saml_assertion_ids (assertion_id, expires_at, node_id) \
+                 VALUES ($1, $2, $3) ON CONFLICT (assertion_id) DO NOTHING"
+            )
+            .bind(&aid)
+            .bind(expires_at)
+            .bind(&nid)
+            .execute(&pool)
+            .await
+            .map_err(|e| format!("PostgresAssertionCache query: {e}"))?;
+            Ok::<bool, String>(res.rows_affected() == 0)
+        })?;
+
+        if !is_replay {
+            let mut cache = assertion_id_cache()
+                .lock()
+                .map_err(|_| "assertion ID cache lock poisoned".to_string())?;
+            let _ = cache.check_and_record(assertion_id, retention_secs);
+        } else {
+            SecurityEvent::saml_assertion_replay_detected(assertion_id);
+        }
 
         tracing::debug!(
-            db_url = %self.db_url,
             node_id = %self.node_id,
             assertion_id = %assertion_id,
-            expires_at = expires_at,
-            "PostgresAssertionCache: checking assertion ID (falling back to in-memory until postgres crate is wired)"
+            is_replay = is_replay,
+            "PostgresAssertionCache: assertion check complete"
         );
 
-        // Fallback to in-memory check so the system still functions.
-        // This is safe: the in-memory check is strictly more conservative
-        // (it catches replays on the same node; cross-node is the gap).
-        let mut cache = assertion_id_cache()
-            .lock()
-            .map_err(|_| "assertion ID cache lock poisoned".to_string())?;
-        match cache.check_and_record(assertion_id, retention_secs) {
-            Ok(()) => Ok(false),
-            Err(_) => Ok(true),
-        }
+        Ok(is_replay)
     }
 }
 
 /// Factory function to create the appropriate assertion cache backend.
 ///
-/// In military deployment mode (`MILNET_MILITARY_DEPLOYMENT=1`), returns a
-/// `PostgresAssertionCache` if `MILNET_SAML_DB_URL` is set. Falls back to
-/// `InMemoryAssertionCache` with a CRITICAL SIEM alert if the DB URL is missing.
-///
-/// In non-military mode, returns `InMemoryAssertionCache`.
+/// Military mode: requires PostgreSQL or exits (MLP mode allows fallback).
+/// Non-military: in-memory with SIEM warning.
 pub fn create_assertion_cache() -> Box<dyn DistributedAssertionCache> {
     if is_military_deployment() {
         if let Ok(db_url) = std::env::var("MILNET_SAML_DB_URL") {
             if !db_url.is_empty() {
                 let node_id = std::env::var("MILNET_NODE_ID")
                     .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+                let cache = PostgresAssertionCache::new(db_url, node_id.clone());
+                if cache.pool.is_none() {
+                    if crate::config::is_mlp_mode() {
+                        tracing::warn!(
+                            target: "siem",
+                            "SIEM:WARNING MLP mode: PostgresAssertionCache pool init failed, \
+                             falling back to in-memory."
+                        );
+                        warn_if_no_distributed_cache();
+                        return Box::new(cache);
+                    }
+                    tracing::error!(
+                        target: "siem",
+                        "SIEM:CRITICAL PostgresAssertionCache pool init failed in military mode."
+                    );
+                    SecurityEvent::crypto_failure(
+                        "PostgresAssertionCache pool init failed in military mode.",
+                    );
+                    std::process::exit(78);
+                }
                 tracing::info!(
-                    "SAML assertion cache: using PostgreSQL backend for military deployment (node={})",
+                    "SAML assertion cache: PostgreSQL backend active (node={})",
                     node_id
                 );
-                return Box::new(PostgresAssertionCache::new(db_url, node_id));
+                return Box::new(cache);
             }
         }
-        // Military mode but no DB URL configured -- REFUSE to start.
+        if crate::config::is_mlp_mode() {
+            tracing::warn!(
+                target: "siem",
+                "SIEM:WARNING MLP mode: MILNET_SAML_DB_URL not set, in-memory fallback."
+            );
+            warn_if_no_distributed_cache();
+            return Box::new(InMemoryAssertionCache);
+        }
         tracing::error!(
             target: "siem",
             "SIEM:CRITICAL Military deployment requires distributed SAML assertion cache. \

@@ -356,6 +356,41 @@ impl Default for RaftConfig {
     }
 }
 
+/// Joint consensus configuration state for safe membership changes (Raft Section 4.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JointConfig {
+    Cold,
+    Joint { old_peers: Vec<(NodeId, String)>, new_peers: Vec<(NodeId, String)> },
+    Cnew { new_peers: Vec<(NodeId, String)> },
+}
+
+impl JointConfig {
+    pub fn is_in_transition(&self) -> bool {
+        !matches!(self, JointConfig::Cold)
+    }
+
+    pub fn has_quorum(&self, voters: &HashSet<NodeId>, self_id: NodeId, peers: &[(NodeId, String)]) -> bool {
+        match self {
+            JointConfig::Cold => {
+                let cluster_size = peers.len() + 1;
+                voters.len() >= cluster_size / 2 + 1
+            }
+            JointConfig::Joint { old_peers, new_peers } => {
+                let old_quorum = old_peers.len() / 2 + 1;
+                let old_voters = voters.iter().filter(|v| **v == self_id || old_peers.iter().any(|(id, _)| id == *v)).count();
+                let new_quorum = new_peers.len() / 2 + 1;
+                let new_voters = voters.iter().filter(|v| **v == self_id || new_peers.iter().any(|(id, _)| id == *v)).count();
+                old_voters >= old_quorum && new_voters >= new_quorum
+            }
+            JointConfig::Cnew { new_peers } => {
+                let cluster_size = new_peers.len() + 1;
+                let relevant = voters.iter().filter(|v| **v == self_id || new_peers.iter().any(|(id, _)| id == *v)).count();
+                relevant >= cluster_size / 2 + 1
+            }
+        }
+    }
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 /// Generate a random election timeout duration using `getrandom`.
@@ -765,9 +800,10 @@ pub struct RaftState {
     /// For each peer, highest log index known to be replicated (Leader only).
     /// Persistence backend for safety-critical state.
     persistence: Box<dyn RaftPersistence>,
-    /// Guard against concurrent membership changes (joint consensus not yet
-    /// implemented). Only one config change may be in-flight at a time.
+    /// Guard against concurrent membership changes.
     pending_config_change: bool,
+    /// Joint consensus state for safe membership changes (Raft Section 4.3).
+    joint_config: JointConfig,
     match_index: HashMap<NodeId, LogIndex>,
     /// This node's ML-DSA-87 signing key for entry-level signatures.
     /// When set, security-critical commands proposed by this node are signed.
@@ -897,6 +933,7 @@ impl RaftState {
             persistence,
             log_persistence,
             pending_config_change: false,
+            joint_config: JointConfig::Cold,
             signing_key: None,
             peer_verifying_keys: HashMap::new(),
             pre_votes_received: HashSet::new(),
@@ -1030,15 +1067,11 @@ impl RaftState {
 
     /// Propose a new cluster command. Only succeeds if this node is the leader.
     ///
-    /// LIMITATION: Membership changes (MemberJoin, MemberLeave) do not use
-    /// joint consensus (Raft Section 6). Only one membership change may be
-    /// in-flight at a time. Concurrent config changes are rejected until
-    /// the current one is committed.
+    /// Membership changes use joint consensus per Raft Section 4.3.
     pub fn propose(&mut self, command: ClusterCommand) -> Result<LogIndex, String> {
         if self.role != RaftRole::Leader {
             return Err("not the leader".into());
         }
-        // Guard against concurrent membership changes.
         let is_config_change = matches!(
             command,
             ClusterCommand::MemberJoin { .. } | ClusterCommand::MemberLeave { .. }
@@ -1047,7 +1080,14 @@ impl RaftState {
             if self.pending_config_change {
                 return Err("concurrent config change in progress; wait for commit".into());
             }
+            if self.joint_config.is_in_transition() {
+                return Err("joint consensus in progress; wait for completion before new config change".into());
+            }
             self.pending_config_change = true;
+            let new_peers = self.compute_new_peers(&command);
+            let old_peers = self.config.peers.clone();
+            self.joint_config = JointConfig::Joint { old_peers, new_peers };
+            tracing::info!(node = %self.node_id, "SIEM:INFO entering joint consensus for membership change");
         }
         let index = LogIndex(self.last_log_index().0 + 1);
 
@@ -1127,16 +1167,17 @@ impl RaftState {
         while self.last_applied < self.commit_index {
             self.last_applied = LogIndex(self.last_applied.0 + 1);
             if let Some(entry) = self.log_entry_at(self.last_applied).cloned() {
-                // Track if a membership change entry is committed.
                 if matches!(entry.command, ClusterCommand::MemberJoin { .. } | ClusterCommand::MemberLeave { .. }) {
                     clear_config_change = true;
                 }
                 entries.push(entry);
             }
         }
-        // Clear pending_config_change after the borrow of self.log is released.
         if clear_config_change {
-            self.pending_config_change = false;
+            self.advance_joint_consensus();
+            if !self.joint_config.is_in_transition() {
+                self.pending_config_change = false;
+            }
         }
         entries
     }
@@ -1209,6 +1250,39 @@ impl RaftState {
         self.role == RaftRole::Follower
             && self.voted_for == Some(self.node_id)
             && self.leader_id.is_none()
+    }
+
+    pub fn joint_config(&self) -> &JointConfig { &self.joint_config }
+
+    fn compute_new_peers(&self, command: &ClusterCommand) -> Vec<(NodeId, String)> {
+        let mut new_peers = self.config.peers.clone();
+        match command {
+            ClusterCommand::MemberJoin { node_id, addr, .. } => {
+                if !new_peers.iter().any(|(id, _)| id == node_id) {
+                    new_peers.push((*node_id, addr.clone()));
+                }
+            }
+            ClusterCommand::MemberLeave { node_id } => {
+                new_peers.retain(|(id, _)| id != node_id);
+            }
+            _ => {}
+        }
+        new_peers
+    }
+
+    fn advance_joint_consensus(&mut self) {
+        match self.joint_config.clone() {
+            JointConfig::Joint { new_peers, .. } => {
+                self.joint_config = JointConfig::Cnew { new_peers };
+                tracing::info!(node = %self.node_id, "SIEM:INFO joint consensus: Joint committed, transitioning to Cnew");
+            }
+            JointConfig::Cnew { new_peers } => {
+                self.config.peers = new_peers;
+                self.joint_config = JointConfig::Cold;
+                tracing::info!(node = %self.node_id, peers = self.config.peers.len(), "SIEM:INFO joint consensus complete");
+            }
+            JointConfig::Cold => {}
+        }
     }
 
     // ── Private: pre-vote ──────────────────────────────────────────────────

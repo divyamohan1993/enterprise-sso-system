@@ -24,6 +24,51 @@ use uuid::Uuid;
 
 use crate::multi_tenancy::{TenantContext, TenantId};
 
+// ── Blind index helpers ────────────────────────────────────────────────────
+
+/// Compute HMAC-SHA512 blind index for a username.
+/// Returns hex-encoded hash suitable for `username_blind_idx` column lookups.
+/// All nodes MUST use the same HMAC key (derived from master KEK via HKDF-SHA512).
+pub fn compute_username_blind_idx(username: &str, hmac_key: &[u8]) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha512;
+    type HmacSha512 = Hmac<Sha512>;
+    let mut mac = HmacSha512::new_from_slice(hmac_key)
+        .unwrap_or_else(|_| unreachable!("HMAC-SHA512 accepts any key length per RFC 2104"));
+    mac.update(b"MILNET-USERNAME-BLIND-v1:");
+    mac.update(username.as_bytes());
+    let result = mac.finalize().into_bytes();
+    hex::encode(result)
+}
+
+/// Compute HMAC-SHA512 blind index for an email address.
+/// Returns hex-encoded hash suitable for `email_hash` column lookups.
+pub fn compute_email_blind_idx(email: &str, hmac_key: &[u8]) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha512;
+    type HmacSha512 = Hmac<Sha512>;
+    let mut mac = HmacSha512::new_from_slice(hmac_key)
+        .unwrap_or_else(|_| unreachable!("HMAC-SHA512 accepts any key length per RFC 2104"));
+    mac.update(b"MILNET-EMAIL-BLIND-v1:");
+    mac.update(email.as_bytes());
+    let result = mac.finalize().into_bytes();
+    hex::encode(result)
+}
+
+/// Derive the blind-index HMAC key from master KEK via HKDF-SHA512.
+pub fn derive_blind_index_key(master_kek: &[u8; 32]) -> [u8; 64] {
+    use hkdf::Hkdf;
+    use sha2::Sha512;
+    let hk = Hkdf::<Sha512>::new(Some(b"MILNET-BLIND-INDEX-SALT-v1"), master_kek);
+    let mut okm = [0u8; 64];
+    hk.expand(b"MILNET-BLIND-INDEX-KEY-v1", &mut okm)
+        .unwrap_or_else(|e| {
+            tracing::error!("FATAL: HKDF expansion failed for blind index key: {e}");
+            std::process::exit(199);
+        });
+    okm
+}
+
 // ---------------------------------------------------------------------------
 // Database operating mode — graceful degradation
 // ---------------------------------------------------------------------------
@@ -734,6 +779,10 @@ pub async fn init_database(database_url: &str) -> Result<PgPool, String> {
     "#).execute(&pool).await.map_err(|e| format!("Failed to create key_material table: {e}"))?;
 
     // Migration: add email and auth_provider columns for Google OAuth
+    // DEPRECATED: plaintext `email` column retained only for backward compatibility.
+    // All lookups MUST use email_hash (blind index) + email_encrypted (decrypt for display).
+    // In military mode this column is ignored. Will be DROPped when feature flag
+    // `MILNET_DROP_PLAINTEXT_EMAIL=1` is enabled.
     if let Err(e) = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(255)")
         .execute(&pool).await {
         tracing::warn!("migration: add email column failed: {}", e);
@@ -760,6 +809,59 @@ pub async fn init_database(database_url: &str) -> Result<PgPool, String> {
     if let Err(e) = sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS users_email_hash_unique ON users (email_hash) WHERE email_hash IS NOT NULL")
         .execute(&pool).await {
         tracing::warn!("migration: create users_email_hash_unique index failed: {}", e);
+    }
+
+    // Migration: DROP plaintext email column when feature flag is enabled.
+    // Guarded by MILNET_DROP_PLAINTEXT_EMAIL=1 for backward compatibility during rollout.
+    if std::env::var("MILNET_DROP_PLAINTEXT_EMAIL").as_deref() == Ok("1") {
+        if let Err(e) = sqlx::query("ALTER TABLE users DROP COLUMN IF EXISTS email")
+            .execute(&pool).await {
+            tracing::error!("migration: DROP plaintext email column failed: {}", e);
+        } else {
+            tracing::info!("migration: plaintext email column dropped successfully");
+        }
+    }
+
+    // Migration: add username_blind_idx for HMAC-SHA512 blind index lookups (replaces plaintext username queries)
+    if let Err(e) = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS username_blind_idx VARCHAR(255)")
+        .execute(&pool).await {
+        tracing::warn!("migration: add username_blind_idx column failed: {}", e);
+    }
+    if let Err(e) = sqlx::query("CREATE INDEX IF NOT EXISTS users_username_blind_idx ON users (username_blind_idx) WHERE username_blind_idx IS NOT NULL")
+        .execute(&pool).await {
+        tracing::warn!("migration: create users_username_blind_idx index failed: {}", e);
+    }
+
+    // Migration: add username_encrypted for envelope-encrypted username storage
+    if let Err(e) = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS username_encrypted BYTEA")
+        .execute(&pool).await {
+        tracing::warn!("migration: add username_encrypted column failed: {}", e);
+    }
+
+    // DEPRECATED: plaintext `username` column retained for rolling migration only.
+    // All new lookups MUST use username_blind_idx. In military mode, plaintext column
+    // is ignored entirely. Will be dropped in a future migration.
+
+    // In military mode: verify plaintext email column does not contain live data.
+    if crate::config::require_hardware_security() {
+        tracing::warn!("MILITARY MODE: plaintext username/email columns are deprecated. Use blind indexes only.");
+        let plaintext_email_count: Option<(i64,)> = sqlx::query_as(
+            "SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'email'"
+        ).fetch_optional(&pool).await.map_err(|e| format!("military check failed: {e}"))?;
+        if let Some((count,)) = plaintext_email_count {
+            if count > 0 {
+                let data_count: (i64,) = sqlx::query_as(
+                    "SELECT COUNT(*) FROM users WHERE email IS NOT NULL AND email != ''"
+                ).fetch_one(&pool).await.map_err(|e| format!("military check failed: {e}"))?;
+                if data_count.0 > 0 {
+                    panic!(
+                        "MILITARY MODE VIOLATION: {} rows still have plaintext email data. \
+                         Run migration or set MILNET_DROP_PLAINTEXT_EMAIL=1",
+                        data_count.0
+                    );
+                }
+            }
+        }
     }
 
     sqlx::query(r#"
@@ -894,6 +996,9 @@ impl TenantAwarePool {
     }
 
     /// Insert a user scoped to the current tenant.
+    ///
+    /// Writes both the plaintext username (deprecated, for migration compatibility)
+    /// and the HMAC-SHA512 blind index for O(1) lookups without decryption.
     pub async fn insert_user(
         &self,
         id: Uuid,
@@ -907,16 +1012,28 @@ impl TenantAwarePool {
         let stmt = format!("SET LOCAL app.current_tenant_id = '{}'", tenant_id);
         sqlx::query(&stmt).execute(&mut *tx).await?;
 
+        // Compute blind index for username lookup without decryption
+        let blind_idx = if let Ok(kek) = std::panic::catch_unwind(|| {
+            *crate::sealed_keys::cached_master_kek()
+        }) {
+            let hmac_key = derive_blind_index_key(&kek);
+            Some(compute_username_blind_idx(username, &hmac_key))
+        } else {
+            tracing::warn!("KEK unavailable: username_blind_idx not set for user {}", id);
+            None
+        };
+
         sqlx::query(
-            "INSERT INTO users (id, tenant_id, username, opaque_registration, tier, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6)"
+            "INSERT INTO users (id, tenant_id, username, opaque_registration, tier, created_at, username_blind_idx) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)"
         )
         .bind(id)
         .bind(tenant_id)
-        .bind(username)
+        .bind(username) // DEPRECATED: plaintext column retained for rolling migration
         .bind(opaque_registration)
         .bind(tier)
         .bind(created_at)
+        .bind(blind_idx.as_deref())
         .execute(&mut *tx)
         .await?;
 
@@ -925,11 +1042,35 @@ impl TenantAwarePool {
     }
 
     /// Query a user by username, scoped to the current tenant.
+    ///
+    /// In military mode: uses HMAC-SHA512 blind index (`username_blind_idx`) for lookup.
+    /// Fallback: uses plaintext `username` column (deprecated, migration only).
     pub async fn get_user_by_username(
         &self,
         username: &str,
     ) -> Result<Option<(Uuid, String, Option<Vec<u8>>, i32, i64, bool)>, sqlx::Error> {
         let tenant_id = Self::require_tenant_id()?;
+
+        // In military/production mode, use blind index for lookup
+        let use_blind_index = std::panic::catch_unwind(|| {
+            *crate::sealed_keys::cached_master_kek()
+        }).ok();
+
+        if let Some(kek) = use_blind_index {
+            let hmac_key = derive_blind_index_key(&kek);
+            let blind_idx = compute_username_blind_idx(username, &hmac_key);
+            let row: Option<(Uuid, String, Option<Vec<u8>>, i32, i64, bool)> = sqlx::query_as(
+                "SELECT id, username, opaque_registration, tier, created_at, is_active \
+                 FROM users WHERE tenant_id = $1 AND username_blind_idx = $2"
+            )
+            .bind(tenant_id)
+            .bind(&blind_idx)
+            .fetch_optional(&self.pool)
+            .await?;
+            return Ok(row);
+        }
+
+        // Fallback: plaintext column (deprecated, pre-migration data)
         let row: Option<(Uuid, String, Option<Vec<u8>>, i32, i64, bool)> = sqlx::query_as(
             "SELECT id, username, opaque_registration, tier, created_at, is_active \
              FROM users WHERE tenant_id = $1 AND username = $2"

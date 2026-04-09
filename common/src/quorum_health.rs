@@ -4,38 +4,103 @@
 //! Tracked subsystems:
 //! - **Raft consensus**: needs majority (3 of 5) for leader election
 //! - **FROST signing**: needs threshold (3 of 5) for token issuance
-//! - **BFT audit**: needs 2f+1 honest nodes (5 of 7) for Byzantine fault tolerance
+//! - **BFT audit**: needs 2f+1 honest nodes (7 of 11) for Byzantine fault tolerance
 //! - **Shamir KEK**: needs threshold (3 of 5) for key reconstruction
 
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 // ---------------------------------------------------------------------------
-// Thresholds (matching system architecture: 5-node Raft, 3-of-5 FROST/KEK, 7-node BFT)
+// BFT configuration (shared with audit/src/bft.rs)
 // ---------------------------------------------------------------------------
 
-/// Raft requires strict majority: ceil(5/2)+1 = 3.
+/// Configurable BFT parameters. Both quorum_health and audit BFT modules
+/// must reference the same configuration to prevent quorum mismatches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BftConfig {
+    /// Total number of BFT audit nodes in the cluster.
+    pub total_nodes: u32,
+    /// Maximum number of Byzantine (faulty) nodes tolerated: f = floor((n-1)/3).
+    pub max_byzantine: u32,
+    /// Quorum size required for BFT agreement: 2f + 1.
+    pub quorum_size: u32,
+}
+
+impl BftConfig {
+    /// Create a new BFT configuration. Panics if the invariant
+    /// `quorum_size == 2 * max_byzantine + 1` is violated.
+    pub fn new(total_nodes: u32, max_byzantine: u32, quorum_size: u32) -> Self {
+        assert_eq!(
+            quorum_size,
+            2 * max_byzantine + 1,
+            "BFT invariant violated: quorum_size ({}) must equal 2 * max_byzantine ({}) + 1 = {}",
+            quorum_size,
+            max_byzantine,
+            2 * max_byzantine + 1,
+        );
+        assert!(
+            total_nodes >= quorum_size,
+            "BFT invariant violated: total_nodes ({}) must be >= quorum_size ({})",
+            total_nodes,
+            quorum_size,
+        );
+        Self {
+            total_nodes,
+            max_byzantine,
+            quorum_size,
+        }
+    }
+
+    /// Load BFT configuration from environment or use the default 11-node cluster.
+    pub fn from_env() -> Self {
+        let total_nodes: u32 = std::env::var("MILNET_BFT_TOTAL_NODES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(11);
+        let max_byzantine: u32 = std::env::var("MILNET_BFT_MAX_BYZANTINE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+        let quorum_size = 2 * max_byzantine + 1;
+        Self::new(total_nodes, max_byzantine, quorum_size)
+    }
+
+    /// Validate that another node's BFT config matches ours.
+    pub fn validate_peer_config(&self, peer_config: &BftConfig) -> Result<(), String> {
+        if self != peer_config {
+            return Err(format!(
+                "BFT config mismatch: local(n={},f={},q={}) vs peer(n={},f={},q={})",
+                self.total_nodes, self.max_byzantine, self.quorum_size,
+                peer_config.total_nodes, peer_config.max_byzantine, peer_config.quorum_size,
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for BftConfig {
+    fn default() -> Self {
+        Self::new(11, 3, 7)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Thresholds
+// ---------------------------------------------------------------------------
+
 const RAFT_QUORUM: u32 = 3;
-/// FROST threshold for signing.
 const FROST_THRESHOLD: u32 = 3;
-/// BFT requires 2f+1 honest nodes. With f=2 (7-node cluster), need 5.
-const BFT_QUORUM: u32 = 5;
-/// Shamir KEK reconstruction threshold.
 const KEK_THRESHOLD: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // QuorumStatus
 // ---------------------------------------------------------------------------
 
-/// Overall cluster quorum status.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QuorumStatus {
-    /// All subsystems at or above quorum.
     Healthy,
-    /// Some subsystems below quorum but at least one distributed protocol still works.
     Degraded { systems: Vec<&'static str> },
-    /// Multiple subsystems below quorum. Cluster barely operational.
     Critical,
-    /// Cannot operate any distributed protocol. Node must enter emergency mode.
     QuorumLost,
 }
 
@@ -43,41 +108,43 @@ pub enum QuorumStatus {
 // QuorumHealth
 // ---------------------------------------------------------------------------
 
-/// Tracks live peer counts for each distributed subsystem.
-///
-/// All fields are atomic so any thread (heartbeat receiver, health checker,
-/// API handler) can update or read without locks.
 pub struct QuorumHealth {
-    /// Number of Raft peers responding (including self).
     pub raft_healthy_peers: AtomicU32,
-    /// Number of FROST signers available for threshold signing.
     pub frost_available_signers: AtomicU32,
-    /// Number of BFT nodes believed honest.
     pub bft_honest_nodes: AtomicU32,
-    /// Number of KEK share holders reachable.
     pub kek_available_shares: AtomicU32,
+    bft_config: BftConfig,
 }
 
 impl QuorumHealth {
-    /// Create a new health tracker. Starts with zero across the board
-    /// (conservative: assume nothing until proven healthy).
     pub fn new() -> Self {
+        Self::with_bft_config(BftConfig::default())
+    }
+
+    pub fn with_bft_config(bft_config: BftConfig) -> Self {
         Self {
             raft_healthy_peers: AtomicU32::new(0),
             frost_available_signers: AtomicU32::new(0),
             bft_honest_nodes: AtomicU32::new(0),
             kek_available_shares: AtomicU32::new(0),
+            bft_config,
         }
     }
 
-    /// Create a tracker initialized to healthy values (useful for tests).
     pub fn new_healthy() -> Self {
+        let bft_config = BftConfig::default();
+        let total = bft_config.total_nodes;
         Self {
             raft_healthy_peers: AtomicU32::new(5),
             frost_available_signers: AtomicU32::new(5),
-            bft_honest_nodes: AtomicU32::new(7),
+            bft_honest_nodes: AtomicU32::new(total),
             kek_available_shares: AtomicU32::new(5),
+            bft_config,
         }
+    }
+
+    pub fn bft_config(&self) -> &BftConfig {
+        &self.bft_config
     }
 
     pub fn update_raft_peers(&self, count: u32) {
@@ -96,7 +163,6 @@ impl QuorumHealth {
         self.kek_available_shares.store(count, Ordering::SeqCst);
     }
 
-    /// Assess overall quorum status across all subsystems.
     pub fn assess(&self) -> QuorumStatus {
         let raft = self.raft_healthy_peers.load(Ordering::SeqCst);
         let frost = self.frost_available_signers.load(Ordering::SeqCst);
@@ -105,7 +171,7 @@ impl QuorumHealth {
 
         let raft_ok = raft >= RAFT_QUORUM;
         let frost_ok = frost >= FROST_THRESHOLD;
-        let bft_ok = bft >= BFT_QUORUM;
+        let bft_ok = bft >= self.bft_config.quorum_size;
         let kek_ok = kek >= KEK_THRESHOLD;
 
         let all_ok = raft_ok && frost_ok && bft_ok && kek_ok;
@@ -114,27 +180,16 @@ impl QuorumHealth {
         if all_ok {
             return QuorumStatus::Healthy;
         }
-
         if none_ok {
             return QuorumStatus::QuorumLost;
         }
 
-        // Collect degraded subsystems
         let mut degraded = Vec::new();
-        if !raft_ok {
-            degraded.push("raft");
-        }
-        if !frost_ok {
-            degraded.push("frost");
-        }
-        if !bft_ok {
-            degraded.push("bft");
-        }
-        if !kek_ok {
-            degraded.push("kek");
-        }
+        if !raft_ok { degraded.push("raft"); }
+        if !frost_ok { degraded.push("frost"); }
+        if !bft_ok { degraded.push("bft"); }
+        if !kek_ok { degraded.push("kek"); }
 
-        // Critical: 3+ subsystems down, or both consensus and signing down
         if degraded.len() >= 3 || (!raft_ok && !frost_ok) {
             QuorumStatus::Critical
         } else {
@@ -142,12 +197,6 @@ impl QuorumHealth {
         }
     }
 
-    /// Return HTTP-style status for the `/health` endpoint.
-    ///
-    /// - `200 OK` when healthy
-    /// - `200 DEGRADED` when degraded (still serving reads)
-    /// - `503 CRITICAL_DEGRADATION` when critical
-    /// - `503 QUORUM_LOST` when all quorums lost
     pub fn health_endpoint_status(&self) -> (u16, &'static str) {
         match self.assess() {
             QuorumStatus::Healthy => (200, "OK"),
@@ -164,9 +213,9 @@ impl Default for QuorumHealth {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+pub fn bft_quorum() -> u32 {
+    BftConfig::default().quorum_size
+}
 
 #[cfg(test)]
 mod tests {
@@ -188,7 +237,7 @@ mod tests {
     #[test]
     fn single_subsystem_degraded_bft() {
         let qh = QuorumHealth::new_healthy();
-        qh.update_bft_nodes(4); // below 5
+        qh.update_bft_nodes(6);
         let status = qh.assess();
         assert!(matches!(status, QuorumStatus::Degraded { ref systems } if systems == &["bft"]));
         assert_eq!(qh.health_endpoint_status(), (200, "DEGRADED"));
@@ -197,7 +246,7 @@ mod tests {
     #[test]
     fn single_subsystem_degraded_kek() {
         let qh = QuorumHealth::new_healthy();
-        qh.update_kek_shares(2); // below 3
+        qh.update_kek_shares(2);
         let status = qh.assess();
         assert!(matches!(status, QuorumStatus::Degraded { ref systems } if systems == &["kek"]));
     }
@@ -233,20 +282,22 @@ mod tests {
 
     #[test]
     fn boundary_exactly_at_threshold() {
+        let bft_q = bft_quorum();
         let qh = QuorumHealth::new();
         qh.update_raft_peers(RAFT_QUORUM);
         qh.update_frost_signers(FROST_THRESHOLD);
-        qh.update_bft_nodes(BFT_QUORUM);
+        qh.update_bft_nodes(bft_q);
         qh.update_kek_shares(KEK_THRESHOLD);
         assert_eq!(qh.assess(), QuorumStatus::Healthy);
     }
 
     #[test]
     fn boundary_one_below_threshold() {
+        let bft_q = bft_quorum();
         let qh = QuorumHealth::new();
         qh.update_raft_peers(RAFT_QUORUM - 1);
         qh.update_frost_signers(FROST_THRESHOLD);
-        qh.update_bft_nodes(BFT_QUORUM);
+        qh.update_bft_nodes(bft_q);
         qh.update_kek_shares(KEK_THRESHOLD);
         let status = qh.assess();
         assert!(matches!(status, QuorumStatus::Degraded { ref systems } if systems == &["raft"]));
@@ -254,10 +305,11 @@ mod tests {
 
     #[test]
     fn degraded_two_non_critical_subsystems() {
+        let bft_q = bft_quorum();
         let qh = QuorumHealth::new();
         qh.update_raft_peers(RAFT_QUORUM);
         qh.update_frost_signers(FROST_THRESHOLD);
-        qh.update_bft_nodes(BFT_QUORUM - 1);
+        qh.update_bft_nodes(bft_q - 1);
         qh.update_kek_shares(KEK_THRESHOLD - 1);
         let status = qh.assess();
         assert!(matches!(status, QuorumStatus::Degraded { ref systems } if systems.len() == 2));
@@ -284,8 +336,8 @@ mod tests {
         assert_eq!(qh.raft_healthy_peers.load(Ordering::SeqCst), 5);
         qh.update_frost_signers(4);
         assert_eq!(qh.frost_available_signers.load(Ordering::SeqCst), 4);
-        qh.update_bft_nodes(7);
-        assert_eq!(qh.bft_honest_nodes.load(Ordering::SeqCst), 7);
+        qh.update_bft_nodes(11);
+        assert_eq!(qh.bft_honest_nodes.load(Ordering::SeqCst), 11);
         qh.update_kek_shares(3);
         assert_eq!(qh.kek_available_shares.load(Ordering::SeqCst), 3);
     }
@@ -294,18 +346,36 @@ mod tests {
     fn transition_healthy_to_degraded_to_critical_to_lost() {
         let qh = QuorumHealth::new_healthy();
         assert_eq!(qh.assess(), QuorumStatus::Healthy);
-
-        // Degrade one
         qh.update_bft_nodes(3);
         assert!(matches!(qh.assess(), QuorumStatus::Degraded { .. }));
-
-        // Lose consensus + signing
         qh.update_raft_peers(1);
         qh.update_frost_signers(1);
         assert_eq!(qh.assess(), QuorumStatus::Critical);
-
-        // Lose everything
         qh.update_kek_shares(0);
         assert_eq!(qh.assess(), QuorumStatus::QuorumLost);
+    }
+
+    #[test]
+    fn bft_config_invariant_holds() {
+        let cfg = BftConfig::default();
+        assert_eq!(cfg.total_nodes, 11);
+        assert_eq!(cfg.max_byzantine, 3);
+        assert_eq!(cfg.quorum_size, 7);
+        assert_eq!(cfg.quorum_size, 2 * cfg.max_byzantine + 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "BFT invariant violated")]
+    fn bft_config_rejects_bad_quorum() {
+        BftConfig::new(11, 3, 5);
+    }
+
+    #[test]
+    fn bft_config_peer_validation() {
+        let local = BftConfig::default();
+        let same = BftConfig::default();
+        assert!(local.validate_peer_config(&same).is_ok());
+        let different = BftConfig::new(7, 2, 5);
+        assert!(local.validate_peer_config(&different).is_err());
     }
 }

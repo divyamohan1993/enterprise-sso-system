@@ -218,7 +218,15 @@ impl EncryptedPool {
 
 impl Drop for EncryptedPool {
     fn drop(&mut self) {
-        // SAFETY: munlock is a memory-protection syscall, safe to call.
+        // Defense-in-depth: volatile zero + compiler fence before munlock.
+        #[allow(unsafe_code)]
+        unsafe {
+            let ptr = self.master_kek.as_mut_ptr();
+            let len = self.master_kek.len();
+            core::ptr::write_volatile(ptr, 0u8);
+            core::ptr::write_bytes(ptr, 0, len);
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        }
         #[cfg(unix)]
         #[allow(unsafe_code)]
         unsafe {

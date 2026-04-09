@@ -357,13 +357,15 @@ impl RefreshTokenStore {
             tracing::error!("FATAL: CSPRNG failure in refresh token generation: {e}");
             std::process::exit(1);
         });
-        let token_value = format!("rt_{}", hex::encode(token_bytes));
+        let mut token_value = format!("rt_{}", hex::encode(token_bytes));
         zeroize::Zeroize::zeroize(&mut token_bytes);
         let now = common::secure_time::secure_now_secs_i64();
+        let token_key = token_value.clone();
+        let token_stored = token_value.clone();
         self.tokens.insert(
-            token_value.clone(),
+            token_key,
             RefreshToken {
-                token: token_value.clone(),
+                token: token_stored,
                 user_id,
                 client_id: client_id.to_string(),
                 scope: scope.to_string(),
@@ -372,7 +374,10 @@ impl RefreshTokenStore {
                 family_id: family_id.to_string(),
             },
         );
-        token_value
+        // Zeroize the working copy of the hex-encoded token secret.
+        let ret = token_value.clone();
+        zeroize::Zeroize::zeroize(&mut token_value);
+        ret
     }
 
     /// Redeem a refresh token: validates it, marks as used, and issues a

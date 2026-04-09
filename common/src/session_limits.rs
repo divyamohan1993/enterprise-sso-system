@@ -520,6 +520,127 @@ impl DistributedSessionTracker {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Session Invalidation on Privilege Change
+// ---------------------------------------------------------------------------
+
+/// Reason for session invalidation. Logged to SIEM for audit trail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionInvalidationReason {
+    /// User changed their password.
+    PasswordChanged,
+    /// User's role was changed.
+    RoleChanged,
+    /// User received elevated permissions.
+    PermissionEscalation,
+    /// Security incident detected.
+    SecurityIncident,
+    /// Administrative action.
+    AdminAction,
+}
+
+impl SessionInvalidationReason {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::PasswordChanged => "password_changed",
+            Self::RoleChanged => "role_changed",
+            Self::PermissionEscalation => "permission_escalation",
+            Self::SecurityIncident => "security_incident",
+            Self::AdminAction => "admin_action",
+        }
+    }
+}
+
+impl SessionTracker {
+    /// Invalidate ALL sessions for a user due to a privilege or security event.
+    /// Distinct from `remove_all_sessions` (GDPR deletion) -- this logs the reason.
+    pub fn invalidate_sessions_for_user(
+        &self,
+        user_id: &Uuid,
+        reason: SessionInvalidationReason,
+    ) -> usize {
+        let mut active = self.active.lock().unwrap_or_else(|e| {
+            tracing::error!(
+                target: "siem",
+                category = "security",
+                action = "mutex_poisoning_recovered",
+                "SessionTracker mutex poisoned in invalidate_sessions_for_user - recovering"
+            );
+            e.into_inner()
+        });
+        let count = active
+            .get(user_id)
+            .map(|sessions| sessions.len())
+            .unwrap_or(0);
+        active.remove(user_id);
+
+        if count > 0 {
+            crate::siem::SecurityEvent::session_revoked(
+                &user_id.to_string(),
+                &format!("privilege_change:{}", reason.as_str()),
+            );
+            tracing::info!(
+                target: "siem",
+                user_id = %user_id,
+                reason = reason.as_str(),
+                sessions_invalidated = count,
+                "SIEM:INFO All sessions invalidated for user due to privilege change"
+            );
+        }
+
+        count
+    }
+
+    /// Hook called when a user's privileges change.
+    pub fn on_privilege_change(
+        &self,
+        user_id: &Uuid,
+        reason: SessionInvalidationReason,
+    ) -> usize {
+        self.invalidate_sessions_for_user(user_id, reason)
+    }
+}
+
+impl DistributedSessionTracker {
+    /// Invalidate all sessions for a user across cache and database.
+    pub async fn invalidate_sessions_for_user(
+        &self,
+        user_id: &Uuid,
+        reason: SessionInvalidationReason,
+    ) -> Result<usize, String> {
+        let cache_count = self.cache.invalidate_sessions_for_user(user_id, reason);
+
+        let db_result = sqlx::query("DELETE FROM active_sessions WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("invalidate sessions in DB: {e}"))?;
+
+        let db_count = db_result.rows_affected() as usize;
+        let total = cache_count.max(db_count);
+
+        tracing::info!(
+            target: "siem",
+            user_id = %user_id,
+            reason = reason.as_str(),
+            cache_invalidated = cache_count,
+            db_invalidated = db_count,
+            "SIEM:INFO DistributedSessionTracker: sessions invalidated on privilege change"
+        );
+
+        Ok(total)
+    }
+
+    /// Hook for privilege change events.
+    pub async fn on_privilege_change(
+        &self,
+        user_id: &Uuid,
+        reason: SessionInvalidationReason,
+    ) -> Result<usize, String> {
+        self.invalidate_sessions_for_user(user_id, reason).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,5 +705,62 @@ mod tests {
         let removed = tracker.cleanup_inactive(1500, 1000);
         assert_eq!(removed, 0);
         assert_eq!(tracker.active_count(&user), 1);
+    }
+
+    #[test]
+    fn test_invalidate_sessions_for_user_removes_all() {
+        let tracker = SessionTracker::new(5);
+        let user = Uuid::new_v4();
+        tracker.register_session(user, Uuid::new_v4(), 1000).unwrap();
+        tracker.register_session(user, Uuid::new_v4(), 1000).unwrap();
+        tracker.register_session(user, Uuid::new_v4(), 1000).unwrap();
+        assert_eq!(tracker.active_count(&user), 3);
+
+        let invalidated = tracker.invalidate_sessions_for_user(
+            &user,
+            SessionInvalidationReason::PasswordChanged,
+        );
+        assert_eq!(invalidated, 3);
+        assert_eq!(tracker.active_count(&user), 0);
+    }
+
+    #[test]
+    fn test_invalidate_does_not_affect_other_users() {
+        let tracker = SessionTracker::new(5);
+        let user_a = Uuid::new_v4();
+        let user_b = Uuid::new_v4();
+        tracker.register_session(user_a, Uuid::new_v4(), 1000).unwrap();
+        tracker.register_session(user_b, Uuid::new_v4(), 1000).unwrap();
+
+        tracker.invalidate_sessions_for_user(
+            &user_a,
+            SessionInvalidationReason::RoleChanged,
+        );
+        assert_eq!(tracker.active_count(&user_a), 0);
+        assert_eq!(tracker.active_count(&user_b), 1);
+    }
+
+    #[test]
+    fn test_on_privilege_change_hook() {
+        let tracker = SessionTracker::new(5);
+        let user = Uuid::new_v4();
+        tracker.register_session(user, Uuid::new_v4(), 1000).unwrap();
+
+        let count = tracker.on_privilege_change(
+            &user,
+            SessionInvalidationReason::SecurityIncident,
+        );
+        assert_eq!(count, 1);
+        assert_eq!(tracker.active_count(&user), 0);
+    }
+
+    #[test]
+    fn test_invalidate_nonexistent_user() {
+        let tracker = SessionTracker::new(5);
+        let count = tracker.invalidate_sessions_for_user(
+            &Uuid::new_v4(),
+            SessionInvalidationReason::AdminAction,
+        );
+        assert_eq!(count, 0);
     }
 }

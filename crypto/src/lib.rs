@@ -17,6 +17,7 @@
 
 pub mod ct;
 pub mod dpop;
+#[allow(unsafe_code)]
 pub mod drbg;
 pub mod entropy;
 pub mod receipts;
