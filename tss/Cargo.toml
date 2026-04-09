@@ -24,6 +24,7 @@ aes-gcm.workspace = true
 getrandom.workspace = true
 hkdf.workspace = true
 zeroize.workspace = true
+subtle.workspace = true
 
 [features]
 default = ["production"]
