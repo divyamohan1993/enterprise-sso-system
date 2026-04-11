@@ -1726,7 +1726,7 @@ fn test_attack_xwing_pq_kem_produces_real_shared_secrets() {
 
     // Secret must not be all zeros
     assert_ne!(
-        client_secret.as_bytes(), &[0u8; 32],
+        client_secret.as_bytes(), &[0u8; 64],
         "shared secret must not be all zeros"
     );
 
