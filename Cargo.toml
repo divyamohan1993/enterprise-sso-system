@@ -70,7 +70,7 @@ p256 = { version = "0.13", features = ["ecdsa", "ecdh"] }
 libc = "0.2"
 aegis = "0.6"
 pbkdf2 = "0.12"
-cryptoki = "0.10"
+cryptoki = "0.12"
 bs58 = "0.5"
 criterion = { version = "0.5", features = ["html_reports"] }
 insta = { version = "1", features = ["yaml"] }
