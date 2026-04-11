@@ -296,51 +296,101 @@ async fn main() {
         }
 
         // CNSA 2.0 compliant: TLS 1.3 only with AES-256-GCM-SHA384
-        // Post-quantum hybrid key exchange: X25519MLKEM768 preferred, X25519 fallback.
-        // Set MILNET_PQ_TLS_ONLY=1 or MILNET_MILITARY_DEPLOYMENT=1 to remove
-        // classical fallback entirely (CNSA 2.0 strict / military mode).
+        // Post-quantum hybrid key exchange: X25519MLKEM768 is the ONLY group
+        // offered by default (PQ-only). Classical X25519 fallback requires
+        // explicit opt-in via MILNET_ALLOW_CLASSICAL_TLS=1 and is NEVER
+        // permitted in military mode (MILNET_MILITARY_DEPLOYMENT=1).
         //
-        // CNSA 2.0 Level 5 COMPLIANCE NOTE:
+        // CNSA 2.0 Level 5 COMPLIANCE GAP:
         // TLS key exchange uses X25519MLKEM768 (ML-KEM-768, NIST Level 3) because
         // rustls/aws-lc-rs does not yet expose X25519MLKEM1024. When upstream adds
-        // X25519MLKEM1024 support, this MUST be upgraded immediately:
-        //   - https://github.com/rustls/rustls/issues (X25519MLKEM1024 support)
-        //   - https://github.com/aws/aws-lc-rs/issues (ML-KEM-1024 kx group)
+        // X25519MLKEM1024 support, this MUST be upgraded immediately.
         //
         // MITIGATION: All sensitive key exchanges above TLS use the application-layer
         // X-Wing hybrid KEM (X25519 + ML-KEM-1024, NIST Level 5) via crypto::xwing.
         // TLS provides transport-layer PQ protection; X-Wing provides Level 5
-        // application-layer protection. This is defense-in-depth: even if TLS is
-        // broken (requiring a Level 3+ quantum attack), the application layer
-        // remains protected at Level 5.
-        tracing::warn!(
-            "CNSA2-LEVEL5-GAP: TLS key exchange uses ML-KEM-768 (Level 3) instead of \
-             ML-KEM-1024 (Level 5). Awaiting rustls/aws-lc-rs X25519MLKEM1024 support. \
-             Application-layer X-Wing (ML-KEM-1024) provides Level 5 defense-in-depth."
-        );
+        // application-layer protection. Defense-in-depth.
+        //
+        // Set MILNET_TLS_PQ_LEVEL=5 to block startup until ML-KEM-1024 is available.
         let military_mode = std::env::var("MILNET_MILITARY_DEPLOYMENT")
             .map(|v| v == "1")
             .unwrap_or(false);
-        let pq_only = military_mode
-            || std::env::var("MILNET_PQ_TLS_ONLY")
+
+        // CR-10: Enforce MILNET_TLS_PQ_LEVEL=5 or MILNET_REQUIRE_MLKEM1024=1
+        let require_level5 = std::env::var("MILNET_TLS_PQ_LEVEL")
+            .map(|v| v == "5")
+            .unwrap_or(false)
+            || std::env::var("MILNET_REQUIRE_MLKEM1024")
                 .map(|v| v == "1")
                 .unwrap_or(false);
-        let kx_groups: Vec<&'static dyn rustls::crypto::SupportedKxGroup> = if pq_only {
-            tracing::info!(
-                military_mode = military_mode,
-                "PQ-only TLS mode: X25519 classical fallback REMOVED — only X25519MLKEM768 allowed"
+
+        if require_level5 {
+            tracing::error!(
+                target: "siem",
+                category = "security",
+                severity = "CRITICAL",
+                action = "tls_pq_level5_enforcement_failed",
+                "FATAL: MILNET_TLS_PQ_LEVEL=5 (or MILNET_REQUIRE_MLKEM1024=1) is set but \
+                 TLS layer only supports ML-KEM-768 (X25519MLKEM768). CNSA 2.0 requires \
+                 ML-KEM-1024 for TOP SECRET. Refusing to start."
             );
-            vec![
-                rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768,
-            ]
+            std::process::exit(198);
+        }
+
+        // CR-10: SIEM:CRITICAL log in military mode documenting Level 3 gap.
+        // Do NOT abort: app-layer X-Wing provides Level 5 defense-in-depth.
+        if military_mode {
+            tracing::error!(
+                target: "siem",
+                category = "security",
+                severity = "CRITICAL",
+                action = "tls_pq_level3_gap",
+                "SIEM:CRITICAL: MILNET_MILITARY_DEPLOYMENT=1 but gateway TLS key exchange \
+                 uses ML-KEM-768 (NIST Level 3) instead of ML-KEM-1024 (NIST Level 5). \
+                 rustls/aws-lc-rs does not yet expose X25519MLKEM1024. Application-layer \
+                 X-Wing (ML-KEM-1024, Level 5) provides defense-in-depth. Set \
+                 MILNET_TLS_PQ_LEVEL=5 to block startup until upstream adds support."
+            );
+        }
+
+        // CR-11: PQ-only is the DEFAULT. Classical X25519 requires explicit opt-in.
+        // Military mode ALWAYS rejects classical regardless of opt-in env var.
+        let classical_allowed = if military_mode {
+            false
         } else {
+            std::env::var("MILNET_ALLOW_CLASSICAL_TLS")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+                || std::env::var("MILNET_PQ_TLS_ONLY")
+                    .map(|v| v == "0")
+                    .unwrap_or(false)
+        };
+
+        let kx_groups: Vec<&'static dyn rustls::crypto::SupportedKxGroup> = if classical_allowed {
+            tracing::warn!(
+                target: "siem",
+                category = "security",
+                severity = "HIGH",
+                action = "tls_classical_fallback_enabled",
+                "Gateway TLS: Classical X25519 fallback ENABLED via MILNET_ALLOW_CLASSICAL_TLS=1. \
+                 PQ-only mode is recommended for CNSA 2.0 compliance."
+            );
             vec![
                 rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768,
                 rustls::crypto::aws_lc_rs::kx_group::X25519,
             ]
+        } else {
+            tracing::info!(
+                military_mode = military_mode,
+                "Gateway TLS: PQ-only mode active (default) -- only X25519MLKEM768 key \
+                 exchange allowed, classical connections will be rejected"
+            );
+            vec![
+                rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768,
+            ]
         };
 
-        // Startup integrity check: in military mode, exit if classical fallback is present
+        // Military mode integrity check: exit if classical fallback would be offered
         if military_mode && kx_groups.len() > 1 {
             tracing::error!(
                 "FATAL: MILNET_MILITARY_DEPLOYMENT=1 but X25519 classical fallback is present \

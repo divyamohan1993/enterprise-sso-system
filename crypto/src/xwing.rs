@@ -80,6 +80,9 @@ pub enum XWingError {
     MlKemCiphertextInvalid,
     /// ML-KEM-1024 decapsulation failed (implicit rejection triggered).
     MlKemDecapsulationFailed,
+    /// The X25519 public key is a low-order point (identity or small subgroup).
+    /// DH output was all zeros, indicating a key-compromise impersonation attempt.
+    X25519LowOrderPoint,
 }
 
 impl std::fmt::Display for XWingError {
@@ -87,6 +90,7 @@ impl std::fmt::Display for XWingError {
         match self {
             Self::MlKemCiphertextInvalid => write!(f, "ML-KEM-1024 ciphertext invalid"),
             Self::MlKemDecapsulationFailed => write!(f, "ML-KEM-1024 decapsulation failed"),
+            Self::X25519LowOrderPoint => write!(f, "X25519 low-order point rejected"),
         }
     }
 }
@@ -410,6 +414,13 @@ pub fn xwing_decapsulate(
 
     // X25519 DH with the client's ephemeral public key.
     let x25519_ss = server_kp.x25519_secret.diffie_hellman(&client_public);
+
+    // Reject low-order points: if the DH output is all zeros, the client
+    // sent a small-subgroup or identity point. This prevents key-compromise
+    // impersonation attacks via low-order X25519 public keys.
+    if x25519_ss.as_bytes().iter().all(|&b| b == 0) {
+        return Err(XWingError::X25519LowOrderPoint);
+    }
 
     // ML-KEM-1024 decapsulation.
     let ml_kem_ct = ml_kem::Ciphertext::<MlKem1024>::try_from(ciphertext.ml_kem_ct.as_slice())

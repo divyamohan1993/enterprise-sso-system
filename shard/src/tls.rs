@@ -327,30 +327,45 @@ fn ca_root_store(ca: &CertificateAuthority) -> Arc<RootCertStore> {
     Arc::new(root_store)
 }
 
-/// Returns `true` if PQ-only TLS mode should be enforced.
+/// Returns `true` if classical X25519 TLS fallback is explicitly allowed.
 ///
-/// Enabled when either `MILNET_PQ_TLS_ONLY=1` or `MILNET_MILITARY_DEPLOYMENT=1`.
-/// When enabled, only the post-quantum hybrid key exchange (X25519MLKEM768) is
-/// offered — no classical fallback.  This enforces CNSA 2.0 strict mode for
-/// quantum-resistant key exchange.
-fn pq_tls_only() -> bool {
+/// PQ-only TLS is the DEFAULT. Classical X25519 fallback requires explicit
+/// opt-in via `MILNET_ALLOW_CLASSICAL_TLS=1`. In military mode
+/// (`MILNET_MILITARY_DEPLOYMENT=1`), classical fallback is ALWAYS rejected
+/// regardless of `MILNET_ALLOW_CLASSICAL_TLS`.
+///
+/// Legacy env var `MILNET_PQ_TLS_ONLY=0` is also honored as an alias for
+/// `MILNET_ALLOW_CLASSICAL_TLS=1` for backward compatibility.
+fn allow_classical_tls() -> bool {
     let military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
         .map(|v| v == "1")
         .unwrap_or(false);
-    let pq_flag = std::env::var("MILNET_PQ_TLS_ONLY")
+
+    // Military mode: classical fallback is NEVER allowed.
+    if military {
+        return false;
+    }
+
+    // Explicit opt-in to classical fallback.
+    let allow_classical = std::env::var("MILNET_ALLOW_CLASSICAL_TLS")
         .map(|v| v == "1")
         .unwrap_or(false);
-    military || pq_flag
+
+    // Legacy compat: MILNET_PQ_TLS_ONLY=0 means "allow classical".
+    let legacy_allow = std::env::var("MILNET_PQ_TLS_ONLY")
+        .map(|v| v == "0")
+        .unwrap_or(false);
+
+    allow_classical || legacy_allow
 }
 
 /// Build the CNSA 2.0 compliant crypto provider.
 ///
 /// * Cipher suite: TLS 1.3 AES-256-GCM-SHA384 only (CNSA 2.0).
 /// * Key exchange: X25519MLKEM768 (ML-KEM-768 + X25519 hybrid, post-quantum)
-///   preferred, with classical X25519 fallback unless PQ-only mode is active.
-///
-/// In military mode (`MILNET_MILITARY_DEPLOYMENT=1`), performs a startup
-/// integrity check: PANICs if classical X25519 fallback would be present.
+///   is the only group offered by default (PQ-only). Classical X25519 fallback
+///   requires explicit opt-in via `MILNET_ALLOW_CLASSICAL_TLS=1` and is NEVER
+///   permitted in military mode (`MILNET_MILITARY_DEPLOYMENT=1`).
 ///
 /// # CNSA 2.0 GAP: ML-KEM-768 vs ML-KEM-1024
 ///
@@ -363,36 +378,85 @@ fn pq_tls_only() -> bool {
 /// - ML-KEM-768 = NIST Level 3 (equivalent to AES-192)
 /// - ML-KEM-1024 = NIST Level 5 (equivalent to AES-256)
 ///
-/// This is a KNOWN CNSA 2.0 COMPLIANCE GAP. Operators who require strict CNSA 2.0
-/// ML-KEM-1024 across ALL layers must set `MILNET_REQUIRE_MLKEM1024=1` to prevent
-/// startup with ML-KEM-768. The system will refuse to start until `rustls`/`aws-lc-rs`
-/// expose `X25519MLKEM1024` and this function is upgraded.
+/// ## Enforcement via `MILNET_TLS_PQ_LEVEL`
+///
+/// Set `MILNET_TLS_PQ_LEVEL=5` to require ML-KEM-1024 at the TLS layer. Since
+/// rustls/aws-lc-rs does not yet expose X25519MLKEM1024, the process will refuse
+/// to start. This is equivalent to the older `MILNET_REQUIRE_MLKEM1024=1`.
+///
+/// ## Military deployment SIEM logging
+///
+/// When `MILNET_MILITARY_DEPLOYMENT=1`, a SIEM:CRITICAL log is emitted at startup
+/// documenting the Level 3 gap. The process does NOT abort because the
+/// application-layer X-Wing (ML-KEM-1024) provides Level 5 defense-in-depth.
 fn cnsa2_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
-    // Enforce ML-KEM-1024 requirement if operator has set the env var.
-    // This blocks startup to force acknowledgement of the CNSA 2.0 gap.
-    if std::env::var("MILNET_REQUIRE_MLKEM1024").map(|v| v == "1").unwrap_or(false) {
+    let military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+
+    // MILNET_TLS_PQ_LEVEL=5 enforces ML-KEM-1024 at the TLS layer.
+    // Supersedes the older MILNET_REQUIRE_MLKEM1024 env var.
+    let require_level5 = std::env::var("MILNET_TLS_PQ_LEVEL")
+        .map(|v| v == "5")
+        .unwrap_or(false)
+        || std::env::var("MILNET_REQUIRE_MLKEM1024")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+
+    if require_level5 {
         tracing::error!(
-            "FATAL: MILNET_REQUIRE_MLKEM1024=1 is set but TLS layer only supports ML-KEM-768 \
-             (X25519MLKEM768). CNSA 2.0 requires ML-KEM-1024 for TOP SECRET. \
-             Refusing to start. Unset MILNET_REQUIRE_MLKEM1024 to acknowledge this gap, \
+            target: "siem",
+            category = "security",
+            severity = "CRITICAL",
+            action = "tls_pq_level5_enforcement_failed",
+            "FATAL: MILNET_TLS_PQ_LEVEL=5 (or MILNET_REQUIRE_MLKEM1024=1) is set but TLS \
+             layer only supports ML-KEM-768 (X25519MLKEM768). CNSA 2.0 requires ML-KEM-1024 \
+             for TOP SECRET. Refusing to start. Unset the env var to acknowledge this gap, \
              or wait for rustls/aws-lc-rs to expose X25519MLKEM1024."
         );
         std::process::exit(198);
     }
 
-    let is_pq_only = pq_tls_only();
-    let military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
-        .map(|v| v == "1")
-        .unwrap_or(false);
+    // CR-10: In military mode, emit SIEM:CRITICAL documenting the Level 3 gap.
+    // Do NOT abort: app-layer X-Wing provides Level 5 defense-in-depth.
+    if military {
+        tracing::error!(
+            target: "siem",
+            category = "security",
+            severity = "CRITICAL",
+            action = "tls_pq_level3_gap",
+            "SIEM:CRITICAL: MILNET_MILITARY_DEPLOYMENT=1 but TLS key exchange uses \
+             ML-KEM-768 (NIST Level 3) instead of ML-KEM-1024 (NIST Level 5). \
+             rustls/aws-lc-rs does not yet expose X25519MLKEM1024. Application-layer \
+             X-Wing (ML-KEM-1024, Level 5) provides defense-in-depth. Set \
+             MILNET_TLS_PQ_LEVEL=5 to block startup until upstream adds support."
+        );
+    }
 
-    let kx_groups: Vec<&'static dyn rustls::crypto::SupportedKxGroup> = if is_pq_only {
-        vec![
-            rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768, // PQ hybrid only
-        ]
-    } else {
+    // CR-11: PQ-only is the DEFAULT. Classical X25519 requires explicit opt-in.
+    let classical_allowed = allow_classical_tls();
+
+    let kx_groups: Vec<&'static dyn rustls::crypto::SupportedKxGroup> = if classical_allowed {
+        tracing::warn!(
+            target: "siem",
+            category = "security",
+            severity = "HIGH",
+            action = "tls_classical_fallback_enabled",
+            "SHARD TLS: Classical X25519 fallback ENABLED via MILNET_ALLOW_CLASSICAL_TLS=1. \
+             PQ-only mode is recommended for CNSA 2.0 compliance."
+        );
         vec![
             rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768, // PQ hybrid preferred
-            rustls::crypto::aws_lc_rs::kx_group::X25519,          // classical fallback
+            rustls::crypto::aws_lc_rs::kx_group::X25519,          // classical fallback (opt-in)
+        ]
+    } else {
+        tracing::info!(
+            military_mode = military,
+            "SHARD TLS: PQ-only mode active (default) -- only X25519MLKEM768 key exchange \
+             allowed, classical connections will be rejected"
+        );
+        vec![
+            rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768, // PQ hybrid only
         ]
     };
 
@@ -403,14 +467,6 @@ fn cnsa2_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
              in SHARD TLS key exchange groups. This MUST NOT happen in military deployments."
         );
         std::process::exit(1);
-    }
-
-    if is_pq_only {
-        tracing::info!(
-            military_mode = military,
-            "SHARD TLS: PQ-only mode active — only X25519MLKEM768 key exchange allowed, \
-             non-PQ connections will be rejected"
-        );
     }
 
     Arc::new(rustls::crypto::CryptoProvider {
@@ -884,49 +940,79 @@ mod tests {
     }
 
     #[test]
-    fn test_cnsa2_provider_includes_pq_hybrid_kx() {
-        // Default mode (MILNET_PQ_TLS_ONLY not set): PQ hybrid + classical fallback.
+    fn test_cnsa2_provider_default_is_pq_only() {
+        // Default mode: PQ-only (no classical fallback unless explicitly opted in).
+        // Ensure no classical opt-in env vars are set.
+        std::env::remove_var("MILNET_ALLOW_CLASSICAL_TLS");
+        std::env::remove_var("MILNET_PQ_TLS_ONLY");
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
         let provider = cnsa2_crypto_provider();
 
-        // First kx_group must be X25519MLKEM768 (PQ hybrid preferred).
-        let first_group = &provider.kx_groups[0];
         assert_eq!(
-            format!("{:?}", first_group.name()),
+            provider.kx_groups.len(),
+            1,
+            "default mode must be PQ-only with exactly one key exchange group"
+        );
+        assert_eq!(
+            format!("{:?}", provider.kx_groups[0].name()),
+            "X25519MLKEM768",
+            "default key exchange group must be PQ hybrid X25519MLKEM768"
+        );
+    }
+
+    #[test]
+    fn test_classical_fallback_requires_explicit_opt_in() {
+        // Classical X25519 fallback requires MILNET_ALLOW_CLASSICAL_TLS=1.
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        std::env::remove_var("MILNET_PQ_TLS_ONLY");
+        std::env::set_var("MILNET_ALLOW_CLASSICAL_TLS", "1");
+        let provider = cnsa2_crypto_provider();
+        std::env::remove_var("MILNET_ALLOW_CLASSICAL_TLS");
+
+        assert_eq!(
+            provider.kx_groups.len(),
+            2,
+            "classical opt-in must add X25519 fallback"
+        );
+        assert_eq!(
+            format!("{:?}", provider.kx_groups[0].name()),
             "X25519MLKEM768",
             "first key exchange group must be PQ hybrid X25519MLKEM768"
         );
-
-        // Must have at least 2 groups (PQ hybrid + classical fallback).
-        assert!(
-            provider.kx_groups.len() >= 2,
-            "default mode must include classical X25519 fallback"
-        );
-        let second_group = &provider.kx_groups[1];
         assert_eq!(
-            format!("{:?}", second_group.name()),
+            format!("{:?}", provider.kx_groups[1].name()),
             "X25519",
             "second key exchange group must be classical X25519 fallback"
         );
     }
 
     #[test]
-    fn test_pq_tls_only_mode_no_classical_fallback() {
-        // Simulate MILNET_PQ_TLS_ONLY=1 by temporarily setting the env var.
-        // Note: this test is not thread-safe with other tests that read this env var,
-        // but Rust test runner serializes tests by default unless --test-threads is set.
-        std::env::set_var("MILNET_PQ_TLS_ONLY", "1");
-        let provider = cnsa2_crypto_provider();
+    fn test_military_mode_rejects_classical_even_if_opted_in() {
+        // Military mode must NEVER allow classical fallback.
+        std::env::set_var("MILNET_MILITARY_DEPLOYMENT", "1");
+        std::env::set_var("MILNET_ALLOW_CLASSICAL_TLS", "1");
+        let result = allow_classical_tls();
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        std::env::remove_var("MILNET_ALLOW_CLASSICAL_TLS");
+
+        assert!(
+            !result,
+            "military mode must reject classical TLS even with MILNET_ALLOW_CLASSICAL_TLS=1"
+        );
+    }
+
+    #[test]
+    fn test_pq_only_legacy_compat() {
+        // MILNET_PQ_TLS_ONLY=0 should act as MILNET_ALLOW_CLASSICAL_TLS=1 (legacy compat).
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        std::env::remove_var("MILNET_ALLOW_CLASSICAL_TLS");
+        std::env::set_var("MILNET_PQ_TLS_ONLY", "0");
+        let result = allow_classical_tls();
         std::env::remove_var("MILNET_PQ_TLS_ONLY");
 
-        assert_eq!(
-            provider.kx_groups.len(),
-            1,
-            "PQ-only mode must have exactly one key exchange group"
-        );
-        assert_eq!(
-            format!("{:?}", provider.kx_groups[0].name()),
-            "X25519MLKEM768",
-            "PQ-only mode must use only X25519MLKEM768"
+        assert!(
+            result,
+            "MILNET_PQ_TLS_ONLY=0 must allow classical TLS for backward compatibility"
         );
     }
 

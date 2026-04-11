@@ -2939,6 +2939,160 @@ pub fn create_hsm_backend() -> Box<dyn HsmKeyOps> {
 }
 
 // ---------------------------------------------------------------------------
+// Startup hardware verification
+// ---------------------------------------------------------------------------
+
+/// Check whether a real PKCS#11 shared library is loadable on this host.
+///
+/// Looks for the library path configured via `MILNET_PKCS11_LIB` env var,
+/// or common default paths. Returns `true` if at least one `.so` file exists
+/// at the configured or default locations.
+pub fn check_pkcs11_library_available() -> bool {
+    if let Ok(path) = std::env::var("MILNET_PKCS11_LIB") {
+        return std::path::Path::new(&path).exists();
+    }
+    // Check common default locations
+    let defaults = [
+        "/usr/lib/softhsm/libsofthsm2.so",
+        "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so",
+        "/usr/lib64/pkcs11/libsofthsm2.so",
+        "/usr/local/lib/softhsm/libsofthsm2.so",
+        "/opt/cloudhsm/lib/libcloudhsm_pkcs11.so",
+    ];
+    defaults.iter().any(|p| std::path::Path::new(p).exists())
+}
+
+/// Verify that all hardware security modules (HSM, TPM, enclave) are
+/// available and operational. Emits SIEM events and exits in military
+/// mode if hardware is missing.
+///
+/// Returns a summary of each subsystem's status.
+pub fn verify_hardware_security_modules() -> Vec<common::config::DeploymentValidation> {
+    let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let is_mlp = common::config::is_mlp_mode();
+
+    let mut results = Vec::with_capacity(3);
+
+    // 1. HSM / PKCS#11 check
+    let pkcs11_available = check_pkcs11_library_available();
+    if !pkcs11_available && is_military {
+        common::siem::SecurityEvent {
+            timestamp: common::siem::SecurityEvent::now_iso8601(),
+            category: "hsm",
+            action: "pkcs11_library_missing",
+            severity: common::siem::Severity::Critical,
+            outcome: "failure",
+            user_id: None,
+            source_ip: None,
+            detail: Some(
+                "MILNET_MILITARY_DEPLOYMENT=1 but no PKCS#11 library found. \
+                 Hardware HSM is required for military deployment."
+                    .into(),
+            ),
+        }
+        .emit();
+        if !is_mlp {
+            tracing::error!(
+                "SIEM:CRITICAL no PKCS#11 library found in military deployment. Terminating."
+            );
+            std::process::exit(199);
+        }
+        tracing::warn!(
+            "SIEM:CRITICAL no PKCS#11 library found but MLP mode acknowledged. Continuing with degraded security."
+        );
+    }
+    results.push(common::config::DeploymentValidation {
+        component: "hsm".into(),
+        hardware_backed: pkcs11_available,
+        mlp_relaxed: !pkcs11_available && is_mlp,
+        summary: if pkcs11_available {
+            "PKCS#11 library available".into()
+        } else if is_mlp {
+            "No PKCS#11 library (MLP mode)".into()
+        } else {
+            "No PKCS#11 library found".into()
+        },
+    });
+
+    // 2. TPM check
+    let tpm_available = crate::tpm::verify_real_tpm();
+    if !tpm_available && is_military {
+        common::siem::SecurityEvent {
+            timestamp: common::siem::SecurityEvent::now_iso8601(),
+            category: "tpm",
+            action: "tpm_device_missing",
+            severity: common::siem::Severity::Critical,
+            outcome: "failure",
+            user_id: None,
+            source_ip: None,
+            detail: Some(
+                "MILNET_MILITARY_DEPLOYMENT=1 but no TPM device (/dev/tpmrm0 or /dev/tpm0) found. \
+                 Hardware TPM is required for military deployment."
+                    .into(),
+            ),
+        }
+        .emit();
+        if !is_mlp {
+            tracing::error!(
+                "SIEM:CRITICAL no TPM device found in military deployment. Terminating."
+            );
+            std::process::exit(199);
+        }
+    }
+    results.push(crate::tpm::validate_deployment_mode());
+
+    // 3. Enclave check
+    let caps = crate::enclave::detect_confidential_compute();
+    if !caps.has_hardware() && is_military {
+        common::siem::SecurityEvent {
+            timestamp: common::siem::SecurityEvent::now_iso8601(),
+            category: "enclave",
+            action: "hardware_enclave_missing",
+            severity: common::siem::Severity::Critical,
+            outcome: "failure",
+            user_id: None,
+            source_ip: None,
+            detail: Some(
+                "MILNET_MILITARY_DEPLOYMENT=1 but no hardware enclave (SGX/SEV-SNP/TrustZone) detected. \
+                 Hardware enclave is required for military deployment."
+                    .into(),
+            ),
+        }
+        .emit();
+        if !is_mlp {
+            tracing::error!(
+                "SIEM:CRITICAL no hardware enclave found in military deployment. Terminating."
+            );
+            std::process::exit(199);
+        }
+    }
+    results.push(crate::enclave::validate_deployment_mode());
+
+    if is_military {
+        let all_hw = results.iter().all(|r| r.hardware_backed);
+        if all_hw {
+            tracing::info!(
+                "hardware security modules verified: HSM, TPM, and enclave all hardware-backed"
+            );
+        } else {
+            let missing: Vec<&str> = results
+                .iter()
+                .filter(|r| !r.hardware_backed)
+                .map(|r| r.component.as_str())
+                .collect();
+            tracing::warn!(
+                "hardware security modules degraded: {} not hardware-backed (MLP mode)",
+                missing.join(", ")
+            );
+        }
+    }
+
+    results
+}
+
+// ---------------------------------------------------------------------------
 // Real PKCS#11 hardware session via the `cryptoki` crate
 // ---------------------------------------------------------------------------
 

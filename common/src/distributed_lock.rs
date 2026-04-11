@@ -175,6 +175,46 @@ pub fn is_distributed_fencing_enabled() -> bool {
     DISTRIBUTED_FENCING_POOL.get().is_some()
 }
 
+/// Enforce that distributed fencing is initialized in production mode.
+/// Call after all startup initialization is complete.
+/// In production (MILNET_PRODUCTION=1), if distributed fencing is not initialized,
+/// logs SIEM:CRITICAL and exits the process. Local AtomicU64 fencing is forbidden
+/// in production because it resets on restart, violating monotonicity across processes.
+pub fn enforce_distributed_fencing_in_production() {
+    if cfg!(test) || cfg!(feature = "test-support") {
+        return;
+    }
+    let is_production = std::env::var("MILNET_PRODUCTION").is_ok()
+        || std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok();
+    if !is_production {
+        return;
+    }
+    if is_distributed_fencing_enabled() {
+        return;
+    }
+    let event = crate::siem::SecurityEvent {
+        timestamp: crate::siem::SecurityEvent::now_iso8601(),
+        category: "distributed_lock",
+        action: "fencing_not_distributed_production",
+        severity: crate::siem::Severity::Critical,
+        outcome: "failure",
+        user_id: None,
+        source_ip: None,
+        detail: Some(
+            "MILNET_PRODUCTION=1 but distributed fencing (PostgreSQL sequence) is not initialized. \
+             Local AtomicU64 fencing resets on restart and cannot guarantee monotonicity across processes. \
+             Call init_distributed_fencing_pool() at startup."
+                .into(),
+        ),
+    };
+    event.emit();
+    tracing::error!(
+        "SIEM:CRITICAL Distributed fencing not initialized in production mode. \
+         Fencing tokens from local AtomicU64 are unsafe. Exiting."
+    );
+    std::process::exit(1);
+}
+
 /// Validate that the fencing sequence exists in the database.
 /// Call at startup to fail fast if the migration is missing.
 pub async fn validate_fencing_sequence() -> Result<(), LockError> {

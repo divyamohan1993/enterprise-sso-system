@@ -85,12 +85,57 @@ impl Default for BftConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Thresholds
+// Dynamic quorum configuration
 // ---------------------------------------------------------------------------
 
-const RAFT_QUORUM: u32 = 3;
-const FROST_THRESHOLD: u32 = 3;
-const KEK_THRESHOLD: u32 = 3;
+/// Configuration for Raft, FROST, and KEK cluster sizes.
+/// Quorum is computed dynamically as cluster_size / 2 + 1 (majority).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterConfig {
+    /// Number of Raft peers in the cluster.
+    pub raft_cluster_size: u32,
+    /// Number of FROST signers in the cluster.
+    pub frost_cluster_size: u32,
+    /// Number of KEK share holders in the cluster.
+    pub kek_cluster_size: u32,
+}
+
+impl ClusterConfig {
+    /// Compute majority quorum: cluster_size / 2 + 1.
+    pub fn majority_quorum(cluster_size: u32) -> u32 {
+        if cluster_size == 0 { return 1; }
+        cluster_size / 2 + 1
+    }
+
+    pub fn raft_quorum(&self) -> u32 {
+        Self::majority_quorum(self.raft_cluster_size)
+    }
+
+    pub fn frost_threshold(&self) -> u32 {
+        Self::majority_quorum(self.frost_cluster_size)
+    }
+
+    pub fn kek_threshold(&self) -> u32 {
+        Self::majority_quorum(self.kek_cluster_size)
+    }
+
+    /// Load from environment or use defaults (5-node clusters).
+    pub fn from_env() -> Self {
+        let raft = std::env::var("MILNET_RAFT_CLUSTER_SIZE")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+        let frost = std::env::var("MILNET_FROST_CLUSTER_SIZE")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+        let kek = std::env::var("MILNET_KEK_CLUSTER_SIZE")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+        Self { raft_cluster_size: raft, frost_cluster_size: frost, kek_cluster_size: kek }
+    }
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self { raft_cluster_size: 5, frost_cluster_size: 5, kek_cluster_size: 5 }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // QuorumStatus
@@ -114,6 +159,7 @@ pub struct QuorumHealth {
     pub bft_honest_nodes: AtomicU32,
     pub kek_available_shares: AtomicU32,
     bft_config: BftConfig,
+    cluster_config: ClusterConfig,
 }
 
 impl QuorumHealth {
@@ -122,29 +168,40 @@ impl QuorumHealth {
     }
 
     pub fn with_bft_config(bft_config: BftConfig) -> Self {
+        Self::with_full_config(bft_config, ClusterConfig::default())
+    }
+
+    pub fn with_full_config(bft_config: BftConfig, cluster_config: ClusterConfig) -> Self {
         Self {
             raft_healthy_peers: AtomicU32::new(0),
             frost_available_signers: AtomicU32::new(0),
             bft_honest_nodes: AtomicU32::new(0),
             kek_available_shares: AtomicU32::new(0),
             bft_config,
+            cluster_config,
         }
     }
 
     pub fn new_healthy() -> Self {
         let bft_config = BftConfig::default();
+        let cluster_config = ClusterConfig::default();
         let total = bft_config.total_nodes;
         Self {
-            raft_healthy_peers: AtomicU32::new(5),
-            frost_available_signers: AtomicU32::new(5),
+            raft_healthy_peers: AtomicU32::new(cluster_config.raft_cluster_size),
+            frost_available_signers: AtomicU32::new(cluster_config.frost_cluster_size),
             bft_honest_nodes: AtomicU32::new(total),
-            kek_available_shares: AtomicU32::new(5),
+            kek_available_shares: AtomicU32::new(cluster_config.kek_cluster_size),
             bft_config,
+            cluster_config,
         }
     }
 
     pub fn bft_config(&self) -> &BftConfig {
         &self.bft_config
+    }
+
+    pub fn cluster_config(&self) -> &ClusterConfig {
+        &self.cluster_config
     }
 
     pub fn update_raft_peers(&self, count: u32) {
@@ -169,10 +226,14 @@ impl QuorumHealth {
         let bft = self.bft_honest_nodes.load(Ordering::SeqCst);
         let kek = self.kek_available_shares.load(Ordering::SeqCst);
 
-        let raft_ok = raft >= RAFT_QUORUM;
-        let frost_ok = frost >= FROST_THRESHOLD;
+        let raft_quorum = self.cluster_config.raft_quorum();
+        let frost_threshold = self.cluster_config.frost_threshold();
+        let kek_threshold = self.cluster_config.kek_threshold();
+
+        let raft_ok = raft >= raft_quorum;
+        let frost_ok = frost >= frost_threshold;
         let bft_ok = bft >= self.bft_config.quorum_size;
-        let kek_ok = kek >= KEK_THRESHOLD;
+        let kek_ok = kek >= kek_threshold;
 
         let all_ok = raft_ok && frost_ok && bft_ok && kek_ok;
         let none_ok = !raft_ok && !frost_ok && !bft_ok && !kek_ok;
@@ -283,22 +344,24 @@ mod tests {
     #[test]
     fn boundary_exactly_at_threshold() {
         let bft_q = bft_quorum();
+        let cc = ClusterConfig::default();
         let qh = QuorumHealth::new();
-        qh.update_raft_peers(RAFT_QUORUM);
-        qh.update_frost_signers(FROST_THRESHOLD);
+        qh.update_raft_peers(cc.raft_quorum());
+        qh.update_frost_signers(cc.frost_threshold());
         qh.update_bft_nodes(bft_q);
-        qh.update_kek_shares(KEK_THRESHOLD);
+        qh.update_kek_shares(cc.kek_threshold());
         assert_eq!(qh.assess(), QuorumStatus::Healthy);
     }
 
     #[test]
     fn boundary_one_below_threshold() {
         let bft_q = bft_quorum();
+        let cc = ClusterConfig::default();
         let qh = QuorumHealth::new();
-        qh.update_raft_peers(RAFT_QUORUM - 1);
-        qh.update_frost_signers(FROST_THRESHOLD);
+        qh.update_raft_peers(cc.raft_quorum() - 1);
+        qh.update_frost_signers(cc.frost_threshold());
         qh.update_bft_nodes(bft_q);
-        qh.update_kek_shares(KEK_THRESHOLD);
+        qh.update_kek_shares(cc.kek_threshold());
         let status = qh.assess();
         assert!(matches!(status, QuorumStatus::Degraded { ref systems } if systems == &["raft"]));
     }
@@ -306,13 +369,37 @@ mod tests {
     #[test]
     fn degraded_two_non_critical_subsystems() {
         let bft_q = bft_quorum();
+        let cc = ClusterConfig::default();
         let qh = QuorumHealth::new();
-        qh.update_raft_peers(RAFT_QUORUM);
-        qh.update_frost_signers(FROST_THRESHOLD);
+        qh.update_raft_peers(cc.raft_quorum());
+        qh.update_frost_signers(cc.frost_threshold());
         qh.update_bft_nodes(bft_q - 1);
-        qh.update_kek_shares(KEK_THRESHOLD - 1);
+        qh.update_kek_shares(cc.kek_threshold() - 1);
         let status = qh.assess();
         assert!(matches!(status, QuorumStatus::Degraded { ref systems } if systems.len() == 2));
+    }
+
+    #[test]
+    fn dynamic_quorum_from_cluster_size() {
+        // majority_quorum(5) = 3, majority_quorum(7) = 4, majority_quorum(3) = 2
+        assert_eq!(ClusterConfig::majority_quorum(5), 3);
+        assert_eq!(ClusterConfig::majority_quorum(7), 4);
+        assert_eq!(ClusterConfig::majority_quorum(3), 2);
+        assert_eq!(ClusterConfig::majority_quorum(1), 1);
+        assert_eq!(ClusterConfig::majority_quorum(0), 1);
+    }
+
+    #[test]
+    fn custom_cluster_sizes() {
+        let cc = ClusterConfig { raft_cluster_size: 7, frost_cluster_size: 7, kek_cluster_size: 7 };
+        let qh = QuorumHealth::with_full_config(BftConfig::default(), cc);
+        // 7-node cluster needs quorum of 4
+        qh.update_raft_peers(3);
+        qh.update_frost_signers(4);
+        qh.update_bft_nodes(7);
+        qh.update_kek_shares(4);
+        let status = qh.assess();
+        assert!(matches!(status, QuorumStatus::Degraded { ref systems } if systems == &["raft"]));
     }
 
     #[test]

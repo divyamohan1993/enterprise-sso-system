@@ -109,6 +109,8 @@ pub enum ImplementationStatus {
     Alternative,
     /// Not applicable to this system.
     NotApplicable,
+    /// Not yet implemented; gap identified.
+    NotImplemented,
 }
 
 /// A control implementation description for the SSP.
@@ -330,7 +332,7 @@ impl SspGenerator {
             .filter(|c| c.status == ImplementationStatus::PartiallyImplemented)
             .count();
         let planned = self.controls.values()
-            .filter(|c| c.status == ImplementationStatus::Planned)
+            .filter(|c| matches!(c.status, ImplementationStatus::Planned | ImplementationStatus::NotImplemented))
             .count();
         let not_applicable = self.controls.values()
             .filter(|c| c.status == ImplementationStatus::NotApplicable)
@@ -592,6 +594,364 @@ impl SspGenerator {
             ],
             responsible_roles: vec!["ISSO".to_string(), "SOC Analyst".to_string()],
             last_assessed: None,
+        });
+
+        // ── Additional AC controls ──
+        self.register_control(ControlImplementation {
+            control_id: "AC-3".to_string(), family: ControlFamily::AC,
+            title: "Access Enforcement".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "RBAC with conditional access policies enforce access decisions at every API endpoint.".to_string(),
+            code_references: vec!["common/src/idm.rs".to_string(), "common/src/conditional_access.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["ISSO".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "AC-4".to_string(), family: ControlFamily::AC,
+            title: "Information Flow Enforcement".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "Cross-domain guard enforces information flow policies between classification domains.".to_string(),
+            code_references: vec!["common/src/classification.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["ISSO".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "AC-6".to_string(), family: ControlFamily::AC,
+            title: "Least Privilege".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "Per-service OS users with minimal permissions. Drop-all capability set. Tiered RBAC.".to_string(),
+            code_references: vec!["common/src/idm.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["System Administrator".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "AC-7".to_string(), family: ControlFamily::AC,
+            title: "Unsuccessful Logon Attempts".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "Account lockout after configurable failed attempts via session_limits module.".to_string(),
+            code_references: vec!["common/src/session_limits.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["System Administrator".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "AC-8".to_string(), family: ControlFamily::AC,
+            title: "System Use Notification".to_string(),
+            status: ImplementationStatus::NotImplemented,
+            implementation_description: "System use notification banner not yet implemented at login.".to_string(),
+            code_references: vec![], config_references: vec![], responsible_roles: vec!["ISSO".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "AC-10".to_string(), family: ControlFamily::AC,
+            title: "Concurrent Session Control".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "Session limits module enforces concurrent session caps per user.".to_string(),
+            code_references: vec!["common/src/session_limits.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["ISSO".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "AC-11".to_string(), family: ControlFamily::AC,
+            title: "Device Lock".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "Session idle timeout triggers automatic session lock.".to_string(),
+            code_references: vec!["common/src/session_limits.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["ISSO".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "AC-12".to_string(), family: ControlFamily::AC,
+            title: "Session Termination".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "Absolute session timeout forces re-authentication.".to_string(),
+            code_references: vec!["common/src/session_limits.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["ISSO".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "AC-14".to_string(), family: ControlFamily::AC,
+            title: "Permitted Actions Without Identification or Authentication".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "Only health check and public key endpoints are accessible without authentication.".to_string(),
+            code_references: vec!["gateway/src/main.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["ISSO".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "AC-17".to_string(), family: ControlFamily::AC,
+            title: "Remote Access".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "All remote access via TLS 1.3 with PQ key exchange. VPN not required; TLS provides equivalent protection.".to_string(),
+            code_references: vec!["shard/src/tls.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["Network Engineer".to_string()], last_assessed: None,
+        });
+
+        // ── Additional AU controls ──
+        self.register_control(ControlImplementation {
+            control_id: "AU-3".to_string(), family: ControlFamily::AU,
+            title: "Content of Audit Records".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "Audit records include timestamp, source, user ID, event type, outcome, and correlation ID.".to_string(),
+            code_references: vec!["common/src/siem.rs".to_string(), "common/src/structured_logging.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["ISSO".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "AU-4".to_string(), family: ControlFamily::AU,
+            title: "Audit Log Storage Capacity".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "Audit log storage managed by infrastructure. Retention period enforced per compliance regime.".to_string(),
+            code_references: vec!["common/src/compliance.rs".to_string()],
+            config_references: vec!["AUDIT_RETENTION_DAYS".to_string()], responsible_roles: vec!["System Administrator".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "AU-5".to_string(), family: ControlFamily::AU,
+            title: "Response to Audit Logging Process Failures".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "Audit failure triggers SIEM alert. System continues operation but logs degraded audit state.".to_string(),
+            code_references: vec!["common/src/siem.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["ISSO".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "AU-6".to_string(), family: ControlFamily::AU,
+            title: "Audit Record Review, Analysis, and Reporting".to_string(),
+            status: ImplementationStatus::PartiallyImplemented,
+            implementation_description: "SIEM event bus provides real-time streaming. Manual correlation tooling not yet deployed.".to_string(),
+            code_references: vec!["common/src/siem_webhook.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["SOC Analyst".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "AU-8".to_string(), family: ControlFamily::AU,
+            title: "Time Stamps".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "All audit records use UTC timestamps from system clock. NTP synchronization assumed (environmental).".to_string(),
+            code_references: vec!["common/src/structured_logging.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["System Administrator".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "AU-9".to_string(), family: ControlFamily::AU,
+            title: "Protection of Audit Information".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "Tamper-evident hash chain protects audit log integrity. Encrypted audit metadata with AES-256-GCM.".to_string(),
+            code_references: vec!["common/src/encrypted_audit.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["ISSO".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "AU-12".to_string(), family: ControlFamily::AU,
+            title: "Audit Record Generation".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "All security-relevant modules emit SIEM events at the point of action.".to_string(),
+            code_references: vec!["common/src/siem.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["ISSO".to_string()], last_assessed: None,
+        });
+
+        // ── Additional IA controls ──
+        self.register_control(ControlImplementation {
+            control_id: "IA-2(1)".to_string(), family: ControlFamily::IA,
+            title: "Multi-Factor Authentication to Privileged Accounts".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "AAL3 hardware MFA required for all privileged (Sovereign tier) accounts.".to_string(),
+            code_references: vec!["common/src/compliance.rs".to_string(), "fido/src/authentication.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["ISSO".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "IA-2(2)".to_string(), family: ControlFamily::IA,
+            title: "Multi-Factor Authentication to Non-Privileged Accounts".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "AAL2 two-factor authentication required for Operational tier accounts.".to_string(),
+            code_references: vec!["common/src/compliance.rs".to_string(), "common/src/totp.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["ISSO".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "IA-3".to_string(), family: ControlFamily::IA,
+            title: "Device Identification and Authentication".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "Device identity via FIDO2 attestation and mTLS certificates.".to_string(),
+            code_references: vec!["fido/src/registration.rs".to_string(), "shard/src/tls.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["ISSO".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "IA-4".to_string(), family: ControlFamily::IA,
+            title: "Identifier Management".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "User identifiers (UUIDs) assigned at registration. Never reused after account deletion.".to_string(),
+            code_references: vec!["common/src/idm.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["System Administrator".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "IA-5(1)".to_string(), family: ControlFamily::IA,
+            title: "Password-Based Authentication".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "OPAQUE PAKE protocol ensures server never sees plaintext passwords.".to_string(),
+            code_references: vec!["opaque/src/opaque_impl.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["ISSO".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "IA-6".to_string(), family: ControlFamily::IA,
+            title: "Authentication Feedback".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "Authentication failures return generic error messages without revealing which factor failed.".to_string(),
+            code_references: vec!["common/src/error_response.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["ISSO".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "IA-8".to_string(), family: ControlFamily::IA,
+            title: "Identification and Authentication (Non-Organizational Users)".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "External users authenticate via the same OPAQUE+FIDO2 mechanisms. No anonymous access.".to_string(),
+            code_references: vec!["opaque/src/opaque_impl.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["ISSO".to_string()], last_assessed: None,
+        });
+
+        // ── Additional SC controls ──
+        self.register_control(ControlImplementation {
+            control_id: "SC-8".to_string(), family: ControlFamily::SC,
+            title: "Transmission Confidentiality and Integrity".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "TLS 1.3 with CNSA 2.0 cipher suites. DPoP proof-of-possession on all tokens.".to_string(),
+            code_references: vec!["shard/src/tls.rs".to_string(), "crypto/src/dpop.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["Network Engineer".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "SC-8(1)".to_string(), family: ControlFamily::SC,
+            title: "Cryptographic Protection".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "All network communications encrypted with AES-256-GCM via TLS 1.3.".to_string(),
+            code_references: vec!["shard/src/tls.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["Network Engineer".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "SC-12".to_string(), family: ControlFamily::SC,
+            title: "Cryptographic Key Establishment and Management".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "Key lifecycle via key_rotation module. FROST DKG for distributed key generation.".to_string(),
+            code_references: vec!["common/src/key_rotation.rs".to_string(), "crypto/src/frost.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["ISSO".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "SC-17".to_string(), family: ControlFamily::SC,
+            title: "Public Key Infrastructure Certificates".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "Certificate lifecycle managed with automatic renewal. CRL checking for CAC/PIV.".to_string(),
+            code_references: vec!["common/src/cert_lifecycle.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["ISSO".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "SC-23".to_string(), family: ControlFamily::SC,
+            title: "Session Authenticity".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "Session tokens signed with ML-DSA-87. DPoP binding ties tokens to client keys.".to_string(),
+            code_references: vec!["sso-protocol/src/tokens.rs".to_string(), "crypto/src/dpop.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["ISSO".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "SC-28".to_string(), family: ControlFamily::SC,
+            title: "Protection of Information at Rest".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "AES-256-GCM encryption for all data at rest. Sealed key storage with vTPM binding.".to_string(),
+            code_references: vec!["crypto/src/sealed.rs".to_string(), "common/src/sealed_keys.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["ISSO".to_string()], last_assessed: None,
+        });
+
+        // ── Additional SI controls ──
+        self.register_control(ControlImplementation {
+            control_id: "SI-2".to_string(), family: ControlFamily::SI,
+            title: "Flaw Remediation".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "Dependency audit via cargo-audit in CI. Automated vulnerability scanning.".to_string(),
+            code_references: vec!["Cargo.toml".to_string()],
+            config_references: vec![], responsible_roles: vec!["System Administrator".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "SI-3".to_string(), family: ControlFamily::SI,
+            title: "Malicious Code Protection".to_string(),
+            status: ImplementationStatus::NotImplemented,
+            implementation_description: "Antimalware scanning is an environmental control; not implemented at application layer.".to_string(),
+            code_references: vec![], config_references: vec![], responsible_roles: vec!["System Administrator".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "SI-4".to_string(), family: ControlFamily::SI,
+            title: "System Monitoring".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "SIEM event bus with real-time monitoring. Risk scoring engine for anomaly detection.".to_string(),
+            code_references: vec!["common/src/siem.rs".to_string(), "common/src/risk_scoring.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["SOC Analyst".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "SI-5".to_string(), family: ControlFamily::SI,
+            title: "Security Alerts, Advisories, and Directives".to_string(),
+            status: ImplementationStatus::PartiallyImplemented,
+            implementation_description: "SIEM webhook sends alerts to external systems. Advisory tracking is manual.".to_string(),
+            code_references: vec!["common/src/siem_webhook.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["ISSO".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "SI-7".to_string(), family: ControlFamily::SI,
+            title: "Software, Firmware, and Information Integrity".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "Binary attestation via BLAKE3. Measured boot via vTPM. Build manifests for reproducibility.".to_string(),
+            code_references: vec!["crypto/src/attest.rs".to_string(), "common/src/measured_boot.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["System Administrator".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "SI-10".to_string(), family: ControlFamily::SI,
+            title: "Information Input Validation".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "Input validation at gateway layer. Content-type enforcement. Error response sanitization.".to_string(),
+            code_references: vec!["common/src/error_response.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["ISSO".to_string()], last_assessed: None,
+        });
+
+        // ── IR controls ──
+        self.register_control(ControlImplementation {
+            control_id: "IR-4".to_string(), family: ControlFamily::IR,
+            title: "Incident Handling".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "Automated incident response module. SIEM integration for real-time alerting.".to_string(),
+            code_references: vec!["common/src/incident_response.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["Incident Response Team".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "IR-5".to_string(), family: ControlFamily::IR,
+            title: "Incident Monitoring".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "SIEM event bus monitors all security incidents in real time.".to_string(),
+            code_references: vec!["common/src/siem.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["SOC Analyst".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "IR-6".to_string(), family: ControlFamily::IR,
+            title: "Incident Reporting".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "Incident reporting via SIEM webhook. CERT-In reporting deadline tracking in compliance module.".to_string(),
+            code_references: vec!["common/src/compliance.rs".to_string(), "common/src/siem_webhook.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["ISSO".to_string()], last_assessed: None,
+        });
+
+        // ── CM controls ──
+        self.register_control(ControlImplementation {
+            control_id: "CM-2".to_string(), family: ControlFamily::CM,
+            title: "Baseline Configuration".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "Measured boot records baseline. STIG scanner validates configuration against baseline.".to_string(),
+            code_references: vec!["common/src/measured_boot.rs".to_string(), "common/src/stig.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["System Administrator".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "CM-6".to_string(), family: ControlFamily::CM,
+            title: "Configuration Settings".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "Startup checks enforce mandatory security settings. Any deviation halts service.".to_string(),
+            code_references: vec!["common/src/startup_checks.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["System Administrator".to_string()], last_assessed: None,
+        });
+        self.register_control(ControlImplementation {
+            control_id: "CM-7".to_string(), family: ControlFamily::CM,
+            title: "Least Functionality".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "Minimal service surface. Only required endpoints exposed. Feature gates disable unused functionality.".to_string(),
+            code_references: vec!["gateway/src/main.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["System Administrator".to_string()], last_assessed: None,
+        });
+
+        // ── RA controls ──
+        self.register_control(ControlImplementation {
+            control_id: "RA-5".to_string(), family: ControlFamily::RA,
+            title: "Vulnerability Monitoring and Scanning".to_string(),
+            status: ImplementationStatus::Implemented,
+            implementation_description: "cargo-audit for dependency vulnerability scanning. STIG scanner for system configuration.".to_string(),
+            code_references: vec!["common/src/stig.rs".to_string(), "common/src/stig_scanner.rs".to_string()],
+            config_references: vec![], responsible_roles: vec!["ISSO".to_string()], last_assessed: None,
         });
     }
 
@@ -966,28 +1326,31 @@ mod tests {
         let mut gen = SspGenerator::new("MILNET SSO".to_string(), FedRampLevel::High);
         gen.auto_populate_from_code();
 
-        // Must have all six key controls
+        // Must have all critical control families well covered
         assert!(gen.controls.contains_key("AC-2"), "must have AC-2 Account Management");
+        assert!(gen.controls.contains_key("AC-3"), "must have AC-3 Access Enforcement");
+        assert!(gen.controls.contains_key("AC-7"), "must have AC-7 Unsuccessful Logon");
         assert!(gen.controls.contains_key("IA-2"), "must have IA-2 Identification and Authentication");
         assert!(gen.controls.contains_key("IA-5"), "must have IA-5 Authenticator Management");
         assert!(gen.controls.contains_key("SC-7"), "must have SC-7 Boundary Protection");
         assert!(gen.controls.contains_key("SC-13"), "must have SC-13 Cryptographic Protection");
         assert!(gen.controls.contains_key("AU-2"), "must have AU-2 Event Logging");
+        assert!(gen.controls.contains_key("AU-9"), "must have AU-9 Protection of Audit Info");
+        assert!(gen.controls.contains_key("SI-7"), "must have SI-7 Integrity");
+        assert!(gen.controls.contains_key("IR-4"), "must have IR-4 Incident Handling");
 
-        // All auto-populated controls should be Implemented
-        for (id, ctrl) in &gen.controls {
-            assert_eq!(
-                ctrl.status,
-                ImplementationStatus::Implemented,
-                "control {} should be Implemented",
-                id
-            );
-            assert!(
-                !ctrl.code_references.is_empty(),
-                "control {} should have code references",
-                id
-            );
-        }
+        // Should have significantly more than 14 controls now
+        assert!(
+            gen.controls.len() >= 40,
+            "expected >= 40 controls after auto-populate, got {}",
+            gen.controls.len()
+        );
+
+        // NotImplemented controls should exist (honest gaps)
+        let not_impl = gen.controls.values()
+            .filter(|c| c.status == ImplementationStatus::NotImplemented)
+            .count();
+        assert!(not_impl > 0, "should have some NotImplemented controls for honesty");
     }
 
     #[test]

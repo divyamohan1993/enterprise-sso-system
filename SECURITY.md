@@ -13,7 +13,7 @@ Older versions are not backported unless a critical vulnerability affects deploy
 
 **Do not open a public GitHub issue for security vulnerabilities.**
 
-To report a vulnerability, email **[DEPLOY: configure actual security reporting email]** with:
+To report a vulnerability, email **security@<your-domain>**  <!-- CONFIGURE: Set your organization's security team email --> with:
 
 1. A description of the vulnerability and its potential impact.
 2. Steps to reproduce or a proof-of-concept (if available).

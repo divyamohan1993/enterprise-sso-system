@@ -594,6 +594,125 @@ impl ComplianceEngine {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Unified Compliance Dashboard
+// ---------------------------------------------------------------------------
+
+/// Aggregated compliance dashboard across all frameworks.
+#[derive(Debug)]
+pub struct ComplianceDashboard {
+    /// FIPS 140-3 CMVP validation percentage.
+    pub fips_percentage: f64,
+    /// CNSA 2.0 Level 5 status (true = all checks pass).
+    pub cnsa2_passed: bool,
+    /// CMMC compliance percentage (against 110 practices).
+    pub cmmc_percentage: f64,
+    /// CMMC practices assessed / total.
+    pub cmmc_assessed: usize,
+    /// Common Criteria SFR coverage (0.0 to 1.0).
+    pub cc_sfr_coverage: f64,
+    /// FedRAMP controls mapped.
+    pub fedramp_controls_mapped: usize,
+    /// SOC 2 evidence items collected.
+    pub soc2_evidence_count: usize,
+    /// STIG check pass rate (0.0 to 1.0).
+    pub stig_pass_rate: f64,
+    /// Overall readiness assessment.
+    pub overall_assessment: String,
+}
+
+/// Generate a unified compliance dashboard aggregating all framework scores.
+///
+/// Runs at startup and logs results to SIEM.
+pub fn compliance_dashboard() -> ComplianceDashboard {
+    // FIPS
+    let fips_summary = crate::fips_validation::fips_compliance_summary();
+    let fips_pct = fips_summary.compliance_percentage;
+
+    // CNSA 2.0 (don't call enforce which might exit in military mode)
+    let cnsa2_passed = crate::cnsa2::is_cnsa2_compliant();
+
+    // CMMC
+    let cmmc = crate::cmmc::CmmcAssessor::new();
+    let cmmc_pct = cmmc.compliance_percentage();
+    let (met, partial, not_met) = cmmc.score();
+    let cmmc_assessed = met + partial + not_met;
+
+    // Common Criteria
+    let cc = crate::common_criteria::SecurityTarget::milnet_default();
+    let cc_sfr = cc.sfr_implementation_coverage();
+
+    // FedRAMP
+    let mut fedramp = crate::fedramp_evidence::SspGenerator::new(
+        "MILNET SSO".to_string(),
+        crate::fedramp_evidence::FedRampLevel::High,
+    );
+    fedramp.auto_populate_from_code();
+    let fedramp_count = fedramp.controls.len();
+
+    // STIG
+    let mut stig = crate::stig::StigAuditor::new();
+    stig.run_all();
+    let stig_summary = stig.summary();
+    let stig_pass = if stig_summary.total > 0 {
+        stig_summary.passed as f64 / stig_summary.total as f64
+    } else {
+        0.0
+    };
+
+    let overall = if fips_pct >= 100.0 && cnsa2_passed && cmmc_pct >= 80.0 && cc_sfr >= 0.9 {
+        "FULLY COMPLIANT: All frameworks at or above threshold.".to_string()
+    } else if fips_pct >= 50.0 || cmmc_pct >= 30.0 {
+        format!(
+            "PARTIALLY COMPLIANT: FIPS {:.0}%, CMMC {:.0}%, CC SFR {:.0}%. Gaps remain.",
+            fips_pct, cmmc_pct, cc_sfr * 100.0
+        )
+    } else {
+        format!(
+            "NOT COMPLIANT: FIPS {:.0}%, CMMC {:.0}%, CC SFR {:.0}%. Significant gaps.",
+            fips_pct, cmmc_pct, cc_sfr * 100.0
+        )
+    };
+
+    tracing::info!(
+        "SIEM:COMPLIANCE-DASHBOARD FIPS={:.0}% CNSA2={} CMMC={:.0}% CC_SFR={:.0}% \
+         FedRAMP_controls={} STIG_pass={:.0}% SOC2=pending assessment={}",
+        fips_pct,
+        if cnsa2_passed { "PASS" } else { "FAIL" },
+        cmmc_pct,
+        cc_sfr * 100.0,
+        fedramp_count,
+        stig_pass * 100.0,
+        if overall.starts_with("FULLY") { "COMPLIANT" } else { "GAPS" }
+    );
+
+    ComplianceDashboard {
+        fips_percentage: fips_pct,
+        cnsa2_passed,
+        cmmc_percentage: cmmc_pct,
+        cmmc_assessed,
+        cc_sfr_coverage: cc_sfr,
+        fedramp_controls_mapped: fedramp_count,
+        soc2_evidence_count: 0, // populated when auto_populate is called
+        stig_pass_rate: stig_pass,
+        overall_assessment: overall,
+    }
+}
+
+/// Run all compliance checks at startup and log results to SIEM.
+pub fn run_compliance_startup_checks() {
+    // FIPS startup check
+    crate::fips_validation::fips_startup_check();
+
+    // Generate dashboard
+    let dashboard = compliance_dashboard();
+
+    tracing::info!(
+        "SIEM:COMPLIANCE-STARTUP Overall: {}",
+        dashboard.overall_assessment
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -836,5 +955,31 @@ mod tests {
     fn test_validate_assurance_unknown_tier_violation() {
         let violations = validate_assurance_level(99, false, false, false, false);
         assert!(violations.iter().any(|v| v.rule == "ASSURANCE_LEVEL"));
+    }
+
+    #[test]
+    fn test_compliance_dashboard() {
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        let dashboard = compliance_dashboard();
+        // FIPS should be 0% (no CMVP validation)
+        assert!(dashboard.fips_percentage < 1.0);
+        // CMMC should be < 50% (not all 110 practices met)
+        assert!(dashboard.cmmc_percentage < 50.0);
+        // CC SFR coverage < 100% (some unimplemented)
+        assert!(dashboard.cc_sfr_coverage < 1.0);
+        // FedRAMP should have >= 40 controls
+        assert!(dashboard.fedramp_controls_mapped >= 40);
+        // Overall should say NOT COMPLIANT or PARTIALLY COMPLIANT
+        assert!(
+            !dashboard.overall_assessment.starts_with("FULLY"),
+            "should not be fully compliant with no FIPS validation"
+        );
+    }
+
+    #[test]
+    fn test_compliance_startup_checks_run() {
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        // Just verify it doesn't panic
+        run_compliance_startup_checks();
     }
 }

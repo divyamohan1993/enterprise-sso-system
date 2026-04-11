@@ -336,6 +336,117 @@ impl Default for FipsComplianceRegistry {
     }
 }
 
+/// Honest FIPS compliance summary for auditors and dashboards.
+#[derive(Debug, Clone)]
+pub struct FipsComplianceSummary {
+    /// Total registered cryptographic modules.
+    pub total_modules: usize,
+    /// Modules with active CMVP certificates.
+    pub validated_modules: usize,
+    /// Modules pending submission or in review.
+    pub unvalidated_modules: Vec<String>,
+    /// True percentage of CMVP-validated modules.
+    pub compliance_percentage: f64,
+    /// Whether the system meets FIPS 140-3 requirements for military deployment.
+    pub military_ready: bool,
+    /// Human-readable honest assessment.
+    pub assessment: String,
+}
+
+/// Return an honest FIPS compliance summary from the global registry.
+pub fn fips_compliance_summary() -> FipsComplianceSummary {
+    let registry = global_registry().lock().unwrap();
+    let total = registry.module_count();
+    let validated = registry.validated_count();
+    let pct = compliance_percentage_from_registry(&registry);
+    let unvalidated: Vec<String> = registry
+        .unvalidated_modules()
+        .iter()
+        .map(|m| m.module_name.clone())
+        .collect();
+
+    let military_ready = registry.all_validated();
+
+    let assessment = if military_ready {
+        "All cryptographic modules hold active FIPS 140-3 CMVP certificates.".to_string()
+    } else if validated == 0 {
+        format!(
+            "NONE of {} cryptographic modules have CMVP validation. \
+             All algorithms are NIST-approved but Rust implementations have not been \
+             submitted to a CMVP-accredited lab. System is NOT FIPS 140-3 compliant.",
+            total
+        )
+    } else {
+        format!(
+            "{}/{} modules validated ({:.0}%). {} modules lack CMVP certificates. \
+             System is PARTIALLY FIPS 140-3 compliant.",
+            validated,
+            total,
+            pct,
+            total - validated
+        )
+    };
+
+    FipsComplianceSummary {
+        total_modules: total,
+        validated_modules: validated,
+        unvalidated_modules: unvalidated,
+        compliance_percentage: pct,
+        military_ready,
+        assessment,
+    }
+}
+
+/// Return the true FIPS CMVP validation percentage (0.0 to 100.0).
+pub fn compliance_percentage() -> f64 {
+    let registry = global_registry().lock().unwrap();
+    compliance_percentage_from_registry(&registry)
+}
+
+fn compliance_percentage_from_registry(registry: &FipsComplianceRegistry) -> f64 {
+    let total = registry.module_count();
+    if total == 0 {
+        return 0.0;
+    }
+    (registry.validated_count() as f64 / total as f64) * 100.0
+}
+
+/// Run FIPS compliance startup check.
+///
+/// If `MILNET_MILITARY_DEPLOYMENT=1` and any required module is `NotSubmitted`,
+/// logs `SIEM:CRITICAL` with exact module names. Does NOT exit (FIPS submission
+/// is an external process), but makes the gap highly visible.
+pub fn fips_startup_check() {
+    let summary = fips_compliance_summary();
+    let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1");
+
+    if is_military && !summary.military_ready {
+        tracing::error!(
+            "SIEM:CRITICAL FIPS-STARTUP: Military deployment active but {}/{} modules \
+             lack CMVP validation. Non-validated modules: [{}]. \
+             Compliance: {:.0}%. System is NOT FIPS 140-3 certified.",
+            summary.unvalidated_modules.len(),
+            summary.total_modules,
+            summary.unvalidated_modules.join(", "),
+            summary.compliance_percentage,
+        );
+    } else if !summary.military_ready {
+        tracing::warn!(
+            "FIPS-STARTUP: {}/{} modules validated ({:.0}%). \
+             Non-validated: [{}]",
+            summary.validated_modules,
+            summary.total_modules,
+            summary.compliance_percentage,
+            summary.unvalidated_modules.join(", "),
+        );
+    } else {
+        tracing::info!(
+            "FIPS-STARTUP: All {} modules hold active CMVP certificates.",
+            summary.total_modules,
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Transition Plan
 // ---------------------------------------------------------------------------
@@ -922,5 +1033,29 @@ mod tests {
         assert_eq!(parse_days_until("not-a-date"), None);
         assert_eq!(parse_days_until("2025"), None);
         assert_eq!(parse_days_until(""), None);
+    }
+
+    #[test]
+    fn test_fips_compliance_summary_honest() {
+        let summary = fips_compliance_summary();
+        // Default modules are all NotSubmitted
+        assert_eq!(summary.validated_modules, 0);
+        assert!(!summary.military_ready);
+        assert!(summary.compliance_percentage < 0.01);
+        assert!(summary.assessment.contains("NONE"));
+        assert!(!summary.unvalidated_modules.is_empty());
+    }
+
+    #[test]
+    fn test_compliance_percentage_zero() {
+        let pct = compliance_percentage();
+        // All defaults are NotSubmitted
+        assert!(pct < 0.01, "expected 0%, got {:.1}%", pct);
+    }
+
+    #[test]
+    fn test_fips_startup_check_runs() {
+        // Just verify it doesn't panic
+        fips_startup_check();
     }
 }

@@ -244,6 +244,54 @@ pub struct ByzantineDetectionState {
     pub confirmed_byzantine: Vec<usize>,
 }
 
+/// Verify that BFT node addresses are not all on localhost.
+/// In military mode, all nodes sharing the same process has zero BFT guarantees.
+/// This checks a list of configured addresses (from MILNET_BFT_NODE_ADDRS env var,
+/// comma-separated) and emits SIEM:CRITICAL if all resolve to localhost.
+///
+/// PRODUCTION DEPLOYMENT: Each BFT node must run as a separate process on a
+/// separate host. This check is a startup safety net, not a substitute for
+/// proper deployment architecture.
+fn check_bft_node_addresses() {
+    if cfg!(test) || cfg!(feature = "test-support") {
+        return;
+    }
+    let addrs = match std::env::var("MILNET_BFT_NODE_ADDRS") {
+        Ok(a) if !a.is_empty() => a,
+        _ => return, // No addresses configured, skip check
+    };
+    let all_local = addrs.split(',').all(|addr| {
+        let addr = addr.trim();
+        addr.starts_with("127.") || addr.starts_with("localhost") || addr == "::1"
+    });
+    if all_local {
+        let msg = format!(
+            "SIEM:CRITICAL All {} BFT node addresses resolve to localhost. \
+             Zero Byzantine fault tolerance in this configuration. \
+             Deploy BFT nodes on separate hosts.",
+            addrs.split(',').count()
+        );
+        tracing::error!("{}", msg);
+        common::siem::SecurityEvent {
+            timestamp: common::siem::SecurityEvent::now_iso8601(),
+            category: "bft_audit",
+            action: "single_host_bft_detected",
+            severity: common::siem::Severity::Critical,
+            outcome: "failure",
+            user_id: None,
+            source_ip: None,
+            detail: Some(msg),
+        }
+        .emit();
+        if std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok() {
+            panic!(
+                "FATAL: All BFT nodes on localhost in military deployment. \
+                 Deploy on separate hosts."
+            );
+        }
+    }
+}
+
 /// Startup check: BFT single-process mode warning/enforcement.
 /// In production, single-process mode requires explicit acknowledgment.
 /// In military deployment, single-process mode is unconditionally fatal.
@@ -333,6 +381,8 @@ pub struct BftAuditCluster {
     single_process_mode: bool,
     /// Nodes currently quarantined for Byzantine behavior.
     pub quarantined: Vec<QuarantinedNode>,
+    /// Timestamp of the last successful proposal (monotonic).
+    last_proposal_at: Instant,
 }
 
 impl BftAuditCluster {
@@ -349,6 +399,7 @@ impl BftAuditCluster {
         }
 
         check_single_process_military_deployment();
+        check_bft_node_addresses();
 
         let f = (node_count - 1) / 3; // max Byzantine faults tolerated
         let quorum = 2 * f + 1; // minimum for consensus
@@ -362,6 +413,7 @@ impl BftAuditCluster {
             sequence_number: 0,
             single_process_mode: default_single_process_mode(),
             quarantined: Vec::new(),
+            last_proposal_at: Instant::now(),
         };
         cluster.initialize_heartbeats();
         cluster
@@ -395,6 +447,7 @@ impl BftAuditCluster {
             sequence_number: 0,
             single_process_mode: default_single_process_mode(),
             quarantined: Vec::new(),
+            last_proposal_at: Instant::now(),
         };
         cluster.initialize_heartbeats();
         cluster
@@ -442,6 +495,7 @@ impl BftAuditCluster {
             sequence_number: 0,
             single_process_mode: default_single_process_mode(),
             quarantined: Vec::new(),
+            last_proposal_at: Instant::now(),
         };
         cluster.initialize_heartbeats();
         cluster
@@ -466,8 +520,27 @@ impl BftAuditCluster {
         }
     }
 
-    /// Maximum time to wait for a proposer to complete before rotating to next.
+    /// Maximum time to wait for a proposer to produce an entry before rotation (5 seconds).
     const PROPOSER_TIMEOUT_MS: u128 = 5_000;
+
+    /// Check if the current proposer has timed out.
+    /// If the last successful proposal was more than PROPOSER_TIMEOUT_MS ago,
+    /// automatically advance to the next proposer by incrementing the sequence number.
+    pub fn check_proposer_timeout(&mut self) -> bool {
+        let elapsed = self.last_proposal_at.elapsed().as_millis();
+        if elapsed > Self::PROPOSER_TIMEOUT_MS {
+            self.sequence_number += 1;
+            tracing::warn!(
+                elapsed_ms = elapsed,
+                new_sequence = self.sequence_number,
+                "BFT proposer timeout: advancing to next proposer after {}ms",
+                elapsed
+            );
+            true
+        } else {
+            false
+        }
+    }
 
     /// Propose an entry using a two-phase BFT commit protocol.
     ///
@@ -638,13 +711,16 @@ impl BftAuditCluster {
                 }
             }
 
+            // Use effective_quorum to account for quarantined nodes
+            let required = self.effective_quorum().unwrap_or(self.quorum_size);
+
             // Check if we have quorum prepare votes
-            if prepare_votes.len() < self.quorum_size {
+            if prepare_votes.len() < required {
                 last_error = format!(
                     "prepare quorum not met: {}/{} voted (need {}) for proposer {} (attempt {}/{})",
                     prepare_votes.len(),
                     self.nodes.len(),
-                    self.quorum_size,
+                    required,
                     proposer_idx,
                     attempt + 1,
                     max_proposer_attempts
@@ -663,7 +739,7 @@ impl BftAuditCluster {
             let mut commit_count = 0usize;
             for &node_idx in &voting_nodes {
                 // Verify quorum proof: this node can see that enough nodes prepared
-                if voting_nodes.len() < self.quorum_size {
+                if voting_nodes.len() < required {
                     continue; // Should not happen, but defense in depth
                 }
                 // Actually commit the entry
@@ -672,14 +748,15 @@ impl BftAuditCluster {
                 }
             }
 
-            if commit_count >= self.quorum_size {
+            if commit_count >= required {
                 // Exchange heartbeats among all nodes that committed.
                 self.exchange_heartbeats();
                 self.sequence_number += 1;
+                self.last_proposal_at = Instant::now();
                 tracing::info!(
                     proposer = proposer_idx,
                     committed = commit_count,
-                    quorum = self.quorum_size,
+                    quorum = required,
                     attempt = attempt + 1,
                     "BFT entry committed via two-phase protocol"
                 );
@@ -690,7 +767,7 @@ impl BftAuditCluster {
                 "commit failed: {}/{} committed (need {}) for proposer {}",
                 commit_count,
                 voting_nodes.len(),
-                self.quorum_size,
+                required,
                 proposer_idx
             );
         }

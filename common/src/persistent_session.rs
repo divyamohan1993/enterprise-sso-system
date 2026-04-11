@@ -93,20 +93,52 @@ impl PersistentSessionStore {
         .map_err(|e| format!("ensure persistent_sessions table: {e}"))?;
 
         // Index for fast user lookups.
-        let _ = sqlx::query(
+        match sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_persistent_sessions_user \
              ON persistent_sessions (user_id) WHERE NOT terminated",
         )
         .execute(pool)
-        .await;
+        .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                let msg = format!("migration: create idx_persistent_sessions_user failed: {e}");
+                crate::siem::emit_runtime_error(
+                    crate::siem::category::COMPLIANCE_ALERT,
+                    &msg,
+                    "persistent_session index migration failure",
+                    file!(), line!(), column!(), module_path!(),
+                );
+                if crate::config::require_hardware_security() {
+                    panic!("MILITARY MODE: persistent session migration failure: {msg}");
+                }
+                tracing::error!("{msg}");
+            }
+        }
 
         // Index for cleanup of expired sessions.
-        let _ = sqlx::query(
+        match sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_persistent_sessions_expiry \
              ON persistent_sessions (expires_at) WHERE NOT terminated",
         )
         .execute(pool)
-        .await;
+        .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                let msg = format!("migration: create idx_persistent_sessions_expiry failed: {e}");
+                crate::siem::emit_runtime_error(
+                    crate::siem::category::COMPLIANCE_ALERT,
+                    &msg,
+                    "persistent_session index migration failure",
+                    file!(), line!(), column!(), module_path!(),
+                );
+                if crate::config::require_hardware_security() {
+                    panic!("MILITARY MODE: persistent session migration failure: {msg}");
+                }
+                tracing::error!("{msg}");
+            }
+        }
 
         Ok(())
     }

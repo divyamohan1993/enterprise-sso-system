@@ -189,8 +189,8 @@ pub fn load_error_level_from_env() {
             tracing::info!("error_level=verbose (requested via MILNET_ERROR_LEVEL)");
         }
         None => {
-            error_level().set_level(ErrorLevel::Verbose);
-            tracing::info!("error_level=verbose (default -- SIEM panel receives all errors with file:line)");
+            error_level().set_level(ErrorLevel::Warn);
+            tracing::info!("error_level=warn (default -- set MILNET_ERROR_LEVEL=verbose for file:line detail)");
         }
         Some(other) => {
             tracing::warn!(

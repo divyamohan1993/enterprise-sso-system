@@ -15,19 +15,68 @@ use uuid::Uuid;
 use zeroize::Zeroize;
 
 /// HMAC key for computing device fingerprint blind indices.
-/// Initialized once from the OS CSPRNG. In production this MUST come from a KMS.
+/// Persisted across restarts via MILNET_FP_BLIND_KEY env var or derived from
+/// master KEK via HKDF-SHA512 with info="MILNET-FP-BLIND-KEY-v1".
+/// Falls back to OS CSPRNG only in dev/test mode (not military).
 static FP_BLIND_KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
 
 fn fp_blind_key() -> &'static [u8; 32] {
     FP_BLIND_KEY.get_or_init(|| {
+        // Priority 1: Explicit env var (hex-encoded 32-byte key).
+        if let Ok(hex_key) = std::env::var("MILNET_FP_BLIND_KEY") {
+            if let Ok(bytes) = hex::decode(hex_key.trim()) {
+                if bytes.len() == 32 {
+                    let mut key = [0u8; 32];
+                    key.copy_from_slice(&bytes);
+                    tracing::info!("FP_BLIND_KEY loaded from MILNET_FP_BLIND_KEY env var");
+                    return key;
+                }
+                tracing::error!("MILNET_FP_BLIND_KEY must be exactly 32 bytes (64 hex chars), got {}", bytes.len());
+            } else {
+                tracing::error!("MILNET_FP_BLIND_KEY is not valid hex");
+            }
+        }
+
+        // Priority 2: Derive from master KEK via HKDF-SHA512.
+        if let Ok(kek_hex) = std::env::var("MILNET_MASTER_KEK") {
+            if let Ok(kek_bytes) = hex::decode(kek_hex.trim()) {
+                if kek_bytes.len() == 32 {
+                    use hkdf::Hkdf;
+                    use sha2::Sha512;
+                    let hk = Hkdf::<Sha512>::new(
+                        Some(b"MILNET-FP-BLIND-KEY-SALT-v1"),
+                        &kek_bytes,
+                    );
+                    let mut key = [0u8; 32];
+                    if hk.expand(b"MILNET-FP-BLIND-KEY-v1", &mut key).is_ok() {
+                        tracing::info!("FP_BLIND_KEY derived from MILNET_MASTER_KEK via HKDF-SHA512");
+                        return key;
+                    }
+                    tracing::error!("HKDF-SHA512 derivation failed for FP_BLIND_KEY");
+                }
+            }
+        }
+
+        // Priority 3: In military mode, we must have a deterministic key.
+        if std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok() {
+            tracing::error!(
+                "CRITICAL: No persistent FP_BLIND_KEY available in military mode. \
+                 Set MILNET_FP_BLIND_KEY (hex) or MILNET_MASTER_KEK for HKDF derivation. \
+                 Random key would break existing sessions on restart."
+            );
+            std::process::exit(1);
+        }
+
+        // Priority 4: Dev/test fallback -- random key (not restart-safe).
         let mut key = [0u8; 32];
-        // SECURITY: CSPRNG failure at this point is unrecoverable — the system
-        // cannot generate secure key material. OnceLock prevents retry, so we
-        // must succeed or abort.
         if let Err(e) = getrandom::getrandom(&mut key) {
             tracing::error!("CRITICAL: OS CSPRNG failure during blind key init: {e}");
             std::process::exit(1);
         }
+        tracing::warn!(
+            "FP_BLIND_KEY generated from CSPRNG (not persistent). \
+             Sessions will be invalidated on restart. Set MILNET_FP_BLIND_KEY for persistence."
+        );
         key
     })
 }
@@ -464,7 +513,7 @@ impl InvalidationReason {
 }
 
 /// A signed session invalidation event for cross-node propagation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SessionInvalidationEvent {
     pub user_id: Uuid,
     pub reason: InvalidationReason,
@@ -473,11 +522,36 @@ pub struct SessionInvalidationEvent {
     pub signature: Vec<u8>,
 }
 
+/// Custom Debug for SessionInvalidationEvent -- redacts signature to prevent
+/// HMAC material leaking into logs.
+impl std::fmt::Debug for SessionInvalidationEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionInvalidationEvent")
+            .field("user_id", &self.user_id)
+            .field("reason", &self.reason)
+            .field("timestamp", &self.timestamp)
+            .field("node_id", &self.node_id)
+            .field("signature", &"[REDACTED]")
+            .finish()
+    }
+}
+
 /// Processes invalidation events with signature verification and replay protection.
 pub struct InvalidationEventProcessor {
     hmac_key: Vec<u8>,
     seen_events: std::collections::HashMap<String, Vec<i64>>,
     replay_window_us: i64,
+}
+
+/// Custom Debug for InvalidationEventProcessor -- redacts HMAC key.
+impl std::fmt::Debug for InvalidationEventProcessor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InvalidationEventProcessor")
+            .field("hmac_key", &"[REDACTED]")
+            .field("seen_events_count", &self.seen_events.len())
+            .field("replay_window_us", &self.replay_window_us)
+            .finish()
+    }
 }
 
 impl InvalidationEventProcessor {
@@ -1270,5 +1344,55 @@ mod tests {
         assert_eq!(InvalidationReason::PermissionEscalation.as_str(), "permission_escalation");
         assert_eq!(InvalidationReason::SecurityIncident.as_str(), "security_incident");
         assert_eq!(InvalidationReason::AdminAction.as_str(), "admin_action");
+    }
+
+    // ── MD-34: FP blind key determinism tests ─────────────────────────
+
+    #[test]
+    fn fp_blind_key_returns_consistent_value() {
+        // OnceLock ensures the same key is returned on every call.
+        let key1 = fp_blind_key();
+        let key2 = fp_blind_key();
+        assert_eq!(key1, key2, "fp_blind_key must return the same value on repeated calls");
+    }
+
+    #[test]
+    fn blind_device_fingerprint_deterministic() {
+        let fp = [0xABu8; 32];
+        let blind1 = blind_device_fingerprint(&fp);
+        let blind2 = blind_device_fingerprint(&fp);
+        assert_eq!(blind1, blind2, "same fingerprint must produce same blind index");
+    }
+
+    #[test]
+    fn blind_device_fingerprint_different_inputs_differ() {
+        let fp1 = [0xAAu8; 32];
+        let fp2 = [0xBBu8; 32];
+        let blind1 = blind_device_fingerprint(&fp1);
+        let blind2 = blind_device_fingerprint(&fp2);
+        assert_ne!(blind1, blind2, "different fingerprints must produce different blind indices");
+    }
+
+    // ── Debug redaction tests ─────────────────────────────────────────
+
+    #[test]
+    fn distributed_session_debug_redacts_sensitive_fields() {
+        let session = DistributedSession {
+            session_id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            tier: 2,
+            created_at: 1_000_000,
+            expires_at: 2_000_000,
+            last_activity: 1_000_000,
+            ratchet_epoch: 1,
+            encrypted_chain_key: vec![0xDE, 0xAD],
+            device_fingerprint: [0xBE; 32],
+            classification: 1,
+            terminated: false,
+        };
+        let debug_str = format!("{:?}", session);
+        assert!(debug_str.contains("[ENCRYPTED]"), "chain key must be redacted in Debug");
+        assert!(debug_str.contains("[REDACTED]"), "fingerprint must be redacted in Debug");
+        assert!(!debug_str.contains("DEAD"), "raw chain key bytes must not appear in Debug");
     }
 }

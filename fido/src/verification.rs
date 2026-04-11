@@ -154,7 +154,7 @@ pub fn parse_authenticator_data(auth_data: &[u8]) -> Result<ParsedAuthData, &'st
 /// Validate that the RP ID hash in authenticator data matches the expected RP ID.
 pub fn validate_rp_id_hash(parsed: &ParsedAuthData, expected_rp_id: &str) -> Result<(), &'static str> {
     let expected_hash = Sha256::digest(expected_rp_id.as_bytes());
-    if parsed.rp_id_hash[..] != expected_hash[..] {
+    if !crypto::ct::ct_eq(&parsed.rp_id_hash, &expected_hash) {
         return Err("RP ID hash mismatch");
     }
     Ok(())
@@ -629,7 +629,7 @@ fn validate_client_data(
     let decoded_challenge = base64_url_decode(challenge_b64)
         .map_err(|_| "Client data challenge is not valid base64url")?;
 
-    if decoded_challenge != expected_challenge {
+    if !crypto::ct::ct_eq(&decoded_challenge, expected_challenge) {
         return Err("Client data challenge mismatch");
     }
 
@@ -638,7 +638,7 @@ fn validate_client_data(
         .and_then(|v| v.as_str())
         .ok_or("Client data missing 'origin' field")?;
 
-    if origin != expected_origin {
+    if !crypto::ct::ct_eq(origin.as_bytes(), expected_origin.as_bytes()) {
         return Err("Client data origin mismatch");
     }
 

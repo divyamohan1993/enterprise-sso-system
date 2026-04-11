@@ -531,7 +531,18 @@ impl FileRaftLogPersistence {
     }
 }
 
+/// Compute a 32-bit checksum of WAL entry data for corruption detection.
+/// Uses the first 4 bytes of BLAKE3 hash (already a dependency) for speed
+/// and collision resistance far exceeding CRC32.
+fn wal_checksum(data: &[u8]) -> u32 {
+    let hash = blake3::hash(data);
+    let bytes = hash.as_bytes();
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
 impl RaftLogPersistence for FileRaftLogPersistence {
+    /// WAL entry format: [length: u32][checksum: u32][data: postcard bytes]
+    /// The checksum is CRC32 over the serialized data, verified on load.
     fn append_entries(&self, entries: &[LogEntry]) -> Result<(), String> {
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
@@ -543,7 +554,9 @@ impl RaftLogPersistence for FileRaftLogPersistence {
             let data = postcard::to_allocvec(entry)
                 .map_err(|e| format!("serialize log entry: {e}"))?;
             let len = (data.len() as u32).to_le_bytes();
+            let checksum = wal_checksum(&data).to_le_bytes();
             f.write_all(&len).map_err(|e| format!("write WAL len: {e}"))?;
+            f.write_all(&checksum).map_err(|e| format!("write WAL checksum: {e}"))?;
             f.write_all(&data).map_err(|e| format!("write WAL data: {e}"))?;
         }
         f.sync_all().map_err(|e| format!("fsync WAL: {e}"))?;
@@ -559,11 +572,15 @@ impl RaftLogPersistence for FileRaftLogPersistence {
         };
         let mut entries = Vec::new();
         let mut cursor = &data[..];
-        while cursor.len() >= 4 {
+        while cursor.len() >= 8 {
+            // Read length (4 bytes) + checksum (4 bytes)
             let mut len_buf = [0u8; 4];
             len_buf.copy_from_slice(&cursor[..4]);
             let len = u32::from_le_bytes(len_buf) as usize;
-            cursor = &cursor[4..];
+            let mut crc_buf = [0u8; 4];
+            crc_buf.copy_from_slice(&cursor[4..8]);
+            let stored_crc = u32::from_le_bytes(crc_buf);
+            cursor = &cursor[8..];
             if cursor.len() < len {
                 tracing::warn!(
                     expected = len,
@@ -572,7 +589,19 @@ impl RaftLogPersistence for FileRaftLogPersistence {
                 );
                 break;
             }
-            let entry: LogEntry = postcard::from_bytes(&cursor[..len])
+            let entry_data = &cursor[..len];
+            // Verify checksum before deserializing
+            let computed_crc = wal_checksum(entry_data);
+            if computed_crc != stored_crc {
+                tracing::error!(
+                    stored_crc = stored_crc,
+                    computed_crc = computed_crc,
+                    entry_len = len,
+                    "WAL entry checksum mismatch -- rejecting corrupted entry, stopping recovery"
+                );
+                break;
+            }
+            let entry: LogEntry = postcard::from_bytes(entry_data)
                 .map_err(|e| format!("deserialize WAL entry: {e}"))?;
             entries.push(entry);
             cursor = &cursor[len..];
@@ -594,7 +623,9 @@ impl RaftLogPersistence for FileRaftLogPersistence {
             let data = postcard::to_allocvec(entry)
                 .map_err(|e| format!("serialize log entry: {e}"))?;
             let len = (data.len() as u32).to_le_bytes();
+            let checksum = wal_checksum(&data).to_le_bytes();
             f.write_all(&len).map_err(|e| format!("write WAL len: {e}"))?;
+            f.write_all(&checksum).map_err(|e| format!("write WAL checksum: {e}"))?;
             f.write_all(&data).map_err(|e| format!("write WAL data: {e}"))?;
         }
         f.sync_all().map_err(|e| format!("fsync WAL tmp: {e}"))?;

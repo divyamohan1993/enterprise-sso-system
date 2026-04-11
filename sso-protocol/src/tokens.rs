@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 // ---------------------------------------------------------------------------
 // JTI Replay Cache — distributed with L1 in-memory + L2 database backend
@@ -278,7 +279,7 @@ pub const MAX_TOKEN_LIFETIME_SECS: i64 = 24 * 3600;
 /// the same initial grant share a family ID. On double-consumption (token reuse),
 /// the ENTIRE family is revoked to mitigate stolen refresh token attacks per
 /// RFC 6749 Section 10.4 and NIST SP 800-63B.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RefreshToken {
     pub token: String,
     pub user_id: Uuid,
@@ -292,16 +293,63 @@ pub struct RefreshToken {
     pub family_id: String,
 }
 
+/// Custom Debug for RefreshToken -- redacts token value, client_id, and family_id
+/// to prevent accidental exposure of bearer credentials in logs.
+impl std::fmt::Debug for RefreshToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RefreshToken")
+            .field("token", &"[REDACTED]")
+            .field("user_id", &self.user_id)
+            .field("client_id", &"[REDACTED]")
+            .field("scope", &self.scope)
+            .field("expires_at", &self.expires_at)
+            .field("used", &self.used)
+            .field("family_id", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Zeroize sensitive token material on drop to prevent memory forensics.
+impl Drop for RefreshToken {
+    fn drop(&mut self) {
+        self.token.zeroize();
+        self.client_id.zeroize();
+        self.family_id.zeroize();
+        self.scope.zeroize();
+    }
+}
+
 /// In-memory refresh token store with rotation and single-use enforcement.
 ///
 /// WARNING: This store is volatile. All refresh tokens are lost on process
 /// restart. In production, set `persistence_backend` to a durable store.
-#[derive(Debug)]
 pub struct RefreshTokenStore {
     tokens: HashMap<String, RefreshToken>,
     /// Optional persistence backend name for operational awareness.
     /// When None, the store is purely in-memory (volatile).
     pub persistence_backend: Option<String>,
+}
+
+/// Custom Debug for RefreshTokenStore -- redacts token count only.
+impl std::fmt::Debug for RefreshTokenStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RefreshTokenStore")
+            .field("token_count", &self.tokens.len())
+            .field("persistence_backend", &self.persistence_backend)
+            .finish()
+    }
+}
+
+/// Zeroize all token keys and values on drop.
+impl Drop for RefreshTokenStore {
+    fn drop(&mut self) {
+        // Drain the map so each key is owned and can be zeroized.
+        let entries: Vec<(String, RefreshToken)> = self.tokens.drain().collect();
+        for (mut key, _value) in entries {
+            // RefreshToken's own Drop handles its fields.
+            key.zeroize();
+        }
+    }
 }
 
 impl RefreshTokenStore {
@@ -470,11 +518,9 @@ impl RefreshTokenStore {
     }
 }
 
-impl Default for RefreshTokenStore {
-    fn default() -> Self {
-        Self::new().expect("RefreshTokenStore::default() failed — check MILNET_MILITARY_DEPLOYMENT")
-    }
-}
+// NOTE: Default impl intentionally removed (MD-10). RefreshTokenStore::new()
+// returns Result and can fail in military mode. Callers must use new() and
+// handle the error explicitly. Default::default() cannot propagate errors.
 
 // ---------------------------------------------------------------------------
 // PersistentRefreshTokenStore -- PostgreSQL-backed refresh token storage
@@ -1470,5 +1516,69 @@ mod tests {
 
         let result = store.redeem(&token, "client-1");
         assert!(result.is_err(), "revoked family token must be rejected");
+    }
+
+    // ── MD-7: RefreshToken zeroization tests ──────────────────────────
+
+    #[test]
+    fn refresh_token_drop_runs_without_panic() {
+        let rt = RefreshToken {
+            token: "rt_deadbeef".to_string(),
+            user_id: Uuid::new_v4(),
+            client_id: "client-x".to_string(),
+            scope: "openid profile".to_string(),
+            expires_at: 9999999999,
+            used: false,
+            family_id: "fam_test".to_string(),
+        };
+        drop(rt);
+    }
+
+    #[test]
+    fn refresh_token_debug_redacts_sensitive_fields() {
+        let rt = RefreshToken {
+            token: "rt_supersecret".to_string(),
+            user_id: Uuid::new_v4(),
+            client_id: "secret-client".to_string(),
+            scope: "openid".to_string(),
+            expires_at: 9999999999,
+            used: false,
+            family_id: "fam_secret".to_string(),
+        };
+        let debug_str = format!("{:?}", rt);
+        assert!(debug_str.contains("[REDACTED]"), "token must be redacted");
+        assert!(!debug_str.contains("rt_supersecret"), "raw token must not appear in Debug");
+        assert!(!debug_str.contains("secret-client"), "client_id must not appear in Debug");
+        assert!(!debug_str.contains("fam_secret"), "family_id must not appear in Debug");
+    }
+
+    // ── MD-10: RefreshTokenStore no Default ───────────────────────────
+
+    #[test]
+    fn refresh_token_store_new_succeeds_outside_military() {
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        let store = RefreshTokenStore::new();
+        assert!(store.is_ok(), "RefreshTokenStore::new() must succeed outside military mode");
+    }
+
+    #[test]
+    fn refresh_token_store_debug_redacts() {
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        let store = RefreshTokenStore::new().unwrap();
+        let debug_str = format!("{:?}", store);
+        assert!(debug_str.contains("token_count"), "debug must show token count");
+        assert!(!debug_str.contains("rt_"), "debug must not contain raw tokens");
+    }
+
+    #[test]
+    fn refresh_token_store_drop_zeroizes_keys() {
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        let mut store = RefreshTokenStore::new().unwrap();
+        let user = Uuid::new_v4();
+        store.issue(user, "c1", "openid");
+        store.issue(user, "c2", "openid profile");
+        assert_eq!(store.tokens.len(), 2);
+        drop(store);
+        // If drop panics, the test fails. This verifies safe zeroization.
     }
 }

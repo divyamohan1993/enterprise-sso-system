@@ -37,6 +37,8 @@ pub struct MerkleTree {
     root: Option<MerkleNode>,
     /// Sorted entries: key -> SHA-512 hash of the value.
     leaves: BTreeMap<Vec<u8>, Hash512>,
+    /// Dirty flag: set when leaves change, cleared on rebuild.
+    dirty: bool,
 }
 
 impl MerkleTree {
@@ -44,12 +46,24 @@ impl MerkleTree {
         Self {
             root: None,
             leaves: BTreeMap::new(),
+            dirty: false,
         }
     }
 
     /// Insert or update an entry. The caller provides the SHA-512 hash of the value.
+    /// Sets the dirty flag but does not rebuild the tree. Call `rebuild_if_dirty()`
+    /// or `root_hash()` to trigger a rebuild when needed.
     pub fn insert(&mut self, key: Vec<u8>, value_hash: Hash512) {
         self.leaves.insert(key, value_hash);
+        self.dirty = true;
+    }
+
+    /// Insert multiple entries and rebuild the tree once at the end.
+    /// More efficient than calling `insert()` in a loop when adding many entries.
+    pub fn insert_batch(&mut self, entries: impl IntoIterator<Item = (Vec<u8>, Hash512)>) {
+        for (key, value_hash) in entries {
+            self.leaves.insert(key, value_hash);
+        }
         self.rebuild();
     }
 
@@ -57,13 +71,30 @@ impl MerkleTree {
     pub fn remove(&mut self, key: &[u8]) -> bool {
         let removed = self.leaves.remove(key).is_some();
         if removed {
-            self.rebuild();
+            self.dirty = true;
         }
         removed
     }
 
+    /// Rebuild the tree if any modifications have been made since the last rebuild.
+    pub fn rebuild_if_dirty(&mut self) {
+        if self.dirty {
+            self.rebuild();
+        }
+    }
+
     /// Get the root hash for quick comparison. Empty tree returns all-zeros.
-    pub fn root_hash(&self) -> Hash512 {
+    /// Triggers a rebuild if the tree is dirty.
+    pub fn root_hash(&mut self) -> Hash512 {
+        self.rebuild_if_dirty();
+        self.root_hash_cached()
+    }
+
+    /// Get the cached root hash without rebuilding.
+    /// Returns the hash from the last rebuild. If inserts have occurred since
+    /// the last rebuild, this may be stale. Call `rebuild_if_dirty()` first
+    /// if you need a current hash.
+    pub fn root_hash_cached(&self) -> Hash512 {
         self.root.as_ref().map_or(EMPTY_HASH, |n| n.hash)
     }
 
@@ -78,6 +109,8 @@ impl MerkleTree {
 
     /// Verify internal consistency: recompute all hashes bottom-up and check
     /// they match the stored hashes.
+    /// Note: if the tree is dirty, verification checks the last-rebuilt state.
+    /// Call `rebuild_if_dirty()` first for a current verification.
     pub fn verify_tree(&self) -> bool {
         match &self.root {
             None => self.leaves.is_empty(),
@@ -106,6 +139,7 @@ impl MerkleTree {
     // -- internal --
 
     fn rebuild(&mut self) {
+        self.dirty = false;
         if self.leaves.is_empty() {
             self.root = None;
             return;
@@ -118,6 +152,13 @@ impl MerkleTree {
 impl Default for MerkleTree {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl MerkleTree {
+    /// Check if the tree has uncommitted modifications.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
     }
 }
 
@@ -249,9 +290,13 @@ impl MerkleSync {
     /// Find all differences between two trees efficiently.
     /// Uses sorted key iteration (O(n) worst case, but the common case where
     /// trees are mostly identical exits early via hash comparison at each level).
-    pub fn find_differences(local: &MerkleTree, remote: &MerkleTree) -> SyncDiff {
+    /// Both trees must be up-to-date (call `rebuild_if_dirty()` before calling).
+    pub fn find_differences(local: &mut MerkleTree, remote: &mut MerkleTree) -> SyncDiff {
+        local.rebuild_if_dirty();
+        remote.rebuild_if_dirty();
+
         // Fast path: identical roots means identical state.
-        if local.root_hash() == remote.root_hash() {
+        if local.root_hash_cached() == remote.root_hash_cached() {
             return SyncDiff::default();
         }
 
@@ -421,7 +466,7 @@ mod tests {
 
     #[test]
     fn empty_tree() {
-        let t = MerkleTree::new();
+        let mut t = MerkleTree::new();
         assert_eq!(t.root_hash(), EMPTY_HASH);
         assert!(t.is_empty());
         assert!(t.verify_tree());
@@ -443,6 +488,7 @@ mod tests {
             t.insert(format!("key_{i:04}").into_bytes(), h(&i.to_le_bytes()));
         }
         assert_eq!(t.len(), 20);
+        t.rebuild_if_dirty();
         assert!(t.verify_tree());
     }
 
@@ -465,6 +511,7 @@ mod tests {
         t.remove(b"k2");
         assert_eq!(t.len(), 1);
         assert_ne!(t.root_hash(), r_before);
+        t.rebuild_if_dirty();
         assert!(t.verify_tree());
     }
 
@@ -479,7 +526,7 @@ mod tests {
             b.insert(k, v);
         }
         assert!(MerkleSync::compare_roots(&a.root_hash(), &b.root_hash()));
-        let diff = MerkleSync::find_differences(&a, &b);
+        let diff = MerkleSync::find_differences(&mut a, &mut b);
         assert!(diff.is_empty());
     }
 
@@ -492,7 +539,7 @@ mod tests {
         remote.insert(b"k1".to_vec(), h(b"v1"));
         remote.insert(b"k2".to_vec(), h(b"v2")); // only remote has this
 
-        let diff = MerkleSync::find_differences(&local, &remote);
+        let diff = MerkleSync::find_differences(&mut local, &mut remote);
         assert_eq!(diff.missing_local, vec![b"k2".to_vec()]);
         assert!(diff.missing_remote.is_empty());
         assert!(diff.divergent.is_empty());
@@ -507,7 +554,7 @@ mod tests {
         local.insert(b"k2".to_vec(), h(b"v2")); // only local
         remote.insert(b"k1".to_vec(), h(b"v1"));
 
-        let diff = MerkleSync::find_differences(&local, &remote);
+        let diff = MerkleSync::find_differences(&mut local, &mut remote);
         assert!(diff.missing_local.is_empty());
         assert_eq!(diff.missing_remote, vec![b"k2".to_vec()]);
     }
@@ -520,7 +567,7 @@ mod tests {
         local.insert(b"k1".to_vec(), h(b"v1_local"));
         remote.insert(b"k1".to_vec(), h(b"v1_remote"));
 
-        let diff = MerkleSync::find_differences(&local, &remote);
+        let diff = MerkleSync::find_differences(&mut local, &mut remote);
         assert!(diff.missing_local.is_empty());
         assert!(diff.missing_remote.is_empty());
         assert_eq!(diff.divergent, vec![b"k1".to_vec()]);
@@ -535,7 +582,7 @@ mod tests {
         remote.insert(b"k1".to_vec(), h(b"v1"));
         remote.insert(b"k2".to_vec(), h(b"v2"));
 
-        let diff = MerkleSync::find_differences(&local.tree, &remote.tree);
+        let diff = MerkleSync::find_differences(&mut local.tree, &mut remote.tree);
         assert_eq!(diff.missing_local.len(), 1);
 
         // Reconcile: fetch from remote with a permissive verify_fn (test mode)
@@ -561,7 +608,7 @@ mod tests {
         local.insert(b"k1".to_vec(), h(b"old"));
         remote.insert(b"k1".to_vec(), h(b"new"));
 
-        let diff = MerkleSync::find_differences(&local.tree, &remote.tree);
+        let diff = MerkleSync::find_differences(&mut local.tree, &mut remote.tree);
         assert_eq!(diff.divergent.len(), 1);
 
         let remote_tree = &remote.tree;
@@ -584,12 +631,14 @@ mod tests {
             t.insert(format!("key_{i:06}").into_bytes(), h(&i.to_le_bytes()));
         }
         assert_eq!(t.len(), 1000);
+        t.rebuild_if_dirty();
         assert!(t.verify_tree());
 
         // Remove some and verify
         for i in (0u32..1000).step_by(3) {
             t.remove(format!("key_{i:06}").as_bytes());
         }
+        t.rebuild_if_dirty();
         assert!(t.verify_tree());
     }
 
@@ -612,9 +661,39 @@ mod tests {
         local.insert(b"divergent".to_vec(), h(b"version_a"));
         remote.insert(b"divergent".to_vec(), h(b"version_b"));
 
-        let diff = MerkleSync::find_differences(&local, &remote);
+        let diff = MerkleSync::find_differences(&mut local, &mut remote);
         assert_eq!(diff.missing_local, vec![b"remote_only".to_vec()]);
         assert_eq!(diff.missing_remote, vec![b"local_only".to_vec()]);
         assert_eq!(diff.divergent, vec![b"divergent".to_vec()]);
+    }
+
+    #[test]
+    fn insert_batch_rebuilds_once() {
+        let mut t = MerkleTree::new();
+        let entries: Vec<_> = (0u32..100)
+            .map(|i| (format!("key_{i:04}").into_bytes(), h(&i.to_le_bytes())))
+            .collect();
+        t.insert_batch(entries);
+        assert_eq!(t.len(), 100);
+        assert!(!t.is_dirty());
+        assert!(t.verify_tree());
+    }
+
+    #[test]
+    fn dirty_flag_lifecycle() {
+        let mut t = MerkleTree::new();
+        assert!(!t.is_dirty());
+
+        t.insert(b"k1".to_vec(), h(b"v1"));
+        assert!(t.is_dirty());
+
+        t.rebuild_if_dirty();
+        assert!(!t.is_dirty());
+
+        t.remove(b"k1");
+        assert!(t.is_dirty());
+
+        let _ = t.root_hash(); // triggers rebuild
+        assert!(!t.is_dirty());
     }
 }

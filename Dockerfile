@@ -4,7 +4,8 @@
 # and read-only filesystem compatibility.
 
 # ── Stage 1: Builder ─────────────────────────────────────────────────────────
-FROM rust:1.88-bookworm AS builder
+# pinned 2026-04-11 rust:1.88-bookworm
+FROM rust:1.88-bookworm@sha256:59c4f641af5de26e5970c79e2ea4e43f30aa0b2e3ac3bafc0211cce2a01e9e5c AS builder
 
 ARG SERVICE_NAME=gateway
 ENV CARGO_TERM_COLOR=always \

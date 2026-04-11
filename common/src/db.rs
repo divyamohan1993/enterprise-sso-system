@@ -811,9 +811,12 @@ pub async fn init_database(database_url: &str) -> Result<PgPool, String> {
         tracing::warn!("migration: create users_email_hash_unique index failed: {}", e);
     }
 
-    // Migration: DROP plaintext email column when feature flag is enabled.
-    // Guarded by MILNET_DROP_PLAINTEXT_EMAIL=1 for backward compatibility during rollout.
-    if std::env::var("MILNET_DROP_PLAINTEXT_EMAIL").as_deref() == Ok("1") {
+    // Migration: DROP plaintext email column when feature flag is enabled OR
+    // in military mode (auto-triggered by MD-6 fix above). The env var provides
+    // an explicit opt-in for non-military deployments during rollout.
+    if std::env::var("MILNET_DROP_PLAINTEXT_EMAIL").as_deref() == Ok("1")
+        || crate::config::require_hardware_security()
+    {
         if let Err(e) = sqlx::query("ALTER TABLE users DROP COLUMN IF EXISTS email")
             .execute(&pool).await {
             tracing::error!("migration: DROP plaintext email column failed: {}", e);
@@ -838,29 +841,116 @@ pub async fn init_database(database_url: &str) -> Result<PgPool, String> {
         tracing::warn!("migration: add username_encrypted column failed: {}", e);
     }
 
-    // DEPRECATED: plaintext `username` column retained for rolling migration only.
-    // All new lookups MUST use username_blind_idx. In military mode, plaintext column
-    // is ignored entirely. Will be dropped in a future migration.
-
-    // In military mode: verify plaintext email column does not contain live data.
+    // ── MD-5: Drop plaintext username column in military mode ──
+    // In military mode, the plaintext username column is a data exposure risk.
+    // Verify encrypted columns exist, then drop the plaintext column.
     if crate::config::require_hardware_security() {
         tracing::warn!("MILITARY MODE: plaintext username/email columns are deprecated. Use blind indexes only.");
-        let plaintext_email_count: Option<(i64,)> = sqlx::query_as(
-            "SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'email'"
+
+        // Check that encrypted username infrastructure exists before dropping plaintext.
+        let has_encrypted: Option<(i64,)> = sqlx::query_as(
+            "SELECT COUNT(*) FROM information_schema.columns \
+             WHERE table_name = 'users' AND column_name IN ('username_encrypted', 'username_blind_idx')"
         ).fetch_optional(&pool).await.map_err(|e| format!("military check failed: {e}"))?;
-        if let Some((count,)) = plaintext_email_count {
-            if count > 0 {
+
+        if has_encrypted.map(|(c,)| c >= 2).unwrap_or(false) {
+            // Both encrypted columns exist. Drop the plaintext username column.
+            match sqlx::query("ALTER TABLE users DROP COLUMN IF EXISTS username")
+                .execute(&pool).await
+            {
+                Ok(_) => {
+                    tracing::info!("MILITARY MODE: plaintext username column dropped successfully");
+                    crate::siem::emit_runtime_error(
+                        crate::siem::category::COMPLIANCE_ALERT,
+                        "Plaintext username column dropped from users table in military mode",
+                        "plaintext column removal",
+                        file!(), line!(), column!(), module_path!(),
+                    );
+                }
+                Err(e) => {
+                    tracing::error!("MILITARY MODE: failed to drop plaintext username column: {e}");
+                }
+            }
+        } else {
+            crate::siem::emit_runtime_error(
+                crate::siem::category::COMPLIANCE_ALERT,
+                "WARNING: Cannot drop plaintext username column -- encrypted columns not yet populated. \
+                 Run username encryption migration first.",
+                "plaintext username column persists",
+                file!(), line!(), column!(), module_path!(),
+            );
+        }
+
+        // ── MD-6: Auto-drop plaintext email column in military mode ──
+        // In military mode, automatically drop the plaintext email column
+        // without requiring MILNET_DROP_PLAINTEXT_EMAIL env var.
+        let has_email_encrypted: Option<(i64,)> = sqlx::query_as(
+            "SELECT COUNT(*) FROM information_schema.columns \
+             WHERE table_name = 'users' AND column_name IN ('email_encrypted', 'email_hash')"
+        ).fetch_optional(&pool).await.map_err(|e| format!("military check failed: {e}"))?;
+
+        if has_email_encrypted.map(|(c,)| c >= 2).unwrap_or(false) {
+            // Check for live plaintext email data before dropping.
+            let plaintext_email_col: Option<(i64,)> = sqlx::query_as(
+                "SELECT COUNT(*) FROM information_schema.columns \
+                 WHERE table_name = 'users' AND column_name = 'email'"
+            ).fetch_optional(&pool).await.map_err(|e| format!("military check failed: {e}"))?;
+
+            if plaintext_email_col.map(|(c,)| c > 0).unwrap_or(false) {
                 let data_count: (i64,) = sqlx::query_as(
                     "SELECT COUNT(*) FROM users WHERE email IS NOT NULL AND email != ''"
                 ).fetch_one(&pool).await.map_err(|e| format!("military check failed: {e}"))?;
                 if data_count.0 > 0 {
+                    crate::siem::emit_runtime_error(
+                        crate::siem::category::COMPLIANCE_ALERT,
+                        &format!(
+                            "CRITICAL: {} rows still have plaintext email data in military mode. \
+                             Data must be migrated to email_encrypted before column can be dropped.",
+                            data_count.0
+                        ),
+                        "plaintext email data in military mode",
+                        file!(), line!(), column!(), module_path!(),
+                    );
                     panic!(
                         "MILITARY MODE VIOLATION: {} rows still have plaintext email data. \
-                         Run migration or set MILNET_DROP_PLAINTEXT_EMAIL=1",
+                         Migrate data to email_encrypted column before deployment.",
                         data_count.0
                     );
                 }
+
+                // No live data, safe to drop.
+                match sqlx::query("ALTER TABLE users DROP COLUMN IF EXISTS email")
+                    .execute(&pool).await
+                {
+                    Ok(_) => {
+                        tracing::info!("MILITARY MODE: plaintext email column dropped successfully");
+                        crate::siem::emit_runtime_error(
+                            crate::siem::category::COMPLIANCE_ALERT,
+                            "Plaintext email column dropped from users table in military mode",
+                            "plaintext column removal",
+                            file!(), line!(), column!(), module_path!(),
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!("MILITARY MODE: failed to drop plaintext email column: {e}");
+                    }
+                }
             }
+        }
+    } else {
+        // Non-military mode: warn about plaintext columns.
+        let has_plaintext_username: Option<(i64,)> = sqlx::query_as(
+            "SELECT COUNT(*) FROM information_schema.columns \
+             WHERE table_name = 'users' AND column_name = 'username'"
+        ).fetch_optional(&pool).await.map_err(|e| format!("check failed: {e}"))?;
+        if has_plaintext_username.map(|(c,)| c > 0).unwrap_or(false) {
+            crate::siem::emit_runtime_error(
+                crate::siem::category::COMPLIANCE_ALERT,
+                "WARNING: Plaintext username column exists in users table. \
+                 Enable military mode or migrate to encrypted columns.",
+                "plaintext username column present",
+                file!(), line!(), column!(), module_path!(),
+            );
         }
     }
 

@@ -25,6 +25,7 @@ postcard = { version = "1", features = ["alloc"] }
 sha2 = "0.10"
 hkdf = "0.12"
 toml = "0.8"
+base64 = "0.22"
 risk = { path = "../risk" }
 kt = { path = "../kt" }
 

@@ -77,6 +77,7 @@ ignore = [
     # No known security vulnerability — this advisory is "unmaintained" only.
     # Re-evaluate when heapless >= 0.9 drops the atomic-polyfill dependency.
     { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill unmaintained — transitive via postcard->heapless, no security impact on x86_64; dead code on native-atomic targets" },
+    # REVIEW-BY: 2026-09-30 -- migrate to aws-lc-rs RSA or remove RSA entirely
     { id = "RUSTSEC-2023-0071", reason = "RSA used only for Google JWKS RS256 verification (not signing). Mitigated with 50ms timing floor in google_oauth.rs. No fix available upstream; monitoring for replacement." },
     #{ crate = "a-crate-that-is-yanked@0.1.1", reason = "you can specify why you are ignoring the yanked crate" },
 ]
@@ -188,6 +189,8 @@ deny = [
     { crate = "rustls-pemfile", reason = "UNMAINTAINED (RUSTSEC-2025-0134) — use rustls-pki-types PemObject or inline PEM parsing" },
     { crate = "ring", reason = "Use aws-lc-rs instead — ring lacks FIPS certification and post-quantum readiness required for CNSA 2.0" },
     { crate = "libsqlite3-sys", reason = "Avoid native SQLite C dependency — use rusqlite with bundled feature or pure-Rust alternative" },
+    { crate = "native-tls", reason = "Use rustls exclusively" },
+    { crate = "openssl-probe", reason = "No OpenSSL dependency allowed" },
 ]
 
 # List of features to allow/deny

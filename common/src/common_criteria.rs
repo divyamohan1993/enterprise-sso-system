@@ -260,6 +260,85 @@ pub fn default_sfr_mapping() -> Vec<SecurityFunctionalRequirement> {
             ],
             implemented: true,
         },
+        // ── FTP: Trusted Path ──
+        SecurityFunctionalRequirement {
+            sfr_id: "FTP_ITC.1".to_string(),
+            title: "Inter-TSF trusted channel".to_string(),
+            cc_class: "FTP".to_string(),
+            implementation: "mTLS with certificate pinning between all internal modules. \
+                TLS 1.3 with CNSA 2.0 cipher suites for all external communications."
+                .to_string(),
+            code_modules: vec![
+                "shard/src/tls.rs".to_string(),
+                "gateway/src/main.rs".to_string(),
+            ],
+            implemented: true,
+        },
+        SecurityFunctionalRequirement {
+            sfr_id: "FTP_TRP.1".to_string(),
+            title: "Trusted path".to_string(),
+            cc_class: "FTP".to_string(),
+            implementation: "TLS 1.3 trusted path for all user-facing communications. \
+                DPoP proof-of-possession prevents token interception."
+                .to_string(),
+            code_modules: vec![
+                "crypto/src/dpop.rs".to_string(),
+            ],
+            implemented: true,
+        },
+        // ── FMT: Security Management ──
+        SecurityFunctionalRequirement {
+            sfr_id: "FMT_SMF.1".to_string(),
+            title: "Specification of management functions".to_string(),
+            cc_class: "FMT".to_string(),
+            implementation: "Admin service exposes management functions with RBAC. \
+                Key rotation, user management, and policy configuration available \
+                through authenticated admin API."
+                .to_string(),
+            code_modules: vec![
+                "admin/src/routes.rs".to_string(),
+                "common/src/idm.rs".to_string(),
+            ],
+            implemented: false, // Not fully verified: admin API coverage incomplete
+        },
+        SecurityFunctionalRequirement {
+            sfr_id: "FMT_SMR.1".to_string(),
+            title: "Security management roles".to_string(),
+            cc_class: "FMT".to_string(),
+            implementation: "RBAC roles defined (admin, operator, viewer). Role assignment \
+                requires ceremony approval at elevated tiers."
+                .to_string(),
+            code_modules: vec![
+                "common/src/idm.rs".to_string(),
+                "common/src/conditional_access.rs".to_string(),
+            ],
+            implemented: true,
+        },
+        // ── FTA: TOE Access ──
+        SecurityFunctionalRequirement {
+            sfr_id: "FTA_SSL.1".to_string(),
+            title: "TSF-initiated session locking".to_string(),
+            cc_class: "FTA".to_string(),
+            implementation: "Session idle timeout locks sessions after configurable period. \
+                Sovereign tier uses reduced timeouts."
+                .to_string(),
+            code_modules: vec![
+                "common/src/session_limits.rs".to_string(),
+            ],
+            implemented: true,
+        },
+        SecurityFunctionalRequirement {
+            sfr_id: "FTA_TSE.1".to_string(),
+            title: "TOE session establishment".to_string(),
+            cc_class: "FTA".to_string(),
+            implementation: "Conditional access policies control session establishment based \
+                on device tier, risk score, and classification level."
+                .to_string(),
+            code_modules: vec![
+                "common/src/conditional_access.rs".to_string(),
+            ],
+            implemented: false, // Not fully verified: conditional access policy engine incomplete
+        },
     ]
 }
 
@@ -500,12 +579,33 @@ impl SecurityTarget {
     }
 
     /// Return the fraction of SFRs that are fully implemented (0.0 to 1.0).
+    ///
+    /// Uses the `implemented` flag on each SFR. SFRs marked `implemented: false`
+    /// have not been verified and reduce the coverage percentage.
     pub fn sfr_implementation_coverage(&self) -> f64 {
         if self.sfrs.is_empty() {
-            return 1.0;
+            return 0.0;
         }
-        let implemented = self.sfrs.iter().filter(|s| s.implemented).count();
-        implemented as f64 / self.sfrs.len() as f64
+        let verified = self.sfrs.iter().filter(|s| s.implemented).count();
+        verified as f64 / self.sfrs.len() as f64
+    }
+
+    /// Return SFRs that are NOT implemented.
+    pub fn unimplemented_sfrs(&self) -> Vec<&SecurityFunctionalRequirement> {
+        self.sfrs.iter().filter(|s| !s.implemented).collect()
+    }
+
+    /// Return the CC functional classes covered by implemented SFRs.
+    pub fn covered_classes(&self) -> Vec<String> {
+        let mut classes: Vec<String> = self
+            .sfrs
+            .iter()
+            .filter(|s| s.implemented)
+            .map(|s| s.cc_class.clone())
+            .collect();
+        classes.sort();
+        classes.dedup();
+        classes
     }
 
     /// Generate a text summary of the Security Target.
@@ -531,10 +631,22 @@ impl SecurityTarget {
             self.sfrs.len()
         ));
 
-        report.push_str(&format!("SAR Count: {}\n", self.sars.len()));
+        let unimpl = self.unimplemented_sfrs();
+        if !unimpl.is_empty() {
+            report.push_str("Unimplemented SFRs:\n");
+            for sfr in &unimpl {
+                report.push_str(&format!("  - {} ({}): {}\n", sfr.sfr_id, sfr.cc_class, sfr.title));
+            }
+        }
+
+        report.push_str(&format!("\nSAR Count: {}\n", self.sars.len()));
         report.push_str(&format!(
             "TOE Components: {}\n",
             self.toe_boundary.included_components.len()
+        ));
+        report.push_str(&format!(
+            "CC Classes Covered: {}\n",
+            self.covered_classes().join(", ")
         ));
 
         report
@@ -569,13 +681,35 @@ mod tests {
     }
 
     #[test]
-    fn test_default_sfrs_all_implemented() {
+    fn test_default_sfrs_have_code_references() {
         let sfrs = default_sfr_mapping();
         assert!(!sfrs.is_empty());
         for sfr in &sfrs {
-            assert!(sfr.implemented, "SFR {} should be implemented", sfr.sfr_id);
             assert!(!sfr.code_modules.is_empty(), "SFR {} must have code references", sfr.sfr_id);
         }
+    }
+
+    #[test]
+    fn test_default_sfrs_include_new_classes() {
+        let sfrs = default_sfr_mapping();
+        let classes: Vec<&str> = sfrs.iter().map(|s| s.cc_class.as_str()).collect();
+        assert!(classes.contains(&"FTP"), "must include FTP (Trusted Path)");
+        assert!(classes.contains(&"FMT"), "must include FMT (Security Management)");
+        assert!(classes.contains(&"FTA"), "must include FTA (TOE Access)");
+    }
+
+    #[test]
+    fn test_sfr_coverage_not_100_percent() {
+        let st = SecurityTarget::milnet_default();
+        // With FMT_SMF.1 and FTA_TSE.1 marked as not implemented, coverage < 1.0
+        assert!(
+            st.sfr_implementation_coverage() < 1.0,
+            "SFR coverage should be < 100% with unimplemented SFRs"
+        );
+        assert!(
+            st.sfr_implementation_coverage() > 0.5,
+            "SFR coverage should be > 50%"
+        );
     }
 
     #[test]
@@ -605,7 +739,8 @@ mod tests {
         assert!(!st.protection_profiles.is_empty());
         assert!(!st.sfrs.is_empty());
         assert!(!st.sars.is_empty());
-        assert_eq!(st.sfr_implementation_coverage(), 1.0);
+        // Coverage is < 100% with honest assessment
+        assert!(st.sfr_implementation_coverage() < 1.0);
     }
 
     #[test]
@@ -615,6 +750,27 @@ mod tests {
         assert!(summary.contains("MILNET Enterprise SSO System"));
         assert!(summary.contains("EAL4"));
         assert!(summary.contains("PP_APP_v1.4"));
-        assert!(summary.contains("100%"));
+        // Coverage is no longer 100%
+        assert!(!summary.contains("100%"), "should not claim 100% with unimplemented SFRs");
+        assert!(summary.contains("Unimplemented SFRs"));
+    }
+
+    #[test]
+    fn test_unimplemented_sfrs_identified() {
+        let st = SecurityTarget::milnet_default();
+        let unimpl = st.unimplemented_sfrs();
+        assert!(!unimpl.is_empty(), "should identify unimplemented SFRs");
+        let ids: Vec<&str> = unimpl.iter().map(|s| s.sfr_id.as_str()).collect();
+        assert!(ids.contains(&"FMT_SMF.1") || ids.contains(&"FTA_TSE.1"),
+            "should include FMT_SMF.1 or FTA_TSE.1 as unimplemented");
+    }
+
+    #[test]
+    fn test_covered_classes() {
+        let st = SecurityTarget::milnet_default();
+        let classes = st.covered_classes();
+        assert!(classes.contains(&"FIA".to_string()));
+        assert!(classes.contains(&"FCS".to_string()));
+        assert!(classes.contains(&"FTP".to_string()));
     }
 }

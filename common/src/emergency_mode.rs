@@ -16,6 +16,64 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------
+// Persistence
+// ---------------------------------------------------------------------------
+
+/// Default path for persisted emergency mode state.
+const DEFAULT_EMERGENCY_STATE_PATH: &str = "/var/lib/milnet/emergency_mode.json";
+
+/// Get the configured emergency state file path.
+fn emergency_state_path() -> String {
+    std::env::var("MILNET_EMERGENCY_STATE_PATH")
+        .unwrap_or_else(|_| DEFAULT_EMERGENCY_STATE_PATH.to_string())
+}
+
+/// Persisted emergency mode state written to disk.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedEmergencyState {
+    active: bool,
+    reason: u8,
+    activated_at_micros: u64,
+}
+
+/// Persist emergency mode state to disk using atomic write (tmp+fsync+rename).
+fn persist_emergency_state(active: bool, reason: u8, activated_at_micros: u64) {
+    let state = PersistedEmergencyState { active, reason, activated_at_micros };
+    let path = emergency_state_path();
+    let tmp = format!("{path}.tmp");
+    let json = match serde_json::to_string(&state) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::error!("failed to serialize emergency state: {e}");
+            return;
+        }
+    };
+    // Ensure parent directory exists
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = std::fs::File::create(&tmp) {
+        use std::io::Write;
+        if f.write_all(json.as_bytes()).is_ok() && f.sync_all().is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+}
+
+/// Load persisted emergency state from disk. Returns None if file doesn't exist.
+fn load_emergency_state() -> Option<PersistedEmergencyState> {
+    let path = emergency_state_path();
+    let data = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+/// Remove the persisted emergency state file.
+fn clear_emergency_state() {
+    let path = emergency_state_path();
+    let _ = std::fs::remove_file(&path);
+}
+
+// ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
@@ -145,10 +203,12 @@ pub struct EmergencyMode {
 }
 
 impl EmergencyMode {
-    /// Create a new inactive emergency mode tracker.
+    /// Create a new emergency mode tracker.
+    /// Restores persisted state from disk if available: if emergency mode was
+    /// active when the process last exited, it will be re-entered on startup.
     pub fn new() -> Self {
         let deadline = Self::micros_from_now(DEAD_MAN_SWITCH_TIMEOUT);
-        Self {
+        let em = Self {
             active: AtomicBool::new(false),
             activated_at_micros: AtomicU64::new(0),
             reason: AtomicU8::new(0),
@@ -156,7 +216,25 @@ impl EmergencyMode {
             consecutive_signing_failures: AtomicU32::new(0),
             healthy_peer_count: AtomicU32::new(min_healthy_peers()),
             dead_man_switch_deadline: AtomicU64::new(deadline),
+        };
+
+        // Restore persisted state from disk
+        if let Some(state) = load_emergency_state() {
+            if state.active {
+                em.active.store(true, Ordering::SeqCst);
+                em.activated_at_micros.store(state.activated_at_micros, Ordering::SeqCst);
+                em.reason.store(state.reason, Ordering::SeqCst);
+                let reason_name = EmergencyReason::from_u8(state.reason)
+                    .map(|r| r.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                tracing::warn!(
+                    reason = %reason_name,
+                    "EMERGENCY MODE RESTORED from persisted state on startup"
+                );
+            }
         }
+
+        em
     }
 
     /// Check all trigger conditions and activate emergency mode if any fire.
@@ -203,8 +281,11 @@ impl EmergencyMode {
     fn activate(&self, reason: EmergencyReason) {
         let was_active = self.active.swap(true, Ordering::SeqCst);
         if !was_active {
-            self.activated_at_micros.store(Self::now_micros(), Ordering::SeqCst);
+            let now = Self::now_micros();
+            self.activated_at_micros.store(now, Ordering::SeqCst);
             self.reason.store(reason.to_u8(), Ordering::SeqCst);
+            // Persist to disk so state survives restarts
+            persist_emergency_state(true, reason.to_u8(), now);
         }
 
         if !was_active {
@@ -380,7 +461,7 @@ impl EmergencyMode {
         self.try_deactivate()
     }
 
-    /// Internal deactivation: reset all state and emit SIEM event.
+    /// Internal deactivation: reset all state, clear persisted state, and emit SIEM event.
     fn do_deactivate(&self) {
         let reason_val = self.reason.load(Ordering::SeqCst);
         let reason_name = EmergencyReason::from_u8(reason_val)
@@ -390,6 +471,9 @@ impl EmergencyMode {
         self.active.store(false, Ordering::SeqCst);
         self.activated_at_micros.store(0, Ordering::SeqCst);
         self.reason.store(0, Ordering::SeqCst);
+
+        // Clear persisted state from disk
+        clear_emergency_state();
 
         // Reset dead man switch deadline
         let new_deadline = Self::micros_from_now(DEAD_MAN_SWITCH_TIMEOUT);
@@ -817,6 +901,52 @@ mod tests {
         // Dead man switch should be reset to future, so tick should NOT fire
         em.dead_man_switch_tick();
         assert!(!em.is_active());
+    }
+
+    #[test]
+    fn persistence_survives_restart() {
+        // Use a temp file for this test
+        let dir = std::env::temp_dir().join("milnet_emergency_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("emergency_mode.json");
+        std::env::set_var("MILNET_EMERGENCY_STATE_PATH", path.to_str().unwrap());
+
+        // Clean up any prior state
+        let _ = std::fs::remove_file(&path);
+
+        // Activate emergency mode
+        {
+            let em = EmergencyMode::new();
+            assert!(!em.is_active());
+            em.manual_activate();
+            assert!(em.is_active());
+            assert_eq!(em.reason(), Some(EmergencyReason::ManualTrigger));
+        }
+
+        // "Restart" by creating a new instance -- should restore state
+        {
+            let em = EmergencyMode::new();
+            assert!(em.is_active(), "emergency mode should be restored from disk");
+            assert_eq!(em.reason(), Some(EmergencyReason::ManualTrigger));
+
+            // Deactivate
+            let past = EmergencyMode::now_micros()
+                .saturating_sub(Duration::from_secs(31).as_micros() as u64);
+            em.activated_at_micros.store(past, Ordering::SeqCst);
+            assert!(em.manual_deactivate());
+            assert!(!em.is_active());
+        }
+
+        // After deactivation, restart should not re-enter emergency mode
+        {
+            let em = EmergencyMode::new();
+            assert!(!em.is_active(), "emergency mode should not restore after deactivation");
+        }
+
+        // Clean up
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+        std::env::remove_var("MILNET_EMERGENCY_STATE_PATH");
     }
 
     #[test]

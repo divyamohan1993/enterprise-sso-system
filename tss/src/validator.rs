@@ -10,7 +10,8 @@ pub enum ReceiptVerificationKey<'a> {
     /// ML-DSA-87 asymmetric verifying key (preferred, CNSA 2.0 compliant).
     /// The verifying key is the encoded ML-DSA-87 public key (1952 bytes).
     MlDsa87(&'a [u8]),
-    /// Both keys available — prefer ML-DSA-87, fall back to HMAC.
+    /// Both keys available — in military mode both must pass (AND logic).
+    /// In non-military mode, ML-DSA-87 is preferred with HMAC fallback.
     Both {
         hmac_key: &'a [u8; 64],
         mldsa87_key: &'a [u8],
@@ -19,9 +20,10 @@ pub enum ReceiptVerificationKey<'a> {
 
 /// Verify a single receipt's signature using the specified key.
 ///
-/// When `Both` keys are provided, ML-DSA-87 is preferred.  HMAC is only
-/// attempted if no ML-DSA-87 key is available or if ML-DSA-87 verification fails
-/// (to support migration from symmetric to asymmetric signing).
+/// In military mode (MILNET_MILITARY_DEPLOYMENT=1), the `Both` variant requires
+/// BOTH ML-DSA-87 AND HMAC to pass (AND logic). MILNET_RECEIPT_PQ_ONLY defaults
+/// to "1" in military mode but can be overridden. In non-military mode, ML-DSA-87
+/// is preferred with HMAC fallback for migration.
 fn verify_receipt_with_key(receipt: &Receipt, key: &ReceiptVerificationKey<'_>) -> bool {
     match key {
         ReceiptVerificationKey::Hmac(hmac_key) => {
@@ -32,17 +34,24 @@ fn verify_receipt_with_key(receipt: &Receipt, key: &ReceiptVerificationKey<'_>) 
             crypto::receipts::verify_receipt_asymmetric(mldsa87_key, &data, &receipt.signature)
         }
         ReceiptVerificationKey::Both { hmac_key, mldsa87_key } => {
-            // Prefer ML-DSA-87 when available; fall back to HMAC for
-            // receipts that were signed before the ML-DSA-87 migration.
             let data = crypto::receipts::receipt_signing_data(receipt);
-            if crypto::receipts::verify_receipt_asymmetric(mldsa87_key, &data, &receipt.signature) {
-                true
+            let pq_ok = crypto::receipts::verify_receipt_asymmetric(mldsa87_key, &data, &receipt.signature);
+            let hmac_ok = verify_receipt_signature(receipt, hmac_key).unwrap_or(false);
+
+            // In military mode (MILNET_MILITARY_DEPLOYMENT=1), PQ-only defaults
+            // to enforced. MILNET_RECEIPT_PQ_ONLY can override explicitly.
+            let military = std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1");
+            let pq_only = match std::env::var("MILNET_RECEIPT_PQ_ONLY") {
+                Ok(v) => v == "1",
+                Err(_) => military, // default to true in military mode
+            };
+
+            if pq_only {
+                // Military/PQ-only: BOTH must pass (AND logic, no fallback)
+                pq_ok && hmac_ok
             } else {
-                // If PQ-only mode is enforced, do not fall back to HMAC
-                if std::env::var("MILNET_RECEIPT_PQ_ONLY").is_ok() {
-                    return false;
-                }
-                verify_receipt_signature(receipt, hmac_key).unwrap_or(false)
+                // Migration mode: ML-DSA-87 preferred, HMAC fallback
+                if pq_ok { true } else { hmac_ok }
             }
         }
     }

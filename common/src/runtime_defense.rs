@@ -268,6 +268,43 @@ pub fn runtime_defense_sweep(expected_binary_hash: &[u8; 64]) -> Vec<RuntimeAler
     alerts
 }
 
+/// Verify that the process is running in a separate PID namespace.
+///
+/// Checks `/proc/self/ns/pid` vs `/proc/1/ns/pid`. If they match, the process
+/// shares the host PID namespace, which means no namespace isolation between
+/// services. Returns `true` if the process is in an isolated namespace.
+pub fn verify_pid_namespace_isolation() -> bool {
+    let self_ns = match std::fs::read_link("/proc/self/ns/pid") {
+        Ok(p) => p,
+        Err(_) => {
+            tracing::warn!("cannot read /proc/self/ns/pid; namespace isolation check skipped");
+            return false;
+        }
+    };
+    let init_ns = match std::fs::read_link("/proc/1/ns/pid") {
+        Ok(p) => p,
+        Err(_) => {
+            // Cannot read init ns -- likely already in a container
+            tracing::info!("cannot read /proc/1/ns/pid; likely running in a container (isolated)");
+            return true;
+        }
+    };
+
+    let isolated = self_ns != init_ns;
+    if !isolated {
+        tracing::warn!(
+            target: "siem",
+            self_ns = ?self_ns,
+            "SIEM:WARNING process shares the host PID namespace. \
+             No namespace isolation between services. Deploy in separate \
+             PID namespaces (containers, systemd PrivatePIDs) for defense in depth."
+        );
+    } else {
+        tracing::info!("PID namespace isolation verified: process is in a separate namespace");
+    }
+    isolated
+}
+
 impl RuntimeDefenseHandle {
     /// Connect the defense pipeline to a Raft cluster node.
     ///
@@ -300,5 +337,219 @@ impl RuntimeDefenseHandle {
                 }
             }
         });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // runtime_defense_sweep tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sweep_returns_alerts_vec() {
+        // A valid hash that won't match the running binary
+        let fake_hash = [0xAA_u8; 64];
+        let alerts = runtime_defense_sweep(&fake_hash);
+        // Should always return some alerts (binary hash mismatch at minimum)
+        assert!(!alerts.is_empty(), "sweep should detect binary hash mismatch");
+    }
+
+    #[test]
+    fn sweep_detects_binary_integrity_mismatch() {
+        let wrong_hash = [0xFF_u8; 64];
+        let alerts = runtime_defense_sweep(&wrong_hash);
+        let integrity_alert = alerts
+            .iter()
+            .find(|a| a.check == "binary_integrity");
+        assert!(
+            integrity_alert.is_some(),
+            "must detect binary integrity mismatch"
+        );
+        let alert = integrity_alert.unwrap();
+        assert_eq!(alert.severity, "critical");
+        assert!(alert.detail.contains("hash mismatch") || alert.detail.contains("Cannot read"));
+    }
+
+    #[test]
+    fn sweep_checks_debugger_tracer_pid() {
+        // In normal test execution, TracerPid should be 0 (no debugger)
+        let hash = [0x00_u8; 64];
+        let alerts = runtime_defense_sweep(&hash);
+        let debugger_alert = alerts
+            .iter()
+            .find(|a| a.check == "debugger_detection");
+        // Under normal testing, no debugger should be attached
+        // If CI attaches a debugger, this would fire but that's expected
+        if let Some(alert) = debugger_alert {
+            assert_eq!(alert.severity, "critical");
+            assert!(alert.detail.contains("TracerPid"));
+        }
+    }
+
+    #[test]
+    fn sweep_checks_ld_preload() {
+        // Temporarily set LD_PRELOAD and verify detection
+        let original = std::env::var("LD_PRELOAD").ok();
+
+        std::env::set_var("LD_PRELOAD", "/tmp/fake_inject.so");
+        let hash = [0x00_u8; 64];
+        let alerts = runtime_defense_sweep(&hash);
+        let inject_alert = alerts
+            .iter()
+            .find(|a| a.check == "library_injection");
+        assert!(
+            inject_alert.is_some(),
+            "must detect LD_PRELOAD injection"
+        );
+        assert_eq!(inject_alert.unwrap().severity, "critical");
+        assert!(inject_alert.unwrap().detail.contains("LD_PRELOAD"));
+
+        // Restore
+        match original {
+            Some(v) => std::env::set_var("LD_PRELOAD", v),
+            None => std::env::remove_var("LD_PRELOAD"),
+        }
+    }
+
+    #[test]
+    fn sweep_no_ld_preload_no_alert() {
+        let original = std::env::var("LD_PRELOAD").ok();
+        std::env::remove_var("LD_PRELOAD");
+
+        let hash = [0x00_u8; 64];
+        let alerts = runtime_defense_sweep(&hash);
+        let inject_alert = alerts
+            .iter()
+            .find(|a| a.check == "library_injection");
+        assert!(
+            inject_alert.is_none(),
+            "should not alert when LD_PRELOAD is not set"
+        );
+
+        // Restore
+        if let Some(v) = original {
+            std::env::set_var("LD_PRELOAD", v);
+        }
+    }
+
+    #[test]
+    fn sweep_checks_capability_escalation() {
+        let hash = [0x00_u8; 64];
+        let alerts = runtime_defense_sweep(&hash);
+        // In CI, we typically don't have full caps, so no alert expected
+        // Just verify the check runs without panic
+        for alert in &alerts {
+            if alert.check == "capability_escalation" {
+                assert_eq!(alert.severity, "high");
+                assert!(alert.detail.contains("capabilities"));
+            }
+        }
+    }
+
+    #[test]
+    fn sweep_checks_vmlck() {
+        let hash = [0x00_u8; 64];
+        let alerts = runtime_defense_sweep(&hash);
+        // VmLck check: in CI without mlock, VmLck is 0
+        let vmlck_alert = alerts
+            .iter()
+            .find(|a| a.check == "memory_canary");
+        // If VmLck is 0 (which it is in CI without mlock), we get an alert
+        if let Some(alert) = vmlck_alert {
+            assert_eq!(alert.severity, "high");
+            assert!(alert.detail.contains("VmLck"));
+        }
+    }
+
+    #[test]
+    fn runtime_alert_debug_format() {
+        let alert = RuntimeAlert {
+            check: "test_check",
+            severity: "critical",
+            detail: "test detail".to_string(),
+        };
+        let dbg = format!("{:?}", alert);
+        assert!(dbg.contains("test_check"));
+        assert!(dbg.contains("critical"));
+    }
+
+    #[test]
+    fn runtime_alert_clone() {
+        let alert = RuntimeAlert {
+            check: "test_check",
+            severity: "high",
+            detail: "detail".to_string(),
+        };
+        let cloned = alert.clone();
+        assert_eq!(cloned.check, alert.check);
+        assert_eq!(cloned.severity, alert.severity);
+        assert_eq!(cloned.detail, alert.detail);
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_pid_namespace_isolation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn namespace_isolation_returns_bool() {
+        // Just verify it runs without panic and returns a bool
+        let _result = verify_pid_namespace_isolation();
+    }
+
+    // -----------------------------------------------------------------------
+    // start_runtime_defense tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn start_runtime_defense_returns_handle() {
+        let hash = [0xBB_u8; 64];
+        let handle = start_runtime_defense("test-service", 8443, hash);
+        // Verify handle fields are populated
+        assert_ne!(handle.node_id, NodeId::random()); // different random IDs
+        // Pipeline and detector should be accessible
+        let _det = handle.detector.lock().await;
+        let _pip = handle.pipeline.lock().await;
+    }
+
+    #[tokio::test]
+    async fn start_runtime_defense_spawns_tasks() {
+        let hash = [0xCC_u8; 64];
+        let handle = start_runtime_defense("sweep-test", 9443, hash);
+        // Allow the spawned tasks a moment to start
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Verify detector is accessible (tasks didn't panic)
+        let det = handle.detector.lock().await;
+        let _ = det.suspicion_score();
+    }
+
+    // -----------------------------------------------------------------------
+    // sweep with matching binary hash (no integrity alert)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sweep_with_actual_binary_hash() {
+        // Compute the real binary hash and verify no integrity alert
+        if let Ok(binary) = std::fs::read("/proc/self/exe") {
+            use sha2::{Sha512, Digest};
+            let hash = Sha512::digest(&binary);
+            let mut expected = [0u8; 64];
+            expected.copy_from_slice(&hash);
+
+            let alerts = runtime_defense_sweep(&expected);
+            let integrity_alert = alerts
+                .iter()
+                .find(|a| a.check == "binary_integrity");
+            assert!(
+                integrity_alert.is_none(),
+                "should not alert when binary hash matches"
+            );
+        }
     }
 }

@@ -159,32 +159,72 @@ fn hmac_key_variant_wrong_key_rejected() {
 #[serial]
 fn both_key_variant_hmac_fallback() {
     // Receipts signed with HMAC only. When Both is provided with a bogus
-    // ML-DSA-87 key, HMAC fallback should still validate (unless PQ-only).
+    // ML-DSA-87 key, HMAC fallback should still validate in non-military mode.
     let chain = build_chain(1, &SIGNING_KEY_A);
     let bogus_mldsa = [0u8; 32]; // wrong size, will fail ML-DSA-87 verify
     let key = ReceiptVerificationKey::Both {
         hmac_key: &SIGNING_KEY_A,
         mldsa87_key: &bogus_mldsa,
     };
-    // Ensure PQ-only env var is NOT set for this test
+    // Ensure both env vars are NOT set for this test
     std::env::remove_var("MILNET_RECEIPT_PQ_ONLY");
+    std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
     assert!(validate_receipt_chain_with_key(&chain, &key).is_ok());
 }
 
 #[test]
 #[serial]
 fn both_key_pq_only_blocks_hmac_fallback() {
-    // When MILNET_RECEIPT_PQ_ONLY is set, HMAC fallback is blocked.
+    // When MILNET_RECEIPT_PQ_ONLY is set, Both requires AND logic (both must pass).
+    // With bogus ML-DSA key, PQ fails, so chain must be rejected.
     let chain = build_chain(1, &SIGNING_KEY_A);
     let bogus_mldsa = [0u8; 32];
     let key = ReceiptVerificationKey::Both {
         hmac_key: &SIGNING_KEY_A,
         mldsa87_key: &bogus_mldsa,
     };
+    std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
     std::env::set_var("MILNET_RECEIPT_PQ_ONLY", "1");
     let result = validate_receipt_chain_with_key(&chain, &key);
     std::env::remove_var("MILNET_RECEIPT_PQ_ONLY");
-    assert!(result.is_err(), "PQ-only mode must block HMAC fallback");
+    assert!(result.is_err(), "PQ-only mode must require both signatures to pass");
+}
+
+#[test]
+#[serial]
+fn military_mode_defaults_pq_only() {
+    // In military deployment mode, MILNET_RECEIPT_PQ_ONLY defaults to enforced.
+    // With bogus ML-DSA key, chain must be rejected even without explicit PQ_ONLY.
+    let chain = build_chain(1, &SIGNING_KEY_A);
+    let bogus_mldsa = [0u8; 32];
+    let key = ReceiptVerificationKey::Both {
+        hmac_key: &SIGNING_KEY_A,
+        mldsa87_key: &bogus_mldsa,
+    };
+    std::env::remove_var("MILNET_RECEIPT_PQ_ONLY");
+    std::env::set_var("MILNET_MILITARY_DEPLOYMENT", "1");
+    let result = validate_receipt_chain_with_key(&chain, &key);
+    std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+    assert!(result.is_err(), "military mode must default to PQ-only (AND logic)");
+}
+
+#[test]
+#[serial]
+fn military_mode_pq_only_override_disabled() {
+    // Military mode with MILNET_RECEIPT_PQ_ONLY explicitly set to "0" disables PQ-only.
+    // HMAC fallback should work in this case.
+    let chain = build_chain(1, &SIGNING_KEY_A);
+    let bogus_mldsa = [0u8; 32];
+    let key = ReceiptVerificationKey::Both {
+        hmac_key: &SIGNING_KEY_A,
+        mldsa87_key: &bogus_mldsa,
+    };
+    std::env::set_var("MILNET_MILITARY_DEPLOYMENT", "1");
+    std::env::set_var("MILNET_RECEIPT_PQ_ONLY", "0");
+    let result = validate_receipt_chain_with_key(&chain, &key);
+    std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+    std::env::remove_var("MILNET_RECEIPT_PQ_ONLY");
+    assert!(result.is_ok(), "explicit PQ_ONLY=0 overrides military default");
 }
 
 #[test]

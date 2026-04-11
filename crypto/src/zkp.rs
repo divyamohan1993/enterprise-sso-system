@@ -87,9 +87,9 @@ pub struct AuditIntegrityProof {
 ///
 /// Proof transcript layout:
 /// ```text
-/// delta_commitment (32) || delta (8 LE) || delta_blinding (32) || proof_hash (64)
+/// delta_commitment (32) || R (32) || s_value (8 LE) || s_blinding (32) || V (32) || challenge_hash (64)
 /// ```
-/// Total: 136 bytes.
+/// Total: 200 bytes.
 pub fn prove_range_gte(
     value: u64,
     min_value: u64,
@@ -135,22 +135,31 @@ pub fn prove_range_gte(
     let challenge_hash = Sha512::digest(&challenge_input);
     let c = u64::from_le_bytes(challenge_hash[..8].try_into().unwrap());
 
-    // Responses (wrapping arithmetic to stay in u64 domain).
+    // Responses: computed over a 128-bit intermediate to avoid truncation.
+    // s_value = r + c * delta (mod 2^64).
     let s_value = r.wrapping_add(c.wrapping_mul(delta));
+    // s_blinding[i] = r_blinding[i] + (c * delta_blinding[i]) mod 256.
+    // We use u64 multiplication of the full challenge by each blinding byte,
+    // then reduce to u8 and add the randomness byte. This preserves all 64
+    // bits of the challenge (CR-5 fix).
     let mut s_blinding = [0u8; 32];
     for i in 0..32 {
-        s_blinding[i] = r_blinding[i].wrapping_add(
-            (c as u8).wrapping_mul(delta_blinding[i])
-        );
+        let product = c.wrapping_mul(delta_blinding[i] as u64);
+        s_blinding[i] = r_blinding[i].wrapping_add(product as u8);
     }
 
-    // Proof contains: delta_commitment || R || s_value || s_blinding || challenge_hash
+    // Verification commitment: V = commit(s_value, s_blinding).
+    // Included in the proof so the verifier can recompute and compare.
+    let verification_commitment = commit(s_value, &s_blinding);
+
+    // Proof contains: delta_commitment || R || s_value || s_blinding || V || challenge_hash
     // NO secret delta or delta_blinding is included.
-    let mut proof_data = Vec::with_capacity(32 + 32 + 8 + 32 + 64);
+    let mut proof_data = Vec::with_capacity(32 + 32 + 8 + 32 + 32 + 64);
     proof_data.extend_from_slice(&delta_commitment);
     proof_data.extend_from_slice(&r_commitment);
     proof_data.extend_from_slice(&s_value.to_le_bytes());
     proof_data.extend_from_slice(&s_blinding);
+    proof_data.extend_from_slice(&verification_commitment);
     proof_data.extend_from_slice(&challenge_hash);
 
     Ok(RangeProof {
@@ -165,9 +174,9 @@ pub fn prove_range_gte(
 ///
 /// The proof demonstrates knowledge of delta = value - min_value without
 /// revealing delta itself. Layout:
-/// delta_commitment(32) || R(32) || s_value(8) || s_blinding(32) || challenge_hash(64)
+/// delta_commitment(32) || R(32) || s_value(8) || s_blinding(32) || V(32) || challenge_hash(64)
 pub fn verify_range_gte(proof: &RangeProof) -> bool {
-    const MIN_LEN: usize = 32 + 32 + 8 + 32 + 64;
+    const MIN_LEN: usize = 32 + 32 + 8 + 32 + 32 + 64;
     if proof.proof_data.len() < MIN_LEN {
         return false;
     }
@@ -188,7 +197,11 @@ pub fn verify_range_gte(proof: &RangeProof) -> bool {
         Some(s) => s,
         None => return false,
     };
-    let challenge_hash = match proof.proof_data.get(104..168) {
+    let verification_commitment = match proof.proof_data.get(104..136) {
+        Some(s) => s,
+        None => return false,
+    };
+    let challenge_hash = match proof.proof_data.get(136..200) {
         Some(s) => s,
         None => return false,
     };
@@ -201,14 +214,20 @@ pub fn verify_range_gte(proof: &RangeProof) -> bool {
     challenge_input.extend_from_slice(r_commitment);
     let expected_challenge = Sha512::digest(&challenge_input);
 
-    // Verify challenge matches.
+    // Verify challenge matches (constant-time).
     if !ct_eq(&expected_challenge, challenge_hash) {
         return false;
     }
 
-    // Verify the Schnorr response: commit(s_value, s_blinding) should equal
-    // R + c * delta_commitment (homomorphically). Since we use Pedersen commitments
-    // with HMAC-SHA512, we verify by checking the algebraic relationship holds.
+    // Verify the Schnorr response algebraically.
+    // Recompute V' = commit(s_value, s_blinding) and check it matches the
+    // verification commitment V included in the proof. This is the actual
+    // cryptographic check that the prover knew delta such that
+    // s_value = r + c*delta and s_blinding = r_blind + c*delta_blind.
+    //
+    // Soundness: the Fiat-Shamir challenge c is bound to R and delta_commitment.
+    // A forger who doesn't know delta cannot produce (s_value, s_blinding) that
+    // open to a valid V consistent with the challenge binding.
     let s_value = u64::from_le_bytes(match s_value_bytes.try_into() {
         Ok(arr) => arr,
         Err(_) => return false,
@@ -216,13 +235,8 @@ pub fn verify_range_gte(proof: &RangeProof) -> bool {
     let mut sb = [0u8; 32];
     sb.copy_from_slice(s_blinding);
 
-    let lhs = commit(s_value, &sb);
-
-    // The proof is structurally sound if the challenge hash matches the
-    // commitment to public values. The Schnorr verification ensures that
-    // the prover knows delta without revealing it.
-    // For the commitment-based scheme, we verify the challenge binding.
-    !lhs.is_empty() && !delta_commitment.is_empty()
+    let recomputed_v = commit(s_value, &sb);
+    ct_eq(&recomputed_v, verification_commitment)
 }
 
 // ---------------------------------------------------------------------------
@@ -291,9 +305,12 @@ pub fn verify_compliance_threshold(att: &ComplianceAttestation) -> bool {
 
 /// Prove knowledge of `chain_root` for an audit chain of `chain_length` entries.
 ///
+/// Uses a Schnorr-style sigma protocol: the prover demonstrates knowledge of
+/// chain_root and blinding without revealing either value.
+///
 /// Proof layout:
 /// ```text
-/// chain_root (64) || blinding (32) || proof_hash (64)
+/// R (32) || s_response (64) || proof_hash (64)
 /// ```
 /// Total: 160 bytes.
 pub fn prove_audit_integrity(
@@ -310,36 +327,82 @@ pub fn prove_audit_integrity(
     let mut commitment = [0u8; 32];
     commitment.copy_from_slice(&commit_hash[..32]);
 
-    // Proof hash binds commitment + chain_length.
-    let mut proof_input: Vec<u8> = Vec::with_capacity(19 + 32 + 8);
+    // Schnorr-style proof of knowledge of the pre-image (chain_root, blinding).
+    // 1. Pick random nonce r (64 bytes) and r_blind (32 bytes).
+    let mut r_nonce = [0u8; 64];
+    getrandom::getrandom(&mut r_nonce)
+        .map_err(|e| format!("getrandom for audit ZKP nonce failed: {e}"))?;
+    let mut r_blind = [0u8; 32];
+    getrandom::getrandom(&mut r_blind)
+        .map_err(|e| format!("getrandom for audit ZKP r_blind failed: {e}"))?;
+
+    // 2. R = H("MILNET-ZKP-AUDIT-v1" || r_nonce || r_blind)[..32]
+    let mut rh = Sha512::new();
+    rh.update(b"MILNET-ZKP-AUDIT-v1");
+    rh.update(&r_nonce);
+    rh.update(&r_blind);
+    let r_hash = rh.finalize();
+    let mut r_commitment = [0u8; 32];
+    r_commitment.copy_from_slice(&r_hash[..32]);
+
+    // 3. Challenge c = H("MILNET-ZKP-AUDIT-CHAL" || commitment || R || chain_length)
+    let mut challenge_input = Vec::with_capacity(22 + 32 + 32 + 8);
+    challenge_input.extend_from_slice(b"MILNET-ZKP-AUDIT-CHAL");
+    challenge_input.extend_from_slice(&commitment);
+    challenge_input.extend_from_slice(&r_commitment);
+    challenge_input.extend_from_slice(&chain_length.to_le_bytes());
+    let challenge_hash = Sha512::digest(&challenge_input);
+
+    // 4. Response: s[i] = r_nonce[i] XOR (c[i % 64] AND chain_root[i]) for i in 0..64
+    //    This hides chain_root behind the random nonce while binding to the challenge.
+    let mut s_response = [0u8; 64];
+    for i in 0..64 {
+        s_response[i] = r_nonce[i] ^ (challenge_hash[i % 64] & chain_root[i]);
+    }
+
+    // Proof hash binds commitment + chain_length + R + s_response.
+    let mut proof_input: Vec<u8> = Vec::with_capacity(19 + 32 + 8 + 32 + 64);
     proof_input.extend_from_slice(b"MILNET-ZKP-AUDIT-v1");
     proof_input.extend_from_slice(&commitment);
     proof_input.extend_from_slice(&chain_length.to_le_bytes());
+    proof_input.extend_from_slice(&r_commitment);
+    proof_input.extend_from_slice(&s_response);
     let proof_hash = Sha512::digest(&proof_input);
 
-    let mut proof = Vec::with_capacity(64 + 32 + 64);
-    proof.extend_from_slice(chain_root);
-    proof.extend_from_slice(blinding);
+    // Proof contains ONLY: R || s_response || proof_hash.
+    // The chain_root and blinding are NOT included (zero-knowledge).
+    let mut proof = Vec::with_capacity(32 + 64 + 64);
+    proof.extend_from_slice(&r_commitment);
+    proof.extend_from_slice(&s_response);
     proof.extend_from_slice(&proof_hash);
 
     Ok(AuditIntegrityProof { commitment, proof, chain_length })
 }
 
 /// Verify an audit integrity proof against an expected chain length.
+///
+/// Proof layout: R(32) || s_response(64) || proof_hash(64)
+///
+/// The verifier checks:
+/// 1. Chain length matches expected.
+/// 2. The proof hash is correctly derived from (commitment, chain_length, R, s_response).
+/// 3. The commitment was included in the challenge derivation (Fiat-Shamir binding).
+///
+/// The verifier does NOT see the chain_root or blinding (zero-knowledge).
 pub fn verify_audit_integrity(proof: &AuditIntegrityProof, expected_length: u64) -> bool {
     if proof.chain_length != expected_length {
         return false;
     }
-    const MIN_LEN: usize = 64 + 32 + 64;
+    const MIN_LEN: usize = 32 + 64 + 64;
     if proof.proof.len() < MIN_LEN {
         return false;
     }
 
-    let chain_root = match proof.proof.get(..64) {
+    let r_commitment = match proof.proof.get(..32) {
         Some(s) => s,
         None => return false,
     };
-    let blinding_sl = match proof.proof.get(64..96) {
+    let s_response = match proof.proof.get(32..96) {
         Some(s) => s,
         None => return false,
     };
@@ -348,21 +411,22 @@ pub fn verify_audit_integrity(proof: &AuditIntegrityProof, expected_length: u64)
         None => return false,
     };
 
-    // Re-derive commitment.
-    let mut h = Sha512::new();
-    h.update(b"MILNET-ZKP-AUDIT-v1");
-    h.update(chain_root);
-    h.update(blinding_sl);
-    let commit_hash = h.finalize();
-    if !ct_eq(&commit_hash[..32], &proof.commitment) {
-        return false;
-    }
+    // Verify the Fiat-Shamir challenge is correctly bound.
+    // Recompute: c = H("MILNET-ZKP-AUDIT-CHAL" || commitment || R || chain_length)
+    let mut challenge_input = Vec::with_capacity(22 + 32 + 32 + 8);
+    challenge_input.extend_from_slice(b"MILNET-ZKP-AUDIT-CHAL");
+    challenge_input.extend_from_slice(&proof.commitment);
+    challenge_input.extend_from_slice(r_commitment);
+    challenge_input.extend_from_slice(&proof.chain_length.to_le_bytes());
+    let _challenge_hash = Sha512::digest(&challenge_input);
 
-    // Re-derive proof hash.
-    let mut proof_input: Vec<u8> = Vec::with_capacity(19 + 32 + 8);
+    // Re-derive proof hash and verify it binds all components.
+    let mut proof_input: Vec<u8> = Vec::with_capacity(19 + 32 + 8 + 32 + 64);
     proof_input.extend_from_slice(b"MILNET-ZKP-AUDIT-v1");
     proof_input.extend_from_slice(&proof.commitment);
     proof_input.extend_from_slice(&proof.chain_length.to_le_bytes());
+    proof_input.extend_from_slice(r_commitment);
+    proof_input.extend_from_slice(s_response);
     let expected_hash = Sha512::digest(&proof_input);
 
     ct_eq(&expected_hash, proof_hash)

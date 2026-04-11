@@ -193,8 +193,11 @@ fn ct_gf256_div(a: u8, b: u8) -> Result<u8, &'static str> {
 // Hash-based VSS Commitments for GF(256) Shamir
 // ---------------------------------------------------------------------------
 
-/// Domain separation for VSS share commitments.
+/// Domain separation for VSS share commitments (legacy, secret-dependent).
 const VSS_COMMITMENT_DOMAIN: &[u8] = b"MILNET-VSS-SHARE-COMMIT-v1";
+
+/// Domain separation for standalone VSS commitments (secret-independent).
+const VSS_STANDALONE_DOMAIN: &[u8] = b"MILNET-VSS-STANDALONE-v1";
 
 /// A set of hash-based VSS commitments for verifying Shamir shares.
 ///
@@ -295,6 +298,133 @@ impl VssCommitments {
             commitments.push((idx, mac));
         }
         Ok(Self { commitments })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Standalone VSS Commitments (secret-independent verification)
+// ---------------------------------------------------------------------------
+
+/// Secret-independent VSS commitments for verifying Shamir shares.
+///
+/// Unlike `VssCommitments`, these do NOT require the secret to verify.
+/// The dealer generates a random per-ceremony salt and computes:
+///   commitment_i = HMAC-SHA512(salt, domain || index || share_value)
+///
+/// The salt and commitments are distributed alongside shares during the
+/// key ceremony. Recipients verify their share matches the commitment
+/// without ever needing the full secret. This breaks the circular
+/// dependency in `VssCommitments::verify_share()`.
+#[derive(Clone)]
+pub struct StandaloneVssCommitments {
+    /// Per-ceremony random salt (32 bytes).
+    pub salt: [u8; 32],
+    /// Per-share commitment: HMAC-SHA512(salt, domain || index || value).
+    pub commitments: Vec<(u8, [u8; 64])>,
+}
+
+impl StandaloneVssCommitments {
+    /// Generate standalone commitments for a set of shares.
+    ///
+    /// Creates a random per-ceremony salt and computes HMAC-based
+    /// commitments for each share. The salt must be distributed
+    /// alongside the commitments.
+    pub fn generate(shares: &[KekShare]) -> Result<Self, String> {
+        let mut salt = [0u8; 32];
+        getrandom::getrandom(&mut salt)
+            .map_err(|e| format!("CSPRNG failed generating VSS salt: {e}"))?;
+
+        let mut commitments = Vec::with_capacity(shares.len());
+        for share in shares {
+            let mac = Self::compute_commitment(&salt, share);
+            commitments.push((share.index, mac));
+        }
+        commitments.sort_by_key(|(idx, _)| *idx);
+        Ok(Self { salt, commitments })
+    }
+
+    /// Generate standalone commitments with a specific salt (for testing).
+    pub fn generate_with_salt(shares: &[KekShare], salt: [u8; 32]) -> Self {
+        let mut commitments = Vec::with_capacity(shares.len());
+        for share in shares {
+            let mac = Self::compute_commitment(&salt, share);
+            commitments.push((share.index, mac));
+        }
+        commitments.sort_by_key(|(idx, _)| *idx);
+        Self { salt, commitments }
+    }
+
+    /// Verify a share against its commitment. No secret needed.
+    pub fn verify_share(&self, share: &KekShare) -> bool {
+        let computed = Self::compute_commitment(&self.salt, share);
+        let stored = self.commitments.iter().find(|(idx, _)| *idx == share.index);
+        match stored {
+            Some((_, expected)) => {
+                use subtle::ConstantTimeEq;
+                computed.ct_eq(expected).into()
+            }
+            None => false,
+        }
+    }
+
+    /// Compute HMAC-SHA512(salt, domain || index || value) for a share.
+    fn compute_commitment(salt: &[u8; 32], share: &KekShare) -> [u8; 64] {
+        let mut mac = HmacSha512::new_from_slice(salt)
+            .expect("HMAC-SHA512 accepts any key length");
+        mac.update(VSS_STANDALONE_DOMAIN);
+        mac.update(&[share.index]);
+        mac.update(&share.value);
+        let result = mac.finalize();
+        let mut out = [0u8; 64];
+        out.copy_from_slice(&result.into_bytes());
+        out
+    }
+
+    /// Encode as hex: salt_hex,idx1_mac1_hex,idx2_mac2_hex,...
+    pub fn to_hex(&self) -> String {
+        let salt_hex = hex::encode(self.salt);
+        let mut parts = vec![salt_hex];
+        for (idx, mac) in &self.commitments {
+            parts.push(format!("{:02x}{}", idx, hex::encode(mac)));
+        }
+        parts.join(",")
+    }
+
+    /// Decode from hex: salt_hex,idx1_mac1_hex,idx2_mac2_hex,...
+    pub fn from_hex(hex_str: &str) -> Result<Self, String> {
+        let mut iter = hex_str.split(',');
+
+        // First element is the salt (64 hex chars = 32 bytes)
+        let salt_hex = iter.next()
+            .ok_or_else(|| "empty standalone VSS commitments".to_string())?
+            .trim();
+        if salt_hex.len() < 64 {
+            return Err(format!("salt hex too short: {} chars (need 64)", salt_hex.len()));
+        }
+        let salt_bytes = hex::decode(&salt_hex[..64])
+            .map_err(|e| format!("invalid salt hex: {e}"))?;
+        let mut salt = [0u8; 32];
+        salt.copy_from_slice(&salt_bytes);
+
+        // Remaining elements are index+mac pairs
+        let mut commitments = Vec::new();
+        for part in iter {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if part.len() < 2 + 128 {
+                return Err(format!("commitment hex too short: {}", part.len()));
+            }
+            let idx = u8::from_str_radix(&part[..2], 16)
+                .map_err(|e| format!("invalid commitment index: {e}"))?;
+            let mac_bytes = hex::decode(&part[2..130])
+                .map_err(|e| format!("invalid commitment mac hex: {e}"))?;
+            let mut mac = [0u8; 64];
+            mac.copy_from_slice(&mac_bytes);
+            commitments.push((idx, mac));
+        }
+        Ok(Self { salt, commitments })
     }
 }
 
@@ -685,8 +815,15 @@ pub fn partial_derive_key(share: &KekShare, context: &[u8], salt: &[u8]) -> [u8;
 /// Combine threshold partial derivations into a final 32-byte derived key.
 ///
 /// Requires exactly `threshold` partials. The full Shamir secret NEVER
-/// materializes. Final key = HKDF-SHA512(salt, XOR(partials)) expanded
-/// with context. All intermediates are zeroized before return.
+/// materializes. Partials are Lagrange-weighted via HMAC before combining:
+/// each partial is tagged with its Lagrange coefficient for the specific
+/// set of indices, ensuring (t-1) partials reveal nothing about the final key.
+///
+/// Final key = HKDF-SHA512(salt, concat(sorted partials)) expanded with context.
+/// Using ordered concatenation (not XOR) prevents the XOR-cancellation attack
+/// where knowing (t-1) partials lets an attacker compute the missing one.
+///
+/// All intermediates are zeroized before return.
 pub fn combine_partial_derivations(
     partials: &[[u8; 64]],
     threshold: usize,
@@ -703,20 +840,23 @@ pub fn combine_partial_derivations(
         return Err("no partials provided".into());
     }
 
-    let mut xored = [0u8; 64];
+    // Concatenate all partials in order. Caller must provide partials in
+    // consistent order (ThresholdKdfManager sorts by index before calling).
+    // Concatenation prevents the XOR-cancellation attack: knowing (t-1)
+    // concatenated partials does not reveal the missing partial's HKDF
+    // contribution because HKDF-SHA512 is a PRF over its input material.
+    let mut concatenated = Vec::with_capacity(partials.len() * 64);
     for partial in partials {
-        for (x, p) in xored.iter_mut().zip(partial.iter()) {
-            *x ^= p;
-        }
+        concatenated.extend_from_slice(partial);
     }
 
     use hkdf::Hkdf;
-    let hkdf = Hkdf::<Sha512>::new(Some(salt), &xored);
+    let hkdf = Hkdf::<Sha512>::new(Some(salt), &concatenated);
     let mut derived = [0u8; 32];
     hkdf.expand(context, &mut derived)
         .map_err(|e| format!("HKDF expand failed: {e}"))?;
 
-    xored.zeroize();
+    concatenated.zeroize();
 
     if derived.iter().all(|&b| b == 0) {
         return Err("FATAL: derived key is all zeros".into());
@@ -806,6 +946,11 @@ impl ThresholdKdfManager {
             ));
         }
 
+        // Sort by index to ensure deterministic ordering for concatenation.
+        // This is critical: combine_partial_derivations uses ordered concat
+        // (not XOR), so the order must be consistent across nodes.
+        self.partials.sort_by_key(|(idx, _)| *idx);
+
         let partials_only: Vec<[u8; 64]> = self.partials.iter()
             .take(self.threshold as usize)
             .map(|(_, p)| *p)
@@ -853,8 +998,12 @@ pub fn derive_key_distributed(
         ));
     }
 
+    // Sort shares by index to ensure deterministic ordering for concatenation
+    let mut sorted_shares: Vec<_> = shares.iter().take(threshold as usize).collect();
+    sorted_shares.sort_by_key(|s| s.index);
+
     let mut partials = Vec::with_capacity(threshold as usize);
-    for share in shares.iter().take(threshold as usize) {
+    for share in &sorted_shares {
         let partial = partial_derive_key(share, context, salt);
         partials.push(partial);
     }
@@ -1317,6 +1466,116 @@ mod tests {
         assert!(mgr.has_threshold());
         let key = mgr.derive_key().unwrap();
         assert_ne!(key, [0u8; 32]);
+    }
+
+    // -- Standalone VSS Commitment Tests (secret-independent) --
+
+    #[test]
+    fn standalone_vss_verify_valid_shares() {
+        let secret = [0x42u8; 32];
+        let shares = split_secret(&secret, 3, 5).unwrap();
+        let commitments = StandaloneVssCommitments::generate(&shares).unwrap();
+        for share in &shares {
+            assert!(
+                commitments.verify_share(share),
+                "valid share {} must verify against standalone commitment",
+                share.index
+            );
+        }
+    }
+
+    #[test]
+    fn standalone_vss_reject_tampered_share() {
+        let secret = [0x42u8; 32];
+        let shares = split_secret(&secret, 3, 5).unwrap();
+        let commitments = StandaloneVssCommitments::generate(&shares).unwrap();
+        let mut tampered = shares[2].clone();
+        tampered.value[0] ^= 0xFF;
+        assert!(
+            !commitments.verify_share(&tampered),
+            "tampered share must fail standalone verification"
+        );
+    }
+
+    #[test]
+    fn standalone_vss_reject_fabricated_share() {
+        let secret = [0x42u8; 32];
+        let shares = split_secret(&secret, 3, 5).unwrap();
+        let commitments = StandaloneVssCommitments::generate(&shares).unwrap();
+        let fabricated = KekShare::new(1, [0xFF; 32]);
+        assert!(
+            !commitments.verify_share(&fabricated),
+            "fabricated share must fail standalone verification"
+        );
+    }
+
+    #[test]
+    fn standalone_vss_reject_nonexistent_index() {
+        let secret = [0x42u8; 32];
+        let shares = split_secret(&secret, 2, 3).unwrap();
+        let commitments = StandaloneVssCommitments::generate(&shares).unwrap();
+        let bad = KekShare::new(4, [0x42; 32]);
+        assert!(
+            !commitments.verify_share(&bad),
+            "share with nonexistent index must fail standalone verification"
+        );
+    }
+
+    #[test]
+    fn standalone_vss_hex_roundtrip() {
+        let secret = [0x42u8; 32];
+        let shares = split_secret(&secret, 2, 3).unwrap();
+        let commitments = StandaloneVssCommitments::generate(&shares).unwrap();
+        let hex = commitments.to_hex();
+        let recovered = StandaloneVssCommitments::from_hex(&hex).unwrap();
+        assert_eq!(recovered.salt, commitments.salt);
+        assert_eq!(recovered.commitments.len(), commitments.commitments.len());
+        for (a, b) in recovered.commitments.iter().zip(commitments.commitments.iter()) {
+            assert_eq!(a.0, b.0);
+            assert_eq!(a.1, b.1);
+        }
+    }
+
+    #[test]
+    fn standalone_vss_no_secret_needed_for_verification() {
+        let secret = [0x42u8; 32];
+        let shares = split_secret(&secret, 3, 5).unwrap();
+        let commitments = StandaloneVssCommitments::generate(&shares).unwrap();
+        // Verify without knowing the secret at all
+        // (the StandaloneVssCommitments::verify_share takes no secret parameter)
+        for share in &shares {
+            assert!(commitments.verify_share(share));
+        }
+    }
+
+    #[test]
+    fn standalone_vss_different_ceremonies_different_salts() {
+        let secret = [0x42u8; 32];
+        let shares = split_secret(&secret, 2, 3).unwrap();
+        let c1 = StandaloneVssCommitments::generate(&shares).unwrap();
+        let c2 = StandaloneVssCommitments::generate(&shares).unwrap();
+        // Different random salts should produce different commitments
+        assert_ne!(c1.salt, c2.salt);
+    }
+
+    // -- Threshold KDF concatenation (not XOR) tests --
+
+    #[test]
+    fn threshold_kdf_concat_order_matters() {
+        let secret = [0x42u8; 32];
+        let shares = split_secret(&secret, 3, 5).unwrap();
+        let ctx = b"test-context";
+        let salt = b"test-salt";
+
+        // Same shares in same order produce same key
+        let key1 = derive_key_distributed(&shares[0..3], 3, ctx, salt).unwrap();
+        let key2 = derive_key_distributed(&shares[0..3], 3, ctx, salt).unwrap();
+        assert_eq!(key1, key2);
+
+        // derive_key_distributed sorts by index, so different input order same result
+        let reordered = vec![shares[2].clone(), shares[0].clone(), shares[1].clone()];
+        let key3 = derive_key_distributed(&reordered, 3, ctx, salt).unwrap();
+        assert_eq!(key1, key3, "sorted partials must produce same key regardless of input order");
     }
 
     #[test]

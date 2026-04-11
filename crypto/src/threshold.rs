@@ -59,9 +59,21 @@ impl Drop for SignerShare {
         }
         // Zero the nonce counter (atomic, no drop concerns).
         self.nonce_counter.store(0, std::sync::atomic::Ordering::Relaxed);
-        // NOTE: Previous defense-in-depth write_bytes over entire struct was UB
-        // (zeroing partially-dropped fields with heap allocations). The per-field
-        // serialization above is the sound alternative.
+
+        // Defense-in-depth: zero the KeyPackage struct memory directly.
+        // We use ManuallyDrop to prevent double-drop of the KeyPackage, then
+        // overwrite its memory with zeros via ptr::write_bytes. This covers
+        // any in-memory representation that serialization may miss.
+        #[allow(unsafe_code)]
+        unsafe {
+            let kp_ptr = &mut self.key_package as *mut KeyPackage;
+            let kp_size = std::mem::size_of::<KeyPackage>();
+            // Replace with a default-initialized value to avoid dropping garbage.
+            // We read the old value into ManuallyDrop (preventing its Drop),
+            // then zero the memory.
+            let _old = std::mem::ManuallyDrop::new(std::ptr::read(kp_ptr));
+            std::ptr::write_bytes(kp_ptr as *mut u8, 0, kp_size);
+        }
     }
 }
 
@@ -93,11 +105,16 @@ pub fn dkg(total: u16, threshold: u16) -> Result<DkgResult, String> {
     for (id, secret_share) in &shares_map {
         let key_package = frost::keys::KeyPackage::try_from(secret_share.clone())
             .map_err(|e| format!("share-to-key-package conversion failed: {e}"))?;
-        // Verify the share's verification key is consistent with the group key
+        // Verify the share's verification key is consistent with the group key.
+        // Use constant-time comparison on serialized bytes to prevent timing
+        // side-channels that could leak information about share values.
         let share_vk = key_package.verifying_share();
-        // The public key package contains all verifying shares -- cross-check
         if let Some(expected_vk) = public_key_package.verifying_shares().get(id) {
-            if share_vk != expected_vk {
+            let share_bytes = share_vk.serialize()
+                .map_err(|e| format!("share VK serialization failed: {e}"))?;
+            let expected_bytes = expected_vk.serialize()
+                .map_err(|e| format!("expected VK serialization failed: {e}"))?;
+            if !crate::ct::ct_eq(&share_bytes, &expected_bytes) {
                 return Err(format!(
                     "DKG share verification failed for signer {id:?} -- possible dealer compromise"
                 ));
@@ -432,13 +449,18 @@ impl ThresholdGroup {
         )
         .map_err(|e| format!("share refresh DKG failed: {e}"))?;
 
-        // Verify each share is consistent with the group public key (Feldman VSS)
+        // Verify each share is consistent with the group public key (Feldman VSS).
+        // Constant-time comparison on serialized bytes to prevent timing leaks.
         for (id, secret_share) in &shares_map {
             let key_package = frost::keys::KeyPackage::try_from(secret_share.clone())
                 .map_err(|e| format!("share-to-key-package conversion failed during refresh: {e}"))?;
             let share_vk = key_package.verifying_share();
             if let Some(expected_vk) = public_key_package.verifying_shares().get(id) {
-                if share_vk != expected_vk {
+                let share_bytes = share_vk.serialize()
+                    .map_err(|e| format!("share VK serialization failed: {e}"))?;
+                let expected_bytes = expected_vk.serialize()
+                    .map_err(|e| format!("expected VK serialization failed: {e}"))?;
+                if !crate::ct::ct_eq(&share_bytes, &expected_bytes) {
                     return Err(format!(
                         "refresh share verification failed for signer {id:?} -- possible dealer compromise"
                     ));

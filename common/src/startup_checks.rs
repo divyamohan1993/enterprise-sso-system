@@ -69,6 +69,9 @@ pub fn run_platform_checks<F: FnOnce() -> bool>(harden_fn: F) -> (
     // can observe stderr (e.g. via container logs).
     install_military_panic_hook();
 
+    // SECURITY: Reject test KEK patterns in production/military deployment.
+    reject_test_kek_in_production();
+
     // SECURITY: Load FIPS activation key and auto-enable FIPS mode in military
     // deployment. This MUST happen before any crypto operations.
     crate::fips::load_fips_activation_key();
@@ -365,6 +368,45 @@ pub fn sanitize_environment() -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// Test KEK rejection — prevent test keys in production
+// ---------------------------------------------------------------------------
+
+/// SECURITY: Detect and reject test/placeholder KEK values in production.
+///
+/// A KEK that consists of a repeating 2-byte (4 hex char) pattern (e.g.
+/// "abababab..." or "12121212...") is almost certainly a test value. If
+/// MILNET_PRODUCTION=1 or MILNET_MILITARY_DEPLOYMENT=1, using such a key
+/// is a fatal configuration error.
+fn reject_test_kek_in_production() {
+    let is_production = std::env::var("MILNET_PRODUCTION").as_deref() == Ok("1")
+        || std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1");
+
+    if !is_production {
+        return;
+    }
+
+    let kek = match std::env::var("MILNET_MASTER_KEK") {
+        Ok(v) => v,
+        Err(_) => return, // No KEK set; other checks will catch this
+    };
+
+    // Check for repeating 2-byte (4 hex char) pattern
+    let kek_bytes = kek.as_bytes();
+    if kek_bytes.len() >= 8 {
+        let pattern = &kek_bytes[..4];
+        let is_repeating = kek_bytes.chunks(4).all(|chunk| chunk == pattern);
+        if is_repeating {
+            eprintln!(
+                "FATAL: test KEK detected in production. \
+                 MILNET_MASTER_KEK is a repeating pattern. \
+                 Generate a real key: openssl rand -hex 32"
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Panic hook — suppress stack traces in production
 // ---------------------------------------------------------------------------
 
@@ -520,6 +562,24 @@ pub fn run_stig_audit() -> Result<crate::stig::StigSummary, Vec<crate::stig::Sti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_reject_test_kek_detects_repeating_pattern() {
+        // The function checks for repeating 4-hex-char (2-byte) patterns.
+        let kek = "abababababababababababababababababababababababababababababababababab";
+        let kek_bytes = kek.as_bytes();
+        assert!(kek_bytes.len() >= 8);
+        let pattern = &kek_bytes[..4];
+        let is_repeating = kek_bytes.chunks(4).all(|chunk| chunk == pattern);
+        assert!(is_repeating, "Should detect 'abab' repeating pattern");
+
+        // Non-repeating key should pass
+        let real_kek = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2";
+        let real_bytes = real_kek.as_bytes();
+        let real_pattern = &real_bytes[..4];
+        let real_repeating = real_bytes.chunks(4).all(|chunk| chunk == real_pattern);
+        assert!(!real_repeating, "Real key should not be detected as repeating");
+    }
 
     #[test]
     fn test_platform_attestation_report_fields() {

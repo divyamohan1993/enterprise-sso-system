@@ -479,10 +479,15 @@ impl AutoPromoteConfig {
         if manual_only {
             return Self { enabled: false, safety_delay_secs: 30, require_witness: true, min_replica_lag_bytes: 0 };
         }
+        let default_delay = if military_mode { 5 } else { 30 };
+        let safety_delay = std::env::var("MILNET_DB_FAILOVER_DELAY")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(default_delay);
         if military_mode {
-            return Self { enabled: true, safety_delay_secs: 10, require_witness: true, min_replica_lag_bytes: 0 };
+            return Self { enabled: true, safety_delay_secs: safety_delay, require_witness: true, min_replica_lag_bytes: 0 };
         }
-        Self::default()
+        Self { safety_delay_secs: safety_delay, ..Self::default() }
     }
 }
 
@@ -1546,6 +1551,38 @@ mod tests {
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("data loss risk"));
+    }
+
+    #[test]
+    fn auto_promote_config_military_mode_defaults_to_5s() {
+        std::env::set_var("MILNET_MILITARY_DEPLOYMENT", "1");
+        std::env::remove_var("MILNET_DB_MANUAL_FAILOVER");
+        std::env::remove_var("MILNET_DB_FAILOVER_DELAY");
+        let cfg = AutoPromoteConfig::from_env();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.safety_delay_secs, 5);
+        assert!(cfg.require_witness);
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+    }
+
+    #[test]
+    fn auto_promote_config_env_override() {
+        std::env::set_var("MILNET_MILITARY_DEPLOYMENT", "1");
+        std::env::set_var("MILNET_DB_FAILOVER_DELAY", "3");
+        std::env::remove_var("MILNET_DB_MANUAL_FAILOVER");
+        let cfg = AutoPromoteConfig::from_env();
+        assert_eq!(cfg.safety_delay_secs, 3);
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        std::env::remove_var("MILNET_DB_FAILOVER_DELAY");
+    }
+
+    #[test]
+    fn auto_promote_config_default_30s() {
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        std::env::remove_var("MILNET_DB_MANUAL_FAILOVER");
+        std::env::remove_var("MILNET_DB_FAILOVER_DELAY");
+        let cfg = AutoPromoteConfig::from_env();
+        assert_eq!(cfg.safety_delay_secs, 30);
     }
 
     #[tokio::test]

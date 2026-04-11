@@ -7,6 +7,9 @@
 
 use std::collections::HashMap;
 
+/// Total number of CMMC 2.0 Level 3 practices (NIST SP 800-171 + 800-172 supplement).
+pub const CMMC_TOTAL_PRACTICES: usize = 110;
+
 /// Status of a CMMC practice assessment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum PracticeStatus {
@@ -18,6 +21,8 @@ pub enum PracticeStatus {
     NotMet,
     /// Practice not applicable to this system.
     NotApplicable,
+    /// Practice has not yet been assessed.
+    NotAssessed,
 }
 
 /// A single CMMC 2.0 / NIST 800-171 practice with assessment result.
@@ -287,6 +292,139 @@ impl CmmcAssessor {
                 evidence: "Automated risk scoring runs continuously; formal periodic risk assessment process documented.".into(),
                 gap: Some("Formal annual risk assessment review with independent assessor not yet scheduled.".into()),
             },
+            // ── Media Protection (MP) ───────────────────────────────────────
+            CmmcPractice {
+                id: "MP.L2-3.8.1".into(),
+                family: "Media Protection".into(),
+                title: "Protect system media containing CUI".into(),
+                level: 2,
+                status: PracticeStatus::NotAssessed,
+                evidence: String::new(),
+                gap: Some("Media protection controls not yet assessed for this software system.".into()),
+            },
+            CmmcPractice {
+                id: "MP.L2-3.8.2".into(),
+                family: "Media Protection".into(),
+                title: "Limit access to CUI on system media to authorized users".into(),
+                level: 2,
+                status: PracticeStatus::NotAssessed,
+                evidence: String::new(),
+                gap: Some("Media access controls not yet assessed.".into()),
+            },
+            CmmcPractice {
+                id: "MP.L2-3.8.3".into(),
+                family: "Media Protection".into(),
+                title: "Sanitize or destroy system media before disposal or release".into(),
+                level: 2,
+                status: PracticeStatus::NotAssessed,
+                evidence: String::new(),
+                gap: Some("Media sanitization procedures not yet assessed.".into()),
+            },
+            // ── Physical and Environmental Protection (PE) ──────────────────
+            CmmcPractice {
+                id: "PE.L2-3.10.1".into(),
+                family: "Physical and Environmental Protection".into(),
+                title: "Limit physical access to organizational systems".into(),
+                level: 2,
+                status: PracticeStatus::NotAssessed,
+                evidence: String::new(),
+                gap: Some("Physical access controls are environmental; not assessed at application layer.".into()),
+            },
+            CmmcPractice {
+                id: "PE.L2-3.10.2".into(),
+                family: "Physical and Environmental Protection".into(),
+                title: "Protect and monitor the physical facility".into(),
+                level: 2,
+                status: PracticeStatus::NotAssessed,
+                evidence: String::new(),
+                gap: Some("Physical facility monitoring is environmental; not assessed at application layer.".into()),
+            },
+            // ── Personnel Security (PS) ─────────────────────────────────────
+            CmmcPractice {
+                id: "PS.L2-3.9.1".into(),
+                family: "Personnel Security".into(),
+                title: "Screen individuals prior to authorizing access to organizational systems".into(),
+                level: 2,
+                status: PracticeStatus::NotAssessed,
+                evidence: String::new(),
+                gap: Some("Personnel screening is an organizational process; not assessed at application layer.".into()),
+            },
+            CmmcPractice {
+                id: "PS.L2-3.9.2".into(),
+                family: "Personnel Security".into(),
+                title: "Ensure CUI is protected during and after personnel actions".into(),
+                level: 2,
+                status: PracticeStatus::NotAssessed,
+                evidence: String::new(),
+                gap: Some("Personnel action procedures not yet assessed.".into()),
+            },
+            // ── Maintenance (MA) ────────────────────────────────────────────
+            CmmcPractice {
+                id: "MA.L2-3.7.1".into(),
+                family: "Maintenance".into(),
+                title: "Perform maintenance on organizational systems".into(),
+                level: 2,
+                status: PracticeStatus::NotAssessed,
+                evidence: String::new(),
+                gap: Some("System maintenance procedures not yet assessed.".into()),
+            },
+            CmmcPractice {
+                id: "MA.L2-3.7.2".into(),
+                family: "Maintenance".into(),
+                title: "Provide controls on maintenance tools and media".into(),
+                level: 2,
+                status: PracticeStatus::NotAssessed,
+                evidence: String::new(),
+                gap: Some("Maintenance tool controls not yet assessed.".into()),
+            },
+            // ── Contingency Planning (CP) ───────────────────────────────────
+            CmmcPractice {
+                id: "CP.L2-3.6.1".into(),
+                family: "Contingency Planning".into(),
+                title: "Establish and maintain a contingency plan".into(),
+                level: 2,
+                status: PracticeStatus::NotAssessed,
+                evidence: String::new(),
+                gap: Some("Contingency plan not yet assessed for this system.".into()),
+            },
+            CmmcPractice {
+                id: "CP.L2-3.6.2".into(),
+                family: "Contingency Planning".into(),
+                title: "Plan for continuity of operations".into(),
+                level: 2,
+                status: PracticeStatus::NotAssessed,
+                evidence: String::new(),
+                gap: Some("Continuity planning not yet assessed.".into()),
+            },
+            // ── Awareness and Training (AT) ─────────────────────────────────
+            CmmcPractice {
+                id: "AT.L2-3.2.1".into(),
+                family: "Awareness and Training".into(),
+                title: "Ensure personnel are trained on security awareness".into(),
+                level: 2,
+                status: PracticeStatus::NotAssessed,
+                evidence: String::new(),
+                gap: Some("Security awareness training is organizational; not assessed at application layer.".into()),
+            },
+            CmmcPractice {
+                id: "AT.L2-3.2.2".into(),
+                family: "Awareness and Training".into(),
+                title: "Ensure personnel are trained on insider threat awareness".into(),
+                level: 2,
+                status: PracticeStatus::NotAssessed,
+                evidence: String::new(),
+                gap: Some("Insider threat training is organizational; not assessed at application layer.".into()),
+            },
+            // ── Planning (PL) ───────────────────────────────────────────────
+            CmmcPractice {
+                id: "PL.L2-3.12.1".into(),
+                family: "Planning".into(),
+                title: "Develop and maintain a system security plan".into(),
+                level: 2,
+                status: PracticeStatus::PartiallyMet,
+                evidence: "FedRAMP SSP generator provides automated SSP sections from code analysis.".into(),
+                gap: Some("Full system security plan document requires additional organizational content.".into()),
+            },
         ];
 
         Self { practices }
@@ -300,17 +438,24 @@ impl CmmcAssessor {
         &self.practices
     }
 
-    /// Return practices that are not fully Met (PartiallyMet or NotMet).
+    /// Return practices that are not fully Met (PartiallyMet, NotMet, or NotAssessed).
     pub fn gaps(&self) -> Vec<&CmmcPractice> {
         self.practices
             .iter()
             .filter(|p| {
-                matches!(p.status, PracticeStatus::PartiallyMet | PracticeStatus::NotMet)
+                matches!(
+                    p.status,
+                    PracticeStatus::PartiallyMet
+                        | PracticeStatus::NotMet
+                        | PracticeStatus::NotAssessed
+                )
             })
             .collect()
     }
 
     /// Return aggregate counts: `(met, partially_met, not_met)`.
+    ///
+    /// Note: `not_met` includes both `NotMet` and `NotAssessed` practices.
     pub fn score(&self) -> (usize, usize, usize) {
         let met = self
             .practices
@@ -325,9 +470,27 @@ impl CmmcAssessor {
         let not_met = self
             .practices
             .iter()
-            .filter(|p| p.status == PracticeStatus::NotMet)
+            .filter(|p| matches!(p.status, PracticeStatus::NotMet | PracticeStatus::NotAssessed))
             .count();
         (met, partial, not_met)
+    }
+
+    /// Return the number of NotAssessed practices.
+    pub fn not_assessed_count(&self) -> usize {
+        self.practices
+            .iter()
+            .filter(|p| p.status == PracticeStatus::NotAssessed)
+            .count()
+    }
+
+    /// Return the compliance percentage against the full 110-practice denominator.
+    pub fn compliance_percentage(&self) -> f64 {
+        let met = self
+            .practices
+            .iter()
+            .filter(|p| p.status == PracticeStatus::Met)
+            .count();
+        (met as f64 / CMMC_TOTAL_PRACTICES as f64) * 100.0
     }
 
     /// Return per-family score summaries.
@@ -344,7 +507,7 @@ impl CmmcAssessor {
             match p.status {
                 PracticeStatus::Met => entry.met += 1,
                 PracticeStatus::PartiallyMet => entry.partial += 1,
-                PracticeStatus::NotMet => entry.not_met += 1,
+                PracticeStatus::NotMet | PracticeStatus::NotAssessed => entry.not_met += 1,
                 PracticeStatus::NotApplicable => entry.not_applicable += 1,
             }
         }
@@ -361,7 +524,10 @@ impl CmmcAssessor {
                 "met": met,
                 "partially_met": partial,
                 "not_met": not_met,
-                "total": self.practices.len(),
+                "not_assessed": self.not_assessed_count(),
+                "assessed": self.practices.len(),
+                "total_required": CMMC_TOTAL_PRACTICES,
+                "compliance_percentage": self.compliance_percentage(),
             },
             "practices": self.practices,
         });
@@ -385,8 +551,8 @@ mod tests {
     fn test_cmmc_assessor_loads_all_practices() {
         let assessor = CmmcAssessor::new();
         assert!(
-            assessor.practices.len() >= 20,
-            "expected >= 20 practices, got {}",
+            assessor.practices.len() >= 35,
+            "expected >= 35 practices (including new families), got {}",
             assessor.practices.len()
         );
     }
@@ -428,12 +594,17 @@ mod tests {
                 gap.id
             );
         }
-        // Verify all PartiallyMet/NotMet practices appear in gaps
+        // Verify all PartiallyMet/NotMet/NotAssessed practices appear in gaps
         let unmet_count = assessor
             .practices
             .iter()
             .filter(|p| {
-                matches!(p.status, PracticeStatus::PartiallyMet | PracticeStatus::NotMet)
+                matches!(
+                    p.status,
+                    PracticeStatus::PartiallyMet
+                        | PracticeStatus::NotMet
+                        | PracticeStatus::NotAssessed
+                )
             })
             .count();
         assert_eq!(gaps.len(), unmet_count);
@@ -483,6 +654,35 @@ mod tests {
     }
 
     #[test]
+    fn test_cmmc_compliance_percentage_against_110() {
+        let assessor = CmmcAssessor::new();
+        let pct = assessor.compliance_percentage();
+        // We have ~20 Met out of 110 total required
+        assert!(pct < 50.0, "expected <50% compliance against 110, got {:.1}%", pct);
+        assert!(pct > 0.0, "expected >0% compliance");
+    }
+
+    #[test]
+    fn test_cmmc_not_assessed_practices() {
+        let assessor = CmmcAssessor::new();
+        let na = assessor.not_assessed_count();
+        assert!(na >= 13, "expected >= 13 NotAssessed practices, got {}", na);
+    }
+
+    #[test]
+    fn test_cmmc_new_families_present() {
+        let assessor = CmmcAssessor::new();
+        let families: std::collections::HashSet<&str> = assessor.practices.iter().map(|p| p.family.as_str()).collect();
+        assert!(families.contains("Media Protection"), "missing Media Protection family");
+        assert!(families.contains("Physical and Environmental Protection"), "missing PE family");
+        assert!(families.contains("Personnel Security"), "missing PS family");
+        assert!(families.contains("Maintenance"), "missing MA family");
+        assert!(families.contains("Contingency Planning"), "missing CP family");
+        assert!(families.contains("Awareness and Training"), "missing AT family");
+        assert!(families.contains("Planning"), "missing PL family");
+    }
+
+    #[test]
     fn test_cmmc_to_json() {
         let assessor = CmmcAssessor::new();
         let json = assessor.to_json();
@@ -494,6 +694,11 @@ mod tests {
         assert!(parsed.get("cmmc_level").is_some());
         assert!(parsed.get("score").is_some());
         assert!(parsed.get("practices").is_some());
+        // Score must include total_required = 110
+        let score = &parsed["score"];
+        assert_eq!(score["total_required"].as_u64().unwrap(), 110);
+        assert!(score.get("compliance_percentage").is_some());
+        assert!(score.get("not_assessed").is_some());
         // practices array non-empty
         let practices = parsed["practices"].as_array().expect("practices must be array");
         assert!(!practices.is_empty());

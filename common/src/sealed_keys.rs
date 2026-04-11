@@ -161,7 +161,27 @@ pub fn cached_master_kek_threshold_kdf() -> &'static [u8; 32] {
                 std::process::exit(1);
             }
         };
-        let peer_shares_csv = std::env::var("MILNET_KEK_PEER_SHARES").ok();
+        // SECURITY: Reject MILNET_KEK_PEER_SHARES if present.
+        // Each node must only hold its OWN share. Peer shares must be
+        // exchanged via network protocol (mTLS), never stored in one env var.
+        if std::env::var("MILNET_KEK_PEER_SHARES").is_ok() {
+            tracing::error!(
+                "SECURITY VIOLATION: MILNET_KEK_PEER_SHARES is set. \
+                 Each node must only hold its own share (MILNET_KEK_SHARE). \
+                 Peer partials must be received via mTLS network protocol. \
+                 Remove MILNET_KEK_PEER_SHARES and configure peer exchange."
+            );
+            crate::siem::SecurityEvent::tamper_detected(
+                "MILNET_KEK_PEER_SHARES detected. All peer shares on one node \
+                 is a critical security violation. Process aborting.",
+            );
+            // Overwrite and remove the dangerous env var before exiting
+            if let Ok(csv) = std::env::var("MILNET_KEK_PEER_SHARES") {
+                std::env::set_var("MILNET_KEK_PEER_SHARES", "0".repeat(csv.len()));
+                std::env::remove_var("MILNET_KEK_PEER_SHARES");
+            }
+            std::process::exit(199);
+        }
 
         let my_share = match KekShare::from_hex(&my_share_hex) {
             Ok(s) => s,
@@ -171,56 +191,76 @@ pub fn cached_master_kek_threshold_kdf() -> &'static [u8; 32] {
             }
         };
 
-        let mut all_shares = vec![my_share];
-        if let Some(ref csv) = peer_shares_csv {
-            for hex_share in csv.split(',') {
-                let hex_share = hex_share.trim();
-                if hex_share.is_empty() { continue; }
-                match KekShare::from_hex(hex_share) {
-                    Ok(share) => {
-                        if !verify_share_commitment(&share) {
-                            tracing::error!(
-                                "SECURITY: VSS verification FAILED for peer share {} in threshold KDF. REJECTED.",
-                                share.index
-                            );
-                            crate::siem::SecurityEvent::tamper_detected(
-                                &format!("Rejected peer share {} in threshold KDF", share.index),
-                            );
-                            continue;
-                        }
-                        all_shares.push(share);
-                    }
-                    Err(e) => tracing::warn!("Failed to parse peer share in threshold KDF: {e}"),
-                }
-            }
+        if !verify_share_commitment(&my_share) {
+            tracing::error!(
+                "SECURITY: VSS verification FAILED for own share {} in threshold KDF. REJECTED.",
+                my_share.index
+            );
+            crate::siem::SecurityEvent::tamper_detected(
+                &format!("Own share {} failed VSS verification in threshold KDF", my_share.index),
+            );
+            std::process::exit(199);
         }
 
-        if all_shares.len() < 3 {
-            tracing::error!("Insufficient shares for threshold KDF: have {}, need 3.", all_shares.len());
+        // Submit own partial. Peer partials arrive via mTLS network protocol
+        // (see distributed_startup.rs). Each peer computes its partial locally
+        // and sends only the partial (not the raw share) over the network.
+        let mut mgr = ThresholdKdfManager::new(3, 5, context.as_bytes(), salt.as_bytes());
+        let my_partial = partial_derive_key(&my_share, context.as_bytes(), salt.as_bytes());
+        if let Err(e) = mgr.submit_partial(my_share.index, my_partial) {
+            tracing::error!("Failed to submit own partial for share {}: {e}", my_share.index);
             std::process::exit(1);
         }
 
-        let mut mgr = ThresholdKdfManager::new(3, 5, context.as_bytes(), salt.as_bytes());
-        for share in &all_shares {
-            let partial = partial_derive_key(share, context.as_bytes(), salt.as_bytes());
-            if let Err(e) = mgr.submit_partial(share.index, partial) {
-                tracing::error!("Failed to submit partial for share {}: {e}", share.index);
-                std::process::exit(1);
+        // Collect peer partials from MILNET_KEK_PEER_PARTIALS (mTLS-received,
+        // hex-encoded, format: "index:partial_hex,index:partial_hex,...")
+        if let Ok(peer_partials_csv) = std::env::var("MILNET_KEK_PEER_PARTIALS") {
+            for entry in peer_partials_csv.split(',') {
+                let entry = entry.trim();
+                if entry.is_empty() { continue; }
+                let parts: Vec<&str> = entry.splitn(2, ':').collect();
+                if parts.len() != 2 {
+                    tracing::warn!("Malformed peer partial entry: {entry}");
+                    continue;
+                }
+                let idx: u8 = match parts[0].parse() {
+                    Ok(i) => i,
+                    Err(e) => { tracing::warn!("Invalid peer partial index: {e}"); continue; }
+                };
+                let partial_bytes = match hex::decode(parts[1]) {
+                    Ok(b) if b.len() == 64 => {
+                        let mut arr = [0u8; 64];
+                        arr.copy_from_slice(&b);
+                        arr
+                    }
+                    Ok(b) => { tracing::warn!("Peer partial wrong length: {} (need 64)", b.len()); continue; }
+                    Err(e) => { tracing::warn!("Invalid peer partial hex: {e}"); continue; }
+                };
+                if let Err(e) = mgr.submit_partial(idx, partial_bytes) {
+                    tracing::warn!("Failed to submit peer partial for index {idx}: {e}");
+                }
             }
+            // Remove peer partials from environment
+            std::env::set_var("MILNET_KEK_PEER_PARTIALS", "0".repeat(peer_partials_csv.len()));
+            std::env::remove_var("MILNET_KEK_PEER_PARTIALS");
         }
 
-        // Zeroize shares
-        for share in &mut all_shares {
-            share.value.zeroize();
+        if !mgr.has_threshold() {
+            tracing::error!(
+                "Insufficient partials for threshold KDF: have {}, need 3. \
+                 Peer partials must arrive via MILNET_KEK_PEER_PARTIALS (mTLS-received).",
+                mgr.partials_collected()
+            );
+            std::process::exit(1);
         }
 
-        // Remove env vars
+        // Zeroize own share
+        let mut my_share = my_share;
+        my_share.value.zeroize();
+
+        // Remove own share env var
         std::env::set_var("MILNET_KEK_SHARE", "0".repeat(my_share_hex.len()));
         std::env::remove_var("MILNET_KEK_SHARE");
-        if let Some(ref csv) = peer_shares_csv {
-            std::env::set_var("MILNET_KEK_PEER_SHARES", "0".repeat(csv.len()));
-            std::env::remove_var("MILNET_KEK_PEER_SHARES");
-        }
 
         match mgr.derive_key() {
             Ok(key) => {
@@ -238,37 +278,55 @@ pub fn cached_master_kek_threshold_kdf() -> &'static [u8; 32] {
     kek.as_bytes()
 }
 
-/// Reconstruct the master KEK from threshold Shamir shares collected via env vars.
+/// Reconstruct the master KEK from threshold Shamir shares.
 ///
 /// - `MILNET_KEK_SHARE`: This node's share (hex-encoded via `KekShare::to_hex`)
 /// - `MILNET_KEK_SHARE_INDEX`: This node's share index (1-based)
-/// - `MILNET_KEK_PEER_SHARES`: Comma-separated hex shares from peers (received via mTLS at startup)
+///
+/// Peer shares are received via mTLS network protocol, NOT via env vars.
+/// MILNET_KEK_PEER_SHARES is rejected (security violation).
 ///
 /// In production mode, panics if threshold (3) shares are not available.
-/// In dev mode, falls back to `cached_master_kek()` (single env var).
 pub fn cached_master_kek_distributed() -> &'static [u8; 32] {
     DISTRIBUTED_KEK_CACHE.get_or_init(|| {
         use crate::threshold_kek::{KekShare, ThresholdKekConfig, ThresholdKekManager};
+
+        // SECURITY: Reject MILNET_KEK_PEER_SHARES if present.
+        if std::env::var("MILNET_KEK_PEER_SHARES").is_ok() {
+            tracing::error!(
+                "SECURITY VIOLATION: MILNET_KEK_PEER_SHARES is set. \
+                 Each node must only hold its own share (MILNET_KEK_SHARE). \
+                 Peer shares must be received via mTLS network protocol. \
+                 Remove MILNET_KEK_PEER_SHARES immediately."
+            );
+            crate::siem::SecurityEvent::tamper_detected(
+                "MILNET_KEK_PEER_SHARES detected in distributed KEK path. \
+                 All peer shares on one node is a critical security violation.",
+            );
+            if let Ok(csv) = std::env::var("MILNET_KEK_PEER_SHARES") {
+                std::env::set_var("MILNET_KEK_PEER_SHARES", "0".repeat(csv.len()));
+                std::env::remove_var("MILNET_KEK_PEER_SHARES");
+            }
+            std::process::exit(199);
+        }
 
         let my_share_hex = std::env::var("MILNET_KEK_SHARE").ok();
         let my_index: u8 = std::env::var("MILNET_KEK_SHARE_INDEX")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(1);
-        let peer_shares_csv = std::env::var("MILNET_KEK_PEER_SHARES").ok();
 
-        // If no share is configured, fail hard — distributed KEK is mandatory.
+        // If no share is configured, fail hard.
         if my_share_hex.is_none() {
             tracing::error!(
                 "MILNET_KEK_SHARE not set. \
                  Distributed threshold KEK is required. Each node must hold \
-                 exactly one Shamir share. Set MILNET_KEK_SHARE, \
-                 MILNET_KEK_SHARE_INDEX, and MILNET_KEK_PEER_SHARES."
+                 exactly one Shamir share. Set MILNET_KEK_SHARE and \
+                 MILNET_KEK_SHARE_INDEX."
             );
             std::process::exit(1);
         }
 
-        // Safe: we verified my_share_hex.is_some() above or called process::exit.
         let Some(my_share_hex) = my_share_hex else {
             std::process::exit(1);
         };
@@ -287,63 +345,48 @@ pub fn cached_master_kek_distributed() -> &'static [u8; 32] {
         }
 
         // Remove share from environment immediately
-        // Overwrite with zeros first to clear libc environ buffer
         std::env::set_var("MILNET_KEK_SHARE", "0".repeat(my_share_hex.len()));
         std::env::remove_var("MILNET_KEK_SHARE");
 
-        // Collect peer shares from env
-        // NOTE: Feldman VSS commitments MUST be verified before accepting peer shares.
-        // Each share should be validated against public polynomial commitments to detect
-        // malicious or corrupted shares before they enter the reconstruction process.
-        if let Some(ref csv) = peer_shares_csv {
+        // Collect peer shares via mTLS (stored in MILNET_KEK_PEER_SHARES_MTLS
+        // by the distributed_startup protocol after mTLS verification)
+        if let Ok(csv) = std::env::var("MILNET_KEK_PEER_SHARES_MTLS") {
             for hex_share in csv.split(',') {
                 let hex_share = hex_share.trim();
-                if hex_share.is_empty() {
-                    continue;
-                }
+                if hex_share.is_empty() { continue; }
                 match KekShare::from_hex(hex_share) {
                     Ok(share) => {
                         if !verify_share_commitment(&share) {
                             tracing::error!(
-                                "SECURITY: VSS commitment verification FAILED for peer share index {}. \
-                                 Share REJECTED to prevent KEK corruption from malicious peer. \
-                                 Ensure MILNET_VSS_COMMITMENTS is set with valid commitments.",
+                                "SECURITY: VSS verification FAILED for mTLS peer share {}. REJECTED.",
                                 share.index
                             );
                             crate::siem::SecurityEvent::tamper_detected(
-                                &format!("Rejected peer share index {} due to VSS verification failure", share.index),
+                                &format!("Rejected mTLS peer share {} due to VSS failure", share.index),
                             );
-                            continue; // Skip this share in ALL modes
+                            continue;
                         }
                         if let Err(e) = mgr.add_peer_share(share) {
                             tracing::warn!("Failed to add peer share: {e}");
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!("Failed to parse peer share hex: {e}");
-                    }
+                    Err(e) => tracing::warn!("Failed to parse peer share hex: {e}"),
                 }
             }
-            // Remove peer shares from environment immediately
-            // Overwrite with zeros first to clear libc environ buffer
-            std::env::set_var("MILNET_KEK_PEER_SHARES", "0".repeat(csv.len()));
-            std::env::remove_var("MILNET_KEK_PEER_SHARES");
+            std::env::set_var("MILNET_KEK_PEER_SHARES_MTLS", "0".repeat(csv.len()));
+            std::env::remove_var("MILNET_KEK_PEER_SHARES_MTLS");
         }
 
-        // Check if we have enough shares — fail hard if not.
         if !mgr.has_threshold() {
             tracing::error!(
                 "Insufficient KEK shares for reconstruction. \
-                 Have {} shares, need 3. Ensure MILNET_KEK_PEER_SHARES \
-                 contains at least 2 peer shares (comma-separated hex).",
+                 Have {} shares, need 3. Peer shares must arrive via mTLS.",
                 mgr.shares_collected()
             );
             std::process::exit(1);
         }
 
-        // Reconstruct with retry (3 attempts, exponential backoff with jitter).
-        // Transient failures (e.g. corrupted share from network glitch) may
-        // succeed on retry after re-collecting shares.
+        // Reconstruct with retry
         const MAX_RECONSTRUCTION_ATTEMPTS: u32 = 3;
         let mut reconstructed_kek: Option<ProtectedKek> = None;
         for attempt in 1..=MAX_RECONSTRUCTION_ATTEMPTS {
@@ -369,23 +412,11 @@ pub fn cached_master_kek_distributed() -> &'static [u8; 32] {
                         MAX_RECONSTRUCTION_ATTEMPTS
                     );
                     if attempt < MAX_RECONSTRUCTION_ATTEMPTS {
-                        // Reset for retry: clear reconstruction_attempted flag and shares
                         mgr.reset_for_retry();
-                        // Re-load shares for the next attempt
                         if let Err(e2) = mgr.load_my_share(&my_share_hex) {
                             tracing::error!("Failed to reload own share on retry: {e2}");
                             std::process::exit(1);
                         }
-                        if let Some(ref csv) = peer_shares_csv {
-                            for hex_share in csv.split(',') {
-                                let hex_share = hex_share.trim();
-                                if hex_share.is_empty() { continue; }
-                                if let Ok(share) = KekShare::from_hex(hex_share) {
-                                    let _ = mgr.add_peer_share(share);
-                                }
-                            }
-                        }
-                        // Exponential backoff with jitter: 500ms * 2^(attempt-1) + rand(0..250ms)
                         let base_ms = 500u64 * (1u64 << (attempt - 1));
                         let mut jitter_bytes = [0u8; 1];
                         let _ = getrandom::getrandom(&mut jitter_bytes);
@@ -405,59 +436,60 @@ pub fn cached_master_kek_distributed() -> &'static [u8; 32] {
     }).as_bytes()
 }
 
-/// Verify a Shamir share against hash-based VSS commitments.
+/// Verify a Shamir share against secret-independent VSS commitments.
 ///
-/// Uses HMAC-SHA512 commitments distributed during the key ceremony.
-/// Each share's commitment is HMAC(commitment_key, index || value) where
-/// the commitment_key is derived from the original secret via HKDF-SHA512.
+/// Uses standalone HMAC-SHA512 commitments that do NOT require the secret.
+/// During key ceremony, the dealer computes for each share:
+///   commitment_i = HMAC-SHA512(ceremony_salt, index || share_value)
+/// and distributes the commitments alongside shares.
 ///
-/// The commitments are loaded from the `MILNET_VSS_COMMITMENTS` env var
+/// This avoids the circular dependency where you need the secret to verify
+/// shares but need shares to reconstruct the secret. Verification is fully
+/// independent: each share is checked against its pre-computed commitment.
+///
+/// Commitments are loaded from the `MILNET_VSS_COMMITMENTS` env var
 /// (hex-encoded, set during the key ceremony and sealed to each node).
-/// If commitments are not available, returns false and callers MUST log
-/// a warning and treat the share as unverified.
+/// If commitments are not available, returns false and callers MUST reject
+/// the share.
 fn verify_share_commitment(share: &crate::threshold_kek::KekShare) -> bool {
-    // Load VSS commitments from environment (set during key ceremony)
+    // Load standalone VSS commitments from environment (set during key ceremony)
     let commitments_hex = match std::env::var("MILNET_VSS_COMMITMENTS") {
         Ok(v) if !v.is_empty() => v,
         _ => {
-            // No commitments available yet (pre-ceremony or legacy deployment)
+            tracing::error!(
+                share_index = share.index,
+                "VSS VERIFICATION FAILED: MILNET_VSS_COMMITMENTS not set. \
+                 Cannot verify share without commitments. Share REJECTED."
+            );
+            crate::siem::SecurityEvent::tamper_detected(
+                &format!(
+                    "VSS commitments unavailable. Share {} rejected. \
+                     Set MILNET_VSS_COMMITMENTS during key ceremony.",
+                    share.index
+                ),
+            );
             return false;
         }
     };
 
-    let commitments = match crate::threshold_kek::VssCommitments::from_hex(&commitments_hex) {
+    let commitments = match crate::threshold_kek::StandaloneVssCommitments::from_hex(&commitments_hex) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("Failed to parse VSS commitments: {e}");
+            crate::siem::SecurityEvent::tamper_detected(
+                &format!("Malformed VSS commitments in MILNET_VSS_COMMITMENTS: {e}"),
+            );
             return false;
         }
     };
 
-    // We need the reconstructed KEK to derive the commitment key.
-    // During initial startup, we don't have it yet, so we verify
-    // against the stored commitment MAC directly. The commitment
-    // format includes a pre-computed HMAC that can be checked
-    // without the secret by comparing stored vs. provided values.
-    //
-    // Check if this share index exists in commitments and if the
-    // share value produces the same HMAC. Since we need the secret
-    // to derive the commitment key, and we're in the process of
-    // collecting shares to reconstruct it, we use a boot-strap
-    // approach: the commitment includes a self-contained proof.
-    //
-    // For the bootstrap case (first reconstruction), we verify the
-    // commitment structurally: the index must be present and the
-    // commitment must be non-zero (basic integrity check).
-    // After first reconstruction, subsequent verifications use the
-    // full HMAC verification path.
-    let has_matching_index = commitments.commitments.iter().any(|(idx, mac)| {
-        *idx == share.index && mac.iter().any(|&b| b != 0)
-    });
+    // Verify the share against its standalone commitment (no secret needed)
+    let valid = commitments.verify_share(share);
 
-    if !has_matching_index {
+    if !valid {
         tracing::error!(
             share_index = share.index,
-            "VSS VERIFICATION FAILED: share index not found in commitments or commitment is zero. \
+            "VSS VERIFICATION FAILED: share does not match its commitment. \
              Possible malicious share injection."
         );
         crate::siem::SecurityEvent::tamper_detected(
@@ -466,10 +498,9 @@ fn verify_share_commitment(share: &crate::threshold_kek::KekShare) -> bool {
                 share.index
             ),
         );
-        return false;
     }
 
-    true
+    valid
 }
 
 /// Unified entry point for obtaining the master KEK.

@@ -23,7 +23,6 @@
 
 use common::error::MilnetError;
 use ml_dsa::{
-    signature::{Signer, Verifier},
     EncodedSignature, EncodedVerifyingKey, KeyGen, MlDsa87, SigningKey, VerifyingKey,
 };
 use serde::{Deserialize, Serialize};
@@ -78,21 +77,31 @@ pub fn generate_pq_keypair_checked() -> Result<(PqSigningKey, PqVerifyingKey), S
     Ok((kp.signing_key().clone(), kp.verifying_key().clone()))
 }
 
+/// FIPS 204 context string for receipt signing (nested FROST + PQ).
+const CTX_RECEIPT_SIGN: &[u8] = b"MILNET-RECEIPT-SIGN-v1";
+/// FIPS 204 context string for raw/audit data signing (standalone PQ).
+const CTX_RAW_SIGN: &[u8] = b"MILNET-RAW-SIGN-v1";
+
 /// Sign with ML-DSA-87: signs `(message || frost_signature)`.
 ///
 /// This nested construction ensures the PQ signature commits to both the
 /// application payload and the classical FROST signature, preventing
 /// stripping attacks.
+///
+/// Uses FIPS 204 context string `MILNET-RECEIPT-SIGN-v1` for domain separation.
 pub fn pq_sign(signing_key: &PqSigningKey, message: &[u8], frost_sig: &[u8; 64]) -> Vec<u8> {
     let mut data = Vec::with_capacity(message.len() + 64);
     data.extend_from_slice(message);
     data.extend_from_slice(frost_sig);
-    let sig: PqSignature = signing_key.sign(&data);
+    let sig: PqSignature = signing_key
+        .sign_deterministic(&data, CTX_RECEIPT_SIGN)
+        .expect("context string within 255-byte FIPS 204 limit");
     sig.encode().to_vec()
 }
 
 /// Verify ML-DSA-87 signature over `(message || frost_signature)`.
 ///
+/// Uses FIPS 204 context string `MILNET-RECEIPT-SIGN-v1` for domain separation.
 /// Returns `true` if the PQ signature is valid.
 pub fn pq_verify(
     verifying_key: &PqVerifyingKey,
@@ -107,27 +116,32 @@ pub fn pq_verify(
     let mut data = Vec::with_capacity(message.len() + 64);
     data.extend_from_slice(message);
     data.extend_from_slice(frost_sig);
-    verifying_key.verify(&data, &sig).is_ok()
+    verifying_key.verify_with_context(&data, CTX_RECEIPT_SIGN, &sig)
 }
 
 /// Sign raw bytes with ML-DSA-87 (no FROST nesting).
 ///
 /// Used for audit entry signing, signed tree heads, and witness checkpoints
 /// where a standalone post-quantum signature is needed.
+///
+/// Uses FIPS 204 context string `MILNET-RAW-SIGN-v1` for domain separation.
 pub fn pq_sign_raw(signing_key: &PqSigningKey, data: &[u8]) -> Vec<u8> {
-    let sig: PqSignature = signing_key.sign(data);
+    let sig: PqSignature = signing_key
+        .sign_deterministic(data, CTX_RAW_SIGN)
+        .expect("context string within 255-byte FIPS 204 limit");
     sig.encode().to_vec()
 }
 
 /// Verify a raw ML-DSA-87 signature over `data`.
 ///
+/// Uses FIPS 204 context string `MILNET-RAW-SIGN-v1` for domain separation.
 /// Returns `true` if the signature is valid.
 pub fn pq_verify_raw(verifying_key: &PqVerifyingKey, data: &[u8], sig_bytes: &[u8]) -> bool {
     let sig = match PqSignature::try_from(sig_bytes) {
         Ok(s) => s,
         Err(_) => return false,
     };
-    verifying_key.verify(data, &sig).is_ok()
+    verifying_key.verify_with_context(data, CTX_RAW_SIGN, &sig)
 }
 
 // ── Crypto Agility: Runtime-Selectable Signature Algorithms ────────────────
@@ -255,8 +269,12 @@ pub fn pq_sign_tagged(signing_key: &PqSigningKey, data: &[u8]) -> Result<Vec<u8>
     let algo = active_pq_signature_algorithm();
     let raw_sig = match algo {
         PqSignatureAlgorithm::MlDsa87 => {
-            // Direct ML-DSA-87 signing (CNSA 2.0 Level 5)
-            let sig: PqSignature = signing_key.sign(data);
+            // Direct ML-DSA-87 signing (CNSA 2.0 Level 5) with FIPS 204 context.
+            let sig: PqSignature = signing_key
+                .sign_deterministic(data, CTX_RAW_SIGN)
+                .map_err(|_| MilnetError::CryptoVerification(
+                    "ML-DSA-87 deterministic signing failed".to_string(),
+                ))?;
             sig.encode().to_vec()
         }
         PqSignatureAlgorithm::SlhDsaSha2256f => {

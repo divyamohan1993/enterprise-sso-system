@@ -683,6 +683,53 @@ pub fn verify_real_tpm() -> bool {
     std::path::Path::new("/dev/tpmrm0").exists() || std::path::Path::new("/dev/tpm0").exists()
 }
 
+/// Startup check for TPM hardware in military deployments.
+///
+/// If `MILNET_MILITARY_DEPLOYMENT=1` and no TPM device exists, emits a
+/// SIEM:CRITICAL event and exits unless MLP mode is acknowledged.
+pub fn verify_tpm_or_exit() {
+    let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+
+    if !is_military {
+        return;
+    }
+
+    if verify_real_tpm() {
+        tracing::info!("TPM startup check passed: hardware TPM device detected");
+        return;
+    }
+
+    common::siem::SecurityEvent {
+        timestamp: common::siem::SecurityEvent::now_iso8601(),
+        category: "tpm",
+        action: "tpm_device_missing_at_startup",
+        severity: common::siem::Severity::Critical,
+        outcome: "failure",
+        user_id: None,
+        source_ip: None,
+        detail: Some(
+            "Military deployment requires TPM device (/dev/tpmrm0 or /dev/tpm0). None found."
+                .into(),
+        ),
+    }
+    .emit();
+
+    if common::config::is_mlp_mode() {
+        common::config::emit_mlp_siem_event("tpm", "no_tpm_device_mlp_acknowledged");
+        tracing::warn!(
+            "SIEM:CRITICAL TPM device missing in military deployment, but MLP mode acknowledged"
+        );
+        return;
+    }
+
+    tracing::error!(
+        "SIEM:CRITICAL TPM device missing in military deployment. Terminating."
+    );
+    std::process::exit(199);
+}
+
 /// Validate the deployment mode for TPM operations.
 ///
 /// - If a real TPM device is present, reports hardware-backed.

@@ -688,6 +688,141 @@ pub fn harden_process() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Kernel lockdown and swap encryption checks (HI-11, HI-14)
+// ---------------------------------------------------------------------------
+
+/// Check the kernel lockdown mode by reading `/sys/kernel/security/lockdown`.
+///
+/// Returns the lockdown mode string (e.g., "none", "integrity", "confidentiality").
+/// If lockdown is "none", secrets in memory may be readable via /proc/PID/mem by root.
+/// Hardware enclaves (SGX/SEV-SNP) are the proper mitigation.
+pub fn check_kernel_lockdown() -> String {
+    match std::fs::read_to_string("/sys/kernel/security/lockdown") {
+        Ok(content) => {
+            // Format is like: "none [integrity] confidentiality" with brackets around active
+            let mode = content
+                .split_whitespace()
+                .find(|s| s.starts_with('['))
+                .map(|s| s.trim_matches(|c| c == '[' || c == ']'))
+                .unwrap_or_else(|| content.trim())
+                .to_string();
+            if mode == "none" {
+                tracing::warn!(
+                    target: "siem",
+                    lockdown_mode = %mode,
+                    "SIEM:WARNING kernel lockdown is 'none'. Root can read /proc/PID/mem. \
+                     SecretBuffers are extractable by privileged attackers. \
+                     Hardware enclaves (SGX/SEV-SNP) are the proper mitigation."
+                );
+            } else {
+                tracing::info!(
+                    lockdown_mode = %mode,
+                    "kernel lockdown mode: {mode}"
+                );
+            }
+            mode
+        }
+        Err(_) => {
+            tracing::warn!(
+                target: "siem",
+                "SIEM:WARNING cannot read /sys/kernel/security/lockdown. \
+                 Kernel lockdown status unknown. Assume 'none' for security posture."
+            );
+            "unknown".to_string()
+        }
+    }
+}
+
+/// Check whether all swap devices are backed by dm-crypt (encrypted swap).
+///
+/// Reads /proc/swaps and verifies each swap device path starts with `/dev/dm-`
+/// or `/dev/mapper/` (indicating dm-crypt). If unencrypted swap is detected:
+/// - `MILNET_MILITARY_DEPLOYMENT=1`: exits the process
+/// - `MILNET_PRODUCTION=1`: logs SIEM:CRITICAL
+/// - Otherwise: logs a warning
+///
+/// Returns `true` if all swap is encrypted (or no swap is configured).
+pub fn check_encrypted_swap() -> bool {
+    let swaps = match std::fs::read_to_string("/proc/swaps") {
+        Ok(s) => s,
+        Err(_) => {
+            tracing::warn!("cannot read /proc/swaps; swap encryption status unknown");
+            return false;
+        }
+    };
+
+    let mut has_unencrypted = false;
+    for line in swaps.lines().skip(1) {
+        let device = match line.split_whitespace().next() {
+            Some(d) => d,
+            None => continue,
+        };
+        // dm-crypt devices appear as /dev/dm-N or /dev/mapper/*
+        let is_encrypted = device.starts_with("/dev/dm-")
+            || device.starts_with("/dev/mapper/")
+            || device.contains("zram"); // zram is in-memory, no disk persistence
+        if !is_encrypted {
+            has_unencrypted = true;
+            tracing::warn!(
+                swap_device = device,
+                "unencrypted swap device detected: {device}"
+            );
+        }
+    }
+
+    if !has_unencrypted {
+        return true;
+    }
+
+    let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let is_production = std::env::var("MILNET_PRODUCTION")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+
+    if is_military {
+        tracing::error!(
+            "SIEM:CRITICAL unencrypted swap detected in military deployment. \
+             Key material may be recoverable from disk. Terminating."
+        );
+        common::siem::SecurityEvent {
+            timestamp: common::siem::SecurityEvent::now_iso8601(),
+            category: "memguard",
+            action: "unencrypted_swap_military",
+            severity: common::siem::Severity::Critical,
+            outcome: "failure",
+            user_id: None,
+            source_ip: None,
+            detail: Some("Unencrypted swap detected in military deployment".into()),
+        }
+        .emit();
+        std::process::exit(199);
+    }
+
+    if is_production {
+        tracing::error!(
+            target: "siem",
+            "SIEM:CRITICAL unencrypted swap detected in production. \
+             Key material may be recoverable from swap partition forensics."
+        );
+        common::siem::SecurityEvent {
+            timestamp: common::siem::SecurityEvent::now_iso8601(),
+            category: "memguard",
+            action: "unencrypted_swap_production",
+            severity: common::siem::Severity::Critical,
+            outcome: "failure",
+            user_id: None,
+            source_ip: None,
+            detail: Some("Unencrypted swap detected in production deployment".into()),
+        }
+        .emit();
+    }
+
+    false
+}
+
+// ---------------------------------------------------------------------------
 // SecureString -- zeroize-on-drop String wrapper for sensitive tokens
 // ---------------------------------------------------------------------------
 

@@ -724,6 +724,23 @@ pub fn activate_enclave(operation: &str) -> Result<ConfidentialComputeCapabiliti
             )),
         }
         .emit();
+
+        // Allow MLP-acknowledged military deployments to continue with software fallback
+        let is_mlp = std::env::var("MILNET_MLP_MODE")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if is_mlp {
+            common::config::emit_mlp_siem_event(
+                "enclave",
+                &format!("software_fallback_military_mlp_{}", operation),
+            );
+            tracing::warn!(
+                operation = operation,
+                "SIEM:CRITICAL software enclave fallback in military deployment (MLP mode acknowledged)"
+            );
+            return Ok(caps);
+        }
+
         std::process::exit(199);
     }
 

@@ -192,9 +192,14 @@ pub enum GossipAction {
 /// This struct is transport-agnostic: callers drive it by calling [`tick`] on
 /// a timer and [`handle_message`] when a message arrives.  The protocol
 /// returns [`GossipAction`]s that the caller dispatches over the wire.
+///
+/// All outgoing messages are HMAC-signed with the transport_key provided at
+/// construction. Callers no longer need to sign messages manually.
 pub struct GossipProtocol {
     node_id: String,
     members: RwLock<HashMap<String, MemberState>>,
+    /// HMAC transport key for auto-signing outgoing messages.
+    transport_key: Vec<u8>,
     /// How long a node stays in SUSPECT before being declared DEAD.
     suspicion_timeout: Duration,
     /// Interval between protocol rounds (informational; caller drives ticks).
@@ -231,13 +236,39 @@ fn epoch_ms() -> u64 {
 
 impl GossipProtocol {
     /// Create a new gossip protocol instance for the given node.
+    /// Uses a zero transport key (for testing only). In production, use
+    /// `new_with_key()` to provide a real HMAC transport key.
     pub fn new(node_id: String) -> Self {
         Self::with_config(node_id, Duration::from_secs(10), Duration::from_secs(1), Duration::from_millis(500), 3)
     }
 
-    /// Create with explicit configuration.
+    /// Create a new gossip protocol instance with an HMAC transport key.
+    /// All outgoing messages will be auto-signed with this key.
+    pub fn new_with_key(node_id: String, transport_key: Vec<u8>) -> Self {
+        Self::with_config_and_key(
+            node_id, transport_key,
+            Duration::from_secs(10), Duration::from_secs(1), Duration::from_millis(500), 3,
+        )
+    }
+
+    /// Create with explicit configuration (uses empty transport key for testing).
     pub fn with_config(
         node_id: String,
+        suspicion_timeout: Duration,
+        ping_interval: Duration,
+        ping_timeout: Duration,
+        indirect_ping_count: usize,
+    ) -> Self {
+        Self::with_config_and_key(
+            node_id, Vec::new(),
+            suspicion_timeout, ping_interval, ping_timeout, indirect_ping_count,
+        )
+    }
+
+    /// Create with explicit configuration and transport key.
+    pub fn with_config_and_key(
+        node_id: String,
+        transport_key: Vec<u8>,
         suspicion_timeout: Duration,
         ping_interval: Duration,
         ping_timeout: Duration,
@@ -246,6 +277,7 @@ impl GossipProtocol {
         Self {
             node_id,
             members: RwLock::new(HashMap::new()),
+            transport_key,
             suspicion_timeout,
             ping_interval,
             ping_timeout,
@@ -255,6 +287,14 @@ impl GossipProtocol {
             pending_updates: RwLock::new(Vec::new()),
             outstanding_pings: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Sign an outgoing message with the transport key and wrap in a GossipAction.
+    fn signed_send(&self, target: String, mut message: GossipMessage) -> GossipAction {
+        if !self.transport_key.is_empty() {
+            message.sign(&self.transport_key);
+        }
+        GossipAction::Send { target, message }
     }
 
     /// Join the cluster by registering seed nodes as initial members.
@@ -288,16 +328,16 @@ impl GossipProtocol {
                 indirect_sent: false,
             });
 
-            actions.push(GossipAction::Send {
-                target: node_id.clone(),
-                message: GossipMessage {
+            actions.push(self.signed_send(
+                node_id.clone(),
+                GossipMessage {
                     sender: self.node_id.clone(),
                     msg_type: GossipMessageType::Ping { sequence: seq },
                     piggyback: self.collect_piggyback_unlocked(),
                     incarnation,
                     hmac_signature: Vec::new(),
                 },
-            });
+            ));
         }
 
         emit_gossip_siem(
@@ -337,16 +377,16 @@ impl GossipProtocol {
                 indirect_sent: false,
             });
 
-            actions.push(GossipAction::Send {
-                target: target.clone(),
-                message: GossipMessage {
+            actions.push(self.signed_send(
+                target.clone(),
+                GossipMessage {
                     sender: self.node_id.clone(),
                     msg_type: GossipMessageType::Ping { sequence: seq },
                     piggyback: self.piggyback_updates(),
                     incarnation,
                     hmac_signature: Vec::new(),
                 },
-            });
+            ));
         }
 
         actions
@@ -386,16 +426,16 @@ impl GossipProtocol {
         match &msg.msg_type {
             GossipMessageType::Ping { sequence } => {
                 // Reply with ACK
-                actions.push(GossipAction::Send {
-                    target: msg.sender.clone(),
-                    message: GossipMessage {
+                actions.push(self.signed_send(
+                    msg.sender.clone(),
+                    GossipMessage {
                         sender: self.node_id.clone(),
                         msg_type: GossipMessageType::Ack { sequence: *sequence },
                         piggyback: self.piggyback_updates(),
                         incarnation,
                         hmac_signature: Vec::new(),
                     },
-                });
+                ));
             }
             GossipMessageType::Ack { sequence } => {
                 let mut outstanding = crate::sync::siem_write(&self.outstanding_pings, "gossip::handle_ack");
@@ -405,16 +445,16 @@ impl GossipProtocol {
             }
             GossipMessageType::PingReq { target, sequence } => {
                 // Forward a PING to the requested target on behalf of the sender
-                actions.push(GossipAction::Send {
-                    target: target.clone(),
-                    message: GossipMessage {
+                actions.push(self.signed_send(
+                    target.clone(),
+                    GossipMessage {
                         sender: self.node_id.clone(),
                         msg_type: GossipMessageType::Ping { sequence: *sequence },
                         piggyback: self.piggyback_updates(),
                         incarnation,
                         hmac_signature: Vec::new(),
                     },
-                });
+                ));
             }
             GossipMessageType::Compound(msgs) => {
                 for sub in msgs {
@@ -644,9 +684,9 @@ impl GossipProtocol {
             let peers = self.pick_k_random_peers(&target, self.indirect_ping_count);
             let incarnation = *crate::sync::siem_read(&self.incarnation, "gossip::indirect_ping_incarnation");
             for peer in peers {
-                actions.push(GossipAction::Send {
-                    target: peer,
-                    message: GossipMessage {
+                actions.push(self.signed_send(
+                    peer,
+                    GossipMessage {
                         sender: self.node_id.clone(),
                         msg_type: GossipMessageType::PingReq {
                             target: target.clone(),
@@ -656,7 +696,7 @@ impl GossipProtocol {
                         incarnation,
                         hmac_signature: Vec::new(),
                     },
-                });
+                ));
             }
             let mut outstanding = crate::sync::siem_write(&self.outstanding_pings, "gossip::indirect_ping_mark");
             if let Some(ping) = outstanding.get_mut(seq) {
@@ -976,5 +1016,63 @@ mod tests {
         // Tick should expire the suspect to dead
         proto.expire_suspects();
         assert!(proto.member_status("node-1").unwrap().is_dead());
+    }
+
+    #[test]
+    fn test_auto_signing_with_transport_key() {
+        let key = vec![0x42u8; 32];
+        let proto = GossipProtocol::new_with_key("node-0".into(), key.clone());
+        let seeds = vec![("node-1".into(), test_metadata())];
+
+        let actions = proto.join(&seeds);
+        assert_eq!(actions.len(), 1);
+
+        match &actions[0] {
+            GossipAction::Send { message, .. } => {
+                assert!(!message.hmac_signature.is_empty(), "message should be auto-signed");
+                // Verify the signature is valid
+                assert!(message.verify_signature(&key).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn test_tick_auto_signs_messages() {
+        let key = vec![0xAB; 32];
+        let proto = GossipProtocol::new_with_key("node-0".into(), key.clone());
+        proto.join(&[("node-1".into(), test_metadata())]);
+
+        let actions = proto.tick();
+        for action in &actions {
+            match action {
+                GossipAction::Send { message, .. } => {
+                    assert!(!message.hmac_signature.is_empty());
+                    assert!(message.verify_signature(&key).is_ok());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_handle_message_ack_auto_signed() {
+        let key = vec![0xCD; 32];
+        let proto = GossipProtocol::new_with_key("node-0".into(), key.clone());
+        proto.join(&[("node-1".into(), test_metadata())]);
+
+        let ping = GossipMessage {
+            sender: "node-1".into(),
+            msg_type: GossipMessageType::Ping { sequence: 99 },
+            piggyback: Vec::new(),
+            incarnation: 0,
+            hmac_signature: Vec::new(),
+        };
+        let actions = proto.handle_message(ping);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            GossipAction::Send { message, .. } => {
+                assert!(!message.hmac_signature.is_empty(), "ACK should be auto-signed");
+                assert!(message.verify_signature(&key).is_ok());
+            }
+        }
     }
 }

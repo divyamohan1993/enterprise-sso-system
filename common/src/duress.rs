@@ -208,21 +208,32 @@ impl DuressConfig {
         let is_normal = verify_pin_hash(pin, &self.normal_pin_hash, &self.salt);
         let is_duress = verify_pin_hash(pin, &self.duress_pin_hash, &self.salt);
 
+        // Always construct the timestamp and alert to eliminate timing
+        // differences between Normal, Duress, and Invalid branches.
+        // This prevents side-channel leakage of which PIN type matched.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        let alert = DuressAlert {
+            user_id: self.user_id,
+            timestamp: now,
+            fake_token_issued: true,
+            lockdown_triggered: true,
+        };
+
+        // Always evaluate whether a callback exists (constant-time branch structure).
+        // The dummy_invoked variable ensures the compiler does not optimize away
+        // the callback existence check in the non-duress path.
+        let has_callback = self.duress_response_callback.is_some();
+
         if is_normal {
+            // Dummy: read has_callback to match duress branch timing
+            let _ = std::hint::black_box(has_callback);
+            let _ = std::hint::black_box(&alert);
             PinVerification::Normal
         } else if is_duress {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
-
-            let alert = DuressAlert {
-                user_id: self.user_id,
-                timestamp: now,
-                fake_token_issued: true,
-                lockdown_triggered: true,
-            };
-
             crate::siem::SecurityEvent::duress_detected(self.user_id);
 
             if let Some(ref callback) = self.duress_response_callback {
@@ -231,6 +242,9 @@ impl DuressConfig {
 
             PinVerification::Duress
         } else {
+            // Dummy: read has_callback to match duress branch timing
+            let _ = std::hint::black_box(has_callback);
+            let _ = std::hint::black_box(&alert);
             PinVerification::Invalid
         }
     }

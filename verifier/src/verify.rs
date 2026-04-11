@@ -289,7 +289,8 @@ fn verify_token_core(
     //     If no expected_ceremony_id is supplied by the caller, the check is
     //     skipped (backward-compatible). Once all callers supply the expected ID,
     //     the `None` path becomes unreachable in production.
-    if token.claims.ceremony_id != [0u8; 32] {
+    let has_ceremony = !crypto::ct::ct_eq(&token.claims.ceremony_id, &[0u8; 32]);
+    if has_ceremony {
         if let Some(expected_ceremony) = expected_ceremony_id {
             if !crypto::ct::ct_eq(&token.claims.ceremony_id, expected_ceremony) {
                 return Err(MilnetError::CryptoVerification(
@@ -299,8 +300,10 @@ fn verify_token_core(
         }
     }
 
-    // 5. Validate ratchet_epoch is within reasonable bounds
-    if token.claims.ratchet_epoch == 0 || token.claims.ratchet_epoch > MAX_SESSION_EPOCHS {
+    // 5. Validate ratchet_epoch is within reasonable bounds (constant-time)
+    let epoch_zero = crypto::ct::ct_eq(&token.claims.ratchet_epoch.to_le_bytes(), &0u64.to_le_bytes());
+    let epoch_over = token.claims.ratchet_epoch > MAX_SESSION_EPOCHS;
+    if epoch_zero || epoch_over {
         return Err(MilnetError::CryptoVerification(format!(
             "ratchet_epoch {} out of valid range [1, {}]",
             token.claims.ratchet_epoch, MAX_SESSION_EPOCHS

@@ -198,4 +198,4 @@ jobs:
             --certificate-identity-regexp "https://github.com/${REPO}/*" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             "ghcr.io/${REPO}/${SERVICE}:master" || \
-          echo "WARNING: Image signature verification failed for ${SERVICE}. Image may not have been signed yet."
+          (echo "CRITICAL: signature verification failed for ${SERVICE}" && exit 1)

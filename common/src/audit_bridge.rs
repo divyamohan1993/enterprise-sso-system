@@ -11,28 +11,138 @@ use std::sync::OnceLock;
 /// Maximum buffered audit entries before forced flush.
 const MAX_BUFFERED_ENTRIES: usize = 10_000;
 
+/// Default path for disk-backed overflow file.
+const DEFAULT_AUDIT_OVERFLOW_PATH: &str = "/var/lib/milnet/audit_overflow.jsonl";
+
+/// Counter for entries dropped when both memory and disk spill fail.
+static DROPPED_ENTRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Flag to emit SIEM:CRITICAL only once on first overflow.
+static OVERFLOW_SIEM_EMITTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 static AUDIT_BUFFER: OnceLock<Mutex<Vec<AuditEntry>>> = OnceLock::new();
 
+/// Get the configured overflow file path.
+fn overflow_path() -> String {
+    std::env::var("MILNET_AUDIT_OVERFLOW_PATH")
+        .unwrap_or_else(|_| DEFAULT_AUDIT_OVERFLOW_PATH.to_string())
+}
+
+/// Spill an audit entry to the disk-backed overflow file.
+fn spill_to_disk(entry: &AuditEntry) -> bool {
+    let path = overflow_path();
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(mut f) => {
+            use std::io::Write;
+            match serde_json::to_string(entry) {
+                Ok(json) => {
+                    if writeln!(f, "{json}").is_ok() {
+                        return true;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("SIEM:CRITICAL audit overflow serialize failed: {e}");
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!("SIEM:CRITICAL audit overflow file open failed: {e}");
+        }
+    }
+    false
+}
+
+/// Drain entries from the disk-backed overflow file.
+/// Returns entries read from disk (file is truncated after read).
+fn drain_overflow_file() -> Vec<AuditEntry> {
+    let path = overflow_path();
+    let data = match std::fs::read_to_string(&path) {
+        Ok(d) if !d.is_empty() => d,
+        _ => return Vec::new(),
+    };
+    // Truncate the file after reading
+    let _ = std::fs::File::create(&path);
+
+    let mut entries = Vec::new();
+    for line in data.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<AuditEntry>(line) {
+            Ok(entry) => entries.push(entry),
+            Err(e) => {
+                tracing::warn!("audit overflow: skipping malformed line: {e}");
+            }
+        }
+    }
+    entries
+}
+
+/// Get the count of entries dropped when both memory and disk spill failed.
+pub fn dropped_entry_count() -> u64 {
+    DROPPED_ENTRIES.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Buffer an audit entry for later collection by the audit service.
+/// When the in-memory buffer hits 10K, spills to a disk-backed overflow file.
+/// Emits SIEM:CRITICAL on first overflow. Increments dropped counter if
+/// even disk spill fails.
 pub fn buffer_audit_entry(entry: AuditEntry) {
     let buf = AUDIT_BUFFER.get_or_init(|| Mutex::new(Vec::new()));
     if let Ok(mut entries) = buf.lock() {
         if entries.len() < MAX_BUFFERED_ENTRIES {
             entries.push(entry);
         } else {
-            tracing::error!("SIEM:CRITICAL audit buffer full, dropping entry");
+            // Emit SIEM:CRITICAL on first overflow
+            if !OVERFLOW_SIEM_EMITTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                tracing::error!(
+                    "SIEM:CRITICAL audit buffer full ({} entries), spilling to disk overflow at {}",
+                    MAX_BUFFERED_ENTRIES,
+                    overflow_path()
+                );
+                crate::siem::SecurityEvent {
+                    timestamp: crate::siem::SecurityEvent::now_iso8601(),
+                    category: "audit_bridge",
+                    action: "buffer_overflow_disk_spill",
+                    severity: crate::siem::Severity::Critical,
+                    outcome: "degraded",
+                    user_id: None,
+                    source_ip: None,
+                    detail: Some(format!(
+                        "audit buffer exceeded {} entries, spilling to disk",
+                        MAX_BUFFERED_ENTRIES
+                    )),
+                }
+                .emit();
+            }
+            // Spill to disk
+            if !spill_to_disk(&entry) {
+                DROPPED_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tracing::error!(
+                    "SIEM:CRITICAL audit entry dropped: both memory buffer and disk spill failed"
+                );
+            }
         }
     }
 }
 
 /// Drain all buffered audit entries (called by the audit service collector).
+/// Drains the disk overflow file first, then the in-memory buffer.
 pub fn drain_audit_buffer() -> Vec<AuditEntry> {
+    // Drain disk overflow first (older entries)
+    let mut result = drain_overflow_file();
+
     let buf = AUDIT_BUFFER.get_or_init(|| Mutex::new(Vec::new()));
     if let Ok(mut entries) = buf.lock() {
-        std::mem::take(&mut *entries)
-    } else {
-        Vec::new()
+        result.append(&mut entries);
+        // Reset overflow flag since buffer is now drained
+        OVERFLOW_SIEM_EMITTED.store(false, std::sync::atomic::Ordering::SeqCst);
     }
+    result
 }
 
 /// Helper to create an audit entry from common parameters.

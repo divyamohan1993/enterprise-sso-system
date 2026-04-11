@@ -520,8 +520,8 @@ pub async fn extract_google_claims(
         return Err(format!("unexpected issuer: {}", claims.iss));
     }
 
-    // Validate audience matches our client_id
-    if claims.aud != expected_client_id {
+    // Validate audience matches our client_id (constant-time to prevent timing oracle)
+    if !crypto::ct::ct_eq(claims.aud.as_bytes(), expected_client_id.as_bytes()) {
         return Err(format!(
             "audience mismatch: expected {}, got {}",
             expected_client_id, claims.aud
@@ -579,8 +579,8 @@ pub fn verify_google_id_token(
         return Err(format!("unexpected issuer: {}", claims.iss));
     }
 
-    // Audience must match our client_id
-    if claims.aud != expected_aud {
+    // Audience must match our client_id (constant-time to prevent timing oracle)
+    if !crypto::ct::ct_eq(claims.aud.as_bytes(), expected_aud.as_bytes()) {
         return Err(format!(
             "audience mismatch: expected {expected_aud}, got {}",
             claims.aud

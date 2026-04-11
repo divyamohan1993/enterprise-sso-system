@@ -208,10 +208,35 @@ pub fn enforce_cnsa2_level5() -> Cnsa2Level5Status {
         );
     }
 
-    Cnsa2Level5Status {
+    let status = Cnsa2Level5Status {
         passed: all_passed,
         checks,
+    };
+
+    // In military mode, CNSA 2.0 Level 5 violations are fatal.
+    let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1");
+    if !all_passed && is_military {
+        let failing: Vec<&str> = status
+            .checks
+            .iter()
+            .filter(|c| !c.passed)
+            .map(|c| c.component)
+            .collect();
+        tracing::error!(
+            "SIEM:FATAL CNSA2-LEVEL5-MILITARY: System MUST NOT start in military mode \
+             with CNSA 2.0 Level 5 violations. Failing components: [{}]. Aborting.",
+            failing.join(", ")
+        );
+        std::process::exit(1);
+    } else if !all_passed {
+        // Non-military mode: log critical but allow startup
+        tracing::error!(
+            "SIEM:CRITICAL CNSA2-LEVEL5: CNSA 2.0 Level 5 violations detected. \
+             System starting in degraded compliance mode."
+        );
     }
+
+    status
 }
 
 #[cfg(test)]
@@ -227,8 +252,12 @@ mod tests {
 
     #[test]
     fn cnsa2_level5_enforcement_with_defaults() {
+        // Ensure MILNET_MILITARY_DEPLOYMENT is NOT set so we don't exit(1)
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+
         // With default config (no MILNET_PQ_SIGNATURE_ALG set), ML-DSA-87 is used.
         // TLS transport uses ML-KEM-768 (Level 3) which is honestly reported as failing.
+        // Non-military mode: logs SIEM:CRITICAL but does NOT abort.
         let status = enforce_cnsa2_level5();
         assert!(!status.passed, "CNSA 2.0 Level 5 should report TLS gap honestly");
         assert!(!status.checks.is_empty());
@@ -247,5 +276,14 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn cnsa2_nonmilitary_allows_startup() {
+        // Non-military mode should return the status without aborting
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        let status = enforce_cnsa2_level5();
+        // We get here = did not abort. Status should reflect the TLS gap.
+        assert!(!status.passed);
     }
 }

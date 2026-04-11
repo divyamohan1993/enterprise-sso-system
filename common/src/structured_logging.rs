@@ -317,11 +317,12 @@ fn syslog_endpoint() -> Option<&'static str> {
         .as_deref()
 }
 
-/// Send a log line to the remote syslog endpoint via TCP+TLS (preferred) or UDP (fallback).
+/// Send a log line to the remote syslog endpoint via TCP+TLS (preferred) or UDP (dev/test only).
 ///
 /// SECURITY: UDP syslog transmits log lines in plaintext, observable by network
-/// attackers. TCP+TLS is used when `MILNET_SYSLOG_TLS=1` is set. Best-effort:
-/// failures are silently ignored to avoid blocking the log path.
+/// attackers. In production (MILNET_PRODUCTION=1), UDP syslog is refused entirely.
+/// In military mode (MILNET_MILITARY_DEPLOYMENT=1), configuring UDP syslog is fatal.
+/// TCP+TLS is used when `MILNET_SYSLOG_TLS=1` is set.
 fn send_to_syslog(endpoint: &str, json_line: &str) {
     use std::net::UdpSocket;
 
@@ -332,15 +333,40 @@ fn send_to_syslog(endpoint: &str, json_line: &str) {
     });
 
     if use_tls {
-        // TCP+TLS syslog (RFC 5425). Use a thread-local persistent connection.
-        // The TLS connection is established lazily and reused across log lines.
-        // On connection failure, silently drop (best-effort logging must not block).
         send_to_syslog_tls(endpoint, json_line);
         return;
     }
 
-    // Fallback: plaintext UDP syslog
-    // Cache the socket in a thread-local to avoid repeated bind overhead
+    // SECURITY: In production, refuse plaintext UDP syslog.
+    static IS_PRODUCTION: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let is_production = *IS_PRODUCTION.get_or_init(|| {
+        std::env::var("MILNET_PRODUCTION").as_deref() == Ok("1")
+    });
+
+    static IS_MILITARY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let is_military = *IS_MILITARY.get_or_init(|| {
+        std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1")
+    });
+
+    if is_military {
+        // Military mode: UDP syslog configuration is a fatal misconfiguration
+        eprintln!(
+            "FATAL: UDP syslog configured in military deployment. \
+             Set MILNET_SYSLOG_TLS=1 or remove MILNET_SYSLOG_ENDPOINT."
+        );
+        std::process::exit(1);
+    }
+
+    if is_production {
+        // Production mode: refuse UDP, log SIEM:CRITICAL
+        tracing::error!(
+            "SIEM:CRITICAL: UDP syslog refused in production mode. \
+             Set MILNET_SYSLOG_TLS=1 for secure log shipping."
+        );
+        return;
+    }
+
+    // Dev/test only: plaintext UDP syslog
     thread_local! {
         static UDP_SOCKET: Option<UdpSocket> = {
             UdpSocket::bind("0.0.0.0:0").ok().map(|s| {
@@ -359,21 +385,22 @@ fn send_to_syslog(endpoint: &str, json_line: &str) {
 
 /// Send a log line over TCP+TLS syslog (RFC 5425 framing: octet-counted).
 ///
-/// SECURITY: This function refuses to send logs over plaintext TCP.
-/// The common crate does not include tokio-rustls, so proper TLS wrapping
-/// is not available here. Use MILNET_SIEM_WEBHOOK or SHARD transport for
-/// secure log shipping instead.
+/// SECURITY: TLS syslog requires a full rustls + tokio-rustls integration
+/// which is not yet implemented in the common crate. This function logs
+/// SIEM:CRITICAL and refuses to silently drop log lines. Deployers must
+/// use MILNET_SIEM_WEBHOOK for secure log shipping until TLS syslog is
+/// implemented.
 fn send_to_syslog_tls(endpoint: &str, _json_line: &str) {
-    // Refuse to send logs over plaintext TCP. The previous implementation
-    // used std::net::TcpStream without any TLS wrapping, silently sending
-    // structured logs (containing correlation IDs, severity, timestamps)
-    // in the clear. This is unacceptable for DoD/MILNET deployment.
-    tracing::error!(
-        endpoint = endpoint,
-        "syslog TLS transport not yet implemented with rustls. \
-         Use MILNET_SIEM_WEBHOOK for secure log shipping. \
-         Refusing to send logs over plaintext TCP."
-    );
+    // Log at most once to avoid flooding
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::error!(
+            endpoint = endpoint,
+            "SIEM:CRITICAL: TLS syslog transport not yet implemented. \
+             Log lines to syslog endpoint are being DROPPED. \
+             Use MILNET_SIEM_WEBHOOK for secure log shipping instead."
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

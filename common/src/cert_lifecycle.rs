@@ -144,8 +144,32 @@ impl Default for RotationPolicy {
             rotate_before_expiry_days: 30,
             ocsp_refresh_interval_secs: 3600,
             crl_refresh_interval_secs: 86400,
-            auto_rotate_enabled: false,
+            auto_rotate_enabled: true,
             notify_days_before_expiry: vec![90, 60, 30, 14, 7, 1],
+        }
+    }
+}
+
+impl RotationPolicy {
+    /// Validate the rotation policy at startup.
+    /// Warns if auto_rotate_enabled is false in military mode.
+    pub fn validate_startup(&self) {
+        if !self.auto_rotate_enabled {
+            if std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1") {
+                tracing::error!(
+                    "SECURITY WARNING: auto_rotate_enabled is false in military deployment. \
+                     Certificates will NOT be automatically rotated. This is a configuration risk."
+                );
+                crate::siem::SecurityEvent::tamper_detected(
+                    "Certificate auto-rotation disabled in military deployment. \
+                     Manual rotation required.",
+                );
+            } else {
+                tracing::warn!(
+                    "Certificate auto-rotation is disabled. \
+                     Enable auto_rotate_enabled for production deployments."
+                );
+            }
         }
     }
 }
@@ -171,6 +195,7 @@ pub struct CertificateLifecycleManager {
 impl CertificateLifecycleManager {
     /// Create a new manager with the given rotation policy.
     pub fn new(policy: RotationPolicy) -> Self {
+        policy.validate_startup();
         Self {
             certs: Mutex::new(HashMap::new()),
             policy,
@@ -442,11 +467,12 @@ impl CertificateLifecycleManager {
         let new_not_before = now;
         let new_not_after = now + 365 * 86400; // 1 year validity.
 
-        // Placeholder CSR bytes — in production this would be a real PKCS#10.
+        // Build CSR with real ECDSA self-signature proving key possession.
         let csr_placeholder = build_rotation_csr_placeholder(
             &subject_dn,
             &public_key_der,
             now,
+            &secret_key,
         );
 
         // Register the new certificate.
@@ -623,18 +649,15 @@ fn current_unix_timestamp() -> i64 {
 
 /// Build a minimal DER-encoded PKCS#10 CertificationRequest structure.
 ///
-/// Constructs a valid (but unsigned) PKCS#10 CSR with:
+/// Constructs a properly self-signed PKCS#10 CSR with:
 /// - Version 0
 /// - Subject DN from the provided string (encoded as a single CN RDN)
 /// - SubjectPublicKeyInfo containing the raw EC public key
-/// - Empty signature (the CA will re-sign with the actual private key)
+/// - ECDSA-SHA256 self-signature proving key possession
 ///
-/// NOTE: For a fully signed CSR, add the `rcgen` crate and replace this
-/// with `rcgen::CertificateSigningRequest`. The current implementation
-/// produces structurally valid DER that a CA can parse but the signature
-/// field is zeroed — the CA must validate identity through an out-of-band
-/// channel (which is the case for automated rotation within a trusted enclave).
-fn build_rotation_csr_placeholder(subject: &str, public_key: &[u8], _timestamp: i64) -> Vec<u8> {
+/// The self-signature proves to the CA that the requester holds the private
+/// key corresponding to the public key in the CSR.
+fn build_rotation_csr_placeholder(subject: &str, public_key: &[u8], _timestamp: i64, signing_key: &p256::SecretKey) -> Vec<u8> {
     // Helper: DER tag-length-value encoding
     fn der_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
         let mut out = vec![tag];
@@ -715,18 +738,21 @@ fn build_rotation_csr_placeholder(subject: &str, public_key: &[u8], _timestamp: 
     let oid_ecdsa_sha256 = der_oid(&[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02]);
     let sig_algorithm = der_sequence(&oid_ecdsa_sha256);
 
-    // Signature: zeroed placeholder (64 bytes for ECDSA P-256).
-    // SECURITY NOTE: This CSR is generated within a trusted rotation enclave.
-    // The CA MUST verify identity via the existing certificate chain, not
-    // solely via CSR self-signature. For full CSR signing, add the `rcgen` crate.
-    let sig_placeholder = der_bitstring(&[0u8; 64]);
+    // Sign the CertificationRequestInfo with the private key (ECDSA-SHA256).
+    // This proves key possession to the CA.
+    let sig_bitstring = {
+        use p256::ecdsa::{SigningKey, signature::Signer, Signature};
+        let ecdsa_key = SigningKey::from(signing_key);
+        let signature: Signature = ecdsa_key.sign(&cert_req_info);
+        der_bitstring(&signature.to_der().as_bytes().to_vec())
+    };
 
     // CertificationRequest (outer SEQUENCE)
     der_sequence(
         &[
             cert_req_info.as_slice(),
             sig_algorithm.as_slice(),
-            sig_placeholder.as_slice(),
+            sig_bitstring.as_slice(),
         ]
         .concat(),
     )
@@ -1004,5 +1030,48 @@ mod tests {
         shutdown.store(true, Ordering::Relaxed);
         // Give the thread time to exit.
         std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // -- MD-26: Auto-rotation enabled by default --
+
+    #[test]
+    fn test_auto_rotate_enabled_by_default() {
+        let policy = RotationPolicy::default();
+        assert!(
+            policy.auto_rotate_enabled,
+            "auto_rotate_enabled must default to true in production"
+        );
+    }
+
+    // -- HI-10: CSR has real signature --
+
+    #[test]
+    fn test_csr_has_real_signature() {
+        let mgr = CertificateLifecycleManager::new(RotationPolicy {
+            auto_rotate_enabled: true,
+            ..RotationPolicy::default()
+        });
+        let now = now_ts();
+
+        let cert_id = mgr.register_certificate(
+            vec![],
+            "CN=csr-test.example.com".into(),
+            "CN=Test CA".into(),
+            vec![0x01],
+            now - 86400,
+            now + 10 * 86400,
+            vec![],
+            vec![KeyUsage::DigitalSignature],
+        );
+
+        let (_, csr_der) = mgr.auto_rotate_certificate(cert_id).unwrap();
+        // CSR must not contain a zeroed signature (64 zero bytes)
+        let zero_sig = [0u8; 64];
+        // The CSR should be non-trivial and not contain a run of 64 zero bytes
+        let has_zero_block = csr_der.windows(64).any(|w| w == &zero_sig[..]);
+        assert!(
+            !has_zero_block,
+            "CSR must have a real ECDSA signature, not zeroed placeholder"
+        );
     }
 }

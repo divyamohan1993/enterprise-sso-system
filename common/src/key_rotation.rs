@@ -83,13 +83,37 @@ pub fn start_rotation_monitor(
 // ── Distributed Key Rotation with Mutual Verification ──────────────────────────
 
 use hmac::{Hmac, Mac};
-use ml_dsa::{signature::{Signer, Verifier}, KeyGen, MlDsa87};
+use ml_dsa::{signature::{Signer, Verifier}, KeyGen, MlDsa87, VerifyingKey, EncodedVerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 type HmacSha512 = Hmac<Sha512>;
+
+/// Derive separate signing and HMAC keys from a single seed via HKDF-SHA512.
+///
+/// Returns (signing_seed, hmac_key) where:
+/// - signing_seed: 32 bytes for ML-DSA-87 key generation
+/// - hmac_key: 64 bytes for HMAC-SHA512 integrity
+///
+/// This prevents the same key material from being used for two different
+/// cryptographic operations (signing vs. MAC), which would violate key
+/// separation principles.
+fn derive_rotation_keys(seed: &[u8]) -> ([u8; 32], [u8; 64]) {
+    use hkdf::Hkdf;
+    let hkdf = Hkdf::<Sha512>::new(Some(b"MILNET-ROTATION-KEY-DERIVE-v1"), seed);
+
+    let mut signing_seed = [0u8; 32];
+    hkdf.expand(b"MILNET-ROTATION-SIGN-v1", &mut signing_seed)
+        .expect("HKDF expand for 32 bytes");
+
+    let mut hmac_key = [0u8; 64];
+    hkdf.expand(b"MILNET-ROTATION-HMAC-v1", &mut hmac_key)
+        .expect("HKDF expand for 64 bytes");
+
+    (signing_seed, hmac_key)
+}
 
 /// Key types in the system, each with independent rotation schedules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -197,41 +221,82 @@ impl RotationEvent {
 
     fn build(
         node_id: RotationNodeId, key_type: KeyType, epoch: u64, timestamp: u64,
-        new_key_material: &[u8], signing_key: &[u8],
+        new_key_material: &[u8], signing_seed: &[u8],
     ) -> Self {
         let new_key_hash = { let mut h = Sha512::new(); h.update(new_key_material); h.finalize().to_vec() };
         let mut evt = Self { node_id, key_type, epoch, timestamp, new_key_hash, signature: Vec::new(), hmac_tag: Vec::new() };
         let canonical = evt.canonical_bytes();
-        // Primary: ML-DSA-87 signature (32-byte seed).
-        if signing_key.len() == 32 {
-            let seed: [u8; 32] = signing_key.try_into().unwrap();
-            let kp = MlDsa87::from_seed(&seed.into());
+
+        // Derive separate keys from the seed via HKDF to prevent key reuse.
+        // signing_key is used for ML-DSA-87, hmac_key for HMAC-SHA512.
+        if signing_seed.len() == 32 {
+            let (derived_sign_seed, hmac_key) = derive_rotation_keys(signing_seed);
+
+            // Primary: ML-DSA-87 signature with derived signing seed.
+            let kp = MlDsa87::from_seed(&derived_sign_seed.into());
             let sig: ml_dsa::Signature<MlDsa87> = kp.signing_key().sign(&canonical);
             evt.signature = sig.encode().to_vec();
+
+            // Secondary: HMAC-SHA512 integrity with separate derived key.
+            let mut mac = HmacSha512::new_from_slice(&hmac_key).expect("HMAC accepts any key length");
+            mac.update(&canonical);
+            evt.hmac_tag = mac.finalize().into_bytes().to_vec();
+        } else {
+            // Non-32-byte key: HMAC-only mode (no ML-DSA).
+            let mut mac = HmacSha512::new_from_slice(signing_seed).expect("HMAC accepts any key length");
+            mac.update(&canonical);
+            evt.hmac_tag = mac.finalize().into_bytes().to_vec();
         }
-        // Secondary: HMAC-SHA512 integrity.
-        let mut mac = HmacSha512::new_from_slice(signing_key).expect("HMAC accepts any key length");
-        mac.update(&canonical);
-        evt.hmac_tag = mac.finalize().into_bytes().to_vec();
         evt
     }
 
+    /// Extract the ML-DSA-87 verifying key (public key) for a given seed.
+    ///
+    /// Cluster members should call this once during setup and store/distribute
+    /// only the verifying key. The seed (signing key) never leaves the node.
+    pub fn verifying_key_from_seed(seed: &[u8]) -> Vec<u8> {
+        assert_eq!(seed.len(), 32, "seed must be 32 bytes");
+        let (derived_sign_seed, _) = derive_rotation_keys(seed);
+        let kp = MlDsa87::from_seed(&derived_sign_seed.into());
+        kp.verifying_key().encode().to_vec()
+    }
+
     /// Verify ML-DSA-87 signature and HMAC tag. O(1).
+    ///
+    /// Accepts EITHER:
+    /// - The ML-DSA-87 verifying key (2592 bytes) for signature-only verification
+    /// - The original 32-byte seed (derives both verifying key and HMAC key)
+    ///
+    /// Production nodes SHOULD use the verifying key form (no seed distribution).
     pub fn verify_signature(&self, verifying_key: &[u8]) -> bool {
         let canonical = self.canonical_bytes();
-        if !self.signature.is_empty() && verifying_key.len() == 32 {
-            let seed: [u8; 32] = match verifying_key.try_into() { Ok(s) => s, Err(_) => return false };
-            let kp = MlDsa87::from_seed(&seed.into());
-            let vk = kp.verifying_key();
+
+        if verifying_key.len() == 32 {
+            // Seed-based verification: derive keys and verify both.
+            let (derived_sign_seed, hmac_key) = derive_rotation_keys(verifying_key);
+
+            if !self.signature.is_empty() {
+                let kp = MlDsa87::from_seed(&derived_sign_seed.into());
+                let vk = kp.verifying_key();
+                let sig = match ml_dsa::Signature::<MlDsa87>::try_from(self.signature.as_slice()) { Ok(s) => s, Err(_) => return false };
+                if vk.verify(&canonical, &sig).is_err() { return false; }
+            }
+            if !self.hmac_tag.is_empty() {
+                let mut mac = match HmacSha512::new_from_slice(&hmac_key) { Ok(m) => m, Err(_) => return false };
+                mac.update(&canonical);
+                if mac.verify_slice(&self.hmac_tag).is_err() { return false; }
+            }
+            !self.signature.is_empty() || !self.hmac_tag.is_empty()
+        } else {
+            // Verifying-key-based verification: ML-DSA signature only.
+            // HMAC verification skipped because the HMAC key is not available
+            // (it is derived from the seed which the verifier should not have).
+            if self.signature.is_empty() { return false; }
+            let vk_enc = match EncodedVerifyingKey::<MlDsa87>::try_from(verifying_key) { Ok(v) => v, Err(_) => return false };
+            let vk = VerifyingKey::<MlDsa87>::decode(&vk_enc);
             let sig = match ml_dsa::Signature::<MlDsa87>::try_from(self.signature.as_slice()) { Ok(s) => s, Err(_) => return false };
-            if vk.verify(&canonical, &sig).is_err() { return false; }
+            vk.verify(&canonical, &sig).is_ok()
         }
-        if !self.hmac_tag.is_empty() {
-            let mut mac = match HmacSha512::new_from_slice(verifying_key) { Ok(m) => m, Err(_) => return false };
-            mac.update(&canonical);
-            if mac.verify_slice(&self.hmac_tag).is_err() { return false; }
-        }
-        !self.signature.is_empty() || !self.hmac_tag.is_empty()
     }
 }
 
@@ -320,6 +385,9 @@ pub struct RotationProposal {
 }
 
 impl RotationProposal {
+    /// Create a new rotation proposal signed with ML-DSA-87 for non-repudiation.
+    ///
+    /// `signing_key`: 32-byte seed. The derived ML-DSA-87 signing key is used.
     pub fn new(
         key_type: KeyType,
         reason: String,
@@ -352,19 +420,39 @@ impl RotationProposal {
 
     fn sign(&mut self, key: &[u8]) {
         let canonical = self.canonical_bytes();
-        let mut mac = HmacSha512::new_from_slice(key).expect("HMAC key");
-        mac.update(&canonical);
-        self.signature = mac.finalize().into_bytes().to_vec();
+        if key.len() == 32 {
+            // ML-DSA-87 signature for non-repudiation
+            let (derived_sign_seed, _) = derive_rotation_keys(key);
+            let kp = MlDsa87::from_seed(&derived_sign_seed.into());
+            let sig: ml_dsa::Signature<MlDsa87> = kp.signing_key().sign(&canonical);
+            self.signature = sig.encode().to_vec();
+        } else {
+            // Fallback: HMAC for non-32-byte keys (backwards compat)
+            let mut mac = HmacSha512::new_from_slice(key).expect("HMAC key");
+            mac.update(&canonical);
+            self.signature = mac.finalize().into_bytes().to_vec();
+        }
     }
 
+    /// Verify proposal signature.
+    ///
+    /// Accepts either a 32-byte seed (derives verifying key) or the raw
+    /// ML-DSA-87 verifying key bytes.
     pub fn verify(&self, key: &[u8]) -> bool {
         let canonical = self.canonical_bytes();
-        let mut mac = match HmacSha512::new_from_slice(key) {
-            Ok(m) => m,
-            Err(_) => return false,
-        };
-        mac.update(&canonical);
-        mac.verify_slice(&self.signature).is_ok()
+        if key.len() == 32 {
+            let (derived_sign_seed, _) = derive_rotation_keys(key);
+            let kp = MlDsa87::from_seed(&derived_sign_seed.into());
+            let vk = kp.verifying_key();
+            let sig = match ml_dsa::Signature::<MlDsa87>::try_from(self.signature.as_slice()) { Ok(s) => s, Err(_) => return false };
+            vk.verify(&canonical, &sig).is_ok()
+        } else {
+            // Try as ML-DSA verifying key
+            let vk_enc = match EncodedVerifyingKey::<MlDsa87>::try_from(key) { Ok(v) => v, Err(_) => return false };
+            let vk = VerifyingKey::<MlDsa87>::decode(&vk_enc);
+            let sig = match ml_dsa::Signature::<MlDsa87>::try_from(self.signature.as_slice()) { Ok(s) => s, Err(_) => return false };
+            vk.verify(&canonical, &sig).is_ok()
+        }
     }
 }
 
@@ -378,6 +466,10 @@ pub struct RotationVote {
 }
 
 impl RotationVote {
+    /// Create a new vote signed with ML-DSA-87 for non-repudiation.
+    ///
+    /// Each node signs with its own key, providing non-repudiation:
+    /// a node cannot deny having voted for a rotation.
     pub fn new(
         voter_id: RotationNodeId,
         proposal: &RotationProposal,
@@ -390,9 +482,16 @@ impl RotationVote {
             signature: Vec::new(),
         };
         let canonical = v.canonical_bytes();
-        let mut mac = HmacSha512::new_from_slice(signing_key).expect("HMAC key");
-        mac.update(&canonical);
-        v.signature = mac.finalize().into_bytes().to_vec();
+        if signing_key.len() == 32 {
+            let (derived_sign_seed, _) = derive_rotation_keys(signing_key);
+            let kp = MlDsa87::from_seed(&derived_sign_seed.into());
+            let sig: ml_dsa::Signature<MlDsa87> = kp.signing_key().sign(&canonical);
+            v.signature = sig.encode().to_vec();
+        } else {
+            let mut mac = HmacSha512::new_from_slice(signing_key).expect("HMAC key");
+            mac.update(&canonical);
+            v.signature = mac.finalize().into_bytes().to_vec();
+        }
         v
     }
 
@@ -404,14 +503,23 @@ impl RotationVote {
         buf
     }
 
+    /// Verify vote signature.
+    ///
+    /// Accepts either a 32-byte seed or ML-DSA-87 verifying key bytes.
     pub fn verify(&self, key: &[u8]) -> bool {
         let canonical = self.canonical_bytes();
-        let mut mac = match HmacSha512::new_from_slice(key) {
-            Ok(m) => m,
-            Err(_) => return false,
-        };
-        mac.update(&canonical);
-        mac.verify_slice(&self.signature).is_ok()
+        if key.len() == 32 {
+            let (derived_sign_seed, _) = derive_rotation_keys(key);
+            let kp = MlDsa87::from_seed(&derived_sign_seed.into());
+            let vk = kp.verifying_key();
+            let sig = match ml_dsa::Signature::<MlDsa87>::try_from(self.signature.as_slice()) { Ok(s) => s, Err(_) => return false };
+            vk.verify(&canonical, &sig).is_ok()
+        } else {
+            let vk_enc = match EncodedVerifyingKey::<MlDsa87>::try_from(key) { Ok(v) => v, Err(_) => return false };
+            let vk = VerifyingKey::<MlDsa87>::decode(&vk_enc);
+            let sig = match ml_dsa::Signature::<MlDsa87>::try_from(self.signature.as_slice()) { Ok(s) => s, Err(_) => return false };
+            vk.verify(&canonical, &sig).is_ok()
+        }
     }
 }
 
@@ -956,7 +1064,12 @@ mod tests {
     // ── Distributed rotation tests ──────────────────────────────────────────
 
     fn test_key() -> Vec<u8> {
+        // 32 bytes to trigger ML-DSA signing path
         b"test-signing-key-32-bytes-long!!".to_vec()
+    }
+
+    fn test_key_32() -> [u8; 32] {
+        *b"test-signing-key-32-bytes-long!!"
     }
 
     fn test_node(name: &str) -> RotationNodeId {
@@ -1405,5 +1518,76 @@ mod tests {
         let approved = RotationApproved::from_votes(KeyType::Hmac, 42, &votes, &key);
         assert!(approved.verify(&key));
         assert!(!approved.verify(b"wrong-aggregate-key-32-bytes!!!!"));
+    }
+
+    // -- HI-7: Separate signing and HMAC keys --
+
+    #[test]
+    fn rotation_event_uses_separate_derived_keys() {
+        let seed = test_key_32();
+        let (sign_seed, hmac_key) = derive_rotation_keys(&seed);
+        // Derived keys must differ from each other and from seed
+        assert_ne!(sign_seed, seed);
+        assert_ne!(&hmac_key[..32], &seed[..]);
+        assert_ne!(&sign_seed[..], &hmac_key[..32]);
+    }
+
+    #[test]
+    fn rotation_event_derived_keys_deterministic() {
+        let seed = test_key_32();
+        let (sign1, hmac1) = derive_rotation_keys(&seed);
+        let (sign2, hmac2) = derive_rotation_keys(&seed);
+        assert_eq!(sign1, sign2);
+        assert_eq!(hmac1, hmac2);
+    }
+
+    // -- HI-8: Verify with verifying key (not seed) --
+
+    #[test]
+    fn rotation_event_verify_with_verifying_key() {
+        let seed = test_key();
+        let evt = RotationEvent::new(test_node("n1"), KeyType::Session, 1, b"key-material", &seed);
+        // Extract verifying key
+        let vk_bytes = RotationEvent::verifying_key_from_seed(&seed);
+        // Verify with verifying key only (no seed needed)
+        assert!(evt.verify_signature(&vk_bytes));
+        // Wrong verifying key must fail
+        let wrong_seed = b"different-seed-32-bytes-long!!!!";
+        let wrong_vk = RotationEvent::verifying_key_from_seed(wrong_seed);
+        assert!(!evt.verify_signature(&wrong_vk));
+    }
+
+    // -- MD-27: Non-repudiation via ML-DSA signatures --
+
+    #[test]
+    fn proposal_uses_ml_dsa_signature() {
+        let key = test_key();
+        let proposal = RotationProposal::new(
+            KeyType::Session, "scheduled".into(), test_node("proposer"), &key,
+        );
+        // ML-DSA signatures are much larger than HMAC-SHA512 (64 bytes)
+        assert!(proposal.signature.len() > 64, "proposal signature should be ML-DSA, not HMAC");
+        assert!(proposal.verify(&key));
+    }
+
+    #[test]
+    fn vote_uses_ml_dsa_signature() {
+        let key = test_key();
+        let proposal = RotationProposal::new(
+            KeyType::Session, "test".into(), test_node("p"), &key,
+        );
+        let vote = RotationVote::new(test_node("v1"), &proposal, &key);
+        assert!(vote.signature.len() > 64, "vote signature should be ML-DSA, not HMAC");
+        assert!(vote.verify(&key));
+    }
+
+    #[test]
+    fn proposal_cross_key_verification_fails() {
+        let key1 = test_key();
+        let key2 = b"another-key-32-bytes-different!!".to_vec();
+        let proposal = RotationProposal::new(
+            KeyType::Hmac, "test".into(), test_node("p"), &key1,
+        );
+        assert!(!proposal.verify(&key2));
     }
 }
