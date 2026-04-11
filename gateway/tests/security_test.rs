@@ -304,6 +304,7 @@ async fn rate_limit_per_ip_enforced() {
     };
     let mut limiter = DistributedRateLimiter::new(config).await;
     limiter.degraded_limit_divisor = 1;
+    limiter.redis_required = false;
 
     let ip: std::net::IpAddr = "192.168.100.1".parse().unwrap();
 
@@ -333,6 +334,7 @@ async fn rate_limit_per_user_enforced() {
     };
     let mut limiter = DistributedRateLimiter::new(config).await;
     limiter.degraded_limit_divisor = 1;
+    limiter.redis_required = false;
 
     limiter.check_user("attacker").await;
     limiter.check_user("attacker").await;

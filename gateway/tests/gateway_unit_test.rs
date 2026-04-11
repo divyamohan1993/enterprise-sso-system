@@ -324,6 +324,7 @@ async fn test_rate_limit_under_threshold() {
     };
     let mut limiter = DistributedRateLimiter::new(config).await;
     limiter.degraded_limit_divisor = 1;
+    limiter.redis_required = false;
 
     let ip: std::net::IpAddr = "192.168.1.1".parse().unwrap();
 
@@ -345,6 +346,7 @@ async fn test_rate_limit_over_threshold() {
     };
     let mut limiter = DistributedRateLimiter::new(config).await;
     limiter.degraded_limit_divisor = 1;
+    limiter.redis_required = false;
 
     let ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
 
@@ -372,6 +374,7 @@ async fn test_rate_limit_different_ips_independent() {
     };
     let mut limiter = DistributedRateLimiter::new(config).await;
     limiter.degraded_limit_divisor = 1;
+    limiter.redis_required = false;
 
     let ip1: std::net::IpAddr = "10.0.0.1".parse().unwrap();
     let ip2: std::net::IpAddr = "10.0.0.2".parse().unwrap();
@@ -399,6 +402,7 @@ async fn test_rate_limit_user_check() {
     };
     let mut limiter = DistributedRateLimiter::new(config).await;
     limiter.degraded_limit_divisor = 1;
+    limiter.redis_required = false;
 
     // Use up user limit
     limiter.check_user("user123").await;
@@ -419,6 +423,7 @@ async fn test_rate_limit_result_fields() {
     };
     let mut limiter = DistributedRateLimiter::new(config).await;
     limiter.degraded_limit_divisor = 1;
+    limiter.redis_required = false;
 
     let ip: std::net::IpAddr = "172.16.0.1".parse().unwrap();
 
@@ -459,6 +464,7 @@ async fn test_rate_limit_exact_boundary_allows_limit_minus_one() {
     };
     let mut limiter = DistributedRateLimiter::new(config).await;
     limiter.degraded_limit_divisor = 1;
+    limiter.redis_required = false;
 
     let ip: std::net::IpAddr = "10.99.0.1".parse().unwrap();
 
@@ -500,6 +506,7 @@ async fn test_rate_limit_per_ip_limit_of_one() {
     };
     let mut limiter = DistributedRateLimiter::new(config).await;
     limiter.degraded_limit_divisor = 1;
+    limiter.redis_required = false;
 
     let ip: std::net::IpAddr = "10.99.0.2".parse().unwrap();
 

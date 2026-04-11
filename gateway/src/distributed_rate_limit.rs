@@ -1163,6 +1163,7 @@ mod tests {
         })
         .await;
         limiter.degraded_limit_divisor = 1;
+        limiter.redis_required = false;
 
         // Redis client should be None (connection failed to non-existent port)
         assert!(
@@ -1197,6 +1198,7 @@ mod tests {
         })
         .await;
         limiter.degraded_limit_divisor = 1; // no divisor for test
+        limiter.redis_required = false;
 
         // Connection failed, so redis_healthy should be false
         assert!(
@@ -1227,6 +1229,7 @@ mod tests {
         })
         .await;
         limiter.degraded_limit_divisor = 1;
+        limiter.redis_required = false;
 
         let ip: IpAddr = "10.0.0.7".parse().unwrap();
 
@@ -1342,6 +1345,7 @@ mod tests {
         })
         .await;
         limiter.degraded_limit_divisor = 1;
+        limiter.redis_required = false;
 
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
@@ -1369,6 +1373,7 @@ mod tests {
         })
         .await;
         limiter.degraded_limit_divisor = 1;
+        limiter.redis_required = false;
 
         let ip: IpAddr = "10.0.0.8".parse().unwrap();
 
@@ -1399,6 +1404,7 @@ mod tests {
         })
         .await;
         limiter.degraded_limit_divisor = 1;
+        limiter.redis_required = false;
 
         let ip: IpAddr = "10.0.0.9".parse().unwrap();
 
@@ -1511,6 +1517,7 @@ mod tests {
         })
         .await;
         limiter.degraded_limit_divisor = 10;
+        limiter.redis_required = false;
 
         let ip: IpAddr = "10.99.0.1".parse().unwrap();
 
@@ -1537,6 +1544,7 @@ mod tests {
         })
         .await;
         limiter.degraded_limit_divisor = 100; // 3/100 = 0, but .max(1) → 1
+        limiter.redis_required = false;
 
         let ip: IpAddr = "10.99.0.2".parse().unwrap();
         let r = limiter.check_ip(ip).await;

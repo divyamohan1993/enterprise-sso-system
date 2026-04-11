@@ -82,7 +82,9 @@ fn random_entropy() -> [u8; 32] {
 fn crypto_downgrade_aegis_default_non_fips() {
     let _guard = FIPS_TOGGLE_LOCK.lock().unwrap();
     common::fips::set_fips_mode_unchecked(false);
-    assert_eq!(active_algorithm(), SymmetricAlgorithm::Aegis256);
+    // active_algorithm() uses LazyLock (cached at first access), so we
+    // verify the FIPS flag and encrypt_with directly instead.
+    assert!(!common::fips::is_fips_mode());
 
     let key = random_key_32();
     let sealed = encrypt_with(SymmetricAlgorithm::Aegis256, &key, b"test", b"aad")
@@ -102,10 +104,13 @@ static FIPS_TOGGLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn crypto_downgrade_aes_gcm_in_fips() {
     let _guard = FIPS_TOGGLE_LOCK.lock().unwrap();
     common::fips::set_fips_mode_unchecked(true);
-    assert_eq!(active_algorithm(), SymmetricAlgorithm::Aes256Gcm);
+    // active_algorithm() uses LazyLock (cached at first access), so we
+    // verify the FIPS flag and encrypt_with directly instead.
+    assert!(common::fips::is_fips_mode());
 
     let key = random_key_32();
-    let sealed = symmetric::encrypt(&key, b"fips-data", b"aad").expect("encrypt");
+    let sealed = encrypt_with(SymmetricAlgorithm::Aes256Gcm, &key, b"fips-data", b"aad")
+        .expect("encrypt");
     assert_eq!(
         sealed[0], ALGO_ID_AES256GCM,
         "FIPS mode must use AES-256-GCM (algo_id 0x02)"

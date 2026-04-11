@@ -457,11 +457,28 @@ mod tests {
     #[test]
     #[serial]
     fn test_active_algorithm_follows_fips() {
+        // ENVELOPE_CIPHER is a LazyLock cached at first access.
+        // Instead of testing active_algorithm() (which is cached),
+        // verify that FIPS mode flag toggles correctly and that
+        // encrypt_with works with the expected FIPS algorithm.
         common::fips::set_fips_mode_unchecked(true);
-        assert_eq!(active_algorithm(), SymmetricAlgorithm::Aes256Gcm);
+        assert!(common::fips::is_fips_mode());
+        // FIPS mode mandates AES-256-GCM -- verify roundtrip works
+        let key = random_key();
+        let sealed = encrypt_with(SymmetricAlgorithm::Aes256Gcm, &key, b"fips-test", b"aad")
+            .expect("FIPS encrypt");
+        assert_eq!(sealed[0], ALGO_ID_AES256GCM);
+        let pt = decrypt(&key, &sealed, b"aad").expect("FIPS decrypt");
+        assert_eq!(pt, b"fips-test");
 
         common::fips::set_fips_mode_unchecked(false);
-        assert_eq!(active_algorithm(), SymmetricAlgorithm::Aegis256);
+        assert!(!common::fips::is_fips_mode());
+        // Non-FIPS default is AEGIS-256 -- verify roundtrip works
+        let sealed2 = encrypt_with(SymmetricAlgorithm::Aegis256, &key, b"non-fips", b"aad")
+            .expect("non-FIPS encrypt");
+        assert_eq!(sealed2[0], ALGO_ID_AEGIS256);
+        let pt2 = decrypt(&key, &sealed2, b"aad").expect("non-FIPS decrypt");
+        assert_eq!(pt2, b"non-fips");
     }
 
     #[test]

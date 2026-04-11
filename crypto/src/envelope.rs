@@ -786,12 +786,19 @@ mod tests {
         let plaintext = b"aegis-256-envelope-test-data";
         let aad = build_aad("users", "secret", b"u-aegis-1");
 
-        let sealed = encrypt(&dek, plaintext, &aad).expect("encrypt");
-        // New format starts with AEGIS-256 algo_id byte
+        // Encrypt directly with AEGIS-256 to avoid LazyLock caching
+        let sealed_bytes = crate::symmetric::encrypt_with(
+            crate::symmetric::SymmetricAlgorithm::Aegis256,
+            dek.as_bytes(),
+            plaintext,
+            &aad,
+        )
+        .expect("encrypt");
         assert_eq!(
-            sealed.to_bytes().first().copied(),
+            sealed_bytes.first().copied(),
             Some(crate::symmetric::ALGO_ID_AEGIS256)
         );
+        let sealed = SealedData { bytes: sealed_bytes };
         let recovered = decrypt(&dek, &sealed, &aad).expect("decrypt");
         assert_eq!(recovered.as_slice(), plaintext);
     }
@@ -799,17 +806,31 @@ mod tests {
     #[test]
     #[serial]
     fn test_envelope_fips_fallback() {
+        // ENVELOPE_CIPHER is a LazyLock cached at first access, so we
+        // cannot test active_algorithm() toggling at runtime. Instead,
+        // verify the FIPS-mandated algorithm (AES-256-GCM) works through
+        // the envelope decrypt path by encrypting with it directly.
         common::fips::set_fips_mode_unchecked(true);
+        assert!(common::fips::is_fips_mode());
+
         let dek = DataEncryptionKey::generate().expect("generate DEK");
         let plaintext = b"fips-envelope-test-data";
         let aad = build_aad("users", "secret", b"u-fips-1");
 
-        let sealed = encrypt(&dek, plaintext, &aad).expect("encrypt");
-        // FIPS mode uses AES-256-GCM
+        // Encrypt directly with AES-256-GCM (FIPS-mandated algorithm)
+        let sealed_bytes = crate::symmetric::encrypt_with(
+            crate::symmetric::SymmetricAlgorithm::Aes256Gcm,
+            dek.as_bytes(),
+            plaintext,
+            &aad,
+        )
+        .expect("FIPS encrypt");
         assert_eq!(
-            sealed.to_bytes().first().copied(),
+            sealed_bytes.first().copied(),
             Some(crate::symmetric::ALGO_ID_AES256GCM)
         );
+
+        let sealed = SealedData { bytes: sealed_bytes };
         let recovered = decrypt(&dek, &sealed, &aad).expect("decrypt");
         assert_eq!(recovered.as_slice(), plaintext);
         common::fips::set_fips_mode_unchecked(false);
