@@ -999,7 +999,7 @@ fn xwing_shared_secret_nonzero_and_good_entropy() {
         let bytes = ss.as_bytes();
         // Must not be all zeros
         assert_ne!(
-            bytes, &[0u8; 32],
+            bytes, &[0u8; 64],
             "shared secret must not be all zeros"
         );
 
