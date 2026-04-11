@@ -296,6 +296,7 @@ fn decrypt_aes256gcm_payload(key: &[u8; 32], payload: &[u8], aad: &[u8]) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     fn random_key() -> [u8; 32] {
         let mut k = [0u8; 32];
@@ -454,6 +455,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_active_algorithm_follows_fips() {
         common::fips::set_fips_mode_unchecked(true);
         assert_eq!(active_algorithm(), SymmetricAlgorithm::Aes256Gcm);

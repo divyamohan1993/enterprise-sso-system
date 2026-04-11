@@ -28,6 +28,7 @@ use kt::merkle::*;
 use ratchet::chain::*;
 use uuid::Uuid;
 use std::collections::HashSet;
+use serial_test::serial;
 
 // ---------------------------------------------------------------------------
 // Helper: run closure on a thread with 8 MB stack (ML-DSA / FROST need it)
@@ -77,6 +78,7 @@ fn random_entropy() -> [u8; 32] {
 /// Test algo_id prefix tags differentiate ciphers.
 /// Verify legacy format (no tag) is rejected.
 #[test]
+#[serial]
 fn crypto_downgrade_aegis_default_non_fips() {
     let _guard = FIPS_TOGGLE_LOCK.lock().unwrap();
     common::fips::set_fips_mode_unchecked(false);
@@ -96,6 +98,7 @@ fn crypto_downgrade_aegis_default_non_fips() {
 static FIPS_TOGGLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
+#[serial]
 fn crypto_downgrade_aes_gcm_in_fips() {
     let _guard = FIPS_TOGGLE_LOCK.lock().unwrap();
     common::fips::set_fips_mode_unchecked(true);

@@ -571,6 +571,7 @@ pub fn unwrap_key_with_keyring(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     /// Helper: generate a DEK and encrypt/decrypt round-trip.
     #[test]
@@ -778,6 +779,7 @@ mod tests {
     // -- AEGIS-256 / FIPS / legacy compat -----------------------------------
 
     #[test]
+    #[serial]
     fn test_envelope_aegis256_roundtrip() {
         common::fips::set_fips_mode_unchecked(false);
         let dek = DataEncryptionKey::generate().expect("generate DEK");
@@ -795,6 +797,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_envelope_fips_fallback() {
         common::fips::set_fips_mode_unchecked(true);
         let dek = DataEncryptionKey::generate().expect("generate DEK");

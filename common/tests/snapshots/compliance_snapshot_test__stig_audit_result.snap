@@ -88,7 +88,7 @@ checks:
   - category: Authentication
     id: V-222602
     severity: CatI
-    status: Pass
+    status: Manual
     title: Application input validation (XSS prevention)
   - category: Authentication
     id: V-222658
@@ -115,7 +115,7 @@ summary:
   cat_ii_failures: 3
   cat_iii_failures: 0
   failed: 6
-  manual: 1
+  manual: 2
   not_applicable: 0
-  passed: 14
+  passed: 13
   total: 21

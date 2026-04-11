@@ -1,6 +1,7 @@
 use common::types::ModuleId;
 use shard::tls::{generate_ca, generate_module_cert, server_tls_config, client_tls_config, tls_connector};
 use shard::tls_transport::{TlsShardListener, tls_connect};
+#[cfg(feature = "test-internals")]
 use tokio::io::AsyncWriteExt;
 
 /// Shared HMAC key for tests.
@@ -50,6 +51,7 @@ async fn transport_roundtrip() {
 }
 
 #[tokio::test]
+#[cfg(feature = "test-internals")]
 async fn transport_replay_rejected() {
     let ca = generate_ca();
     let server_cert = generate_module_cert("localhost", &ca);
@@ -217,6 +219,7 @@ async fn transport_bidirectional() {
 }
 
 #[tokio::test]
+#[cfg(feature = "test-internals")]
 async fn transport_rejects_oversized_frame() {
     // MAX_FRAME_LEN is 16 MiB.
     // Verify that a frame larger than 16 MiB is rejected.

@@ -178,7 +178,10 @@ fn snapshot_fedramp_evidence_structure() {
 
 // ── Hardened security tests: FIPS, classification, cross-domain, duress ──
 
+use serial_test::serial;
+
 #[test]
+#[serial]
 fn test_fips_mode_default_is_off() {
     // SECURITY AUDIT: FIPS mode is OFF by default — must be explicitly enabled for DoD
     assert!(
@@ -188,6 +191,7 @@ fn test_fips_mode_default_is_off() {
 }
 
 #[test]
+#[serial]
 fn test_fips_unchecked_setter_toggles_mode() {
     // SECURITY: set_fips_mode_unchecked is pub but refuses disable in military mode (non-test builds)
     common::fips::set_fips_mode_unchecked(true);

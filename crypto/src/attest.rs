@@ -563,6 +563,7 @@ impl RuntimeAttestor {
 mod tests {
     use super::*;
     use std::io::Write;
+    use serial_test::serial;
 
     /// Generate a pseudo-random hex string for unique temp file names.
     fn random_hex() -> String {
@@ -590,6 +591,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_hash_file() {
         // Ensure non-FIPS for this test so BLAKE3 is used.
         common::fips::set_fips_mode_unchecked(false);
@@ -804,6 +806,7 @@ mod tests {
     // -- FIPS-aware hashing -------------------------------------------------
 
     #[test]
+    #[serial]
     fn test_attestation_fips_sha512() {
         // Set FIPS mode, perform all operations, restore — all in one block.
         // Tests run in parallel so we use the same defensive pattern as

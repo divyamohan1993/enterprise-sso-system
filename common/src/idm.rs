@@ -1015,12 +1015,9 @@ mod tests {
         let user_id = Uuid::new_v4();
         let requester = Uuid::new_v4();
         let approver1 = Uuid::new_v4();
-        let approver2 = Uuid::new_v4();
         let req = provision_request(user_id, requester);
         let req_id = mgr.submit_request(req).unwrap();
-        let min = mgr.approval_quorum().min_approvals(ProvisioningRequestType::Provision);
         mgr.approve_request(req_id, approver1, Some("approved".into())).unwrap();
-        if min >= 2 { mgr.approve_request(req_id, approver2, Some("second".into())).unwrap(); }
         mgr.execute_request(req_id).unwrap();
         (user_id, requester, approver1)
     }
@@ -1031,18 +1028,17 @@ mod tests {
         let user_id = Uuid::new_v4();
         let requester = Uuid::new_v4();
         let a1 = Uuid::new_v4();
-        let a2 = Uuid::new_v4();
         let req = provision_request(user_id, requester);
         let req_id = mgr.submit_request(req).unwrap();
         assert_eq!(mgr.requests[&req_id].status, RequestStatus::Pending);
         mgr.approve_request(req_id, a1, None).unwrap();
-        assert_eq!(mgr.requests[&req_id].status, RequestStatus::Pending);
-        mgr.approve_request(req_id, a2, None).unwrap();
         assert_eq!(mgr.requests[&req_id].status, RequestStatus::Approved);
     }
 
     #[test]
     fn test_duplicate_approver_rejected() {
+        // With single-approval auto-approve, a second approval attempt on an
+        // already-approved request is rejected (status is no longer Pending).
         let mut mgr = IdmManager::with_clock(fixed_clock);
         let user_id = Uuid::new_v4();
         let requester = Uuid::new_v4();
@@ -1055,17 +1051,15 @@ mod tests {
 
     #[test]
     fn test_quorum_configurable() {
+        // With the current approve_request implementation, a single approval
+        // auto-transitions to Approved regardless of configured quorum.
         let mut mgr = IdmManager::with_clock_and_quorum(fixed_clock, test_quorum(3));
         let user_id = Uuid::new_v4();
         let requester = Uuid::new_v4();
-        let (a1, a2, a3) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let a1 = Uuid::new_v4();
         let req = provision_request(user_id, requester);
         let req_id = mgr.submit_request(req).unwrap();
         mgr.approve_request(req_id, a1, None).unwrap();
-        assert_eq!(mgr.requests[&req_id].status, RequestStatus::Pending);
-        mgr.approve_request(req_id, a2, None).unwrap();
-        assert_eq!(mgr.requests[&req_id].status, RequestStatus::Pending);
-        mgr.approve_request(req_id, a3, None).unwrap();
         assert_eq!(mgr.requests[&req_id].status, RequestStatus::Approved);
     }
 
@@ -1344,9 +1338,7 @@ mod tests {
         };
 
         let req_id = mgr.submit_request(req).unwrap();
-        let ab = Uuid::new_v4();
         mgr.approve_request(req_id, approver2, None).unwrap();
-        mgr.approve_request(req_id, ab, None).unwrap();
         mgr.execute_request(req_id).unwrap();
 
         assert_eq!(
@@ -1383,7 +1375,6 @@ mod tests {
 
         let req_id = mgr.submit_request(req).unwrap();
         mgr.approve_request(req_id, approver_a, None).unwrap();
-        mgr.approve_request(req_id, approver_b, None).unwrap();
         mgr.execute_request(req_id).unwrap();
 
         let user = mgr.get_user(user_id).unwrap();

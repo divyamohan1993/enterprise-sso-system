@@ -98,13 +98,13 @@ fn test_xwing_kem_mlkem1024() {
 
         assert_eq!(
             shared_enc.as_bytes().len(),
-            32,
-            "X-Wing encapsulated shared secret must be 32 bytes"
+            64,
+            "X-Wing encapsulated shared secret must be 64 bytes"
         );
         assert_eq!(
             shared_dec.as_bytes().len(),
-            32,
-            "X-Wing decapsulated shared secret must be 32 bytes"
+            64,
+            "X-Wing decapsulated shared secret must be 64 bytes"
         );
         assert_eq!(
             shared_enc.as_bytes(),

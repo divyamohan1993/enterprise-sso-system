@@ -31,8 +31,78 @@ gaps:
     id: RA.L2-3.11.1
     status: PartiallyMet
     title: "Periodically assess the risk to organizational operations, assets, and individuals"
+  - family: Media Protection
+    gap: Media protection controls not yet assessed for this software system.
+    id: MP.L2-3.8.1
+    status: NotAssessed
+    title: Protect system media containing CUI
+  - family: Media Protection
+    gap: Media access controls not yet assessed.
+    id: MP.L2-3.8.2
+    status: NotAssessed
+    title: Limit access to CUI on system media to authorized users
+  - family: Media Protection
+    gap: Media sanitization procedures not yet assessed.
+    id: MP.L2-3.8.3
+    status: NotAssessed
+    title: Sanitize or destroy system media before disposal or release
+  - family: Physical and Environmental Protection
+    gap: "Physical access controls are environmental; not assessed at application layer."
+    id: PE.L2-3.10.1
+    status: NotAssessed
+    title: Limit physical access to organizational systems
+  - family: Physical and Environmental Protection
+    gap: "Physical facility monitoring is environmental; not assessed at application layer."
+    id: PE.L2-3.10.2
+    status: NotAssessed
+    title: Protect and monitor the physical facility
+  - family: Personnel Security
+    gap: "Personnel screening is an organizational process; not assessed at application layer."
+    id: PS.L2-3.9.1
+    status: NotAssessed
+    title: Screen individuals prior to authorizing access to organizational systems
+  - family: Personnel Security
+    gap: Personnel action procedures not yet assessed.
+    id: PS.L2-3.9.2
+    status: NotAssessed
+    title: Ensure CUI is protected during and after personnel actions
+  - family: Maintenance
+    gap: System maintenance procedures not yet assessed.
+    id: MA.L2-3.7.1
+    status: NotAssessed
+    title: Perform maintenance on organizational systems
+  - family: Maintenance
+    gap: Maintenance tool controls not yet assessed.
+    id: MA.L2-3.7.2
+    status: NotAssessed
+    title: Provide controls on maintenance tools and media
+  - family: Contingency Planning
+    gap: Contingency plan not yet assessed for this system.
+    id: CP.L2-3.6.1
+    status: NotAssessed
+    title: Establish and maintain a contingency plan
+  - family: Contingency Planning
+    gap: Continuity planning not yet assessed.
+    id: CP.L2-3.6.2
+    status: NotAssessed
+    title: Plan for continuity of operations
+  - family: Awareness and Training
+    gap: "Security awareness training is organizational; not assessed at application layer."
+    id: AT.L2-3.2.1
+    status: NotAssessed
+    title: Ensure personnel are trained on security awareness
+  - family: Awareness and Training
+    gap: "Insider threat training is organizational; not assessed at application layer."
+    id: AT.L2-3.2.2
+    status: NotAssessed
+    title: Ensure personnel are trained on insider threat awareness
+  - family: Planning
+    gap: Full system security plan document requires additional organizational content.
+    id: PL.L2-3.12.1
+    status: PartiallyMet
+    title: Develop and maintain a system security plan
 score:
   met: 19
-  not_met: 0
-  partially_met: 5
-total_practices: 24
+  not_met: 13
+  partially_met: 6
+total_practices: 38

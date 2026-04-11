@@ -347,6 +347,7 @@ impl RuntimeDefenseHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     // -----------------------------------------------------------------------
     // runtime_defense_sweep tests
@@ -394,6 +395,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn sweep_checks_ld_preload() {
         // Temporarily set LD_PRELOAD and verify detection
         let original = std::env::var("LD_PRELOAD").ok();
@@ -419,6 +421,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn sweep_no_ld_preload_no_alert() {
         let original = std::env::var("LD_PRELOAD").ok();
         std::env::remove_var("LD_PRELOAD");

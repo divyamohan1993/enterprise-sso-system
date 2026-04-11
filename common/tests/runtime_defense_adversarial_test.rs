@@ -5,6 +5,7 @@
 //! binary integrity verification, and VmLck verification.
 
 use common::runtime_defense::{runtime_defense_sweep, RuntimeAlert};
+use serial_test::serial;
 
 // ---------------------------------------------------------------------------
 // Helper: run sweep and find alerts by check name
@@ -62,6 +63,7 @@ fn test_binary_integrity_with_matching_hash() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[serial]
 fn test_ld_preload_detected_when_set() {
     // Save and restore LD_PRELOAD around the test.
     let saved = std::env::var("LD_PRELOAD").ok();
@@ -88,6 +90,7 @@ fn test_ld_preload_detected_when_set() {
 }
 
 #[test]
+#[serial]
 fn test_no_ld_preload_alert_when_unset() {
     let saved = std::env::var("LD_PRELOAD").ok();
     std::env::remove_var("LD_PRELOAD");
@@ -106,6 +109,7 @@ fn test_no_ld_preload_alert_when_unset() {
 }
 
 #[test]
+#[serial]
 fn test_empty_ld_preload_not_flagged() {
     let saved = std::env::var("LD_PRELOAD").ok();
     std::env::set_var("LD_PRELOAD", "");
@@ -214,6 +218,7 @@ fn test_debugger_detection_no_false_positive() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[serial]
 fn test_full_sweep_with_correct_hash() {
     let saved = std::env::var("LD_PRELOAD").ok();
     std::env::remove_var("LD_PRELOAD");
@@ -244,6 +249,7 @@ fn test_full_sweep_with_correct_hash() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[serial]
 fn test_sweep_only_binary_integrity_fails() {
     let saved = std::env::var("LD_PRELOAD").ok();
     std::env::remove_var("LD_PRELOAD");
@@ -267,6 +273,7 @@ fn test_sweep_only_binary_integrity_fails() {
 }
 
 #[test]
+#[serial]
 fn test_sweep_only_ld_preload_fails() {
     let saved = std::env::var("LD_PRELOAD").ok();
     std::env::set_var("LD_PRELOAD", "/usr/lib/evil_hook.so");

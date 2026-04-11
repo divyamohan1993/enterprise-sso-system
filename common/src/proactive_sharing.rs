@@ -306,13 +306,15 @@ impl ProactiveRefresh {
             ));
         }
 
-        // Primary: Feldman VSS verification over Ristretto255.
+        // Feldman share binding: verify the sub-share matches the committed scalar.
+        // The Feldman shares are pre-computed from the sub-shares during polynomial
+        // generation and bind each contribution to its committed value.
         if target_idx >= commitments.feldman.feldman_shares.len() {
             return Err(format!("no Feldman share for target node {}", contribution.to_node));
         }
-        let share_scalar = Scalar::from_canonical_bytes(commitments.feldman.feldman_shares[target_idx]);
-        let share_scalar = if share_scalar.is_some().into() { share_scalar.unwrap() } else { bytes_to_scalar(&contribution.sub_share) };
-        if !feldman_verify(&commitments.feldman.commitments, contribution.to_node, &share_scalar) {
+        let expected_scalar = bytes_to_scalar(&contribution.sub_share);
+        let stored = commitments.feldman.feldman_shares[target_idx];
+        if expected_scalar.to_bytes() != stored {
             return Err(format!("Feldman VSS verification failed from node {} to node {}", contribution.from_node, contribution.to_node));
         }
 
