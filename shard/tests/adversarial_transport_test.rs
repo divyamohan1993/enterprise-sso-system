@@ -14,8 +14,8 @@ fn make_protocol_pair() -> (ShardProtocol, ShardProtocol) {
     let key = [0x42u8; 64];
     let sender_id = ModuleId::Gateway;
     let receiver_id = ModuleId::Orchestrator;
-    let sender = ShardProtocol::new(sender_id, &key);
-    let receiver = ShardProtocol::new(receiver_id, &key);
+    let sender = ShardProtocol::new(sender_id, key);
+    let receiver = ShardProtocol::new(receiver_id, key);
     (sender, receiver)
 }
 
@@ -163,7 +163,7 @@ fn test_out_of_order_frames_rejected() {
 
     // Create a new receiver for fresh state.
     let key = [0x42u8; 64];
-    let mut receiver2 = ShardProtocol::new(ModuleId::Orchestrator, &key);
+    let mut receiver2 = ShardProtocol::new(ModuleId::Orchestrator, key);
 
     // Try verifying msg3 before msg1 (out of order).
     // Whether this succeeds depends on the protocol's replay window.
@@ -178,8 +178,8 @@ fn test_out_of_order_frames_rejected() {
 fn test_wrong_key_rejected() {
     let key1 = [0x42u8; 64];
     let key2 = [0x99u8; 64];
-    let mut sender = ShardProtocol::new(ModuleId::Gateway, &key1);
-    let mut receiver = ShardProtocol::new(ModuleId::Orchestrator, &key2);
+    let mut sender = ShardProtocol::new(ModuleId::Gateway, key1);
+    let mut receiver = ShardProtocol::new(ModuleId::Orchestrator, key2);
 
     let payload = b"cross-key test";
     let msg = sender.create_message(payload).unwrap();
@@ -200,18 +200,22 @@ fn test_all_module_ids_can_create_messages() {
     let modules = [
         ModuleId::Gateway,
         ModuleId::Orchestrator,
-        ModuleId::Crypto,
-        ModuleId::Shard,
+        ModuleId::Tss,
+        ModuleId::Verifier,
         ModuleId::Ratchet,
+        ModuleId::Kt,
+        ModuleId::Risk,
+        ModuleId::Audit,
+        ModuleId::Admin,
     ];
 
     for &module in &modules {
-        let mut proto = ShardProtocol::new(module, &key);
+        let mut proto = ShardProtocol::new(module, key);
         let msg = proto.create_message(b"hello").unwrap();
         assert!(!msg.is_empty());
 
         // Any receiver with the same key should verify.
-        let mut receiver = ShardProtocol::new(ModuleId::Gateway, &key);
+        let mut receiver = ShardProtocol::new(ModuleId::Gateway, key);
         let result = receiver.verify_message(&msg);
         assert!(
             result.is_ok(),
@@ -228,8 +232,8 @@ fn test_all_module_ids_can_create_messages() {
 #[test]
 fn test_many_sequential_messages() {
     let key = [0x42u8; 64];
-    let mut sender = ShardProtocol::new(ModuleId::Gateway, &key);
-    let mut receiver = ShardProtocol::new(ModuleId::Orchestrator, &key);
+    let mut sender = ShardProtocol::new(ModuleId::Gateway, key);
+    let mut receiver = ShardProtocol::new(ModuleId::Orchestrator, key);
 
     for i in 0..1000u32 {
         let payload = format!("message-{}", i);
