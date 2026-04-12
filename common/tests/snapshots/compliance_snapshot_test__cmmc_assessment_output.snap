@@ -52,12 +52,12 @@ gaps:
     status: NotAssessed
     title: Limit physical access to organizational systems
   - family: Physical and Environmental Protection
-    gap: "Physical facility monitoring is environmental; not assessed at application layer."
+    gap: Physical facility monitoring is environmental; not assessed at application layer.
     id: PE.L2-3.10.2
     status: NotAssessed
     title: Protect and monitor the physical facility
   - family: Personnel Security
-    gap: "Personnel screening is an organizational process; not assessed at application layer."
+    gap: Personnel screening is an organizational process; not assessed at application layer.
     id: PS.L2-3.9.1
     status: NotAssessed
     title: Screen individuals prior to authorizing access to organizational systems
@@ -87,12 +87,12 @@ gaps:
     status: NotAssessed
     title: Plan for continuity of operations
   - family: Awareness and Training
-    gap: "Security awareness training is organizational; not assessed at application layer."
+    gap: Security awareness training is organizational; not assessed at application layer.
     id: AT.L2-3.2.1
     status: NotAssessed
     title: Ensure personnel are trained on security awareness
   - family: Awareness and Training
-    gap: "Insider threat training is organizational; not assessed at application layer."
+    gap: Insider threat training is organizational; not assessed at application layer.
     id: AT.L2-3.2.2
     status: NotAssessed
     title: Ensure personnel are trained on insider threat awareness
