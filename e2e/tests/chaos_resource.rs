@@ -59,6 +59,7 @@ async fn test_rate_limit_enforcement() {
     };
     let mut limiter = DistributedRateLimiter::new(config).await;
     limiter.degraded_limit_divisor = 1;
+    limiter.redis_required = false;
     let ip: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
 
     // Exhaust the per-IP limit.

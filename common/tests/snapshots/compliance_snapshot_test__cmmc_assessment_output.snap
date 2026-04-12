@@ -47,7 +47,7 @@ gaps:
     status: NotAssessed
     title: Sanitize or destroy system media before disposal or release
   - family: Physical and Environmental Protection
-    gap: "Physical access controls are environmental; not assessed at application layer."
+    gap: Physical access controls are environmental; not assessed at application layer.
     id: PE.L2-3.10.1
     status: NotAssessed
     title: Limit physical access to organizational systems
