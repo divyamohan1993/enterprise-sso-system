@@ -429,7 +429,7 @@ impl CredentialStore {
         h.update(env_digest);
         let signed_message = h.finalize();
 
-        if !crypto::pq_sign::pq_verify_raw(admin_pq_verifying_key, &signed_message, admin_signature) {
+        if !crypto::pq_sign::pq_verify_raw_from_bytes(admin_pq_verifying_key, &signed_message, admin_signature) {
             tracing::error!(
                 target: "siem",
                 "SIEM:CRITICAL OPAQUE re-registration: admin ML-DSA-87 signature verification failed"
