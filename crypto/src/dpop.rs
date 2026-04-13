@@ -67,11 +67,36 @@ impl GuardedSigningKey {
 
 impl Drop for GuardedSigningKey {
     fn drop(&mut self) {
-        // munlock signing key region before overwriting.
+        // munlock signing key region before overwriting. We MUST check the
+        // return code: munlock(2) can fail with EINVAL/EAGAIN/EPERM, and a
+        // silent failure leaves the page locked (or never-locked) which can
+        // mask earlier mlock failures. Under MILNET_MILITARY_DEPLOYMENT, abort.
         let ptr = &self.key as *const DpopSigningKey as *const u8;
         let len = std::mem::size_of::<DpopSigningKey>();
         #[allow(unsafe_code)]
-        unsafe { libc::munlock(ptr as *const libc::c_void, len); }
+        let rc = unsafe { libc::munlock(ptr as *const libc::c_void, len) };
+        if rc != 0 {
+            #[allow(unsafe_code)]
+            let errno = unsafe { *libc::__errno_location() };
+            crate::memguard::record_mlock_failure();
+            tracing::error!(
+                errno = errno,
+                len = len,
+                "SIEM:CRITICAL munlock failed for DPoP signing key on drop \
+                 — page may remain locked and re-used"
+            );
+            let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            if is_military {
+                // Aborting from drop is the only fail-closed option:
+                // a half-locked secret in military mode is unacceptable.
+                eprintln!(
+                    "FATAL: munlock failed (errno={errno}) for DPoP signing key in military deployment"
+                );
+                std::process::abort();
+            }
+        }
         // Overwrite with deterministic dummy.
         let zero_seed = [0u8; 32];
         let dummy_kp = MlDsa87::from_seed(&zero_seed.into());

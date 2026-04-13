@@ -34,6 +34,16 @@ pub fn is_mlock_degraded() -> bool {
     MLOCK_DEGRADED.load(Ordering::SeqCst)
 }
 
+/// Mark the process as having experienced an mlock/munlock failure.
+///
+/// This is the public entry point used by other crypto modules (e.g. dpop)
+/// when they detect a lock/unlock failure outside of the SecretBuffer/SecretVec
+/// constructors that already set the flag internally. Once set, the flag is
+/// monotonic for the process lifetime — degradation can never be cleared.
+pub fn record_mlock_failure() {
+    MLOCK_DEGRADED.store(true, Ordering::SeqCst);
+}
+
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------

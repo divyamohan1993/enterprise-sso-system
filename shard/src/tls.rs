@@ -85,6 +85,88 @@ impl CertificatePinSet {
         self.pins.contains(fingerprint)
     }
 
+    /// C12: Atomically rotate the pin set.
+    ///
+    /// The new pinset MUST be signed by **2-of-3 orchestrator ML-DSA-87
+    /// signatures** over the canonical SHA-512 of the new pinset bytes. On
+    /// success, the old pins are explicitly removed and a SIEM event is
+    /// emitted. On failure no rotation occurs.
+    ///
+    /// `new_pins` is the proposed new pinset as a list of SHA-512 fingerprints.
+    /// `signatures` is `[(orchestrator_pubkey, signature)]` — at least 2 of the
+    /// 3 must verify against the canonical hash.
+    pub fn rotate_with_quorum(
+        &mut self,
+        new_pins: &[[u8; 64]],
+        orchestrator_pubkeys: &[Vec<u8>],
+        signatures: &[(usize, Vec<u8>)],
+    ) -> Result<(), String> {
+        if orchestrator_pubkeys.len() != 3 {
+            return Err(format!(
+                "C12: pin rotation requires exactly 3 orchestrator pubkeys, got {}",
+                orchestrator_pubkeys.len()
+            ));
+        }
+
+        // Canonical hash over new pinset bytes (sorted for determinism).
+        let mut sorted: Vec<[u8; 64]> = new_pins.to_vec();
+        sorted.sort();
+        let mut hasher = Sha512::new();
+        hasher.update(b"MILNET-SHARD-PIN-ROTATION-v1");
+        for p in &sorted {
+            hasher.update(p);
+        }
+        let canonical_digest = hasher.finalize();
+
+        // Verify ML-DSA-87 signatures.
+        let mut valid = 0usize;
+        let mut seen_signers = std::collections::HashSet::new();
+        for (signer_idx, sig) in signatures {
+            if !seen_signers.insert(*signer_idx) {
+                continue; // reject duplicate signer
+            }
+            let pk_bytes = match orchestrator_pubkeys.get(*signer_idx) {
+                Some(p) => p,
+                None => continue,
+            };
+            if crypto::pq_sign::pq_verify_raw_from_bytes(
+                pk_bytes,
+                canonical_digest.as_slice(),
+                sig,
+            ) {
+                valid += 1;
+            }
+        }
+
+        if valid < 2 {
+            tracing::error!(
+                target: "siem",
+                severity = "CRITICAL",
+                action = "shard_pin_rotation_quorum_fail",
+                valid_sigs = valid,
+                "C12: pin rotation rejected — only {} of required 2 orchestrator signatures valid",
+                valid
+            );
+            return Err(format!(
+                "pin rotation requires 2-of-3 orchestrator signatures, only {valid} valid"
+            ));
+        }
+
+        // Atomically replace.
+        self.pins.clear();
+        for p in new_pins {
+            self.pins.insert(*p);
+        }
+        tracing::warn!(
+            target: "siem",
+            severity = "HIGH",
+            action = "shard_pin_rotation_applied",
+            new_pin_count = self.pins.len(),
+            "C12: SHARD pin set rotated under 2-of-3 orchestrator quorum"
+        );
+        Ok(())
+    }
+
     /// Verify a DER-encoded certificate against the pin set.
     /// Returns `Ok(())` if pinned, or `Err` with a CRITICAL log if not.
     pub fn verify_pin(&self, cert_der: &[u8]) -> Result<(), Error> {

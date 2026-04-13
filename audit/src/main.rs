@@ -510,36 +510,67 @@ fn unseal_seed(sealed: &[u8]) -> Result<[u8; 32], String> {
     Ok(seed)
 }
 
-/// Write a sealed (encrypted) seed to disk with restrictive permissions.
+/// Write a sealed (encrypted) seed to disk atomically with 3-generation rotation.
+///
+/// SECURITY (D15): Writes go to `<path>.tmp`, are fsynced, then atomically
+/// renamed over the destination. Before the rename, the existing `<path>`
+/// is rotated through `<path>.gen-1` and `<path>.gen-2` so that two prior
+/// generations are kept on disk for disaster recovery. The parent directory
+/// is fsynced after the rename so the directory entry is durable.
 fn persist_seed(path: &Path, seed: &[u8; 32]) {
     use std::io::Write;
     let sealed = seal_seed(seed);
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)
-    {
+
+    // Rotate generations: gen-1 -> gen-2, current -> gen-1
+    let gen1 = path.with_extension("gen-1");
+    let gen2 = path.with_extension("gen-2");
+    if gen1.exists() {
+        if let Err(e) = std::fs::rename(&gen1, &gen2) {
+            tracing::warn!("seed gen-1 -> gen-2 rotate failed for {:?}: {}", path, e);
+        }
+    }
+    if path.exists() {
+        if let Err(e) = std::fs::rename(path, &gen1) {
+            tracing::warn!("seed current -> gen-1 rotate failed for {:?}: {}", path, e);
+        }
+    }
+
+    let tmp = path.with_extension("tmp");
+    let open_res = {
+        #[cfg(unix)]
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        opts.open(&tmp)
+    };
+    match open_res {
         Ok(mut f) => {
             if let Err(e) = f.write_all(&sealed) {
-                tracing::error!("Failed to write sealed seed to {:?}: {}", path, e);
-            } else if let Err(e) = f.sync_all() {
-                tracing::error!("Failed to sync seed file {:?}: {}", path, e);
-            } else {
-                tracing::info!("Persisted sealed ML-DSA-87 seed to {:?}", path);
-                // Set restrictive permissions (owner read/write only)
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let perms = std::fs::Permissions::from_mode(0o600);
-                    if let Err(e) = std::fs::set_permissions(path, perms) {
-                        tracing::error!("Failed to set permissions on {:?}: {}", path, e);
-                    }
+                tracing::error!("FATAL: failed to write sealed seed tmp {:?}: {}", tmp, e);
+                std::process::exit(1);
+            }
+            if let Err(e) = f.sync_all() {
+                tracing::error!("FATAL: failed to fsync sealed seed tmp {:?}: {}", tmp, e);
+                std::process::exit(1);
+            }
+            drop(f);
+            if let Err(e) = std::fs::rename(&tmp, path) {
+                tracing::error!("FATAL: atomic rename of sealed seed failed {:?} -> {:?}: {}", tmp, path, e);
+                std::process::exit(1);
+            }
+            // fsync parent directory so the rename is durable
+            if let Some(parent) = path.parent() {
+                if let Ok(dir) = std::fs::File::open(parent) {
+                    let _ = dir.sync_all();
                 }
             }
+            tracing::info!("Persisted sealed ML-DSA-87 seed to {:?} (atomic, 3-gen)", path);
         }
         Err(e) => {
-            tracing::error!("Failed to open seed file {:?} for writing: {}", path, e);
+            tracing::error!("FATAL: failed to open sealed seed tmp {:?}: {}", tmp, e);
+            std::process::exit(1);
         }
     }
 }
@@ -642,6 +673,15 @@ fn append_witness_checkpoint(
         .append(true)
         .open(path)?;
     writeln!(file, "{}", json)?;
-    file.sync_data()?;
+    // SECURITY (D7): full fsync (data + metadata) — sync_data alone is
+    // insufficient against power-loss because metadata may not be persisted.
+    file.sync_all()?;
+    drop(file);
+    // Also fsync the parent directory so the file entry itself is durable.
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
     Ok(())
 }

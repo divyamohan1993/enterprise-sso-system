@@ -7,6 +7,46 @@ use tokio::sync::RwLock;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Credential operation enum (D17): replaces plaintext string in leaf input.
+/// Wire-stable u8 discriminant — never reuse values.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[repr(u8)]
+enum KtOperation {
+    Bind = 1,
+    Revoke = 2,
+    Rotate = 3,
+}
+
+impl KtOperation {
+    fn as_str(self) -> &'static str {
+        match self {
+            KtOperation::Bind => "bind",
+            KtOperation::Revoke => "revoke",
+            KtOperation::Rotate => "rotate",
+        }
+    }
+
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "bind" => Some(KtOperation::Bind),
+            "revoke" => Some(KtOperation::Revoke),
+            "rotate" => Some(KtOperation::Rotate),
+            _ => None,
+        }
+    }
+}
+
+/// Persisted leaf record (D11). Stored append-only as length-prefixed postcard.
+/// Replayed at startup to rebuild the in-memory tree exactly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct KtLeafRecord {
+    sequence: u64,
+    user_id: Uuid,
+    operation: KtOperation,
+    credential_hash: [u8; 32],
+    timestamp: i64,
+}
+
 /// Requests handled by the Key Transparency service.
 #[derive(Debug, Serialize, Deserialize)]
 enum KtRequest {
@@ -96,29 +136,68 @@ fn unseal_seed(sealed: &[u8]) -> Result<[u8; 32], String> {
     Ok(seed)
 }
 
-/// Write a sealed (encrypted) seed to disk with restrictive permissions.
+/// Write a sealed (encrypted) seed to disk atomically with 3-generation rotation.
+///
+/// SECURITY (D15): Writes go to `<path>.tmp`, are fsynced, then atomically
+/// renamed over the destination. Two prior generations (`<path>.gen-1` and
+/// `<path>.gen-2`) are kept on disk for disaster recovery. Parent directory
+/// is fsynced after the rename so the directory entry is durable.
 fn persist_seed(path: &Path, seed: &[u8; 32]) {
     use std::io::Write;
     let sealed = seal_seed(seed);
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)
-    {
+
+    let gen1 = path.with_extension("gen-1");
+    let gen2 = path.with_extension("gen-2");
+    if gen1.exists() {
+        if let Err(e) = std::fs::rename(&gen1, &gen2) {
+            tracing::warn!("KT seed gen-1 -> gen-2 rotate failed for {:?}: {}", path, e);
+        }
+    }
+    if path.exists() {
+        if let Err(e) = std::fs::rename(path, &gen1) {
+            tracing::warn!("KT seed current -> gen-1 rotate failed for {:?}: {}", path, e);
+        }
+    }
+
+    let tmp = path.with_extension("tmp");
+    let open_res = {
+        #[cfg(unix)]
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        opts.open(&tmp)
+    };
+    match open_res {
         Ok(mut file) => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Err(e) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
-                    tracing::error!("SIEM:ERROR failed to set file permissions on {:?}: {e}", path);
+            if let Err(e) = file.write_all(&sealed) {
+                tracing::error!("FATAL: failed to write sealed KT seed tmp {:?}: {}", tmp, e);
+                std::process::exit(1);
+            }
+            if let Err(e) = file.sync_all() {
+                tracing::error!("FATAL: failed to fsync sealed KT seed tmp {:?}: {}", tmp, e);
+                std::process::exit(1);
+            }
+            drop(file);
+            if let Err(e) = std::fs::rename(&tmp, path) {
+                tracing::error!(
+                    "FATAL: atomic rename of sealed KT seed failed {:?} -> {:?}: {}",
+                    tmp, path, e
+                );
+                std::process::exit(1);
+            }
+            if let Some(parent) = path.parent() {
+                if let Ok(dir) = std::fs::File::open(parent) {
+                    let _ = dir.sync_all();
                 }
             }
-            if let Err(e) = file.write_all(&sealed) {
-                tracing::error!("Failed to write sealed seed to {:?}: {}", path, e);
-            }
+            tracing::info!("Persisted sealed KT ML-DSA-87 seed to {:?} (atomic, 3-gen)", path);
         }
-        Err(e) => tracing::error!("Failed to open {:?} for seed persistence: {}", path, e),
+        Err(e) => {
+            tracing::error!("FATAL: failed to open KT sealed seed tmp {:?}: {}", tmp, e);
+            std::process::exit(1);
+        }
     }
 }
 
@@ -204,6 +283,189 @@ fn load_or_generate_keypair(
     }
 
     (signing_key, verifying_key)
+}
+
+// ---------------------------------------------------------------------------
+// D11: Append-only leaf log — every leaf is persisted before the in-memory
+// tree is mutated, so a crash after the write is recoverable on the next
+// start. File format: repeated [len_le_u32 || postcard(KtLeafRecord)] records.
+// ---------------------------------------------------------------------------
+
+fn append_leaf_record(path: &Path, rec: &KtLeafRecord) -> std::io::Result<()> {
+    use std::io::Write;
+    let encoded = postcard::to_allocvec(rec)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let len = encoded.len() as u32;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    file.write_all(&len.to_le_bytes())?;
+    file.write_all(&encoded)?;
+    // Full fsync of file + parent dir for power-loss durability.
+    file.sync_all()?;
+    drop(file);
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
+}
+
+fn load_leaf_records(path: &Path) -> Vec<KtLeafRecord> {
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            tracing::error!("KT leaf log: read {:?} failed: {}", path, e);
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    while offset + 4 <= data.len() {
+        let len_bytes: [u8; 4] = match data[offset..offset + 4].try_into() {
+            Ok(b) => b,
+            Err(_) => break,
+        };
+        let n = u32::from_le_bytes(len_bytes) as usize;
+        offset += 4;
+        if offset + n > data.len() {
+            tracing::warn!("KT leaf log truncated at offset {} in {:?}", offset - 4, path);
+            common::siem::SecurityEvent::tamper_detected(
+                &format!("KT leaf log truncated at offset {} in {:?}", offset - 4, path),
+            );
+            break;
+        }
+        match postcard::from_bytes::<KtLeafRecord>(&data[offset..offset + n]) {
+            Ok(rec) => out.push(rec),
+            Err(e) => {
+                tracing::error!("KT leaf log: malformed record at offset {}: {}", offset - 4, e);
+                common::siem::SecurityEvent::tamper_detected(
+                    &format!("KT leaf log malformed record at offset {} in {:?}: {}",
+                             offset - 4, path, e),
+                );
+            }
+        }
+        offset += n;
+    }
+    // Verify sequence numbers are contiguous from 0
+    for (i, rec) in out.iter().enumerate() {
+        if rec.sequence != i as u64 {
+            tracing::error!(
+                "SIEM:CRITICAL KT leaf log sequence gap: expected {}, got {} -- TAMPER",
+                i, rec.sequence
+            );
+            common::siem::SecurityEvent::tamper_detected(
+                &format!("KT leaf log sequence gap at index {}: stored {}", i, rec.sequence),
+            );
+            return out[..i].to_vec();
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// D12: Append-only signed tree head log. Each STH is persisted before being
+// pushed to the witness. Format identical to leaf log (length-prefixed
+// postcard).
+// ---------------------------------------------------------------------------
+
+/// Serde helper for `[u8; 64]` — serde only supports arrays up to 32 natively.
+mod byte_array_64 {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    pub fn serialize<S: Serializer>(data: &[u8; 64], ser: S) -> Result<S::Ok, S::Error> {
+        data.as_slice().serialize(ser)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<[u8; 64], D::Error> {
+        let v: Vec<u8> = Vec::deserialize(de)?;
+        v.try_into().map_err(|v: Vec<u8>| {
+            serde::de::Error::custom(format!("expected 64 bytes, got {}", v.len()))
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedSth {
+    tree_size: u64,
+    #[serde(with = "byte_array_64")]
+    root: [u8; 64],
+    timestamp: i64,
+    /// ML-DSA-87 signature over (tree_size || root || timestamp || prev_sth_hash)
+    signature: Vec<u8>,
+    /// Hash of the previous STH for RFC 6962-style consistency chaining.
+    #[serde(with = "byte_array_64")]
+    prev_sth_hash: [u8; 64],
+}
+
+fn append_sth_record(path: &Path, sth: &PersistedSth) -> std::io::Result<()> {
+    use std::io::Write;
+    let encoded = postcard::to_allocvec(sth)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let len = encoded.len() as u32;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    file.write_all(&len.to_le_bytes())?;
+    file.write_all(&encoded)?;
+    file.sync_all()?;
+    drop(file);
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
+}
+
+fn hash_sth(sth: &PersistedSth) -> [u8; 64] {
+    use sha2::{Digest, Sha512};
+    let mut h = Sha512::new();
+    h.update(b"MILNET-KT-STH-v1");
+    h.update(sth.tree_size.to_be_bytes());
+    h.update(sth.root);
+    h.update(sth.timestamp.to_be_bytes());
+    h.update(sth.prev_sth_hash);
+    let r = h.finalize();
+    let mut out = [0u8; 64];
+    out.copy_from_slice(&r);
+    out
+}
+
+fn load_last_sth_hash(path: &Path) -> [u8; 64] {
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(_) => return [0u8; 64],
+    };
+    let mut last_hash = [0u8; 64];
+    let mut offset = 0usize;
+    while offset + 4 <= data.len() {
+        let n = u32::from_le_bytes(match data[offset..offset + 4].try_into() {
+            Ok(b) => b,
+            Err(_) => break,
+        }) as usize;
+        offset += 4;
+        if offset + n > data.len() {
+            break;
+        }
+        if let Ok(sth) = postcard::from_bytes::<PersistedSth>(&data[offset..offset + n]) {
+            last_hash = hash_sth(&sth);
+        }
+        offset += n;
+    }
+    last_hash
 }
 
 /// Ensure a directory exists, creating it (with parents) if needed.
@@ -420,14 +682,59 @@ async fn main() {
         tracing::info!(
             tree_size = count,
             root = %hex::encode(&root[..8]),
-            "Merkle tree checkpoint verified (tree state will be rebuilt from audit log)"
+            "Merkle tree checkpoint verified (tree state will be rebuilt from leaf log)"
         );
     }
+
+    // ── D11: Replay persisted leaves into the in-memory tree ────────────
+    let leaf_log_path = data_dir.join("kt_leaves.log");
+    {
+        let records = load_leaf_records(&leaf_log_path);
+        if !records.is_empty() {
+            let mut t = tree.write().await;
+            for rec in &records {
+                t.append_credential_op(
+                    &rec.user_id,
+                    rec.operation.as_str(),
+                    &rec.credential_hash,
+                    rec.timestamp,
+                );
+            }
+            tracing::info!(
+                "KT replayed {} persisted leaves; tree root={}",
+                records.len(),
+                hex::encode(&t.root()[..8])
+            );
+            // Cross-check against checkpoint root if present.
+            if let Some((cp_count, cp_root)) = load_tree_checkpoint(&tree_checkpoint_path) {
+                if cp_count == t.len() as u64 && cp_root != t.root() {
+                    tracing::error!(
+                        "SIEM:CRITICAL KT replay root mismatch with checkpoint: \
+                         checkpoint={}, replay={}",
+                        hex::encode(&cp_root[..8]),
+                        hex::encode(&t.root()[..8])
+                    );
+                    common::siem::SecurityEvent::tamper_detected(
+                        "KT replay root diverges from checkpoint -- TAMPER",
+                    );
+                    std::process::exit(199);
+                }
+            }
+        }
+    }
+
+    // ── D12: STH log + previous STH hash for chaining ───────────────────
+    let sth_log_path = data_dir.join("kt_sth.log");
+    let last_sth_hash_init = load_last_sth_hash(&sth_log_path);
+    let last_sth_hash: Arc<tokio::sync::Mutex<[u8; 64]>> =
+        Arc::new(tokio::sync::Mutex::new(last_sth_hash_init));
 
     // Spawn periodic signed tree head + tree persistence task (every 60 seconds)
     let tree_clone = tree.clone();
     let pq_key_clone = pq_signing_key.clone();
     let checkpoint_path = tree_checkpoint_path.clone();
+    let sth_path = sth_log_path.clone();
+    let last_sth_hash_task = last_sth_hash.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
@@ -435,9 +742,46 @@ async fn main() {
             let t = tree_clone.read().await;
             if t.len() > 0 {
                 let sth = t.signed_tree_head(&pq_key_clone);
-                tracing::info!("Signed tree head: {} leaves, root={}", sth.tree_size, hex::encode(&sth.root[..8]));
+                tracing::info!(
+                    "Signed tree head: {} leaves, root={}",
+                    sth.tree_size,
+                    hex::encode(&sth.root[..8])
+                );
                 // Persist Merkle tree checkpoint with HMAC-SHA512 integrity
                 persist_tree(&t, &checkpoint_path);
+
+                // D12: build, sign, persist, and chain a PersistedSth.
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_micros() as i64;
+                let mut prev_hash_lock = last_sth_hash_task.lock().await;
+                let mut to_sign = Vec::with_capacity(8 + 64 + 8 + 64);
+                to_sign.extend_from_slice(&sth.tree_size.to_be_bytes());
+                to_sign.extend_from_slice(&sth.root);
+                to_sign.extend_from_slice(&timestamp.to_be_bytes());
+                to_sign.extend_from_slice(&*prev_hash_lock);
+                let signature = crypto::pq_sign::pq_sign_raw(&pq_key_clone, &to_sign);
+                let persisted = PersistedSth {
+                    tree_size: sth.tree_size,
+                    root: sth.root,
+                    timestamp,
+                    signature,
+                    prev_sth_hash: *prev_hash_lock,
+                };
+                if let Err(e) = append_sth_record(&sth_path, &persisted) {
+                    tracing::error!("KT STH log append failed: {}", e);
+                    common::siem::SecurityEvent::tamper_detected(
+                        &format!("KT STH log append failed: {}", e),
+                    );
+                } else {
+                    *prev_hash_lock = hash_sth(&persisted);
+                    tracing::info!(
+                        "KT STH persisted: size={} chain_hash={}",
+                        persisted.tree_size,
+                        hex::encode(&prev_hash_lock[..8])
+                    );
+                }
             }
         }
     });
@@ -465,13 +809,60 @@ async fn main() {
     loop {
         if let Ok(mut transport) = listener.accept().await {
             let tree = tree.clone();
+            let leaf_log_path = leaf_log_path.clone();
             tokio::spawn(async move {
-                while let Ok((_sender, payload)) = transport.recv().await {
+                while let Ok((sender, payload)) = transport.recv().await {
+                    // SECURITY (D3): authoritative caller identity is the mTLS
+                    // peer module, not anything carried in the payload.
+                    let authorized = matches!(
+                        sender,
+                        common::types::ModuleId::Orchestrator
+                            | common::types::ModuleId::Opaque
+                            | common::types::ModuleId::Tss
+                            | common::types::ModuleId::Admin
+                    );
+                    if !authorized {
+                        tracing::error!(
+                            sender = ?sender,
+                            "SECURITY: unauthorized module attempted to mutate KT log"
+                        );
+                        continue;
+                    }
                     if let Ok(request) = postcard::from_bytes::<KtRequest>(&payload) {
                         match request {
                             KtRequest::AppendOp { user_id, operation, credential_hash, timestamp } => {
-                                let mut tree = tree.write().await;
-                                tree.append_credential_op(&user_id, &operation, &credential_hash, timestamp);
+                                // D17: parse operation as enum; reject unknown.
+                                let op = match KtOperation::from_str(&operation) {
+                                    Some(o) => o,
+                                    None => {
+                                        tracing::error!(
+                                            "KT rejecting unknown operation: {}", operation
+                                        );
+                                        continue;
+                                    }
+                                };
+                                // D11: persist leaf BEFORE mutating the tree so
+                                // a crash after append is fully recoverable.
+                                let mut t = tree.write().await;
+                                let seq = t.len() as u64;
+                                let rec = KtLeafRecord {
+                                    sequence: seq,
+                                    user_id,
+                                    operation: op,
+                                    credential_hash,
+                                    timestamp,
+                                };
+                                if let Err(e) = append_leaf_record(&leaf_log_path, &rec) {
+                                    tracing::error!(
+                                        "FATAL: KT leaf log append failed for seq={}: {} -- refusing to mutate tree",
+                                        seq, e
+                                    );
+                                    common::siem::SecurityEvent::tamper_detected(
+                                        &format!("KT leaf log append failed seq={}: {}", seq, e),
+                                    );
+                                    continue;
+                                }
+                                t.append_credential_op(&user_id, op.as_str(), &credential_hash, timestamp);
                             }
                             KtRequest::GetRoot => {
                                 let tree = tree.read().await;

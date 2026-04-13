@@ -138,7 +138,7 @@ mod tests {
     fn random_salt() -> Vec<u8> {
         use rand::RngCore;
         let mut salt = vec![0u8; 16];
-        rand::thread_rng().fill_bytes(&mut salt);
+        rand::rngs::OsRng.fill_bytes(&mut salt);
         salt
     }
 

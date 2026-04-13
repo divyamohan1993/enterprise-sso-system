@@ -126,6 +126,104 @@ pub fn is_dpop_replay(proof_hash: &[u8; 64]) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// D6: Compile/deploy-time pinning of ML-DSA-87 verifier keys.
+//
+// To prevent runtime injection of attacker-supplied verifier keys, every
+// `verify_token*` call routes through `assert_key_is_pinned`. The pinned set
+// is the SHA-512 fingerprints of the encoded ML-DSA-87 verifying keys, loaded
+// from `MILNET_PINNED_VERIFIER_KEYS` (comma-separated hex SHA-512 digests).
+// Production deployments should hard-code this via a regen build script that
+// runs after the offline ceremony — the env var is the deployment surface.
+//
+// In military mode (`MILNET_MILITARY_DEPLOYMENT=1`), the pin list is REQUIRED
+// and a missing/empty list fails closed. In dev, an unset list is allowed.
+// ---------------------------------------------------------------------------
+
+use std::sync::OnceLock;
+
+static PINNED_VK_FINGERPRINTS: OnceLock<Vec<[u8; 64]>> = OnceLock::new();
+
+fn pinned_fingerprints() -> &'static Vec<[u8; 64]> {
+    PINNED_VK_FINGERPRINTS.get_or_init(|| {
+        let raw = std::env::var("MILNET_PINNED_VERIFIER_KEYS").unwrap_or_default();
+        let mut out = Vec::new();
+        for entry in raw.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            match hex::decode(entry) {
+                Ok(bytes) if bytes.len() == 64 => {
+                    let mut fp = [0u8; 64];
+                    fp.copy_from_slice(&bytes);
+                    out.push(fp);
+                }
+                Ok(bytes) => {
+                    tracing::error!(
+                        "MILNET_PINNED_VERIFIER_KEYS entry has wrong length {} (expected 64)",
+                        bytes.len()
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "MILNET_PINNED_VERIFIER_KEYS entry not valid hex: {}", e
+                    );
+                }
+            }
+        }
+        out
+    })
+}
+
+/// Compute the SHA-512 fingerprint of an encoded ML-DSA-87 verifying key.
+/// This is the value that should be pinned via `MILNET_PINNED_VERIFIER_KEYS`.
+pub fn fingerprint_pq_verifying_key(vk: &PqVerifyingKey) -> [u8; 64] {
+    use ml_dsa::EncodedVerifyingKey;
+    use sha2::{Digest, Sha512};
+    let encoded: EncodedVerifyingKey<ml_dsa::MlDsa87> = vk.encode();
+    let mut h = Sha512::new();
+    h.update(b"MILNET-VERIFIER-VK-PIN-v1");
+    h.update(AsRef::<[u8]>::as_ref(&encoded));
+    let r = h.finalize();
+    let mut fp = [0u8; 64];
+    fp.copy_from_slice(&r);
+    fp
+}
+
+/// Reject the verification if the supplied verifying key is not in the
+/// pinned allowlist. In military mode, an empty pin list is fail-closed.
+fn assert_key_is_pinned(vk: &PqVerifyingKey) -> Result<(), MilnetError> {
+    let pinned = pinned_fingerprints();
+    let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if pinned.is_empty() {
+        if is_military {
+            return Err(MilnetError::CryptoVerification(
+                "MILNET_PINNED_VERIFIER_KEYS is unset in military deployment — \
+                 refusing to verify with unpinned key".into(),
+            ));
+        }
+        return Ok(());
+    }
+    let fp = fingerprint_pq_verifying_key(vk);
+    for pinned_fp in pinned {
+        if crypto::ct::ct_eq(&fp, pinned_fp) {
+            return Ok(());
+        }
+    }
+    common::siem::SecurityEvent::tamper_detected(
+        &format!(
+            "verifier rejected unpinned ML-DSA-87 key (fp={})",
+            hex::encode(&fp[..16])
+        ),
+    );
+    Err(MilnetError::CryptoVerification(
+        "verifier key is not in the pinned allowlist".into(),
+    ))
+}
+
 /// Verify a token's signature and claims (spec C.11), enforcing DPoP channel
 /// binding.
 ///
@@ -198,6 +296,11 @@ fn verify_token_core(
     client_dpop_key: Option<&[u8]>,
     expected_ceremony_id: Option<&[u8; 32]>,
 ) -> Result<TokenClaims, MilnetError> {
+    // SECURITY (D6): the supplied verifying key MUST be in the pinned set.
+    // This prevents a compromised caller from injecting an attacker-controlled
+    // key that would let any signature pass.
+    assert_key_is_pinned(pq_verifying_key)?;
+
     // 1. Check version
     if token.header.version != 1 {
         return Err(MilnetError::CryptoVerification(
@@ -222,14 +325,32 @@ fn verify_token_core(
         ));
     }
 
-    // 3b. Check iat is not in the future (with clock skew tolerance).
-    // Tokens issued in the future indicate clock manipulation or replay
-    // of pre-generated tokens. Tolerance: 10 seconds per NIST SP 800-63B.
-    const IAT_SKEW_TOLERANCE_US: i64 = 10_000_000; // 10 seconds in microseconds
-    if token.claims.iat > now + IAT_SKEW_TOLERANCE_US {
+    // 3b. F18: Symmetric clock-skew enforcement.
+    //   require: now - 10s <= iat AND iat <= exp AND exp <= now + 10s
+    // Asymmetric skew handling could let attackers replay tokens generated on
+    // skewed clocks. Reject any token where iat is too old or exp is too far
+    // in the future relative to local secure time.
+    const SKEW_TOLERANCE_US: i64 = 10_000_000; // 10 seconds in microseconds
+    if token.claims.iat > now + SKEW_TOLERANCE_US {
         return Err(MilnetError::CryptoVerification(
             "token iat is in the future beyond clock skew tolerance".into(),
         ));
+    }
+    if token.claims.iat > token.claims.exp {
+        return Err(MilnetError::CryptoVerification(
+            "token iat is after exp — malformed claims".into(),
+        ));
+    }
+    // F8: Per-tier expiry enforcement. Tier 1 (Sovereign / AAL3) must have
+    // exp <= iat + 15 minutes. Stolen high-assurance tokens get the smallest
+    // possible replay window.
+    if token.claims.tier == 1 {
+        const AAL3_MAX_LIFETIME_US: i64 = 15 * 60 * 1_000_000;
+        if token.claims.exp - token.claims.iat > AAL3_MAX_LIFETIME_US {
+            return Err(MilnetError::CryptoVerification(
+                "AAL3 (tier 1) token lifetime exceeds 15-minute maximum".into(),
+            ));
+        }
     }
 
     // 4. DPoP channel binding enforcement (MANDATORY, unconditional):

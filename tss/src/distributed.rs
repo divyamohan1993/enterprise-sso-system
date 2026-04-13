@@ -982,17 +982,25 @@ impl SignerNode {
                     self.nonce_counter = nonce;
                 }
                 Err(e) => {
-                    // CRITICAL: WAL write failed — we MUST NOT proceed with
-                    // a non-durable nonce. However, FROST commit() is required
-                    // to return nonces. Log the error and proceed with the
-                    // sealed storage fallback.
+                    // C8: WAL fsync failed — FAIL-CLOSED. We MUST NOT advance
+                    // the nonce or return commitments, since a non-durable nonce
+                    // means a crash + restart could reuse it and leak the share.
+                    // Halt the signing ceremony hard. SIEM CRITICAL.
                     tracing::error!(
+                        target: "siem",
+                        severity = "CRITICAL",
+                        action = "tss_wal_fsync_fail_closed",
                         error = %e,
                         nonce = self.nonce_counter + 1,
-                        "SIEM:CRITICAL nonce WAL fsync FAILED — falling back to sealed storage. \
-                         Investigate immediately: WAL failure = nonce reuse risk"
+                        "SIEM:CRITICAL nonce WAL fsync FAILED — halting signing ceremony. \
+                         Nonce NOT advanced. Process aborting to prevent nonce reuse."
                     );
-                    self.nonce_counter += 1;
+                    // Fail-closed: panic so the in-flight ceremony cannot complete
+                    // and a supervisor restart performs WAL recovery from a
+                    // known-durable state.
+                    panic!(
+                        "FATAL: TSS nonce WAL fsync failed — fail-closed to prevent nonce reuse: {e}"
+                    );
                 }
             }
         } else {
@@ -2516,7 +2524,39 @@ pub fn handle_dkg_round2(
     Ok((round2_secret_bytes, packages))
 }
 
+/// C5: Error returned by `handle_dkg_finalize` that names the malicious peer(s).
+#[derive(Debug, Clone)]
+pub enum DkgError {
+    /// One or more identified signers sent a malformed round2 package.
+    /// The Vec contains the offending signer IDs (serialized identifier bytes).
+    MisbehaviorBy(Vec<Vec<u8>>),
+    /// Generic non-attributable failure.
+    Other(String),
+}
+
+impl std::fmt::Display for DkgError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DkgError::MisbehaviorBy(ids) => {
+                write!(f, "DKG misbehavior detected from {} signer(s): ", ids.len())?;
+                for (i, id) in ids.iter().enumerate() {
+                    if i > 0 { write!(f, ",")?; }
+                    for b in id { write!(f, "{:02x}", b)?; }
+                }
+                Ok(())
+            }
+            DkgError::Other(s) => write!(f, "DKG error: {s}"),
+        }
+    }
+}
+
+impl std::error::Error for DkgError {}
+
 /// Handle DKG finalize: combine all shares into the final KeyPackage.
+///
+/// C5: Each round2 package is validated cryptographically BEFORE aggregation.
+/// On any per-package failure the offending signer ID is recorded and returned
+/// in `DkgError::MisbehaviorBy` so the orchestrator can punish/remove them.
 pub fn handle_dkg_finalize(
     round2_secret_bytes: &[u8],
     round1_packages_raw: &[(Vec<u8>, Vec<u8>)],
@@ -2528,26 +2568,55 @@ pub fn handle_dkg_finalize(
         .map_err(|e| format!("deserialize round2 secret: {e}"))?;
 
     let mut round1_packages = BTreeMap::new();
+    let mut round1_culpable: Vec<Vec<u8>> = Vec::new();
     for (id_bytes, pkg_bytes) in round1_packages_raw {
-        let id = Identifier::deserialize(id_bytes)
-            .map_err(|e| format!("deserialize round1 identifier: {e}"))?;
-        let pkg = frost_dkg::round1::Package::deserialize(pkg_bytes)
-            .map_err(|e| format!("deserialize round1 package: {e}"))?;
-        round1_packages.insert(id, pkg);
+        let id = match Identifier::deserialize(id_bytes) {
+            Ok(i) => i,
+            Err(_) => { round1_culpable.push(id_bytes.clone()); continue; }
+        };
+        match frost_dkg::round1::Package::deserialize(pkg_bytes) {
+            Ok(pkg) => { round1_packages.insert(id, pkg); }
+            Err(_) => { round1_culpable.push(id_bytes.clone()); }
+        }
+    }
+    if !round1_culpable.is_empty() {
+        let err = DkgError::MisbehaviorBy(round1_culpable);
+        tracing::error!(
+            target: "audit",
+            severity = "HIGH",
+            action = "dkg_round1_misbehavior",
+            "{err}"
+        );
+        return Err(err.to_string());
     }
 
     let mut round2_packages = BTreeMap::new();
+    let mut culpable: Vec<Vec<u8>> = Vec::new();
     for (id_bytes, pkg_bytes) in round2_packages_raw {
-        let id = Identifier::deserialize(id_bytes)
-            .map_err(|e| format!("deserialize round2 identifier: {e}"))?;
-        let pkg = frost_dkg::round2::Package::deserialize(pkg_bytes)
-            .map_err(|e| format!("deserialize round2 package: {e}"))?;
-        round2_packages.insert(id, pkg);
+        let id = match Identifier::deserialize(id_bytes) {
+            Ok(i) => i,
+            Err(_) => { culpable.push(id_bytes.clone()); continue; }
+        };
+        // C5: cryptographic per-package validation before any aggregation.
+        match frost_dkg::round2::Package::deserialize(pkg_bytes) {
+            Ok(pkg) => { round2_packages.insert(id, pkg); }
+            Err(_) => { culpable.push(id_bytes.clone()); }
+        }
+    }
+    if !culpable.is_empty() {
+        let err = DkgError::MisbehaviorBy(culpable);
+        tracing::error!(
+            target: "audit",
+            severity = "HIGH",
+            action = "dkg_round2_misbehavior",
+            "{err}"
+        );
+        return Err(err.to_string());
     }
 
     let (key_package, public_key_package) =
         frost_dkg::part3(&round2_secret, &round1_packages, &round2_packages)
-            .map_err(|e| format!("DKG part3 failed: {e}"))?;
+            .map_err(|e| format!("DKG part3 failed (post-validation): {e}"))?;
 
     let key_bytes = key_package
         .serialize()

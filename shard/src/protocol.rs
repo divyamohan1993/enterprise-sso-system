@@ -44,27 +44,30 @@ impl AsRef<[u8]> for SecurePayload {
     }
 }
 
+// SecurePayload comparisons go through ct_eq so that timing leaks cannot
+// reveal the plaintext byte-by-byte. ct_eq returns false on length mismatch
+// without leaking the matching prefix length.
 impl PartialEq<[u8]> for SecurePayload {
     fn eq(&self, other: &[u8]) -> bool {
-        self.0 == other
+        ct_eq(&self.0, other)
     }
 }
 
 impl PartialEq<&[u8]> for SecurePayload {
     fn eq(&self, other: &&[u8]) -> bool {
-        self.0.as_slice() == *other
+        ct_eq(&self.0, *other)
     }
 }
 
 impl<const N: usize> PartialEq<&[u8; N]> for SecurePayload {
     fn eq(&self, other: &&[u8; N]) -> bool {
-        self.0.as_slice() == other.as_slice()
+        ct_eq(&self.0, other.as_slice())
     }
 }
 
 impl PartialEq<Vec<u8>> for SecurePayload {
     fn eq(&self, other: &Vec<u8>) -> bool {
-        self.0 == *other
+        ct_eq(&self.0, other.as_slice())
     }
 }
 
@@ -188,9 +191,39 @@ impl ShardProtocol {
         Ok(common::secure_time::secure_now_us_i64())
     }
 
+    /// C11: Number of messages that share a single HMAC sub-key before the
+    /// per-counter ratchet rolls forward. Each window of 10 000 sequence numbers
+    /// gets an independent HMAC key derived via HKDF-Expand-SHA512.
+    const HMAC_RATCHET_INTERVAL: u64 = 10_000;
+
+    /// C11: Derive the per-window HMAC sub-key for a given message sequence.
+    ///
+    /// Both sender and receiver derive the same sub-key from the long-lived
+    /// `hmac_key` and the window counter (`sequence / HMAC_RATCHET_INTERVAL`).
+    /// Forward-secrecy is provided at the *granularity of windows*: an attacker
+    /// who learns the window-N sub-key cannot reverse it to window N-1.
+    fn ratchet_subkey(base: &[u8; 64], sequence: u64) -> [u8; 64] {
+        let counter = sequence / Self::HMAC_RATCHET_INTERVAL;
+        let info = counter.to_be_bytes();
+        let hk = match Hkdf::<Sha512>::from_prk(base) {
+            Ok(h) => h,
+            Err(_) => {
+                // PRK length error is impossible for a 64-byte key; fail closed.
+                return [0u8; 64];
+            }
+        };
+        let mut out = [0u8; 64];
+        if hk.expand(&info, &mut out).is_err() {
+            return [0u8; 64];
+        }
+        out
+    }
+
     /// Compute HMAC-SHA512 over the domain prefix and message fields (excluding the HMAC field).
+    /// C11: The MAC key is derived per-window from `key` and `msg.sequence`.
     fn compute_hmac(key: &[u8; 64], msg: &ShardMessage) -> [u8; 64] {
-        let mut mac = match <HmacSha512 as Mac>::new_from_slice(key) {
+        let subkey = Self::ratchet_subkey(key, msg.sequence);
+        let mut mac = match <HmacSha512 as Mac>::new_from_slice(&subkey) {
             Ok(m) => m,
             Err(e) => {
                 common::siem::emit_runtime_error(

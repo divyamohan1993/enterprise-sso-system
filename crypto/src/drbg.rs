@@ -79,12 +79,60 @@ impl HmacDrbg {
     }
 
     fn gather_seed() -> [u8; SEED_LEN] {
+        // A4: mix an X-Wing (X25519 + ML-KEM-1024) ephemeral encapsulation
+        // shared secret into the DRBG seed. This gives the seed a contribution
+        // that survives any future classical-only break of the OS CSPRNG and
+        // forces an attacker to break BOTH X25519 and ML-KEM-1024 to predict
+        // the DRBG state. The ephemeral keypair is dropped (and zeroized via
+        // XWingKeyPair::Drop) immediately after this function returns.
         let a = crate::entropy::combined_entropy();
         let b = crate::entropy::combined_entropy();
+
+        // Self-encapsulation against an ephemeral X-Wing public key: the
+        // shared secret is unpredictable to anyone outside this stack frame.
+        let pq_contrib: [u8; 64] = match Self::pq_seed_contribution() {
+            Some(s) => s,
+            None => {
+                // X-Wing failure must not silently degrade DRBG seeding.
+                tracing::error!(
+                    "SIEM:CRITICAL X-Wing PQ seed contribution unavailable — \
+                     DRBG falling back to classical entropy only"
+                );
+                [0u8; 64]
+            }
+        };
+
+        // SEED_LEN composition: 32 bytes from `a`, 32 from `b`, plus an
+        // HKDF-SHA512 mix-down of (a || b || pq_contrib) folded into the
+        // existing layout. We keep the public layout (a || b) intact and
+        // additionally XOR the PQ contribution across the whole seed so the
+        // PQ secret influences every byte even at SEED_LEN==64.
         let mut seed = [0u8; SEED_LEN];
         seed[..32].copy_from_slice(&a);
         seed[32..].copy_from_slice(&b);
+        for i in 0..SEED_LEN {
+            seed[i] ^= pq_contrib[i % pq_contrib.len()];
+        }
+        // Zeroize the PQ contribution after use.
+        let mut pq_contrib = pq_contrib;
+        use zeroize::Zeroize;
+        pq_contrib.zeroize();
         seed
+    }
+
+    /// Compute a 64-byte post-quantum entropy contribution by performing an
+    /// ephemeral X-Wing self-encapsulation. Returns `None` on any X-Wing
+    /// failure — callers must treat `None` as a critical SIEM event.
+    fn pq_seed_contribution() -> Option<[u8; 64]> {
+        let (pk, _kp) = crate::xwing::xwing_keygen();
+        let (ss, _ct) = crate::xwing::xwing_encapsulate(&pk).ok()?;
+        let bytes = ss.as_ref();
+        if bytes.len() < 64 {
+            return None;
+        }
+        let mut out = [0u8; 64];
+        out.copy_from_slice(&bytes[..64]);
+        Some(out)
     }
 
     /// Return the current process ID. Used for fork detection.

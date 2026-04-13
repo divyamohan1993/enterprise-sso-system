@@ -723,8 +723,11 @@ impl SecretDeliveryServer {
             .get_secret(name)
             .ok_or_else(|| format!("secret '{}' not found", name))?;
 
-        // Generate ephemeral X25519 keypair for this delivery
-        let our_secret = x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng());
+        // Generate ephemeral X25519 keypair for this delivery.
+        // CRITICAL: must use OsRng (not thread_rng) — thread_rng is reseeded
+        // from the OS but its construction is not crypto-grade for DH key
+        // material under the nation-state threat model.
+        let our_secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
         let session = create_ephemeral_session(&our_secret, peer_public)?;
 
         let encrypted = session_encrypt(&session, &secret_bytes)?;
@@ -845,8 +848,9 @@ impl SecretDeliveryClient {
             return Err(format!("authentication failed: {:?}", auth_result));
         }
 
-        // Generate ephemeral X25519 keypair for this request
-        let our_secret = x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng());
+        // Generate ephemeral X25519 keypair for this request.
+        // CRITICAL: must use OsRng for DH key material (see deliver_secret).
+        let our_secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
         let our_public = x25519_dalek::PublicKey::from(&our_secret);
 
         // Server delivers encrypted secret
@@ -1660,7 +1664,7 @@ mod tests {
         let (server, _client) = make_server_and_client();
         server.register_secret("key1", b"secret1".to_vec());
 
-        let peer_secret = x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng());
+        let peer_secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
         let peer_public = x25519_dalek::PublicKey::from(&peer_secret);
 
         let (_, srv_pub1) = server.deliver_secret("key1", &peer_public.to_bytes()).unwrap();
@@ -1672,9 +1676,9 @@ mod tests {
 
     #[test]
     fn test_session_encrypt_decrypt_roundtrip() {
-        let secret_a = x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng());
+        let secret_a = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
         let public_a = x25519_dalek::PublicKey::from(&secret_a);
-        let secret_b = x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng());
+        let secret_b = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
         let public_b = x25519_dalek::PublicKey::from(&secret_b);
 
         let session_a = create_ephemeral_session(&secret_a, &public_b.to_bytes()).unwrap();
@@ -1903,14 +1907,14 @@ mod tests {
         let (server, _) = make_server_and_client();
         server.register_secret("secret", b"payload".to_vec());
 
-        let attacker_secret = x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng());
+        let attacker_secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
         let attacker_public = x25519_dalek::PublicKey::from(&attacker_secret);
 
         let (encrypted, server_pub) =
             server.deliver_secret("secret", &attacker_public.to_bytes()).unwrap();
 
         // Attacker gets the ciphertext but tries to decrypt with a different keypair
-        let other_secret = x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng());
+        let other_secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
         let wrong_session = create_ephemeral_session(&other_secret, &server_pub).unwrap();
         let result = session_decrypt(&wrong_session, &encrypted);
         assert!(result.is_err());
@@ -1925,9 +1929,9 @@ mod tests {
 
     #[test]
     fn test_adversarial_tampered_ciphertext() {
-        let secret_a = x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng());
+        let secret_a = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
         let public_a = x25519_dalek::PublicKey::from(&secret_a);
-        let secret_b = x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng());
+        let secret_b = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
         let public_b = x25519_dalek::PublicKey::from(&secret_b);
 
         let session = create_ephemeral_session(&secret_a, &public_b.to_bytes()).unwrap();
@@ -2009,7 +2013,7 @@ mod tests {
     #[test]
     fn test_server_secret_not_found() {
         let (server, _) = make_server_and_client();
-        let peer_secret = x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng());
+        let peer_secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
         let peer_public = x25519_dalek::PublicKey::from(&peer_secret);
 
         let result = server.deliver_secret("nonexistent", &peer_public.to_bytes());

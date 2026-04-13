@@ -29,9 +29,29 @@ pub struct SignerShare {
 }
 
 impl SignerShare {
+    /// C14: Closure-based safe variant of [`Self::into_parts`].
+    ///
+    /// The borrowed identifier and key package are passed to `f`, then the
+    /// share is dropped via its standard `Drop` impl which performs full
+    /// zeroization. Prefer this over `into_parts()` for any caller that does
+    /// not absolutely need ownership of the inner fields.
+    pub fn with_parts<F, R>(self, f: F) -> R
+    where
+        F: FnOnce(&Identifier, &KeyPackage) -> R,
+    {
+        let result = f(&self.identifier, &self.key_package);
+        // self drops here -- Drop impl zeroizes both fields.
+        result
+    }
+
     /// Consume the share and return its parts without triggering Drop zeroization.
     /// Use when transferring ownership to a `SignerNode` or other secure container
     /// that will handle its own zeroization.
+    ///
+    /// SECURITY: Prefer [`Self::with_parts`] which guarantees zeroization. This
+    /// raw extractor only exists for the small number of internal callers that
+    /// transfer the inner fields into another container that owns its own
+    /// zeroization (e.g. `SignerNode::from_share`).
     pub fn into_parts(self) -> (Identifier, KeyPackage) {
         // SAFETY: We wrap self in ManuallyDrop to prevent the Drop impl from
         // running, then use ptr::read to move fields out. This is the standard
@@ -92,6 +112,24 @@ pub struct DkgResult {
 /// `pedersen_dkg.rs`.
 #[deprecated(note = "Use dkg_distributed() for production. This uses a trusted dealer.")]
 pub fn dkg(total: u16, threshold: u16) -> Result<DkgResult, String> {
+    // C4: Trusted-dealer DKG is FORBIDDEN in production. The trusted dealer
+    // briefly holds the entire signing key, which violates the threshold trust
+    // model. Production code MUST use `dkg_distributed()`.
+    if !cfg!(test) {
+        if std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1")
+            || std::env::var("MILNET_PRODUCTION").as_deref() == Ok("1")
+        {
+            tracing::error!(
+                target: "siem",
+                severity = "CRITICAL",
+                action = "trusted_dealer_dkg_blocked",
+                "FATAL: trusted-dealer dkg() called in production. Use dkg_distributed()."
+            );
+            return Err(
+                "trusted-dealer DKG forbidden in production; use dkg_distributed()".to_string(),
+            );
+        }
+    }
     let mut rng = rand::rngs::OsRng;
     let (shares_map, public_key_package) = frost::keys::generate_with_dealer(
         total,

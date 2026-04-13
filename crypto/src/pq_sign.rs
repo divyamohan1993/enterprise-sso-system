@@ -144,6 +144,20 @@ pub fn pq_verify_raw(verifying_key: &PqVerifyingKey, data: &[u8], sig_bytes: &[u
     verifying_key.verify_with_context(data, CTX_RAW_SIGN, &sig)
 }
 
+/// C12: Convenience wrapper that takes the raw encoded ML-DSA-87 verifying key
+/// as bytes (rather than an already-decoded `PqVerifyingKey`).
+///
+/// This avoids forcing downstream crates to depend on `ml-dsa` directly.
+/// Returns `true` only if the encoded key parses AND the signature verifies.
+pub fn pq_verify_raw_from_bytes(vk_bytes: &[u8], data: &[u8], sig_bytes: &[u8]) -> bool {
+    let vk_enc = match <EncodedVerifyingKey<MlDsa87> as TryFrom<&[u8]>>::try_from(vk_bytes) {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+    let vk = PqVerifyingKey::decode(&vk_enc);
+    pq_verify_raw(&vk, data, sig_bytes)
+}
+
 // ── Crypto Agility: Runtime-Selectable Signature Algorithms ────────────────
 //
 // CNSA 2.0 and FIPS 140-3 require crypto agility — the ability to migrate

@@ -901,9 +901,70 @@ impl HardwarePkcs11Session {
             CacError::SigningFailed(format!("private key '{}' not found", key_label))
         })?;
 
+        // CAC mechanism policy (CNSA 2.0 / NIST CAC 2.0 roadmap, A8 hardening):
+        //
+        //  - RSA-PKCS#1 v1.5 is DEPRECATED. Reject by default. Operators with
+        //    legacy DoD card stocks may temporarily set
+        //    MILNET_CAC_ALLOW_LEGACY_RSA=1 to permit it; every such use is
+        //    logged at CRIT severity to the SIEM. The hard sunset date below
+        //    is enforced on the wall clock — past the sunset epoch we refuse
+        //    even with the override flag.
+        //  - P-384 ECDSA remains accepted (still on the NIST CAC 2.0 roadmap)
+        //    but every use is logged at CRIT to the SIEM so the migration to
+        //    ML-DSA-87 / hybrid PIV cards can be tracked.
+        //
+        // NIST CAC 2.0 hard sunset for RSA-PKCS#1 v1.5: 2031-01-01T00:00:00Z
+        // (matches CNSA 2.0 quantum-readiness deadline).
+        const CAC_LEGACY_RSA_SUNSET_EPOCH_SECS: u64 = 1_924_905_600;
+
         let ckm = match mechanism {
-            SignMechanism::RsaPkcs => Mechanism::RsaPkcs,
-            SignMechanism::EcdsaP256 | SignMechanism::EcdsaP384 => Mechanism::Ecdsa,
+            SignMechanism::RsaPkcs => {
+                let allow_legacy = std::env::var("MILNET_CAC_ALLOW_LEGACY_RSA")
+                    .map(|v| v == "1")
+                    .unwrap_or(false);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(u64::MAX);
+                if !allow_legacy {
+                    tracing::error!(
+                        key_label = %key_label,
+                        "SIEM:CRITICAL CAC RSA-PKCS#1 v1.5 sign attempt rejected — \
+                         set MILNET_CAC_ALLOW_LEGACY_RSA=1 if you must use legacy DoD card stock"
+                    );
+                    return Err(CacError::SigningFailed(
+                        "RSA-PKCS#1 v1.5 is deprecated under CNSA 2.0. \
+                         Set MILNET_CAC_ALLOW_LEGACY_RSA=1 to override (legacy hardware only)."
+                            .to_string(),
+                    ));
+                }
+                if now >= CAC_LEGACY_RSA_SUNSET_EPOCH_SECS {
+                    tracing::error!(
+                        key_label = %key_label,
+                        sunset = CAC_LEGACY_RSA_SUNSET_EPOCH_SECS,
+                        "SIEM:CRITICAL CAC RSA-PKCS#1 v1.5 sunset reached — refusing"
+                    );
+                    return Err(CacError::SigningFailed(
+                        "RSA-PKCS#1 v1.5 hard sunset (2031-01-01) reached — refusing".to_string(),
+                    ));
+                }
+                tracing::warn!(
+                    key_label = %key_label,
+                    "SIEM:CRITICAL CAC RSA-PKCS#1 v1.5 in use under MILNET_CAC_ALLOW_LEGACY_RSA \
+                     override — schedule migration to ML-DSA-87"
+                );
+                Mechanism::RsaPkcs
+            }
+            SignMechanism::EcdsaP256 => Mechanism::Ecdsa,
+            SignMechanism::EcdsaP384 => {
+                tracing::error!(
+                    key_label = %key_label,
+                    "SIEM:CRITICAL CAC P-384 ECDSA in use — classical curve, not PQ-safe; \
+                     migrate to ML-DSA-87 per NIST CAC 2.0 roadmap by {}",
+                    CAC_LEGACY_RSA_SUNSET_EPOCH_SECS
+                );
+                Mechanism::Ecdsa
+            }
         };
 
         let signature = self

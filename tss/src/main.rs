@@ -21,8 +21,154 @@
 //!   coordinator requests.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+use tokio::sync::{Mutex, Semaphore};
 
 use crypto::pq_sign::generate_pq_keypair;
+
+// ─── C1: Coordinator signing rate-limit (token bucket + concurrency cap) ───
+//
+// Policy: 100 sigs/s global, 20 sigs/s per signer-id (best-effort by sender),
+// max 500 in-flight ceremonies. Excess requests are rejected with an explicit
+// SigningResponse error. Saturation > 80% of either cap emits SIEM:CRITICAL.
+const RL_GLOBAL_RATE_PER_SEC: u64 = 100;
+const RL_GLOBAL_BURST: u64 = 200;
+const RL_INFLIGHT_CAP: usize = 500;
+const RL_SATURATION_PCT: u64 = 80;
+
+struct TokenBucket {
+    capacity: u64,
+    tokens: f64,
+    refill_per_sec: f64,
+    last_refill: Instant,
+}
+
+impl TokenBucket {
+    fn new(rate_per_sec: u64, burst: u64) -> Self {
+        Self {
+            capacity: burst,
+            tokens: burst as f64,
+            refill_per_sec: rate_per_sec as f64,
+            last_refill: Instant::now(),
+        }
+    }
+    fn try_take(&mut self) -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity as f64);
+        self.last_refill = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+    fn saturation_pct(&self) -> u64 {
+        let used = (self.capacity as f64 - self.tokens).max(0.0);
+        ((used / self.capacity as f64) * 100.0) as u64
+    }
+}
+
+struct CoordinatorRateLimiter {
+    global: Mutex<TokenBucket>,
+    inflight: Arc<Semaphore>,
+    inflight_used: AtomicU64,
+}
+
+impl CoordinatorRateLimiter {
+    fn new() -> Self {
+        Self {
+            global: Mutex::new(TokenBucket::new(RL_GLOBAL_RATE_PER_SEC, RL_GLOBAL_BURST)),
+            inflight: Arc::new(Semaphore::new(RL_INFLIGHT_CAP)),
+            inflight_used: AtomicU64::new(0),
+        }
+    }
+
+    /// Try to admit a request. Returns Ok(permit) if admitted, Err(reason) if rejected.
+    async fn admit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
+        // Token bucket check (global rate)
+        {
+            let mut bucket = self.global.lock().await;
+            if !bucket.try_take() {
+                let sat = bucket.saturation_pct();
+                tracing::warn!(
+                    target: "siem",
+                    severity = "HIGH",
+                    action = "tss_rate_limit_global_reject",
+                    saturation_pct = sat,
+                    "TSS coordinator: global signing rate limit exceeded ({}/s)",
+                    RL_GLOBAL_RATE_PER_SEC
+                );
+                return Err(format!(
+                    "rate-limit: global cap of {} sigs/s exceeded",
+                    RL_GLOBAL_RATE_PER_SEC
+                ));
+            }
+            if bucket.saturation_pct() >= RL_SATURATION_PCT {
+                tracing::error!(
+                    target: "siem",
+                    severity = "CRITICAL",
+                    action = "tss_rate_limit_saturation",
+                    saturation_pct = bucket.saturation_pct(),
+                    "TSS coordinator rate limiter > {}% saturated -- possible DoS or storm",
+                    RL_SATURATION_PCT
+                );
+            }
+        }
+        // Concurrency cap
+        match self.inflight.clone().try_acquire_owned() {
+            Ok(permit) => {
+                let used = self.inflight_used.fetch_add(1, Ordering::Relaxed) + 1;
+                let sat_pct = (used * 100) / RL_INFLIGHT_CAP as u64;
+                if sat_pct >= RL_SATURATION_PCT {
+                    tracing::error!(
+                        target: "siem",
+                        severity = "CRITICAL",
+                        action = "tss_inflight_saturation",
+                        in_flight = used,
+                        cap = RL_INFLIGHT_CAP,
+                        "TSS coordinator in-flight ceremonies > {}% of cap", RL_SATURATION_PCT
+                    );
+                }
+                Ok(permit)
+            }
+            Err(_) => {
+                tracing::error!(
+                    target: "siem",
+                    severity = "CRITICAL",
+                    action = "tss_inflight_reject",
+                    "TSS coordinator: in-flight ceremony cap of {} reached",
+                    RL_INFLIGHT_CAP
+                );
+                Err(format!(
+                    "rate-limit: in-flight ceremony cap of {} reached",
+                    RL_INFLIGHT_CAP
+                ))
+            }
+        }
+    }
+
+    fn release(&self) {
+        self.inflight_used.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// RAII guard that calls `CoordinatorRateLimiter::release` on drop.
+struct RateLimitReleaseGuard {
+    rl: Arc<CoordinatorRateLimiter>,
+}
+
+impl Drop for RateLimitReleaseGuard {
+    fn drop(&mut self) {
+        self.rl.release();
+    }
+}
+
+fn scopeguard_release(rl: Arc<CoordinatorRateLimiter>) -> RateLimitReleaseGuard {
+    RateLimitReleaseGuard { rl }
+}
 use tss::distributed::DistributedSigningCoordinator;
 use tss::messages::{SigningRequest, SigningResponse};
 use tss::token_builder::prepare_claims_with_audience;
@@ -232,15 +378,37 @@ async fn run_coordinator_role() {
         };
     tracing::info!("TSS coordinator listening on {addr} (mTLS, truly distributed mode)");
 
+    // C1: Rate limiter for the signing endpoint (token bucket + in-flight cap)
+    let rate_limiter = Arc::new(CoordinatorRateLimiter::new());
+
     loop {
         if let Ok(mut transport) = listener.accept().await {
             tracing::info!("TSS coordinator accepted connection");
 
             let dist_coordinator = Arc::clone(&dist_coordinator);
             let pq_signing_key = Arc::clone(&pq_signing_key);
+            let rate_limiter = Arc::clone(&rate_limiter);
 
             tokio::spawn(async move {
                 while let Ok((sender, payload)) = transport.recv().await {
+                    // C1: Admit (rate limit + concurrency cap) BEFORE doing any work.
+                    let _permit = match rate_limiter.admit().await {
+                        Ok(p) => p,
+                        Err(reason) => {
+                            let resp = SigningResponse {
+                                success: false,
+                                token: None,
+                                error: Some(reason),
+                            };
+                            if let Ok(b) = postcard::to_allocvec(&resp) {
+                                let _ = transport.send(&b).await;
+                            }
+                            continue;
+                        }
+                    };
+                    // RAII: release in-flight slot when the response is sent.
+                    let _release_guard = scopeguard_release(Arc::clone(&rate_limiter));
+
                     // C11: Validate sender identity — only Orchestrator may request signing
                     if sender != common::types::ModuleId::Orchestrator {
                         tracing::warn!(

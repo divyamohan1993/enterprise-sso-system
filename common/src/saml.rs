@@ -3148,10 +3148,16 @@ fn inflate_raw(data: &[u8]) -> Result<String, String> {
         .map_err(|e| format!("inflate failed: {}", e))
 }
 
-/// SHA-1 hash (for SAML artifact source ID computation).
+/// FIPS-approved truncated hash for SAML artifact source ID computation.
+///
+/// The SAML 2.0 spec defines the artifact source_id as 20 bytes for routing,
+/// which historically used SHA-1. Under CNSA 2.0 / FIPS 140-3 SHA-1 is forbidden
+/// even for non-security purposes. We compute SHA-512 and truncate to the spec
+/// width (20 bytes) — FIPS 180-4 §7 explicitly permits truncation of an approved
+/// hash for cases where the output width is constrained by an external protocol.
 fn sha1_hash(data: &[u8]) -> [u8; 20] {
     use sha2::Digest;
-    let hash = sha2::Sha256::digest(data);
+    let hash = sha2::Sha512::digest(data);
     let mut result = [0u8; 20];
     result.copy_from_slice(&hash[..20]);
     result

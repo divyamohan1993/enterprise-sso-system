@@ -88,27 +88,25 @@ impl NonceBloomFilter {
 
     /// Compute k independent bit positions for a nonce using SipHash-style
     /// double hashing: h(i) = (h1 + i * h2) mod m
-    /// Uses SHA-512 for CNSA 2.0 compliance.
+    ///
+    /// Uses CSHAKE256 (SHA-3 family) with NIST SP 800-185 customization strings
+    /// for domain separation. CSHAKE256 is post-quantum-safe (no Grover speedup
+    /// matters for collision-resistance at 256-bit output) and aligns with the
+    /// CNSA 2.0 hash-agility direction. The XOF nature lets us derive both h1
+    /// and h2 from a single absorption pass.
     fn positions(nonce: &[u8; 32]) -> [usize; BLOOM_FILTER_K] {
-        use sha2::{Digest, Sha512};
+        use sha3::digest::{ExtendableOutput, Update, XofReader};
 
-        // First hash: SHA-512 of nonce
-        let mut hasher = Sha512::new();
-        hasher.update(b"MILNET-BLOOM-H1");
+        // Single CSHAKE256 absorption with the bloom-filter customization;
+        // we read 16 bytes of XOF output and split into h1 || h2.
+        let mut hasher = sha3::CShake256::new(b"MILNET-BLOOM-CSHAKE256-v1");
         hasher.update(nonce);
-        let h1_full = hasher.finalize();
-        let h1_bytes: [u8; 8] = h1_full[..8].try_into()
-            .map_err(|_| ()).unwrap_or([0u8; 8]);
-        let h1 = u64::from_le_bytes(h1_bytes) as usize;
+        let mut reader = hasher.finalize_xof();
+        let mut xof = [0u8; 16];
+        reader.read(&mut xof);
 
-        // Second hash: SHA-512 of nonce with different domain
-        let mut hasher = Sha512::new();
-        hasher.update(b"MILNET-BLOOM-H2");
-        hasher.update(nonce);
-        let h2_full = hasher.finalize();
-        let h2_bytes: [u8; 8] = h2_full[..8].try_into()
-            .map_err(|_| ()).unwrap_or([0u8; 8]);
-        let h2 = u64::from_le_bytes(h2_bytes) as usize;
+        let h1 = u64::from_le_bytes(xof[..8].try_into().unwrap_or([0u8; 8])) as usize;
+        let h2 = u64::from_le_bytes(xof[8..].try_into().unwrap_or([0u8; 8])) as usize;
 
         let mut positions = [0usize; BLOOM_FILTER_K];
         for i in 0..BLOOM_FILTER_K {
@@ -483,13 +481,17 @@ impl RatchetChain {
         }
 
         // --- Derive new chain key, mixing server_nonce into info ---
+        // Wrap intermediates in Zeroizing so that ANY error path scrubs the
+        // partially-computed key material before unwinding (A13). Without this,
+        // an attacker observing a panic / error path could potentially recover
+        // a leaked partial chain key from process memory.
         let hk = Hkdf::<Sha512>::new(Some(self.chain_key_ref()), domain::RATCHET_ADVANCE);
-        let mut info = Vec::with_capacity(96);
+        let mut info = zeroize::Zeroizing::new(Vec::<u8>::with_capacity(96));
         info.extend_from_slice(client_entropy);
         info.extend_from_slice(server_entropy);
         info.extend_from_slice(server_nonce);
-        let mut new_key = [0u8; 64];
-        hk.expand(&info, &mut new_key)
+        let mut new_key = zeroize::Zeroizing::new([0u8; 64]);
+        hk.expand(info.as_slice(), &mut new_key[..])
             .map_err(|_| RatchetError::ZeroEntropy("HKDF-SHA512 expand failed during chain advance".into()))?;
 
         // Unlock old key region before overwrite (will re-lock new data)
@@ -499,14 +501,13 @@ impl RatchetChain {
         }
 
         self.chain_key_mut().zeroize(); // securely erase old key
-        *self.chain_key_mut() = new_key;
+        *self.chain_key_mut() = *new_key;
         self.epoch += 1;
 
-        // Re-lock the new key
+        // Re-lock the new key. If lock_chain_key() fails, Zeroizing<...> drops
+        // above will still scrub `new_key` and `info` on the unwinding path.
         self.lock_chain_key()?;
 
-        info.zeroize();
-        new_key.zeroize();
         Ok(())
     }
 

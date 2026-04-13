@@ -341,7 +341,16 @@ fn append_checkpoint_to_file(path: &Path, cp: &WitnessCheckpoint) -> std::io::Re
         .open(path)?;
     file.write_all(&len.to_le_bytes())?;
     file.write_all(&encoded)?;
-    file.sync_data()?;
+    // SECURITY (D7): full fsync of the file AND parent directory. sync_data
+    // alone leaves metadata vulnerable to power-loss and the directory entry
+    // for newly created files may not be persisted otherwise.
+    file.sync_all()?;
+    drop(file);
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
     Ok(())
 }
 

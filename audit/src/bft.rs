@@ -1193,7 +1193,16 @@ fn append_entry_to_file(path: &std::path::Path, entry: &AuditEntry) -> std::io::
         .append(true)
         .open(path)?;
     writeln!(file, "{}", hex::encode(&blob))?;
-    file.sync_data()?;
+    // SECURITY (D7): full fsync — sync_data omits metadata which may leave
+    // the line lost after a power cut. Also fsync the parent directory so
+    // the directory entry update is persisted.
+    file.sync_all()?;
+    drop(file);
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
 
     // Zeroize key material
     let mut key = key;
@@ -1224,8 +1233,13 @@ fn load_entries_from_file(path: &std::path::Path, node_id: u8) -> Vec<AuditEntry
     use aes_gcm::aead::generic_array::GenericArray;
     let cipher = Aes256Gcm::new(GenericArray::from_slice(&key));
 
+    let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+
     let reader = BufReader::new(file);
     let mut entries = Vec::new();
+    let mut failures: usize = 0;
     for (line_num, line) in reader.lines().enumerate() {
         match line {
             Ok(text) => {
@@ -1233,32 +1247,75 @@ fn load_entries_from_file(path: &std::path::Path, node_id: u8) -> Vec<AuditEntry
                 if text.is_empty() {
                     continue;
                 }
-                // Try encrypted format first (hex-encoded nonce || ciphertext)
-                let parsed = hex::decode(&text)
-                    .ok()
-                    .and_then(|blob| {
-                        if blob.len() < 12 + 16 {
-                            return None; // Too short for nonce + tag
+                // SECURITY (D14): no `.ok()` swallowing — every failure is
+                // recorded, SIEM-flagged, and aborts the load in military mode
+                // so the system fails-closed on persistence corruption.
+                let blob = match hex::decode(&text) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        failures += 1;
+                        common::siem::SecurityEvent::tamper_detected(&format!(
+                            "BFT node {} line {}: hex decode failed: {}",
+                            node_id, line_num + 1, e
+                        ));
+                        if is_military {
+                            tracing::error!(
+                                "FATAL: BFT node {} hex decode failed in military mode -- aborting load",
+                                node_id
+                            );
+                            std::process::exit(199);
                         }
-                        let nonce = GenericArray::from_slice(&blob[..12]);
-                        let payload = aes_gcm::aead::Payload {
-                            msg: &blob[12..],
-                            aad: BFT_PERSIST_AAD,
-                        };
-                        cipher.decrypt(nonce, payload).ok()
-                    })
-                    .and_then(|plaintext| {
-                        serde_json::from_slice::<AuditEntry>(&plaintext).ok()
-                    });
-
-                // Fallback: try legacy plaintext JSON for migration
-                let entry = parsed.or_else(|| {
-                    tracing::warn!(
-                        "BFT node {}: line {} is not encrypted, attempting legacy plaintext parse",
-                        node_id, line_num + 1
-                    );
-                    serde_json::from_str::<AuditEntry>(&text).ok()
-                });
+                        continue;
+                    }
+                };
+                if blob.len() < 12 + 16 {
+                    failures += 1;
+                    common::siem::SecurityEvent::tamper_detected(&format!(
+                        "BFT node {} line {}: truncated record ({} bytes)",
+                        node_id, line_num + 1, blob.len()
+                    ));
+                    if is_military {
+                        std::process::exit(199);
+                    }
+                    continue;
+                }
+                let nonce = GenericArray::from_slice(&blob[..12]);
+                let payload = aes_gcm::aead::Payload {
+                    msg: &blob[12..],
+                    aad: BFT_PERSIST_AAD,
+                };
+                let plaintext = match cipher.decrypt(nonce, payload) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        failures += 1;
+                        common::siem::SecurityEvent::tamper_detected(&format!(
+                            "BFT node {} line {}: AES-GCM decrypt failed: {} -- TAMPER",
+                            node_id, line_num + 1, e
+                        ));
+                        if is_military {
+                            tracing::error!(
+                                "FATAL: BFT node {} AES-GCM decrypt failed in military mode -- aborting load",
+                                node_id
+                            );
+                            std::process::exit(199);
+                        }
+                        continue;
+                    }
+                };
+                let entry = match serde_json::from_slice::<AuditEntry>(&plaintext) {
+                    Ok(e) => Some(e),
+                    Err(e) => {
+                        failures += 1;
+                        common::siem::SecurityEvent::tamper_detected(&format!(
+                            "BFT node {} line {}: postdecrypt JSON parse failed: {}",
+                            node_id, line_num + 1, e
+                        ));
+                        if is_military {
+                            std::process::exit(199);
+                        }
+                        None
+                    }
+                };
 
                 match entry {
                     Some(e) => entries.push(e),
@@ -1288,6 +1345,13 @@ fn load_entries_from_file(path: &std::path::Path, node_id: u8) -> Vec<AuditEntry
 
     // Zeroize key material
     zeroize::Zeroize::zeroize(&mut key);
+
+    if failures > 0 {
+        tracing::error!(
+            "BFT node {}: loaded {} entries with {} record failures from {:?}",
+            node_id, entries.len(), failures, path
+        );
+    }
 
     entries
 }
