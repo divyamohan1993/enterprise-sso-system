@@ -95,11 +95,17 @@ impl NonceBloomFilter {
     /// CNSA 2.0 hash-agility direction. The XOF nature lets us derive both h1
     /// and h2 from a single absorption pass.
     fn positions(nonce: &[u8; 32]) -> [usize; BLOOM_FILTER_K] {
-        use sha3::digest::{ExtendableOutput, Update, XofReader};
+        use sha3::digest::{core_api::CoreWrapper, ExtendableOutput, Update, XofReader};
 
         // Single CSHAKE256 absorption with the bloom-filter customization;
         // we read 16 bytes of XOF output and split into h1 || h2.
-        let mut hasher = sha3::CShake256::new(b"MILNET-BLOOM-CSHAKE256-v1");
+        // sha3::CShake256 is CoreWrapper<CShake256Core>; construct the core
+        // with function_name=N=b"" and customization S, then wrap it.
+        let core = sha3::CShake256Core::new_with_function_name(
+            b"",
+            b"MILNET-BLOOM-CSHAKE256-v1",
+        );
+        let mut hasher: sha3::CShake256 = CoreWrapper::from_core(core);
         hasher.update(nonce);
         let mut reader = hasher.finalize_xof();
         let mut xof = [0u8; 16];
