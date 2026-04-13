@@ -102,22 +102,95 @@ pub fn validate_redirect_uri(
 
     // SECURITY: Enforce HTTPS for ALL redirect URIs — no exceptions.
     // Per OAuth 2.1 Section 1.4.1 and NIST SP 800-63B.
-    if !redirect_uri.starts_with("https://") {
+    if !redirect_uri.starts_with("https://") && !redirect_uri.starts_with("HTTPS://") {
         return Err("redirect_uri must use https://");
     }
 
-    // SECURITY: EXACT STRING MATCH against registered redirect URIs.
-    // No normalization, no wildcard expansion, no subdomain matching.
-    // Constant-time comparison to prevent timing side-channels on URI values.
-    let matched = registered_uris
-        .iter()
-        .any(|registered| crypto::ct::ct_eq(redirect_uri.as_bytes(), registered.as_bytes()));
+    // F16: Normalize both sides before comparison so that semantically
+    // identical URIs match (case differences in scheme/host, default port
+    // :443, fragment, percent-encoding case). Path/query are preserved
+    // byte-for-byte to keep comparison strict — only safe canonicalizations
+    // are applied.
+    let normalized_input = canonicalize_redirect_uri(redirect_uri)?;
+
+    let matched = registered_uris.iter().any(|registered| {
+        match canonicalize_redirect_uri(registered) {
+            Ok(reg) => crypto::ct::ct_eq(normalized_input.as_bytes(), reg.as_bytes()),
+            Err(_) => false,
+        }
+    });
 
     if matched {
         Ok(())
     } else {
-        Err("redirect_uri does not match any registered redirect URI (exact match required)")
+        Err("redirect_uri does not match any registered redirect URI (normalized exact match required)")
     }
+}
+
+/// Canonicalize a redirect URI for comparison.
+///
+/// Applied transformations (safe, lossless):
+/// - Lowercase the scheme and the host component
+/// - Strip the default HTTPS port (`:443`)
+/// - Strip URL fragment (`#...`) — never sent to the server per RFC 3986
+/// - Uppercase percent-encoded escape hex digits (`%2f` → `%2F`)
+///
+/// Path and query strings are otherwise preserved byte-for-byte.
+fn canonicalize_redirect_uri(uri: &str) -> Result<String, &'static str> {
+    // Strip fragment first.
+    let no_frag = match uri.find('#') {
+        Some(i) => &uri[..i],
+        None => uri,
+    };
+    // Locate scheme separator.
+    let scheme_end = no_frag.find("://").ok_or("redirect_uri missing scheme")?;
+    let scheme = &no_frag[..scheme_end];
+    let rest = &no_frag[scheme_end + 3..];
+    if scheme.is_empty() {
+        return Err("redirect_uri missing scheme");
+    }
+    // Split authority from path/query.
+    let (authority, path_q) = match rest.find(|c| c == '/' || c == '?') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    if authority.is_empty() {
+        return Err("redirect_uri missing host");
+    }
+    // Authority may contain userinfo @ host:port — userinfo is forbidden in
+    // redirect URIs (RFC 6749 §3.1.2), reject if present.
+    if authority.contains('@') {
+        return Err("redirect_uri must not contain userinfo");
+    }
+    // Lowercase authority then strip default :443.
+    let mut auth_lc = authority.to_ascii_lowercase();
+    if let Some(stripped) = auth_lc.strip_suffix(":443") {
+        auth_lc = stripped.to_string();
+    }
+    // Uppercase percent-encoded escape hex digits.
+    let path_q_norm = uppercase_pct_escapes(path_q);
+    let scheme_lc = scheme.to_ascii_lowercase();
+    Ok(format!("{scheme_lc}://{auth_lc}{path_q_norm}"))
+}
+
+fn uppercase_pct_escapes(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len()
+            && bytes[i + 1].is_ascii_hexdigit() && bytes[i + 2].is_ascii_hexdigit()
+        {
+            out.push('%');
+            out.push((bytes[i + 1] as char).to_ascii_uppercase());
+            out.push((bytes[i + 2] as char).to_ascii_uppercase());
+            i += 3;
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
 }
 
 // ── OAuth State Parameter CSRF Protection ──────────────────────────────────

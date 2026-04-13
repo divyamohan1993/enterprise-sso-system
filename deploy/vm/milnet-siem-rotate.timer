@@ -1,0 +1,15 @@
+# MILNET SIEM webhook token rotation alerter
+# Fires daily; the service unit checks /var/lib/milnet/siem-rotation.stamp
+# and pages on-call if the timestamp is older than 90 days.
+[Unit]
+Description=MILNET SIEM webhook rotation overdue check (daily)
+Documentation=file:///opt/milnet/runbooks/siem-webhook-rotate.md
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=900
+Unit=milnet-siem-rotate-check.service
+
+[Install]
+WantedBy=timers.target

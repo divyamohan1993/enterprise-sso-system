@@ -16,7 +16,7 @@ fn fresh_nonce() -> [u8; 32] {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
+    #![proptest_config(ProptestConfig::with_cases(1000))] // I20
     #[test] fn advance_diff(ms in prop::array::uniform32(any::<u8>()).prop_map(|h| { let mut f=[0u8;64]; f[..32].copy_from_slice(&h); f[32..].copy_from_slice(&h); f })) {
         let ce = quality_entropy();
         let se = quality_entropy();

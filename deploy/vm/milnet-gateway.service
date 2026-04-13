@@ -32,7 +32,8 @@ LimitNOFILE=65536
 LimitMEMLOCK=infinity
 
 # Allow binding to privileged port if fronted by iptables redirect
-AmbientCapabilities=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_IPC_LOCK
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_IPC_LOCK
 
 # Security hardening
 ProtectSystem=strict

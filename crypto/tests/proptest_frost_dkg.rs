@@ -2,7 +2,9 @@ use proptest::prelude::*;
 use crypto::threshold::{dkg_distributed, threshold_sign_with_indices, verify_group_signature};
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(8))]
+    // I20: 1000 cases. Custom strategies must respect FROST t-of-n bounds
+    // (3-of-5 minimum threshold honoured by the existing strategies below).
+    #![proptest_config(ProptestConfig::with_cases(1000))]
 
     /// Any t-subset of n shares can produce a valid signature.
     #[test]

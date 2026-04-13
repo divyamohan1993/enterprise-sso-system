@@ -1,0 +1,20 @@
+# MILNET SSO — Canonical SSH host key fingerprints
+#
+# This file is the trust anchor for SSH connections during VM provisioning.
+# StrictHostKeyChecking=yes is enforced by deploy/vm/provision.sh — TOFU
+# (accept-new) is forbidden to prevent MITM during first-contact bootstrap.
+#
+# POPULATION PROCESS (golden-image build pipeline):
+#   1. During VM image bake, the build host runs:
+#        ssh-keyscan -t ed25519,rsa,ecdsa <vm-ip> >> known_hosts.seed
+#      from inside the trusted build network where the new image's host keys
+#      are computed deterministically by cloud-init / Packer.
+#   2. The Packer build job signs this file with the build CA key:
+#        cosign sign-blob --key cosign.key known_hosts.seed
+#   3. Operators verify the cosign signature before running provision.sh.
+#
+# Format: one host per line —
+#   <ip-or-hostname> ssh-ed25519 AAAAC3Nz...
+#
+# DO NOT add entries here by hand from a live VM — that defeats the purpose.
+# Entries MUST come from the golden-image build process or the bake-time CA.

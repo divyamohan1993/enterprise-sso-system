@@ -3,13 +3,16 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'nonce-MILNET2025'; style-src 'self' 'nonce-MILNET2025' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'">
+<!-- Authoritative CSP is set by the server response header, with a per-request
+     random nonce. The meta tag is intentionally NOT used so it cannot weaken
+     the deployed policy. -->
 <meta http-equiv="X-Content-Type-Options" content="nosniff">
 <meta name="referrer" content="strict-origin-when-cross-origin">
 <title>MILNET SSO // Admin Console</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet" crossorigin="anonymous">
-<style nonce="MILNET2025">
+<!-- E13: External font CDN removed. Fonts are vendored locally under
+     /fonts/ with the strict same-origin CSP enforced by the server. -->
+<link rel="stylesheet" href="/fonts/jetbrains-mono.css">
+<style nonce="{{CSP_NONCE}}">
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   :root {
     --bg: #0a0a0a; --bg2: #111; --bg3: #1a1a1a; --bg4: #141414; --border: #222; --border-light: #2a2a2a;
@@ -1058,7 +1061,7 @@
 
 <div class="toast" id="toast"></div>
 
-<script nonce="MILNET2025">
+<script nonce="{{CSP_NONCE}}">
 // ══════════════════════════════════════════════════════════════════════════════
 // CLIENT-SIDE PASSWORD HASHING
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1120,10 +1123,13 @@ function clearTerm(termId) {
 
 async function api(path, opts) {
   opts = opts || {};
-  var headers = Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {});
-  var token = authToken || localStorage.getItem('authToken') || localStorage.getItem('adminKey');
-  if (token) headers['Authorization'] = 'Bearer ' + token;
-  var resp = await fetch('/api' + path, Object.assign({}, opts, { headers: headers }));
+  // E17: charset must be explicit so middleware accepts the request.
+  var headers = Object.assign({ 'Content-Type': 'application/json; charset=utf-8' }, opts.headers || {});
+  // E1: rely on the __Host-milnet-auth httpOnly cookie via credentials:'include'.
+  // No localStorage read — tokens are NEVER exposed to JS. Bearer header is
+  // only added if an in-memory authToken exists for CLI/non-browser usage.
+  if (authToken) headers['Authorization'] = 'Bearer ' + authToken;
+  var resp = await fetch('/api' + path, Object.assign({}, opts, { headers: headers, credentials: 'include' }));
   var body;
   try { body = await resp.json(); } catch(e) { body = {}; }
   if (!resp.ok) { var err = new Error(body.message || body.error || 'Request failed'); err.status = resp.status; err.body = body; throw err; }
@@ -1412,7 +1418,7 @@ async function doLogin() {
     });
 
     authToken = data.token || data.access_token;
-    localStorage.setItem('authToken', authToken);
+    /* E1: token persistence removed — server set httpOnly cookie. */
     if (!authToken) throw new Error('No token in response');
 
     tokenClaims = decodeJwtPayload(authToken) || {};
@@ -2293,7 +2299,7 @@ async function doRecovery() {
 
     authToken = data.token || data.access_token;
     if (authToken) {
-      localStorage.setItem('authToken', authToken);
+      /* E1: token persistence removed — server set httpOnly cookie. */
       tokenClaims = decodeJwtPayload(authToken) || {};
       if (!tokenClaims.tier && data.tier) tokenClaims.tier = data.tier;
       if (!tokenClaims.username && data.username) tokenClaims.username = data.username;
@@ -2660,7 +2666,7 @@ async function doPasskeyLogin() {
     if (verifyData.success) {
       authToken = verifyData.token || verifyData.access_token;
       if (authToken) {
-        localStorage.setItem('authToken', authToken);
+        /* E1: token persistence removed — server set httpOnly cookie. */
         tokenClaims = decodeJwtPayload(authToken) || {};
         if (!tokenClaims.tier && verifyData.tier) tokenClaims.tier = verifyData.tier;
         if (!tokenClaims.username) tokenClaims.username = user;
@@ -2924,9 +2930,8 @@ async function doSetup() {
     termLog(term, '', '');
     termLog(term, '> Redirecting to login...', 'prompt');
 
-    if (data.admin_api_key) {
-      localStorage.setItem('adminKey', data.admin_api_key);
-    }
+    /* E1: admin API key MUST NOT be persisted in localStorage where any XSS
+       can exfiltrate it. Display once, operator copies to a secrets vault. */
 
     showToast('System initialized. Redirecting to login...');
     setTimeout(function() { showLogin(); }, 3000);

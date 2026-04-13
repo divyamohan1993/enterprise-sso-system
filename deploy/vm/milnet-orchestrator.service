@@ -31,6 +31,8 @@ CPUQuota=200%
 TasksMax=512
 LimitNOFILE=65536
 LimitMEMLOCK=infinity
+AmbientCapabilities=CAP_IPC_LOCK
+CapabilityBoundingSet=CAP_IPC_LOCK
 
 # Security hardening (STIG-compliant)
 ProtectSystem=strict

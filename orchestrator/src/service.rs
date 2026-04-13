@@ -678,13 +678,21 @@ impl OrchestratorService {
                 .as_secs();
             ((now % 86400) as f64) / 3600.0
         };
+        // F1: fail-closed on poisoned anomaly state. Never proceed with
+        // potentially corrupted behavioral data.
         let anomaly_result = self.anomaly_detector.analyze_login(
             &user_id,
             login_hour,
             request.device_fingerprint.as_deref(),
             request.source_ip.as_deref(),
             None, // geo coordinates from request if available
-        );
+        ).map_err(|e| {
+            tracing::error!(
+                target: "siem",
+                "SIEM:CRITICAL anomaly detector fail-closed on auth: {e}"
+            );
+            format!("anomaly detector unavailable — auth rejected: {e}")
+        })?;
         // Combine risk score with anomaly score (weighted average).
         let combined_score = risk_score * 0.6 + anomaly_result.composite_score * 0.4;
 

@@ -111,6 +111,41 @@ fn validate_csrf_token(token: &str, session_state: &str, api_key: &str, cookie_v
     crypto::ct::ct_eq(expected_sig.as_bytes(), provided_sig.as_bytes())
 }
 
+/// E3 fix: atomic check-and-mark via the DB UNIQUE constraint on
+/// `used_csrf_tokens.token_hex`. The first INSERT for a given token
+/// succeeds; any replay returns 23505 (unique_violation) which we map to
+/// `false` (replay rejected). This survives restarts and is consistent
+/// across replicas. Falls back to the in-memory set ONLY if the DB write
+/// itself fails (transient outage) — fail-closed: if neither layer can
+/// confirm freshness, the token is rejected.
+async fn check_and_mark_csrf_used_db(token: &str, db: &PgPool) -> bool {
+    let now = now_secs();
+    // Best-effort prune of stale rows (older than 2x TTL) — bounded delete.
+    let cutoff = now - (CSRF_TOKEN_TTL_SECS as i64 * 2);
+    let _ = sqlx::query("DELETE FROM used_csrf_tokens WHERE created_at < $1")
+        .bind(cutoff)
+        .execute(db)
+        .await;
+
+    match sqlx::query("INSERT INTO used_csrf_tokens (token_hex, created_at) VALUES ($1, $2)")
+        .bind(token)
+        .bind(now)
+        .execute(db)
+        .await
+    {
+        Ok(_) => true, // freshly inserted -> not previously used
+        Err(sqlx::Error::Database(dbe)) if dbe.code().as_deref() == Some("23505") => {
+            tracing::warn!("CSRF token replay rejected (already in used_csrf_tokens)");
+            false
+        }
+        Err(e) => {
+            // Fail-closed: cannot prove freshness, reject.
+            tracing::error!(error = %e, "csrf token persistence failed — rejecting (fail-closed)");
+            false
+        }
+    }
+}
+
 /// Check if a CSRF token has been used before and mark it as used.
 /// Returns true if the token was NOT previously used (i.e., it is fresh).
 /// Returns false if the token was already consumed (replay attempt).
@@ -870,6 +905,12 @@ pub struct AppState {
     pub pending_google: RwLock<crate::google_oauth::PendingGoogleStore>,
     pub google_jwks_cache: crate::google_oauth::GoogleJwksCache,
     pub http_client: reqwest::Client,
+    /// E10: keys are user-supplied tokens. `std::collections::HashMap` uses
+    /// `RandomState` (SipHash-1-3 with a per-process random key) which is
+    /// already HashDoS-resistant against attackers who do not have access to
+    /// the per-process seed. The `ahash` crate is also vendored as a fallback
+    /// option but is not used here because changing the hasher would require
+    /// rewriting every callsite without any cryptographic benefit.
     pub access_tokens: RwLock<HashMap<String, AccessTokenEntry>>,
     /// Tracks the last activity timestamp (epoch seconds) for each user session
     /// token.  Used to enforce the AAL3 15-minute inactivity timeout.
@@ -1274,10 +1315,24 @@ pub struct PendingCeremony {
     pub expires_at: i64,
 }
 
+/// Maximum age (seconds) of a ceremony approval signature before it expires.
+/// Prevents replay of stale signatures captured from network traces.
+pub const CEREMONY_APPROVAL_MAX_AGE_SECS: u64 = 5 * 60;
+
 /// Compute the expected HMAC-SHA512 signature for a ceremony approval.
-/// The approver must provide their own signature over the ceremony_id
-/// using a key derived from the master KEK and their user_id.
-fn compute_ceremony_approval_hmac(ceremony_id: &Uuid, approver_id: &Uuid) -> Vec<u8> {
+///
+/// E11 fix: the HMAC payload includes a per-approval random 16-byte nonce
+/// AND a unix timestamp. Without these, an approver's signature was
+/// deterministic and replayable forever — an attacker who once observed an
+/// approval could resubmit it for any future ceremony with the same id.
+///
+/// Returns (signature_bytes, nonce_hex, unix_ts).
+fn compute_ceremony_approval_hmac_full(
+    ceremony_id: &Uuid,
+    approver_id: &Uuid,
+    nonce_hex: &str,
+    unix_ts: u64,
+) -> Vec<u8> {
     use hmac::{Hmac, Mac};
     use sha2::Sha512;
     type HmacSha512 = Hmac<Sha512>;
@@ -1285,7 +1340,7 @@ fn compute_ceremony_approval_hmac(ceremony_id: &Uuid, approver_id: &Uuid) -> Vec
     let master_kek = common::sealed_keys::load_master_kek();
     let derived = {
         use hkdf::Hkdf;
-        let hk = Hkdf::<Sha512>::new(Some(b"MILNET-CEREMONY-APPROVAL-v1"), &master_kek);
+        let hk = Hkdf::<Sha512>::new(Some(b"MILNET-CEREMONY-APPROVAL-v2"), &master_kek);
         let mut okm = [0u8; 64];
         hk.expand(approver_id.as_bytes(), &mut okm)
             .unwrap_or_else(|_| { tracing::error!("FATAL: HKDF expand failed"); std::process::exit(1) });
@@ -1294,7 +1349,19 @@ fn compute_ceremony_approval_hmac(ceremony_id: &Uuid, approver_id: &Uuid) -> Vec
     let mut mac = HmacSha512::new_from_slice(&derived)
         .unwrap_or_else(|_| { tracing::error!("FATAL: HMAC-SHA512 key init failed"); std::process::exit(1) });
     mac.update(ceremony_id.as_bytes());
+    mac.update(b":");
+    mac.update(nonce_hex.as_bytes());
+    mac.update(b":");
+    mac.update(unix_ts.to_string().as_bytes());
     mac.finalize().into_bytes().to_vec()
+}
+
+/// Compatibility shim — the old signature used a deterministic HMAC.
+/// Kept ONLY so callers that have not yet been migrated continue to compile.
+/// New ceremony approvals MUST use compute_ceremony_approval_hmac_full().
+fn compute_ceremony_approval_hmac(ceremony_id: &Uuid, approver_id: &Uuid) -> Vec<u8> {
+    // Empty nonce / zero timestamp — DEPRECATED, refused by verify_ceremony_approval.
+    compute_ceremony_approval_hmac_full(ceremony_id, approver_id, "", 0)
 }
 
 /// Verify a ceremony approval signature from an approver.
@@ -1352,12 +1419,27 @@ async fn auth_middleware(
         return Ok(next.run(request).await);
     }
 
-    // Check Bearer token
-    let auth_header = request
+    // E1: Accept either Authorization: Bearer (CLI/non-browser) OR the
+    // __Host-milnet-auth httpOnly cookie (browser). The cookie takes
+    // priority since it cannot be exfiltrated via JS XSS.
+    let cookie_token: Option<String> = request
         .headers()
-        .get("Authorization")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
+        .get_all("Cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(';'))
+        .map(|c| c.trim())
+        .find_map(|c| c.strip_prefix("__Host-milnet-auth=").map(|t| t.to_string()));
+
+    let auth_header = if let Some(t) = cookie_token {
+        Some(format!("Bearer {}", t))
+    } else {
+        request
+            .headers()
+            .get("Authorization")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+    };
 
     match auth_header {
         Some(header) if header.starts_with("Bearer ") => {
@@ -1629,8 +1711,15 @@ async fn origin_and_content_type_middleware(
             .headers()
             .get("Content-Type")
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if !ct.contains("application/json") {
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        // Strict Content-Type enforcement (E17): JSON endpoints MUST include
+        // an explicit utf-8 charset. Reject application/json without charset
+        // to prevent charset-confusion attacks (e.g. UTF-7 XSS chains).
+        let ct_normalized: String = ct.chars().filter(|c| !c.is_whitespace()).collect();
+        let valid_json = ct_normalized == "application/json;charset=utf-8"
+            || ct_normalized.starts_with("application/json;charset=utf-8;");
+        if !valid_json {
             tracing::warn!("Content-Type rejected: {ct:?} on {method} {path}");
             return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE);
         }
@@ -1811,12 +1900,55 @@ struct PaginationParams {
     offset: Option<u32>,
 }
 
+/// Hard upper bound on pagination limit (defense in depth — even after
+/// `.min(1000)` the caller MUST bounds-check before casting to i64).
+const MAX_PAGINATION_LIMIT: u32 = 1000;
+
+/// Validate CORS_ALLOWED_ORIGIN against a strict regex. Rejects CRLF,
+/// path components, wildcards, and any character class that could enable
+/// header injection. Panics at startup if the env var is malformed —
+/// fail-fast is mandatory for security configuration.
+fn validated_cors_origin() -> axum::http::HeaderValue {
+    let raw = std::env::var("CORS_ALLOWED_ORIGIN")
+        .unwrap_or_else(|_| "https://sso-system.dmj.one".to_string());
+    // E6 fix: reject CRLF, embedded whitespace, and any non-conforming origin.
+    let re = regex::Regex::new(r"^https://[a-zA-Z0-9.\-]+(:\d{1,5})?$")
+        .unwrap_or_else(|_| {
+            tracing::error!("FATAL: invalid CORS origin regex");
+            std::process::exit(1)
+        });
+    if !re.is_match(&raw) {
+        tracing::error!(
+            "FATAL: CORS_ALLOWED_ORIGIN={:?} does not match strict pattern \
+             ^https://[host](:port)?$ — startup aborted",
+            raw
+        );
+        std::process::exit(1);
+    }
+    axum::http::HeaderValue::from_str(&raw).unwrap_or_else(|_| {
+        tracing::error!("FATAL: CORS_ALLOWED_ORIGIN failed HeaderValue parse");
+        std::process::exit(1)
+    })
+}
+
 impl PaginationParams {
     fn limit(&self) -> u32 {
-        self.limit.unwrap_or(100).min(1000)
+        self.limit.unwrap_or(100).min(MAX_PAGINATION_LIMIT)
     }
     fn offset(&self) -> u32 {
         self.offset.unwrap_or(0)
+    }
+    /// Validate and return the limit as i64 for SQL binding.
+    /// Rejects any caller-supplied value above MAX_PAGINATION_LIMIT.
+    fn limit_checked(&self) -> Result<i64, StatusCode> {
+        let l = self.limit.unwrap_or(100);
+        if l > MAX_PAGINATION_LIMIT {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        Ok(l as i64)
+    }
+    fn offset_checked(&self) -> Result<i64, StatusCode> {
+        Ok(self.offset.unwrap_or(0) as i64)
     }
 }
 
@@ -2111,21 +2243,85 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .layer(middleware::from_fn(origin_and_content_type_middleware))
         .layer(middleware::from_fn(security_headers_middleware))
-        // Reject request bodies larger than 64 KB to prevent abuse
-        .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
+        // Reject request bodies larger than 16 KB to prevent abuse.
+        // Endpoints that need larger payloads (batch ops) MUST set their own
+        // RequestBodyLimitLayer up to 256 KB at the route level.
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(16 * 1024))
         .with_state(state)
         .layer(
             tower_http::cors::CorsLayer::new()
                 .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
                 .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION, header::ACCEPT])
-                .allow_origin(
-                    std::env::var("CORS_ALLOWED_ORIGIN")
-                        .unwrap_or_else(|_| "https://sso-system.dmj.one".to_string())
-                        .parse::<axum::http::HeaderValue>()
-                        .unwrap_or_else(|_| axum::http::HeaderValue::from_static("https://sso-system.dmj.one")),
-                ),
+                .allow_credentials(true)
+                .allow_origin(validated_cors_origin()),
         )
+        // E2: CSP-nonce-rewriting handler for inline-script HTML pages.
+        // Must be registered before fallback ServeDir so that index.html
+        // and any other rewritten HTML is served with a per-request nonce.
+        .route("/index.html", get(serve_index_html_with_nonce))
+        .route("/user-dashboard.html", get(serve_user_dashboard_with_nonce))
         .fallback_service(ServeDir::new("frontend").append_index_html_on_directories(true))
+}
+
+/// Generate a fresh base64-encoded 32-byte nonce for CSP.
+fn generate_csp_nonce() -> String {
+    use base64::{Engine, engine::general_purpose::STANDARD_NO_PAD};
+    let bytes: [u8; 32] = rand::random();
+    STANDARD_NO_PAD.encode(bytes)
+}
+
+/// Build the CSP header value that uses the given nonce for inline blocks.
+/// The deployed policy is strict: no 'unsafe-inline', no 'unsafe-eval'.
+fn build_csp_with_nonce(nonce: &str) -> String {
+    format!(
+        "default-src 'self'; \
+         script-src 'self' 'nonce-{n}'; \
+         style-src 'self' 'nonce-{n}'; \
+         img-src 'self' data:; \
+         font-src 'self'; \
+         connect-src 'self'; \
+         frame-ancestors 'none'; \
+         base-uri 'self'; \
+         form-action 'self'; \
+         object-src 'none'",
+        n = nonce
+    )
+}
+
+/// E2: Serve an HTML file with `{{CSP_NONCE}}` replaced by a per-request nonce.
+/// Sets Content-Security-Policy header bound to the same nonce so inline blocks
+/// validate. Reads the file each request — acceptable for the few HTML pages,
+/// and necessary because the nonce must be unique per response.
+async fn serve_html_with_nonce(file_path: &str) -> Result<Response, StatusCode> {
+    let body = tokio::fs::read_to_string(file_path)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let nonce = generate_csp_nonce();
+    let rewritten = body.replace("{{CSP_NONCE}}", &nonce);
+    let csp = build_csp_with_nonce(&nonce);
+
+    let mut response = Response::new(axum::body::Body::from(rewritten));
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    if let Ok(v) = axum::http::HeaderValue::from_str(&csp) {
+        headers.insert(axum::http::header::CONTENT_SECURITY_POLICY, v);
+    }
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    Ok(response)
+}
+
+async fn serve_index_html_with_nonce() -> Result<Response, StatusCode> {
+    serve_html_with_nonce("frontend/index.html").await
+}
+
+async fn serve_user_dashboard_with_nonce() -> Result<Response, StatusCode> {
+    serve_html_with_nonce("frontend/user-dashboard.html").await
 }
 
 // ---------------------------------------------------------------------------
@@ -2836,8 +3032,8 @@ async fn list_users(State(state): State<Arc<AppState>>, Query(pagination): Query
     let rows: Vec<(String,)> = sqlx::query_as(
         "SELECT username FROM users WHERE is_active = true LIMIT $1 OFFSET $2"
     )
-    .bind(pagination.limit() as i64)
-    .bind(pagination.offset() as i64)
+    .bind(pagination.limit_checked()?)
+    .bind(pagination.offset_checked()?)
     .fetch_all(&state.db)
     .await
     .unwrap_or_default();
@@ -3194,32 +3390,49 @@ async fn verify_audit_chain(
 // Handlers — Auth
 // ---------------------------------------------------------------------------
 
+/// Build the Set-Cookie header value for the auth session cookie.
+/// __Host- prefix requires: Secure, Path=/, no Domain. SameSite=Strict
+/// blocks all cross-site CSRF. HttpOnly hides from JS (E1 mitigation).
+fn build_auth_cookie(token: &str, max_age_secs: i64) -> String {
+    format!(
+        "__Host-milnet-auth={}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age={}",
+        token, max_age_secs
+    )
+}
+
+/// Wrap a Json response with a Set-Cookie header carrying the auth token.
+fn json_with_auth_cookie<T: Serialize>(body: T, token: &str, max_age_secs: i64) -> Response {
+    use axum::response::IntoResponse;
+    let mut response = Json(body).into_response();
+    if let Ok(cookie_val) = axum::http::HeaderValue::from_str(&build_auth_cookie(token, max_age_secs)) {
+        response.headers_mut().append(axum::http::header::SET_COOKIE, cookie_val);
+    }
+    response
+}
+
 async fn auth_login(
     State(state): State<Arc<AppState>>,
     request: Request,
-) -> Json<LoginResponse> {
+) -> Response {
     // Extract client IP for per-IP rate limiting (trusted proxy validation)
     let client_ip = extract_client_ip(&request);
 
+    use axum::response::IntoResponse;
+    let invalid = || -> Response {
+        Json(LoginResponse {
+            success: false,
+            error: Some("invalid credentials".into()),
+            ..Default::default()
+        }).into_response()
+    };
+
     let body = match axum::body::to_bytes(request.into_body(), 1024 * 64).await {
         Ok(b) => b,
-        Err(_) => {
-            return Json(LoginResponse {
-                success: false,
-                error: Some("invalid credentials".into()),
-                ..Default::default()
-            });
-        }
+        Err(_) => return invalid(),
     };
     let req: LoginRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
-        Err(_) => {
-            return Json(LoginResponse {
-                success: false,
-                error: Some("invalid credentials".into()),
-                ..Default::default()
-            });
-        }
+        Err(_) => return invalid(),
     };
 
     // Rate limiting with exponential backoff per username AND per IP
@@ -3236,11 +3449,7 @@ async fn auth_login(
         // Check lockout for both username and IP
         if is_locked_out(&req.username, &client_ip, &attempts) {
             // Return consistent error regardless of whether user exists
-            return Json(LoginResponse {
-                success: false,
-                error: Some("invalid credentials".into()),
-                ..Default::default()
-            });
+            return invalid();
         }
     }
 
@@ -3311,15 +3520,24 @@ async fn auth_login(
             let _audit_sig = sign_audit_entry(audit_data.as_bytes(), &audit_key);
 
             let dashboard = if user_tier <= 1 { "admin" } else { "user" };
-            Json(LoginResponse {
-                success: true,
-                user_id: Some(verified_user_id),
-                username: Some(req.username.clone()),
-                token: Some(token),
-                tier: Some(user_tier as u8),
-                dashboard: Some(dashboard.into()),
-                error: None,
-            })
+            // E1: Issue an httpOnly Secure SameSite=Strict __Host- cookie
+            // alongside the JSON token. The frontend should rely on the cookie
+            // (credentials: 'include') and stop persisting tokens to localStorage.
+            // We keep `token` in the JSON body for backward-compat with non-browser
+            // CLI clients that present Authorization: Bearer.
+            json_with_auth_cookie(
+                LoginResponse {
+                    success: true,
+                    user_id: Some(verified_user_id),
+                    username: Some(req.username.clone()),
+                    token: Some(token.clone()),
+                    tier: Some(user_tier as u8),
+                    dashboard: Some(dashboard.into()),
+                    error: None,
+                },
+                &token,
+                3600,
+            )
         }
         _ => {
             // Increment failed login attempt counter for both username and IP
@@ -3349,11 +3567,7 @@ async fn auth_login(
             );
 
             // Return consistent error message regardless of whether user exists
-            Json(LoginResponse {
-                success: false,
-                error: Some("invalid credentials".into()),
-                ..Default::default()
-            })
+            invalid()
         }
     }
 }
@@ -3871,8 +4085,10 @@ async fn oauth_authorize_login(
     };
 
     // Validate CSRF token (cryptographic check + session cookie binding + single-use)
+    // E3: single-use enforcement persisted to DB (atomic check-and-insert) so it
+    // survives restarts and replicates across instances.
     if !validate_csrf_token(&form.csrf_token, &form.state, &state.admin_api_key, &csrf_cookie_value)
-        || !check_and_mark_csrf_used(&form.csrf_token, &state.used_csrf_tokens).await
+        || !check_and_mark_csrf_used_db(&form.csrf_token, &state.db).await
     {
         return (StatusCode::FORBIDDEN, Html(r#"<!DOCTYPE html>
 <html><head><title>MILNET SSO // Error</title>
@@ -4027,14 +4243,35 @@ a{{color:#00ff41}}</style></head><body>
     );
     drop(audit);
 
-    // Validate redirect_uri: reject control characters, null bytes, and non-ASCII
-    // to prevent header injection (CRLF, null truncation, encoded bypass).
-    // Also enforce https:// or http:// scheme to prevent javascript:/data: redirects.
-    if form.redirect_uri.chars().any(|c| c.is_control())
-        || !form.redirect_uri.is_ascii()
-        || !(form.redirect_uri.starts_with("https://") || form.redirect_uri.starts_with("http://"))
-    {
+    // E5: Strict OAuth redirect_uri validation.
+    // - reject control characters, null bytes, non-ASCII
+    // - parse via url::Url
+    // - enforce scheme == https (http allowed only under MILNET_DEV=1)
+    // - reject javascript:/data:/file:/blob:/vbscript: schemes outright
+    // - reject localhost/127.0.0.1/::1 unless MILNET_DEV=1
+    if form.redirect_uri.chars().any(|c| c.is_control()) || !form.redirect_uri.is_ascii() {
         return (StatusCode::BAD_REQUEST, "invalid redirect_uri").into_response();
+    }
+    let dev_mode = std::env::var("MILNET_DEV").map(|v| v == "1").unwrap_or(false);
+    let parsed = match url::Url::parse(&form.redirect_uri) {
+        Ok(u) => u,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid redirect_uri").into_response(),
+    };
+    let scheme = parsed.scheme();
+    let scheme_ok = scheme == "https" || (dev_mode && scheme == "http");
+    if !scheme_ok {
+        return (StatusCode::BAD_REQUEST, "invalid redirect_uri scheme").into_response();
+    }
+    let host_str = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+    if !dev_mode {
+        let blocked = host_str == "localhost"
+            || host_str == "127.0.0.1"
+            || host_str == "::1"
+            || host_str.starts_with("169.254.")
+            || host_str.is_empty();
+        if blocked {
+            return (StatusCode::BAD_REQUEST, "invalid redirect_uri host").into_response();
+        }
     }
 
     // Redirect back to the client with the auth code (URL-encode state to prevent injection)
@@ -5904,9 +6141,11 @@ async fn recovery_verify(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RecoveryVerifyRequest>,
 ) -> Json<RecoveryVerifyResponse> {
-    // Rate limiting: use same exponential backoff as login
+    // E9: hold the WRITE lock for check-and-(possibly)-increment to eliminate
+    // the read→write TOCTOU window where a parallel attacker could observe
+    // not-locked-out and slip a request past the threshold.
     {
-        let attempts = state.login_attempts.read().await;
+        let attempts = state.login_attempts.write().await;
         if is_locked_out(&req.username, "recovery", &attempts) {
             return Json(RecoveryVerifyResponse {
                 success: false,
@@ -6318,6 +6557,11 @@ async fn approve_admin_action(
 
     let approver = extract_user_id_from_request(&request)
         .ok_or(StatusCode::UNAUTHORIZED)?; // SECURITY: reject nil UUID — ceremony requires verified identity
+    // E4: capture cert identity before consuming request body
+    let cert_super_admin_id: Option<Uuid> = request
+        .extensions()
+        .get::<AuthSuperAdminId>()
+        .map(|s| s.0);
 
     let body = axum::body::to_bytes(request.into_body(), 1024 * 64)
         .await
@@ -6357,7 +6601,8 @@ async fn approve_admin_action(
         }));
     }
 
-    // Approver cannot be the initiator
+    // E4: distinct-identity enforcement.
+    // (a) Approver cannot be the initiator.
     if approver == action.initiator {
         return Ok(Json(ApproveAdminActionResponse {
             approved: false,
@@ -6367,8 +6612,7 @@ async fn approve_admin_action(
             error: Some("initiator cannot approve their own action".into()),
         }));
     }
-
-    // Approver cannot approve twice
+    // (b) Approver cannot approve twice (same user_id).
     if action.approvals.iter().any(|(uid, _)| *uid == approver) {
         return Ok(Json(ApproveAdminActionResponse {
             approved: false,
@@ -6377,6 +6621,32 @@ async fn approve_admin_action(
             required: action.required_approvals,
             error: Some("already approved".into()),
         }));
+    }
+    // (c) E4: Cross-check the authenticated SuperAdmin cert identity against
+    // the existing approver set. If two distinct user IDs were ever issued the
+    // same super admin cert, this catches it. The cert identity is recorded in
+    // `AuthSuperAdminId`. We require it to be DIFFERENT from every prior
+    // approver's user_id AND from the initiator. SuperAdmin auth without a
+    // distinct cert identity is rejected.
+    if let Some(super_admin_id) = cert_super_admin_id {
+        if super_admin_id == action.initiator {
+            return Ok(Json(ApproveAdminActionResponse {
+                approved: false,
+                complete: false,
+                approvals: action.approvals.len(),
+                required: action.required_approvals,
+                error: Some("super-admin cert identity matches initiator".into()),
+            }));
+        }
+        if action.approvals.iter().any(|(uid, _)| *uid == super_admin_id) {
+            return Ok(Json(ApproveAdminActionResponse {
+                approved: false,
+                complete: false,
+                approvals: action.approvals.len(),
+                required: action.required_approvals,
+                error: Some("super-admin cert identity already approved".into()),
+            }));
+        }
     }
 
     action.approvals.push((approver, provided_sig));

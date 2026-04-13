@@ -1,0 +1,31 @@
+/* E13: locally-served font face. Replace the woff2 files under
+   /frontend/fonts/ with the JetBrains Mono binaries from the upstream
+   release at https://www.jetbrains.com/lp/mono/ at deploy time. The
+   files are intentionally not committed because they are large binary
+   assets; the build pipeline must populate them before serving.
+
+   Until binaries are populated, the @font-face will fail and the page
+   will render with the system monospace fallback (Fira Code, monospace).
+   This is by design: the page MUST work without external network access. */
+
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('/fonts/JetBrainsMono-Regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('/fonts/JetBrainsMono-SemiBold.woff2') format('woff2');
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('/fonts/JetBrainsMono-Bold.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}

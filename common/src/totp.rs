@@ -435,7 +435,7 @@ pub fn generate_secret() -> Result<zeroize::Zeroizing<[u8; 32]>, String> {
 /// SECURITY: SHA-1 is rejected unconditionally. It is cryptographically broken
 /// and prohibited for all MILNET operations.
 #[allow(deprecated)]
-fn hmac_totp(algorithm: TotpAlgorithm, secret: &[u8], counter_bytes: &[u8; 8]) -> Result<Vec<u8>, String> {
+fn hmac_totp(algorithm: TotpAlgorithm, secret: &[u8], counter_bytes: &[u8; 8]) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
     match algorithm {
         TotpAlgorithm::Sha1 => {
             tracing::error!(
@@ -449,13 +449,13 @@ fn hmac_totp(algorithm: TotpAlgorithm, secret: &[u8], counter_bytes: &[u8; 8]) -
             let mut mac = HmacSha256::new_from_slice(secret)
                 .map_err(|_| "HMAC-SHA256 key initialization failed".to_string())?;
             mac.update(counter_bytes);
-            Ok(mac.finalize().into_bytes().to_vec())
+            Ok(zeroize::Zeroizing::new(mac.finalize().into_bytes().to_vec()))
         }
         TotpAlgorithm::Sha512 => {
             let mut mac = HmacSha512::new_from_slice(secret)
                 .map_err(|_| "HMAC-SHA512 key initialization failed".to_string())?;
             mac.update(counter_bytes);
-            Ok(mac.finalize().into_bytes().to_vec())
+            Ok(zeroize::Zeroizing::new(mac.finalize().into_bytes().to_vec()))
         }
     }
 }

@@ -5,8 +5,9 @@
 //! - `Verbose`: full error details including file/line exposed in responses
 //! - `Warn`: errors mapped to generic safe messages, no file/line
 //!
-//! Default is Verbose. The codebase is open-source — hiding line numbers
-//! provides no security benefit when source is already public.
+//! Default is Warn. Verbose may only be enabled by explicitly setting
+//! MILNET_ERROR_LEVEL=verbose, which logs a startup WARN. Source paths and
+//! file:line never leak to clients in Warn mode.
 #![forbid(unsafe_code)]
 
 use crate::config::error_level;

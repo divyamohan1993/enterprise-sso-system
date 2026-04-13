@@ -1057,4 +1057,25 @@ DKGEventualCompletion ==
 KeyRotationEventualCompletion ==
     keyTransition.phase = "dual" ~> keyTransition.phase = "none"
 
+\* LIVENESS 4 (I18): Ceremonies eventually terminate (Complete or Failed).
+\* No ceremony may remain "in progress" forever.
+CeremonyEventuallyCompletes ==
+    \A c \in DOMAIN ceremonies :
+        <>[](ceremonies[c].state = "Complete"
+             \/ ceremonies[c].state = "Failed")
+
+\* LIVENESS 5 (I18): The system never becomes globally deadlocked.
+\* From every reachable state we can always make progress (some
+\* enabled action). Modelled as a temporal invariant on the
+\* program counter map: no participant remains "blocked" forever.
+NoDeadlock ==
+    \A p \in DOMAIN pc :
+        []<>(pc[p] /= "blocked")
+
+\* LIVENESS 6 (I18): Audit BFT quorum eventually commits or rejects
+\* every proposed entry — no entry remains "pending" indefinitely.
+AuditEventuallyDecided ==
+    \A e \in DOMAIN auditPending :
+        <>(e \in DOMAIN auditCommitted \/ e \in DOMAIN auditRejected)
+
 =======================================================================

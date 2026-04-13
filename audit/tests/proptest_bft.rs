@@ -16,7 +16,7 @@ fn propose_default(cluster: &mut BftAuditCluster) -> Result<[u8; 64], String> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(16))]
+    #![proptest_config(ProptestConfig::with_cases(1000))] // I20
 
     /// Honest quorum always reaches agreement.
     #[test]

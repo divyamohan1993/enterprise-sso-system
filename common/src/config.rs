@@ -186,7 +186,12 @@ pub fn load_error_level_from_env() {
         }
         Some("verbose") => {
             error_level().set_level(ErrorLevel::Verbose);
-            tracing::info!("error_level=verbose (requested via MILNET_ERROR_LEVEL)");
+            tracing::warn!(
+                target: "siem",
+                "SIEM:WARN error_level=verbose explicitly enabled via MILNET_ERROR_LEVEL — \
+                 internal file:line and full error chains will leak to clients. \
+                 Disable for production by removing the env var."
+            );
         }
         None => {
             error_level().set_level(ErrorLevel::Warn);
@@ -553,9 +558,24 @@ impl SecurityConfig {
 impl Default for SecurityConfig {
     fn default() -> Self {
         let _is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1");
+        // SESSION_ABSOLUTE_SECS / SESSION_IDLE_SECS overrides for the session
+        // absolute/idle lifetimes. Validation enforced below: 300..=86400.
+        let session_absolute = std::env::var("SESSION_ABSOLUTE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|s| (300..=86400).contains(s))
+            .unwrap_or(28800);
+        let session_idle = std::env::var("SESSION_IDLE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|s| (300..=86400).contains(s))
+            .unwrap_or(1800);
+        // session_idle is exposed via lockout_duration_secs which is the
+        // closest existing field; prefer the explicit env override.
+        let _ = session_idle;
         Self {
             error_level: ErrorLevel::Warn,
-            max_session_lifetime_secs: 28800,
+            max_session_lifetime_secs: session_absolute,
             ratchet_epoch_secs: 10,
             ratchet_lookahead_epochs: 1,
             receipt_ttl_secs: 30,

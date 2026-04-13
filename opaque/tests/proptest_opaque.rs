@@ -2,7 +2,7 @@ use proptest::prelude::*;
 use opaque::store::CredentialStore;
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(16))]
+    #![proptest_config(ProptestConfig::with_cases(1000))] // I20
 
     /// Registration then login with correct password succeeds.
     #[test]

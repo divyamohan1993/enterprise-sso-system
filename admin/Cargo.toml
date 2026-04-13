@@ -36,6 +36,9 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-core = "0.3"
 urlencoding = "2"
+url = "2"
+ahash = "0.8"
+regex = "1"
 rsa.workspace = true
 aes-gcm.workspace = true
 getrandom.workspace = true

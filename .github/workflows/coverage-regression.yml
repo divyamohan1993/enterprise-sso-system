@@ -1,0 +1,54 @@
+# I19 — every fix: commit must add a test file. SAFE: only github.base_ref
+# is consumed (and only via an env var); commit subjects are read from
+# `git log` locally and never interpolated into shell.
+name: Coverage Regression Policy
+
+on:
+  pull_request:
+    branches: [master, main]
+
+permissions:
+  contents: read
+
+jobs:
+  fix-must-have-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - name: Require new test for every fix commit
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          FAIL=0
+          for COMMIT in $(git rev-list "origin/${BASE_REF}..HEAD"); do
+            SUBJECT=$(git log --format='%s' -1 "$COMMIT")
+            case "$SUBJECT" in
+              fix:*|fix\(*) ;;
+              *) continue ;;
+            esac
+            ADDED_TEST=0
+            while IFS= read -r line; do
+              status=$(printf '%s' "$line" | awk '{print $1}')
+              path=$(printf '%s' "$line" | awk '{print $2}')
+              [ "$status" = "A" ] || continue
+              case "$path" in
+                */tests/*|fuzz/fuzz_targets/*|e2e/tests/*)
+                  ADDED_TEST=1
+                  break
+                  ;;
+              esac
+            done < <(git show --pretty=format: --name-status "$COMMIT")
+            if [ "$ADDED_TEST" -eq 0 ]; then
+              echo "POLICY VIOLATION: fix commit $COMMIT has no new test file"
+              FAIL=$((FAIL + 1))
+            else
+              echo "OK: $COMMIT includes a test delta"
+            fi
+          done
+          if [ "$FAIL" -gt 0 ]; then
+            echo "FATAL: $FAIL fix commit(s) lack a regression test."
+            exit 1
+          fi

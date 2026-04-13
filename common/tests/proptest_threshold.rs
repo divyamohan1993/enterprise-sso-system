@@ -2,7 +2,7 @@ use proptest::prelude::*;
 use common::threshold_kek::{split_secret, reconstruct_secret};
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(32))]
+    #![proptest_config(ProptestConfig::with_cases(1000))] // I20
 
     /// Any k-of-n subset of shares reconstructs the same secret.
     /// Generate a random secret, split into shares, pick different k-sized

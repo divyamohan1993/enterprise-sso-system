@@ -23,7 +23,15 @@ BINARY_DIR="${BINARY_DIR:-$PROJECT_ROOT/target/release}"
 ENV_DIR="$SCRIPT_DIR/env"
 SYSTEMD_DIR="$SCRIPT_DIR"
 SSH_USER="${SSH_USER:-root}"
-SSH_OPTS="${SSH_OPTS:--o StrictHostKeyChecking=accept-new -o ConnectTimeout=10}"
+# SECURITY: Strict host key checking — never TOFU. Pre-seed known_hosts from
+# the canonical golden-image fingerprints checked into deploy/vm/known_hosts.seed.
+SSH_KNOWN_HOSTS="${SSH_KNOWN_HOSTS:-$SCRIPT_DIR/known_hosts.seed}"
+if [ ! -s "$SSH_KNOWN_HOSTS" ]; then
+    echo "ERROR: SSH known_hosts seed file missing or empty: $SSH_KNOWN_HOSTS" >&2
+    echo "Populate it from the golden image build process before provisioning." >&2
+    exit 1
+fi
+SSH_OPTS="${SSH_OPTS:--o StrictHostKeyChecking=yes -o UserKnownHostsFile=$SSH_KNOWN_HOSTS -o ConnectTimeout=10}"
 INSTALL_DIR="/opt/milnet/bin"
 CONFIG_DIR="/etc/milnet"
 DATA_DIR="/var/lib/milnet"

@@ -247,7 +247,23 @@ pub struct DistributedRateLimiter {
     /// Counter for the number of times degraded mode has been activated.
     /// Useful for monitoring/alerting on persistent Redis failures.
     pub degraded_mode_activations: Arc<AtomicU64>,
+    /// E7 fix: timestamp (epoch seconds) when Redis first became unhealthy.
+    /// 0 = currently healthy. Once outage exceeds REDIS_OUTAGE_FAIL_CLOSED_SECS,
+    /// the gateway transitions to fail-closed: ALL non-whitelisted traffic
+    /// rejected until Redis recovers.
+    pub redis_unhealthy_since: Arc<AtomicU64>,
 }
+
+/// E7: After Redis has been unavailable for this many seconds, the gateway
+/// transitions from "degraded local fallback" to fail-closed (deny-all).
+/// 30 seconds is short enough to limit attacker exploitation but long enough
+/// that brief Redis blips don't black-hole the service.
+pub const REDIS_OUTAGE_FAIL_CLOSED_SECS: u64 = 30;
+
+/// E7: Local token bucket rate (req/s per IP) used while Redis is degraded.
+/// Hard-capped at 10 req/s per IP regardless of normal Redis-backed limit
+/// to constrain attacker amplification when the global counter is unavailable.
+pub const REDIS_DEGRADED_LOCAL_RPS_PER_IP: u64 = 10;
 
 /// Minimal Redis client wrapper.
 ///
@@ -609,6 +625,7 @@ impl DistributedRateLimiter {
             redis_required,
             degraded_limit_divisor,
             degraded_mode_activations: Arc::new(AtomicU64::new(0)),
+            redis_unhealthy_since: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -654,8 +671,60 @@ impl DistributedRateLimiter {
         }
     }
 
+    /// E7: Returns true if the gateway should fail-closed (deny ALL) because
+    /// Redis has been down longer than REDIS_OUTAGE_FAIL_CLOSED_SECS.
+    fn should_fail_closed(&self) -> bool {
+        let since = self.redis_unhealthy_since.load(std::sync::atomic::Ordering::Relaxed);
+        if since == 0 {
+            return false;
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        now.saturating_sub(since) >= REDIS_OUTAGE_FAIL_CLOSED_SECS
+    }
+
+    /// E7: Mark Redis healthy — clears the outage timer.
+    fn mark_redis_healthy(&self) {
+        self.redis_healthy.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.redis_unhealthy_since.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// E7: Mark Redis unhealthy — starts the outage timer if not already running.
+    fn mark_redis_unhealthy(&self) {
+        self.redis_healthy.store(false, std::sync::atomic::Ordering::Relaxed);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Only set if currently 0 (don't reset an existing timer)
+        let _ = self.redis_unhealthy_since.compare_exchange(
+            0, now,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
     /// Internal: perform the rate limit check with Redis fallback.
     async fn check_rate_limit(&self, key: &str, limit: u64) -> RateLimitResult {
+        // E7: fail-closed if Redis has been down longer than the threshold.
+        if self.should_fail_closed() {
+            error!(
+                key = key,
+                "SIEM:CRITICAL rate limit FAIL-CLOSED: Redis outage > {}s, denying request",
+                REDIS_OUTAGE_FAIL_CLOSED_SECS
+            );
+            common::siem::SecurityEvent::tamper_detected(
+                "Gateway rate limit fail-closed: Redis outage exceeded threshold"
+            );
+            return RateLimitResult {
+                allowed: false,
+                remaining: 0,
+                reset_after_secs: REDIS_OUTAGE_FAIL_CLOSED_SECS,
+                retry_after_secs: REDIS_OUTAGE_FAIL_CLOSED_SECS,
+            };
+        }
         // Try Redis first
         if self.redis_healthy.load(std::sync::atomic::Ordering::Relaxed) {
             if let Some(ref redis) = self.redis_client {
@@ -677,17 +746,19 @@ impl DistributedRateLimiter {
                     }
                     Err(e) => {
                         warn!("Redis rate limit check failed, falling back to local: {e}");
-                        self.redis_healthy
-                            .store(false, std::sync::atomic::Ordering::Relaxed);
+                        self.mark_redis_unhealthy();
                         // Spawn background reconnection with exponential backoff
                         let redis_clone = redis.clone();
                         let healthy_clone = self.redis_healthy.clone();
+                        let unhealthy_since_clone = self.redis_unhealthy_since.clone();
                         tokio::spawn(async move {
                             let mut client = redis_clone.lock().await;
                             match client.try_reconnect().await {
                                 Ok(()) => {
                                     healthy_clone
                                         .store(true, std::sync::atomic::Ordering::Relaxed);
+                                    unhealthy_since_clone
+                                        .store(0, std::sync::atomic::Ordering::Relaxed);
                                     info!("Redis rate limit backend reconnected");
                                 }
                                 Err(e) => {
@@ -700,12 +771,19 @@ impl DistributedRateLimiter {
             }
         }
 
-        // SECURITY: In degraded mode, apply stricter limits. Production: 50% of normal.
-        let degraded_limit = if self.redis_required {
+        // E7: hard cap on degraded local fallback. The previous formula
+        // (limit/2 or limit/divisor) could still allow ~1000 r/s if the
+        // configured per_ip_limit was 2000. The new cap is min(prev, 10/window)
+        // for IP-scoped keys to cap attacker amplification regardless of config.
+        let mut degraded_limit = if self.redis_required {
             (limit / 2).max(1)
         } else {
             (limit / self.degraded_limit_divisor).max(1)
         };
+        if key.starts_with("rl:ip:") {
+            let cap = REDIS_DEGRADED_LOCAL_RPS_PER_IP.saturating_mul(self.config.window_secs).max(1);
+            degraded_limit = degraded_limit.min(cap);
+        }
         let activations = self.degraded_mode_activations.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         let severity = if self.redis_required { "CRITICAL" } else { "SECURITY" };
         warn!(

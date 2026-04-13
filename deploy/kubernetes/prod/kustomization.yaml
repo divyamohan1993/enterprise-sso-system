@@ -1,0 +1,22 @@
+# MILNET SSO — production overlay
+# Image digests are injected by the CI pipeline (.github/workflows/ci.yml,
+# "render-prod-manifest" step) by sed-replacing PLACEHOLDER_DIGEST tokens in
+# workloads.yaml with the cosign-verified digests of the just-built images.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: milnet
+resources:
+  - ../namespace.yaml
+  - ../audit-policy.yaml
+  - ../network-policy.yaml
+  - ../rbac.yaml
+  - ../pod-disruption-budgets.yaml
+  - ../external-secrets/external-secrets-operator.yaml
+  - ../external-secrets/secret-store-vault.yaml
+  - ../external-secrets/externalsecret-master-kek.yaml
+  - ../external-secrets/externalsecret-tss-shares.yaml
+  - ../external-secrets/externalsecret-pq-signing-keys.yaml
+  - workloads.yaml
+commonLabels:
+  app.kubernetes.io/part-of: milnet-sso
+  milnet.io/environment: prod

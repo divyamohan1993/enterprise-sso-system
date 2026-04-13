@@ -24,6 +24,29 @@ use uuid::Uuid;
 
 use crate::multi_tenancy::{TenantContext, TenantId};
 
+/// Workspace-wide allowlist of tables that may be referenced via `format!()`
+/// in dynamic SQL. G18: any caller that passes a `&'static [&'static str]`
+/// of table names through `format!` must first call this assertion. It is a
+/// runtime tripwire — production paths only ever supply names from this set,
+/// but any future regression that introduces user-controlled table names will
+/// trip immediately rather than reaching the SQL planner.
+const APPROVED_DYNAMIC_TABLES: &[&str] = &[
+    "users", "devices", "sessions", "audit_log", "portals",
+    "fido_credentials", "authorization_codes", "oauth_codes",
+    "revoked_tokens", "recovery_codes",
+];
+
+fn assert_table_allowlisted(tables: &[&str]) {
+    for t in tables {
+        if !APPROVED_DYNAMIC_TABLES.contains(t) {
+            panic!(
+                "G18 SQL safety: table {:?} not in APPROVED_DYNAMIC_TABLES allowlist",
+                t
+            );
+        }
+    }
+}
+
 // ── Blind index helpers ────────────────────────────────────────────────────
 
 /// Compute HMAC-SHA512 blind index for a username.
@@ -992,12 +1015,16 @@ pub async fn init_database(database_url: &str) -> Result<PgPool, String> {
     // ── Multi-tenancy column migrations (idempotent) ──
     // CRITICAL: tenant_id columns are required for tenant isolation / RLS.
     // Failures here must be propagated to prevent running without tenant scoping.
-    let tenant_tables = [
+    let tenant_tables: &'static [&'static str] = &[
         "users", "devices", "sessions", "audit_log", "portals",
         "fido_credentials", "authorization_codes", "oauth_codes",
         "revoked_tokens", "recovery_codes",
     ];
-    for table in &tenant_tables {
+    // G18: assert every name is from the static allowlist before format!ing
+    // it into SQL. This is a runtime tripwire in case someone adds a dynamic
+    // source later.
+    assert_table_allowlisted(tenant_tables);
+    for table in tenant_tables {
         let sql = format!(
             "ALTER TABLE {} ADD COLUMN IF NOT EXISTS tenant_id UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'",
             table
@@ -1009,7 +1036,7 @@ pub async fn init_database(database_url: &str) -> Result<PgPool, String> {
     }
 
     // ── Tenant-scoped indexes (required for RLS performance) ──
-    for table in &tenant_tables {
+    for table in tenant_tables {
         let sql = format!(
             "CREATE INDEX IF NOT EXISTS idx_{}_tenant_id ON {} (tenant_id)",
             table, table
@@ -1669,7 +1696,7 @@ impl TenantAwarePool {
         let mut total: u64 = 0;
 
         // Order matters: delete child rows before parent rows (FK constraints).
-        let tables = [
+        let tables: &'static [&'static str] = &[
             "recovery_codes",
             "fido_credentials",
             "authorization_codes",
@@ -1681,8 +1708,10 @@ impl TenantAwarePool {
             "portals",
             "users",
         ];
+        // G18: gate the dynamic SQL formatting on the static allowlist.
+        assert_table_allowlisted(tables);
 
-        for table in &tables {
+        for table in tables {
             let query = format!("DELETE FROM {} WHERE tenant_id = $1", table);
             let result = sqlx::query(&query)
                 .bind(tenant_id)

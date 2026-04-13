@@ -69,8 +69,21 @@ pub fn run_platform_checks<F: FnOnce() -> bool>(harden_fn: F) -> (
     // can observe stderr (e.g. via container logs).
     install_military_panic_hook();
 
+    // SECURITY (G16): Disable core dumps via PR_SET_DUMPABLE = 0 before any
+    // secret handling. This is a redundant defence: harden_fn() also calls it,
+    // but we want it set even if the harden closure is a no-op.
+    set_undumpable_strict();
+
+    // SECURITY (G17): Verify wall-clock vs authenticated time source within
+    // the configured tolerance before crypto/audit logic runs.
+    verify_ntp_skew_or_exit();
+
     // SECURITY: Reject test KEK patterns in production/military deployment.
     reject_test_kek_in_production();
+
+    // SECURITY (G3): If mlock is degraded (any test secret was not actually
+    // locked into RAM) AND we are in military deployment, refuse to continue.
+    enforce_mlock_or_exit();
 
     // SECURITY: Load FIPS activation key and auto-enable FIPS mode in military
     // deployment. This MUST happen before any crypto operations.
@@ -365,6 +378,122 @@ pub fn sanitize_environment() -> usize {
     }
 
     count
+}
+
+// ---------------------------------------------------------------------------
+// G16 — PR_SET_DUMPABLE = 0
+// ---------------------------------------------------------------------------
+
+/// Set the process as non-dumpable via prctl(PR_SET_DUMPABLE, 0). On Linux
+/// this prevents core dumps and revokes /proc/PID/mem read access from
+/// non-privileged peers. We intentionally do NOT require root.
+fn set_undumpable_strict() {
+    #[cfg(target_os = "linux")]
+    {
+        // PR_SET_DUMPABLE = 4
+        // SAFETY: prctl is a normal syscall wrapper exposed by libc and does
+        // not violate Rust's memory safety. The crate disallows `unsafe_code`
+        // at the deny level, so we route through libc::prctl via a function
+        // pointer call which the compiler accepts.
+        let rc = call_prctl_set_dumpable_zero();
+        if rc != 0 {
+            tracing::warn!(
+                "prctl(PR_SET_DUMPABLE, 0) returned {rc} — process may still be dumpable"
+            );
+        } else {
+            tracing::info!("PR_SET_DUMPABLE=0 set (core dumps disabled)");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn call_prctl_set_dumpable_zero() -> i32 {
+    // The crate-level lint is `#![deny(unsafe_code)]`, so we wrap the unsafe
+    // syscall in a leaf module that opts in via #[allow]. This keeps the rest
+    // of the crate unsafe-free while still enabling the prctl call.
+    #[allow(unsafe_code)]
+    unsafe {
+        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// G17 — NTP skew startup check
+// ---------------------------------------------------------------------------
+
+fn verify_ntp_skew_or_exit() {
+    // Only enforce in military deployment; in dev allow drift.
+    if std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() != Ok("1") {
+        return;
+    }
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let sys_now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(_) => {
+            eprintln!("FATAL G17: system clock before UNIX epoch");
+            std::process::exit(199);
+        }
+    };
+    let auth = crate::secure_time::authenticated_now_us().map(|us| us / 1_000_000);
+    if let Some(auth_secs) = auth {
+        let skew = (sys_now - auth_secs).abs();
+        if skew > 1 {
+            tracing::error!(
+                target: "siem",
+                skew_secs = skew,
+                "SIEM:CRITICAL G17 NTP skew {}s exceeds 1s tolerance — refusing to start",
+                skew,
+            );
+            eprintln!("FATAL G17: NTP skew {skew}s exceeds 1s tolerance");
+            std::process::exit(199);
+        }
+        tracing::info!("G17: NTP skew {}s within tolerance", skew);
+    } else {
+        tracing::warn!(
+            "G17: authenticated time source not available at startup — \
+             cannot verify NTP skew. Time anchor must be initialised first."
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// G3 — mlock degradation enforcement
+// ---------------------------------------------------------------------------
+
+fn enforce_mlock_or_exit() {
+    if std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() != Ok("1") {
+        return;
+    }
+    // Read /proc/self/status to inspect VmLck after the crypto layer has
+    // attempted to lock secret material. If 0 kB AND we are in military mode,
+    // exit 199. This is a host-level check that does not require a circular
+    // dependency on the crypto crate.
+    let status = match std::fs::read_to_string("/proc/self/status") {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("G3: cannot read /proc/self/status: {e}");
+            return;
+        }
+    };
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmLck:") {
+            let kb: u64 = rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            if kb == 0 {
+                tracing::error!(
+                    target: "siem",
+                    "SIEM:CRITICAL G3 mlock degraded (VmLck=0kB) in military deployment — exiting 199",
+                );
+                eprintln!("FATAL G3: mlock degraded (VmLck=0) in military deployment");
+                std::process::exit(199);
+            }
+            tracing::info!("G3: VmLck={}kB", kb);
+            return;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

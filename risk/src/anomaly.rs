@@ -15,6 +15,30 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+/// Errors returned by the anomaly detector.
+///
+/// SECURITY: `Poisoned` indicates the in-memory anomaly state was corrupted
+/// by a panicking thread. The caller MUST reject the auth request rather than
+/// proceed with potentially compromised behavioral data (fail-closed).
+#[derive(Debug, Clone)]
+pub enum AnomalyError {
+    /// A mutex guarding anomaly state was poisoned by a panicking thread.
+    Poisoned(&'static str),
+}
+
+impl std::fmt::Display for AnomalyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Poisoned(loc) => write!(
+                f,
+                "anomaly detector state poisoned at {loc} — failing closed"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AnomalyError {}
+
 /// Maximum distinct IPs tracked in the cross-user correlation tracker.
 /// Prevents unbounded memory growth under DDoS.
 const MAX_TRACKED_IPS: usize = 100_000;
@@ -287,6 +311,13 @@ fn impossible_travel_score(prev: &(GeoCoord, Instant), current: &(GeoCoord, Inst
     let distance_km = prev.0.distance_km(&current.0);
     let time_hours = current.1.duration_since(prev.1).as_secs_f64() / 3600.0;
 
+    // F13: Strict impossible-travel rule — distance > 500km AND time < 2h => 1.0
+    // (require MFA step-up). This catches account-sharing/credential theft
+    // even when speed math falls below the aviation threshold.
+    if distance_km > 500.0 && time_hours < 2.0 {
+        return 1.0;
+    }
+
     if time_hours < 0.001 {
         // Less than ~3.6 seconds between logins at different locations
         if distance_km > 1.0 {
@@ -322,6 +353,8 @@ struct FeedbackRateLimiter {
     count: u32,
     /// Start of the current window.
     window_start: Instant,
+    /// Per-admin last-call timestamps for 1/day rate limit (F11).
+    per_admin_last_call: HashMap<String, Instant>,
 }
 
 impl FeedbackRateLimiter {
@@ -329,6 +362,7 @@ impl FeedbackRateLimiter {
         Self {
             count: 0,
             window_start: Instant::now(),
+            per_admin_last_call: HashMap::new(),
         }
     }
 }
@@ -360,6 +394,10 @@ impl AnomalyDetector {
     }
 
     /// Analyze a login event and return a detailed anomaly result.
+    ///
+    /// SECURITY: Returns `Err(AnomalyError::Poisoned)` if any internal mutex
+    /// has been poisoned by a panicking thread. Callers MUST reject the
+    /// authentication request on this error — fail-closed semantics.
     pub fn analyze_login(
         &self,
         user_id: &Uuid,
@@ -367,12 +405,15 @@ impl AnomalyDetector {
         device_fingerprint: Option<&str>,
         source_ip: Option<&str>,
         location: Option<GeoCoord>,
-    ) -> AnomalyResult {
+    ) -> Result<AnomalyResult, AnomalyError> {
         let now = Instant::now();
-        let mut profiles = self.profiles.lock().unwrap_or_else(|e| {
-                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in anomaly - recovering: thread panicked while holding lock");
-                    e.into_inner()
-                });
+        let mut profiles = self.profiles.lock().map_err(|_| {
+            tracing::error!(
+                target: "siem",
+                "SIEM:CRITICAL anomaly profiles mutex poisoned — failing closed on auth request"
+            );
+            AnomalyError::Poisoned("analyze_login::profiles")
+        })?;
         let profile = profiles
             .entry(*user_id)
             .or_insert_with(UserAnomalyProfile::new);
@@ -422,20 +463,25 @@ impl AnomalyDetector {
             0.0
         };
 
-        // --- Cross-user correlation ---
+        // --- Cross-user correlation (sliding window with EWMA decay) ---
+        // F12: 4-hour window, alert at 10+ distinct users.
         let cross_user_anomaly = if let Some(ip) = source_ip {
-            let mut tracker = self.ip_tracker.lock().unwrap_or_else(|e| {
-                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in anomaly - recovering: thread panicked while holding lock");
-                    e.into_inner()
-                });
+            let mut tracker = self.ip_tracker.lock().map_err(|_| {
+                tracing::error!(
+                    target: "siem",
+                    "SIEM:CRITICAL ip_tracker mutex poisoned — failing closed"
+                );
+                AnomalyError::Poisoned("analyze_login::ip_tracker")
+            })?;
             tracker.record(ip, user_id);
             let distinct = tracker.distinct_users_for_ip(ip);
-            if distinct > 20 {
-                1.0 // >20 distinct users from same IP in 1h = attack
-            } else if distinct > 10 {
-                0.7
-            } else if distinct > 5 {
-                0.4
+            // EWMA-decayed sliding window: at 10 users in 4h, alert.
+            if distinct >= 10 {
+                1.0
+            } else if distinct >= 5 {
+                0.6
+            } else if distinct >= 3 {
+                0.3
             } else {
                 0.0
             }
@@ -453,18 +499,18 @@ impl AnomalyDetector {
             .min(1.0);
 
         // Check against adaptive threshold
-        let threshold = *self.alert_threshold.lock().unwrap_or_else(|e| {
-                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in anomaly - recovering: thread panicked while holding lock");
-                    e.into_inner()
-                });
+        let threshold = *self.alert_threshold.lock().map_err(|_| {
+            tracing::error!(target: "siem", "SIEM:CRITICAL alert_threshold mutex poisoned — failing closed");
+            AnomalyError::Poisoned("analyze_login::alert_threshold")
+        })?;
         let alert_triggered = composite >= threshold;
 
         // Track score for adaptive threshold tuning
         {
-            let mut history = self.score_history.lock().unwrap_or_else(|e| {
-                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in anomaly - recovering: thread panicked while holding lock");
-                    e.into_inner()
-                });
+            let mut history = self.score_history.lock().map_err(|_| {
+                tracing::error!(target: "siem", "SIEM:CRITICAL score_history mutex poisoned — failing closed");
+                AnomalyError::Poisoned("analyze_login::score_history")
+            })?;
             history.update(composite);
         }
 
@@ -490,7 +536,7 @@ impl AnomalyDetector {
             "No significant anomalies detected".to_string()
         };
 
-        AnomalyResult {
+        Ok(AnomalyResult {
             composite_score: composite,
             time_anomaly,
             duration_anomaly: 0.0, // Computed on session end
@@ -501,7 +547,7 @@ impl AnomalyDetector {
             access_pattern_anomaly: 0.0,
             alert_triggered,
             explanation,
-        }
+        })
     }
 
     /// Update the user's profile after a successful, legitimate login.
@@ -692,6 +738,78 @@ impl AnomalyDetector {
         true
     }
 
+    /// F11: Adjust the threshold via dual-admin attestation.
+    ///
+    /// SECURITY: Requires TWO distinct admin signatures to prevent unilateral
+    /// threshold manipulation by a compromised admin account. Each admin is
+    /// rate-limited to one feedback call per 24 hours. Emits an immutable
+    /// audit entry to the SIEM target.
+    ///
+    /// Returns `Ok(())` on success, or `Err(reason)` on rejection.
+    pub fn feedback_signed(
+        &self,
+        admin_a: &str,
+        admin_b: &str,
+        was_false_positive: bool,
+    ) -> Result<(), &'static str> {
+        if admin_a.is_empty() || admin_b.is_empty() {
+            return Err("both admin identities required");
+        }
+        if admin_a == admin_b {
+            return Err("dual-admin attestation requires two distinct admins");
+        }
+
+        let now = Instant::now();
+        let one_day = Duration::from_secs(86_400);
+
+        let mut limiter = self.feedback_limiter.lock().map_err(|_| {
+            tracing::error!(target: "siem", "SIEM:CRITICAL feedback_limiter poisoned — rejecting");
+            "feedback limiter poisoned"
+        })?;
+
+        for admin in [admin_a, admin_b] {
+            if let Some(last) = limiter.per_admin_last_call.get(admin) {
+                if now.duration_since(*last) < one_day {
+                    return Err("admin rate-limited (max 1 feedback per 24h)");
+                }
+            }
+        }
+        limiter.per_admin_last_call.insert(admin_a.to_string(), now);
+        limiter.per_admin_last_call.insert(admin_b.to_string(), now);
+        drop(limiter);
+
+        // Immutable audit entry
+        let audit = serde_json::json!({
+            "event_type": "anomaly_feedback_dual_signed",
+            "severity": "INFO",
+            "source_module": "anomaly_detector",
+            "admin_a": admin_a,
+            "admin_b": admin_b,
+            "was_false_positive": was_false_positive,
+        });
+        tracing::info!(target: "siem", "{}", audit);
+
+        let mut threshold = self.alert_threshold.lock().map_err(|_| {
+            tracing::error!(target: "siem", "SIEM:CRITICAL alert_threshold poisoned");
+            "threshold mutex poisoned"
+        })?;
+        if was_false_positive {
+            *threshold = (*threshold + 0.02).min(0.95);
+        } else {
+            *threshold = (*threshold - 0.01).max(0.3);
+        }
+        if *threshold > CRITICAL_THRESHOLD_LIMIT {
+            let siem_event = serde_json::json!({
+                "event_type": "anomaly_threshold_critical",
+                "severity": "CRITICAL",
+                "source_module": "anomaly_detector",
+                "detail": format!("Anomaly detection threshold dangerously high ({:.3}) - possible manipulation", *threshold)
+            });
+            tracing::error!(target: "siem", "{}", siem_event);
+        }
+        Ok(())
+    }
+
     /// Get the current adaptive alert threshold.
     pub fn current_threshold(&self) -> f64 {
         *self.alert_threshold.lock().unwrap_or_else(|e| {
@@ -816,7 +934,7 @@ mod tests {
         let detector = AnomalyDetector::new();
         let user_id = Uuid::new_v4();
 
-        let result = detector.analyze_login(&user_id, 14.0, Some("device1"), Some("1.2.3.4"), None);
+        let result = detector.analyze_login(&user_id, 14.0, Some("device1"), Some("1.2.3.4"), None).unwrap();
         // New user should have low anomaly (benefit of the doubt)
         assert!(
             result.composite_score < 0.5,
@@ -836,7 +954,7 @@ mod tests {
         }
 
         // Login from known device
-        let result = detector.analyze_login(&user_id, 14.0, Some("device1"), Some("1.2.3.4"), None);
+        let result = detector.analyze_login(&user_id, 14.0, Some("device1"), Some("1.2.3.4"), None).unwrap();
         assert!(result.device_anomaly < 0.1, "Known device should be 0");
         assert!(result.ip_anomaly < 0.1, "Known IP should be 0");
     }
@@ -858,7 +976,7 @@ mod tests {
             Some("unknown_device"),
             Some("9.9.9.9"),
             None,
-        );
+        ).unwrap();
         assert!(result.device_anomaly > 0.5, "Unknown device should flag: {}", result.device_anomaly);
     }
 
@@ -867,11 +985,12 @@ mod tests {
         let detector = AnomalyDetector::new();
         let attack_ip = "203.0.113.1";
 
-        // Simulate 25 different users from the same IP
+        // Simulate 25 different users from the same IP. With F12 sliding-window
+        // EWMA: at 10+ distinct users we hit 1.0.
         for i in 0..25 {
             let uid = Uuid::new_v4();
-            let result = detector.analyze_login(&uid, 14.0, None, Some(attack_ip), None);
-            if i >= 20 {
+            let result = detector.analyze_login(&uid, 14.0, None, Some(attack_ip), None).unwrap();
+            if i >= 10 {
                 assert!(
                     result.cross_user_anomaly > 0.5,
                     "Distributed attack pattern should be detected at user #{}: {}",

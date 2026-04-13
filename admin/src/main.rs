@@ -274,6 +274,43 @@ async fn main() {
         std::env::var("SSO_BASE_URL"),
     ) {
         (Ok(cid), Ok(csec), Ok(base)) => {
+            // E8: Validate SSO_BASE_URL strictly.
+            // - parse via url::Url
+            // - require https scheme
+            // - reject RFC1918 / loopback / link-local hosts unless MILNET_DEV=1
+            let dev_mode = std::env::var("MILNET_DEV").map(|v| v == "1").unwrap_or(false);
+            let parsed_base = match url::Url::parse(&base) {
+                Ok(u) => u,
+                Err(e) => {
+                    tracing::error!("FATAL: SSO_BASE_URL is not a valid URL: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if parsed_base.scheme() != "https" && !(dev_mode && parsed_base.scheme() == "http") {
+                tracing::error!("FATAL: SSO_BASE_URL must use https scheme");
+                std::process::exit(1);
+            }
+            let h = parsed_base.host_str().unwrap_or("").to_ascii_lowercase();
+            if !dev_mode {
+                let bad = h.is_empty()
+                    || h == "localhost"
+                    || h == "127.0.0.1"
+                    || h == "::1"
+                    || h.starts_with("10.")
+                    || h.starts_with("192.168.")
+                    || h.starts_with("169.254.")
+                    || (h.starts_with("172.") && {
+                        // 172.16.0.0/12 — second octet 16..=31
+                        let oct = h.split('.').nth(1).and_then(|x| x.parse::<u8>().ok());
+                        matches!(oct, Some(o) if (16..=31).contains(&o))
+                    })
+                    || h.starts_with("fc")
+                    || h.starts_with("fd");
+                if bad {
+                    tracing::error!("FATAL: SSO_BASE_URL host {:?} is RFC1918/loopback/link-local — refusing to start in production", h);
+                    std::process::exit(1);
+                }
+            }
             // SECURITY: Overwrite OAuth secrets with zeros before removing.
             // These must not linger in /proc/pid/environ.
             if let Ok(val) = std::env::var("GOOGLE_CLIENT_ID") {

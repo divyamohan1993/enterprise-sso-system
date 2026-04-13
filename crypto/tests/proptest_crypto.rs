@@ -4,7 +4,7 @@ use crypto::envelope::{DataEncryptionKey, KeyEncryptionKey, decrypt, encrypt, wr
 use crypto::xwing::{XWingKeyPair, xwing_decapsulate, xwing_encapsulate, derive_session_key};
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
+    #![proptest_config(ProptestConfig::with_cases(1000))] // I20
     #[test]
     fn aes256gcm_roundtrip(pt in prop::collection::vec(any::<u8>(), 0..4096), aad in prop::collection::vec(any::<u8>(), 0..256)) {
         let dek = DataEncryptionKey::generate().expect("generate DEK");

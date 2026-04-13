@@ -28,6 +28,8 @@ toml = "0.8"
 base64 = "0.22"
 risk = { path = "../risk" }
 kt = { path = "../kt" }
+url = "2"
+http = "1"
 
 [features]
 default = ["production"]
@@ -231,4 +233,29 @@ doc = false
 [[bin]]
 name = "fuzz_hkdf_inputs"
 path = "fuzz_targets/fuzz_hkdf_inputs.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_jwt_forge"
+path = "fuzz_targets/fuzz_jwt_forge.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_shard_protocol"
+path = "fuzz_targets/fuzz_shard_protocol.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_jwe_bounds"
+path = "fuzz_targets/fuzz_jwe_bounds.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_url_ssrf"
+path = "fuzz_targets/fuzz_url_ssrf.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_null_byte_pii"
+path = "fuzz_targets/fuzz_null_byte_pii.rs"
 doc = false

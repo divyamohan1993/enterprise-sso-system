@@ -175,7 +175,27 @@ impl EncryptedPool {
 
             result
         } else {
-            // Legacy format: nonce(12) || ciphertext || tag(16)
+            // Legacy v1 format: nonce(12) || ciphertext || tag(16)
+            // G11: strict mode rejects v1 entirely. Default-on in military.
+            let strict = std::env::var("MILNET_REJECT_V1_ENVELOPE").as_deref() == Ok("1")
+                || std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1");
+            if strict {
+                tracing::error!(
+                    target: "siem",
+                    table = table,
+                    column = column,
+                    "SIEM:CRITICAL G11 v1 envelope rejected in strict mode"
+                );
+                return Err("G11: legacy v1 envelope rejected in strict mode".into());
+            }
+            // Background re-encryption signal: emit a tracing event so an
+            // out-of-band sweeper job can re-write this row as v2.
+            tracing::warn!(
+                target: "envelope_migration",
+                table = table,
+                column = column,
+                "G11: v1 envelope decoded — background re-encrypt to v2 required"
+            );
             if sealed.len() < 12 + 16 {
                 return Err("sealed data too short for nonce + tag".into());
             }

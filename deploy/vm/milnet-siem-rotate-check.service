@@ -1,0 +1,23 @@
+# MILNET SIEM rotation overdue check
+# Reads /var/lib/milnet/siem-rotation.stamp; if older than 90 days, fires a
+# critical alert via the local SIEM forwarder. NEVER auto-rotates — see
+# deploy/vm/runbooks/siem-webhook-rotate.md.
+[Unit]
+Description=MILNET SIEM webhook rotation overdue check
+Documentation=file:///opt/milnet/runbooks/siem-webhook-rotate.md
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=milnet
+Group=milnet
+ExecStart=/opt/milnet/bin/check-siem-rotation --max-age-days=90 --stamp /var/lib/milnet/siem-rotation.stamp --alert-on-overdue
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ReadOnlyPaths=/var/lib/milnet/siem-rotation.stamp
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=milnet-siem-rotate-check

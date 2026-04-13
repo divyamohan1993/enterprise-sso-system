@@ -9,7 +9,7 @@ FROM rust:1.88-bookworm@sha256:59c4f641af5de26e5970c79e2ea4e43f30aa0b2e3ac3bafc0
 
 ARG SERVICE_NAME=gateway
 ENV CARGO_TERM_COLOR=always \
-    RUSTFLAGS="-D warnings -C target-feature=+crt-static -C link-arg=-Wl,-z,relro,-z,now -C link-arg=-Wl,-z,noexecstack"
+    RUSTFLAGS="-D warnings -C target-feature=+crt-static -C relocation-model=pic -C link-arg=-pie -C link-arg=-Wl,-z,relro -C link-arg=-Wl,-z,now -C link-arg=-Wl,-z,noexecstack"
 
 WORKDIR /build
 

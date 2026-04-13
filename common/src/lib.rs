@@ -51,6 +51,12 @@ pub mod backup;
 // ── Developer mode & error response sanitisation ──
 pub mod error_response;
 
+// ── Centralized validation, login lockout, password policy, secret loading ──
+pub mod input_validation;
+pub mod login_lockout;
+pub mod password_policy;
+pub mod secret_loader;
+
 // ── FIPS mode runtime toggle ──
 pub mod fips;
 

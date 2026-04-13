@@ -37,7 +37,7 @@ fn build_signed_chain(len: usize, signing_key: &[u8; 64]) -> Vec<Receipt> {
 const KEY: [u8; 64] = [0xAB; 64];
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(32))]
+    #![proptest_config(ProptestConfig::with_cases(1000))] // I20
 
     /// Valid chain always validates.
     #[test]

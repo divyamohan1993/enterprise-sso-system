@@ -315,6 +315,32 @@ jobs:
           path: container-sbom-${{ matrix.service }}.json
           if-no-files-found: error
 
+      # Inject the verified digest into the production manifest. The rendered
+      # manifest is uploaded as an artifact for the deploy job to consume.
+      - name: Render prod manifest with verified digest
+        env:
+          SERVICE: ${{ matrix.service }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          REPO_OWNER: dmj-one
+        run: |
+          set -euo pipefail
+          mkdir -p rendered
+          cp deploy/kubernetes/prod/workloads.yaml "rendered/workloads.yaml.${SERVICE}"
+          IMAGE="ghcr.io/${REPO_OWNER}/milnet-${SERVICE}@${DIGEST}"
+          PLACEHOLDER="ghcr.io/${REPO_OWNER}/milnet-${SERVICE}@sha256:PLACEHOLDER_DIGEST"
+          sed -i "s|${PLACEHOLDER}|${IMAGE}|g" "rendered/workloads.yaml.${SERVICE}"
+          if grep -q PLACEHOLDER_DIGEST "rendered/workloads.yaml.${SERVICE}" \
+             && [ "$(grep -c "ghcr.io/${REPO_OWNER}/milnet-" "rendered/workloads.yaml.${SERVICE}")" -lt 1 ]; then
+            echo "FATAL: placeholder for ${SERVICE} not replaced"
+            exit 1
+          fi
+      - name: Upload rendered manifest fragment
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rendered-prod-${{ matrix.service }}
+          path: rendered/workloads.yaml.${{ matrix.service }}
+          if-no-files-found: error
+
       # Verify image signature before deployment gate
       - name: Verify container image signature
         run: |
@@ -360,17 +386,35 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
 
-      - name: Reproducibility check (rebuild and compare)
+      - name: Reproducibility check (rebuild twice and compare digests)
+        env:
+          SOURCE_DATE_EPOCH: "1700000000"
         run: |
+          set -euo pipefail
           echo "=== Build Reproducibility Verification ==="
-          echo "Rebuilding admin service to verify deterministic output..."
-          docker buildx build \
-            --build-arg SERVICE_NAME=admin \
-            --no-cache \
-            --output type=docker,name=milnet-repro-check \
-            .
-          echo "Reproducibility build completed successfully."
-          echo "In production, compare layer digests against the pushed image."
+          build_once() {
+            local out="$1"
+            docker buildx build \
+              --build-arg SERVICE_NAME=admin \
+              --build-arg SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
+              --no-cache \
+              --provenance=false \
+              --sbom=false \
+              --output type=oci,dest="$out",rewrite-timestamp=true \
+              .
+          }
+          build_once /tmp/build-a.tar
+          build_once /tmp/build-b.tar
+          DIGEST_A=$(sha256sum /tmp/build-a.tar | awk '{print $1}')
+          DIGEST_B=$(sha256sum /tmp/build-b.tar | awk '{print $1}')
+          echo "Build A digest: $DIGEST_A"
+          echo "Build B digest: $DIGEST_B"
+          if [ "$DIGEST_A" != "$DIGEST_B" ]; then
+            echo "FATAL: reproducibility check failed — builds are not bit-identical."
+            echo "Investigate non-deterministic inputs (timestamps, build IDs, RNG seeds)."
+            exit 1
+          fi
+          echo "OK: reproducibility verified."
 
   # ── Stage 9: Signed Commits Verification (PRs only) ─────────────────────────
   commit-verification:
@@ -405,3 +449,102 @@ jobs:
             echo "See: https://docs.github.com/en/authentication/managing-commit-signature-verification"
             exit 1
           fi
+
+  # ── I6: Coverage gate — 85% minimum on critical crates ─────────────────
+  coverage:
+    runs-on: ubuntu-latest
+    needs: check
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@7b1c307e0dcbda6122208f10795a713336a9b35a # stable
+        with:
+          components: llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+      - name: Generate coverage report
+        env:
+          RUST_MIN_STACK: "8388608"
+          MILNET_MASTER_KEK: "abababababababababababababababababababababababababababababababababab"
+        run: |
+          cargo llvm-cov --workspace --json --output-path coverage.json \
+            --ignore-filename-regex '(tests?/|benches/|fuzz/|examples/)' \
+            -- --skip ignored
+      - name: Enforce 85% line coverage on critical crates
+        run: |
+          python3 - <<'PY'
+          import json, sys
+          MIN = 85.0
+          critical = ["crypto/", "opaque/", "fido/", "audit/", "tss/", "kt/"]
+          data = json.load(open("coverage.json"))
+          totals = {c: [0, 0] for c in critical}
+          for f in data["data"][0]["files"]:
+              name = f["filename"]
+              for c in critical:
+                  if "/" + c in name + "/" or name.startswith(c):
+                      lines = f["summary"]["lines"]
+                      totals[c][0] += lines["covered"]
+                      totals[c][1] += lines["count"]
+                      break
+          failed = []
+          for c, (cov, tot) in totals.items():
+              pct = 100.0 * cov / tot if tot else 0.0
+              print(f"{c}: {pct:.2f}% ({cov}/{tot})")
+              if tot == 0 or pct < MIN:
+                  failed.append((c, pct))
+          if failed:
+              for c, pct in failed:
+                  print(f"FAIL: {c} coverage {pct:.2f}% < {MIN}%")
+              sys.exit(1)
+          PY
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-report
+          path: coverage.json
+          retention-days: 14
+
+  # ── I7: Mutation testing (cargo-mutants) on critical crates ────────────
+  mutation:
+    runs-on: ubuntu-latest
+    needs: check
+    if: github.event_name == 'schedule' || contains(github.event.head_commit.message, '[mutants]')
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@7b1c307e0dcbda6122208f10795a713336a9b35a # stable
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+      - name: Run mutation tests on crypto and tss
+        env:
+          RUST_MIN_STACK: "8388608"
+          MILNET_MASTER_KEK: "abababababababababababababababababababababababababababababababababab"
+        run: |
+          cargo mutants --package crypto --package tss --timeout 120 --no-shuffle
+      - name: Upload mutants report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mutants-report
+          path: mutants.out/
+          retention-days: 14
+
+  # ── I5: Dudect statistical timing test runner ─────────────────────────
+  dudect:
+    runs-on: ubuntu-latest
+    needs: check
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@7b1c307e0dcbda6122208f10795a713336a9b35a # stable
+      - name: Run dudect timing tests (release, ignored)
+        env:
+          RUST_MIN_STACK: "8388608"
+          MILNET_MASTER_KEK: "abababababababababababababababababababababababababababababababababab"
+        run: |
+          cargo test --release -p crypto --test dudect_timing_test -- --ignored --nocapture
+          cargo test --release -p opaque --test login_timing_oracle_test -- --ignored --nocapture

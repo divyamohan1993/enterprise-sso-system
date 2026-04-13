@@ -1,0 +1,15 @@
+[package]
+name = "rsa-verify-shim"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "RSA verify-only shim wrapping aws-lc-rs for CNSA-2.0 compliant JWKS verification"
+publish = false
+
+[dependencies]
+aws-lc-rs = { version = "1.10", default-features = false, features = ["aws-lc-sys"] }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+zeroize = { workspace = true }
