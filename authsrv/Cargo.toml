@@ -1,0 +1,38 @@
+[package]
+name = "authsrv"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "authsrv"
+path = "src/main.rs"
+
+[dependencies]
+common = { path = "../common" }
+crypto = { path = "../crypto" }
+sso-protocol = { path = "../sso-protocol" }
+serde.workspace = true
+serde_json = "1"
+serde_urlencoded = "0.7"
+thiserror.workspace = true
+uuid.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal"] }
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "limit"] }
+tracing.workspace = true
+base64 = "0.22"
+sha2.workspace = true
+hmac.workspace = true
+rand.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tokio = { workspace = true, features = ["test-util"] }
+
+[features]
+default = ["production"]
+production = ["common/production", "sso-protocol/production"]

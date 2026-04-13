@@ -17,6 +17,25 @@ members = [
     "admin",
     "sso-protocol",
     "fido",
+    "rsa-verify-shim",
+    # ── CAT-J: compliance / STIG / competitive features ──
+    "authsrv",
+    "ldap-connector",
+    "kerberos-pkinit",
+    "jit-access",
+    "logout-bch",
+    "stepup-mfa",
+    "saml-sp",
+    "account-linking",
+    "offline-jwt",
+    "mfa-sms-push",
+    "mdm-compliance",
+    "threat-intel",
+    "siem-cef-leef",
+    "compliance-reports",
+    "stig-checks",
+    "dudect-harness",
+    "pitr-store",
 ]
 exclude = ["fuzz"]
 
@@ -52,7 +71,7 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 frost-ristretto255 = "2.2"
 frost-core = "2.2"
 opaque-ke = { version = "4.0", features = ["argon2", "ristretto255"] }
-ml-dsa = "0.1.0-rc.7"
+ml-dsa = "=0.1.0-rc.7"
 ml-kem = "0.2"
 argon2 = "0.5"
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std"] }

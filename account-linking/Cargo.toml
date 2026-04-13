@@ -1,0 +1,19 @@
+[package]
+name = "account-linking"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+common = { path = "../common" }
+crypto = { path = "../crypto" }
+serde.workspace = true
+serde_json = "1"
+thiserror.workspace = true
+uuid.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+[features]
+default = ["production"]
+production = ["common/production"]

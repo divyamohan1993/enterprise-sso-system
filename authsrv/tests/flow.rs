@@ -1,0 +1,96 @@
+use authsrv::*;
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use tower::ServiceExt;
+
+fn app() -> axum::Router {
+    let s = test_state();
+    router().with_state(s)
+}
+
+#[tokio::test]
+async fn discovery_returns_endpoints() {
+    let resp = app().oneshot(Request::get("/.well-known/openid-configuration").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(v["token_endpoint"].as_str().unwrap().ends_with("/token"));
+    assert_eq!(v["code_challenge_methods_supported"][0], "S256");
+}
+
+#[tokio::test]
+async fn jwks_returns_keyset() {
+    let resp = app().oneshot(Request::get("/.well-known/jwks.json").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn authorize_requires_pkce_s256() {
+    let q = "response_type=code&client_id=test-client&redirect_uri=https://rp.test/cb&code_challenge=abcdefghijklmnopqrstuvwxyzabcdefghijklmno1234&code_challenge_method=plain";
+    let resp = app().oneshot(Request::get(format!("/authorize?{}", q)).body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn full_code_exchange_round_trip() {
+    let s = test_state();
+    let app = router().with_state(s.clone());
+    let (verifier, challenge) = pkce_pair();
+    let q = format!(
+        "response_type=code&client_id=test-client&redirect_uri=https://rp.test/cb&code_challenge={}&code_challenge_method=S256",
+        challenge
+    );
+    let resp = app.clone().oneshot(Request::get(format!("/authorize?{}", q)).body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let loc = resp.headers().get("location").unwrap().to_str().unwrap().to_string();
+    let code = loc.split("code=").nth(1).unwrap().split('&').next().unwrap().to_string();
+
+    let body = format!("grant_type=authorization_code&code={}&redirect_uri=https://rp.test/cb&client_id=test-client&code_verifier={}", code, verifier);
+    let resp = app.clone().oneshot(
+        Request::post("/token")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap()
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let tr: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(tr["access_token"].as_str().unwrap().starts_with("at_"));
+    assert!(tr["refresh_token"].as_str().unwrap().starts_with("rt_"));
+    assert_eq!(tr["token_type"], "DPoP");
+}
+
+#[tokio::test]
+async fn refresh_token_reuse_revokes_family() {
+    let s = test_state();
+    let app = router().with_state(s.clone());
+    let (v, c) = pkce_pair();
+    let q = format!("response_type=code&client_id=test-client&redirect_uri=https://rp.test/cb&code_challenge={}&code_challenge_method=S256", c);
+    let r = app.clone().oneshot(Request::get(format!("/authorize?{}", q)).body(Body::empty()).unwrap()).await.unwrap();
+    let code = r.headers().get("location").unwrap().to_str().unwrap().split("code=").nth(1).unwrap().to_string();
+    let body = format!("grant_type=authorization_code&code={}&redirect_uri=https://rp.test/cb&client_id=test-client&code_verifier={}", code, v);
+    let r = app.clone().oneshot(Request::post("/token").header("content-type", "application/x-www-form-urlencoded").body(Body::from(body)).unwrap()).await.unwrap();
+    let bytes = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap();
+    let tr: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let rt = tr["refresh_token"].as_str().unwrap().to_string();
+
+    let body = format!("grant_type=refresh_token&refresh_token={}", rt);
+    let r1 = app.clone().oneshot(Request::post("/token").header("content-type", "application/x-www-form-urlencoded").body(Body::from(body.clone())).unwrap()).await.unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+
+    let r2 = app.clone().oneshot(Request::post("/token").header("content-type", "application/x-www-form-urlencoded").body(Body::from(body)).unwrap()).await.unwrap();
+    assert_eq!(r2.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn introspect_unknown_inactive() {
+    let resp = app().oneshot(
+        Request::post("/introspect")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from("token=nope"))
+            .unwrap()
+    ).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["active"], false);
+}

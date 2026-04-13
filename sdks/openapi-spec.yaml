@@ -1,0 +1,123 @@
+openapi: 3.0.3
+info:
+  title: MILNET SSO API
+  version: 0.1.0
+  description: |
+    OpenAPI surface for the MILNET enterprise SSO system. Generated SDKs for
+    Go / Python / .NET / Java / JS are produced from this document via
+    openapi-generator-cli.
+servers:
+  - url: https://sso.milnet.mil
+paths:
+  /.well-known/openid-configuration:
+    get:
+      summary: OpenID Connect discovery
+      operationId: discovery
+      responses:
+        '200':
+          description: discovery document
+          content:
+            application/json:
+              schema:
+                type: object
+  /.well-known/jwks.json:
+    get:
+      summary: JSON Web Key Set
+      operationId: jwks
+      responses:
+        '200':
+          description: keyset
+          content:
+            application/json:
+              schema:
+                type: object
+  /authorize:
+    get:
+      summary: OAuth 2.1 authorization endpoint
+      operationId: authorize
+      parameters:
+        - name: response_type
+          in: query
+          required: true
+          schema: { type: string, enum: [code] }
+        - name: client_id
+          in: query
+          required: true
+          schema: { type: string }
+        - name: redirect_uri
+          in: query
+          required: true
+          schema: { type: string, format: uri }
+        - name: scope
+          in: query
+          schema: { type: string }
+        - name: state
+          in: query
+          schema: { type: string }
+        - name: code_challenge
+          in: query
+          required: true
+          schema: { type: string }
+        - name: code_challenge_method
+          in: query
+          required: true
+          schema: { type: string, enum: [S256] }
+      responses:
+        '303':
+          description: redirect with code
+  /token:
+    post:
+      summary: Token endpoint
+      operationId: token
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [grant_type]
+              properties:
+                grant_type: { type: string }
+                code: { type: string }
+                redirect_uri: { type: string }
+                client_id: { type: string }
+                code_verifier: { type: string }
+                refresh_token: { type: string }
+      responses:
+        '200':
+          description: tokens
+  /userinfo:
+    get:
+      summary: Userinfo
+      operationId: userinfo
+      security:
+        - dpop: []
+      responses:
+        '200':
+          description: claims
+  /introspect:
+    post:
+      summary: RFC 7662 introspection
+      operationId: introspect
+      responses:
+        '200':
+          description: result
+  /revoke:
+    post:
+      summary: RFC 7009 revocation
+      operationId: revoke
+      responses:
+        '200':
+          description: ok
+  /end_session:
+    get:
+      summary: RP-initiated logout
+      operationId: end_session
+      responses:
+        '302':
+          description: redirect
+components:
+  securitySchemes:
+    dpop:
+      type: http
+      scheme: DPoP
