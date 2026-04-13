@@ -105,15 +105,16 @@ pub trait LdapClient: Send + Sync {
 }
 
 pub fn map_ldap_attrs_to_scim_user(dn: &str, attrs: &HashMap<String, Vec<String>>) -> ScimUser {
-    let first = |k: &str| attrs.get(k).and_then(|v| v.first().cloned()).unwrap_or_default();
+    let first_opt = |k: &str| attrs.get(k).and_then(|v| v.first().cloned());
+    let first = |k: &str| first_opt(k).unwrap_or_default();
     let many = |k: &str| attrs.get(k).cloned().unwrap_or_default();
     let usn = attrs.get("uSNChanged")
         .and_then(|v| v.first())
         .and_then(|s| s.parse::<u64>().ok());
     ScimUser {
-        id: first("objectGUID").or_else(|| Some(dn.to_string())).unwrap_or_default(),
-        user_name: first("sAMAccountName").or_else(|| Some(first("uid"))).unwrap_or_default(),
-        display_name: first("displayName").or_else(|| Some(first("cn"))).unwrap_or_default(),
+        id: first_opt("objectGUID").unwrap_or_else(|| dn.to_string()),
+        user_name: first_opt("sAMAccountName").unwrap_or_else(|| first("uid")),
+        display_name: first_opt("displayName").unwrap_or_else(|| first("cn")),
         emails: many("mail"),
         active: first("userAccountControl").parse::<u32>().map(|f| f & 0x2 == 0).unwrap_or(true),
         groups: many("memberOf"),
