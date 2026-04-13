@@ -27,6 +27,10 @@ const MIN_AUTH_DATA_LEN: usize = 37;
 /// Authenticator data flags (section 6.1).
 const FLAG_UP: u8 = 0b0000_0001; // bit 0 -- User Present
 const FLAG_UV: u8 = 0b0000_0100; // bit 2 -- User Verified
+/// bit 3 — Backup Eligible (BE) per WebAuthn L3.
+const FLAG_BE: u8 = 0b0000_1000;
+/// bit 4 — Backup State (BS) per WebAuthn L3.
+const FLAG_BS: u8 = 0b0001_0000;
 const FLAG_AT: u8 = 0b0100_0000; // bit 6 -- Attested credential data included
 const _FLAG_ED: u8 = 0b1000_0000; // bit 7 -- Extension data included
 
@@ -87,6 +91,10 @@ pub struct ParsedAuthData {
     pub user_verified: bool,
     /// True if attested credential data is included.
     pub attested_credential_data: bool,
+    /// B8 — Backup Eligible flag (BE, bit 3).
+    pub backup_eligible: bool,
+    /// B8 — Backup State flag (BS, bit 4).
+    pub backup_state: bool,
 }
 
 /// Parsed client data JSON (CollectedClientData per WebAuthn spec).
@@ -101,11 +109,17 @@ pub struct ParsedClientData {
 }
 
 /// Data extracted from attestation during registration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AttestationData {
     pub credential_id: Vec<u8>,
     pub public_key_cose: Vec<u8>,
     pub sign_count: u32,
+    /// 16-byte authenticator AAGUID (B6).
+    pub aaguid: [u8; 16],
+    /// B8 — backup-eligible flag captured at registration time.
+    pub backup_eligible: bool,
+    /// B8 — backup-state flag captured at registration time.
+    pub backup_state: bool,
 }
 
 /// Result of attestation statement verification.
@@ -148,6 +162,8 @@ pub fn parse_authenticator_data(auth_data: &[u8]) -> Result<ParsedAuthData, &'st
         user_present: flags & FLAG_UP != 0,
         user_verified: flags & FLAG_UV != 0,
         attested_credential_data: flags & FLAG_AT != 0,
+        backup_eligible: flags & FLAG_BE != 0,
+        backup_state: flags & FLAG_BS != 0,
     })
 }
 
@@ -1097,6 +1113,87 @@ pub fn verify_authentication_response(
     Ok(parsed.sign_count)
 }
 
+/// B7 + B8 — Authentication response verification with cloned-credential
+/// lockout and backup-state enforcement.
+///
+/// On sign-count rollback this:
+///   1. sets `stored_credential.cloned_flag = true`
+///   2. emits a SIEM critical event
+///   3. returns Err — and the lockout persists across requests because the
+///      credential mutation is visible to the store
+///
+/// While `cloned_flag` is set every subsequent call returns Err immediately
+/// (no signature verification, no token issuance) until an admin clears the
+/// flag via re-enrollment.
+pub fn verify_authentication_response_with_lockout(
+    auth_result: &crate::types::AuthenticationResult,
+    stored_credential: &mut crate::types::StoredCredential,
+    expected_rp_id: &str,
+    require_user_verification: bool,
+) -> Result<u32, &'static str> {
+    if stored_credential.cloned_flag {
+        tracing::error!(
+            target: "siem",
+            "SIEM:CRITICAL FIDO assertion refused: credential locked (cloned_flag=true) cred_id_len={}",
+            stored_credential.credential_id.len(),
+        );
+        return Err("Credential locked: cloned authenticator detected — admin re-enrollment required");
+    }
+
+    let parsed = parse_authenticator_data(&auth_result.authenticator_data)?;
+    validate_rp_id_hash(&parsed, expected_rp_id)?;
+    validate_user_present(&parsed)?;
+    if require_user_verification {
+        validate_user_verified(&parsed)?;
+    }
+
+    if stored_credential.sign_count > 0 || parsed.sign_count > 0 {
+        if parsed.sign_count <= stored_credential.sign_count {
+            stored_credential.cloned_flag = true;
+            tracing::error!(
+                target: "siem",
+                "SIEM:CRITICAL FIDO sign-count rollback detected — credential locked. \
+                 stored={} authenticator_reported={} cred_id_len={}",
+                stored_credential.sign_count,
+                parsed.sign_count,
+                stored_credential.credential_id.len(),
+            );
+            return Err("Possible authenticator clone detected — credential locked");
+        }
+    }
+
+    // B8: enforce backupState policy
+    if parsed.backup_state && crate::policy::reject_backed_up_credentials() {
+        tracing::warn!(
+            target: "siem",
+            "SIEM:WARN FIDO assertion rejected: backupState=1 not allowed in military mode"
+        );
+        return Err("Backed-up credential rejected by policy (BS=1)");
+    }
+    stored_credential.backup_eligible = parsed.backup_eligible;
+    stored_credential.backup_state = parsed.backup_state;
+
+    let client_data_hash = Sha256::digest(&auth_result.client_data);
+    let pubkey = &stored_credential.public_key;
+    if pubkey.len() == 65 && pubkey[0] == 0x04 {
+        verify_signature_es256(
+            &auth_result.authenticator_data,
+            &client_data_hash,
+            &auth_result.signature,
+            pubkey,
+        )?;
+    } else {
+        verify_signature_cose(
+            &auth_result.authenticator_data,
+            &client_data_hash,
+            &auth_result.signature,
+            pubkey,
+        )?;
+    }
+
+    Ok(parsed.sign_count)
+}
+
 /// Full authentication response verification with client data validation.
 ///
 /// Like [`verify_authentication_response`] but also validates the client data JSON
@@ -1172,10 +1269,16 @@ pub fn parse_attestation_auth_data(
     let credential_id = auth_data[cred_id_start..cred_id_end].to_vec();
     let public_key_cose = auth_data[cred_id_end..].to_vec();
 
+    let mut aaguid = [0u8; 16];
+    aaguid.copy_from_slice(&auth_data[37..53]);
+
     Ok(AttestationData {
         credential_id,
         public_key_cose,
         sign_count: parsed.sign_count,
+        aaguid,
+        backup_eligible: parsed.backup_eligible,
+        backup_state: parsed.backup_state,
     })
 }
 
@@ -1515,6 +1618,9 @@ pub fn verify_attestation_object(
 
     let fmt_str = fmt.ok_or("Attestation object: missing 'fmt' field")?;
     let auth_data = auth_data_bytes.ok_or("Attestation object: missing 'authData' field")?;
+
+    // B9 — enforce attestation format allow-list (military mode forbids none/fido-u2f).
+    crate::policy::enforce_attestation_format(&fmt_str)?;
 
     match fmt_str.as_str() {
         "none" => {
@@ -2175,6 +2281,7 @@ mod tests {
             user_id,
             sign_count: 5,
             authenticator_type: "cross-platform".into(),
+        ..Default::default()
         };
 
         let new_count = verify_authentication_response(&auth_result, &stored, rp_id, true).unwrap();
@@ -2205,6 +2312,7 @@ mod tests {
             user_id,
             sign_count: 10,
             authenticator_type: "platform".into(),
+        ..Default::default()
         };
 
         let err = verify_authentication_response(&auth_result, &stored, rp_id, true).unwrap_err();
@@ -2232,6 +2340,7 @@ mod tests {
             user_id: Uuid::new_v4(),
             sign_count: 5,
             authenticator_type: "platform".into(),
+        ..Default::default()
         };
 
         let err = verify_authentication_response(&auth_result, &stored, rp_id, true).unwrap_err();
@@ -2263,6 +2372,7 @@ mod tests {
             user_id: Uuid::new_v4(),
             sign_count: 0,
             authenticator_type: "cross-platform".into(),
+        ..Default::default()
         };
 
         let result = verify_authentication_response(&auth_result, &stored, rp_id, true);
@@ -2291,6 +2401,7 @@ mod tests {
             user_id: Uuid::new_v4(),
             sign_count: 0,
             authenticator_type: "cross-platform".into(),
+        ..Default::default()
         };
 
         let err = verify_authentication_response(&auth_result, &stored, "sso.milnet.example", true)
@@ -2323,6 +2434,7 @@ mod tests {
             user_id: Uuid::new_v4(),
             sign_count: 0,
             authenticator_type: "cross-platform".into(),
+        ..Default::default()
         };
 
         // UV not required -- should pass
@@ -2370,6 +2482,7 @@ mod tests {
             user_id: Uuid::new_v4(),
             sign_count: 0,
             authenticator_type: "cross-platform".into(),
+        ..Default::default()
         };
 
         let result = verify_authentication_response_full(
@@ -2409,6 +2522,7 @@ mod tests {
             user_id: Uuid::new_v4(),
             sign_count: 0,
             authenticator_type: "cross-platform".into(),
+        ..Default::default()
         };
 
         let err = verify_authentication_response_full(
@@ -2853,6 +2967,7 @@ mod tests {
             user_id: Uuid::new_v4(),
             sign_count: 0,
             authenticator_type: "cross-platform".into(),
+        ..Default::default()
         };
         let result = verify_authentication_response(&auth_result, &stored, rp_id, true);
         assert!(result.is_ok());
@@ -2892,6 +3007,7 @@ mod tests {
             user_id: Uuid::new_v4(),
             sign_count: 0,
             authenticator_type: "cross-platform".into(),
+        ..Default::default()
         };
         let result = verify_authentication_response(&auth_result, &stored, rp_id, true);
         assert!(result.is_ok());
@@ -2928,6 +3044,7 @@ mod tests {
             user_id: Uuid::new_v4(),
             sign_count: 0,
             authenticator_type: "cross-platform".into(),
+        ..Default::default()
         };
         let result = verify_authentication_response(&auth_result, &stored, rp_id, true);
         assert!(result.is_ok());
@@ -2966,6 +3083,7 @@ mod tests {
             user_id: Uuid::new_v4(),
             sign_count: 0,
             authenticator_type: "cross-platform".into(),
+        ..Default::default()
         };
         // ES256 key can't verify RS256 signature
         assert!(verify_authentication_response(&auth_result, &stored, rp_id, true).is_err());

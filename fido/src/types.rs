@@ -61,7 +61,7 @@ pub struct AllowCredential {
 }
 
 /// Stored credential for a user.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct StoredCredential {
     pub credential_id: Vec<u8>,
     pub public_key: Vec<u8>,
@@ -69,7 +69,24 @@ pub struct StoredCredential {
     pub sign_count: u32,
     /// `"platform"` (Windows Hello, Touch ID) or `"cross-platform"` (YubiKey).
     pub authenticator_type: String,
+    /// FIDO2 AAGUID of the registering authenticator (16 bytes).
+    /// Defaults to all-zero for legacy records loaded without an AAGUID.
+    #[serde(default = "default_aaguid")]
+    pub aaguid: [u8; 16],
+    /// B7 — set to `true` when a sign-count rollback is detected. While this
+    /// flag is set the credential is locked out and ALL future assertions are
+    /// rejected until an admin re-enrolls it via the OPAQUE admin path.
+    #[serde(default)]
+    pub cloned_flag: bool,
+    /// WebAuthn `backupEligible` (BE) flag from the most recent ceremony.
+    #[serde(default)]
+    pub backup_eligible: bool,
+    /// WebAuthn `backupState` (BS) flag from the most recent ceremony.
+    #[serde(default)]
+    pub backup_state: bool,
 }
+
+fn default_aaguid() -> [u8; 16] { [0u8; 16] }
 
 impl std::fmt::Debug for StoredCredential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

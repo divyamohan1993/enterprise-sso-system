@@ -16,6 +16,33 @@ use sha2::Sha512;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 use serde::{Serialize, Deserialize};
 
+/// Zeroize-on-drop wrapper for Shamir polynomial coefficients.
+///
+/// SECURITY: B4 — coefficients carry the secret share polynomial; if a panic
+/// unwinds shamir_split they must be wiped before stack memory is released.
+/// `ZeroizeOnDrop` ensures the inner Vec is wiped on every exit path including
+/// panic unwind.
+#[derive(Zeroize, ZeroizeOnDrop)]
+struct PolyCoeffs(Vec<u8>);
+
+impl PolyCoeffs {
+    fn new(len: usize) -> Self {
+        Self(vec![0u8; len])
+    }
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.0
+    }
+}
+
+impl core::ops::Deref for PolyCoeffs {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] { &self.0 }
+}
+
+impl core::ops::DerefMut for PolyCoeffs {
+    fn deref_mut(&mut self) -> &mut [u8] { &mut self.0 }
+}
+
 // ---------------------------------------------------------------------------
 // GF(256) arithmetic — irreducible polynomial x^8 + x^4 + x^3 + x + 1 (0x11B)
 // ---------------------------------------------------------------------------
@@ -88,14 +115,16 @@ fn shamir_split(secret: &[u8; 32], threshold: u8, total: u8) -> Vec<OprfShare> {
         })
         .collect();
 
-    // For each byte position, create a random polynomial and evaluate
-    let mut coefficients = vec![0u8; threshold as usize];
+    // For each byte position, create a random polynomial and evaluate.
+    // SECURITY (B4): PolyCoeffs is `ZeroizeOnDrop` — the secret-bearing
+    // coefficients are wiped on every exit path, including panic unwind.
+    let mut coefficients = PolyCoeffs::new(threshold as usize);
     for byte_idx in 0..32 {
         // coefficient[0] = secret byte (the constant term)
         coefficients[0] = secret[byte_idx];
 
         // Random coefficients for degrees 1..threshold-1
-        getrandom::getrandom(&mut coefficients[1..]).unwrap_or_else(|e| {
+        getrandom::getrandom(&mut coefficients.as_mut_slice()[1..]).unwrap_or_else(|e| {
             tracing::error!("FATAL: CSPRNG failure in OPAQUE threshold sharing: {e}");
             std::process::exit(1);
         });
@@ -113,10 +142,8 @@ fn shamir_split(secret: &[u8; 32], threshold: u8, total: u8) -> Vec<OprfShare> {
         }
     }
 
-    // Zeroize coefficients
-    for c in coefficients.iter_mut() {
-        *c = 0;
-    }
+    // PolyCoeffs Drop runs here — explicit drop documents the wipe.
+    drop(coefficients);
 
     shares
 }

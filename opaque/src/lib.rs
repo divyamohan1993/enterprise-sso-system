@@ -7,6 +7,7 @@
 
 pub mod messages;
 pub mod opaque_impl;
+pub mod rate_limit;
 pub mod service;
 pub mod store;
 pub mod threshold;

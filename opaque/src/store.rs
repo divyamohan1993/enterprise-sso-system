@@ -392,6 +392,89 @@ impl CredentialStore {
         self.store_registration(username, registration_bytes)
     }
 
+    /// Admin-authorized re-registration (B11).
+    ///
+    /// This is the only password-reset / re-enrollment path. There is NO
+    /// self-service password reset by design — military deployment requires
+    /// out-of-band admin authorization for any credential rotation.
+    ///
+    /// `admin_pq_verifying_key` — ML-DSA-87 verifying key for the admin role
+    /// (from common::sealed_keys / orchestrator key escrow).
+    /// `admin_signature` — ML-DSA-87 signature over
+    ///     `b"MILNET-OPAQUE-REREG-V1" || user_id_bytes || sha512(new_envelope)`.
+    /// `new_opaque_envelope` — the new serialized `RegistrationUpload` produced
+    /// by a fresh client OPAQUE registration ceremony.
+    ///
+    /// On success, an audit entry is emitted and the existing user record is
+    /// overwritten. On signature failure the call returns
+    /// `MilnetError::CryptoVerification` and emits a SIEM critical event.
+    pub fn re_register_with_admin_authorization(
+        &mut self,
+        admin_pq_verifying_key: &[u8],
+        admin_signature: &[u8],
+        username: &str,
+        user_id: Uuid,
+        new_opaque_envelope: Vec<u8>,
+    ) -> Result<Uuid, MilnetError> {
+        use sha2::{Digest, Sha512};
+
+        let mut h = Sha512::new();
+        h.update(b"MILNET-OPAQUE-REREG-V1");
+        h.update(user_id.as_bytes());
+        let env_digest = {
+            let mut e = Sha512::new();
+            e.update(&new_opaque_envelope);
+            e.finalize()
+        };
+        h.update(env_digest);
+        let signed_message = h.finalize();
+
+        if !crypto::pq_sign::pq_verify_raw(admin_pq_verifying_key, &signed_message, admin_signature) {
+            tracing::error!(
+                target: "siem",
+                "SIEM:CRITICAL OPAQUE re-registration: admin ML-DSA-87 signature verification failed"
+            );
+            return Err(MilnetError::CryptoVerification(
+                "admin re-registration signature invalid".into(),
+            ));
+        }
+
+        // Validate that the new envelope is a parseable OPAQUE upload before
+        // committing the overwrite. Accept either RegistrationUpload (raw
+        // client finish message) or a finalized ServerRegistration blob.
+        let registration_bytes = match opaque_ke::RegistrationUpload::<OpaqueCs>::deserialize(
+            &new_opaque_envelope,
+        ) {
+            Ok(upload) => ServerRegistration::<OpaqueCs>::finish(upload).serialize().to_vec(),
+            Err(_) => match ServerRegistration::<OpaqueCs>::deserialize(&new_opaque_envelope) {
+                Ok(_) => new_opaque_envelope.clone(),
+                Err(_) => {
+                    return Err(MilnetError::CryptoVerification(
+                        "new_opaque_envelope is not a valid OPAQUE upload".into(),
+                    ));
+                }
+            },
+        };
+
+        let new_uid = self.re_register_user(username, registration_bytes)?;
+
+        common::audit_bridge::buffer_audit_entry(
+            common::audit_bridge::create_audit_entry(
+                common::types::AuditEventType::AuthSuccess,
+                vec![new_uid],
+                Vec::new(),
+                None,
+                None,
+            ),
+        );
+        tracing::info!(
+            target: "siem",
+            "SIEM:INFO OPAQUE re-registration authorized by admin signature for user_id={}",
+            common::log_pseudonym::pseudonym_uuid(new_uid),
+        );
+        Ok(new_uid)
+    }
+
     /// Authorized re-registration with password. Runs the full OPAQUE protocol
     /// and overwrites the existing user record. Fails if user does not exist.
     pub fn re_register_with_password(&mut self, username: &str, password: &[u8]) -> Result<Uuid, MilnetError> {

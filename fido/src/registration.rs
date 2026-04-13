@@ -255,6 +255,14 @@ pub fn validate_and_register(
     // Parse and validate attestation authenticator data
     let att_data = verification::parse_attestation_auth_data(auth_data, expected_rp_id)?;
 
+    // B6: enforce AAGUID allow-list (military mode rejects unknown authenticators)
+    crate::policy::enforce_aaguid(&att_data.aaguid)?;
+
+    // B8: reject backed-up credentials when policy requires it
+    if att_data.backup_state && crate::policy::reject_backed_up_credentials() {
+        return Err("Registration rejected: backupState=1 not allowed in military mode");
+    }
+
     // Reject duplicate credential IDs
     if store.credential_exists(&att_data.credential_id) {
         return Err("Credential ID already registered (duplicate registration rejected)");
@@ -266,6 +274,10 @@ pub fn validate_and_register(
         user_id,
         sign_count: att_data.sign_count,
         authenticator_type: authenticator_type.to_string(),
+        aaguid: att_data.aaguid,
+        cloned_flag: false,
+        backup_eligible: att_data.backup_eligible,
+        backup_state: att_data.backup_state,
     };
 
     store.store_credential(cred.clone());
@@ -352,6 +364,7 @@ impl PersistentCredentialStore {
                     user_id,
                     sign_count: sign_count as u32,
                     authenticator_type: auth_type,
+                ..Default::default()
                 });
             }
         }
@@ -532,6 +545,7 @@ mod tests {
             user_id,
             sign_count: 0,
             authenticator_type: "cross-platform".into(),
+        ..Default::default()
         };
         store.store_credential(cred);
 
@@ -643,6 +657,7 @@ mod tests {
             user_id: Uuid::new_v4(),
             sign_count: 0,
             authenticator_type: "platform".into(),
+        ..Default::default()
         });
         assert!(store.credential_exists(&cred_id));
     }

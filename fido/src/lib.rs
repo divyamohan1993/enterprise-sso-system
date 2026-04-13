@@ -5,6 +5,7 @@
 //! cross-platform authenticators (YubiKey, other security keys).
 
 pub mod authentication;
+pub mod policy;
 pub mod registration;
 pub mod types;
 pub mod verification;

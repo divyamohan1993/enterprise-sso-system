@@ -45,6 +45,23 @@ pub fn verify_authentication_response(
     )
 }
 
+/// B7 — Verify an authentication response and lock the credential on
+/// sign-count rollback. Mutates `stored_credential` to set `cloned_flag` if
+/// a clone is detected; the caller must persist the mutation.
+pub fn verify_authentication_response_with_lockout(
+    auth_result: &AuthenticationResult,
+    stored_credential: &mut StoredCredential,
+    expected_rp_id: &str,
+    require_user_verification: bool,
+) -> Result<u32, &'static str> {
+    verification::verify_authentication_response_with_lockout(
+        auth_result,
+        stored_credential,
+        expected_rp_id,
+        require_user_verification,
+    )
+}
+
 /// Update the stored sign count after a successful authentication.
 ///
 /// The caller must ensure `new_count` came from a successful call to
@@ -77,6 +94,7 @@ mod tests {
             user_id,
             sign_count: 5,
             authenticator_type: "platform".into(),
+        ..Default::default()
         };
         let cred2 = StoredCredential {
             credential_id: vec![4, 5, 6],
@@ -84,6 +102,7 @@ mod tests {
             user_id,
             sign_count: 2,
             authenticator_type: "cross-platform".into(),
+        ..Default::default()
         };
 
         let opts = create_authentication_options("sso.milnet.example", &[&cred1, &cred2]);
@@ -113,6 +132,7 @@ mod tests {
             user_id: Uuid::new_v4(),
             sign_count: 5,
             authenticator_type: "platform".into(),
+        ..Default::default()
         };
         assert!(update_sign_count(&mut cred, 10).is_ok());
         assert_eq!(cred.sign_count, 10);
@@ -126,6 +146,7 @@ mod tests {
             user_id: Uuid::new_v4(),
             sign_count: 0,
             authenticator_type: "cross-platform".into(),
+        ..Default::default()
         };
         // 0 -> 0 is allowed (authenticator doesn't support counters)
         assert!(update_sign_count(&mut cred, 0).is_ok());
@@ -140,6 +161,7 @@ mod tests {
             user_id: Uuid::new_v4(),
             sign_count: 10,
             authenticator_type: "platform".into(),
+        ..Default::default()
         };
         let err = update_sign_count(&mut cred, 5).unwrap_err();
         assert_eq!(err, "New sign count must not be less than stored sign count");
@@ -155,6 +177,7 @@ mod tests {
             user_id: Uuid::new_v4(),
             sign_count: 7,
             authenticator_type: "platform".into(),
+        ..Default::default()
         };
         let err = update_sign_count(&mut cred, 7).unwrap_err();
         assert_eq!(

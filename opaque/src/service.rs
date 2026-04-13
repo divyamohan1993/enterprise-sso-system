@@ -25,7 +25,32 @@ use tracing::{error, info};
 
 use crate::messages::{OpaqueRequest, OpaqueResponse};
 use crate::opaque_impl::{OpaqueCs, OpaqueCsFips};
+use crate::rate_limit::{LimitReject, OprfRateLimiter};
 use crate::store::CredentialStore;
+
+/// Length (bytes) of an RFC 9266 TLS exporter used as channel binding for
+/// OPAQUE messages. Standard exporters output 32 bytes.
+pub const TLS_EXPORTER_LEN: usize = 32;
+
+/// HKDF context label used to bind the TLS exporter into the OPAQUE
+/// transcript via `ServerLoginParameters.context`. Any tampering with the
+/// underlying TLS connection will produce a different binding and the OPAQUE
+/// `LoginFinish` will fail.
+pub const CHANNEL_BINDING_LABEL: &[u8] = b"MILNET-OPAQUE-CHANNEL-BIND-RFC9266-V1";
+
+/// Build the channel-binding context byte string injected into the OPAQUE
+/// transcript. CNSA 2.0 — uses HKDF-SHA512 to compress the exporter and
+/// label into a 32-byte context tag.
+pub fn build_channel_binding_context(tls_exporter: &[u8; TLS_EXPORTER_LEN]) -> [u8; 32] {
+    use hkdf::Hkdf;
+    use sha2::Sha512;
+    let hk = Hkdf::<Sha512>::new(Some(CHANNEL_BINDING_LABEL), tls_exporter);
+    let mut out = [0u8; 32];
+    // Expand failure on a 32-byte output is impossible for SHA-512 OKM length.
+    hk.expand(b"opaque-channel-binding", &mut out)
+        .expect("HKDF-SHA512 expand of 32 bytes never fails");
+    out
+}
 
 /// ML-DSA-87 receipt signer (CNSA 2.0 Level 5 compliant).
 pub struct ReceiptSigner {
@@ -84,6 +109,157 @@ const MAX_USERNAME_BYTES: usize = 255;
 /// Ensures consistent response timing whether the user exists or not,
 /// preventing timing-based username enumeration.
 const LOGIN_LOOKUP_FLOOR_US: u128 = 5_000; // 5ms
+
+/// Handle a LoginStart request with TLS channel binding (B1) and OPRF rate
+/// limiting (B2). The `tls_exporter` is the RFC 9266 TLS exporter
+/// (`tls-exporter` in TLS 1.3) bound to the underlying connection. The
+/// `client_ip` is used as the per-IP rate-limit key.
+///
+/// On success returns `(response_bytes, ServerLogin state)`. On rate-limit
+/// rejection returns `Err`. Fails CLOSED on limiter lookup failure.
+pub fn handle_login_start_bound(
+    store: &CredentialStore,
+    rl: &OprfRateLimiter,
+    client_ip: &str,
+    username: &str,
+    credential_request_bytes: &[u8],
+    tls_exporter: &[u8; TLS_EXPORTER_LEN],
+) -> Result<(Vec<u8>, ServerLogin<OpaqueCs>), String> {
+    rl.check(client_ip, username).map_err(|e: LimitReject| {
+        common::audit_bridge::buffer_audit_entry(
+            common::audit_bridge::create_audit_entry(
+                common::types::AuditEventType::AuthFailure,
+                Vec::new(),
+                Vec::new(),
+                None,
+                None,
+            ),
+        );
+        format!("OPRF rate-limit reject: {e}")
+    })?;
+
+    if username.len() > MAX_USERNAME_BYTES {
+        return Err("username exceeds maximum length".to_string());
+    }
+
+    let start = Instant::now();
+
+    let credential_request = CredentialRequest::<OpaqueCs>::deserialize(credential_request_bytes)
+        .map_err(|e| format!("deserialize credential request: {e}"))?;
+
+    let password_file = match store.get_registration(username) {
+        Ok((reg, _user_id)) => Some(reg),
+        Err(_) => None,
+    };
+
+    let binding = build_channel_binding_context(tls_exporter);
+    let mut params = ServerLoginParameters::default();
+    params.context = Some(&binding[..]);
+
+    let mut rng = rand::rngs::OsRng;
+    let server_login_start = ServerLogin::<OpaqueCs>::start(
+        &mut rng,
+        store.server_setup(),
+        password_file,
+        credential_request,
+        username.as_bytes(),
+        params,
+    )
+    .map_err(|e| format!("server login start: {e}"))?;
+
+    let response_bytes = server_login_start.message.serialize().to_vec();
+
+    let elapsed_us = start.elapsed().as_micros();
+    if elapsed_us < LOGIN_LOOKUP_FLOOR_US {
+        let remaining = LOGIN_LOOKUP_FLOOR_US - elapsed_us;
+        std::thread::sleep(std::time::Duration::from_micros(remaining as u64));
+    }
+
+    Ok((response_bytes, server_login_start.state))
+}
+
+/// Channel-bound LoginFinish (B1, B10). Returns the OPAQUE session_key in
+/// addition to the standard OpaqueResponse so the SSO protocol layer can
+/// bind it to DPoP / TLS exporter / further key derivation.
+///
+/// SECURITY: callers MUST consume `session_key` and zeroize it after use.
+/// The session_key is the output of the OPAQUE 3DH key exchange and grants
+/// authenticated channel state to the holder.
+pub fn handle_login_finish_bound(
+    server_login: ServerLogin<OpaqueCs>,
+    credential_finalization_bytes: &[u8],
+    signer: &ReceiptSigner,
+    user_id: uuid::Uuid,
+    ceremony_session_id: [u8; 32],
+    dpop_key_hash: [u8; 64],
+    tls_exporter: &[u8; TLS_EXPORTER_LEN],
+) -> (OpaqueResponse, Option<Vec<u8>>) {
+    let credential_finalization =
+        match CredentialFinalization::<OpaqueCs>::deserialize(credential_finalization_bytes) {
+            Ok(cf) => cf,
+            Err(e) => {
+                return (
+                    OpaqueResponse::Error {
+                        message: format!("deserialize credential finalization: {e}"),
+                    },
+                    None,
+                );
+            }
+        };
+
+    let binding = build_channel_binding_context(tls_exporter);
+    let mut params = ServerLoginParameters::default();
+    params.context = Some(&binding[..]);
+
+    match server_login.finish(credential_finalization, params) {
+        Ok(server_login_finish) => {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(std::time::Duration::ZERO)
+                .as_micros() as i64;
+            let mut receipt = Receipt {
+                ceremony_session_id,
+                step_id: 1,
+                prev_receipt_hash: [0u8; 64],
+                user_id,
+                dpop_key_hash,
+                timestamp: now,
+                nonce: generate_nonce(),
+                signature: Vec::new(),
+                ttl_seconds: 30,
+            };
+            signer.sign(&mut receipt);
+            common::audit_bridge::buffer_audit_entry(
+                common::audit_bridge::create_audit_entry(
+                    common::types::AuditEventType::AuthSuccess,
+                    vec![user_id],
+                    Vec::new(),
+                    None,
+                    None,
+                ),
+            );
+            let session_key = server_login_finish.session_key.as_slice().to_vec();
+            (OpaqueResponse::LoginSuccess { receipt }, Some(session_key))
+        }
+        Err(_) => {
+            common::audit_bridge::buffer_audit_entry(
+                common::audit_bridge::create_audit_entry(
+                    common::types::AuditEventType::AuthFailure,
+                    vec![user_id],
+                    Vec::new(),
+                    None,
+                    None,
+                ),
+            );
+            (
+                OpaqueResponse::Error {
+                    message: "password verification failed".into(),
+                },
+                None,
+            )
+        }
+    }
+}
 
 /// Handle a LoginStart request: perform the server side of OPAQUE login step 1.
 ///
