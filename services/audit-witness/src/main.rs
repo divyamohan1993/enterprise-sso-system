@@ -83,7 +83,8 @@ fn main() {
     // ── Load the witness signing key ─────────────────────────────────────
     let signing_key = load_signing_key();
     let verifying_key = signing_key.verifying_key().clone();
-    let vk_hex = hex::encode(verifying_key.encode().as_ref());
+    let vk_bytes = verifying_key.encode();
+    let vk_hex = hex::encode(AsRef::<[u8]>::as_ref(&vk_bytes));
     tracing::info!(vk_prefix = %&vk_hex[..16], "audit-witness key loaded");
 
     // ── Bind the UDS ─────────────────────────────────────────────────────
