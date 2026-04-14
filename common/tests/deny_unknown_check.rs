@@ -23,7 +23,6 @@ use syn::{visit::Visit, Fields, ItemStruct, Visibility};
 struct Violation {
     file: PathBuf,
     name: String,
-    line: usize,
 }
 
 struct Checker {
@@ -78,11 +77,11 @@ impl<'ast> Visit<'ast> for Checker {
         if has_deny_unknown(s) {
             return;
         }
+        // proc-macro2 Span::start().line is gated behind procmacro2_semver_exempt
+        // on stable; report file + struct name only.
         self.violations.push(Violation {
             file: self.file.clone(),
             name: s.ident.to_string(),
-            // syn 2.x exposes the span; line() returns 1-based source line.
-            line: s.ident.span().start().line,
         });
     }
 }
@@ -141,7 +140,7 @@ fn every_pub_deserialize_struct_has_deny_unknown_fields() {
              #[serde(deny_unknown_fields)]:\n",
         );
         for v in &all_violations {
-            msg.push_str(&format!("  {}:{} -- {}\n", v.file.display(), v.line, v.name));
+            msg.push_str(&format!("  {} -- {}\n", v.file.display(), v.name));
         }
         panic!("{msg}");
     }
