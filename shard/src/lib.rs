@@ -6,5 +6,6 @@
 
 pub mod protocol;
 pub mod tls;
+pub mod tls_ca;
 pub mod tls_transport;
 pub mod transport;
