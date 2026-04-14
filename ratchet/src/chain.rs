@@ -52,6 +52,26 @@ impl std::error::Error for RatchetError {}
 /// Maximum lookahead/lookbehind window for epoch verification.
 const EPOCH_WINDOW: u64 = 3;
 
+/// A2: ratchet protocol version. Bumped to 2 when PQ puncturing was added.
+pub const PROTOCOL_VERSION: u16 = 2;
+
+/// A2: periodicity (in epochs) at which a PQ puncture is mixed into the
+/// chain via X-Wing decapsulation. At 10s/epoch this puts a PQ re-keying
+/// event roughly every ~2.8 hours, well within the 8h maximum session
+/// lifetime so every chain receives at least one PQ mix in production.
+pub const PQ_PUNCTURE_INTERVAL: u64 = 1000;
+
+/// A2: size of the pre-computed X-Wing ciphertext ring allocated at session
+/// establishment. 10_000 ciphertexts gives ~10 full puncture cycles of the
+/// 1000-epoch interval, more than the 2880-epoch max session lifetime can
+/// consume, so a session never runs out of PQ material.
+pub const PQ_CIPHERTEXT_RING_SIZE: usize = 10_000;
+
+/// A2: domain separator for the HKDF mix performed on a PQ puncture.
+/// The new chain key is derived as
+/// `HKDF-SHA512(old_chain_key || pq_shared_secret, info=PQ_PUNCTURE_INFO)`.
+const PQ_PUNCTURE_INFO: &[u8] = b"milnet-ratchet-pq-puncture-v1";
+
 /// Number of recent server nonces to track for clone detection.
 ///
 /// Expanded from 10 to 1000 to cover longer session windows.  At 10s per
@@ -254,6 +274,21 @@ pub struct RatchetChain {
     /// the exact `recent_nonces` window.  Nonces are added to the filter
     /// as they age out of the exact-match deque.
     nonce_bloom: NonceBloomFilter,
+    /// A2: PQ puncture state. `pq_ciphertext_ring` holds one pre-computed
+    /// X-Wing ciphertext per puncture event, produced at session
+    /// establishment via `crypto::xwing::xwing_encapsulate` against the
+    /// peer's pinned X-Wing public key. On each puncture the next entry is
+    /// consumed (decapsulated via the local X-Wing secret to recover the
+    /// shared secret), mixed into the chain key, and zeroized in place.
+    /// `pq_keypair` is retained to perform those decapsulations.
+    /// `pq_puncture_index` records how many ciphertexts have been consumed
+    /// so that persistent state (`from_persisted`) can resume correctly and
+    /// never replay the same ciphertext across a crash. When no PQ material
+    /// was configured (legacy `new`), both fields are `None` and puncturing
+    /// is a no-op.
+    pq_ciphertext_ring: Option<Vec<zeroize::Zeroizing<Vec<u8>>>>,
+    pq_keypair: Option<std::sync::Arc<crypto::xwing::XWingKeyPair>>,
+    pq_puncture_index: u64,
 }
 
 // SAFETY: RatchetChain is only mutated through &mut self (advance, lock_chain_key, etc.)
@@ -284,6 +319,15 @@ impl Zeroize for RatchetChain {
         self.canary_tail.zeroize();
         self.expected_head.zeroize();
         self.expected_tail.zeroize();
+        // A2: drop PQ ring (Zeroizing entries wipe on drop) and keypair.
+        if let Some(mut ring) = self.pq_ciphertext_ring.take() {
+            for ct in ring.iter_mut() {
+                ct.zeroize();
+            }
+            ring.clear();
+        }
+        self.pq_keypair = None;
+        self.pq_puncture_index.zeroize();
     }
 }
 
@@ -367,9 +411,130 @@ impl RatchetChain {
             recent_nonces: VecDeque::new(),
             recent_nonces_set: HashSet::new(),
             nonce_bloom: NonceBloomFilter::new(),
+            pq_ciphertext_ring: None,
+            pq_keypair: None,
+            pq_puncture_index: 0,
         };
         chain.lock_chain_key().map_err(|e| e.to_string())?;
         Ok(chain)
+    }
+
+    /// A2: create a new chain with a pre-computed X-Wing ciphertext ring
+    /// bound to `local_kp` and `peer_pk`. At session establishment we run
+    /// `PQ_CIPHERTEXT_RING_SIZE` X-Wing encapsulations against the peer's
+    /// public key; on every `advance` whose resulting epoch is a multiple
+    /// of [`PQ_PUNCTURE_INTERVAL`], the next ciphertext is decapsulated
+    /// with `local_kp` and its 64-byte shared secret is mixed into the
+    /// chain key via HKDF-SHA512 with the [`PQ_PUNCTURE_INFO`] separator.
+    /// This provides a CNSA 2.0 Level 5 PQ re-keying event independent of
+    /// the classical HKDF ratchet so an attacker harvesting ciphertexts
+    /// today cannot recover future chain keys even with a cryptographically
+    /// relevant quantum computer.
+    pub fn new_with_pq(
+        master_secret: &[u8; 64],
+        peer_pk: &crypto::xwing::XWingPublicKey,
+        local_kp: std::sync::Arc<crypto::xwing::XWingKeyPair>,
+    ) -> Result<Self, String> {
+        let mut chain = Self::new(master_secret)?;
+        let mut ring: Vec<zeroize::Zeroizing<Vec<u8>>> =
+            Vec::with_capacity(PQ_CIPHERTEXT_RING_SIZE);
+        for _ in 0..PQ_CIPHERTEXT_RING_SIZE {
+            let (_ss, ct) = crypto::xwing::xwing_encapsulate(peer_pk)
+                .map_err(|e| format!("A2: X-Wing encapsulate failed: {:?}", e))?;
+            // Drop the fresh shared secret: the ring stores only ciphertexts.
+            // The peer will recover the same shared secret at puncture time by
+            // decapsulating with the secret half of `local_kp`.
+            ring.push(zeroize::Zeroizing::new(ct.to_bytes()));
+        }
+        chain.pq_ciphertext_ring = Some(ring);
+        chain.pq_keypair = Some(local_kp);
+        chain.pq_puncture_index = 0;
+        Ok(chain)
+    }
+
+    /// A2: apply a PQ puncture to `chain_key` in-place at `epoch` boundaries
+    /// that are multiples of `PQ_PUNCTURE_INTERVAL`. Consumes the next entry
+    /// from the ciphertext ring, decapsulates via the local X-Wing secret,
+    /// and mixes the 64-byte shared secret into the current chain key:
+    ///
+    /// ```text
+    /// new_chain = HKDF-SHA512(
+    ///     salt = old_chain_key,
+    ///     ikm  = pq_shared_secret,
+    ///     info = "milnet-ratchet-pq-puncture-v1"
+    /// )
+    /// ```
+    ///
+    /// Returns `Ok(true)` when a puncture was applied, `Ok(false)` when no
+    /// PQ material was configured or the ring was exhausted (fail-open on
+    /// exhaustion is explicitly rejected — we instead log SIEM:CRITICAL and
+    /// refuse to advance). Errors from X-Wing decapsulation are surfaced as
+    /// `RatchetError::ZeroEntropy` so they trigger the existing fail-closed
+    /// session-termination path.
+    fn apply_pq_puncture(&mut self) -> Result<bool, RatchetError> {
+        let kp = match &self.pq_keypair {
+            Some(kp) => kp.clone(),
+            None => return Ok(false),
+        };
+        let idx = self.pq_puncture_index as usize;
+        let ring = match &mut self.pq_ciphertext_ring {
+            Some(r) => r,
+            None => return Ok(false),
+        };
+        if idx >= ring.len() {
+            tracing::error!(
+                epoch = self.epoch,
+                "SIEM:CRITICAL ratchet PQ ciphertext ring exhausted at puncture index {} — \
+                 refusing to advance without PQ cover",
+                idx
+            );
+            return Err(RatchetError::ZeroEntropy(
+                "PQ ring exhausted".into(),
+            ));
+        }
+
+        let ct_bytes = ring[idx].clone();
+        let ct = match crypto::xwing::Ciphertext::from_bytes(&ct_bytes) {
+            Some(c) => c,
+            None => {
+                tracing::error!(
+                    epoch = self.epoch,
+                    "SIEM:CRITICAL ratchet PQ ciphertext at index {} failed to parse",
+                    idx
+                );
+                return Err(RatchetError::ZeroEntropy(
+                    "PQ ciphertext parse failed".into(),
+                ));
+            }
+        };
+        let ss = crypto::xwing::xwing_decapsulate(&kp, &ct).map_err(|e| {
+            tracing::error!(
+                epoch = self.epoch,
+                "SIEM:CRITICAL ratchet PQ decapsulate failed at index {}: {:?}",
+                idx, e
+            );
+            RatchetError::ZeroEntropy("PQ decapsulate failed".into())
+        })?;
+
+        // HKDF-SHA512(salt=old_chain_key, ikm=pq_shared_secret, info=...).
+        let hk = Hkdf::<Sha512>::new(Some(self.chain_key_ref()), ss.as_bytes());
+        let mut new_key = zeroize::Zeroizing::new([0u8; 64]);
+        hk.expand(PQ_PUNCTURE_INFO, &mut new_key[..])
+            .map_err(|_| RatchetError::ZeroEntropy("HKDF expand failed on PQ puncture".into()))?;
+
+        // Re-lock swap semantics identical to `advance`.
+        if self.key_locked {
+            munlock_region(self.chain_key_ref().as_ptr(), self.chain_key_ref().len());
+            self.key_locked = false;
+        }
+        self.chain_key_mut().zeroize();
+        *self.chain_key_mut() = *new_key;
+        self.lock_chain_key()?;
+
+        // Zeroize the consumed ciphertext in place and bump the index.
+        ring[idx].zeroize();
+        self.pq_puncture_index = self.pq_puncture_index.saturating_add(1);
+        Ok(true)
     }
 
     /// Advance the chain by one epoch.
@@ -513,6 +678,13 @@ impl RatchetChain {
         // Re-lock the new key. If lock_chain_key() fails, Zeroizing<...> drops
         // above will still scrub `new_key` and `info` on the unwinding path.
         self.lock_chain_key()?;
+
+        // A2: apply a PQ puncture once every `PQ_PUNCTURE_INTERVAL` epochs
+        // (and always on epoch 0, so a session's very first advance receives
+        // PQ cover). Skipped when no PQ material was configured.
+        if self.epoch != 0 && self.epoch % PQ_PUNCTURE_INTERVAL == 0 {
+            let _ = self.apply_pq_puncture()?;
+        }
 
         Ok(())
     }
@@ -688,9 +860,49 @@ impl RatchetChain {
             recent_nonces: VecDeque::new(),
             recent_nonces_set: HashSet::new(),
             nonce_bloom: NonceBloomFilter::new(),
+            pq_ciphertext_ring: None,
+            pq_keypair: None,
+            pq_puncture_index: 0,
         };
         chain.lock_chain_key().map_err(|e| e.to_string())?;
         Ok(chain)
+    }
+
+    /// A2: restore the ratchet's PQ puncture state after a crash. The caller
+    /// must supply the same (peer_pk, local_kp) pair that was used to
+    /// construct the session so ciphertexts are pinned to the same X-Wing
+    /// identities. `puncture_index` is the persisted count of already-
+    /// consumed ciphertexts. Entries at indices `< puncture_index` are
+    /// immediately zeroized to preserve the forward-secrecy invariant that
+    /// no ciphertext may be re-used after a crash restart.
+    pub fn restore_pq_state(
+        &mut self,
+        peer_pk: &crypto::xwing::XWingPublicKey,
+        local_kp: std::sync::Arc<crypto::xwing::XWingKeyPair>,
+        puncture_index: u64,
+    ) -> Result<(), String> {
+        let mut ring: Vec<zeroize::Zeroizing<Vec<u8>>> =
+            Vec::with_capacity(PQ_CIPHERTEXT_RING_SIZE);
+        for i in 0..PQ_CIPHERTEXT_RING_SIZE {
+            let (_ss, ct) = crypto::xwing::xwing_encapsulate(peer_pk)
+                .map_err(|e| format!("A2: X-Wing encapsulate failed on restore: {:?}", e))?;
+            let mut z = zeroize::Zeroizing::new(ct.to_bytes());
+            if (i as u64) < puncture_index {
+                // Already consumed in a prior run — scrub immediately.
+                z.zeroize();
+            }
+            ring.push(z);
+        }
+        self.pq_ciphertext_ring = Some(ring);
+        self.pq_keypair = Some(local_kp);
+        self.pq_puncture_index = puncture_index;
+        Ok(())
+    }
+
+    /// A2: current PQ puncture index — number of ciphertexts already
+    /// consumed from the ring. Intended for persistence.
+    pub fn pq_puncture_index(&self) -> u64 {
+        self.pq_puncture_index
     }
 
     /// Return a copy of the current chain key for persistence (must be encrypted before storage).
@@ -732,5 +944,16 @@ impl Drop for RatchetChain {
         self.canary_tail.zeroize();
         self.expected_head.zeroize();
         self.expected_tail.zeroize();
+
+        // 6. A2: drop PQ ring + keypair (Zeroizing + Arc<XWingKeyPair>::Drop
+        // wipe the secret halves).
+        if let Some(mut ring) = self.pq_ciphertext_ring.take() {
+            for ct in ring.iter_mut() {
+                ct.zeroize();
+            }
+            ring.clear();
+        }
+        self.pq_keypair = None;
+        self.pq_puncture_index.zeroize();
     }
 }

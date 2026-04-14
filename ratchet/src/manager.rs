@@ -101,6 +101,37 @@ impl SessionManager {
     /// Maximum number of concurrent ratchet sessions.
     const MAX_SESSIONS: usize = 100_000;
 
+    /// A2: Create a session with a pre-computed X-Wing PQ ciphertext ring
+    /// bound to the peer's public key and this node's local X-Wing keypair.
+    /// The returned session will receive a PQ puncture every
+    /// `PQ_PUNCTURE_INTERVAL` epochs. Falls through to [`Self::create_session`]
+    /// when a caller does not need the PQ path.
+    pub fn create_session_with_pq(
+        &self,
+        session_id: Uuid,
+        master_secret: &[u8; 64],
+        peer_pk: &crypto::xwing::XWingPublicKey,
+        local_kp: std::sync::Arc<crypto::xwing::XWingKeyPair>,
+    ) -> Result<u64, String> {
+        let chain = RatchetChain::new_with_pq(master_secret, peer_pk, local_kp)?;
+        let epoch = chain.epoch();
+        let mut sessions = match self.sessions.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::error!("sessions RwLock poisoned — recovering write access");
+                poisoned.into_inner()
+            }
+        };
+        if sessions.len() >= Self::MAX_SESSIONS && !sessions.contains_key(&session_id) {
+            return Err(format!(
+                "MAX_SESSIONS ({}) reached — cannot create new ratchet session",
+                Self::MAX_SESSIONS
+            ));
+        }
+        sessions.insert(session_id, chain);
+        Ok(epoch)
+    }
+
     /// Create a new session and return its initial epoch (always 0).
     pub fn create_session(&self, session_id: Uuid, master_secret: &[u8; 64]) -> Result<u64, String> {
         let chain = RatchetChain::new(master_secret)?;
