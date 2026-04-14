@@ -763,7 +763,7 @@ async fn main() {
                 to_sign.extend_from_slice(&*prev_hash_lock);
                 let signature = crypto::pq_sign::pq_sign_raw(&pq_key_clone, &to_sign);
                 let persisted = PersistedSth {
-                    tree_size: sth.tree_size,
+                    tree_size: sth.tree_size as u64,
                     root: sth.root,
                     timestamp,
                     signature,
