@@ -5,6 +5,7 @@
 //! state machine to produce threshold-signed authentication tokens.
 
 pub mod ceremony;
+pub mod idempotency;
 pub mod messages;
 pub mod service;
 pub mod sovereign;
