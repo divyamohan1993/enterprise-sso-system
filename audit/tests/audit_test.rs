@@ -160,6 +160,10 @@ fn audit_request_roundtrip() {
         risk_score: 0.42,
         metadata: vec![1, 2, 3, 4],
         classification: 2, // Secret
+        // D10 (wave-2 audit): idempotency + per-tenant throttle fields
+        idempotency_event_id: None,
+        idempotency_signature: Vec::new(),
+        tenant_id: Uuid::nil(),
     };
     let bytes = postcard::to_allocvec(&req).expect("serialize");
     let decoded: AuditRequest = postcard::from_bytes(&bytes).expect("deserialize");
