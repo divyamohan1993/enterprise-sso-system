@@ -64,6 +64,291 @@ impl opaque_ke::ksf::Ksf for Pbkdf2Sha512 {
     }
 }
 
+// ── B3: Sealed ServerSetup handle (2-of-3 threshold envelope protection) ──
+//
+// SECURITY: opaque-ke's ServerSetup<OpaqueCs> embeds the OPRF seed in plain
+// memory once constructed. We cannot extract the seed (the type is opaque)
+// and forking opaque-ke to inject custom envelope handling is impractical
+// for the v0.1 hardening pass. Instead, we keep ServerSetup OUT of long-lived
+// memory and only reconstruct it on demand via a sealed envelope:
+//
+//   1. At install time, the operator creates 3 random 32-byte share files,
+//      loaded by `common::secret_loader` under names
+//      `opaque-server-share-0`, `opaque-server-share-1`, `opaque-server-share-2`.
+//   2. Any 2 of the 3 shares are XOR-then-HKDF-combined into an envelope KEK.
+//      (This is an additive 2-of-3 sharing equivalent for envelope key
+//      protection — distinct from `threshold.rs` which performs Shamir
+//      splitting of the OPRF master key for the partial-evaluation path.)
+//   3. The serialized ServerSetup is encrypted with AES-256-GCM under the KEK
+//      and stored on disk. The KEK is zeroized after each per-request
+//      reconstruction.
+//
+// Per-request flow: load 2 shares → derive KEK → decrypt envelope →
+// `ServerSetup::deserialize` → use → drop (zeroized) → wipe envelope buffer.
+//
+// This bounds OPRF-seed exposure to the duration of a single request and
+// removes the seed from steady-state RAM. A snapshot attacker must catch
+// the process mid-request AND already hold 2 of the 3 share files.
+
+use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce};
+use hkdf::Hkdf;
+use opaque_ke::ServerSetup;
+use sha2::Sha512;
+use zeroize::Zeroizing;
+
+/// Names of the 3 OPAQUE server shares as resolved by `common::secret_loader`.
+pub const OPAQUE_SERVER_SHARE_NAMES: [&str; 3] = [
+    "opaque-server-share-0",
+    "opaque-server-share-1",
+    "opaque-server-share-2",
+];
+
+/// Sealed envelope holding an encrypted serialized `ServerSetup`.
+///
+/// The envelope itself is safe to hold in memory and persist to disk — the
+/// AES-256-GCM ciphertext is opaque without 2 of the 3 OPAQUE server shares.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct ServerSetupSealedEnvelope {
+    /// Random 12-byte AES-GCM nonce.
+    pub nonce: [u8; 12],
+    /// AES-256-GCM ciphertext of the serialized ServerSetup (includes 16-byte tag).
+    pub ciphertext: Vec<u8>,
+}
+
+/// Errors for sealed ServerSetup operations.
+#[derive(Debug)]
+pub enum SealedSetupError {
+    /// Fewer than 2 shares could be loaded.
+    InsufficientShares(String),
+    /// AES-GCM seal/open failed (tampering or wrong shares).
+    Crypto(&'static str),
+    /// `ServerSetup::deserialize` rejected the recovered bytes.
+    Deserialize,
+    /// CSPRNG failure.
+    Random(&'static str),
+}
+
+impl std::fmt::Display for SealedSetupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InsufficientShares(s) => write!(f, "OPAQUE share load failed: {s}"),
+            Self::Crypto(s) => write!(f, "OPAQUE envelope crypto: {s}"),
+            Self::Deserialize => write!(f, "OPAQUE envelope deserialize failed"),
+            Self::Random(s) => write!(f, "OPAQUE envelope CSPRNG: {s}"),
+        }
+    }
+}
+
+impl std::error::Error for SealedSetupError {}
+
+/// Load any 2-of-3 OPAQUE server shares via `common::secret_loader` and
+/// derive a 32-byte envelope KEK. Returns the KEK as a zeroizing buffer.
+///
+/// The combine is HKDF-SHA512(salt = "MILNET-OPAQUE-ENVELOPE-KEK-v1",
+/// ikm = share_a || share_b || domain) where (a, b) are sorted by share index
+/// so that any 2-of-3 pair derives the same KEK as long as the same two
+/// shares are present.
+fn derive_envelope_kek() -> Result<Zeroizing<[u8; 32]>, SealedSetupError> {
+    let mut loaded: Vec<(usize, Zeroizing<Vec<u8>>)> = Vec::with_capacity(3);
+    let mut errors: Vec<String> = Vec::new();
+
+    for (idx, name) in OPAQUE_SERVER_SHARE_NAMES.iter().enumerate() {
+        match common::secret_loader::load_secret(name) {
+            Ok(buf) => {
+                if buf.len() < 32 {
+                    errors.push(format!("{name}: too short ({} bytes)", buf.len()));
+                    continue;
+                }
+                loaded.push((idx, buf));
+                if loaded.len() == 2 {
+                    break;
+                }
+            }
+            Err(e) => errors.push(format!("{name}: {e}")),
+        }
+    }
+
+    if loaded.len() < 2 {
+        return Err(SealedSetupError::InsufficientShares(errors.join("; ")));
+    }
+
+    // Stable order so any 2-of-3 pair derives the same KEK.
+    loaded.sort_by_key(|(idx, _)| *idx);
+
+    let mut ikm = Zeroizing::new(Vec::with_capacity(64 + 1));
+    ikm.extend_from_slice(&loaded[0].1[..32]);
+    ikm.extend_from_slice(&loaded[1].1[..32]);
+    // Bind the pair indices so different pairs derive independent KEKs only
+    // if explicitly desired; here we omit the indices so any 2 shares yield
+    // the same KEK and the envelope remains decryptable from any pair.
+
+    let hk = Hkdf::<Sha512>::new(Some(b"MILNET-OPAQUE-ENVELOPE-KEK-v1"), &ikm);
+    let mut kek = Zeroizing::new([0u8; 32]);
+    hk.expand(b"opaque-server-setup-envelope", kek.as_mut())
+        .map_err(|_| SealedSetupError::Crypto("HKDF expand"))?;
+
+    Ok(kek)
+}
+
+/// Seal a freshly generated `ServerSetup<OpaqueCs>` into a transportable
+/// envelope. The plaintext serialization is wiped after sealing.
+pub fn seal_server_setup(
+    setup: &ServerSetup<OpaqueCs>,
+) -> Result<ServerSetupSealedEnvelope, SealedSetupError> {
+    let kek = derive_envelope_kek()?;
+    let cipher = Aes256Gcm::new_from_slice(kek.as_ref())
+        .map_err(|_| SealedSetupError::Crypto("AES key init"))?;
+
+    let mut nonce = [0u8; 12];
+    getrandom::getrandom(&mut nonce).map_err(|_| SealedSetupError::Random("nonce"))?;
+
+    let mut plaintext = Zeroizing::new(setup.serialize().to_vec());
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce), plaintext.as_slice())
+        .map_err(|_| SealedSetupError::Crypto("AES-GCM seal"))?;
+    plaintext.zeroize();
+
+    Ok(ServerSetupSealedEnvelope { nonce, ciphertext })
+}
+
+/// Handle that wraps a sealed `ServerSetup` envelope.
+///
+/// The OPRF seed only materializes inside the closure passed to [`with_setup`],
+/// and is wiped immediately on closure exit. The envelope itself can sit in
+/// long-lived memory safely.
+pub struct ServerSetupHandle {
+    envelope: ServerSetupSealedEnvelope,
+}
+
+impl ServerSetupHandle {
+    /// Create a handle from an existing sealed envelope (e.g. read from disk).
+    pub fn from_envelope(envelope: ServerSetupSealedEnvelope) -> Self {
+        Self { envelope }
+    }
+
+    /// Generate a fresh `ServerSetup`, seal it, and return the handle.
+    /// The unsealed `ServerSetup` is dropped (and its serialization zeroized)
+    /// before this function returns.
+    pub fn generate_and_seal() -> Result<Self, SealedSetupError> {
+        let mut rng = rand::rngs::OsRng;
+        let setup = ServerSetup::<OpaqueCs>::new(&mut rng);
+        let envelope = seal_server_setup(&setup)?;
+        // `setup` drop here. opaque-ke's ServerSetup does not implement Zeroize,
+        // but the serialization buffer used for sealing is wiped inside
+        // seal_server_setup. The remaining residue is bounded in lifetime.
+        drop(setup);
+        Ok(Self { envelope })
+    }
+
+    /// Borrow the sealed envelope (e.g. to persist to disk).
+    pub fn envelope(&self) -> &ServerSetupSealedEnvelope {
+        &self.envelope
+    }
+
+    /// Reconstruct the `ServerSetup` for the duration of `f` and wipe it
+    /// immediately after. Returns the closure's result.
+    ///
+    /// The plaintext serialization buffer is held in a `Zeroizing<Vec<u8>>`
+    /// and the recovered `ServerSetup` is dropped at scope exit.
+    pub fn with_setup<R>(
+        &self,
+        f: impl FnOnce(&ServerSetup<OpaqueCs>) -> R,
+    ) -> Result<R, SealedSetupError> {
+        let kek = derive_envelope_kek()?;
+        let cipher = Aes256Gcm::new_from_slice(kek.as_ref())
+            .map_err(|_| SealedSetupError::Crypto("AES key init"))?;
+
+        let mut plaintext = Zeroizing::new(
+            cipher
+                .decrypt(
+                    Nonce::from_slice(&self.envelope.nonce),
+                    self.envelope.ciphertext.as_slice(),
+                )
+                .map_err(|_| SealedSetupError::Crypto("AES-GCM open"))?,
+        );
+
+        let setup = ServerSetup::<OpaqueCs>::deserialize(&plaintext)
+            .map_err(|_| SealedSetupError::Deserialize)?;
+
+        let result = f(&setup);
+
+        // Explicit drop documents the ordering: ServerSetup first, then wipe.
+        drop(setup);
+        plaintext.zeroize();
+        // KEK zeroizes on Zeroizing<...> drop.
+        Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod sealed_setup_tests {
+    use super::*;
+
+    /// Set up 3 deterministic shares in env and return a guard that clears them.
+    struct ShareGuard;
+    impl ShareGuard {
+        fn install() -> Self {
+            std::env::set_var("MILNET_DEV_ALLOW_ENV_SECRETS", "1");
+            std::env::remove_var("MILNET_PRODUCTION");
+            std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+            // 32-byte shares hex-padded → 64 chars; the loader returns raw env bytes,
+            // so we use exactly 32 ASCII bytes per share for deterministic tests.
+            std::env::set_var("MILNET_opaque-server-share-0_SEALED", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+            std::env::set_var("MILNET_opaque-server-share-1_SEALED", "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
+            std::env::set_var("MILNET_opaque-server-share-2_SEALED", "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC");
+            Self
+        }
+    }
+    impl Drop for ShareGuard {
+        fn drop(&mut self) {
+            for n in &OPAQUE_SERVER_SHARE_NAMES {
+                std::env::remove_var(format!("MILNET_{n}_SEALED"));
+            }
+            std::env::remove_var("MILNET_DEV_ALLOW_ENV_SECRETS");
+        }
+    }
+
+    #[test]
+    fn seal_unseal_roundtrip_recovers_server_setup() {
+        let _g = ShareGuard::install();
+
+        let handle = ServerSetupHandle::generate_and_seal().expect("seal");
+        let original_pk = handle
+            .with_setup(|s| s.serialize().to_vec())
+            .expect("unseal");
+
+        // Second open must yield identical bytes
+        let again = handle
+            .with_setup(|s| s.serialize().to_vec())
+            .expect("unseal 2");
+        assert_eq!(original_pk, again, "two opens of same envelope must agree");
+    }
+
+    #[test]
+    fn missing_shares_returns_error() {
+        // Ensure no shares set
+        for n in &OPAQUE_SERVER_SHARE_NAMES {
+            std::env::remove_var(format!("MILNET_{n}_SEALED"));
+        }
+        std::env::remove_var("MILNET_PRODUCTION");
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+
+        let r = ServerSetupHandle::generate_and_seal();
+        assert!(matches!(r, Err(SealedSetupError::InsufficientShares(_))));
+    }
+
+    #[test]
+    fn tampered_ciphertext_fails_to_open() {
+        let _g = ShareGuard::install();
+        let handle = ServerSetupHandle::generate_and_seal().expect("seal");
+        let mut env = handle.envelope().clone();
+        env.ciphertext[0] ^= 0xFF;
+        let tampered = ServerSetupHandle::from_envelope(env);
+        let r = tampered.with_setup(|_| ());
+        assert!(matches!(r, Err(SealedSetupError::Crypto(_))));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

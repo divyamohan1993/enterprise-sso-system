@@ -28,6 +28,7 @@ hkdf.workspace = true
 subtle.workspace = true
 zeroize = { version = "1", features = ["zeroize_derive"] }
 getrandom = "0.2"
+aes-gcm.workspace = true
 
 [features]
 default = ["production"]
