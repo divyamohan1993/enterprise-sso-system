@@ -20,6 +20,7 @@ ed25519-dalek.workspace = true
 signature = "2"
 tracing.workspace = true
 sqlx.workspace = true
+postcard.workspace = true
 
 [dev-dependencies]
 serial_test.workspace = true

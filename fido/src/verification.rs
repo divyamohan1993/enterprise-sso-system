@@ -1550,6 +1550,10 @@ pub fn verify_attestation_object(
     let mut att_stmt_alg: Option<i64> = None;
     let mut att_stmt_sig: Option<Vec<u8>> = None;
     let mut att_stmt_x5c: Option<Vec<Vec<u8>>> = None;
+    // B13 — TPM attestation specific fields.
+    let mut att_stmt_ver: Option<String> = None;
+    let mut att_stmt_cert_info: Option<Vec<u8>> = None;
+    let mut att_stmt_pub_area: Option<Vec<u8>> = None;
 
     for _ in 0..map_len {
         let key = reader.read_map_key()
@@ -1586,6 +1590,18 @@ pub fn verify_attestation_object(
                         CborMapKey::Text(ref sk) if sk == "sig" => {
                             att_stmt_sig = Some(reader.read_bstr()
                                 .ok_or("attStmt: failed to read sig")?);
+                        }
+                        CborMapKey::Text(ref sk) if sk == "ver" => {
+                            att_stmt_ver = Some(reader.read_tstr()
+                                .ok_or("attStmt: failed to read ver")?);
+                        }
+                        CborMapKey::Text(ref sk) if sk == "certInfo" => {
+                            att_stmt_cert_info = Some(reader.read_bstr()
+                                .ok_or("attStmt: failed to read certInfo")?);
+                        }
+                        CborMapKey::Text(ref sk) if sk == "pubArea" => {
+                            att_stmt_pub_area = Some(reader.read_bstr()
+                                .ok_or("attStmt: failed to read pubArea")?);
                         }
                         CborMapKey::Text(ref sk) if sk == "x5c" => {
                             let arr_len = reader.read_array_len()
@@ -1660,15 +1676,275 @@ pub fn verify_attestation_object(
                 )
             }
         }
-        "tpm" | "android-key" => {
-            // TPM and android-key are accepted attestation formats for
-            // hardware-backed authenticators. Full implementation delegates
-            // to format-specific verification (out of scope for this module).
-            // For now, fall through to the packed path structure.
-            Err("Attestation format not yet implemented (accepted in principle)")
+        "tpm" => {
+            // B13 — TPM 2.0 attestation per WebAuthn §8.3.
+            let ver = att_stmt_ver
+                .ok_or("TPM attestation: missing 'ver' in attStmt")?;
+            let cert_info = att_stmt_cert_info
+                .ok_or("TPM attestation: missing 'certInfo' in attStmt")?;
+            let pub_area = att_stmt_pub_area
+                .ok_or("TPM attestation: missing 'pubArea' in attStmt")?;
+            let sig = att_stmt_sig
+                .ok_or("TPM attestation: missing 'sig' in attStmt")?;
+            let x5c = att_stmt_x5c
+                .ok_or("TPM attestation: missing 'x5c' AIK chain")?;
+            verify_tpm_attestation(
+                &auth_data,
+                client_data_hash,
+                expected_rp_id,
+                &ver,
+                &cert_info,
+                &pub_area,
+                &sig,
+                &x5c,
+            )
+        }
+        "android-key" => {
+            // android-key remains out of scope for this hardening pass.
+            Err("Attestation format 'android-key' not yet implemented")
         }
         _ => {
             Err("Unsupported attestation format")
+        }
+    }
+}
+
+// ── B13: TPM 2.0 attestation verification ─────────────────────────────
+
+/// Verify a TPM 2.0 attestation statement per WebAuthn §8.3.
+///
+/// Performs structural validation of `certInfo` and `pubArea`, binds the
+/// extraData field to `SHA-256(authData || clientDataHash)`, validates the
+/// `attested.name` against the pubArea hash, requires TPM 2.0, verifies the
+/// AIK signature using the leaf certificate's public key, and chains the
+/// AIK certificate to a pinned vendor root via [`crate::tpm_attestation::TpmAikRootStore`].
+///
+/// The vendor root store is loaded once per process from
+/// `MILNET_TPM_AIK_ROOTS_DIR`. In military mode an empty store causes
+/// every TPM attestation to be rejected.
+pub fn verify_tpm_attestation(
+    auth_data: &[u8],
+    client_data_hash: &[u8],
+    expected_rp_id: &str,
+    ver: &str,
+    cert_info: &[u8],
+    pub_area: &[u8],
+    sig: &[u8],
+    x5c: &[Vec<u8>],
+) -> Result<(AttestationData, AttestationType), &'static str> {
+    use crate::tpm_attestation::{
+        parse_certify_info, require_tpm_2_0, verify_certify_info_binding, TpmAikRootStore,
+    };
+
+    require_tpm_2_0(ver).map_err(|_| "TPM attestation: only TPM 2.0 accepted")?;
+
+    let parsed_cert_info = parse_certify_info(cert_info)
+        .map_err(|_| "TPM attestation: certInfo decode failed")?;
+
+    verify_certify_info_binding(&parsed_cert_info, auth_data, client_data_hash, pub_area)
+        .map_err(|_| "TPM attestation: certInfo binding failed")?;
+
+    if x5c.is_empty() {
+        return Err("TPM attestation: empty AIK x5c chain");
+    }
+
+    // Verify sig over certInfo using the AIK leaf certificate's public key.
+    // FIDO TPM attestation almost always uses RSA AIKs; we fall back to ECDSA
+    // P-256 if the cert turns out to be EC.
+    let leaf = &x5c[0];
+    let signature_ok = verify_aik_signature(leaf, cert_info, sig);
+    if !signature_ok {
+        return Err("TPM attestation: AIK signature over certInfo failed");
+    }
+
+    // Vendor root pinning.
+    let root_store = tpm_root_store();
+    root_store
+        .verify_chain(x5c)
+        .map_err(|_| "TPM attestation: AIK chain not pinned to a vendor root")?;
+
+    // Finally extract the FIDO-level attestation auth data.
+    let att_data = parse_attestation_auth_data(auth_data, expected_rp_id)?;
+    Ok((att_data, AttestationType::Basic))
+}
+
+/// Process-wide TPM AIK root store, loaded lazily from
+/// `MILNET_TPM_AIK_ROOTS_DIR`.
+fn tpm_root_store() -> &'static crate::tpm_attestation::TpmAikRootStore {
+    use std::sync::OnceLock;
+    static STORE: OnceLock<crate::tpm_attestation::TpmAikRootStore> = OnceLock::new();
+    STORE.get_or_init(crate::tpm_attestation::TpmAikRootStore::load_from_env)
+}
+
+/// Verify an AIK signature over `certInfo` using a leaf certificate.
+///
+/// Tries RSA PKCS#1 v1.5 SHA-256 first (the dominant TPM 2.0 case); if the
+/// certificate's SubjectPublicKeyInfo is EC P-256 instead, falls back to
+/// ECDSA P-256 SHA-256.
+fn verify_aik_signature(leaf_cert_der: &[u8], cert_info: &[u8], sig: &[u8]) -> bool {
+    // Try EC P-256 path first — cheapest extraction with the existing helper.
+    if let Ok(sec1) = extract_ec_public_key_from_der(leaf_cert_der) {
+        if let Ok(vk) = p256::ecdsa::VerifyingKey::from_sec1_bytes(&sec1) {
+            if let Ok(parsed_sig) = p256::ecdsa::Signature::from_der(sig) {
+                if vk.verify(cert_info, &parsed_sig).is_ok() {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // RSA path: extract RSA SubjectPublicKeyInfo.
+    if let Some((n, e)) = extract_rsa_pubkey_from_der(leaf_cert_der) {
+        if let Ok(rsa_pub) = RsaPublicKey::new(
+            rsa::BigUint::from_bytes_be(&n),
+            rsa::BigUint::from_bytes_be(&e),
+        ) {
+            // SHA-256 PKCS#1 v1.5 is the FIDO-mandated AIK signing algorithm.
+            let vk = RsaVerifyingKey::<Sha256>::new(rsa_pub);
+            use signature::Verifier as _;
+            if let Ok(parsed_sig) = rsa::pkcs1v15::Signature::try_from(sig) {
+                if vk.verify(cert_info, &parsed_sig).is_ok() {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// Minimal extractor for an RSA SubjectPublicKeyInfo from a DER X.509 cert.
+///
+/// Locates the RSA OID 1.2.840.113549.1.1.1 (06 09 2A 86 48 86 F7 0D 01 01 01)
+/// then reads the BIT STRING following it, strips the unused-bits byte, and
+/// parses the inner SEQUENCE { INTEGER n, INTEGER e }.
+fn extract_rsa_pubkey_from_der(cert_der: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    const RSA_OID: [u8; 11] = [
+        0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01,
+    ];
+    let oid_pos = find_subsequence(cert_der, &RSA_OID)?;
+    let after = &cert_der[oid_pos + RSA_OID.len()..];
+
+    // Skip optional NULL parameters: 05 00
+    let mut idx = 0;
+    if after.len() >= 2 && after[0] == 0x05 && after[1] == 0x00 {
+        idx = 2;
+    }
+
+    // Expect BIT STRING (0x03)
+    if idx >= after.len() || after[idx] != 0x03 {
+        return None;
+    }
+    idx += 1;
+    let (bs_len, hsz) = read_der_length(&after[idx..]).ok()?;
+    idx += hsz;
+    if idx + bs_len > after.len() || bs_len == 0 {
+        return None;
+    }
+    if after[idx] != 0x00 {
+        // unused bits byte
+        return None;
+    }
+    let inner = &after[idx + 1..idx + bs_len];
+
+    // inner = SEQUENCE { INTEGER n, INTEGER e }
+    if inner.is_empty() || inner[0] != 0x30 {
+        return None;
+    }
+    let (_seq_len, seq_hsz) = read_der_length(&inner[1..]).ok()?;
+    let mut p = 1 + seq_hsz;
+
+    // INTEGER n
+    if p >= inner.len() || inner[p] != 0x02 {
+        return None;
+    }
+    p += 1;
+    let (n_len, n_hsz) = read_der_length(&inner[p..]).ok()?;
+    p += n_hsz;
+    if p + n_len > inner.len() {
+        return None;
+    }
+    let mut n = inner[p..p + n_len].to_vec();
+    // Strip leading 0x00 sign byte if present.
+    if n.first() == Some(&0x00) {
+        n.remove(0);
+    }
+    p += n_len;
+
+    // INTEGER e
+    if p >= inner.len() || inner[p] != 0x02 {
+        return None;
+    }
+    p += 1;
+    let (e_len, e_hsz) = read_der_length(&inner[p..]).ok()?;
+    p += e_hsz;
+    if p + e_len > inner.len() {
+        return None;
+    }
+    let mut e = inner[p..p + e_len].to_vec();
+    if e.first() == Some(&0x00) {
+        e.remove(0);
+    }
+
+    Some((n, e))
+}
+
+// ── B5: MDS3 trust store wiring ───────────────────────────────────────
+
+/// Process-wide FIDO MDS3 store, loaded once from the embedded offline mirror
+/// (and optionally refreshed online if `MILNET_FIDO_MDS3_ONLINE=1`).
+pub fn mds3_store() -> &'static crate::mds3::Mds3Store {
+    use std::sync::OnceLock;
+    static STORE: OnceLock<crate::mds3::Mds3Store> = OnceLock::new();
+    STORE.get_or_init(|| {
+        crate::mds3::Mds3Store::load().unwrap_or_else(|e| {
+            tracing::error!(
+                target: "siem",
+                error = %e,
+                "SIEM:CRITICAL FIDO MDS3 mirror failed to load — empty store will reject all attestations in military mode"
+            );
+            // Return an empty store; military-mode validation will fail closed.
+            crate::mds3::Mds3Store::from_blob(&[]).expect("empty blob always parses")
+        })
+    })
+}
+
+/// Validate an attestation chain against the pinned MDS3 mirror by AAGUID.
+///
+/// Fails closed in military mode (`MILNET_MILITARY_DEPLOYMENT` unset or != "0"),
+/// permissive otherwise (logs and allows so non-military deployments retain
+/// the existing softer behaviour).
+pub fn validate_attestation_chain_mds3(
+    aaguid: &[u8; 16],
+    x5c: &[Vec<u8>],
+    attestation_type: &AttestationType,
+) -> Result<(), &'static str> {
+    match attestation_type {
+        AttestationType::None | AttestationType::SelfAttestation => Ok(()),
+        AttestationType::Basic => {
+            if x5c.is_empty() {
+                return Err("Basic attestation requires certificate chain");
+            }
+            match mds3_store().validate_chain(aaguid, x5c) {
+                Ok(_entry) => Ok(()),
+                Err(e) => {
+                    if require_military_mds() {
+                        tracing::error!(
+                            target: "siem",
+                            error = %e,
+                            "SIEM:ERROR MDS3 chain validation failed (fail-closed)"
+                        );
+                        Err("Attestation chain not trusted by FIDO MDS3 mirror")
+                    } else {
+                        tracing::warn!(
+                            target: "siem",
+                            error = %e,
+                            "SIEM:WARN MDS3 chain validation failed; allowing in non-military mode"
+                        );
+                        Ok(())
+                    }
+                }
+            }
         }
     }
 }
