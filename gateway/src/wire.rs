@@ -184,6 +184,7 @@ mod tests {
             username: "alice".into(),
             password: vec![0x01, 0x02, 0x03],
             audience: Some("resource-server".into()),
+            device_attestation_age_secs: None,
         };
         let debug_str = format!("{:?}", req);
         assert!(
@@ -200,10 +201,11 @@ mod tests {
     #[test]
     fn auth_request_zeroizes_password_on_drop() {
         // We verify the Drop impl calls zeroize by observing the Vec is zeroed.
-        let mut req = AuthRequest {
+        let req = AuthRequest {
             username: "bob".into(),
             password: vec![0xFF; 32],
             audience: None,
+            device_attestation_age_secs: None,
         };
         // Manually call drop to trigger zeroize.
         let pw_ptr = req.password.as_ptr();
@@ -222,6 +224,7 @@ mod tests {
             username: "carol".into(),
             password: vec![0xDE, 0xAD],
             audience: Some("api.example.com".into()),
+            device_attestation_age_secs: None,
         };
         let bytes = postcard::to_allocvec(&req).expect("serialize AuthRequest");
         let recovered: AuthRequest = postcard::from_bytes(&bytes).expect("deserialize AuthRequest");
@@ -238,6 +241,7 @@ mod tests {
             username: "dave".into(),
             password: vec![1],
             audience: None,
+            device_attestation_age_secs: None,
         };
         let bytes = postcard::to_allocvec(&req).unwrap();
         let recovered: AuthRequest = postcard::from_bytes(&bytes).unwrap();
