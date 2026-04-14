@@ -6,17 +6,28 @@
 //! 2. Tokens issued after rotation verify with the new current key only.
 //! No panics under concurrent rotation/verification.
 
-use sso_protocol::tokens::{create_id_token, verify_id_token, OidcSigningKey};
+use sso_protocol::tokens::{create_id_token, verify_id_token_with_audience, OidcSigningKey};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use uuid::Uuid;
+
+/// F7 (wave-2 risk-session): verify_id_token now requires an expected
+/// audience — the bare claim is ignored to prevent forged-claim smuggling.
+/// Tests must pass a non-empty audience to both create and verify.
+const TEST_AUDIENCE: &str = "client-A";
 
 #[test]
 fn rotation_grace_window_old_token_still_verifies() {
     let mut sk = OidcSigningKey::generate();
     let user = Uuid::new_v4();
 
-    let old_token = create_id_token("https://idp.milnet.mil", &user, "client-A", None, &sk);
+    let old_token = create_id_token(
+        "https://idp.milnet.mil",
+        &user,
+        TEST_AUDIENCE,
+        None,
+        &sk,
+    );
 
     // Capture the OLD verifying key before rotating so we can verify against
     // the previous slot post-rotation.
@@ -29,13 +40,20 @@ fn rotation_grace_window_old_token_still_verifies() {
     };
 
     // Old token must still verify against the previous slot.
-    let claims = verify_id_token(&old_token, &old_vk_clone)
+    let claims = verify_id_token_with_audience(&old_token, &old_vk_clone, TEST_AUDIENCE, true)
         .expect("old token must verify against previous-generation key in grace window");
     assert_eq!(claims.sub, user.to_string());
 
     // A token signed AFTER rotation must verify against the new current key.
-    let new_token = create_id_token("https://idp.milnet.mil", &user, "client-A", None, &sk);
-    verify_id_token(&new_token, sk.verifying_key()).expect("new token verifies under current key");
+    let new_token = create_id_token(
+        "https://idp.milnet.mil",
+        &user,
+        TEST_AUDIENCE,
+        None,
+        &sk,
+    );
+    verify_id_token_with_audience(&new_token, sk.verifying_key(), TEST_AUDIENCE, true)
+        .expect("new token verifies under current key");
 }
 
 #[test]
@@ -43,14 +61,16 @@ fn concurrent_rotation_and_verification_no_panic() {
     let sk = Arc::new(RwLock::new(OidcSigningKey::generate()));
     let user = Uuid::new_v4();
 
-    // Pre-sign a batch of tokens with generation 1.
+    // Pre-sign a batch of tokens with generation 1. All tokens use the same
+    // audience so the concurrent verifier threads can verify with a single
+    // expected audience (F7 mandates audience binding on every verify).
     let pre_tokens: Vec<String> = (0..32)
-        .map(|i| {
+        .map(|_| {
             let g = sk.read().unwrap();
             create_id_token(
                 "https://idp.milnet.mil",
                 &user,
-                &format!("client-{i}"),
+                TEST_AUDIENCE,
                 None,
                 &g,
             )
@@ -75,9 +95,14 @@ fn concurrent_rotation_and_verification_no_panic() {
             let sk = Arc::clone(&sk);
             thread::spawn(move || {
                 let g = sk.read().unwrap();
-                let _ = verify_id_token(&tok, g.verifying_key());
+                let _ = verify_id_token_with_audience(
+                    &tok,
+                    g.verifying_key(),
+                    TEST_AUDIENCE,
+                    true,
+                );
                 if let Some(prev) = g.previous_verifying_key() {
-                    let _ = verify_id_token(&tok, prev);
+                    let _ = verify_id_token_with_audience(&tok, prev, TEST_AUDIENCE, true);
                 }
             })
         })

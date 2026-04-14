@@ -715,11 +715,22 @@ fn unix_timestamp_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     fn random_key() -> [u8; 32] {
         let mut k = [0u8; 32];
         getrandom::getrandom(&mut k).expect("getrandom failed");
         k
+    }
+
+    /// A12 fix: the adaptive encrypt/decrypt paths branch on the global
+    /// FIPS flag. Other tests in this crate (envelope, seal, kdf, symmetric)
+    /// toggle that flag, so every test that exercises a FIPS-branched
+    /// encrypt→decrypt round-trip MUST capture the flag at both ends. Since
+    /// the flag is process-global and AtomicBool, we snapshot once under
+    /// #[serial] and hold it stable for the duration of the test.
+    fn pin_fips_state(enabled: bool) {
+        common::fips::set_fips_mode_unchecked(enabled);
     }
 
     #[test]
@@ -783,7 +794,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_adaptive_critical_rekey() {
+        pin_fips_state(false);
         let ac = AdaptiveCrypto::new();
         ac.escalate_immediate(CryptoThreatLevel::Critical);
         assert_eq!(ac.current_level(), CryptoThreatLevel::Critical);

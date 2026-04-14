@@ -657,9 +657,12 @@ fn make_test_tenant(slug: &str) -> Tenant {
 #[test]
 fn extract_tenant_from_jwt_payload_returns_valid_uuid() {
     let tenant_uuid = Uuid::new_v4();
+    // F7 (wave-2 risk-session): tenant extractor now requires a matching
+    // `aud` claim formatted as `tenant:<uuid>`; the bare tenant_id without
+    // aud binding is ignored to prevent forged-claim smuggling.
     let payload = format!(
-        r#"{{"sub":"user-42","tenant_id":"{}","iat":1700000000}}"#,
-        tenant_uuid
+        r#"{{"sub":"user-42","tenant_id":"{tid}","aud":"tenant:{tid}","iat":1700000000}}"#,
+        tid = tenant_uuid
     );
     let extracted = extract_tenant_from_jwt_payload(&payload);
     assert_eq!(extracted, Some(tenant_uuid));
