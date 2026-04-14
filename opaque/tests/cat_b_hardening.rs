@@ -95,7 +95,7 @@ fn b1_channel_binding_blocks_relay_attack() {
         );
         match response {
             opaque::messages::OpaqueResponse::Error { .. } => {}
-            other => panic!("expected Error on channel-binding mismatch, got {other:?}"),
+            _ => panic!("expected Error on channel-binding mismatch"),
         }
         assert!(session_key.is_none(), "no session_key on rejection");
     });
