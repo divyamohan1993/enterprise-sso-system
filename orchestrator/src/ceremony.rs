@@ -66,7 +66,22 @@ pub struct CeremonySession {
     pub epoch: u64,
 }
 
-/// Timeout for ceremony sessions in seconds.
+/// F14: Compute the ceremony timeout dynamically from the maximum token
+/// lifetime configured in `SecurityConfig` plus a 60s safety margin. This
+/// ensures no ceremony can be starved in-flight by a hard-coded limit that
+/// is smaller than the token it signs.
+pub fn ceremony_timeout_secs() -> i64 {
+    let cfg = common::config::SecurityConfig::default();
+    let max_tier_secs = (1u8..=4u8)
+        .map(|t| cfg.token_lifetime_for_tier(t))
+        .max()
+        .unwrap_or(30) as i64;
+    max_tier_secs + 60
+}
+
+/// Fallback timeout (kept for backwards compatibility with callers that
+/// read the constant directly). Dynamic callers should prefer
+/// `ceremony_timeout_secs()`.
 pub const CEREMONY_TIMEOUT_SECS: i64 = 30;
 
 /// Maximum total pending ceremonies system-wide (prevents memory exhaustion).
@@ -184,9 +199,12 @@ impl CeremonyTracker {
     /// Returns the number of ceremonies cleaned up.
     pub fn cleanup_expired(&mut self) -> usize {
         let now = common::secure_time::secure_now_secs_i64();
+        // F14: use the dynamic ceremony timeout so the cleanup horizon tracks
+        // the configured maximum token lifetime rather than a hard-coded 30s.
+        let timeout_secs = ceremony_timeout_secs();
 
         let to_remove: Vec<String> = self.sessions.iter()
-            .filter(|(_, s)| (now - s.created_at) > CEREMONY_TIMEOUT_SECS)
+            .filter(|(_, s)| (now - s.created_at) > timeout_secs)
             .map(|(k, _)| k.clone())
             .collect();
 

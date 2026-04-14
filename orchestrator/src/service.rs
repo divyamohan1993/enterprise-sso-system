@@ -120,6 +120,13 @@ pub struct OrchestratorService {
     /// endpoints can be discovered via DNS or multi-address env vars
     /// (e.g. OPAQUE_ADDRS=host1:port,host2:port).
     pub service_registry: Arc<ServiceRegistry>,
+    /// F4: idempotency cache for outbound RPC retries.
+    pub idempotency_cache: Arc<crate::idempotency::IdempotencyCache>,
+    /// F5: saga compensation revocation set (OPAQUE receipt IDs revoked
+    /// because a downstream TSS call failed).
+    pub revocation_set: Arc<crate::idempotency::RevocationSet>,
+    /// F10: inline circuit breaker used alongside the bounded worker pool.
+    pub f10_breaker: Arc<crate::idempotency::InlineBreaker>,
 }
 
 /// Build a `ServiceRegistry` seeded with the given OPAQUE and TSS addresses.
@@ -207,6 +214,9 @@ impl OrchestratorService {
             opaque_bulkhead: common::bulkhead::Bulkhead::new("opaque", 50, 100, std::time::Duration::from_secs(5)),
             tss_bulkhead: common::bulkhead::Bulkhead::new("tss", 30, 60, std::time::Duration::from_secs(5)),
             service_registry,
+            idempotency_cache: Arc::new(crate::idempotency::IdempotencyCache::new()),
+            revocation_set: Arc::new(crate::idempotency::RevocationSet::new()),
+            f10_breaker: Arc::new(crate::idempotency::InlineBreaker::new()),
         }
     }
 
@@ -239,6 +249,9 @@ impl OrchestratorService {
             opaque_bulkhead: common::bulkhead::Bulkhead::new("opaque", 50, 100, std::time::Duration::from_secs(5)),
             tss_bulkhead: common::bulkhead::Bulkhead::new("tss", 30, 60, std::time::Duration::from_secs(5)),
             service_registry,
+            idempotency_cache: Arc::new(crate::idempotency::IdempotencyCache::new()),
+            revocation_set: Arc::new(crate::idempotency::RevocationSet::new()),
+            f10_breaker: Arc::new(crate::idempotency::InlineBreaker::new()),
         }
     }
 
@@ -267,6 +280,9 @@ impl OrchestratorService {
             opaque_bulkhead: common::bulkhead::Bulkhead::new("opaque", 50, 100, std::time::Duration::from_secs(5)),
             tss_bulkhead: common::bulkhead::Bulkhead::new("tss", 30, 60, std::time::Duration::from_secs(5)),
             service_registry,
+            idempotency_cache: Arc::new(crate::idempotency::IdempotencyCache::new()),
+            revocation_set: Arc::new(crate::idempotency::RevocationSet::new()),
+            f10_breaker: Arc::new(crate::idempotency::InlineBreaker::new()),
         }
     }
 
@@ -299,6 +315,9 @@ impl OrchestratorService {
             opaque_bulkhead: common::bulkhead::Bulkhead::new("opaque", 50, 100, std::time::Duration::from_secs(5)),
             tss_bulkhead: common::bulkhead::Bulkhead::new("tss", 30, 60, std::time::Duration::from_secs(5)),
             service_registry,
+            idempotency_cache: Arc::new(crate::idempotency::IdempotencyCache::new()),
+            revocation_set: Arc::new(crate::idempotency::RevocationSet::new()),
+            f10_breaker: Arc::new(crate::idempotency::InlineBreaker::new()),
         }
     }
 
@@ -503,6 +522,17 @@ impl OrchestratorService {
         use opaque_ke::{ClientLogin, ClientLoginFinishParameters};
         use rand::rngs::OsRng;
 
+        // F9: per-request deadline enforced on every outbound await below.
+        let req_deadline = common::deadline::RequestDeadline::new(Self::AUTH_REQUEST_DEADLINE);
+
+        // F4: idempotency key for this outbound RPC sequence. Gateway may pass
+        // correlation_id; if absent, derive a fresh uuid.
+        let idempotency_key: Uuid = request.correlation_id.unwrap_or_else(Uuid::new_v4);
+        if let Some(cached) = self.idempotency_cache.get(&idempotency_key) {
+            tracing::debug!(key = %idempotency_key, "F4 idempotency cache hit — returning cached response");
+            return Ok(cached);
+        }
+
         // 1. Generate ceremony session ID
         let session_id = generate_nonce();
         let mut session = CeremonySession::new(session_id);
@@ -553,16 +583,20 @@ impl OrchestratorService {
 
         let _opaque_permit = self.opaque_bulkhead.acquire().await
             .map_err(|e| format!("OPAQUE bulkhead: {e}"))?;
-        let mut opaque_transport = self.connect_opaque().await?;
-        opaque_transport
-            .send(&login_start_bytes)
+        let deadline_at = tokio::time::Instant::from_std(req_deadline.expires_at());
+        let mut opaque_transport = tokio::time::timeout_at(deadline_at, self.connect_opaque())
             .await
+            .map_err(|_| "F9 deadline exceeded: connect_opaque".to_string())??;
+        tokio::time::timeout_at(deadline_at, opaque_transport.send(&login_start_bytes))
+            .await
+            .map_err(|_| "F9 deadline exceeded: send login_start".to_string())?
             .map_err(|e| format!("send login start to OPAQUE: {e}"))?;
 
-        let (_sender, opaque_resp1_bytes) = opaque_transport
-            .recv()
-            .await
-            .map_err(|e| format!("recv login challenge from OPAQUE: {e}"))?;
+        let (_sender, opaque_resp1_bytes) =
+            tokio::time::timeout_at(deadline_at, opaque_transport.recv())
+                .await
+                .map_err(|_| "F9 deadline exceeded: recv login_challenge".to_string())?
+                .map_err(|e| format!("recv login challenge from OPAQUE: {e}"))?;
 
         let opaque_resp1: OpaqueResponse = postcard::from_bytes(&opaque_resp1_bytes)
             .map_err(|e| format!("deserialize login challenge: {e}"))?;
@@ -609,15 +643,16 @@ impl OrchestratorService {
         let login_finish_bytes = postcard::to_allocvec(&login_finish_req)
             .map_err(|e| format!("serialize login finish: {e}"))?;
 
-        opaque_transport
-            .send(&login_finish_bytes)
+        tokio::time::timeout_at(deadline_at, opaque_transport.send(&login_finish_bytes))
             .await
+            .map_err(|_| "F9 deadline exceeded: send login_finish".to_string())?
             .map_err(|e| format!("send login finish to OPAQUE: {e}"))?;
 
-        let (_sender, opaque_resp2_bytes) = opaque_transport
-            .recv()
-            .await
-            .map_err(|e| format!("recv login result from OPAQUE: {e}"))?;
+        let (_sender, opaque_resp2_bytes) =
+            tokio::time::timeout_at(deadline_at, opaque_transport.recv())
+                .await
+                .map_err(|_| "F9 deadline exceeded: recv login_result".to_string())?
+                .map_err(|e| format!("recv login result from OPAQUE: {e}"))?;
 
         let opaque_resp2: OpaqueResponse = postcard::from_bytes(&opaque_resp2_bytes)
             .map_err(|e| format!("deserialize login result: {e}"))?;
@@ -649,6 +684,17 @@ impl OrchestratorService {
             return Err(format!("receipt verification failed: {e}"));
         }
 
+        // F5: reject any receipt present in the saga compensation revocation set.
+        {
+            let mut rid = [0u8; 32];
+            rid[..16].copy_from_slice(receipt.user_id.as_bytes());
+            rid[16..].copy_from_slice(&receipt.ceremony_session_id[..16]);
+            if self.revocation_set.is_revoked(&rid) {
+                session.fail("receipt revoked by saga compensation".into()).ok();
+                return Err("receipt revoked by saga compensation (prior TSS failure)".into());
+            }
+        }
+
         // 4. Add receipt to chain
         session.user_id = Some(receipt.user_id);
         session.receipt_chain.add_receipt(receipt).map_err(|e| format!("receipt chain: {e}"))?;
@@ -667,7 +713,31 @@ impl OrchestratorService {
             network_id: None,
             session_duration_secs: None,
         };
-        let risk_score = self.risk_engine.compute_score(&user_id, &risk_signals);
+        let source_ip_parsed = request
+            .source_ip
+            .as_deref()
+            .and_then(|s| s.parse::<std::net::IpAddr>().ok());
+
+        // F3: TPM re-attestation freshness gate. Reject if the declared
+        // attestation age exceeds 7 days (fail-closed).
+        {
+            let age_secs = request.device_attestation_age_secs.unwrap_or(f64::INFINITY);
+            let max = risk::device_profile::REATTESTATION_MAX_AGE_SECS as f64;
+            if age_secs > max {
+                common::siem::SecurityEvent::auth_failure(
+                    Some(user_id),
+                    None,
+                    "device re-attestation required (stale >7d)",
+                );
+                return Err(
+                    "device attestation stale — TPM re-attestation required (>7d old)".into(),
+                );
+            }
+        }
+
+        let risk_score = self
+            .risk_engine
+            .compute_score_with_ip(&user_id, &risk_signals, source_ip_parsed);
 
         // Run advanced anomaly detection (z-score, impossible travel, cross-user correlation).
         // This was previously disconnected — now integrated into the auth decision path.
@@ -756,24 +826,61 @@ impl OrchestratorService {
 
         let _tss_permit = self.tss_bulkhead.acquire().await
             .map_err(|e| format!("TSS bulkhead: {e}"))?;
-        let mut tss_transport = self.connect_tss().await?;
-        tss_transport.send(&signing_bytes).await.map_err(|e| format!("send to TSS: {e}"))?;
-        let (_sender, tss_resp_bytes) = tss_transport.recv().await.map_err(|e| format!("recv from TSS: {e}"))?;
+        // F9: deadline on every TSS network await.
+        let mut tss_transport = tokio::time::timeout_at(deadline_at, self.connect_tss())
+            .await
+            .map_err(|_| "F9 deadline exceeded: connect_tss".to_string())??;
+        tokio::time::timeout_at(deadline_at, tss_transport.send(&signing_bytes))
+            .await
+            .map_err(|_| "F9 deadline exceeded: send to TSS".to_string())?
+            .map_err(|e| format!("send to TSS: {e}"))?;
+        let (_sender, tss_resp_bytes) = tokio::time::timeout_at(deadline_at, tss_transport.recv())
+            .await
+            .map_err(|_| "F9 deadline exceeded: recv from TSS".to_string())?
+            .map_err(|e| format!("recv from TSS: {e}"))?;
 
         let tss_resp: SigningResponse = postcard::from_bytes(&tss_resp_bytes)
             .map_err(|e| format!("deserialize signing response: {e}"))?;
 
         if !tss_resp.success {
+            // F5: saga compensation — revoke the OPAQUE receipt so it cannot
+            // be replayed in a subsequent ceremony now that the downstream
+            // TSS call failed after OPAQUE success.
+            if let Some(receipt) = session.receipt_chain.receipts().last() {
+                let mut rid = [0u8; 32];
+                rid[..16].copy_from_slice(receipt.user_id.as_bytes());
+                rid[16..].copy_from_slice(&receipt.ceremony_session_id[..16]);
+                self.revocation_set.revoke(rid);
+            }
+            self.f10_breaker.record_failure();
             session.fail(tss_resp.error.clone().unwrap_or_default()).ok();
             return Err(tss_resp.error.unwrap_or_else(|| "TSS signing failed".into()));
         }
+        self.f10_breaker.record_success();
 
         session.tss_complete()?;
-        tss_resp.token.ok_or_else(|| "TSS success but no token".into())
+        let token = tss_resp
+            .token
+            .ok_or_else(|| "TSS success but no token".to_string())?;
+
+        // F4: cache the response for this idempotency key (60s TTL).
+        self.idempotency_cache.put(idempotency_key, token.clone());
+        Ok(token)
     }
 
     /// Overall request deadline for auth processing (5 seconds).
     const AUTH_REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// F14: Compute ceremony timeout dynamically from max token lifetime.
+    /// `max_token_lifetime + 60s` so no ceremony times out mid-flight.
+    pub fn dynamic_ceremony_timeout() -> std::time::Duration {
+        let cfg = common::config::SecurityConfig::default();
+        let max_tier_secs = (1u8..=4u8)
+            .map(|t| cfg.token_lifetime_for_tier(t))
+            .max()
+            .unwrap_or(30);
+        std::time::Duration::from_secs(max_tier_secs + 60)
+    }
 
     /// Start the orchestrator as a SHARD mTLS listener, processing auth requests.
     ///
@@ -790,6 +897,13 @@ impl OrchestratorService {
 
         tracing::info!("Orchestrator listening on {} (mTLS)", listen_addr);
 
+        // F10: bounded worker pool — semaphore caps concurrent ceremonies at
+        // WORKER_POOL_CAPACITY. New connections beyond the bound wait (and
+        // get dropped when the accept-loop eventually times out).
+        let worker_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(
+            crate::idempotency::WORKER_POOL_CAPACITY,
+        ));
+
         loop {
             // Accept errors are transient (e.g., fd exhaustion). Log and retry.
             let mut transport = match listener.accept().await {
@@ -800,8 +914,31 @@ impl OrchestratorService {
                 }
             };
 
+            // F10: refuse new work when the inline breaker is OPEN.
+            if !self.f10_breaker.allow() {
+                tracing::error!(
+                    target: "siem",
+                    "SIEM:CRITICAL F10 breaker open — dropping inbound connection"
+                );
+                continue;
+            }
+
+            // Acquire a worker permit before spawning — bounded concurrency.
+            let permit = match worker_permits.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    tracing::error!(
+                        target: "siem",
+                        capacity = crate::idempotency::WORKER_POOL_CAPACITY,
+                        "SIEM:WARN F10 worker pool saturated — dropping connection"
+                    );
+                    continue;
+                }
+            };
+
             let service = Arc::clone(&self);
             tokio::spawn(async move {
+                let _permit = permit; // released on drop
                 // Wrap the entire request processing in a deadline timeout.
                 let deadline_result = tokio::time::timeout(
                     OrchestratorService::AUTH_REQUEST_DEADLINE,
