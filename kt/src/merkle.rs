@@ -229,10 +229,11 @@ fn compute_leaf(
 }
 
 fn hash_pair(left: &[u8; 64], right: &[u8; 64]) -> [u8; 64] {
+    use sha2::Digest as Sha2Digest;
     let mut hasher = Sha512::new();
-    hasher.update(&[0x01]); // RFC 6962 internal node prefix
-    hasher.update(left);
-    hasher.update(right);
+    Sha2Digest::update(&mut hasher, &[0x01]); // RFC 6962 internal node prefix
+    Sha2Digest::update(&mut hasher, left);
+    Sha2Digest::update(&mut hasher, right);
     let result = hasher.finalize();
     let mut hash = [0u8; 64];
     hash.copy_from_slice(&result);

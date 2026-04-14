@@ -477,23 +477,29 @@ impl RatchetChain {
             None => return Ok(false),
         };
         let idx = self.pq_puncture_index as usize;
-        let ring = match &mut self.pq_ciphertext_ring {
-            Some(r) => r,
-            None => return Ok(false),
-        };
-        if idx >= ring.len() {
-            tracing::error!(
-                epoch = self.epoch,
-                "SIEM:CRITICAL ratchet PQ ciphertext ring exhausted at puncture index {} — \
-                 refusing to advance without PQ cover",
-                idx
-            );
-            return Err(RatchetError::ZeroEntropy(
-                "PQ ring exhausted".into(),
-            ));
-        }
 
-        let ct_bytes = ring[idx].clone();
+        // Take the ciphertext out of the ring as an owned Vec so the
+        // mutable borrow on `self.pq_ciphertext_ring` ends before we touch
+        // any other &mut self field. The empty Vec left in place is the
+        // equivalent of the prior in-place zeroize: the slot now holds zero
+        // bytes of plaintext key material.
+        let ct_bytes: Vec<u8> = {
+            let ring = match self.pq_ciphertext_ring.as_mut() {
+                Some(r) => r,
+                None => return Ok(false),
+            };
+            if idx >= ring.len() {
+                tracing::error!(
+                    epoch = self.epoch,
+                    "SIEM:CRITICAL ratchet PQ ciphertext ring exhausted at puncture index {} — \
+                     refusing to advance without PQ cover",
+                    idx
+                );
+                return Err(RatchetError::ZeroEntropy("PQ ring exhausted".into()));
+            }
+            std::mem::take(&mut ring[idx])
+        };
+
         let ct = match crypto::xwing::Ciphertext::from_bytes(&ct_bytes) {
             Some(c) => c,
             None => {
@@ -502,9 +508,7 @@ impl RatchetChain {
                     "SIEM:CRITICAL ratchet PQ ciphertext at index {} failed to parse",
                     idx
                 );
-                return Err(RatchetError::ZeroEntropy(
-                    "PQ ciphertext parse failed".into(),
-                ));
+                return Err(RatchetError::ZeroEntropy("PQ ciphertext parse failed".into()));
             }
         };
         let ss = crypto::xwing::xwing_decapsulate(&kp, &ct).map_err(|e| {
@@ -522,7 +526,7 @@ impl RatchetChain {
         hk.expand(PQ_PUNCTURE_INFO, &mut new_key[..])
             .map_err(|_| RatchetError::ZeroEntropy("HKDF expand failed on PQ puncture".into()))?;
 
-        // Re-lock swap semantics identical to `advance`.
+        // Re-lock swap semantics identical to `advance`. Ring borrow is gone.
         if self.key_locked {
             munlock_region(self.chain_key_ref().as_ptr(), self.chain_key_ref().len());
             self.key_locked = false;
@@ -531,8 +535,10 @@ impl RatchetChain {
         *self.chain_key_mut() = *new_key;
         self.lock_chain_key()?;
 
-        // Zeroize the consumed ciphertext in place and bump the index.
-        ring[idx].zeroize();
+        // ct_bytes already moved out of the ring; drop here wipes the
+        // last copy (Vec<u8> is not zeroize-on-drop, so wipe explicitly).
+        let mut ct_bytes = ct_bytes;
+        ct_bytes.zeroize();
         self.pq_puncture_index = self.pq_puncture_index.saturating_add(1);
         Ok(true)
     }
