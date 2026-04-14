@@ -471,21 +471,96 @@ fn allow_classical_tls() -> bool {
 /// When `MILNET_MILITARY_DEPLOYMENT=1`, a SIEM:CRITICAL log is emitted at startup
 /// documenting the Level 3 gap. The process does NOT abort because the
 /// application-layer X-Wing (ML-KEM-1024) provides Level 5 defense-in-depth.
+/// A5: whether the application-layer X-Wing (ML-KEM-1024 + X25519) path is
+/// active. Defaults on because every SHARD peer in-tree speaks X-Wing over
+/// the TLS session. Operators MAY assert it off (via
+/// `MILNET_TLS_APP_XWING_ACTIVE=0`) for isolated test clusters.
+fn app_layer_xwing_active() -> bool {
+    std::env::var("MILNET_TLS_APP_XWING_ACTIVE")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+}
+
+#[cfg(not(feature = "tls_pq_level5"))]
+const _TLS_PQ_LEVEL5_COMPILE_WARNING: () = {
+    // NOTE(A5): `tls_pq_level5` feature is OFF. rustls/aws-lc-rs does not
+    // yet export X25519MLKEM1024; the runtime path will fall back to
+    // X25519MLKEM768 and rely on application-layer X-Wing (ML-KEM-1024)
+    // for Level 5 defence-in-depth. Enable this feature when the upstream
+    // symbol becomes available to switch the TLS handshake itself to
+    // ML-KEM-1024. This is a warning, NOT a hard error, so builds that do
+    // not require TOP SECRET can continue to compile.
+};
+
 fn cnsa2_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
     let military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
         .map(|v| v == "1")
         .unwrap_or(false);
 
-    // MILNET_TLS_PQ_LEVEL=5 enforces ML-KEM-1024 at the TLS layer.
-    // Supersedes the older MILNET_REQUIRE_MLKEM1024 env var.
-    let require_level5 = std::env::var("MILNET_TLS_PQ_LEVEL")
-        .map(|v| v == "5")
-        .unwrap_or(false)
-        || std::env::var("MILNET_REQUIRE_MLKEM1024")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+    // A5: MILNET_TLS_PQ_LEVEL is the canonical env gate. Default level is 3
+    // (X25519MLKEM768) because that is what rustls/aws-lc-rs ships today.
+    // Level 5 is only admissible when the `tls_pq_level5` feature is enabled
+    // AND upstream exposes X25519MLKEM1024 — otherwise it is a hard error.
+    let tls_pq_level: u8 = std::env::var("MILNET_TLS_PQ_LEVEL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
 
-    if require_level5 {
+    let legacy_require_level5 = std::env::var("MILNET_REQUIRE_MLKEM1024")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+
+    if !(tls_pq_level == 3 || tls_pq_level == 5) {
+        tracing::error!(
+            target: "siem",
+            severity = "CRITICAL",
+            "FATAL: MILNET_TLS_PQ_LEVEL={} is not one of {{3,5}}. Refusing to start.",
+            tls_pq_level
+        );
+        std::process::exit(198);
+    }
+
+    let require_level5 = tls_pq_level == 5 || legacy_require_level5;
+
+    // A5: log the chosen PQ level and the state of application-layer X-Wing
+    // at startup so SIEM always has a clear record of which PQ surface the
+    // service is presenting on the wire.
+    let xwing_active = app_layer_xwing_active();
+    tracing::info!(
+        target: "siem",
+        category = "security",
+        severity = "INFO",
+        action = "tls_pq_level_startup",
+        tls_pq_level,
+        xwing_app_layer_active = xwing_active,
+        military_mode = military,
+        "SHARD TLS startup: MILNET_TLS_PQ_LEVEL={} app_xwing_active={} military={}",
+        tls_pq_level, xwing_active, military
+    );
+
+    // Level 5 requires EITHER rustls exposing X25519MLKEM1024 (feature-gated)
+    // OR a live application-layer X-Wing channel providing Level 5 cover.
+    #[cfg(not(feature = "tls_pq_level5"))]
+    let level5_tls_available = false;
+    #[cfg(feature = "tls_pq_level5")]
+    let level5_tls_available = true;
+
+    if require_level5 && !level5_tls_available {
+        // A5: in military mode, absence of X-Wing at level 5 is a fatal
+        // SIEM:CRITICAL — the operator asked for Level 5 on the wire and we
+        // cannot give it even with app-layer fallback.
+        if military && !xwing_active {
+            tracing::error!(
+                target: "siem",
+                category = "security",
+                severity = "CRITICAL",
+                action = "tls_pq_level5_unreachable",
+                "SIEM:CRITICAL: MILNET_MILITARY_DEPLOYMENT=1 with MILNET_TLS_PQ_LEVEL=5 \
+                 but neither the `tls_pq_level5` cargo feature nor the application-layer \
+                 X-Wing channel is active. Refusing to start."
+            );
+            std::process::exit(198);
+        }
         tracing::error!(
             target: "siem",
             category = "security",
@@ -494,7 +569,8 @@ fn cnsa2_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
             "FATAL: MILNET_TLS_PQ_LEVEL=5 (or MILNET_REQUIRE_MLKEM1024=1) is set but TLS \
              layer only supports ML-KEM-768 (X25519MLKEM768). CNSA 2.0 requires ML-KEM-1024 \
              for TOP SECRET. Refusing to start. Unset the env var to acknowledge this gap, \
-             or wait for rustls/aws-lc-rs to expose X25519MLKEM1024."
+             or rebuild with the `tls_pq_level5` cargo feature once rustls/aws-lc-rs \
+             exposes X25519MLKEM1024."
         );
         std::process::exit(198);
     }

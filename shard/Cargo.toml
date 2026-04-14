@@ -20,6 +20,7 @@ tokio-rustls.workspace = true
 rcgen.workspace = true
 tracing.workspace = true
 zeroize.workspace = true
+hex.workspace = true
 
 [dev-dependencies]
 serial_test.workspace = true
@@ -28,3 +29,7 @@ serial_test.workspace = true
 default = ["production"]
 production = ["common/production"]
 test-internals = []
+# A5: Gate the X25519MLKEM1024 kx-group behind this feature. Off by default
+# because rustls/aws-lc-rs does not currently expose it. Enable to promote
+# TLS key exchange to Level 5 once upstream lands the symbol.
+tls_pq_level5 = []
