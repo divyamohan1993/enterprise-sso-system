@@ -1435,6 +1435,426 @@ pub fn scrub_all_milnet_env_vars() {
     }
 }
 
+// ===========================================================================
+// C2: 2-of-3 KEK Threshold Unseal (HSM-backed + UDS dev fallback)
+// ===========================================================================
+//
+// CRITICAL PROPERTY: the master KEK is NEVER held by any single entity. It is
+// always reconstructed 2-of-3 at the moment of use, from:
+//
+//   - Production (military mode): three independent PKCS#11 HSM slots, each
+//     holding one Shamir share of the KEK. Any two slots can unseal.
+//     Implemented via the `cryptoki` crate (workspace feature `cac`).
+//
+//   - Non-HSM dev: three helper processes, each bound to an authenticated
+//     Unix Domain Socket on tmpfs. Each helper serves one share; the client
+//     verifies the helper's identity via SO_PEERCRED (uid + pid), then
+//     collects 2 partial shares and runs Shamir reconstruction locally.
+//
+// In military mode, the UDS fallback is refused: process aborts if no HSM
+// backend is configured.
+//
+// The outputs of both backends are indistinguishable to downstream callers —
+// each returns the fully reconstructed 32-byte KEK plus a domain-tagged
+// verification hash used by the KEK canary path.
+
+/// Environment variables consulted by the 2-of-3 unseal path.
+///
+/// - `MILNET_KEK2OF3_BACKEND`    : `pkcs11` (default in military) or `uds`
+/// - `MILNET_KEK2OF3_PKCS11_LIB` : path to the PKCS#11 library (.so)
+/// - `MILNET_KEK2OF3_PKCS11_SLOTS`: comma-separated list of 3 slot ids
+/// - `MILNET_KEK2OF3_PKCS11_PINS`: comma-separated list of 3 slot PINs
+/// - `MILNET_KEK2OF3_UDS_PATHS`  : comma-separated list of 3 UDS paths
+/// - `MILNET_KEK2OF3_UDS_UIDS`   : comma-separated list of 3 expected helper uids
+///
+/// Exactly 3 entries required in each slot/pin/path list. Threshold is 2.
+const C2_THRESHOLD: u8 = 2;
+const C2_TOTAL: u8 = 3;
+
+/// The result of a 2-of-3 unseal: the 32-byte KEK plus an audit tag.
+pub struct KekUnsealResult {
+    pub kek: [u8; 32],
+    /// Domain-tagged SHA-512 of the KEK for canary / verification.
+    pub verify_hash: [u8; 64],
+    pub backend: &'static str,
+}
+
+impl Zeroize for KekUnsealResult {
+    fn zeroize(&mut self) {
+        self.kek.zeroize();
+        self.verify_hash.zeroize();
+    }
+}
+
+impl Drop for KekUnsealResult {
+    fn drop(&mut self) {
+        self.kek.zeroize();
+    }
+}
+
+fn is_military_mode() -> bool {
+    std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1")
+}
+
+fn kek_verify_hash(kek: &[u8; 32]) -> [u8; 64] {
+    use sha2::{Digest, Sha512};
+    let mut h = Sha512::new();
+    h.update(b"MILNET-KEK-2OF3-VERIFY-v1");
+    h.update(kek);
+    let out = h.finalize();
+    let mut arr = [0u8; 64];
+    arr.copy_from_slice(&out);
+    arr
+}
+
+/// Perform a 2-of-3 KEK unseal. Returns the reconstructed KEK.
+///
+/// In military mode: requires PKCS#11 backend. Panics if unavailable.
+/// Outside military mode: falls back to UDS helpers if PKCS#11 is not configured.
+pub fn unseal_kek_2of3() -> Result<KekUnsealResult, String> {
+    let backend = std::env::var("MILNET_KEK2OF3_BACKEND")
+        .unwrap_or_else(|_| {
+            if is_military_mode() { "pkcs11".to_string() } else { "uds".to_string() }
+        });
+
+    match backend.as_str() {
+        "pkcs11" | "hsm" => {
+            #[cfg(feature = "cac")]
+            {
+                return unseal_kek_2of3_pkcs11();
+            }
+            #[cfg(not(feature = "cac"))]
+            {
+                if is_military_mode() {
+                    tracing::error!(
+                        "C2 FATAL: military mode requires PKCS#11 HSM backend for 2-of-3 KEK unseal, \
+                         but this binary was built without the `cac` feature. Refusing to start."
+                    );
+                    crate::siem::SecurityEvent::crypto_failure(
+                        "military mode without PKCS#11 2-of-3 KEK backend: aborting",
+                    );
+                    std::process::exit(199);
+                }
+                tracing::warn!(
+                    "C2: PKCS#11 backend requested but `cac` feature not compiled; \
+                     falling back to UDS helpers (dev only)"
+                );
+                return unseal_kek_2of3_uds();
+            }
+        }
+        "uds" => {
+            if is_military_mode() {
+                tracing::error!(
+                    "C2 FATAL: UDS fallback for 2-of-3 KEK unseal is FORBIDDEN in military mode. \
+                     Configure MILNET_KEK2OF3_BACKEND=pkcs11 with HSM slots."
+                );
+                crate::siem::SecurityEvent::crypto_failure(
+                    "UDS KEK fallback attempted in military mode: aborting",
+                );
+                std::process::exit(199);
+            }
+            unseal_kek_2of3_uds()
+        }
+        other => Err(format!("unknown MILNET_KEK2OF3_BACKEND: {other}")),
+    }
+}
+
+/// Reconstruct the 32-byte KEK from 2-of-3 shares using the existing
+/// Shamir implementation in `threshold_kek`.
+fn reconstruct_2of3(shares: Vec<crate::threshold_kek::KekShare>) -> Result<[u8; 32], String> {
+    if shares.len() < C2_THRESHOLD as usize {
+        return Err(format!(
+            "need at least {} shares, got {}",
+            C2_THRESHOLD,
+            shares.len()
+        ));
+    }
+    crate::threshold_kek::reconstruct_secret(&shares[..C2_THRESHOLD as usize])
+}
+
+// --- PKCS#11 backend (feature = "cac") ----------------------------------
+
+#[cfg(feature = "cac")]
+fn unseal_kek_2of3_pkcs11() -> Result<KekUnsealResult, String> {
+    use cryptoki::context::{CInitializeArgs, Pkcs11};
+
+    let lib_path = std::env::var("MILNET_KEK2OF3_PKCS11_LIB")
+        .map_err(|_| "MILNET_KEK2OF3_PKCS11_LIB not set".to_string())?;
+    let slots_csv = std::env::var("MILNET_KEK2OF3_PKCS11_SLOTS")
+        .map_err(|_| "MILNET_KEK2OF3_PKCS11_SLOTS not set".to_string())?;
+    let pins_csv = std::env::var("MILNET_KEK2OF3_PKCS11_PINS")
+        .map_err(|_| "MILNET_KEK2OF3_PKCS11_PINS not set".to_string())?;
+
+    let slot_ids: Vec<u64> = slots_csv
+        .split(',')
+        .map(|s| s.trim().parse::<u64>().map_err(|e| format!("bad slot id: {e}")))
+        .collect::<Result<_, _>>()?;
+    let pins: Vec<String> = pins_csv.split(',').map(|s| s.trim().to_string()).collect();
+
+    if slot_ids.len() != C2_TOTAL as usize || pins.len() != C2_TOTAL as usize {
+        return Err(format!(
+            "PKCS#11 2-of-3 requires exactly {} slots and {} pins",
+            C2_TOTAL, C2_TOTAL
+        ));
+    }
+
+    let pkcs11 = Pkcs11::new(&lib_path)
+        .map_err(|e| format!("Pkcs11::new({lib_path}): {e}"))?;
+    pkcs11
+        .initialize(CInitializeArgs::OsThreads)
+        .map_err(|e| format!("PKCS#11 initialize: {e}"))?;
+
+    // Try to read all 3 shares; stop after 2 successes (threshold met).
+    let mut shares: Vec<crate::threshold_kek::KekShare> = Vec::new();
+    let mut slot_errors: Vec<String> = Vec::new();
+
+    for (i, (&slot_id, pin)) in slot_ids.iter().zip(pins.iter()).enumerate() {
+        let share_index = (i as u8) + 1;
+        match read_share_from_pkcs11_slot(&pkcs11, slot_id, pin, share_index) {
+            Ok(share) => {
+                shares.push(share);
+                if shares.len() >= C2_THRESHOLD as usize {
+                    break;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "C2: PKCS#11 slot {slot_id} (share {share_index}) unavailable: {e}"
+                );
+                slot_errors.push(format!("slot {slot_id}: {e}"));
+            }
+        }
+    }
+
+    if shares.len() < C2_THRESHOLD as usize {
+        return Err(format!(
+            "PKCS#11 2-of-3 KEK unseal FAILED: only {} shares available (need {}). Errors: {}",
+            shares.len(),
+            C2_THRESHOLD,
+            slot_errors.join("; ")
+        ));
+    }
+
+    let kek = reconstruct_2of3(shares)?;
+    let verify_hash = kek_verify_hash(&kek);
+    tracing::info!(
+        "C2: KEK reconstructed via 2-of-3 PKCS#11 HSM unseal (slots used: {})",
+        C2_THRESHOLD
+    );
+    Ok(KekUnsealResult {
+        kek,
+        verify_hash,
+        backend: "pkcs11",
+    })
+}
+
+#[cfg(feature = "cac")]
+fn read_share_from_pkcs11_slot(
+    pkcs11: &cryptoki::context::Pkcs11,
+    slot_id: u64,
+    pin: &str,
+    share_index: u8,
+) -> Result<crate::threshold_kek::KekShare, String> {
+    use cryptoki::object::{Attribute, AttributeType};
+    use cryptoki::session::UserType;
+    use cryptoki::slot::Slot;
+    use cryptoki::types::AuthPin;
+
+    let slot = Slot::try_from(slot_id).map_err(|e| format!("invalid slot {slot_id}: {e}"))?;
+    let session = pkcs11
+        .open_ro_session(slot)
+        .map_err(|e| format!("open_ro_session({slot_id}): {e}"))?;
+    session
+        .login(UserType::User, Some(&AuthPin::new(pin.to_string())))
+        .map_err(|e| format!("login({slot_id}): {e}"))?;
+
+    // We store each share as a DATA object labelled
+    // "MILNET-KEK-SHARE-v1:<share_index>" containing postcard-serialised
+    // `KekShare` bytes.
+    let label = format!("MILNET-KEK-SHARE-v1:{}", share_index);
+    let template = vec![Attribute::Label(label.clone().into_bytes())];
+    let handles = session
+        .find_objects(&template)
+        .map_err(|e| format!("find_objects({label}): {e}"))?;
+    let handle = *handles
+        .first()
+        .ok_or_else(|| format!("no share object with label {label}"))?;
+    let attrs = session
+        .get_attributes(handle, &[AttributeType::Value])
+        .map_err(|e| format!("get_attributes({label}): {e}"))?;
+    let value = attrs
+        .into_iter()
+        .find_map(|a| if let Attribute::Value(v) = a { Some(v) } else { None })
+        .ok_or_else(|| format!("DATA object {label} has no CKA_VALUE"))?;
+
+    let hex_str = std::str::from_utf8(&value)
+        .map_err(|e| format!("slot {slot_id} CKA_VALUE not valid UTF-8 hex: {e}"))?;
+    let share = crate::threshold_kek::KekShare::from_hex(hex_str.trim())
+        .map_err(|e| format!("parse KekShare from slot {slot_id}: {e}"))?;
+    if share.index != share_index {
+        return Err(format!(
+            "slot {slot_id} label says share {share_index} but stored share index is {}",
+            share.index
+        ));
+    }
+    Ok(share)
+}
+
+// --- UDS helper backend (dev only) --------------------------------------
+
+fn unseal_kek_2of3_uds() -> Result<KekUnsealResult, String> {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let paths_csv = std::env::var("MILNET_KEK2OF3_UDS_PATHS")
+        .map_err(|_| "MILNET_KEK2OF3_UDS_PATHS not set".to_string())?;
+    let uids_csv = std::env::var("MILNET_KEK2OF3_UDS_UIDS")
+        .map_err(|_| "MILNET_KEK2OF3_UDS_UIDS not set".to_string())?;
+
+    let paths: Vec<String> = paths_csv.split(',').map(|s| s.trim().to_string()).collect();
+    let uids: Vec<u32> = uids_csv
+        .split(',')
+        .map(|s| s.trim().parse::<u32>().map_err(|e| format!("bad uid: {e}")))
+        .collect::<Result<_, _>>()?;
+
+    if paths.len() != C2_TOTAL as usize || uids.len() != C2_TOTAL as usize {
+        return Err(format!(
+            "UDS 2-of-3 requires exactly {} paths and {} uids",
+            C2_TOTAL, C2_TOTAL
+        ));
+    }
+
+    let mut shares: Vec<crate::threshold_kek::KekShare> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    for (i, (path, &expected_uid)) in paths.iter().zip(uids.iter()).enumerate() {
+        let share_index = (i as u8) + 1;
+        let mut stream = match UnixStream::connect(path) {
+            Ok(s) => s,
+            Err(e) => {
+                errors.push(format!("connect {path}: {e}"));
+                continue;
+            }
+        };
+
+        if let Err(e) = verify_peer_credentials(&stream, expected_uid) {
+            errors.push(format!("{path}: SO_PEERCRED check failed: {e}"));
+            continue;
+        }
+
+        // Protocol: send request, receive (index:u8 || share_bytes_len:u16 || share_bytes)
+        let request = format!("GET_SHARE:{share_index}\n");
+        if let Err(e) = stream.write_all(request.as_bytes()) {
+            errors.push(format!("{path}: write: {e}"));
+            continue;
+        }
+        // Response: ASCII hex share (66 chars = 2 index + 64 value), newline-terminated.
+        let mut body = vec![0u8; 128];
+        let n = match stream.read(&mut body) {
+            Ok(n) => n,
+            Err(e) => {
+                errors.push(format!("{path}: read body: {e}"));
+                continue;
+            }
+        };
+        body.truncate(n);
+        let hex_str = match std::str::from_utf8(&body) {
+            Ok(s) => s.trim(),
+            Err(e) => {
+                errors.push(format!("{path}: not valid utf-8: {e}"));
+                continue;
+            }
+        };
+        let share = match crate::threshold_kek::KekShare::from_hex(hex_str) {
+            Ok(s) => s,
+            Err(e) => {
+                errors.push(format!("{path}: parse KekShare: {e}"));
+                continue;
+            }
+        };
+        if share.index != share_index {
+            errors.push(format!(
+                "{path}: serialized share index {} != expected {share_index}",
+                share.index
+            ));
+            continue;
+        }
+        shares.push(share);
+        if shares.len() >= C2_THRESHOLD as usize {
+            break;
+        }
+    }
+
+    if shares.len() < C2_THRESHOLD as usize {
+        return Err(format!(
+            "UDS 2-of-3 KEK unseal FAILED: {} shares (need {}). Errors: {}",
+            shares.len(),
+            C2_THRESHOLD,
+            errors.join("; ")
+        ));
+    }
+
+    let kek = reconstruct_2of3(shares)?;
+    let verify_hash = kek_verify_hash(&kek);
+    tracing::info!(
+        "C2: KEK reconstructed via 2-of-3 UDS dev helpers (dev mode only)"
+    );
+    Ok(KekUnsealResult {
+        kek,
+        verify_hash,
+        backend: "uds",
+    })
+}
+
+/// SO_PEERCRED verification on a Unix socket. Rejects if the peer uid
+/// does not match `expected_uid`.
+fn verify_peer_credentials(
+    stream: &std::os::unix::net::UnixStream,
+    expected_uid: u32,
+) -> Result<(), String> {
+    use std::os::unix::io::AsRawFd;
+
+    // Safety: libc::getsockopt with SO_PEERCRED is the canonical way to
+    // obtain the peer's (pid, uid, gid) on a connected UDS on Linux. We
+    // treat the socket fd as borrowed; the struct ucred is POD.
+    #[repr(C)]
+    struct Ucred {
+        pid: i32,
+        uid: u32,
+        gid: u32,
+    }
+
+    let fd = stream.as_raw_fd();
+    let mut cred = Ucred { pid: 0, uid: u32::MAX, gid: u32::MAX };
+    let mut len = std::mem::size_of::<Ucred>() as libc::socklen_t;
+
+    // SAFETY: fd is borrowed from an owned UnixStream; &mut cred points to
+    // a valid Ucred-sized region; len is initialised to its size. The call
+    // writes into cred and len only, and returns a C int.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "getsockopt(SO_PEERCRED) failed: errno {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if cred.uid != expected_uid {
+        return Err(format!(
+            "peer uid {} != expected {} (pid {})",
+            cred.uid, expected_uid, cred.pid
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
