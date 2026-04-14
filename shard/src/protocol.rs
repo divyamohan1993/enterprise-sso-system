@@ -512,6 +512,193 @@ impl ShardProtocol {
         Ok(())
     }
 
+    /// C9: Export sequence state encrypted with AES-256-GCM.
+    ///
+    /// Format: `[1 byte version=1] [12 byte nonce] [ciphertext] [64 byte HMAC-SHA512]`
+    /// where the HMAC covers `(version || nonce || ciphertext)`.
+    ///
+    /// The encryption key is derived via HKDF-SHA512 from the master KEK
+    /// with info `"milnet-shard-seq-state-v1"`; the integrity HMAC key is
+    /// derived with info `"milnet-shard-seq-state-mac-v1"`. Both rotate
+    /// automatically when the master KEK rotates (see
+    /// [`common::key_rotation`]).
+    ///
+    /// On KEK rotation, callers MUST re-export; the old ciphertext becomes
+    /// undecryptable.
+    pub fn export_sequences_encrypted(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Result<(), common::error::MilnetError> {
+        use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
+        use hkdf::Hkdf;
+        use hmac::Mac;
+
+        let state = AuthenticatedSequenceState {
+            send_sequence: self.send_sequence,
+            recv_sequences: self.recv_sequences.clone(),
+        };
+        let plaintext = postcard::to_allocvec(&state).map_err(|e| {
+            MilnetError::Shard(format!("serialize sequence state: {e}"))
+        })?;
+
+        // Derive encryption and HMAC keys from the master KEK.
+        let master = common::sealed_keys::cached_master_kek();
+        let hk = Hkdf::<Sha512>::new(None, master);
+        let mut enc_key = [0u8; 32];
+        hk.expand(b"milnet-shard-seq-state-v1", &mut enc_key)
+            .map_err(|e| MilnetError::Shard(format!("HKDF enc key: {e}")))?;
+        let mut mac_key = [0u8; 64];
+        hk.expand(b"milnet-shard-seq-state-mac-v1", &mut mac_key)
+            .map_err(|e| MilnetError::Shard(format!("HKDF mac key: {e}")))?;
+
+        // Fresh 96-bit nonce
+        let mut nonce_bytes = [0u8; 12];
+        getrandom::getrandom(&mut nonce_bytes)
+            .map_err(|e| MilnetError::Shard(format!("getrandom nonce: {e}")))?;
+
+        let cipher = Aes256Gcm::new_from_slice(&enc_key)
+            .map_err(|e| MilnetError::Shard(format!("AES-256-GCM key: {e}")))?;
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce_bytes), plaintext.as_slice())
+            .map_err(|e| MilnetError::Shard(format!("AES-256-GCM encrypt: {e}")))?;
+
+        // Integrity HMAC over (version || nonce || ciphertext).
+        const VERSION: u8 = 1;
+        let mut mac = <HmacSha512 as Mac>::new_from_slice(&mac_key)
+            .map_err(|e| MilnetError::Shard(format!("HMAC key: {e}")))?;
+        mac.update(&[VERSION]);
+        mac.update(&nonce_bytes);
+        mac.update(&ciphertext);
+        let tag = mac.finalize().into_bytes();
+
+        let mut out = Vec::with_capacity(1 + 12 + ciphertext.len() + 64);
+        out.push(VERSION);
+        out.extend_from_slice(&nonce_bytes);
+        out.extend_from_slice(&ciphertext);
+        out.extend_from_slice(&tag);
+
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, &out)
+            .map_err(|e| MilnetError::Shard(format!("write seq tmp: {e}")))?;
+        std::fs::rename(&tmp, path)
+            .map_err(|e| MilnetError::Shard(format!("rename seq tmp: {e}")))?;
+
+        // Zeroize derived keys
+        {
+            use zeroize::Zeroize;
+            enc_key.zeroize();
+            mac_key.zeroize();
+        }
+        self.last_persisted_epoch = self.send_sequence;
+        Ok(())
+    }
+
+    /// C9: Import an encrypted sequence state written by
+    /// [`Self::export_sequences_encrypted`].
+    ///
+    /// Verifies the HMAC and decrypts the AES-256-GCM blob. On any
+    /// verification failure — bad tag, wrong key, truncated file — returns
+    /// an error and leaves the in-memory state untouched.
+    ///
+    /// If the feature `shard-seq-unencrypted-migration` is enabled, a
+    /// plaintext postcard blob (legacy v0 format) is accepted as a
+    /// forward-compat one-shot migration path.
+    pub fn import_sequences_encrypted(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Result<(), common::error::MilnetError> {
+        use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
+        use hkdf::Hkdf;
+        use hmac::Mac;
+
+        let raw = std::fs::read(path)
+            .map_err(|e| MilnetError::Shard(format!("read {:?}: {e}", path)))?;
+
+        // Legacy-unencrypted migration path (feature-gated).
+        #[cfg(feature = "shard-seq-unencrypted-migration")]
+        {
+            if let Ok(state) = postcard::from_bytes::<AuthenticatedSequenceState>(&raw) {
+                tracing::warn!(
+                    "C9: accepted legacy unencrypted sequence state from {:?} \
+                     (shard-seq-unencrypted-migration feature). Re-export will encrypt.",
+                    path
+                );
+                self.apply_state(state);
+                return Ok(());
+            }
+        }
+
+        if raw.len() < 1 + 12 + 64 {
+            return Err(MilnetError::Shard(format!(
+                "encrypted seq file too short: {} bytes",
+                raw.len()
+            )));
+        }
+        let version = raw[0];
+        if version != 1 {
+            return Err(MilnetError::Shard(format!(
+                "unsupported encrypted seq version: {version}"
+            )));
+        }
+        let nonce_bytes: [u8; 12] = raw[1..13]
+            .try_into()
+            .map_err(|_| MilnetError::Shard("nonce slice".into()))?;
+        let ct_end = raw.len() - 64;
+        let ciphertext = &raw[13..ct_end];
+        let stored_tag = &raw[ct_end..];
+
+        let master = common::sealed_keys::cached_master_kek();
+        let hk = Hkdf::<Sha512>::new(None, master);
+        let mut enc_key = [0u8; 32];
+        hk.expand(b"milnet-shard-seq-state-v1", &mut enc_key)
+            .map_err(|e| MilnetError::Shard(format!("HKDF enc key: {e}")))?;
+        let mut mac_key = [0u8; 64];
+        hk.expand(b"milnet-shard-seq-state-mac-v1", &mut mac_key)
+            .map_err(|e| MilnetError::Shard(format!("HKDF mac key: {e}")))?;
+
+        let mut mac = <HmacSha512 as Mac>::new_from_slice(&mac_key)
+            .map_err(|e| MilnetError::Shard(format!("HMAC key: {e}")))?;
+        mac.update(&[version]);
+        mac.update(&nonce_bytes);
+        mac.update(ciphertext);
+        if mac.verify_slice(stored_tag).is_err() {
+            use zeroize::Zeroize;
+            enc_key.zeroize();
+            mac_key.zeroize();
+            return Err(MilnetError::Shard(
+                "encrypted seq HMAC mismatch — file tampered or wrong KEK".into(),
+            ));
+        }
+
+        let cipher = Aes256Gcm::new_from_slice(&enc_key)
+            .map_err(|e| MilnetError::Shard(format!("AES-256-GCM key: {e}")))?;
+        let plaintext = cipher
+            .decrypt(Nonce::from_slice(&nonce_bytes), ciphertext)
+            .map_err(|_| MilnetError::Shard("AES-256-GCM decrypt failed".into()))?;
+
+        use zeroize::Zeroize;
+        enc_key.zeroize();
+        mac_key.zeroize();
+
+        let state: AuthenticatedSequenceState = postcard::from_bytes(&plaintext)
+            .map_err(|e| MilnetError::Shard(format!("deserialize: {e}")))?;
+        self.apply_state(state);
+        Ok(())
+    }
+
+    /// Apply a parsed authenticated sequence state, advancing only.
+    fn apply_state(&mut self, state: AuthenticatedSequenceState) {
+        if state.send_sequence > self.send_sequence {
+            self.send_sequence = state.send_sequence;
+        }
+        for (module, seq) in state.recv_sequences {
+            let current = self.recv_sequences.entry(module).or_insert(0);
+            if seq > *current {
+                *current = seq;
+            }
+        }
+    }
+
     /// Mark the current epoch as persisted. Call this after successfully
     /// writing [`export_sequences`] to durable storage.
     pub fn mark_persisted(&mut self) {
