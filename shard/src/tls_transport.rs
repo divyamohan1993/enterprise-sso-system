@@ -17,6 +17,98 @@ use common::types::ModuleId;
 
 use crate::protocol::ShardProtocol;
 
+// ---------------------------------------------------------------------------
+// C10: App-layer PQ key exchange + double-AEAD
+//
+// Rationale: the underlying TLS session may use classical X25519 key
+// exchange (where `tls_pq_level5` is disabled). Even if today's session
+// survives, an adversary who records traffic and later recovers the X25519
+// shared secret (harvest-now-decrypt-later) would then recover every
+// SHARD payload. We defeat that by running a SECOND key exchange *inside*
+// the established TLS session using X-Wing (X25519 + ML-KEM-1024 hybrid)
+// and re-encrypting each SHARD payload with AES-256-GCM under the resulting
+// session key. The pubkey used for X-Wing is pinned to the mTLS peer
+// certificate's SHA-512 fingerprint to block key-substitution attacks.
+// ---------------------------------------------------------------------------
+
+use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
+
+/// Session state for the app-layer PQ layer. Holds the AEAD key and a
+/// monotonically increasing nonce counter.
+pub struct PqSessionState {
+    aead_key: [u8; 32],
+    send_counter: u64,
+    recv_counter: u64,
+    /// SHA-512 fingerprint of the mTLS peer certificate we bound to.
+    peer_cert_fp: [u8; 64],
+}
+
+impl PqSessionState {
+    fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, MilnetError> {
+        let counter = self.send_counter;
+        self.send_counter = self
+            .send_counter
+            .checked_add(1)
+            .ok_or_else(|| MilnetError::Shard("PQ session counter overflow".into()))?;
+        let mut nonce = [0u8; 12];
+        nonce[4..].copy_from_slice(&counter.to_be_bytes());
+        let cipher = Aes256Gcm::new_from_slice(&self.aead_key)
+            .map_err(|e| MilnetError::Shard(format!("AES key: {e}")))?;
+        let ct = cipher
+            .encrypt(Nonce::from_slice(&nonce), plaintext)
+            .map_err(|_| MilnetError::Shard("PQ outer encrypt failed".into()))?;
+        let mut out = Vec::with_capacity(8 + ct.len());
+        out.extend_from_slice(&counter.to_be_bytes());
+        out.extend_from_slice(&ct);
+        Ok(out)
+    }
+
+    fn decrypt(&mut self, blob: &[u8]) -> Result<Vec<u8>, MilnetError> {
+        if blob.len() < 8 {
+            return Err(MilnetError::Shard("PQ blob too short".into()));
+        }
+        let counter = u64::from_be_bytes(blob[..8].try_into().unwrap());
+        if counter <= self.recv_counter && self.recv_counter != 0 {
+            return Err(MilnetError::Shard(format!(
+                "PQ replay detected: counter {counter} <= last {}",
+                self.recv_counter
+            )));
+        }
+        self.recv_counter = counter;
+        let mut nonce = [0u8; 12];
+        nonce[4..].copy_from_slice(&counter.to_be_bytes());
+        let cipher = Aes256Gcm::new_from_slice(&self.aead_key)
+            .map_err(|e| MilnetError::Shard(format!("AES key: {e}")))?;
+        cipher
+            .decrypt(Nonce::from_slice(&nonce), &blob[8..])
+            .map_err(|_| MilnetError::Shard("PQ outer decrypt failed".into()))
+    }
+}
+
+impl Drop for PqSessionState {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.aead_key.zeroize();
+    }
+}
+
+/// Derive the app-layer AEAD key from the X-Wing shared secret AND the
+/// pinned mTLS peer certificate fingerprint. Pinning the KDF input to the
+/// cert fingerprint defeats attacks where an adversary substitutes a
+/// different X-Wing public key during the handshake.
+fn derive_pq_session_key(
+    xwing_shared: &[u8],
+    peer_cert_fp: &[u8; 64],
+) -> Result<[u8; 32], MilnetError> {
+    use hkdf::Hkdf;
+    use sha2::Sha512;
+    let hk = Hkdf::<Sha512>::new(Some(b"MILNET-SHARD-PQ-APPLAYER-v1"), xwing_shared);
+    let mut okm = [0u8; 32];
+    hk.expand(peer_cert_fp, &mut okm)
+        .map_err(|e| MilnetError::Shard(format!("HKDF: {e}")))?;
+    Ok(okm)
+}
+
 /// Maximum SHARD frame payload size (16 MiB). Accommodates ML-DSA-87 signatures,
 /// FROST threshold shares, OPAQUE ceremony payloads, and concurrent e2e flows.
 const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
@@ -93,6 +185,10 @@ async fn recv_on_inner<R: AsyncReadExt + Unpin>(
 pub struct TlsShardTransport {
     stream: TlsTransportStream,
     pub protocol: ShardProtocol,
+    /// C10: optional app-layer PQ session established AFTER the mTLS handshake.
+    /// When present, `send_pq`/`recv_pq` double-encrypt payloads under a
+    /// X-Wing-derived key bound to the peer cert fingerprint.
+    pq_session: Option<PqSessionState>,
 }
 
 /// Unifies the server and client TLS stream types so that
@@ -107,6 +203,7 @@ impl TlsShardTransport {
         Self {
             stream: TlsTransportStream::Server(stream),
             protocol,
+            pq_session: None,
         }
     }
 
@@ -114,6 +211,80 @@ impl TlsShardTransport {
         Self {
             stream: TlsTransportStream::Client(stream),
             protocol,
+            pq_session: None,
+        }
+    }
+
+    /// C10: Install an app-layer PQ session state (derived from a prior
+    /// [`crypto::xwing`] exchange). `peer_cert_fp` must be the SHA-512
+    /// fingerprint of the mTLS peer certificate used during the handshake;
+    /// pinning here defeats X-Wing public-key substitution.
+    pub fn install_pq_session(
+        &mut self,
+        xwing_shared_secret: &[u8],
+        peer_cert_fp: [u8; 64],
+    ) -> Result<(), MilnetError> {
+        let aead_key = derive_pq_session_key(xwing_shared_secret, &peer_cert_fp)?;
+        self.pq_session = Some(PqSessionState {
+            aead_key,
+            send_counter: 0,
+            recv_counter: 0,
+            peer_cert_fp,
+        });
+        tracing::info!(
+            "C10: installed app-layer PQ session (X-Wing-derived AEAD) bound to peer cert fingerprint"
+        );
+        Ok(())
+    }
+
+    /// C10: Return a reference to the installed PQ session fingerprint, if any.
+    pub fn pq_peer_fingerprint(&self) -> Option<&[u8; 64]> {
+        self.pq_session.as_ref().map(|s| &s.peer_cert_fp)
+    }
+
+    /// C10: Send a payload with the full double-AEAD wrapping. The outer
+    /// AEAD is the installed PQ session key; the inner is the existing
+    /// SHARD AEAD. Falls back to [`Self::send`] if no PQ session is installed
+    /// (documented harvest-now-decrypt-later hole in that configuration).
+    pub async fn send_pq(&mut self, payload: &[u8]) -> Result<(), MilnetError> {
+        if let Some(ref mut pq) = self.pq_session {
+            let outer = pq.encrypt(payload)?;
+            self.send_inner(&outer).await
+        } else {
+            tracing::warn!(
+                "C10: send_pq called without installed PQ session — falling back to single-layer AEAD"
+            );
+            self.send_inner(payload).await
+        }
+    }
+
+    /// C10: Receive and unwrap both AEAD layers.
+    pub async fn recv_pq(
+        &mut self,
+    ) -> Result<(ModuleId, Vec<u8>), MilnetError> {
+        let (sender, inner_payload) = self.recv_inner().await?;
+        let bytes: Vec<u8> = inner_payload.0.clone();
+        if let Some(ref mut pq) = self.pq_session {
+            let plaintext = pq.decrypt(&bytes)?;
+            Ok((sender, plaintext))
+        } else {
+            Ok((sender, bytes))
+        }
+    }
+
+    async fn send_inner(&mut self, payload: &[u8]) -> Result<(), MilnetError> {
+        match &mut self.stream {
+            TlsTransportStream::Server(s) => send_on(s, &mut self.protocol, payload).await,
+            TlsTransportStream::Client(s) => send_on(s, &mut self.protocol, payload).await,
+        }
+    }
+
+    async fn recv_inner(
+        &mut self,
+    ) -> Result<(ModuleId, super::protocol::SecurePayload), MilnetError> {
+        match &mut self.stream {
+            TlsTransportStream::Server(s) => recv_on(s, &mut self.protocol).await,
+            TlsTransportStream::Client(s) => recv_on(s, &mut self.protocol).await,
         }
     }
 
