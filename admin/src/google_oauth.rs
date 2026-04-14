@@ -330,7 +330,7 @@ pub struct GoogleTokenResponse {
 // ---------------------------------------------------------------------------
 
 /// Claims extracted from a Google ID token JWT payload.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 pub struct GoogleIdTokenClaims {
     pub sub: String,
     pub email: String,
@@ -563,6 +563,192 @@ pub async fn extract_google_claims(
     }
 
     Ok(claims)
+}
+
+// ---------------------------------------------------------------------------
+// A1: MILNET admin token — PQ counter-signature wrapping Google RS256 JWT.
+//
+// Google's RS256 signature is classical and does not meet CNSA 2.0 Level 5.
+// MilnetAdminToken wraps a fully-verified Google id_token with an outer
+// ML-DSA-87 signature computed by a pinned MILNET admin signing key loaded
+// from the sealed secret store. The outer signature commits to
+// SHA-512(google_jwt_bytes || claims_json) so neither the serialised JWT
+// nor the canonical JSON claim view can be substituted independently.
+//
+// Verifiers MUST treat the Google RS256 verification as a non-authoritative
+// input — only the outer PQ signature, checked against the pinned admin
+// verifying key, confers authority. Google claims provide identity attributes
+// only; authority to mutate MILNET admin state derives from the PQ signature.
+// ---------------------------------------------------------------------------
+
+/// Sealed-secret name under which the MILNET admin ML-DSA-87 signing seed
+/// is provisioned. 32 raw bytes or 64 hex chars.
+const ADMIN_PQ_SIGNING_KEY_NAME: &str = "ADMIN_PQ_SIGNING_SEED";
+
+/// Wrapped MILNET admin token.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MilnetAdminToken {
+    /// Base64url-encoded original Google id_token (compact JWS).
+    pub inner_google_jwt_b64: String,
+    /// ML-DSA-87 signature over SHA-512(google_jwt_bytes || claims_json).
+    pub outer_pq_sig: Vec<u8>,
+    /// SHA-512 hash of the encoded ML-DSA-87 verifying key for key pinning.
+    /// Serialised as a byte vector (serde derive does not support `[u8; 64]`).
+    #[serde(with = "serde_bytes_64")]
+    pub outer_pq_vk_hash: [u8; 64],
+}
+
+mod serde_bytes_64 {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    pub fn serialize<S: Serializer>(data: &[u8; 64], ser: S) -> Result<S::Ok, S::Error> {
+        data.as_slice().serialize(ser)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<[u8; 64], D::Error> {
+        let v: Vec<u8> = Vec::deserialize(de)?;
+        v.try_into().map_err(|v: Vec<u8>| {
+            serde::de::Error::custom(format!("expected 64 bytes, got {}", v.len()))
+        })
+    }
+}
+
+/// A1 domain separator for the PQ counter-signature input.
+const ADMIN_PQ_COUNTERSIGN_DOMAIN: &[u8] = b"MILNET-ADMIN-GOOGLE-COUNTERSIGN-v1";
+
+/// Load the pinned MILNET admin ML-DSA-87 signing key.
+///
+/// The seed is resolved through `common::secret_loader` (UDS helper ->
+/// systemd LoadCredential -> env escape hatch). Reading the seed directly
+/// from an environment variable is NEVER attempted — that path is gated by
+/// the loader and blocked in production. If the loader fails in military
+/// mode, we panic so the service refuses to start with an unpinned key.
+pub fn load_admin_pq_signing_key() -> Result<
+    (
+        crypto::pq_sign::PqSigningKey,
+        crypto::pq_sign::PqVerifyingKey,
+        [u8; 64],
+    ),
+    String,
+> {
+    use ml_dsa::{KeyGen, MlDsa87};
+    use sha2::{Digest, Sha512};
+    use zeroize::Zeroize;
+
+    let sealed = match common::secret_loader::load_secret(ADMIN_PQ_SIGNING_KEY_NAME) {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = format!(
+                "A1: failed to load ADMIN_PQ_SIGNING_SEED from sealed secret store: {}",
+                e
+            );
+            let military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            if military {
+                tracing::error!(
+                    target: "siem",
+                    category = "security",
+                    severity = "CRITICAL",
+                    "FATAL: {} — panicking in military mode",
+                    msg
+                );
+                panic!("{}", msg);
+            }
+            return Err(msg);
+        }
+    };
+
+    let mut seed = [0u8; 32];
+    if sealed.len() == 32 {
+        seed.copy_from_slice(&sealed[..]);
+    } else if sealed.len() == 64 {
+        match hex::decode(&sealed[..]) {
+            Ok(b) if b.len() == 32 => seed.copy_from_slice(&b),
+            _ => return Err("A1: ADMIN_PQ_SIGNING_SEED is not 32 raw or 64 hex bytes".into()),
+        }
+    } else {
+        return Err(format!(
+            "A1: ADMIN_PQ_SIGNING_SEED unexpected length {}",
+            sealed.len()
+        ));
+    }
+
+    let kp = MlDsa87::from_seed(&seed.into());
+    seed.zeroize();
+    let sk = kp.signing_key().clone();
+    let vk = kp.verifying_key().clone();
+
+    let encoded = vk.encode();
+    let mut h = Sha512::new();
+    h.update(AsRef::<[u8]>::as_ref(&encoded));
+    let vk_hash: [u8; 64] = h.finalize().into();
+
+    Ok((sk, vk, vk_hash))
+}
+
+/// Compute the canonical input bytes counter-signed by the admin PQ key.
+///
+/// Input format: domain_sep || SHA-512(google_jwt_bytes || claims_json)
+fn compute_admin_countersign_input(google_jwt: &str, claims_json: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha512};
+    let mut h = Sha512::new();
+    h.update(google_jwt.as_bytes());
+    h.update(claims_json);
+    let digest: [u8; 64] = h.finalize().into();
+    let mut out = Vec::with_capacity(ADMIN_PQ_COUNTERSIGN_DOMAIN.len() + 64);
+    out.extend_from_slice(ADMIN_PQ_COUNTERSIGN_DOMAIN);
+    out.extend_from_slice(&digest);
+    out
+}
+
+/// Wrap a verified Google id_token + claims in a MilnetAdminToken by
+/// computing an outer ML-DSA-87 signature with the pinned admin signing key.
+///
+/// Callers MUST have already run the full `extract_google_claims` pipeline
+/// (RS256 verify, issuer, audience, exp, nonce). Wrapping an unverified JWT
+/// is a bug: the outer PQ signature binds the Google classical signature
+/// into the authoritative envelope, but does NOT itself re-check it.
+pub fn wrap_admin_token(
+    google_jwt: &str,
+    claims: &GoogleIdTokenClaims,
+    signing_key: &crypto::pq_sign::PqSigningKey,
+    vk_hash: [u8; 64],
+) -> Result<MilnetAdminToken, String> {
+    let claims_json = serde_json::to_vec(claims)
+        .map_err(|e| format!("A1: canonical claims serialization failed: {}", e))?;
+    let to_sign = compute_admin_countersign_input(google_jwt, &claims_json);
+    let sig = crypto::pq_sign::pq_sign_raw(signing_key, &to_sign);
+    Ok(MilnetAdminToken {
+        inner_google_jwt_b64: google_jwt.to_string(),
+        outer_pq_sig: sig,
+        outer_pq_vk_hash: vk_hash,
+    })
+}
+
+/// Verify a MilnetAdminToken's outer PQ signature against the pinned admin
+/// verifying key. On success, returns the original Google id_token string so
+/// the caller can then run the classical Google RS256 path as a
+/// non-authoritative identity input.
+///
+/// Rejects the token if:
+/// - The pinned `outer_pq_vk_hash` does not match the supplied verifying key.
+/// - The ML-DSA-87 signature does not verify against
+///   `SHA-512(google_jwt || claims_json)`.
+pub fn verify_admin_token<'a>(
+    token: &'a MilnetAdminToken,
+    claims: &GoogleIdTokenClaims,
+    verifying_key: &crypto::pq_sign::PqVerifyingKey,
+    expected_vk_hash: &[u8; 64],
+) -> Result<&'a str, String> {
+    if !crypto::ct::ct_eq(&token.outer_pq_vk_hash, expected_vk_hash) {
+        return Err("A1: admin token outer_pq_vk_hash pin mismatch".into());
+    }
+    let claims_json = serde_json::to_vec(claims)
+        .map_err(|e| format!("A1: canonical claims serialization failed: {}", e))?;
+    let to_verify = compute_admin_countersign_input(&token.inner_google_jwt_b64, &claims_json);
+    if !crypto::pq_sign::pq_verify_raw(verifying_key, &to_verify, &token.outer_pq_sig) {
+        return Err("A1: ML-DSA-87 outer counter-signature verification failed".into());
+    }
+    Ok(&token.inner_google_jwt_b64)
 }
 
 // ---------------------------------------------------------------------------

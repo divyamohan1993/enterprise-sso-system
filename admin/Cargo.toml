@@ -40,6 +40,7 @@ url = "2"
 ahash = "0.8"
 regex = "1"
 rsa.workspace = true
+ml-dsa.workspace = true
 aes-gcm.workspace = true
 getrandom.workspace = true
 zeroize.workspace = true
