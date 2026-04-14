@@ -1,6 +1,72 @@
 //! Concurrent session tracking — enforces max_concurrent_sessions_per_user.
 #![forbid(unsafe_code)]
 
+// ---------------------------------------------------------------------------
+// F17: ratchet chain_key encryption with per-session AAD
+// ---------------------------------------------------------------------------
+
+/// F17: build the AAD used when persisting a ratchet chain_key. The
+/// 64-byte AAD is `user_id || session_id` (each 32 bytes via blake3), which
+/// cryptographically binds the ciphertext to a single (user, session) pair
+/// and blocks cross-session replay even if two sessions share a chain_key
+/// at some point in their lifecycle.
+pub fn chain_key_aad(user_id: &uuid::Uuid, session_id: &uuid::Uuid) -> [u8; 64] {
+    let mut aad = [0u8; 64];
+    // user_id is 16 bytes — expand to 32 via blake3 so both halves are
+    // indistinguishable from random. Same for session_id.
+    let u = blake3::hash(user_id.as_bytes());
+    let s = blake3::hash(session_id.as_bytes());
+    aad[..32].copy_from_slice(u.as_bytes());
+    aad[32..].copy_from_slice(s.as_bytes());
+    aad
+}
+
+/// F17: encrypt a ratchet chain_key with AES-256-GCM using the per-session AAD.
+/// Ciphertext layout: `nonce (12 bytes) || aes_gcm_ct_and_tag`.
+pub fn seal_chain_key(
+    master_kek: &[u8; 32],
+    chain_key: &[u8],
+    user_id: &uuid::Uuid,
+    session_id: &uuid::Uuid,
+) -> Result<Vec<u8>, String> {
+    use aes_gcm::{aead::{Aead, KeyInit, Payload}, Aes256Gcm, Nonce};
+    let aad = chain_key_aad(user_id, session_id);
+    let cipher = Aes256Gcm::new_from_slice(master_kek)
+        .map_err(|e| format!("F17 seal chain_key init: {e}"))?;
+    let mut nonce_bytes = [0u8; 12];
+    getrandom::getrandom(&mut nonce_bytes)
+        .map_err(|e| format!("F17 seal chain_key rng: {e}"))?;
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ct = cipher
+        .encrypt(nonce, Payload { msg: chain_key, aad: &aad })
+        .map_err(|_| "F17 seal chain_key encrypt failed".to_string())?;
+    let mut out = Vec::with_capacity(12 + ct.len());
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+/// F17: decrypt a persisted chain_key ciphertext, enforcing the same AAD.
+/// A mismatched (user, session) MUST fail — this blocks cross-session replay.
+pub fn open_chain_key(
+    master_kek: &[u8; 32],
+    ciphertext: &[u8],
+    user_id: &uuid::Uuid,
+    session_id: &uuid::Uuid,
+) -> Result<Vec<u8>, String> {
+    use aes_gcm::{aead::{Aead, KeyInit, Payload}, Aes256Gcm, Nonce};
+    if ciphertext.len() < 12 + 16 {
+        return Err("F17 chain_key ciphertext too short".into());
+    }
+    let aad = chain_key_aad(user_id, session_id);
+    let cipher = Aes256Gcm::new_from_slice(master_kek)
+        .map_err(|e| format!("F17 open chain_key init: {e}"))?;
+    let nonce = Nonce::from_slice(&ciphertext[..12]);
+    cipher
+        .decrypt(nonce, Payload { msg: &ciphertext[12..], aad: &aad })
+        .map_err(|_| "F17 chain_key AAD mismatch — cross-session replay blocked".to_string())
+}
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 use uuid::Uuid;
@@ -602,6 +668,71 @@ impl SessionTracker {
 }
 
 impl DistributedSessionTracker {
+    /// F6: On logout, walk the refresh token family and mark every token in
+    /// the family as revoked. Creates the `refresh_token_family` table if it
+    /// does not exist (migration 010 is the canonical DDL; this is safety net).
+    pub async fn revoke_refresh_family_on_logout(
+        &self,
+        user_id: &Uuid,
+        family_id: &Uuid,
+    ) -> Result<u64, String> {
+        // Defensive DDL — normally provided by migration 010.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS refresh_token_family (\
+                token_id UUID PRIMARY KEY,\
+                family_id UUID NOT NULL,\
+                user_id UUID NOT NULL,\
+                issued_at BIGINT NOT NULL,\
+                expires_at BIGINT NOT NULL,\
+                revoked BOOLEAN NOT NULL DEFAULT FALSE\
+             )",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("ensure refresh_token_family table: {e}"))?;
+
+        let result = sqlx::query(
+            "UPDATE refresh_token_family SET revoked = TRUE \
+             WHERE family_id = $1 AND user_id = $2 AND revoked = FALSE",
+        )
+        .bind(family_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("revoke refresh family: {e}"))?;
+
+        tracing::info!(
+            target: "siem",
+            %user_id,
+            %family_id,
+            rows = result.rows_affected(),
+            "SIEM:INFO F6 refresh token family revoked on logout"
+        );
+        Ok(result.rows_affected())
+    }
+
+    /// F6: Rotate (invalidate) the current session ID for `user_id` and
+    /// replace it with a freshly issued one. Returns the new session UUID.
+    /// The old session is removed both from the L1 cache and the DB.
+    pub async fn rotate_session_id(
+        &self,
+        user_id: &Uuid,
+        old_session_id: &Uuid,
+        now: i64,
+    ) -> Result<Uuid, String> {
+        self.remove_session(user_id, old_session_id).await?;
+        let new_session_id = Uuid::new_v4();
+        self.register_session(*user_id, new_session_id, now).await?;
+        tracing::info!(
+            target: "siem",
+            %user_id,
+            old = %old_session_id,
+            new = %new_session_id,
+            "SIEM:INFO F6 session rotated"
+        );
+        Ok(new_session_id)
+    }
+
     /// Invalidate all sessions for a user across cache and database.
     pub async fn invalidate_sessions_for_user(
         &self,
