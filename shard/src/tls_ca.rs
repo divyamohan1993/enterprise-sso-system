@@ -185,8 +185,20 @@ fn load_persisted_ca(cert_path: &Path) -> Result<CertificateAuthority, TlsCaErro
     let key_pair = KeyPair::from_pem(key_pem_str)
         .map_err(|e| TlsCaError::CaLoadFailed(format!("parse CA KeyPair: {e}")))?;
 
-    let params = CertificateParams::from_ca_cert_pem(&pem)
-        .map_err(|e| TlsCaError::CaLoadFailed(format!("parse CA cert: {e}")))?;
+    // rcgen 0.13 dropped `CertificateParams::from_ca_cert_pem`. Reconstruct
+    // deterministic CA params (matching `bootstrap_ca`) — the rehydrated
+    // Certificate is only ever used as a signing parent for module certs;
+    // module-cert pinning is independent of the CA cert serial. The
+    // persisted PEM at `cert_path` (referenced via `pem`) remains the
+    // canonical wire artefact for clients that want the original CA blob.
+    let _ = pem; // canonical CA PEM read above; retained on disk
+    let mut params = CertificateParams::new(Vec::<String>::new())
+        .map_err(|e| TlsCaError::CaLoadFailed(format!("CA params: {e}")))?;
+    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "MILNET SHARD CA");
     let cert = params
         .self_signed(&key_pair)
         .map_err(|e| TlsCaError::CaLoadFailed(format!("rehydrate self-signed: {e}")))?;
