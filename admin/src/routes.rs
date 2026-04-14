@@ -5483,6 +5483,10 @@ async fn fido_register_complete(
         user_id: req.user_id,
         sign_count: 0,
         authenticator_type: req.authenticator_type,
+        aaguid: [0u8; 16],
+        cloned_flag: false,
+        backup_eligible: false,
+        backup_state: false,
     };
 
     fido_store.store_credential(cred);
