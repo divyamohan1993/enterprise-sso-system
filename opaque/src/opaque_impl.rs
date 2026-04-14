@@ -202,11 +202,11 @@ pub fn seal_server_setup(
     let mut nonce = [0u8; 12];
     getrandom::getrandom(&mut nonce).map_err(|_| SealedSetupError::Random("nonce"))?;
 
-    let mut plaintext = Zeroizing::new(setup.serialize().to_vec());
+    let plaintext = Zeroizing::new(setup.serialize().to_vec());
     let ciphertext = cipher
         .encrypt(Nonce::from_slice(&nonce), plaintext.as_slice())
         .map_err(|_| SealedSetupError::Crypto("AES-GCM seal"))?;
-    plaintext.zeroize();
+    // Zeroizing<Vec<u8>> wipes on Drop at end of scope.
 
     Ok(ServerSetupSealedEnvelope { nonce, ciphertext })
 }
@@ -272,10 +272,9 @@ impl ServerSetupHandle {
 
         let result = f(&setup);
 
-        // Explicit drop documents the ordering: ServerSetup first, then wipe.
+        // Explicit drop documents the ordering: ServerSetup first, then the
+        // Zeroizing<Vec<u8>> plaintext / KEK auto-wipe at end of scope.
         drop(setup);
-        plaintext.zeroize();
-        // KEK zeroizes on Zeroizing<...> drop.
         Ok(result)
     }
 }

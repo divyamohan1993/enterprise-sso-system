@@ -50,7 +50,7 @@ pub fn is_available() -> bool {
 /// Returns None when the database is missing or the IP has no record.
 pub fn derive_network_id(ip: IpAddr) -> Option<String> {
     let r = reader()?;
-    let asn: geoip2::Asn = r.lookup(ip).ok()?;
+    let asn: geoip2::Asn = r.lookup(ip).ok().flatten()?;
     asn.autonomous_system_number.map(|n| format!("AS{n}"))
 }
 
