@@ -7,10 +7,29 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+
+/// Force a TCP RST on drop via SO_LINGER(1, 0). `TcpStream::set_linger`
+/// is unstable on stable Rust (tcp_linger #88494), so we drop to libc.
+fn force_linger_zero(stream: &TcpStream) {
+    let fd = stream.as_raw_fd();
+    let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+    // SAFETY: fd is a valid open socket for the lifetime of `stream`; the
+    // libc::linger struct has the correct size and is passed read-only.
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            &linger as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        );
+    }
+}
 
 fn spawn_echo_server(port_tx: std::sync::mpsc::Sender<u16>) -> Arc<AtomicBool> {
     let stop = Arc::new(AtomicBool::new(false));
@@ -43,7 +62,7 @@ fn chaos_tcp_rst_yields_error_not_panic() {
 
     // Open a connection then immediately abort it via SO_LINGER=0 (TCP RST).
     let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
-    stream.set_linger(Some(Duration::from_secs(0))).expect("set_linger");
+    force_linger_zero(&stream);
     drop(stream);
 
     // Reconnecting must still work after the RST.
