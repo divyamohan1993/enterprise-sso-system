@@ -233,6 +233,7 @@ pub enum ComplianceRegime {
 
 /// Full compliance configuration for a deployment.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ComplianceConfig {
     pub regime: ComplianceRegime,
     pub data_residency_regions: Vec<String>,

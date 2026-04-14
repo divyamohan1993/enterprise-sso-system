@@ -18,6 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // ── Revocation Quorum ───────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RevocationRequest {
     pub serial: u64,
     pub requester_id: NodeId,
@@ -27,6 +28,7 @@ pub struct RevocationRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RevocationVote {
     pub serial: u64,
     pub voter_id: NodeId,
@@ -219,6 +221,7 @@ impl CaPersistence for NullCaPersistence {
 
 /// Certificate Signing Request for the distributed CA.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CertSigningRequest {
     pub module_name: String,
     pub subject_alt_names: Vec<String>,
@@ -229,6 +232,7 @@ pub struct CertSigningRequest {
 
 /// Issued certificate record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IssuedCert {
     pub serial: u64,
     pub module_name: String,
@@ -481,6 +485,7 @@ impl DistributedCa {
 
 /// Event logged to SIEM when a CA key rotation occurs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CaRotationEvent {
     pub timestamp: i64,
     pub old_key_fingerprint: Vec<u8>,
@@ -493,6 +498,7 @@ pub struct CaRotationEvent {
 
 /// Vote cast by a node to approve a CA key rotation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RotationVote {
     pub voter_id: NodeId,
     pub new_key_fingerprint: Vec<u8>,
@@ -533,6 +539,7 @@ impl RotationQuorum {
 
 /// Retired CA key kept during the grace period for verifying existing certs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetiredCaKey {
     pub fingerprint: Vec<u8>,
     pub retired_at: i64,
@@ -706,6 +713,7 @@ pub enum CaInstanceStatus {
 
 /// A single CA instance in the redundant CA pool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CaInstance {
     pub instance_id: String,
     pub node_id: NodeId,

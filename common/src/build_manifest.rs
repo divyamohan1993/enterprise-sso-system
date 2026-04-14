@@ -14,6 +14,7 @@ use std::path::Path;
 /// the build system or CI pipeline, then serialised into the binary using
 /// the [`embed_build_info`] macro.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct BuildManifest {
     /// Git commit hash (full SHA-1) at build time.
     pub git_commit: String,

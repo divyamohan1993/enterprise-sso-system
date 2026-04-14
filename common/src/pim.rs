@@ -57,6 +57,7 @@ pub enum ElevationStatus {
 
 /// A request for just-in-time privilege elevation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ElevationRequest {
     /// Unique identifier for this request.
     pub request_id: Uuid,
@@ -88,6 +89,7 @@ pub struct ElevationRequest {
 
 /// An active, time-bounded privilege elevation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActiveElevation {
     /// Unique elevation identifier.
     pub elevation_id: Uuid,
@@ -131,6 +133,7 @@ impl ActiveElevation {
 
 /// Configurable policy constraints for the PIM subsystem.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ElevationConstraints {
     /// Maximum allowed elevation duration in seconds (default 4 hours).
     pub max_duration_secs: u64,

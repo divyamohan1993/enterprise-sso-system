@@ -127,6 +127,7 @@ impl core::fmt::Display for EvaluationAssuranceLevel {
 /// Each SFR maps to a specific CC Part 2 functional class and is linked
 /// to the code module(s) that implement it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SecurityFunctionalRequirement {
     /// CC SFR identifier (e.g., "FIA_UAU.2", "FCS_COP.1").
     pub sfr_id: String,
@@ -348,6 +349,7 @@ pub fn default_sfr_mapping() -> Vec<SecurityFunctionalRequirement> {
 
 /// CC Security Assurance Requirement (SAR) mapped to development artifacts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SecurityAssuranceRequirement {
     /// CC SAR identifier (e.g., "ADV_ARC.1", "ATE_COV.2").
     pub sar_id: String,
@@ -450,6 +452,7 @@ pub fn default_sar_mapping() -> Vec<SecurityAssuranceRequirement> {
 /// functions. Components outside the TOE boundary are part of the
 /// operational environment and must meet stated assumptions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToeBoundary {
     /// Components included in the TOE.
     pub included_components: Vec<ToeComponent>,
@@ -459,6 +462,7 @@ pub struct ToeBoundary {
 
 /// A component within the TOE boundary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToeComponent {
     /// Component name.
     pub name: String,

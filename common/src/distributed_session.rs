@@ -100,6 +100,7 @@ pub fn blind_device_fingerprint(fp: &[u8; 32]) -> [u8; 32] {
 
 /// Session state for distributed storage.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DistributedSession {
     /// Unique session identifier.
     pub session_id: Uuid,
@@ -161,6 +162,7 @@ impl Drop for DistributedSession {
 
 /// Configuration for the distributed session store.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionStoreConfig {
     /// Maximum session duration per tier (microseconds).
     pub max_duration_by_tier: [i64; 4],
@@ -514,6 +516,7 @@ impl InvalidationReason {
 
 /// A signed session invalidation event for cross-node propagation.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionInvalidationEvent {
     pub user_id: Uuid,
     pub reason: InvalidationReason,

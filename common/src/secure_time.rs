@@ -107,6 +107,7 @@ impl Default for TimeSource {
 
 /// Configuration for authenticated time acquisition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthenticatedTimeConfig {
     /// Primary time source.
     pub primary_source: TimeSource,
@@ -150,6 +151,7 @@ impl Default for AuthenticatedTimeConfig {
 
 /// Response from a Roughtime server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RoughtimeResponse {
     /// Server that provided the response.
     pub server: String,
@@ -170,6 +172,7 @@ pub struct RoughtimeResponse {
 
 /// Response from an NTS-authenticated NTP query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NtsResponse {
     /// Unix timestamp in milliseconds.
     pub timestamp: u64,
@@ -185,6 +188,7 @@ pub struct NtsResponse {
 
 /// A verified timestamp with provenance metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthenticatedTimestamp {
     /// Unix timestamp in milliseconds.
     pub timestamp_ms: u64,
@@ -198,6 +202,7 @@ pub struct AuthenticatedTimestamp {
 
 /// Result of a time consistency check across multiple sources.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TimeConsistencyResult {
     /// Whether all sources agree within the allowed skew.
     pub consistent: bool,
@@ -211,6 +216,7 @@ pub struct TimeConsistencyResult {
 
 /// Proof of time from Roughtime servers (chained for non-repudiation).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RoughtimeProof {
     /// Ordered list of Roughtime responses forming a proof chain.
     pub responses: Vec<RoughtimeResponse>,

@@ -22,6 +22,7 @@ type HmacSha512 = Hmac<Sha512>;
 
 /// Encrypted audit metadata — stored alongside the hash-chain fields.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EncryptedAuditMetadata {
     /// AES-256-GCM nonce.
     pub nonce: [u8; 12],

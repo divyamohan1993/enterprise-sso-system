@@ -1438,7 +1438,8 @@ mod tests {
 
     #[test]
     fn threshold_kdf_concurrent_submissions() {
-        use std::sync::{Arc, Mutex};
+        use parking_lot::Mutex;
+        use std::sync::Arc;
         use std::thread;
 
         let secret = [0x42u8; 32];
@@ -1456,13 +1457,13 @@ mod tests {
         let handles: Vec<_> = partials.into_iter().map(|(idx, partial)| {
             let mgr = Arc::clone(&mgr);
             thread::spawn(move || {
-                mgr.lock().unwrap().submit_partial(idx, partial).unwrap();
+                mgr.lock().submit_partial(idx, partial).unwrap();
             })
         }).collect();
 
         for h in handles { h.join().unwrap(); }
 
-        let mgr = Arc::try_unwrap(mgr).unwrap().into_inner().unwrap();
+        let mgr = Arc::try_unwrap(mgr).unwrap().into_inner();
         assert!(mgr.has_threshold());
         let key = mgr.derive_key().unwrap();
         assert_ne!(key, [0u8; 32]);

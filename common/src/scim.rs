@@ -53,6 +53,7 @@ pub const SCHEMA_BULK_RESPONSE: &str = "urn:ietf:params:scim:api:messages:2.0:Bu
 
 /// SCIM resource metadata (common to all resources).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScimMeta {
     /// Resource type (e.g. "User", "Group").
     #[serde(rename = "resourceType")]
@@ -72,6 +73,7 @@ pub struct ScimMeta {
 
 /// SCIM 2.0 User Name component.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScimName {
     /// Full formatted name.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -86,6 +88,7 @@ pub struct ScimName {
 
 /// SCIM 2.0 Email entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScimEmail {
     /// Email address value.
     pub value: String,
@@ -99,6 +102,7 @@ pub struct ScimEmail {
 
 /// SCIM 2.0 Group membership reference (for User.groups).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScimGroupRef {
     /// Group resource ID.
     pub value: String,
@@ -112,6 +116,7 @@ pub struct ScimGroupRef {
 
 /// SCIM 2.0 User resource.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScimUser {
     /// Schema URNs.
     pub schemas: Vec<String>,
@@ -177,6 +182,7 @@ fn default_true() -> bool {
 
 /// SCIM 2.0 member reference (for Group.members).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScimMemberRef {
     /// User resource ID.
     pub value: String,
@@ -190,6 +196,7 @@ pub struct ScimMemberRef {
 
 /// SCIM 2.0 Group resource.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScimGroup {
     /// Schema URNs.
     pub schemas: Vec<String>,
@@ -212,6 +219,7 @@ pub struct ScimGroup {
 
 /// SCIM 2.0 List Response (RFC 7644 Section 3.4.2).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScimListResponse<T: Serialize> {
     /// Schema URNs.
     pub schemas: Vec<String>,
@@ -233,6 +241,7 @@ pub struct ScimListResponse<T: Serialize> {
 
 /// SCIM 2.0 Error Response (RFC 7644 Section 3.12).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScimError {
     /// Schema URNs.
     pub schemas: Vec<String>,
@@ -311,6 +320,7 @@ pub enum ScimFilterOp {
 
 /// A single SCIM filter expression.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScimFilter {
     /// Attribute path (e.g. "userName", "emails.value").
     pub attribute: String,
@@ -459,6 +469,7 @@ pub enum PatchOpType {
 
 /// A single SCIM Patch operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PatchOperation {
     /// Operation type.
     pub op: PatchOpType,
@@ -472,6 +483,7 @@ pub struct PatchOperation {
 
 /// SCIM Patch request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScimPatchRequest {
     /// Schema URNs (must include PatchOp schema).
     pub schemas: Vec<String>,
@@ -494,6 +506,7 @@ pub enum BulkMethod {
 
 /// A single operation within a SCIM Bulk request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BulkOperation {
     /// HTTP method.
     pub method: BulkMethod,
@@ -509,6 +522,7 @@ pub struct BulkOperation {
 
 /// SCIM Bulk request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScimBulkRequest {
     /// Schema URNs.
     pub schemas: Vec<String>,
@@ -519,6 +533,7 @@ pub struct ScimBulkRequest {
 
 /// Result of a single bulk operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BulkOperationResult {
     /// HTTP method.
     pub method: BulkMethod,
@@ -536,6 +551,7 @@ pub struct BulkOperationResult {
 
 /// SCIM Bulk response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScimBulkResponse {
     /// Schema URNs.
     pub schemas: Vec<String>,
@@ -548,6 +564,7 @@ pub struct ScimBulkResponse {
 
 /// SCIM Service Provider Configuration (RFC 7643 Section 5).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServiceProviderConfig {
     /// Schema URNs.
     pub schemas: Vec<String>,
@@ -571,12 +588,14 @@ pub struct ServiceProviderConfig {
 
 /// Feature support toggle.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FeatureSupport {
     pub supported: bool,
 }
 
 /// Bulk operation support configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BulkSupport {
     pub supported: bool,
     #[serde(rename = "maxOperations")]
@@ -587,6 +606,7 @@ pub struct BulkSupport {
 
 /// Filter support configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FilterSupport {
     pub supported: bool,
     #[serde(rename = "maxResults")]
@@ -595,6 +615,7 @@ pub struct FilterSupport {
 
 /// Authentication scheme descriptor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthenticationScheme {
     /// Scheme name.
     pub name: String,

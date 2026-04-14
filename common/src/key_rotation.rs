@@ -61,6 +61,13 @@ pub fn start_rotation_monitor(
                         Ok(()) => {
                             tracing::info!("Key rotation completed successfully");
                             crate::siem::SecurityEvent::key_rotation("scheduled rotation completed");
+                            // G7: emit a structured audit lifecycle entry for every
+                            // successful scheduled rotation. Without a specific KeyType,
+                            // emit one for each tracked type so downstream queries
+                            // never miss a rotation.
+                            for kt in [KeyType::Session, KeyType::Hmac, KeyType::Signing, KeyType::MasterShare] {
+                                audit_key_rotated(kt, None, 0);
+                            }
                         }
                         Err(e) => {
                             tracing::error!("Key rotation failed: {}", e);
@@ -167,6 +174,7 @@ impl std::fmt::Display for RotationNodeId {
 
 /// A rotation event broadcast when a node completes a key rotation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RotationEvent {
     pub node_id: RotationNodeId,
     pub key_type: KeyType,
@@ -376,6 +384,7 @@ impl RotationAnomaly {
 
 /// A proposal to rotate a key, requiring quorum approval.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RotationProposal {
     pub key_type: KeyType,
     pub reason: String,
@@ -458,6 +467,7 @@ impl RotationProposal {
 
 /// A vote approving a rotation proposal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RotationVote {
     pub voter_id: RotationNodeId,
     pub key_type: KeyType,
@@ -525,6 +535,7 @@ impl RotationVote {
 
 /// Aggregated approval after quorum is reached.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RotationApproved {
     pub key_type: KeyType,
     pub epoch: u64,
@@ -828,6 +839,7 @@ impl RotationWitness {
 
 /// Persisted rotation state with HMAC-SHA512 integrity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RotationState {
     /// Last seen epoch per (node_id string, key_type label).
     pub epochs: HashMap<String, HashMap<String, u64>>,
@@ -899,6 +911,330 @@ impl RotationState {
         self.last_rotation
             .insert(key_type.label().to_string(), ts);
     }
+}
+
+// ── G2: Quorum-gated cutover proposal with atomic sequence flip ─────────────
+//
+// Threat model: a single node must NEVER be able to unilaterally rotate a key.
+// Every cutover requires 3-of-5 distinct rotation-node ML-DSA-87 signatures
+// over the canonical proposal bytes. The proposal also carries an explicit
+// `sequence` number, and the cutover is atomic at sequence N: requests with
+// `seq < N` use the old key, requests with `seq >= N` use the new key. There
+// is NO coexistence window.
+//
+// The cutover state is persisted via atomic-rename so a crash mid-cutover
+// either commits or rolls back, never both.
+
+/// Minimum number of distinct rotation-node signatures required for a cutover.
+pub const ROTATION_CUTOVER_THRESHOLD: usize = 3;
+/// Total number of rotation nodes in the standard 3-of-5 quorum.
+pub const ROTATION_CUTOVER_TOTAL: usize = 5;
+
+/// A proposal to atomically cut over a key at a specific sequence number.
+///
+/// Distinct from [`RotationProposal`] which initiates a rotation vote.
+/// `RotationCutoverProposal` is the artefact that gets persisted and that
+/// every node consults when deciding whether to use the old or the new key
+/// for an operation tagged with sequence number `s`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RotationCutoverProposal {
+    /// Monotonic sequence number at which the new key takes effect.
+    /// Operations with `seq < sequence` MUST use the old key. Operations
+    /// with `seq >= sequence` MUST use the new key.
+    pub sequence: u64,
+    /// SHA-512 hash of the new key material (64 bytes). The full key material
+    /// itself never appears in the proposal; only its hash, which the node
+    /// independently re-derives from its share to verify.
+    pub new_key_hash: [u8; 64],
+    /// Absolute Unix-epoch deadline by which the cutover MUST be applied or
+    /// the proposal expires. Prevents an indefinitely-stalled rotation from
+    /// being replayed weeks later.
+    pub deadline_ts: u64,
+    /// Type of key being rotated.
+    pub key_type: KeyType,
+    /// 3-of-5 distinct rotation-node ML-DSA-87 signatures over `canonical_bytes`.
+    /// Each entry is `(node_id, ml_dsa_87_signature_bytes)`. Duplicate node
+    /// IDs are rejected by [`verify_quorum`].
+    pub signatures: Vec<(RotationNodeId, Vec<u8>)>,
+}
+
+impl RotationCutoverProposal {
+    /// Canonical byte serialisation for signing/verification.
+    /// Format: `b"MILNET-CUTOVER-v1" || key_type || seq || deadline || new_key_hash`.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(128);
+        buf.extend_from_slice(b"MILNET-CUTOVER-v1");
+        buf.extend_from_slice(self.key_type.label().as_bytes());
+        buf.extend_from_slice(&self.sequence.to_le_bytes());
+        buf.extend_from_slice(&self.deadline_ts.to_le_bytes());
+        buf.extend_from_slice(&self.new_key_hash);
+        buf
+    }
+
+    /// Construct an unsigned proposal. Rotation nodes call [`sign`] to add
+    /// their signatures one at a time until threshold is reached.
+    pub fn new(
+        key_type: KeyType,
+        sequence: u64,
+        new_key_material: &[u8],
+        deadline_ts: u64,
+    ) -> Self {
+        let mut h = Sha512::new();
+        h.update(new_key_material);
+        let digest = h.finalize();
+        let mut new_key_hash = [0u8; 64];
+        new_key_hash.copy_from_slice(&digest);
+        Self {
+            sequence,
+            new_key_hash,
+            deadline_ts,
+            key_type,
+            signatures: Vec::new(),
+        }
+    }
+
+    /// Add a signature from `node_id` using its 32-byte ML-DSA-87 seed.
+    /// Rejects duplicate signers. Returns the new signature count.
+    pub fn sign(&mut self, node_id: RotationNodeId, seed: &[u8; 32]) -> Result<usize, String> {
+        if self.signatures.iter().any(|(n, _)| n == &node_id) {
+            return Err(format!("node {} has already signed", node_id));
+        }
+        let (derived_sign_seed, _) = derive_rotation_keys(seed);
+        let kp = MlDsa87::from_seed(&derived_sign_seed.into());
+        let sig: ml_dsa::Signature<MlDsa87> = kp.signing_key().sign(&self.canonical_bytes());
+        self.signatures.push((node_id, sig.encode().to_vec()));
+        Ok(self.signatures.len())
+    }
+
+    /// Verify the proposal has at least [`ROTATION_CUTOVER_THRESHOLD`]
+    /// distinct valid ML-DSA-87 signatures from `members`. Each member's
+    /// ML-DSA-87 verifying key is looked up by `node_id`.
+    pub fn verify_quorum(
+        &self,
+        members: &HashMap<RotationNodeId, Vec<u8>>,
+        now_ts: u64,
+    ) -> Result<(), String> {
+        if now_ts > self.deadline_ts {
+            return Err(format!(
+                "proposal deadline expired: now={now_ts}, deadline={}",
+                self.deadline_ts
+            ));
+        }
+        let canonical = self.canonical_bytes();
+        let mut seen: std::collections::HashSet<&RotationNodeId> = Default::default();
+        let mut valid = 0usize;
+        for (nid, sig_bytes) in &self.signatures {
+            if !seen.insert(nid) {
+                continue; // ignore duplicate signer
+            }
+            let vk_material = match members.get(nid) {
+                Some(k) => k,
+                None => continue,
+            };
+            // Accept either 32-byte seed (test) or full ML-DSA-87 verifying key (prod).
+            let ok = if vk_material.len() == 32 {
+                let (derived_sign_seed, _) = derive_rotation_keys(vk_material);
+                let kp = MlDsa87::from_seed(&derived_sign_seed.into());
+                let vk = kp.verifying_key();
+                ml_dsa::Signature::<MlDsa87>::try_from(sig_bytes.as_slice())
+                    .map(|s| vk.verify(&canonical, &s).is_ok())
+                    .unwrap_or(false)
+            } else {
+                let vk_enc = match EncodedVerifyingKey::<MlDsa87>::try_from(vk_material.as_slice()) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let vk = VerifyingKey::<MlDsa87>::decode(&vk_enc);
+                ml_dsa::Signature::<MlDsa87>::try_from(sig_bytes.as_slice())
+                    .map(|s| vk.verify(&canonical, &s).is_ok())
+                    .unwrap_or(false)
+            };
+            if ok {
+                valid += 1;
+            }
+        }
+        if valid >= ROTATION_CUTOVER_THRESHOLD {
+            Ok(())
+        } else {
+            Err(format!(
+                "insufficient valid cutover signatures: {valid}/{ROTATION_CUTOVER_THRESHOLD}"
+            ))
+        }
+    }
+}
+
+/// Persisted cutover state for a single key type. Atomic-rename safe.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CutoverState {
+    pub key_type: KeyType,
+    /// The sequence number at which the latest committed cutover takes effect.
+    /// Operations with `op_seq < cutover_sequence` use the old key.
+    /// Operations with `op_seq >= cutover_sequence` use the new key.
+    pub cutover_sequence: u64,
+    /// Hash of the new key material that was committed at `cutover_sequence`.
+    pub new_key_hash: [u8; 64],
+    /// Unix-epoch when this cutover was committed.
+    pub committed_at: u64,
+}
+
+impl CutoverState {
+    /// Load the persisted cutover state from `path`, verifying that the
+    /// witnessed proposal's signatures still validate against the known
+    /// member set. Returns `None` if no state exists yet.
+    pub fn load(
+        path: &str,
+        members: &HashMap<RotationNodeId, Vec<u8>>,
+    ) -> Result<Option<Self>, String> {
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("read cutover state: {e}")),
+        };
+        // Expected layout: serialized (proposal_json_len:u32 || proposal_json || state_json)
+        if data.len() < 4 {
+            return Err("cutover state file truncated".into());
+        }
+        let plen = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
+        if data.len() < 4 + plen {
+            return Err("cutover state proposal truncated".into());
+        }
+        let proposal_bytes = &data[4..4 + plen];
+        let state_bytes = &data[4 + plen..];
+        let proposal: RotationCutoverProposal = serde_json::from_slice(proposal_bytes)
+            .map_err(|e| format!("decode cutover proposal: {e}"))?;
+        // Re-validate signatures even at load time: prevents a tampered file
+        // from injecting a forged cutover into a freshly-restarted node. We
+        // pass deadline_ts as "now" so historic proposals still verify.
+        proposal
+            .verify_quorum(members, proposal.deadline_ts)
+            .map_err(|e| format!("persisted cutover failed quorum re-check: {e}"))?;
+        let state: CutoverState = serde_json::from_slice(state_bytes)
+            .map_err(|e| format!("decode cutover state: {e}"))?;
+        if state.cutover_sequence != proposal.sequence
+            || state.new_key_hash != proposal.new_key_hash
+            || state.key_type != proposal.key_type
+        {
+            return Err("persisted cutover state does not match its proposal".into());
+        }
+        Ok(Some(state))
+    }
+
+    /// Atomically commit `proposal` as the new cutover. Writes to a tmp
+    /// file, fsyncs, then renames in-place. Verifies quorum BEFORE persisting.
+    pub fn commit(
+        path: &str,
+        proposal: &RotationCutoverProposal,
+        members: &HashMap<RotationNodeId, Vec<u8>>,
+        now_ts: u64,
+    ) -> Result<Self, String> {
+        proposal.verify_quorum(members, now_ts)?;
+        let state = Self {
+            key_type: proposal.key_type,
+            cutover_sequence: proposal.sequence,
+            new_key_hash: proposal.new_key_hash,
+            committed_at: now_ts,
+        };
+        let proposal_bytes = serde_json::to_vec(proposal)
+            .map_err(|e| format!("encode cutover proposal: {e}"))?;
+        let state_bytes = serde_json::to_vec(&state)
+            .map_err(|e| format!("encode cutover state: {e}"))?;
+        let plen = (proposal_bytes.len() as u32).to_le_bytes();
+        let mut buf = Vec::with_capacity(4 + proposal_bytes.len() + state_bytes.len());
+        buf.extend_from_slice(&plen);
+        buf.extend_from_slice(&proposal_bytes);
+        buf.extend_from_slice(&state_bytes);
+
+        let tmp = format!("{path}.tmp");
+        std::fs::write(&tmp, &buf).map_err(|e| format!("write tmp cutover: {e}"))?;
+        let f = std::fs::File::open(&tmp).map_err(|e| format!("open tmp cutover: {e}"))?;
+        f.sync_all().map_err(|e| format!("fsync tmp cutover: {e}"))?;
+        std::fs::rename(&tmp, path).map_err(|e| format!("rename cutover: {e}"))?;
+
+        emit_key_lifecycle_audit(
+            "cutover_committed",
+            proposal.key_type,
+            None,
+            Some(proposal.sequence),
+        );
+        Ok(state)
+    }
+
+    /// Decide which key generation to use for an operation tagged with
+    /// `op_sequence`. Returns `true` if the new key applies, `false` for old.
+    /// This is the single source of truth for atomic key cutover.
+    #[inline]
+    pub fn use_new_key_for(&self, op_sequence: u64) -> bool {
+        op_sequence >= self.cutover_sequence
+    }
+}
+
+// ── G7: audit hook for key lifecycle events ─────────────────────────────────
+//
+// Every key generate/rotate/derive/destroy MUST emit a structured audit
+// entry through `audit_bridge`. The audit pipeline collects entries and
+// pushes them into the BFT audit chain, providing tamper-evident lifecycle
+// history for every key in the system.
+
+/// Emit a structured audit entry for a key lifecycle event.
+///
+/// `operation` is one of: `"generate"`, `"rotate"`, `"derive"`, `"destroy"`,
+/// `"cutover_committed"`. The audit entry uses `AuditEventType::KeyRotation`
+/// (the only key-lifecycle variant in the audit type enum) and encodes the
+/// detail in correlation_id-adjacent fields.
+pub fn emit_key_lifecycle_audit(
+    operation: &str,
+    key_type: KeyType,
+    proposer: Option<&RotationNodeId>,
+    sequence: Option<u64>,
+) {
+    use crate::audit_bridge::{buffer_audit_entry, create_audit_entry};
+    use crate::types::AuditEventType;
+    let mut entry = create_audit_entry(
+        AuditEventType::KeyRotation,
+        Vec::new(),
+        Vec::new(),
+        None,
+        Some(format!(
+            "key_lifecycle:{}:{}:{}{}",
+            operation,
+            key_type.label(),
+            sequence.map(|s| s.to_string()).unwrap_or_else(|| "-".into()),
+            proposer.map(|p| format!(":{}", p.0)).unwrap_or_default(),
+        )),
+    );
+    // Use trace_id as a structured carrier for the operation label so the
+    // audit chain UI can filter on it.
+    entry.trace_id = Some(format!("key_lifecycle:{operation}:{}", key_type.label()));
+    buffer_audit_entry(entry);
+    tracing::info!(
+        target: "audit",
+        operation,
+        key_type = key_type.label(),
+        sequence = ?sequence,
+        proposer = ?proposer.map(|p| &p.0),
+        "key lifecycle event"
+    );
+}
+
+/// Convenience wrappers that record each lifecycle stage. Call from the
+/// code paths that actually generate/derive/destroy key material.
+pub fn audit_key_generated(key_type: KeyType, proposer: Option<&RotationNodeId>) {
+    emit_key_lifecycle_audit("generate", key_type, proposer, None);
+}
+pub fn audit_key_rotated(
+    key_type: KeyType,
+    proposer: Option<&RotationNodeId>,
+    sequence: u64,
+) {
+    emit_key_lifecycle_audit("rotate", key_type, proposer, Some(sequence));
+}
+pub fn audit_key_derived(key_type: KeyType, proposer: Option<&RotationNodeId>) {
+    emit_key_lifecycle_audit("derive", key_type, proposer, None);
+}
+pub fn audit_key_destroyed(key_type: KeyType, proposer: Option<&RotationNodeId>) {
+    emit_key_lifecycle_audit("destroy", key_type, proposer, None);
 }
 
 /// Rotation scheduler that proposes rotations automatically.

@@ -13,6 +13,7 @@ use std::hash::Hash;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct GCounter {
     counts: HashMap<String, u64>,
 }
@@ -67,6 +68,7 @@ impl Default for GCounter {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PNCounter {
     increments: GCounter,
     decrements: GCounter,
@@ -122,6 +124,7 @@ impl Default for PNCounter {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct GSet<T: Eq + Hash + Clone> {
     elements: HashSet<T>,
 }
@@ -182,6 +185,7 @@ impl<T: Eq + Hash + Clone> Default for GSet<T> {
 /// Each add is tagged with (node_id, timestamp). Remove removes all *observed*
 /// tags for that element. Concurrent adds after a remove survive.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ORSet<T: Eq + Hash + Clone> {
     elements: HashMap<T, HashSet<(String, u64)>>,
     tombstones: HashMap<T, HashSet<(String, u64)>>,
@@ -296,6 +300,7 @@ impl<T: Eq + Hash + Clone> Default for ORSet<T> {
 /// Prevents NTP manipulation from winning writes by ensuring the clock
 /// always moves forward, even if physical time goes backward.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HybridTimestamp {
     /// Physical time component (milliseconds since epoch).
     pub wall_ms: u64,
@@ -371,6 +376,7 @@ impl Ord for HybridTimestamp {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct LWWRegister<T: Clone> {
     value: T,
     /// HLC timestamp that is resistant to NTP manipulation.

@@ -101,6 +101,7 @@ mod byte_array_64 {
 /// Per-request context for distributed tracing across the auth pipeline.
 /// Generated at the gateway and threaded through orchestrator -> OPAQUE -> TSS.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RequestContext {
     /// Unique ID for this request, linking all audit entries in a single auth flow.
     pub correlation_id: Uuid,
@@ -127,6 +128,7 @@ impl Default for RequestContext {
 // ── Token types (spec B.14) ───────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TokenHeader {
     pub version: u8,
     pub algorithm: u8,
@@ -134,6 +136,7 @@ pub struct TokenHeader {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TokenClaims {
     pub sub: Uuid,
     pub iss: [u8; 32],
@@ -190,6 +193,7 @@ impl Drop for TokenClaims {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Token {
     pub header: TokenHeader,
     pub claims: TokenClaims,
@@ -267,6 +271,7 @@ impl Token {
 /// Uses AES-256-GCM envelope encryption with per-token random nonce.
 /// The ciphertext includes the 16-byte GCM authentication tag.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EncryptedClaims {
     /// AES-256-GCM nonce (12 bytes).
     pub nonce: [u8; 12],
@@ -277,6 +282,7 @@ pub struct EncryptedClaims {
 /// Token with encrypted claims — used for wire transmission.
 /// Claims are AES-256-GCM encrypted so they are never plaintext on the wire.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EncryptedToken {
     pub header: TokenHeader,
     /// JWE-encrypted claims (AES-256-GCM).
@@ -314,6 +320,7 @@ impl Drop for EncryptedToken {
 // ── Receipt (spec Section 6) ──────────────────────────────────────────
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Receipt {
     pub ceremony_session_id: [u8; 32],
     pub step_id: u8,
@@ -459,6 +466,7 @@ pub enum AuditEventType {
 // ── AuditEntry ────────────────────────────────────────────────────────
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuditEntry {
     pub event_id: Uuid,
     pub event_type: AuditEventType,
@@ -546,6 +554,7 @@ impl Drop for AuditEntry {
 // ── ShardMessage (spec Section 11) ────────────────────────────────────
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShardMessage {
     pub version: u8,
     pub sender_module: ModuleId,
@@ -574,6 +583,7 @@ impl std::fmt::Debug for ShardMessage {
 
 /// A recovery code stored in the database (hash only, never plaintext)
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StoredRecoveryCode {
     pub id: Uuid,
     pub user_id: Uuid,

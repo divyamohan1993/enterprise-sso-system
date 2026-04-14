@@ -41,6 +41,7 @@ type QcSignature = ml_dsa::Signature<MlDsa87>;
 /// A Quorum Certificate proves that `quorum_size` distinct nodes signed
 /// the same `value_hash` in a given `epoch`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QuorumCertificate {
     /// The epoch (consensus round) this certificate belongs to.
     pub epoch: u64,

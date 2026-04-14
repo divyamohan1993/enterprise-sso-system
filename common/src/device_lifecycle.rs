@@ -71,6 +71,7 @@ impl std::fmt::Display for OsType {
 
 /// Geographic location of a device.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeviceLocation {
     /// Latitude in decimal degrees.
     pub latitude: f64,
@@ -80,6 +81,7 @@ pub struct DeviceLocation {
 
 /// Full device inventory record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeviceInventory {
     /// Unique device identifier.
     pub device_id: Uuid,
@@ -113,6 +115,7 @@ pub struct DeviceInventory {
 
 /// Device health report submitted during a health check.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeviceHealthReport {
     /// Days since the last OS patch was applied.
     pub os_patch_level: u32,
@@ -151,6 +154,7 @@ pub enum RemediationPriority {
 
 /// A recommended remediation action.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RemediationAction {
     /// The type of remediation.
     pub action: RemediationType,

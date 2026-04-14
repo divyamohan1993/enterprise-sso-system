@@ -82,6 +82,7 @@ mod byte_array_64 {
 
 /// A witness attestation: proof that an independent node observed a signing request.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WitnessAttestation {
     /// Node ID of the witness (must differ from the signer).
     pub witness_node_id: String,
@@ -110,6 +111,7 @@ impl std::fmt::Debug for WitnessAttestation {
 
 /// A signature bundled with its witness attestations for audit trail.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WitnessedSignature {
     /// The actual cryptographic signature produced by the signer.
     pub signature: Vec<u8>,

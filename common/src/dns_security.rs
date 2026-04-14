@@ -84,6 +84,7 @@ impl std::fmt::Display for DnsRecordType {
 
 /// DNSSEC trust anchor for chain-of-trust validation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DnsTrustAnchor {
     /// DNS zone (e.g., "." for root).
     pub zone: String,
@@ -97,6 +98,7 @@ pub struct DnsTrustAnchor {
 
 /// DANE TLSA record for certificate pinning via DNS.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DaneTlsaRecord {
     /// Certificate usage field (0-3).
     /// 0 = CA constraint, 1 = Service cert constraint,
@@ -141,6 +143,7 @@ impl DaneTlsaRecord {
 
 /// A DNS answer record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DnsAnswer {
     /// Record name.
     pub name: String,
@@ -154,6 +157,7 @@ pub struct DnsAnswer {
 
 /// Response from a secure DNS query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DnsResponse {
     /// Answer records.
     pub answers: Vec<DnsAnswer>,
@@ -171,6 +175,7 @@ pub struct DnsResponse {
 
 /// Configuration for the secure DNS resolver.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DnsSecurityConfig {
     /// Enable DNSSEC validation on all queries.
     pub enable_dnssec_validation: bool,

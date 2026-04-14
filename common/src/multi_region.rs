@@ -86,6 +86,7 @@ pub enum RegionHealth {
 
 /// Configuration for a single region.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RegionConfig {
     /// Region identifier (e.g., "us-east1", "europe-west1", "asia-south1").
     pub region_id: String,
@@ -125,6 +126,7 @@ pub enum StateCategory {
 
 /// A state replication event to be propagated to all regions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StateReplicationEvent {
     /// Unique event ID.
     pub event_id: String,
@@ -153,6 +155,7 @@ pub struct RouteDecision {
 
 /// Result of a cross-region health check.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CrossRegionHealthReport {
     /// Health of each region.
     pub region_health: HashMap<String, RegionHealth>,
@@ -170,6 +173,7 @@ pub struct CrossRegionHealthReport {
 
 /// Distribution of FROST signing shares across regions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RegionShareDistribution {
     /// Mapping of region_id -> number of FROST shares held.
     pub shares_per_region: HashMap<String, usize>,

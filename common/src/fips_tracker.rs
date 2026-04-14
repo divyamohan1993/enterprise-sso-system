@@ -30,6 +30,7 @@ use crate::siem::SecurityEvent;
 
 /// A CMVP-accredited CST (Cryptographic and Security Testing) laboratory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CstLab {
     /// Lab name.
     pub name: String,
@@ -86,6 +87,7 @@ impl SubmissionPhase {
 
 /// A CMVP submission record for a cryptographic module.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CmvpSubmission {
     /// Submission tracking identifier.
     pub tracking_id: String,
@@ -119,6 +121,7 @@ pub struct CmvpSubmission {
 
 /// A phase transition event in the submission lifecycle.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PhaseTransition {
     /// Previous phase.
     pub from: SubmissionPhase,
@@ -153,6 +156,7 @@ pub enum ExpiryAlertLevel {
 
 /// Certificate expiry alert.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExpiryAlert {
     /// Module name.
     pub module_name: String,
@@ -172,6 +176,7 @@ pub struct ExpiryAlert {
 
 /// An entry in the algorithm transition timeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TransitionEntry {
     /// Algorithm being transitioned from.
     pub from_algorithm: String,

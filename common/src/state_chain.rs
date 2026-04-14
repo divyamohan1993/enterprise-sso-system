@@ -78,6 +78,7 @@ mod byte_array_64 {
 
 /// A single entry in the distributed state chain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StateEntry {
     /// Monotonically increasing index (0 = genesis).
     pub index: u64,

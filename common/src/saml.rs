@@ -572,6 +572,7 @@ impl SignatureAlgorithm {
 
 /// A SAML attribute with name and values.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SamlAttribute {
     /// Attribute name (e.g., "urn:oid:1.3.6.1.4.1.5923.1.1.1.7" for eduPersonEntitlement).
     pub name: String,
@@ -637,6 +638,7 @@ impl SamlAttribute {
 
 /// Configurable attribute mapping from internal user properties to SAML attributes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AttributeMapping {
     /// Map of internal field name to SAML attribute definition.
     pub mappings: HashMap<String, AttributeMappingEntry>,
@@ -644,6 +646,7 @@ pub struct AttributeMapping {
 
 /// A single attribute mapping entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AttributeMappingEntry {
     /// SAML attribute name (URI format).
     pub saml_name: String,
@@ -719,6 +722,7 @@ impl AttributeMapping {
 
 /// Conditions element for a SAML Assertion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SamlConditions {
     /// NotBefore timestamp (ISO 8601).
     pub not_before: String,
@@ -788,6 +792,7 @@ impl SamlConditions {
 
 /// Parsed SAML AuthnRequest from a Service Provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthnRequest {
     /// Unique request ID (to be echoed in InResponseTo).
     pub id: String,
@@ -1103,6 +1108,7 @@ impl AuthnRequest {
 
 /// A SAML NameID value.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SamlNameId {
     /// The NameID value (e.g., user ID, email, opaque identifier).
     pub value: String,
@@ -1182,6 +1188,7 @@ impl SamlNameId {
 
 /// A SAML 2.0 Assertion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SamlAssertion {
     /// Assertion ID.
     pub id: String,
@@ -1291,6 +1298,7 @@ impl SamlStatusCode {
 
 /// SAML 2.0 Response (from IdP to SP).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SamlResponse {
     /// Response ID.
     pub id: String,
@@ -1398,6 +1406,7 @@ impl SamlResponse {
 
 /// SAML Artifact for the Artifact Binding protocol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SamlArtifact {
     /// Artifact type code (always 0x0004 for SAML 2.0).
     pub type_code: u16,
@@ -1607,6 +1616,7 @@ impl LogoutReason {
 
 /// SAML LogoutRequest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LogoutRequest {
     /// Request ID.
     pub id: String,
@@ -1736,6 +1746,7 @@ impl LogoutRequest {
 
 /// SAML LogoutResponse.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LogoutResponse {
     /// Response ID.
     pub id: String,
@@ -1794,6 +1805,7 @@ impl LogoutResponse {
 
 /// Parsed Service Provider metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SpMetadata {
     /// SP entity ID.
     pub entity_id: String,
@@ -1953,6 +1965,7 @@ impl Default for SpTrustStore {
 
 /// SAML IdP configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IdpConfig {
     /// IdP entity ID (e.g., "https://idp.milnet.mil/saml2").
     pub entity_id: String,
@@ -2006,6 +2019,7 @@ impl Default for IdpConfig {
 
 /// Authenticated user information for assertion generation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthenticatedUser {
     /// User ID.
     pub user_id: Uuid,

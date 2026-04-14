@@ -115,6 +115,7 @@ pub enum ImplementationStatus {
 
 /// A control implementation description for the SSP.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ControlImplementation {
     /// Control identifier (e.g., "AC-2", "IA-5(1)").
     pub control_id: String,
@@ -159,6 +160,7 @@ pub enum EvidenceType {
 
 /// A piece of FedRAMP evidence tied to a control.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Evidence {
     /// Unique evidence identifier.
     pub evidence_id: String,
@@ -187,6 +189,7 @@ pub enum PoamRisk {
 
 /// A POA&M (Plan of Action & Milestones) entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PoamEntry {
     /// Unique POA&M identifier.
     pub poam_id: String,
@@ -210,6 +213,7 @@ pub struct PoamEntry {
 
 /// POA&M milestone.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PoamMilestone {
     /// Milestone description.
     pub description: String,
@@ -235,6 +239,7 @@ pub enum PoamStatus {
 
 /// Continuous monitoring data point.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MonitoringDataPoint {
     /// Metric name.
     pub metric: String,
@@ -1175,6 +1180,7 @@ impl SspGenerator {
 
 /// Compliance statistics summary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ComplianceStats {
     pub total_controls: usize,
     pub implemented: usize,

@@ -130,6 +130,7 @@ pub enum ClusterCommand {
 /// node. Followers verify this signature before accepting the entry, preventing
 /// a compromised leader from forging commands attributed to other nodes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LogEntry {
     pub term: Term,
     pub index: LogIndex,
@@ -259,6 +260,7 @@ pub enum RaftMessage {
 /// An authenticated Raft message wrapper that binds each message to its sender
 /// via HMAC-SHA512. Prevents Byzantine message forgery between Raft nodes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthenticatedRaftMessage {
     /// The actual Raft protocol message.
     pub message: RaftMessage,
@@ -335,6 +337,7 @@ impl RaftMessage {
 
 /// Configuration for a Raft node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RaftConfig {
     /// Heartbeat interval in milliseconds (default: 500).
     pub heartbeat_ms: u64,
@@ -663,6 +666,7 @@ pub const MAX_SNAPSHOT_SIZE: usize = 64 * 1024 * 1024;
 
 /// A point-in-time snapshot of the state machine, used for log compaction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RaftSnapshot {
     /// Last log entry index included in this snapshot.
     pub last_included_index: u64,

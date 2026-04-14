@@ -22,6 +22,7 @@ use crate::siem::{SecurityEvent, Severity};
 
 /// Metadata about a cluster node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeMetadata {
     /// Deployment region (e.g. "us-east-1").
     pub region: String,
@@ -79,6 +80,7 @@ pub struct MemberState {
 /// A compromised node can only send messages attributed to itself, not forge
 /// messages from other nodes (incarnation spoofing, status manipulation).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GossipMessage {
     pub sender: String,
     pub msg_type: GossipMessageType,
@@ -165,6 +167,7 @@ pub enum GossipMessageType {
 
 /// A membership state change piggybacked on gossip messages.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MembershipUpdate {
     pub node_id: String,
     pub status: MemberStatus,

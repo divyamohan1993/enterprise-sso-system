@@ -50,6 +50,35 @@ impl BlindIndex {
         Self { blind_key: key }
     }
 
+    /// G12: derive a per-tenant blind-index key from the master KEK.
+    ///
+    /// Threat: a single global blind-index key allows a tenant who learns
+    /// the key to enumerate ANY other tenant's encrypted columns by computing
+    /// `HMAC(global_key, candidate_value)` and probing for matches.
+    ///
+    /// Mitigation: each tenant gets its own derived key via
+    /// `HKDF(master_kek, info = "milnet-blind-index-v1" || tenant_id)`.
+    /// Cross-tenant search is impossible because the keys are independent
+    /// HKDF outputs of the same master.
+    ///
+    /// `tenant_id` is the per-tenant identifier; for stability across
+    /// renames it should be the tenant UUID, not the tenant name.
+    pub fn derive_per_tenant(master: &[u8; 32], tenant_id: &[u8]) -> Self {
+        use hkdf::Hkdf;
+        let hk = Hkdf::<Sha512>::new(Some(BLIND_INDEX_DOMAIN), master);
+        let mut info = Vec::with_capacity(32 + tenant_id.len());
+        info.extend_from_slice(b"milnet-blind-index-v1");
+        info.extend_from_slice(tenant_id);
+        let mut key = [0u8; 64];
+        if let Err(e) = hk.expand(&info, &mut key) {
+            tracing::error!(
+                "FATAL: HKDF-SHA512 expand failed for per-tenant SSE blind index key: {e}"
+            );
+            std::process::exit(1);
+        }
+        Self { blind_key: key }
+    }
+
     /// Compute a 32-byte blind index for `plaintext` (HMAC-SHA512 truncated).
     pub fn compute(&self, plaintext: &[u8]) -> [u8; 32] {
         let full = self.compute_full(plaintext);

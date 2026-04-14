@@ -67,6 +67,7 @@ pub enum BmcProtocol {
 
 /// Configuration for BMC security auditing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BmcConfig {
     /// BMC management IP address (None = auto-detect).
     pub bmc_address: Option<String>,
@@ -98,6 +99,7 @@ impl Default for BmcConfig {
 
 /// Firmware image metadata and signing information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FirmwareManifest {
     /// Firmware version string.
     pub version: String,
@@ -132,6 +134,7 @@ pub enum FindingSeverity {
 
 /// A single security finding from a BMC audit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Finding {
     /// Short identifier for the finding (e.g., "BMC-001").
     pub id: String,
@@ -147,6 +150,7 @@ pub struct Finding {
 
 /// Aggregate result of a BMC security audit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BmcAuditResult {
     /// Number of checks that passed.
     pub checks_passed: u32,
@@ -162,6 +166,7 @@ pub struct BmcAuditResult {
 
 /// Information about a BMC user account.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BmcUser {
     /// User ID (IPMI channel user ID).
     pub user_id: u8,

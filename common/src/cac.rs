@@ -25,6 +25,7 @@ use sha2::{Digest, Sha512};
 
 /// Information about an inserted CAC/PIV smart card.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CacCardInfo {
     /// Smart card serial number (from card middleware).
     pub card_serial: String,

@@ -94,6 +94,7 @@ pub enum StartupError {
 
 /// Attestation from a single peer, signed with ML-DSA-87.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PeerAttestation {
     /// Unique identifier of the attesting node.
     pub node_id: String,

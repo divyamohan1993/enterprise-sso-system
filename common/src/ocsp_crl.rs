@@ -33,6 +33,7 @@ pub enum RevocationStatus {
 
 /// Configuration for OCSP checking.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OcspConfig {
     /// OCSP responder URLs (tried in order).
     pub responder_urls: Vec<String>,
@@ -59,6 +60,7 @@ impl Default for OcspConfig {
 
 /// Configuration for CRL checking.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CrlConfig {
     /// CRL distribution point URLs.
     pub distribution_points: Vec<String>,

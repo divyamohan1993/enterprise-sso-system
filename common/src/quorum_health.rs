@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// Configurable BFT parameters. Both quorum_health and audit BFT modules
 /// must reference the same configuration to prevent quorum mismatches.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BftConfig {
     /// Total number of BFT audit nodes in the cluster.
     pub total_nodes: u32,

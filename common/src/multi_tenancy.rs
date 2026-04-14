@@ -145,6 +145,7 @@ impl TenantComplianceRegime {
 /// Each tenant is a fully isolated unit with its own encryption keys,
 /// compliance regime, data residency constraints, and resource quotas.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Tenant {
     /// Unique identifier for this tenant.
     pub tenant_id: TenantId,
@@ -742,6 +743,7 @@ impl Default for TenantManager {
 
 /// Rate limiting parameters for a tenant.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TenantRateLimitConfig {
     /// Maximum sustained requests per second.
     pub rps: u32,
@@ -765,6 +767,7 @@ impl Default for TenantRateLimitConfig {
 /// These override system-wide defaults and allow tenants with different
 /// compliance requirements to have appropriately strict controls.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TenantPolicy {
     /// Session timeout in seconds. Default: 3600 (1 hour).
     pub session_timeout_secs: i64,

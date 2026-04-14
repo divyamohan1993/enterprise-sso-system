@@ -134,6 +134,7 @@ pub fn validate_multi_person_ceremony(
 
 /// Action token for single-use critical operations per spec Section 7
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActionToken {
     pub action_name: String,
     pub authorized_by: Vec<uuid::Uuid>,

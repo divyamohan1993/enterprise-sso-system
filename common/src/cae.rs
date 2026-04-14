@@ -30,6 +30,7 @@ use crate::types::DeviceTier;
 
 /// Configuration for the Continuous Access Evaluator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CaeConfig {
     /// Heartbeat interval per tier in seconds: [Tier1, Tier2, Tier3, Tier4].
     pub heartbeat_interval_by_tier: [u64; 4],
@@ -128,6 +129,7 @@ impl std::fmt::Display for CaeAction {
 
 /// Result of a continuous access evaluation cycle.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CaeDecision {
     /// Session that was evaluated.
     pub session_id: Uuid,
@@ -149,6 +151,7 @@ pub struct CaeDecision {
 ///
 /// Updated by heartbeats and external signal feeds (risk engine, GeoIP, etc.).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionSignals {
     /// Current risk score (0.0 - 1.0).
     pub risk_score: f64,

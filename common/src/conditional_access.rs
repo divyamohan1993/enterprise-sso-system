@@ -51,6 +51,7 @@ pub enum DayOfWeek {
 
 /// A CIDR network specification for IP range matching.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CidrRange {
     /// Network address (e.g. 10.0.0.0, fd00::1).
     pub network: IpAddr,
@@ -117,6 +118,7 @@ impl CidrRange {
 
 /// UTC time window restriction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TimeWindow {
     /// Start hour (inclusive), 0-23 UTC.
     pub start_hour: u8,
@@ -147,6 +149,7 @@ impl TimeWindow {
 
 /// Risk score thresholds for conditional access decisions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RiskThresholds {
     /// Allow if score is strictly below this value.
     pub allow_below: f64,
@@ -216,6 +219,7 @@ pub enum Condition {
 /// All fields are optional to support partial evaluation (a condition that
 /// references a missing field evaluates to `false`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AccessContext {
     /// Source IP address of the request.
     pub source_ip: Option<IpAddr>,
@@ -350,6 +354,7 @@ pub fn evaluate_condition(condition: &Condition, ctx: &AccessContext) -> bool {
 
 /// A named policy rule consisting of a condition and an action.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyRule {
     /// Human-readable name for audit logging.
     pub name: String,
@@ -365,6 +370,7 @@ pub struct PolicyRule {
 
 /// Structured result of a policy evaluation, suitable for audit logging.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyDecision {
     /// The action determined by evaluation.
     pub action: PolicyAction,

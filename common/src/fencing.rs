@@ -27,6 +27,7 @@ type FencingSignature = ml_dsa::Signature<MlDsa87>;
 /// The signature covers `SHA-512(epoch || leader_node_id)`, binding the
 /// token to exactly one leader in exactly one epoch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FencingToken {
     /// The epoch (term) this token was issued in.
     pub epoch: u64,

@@ -34,6 +34,7 @@ const COMPACTION_THRESHOLD: usize = 10_000;
 
 /// A revocation command sent over the SHARD protocol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RevocationCommand {
     /// The token_id of the token to revoke.
     pub token_id: [u8; 16],

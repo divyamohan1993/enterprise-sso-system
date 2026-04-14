@@ -19,6 +19,7 @@ const SHA256_V1_TAG: u8 = 0x01;
 const SHA512_V1B_TAG: u8 = 0x03;
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DuressConfig {
     pub user_id: Uuid,
     /// PIN hash bytes. Format: version_tag(1) || hash_data(variable).
@@ -252,6 +253,7 @@ impl DuressConfig {
 
 /// Duress alert — generated when duress PIN is detected
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DuressAlert {
     pub user_id: Uuid,
     pub timestamp: i64,

@@ -55,6 +55,7 @@ pub enum SessionEventType {
 
 /// A single event inside a recorded session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionEvent {
     /// Unix timestamp (seconds) when the event occurred.
     pub timestamp: i64,
@@ -74,6 +75,7 @@ pub struct SessionEvent {
 
 /// A complete session recording.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionRecording {
     pub session_id: Uuid,
     pub user_id: Uuid,
@@ -90,6 +92,7 @@ pub struct SessionRecording {
 
 /// Policy governing which sessions must be recorded and what requires approval.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PamPolicy {
     /// Device tiers that require session recording (e.g. tiers 1..=3).
     pub require_recording_for_tiers: Vec<u8>,

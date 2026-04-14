@@ -101,6 +101,7 @@ impl std::fmt::Display for EventCategory {
 
 /// CloudEvents-formatted event envelope (CNCF spec 1.0).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CloudEvent {
     /// Event ID (UUID).
     pub id: String,
@@ -179,6 +180,7 @@ impl std::fmt::Display for DeliveryStatus {
 
 /// Record of a single delivery attempt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeliveryRecord {
     /// Delivery attempt ID.
     pub id: String,
@@ -204,6 +206,7 @@ pub struct DeliveryRecord {
 
 /// A registered webhook endpoint.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WebhookConfig {
     /// Unique webhook ID.
     pub id: String,
@@ -357,6 +360,7 @@ impl WebhookConfig {
 
 /// Webhook update request (fields that can be modified).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WebhookUpdate {
     /// Updated name (if any).
     pub name: Option<String>,
@@ -424,6 +428,7 @@ impl WebhookRateLimiter {
 
 /// A dead letter entry for permanently failed deliveries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeadLetterEntry {
     /// Original CloudEvent.
     pub event: CloudEvent,
@@ -1031,6 +1036,7 @@ impl EventStreamManager {
 
 /// Streaming subsystem statistics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StreamingStats {
     /// Total events processed.
     pub events_processed: u64,

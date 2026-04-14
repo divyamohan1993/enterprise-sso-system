@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 /// A single STIG/CIS compliance check result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StigCheck {
     pub id: String,
     pub title: String,
@@ -66,6 +67,7 @@ pub enum StigStatus {
 
 /// Aggregate statistics over all checks that have been run.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StigSummary {
     pub total: usize,
     pub passed: usize,

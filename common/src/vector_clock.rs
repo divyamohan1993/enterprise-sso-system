@@ -16,6 +16,7 @@ use std::collections::HashMap;
 /// of A is <= the corresponding component of B, with at least one strictly less.
 /// If neither dominates the other, the events are concurrent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct VectorClock {
     clocks: HashMap<String, u64>,
     node_id: String,
@@ -152,6 +153,7 @@ impl VectorClock {
 /// Does not include the node_id of the sender — the receiver merges
 /// the raw counters and increments its own.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct VectorClockSnapshot {
     pub clocks: HashMap<String, u64>,
 }

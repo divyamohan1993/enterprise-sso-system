@@ -191,6 +191,7 @@ pub fn default_permissions(role: AdminRole) -> Vec<Permission> {
 
 /// Represents an admin user with role and scope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdminIdentity {
     /// Admin user ID.
     pub user_id: Uuid,
@@ -382,6 +383,7 @@ impl std::fmt::Display for InvitationStatus {
 
 /// An invitation for a new admin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdminInvitation {
     /// Invitation ID.
     pub id: String,
@@ -453,6 +455,7 @@ impl AdminRateLimiter {
 
 /// Summary of an admin's recent activity for the dashboard.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdminActivitySummary {
     /// Admin user ID.
     pub admin_id: Uuid,
@@ -474,6 +477,7 @@ pub struct AdminActivitySummary {
 
 /// Aggregated dashboard data for all admins.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdminDashboardData {
     /// Total admins.
     pub total_admins: u64,
@@ -510,6 +514,7 @@ pub struct DelegatedAdminStore {
 
 /// An admin audit log entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdminAuditEntry {
     /// Entry ID.
     pub id: String,

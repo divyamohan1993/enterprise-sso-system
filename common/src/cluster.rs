@@ -289,6 +289,7 @@ impl TamperQuorum {
 
 /// Configuration for a single peer in the cluster.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PeerConfig {
     pub node_id: NodeId,
     pub raft_addr: String,

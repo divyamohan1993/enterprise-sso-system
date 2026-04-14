@@ -55,6 +55,7 @@ impl std::fmt::Display for UserLifecycleStatus {
 /// Entitlements are time-bounded and require justification. They can be
 /// automatically expired by the [`IdmManager::expire_entitlements`] sweep.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AccessEntitlement {
     /// Unique identifier for this entitlement grant.
     pub entitlement_id: Uuid,
@@ -81,6 +82,7 @@ pub struct AccessEntitlement {
 /// This struct represents the desired or actual state of a user's identity
 /// attributes, group memberships, and access entitlements.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UserAttributes {
     /// Unique user identifier.
     pub user_id: Uuid,
@@ -148,6 +150,7 @@ pub enum RequestStatus {
 
 /// A single approval or denial decision within an approval chain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApprovalDecision {
     /// UUID of the approver.
     pub approver_id: Uuid,
@@ -173,6 +176,7 @@ pub enum ApprovalOutcome {
 /// Requests are submitted, approved/denied through the approval chain,
 /// and then executed to modify the identity store.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProvisioningRequest {
     /// Unique request identifier.
     pub request_id: Uuid,
@@ -200,6 +204,7 @@ pub struct ProvisioningRequest {
 
 /// Tracks what was revoked during a deprovisioning action.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeprovisioningRecord {
     /// Number of active sessions terminated.
     pub sessions_terminated: u32,

@@ -123,6 +123,7 @@ pub enum Soc2EvidenceType {
 
 /// Evidence of an access review.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AccessReviewEvidence {
     /// User whose access was reviewed.
     pub user_id: String,
@@ -142,6 +143,7 @@ pub struct AccessReviewEvidence {
 
 /// Evidence of a change management event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChangeManagementEvidence {
     /// Change identifier (e.g., PR number, ticket ID).
     pub change_id: String,
@@ -163,6 +165,7 @@ pub struct ChangeManagementEvidence {
 
 /// Evidence of incident response activity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IncidentResponseEvidence {
     /// Incident identifier.
     pub incident_id: String,
@@ -186,6 +189,7 @@ pub struct IncidentResponseEvidence {
 
 /// An access log entry for audit evidence.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AccessLogEvidence {
     /// User who accessed the resource.
     pub user_id: String,
@@ -207,6 +211,7 @@ pub struct AccessLogEvidence {
 
 /// A SOC 2 evidence record tied to one or more Trust Service Criteria.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Soc2Evidence {
     /// Unique evidence identifier.
     pub evidence_id: String,
@@ -224,6 +229,7 @@ pub struct Soc2Evidence {
 
 /// Defines the audit period for evidence.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuditPeriod {
     /// Start of the audit period (ISO 8601).
     pub start: String,
@@ -557,6 +563,7 @@ impl Soc2Collector {
 
 /// An audit evidence package ready for auditor review.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuditPackage {
     /// Organization name.
     pub organization: String,
@@ -574,6 +581,7 @@ pub struct AuditPackage {
 
 /// Summary for a single criteria category.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CriteriaSummary {
     /// The criteria category.
     pub category: TrustServiceCategory,

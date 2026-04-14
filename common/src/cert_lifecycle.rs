@@ -52,6 +52,7 @@ pub enum OcspResponseStatus {
 
 /// Cached OCSP staple for a certificate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OcspStaple {
     /// Raw OCSP response bytes.
     pub response_bytes: Vec<u8>,
@@ -72,6 +73,7 @@ impl OcspStaple {
 
 /// A parsed / cached Certificate Revocation List.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CrlEntry {
     /// Raw CRL bytes (DER).
     pub crl_bytes: Vec<u8>,
@@ -97,6 +99,7 @@ impl CrlEntry {
 
 /// A registered certificate with its metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CertificateEntry {
     pub cert_id: Uuid,
     /// Subject distinguished name.
@@ -125,6 +128,7 @@ pub struct CertificateEntry {
 
 /// Policy controlling automatic rotation and refresh intervals.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RotationPolicy {
     /// Days before expiry at which automatic rotation is triggered.
     pub rotate_before_expiry_days: u32,

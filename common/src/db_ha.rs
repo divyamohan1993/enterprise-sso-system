@@ -38,6 +38,7 @@ pub enum NodeHealth {
 
 /// Configuration for a single database node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     /// Unique identifier for this node.
     pub node_id: String,
@@ -60,6 +61,7 @@ pub enum NodeRole {
 
 /// HA cluster configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HaConfig {
     /// Primary node configuration.
     pub primary: NodeConfig,
@@ -428,6 +430,7 @@ impl HaPool {
 
 /// Cluster health summary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClusterHealth {
     pub primary_healthy: bool,
     pub healthy_replicas: usize,
@@ -441,6 +444,7 @@ pub struct ClusterHealth {
 
 /// Configuration for automatic database failover.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AutoFailoverConfig {
     /// How long the primary must be unreachable before failover is attempted (seconds).
     pub failover_threshold_secs: u64,
@@ -465,6 +469,7 @@ impl Default for AutoFailoverConfig {
 
 /// Configuration for automatic database promotion with witness verification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AutoPromoteConfig {
     pub enabled: bool,
     pub safety_delay_secs: u64,
@@ -499,6 +504,7 @@ impl Default for AutoPromoteConfig {
 
 /// A witness attestation for a database promotion event, signed with HMAC-SHA512.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PromotionWitness {
     pub witness_node_id: String,
     pub promoted_node_id: String,
@@ -542,6 +548,7 @@ impl PromotionWitness {
 
 /// Result of a witnessed automatic promotion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WitnessedPromotionResult {
     pub approved: bool,
     pub witness: Option<PromotionWitness>,
@@ -560,6 +567,7 @@ pub fn verify_primary_unreachable(primary_reports: &[(String, bool)], required_c
 
 /// Result of a failover attempt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FailoverResult {
     /// Whether failover succeeded.
     pub success: bool,
@@ -1081,6 +1089,7 @@ impl HaPool {
 
 /// Backup manifest for verified backups.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackupManifest {
     /// Unique backup identifier.
     pub backup_id: String,

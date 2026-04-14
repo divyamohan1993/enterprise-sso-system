@@ -50,6 +50,7 @@ const RECOVERY_CODE_LENGTH: usize = 16;
 /// All self-service actions MUST go through this context to ensure
 /// the user has a valid session AND has completed MFA verification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerifiedSession {
     /// User ID.
     pub user_id: Uuid,
@@ -124,6 +125,7 @@ impl std::fmt::Display for PasswordResetStatus {
 
 /// A password reset request.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PasswordResetRequest {
     /// Request ID.
     pub id: String,
@@ -202,6 +204,7 @@ pub enum MfaEnrollmentStatus {
 
 /// TOTP enrollment data.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TotpEnrollment {
     /// TOTP secret (base32 encoded).
     /// SECURITY: Zeroized on Drop to prevent memory forensics extraction.
@@ -237,6 +240,7 @@ impl Drop for TotpEnrollment {
 
 /// FIDO2 enrollment data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Fido2Enrollment {
     /// Credential ID (base64).
     pub credential_id: String,
@@ -255,6 +259,7 @@ pub struct Fido2Enrollment {
 
 /// An MFA enrollment record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MfaEnrollmentRecord {
     /// Enrollment ID.
     pub id: String,
@@ -297,6 +302,7 @@ impl std::fmt::Display for DeviceStatus {
 
 /// A registered device.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RegisteredDevice {
     /// Device ID.
     pub id: String,
@@ -351,6 +357,7 @@ impl std::fmt::Display for AccessRequestStatus {
 
 /// An access request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AccessRequest {
     /// Request ID.
     pub id: String,
@@ -380,6 +387,7 @@ pub struct AccessRequest {
 
 /// Profile update request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProfileUpdate {
     /// New display name (if changing).
     pub display_name: Option<String>,
@@ -389,6 +397,7 @@ pub struct ProfileUpdate {
 
 /// Email verification for profile updates.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EmailVerification {
     /// Verification ID.
     pub id: String,
@@ -430,6 +439,7 @@ impl Drop for EmailVerification {
 
 /// Recovery code set for a user.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecoveryCodeSet {
     /// User ID.
     pub user_id: Uuid,
@@ -441,6 +451,7 @@ pub struct RecoveryCodeSet {
 
 /// A single recovery code.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecoveryCode {
     /// The code (plaintext during generation, hash for storage).
     pub code: String,
@@ -479,6 +490,7 @@ impl Drop for RegisteredDevice {
 
 /// Representation of an active user session for the self-service portal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActiveSession {
     /// Session ID.
     pub session_id: String,
@@ -536,6 +548,7 @@ pub struct SelfServiceStore {
 
 /// Simplified user profile.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UserProfile {
     /// User ID.
     pub user_id: Uuid,

@@ -26,6 +26,7 @@ use crate::stig::{StigAuditor, StigCheck, StigCategory, StigSeverity, StigStatus
 
 /// Configuration for a STIG scan run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScanConfig {
     /// Human-readable scan name (e.g., "Pre-Deploy STIG Scan").
     pub scan_name: String,
@@ -63,6 +64,7 @@ impl Default for ScanConfig {
 
 /// Result of a complete STIG scan run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScanResult {
     /// Scan configuration used.
     pub config: ScanConfig,
@@ -113,6 +115,7 @@ impl ScanResult {
 
 /// A deviation (accepted finding) with justification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Deviation {
     /// STIG check ID this deviation applies to.
     pub check_id: String,
@@ -144,6 +147,7 @@ pub enum DeviationRisk {
 
 /// Record of an auto-remediation that was applied.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RemediationRecord {
     /// STIG check ID that was remediated.
     pub check_id: String,

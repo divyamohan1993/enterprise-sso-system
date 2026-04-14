@@ -107,6 +107,7 @@ pub enum DiscoveryBackend {
 
 /// Configuration for a single service endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EndpointConfig {
     /// Address in `host:port` format.
     pub address: String,
@@ -118,6 +119,7 @@ pub struct EndpointConfig {
 
 /// Configuration for a registered service.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServiceConfig {
     /// Unique service name (e.g., `"orchestrator"`, `"tss-signer"`).
     pub name: String,

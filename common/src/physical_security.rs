@@ -99,6 +99,7 @@ impl std::fmt::Display for TempestClass {
 
 /// A Sensitive Compartmented Information Facility (SCIF) zone.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScifZone {
     /// Unique zone identifier.
     pub zone_id: String,
@@ -123,6 +124,7 @@ pub struct ScifZone {
 
 /// A physical access log entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PhysicalAccessLog {
     /// Unique entry identifier.
     pub entry_id: String,
@@ -146,6 +148,7 @@ pub struct PhysicalAccessLog {
 
 /// TEMPEST/EMSEC compliance status for a zone.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TempestCompliance {
     /// Zone this compliance record applies to.
     pub zone_id: String,

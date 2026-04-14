@@ -38,6 +38,7 @@ mod byte_array_64 {
 
 /// Request from audit service to witness cosigner.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WitnessSignRequest {
     #[serde(with = "byte_array_64")]
     pub audit_root: [u8; 64],
@@ -51,6 +52,7 @@ pub struct WitnessSignRequest {
 
 /// Response from witness cosigner.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WitnessSignResponse {
     pub signature: Vec<u8>,
     pub cosigner_id: String,

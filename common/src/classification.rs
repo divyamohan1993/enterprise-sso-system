@@ -82,6 +82,7 @@ impl Default for ClassificationLevel {
 /// compartments provide horizontal access control within the same level. A user must hold
 /// ALL required compartments to access a compartmented resource.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClassifiedResource {
     /// The vertical classification level.
     pub level: ClassificationLevel,

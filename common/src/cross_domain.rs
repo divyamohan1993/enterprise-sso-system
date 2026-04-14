@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 /// A security domain with a name and classification level.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SecurityDomain {
     /// Unique identifier for the domain.
     pub id: Uuid,
@@ -34,6 +35,7 @@ pub enum FlowDirection {
 
 /// A policy rule authorizing data flow between two domains.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FlowRule {
     /// Source domain ID.
     pub source_domain: Uuid,
