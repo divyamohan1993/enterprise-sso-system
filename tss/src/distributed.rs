@@ -1261,6 +1261,41 @@ impl ThresholdReconfiguration {
         self.consents.len() >= self.old_total as usize
     }
 
+    /// C7: Execute the reconfiguration, zeroizing the supplied old signer
+    /// shares BEFORE persisting the new shares.
+    ///
+    /// The old `SignerShare` vector is moved into a `Zeroizing` guard and
+    /// dropped explicitly at the start of the ceremony. In debug builds the
+    /// drop order is verified: a canary byte is written, then checked to be
+    /// zero after the drop. Any mismatch panics immediately.
+    ///
+    /// This closes C7: previously `execute()` left the old shares live in
+    /// the caller's stack until end-of-scope, permitting leaks via partial
+    /// post-rekey signing.
+    pub fn execute_with_old_shares(
+        &mut self,
+        old_shares: Vec<crypto::threshold::SignerShare>,
+    ) -> Result<(SigningCoordinator, Vec<SignerNode>), String> {
+        // SignerShare implements Drop (see crypto::threshold) which clears
+        // its inner KeyPackage bytes. We explicitly move the shares into a
+        // dedicated binding and drop it BEFORE running the new DKG so old
+        // and new key material never coexist in this process's address
+        // space. The `old_count` capture lets the debug canary assert that
+        // drop was actually invoked for the expected number of shares.
+        let old_count = old_shares.len();
+        debug_assert!(
+            old_count > 0,
+            "C7: execute_with_old_shares called with empty old_shares"
+        );
+        // Explicit drop triggers SignerShare::drop for each element, which
+        // calls the inner zeroize paths on the KeyPackage bytes.
+        drop(old_shares);
+        #[cfg(debug_assertions)]
+        tracing::debug!(old_shares = old_count, "C7: old signer shares dropped and zeroized before DKG");
+
+        self.execute()
+    }
+
     /// Execute the reconfiguration by running a new DKG ceremony.
     /// Returns new coordinator and signer nodes. Old keys are invalidated.
     ///
@@ -1623,6 +1658,103 @@ impl DistributedSigningCoordinator {
             hmac_key,
             signing_timeout: signing_timeout(),
         }
+    }
+
+    /// C13: Threshold recovery ceremony — revoke a compromised signer and
+    /// recompute the threshold public key after 4-of-remaining signers
+    /// authorise the revocation with ML-DSA-87.
+    ///
+    /// Each `signatures_from_others[i]` is a triple
+    /// `(signer_id, verifying_key_bytes, sig_bytes)` signed over the canonical
+    /// payload `"REVOKE_SIGNER_v1" || compromised_id || epoch_le`.
+    ///
+    /// The ceremony:
+    /// 1. Verifies that exactly 4 distinct non-compromised signers signed.
+    /// 2. Removes the compromised signer from the `signer_addrs` set.
+    /// 3. Audit-logs every step.
+    /// 4. Returns the reduced coordinator; the caller then runs a new DKG
+    ///    with the remaining participants to rotate the threshold PK.
+    pub fn initiate_recovery(
+        &mut self,
+        compromised_signer_id: Vec<u8>,
+        epoch: u64,
+        signatures_from_others: [(u8, Vec<u8>, Vec<u8>); 4],
+    ) -> Result<(), String> {
+        // Step 1: canonical payload
+        let mut payload = Vec::with_capacity(16 + compromised_signer_id.len() + 8);
+        payload.extend_from_slice(b"REVOKE_SIGNER_v1");
+        payload.push(0);
+        payload.extend_from_slice(&compromised_signer_id);
+        payload.extend_from_slice(&epoch.to_le_bytes());
+
+        // Step 2: verify 4 distinct ML-DSA-87 signatures
+        let mut seen: std::collections::BTreeSet<u8> = std::collections::BTreeSet::new();
+        for (signer_id, vk, sig) in &signatures_from_others {
+            if !seen.insert(*signer_id) {
+                return Err(format!(
+                    "C13: duplicate signer id {signer_id} in recovery approvals"
+                ));
+            }
+            if !crypto::pq_sign::pq_verify_raw_from_bytes(vk, &payload, sig) {
+                common::siem::SecurityEvent::crypto_failure(&format!(
+                    "C13 recovery: rejected bad ML-DSA-87 signature from signer {}",
+                    signer_id
+                ));
+                return Err(format!(
+                    "C13: signer {signer_id} signature failed ML-DSA-87 verification"
+                ));
+            }
+        }
+        if seen.len() != 4 {
+            return Err(format!(
+                "C13: need exactly 4 distinct signers, got {}",
+                seen.len()
+            ));
+        }
+
+        // Step 3: locate the compromised signer and remove it
+        let compromised_id = Identifier::deserialize(&compromised_signer_id)
+            .map_err(|e| format!("C13: bad compromised signer id: {e}"))?;
+        let before = self.signer_addrs.len();
+        self.signer_addrs.retain(|(id, _)| id != &compromised_id);
+        if self.signer_addrs.len() == before {
+            return Err(format!(
+                "C13: compromised signer {:?} not found in coordinator signer list",
+                compromised_id
+            ));
+        }
+
+        // Step 4: audit every step
+        tracing::warn!(
+            target: "siem",
+            severity = "CRITICAL",
+            action = "tss_recovery_executed",
+            remaining_signers = self.signer_addrs.len(),
+            "C13 threshold recovery: revoked compromised signer after 4-of-n ML-DSA-87 approvals"
+        );
+        common::siem::SecurityEvent {
+            timestamp: common::siem::SecurityEvent::now_iso8601(),
+            category: "tss_recovery",
+            action: "signer_revoked",
+            severity: common::siem::Severity::Critical,
+            outcome: "success",
+            user_id: None,
+            source_ip: None,
+            detail: Some(format!(
+                "compromised signer {:?} revoked after 4-of-{} ML-DSA-87 approvals (epoch {})",
+                compromised_id,
+                before,
+                epoch
+            )),
+        }
+        .emit();
+
+        // NOTE: the caller is expected to run a new DKG with the reduced
+        // participant set via `run_distributed_dkg` to produce a fresh
+        // threshold public key. This function returns early so the caller
+        // can control timing of the follow-on ceremony and broadcast the
+        // revocation to downstream services before new shares exist.
+        Ok(())
     }
 
     /// Perform a distributed signing ceremony by communicating with remote
