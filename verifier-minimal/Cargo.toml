@@ -1,0 +1,32 @@
+[package]
+name = "verifier-minimal"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Minimal-TCB credential verifier — no tokio, no serde, just postcard + crypto."
+
+# D13: Strictly minimal dependency set so the trusted computing base of the
+# verifier is auditable in a single sitting. Target: <15 KLOC TCB total.
+#
+# We deliberately do NOT pull in:
+#   * tokio / async runtimes
+#   * serde (replaced by manual postcard impls)
+#   * anything from the `common` or `shard` crates
+#   * tracing infra
+[dependencies]
+crypto = { path = "../crypto" }
+postcard = { workspace = true }
+ml-dsa = { workspace = true }
+frost-ristretto255 = { workspace = true }
+sha2 = { workspace = true }
+
+[features]
+default = ["production"]
+production = []
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "verifier-minimal"
+path = "src/main.rs"

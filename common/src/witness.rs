@@ -27,6 +27,7 @@ mod byte_array_64 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WitnessCheckpoint {
     #[serde(with = "byte_array_64")]
     pub audit_root: [u8; 64],
@@ -120,10 +121,14 @@ impl WitnessLog {
     /// Including sequence and timestamp in the signed data prevents replay and
     /// ensures checkpoint ordering is cryptographically bound.
     ///
-    /// SECURITY: The witness signing key SHOULD be stored in an HSM or separate
-    /// service, NOT in the same process as the audit log. If the audit service is
-    /// compromised and the signing key is local, an attacker can forge checkpoints.
-    /// For production military deployment, use an external witness cosigner.
+    /// SECURITY (D1): The witness signing key MUST live in a separate process.
+    /// Production deploys the dedicated `audit-witness` binary (under
+    /// `services/audit-witness/`) which owns its own ML-DSA-87 key, listens
+    /// on `/run/milnet/audit-witness.sock`, and authenticates connecting
+    /// clients via SO_PEERCRED. The `sign_fn` closure passed here should
+    /// dispatch to that UDS, never to a local key in the audit process.
+    /// Co-locating the key would let any compromise of the audit service
+    /// forge witness checkpoints.
     pub fn add_signed_checkpoint(
         &mut self,
         audit_root: [u8; 64],

@@ -280,6 +280,20 @@ pub struct AuditRequest {
     /// 0=Unclassified, 1=Confidential, 2=Secret, 3=TopSecret, 4=SCI
     #[serde(default)]
     pub classification: u8,
+    /// D10: caller-supplied event ID for idempotent retries. When two
+    /// requests arrive with the same (event_id, signature) pair within the
+    /// 24h dedup window, the second is silently accepted without creating
+    /// a duplicate chain entry.
+    #[serde(default)]
+    pub idempotency_event_id: Option<Uuid>,
+    /// D10: caller-supplied signature binding the idempotency_event_id to
+    /// the request payload. Used as the second half of the dedup key so an
+    /// attacker cannot replay another tenant's event_id.
+    #[serde(default)]
+    pub idempotency_signature: Vec<u8>,
+    /// D10: per-tenant throttle key. Defaults to Nil when unset (global bucket).
+    #[serde(default)]
+    pub tenant_id: Option<Uuid>,
 }
 
 /// Wire response type from audit service.

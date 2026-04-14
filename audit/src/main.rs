@@ -1,6 +1,35 @@
 #![forbid(unsafe_code)]
 //! audit: Audit Log (BFT) service entry point.
 //!
+//! # 11-VM deployment topology (D2, production/military)
+//!
+//! The BFT audit cluster tolerates f=3 Byzantine faults with n=11 nodes and a
+//! quorum of 2f+1 = 7. For the f=3 guarantee to hold, each node MUST be its
+//! own failure domain — running all 11 nodes in a single process (the default
+//! dev configuration) gives zero real Byzantine fault tolerance because any
+//! compromise of the process owns every node.
+//!
+//! Production deploys the audit service 11 times, once per VM, each pinned to
+//! its own node index:
+//!
+//! | VM          | Env                          | Role                      |
+//! |-------------|------------------------------|---------------------------|
+//! | audit-00    | `MILNET_BFT_NODE_INDEX=0`    | Audit replica 0           |
+//! | audit-01    | `MILNET_BFT_NODE_INDEX=1`    | Audit replica 1           |
+//! | ...         | ...                          | ...                       |
+//! | audit-10    | `MILNET_BFT_NODE_INDEX=10`   | Audit replica 10          |
+//!
+//! Each process sets `MILNET_BFT_STANDALONE=1` (or simply exports
+//! `MILNET_BFT_NODE_INDEX`, which implies it) and configures the peer list via
+//! `MILNET_BFT_NODE_ADDRS=<csv of peer SHARD mTLS addresses>`. Nodes
+//! communicate via the SHARD mTLS transport — they do NOT share an address
+//! space, and a compromise of a single VM quarantines at most one node.
+//!
+//! See `audit::bft::BftStandaloneMode` for the selector used at runtime.
+//!
+//! Single-process mode is still supported for local development (`cargo run`
+//! / integration tests with `MILNET_BFT_SINGLE_PROCESS_ACK=1`).
+//!
 //! Persistence layout under `AUDIT_DATA_DIR` (default `/var/lib/milnet/audit`):
 //!
 //!   audit.jsonl              — primary append-only audit log (JSON lines)
@@ -108,11 +137,19 @@ async fn main() {
     let (pq_signing_key, _pq_verifying_key) =
         load_or_generate_keypair(&signing_seed_path, &verifying_key_path);
 
-    // ── Witness signing key persistence ──────────────────────────────────
-    let witness_seed_path = data_dir.join("witness_seed.bin");
-    let witness_vk_path = data_dir.join("witness_verifying_key.bin");
-    let (witness_signing_key, _witness_verifying_key) =
-        load_or_generate_keypair(&witness_seed_path, &witness_vk_path);
+    // ── D1: Witness signing is performed out-of-process ─────────────────
+    // The witness signing key is owned by the `audit-witness` binary and
+    // never loaded into the audit process. We open a connection to its UDS
+    // here so the periodic checkpoint task can request signatures.
+    let witness_sock_path = std::env::var("MILNET_AUDIT_WITNESS_SOCK")
+        .unwrap_or_else(|_| "/run/milnet/audit-witness.sock".to_string());
+    if !std::path::Path::new(&witness_sock_path).exists() {
+        tracing::warn!(
+            "audit-witness socket {:?} not present; checkpoints will be skipped \
+             until the witness binary is started",
+            witness_sock_path
+        );
+    }
 
     // ── BFT cluster with per-node persistence ────────────────────────────
     let bft_dir = data_dir.join("bft_nodes");
@@ -170,8 +207,25 @@ async fn main() {
                     let staleness_flag = if kt_fresh { "fresh" } else { "stale" };
 
                     let mut wl = witness_log.lock().await;
+                    let sock_path = witness_sock_path.clone();
                     wl.add_signed_checkpoint(audit_root, kt_root, |data| {
-                        crypto::pq_sign::pq_sign_raw(&witness_signing_key, data)
+                        // D1: ask the out-of-process witness to sign the
+                        // SHA-256 hash of the canonical checkpoint payload.
+                        // We hash here rather than sending the full payload
+                        // so the witness API stays a fixed 32-byte input.
+                        use sha2::{Digest, Sha256};
+                        let h = Sha256::digest(data);
+                        match witness_sign_via_uds(&sock_path, h.as_slice()) {
+                            Ok(sig) => sig,
+                            Err(e) => {
+                                tracing::error!(
+                                    "audit-witness UDS sign failed ({}): emitting empty \
+                                     signature -- checkpoint will fail verification",
+                                    e
+                                );
+                                Vec::new()
+                            }
+                        }
                     });
 
                     // Persist the new checkpoint.
@@ -216,10 +270,15 @@ async fn main() {
             }
         };
 
+    // D10: Start shared admission controller (dedup + per-tenant throttle).
+    let admission = audit::throttle::AdmissionControl::new();
+    admission.spawn_eviction_task();
+
     tracing::info!("Audit service listening on {addr} (mTLS)");
     loop {
         if let Ok(mut transport) = listener.accept().await {
             let cluster = cluster.clone();
+            let admission = admission.clone();
             tokio::spawn(async move {
                 while let Ok((sender, payload)) = transport.recv().await {
                     let response = match postcard::from_bytes::<AuditRequest>(&payload) {
@@ -243,6 +302,41 @@ async fn main() {
                                 continue;
                             }
                             tracing::debug!(sender = ?sender, event_type = ?req.event_type, "audit entry from verified sender");
+
+                            // D10: admission control — dedup + per-tenant throttle.
+                            let tenant_id = req.tenant_id.unwrap_or(uuid::Uuid::nil());
+                            let idemp_id = req.idempotency_event_id;
+                            let idemp_sig = req.idempotency_signature.clone();
+                            match admission.check(tenant_id, idemp_id, &idemp_sig).await {
+                                audit::throttle::AdmissionDecision::DuplicateIgnored => {
+                                    // Silent idempotent success — no new chain entry.
+                                    let resp = AuditResponse {
+                                        success: true,
+                                        event_id: idemp_id,
+                                        error: None,
+                                    };
+                                    if let Ok(resp_bytes) = postcard::to_allocvec(&resp) {
+                                        let _ = transport.send(&resp_bytes).await;
+                                    }
+                                    continue;
+                                }
+                                audit::throttle::AdmissionDecision::ThrottleExceeded => {
+                                    let resp = AuditResponse {
+                                        success: false,
+                                        event_id: None,
+                                        error: Some(format!(
+                                            "per-tenant throttle exceeded for tenant {}",
+                                            tenant_id
+                                        )),
+                                    };
+                                    if let Ok(resp_bytes) = postcard::to_allocvec(&resp) {
+                                        let _ = transport.send(&resp_bytes).await;
+                                    }
+                                    continue;
+                                }
+                                audit::throttle::AdmissionDecision::Accept => {}
+                            }
+
                             let mut c = cluster.write().await;
                             match c.propose_entry(
                                 req.event_type,
@@ -252,10 +346,15 @@ async fn main() {
                                 vec![],
                                 req.classification,
                             ) {
-                                Ok(_entry_hash) => AuditResponse {
-                                    success: true,
-                                    event_id: Some(uuid::Uuid::new_v4()),
-                                    error: None,
+                                Ok(_entry_hash) => {
+                                    // D10: record the commit so replays within
+                                    // the TTL hit the idempotent-replay path.
+                                    admission.record_commit(idemp_id, &idemp_sig).await;
+                                    AuditResponse {
+                                        success: true,
+                                        event_id: Some(idemp_id.unwrap_or_else(uuid::Uuid::new_v4)),
+                                        error: None,
+                                    }
                                 },
                                 Err(e) => AuditResponse {
                                     success: false,
@@ -279,6 +378,36 @@ async fn main() {
             });
         }
     }
+}
+
+// ── D1: out-of-process witness signature client ─────────────────────────
+
+/// Connect to the audit-witness UDS, submit a 32-byte hash, and return the
+/// ML-DSA-87 signature bytes. Any error (socket missing, malformed reply,
+/// hex decode failure) is returned to the caller.
+fn witness_sign_via_uds(sock_path: &str, hash: &[u8]) -> Result<Vec<u8>, String> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    if hash.len() != 32 {
+        return Err(format!("expected 32-byte hash, got {}", hash.len()));
+    }
+    let mut stream = UnixStream::connect(sock_path)
+        .map_err(|e| format!("connect {sock_path}: {e}"))?;
+    let req = format!("SIGN {}\n", hex::encode(hash));
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| format!("write: {e}"))?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .map_err(|e| format!("read: {e}"))?;
+    let line = line.trim();
+    let sig_hex = line
+        .strip_prefix("SIG ")
+        .ok_or_else(|| format!("unexpected response: {}", line))?;
+    hex::decode(sig_hex).map_err(|e| format!("hex decode: {e}"))
 }
 
 // ── KT root fetch ───────────────────────────────────────────────────────

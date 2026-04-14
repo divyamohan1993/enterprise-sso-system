@@ -36,6 +36,10 @@ members = [
     "stig-checks",
     "dudect-harness",
     "pitr-store",
+    # ── W2-D1: out-of-process audit witness signer ──
+    "services/audit-witness",
+    # ── W2-D13: minimal-TCB verifier ──
+    "verifier-minimal",
 ]
 exclude = ["fuzz"]
 

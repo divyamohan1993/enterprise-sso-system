@@ -4,5 +4,6 @@
 pub mod bft;
 pub mod blockchain;
 pub mod log;
+pub mod throttle;
 
 pub use log::{AuditError, audit_write_or_die};

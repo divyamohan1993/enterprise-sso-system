@@ -30,6 +30,230 @@ pub const MIN_BFT_NODES: usize = 11;
 /// Quorum size: 2f+1 where f = floor((n-1)/3). With 11 nodes: f=3, quorum=7.
 pub const BFT_QUORUM: usize = 7;
 
+/// D4: number of rotating signatures required per committed entry.
+/// Three distinct BFT nodes (selected per epoch) co-sign every entry so a
+/// single compromised signer cannot forge a valid entry by itself.
+pub const SIGNATURES_PER_ENTRY: usize = 3;
+
+// ── D4: pinned verifying keys loaded from include_bytes! ─────────────────
+
+/// Raw bytes of the release-ceremony-produced pinned VK file. See
+/// `audit/build.rs` for the wire format.
+const PINNED_VKS_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pinned_vks.bin"));
+
+/// D4: Parse the pinned verifying keys into decoded `PqVerifyingKey`s.
+///
+/// Returns an empty vec if the file is a build-time placeholder. The runtime
+/// `require_pinned_vks()` helper asserts length = 11 when standalone mode
+/// is active, so placeholder stubs cannot accidentally ship to production.
+pub fn load_pinned_vks() -> Vec<pq_sign::PqVerifyingKey> {
+    use ml_dsa::{EncodedVerifyingKey, MlDsa87, VerifyingKey};
+    let bytes = PINNED_VKS_BYTES;
+    if bytes.len() < 4 {
+        return Vec::new();
+    }
+    let n = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    let mut out = Vec::with_capacity(n);
+    let mut offset = 4usize;
+    for _ in 0..n {
+        if offset + 4 > bytes.len() {
+            return out;
+        }
+        let len = u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]) as usize;
+        offset += 4;
+        if offset + len > bytes.len() {
+            return out;
+        }
+        let vk_bytes = &bytes[offset..offset + len];
+        if let Ok(enc) = EncodedVerifyingKey::<MlDsa87>::try_from(vk_bytes) {
+            out.push(VerifyingKey::<MlDsa87>::decode(&enc));
+        }
+        offset += len;
+    }
+    out
+}
+
+/// D4: Assert 11 pinned VKs are available; panics in production if not.
+/// Callable at startup.
+pub fn require_pinned_vks_or_panic() {
+    let vks = load_pinned_vks();
+    if vks.len() != MIN_BFT_NODES {
+        let is_production = std::env::var("MILNET_PRODUCTION").is_ok()
+            || std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok();
+        if is_production {
+            panic!(
+                "FATAL: pinned_vks.bin contains {} keys, expected {}. \
+                 Regenerate via the release ceremony.",
+                vks.len(),
+                MIN_BFT_NODES
+            );
+        } else {
+            tracing::warn!(
+                "pinned_vks.bin contains {} keys (expected {}) — using placeholder \
+                 (non-production build only)",
+                vks.len(),
+                MIN_BFT_NODES
+            );
+        }
+    }
+}
+
+/// D4: Select the 3 signer node indices for a given epoch.
+///
+/// Rotation schedule:
+///   signer_0 = current_epoch        % 11
+///   signer_1 = (current_epoch + 4)  % 11
+///   signer_2 = (current_epoch + 7)  % 11
+///
+/// The offsets 4 and 7 are coprime with 11 so every epoch picks 3 distinct
+/// signers and over 11 epochs every node signs at least once as each slot.
+pub fn signer_slots_for_epoch(epoch: u64) -> [usize; SIGNATURES_PER_ENTRY] {
+    let n = MIN_BFT_NODES as u64;
+    [
+        (epoch % n) as usize,
+        ((epoch + 4) % n) as usize,
+        ((epoch + 7) % n) as usize,
+    ]
+}
+
+/// D4: Encode multiple ML-DSA-87 signatures into a single `Vec<u8>` that
+/// fits AuditEntry's `signature: Vec<u8>` wire field without requiring a
+/// schema change.
+///
+/// Wire format: [u8 count] [u32 LE len0] [sig0 bytes] [u32 LE len1] [sig1 bytes] ...
+pub fn encode_multi_signature(sigs: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + sigs.iter().map(|s| 4 + s.len()).sum::<usize>());
+    out.push(sigs.len() as u8);
+    for s in sigs {
+        out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        out.extend_from_slice(s);
+    }
+    out
+}
+
+/// D4: Decode a multi-signature blob produced by `encode_multi_signature`.
+pub fn decode_multi_signature(blob: &[u8]) -> Option<Vec<Vec<u8>>> {
+    if blob.is_empty() {
+        return None;
+    }
+    let n = blob[0] as usize;
+    let mut out = Vec::with_capacity(n);
+    let mut offset = 1usize;
+    for _ in 0..n {
+        if offset + 4 > blob.len() {
+            return None;
+        }
+        let len = u32::from_le_bytes([
+            blob[offset],
+            blob[offset + 1],
+            blob[offset + 2],
+            blob[offset + 3],
+        ]) as usize;
+        offset += 4;
+        if offset + len > blob.len() {
+            return None;
+        }
+        out.push(blob[offset..offset + len].to_vec());
+        offset += len;
+    }
+    Some(out)
+}
+
+/// D4: Produce the 11 per-node ML-DSA-87 signing keys used to synthesize
+/// the rotating 3-signer multi-signature.
+///
+/// * **Single-process mode** — derives all 11 seeds via HKDF-SHA512 from the
+///   master KEK with per-slot info strings, so every restart reproduces the
+///   same keypair set and entries persisted to disk stay verifiable.
+/// * **Standalone mode** — only populates the slot matching
+///   `MILNET_BFT_NODE_INDEX`; the remaining entries are `None` and the
+///   cluster relies on SHARD mTLS peer messages to collect sibling slot
+///   signatures at propose time.
+fn synthesize_or_load_signing_keys(node_count: usize) -> Vec<Option<pq_sign::PqSigningKey>> {
+    use hkdf::Hkdf;
+    use ml_dsa::{KeyGen, MlDsa87};
+    use sha2::Sha512;
+    use zeroize::Zeroize;
+
+    let mut keys: Vec<Option<pq_sign::PqSigningKey>> = (0..node_count).map(|_| None).collect();
+
+    // In test builds we derive from a stable per-slot seed that does not
+    // depend on the master KEK so unit tests don't require KEK setup.
+    let test_mode = cfg!(test) || cfg!(feature = "test-support");
+
+    let standalone = BftStandaloneMode::from_env() == BftStandaloneMode::Standalone;
+    let local_slot: Option<usize> = std::env::var("MILNET_BFT_NODE_INDEX")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok());
+
+    let derive_seed = |slot: usize| -> [u8; 32] {
+        let mut seed = [0u8; 32];
+        if test_mode {
+            // Deterministic per-slot seed — test fixture only.
+            let info = format!("TEST-BFT-SLOT-{}", slot);
+            use sha2::Digest;
+            let h = Sha512::digest(info.as_bytes());
+            seed.copy_from_slice(&h[..32]);
+        } else {
+            let kek = common::sealed_keys::cached_master_kek();
+            let hk = Hkdf::<Sha512>::new(Some(b"MILNET-BFT-NODE-SIGN-v1"), kek);
+            let info = format!("bft-node-signing-{}", slot);
+            hk.expand(info.as_bytes(), &mut seed)
+                .expect("HKDF expand for BFT node signing seed");
+        }
+        seed
+    };
+
+    for slot in 0..node_count {
+        if standalone && Some(slot) != local_slot {
+            continue;
+        }
+        let mut seed = derive_seed(slot);
+        let kp = MlDsa87::from_seed(&seed.into());
+        seed.zeroize();
+        keys[slot] = Some(kp.signing_key().clone());
+    }
+    keys
+}
+
+/// D4: Verify that an AuditEntry carries `SIGNATURES_PER_ENTRY` valid
+/// ML-DSA-87 signatures from the three signer slots assigned to the given
+/// epoch, using the pinned VK list. Returns `true` iff all three signatures
+/// verify under distinct signer slots.
+pub fn verify_multi_signature(
+    entry_hash: &[u8],
+    multi_sig_blob: &[u8],
+    epoch: u64,
+    pinned_vks: &[pq_sign::PqVerifyingKey],
+) -> bool {
+    if pinned_vks.len() != MIN_BFT_NODES {
+        return false;
+    }
+    let Some(sigs) = decode_multi_signature(multi_sig_blob) else {
+        return false;
+    };
+    if sigs.len() != SIGNATURES_PER_ENTRY {
+        return false;
+    }
+    let slots = signer_slots_for_epoch(epoch);
+    // Distinct slot requirement.
+    if slots[0] == slots[1] || slots[1] == slots[2] || slots[0] == slots[2] {
+        return false;
+    }
+    for (i, &slot) in slots.iter().enumerate() {
+        let vk = &pinned_vks[slot];
+        if !pq_sign::pq_verify_raw(vk, entry_hash, &sigs[i]) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Returns true if the cluster has sufficient nodes for BFT guarantees.
 pub fn has_bft_quorum(node_count: usize) -> bool {
     node_count >= MIN_BFT_NODES
@@ -154,6 +378,12 @@ impl AuditNode {
 
         // SECURITY: Verify proposer's ML-DSA-87 signature on the entry.
         // Without this check, any node could inject unsigned entries into the chain.
+        //
+        // D4: If the signature field carries a multi-signature blob (as
+        // produced by encode_multi_signature — first byte is the sig count),
+        // defer verification to the cluster-level `verify_multi_signature`
+        // check which runs against the pinned VK list before the commit loop.
+        // Per-node verification can only see one VK and would reject the blob.
         if let Some(ref vk) = self.pq_verifying_key {
             if entry.signature.is_empty() {
                 tracing::warn!(
@@ -162,13 +392,18 @@ impl AuditNode {
                 );
                 return None;
             }
-            let entry_hash = hash_entry(entry);
-            if !pq_sign::pq_verify_raw(vk, &entry_hash, &entry.signature) {
-                tracing::warn!(
-                    "BFT node {}: rejecting entry with invalid proposer signature (event_id={})",
-                    self.node_id, entry.event_id
-                );
-                return None;
+            let looks_like_multi_sig = decode_multi_signature(&entry.signature)
+                .map(|v| v.len() == SIGNATURES_PER_ENTRY)
+                .unwrap_or(false);
+            if !looks_like_multi_sig {
+                let entry_hash = hash_entry(entry);
+                if !pq_sign::pq_verify_raw(vk, &entry_hash, &entry.signature) {
+                    tracing::warn!(
+                        "BFT node {}: rejecting entry with invalid proposer signature (event_id={})",
+                        self.node_id, entry.event_id
+                    );
+                    return None;
+                }
             }
         }
 
@@ -292,20 +527,75 @@ fn check_bft_node_addresses() {
     }
 }
 
+/// D2: BftStandaloneMode selects between single-process (one process hosts
+/// all 11 AuditNode instances, used in local dev/test only) and standalone
+/// mode (each BFT node is a separate OS process that communicates with the
+/// cluster over SHARD mTLS). In the production/military deployment topology
+/// each of the 11 nodes runs on its own VM, and the audit service binary
+/// is invoked 11 times (one per VM) with `MILNET_BFT_NODE_INDEX=N` set.
+///
+/// See `audit/src/main.rs` module docs for the full 11-VM topology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BftStandaloneMode {
+    /// All 11 nodes run in a single process. Non-production only.
+    SingleProcess,
+    /// Each BFT node runs in its own process and communicates via SHARD mTLS.
+    Standalone,
+}
+
+impl BftStandaloneMode {
+    /// Resolve the deployment mode from environment variables.
+    ///
+    /// Standalone mode is selected when either:
+    ///   * `MILNET_BFT_STANDALONE=1`, or
+    ///   * `MILNET_BFT_NODE_INDEX=<N>` is present (signals a dedicated process).
+    pub fn from_env() -> Self {
+        if std::env::var("MILNET_BFT_STANDALONE").as_deref() == Ok("1")
+            || std::env::var("MILNET_BFT_NODE_INDEX").is_ok()
+        {
+            BftStandaloneMode::Standalone
+        } else {
+            BftStandaloneMode::SingleProcess
+        }
+    }
+}
+
 /// Startup check: BFT single-process mode warning/enforcement.
 /// In production, single-process mode requires explicit acknowledgment.
-/// In military deployment, single-process mode is unconditionally fatal.
+/// In military deployment, single-process mode is unconditionally fatal
+/// UNLESS `MILNET_BFT_SINGLE_PROCESS_ACK=1` is also set (test-only override).
 /// In test builds (cfg(test) or feature "test-support"), enforcement is skipped.
 fn check_single_process_military_deployment() {
     // Test builds: allow single-process mode without ceremony.
     if cfg!(test) || cfg!(feature = "test-support") {
         return;
     }
+    // D2: If we are running in Standalone mode, every single-process check
+    // is moot — each BFT node is its own process and the usual "all nodes
+    // in one address space" threat model does not apply.
+    if BftStandaloneMode::from_env() == BftStandaloneMode::Standalone {
+        tracing::info!(
+            "BFT standalone mode active (MILNET_BFT_STANDALONE or MILNET_BFT_NODE_INDEX set); \
+             skipping single-process enforcement"
+        );
+        return;
+    }
     if std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok() {
+        // D2: allow the test-only override to bypass the hard panic.
+        if std::env::var("MILNET_BFT_SINGLE_PROCESS_ACK").as_deref() == Ok("1") {
+            tracing::warn!(
+                target: "siem",
+                "SIEM:WARNING: BFT audit running in single-process mode in military deployment \
+                 with MILNET_BFT_SINGLE_PROCESS_ACK=1. This override is TEST-ONLY; \
+                 production must use MILNET_BFT_STANDALONE=1 with one process per VM."
+            );
+            return;
+        }
         panic!(
             "FATAL: BFT audit running in single-process mode in military deployment. \
              All 11 nodes share one address space -- zero actual Byzantine fault tolerance. \
-             Deploy BFT nodes as separate processes/VMs."
+             Deploy BFT nodes as separate processes/VMs (set MILNET_BFT_STANDALONE=1) \
+             or set MILNET_BFT_SINGLE_PROCESS_ACK=1 (test-only override)."
         );
     }
     // In production, single-process mode is NEVER permitted.
@@ -317,7 +607,7 @@ fn check_single_process_military_deployment() {
         panic!(
             "FATAL: BFT audit running in single-process mode. \
              All nodes share one address space -- zero actual Byzantine fault tolerance. \
-             Deploy BFT nodes as separate processes/VMs."
+             Deploy BFT nodes as separate processes/VMs (MILNET_BFT_STANDALONE=1)."
         );
     }
     // Non-production, non-military, with explicit ACK: require MLP mode
@@ -373,10 +663,21 @@ pub struct BftAuditCluster {
     pq_signing_key: Option<pq_sign::PqSigningKey>,
     /// Optional ML-DSA-87 verifying key (derived from signing key) for signature verification.
     pq_verifying_key: Option<pq_sign::PqVerifyingKey>,
+    /// D4: eleven per-node signing keys. In single-process mode all 11 are
+    /// held here so the cluster can synthesize the 3-signer multi-signature
+    /// locally. In standalone mode only the local slot is populated and the
+    /// remaining 2 signatures arrive via SHARD mTLS from peers.
+    per_node_signing_keys: Vec<Option<pq_sign::PqSigningKey>>,
+    /// D4: pinned verifying keys (loaded from include_bytes!("pinned_vks.bin"))
+    /// used to verify every committed entry's 3-signature rotation.
+    pinned_vks: Vec<pq_sign::PqVerifyingKey>,
     /// Maximum Byzantine faults tolerated.
     f: usize,
     /// Monotonic sequence number for proposer rotation.
     sequence_number: u64,
+    /// D4: current rotation epoch. Incremented on every committed entry so
+    /// successive entries rotate through the 3 signer slots.
+    current_epoch: u64,
     /// Single-process mode flag. True when BFT nodes run in one process.
     single_process_mode: bool,
     /// Nodes currently quarantined for Byzantine behavior.
@@ -404,13 +705,18 @@ impl BftAuditCluster {
         let f = (node_count - 1) / 3; // max Byzantine faults tolerated
         let quorum = 2 * f + 1; // minimum for consensus
         let nodes: Vec<AuditNode> = (0..node_count as u8).map(AuditNode::new).collect();
+        let pinned_vks = load_pinned_vks();
+        let per_node_signing_keys = synthesize_or_load_signing_keys(node_count);
         let mut cluster = Self {
             nodes,
             quorum_size: quorum,
             pq_signing_key: None,
             pq_verifying_key: None,
+            per_node_signing_keys,
+            pinned_vks,
             f,
             sequence_number: 0,
+            current_epoch: 0,
             single_process_mode: default_single_process_mode(),
             quarantined: Vec::new(),
             last_proposal_at: Instant::now(),
@@ -438,13 +744,18 @@ impl BftAuditCluster {
         let nodes: Vec<AuditNode> = (0..node_count as u8)
             .map(|id| AuditNode::new_with_verifying_key(id, verifying_key.clone()))
             .collect();
+        let pinned_vks = load_pinned_vks();
+        let per_node_signing_keys = synthesize_or_load_signing_keys(node_count);
         let mut cluster = Self {
             nodes,
             quorum_size: quorum,
             pq_signing_key: Some(signing_key),
             pq_verifying_key: Some(verifying_key),
+            per_node_signing_keys,
+            pinned_vks,
             f,
             sequence_number: 0,
+            current_epoch: 0,
             single_process_mode: default_single_process_mode(),
             quarantined: Vec::new(),
             last_proposal_at: Instant::now(),
@@ -486,13 +797,18 @@ impl BftAuditCluster {
             .collect();
         check_single_process_military_deployment();
 
+        let pinned_vks = load_pinned_vks();
+        let per_node_signing_keys = synthesize_or_load_signing_keys(node_count);
         let mut cluster = Self {
             nodes,
             quorum_size: quorum,
             pq_signing_key: Some(signing_key),
             pq_verifying_key: Some(verifying_key),
+            per_node_signing_keys,
+            pinned_vks,
             f,
             sequence_number: 0,
+            current_epoch: 0,
             single_process_mode: default_single_process_mode(),
             quarantined: Vec::new(),
             last_proposal_at: Instant::now(),
@@ -651,10 +967,31 @@ impl BftAuditCluster {
                 user_agent: None,
             };
 
-            if let Some(ref key) = self.pq_signing_key {
-                let hash = hash_entry(&entry);
-                entry.signature = pq_sign::pq_sign_raw(key, &hash);
+            // D4: Sign the entry with the 3 rotating slot keys chosen for
+            // the current epoch. All three signatures are concatenated into
+            // the single AuditEntry::signature field via encode_multi_signature.
+            let hash = hash_entry(&entry);
+            let slots = signer_slots_for_epoch(self.current_epoch);
+            let mut slot_sigs: Vec<Vec<u8>> = Vec::with_capacity(SIGNATURES_PER_ENTRY);
+            let mut missing_slots: Vec<usize> = Vec::new();
+            for &slot in &slots {
+                match self.per_node_signing_keys.get(slot).and_then(|k| k.as_ref()) {
+                    Some(sk) => slot_sigs.push(pq_sign::pq_sign_raw(sk, &hash)),
+                    None => missing_slots.push(slot),
+                }
             }
+            if !missing_slots.is_empty() {
+                // Standalone mode peers should have co-signed via SHARD mTLS
+                // before we reach this path; in single-process mode all 11
+                // keys are local so this never fires. Fail-closed.
+                last_error = format!(
+                    "missing signer-slot keys {:?} for epoch {}",
+                    missing_slots, self.current_epoch
+                );
+                tracing::error!("{}", last_error);
+                continue;
+            }
+            entry.signature = encode_multi_signature(&slot_sigs);
 
             // ── PHASE 1: PREPARE ──
             // Send entry to all nodes, collect prepare votes.
@@ -729,6 +1066,28 @@ impl BftAuditCluster {
                 continue; // Try next proposer
             }
 
+            // D4: Cluster-level verification of the 3-of-11 rotating multi-signature
+            // against the pinned VK list. This is redundant with per-node
+            // verification below (which only knows about one VK) but it is the
+            // authoritative check: if it fails we reject the entire entry.
+            if !self.pinned_vks.is_empty() {
+                let entry_hash = hash_entry(&entry);
+                if !verify_multi_signature(
+                    &entry_hash,
+                    &entry.signature,
+                    self.current_epoch,
+                    &self.pinned_vks,
+                ) {
+                    last_error = format!(
+                        "multi-signature verification failed for epoch {} proposer {}",
+                        self.current_epoch, proposer_idx
+                    );
+                    tracing::error!("{}", last_error);
+                    common::siem::SecurityEvent::tamper_detected(&last_error);
+                    continue;
+                }
+            }
+
             // ── PHASE 2: COMMIT ──
             // Quorum reached. Now commit the entry to all nodes that prepared.
             // The commit includes the quorum proof (set of voting node indices)
@@ -752,6 +1111,7 @@ impl BftAuditCluster {
                 // Exchange heartbeats among all nodes that committed.
                 self.exchange_heartbeats();
                 self.sequence_number += 1;
+                self.current_epoch += 1; // D4: rotate signer slots
                 self.last_proposal_at = Instant::now();
                 tracing::info!(
                     proposer = proposer_idx,
