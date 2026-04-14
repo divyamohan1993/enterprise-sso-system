@@ -282,6 +282,7 @@ impl ServerSetupHandle {
 #[cfg(test)]
 mod sealed_setup_tests {
     use super::*;
+    use serial_test::serial;
 
     /// Set up 3 deterministic shares in env and return a guard that clears them.
     struct ShareGuard;
@@ -308,6 +309,7 @@ mod sealed_setup_tests {
     }
 
     #[test]
+    #[serial]
     fn seal_unseal_roundtrip_recovers_server_setup() {
         let _g = ShareGuard::install();
 
@@ -324,6 +326,7 @@ mod sealed_setup_tests {
     }
 
     #[test]
+    #[serial]
     fn missing_shares_returns_error() {
         // Ensure no shares set
         for n in &OPAQUE_SERVER_SHARE_NAMES {
@@ -337,6 +340,7 @@ mod sealed_setup_tests {
     }
 
     #[test]
+    #[serial]
     fn tampered_ciphertext_fails_to_open() {
         let _g = ShareGuard::install();
         let handle = ServerSetupHandle::generate_and_seal().expect("seal");

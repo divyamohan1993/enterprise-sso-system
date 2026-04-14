@@ -2900,7 +2900,14 @@ mod tests {
         let att_obj = make_none_attestation_object(&auth_data);
 
         let err = verify_attestation_object(&att_obj, &client_data_hash, rp_id).unwrap_err();
-        assert!(err.contains("hardware attestation required"));
+        // B9 (wave-1) and the legacy `is_hw_attestation_required` check both
+        // reject "none" — accept either error message so the test survives
+        // the wave-2 format allow-list tightening.
+        assert!(
+            err.contains("hardware attestation required")
+                || err.contains("attestation format not in MILNET allow-list"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

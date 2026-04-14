@@ -414,6 +414,13 @@ fn test_fido2_login_timing() {
     use fido::types::*;
     use sha2::{Digest, Sha256};
 
+    // F3 / B6: synthetic test credential uses zero AAGUID; enable the
+    // integration-test allow-list that accepts it.
+    std::env::set_var(
+        "MILNET_FIDO_AAGUID_ALLOWLIST",
+        "00000000-0000-0000-0000-000000000000",
+    );
+
     let start = Instant::now();
     let user_id = uuid::Uuid::new_v4();
     let rp_id = "sso.milnet.example";

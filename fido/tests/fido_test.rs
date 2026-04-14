@@ -254,6 +254,7 @@ fn test_registration_options_algorithms() {
 
 #[test]
 fn test_registration_response_verification() {
+    ensure_test_aaguid_allowlist();
     let mut store = CredentialStore::new();
     let rp_id = "sso.milnet.gov";
     let user_id = Uuid::new_v4();
@@ -302,6 +303,7 @@ fn test_registration_response_invalid_rp_id() {
 
 #[test]
 fn test_registration_response_missing_user_verification() {
+    ensure_test_aaguid_allowlist();
     let mut store = CredentialStore::new();
     let rp_id = "sso.milnet.gov";
     let cred_id = vec![0xBB];
@@ -343,6 +345,7 @@ fn test_registration_response_no_at_flag() {
 
 #[test]
 fn test_registration_duplicate_rejected() {
+    ensure_test_aaguid_allowlist();
     let mut store = CredentialStore::new();
     let rp_id = "sso.milnet.gov";
     let user_id = Uuid::new_v4();
@@ -1390,6 +1393,7 @@ fn test_base64_url_encode() {
 
 #[test]
 fn test_full_registration_and_authentication_flow() {
+    ensure_test_aaguid_allowlist();
     let rp_id = "sso.milnet.gov";
     let user_id = Uuid::new_v4();
     let mut store = CredentialStore::new();

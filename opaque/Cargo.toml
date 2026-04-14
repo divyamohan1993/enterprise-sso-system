@@ -39,3 +39,4 @@ opaque-ke.workspace = true
 rand.workspace = true
 crypto = { path = "../crypto" }
 proptest = "1"
+serial_test.workspace = true

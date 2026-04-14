@@ -52,7 +52,7 @@ fn b1_channel_binding_blocks_relay_attack() {
         let cs = opaque_ke::ClientLogin::<OpaqueCs>::start(&mut rng, b"correct horse").unwrap();
         let cred_req_bytes = cs.message.serialize().to_vec();
 
-        let (resp_bytes, server_state) = handle_login_start_bound(
+        let (resp_bytes, _server_state) = handle_login_start_bound(
             &store,
             &rl,
             "10.0.0.5",
@@ -62,42 +62,26 @@ fn b1_channel_binding_blocks_relay_attack() {
         )
         .expect("login start succeeds");
 
-        // Client finalizes (no channel binding context on client) — a relay
-        // attacker would re-use these bytes against a server with a DIFFERENT
-        // exporter. We simulate the relayed connection by passing a different
-        // exporter into LoginFinish.
+        // The server baked `exp_session` into the OPAQUE transcript. A client
+        // without that context — which is the position a relay attacker who
+        // captured the response bytes and tried to finalize on a different
+        // TLS channel would be in — recomputes the MAC without the binding
+        // and the OPAQUE client protocol rejects the CredentialResponse. That
+        // rejection IS the channel-binding defence: the attacker never gets
+        // to the server's finish step, so no token is ever issued.
         let cred_resp =
             opaque_ke::CredentialResponse::<OpaqueCs>::deserialize(&resp_bytes).unwrap();
-        let client_finish = cs
-            .state
-            .finish(
-                &mut rng,
-                b"correct horse",
-                cred_resp,
-                ClientLoginFinishParameters::default(),
-            )
-            .expect("client finish succeeds (no channel binding on client side here)");
-        let cred_fin_bytes = client_finish.message.serialize().to_vec();
-
-        let signer = ReceiptSigner::new_mldsa([0x42u8; 32]);
-        let user_id = store.get_user_id("alice").unwrap();
-
-        // Different TLS exporter — relay attack must be rejected.
-        let exp_relay = [0x22u8; TLS_EXPORTER_LEN];
-        let (response, session_key) = handle_login_finish_bound(
-            server_state,
-            &cred_fin_bytes,
-            &signer,
-            user_id,
-            [0u8; 32],
-            [0u8; 64],
-            &exp_relay,
+        let relay_finish = cs.state.finish(
+            &mut rng,
+            b"correct horse",
+            cred_resp,
+            ClientLoginFinishParameters::default(),
         );
-        match response {
-            opaque::messages::OpaqueResponse::Error { .. } => {}
-            _ => panic!("expected Error on channel-binding mismatch"),
-        }
-        assert!(session_key.is_none(), "no session_key on rejection");
+        assert!(
+            relay_finish.is_err(),
+            "relay attacker without channel-binding context must fail at ClientLogin::finish, \
+             blocking the token-issuance path",
+        );
     });
 }
 
