@@ -284,7 +284,10 @@ fn bft_signed_cluster_tolerates_byzantine() {
 
 #[test]
 fn bft_signed_entries_have_valid_signature_bytes() {
-    let (signing_key, verifying_key) = crypto::pq_sign::generate_pq_keypair();
+    // D4 (wave-2 audit): entries now carry a multi-signature blob from 3
+    // rotating pinned slot keys, not a single ML-DSA-87 signature. Verify
+    // via verify_multi_signature against the pinned VKs loaded at startup.
+    let (signing_key, _legacy_vk) = crypto::pq_sign::generate_pq_keypair();
     let mut cluster = audit::bft::BftAuditCluster::new_with_signing_key(11, signing_key);
 
     cluster
@@ -300,9 +303,12 @@ fn bft_signed_entries_have_valid_signature_bytes() {
 
     let entry = &cluster.nodes[0].log.entries()[0];
     let entry_hash = hash_entry(entry);
-
-    let valid = crypto::pq_sign::pq_verify_raw(&verifying_key, &entry_hash, &entry.signature);
-    assert!(valid, "ML-DSA-87 signature should verify");
+    let pinned = audit::bft::load_pinned_vks();
+    assert_eq!(pinned.len(), 11, "expected 11 pinned BFT verifying keys");
+    // First proposal on a fresh cluster signs under epoch 0 (the cluster
+    // increments after success). Index 0 in the entries vec corresponds.
+    let valid = audit::bft::verify_multi_signature(&entry_hash, &entry.signature, 0, &pinned);
+    assert!(valid, "BFT 3-of-11 multi-signature must verify");
 }
 
 // ── Signature verification tests ─────────────────────────────────────

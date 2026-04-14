@@ -405,6 +405,7 @@ pub fn validate_fencing_token(provided: u64, expected: u64) -> Result<(), LockEr
 
 /// A held lock with its metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LockGrant {
     /// Name / identifier of the lock.
     pub name: String,

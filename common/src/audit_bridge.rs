@@ -177,6 +177,7 @@ pub fn create_audit_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use uuid::Uuid;
 
     fn make_entry(event_type: AuditEventType) -> AuditEntry {
@@ -203,6 +204,7 @@ mod tests {
     // ── 1. Buffer an audit entry and drain it ────────────────────────────
 
     #[test]
+    #[serial]
     fn buffer_and_drain_single_entry() {
         // Drain any leftover state from other tests
         let _ = drain_audit_buffer();
@@ -219,6 +221,7 @@ mod tests {
     // ── 2. Buffer multiple entries and drain all ─────────────────────────
 
     #[test]
+    #[serial]
     fn buffer_multiple_and_drain_all() {
         let _ = drain_audit_buffer();
 
@@ -241,6 +244,7 @@ mod tests {
     // ── 3. Drain empty buffer returns empty vec ──────────────────────────
 
     #[test]
+    #[serial]
     fn drain_empty_returns_empty() {
         let _ = drain_audit_buffer();
         let drained = drain_audit_buffer();
@@ -250,6 +254,7 @@ mod tests {
     // ── 4. Concurrent buffer writes are safe ─────────────────────────────
 
     #[test]
+    #[serial]
     fn concurrent_buffer_writes() {
         let _ = drain_audit_buffer();
 
@@ -280,6 +285,7 @@ mod tests {
     // ── 5. Buffer respects capacity limit ────────────────────────────────
 
     #[test]
+    #[serial]
     fn buffer_respects_max_capacity() {
         let _ = drain_audit_buffer();
 
@@ -307,6 +313,7 @@ mod tests {
     // ── 6. Entry integrity preserved through buffer/drain cycle ──────────
 
     #[test]
+    #[serial]
     fn entry_integrity_preserved() {
         let _ = drain_audit_buffer();
 
