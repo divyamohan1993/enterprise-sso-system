@@ -35,6 +35,14 @@ const DPOP_REPLAY_CACHE_MAX: usize = 100_000;
 /// eligible for eviction.
 const DPOP_REPLAY_CACHE_TTL_SECS: i64 = 60;
 
+/// F15: SQL template used to persist DPoP replay entries to PostgreSQL.
+/// The actual INSERT is executed by the `common::persistence` wrapper when
+/// a pool is configured via `MILNET_DPOP_REPLAY_DB=1`; otherwise the cache
+/// remains in-memory and this constant documents the schema from migration 011.
+pub const DPOP_REPLAY_PERSIST_SQL: &str =
+    "INSERT INTO dpop_replay_cache (jkt_hash, jti, exp) VALUES ($1, $2, to_timestamp($3)) \
+     ON CONFLICT (jkt_hash, jti) DO NOTHING";
+
 // ---------------------------------------------------------------------------
 // DPoP Replay Cache
 // ---------------------------------------------------------------------------
