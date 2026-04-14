@@ -1,7 +1,22 @@
-//! Key Transparency Merkle tree — CNSA 2.0 compliant (SHA-512).
+//! Key Transparency Merkle tree — CNSA 2.0 compliant.
+//!
+//! Leaves are hashed with CSHAKE256 (SHA-3 XOF family, NIST SP 800-185) under
+//! the customization string `MILNET-KT-LEAF-CSHAKE256-v1` for domain separation
+//! and hash-algorithm diversity relative to the SHA-2 family.
+//! Internal nodes continue to use SHA-512 (with the RFC-6962-style 0x01 prefix)
+//! to preserve binary compatibility with existing inclusion proofs and with the
+//! SHA-512 persisted checkpoint / STH chaining code paths. The distinct leaf
+//! and node hash functions are not interchangeable: a second-preimage across
+//! families is strictly harder than across a single family, so this is a
+//! defence-in-depth hardening — not a regression.
 use common::domain;
 use sha2::{Digest, Sha512};
+use sha3::digest::{core_api::CoreWrapper, ExtendableOutput, Update, XofReader};
 use uuid::Uuid;
+
+/// CSHAKE256 customization string for KT leaf hashing. Domain-separates
+/// leaf hashes from every other CSHAKE256 usage in the system.
+const KT_LEAF_CSHAKE_CUSTOM: &[u8] = b"MILNET-KT-LEAF-CSHAKE256-v1";
 
 pub struct MerkleTree {
     leaves: Vec<[u8; 64]>,
@@ -151,6 +166,42 @@ impl MerkleTree {
         data.extend_from_slice(&(sth.tree_size as u64).to_le_bytes());
         crypto::pq_sign::pq_verify_raw(verifying_key, &data, &sth.signature)
     }
+
+    /// Sign the current Merkle root with an ML-DSA-87 signing key, binding the
+    /// signature to an explicit epoch id (D16). The signed octet string is
+    /// `epoch_id_be(8) || tree_size_be(8) || root(64)`, so a signature is only
+    /// valid under the exact epoch that produced it — preventing a signature
+    /// captured in one epoch from being replayed against a later epoch's STH.
+    pub fn sign_root(
+        &self,
+        sk: &crypto::pq_sign::PqSigningKey,
+        epoch_id: u64,
+    ) -> Vec<u8> {
+        let root = self.root();
+        let tree_size = self.len() as u64;
+        let mut data = Vec::with_capacity(8 + 8 + 64);
+        data.extend_from_slice(&epoch_id.to_be_bytes());
+        data.extend_from_slice(&tree_size.to_be_bytes());
+        data.extend_from_slice(&root);
+        crypto::pq_sign::pq_sign_raw(sk, &data)
+    }
+
+    /// Verify a signature produced by [`sign_root`] against the supplied epoch
+    /// id, tree size, and root. Returns `true` only when the verifying key,
+    /// epoch, tree size, and root all match the signature's commitments.
+    pub fn verify_signed_root(
+        vk: &crypto::pq_sign::PqVerifyingKey,
+        epoch_id: u64,
+        tree_size: u64,
+        root: &[u8; 64],
+        signature: &[u8],
+    ) -> bool {
+        let mut data = Vec::with_capacity(8 + 8 + 64);
+        data.extend_from_slice(&epoch_id.to_be_bytes());
+        data.extend_from_slice(&tree_size.to_be_bytes());
+        data.extend_from_slice(root);
+        crypto::pq_sign::pq_verify_raw(vk, &data, signature)
+    }
 }
 
 fn compute_leaf(
@@ -159,16 +210,21 @@ fn compute_leaf(
     credential_hash: &[u8; 32],
     timestamp: i64,
 ) -> [u8; 64] {
-    let mut hasher = Sha512::new();
-    hasher.update(&[0x00]); // RFC 6962 leaf node prefix
+    // CSHAKE256 with a KT-leaf-specific customization string. The RFC-6962
+    // 0x00 leaf prefix and the legacy KT_LEAF domain tag are also absorbed so
+    // that a leaf hash cannot collide with any internal-node hash or any other
+    // CSHAKE256 leaf scheme in the codebase.
+    let core = sha3::CShake256Core::new_with_function_name(b"", KT_LEAF_CSHAKE_CUSTOM);
+    let mut hasher: sha3::CShake256 = CoreWrapper::from_core(core);
+    hasher.update(&[0x00]); // RFC 6962 leaf prefix
     hasher.update(domain::KT_LEAF);
     hasher.update(user_id.as_bytes());
     hasher.update(operation.as_bytes());
     hasher.update(credential_hash);
-    hasher.update(timestamp.to_le_bytes());
-    let result = hasher.finalize();
+    hasher.update(&timestamp.to_le_bytes());
+    let mut reader = hasher.finalize_xof();
     let mut hash = [0u8; 64];
-    hash.copy_from_slice(&result);
+    reader.read(&mut hash);
     hash
 }
 
