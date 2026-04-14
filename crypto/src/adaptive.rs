@@ -473,10 +473,31 @@ fn encrypt_high(key: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>,
 
     // Layer 1 (inner): AES-256-GCM
     let layer1 = encrypt_aes256gcm(&k1, plaintext, aad)?;
-    // Layer 2 (middle): ChaCha20-Poly1305
-    let layer2 = encrypt_chacha20(&k2, &layer1, aad)?;
-    // Layer 3 (outer): AEGIS-256
-    let layer3 = encrypt_aegis256(&k3, &layer2, aad)?;
+    // A12: Layer 2 (middle) default is ChaCha20-Poly1305. Under FIPS mode,
+    // ChaCha20 is not an approved primitive, so we substitute AES-256-GCM
+    // with a domain-separated AAD so that the inner and middle layers still
+    // cover distinct AEAD contexts. Both sides of the wire MUST be in the
+    // same FIPS state for ciphertexts to be decryptable; mixed-mode clusters
+    // are a deployment-time configuration error.
+    let layer2 = if common::fips::is_fips_mode() {
+        let mut fips_aad = Vec::with_capacity(aad.len() + 32);
+        fips_aad.extend_from_slice(b"MILNET-ADAPTIVE-FIPS-L2-AESGCM-v1|");
+        fips_aad.extend_from_slice(aad);
+        encrypt_aes256gcm(&k2, &layer1, &fips_aad)?
+    } else {
+        encrypt_chacha20(&k2, &layer1, aad)?
+    };
+    // Layer 3 (outer): AEGIS-256 in non-FIPS mode. AEGIS-256 is NOT an
+    // approved FIPS 140-3 primitive either, so under FIPS we wrap with a
+    // second AES-256-GCM layer using another distinct AAD.
+    let layer3 = if common::fips::is_fips_mode() {
+        let mut fips_aad = Vec::with_capacity(aad.len() + 32);
+        fips_aad.extend_from_slice(b"MILNET-ADAPTIVE-FIPS-L3-AESGCM-v1|");
+        fips_aad.extend_from_slice(aad);
+        encrypt_aes256gcm(&k3, &layer2, &fips_aad)?
+    } else {
+        encrypt_aegis256(&k3, &layer2, aad)?
+    };
 
     Ok(layer3)
 }
@@ -484,11 +505,24 @@ fn encrypt_high(key: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>,
 fn decrypt_high(key: &[u8; 32], payload: &[u8], aad: &[u8]) -> Result<Vec<u8>, String> {
     let (k1, k2, k3) = derive_layer_keys(key)?;
 
-    // Peel outer: AEGIS-256
-    let layer2 = decrypt_aegis256(&k3, payload, aad)?;
-    // Peel middle: ChaCha20-Poly1305
-    let layer1 = decrypt_chacha20(&k2, &layer2, aad)?;
-    // Peel inner: AES-256-GCM
+    // A12: peel order mirrors encrypt_high. Under FIPS both outer layers
+    // are AES-256-GCM with domain-separated AADs.
+    let layer2 = if common::fips::is_fips_mode() {
+        let mut fips_aad = Vec::with_capacity(aad.len() + 32);
+        fips_aad.extend_from_slice(b"MILNET-ADAPTIVE-FIPS-L3-AESGCM-v1|");
+        fips_aad.extend_from_slice(aad);
+        decrypt_aes256gcm(&k3, payload, &fips_aad)?
+    } else {
+        decrypt_aegis256(&k3, payload, aad)?
+    };
+    let layer1 = if common::fips::is_fips_mode() {
+        let mut fips_aad = Vec::with_capacity(aad.len() + 32);
+        fips_aad.extend_from_slice(b"MILNET-ADAPTIVE-FIPS-L2-AESGCM-v1|");
+        fips_aad.extend_from_slice(aad);
+        decrypt_aes256gcm(&k2, &layer2, &fips_aad)?
+    } else {
+        decrypt_chacha20(&k2, &layer2, aad)?
+    };
     decrypt_aes256gcm(&k1, &layer1, aad)
 }
 

@@ -750,13 +750,27 @@ impl PgAdvisoryLockManager {
 
     /// Derive a stable `i64` advisory lock key from a lock name.
     ///
-    /// Uses BLAKE3 hash truncated to 8 bytes, ensuring consistent key
-    /// derivation across all instances.
+    /// Default path uses BLAKE3 truncated to 8 bytes. Under FIPS mode
+    /// (A12: BLAKE3 is not a FIPS 140-3 approved primitive) we switch to
+    /// SHA-512 truncated to 8 bytes. The two functions are not compatible:
+    /// a cluster MUST NOT mix FIPS and non-FIPS nodes, or peers will
+    /// compute different advisory lock keys for the same lock name and
+    /// fail to mutually exclude. FIPS mode is a cluster-wide configuration,
+    /// so this invariant is enforced at deployment time.
     fn lock_key(name: &str) -> i64 {
-        let hash = blake3::hash(name.as_bytes());
-        let bytes: [u8; 8] = hash.as_bytes()[..8]
-            .try_into()
-            .unwrap_or([0u8; 8]);
+        let bytes: [u8; 8] = if crate::fips::is_fips_mode() {
+            use sha2::{Digest, Sha512};
+            let mut h = Sha512::new();
+            h.update(b"MILNET-LOCK-KEY-SHA512-FIPS-v1");
+            h.update(name.as_bytes());
+            let digest = h.finalize();
+            let mut out = [0u8; 8];
+            out.copy_from_slice(&digest[..8]);
+            out
+        } else {
+            let hash = blake3::hash(name.as_bytes());
+            hash.as_bytes()[..8].try_into().unwrap_or([0u8; 8])
+        };
         // Mask the sign bit to keep the key positive for readability in
         // pg_locks, but this is not a security requirement.
         i64::from_le_bytes(bytes) & i64::MAX
