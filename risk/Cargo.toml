@@ -22,6 +22,7 @@ hmac.workspace = true
 sha2.workspace = true
 aes-gcm.workspace = true
 ml-dsa.workspace = true
+maxminddb = "0.26"
 
 [features]
 default = ["production"]

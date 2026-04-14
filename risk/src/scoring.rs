@@ -663,6 +663,31 @@ impl RiskEngine {
         }
     }
 
+    /// F2: Compute risk score with server-side ASN verification.
+    ///
+    /// `source_ip` is the observed client IP (never trusted from the
+    /// request body). If the client-declared `network_id` disagrees with
+    /// the server-derived ASN, the score is clamped to 1.0 (critical).
+    pub fn compute_score_with_ip(
+        &self,
+        user_id: &Uuid,
+        signals: &RiskSignals,
+        source_ip: Option<std::net::IpAddr>,
+    ) -> f64 {
+        if let Err(reason) =
+            crate::asn_resolver::verify_network_id(source_ip, signals.network_id.as_deref())
+        {
+            tracing::error!(
+                target: "siem",
+                user_id = %user_id,
+                reason = %reason,
+                "SIEM:CRITICAL F2 network_id verification failed — forcing critical risk score"
+            );
+            return 1.0;
+        }
+        self.compute_score(user_id, signals)
+    }
+
     /// Compute risk score from signals. Returns 0.0-1.0.
     pub fn compute_score(&self, user_id: &Uuid, signals: &RiskSignals) -> f64 {
         let signals = self.validate_signals(signals);
