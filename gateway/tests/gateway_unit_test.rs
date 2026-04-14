@@ -176,6 +176,7 @@ fn test_wire_auth_request_serialization() {
         username: "alice".into(),
         password: vec![0x01, 0x02, 0x03],
         audience: Some("my-service".to_string()),
+        device_attestation_age_secs: None,
     };
     let bytes = postcard::to_allocvec(&req).unwrap();
     let decoded: AuthRequest = postcard::from_bytes(&bytes).unwrap();
@@ -190,6 +191,7 @@ fn test_wire_auth_request_no_audience() {
         username: "bob".into(),
         password: vec![],
         audience: None,
+        device_attestation_age_secs: None,
     };
     let bytes = postcard::to_allocvec(&req).unwrap();
     let decoded: AuthRequest = postcard::from_bytes(&bytes).unwrap();

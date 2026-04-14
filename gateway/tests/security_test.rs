@@ -483,6 +483,7 @@ fn auth_request_debug_redacts_password() {
         username: "alice".into(),
         password: vec![0x42; 32],
         audience: None,
+        device_attestation_age_secs: None,
     };
     let debug_str = format!("{:?}", req);
     assert!(
