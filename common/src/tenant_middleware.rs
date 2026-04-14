@@ -33,15 +33,40 @@ pub const TENANT_ID_CLAIM: &str = "tenant_id";
 /// Extract tenant_id from a JWT payload (simple JSON parsing without
 /// pulling in a full JWT library — the JWT signature is already verified
 /// by the upstream auth middleware).
+///
+/// F7: requires the JWT to carry `aud = "tenant:<tenant_id>"` and compares
+/// the audience constant-time against the derived expected audience. Any
+/// mismatch returns `None` so the caller rejects the request.
 pub fn extract_tenant_from_jwt_payload(payload_json: &str) -> Option<Uuid> {
-    // Minimal extraction: look for "tenant_id":"<uuid>" in the claims JSON.
-    let parsed: Result<serde_json::Value, _> = serde_json::from_str(payload_json);
-    match parsed {
-        Ok(val) => val
-            .get(TENANT_ID_CLAIM)
-            .and_then(|v| v.as_str())
-            .and_then(|s| Uuid::parse_str(s).ok()),
-        Err(_) => None,
+    use subtle::ConstantTimeEq;
+    let val: serde_json::Value = serde_json::from_str(payload_json).ok()?;
+    let tenant_id: Uuid = val
+        .get(TENANT_ID_CLAIM)
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok())?;
+
+    // The token MUST carry an `aud` claim bound to this tenant.
+    let aud = val.get("aud")?;
+    let aud_str: String = match aud {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .find(|s| s.starts_with("tenant:"))?
+            .to_string(),
+        _ => return None,
+    };
+    let expected = format!("tenant:{}", tenant_id);
+    if aud_str.as_bytes().ct_eq(expected.as_bytes()).unwrap_u8() == 1 {
+        Some(tenant_id)
+    } else {
+        tracing::warn!(
+            target: "siem",
+            %tenant_id,
+            claim_aud = %aud_str,
+            "SIEM:CRITICAL F7 JWT tenant_id/aud mismatch — rejecting"
+        );
+        None
     }
 }
 
@@ -401,12 +426,24 @@ mod tests {
 
     #[test]
     fn extract_tenant_from_jwt_payload_valid() {
-        let payload = r#"{"sub":"user123","tenant_id":"550e8400-e29b-41d4-a716-446655440000","iat":1700000000}"#;
+        let payload = r#"{"sub":"user123","tenant_id":"550e8400-e29b-41d4-a716-446655440000","aud":"tenant:550e8400-e29b-41d4-a716-446655440000","iat":1700000000}"#;
         let result = extract_tenant_from_jwt_payload(payload);
         assert_eq!(
             result,
             Some(Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap())
         );
+    }
+
+    #[test]
+    fn f7_jwt_without_aud_rejected() {
+        let payload = r#"{"tenant_id":"550e8400-e29b-41d4-a716-446655440000"}"#;
+        assert!(extract_tenant_from_jwt_payload(payload).is_none());
+    }
+
+    #[test]
+    fn f7_jwt_wrong_aud_rejected() {
+        let payload = r#"{"tenant_id":"550e8400-e29b-41d4-a716-446655440000","aud":"tenant:00000000-0000-0000-0000-000000000000"}"#;
+        assert!(extract_tenant_from_jwt_payload(payload).is_none());
     }
 
     #[test]
