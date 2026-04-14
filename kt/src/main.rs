@@ -104,6 +104,7 @@ fn seal_seed(seed: &[u8; 32]) -> Vec<u8> {
 }
 
 /// Decrypt a sealed seed back to a 32-byte seed.
+#[allow(dead_code)]
 fn unseal_seed(sealed: &[u8]) -> Result<[u8; 32], String> {
     if sealed.len() < 12 + 16 + 32 {
         return Err("sealed data too short".into());
@@ -142,6 +143,7 @@ fn unseal_seed(sealed: &[u8]) -> Result<[u8; 32], String> {
 /// renamed over the destination. Two prior generations (`<path>.gen-1` and
 /// `<path>.gen-2`) are kept on disk for disaster recovery. Parent directory
 /// is fsynced after the rename so the directory entry is durable.
+#[allow(dead_code)]
 fn persist_seed(path: &Path, seed: &[u8; 32]) {
     use std::io::Write;
     let sealed = seal_seed(seed);
@@ -203,6 +205,10 @@ fn persist_seed(path: &Path, seed: &[u8; 32]) {
 
 /// Load an existing sealed seed from disk, or generate a fresh one and persist it.
 /// Also writes/overwrites the encoded verifying key so external parties can verify.
+///
+/// D16: superseded by [`load_kt_signing_epoch`]; retained for migration/test
+/// reproducibility of legacy on-disk seeds.
+#[allow(dead_code)]
 fn load_or_generate_keypair(
     seed_path: &Path,
     vk_path: &Path,
@@ -397,11 +403,132 @@ struct PersistedSth {
     #[serde(with = "byte_array_64")]
     root: [u8; 64],
     timestamp: i64,
-    /// ML-DSA-87 signature over (tree_size || root || timestamp || prev_sth_hash)
+    /// ML-DSA-87 signature over
+    /// (epoch_id || tree_size || root || timestamp || prev_sth_hash), all
+    /// encoded big-endian. The epoch id binds the signature to the current
+    /// KT signing epoch so a signature captured under one epoch cannot be
+    /// replayed against STHs from a later epoch (D16).
     signature: Vec<u8>,
     /// Hash of the previous STH for RFC 6962-style consistency chaining.
     #[serde(with = "byte_array_64")]
     prev_sth_hash: [u8; 64],
+    /// KT signing epoch id under which this STH was signed. Default 0 for
+    /// legacy records produced before D16 rolled out.
+    #[serde(default)]
+    epoch_id: u64,
+}
+
+/// D16: KT signing epoch metadata. A fresh ML-DSA-87 signing key is loaded
+/// once per 24h window from the sealed secret store under the name
+/// `kt-epoch-<id>`. The epoch id is `floor(unix_secs / 86400)`. Absence of a
+/// sealed key for the current epoch is fatal — the service refuses to start
+/// rather than signing with a stale key. On rollover the STH task reloads the
+/// next epoch's key atomically.
+struct KtSigningEpoch {
+    epoch_id: u64,
+    start_ts: u64,
+    end_ts: u64,
+    signing_key_ref: String,
+    signing_key: crypto::pq_sign::PqSigningKey,
+    verifying_key: crypto::pq_sign::PqVerifyingKey,
+    verifying_key_hash: [u8; 64],
+}
+
+const KT_EPOCH_DURATION_SECS: u64 = 86_400; // 24h
+
+fn compute_current_epoch_id() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() / KT_EPOCH_DURATION_SECS)
+        .unwrap_or(0)
+}
+
+/// Load the KT signing epoch for `epoch_id` from the sealed secret store.
+///
+/// The sealed secret is expected to be a 32-byte ML-DSA-87 seed. Absence is
+/// fatal: the caller MUST refuse to start. Any operator wishing to run KT
+/// must provision `kt-epoch-<id>` via the secret loader (UDS helper,
+/// systemd LoadCredential, or — in dev — the env escape hatch) before the
+/// epoch begins.
+fn load_kt_signing_epoch(epoch_id: u64) -> KtSigningEpoch {
+    use ml_dsa::{KeyGen, MlDsa87};
+    use zeroize::Zeroize;
+
+    let key_name = format!("kt-epoch-{}", epoch_id);
+    let sealed = match common::secret_loader::load_secret(&key_name) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                target: "siem",
+                category = "security",
+                severity = "CRITICAL",
+                action = "kt_epoch_key_missing",
+                epoch_id = epoch_id,
+                key_name = %key_name,
+                error = %e,
+                "FATAL: KT signing epoch key '{}' not present in sealed secret store — \
+                 refusing to start. Provision the sealed seed before the epoch begins.",
+                key_name
+            );
+            std::process::exit(197);
+        }
+    };
+
+    // Accept either a raw 32-byte seed or hex-encoded 64-char seed.
+    let mut seed = [0u8; 32];
+    if sealed.len() == 32 {
+        seed.copy_from_slice(&sealed[..]);
+    } else if sealed.len() == 64 {
+        // Hex path (common for env-sourced secrets in dev).
+        match hex::decode(&sealed[..]) {
+            Ok(b) if b.len() == 32 => seed.copy_from_slice(&b),
+            _ => {
+                tracing::error!(
+                    target: "siem",
+                    severity = "CRITICAL",
+                    epoch_id = epoch_id,
+                    "FATAL: KT signing epoch key '{}' has unexpected size {}; expected 32 raw \
+                     or 64 hex chars",
+                    key_name, sealed.len()
+                );
+                std::process::exit(197);
+            }
+        }
+    } else {
+        tracing::error!(
+            target: "siem",
+            severity = "CRITICAL",
+            epoch_id = epoch_id,
+            "FATAL: KT signing epoch key '{}' has unexpected size {}",
+            key_name, sealed.len()
+        );
+        std::process::exit(197);
+    }
+
+    let kp = MlDsa87::from_seed(&seed.into());
+    seed.zeroize();
+    let signing_key = kp.signing_key().clone();
+    let verifying_key = kp.verifying_key().clone();
+
+    // Hash the encoded verifying key for audit/export.
+    let encoded_vk = verifying_key.encode();
+    let mut h = sha2::Sha512::new();
+    use sha2::Digest as _;
+    h.update(AsRef::<[u8]>::as_ref(&encoded_vk));
+    let vk_hash: [u8; 64] = h.finalize().into();
+
+    let start_ts = epoch_id.saturating_mul(KT_EPOCH_DURATION_SECS);
+    let end_ts = start_ts.saturating_add(KT_EPOCH_DURATION_SECS);
+
+    KtSigningEpoch {
+        epoch_id,
+        start_ts,
+        end_ts,
+        signing_key_ref: key_name,
+        signing_key,
+        verifying_key,
+        verifying_key_hash: vk_hash,
+    }
 }
 
 fn append_sth_record(path: &Path, sth: &PersistedSth) -> std::io::Result<()> {
@@ -433,7 +560,8 @@ fn append_sth_record(path: &Path, sth: &PersistedSth) -> std::io::Result<()> {
 fn hash_sth(sth: &PersistedSth) -> [u8; 64] {
     use sha2::{Digest, Sha512};
     let mut h = Sha512::new();
-    h.update(b"MILNET-KT-STH-v1");
+    h.update(b"MILNET-KT-STH-v2");
+    h.update(sth.epoch_id.to_be_bytes());
     h.update(sth.tree_size.to_be_bytes());
     h.update(sth.root);
     h.update(sth.timestamp.to_be_bytes());
@@ -669,12 +797,47 @@ async fn main() {
     );
     ensure_dir(&data_dir);
 
-    // ── Load or generate ML-DSA-87 signing keypair (persisted, sealed) ──
-    let signing_seed_path = data_dir.join("signing_seed.bin");
+    // ── D16: Epoch-based ML-DSA-87 signing key (24h rollover) ────────────
+    //
+    // A fresh signing seed is provisioned per 24h epoch under the sealed
+    // secret name `kt-epoch-<id>`. We load the current epoch's key at
+    // startup; the periodic STH task checks for rollover on every tick and
+    // reloads atomically. The legacy `load_or_generate_keypair` path is
+    // retained only to preserve the encoded verifying key on-disk for
+    // external verifiers during migration.
     let verifying_key_path = data_dir.join("verifying_key.bin");
-    let (pq_signing_key, _pq_verifying_key) =
-        load_or_generate_keypair(&signing_seed_path, &verifying_key_path);
-    tracing::info!("ML-DSA-87 signing keypair loaded/generated for tree head signatures");
+    let current_epoch_id = compute_current_epoch_id();
+    let initial_signing_epoch = load_kt_signing_epoch(current_epoch_id);
+    tracing::info!(
+        epoch_id = initial_signing_epoch.epoch_id,
+        key_ref = %initial_signing_epoch.signing_key_ref,
+        vk_hash_prefix = %hex::encode(&initial_signing_epoch.verifying_key_hash[..8]),
+        "D16: loaded KT signing epoch from sealed secret store"
+    );
+    let encoded_vk = initial_signing_epoch.verifying_key.encode();
+    if let Err(e) = std::fs::write(
+        &verifying_key_path,
+        AsRef::<[u8]>::as_ref(&encoded_vk),
+    ) {
+        tracing::warn!(
+            "Failed to export KT epoch verifying key to {:?}: {}",
+            verifying_key_path, e
+        );
+    }
+    let current_epoch: Arc<tokio::sync::Mutex<KtSigningEpoch>> =
+        Arc::new(tokio::sync::Mutex::new(initial_signing_epoch));
+
+    // ── D5: 2-of-5 consensus signing setup ────────────────────────────
+    kt::consensus::require_pinned_vks_or_panic();
+    let kt_consensus_keys: Arc<Vec<Option<crypto::pq_sign::PqSigningKey>>> =
+        Arc::new(kt::consensus::synthesize_signing_keys());
+    let kt_pinned_vks: Arc<Vec<crypto::pq_sign::PqVerifyingKey>> =
+        Arc::new(kt::consensus::load_pinned_vks());
+    tracing::info!(
+        "KT 2-of-5 consensus initialized: {} local signing slots, {} pinned VKs",
+        kt_consensus_keys.iter().filter(|k| k.is_some()).count(),
+        kt_pinned_vks.len()
+    );
 
     // ── Load Merkle tree checkpoint if it exists ─────────────────────────
     let tree_checkpoint_path = data_dir.join("merkle_tree.bin");
@@ -731,43 +894,84 @@ async fn main() {
 
     // Spawn periodic signed tree head + tree persistence task (every 60 seconds)
     let tree_clone = tree.clone();
-    let pq_key_clone = pq_signing_key.clone();
     let checkpoint_path = tree_checkpoint_path.clone();
     let sth_path = sth_log_path.clone();
     let last_sth_hash_task = last_sth_hash.clone();
+    let current_epoch_task = current_epoch.clone();
+    let verifying_key_path_task = verifying_key_path.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             interval.tick().await;
+
+            // D16: epoch rollover check — atomically swap in the next epoch's
+            // sealed signing key whenever wall-clock crosses a 24h boundary.
+            let now_epoch = compute_current_epoch_id();
+            {
+                let mut ep = current_epoch_task.lock().await;
+                if now_epoch != ep.epoch_id {
+                    let prev_id = ep.epoch_id;
+                    let next = load_kt_signing_epoch(now_epoch);
+                    tracing::info!(
+                        prev_epoch = prev_id,
+                        new_epoch = next.epoch_id,
+                        key_ref = %next.signing_key_ref,
+                        vk_hash_prefix = %hex::encode(&next.verifying_key_hash[..8]),
+                        "D16: KT signing epoch rollover — atomically transitioning"
+                    );
+                    let encoded = next.verifying_key.encode();
+                    if let Err(e) = std::fs::write(
+                        &verifying_key_path_task,
+                        AsRef::<[u8]>::as_ref(&encoded),
+                    ) {
+                        tracing::warn!(
+                            "KT epoch rollover: failed to export verifying key: {}",
+                            e
+                        );
+                    }
+                    *ep = next;
+                }
+            }
+
             let t = tree_clone.read().await;
             if t.len() > 0 {
-                let sth = t.signed_tree_head(&pq_key_clone);
+                let ep = current_epoch_task.lock().await;
+                let pq_key = &ep.signing_key;
+                let epoch_id = ep.epoch_id;
+                let sth = t.signed_tree_head(pq_key);
                 tracing::info!(
-                    "Signed tree head: {} leaves, root={}",
+                    "Signed tree head (epoch {}): {} leaves, root={}",
+                    epoch_id,
                     sth.tree_size,
                     hex::encode(&sth.root[..8])
                 );
                 // Persist Merkle tree checkpoint with HMAC-SHA512 integrity
                 persist_tree(&t, &checkpoint_path);
 
-                // D12: build, sign, persist, and chain a PersistedSth.
+                // D12/D16: build, sign, persist, and chain a PersistedSth.
+                // Signed payload:
+                //   epoch_id || tree_size || root || timestamp || prev_sth_hash
+                // All fixed-width integers big-endian.
                 let timestamp = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_micros() as i64;
                 let mut prev_hash_lock = last_sth_hash_task.lock().await;
-                let mut to_sign = Vec::with_capacity(8 + 64 + 8 + 64);
+                let mut to_sign = Vec::with_capacity(8 + 8 + 64 + 8 + 64);
+                to_sign.extend_from_slice(&epoch_id.to_be_bytes());
                 to_sign.extend_from_slice(&sth.tree_size.to_be_bytes());
                 to_sign.extend_from_slice(&sth.root);
                 to_sign.extend_from_slice(&timestamp.to_be_bytes());
                 to_sign.extend_from_slice(&*prev_hash_lock);
-                let signature = crypto::pq_sign::pq_sign_raw(&pq_key_clone, &to_sign);
+                let signature = crypto::pq_sign::pq_sign_raw(pq_key, &to_sign);
+                drop(ep);
                 let persisted = PersistedSth {
                     tree_size: sth.tree_size as u64,
                     root: sth.root,
                     timestamp,
                     signature,
                     prev_sth_hash: *prev_hash_lock,
+                    epoch_id,
                 };
                 if let Err(e) = append_sth_record(&sth_path, &persisted) {
                     tracing::error!("KT STH log append failed: {}", e);
@@ -810,6 +1014,8 @@ async fn main() {
         if let Ok(mut transport) = listener.accept().await {
             let tree = tree.clone();
             let leaf_log_path = leaf_log_path.clone();
+            let kt_consensus_keys = kt_consensus_keys.clone();
+            let kt_pinned_vks = kt_pinned_vks.clone();
             tokio::spawn(async move {
                 while let Ok((sender, payload)) = transport.recv().await {
                     // SECURITY (D3): authoritative caller identity is the mTLS
@@ -841,6 +1047,39 @@ async fn main() {
                                         continue;
                                     }
                                 };
+                                // D5: 2-of-5 consensus check. The leader (this
+                                // process) signs the canonical leaf with every
+                                // local slot key it holds. In single-process
+                                // mode that is all 5 keys; in standalone mode
+                                // the peer signatures must be collected first
+                                // (see kt::consensus). The threshold check
+                                // verifies at least 2 distinct pinned VKs.
+                                let leaf_bytes = kt::consensus::canonical_leaf_bytes(
+                                    &user_id,
+                                    op.as_str(),
+                                    &credential_hash,
+                                    timestamp,
+                                );
+                                let signatures = kt::consensus::sign_leaf_with_local_slots(
+                                    &leaf_bytes,
+                                    &kt_consensus_keys,
+                                );
+                                if !kt::consensus::verify_threshold(
+                                    &leaf_bytes,
+                                    &signatures,
+                                    &kt_pinned_vks,
+                                ) {
+                                    tracing::error!(
+                                        "SIEM:CRITICAL KT consensus failed: only {} valid signatures, threshold is {}",
+                                        signatures.len(),
+                                        kt::consensus::KT_THRESHOLD
+                                    );
+                                    common::siem::SecurityEvent::tamper_detected(
+                                        "KT 2-of-5 consensus failed -- refusing to append leaf",
+                                    );
+                                    continue;
+                                }
+
                                 // D11: persist leaf BEFORE mutating the tree so
                                 // a crash after append is fully recoverable.
                                 let mut t = tree.write().await;
