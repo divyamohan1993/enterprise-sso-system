@@ -868,7 +868,7 @@ async fn forward_to_orchestrator(
         tier: 0,                  // Orchestrator decides tier
         audience: auth_req.audience.clone(),
         ceremony_id: [0u8; 32],   // Assigned by orchestrator during ceremony
-        device_attestation_age_secs: None,
+        device_attestation_age_secs: auth_req.device_attestation_age_secs,
         geo_velocity_kmh: None,
         is_unusual_network: None,
         is_unusual_time: None,

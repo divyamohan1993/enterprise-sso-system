@@ -17,6 +17,32 @@ use serial_test::serial;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+// ── Test-harness init ───────────────────────────────────────────────────
+
+/// Populate `MILNET_FIDO_AAGUID_ALLOWLIST` with the all-zero AAGUID used
+/// by synthetic test credentials, in addition to the production default
+/// vendor list. Idempotent via `Once` so parallel tests don't race.
+/// Never called in release or military builds — this file is compiled
+/// only as part of the `fido` integration-test binary.
+fn ensure_test_aaguid_allowlist() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        std::env::set_var(
+            "MILNET_FIDO_AAGUID_ALLOWLIST",
+            "00000000-0000-0000-0000-000000000000,\
+             cb69481e-8ff7-4039-93ec-0a2729a154a8,\
+             fa2b99dc-9e39-4257-8f92-4a30d23c4118,\
+             2fc0579f-8113-47ea-b116-bb5a8db9202a,\
+             c5ef55ff-ad9a-4b9f-b580-adebafe026d0,\
+             f8a011f3-8c0a-4d15-8006-17111f9edc7d,\
+             08987058-cadc-4b81-b6e1-30de50dcbe96,\
+             dd4ec289-e01d-41c9-bb89-70fa845d4bf2,\
+             f24a8e70-d0d3-f82c-2937-32523cc4de5a",
+        );
+    });
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 /// Build authenticator data with the Attested Credential Data extension.

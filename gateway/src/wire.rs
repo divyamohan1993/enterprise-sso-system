@@ -36,6 +36,12 @@ pub struct AuthRequest {
     /// Target audience for the token (e.g. a resource server identifier).
     #[serde(default)]
     pub audience: Option<String>,
+    /// F3: client-declared TPM re-attestation age in seconds. Absent = no
+    /// fresh attestation signal; the orchestrator fail-closes on >7d stale.
+    /// Legitimate clients populate this from their local TPM attestation
+    /// timestamp. Field is threaded through gateway → orchestrator.
+    #[serde(default)]
+    pub device_attestation_age_secs: Option<f64>,
 }
 
 /// SECURITY: Redact password from Debug output and zeroize on drop.

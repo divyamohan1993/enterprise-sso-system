@@ -28,3 +28,7 @@ serial_test.workspace = true
 [features]
 default = ["production"]
 production = ["common/production"]
+# Permissive allow-list entries for synthetic test credentials (zero AAGUID,
+# etc). Enabled only when integration tests set MILNET_FIDO_AAGUID_ALLOWLIST
+# at startup — see fido/tests/ harness init. Never enabled in release.
+test-support = []

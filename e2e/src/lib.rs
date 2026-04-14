@@ -136,6 +136,10 @@ pub async fn client_auth(
         username: username.to_string(),
         password: password.to_vec(),
         audience: Some("test-service".to_string()),
+        // F3: test client declares a fresh TPM attestation (10 seconds old).
+        // Real clients populate this from their local TPM attestation
+        // timestamp; the orchestrator fail-closes on anything >7d.
+        device_attestation_age_secs: Some(10.0),
     };
     let auth_plain = postcard::to_allocvec(&auth_req).expect("serialize auth request");
     let cipher = Aes256Gcm::new_from_slice(&enc_key).expect("AES key init");
@@ -217,6 +221,10 @@ pub async fn client_auth_with_dpop(
         username: username.to_string(),
         password: password.to_vec(),
         audience: Some("test-service".to_string()),
+        // F3: test client declares a fresh TPM attestation (10 seconds old).
+        // Real clients populate this from their local TPM attestation
+        // timestamp; the orchestrator fail-closes on anything >7d.
+        device_attestation_age_secs: Some(10.0),
     };
     let auth_plain = postcard::to_allocvec(&auth_req).expect("serialize auth request");
     let cipher = Aes256Gcm::new_from_slice(&enc_key).expect("AES key init");

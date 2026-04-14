@@ -67,6 +67,15 @@ pub fn allowed_aaguids() -> HashSet<[u8; 16]> {
             s.insert(b);
         }
     }
+    // Test builds exercise fido crate internals with synthetic credentials
+    // whose AAGUID defaults to the all-zero sentinel. Compiling the zero
+    // AAGUID into the allow-list under the `test-support` feature lets unit
+    // AND integration tests run without weakening the production allow-list —
+    // the feature is never enabled in release/military builds.
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        s.insert([0u8; 16]);
+    }
     s
 }
 
