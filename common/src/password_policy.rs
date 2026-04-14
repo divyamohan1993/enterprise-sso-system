@@ -71,8 +71,28 @@ pub fn validate_password(user_id: &str, candidate: &str) -> Result<(), String> {
         return Err("password must include upper, lower, digit, and symbol".into());
     }
     let lower = candidate.to_lowercase();
+    // 1. Exact-match against the embedded list.
     if common_set().contains(lower.as_str()) {
         return Err("password is on the common-password block list".into());
+    }
+    // 2. Strip leading and trailing non-letters and re-check. Catches the
+    //    "common-root + digits/symbols" pattern (e.g. "Password1234!" →
+    //    "password", "Qwerty99$" → "qwerty"). NIST SP 800-63B §5.1.1.2 calls
+    //    out this exact dictionary-derivative class.
+    let trimmed: String = lower
+        .trim_matches(|c: char| !c.is_ascii_lowercase())
+        .chars()
+        .take_while(|c| c.is_ascii_lowercase())
+        .collect();
+    if trimmed.len() >= 4 && common_set().contains(trimmed.as_str()) {
+        return Err("password is a common-root with trivial decoration".into());
+    }
+    // 3. Substring scan: any common password ≥ 4 chars appearing inside the
+    //    candidate. Bounded cost (the embedded list is small).
+    for &cp in COMMON_PASSWORDS {
+        if cp.len() >= 4 && lower.contains(cp) {
+            return Err("password contains a common-password substring".into());
+        }
     }
     let h = sha512(candidate.as_bytes());
     let guard = match store().lock() { Ok(g) => g, Err(p) => p.into_inner() };
