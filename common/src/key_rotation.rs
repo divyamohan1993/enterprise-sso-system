@@ -946,6 +946,7 @@ pub struct RotationCutoverProposal {
     /// SHA-512 hash of the new key material (64 bytes). The full key material
     /// itself never appears in the proposal; only its hash, which the node
     /// independently re-derives from its share to verify.
+    #[serde(with = "crate::types::byte_array_64")]
     pub new_key_hash: [u8; 64],
     /// Absolute Unix-epoch deadline by which the cutover MUST be applied or
     /// the proposal expires. Prevents an indefinitely-stalled rotation from
@@ -1074,6 +1075,7 @@ pub struct CutoverState {
     /// Operations with `op_seq >= cutover_sequence` use the new key.
     pub cutover_sequence: u64,
     /// Hash of the new key material that was committed at `cutover_sequence`.
+    #[serde(with = "crate::types::byte_array_64")]
     pub new_key_hash: [u8; 64],
     /// Unix-epoch when this cutover was committed.
     pub committed_at: u64,

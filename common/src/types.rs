@@ -80,7 +80,7 @@ uuid_newtype!(
 );
 
 /// Serde helper for `[u8; 64]` — serde only supports arrays up to 32 natively.
-mod byte_array_64 {
+pub mod byte_array_64 {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     pub fn serialize<S: Serializer>(data: &[u8; 64], ser: S) -> Result<S::Ok, S::Error> {
