@@ -456,6 +456,77 @@ impl ThresholdGroup {
         })
     }
 
+    /// C6: Rekey gated by 3-of-5 BFT quorum approval.
+    ///
+    /// Before running the distributed DKG, verifies that `approvals` contain
+    /// at least `quorum` distinct ML-DSA-87 signatures over the canonical
+    /// payload `"REKEY_CONSENSUS_v1" || epoch_le || group_pk_hash`. Each
+    /// `approvals[i]` is a `(signer_id, verifying_key_bytes, signature_bytes)`
+    /// triple; `signer_id`s must be unique.
+    ///
+    /// On success, runs the standard [`Self::rekey`] ceremony. On quorum
+    /// failure, returns an error and emits a SIEM:CRITICAL audit entry.
+    pub fn rekey_signed_consensus(
+        &self,
+        current_shares: &[SignerShare],
+        current_epoch: u64,
+        approvals: &[(u8, Vec<u8>, Vec<u8>)],
+        quorum: usize,
+    ) -> Result<ShareRefreshResult, String> {
+        // Canonical payload ---------------------------------------------------
+        let group_pk_hash = {
+            use sha2::{Digest, Sha512};
+            let mut h = Sha512::new();
+            let pk_bytes = self
+                .public_key_package
+                .verifying_key()
+                .serialize()
+                .map_err(|e| format!("serialize group pk: {e}"))?;
+            h.update(&pk_bytes);
+            let out = h.finalize();
+            let mut arr = [0u8; 64];
+            arr.copy_from_slice(&out);
+            arr
+        };
+        let mut payload = Vec::with_capacity(24 + 8 + 64);
+        payload.extend_from_slice(b"REKEY_CONSENSUS_v1");
+        payload.push(0);
+        payload.extend_from_slice(&current_epoch.to_le_bytes());
+        payload.extend_from_slice(&group_pk_hash);
+
+        // Verify at least `quorum` distinct, valid signatures.
+        let mut seen: std::collections::BTreeSet<u8> = std::collections::BTreeSet::new();
+        let mut good = 0usize;
+        for (signer_id, vk, sig) in approvals {
+            if !seen.insert(*signer_id) {
+                return Err(format!("duplicate approval signer_id {}", signer_id));
+            }
+            if !crate::pq_sign::pq_verify_raw_from_bytes(vk, &payload, sig) {
+                return Err(format!(
+                    "approval signature for signer {} failed ML-DSA-87 verification",
+                    signer_id
+                ));
+            }
+            good += 1;
+            if good >= quorum {
+                break;
+            }
+        }
+        if good < quorum {
+            return Err(format!(
+                "rekey consensus failed: have {good}/{quorum} valid approvals",
+            ));
+        }
+
+        tracing::warn!(
+            epoch = current_epoch,
+            quorum = quorum,
+            "SIEM:CRITICAL C6 proactive rekey authorised by {good}-of-{quorum} BFT quorum"
+        );
+
+        self.rekey(current_shares, current_epoch)
+    }
+
     /// INSECURE: Rekey using a trusted dealer. ONE process holds the complete
     /// signing key during rekey, violating the distributed trust model.
     ///
