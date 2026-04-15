@@ -110,6 +110,20 @@ pub fn encrypt_with(
     plaintext: &[u8],
     aad: &[u8],
 ) -> Result<Vec<u8>, String> {
+    // CAT-I: FIPS mode hard-rejects non-approved AEADs at the entry point.
+    // `active_algorithm()` already returns AES-256-GCM when FIPS is on, but
+    // callers can pick an algorithm explicitly via `encrypt_with`. Reject
+    // AEGIS-256 and ChaCha20-Poly1305 before they execute so a mis-wired
+    // caller in military deployment gets a loud error, not silent fallback.
+    if common::fips::is_fips_mode()
+        && !matches!(algo, SymmetricAlgorithm::Aes256Gcm)
+    {
+        return Err(format!(
+            "FIPS mode: AEAD {:?} rejected — only AES-256-GCM is permitted \
+             under FIPS 140-3. This is a CAT-I compliance hard-reject.",
+            algo
+        ));
+    }
     match algo {
         SymmetricAlgorithm::Aegis256 => encrypt_aegis256(key, plaintext, aad),
         SymmetricAlgorithm::Aes256Gcm => encrypt_aes256gcm(key, plaintext, aad),

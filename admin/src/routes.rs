@@ -5487,6 +5487,7 @@ async fn fido_register_complete(
         cloned_flag: false,
         backup_eligible: false,
         backup_state: false,
+        pq_attestation: Vec::new(),
     };
 
     fido_store.store_credential(cred);

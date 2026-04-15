@@ -2,6 +2,7 @@
 //! gateway: Bastion Gateway (DDoS filter, TLS termination).
 
 pub mod banner;
+pub mod device_attestation;
 pub mod distributed_rate_limit;
 pub mod puzzle;
 pub mod server;

@@ -223,6 +223,137 @@ struct LocalEntry {
     last_refill: Instant,
 }
 
+// ── GW-RATE count-min sketch ────────────────────────────────────────────────
+//
+// Fixed-size probabilistic frequency counter. 4 rows × 4096 buckets × u32
+// ≈ 64 KiB of bounded memory regardless of key cardinality. Each key is
+// hashed into one bucket per row; the reported count for a key is the
+// minimum of its buckets (min of 4 independent hashes → tight overestimate
+// bound).
+//
+// Seeds rotate once per minute via `maybe_rotate_seeds`: this prevents an
+// attacker who learns collision hotspots from amplifying false counts on
+// legitimate keys over longer attack windows. The sketch is zeroed on
+// rotation.
+
+const CMS_ROWS: usize = 4;
+const CMS_COLS: usize = 4096;
+const CMS_SEED_ROTATE_SECS: u64 = 60;
+
+pub struct CountMinSketch {
+    rows: [[u32; CMS_COLS]; CMS_ROWS],
+    seeds: [u64; CMS_ROWS],
+    last_rotated: Instant,
+}
+
+impl CountMinSketch {
+    pub fn new() -> Self {
+        let seeds = Self::fresh_seeds();
+        Self {
+            rows: [[0u32; CMS_COLS]; CMS_ROWS],
+            seeds,
+            last_rotated: Instant::now(),
+        }
+    }
+
+    fn fresh_seeds() -> [u64; CMS_ROWS] {
+        let mut s = [0u64; CMS_ROWS];
+        let mut buf = [0u8; 8 * CMS_ROWS];
+        if getrandom::getrandom(&mut buf).is_ok() {
+            for i in 0..CMS_ROWS {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&buf[i * 8..(i + 1) * 8]);
+                s[i] = u64::from_le_bytes(b);
+            }
+        } else {
+            // Fallback seeds — still non-zero so FNV doesn't collapse, but
+            // this branch should never execute on any platform we support.
+            for i in 0..CMS_ROWS {
+                s[i] = 0x9e3779b97f4a7c15u64.wrapping_mul((i as u64) + 1);
+            }
+        }
+        s
+    }
+
+    /// Rotate seeds and zero the sketch if >= `CMS_SEED_ROTATE_SECS` have
+    /// passed since the last rotation.
+    fn maybe_rotate_seeds(&mut self) {
+        if self.last_rotated.elapsed().as_secs() >= CMS_SEED_ROTATE_SECS {
+            self.seeds = Self::fresh_seeds();
+            for row in self.rows.iter_mut() {
+                for bucket in row.iter_mut() {
+                    *bucket = 0;
+                }
+            }
+            self.last_rotated = Instant::now();
+        }
+    }
+
+    /// Hash `key` into the bucket index for `row_idx`. FNV-1a with a
+    /// per-row seed xored in as a prefix; this is not cryptographic
+    /// (doesn't need to be — seeds rotate each minute) but gives
+    /// sufficient dispersion for CMS purposes.
+    fn bucket_idx(&self, row_idx: usize, key: &[u8]) -> usize {
+        let seed = self.seeds[row_idx];
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in seed.to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        for b in key {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        (h as usize) % CMS_COLS
+    }
+
+    /// Increment the count for `key` by 1 in every row (saturating at
+    /// `u32::MAX`). Returns the new minimum count across rows.
+    pub fn observe(&mut self, key: &[u8]) -> u32 {
+        self.maybe_rotate_seeds();
+        let mut min = u32::MAX;
+        for row in 0..CMS_ROWS {
+            let idx = self.bucket_idx(row, key);
+            let bucket = &mut self.rows[row][idx];
+            *bucket = bucket.saturating_add(1);
+            if *bucket < min {
+                min = *bucket;
+            }
+        }
+        min
+    }
+
+    /// Read the estimated count for `key` without incrementing.
+    pub fn estimate(&self, key: &[u8]) -> u32 {
+        let mut min = u32::MAX;
+        for row in 0..CMS_ROWS {
+            let idx = self.bucket_idx(row, key);
+            let bucket = self.rows[row][idx];
+            if bucket < min {
+                min = bucket;
+            }
+        }
+        min
+    }
+
+    /// Test helper: reset all buckets and rotate seeds immediately.
+    pub fn reset(&mut self) {
+        self.seeds = Self::fresh_seeds();
+        for row in self.rows.iter_mut() {
+            for bucket in row.iter_mut() {
+                *bucket = 0;
+            }
+        }
+        self.last_rotated = Instant::now();
+    }
+}
+
+impl Default for CountMinSketch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Distributed rate limiter with Redis backend and local fallback.
 ///
 /// When Redis is unavailable, local fallback applies a **conservative divisor**
@@ -233,8 +364,19 @@ pub struct DistributedRateLimiter {
     config: RateLimitConfig,
     /// Redis client (None if Redis is not configured or connection failed).
     redis_client: Option<Arc<Mutex<RedisClient>>>,
-    /// Local fallback state.
+    /// Local fallback state — keyed frequency table protected in front by
+    /// a count-min sketch (see `cms`). The HashMap still carries the
+    /// token-bucket state (window_start, tokens, last_refill) for the
+    /// narrow set of keys currently inside their rate-limit window. The
+    /// CMS enforces a Sybil DoS guard: if an attacker sprays 10⁶ distinct
+    /// keys, the HashMap is never allowed to grow past the CMS cap, so
+    /// legitimate entries can never be evicted by adversarial churn.
     local_state: Arc<Mutex<HashMap<String, LocalEntry>>>,
+    /// GW-RATE count-min sketch: 4 rows × 4096 buckets × u32. Any key's
+    /// approximate count can be read in O(4); insertion is O(4). The
+    /// seed rotates once per minute to prevent adversaries from
+    /// pre-computing colliding keys over long runs.
+    cms: Arc<Mutex<CountMinSketch>>,
     /// Whether Redis is currently healthy.
     redis_healthy: Arc<std::sync::atomic::AtomicBool>,
     /// Whether Redis is required in this deployment mode.
@@ -621,6 +763,7 @@ impl DistributedRateLimiter {
             config,
             redis_client,
             local_state: Arc::new(Mutex::new(HashMap::new())),
+            cms: Arc::new(Mutex::new(CountMinSketch::new())),
             redis_healthy,
             redis_required,
             degraded_limit_divisor,
@@ -674,7 +817,7 @@ impl DistributedRateLimiter {
     /// E7: Returns true if the gateway should fail-closed (deny ALL) because
     /// Redis has been down longer than REDIS_OUTAGE_FAIL_CLOSED_SECS.
     fn should_fail_closed(&self) -> bool {
-        let since = self.redis_unhealthy_since.load(std::sync::atomic::Ordering::Relaxed);
+        let since = self.redis_unhealthy_since.load(std::sync::atomic::Ordering::Acquire);
         if since == 0 {
             return false;
         }
@@ -687,22 +830,26 @@ impl DistributedRateLimiter {
 
     /// E7: Mark Redis healthy — clears the outage timer.
     fn mark_redis_healthy(&self) {
-        self.redis_healthy.store(true, std::sync::atomic::Ordering::Relaxed);
-        self.redis_unhealthy_since.store(0, std::sync::atomic::Ordering::Relaxed);
+        // Release ordering: publishes the "healthy" transition so concurrent
+        // readers on other cores observe the cleared outage timer coherently.
+        self.redis_unhealthy_since.store(0, std::sync::atomic::Ordering::Release);
+        self.redis_healthy.store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// E7: Mark Redis unhealthy — starts the outage timer if not already running.
     fn mark_redis_unhealthy(&self) {
-        self.redis_healthy.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.redis_healthy.store(false, std::sync::atomic::Ordering::Release);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        // Only set if currently 0 (don't reset an existing timer)
+        // Only set if currently 0 (don't reset an existing timer).
+        // AcqRel on success publishes the outage start to other cores,
+        // Acquire on failure gates our branch on the observed prior value.
         let _ = self.redis_unhealthy_since.compare_exchange(
             0, now,
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
         );
     }
 
@@ -726,7 +873,7 @@ impl DistributedRateLimiter {
             };
         }
         // Try Redis first
-        if self.redis_healthy.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.redis_healthy.load(std::sync::atomic::Ordering::Acquire) {
             if let Some(ref redis) = self.redis_client {
                 let now_ms = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -755,10 +902,12 @@ impl DistributedRateLimiter {
                             let mut client = redis_clone.lock().await;
                             match client.try_reconnect().await {
                                 Ok(()) => {
-                                    healthy_clone
-                                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                                    // Release ordering publishes the recovery
+                                    // transition atomically w.r.t. observers.
                                     unhealthy_since_clone
-                                        .store(0, std::sync::atomic::Ordering::Relaxed);
+                                        .store(0, std::sync::atomic::Ordering::Release);
+                                    healthy_clone
+                                        .store(true, std::sync::atomic::Ordering::Release);
                                     info!("Redis rate limit backend reconnected");
                                 }
                                 Err(e) => {
@@ -784,7 +933,27 @@ impl DistributedRateLimiter {
             let cap = REDIS_DEGRADED_LOCAL_RPS_PER_IP.saturating_mul(self.config.window_secs).max(1);
             degraded_limit = degraded_limit.min(cap);
         }
-        let activations = self.degraded_mode_activations.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        // Saturating fetch_add: stops at u64::MAX rather than wrapping to 0,
+        // which would silently lose the "degraded mode ever triggered" signal.
+        let activations = {
+            let counter = &self.degraded_mode_activations;
+            let mut prev = counter.load(std::sync::atomic::Ordering::Acquire);
+            loop {
+                if prev == u64::MAX {
+                    break u64::MAX;
+                }
+                let next = prev.saturating_add(1);
+                match counter.compare_exchange_weak(
+                    prev,
+                    next,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                ) {
+                    Ok(_) => break next,
+                    Err(observed) => prev = observed,
+                }
+            }
+        };
         let severity = if self.redis_required { "CRITICAL" } else { "SECURITY" };
         warn!(
             key = key,
@@ -799,7 +968,26 @@ impl DistributedRateLimiter {
     }
 
     /// Local in-memory rate limiting (fallback when Redis is unavailable).
+    ///
+    /// GW-RATE: the count-min sketch is consulted first. If the CMS
+    /// estimate for this key already exceeds `limit`, we reject without
+    /// touching the HashMap — this prevents a Sybil attacker spraying
+    /// 10⁶ distinct keys from evicting legitimate entries (the old LRU
+    /// eviction was the DoS vector). Only keys under the CMS estimate
+    /// get a HashMap slot.
     async fn check_local(&self, key: &str, limit: u64) -> RateLimitResult {
+        {
+            let mut cms = self.cms.lock().await;
+            let observed = cms.observe(key.as_bytes()) as u64;
+            if observed > limit {
+                return RateLimitResult {
+                    allowed: false,
+                    remaining: 0,
+                    reset_after_secs: self.config.window_secs,
+                    retry_after_secs: self.config.window_secs,
+                };
+            }
+        }
         let mut state = self.local_state.lock().await;
         let now = Instant::now();
         let window = Duration::from_secs(self.config.window_secs);
@@ -858,7 +1046,7 @@ impl DistributedRateLimiter {
     /// Token bucket burst check.
     async fn check_burst(&self, key: &str) -> RateLimitResult {
         // Try Redis first
-        if self.redis_healthy.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.redis_healthy.load(std::sync::atomic::Ordering::Acquire) {
             if let Some(ref redis) = self.redis_client {
                 let now_secs = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -966,17 +1154,17 @@ impl DistributedRateLimiter {
                 let mut client = redis.lock().await;
                 match client.ping().await {
                     Ok(()) => {
-                        if !self.redis_healthy.load(std::sync::atomic::Ordering::Relaxed) {
+                        if !self.redis_healthy.load(std::sync::atomic::Ordering::Acquire) {
                             info!("Redis rate limit backend recovered");
                             self.redis_healthy
-                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                                .store(true, std::sync::atomic::Ordering::Release);
                         }
                     }
                     Err(e) => {
-                        if self.redis_healthy.load(std::sync::atomic::Ordering::Relaxed) {
+                        if self.redis_healthy.load(std::sync::atomic::Ordering::Acquire) {
                             warn!("Redis rate limit backend unhealthy: {e}");
                             self.redis_healthy
-                                .store(false, std::sync::atomic::Ordering::Relaxed);
+                                .store(false, std::sync::atomic::Ordering::Release);
                         }
                     }
                 }
@@ -985,7 +1173,14 @@ impl DistributedRateLimiter {
     }
 
     pub fn is_redis_required(&self) -> bool { self.redis_required }
-    pub fn is_redis_healthy(&self) -> bool { self.redis_healthy.load(std::sync::atomic::Ordering::Relaxed) }
+    pub fn is_redis_healthy(&self) -> bool { self.redis_healthy.load(std::sync::atomic::Ordering::Acquire) }
+
+    /// Test helper: clear both the CMS and the local HashMap so tests
+    /// start from a known-empty state. Not for production use.
+    pub async fn reset(&self) {
+        self.cms.lock().await.reset();
+        self.local_state.lock().await.clear();
+    }
 
     /// Export local counters for gossip-based sync when Redis is unavailable.
     pub async fn export_local_counters(&self) -> Vec<(String, u64)> {

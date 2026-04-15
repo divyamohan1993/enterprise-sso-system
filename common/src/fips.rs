@@ -46,6 +46,13 @@ fn is_military_deployment() -> bool {
 /// Hot-path reads use Relaxed ordering — the bool is set once at startup
 /// (or by an authorised admin operation) and the worst-case outcome of a
 /// stale read is an extra FIPS check, not a security bypass.
+//
+// CAT-I verified: FIPS default flips to true in military mode. Statics
+// cannot read env at init time, so the flip happens in
+// `load_fips_activation_key()` below (see the
+// `is_military_deployment()` branch that calls
+// `FIPS_MODE.store(true, Ordering::Relaxed)`). Every service main() must
+// call `load_fips_activation_key()` before constructing any cipher.
 static FIPS_MODE: AtomicBool = AtomicBool::new(false);
 
 /// Cryptographic activation key for FIPS mode.

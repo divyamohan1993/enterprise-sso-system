@@ -369,6 +369,10 @@ pub fn threshold_sign(
 }
 
 /// Verify a combined group signature against the group's verifying key.
+///
+/// INTERNAL USE ONLY. External consumers MUST use
+/// [`verify_threshold_signature_pq_wrapped`]; bare FROST signatures are
+/// classical Ristretto255 and do not meet CNSA 2.0 Level 5 (CAT-A task 5).
 pub fn verify_group_signature(
     group: &ThresholdGroup,
     message: &[u8],
@@ -383,6 +387,91 @@ pub fn verify_group_signature(
         .verifying_key()
         .verify(message, &sig)
         .is_ok()
+}
+
+// ---------------------------------------------------------------------------
+// CAT-A task 5: PQ-wrapped threshold signatures (mandatory at external seams)
+// ---------------------------------------------------------------------------
+
+mod threshold_state {
+    pub trait Sealed {}
+    pub struct Raw;
+    pub struct PqWrapped;
+    impl Sealed for Raw {}
+    impl Sealed for PqWrapped {}
+}
+
+pub use threshold_state::{PqWrapped, Raw};
+
+/// Sealed marker trait for [`ThresholdSignature`] states.
+pub trait ThresholdSignatureState: threshold_state::Sealed {}
+impl ThresholdSignatureState for Raw {}
+impl ThresholdSignatureState for PqWrapped {}
+
+/// Typestate-wrapped threshold signature. Only the `PqWrapped` variant is
+/// constructible outside this module, so callers cannot bypass the PQ
+/// wrap by construction.
+#[derive(Clone)]
+pub struct ThresholdSignature<S: ThresholdSignatureState> {
+    frost_bytes: [u8; 64],
+    pq_signature: Vec<u8>,
+    transcript: Vec<u8>,
+    _state: std::marker::PhantomData<S>,
+}
+
+impl<S: ThresholdSignatureState> ThresholdSignature<S> {
+    pub fn frost_bytes(&self) -> &[u8; 64] { &self.frost_bytes }
+}
+
+impl ThresholdSignature<PqWrapped> {
+    pub fn pq_signature(&self) -> &[u8] { &self.pq_signature }
+    pub fn transcript(&self) -> &[u8] { &self.transcript }
+}
+
+/// CAT-A task 5: the ONLY public path that releases a threshold signature.
+/// Runs FROST round1/round2/aggregate, then wraps the 64-byte aggregate
+/// with an ML-DSA-87 signature over `(transcript || frost_bytes)` via
+/// [`crate::pq_sign::pq_sign`].
+pub fn threshold_sign_pq_wrapped(
+    shares: &mut [SignerShare],
+    group: &ThresholdGroup,
+    message: &[u8],
+    threshold: usize,
+    pq_signing_key: &crate::pq_sign::PqSigningKey,
+) -> Result<ThresholdSignature<PqWrapped>, String> {
+    let frost_bytes = threshold_sign(shares, group, message, threshold)?;
+    let pq_signature = crate::pq_sign::pq_sign(pq_signing_key, message, &frost_bytes);
+    Ok(ThresholdSignature {
+        frost_bytes,
+        pq_signature,
+        transcript: message.to_vec(),
+        _state: std::marker::PhantomData,
+    })
+}
+
+/// Verify a PQ-wrapped threshold signature. Both the FROST aggregate AND
+/// the ML-DSA-87 outer signature MUST validate.
+pub fn verify_threshold_signature_pq_wrapped(
+    group: &ThresholdGroup,
+    sig: &ThresholdSignature<PqWrapped>,
+    pq_verifying_key: &crate::pq_sign::PqVerifyingKey,
+) -> bool {
+    if sig.pq_signature.is_empty() {
+        tracing::error!(
+            target: "siem",
+            "SIEM:CRITICAL bare FROST signature presented without ML-DSA-87 wrap"
+        );
+        return false;
+    }
+    if !verify_group_signature(group, &sig.transcript, &sig.frost_bytes) {
+        return false;
+    }
+    crate::pq_sign::pq_verify(
+        pq_verifying_key,
+        &sig.transcript,
+        &sig.frost_bytes,
+        &sig.pq_signature,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -615,6 +704,67 @@ mod tests {
     #[allow(deprecated)]
     fn make_group(total: u16, threshold: u16) -> DkgResult {
         dkg(total, threshold).expect("DKG must succeed in tests")
+    }
+
+    fn run_wrapped<F: FnOnce() + Send + 'static>(f: F) {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(f)
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[test]
+    fn cat_a_kat_pq_wrapped_threshold_roundtrip() {
+        run_wrapped(|| {
+            let r = make_group(3, 2);
+            let mut shares = r.shares;
+            let group = r.group;
+            let (pq_sk, pq_vk) = crate::pq_sign::generate_pq_keypair();
+            let msg = b"CAT-A task 5 KAT message";
+            let sig = threshold_sign_pq_wrapped(&mut shares, &group, msg, 2, &pq_sk)
+                .expect("pq wrapped sign");
+            assert!(verify_threshold_signature_pq_wrapped(&group, &sig, &pq_vk));
+        });
+    }
+
+    #[test]
+    fn cat_a_kat_bare_frost_rejected() {
+        run_wrapped(|| {
+            let r = make_group(3, 2);
+            let mut shares = r.shares;
+            let group = r.group;
+            let (_pq_sk, pq_vk) = crate::pq_sign::generate_pq_keypair();
+            let msg = b"bare FROST rejection test";
+            let frost_bytes = threshold_sign(&mut shares, &group, msg, 2)
+                .expect("frost sign");
+            let bare = ThresholdSignature::<PqWrapped> {
+                frost_bytes,
+                pq_signature: Vec::new(),
+                transcript: msg.to_vec(),
+                _state: std::marker::PhantomData,
+            };
+            assert!(
+                !verify_threshold_signature_pq_wrapped(&group, &bare, &pq_vk),
+                "bare FROST signature MUST be rejected"
+            );
+        });
+    }
+
+    #[test]
+    fn cat_a_kat_tampered_transcript_rejected() {
+        run_wrapped(|| {
+            let r = make_group(3, 2);
+            let mut shares = r.shares;
+            let group = r.group;
+            let (pq_sk, pq_vk) = crate::pq_sign::generate_pq_keypair();
+            let msg = b"original";
+            let mut sig = threshold_sign_pq_wrapped(&mut shares, &group, msg, 2, &pq_sk)
+                .expect("sign");
+            sig.transcript[0] ^= 0xFF;
+            assert!(!verify_threshold_signature_pq_wrapped(&group, &sig, &pq_vk));
+        });
     }
 
     #[test]

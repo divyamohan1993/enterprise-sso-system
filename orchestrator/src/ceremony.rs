@@ -9,6 +9,23 @@
 //! - **Peer replication** via `sync_from_peers()` for cross-orchestrator state recovery
 //! - **Epoch-based conflict resolution** for concurrent updates (higher epoch wins)
 //! - **TTL-based cleanup** that sweeps both L1 cache and L2 durable store
+//!
+//! # CAT-H-followup: RES-DEGRADE CEREMONY (NOT YET IMPLEMENTED)
+//!
+//! The RES-DEGRADE CEREMONY fix spec calls for a Raft-replicated log of
+//! in-flight ceremony steps so that on leader death a newly elected leader
+//! can replay recent ceremonies and clients can resume by ceremony ID with
+//! a 5-minute TTL. The existing `DistributedCeremonyTracker` provides L2
+//! durability and cross-orchestrator sync but does NOT yet route writes
+//! through the Raft log in `common/src/raft.rs` — meaning a partition-
+//! windowed ceremony can be lost on leader death.
+//!
+//! Implementation requires threading `common::raft::Log` into the
+//! `CeremonyPersistence` trait as a log-append target, adding a
+//! `ResumeById(CeremonyId)` client entry point, and wiring TTL expiry
+//! through the Raft state machine.
+//!
+//! Deferred out of the current CAT-H pass by team-lead direction.
 
 use std::collections::HashMap;
 use crypto::receipts::ReceiptChain;

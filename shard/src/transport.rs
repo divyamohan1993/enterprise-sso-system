@@ -589,7 +589,16 @@ impl ShardListener {
             None,
         )?;
 
-        let protocol = ShardProtocol::new(self.module_id, self.hmac_key);
+        // RES-SHARDHMAC: prefer per-pair IKM derived from
+        // `domain_root(KeyDomain::ShardHmac)` when the TLS identity map
+        // yields a confirmed peer ModuleId. Fall back to the legacy
+        // shared `self.hmac_key` when no identity map is configured
+        // (e.g. test deployments and the transitional period before
+        // every service carries the SHARD-HMAC domain root).
+        let protocol = match peer_module {
+            Some(peer) => ShardProtocol::for_pair(self.module_id, peer),
+            None => ShardProtocol::new(self.module_id, self.hmac_key),
+        };
         let mut transport = ShardTransport::from_tls_server(tls_stream, protocol);
         if let Some(module_id) = peer_module {
             transport.set_peer_module(module_id);
@@ -635,7 +644,10 @@ impl ShardListener {
             Some(sender_module),
         )?;
 
-        let protocol = ShardProtocol::new(self.module_id, self.hmac_key);
+        // RES-SHARDHMAC: communication matrix path, peer module is
+        // always known (it's the `sender_module` argument), so we
+        // always use per-pair IKM here.
+        let protocol = ShardProtocol::for_pair(self.module_id, sender_module);
         let mut transport = ShardTransport::from_tls_server(tls_stream, protocol);
         if let Some(module_id) = peer_module {
             transport.set_peer_module(module_id);
@@ -694,7 +706,17 @@ pub async fn tls_connect_expecting(
         expected_peer,
     )?;
 
-    let protocol = ShardProtocol::new(module_id, hmac_key);
+    // RES-SHARDHMAC: prefer per-pair IKM when we know which peer we're
+    // talking to (expected_peer set by caller OR identity map resolved
+    // peer_module from the cert). Fall back to the legacy shared
+    // `hmac_key` only when neither source identifies the remote —
+    // `tls_connect` wrapper takes that path today and is tagged as a
+    // CAT-H-followup to be tightened once the identity map is mandatory.
+    let resolved_peer = expected_peer.or(peer_module);
+    let protocol = match resolved_peer {
+        Some(peer) => ShardProtocol::for_pair(module_id, peer),
+        None => ShardProtocol::new(module_id, hmac_key),
+    };
     let mut transport = ShardTransport::from_tls_client(tls_stream, protocol);
     if let Some(mid) = peer_module {
         transport.set_peer_module(mid);

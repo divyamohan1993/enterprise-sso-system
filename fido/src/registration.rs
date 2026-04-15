@@ -215,6 +215,14 @@ impl CredentialStore {
         self.credentials.len()
     }
 
+    /// Count credentials that lack a PQ attestation binding.
+    pub fn credentials_missing_pq_binding(&self) -> usize {
+        self.credentials
+            .values()
+            .filter(|c| c.pq_attestation.is_empty())
+            .count()
+    }
+
     /// Check whether a credential ID is already registered.
     pub fn credential_exists(&self, credential_id: &[u8]) -> bool {
         self.credentials.contains_key(credential_id)
@@ -252,18 +260,35 @@ pub fn validate_and_register(
     user_id: Uuid,
     authenticator_type: &str,
 ) -> Result<StoredCredential, &'static str> {
-    // Parse and validate attestation authenticator data
+    validate_and_register_pq(
+        store, auth_data, expected_rp_id, user_id, authenticator_type,
+        &[], &[], &[],
+    )
+}
+
+/// CAT-A task 1: registration with mandatory PQ attestation binding.
+pub fn validate_and_register_pq(
+    store: &mut CredentialStore,
+    auth_data: &[u8],
+    expected_rp_id: &str,
+    user_id: Uuid,
+    authenticator_type: &str,
+    classical_att_bytes: &[u8],
+    client_data_hash: &[u8],
+    pq_attestation: &[u8],
+) -> Result<StoredCredential, &'static str> {
     let att_data = verification::parse_attestation_auth_data(auth_data, expected_rp_id)?;
 
-    // B6: enforce AAGUID allow-list (military mode rejects unknown authenticators)
     crate::policy::enforce_aaguid(&att_data.aaguid)?;
 
-    // B8: reject backed-up credentials when policy requires it
     if att_data.backup_state && crate::policy::reject_backed_up_credentials() {
         return Err("Registration rejected: backupState=1 not allowed in military mode");
     }
 
-    // Reject duplicate credential IDs
+    crate::policy::enforce_pq_attestation(
+        pq_attestation, classical_att_bytes, auth_data, client_data_hash,
+    )?;
+
     if store.credential_exists(&att_data.credential_id) {
         return Err("Credential ID already registered (duplicate registration rejected)");
     }
@@ -278,6 +303,7 @@ pub fn validate_and_register(
         cloned_flag: false,
         backup_eligible: att_data.backup_eligible,
         backup_state: att_data.backup_state,
+        pq_attestation: pq_attestation.to_vec(),
     };
 
     store.store_credential(cred.clone());
@@ -320,6 +346,9 @@ impl PersistentCredentialStore {
             pool,
         };
         store.load_from_db().await?;
+        let missing = store.memory.credentials_missing_pq_binding();
+        crate::policy::enforce_pq_binding_invariant(missing)
+            .map_err(|e| format!("PQ binding invariant: {e}"))?;
         Ok(store)
     }
 
@@ -364,7 +393,11 @@ impl PersistentCredentialStore {
                     user_id,
                     sign_count: sign_count as u32,
                     authenticator_type: auth_type,
-                ..Default::default()
+                    aaguid: [0u8; 16],
+                    cloned_flag: false,
+                    backup_eligible: false,
+                    backup_state: false,
+                    pq_attestation: Vec::new(),
                 });
             }
         }

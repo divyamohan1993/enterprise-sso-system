@@ -1,0 +1,49 @@
+# MILNET SSO — production overlay.
+#
+# Image digests below are placeholders. CI must inject real digests via:
+#
+#   for svc in gateway orchestrator opaque tss verifier ratchet risk audit kt admin; do
+#     kustomize edit set image \
+#       "ghcr.io/dmj-one/milnet-${svc}=ghcr.io/dmj-one/milnet-${svc}@${DIGEST_FROM_BUILD}"
+#   done
+#
+# A `kustomize build deploy/kubernetes/overlays/prod` dry-run in CI fails if
+# any placeholder digest remains. Never apply this overlay without digests.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: milnet
+resources:
+  - ../../base
+commonLabels:
+  milnet.io/environment: prod
+images:
+  - name: ghcr.io/dmj-one/milnet-gateway
+    newName: ghcr.io/dmj-one/milnet-gateway
+    digest: sha256:REPLACE_WITH_CI_BUILD_DIGEST
+  - name: ghcr.io/dmj-one/milnet-orchestrator
+    newName: ghcr.io/dmj-one/milnet-orchestrator
+    digest: sha256:REPLACE_WITH_CI_BUILD_DIGEST
+  - name: ghcr.io/dmj-one/milnet-tss
+    newName: ghcr.io/dmj-one/milnet-tss
+    digest: sha256:REPLACE_WITH_CI_BUILD_DIGEST
+  - name: ghcr.io/dmj-one/milnet-opaque
+    newName: ghcr.io/dmj-one/milnet-opaque
+    digest: sha256:REPLACE_WITH_CI_BUILD_DIGEST
+  - name: ghcr.io/dmj-one/milnet-verifier
+    newName: ghcr.io/dmj-one/milnet-verifier
+    digest: sha256:REPLACE_WITH_CI_BUILD_DIGEST
+  - name: ghcr.io/dmj-one/milnet-ratchet
+    newName: ghcr.io/dmj-one/milnet-ratchet
+    digest: sha256:REPLACE_WITH_CI_BUILD_DIGEST
+  - name: ghcr.io/dmj-one/milnet-risk
+    newName: ghcr.io/dmj-one/milnet-risk
+    digest: sha256:REPLACE_WITH_CI_BUILD_DIGEST
+  - name: ghcr.io/dmj-one/milnet-audit
+    newName: ghcr.io/dmj-one/milnet-audit
+    digest: sha256:REPLACE_WITH_CI_BUILD_DIGEST
+  - name: ghcr.io/dmj-one/milnet-kt
+    newName: ghcr.io/dmj-one/milnet-kt
+    digest: sha256:REPLACE_WITH_CI_BUILD_DIGEST
+  - name: ghcr.io/dmj-one/milnet-admin
+    newName: ghcr.io/dmj-one/milnet-admin
+    digest: sha256:REPLACE_WITH_CI_BUILD_DIGEST

@@ -84,6 +84,10 @@ pub struct StoredCredential {
     /// WebAuthn `backupState` (BS) flag from the most recent ceremony.
     #[serde(default)]
     pub backup_state: bool,
+    /// CAT-A task 1: ML-DSA-87 attestation binding over
+    /// `SHA-512(classical_attestation_bytes || authenticator_data || client_data_hash)`.
+    #[serde(default)]
+    pub pq_attestation: Vec<u8>,
 }
 
 fn default_aaguid() -> [u8; 16] { [0u8; 16] }
@@ -104,6 +108,7 @@ impl Drop for StoredCredential {
     fn drop(&mut self) {
         self.credential_id.zeroize();
         self.public_key.zeroize();
+        self.pq_attestation.zeroize();
     }
 }
 

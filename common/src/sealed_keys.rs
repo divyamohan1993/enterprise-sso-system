@@ -4,6 +4,27 @@
 //! Keys are loaded from sealed storage (encrypted env vars) and unwrapped
 //! using the master KEK. Raw plaintext env vars are rejected in production mode.
 //!
+//! # CAT-H-followup: RES-BOOT degraded-mode fallback (NOT YET IMPLEMENTED)
+//!
+//! The RES-BOOT fix spec calls for a graceful fallback path when the
+//! quorum-of-peers unsealing path is unreachable at startup: cache the
+//! unsealed KEK in a TPM-sealed tmpfs file that survives brief restarts
+//! (1-hour auto-expiry), emit a SIEM degraded-mode alert on use, and
+//! proceed. On subsequent restarts if quorum is still unreachable, unseal
+//! the snapshot via `tpm2_unseal` and continue.
+//!
+//! This is NOT YET implemented. The current cluster-reconstruction code
+//! path in `common/src/cluster.rs:~805` panics if quorum is unreachable;
+//! that behaviour is retained for now. Implementation requires:
+//! - A new `tpm_sealed_snapshot` submodule that wraps `tpm2_seal` /
+//!   `tpm2_unseal` via the `tpm2-tss` crate (already in the workspace).
+//! - tmpfs mount at `/run/milnet/kek-snapshot` with 0600 perms.
+//! - SIEM event emission on both write and degraded-mode use.
+//! - Auto-expiry by writing an HMAC-signed timestamp alongside the blob
+//!   and refusing to unseal it if the timestamp is older than 1 hour.
+//!
+//! Deferred out of the current CAT-H pass by team-lead direction.
+//!
 //! # Key Loading Hierarchy
 //! 1. Check for sealed (encrypted) key in env: `{NAME}_SEALED`
 //! 2. Unwrap with master KEK via HKDF-SHA512

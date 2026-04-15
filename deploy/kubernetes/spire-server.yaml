@@ -1,0 +1,132 @@
+# SPIRE server for CAT-O DT-MUTAUTH (SPIFFE SVIDs replace self-signed CA).
+#
+# Workflow:
+#   - SPIRE server issues workload SVIDs with URI SAN
+#     spiffe://milnet/<service>/<node-id>.
+#   - A DaemonSet SPIRE agent (see spire-agent.yaml, follow-up) mounts the
+#     workload API socket into each pod at
+#     /run/spire/agent-sockets/api.sock.
+#   - The svid store helper renders the workload's leaf cert, leaf key,
+#     and trust bundle to SPIFFE_SVID_DIR on a tmpfs, rotating in place
+#     as short-lived certs (TTL 1h) are reissued.
+#
+# Services consume SVIDs via shard::spiffe::FilesystemSvidSource which
+# reads from SPIFFE_SVID_DIR. The filesystem hop is an intentional
+# simplification to avoid pulling the unvetted `spiffe` crate's
+# tonic/protobuf transitive dep chain; direct Workload API integration
+# is tracked as a CAT-O-followup.
+#
+# This manifest is a minimal skeleton — full production deployment
+# requires:
+#   - Upstream CA bundle (HSM-backed ICA recommended)
+#   - PersistentVolume for the server datastore
+#   - NodeAttestor plugin configured for k8s PSAT or vTPM
+#   - Federation bundle for cross-cluster trust (CAT-O-followup)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: spire
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spire-server-config
+  namespace: spire
+data:
+  server.conf: |
+    server {
+      bind_address = "0.0.0.0"
+      bind_port    = "8081"
+      trust_domain = "milnet"
+      data_dir     = "/run/spire/data"
+      log_level    = "INFO"
+      ca_ttl       = "168h"
+      default_x509_svid_ttl = "1h"
+      default_jwt_svid_ttl  = "5m"
+      ca_key_type  = "ec-p384"
+    }
+
+    plugins {
+      DataStore "sql" {
+        plugin_data {
+          database_type = "sqlite3"
+          connection_string = "/run/spire/data/datastore.sqlite3"
+        }
+      }
+
+      KeyManager "disk" {
+        plugin_data {
+          keys_path = "/run/spire/data/keys.json"
+        }
+      }
+
+      NodeAttestor "k8s_psat" {
+        plugin_data {
+          clusters = {
+            "milnet" = {
+              service_account_allow_list = ["spire:spire-agent"]
+            }
+          }
+        }
+      }
+
+      UpstreamAuthority "disk" {
+        plugin_data {
+          cert_file_path = "/run/spire/secrets/upstream-ca.crt"
+          key_file_path  = "/run/spire/secrets/upstream-ca.key"
+        }
+      }
+    }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: spire-server
+  namespace: spire
+spec:
+  serviceName: spire-server
+  replicas: 1
+  selector:
+    matchLabels: { app: spire-server }
+  template:
+    metadata:
+      labels: { app: spire-server }
+    spec:
+      serviceAccountName: spire-server
+      containers:
+        - name: spire-server
+          image: ghcr.io/spiffe/spire-server:1.9.5
+          args: ["-config", "/run/spire/config/server.conf"]
+          ports: [{ containerPort: 8081 }]
+          volumeMounts:
+            - { name: config, mountPath: /run/spire/config }
+            - { name: data, mountPath: /run/spire/data }
+            - { name: upstream-ca, mountPath: /run/spire/secrets, readOnly: true }
+          livenessProbe:
+            exec: { command: ["/opt/spire/bin/spire-server", "healthcheck"] }
+            initialDelaySeconds: 15
+            periodSeconds: 10
+      volumes:
+        - { name: config, configMap: { name: spire-server-config } }
+        - { name: upstream-ca, secret: { secretName: spire-upstream-ca } }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: { requests: { storage: 10Gi } }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spire-server
+  namespace: spire
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spire-server
+  namespace: spire
+spec:
+  selector: { app: spire-server }
+  ports:
+    - { name: api, port: 8081, targetPort: 8081 }

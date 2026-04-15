@@ -1,0 +1,13 @@
+# MILNET SSO System — Postgres standby manifest (POINTER FILE)
+#
+# This file exists to preserve the expected filename from the RES-SPOF
+# fix spec. The ACTUAL primary+standby manifest lives in
+# `postgres-ha.yaml` as a single Patroni-managed StatefulSet with
+# synchronous replication (synchronous_commit=remote_apply,
+# synchronous_standby_names='ANY 2 (postgres-0, postgres-1, postgres-2)').
+#
+# See `postgres-primary.yaml` in this directory for the full rationale
+# behind the consolidated manifest shape.
+---
+# This file is intentionally empty of Kubernetes resources.
+# Apply deploy/kubernetes/postgres-ha.yaml instead.

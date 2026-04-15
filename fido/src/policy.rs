@@ -2,6 +2,7 @@
 //! backup-eligible enforcement (CAT-B B6, B8, B9).
 
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 /// Hardcoded military-mode default AAGUID allow-list.
 ///
@@ -93,6 +94,18 @@ pub fn military_mode() -> bool {
 /// warning to SIEM).
 pub fn enforce_aaguid(aaguid: &[u8; 16]) -> Result<(), &'static str> {
     let list = allowed_aaguids();
+    // CAT-A task 2: all-zero AAGUID is the "unknown authenticator" sentinel
+    // and MUST be rejected outside test builds.
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        if aaguid == &[0u8; 16] {
+            tracing::error!(
+                target: "siem",
+                "SIEM:CRITICAL FIDO AAGUID rejected: all-zero sentinel"
+            );
+            return Err("AAGUID all-zero sentinel is not a valid authenticator identity");
+        }
+    }
     if list.contains(aaguid) {
         return Ok(());
     }
@@ -119,6 +132,139 @@ pub fn reject_backed_up_credentials() -> bool {
         Ok(val) => val == "1" || val.to_lowercase() == "true",
         Err(_) => military_mode(),
     }
+}
+
+// ── CAT-A task 1: PQ attestation binding ──────────────────────────────
+
+/// Whether ML-DSA-87 PQ attestation binding is mandatory for FIDO
+/// registration. Defaults ON in military mode; test/test-support builds
+/// default OFF.
+pub fn pq_attestation_required() -> bool {
+    match std::env::var("MILNET_FIDO_PQ_REQUIRED") {
+        Ok(val) => val == "1" || val.to_lowercase() == "true",
+        Err(_) => {
+            #[cfg(any(test, feature = "test-support"))]
+            { false }
+            #[cfg(not(any(test, feature = "test-support")))]
+            { military_mode() }
+        }
+    }
+}
+
+fn pq_trust_store() -> &'static Vec<Vec<u8>> {
+    static STORE: OnceLock<Vec<Vec<u8>>> = OnceLock::new();
+    STORE.get_or_init(|| {
+        let dir = match std::env::var("MILNET_FIDO_PQ_TRUST_DIR") {
+            Ok(d) => d,
+            Err(_) => return Vec::new(),
+        };
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::error!(
+                    target: "siem",
+                    "SIEM:CRITICAL Failed to read MILNET_FIDO_PQ_TRUST_DIR={}: {}",
+                    dir, e
+                );
+                return Vec::new();
+            }
+        };
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() { continue; }
+            if let Ok(bytes) = std::fs::read(&path) {
+                out.push(bytes);
+            }
+        }
+        out
+    })
+}
+
+/// Verify the ML-DSA-87 wrap over
+/// `SHA-512(classical_att_bytes || authenticator_data || client_data_hash)`
+/// against the allow-listed PQ attestation trust store.
+pub fn verify_pq_attestation_binding(
+    pq_sig: &[u8],
+    classical_att_bytes: &[u8],
+    authenticator_data: &[u8],
+    client_data_hash: &[u8],
+) -> Result<(), &'static str> {
+    use sha2::{Digest, Sha512};
+    if pq_sig.is_empty() {
+        return Err("PQ attestation binding missing");
+    }
+    let mut h = Sha512::new();
+    h.update(classical_att_bytes);
+    h.update(authenticator_data);
+    h.update(client_data_hash);
+    let digest = h.finalize();
+
+    let store = pq_trust_store();
+    if store.is_empty() {
+        if pq_attestation_required() {
+            tracing::error!(
+                target: "siem",
+                "SIEM:CRITICAL PQ attestation required but trust store is empty"
+            );
+            return Err("PQ attestation trust store empty");
+        }
+        return Ok(());
+    }
+    for vk_bytes in store.iter() {
+        let vk_enc = match crypto::pq_sign::PqEncodedVerifyingKey::try_from(vk_bytes.as_slice()) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let vk = crypto::pq_sign::PqVerifyingKey::decode(&vk_enc);
+        if crypto::pq_sign::pq_verify_tagged(&vk, &digest, pq_sig) {
+            return Ok(());
+        }
+    }
+    Err("PQ attestation binding verification failed")
+}
+
+/// Enforce the PQ binding when policy requires it; best-effort verification
+/// when a binding is present but not required.
+pub fn enforce_pq_attestation(
+    pq_sig: &[u8],
+    classical_att_bytes: &[u8],
+    authenticator_data: &[u8],
+    client_data_hash: &[u8],
+) -> Result<(), &'static str> {
+    if !pq_attestation_required() {
+        if !pq_sig.is_empty() {
+            return verify_pq_attestation_binding(
+                pq_sig, classical_att_bytes, authenticator_data, client_data_hash,
+            );
+        }
+        return Ok(());
+    }
+    if pq_sig.is_empty() {
+        tracing::error!(
+            target: "siem",
+            "SIEM:CRITICAL FIDO registration rejected: missing PQ attestation binding"
+        );
+        return Err("FIDO registration rejected: PQ attestation binding required");
+    }
+    verify_pq_attestation_binding(pq_sig, classical_att_bytes, authenticator_data, client_data_hash)
+}
+
+/// Startup invariant: abort if any already-registered credential lacks a
+/// PQ attestation binding and policy requires one.
+pub fn enforce_pq_binding_invariant(creds_missing_pq: usize) -> Result<(), &'static str> {
+    if creds_missing_pq == 0 {
+        return Ok(());
+    }
+    if pq_attestation_required() {
+        tracing::error!(
+            target: "siem",
+            "SIEM:CRITICAL {} FIDO credential(s) lack PQ attestation binding",
+            creds_missing_pq
+        );
+        return Err("unbound FIDO credentials present under MILNET_FIDO_PQ_REQUIRED");
+    }
+    Ok(())
 }
 
 /// B9 — attestation format allow-list. Returns Err if format is not allowed

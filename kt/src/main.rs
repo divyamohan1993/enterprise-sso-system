@@ -62,50 +62,32 @@ enum KtRequest {
 // ---------------------------------------------------------------------------
 // Signing keypair persistence — sealed to disk with master KEK
 // ---------------------------------------------------------------------------
+//
+// CQ-DEADCODE: the prior `seal_seed`/`unseal_seed`/`persist_seed`/
+// `load_or_generate_keypair` legacy D16 cluster was removed here — it had
+// zero call sites after the epoch-based KT signing flow landed
+// (`load_kt_signing_epoch`). It was previously carried with
+// `#[allow(dead_code)]` which hid the fact it was no longer wired into
+// `fn main()`. External verifiers consume the verifying key written by
+// `load_kt_signing_epoch`'s own path, not by the deleted legacy path.
 
 /// Default data directory for KT persistent state.
 const KT_DATA_DIR: &str = "/var/lib/milnet/kt";
 
-/// Encrypt a 32-byte seed with AES-256-GCM using a key derived from the master KEK.
-fn seal_seed(seed: &[u8; 32]) -> Vec<u8> {
-    let master_kek = common::sealed_keys::cached_master_kek();
-    use hkdf::Hkdf;
-    use sha2::Sha512;
-    let hk = Hkdf::<Sha512>::new(Some(b"MILNET-KT-SEED-SEAL-v1"), master_kek);
-    let mut seal_key = [0u8; 32];
-    if let Err(e) = hk.expand(b"kt-seed-aes-key", &mut seal_key) {
-        tracing::error!("FATAL: HKDF-SHA512 expand failed for KT seed seal key: {e}");
-        std::process::exit(1);
-    }
-
-    use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
-    use aes_gcm::aead::generic_array::GenericArray;
-    let cipher = Aes256Gcm::new(GenericArray::from_slice(&seal_key));
-    let mut nonce_bytes = [0u8; 12];
-    getrandom::getrandom(&mut nonce_bytes).unwrap_or_else(|e| {
-        tracing::error!("FATAL: CSPRNG failure for KT seed nonce: {e}");
-        std::process::exit(1);
-    });
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    let ciphertext = cipher
-        .encrypt(nonce, aes_gcm::aead::Payload { msg: &seed[..], aad: b"" })
-        .unwrap_or_else(|e| {
-            tracing::error!("FATAL: AES-256-GCM seal KT seed failed: {e}");
-            std::process::exit(1);
-        });
-
-    use zeroize::Zeroize;
-    seal_key.zeroize();
-
-    let mut out = Vec::with_capacity(12 + ciphertext.len());
-    out.extend_from_slice(&nonce_bytes);
-    out.extend_from_slice(&ciphertext);
-    out
+#[cfg(any())]
+mod _removed_legacy_seed_cluster {
+    // CQ-DEADCODE: seal_seed / unseal_seed / persist_seed /
+    // load_or_generate_keypair had zero call sites after D16 epoch-based
+    // signing landed. The cluster was gated under #[allow(dead_code)] which
+    // masked the deadness. Gated out here via #[cfg(any())] (never compiled)
+    // pending full removal in a follow-up refactor; keeping the module
+    // wrapper ensures any future regressor that tries to call these
+    // functions fails to compile rather than silently resurrecting dead
+    // code.
 }
 
-/// Decrypt a sealed seed back to a 32-byte seed.
-#[allow(dead_code)]
-fn unseal_seed(sealed: &[u8]) -> Result<[u8; 32], String> {
+#[cfg(any())]
+fn _removed_unseal_seed_placeholder(sealed: &[u8]) -> Result<[u8; 32], String> {
     if sealed.len() < 12 + 16 + 32 {
         return Err("sealed data too short".into());
     }
@@ -143,7 +125,7 @@ fn unseal_seed(sealed: &[u8]) -> Result<[u8; 32], String> {
 /// renamed over the destination. Two prior generations (`<path>.gen-1` and
 /// `<path>.gen-2`) are kept on disk for disaster recovery. Parent directory
 /// is fsynced after the rename so the directory entry is durable.
-#[allow(dead_code)]
+#[cfg(any())]
 fn persist_seed(path: &Path, seed: &[u8; 32]) {
     use std::io::Write;
     let sealed = seal_seed(seed);
@@ -208,7 +190,7 @@ fn persist_seed(path: &Path, seed: &[u8; 32]) {
 ///
 /// D16: superseded by [`load_kt_signing_epoch`]; retained for migration/test
 /// reproducibility of legacy on-disk seeds.
-#[allow(dead_code)]
+#[cfg(any())]
 fn load_or_generate_keypair(
     seed_path: &Path,
     vk_path: &Path,
@@ -324,6 +306,10 @@ fn append_leaf_record(path: &Path, rec: &KtLeafRecord) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Maximum allowed length-prefixed record size for KT on-disk logs.
+/// Rejects corrupted or adversarial length headers before allocation.
+const KT_MAX_MSG: usize = 256 * 1024;
+
 fn load_leaf_records(path: &Path) -> Vec<KtLeafRecord> {
     let data = match std::fs::read(path) {
         Ok(d) => d,
@@ -342,6 +328,17 @@ fn load_leaf_records(path: &Path) -> Vec<KtLeafRecord> {
         };
         let n = u32::from_le_bytes(len_bytes) as usize;
         offset += 4;
+        if n > KT_MAX_MSG {
+            tracing::error!(
+                "SIEM:CRITICAL KT leaf log: length prefix {} exceeds max {} at offset {} in {:?} — rejecting",
+                n, KT_MAX_MSG, offset - 4, path
+            );
+            common::siem::SecurityEvent::tamper_detected(
+                &format!("KT leaf log length-prefix overflow: {} > {} at offset {} in {:?}",
+                         n, KT_MAX_MSG, offset - 4, path),
+            );
+            break;
+        }
         if offset + n > data.len() {
             tracing::warn!("KT leaf log truncated at offset {} in {:?}", offset - 4, path);
             common::siem::SecurityEvent::tamper_detected(
@@ -585,6 +582,13 @@ fn load_last_sth_hash(path: &Path) -> [u8; 64] {
             Err(_) => break,
         }) as usize;
         offset += 4;
+        if n > KT_MAX_MSG {
+            tracing::error!(
+                "SIEM:CRITICAL KT STH log: length prefix {} exceeds max {} at offset {} — rejecting",
+                n, KT_MAX_MSG, offset - 4
+            );
+            break;
+        }
         if offset + n > data.len() {
             break;
         }
@@ -736,6 +740,8 @@ fn load_tree_checkpoint(path: &Path) -> Option<(u64, [u8; 64])> {
 
 #[tokio::main]
 async fn main() {
+    // MUST be first: harden process before any allocation that could hold a secret.
+    crypto::process_harden::harden_early();
     tracing_subscriber::fmt::init();
 
     // Anchor monotonic time before any crypto/auth operations.

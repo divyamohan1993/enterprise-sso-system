@@ -1,0 +1,21 @@
+# MILNET SSO System — Postgres primary manifest (POINTER FILE)
+#
+# This file exists to preserve the expected filename from the RES-SPOF
+# fix spec. The ACTUAL primary+standby manifest lives in
+# `postgres-ha.yaml` as a single Patroni-managed StatefulSet.
+#
+# Why not a separate primary manifest:
+# Patroni elects the primary at runtime via etcd leader election. Every
+# pod in the StatefulSet runs the same image with the same config;
+# whichever pod holds the etcd leader key IS the primary for as long as
+# it holds the key. Splitting into a primary-only manifest would require
+# hard-coding ordinal 0 as the forever-primary, which is exactly what
+# `postgres.yaml` (the pre-Patroni manifest this replaces) did — and it
+# had no automated failover.
+#
+# To apply the Postgres HA topology, apply `postgres-ha.yaml` and
+# `etcd.yaml` together. Do NOT apply `postgres.yaml` alongside — it is
+# the legacy single-primary manifest kept for rollback purposes only.
+---
+# This file is intentionally empty of Kubernetes resources.
+# Apply deploy/kubernetes/postgres-ha.yaml instead.

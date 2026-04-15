@@ -109,10 +109,15 @@ impl PersistentSessionStore {
                     "persistent_session index migration failure",
                     file!(), line!(), column!(), module_path!(),
                 );
-                if crate::config::require_hardware_security() {
-                    panic!("MILITARY MODE: persistent session migration failure: {msg}");
-                }
+                // CQ-PANIC: never panic on DB migration failure. Propagate so
+                // callers can reject the session store and force re-auth
+                // rather than crash the process.
                 tracing::error!("{msg}");
+                if crate::config::require_hardware_security() {
+                    return Err(format!(
+                        "MILITARY MODE: persistent session migration failure: {msg}"
+                    ));
+                }
             }
         }
 
@@ -133,10 +138,15 @@ impl PersistentSessionStore {
                     "persistent_session index migration failure",
                     file!(), line!(), column!(), module_path!(),
                 );
-                if crate::config::require_hardware_security() {
-                    panic!("MILITARY MODE: persistent session migration failure: {msg}");
-                }
+                // CQ-PANIC: never panic on DB migration failure. Propagate so
+                // callers can reject the session store and force re-auth
+                // rather than crash the process.
                 tracing::error!("{msg}");
+                if crate::config::require_hardware_security() {
+                    return Err(format!(
+                        "MILITARY MODE: persistent session migration failure: {msg}"
+                    ));
+                }
             }
         }
 

@@ -63,6 +63,117 @@ fn max_connections_per_ip() -> u32 {
 /// Rate-limit window duration (60 seconds).
 const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 
+// ── GW-RATE: trusted-proxy CIDR allowlist ──────────────────────────────────
+//
+// `MILNET_TRUSTED_PROXY_CIDRS` is a comma-separated list of CIDR ranges
+// (`10.0.0.0/8,2001:db8::/32`) from which `X-Forwarded-For` headers may be
+// trusted. If the immediate TCP peer's IP does not fall inside one of
+// these ranges, any XFF header is IGNORED and the direct peer IP is used
+// as the client IP. Default: empty list — trust nothing, always use the
+// direct peer. A client cannot forge an effective IP.
+
+/// Parsed CIDR entry: base address + prefix length.
+#[derive(Debug, Clone, Copy)]
+pub struct TrustedCidr {
+    pub base: IpAddr,
+    pub prefix_len: u8,
+}
+
+impl TrustedCidr {
+    /// Parse a single CIDR like `10.0.0.0/8` or `2001:db8::/32`.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        let (ip_str, prefix_str) = s
+            .split_once('/')
+            .ok_or_else(|| format!("CIDR missing '/': {s}"))?;
+        let base: IpAddr = ip_str
+            .parse()
+            .map_err(|_| format!("invalid IP in CIDR: {ip_str}"))?;
+        let prefix_len: u8 = prefix_str
+            .parse()
+            .map_err(|_| format!("invalid prefix length: {prefix_str}"))?;
+        let max = if base.is_ipv4() { 32 } else { 128 };
+        if prefix_len > max {
+            return Err(format!("prefix length {prefix_len} exceeds {max} for {ip_str}"));
+        }
+        Ok(Self { base, prefix_len })
+    }
+
+    /// Test membership: does `ip` fall inside this CIDR range?
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (self.base, ip) {
+            (IpAddr::V4(base4), IpAddr::V4(ip4)) => {
+                let shift = 32u8.saturating_sub(self.prefix_len);
+                if shift >= 32 {
+                    return true;
+                }
+                let mask: u32 = u32::MAX.wrapping_shl(shift as u32);
+                (u32::from(base4) & mask) == (u32::from(ip4) & mask)
+            }
+            (IpAddr::V6(base6), IpAddr::V6(ip6)) => {
+                let shift = 128u8.saturating_sub(self.prefix_len);
+                if shift >= 128 {
+                    return true;
+                }
+                let mask: u128 = u128::MAX.wrapping_shl(shift as u32);
+                (u128::from(base6) & mask) == (u128::from(ip6) & mask)
+            }
+            // Mismatched families never match.
+            _ => false,
+        }
+    }
+}
+
+static TRUSTED_PROXY_CIDRS: std::sync::LazyLock<Vec<TrustedCidr>> =
+    std::sync::LazyLock::new(|| {
+        let Ok(raw) = std::env::var("MILNET_TRUSTED_PROXY_CIDRS") else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for part in raw.split(',').filter(|p| !p.trim().is_empty()) {
+            match TrustedCidr::parse(part) {
+                Ok(cidr) => out.push(cidr),
+                Err(e) => {
+                    warn!(
+                        "MILNET_TRUSTED_PROXY_CIDRS entry rejected: {e} — \
+                         treating as trust-none for safety"
+                    );
+                }
+            }
+        }
+        out
+    });
+
+/// Pick the effective client IP for rate-limiting and audit purposes.
+///
+/// If the direct peer IP is inside an allowlisted proxy CIDR AND an
+/// `X-Forwarded-For` value is supplied, the leftmost valid IP from the
+/// header is used. Otherwise the direct peer IP is used and any
+/// client-supplied XFF is ignored. Default (empty allowlist) always
+/// returns the direct peer IP — a client cannot forge its IP.
+pub fn effective_client_ip(peer: IpAddr, xff_header: Option<&str>) -> IpAddr {
+    let allowlist = &*TRUSTED_PROXY_CIDRS;
+    if allowlist.is_empty() {
+        return peer;
+    }
+    let trusted = allowlist.iter().any(|c| c.contains(peer));
+    if !trusted {
+        return peer;
+    }
+    let Some(xff) = xff_header else {
+        return peer;
+    };
+    // Leftmost entry is the original client; later entries are intermediate
+    // proxies. Strip whitespace, parse, fall back to peer on any failure.
+    for candidate in xff.split(',') {
+        let c = candidate.trim();
+        if let Ok(ip) = c.parse::<IpAddr>() {
+            return ip;
+        }
+    }
+    peer
+}
+
 /// Global maximum concurrent connections.
 pub const MAX_CONCURRENT_CONNECTIONS: usize = 1000;
 
@@ -766,11 +877,60 @@ async fn handle_connection(
         e
     })?;
     let auth_plaintext = decrypt_frame(&enc_key, &encrypted_auth)?;
-    let auth_req: AuthRequest = postcard::from_bytes(&auth_plaintext)
+    let mut auth_req: AuthRequest = postcard::from_bytes(&auth_plaintext)
         .map_err(|e| format!("deserialize auth request: {e}"))?;
 
     common::error_response::log_crypto_operation("decrypt_frame", "AES-256-GCM", "session_key");
     common::error_response::verbose_log("gateway", "auth request decrypted and deserialized");
+
+    // GW-ATTEST: if the client supplied a signed device-attestation
+    // assertion, validate it (signature, signer, nonce binding to this
+    // session, freshness). On success, overwrite the unsigned
+    // `device_attestation_age_secs` with the validated value from the
+    // assertion's `issued_at_secs`. On failure, reject the entire auth
+    // request fail-closed — in military deployment an unsigned assertion
+    // is ALSO rejected.
+    match auth_req.device_attestation.as_ref() {
+        Some(assertion) => {
+            match crate::device_attestation::validate_assertion(assertion, &session_key) {
+                Ok(issued_at_secs) => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let age = now.saturating_sub(issued_at_secs) as f64;
+                    auth_req.device_attestation_age_secs = Some(age);
+                    // Drop the raw assertion so it cannot be forwarded.
+                    auth_req.device_attestation = None;
+                    common::error_response::verbose_log(
+                        "gateway",
+                        "device attestation assertion validated",
+                    );
+                }
+                Err(e) => {
+                    warn!(error = %e, "SIEM:SECURITY device attestation rejected");
+                    common::siem::SecurityEvent::tamper_detected(
+                        &format!("device attestation rejected: {e}"),
+                    );
+                    return Err(format!("device attestation invalid: {e}"));
+                }
+            }
+        }
+        None => {
+            if std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok() {
+                warn!(
+                    "SIEM:SECURITY rejecting auth request without signed \
+                     device attestation in military deployment"
+                );
+                common::siem::SecurityEvent::tamper_detected(
+                    "auth request missing signed device attestation",
+                );
+                return Err(
+                    "signed device attestation required in military deployment".to_string(),
+                );
+            }
+        }
+    }
 
     // Generate distributed tracing context for this auth request.
     // This correlation_id threads through orchestrator -> OPAQUE -> TSS
@@ -1075,8 +1235,60 @@ async fn recv_raw_frame_limited(
             .await
             .map_err(|e| format!("read payload: {e}"))?;
         remaining -= to_read;
+
+        // GW-PARSE: the gateway wire protocol is uncompressed binary
+        // postcard. Reject any frame whose leading bytes match a known
+        // compression magic (gzip, zlib, brotli-stream, zstd). We never
+        // decompress — this prevents zip-bomb amplification and an entire
+        // class of decompressor-bug exploits.
+        if start == 0 && buf.len() >= 2 {
+            if is_compression_magic(&buf) {
+                warn!(
+                    first_byte = buf[0],
+                    second_byte = buf[1],
+                    "SIEM:SECURITY rejecting compressed wire frame — gateway does not decompress"
+                );
+                common::siem::SecurityEvent::tamper_detected(
+                    "wire frame with compression magic rejected",
+                );
+                return Err("compressed wire frames are not accepted".to_string());
+            }
+        }
     }
     Ok(buf)
+}
+
+/// GW-PARSE: detect leading bytes of common compression formats. The
+/// gateway speaks raw postcard and must never decompress — any match
+/// causes the frame to be rejected fail-closed.
+///
+/// Magic numbers covered:
+/// - gzip:   `1f 8b`
+/// - zlib:   `78 01`, `78 5e`, `78 9c`, `78 da` (and other `78 xx` with
+///   valid FCHECK); we match on leading `0x78` with the most common
+///   second-byte values.
+/// - zstd:   `28 b5 2f fd`
+/// - xz:     `fd 37 7a 58 5a 00`
+/// - lz4:    `04 22 4d 18`
+/// - brotli: no fixed magic — impossible to reliably detect by prefix;
+///   document the gap rather than false-match valid postcard payloads.
+fn is_compression_magic(buf: &[u8]) -> bool {
+    match buf {
+        // gzip
+        [0x1f, 0x8b, ..] => true,
+        // zlib — only the common FCHECK-valid variants
+        [0x78, 0x01, ..] => true,
+        [0x78, 0x5e, ..] => true,
+        [0x78, 0x9c, ..] => true,
+        [0x78, 0xda, ..] => true,
+        // zstd
+        [0x28, 0xb5, 0x2f, 0xfd, ..] => true,
+        // xz
+        [0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, ..] => true,
+        // lz4
+        [0x04, 0x22, 0x4d, 0x18, ..] => true,
+        _ => false,
+    }
 }
 
 /// Send a raw byte payload with 4-byte BE length prefix.

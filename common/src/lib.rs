@@ -13,6 +13,7 @@ pub mod domain;
 pub mod sync;
 pub mod duress;
 pub mod error;
+pub mod io;
 pub mod network;
 pub mod revocation;
 pub mod types;
@@ -23,6 +24,7 @@ pub mod witness;
 // ── Military hardening modules ──
 pub mod cnsa2;
 pub mod encrypted_db;
+pub mod key_hierarchy;
 #[allow(unsafe_code)]
 pub mod sealed_keys;
 
@@ -98,6 +100,7 @@ pub mod cert_lifecycle;
 
 // ── Database HA and distributed sessions ──
 pub mod db_ha;
+pub mod db_pool;
 pub mod distributed_session;
 
 // ── Distributed consensus, cluster coordination, and auto-healing ──

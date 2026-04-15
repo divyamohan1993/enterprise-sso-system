@@ -280,7 +280,14 @@ impl Default for SessionManager {
 
 /// Derive a chain key deterministically from a master secret and epoch counter.
 /// This allows reconstructing chain state without persisting the raw key.
-#[allow(dead_code)] // Will be used by load_from_db once migration to epoch-only storage is complete
+///
+/// CQ-DEADCODE: currently exercised only by unit tests (see `mod tests` at the
+/// bottom of this file). The original `#[allow(dead_code)]` marker carried a
+/// stale "will be used by load_from_db once migration complete" comment that
+/// never materialized. Gate under `#[cfg(test)]` so the prod binary does not
+/// carry the function and the true build state is visible to future CAT-L
+/// audits.
+#[cfg(test)]
 fn derive_chain_key_from_epoch(master: &[u8], epoch: u64) -> [u8; 32] {
     use hkdf::Hkdf;
     use sha2::Sha512;

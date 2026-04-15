@@ -37,6 +37,15 @@ pub struct Argon2idKsf;
 
 impl KeyStretchingFunction for Argon2idKsf {
     fn stretch(&self, password: &[u8], salt: &[u8]) -> Result<Vec<u8>, String> {
+        // CAT-I: Argon2id is not FIPS 140-3 approved. Hard-reject in FIPS mode
+        // so a mis-wired caller in military deployment gets a loud error
+        // instead of silent use of a non-approved KSF.
+        if common::fips::is_fips_mode() {
+            return Err(
+                "FIPS mode: Argon2id rejected — only PBKDF2-SHA512 is permitted \
+                 under FIPS 140-3. This is a CAT-I compliance hard-reject.".to_string()
+            );
+        }
         use argon2::{Algorithm, Argon2, Params, Version};
 
         let params = Params::new(65536, 4, 4, Some(32))

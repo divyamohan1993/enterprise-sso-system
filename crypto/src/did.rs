@@ -547,26 +547,9 @@ pub fn verify_did_auth(
 // Key Agreement
 // ---------------------------------------------------------------------------
 
-/// Derive a shared secret using X25519 Diffie-Hellman with HKDF-SHA512.
-///
-/// The raw DH output is passed through HKDF-SHA512 with a domain-specific
-/// info string to produce a uniformly distributed key. Raw X25519 output
-/// should never be used directly as key material.
-pub fn did_key_agreement(
-    our_secret: &[u8; 32],
-    their_public: &[u8; 32],
-) -> [u8; 32] {
-    let our_secret = x25519_dalek::StaticSecret::from(*our_secret);
-    let their_public = x25519_dalek::PublicKey::from(*their_public);
-    let raw_dh = our_secret.diffie_hellman(&their_public);
-
-    // Apply HKDF-SHA512 to extract a uniformly distributed key
-    let hk = hkdf::Hkdf::<sha2::Sha512>::new(Some(b"MILNET-DID-KEYAGREE-SALT-v1"), raw_dh.as_bytes());
-    let mut okm = [0u8; 32];
-    hk.expand(b"MILNET-DID-KEY-AGREEMENT-v1", &mut okm)
-        .expect("HKDF-SHA512 expand for 32 bytes cannot fail");
-    okm
-}
+// CAT-A task 4: the standalone X25519 `did_key_agreement` helper has been
+// deleted. DID key agreement now MUST go through `crate::xwing`
+// (ML-KEM-1024 + X25519 hybrid KEM).
 
 // ---------------------------------------------------------------------------
 // DID Registration / Rotation
@@ -793,22 +776,14 @@ mod tests {
     }
 
     #[test]
-    fn test_did_key_agreement() {
-        let mut secret_a = [0u8; 32];
-        let mut secret_b = [0u8; 32];
-        getrandom::getrandom(&mut secret_a).unwrap();
-        getrandom::getrandom(&mut secret_b).unwrap();
-
-        let static_a = x25519_dalek::StaticSecret::from(secret_a);
-        let static_b = x25519_dalek::StaticSecret::from(secret_b);
-
-        let public_a = x25519_dalek::PublicKey::from(&static_a);
-        let public_b = x25519_dalek::PublicKey::from(&static_b);
-
-        let shared_ab = did_key_agreement(&secret_a, public_b.as_bytes());
-        let shared_ba = did_key_agreement(&secret_b, public_a.as_bytes());
-
-        assert_eq!(shared_ab, shared_ba, "DH shared secrets must match");
+    fn test_did_key_agreement_uses_xwing() {
+        // CAT-A task 4: DID key agreement now runs through X-Wing.
+        let (server_pk, server_kp) = crate::xwing::xwing_keygen();
+        let (client_ss, ct) = crate::xwing::xwing_encapsulate(&server_pk)
+            .expect("xwing encapsulate");
+        let server_ss = crate::xwing::xwing_decapsulate(&server_kp, &ct)
+            .expect("xwing decapsulate");
+        assert_eq!(client_ss.as_bytes(), server_ss.as_bytes());
     }
 
     #[test]

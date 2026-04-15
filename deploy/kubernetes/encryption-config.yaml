@@ -1,0 +1,39 @@
+# MILNET SSO — kube-apiserver EncryptionConfiguration
+#
+# Encrypts Secret resources in etcd at rest. Primary provider is AES-GCM
+# (256-bit, AEAD); AES-CBC is kept as a fallback so already-stored CBC
+# entries can still be decrypted during a rolling rekey.
+#
+# This file is consumed by the kube-apiserver via the flag:
+#   --encryption-provider-config=/etc/kubernetes/encryption-config.yaml
+#
+# IMPORTANT: For production, prefer External Secrets Operator + HashiCorp
+# Vault for any Opaque secret. The ESO manifests in
+# deploy/kubernetes/external-secrets/ are MANDATORY for new secrets — this
+# file only protects the legacy etcd-backed Secret store as a defence layer
+# below ESO. The 32-byte secret values below are placeholders and MUST be
+# replaced via Vault prior to apiserver start. Never commit real key bytes.
+---
+apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+  - resources:
+      - secrets
+    providers:
+      # Primary: AES-256-GCM (AEAD; rotate via Vault `transit` engine).
+      - aesgcm:
+          keys:
+            - name: key-2026-04
+              secret: REPLACE_WITH_BASE64_32B_FROM_VAULT_milnet_etcd_aesgcm_2026_04
+      # Fallback: AES-CBC for legacy entries written before the AES-GCM
+      # rollout. Kept as second provider so apiserver can still decrypt
+      # them during the rekey window. Removed once `kubectl get secrets
+      # --all-namespaces -o json | kubectl replace -f -` has rewritten
+      # every secret with the new primary.
+      - aescbc:
+          keys:
+            - name: key-2026-03
+              secret: REPLACE_WITH_BASE64_32B_FROM_VAULT_milnet_etcd_aescbc_2026_03
+      # Identity must be last and is the no-op fallback so existing
+      # plaintext secrets remain readable until rewrite.
+      - identity: {}

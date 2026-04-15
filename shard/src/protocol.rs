@@ -4,7 +4,9 @@
 //! HMAC-SHA512, AEGIS-256 encryption (AES-256-GCM in FIPS mode), replay
 //! protection, and timestamp validation.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hkdf::Hkdf;
@@ -13,6 +15,7 @@ use sha2::Sha512;
 
 use common::domain::SHARD_AUTH;
 use common::error::MilnetError;
+use common::key_hierarchy::{self, KeyDomain};
 use common::types::{ModuleId, ShardMessage};
 use crypto::ct::ct_eq;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -162,7 +165,118 @@ fn derive_hmac_key(shared_secret: &[u8; 64]) -> [u8; 64] {
     okm
 }
 
+/// Lowercase label for a `ModuleId` used in per-pair HKDF info strings.
+///
+/// `ModuleId::Gateway` → `"gateway"`, `ModuleId::Orchestrator` → `"orchestrator"`, etc.
+/// Uses `Debug` + `to_ascii_lowercase` rather than maintaining a duplicate match so
+/// new `ModuleId` variants pick up labels automatically.
+fn module_label(m: ModuleId) -> String {
+    format!("{m:?}").to_ascii_lowercase()
+}
+
+/// RES-SHARDHMAC: Per-pair HMAC input keying material derived from the
+/// shared-HMAC key domain root.
+///
+/// Replaces the legacy "single shared key across all services" model
+/// (see fix spec RES-SHARDHMAC). Given a sender and recipient `ModuleId`,
+/// derives a unique 64-byte IKM via:
+///
+/// ```text
+/// HKDF-SHA512(
+///     ikm  = domain_root(KeyDomain::ShardHmac),
+///     salt = b"MILNET-SHARD-HMAC-v1",
+///     info = format!("SHARD-{lo}-TO-{hi}", lo = lower(sender), hi = lower(recipient)),
+/// )
+/// ```
+///
+/// The pair is *not* order-normalized: `(Gateway, Orchestrator)` and
+/// `(Orchestrator, Gateway)` produce DIFFERENT keys, providing
+/// asymmetric channel keying and a finer-grained blast radius. Both
+/// endpoints must agree on which direction they are computing for.
+///
+/// Compromise of one pair's HMAC key does not leak any other pair's
+/// key thanks to HKDF-Expand's independence across distinct `info`
+/// strings.
+///
+/// # Panics
+///
+/// Panics only if the calling service's `KeyDomain::ShardHmac` is not
+/// in its allowed domain set (see `common::key_hierarchy`). This is
+/// the correct behaviour — a service that holds no SHARD-HMAC authority
+/// must not be able to forge SHARD messages even with full memory
+/// disclosure.
+pub fn derive_pair_ikm(sender: ModuleId, recipient: ModuleId) -> [u8; 64] {
+    let root = key_hierarchy::domain_root(KeyDomain::ShardHmac);
+    let hk = Hkdf::<Sha512>::new(Some(b"MILNET-SHARD-HMAC-v1"), root);
+    let info = format!(
+        "SHARD-{}-TO-{}",
+        module_label(sender),
+        module_label(recipient)
+    );
+    let mut okm = [0u8; 64];
+    if let Err(e) = hk.expand(info.as_bytes(), &mut okm) {
+        common::siem::emit_runtime_error(
+            common::siem::category::CRYPTO_FAILURE,
+            "HKDF-SHA512 expand for per-pair SHARD IKM",
+            &format!("{e}"),
+            file!(),
+            line!(),
+            column!(),
+            module_path!(),
+        );
+        // Zeroed IKM — downstream HMAC verify fails safely.
+    }
+    okm
+}
+
+/// Per-pair IKM cache, keyed by `(sender, recipient)`.
+///
+/// Using `BTreeMap` (not `HashMap`) to comply with CAT-K's
+/// `no-secret-hashmap` lint: secret key material must not live in
+/// `std::collections::HashMap` because its SipHash keying is not
+/// constant-time and its iteration order leaks layout information
+/// across processes via malloc patterns. `BTreeMap` uses a
+/// deterministic comparison and fixed layout.
+static PAIR_IKM_CACHE: OnceLock<Mutex<BTreeMap<(ModuleId, ModuleId), [u8; 64]>>> =
+    OnceLock::new();
+
+fn cached_pair_ikm(sender: ModuleId, recipient: ModuleId) -> [u8; 64] {
+    let cache = PAIR_IKM_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut guard = match cache.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            // Poisoning means a prior thread panicked while holding the
+            // lock. The cache state is still valid; recover it.
+            poisoned.into_inner()
+        }
+    };
+    if let Some(k) = guard.get(&(sender, recipient)) {
+        return *k;
+    }
+    let ikm = derive_pair_ikm(sender, recipient);
+    guard.insert((sender, recipient), ikm);
+    ikm
+}
+
 impl ShardProtocol {
+    /// RES-SHARDHMAC: Construct a `ShardProtocol` for a specific
+    /// sender→recipient pair, deriving the HMAC+encryption IKM from
+    /// the domain-separated SHARD-HMAC root.
+    ///
+    /// `local` is the module_id that *this* process owns (used as the
+    /// `sender_module` field in outbound messages). `peer` is the
+    /// remote module this transport session is bound to.
+    ///
+    /// Prefer this constructor over [`ShardProtocol::new`] in all new
+    /// code. The legacy `new` is retained for tests and for the
+    /// transitional period while the `common::key_hierarchy` domain
+    /// root is being provisioned in every service's allowed-domain
+    /// set.
+    pub fn for_pair(local: ModuleId, peer: ModuleId) -> Self {
+        let ikm = cached_pair_ikm(local, peer);
+        Self::new(local, ikm)
+    }
+
     /// Create a new protocol instance for the given module.
     ///
     /// The `shared_secret` is used as input keying material for HKDF-SHA512.

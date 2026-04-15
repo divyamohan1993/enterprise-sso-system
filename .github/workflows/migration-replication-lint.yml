@@ -1,0 +1,80 @@
+# MILNET SSO System — Migration replication-safety lint
+#
+# RES-SPOF (Postgres HA): after landing Patroni + synchronous streaming
+# replication, a DDL migration that breaks logical-or-streaming replication
+# can take the whole cluster offline during a rolling deploy (the standbys
+# disconnect, quorum-2 sync commit blocks writes indefinitely).
+#
+# This workflow greps every file under `migrations/` for the patterns
+# known to break replication on Postgres 16 and fails the build if any
+# are found. Overrides require a `-- REPLICATION-OK: <reason>` comment
+# on the same line, reviewed by a DBA.
+#
+# SECURITY: this workflow does NOT reference any github.event.* fields
+# in run: blocks. It only runs `actions/checkout@v4` and pure shell
+# commands over tracked files under `migrations/`. No injection surface.
+
+name: migration-replication-lint
+
+on:
+  push:
+    paths:
+      - 'migrations/**'
+      - '.github/workflows/migration-replication-lint.yml'
+  pull_request:
+    paths:
+      - 'migrations/**'
+      - '.github/workflows/migration-replication-lint.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  lint-migrations:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan migrations for replication-breaking DDL
+        shell: bash
+        run: |
+          set -eo pipefail
+
+          fail=0
+          declare -A patterns=(
+            ["DROP TYPE .* CASCADE"]="DROP TYPE ... CASCADE rewrites every dependent column, breaks replication"
+            ["ALTER TABLE .* ALTER COLUMN .* TYPE"]="ALTER COLUMN TYPE rewrites the table, invalidates replication slots"
+            ["^[[:space:]]*CLUSTER\\b"]="CLUSTER rewrites heap files, breaks hot-standby feedback"
+            ["REFRESH MATERIALIZED VIEW [^;]*$"]="REFRESH MATERIALIZED VIEW without CONCURRENTLY takes ACCESS EXCLUSIVE"
+            ["VACUUM FULL"]="VACUUM FULL rewrites the table, breaks replication slots"
+            ["DROP PUBLICATION"]="DROP PUBLICATION invalidates downstream subscriptions"
+            ["^[[:space:]]*ALTER SYSTEM\\b"]="ALTER SYSTEM rewrites auto.conf which is NOT replicated"
+          )
+
+          shopt -s nullglob
+          files=(migrations/*.sql)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "no migration files found; skipping."
+            exit 0
+          fi
+
+          for f in "${files[@]}"; do
+            for pat in "${!patterns[@]}"; do
+              hits=$(grep -in -E "$pat" "$f" | grep -v 'REPLICATION-OK:' || true)
+              if [ -n "$hits" ]; then
+                echo "::error file=$f::replication-breaking DDL matched /$pat/ - ${patterns[$pat]}"
+                echo "$hits" | sed 's/^/  /'
+                fail=1
+              fi
+            done
+          done
+
+          if [ $fail -ne 0 ]; then
+            echo ""
+            echo "Replication-safety lint failed. Options:"
+            echo "  1. Rewrite the migration to avoid the blocked DDL."
+            echo "  2. Split the migration across a primary-then-standby sequence reviewed by a DBA."
+            echo "  3. Add a '-- REPLICATION-OK: <reason>' comment on the offending line after DBA review."
+            exit 1
+          fi
+          echo "migration replication lint: clean"

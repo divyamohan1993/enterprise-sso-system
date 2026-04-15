@@ -604,11 +604,30 @@ impl OrchestratorService {
         let credential_response_bytes = match opaque_resp1 {
             OpaqueResponse::LoginChallenge { credential_response } => credential_response,
             OpaqueResponse::Error { message } => {
-                session.fail(message.clone()).ok();
+                if let Err(close_err) = session.fail(message.clone()) {
+                    tracing::error!(
+                        target: "milnet::siem",
+                        error.code = "ORCH-SESSION-FAIL-001",
+                        error.stage = "opaque_login_challenge",
+                        error.message = %close_err,
+                        "failed to close orchestrator session cleanly after OPAQUE error"
+                    );
+                    common::siem::SecurityEvent::tamper_detected(
+                        &format!("orchestrator session fail/close error: {close_err}"),
+                    );
+                }
                 return Err(message);
             }
             _ => {
-                session.fail("unexpected OPAQUE response".into()).ok();
+                if let Err(close_err) = session.fail("unexpected OPAQUE response".into()) {
+                    tracing::error!(
+                        target: "milnet::siem",
+                        error.code = "ORCH-SESSION-FAIL-002",
+                        error.stage = "opaque_login_challenge_unexpected",
+                        error.message = %close_err,
+                        "failed to close orchestrator session cleanly"
+                    );
+                }
                 return Err("unexpected OPAQUE response to LoginStart".into());
             }
         };
@@ -630,7 +649,15 @@ impl OrchestratorService {
             .await
             .map_err(|e| format!("OPAQUE client login finish task: {e}"))?
             .map_err(|e| {
-                session.fail(format!("OPAQUE login finish: {e}")).ok();
+                if let Err(close_err) = session.fail(format!("OPAQUE login finish: {e}")) {
+                    tracing::error!(
+                        target: "milnet::siem",
+                        error.code = "ORCH-SESSION-FAIL-003",
+                        error.stage = "opaque_client_login_finish",
+                        error.message = %close_err,
+                        "failed to close orchestrator session cleanly after OPAQUE finish failure"
+                    );
+                }
                 format!("OPAQUE client login finish: {e}")
             })?;
 
@@ -660,11 +687,30 @@ impl OrchestratorService {
         let receipt = match opaque_resp2 {
             OpaqueResponse::LoginSuccess { receipt } => receipt,
             OpaqueResponse::Error { message } => {
-                session.fail(message.clone()).ok();
+                if let Err(close_err) = session.fail(message.clone()) {
+                    tracing::error!(
+                        target: "milnet::siem",
+                        error.code = "ORCH-SESSION-FAIL-004",
+                        error.stage = "opaque_login_result_error",
+                        error.message = %close_err,
+                        "failed to close orchestrator session cleanly after OPAQUE login result error"
+                    );
+                    common::siem::SecurityEvent::tamper_detected(
+                        &format!("orchestrator session fail/close error: {close_err}"),
+                    );
+                }
                 return Err(message);
             }
             _ => {
-                session.fail("unexpected OPAQUE response".into()).ok();
+                if let Err(close_err) = session.fail("unexpected OPAQUE response".into()) {
+                    tracing::error!(
+                        target: "milnet::siem",
+                        error.code = "ORCH-SESSION-FAIL-005",
+                        error.stage = "opaque_login_result_unexpected",
+                        error.message = %close_err,
+                        "failed to close orchestrator session cleanly"
+                    );
+                }
                 return Err("unexpected OPAQUE response to LoginFinish".into());
             }
         };
@@ -680,7 +726,18 @@ impl OrchestratorService {
             common::siem::SecurityEvent::tamper_detected(
                 &format!("independent receipt verification failed: {e}"),
             );
-            session.fail(format!("receipt verification: {e}")).ok();
+            if let Err(close_err) = session.fail(format!("receipt verification: {e}")) {
+                tracing::error!(
+                    target: "milnet::siem",
+                    error.code = "ORCH-SESSION-FAIL-006",
+                    error.stage = "receipt_verification",
+                    error.message = %close_err,
+                    "failed to close orchestrator session cleanly after receipt verification failure"
+                );
+                common::siem::SecurityEvent::tamper_detected(
+                    &format!("orchestrator session fail/close after receipt-verify: {close_err}"),
+                );
+            }
             return Err(format!("receipt verification failed: {e}"));
         }
 
@@ -690,7 +747,15 @@ impl OrchestratorService {
             rid[..16].copy_from_slice(receipt.user_id.as_bytes());
             rid[16..].copy_from_slice(&receipt.ceremony_session_id[..16]);
             if self.revocation_set.is_revoked(&rid) {
-                session.fail("receipt revoked by saga compensation".into()).ok();
+                if let Err(close_err) = session.fail("receipt revoked by saga compensation".into()) {
+                    tracing::error!(
+                        target: "milnet::siem",
+                        error.code = "ORCH-SESSION-FAIL-007",
+                        error.stage = "saga_revoked",
+                        error.message = %close_err,
+                        "failed to close orchestrator session cleanly after saga-compensation revocation"
+                    );
+                }
                 return Err("receipt revoked by saga compensation (prior TSS failure)".into());
             }
         }

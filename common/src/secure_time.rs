@@ -360,6 +360,20 @@ pub struct SecureTimeProvider {
 impl SecureTimeProvider {
     /// Create a new provider with the given configuration.
     pub fn new(config: AuthenticatedTimeConfig) -> Self {
+        // CNSA-CLOCK-UNAUTHENTICATED: surface the stub nature of this module
+        // loudly at every construction so SIEM/ops see the gap immediately.
+        // Roughtime and NTS-KE clients are not yet implemented; the current
+        // code paths return SystemTime::now() with placeholder signatures.
+        tracing::warn!(
+            target: "milnet::siem",
+            cnsa_gap = true,
+            severity = "WARNING",
+            event = "cnsa_clock_unauthenticated",
+            "CNSA-CLOCK-UNAUTHENTICATED: authenticated_now_us() currently \
+             returns SystemTime::now() and is NOT cryptographically \
+             authenticated. Roughtime/NTS clients are stubbed. Clock-skew \
+             attacks are NOT mitigated."
+        );
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -825,9 +839,40 @@ pub fn verify_roughtime_response_hybrid(response: &RoughtimeResponse) -> bool {
 }
 
 /// Try to obtain an authenticated timestamp in microseconds using
-/// `SecureTimeProvider` with the default configuration. Returns `None`
-/// if all authenticated sources fail, allowing the caller to fall back
-/// to the local system clock.
+/// `SecureTimeProvider` with the default configuration.
+///
+/// # ⚠ CNSA-CLOCK-UNAUTHENTICATED ⚠
+///
+/// **This function is NOT currently cryptographically authenticated.**
+/// The underlying Roughtime client (`query_roughtime_server`) and NTS-KE
+/// client (`query_ntp`) are simulation stubs that return `SystemTime::now()`
+/// with placeholder signature bytes. `verify_roughtime_response_hybrid`
+/// performs a length-check only — no Ed25519 or ML-DSA-87 signature
+/// verification against any trusted key is performed.
+///
+/// **Threat exposure:**
+/// - A passive attacker who can set the local wall clock (clock_settime,
+///   date -s, NTP poisoning of the host OS) defeats every security
+///   decision that calls this function.
+/// - A network attacker who can spoof UDP packets on the Roughtime port
+///   defeats this function trivially; there is no verification to fail.
+///
+/// **Do NOT rely on this function for security decisions that require
+/// authenticated time** until the Roughtime and NTS-KE clients land with
+/// real wire-format parsing and signature verification. Callers that
+/// currently use `SystemTime::now()` directly should continue to do so;
+/// switching to `authenticated_now_us()` does not reduce the attack
+/// surface until the clients are implemented.
+///
+/// A `tracing::warn!` event tagged `CNSA-CLOCK-UNAUTHENTICATED` is
+/// emitted on every `SecureTimeProvider::new()` call so SIEM can alert
+/// on this gap.
+// CAT-H-followup: implement real Roughtime (draft-ietf-ntp-roughtime:
+// nonce, CBOR tag parsing, Merkle root, Ed25519 verify against pinned
+// server keys) and real NTS-KE (RFC 8915: TLS 1.3 ALPN=ntske/1, cookie
+// exchange, NTPv4 with NTS extension fields, AEAD verify). Only then
+// may `authenticated_now_us()` return Some(_) with the `authenticated`
+// flag set to true.
 pub fn authenticated_now_us() -> Option<i64> {
     let provider = SecureTimeProvider::new(AuthenticatedTimeConfig::default());
     match provider.get_authenticated_time() {

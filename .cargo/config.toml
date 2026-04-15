@@ -1,0 +1,14 @@
+# CAT-K side-channel hardening: hardware AES + speculative-execution mitigations.
+#
+# target-cpu=x86-64-v3 enables AES-NI, PCLMULQDQ, AVX2, SSE4.2 — all hardware
+# crypto paths used by AES-256-GCM, AEGIS, GHASH and friends. This eliminates
+# the cache-timing oracle from software AES T-tables.
+#
+# +retpoline mitigates Spectre v2 (branch target injection) on x86_64. The
+# runtime side of the check lives in common::startup_checks::verify_spectre_mitigations.
+
+[build]
+rustflags = [
+    "-C", "target-cpu=x86-64-v3",
+    "-C", "target-feature=+aes,+pclmulqdq,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+retpoline",
+]

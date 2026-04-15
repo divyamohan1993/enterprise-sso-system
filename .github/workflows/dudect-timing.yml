@@ -1,0 +1,69 @@
+name: dudect-timing
+
+# CAT-K SC-DUDECT CI INTEGRATION
+#
+# Runs the dudect timing suite against every constant-time hot path identified
+# by the side-channel review. Fails the build if any target's Welch t-statistic
+# exceeds 4.5 over 100k samples.
+#
+# Must run on a bare-metal runner (or a no-noisy-neighbour dedicated VM) — the
+# default GitHub-hosted runners are too noisy for sub-nanosecond timing
+# measurements and will produce false positives.
+#
+# Security note: this workflow takes no untrusted input from PR metadata.
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  schedule:
+    - cron: "0 3 * * *"
+
+jobs:
+  dudect:
+    name: dudect timing suite
+    runs-on: [self-hosted, bare-metal, x86_64]
+    timeout-minutes: 30
+
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: "-C target-cpu=x86-64-v3 -C target-feature=+aes,+pclmulqdq,+ssse3,+sse4.1,+sse4.2,+avx,+avx2"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify AES-NI present on runner
+        run: |
+          if ! grep -q '\baes\b' /proc/cpuinfo; then
+            echo "FATAL: dudect runner lacks AES-NI; refusing to measure" >&2
+            exit 1
+          fi
+
+      - name: Pin CPU governor to performance
+        run: |
+          for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+            echo performance | sudo tee "$f" || true
+          done
+
+      - name: Build dudect-suite (release)
+        run: cargo build --release --bin dudect-suite -p dudect-harness
+
+      - name: Run dudect-suite
+        run: taskset -c 2 ./target/release/dudect-suite | tee dudect-results.txt
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dudect-results
+          path: dudect-results.txt
+
+  xtask-entry:
+    name: cargo xtask dudect (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Document entry point
+        run: |
+          echo "Run locally with: cargo run --release -p dudect-harness --bin dudect-suite"

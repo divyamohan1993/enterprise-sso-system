@@ -492,6 +492,42 @@ const _TLS_PQ_LEVEL5_COMPILE_WARNING: () = {
     // not require TOP SECRET can continue to compile.
 };
 
+/// CAT-A task 3: durable, blocking SIEM delivery with a 30s deadline.
+/// Writes one JSON line to `MILNET_SIEM_AUDIT_LOG` (default
+/// `/var/log/milnet/siem-audit.log`) and fsyncs before returning. The
+/// caller MUST abort on Err when military mode is active.
+fn deliver_blocking_siem_event(tag: &str, action: &str) -> Result<(), String> {
+    use std::io::Write;
+    let path = std::env::var("MILNET_SIEM_AUDIT_LOG")
+        .unwrap_or_else(|_| "/var/log/milnet/siem-audit.log".to_string());
+    let start = std::time::Instant::now();
+    let deadline = std::time::Duration::from_secs(30);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = format!(
+        r#"{{"ts":{ts},"tag":"{tag}","action":"{action}","severity":"CRITICAL"}}"#,
+    );
+    loop {
+        match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(mut f) => {
+                f.write_all(line.as_bytes())
+                    .and_then(|_| f.write_all(b"\n"))
+                    .and_then(|_| f.sync_all())
+                    .map_err(|e| format!("siem write/fsync {path}: {e}"))?;
+                return Ok(());
+            }
+            Err(e) => {
+                if start.elapsed() >= deadline {
+                    return Err(format!("siem open {path} deadline: {e}"));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
+    }
+}
+
 fn cnsa2_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
     let military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
         .map(|v| v == "1")
@@ -575,20 +611,26 @@ fn cnsa2_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
         std::process::exit(198);
     }
 
-    // CR-10: In military mode, emit SIEM:CRITICAL documenting the Level 3 gap.
-    // Do NOT abort: app-layer X-Wing provides Level 5 defense-in-depth.
+    // CR-10 / CAT-A task 3: military mode emits SIEM:CRITICAL tagged
+    // `CNSA-2.0-GAP` and blocks on durable SIEM delivery before continuing.
     if military {
         tracing::error!(
             target: "siem",
             category = "security",
             severity = "CRITICAL",
-            action = "tls_pq_level3_gap",
-            "SIEM:CRITICAL: MILNET_MILITARY_DEPLOYMENT=1 but TLS key exchange uses \
+            action = "CNSA-2.0-GAP",
+            "CNSA-2.0-GAP: MILNET_MILITARY_DEPLOYMENT=1 but TLS key exchange uses \
              ML-KEM-768 (NIST Level 3) instead of ML-KEM-1024 (NIST Level 5). \
              rustls/aws-lc-rs does not yet expose X25519MLKEM1024. Application-layer \
-             X-Wing (ML-KEM-1024, Level 5) provides defense-in-depth. Set \
-             MILNET_TLS_PQ_LEVEL=5 to block startup until upstream adds support."
+             X-Wing provides Level 5 defense-in-depth."
         );
+        if let Err(e) = deliver_blocking_siem_event("CNSA-2.0-GAP", "tls_startup_level3_gap") {
+            tracing::error!(
+                target: "siem",
+                "FATAL: blocking SIEM delivery failed in military mode: {e}. Aborting."
+            );
+            std::process::exit(198);
+        }
     }
 
     // CR-11: PQ-only is the DEFAULT. Classical X25519 requires explicit opt-in.

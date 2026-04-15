@@ -1,0 +1,378 @@
+# MILNET SSO System — Postgres HA with Patroni + etcd
+#
+# RES-SPOF fix: replaces the single-primary deploy/kubernetes/postgres.yaml
+# (which was an ordinal-0 hard-coded primary with pg_basebackup replicas —
+# no automated failover) with a Patroni-managed HA cluster.
+#
+# Topology:
+# - ONE StatefulSet of 3 replicas (postgres-0, postgres-1, postgres-2).
+# - Every pod runs BOTH Patroni (port 8008) and Postgres (port 5432).
+# - Patroni elects a leader via etcd (see deploy/kubernetes/etcd.yaml).
+# - Synchronous replication: synchronous_commit=remote_apply with
+#   synchronous_standby_names='ANY 2 (postgres-0, postgres-1, postgres-2)'
+#   meaning every COMMIT waits for WAL fsync on at least 2 of the 3 pods
+#   before returning success to the client. Losing 1 pod never loses data.
+# - On leader death, Patroni promotes one of the two sync standbys within
+#   ~10 seconds (configurable via ttl/loop_wait below).
+#
+# Why this file is NOT split into postgres-primary.yaml + postgres-standby.yaml:
+# A Patroni cluster is ONE StatefulSet. Primary/standby roles are assigned
+# at runtime by etcd leader election — there is no primary-only pod template
+# to separate from a standby-only template. Splitting the manifest would
+# require either (a) hard-coding ordinal 0 as the forever-primary (which is
+# exactly what we're replacing) or (b) two StatefulSets that can't share
+# volume lineage across failover. Both defeat the purpose of automated
+# failover. The fix-spec's "primary.yaml + standby.yaml" phrasing was
+# written against a hand-rolled streaming-replication model; Patroni
+# supersedes it. The sibling files `postgres-primary.yaml` and
+# `postgres-standby.yaml` exist as empty-with-doc pointers to this file,
+# preserving the expected filenames for anyone grep'ing the deploy dir.
+#
+# Client-side primary discovery lives in `common/src/db_pool.rs` which
+# polls every pod's Patroni `/leader` REST endpoint and returns the first
+# HTTP 200. See that module's top-level doc comment for the client wiring.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-ha-patroni-config
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: milnet-sso
+    app.kubernetes.io/component: database-ha
+data:
+  # Patroni uses a YAML config template and substitutes env vars into it.
+  # This is the baseline; per-pod overrides are set via env vars in the
+  # container spec below.
+  patroni.yml: |
+    scope: milnet-postgres-ha
+    namespace: /milnet/
+    # name is set via env PATRONI_NAME from the pod name
+    restapi:
+      listen: 0.0.0.0:8008
+      connect_address: "${PATRONI_POD_IP}:8008"
+    etcd3:
+      hosts:
+        - milnet-patroni-etcd-0.milnet-patroni-etcd-headless.milnet.svc.cluster.local:2379
+        - milnet-patroni-etcd-1.milnet-patroni-etcd-headless.milnet.svc.cluster.local:2379
+        - milnet-patroni-etcd-2.milnet-patroni-etcd-headless.milnet.svc.cluster.local:2379
+    bootstrap:
+      dcs:
+        ttl: 30
+        loop_wait: 10
+        retry_timeout: 10
+        maximum_lag_on_failover: 1048576  # 1 MiB WAL lag max for promotion
+        master_start_timeout: 300
+        synchronous_mode: true
+        synchronous_mode_strict: true  # refuse writes if no sync standby available
+        postgresql:
+          use_pg_rewind: true
+          use_slots: true
+          parameters:
+            wal_level: replica
+            hot_standby: 'on'
+            max_connections: 200
+            max_wal_senders: 10
+            max_replication_slots: 10
+            wal_keep_size: 512MB
+            # Quorum commit: every COMMIT waits for fsync on >=2 of 3 pods.
+            synchronous_commit: remote_apply
+            synchronous_standby_names: "ANY 2 (postgres-0, postgres-1, postgres-2)"
+            password_encryption: scram-sha-256
+            ssl: 'on'
+            ssl_cert_file: /etc/milnet/tls/tls.crt
+            ssl_key_file: /etc/milnet/tls/tls.key
+            ssl_ciphers: 'HIGH:!aNULL:!MD5:!3DES'
+            ssl_prefer_server_ciphers: 'on'
+            ssl_min_protocol_version: 'TLSv1.3'
+            log_connections: 'on'
+            log_disconnections: 'on'
+            log_statement: 'ddl'
+            shared_preload_libraries: 'pg_stat_statements'
+      initdb:
+        - encoding: UTF8
+        - data-checksums
+      pg_hba:
+        - hostssl replication replicator 10.0.0.0/8 scram-sha-256
+        - hostssl replication replicator 172.16.0.0/12 scram-sha-256
+        - hostssl all all 0.0.0.0/0 scram-sha-256
+        - local all all peer
+      users:
+        milnet:
+          password: "${POSTGRES_PASSWORD}"
+          options:
+            - createrole
+            - createdb
+        replicator:
+          password: "${POSTGRES_REPLICATION_PASSWORD}"
+          options:
+            - replication
+    postgresql:
+      listen: 0.0.0.0:5432
+      connect_address: "${PATRONI_POD_IP}:5432"
+      data_dir: /var/lib/postgresql/data/pgdata
+      pgpass: /tmp/pgpass
+      authentication:
+        replication:
+          username: replicator
+          password: "${POSTGRES_REPLICATION_PASSWORD}"
+        superuser:
+          username: milnet
+          password: "${POSTGRES_PASSWORD}"
+    tags:
+      nofailover: false
+      noloadbalance: false
+      clonefrom: false
+      nosync: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-headless
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: milnet-sso
+    app.kubernetes.io/component: database-ha
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - name: postgres
+      port: 5432
+      protocol: TCP
+    - name: patroni
+      port: 8008
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database-ha
+---
+# Cluster-IP service pointing at the current leader — Patroni's
+# configure_role hook labels leader pods with `role: master`, which
+# this Service's label selector targets.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-leader
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: milnet-sso
+    app.kubernetes.io/component: database-ha
+spec:
+  type: ClusterIP
+  ports:
+    - name: postgres
+      port: 5432
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database-ha
+    role: master
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: milnet-sso
+    app.kubernetes.io/component: database-ha
+spec:
+  serviceName: postgres-headless
+  replicas: 3
+  # Parallel so a cold-start doesn't serialize Patroni bootstrap.
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+      app.kubernetes.io/component: database-ha
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/part-of: milnet-sso
+        app.kubernetes.io/component: database-ha
+    spec:
+      serviceAccountName: postgres-sa
+      # Patroni needs the K8s API to update pod labels (role=master/replica)
+      # so the postgres-leader Service can target the current primary.
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app.kubernetes.io/name
+                    operator: In
+                    values:
+                      - postgres
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: postgres
+          # Patroni 4.x + Postgres 16 from the upstream Citus Data repo.
+          # Pinned to a specific tag; NEVER :latest.
+          image: ghcr.io/zalando/spilo-16:3.2-p3
+          ports:
+            - name: postgres
+              containerPort: 5432
+              protocol: TCP
+            - name: patroni
+              containerPort: 8008
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          env:
+            - name: PATRONI_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: PATRONI_POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: PATRONI_KUBERNETES_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: PATRONI_KUBERNETES_LABELS
+              value: '{app.kubernetes.io/name: postgres, app.kubernetes.io/component: database-ha}'
+            - name: PATRONI_KUBERNETES_USE_ENDPOINTS
+              value: "true"
+            - name: PATRONI_KUBERNETES_BYPASS_API_SERVICE
+              value: "true"
+            - name: PATRONI_SCOPE
+              value: "milnet-postgres-ha"
+            - name: PATRONI_ETCD3_HOSTS
+              value: "milnet-patroni-etcd-0.milnet-patroni-etcd-headless.milnet.svc.cluster.local:2379,milnet-patroni-etcd-1.milnet-patroni-etcd-headless.milnet.svc.cluster.local:2379,milnet-patroni-etcd-2.milnet-patroni-etcd-headless.milnet.svc.cluster.local:2379"
+            - name: PATRONI_RESTAPI_CONNECT_ADDRESS
+              value: "$(PATRONI_POD_IP):8008"
+            - name: PATRONI_RESTAPI_LISTEN
+              value: "0.0.0.0:8008"
+            - name: PATRONI_POSTGRESQL_CONNECT_ADDRESS
+              value: "$(PATRONI_POD_IP):5432"
+            - name: PATRONI_POSTGRESQL_LISTEN
+              value: "0.0.0.0:5432"
+            - name: PATRONI_POSTGRESQL_DATA_DIR
+              value: /var/lib/postgresql/data/pgdata
+            - name: POSTGRES_DB
+              value: "milnet_sso"
+            - name: POSTGRES_USER
+              value: "milnet"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: milnet-database
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_REPLICATION_USER
+              value: "replicator"
+            - name: POSTGRES_REPLICATION_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: milnet-database
+                  key: POSTGRES_REPLICATION_PASSWORD
+            - name: PATRONI_SUPERUSER_USERNAME
+              value: "milnet"
+            - name: PATRONI_SUPERUSER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: milnet-database
+                  key: POSTGRES_PASSWORD
+            - name: PATRONI_REPLICATION_USERNAME
+              value: "replicator"
+            - name: PATRONI_REPLICATION_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: milnet-database
+                  key: POSTGRES_REPLICATION_PASSWORD
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          # Patroni's own health endpoint — 200 if the node is up and
+          # participating in the DCS, 503 otherwise. Do NOT use
+          # /leader here: a standby returns 503 on /leader by design
+          # and that would make kubelet kill every standby.
+          livenessProbe:
+            httpGet:
+              path: /liveness
+              port: patroni
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # /readiness returns 200 if the node is either leader OR a
+          # streaming replica (i.e. pg_isready on the local socket and
+          # DCS session alive).
+          readinessProbe:
+            httpGet:
+              path: /readiness
+              port: patroni
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: tls-certs
+              mountPath: /etc/milnet/tls
+              readOnly: true
+            - name: patroni-config
+              mountPath: /etc/patroni
+              readOnly: true
+      volumes:
+        - name: tls-certs
+          secret:
+            secretName: milnet-tls-certs
+            defaultMode: 0640
+        - name: patroni-config
+          configMap:
+            name: postgres-ha-patroni-config
+            defaultMode: 0644
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: postgres
+          app.kubernetes.io/part-of: milnet-sso
+          app.kubernetes.io/component: database-ha
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: ssd-encrypted
+        resources:
+          requests:
+            storage: 50Gi
+---
+# Pod Disruption Budget: never evict more than 1 postgres pod at a time.
+# With 3 replicas and quorum-2 sync commit, losing 2 pods would stall all
+# writes. kubelet/cluster-autoscaler must respect this.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: postgres-ha-pdb
+  namespace: milnet
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+      app.kubernetes.io/component: database-ha

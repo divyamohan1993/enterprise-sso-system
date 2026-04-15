@@ -17,6 +17,9 @@ use ratchet::manager::{RatchetAction, RatchetRequest, RatchetResponse};
 
 #[tokio::main]
 async fn main() {
+    // MUST be first: harden process before any allocation that could hold a secret.
+    // OnceLock-idempotent with later PR_SET_DUMPABLE calls.
+    crypto::process_harden::harden_early();
     tracing_subscriber::fmt::init();
 
     // Anchor monotonic time before any crypto/auth operations.

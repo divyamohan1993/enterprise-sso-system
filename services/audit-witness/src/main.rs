@@ -1,6 +1,7 @@
-// Limited unsafe is required for the SO_PEERCRED getsockopt call below.
-// All other code paths must be safe — keep the allow scoped to this module.
-#![allow(unsafe_code)]
+// CQ-UNSAFE: SO_PEERCRED now goes through the safe `nix` wrapper
+// (`nix::sys::socket::getsockopt` with `sockopt::PeerCredentials`).
+// No `unsafe` remains in this crate.
+#![deny(unsafe_code)]
 //! audit-witness — D1 fix for co-located witness signing key.
 //!
 //! Listens on a Unix domain socket at `/run/milnet/audit-witness.sock` and
@@ -49,14 +50,9 @@ const AUDIT_UID_ENV: &str = "MILNET_AUDIT_UID";
 /// Env var that supplies the audit service's pid for the startup co-location check.
 const AUDIT_PID_ENV: &str = "MILNET_AUDIT_PID";
 
-#[repr(C)]
-struct Ucred {
-    pid: i32,
-    uid: u32,
-    gid: u32,
-}
-
 fn main() {
+    // MUST be first: harden process before any allocation that could hold a secret.
+    crypto::process_harden::harden_early();
     tracing_subscriber::fmt::init();
 
     let sock_path = std::env::var("MILNET_AUDIT_WITNESS_SOCK")
@@ -269,35 +265,24 @@ fn load_signing_key_from_fd(fd: i32) -> crypto::pq_sign::PqSigningKey {
 }
 
 fn verify_peer_uid(stream: &UnixStream, expected_uid: u32) -> Result<(), String> {
-    use std::os::unix::io::AsRawFd;
-    let fd = stream.as_raw_fd();
-    let mut cred = Ucred { pid: 0, uid: u32::MAX, gid: u32::MAX };
-    let mut len = std::mem::size_of::<Ucred>() as libc::socklen_t;
-    let rc = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            &mut cred as *mut _ as *mut libc::c_void,
-            &mut len,
-        )
-    };
-    if rc != 0 {
-        return Err(format!(
-            "getsockopt(SO_PEERCRED) failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    if cred.uid != expected_uid {
+    // CQ-UNSAFE: use `nix`'s safe typed wrapper instead of the raw
+    // `libc::getsockopt` + out-parameter dance. The wrapper enforces the
+    // correct `optlen` and struct layout at compile time.
+    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+    let peer = getsockopt(stream, PeerCredentials)
+        .map_err(|e| format!("getsockopt(SO_PEERCRED) failed: {e}"))?;
+    let peer_uid = peer.uid();
+    let peer_pid = peer.pid();
+    if peer_uid != expected_uid {
         return Err(format!(
             "peer uid {} != expected {} (pid {})",
-            cred.uid, expected_uid, cred.pid
+            peer_uid, expected_uid, peer_pid
         ));
     }
-    if cred.pid == std::process::id() as i32 {
+    if peer_pid == std::process::id() as i32 {
         return Err(format!(
             "peer pid {} equals witness pid -- co-location prohibited",
-            cred.pid
+            peer_pid
         ));
     }
     Ok(())

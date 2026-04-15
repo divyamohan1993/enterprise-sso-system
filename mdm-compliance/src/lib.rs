@@ -18,6 +18,21 @@ pub enum MdmError {
     Auth(String),
     #[error("parse: {0}")]
     Parse(String),
+    /// Adapter is not implemented in this build. CAT-I fail-closed rule:
+    /// callers MUST treat this as DENY for Tier 1 (Sovereign) classification.
+    #[error("not implemented: {adapter}")]
+    NotImplemented { adapter: &'static str },
+}
+
+/// CAT-I fail-closed helper: map an MDM fetch result to a policy decision
+/// for high-assurance tiers. A `NotImplemented` or any other error MUST
+/// deny access at Tier 1 (Sovereign). Unknown posture is never "allow".
+///
+/// Consumers in `common::conditional_access` should call this when they
+/// consume an MDM result on the authorization path.
+pub fn fail_closed_for_tier1<T>(result: &Result<T, MdmError>) -> bool {
+    // Returns true iff access should be DENIED.
+    result.is_err()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,8 +70,11 @@ pub struct IntuneAdapter {
 impl MdmAdapter for IntuneAdapter {
     fn name(&self) -> &'static str { "intune" }
     async fn fetch(&self) -> Result<Vec<DevicePosture>, MdmError> {
-        // Real Graph API call lives here; returning empty until tenant is provisioned.
-        Ok(vec![])
+        // CAT-I: Real Graph API integration is not implemented in this build.
+        // Fail closed — do NOT return an empty vec (which would be read as
+        // "no non-compliant devices"). Callers on the authorization path
+        // must treat this as DENY for Tier 1.
+        Err(MdmError::NotImplemented { adapter: "intune" })
     }
 }
 
@@ -69,7 +87,10 @@ pub struct JamfAdapter {
 #[async_trait]
 impl MdmAdapter for JamfAdapter {
     fn name(&self) -> &'static str { "jamf" }
-    async fn fetch(&self) -> Result<Vec<DevicePosture>, MdmError> { Ok(vec![]) }
+    async fn fetch(&self) -> Result<Vec<DevicePosture>, MdmError> {
+        // CAT-I: fail-closed stub. See IntuneAdapter::fetch for rationale.
+        Err(MdmError::NotImplemented { adapter: "jamf" })
+    }
 }
 
 pub struct WorkspaceOneAdapter {
@@ -81,7 +102,10 @@ pub struct WorkspaceOneAdapter {
 #[async_trait]
 impl MdmAdapter for WorkspaceOneAdapter {
     fn name(&self) -> &'static str { "workspaceone" }
-    async fn fetch(&self) -> Result<Vec<DevicePosture>, MdmError> { Ok(vec![]) }
+    async fn fetch(&self) -> Result<Vec<DevicePosture>, MdmError> {
+        // CAT-I: fail-closed stub. See IntuneAdapter::fetch for rationale.
+        Err(MdmError::NotImplemented { adapter: "workspaceone" })
+    }
 }
 
 pub async fn poll_loop<F>(

@@ -397,37 +397,61 @@ pub fn combined_entropy_with_retries(max_retries: u32) -> Result<[u8; 32], &'sta
 pub fn combined_entropy() -> [u8; 32] {
     let output = match combined_entropy_with_retries(3) {
         Ok(output) => output,
-        Err(msg) => panic!("ENTROPY HEALTH FAILURE: {}", msg),
+        Err(msg) => {
+            // CQ-PANIC: graceful military-mode abort path. Log SIEM event
+            // first so logging infra can capture it, then abort() — not
+            // panic! — so no unwind-based recovery is attempted and keys
+            // can never be derived from a compromised entropy source.
+            tracing::error!(
+                "SIEM:CRITICAL ENTROPY HEALTH FAILURE (all retries exhausted): {}. \
+                 Aborting — cannot safely generate keys.",
+                msg
+            );
+            std::process::abort();
+        }
     };
 
-    // Post-generation validation: reject degenerate output
-    post_generation_validate(&output);
+    // Post-generation validation: reject degenerate output.
+    if let Err(e) = post_generation_validate(&output) {
+        tracing::error!(
+            "SIEM:CRITICAL ENTROPY POST-GEN VALIDATION FAILED: {}. Aborting.",
+            e
+        );
+        std::process::abort();
+    }
 
     output
 }
 
-/// Validate entropy output after generation. PANICs on degenerate output.
+/// Validate entropy output after generation. Returns Err on degenerate output.
+///
+/// CQ-PANIC: was previously panicking; now returns typed error so callers can
+/// trigger a graceful military-mode abort path rather than crash via panic.
 ///
 /// Checks:
 /// 1. Output is not all zeros
 /// 2. Output halves (first 16 bytes vs last 16 bytes) are different
-fn post_generation_validate(output: &[u8; 32]) {
+fn post_generation_validate(output: &[u8; 32]) -> Result<(), EntropyError> {
     // Check for all-zero output
     let mut acc: u8 = 0;
     for &b in output.iter() {
         acc |= b;
     }
     if acc == 0 {
-        panic!("ENTROPY HEALTH FAILURE: generated output is all zeros — entropy source catastrophically broken");
+        return Err(EntropyError::HealthTestFailed(
+            "generated output is all zeros — entropy source catastrophically broken".to_string(),
+        ));
     }
 
     // Check that output halves differ
     if output[..16] == output[16..] {
-        panic!(
-            "ENTROPY HEALTH FAILURE: generated output halves are identical — \
-             entropy source may be stuck or looping"
-        );
+        return Err(EntropyError::HealthTestFailed(
+            "generated output halves are identical — entropy source may be stuck or looping"
+                .to_string(),
+        ));
     }
+
+    Ok(())
 }
 
 /// Generate a 32-byte nonce using the hardened entropy system.
@@ -465,11 +489,13 @@ pub fn startup_entropy_health_check() {
         match combined_entropy_checked() {
             Ok(sample) => all_bytes.extend_from_slice(&sample),
             Err(e) => {
-                panic!(
-                    "ENTROPY HEALTH FAILURE at startup: cannot generate entropy: {}. \
-                     Refusing to start — key generation would be insecure.",
+                // CQ-PANIC: graceful abort rather than panic at startup.
+                tracing::error!(
+                    "SIEM:CRITICAL ENTROPY HEALTH FAILURE at startup: cannot generate entropy: {}. \
+                     Refusing to start — key generation would be insecure. Aborting.",
                     e
                 );
+                std::process::abort();
             }
         }
     }
@@ -492,12 +518,14 @@ pub fn startup_entropy_health_check() {
     // We use 400 as a generous threshold to avoid false positives.
     let critical_value = 400.0;
     if chi_squared > critical_value {
-        panic!(
-            "ENTROPY HEALTH FAILURE at startup: chi-squared test failed \
+        // CQ-PANIC: graceful abort rather than panic on chi-squared failure.
+        tracing::error!(
+            "SIEM:CRITICAL ENTROPY HEALTH FAILURE at startup: chi-squared test failed \
              (chi2 = {:.1}, critical = {:.1}). Entropy source appears \
-             non-random. Refusing to start — key generation would be insecure.",
+             non-random. Refusing to start — key generation would be insecure. Aborting.",
             chi_squared, critical_value
         );
+        std::process::abort();
     }
 
     tracing::info!(

@@ -100,6 +100,16 @@ pub struct AssuranceLevelBinding {
 /// Returns `None` for unrecognized tier values.
 pub fn assurance_levels_for_tier(tier: u8) -> Option<AssuranceLevelBinding> {
     match tier {
+        // AAL3 claim removed — crypto::cac is a stub. See CAT-I.
+        //
+        // The Aal3 enum value is retained here because it is the *declared
+        // target* for Sovereign tier and is referenced by validation rules
+        // (see `AAL3_HARDWARE_MFA` in `validate_assurance_level`). However,
+        // the underlying PKCS#11 CAC/PIV implementation at
+        // `crypto/src/cac.rs` is a stub, so any actual assertion of AAL3
+        // compliance in this build is a paper claim, not a cryptographic
+        // one. Deployments that set `MILNET_REQUIRE_AAL3=1` will panic at
+        // startup via `crypto::cac::init_cac_or_panic()`.
         1 => Some(AssuranceLevelBinding {
             ial: IdentityAssuranceLevel::Ial3,
             aal: AuthenticatorAssuranceLevel::Aal3,

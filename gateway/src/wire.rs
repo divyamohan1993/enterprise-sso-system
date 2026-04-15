@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::device_attestation::DeviceAttestationAssertion;
+
 /// Serde helper for `[u8; 64]` — serde only supports arrays up to 32 natively.
 mod byte_array_64 {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -36,12 +38,23 @@ pub struct AuthRequest {
     /// Target audience for the token (e.g. a resource server identifier).
     #[serde(default)]
     pub audience: Option<String>,
-    /// F3: client-declared TPM re-attestation age in seconds. Absent = no
-    /// fresh attestation signal; the orchestrator fail-closes on >7d stale.
-    /// Legitimate clients populate this from their local TPM attestation
-    /// timestamp. Field is threaded through gateway → orchestrator.
+    /// DEPRECATED: unsigned client-declared age. Retained for wire
+    /// compatibility with downstream crates that still consume the f64.
+    /// The gateway no longer trusts this value when
+    /// `device_attestation` is present; the validated assertion's
+    /// `issued_at_secs` is authoritative. A future wave will remove
+    /// this field entirely (cross-CAT migration).
     #[serde(default)]
     pub device_attestation_age_secs: Option<f64>,
+    /// GW-ATTEST: signed device attestation assertion. The gateway
+    /// validates the signature, nonce binding, signer, and freshness;
+    /// only the validated `issued_at_secs` integer is forwarded
+    /// (via `device_attestation_age_secs` on `OrchestratorRequest`) to
+    /// the orchestrator. `None` means no signed attestation was
+    /// presented — in military deployment the gateway rejects such
+    /// requests fail-closed via `validate_or_reject_attestation`.
+    #[serde(default)]
+    pub device_attestation: Option<DeviceAttestationAssertion>,
 }
 
 /// SECURITY: Redact password from Debug output and zeroize on drop.
@@ -185,6 +198,7 @@ mod tests {
             password: vec![0x01, 0x02, 0x03],
             audience: Some("resource-server".into()),
             device_attestation_age_secs: None,
+            device_attestation: None,
         };
         let debug_str = format!("{:?}", req);
         assert!(
@@ -206,6 +220,7 @@ mod tests {
             password: vec![0xFF; 32],
             audience: None,
             device_attestation_age_secs: None,
+            device_attestation: None,
         };
         // Manually call drop to trigger zeroize.
         let pw_ptr = req.password.as_ptr();
@@ -225,6 +240,7 @@ mod tests {
             password: vec![0xDE, 0xAD],
             audience: Some("api.example.com".into()),
             device_attestation_age_secs: None,
+            device_attestation: None,
         };
         let bytes = postcard::to_allocvec(&req).expect("serialize AuthRequest");
         let recovered: AuthRequest = postcard::from_bytes(&bytes).expect("deserialize AuthRequest");
@@ -242,6 +258,7 @@ mod tests {
             password: vec![1],
             audience: None,
             device_attestation_age_secs: None,
+            device_attestation: None,
         };
         let bytes = postcard::to_allocvec(&req).unwrap();
         let recovered: AuthRequest = postcard::from_bytes(&bytes).unwrap();

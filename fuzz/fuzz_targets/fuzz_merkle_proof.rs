@@ -10,8 +10,19 @@ fuzz_target!(|data: &[u8]| {
     root.copy_from_slice(&data[..64]);
     let mut leaf = [0u8; 64];
     leaf.copy_from_slice(&data[64..128]);
-    let index = u64::from_le_bytes(data[128..136].try_into().unwrap()) as usize;
-    let tree_size = u64::from_le_bytes(data[136..144].try_into().unwrap()) as usize;
+    // Clamp untrusted length prefixes to a fuzz-safe ceiling (1 << 20 leaves)
+    // to prevent allocation blow-up and unreachable-branch explosion.
+    const FUZZ_MAX_TREE: usize = 1 << 20;
+    let raw_tree_size = u64::from_le_bytes(data[136..144].try_into().unwrap()) as usize;
+    let tree_size = raw_tree_size.min(FUZZ_MAX_TREE);
+    if tree_size == 0 {
+        return;
+    }
+    let raw_index = u64::from_le_bytes(data[128..136].try_into().unwrap()) as usize;
+    if raw_index >= tree_size {
+        return;
+    }
+    let index = raw_index;
 
     // Build proof elements from remaining data (64 bytes each)
     let remaining = &data[144..];

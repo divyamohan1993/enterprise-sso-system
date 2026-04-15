@@ -7,6 +7,8 @@
 use std::io::Read;
 
 fn main() {
+    // MUST be first: harden process before any allocation that could hold a secret.
+    crypto::process_harden::harden_early();
     let mut buf = Vec::new();
     if let Err(e) = std::io::stdin().read_to_end(&mut buf) {
         eprintln!("verifier-minimal: read stdin failed: {}", e);

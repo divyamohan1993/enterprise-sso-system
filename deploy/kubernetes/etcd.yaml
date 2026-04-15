@@ -1,0 +1,222 @@
+# MILNET SSO System — etcd (Patroni DCS backend)
+#
+# 3-node etcd StatefulSet used EXCLUSIVELY as the Distributed Configuration
+# Store (DCS) for Patroni's Postgres leader election. This etcd cluster is
+# NOT general-purpose — application services MUST NOT read or write to it.
+# Only the Patroni agents inside each postgres pod are permitted clients,
+# enforced by the NetworkPolicy block further down.
+#
+# Why etcd and not Consul/ZooKeeper:
+# - Patroni ships first-class etcd v3 client support
+# - etcd's Raft + linearizable reads map cleanly onto Patroni's "leader key
+#   TTL refresh" pattern, which needs strict consistency
+# - Smaller operational surface than Consul (no DNS, no health check layer)
+#
+# SIZING: 3 replicas, single-AZ, anti-affinity by hostname. For cross-AZ
+# quorum (5 replicas spread across 3 AZs) see deploy/kubernetes/prod/
+# overlays.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: milnet-patroni-etcd-headless
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: milnet-patroni-etcd
+    app.kubernetes.io/part-of: milnet-sso
+    app.kubernetes.io/component: patroni-dcs
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - name: client
+      port: 2379
+      protocol: TCP
+    - name: peer
+      port: 2380
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: milnet-patroni-etcd
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: milnet-patroni-etcd
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: milnet-patroni-etcd
+    app.kubernetes.io/part-of: milnet-sso
+spec:
+  type: ClusterIP
+  ports:
+    - name: client
+      port: 2379
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: milnet-patroni-etcd
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: milnet-patroni-etcd
+  namespace: milnet
+  labels:
+    app.kubernetes.io/name: milnet-patroni-etcd
+    app.kubernetes.io/part-of: milnet-sso
+    app.kubernetes.io/component: patroni-dcs
+spec:
+  serviceName: milnet-patroni-etcd-headless
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: milnet-patroni-etcd
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: milnet-patroni-etcd
+        app.kubernetes.io/part-of: milnet-sso
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app.kubernetes.io/name
+                    operator: In
+                    values:
+                      - milnet-patroni-etcd
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: etcd
+          # Pinned to a specific digest-addressable tag. NEVER :latest.
+          image: quay.io/coreos/etcd:v3.5.15
+          ports:
+            - name: client
+              containerPort: 2379
+              protocol: TCP
+            - name: peer
+              containerPort: 2380
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "250m"
+              memory: 256Mi
+            limits:
+              cpu: "500m"
+              memory: 512Mi
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: SET_NAME
+              value: "milnet-patroni-etcd"
+            - name: ETCD_NAME
+              value: "$(POD_NAME)"
+            - name: ETCD_DATA_DIR
+              value: "/var/lib/etcd/default.etcd"
+            - name: ETCD_INITIAL_CLUSTER_TOKEN
+              value: "milnet-patroni-etcd-v1"
+            - name: ETCD_INITIAL_CLUSTER_STATE
+              value: "new"
+            - name: ETCD_LISTEN_PEER_URLS
+              value: "http://0.0.0.0:2380"
+            - name: ETCD_LISTEN_CLIENT_URLS
+              value: "http://0.0.0.0:2379"
+            - name: ETCD_ADVERTISE_CLIENT_URLS
+              value: "http://$(POD_NAME).$(SET_NAME)-headless.$(POD_NAMESPACE).svc.cluster.local:2379"
+            - name: ETCD_INITIAL_ADVERTISE_PEER_URLS
+              value: "http://$(POD_NAME).$(SET_NAME)-headless.$(POD_NAMESPACE).svc.cluster.local:2380"
+            - name: ETCD_INITIAL_CLUSTER
+              value: "milnet-patroni-etcd-0=http://milnet-patroni-etcd-0.milnet-patroni-etcd-headless.milnet.svc.cluster.local:2380,milnet-patroni-etcd-1=http://milnet-patroni-etcd-1.milnet-patroni-etcd-headless.milnet.svc.cluster.local:2380,milnet-patroni-etcd-2=http://milnet-patroni-etcd-2.milnet-patroni-etcd-headless.milnet.svc.cluster.local:2380"
+            # Keep the etcd DB small — Patroni writes ~100B per leader
+            # refresh every 10s. 64 MiB is 3-4 orders of magnitude larger
+            # than any realistic working set for this workload.
+            - name: ETCD_QUOTA_BACKEND_BYTES
+              value: "67108864"
+            - name: ETCD_AUTO_COMPACTION_MODE
+              value: "periodic"
+            - name: ETCD_AUTO_COMPACTION_RETENTION
+              value: "1h"
+            - name: ETCD_MAX_REQUEST_BYTES
+              value: "1572864"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: client
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: client
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/etcd
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: milnet-patroni-etcd
+          app.kubernetes.io/part-of: milnet-sso
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: ssd-encrypted
+        resources:
+          requests:
+            storage: 2Gi
+---
+# NetworkPolicy: etcd accepts traffic ONLY from Postgres Patroni pods.
+# Any other pod (gateway, orchestrator, etc.) is blocked at L4.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: milnet-patroni-etcd-ingress
+  namespace: milnet
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: milnet-patroni-etcd
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+              app.kubernetes.io/component: database-ha
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: milnet-patroni-etcd
+      ports:
+        - port: 2379
+          protocol: TCP
+        - port: 2380
+          protocol: TCP
