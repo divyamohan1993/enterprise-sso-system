@@ -77,9 +77,9 @@ dependencies = [
 
 [[package]]
 name = "aegis"
-version = "0.6.13"
+version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c250d2c49d5ac96bb1ec753b1305f5489a19632cef15846ee14803afd6300607"
+checksum = "78412fa53e6da95324e8902c3641b3ff32ab45258582ea997eb9169c68ffa219"
 dependencies = [
  "cc",
  "softaes",
@@ -296,6 +296,7 @@ dependencies = [
  "hex",
  "libc",
  "ml-dsa",
+ "nix",
  "sha2",
  "tokio",
  "tracing",
@@ -2483,6 +2484,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "mfa-sms-push"
 version = "0.1.0"
 dependencies = [
@@ -2565,6 +2575,19 @@ checksum = "6dfecc750073acc09af2f8899b2342d520d570392ba1c3aed53eeb0d84ca4103"
 dependencies = [
  "hybrid-array 0.4.8",
  "num-traits",
+]
+
+[[package]]
+name = "nix"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
+dependencies = [
+ "bitflags 2.11.0",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+ "memoffset",
 ]
 
 [[package]]
