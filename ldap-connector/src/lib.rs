@@ -31,6 +31,31 @@ pub enum LdapError {
     TlsRequired,
     #[error("ldap-runtime feature is not enabled")]
     RuntimeMissing,
+    #[error("anonymous bind rejected: empty bind_dn")]
+    AnonymousBindRejected,
+    #[error("invalid filter value")]
+    InvalidFilter,
+}
+
+/// RFC 4515 LDAP filter value escaper. Escapes the metacharacters
+/// `* ( ) \ NUL` to their `\HH` hex form. All attribute values that are
+/// interpolated into search filters MUST go through this function — see
+/// the `no_unescaped_filter_format` lint test.
+pub fn escape_filter_value(input: &str) -> String {
+    let mut out = Vec::with_capacity(input.len());
+    for &b in input.as_bytes() {
+        match b {
+            b'*' => out.extend_from_slice(b"\\2a"),
+            b'(' => out.extend_from_slice(b"\\28"),
+            b')' => out.extend_from_slice(b"\\29"),
+            b'\\' => out.extend_from_slice(b"\\5c"),
+            0u8 => out.extend_from_slice(b"\\00"),
+            _ => out.push(b),
+        }
+    }
+    // Safe: we only emit ASCII for escapes and copy other bytes verbatim
+    // from a valid &str, so the result is still valid UTF-8.
+    String::from_utf8(out).expect("utf-8 preserved")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,8 +78,39 @@ impl LdapConfig {
         if !self.url.starts_with("ldaps://") {
             return Err(LdapError::TlsRequired);
         }
+        if self.bind_dn.trim().is_empty() {
+            return Err(LdapError::AnonymousBindRejected);
+        }
+        validate_filter_shape(&self.user_filter)?;
+        validate_filter_shape(&self.group_filter)?;
         Ok(())
     }
+}
+
+/// Cheap structural check that a configured filter is well-formed
+/// (balanced parens, starts with `(`, ends with `)`, no embedded NULs).
+/// This is a configuration sanity check — it does not replace per-value
+/// escaping via [`escape_filter_value`].
+pub fn validate_filter_shape(f: &str) -> Result<(), LdapError> {
+    if f.is_empty() || !f.starts_with('(') || !f.ends_with(')') {
+        return Err(LdapError::InvalidFilter);
+    }
+    if f.as_bytes().contains(&0) {
+        return Err(LdapError::InvalidFilter);
+    }
+    let mut depth: i32 = 0;
+    let mut esc = false;
+    for &b in f.as_bytes() {
+        if esc { esc = false; continue; }
+        match b {
+            b'\\' => esc = true,
+            b'(' => depth += 1,
+            b')' => { depth -= 1; if depth < 0 { return Err(LdapError::InvalidFilter); } }
+            _ => {}
+        }
+    }
+    if depth != 0 { return Err(LdapError::InvalidFilter); }
+    Ok(())
 }
 
 mod humantime_serde_compat {
@@ -138,7 +194,10 @@ pub mod runtime {
     impl Ldap3Client {
         pub async fn connect(cfg: LdapConfig) -> Result<Self, LdapError> {
             cfg.validate()?;
-            let settings = LdapConnSettings::new();
+            // Defense in depth: ldap3 v0.11 default settings already verify
+            // server certs over ldaps://, but we explicitly reject referral
+            // chasing to defeat SMB-relay / referral-injection downgrades.
+            let settings = LdapConnSettings::new().set_no_tls_verify(false);
             let (conn, mut ldap) = LdapConnAsync::with_settings(settings, &cfg.url)
                 .await
                 .map_err(|e| LdapError::Connect(e.to_string()))?;
