@@ -3093,6 +3093,214 @@ pub async fn recovery_quorum_check(
 }
 
 // ===========================================================================
+// Distributed nonce counter — 2-phase commit across FROST signers
+// ===========================================================================
+
+pub trait DistributedNoncePeer: Send + Sync {
+    fn peer_id(&self) -> &str;
+    fn prepare(&self, session_id: [u8; 32]) -> Result<u64, NonceCoordError>;
+    fn commit(&self, session_id: [u8; 32]) -> Result<(), NonceCoordError>;
+    fn abort(&self, session_id: [u8; 32]) -> Result<(), NonceCoordError>;
+}
+
+#[derive(Debug, Clone)]
+pub enum NonceCoordError {
+    PeerRejected(String),
+    PeerTimeout(String),
+    QuorumNotReached { got: usize, need: usize },
+    Io(String),
+}
+
+impl std::fmt::Display for NonceCoordError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PeerRejected(d) => write!(f, "nonce peer rejected: {d}"),
+            Self::PeerTimeout(p) => write!(f, "nonce peer timed out: {p}"),
+            Self::QuorumNotReached { got, need } => {
+                write!(f, "nonce quorum not reached: got {got}, need {need}")
+            }
+            Self::Io(d) => write!(f, "nonce coord I/O: {d}"),
+        }
+    }
+}
+
+impl std::error::Error for NonceCoordError {}
+
+#[derive(Debug, Clone)]
+pub struct PeerCommitment {
+    pub peer_id: String,
+    pub candidate_nonce: u64,
+}
+
+/// Coordinator: each ceremony generates a fresh random session ID and
+/// calls `reserve_and_commit`. Phase 1 reserves the next counter value
+/// on every peer; phase 2 commits (fsync) after threshold acks. Any
+/// rejection/timeout aborts the ceremony and rolls back reservations.
+pub struct DistributedNonceCoordinator {
+    peers: Vec<Box<dyn DistributedNoncePeer>>,
+    threshold: usize,
+}
+
+impl DistributedNonceCoordinator {
+    pub fn new(peers: Vec<Box<dyn DistributedNoncePeer>>, threshold: usize) -> Self {
+        assert!(threshold >= 2, "distributed nonce threshold must be >= 2");
+        assert!(threshold <= peers.len(), "threshold must be <= peer count");
+        Self { peers, threshold }
+    }
+
+    pub fn fresh_session_id() -> [u8; 32] {
+        let mut id = [0u8; 32];
+        if getrandom::getrandom(&mut id).is_err() {
+            panic!("FATAL: getrandom failed generating nonce session id");
+        }
+        id
+    }
+
+    pub fn reserve_and_commit(&self, session_id: [u8; 32]) -> Result<u64, NonceCoordError> {
+        let mut commitments: Vec<PeerCommitment> = Vec::with_capacity(self.peers.len());
+        let mut reserved_ids: Vec<String> = Vec::with_capacity(self.peers.len());
+        for peer in &self.peers {
+            match peer.prepare(session_id) {
+                Ok(candidate) => {
+                    reserved_ids.push(peer.peer_id().to_string());
+                    commitments.push(PeerCommitment {
+                        peer_id: peer.peer_id().to_string(),
+                        candidate_nonce: candidate,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        peer = %peer.peer_id(),
+                        error = %e,
+                        "SIEM:WARNING nonce peer phase-1 failed"
+                    );
+                }
+            }
+        }
+
+        if commitments.len() < self.threshold {
+            self.broadcast_abort(session_id, &reserved_ids);
+            return Err(NonceCoordError::QuorumNotReached {
+                got: commitments.len(),
+                need: self.threshold,
+            });
+        }
+
+        let mut committed: usize = 0;
+        for peer in &self.peers {
+            if !reserved_ids.iter().any(|p| *p == peer.peer_id()) {
+                continue;
+            }
+            match peer.commit(session_id) {
+                Ok(()) => committed += 1,
+                Err(e) => {
+                    tracing::error!(
+                        peer = %peer.peer_id(),
+                        error = %e,
+                        "SIEM:CRITICAL nonce peer phase-2 commit failed — aborting"
+                    );
+                    self.broadcast_abort(session_id, &reserved_ids);
+                    return Err(NonceCoordError::PeerRejected(format!(
+                        "commit failed on {}: {e}",
+                        peer.peer_id()
+                    )));
+                }
+            }
+        }
+
+        if committed < self.threshold {
+            self.broadcast_abort(session_id, &reserved_ids);
+            return Err(NonceCoordError::QuorumNotReached {
+                got: committed,
+                need: self.threshold,
+            });
+        }
+
+        Ok(commitments.iter().map(|c| c.candidate_nonce).max().unwrap_or(0))
+    }
+
+    fn broadcast_abort(&self, session_id: [u8; 32], reserved_ids: &[String]) {
+        for peer in &self.peers {
+            if reserved_ids.iter().any(|p| p == peer.peer_id()) {
+                if let Err(e) = peer.abort(session_id) {
+                    tracing::warn!(
+                        peer = %peer.peer_id(),
+                        error = %e,
+                        "nonce peer abort failed (peer timeout will GC)"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Reference peer wrapping a per-peer `NonceWal` under a mutex.
+/// Production deployments layer mTLS on top of this.
+pub struct LocalNoncePeer {
+    id: String,
+    inner: std::sync::Mutex<LocalNoncePeerInner>,
+}
+
+struct LocalNoncePeerInner {
+    wal: NonceWal,
+    reservations: std::collections::HashMap<[u8; 32], u64>,
+}
+
+impl LocalNoncePeer {
+    pub fn new(id: impl Into<String>, wal_path: Option<PathBuf>) -> Self {
+        Self {
+            id: id.into(),
+            inner: std::sync::Mutex::new(LocalNoncePeerInner {
+                wal: NonceWal::new(wal_path),
+                reservations: std::collections::HashMap::new(),
+            }),
+        }
+    }
+}
+
+impl DistributedNoncePeer for LocalNoncePeer {
+    fn peer_id(&self) -> &str { &self.id }
+
+    fn prepare(&self, session_id: [u8; 32]) -> Result<u64, NonceCoordError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| NonceCoordError::Io(format!("mutex poisoned: {e}")))?;
+        if let Some(existing) = inner.reservations.get(&session_id).copied() {
+            return Ok(existing);
+        }
+        let candidate = inner.wal.current_nonce().saturating_add(1);
+        inner.reservations.insert(session_id, candidate);
+        Ok(candidate)
+    }
+
+    fn commit(&self, session_id: [u8; 32]) -> Result<(), NonceCoordError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| NonceCoordError::Io(format!("mutex poisoned: {e}")))?;
+        let candidate = inner
+            .reservations
+            .remove(&session_id)
+            .ok_or_else(|| NonceCoordError::PeerRejected("no reservation to commit".into()))?;
+        inner
+            .wal
+            .fsync_wal(candidate)
+            .map_err(|e| NonceCoordError::Io(format!("WAL fsync failed: {e}")))?;
+        Ok(())
+    }
+
+    fn abort(&self, session_id: [u8; 32]) -> Result<(), NonceCoordError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| NonceCoordError::Io(format!("mutex poisoned: {e}")))?;
+        inner.reservations.remove(&session_id);
+        Ok(())
+    }
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 

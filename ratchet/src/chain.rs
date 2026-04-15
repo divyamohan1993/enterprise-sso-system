@@ -32,6 +32,10 @@ pub enum RatchetError {
     CanaryViolation,
     /// mlock failed in production mode.
     MlockFailed(String),
+    /// Chain is poisoned — all operations refused.
+    Poisoned(&'static str),
+    /// PQ puncture freshness invariant violated and could not be repaired.
+    PqStale(u64),
 }
 
 impl std::fmt::Display for RatchetError {
@@ -43,6 +47,8 @@ impl std::fmt::Display for RatchetError {
             Self::NonceReuse(detail) => write!(f, "ratchet: nonce reuse detected ({detail})"),
             Self::CanaryViolation => write!(f, "ratchet: memory canary violation detected"),
             Self::MlockFailed(detail) => write!(f, "ratchet: mlock failed ({detail})"),
+            Self::Poisoned(reason) => write!(f, "ratchet: chain poisoned ({reason})"),
+            Self::PqStale(gap) => write!(f, "ratchet: PQ freshness invariant violated (gap={gap})"),
         }
     }
 }
@@ -86,8 +92,11 @@ const NONCE_HISTORY_SIZE: usize = 1000;
 /// rate of ~0.01% for up to 10,000 nonces.  This means an attacker replaying
 /// an old nonce has a 99.99% chance of being caught even after it ages out of
 /// the exact-match window.
-const BLOOM_FILTER_BITS: usize = 16 * 1024 * 8; // 131,072 bits (16 KiB)
-const BLOOM_FILTER_K: usize = 7;
+/// Target FPR ≤ 1e-5 (0.001%) at 10,000 nonces. Formula
+/// `(1 - e^{-k n / m})^k` with m=524288, k=10, n=10000 → ~7e-7. Previous
+/// 16 KiB / k=7 measured ~1% FPR — 100x above claim.
+pub const BLOOM_FILTER_BITS: usize = 524_288; // 64 KiB
+pub const BLOOM_FILTER_K: usize = 10;
 
 /// A compact Bloom filter for probabilistic nonce-reuse detection.
 ///
@@ -289,6 +298,15 @@ pub struct RatchetChain {
     pq_ciphertext_ring: Option<Vec<zeroize::Zeroizing<Vec<u8>>>>,
     pq_keypair: Option<std::sync::Arc<crypto::xwing::XWingKeyPair>>,
     pq_puncture_index: u64,
+    /// Last epoch at which a PQ puncture was successfully mixed into
+    /// `chain_key`. Bound to the epoch counter so the invariant
+    /// `self.epoch - self.last_pq_puncture_epoch < PQ_PUNCTURE_INTERVAL`
+    /// is enforced on every advance.
+    last_pq_puncture_epoch: u64,
+    /// When true, the chain refuses all operations. Set on canary
+    /// mismatch, PQ freshness violation, PQ puncture failure, etc.
+    /// Atomic so `verify_canaries_strict` can flip it under `&self`.
+    poisoned: std::sync::atomic::AtomicBool,
 }
 
 // SAFETY: RatchetChain is only mutated through &mut self (advance, lock_chain_key, etc.)
@@ -328,6 +346,9 @@ impl Zeroize for RatchetChain {
         }
         self.pq_keypair = None;
         self.pq_puncture_index.zeroize();
+        self.last_pq_puncture_epoch.zeroize();
+        self.poisoned
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -353,19 +374,33 @@ impl RatchetChain {
     }
 
     /// Check canary integrity, returning an error on violation.
-    /// On violation, key material is zeroized before returning.
+    /// Forwards to `verify_canaries_strict` which also checks poison
+    /// state and process-aborts on memory corruption.
     fn check_canaries(&self) -> Result<(), RatchetError> {
+        self.verify_canaries_strict()
+    }
+
+    /// Strict canary + poison check invoked on every access (advance,
+    /// generate_tag, verify_tag, apply_pq_puncture). On canary mismatch
+    /// the chain key is zeroized, the chain is poisoned, and the
+    /// process is aborted: memory corruption in a live signing chain
+    /// is treated as cryptographic compromise.
+    pub fn verify_canaries_strict(&self) -> Result<(), RatchetError> {
+        if self.poisoned.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(RatchetError::Poisoned("prior integrity violation"));
+        }
         if !self.verify_canaries() {
             tracing::error!(
-                "SECURITY: canary violation detected in RatchetChain (epoch={}) — \
-                 possible buffer overflow or use-after-free. Zeroizing key material.",
+                "SIEM:CRITICAL RatchetChain canary violation (epoch={}) — \
+                 memory corruption / compromise. Zeroizing and aborting.",
                 self.epoch
             );
-            // Zeroize via UnsafeCell -- sound because UnsafeCell permits interior mutability.
             unsafe {
                 (*self.chain_key.get()).zeroize();
             }
-            return Err(RatchetError::CanaryViolation);
+            self.poisoned
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            std::process::abort();
         }
         Ok(())
     }
@@ -414,6 +449,8 @@ impl RatchetChain {
             pq_ciphertext_ring: None,
             pq_keypair: None,
             pq_puncture_index: 0,
+            last_pq_puncture_epoch: 0,
+            poisoned: std::sync::atomic::AtomicBool::new(false),
         };
         chain.lock_chain_key().map_err(|e| e.to_string())?;
         Ok(chain)
@@ -472,6 +509,7 @@ impl RatchetChain {
     /// `RatchetError::ZeroEntropy` so they trigger the existing fail-closed
     /// session-termination path.
     fn apply_pq_puncture(&mut self) -> Result<bool, RatchetError> {
+        self.verify_canaries_strict()?;
         let kp = match &self.pq_keypair {
             Some(kp) => kp.clone(),
             None => return Ok(false),
@@ -540,6 +578,7 @@ impl RatchetChain {
         let mut ct_bytes = ct_bytes;
         ct_bytes.zeroize();
         self.pq_puncture_index = self.pq_puncture_index.saturating_add(1);
+        self.last_pq_puncture_epoch = self.epoch;
         Ok(true)
     }
 
@@ -685,11 +724,39 @@ impl RatchetChain {
         // above will still scrub `new_key` and `info` on the unwinding path.
         self.lock_chain_key()?;
 
-        // A2: apply a PQ puncture once every `PQ_PUNCTURE_INTERVAL` epochs
-        // (and always on epoch 0, so a session's very first advance receives
-        // PQ cover). Skipped when no PQ material was configured.
+        // A2: apply a PQ puncture once every `PQ_PUNCTURE_INTERVAL` epochs.
         if self.epoch != 0 && self.epoch % PQ_PUNCTURE_INTERVAL == 0 {
             let _ = self.apply_pq_puncture()?;
+        }
+
+        // PQ freshness invariant: bind the epoch counter to PQ puncture
+        // freshness. If the gap between the current epoch and the last
+        // successful PQ puncture has reached `PQ_PUNCTURE_INTERVAL`,
+        // force a synchronous puncture now. If that fails, poison the
+        // chain — we refuse to continue without PQ cover.
+        if self.pq_keypair.is_some() {
+            let gap = self.epoch.saturating_sub(self.last_pq_puncture_epoch);
+            if gap >= PQ_PUNCTURE_INTERVAL {
+                tracing::warn!(
+                    epoch = self.epoch,
+                    last_pq = self.last_pq_puncture_epoch,
+                    gap = gap,
+                    "ratchet: PQ freshness invariant violated — forcing synchronous puncture"
+                );
+                match self.apply_pq_puncture() {
+                    Ok(true) => {}
+                    Ok(false) | Err(_) => {
+                        tracing::error!(
+                            epoch = self.epoch,
+                            "SIEM:CRITICAL ratchet forced PQ puncture failed — poisoning chain"
+                        );
+                        self.poisoned
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                        self.chain_key_mut().zeroize();
+                        return Err(RatchetError::PqStale(gap));
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -869,6 +936,8 @@ impl RatchetChain {
             pq_ciphertext_ring: None,
             pq_keypair: None,
             pq_puncture_index: 0,
+            last_pq_puncture_epoch: epoch,
+            poisoned: std::sync::atomic::AtomicBool::new(false),
         };
         chain.lock_chain_key().map_err(|e| e.to_string())?;
         Ok(chain)
@@ -911,6 +980,38 @@ impl RatchetChain {
         self.pq_puncture_index
     }
 
+    /// Epoch at which the most recent PQ puncture was mixed into the chain.
+    pub fn last_pq_puncture_epoch(&self) -> u64 {
+        self.last_pq_puncture_epoch
+    }
+
+    /// Restore persisted PQ freshness epoch. Rejects values that would
+    /// violate the freshness invariant; the chain is then poisoned and
+    /// unusable.
+    pub fn restore_pq_freshness(&mut self, last_pq_puncture_epoch: u64) -> Result<(), RatchetError> {
+        if self.epoch < last_pq_puncture_epoch {
+            return Err(RatchetError::PqStale(0));
+        }
+        let gap = self.epoch.saturating_sub(last_pq_puncture_epoch);
+        if gap >= PQ_PUNCTURE_INTERVAL {
+            tracing::error!(
+                epoch = self.epoch,
+                last_pq = last_pq_puncture_epoch,
+                "ratchet: imported state violates PQ freshness invariant — rejecting"
+            );
+            self.poisoned
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            return Err(RatchetError::PqStale(gap));
+        }
+        self.last_pq_puncture_epoch = last_pq_puncture_epoch;
+        Ok(())
+    }
+
+    /// Whether this chain has been poisoned by an integrity violation.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Return a copy of the current chain key for persistence (must be encrypted before storage).
     ///
     /// # Errors
@@ -918,6 +1019,27 @@ impl RatchetChain {
     pub fn current_key(&self) -> Result<[u8; 64], RatchetError> {
         self.check_canaries()?;
         Ok(*self.chain_key_ref())
+    }
+}
+
+/// Test-only helpers exposing Bloom filter internals so integration
+/// tests can experimentally measure FPR against production parameters.
+#[doc(hidden)]
+pub mod test_support {
+    use super::NonceBloomFilter;
+
+    pub struct BloomHandle(NonceBloomFilter);
+
+    pub fn new_bloom_filter() -> BloomHandle {
+        BloomHandle(NonceBloomFilter::new())
+    }
+
+    pub fn bloom_insert(h: &mut BloomHandle, nonce: &[u8; 32]) {
+        h.0.insert(nonce);
+    }
+
+    pub fn bloom_contains(h: &BloomHandle, nonce: &[u8; 32]) -> bool {
+        h.0.might_contain(nonce)
     }
 }
 

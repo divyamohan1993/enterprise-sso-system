@@ -33,8 +33,15 @@ use zeroize::Zeroize;
 /// Default socket path. Override via `MILNET_AUDIT_WITNESS_SOCK`.
 const DEFAULT_SOCK: &str = "/run/milnet/audit-witness.sock";
 
-/// Secret loader name for the witness signing seed.
+/// Legacy master-KEK-derived seed. Only used when the fd-based
+/// independent path is explicitly disabled via
+/// `MILNET_WITNESS_ALLOW_KEK_DERIVED=1` (non-production only).
 const WITNESS_KEY_NAME: &str = "audit-witness-key";
+
+/// Env var carrying an inherited fd whose contents are a witness seed
+/// derived from a source INDEPENDENT of the master KEK (HSM / KMS /
+/// systemd LoadCredential). Production MUST set this.
+const WITNESS_SEED_FD_ENV: &str = "MILNET_WITNESS_SEED_FD";
 
 /// Env var that tells the witness which uid the audit service runs as.
 const AUDIT_UID_ENV: &str = "MILNET_AUDIT_UID";
@@ -151,6 +158,38 @@ fn main() {
 }
 
 fn load_signing_key() -> crypto::pq_sign::PqSigningKey {
+    // Preferred: a fd inherited from an independent second source.
+    // A compromise of master-KEK sealed storage does NOT yield this key.
+    if let Ok(fd_str) = std::env::var(WITNESS_SEED_FD_ENV) {
+        let fd: i32 = match fd_str.parse() {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::error!(
+                    "FATAL: {} is set but unparsable ({}). Refusing to start.",
+                    WITNESS_SEED_FD_ENV, e
+                );
+                std::process::exit(3);
+            }
+        };
+        return load_signing_key_from_fd(fd);
+    }
+
+    let allow_kek = std::env::var("MILNET_WITNESS_ALLOW_KEK_DERIVED").as_deref() == Ok("1");
+    if !allow_kek {
+        tracing::error!(
+            "FATAL: {} is not set. The witness signing seed must be supplied \
+             via a file descriptor derived from a source independent of the \
+             master KEK. Refusing to start.",
+            WITNESS_SEED_FD_ENV
+        );
+        std::process::exit(4);
+    }
+
+    tracing::warn!(
+        "MILNET_WITNESS_ALLOW_KEK_DERIVED=1 — DEGRADED security posture; \
+         falling back to master-KEK-derived secret_loader path"
+    );
+
     use common::secret_loader;
     let secret = match secret_loader::load_secret(WITNESS_KEY_NAME) {
         Ok(s) => s,
@@ -174,6 +213,58 @@ fn load_signing_key() -> crypto::pq_sign::PqSigningKey {
     seed.copy_from_slice(&secret[..32]);
     let kp = MlDsa87::from_seed(&seed.into());
     seed.zeroize();
+    kp.signing_key().clone()
+}
+
+/// Read a 32-byte seed from an inherited fd and derive the witness
+/// signing key. Enforces a second-source entropy quality gate
+/// (not all-zero, not all-0xff, >= 16 distinct byte values).
+fn load_signing_key_from_fd(fd: i32) -> crypto::pq_sign::PqSigningKey {
+    use std::io::Read;
+    use std::os::unix::io::FromRawFd;
+
+    if fd < 3 {
+        tracing::error!(
+            "FATAL: witness seed fd {} is stdin/stdout/stderr — refusing to start", fd
+        );
+        std::process::exit(5);
+    }
+
+    let mut f: std::fs::File = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut seed = [0u8; 32];
+    if let Err(e) = f.read_exact(&mut seed) {
+        tracing::error!(
+            "FATAL: failed to read 32 bytes of witness seed from fd {}: {}", fd, e
+        );
+        seed.zeroize();
+        std::process::exit(6);
+    }
+
+    let all_zero = seed.iter().all(|&b| b == 0);
+    let all_ff = seed.iter().all(|&b| b == 0xff);
+    let distinct = {
+        let mut seen = [false; 256];
+        let mut n = 0usize;
+        for &b in seed.iter() {
+            if !seen[b as usize] { seen[b as usize] = true; n += 1; }
+        }
+        n
+    };
+    if all_zero || all_ff || distinct < 16 {
+        tracing::error!(
+            "FATAL: witness seed from fd {} failed entropy gate \
+             (all_zero={}, all_ff={}, distinct={})",
+            fd, all_zero, all_ff, distinct
+        );
+        seed.zeroize();
+        std::process::exit(7);
+    }
+
+    let kp = MlDsa87::from_seed(&seed.into());
+    seed.zeroize();
+    tracing::info!(
+        "audit-witness: seed loaded from fd {} (independent of master KEK)", fd
+    );
     kp.signing_key().clone()
 }
 
