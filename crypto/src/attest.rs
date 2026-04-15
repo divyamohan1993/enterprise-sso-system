@@ -617,7 +617,15 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_build_and_verify_manifest() {
+        // Why: hash_file picks the algorithm based on FIPS mode (BLAKE3
+        // vs SHA-512). If a parallel test flips FIPS mode between build
+        // and verify, the re-hash will mismatch the manifest entry even
+        // though the file on disk is identical. Pin FIPS off for this
+        // test and serialize against other attest tests.
+        common::fips::set_fips_mode_unchecked(false);
+
         let p1 = tmp_file(b"binary-alpha");
         let p2 = tmp_file(b"config-beta");
         let key = test_key();
@@ -640,7 +648,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_tampered_manifest_detected() {
+        common::fips::set_fips_mode_unchecked(false);
         let p = tmp_file(b"important binary");
         let key = test_key();
 
@@ -660,7 +670,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_tampered_manifest_wrong_key() {
+        common::fips::set_fips_mode_unchecked(false);
         let p = tmp_file(b"important binary");
         let key = test_key();
 
@@ -681,7 +693,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_file_modification_detected() {
+        common::fips::set_fips_mode_unchecked(false);
         let p = tmp_file(b"original content");
         let key = test_key();
 
@@ -743,7 +757,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_runtime_attestor_creation() {
+        common::fips::set_fips_mode_unchecked(false);
         let p = tmp_file(b"runtime test binary");
         let key = test_key();
 
@@ -757,7 +773,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_runtime_attestor_check() {
+        common::fips::set_fips_mode_unchecked(false);
         let p = tmp_file(b"runtime check binary");
         let key = test_key();
 
@@ -776,7 +794,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_runtime_attestor_detects_tampering() {
+        common::fips::set_fips_mode_unchecked(false);
         let p = tmp_file(b"runtime tamper binary");
         let key = test_key();
 
@@ -858,10 +878,12 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_attestation_non_fips_blake3() {
         // Test that attestation works regardless of FIPS mode.
         // Due to global FIPS flag races in parallel tests, we verify
         // self-consistency rather than asserting a specific algorithm.
+        common::fips::set_fips_mode_unchecked(false);
         let content = b"non-fips-attestation-test";
         let path = tmp_file(content);
         let key = test_key();
