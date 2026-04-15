@@ -25,6 +25,8 @@ hkdf.workspace = true
 
 [dev-dependencies]
 proptest = "1"
+ctor = "0.2"
+once_cell = "1"
 
 [features]
 default = ["production"]

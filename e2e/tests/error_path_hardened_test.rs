@@ -14,8 +14,16 @@ use common::types::{AuditEntry, AuditEventType, Receipt};
 use crypto::memguard::{is_mlock_degraded, SecretBuffer, SecretVec, MemguardError};
 use crypto::threshold::{dkg, threshold_sign, verify_group_signature};
 use audit::log::{AuditLog, hash_entry};
+use once_cell::sync::Lazy;
 use serial_test::serial;
 use uuid::Uuid;
+
+// Set MILNET_TESTING_SINGLE_KEK_ACK once, at first test start, for the entire
+// lifetime of this test binary. Parallel tests in this file depend on it being
+// set for the whole run, so we never unset it.
+static SINGLE_KEK_ACK_INIT: Lazy<()> = Lazy::new(|| {
+    std::env::set_var("MILNET_TESTING_SINGLE_KEK_ACK", "1");
+});
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -465,11 +473,11 @@ fn fencing_counter_corrupted_state_recovery() {
 // ===========================================================================
 
 #[test]
+#[serial]
 fn audit_archival_to_valid_dir_succeeds() {
-    std::env::set_var("MILNET_TESTING_SINGLE_KEK_ACK", "1");
+    Lazy::force(&SINGLE_KEK_ACK_INIT);
     run_with_large_stack(|| {
-        // Re-set inside thread to guard against parallel test clearing it
-        std::env::set_var("MILNET_TESTING_SINGLE_KEK_ACK", "1");
+        Lazy::force(&SINGLE_KEK_ACK_INIT);
         let (signing_key, _vk) = crypto::pq_sign::generate_pq_keypair();
         let archive_dir = temp_dir("audit-archive");
 

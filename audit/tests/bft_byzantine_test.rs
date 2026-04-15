@@ -1,6 +1,10 @@
 //! I17 [MED] Byzantine simulation: forged signatures from f honest-equivalent
 //! nodes must not poison the consistent honest chain.
 
+mod test_bootstrap;
+#[allow(unused_imports)]
+use test_bootstrap as _;
+
 use audit::bft::BftAuditCluster;
 use common::types::AuditEventType;
 use uuid::Uuid;

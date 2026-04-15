@@ -1,3 +1,7 @@
+mod test_bootstrap;
+#[allow(unused_imports)]
+use test_bootstrap as _;
+
 use proptest::prelude::*;
 use audit::bft::BftAuditCluster;
 use audit::log::hash_entry;

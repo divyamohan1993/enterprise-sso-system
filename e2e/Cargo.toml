@@ -43,6 +43,7 @@ x25519-dalek.workspace = true
 hex.workspace = true
 ml-kem.workspace = true
 serial_test.workspace = true
+once_cell = "1"
 rustls.workspace = true
 tokio-rustls.workspace = true
 rcgen.workspace = true
