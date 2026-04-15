@@ -226,6 +226,11 @@ fn load_signing_key_from_fd(fd: i32) -> crypto::pq_sign::PqSigningKey {
         std::process::exit(5);
     }
 
+    // SAFETY: fd is inherited from the parent (systemd LoadCredential or
+    // launcher) and fully owned by this process. No other code holds it.
+    // Taking ownership via from_raw_fd is the only way to read from an
+    // inherited fd without copying the seed through an env var (rejected).
+    #[allow(unsafe_code)]
     let mut f: std::fs::File = unsafe { std::fs::File::from_raw_fd(fd) };
     let mut seed = [0u8; 32];
     if let Err(e) = f.read_exact(&mut seed) {
