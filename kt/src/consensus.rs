@@ -18,6 +18,8 @@
 
 use crypto::pq_sign;
 use ml_dsa::{KeyGen, MlDsa87};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha512};
 
 /// Total KT consensus nodes.
 pub const KT_NODES: usize = 5;
@@ -194,6 +196,255 @@ pub fn canonical_leaf_bytes(
     out.extend_from_slice(credential_hash);
     out.extend_from_slice(&timestamp.to_be_bytes());
     out
+}
+
+// ---------------------------------------------------------------------------
+// External checkpoint publication — append-only hash-chained JSONL log
+// ---------------------------------------------------------------------------
+
+/// Default path for the append-only KT checkpoint log.
+pub const DEFAULT_CHECKPOINT_LOG_PATH: &str = "/var/lib/milnet/kt_checkpoints.jsonl";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Checkpoint {
+    pub tree_size: u64,
+    pub range_start: u64,
+    pub range_end: u64,
+    #[serde(with = "hex_64")]
+    pub root: [u8; 64],
+    pub epoch_id: u64,
+    pub timestamp_us: i64,
+    #[serde(with = "hex_64")]
+    pub prev_hash: [u8; 64],
+    pub signatures: Vec<CheckpointSignature>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointSignature {
+    pub slot: usize,
+    #[serde(with = "hex_vec")]
+    pub signature: Vec<u8>,
+}
+
+pub fn canonical_checkpoint_bytes(cp: &Checkpoint) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + 8 + 8 + 64 + 8 + 8 + 64);
+    out.extend_from_slice(b"MILNET-KT-CHECKPOINT-v1");
+    out.extend_from_slice(&cp.tree_size.to_be_bytes());
+    out.extend_from_slice(&cp.range_start.to_be_bytes());
+    out.extend_from_slice(&cp.range_end.to_be_bytes());
+    out.extend_from_slice(&cp.root);
+    out.extend_from_slice(&cp.epoch_id.to_be_bytes());
+    out.extend_from_slice(&cp.timestamp_us.to_be_bytes());
+    out.extend_from_slice(&cp.prev_hash);
+    out
+}
+
+pub fn hash_checkpoint(cp: &Checkpoint) -> [u8; 64] {
+    let mut h = Sha512::new();
+    h.update(canonical_checkpoint_bytes(cp));
+    for s in &cp.signatures {
+        h.update((s.slot as u32).to_be_bytes());
+        h.update(&s.signature);
+    }
+    let mut out = [0u8; 64];
+    out.copy_from_slice(&h.finalize());
+    out
+}
+
+pub fn verify_checkpoint(cp: &Checkpoint, pinned_vks: &[pq_sign::PqVerifyingKey]) -> bool {
+    if pinned_vks.len() != KT_NODES {
+        return false;
+    }
+    let msg = canonical_checkpoint_bytes(cp);
+    let mut seen = [false; KT_NODES];
+    let mut valid = 0usize;
+    for s in &cp.signatures {
+        if s.slot >= KT_NODES || seen[s.slot] {
+            continue;
+        }
+        if pq_sign::pq_verify_raw(&pinned_vks[s.slot], &msg, &s.signature) {
+            seen[s.slot] = true;
+            valid += 1;
+            if valid >= KT_THRESHOLD {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn sign_checkpoint(
+    cp_no_sigs: &Checkpoint,
+    local_keys: &[Option<pq_sign::PqSigningKey>],
+) -> Vec<CheckpointSignature> {
+    let msg = canonical_checkpoint_bytes(cp_no_sigs);
+    let mut out = Vec::new();
+    for (slot, key) in local_keys.iter().enumerate() {
+        if let Some(sk) = key {
+            out.push(CheckpointSignature {
+                slot,
+                signature: pq_sign::pq_sign_raw(sk, &msg),
+            });
+        }
+    }
+    out
+}
+
+pub fn append_checkpoint(
+    path: &std::path::Path,
+    cp: &Checkpoint,
+) -> Result<(), std::io::Error> {
+    use std::io::Write;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let expected_prev = last_hash_in_log(path)?;
+    if cp.prev_hash != expected_prev {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "checkpoint prev_hash does not match last row hash",
+        ));
+    }
+    let mut line = serde_json::to_string(cp)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    line.push('\n');
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    f.write_all(line.as_bytes())?;
+    f.sync_all()?;
+    Ok(())
+}
+
+pub fn last_hash_in_log(path: &std::path::Path) -> Result<[u8; 64], std::io::Error> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok([0u8; 64]),
+        Err(e) => return Err(e),
+    };
+    let text = std::str::from_utf8(&bytes).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("utf8: {e}"))
+    })?;
+    let mut last: [u8; 64] = [0u8; 64];
+    for line in text.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let cp: Checkpoint = serde_json::from_str(line).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("row: {e}"))
+        })?;
+        last = hash_checkpoint(&cp);
+    }
+    Ok(last)
+}
+
+pub fn publish_checkpoint(
+    log_path: Option<&std::path::Path>,
+    tree_size: u64,
+    range_start: u64,
+    range_end: u64,
+    root: [u8; 64],
+    epoch_id: u64,
+    signatures: Vec<CheckpointSignature>,
+) -> Result<Checkpoint, std::io::Error> {
+    let default_path_buf = std::path::PathBuf::from(
+        std::env::var("MILNET_KT_CHECKPOINT_LOG")
+            .unwrap_or_else(|_| DEFAULT_CHECKPOINT_LOG_PATH.to_string()),
+    );
+    let path: &std::path::Path = match log_path {
+        Some(p) => p,
+        None => default_path_buf.as_path(),
+    };
+    let prev_hash = last_hash_in_log(path)?;
+    let timestamp_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as i64;
+    let cp = Checkpoint {
+        tree_size,
+        range_start,
+        range_end,
+        root,
+        epoch_id,
+        timestamp_us,
+        prev_hash,
+        signatures,
+    };
+    append_checkpoint(path, &cp)?;
+    gossip_checkpoint_best_effort(&cp);
+    Ok(cp)
+}
+
+fn gossip_checkpoint_best_effort(cp: &Checkpoint) {
+    let addrs = match std::env::var("MILNET_KT_WITNESSES") {
+        Ok(v) if !v.is_empty() => v,
+        _ => return,
+    };
+    let payload = match serde_json::to_vec(cp) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "kt: failed to serialize checkpoint for gossip");
+            return;
+        }
+    };
+    for addr in addrs.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let sock: std::net::SocketAddr = match addr.parse() {
+            Ok(s) => s,
+            Err(_) => {
+                tracing::warn!(addr = %addr, "kt: invalid witness address");
+                continue;
+            }
+        };
+        match std::net::TcpStream::connect_timeout(&sock, std::time::Duration::from_secs(2)) {
+            Ok(mut s) => {
+                use std::io::Write as _;
+                let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+                if let Err(e) = s.write_all(&payload) {
+                    tracing::warn!(addr = %addr, error = %e, "kt: witness gossip write failed");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(addr = %addr, error = %e, "kt: witness gossip connect failed");
+            }
+        }
+    }
+}
+
+pub fn prove_inclusion(
+    tree: &crate::merkle::MerkleTree,
+    leaf_idx: usize,
+) -> Option<Vec<[u8; 64]>> {
+    tree.inclusion_proof(leaf_idx)
+}
+
+mod hex_64 {
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(bytes: &[u8; 64], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(bytes))
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 64], D::Error> {
+        let s = String::deserialize(d)?;
+        let v = hex::decode(&s).map_err(serde::de::Error::custom)?;
+        if v.len() != 64 {
+            return Err(serde::de::Error::custom("expected 64 bytes"));
+        }
+        let mut out = [0u8; 64];
+        out.copy_from_slice(&v);
+        Ok(out)
+    }
+}
+
+mod hex_vec {
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(bytes))
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let s = String::deserialize(d)?;
+        hex::decode(&s).map_err(serde::de::Error::custom)
+    }
 }
 
 #[cfg(test)]
