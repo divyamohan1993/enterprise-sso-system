@@ -21,7 +21,8 @@ fn now_secs() -> u64 {
 
 fn setup_trust() -> (crypto::pq_sign::PqSigningKey, Vec<u8>) {
     let (sk, vk) = crypto::pq_sign::generate_pq_keypair();
-    let vk_bytes = vk.encode().as_ref().to_vec();
+    let encoded = vk.encode();
+    let vk_bytes: Vec<u8> = AsRef::<[u8]>::as_ref(&encoded).to_vec();
     let mut store = HashMap::new();
     store.insert(SIGNER_ID.to_string(), vk_bytes.clone());
     gateway::device_attestation::test_install_trust_store(store);

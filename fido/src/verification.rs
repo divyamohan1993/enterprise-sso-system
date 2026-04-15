@@ -2557,7 +2557,11 @@ mod tests {
             user_id,
             sign_count: 5,
             authenticator_type: "cross-platform".into(),
-        ..Default::default()
+        aaguid: [0u8; 16],
+        cloned_flag: false,
+        backup_eligible: false,
+        backup_state: false,
+        pq_attestation: Vec::new()
         };
 
         let new_count = verify_authentication_response(&auth_result, &stored, rp_id, true).unwrap();
@@ -2588,7 +2592,11 @@ mod tests {
             user_id,
             sign_count: 10,
             authenticator_type: "platform".into(),
-        ..Default::default()
+        aaguid: [0u8; 16],
+        cloned_flag: false,
+        backup_eligible: false,
+        backup_state: false,
+        pq_attestation: Vec::new()
         };
 
         let err = verify_authentication_response(&auth_result, &stored, rp_id, true).unwrap_err();
@@ -2616,7 +2624,11 @@ mod tests {
             user_id: Uuid::new_v4(),
             sign_count: 5,
             authenticator_type: "platform".into(),
-        ..Default::default()
+        aaguid: [0u8; 16],
+        cloned_flag: false,
+        backup_eligible: false,
+        backup_state: false,
+        pq_attestation: Vec::new()
         };
 
         let err = verify_authentication_response(&auth_result, &stored, rp_id, true).unwrap_err();
@@ -2648,7 +2660,11 @@ mod tests {
             user_id: Uuid::new_v4(),
             sign_count: 0,
             authenticator_type: "cross-platform".into(),
-        ..Default::default()
+        aaguid: [0u8; 16],
+        cloned_flag: false,
+        backup_eligible: false,
+        backup_state: false,
+        pq_attestation: Vec::new()
         };
 
         let result = verify_authentication_response(&auth_result, &stored, rp_id, true);
@@ -2677,7 +2693,11 @@ mod tests {
             user_id: Uuid::new_v4(),
             sign_count: 0,
             authenticator_type: "cross-platform".into(),
-        ..Default::default()
+        aaguid: [0u8; 16],
+        cloned_flag: false,
+        backup_eligible: false,
+        backup_state: false,
+        pq_attestation: Vec::new()
         };
 
         let err = verify_authentication_response(&auth_result, &stored, "sso.milnet.example", true)
@@ -2710,7 +2730,11 @@ mod tests {
             user_id: Uuid::new_v4(),
             sign_count: 0,
             authenticator_type: "cross-platform".into(),
-        ..Default::default()
+        aaguid: [0u8; 16],
+        cloned_flag: false,
+        backup_eligible: false,
+        backup_state: false,
+        pq_attestation: Vec::new()
         };
 
         // UV not required -- should pass
@@ -2758,7 +2782,11 @@ mod tests {
             user_id: Uuid::new_v4(),
             sign_count: 0,
             authenticator_type: "cross-platform".into(),
-        ..Default::default()
+        aaguid: [0u8; 16],
+        cloned_flag: false,
+        backup_eligible: false,
+        backup_state: false,
+        pq_attestation: Vec::new()
         };
 
         let result = verify_authentication_response_full(
@@ -2798,7 +2826,11 @@ mod tests {
             user_id: Uuid::new_v4(),
             sign_count: 0,
             authenticator_type: "cross-platform".into(),
-        ..Default::default()
+        aaguid: [0u8; 16],
+        cloned_flag: false,
+        backup_eligible: false,
+        backup_state: false,
+        pq_attestation: Vec::new()
         };
 
         let err = verify_authentication_response_full(
@@ -3250,7 +3282,11 @@ mod tests {
             user_id: Uuid::new_v4(),
             sign_count: 0,
             authenticator_type: "cross-platform".into(),
-        ..Default::default()
+        aaguid: [0u8; 16],
+        cloned_flag: false,
+        backup_eligible: false,
+        backup_state: false,
+        pq_attestation: Vec::new()
         };
         let result = verify_authentication_response(&auth_result, &stored, rp_id, true);
         assert!(result.is_ok());
@@ -3290,7 +3326,11 @@ mod tests {
             user_id: Uuid::new_v4(),
             sign_count: 0,
             authenticator_type: "cross-platform".into(),
-        ..Default::default()
+        aaguid: [0u8; 16],
+        cloned_flag: false,
+        backup_eligible: false,
+        backup_state: false,
+        pq_attestation: Vec::new()
         };
         let result = verify_authentication_response(&auth_result, &stored, rp_id, true);
         assert!(result.is_ok());
@@ -3327,7 +3367,11 @@ mod tests {
             user_id: Uuid::new_v4(),
             sign_count: 0,
             authenticator_type: "cross-platform".into(),
-        ..Default::default()
+        aaguid: [0u8; 16],
+        cloned_flag: false,
+        backup_eligible: false,
+        backup_state: false,
+        pq_attestation: Vec::new()
         };
         let result = verify_authentication_response(&auth_result, &stored, rp_id, true);
         assert!(result.is_ok());
@@ -3366,7 +3410,11 @@ mod tests {
             user_id: Uuid::new_v4(),
             sign_count: 0,
             authenticator_type: "cross-platform".into(),
-        ..Default::default()
+        aaguid: [0u8; 16],
+        cloned_flag: false,
+        backup_eligible: false,
+        backup_state: false,
+        pq_attestation: Vec::new()
         };
         // ES256 key can't verify RS256 signature
         assert!(verify_authentication_response(&auth_result, &stored, rp_id, true).is_err());

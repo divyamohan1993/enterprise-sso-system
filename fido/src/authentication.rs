@@ -94,7 +94,11 @@ mod tests {
             user_id,
             sign_count: 5,
             authenticator_type: "platform".into(),
-        ..Default::default()
+        aaguid: [0u8; 16],
+        cloned_flag: false,
+        backup_eligible: false,
+        backup_state: false,
+        pq_attestation: Vec::new()
         };
         let cred2 = StoredCredential {
             credential_id: vec![4, 5, 6],
@@ -102,7 +106,11 @@ mod tests {
             user_id,
             sign_count: 2,
             authenticator_type: "cross-platform".into(),
-        ..Default::default()
+        aaguid: [0u8; 16],
+        cloned_flag: false,
+        backup_eligible: false,
+        backup_state: false,
+        pq_attestation: Vec::new()
         };
 
         let opts = create_authentication_options("sso.milnet.example", &[&cred1, &cred2]);
@@ -132,7 +140,11 @@ mod tests {
             user_id: Uuid::new_v4(),
             sign_count: 5,
             authenticator_type: "platform".into(),
-        ..Default::default()
+        aaguid: [0u8; 16],
+        cloned_flag: false,
+        backup_eligible: false,
+        backup_state: false,
+        pq_attestation: Vec::new()
         };
         assert!(update_sign_count(&mut cred, 10).is_ok());
         assert_eq!(cred.sign_count, 10);
@@ -146,7 +158,11 @@ mod tests {
             user_id: Uuid::new_v4(),
             sign_count: 0,
             authenticator_type: "cross-platform".into(),
-        ..Default::default()
+        aaguid: [0u8; 16],
+        cloned_flag: false,
+        backup_eligible: false,
+        backup_state: false,
+        pq_attestation: Vec::new()
         };
         // 0 -> 0 is allowed (authenticator doesn't support counters)
         assert!(update_sign_count(&mut cred, 0).is_ok());
@@ -161,7 +177,11 @@ mod tests {
             user_id: Uuid::new_v4(),
             sign_count: 10,
             authenticator_type: "platform".into(),
-        ..Default::default()
+        aaguid: [0u8; 16],
+        cloned_flag: false,
+        backup_eligible: false,
+        backup_state: false,
+        pq_attestation: Vec::new()
         };
         let err = update_sign_count(&mut cred, 5).unwrap_err();
         assert_eq!(err, "New sign count must not be less than stored sign count");
@@ -177,7 +197,11 @@ mod tests {
             user_id: Uuid::new_v4(),
             sign_count: 7,
             authenticator_type: "platform".into(),
-        ..Default::default()
+        aaguid: [0u8; 16],
+        cloned_flag: false,
+        backup_eligible: false,
+        backup_state: false,
+        pq_attestation: Vec::new()
         };
         let err = update_sign_count(&mut cred, 7).unwrap_err();
         assert_eq!(

@@ -578,7 +578,11 @@ mod tests {
             user_id,
             sign_count: 0,
             authenticator_type: "cross-platform".into(),
-        ..Default::default()
+        aaguid: [0u8; 16],
+        cloned_flag: false,
+        backup_eligible: false,
+        backup_state: false,
+        pq_attestation: Vec::new()
         };
         store.store_credential(cred);
 
@@ -690,7 +694,11 @@ mod tests {
             user_id: Uuid::new_v4(),
             sign_count: 0,
             authenticator_type: "platform".into(),
-        ..Default::default()
+        aaguid: [0u8; 16],
+        cloned_flag: false,
+        backup_eligible: false,
+        backup_state: false,
+        pq_attestation: Vec::new()
         });
         assert!(store.credential_exists(&cred_id));
     }
