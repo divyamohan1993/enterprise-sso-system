@@ -360,6 +360,7 @@ mod tests {
     // ── 7. Drain clears the buffer ───────────────────────────────────────
 
     #[test]
+    #[serial]
     fn drain_clears_buffer() {
         let _ = drain_audit_buffer();
 
