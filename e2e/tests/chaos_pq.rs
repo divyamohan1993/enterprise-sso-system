@@ -11,6 +11,7 @@ use crypto::symmetric::{
     active_algorithm, decrypt, encrypt_with, SymmetricAlgorithm,
 };
 use crypto::xwing::{xwing_keygen, xwing_encapsulate, xwing_decapsulate};
+use serial_test::serial;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -175,10 +176,10 @@ fn test_token_dpop_hash_zero_sentinel_64() {
 // ---------------------------------------------------------------------------
 
 /// With FIPS mode disabled, `active_algorithm()` must return AEGIS-256.
-/// Note: This test races with parallel FIPS-toggling tests. We verify the
-/// mapping logic by checking both states explicitly.
 #[test]
+#[serial(fips)]
 fn test_aegis256_default_symmetric() {
+    fips::set_fips_mode_unchecked(false);
     // Verify that non-FIPS → AEGIS-256 mapping exists in the code.
     // We test by checking the enum variant is available and encrypt works.
     let key = [0xAAu8; 32];
@@ -198,6 +199,7 @@ fn test_aegis256_default_symmetric() {
 
 /// With FIPS mode enabled, `active_algorithm()` must return AES-256-GCM.
 #[test]
+#[serial(fips)]
 fn test_aes256gcm_fips_symmetric() {
     fips::set_fips_mode_unchecked(true);
     let algo = active_algorithm();
@@ -218,6 +220,7 @@ fn test_aes256gcm_fips_symmetric() {
 /// recover the plaintext from either blob without prior knowledge of the
 /// algorithm.
 #[test]
+#[serial(fips)]
 fn test_symmetric_wire_format_self_describing() {
     use crypto::symmetric::{ALGO_ID_AEGIS256, ALGO_ID_AES256GCM};
 
