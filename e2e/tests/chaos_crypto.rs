@@ -300,7 +300,9 @@ fn test_legacy_aes256gcm_rejected_after_fallback_removal() {
 /// Set the first byte of a sealed blob to 0xFF (unknown algo_id), verify
 /// that decryption returns an error rather than panicking.
 #[test]
+#[serial(fips)]
 fn test_symmetric_algo_id_corruption() {
+    fips::set_fips_mode_unchecked(false);
     let key = random_key();
     let plaintext = b"algo id corruption test";
     let aad = b"corruption-aad";
