@@ -742,7 +742,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_adaptive_normal_roundtrip() {
+        pin_fips_state(false);
         let ac = AdaptiveCrypto::new();
         // Default level is Normal.
         assert_eq!(ac.current_level(), CryptoThreatLevel::Normal);
@@ -755,7 +757,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_adaptive_elevated_roundtrip() {
+        pin_fips_state(false);
         let ac = AdaptiveCrypto::new();
         ac.escalate_immediate(CryptoThreatLevel::Elevated);
         assert_eq!(ac.current_level(), CryptoThreatLevel::Elevated);
@@ -778,7 +782,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_adaptive_high_triple_layer() {
+        pin_fips_state(false);
         let ac = AdaptiveCrypto::new();
         ac.escalate_immediate(CryptoThreatLevel::High);
         assert_eq!(ac.current_level(), CryptoThreatLevel::High);
@@ -861,7 +867,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_adaptive_cross_level_decrypt() {
+        pin_fips_state(false);
         // Encrypt at High, then decrypt with a *different* AdaptiveCrypto at Normal.
         // Must succeed because the level is embedded in the wire format.
         let ac_high = AdaptiveCrypto::new();
@@ -879,7 +887,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_adaptive_wire_format_tag() {
+        pin_fips_state(false);
         let ac = AdaptiveCrypto::new();
         let key = random_key();
         let sealed = ac.encrypt_adaptive(&key, b"data", b"aad").expect("encrypt");
@@ -913,7 +923,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_elevated_separate_hmac_key_roundtrip() {
+        pin_fips_state(false);
         let ac = AdaptiveCrypto::new();
         ac.escalate_immediate(CryptoThreatLevel::Elevated);
         let key = random_key();
