@@ -277,15 +277,12 @@ fn nonce_wal_partial_write_recovery() {
             "empty WAL must produce non-zero safe nonce (safety margin)"
         );
 
-        // Corrupted CRC.
-        let mut bad_crc = entry;
-        bad_crc[16] ^= 0xFF;
-        std::fs::write(&wal_path, &bad_crc).expect("write bad CRC");
-        let wal_bad_crc = tss::distributed::NonceWal::new(Some(wal_path.clone()));
-        assert!(
-            wal_bad_crc.current_nonce() > 0,
-            "bad CRC WAL must produce non-zero safe nonce"
-        );
+        // Note: corrupted-CRC and corrupted-magic WALs trigger
+        // `std::process::exit(199)` in production code because nonce-WAL tamper
+        // enables FROST key recovery via nonce reuse — a catastrophic outcome
+        // that must halt the signer. Those cases cannot be exercised from
+        // in-process tests without killing the test binary, and they belong
+        // in a subprocess-based chaos suite instead.
 
         // Cleanup.
         std::env::remove_var("MILNET_TSS_NONCE_WAL_PATH");

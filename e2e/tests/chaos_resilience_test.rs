@@ -382,29 +382,13 @@ fn test_frost_nonce_wal_survives_partial_write() {
             "truncated WAL must still produce a non-zero nonce counter (safety margin)"
         );
 
-        // Corrupt the CRC: valid length but wrong checksum.
-        let mut bad_crc_entry = entry;
-        bad_crc_entry[16] ^= 0xFF; // flip a CRC byte
-        std::fs::write(&wal_path, &bad_crc_entry).expect("write bad CRC WAL");
-
-        let wal_bad_crc = tss::distributed::NonceWal::new(Some(wal_path.clone()));
-        // Bad CRC should be treated as corruption, returning 0 for the WAL nonce.
-        // Recovery then uses safety margin only.
-        assert!(
-            wal_bad_crc.current_nonce() > 0,
-            "bad CRC WAL must still produce a safe nonce counter"
-        );
-
-        // Corrupt the magic bytes: valid length and CRC but wrong sentinel.
-        let mut bad_magic_entry = entry;
-        bad_magic_entry[20] = 0x00; // break sentinel
-        std::fs::write(&wal_path, &bad_magic_entry).expect("write bad magic WAL");
-
-        let wal_bad_magic = tss::distributed::NonceWal::new(Some(wal_path.clone()));
-        assert!(
-            wal_bad_magic.current_nonce() > 0,
-            "bad magic WAL must still produce a safe nonce counter"
-        );
+        // Note: CRC and magic-byte tamper trigger `std::process::exit(199)`
+        // in production code because nonce-WAL tamper enables FROST key
+        // recovery via nonce reuse. These cases cannot be exercised from
+        // in-process tests without killing the binary and belong in a
+        // subprocess-based chaos suite instead. Only a bad-magic WAL that is
+        // *also too short to validate* can be tolerated — already covered by
+        // the truncation case above.
 
         // Cleanup env vars.
         std::env::remove_var("MILNET_TSS_NONCE_WAL_PATH");
