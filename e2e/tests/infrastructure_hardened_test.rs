@@ -996,7 +996,11 @@ fn fido_credential_store_persistence_roundtrip() {
         user_id,
         sign_count: 0,
         authenticator_type: "cross-platform".to_string(),
-        ..Default::default()
+        aaguid: [0u8; 16],
+        cloned_flag: false,
+        backup_eligible: false,
+        backup_state: false,
+        pq_attestation: Vec::new(),
     };
     store.store_credential(cred.clone());
 
@@ -1184,7 +1188,11 @@ fn fido_credential_removal_purges_all_user_data() {
         user_id,
         sign_count: 0,
         authenticator_type: "platform".to_string(),
-        ..Default::default()
+        aaguid: [0u8; 16],
+        cloned_flag: false,
+        backup_eligible: false,
+        backup_state: false,
+        pq_attestation: Vec::new(),
     });
     store.store_credential(StoredCredential {
         credential_id: vec![2, 2],
@@ -1192,7 +1200,11 @@ fn fido_credential_removal_purges_all_user_data() {
         user_id,
         sign_count: 0,
         authenticator_type: "cross-platform".to_string(),
-        ..Default::default()
+        aaguid: [0u8; 16],
+        cloned_flag: false,
+        backup_eligible: false,
+        backup_state: false,
+        pq_attestation: Vec::new(),
     });
     store.store_credential(StoredCredential {
         credential_id: vec![3, 3],
@@ -1200,7 +1212,11 @@ fn fido_credential_removal_purges_all_user_data() {
         user_id: other_user,
         sign_count: 0,
         authenticator_type: "platform".to_string(),
-        ..Default::default()
+        aaguid: [0u8; 16],
+        cloned_flag: false,
+        backup_eligible: false,
+        backup_state: false,
+        pq_attestation: Vec::new(),
     });
 
     // Store a challenge for the user.
