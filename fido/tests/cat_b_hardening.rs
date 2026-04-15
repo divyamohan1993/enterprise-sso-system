@@ -61,7 +61,11 @@ fn b7_sign_count_rollback_locks_credential() {
         user_id,
         sign_count: 10,
         authenticator_type: "cross-platform".into(),
-        ..Default::default()
+            aaguid: [0u8; 16],
+        cloned_flag: false,
+        backup_eligible: false,
+        backup_state: false,
+        pq_attestation: Vec::new()
     };
     let res = verify_authentication_response_with_lockout(&auth_result, &mut stored, rp_id, true);
     assert!(res.is_err(), "rollback must be rejected");

@@ -140,7 +140,11 @@ fn make_stored_credential(
         user_id,
         sign_count,
         authenticator_type: authenticator_type.to_string(),
-    ..Default::default()
+        aaguid: [0u8; 16],
+        cloned_flag: false,
+        backup_eligible: false,
+        backup_state: false,
+        pq_attestation: Vec::new()
     }
 }
 
@@ -1292,7 +1296,11 @@ fn test_stored_credential_creation() {
         user_id,
         sign_count: 0,
         authenticator_type: "cross-platform".to_string(),
-    ..Default::default()
+        aaguid: [0u8; 16],
+        cloned_flag: false,
+        backup_eligible: false,
+        backup_state: false,
+        pq_attestation: Vec::new()
     };
 
     assert_eq!(cred.credential_id, vec![0xDE, 0xAD]);
@@ -1311,7 +1319,11 @@ fn test_stored_credential_clone() {
         user_id,
         sign_count: 7,
         authenticator_type: "platform".to_string(),
-    ..Default::default()
+        aaguid: [0u8; 16],
+        cloned_flag: false,
+        backup_eligible: false,
+        backup_state: false,
+        pq_attestation: Vec::new()
     };
 
     let cloned = cred.clone();
@@ -1330,7 +1342,11 @@ fn test_types_serialization_roundtrip() {
         user_id,
         sign_count: 42,
         authenticator_type: "platform".to_string(),
-    ..Default::default()
+        aaguid: [0u8; 16],
+        cloned_flag: false,
+        backup_eligible: false,
+        backup_state: false,
+        pq_attestation: Vec::new()
     };
 
     let json = serde_json::to_string(&cred).unwrap();
