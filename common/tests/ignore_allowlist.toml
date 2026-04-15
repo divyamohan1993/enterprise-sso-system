@@ -1,0 +1,32 @@
+# Allowlist for test_exclusion_guardrail.rs.
+# Every entry must cite justification + review date + owning ticket/audit.
+# Guardrail FAILS if anything exists outside this list.
+schema_version = 1
+
+[[ignored]]
+file = "crypto/tests/dudect_timing_test.rs"
+test = "ct_eq_is_constant_time_welch"
+reason = "Statistical Welch-t timing; requires bare-metal + pinned CPU. Runs nightly via dudect-timing.yml timing-ignored-tests job."
+audit = "2026-04-15"
+
+[[ignored]]
+file = "crypto/tests/dudect_timing_test.rs"
+test = "ct_eq_variable_length_constant_time"
+reason = "Same as above (variable-length ct_eq covering early/late diff positions)."
+audit = "2026-04-15"
+
+[[ignored]]
+file = "opaque/tests/login_timing_oracle_test.rs"
+test = "login_user_existence_no_timing_oracle"
+reason = "OPAQUE login user-existence timing oracle check; statistical, nightly bare-metal only."
+audit = "2026-04-15"
+
+[[disabled_files]]
+path = "saml-sp/tests/e2e.rs.disabled"
+reason = "saml-sp lib.rs is a stub; 1800 lines unwired per 2026-04-15 audit. Re-enable after saml-sp revive (W3)."
+audit = "2026-04-15"
+
+[[disabled_files]]
+path = "saml-sp/tests/validate_negative.rs.disabled"
+reason = "Depends on saml-sp stub lib.rs. Re-enable alongside e2e.rs."
+audit = "2026-04-15"

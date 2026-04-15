@@ -59,6 +59,26 @@ jobs:
           name: dudect-results
           path: dudect-results.txt
 
+  timing-ignored-tests:
+    name: "#[ignore] timing tests (release, single-threaded)"
+    runs-on: [self-hosted, bare-metal, x86_64]
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: "-C target-cpu=x86-64-v3 -C target-feature=+aes,+pclmulqdq,+avx,+avx2"
+      RUST_MIN_STACK: "8388608"
+      MILNET_MASTER_KEK: "abababababababababababababababababababababababababababababababababab"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pin CPU governor to performance
+        run: for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo performance | sudo tee "$f" || true; done
+      - name: Run ignored timing tests
+        run: |
+          taskset -c 2 cargo test --release -p crypto --test dudect_timing_test \
+            -- --ignored --test-threads=1 --nocapture
+          taskset -c 2 cargo test --release -p opaque --test login_timing_oracle_test \
+            -- --ignored --test-threads=1 --nocapture
+
   xtask-entry:
     name: cargo xtask dudect (smoke)
     runs-on: ubuntu-latest

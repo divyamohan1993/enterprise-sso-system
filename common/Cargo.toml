@@ -45,6 +45,8 @@ serial_test.workspace = true
 syn = { version = "2", features = ["full", "visit", "extra-traits"] }
 quote = "1"
 proc-macro2 = "1"
+walkdir = "2"
+toml = "0.8"
 
 [features]
 default = ["production"]
