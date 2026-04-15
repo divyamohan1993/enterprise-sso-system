@@ -318,6 +318,6 @@ mod tests {
         match cb.guard() {
             Err(e) => assert!(e.to_string().contains("circuit breaker is open")),
             Ok(_) => panic!("expected CircuitOpenError"),
-        }
+        };
     }
 }
