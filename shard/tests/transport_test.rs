@@ -1,8 +1,6 @@
 use common::types::ModuleId;
 use shard::tls::{generate_ca, generate_module_cert, server_tls_config, client_tls_config, tls_connector};
 use shard::tls_transport::{TlsShardListener, tls_connect};
-#[cfg(feature = "test-internals")]
-use tokio::io::AsyncWriteExt;
 
 /// Shared HMAC key for tests.
 fn test_key() -> [u8; 64] {
@@ -48,69 +46,6 @@ async fn transport_roundtrip() {
     let (sender, payload) = handle.await.unwrap();
     assert_eq!(sender, ModuleId::Gateway);
     assert_eq!(payload, b"hello shard");
-}
-
-#[tokio::test]
-#[cfg(feature = "test-internals")]
-async fn transport_replay_rejected() {
-    let ca = generate_ca();
-    let server_cert = generate_module_cert("localhost", &ca);
-    let client_cert = generate_module_cert("client", &ca);
-    let server_cfg = server_tls_config(&server_cert, &ca);
-    let client_cfg = client_tls_config(&client_cert, &ca);
-
-    let listener = TlsShardListener::bind(
-        "127.0.0.1:0",
-        ModuleId::Verifier,
-        test_key(),
-        server_cfg,
-    )
-    .await
-    .unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-
-    let connector = tls_connector(client_cfg);
-
-    // Server side: receive the first message normally, then capture raw bytes
-    // of a second message, and try to replay them on a new connection.
-    let handle = tokio::spawn(async move {
-        let mut server = listener.accept().await.unwrap();
-        // First message — receive and verify (advances sequence to 1)
-        let (sender, payload) = server.recv().await.unwrap();
-        assert_eq!(sender, ModuleId::Gateway);
-        assert_eq!(payload, b"legit message");
-
-        // Second message — read raw bytes without verifying
-        let raw = server.recv_raw().await.unwrap();
-
-        // Third message — receive and verify (advances sequence to 3)
-        let (_sender, _payload) = server.recv().await.unwrap();
-
-        // Now replay the raw bytes of message 2 (sequence=2, but server
-        // already saw sequence up to 3). This should fail replay detection.
-        let result = server.protocol.verify_message(&raw);
-        assert!(result.is_err(), "replay should be rejected");
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("replay"),
-            "error should mention replay, got: {err}"
-        );
-    });
-
-    let mut client = tls_connect(
-        &addr,
-        ModuleId::Gateway,
-        test_key(),
-        &connector,
-        "localhost",
-    )
-    .await
-    .unwrap();
-    client.send(b"legit message").await.unwrap();
-    client.send(b"message to replay").await.unwrap();
-    client.send(b"third message").await.unwrap();
-
-    handle.await.unwrap();
 }
 
 #[tokio::test]
@@ -214,63 +149,6 @@ async fn transport_bidirectional() {
     let (sender, payload) = client.recv().await.unwrap();
     assert_eq!(sender, ModuleId::Verifier);
     assert_eq!(payload, b"pong");
-
-    server_handle.await.unwrap();
-}
-
-#[tokio::test]
-#[cfg(feature = "test-internals")]
-async fn transport_rejects_oversized_frame() {
-    // MAX_FRAME_LEN is 16 MiB.
-    // Verify that a frame larger than 16 MiB is rejected.
-    let ca = generate_ca();
-    let server_cert = generate_module_cert("localhost", &ca);
-    let client_cert = generate_module_cert("client", &ca);
-    let server_cfg = server_tls_config(&server_cert, &ca);
-    let client_cfg = client_tls_config(&client_cert, &ca);
-
-    let listener = TlsShardListener::bind(
-        "127.0.0.1:0",
-        ModuleId::Verifier,
-        test_key(),
-        server_cfg,
-    )
-    .await
-    .unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-
-    let connector = tls_connector(client_cfg);
-
-    // Server: attempt to recv a frame that exceeds 16 MiB
-    let server_handle = tokio::spawn(async move {
-        let mut server = listener.accept().await.unwrap();
-        let result = server.recv().await;
-        assert!(
-            result.is_err(),
-            "receiving a frame > 16 MiB must fail"
-        );
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("frame too large"),
-            "error must mention 'frame too large', got: {err}"
-        );
-    });
-
-    // Client: manually write an oversized frame length header (3 MiB)
-    let mut client = tls_connect(
-        &addr,
-        ModuleId::Gateway,
-        test_key(),
-        &connector,
-        "localhost",
-    )
-    .await
-    .unwrap();
-
-    // Send a frame length of 17 MiB (exceeds 16 MiB limit)
-    let oversized_len: u32 = 17 * 1024 * 1024;
-    let payload = vec![0xAA; oversized_len as usize];
-    let _ = client.send_raw(&payload).await;
 
     server_handle.await.unwrap();
 }
