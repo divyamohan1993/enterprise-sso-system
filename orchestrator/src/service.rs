@@ -607,7 +607,7 @@ impl OrchestratorService {
                 if let Err(close_err) = session.fail(message.clone()) {
                     tracing::error!(
                         target: "milnet::siem",
-                        error.code = "ORCH-SESSION-FAIL-001",
+                        error_code = "ORCH-SESSION-FAIL-001",
                         error.stage = "opaque_login_challenge",
                         error.message = %close_err,
                         "failed to close orchestrator session cleanly after OPAQUE error"
@@ -622,7 +622,7 @@ impl OrchestratorService {
                 if let Err(close_err) = session.fail("unexpected OPAQUE response".into()) {
                     tracing::error!(
                         target: "milnet::siem",
-                        error.code = "ORCH-SESSION-FAIL-002",
+                        error_code = "ORCH-SESSION-FAIL-002",
                         error.stage = "opaque_login_challenge_unexpected",
                         error.message = %close_err,
                         "failed to close orchestrator session cleanly"
@@ -652,7 +652,7 @@ impl OrchestratorService {
                 if let Err(close_err) = session.fail(format!("OPAQUE login finish: {e}")) {
                     tracing::error!(
                         target: "milnet::siem",
-                        error.code = "ORCH-SESSION-FAIL-003",
+                        error_code = "ORCH-SESSION-FAIL-003",
                         error.stage = "opaque_client_login_finish",
                         error.message = %close_err,
                         "failed to close orchestrator session cleanly after OPAQUE finish failure"
@@ -690,7 +690,7 @@ impl OrchestratorService {
                 if let Err(close_err) = session.fail(message.clone()) {
                     tracing::error!(
                         target: "milnet::siem",
-                        error.code = "ORCH-SESSION-FAIL-004",
+                        error_code = "ORCH-SESSION-FAIL-004",
                         error.stage = "opaque_login_result_error",
                         error.message = %close_err,
                         "failed to close orchestrator session cleanly after OPAQUE login result error"
@@ -705,7 +705,7 @@ impl OrchestratorService {
                 if let Err(close_err) = session.fail("unexpected OPAQUE response".into()) {
                     tracing::error!(
                         target: "milnet::siem",
-                        error.code = "ORCH-SESSION-FAIL-005",
+                        error_code = "ORCH-SESSION-FAIL-005",
                         error.stage = "opaque_login_result_unexpected",
                         error.message = %close_err,
                         "failed to close orchestrator session cleanly"
@@ -729,7 +729,7 @@ impl OrchestratorService {
             if let Err(close_err) = session.fail(format!("receipt verification: {e}")) {
                 tracing::error!(
                     target: "milnet::siem",
-                    error.code = "ORCH-SESSION-FAIL-006",
+                    error_code = "ORCH-SESSION-FAIL-006",
                     error.stage = "receipt_verification",
                     error.message = %close_err,
                     "failed to close orchestrator session cleanly after receipt verification failure"
@@ -750,7 +750,7 @@ impl OrchestratorService {
                 if let Err(close_err) = session.fail("receipt revoked by saga compensation".into()) {
                     tracing::error!(
                         target: "milnet::siem",
-                        error.code = "ORCH-SESSION-FAIL-007",
+                        error_code = "ORCH-SESSION-FAIL-007",
                         error.stage = "saga_revoked",
                         error.message = %close_err,
                         "failed to close orchestrator session cleanly after saga-compensation revocation"

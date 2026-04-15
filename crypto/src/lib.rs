@@ -33,6 +33,7 @@ pub mod envelope;
 pub mod seal;
 #[allow(unsafe_code)]
 pub mod memguard;
+pub mod process_harden;
 #[allow(unsafe_code)]
 pub mod seccomp;
 pub mod attest;
