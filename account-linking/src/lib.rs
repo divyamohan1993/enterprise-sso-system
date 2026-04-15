@@ -172,6 +172,7 @@ pub struct LinkStore {
     inner: Mutex<Inner>,
 }
 
+#[derive(Debug)]
 pub struct InitiateOutcome {
     /// Hex-encoded raw challenge. Caller embeds it in the confirmation URL.
     /// Returned ONLY for the dispatch sink — never logged, never persisted.
