@@ -909,7 +909,7 @@ struct AuthenticatedSequenceState {
 // ---------------------------------------------------------------------------
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Default filename for persisted sequence state alongside the service data dir.
 const SEQUENCE_FILE_NAME: &str = "shard_sequences.bin";

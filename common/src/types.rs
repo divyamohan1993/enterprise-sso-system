@@ -407,7 +407,7 @@ pub enum ActionLevel {
 }
 
 /// Identifies a system module.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum ModuleId {
     Gateway = 1,
