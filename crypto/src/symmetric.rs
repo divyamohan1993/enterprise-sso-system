@@ -65,29 +65,37 @@ pub enum SymmetricAlgorithm {
 // ---------------------------------------------------------------------------
 
 /// Cached envelope cipher from `MILNET_ENVELOPE_CIPHER` env var.
-static ENVELOPE_CIPHER: std::sync::LazyLock<SymmetricAlgorithm> = std::sync::LazyLock::new(|| {
-    if common::fips::is_fips_mode() {
-        return SymmetricAlgorithm::Aes256Gcm;
-    }
-    match std::env::var("MILNET_ENVELOPE_CIPHER").as_deref() {
-        Ok("aes-256-gcm") => SymmetricAlgorithm::Aes256Gcm,
-        Ok("chacha20-poly1305") => SymmetricAlgorithm::ChaCha20Poly1305,
-        Ok("aegis-256") | Err(_) => SymmetricAlgorithm::Aegis256,
-        Ok(other) => {
-            tracing::error!(
-                "MILNET_ENVELOPE_CIPHER unknown value '{}', defaulting to aegis-256", other
-            );
-            SymmetricAlgorithm::Aegis256
+///
+/// IMPORTANT: this does NOT check FIPS mode. FIPS mode is checked on every
+/// call to `active_algorithm()` so that tests (and runtime FIPS flips) see
+/// the current state. Caching only the env-var-derived choice keeps the
+/// hot path to a single atomic load + no env lookup.
+static ENVELOPE_CIPHER_FROM_ENV: std::sync::LazyLock<SymmetricAlgorithm> =
+    std::sync::LazyLock::new(|| {
+        match std::env::var("MILNET_ENVELOPE_CIPHER").as_deref() {
+            Ok("aes-256-gcm") => SymmetricAlgorithm::Aes256Gcm,
+            Ok("chacha20-poly1305") => SymmetricAlgorithm::ChaCha20Poly1305,
+            Ok("aegis-256") | Err(_) => SymmetricAlgorithm::Aegis256,
+            Ok(other) => {
+                tracing::error!(
+                    "MILNET_ENVELOPE_CIPHER unknown value '{}', defaulting to aegis-256",
+                    other
+                );
+                SymmetricAlgorithm::Aegis256
+            }
         }
-    }
-});
+    });
 
 /// Returns the active algorithm for new encryptions.
 ///
-/// FIPS mode overrides to AES-256-GCM. Otherwise reads MILNET_ENVELOPE_CIPHER.
-/// Decryption always supports all algorithms via the algo_id wire format byte.
+/// FIPS mode overrides to AES-256-GCM on every call. Otherwise returns the
+/// (cached) choice from MILNET_ENVELOPE_CIPHER. Decryption always supports
+/// all algorithms via the algo_id wire format byte.
 pub fn active_algorithm() -> SymmetricAlgorithm {
-    *ENVELOPE_CIPHER
+    if common::fips::is_fips_mode() {
+        return SymmetricAlgorithm::Aes256Gcm;
+    }
+    *ENVELOPE_CIPHER_FROM_ENV
 }
 
 // ---------------------------------------------------------------------------
