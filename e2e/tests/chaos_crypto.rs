@@ -300,6 +300,7 @@ fn test_legacy_aes256gcm_rejected_after_fallback_removal() {
 /// Set the first byte of a sealed blob to 0xFF (unknown algo_id), verify
 /// that decryption returns an error rather than panicking.
 #[test]
+#[serial(fips)]
 fn test_symmetric_algo_id_corruption() {
     // Why: an earlier test in this binary (test_fips_mode_forces_pbkdf2)
     // enables FIPS mode, which persists in the static FIPS_MODE atomic for
@@ -307,8 +308,7 @@ fn test_symmetric_algo_id_corruption() {
     // but this test only cares about decrypt's algo_id corruption handling
     // and can use either AEAD as its base. Explicitly disable FIPS here
     // so the test is order-independent.
-    common::fips::set_fips_mode_unchecked(false);
-
+    fips::set_fips_mode_unchecked(false);
     let key = random_key();
     let plaintext = b"algo id corruption test";
     let aad = b"corruption-aad";

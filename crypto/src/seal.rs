@@ -633,6 +633,7 @@ impl Default for KeyRotationScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     const TEST_SEED: &[u8] = b"test-seed-with-enough-entropy-for-hkdf-extraction";
 
@@ -713,6 +714,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(fips)]
     fn sealed_output_has_expected_overhead() {
         // Ensure non-FIPS so AEGIS-256 is selected.
         common::fips::set_fips_mode_unchecked(false);
@@ -865,6 +867,7 @@ mod tests {
     // -- AEGIS-256 / FIPS / legacy compat -----------------------------------
 
     #[test]
+    #[serial(fips)]
     fn test_seal_aegis256_roundtrip() {
         // Non-FIPS mode → AEGIS-256
         common::fips::set_fips_mode_unchecked(false);
@@ -877,6 +880,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(fips)]
     fn test_seal_fips_aes256gcm_roundtrip() {
         // FIPS mode → AES-256-GCM
         common::fips::set_fips_mode_unchecked(true);
@@ -890,6 +894,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(fips)]
     fn test_seal_legacy_backward_compat() {
         use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
         use aes_gcm::aead::Aead;
