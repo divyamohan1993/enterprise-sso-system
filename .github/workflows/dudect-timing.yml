@@ -31,7 +31,7 @@ jobs:
       RUSTFLAGS: "-C target-cpu=x86-64-v3 -C target-feature=+aes,+pclmulqdq,+ssse3,+sse4.1,+sse4.2,+avx,+avx2"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Verify AES-NI present on runner
         run: |
@@ -69,7 +69,7 @@ jobs:
       RUST_MIN_STACK: "8388608"
       MILNET_MASTER_KEK: "abababababababababababababababababababababababababababababababababab"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Pin CPU governor to performance
         run: for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo performance | sudo tee "$f" || true; done
       - name: Run ignored timing tests
@@ -83,7 +83,7 @@ jobs:
     name: cargo xtask dudect (smoke)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Document entry point
         run: |
           echo "Run locally with: cargo run --release -p dudect-harness --bin dudect-suite"
