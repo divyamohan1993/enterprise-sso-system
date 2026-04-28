@@ -170,7 +170,9 @@ impl MfaProvider for TwilioSmsProvider {
 }
 
 /// Generic push provider interface — concrete APNS/FCM adapters land behind
-/// `--features apns,fcm` once platform certificates are provisioned.
+/// `--features apns,fcm` once platform certificates are provisioned. The
+/// shared logic for number-matching anti-fatigue is implemented here so
+/// future adapters share a single, audited primitive.
 pub struct PushProvider {
     pub vendor: String,
 }
@@ -183,5 +185,106 @@ impl MfaProvider for PushProvider {
             "push vendor `{}` not yet wired — gated behind apns/fcm features",
             self.vendor
         )))
+    }
+}
+
+/// Per-request number-matching challenge for push MFA. The user enrols
+/// the matching N-digit code into their push notification UI; if the
+/// digits typed at the verifier do not match, the push is rejected.
+#[derive(Debug, Clone)]
+pub struct NumberMatchChallenge {
+    pub digits: String,
+    pub challenge_id: [u8; 32],
+    pub expires_at: i64,
+}
+
+pub const PUSH_NUMBER_MATCH_DIGITS: usize = 2;
+
+/// Build a fresh number-match challenge.
+pub fn new_number_match_challenge(now_unix: i64) -> Result<NumberMatchChallenge, MfaError> {
+    let mut buf = [0u8; PUSH_NUMBER_MATCH_DIGITS];
+    getrandom::getrandom(&mut buf).map_err(|e| MfaError::Transport(e.to_string()))?;
+    let digits: String = buf.iter().map(|b| ((*b % 10) + b'0') as char).collect();
+    let mut id = [0u8; 32];
+    getrandom::getrandom(&mut id).map_err(|e| MfaError::Transport(e.to_string()))?;
+    Ok(NumberMatchChallenge {
+        digits,
+        challenge_id: id,
+        expires_at: now_unix + 60,
+    })
+}
+
+/// Constant-time verify of a typed digit string against a challenge.
+pub fn verify_number_match(
+    challenge: &NumberMatchChallenge,
+    typed: &str,
+    now_unix: i64,
+) -> bool {
+    if now_unix > challenge.expires_at {
+        return false;
+    }
+    if typed.len() != challenge.digits.len() {
+        return false;
+    }
+    use subtle::ConstantTimeEq;
+    typed
+        .as_bytes()
+        .ct_eq(challenge.digits.as_bytes())
+        .unwrap_u8()
+        == 1
+}
+
+#[cfg(test)]
+mod number_match_tests {
+    use super::*;
+
+    #[test]
+    fn fresh_challenge_has_correct_digit_count_and_unexpired() {
+        let now = 1_000_000;
+        let c = new_number_match_challenge(now).unwrap();
+        assert_eq!(c.digits.len(), PUSH_NUMBER_MATCH_DIGITS);
+        assert!(c.digits.bytes().all(|b| (b'0'..=b'9').contains(&b)));
+        assert!(c.expires_at > now);
+        assert_ne!(c.challenge_id, [0u8; 32]);
+    }
+
+    #[test]
+    fn correct_digits_verify() {
+        let now = 1_000_000;
+        let c = new_number_match_challenge(now).unwrap();
+        let typed = c.digits.clone();
+        assert!(verify_number_match(&c, &typed, now));
+    }
+
+    #[test]
+    fn wrong_digits_rejected() {
+        let now = 1_000_000;
+        let c = new_number_match_challenge(now).unwrap();
+        let typed: String = c
+            .digits
+            .chars()
+            .map(|d| {
+                let n = d.to_digit(10).unwrap();
+                std::char::from_digit((n + 5) % 10, 10).unwrap()
+            })
+            .collect();
+        assert_ne!(typed, c.digits);
+        assert!(!verify_number_match(&c, &typed, now));
+    }
+
+    #[test]
+    fn expired_rejected() {
+        let now = 1_000_000;
+        let c = new_number_match_challenge(now).unwrap();
+        let typed = c.digits.clone();
+        assert!(!verify_number_match(&c, &typed, now + 120));
+    }
+
+    #[test]
+    fn wrong_length_rejected() {
+        let now = 1_000_000;
+        let c = new_number_match_challenge(now).unwrap();
+        assert!(!verify_number_match(&c, "1", now));
+        assert!(!verify_number_match(&c, "12345", now));
     }
 }

@@ -245,6 +245,19 @@ pub enum RiskLevel {
     Critical, // >= 0.8
 }
 
+/// Caller-supplied attestation accompanying a baseline-update request.
+///
+/// `update_baseline_if_safe` rejects any update whose attestation is not
+/// (a) `Normal`-risk AND (b) backed by a hardware factor (FIDO2 / CAC /
+/// PIV / smartcard). The effect is that an attacker who slipped past
+/// (e.g. via the SMS path or via a stolen password) cannot bend the
+/// user's baseline toward attacker-controlled signals.
+#[derive(Debug, Clone, Copy)]
+pub struct BaselineUpdateAttestation {
+    pub level: RiskLevel,
+    pub authenticated_with_hardware_factor: bool,
+}
+
 /// Window duration for the server-side failed attempt counter (1 hour).
 const FAILED_ATTEMPT_WINDOW_SECS: u64 = 3600;
 
@@ -411,10 +424,37 @@ impl BaselineStore {
         lww.clear();
     }
 
+    /// Apply [`update_baseline`] only if the supplied attestation passes
+    /// the hardware-factor + Normal-risk gate. Returns `true` if the
+    /// baseline was updated, `false` if the update was refused.
+    pub fn update_baseline_if_safe(
+        &self,
+        user_id: Uuid,
+        signals: &RiskSignals,
+        attestation: BaselineUpdateAttestation,
+    ) -> bool {
+        if !attestation.authenticated_with_hardware_factor
+            || !matches!(attestation.level, RiskLevel::Normal)
+        {
+            tracing::info!(
+                target: "siem",
+                "SIEM:INFO baseline update refused — attestation = (hw={}, level={:?})",
+                attestation.authenticated_with_hardware_factor,
+                attestation.level,
+            );
+            return false;
+        }
+        self.update_baseline(user_id, signals);
+        true
+    }
+
     /// Update (or create) the baseline for `user_id` after a successful auth.
     ///
     /// Numeric fields are updated via exponential moving average so the
     /// baseline drifts smoothly rather than snapping to the latest value.
+    ///
+    /// **Use [`update_baseline_if_safe`] for any path that consumes
+    /// authenticated session signals.**
     pub fn update_baseline(&self, user_id: Uuid, signals: &RiskSignals) {
         let mut store = self.inner.lock().unwrap_or_else(|e| {
                     tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in scoring - recovering: thread panicked while holding lock");
@@ -570,19 +610,28 @@ impl Default for BaselineStore {
 /// Maximum number of failed attempt counter entries before eviction.
 const MAX_FAILED_COUNTERS: usize = 100_000;
 
+/// Trait for a cluster-replicated failed-attempt counter (L2). The local
+/// `failed_attempt_counter` HashMap is per-node L1; deployments running
+/// more than one orchestrator MUST also wire an L2 implementation that
+/// reflects the count across nodes (Redis Cluster, Bigtable, Spanner, or
+/// the BFT log itself). Without an L2, an attacker rotates across
+/// orchestrator instances to defeat per-node 5-strike thresholds.
+pub trait DistributedFailedAttemptCounter: Send + Sync {
+    fn increment(&self, user_id: &Uuid) -> Result<u32, String>;
+    fn read(&self, user_id: &Uuid) -> Result<u32, String>;
+}
+
 pub struct RiskEngine {
     /// Per-user behavioral baselines for anomaly detection.
     pub baseline_store: BaselineStore,
 
-    /// Server-side failed attempt counter per user ID.
-    /// Each entry stores (count, window_start). The counter resets when the
-    /// window expires. This is authoritative and replaces the client-supplied
-    /// `recent_failed_attempts` field.
-    ///
-    /// Wrapped in a Mutex so that `record_failed_attempt` can be called
-    /// through a shared `&self` reference (the orchestrator holds the engine
-    /// behind an immutable borrow in `process_auth`).
+    /// Server-side failed attempt counter per user ID (L1, per-node).
     failed_attempt_counter: Mutex<HashMap<Uuid, (u32, Instant)>>,
+
+    /// Optional cluster-replicated counter (L2). When configured, scoring
+    /// uses `max(L1, L2)` so a per-node bypass via load-balancer rotation
+    /// is impossible.
+    distributed_counter: Option<std::sync::Arc<dyn DistributedFailedAttemptCounter>>,
 }
 
 impl RiskEngine {
@@ -590,7 +639,17 @@ impl RiskEngine {
         Self {
             baseline_store: BaselineStore::new(),
             failed_attempt_counter: Mutex::new(HashMap::new()),
+            distributed_counter: None,
         }
+    }
+
+    /// Wire a cluster-replicated failed-attempt counter (L2).
+    pub fn with_distributed_counter(
+        mut self,
+        counter: std::sync::Arc<dyn DistributedFailedAttemptCounter>,
+    ) -> Self {
+        self.distributed_counter = Some(counter);
+        self
     }
 
     /// Record a failed authentication attempt for a user. Must be called by
@@ -622,25 +681,53 @@ impl RiskEngine {
         } else {
             entry.0 = entry.0.saturating_add(1);
         }
+        drop(counter);
+        // Propagate to L2 distributed counter if wired.
+        if let Some(dc) = &self.distributed_counter {
+            if let Err(e) = dc.increment(user_id) {
+                tracing::warn!(
+                    target: "siem",
+                    "SIEM:WARNING distributed failed-attempt counter increment failed: {}", e
+                );
+            }
+        }
     }
 
-    /// Get the server-side failed attempt count for a user.
+    /// Get the server-side failed attempt count for a user, taking the
+    /// max of the local L1 counter and the distributed L2 counter when
+    /// configured.
     fn server_failed_attempts(&self, user_id: &Uuid) -> u32 {
-        let counter = self.failed_attempt_counter.lock().unwrap_or_else(|e| {
-                    tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in scoring - recovering: thread panicked while holding lock");
-                    e.into_inner()
-                });
-        match counter.get(user_id) {
-            Some((count, start)) => {
-                let elapsed = Instant::now().duration_since(*start).as_secs();
-                if elapsed > FAILED_ATTEMPT_WINDOW_SECS {
-                    0 // window expired
-                } else {
-                    *count
+        let l1 = {
+            let counter = self.failed_attempt_counter.lock().unwrap_or_else(|e| {
+                        tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in scoring - recovering: thread panicked while holding lock");
+                        e.into_inner()
+                    });
+            match counter.get(user_id) {
+                Some((count, start)) => {
+                    let elapsed = Instant::now().duration_since(*start).as_secs();
+                    if elapsed > FAILED_ATTEMPT_WINDOW_SECS {
+                        0
+                    } else {
+                        *count
+                    }
                 }
+                None => 0,
             }
+        };
+        let l2 = match &self.distributed_counter {
+            Some(dc) => match dc.read(user_id) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "siem",
+                        "SIEM:WARNING distributed failed-attempt counter read failed: {} — falling back to L1", e
+                    );
+                    0
+                }
+            },
             None => 0,
-        }
+        };
+        l1.max(l2)
     }
 
     /// Validate and sanitize client-supplied risk signals.
