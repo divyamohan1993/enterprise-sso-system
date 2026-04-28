@@ -4,6 +4,16 @@
 //! adapter for SMS. Push delivery is an interface only — concrete adapters
 //! (APNS/FCM) live behind a feature flag once the platform certs are
 //! provisioned.
+//!
+//! ## SMS policy gate
+//!
+//! SMS is the cheapest factor to subvert (SIM swap, SS7, eSIM transfer).
+//! On a Pentagon-grade SSO, SMS MUST NOT be the deciding factor for
+//! anything except low-risk / low-assurance contexts. [`SmsPolicy::evaluate`]
+//! is the single chokepoint that any caller wishing to send an SMS-MFA
+//! message must pass first; it hard-rejects when the user has a hardware
+//! authenticator (FIDO2/WebAuthn or a smartcard) enrolled, or when the
+//! current risk tier is anything stronger than `Normal`.
 #![forbid(unsafe_code)]
 
 use async_trait::async_trait;
@@ -20,6 +30,67 @@ pub enum MfaError {
     RateLimited(u64),
     #[error("provider rejected: {0}")]
     Rejected(String),
+    /// SMS MFA is policy-blocked for this user / risk context.
+    #[error("SMS MFA policy-blocked: {0}")]
+    PolicyBlocked(&'static str),
+}
+
+/// Risk tier feeding the SMS policy gate. Mirrors `risk::RiskLevel` so
+/// downstream callers can convert without taking a dep on the risk crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RiskTierForSms {
+    Normal,
+    Elevated,
+    High,
+    Critical,
+}
+
+/// Per-user enrolment context fed into the SMS policy gate.
+#[derive(Debug, Clone, Copy)]
+pub struct SmsPolicyContext {
+    /// True if the user has at least one usable FIDO2/WebAuthn or smartcard
+    /// (CAC/PIV) credential. SMS is denied whenever a hardware factor is
+    /// available, because allowing the SMS fallback would silently downgrade
+    /// the user's effective AAL to the weakest enrolled factor.
+    pub has_hardware_factor: bool,
+    /// Current risk tier from the risk-scoring engine.
+    pub risk: RiskTierForSms,
+    /// Caller-determined assurance level requirement: if true, SMS is
+    /// rejected unconditionally.
+    pub require_high_assurance: bool,
+}
+
+/// Single chokepoint for the SMS-MFA policy decision. Always fail-closed —
+/// caller must present an `Allow` before sending an SMS.
+pub enum SmsPolicy {
+    /// SMS allowed for this context.
+    Allow,
+    /// SMS rejected; caller must present a hardware factor instead.
+    Deny(&'static str),
+}
+
+impl SmsPolicy {
+    /// Evaluate the policy against the supplied context.
+    pub fn evaluate(ctx: SmsPolicyContext) -> Self {
+        if ctx.require_high_assurance {
+            return SmsPolicy::Deny("SMS denied: high-assurance context — present hardware factor");
+        }
+        if ctx.has_hardware_factor {
+            return SmsPolicy::Deny("SMS denied: hardware factor enrolled — SMS would downgrade AAL");
+        }
+        match ctx.risk {
+            RiskTierForSms::Normal => SmsPolicy::Allow,
+            RiskTierForSms::Elevated
+            | RiskTierForSms::High
+            | RiskTierForSms::Critical => SmsPolicy::Deny(
+                "SMS denied: risk tier above Normal — present hardware factor",
+            ),
+        }
+    }
+
+    pub fn allowed(&self) -> bool {
+        matches!(self, SmsPolicy::Allow)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -57,6 +128,18 @@ impl TwilioSmsProvider {
                 .timeout(Duration::from_secs(10))
                 .build()
                 .unwrap_or_default(),
+        }
+    }
+
+    /// Send an SMS only if the policy gate authorises it.
+    pub async fn send_with_policy(
+        &self,
+        ctx: SmsPolicyContext,
+        msg: &MfaMessage,
+    ) -> Result<String, MfaError> {
+        match SmsPolicy::evaluate(ctx) {
+            SmsPolicy::Allow => self.send(msg).await,
+            SmsPolicy::Deny(reason) => Err(MfaError::PolicyBlocked(reason)),
         }
     }
 }

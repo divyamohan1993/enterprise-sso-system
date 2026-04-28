@@ -82,21 +82,94 @@ const CTX_RECEIPT_SIGN: &[u8] = b"MILNET-RECEIPT-SIGN-v1";
 /// FIPS 204 context string for raw/audit data signing (standalone PQ).
 const CTX_RAW_SIGN: &[u8] = b"MILNET-RAW-SIGN-v1";
 
+// Compile-time assert that both static contexts fit FIPS 204 §5.4 ctx limit (255 bytes).
+const _: () = assert!(CTX_RECEIPT_SIGN.len() <= 255);
+const _: () = assert!(CTX_RAW_SIGN.len() <= 255);
+
+/// FIPS 204 §5.4 limits the `ctx` parameter of `sign_deterministic` /
+/// `verify_with_context` to 255 bytes.
+pub const FIPS204_CTX_MAX: usize = 255;
+
+/// Build a ceremony-bound FIPS 204 context string of the form
+/// `<base> || 0x1F || ceremony_id || 0x1F || epoch_le8`.
+pub fn ceremony_bound_ctx(
+    base: &[u8],
+    ceremony_id: &[u8; 32],
+    epoch: u64,
+) -> Result<Vec<u8>, MilnetError> {
+    let total = base.len() + 1 + ceremony_id.len() + 1 + 8;
+    if total > FIPS204_CTX_MAX {
+        return Err(MilnetError::CryptoVerification(format!(
+            "ceremony-bound context exceeds FIPS 204 255-byte limit: {} bytes",
+            total
+        )));
+    }
+    let mut ctx = Vec::with_capacity(total);
+    ctx.extend_from_slice(base);
+    ctx.push(0x1F);
+    ctx.extend_from_slice(ceremony_id);
+    ctx.push(0x1F);
+    ctx.extend_from_slice(&epoch.to_le_bytes());
+    Ok(ctx)
+}
+
 /// Sign with ML-DSA-87: signs `(message || frost_signature)`.
 ///
-/// This nested construction ensures the PQ signature commits to both the
-/// application payload and the classical FROST signature, preventing
-/// stripping attacks.
-///
-/// Uses FIPS 204 context string `MILNET-RECEIPT-SIGN-v1` for domain separation.
+/// Uses FIPS 204 context string `MILNET-RECEIPT-SIGN-v1` for domain
+/// separation. The static const_assert above guarantees the context fits the
+/// FIPS 204 255-byte ctx limit, so the `expect()` here is unreachable.
 pub fn pq_sign(signing_key: &PqSigningKey, message: &[u8], frost_sig: &[u8; 64]) -> Vec<u8> {
     let mut data = Vec::with_capacity(message.len() + 64);
     data.extend_from_slice(message);
     data.extend_from_slice(frost_sig);
     let sig: PqSignature = signing_key
         .sign_deterministic(&data, CTX_RECEIPT_SIGN)
-        .expect("context string within 255-byte FIPS 204 limit");
+        .expect("CTX_RECEIPT_SIGN length is asserted at compile time to fit FIPS 204 ctx limit");
     sig.encode().to_vec()
+}
+
+/// Sign with ML-DSA-87 binding the ceremony-id + epoch into the FIPS 204
+/// context, defending against cross-ceremony signature replay.
+pub fn pq_sign_ceremony_bound(
+    signing_key: &PqSigningKey,
+    message: &[u8],
+    frost_sig: &[u8; 64],
+    ceremony_id: &[u8; 32],
+    epoch: u64,
+) -> Result<Vec<u8>, MilnetError> {
+    let ctx = ceremony_bound_ctx(CTX_RECEIPT_SIGN, ceremony_id, epoch)?;
+    let mut data = Vec::with_capacity(message.len() + 64);
+    data.extend_from_slice(message);
+    data.extend_from_slice(frost_sig);
+    let sig: PqSignature = signing_key
+        .sign_deterministic(&data, &ctx)
+        .map_err(|_| MilnetError::CryptoVerification(
+            "ML-DSA-87 ceremony-bound deterministic signing failed".to_string(),
+        ))?;
+    Ok(sig.encode().to_vec())
+}
+
+/// Verify a ceremony-bound ML-DSA-87 signature.
+pub fn pq_verify_ceremony_bound(
+    verifying_key: &PqVerifyingKey,
+    message: &[u8],
+    frost_sig: &[u8; 64],
+    ceremony_id: &[u8; 32],
+    epoch: u64,
+    pq_sig: &[u8],
+) -> bool {
+    let ctx = match ceremony_bound_ctx(CTX_RECEIPT_SIGN, ceremony_id, epoch) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let sig = match PqSignature::try_from(pq_sig) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let mut data = Vec::with_capacity(message.len() + 64);
+    data.extend_from_slice(message);
+    data.extend_from_slice(frost_sig);
+    verifying_key.verify_with_context(&data, &ctx, &sig)
 }
 
 /// Verify ML-DSA-87 signature over `(message || frost_signature)`.
@@ -128,8 +201,46 @@ pub fn pq_verify(
 pub fn pq_sign_raw(signing_key: &PqSigningKey, data: &[u8]) -> Vec<u8> {
     let sig: PqSignature = signing_key
         .sign_deterministic(data, CTX_RAW_SIGN)
-        .expect("context string within 255-byte FIPS 204 limit");
+        .expect("CTX_RAW_SIGN length is asserted at compile time to fit FIPS 204 ctx limit");
     sig.encode().to_vec()
+}
+
+/// Sign raw bytes with ML-DSA-87, binding the supplied 32-byte domain
+/// (e.g. ceremony-id, BFT-node-id, backup-id) into the FIPS 204 context.
+pub fn pq_sign_raw_domain(
+    signing_key: &PqSigningKey,
+    data: &[u8],
+    domain: &[u8; 32],
+) -> Result<Vec<u8>, MilnetError> {
+    let mut ctx = Vec::with_capacity(CTX_RAW_SIGN.len() + 1 + domain.len());
+    ctx.extend_from_slice(CTX_RAW_SIGN);
+    ctx.push(0x1F);
+    ctx.extend_from_slice(domain);
+    debug_assert!(ctx.len() <= FIPS204_CTX_MAX);
+    let sig: PqSignature = signing_key
+        .sign_deterministic(data, &ctx)
+        .map_err(|_| MilnetError::CryptoVerification(
+            "ML-DSA-87 domain-bound deterministic signing failed".to_string(),
+        ))?;
+    Ok(sig.encode().to_vec())
+}
+
+/// Verify a domain-bound raw ML-DSA-87 signature.
+pub fn pq_verify_raw_domain(
+    verifying_key: &PqVerifyingKey,
+    data: &[u8],
+    domain: &[u8; 32],
+    sig_bytes: &[u8],
+) -> bool {
+    let mut ctx = Vec::with_capacity(CTX_RAW_SIGN.len() + 1 + domain.len());
+    ctx.extend_from_slice(CTX_RAW_SIGN);
+    ctx.push(0x1F);
+    ctx.extend_from_slice(domain);
+    let sig = match PqSignature::try_from(sig_bytes) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    verifying_key.verify_with_context(data, &ctx, &sig)
 }
 
 /// Verify a raw ML-DSA-87 signature over `data`.
