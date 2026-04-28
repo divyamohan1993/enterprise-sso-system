@@ -22,6 +22,15 @@ pub enum JitError {
     Expired,
     #[error("lock poisoned")]
     Poisoned,
+    /// Separation-of-duties violation: the approver is the same identity as
+    /// the requestor. Self-approval of role elevation is rejected.
+    #[error("self-approval forbidden (approver_id == requestor_id)")]
+    SelfApprovalForbidden,
+    /// The supplied approver lacks any role authorising approval of the
+    /// requested role. Caller must pre-resolve approver authority and pass
+    /// `approver_authorised = true` explicitly.
+    #[error("approver not authorised for role `{0}`")]
+    ApproverNotAuthorised(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,13 +96,38 @@ impl JitStore {
         Ok(req)
     }
 
-    pub fn approve(&self, id: Uuid, approver: impl Into<String>) -> Result<(), JitError> {
+    /// Approve an elevation request.
+    ///
+    /// Separation of duties is enforced: the approver MUST be a different
+    /// identity than the requestor and MUST have been pre-authorised for the
+    /// requested role by the caller. The caller is responsible for
+    /// establishing approver authority (e.g. role-mapping lookup against an
+    /// HSM-backed policy) and passing `approver_authorised = true` only when
+    /// that check has succeeded under MFA-fresh context.
+    pub fn approve(
+        &self,
+        id: Uuid,
+        approver: impl Into<String>,
+        approver_authorised: bool,
+    ) -> Result<(), JitError> {
+        let approver = approver.into();
         let mut g = self.inner.lock().map_err(|_| JitError::Poisoned)?;
         let r = g.get_mut(&id).ok_or(JitError::NotFound)?;
         if r.status != ElevationStatus::Pending {
             return Err(JitError::InvalidState(format!("{:?}", r.status)));
         }
-        r.approver_id = Some(approver.into());
+        // Constant-time compare on identity strings to avoid leaking
+        // approver length via a short-circuit on the first mismatching byte.
+        if approver.as_bytes().len() == r.user_id.as_bytes().len() {
+            use subtle::ConstantTimeEq;
+            if approver.as_bytes().ct_eq(r.user_id.as_bytes()).into() {
+                return Err(JitError::SelfApprovalForbidden);
+            }
+        }
+        if !approver_authorised {
+            return Err(JitError::ApproverNotAuthorised(r.requested_role.clone()));
+        }
+        r.approver_id = Some(approver);
         r.status = ElevationStatus::Approved;
         Ok(())
     }

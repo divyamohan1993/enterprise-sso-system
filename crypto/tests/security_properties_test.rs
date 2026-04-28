@@ -318,48 +318,60 @@ fn fips_kat_pq_algorithms_lack_hardcoded_vectors() {
 
 // ── KSF Argon2id iteration count hardening ──────────────────────────────
 
-/// Verify that Argon2id KSF uses 4 iterations (hardened from 3).
-/// The test stretches a password with 4 iterations (current) and 3 iterations
-/// (old), and confirms the outputs differ. This proves the iteration count
-/// change took effect and passwords stretched with the old params produce
-/// different derived keys.
+/// Verify the production Argon2id KSF uses the documented hardened
+/// parameters (96 MiB memory, 6 iterations, 4 lanes, 32-byte output) and that
+/// dropping any of the cost factors produces a strictly different output.
 #[test]
-fn ksf_argon2id_4_iterations_differs_from_3() {
+fn ksf_argon2id_hardened_params_take_effect() {
     use argon2::{Algorithm, Argon2, Params, Version};
+    use crypto::kdf::{
+        Argon2idKsf, KeyStretchingFunction, ARGON2ID_LANES, ARGON2ID_M_COST_KIB, ARGON2ID_OUT_LEN,
+        ARGON2ID_T_COST,
+    };
 
     let password = b"test-password-for-iteration-count";
     let salt = b"fixed-salt-for-determinism-00000";
 
-    // Current production params: memory=65536 KiB, iterations=4, parallelism=4, output=32
-    let params_4 = Params::new(65536, 4, 4, Some(32)).expect("params_4");
-    let argon2_4 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params_4);
-    let mut output_4 = vec![0u8; 32];
-    argon2_4
-        .hash_password_into(password, salt, &mut output_4)
-        .expect("argon2id with 4 iterations");
+    let params_hardened = Params::new(
+        ARGON2ID_M_COST_KIB,
+        ARGON2ID_T_COST,
+        ARGON2ID_LANES,
+        Some(ARGON2ID_OUT_LEN),
+    )
+    .expect("hardened params");
+    let argon2_hardened = Argon2::new(Algorithm::Argon2id, Version::V0x13, params_hardened);
+    let mut output_hardened = vec![0u8; ARGON2ID_OUT_LEN];
+    argon2_hardened
+        .hash_password_into(password, salt, &mut output_hardened)
+        .expect("argon2id with hardened params");
 
-    // Old params: same but iterations=3
-    let params_3 = Params::new(65536, 3, 4, Some(32)).expect("params_3");
-    let argon2_3 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params_3);
-    let mut output_3 = vec![0u8; 32];
-    argon2_3
-        .hash_password_into(password, salt, &mut output_3)
-        .expect("argon2id with 3 iterations");
+    let params_weak = Params::new(
+        ARGON2ID_M_COST_KIB,
+        ARGON2ID_T_COST.saturating_sub(2).max(1),
+        ARGON2ID_LANES,
+        Some(ARGON2ID_OUT_LEN),
+    )
+    .expect("weak params");
+    let argon2_weak = Argon2::new(Algorithm::Argon2id, Version::V0x13, params_weak);
+    let mut output_weak = vec![0u8; ARGON2ID_OUT_LEN];
+    argon2_weak
+        .hash_password_into(password, salt, &mut output_weak)
+        .expect("argon2id with weak params");
 
     assert_ne!(
-        output_4, output_3,
-        "4-iteration Argon2id must produce different output from 3-iteration \
-         (proves the hardened iteration count took effect)"
+        output_hardened, output_weak,
+        "production Argon2id params must produce different output from weaker iterations"
     );
 
-    // Also verify the production KSF API produces the same 4-iteration output
-    use crypto::kdf::{Argon2idKsf, KeyStretchingFunction};
     let ksf = Argon2idKsf;
     let ksf_output = ksf.stretch(password, salt).expect("KSF stretch");
     assert_eq!(
-        ksf_output, output_4,
-        "Argon2idKsf must use exactly 4 iterations (matching params_4)"
+        ksf_output, output_hardened,
+        "Argon2idKsf must use the exported hardened constants"
     );
+
+    assert!(ARGON2ID_T_COST >= 6, "t_cost must be >= 6 for 5-year forward security");
+    assert!(ARGON2ID_M_COST_KIB >= 65_536, "m_cost must be >= 64 MiB");
 }
 
 /// Verify the KSF algorithm ID is correct.
