@@ -18,12 +18,23 @@ impl ChallengeDispatch for CapturingDispatch {
     }
 }
 
+fn rand_challenge_id() -> [u8; 32] {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(1);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let mut id = [0u8; 32];
+    id[..8].copy_from_slice(&n.to_be_bytes());
+    id[8..16].copy_from_slice(&0xa5a5a5a5_a5a5a5a5u64.to_be_bytes());
+    id
+}
+
 fn fresh_proof(user: &str) -> StepUpProof {
     StepUpProof {
         user: user.into(),
         user_verified: true,
         asserted_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64,
+        challenge_id: rand_challenge_id(),
     }
 }
 
@@ -60,6 +71,7 @@ fn initiate_without_uv_step_up_rejected() {
         user_verified: false,
         asserted_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64,
+        challenge_id: rand_challenge_id(),
     };
     let err = s.initiate_link(&proof, Provider::Cac, "edipi-9", "alice@mil", &d).unwrap_err();
     assert!(matches!(err, LinkError::StepUpRequired));
@@ -74,8 +86,50 @@ fn stale_step_up_rejected() {
         user: "alice".into(),
         user_verified: true,
         asserted_at: 0, // ancient
+        challenge_id: rand_challenge_id(),
     };
     let err = s.initiate_link(&stale, Provider::Cac, "edipi-9", "alice@mil", &d).unwrap_err();
+    assert!(matches!(err, LinkError::StepUpRequired));
+}
+
+#[test]
+fn step_up_proof_is_one_shot() {
+    let s = LinkStore::new(b"k".to_vec());
+    let d = CapturingDispatch::new();
+    let cid = rand_challenge_id();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    let proof_a = StepUpProof {
+        user: "alice".into(),
+        user_verified: true,
+        asserted_at: now,
+        challenge_id: cid,
+    };
+    s.initiate_link(&proof_a, Provider::Google, "g-1", "a@e.x", &d).unwrap();
+    let proof_b = StepUpProof {
+        user: "alice".into(),
+        user_verified: true,
+        asserted_at: now,
+        challenge_id: cid, // same!
+    };
+    let err = s
+        .initiate_link(&proof_b, Provider::Google, "g-2", "a@e.x", &d)
+        .unwrap_err();
+    assert!(matches!(err, LinkError::StepUpRequired));
+}
+
+#[test]
+fn step_up_proof_with_zero_challenge_rejected() {
+    let s = LinkStore::new(b"k".to_vec());
+    let d = CapturingDispatch::new();
+    let proof = StepUpProof {
+        user: "alice".into(),
+        user_verified: true,
+        asserted_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64,
+        challenge_id: [0u8; 32],
+    };
+    let err = s.initiate_link(&proof, Provider::Google, "g-1", "a@e.x", &d).unwrap_err();
     assert!(matches!(err, LinkError::StepUpRequired));
 }
 
