@@ -9,6 +9,11 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// Callback invoked by the detached duress dispatcher when a duress PIN
+/// match is observed. Wrapped in `Arc` so the verify path can clone it
+/// without holding the duress-config lock.
+pub type DuressResponseCallback = Arc<dyn Fn(&DuressAlert) + Send + Sync>;
+
 /// Version tag prepended to HKDF-based hashes to distinguish from legacy SHA-256.
 const HKDF_V2_TAG: u8 = 0x02;
 
@@ -33,10 +38,8 @@ pub struct DuressConfig {
     pub salt: [u8; 32],
     /// Optional callback invoked when duress is detected. Enables automated
     /// incident response (session revocation, account lockdown, SOC paging).
-    /// Wrapped in `Arc` so the dispatch path can clone the handle without
-    /// taking the duress-config lock.
     #[serde(skip)]
-    pub duress_response_callback: Option<Arc<dyn Fn(&DuressAlert) + Send + Sync>>,
+    pub duress_response_callback: Option<DuressResponseCallback>,
 }
 
 impl std::fmt::Debug for DuressConfig {
@@ -123,11 +126,11 @@ fn hash_pin_v1(pin: &[u8]) -> Vec<u8> {
 fn verify_pin_hash(pin: &[u8], stored: &[u8], salt: &[u8; 32]) -> bool {
     use subtle::ConstantTimeEq;
 
-    if stored.is_empty() {
+    let Some(&tag) = stored.first() else {
         return false;
-    }
+    };
 
-    match stored[0] {
+    match tag {
         HKDF_V2_TAG => {
             let candidate = hash_pin_v2(pin, salt);
             candidate.ct_eq(stored).into()
@@ -225,14 +228,19 @@ impl DuressConfig {
             lockdown_triggered: true,
         };
 
-        // Single, branch-symmetric channel-send. The dispatcher decides
-        // whether to fan out to SIEM and the user callback.
+        // Single, branch-symmetric channel-send on the common (non-saturated)
+        // path. On saturation the dispatch unit is returned and we
+        // synchronously fall back, but ONLY for `is_duress=true` events —
+        // non-duress saturation is a no-op (no security signal lost).
         let cb = self.duress_response_callback.as_ref().map(Arc::clone);
-        enqueue_duress_alert(DuressDispatch {
+        let dispatch = DuressDispatch {
             alert: alert.clone(),
             is_duress,
             callback: cb,
-        });
+        };
+        if let Err(returned) = enqueue_duress_alert(dispatch) {
+            emit_duress_inline(&returned);
+        }
 
         if is_normal {
             PinVerification::Normal
@@ -258,7 +266,7 @@ pub struct DuressAlert {
 pub struct DuressDispatch {
     pub alert: DuressAlert,
     pub is_duress: bool,
-    pub callback: Option<Arc<dyn Fn(&DuressAlert) + Send + Sync>>,
+    pub callback: Option<DuressResponseCallback>,
 }
 
 impl std::fmt::Debug for DuressDispatch {
@@ -277,7 +285,7 @@ static DURESS_TX: std::sync::OnceLock<std::sync::mpsc::SyncSender<DuressDispatch
 fn duress_dispatcher_tx() -> &'static std::sync::mpsc::SyncSender<DuressDispatch> {
     DURESS_TX.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::sync_channel::<DuressDispatch>(1024);
-        std::thread::Builder::new()
+        if let Err(e) = std::thread::Builder::new()
             .name("milnet-duress-dispatch".into())
             .spawn(move || {
                 while let Ok(d) = rx.recv() {
@@ -291,16 +299,60 @@ fn duress_dispatcher_tx() -> &'static std::sync::mpsc::SyncSender<DuressDispatch
                     }
                 }
             })
-            .expect("spawn milnet-duress-dispatch thread");
+        {
+            // Spawn failure is logged loudly but not fatal: with no
+            // dispatcher thread the channel will fill and `try_send` will
+            // start dropping alerts, surfacing as SIEM:CRITICAL events on
+            // every subsequent duress observation. We deliberately do not
+            // panic here so a transient resource exhaustion at startup
+            // doesn't crash the whole gateway.
+            tracing::error!(
+                target: "siem",
+                "SIEM:CRITICAL failed to spawn milnet-duress-dispatch thread: {e}"
+            );
+        }
         tx
     })
 }
 
-/// Enqueue a duress dispatch unit on the detached MPSC channel. Bounded,
-/// non-blocking, branch-symmetric.
-pub fn enqueue_duress_alert(d: DuressDispatch) {
+/// Enqueue a duress dispatch unit on the detached MPSC channel.
+///
+/// Bounded, non-blocking on the common path. Returns `Err(d)` on
+/// saturation so the caller can synchronously fall back rather than
+/// silently dropping a real duress observation. Non-duress drops can
+/// be discarded freely (they carry no security-relevant signal); the
+/// guarantee is that an `is_duress=true` dispatch always reaches SIEM
+/// + callback either through the dispatcher thread or through the
+/// caller's fallback path.
+pub fn enqueue_duress_alert(
+    d: DuressDispatch,
+) -> Result<(), DuressDispatch> {
     let tx = duress_dispatcher_tx();
-    if tx.try_send(d).is_err() {
-        tracing::error!("SIEM:CRITICAL duress dispatcher saturated — alert dropped on the floor");
+    match tx.try_send(d) {
+        Ok(()) => Ok(()),
+        Err(std::sync::mpsc::TrySendError::Full(d))
+        | Err(std::sync::mpsc::TrySendError::Disconnected(d)) => {
+            tracing::error!(
+                target: "siem",
+                "SIEM:CRITICAL duress dispatcher saturated — alert returned to caller for inline fallback"
+            );
+            Err(d)
+        }
+    }
+}
+
+/// Inline-emit a duress alert. Called by `verify_pin` when the bounded
+/// dispatcher queue refused the enqueue, so a real duress observation
+/// is never silently lost. The verify-side timing penalty is acceptable
+/// here because saturation is the operational rare-path.
+fn emit_duress_inline(d: &DuressDispatch) {
+    if !d.is_duress {
+        return;
+    }
+    crate::siem::SecurityEvent::duress_detected(d.alert.user_id);
+    if let Some(cb) = d.callback.as_ref() {
+        let _ = std::panic::catch_unwind(
+            std::panic::AssertUnwindSafe(|| cb(&d.alert)),
+        );
     }
 }

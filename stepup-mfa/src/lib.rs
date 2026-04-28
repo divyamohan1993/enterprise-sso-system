@@ -102,7 +102,8 @@ fn sensitivity_byte(s: Sensitivity) -> u8 {
     }
 }
 
-fn compute_binding_tag(session_id: &[u8; 32], asserted_at: i64, s: Sensitivity) -> [u8; 64] {
+#[doc(hidden)]
+pub fn compute_binding_tag(session_id: &[u8; 32], asserted_at: i64, s: Sensitivity) -> [u8; 64] {
     let mut h = Sha512::new();
     h.update(MFA_ASSERTED_DOMAIN);
     h.update(session_id);
@@ -139,8 +140,17 @@ pub fn new_mfa_asserted_claim(session_id: [u8; 32], s: Sensitivity) -> MfaAssert
     }
 }
 
+/// Tolerated forward clock skew between the asserter and verifier. Tight
+/// because both are controlled by the same fleet — anything more than
+/// this points at clock tampering or a forged claim.
+pub const MFA_ASSERTED_FORWARD_SKEW_SECS: i64 = 5;
+
 /// Verify an `mfa_asserted` claim against the session id and required
-/// sensitivity. Constant-time and TTL-bounded.
+/// sensitivity. Constant-time, TTL-bounded, and rejects claims that
+/// purport to have been asserted in the future (beyond a small forward
+/// skew window) — a future-dated `asserted_at` would otherwise sit
+/// inside the verifier's `now - asserted_at <= TTL` window indefinitely
+/// and bypass the freshness guarantee.
 pub fn verify_mfa_asserted_claim(
     claim: &MfaAssertedClaim,
     expected_session_id: &[u8; 32],
@@ -150,7 +160,9 @@ pub fn verify_mfa_asserted_claim(
         return false;
     }
     let now = now_secs();
-    if now - claim.asserted_at > MFA_ASSERTED_TTL_SECS {
+    let age = now - claim.asserted_at;
+    // Reject expired (age > TTL) AND future-dated (age < -skew) claims.
+    if age > MFA_ASSERTED_TTL_SECS || age < -MFA_ASSERTED_FORWARD_SKEW_SECS {
         return false;
     }
     if claim.session_id.ct_eq(expected_session_id).unwrap_u8() != 1 {
@@ -231,4 +243,5 @@ mod stepup_rebinding_tests {
         };
         assert!(!verify_mfa_asserted_claim(&claim, &sid, Sensitivity::Critical));
     }
+
 }
