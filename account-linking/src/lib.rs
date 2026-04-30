@@ -76,21 +76,31 @@ pub struct IdentityLink {
 
 /// Caller-supplied proof that a fresh user-verifying FIDO assertion was
 /// completed for this session. The store does not validate the FIDO blob
-/// itself — that is the gateway's job — but it requires `uv == true` and
-/// a recent timestamp before allowing `initiate_link` to proceed.
+/// itself — that is the gateway's job — but it requires `uv == true`, a
+/// recent timestamp, AND a unique 32-byte `challenge_id` that the gateway
+/// must have produced specifically for this `initiate_link` call. The
+/// store rejects re-use of a challenge_id, so the same proof cannot
+/// authorise multiple link operations within the 120-second window.
 #[derive(Debug, Clone)]
 pub struct StepUpProof {
     pub user: String,
     pub user_verified: bool,
     pub asserted_at: i64,
+    /// 32-byte per-operation challenge id. The gateway derives this from
+    /// the FIDO challenge it sent the authenticator, so a given proof is
+    /// usable once and only once.
+    pub challenge_id: [u8; 32],
 }
 
 impl StepUpProof {
     /// Step-up is valid for a short window after the FIDO assertion.
-    const MAX_AGE_SECS: i64 = 120;
+    pub const MAX_AGE_SECS: i64 = 120;
 
     pub fn is_fresh(&self, now: i64) -> bool {
-        self.user_verified && (now - self.asserted_at).abs() <= Self::MAX_AGE_SECS
+        self.user_verified
+            && (now - self.asserted_at).abs() <= Self::MAX_AGE_SECS
+            // A proof with an all-zero challenge id is never accepted.
+            && self.challenge_id != [0u8; 32]
     }
 }
 
@@ -165,6 +175,9 @@ struct Inner {
     links: HashMap<(Provider, String), IdentityLink>,
     pending: HashMap<(String, [u8; 32]), PendingLink>,
     rate: HashMap<String, VecDeque<i64>>,
+    /// Set of step-up `challenge_id`s already consumed, with the unix-ts
+    /// at which they were consumed.
+    consumed_challenges: HashMap<[u8; 32], i64>,
 }
 
 pub struct LinkStore {
@@ -188,6 +201,7 @@ impl LinkStore {
                 links: HashMap::new(),
                 pending: HashMap::new(),
                 rate: HashMap::new(),
+                consumed_challenges: HashMap::new(),
             }),
         }
     }
@@ -210,6 +224,16 @@ impl LinkStore {
         let user = proof.user.clone();
 
         let mut g = self.inner.lock().map_err(|_| LinkError::Poisoned)?;
+
+        // Reject re-use of a step-up proof. A FIDO assertion authorises one
+        // link operation, period.
+        let challenge_id = proof.challenge_id;
+        g.consumed_challenges
+            .retain(|_, ts| now - *ts <= StepUpProof::MAX_AGE_SECS * 2);
+        if g.consumed_challenges.contains_key(&challenge_id) {
+            return Err(LinkError::StepUpRequired);
+        }
+        g.consumed_challenges.insert(challenge_id, now);
 
         // Reject if already linked to a different user.
         if let Some(existing) = g.links.get(&(provider, subject.to_string())) {

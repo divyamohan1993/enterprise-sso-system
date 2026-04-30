@@ -122,6 +122,66 @@ impl AsRef<[u8]> for SharedSecret {
 /// Length of the HKDF-derived session key in bytes (64 bytes = 512 bits).
 pub const SESSION_KEY_LEN: usize = 64;
 
+/// Curve25519 small-order public-key blacklist.
+///
+/// Every entry is a u-coordinate that yields a low-order point after the
+/// Curve25519 clamping step. Sending one of these as the peer's public key
+/// forces the resulting Diffie-Hellman shared secret into a small-subgroup
+/// output (zero or a fixed structured value), enabling key-compromise
+/// impersonation without observing the actual secret.
+const X25519_SMALL_ORDER_BLACKLIST: [[u8; 32]; 7] = [
+    // 0 (identity).
+    [0; 32],
+    // 1.
+    [
+        1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0,
+    ],
+    // 325606250916557431795983626356110631294008115727848805560023387167927233504
+    [
+        0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f, 0xc4,
+        0x6a, 0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16, 0x5f, 0x49,
+        0xb8, 0x00,
+    ],
+    // 39382357235489614581723060781553021112529911719440698176882885853963445705823
+    [
+        0x5f, 0x9c, 0x95, 0xbc, 0xa3, 0x50, 0x8c, 0x24, 0xb1, 0xd0, 0xb1, 0x55, 0x9c, 0x83, 0xef,
+        0x5b, 0x04, 0x44, 0x5c, 0xc4, 0x58, 0x1c, 0x8e, 0x86, 0xd8, 0x22, 0x4e, 0xdd, 0xd0, 0x9f,
+        0x11, 0x57,
+    ],
+    // p-1 (mod p)
+    [
+        0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0x7f,
+    ],
+    // p
+    [
+        0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0x7f,
+    ],
+    // p+1
+    [
+        0xee, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0x7f,
+    ],
+];
+
+/// Constant-time check: does `pk` match a known small-order Curve25519
+/// public key? Compares against every blacklist entry without short-
+/// circuiting so that a malicious peer cannot infer which entry matched
+/// from response timing.
+pub fn is_x25519_small_order(pk: &[u8; 32]) -> bool {
+    use subtle::{Choice, ConstantTimeEq};
+    let mut hit = Choice::from(0u8);
+    for entry in X25519_SMALL_ORDER_BLACKLIST.iter() {
+        hit |= pk.ct_eq(entry);
+    }
+    hit.unwrap_u8() == 1
+}
+
 /// Derive a session encryption key from the X-Wing shared secret using
 /// HKDF-SHA512.  The `context` parameter should uniquely bind the derivation
 /// to the current session (e.g. concatenation of nonces from both sides).
@@ -412,12 +472,19 @@ pub fn xwing_decapsulate(
 ) -> Result<SharedSecret, XWingError> {
     let client_public = PublicKey::from(ciphertext.x25519_pk_client);
 
+    // CAT-I: explicit low-order point rejection on the *peer* public key,
+    // BEFORE running the DH. The post-DH all-zero check stays as a
+    // belt-and-suspenders second line, but several non-identity small-order
+    // points produce structured-but-non-zero shared secrets that the
+    // post-DH check alone would let through.
+    if is_x25519_small_order(&ciphertext.x25519_pk_client) {
+        return Err(XWingError::X25519LowOrderPoint);
+    }
+
     // X25519 DH with the client's ephemeral public key.
     let x25519_ss = server_kp.x25519_secret.diffie_hellman(&client_public);
 
-    // Reject low-order points: if the DH output is all zeros, the client
-    // sent a small-subgroup or identity point. This prevents key-compromise
-    // impersonation attacks via low-order X25519 public keys.
+    // Belt-and-suspenders: also reject the all-zero post-DH output.
     if x25519_ss.as_bytes().iter().all(|&b| b == 0) {
         return Err(XWingError::X25519LowOrderPoint);
     }

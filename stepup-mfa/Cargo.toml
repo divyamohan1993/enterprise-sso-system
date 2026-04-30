@@ -8,6 +8,8 @@ license.workspace = true
 common = { path = "../common" }
 serde.workspace = true
 serde_json = "1"
+sha2.workspace = true
+subtle.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 regex = "1"

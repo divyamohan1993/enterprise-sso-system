@@ -5,12 +5,14 @@
 //! audit-witness — D1 fix for co-located witness signing key.
 //!
 //! Listens on a Unix domain socket at `/run/milnet/audit-witness.sock` and
-//! signs checkpoint hashes submitted by the audit service. The witness signing
-//! key is loaded via `common::secret_loader` under the name `audit-witness-key`
-//! and never leaves this process. SO_PEERCRED is used on both sides to verify
-//! that the connecting client runs under the expected uid, and at startup the
-//! witness asserts `audit_pid != witness_pid` so a single compromised process
-//! cannot hold both signing keys.
+//! signs checkpoint hashes submitted by the audit service. The witness
+//! signing seed is read from an inherited file descriptor passed via
+//! `MILNET_WITNESS_SEED_FD`, sourced from an independent second factor —
+//! HSM, Cloud KMS, or systemd `LoadCredential` — and never derived from the
+//! cluster master KEK. SO_PEERCRED is used on both sides to verify that the
+//! connecting client runs under the expected uid, and at startup the witness
+//! asserts `audit_pid != witness_pid` so a single compromised process cannot
+//! hold both signing keys.
 //!
 //! ## Wire protocol (line-oriented over UDS)
 //!
@@ -34,14 +36,11 @@ use zeroize::Zeroize;
 /// Default socket path. Override via `MILNET_AUDIT_WITNESS_SOCK`.
 const DEFAULT_SOCK: &str = "/run/milnet/audit-witness.sock";
 
-/// Legacy master-KEK-derived seed. Only used when the fd-based
-/// independent path is explicitly disabled via
-/// `MILNET_WITNESS_ALLOW_KEK_DERIVED=1` (non-production only).
-const WITNESS_KEY_NAME: &str = "audit-witness-key";
-
 /// Env var carrying an inherited fd whose contents are a witness seed
 /// derived from a source INDEPENDENT of the master KEK (HSM / KMS /
-/// systemd LoadCredential). Production MUST set this.
+/// systemd LoadCredential). Production MUST set this. There is no longer
+/// a master-KEK-derived fallback path: a witness whose seed is recoverable
+/// from the master KEK is operationally equivalent to no witness at all.
 const WITNESS_SEED_FD_ENV: &str = "MILNET_WITNESS_SEED_FD";
 
 /// Env var that tells the witness which uid the audit service runs as.
@@ -154,62 +153,45 @@ fn main() {
 }
 
 fn load_signing_key() -> crypto::pq_sign::PqSigningKey {
-    // Preferred: a fd inherited from an independent second source.
-    // A compromise of master-KEK sealed storage does NOT yield this key.
-    if let Ok(fd_str) = std::env::var(WITNESS_SEED_FD_ENV) {
-        let fd: i32 = match fd_str.parse() {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::error!(
-                    "FATAL: {} is set but unparsable ({}). Refusing to start.",
-                    WITNESS_SEED_FD_ENV, e
-                );
-                std::process::exit(3);
-            }
-        };
-        return load_signing_key_from_fd(fd);
-    }
-
-    let allow_kek = std::env::var("MILNET_WITNESS_ALLOW_KEK_DERIVED").as_deref() == Ok("1");
-    if !allow_kek {
+    // The ONLY supported path is a fd inherited from an independent second
+    // source (HSM, Cloud KMS, or systemd LoadCredential). A compromise of
+    // master-KEK sealed storage MUST NOT yield this key. The previous
+    // master-KEK-derived fallback (gated by MILNET_WITNESS_ALLOW_KEK_DERIVED)
+    // has been removed: a witness whose seed is recoverable from the same
+    // KEK that protects the rest of the cluster contributes zero independent
+    // assurance to the audit chain.
+    if std::env::var("MILNET_WITNESS_ALLOW_KEK_DERIVED").is_ok() {
         tracing::error!(
-            "FATAL: {} is not set. The witness signing seed must be supplied \
-             via a file descriptor derived from a source independent of the \
-             master KEK. Refusing to start.",
+            "FATAL: MILNET_WITNESS_ALLOW_KEK_DERIVED is set but the master-KEK-derived \
+             witness path has been REMOVED. The witness must be seeded from a source \
+             independent of the master KEK via {}.",
             WITNESS_SEED_FD_ENV
         );
-        std::process::exit(4);
+        std::process::exit(7);
     }
-
-    tracing::warn!(
-        "MILNET_WITNESS_ALLOW_KEK_DERIVED=1 — DEGRADED security posture; \
-         falling back to master-KEK-derived secret_loader path"
-    );
-
-    use common::secret_loader;
-    let secret = match secret_loader::load_secret(WITNESS_KEY_NAME) {
-        Ok(s) => s,
-        Err(e) => {
+    let fd_str = match std::env::var(WITNESS_SEED_FD_ENV) {
+        Ok(v) => v,
+        Err(_) => {
             tracing::error!(
-                "FATAL: failed to load secret '{}': {}. The witness signing seed must \
-                 be provisioned via /run/milnet/secrets.sock or systemd LoadCredential.",
-                WITNESS_KEY_NAME, e
+                "FATAL: {} is not set. The witness signing seed must be supplied via a \
+                 file descriptor derived from a source independent of the master KEK \
+                 (HSM / Cloud KMS / systemd LoadCredential). Refusing to start.",
+                WITNESS_SEED_FD_ENV
             );
-            std::process::exit(1);
+            std::process::exit(4);
         }
     };
-    if secret.len() < 32 {
-        tracing::error!(
-            "FATAL: '{}' returned {} bytes, need at least 32",
-            WITNESS_KEY_NAME, secret.len()
-        );
-        std::process::exit(1);
-    }
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(&secret[..32]);
-    let kp = MlDsa87::from_seed(&seed.into());
-    seed.zeroize();
-    kp.signing_key().clone()
+    let fd: i32 = match fd_str.parse() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!(
+                "FATAL: {} is set but unparsable ({}). Refusing to start.",
+                WITNESS_SEED_FD_ENV, e
+            );
+            std::process::exit(3);
+        }
+    };
+    load_signing_key_from_fd(fd)
 }
 
 /// Read a 32-byte seed from an inherited fd and derive the witness

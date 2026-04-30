@@ -42,8 +42,12 @@ impl CipherSuite for OpaqueCsFips {
 #[derive(Default)]
 pub struct Pbkdf2Sha512;
 
-/// PBKDF2-SHA512 iteration count (OWASP 2023 recommendation for SHA-512).
-const PBKDF2_ITERATIONS: u32 = 210_000;
+/// PBKDF2-SHA512 iteration count.
+///
+/// Set to 600 000, well above OWASP/NIST SP 800-132 contemporary baseline
+/// for SHA-512, so the construction remains defensible for at least 5 years
+/// against commodity GPU/ASIC speed-ups. Mirrors `crypto::kdf::PBKDF2_SHA512_ITERATIONS`.
+const PBKDF2_ITERATIONS: u32 = 600_000;
 
 impl opaque_ke::ksf::Ksf for Pbkdf2Sha512 {
     fn hash<L: ArrayLength<u8>>(
@@ -450,7 +454,10 @@ mod tests {
 
     #[test]
     fn pbkdf2_iterations_is_owasp_minimum() {
-        assert_eq!(PBKDF2_ITERATIONS, 210_000, "must meet OWASP 2023 minimum for SHA-512");
+        assert!(
+            PBKDF2_ITERATIONS >= 600_000,
+            "must meet contemporary OWASP/NIST baseline (>=600k) for SHA-512"
+        );
     }
 
     // ── FIPS mode KSF selection ───────────────────────────────────────

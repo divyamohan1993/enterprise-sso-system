@@ -6,7 +6,13 @@
 //! New installations use HKDF-SHA512 (v2).
 
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use uuid::Uuid;
+
+/// Callback invoked by the detached duress dispatcher when a duress PIN
+/// match is observed. Wrapped in `Arc` so the verify path can clone it
+/// without holding the duress-config lock.
+pub type DuressResponseCallback = Arc<dyn Fn(&DuressAlert) + Send + Sync>;
 
 /// Version tag prepended to HKDF-based hashes to distinguish from legacy SHA-256.
 const HKDF_V2_TAG: u8 = 0x02;
@@ -33,7 +39,7 @@ pub struct DuressConfig {
     /// Optional callback invoked when duress is detected. Enables automated
     /// incident response (session revocation, account lockdown, SOC paging).
     #[serde(skip)]
-    pub duress_response_callback: Option<Box<dyn Fn(&DuressAlert) + Send + Sync>>,
+    pub duress_response_callback: Option<DuressResponseCallback>,
 }
 
 impl std::fmt::Debug for DuressConfig {
@@ -120,11 +126,11 @@ fn hash_pin_v1(pin: &[u8]) -> Vec<u8> {
 fn verify_pin_hash(pin: &[u8], stored: &[u8], salt: &[u8; 32]) -> bool {
     use subtle::ConstantTimeEq;
 
-    if stored.is_empty() {
+    let Some(&tag) = stored.first() else {
         return false;
-    }
+    };
 
-    match stored[0] {
+    match tag {
         HKDF_V2_TAG => {
             let candidate = hash_pin_v2(pin, salt);
             candidate.ct_eq(stored).into()
@@ -200,18 +206,16 @@ impl DuressConfig {
     }
 
     /// Verify a PIN against both normal and duress hashes.
-    /// Supports legacy SHA-256 (v1), SHA-512 (v1b), and HKDF-SHA512 (v2) formats
-    /// for backward compatibility.
     ///
-    /// When duress is detected, a CRITICAL SIEM event is emitted automatically
-    /// and the `duress_response_callback` (if configured) is invoked.
+    /// SIEM event and configured response callback are dispatched on a
+    /// *detached* path: the synchronous return value carries no observable
+    /// side effect that varies between Normal, Duress, and Invalid
+    /// branches, so a remote attacker cannot distinguish branches by
+    /// response timing.
     pub fn verify_pin(&self, pin: &[u8]) -> PinVerification {
         let is_normal = verify_pin_hash(pin, &self.normal_pin_hash, &self.salt);
         let is_duress = verify_pin_hash(pin, &self.duress_pin_hash, &self.salt);
 
-        // Always construct the timestamp and alert to eliminate timing
-        // differences between Normal, Duress, and Invalid branches.
-        // This prevents side-channel leakage of which PIN type matched.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -224,28 +228,25 @@ impl DuressConfig {
             lockdown_triggered: true,
         };
 
-        // Always evaluate whether a callback exists (constant-time branch structure).
-        // The dummy_invoked variable ensures the compiler does not optimize away
-        // the callback existence check in the non-duress path.
-        let has_callback = self.duress_response_callback.is_some();
+        // Single, branch-symmetric channel-send on the common (non-saturated)
+        // path. On saturation the dispatch unit is returned and we
+        // synchronously fall back, but ONLY for `is_duress=true` events —
+        // non-duress saturation is a no-op (no security signal lost).
+        let cb = self.duress_response_callback.as_ref().map(Arc::clone);
+        let dispatch = DuressDispatch {
+            alert: alert.clone(),
+            is_duress,
+            callback: cb,
+        };
+        if let Err(returned) = enqueue_duress_alert(dispatch) {
+            emit_duress_inline(&returned);
+        }
 
         if is_normal {
-            // Dummy: read has_callback to match duress branch timing
-            let _ = std::hint::black_box(has_callback);
-            let _ = std::hint::black_box(&alert);
             PinVerification::Normal
         } else if is_duress {
-            crate::siem::SecurityEvent::duress_detected(self.user_id);
-
-            if let Some(ref callback) = self.duress_response_callback {
-                callback(&alert);
-            }
-
             PinVerification::Duress
         } else {
-            // Dummy: read has_callback to match duress branch timing
-            let _ = std::hint::black_box(has_callback);
-            let _ = std::hint::black_box(&alert);
             PinVerification::Invalid
         }
     }
@@ -259,4 +260,99 @@ pub struct DuressAlert {
     pub timestamp: i64,
     pub fake_token_issued: bool,
     pub lockdown_triggered: bool,
+}
+
+/// One unit of work for the detached duress dispatcher.
+pub struct DuressDispatch {
+    pub alert: DuressAlert,
+    pub is_duress: bool,
+    pub callback: Option<DuressResponseCallback>,
+}
+
+impl std::fmt::Debug for DuressDispatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DuressDispatch")
+            .field("alert", &self.alert)
+            .field("is_duress", &self.is_duress)
+            .field("has_callback", &self.callback.is_some())
+            .finish()
+    }
+}
+
+static DURESS_TX: std::sync::OnceLock<std::sync::mpsc::SyncSender<DuressDispatch>> =
+    std::sync::OnceLock::new();
+
+fn duress_dispatcher_tx() -> &'static std::sync::mpsc::SyncSender<DuressDispatch> {
+    DURESS_TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<DuressDispatch>(1024);
+        if let Err(e) = std::thread::Builder::new()
+            .name("milnet-duress-dispatch".into())
+            .spawn(move || {
+                while let Ok(d) = rx.recv() {
+                    if d.is_duress {
+                        crate::siem::SecurityEvent::duress_detected(d.alert.user_id);
+                        if let Some(cb) = &d.callback {
+                            let _ = std::panic::catch_unwind(
+                                std::panic::AssertUnwindSafe(|| cb(&d.alert)),
+                            );
+                        }
+                    }
+                }
+            })
+        {
+            // Spawn failure is logged loudly but not fatal: with no
+            // dispatcher thread the channel will fill and `try_send` will
+            // start dropping alerts, surfacing as SIEM:CRITICAL events on
+            // every subsequent duress observation. We deliberately do not
+            // panic here so a transient resource exhaustion at startup
+            // doesn't crash the whole gateway.
+            tracing::error!(
+                target: "siem",
+                "SIEM:CRITICAL failed to spawn milnet-duress-dispatch thread: {e}"
+            );
+        }
+        tx
+    })
+}
+
+/// Enqueue a duress dispatch unit on the detached MPSC channel.
+///
+/// Bounded, non-blocking on the common path. Returns `Err(d)` on
+/// saturation so the caller can synchronously fall back rather than
+/// silently dropping a real duress observation. Non-duress drops can
+/// be discarded freely (they carry no security-relevant signal); the
+/// guarantee is that an `is_duress=true` dispatch always reaches SIEM
+/// + callback either through the dispatcher thread or through the
+/// caller's fallback path.
+pub fn enqueue_duress_alert(
+    d: DuressDispatch,
+) -> Result<(), DuressDispatch> {
+    let tx = duress_dispatcher_tx();
+    match tx.try_send(d) {
+        Ok(()) => Ok(()),
+        Err(std::sync::mpsc::TrySendError::Full(d))
+        | Err(std::sync::mpsc::TrySendError::Disconnected(d)) => {
+            tracing::error!(
+                target: "siem",
+                "SIEM:CRITICAL duress dispatcher saturated — alert returned to caller for inline fallback"
+            );
+            Err(d)
+        }
+    }
+}
+
+/// Inline-emit a duress alert. Called by `verify_pin` when the bounded
+/// dispatcher queue refused the enqueue, so a real duress observation
+/// is never silently lost. The verify-side timing penalty is acceptable
+/// here because saturation is the operational rare-path.
+fn emit_duress_inline(d: &DuressDispatch) {
+    if !d.is_duress {
+        return;
+    }
+    crate::siem::SecurityEvent::duress_detected(d.alert.user_id);
+    if let Some(cb) = d.callback.as_ref() {
+        let _ = std::panic::catch_unwind(
+            std::panic::AssertUnwindSafe(|| cb(&d.alert)),
+        );
+    }
 }

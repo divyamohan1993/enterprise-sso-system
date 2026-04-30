@@ -30,10 +30,23 @@ pub trait KeyStretchingFunction: Send + Sync {
 
 /// Argon2id key stretching function.
 ///
-/// Parameters: memory = 64 MiB (65536 KiB), iterations = 4,
-/// parallelism = 4, output = 32 bytes.  Not FIPS approved; use
-/// [`Pbkdf2Sha512Ksf`] in FIPS mode.
+/// Parameters: memory = 96 MiB (98304 KiB), iterations = 6, parallelism = 4,
+/// output = 32 bytes. Picked above OWASP-2024 Argon2id baseline (12 MiB, t=3)
+/// with a generous safety margin so the construction stays defensible against
+/// commodity GPU/ASIC speed-ups for at least the next five years.
+///
+/// Not FIPS approved; use [`Pbkdf2Sha512Ksf`] in FIPS mode.
 pub struct Argon2idKsf;
+
+/// Argon2id memory cost in KiB (96 MiB). Tuned for 5-year forward security
+/// against contemporary GPU/ASIC offline-cracking economics.
+pub const ARGON2ID_M_COST_KIB: u32 = 98_304;
+/// Argon2id iteration count. Above OWASP min (3) with margin.
+pub const ARGON2ID_T_COST: u32 = 6;
+/// Argon2id parallelism (lanes).
+pub const ARGON2ID_LANES: u32 = 4;
+/// Argon2id output length in bytes.
+pub const ARGON2ID_OUT_LEN: usize = 32;
 
 impl KeyStretchingFunction for Argon2idKsf {
     fn stretch(&self, password: &[u8], salt: &[u8]) -> Result<Vec<u8>, String> {
@@ -48,11 +61,16 @@ impl KeyStretchingFunction for Argon2idKsf {
         }
         use argon2::{Algorithm, Argon2, Params, Version};
 
-        let params = Params::new(65536, 4, 4, Some(32))
+        let params = Params::new(
+            ARGON2ID_M_COST_KIB,
+            ARGON2ID_T_COST,
+            ARGON2ID_LANES,
+            Some(ARGON2ID_OUT_LEN),
+        )
             .map_err(|e| format!("argon2 params error: {e}"))?;
         let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
-        let mut output = vec![0u8; 32];
+        let mut output = vec![0u8; ARGON2ID_OUT_LEN];
         argon2
             .hash_password_into(password, salt, &mut output)
             .map_err(|e| format!("argon2id stretch error: {e}"))?;
@@ -75,14 +93,21 @@ impl KeyStretchingFunction for Argon2idKsf {
 
 /// PBKDF2-HMAC-SHA512 key stretching function.
 ///
-/// Parameters: iterations = 210 000, hash = HMAC-SHA512, output = 32 bytes.
-/// FIPS 140-3 approved; selected automatically when FIPS mode is active.
+/// Parameters: iterations = 600 000 (NIST SP 800-132 IG / OWASP 2024 baseline
+/// for SHA-512), hash = HMAC-SHA512, output = 32 bytes. FIPS 140-3 approved;
+/// selected automatically when FIPS mode is active. The previous value of
+/// 210 000 was below the contemporary recommendation; 600 000 keeps the
+/// construction defensible for at least 5 years against GPU/ASIC speed-ups.
 pub struct Pbkdf2Sha512Ksf;
+
+/// PBKDF2-HMAC-SHA512 iteration count. Sized for 5-year forward security
+/// against commodity GPU/ASIC offline cracking.
+pub const PBKDF2_SHA512_ITERATIONS: u32 = 600_000;
 
 impl KeyStretchingFunction for Pbkdf2Sha512Ksf {
     fn stretch(&self, password: &[u8], salt: &[u8]) -> Result<Vec<u8>, String> {
         let mut output = vec![0u8; 32];
-        pbkdf2::pbkdf2_hmac::<sha2::Sha512>(password, salt, 210_000, &mut output);
+        pbkdf2::pbkdf2_hmac::<sha2::Sha512>(password, salt, PBKDF2_SHA512_ITERATIONS, &mut output);
         Ok(output)
     }
 
