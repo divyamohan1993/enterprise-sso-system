@@ -99,3 +99,6 @@ terraform/terraform.tfstate.backup
 # Playwright
 .playwright-mcp/
 deploy/dev-test/plan.tfplan
+
+# Local audit/review artifacts (transient)
+.ultrareview/
