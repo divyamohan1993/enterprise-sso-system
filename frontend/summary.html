@@ -301,19 +301,19 @@
   </div>
   <div class="rt">
     <div class="badge">Technical Summary Sheet</div>
-    <div class="meta">CNSA 2.0 Algorithms · NIST Level 5 · Rust 1.88 · 530K LoC</div>
+    <div class="meta">CNSA 2.0 Algorithms · NIST Level 5 · Rust 1.88 · 266K LoC</div>
   </div>
 </header>
 
 <main class="ct" role="main">
 
   <section class="hero">
-    <p class="hook">Every SSO today trusts the server with your password. This one doesn't.</p>
-    <h2>Post-quantum threshold SSO with <em>server-blind credentials</em> and <em>10-second forward-secret key ratchet</em></h2>
+    <p class="hook">Every SSO today stores your password in a recoverable form. This one doesn't.</p>
+    <h2>Post-quantum threshold SSO with <em>server-blind credential storage</em> and a <em>10-second key-ratchet target</em></h2>
     <div class="nums">
       <div class="n"><div class="nv">5</div><div class="nl">Isolated VMs</div></div>
       <div class="dv" role="presentation"></div>
-      <div class="n"><div class="nv">35</div><div class="nl">Workspace Crates</div></div>
+      <div class="n"><div class="nv">36</div><div class="nl">Workspace Crates</div></div>
       <div class="dv" role="presentation"></div>
       <div class="n"><div class="nv">3-of-5</div><div class="nl">FROST Threshold</div></div>
       <div class="dv" role="presentation"></div>
@@ -323,11 +323,11 @@
       <div class="dv" role="presentation"></div>
       <div class="n"><div class="nv">5,400+</div><div class="nl">Tests</div></div>
       <div class="dv" role="presentation"></div>
-      <div class="n"><div class="nv">53</div><div class="nl">Fuzz Targets</div></div>
+      <div class="n"><div class="nv">45</div><div class="nl">Fuzz Targets</div></div>
       <div class="dv" role="presentation"></div>
       <div class="n"><div class="nv">20</div><div class="nl">Algorithms</div></div>
       <div class="dv" role="presentation"></div>
-      <div class="n"><div class="nv">15</div><div class="nl">TLA+ Invariants</div></div>
+      <div class="n"><div class="nv">19</div><div class="nl">TLA+ Invariants</div></div>
     </div>
   </section>
 
@@ -337,7 +337,7 @@
 
   <div class="grid">
     <section class="card green">
-      <h3>Cryptographic Stack <span class="pill">FIPS 203 / 204 / 205</span></h3>
+      <h3>Cryptographic Stack <span class="pill">FIPS 203/204/205 Algorithms</span></h3>
       <ul>
         <li><strong>X-Wing-style</strong> hybrid KEM: X25519 + ML-KEM-1024</li>
         <li><strong>FROST 3-of-5</strong> Ristretto255 + <strong>ML-DSA-87</strong> PQ wrap</li>
@@ -350,27 +350,27 @@
     <section class="card blue">
       <h3>Threshold Architecture <span class="pill">No Single Point of Failure</span></h3>
       <ul>
-        <li><strong>Signing:</strong> FROST 3-of-5 across 5 Shielded VMs</li>
+        <li><strong>Signing:</strong> FROST 3-of-5, 5 signer processes on 3 Shielded VMs</li>
         <li><strong>Auth:</strong> OPAQUE 2-of-3 Shamir across 3 VMs</li>
-        <li><strong>Audit:</strong> 11-node BFT, SHA-512 hash + Merkle chain</li>
+        <li><strong>Audit:</strong> 11-node BFT (single-host today), SHA-512 + Merkle</li>
         <li><strong>Master KEK:</strong> 3-of-5 Shamir, reconstruct in mlock'd memory</li>
         <li><strong>Database:</strong> 3-node Patroni HA, sync ANY 2 quorum</li>
-        <li><strong>Guarantee:</strong> N-1 share compromise leaks zero secrets</li>
+        <li><strong>Guarantee:</strong> below-threshold share loss leaks zero secrets</li>
       </ul>
     </section>
     <section class="card amber">
       <h3>Host Hardening <span class="pill">Defense in Depth</span></h3>
       <ul>
         <li><strong>3-layer:</strong> mlock + DONTDUMP + RLIMIT_CORE=0</li>
-        <li><strong>Seccomp BPF</strong> on gateway / orchestrator / tss daemons</li>
-        <li><strong>52 env vars</strong> wiped post-init (PR_SET_DUMPABLE=0)</li>
+        <li><strong>Seccomp BPF</strong> on 6 daemons (7 still uncovered)</li>
+        <li><strong>60 env vars</strong> wiped post-init (PR_SET_DUMPABLE=0)</li>
         <li><strong>Canary:</strong> random u64 sentinels, instant _exit(199)</li>
         <li><strong>HSM / KMS / TPM</strong> interfaces (hw backends pending)</li>
-        <li><strong>Zeroize-on-drop</strong> on all keys, tokens, nonces</li>
+        <li><strong>Zeroize-on-drop</strong> on long-lived keys + session tokens</li>
       </ul>
     </section>
     <section class="card purple">
-      <h3>Auth Protocols <span class="pill">PQ DPoP · CAC/PIV · AAL3</span></h3>
+      <h3>Auth Protocols <span class="pill">PQ DPoP · CAC/PIV · AAL3-capable</span></h3>
       <ul>
         <li><strong>OAuth 2.1</strong> mandatory PKCE S256, 30s code expiry</li>
         <li><strong>SAML 2.0</strong> custom DTD-free parser, replay cache</li>
@@ -381,15 +381,15 @@
       </ul>
     </section>
     <section class="card wide cyan">
-      <h3>Verification &amp; Exclusives <span class="pill">5,400+ Tests · TLA+ Formal Model</span></h3>
+      <h3>Verification &amp; Exclusives <span class="pill">5,400+ Tests · TLA+ Spec</span></h3>
       <ul>
-        <li><strong>Honey encryption</strong> primitive: wrong key = plausible fake</li>
-        <li><strong>54 E2E</strong> attack suites + 53 libFuzzer targets</li>
+        <li><strong>Honey encryption</strong> primitive (not wired to auth flow yet)</li>
+        <li><strong>54 E2E</strong> attack suites + 45 buildable libFuzzer targets</li>
         <li><strong>Duress PIN:</strong> SIEM alert + session revocation on coercion</li>
-        <li><strong>12 NIST KAT</strong> functions + 53 proptest properties</li>
+        <li><strong>12 KAT</strong> functions + 78 proptest properties</li>
         <li><strong>Key Transparency:</strong> CSHAKE256 + SHA-512 Merkle tree</li>
         <li><strong>9 chaos suites:</strong> Byzantine, clock, crypto, PQ, resource</li>
-        <li><strong>6-signal UEBA:</strong> EMA baselines, 4 threat levels</li>
+        <li><strong>9-signal UEBA:</strong> EMA baselines, 4 threat levels</li>
         <li><strong>9-stage CI/CD:</strong> CycloneDX + SPDX SBOM, Cosign, SLSA 3</li>
       </ul>
     </section>
@@ -404,13 +404,13 @@
       <th scope="col">Okta FedRAMP</th><th scope="col">MS Entra</th>
     </tr></thead>
     <tbody>
-      <tr><td>Post-Quantum</td><td>ML-KEM-1024 + ML-DSA-87 <span class="otag">ONLY US</span></td><td class="tr">None</td><td class="ty">TLS-only ML-KEM-768</td><td class="tr">None</td><td class="tr">None</td></tr>
-      <tr><td>Server-Blind Auth</td><td>OPAQUE aPAKE <span class="otag">ONLY US</span></td><td class="ty">N/A (cert)</td><td class="tr">Std hash</td><td class="tr">Std hash</td><td class="tr">Std hash</td></tr>
+      <tr><td>Post-Quantum (Identity)</td><td>ML-KEM-1024 + ML-DSA-87 in auth tokens</td><td class="tr">None</td><td class="ty">TLS-only ML-KEM-768</td><td class="tr">None</td><td class="ty">CNG/SymCrypt (OS-layer)</td></tr>
+      <tr><td>Credential Storage</td><td>OPAQUE envelope (DB-leak resistant) <span class="otag">ONLY US</span></td><td class="ty">N/A (cert)</td><td class="tr">Std hash</td><td class="tr">Std hash</td><td class="tr">Std hash</td></tr>
       <tr><td>Threshold Signing</td><td>FROST + PQ wrap <span class="otag">ONLY US</span></td><td class="tr">Single CA</td><td class="tr">Single KMS</td><td class="tr">Single HSM</td><td class="tr">Single HSM</td></tr>
       <tr><td>Forward Secrecy</td><td>10s epoch ratchet <span class="otag">ONLY US</span></td><td class="ty">TLS session</td><td class="ty">TLS session</td><td class="tr">None</td><td class="tr">None</td></tr>
       <tr><td>Tamper-Proof Audit</td><td>11-node BFT hash chain <span class="otag">ONLY US</span></td><td class="ty">Central log</td><td class="ty">CloudTrail</td><td class="ty">Syslog</td><td class="ty">Azure Mon</td></tr>
       <tr><td>Deception Defense</td><td>Duress PIN <span class="otag">ONLY US</span></td><td class="tr">None</td><td class="tr">None</td><td class="tr">None</td><td class="tr">None</td></tr>
-      <tr><td>FIPS 140-3</td><td class="ty">Planned (not submitted)</td><td>Validated</td><td>Validated</td><td>Validated</td><td>Validated</td></tr>
+      <tr><td>FIPS 140-3</td><td class="tr">Roadmap (lab not yet engaged)</td><td>Validated</td><td>Validated</td><td>Validated</td><td>Validated</td></tr>
     </tbody>
   </table>
   </div>
@@ -435,7 +435,7 @@
   </div>
   <div class="card wide cyan">
     <h3 style="justify-content:center; border-bottom:none; margin-bottom:0;">
-      <span style="font:400 1.05rem/1.4 var(--fd); color:#0e7490; font-style:italic; text-transform:none; letter-spacing:0;">Passwords are stored as OPAQUE envelopes — never as recoverable hashes. Tokens require 3 of 5 isolated machines to sign, with both classical and post-quantum signatures. Session keys advance every 10 seconds and zeroize on drop. Memory is mlock'd; core dumps blocked.</span>
+      <span style="font:400 1.05rem/1.4 var(--fd); color:#0e7490; font-style:italic; text-transform:none; letter-spacing:0;">Passwords are stored as OPAQUE envelopes — never as recoverable hashes. Tokens require 3 of 5 separate signer processes plus an ML-DSA-87 wrap. Session keys ratchet on a 10-second cadence and zeroize on drop. Memory is mlock'd; core dumps blocked.</span>
     </h3>
   </div>
 
@@ -447,7 +447,7 @@
   </div>
   <div class="foot-label">Capabilities</div>
   <div class="foot-tags">
-    <span class="ft fc">Post-Quantum</span><span class="ft fc">Threshold Crypto</span><span class="ft fc">Forward Secret</span><span class="ft fc">Ristretto255</span><span class="ft fc">Argon2id</span><span class="ft fa">OPAQUE aPAKE</span><span class="ft fa">Bell-LaPadula</span><span class="ft fa">Duress PIN</span><span class="ft fa">DPoP</span><span class="ft fa">PKCE</span><span class="ft fh">Seccomp</span><span class="ft fh">mlock</span><span class="ft fh">Zeroize</span><span class="ft fh">Shielded VM</span><span class="ft fp">11-node BFT</span><span class="ft fp">FIDO2/CAC</span><span class="ft fp">TLA+ Verified</span><span class="ft fv">SLSA 3</span><span class="ft fv">Cosign</span>
+    <span class="ft fc">Post-Quantum</span><span class="ft fc">Threshold Crypto</span><span class="ft fc">Forward Secret</span><span class="ft fc">Ristretto255</span><span class="ft fc">Argon2id</span><span class="ft fa">OPAQUE aPAKE</span><span class="ft fa">Bell-LaPadula</span><span class="ft fa">Duress PIN</span><span class="ft fa">DPoP</span><span class="ft fa">PKCE</span><span class="ft fh">Seccomp</span><span class="ft fh">mlock</span><span class="ft fh">Zeroize</span><span class="ft fh">Shielded VM</span><span class="ft fp">11-node BFT</span><span class="ft fp">FIDO2/CAC</span><span class="ft fp">TLA+ Spec</span><span class="ft fv">SLSA 3</span><span class="ft fv">Cosign</span>
   </div>
   <div style="font:400 0.8rem var(--fu); color:#94a3b8; display:flex; justify-content:space-between;">
     <span>Apache 2.0 with patent retaliation. Original work by Divya Mohan. © 2025–2026 dmj.one.</span>
