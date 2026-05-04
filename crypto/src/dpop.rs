@@ -11,6 +11,7 @@ use ml_dsa::{
     KeyGen, MlDsa87, SigningKey, VerifyingKey,
 };
 use sha2::{Digest, Sha512};
+use std::pin::Pin;
 use zeroize::Zeroize;
 use common::domain;
 
@@ -36,18 +37,74 @@ pub struct GuardedSigningKey {
 }
 
 impl GuardedSigningKey {
-    /// Wrap an existing `DpopSigningKey` with secure memory protections.
-    ///
-    /// Creates a locked sentinel buffer to keep the process pages mlocked,
-    /// and retains the original key for signing.  If mlock fails in a
-    /// non-production environment, the key is still usable but a warning
-    /// is emitted.
-    pub fn new(key: DpopSigningKey) -> Self {
+    /// Build the guarded key in an *unlocked* state. Used internally by
+    /// [`new_pinned`]. The sentinel `SecretVec` is built via the address-
+    /// correct `new_pinned`. The actual ML-DSA-87 signing key is NOT
+    /// mlocked here — that is deferred to [`lock_in_place`] which runs
+    /// after the outer `Self` reaches its final pinned heap address.
+    fn build_unlocked(key: DpopSigningKey) -> Self {
         let mut sentinel = vec![0u8; 64];
         let _ = getrandom::getrandom(&mut sentinel);
-        let locked = crate::memguard::SecretVec::new(sentinel).ok();
-        let guarded = Self { key, _locked_sentinel: locked };
-        // Best-effort mlock of the actual ML-DSA-87 signing key struct memory.
+        let locked = crate::memguard::SecretVec::new_pinned(sentinel).ok();
+        Self { key, _locked_sentinel: locked }
+    }
+
+    /// Apply mlock to the inner `DpopSigningKey` at its final, stable
+    /// pinned address. Must be called only after `Self` has been placed
+    /// at its final heap address (e.g. inside `Box::pin`).
+    pub fn lock_in_place(self: Pin<&mut Self>) -> Result<(), crate::memguard::MemguardError> {
+        // SAFETY: We only call mlock on the address of `self.key` and
+        // do not move `key` out of `self`.
+        let this: &mut Self = unsafe { self.get_unchecked_mut() };
+        let ptr = &this.key as *const DpopSigningKey as *const u8;
+        let len = std::mem::size_of::<DpopSigningKey>();
+        #[allow(unsafe_code)]
+        let rc = unsafe { libc::mlock(ptr as *const libc::c_void, len) };
+        if rc == 0 {
+            #[allow(unsafe_code)]
+            unsafe {
+                libc::madvise(ptr as *mut libc::c_void, len, libc::MADV_DONTDUMP);
+            }
+            Ok(())
+        } else {
+            crate::memguard::record_mlock_failure();
+            let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            if is_military {
+                panic!(
+                    "FATAL: mlock failed for DPoP signing key in military deployment \
+                     (MILNET_MILITARY_DEPLOYMENT=1). Key material MUST be locked in RAM."
+                );
+            }
+            tracing::error!(
+                "SIEM:CRITICAL mlock failed for DPoP GuardedSigningKey — key may be swappable"
+            );
+            Err(crate::memguard::MemguardError::MlockFailed)
+        }
+    }
+
+    /// Address-correct constructor: places the guarded key on the heap
+    /// and locks the live address. **This is the only constructor that
+    /// fulfils the mlock contract** — `new` mlocks the constructor's
+    /// stack frame, which the return-by-value invalidates.
+    pub fn new_pinned(key: DpopSigningKey) -> Result<Pin<Box<Self>>, crate::memguard::MemguardError> {
+        let guarded = Self::build_unlocked(key);
+        let mut pinned: Pin<Box<Self>> = Box::pin(guarded);
+        pinned.as_mut().lock_in_place()?;
+        Ok(pinned)
+    }
+
+    /// **DEPRECATED** — `mlock`-after-move is unsound. The `mlock` here
+    /// targets the constructor's stack frame; the value is then
+    /// `memcpy`'d into the caller's slot, leaving the live key bytes
+    /// outside the locked region. Use [`new_pinned`] instead.
+    #[deprecated(
+        note = "use new_pinned; mlock-after-move semantics are unsafe — the live signing key address is not the address that was locked"
+    )]
+    pub fn new(key: DpopSigningKey) -> Self {
+        let guarded = Self::build_unlocked(key);
+        // Legacy mlock-after-move path retained verbatim.
         let ptr = &guarded.key as *const DpopSigningKey as *const u8;
         let len = std::mem::size_of::<DpopSigningKey>();
         #[allow(unsafe_code)]
@@ -106,8 +163,12 @@ impl Drop for GuardedSigningKey {
 
 /// Generate an ML-DSA-87 keypair for DPoP proof generation.
 ///
-/// Returns a `GuardedSigningKey` (zeroized on drop, mlocked) and the
-/// corresponding `DpopVerifyingKey`.
+/// **DEPRECATED** — uses [`GuardedSigningKey::new`] which has
+/// mlock-after-move semantics. Prefer [`generate_dpop_keypair_pinned`].
+#[deprecated(
+    note = "use generate_dpop_keypair_pinned; underlying GuardedSigningKey::new mlock-after-move is unsafe"
+)]
+#[allow(deprecated)]
 pub fn generate_dpop_keypair() -> (GuardedSigningKey, DpopVerifyingKey) {
     let mut seed = [0u8; 32];
     if getrandom::getrandom(&mut seed).is_err() {
@@ -117,6 +178,25 @@ pub fn generate_dpop_keypair() -> (GuardedSigningKey, DpopVerifyingKey) {
     seed.zeroize();
     let guarded = GuardedSigningKey::new(kp.signing_key().clone());
     (guarded, kp.verifying_key().clone())
+}
+
+/// Generate an ML-DSA-87 keypair returning a pinned, address-correctly
+/// locked `GuardedSigningKey`.
+///
+/// Returns `Err(MemguardError::MlockFailed)` outside military mode if
+/// `RLIMIT_MEMLOCK` is exhausted; in `MILNET_MILITARY_DEPLOYMENT=1`
+/// mlock failure aborts the process.
+pub fn generate_dpop_keypair_pinned()
+    -> Result<(Pin<Box<GuardedSigningKey>>, DpopVerifyingKey), crate::memguard::MemguardError>
+{
+    let mut seed = [0u8; 32];
+    if getrandom::getrandom(&mut seed).is_err() {
+        panic!("FATAL: OS CSPRNG unavailable — cannot generate DPoP keypair safely");
+    }
+    let kp = MlDsa87::from_seed(&seed.into());
+    seed.zeroize();
+    let pinned = GuardedSigningKey::new_pinned(kp.signing_key().clone())?;
+    Ok((pinned, kp.verifying_key().clone()))
 }
 
 /// Generate a raw ML-DSA-87 keypair without `GuardedSigningKey` wrapping.
