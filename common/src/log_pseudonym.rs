@@ -29,10 +29,20 @@ fn pseudonym_key() -> &'static [u8; 32] {
         let kek = crate::sealed_keys::cached_master_kek();
         let hk = hkdf::Hkdf::<Sha512>::new(Some(LOG_PSEUDONYM_DOMAIN), kek);
         let mut okm = [0u8; 32];
+        // X-V — Invariant: HKDF-SHA512-Expand of 32 bytes is mathematically
+        // infallible per RFC 5869 §2.3 (32 ≤ 255 × HashLen = 16 320 with
+        // HashLen=64). The pre-fix `unwrap_or_else(|_| copy_from_slice(kek))`
+        // was unreachable today, but if a future hkdf bump ever changed the
+        // bound it would silently use the master KEK as the pseudonym HMAC
+        // key — defeating pseudonymisation entirely (anyone who can observe
+        // many `(plaintext, pseudonym)` pairs could probe the KEK directly).
+        // Replace the silent fallback with `expect` so any failure is a
+        // loud panic, surfaced in tests, not a silent privacy regression.
         hk.expand(b"log-pseudonym-hmac-key", &mut okm)
-            .unwrap_or_else(|_| {
-                okm.copy_from_slice(kek);
-            });
+            .expect(
+                "HKDF-SHA512 expand of 32 bytes is infallible per RFC 5869 \
+                 §2.3 — input never empty under construction invariants",
+            );
         okm
     })
 }
