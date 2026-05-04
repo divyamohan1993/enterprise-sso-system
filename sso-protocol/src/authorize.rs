@@ -628,21 +628,23 @@ impl PersistentAuthorizationStore {
     }
     async fn load_from_db(&mut self) -> Result<(), String> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
-        // DB stores hashed code keys and blinded code_challenges — load them directly.
-        let rows: Vec<(String, String, String, Uuid, Option<String>, i32, Option<String>, i64, bool)> =
+        // X-I: load `scope` so cache-warm reads can construct a complete
+        // AuthorizationCode (the redirect-uri-bound scope is required to
+        // mint a token; pre-fix this column was discarded).
+        let rows: Vec<(String, String, String, Uuid, String, Option<String>, i32, Option<String>, i64, bool)> =
             sqlx::query_as(
                 "SELECT code_hash, client_id, redirect_uri, user_id, \
-                 code_challenge_blind, tier, nonce, created_at, consumed \
+                 scope, code_challenge_blind, tier, nonce, created_at, consumed \
                  FROM authorization_codes WHERE created_at > $1",
             )
             .bind(now - (CODE_EXPIRY_SECS * 2))
             .fetch_all(&self.pool)
             .await
             .map_err(|e| format!("load codes: {e}"))?;
-        for (code_hash, cid, ruri, uid, cc_blind, tier, nonce, cat, consumed) in rows {
+        for (code_hash, cid, ruri, uid, scope, cc_blind, tier, nonce, cat, consumed) in rows {
             self.memory.codes.insert(code_hash, AuthorizationCode {
                 code: String::new(), client_id: cid, redirect_uri: ruri,
-                user_id: uid, scope: String::new(), code_challenge: cc_blind,
+                user_id: uid, scope, code_challenge: cc_blind,
                 nonce, tier: tier as u8, expires_at: cat + CODE_EXPIRY_SECS,
                 consumed,
             });
@@ -655,61 +657,89 @@ impl PersistentAuthorizationStore {
         let blinded_challenge = code_challenge.as_deref().map(blind_code_challenge);
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
         // Store hashed code and blinded challenge in DB — never plaintext.
-        sqlx::query("INSERT INTO authorization_codes (code_hash, client_id, redirect_uri, user_id, code_challenge_blind, tier, nonce, created_at, consumed) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,FALSE)")
-            .bind(&hashed_key).bind(client_id).bind(redirect_uri).bind(user_id).bind(blinded_challenge.as_deref()).bind(tier as i32).bind(nonce.as_deref()).bind(now)
+        // X-I: persist `scope` so cross-instance consume_code can rebuild
+        // a complete AuthorizationCode from the DELETE...RETURNING result.
+        sqlx::query("INSERT INTO authorization_codes (code_hash, client_id, redirect_uri, user_id, scope, code_challenge_blind, tier, nonce, created_at, consumed) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,FALSE)")
+            .bind(&hashed_key).bind(client_id).bind(redirect_uri).bind(user_id).bind(scope).bind(blinded_challenge.as_deref()).bind(tier as i32).bind(nonce.as_deref()).bind(now)
             .execute(&self.pool).await.map_err(|e| format!("persist code: {e}"))?;
         Ok(code)
     }
     pub async fn create_code(&mut self, client_id: &str, redirect_uri: &str, user_id: Uuid, scope: &str, code_challenge: Option<String>, nonce: Option<String>) -> Result<String, String> {
         self.create_code_with_tier(client_id, redirect_uri, user_id, scope, code_challenge, nonce, 2).await
     }
-    /// Consume an authorization code with atomic database protection.
+    /// Consume an authorization code with atomic cross-instance protection.
     ///
-    /// Uses `UPDATE ... WHERE consumed = FALSE` to prevent cross-instance replay:
-    /// even if two instances race on the same code, only one will succeed because
-    /// the atomic UPDATE returns rows_affected=0 for the loser.
+    /// X-I — uses a single `DELETE ... WHERE consumed = FALSE RETURNING ...`
+    /// statement so the row is atomically claimed and returned in one
+    /// query. Pre-fix logic split this into UPDATE-then-SELECT-cache
+    /// and lost the AuthorizationCode entirely whenever the local cache
+    /// was cold (the cross-instance scenario the persistent store
+    /// exists to support): the UPDATE marked the row consumed, then
+    /// `self.memory.consume_code(code)` returned `None` because the
+    /// code was minted on a different instance, and the function
+    /// returned `Ok(None)` despite winning the race. The caller could
+    /// not complete the token exchange. The pre-fix code also lost
+    /// `scope` because `load_from_db` discarded that column.
+    ///
+    /// With `DELETE ... RETURNING`:
+    ///   - Exactly one instance gets a non-empty row (the race winner).
+    ///   - The losing instance gets a row count of zero → `Ok(None)`.
+    ///   - The winner reconstructs a full `AuthorizationCode` from the
+    ///     returned columns (including scope) and returns `Ok(Some(...))`.
+    ///   - The in-memory cache is best-effort cleared regardless of
+    ///     whether the entry existed.
     pub async fn consume_code(&mut self, code: &str) -> Result<Option<AuthorizationCode>, String> {
         let hashed_key = hash_code(code);
 
-        // Atomic DB update: only succeeds if the code has NOT been consumed yet.
-        // This is the source of truth for cross-instance replay prevention.
-        let result = sqlx::query(
-            "UPDATE authorization_codes SET consumed = TRUE \
-             WHERE code_hash = $1 AND consumed = FALSE"
-        )
-        .bind(&hashed_key)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("atomic consume: {e}"))?;
+        // Atomic claim+fetch: DELETE the row only if not yet consumed,
+        // and RETURN every column needed to rebuild the AuthorizationCode.
+        // (`consumed` is not in RETURNING because a race-winning DELETE
+        // implies `consumed=FALSE` at the moment of the claim.)
+        let row: Option<(String, String, Uuid, String, Option<String>, i32, Option<String>, i64)> =
+            sqlx::query_as(
+                "DELETE FROM authorization_codes \
+                 WHERE code_hash = $1 AND consumed = FALSE \
+                 RETURNING client_id, redirect_uri, user_id, scope, \
+                           code_challenge_blind, tier, nonce, created_at",
+            )
+            .bind(&hashed_key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| format!("atomic consume (DELETE RETURNING): {e}"))?;
 
-        if result.rows_affected() == 0 {
-            // Either the code doesn't exist or was already consumed by another instance.
-            // Ensure the in-memory cache is consistent: try consuming (which will also
-            // fail if already consumed) and then clean up.
-            if self.memory.consume_code(code).is_none() {
+        // Best-effort cache cleanup either way (no panic on miss — the
+        // map may not have the entry in the cross-instance case).
+        let _ = self.memory.consume_code(code);
+
+        match row {
+            None => {
+                // Either the code does not exist, or another instance
+                // already consumed it. Either way, this instance lost.
                 tracing::debug!(
                     target: "siem",
-                    "Authorization code not found in memory cache during DB-authoritative consume — expected for cross-instance scenarios"
+                    "X-I: authorization code race lost (or code unknown) — \
+                     cross-instance consume returned no row"
                 );
+                Ok(None)
             }
-            sqlx::query("DELETE FROM authorization_codes WHERE code_hash = $1 AND consumed = TRUE")
-                .bind(&hashed_key)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| format!("cleanup consumed code: {e}"))?;
-            return Ok(None);
+            Some((client_id, redirect_uri, user_id, scope, code_challenge_blind, tier, nonce, created_at)) => {
+                // X-I: reconstruct the full AuthorizationCode from the
+                // returned row, including scope. Pre-fix this branch
+                // returned Ok(None) when the local cache was cold.
+                Ok(Some(AuthorizationCode {
+                    code: String::new(), // raw code never re-surfaces post-redeem
+                    client_id,
+                    redirect_uri,
+                    user_id,
+                    scope,
+                    code_challenge: code_challenge_blind,
+                    nonce,
+                    tier: tier as u8,
+                    expires_at: created_at + CODE_EXPIRY_SECS,
+                    consumed: true,
+                }))
+            }
         }
-
-        // DB confirmed this instance won the race — now consume from in-memory cache.
-        let r = self.memory.consume_code(code);
-        if r.is_none() {
-            // Edge case: in-memory cache was stale (e.g., code expired in cache but
-            // not in DB). The DB update already marked it consumed, which is correct.
-            tracing::warn!(
-                "Authorization code consumed in DB but not in memory cache — cache was stale"
-            );
-        }
-        Ok(r)
     }
     pub fn is_code_consumed(&self, code: &str) -> bool { self.memory.is_code_consumed(code) }
     pub async fn cleanup_expired(&mut self) -> Result<(), String> {
