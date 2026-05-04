@@ -9,12 +9,16 @@
 //! Verifying-key pinning mirrors the D4 audit design: `build.rs` produces
 //! `OUT_DIR/pinned_vks.bin` and the runtime loader parses it once at startup.
 //!
-//! Signing-key derivation: in single-process mode all 5 keys are derived from
-//! `master_kek` via HKDF-SHA512 with per-slot info strings, so the local
-//! service can synthesize its own 2-of-5 signatures for local dev/test. In
-//! standalone deployments (one process per VM) only the local slot is
-//! populated and the other signatures must arrive from peers before
-//! `commit_leaf` is called.
+//! Signing-key derivation (X-J): controlled by `MILNET_KT_DEPLOYMENT_MODE`.
+//! * `distributed` (the only mode permitted in `MILNET_MILITARY_DEPLOYMENT=1`)
+//!   reads ONLY the local slot's seed from `MILNET_KT_SIGNER_<i>_SEAL` (a
+//!   TPM-sealed 32-byte hex). Peer signatures arrive over the consensus
+//!   protocol before `verify_threshold` is called.
+//! * `single` (dev / local integration only) synthesises all 5 keys from the
+//!   master KEK via HKDF-SHA512. STARTUP CRITICAL is logged on activation;
+//!   the binary refuses to start in this mode under
+//!   `MILNET_MILITARY_DEPLOYMENT=1` because a single-host compromise yields
+//!   full forgery capability.
 
 use crypto::pq_sign;
 use ml_dsa::{KeyGen, MlDsa87};
@@ -86,44 +90,184 @@ pub fn require_pinned_vks_or_panic() {
     }
 }
 
-/// Derive the 5 per-node signing keys. In single-process mode all 5 slots
-/// are populated from HKDF(master_kek, slot_info). In standalone mode only
-/// the slot matching `MILNET_KT_NODE_INDEX` is populated.
-pub fn synthesize_signing_keys() -> Vec<Option<pq_sign::PqSigningKey>> {
+/// X-J: KT signing-key deployment mode. The 2-of-5 consensus property only
+/// holds when each signer slot lives in a separate process on a separate
+/// failure domain. Single-process mode synthesises all 5 keys from one
+/// master KEK, which is operationally equivalent to a 1-of-1 system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KtDeploymentMode {
+    /// One process per slot; only the local slot's seed is loaded, sourced
+    /// from a TPM-sealed env var (`MILNET_KT_SIGNER_<i>_SEAL`). This is the
+    /// only mode permitted in `MILNET_MILITARY_DEPLOYMENT=1`.
+    Distributed,
+    /// One process synthesises all 5 keys from `master_kek`. Dev / local
+    /// integration tests only — emits STARTUP CRITICAL on activation, and
+    /// is refused outright in `MILNET_MILITARY_DEPLOYMENT=1`.
+    Single,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum KtKeyError {
+    #[error("MILNET_KT_DEPLOYMENT_MODE={0:?} not recognized; expected `single` or `distributed`")]
+    BadMode(String),
+    #[error(
+        "MILNET_KT_DEPLOYMENT_MODE=single is forbidden in MILNET_MILITARY_DEPLOYMENT=1: a \
+         single-host derivation of all 5 signer keys defeats the 2-of-5 consensus property"
+    )]
+    SingleInMilitary,
+    #[error("MILNET_KT_DEPLOYMENT_MODE=distributed requires MILNET_KT_NODE_INDEX in 0..{KT_NODES}")]
+    NodeIndexMissing,
+    #[error(
+        "MILNET_KT_DEPLOYMENT_MODE=distributed: signer seed env `MILNET_KT_SIGNER_{0}_SEAL` \
+         is unset (must be a TPM-sealed 32-byte hex seed)"
+    )]
+    SealMissing(usize),
+    #[error("MILNET_KT_SIGNER_{slot}_SEAL is malformed: {detail}")]
+    SealMalformed { slot: usize, detail: String },
+}
+
+const SINGLE_MODE_CRITICAL_LOG: &str =
+    "kt_consensus.SINGLE_HOST_MODE_NOT_FOR_PRODUCTION single-process mode synthesises all 5 \
+     KT consensus signer keys from one master KEK; a single-host compromise yields full \
+     forgery capability. Refuse to deploy this in production.";
+
+/// Determine the deployment mode from env. Must be called by every entry
+/// path that loads consensus signing keys, including tests, so the same
+/// production-strict logic is exercised everywhere.
+pub fn select_deployment_mode() -> Result<KtDeploymentMode, KtKeyError> {
+    // Production gating mirrors the rest of the workspace: literal "1".
+    let military = std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1");
+    let raw = std::env::var("MILNET_KT_DEPLOYMENT_MODE")
+        .unwrap_or_else(|_| {
+            if military {
+                "distributed".to_string()
+            } else {
+                "single".to_string()
+            }
+        });
+    let mode = match raw.as_str() {
+        "single" => KtDeploymentMode::Single,
+        "distributed" => KtDeploymentMode::Distributed,
+        other => return Err(KtKeyError::BadMode(other.to_string())),
+    };
+    if mode == KtDeploymentMode::Single && military {
+        return Err(KtKeyError::SingleInMilitary);
+    }
+    Ok(mode)
+}
+
+/// X-J: Derive the per-node signing keys for the active deployment mode.
+///
+/// * `Distributed`: read TPM-sealed seed for the local slot only from
+///   `MILNET_KT_SIGNER_<i>_SEAL` (32-byte hex) and refuse to derive any
+///   other slot's key.
+/// * `Single`: synthesise all 5 keys from the master KEK (legacy path).
+///   Emits STARTUP CRITICAL via `tracing::error!` and is the only path
+///   that retains the prior single-host derivation behaviour.
+pub fn try_synthesize_signing_keys(
+    mode: KtDeploymentMode,
+) -> Result<Vec<Option<pq_sign::PqSigningKey>>, KtKeyError> {
     use hkdf::Hkdf;
     use sha2::Sha512;
     use zeroize::Zeroize;
 
-    let standalone = std::env::var("MILNET_KT_STANDALONE").as_deref() == Ok("1")
-        || std::env::var("MILNET_KT_NODE_INDEX").is_ok();
-    let local_slot: Option<usize> = std::env::var("MILNET_KT_NODE_INDEX")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok());
-
     let mut keys: Vec<Option<pq_sign::PqSigningKey>> = (0..KT_NODES).map(|_| None).collect();
     let test_mode = cfg!(test);
 
-    for slot in 0..KT_NODES {
-        if standalone && Some(slot) != local_slot {
-            continue;
+    match mode {
+        KtDeploymentMode::Distributed => {
+            let local_slot: usize = std::env::var("MILNET_KT_NODE_INDEX")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .ok_or(KtKeyError::NodeIndexMissing)?;
+            if local_slot >= KT_NODES {
+                return Err(KtKeyError::NodeIndexMissing);
+            }
+            let env = format!("MILNET_KT_SIGNER_{}_SEAL", local_slot);
+            let hex_seed = std::env::var(&env)
+                .map_err(|_| KtKeyError::SealMissing(local_slot))?;
+            let mut seed = [0u8; 32];
+            let raw = hex::decode(hex_seed.trim()).map_err(|e| KtKeyError::SealMalformed {
+                slot: local_slot,
+                detail: format!("hex: {e}"),
+            })?;
+            if raw.len() != 32 {
+                return Err(KtKeyError::SealMalformed {
+                    slot: local_slot,
+                    detail: format!("expected 32 bytes, got {}", raw.len()),
+                });
+            }
+            seed.copy_from_slice(&raw);
+            let kp = MlDsa87::from_seed(&seed.into());
+            seed.zeroize();
+            keys[local_slot] = Some(kp.signing_key().clone());
+            tracing::info!(
+                slot = local_slot,
+                "KT distributed mode: loaded local signer seed from {env} (TPM-sealed)"
+            );
         }
-        let mut seed = [0u8; 32];
-        if test_mode {
-            use sha2::Digest;
-            let h = Sha512::digest(format!("TEST-KT-SLOT-{}", slot).as_bytes());
-            seed.copy_from_slice(&h[..32]);
-        } else {
-            let kek = common::sealed_keys::cached_master_kek();
-            let hk = Hkdf::<Sha512>::new(Some(b"MILNET-KT-NODE-SIGN-v1"), kek);
-            let info = format!("kt-node-signing-{}", slot);
-            hk.expand(info.as_bytes(), &mut seed)
-                .expect("HKDF expand for KT node signing seed");
+        KtDeploymentMode::Single => {
+            // STARTUP CRITICAL — the security property ("2-of-5 quorum") is
+            // forfeit until each slot moves to its own host.
+            tracing::error!(
+                target: "siem",
+                severity = "CRITICAL",
+                action = "kt_consensus.single_host_mode_not_for_production",
+                "{}",
+                SINGLE_MODE_CRITICAL_LOG
+            );
+            for slot in 0..KT_NODES {
+                let mut seed = [0u8; 32];
+                if test_mode {
+                    use sha2::Digest;
+                    let h = Sha512::digest(format!("TEST-KT-SLOT-{}", slot).as_bytes());
+                    seed.copy_from_slice(&h[..32]);
+                } else {
+                    let kek = common::sealed_keys::cached_master_kek();
+                    let hk = Hkdf::<Sha512>::new(Some(b"MILNET-KT-NODE-SIGN-v1"), kek);
+                    let info = format!("kt-node-signing-{}", slot);
+                    hk.expand(info.as_bytes(), &mut seed)
+                        .expect("HKDF expand for KT node signing seed");
+                }
+                let kp = MlDsa87::from_seed(&seed.into());
+                seed.zeroize();
+                keys[slot] = Some(kp.signing_key().clone());
+            }
         }
-        let kp = MlDsa87::from_seed(&seed.into());
-        seed.zeroize();
-        keys[slot] = Some(kp.signing_key().clone());
     }
-    keys
+    Ok(keys)
+}
+
+/// X-J: Convenience wrapper that selects the deployment mode and derives
+/// the keys, exiting fatally on any configuration violation. This is the
+/// only entry point the binary should call at startup; tests should call
+/// `try_synthesize_signing_keys` directly with an explicit mode so they
+/// can assert the error variants.
+pub fn synthesize_signing_keys() -> Vec<Option<pq_sign::PqSigningKey>> {
+    let mode = match select_deployment_mode() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!(
+                target: "siem",
+                severity = "CRITICAL",
+                action = "kt_consensus.deployment_mode_invalid",
+                "FATAL: KT deployment mode invalid: {e}"
+            );
+            std::process::exit(198);
+        }
+    };
+    match try_synthesize_signing_keys(mode) {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!(
+                target: "siem",
+                severity = "CRITICAL",
+                action = "kt_consensus.signer_keys_unavailable",
+                "FATAL: KT signer keys unavailable: {e}"
+            );
+            std::process::exit(198);
+        }
+    }
 }
 
 /// A single signer-slot signature over the leaf canonical bytes.

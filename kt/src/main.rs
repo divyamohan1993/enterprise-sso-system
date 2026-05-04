@@ -48,6 +48,12 @@ struct KtLeafRecord {
 }
 
 /// Requests handled by the Key Transparency service.
+// TODO(Phase 4): per `kt.md` P1-1/P1-2 the wire surface must grow to expose
+// `GetSth` / `GetProof` / `GetConsistency` so external auditors can pull
+// signed tree heads, inclusion proofs, and consistency proofs without
+// reading the host's filesystem. The X-J landing here covers on-load STH
+// verification only; the request-handler additions are deliberately out of
+// scope for this fix.
 #[derive(Debug, Serialize, Deserialize)]
 enum KtRequest {
     AppendOp {
@@ -380,40 +386,12 @@ fn load_leaf_records(path: &Path) -> Vec<KtLeafRecord> {
 // postcard).
 // ---------------------------------------------------------------------------
 
-/// Serde helper for `[u8; 64]` — serde only supports arrays up to 32 natively.
-mod byte_array_64 {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-    pub fn serialize<S: Serializer>(data: &[u8; 64], ser: S) -> Result<S::Ok, S::Error> {
-        data.as_slice().serialize(ser)
-    }
-    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<[u8; 64], D::Error> {
-        let v: Vec<u8> = Vec::deserialize(de)?;
-        v.try_into().map_err(|v: Vec<u8>| {
-            serde::de::Error::custom(format!("expected 64 bytes, got {}", v.len()))
-        })
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedSth {
-    tree_size: u64,
-    #[serde(with = "byte_array_64")]
-    root: [u8; 64],
-    timestamp: i64,
-    /// ML-DSA-87 signature over
-    /// (epoch_id || tree_size || root || timestamp || prev_sth_hash), all
-    /// encoded big-endian. The epoch id binds the signature to the current
-    /// KT signing epoch so a signature captured under one epoch cannot be
-    /// replayed against STHs from a later epoch (D16).
-    signature: Vec<u8>,
-    /// Hash of the previous STH for RFC 6962-style consistency chaining.
-    #[serde(with = "byte_array_64")]
-    prev_sth_hash: [u8; 64],
-    /// KT signing epoch id under which this STH was signed. Default 0 for
-    /// legacy records produced before D16 rolled out.
-    #[serde(default)]
-    epoch_id: u64,
-}
+// X-J: STH log structures + on-load verifier live in `kt::sth_log` so
+// integration tests can exercise the verifier without running the binary.
+use kt::sth_log::{
+    append_sth_record, hash_sth, load_pinned_sth_signer_pubs, verify_sth_log, PersistedSth,
+    SthVerifyError,
+};
 
 /// D16: KT signing epoch metadata. A fresh ML-DSA-87 signing key is loaded
 /// once per 24h window from the sealed secret store under the name
@@ -528,76 +506,38 @@ fn load_kt_signing_epoch(epoch_id: u64) -> KtSigningEpoch {
     }
 }
 
-fn append_sth_record(path: &Path, sth: &PersistedSth) -> std::io::Result<()> {
-    use std::io::Write;
-    let encoded = postcard::to_allocvec(sth)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let len = encoded.len() as u32;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
-    }
-    file.write_all(&len.to_le_bytes())?;
-    file.write_all(&encoded)?;
-    file.sync_all()?;
-    drop(file);
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
-    Ok(())
-}
-
-fn hash_sth(sth: &PersistedSth) -> [u8; 64] {
-    use sha2::{Digest, Sha512};
-    let mut h = Sha512::new();
-    h.update(b"MILNET-KT-STH-v2");
-    h.update(sth.epoch_id.to_be_bytes());
-    h.update(sth.tree_size.to_be_bytes());
-    h.update(sth.root);
-    h.update(sth.timestamp.to_be_bytes());
-    h.update(sth.prev_sth_hash);
-    let r = h.finalize();
-    let mut out = [0u8; 64];
-    out.copy_from_slice(&r);
-    out
-}
-
-fn load_last_sth_hash(path: &Path) -> [u8; 64] {
-    let data = match std::fs::read(path) {
-        Ok(d) => d,
-        Err(_) => return [0u8; 64],
-    };
-    let mut last_hash = [0u8; 64];
-    let mut offset = 0usize;
-    while offset + 4 <= data.len() {
-        let n = u32::from_le_bytes(match data[offset..offset + 4].try_into() {
-            Ok(b) => b,
-            Err(_) => break,
-        }) as usize;
-        offset += 4;
-        if n > KT_MAX_MSG {
+/// X-J: Walk the STH log, verify every persisted STH against the pinned
+/// signer pubkey set, and return the chain hash of the LAST verified STH.
+/// Any verification failure is fatal — a chain we cannot trust must not
+/// advance the local view. Wraps `kt::sth_log::verify_sth_log` so the
+/// fatal-exit policy lives next to the rest of the service's startup
+/// SIEM emission.
+fn load_last_sth_hash(
+    path: &Path,
+    pinned_vks: &[crypto::pq_sign::PqVerifyingKey],
+) -> [u8; 64] {
+    let military = std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1");
+    match verify_sth_log(path, pinned_vks, military) {
+        Ok(h) => h,
+        Err(e) => {
+            let action = match &e {
+                SthVerifyError::Io(_) => "state_chain.sth_log_io_failure",
+                SthVerifyError::Oversize { .. } => "state_chain.sth_log_oversize",
+                SthVerifyError::Decode { .. } => "state_chain.sth_decode_failed",
+                SthVerifyError::ChainBreak { .. } => "state_chain.sth_chain_break",
+                SthVerifyError::BadSignature { .. } => "state_chain.sth_verification_failed",
+                SthVerifyError::NoPinnedKeys => "state_chain.sth_verification_failed",
+            };
             tracing::error!(
-                "SIEM:CRITICAL KT STH log: length prefix {} exceeds max {} at offset {} — rejecting",
-                n, KT_MAX_MSG, offset - 4
+                target: "siem",
+                severity = "CRITICAL",
+                action,
+                "FATAL: KT STH log verification failed: {} -- refusing to advance",
+                e
             );
-            break;
+            std::process::exit(196);
         }
-        if offset + n > data.len() {
-            break;
-        }
-        if let Ok(sth) = postcard::from_bytes::<PersistedSth>(&data[offset..offset + n]) {
-            last_hash = hash_sth(&sth);
-        }
-        offset += n;
     }
-    last_hash
 }
 
 /// Ensure a directory exists, creating it (with parents) if needed.
@@ -892,9 +832,22 @@ async fn main() {
         }
     }
 
-    // ── D12: STH log + previous STH hash for chaining ───────────────────
+    // ── D12 / X-J: STH log + previous STH hash, with on-load signature
+    // verification against the pinned STH-signer pubkey set.
     let sth_log_path = data_dir.join("kt_sth.log");
-    let last_sth_hash_init = load_last_sth_hash(&sth_log_path);
+    let pinned_sth_vks = load_pinned_sth_signer_pubs();
+    if pinned_sth_vks.is_empty() {
+        tracing::info!(
+            "kt: no MILNET_KT_SIGNER_PUBS set; STH signature verification on load is \
+             best-effort (allowed only outside MILNET_MILITARY_DEPLOYMENT=1)"
+        );
+    } else {
+        tracing::info!(
+            "kt: loaded {} pinned STH signer verifying keys for X-J on-load verification",
+            pinned_sth_vks.len()
+        );
+    }
+    let last_sth_hash_init = load_last_sth_hash(&sth_log_path, &pinned_sth_vks);
     let last_sth_hash: Arc<tokio::sync::Mutex<[u8; 64]>> =
         Arc::new(tokio::sync::Mutex::new(last_sth_hash_init));
 

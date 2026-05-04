@@ -4,3 +4,4 @@
 pub mod auditor;
 pub mod consensus;
 pub mod merkle;
+pub mod sth_log;
