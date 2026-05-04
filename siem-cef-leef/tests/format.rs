@@ -1,10 +1,9 @@
 use siem_cef_leef::*;
-use std::collections::BTreeMap;
 
 fn sample() -> SecurityEvent {
-    let mut ext = BTreeMap::new();
-    ext.insert("src".into(), "10.0.0.1".into());
-    ext.insert("suser".into(), "alice".into());
+    let mut ext = ExtensionMap::new();
+    ext.insert("src", "10.0.0.1").unwrap();
+    ext.insert("suser", "alice").unwrap();
     SecurityEvent {
         vendor: "MILNET".into(),
         product: "SSO".into(),
@@ -18,7 +17,7 @@ fn sample() -> SecurityEvent {
 
 #[test]
 fn cef_header_shape() {
-    let s = format_cef(&sample());
+    let s = format_cef(&sample()).unwrap();
     assert!(s.starts_with("CEF:0|MILNET|SSO|0.1.0|AUTH_FAIL|Authentication failed|7|"));
     assert!(s.contains("src=10.0.0.1"));
 }
@@ -27,13 +26,13 @@ fn cef_header_shape() {
 fn cef_escapes_pipe_in_header() {
     let mut ev = sample();
     ev.product = "S|SO".into();
-    let s = format_cef(&ev);
+    let s = format_cef(&ev).unwrap();
     assert!(s.contains(r"S\|SO"));
 }
 
 #[test]
 fn leef_v2_shape() {
-    let s = format_leef(&sample());
+    let s = format_leef(&sample()).unwrap();
     assert!(s.starts_with("LEEF:2.0|MILNET|SSO|0.1.0|AUTH_FAIL|^|"));
     assert!(s.contains("sev=7"));
 }
