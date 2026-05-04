@@ -398,8 +398,27 @@ impl JointConfig {
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 /// Generate a random election timeout duration using `getrandom`.
+///
 /// Uses rejection sampling to avoid modulo bias.
-fn random_election_timeout(min_ms: u64, max_ms: u64) -> Duration {
+///
+/// **Why deterministic fallback is forbidden** — Raft's safety relies on
+/// election timeouts being independently random per node. If two nodes
+/// time out simultaneously they split-vote and the term advances without
+/// a leader; with adversarial scheduling this can repeat indefinitely
+/// (livelock). A deterministic fallback such as `[42; 8]` makes every
+/// node fire on the same schedule under entropy stress, guaranteeing
+/// the split-vote pathology rather than tolerating it.
+///
+/// Therefore on `getrandom` failure we propagate
+/// `MilnetError::EntropyExhausted` to the caller. Callers MUST refuse
+/// to reset the election timer on this error and refuse to participate
+/// in elections until entropy is restored (and the underlying DRBG is
+/// re-seeded — that recovery happens at a higher layer that has access
+/// to `crypto::drbg`, since `common` cannot depend on `crypto`).
+fn random_election_timeout(
+    min_ms: u64,
+    max_ms: u64,
+) -> Result<Duration, crate::error::MilnetError> {
     let range = max_ms - min_ms;
     debug_assert!(range > 0, "election timeout range must be positive");
     // Rejection sampling: find the largest multiple of `range` that fits in u64,
@@ -408,13 +427,12 @@ fn random_election_timeout(min_ms: u64, max_ms: u64) -> Duration {
     let limit = bucket_size * range;
     loop {
         let mut buf = [0u8; 8];
-        getrandom::getrandom(&mut buf).unwrap_or_else(|_| {
-            buf = [42; 8];
-        });
+        getrandom::getrandom(&mut buf)
+            .map_err(|_| crate::error::MilnetError::EntropyExhausted)?;
         let sample = u64::from_le_bytes(buf);
         if sample < limit {
             let random = sample % range;
-            return Duration::from_millis(min_ms + random);
+            return Ok(Duration::from_millis(min_ms + random));
         }
     }
 }
@@ -865,6 +883,13 @@ pub struct RaftState {
     snapshot_last_included_index: u64,
     /// Term of the last entry included in the most recent snapshot.
     snapshot_last_included_term: u64,
+    /// Set when `random_election_timeout` returned
+    /// `MilnetError::EntropyExhausted`. While this is `true` the node
+    /// refuses to start pre-votes or elections — Raft safety requires
+    /// independent randomness per node, so a tainted entropy source must
+    /// halt election participation rather than fall back to deterministic
+    /// timeouts (X-U).
+    entropy_tainted: bool,
 }
 
 impl RaftState {
@@ -903,10 +928,32 @@ impl RaftState {
         log_persistence: Box<dyn RaftLogPersistence>,
         snapshot_persistence: Box<dyn RaftSnapshotPersistence>,
     ) -> Self {
-        let timeout = random_election_timeout(
+        // X-U: entropy failure at construction means we cannot generate an
+        // independent election deadline. We mark the node tainted and fall
+        // back to a *bounded* deadline of `max_ms` from now — the same value
+        // every tainted node would compute, but the tainted flag prevents
+        // the node from ever transitioning to Candidate, so the deterministic
+        // deadline is harmless. A higher layer is responsible for attempting
+        // a DRBG reseed and restarting the node when entropy is restored.
+        let (timeout, entropy_tainted) = match random_election_timeout(
             config.election_timeout_min_ms,
             config.election_timeout_max_ms,
-        );
+        ) {
+            Ok(t) => (t, false),
+            Err(_) => {
+                tracing::error!(
+                    target: "siem",
+                    node = %node_id,
+                    severity = "CRITICAL",
+                    action = "raft.entropy_exhausted_at_init",
+                    "SIEM:CRITICAL OS entropy unavailable at Raft init — node \
+                     marked entropy_tainted; refuses to participate in elections \
+                     until restarted. Operator: investigate getrandom() / kernel \
+                     entropy pool / RDRAND availability."
+                );
+                (Duration::from_millis(config.election_timeout_max_ms), true)
+            }
+        };
 
         let (recovered_term, recovered_voted_for) = persistence
             .recover_state()
@@ -978,7 +1025,16 @@ impl RaftState {
             last_snapshot: recovered_snapshot,
             snapshot_last_included_index: snap_index,
             snapshot_last_included_term: snap_term,
+            entropy_tainted,
         }
+    }
+
+    /// Returns `true` if a previous call to `random_election_timeout`
+    /// returned `MilnetError::EntropyExhausted`. While tainted, this node
+    /// refuses to start pre-votes or elections; the operator must restart
+    /// the node after entropy is restored.
+    pub fn is_entropy_tainted(&self) -> bool {
+        self.entropy_tainted
     }
 
     /// Set this node's ML-DSA-87 signing key for entry-level signatures.
@@ -1087,6 +1143,11 @@ impl RaftState {
         match self.role {
             RaftRole::Leader => self.send_heartbeats(),
             RaftRole::Follower | RaftRole::Candidate => {
+                if self.entropy_tainted {
+                    // X-U: refuse to start any new election while entropy is
+                    // tainted; deterministic fallback timeouts would split-vote.
+                    return Vec::new();
+                }
                 if Instant::now() >= self.election_deadline {
                     tracing::info!(
                         node = %self.node_id,
@@ -1325,6 +1386,11 @@ impl RaftState {
 
     /// Start the pre-vote phase: propose term+1 without actually incrementing.
     fn start_pre_vote(&mut self) -> Vec<(NodeId, RaftMessage)> {
+        if self.entropy_tainted {
+            // X-U: defence-in-depth — `tick` already gates this, but a
+            // direct caller (e.g. test harness) must also be refused.
+            return Vec::new();
+        }
         self.in_pre_vote = true;
         self.pre_votes_received.clear();
         // Count our own pre-vote.
@@ -1451,12 +1517,34 @@ impl RaftState {
     // ── Private: election ──────────────────────────────────────────────────
 
     /// Reset election timer to a new random deadline.
+    ///
+    /// X-U: on `EntropyExhausted`, mark the node tainted, log SIEM CRITICAL,
+    /// and leave the existing `election_deadline` untouched. The caller's
+    /// tick loop already gates election transitions on `entropy_tainted`,
+    /// so a stale deadline is harmless once tainted.
     fn reset_election_timer(&mut self) {
-        let timeout = random_election_timeout(
+        match random_election_timeout(
             self.config.election_timeout_min_ms,
             self.config.election_timeout_max_ms,
-        );
-        self.election_deadline = Instant::now() + timeout;
+        ) {
+            Ok(timeout) => {
+                self.election_deadline = Instant::now() + timeout;
+            }
+            Err(_) => {
+                if !self.entropy_tainted {
+                    tracing::error!(
+                        target: "siem",
+                        node = %self.node_id,
+                        severity = "CRITICAL",
+                        action = "raft.entropy_exhausted",
+                        "SIEM:CRITICAL OS entropy unavailable for Raft election timer \
+                         — node marked entropy_tainted; refuses to start new pre-votes \
+                         or elections until restarted (X-U)."
+                    );
+                }
+                self.entropy_tainted = true;
+            }
+        }
     }
 
     /// Start a new election: increment term, vote for self, solicit votes.
@@ -3329,5 +3417,71 @@ mod tests {
         let committed = node.take_committed();
         assert_eq!(committed.len(), 1);
         std::env::remove_var("MILNET_RAFT_SNAPSHOT_THRESHOLD");
+    }
+
+    // ── X-U regression — entropy-tainted Raft refuses to vote ─────────────
+
+    /// Regression for `common/src/raft.rs:411-413` — `random_election_timeout`
+    /// previously fell back to a deterministic `[42; 8]` on `getrandom`
+    /// failure, producing identical timeouts across every tainted node and
+    /// guaranteeing split-vote livelock under entropy stress. With the X-U
+    /// fix, the function returns `MilnetError::EntropyExhausted` and the
+    /// node enters `entropy_tainted` mode where elections are refused.
+    #[test]
+    fn entropy_exhausted_marks_node_tainted_and_blocks_elections() {
+        let (mut n1, _n2, _n3) = make_three_nodes();
+        // Node starts healthy.
+        assert!(!n1.is_entropy_tainted());
+
+        // Simulate `EntropyExhausted` propagation by directly setting the
+        // tainted flag. (We cannot fault-inject `getrandom` from a Rust
+        // unit test without LD_PRELOAD; this in-module test exercises the
+        // post-failure behaviour, which is the security-load-bearing
+        // half. The entropy-failure path itself is exercised via type-
+        // system: `random_election_timeout` returns `Result` and the
+        // only `Err` branch sets this flag.)
+        n1.entropy_tainted = true;
+
+        // Force the election deadline into the past — a healthy node
+        // would immediately start a pre-vote. A tainted node must not.
+        n1.election_deadline = Instant::now() - Duration::from_secs(1);
+        let messages = n1.tick();
+        assert!(
+            messages.is_empty(),
+            "X-U regression: tainted node tick must produce no messages, \
+             got {} messages",
+            messages.len()
+        );
+    }
+
+    #[test]
+    fn entropy_exhausted_blocks_direct_pre_vote() {
+        let (mut n1, _n2, _n3) = make_three_nodes();
+        n1.entropy_tainted = true;
+
+        let messages = n1.start_pre_vote();
+        assert!(
+            messages.is_empty(),
+            "X-U regression: start_pre_vote must refuse when entropy is \
+             tainted (defence-in-depth — `tick` already gates this, but \
+             a direct caller must also be refused)"
+        );
+        // The internal pre-vote bookkeeping must NOT have advanced.
+        assert!(!n1.in_pre_vote);
+    }
+
+    #[test]
+    fn healthy_random_election_timeout_returns_value_in_range() {
+        // Smoke: the happy path still works after the signature change.
+        for _ in 0..256 {
+            let dur = random_election_timeout(1500, 3000)
+                .expect("getrandom is available in CI");
+            let ms = dur.as_millis() as u64;
+            assert!(
+                (1500..3000).contains(&ms),
+                "election timeout {} ms outside [1500, 3000)",
+                ms
+            );
+        }
     }
 }

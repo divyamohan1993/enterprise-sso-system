@@ -76,6 +76,9 @@ pub enum MilnetError {
 
     #[error("KEK reconstruction failed: {0}")]
     KekReconstruction(String),
+
+    #[error("OS entropy unavailable — refusing to fall back to deterministic randomness (X-U)")]
+    EntropyExhausted,
 }
 
 impl MilnetError {
