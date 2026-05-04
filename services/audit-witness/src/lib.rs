@@ -35,6 +35,7 @@ pub enum WitnessSeqError {
 /// Persisted sequence state. The chain is append-only with each record's
 /// `chain_after = SHA-256(prev_chain || seq_be || hash)`. On open() the chain
 /// is recomputed end-to-end and any mismatch fails closed (Corrupt).
+#[derive(Debug)]
 pub struct WitnessSeqState {
     last_seq: Option<u64>,
     last_chain: [u8; 32],
