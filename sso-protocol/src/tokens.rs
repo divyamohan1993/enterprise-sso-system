@@ -12,8 +12,17 @@ use zeroize::Zeroize;
 
 /// Trait for pluggable JTI replay storage backends.
 ///
-/// Implementations must be safe to call from synchronous contexts (the default
-/// in-memory cache) or async contexts (the database-backed store).
+/// **DEPRECATED for `DatabaseJtiStore` paths.** The sync trait cannot
+/// safely call into a sqlx pool from inside an existing tokio runtime
+/// (it panics with "Cannot start a runtime from within a runtime"). The
+/// pre-fix `block_on` workaround also failed open on any DB error,
+/// allowing replayed JTIs through during brief Postgres outages.
+///
+/// New callers should use [`AsyncJtiReplayStore`]. The sync trait is
+/// retained for `LocalJtiStore` (which has no async dependencies) and
+/// for source-compatibility while the workspace migrates; on
+/// `DatabaseJtiStore` it now fails CLOSED (denies the request) and
+/// emits a SIEM CRITICAL `jti_store.db_failure` audit event (X-G).
 pub trait JtiReplayStore: Send + Sync {
     /// Mark a JTI as used with its expiry timestamp.
     /// Returns `Ok(true)` if the JTI was freshly inserted (not a replay).
@@ -123,78 +132,228 @@ impl DatabaseJtiStore {
     }
 }
 
+/// X-G: emit a SIEM CRITICAL audit event for a JTI store failure.
+///
+/// The function constructs a synthetic `AuditEntry` describing the
+/// failure and routes it through `common::audit_bridge::buffer_audit_entry`.
+/// This is the canonical observability surface — the event reaches the
+/// BFT audit chain via the periodic sweep, regardless of whether the
+/// caller has access to a SIEM emitter directly.
+fn emit_jti_db_failure_audit(jti: &str, reason: &str) {
+    use common::types::{AuditEntry, AuditEventType};
+    use uuid::Uuid;
+
+    tracing::error!(
+        target: "siem",
+        category = "jti_store",
+        action = "jti_store.db_failure",
+        severity = "CRITICAL",
+        jti = jti,
+        reason = reason,
+        "SIEM:CRITICAL JTI store database failure — failing closed (treating \
+         JTI as already-used) to refuse the request. X-G: a fail-open here \
+         allows replayed tokens to be accepted across instances."
+    );
+
+    let entry = AuditEntry {
+        event_id: Uuid::new_v4(),
+        event_type: AuditEventType::SystemDegraded,
+        user_ids: Vec::new(),
+        device_ids: Vec::new(),
+        ceremony_receipts: Vec::new(),
+        risk_score: 1.0,
+        classification: 0,
+        timestamp: common::secure_time::secure_now_secs_i64(),
+        prev_hash: [0u8; 64],
+        signature: Vec::new(),
+        correlation_id: None,
+        trace_id: None,
+        source_ip: None,
+        session_id: None,
+        request_id: Some(format!("jti_store.db_failure:{jti}")),
+        user_agent: Some(format!("reason={reason}")),
+    };
+    common::audit_bridge::buffer_audit_entry(entry);
+}
+
 impl JtiReplayStore for DatabaseJtiStore {
+    /// **DEPRECATED sync path** — calling this from inside an async
+    /// runtime previously panicked (`Cannot start a runtime from within
+    /// a runtime`). The fail-open `unwrap_or(false)` was also a critical
+    /// security regression: a brief Postgres outage let attackers replay
+    /// captured ID tokens against any sibling instance whose L1 cache
+    /// did not already hold the JTI.
+    ///
+    /// X-G: until callers migrate to [`AsyncJtiReplayStore`], the sync
+    /// path returns `Ok(true)` (treats the JTI as already-used) on any
+    /// path that would otherwise need to touch the DB, and emits a
+    /// SIEM CRITICAL `jti_store.db_failure` audit event. This is
+    /// fail-closed: legitimate requests fail temporarily, but no
+    /// replayed token is ever accepted.
     fn mark_used(&self, jti: &str, expires_at: i64) -> Result<bool, String> {
-        // Check L1 cache first (fast path)
+        // L1 cache hit means we already saw this JTI in-process —
+        // returning `Ok(false)` (not fresh, replay) is correct without
+        // touching the DB.
         if self.local.is_used(jti) {
             return Ok(false);
         }
 
-        // Write-through to database using a blocking spawn since we are in sync context.
-        // Use INSERT ... ON CONFLICT to atomically check+insert.
-        let pool = self.pool.clone();
-        let jti_owned = jti.to_string();
-        let db_result = std::thread::scope(|_| {
-            // Build a minimal tokio runtime for the blocking DB call
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| format!("tokio runtime: {e}"))?;
-            rt.block_on(async {
-                let result = sqlx::query(
-                    "INSERT INTO jti_replay (jti, expires_at) VALUES ($1, $2) \
-                     ON CONFLICT (jti) DO NOTHING"
-                )
-                .bind(&jti_owned)
-                .bind(expires_at)
-                .execute(&pool)
-                .await
-                .map_err(|e| format!("insert jti_replay: {e}"))?;
-                // rows_affected == 1 means fresh insert, 0 means conflict (replay)
-                Ok::<bool, String>(result.rows_affected() == 1)
-            })
-        });
-
-        let was_fresh = db_result?;
-        if was_fresh {
-            // Update L1 cache
-            if let Err(e) = self.local.mark_used(jti, expires_at) {
-                tracing::error!(
-                    target: "siem",
-                    "SECURITY: JTI L1 cache mark_used failed for jti={}: {}. \
-                     Token replay via L1 cache bypass possible. DB L2 is authoritative.",
-                    jti, e
-                );
-            }
-        }
-        Ok(was_fresh)
+        // Sync DB call would require nested tokio runtime → panic. Until
+        // the caller migrates to AsyncJtiReplayStore, refuse to certify
+        // freshness without the L2 check. Fail-closed: pretend the JTI
+        // is already used so the verifier rejects the request.
+        emit_jti_db_failure_audit(
+            jti,
+            "sync DatabaseJtiStore::mark_used called — migrate caller to AsyncJtiReplayStore",
+        );
+        // Returning `Ok(false)` on the sync path means "not fresh" =
+        // request will be rejected with "JTI replay detected", which is
+        // the fail-closed posture for this layer. The duplicate `expires_at`
+        // is intentionally unused because we are not certifying anything.
+        let _ = expires_at;
+        Ok(false)
     }
 
     fn is_used(&self, jti: &str) -> bool {
-        // Check L1 first
         if self.local.is_used(jti) {
             return true;
         }
-        // Fall through to DB
-        let pool = self.pool.clone();
-        let jti_owned = jti.to_string();
-        std::thread::scope(|_| {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .ok();
-            rt.map(|rt| {
-                rt.block_on(async {
-                    sqlx::query_scalar::<_, i64>(
-                        "SELECT COUNT(*) FROM jti_replay WHERE jti = $1"
-                    )
-                    .bind(&jti_owned)
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap_or(0) > 0
-                })
-            })
-            .unwrap_or(false)
+        // X-G: fail-closed — assume the JTI IS used, force the caller
+        // to reject the request rather than risk replay against a
+        // sibling instance whose L1 happens to be cold.
+        emit_jti_db_failure_audit(
+            jti,
+            "sync DatabaseJtiStore::is_used called — migrate caller to AsyncJtiReplayStore",
+        );
+        true
+    }
+}
+
+// ---------------------------------------------------------------------------
+// X-G: Async JTI replay store
+//
+// The sync `JtiReplayStore` trait above panics when its `DatabaseJtiStore`
+// implementation tries to spin up a nested tokio runtime from inside an
+// existing async runtime, and previously failed open on every DB error.
+// `AsyncJtiReplayStore` exposes the database path correctly via native
+// async fn in trait (Rust 1.75+), and any DB error converts to a
+// fail-closed `Ok(true)` so the verifier rejects the request and emits
+// a SIEM CRITICAL `jti_store.db_failure` audit event.
+// ---------------------------------------------------------------------------
+
+/// Async-correct JTI replay store. Use this from any code path that
+/// already has a tokio runtime available — the legacy sync trait
+/// fails closed when called against a `DatabaseJtiStore` and is being
+/// phased out.
+pub trait AsyncJtiReplayStore: Send + Sync {
+    /// Mark a JTI as used. Returns `Ok(true)` if freshly inserted.
+    /// On any DB error, returns `Ok(false)` (fail-closed: refuse to
+    /// certify freshness; the caller will treat this as a replay) and
+    /// emits a SIEM CRITICAL `jti_store.db_failure` event.
+    fn mark_used<'a>(
+        &'a self,
+        jti: &'a str,
+        expires_at: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + 'a>>;
+
+    /// Check whether a JTI has already been used. Fails closed: any DB
+    /// error returns `true` (denying the request) and emits SIEM CRITICAL.
+    fn is_used<'a>(
+        &'a self,
+        jti: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
+}
+
+impl AsyncJtiReplayStore for LocalJtiStore {
+    fn mark_used<'a>(
+        &'a self,
+        jti: &'a str,
+        expires_at: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            <LocalJtiStore as JtiReplayStore>::mark_used(self, jti, expires_at)
+        })
+    }
+
+    fn is_used<'a>(
+        &'a self,
+        jti: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move { <LocalJtiStore as JtiReplayStore>::is_used(self, jti) })
+    }
+}
+
+impl AsyncJtiReplayStore for DatabaseJtiStore {
+    fn mark_used<'a>(
+        &'a self,
+        jti: &'a str,
+        expires_at: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            // L1 hit — replay, no DB roundtrip.
+            if self.local.is_used(jti) {
+                return Ok(false);
+            }
+
+            // Atomic check+insert via INSERT ... ON CONFLICT DO NOTHING.
+            // X-G: any sqlx::Error here is fail-closed (treat as replay)
+            // PLUS emit SIEM CRITICAL jti_store.db_failure.
+            let result = match sqlx::query(
+                "INSERT INTO jti_replay (jti, expires_at) VALUES ($1, $2) \
+                 ON CONFLICT (jti) DO NOTHING",
+            )
+            .bind(jti)
+            .bind(expires_at)
+            .execute(&self.pool)
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    emit_jti_db_failure_audit(jti, &format!("insert: {e}"));
+                    // Fail-closed: return Ok(false) ("not fresh" =
+                    // verifier rejects with "JTI replay detected").
+                    return Ok(false);
+                }
+            };
+            let was_fresh = result.rows_affected() == 1;
+
+            if was_fresh {
+                if let Err(e) = self.local.mark_used(jti, expires_at) {
+                    tracing::warn!(
+                        target: "siem",
+                        "JTI L1 cache mark_used failed for jti={jti}: {e}. \
+                         DB L2 is authoritative; fail-closed posture preserved."
+                    );
+                }
+            }
+            Ok(was_fresh)
+        })
+    }
+
+    fn is_used<'a>(
+        &'a self,
+        jti: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            if self.local.is_used(jti) {
+                return true;
+            }
+            match sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM jti_replay WHERE jti = $1",
+            )
+            .bind(jti)
+            .fetch_one(&self.pool)
+            .await
+            {
+                Ok(count) => count > 0,
+                Err(e) => {
+                    emit_jti_db_failure_audit(jti, &format!("count: {e}"));
+                    // Fail-closed: assume used (deny the request).
+                    true
+                }
+            }
         })
     }
 }
