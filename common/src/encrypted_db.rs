@@ -48,12 +48,12 @@ impl EncryptedPool {
 
     /// Apply `mlock` + `MADV_DONTDUMP` to the master KEK at its current
     /// (pinned) live address. Idempotent.
+    #[allow(unsafe_code)]
     pub fn lock_in_place(self: Pin<&mut Self>) {
         // SAFETY: We do not move `master_kek` out of `self`. We only
         // apply mlock/madvise to its in-place address.
         let this: &mut Self = unsafe { self.get_unchecked_mut() };
         #[cfg(unix)]
-        #[allow(unsafe_code)]
         unsafe {
             let ptr = this.master_kek.as_ptr();
             let len = this.master_kek.len();

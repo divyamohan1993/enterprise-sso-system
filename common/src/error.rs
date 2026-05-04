@@ -159,6 +159,15 @@ impl MilnetError {
             MilnetError::OidcNonceMismatch => {
                 "Authentication failed due to a security check. Please try again."
             }
+            MilnetError::CorruptedKekShare => {
+                "A key-share integrity check failed. Contact your administrator immediately."
+            }
+            MilnetError::KekReconstruction(_) => {
+                "Key reconstruction failed. Contact your administrator immediately."
+            }
+            MilnetError::EntropyExhausted => {
+                "System entropy is exhausted. Operations are paused for safety until hardware RNG recovers."
+            }
         }
     }
 }
