@@ -1782,6 +1782,27 @@ pub fn test_state() -> Arc<AsState> {
 pub const TEST_SESSION_HEADER: &str = "session-test-1";
 
 #[cfg(any(test, feature = "test-util"))]
+pub const TEST_CLIENT_ID: &str = "test-client";
+
+#[cfg(any(test, feature = "test-util"))]
+pub const TEST_CLIENT_SECRET: &str = "test-secret";
+
+/// Idempotent DRBG bootstrap for test harnesses.  Returns Ok on first call;
+/// subsequent calls are silently ignored (the OnceLock has already been set).
+#[cfg(any(test, feature = "test-util"))]
+pub fn ensure_drbg_init() {
+    let _ = init_drbg();
+    common::secure_time::init_time_anchor();
+}
+
+/// Drain and return the buffered audit entries — a thin wrapper for tests so
+/// integration test crates do not need a direct `common` dev-dep.
+#[cfg(any(test, feature = "test-util"))]
+pub fn drain_audit_count() -> usize {
+    common::audit_bridge::drain_audit_buffer().len()
+}
+
+#[cfg(any(test, feature = "test-util"))]
 pub fn pkce_pair() -> (String, String) {
     let mut buf = [0u8; 32];
     let _ = rand_bytes(&mut buf);

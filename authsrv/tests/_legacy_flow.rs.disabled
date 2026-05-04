@@ -1,3 +1,14 @@
+// TODO(Phase 7): this legacy harness depends on the killed
+// "anon-test-subject" demo path on /authorize.  Phase 7 (interactive
+// identity) will rewrite each scenario against a real OPAQUE+WebAuthn+CAC
+// session — the file is suffix-disabled here (extension is `.disabled`
+// rather than `.rs`) so cargo's test-target discovery skips it without
+// losing the historical golden flows.  See master plan §5 Phase 7.
+//
+// Until Phase 7 lands, the new integration test suite under
+// `authsrv/tests/*.rs` covers the hardening invariants for
+// authorize / token / introspect / revoke / end_session / userinfo.
+
 use authsrv::*;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
