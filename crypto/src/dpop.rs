@@ -32,8 +32,10 @@ pub struct GuardedSigningKey {
     /// The parsed ML-DSA-87 signing key used for actual signing operations.
     key: DpopSigningKey,
     /// Memory-locked sentinel — ensures the OS mlock covers the key's
-    /// memory pages and the material is zeroized on drop.
-    _locked_sentinel: Option<crate::memguard::SecretVec>,
+    /// memory pages and the material is zeroized on drop. Pin<Box<_>>
+    /// pins the heap address so SecretVec's mlock is applied to the
+    /// stable live address (X-A.2 fix).
+    _locked_sentinel: Option<Pin<Box<crate::memguard::SecretVec>>>,
 }
 
 impl GuardedSigningKey {
