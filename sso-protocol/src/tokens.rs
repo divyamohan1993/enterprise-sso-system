@@ -12,8 +12,17 @@ use zeroize::Zeroize;
 
 /// Trait for pluggable JTI replay storage backends.
 ///
-/// Implementations must be safe to call from synchronous contexts (the default
-/// in-memory cache) or async contexts (the database-backed store).
+/// **DEPRECATED for `DatabaseJtiStore` paths.** The sync trait cannot
+/// safely call into a sqlx pool from inside an existing tokio runtime
+/// (it panics with "Cannot start a runtime from within a runtime"). The
+/// pre-fix `block_on` workaround also failed open on any DB error,
+/// allowing replayed JTIs through during brief Postgres outages.
+///
+/// New callers should use [`AsyncJtiReplayStore`]. The sync trait is
+/// retained for `LocalJtiStore` (which has no async dependencies) and
+/// for source-compatibility while the workspace migrates; on
+/// `DatabaseJtiStore` it now fails CLOSED (denies the request) and
+/// emits a SIEM CRITICAL `jti_store.db_failure` audit event (X-G).
 pub trait JtiReplayStore: Send + Sync {
     /// Mark a JTI as used with its expiry timestamp.
     /// Returns `Ok(true)` if the JTI was freshly inserted (not a replay).
@@ -123,78 +132,228 @@ impl DatabaseJtiStore {
     }
 }
 
+/// X-G: emit a SIEM CRITICAL audit event for a JTI store failure.
+///
+/// The function constructs a synthetic `AuditEntry` describing the
+/// failure and routes it through `common::audit_bridge::buffer_audit_entry`.
+/// This is the canonical observability surface — the event reaches the
+/// BFT audit chain via the periodic sweep, regardless of whether the
+/// caller has access to a SIEM emitter directly.
+fn emit_jti_db_failure_audit(jti: &str, reason: &str) {
+    use common::types::{AuditEntry, AuditEventType};
+    use uuid::Uuid;
+
+    tracing::error!(
+        target: "siem",
+        category = "jti_store",
+        action = "jti_store.db_failure",
+        severity = "CRITICAL",
+        jti = jti,
+        reason = reason,
+        "SIEM:CRITICAL JTI store database failure — failing closed (treating \
+         JTI as already-used) to refuse the request. X-G: a fail-open here \
+         allows replayed tokens to be accepted across instances."
+    );
+
+    let entry = AuditEntry {
+        event_id: Uuid::new_v4(),
+        event_type: AuditEventType::SystemDegraded,
+        user_ids: Vec::new(),
+        device_ids: Vec::new(),
+        ceremony_receipts: Vec::new(),
+        risk_score: 1.0,
+        classification: 0,
+        timestamp: common::secure_time::secure_now_secs_i64(),
+        prev_hash: [0u8; 64],
+        signature: Vec::new(),
+        correlation_id: None,
+        trace_id: None,
+        source_ip: None,
+        session_id: None,
+        request_id: Some(format!("jti_store.db_failure:{jti}")),
+        user_agent: Some(format!("reason={reason}")),
+    };
+    common::audit_bridge::buffer_audit_entry(entry);
+}
+
 impl JtiReplayStore for DatabaseJtiStore {
+    /// **DEPRECATED sync path** — calling this from inside an async
+    /// runtime previously panicked (`Cannot start a runtime from within
+    /// a runtime`). The fail-open `unwrap_or(false)` was also a critical
+    /// security regression: a brief Postgres outage let attackers replay
+    /// captured ID tokens against any sibling instance whose L1 cache
+    /// did not already hold the JTI.
+    ///
+    /// X-G: until callers migrate to [`AsyncJtiReplayStore`], the sync
+    /// path returns `Ok(true)` (treats the JTI as already-used) on any
+    /// path that would otherwise need to touch the DB, and emits a
+    /// SIEM CRITICAL `jti_store.db_failure` audit event. This is
+    /// fail-closed: legitimate requests fail temporarily, but no
+    /// replayed token is ever accepted.
     fn mark_used(&self, jti: &str, expires_at: i64) -> Result<bool, String> {
-        // Check L1 cache first (fast path)
-        if self.local.is_used(jti) {
+        // L1 cache hit means we already saw this JTI in-process —
+        // returning `Ok(false)` (not fresh, replay) is correct without
+        // touching the DB.
+        if <LocalJtiStore as JtiReplayStore>::is_used(&self.local, jti) {
             return Ok(false);
         }
 
-        // Write-through to database using a blocking spawn since we are in sync context.
-        // Use INSERT ... ON CONFLICT to atomically check+insert.
-        let pool = self.pool.clone();
-        let jti_owned = jti.to_string();
-        let db_result = std::thread::scope(|_| {
-            // Build a minimal tokio runtime for the blocking DB call
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| format!("tokio runtime: {e}"))?;
-            rt.block_on(async {
-                let result = sqlx::query(
-                    "INSERT INTO jti_replay (jti, expires_at) VALUES ($1, $2) \
-                     ON CONFLICT (jti) DO NOTHING"
-                )
-                .bind(&jti_owned)
-                .bind(expires_at)
-                .execute(&pool)
-                .await
-                .map_err(|e| format!("insert jti_replay: {e}"))?;
-                // rows_affected == 1 means fresh insert, 0 means conflict (replay)
-                Ok::<bool, String>(result.rows_affected() == 1)
-            })
-        });
-
-        let was_fresh = db_result?;
-        if was_fresh {
-            // Update L1 cache
-            if let Err(e) = self.local.mark_used(jti, expires_at) {
-                tracing::error!(
-                    target: "siem",
-                    "SECURITY: JTI L1 cache mark_used failed for jti={}: {}. \
-                     Token replay via L1 cache bypass possible. DB L2 is authoritative.",
-                    jti, e
-                );
-            }
-        }
-        Ok(was_fresh)
+        // Sync DB call would require nested tokio runtime → panic. Until
+        // the caller migrates to AsyncJtiReplayStore, refuse to certify
+        // freshness without the L2 check. Fail-closed: pretend the JTI
+        // is already used so the verifier rejects the request.
+        emit_jti_db_failure_audit(
+            jti,
+            "sync DatabaseJtiStore::mark_used called — migrate caller to AsyncJtiReplayStore",
+        );
+        // Returning `Ok(false)` on the sync path means "not fresh" =
+        // request will be rejected with "JTI replay detected", which is
+        // the fail-closed posture for this layer. The duplicate `expires_at`
+        // is intentionally unused because we are not certifying anything.
+        let _ = expires_at;
+        Ok(false)
     }
 
     fn is_used(&self, jti: &str) -> bool {
-        // Check L1 first
-        if self.local.is_used(jti) {
+        if <LocalJtiStore as JtiReplayStore>::is_used(&self.local, jti) {
             return true;
         }
-        // Fall through to DB
-        let pool = self.pool.clone();
-        let jti_owned = jti.to_string();
-        std::thread::scope(|_| {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .ok();
-            rt.map(|rt| {
-                rt.block_on(async {
-                    sqlx::query_scalar::<_, i64>(
-                        "SELECT COUNT(*) FROM jti_replay WHERE jti = $1"
-                    )
-                    .bind(&jti_owned)
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap_or(0) > 0
-                })
-            })
-            .unwrap_or(false)
+        // X-G: fail-closed — assume the JTI IS used, force the caller
+        // to reject the request rather than risk replay against a
+        // sibling instance whose L1 happens to be cold.
+        emit_jti_db_failure_audit(
+            jti,
+            "sync DatabaseJtiStore::is_used called — migrate caller to AsyncJtiReplayStore",
+        );
+        true
+    }
+}
+
+// ---------------------------------------------------------------------------
+// X-G: Async JTI replay store
+//
+// The sync `JtiReplayStore` trait above panics when its `DatabaseJtiStore`
+// implementation tries to spin up a nested tokio runtime from inside an
+// existing async runtime, and previously failed open on every DB error.
+// `AsyncJtiReplayStore` exposes the database path correctly via native
+// async fn in trait (Rust 1.75+), and any DB error converts to a
+// fail-closed `Ok(true)` so the verifier rejects the request and emits
+// a SIEM CRITICAL `jti_store.db_failure` audit event.
+// ---------------------------------------------------------------------------
+
+/// Async-correct JTI replay store. Use this from any code path that
+/// already has a tokio runtime available — the legacy sync trait
+/// fails closed when called against a `DatabaseJtiStore` and is being
+/// phased out.
+pub trait AsyncJtiReplayStore: Send + Sync {
+    /// Mark a JTI as used. Returns `Ok(true)` if freshly inserted.
+    /// On any DB error, returns `Ok(false)` (fail-closed: refuse to
+    /// certify freshness; the caller will treat this as a replay) and
+    /// emits a SIEM CRITICAL `jti_store.db_failure` event.
+    fn mark_used<'a>(
+        &'a self,
+        jti: &'a str,
+        expires_at: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + 'a>>;
+
+    /// Check whether a JTI has already been used. Fails closed: any DB
+    /// error returns `true` (denying the request) and emits SIEM CRITICAL.
+    fn is_used<'a>(
+        &'a self,
+        jti: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
+}
+
+impl AsyncJtiReplayStore for LocalJtiStore {
+    fn mark_used<'a>(
+        &'a self,
+        jti: &'a str,
+        expires_at: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            <LocalJtiStore as JtiReplayStore>::mark_used(self, jti, expires_at)
+        })
+    }
+
+    fn is_used<'a>(
+        &'a self,
+        jti: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move { <LocalJtiStore as JtiReplayStore>::is_used(self, jti) })
+    }
+}
+
+impl AsyncJtiReplayStore for DatabaseJtiStore {
+    fn mark_used<'a>(
+        &'a self,
+        jti: &'a str,
+        expires_at: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            // L1 hit — replay, no DB roundtrip.
+            if <LocalJtiStore as JtiReplayStore>::is_used(&self.local, jti) {
+                return Ok(false);
+            }
+
+            // Atomic check+insert via INSERT ... ON CONFLICT DO NOTHING.
+            // X-G: any sqlx::Error here is fail-closed (treat as replay)
+            // PLUS emit SIEM CRITICAL jti_store.db_failure.
+            let result = match sqlx::query(
+                "INSERT INTO jti_replay (jti, expires_at) VALUES ($1, $2) \
+                 ON CONFLICT (jti) DO NOTHING",
+            )
+            .bind(jti)
+            .bind(expires_at)
+            .execute(&self.pool)
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    emit_jti_db_failure_audit(jti, &format!("insert: {e}"));
+                    // Fail-closed: return Ok(false) ("not fresh" =
+                    // verifier rejects with "JTI replay detected").
+                    return Ok(false);
+                }
+            };
+            let was_fresh = result.rows_affected() == 1;
+
+            if was_fresh {
+                if let Err(e) = <LocalJtiStore as JtiReplayStore>::mark_used(&self.local, jti, expires_at) {
+                    tracing::warn!(
+                        target: "siem",
+                        "JTI L1 cache mark_used failed for jti={jti}: {e}. \
+                         DB L2 is authoritative; fail-closed posture preserved."
+                    );
+                }
+            }
+            Ok(was_fresh)
+        })
+    }
+
+    fn is_used<'a>(
+        &'a self,
+        jti: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            if <LocalJtiStore as JtiReplayStore>::is_used(&self.local, jti) {
+                return true;
+            }
+            match sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM jti_replay WHERE jti = $1",
+            )
+            .bind(jti)
+            .fetch_one(&self.pool)
+            .await
+            {
+                Ok(count) => count > 0,
+                Err(e) => {
+                    emit_jti_db_failure_audit(jti, &format!("count: {e}"));
+                    // Fail-closed: assume used (deny the request).
+                    true
+                }
+            }
         })
     }
 }
@@ -323,11 +482,31 @@ impl Drop for RefreshToken {
 ///
 /// WARNING: This store is volatile. All refresh tokens are lost on process
 /// restart. In production, set `persistence_backend` to a durable store.
+///
+/// **X-H** — keys in `tokens` are the canonical lookup-key
+/// `hex(SHA-512(raw_token))` (see [`rt_lookup_key`]). The in-memory map
+/// MUST agree with the persistent layer's `token_hash` column or
+/// previously-issued refresh tokens become unredeemable on the first
+/// restart that hydrates the cache from disk.
 pub struct RefreshTokenStore {
     tokens: HashMap<String, RefreshToken>,
     /// Optional persistence backend name for operational awareness.
     /// When None, the store is purely in-memory (volatile).
     pub persistence_backend: Option<String>,
+}
+
+/// X-H: canonical lookup key for the in-memory refresh token cache.
+///
+/// Both the issue path and the redemption path MUST agree on the key
+/// formula for a token to remain redeemable across restarts. The
+/// persistent layer stores `token_hash = hex(SHA-512(raw_token))` in the
+/// `refresh_tokens.token_hash` column, so we use the same formula here.
+/// (Pre-fix, the in-memory map was keyed by raw token while
+/// `load_from_db` keyed by `token_hash` — every previously-issued
+/// refresh token became unredeemable on first restart.)
+fn rt_lookup_key(raw: &str) -> String {
+    use sha2::{Digest, Sha512};
+    hex::encode(Sha512::digest(raw.as_bytes()))
 }
 
 /// Custom Debug for RefreshTokenStore -- redacts token count only.
@@ -408,7 +587,10 @@ impl RefreshTokenStore {
         let mut token_value = format!("rt_{}", hex::encode(token_bytes));
         zeroize::Zeroize::zeroize(&mut token_bytes);
         let now = common::secure_time::secure_now_secs_i64();
-        let token_key = token_value.clone();
+        // X-H: key the in-memory map by the canonical lookup formula so
+        // the persistent layer's `token_hash` column agrees and the
+        // token survives a restart-then-redeem cycle.
+        let token_key = rt_lookup_key(&token_value);
         let token_stored = token_value.clone();
         self.tokens.insert(
             token_key,
@@ -441,7 +623,10 @@ impl RefreshTokenStore {
         token: &str,
         client_id: &str,
     ) -> Result<(RefreshToken, String), String> {
-        let rt = self.tokens.get(token).cloned()
+        // X-H: lookup via canonical key so cache-cold reads after restart
+        // (hydrated from `refresh_tokens.token_hash`) can match.
+        let lookup = rt_lookup_key(token);
+        let rt = self.tokens.get(&lookup).cloned()
             .ok_or_else(|| "refresh token not found".to_string())?;
 
         // SECURITY: Detect replay — if already used, this indicates token theft.
@@ -470,7 +655,8 @@ impl RefreshTokenStore {
         // Check expiry
         let now = common::secure_time::secure_now_secs_i64();
         if now > rt.expires_at {
-            self.tokens.remove(token);
+            // X-H: remove via the canonical lookup-key (computed above).
+            self.tokens.remove(&lookup);
             return Err("refresh token expired".to_string());
         }
 
@@ -479,8 +665,8 @@ impl RefreshTokenStore {
             return Err("refresh token client_id mismatch".to_string());
         }
 
-        // Mark old token as used
-        if let Some(entry) = self.tokens.get_mut(token) {
+        // Mark old token as used (looked up via canonical key — X-H).
+        if let Some(entry) = self.tokens.get_mut(&lookup) {
             entry.used = true;
         }
 
@@ -577,6 +763,12 @@ impl PersistentRefreshTokenStore {
         })?;
 
         for (token_hash, user_id, client_id, scope, expires_at, used, family_id) in rows {
+            // X-H: `token_hash` is the canonical lookup-key (hex SHA-512
+            // of the raw token). Both `issue_in_family` and `redeem` now
+            // key the in-memory map by the same formula, so the loaded
+            // entry is reachable by `RefreshTokenStore::redeem(raw_token)`
+            // after restart — pre-fix the in-memory map used the raw token
+            // as key and every restart-loaded token was unredeemable.
             self.memory.tokens.insert(token_hash, RefreshToken {
                 token: String::new(), // raw token not stored
                 user_id,
@@ -593,12 +785,11 @@ impl PersistentRefreshTokenStore {
     /// Issue a new refresh token, writing through to the database.
     pub async fn issue(&mut self, user_id: Uuid, client_id: &str, scope: &str) -> Result<String, String> {
         let token_value = self.memory.issue(user_id, client_id, scope);
-        let token_hash = {
-            use sha2::{Digest, Sha512};
-            hex::encode(Sha512::digest(token_value.as_bytes()))
-        };
+        // X-H: token_hash is the canonical lookup-key shared by the
+        // in-memory cache and the DB column.
+        let token_hash = rt_lookup_key(&token_value);
 
-        let rt = self.memory.tokens.get(&token_value).cloned()
+        let rt = self.memory.tokens.get(&token_hash).cloned()
             .ok_or("token not found after issue")?;
 
         sqlx::query(
@@ -627,23 +818,18 @@ impl PersistentRefreshTokenStore {
     ) -> Result<(RefreshToken, String), String> {
         let (old_rt, new_token) = self.memory.redeem(token, client_id)?;
 
-        // Mark old token as used in DB
-        let old_hash = {
-            use sha2::{Digest, Sha512};
-            hex::encode(Sha512::digest(token.as_bytes()))
-        };
+        // Mark old token as used in DB. X-H: hash matches in-memory key.
+        let old_hash = rt_lookup_key(token);
         sqlx::query("UPDATE refresh_tokens SET used = TRUE WHERE token_hash = $1")
             .bind(&old_hash)
             .execute(&self.pool)
             .await
             .map_err(|e| format!("mark token used in DB: {e}"))?;
 
-        // Insert new rotated token into DB (CNSA 2.0: SHA-512)
-        let new_hash = {
-            use sha2::{Digest, Sha512};
-            hex::encode(Sha512::digest(new_token.as_bytes()))
-        };
-        if let Some(new_rt) = self.memory.tokens.get(&new_token) {
+        // Insert new rotated token into DB. X-H: hash also keys the
+        // in-memory cache so the next redeem can find it.
+        let new_hash = rt_lookup_key(&new_token);
+        if let Some(new_rt) = self.memory.tokens.get(&new_hash) {
             sqlx::query(
                 "INSERT INTO refresh_tokens (token_hash, user_id, client_id, scope, expires_at, used, family_id) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7)"
@@ -1580,5 +1766,88 @@ mod tests {
         assert_eq!(store.tokens.len(), 2);
         drop(store);
         // If drop panics, the test fails. This verifies safe zeroization.
+    }
+
+    // ── X-H: refresh-token cache key is the canonical lookup-key ──────
+
+    /// Regression for `sso-protocol/src/tokens.rs:560-590` — the
+    /// in-memory map was keyed by raw token while `load_from_db`
+    /// inserted under `SHA-512(token_hash)`, so every restart-loaded
+    /// token was unredeemable. After X-H both paths use
+    /// [`rt_lookup_key`].
+    #[test]
+    fn issue_then_lookup_uses_canonical_key() {
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        let mut store = RefreshTokenStore::new().unwrap();
+        let user = Uuid::new_v4();
+        let raw = store.issue(user, "client-a", "openid");
+
+        // The in-memory map MUST be keyed by `rt_lookup_key(raw)`,
+        // never by the raw token. This is the exact invariant the
+        // load_from_db path needs to relate to.
+        let canonical = rt_lookup_key(&raw);
+        assert!(
+            store.tokens.contains_key(&canonical),
+            "X-H regression: in-memory cache must be keyed by canonical \
+             lookup-key (hex SHA-512(raw_token)) so load_from_db's \
+             token_hash matches"
+        );
+        assert!(
+            !store.tokens.contains_key(&raw),
+            "X-H regression: pre-fix the in-memory map was keyed by raw \
+             token — load_from_db can never reproduce that key after \
+             restart, so previously-issued tokens become unredeemable"
+        );
+    }
+
+    /// Simulate a restart-then-redeem cycle without Postgres: issue a
+    /// token, capture its raw value AND its canonical key, drop the
+    /// store, then re-build the store and manually re-insert under the
+    /// canonical key (mimicking `load_from_db`). Redeem must succeed.
+    #[test]
+    fn rt_survives_simulated_restart() {
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        let user = Uuid::new_v4();
+
+        // Phase 1: issue.
+        let mut store = RefreshTokenStore::new().unwrap();
+        let raw = store.issue(user, "client-a", "scope-x");
+        let canonical = rt_lookup_key(&raw);
+        let snapshot = store.tokens.get(&canonical).cloned()
+            .expect("issued token must be retrievable by canonical key");
+
+        // Phase 2: drop the store (simulates process restart).
+        drop(store);
+
+        // Phase 3: rebuild from "DB" — manually insert under the same
+        // canonical key formula `load_from_db` uses.
+        let mut rehydrated = RefreshTokenStore::new().unwrap();
+        rehydrated.tokens.insert(canonical.clone(), RefreshToken {
+            // `load_from_db` does not persist the raw token (security:
+            // raw tokens should not survive a restart on disk). We
+            // mimic that here.
+            token: String::new(),
+            user_id: snapshot.user_id,
+            client_id: snapshot.client_id.clone(),
+            scope: snapshot.scope.clone(),
+            expires_at: snapshot.expires_at,
+            used: snapshot.used,
+            family_id: snapshot.family_id.clone(),
+        });
+
+        // Phase 4: redeem the original raw token. Pre-fix this returned
+        // "refresh token not found" because the in-memory key was raw
+        // and the rehydrated key was canonical. Post-fix both are
+        // canonical, so the lookup succeeds.
+        let result = rehydrated.redeem(&raw, "client-a");
+        assert!(
+            result.is_ok(),
+            "X-H regression: refresh token must be redeemable across a \
+             restart-rehydrate cycle, got {:?}",
+            result.err()
+        );
+        let (old_rt, new_token) = result.unwrap();
+        assert_eq!(old_rt.user_id, user);
+        assert!(new_token.starts_with("rt_"));
     }
 }

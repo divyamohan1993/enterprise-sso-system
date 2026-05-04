@@ -70,6 +70,15 @@ pub enum MilnetError {
 
     #[error("OIDC nonce mismatch")]
     OidcNonceMismatch,
+
+    #[error("corrupted KEK share — reconstructed key does not match expected commitment (X-C: silent slot poisoning rejected)")]
+    CorruptedKekShare,
+
+    #[error("KEK reconstruction failed: {0}")]
+    KekReconstruction(String),
+
+    #[error("OS entropy unavailable — refusing to fall back to deterministic randomness (X-U)")]
+    EntropyExhausted,
 }
 
 impl MilnetError {
@@ -149,6 +158,15 @@ impl MilnetError {
             }
             MilnetError::OidcNonceMismatch => {
                 "Authentication failed due to a security check. Please try again."
+            }
+            MilnetError::CorruptedKekShare => {
+                "A key-share integrity check failed. Contact your administrator immediately."
+            }
+            MilnetError::KekReconstruction(_) => {
+                "Key reconstruction failed. Contact your administrator immediately."
+            }
+            MilnetError::EntropyExhausted => {
+                "System entropy is exhausted. Operations are paused for safety until hardware RNG recovers."
             }
         }
     }

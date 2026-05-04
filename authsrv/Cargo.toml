@@ -20,20 +20,33 @@ uuid.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal"] }
 axum = "0.8"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "limit"] }
+tower-http = { version = "0.6", features = [
+    "catch-panic",
+    "cors",
+    "limit",
+    "request-id",
+    "set-header",
+    "timeout",
+    "trace",
+] }
 tracing.workspace = true
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 base64 = "0.22"
 sha2.workspace = true
-hmac.workspace = true
-rand.workspace = true
-getrandom.workspace = true
+subtle.workspace = true
+url = "2"
 hex.workspace = true
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 tokio = { workspace = true, features = ["test-util"] }
+tower = { version = "0.5", features = ["util"] }
 
 [features]
+# Production behaviour is unconditional — `production` is a strict opt-in marker
+# for downstream feature unification.  `test-util` exposes pkce-pair / state
+# helpers and MUST NEVER be in the default set (it would ship test fixtures
+# into the production binary; see master plan §5 Phase 1, D-19).
 default = ["production"]
 production = ["common/production", "sso-protocol/production"]
+test-util = []

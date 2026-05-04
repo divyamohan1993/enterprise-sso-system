@@ -210,14 +210,16 @@ async fn main() {
 
                     let mut wl = witness_log.lock().await;
                     let sock_path = witness_sock_path.clone();
-                    wl.add_signed_checkpoint(audit_root, kt_root, |data| {
-                        // D1: ask the out-of-process witness to sign the
-                        // SHA-256 hash of the canonical checkpoint payload.
-                        // We hash here rather than sending the full payload
-                        // so the witness API stays a fixed 32-byte input.
+                    wl.add_signed_checkpoint(audit_root, kt_root, |seq, data| {
+                        // X-K: ask the out-of-process witness to sign the
+                        // SHA-256 of the canonical checkpoint payload, with
+                        // the per-checkpoint seq carried explicitly so the
+                        // witness can enforce strict monotonicity (replay /
+                        // equivocation defense). The witness binds both the
+                        // seq and the hash into its domain-tagged signature.
                         use sha2::{Digest, Sha256};
                         let h = Sha256::digest(data);
-                        match witness_sign_via_uds(&sock_path, h.as_slice()) {
+                        match witness_sign_via_uds(&sock_path, seq, h.as_slice()) {
                             Ok(sig) => sig,
                             Err(e) => {
                                 tracing::error!(
@@ -384,10 +386,10 @@ async fn main() {
 
 // ── D1: out-of-process witness signature client ─────────────────────────
 
-/// Connect to the audit-witness UDS, submit a 32-byte hash, and return the
-/// ML-DSA-87 signature bytes. Any error (socket missing, malformed reply,
-/// hex decode failure) is returned to the caller.
-fn witness_sign_via_uds(sock_path: &str, hash: &[u8]) -> Result<Vec<u8>, String> {
+/// Connect to the audit-witness UDS, submit `(seq, 32-byte hash)`, and return
+/// the ML-DSA-87 signature bytes. The witness enforces strict-monotonic seq
+/// on its side and returns `ERR seq replayed: ...\n` on replay.
+fn witness_sign_via_uds(sock_path: &str, seq: u64, hash: &[u8]) -> Result<Vec<u8>, String> {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
 
@@ -396,7 +398,7 @@ fn witness_sign_via_uds(sock_path: &str, hash: &[u8]) -> Result<Vec<u8>, String>
     }
     let mut stream = UnixStream::connect(sock_path)
         .map_err(|e| format!("connect {sock_path}: {e}"))?;
-    let req = format!("SIGN {}\n", hex::encode(hash));
+    let req = format!("SIGN {} {}\n", seq, hex::encode(hash));
     stream
         .write_all(req.as_bytes())
         .map_err(|e| format!("write: {e}"))?;

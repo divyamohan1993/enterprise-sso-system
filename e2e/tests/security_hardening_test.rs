@@ -350,13 +350,14 @@ fn witness_checkpoint_sequence_monotonic() {
     for i in 0..5 {
         let audit_root = [i as u8; 64];
         let kt_root = [(i + 100) as u8; 64];
-        log.add_signed_checkpoint(audit_root, kt_root, |data| {
+        log.add_signed_checkpoint(audit_root, kt_root, |seq, data| {
             // The signed payload must include sequence + timestamp (128 + 16 = 144 bytes)
             assert!(
                 data.len() >= 128 + 16,
                 "signed witness data must include audit_root(64) + kt_root(64) + seq(8) + ts(8), got {} bytes",
                 data.len()
             );
+            assert_eq!(seq, i as u64, "closure must receive the per-checkpoint seq");
             // Return dummy signature for test
             data.to_vec()
         });

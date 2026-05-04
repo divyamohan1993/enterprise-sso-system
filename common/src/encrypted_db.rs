@@ -20,7 +20,8 @@
 //! | witness_checkpoints| signature           | witness:sig         |
 
 use sqlx::PgPool;
-use zeroize::Zeroize;
+use std::pin::Pin;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Version tag prepended to the new envelope format (per-operation DEK).
 const ENVELOPE_V2_TAG: u8 = 0x02;
@@ -38,13 +39,66 @@ pub struct EncryptedPool {
 }
 
 impl EncryptedPool {
-    /// Wrap a raw pool with envelope encryption using the given master KEK.
+    /// Build the pool wrapper without applying mlock. Used by
+    /// [`new_pinned`] which calls [`lock_in_place`] after the value
+    /// reaches its final pinned heap address.
+    fn build_unlocked(pool: PgPool, master_kek: [u8; 32]) -> Self {
+        Self { pool, master_kek }
+    }
+
+    /// Apply `mlock` + `MADV_DONTDUMP` to the master KEK at its current
+    /// (pinned) live address. Idempotent.
+    #[allow(unsafe_code)]
+    pub fn lock_in_place(self: Pin<&mut Self>) {
+        // SAFETY: We do not move `master_kek` out of `self`. We only
+        // apply mlock/madvise to its in-place address.
+        let this: &mut Self = unsafe { self.get_unchecked_mut() };
+        #[cfg(unix)]
+        unsafe {
+            let ptr = this.master_kek.as_ptr();
+            let len = this.master_kek.len();
+            libc::mlock(ptr as *const libc::c_void, len);
+            libc::madvise(ptr as *mut libc::c_void, len, libc::MADV_DONTDUMP);
+        }
+        let _ = this; // suppress unused-mut on non-unix targets
+    }
+
+    /// Address-correct constructor: places the wrapper on the heap and
+    /// then mlocks the live KEK address.
+    ///
+    /// The caller passes `Zeroizing<[u8; 32]>` so the input bytes are
+    /// scrubbed when the stack copy is dropped — even if `Self` is later
+    /// dropped, the path that brought the KEK into this constructor
+    /// retains zeroize-on-drop semantics.
+    ///
+    /// **This is the only constructor that fulfils the mlock contract.**
+    /// `new` mlocks the constructor's stack frame; the by-value return
+    /// invalidates that lock when the caller `memcpy`'s the value into
+    /// its own slot.
+    pub fn new_pinned(pool: PgPool, master_kek: Zeroizing<[u8; 32]>) -> Pin<Box<Self>> {
+        // Copy the KEK bytes into the heap-resident `Self` and drop the
+        // `Zeroizing` wrapper so the transit copy is wiped immediately.
+        let kek_copy: [u8; 32] = *master_kek;
+        drop(master_kek);
+        let pinned: Pin<Box<Self>> = Box::pin(Self::build_unlocked(pool, kek_copy));
+        // SAFETY: we do not move out of `pinned`; lock_in_place only
+        // applies syscall-level protection to in-place memory.
+        let mut pinned = pinned;
+        pinned.as_mut().lock_in_place();
+        pinned
+    }
+
+    /// **DEPRECATED** — `mlock`-after-move is unsound. The `mlock` here
+    /// targets the constructor's stack frame; the value is then
+    /// `memcpy`'d into the caller's slot, leaving the live master-KEK
+    /// bytes outside the locked region. Use [`new_pinned`] instead.
+    #[deprecated(
+        note = "use new_pinned; mlock-after-move semantics are unsafe — the live KEK address is not the address that was locked"
+    )]
     pub fn new(pool: PgPool, master_kek: [u8; 32]) -> Self {
-        let s = Self { pool, master_kek };
-        // Prevent master KEK from being swapped to disk.
-        // SAFETY: mlock/madvise are memory-protection syscalls that do not
-        // violate memory safety. Required to prevent the root database
-        // encryption key from being written to swap or core dumps.
+        let s = Self::build_unlocked(pool, master_kek);
+        // Legacy mlock-after-stack-build behaviour retained for source
+        // compatibility while admin/main.rs migrates.
         #[cfg(unix)]
         #[allow(unsafe_code)]
         unsafe {
@@ -342,8 +396,21 @@ pub async fn load_or_generate_key_32_encrypted(epool: &EncryptedPool, name: &str
 }
 
 /// Initialize an encrypted pool with the given master KEK.
+///
+/// **DEPRECATED** — uses [`EncryptedPool::new`] which has
+/// mlock-after-move semantics. Prefer [`wrap_pool_pinned`].
+#[deprecated(
+    note = "use wrap_pool_pinned; underlying EncryptedPool::new mlock-after-move is unsafe"
+)]
+#[allow(deprecated)]
 pub fn wrap_pool(pool: PgPool, master_kek: [u8; 32]) -> EncryptedPool {
     EncryptedPool::new(pool, master_kek)
+}
+
+/// Initialize an encrypted pool with the given master KEK, address-
+/// correctly mlocked at its final pinned heap location.
+pub fn wrap_pool_pinned(pool: PgPool, master_kek: Zeroizing<[u8; 32]>) -> Pin<Box<EncryptedPool>> {
+    EncryptedPool::new_pinned(pool, master_kek)
 }
 
 /// Encrypt a ratchet chain key for storage in the `ratchet_sessions` table.

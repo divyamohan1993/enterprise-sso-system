@@ -15,6 +15,7 @@
 
 #![allow(unsafe_code)]
 
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use zeroize::Zeroize;
 
@@ -184,20 +185,17 @@ pub struct SecretBuffer<const N: usize> {
 }
 
 impl<const N: usize> SecretBuffer<N> {
-    /// Create a new `SecretBuffer` protecting the given data.
+    /// Build the buffer in an *unlocked* state at the caller's stack frame.
     ///
-    /// The data region is mlocked to prevent swapping.  If `mlock` fails
-    /// (e.g. due to resource limits in a dev environment), a warning is
-    /// logged and the buffer is still usable — the `locked` field tracks
-    /// whether the lock succeeded.
-    pub fn new(data: [u8; N]) -> Result<Self, MemguardError> {
+    /// Used internally by `new_pinned`. Canary state is initialised so the
+    /// move-resistant HMAC scheme remains valid after the value is placed
+    /// on the heap, but `mlock` is intentionally NOT called here — the
+    /// caller's address is about to be invalidated by a move.
+    fn build_unlocked(data: [u8; N]) -> Result<Self, MemguardError> {
         if N == 0 {
             return Err(MemguardError::InvalidSize);
         }
 
-        // Canary values are set after construction using derive_canary()
-        // based on the buffer's heap address. This ensures expected values
-        // are derived from a process-wide HMAC key, not stored in the struct.
         let nonce = {
             let mut b = [0u8; 8];
             getrandom::getrandom(&mut b).map_err(|_| MemguardError::AllocationFailed)?;
@@ -212,13 +210,6 @@ impl<const N: usize> SecretBuffer<N> {
             locked: false,
         };
 
-        // Generate random canaries. These are stored in the struct and verified
-        // on every access. The process-wide HMAC key ensures derive_canary()
-        // produces consistent values for a given address, but since the struct
-        // may be moved (Rust has no move constructors), we use random canaries
-        // instead and store them alongside the buffer. The security improvement
-        // over the old scheme is that canary values are cryptographically random
-        // rather than predictable XOR patterns.
         let head = {
             let mut b = [0u8; 8];
             getrandom::getrandom(&mut b).map_err(|_| MemguardError::AllocationFailed)?;
@@ -232,9 +223,6 @@ impl<const N: usize> SecretBuffer<N> {
         buf.canary_head = head;
         buf.canary_tail = tail;
 
-        // Compute and store HMAC over (nonce, canary_head, canary_tail) for
-        // tamper detection in verify_canaries(). Uses a per-instance random nonce
-        // instead of the buffer address because Rust moves (memcpy) change addresses.
         {
             use hmac::{Hmac, Mac};
             use sha2::Sha512;
@@ -247,22 +235,97 @@ impl<const N: usize> SecretBuffer<N> {
             buf.canary_hmac = u64::from_ne_bytes(result[..8].try_into().unwrap());
         }
 
-        // Attempt to mlock the data region.
-        // SECURITY: mlock prevents key material from being swapped to disk.
-        // In military deployment mode (MILNET_MILITARY_DEPLOYMENT=1), mlock
-        // failure is FATAL — keys without mlock can be swapped to disk and
-        // recovered by a nation-state attacker with physical access.
+        Ok(buf)
+    }
+
+    /// Apply mlock to a buffer that already lives at its final, stable
+    /// address (via `Pin<Box<Self>>` or any other pinning mechanism).
+    ///
+    /// This is the only address-correct way to mlock a `SecretBuffer<N>`,
+    /// because `data` is an inline `[u8; N]` field — its address moves with
+    /// the struct. After `Pin<Box<Self>>` placement, the address of `data`
+    /// is stable, and locking it actually pins the live secret pages.
+    ///
+    /// In `MILNET_MILITARY_DEPLOYMENT=1` mode an `mlock` failure panics.
+    /// Otherwise it returns `Err(MemguardError::MlockFailed)` and sets the
+    /// process-wide `MLOCK_DEGRADED` flag for SIEM observation.
+    pub fn lock_in_place(self: Pin<&mut Self>) -> Result<(), MemguardError> {
+        // SAFETY: `data` is an inline array; modifying `locked` does not
+        // invalidate the pin's structural guarantees, and we never move
+        // `data` out of `self`.
+        let this: &mut Self = unsafe { self.get_unchecked_mut() };
+        if this.locked {
+            return Ok(());
+        }
+        let data_ptr = this.data.as_ptr();
+        if mlock_slice(data_ptr, N) {
+            this.locked = true;
+            madv_dontdump(data_ptr, N);
+            Ok(())
+        } else {
+            MLOCK_DEGRADED.store(true, Ordering::SeqCst);
+
+            let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+
+            if is_military {
+                panic!(
+                    "FATAL: mlock failed for {N}-byte SecretBuffer in military deployment \
+                     (MILNET_MILITARY_DEPLOYMENT=1). Key material MUST be locked in RAM. \
+                     Ensure RLIMIT_MEMLOCK is sufficient (ulimit -l). Aborting to prevent \
+                     key material from being swapped to disk."
+                );
+            }
+
+            tracing::error!(
+                buffer_size = N,
+                "CRITICAL SECURITY DEGRADATION: mlock failed for {N}-byte SecretBuffer. \
+                 Key material may be swappable to disk. Ensure RLIMIT_MEMLOCK is sufficient. \
+                 SIEM alert: mlock_failure_detected"
+            );
+            Err(MemguardError::MlockFailed)
+        }
+    }
+
+    /// Address-correct constructor: places the buffer on the heap and locks
+    /// the live address. **This is the only constructor that fulfils the
+    /// mlock contract.**
+    ///
+    /// The returned `Pin<Box<Self>>` guarantees the `data` field's address
+    /// is stable for the lifetime of the value, so `mlock` covers exactly
+    /// the bytes where the secret will live.
+    pub fn new_pinned(data: [u8; N]) -> Result<Pin<Box<Self>>, MemguardError> {
+        let buf = Self::build_unlocked(data)?;
+        let mut pinned: Pin<Box<Self>> = Box::pin(buf);
+        pinned.as_mut().lock_in_place()?;
+        Ok(pinned)
+    }
+
+    /// **DEPRECATED** — `mlock`-after-move is unsound.
+    ///
+    /// This constructor builds the buffer on the caller's stack frame, calls
+    /// `mlock` on that frame's address, then returns by value. The returned
+    /// value is then `memcpy`'d into the caller's slot, and the live secret
+    /// pages are NOT the ones that were locked. Use [`new_pinned`] instead.
+    ///
+    /// Retained for source-compatibility while the workspace migrates;
+    /// callers receive a deprecation warning at the call site.
+    #[deprecated(
+        note = "use new_pinned; mlock-after-move semantics are unsafe — the live secret address is not the address that was locked"
+    )]
+    pub fn new(data: [u8; N]) -> Result<Self, MemguardError> {
+        let mut buf = Self::build_unlocked(data)?;
+
+        // Legacy mlock-after-move behaviour, retained verbatim so existing
+        // callers see the same observable behaviour while they migrate.
         let data_ptr = buf.data.as_ptr();
         if mlock_slice(data_ptr, N) {
             buf.locked = true;
-            // Exclude from core dumps
             madv_dontdump(data_ptr, N);
         } else {
             MLOCK_DEGRADED.store(true, Ordering::SeqCst);
 
-            // SECURITY: In military/production deployment, mlock failure is
-            // UNACCEPTABLE. Sensitive keys without mlock can be swapped to
-            // disk and recovered via forensic analysis of swap partitions.
             let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
                 .map(|v| v == "1")
                 .unwrap_or(false);
@@ -417,11 +480,14 @@ pub struct SecretVec {
 }
 
 impl SecretVec {
-    /// Create a new `SecretVec` protecting the given data.
+    /// Build the buffer in an *unlocked* state.
     ///
-    /// The heap buffer is mlocked to prevent swapping.  If `mlock` fails,
-    /// a warning is logged but the buffer remains usable.
-    pub fn new(data: Vec<u8>) -> Result<Self, MemguardError> {
+    /// Used internally by `new_pinned`. The Vec's heap allocation is stable
+    /// across moves of `Self`, but `lock_in_place` is only called after the
+    /// outer `Self` lives at its final pinned address — this matches the
+    /// `SecretBuffer<N>` pattern and removes any ambiguity about where the
+    /// mlock applies.
+    fn build_unlocked(data: Vec<u8>) -> Result<Self, MemguardError> {
         if data.is_empty() {
             return Err(MemguardError::InvalidSize);
         }
@@ -455,7 +521,7 @@ impl SecretVec {
             u64::from_ne_bytes(result[..8].try_into().unwrap())
         };
 
-        let mut sv = Self {
+        Ok(Self {
             data,
             original_len,
             canary: head,
@@ -463,16 +529,82 @@ impl SecretVec {
             canary_hmac: canary_hmac_val,
             canary_nonce: nonce,
             locked: false,
-        };
+        })
+    }
 
+    /// Apply mlock to the underlying heap buffer once `Self` is pinned at
+    /// its final address. The Vec's allocation is stable across moves, but
+    /// pinning the outer `Self` means we never get a second move that could
+    /// reallocate it (no `&mut` access leaks).
+    pub fn lock_in_place(self: Pin<&mut Self>) -> Result<(), MemguardError> {
+        // SAFETY: We only adjust `locked`; we never move `data` out of `self`.
+        let this: &mut Self = unsafe { self.get_unchecked_mut() };
+        if this.locked {
+            return Ok(());
+        }
+        let ptr = this.data.as_ptr();
+        let len = this.data.len();
+        if mlock_slice(ptr, len) {
+            this.locked = true;
+            madv_dontdump(ptr, len);
+            Ok(())
+        } else {
+            MLOCK_DEGRADED.store(true, Ordering::SeqCst);
+
+            let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+
+            if is_military {
+                panic!(
+                    "FATAL: mlock failed for {len}-byte SecretVec in military deployment \
+                     (MILNET_MILITARY_DEPLOYMENT=1). Key material MUST be locked in RAM. \
+                     Ensure RLIMIT_MEMLOCK is sufficient (ulimit -l). Aborting to prevent \
+                     key material from being swapped to disk."
+                );
+            }
+
+            tracing::error!(
+                buffer_size = len,
+                "CRITICAL SECURITY DEGRADATION: mlock failed for {len}-byte SecretVec. \
+                 Key material may be swappable to disk. Ensure RLIMIT_MEMLOCK is sufficient. \
+                 SIEM alert: mlock_failure_detected"
+            );
+            Err(MemguardError::MlockFailed)
+        }
+    }
+
+    /// Address-correct constructor: places the SecretVec on the heap and
+    /// locks the live address. **This is the only constructor that fulfils
+    /// the mlock contract** without ambiguity.
+    pub fn new_pinned(data: Vec<u8>) -> Result<Pin<Box<Self>>, MemguardError> {
+        let sv = Self::build_unlocked(data)?;
+        let mut pinned: Pin<Box<Self>> = Box::pin(sv);
+        pinned.as_mut().lock_in_place()?;
+        Ok(pinned)
+    }
+
+    /// **DEPRECATED** — see [`SecretBuffer::new`]. The Vec's heap
+    /// allocation is technically stable across moves of `Self`, but this
+    /// API does not surface the pin/lock split that callers must perform
+    /// to satisfy the mlock contract on the canonical [`SecretBuffer`]
+    /// path. Use [`new_pinned`] for unambiguous semantics.
+    #[deprecated(
+        note = "use new_pinned; mlock-after-move semantics are unsafe — prefer Pin<Box<SecretVec>>"
+    )]
+    pub fn new(data: Vec<u8>) -> Result<Self, MemguardError> {
+        let mut sv = Self::build_unlocked(data)?;
+
+        // Legacy mlock-after-stack-build behaviour retained for source
+        // compatibility. Vec heap allocation is stable across the move
+        // here, so this path lock applies to the live bytes — it is
+        // deprecated only for API uniformity with `SecretBuffer<N>`.
         let ptr = sv.data.as_ptr();
         let len = sv.data.len();
         if mlock_slice(ptr, len) {
             sv.locked = true;
-            // Exclude from core dumps
             madv_dontdump(ptr, len);
         } else {
-            // SECURITY: In military deployment, mlock failure is FATAL.
             MLOCK_DEGRADED.store(true, Ordering::SeqCst);
 
             let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT")
@@ -604,12 +736,27 @@ pub type SecretKey128 = SecretBuffer<128>;
 
 /// Create a `SecretBuffer` filled with entropy from the OS CSPRNG.
 ///
-/// This is the recommended way to generate ephemeral keys, nonces, and
-/// other short-lived secret material.
+/// **DEPRECATED** — uses [`SecretBuffer::new`], which has mlock-after-move
+/// semantics. Prefer [`generate_secret_pinned`] for new code.
+#[deprecated(
+    note = "use generate_secret_pinned; underlying SecretBuffer::new mlock-after-move is unsafe"
+)]
+#[allow(deprecated)]
 pub fn generate_secret<const N: usize>() -> Result<SecretBuffer<N>, MemguardError> {
     let mut buf = [0u8; N];
     getrandom::getrandom(&mut buf).map_err(|_| MemguardError::AllocationFailed)?;
     SecretBuffer::new(buf)
+}
+
+/// Create a pinned `SecretBuffer` filled with entropy from the OS CSPRNG.
+///
+/// The returned `Pin<Box<SecretBuffer<N>>>` has the secret bytes mlocked at
+/// their final stable heap address — the address that lives for the entire
+/// lifetime of the value.
+pub fn generate_secret_pinned<const N: usize>() -> Result<Pin<Box<SecretBuffer<N>>>, MemguardError> {
+    let mut buf = [0u8; N];
+    getrandom::getrandom(&mut buf).map_err(|_| MemguardError::AllocationFailed)?;
+    SecretBuffer::new_pinned(buf)
 }
 
 /// Harden the current process against memory disclosure attacks.
@@ -893,6 +1040,7 @@ impl Eq for SecureString {}
 // ===========================================================================
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
@@ -1045,5 +1193,38 @@ mod tests {
         let c = SecureString::new("diff".to_string());
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    // ---------------------------------------------------------------
+    // X-A: pinned constructors basic correctness
+    // (regression for crypto/src/memguard.rs:186-288, :402-499 —
+    //  mlock-after-move on stack-built constructor)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn secret_buffer_new_pinned_is_locked_and_readable() {
+        let pinned = SecretBuffer::<32>::new_pinned([0xA5; 32])
+            .expect("new_pinned failed");
+        assert!(pinned.is_locked(), "pinned buffer must be mlocked");
+        assert_eq!(pinned.as_bytes(), &[0xA5; 32]);
+    }
+
+    #[test]
+    fn secret_vec_new_pinned_is_locked_and_readable() {
+        let pinned = SecretVec::new_pinned(vec![0x5A; 48])
+            .expect("new_pinned failed");
+        assert!(pinned.is_locked(), "pinned vec must be mlocked");
+        assert_eq!(pinned.as_bytes(), &[0x5A; 48][..]);
+    }
+
+    #[test]
+    fn lock_in_place_idempotent() {
+        let mut pinned = SecretBuffer::<16>::new_pinned([0u8; 16])
+            .expect("new_pinned failed");
+        // Already locked by new_pinned. A second call must succeed without
+        // attempting a redundant mlock or perturbing state.
+        assert!(pinned.is_locked());
+        pinned.as_mut().lock_in_place().expect("idempotent lock failed");
+        assert!(pinned.is_locked());
     }
 }
