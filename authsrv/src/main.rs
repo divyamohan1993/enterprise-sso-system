@@ -65,6 +65,12 @@ async fn main() {
     crypto::entropy::startup_entropy_health_check();
     crypto::fips_kat::run_startup_kats_or_panic();
 
+    // Initialise the crate-wide DRBG before seccomp narrows the syscall set
+    // (the DRBG seed gathering uses entropy syscalls).
+    if let Err(e) = authsrv::init_drbg() {
+        fatal(&format!("DRBG init failed: {e}"));
+    }
+
     // seccomp filter — applied after early initialisation so the syscall set
     // is settled but before we open the listening socket.
     if !crypto::seccomp::apply_seccomp_filter() {
