@@ -1580,17 +1580,63 @@ pub fn unseal_kek_2of3() -> Result<KekUnsealResult, String> {
     }
 }
 
-/// Reconstruct the 32-byte KEK from 2-of-3 shares using the existing
-/// Shamir implementation in `threshold_kek`.
-fn reconstruct_2of3(shares: Vec<crate::threshold_kek::KekShare>) -> Result<[u8; 32], String> {
-    if shares.len() < C2_THRESHOLD as usize {
-        return Err(format!(
-            "need at least {} shares, got {}",
-            C2_THRESHOLD,
-            shares.len()
-        ));
+/// 32-byte BLAKE3 commitment over a reconstructed KEK. Used by
+/// [`reconstruct_2of3`] to refuse a poisoned reconstruction silently.
+pub type KekVerifyHash = [u8; 32];
+
+/// Compute the BLAKE3 commitment over a 32-byte KEK. Used to bind a
+/// reconstructed KEK to a known-good value loaded from
+/// `MILNET_VSS_COMMITMENTS` (or any other authenticated source).
+pub fn compute_kek_verify_blake3(kek: &[u8; 32]) -> KekVerifyHash {
+    let h = blake3::hash(kek);
+    *h.as_bytes()
+}
+
+/// Reconstruct the 32-byte KEK from exactly two Shamir shares.
+///
+/// **Security contract** — when `expected` is `Some`, the reconstructed
+/// KEK is bound to a known-good commitment via constant-time comparison
+/// of `BLAKE3(reconstructed)` against the supplied hash. Mismatch
+/// returns `MilnetError::CorruptedKekShare` and zeroizes the
+/// intermediate buffer; a single corrupted slot can therefore no
+/// longer poison the resulting KEK silently.
+///
+/// Callers that do not yet have a commitment available pass `None`;
+/// this preserves Phase 0 backward compatibility while Phase 8 wires
+/// `MILNET_VSS_COMMITMENTS` (BASE64-encoded list, one entry per slot)
+/// through the boot path. **Pass `Some(&hash)` whenever a commitment
+/// is available** — `None` is a temporary affordance, not a long-term
+/// API contract.
+pub fn reconstruct_2of3(
+    parts: &[crate::threshold_kek::KekShare; 2],
+    expected: Option<&KekVerifyHash>,
+) -> Result<zeroize::Zeroizing<[u8; 32]>, crate::error::MilnetError> {
+    let raw = crate::threshold_kek::reconstruct_secret(&parts[..])
+        .map_err(crate::error::MilnetError::KekReconstruction)?;
+
+    let mut kek = zeroize::Zeroizing::new([0u8; 32]);
+    if raw.len() != 32 {
+        // raw is `Vec<u8>`; zeroize on the way out via Drop.
+        return Err(crate::error::MilnetError::KekReconstruction(format!(
+            "reconstructed secret length is {}, expected 32",
+            raw.len()
+        )));
     }
-    crate::threshold_kek::reconstruct_secret(&shares[..C2_THRESHOLD as usize])
+    kek.copy_from_slice(&raw);
+    // Drop `raw` (zeroized) — the caller now holds the only live copy.
+    drop(raw);
+
+    if let Some(commitment) = expected {
+        use subtle::ConstantTimeEq;
+        let computed = compute_kek_verify_blake3(&kek);
+        let ok: bool = computed.ct_eq(commitment).into();
+        if !ok {
+            // `kek` is zeroized on drop via Zeroizing; no extra wipe needed.
+            return Err(crate::error::MilnetError::CorruptedKekShare);
+        }
+    }
+
+    Ok(kek)
 }
 
 // --- PKCS#11 backend (feature = "cac") ----------------------------------
@@ -1656,7 +1702,15 @@ fn unseal_kek_2of3_pkcs11() -> Result<KekUnsealResult, String> {
         ));
     }
 
-    let kek = reconstruct_2of3(shares)?;
+    let parts: [crate::threshold_kek::KekShare; 2] = [shares[0].clone(), shares[1].clone()];
+    // X-C / Phase 8 prereq (sealed_keys.rs around line 1705): pass
+    // `Some(&commitment)` once `MILNET_VSS_COMMITMENTS` is wired through
+    // the boot path. Until then, reconstruction proceeds without the
+    // commitment check and is only protected by the slot-side ACLs.
+    let kek_z = reconstruct_2of3(&parts, None).map_err(|e| e.to_string())?;
+    let mut kek = [0u8; 32];
+    kek.copy_from_slice(&kek_z[..]);
+    drop(kek_z);
     let verify_hash = kek_verify_hash(&kek);
     tracing::info!(
         "C2: KEK reconstructed via 2-of-3 PKCS#11 HSM unseal (slots used: {})",
@@ -1815,7 +1869,15 @@ fn unseal_kek_2of3_uds() -> Result<KekUnsealResult, String> {
         ));
     }
 
-    let kek = reconstruct_2of3(shares)?;
+    let parts: [crate::threshold_kek::KekShare; 2] = [shares[0].clone(), shares[1].clone()];
+    // X-C / Phase 8 prereq (sealed_keys.rs around line 1872): pass
+    // `Some(&commitment)` once `MILNET_VSS_COMMITMENTS` is wired through
+    // the boot path. UDS is dev-only; the commitment check matters here
+    // mainly for parity with the PKCS#11 path.
+    let kek_z = reconstruct_2of3(&parts, None).map_err(|e| e.to_string())?;
+    let mut kek = [0u8; 32];
+    kek.copy_from_slice(&kek_z[..]);
+    drop(kek_z);
     let verify_hash = kek_verify_hash(&kek);
     tracing::info!(
         "C2: KEK reconstructed via 2-of-3 UDS dev helpers (dev mode only)"

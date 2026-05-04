@@ -70,6 +70,12 @@ pub enum MilnetError {
 
     #[error("OIDC nonce mismatch")]
     OidcNonceMismatch,
+
+    #[error("corrupted KEK share — reconstructed key does not match expected commitment (X-C: silent slot poisoning rejected)")]
+    CorruptedKekShare,
+
+    #[error("KEK reconstruction failed: {0}")]
+    KekReconstruction(String),
 }
 
 impl MilnetError {
