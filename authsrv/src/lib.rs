@@ -292,7 +292,7 @@ impl IntoResponse for AsError {
     }
 }
 
-fn lock_or_fail<T>(m: &Mutex<T>, label: &'static str) -> Result<MutexGuard<'_, T>, AsError> {
+fn lock_or_fail<'a, T>(m: &'a Mutex<T>, label: &'static str) -> Result<MutexGuard<'a, T>, AsError> {
     m.lock().map_err(|_| {
         emit_audit_critical("lock.poisoned", &format!("mutex `{label}` poisoned"), None, None);
         AsError::server("server_error", "internal lock poisoned", "lock.poisoned")
