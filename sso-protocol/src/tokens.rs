@@ -482,11 +482,31 @@ impl Drop for RefreshToken {
 ///
 /// WARNING: This store is volatile. All refresh tokens are lost on process
 /// restart. In production, set `persistence_backend` to a durable store.
+///
+/// **X-H** — keys in `tokens` are the canonical lookup-key
+/// `hex(SHA-512(raw_token))` (see [`rt_lookup_key`]). The in-memory map
+/// MUST agree with the persistent layer's `token_hash` column or
+/// previously-issued refresh tokens become unredeemable on the first
+/// restart that hydrates the cache from disk.
 pub struct RefreshTokenStore {
     tokens: HashMap<String, RefreshToken>,
     /// Optional persistence backend name for operational awareness.
     /// When None, the store is purely in-memory (volatile).
     pub persistence_backend: Option<String>,
+}
+
+/// X-H: canonical lookup key for the in-memory refresh token cache.
+///
+/// Both the issue path and the redemption path MUST agree on the key
+/// formula for a token to remain redeemable across restarts. The
+/// persistent layer stores `token_hash = hex(SHA-512(raw_token))` in the
+/// `refresh_tokens.token_hash` column, so we use the same formula here.
+/// (Pre-fix, the in-memory map was keyed by raw token while
+/// `load_from_db` keyed by `token_hash` — every previously-issued
+/// refresh token became unredeemable on first restart.)
+fn rt_lookup_key(raw: &str) -> String {
+    use sha2::{Digest, Sha512};
+    hex::encode(Sha512::digest(raw.as_bytes()))
 }
 
 /// Custom Debug for RefreshTokenStore -- redacts token count only.
@@ -567,7 +587,10 @@ impl RefreshTokenStore {
         let mut token_value = format!("rt_{}", hex::encode(token_bytes));
         zeroize::Zeroize::zeroize(&mut token_bytes);
         let now = common::secure_time::secure_now_secs_i64();
-        let token_key = token_value.clone();
+        // X-H: key the in-memory map by the canonical lookup formula so
+        // the persistent layer's `token_hash` column agrees and the
+        // token survives a restart-then-redeem cycle.
+        let token_key = rt_lookup_key(&token_value);
         let token_stored = token_value.clone();
         self.tokens.insert(
             token_key,
@@ -600,7 +623,10 @@ impl RefreshTokenStore {
         token: &str,
         client_id: &str,
     ) -> Result<(RefreshToken, String), String> {
-        let rt = self.tokens.get(token).cloned()
+        // X-H: lookup via canonical key so cache-cold reads after restart
+        // (hydrated from `refresh_tokens.token_hash`) can match.
+        let lookup = rt_lookup_key(token);
+        let rt = self.tokens.get(&lookup).cloned()
             .ok_or_else(|| "refresh token not found".to_string())?;
 
         // SECURITY: Detect replay — if already used, this indicates token theft.
@@ -629,7 +655,8 @@ impl RefreshTokenStore {
         // Check expiry
         let now = common::secure_time::secure_now_secs_i64();
         if now > rt.expires_at {
-            self.tokens.remove(token);
+            // X-H: remove via the canonical lookup-key (computed above).
+            self.tokens.remove(&lookup);
             return Err("refresh token expired".to_string());
         }
 
@@ -638,8 +665,8 @@ impl RefreshTokenStore {
             return Err("refresh token client_id mismatch".to_string());
         }
 
-        // Mark old token as used
-        if let Some(entry) = self.tokens.get_mut(token) {
+        // Mark old token as used (looked up via canonical key — X-H).
+        if let Some(entry) = self.tokens.get_mut(&lookup) {
             entry.used = true;
         }
 
@@ -736,6 +763,12 @@ impl PersistentRefreshTokenStore {
         })?;
 
         for (token_hash, user_id, client_id, scope, expires_at, used, family_id) in rows {
+            // X-H: `token_hash` is the canonical lookup-key (hex SHA-512
+            // of the raw token). Both `issue_in_family` and `redeem` now
+            // key the in-memory map by the same formula, so the loaded
+            // entry is reachable by `RefreshTokenStore::redeem(raw_token)`
+            // after restart — pre-fix the in-memory map used the raw token
+            // as key and every restart-loaded token was unredeemable.
             self.memory.tokens.insert(token_hash, RefreshToken {
                 token: String::new(), // raw token not stored
                 user_id,
@@ -752,12 +785,11 @@ impl PersistentRefreshTokenStore {
     /// Issue a new refresh token, writing through to the database.
     pub async fn issue(&mut self, user_id: Uuid, client_id: &str, scope: &str) -> Result<String, String> {
         let token_value = self.memory.issue(user_id, client_id, scope);
-        let token_hash = {
-            use sha2::{Digest, Sha512};
-            hex::encode(Sha512::digest(token_value.as_bytes()))
-        };
+        // X-H: token_hash is the canonical lookup-key shared by the
+        // in-memory cache and the DB column.
+        let token_hash = rt_lookup_key(&token_value);
 
-        let rt = self.memory.tokens.get(&token_value).cloned()
+        let rt = self.memory.tokens.get(&token_hash).cloned()
             .ok_or("token not found after issue")?;
 
         sqlx::query(
@@ -786,23 +818,18 @@ impl PersistentRefreshTokenStore {
     ) -> Result<(RefreshToken, String), String> {
         let (old_rt, new_token) = self.memory.redeem(token, client_id)?;
 
-        // Mark old token as used in DB
-        let old_hash = {
-            use sha2::{Digest, Sha512};
-            hex::encode(Sha512::digest(token.as_bytes()))
-        };
+        // Mark old token as used in DB. X-H: hash matches in-memory key.
+        let old_hash = rt_lookup_key(token);
         sqlx::query("UPDATE refresh_tokens SET used = TRUE WHERE token_hash = $1")
             .bind(&old_hash)
             .execute(&self.pool)
             .await
             .map_err(|e| format!("mark token used in DB: {e}"))?;
 
-        // Insert new rotated token into DB (CNSA 2.0: SHA-512)
-        let new_hash = {
-            use sha2::{Digest, Sha512};
-            hex::encode(Sha512::digest(new_token.as_bytes()))
-        };
-        if let Some(new_rt) = self.memory.tokens.get(&new_token) {
+        // Insert new rotated token into DB. X-H: hash also keys the
+        // in-memory cache so the next redeem can find it.
+        let new_hash = rt_lookup_key(&new_token);
+        if let Some(new_rt) = self.memory.tokens.get(&new_hash) {
             sqlx::query(
                 "INSERT INTO refresh_tokens (token_hash, user_id, client_id, scope, expires_at, used, family_id) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7)"
@@ -1739,5 +1766,88 @@ mod tests {
         assert_eq!(store.tokens.len(), 2);
         drop(store);
         // If drop panics, the test fails. This verifies safe zeroization.
+    }
+
+    // ── X-H: refresh-token cache key is the canonical lookup-key ──────
+
+    /// Regression for `sso-protocol/src/tokens.rs:560-590` — the
+    /// in-memory map was keyed by raw token while `load_from_db`
+    /// inserted under `SHA-512(token_hash)`, so every restart-loaded
+    /// token was unredeemable. After X-H both paths use
+    /// [`rt_lookup_key`].
+    #[test]
+    fn issue_then_lookup_uses_canonical_key() {
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        let mut store = RefreshTokenStore::new().unwrap();
+        let user = Uuid::new_v4();
+        let raw = store.issue(user, "client-a", "openid");
+
+        // The in-memory map MUST be keyed by `rt_lookup_key(raw)`,
+        // never by the raw token. This is the exact invariant the
+        // load_from_db path needs to relate to.
+        let canonical = rt_lookup_key(&raw);
+        assert!(
+            store.tokens.contains_key(&canonical),
+            "X-H regression: in-memory cache must be keyed by canonical \
+             lookup-key (hex SHA-512(raw_token)) so load_from_db's \
+             token_hash matches"
+        );
+        assert!(
+            !store.tokens.contains_key(&raw),
+            "X-H regression: pre-fix the in-memory map was keyed by raw \
+             token — load_from_db can never reproduce that key after \
+             restart, so previously-issued tokens become unredeemable"
+        );
+    }
+
+    /// Simulate a restart-then-redeem cycle without Postgres: issue a
+    /// token, capture its raw value AND its canonical key, drop the
+    /// store, then re-build the store and manually re-insert under the
+    /// canonical key (mimicking `load_from_db`). Redeem must succeed.
+    #[test]
+    fn rt_survives_simulated_restart() {
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        let user = Uuid::new_v4();
+
+        // Phase 1: issue.
+        let mut store = RefreshTokenStore::new().unwrap();
+        let raw = store.issue(user, "client-a", "scope-x");
+        let canonical = rt_lookup_key(&raw);
+        let snapshot = store.tokens.get(&canonical).cloned()
+            .expect("issued token must be retrievable by canonical key");
+
+        // Phase 2: drop the store (simulates process restart).
+        drop(store);
+
+        // Phase 3: rebuild from "DB" — manually insert under the same
+        // canonical key formula `load_from_db` uses.
+        let mut rehydrated = RefreshTokenStore::new().unwrap();
+        rehydrated.tokens.insert(canonical.clone(), RefreshToken {
+            // `load_from_db` does not persist the raw token (security:
+            // raw tokens should not survive a restart on disk). We
+            // mimic that here.
+            token: String::new(),
+            user_id: snapshot.user_id,
+            client_id: snapshot.client_id.clone(),
+            scope: snapshot.scope.clone(),
+            expires_at: snapshot.expires_at,
+            used: snapshot.used,
+            family_id: snapshot.family_id.clone(),
+        });
+
+        // Phase 4: redeem the original raw token. Pre-fix this returned
+        // "refresh token not found" because the in-memory key was raw
+        // and the rehydrated key was canonical. Post-fix both are
+        // canonical, so the lookup succeeds.
+        let result = rehydrated.redeem(&raw, "client-a");
+        assert!(
+            result.is_ok(),
+            "X-H regression: refresh token must be redeemable across a \
+             restart-rehydrate cycle, got {:?}",
+            result.err()
+        );
+        let (old_rt, new_token) = result.unwrap();
+        assert_eq!(old_rt.user_id, user);
+        assert!(new_token.starts_with("rt_"));
     }
 }
