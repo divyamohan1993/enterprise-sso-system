@@ -17,24 +17,35 @@
 //! ## Wire protocol (line-oriented over UDS)
 //!
 //! ```text
-//! HEALTH                       -> "OK <pid> <iso8601>\n"
-//! SIGN <hex-32-byte-hash>      -> "SIG <hex-encoded-ml-dsa-87-signature>\n"
-//! VK                           -> "VK <hex-encoded-verifying-key>\n"
+//! HEALTH                                  -> "OK <pid> <iso8601>\n"
+//! SIGN <decimal-seq> <hex-32-byte-hash>   -> "SIG <hex-encoded-ml-dsa-87-signature>\n"
+//! VK                                      -> "VK <hex-encoded-verifying-key>\n"
 //! ```
 //!
 //! Any malformed request is answered with `ERR <reason>\n` and the connection
 //! is closed.
+//!
+//! X-K hardening: every SIGN payload is signed with the audit-witness FIPS 204
+//! domain tag (`AUDIT_WITNESS_DOMAIN`) so a witness signature cannot be
+//! cross-presented as any other ML-DSA-87 signature in the system, and every
+//! SIGN request must carry a strictly-monotonic `seq` that the witness
+//! persists in `<data_dir>/witness_seq.log` (chain-hashed, fsynced) so a
+//! compromised audit service cannot equivocate between observers.
 
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
 
+use audit_witness::{process_request, WitnessSeqState};
 use ml_dsa::{KeyGen, MlDsa87};
 use std::io::{BufRead, BufReader, Write};
 use zeroize::Zeroize;
 
 /// Default socket path. Override via `MILNET_AUDIT_WITNESS_SOCK`.
 const DEFAULT_SOCK: &str = "/run/milnet/audit-witness.sock";
+
+/// Default data dir for the persisted witness sequence chain.
+const DEFAULT_DATA_DIR: &str = "/var/lib/milnet/audit-witness";
 
 /// Env var carrying an inherited fd whose contents are a witness seed
 /// derived from a source INDEPENDENT of the master KEK (HSM / KMS /
@@ -48,6 +59,9 @@ const AUDIT_UID_ENV: &str = "MILNET_AUDIT_UID";
 
 /// Env var that supplies the audit service's pid for the startup co-location check.
 const AUDIT_PID_ENV: &str = "MILNET_AUDIT_PID";
+
+/// Env var for the persisted witness sequence chain directory.
+const DATA_DIR_ENV: &str = "MILNET_AUDIT_WITNESS_DATA_DIR";
 
 fn main() {
     // MUST be first: harden process before any allocation that could hold a secret.
@@ -88,6 +102,37 @@ fn main() {
     let vk_bytes = verifying_key.encode();
     let vk_hex = hex::encode(AsRef::<[u8]>::as_ref(&vk_bytes));
     tracing::info!(vk_prefix = %&vk_hex[..16], "audit-witness key loaded");
+
+    // ── X-K: load and verify the persisted per-witness sequence chain ────
+    // Any tamper detected on disk is fatal: signing with a chain whose
+    // integrity is in doubt would let an attacker rewrite history. We exit
+    // with code 11 so the supervisor surfaces the SIEM event.
+    let data_dir = PathBuf::from(
+        std::env::var(DATA_DIR_ENV).unwrap_or_else(|_| DEFAULT_DATA_DIR.to_string()),
+    );
+    let seq_state = match WitnessSeqState::open(&data_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                target: "siem",
+                severity = "CRITICAL",
+                action = "audit_witness.seq_log_load_failed",
+                error = %e,
+                "FATAL: audit-witness seq chain failed to load — refusing to start"
+            );
+            std::process::exit(11);
+        }
+    };
+    if let Some(s) = seq_state.last_seq() {
+        tracing::info!(
+            "audit-witness seq chain loaded; last_seq={}, chain_prefix={}",
+            s,
+            hex::encode(&seq_state.last_chain()[..8])
+        );
+    } else {
+        tracing::info!("audit-witness seq chain empty — fresh start");
+    }
+    let seq_state: Mutex<WitnessSeqState> = Mutex::new(seq_state);
 
     // ── Bind the UDS ─────────────────────────────────────────────────────
     let path = PathBuf::from(&sock_path);
@@ -143,7 +188,7 @@ fn main() {
                         continue;
                     }
                 }
-                handle_client(stream, &signing_key, &vk_hex);
+                handle_client(stream, &seq_state, &signing_key, &vk_hex);
             }
             Err(e) => {
                 tracing::warn!("accept error: {}", e);
@@ -277,50 +322,31 @@ fn verify_peer_uid(stream: &UnixStream, expected_uid: u32) -> Result<(), String>
 
 fn handle_client(
     mut stream: UnixStream,
+    seq_state: &Mutex<WitnessSeqState>,
     signing_key: &crypto::pq_sign::PqSigningKey,
     vk_hex: &str,
 ) {
-    let mut reader = BufReader::new(stream.try_clone().expect("stream clone"));
+    let cloned = match stream.try_clone() {
+        Ok(c) => c,
+        Err(e) => {
+            // Don't panic on EMFILE / ENFILE: that is exactly the DoS the
+            // attacker wants. Drop the connection and keep serving.
+            tracing::warn!("accept clone failed: {}", e);
+            return;
+        }
+    };
+    let mut reader = BufReader::new(cloned);
     let mut line = String::new();
     if let Err(e) = reader.read_line(&mut line) {
         tracing::warn!("read_line: {}", e);
         return;
     }
     let line = line.trim();
-    let response = process_request(line, signing_key, vk_hex);
+    let response = process_request(line, seq_state, signing_key, vk_hex);
     if let Err(e) = stream.write_all(response.as_bytes()) {
         tracing::warn!("write response: {}", e);
     }
     let _ = stream.flush();
-}
-
-fn process_request(
-    request: &str,
-    signing_key: &crypto::pq_sign::PqSigningKey,
-    vk_hex: &str,
-) -> String {
-    if request == "HEALTH" {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        return format!("OK {} {}\n", std::process::id(), ts);
-    }
-    if request == "VK" {
-        return format!("VK {}\n", vk_hex);
-    }
-    if let Some(hex_hash) = request.strip_prefix("SIGN ") {
-        let bytes = match hex::decode(hex_hash) {
-            Ok(b) => b,
-            Err(e) => return format!("ERR hex decode: {}\n", e),
-        };
-        if bytes.len() != 32 {
-            return format!("ERR expected 32-byte hash, got {}\n", bytes.len());
-        }
-        let sig = crypto::pq_sign::pq_sign_raw(signing_key, &bytes);
-        return format!("SIG {}\n", hex::encode(&sig));
-    }
-    format!("ERR unknown command: {}\n", request)
 }
 
 #[allow(dead_code)]

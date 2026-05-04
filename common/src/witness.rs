@@ -116,10 +116,12 @@ impl WitnessLog {
 
     /// Add a signed checkpoint using a provided signing function.
     ///
-    /// The signing function receives the concatenation of `audit_root || kt_root ||
-    /// sequence_be || timestamp_be` and returns the ML-DSA-87 signature bytes.
-    /// Including sequence and timestamp in the signed data prevents replay and
-    /// ensures checkpoint ordering is cryptographically bound.
+    /// The signing function receives the per-checkpoint `seq` and the
+    /// concatenation of `audit_root || kt_root || sequence_be || timestamp_be`,
+    /// and returns the ML-DSA-87 signature bytes. The seq is exposed
+    /// explicitly because the audit-witness binary uses it to enforce a
+    /// strict-monotonic counter on its side (replay / equivocation defense)
+    /// and binds it into the signed payload independently of the data hash.
     ///
     /// SECURITY (D1): The witness signing key MUST live in a separate process.
     /// Production deploys the dedicated `audit-witness` binary (under
@@ -133,7 +135,7 @@ impl WitnessLog {
         &mut self,
         audit_root: [u8; 64],
         kt_root: [u8; 64],
-        sign_fn: impl FnOnce(&[u8]) -> Vec<u8>,
+        sign_fn: impl FnOnce(u64, &[u8]) -> Vec<u8>,
     ) {
         let seq = self.checkpoints.len() as u64;
         let ts = std::time::SystemTime::now()
@@ -147,7 +149,7 @@ impl WitnessLog {
         data.extend_from_slice(&kt_root);
         data.extend_from_slice(&seq.to_be_bytes());
         data.extend_from_slice(&ts.to_be_bytes());
-        let signature = sign_fn(&data);
+        let signature = sign_fn(seq, &data);
         self.add_checkpoint(audit_root, kt_root, signature);
     }
 
@@ -404,13 +406,21 @@ fn load_and_verify_checkpoints(path: &Path) -> Vec<WitnessCheckpoint> {
             return verified;
         }
 
-        // Verify ML-DSA-87 signature
+        // X-K: verify the audit-witness ML-DSA-87 signature using the same
+        // domain-tagged composition the witness uses on the signing side:
+        //   payload = seq_be || SHA-256(audit_root || kt_root || seq_be || ts_be)
+        // FIPS 204 ctx is `MILNET-RAW-SIGN-v1 || 0x1F || AUDIT_WITNESS_DOMAIN`.
         if let Some(ref vk) = vk_bytes {
-            let mut signed_data = Vec::with_capacity(128 + 16);
-            signed_data.extend_from_slice(&cp.audit_root);
-            signed_data.extend_from_slice(&cp.kt_root);
-            signed_data.extend_from_slice(&cp.sequence.to_be_bytes());
-            signed_data.extend_from_slice(&cp.timestamp.to_be_bytes());
+            let mut audit_data = Vec::with_capacity(128 + 16);
+            audit_data.extend_from_slice(&cp.audit_root);
+            audit_data.extend_from_slice(&cp.kt_root);
+            audit_data.extend_from_slice(&cp.sequence.to_be_bytes());
+            audit_data.extend_from_slice(&cp.timestamp.to_be_bytes());
+            use sha2::{Digest, Sha256};
+            let pre_hash: [u8; 32] = Sha256::digest(&audit_data).into();
+            let mut signed_data = [0u8; 40];
+            signed_data[0..8].copy_from_slice(&cp.sequence.to_be_bytes());
+            signed_data[8..40].copy_from_slice(&pre_hash);
 
             if !verify_checkpoint_signature(vk, &signed_data, &cp.signature) {
                 sig_failures += 1;
@@ -437,9 +447,22 @@ fn load_and_verify_checkpoints(path: &Path) -> Vec<WitnessCheckpoint> {
     verified
 }
 
-/// Verify an ML-DSA-87 signature on checkpoint data.
+/// X-K: domain separator for ML-DSA-87 audit-witness checkpoint signatures.
+/// Must match `audit_witness::AUDIT_WITNESS_DOMAIN` byte-for-byte. We
+/// duplicate the constant here rather than introduce a `crypto` dep on
+/// `common` (which would cycle: `crypto` -> `common`) or a `services/*`
+/// dep on `common` (which is layering inversion).
+const AUDIT_WITNESS_DOMAIN: &[u8; 32] = b"AUDIT-WITNESS-CHECKPOINT-v1\0\0\0\0\0";
+
+/// FIPS 204 raw-sign context used by `crypto::pq_sign::pq_sign_raw_domain` —
+/// kept in sync here so we can verify without a `crypto` dep cycle.
+const CTX_RAW_SIGN: &[u8] = b"MILNET-RAW-SIGN-v1";
+
+/// Verify an ML-DSA-87 audit-witness signature, using the same FIPS 204
+/// domain-tagged context the witness signs with. `data` is the 40-byte
+/// payload `seq_be || SHA-256(audit_root || kt_root || seq_be || ts_be)`.
 fn verify_checkpoint_signature(vk_bytes: &[u8], data: &[u8], sig_bytes: &[u8]) -> bool {
-    use ml_dsa::{signature::Verifier, EncodedVerifyingKey, MlDsa87, VerifyingKey};
+    use ml_dsa::{EncodedVerifyingKey, MlDsa87, VerifyingKey};
 
     let vk_enc = match EncodedVerifyingKey::<MlDsa87>::try_from(vk_bytes) {
         Ok(enc) => enc,
@@ -450,7 +473,11 @@ fn verify_checkpoint_signature(vk_bytes: &[u8], data: &[u8], sig_bytes: &[u8]) -
         Ok(s) => s,
         Err(_) => return false,
     };
-    vk.verify(data, &sig).is_ok()
+    let mut ctx = Vec::with_capacity(CTX_RAW_SIGN.len() + 1 + AUDIT_WITNESS_DOMAIN.len());
+    ctx.extend_from_slice(CTX_RAW_SIGN);
+    ctx.push(0x1F);
+    ctx.extend_from_slice(AUDIT_WITNESS_DOMAIN);
+    vk.verify_with_context(data, &ctx, &sig)
 }
 
 /// Load all checkpoints from a length-prefixed postcard file.
