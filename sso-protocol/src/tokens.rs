@@ -194,7 +194,7 @@ impl JtiReplayStore for DatabaseJtiStore {
         // L1 cache hit means we already saw this JTI in-process —
         // returning `Ok(false)` (not fresh, replay) is correct without
         // touching the DB.
-        if self.local.is_used(jti) {
+        if <LocalJtiStore as JtiReplayStore>::is_used(&self.local, jti) {
             return Ok(false);
         }
 
@@ -215,7 +215,7 @@ impl JtiReplayStore for DatabaseJtiStore {
     }
 
     fn is_used(&self, jti: &str) -> bool {
-        if self.local.is_used(jti) {
+        if <LocalJtiStore as JtiReplayStore>::is_used(&self.local, jti) {
             return true;
         }
         // X-G: fail-closed — assume the JTI IS used, force the caller
@@ -293,7 +293,7 @@ impl AsyncJtiReplayStore for DatabaseJtiStore {
     {
         Box::pin(async move {
             // L1 hit — replay, no DB roundtrip.
-            if self.local.is_used(jti) {
+            if <LocalJtiStore as JtiReplayStore>::is_used(&self.local, jti) {
                 return Ok(false);
             }
 
@@ -320,7 +320,7 @@ impl AsyncJtiReplayStore for DatabaseJtiStore {
             let was_fresh = result.rows_affected() == 1;
 
             if was_fresh {
-                if let Err(e) = self.local.mark_used(jti, expires_at) {
+                if let Err(e) = <LocalJtiStore as JtiReplayStore>::mark_used(&self.local, jti, expires_at) {
                     tracing::warn!(
                         target: "siem",
                         "JTI L1 cache mark_used failed for jti={jti}: {e}. \
@@ -337,7 +337,7 @@ impl AsyncJtiReplayStore for DatabaseJtiStore {
         jti: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
         Box::pin(async move {
-            if self.local.is_used(jti) {
+            if <LocalJtiStore as JtiReplayStore>::is_used(&self.local, jti) {
                 return true;
             }
             match sqlx::query_scalar::<_, i64>(
