@@ -1,0 +1,693 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MILNET SSO &middot; Executive Overview</title>
+<meta name="description" content="MILNET SSO four-page executive overview: use case, deployment, location, cost, customers, and competitive position.">
+<meta name="robots" content="noindex">
+<link rel="stylesheet" href="/fonts/jetbrains-mono.css">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --fd: 'Instrument Serif', Georgia, serif;
+    --fh: 'Sentient', Georgia, serif;
+    --fl: 'Geist', system-ui, sans-serif;
+    --fu: 'Inter', system-ui, sans-serif;
+    --f:  'Times New Roman', Times, serif;
+    --fm: 'Geist Mono', 'JetBrains Mono', monospace;
+
+    --s9: #0c0f1a; --s8: #1f2433; --s7: #2e3347;
+    --s6: #475569; --s5: #6b7280; --s4: #9ca3af;
+    --s3: #cbd5e1; --s2: #e5e7eb; --s1: #f3f4f6; --s0: #fafafc;
+    --paper: #fbfbf7;
+
+    --g: #059669; --g2: #047857;
+    --b: #3b82f6; --b2: #1d4ed8;
+    --a: #f59e0b; --a2: #b45309;
+    --p: #8b5cf6; --p2: #6d28d9;
+    --c: #06b6d4; --c2: #0e7490;
+    --r: #ef4444; --r2: #b91c1c;
+    --gold: #facc15;
+    --navy: #0c0f1a;
+  }
+
+  html { font-size: 16px; }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { transition: none !important; animation: none !important; }
+  }
+
+  body {
+    background: #d9dce4;
+    color: var(--s9);
+    font-family: var(--f);
+    line-height: 1.5;
+    padding: 28px 0;
+    display: flex; flex-direction: column; align-items: center; gap: 28px;
+    min-height: 100vh;
+  }
+
+  a { color: var(--b); text-decoration: none; border-bottom: 1px dotted rgba(59,130,246,0.4); }
+  a:hover, a:focus-visible { color: #1d4ed8; }
+  a:focus-visible { outline: 2px solid var(--b); outline-offset: 2px; }
+
+  /* ─── PAGE: A4 portrait, fixed geometry ─── */
+  .page {
+    width: 210mm;
+    height: 297mm;
+    background: var(--paper);
+    box-shadow: 0 10px 40px rgba(0,0,0,0.18), 0 2px 6px rgba(0,0,0,0.08);
+    position: relative;
+    overflow: hidden;
+    display: grid;
+    grid-template-rows: auto 1fr auto;
+    color: var(--s9);
+  }
+
+  /* ─── BAND (full-bleed dark navy + corporate-gradient stripe) ─── */
+  .band {
+    background: linear-gradient(135deg, #0c0f1a 0%, #131a2e 40%, #0e1a2d 100%);
+    color: #fff;
+    position: relative;
+    padding: 14mm 16mm 8mm;
+  }
+  .band::after {
+    content: ''; position: absolute; bottom: 0; left: 0; right: 0; height: 2.2mm;
+    background: linear-gradient(90deg, var(--g) 0%, var(--b) 25%, var(--p) 50%, var(--c) 75%, var(--g) 100%);
+  }
+  .band.compact { padding: 8mm 16mm 5mm; }
+  .band.compact::after { height: 1.6mm; }
+  .band .row {
+    display: flex; justify-content: space-between; align-items: flex-end;
+    gap: 10mm;
+  }
+  .band h1 {
+    font: 400 26pt/1 var(--fd); color: #fff; letter-spacing: 0.5px;
+    text-shadow: 0 0 30px rgba(5,150,105,0.3), 0 0 60px rgba(59,130,246,0.15);
+  }
+  .band.compact h1 { font-size: 17pt; }
+  .band .sub {
+    font: 400 10pt/1.4 var(--fu); color: #94a3b8; margin-top: 1.5mm;
+  }
+  .band.compact .sub { font-size: 9pt; margin-top: 1mm; }
+  .band .meta { text-align: right; font: 400 9pt/1.4 var(--fu); color: #cbd5e1; }
+  .band .badge {
+    display: inline-block; padding: 1.5mm 3mm; margin-bottom: 1.5mm;
+    font: 700 8pt var(--fl); letter-spacing: 1.4px; text-transform: uppercase;
+    background: linear-gradient(135deg, rgba(250,204,21,0.18), rgba(250,204,21,0.06));
+    color: var(--gold); border: 1px solid rgba(250,204,21,0.3);
+    border-radius: 1.5mm;
+  }
+  .band.compact .meta { font-size: 8.5pt; }
+
+  /* ─── INNER CONTENT AREA ─── */
+  .inner {
+    padding: 11mm 16mm 9mm;
+    display: flex; flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* ─── HERO (page 1) ─── */
+  .hero { padding-bottom: 7mm; border-bottom: 0.5pt solid var(--s2); margin-bottom: 7mm; }
+  .hero .kicker {
+    font: 700 9pt var(--fl); color: var(--g2);
+    letter-spacing: 2px; text-transform: uppercase;
+    margin-bottom: 4mm;
+  }
+  .hero h2 {
+    font: 400 28pt/1.16 var(--fd); color: var(--s9);
+    letter-spacing: -0.01em; max-width: 22em;
+  }
+  .hero h2 em { font-style: italic; color: var(--g2); }
+  .hero .lede {
+    margin-top: 5mm;
+    font: 400 11pt/1.55 var(--f); color: var(--s7);
+    max-width: 40em;
+  }
+  .hero .lede strong { color: var(--s9); font-family: var(--fl); font-weight: 700; }
+  .hero .nums {
+    margin-top: 6mm;
+    display: grid; grid-template-columns: repeat(5, 1fr);
+    gap: 0.4mm;
+    background: rgba(0,0,0,0.06);
+    border-radius: 2mm;
+    overflow: hidden;
+  }
+  .hero .nums .n {
+    background: rgba(255,255,255,0.6);
+    padding: 4mm 4mm; text-align: left;
+  }
+  .hero .nums .nv {
+    font: 700 16pt/1 var(--fl); color: var(--s9);
+    font-variant-numeric: tabular-nums;
+  }
+  .hero .nums .nl {
+    font: 600 7pt var(--fu); color: var(--s5);
+    text-transform: uppercase; letter-spacing: 0.9px; margin-top: 1.2mm;
+  }
+
+  /* ─── SECTION HEADER ─── */
+  .sec-h {
+    display: flex; align-items: baseline; gap: 4mm;
+    padding-bottom: 2.5mm; margin-bottom: 4mm;
+    border-bottom: 0.5pt solid var(--s2);
+  }
+  .sec-h .num {
+    font: 700 9pt var(--fl); color: var(--s5);
+    letter-spacing: 2px; text-transform: uppercase;
+  }
+  .sec-h .title {
+    font: 600 13.5pt var(--fh); color: var(--s9); line-height: 1.25; flex: 1;
+  }
+  .sec-h .pill {
+    font: 700 7pt var(--fl); color: #fff;
+    padding: 1mm 2.5mm; border-radius: 20px;
+    letter-spacing: 0.6px; text-transform: uppercase;
+    white-space: nowrap;
+  }
+  .sec-h .pill.g { background: linear-gradient(135deg, var(--g2), var(--g)); }
+  .sec-h .pill.b { background: linear-gradient(135deg, var(--b2), var(--b)); }
+  .sec-h .pill.a { background: linear-gradient(135deg, var(--a2), #d97706); }
+  .sec-h .pill.p { background: linear-gradient(135deg, var(--p2), var(--p)); }
+  .sec-h .pill.c { background: linear-gradient(135deg, var(--c2), var(--c)); }
+  .sec-h .pill.gold { background: linear-gradient(135deg, #854d0e, #ca8a04); }
+
+  section { break-inside: avoid; }
+  section + section { margin-top: 9mm; }
+  section p {
+    font: 400 10.5pt/1.6 var(--f); color: var(--s7);
+    margin-top: 3mm;
+  }
+  section p:first-of-type { margin-top: 0; }
+  section p strong { color: var(--s9); font-family: var(--fl); font-weight: 700; }
+  section p em { color: var(--s9); font-style: italic; }
+  section ul { list-style: none; margin-top: 3mm; }
+  section li {
+    font: 400 10.5pt/1.55 var(--f); color: var(--s7);
+    padding-left: 5mm; position: relative; margin-top: 1.5mm;
+  }
+  section li:first-child { margin-top: 0; }
+  section li::before {
+    content: ''; position: absolute; left: 0; top: 1.9mm;
+    width: 2mm; height: 2mm; border-radius: 50%;
+  }
+  section.s1 li::before { background: var(--g); }
+  section.s2 li::before { background: var(--b); }
+  section.s3 li::before { background: #d97706; }
+  section.s4 li::before { background: var(--p); }
+  section.s5 li::before { background: var(--c); }
+  section.s6 li::before { background: #ca8a04; }
+  section li strong { font: 600 9.5pt var(--fm); color: var(--s9); }
+  section code {
+    font: 400 9.5pt var(--fm); color: var(--s9);
+    background: rgba(0,0,0,0.04); padding: 0.3mm 1.2mm; border-radius: 1mm;
+  }
+
+  /* ─── DEPLOY PHASES ─── */
+  .phases {
+    display: flex; gap: 1.5mm; flex-wrap: wrap;
+    font: 600 8.5pt var(--fm);
+    margin: 3mm 0 4mm;
+  }
+  .phases .ph {
+    padding: 1.2mm 2.6mm; border-radius: 1.2mm;
+    background: rgba(59,130,246,0.1); color: var(--b2);
+    border: 1px solid rgba(59,130,246,0.18);
+  }
+  .phases .arr { color: var(--s4); align-self: center; font-weight: 700; }
+
+  /* ─── COST TABLE (page 3 §04) ─── */
+  .cost {
+    width: 100%; border-collapse: collapse;
+    font: 400 10pt/1.5 var(--f);
+    margin-top: 2mm;
+    table-layout: fixed;
+  }
+  .cost thead tr {
+    background: linear-gradient(135deg, #0c0f1a, #1e293b); color: #fff;
+  }
+  .cost th {
+    text-align: left; padding: 2.5mm 3.5mm;
+    font: 700 7.5pt var(--fl); letter-spacing: 1px; text-transform: uppercase;
+  }
+  .cost th.r { text-align: right; }
+  .cost td {
+    padding: 2.8mm 3.5mm; border-top: 0.4pt solid var(--s2);
+    color: var(--s7); vertical-align: top;
+  }
+  .cost tbody tr { background: rgba(255,255,255,0.5); }
+  .cost tbody tr:nth-child(even) { background: rgba(243,244,246,0.6); }
+  .cost tbody tr.gov { background: rgba(5,150,105,0.08); }
+  .cost td.profile {
+    font: 600 10pt var(--fl); color: var(--s9); white-space: nowrap;
+  }
+  .cost td.foot { font: 400 9.5pt var(--f); color: var(--s7); }
+  .cost td.price {
+    text-align: right; font: 700 10pt var(--fl); color: var(--s9);
+    font-variant-numeric: tabular-nums; white-space: nowrap;
+  }
+  .cost td.price.warn { color: var(--a2); }
+  .cost tr.gov td.price { color: var(--g2); }
+
+  /* ─── CUSTOMER CHIPS (page 3 §05) ─── */
+  .chips {
+    display: grid; grid-template-columns: 1fr 1fr;
+    gap: 5mm 8mm;
+    margin-top: 2mm;
+  }
+  .chip {
+    border-left: 0.8mm solid;
+    padding: 1mm 0 1mm 4mm;
+  }
+  .chip.g { border-color: var(--g); }
+  .chip.b { border-color: var(--b); }
+  .chip.a { border-color: #d97706; }
+  .chip.p { border-color: var(--p); }
+  .chip.c { border-color: var(--c); }
+  .chip.gold { border-color: #ca8a04; }
+  .chip .label {
+    font: 700 10pt var(--fl); color: var(--s9);
+  }
+  .chip .why {
+    font: 400 9.5pt/1.5 var(--f); color: var(--s7);
+    margin-top: 1mm;
+  }
+
+  /* ─── COMPETITION TABLE (page 4 §06) ─── */
+  .comp {
+    width: 100%; border-collapse: collapse;
+    font: 400 9pt/1.4 var(--f);
+    margin-top: 2mm;
+    table-layout: fixed;
+  }
+  .comp thead tr {
+    background: linear-gradient(135deg, #0c0f1a, #1e293b); color: #fff;
+  }
+  .comp th {
+    text-align: left; padding: 2.2mm 2.5mm;
+    font: 700 7pt var(--fl); letter-spacing: 0.6px; text-transform: uppercase;
+    vertical-align: bottom;
+  }
+  .comp th.us { background: linear-gradient(135deg, var(--g2), var(--g)); }
+  .comp th.center, .comp td.center { text-align: center; }
+  .comp td {
+    padding: 2mm 2.5mm; border-top: 0.3pt solid var(--s2);
+    color: var(--s7); vertical-align: middle;
+  }
+  .comp tbody tr { background: rgba(255,255,255,0.4); }
+  .comp tbody tr:nth-child(even) { background: rgba(243,244,246,0.55); }
+  .comp tbody tr.us { background: rgba(5,150,105,0.08); }
+  .comp tbody tr.us:nth-child(even) { background: rgba(5,150,105,0.12); }
+  .comp td.sys { font: 600 9pt var(--fl); color: var(--s9); }
+  .comp td.us-cell { color: var(--g2); font-weight: 700; }
+  .comp .check { color: var(--g); font: 700 10pt var(--fm); }
+  .comp .x { color: #cbd5e1; font: 700 9pt var(--fm); }
+  .comp .partial { font: 600 7pt var(--fl); color: var(--a2); }
+  .comp .ok { font: 600 7pt var(--fl); color: var(--g2); }
+
+  /* ─── CTA STRIP (page 4 above footer) ─── */
+  .cta {
+    background: linear-gradient(135deg, #0c0f1a 0%, #162032 50%, #0f1729 100%);
+    color: #fff;
+    padding: 7mm 16mm;
+    display: grid; grid-template-columns: 1fr auto;
+    gap: 8mm; align-items: center;
+  }
+  .cta h3 {
+    font: 400 16pt/1.3 var(--fd); color: #fff; margin: 0 0 2mm;
+  }
+  .cta h3 em { font-style: italic; color: var(--gold); }
+  .cta p {
+    font: 400 9.5pt/1.5 var(--fu); color: var(--s3); margin: 0;
+  }
+  .cta .actions {
+    display: flex; flex-direction: column; align-items: flex-end; gap: 2mm;
+  }
+  .cta a.btn {
+    display: inline-block; padding: 2.5mm 6mm;
+    background: var(--gold); color: var(--navy);
+    border-radius: 1.2mm; border: 0;
+    font: 700 9.5pt var(--fl); letter-spacing: 0.5px;
+    text-transform: uppercase; white-space: nowrap;
+  }
+  .cta a.btn:hover, .cta a.btn:focus-visible { color: var(--navy); }
+  .cta .links { font: 400 8.5pt var(--fu); color: #cbd5e1; }
+  .cta .links a { color: #93c5fd; border-bottom-color: rgba(147,197,253,0.35); }
+
+  /* ─── PAGE FOOTER ─── */
+  .pgft {
+    background: linear-gradient(135deg, #0c0f1a 0%, #162032 50%, #0f1729 100%);
+    color: rgba(255,255,255,0.85);
+    padding: 4mm 16mm 4.5mm;
+    display: flex; justify-content: space-between; align-items: center;
+    font: 400 9pt var(--fu);
+    position: relative;
+  }
+  .pgft::before {
+    content: ''; position: absolute; top: 0; left: 0; right: 0; height: 1.6mm;
+    background: linear-gradient(90deg, var(--g) 0%, var(--b) 25%, var(--p) 50%, var(--c) 75%, var(--g) 100%);
+  }
+  .pgft strong { color: var(--gold); font-family: var(--fl); }
+  .pgft a { color: #93c5fd; border-bottom-color: rgba(147,197,253,0.35); }
+  .pgft .ftleft { display: flex; flex-direction: column; gap: 0.8mm; }
+  .pgft .lic {
+    font: 400 7.5pt/1.3 var(--fu); color: #94a3b8;
+    letter-spacing: 0.2px;
+  }
+  .pgft .pgnum {
+    font: 700 8.5pt var(--fl); color: #cbd5e1;
+    letter-spacing: 1.2px; text-transform: uppercase;
+    flex-shrink: 0;
+  }
+
+  /* ─── PRINT (zero margin, four A4 pages) ─── */
+  @media print {
+    @page { size: A4 portrait; margin: 0; }
+    html, body { background: #fff; padding: 0; margin: 0; width: 210mm; gap: 0; }
+    body { display: block; }
+    .page {
+      width: 210mm; height: 297mm;
+      box-shadow: none;
+      page-break-after: always; break-after: page;
+      margin: 0;
+    }
+    .page:last-of-type { page-break-after: auto; break-after: auto; }
+    .band, .pgft, .cta, .cost thead tr, .comp thead tr, .comp th.us {
+      -webkit-print-color-adjust: exact; print-color-adjust: exact;
+    }
+    a { color: var(--s9); border: 0; }
+    a[href]::after { content: ""; }
+  }
+  @media (forced-colors: active) {
+    .page, .cost, .comp, .cta { border: 1px solid CanvasText; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<!-- PAGE 1 OF 4 · COVER + USE CASE                          -->
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<article class="page" aria-label="Page 1 of 4">
+
+  <header class="band">
+    <div class="row">
+      <div>
+        <h1>MILNET Single Sign-On</h1>
+        <div class="sub">Executive Overview &middot; Capability Pamphlet</div>
+      </div>
+      <div class="meta">
+        <span class="badge">Executive Brief</span><br>
+        v1.0 &middot; 2026-05-06<br>
+        Built by <a href="https://dmj.one" style="color:#bfdbfe;">dmj.one</a>
+      </div>
+    </div>
+  </header>
+
+  <div class="inner">
+
+    <section class="hero" aria-labelledby="hero-h">
+      <div class="kicker">Six questions, four pages, all the answers a regulated buyer asks</div>
+      <h2 id="hero-h">Post-quantum, formally-verified, threshold-signed enterprise <em>single sign-on</em>.</h2>
+      <p class="lede">All four pillars implemented in one stack: <strong>post-quantum identity, threshold issuance, formal verification, Key Transparency.</strong> No commercial vendor ships the bundle. The window opens with the NSA 2030 deadline and closes when incumbents catch up.</p>
+      <div class="nums">
+        <div class="n"><span class="nv">266K</span><div class="nl">Lines Rust</div></div>
+        <div class="n"><span class="nv">19</span><div class="nl">TLA+ Proofs</div></div>
+        <div class="n"><span class="nv">5,422</span><div class="nl">Tests</div></div>
+        <div class="n"><span class="nv">21</span><div class="nl">VM Topology</div></div>
+        <div class="n"><span class="nv">36</span><div class="nl">Workspace Crates</div></div>
+      </div>
+    </section>
+
+    <section class="s1" aria-labelledby="s1">
+      <div class="sec-h">
+        <span class="num">01</span>
+        <span class="title" id="s1">Use case &middot; why this matters now</span>
+        <span class="pill g">Why now</span>
+      </div>
+      <p>Identity for buyers whose regulator has named a 2030 cryptographic deadline. Defence, banking, healthcare, critical infrastructure, sovereign cloud. <strong>Microsoft, Okta, Google, Ping have no generally-available post-quantum identity protocol in 2026.</strong> The window of advantage is two to four years.</p>
+      <ul>
+        <li><strong>NSA CNSA 2.0</strong> mandates ML-KEM (FIPS 203) and ML-DSA (FIPS 204) for new National Security Systems by 2027 start, 2033 complete.</li>
+        <li><strong>OMB M-23-02</strong> requires annual cryptographic inventory and post-quantum migration plan from every federal agency.</li>
+        <li><strong>OMB M-22-09</strong> mandates phishing-resistant MFA across the entire US federal civilian government.</li>
+        <li><strong>Harvest now, decrypt later:</strong> any data with greater-than-ten-year confidentiality is already exposed. Healthcare, intelligence, IP filings, M&amp;A, legal hold.</li>
+        <li>Closest analog systems are partial: Apple has Key Transparency at scale, Signal has post-quantum messaging, Estonia has classical threshold signatures. <em>None bundle all four into identity.</em></li>
+      </ul>
+    </section>
+
+  </div>
+
+  <footer class="pgft">
+    <div class="ftleft">
+      <div><strong>MILNET SSO</strong> &middot; <a href="mailto:contact@dmj.one">contact@dmj.one</a></div>
+      <div class="lic">&copy; 2026 dmj.one &middot; Licensed under Apache License 2.0 &middot; Patent grant with retaliation clause</div>
+    </div>
+    <div class="pgnum">Page 1 of 4</div>
+  </footer>
+
+</article>
+
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<!-- PAGE 2 OF 4 · DEPLOYMENT + LOCATION                     -->
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<article class="page" aria-label="Page 2 of 4">
+
+  <header class="band compact">
+    <div class="row">
+      <div>
+        <h1>MILNET SSO &middot; How and where it ships</h1>
+        <div class="sub">One bash command &middot; sovereign-ready GCP deployment</div>
+      </div>
+      <div class="meta">Page 2 of 4 &middot; Continued</div>
+    </div>
+  </header>
+
+  <div class="inner">
+
+    <section class="s2" aria-labelledby="s2">
+      <div class="sec-h">
+        <span class="num">02</span>
+        <span class="title" id="s2">Deployment &middot; one bash command</span>
+        <span class="pill b">30 minutes</span>
+      </div>
+      <p>One command. Twenty-one VMs. Three availability zones. Active-active. Under thirty minutes from empty cloud project to live OIDC issuer with FROST 3-of-5 token signing.</p>
+      <div class="phases">
+        <span class="ph">VPC + IAP</span><span class="arr">&rarr;</span>
+        <span class="ph">Shielded VMs</span><span class="arr">&rarr;</span>
+        <span class="ph">Key Ceremony</span><span class="arr">&rarr;</span>
+        <span class="ph">FROST DKG</span><span class="arr">&rarr;</span>
+        <span class="ph">Self-Signed CA</span><span class="arr">&rarr;</span>
+        <span class="ph">Systemd Start</span><span class="arr">&rarr;</span>
+        <span class="ph">Health Check</span>
+      </div>
+      <ul>
+        <li><code>./auto_provision.sh --project P --region asia-south2 --nodes 5</code> &middot; one-shot provisioning.</li>
+        <li><strong>Containers:</strong> distroless static-PIE, UID 65534, RELRO/NOW, cosign-signed, CycloneDX 1.5 SBOM emitted from <code>cargo metadata</code>.</li>
+        <li><strong>Kubernetes alternative:</strong> 3-replica Patroni Postgres, 3-node etcd, External Secrets Operator + Vault.</li>
+        <li><strong>Migrations:</strong> 11 numbered SQL files (tenancy, encrypted PII, audit envelope encryption, DPoP replay cache).</li>
+        <li><strong>Recovery:</strong> gateway managed instance group autoscales 1 to 50 on 60% CPU. <code>heal.sh</code> swaps a binary and restarts.</li>
+      </ul>
+    </section>
+
+    <section class="s3" aria-labelledby="s3">
+      <div class="sec-h">
+        <span class="num">03</span>
+        <span class="title" id="s3">Where we deploy &middot; sovereign-ready</span>
+        <span class="pill a">GCP &middot; Portable</span>
+      </div>
+      <p>Google Cloud first. Portable to AWS, Azure, on-premise, and air-gapped enclaves. <strong>India sovereignty by construction:</strong> deployable in Delhi, Mumbai, Hyderabad. DPDP Act 2023 + GDPR + CERT-In hooks built in.</p>
+      <ul>
+        <li><strong>GCP regions:</strong> <code>asia-south2</code> (Delhi, live), <code>asia-south1</code> (Mumbai, script default). Single-region multi-AZ active-active. No cross-region DR yet.</li>
+        <li><strong>21-VM topology:</strong> gateway, orchestrator, opaque, tss, ratchet, verifier, audit (11-node BFT), kt, risk, admin. TSS spread across <code>-a / -b / -c</code> AZs.</li>
+        <li><strong>GCP services touched:</strong> Compute (Shielded + AMD SEV-SNP Confidential), VPC + Cloud NAT + IAP, Cloud HSM + KMS + Secret Manager, Cloud Armor, External TCP LB, Binary Authorization, VPC-SC, Access Transparency, Security Command Center Premium.</li>
+        <li><strong>Not used:</strong> GKE, Cloud Run, Cloud SQL, Spanner, Pub/Sub. Postgres is self-managed for Confidential VM + dm-verity + PKCS#11 HSM access.</li>
+        <li><strong>Air-gap path:</strong> <code>offline-jwt</code> validates against pinned trust stores with CRDT-merged replay caches. Cleared-facility deployable.</li>
+      </ul>
+    </section>
+
+  </div>
+
+  <footer class="pgft">
+    <div class="ftleft">
+      <div><strong>MILNET SSO</strong> &middot; <a href="mailto:contact@dmj.one">contact@dmj.one</a></div>
+      <div class="lic">&copy; 2026 dmj.one &middot; Licensed under Apache License 2.0 &middot; Patent grant with retaliation clause</div>
+    </div>
+    <div class="pgnum">Page 2 of 4</div>
+  </footer>
+
+</article>
+
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<!-- PAGE 3 OF 4 · COST + CUSTOMERS                          -->
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<article class="page" aria-label="Page 3 of 4">
+
+  <header class="band compact">
+    <div class="row">
+      <div>
+        <h1>MILNET SSO &middot; Cost and customer fit</h1>
+        <div class="sub">Cost ladder &middot; six buyer profiles</div>
+      </div>
+      <div class="meta">Page 3 of 4 &middot; Continued</div>
+    </div>
+  </header>
+
+  <div class="inner">
+
+    <section class="s4" aria-labelledby="s4">
+      <div class="sec-h">
+        <span class="num">04</span>
+        <span class="title" id="s4">Cost &middot; what it takes to run</span>
+        <span class="pill p">USD/mo &middot; GCP list</span>
+      </div>
+      <p>GCP <code>asia-south1</code> on-demand list pricing, sustained-use discount applied. Self-host model: <strong>customer pays infrastructure directly to cloud, no markup.</strong> Software licensing tier publishes at FedRAMP Moderate Authorization.</p>
+      <table class="cost">
+        <thead>
+          <tr>
+            <th style="width: 36%;">Profile</th>
+            <th>Footprint</th>
+            <th class="r" style="width: 22%;">$/month</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td class="profile">Free-tier MVP</td><td class="foot">1 spot VM, k3s, no HSM. Demo / dev only.</td><td class="price">$50 &ndash; 80</td></tr>
+          <tr><td class="profile">Min viable production</td><td class="foot">5 VMs, 2 HSM keys, Cloud Armor, on-VM Vault.</td><td class="price">$780 &ndash; 1,500</td></tr>
+          <tr><td class="profile">10K monthly active users</td><td class="foot">21-VM full topology, ~10M auth events / month.</td><td class="price">$1,800 &ndash; 2,200</td></tr>
+          <tr><td class="profile">1M monthly active users</td><td class="foot">Gateway MIG 8 to 15 VMs, 500 RPS / 3K peak.</td><td class="price">$5,500 &ndash; 8,500</td></tr>
+          <tr class="gov"><td class="profile">Government-grade</td><td class="foot">Full Confidential, dedicated HSM, Assured Workloads, dual-region warm DR.</td><td class="price warn">$15K &ndash; 25K</td></tr>
+        </tbody>
+      </table>
+      <ul style="margin-top: 4mm;">
+        <li><strong>Certification budget</strong> (separate from infrastructure): $2.5M to $5.7M over 3 years for FIPS 140-3 L1, FedRAMP Moderate + High, NIAP CC EAL4+, CSfC, IL5. Ongoing $700K to $1.4M / year.</li>
+        <li><strong>5K-seat unit economics:</strong> $15 / user / month list = $900K ARR. Government-grade infrastructure $300K / year. <strong>67% gross margin</strong> before certification amortisation.</li>
+      </ul>
+    </section>
+
+    <section class="s5" aria-labelledby="s5">
+      <div class="sec-h">
+        <span class="num">05</span>
+        <span class="title" id="s5">Customers &middot; who buys this</span>
+        <span class="pill c">Regulated &middot; sovereign</span>
+      </div>
+      <p>Buyers whose cost of a credential leak is measured in lives, classified material, or front-page lawsuits, and whose regulator has named a 2030 deadline.</p>
+      <div class="chips">
+        <div class="chip g">
+          <div class="label">US Federal &amp; DoD</div>
+          <div class="why">Civilian agencies (FedRAMP Moderate / Class B-C), DoD components (IL4 / IL5), defence primes under CMMC L3.</div>
+        </div>
+        <div class="chip a">
+          <div class="label">India Government &amp; PSU</div>
+          <div class="why">Central ministries, state e-governance, BFSI under RBI / SEBI / IRDAI, defence PSUs (HAL, BEL, BDL, BEML).</div>
+        </div>
+        <div class="chip b">
+          <div class="label">Healthcare &amp; Pharma R&amp;D</div>
+          <div class="why">HIPAA hospitals, 21 CFR Part 11 trial sponsors, 25-year retention regimes where harvest-and-wait is existential.</div>
+        </div>
+        <div class="chip p">
+          <div class="label">Critical Infrastructure</div>
+          <div class="why">Energy grid, telecom carriers, central banks, satellite operators, water utilities. NERC CIP, NIS2, India CEA mandates.</div>
+        </div>
+        <div class="chip c">
+          <div class="label">Sovereign Cloud Channels</div>
+          <div class="why">Yotta, Tata Communications, ESDS, Bharti Airtel (India); G42 (UAE); STC (Saudi); OVHcloud Sovereign; Atos / Eviden.</div>
+        </div>
+        <div class="chip gold">
+          <div class="label">Financial Services &amp; CBDCs</div>
+          <div class="why">Tier-1 banks, central banks, exchanges, payment processors, custodians. Threshold signatures already familiar from custody.</div>
+        </div>
+      </div>
+    </section>
+
+  </div>
+
+  <footer class="pgft">
+    <div class="ftleft">
+      <div><strong>MILNET SSO</strong> &middot; <a href="mailto:contact@dmj.one">contact@dmj.one</a></div>
+      <div class="lic">&copy; 2026 dmj.one &middot; Licensed under Apache License 2.0 &middot; Patent grant with retaliation clause</div>
+    </div>
+    <div class="pgnum">Page 3 of 4</div>
+  </footer>
+
+</article>
+
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<!-- PAGE 4 OF 4 · COMPETITION + CTA                          -->
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<article class="page" aria-label="Page 4 of 4">
+
+  <header class="band compact">
+    <div class="row">
+      <div>
+        <h1>MILNET SSO &middot; Versus the field</h1>
+        <div class="sub">Four-cell test &middot; verified May 2026</div>
+      </div>
+      <div class="meta">Page 4 of 4 &middot; Final</div>
+    </div>
+  </header>
+
+  <div class="inner">
+
+    <section class="s6" aria-labelledby="s6">
+      <div class="sec-h">
+        <span class="num">06</span>
+        <span class="title" id="s6">Versus the field</span>
+        <span class="pill gold">Four-cell test</span>
+      </div>
+      <p>Pricing from official vendor pages on 2026-05-06. <strong>Four-cell test:</strong> post-quantum identity tokens / threshold signatures in auth / formal verification of auth core / Key Transparency at scale. Every other vendor scores at most one cell. MILNET is the only row with all four.</p>
+      <table class="comp">
+        <thead>
+          <tr>
+            <th style="width: 26%;">Vendor</th>
+            <th class="center" style="width: 13%;">$/user/mo</th>
+            <th class="center" style="width: 14%;">FedRAMP / IL</th>
+            <th class="center" style="width: 11.75%;">PQ identity</th>
+            <th class="center" style="width: 11.75%;">Threshold</th>
+            <th class="center" style="width: 11.75%;">Formal verif</th>
+            <th class="center" style="width: 11.75%;">Key Transp.</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td class="sys">Microsoft Entra ID P1 / P2 / Suite</td><td class="center">$6 / $9 / $12</td><td class="center">High &middot; IL4-6</td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td></tr>
+          <tr><td class="sys">Okta Workforce SSO / Core / Pro</td><td class="center">$6 / $14 / $17</td><td class="center">Mod &middot; <em>Gov:</em> High + IL4</td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td></tr>
+          <tr><td class="sys">Google Cloud Identity Premium</td><td class="center">~$6</td><td class="center">None</td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="partial">CT only</span></td></tr>
+          <tr><td class="sys">Google BeyondCorp Enterprise</td><td class="center">$6 / $9</td><td class="center">High &middot; IL4</td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td></tr>
+          <tr><td class="sys">Ping Identity / PingFederate</td><td class="center">$3 &ndash; 6</td><td class="center">Mod &middot; High WIP</td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td></tr>
+          <tr><td class="sys">SailPoint &middot; CyberArk</td><td class="center">Contact</td><td class="center">Mod / High</td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td></tr>
+          <tr><td class="sys">Cloudflare Zero Trust</td><td class="center">$7+</td><td class="center">Mod &middot; IL5 WIP</td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td></tr>
+          <tr><td class="sys">Beyond Identity &middot; Stytch &middot; Clerk</td><td class="center">Varies</td><td class="center">None</td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td></tr>
+          <tr><td class="sys">Apple Passkeys + iCloud CKV</td><td class="center">Free</td><td class="center">N/A consumer</td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="check">&check;</span></td></tr>
+          <tr><td class="sys">Estonia Smart-ID</td><td class="center">National</td><td class="center">National</td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="check">&check;</span><span class="partial"> RSA</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td></tr>
+          <tr><td class="sys">EUDI Wallet (eIDAS 2.0)</td><td class="center">National</td><td class="center">27 states</td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td></tr>
+          <tr><td class="sys">Signal Protocol &middot; iMessage PQ3</td><td class="center">Free</td><td class="center">N/A messaging</td><td class="center"><span class="check">&check;</span><span class="partial"> msg</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="partial">UC proof</span></td><td class="center"><span class="x">&times;</span></td></tr>
+          <tr><td class="sys">Project Everest &middot; HACL*</td><td class="center">N/A</td><td class="center">Research</td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="check">&check;</span><span class="partial"> crypto</span></td><td class="center"><span class="x">&times;</span></td></tr>
+          <tr class="us"><td class="sys"><strong>MILNET SSO</strong></td><td class="center us-cell">BYO-host</td><td class="center us-cell">NIAP-eligible</td><td class="center us-cell"><span class="check">&check;</span><span class="ok"> ML-DSA-87</span></td><td class="center us-cell"><span class="check">&check;</span><span class="ok"> FROST 3/5</span></td><td class="center us-cell"><span class="check">&check;</span><span class="ok"> 19 TLA+</span></td><td class="center us-cell"><span class="check">&check;</span><span class="ok"> KT log</span></td></tr>
+        </tbody>
+      </table>
+    </section>
+
+  </div>
+
+  <div class="cta" role="region" aria-label="Get in touch">
+    <div>
+      <h3>Three doors. <em>Same stack.</em></h3>
+      <p>Series A &middot; design-partner pilot &middot; sovereign-empanelment briefing. English, Hindi, or your regional language.</p>
+    </div>
+    <div class="actions">
+      <a class="btn" href="mailto:contact@dmj.one">contact@dmj.one</a>
+      <div class="links"><a href="/usecase.html">India use case</a> &middot; <a href="/business.html">Buyer brief</a> &middot; <a href="/investors.html">Strategic brief</a></div>
+    </div>
+  </div>
+
+  <footer class="pgft">
+    <div class="ftleft">
+      <div><strong>MILNET SSO</strong> &middot; <a href="mailto:contact@dmj.one">contact@dmj.one</a></div>
+      <div class="lic">&copy; 2026 dmj.one &middot; Licensed under Apache License 2.0 &middot; Patent grant with retaliation clause</div>
+    </div>
+    <div class="pgnum">Page 4 of 4</div>
+  </footer>
+
+</article>
+
+</body>
+</html>

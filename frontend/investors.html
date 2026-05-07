@@ -1,0 +1,1060 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MILNET SSO &middot; Strategic Brief for Investors</title>
+<meta name="description" content="MILNET SSO strategic brief: an eight-page investor pamphlet on the only identity stack to combine post-quantum cryptography, threshold signatures, formal verification, and Key Transparency.">
+<meta name="robots" content="noindex">
+<link rel="stylesheet" href="/fonts/jetbrains-mono.css">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --fd: 'Instrument Serif', Georgia, serif;
+    --fh: 'Sentient', Georgia, serif;
+    --fl: 'Geist', system-ui, sans-serif;
+    --fu: 'Inter', system-ui, sans-serif;
+    --f:  'Times New Roman', Times, serif;
+    --fm: 'Geist Mono', 'JetBrains Mono', monospace;
+
+    --s9: #0c0f1a; --s8: #1f2433; --s7: #2e3347;
+    --s6: #475569; --s5: #6b7280; --s4: #9ca3af;
+    --s3: #cbd5e1; --s2: #e5e7eb; --s1: #f3f4f6; --s0: #fafafc;
+    --paper: #fbfbf7;
+
+    --g: #059669; --g2: #047857;
+    --b: #3b82f6; --b2: #1d4ed8;
+    --a: #f59e0b; --a2: #b45309;
+    --p: #8b5cf6; --p2: #6d28d9;
+    --c: #06b6d4; --c2: #0e7490;
+    --r: #ef4444; --r2: #b91c1c;
+    --gold: #facc15;
+    --navy: #0c0f1a;
+    text-align:justify;
+  }
+
+  html { font-size: 16px; }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { transition: none !important; animation: none !important; }
+  }
+
+  body {
+    background: #d9dce4;
+    color: var(--s9);
+    font-family: var(--f);
+    line-height: 1.5;
+    padding: 28px 0;
+    display: flex; flex-direction: column; align-items: center; gap: 28px;
+    min-height: 100vh;
+  }
+
+  a { color: var(--b); text-decoration: none; border-bottom: 1px dotted rgba(59,130,246,0.4); }
+  a:hover, a:focus-visible { color: #1d4ed8; }
+  a:focus-visible { outline: 2px solid var(--b); outline-offset: 2px; }
+
+  /* ─── PAGE: A4 portrait, fixed geometry ─── */
+  .page {
+    width: 210mm;
+    height: 297mm;
+    background: var(--paper);
+    box-shadow: 0 10px 40px rgba(0,0,0,0.18), 0 2px 6px rgba(0,0,0,0.08);
+    position: relative;
+    overflow: hidden;
+    display: grid;
+    grid-template-rows: auto 1fr auto;
+    color: var(--s9);
+  }
+
+  /* ─── BAND (full-bleed dark navy + corporate-gradient stripe) ─── */
+  .band {
+    background: linear-gradient(135deg, #0c0f1a 0%, #131a2e 40%, #0e1a2d 100%);
+    color: #fff;
+    position: relative;
+    padding: 14mm 16mm 8mm;
+  }
+  .band::after {
+    content: ''; position: absolute; bottom: 0; left: 0; right: 0; height: 2.2mm;
+    background: linear-gradient(90deg, var(--g) 0%, var(--b) 25%, var(--p) 50%, var(--c) 75%, var(--g) 100%);
+  }
+  .band.compact { padding: 8mm 16mm 5mm; }
+  .band.compact::after { height: 1.6mm; }
+  .band .row {
+    display: flex; justify-content: space-between; align-items: flex-end;
+    gap: 10mm;
+  }
+  .band h1 {
+    font: 400 26pt/1 var(--fd); color: #fff; letter-spacing: 0.5px;
+    text-shadow: 0 0 30px rgba(5,150,105,0.3), 0 0 60px rgba(59,130,246,0.15);
+  }
+  .band.compact h1 { font-size: 17pt; }
+  .band .sub {
+    font: 400 10pt/1.4 var(--fu); color: #94a3b8; margin-top: 1.5mm;
+  }
+  .band.compact .sub { font-size: 9pt; margin-top: 1mm; }
+  .band .meta { text-align: right; font: 400 9pt/1.4 var(--fu); color: #cbd5e1; }
+  .band .badge {
+    display: inline-block; padding: 1.5mm 3mm; margin-bottom: 1.5mm;
+    font: 700 8pt var(--fl); letter-spacing: 1.4px; text-transform: uppercase;
+    background: linear-gradient(135deg, rgba(239,68,68,0.18), rgba(185,28,28,0.12));
+    color: #fca5a5; border: 1px solid rgba(239,68,68,0.4);
+    border-radius: 1.5mm;
+  }
+  .band.compact .meta { font-size: 8.5pt; }
+
+  /* ─── INNER CONTENT AREA ─── */
+  .inner {
+    padding: 11mm 16mm 9mm;
+    display: flex; flex-direction: column;
+    overflow: hidden;
+  }
+  .inner.tight { padding: 8mm 16mm 6mm; }
+  .inner.tight section + section { margin-top: 5mm; }
+  .inner.tight .cd { padding: 3mm 3.5mm; }
+  .inner.tight .cd h4 { margin-bottom: 1.5mm; }
+  .inner.tight .cd ul li { font-size: 8.8pt; line-height: 1.4; margin-top: 0.5mm; }
+  .inner.tight .cd ul li::before { top: 1.4mm; width: 1.3mm; height: 1.3mm; }
+  .inner.tight section p { font-size: 9.5pt; line-height: 1.5; margin-top: 2mm; }
+
+  /* ─── COVER (page 1) ─── */
+  .cover {
+    flex: 1;
+    display: flex; flex-direction: column;
+    padding: 4mm 0 0;
+  }
+  .cover .stamp {
+    align-self: flex-start;
+    border: 2.5px solid var(--r2);
+    color: var(--r2);
+    padding: 2mm 5mm;
+    font: 700 11pt var(--fl); letter-spacing: 3px; text-transform: uppercase;
+    transform: rotate(-0deg);
+    margin-bottom: 14mm;
+    background: rgba(239,68,68,0.04);
+  }
+  .cover .hook {
+    font: 400 12pt var(--fd); color: var(--s5);
+    letter-spacing: 0.5px;
+    margin-bottom: 8mm;
+  }
+  .cover h2 {
+    font: 400 36pt/1.12 var(--fd); color: var(--s9);
+    letter-spacing: -0.015em;
+    margin-bottom: 10mm;
+  }
+  .cover h2 em { font-style: italic; color: var(--g2); }
+  .cover .tag {
+    font: 400 12pt/1.55 var(--f); color: var(--s7);
+    max-width: 38em;
+  }
+  .cover .tag strong { color: var(--s9); font-family: var(--fl); font-weight: 700; }
+  .cover .nums {
+    margin-top: auto;
+    display: grid; grid-template-columns: repeat(4, 1fr);
+    gap: 0.4mm;
+    background: rgba(0,0,0,0.06);
+    border-radius: 2mm;
+    overflow: hidden;
+  }
+  .cover .nums .n {
+    background: rgba(255,255,255,0.6);
+    padding: 5mm 4mm; text-align: left;
+  }
+  .cover .nums .nv {
+    font: 700 22pt/1 var(--fl); color: var(--s9);
+    font-variant-numeric: tabular-nums;
+  }
+  .cover .nums .nl {
+    font: 600 7.5pt var(--fu); color: var(--s5);
+    text-transform: uppercase; letter-spacing: 1px; margin-top: 1.5mm;
+  }
+
+  /* ─── SECTION HEADER ─── */
+  .sec-h {
+    display: flex; align-items: baseline; gap: 4mm;
+    padding-bottom: 2.5mm; margin-bottom: 4mm;
+    border-bottom: 0.5pt solid var(--s2);
+  }
+  .sec-h .num {
+    font: 700 9pt var(--fl); color: var(--s5);
+    letter-spacing: 2px; text-transform: uppercase;
+  }
+  .sec-h .title {
+    font: 600 13.5pt var(--fh); color: var(--s9); line-height: 1.25;
+  }
+
+  /* ─── PROSE ─── */
+  section p {
+    font: 400 10.5pt/1.6 var(--f); color: var(--s7);
+    margin-top: 3mm;
+  }
+  section p:first-of-type { margin-top: 0; }
+  section p strong { color: var(--s9); font-family: var(--fl); font-weight: 700; }
+  section p em { color: var(--s9); font-style: italic; }
+
+  .pull {
+    border-left: 0.8mm solid var(--gold);
+    padding: 2mm 5mm;
+    margin: 5mm 0;
+    font: 400 12pt/1.45 var(--fd); font-style: italic;
+    color: var(--s8);
+    background: rgba(250,204,21,0.05);
+  }
+
+  /* ─── 3-CARD CALLOUT GRID (Why now) ─── */
+  .cards3 {
+    display: grid; grid-template-columns: 1fr 1fr 1fr;
+    gap: 4mm; margin-top: 1mm;
+  }
+  .cd {
+    background: rgba(255,255,255,0.55);
+    border: 0.5pt solid var(--s2);
+    border-radius: 2mm;
+    padding: 4mm 4mm 4mm 4mm;
+    border-left: 1mm solid;
+    position: relative;
+  }
+  .cd.a { border-left-color: var(--a); }
+  .cd.b { border-left-color: var(--b); }
+  .cd.r { border-left-color: var(--r); }
+  .cd.g { border-left-color: var(--g); }
+  .cd.p { border-left-color: var(--p); }
+  .cd.c { border-left-color: var(--c); }
+  .cd .lab {
+    font: 700 7.5pt var(--fl); letter-spacing: 1.4px; text-transform: uppercase;
+    color: var(--s5); margin-bottom: 1.5mm;
+  }
+  .cd h4 {
+    font: 600 11.5pt/1.3 var(--fh); color: var(--s9);
+    margin-bottom: 2mm;
+  }
+  .cd p { font: 400 9.5pt/1.5 var(--f); color: var(--s7); margin: 0; }
+  .cd ul { margin: 0; padding: 0; list-style: none; }
+  .cd ul li {
+    font: 400 9.5pt/1.45 var(--f); color: var(--s7);
+    padding-left: 4mm; position: relative; margin-top: 1mm;
+  }
+  .cd ul li:first-child { margin-top: 0; }
+  .cd ul li::before {
+    content: ''; position: absolute; left: 0; top: 1.6mm;
+    width: 1.5mm; height: 1.5mm; border-radius: 50%;
+  }
+  .cd.a ul li::before { background: var(--a); }
+  .cd.b ul li::before { background: var(--b); }
+  .cd.r ul li::before { background: var(--r); }
+  .cd.g ul li::before { background: var(--g); }
+  .cd.p ul li::before { background: var(--p); }
+  .cd.c ul li::before { background: var(--c); }
+
+  /* ─── 4-PILLAR GRID (page 3) ─── */
+  .pil4 {
+    display: grid; grid-template-columns: 1fr 1fr;
+    gap: 4mm; margin-top: 1mm;
+  }
+  .pil {
+    background: rgba(255,255,255,0.55);
+    border: 0.5pt solid var(--s2);
+    border-radius: 2mm;
+    padding: 4mm;
+    border-top: 1.2mm solid;
+  }
+  .pil.g { border-top-color: var(--g); }
+  .pil.b { border-top-color: var(--b); }
+  .pil.p { border-top-color: var(--p); }
+  .pil.c { border-top-color: var(--c); }
+  .pil .lab {
+    font: 700 7.5pt var(--fl); letter-spacing: 1.4px; text-transform: uppercase;
+    color: var(--s5); margin-bottom: 1.5mm;
+  }
+  .pil h4 {
+    font: 600 12pt/1.3 var(--fh); color: var(--s9);
+    margin-bottom: 2.5mm;
+  }
+  .pil p {
+    font: 400 9.5pt/1.5 var(--f); color: var(--s7); margin: 0;
+  }
+  .pil p strong { color: var(--s9); font-family: var(--fl); font-weight: 700; }
+
+  /* ─── STATS BLOCK ─── */
+  .stats4 {
+    display: grid; grid-template-columns: repeat(4, 1fr);
+    gap: 4mm; margin-top: 5mm;
+  }
+  .st {
+    background: rgba(255,255,255,0.65);
+    border: 0.5pt solid var(--s2);
+    border-radius: 2mm;
+    padding: 4mm;
+    border-top: 1.2mm solid;
+  }
+  .st.g { border-top-color: var(--g); }
+  .st.b { border-top-color: var(--b); }
+  .st.p { border-top-color: var(--p); }
+  .st.a { border-top-color: var(--a); }
+  .st .l {
+    font: 600 7.5pt var(--fu); color: var(--s5);
+    text-transform: uppercase; letter-spacing: 1.2px;
+  }
+  .st .v {
+    font: 700 22pt/1 var(--fl); color: var(--s9);
+    font-variant-numeric: tabular-nums;
+    margin-top: 1.5mm;
+  }
+  .st .d {
+    font: 400 8.5pt/1.45 var(--f); color: var(--s7); margin-top: 2mm;
+  }
+
+  /* ─── MOAT TABLE (page 4) ─── */
+  .moat {
+    width: 100%; border-collapse: collapse;
+    margin-top: 1mm;
+    font: 400 8.5pt/1.4 var(--f);
+    table-layout: fixed;
+  }
+  .moat thead tr {
+    background: linear-gradient(135deg, #0c0f1a, #1e293b); color: #fff;
+  }
+  .moat th {
+    text-align: left; padding: 2.5mm 2.5mm;
+    font: 700 7pt var(--fl); letter-spacing: 0.8px; text-transform: uppercase;
+    vertical-align: bottom;
+  }
+  .moat th.us { background: linear-gradient(135deg, var(--g2), var(--g)); }
+  .moat th.center, .moat td.center { text-align: center; }
+  .moat td {
+    padding: 2.2mm 2.5mm; border-top: 0.4pt solid var(--s2);
+    color: var(--s7); vertical-align: middle;
+  }
+  .moat tbody tr { background: rgba(255,255,255,0.5); }
+  .moat tbody tr:nth-child(even) { background: rgba(243,244,246,0.6); }
+  .moat tbody tr.us { background: rgba(5,150,105,0.08); }
+  .moat tbody tr.us:nth-child(even) { background: rgba(5,150,105,0.12); }
+  .moat td.sys {
+    font: 600 8.5pt var(--fl); color: var(--s9);
+  }
+  .moat td.cat {
+    font: 400 8pt var(--f); color: var(--s7);
+  }
+  .moat td.us-cell { color: var(--g2); font-weight: 700; }
+  .moat .check { color: var(--g); font: 700 11pt var(--fm); }
+  .moat .x { color: #cbd5e1; font: 700 10pt var(--fm); }
+  .moat .partial {
+    font: 600 7.5pt var(--fl); color: var(--a2);
+    display: block; line-height: 1.2; margin-top: 0.5mm;
+  }
+  .moat .ok {
+    font: 600 7.5pt var(--fl); color: var(--g2);
+    display: block; line-height: 1.2; margin-top: 0.5mm;
+  }
+
+  /* ─── DEALS GRID (page 6) ─── */
+  .deals {
+    display: grid; grid-template-columns: repeat(3, 1fr);
+    gap: 3mm; margin-top: 1mm;
+  }
+  .deal {
+    background: rgba(255,255,255,0.55);
+    border: 0.5pt solid var(--s2);
+    border-radius: 2mm;
+    padding: 3mm 3.5mm;
+    border-left: 0.7mm solid var(--g);
+  }
+  .deal .nm {
+    font: 700 7pt var(--fl); color: var(--s5);
+    text-transform: uppercase; letter-spacing: 1.2px;
+  }
+  .deal .pr {
+    font: 700 13pt/1 var(--fl); color: var(--s9);
+    font-variant-numeric: tabular-nums; margin: 1mm 0;
+  }
+  .deal .ds {
+    font: 400 8pt/1.4 var(--f); color: var(--s7);
+  }
+
+  /* ─── TIMELINE (page 7) ─── */
+  .tline {
+    display: grid; grid-template-columns: repeat(5, 1fr);
+    gap: 3mm; margin-top: 2mm;
+  }
+  .tl {
+    background: rgba(255,255,255,0.55);
+    border: 0.5pt solid var(--s2);
+    border-radius: 2mm;
+    padding: 3mm 3mm 3.5mm;
+    border-top: 1mm solid var(--g);
+  }
+  .tl .q { font: 700 7.5pt var(--fl); color: var(--g2); letter-spacing: 0.6px; text-transform: uppercase; }
+  .tl .t { font: 600 9.5pt/1.25 var(--fh); color: var(--s9); margin: 1mm 0; }
+  .tl .b { font: 400 8pt/1.4 var(--f); color: var(--s7); }
+
+  /* ─── CTA STRIP (page 8) ─── */
+  .cta {
+    background: linear-gradient(135deg, #0c0f1a 0%, #162032 50%, #0f1729 100%);
+    color: #fff;
+    padding: 7mm 16mm;
+    display: grid; grid-template-columns: 1fr auto;
+    gap: 8mm; align-items: center;
+  }
+  .cta h3 {
+    font: 400 16pt/1.3 var(--fd); color: #fff;
+    margin: 0 0 2mm;
+  }
+  .cta h3 em { font-style: italic; color: var(--gold); }
+  .cta p {
+    font: 400 9.5pt/1.5 var(--fu); color: var(--s3); margin: 0;
+  }
+  .cta .actions {
+    display: flex; flex-direction: column; align-items: flex-end; gap: 2mm;
+  }
+  .cta a.btn {
+    display: inline-block; padding: 2.5mm 6mm;
+    background: var(--gold); color: var(--navy);
+    border-radius: 1.2mm; border: 0;
+    font: 700 9.5pt var(--fl); letter-spacing: 0.5px;
+    text-transform: uppercase; white-space: nowrap;
+  }
+  .cta .links { font: 400 8.5pt var(--fu); color: #cbd5e1; }
+  .cta .links a { color: #93c5fd; border-bottom-color: rgba(147,197,253,0.35); }
+
+  /* ─── PAGE FOOTER ─── */
+  .pgft {
+    background: linear-gradient(135deg, #0c0f1a 0%, #162032 50%, #0f1729 100%);
+    color: rgba(255,255,255,0.85);
+    padding: 4.5mm 16mm;
+    display: flex; justify-content: space-between; align-items: center;
+    font: 400 8.5pt var(--fu);
+    position: relative;
+  }
+  .pgft::before {
+    content: ''; position: absolute; top: 0; left: 0; right: 0; height: 1.6mm;
+    background: linear-gradient(90deg, var(--g) 0%, var(--b) 25%, var(--p) 50%, var(--c) 75%, var(--g) 100%);
+  }
+  .pgft strong { color: var(--gold); font-family: var(--fl); }
+  .pgft a { color: #93c5fd; border-bottom-color: rgba(147,197,253,0.35); }
+  .pgft .conf {
+    font: 700 7.5pt var(--fl); letter-spacing: 1.6px; text-transform: uppercase;
+    color: #fca5a5;
+  }
+  .pgft .pgnum { font: 700 8pt var(--fl); color: #cbd5e1; letter-spacing: 1.2px; text-transform: uppercase; }
+
+  /* ─── DISCLAIMER (page 8 bottom) ─── */
+  .disc {
+    font: 400 6.8pt/1.4 var(--fu); color: var(--s5);
+    border-top: 0.4pt solid var(--s2);
+    padding-top: 2mm; margin-top: 2.5mm;
+  }
+
+  /* ─── PRINT (zero margin, multi-page brochure) ─── */
+  @media print {
+    @page { size: A4 portrait; margin: 0; }
+    html, body {
+      background: #fff;
+      padding: 0; margin: 0;
+      width: 210mm;
+      gap: 0;
+    }
+    body { display: block; }
+    .page {
+      width: 210mm;
+      height: 297mm;
+      box-shadow: none;
+      page-break-after: always;
+      break-after: page;
+      margin: 0;
+    }
+    .page:last-of-type {
+      page-break-after: auto;
+      break-after: auto;
+    }
+    .band, .pgft, .cta, .moat thead tr, .moat th.us {
+      -webkit-print-color-adjust: exact; print-color-adjust: exact;
+    }
+    a { color: var(--s9); border: 0; }
+    a[href]::after { content: ""; }
+  }
+  @media (forced-colors: active) {
+    .page, .moat, .cta, .deal, .pil, .cd, .st, .tl { border: 1px solid CanvasText; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<!-- PAGE 1 OF 8 · COVER                                      -->
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<article class="page" aria-label="Page 1 of 8 · Cover">
+
+  <header class="band">
+    <div class="row">
+      <div>
+        <h1>MILNET Single Sign-On</h1>
+        <div class="sub">Strategic Brief &middot; Investors, Boards, Government</div>
+      </div>
+      <div class="meta">
+        <span class="badge">Strategic Confidential</span><br>
+        v1.0 &middot; 2026-05-06<br>
+        Built by <a href="https://dmj.one" style="color:#bfdbfe;">dmj.one</a>
+      </div>
+    </div>
+  </header>
+
+  <div class="inner">
+    <div class="cover">
+      <div class="stamp">Strategic &middot; Confidential</div>
+      <div class="hook">The most defensible identity stack of the post-quantum decade.</div>
+      <h2>The only stack that has implemented all four pillars in one identity product: post-quantum cryptography, threshold signatures, formal verification, <em>and</em> Key Transparency.</h2>
+      <p class="tag">Apple, Google, Microsoft, Okta, Ping, SailPoint, CyberArk: not one of them has the bundle. The closest research-grade work lives below the identity layer. <strong>Our window of advantage opens with the NSA 2030 deadline and closes when incumbents catch up. Two to four years.</strong></p>
+
+      <div class="nums">
+        <div class="n"><span class="nv">266K</span><div class="nl">Lines of Rust</div></div>
+        <div class="n"><span class="nv">19</span><div class="nl">TLA+ Invariants</div></div>
+        <div class="n"><span class="nv">5,422</span><div class="nl">Tests &middot; 53 Fuzz</div></div>
+        <div class="n"><span class="nv">$25B+</span><div class="nl">Global IAM TAM</div></div>
+      </div>
+    </div>
+  </div>
+
+  <footer class="pgft">
+    <div><strong>MILNET SSO</strong> &middot; <a href="mailto:contact@dmj.one">contact@dmj.one</a></div>
+    <div class="conf">Strategic Confidential</div>
+    <div class="pgnum">Page 1 of 8</div>
+  </footer>
+
+</article>
+
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<!-- PAGE 2 OF 8 · THESIS + WHY NOW                            -->
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<article class="page" aria-label="Page 2 of 8">
+
+  <header class="band compact">
+    <div class="row">
+      <div>
+        <h1>Thesis &middot; and why now</h1>
+        <div class="sub">The strongest identity stack ever built sits in the wrong category</div>
+      </div>
+      <div class="meta">Page 2 of 8</div>
+    </div>
+  </header>
+
+  <div class="inner">
+
+    <section aria-labelledby="s1">
+      <div class="sec-h">
+        <span class="num">01</span>
+        <span class="title" id="s1">A category nobody is yet building</span>
+      </div>
+      <p>For the last fifteen years the identity industry sold convenience as a category. Single-sign-on, password reset, social login. Sprinkle MFA, ship more SAML, raise an IPO. <em>That category is now obsolete.</em> The buyer who matters in 2027 to 2033 is not a SaaS director. It is a CIO of a regulated bank, a defence prime, a sovereign cloud, a ministry, a hospital network. Their procurement team is reading the NSA CNSA 2.0 directive and the OMB M-23-02 cryptographic-inventory mandate. They cannot buy a product whose roadmap says &ldquo;post-quantum coming.&rdquo;</p>
+      <p>MILNET is built for that buyer. Hybrid post-quantum is the default, not a feature flag. Token issuance is threshold-signed across five hosts. Nineteen safety invariants are mechanically checked in TLA+. Every audit entry is BFT-signed and Merkle-anchored. <strong>This is the first identity product that a regulator, an auditor, and a quantum threat-modeller can all sign off on without asking for a roadmap commitment.</strong></p>
+      <div class="pull">&ldquo;A 2027 procurement officer who buys a non-PQ identity vendor will face their own audit committee in 2030.&rdquo;</div>
+    </section>
+
+    <section style="margin-top: 6mm;" aria-labelledby="s2">
+      <div class="sec-h">
+        <span class="num">02</span>
+        <span class="title" id="s2">Three regulatory clocks. None can be paused.</span>
+      </div>
+      <div class="cards3">
+        <div class="cd a">
+          <div class="lab">2030 / 2033</div>
+          <h4>NSA CNSA 2.0</h4>
+          <ul>
+            <li>Software and firmware that signs code: full PQC by <strong>2030</strong>.</li>
+            <li>New National Security Systems start <strong>2027</strong>, complete migration <strong>2033</strong>.</li>
+            <li>ML-KEM (FIPS 203), ML-DSA (FIPS 204), AES-256, SHA-384/512.</li>
+          </ul>
+        </div>
+        <div class="cd b">
+          <div class="lab">In effect</div>
+          <h4>OMB M-23-02 &middot; NSM-10</h4>
+          <ul>
+            <li>Annual cryptographic inventory mandated for all federal agencies.</li>
+            <li>OMB M-22-09: phishing-resistant MFA across federal civilian agencies.</li>
+            <li>Identity sits at the top of every agency&rsquo;s migration backlog.</li>
+          </ul>
+        </div>
+        <div class="cd r">
+          <div class="lab">Real risk</div>
+          <h4>Harvest Now, Decrypt Later</h4>
+          <ul>
+            <li>Adversary nations are <strong>archiving</strong> classical-encrypted traffic today.</li>
+            <li>Anything with &gt;10-year confidentiality is <em>already</em> exposed.</li>
+            <li>Healthcare, intelligence cables, IP, M&amp;A, legal hold.</li>
+          </ul>
+        </div>
+      </div>
+      <div class="pull" style="border-color: var(--g); background: rgba(5,150,105,0.05); margin-top: 6mm;">Window of advantage: <strong style="font-family: var(--fl); color: var(--g2);">two to four years.</strong> A buyer signing in 2026 to 2027 is locked into our PQ stack before incumbents have a comparable offer. By 2028 to 2029, the wedge closes.</div>
+    </section>
+
+  </div>
+
+  <footer class="pgft">
+    <div><strong>MILNET SSO</strong> &middot; <a href="mailto:contact@dmj.one">contact@dmj.one</a></div>
+    <div class="conf">Strategic Confidential</div>
+    <div class="pgnum">Page 2 of 8</div>
+  </footer>
+
+</article>
+
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<!-- PAGE 3 OF 8 · PRODUCT                                     -->
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<article class="page" aria-label="Page 3 of 8">
+
+  <header class="band compact">
+    <div class="row">
+      <div>
+        <h1>Product &middot; four pillars, one stack</h1>
+        <div class="sub">Each claim maps to working Rust code in this repository</div>
+      </div>
+      <div class="meta">Page 3 of 8</div>
+    </div>
+  </header>
+
+  <div class="inner">
+
+    <section aria-labelledby="s3">
+      <div class="sec-h">
+        <span class="num">03</span>
+        <span class="title" id="s3">Four pillars in code &middot; not roadmap, not vendor demo</span>
+      </div>
+      <div class="pil4">
+        <div class="pil g">
+          <div class="lab">Pillar 1</div>
+          <h4>Post-Quantum Native</h4>
+          <p>Hybrid <strong>X25519 + ML-KEM-1024</strong> in the session ratchet. <strong>ML-DSA-87</strong> on every issued token, every audit entry, every transparency-log leaf. <strong>SLH-DSA</strong>, LMS, XMSS reserves for code signing. FIPS 140-3 startup KATs gate every primitive at boot.</p>
+        </div>
+        <div class="pil b">
+          <div class="lab">Pillar 2</div>
+          <h4>Threshold Everywhere</h4>
+          <p><strong>FROST-Ristretto255 3-of-5</strong> threshold token signing with persistent fsync&rsquo;d nonce log. <strong>2-of-3 threshold OPAQUE</strong>: no single server can recover the password OPRF. <strong>Pedersen DKG</strong> + 3-of-5 quorum to issue any internal certificate.</p>
+        </div>
+        <div class="pil p">
+          <div class="lab">Pillar 3</div>
+          <h4>Formally Verified</h4>
+          <p>1,081-line TLA+ specification with <strong>19 mechanically-checked safety invariants</strong> plus 3 liveness properties. Models the auth state machine, FROST DKG, OPAQUE, ratchet, Bell-LaPadula, key rotation, multi-tenancy, CAE re-evaluation. Constant-time TLA+ + dudect Welch t-test.</p>
+        </div>
+        <div class="pil c">
+          <div class="lab">Pillar 4</div>
+          <h4>Audit + Transparency</h4>
+          <p><strong>11-node Byzantine Fault Tolerant audit cluster</strong>, ML-DSA-87 signed and hash-chained. Out-of-process witness signer over UDS. <strong>Key Transparency log</strong> with 2-of-5 ML-DSA-87 consensus and CSHAKE256 leaves. Independent auditor service.</p>
+        </div>
+      </div>
+
+      <div class="stats4">
+        <div class="st g">
+          <div class="l">Auditable lines</div>
+          <div class="v">266K</div>
+          <div class="d">Memory-safe Rust. No <code>unsafe</code> outside of mlock and a single canary buffer.</div>
+        </div>
+        <div class="st b">
+          <div class="l">Test coverage</div>
+          <div class="v">5,422</div>
+          <div class="d">Including <strong>53 fuzz targets</strong> and <strong>62 e2e + chaos + nation-state</strong> attack simulations.</div>
+        </div>
+        <div class="st p">
+          <div class="l">Formal invariants</div>
+          <div class="v">19</div>
+          <div class="d">Plus 3 liveness properties. No commercial identity vendor publishes any.</div>
+        </div>
+        <div class="st a">
+          <div class="l">Workspace crates</div>
+          <div class="v">36</div>
+          <div class="d">Modular: each compliance, threat, or jurisdiction control is a swap-in crate.</div>
+        </div>
+      </div>
+    </section>
+
+  </div>
+
+  <footer class="pgft">
+    <div><strong>MILNET SSO</strong> &middot; <a href="mailto:contact@dmj.one">contact@dmj.one</a></div>
+    <div class="conf">Strategic Confidential</div>
+    <div class="pgnum">Page 3 of 8</div>
+  </footer>
+
+</article>
+
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<!-- PAGE 4 OF 8 · THE MOAT (full-page table)                  -->
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<article class="page" aria-label="Page 4 of 8">
+
+  <header class="band compact">
+    <div class="row">
+      <div>
+        <h1>The Moat &middot; nobody else is in this cell</h1>
+        <div class="sub">Commercial &amp; research frontier &middot; verified May 2026</div>
+      </div>
+      <div class="meta">Page 4 of 8</div>
+    </div>
+  </header>
+
+  <div class="inner">
+
+    <section aria-labelledby="s4">
+      <div class="sec-h">
+        <span class="num">04</span>
+        <span class="title" id="s4">Four-dimensional moat &middot; only one row hits all four</span>
+      </div>
+
+      <p>We benchmarked against both commercial incumbents and the research-grade frontier. Each excels at a single dimension. None ships the full bundle. <em>Read the bottom row.</em></p>
+
+      <table class="moat" style="margin-top: 4mm;">
+        <thead>
+          <tr>
+            <th style="width: 30%;">System</th>
+            <th style="width: 22%;">Category</th>
+            <th class="center" style="width: 12%;">PQ identity tokens</th>
+            <th class="center" style="width: 12%;">Threshold sigs in auth</th>
+            <th class="center" style="width: 12%;">Formal verif of auth core</th>
+            <th class="center" style="width: 12%;">Key Transparency at scale</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td class="sys">Microsoft Entra ID</td><td class="cat">Hyperscaler IdP, 700M MAU</td><td class="center"><span class="x">&times;</span><span class="partial">TLS only</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span><span class="partial">Everest = crypto, not identity</span></td><td class="center"><span class="x">&times;</span></td></tr>
+          <tr><td class="sys">Google Cloud Identity</td><td class="cat">Hyperscaler IdP</td><td class="center"><span class="x">&times;</span><span class="partial">Chrome only</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="partial">Trillian for CT, not user identity</span></td></tr>
+          <tr><td class="sys">Apple Passkeys + iCloud</td><td class="cat">Consumer, 2.2B devices</td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="check">&check;</span><span class="ok">CKV in production</span></td></tr>
+          <tr><td class="sys">Okta &middot; Ping &middot; ForgeRock</td><td class="cat">Public IdP / IGA</td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td></tr>
+          <tr><td class="sys">SailPoint &middot; CyberArk</td><td class="cat">Enterprise IGA / PAM</td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td></tr>
+          <tr><td class="sys">Cloudflare Zero Trust</td><td class="cat">Network identity</td><td class="center"><span class="x">&times;</span><span class="partial">TLS only</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td></tr>
+          <tr><td class="sys">Beyond Identity &middot; Stytch &middot; Clerk</td><td class="cat">Modern passwordless</td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td></tr>
+          <!-- <tr><td class="sys">Teleport (Gravitational)</td><td class="cat">Infra access</td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span><span class="partial">audited, not verified</span></td><td class="center"><span class="x">&times;</span></td></tr> -->
+          <tr><td class="sys">EU EUDI Wallet (eIDAS 2.0)</td><td class="cat">Sovereign &middot; 27 states</td><td class="center"><span class="x">&times;</span><span class="partial">classical mandated</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td></tr>
+          <tr><td class="sys">India Aadhaar &middot; DigiLocker</td><td class="cat">National &middot; 1.4B holders</td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td></tr>
+          <tr><td class="sys">US Login.gov &middot; UK GOV.UK One Login</td><td class="cat">National civilian SSO</td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td></tr>
+          <tr><td class="sys">Estonia Smart-ID</td><td class="cat">Sovereign &middot; 4M users</td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="check">&check;</span><span class="partial">2-of-2 RSA, classical</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td></tr>
+          <!-- <tr><td class="sys">WhatsApp KT &middot; Apple iCloud CKV</td><td class="cat">Messaging KT, planet scale</td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="check">&check;</span><span class="ok">production</span></td></tr> -->
+          <tr><td class="sys">Signal PQXDH &middot; iMessage PQ3</td><td class="cat">Messaging E2EE</td><td class="center"><span class="check">&check;</span><span class="partial">messaging, not identity</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="partial">UC framework proof</span></td><td class="center"><span class="x">&times;</span></td></tr>
+          <tr><td class="sys">Project Everest &middot; HACL* &middot; miTLS</td><td class="cat">Research-grade verified crypto</td><td class="center"><span class="x">&times;</span><span class="partial">crypto layer</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="check">&check;</span><span class="ok">F* verified</span></td><td class="center"><span class="x">&times;</span></td></tr>
+          <tr><td class="sys">Sigstore &middot; Trillian (artifacts)</td><td class="cat">Software supply chain</td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="x">&times;</span></td><td class="center"><span class="check">&check;</span><span class="partial">artifacts, not identity</span></td></tr>
+          <tr class="us"><td class="sys"><strong>MILNET SSO</strong></td><td class="cat"><strong>Frontier identity</strong></td><td class="center us-cell"><span class="check">&check;</span><span class="ok">ML-DSA-87 tokens</span></td><td class="center us-cell"><span class="check">&check;</span><span class="ok">FROST 3-of-5</span></td><td class="center us-cell"><span class="check">&check;</span><span class="ok">19 TLA+ invariants</span></td><td class="center us-cell"><span class="check">&check;</span><span class="ok">KT log + auditor</span></td></tr>
+        </tbody>
+      </table>
+
+      <div class="pull" style="margin-top: 5mm;">Apple has KT at planet scale, no PQ identity. Signal has PQ messaging, no threshold sigs. Estonia has production threshold sigs, classical RSA. Microsoft Project Everest is the only formal-verification gold standard, but the auth orchestration layer is unverified. <strong>Combining all four into one identity product is the moat.</strong></div>
+    </section>
+
+  </div>
+
+  <footer class="pgft">
+    <div><strong>MILNET SSO</strong> &middot; <a href="mailto:contact@dmj.one">contact@dmj.one</a></div>
+    <div class="conf">Strategic Confidential</div>
+    <div class="pgnum">Page 4 of 8</div>
+  </footer>
+
+</article>
+
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<!-- PAGE 5 OF 8 · MARKET                                     -->
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<article class="page" aria-label="Page 5 of 8">
+
+  <header class="band compact">
+    <div class="row">
+      <div>
+        <h1>Market &middot; where the dollars live</h1>
+        <div class="sub">Regulated and sovereign-customer slice with formal compliance gate</div>
+      </div>
+      <div class="meta">Page 5 of 8</div>
+    </div>
+  </header>
+
+  <div class="inner">
+
+    <section aria-labelledby="s5">
+      <div class="sec-h">
+        <span class="num">05</span>
+        <span class="title" id="s5">Total addressable market &amp; the customers who pay it</span>
+      </div>
+      <p>Identity is a $25B+ global market growing low double-digits. The segment that matters for our pitch is the regulated and sovereign slice where formal compliance posture is a procurement gate.</p>
+
+      <div class="stats4" style="margin-top: 4mm;">
+        <div class="st g"><div class="l">Global IAM TAM</div><div class="v">$25B<sub style="font-size: 50%;">+/yr</sub></div><div class="d">IDC, Gartner converging estimates for 2026 IAM spend across SSO, IGA, PAM, CIAM, ZTNA.</div></div>
+        <div class="st b"><div class="l">US Federal &amp; DoD identity</div><div class="v">$1.3-2B<sub style="font-size: 50%;">/yr</sub></div><div class="d">~10-15% of the ~$13B FY24 federal cybersecurity budget. Reachable: $200-500M.</div></div>
+        <div class="st p"><div class="l">India sovereign + BFSI</div><div class="v">$25-100M<sub style="font-size: 50%;">/yr</sub></div><div class="d">Central + state + PSU + BFSI at ₹100-500/user/mo, population-scale.</div></div>
+        <div class="st a"><div class="l">EU regulated + sovereign</div><div class="v">€800M<sub style="font-size: 50%;">+/yr</sub></div><div class="d">EUDI-adjacent, defence, DORA, NIS2 supervisor mandates. Same PQ clock.</div></div>
+      </div>
+
+      <div class="cards3" style="margin-top: 6mm;">
+        <div class="cd g">
+          <div class="lab">Tier-1 fit</div>
+          <h4>Defence &amp; National Security</h4>
+          <p>US DoD primes (Lockheed, RTX, Northrop, BAE), NATO ministries, Indian defence PSUs (HAL, BEL, BDL, BEML), Five Eyes intelligence-adjacent contractors, sovereign-cloud operators serving classified.</p>
+        </div>
+        <div class="cd b">
+          <div class="lab">High value</div>
+          <h4>Financial Services &amp; CBDCs</h4>
+          <p>Tier-1 banks, central banks, securities exchanges, payment processors, crypto custodians. Threshold cryptography in identity is the same primitive these institutions buy from Fireblocks for custody.</p>
+        </div>
+        <div class="cd p">
+          <div class="lab">High value</div>
+          <h4>Healthcare &amp; Pharma R&amp;D</h4>
+          <p>Hospital networks under HIPAA, pharma sponsors with 25-year clinical-trial retention, research consortia where harvest-now-decrypt-later is existential to IP and patient confidentiality.</p>
+        </div>
+        <div class="cd a">
+          <div class="lab">High value</div>
+          <h4>Critical Infrastructure</h4>
+          <p>Energy grid, telecom carriers, water utilities, satellite networks, smart-grid SCADA. NERC CIP, NIS2, India CEA mandates. Air-gappable, single-host-tolerant, fail-closed.</p>
+        </div>
+        <div class="cd c">
+          <div class="lab">Channel</div>
+          <h4>Sovereign Cloud Resellers</h4>
+          <p>Yotta, Tata Communications, ESDS, Bharti Airtel (India); G42 (UAE); STC (Saudi); OVHcloud Sovereign; Atos / Eviden. White-label, no telemetry, license-friendly bundle.</p>
+        </div>
+        <div class="cd r">
+          <div class="lab">Strategic</div>
+          <h4>Government Programs</h4>
+          <p>India Stack-adjacent (UIDAI, DigiLocker, MeriPehchaan), EUDI Wallet member-state issuers, UK GOV.UK Verify successors, Login.gov subcontract opportunities.</p>
+        </div>
+      </div>
+    </section>
+
+  </div>
+
+  <footer class="pgft">
+    <div><strong>MILNET SSO</strong> &middot; <a href="mailto:contact@dmj.one">contact@dmj.one</a></div>
+    <div class="conf">Strategic Confidential</div>
+    <div class="pgnum">Page 5 of 8</div>
+  </footer>
+
+</article>
+
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<!-- PAGE 6 OF 8 · COMPARABLES                                 -->
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<article class="page" aria-label="Page 6 of 8">
+
+  <header class="band compact">
+    <div class="row">
+      <div>
+        <h1>Comparables &middot; what identity is worth</h1>
+        <div class="sub">Public &amp; private benchmarks &middot; not one of these has the four-cell bundle</div>
+      </div>
+      <div class="meta">Page 6 of 8</div>
+    </div>
+  </header>
+
+  <div class="inner">
+
+    <section aria-labelledby="s6">
+      <div class="sec-h">
+        <span class="num">06</span>
+        <span class="title" id="s6">Public market &amp; private comparables</span>
+      </div>
+
+      <div class="deals">
+        <div class="deal"><div class="nm">SailPoint &middot; IGA</div><div class="pr">$12.8B</div><div class="ds">Re-IPO Feb 2025 fully diluted. Up from $6.9B Thoma Bravo take-private 2022. ARR ~$700M.</div></div>
+        <div class="deal"><div class="nm">CyberArk &middot; PAM</div><div class="pr">~$11B</div><div class="ds">NASDAQ:CYBR. ~$1.0B FY24 revenue, +28% YoY ARR growth. Acquired Venafi $1.54B, Zilla 2025.</div></div>
+        <div class="deal"><div class="nm">Okta &middot; IdP</div><div class="pr">~$2.6B<sub style="font-size: 65%;"> ARR</sub></div><div class="ds">NASDAQ:OKTA. Auth0 acquisition $6.5B in 2021. Workforce + Customer Identity bundles.</div></div>
+        <div class="deal"><div class="nm">Cloudflare &middot; ZT</div><div class="pr">$1.67B<sub style="font-size: 65%;"> rev</sub></div><div class="ds">NYSE:NET. FY24 revenue, +30% YoY. Cloudflare One bundles ZTNA, Access, Tunnel, BI.</div></div>
+        <div class="deal"><div class="nm">ForgeRock</div><div class="pr">$2.3B</div><div class="ds">Thoma Bravo take-private 2023. Now under Ping Identity umbrella post-merger.</div></div>
+        <div class="deal"><div class="nm">WorkOS &middot; B2B</div><div class="pr">~$1.5B</div><div class="ds">Series B May 2024, $80M led by Greylock. ARR rumoured $30-50M end-2024. Vercel, OpenAI, Plaid customers.</div></div>
+        <div class="deal"><div class="nm">Beyond Identity</div><div class="pr">$1.1B</div><div class="ds">Series C Feb 2022, $100M. ~700 enterprise customers cited late 2024.</div></div>
+        <div class="deal"><div class="nm">Teleport</div><div class="pr">$1.1B</div><div class="ds">Series C Oct 2022, $110M (Bessemer / Insight). FedRAMP Moderate. ~$60-80M ARR estimated.</div></div>
+        <div class="deal"><div class="nm">Stytch &middot; B2B</div><div class="pr">~$1B</div><div class="ds">Series B Nov 2021, $90M. Pivoted to B2B 2023-24.</div></div>
+        <div class="deal"><div class="nm">Tailscale</div><div class="pr">$1B+</div><div class="ds">Series B Aug 2022, $100M, CRV-led. ~6K paying customers end-2024.</div></div>
+        <div class="deal"><div class="nm">Saviynt &middot; IGA</div><div class="pr">$205M<sub style="font-size: 65%;"> debt</sub></div><div class="ds">Growth round Sep 2023, AB Private Credit. Cloud-native IGA upstart competing with SailPoint.</div></div>
+        <div class="deal"><div class="nm">Clerk &middot; React DX</div><div class="pr">~$320M</div><div class="ds">Series B Apr 2024, $30M (CRV). React-ecosystem auth components.</div></div>
+      </div>
+
+      <div class="pull" style="margin-top: 6mm;"><strong style="color: var(--g2); font-family: var(--fl);">Read these as floors, not ceilings.</strong> SailPoint is worth $12.8B without post-quantum, without formal verification, without threshold cryptography. CyberArk is worth $11B for PAM alone. Auth0 sold for $6.5B with no IL5 / IL6 path. The category multiple says: a credible PQ-native, formally-verified identity stack with a regulated / sovereign customer wedge is a $1B Series B story and a $5B-plus exit target on a five-to-seven year horizon.</div>
+    </section>
+
+  </div>
+
+  <footer class="pgft">
+    <div><strong>MILNET SSO</strong> &middot; <a href="mailto:contact@dmj.one">contact@dmj.one</a></div>
+    <div class="conf">Strategic Confidential</div>
+    <div class="pgnum">Page 6 of 8</div>
+  </footer>
+
+</article>
+
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<!-- PAGE 7 OF 8 · UNIT ECONOMICS + ROADMAP                    -->
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<article class="page" aria-label="Page 7 of 8">
+
+  <header class="band compact">
+    <div class="row">
+      <div>
+        <h1>Unit economics &middot; and the 24-month plan</h1>
+        <div class="sub">Contract math on a representative 5,000-seat agency win</div>
+      </div>
+      <div class="meta">Page 7 of 8</div>
+    </div>
+  </header>
+
+  <div class="inner">
+
+    <section aria-labelledby="s7">
+      <div class="sec-h">
+        <span class="num">07</span>
+        <span class="title" id="s7">Unit economics &middot; the contract math</span>
+      </div>
+      <p>We can price at premium because the regulated buyer&rsquo;s alternative is a multi-million-dollar internal cryptographic migration.</p>
+      <div class="cards3" style="grid-template-columns: 1fr 1fr; margin-top: 4mm;">
+        <div class="cd g">
+          <div class="lab">5K seats</div>
+          <h4>Revenue side</h4>
+          <ul>
+            <li><strong>$15 / user / month</strong> list. Premium to Microsoft Entra P2 ($9), Okta Pro ($17). Justified by PQ + formal verification + threshold + KT bundle.</li>
+            <li>ACV: <strong>$900K ARR</strong> per 5K-seat customer.</li>
+            <li>Three-year TCV with normal escalators: <strong>$2.9M</strong>.</li>
+            <li>Government bundles add prof-services line: $300-700K integration.</li>
+          </ul>
+        </div>
+        <div class="cd b">
+          <div class="lab">Self-host</div>
+          <h4>Cost side</h4>
+          <ul>
+            <li>Government-grade infra: <strong>$25K / month</strong> (21-VM topology, Confidential VMs, Cloud HSM, dual-region warm DR).</li>
+            <li>Annualised infra: <strong>$300K / year</strong>.</li>
+            <li>Gross margin before cert amortisation: <strong>67%</strong>.</li>
+            <li>Cert amortisation: $2.5-5.7M three-year cert spend amortised across 10-25 customers averages $25-150K / customer / year.</li>
+          </ul>
+        </div>
+      </div>
+      <div class="pull" style="border-color: var(--g); background: rgba(5,150,105,0.05); margin-top: 5mm;"><strong style="color: var(--g2); font-family: var(--fl);">Steady-state target:</strong> 70% gross margin at 25 customers, 80% at 100, 85%+ at 250. CAC payback inside year one for federal / DoD wins via existing prime-contractor channels. Software-defined-margin business, not managed-service margin.</div>
+    </section>
+
+    <section style="margin-top: 7mm;" aria-labelledby="s8">
+      <div class="sec-h">
+        <span class="num">08</span>
+        <span class="title" id="s8">Twenty-four-month plan</span>
+      </div>
+      <div class="tline">
+        <div class="tl"><div class="q">2026 Q3</div><div class="t">Design partners</div><div class="b">Sign two: one US defence prime, one Indian PSU. FIPS 140-3 L1 lab kickoff. FedRAMP Moderate sponsor outreach.</div></div>
+        <div class="tl"><div class="q">2026 Q4</div><div class="t">First paid pilot</div><div class="b">Hardware HSM integration on Cloud HSM. CMVP queue submission. India sovereign-cloud channel discussions.</div></div>
+        <div class="tl"><div class="q">2027 Q1</div><div class="t">3 reference customers</div><div class="b">FedRAMP Moderate Pre-Auth. CC EAL4+ Security Target draft. Tata / Yotta channel agreements.</div></div>
+        <div class="tl"><div class="q">2027 H2</div><div class="t">Cert harvest</div><div class="b">FIPS 140-3 L1 cert. FedRAMP Moderate Authorization. CC EAL4+ in evaluation. 10 customers. First DoD agency.</div></div>
+        <div class="tl"><div class="q">2028 H1</div><div class="t">FedRAMP High + IL5</div><div class="b">CSfC component listing. India MeitY empanelment. 25+ customers. Approaching ARR for Series B.</div></div>
+      </div>
+    </section>
+
+    <section style="margin-top: 7mm;" aria-labelledby="s9">
+      <div class="sec-h">
+        <span class="num">09</span>
+        <span class="title" id="s9">Why this team can execute</span>
+      </div>
+      <p>Founder-led, full-stack, ship-or-die. The repository itself is the strongest CV: 266K lines of memory-safe Rust, 19 mechanically-checked TLA+ invariants, Pentagon-grade chaos tests, an 11-node BFT audit cluster, written by a small founding team without venture capital.</p>
+    </section>
+
+  </div>
+
+  <footer class="pgft">
+    <div><strong>MILNET SSO</strong> &middot; <a href="mailto:contact@dmj.one">contact@dmj.one</a></div>
+    <div class="conf">Strategic Confidential</div>
+    <div class="pgnum">Page 7 of 8</div>
+  </footer>
+
+</article>
+
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<!-- PAGE 8 OF 8 · TEAM + ASK                                  -->
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<article class="page" aria-label="Page 8 of 8">
+
+  <header class="band compact">
+    <div class="row">
+      <div>
+        <h1>Team &middot; and the ask</h1>
+        <div class="sub">Pre-production reference implementation, seeking Series A</div>
+      </div>
+      <div class="meta">Page 8 of 8</div>
+    </div>
+  </header>
+
+  <div class="inner tight">
+
+    <section aria-labelledby="s9">
+      <!-- <div class="sec-h">
+        <span class="num">09</span>
+        <span class="title" id="s9">Why this team can execute</span>
+      </div>
+      <p>Founder-led, full-stack, ship-or-die. The repository itself is the strongest CV: 266K lines of memory-safe Rust, 19 mechanically-checked TLA+ invariants, Pentagon-grade chaos tests, an 11-node BFT audit cluster, written by a small founding team without venture capital.</p> -->
+      <div class="cards3" style="grid-template-columns: 1fr 1fr; margin-top: 4mm;">
+        <div class="cd a">
+          <div class="lab">Posture</div>
+          <h4>Founder-led, India-headquartered</h4>
+          <p>Built by <a href="https://dmj.one">dmj.one</a> &middot; lead architect <strong>Divya Mohan</strong>. Globally addressable. Engineering philosophy is conference-paper grade: every primitive must compile, run, and be reviewable as if for USENIX Security or IEEE S&amp;P. Every marketed cryptographic pillar has live, testable code; vendor wiring (hardware HSM, MDM adapters, PKINIT runtime) is the productionisation work this round funds.</p>
+        </div>
+        <div class="cd c">
+          <div class="lab">Edge</div>
+          <h4>Why this team beats the field</h4>
+          <ul>
+            <li><strong>Security-first defaults</strong>: FIPS 140-3 KATs, ZeroizeOnDrop, mlock, fail-closed errors. Retrofitting incumbents to this posture is multi-year work.</li>
+            <li><strong>India + global dual market</strong>: India hedges US procurement-cycle slowness, and is a credibility wedge in EU sovereign-cloud conversations.</li>
+            <li><strong>Founder owns the code path</strong>: every architectural decision can be defended against a hostile reviewer.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section style="margin-top: 7mm;" aria-labelledby="s10">
+      <div class="sec-h">
+        <span class="num">10</span>
+        <span class="title" id="s10">What we are asking, by audience</span>
+      </div>
+      <p>Three audiences, three doors. Same stack. Different conversation. <strong>Stage: pre-production reference implementation.</strong> Architecture and protocol code complete; production hardening, hardware HSM integration, certifications, and first commercial pilot are funded by this round.</p>
+      <div class="cards3" style="margin-top: 4mm;">
+        <div class="cd g">
+          <div class="lab">Series A</div>
+          <h4>Venture investor</h4>
+          <ul>
+            <li>Funding round: <strong>seed-extension or Series A</strong>, sized to the certification + GTM ladder.</li>
+            <li>Use of funds: 60% engineering hardening, 25% certification, 15% GTM into US defence and Indian sovereign channels.</li>
+            <li>Comparables: SailPoint $12.8B, CyberArk $11B, Auth0 $6.5B exit.</li>
+            <li>Ask: <strong>warm intro, term-sheet conversation, or strategic LP</strong>.</li>
+          </ul>
+        </div>
+        <div class="cd b">
+          <div class="lab">Pilot</div>
+          <h4>Enterprise CEO / CISO</h4>
+          <ul>
+            <li>Two design-partner slots remain for 2026 H2: <strong>one US defence prime, one Indian PSU</strong>.</li>
+            <li>In return: discounted multi-year ARR, named architectural input, joint case-study + reference rights.</li>
+            <li>Pilot scope: deploy <code>auto_provision.sh</code> in customer cloud, federate with existing AD/Entra, run live OIDC for one bounded application set.</li>
+            <li>Ask: <strong>30-min walkthrough with CISO + identity architect</strong>.</li>
+          </ul>
+        </div>
+        <div class="cd a">
+          <div class="lab">Sovereign</div>
+          <h4>Government official</h4>
+          <ul>
+            <li>Ready for empanelment with <strong>MeitY, NIC, CDAC, CERT-In</strong> and EU + Five Eyes counterparts.</li>
+            <li>Indian sovereignty: built in India, deployable in Delhi / Mumbai / Hyderabad, DPDP 2023, CERT-In, GIGW 3.0.</li>
+            <li>EU posture: OIDC / OAuth 2.1 / FIDO2 / SAML overlap with EUDI Wallet; full VC profile (OID4VC, OID4VP, mdoc, SD-JWT) on the integration roadmap. Gaia-X deployable.</li>
+            <li>Ask: <strong>technical pre-bid briefing or RFP inclusion</strong>.</li>
+          </ul>
+        </div>
+      </div>
+      <div class="disc">
+        Pricing for third-party products and recent funding rounds drawn from official vendor pages and reputable trade press; figures reflect best knowledge as of 2026-05-06 and may vary with private-market disclosures. Comparable valuations are presented as category indicators, not as forecasts. Certification cost ranges synthesised from public CMVP queue data, Lightship Security, Corsec, and FedRAMP marketplace statistics. Frontier-system claims (Apple iCloud Contact Key Verification, WhatsApp Key Transparency, Signal PQXDH, Microsoft Project Everest / HACL*, Estonia Smart-ID, EUDI Wallet) are based on publicly disclosed technical descriptions. <em>Forward-looking statements about market windows, certification timelines, and unit economics are projections, not guarantees.</em>
+      </div>
+    </section>
+
+  </div>
+
+  <div class="cta" role="region" aria-label="Get in touch">
+    <div>
+      <h3>One contact point for all three doors. <em>Let&rsquo;s talk.</em></h3>
+      <p>Decks, technical walkthroughs, code-review sessions, and design-partner discussions on request. The window is two to four years. The procurement clock is running.</p>
+    </div>
+    <div class="actions">
+      <a class="btn" href="mailto:contact@dmj.one">contact@dmj.one</a>
+      <!-- <div class="links"><a href="/onepager.html">Overview</a> &middot; <a href="/business.html">Buyer brief</a> &middot; <a href="/usecase.html">India use case</a></div> -->
+    </div>
+  </div>
+
+  <footer class="pgft">
+    <span style="color:#fcd34d;">Made in India</span> #AtmanirbharBharat #India2047</div>
+    <div class="conf">Strategic Confidential</div>
+    <div class="pgnum">Page 8 of 8</div>
+  </footer>
+
+</article>
+
+</body>
+</html>

@@ -1,0 +1,1033 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MILNET SSO &middot; Business Brief</title>
+<meta name="description" content="MILNET SSO business brief: post-quantum identity for regulated buyers. Cost, certification path, deployment topology, and competitive position vs Microsoft Entra, Okta, Google, Ping.">
+<meta name="robots" content="noindex">
+<link rel="stylesheet" href="/fonts/jetbrains-mono.css">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --fd: 'Instrument Serif', Georgia, serif;
+    --fh: 'Sentient', Georgia, serif;
+    --fl: 'Geist', system-ui, sans-serif;
+    --fu: 'Inter', system-ui, sans-serif;
+    --f:  'Times New Roman', Times, serif;
+    --fm: 'Geist Mono', 'JetBrains Mono', monospace;
+
+    --s9: #0c0f1a; --s8: #1f2433; --s7: #2e3347;
+    --s5: #6b7280; --s4: #9ca3af; --s3: #cbd5e1;
+    --s2: #e5e7eb; --s1: #f3f4f6; --s0: #fafafc;
+
+    --g: #059669; --b: #3b82f6; --a: #f59e0b;
+    --p: #8b5cf6; --c: #06b6d4; --r: #ef4444;
+  }
+
+  html { font-size: 16px; scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    * { transition: none !important; animation: none !important; }
+  }
+
+  body {
+    background: var(--s0);
+    color: var(--s9);
+    font-family: var(--f);
+    line-height: 1.55;
+    min-height: 100vh;
+    position: relative;
+  }
+
+  body::before {
+    content: ''; position: fixed; inset: 0; z-index: 0; pointer-events: none;
+    background:
+      radial-gradient(ellipse 60% 50% at 15% 5%, rgba(5,150,105,0.06), transparent),
+      radial-gradient(ellipse 50% 40% at 85% 8%, rgba(59,130,246,0.06), transparent),
+      radial-gradient(ellipse 40% 35% at 50% 95%, rgba(139,92,246,0.05), transparent),
+      radial-gradient(ellipse 30% 30% at 75% 50%, rgba(6,182,212,0.03), transparent);
+  }
+  body > * { position: relative; z-index: 1; }
+
+  a { color: var(--b); text-decoration: none; border-bottom: 1px dotted rgba(59,130,246,0.4); }
+  a:hover, a:focus-visible { color: #1d4ed8; border-bottom-color: var(--b); }
+  a:focus-visible { outline: 2px solid var(--b); outline-offset: 2px; }
+
+  /* ────────── HEADER ────────── */
+  .hdr {
+    padding: 1.4rem 2rem;
+    background: linear-gradient(135deg, #0c0f1a 0%, #131a2e 40%, #0e1a2d 100%);
+    position: relative; overflow: hidden;
+    display: flex; justify-content: space-between; align-items: center;
+    flex-wrap: wrap; gap: 1rem;
+  }
+  .hdr::after {
+    content: ''; position: absolute; bottom: 0; left: 0; right: 0; height: 2px;
+    background: linear-gradient(90deg, var(--g) 0%, var(--b) 25%, var(--p) 50%, var(--c) 75%, var(--g) 100%);
+  }
+  .hdr h1 {
+    font: 400 2rem/1 var(--fd); color: #fff; letter-spacing: 1.5px;
+    text-shadow: 0 0 40px rgba(5,150,105,0.3), 0 0 80px rgba(59,130,246,0.15);
+  }
+  .hdr .sub { font: 400 0.95rem/1.4 var(--fu); color: #94a3b8; margin-top: 0.25rem; }
+  .hdr .rt { text-align: right; }
+  .badge {
+    display: inline-block; padding: 0.3rem 0.8rem; border-radius: 6px;
+    font: 600 0.78rem var(--fl); letter-spacing: 0.8px; text-transform: uppercase;
+    background: linear-gradient(135deg, rgba(250,204,21,0.18), rgba(250,204,21,0.06));
+    color: #facc15; border: 1px solid rgba(250,204,21,0.3);
+  }
+  .hdr .meta { font: 400 0.82rem var(--fu); color: #cbd5e1; margin-top: 0.3rem; }
+  .nav-pages {
+    display: flex; gap: 0.6rem; flex-wrap: wrap; margin-top: 0.4rem;
+    font: 500 0.78rem var(--fl);
+  }
+  .nav-pages a {
+    color: #93c5fd; border-bottom-color: rgba(147,197,253,0.3);
+  }
+  .nav-pages a:hover { color: #bfdbfe; }
+
+  /* ────────── LAYOUT ────────── */
+  main {
+    max-width: 1240px; margin: 0 auto;
+    padding: 1.4rem 1.6rem 0;
+    display: flex; flex-direction: column; gap: 1.4rem;
+  }
+
+  section { break-inside: avoid; }
+  section h2 {
+    font: 400 1.85rem/1.2 var(--fd);
+    color: var(--s9); margin-bottom: 0.4rem;
+    display: flex; align-items: baseline; gap: 0.6rem;
+  }
+  section h2 .num {
+    font: 600 0.82rem var(--fl); color: var(--s5);
+    letter-spacing: 1.5px; text-transform: uppercase;
+  }
+  section .lead {
+    font: 400 1.05rem/1.5 var(--f); color: var(--s7);
+    max-width: 72ch; margin-bottom: 1rem;
+  }
+  section .lead em { color: var(--s9); font-style: italic; }
+
+  /* ────────── HERO ────────── */
+  .hero {
+    background: linear-gradient(135deg, #0c0f1a 0%, #162032 50%, #0f1729 100%);
+    border-radius: 14px; padding: 1.8rem 2rem; color: #fff;
+    box-shadow: 0 8px 30px rgba(15,23,42,0.18), inset 0 1px 0 rgba(255,255,255,0.06);
+    text-align: center;
+  }
+  .hero .hook {
+    font: 400 1.05rem/1 var(--fd); color: var(--s4);
+    margin-bottom: 0.5rem; letter-spacing: 0.5px;
+  }
+  .hero h2 {
+    font: 400 2.4rem/1.25 var(--fd); color: #fff;
+    border: 0; padding: 0; margin: 0 0 0.6rem; max-width: 30ch;
+    margin-left: auto; margin-right: auto;
+  }
+  .hero h2 em { font-style: italic; color: #facc15; }
+  .hero p.tag {
+    font: 400 1rem/1.5 var(--fu); color: var(--s3);
+    max-width: 65ch; margin: 0.6rem auto 1rem;
+  }
+  .hero .nums {
+    display: grid; grid-template-columns: repeat(6, 1fr);
+    gap: 1px; background: rgba(255,255,255,0.08);
+    margin-top: 1.2rem; border-radius: 8px; overflow: hidden;
+  }
+  .hero .n {
+    background: rgba(12,15,26,0.85);
+    padding: 0.85rem 0.4rem; text-align: center;
+  }
+  .hero .nv { font: 700 1.4rem/1 var(--fl); color: #fff; display: block; }
+  .hero .nl {
+    font: 500 0.66rem/1.3 var(--fu); color: var(--s4);
+    text-transform: uppercase; letter-spacing: 0.4px; margin-top: 0.25rem;
+  }
+  @media (max-width: 760px) {
+    .hero .nums { grid-template-columns: repeat(2, 1fr); }
+  }
+
+  /* ────────── CARDS ────────── */
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0.9rem; }
+  .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.9rem; }
+  .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.7rem; }
+  @media (max-width: 900px) {
+    .grid-2, .grid-3, .grid-4 { grid-template-columns: 1fr; }
+  }
+
+  .card {
+    background: rgba(255,255,255,0.6);
+    backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+    border: 1px solid rgba(255,255,255,0.6);
+    border-radius: 12px;
+    padding: 0.95rem 1.05rem;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04), 0 6px 16px rgba(0,0,0,0.03), inset 0 1px 0 rgba(255,255,255,0.7);
+    position: relative; overflow: hidden;
+  }
+  .card::before {
+    content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2.5px;
+    border-radius: 12px 12px 0 0;
+  }
+  .card h3 {
+    font: 600 1.08rem/1.25 var(--fh); color: var(--s9);
+    margin-bottom: 0.35rem;
+    display: flex; justify-content: space-between; align-items: center; gap: 0.5rem;
+  }
+  .card .pill {
+    font: 600 0.7rem/1 var(--fl); padding: 0.2rem 0.55rem;
+    border-radius: 20px; text-transform: uppercase; letter-spacing: 0.3px;
+    color: #fff; box-shadow: 0 1px 4px rgba(0,0,0,0.1); white-space: nowrap;
+  }
+  .card p { font: 400 0.95rem/1.55 var(--f); color: var(--s7); }
+  .card ul { list-style: none; margin-top: 0.25rem; }
+  .card li {
+    font: 400 0.94rem/1.5 var(--f); color: var(--s7);
+    padding: 0.08rem 0 0.08rem 0.85rem; position: relative;
+  }
+  .card li::before {
+    content: ''; position: absolute; left: 0; top: 0.55rem;
+    width: 5px; height: 5px; border-radius: 50%;
+  }
+  .card li strong { font: 600 0.88rem var(--fm); color: var(--s9); }
+
+  /* card themes */
+  .card.green::before { background: linear-gradient(90deg, var(--g), #34d399); }
+  .card.green h3 { color: #047857; } .card.green li::before { background: var(--g); }
+  .card.green .pill { background: linear-gradient(135deg, #047857, var(--g)); }
+
+  .card.blue::before { background: linear-gradient(90deg, var(--b), #60a5fa); }
+  .card.blue h3 { color: #1d4ed8; } .card.blue li::before { background: var(--b); }
+  .card.blue .pill { background: linear-gradient(135deg, #1d4ed8, var(--b)); }
+
+  .card.amber::before { background: linear-gradient(90deg, #d97706, #fbbf24); }
+  .card.amber h3 { color: #b45309; } .card.amber li::before { background: #d97706; }
+  .card.amber .pill { background: linear-gradient(135deg, #b45309, #d97706); }
+
+  .card.purple::before { background: linear-gradient(90deg, var(--p), #a78bfa); }
+  .card.purple h3 { color: #6d28d9; } .card.purple li::before { background: var(--p); }
+  .card.purple .pill { background: linear-gradient(135deg, #6d28d9, var(--p)); }
+
+  .card.cyan::before { background: linear-gradient(90deg, var(--c), #22d3ee); }
+  .card.cyan h3 { color: #0e7490; } .card.cyan li::before { background: var(--c); }
+  .card.cyan .pill { background: linear-gradient(135deg, #0e7490, var(--c)); }
+
+  .card.red::before { background: linear-gradient(90deg, var(--r), #fb7185); }
+  .card.red h3 { color: #b91c1c; } .card.red li::before { background: var(--r); }
+  .card.red .pill { background: linear-gradient(135deg, #b91c1c, var(--r)); }
+
+  /* ────────── TABLE ────────── */
+  .tbl-wrap {
+    background: rgba(255,255,255,0.55);
+    backdrop-filter: blur(16px);
+    border: 1px solid rgba(255,255,255,0.6);
+    border-radius: 12px; overflow: hidden;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04), 0 6px 16px rgba(0,0,0,0.03);
+  }
+  .tbl { width: 100%; border-collapse: collapse; font: 400 0.9rem/1.4 var(--f); }
+  .tbl caption {
+    font: 600 0.78rem var(--fl); color: var(--s5);
+    letter-spacing: 1px; text-transform: uppercase;
+    text-align: left; padding: 0.7rem 0.9rem 0.4rem; caption-side: top;
+  }
+  .tbl thead tr { background: linear-gradient(135deg, #0c0f1a, #1e293b); color: #fff; }
+  .tbl th {
+    font: 600 0.72rem/1.2 var(--fl); letter-spacing: 0.3px; text-transform: uppercase;
+    text-align: left; padding: 0.55rem 0.6rem;
+  }
+  .tbl th.us { background: linear-gradient(135deg, #047857, var(--g)); color: #fff; }
+  .tbl td { padding: 0.5rem 0.6rem; border-top: 1px solid rgba(0,0,0,0.06); color: var(--s7); vertical-align: top; }
+  .tbl tbody tr { background: rgba(255,255,255,0.35); }
+  .tbl tbody tr:nth-child(even) { background: rgba(243,244,246,0.55); }
+  .tbl tbody tr.us { background: rgba(5,150,105,0.07); }
+  .tbl tbody tr.us:nth-child(even) { background: rgba(5,150,105,0.10); }
+  .tbl td:first-child { font: 600 0.92rem var(--fu); color: var(--s9); white-space: nowrap; }
+  .tbl td.us-cell { color: #047857; font-weight: 600; }
+  .tbl .num-c { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .tbl .y { color: var(--g); font-weight: 600; }
+  .tbl .n { color: var(--r); }
+  .tbl .partial { color: #b45309; }
+
+  /* ────────── CALLOUTS ────────── */
+  .callout {
+    border-radius: 12px; padding: 0.95rem 1.1rem;
+    border: 1px solid; display: flex; gap: 0.8rem; align-items: flex-start;
+    font: 400 0.95rem/1.5 var(--f);
+  }
+  .callout.warn {
+    background: linear-gradient(135deg, rgba(245,158,11,0.08), rgba(245,158,11,0.02));
+    border-color: rgba(245,158,11,0.35); color: #78350f;
+  }
+  .callout.info {
+    background: linear-gradient(135deg, rgba(59,130,246,0.08), rgba(59,130,246,0.02));
+    border-color: rgba(59,130,246,0.3); color: #1e3a8a;
+  }
+  .callout.green {
+    background: linear-gradient(135deg, rgba(5,150,105,0.08), rgba(5,150,105,0.02));
+    border-color: rgba(5,150,105,0.3); color: #064e3b;
+  }
+  .callout strong { font-family: var(--fl); font-weight: 700; }
+  .callout .icon {
+    font: 700 0.95rem/1 var(--fl);
+    flex-shrink: 0; padding: 0.35rem 0.55rem; border-radius: 6px;
+    background: rgba(0,0,0,0.04);
+  }
+
+  /* ────────── KV LIST (cost / cert ladders) ────────── */
+  .kv {
+    display: grid; grid-template-columns: 1fr; gap: 0;
+    background: rgba(255,255,255,0.5); backdrop-filter: blur(16px);
+    border: 1px solid rgba(255,255,255,0.6); border-radius: 12px; overflow: hidden;
+  }
+  .kv .row {
+    display: grid; grid-template-columns: 220px 1fr 160px;
+    gap: 1rem; padding: 0.7rem 1rem;
+    border-top: 1px solid rgba(0,0,0,0.06);
+    align-items: baseline;
+  }
+  .kv .row:first-child { border-top: 0; }
+  .kv .row:nth-child(even) { background: rgba(243,244,246,0.4); }
+  .kv .k { font: 600 0.94rem var(--fu); color: var(--s9); }
+  .kv .v { font: 400 0.92rem/1.5 var(--f); color: var(--s7); }
+  .kv .p { font: 700 0.95rem var(--fl); color: var(--g); text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .kv .p.warn { color: #b45309; }
+  .kv .p.danger { color: var(--r); }
+  @media (max-width: 760px) {
+    .kv .row { grid-template-columns: 1fr; gap: 0.2rem; padding: 0.7rem 0.9rem; }
+    .kv .p { text-align: left; }
+  }
+
+  /* ────────── STATUS LEGEND ────────── */
+  .legend {
+    display: flex; gap: 0.8rem; flex-wrap: wrap;
+    font: 500 0.78rem var(--fl);
+    margin: 0.4rem 0 0.6rem;
+  }
+  .legend span {
+    display: inline-flex; align-items: center; gap: 0.4rem;
+    padding: 0.2rem 0.6rem; border-radius: 20px;
+    background: rgba(255,255,255,0.6); border: 1px solid rgba(0,0,0,0.06);
+  }
+  .legend .dot { width: 8px; height: 8px; border-radius: 50%; }
+  .legend .ship .dot { background: var(--g); }
+  .legend .scaff .dot { background: var(--a); }
+  .legend .plan .dot { background: var(--s4); }
+  .tag-ship, .tag-scaff, .tag-plan, .tag-stub {
+    font: 700 0.62rem var(--fl); padding: 0.12rem 0.45rem; border-radius: 4px;
+    text-transform: uppercase; letter-spacing: 0.3px;
+    margin-left: 0.4rem; vertical-align: middle;
+  }
+  .tag-ship { background: rgba(5,150,105,0.15); color: #047857; }
+  .tag-scaff { background: rgba(245,158,11,0.18); color: #b45309; }
+  .tag-plan { background: rgba(107,114,128,0.18); color: var(--s7); }
+  .tag-stub { background: rgba(239,68,68,0.15); color: #b91c1c; }
+
+  /* ────────── FOOTER ────────── */
+  footer {
+    margin-top: 2rem;
+    padding: 1.2rem 2rem;
+    background: linear-gradient(135deg, #0c0f1a 0%, #162032 50%, #0f1729 100%);
+    color: rgba(255,255,255,0.85);
+    font: 400 0.88rem var(--fu);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.05);
+  }
+  footer .ft-row {
+    max-width: 1240px; margin: 0 auto;
+    display: flex; justify-content: space-between; align-items: center;
+    flex-wrap: wrap; gap: 1rem;
+  }
+  footer strong { color: #facc15; font-family: var(--fl); }
+  footer .tags { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+  footer .ft {
+    font: 500 0.72rem var(--fl); letter-spacing: 0.3px; text-transform: uppercase;
+    padding: 0.18rem 0.55rem; border-radius: 20px;
+    background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12);
+    color: #cbd5e1;
+  }
+  footer .disclaimer {
+    max-width: 1240px; margin: 0.8rem auto 0;
+    font: 400 0.74rem/1.45 var(--fu); color: #64748b;
+    border-top: 1px solid rgba(255,255,255,0.06); padding-top: 0.8rem;
+  }
+
+  /* ────────── PRINT ────────── */
+  @media print {
+    @page { size: A4 portrait; margin: 14mm 12mm; }
+    body { background: #fff; font-size: 10.5pt; }
+    body::before, body::after { display: none; }
+    a { color: var(--s9); border: 0; }
+    a[href^="http"]::after { content: ""; }
+    .hdr, .hero, footer {
+      -webkit-print-color-adjust: exact; print-color-adjust: exact;
+    }
+    .card, .tbl-wrap, .kv, .callout {
+      backdrop-filter: none; background: #fff;
+      border: 1px solid #d1d5db;
+      box-shadow: none; break-inside: avoid;
+    }
+    .nav-pages, .hero .nums { break-inside: avoid; }
+    section { break-inside: avoid-page; margin-bottom: 0.8rem; }
+    section h2 { break-after: avoid; }
+    .grid-2, .grid-3, .grid-4 { break-inside: avoid; }
+    .tbl thead tr, .tbl th.us {
+      -webkit-print-color-adjust: exact; print-color-adjust: exact;
+    }
+    main { padding: 0; }
+  }
+  @media (forced-colors: active) {
+    .card, .tbl-wrap, .kv, .callout { border: 2px solid CanvasText; }
+  }
+</style>
+</head>
+<body>
+
+<header class="hdr" role="banner">
+  <div>
+    <h1>MILNET Single Sign-On</h1>
+    <div class="sub">Business Brief &middot; Post-Quantum Identity for Regulated Buyers</div>
+    <nav class="nav-pages" aria-label="Sister pages">
+      <a href="/about.html">About</a>
+      <a href="/pitch.html">Pitch</a>
+      <a href="/summary.html">Technical Summary</a>
+      <a href="/docs.html">Integration Docs</a>
+    </nav>
+  </div>
+  <div class="rt">
+    <span class="badge">Confidential &middot; Buyer Use</span>
+    <div class="meta">v1.0 &middot; 2026-05-06 &middot; Source-of-truth: code</div>
+  </div>
+</header>
+
+<main>
+
+<!-- ──────────── HERO ──────────── -->
+<section class="hero" aria-labelledby="hero-h">
+  <div class="hook">Built for the buyer who cannot afford a 2030 cryptographic crisis.</div>
+  <h2 id="hero-h">Quantum-safe SSO, <em>shipped today</em>, formally proven, deployable on a single bash command.</h2>
+  <p class="tag">266,000 lines of Rust. 36 crates. 5,422 tests. 19 TLA+ safety invariants. Hybrid post-quantum primitives wired end-to-end. No competitor has all four.</p>
+  <div class="nums" role="group" aria-label="Headline numbers">
+    <div class="n"><span class="nv">266K</span><span class="nl">Lines of Rust</span></div>
+    <div class="n"><span class="nv">36</span><span class="nl">Workspace crates</span></div>
+    <div class="n"><span class="nv">5,422</span><span class="nl">Tests</span></div>
+    <div class="n"><span class="nv">19</span><span class="nl">TLA+ invariants</span></div>
+    <div class="n"><span class="nv">53</span><span class="nl">Fuzz targets</span></div>
+    <div class="n"><span class="nv">62</span><span class="nl">E2E + chaos</span></div>
+  </div>
+</section>
+
+<!-- ──────────── 1. THE PROBLEM ──────────── -->
+<section aria-labelledby="s1">
+  <h2 id="s1"><span class="num">01</span> The deadline already started</h2>
+  <p class="lead">Every byte encrypted today with classical TLS, RSA, or P-256 is being archived by adversaries with state-level budgets. <em>Harvest now, decrypt later.</em> The U.S. NSA fixed the migration deadlines years ago. The major SSO vendors do not yet have a generally-available answer for identity protocols.</p>
+  <div class="grid-3">
+    <article class="card amber">
+      <h3>NSA CNSA 2.0 <span class="pill">2030 / 2033</span></h3>
+      <ul>
+        <li>Software and firmware that signs or distributes new code: <strong>full PQC by 2030</strong>.</li>
+        <li>New National Security Systems start <strong>2027</strong>, complete migration by <strong>2033</strong>.</li>
+        <li>Mandates ML-KEM (FIPS 203), ML-DSA (FIPS 204), AES-256, SHA-384/512.</li>
+      </ul>
+    </article>
+    <article class="card blue">
+      <h3>OMB &amp; CISA <span class="pill">In effect</span></h3>
+      <ul>
+        <li><strong>OMB M-23-02</strong>: agencies must inventory cryptography and migrate to PQC, with annual reports.</li>
+        <li><strong>OMB M-22-09</strong>: phishing-resistant MFA mandated across federal agencies.</li>
+        <li><strong>NSM-10</strong>: NSS migration to quantum-resistant cryptography.</li>
+      </ul>
+    </article>
+    <article class="card red">
+      <h3>The vendor gap <span class="pill">Unfilled</span></h3>
+      <ul>
+        <li>Microsoft, Okta, Google, Ping: <strong>no GA post-quantum identity protocol</strong> as of 2026.</li>
+        <li>TLS-layer PQ (Chrome, SymCrypt) does not protect WebAuthn, OPAQUE, SAML, or token signing.</li>
+        <li>Window of advantage: 2 to 4 years before the incumbents catch up.</li>
+      </ul>
+    </article>
+  </div>
+</section>
+
+<!-- ──────────── 2. WHAT WE BUILT ──────────── -->
+<section aria-labelledby="s2">
+  <h2 id="s2"><span class="num">02</span> Four things no one else has all of</h2>
+  <p class="lead">Every claim below maps to a file in this repository. Sources cited inline.</p>
+  <div class="grid-2">
+    <article class="card green">
+      <h3>1. Post-quantum where it matters <span class="pill">Shipped</span></h3>
+      <ul>
+        <li><strong>ML-KEM-1024</strong> &amp; <strong>X-Wing hybrid KEM</strong> (X25519 + ML-KEM-1024) inside the session ratchet, re-keyed every puncture interval &middot; <a href="/crypto/src/xwing.rs">crypto/src/xwing.rs</a>, <a href="/ratchet">ratchet/</a>.</li>
+        <li><strong>ML-DSA-87</strong> signing for OIDC ID tokens, DPoP proofs, KT log leaves, SAML signatures, audit entries &middot; <a href="/crypto/src/pq_sign.rs">crypto/src/pq_sign.rs</a>.</li>
+        <li><strong>SLH-DSA-SHA2-256f</strong> + <strong>LMS / XMSS</strong> hash-based reserves for code signing &middot; <a href="/crypto/src/slh_dsa.rs">slh_dsa.rs</a>, <a href="/crypto/src/hbs.rs">hbs.rs</a>.</li>
+        <li>FIPS 140-3 startup KATs gate every primitive at boot.</li>
+      </ul>
+    </article>
+    <article class="card blue">
+      <h3>2. Threshold-everything <span class="pill">Shipped</span></h3>
+      <ul>
+        <li><strong>FROST-Ristretto255 3-of-5</strong> threshold signatures for token issuance, dual-signed nested with ML-DSA-87 &middot; <a href="/tss">tss/</a>.</li>
+        <li><strong>2-of-3 threshold OPAQUE</strong>: no single server can reconstruct the OPRF key or learn passwords &middot; <a href="/opaque/src/threshold.rs">opaque/src/threshold.rs</a>.</li>
+        <li><strong>Pedersen DKG</strong> + 3-of-5 quorum for issuing any internal mTLS module certificate &middot; <a href="/shard/src/tls_ca.rs">shard/src/tls_ca.rs</a>.</li>
+        <li>Persistent FROST nonce WAL with fsync &middot; defeats post-restart nonce reuse.</li>
+      </ul>
+    </article>
+    <article class="card purple">
+      <h3>3. Formally verified <span class="pill">Code-truth</span></h3>
+      <ul>
+        <li>TLA+ model <a href="/formal-model/milnet.tla">formal-model/milnet.tla</a>, 1,081 lines: <strong>19 safety invariants</strong> + 3 liveness properties.</li>
+        <li>Models 4 device tiers, FROST DKG, OPAQUE, ratchet, Bell-LaPadula cross-domain guard, token lifecycle, key rotation, PIM no-self-approval, multi-tenancy isolation, CAE re-evaluation.</li>
+        <li>Constant-time TLA+ model + dudect Welch t-test harness &middot; <a href="/dudect-harness">dudect-harness/</a>.</li>
+        <li><em>No incumbent SSO ships formal verification of this depth.</em></li>
+      </ul>
+    </article>
+    <article class="card cyan">
+      <h3>4. BFT audit + risk + KT <span class="pill">Shipped</span></h3>
+      <ul>
+        <li>11-node Byzantine Fault Tolerant audit cluster (f=3, quorum 7), every entry ML-DSA-87 signed and hash-chained &middot; <a href="/audit">audit/</a>.</li>
+        <li>Out-of-process witness signer over UDS with seed independent of the master KEK &middot; <a href="/services/audit-witness">services/audit-witness/</a>.</li>
+        <li>Key Transparency log with 2-of-5 ML-DSA-87 consensus, CSHAKE256 leaves &middot; <a href="/kt">kt/</a>.</li>
+        <li>Real risk engine: per-user EMA baselines, MaxMind ASN cross-check, MITRE ATT&amp;CK-tagged correlation rules, mimicry detection &middot; <a href="/risk">risk/</a>.</li>
+      </ul>
+    </article>
+  </div>
+</section>
+
+<!-- ──────────── 3. WHO BUYS ──────────── -->
+<section aria-labelledby="s3">
+  <h2 id="s3"><span class="num">03</span> Who buys this</h2>
+  <p class="lead">MILNET is not a horizontal commercial SSO. It is for buyers whose cost of a credential-leak incident is measured in lives, classified data, or front-page lawsuits, and whose regulators have already named a 2030 deadline.</p>
+
+  <div class="grid-3">
+    <article class="card green">
+      <h3>US Federal &amp; DoD <span class="pill">Tier-1 fit</span></h3>
+      <p><strong>Civilian agencies</strong> with FedRAMP Moderate / Class B-C requirements; <strong>DoD components</strong> needing IL4/IL5; <strong>defense primes</strong> servicing classified contracts under CMMC L3.</p>
+      <p><em>Why us</em>: CNSA 2.0 alignment, NIAP-eligible posture, DISA STIG XCCDF reports out of the box, formal verification artifacts that fast-track EAL4+/CSfC review.</p>
+    </article>
+    <article class="card amber">
+      <h3>Indian Government &amp; PSU <span class="pill">Strategic</span></h3>
+      <p><strong>Central ministries</strong>, <strong>state e-governance</strong> (1.2B Aadhaar holders, ₹14T monthly UPI volume), <strong>BFSI</strong> regulated under RBI / SEBI / IRDAI, <strong>defense PSUs</strong>.</p>
+      <p><em>Why us</em>: DPDP Act 2023 data residency by construction, CERT-In incident reporting hooks, GIGW 3.0 baseline, made-in-India sovereignty story, deployable in Delhi / Mumbai / Hyderabad availability zones.</p>
+    </article>
+    <article class="card blue">
+      <h3>Healthcare &amp; Pharma <span class="pill">High value</span></h3>
+      <p>Hospitals under HIPAA; pharma R&amp;D under 21 CFR Part 11; clinical trial sponsors with 25-year data retention requirements where harvest-now-decrypt-later is an existential threat.</p>
+      <p><em>Why us</em>: per-tenant encryption keys, BFT audit immutability, PITR plan, encrypted PII at column level (<a href="/migrations">migrations 005-007</a>).</p>
+    </article>
+    <article class="card purple">
+      <h3>Critical Infrastructure <span class="pill">High value</span></h3>
+      <p>Energy grid, telecom carriers, central banks, exchanges, satellite operators, water utilities. Anything whose downtime triggers national news.</p>
+      <p><em>Why us</em>: single-host-compromise tolerant by design, fail-closed defaults, no vendor cloud dependency, can run inside an air-gapped enclave.</p>
+    </article>
+    <article class="card cyan">
+      <h3>Sovereign Cloud Resellers <span class="pill">Channel</span></h3>
+      <p>Country-specific cloud providers (Yotta, Tata Communications, ESDS, Bharti Airtel; G42 in UAE; OVHcloud Sovereign; Atos Bullion) who need a sovereign IDaaS layer to bundle.</p>
+      <p><em>Why us</em>: deployable on customer infrastructure, no telemetry phone-home, no shared control plane, license-friendly to embed.</p>
+    </article>
+    <article class="card red">
+      <h3>Where we are <em>not</em> a fit <span class="pill">Be honest</span></h3>
+      <p>Sub-50-seat startups buying SSO for Slack and GitHub. Brand-conscious mid-market with no compliance pressure. Customers who need self-serve tenant onboarding via wizard <em>today</em> &middot; that is a 2026 H2 deliverable, see &sect;09.</p>
+    </article>
+  </div>
+</section>
+
+<!-- ──────────── 4. VS THE FIELD ──────────── -->
+<section aria-labelledby="s4">
+  <h2 id="s4"><span class="num">04</span> Versus the incumbents</h2>
+  <p class="lead">Pricing pulled from official vendor pages on 2026-05-06. PQ stance verified against vendor security pages and public roadmaps. Where the answer is &ldquo;contact sales&rdquo; we say so.</p>
+  <div class="tbl-wrap">
+    <table class="tbl">
+      <caption>Per-user / month list pricing &middot; FedRAMP &middot; Post-quantum stance</caption>
+      <thead>
+        <tr>
+          <th>Vendor &middot; tier</th>
+          <th class="num-c">$/user/mo</th>
+          <th>FedRAMP &middot; DoD IL</th>
+          <th>PQ identity stance</th>
+          <th>Formal verification</th>
+          <th class="us">MILNET advantage</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Microsoft Entra ID P1</td>
+          <td class="num-c">$6</td>
+          <td>High &middot; IL4 / IL5 / IL6 (Azure Gov)</td>
+          <td><span class="partial">TLS-layer only</span></td>
+          <td><span class="n">No</span></td>
+          <td class="us-cell">PQ identity tokens today</td>
+        </tr>
+        <tr>
+          <td>Microsoft Entra ID P2</td>
+          <td class="num-c">$9</td>
+          <td>Same as P1</td>
+          <td><span class="partial">TLS-layer only</span></td>
+          <td><span class="n">No</span></td>
+          <td class="us-cell">Threshold issuance, no single-host trust</td>
+        </tr>
+        <tr>
+          <td>Microsoft Entra Suite</td>
+          <td class="num-c">$12</td>
+          <td>Same as P1</td>
+          <td><span class="partial">TLS-layer only</span></td>
+          <td><span class="n">No</span></td>
+          <td class="us-cell">Full BFT audit + KT log</td>
+        </tr>
+        <tr>
+          <td>Okta Workforce SSO</td>
+          <td class="num-c">$6</td>
+          <td>Moderate &middot; <em>Okta Gov</em>: High + IL4</td>
+          <td><span class="n">None public</span></td>
+          <td><span class="n">No</span></td>
+          <td class="us-cell">Lower entry for &lt;200-seat regulated</td>
+        </tr>
+        <tr>
+          <td>Okta Core Essentials</td>
+          <td class="num-c">$14</td>
+          <td>Same</td>
+          <td><span class="n">None public</span></td>
+          <td><span class="n">No</span></td>
+          <td class="us-cell">No $1,500 annual minimum</td>
+        </tr>
+        <tr>
+          <td>Okta Professional</td>
+          <td class="num-c">$17</td>
+          <td>Same</td>
+          <td><span class="n">None public</span></td>
+          <td><span class="n">No</span></td>
+          <td class="us-cell">Source-available; deploy in air-gap</td>
+        </tr>
+        <tr>
+          <td>Google Cloud Identity Premium</td>
+          <td class="num-c">~$6</td>
+          <td>None on Cloud Identity itself</td>
+          <td><span class="partial">Chrome / BoringCrypto only</span></td>
+          <td><span class="n">No</span></td>
+          <td class="us-cell">FedRAMP-eligible posture</td>
+        </tr>
+        <tr>
+          <td>Google BeyondCorp Enterprise</td>
+          <td class="num-c">$6 / $9</td>
+          <td>High via Assured Workloads &middot; IL4</td>
+          <td><span class="partial">Chrome only</span></td>
+          <td><span class="n">No</span></td>
+          <td class="us-cell">PQ identity, not just PQ transport</td>
+        </tr>
+        <tr>
+          <td>Ping Identity / PingFederate</td>
+          <td class="num-c">$3 - $6</td>
+          <td>Moderate &middot; High in progress</td>
+          <td><span class="n">None public</span></td>
+          <td><span class="n">No</span></td>
+          <td class="us-cell">No $35K-$50K annual minimum</td>
+        </tr>
+        <tr>
+          <td>ForgeRock (now Ping)</td>
+          <td class="num-c">Contact sales</td>
+          <td>Moderate</td>
+          <td><span class="n">None public</span></td>
+          <td><span class="n">No</span></td>
+          <td class="us-cell">Transparent unit economics</td>
+        </tr>
+        <tr class="us">
+          <td><strong>MILNET SSO</strong></td>
+          <td class="num-c"><strong>Self-host: BYO-infra</strong></td>
+          <td>NIAP / FedRAMP-eligible</td>
+          <td><span class="y">PQ-native, hybrid</span></td>
+          <td><span class="y">19 TLA+ invariants</span></td>
+          <td class="us-cell">All four: PQ + threshold + formal + BFT</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="callout info" style="margin-top: 0.9rem;">
+    <span class="icon">i</span>
+    <div><strong>None of the named incumbents</strong> have published a generally-available date for migrating WebAuthn, OPAQUE, FIDO2, SAML, or token signing to post-quantum cryptography. TLS-layer PQ in Chrome or SymCrypt does not cover identity protocol payloads. This is the durable wedge.</div>
+  </div>
+</section>
+
+<!-- ──────────── 5. COST TO DEPLOY ──────────── -->
+<section aria-labelledby="s5">
+  <h2 id="s5"><span class="num">05</span> Cost to deploy &middot; on Google Cloud</h2>
+  <p class="lead">All numbers in USD per month, GCP <code>asia-south1</code> list pricing, on-demand Sustained Use Discount applied. Reference deployment: VM-based with self-managed Postgres, AMD SEV-SNP Confidential VMs for OPAQUE / TSS / Ratchet / DB tiers, Cloud HSM + Cloud KMS, Cloud Armor on the gateway only.</p>
+  <div class="kv" role="list" aria-label="Deployment cost ladder">
+    <div class="row" role="listitem">
+      <div class="k">Free-tier MVP</div>
+      <div class="v">1 &times; <code>c2-standard-8</code> spot, k3s single-node, no HSM, no Cloud Armor, self-signed TLS, single-VM Postgres. Single-host violates threshold posture &middot; demo / dev only.</div>
+      <div class="p">$50 &ndash; $80</div>
+    </div>
+    <div class="row" role="listitem">
+      <div class="k">Minimum-viable production</div>
+      <div class="v">5 VMs (1 spot gateway + 4 on-demand), 2 Cloud HSM keys, KMS, Cloud Armor, Cloud NAT, on-VM Vault for ESO. Matches the &sect;17.1 reference architecture in <a href="/docs/DISTRIBUTED_VM_ARCHITECTURE.md">DISTRIBUTED_VM_ARCHITECTURE.md</a>.</div>
+      <div class="p">$780 &ndash; $1,500</div>
+    </div>
+    <div class="row" role="listitem">
+      <div class="k">10K monthly active users</div>
+      <div class="v">21-VM full topology, gateway MIG averaging 3 &times; <code>c2-standard-4</code> spot, ~10M auth events / month, ~50 GB log volume / month. Verifier is stateless O(1); MAU growth does not move VM count.</div>
+      <div class="p">$1,800 &ndash; $2,200</div>
+    </div>
+    <div class="row" role="listitem">
+      <div class="k">1M monthly active users</div>
+      <div class="v">Gateway MIG averaging 8 to 15 spot VMs, sustained 500 RPS / peak 3K RPS, audit BFT 500 GB / node. Dominant lines: gateway MIG, Cloud Armor request fees, log volume, Security Command Center Premium (~$3.6K alone at this scale).</div>
+      <div class="p">$5,500 &ndash; $8,500</div>
+    </div>
+    <div class="row" role="listitem">
+      <div class="k">Government-grade isolated</div>
+      <div class="v">All 21 VMs Confidential, dedicated FIPS 140-2 L3 HSM partition, Access Transparency, per-tenant KMS keyring, packet mirroring on every subnet, dual-region warm DR, Assured Workloads. Excludes Indian sovereign-cloud premium.</div>
+      <div class="p warn">$15K &ndash; $25K / region</div>
+    </div>
+  </div>
+  <div class="callout warn" style="margin-top: 0.9rem;">
+    <span class="icon">!</span>
+    <div><strong>Free-tier caveat</strong>: Google Always-Free is <code>us-central1 / east1 / west1</code> only. Nothing in this stack is free in <code>asia-south1</code> (Mumbai) or <code>asia-south2</code> (Delhi). The $50 number is spot-instance pricing, not Always-Free, and must not be sold as &ldquo;free production.&rdquo;</div>
+  </div>
+</section>
+
+<!-- ──────────── 6. CERTIFICATION ──────────── -->
+<section aria-labelledby="s6">
+  <h2 id="s6"><span class="num">06</span> Cost to certify &middot; the real numbers</h2>
+
+  <div class="callout info" style="margin-bottom: 1rem;">
+    <span class="icon">?</span>
+    <div>
+      <strong>Two name corrections first</strong>, because they show up in many RFPs:
+      <ul style="margin-top: 0.4rem; padding-left: 1.2rem;">
+        <li><strong>&ldquo;CNSA Level 5&rdquo;</strong> is not a real standard. <strong>CNSA 2.0</strong> is an NSA-mandated <em>algorithm suite</em> (ML-KEM, ML-DSA, AES-256, SHA-384/512), not a tiered level. Buyers usually mean either CNSA-2.0 alignment <em>or</em> Common Criteria <strong>EAL5+</strong>.</li>
+        <li><strong>&ldquo;FIPS 103&rdquo;</strong> does not exist. <strong>FIPS 140-3</strong> is the current NIST cryptographic module validation; it superseded FIPS 140-2 in 2019, and no new FIPS 140-2 submissions have been accepted since 2022.</li>
+      </ul>
+    </div>
+  </div>
+
+  <p class="lead">Cost ranges synthesized from public CMVP queue data, <a href="https://lightshipsec.com/services/common-criteria/" rel="noopener">Lightship</a>, <a href="https://www.corsec.com/csfc/" rel="noopener">Corsec</a>, and FedRAMP marketplace statistics. <em>Lab fees</em> are paid to the accredited testing lab; <em>consulting</em> is the much larger writing-and-evidence-collection bill, paid to firms like Coalfire / Schellman / Cygnacom. Where buyers ask for &ldquo;EAL7,&rdquo; we tell them the truth: only seL4, INTEGRITY-178B, and a few HSMs have ever achieved it.</p>
+
+  <h3 style="font: 600 1rem var(--fl); color: var(--s5); letter-spacing: 0.5px; text-transform: uppercase; margin: 0.8rem 0 0.4rem;">FIPS 140-3 (NIST CMVP)</h3>
+  <div class="kv">
+    <div class="row"><div class="k">Level 1 &middot; sw module</div><div class="v">Software-only crypto, no physical security. Target this first for our Rust crypto crates. CMVP queue: 8 &ndash; 12 mo. Total: 10 &ndash; 18 mo.</div><div class="p">$40K &ndash; $200K</div></div>
+    <div class="row"><div class="k">Level 2 &middot; tamper-evident</div><div class="v">Role-based authentication, tamper-evident enclosure. CMVP queue: 10 &ndash; 14 mo. Total: 14 &ndash; 22 mo.</div><div class="p">$100K &ndash; $250K</div></div>
+    <div class="row"><div class="k">Level 3 &middot; HSM-class</div><div class="v">Tamper-resistant, identity authentication, environmental failure protection. Target when we move from sw-simulated HSM to physical Cloud HSM partitions. Total: 18 &ndash; 26 mo.</div><div class="p">$250K &ndash; $600K</div></div>
+    <div class="row"><div class="k">Level 4 &middot; hw only</div><div class="v">Tamper-active, full environmental attack resistance. Only relevant if we ship our own HSM hardware. Realistic only for HSM vendors.</div><div class="p warn">$750K &ndash; $2M+</div></div>
+  </div>
+
+  <h3 style="font: 600 1rem var(--fl); color: var(--s5); letter-spacing: 0.5px; text-transform: uppercase; margin: 0.9rem 0 0.4rem;">Common Criteria &middot; NIAP &middot; CSfC</h3>
+  <div class="kv">
+    <div class="row"><div class="k">EAL2 (NIAP cPP)</div><div class="v">Mutual-recognition path under CCRA. Security Target, AGD, ATE, AVA-VAN.2 vulnerability testing. 6 &ndash; 9 months.</div><div class="p">$150K &ndash; $350K</div></div>
+    <div class="row"><div class="k">EAL4+</div><div class="v"><strong>Practical ceiling for an SSO product.</strong> ADV_TDS design analysis, ALC dev environment audit. 12 &ndash; 18 months. Our 19 TLA+ invariants accelerate the design analysis substantially.</div><div class="p">$400K &ndash; $1M</div></div>
+    <div class="row"><div class="k">EAL5+</div><div class="v">Semi-formal modular design proofs. Typically smartcard or separation-kernel territory. Our formal model could anchor an EAL5+ Security Target if a buyer funds it. 18 &ndash; 24 months.</div><div class="p warn">$750K &ndash; $3M</div></div>
+    <div class="row"><div class="k">EAL7</div><div class="v">Formal verification of design. Globally a handful: seL4, INTEGRITY-178B, certain Atalla HSMs. 24 &ndash; 48 months. <em>Not a recommended path for SSO.</em></div><div class="p danger">$5M+</div></div>
+    <div class="row"><div class="k">NIAP CC (US, DoD)</div><div class="v">Must use NIAP-approved Protection Profile. For SSO, the Enterprise Security Management Identity &amp; Credential Management cPP. 9 &ndash; 12 months on top of EAL2 / EAL4+ scope.</div><div class="p">$250K &ndash; $500K</div></div>
+    <div class="row"><div class="k">CSfC component listing</div><div class="v">Commercial Solutions for Classified. Adds NSA component listing on top of NIAP CC against the relevant Capability Package PP. 6 &ndash; 12 months incremental.</div><div class="p">$100K &ndash; $300K</div></div>
+  </div>
+
+  <h3 style="font: 600 1rem var(--fl); color: var(--s5); letter-spacing: 0.5px; text-transform: uppercase; margin: 0.9rem 0 0.4rem;">FedRAMP &middot; DoD Impact Levels</h3>
+  <div class="kv">
+    <div class="row"><div class="k">FedRAMP Moderate</div><div class="v">3PAO + consulting + 9 &ndash; 18 months. Plus ConMon $200K-$400K / yr ongoing. <em>Note</em>: FedRAMP 20x is mid-rollout; Moderate maps to new Class B / C.</div><div class="p">$500K &ndash; $1M</div></div>
+    <div class="row"><div class="k">FedRAMP High / Class D</div><div class="v">~325 NIST 800-53 Rev5 controls, 12 &ndash; 24 months. Plus ConMon $300K-$600K / yr.</div><div class="p warn">$1.2M &ndash; $2.5M</div></div>
+    <div class="row"><div class="k">DoD IL5</div><div class="v">FedRAMP High plus DoD SRG controls (CUI, mission systems). 6 &ndash; 12 months incremental.</div><div class="p warn">$500K &ndash; $1.5M</div></div>
+    <div class="row"><div class="k">DoD IL6</div><div class="v">Classified Secret. Requires DoD-only enclave, CNSSI 1253, cleared personnel + facility. <em>Realistic only as sub-CSP under Azure Gov Secret / AWS GovCloud Secret.</em></div><div class="p danger">Partner path</div></div>
+  </div>
+
+  <h3 style="font: 600 1rem var(--fl); color: var(--s5); letter-spacing: 0.5px; text-transform: uppercase; margin: 0.9rem 0 0.4rem;">Recommended 3-year sequence</h3>
+  <div class="tbl-wrap">
+    <table class="tbl">
+      <caption>Budget plan to enter the regulated market</caption>
+      <thead>
+        <tr>
+          <th>Year</th>
+          <th>Track</th>
+          <th>Calendar</th>
+          <th class="num-c">Investment</th>
+          <th>Outcome</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>Year 1</td><td>FIPS 140-3 Level 1 (sw module)</td><td>12 &ndash; 18 mo</td><td class="num-c">$80K &ndash; $200K</td><td>Algorithm certs (CAVP) + module cert</td></tr>
+        <tr><td>Year 1</td><td>FedRAMP Moderate via agency sponsor</td><td>9 &ndash; 18 mo</td><td class="num-c">$500K &ndash; $1M</td><td>Civilian agency contract eligibility</td></tr>
+        <tr><td>Year 2</td><td>NIAP CC EAL4+ (ESM-ICM cPP)</td><td>9 &ndash; 12 mo</td><td class="num-c">$300K &ndash; $600K</td><td>DoD STIG path; TLA+ accelerates eval</td></tr>
+        <tr><td>Year 2</td><td>FedRAMP High / Class D</td><td>12 &ndash; 18 mo</td><td class="num-c">$700K &ndash; $1.5M</td><td>IL4 baseline</td></tr>
+        <tr><td>Year 3</td><td>CSfC component listing</td><td>6 &ndash; 12 mo</td><td class="num-c">$100K &ndash; $300K</td><td>Classified-data-eligible bundles</td></tr>
+        <tr><td>Year 3</td><td>DoD IL5</td><td>6 &ndash; 12 mo</td><td class="num-c">$500K &ndash; $1.5M</td><td>Mission-system eligibility</td></tr>
+        <tr><td>Year 3</td><td>FIPS 140-3 Level 3 (HSM integration)</td><td>18 &ndash; 26 mo</td><td class="num-c">$250K &ndash; $600K</td><td>Physical HSM module cert</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="callout green" style="margin-top: 0.9rem;">
+    <span class="icon">$</span>
+    <div><strong>3-year certification budget: $2.5M &ndash; $5.7M</strong>. Annual ongoing ConMon + recerts: <strong>$700K &ndash; $1.4M / year</strong>. This is the price of admission for the federal / defense market. Our TLA+ formal model and PQ-native posture are amortization levers &middot; they let us charge premium per-seat to recover the cert spend across 5K to 50K-seat agency contracts.</div>
+  </div>
+</section>
+
+<!-- ──────────── 7. FEATURES ──────────── -->
+<section aria-labelledby="s7">
+  <h2 id="s7"><span class="num">07</span> Feature catalog &middot; with honest status</h2>
+  <p class="lead">Every line below maps to a directory in this repository. We mark each as <em>Shipped</em> (production-grade), <em>Scaffolded</em> (typed, fail-closed, vendor wiring needed), or <em>Planned</em> (next 12-24 months). This transparency is the single biggest reason regulated buyers shortlist us in the first round.</p>
+  <div class="legend" aria-label="Status legend">
+    <span class="ship"><span class="dot"></span>Shipped &middot; production-grade</span>
+    <span class="scaff"><span class="dot"></span>Scaffolded &middot; vendor wiring</span>
+    <span class="plan"><span class="dot"></span>Planned</span>
+  </div>
+
+  <div class="grid-2">
+    <article class="card green">
+      <h3>Authentication protocols</h3>
+      <ul>
+        <li><strong>OIDC / OAuth 2.1</strong> issuer with PKCE-S256, ML-DSA-87 ID tokens, refresh-token family revocation, JWKS rotation <span class="tag-ship">Shipped</span></li>
+        <li><strong>OPAQUE PAKE</strong> (RFC 9497) with 2-of-3 threshold OPRF; server never sees plaintext password <span class="tag-ship">Shipped</span></li>
+        <li><strong>WebAuthn / FIDO2</strong> Level 2 RP, MDS3 offline, TPM packed attestation, AAGUID allow-list <span class="tag-ship">Shipped</span></li>
+        <li><strong>SAML 2.0 SP</strong> with strict XSW / XXE hardening, RSA-SHA256 + ML-DSA-87 signatures <span class="tag-ship">Shipped</span></li>
+        <li><strong>DPoP</strong> (RFC 9449) bound to ML-DSA-87 instead of ES256 <span class="tag-ship">Shipped</span></li>
+        <li><strong>Kerberos PKINIT</strong> CAC / PIV &rarr; TGT (libkrb5 binding fails closed until enabled) <span class="tag-scaff">Scaffolded</span></li>
+        <li><strong>SCIM via LDAP / AD</strong> connector (library compiles, not yet wired into a binary) <span class="tag-scaff">Scaffolded</span></li>
+        <li><strong>Self-serve tenant onboarding wizard</strong> (schema is multi-tenant, UI is operator-only today) <span class="tag-plan">Planned</span></li>
+      </ul>
+    </article>
+
+    <article class="card blue">
+      <h3>Cryptographic primitives</h3>
+      <ul>
+        <li><strong>ML-KEM-1024</strong> (FIPS 203), <strong>X-Wing hybrid</strong> KEM <span class="tag-ship">Shipped</span></li>
+        <li><strong>ML-DSA-87</strong> (FIPS 204), <strong>SLH-DSA-SHA2-256f</strong> (FIPS 205) <span class="tag-ship">Shipped</span></li>
+        <li><strong>FROST-Ristretto255</strong> threshold sigs with persistent nonce WAL <span class="tag-ship">Shipped</span></li>
+        <li><strong>Pedersen DKG</strong>, <strong>2-of-5 ML-DSA-87 KT consensus</strong>, <strong>3-of-5 shard CA quorum</strong> <span class="tag-ship">Shipped</span></li>
+        <li><strong>AEGIS-256</strong>, AES-256-GCM, ChaCha20-Poly1305, Argon2id, HKDF-SHA512, BLAKE3 <span class="tag-ship">Shipped</span></li>
+        <li><strong>HSM / TPM / SGX / SEV-SNP / AWS-KMS</strong> backends behind <code>ProductionKeySource</code> trait; sw-simulated by default until customer provides hardware <span class="tag-scaff">Scaffolded</span></li>
+        <li><strong>PQ TLS kx</strong> (X25519MLKEM1024 for shard mTLS) feature-gated, off by default until rustls/aws-lc-rs upstream lands <span class="tag-scaff">Scaffolded</span></li>
+      </ul>
+    </article>
+
+    <article class="card purple">
+      <h3>Risk &middot; trust &middot; compliance</h3>
+      <ul>
+        <li><strong>Risk engine</strong> (~6,200 LoC): per-user EMA baselines, MaxMind ASN cross-check, mimicry detection, Bloom-filter IP membership <span class="tag-ship">Shipped</span></li>
+        <li><strong>SIEM CEF v0 + LEEF v2.0</strong> with proper escaping <span class="tag-ship">Shipped</span></li>
+        <li><strong>MITRE ATT&amp;CK-tagged</strong> correlation rules: brute force, credential stuffing, impossible travel, lateral movement <span class="tag-ship">Shipped</span></li>
+        <li><strong>DISA STIG V5R3</strong> XCCDF 1.2 reporter: 10 hand-coded controls + 300 templated stubs <span class="tag-ship">Shipped</span></li>
+        <li><strong>FedRAMP / CMMC HTML rollup</strong> reports (renderer; evidence collector wires via callers) <span class="tag-ship">Shipped</span></li>
+        <li><strong>MDM compliance</strong> adapters for Intune / Jamf / Workspace ONE: fail-closed stubs awaiting tenant API keys <span class="tag-scaff">Scaffolded</span></li>
+        <li><strong>Threat-intel</strong>: AbuseIPDB + Shodan live; MaxMind feed stub <span class="tag-scaff">Scaffolded</span></li>
+      </ul>
+    </article>
+
+    <article class="card cyan">
+      <h3>Audit &middot; transparency &middot; recovery</h3>
+      <ul>
+        <li><strong>11-node BFT audit cluster</strong>, ML-DSA-87 signed, hash-chained, per-tenant admission control <span class="tag-ship">Shipped</span></li>
+        <li><strong>Out-of-process audit-witness</strong> over UDS, seed independent of master KEK <span class="tag-ship">Shipped</span></li>
+        <li><strong>Key Transparency log</strong> with 2-of-5 ML-DSA-87 consensus, CSHAKE256 leaves, independent auditor <span class="tag-ship">Shipped</span></li>
+        <li><strong>53 fuzz targets</strong> across JWT, SAML, OPAQUE, FIDO2, ML-DSA / SLH-DSA, Raft / BFT, CRDT, TLS <span class="tag-ship">Shipped</span></li>
+        <li><strong>62 e2e + chaos tests</strong>: nation-state sim, host-compromise, XML wrapping, smuggling, Pentagon hardening <span class="tag-ship">Shipped</span></li>
+        <li><strong>PITR plan engine</strong> (computes replay plan; PostgreSQL <code>archive_command</code> wires the actual streaming) <span class="tag-scaff">Scaffolded</span></li>
+        <li><strong>Cross-region warm DR</strong> playbook <span class="tag-plan">Planned</span></li>
+      </ul>
+    </article>
+  </div>
+</section>
+
+<!-- ──────────── 8. DEPLOYMENT ──────────── -->
+<section aria-labelledby="s8">
+  <h2 id="s8"><span class="num">08</span> Where it deploys &middot; how it deploys</h2>
+  <p class="lead">Single bash command. Twenty-one VMs. Three availability zones. Active-active. No Terraform required.</p>
+  <div class="grid-2">
+    <article class="card amber">
+      <h3>Cloud &amp; region</h3>
+      <ul>
+        <li>GCP only today. <strong>asia-south2</strong> (Delhi) for the live deployment, <strong>asia-south1</strong> (Mumbai) as the script default.</li>
+        <li>Single-region <strong>multi-AZ active-active</strong>: TSS spread <code>-a / -b / -c</code>, BFT audit across 3 AZs, Postgres primary <code>-a</code> + sync <code>-b</code> + async <code>-c</code>.</li>
+        <li>Customer cloud portability: AWS / Azure / on-premise paths exist as plain VMs; no vendor lock-in beyond Cloud HSM and Cloud Armor.</li>
+        <li>Air-gapped enclave deployment supported &middot; the <code>offline-jwt</code> crate validates against pinned trust stores with CRDT-merged replay caches.</li>
+      </ul>
+    </article>
+    <article class="card cyan">
+      <h3>GCP services touched</h3>
+      <ul>
+        <li><strong>Compute</strong>: Shielded VMs, AMD SEV-SNP Confidential VMs for secret-handling tiers</li>
+        <li><strong>Network</strong>: custom-mode VPC, default-deny firewalls, Cloud NAT (apt-only egress), Identity-Aware Proxy for SSH</li>
+        <li><strong>Crypto</strong>: Cloud HSM, Cloud KMS, Secret Manager (per-SA scoping)</li>
+        <li><strong>Edge</strong>: Cloud Armor (OWASP CRS, geo-block, ML adaptive), External TCP pass-through LB</li>
+        <li><strong>Posture</strong>: Binary Authorization, VPC Service Controls, Org Policies, Access Transparency, Security Command Center Premium</li>
+        <li><strong>Observability</strong>: Cloud Audit Logs, Packet Mirroring, VPC Flow Logs</li>
+        <li><em>Not used</em>: GKE, Cloud Run, Cloud SQL, Spanner, Pub/Sub. Postgres is self-managed for Confidential VM + dm-verity + PKCS#11 HSM access.</li>
+      </ul>
+    </article>
+    <article class="card green">
+      <h3>Provisioning</h3>
+      <ul>
+        <li><code>./auto_provision.sh --project P --region asia-south2 --nodes 5</code> &middot; one-shot &middot; <a href="/deploy/vm/auto_provision.sh">deploy/vm/auto_provision.sh</a></li>
+        <li>Phases: VPC + firewall + IAP &rarr; <code>c2-standard-8</code> Shielded VMs &rarr; build &rarr; key ceremony (master KEK &rarr; HKDF sub-keys &rarr; FROST DKG &rarr; self-signed CA) &rarr; ordered systemd start &rarr; health checks.</li>
+        <li>Migrations: 11 numbered SQL files (<a href="/migrations">migrations/</a>) covering tenancy, encrypted PII, audit envelope encryption, DPoP replay cache.</li>
+        <li>Container path: distroless static-PIE on <code>gcr.io/distroless/static-debian12:nonroot</code>, UID 65534, RELRO/NOW/noexecstack, cosign-signed, CycloneDX 1.5 SBOM &middot; <a href="/deploy/ci/sign-and-sbom.sh">sign-and-sbom.sh</a>.</li>
+        <li>k8s alternative: 3-replica Patroni Postgres + 3-node etcd, External Secrets Operator &rarr; Vault &middot; <a href="/deploy/kubernetes">deploy/kubernetes/</a>.</li>
+      </ul>
+    </article>
+    <article class="card blue">
+      <h3>Customer integration</h3>
+      <ul>
+        <li>OpenAPI 3.0 spec &middot; <a href="/sdks/openapi-spec.yaml">sdks/openapi-spec.yaml</a> &middot; generates SDK skeletons for Go, Python, .NET, Java, TypeScript.</li>
+        <li>OIDC flow: register OAuth client &rarr; authorization-code + PKCE-S256 &rarr; <code>/userinfo</code> with DPoP-bound access token.</li>
+        <li>Inbound Google federation wired at <code>/oauth/google/{start,callback}</code> with strict URL validation (rejects RFC1918 / loopback / link-local in production).</li>
+        <li>Admin console: passkey-default + password fallback + recovery codes; full Directory / Applications / Security / Sessions / System tabs &middot; <a href="/index.html">/index.html</a>.</li>
+        <li>End-user portal: <a href="/user-dashboard.html">/user-dashboard.html</a>; integration docs: <a href="/docs.html">/docs.html</a>.</li>
+      </ul>
+    </article>
+  </div>
+</section>
+
+<!-- ──────────── 9. HONEST GAPS ──────────── -->
+<section aria-labelledby="s9">
+  <h2 id="s9"><span class="num">09</span> Honest gaps &middot; what we do <em>not</em> ship today</h2>
+  <p class="lead">Regulated buyers prefer a vendor who lists the gaps over one who hides them. Every item below has a matching code path <em>and</em> a 12 to 24-month plan. Nothing is silently broken; every fail-closed default keeps the system safe in the meantime.</p>
+  <div class="grid-3">
+    <article class="card red">
+      <h3>Hardware roots <span class="pill">SW today</span></h3>
+      <p>HSM / TPM / SGX / SEV-SNP backends are typed and fail-closed; default deployment uses software simulation through <code>ProductionKeySource</code>. Plug into a customer Cloud HSM partition to flip to physical roots. <strong>FIPS 140-3 module is NotSubmitted</strong> &middot; budgeted for Year 1 of the cert ladder above.</p>
+    </article>
+    <article class="card red">
+      <h3>MDM device posture <span class="pill">Stub adapters</span></h3>
+      <p>Intune, Jamf, and Workspace ONE adapters return <code>NotImplemented</code> &middot; deliberately fail-closed, so any Tier-1 conditional access denies. Wires up cleanly when a tenant supplies API credentials. Not appropriate to claim &ldquo;device compliance enforced via MDM&rdquo; until then.</p>
+    </article>
+    <article class="card red">
+      <h3>STIG depth <span class="pill">10 + 300 templated</span></h3>
+      <p>Ten DISA STIG controls are hand-coded and substantive (session timeout, idle lockout, password policy, FIPS mode, audit logging). The remaining 300 are templated derivations &middot; correct but shallow. A real DISA review will credit only the kernel until each family has hand-written checks.</p>
+    </article>
+    <article class="card red">
+      <h3>PITR streaming <span class="pill">Plan only</span></h3>
+      <p><code>pitr-store</code> computes the replay plan given base backups + WAL segments + target timestamp. The actual <code>pg_basebackup</code> + <code>archive_command</code> wiring lives in PostgreSQL config, not in this crate. <em>No RPO / RTO numbers are encoded in code yet</em> &middot; whatever the operator configures is what runs.</p>
+    </article>
+    <article class="card red">
+      <h3>Tenant onboarding <span class="pill">SQL only</span></h3>
+      <p>Schema is fully multi-tenant with row-level security and per-tenant compliance regimes. There is no API endpoint to create tenants &middot; provisioning is a SQL <code>INSERT</code> + admin restart to refresh the in-memory <code>ClientRegistry</code>. Self-serve wizard is on the H2 2026 roadmap.</p>
+    </article>
+    <article class="card red">
+      <h3>Unwired CAT-J crates <span class="pill">Library only</span></h3>
+      <p><code>ldap-connector</code>, <code>logout-bch</code>, <code>jit-access</code>, <code>account-linking</code>, <code>offline-jwt</code> compile and pass their own tests but no production binary references them yet. Ship-blocking: integrating each into <code>admin/</code> is roughly 1 to 2 weeks of work apiece.</p>
+    </article>
+  </div>
+</section>
+
+<!-- ──────────── 10. ROADMAP ──────────── -->
+<section aria-labelledby="s10">
+  <h2 id="s10"><span class="num">10</span> Twelve-to-twenty-four-month plan</h2>
+  <div class="tbl-wrap">
+    <table class="tbl">
+      <caption>Engineering &amp; certification roadmap</caption>
+      <thead>
+        <tr>
+          <th>Quarter</th>
+          <th>Engineering</th>
+          <th>Certification</th>
+          <th>Go-to-market</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>2026 Q3</td>
+          <td>Wire CAT-J crates (<code>ldap-connector</code>, <code>logout-bch</code>, <code>jit-access</code>) into admin. Tenant-onboarding API + UI. PITR streaming.</td>
+          <td>FIPS 140-3 L1 lab kickoff. FedRAMP Moderate sponsor outreach.</td>
+          <td>2 design partners signed (1 Indian PSU, 1 US defense prime).</td>
+        </tr>
+        <tr>
+          <td>2026 Q4</td>
+          <td>MDM adapter wiring (Intune first). Cross-region warm DR runbook. Hardware HSM integration (Cloud HSM partition).</td>
+          <td>FIPS 140-3 L1 testing in progress. CMVP queue submission.</td>
+          <td>First paid pilot. NIAP Protection Profile selection.</td>
+        </tr>
+        <tr>
+          <td>2027 Q1</td>
+          <td>STIG hand-coded coverage to 50+ controls. MaxMind threat-intel feed live. Sovereign-cloud reseller package.</td>
+          <td>FedRAMP Moderate Pre-Authorization. CC EAL4+ Security Target draft.</td>
+          <td>3 reference customers. Channel: Yotta, Tata Communications.</td>
+        </tr>
+        <tr>
+          <td>2027 Q2 - Q4</td>
+          <td>EAL4+ evidence collection (TLA+ binding to design analysis). Hardware root-of-trust for all 4 device tiers.</td>
+          <td>FIPS 140-3 L1 cert. FedRAMP Moderate Authorization. CC EAL4+ evaluation.</td>
+          <td>10 customers. First DoD agency contract via prime.</td>
+        </tr>
+        <tr>
+          <td>2028 H1</td>
+          <td>FIPS 140-3 L3 against physical HSM. CSfC capability package alignment. India CERT-In incident reporting automation.</td>
+          <td>FedRAMP High evaluation. CC EAL4+ certification. CSfC component listing.</td>
+          <td>Indian Government empanelment. 25+ customers.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ──────────── 11. ECONOMICS / TAM ──────────── -->
+<section aria-labelledby="s11">
+  <h2 id="s11"><span class="num">11</span> Market sizing &middot; the prize</h2>
+  <div class="grid-2">
+    <article class="card blue">
+      <h3>US Federal &amp; DoD identity</h3>
+      <p>Federal cybersecurity spend was ~<strong>$13B in FY24</strong>; identity is roughly 10 to 15% of that &middot; a <strong>$1.3B to $2B / year addressable slice</strong> in the US alone, with another similar number in DoD-specific spend. Realistic startup-reachable: the long tail of agencies and primes below the hyperscaler radar &middot; <strong>$200M to $500M / year addressable</strong> for a credible challenger.</p>
+    </article>
+    <article class="card amber">
+      <h3>India Government &amp; PSU</h3>
+      <p>Aadhaar 1.2B holders, 67B annual identity verifications, ₹14T monthly UPI volume. Mid-priced (₹100 to 500 / user / mo, ~$1.20 to $6.00) but at population scale across central + state + PSU + BFSI. <strong>₹200 to 800 crore (~$25M to $100M) / year addressable</strong> for a PQ-ready, made-in-India SSO with DPDP Act 2023 + CERT-In + GIGW 3.0 built in.</p>
+    </article>
+    <article class="card green">
+      <h3>Unit economics &middot; 5,000-seat agency</h3>
+      <p>At a conservative <strong>$15 / user / month list</strong> (premium to Entra P2 / Okta Pro on PQ + formal-verification grounds), a 5K-seat agency contract is <strong>$900K / year ARR</strong>. Self-host deployment cost from &sect;05 caps at $25K / month for the gov-grade tier &middot; <strong>$300K / year infrastructure</strong> &middot; leaving 67% gross margin before cert amortization.</p>
+    </article>
+    <article class="card purple">
+      <h3>The PQ window</h3>
+      <p>NSA CNSA 2.0 mandates full PQC for new NSS systems by 2027 (start) and 2033 (complete). Microsoft, Okta, Google, Ping have no GA post-quantum identity protocol shipping in 2026. Window of competitive advantage: <strong>2 to 4 years</strong>. A buyer signing in 2026 - 2027 is locked into our PQ stack before incumbents have a comparable offer. By 2028 - 2029, the wedge closes.</p>
+    </article>
+  </div>
+</section>
+
+<!-- ──────────── 12. CTA ──────────── -->
+<section aria-labelledby="s12">
+  <h2 id="s12"><span class="num">12</span> What happens next</h2>
+  <div class="grid-3">
+    <article class="card green">
+      <h3>For a CISO buyer</h3>
+      <ul>
+        <li>Read the <a href="/summary.html">Technical Summary Sheet</a> (single A4, code-truth verified).</li>
+        <li>Run <code>auto_provision.sh</code> in your dev project &middot; full 21-VM topology in under 30 minutes.</li>
+        <li>Point your IDP RPs at the <code>/oauth/authorize</code> endpoint; verify the ML-DSA-87 ID-token signature path.</li>
+      </ul>
+    </article>
+    <article class="card blue">
+      <h3>For a procurement officer</h3>
+      <ul>
+        <li>Pricing model is BYO-infrastructure today; per-seat list will publish at FedRAMP Moderate Authorization milestone.</li>
+        <li>Reference architecture &amp; cost workbook: <a href="/docs/DISTRIBUTED_VM_ARCHITECTURE.md">DISTRIBUTED_VM_ARCHITECTURE.md</a>.</li>
+        <li>Compliance evidence: STIG XCCDF reports, CEF / LEEF SIEM streams, BFT audit checkpoints, KT log proofs.</li>
+      </ul>
+    </article>
+    <article class="card amber">
+      <h3>For a design partner</h3>
+      <ul>
+        <li>We are signing two design partners in 2026 H2 &middot; one US defense prime, one Indian PSU.</li>
+        <li>In return: discounted multi-year ARR, named architectural input, joint case-study rights.</li>
+        <li>Contact: <a href="mailto:contact@dmj.one">contact@dmj.one</a></li>
+      </ul>
+    </article>
+  </div>
+</section>
+
+</main>
+
+<footer role="contentinfo">
+  <div class="ft-row">
+    <div>
+      <strong>MILNET SSO</strong> &middot; Built by <a href="https://dmj.one" style="color: #93c5fd;">dmj.one</a> &middot; Contact <a href="mailto:contact@dmj.one" style="color: #93c5fd;">contact@dmj.one</a>
+    </div>
+    <div class="tags">
+      <span class="ft">PQ-Native</span>
+      <span class="ft">FROST 3-of-5</span>
+      <span class="ft">19 TLA+</span>
+      <span class="ft">BFT Audit</span>
+      <span class="ft">DPDP &middot; GDPR</span>
+      <span class="ft">CNSA 2.0 Aligned</span>
+    </div>
+  </div>
+  <div class="disclaimer">
+    Pricing for third-party products fetched from official vendor pages on 2026-05-06. Certification cost ranges synthesized from public CMVP queue data, Lightship Security, Corsec, and FedRAMP marketplace statistics; exact figures vary 2 to 3x with product complexity. FedRAMP 20x is mid-rollout; the new Class A / B / C / D naming applies. DoDIN APL has been sunset; STIG is the active path for DoD network products. No claim of certification status is made beyond what is explicitly listed; FIPS 140-3 module status is NotSubmitted. <em>This brief is the source-of-truth code state on 2026-05-06; rebuild from <code>frontend/business.html</code> after any architectural change.</em>
+  </div>
+</footer>
+
+</body>
+</html>

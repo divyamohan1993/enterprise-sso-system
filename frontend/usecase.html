@@ -1,0 +1,662 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MILNET SSO &middot; Use Case for India</title>
+<meta name="description" content="MILNET SSO use case briefing for the Indian market. A two-page executive pamphlet on post-quantum identity for India's banks, hospitals, ministries, and PSUs.">
+<meta name="robots" content="noindex">
+<link rel="stylesheet" href="/fonts/jetbrains-mono.css">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --fd: 'Instrument Serif', Georgia, serif;
+    --fh: 'Sentient', Georgia, serif;
+    --fl: 'Geist', system-ui, sans-serif;
+    --fu: 'Inter', system-ui, sans-serif;
+    --f:  'Times New Roman', Times, serif;
+
+    --s9: #0c0f1a; --s8: #1f2433; --s7: #2e3347;
+    --s6: #475569; --s5: #6b7280; --s4: #9ca3af;
+    --s3: #cbd5e1; --s2: #e5e7eb; --s1: #f3f4f6; --s0: #fafafc;
+    --paper: #fbfbf7;
+
+    --g: #059669; --b: #3b82f6; --p: #8b5cf6; --c: #06b6d4;
+    --r: #b91c1c; --gold: #facc15;
+    --saffron: #ff9933; --inGreen: #138808;
+    --navy: #0c0f1a;
+    text-align:justify;
+  }
+
+  html { font-size: 16px; }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { transition: none !important; animation: none !important; }
+  }
+
+  body {
+    background: #d9dce4;
+    color: var(--s9);
+    font-family: var(--f);
+    line-height: 1.5;
+    padding: 28px 0;
+    display: flex; flex-direction: column; align-items: center; gap: 28px;
+    min-height: 100vh;
+  }
+
+  a { color: var(--b); text-decoration: none; border-bottom: 1px dotted rgba(59,130,246,0.4); }
+  a:hover, a:focus-visible { color: #1d4ed8; }
+  a:focus-visible { outline: 2px solid var(--b); outline-offset: 2px; }
+
+  /* ─── PAGE: A4 portrait, fixed geometry ─── */
+  .page {
+    width: 210mm;
+    height: 297mm;
+    background: var(--paper);
+    box-shadow: 0 10px 40px rgba(0,0,0,0.18), 0 2px 6px rgba(0,0,0,0.08);
+    position: relative;
+    overflow: hidden;
+    display: grid;
+    grid-template-rows: auto 1fr auto;
+    color: var(--s9);
+  }
+
+  /* ─── BAND (full-bleed dark navy with tricolour stripe) ─── */
+  .band {
+    background: linear-gradient(135deg, #0c0f1a 0%, #131a2e 40%, #0e1a2d 100%);
+    color: #fff;
+    position: relative;
+    padding: 14mm 16mm 8mm;
+  }
+  .band::after {
+    content: ''; position: absolute; bottom: 0; left: 0; right: 0; height: 2.2mm;
+    background: linear-gradient(90deg, var(--saffron) 0%, #ffffff 50%, var(--inGreen) 100%);
+  }
+  .band.compact { padding: 8mm 16mm 5mm; }
+  .band.compact::after { height: 1.6mm; }
+
+  .band .row {
+    display: flex; justify-content: space-between; align-items: flex-end;
+    gap: 10mm;
+  }
+  .band h1 {
+    font: 400 26pt/1 var(--fd); color: #fff; letter-spacing: 0.5px;
+    text-shadow: 0 0 30px rgba(255,153,51,0.3);
+  }
+  .band.compact h1 { font-size: 18pt; }
+  .band .sub {
+    font: 400 10pt/1.4 var(--fu); color: #94a3b8;
+    margin-top: 1.5mm;
+  }
+  .band.compact .sub { font-size: 9pt; margin-top: 1mm; }
+  .band .meta {
+    text-align: right;
+    font: 400 9pt/1.4 var(--fu); color: #cbd5e1;
+  }
+  .band .badge {
+    display: inline-block;
+    padding: 1.5mm 3mm;
+    margin-bottom: 1.5mm;
+    font: 600 8pt var(--fl); letter-spacing: 1.2px; text-transform: uppercase;
+    background: linear-gradient(135deg, rgba(255,153,51,0.18), rgba(19,136,8,0.12));
+    color: var(--gold); border: 1px solid rgba(250,204,21,0.3);
+    border-radius: 1.5mm;
+  }
+  .band.compact .meta { font-size: 8.5pt; }
+
+  /* ─── INNER CONTENT AREA (padded) ─── */
+  .inner {
+    padding: 11mm 16mm 9mm;
+    display: flex; flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* ─── HERO (page 1) ─── */
+  .hero { padding-bottom: 6mm; border-bottom: 0.5pt solid var(--s2); margin-bottom: 6mm; }
+  .hero .kicker {
+    font: 700 9pt var(--fl); color: var(--saffron);
+    letter-spacing: 2px; text-transform: uppercase;
+    margin-bottom: 4mm;
+  }
+  .hero h2 {
+    font: 400 30pt/1.13 var(--fd); color: var(--s9);
+    letter-spacing: -0.01em; max-width: 18em;
+  }
+  .hero h2 em { font-style: italic; color: var(--inGreen); }
+  .hero .lede {
+    margin-top: 5mm;
+    font: 400 11pt/1.55 var(--f); color: var(--s7);
+    max-width: 38em;
+  }
+  .hero .lede strong { color: var(--s9); font-family: var(--fl); font-weight: 700; }
+
+  /* ─── SECTION HEADER ─── */
+  .sec-h {
+    display: flex; align-items: baseline; gap: 4mm;
+    padding-bottom: 2.5mm; margin-bottom: 4mm;
+    border-bottom: 0.5pt solid var(--s2);
+  }
+  .sec-h .num {
+    font: 700 9pt var(--fl); color: var(--s5);
+    letter-spacing: 2px; text-transform: uppercase;
+  }
+  .sec-h .title {
+    font: 600 13.5pt var(--fh); color: var(--s9); line-height: 1.25;
+  }
+
+  /* ─── PROSE ─── */
+  section p {
+    font: 400 10.5pt/1.6 var(--f); color: var(--s7);
+    margin-top: 3mm;
+  }
+  section p:first-of-type { margin-top: 0; }
+  section p strong { color: var(--s9); font-family: var(--fl); font-weight: 700; }
+  section p em { color: var(--s9); font-style: italic; }
+
+  .pull {
+    border-left: 0.8mm solid var(--saffron);
+    padding: 2mm 5mm;
+    margin: 5mm 0;
+    font: 400 12pt/1.45 var(--fd); font-style: italic;
+    color: var(--s8);
+    background: rgba(255,153,51,0.04);
+  }
+
+  /* ─── STORIES (page 2, 2x2 grid) ─── */
+  .stories {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 5mm 7mm;
+    margin-top: 1mm;
+  }
+  .story {
+    padding-left: 4mm;
+    border-left: 0.7mm solid;
+  }
+  .story.r { border-color: var(--r); }
+  .story.b { border-color: var(--b); }
+  .story.a { border-color: var(--saffron); }
+  .story.p { border-color: var(--p); }
+  .story .who {
+    font: 700 7.5pt var(--fl); color: var(--s5);
+    letter-spacing: 1.4px; text-transform: uppercase;
+    margin-bottom: 0.8mm;
+  }
+  .story h4 {
+    font: 600 11pt/1.3 var(--fh); color: var(--s9);
+    margin-bottom: 1.5mm;
+  }
+  .story p {
+    font: 400 9.5pt/1.5 var(--f); color: var(--s7); margin: 0;
+  }
+
+  /* ─── PILLARS TABLE ─── */
+  .pillars {
+    width: 100%; border-collapse: collapse;
+    margin-top: 1mm;
+    font: 400 10pt/1.5 var(--f);
+    table-layout: fixed;
+  }
+  .pillars thead tr {
+    background: linear-gradient(135deg, #0c0f1a, #1e293b); color: #fff;
+  }
+  .pillars th {
+    text-align: left; padding: 2.2mm 3mm;
+    font: 700 7.5pt var(--fl); letter-spacing: 1.2px; text-transform: uppercase;
+  }
+  .pillars td {
+    padding: 2.5mm 3mm; border-top: 0.4pt solid var(--s2);
+    color: var(--s7); vertical-align: top;
+  }
+  .pillars tbody tr { background: rgba(255,255,255,0.5); }
+  .pillars tbody tr:nth-child(even) { background: rgba(243,244,246,0.6); }
+  .pillars td.idx {
+    font: 700 8.5pt var(--fl); color: var(--s4);
+    letter-spacing: 0.5px; text-transform: uppercase; width: 11mm;
+  }
+  .pillars td.name {
+    font: 600 10.5pt var(--fh); color: var(--s9); width: 42mm;
+  }
+  .pillars td.tech {
+    font: 400 9pt var(--fm); color: var(--s9); width: 42mm;
+  }
+  .pillars td.ana {
+    font: 400 9.5pt var(--fd); font-style: italic; color: var(--s7);
+    line-height: 1.45;
+  }
+  .pillars td.name .dot {
+    display: inline-block; width: 2mm; height: 2mm; border-radius: 50%;
+    margin-right: 2mm; vertical-align: middle;
+  }
+  .pillars td.name.g .dot { background: var(--inGreen); }
+  .pillars td.name.b .dot { background: var(--b); }
+  .pillars td.name.p .dot { background: var(--p); }
+  .pillars td.name.c .dot { background: var(--c); }
+
+  /* ─── CUSTOMERS TABLE ─── */
+  .who-tbl {
+    width: 100%; border-collapse: collapse;
+    margin-top: 1mm;
+    font: 400 10pt/1.5 var(--f);
+    table-layout: fixed;
+  }
+  .who-tbl tr { border-top: 0.4pt solid var(--s2); }
+  .who-tbl tr:first-child { border-top: 0; }
+  .who-tbl td {
+    padding: 2.2mm 3mm 2.2mm 4mm;
+    vertical-align: top;
+  }
+  .who-tbl td.org {
+    font: 700 10pt var(--fl); color: var(--s9);
+    width: 60mm;
+    border-left: 1mm solid;
+  }
+  .who-tbl tr.t-saff td.org { border-color: var(--saffron); }
+  .who-tbl tr.t-grn td.org { border-color: var(--inGreen); }
+  .who-tbl tr.t-blu td.org { border-color: var(--b); }
+  .who-tbl tr.t-pur td.org { border-color: var(--p); }
+  .who-tbl tr.t-cyn td.org { border-color: var(--c); }
+  .who-tbl tr.t-gld td.org { border-color: #ca8a04; }
+  .who-tbl td.why {
+    color: var(--s7); font: 400 9.5pt/1.5 var(--f);
+  }
+
+  /* ─── QUESTIONS LIST (new section, page 3) ─── */
+  .qlist {
+    display: grid; grid-template-columns: 1fr 1fr;
+    gap: 4mm 7mm; margin-top: 2mm;
+  }
+  .q {
+    display: flex; gap: 3mm; align-items: flex-start;
+  }
+  .q .qn {
+    font: 700 14pt/1 var(--fl); color: var(--saffron);
+    flex-shrink: 0; width: 9mm;
+    border-right: 0.5mm solid var(--saffron);
+    padding-right: 2.5mm;
+    text-align: right;
+  }
+  .q .qbody { flex: 1; min-width: 0; }
+  .q h4 {
+    font: 600 10pt/1.3 var(--fh); color: var(--s9);
+    margin-bottom: 1mm;
+  }
+  .q p {
+    font: 400 9pt/1.45 var(--f); color: var(--s7);
+    margin: 0;
+  }
+  .q p strong { color: var(--s9); font-family: var(--fl); font-weight: 700; }
+  .q p em { color: var(--s9); font-style: italic; }
+
+  /* ─── PAGE FOOTER (full bleed, two-line legal) ─── */
+  .pgft {
+    background: linear-gradient(135deg, #0c0f1a 0%, #162032 50%, #0f1729 100%);
+    color: rgba(255,255,255,0.85);
+    padding: 4mm 16mm 4.5mm;
+    display: flex; justify-content: space-between; align-items: center;
+    font: 400 9pt var(--fu);
+    position: relative;
+  }
+  .pgft::before {
+    content: ''; position: absolute; top: 0; left: 0; right: 0; height: 1.6mm;
+    background: linear-gradient(90deg, var(--saffron) 0%, #ffffff 50%, var(--inGreen) 100%);
+  }
+  .pgft strong { color: var(--gold); font-family: var(--fl); }
+  .pgft a { color: #93c5fd; border-bottom-color: rgba(147,197,253,0.35); }
+  .pgft .ftleft { display: flex; flex-direction: column; gap: 0.8mm; }
+  .pgft .lic {
+    font: 400 7.5pt/1.3 var(--fu); color: #94a3b8;
+    letter-spacing: 0.2px;
+  }
+  .pgft .pgnum {
+    font: 700 8.5pt var(--fl); color: #cbd5e1;
+    letter-spacing: 1.2px; text-transform: uppercase;
+    flex-shrink: 0;
+  }
+  .pgft .tags { display: flex; gap: 1.5mm; flex-wrap: wrap; }
+  .pgft .ft {
+    font: 600 7pt var(--fl); letter-spacing: 0.5px; text-transform: uppercase;
+    padding: 0.7mm 1.8mm; border-radius: 1mm;
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.12);
+    color: #cbd5e1;
+  }
+
+  /* ─── CTA STRIP (page 2 just above footer) ─── */
+  .cta {
+    background: linear-gradient(135deg, #0c0f1a 0%, #162032 50%, #0f1729 100%);
+    color: #fff;
+    padding: 7mm 16mm;
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 8mm;
+    align-items: center;
+  }
+  .cta h3 {
+    font: 400 16pt/1.3 var(--fd); color: #fff;
+    margin: 0 0 2mm;
+  }
+  .cta h3 em { font-style: italic; color: var(--gold); }
+  .cta p {
+    font: 400 9.5pt/1.5 var(--fu); color: var(--s3);
+    margin: 0;
+  }
+  .cta .actions {
+    display: flex; flex-direction: column; align-items: flex-end; gap: 2mm;
+  }
+  .cta a.btn {
+    display: inline-block; padding: 2.5mm 6mm;
+    background: var(--gold); color: var(--navy);
+    border-radius: 1.2mm; border: 0;
+    font: 700 9.5pt var(--fl); letter-spacing: 0.5px;
+    text-transform: uppercase; white-space: nowrap;
+    box-shadow: 0 4px 14px rgba(250,204,21,0.3);
+  }
+  .cta a.btn:hover, .cta a.btn:focus-visible { color: var(--navy); }
+  .cta .links {
+    font: 400 8.5pt var(--fu); color: #cbd5e1;
+  }
+  .cta .links a { color: #93c5fd; border-bottom-color: rgba(147,197,253,0.35); }
+
+  /* ─── PRINT (zero margin pamphlet, exactly 2 pages) ─── */
+  @media print {
+    @page { size: A4 portrait; margin: 0; }
+    html, body {
+      background: #fff;
+      padding: 0; margin: 0;
+      width: 210mm;
+      gap: 0;
+    }
+    body {
+      display: block;
+    }
+    .page {
+      width: 210mm;
+      height: 297mm;
+      box-shadow: none;
+      page-break-after: always;
+      break-after: page;
+      margin: 0;
+    }
+    .page:last-of-type {
+      page-break-after: auto;
+      break-after: auto;
+    }
+    .band, .pgft, .cta, .pillars thead tr {
+      -webkit-print-color-adjust: exact; print-color-adjust: exact;
+    }
+    a { color: var(--s9); border: 0; }
+    a[href]::after { content: ""; }
+  }
+  @media (forced-colors: active) {
+    .page, .pillars, .who-tbl, .cta { border: 1px solid CanvasText; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<!-- PAGE 1 OF 3                                              -->
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<article class="page" aria-label="Page 1 of 2">
+
+  <header class="band">
+    <div class="row">
+      <div>
+        <h1>MILNET Single Sign-On</h1>
+        <div class="sub">Use Case for India &middot; Executive Pamphlet</div>
+      </div>
+      <div class="meta">
+        <span class="badge">India-First</span><br>
+        v1.0 &middot; 2026-05-06<br>
+        Built by <a href="https://dmj.one" style="color:#bfdbfe;">dmj.one</a>
+      </div>
+    </div>
+  </header>
+
+  <div class="inner">
+
+    <section class="hero" aria-labelledby="hero-h">
+      <div class="kicker">#AatmanirbharBharat &middot; Built in India</div>
+      <h2 id="hero-h">An identity system <em>India</em> can use for the next thirty years, not the last thirty.</h2>
+      <p class="lede">Every login on every Indian government portal, bank, hospital, and ministry depends on cryptography that a future quantum computer will defeat. The deadline to replace it is now. <strong>We built the replacement. In Bharat. In Rust. Without a rupee of foreign capital.</strong></p>
+    </section>
+
+    <section aria-labelledby="s1">
+      <div class="sec-h">
+        <span class="num">01</span>
+        <span class="title" id="s1">Why this matters for India, right now</span>
+      </div>
+      <p>Every UPI transaction, every Aadhaar e-KYC, every DigiLocker handshake, every NPCI settlement, every BFSI login is signed and encrypted today with cryptography that <strong>a future quantum computer will defeat</strong>. The window is ten to fifteen years. Foreign intelligence services are <em>already</em> recording the encrypted traffic. They cannot read it today. They expect to read it after 2032.</p>
+      <p><strong>The shift is starting in India.</strong> MeitY, CERT-In, and RBI have flagged cryptographic agility as a forward security priority; the DPDP Act 2023 sharpens the cost of any credential-leak incident; an Indian PQC timetable is expected to follow the NSA / NIST wave already published abroad. Microsoft, Okta, Google have not yet shipped a generally-available answer for identity. India has a two-to-four-year head start to choose a sovereign one.</p>
+      <div class="pull">&ldquo;Anything India encrypts today with the old locks is, for all practical purposes, public on a delay.&rdquo;</div>
+      <p><strong>Made-in-India is not a slogan here. It is the procurement criterion.</strong> A US or EU vendor cannot be empanelled for classified government workloads. A sovereign-cloud reseller cannot bundle a foreign identity layer. India 2047 needs an Indian-built, DPDP-aligned, CERT-In-ready, MeitY-empanelment-ready identity stack. That is what MILNET is.</p>
+    </section>
+  </div>
+
+  
+
+  <footer class="pgft">
+    <div class="ftleft">
+      <div><strong>MILNET SSO</strong> &middot; <a href="mailto:contact@dmj.one">contact@dmj.one</a></div>
+      <div class="lic">&copy; 2026 dmj.one &middot; Licensed under Apache License 2.0 &middot; Patent grant with retaliation clause</div>
+    </div>
+    <div class="pgnum">Page 1 of 3</div>
+  </footer>
+
+</article>
+
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<!-- PAGE 2 OF 3                                              -->
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<article class="page" aria-label="Page 2 of 3">
+
+  <header class="band compact">
+    <div class="row">
+      <div>
+        <h1>MILNET SSO &middot; The case</h1>
+        <div class="sub">Four stories &middot; Four pillars</div>
+      </div>
+      <div class="meta">Page 2 of 3 &middot; Continued</div>
+    </div>
+  </header>
+
+  <div class="inner">
+
+    <section aria-labelledby="s2">
+      <div class="sec-h">
+        <span class="num">02</span>
+        <span class="title" id="s2">Four Indian stories of what could go wrong</span>
+      </div>
+      <div class="stories">
+        <div class="story r">
+          <div class="who">A government hospital network</div>
+          <h4>AIIMS records, exposed in 2035</h4>
+          <p>Encrypt patient records in 2026 with standard cryptography. An adversary copies the backups year after year. In 2035, when quantum computers are large enough, the entire archive is decrypted in a few weekends. HIV status, mental-health records, genetic markers, all on the open internet. <em>The hospital cannot un-publish this.</em></p>
+        </div>
+        <div class="story b">
+          <div class="who">An Indian bank or NPCI</div>
+          <h4>One stolen key, every customer impersonated</h4>
+          <p>Most identity systems sign login tokens with a single master key. Steal it, and you can mint logins for any customer on any service. Our system splits the key across five servers in three Indian data centres. An attacker has to break into <em>three at once</em>. Cracking one machine gets nothing.</p>
+        </div>
+        <div class="story a">
+          <div class="who">A national identity programme</div>
+          <h4>A subtle bug nobody finds for nine years</h4>
+          <p>National identity software has bugs. Most are caught by testing. A few are not. We did the maths instead. Nineteen statements like <em>&ldquo;no expired token can ever be accepted&rdquo;</em> are mathematically <em>proved</em> impossible to violate. Aerospace and reactor software is written this way. Identity software is not. We thought it should be.</p>
+        </div>
+        <div class="story p">
+          <div class="who">A trust authority (CCA / CA)</div>
+          <h4>Quietly issuing fakes for two months</h4>
+          <p>What if the trust authority itself is compromised? Every credential change in our system is published to a public ledger any auditor or paranoid customer can independently check. If something is issued that should not have been, it shows up within minutes, not weeks.</p>
+        </div>
+      </div>
+    </section>
+
+    <section style="margin-top: 7mm;" aria-labelledby="s3">
+      <div class="sec-h">
+        <span class="num">03</span>
+        <span class="title" id="s3">The four ideas, in plain words. No competitor has all four.</span>
+      </div>
+      <table class="pillars">
+        <thead>
+          <tr>
+            <th>Pillar</th>
+            <th>What we call it</th>
+            <th>Technical name</th>
+            <th>Plain-English analogy</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="idx">01</td>
+            <td class="name g"><span class="dot"></span>Future-proof locks</td>
+            <td class="tech">Post-quantum cryptography</td>
+            <td class="ana">If today&rsquo;s lock is a brass padlock, the new lock is a vault door for a heist film not yet shot. Standardised by NIST in 2024.</td>
+          </tr>
+          <tr>
+            <td class="idx">02</td>
+            <td class="name b"><span class="dot"></span>No single key holder</td>
+            <td class="tech">Threshold signatures</td>
+            <td class="ana">Like a bank vault that needs three different employees to turn three different keys at once. Steal one key, you still cannot open the vault.</td>
+          </tr>
+          <tr>
+            <td class="idx">03</td>
+            <td class="name p"><span class="dot"></span>Mathematical proof</td>
+            <td class="tech">Formal verification (TLA+)</td>
+            <td class="ana">Not &ldquo;we have not seen this car crash in test drives,&rdquo; but &ldquo;the laws of physics make this crash impossible.&rdquo;</td>
+          </tr>
+          <tr>
+            <td class="idx">04</td>
+            <td class="name c"><span class="dot"></span>Receipt for every change</td>
+            <td class="tech">Key Transparency log</td>
+            <td class="ana">Like a panchayat ledger every village member can read. The headman cannot quietly change a record.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>    
+
+  </div>
+
+  <footer class="pgft">
+    <div class="ftleft">
+      <div><strong>MILNET SSO</strong> &middot; <a href="mailto:contact@dmj.one">contact@dmj.one</a></div>
+      <div class="lic">&copy; 2026 dmj.one &middot; Licensed under Apache License 2.0 &middot; Patent grant with retaliation clause</div>
+    </div>
+    <div class="pgnum">Page 2 of 3</div>
+  </footer>
+
+</article>
+
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<!-- PAGE 3 OF 3                                              -->
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<article class="page" aria-label="Page 3 of 3">
+
+  <header class="band compact">
+    <div class="row">
+      <div>
+        <h1>MILNET SSO &middot; The fit</h1>
+        <div class="sub">Indian customers &middot; Questions to ask &middot; Contact</div>
+      </div>
+      <div class="meta">Page 3 of 3 &middot; Continued</div>
+    </div>
+  </header>
+
+  <div class="inner">
+    <section style="margin-top: 7mm;" aria-labelledby="s4">
+      <div class="sec-h">
+        <span class="num">04</span>
+        <span class="title" id="s4">Who in India needs this</span>
+      </div>
+      <table class="who-tbl">
+        <tbody>
+          <tr class="t-saff">
+            <td class="org">MeitY &middot; NIC &middot; CDAC</td>
+            <td class="why">Central ministry workloads, MeghRaj cloud, India Stack-adjacent services, GIGW 3.0 baseline.</td>
+          </tr>
+          <tr class="t-grn">
+            <td class="org">RBI &middot; SEBI &middot; NPCI</td>
+            <td class="why">Tier-1 banks, UPI infrastructure, securities exchanges, payment processors, CBDC pilots.</td>
+          </tr>
+          <tr class="t-blu">
+            <td class="org">DRDO &middot; ISRO &middot; HAL &middot; BEL &middot; BDL</td>
+            <td class="why">Defence PSUs, classified-contract identity, CMMC-equivalent posture under MoD.</td>
+          </tr>
+          <tr class="t-pur">
+            <td class="org">AIIMS &middot; State hospital networks</td>
+            <td class="why">Patient records under DPDP Act 2023. Twenty-five-year confidentiality requirement makes harvest-and-wait existential.</td>
+          </tr>
+          <tr class="t-cyn">
+            <td class="org">Yotta &middot; Tata Communications &middot; ESDS</td>
+            <td class="why">Indian sovereign-cloud operators bundling a sovereign identity layer for resale to gov + BFSI.</td>
+          </tr>
+          <tr class="t-gld">
+            <td class="org">UIDAI &middot; DigiLocker &middot; MeriPehchaan</td>
+            <td class="why">National identity-programme modernisation. PQ migration starts now. India&rsquo;s 1.4 billion citizens cannot afford a re-do.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section style="margin-top: 7mm;" aria-labelledby="s5">
+      <div class="sec-h">
+        <span class="num">05</span>
+        <span class="title" id="s5">Four questions every Indian buyer should ask any identity vendor in 2026</span>
+      </div>
+      <div class="qlist">
+        <div class="q">
+          <div class="qn">01</div>
+          <div class="qbody">
+            <h4>Are you post-quantum today, or only on roadmap?</h4>
+            <p>Demand a list of <strong>NIST FIPS 203 / 204 / 205</strong> algorithms actually deployed in your identity tokens. Roadmap is not deployment. Roadmap means no.</p>
+          </div>
+        </div>
+        <div class="q">
+          <div class="qn">02</div>
+          <div class="qbody">
+            <h4>If a single server is compromised, can the attacker mint tokens?</h4>
+            <p>If the answer involves one master key, walk away. <strong>Threshold signing</strong> means three of five servers must agree before any token is signed.</p>
+          </div>
+        </div>
+        <div class="q">
+          <div class="qn">03</div>
+          <div class="qbody">
+            <h4>Show me the formal proof that an expired token cannot be accepted.</h4>
+            <p>Either there is a <strong>TLA+ / Coq / F*</strong> model with that exact statement, or there is not. There is no middle answer. Testing is not proof.</p>
+          </div>
+        </div>
+        <div class="q">
+          <div class="qn">04</div>
+          <div class="qbody">
+            <h4>Where can I audit, daily, that you have not silently changed cryptographic keys?</h4>
+            <p>The right answer is a <strong>public Merkle log URL</strong>, checked by an independent auditor. Not &ldquo;trust us.&rdquo; Not &ldquo;we will tell you at incident response.&rdquo;</p>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+    <div class="cta" role="region" aria-label="Get in touch">
+      <div>
+        <h3>If any of this is your problem, <em>let&rsquo;s talk.</em></h3>
+        <p>CIO at an Indian bank. Procurement officer at MeitY or a defence PSU. Partner at an Indian venture firm. English,
+          Hindi, or your regional language.</p>
+      </div>
+      <div class="actions">
+        <a class="btn" href="mailto:contact@dmj.one">contact@dmj.one</a>
+        <!-- <div class="links"><a href="/onepager.html">Overview</a> &middot; <a href="/business.html">Buyer brief</a> &middot; <a href="/investors.html">Strategic brief</a></div> -->
+      </div>
+    </div>
+    
+  <footer class="pgft">
+    <div class="ftleft">
+      <div><span style="color:#fcd34d;">Made in India</span> &middot; DPDP 2023 &middot; CERT-In &middot; MeitY-Eligible &middot; #AtmanirbharBharat</div>
+      <div class="lic">&copy; 2026 dmj.one &middot; Licensed under Apache License 2.0 &middot; Patent grant with retaliation clause</div>
+    </div>
+    <div class="pgnum">Page 3 of 3</div>
+  </footer>
+    
+</article>
+
+</body>
+</html>
