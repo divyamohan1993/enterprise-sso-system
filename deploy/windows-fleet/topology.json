@@ -1,0 +1,76 @@
+{
+  "cluster": "milnet-sso",
+  "schema": 1,
+  "description": "Canonical 21-node MILNET SSO topology. The Fleet Commander maps the LAN hosts you select onto these roles. With 21 hosts every role gets a dedicated machine (full zero-shared-fate isolation). With fewer hosts (minimum 5), roles are packed while keeping every threshold group's members on distinct machines.",
+  "min_nodes": 5,
+  "target_nodes": 21,
+  "ports": {
+    "gateway": 9100,
+    "admin": 8080,
+    "orchestrator": 9101,
+    "opaque": 9102,
+    "tss_coordinator": 9103,
+    "verifier": 9104,
+    "ratchet": 9105,
+    "risk": 9106,
+    "audit": 9108,
+    "kt": 9109,
+    "tss_signer_base": 9110,
+    "raft_orchestrator": 9090,
+    "raft_tss": 9190,
+    "health_offset": 1000
+  },
+  "thresholds": {
+    "raft_orchestrator": { "n": 3, "quorum": 2 },
+    "raft_tss": { "n": 3, "quorum": 2 },
+    "frost": { "n": 5, "threshold": 3 },
+    "opaque": { "n": 3, "threshold": 2 },
+    "audit_bft": { "n": 7, "quorum": 5, "byzantine_tolerance": 2 }
+  },
+  "roles": [
+    { "id": "node-01", "zone": "1-DMZ",          "label": "gateway",         "services": ["gateway", "admin"],                     "binaries": ["gateway", "admin"], "public_facing": true },
+    { "id": "node-02", "zone": "2-CEREMONY",     "label": "orchestrator-0",  "services": ["orchestrator", "tss-coordinator"],      "binaries": ["orchestrator", "tss"], "raft_group": "orchestrator", "tss_coordinator": true },
+    { "id": "node-03", "zone": "2-CEREMONY",     "label": "orchestrator-1",  "services": ["orchestrator"],                         "binaries": ["orchestrator"], "raft_group": "orchestrator" },
+    { "id": "node-04", "zone": "2-CEREMONY",     "label": "orchestrator-2",  "services": ["orchestrator"],                         "binaries": ["orchestrator"], "raft_group": "orchestrator" },
+    { "id": "node-05", "zone": "3-AUTH-CORE",    "label": "opaque-1",        "services": ["opaque"],                               "binaries": ["opaque"], "opaque_server_id": 1, "threshold_group": "opaque" },
+    { "id": "node-06", "zone": "3-AUTH-CORE",    "label": "opaque-2",        "services": ["opaque"],                               "binaries": ["opaque"], "opaque_server_id": 2, "threshold_group": "opaque" },
+    { "id": "node-07", "zone": "3-AUTH-CORE",    "label": "opaque-3",        "services": ["opaque"],                               "binaries": ["opaque"], "opaque_server_id": 3, "threshold_group": "opaque" },
+    { "id": "node-08", "zone": "4-SIGNING",      "label": "tss-signer-1",    "services": ["tss-signer@1"],                         "binaries": ["tss"], "tss_signer_index": 1, "threshold_group": "frost" },
+    { "id": "node-09", "zone": "4-SIGNING",      "label": "tss-signer-2",    "services": ["tss-signer@2"],                         "binaries": ["tss"], "tss_signer_index": 2, "threshold_group": "frost" },
+    { "id": "node-10", "zone": "4-SIGNING",      "label": "tss-signer-3",    "services": ["tss-signer@3"],                         "binaries": ["tss"], "tss_signer_index": 3, "threshold_group": "frost" },
+    { "id": "node-11", "zone": "4-SIGNING",      "label": "tss-signer-4",    "services": ["tss-signer@4"],                         "binaries": ["tss"], "tss_signer_index": 4, "threshold_group": "frost" },
+    { "id": "node-12", "zone": "4-SIGNING",      "label": "tss-signer-5",    "services": ["tss-signer@5"],                         "binaries": ["tss"], "tss_signer_index": 5, "threshold_group": "frost" },
+    { "id": "node-13", "zone": "5-VERIFICATION", "label": "verifier-a",      "services": ["verifier"],                             "binaries": ["verifier"] },
+    { "id": "node-14", "zone": "5-VERIFICATION", "label": "verifier-b",      "services": ["verifier"],                             "binaries": ["verifier"] },
+    { "id": "node-15", "zone": "5-VERIFICATION", "label": "ratchet-a",       "services": ["ratchet"],                              "binaries": ["ratchet"] },
+    { "id": "node-16", "zone": "5-VERIFICATION", "label": "ratchet-b",       "services": ["ratchet"],                              "binaries": ["ratchet"] },
+    { "id": "node-17", "zone": "6-AUDIT-BFT",    "label": "audit-1",         "services": ["audit"],                                "binaries": ["audit"], "audit_bft_index": 1, "threshold_group": "audit" },
+    { "id": "node-18", "zone": "6-AUDIT-BFT",    "label": "audit-2",         "services": ["audit"],                                "binaries": ["audit"], "audit_bft_index": 2, "threshold_group": "audit" },
+    { "id": "node-19", "zone": "6-AUDIT-BFT",    "label": "audit-3",         "services": ["audit"],                                "binaries": ["audit"], "audit_bft_index": 3, "threshold_group": "audit" },
+    { "id": "node-20", "zone": "8-INTELLIGENCE", "label": "risk",            "services": ["risk", "audit"],                        "binaries": ["risk", "audit"], "audit_bft_index": 4, "threshold_group": "audit" },
+    { "id": "node-21", "zone": "8-INTELLIGENCE", "label": "kt-witness",      "services": ["kt", "audit"],                          "binaries": ["kt", "audit"], "audit_bft_index": 5, "threshold_group": "audit" }
+  ],
+  "packing_layouts": {
+    "5": [
+      { "host": 0, "roles": ["node-01"] },
+      { "host": 1, "roles": ["node-02", "node-05", "node-08"] },
+      { "host": 2, "roles": ["node-03", "node-06", "node-09", "node-10"] },
+      { "host": 3, "roles": ["node-04", "node-07", "node-11", "node-12"] },
+      { "host": 4, "roles": ["node-13", "node-15", "node-17", "node-20", "node-21"] }
+    ],
+    "7": [
+      { "host": 0, "roles": ["node-01"] },
+      { "host": 1, "roles": ["node-02", "node-08"] },
+      { "host": 2, "roles": ["node-03", "node-05", "node-09"] },
+      { "host": 3, "roles": ["node-04", "node-06", "node-10"] },
+      { "host": 4, "roles": ["node-07", "node-11"] },
+      { "host": 5, "roles": ["node-13", "node-15", "node-12", "node-17"] },
+      { "host": 6, "roles": ["node-14", "node-16", "node-20", "node-21"] }
+    ]
+  },
+  "notes": [
+    "audit BFT: nodes 17-21 each run an audit instance, giving a 5-node BFT cluster (quorum 3, tolerates 1 Byzantine). To reach the canonical 7-node BFT (quorum 5) allocate 7 hosts to the audit zone or co-locate two more audit instances; the Fleet Commander reads the live audit_bft_index set from this file.",
+    "tss-coordinator runs co-located with orchestrator-0 (node-02) as in deploy/vm/provision.sh.",
+    "All inter-node traffic is mTLS over the SHARD transport (HMAC-SHA512 + X-Wing hybrid KEM). Only node-01 (gateway) is reachable from outside the cluster subnet."
+  ]
+}

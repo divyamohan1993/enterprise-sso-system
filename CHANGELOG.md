@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-05-16
+
+### Added
+
+- **deploy/windows-fleet**: Windows Fleet Commander — a double-click mechanism
+  to deploy the full 21-node MILNET SSO cluster across Windows 11 machines on a
+  LAN. `MILNET-Fleet-Commander.bat` launches a PowerShell controller that
+  discovers LAN hosts, presents a selection GUI, maps the chosen IPs onto the
+  21-role topology (`topology.json`), compiles the 10 service binaries once in
+  the controller's WSL2, runs a quantum-safe key ceremony (internal CA,
+  per-node SAN-pinned mTLS certs, master KEK + HKDF sub-keys, FROST 3-of-5
+  shares), and provisions each node: SSH in, install WSL2 Ubuntu with mirrored
+  networking + systemd, push the role payload, start the hardened systemd
+  units. Includes per-node enrollment (`node/Enroll-This-Node.bat`), an in-WSL
+  provisioner, a health + Raft/FROST/OPAQUE/BFT quorum dashboard, and an
+  idempotent teardown script. Inter-node traffic is mTLS over the SHARD
+  transport. Nodes must be explicitly enrolled (SSH-key authorized) before the
+  controller can deploy to them — discovery only lists hosts.
+- **tss**: `examples/fleet_keygen.rs` — offline FROST 3-of-5 + ML-DSA-87 key
+  ceremony helper used by the Windows Fleet Commander. Runs the production
+  Pedersen DKG (`crypto::threshold::dkg_distributed`) and `seal_signer_share`
+  so the sealed shares, group public key, and PQ verifying key match exactly
+  what the deployed `tss` and `verifier` services consume.
+
 ## [0.5.0] - 2026-05-16
 
 Workspace-wide security hardening pass across all 22 service/protocol crates.
