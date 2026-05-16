@@ -58,7 +58,7 @@ postcard = { version = "1", features = ["alloc"] }
 zeroize = { version = "1", features = ["derive"] }
 subtle = "2"
 sha2 = "0.10"
-sha3 = "0.10"
+sha3 = "0.11"
 blake3 = "1"
 hkdf = "0.12"
 hmac = "0.12"
