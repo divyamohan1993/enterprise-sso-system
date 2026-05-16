@@ -571,7 +571,19 @@ impl RatchetChain {
         }
         self.chain_key_mut().zeroize();
         *self.chain_key_mut() = *new_key;
-        self.lock_chain_key()?;
+        // Same fail-closed handling as `advance`: a post-write mlock failure
+        // would otherwise leave an unlocked, swappable PQ-punctured key live.
+        if let Err(e) = self.lock_chain_key() {
+            tracing::error!(
+                epoch = self.epoch,
+                "SIEM:CRITICAL ratchet mlock failed after PQ puncture — \
+                 poisoning chain and zeroizing key"
+            );
+            self.poisoned
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.chain_key_mut().zeroize();
+            return Err(e);
+        }
 
         // ct_bytes already moved out of the ring; drop here wipes the
         // last copy (Vec<u8> is not zeroize-on-drop, so wipe explicitly).
@@ -720,9 +732,23 @@ impl RatchetChain {
         *self.chain_key_mut() = *new_key;
         self.epoch += 1;
 
-        // Re-lock the new key. If lock_chain_key() fails, Zeroizing<...> drops
-        // above will still scrub `new_key` and `info` on the unwinding path.
-        self.lock_chain_key()?;
+        // Re-lock the new key. The new key is already written and the old
+        // region was un-mlocked above, so a failure here would leave a live,
+        // swappable, core-dumpable chain key behind a returned Err — and a
+        // later `advance` would silently continue from that unlocked state.
+        // Fail-closed: poison the chain and zeroize the key so it cannot be
+        // used again. (`new_key`/`info` Zeroizing drops scrub their copies.)
+        if let Err(e) = self.lock_chain_key() {
+            tracing::error!(
+                epoch = self.epoch,
+                "SIEM:CRITICAL ratchet mlock failed after chain advance — \
+                 poisoning chain and zeroizing key"
+            );
+            self.poisoned
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.chain_key_mut().zeroize();
+            return Err(e);
+        }
 
         // A2: apply a PQ puncture once every `PQ_PUNCTURE_INTERVAL` epochs.
         if self.epoch != 0 && self.epoch % PQ_PUNCTURE_INTERVAL == 0 {
@@ -971,6 +997,17 @@ impl RatchetChain {
         self.pq_ciphertext_ring = Some(ring);
         self.pq_keypair = Some(local_kp);
         self.pq_puncture_index = puncture_index;
+        // SECURITY (PQ freshness): `from_persisted` set `last_pq_puncture_epoch
+        // = epoch`. If the caller restores PQ identity here but never calls
+        // `restore_pq_freshness`, the chain would carry `pq_keypair = Some`
+        // with `gap = epoch - epoch = 0`, so the freshness check in `advance`
+        // would not fire for a full `PQ_PUNCTURE_INTERVAL` window — running
+        // without PQ cover after a restart. Forcing `last_pq_puncture_epoch =
+        // 0` makes the next `advance` evaluate `gap = self.epoch`; if the
+        // chain is already overdue it triggers an immediate synchronous
+        // puncture (fail-closed). A subsequent `restore_pq_freshness` call
+        // with a validated persisted value overrides this if available.
+        self.last_pq_puncture_epoch = 0;
         Ok(())
     }
 

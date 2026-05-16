@@ -334,18 +334,28 @@ impl std::fmt::Display for AdminRole {
     }
 }
 
-/// Derive a per-role admin API key from the master KEK using HKDF-SHA512.
+/// Derive a per-role admin API key using HKDF-SHA512.
 ///
 /// Each role gets a unique 32-byte key derived as:
-///   HKDF-SHA512(salt=ADMIN_ROLE_KEY_DERIVE, ikm=master_kek, info=role_label)
+///   HKDF-SHA512(salt=ADMIN_ROLE_KEY_DERIVE || admin_api_key,
+///               ikm=master_kek, info=role_label)
+///
+/// SECURITY (#5): the externally-provisioned `ADMIN_API_KEY` is folded into
+/// the HKDF salt as out-of-band entropy. Without it, every per-role key was
+/// recoverable offline by anyone who learned the master KEK alone — making
+/// the `ADMIN_API_KEY` strength check in `main.rs` moot. With it, recovering
+/// a role key requires BOTH the KEK and the operator-held admin API key.
 ///
 /// The returned key is hex-encoded (64 chars) for use as a Bearer token.
-pub fn derive_admin_role_key(role: AdminRole) -> String {
+pub fn derive_admin_role_key(role: AdminRole, admin_api_key: &str) -> String {
     use hkdf::Hkdf;
     use sha2::Sha512;
 
     let master_kek = common::sealed_keys::load_master_kek();
-    let hk = Hkdf::<Sha512>::new(Some(common::domain::ADMIN_ROLE_KEY_DERIVE), &master_kek);
+    let mut salt = common::domain::ADMIN_ROLE_KEY_DERIVE.to_vec();
+    salt.extend_from_slice(b":");
+    salt.extend_from_slice(admin_api_key.as_bytes());
+    let hk = Hkdf::<Sha512>::new(Some(&salt), &master_kek);
     let mut okm = [0u8; 32];
     hk.expand(role.key_label().as_bytes(), &mut okm)
         .unwrap_or_else(|_| { tracing::error!("FATAL: HKDF expand for admin role key failed"); std::process::exit(1) });
@@ -354,8 +364,11 @@ pub fn derive_admin_role_key(role: AdminRole) -> String {
 
 /// Resolve an API key to an `AdminRole` by checking all derived role keys.
 ///
+/// `admin_api_key` is the out-of-band operator secret folded into the
+/// per-role derivation (see `derive_admin_role_key`).
+///
 /// Returns `None` if the key does not match any role.
-fn resolve_admin_role(api_key: &str) -> Option<AdminRole> {
+fn resolve_admin_role(api_key: &str, admin_api_key: &str) -> Option<AdminRole> {
     let roles = [
         AdminRole::SuperAdmin,
         AdminRole::UserManager,
@@ -368,7 +381,7 @@ fn resolve_admin_role(api_key: &str) -> Option<AdminRole> {
     // match without early exit.
     let mut matched: Option<AdminRole> = None;
     for role in &roles {
-        let derived = derive_admin_role_key(*role);
+        let derived = derive_admin_role_key(*role, admin_api_key);
         if crypto::ct::ct_eq(api_key.as_bytes(), derived.as_bytes()) {
             matched = Some(*role);
         }
@@ -413,6 +426,12 @@ fn required_role_for_route(path: &str, method: &Method) -> AdminRole {
         return AdminRole::SuperAdmin; // Destructive: requires ceremony
     }
     if path == "/api/user/profile" {
+        return AdminRole::ReadOnly;
+    }
+    // Duress PIN registration: self-service for any authenticated user.
+    // The handler enforces that a non-admin caller may only set their OWN
+    // PIN; a UserManager admin may set another user's.
+    if path == "/api/duress-pin" {
         return AdminRole::ReadOnly;
     }
 
@@ -473,9 +492,18 @@ fn required_role_for_route(path: &str, method: &Method) -> AdminRole {
         return AdminRole::SuperAdmin;
     }
 
-    // Recovery endpoints
-    if path.starts_with("/api/recovery/") {
+    // Recovery endpoints.
+    // `generate` and `status` are self-service: a regular user manages their
+    // OWN recovery codes (the handlers enforce ownership — a non-tier-1 caller
+    // may only act on themselves). They must therefore be reachable by plain
+    // user tokens, so map to the `ReadOnly` baseline.
+    // `revoke-all` is a purely administrative operation and stays UserManager.
+    // (`/api/recovery/verify` is auth-exempt and never reaches RBAC.)
+    if path == "/api/recovery/revoke-all" {
         return AdminRole::UserManager;
+    }
+    if path.starts_with("/api/recovery/") {
+        return AdminRole::ReadOnly;
     }
 
     // CAC/PIV endpoints — read-only operations require Auditor;
@@ -709,11 +737,26 @@ pub struct SuperAdminEntry {
 }
 
 /// Derive a unique super admin API key from the master KEK + admin ID.
+///
 /// Each super admin gets a deterministic but unique key.
-pub fn derive_super_admin_key(master_kek: &[u8; 32], admin_id: &Uuid, deployment_id: &str) -> String {
+///
+/// SECURITY (#5): the externally-provisioned `ADMIN_API_KEY` is folded into
+/// the HKDF salt as out-of-band entropy. Without it, every per-super-admin
+/// key was recoverable offline by anyone who learned the master KEK and the
+/// admin's (setup-printed) ID. With it, recovery requires BOTH the KEK and
+/// the operator-held admin API key.
+pub fn derive_super_admin_key(
+    master_kek: &[u8; 32],
+    admin_id: &Uuid,
+    deployment_id: &str,
+    admin_api_key: &str,
+) -> String {
     use hkdf::Hkdf;
     use sha2::Sha512;
-    let salt = format!("MILNET-SUPER-ADMIN-KEY-v1:{}:{}", deployment_id, admin_id);
+    let salt = format!(
+        "MILNET-SUPER-ADMIN-KEY-v1:{}:{}:{}",
+        deployment_id, admin_id, admin_api_key
+    );
     let hk = Hkdf::<Sha512>::new(Some(salt.as_bytes()), master_kek.as_slice());
     let mut okm = [0u8; 32];
     hk.expand(b"super-admin-api-key", &mut okm).unwrap_or_else(|_| { tracing::error!("FATAL: HKDF expand failed"); std::process::exit(1) });
@@ -1182,7 +1225,10 @@ fn extract_client_ip(request: &Request) -> String {
         } else {
             // Fail-closed: no trusted proxies configured, use direct connection IP.
             // Do NOT trust X-Forwarded-For from unknown sources.
-            tracing::warn!(
+            // This is an EXPECTED steady state for single-instance / dev
+            // deployments (and any setup without MILNET_TRUSTED_PROXIES), so
+            // log at debug to avoid drowning real signal on every request.
+            tracing::debug!(
                 x_forwarded_for = %forwarded,
                 "X-Forwarded-For present but no trusted proxies configured — ignoring header"
             );
@@ -1356,21 +1402,37 @@ fn compute_ceremony_approval_hmac_full(
     mac.finalize().into_bytes().to_vec()
 }
 
-/// Compatibility shim — the old signature used a deterministic HMAC.
-/// Kept ONLY so callers that have not yet been migrated continue to compile.
-/// New ceremony approvals MUST use compute_ceremony_approval_hmac_full().
-fn compute_ceremony_approval_hmac(ceremony_id: &Uuid, approver_id: &Uuid) -> Vec<u8> {
-    // Empty nonce / zero timestamp — DEPRECATED, refused by verify_ceremony_approval.
-    compute_ceremony_approval_hmac_full(ceremony_id, approver_id, "", 0)
-}
-
 /// Verify a ceremony approval signature from an approver.
+///
+/// The signature MUST be computed over `ceremony_id:nonce:timestamp` via
+/// `compute_ceremony_approval_hmac_full`. The timestamp must be within
+/// `CEREMONY_APPROVAL_MAX_AGE_SECS` of server time (and not in the future)
+/// so a captured signature cannot be replayed for the rest of the ceremony's
+/// 30-minute lifetime. An empty nonce is refused outright.
 fn verify_ceremony_approval(
     ceremony_id: &Uuid,
     approver_id: &Uuid,
+    nonce_hex: &str,
+    unix_ts: u64,
     provided_signature: &[u8],
 ) -> bool {
-    let expected = compute_ceremony_approval_hmac(ceremony_id, approver_id);
+    // Reject the deprecated deterministic form (empty nonce / zero timestamp).
+    if nonce_hex.is_empty() || unix_ts == 0 {
+        return false;
+    }
+    // Freshness window — reject stale or future-dated approvals.
+    let now = now_secs();
+    if now < 0 {
+        return false;
+    }
+    let now = now as u64;
+    let age = now.saturating_sub(unix_ts);
+    let skew = unix_ts.saturating_sub(now);
+    if age > CEREMONY_APPROVAL_MAX_AGE_SECS || skew > CEREMONY_APPROVAL_MAX_AGE_SECS {
+        return false;
+    }
+    let expected =
+        compute_ceremony_approval_hmac_full(ceremony_id, approver_id, nonce_hex, unix_ts);
     crypto::ct::ct_eq(&expected, provided_signature)
 }
 
@@ -1517,7 +1579,7 @@ async fn auth_middleware(
             }
 
             // Check per-role admin API keys derived from master KEK.
-            if let Some(role) = resolve_admin_role(token) {
+            if let Some(role) = resolve_admin_role(token, &state.admin_api_key) {
                 // Role-based key authenticated — check RBAC permission
                 let req_path = request.uri().path().to_string();
                 let req_method = request.method().clone();
@@ -1626,6 +1688,36 @@ async fn auth_middleware(
                         return Err(StatusCode::UNAUTHORIZED);
                     }
                 };
+                // RBAC for user tokens: a regular user session carries NO admin
+                // role. It may only reach routes whose required role is the
+                // baseline `ReadOnly` (own-profile, FIDO self-management, public
+                // status). Any route mapped to `Auditor` or above — including
+                // every destructive admin op — is an admin-only surface and is
+                // refused here. Without this check the user-token branch would
+                // admit any tier-1 user (e.g. the setup superuser) to handlers
+                // that gate solely on `check_tier`, bypassing RBAC entirely.
+                let req_path = request.uri().path().to_string();
+                let req_method = request.method().clone();
+                let required = required_role_for_route(&req_path, &req_method);
+                if required != AdminRole::ReadOnly {
+                    tracing::warn!(
+                        "RBAC denied: user token has no admin role, insufficient for {} {} (requires {})",
+                        req_method, req_path, required
+                    );
+                    // Record the privilege-escalation attempt to the tamper-proof
+                    // hash-chained audit log so it is visible to forensics.
+                    if let Ok(mut log) = state.audit_log.try_write() {
+                        log.append_signed(
+                            common::types::AuditEventType::AdminRbacDenied,
+                            vec![user_id],
+                            vec![],
+                            0.9,
+                            vec![],
+                            &state.pq_signing_key,
+                        );
+                    }
+                    return Err(StatusCode::FORBIDDEN);
+                }
                 request.extensions_mut().insert(AuthTier(t as u8));
                 request.extensions_mut().insert(AuthUserId(user_id));
                 return Ok(next.run(request).await);
@@ -1882,6 +1974,31 @@ fn check_tier(token_tier: u8, required_tier: u8) -> Result<(), StatusCode> {
     if token_tier <= required_tier {
         Ok(())
     } else {
+        Err(StatusCode::FORBIDDEN)
+    }
+}
+
+/// Enforce that the request carries an admin role satisfying `required`.
+///
+/// Defense in depth for destructive handlers: the RBAC middleware already
+/// gates routes, but a handler must never rely on `check_tier` alone — a
+/// user token (no `AuthAdminRole`) or a lower-privilege admin key would
+/// otherwise slip through if the route map ever drifts. A missing
+/// `AuthAdminRole` is treated as the least-privileged `ReadOnly`, so any
+/// requirement above `ReadOnly` fails closed.
+fn require_admin_role(request: &Request, required: AdminRole) -> Result<(), StatusCode> {
+    let role = request
+        .extensions()
+        .get::<AuthAdminRole>()
+        .map(|r| r.0)
+        .unwrap_or(AdminRole::ReadOnly);
+    if role.satisfies(required) {
+        Ok(())
+    } else {
+        tracing::warn!(
+            "RBAC denied at handler: role {} insufficient (requires {})",
+            role, required
+        );
         Err(StatusCode::FORBIDDEN)
     }
 }
@@ -2160,7 +2277,11 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         // Auth
         .route("/api/auth/login", post(auth_login))
         .route("/api/auth/verify", post(auth_verify))
-        .route("/api/auth/duress-pin", post(register_duress_pin))
+        // Duress PIN registration is NOT under /api/auth/ — that prefix is
+        // exempt from auth_middleware, which would leave this destructive
+        // endpoint unauthenticated (and, with the tier check, permanently
+        // dead). It must run authenticated.
+        .route("/api/duress-pin", post(register_duress_pin))
         .route("/api/auth/logout", post(auth_logout))
         // Key Transparency
         .route("/api/kt/root", get(get_kt_root))
@@ -2495,7 +2616,7 @@ async fn initial_setup(
 
     for admin_setup in &admins_to_create {
         let admin_id = Uuid::new_v4();
-        let api_key = derive_super_admin_key(master_kek, &admin_id, &deployment_id);
+        let api_key = derive_super_admin_key(master_kek, &admin_id, &deployment_id, &state.admin_api_key);
         let key_hash_bytes = hash_admin_key(&api_key);
 
         // Persist to DB
@@ -2709,9 +2830,17 @@ async fn security_dashboard(
 }
 
 /// GET /api/sessions — list active sessions.
+///
+/// Exposes session distribution (token prefixes + user IDs); requires the
+/// `Auditor` admin role (enforced by RBAC middleware) and tier 1 here as
+/// defense in depth — a recovery/emergency token must not enumerate sessions.
 async fn list_sessions(
     State(state): State<Arc<AppState>>,
-) -> Json<serde_json::Value> {
+    request: Request,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(255);
+    check_tier(caller_tier, 1)?;
+
     let tokens = state.access_tokens.read().await;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2728,10 +2857,10 @@ async fn list_sessions(
         })
     }).collect();
 
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "total": sessions.len(),
         "sessions": sessions,
-    }))
+    })))
 }
 
 /// POST /api/security/test/token-tamper — test that token tampering is detected.
@@ -2898,8 +3027,14 @@ async fn register_user(
     let caller_role = request.extensions().get::<AuthAdminRole>()
         .map(|r| r.0)
         .unwrap_or(AdminRole::ReadOnly);
-    // Registering users requires tier 1 (Sovereign)
+    // Registering users requires tier 1 (Sovereign) and the UserManager role.
+    // The role check is defense in depth: a plain user token carries no admin
+    // role and must never reach this handler.
     check_tier(caller_tier, 1)?;
+    if !caller_role.satisfies(AdminRole::UserManager) {
+        tracing::warn!("register_user rejected: caller role {} insufficient (UserManager required)", caller_role);
+        return Err(StatusCode::FORBIDDEN);
+    }
 
     let body = axum::body::to_bytes(request.into_body(), 1024 * 64)
         .await
@@ -3041,8 +3176,20 @@ async fn list_users(State(state): State<Arc<AppState>>, Query(pagination): Query
     Ok(Json(rows.into_iter().map(|r| r.0).collect()))
 }
 
+/// Request body for `delete_user` — carries the multi-person ceremony proof.
+#[derive(Deserialize, Default)]
+struct DeleteUserRequest {
+    /// ID of an approved `DestructiveAction::UserDeletion` ceremony whose
+    /// parameters name the target user. Required — deletion is irreversible.
+    ceremony_action_id: Option<Uuid>,
+}
+
 /// DELETE /api/users/{user_id} — permanently delete a user and all associated data.
-/// Requires Tier 1 (Sovereign) access. Implements GDPR Article 17 right to erasure.
+///
+/// Requires SuperAdmin role AND an approved multi-person ceremony
+/// (`DestructiveAction::UserDeletion`, 2 SuperAdmin approvals). Implements
+/// GDPR Article 17 right to erasure — irreversible, so it carries the
+/// strongest gate of any destructive admin op.
 async fn delete_user(
     State(state): State<Arc<AppState>>,
     Path(user_id): Path<Uuid>,
@@ -3050,6 +3197,69 @@ async fn delete_user(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(255);
     check_tier(caller_tier, 1)?;
+
+    // SECURITY: enforce SuperAdmin role explicitly (defense in depth — the
+    // RBAC middleware already denies non-SuperAdmin admin keys and user tokens
+    // for this route, but the handler must not rely on tier alone).
+    let caller_role = request
+        .extensions()
+        .get::<AuthAdminRole>()
+        .map(|r| r.0)
+        .unwrap_or(AdminRole::ReadOnly);
+    if !caller_role.satisfies(AdminRole::SuperAdmin) {
+        tracing::warn!("delete_user rejected: caller role {} insufficient (SuperAdmin required)", caller_role);
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    // Multi-person ceremony required — consume an approved UserDeletion action.
+    let body = axum::body::to_bytes(request.into_body(), 1024 * 4)
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    // Empty body is permitted only to surface a clear "ceremony required" error.
+    let req: DeleteUserRequest = if body.is_empty() {
+        DeleteUserRequest::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?
+    };
+    let action_id = req.ceremony_action_id.ok_or_else(|| {
+        tracing::warn!("delete_user rejected: no ceremony_action_id provided");
+        StatusCode::FORBIDDEN
+    })?;
+    {
+        let mut actions = state.pending_admin_actions.write().await;
+        let action = actions.get(&action_id).ok_or_else(|| {
+            tracing::warn!("delete_user rejected: ceremony action not found");
+            StatusCode::FORBIDDEN
+        })?;
+        if action.action_type != DestructiveAction::UserDeletion {
+            tracing::warn!("delete_user rejected: wrong ceremony action type");
+            return Err(StatusCode::FORBIDDEN);
+        }
+        if action.approvals.len() < action.required_approvals {
+            tracing::warn!("delete_user rejected: insufficient ceremony approvals");
+            return Err(StatusCode::FORBIDDEN);
+        }
+        if now_secs() > action.expires_at {
+            actions.remove(&action_id);
+            tracing::warn!("delete_user rejected: ceremony action expired");
+            return Err(StatusCode::FORBIDDEN);
+        }
+        // SECURITY: bind the ceremony to THIS user. The approved action's
+        // parameters must name the exact user_id in the path — otherwise an
+        // approved deletion for user A could be replayed to delete user B.
+        let params: serde_json::Value =
+            serde_json::from_str(&action.parameters).map_err(|_| {
+                tracing::warn!("delete_user rejected: ceremony parameters unparseable");
+                StatusCode::FORBIDDEN
+            })?;
+        let target = params.get("user_id").and_then(|v| v.as_str());
+        if target != Some(user_id.to_string().as_str()) {
+            tracing::warn!("delete_user rejected: ceremony target does not match path user_id");
+            return Err(StatusCode::FORBIDDEN);
+        }
+        // Consume the action so it cannot be replayed.
+        actions.remove(&action_id);
+    }
 
     // Verify user exists
     let user_exists: Option<(Uuid,)> = sqlx::query_as(
@@ -3131,6 +3341,8 @@ async fn register_portal(
 ) -> Result<Json<PortalResponse>, StatusCode> {
     let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(4);
     check_tier(caller_tier, 1)?;
+    // SECURITY: enforce UserManager role (defense in depth).
+    require_admin_role(&request, AdminRole::UserManager)?;
 
     let body = axum::body::to_bytes(request.into_body(), 1024 * 64)
         .await
@@ -3201,6 +3413,10 @@ async fn delete_portal(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(4);
     check_tier(caller_tier, 1)?;
+    // SECURITY: enforce UserManager role (defense in depth — RBAC middleware
+    // already denies user tokens and lower roles; the handler must not gate
+    // on tier alone).
+    require_admin_role(&request, AdminRole::UserManager)?;
 
     if let Err(e) = sqlx::query("UPDATE portals SET is_active = false WHERE id = $1")
         .bind(id)
@@ -3262,6 +3478,8 @@ async fn enroll_device(
 ) -> Result<Json<DeviceResponse>, StatusCode> {
     let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(4);
     check_tier(caller_tier, 1)?;
+    // SECURITY: enforce DeviceManager role (defense in depth).
+    require_admin_role(&request, AdminRole::DeviceManager)?;
 
     let body = axum::body::to_bytes(request.into_body(), 1024 * 64)
         .await
@@ -3319,7 +3537,18 @@ async fn enroll_device(
     }))
 }
 
-async fn list_devices(State(state): State<Arc<AppState>>, Query(pagination): Query<PaginationParams>) -> Json<Vec<DeviceResponse>> {
+/// GET /api/devices — list active devices.
+///
+/// Returns the full device fleet (id, tier, enrolled_by); requires the
+/// `Auditor` admin role (RBAC middleware) and tier 1 here as defense in depth.
+async fn list_devices(
+    State(state): State<Arc<AppState>>,
+    Query(pagination): Query<PaginationParams>,
+    request: Request,
+) -> Result<Json<Vec<DeviceResponse>>, StatusCode> {
+    let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(255);
+    check_tier(caller_tier, 1)?;
+
     let rows: Vec<(Uuid, i32, Uuid, bool)> = sqlx::query_as(
         "SELECT id, tier, enrolled_by, is_active FROM devices WHERE is_active = true LIMIT $1 OFFSET $2"
     )
@@ -3336,7 +3565,7 @@ async fn list_devices(State(state): State<Arc<AppState>>, Query(pagination): Que
         is_active: r.3,
     }).collect();
 
-    Json(devices)
+    Ok(Json(devices))
 }
 
 // ---------------------------------------------------------------------------
@@ -3378,12 +3607,20 @@ async fn get_audit_log(
     Ok(Json(entries))
 }
 
+/// GET /api/audit/verify — report audit-chain validity and length.
+///
+/// Requires the `Auditor` admin role (RBAC middleware) and tier 1 here as
+/// defense in depth so an arbitrary authenticated caller cannot probe.
 async fn verify_audit_chain(
     State(state): State<Arc<AppState>>,
-) -> Json<serde_json::Value> {
+    request: Request,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(255);
+    check_tier(caller_tier, 1)?;
+
     let audit = state.audit_log.read().await;
     let valid = audit.verify_chain();
-    Json(serde_json::json!({"chain_valid": valid, "entries": audit.len()}))
+    Ok(Json(serde_json::json!({"chain_valid": valid, "entries": audit.len()})))
 }
 
 // ---------------------------------------------------------------------------
@@ -3463,8 +3700,10 @@ async fn auth_login(
 
     match (user_id, verify_result) {
         (Some(uid), Ok(verified_user_id)) if uid == verified_user_id => {
-            // Generate opaque token: random 32-byte handle
-            let handle_bytes: [u8; 32] = rand::random();
+            // Generate opaque token: 32-byte handle from the project's
+            // hardened entropy path (health-checked, multi-source) — the same
+            // CSPRNG used for nonces elsewhere, for internal consistency.
+            let handle_bytes: [u8; 32] = crypto::entropy::combined_entropy();
             let token = hex::encode(handle_bytes);
             let now = now_secs();
             let expires_at = now + 3600; // 1 hour
@@ -3828,11 +4067,29 @@ async fn register_duress_pin(
     let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(4);
     check_tier(caller_tier, 2)?;
 
+    // Capture caller identity / role BEFORE consuming the body.
+    let caller_user_id = request.extensions().get::<AuthUserId>().map(|u| u.0);
+    let caller_role = request
+        .extensions()
+        .get::<AuthAdminRole>()
+        .map(|r| r.0)
+        .unwrap_or(AdminRole::ReadOnly);
+
     let body = axum::body::to_bytes(request.into_body(), 1024 * 64)
         .await
         .map_err(|_| StatusCode::BAD_REQUEST)?;
     let req: RegisterDuressPinRequest = serde_json::from_slice(&body)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    // SECURITY: ownership enforcement. A regular user token may only register
+    // a duress PIN for ITSELF; setting another account's duress PIN is an
+    // admin action requiring the UserManager role. Without this, any tier-2
+    // user could plant a duress PIN on an arbitrary user_id.
+    let is_admin = caller_role.satisfies(AdminRole::UserManager);
+    if !is_admin && caller_user_id != Some(req.user_id) {
+        tracing::warn!("register_duress_pin rejected: caller may only set their own duress PIN");
+        return Err(StatusCode::FORBIDDEN);
+    }
 
     let config = common::duress::DuressConfig::new(
         req.user_id,
@@ -4043,21 +4300,37 @@ button:hover{{background:#00cc33}}
 }
 
 /// Extract the `__Host-csrf-session` cookie value from a request's Cookie header.
+/// Extract the single `__Host-csrf-session` cookie value.
+///
+/// SECURITY (#8): a browser sends at most ONE cookie of a given name. If more
+/// than one `__Host-csrf-session=` is present, the request is anomalous (e.g.
+/// a forged duplicate injected upstream) — rather than silently trusting the
+/// first occurrence, we fail closed and return an empty string, which makes
+/// the subsequent CSRF comparison reject the request.
 fn extract_csrf_session_cookie(headers: &axum::http::HeaderMap) -> String {
-    headers
+    let matches: Vec<String> = headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|s| s.split(';'))
-        .find_map(|cookie| {
-            let cookie = cookie.trim();
-            if let Some(val) = cookie.strip_prefix("__Host-csrf-session=") {
-                Some(val.to_string())
-            } else {
-                None
-            }
+        .filter_map(|cookie| {
+            cookie
+                .trim()
+                .strip_prefix("__Host-csrf-session=")
+                .map(|val| val.to_string())
         })
-        .unwrap_or_default()
+        .collect();
+    match matches.as_slice() {
+        [only] => only.clone(),
+        [] => String::new(),
+        _ => {
+            tracing::warn!(
+                count = matches.len(),
+                "rejecting request: multiple __Host-csrf-session cookies present (possible injection)"
+            );
+            String::new()
+        }
+    }
 }
 
 /// Handle the login form POST from the OAuth authorize page
@@ -4315,12 +4588,38 @@ struct RevokeTokenRequest {
 }
 
 /// POST /api/tokens/revoke — add a token_id (hex string) to the revocation set.
+///
+/// Requires Tier 1 AND `UserManager` role (or above). Revoking arbitrary
+/// `token_id` values is a session-DoS primitive, so it must not be reachable
+/// by ordinary user tokens or low-privilege admin roles.
 async fn revoke_token(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<RevokeTokenRequest>,
+    request: Request,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(255);
+    check_tier(caller_tier, 1)?;
+
+    // SECURITY: enforce UserManager role (defense in depth — the RBAC
+    // middleware already denies user tokens and lower admin roles for this
+    // route, but the handler must not rely on tier alone).
+    let caller_role = request
+        .extensions()
+        .get::<AuthAdminRole>()
+        .map(|r| r.0)
+        .unwrap_or(AdminRole::ReadOnly);
+    if !caller_role.satisfies(AdminRole::UserManager) {
+        tracing::warn!("revoke_token rejected: caller role {} insufficient (UserManager required)", caller_role);
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let body = axum::body::to_bytes(request.into_body(), 1024 * 4)
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let req: RevokeTokenRequest =
+        serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+
     // Parse hex token_id into [u8; 16]
-    let bytes = hex::decode(&body.token_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let bytes = hex::decode(&req.token_id).map_err(|_| StatusCode::BAD_REQUEST)?;
     if bytes.len() != 16 {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -4336,16 +4635,42 @@ async fn revoke_token(
     let count = revocation.count();
     drop(revocation);
 
+    // SECURITY: audit every revocation — without this, a DoS via token
+    // revocation is silent and invisible to forensic analysis.
+    common::siem::SecurityEvent::admin_data_access(&format!(
+        "TOKEN_REVOKED: token_id={} role={} revoked_count={}",
+        req.token_id, caller_role, count
+    ));
+    {
+        let mut audit = state.audit_log.write().await;
+        audit.append_signed(
+            common::types::AuditEventType::CredentialRevoked,
+            vec![],
+            vec![],
+            0.3,
+            vec![],
+            &state.pq_signing_key,
+        );
+    }
+
     Ok(Json(serde_json::json!({"status": "revoked", "revoked_count": count})))
 }
 
 /// GET /api/tokens/revoked — return the count of revoked tokens.
+///
+/// Requires the `Auditor` admin role (RBAC middleware) and tier 1 here as
+/// defense in depth — the revocation-list size must not leak to ordinary
+/// authenticated callers.
 async fn revoked_token_count(
     State(state): State<Arc<AppState>>,
-) -> Json<serde_json::Value> {
+    request: Request,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(255);
+    check_tier(caller_tier, 1)?;
+
     let revocation = state.revocation_list.read().await;
     let count = revocation.count();
-    Json(serde_json::json!({"revoked_count": count}))
+    Ok(Json(serde_json::json!({"revoked_count": count})))
 }
 
 // ---------------------------------------------------------------------------
@@ -4766,7 +5091,7 @@ async fn add_super_admin(
     let deployment_id = std::env::var("MILNET_DEPLOYMENT_ID")
         .unwrap_or_else(|_| "default-deployment".to_string());
     let admin_id = Uuid::new_v4();
-    let api_key = derive_super_admin_key(master_kek, &admin_id, &deployment_id);
+    let api_key = derive_super_admin_key(master_kek, &admin_id, &deployment_id, &state.admin_api_key);
     let key_hash_bytes = hash_admin_key(&api_key);
 
     // Temporarily unfreeze → insert → re-freeze (all in sequence)
@@ -5436,8 +5761,13 @@ async fn fido_register_begin(
         &existing_ids,
     );
 
-    // Store the challenge so we can verify it on completion
-    fido_store.store_challenge(&options.challenge, req.user_id);
+    // Store the challenge so we can verify it on completion.
+    // A full challenge store must surface as a failure — silently dropping it
+    // would let the user fail registration later with no diagnostic.
+    if let Err(e) = fido_store.store_challenge(&options.challenge, req.user_id) {
+        tracing::error!("FIDO2 register begin: challenge store failed: {e}");
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
 
     Ok(Json(FidoRegisterBeginResponse { options }))
 }
@@ -5490,7 +5820,13 @@ async fn fido_register_complete(
         pq_attestation: Vec::new(),
     };
 
-    fido_store.store_credential(cred);
+    // Persist the credential. A full credential store must surface as a
+    // failure — never report a successful enrolment for a credential that
+    // was actually dropped (that would lock the user out permanently).
+    if let Err(e) = fido_store.store_credential(cred) {
+        tracing::error!("FIDO2 register complete: credential store failed: {e}");
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
     drop(fido_store);
 
     // Log to audit
@@ -5567,10 +5903,39 @@ async fn fido_authenticate_begin(
         &creds,
     );
 
+    drop(fido_store);
+
+    // SECURITY: store the single-use challenge bound to this user so
+    // fido_authenticate_complete can consume it and bind the assertion.
+    // Without a server-issued challenge the assertion is replayable/phishable.
+    {
+        let mut fido_store = state.fido_store.write().await;
+        if let Err(e) = fido_store.store_challenge(&options.challenge, req.user_id) {
+            tracing::error!("FIDO2 authenticate begin: challenge store failed: {e}");
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+    }
+
     Ok(Json(serde_json::to_value(FidoAuthBeginResponse { options }).unwrap_or_else(|e| {
         tracing::error!("FIDO auth options serialization failed: {e}");
         serde_json::json!({"error": "internal serialization error"})
     })))
+}
+
+/// The WebAuthn relying-party origin. The assertion's clientDataJSON `origin`
+/// MUST match this exactly — this is what makes the ceremony non-phishable.
+const FIDO_RP_ORIGIN: &str = "https://sso-system.dmj.one";
+
+/// Extract the raw challenge bytes from a WebAuthn clientDataJSON blob.
+/// The `challenge` field is base64url-encoded (no padding) per spec.
+fn extract_challenge_from_client_data(client_data: &[u8]) -> Option<Vec<u8>> {
+    use base64::Engine;
+    let obj: serde_json::Value = serde_json::from_slice(client_data).ok()?;
+    let challenge_b64 = obj.get("challenge")?.as_str()?;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(challenge_b64)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(challenge_b64))
+        .ok()
 }
 
 async fn fido_authenticate_complete(
@@ -5579,27 +5944,65 @@ async fn fido_authenticate_complete(
 ) -> Json<FidoAuthCompleteResponse> {
     let mut fido_store = state.fido_store.write().await;
 
+    // SECURITY (fido P0): bind the assertion to a server-issued single-use
+    // challenge. Parse the challenge the client echoed in clientDataJSON, then
+    // CONSUME it from the server store — `consume_challenge` succeeds only if
+    // the server actually issued that exact value (via fido_authenticate_begin)
+    // and it has not expired or been used. This closes the replay hole: a
+    // captured assertion cannot be replayed because its challenge is gone.
+    let challenge_bytes = match extract_challenge_from_client_data(&req.client_data) {
+        Some(c) => c,
+        None => {
+            return Json(FidoAuthCompleteResponse {
+                success: false,
+                user_id: None,
+                error: Some("malformed client data: missing or invalid challenge".into()),
+            });
+        }
+    };
+    let challenge_user_id = match fido_store.consume_challenge(&challenge_bytes) {
+        Some(uid) => uid,
+        None => {
+            tracing::warn!("FIDO2 authenticate complete: no matching pending challenge (replay or expired)");
+            return Json(FidoAuthCompleteResponse {
+                success: false,
+                user_id: None,
+                error: Some("unknown, expired, or already-used challenge".into()),
+            });
+        }
+    };
+
     // Look up the credential (immutable borrow first for verification)
     let verification_result = match fido_store.get_credential(&req.credential_id) {
         Some(stored_cred) => {
-            // Build the AuthenticationResult from the client's response
-            let auth_result = fido::types::AuthenticationResult {
-                credential_id: req.credential_id.clone(),
-                authenticator_data: req.authenticator_data.clone(),
-                client_data: req.client_data.clone(),
-                signature: req.signature.clone(),
-            };
+            // SECURITY: the consumed challenge MUST have been issued for the
+            // same user the credential belongs to — otherwise a challenge
+            // issued for user A could authorize a login as user B.
+            if stored_cred.user_id != challenge_user_id {
+                Err("challenge does not belong to this credential's user".to_string())
+            } else {
+                // Build the AuthenticationResult from the client's response
+                let auth_result = fido::types::AuthenticationResult {
+                    credential_id: req.credential_id.clone(),
+                    authenticator_data: req.authenticator_data.clone(),
+                    client_data: req.client_data.clone(),
+                    signature: req.signature.clone(),
+                };
 
-            // Verify the cryptographic signature, RP ID, flags, and sign counter
-            let rp_id = "sso-system.dmj.one";
-            match fido::authentication::verify_authentication_response(
-                &auth_result,
-                stored_cred,
-                rp_id,
-                true, // require user verification
-            ) {
-                Ok(new_sign_count) => Ok((stored_cred.user_id, new_sign_count)),
-                Err(e) => Err(e.to_string()),
+                // Verify the signature, RP ID, flags, sign counter, AND the
+                // challenge + origin binding (clientDataJSON validation).
+                let rp_id = "sso-system.dmj.one";
+                match fido::authentication::verify_authentication_response(
+                    &auth_result,
+                    stored_cred,
+                    rp_id,
+                    &challenge_bytes,
+                    FIDO_RP_ORIGIN,
+                    true, // require user verification
+                ) {
+                    Ok(new_sign_count) => Ok((stored_cred.user_id, new_sign_count)),
+                    Err(e) => Err(e.to_string()),
+                }
             }
         }
         None => Err("unknown credential".into()),
@@ -5694,10 +6097,16 @@ pub struct InitiateCeremonyResponse {
 #[derive(Deserialize)]
 pub struct ApproveCeremonyRequest {
     pub ceremony_id: Uuid,
-    /// HMAC-SHA512 signature over the ceremony_id, proving cryptographic
-    /// binding between the approver and this specific ceremony.
+    /// HMAC-SHA512 signature over `ceremony_id:nonce:timestamp`, proving
+    /// cryptographic binding between the approver and this specific ceremony.
     /// Hex-encoded.
     pub signature: String,
+    /// Per-approval random 16-byte nonce (hex). Bound into the HMAC so a
+    /// captured signature cannot be replayed within the ceremony's lifetime.
+    pub nonce: String,
+    /// Unix timestamp (seconds) the approval was generated. Must be within
+    /// `CEREMONY_APPROVAL_MAX_AGE_SECS` of server time.
+    pub timestamp: u64,
 }
 
 #[derive(Serialize)]
@@ -5710,12 +6119,22 @@ pub struct ApproveCeremonyResponse {
     pub error: Option<String>,
 }
 
-/// Extract the caller's user ID from the Authorization header token.
-/// Token format: `user_id:timestamp:hmac`
+/// Extract the caller's stable identity for ceremony participation.
+///
+/// Returns the authenticated user ID for user tokens, or the per-super-admin
+/// ID for super-admin-key holders. Super admins authenticate with role/cert
+/// keys that carry no `AuthUserId`; without this fallback the ceremony
+/// endpoints — whose RBAC requires SuperAdmin — would have no valid caller
+/// identity and be unreachable. The super-admin ID is a distinct `Uuid` space
+/// from user IDs, so "approver != initiator" stays sound.
 fn extract_user_id_from_request(request: &Request) -> Option<Uuid> {
     // Prefer the user ID set by auth_middleware (works for both opaque and legacy tokens)
     if let Some(auth_user) = request.extensions().get::<AuthUserId>() {
         return Some(auth_user.0);
+    }
+    // Super-admin-key holders: use their per-super-admin identity.
+    if let Some(super_admin) = request.extensions().get::<AuthSuperAdminId>() {
+        return Some(super_admin.0);
     }
     // Fallback: parse from legacy token format in the Authorization header
     let header = request
@@ -5740,6 +6159,10 @@ async fn initiate_ceremony(
 ) -> Result<Json<InitiateCeremonyResponse>, StatusCode> {
     let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(4);
     check_tier(caller_tier, 1)?;
+    // SECURITY: ceremonies are SuperAdmin-only (defense in depth alongside the
+    // RBAC middleware). A plain tier-1 user token carries no admin role and is
+    // refused — otherwise any tier-1 user could initiate destructive ceremonies.
+    require_admin_role(&request, AdminRole::SuperAdmin)?;
 
     let initiator = extract_user_id_from_request(&request)
         .ok_or(StatusCode::UNAUTHORIZED)?; // SECURITY: reject nil UUID — ceremony requires verified identity
@@ -5813,6 +6236,10 @@ async fn approve_ceremony(
 ) -> Result<Json<ApproveCeremonyResponse>, StatusCode> {
     let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(4);
     check_tier(caller_tier, 1)?;
+    // SECURITY: ceremony approval is SuperAdmin-only (defense in depth — a
+    // per-action SuperAdmin check also exists below, but a user token must
+    // never reach this far).
+    require_admin_role(&request, AdminRole::SuperAdmin)?;
 
     let approver = extract_user_id_from_request(&request)
         .ok_or(StatusCode::UNAUTHORIZED)?; // SECURITY: reject nil UUID — ceremony requires verified identity
@@ -5830,9 +6257,17 @@ async fn approve_ceremony(
     let req: ApproveCeremonyRequest =
         serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    // Verify the approver's cryptographic signature over the ceremony_id
+    // Verify the approver's cryptographic signature over
+    // `ceremony_id:nonce:timestamp`. The freshness window inside
+    // `verify_ceremony_approval` defeats replay of a captured signature.
     let provided_sig = hex::decode(&req.signature).map_err(|_| StatusCode::BAD_REQUEST)?;
-    if !verify_ceremony_approval(&req.ceremony_id, &approver, &provided_sig) {
+    if !verify_ceremony_approval(
+        &req.ceremony_id,
+        &approver,
+        &req.nonce,
+        req.timestamp,
+        &provided_sig,
+    ) {
         return Ok(Json(ApproveCeremonyResponse {
             approved: false,
             complete: false,
@@ -6395,16 +6830,16 @@ async fn recovery_revoke_all(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(4);
     check_tier(caller_tier, 1)?;
-
-    let caller_user_id = request.extensions().get::<AuthUserId>().map(|u| u.0);
+    // SECURITY: revoking another user's recovery codes is an administrative
+    // action — require the UserManager admin role. A plain user token carries
+    // no admin role and is refused here (and at the RBAC middleware). The
+    // previous `caller_user_id.is_none()` gate was backwards: it admitted any
+    // user token and rejected admin keys, which is the RBAC bypass flagged in
+    // the audit.
+    require_admin_role(&request, AdminRole::UserManager)?;
 
     let user_id_str = params.get("user_id").ok_or(StatusCode::BAD_REQUEST)?;
     let user_id = Uuid::parse_str(user_id_str).map_err(|_| StatusCode::BAD_REQUEST)?;
-
-    // Ownership check: even tier 1 admins must be authenticated users
-    if caller_user_id.is_none() {
-        return Err(StatusCode::FORBIDDEN);
-    }
 
     let result = sqlx::query("DELETE FROM recovery_codes WHERE user_id = $1")
         .bind(user_id)
@@ -6728,6 +7163,7 @@ async fn get_admin_action_status(
 /// derived from the master KEK and can be distributed to operators based
 /// on their assigned role.
 async fn get_admin_role_keys(
+    State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let caller_role = request
@@ -6744,7 +7180,7 @@ async fn get_admin_role_keys(
     // violating least-privilege and making lateral movement trivial.
     let keys: Vec<serde_json::Value> = vec![serde_json::json!({
         "role": caller_role.key_label(),
-        "api_key": derive_admin_role_key(caller_role),
+        "api_key": derive_admin_role_key(caller_role, &state.admin_api_key),
     })];
 
     Ok(Json(serde_json::json!({ "role_keys": keys })))
@@ -7340,7 +7776,12 @@ mod tests {
             AdminRole::Auditor,
             AdminRole::ReadOnly,
         ];
-        let keys: Vec<String> = roles.iter().map(|r| derive_admin_role_key(*r)).collect();
+        // Out-of-band admin API key folded into derivation (see #5 fix).
+        const TEST_ADMIN_API_KEY: &str = "test-admin-api-key-0123456789abcdef";
+        let keys: Vec<String> = roles
+            .iter()
+            .map(|r| derive_admin_role_key(*r, TEST_ADMIN_API_KEY))
+            .collect();
         // All keys must be unique
         let unique: HashSet<&String> = keys.iter().collect();
         assert_eq!(keys.len(), unique.len(), "all role keys must be unique");
@@ -7348,13 +7789,25 @@ mod tests {
 
     #[test]
     fn role_key_derivation_is_deterministic() {
-        let key1 = derive_admin_role_key(AdminRole::Auditor);
-        let key2 = derive_admin_role_key(AdminRole::Auditor);
+        const TEST_ADMIN_API_KEY: &str = "test-admin-api-key-0123456789abcdef";
+        let key1 = derive_admin_role_key(AdminRole::Auditor, TEST_ADMIN_API_KEY);
+        let key2 = derive_admin_role_key(AdminRole::Auditor, TEST_ADMIN_API_KEY);
         assert_eq!(key1, key2, "same role must produce same key");
     }
 
     #[test]
+    fn role_key_differs_per_admin_api_key() {
+        // SECURITY (#5): the out-of-band admin API key MUST change the derived
+        // key — otherwise it contributes no entropy and the master KEK alone
+        // recovers the role key.
+        let a = derive_admin_role_key(AdminRole::Auditor, "admin-api-key-AAAAAAAAAAAAAAAAAAA");
+        let b = derive_admin_role_key(AdminRole::Auditor, "admin-api-key-BBBBBBBBBBBBBBBBBBB");
+        assert_ne!(a, b, "different admin API keys must yield different role keys");
+    }
+
+    #[test]
     fn role_keys_are_64_hex_chars() {
+        const TEST_ADMIN_API_KEY: &str = "test-admin-api-key-0123456789abcdef";
         for role in &[
             AdminRole::SuperAdmin,
             AdminRole::UserManager,
@@ -7362,7 +7815,7 @@ mod tests {
             AdminRole::Auditor,
             AdminRole::ReadOnly,
         ] {
-            let key = derive_admin_role_key(*role);
+            let key = derive_admin_role_key(*role, TEST_ADMIN_API_KEY);
             assert_eq!(key.len(), 64, "key must be 64 hex chars (32 bytes)");
             assert!(
                 key.chars().all(|c| c.is_ascii_hexdigit()),
@@ -7373,6 +7826,7 @@ mod tests {
 
     #[test]
     fn resolve_admin_role_matches_derived_keys() {
+        const TEST_ADMIN_API_KEY: &str = "test-admin-api-key-0123456789abcdef";
         for role in &[
             AdminRole::SuperAdmin,
             AdminRole::UserManager,
@@ -7380,15 +7834,16 @@ mod tests {
             AdminRole::Auditor,
             AdminRole::ReadOnly,
         ] {
-            let key = derive_admin_role_key(*role);
-            let resolved = resolve_admin_role(&key);
+            let key = derive_admin_role_key(*role, TEST_ADMIN_API_KEY);
+            let resolved = resolve_admin_role(&key, TEST_ADMIN_API_KEY);
             assert_eq!(resolved, Some(*role), "key should resolve back to {:?}", role);
         }
     }
 
     #[test]
     fn resolve_admin_role_rejects_unknown_key() {
-        assert_eq!(resolve_admin_role("not-a-valid-key"), None);
+        const TEST_ADMIN_API_KEY: &str = "test-admin-api-key-0123456789abcdef";
+        assert_eq!(resolve_admin_role("not-a-valid-key", TEST_ADMIN_API_KEY), None);
     }
 
     // ── AdminRole from_u8 Tests ────────────────────────────────────────────
@@ -8127,9 +8582,24 @@ mod tests {
     }
 
     #[test]
-    fn recovery_endpoints_require_user_manager() {
+    fn recovery_self_service_endpoints_allow_readonly() {
+        // generate/status are self-service (handler enforces ownership) and
+        // must be reachable by plain user tokens.
         assert_eq!(
             required_role_for_route("/api/recovery/generate", &Method::POST),
+            AdminRole::ReadOnly
+        );
+        assert_eq!(
+            required_role_for_route("/api/recovery/status", &Method::GET),
+            AdminRole::ReadOnly
+        );
+    }
+
+    #[test]
+    fn recovery_revoke_all_requires_user_manager() {
+        // revoke-all is purely administrative.
+        assert_eq!(
+            required_role_for_route("/api/recovery/revoke-all", &Method::DELETE),
             AdminRole::UserManager
         );
     }
@@ -8161,12 +8631,16 @@ mod tests {
     // ── Ceremony Approval HMAC Tests ─────────────────────────────────────
 
     #[test]
-    fn ceremony_approval_hmac_deterministic() {
+    fn ceremony_approval_hmac_differs_per_nonce() {
+        // The HMAC must NOT be deterministic across nonces — that is the
+        // whole point of the per-approval randomness (replay defeat).
         let cid = Uuid::new_v4();
         let aid = Uuid::new_v4();
-        let sig1 = compute_ceremony_approval_hmac(&cid, &aid);
-        let sig2 = compute_ceremony_approval_hmac(&cid, &aid);
-        assert_eq!(sig1, sig2);
+        let ts = 1_700_000_000u64;
+        assert_ne!(
+            compute_ceremony_approval_hmac_full(&cid, &aid, "aaaa", ts),
+            compute_ceremony_approval_hmac_full(&cid, &aid, "bbbb", ts)
+        );
     }
 
     #[test]
@@ -8174,9 +8648,10 @@ mod tests {
         let c1 = Uuid::new_v4();
         let c2 = Uuid::new_v4();
         let approver = Uuid::new_v4();
+        let ts = 1_700_000_000u64;
         assert_ne!(
-            compute_ceremony_approval_hmac(&c1, &approver),
-            compute_ceremony_approval_hmac(&c2, &approver)
+            compute_ceremony_approval_hmac_full(&c1, &approver, "n", ts),
+            compute_ceremony_approval_hmac_full(&c2, &approver, "n", ts)
         );
     }
 
@@ -8185,9 +8660,10 @@ mod tests {
         let cid = Uuid::new_v4();
         let a1 = Uuid::new_v4();
         let a2 = Uuid::new_v4();
+        let ts = 1_700_000_000u64;
         assert_ne!(
-            compute_ceremony_approval_hmac(&cid, &a1),
-            compute_ceremony_approval_hmac(&cid, &a2)
+            compute_ceremony_approval_hmac_full(&cid, &a1, "n", ts),
+            compute_ceremony_approval_hmac_full(&cid, &a2, "n", ts)
         );
     }
 
@@ -8195,15 +8671,17 @@ mod tests {
     fn verify_ceremony_approval_valid() {
         let cid = Uuid::new_v4();
         let aid = Uuid::new_v4();
-        let sig = compute_ceremony_approval_hmac(&cid, &aid);
-        assert!(verify_ceremony_approval(&cid, &aid, &sig));
+        let ts = crate::routes::now_secs() as u64;
+        let sig = compute_ceremony_approval_hmac_full(&cid, &aid, "deadbeef", ts);
+        assert!(verify_ceremony_approval(&cid, &aid, "deadbeef", ts, &sig));
     }
 
     #[test]
     fn verify_ceremony_approval_wrong_sig_rejected() {
         let cid = Uuid::new_v4();
         let aid = Uuid::new_v4();
-        assert!(!verify_ceremony_approval(&cid, &aid, &[0xFFu8; 64]));
+        let ts = crate::routes::now_secs() as u64;
+        assert!(!verify_ceremony_approval(&cid, &aid, "deadbeef", ts, &[0xFFu8; 64]));
     }
 
     #[test]
@@ -8211,8 +8689,42 @@ mod tests {
         let cid = Uuid::new_v4();
         let real = Uuid::new_v4();
         let fake = Uuid::new_v4();
-        let sig = compute_ceremony_approval_hmac(&cid, &real);
-        assert!(!verify_ceremony_approval(&cid, &fake, &sig));
+        let ts = crate::routes::now_secs() as u64;
+        let sig = compute_ceremony_approval_hmac_full(&cid, &real, "deadbeef", ts);
+        assert!(!verify_ceremony_approval(&cid, &fake, "deadbeef", ts, &sig));
+    }
+
+    #[test]
+    fn verify_ceremony_approval_empty_nonce_rejected() {
+        // The deprecated deterministic form (empty nonce) must be refused.
+        let cid = Uuid::new_v4();
+        let aid = Uuid::new_v4();
+        let ts = crate::routes::now_secs() as u64;
+        let sig = compute_ceremony_approval_hmac_full(&cid, &aid, "", ts);
+        assert!(!verify_ceremony_approval(&cid, &aid, "", ts, &sig));
+    }
+
+    #[test]
+    fn verify_ceremony_approval_stale_timestamp_rejected() {
+        // A signature older than the freshness window cannot be replayed.
+        let cid = Uuid::new_v4();
+        let aid = Uuid::new_v4();
+        let stale = crate::routes::now_secs() as u64
+            - CEREMONY_APPROVAL_MAX_AGE_SECS
+            - 60;
+        let sig = compute_ceremony_approval_hmac_full(&cid, &aid, "deadbeef", stale);
+        assert!(!verify_ceremony_approval(&cid, &aid, "deadbeef", stale, &sig));
+    }
+
+    #[test]
+    fn verify_ceremony_approval_future_timestamp_rejected() {
+        let cid = Uuid::new_v4();
+        let aid = Uuid::new_v4();
+        let future = crate::routes::now_secs() as u64
+            + CEREMONY_APPROVAL_MAX_AGE_SECS
+            + 60;
+        let sig = compute_ceremony_approval_hmac_full(&cid, &aid, "deadbeef", future);
+        assert!(!verify_ceremony_approval(&cid, &aid, "deadbeef", future, &sig));
     }
 
     // ── Lockout Tier Escalation Tests ────────────────────────────────────

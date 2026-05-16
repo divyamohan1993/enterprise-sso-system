@@ -12,12 +12,25 @@ fn welch_zero_for_identical_streams() {
 
 #[test]
 fn detects_obvious_leak() {
-    let report = measure(&[0u8; 16], &[0u8; 16], 2000, |input| {
-        if input.iter().sum::<u8>() == 0 {
-            std::hint::black_box(input.len());
+    // Positive control: a data-dependent loop whose iteration count is driven
+    // by the first input byte. class-1 (0xFF) runs 255 extra iterations per
+    // call versus class-0 (0x00), an unmissable timing difference. If the
+    // harness ever regresses to an always-zero t-statistic this test fails.
+    let class0 = [0u8; 16];
+    let class1 = [0xFFu8; 16];
+    let report = measure(&class0, &class1, 20_000, |input| {
+        let mut acc = 0u64;
+        for _ in 0..input[0] {
+            acc = std::hint::black_box(acc).wrapping_add(1);
         }
+        let _ = std::hint::black_box(acc);
     });
-    assert!(report.samples > 0);
+    assert_eq!(
+        report.verdict,
+        Verdict::LeakDetected,
+        "harness failed to flag a blatant input-dependent loop: |t|={:.3}",
+        report.t
+    );
 }
 
 #[test]

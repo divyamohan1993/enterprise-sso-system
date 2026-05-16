@@ -70,9 +70,16 @@ pub enum SymmetricAlgorithm {
 /// call to `active_algorithm()` so that tests (and runtime FIPS flips) see
 /// the current state. Caching only the env-var-derived choice keeps the
 /// hot path to a single atomic load + no env lookup.
+///
+/// SECURITY/observability (audit P1): the env-var choice is frozen on first
+/// access, so a process that sets `MILNET_ENVELOPE_CIPHER` after any other
+/// code has already read it silently gets stale behaviour. The initializer
+/// therefore emits an `info` log recording the resolved choice the first time
+/// it runs, and [`log_envelope_cipher_config`] lets startup code force that
+/// resolution early (and audit it) before any cipher operation can race it.
 static ENVELOPE_CIPHER_FROM_ENV: std::sync::LazyLock<SymmetricAlgorithm> =
     std::sync::LazyLock::new(|| {
-        match std::env::var("MILNET_ENVELOPE_CIPHER").as_deref() {
+        let chosen = match std::env::var("MILNET_ENVELOPE_CIPHER").as_deref() {
             Ok("aes-256-gcm") => SymmetricAlgorithm::Aes256Gcm,
             Ok("chacha20-poly1305") => SymmetricAlgorithm::ChaCha20Poly1305,
             Ok("aegis-256") | Err(_) => SymmetricAlgorithm::Aegis256,
@@ -83,8 +90,24 @@ static ENVELOPE_CIPHER_FROM_ENV: std::sync::LazyLock<SymmetricAlgorithm> =
                 );
                 SymmetricAlgorithm::Aegis256
             }
-        }
+        };
+        tracing::info!(
+            envelope_cipher = ?chosen,
+            "MILNET_ENVELOPE_CIPHER resolved and cached for the process lifetime \
+             (later env changes are ignored)"
+        );
+        chosen
     });
+
+/// Resolve and audit-log the cached envelope cipher choice.
+///
+/// Call once at service startup, *after* `MILNET_ENVELOPE_CIPHER` is finalised
+/// and *before* any encryption, so the cached choice is pinned deterministically
+/// and recorded in the startup log. Returns the resolved algorithm. This makes
+/// a misconfiguration observable at boot instead of silently undetectable.
+pub fn log_envelope_cipher_config() -> SymmetricAlgorithm {
+    *ENVELOPE_CIPHER_FROM_ENV
+}
 
 /// Returns the active algorithm for new encryptions.
 ///

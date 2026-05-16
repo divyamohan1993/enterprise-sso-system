@@ -721,36 +721,29 @@ impl CredentialStore {
 
 impl Drop for CredentialStore {
     fn drop(&mut self) {
-        use zeroize::Zeroize;
-
-        // SECURITY: opaque-ke ServerSetup does not impl Zeroize. We serialize and
-        // zeroize the serialized form. The original struct memory will be zeroed
-        // when the allocator reuses it, but there is a window where the OPRF seed
-        // and keypair remain in process memory. This is a known limitation tracked
-        // for upstream fix. The crate uses #![forbid(unsafe_code)] so we cannot
-        // use ptr::write_volatile to scrub the struct directly.
-
-        let setup_size = std::mem::size_of_val(&self.server_setup);
-        tracing::debug!(
-            setup_bytes_size = setup_size,
-            "CredentialStore::drop -- zeroizing serialized ServerSetup ({setup_size} bytes struct)"
-        );
-
-        let mut setup_bytes = self.server_setup.serialize().to_vec();
-        setup_bytes.zeroize();
-
-        if let Some(ref fips_setup) = self.server_setup_fips {
-            let fips_size = std::mem::size_of_val(fips_setup);
-            tracing::debug!(
-                fips_setup_bytes_size = fips_size,
-                "CredentialStore::drop -- zeroizing serialized FIPS ServerSetup ({fips_size} bytes struct)"
-            );
-            let mut fips_bytes = fips_setup.serialize().to_vec();
-            fips_bytes.zeroize();
-        }
-
-        // Clear user records (registration blobs contain no passwords but
-        // are high-value for offline attacks)
+        // SECURITY — HONEST LIMITATION (audit P0-3):
+        //
+        // The OPRF seed and server keypair live inside `opaque-ke`'s
+        // `ServerSetup`, which does NOT implement `Zeroize`. The previous
+        // Drop impl serialized the setup into a fresh `Vec` and zeroized THAT
+        // COPY — which wiped nothing in the live struct and gave a false sense
+        // of protection. That no-op has been removed: serializing-then-wiping
+        // a copy is not memory hygiene and must not be presented as such.
+        //
+        // This crate is `#![forbid(unsafe_code)]`, so the `ServerSetup` struct
+        // memory cannot be scrubbed in place here (no `ptr::write_volatile`).
+        // The CORRECT fix is to never hold a plaintext `ServerSetup` in
+        // long-lived RAM: keep it sealed (`opaque_impl::ServerSetupHandle`,
+        // AES-256-GCM under the master KEK) and unseal transiently per request
+        // via `with_setup`, which wipes the `Zeroizing<Vec<u8>>` plaintext on
+        // every call. Wiring that handle into `CredentialStore` is tracked as
+        // a follow-up refactor (audit P1-1); until then the OPRF seed residue
+        // in freed pages after shutdown is a KNOWN, DOCUMENTED exposure — not
+        // a defended one.
+        //
+        // What we CAN and DO scrub here: the in-memory user registration
+        // records (high-value for offline attacks even though they carry no
+        // plaintext passwords).
         self.users.clear();
     }
 }

@@ -25,9 +25,16 @@ pub fn create_authentication_options(
 
 /// Verify an authentication response from the client.
 ///
-/// Validates the authenticator data structure, RP ID hash, user presence/
-/// verification flags, sign count (to detect cloned authenticators), and
-/// the assertion signature.
+/// SECURITY (audit fido P0): `expected_challenge` and `expected_origin` are
+/// mandatory. The challenge MUST be the single-use value issued by
+/// [`create_authentication_options`] for this ceremony; binding it here is
+/// what makes the assertion non-replayable, and the origin check is what
+/// makes it non-phishable. There is intentionally no overload that omits
+/// them.
+///
+/// Validates the clientDataJSON (type/challenge/origin), authenticator data
+/// structure, RP ID hash, user presence/verification flags, sign count (to
+/// detect cloned authenticators), and the assertion signature.
 ///
 /// Returns the new sign count on success so the caller can persist it via
 /// [`update_sign_count`].
@@ -35,12 +42,16 @@ pub fn verify_authentication_response(
     auth_result: &AuthenticationResult,
     stored_credential: &StoredCredential,
     expected_rp_id: &str,
+    expected_challenge: &[u8],
+    expected_origin: &str,
     require_user_verification: bool,
 ) -> Result<u32, &'static str> {
     verification::verify_authentication_response(
         auth_result,
         stored_credential,
         expected_rp_id,
+        expected_challenge,
+        expected_origin,
         require_user_verification,
     )
 }
@@ -48,16 +59,23 @@ pub fn verify_authentication_response(
 /// B7 — Verify an authentication response and lock the credential on
 /// sign-count rollback. Mutates `stored_credential` to set `cloned_flag` if
 /// a clone is detected; the caller must persist the mutation.
+///
+/// SECURITY (audit fido P0): `expected_challenge` and `expected_origin` are
+/// mandatory — see [`verify_authentication_response`].
 pub fn verify_authentication_response_with_lockout(
     auth_result: &AuthenticationResult,
     stored_credential: &mut StoredCredential,
     expected_rp_id: &str,
+    expected_challenge: &[u8],
+    expected_origin: &str,
     require_user_verification: bool,
 ) -> Result<u32, &'static str> {
     verification::verify_authentication_response_with_lockout(
         auth_result,
         stored_credential,
         expected_rp_id,
+        expected_challenge,
+        expected_origin,
         require_user_verification,
     )
 }

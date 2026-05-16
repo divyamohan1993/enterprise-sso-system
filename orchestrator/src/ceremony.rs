@@ -288,6 +288,13 @@ pub trait CeremonyPersistence: Send + Sync {
 
     /// List all active (non-terminal) ceremony IDs in the durable store.
     fn list_active_ceremonies(&self) -> Result<Vec<[u8; 32]>, String>;
+
+    /// Remove every ceremony whose `updated_at` is older than `cutoff_secs`
+    /// (a Unix timestamp). Returns the number of entries removed.
+    ///
+    /// This is the L2 half of TTL cleanup; without it, durable L2 entries
+    /// accumulate forever while only L1 is swept.
+    fn cleanup_expired(&self, cutoff_secs: i64) -> Result<usize, String>;
 }
 
 /// Database-backed ceremony persistence using SQL with parameterized queries.
@@ -406,8 +413,15 @@ impl CeremonyPersistence for DatabaseCeremonyPersistence {
     fn store_ceremony(&self, id: &[u8; 32], state: &CeremonyState) -> Result<(), String> {
         let dir = std::path::Path::new(&self.connection_url);
         if let Err(e) = std::fs::create_dir_all(dir) {
-            tracing::error!("L2 persistence: failed to create dir: {e}");
-            return Ok(());
+            // Propagate the failure: silently returning Ok here degraded
+            // write-through L2 persistence to L1-only with no operator
+            // signal, reintroducing the single-point-of-failure this layer
+            // exists to eliminate.
+            tracing::error!(
+                target: "siem",
+                "SIEM:ERROR L2 persistence: failed to create data dir: {e}"
+            );
+            return Err(format!("L2 persistence: create_dir_all failed: {e}"));
         }
 
         let record = L2Record {
@@ -510,6 +524,53 @@ impl CeremonyPersistence for DatabaseCeremonyPersistence {
         }
 
         Ok(ids)
+    }
+
+    fn cleanup_expired(&self, cutoff_secs: i64) -> Result<usize, String> {
+        let dir = std::path::Path::new(&self.connection_url);
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            // No directory yet means nothing persisted — not an error.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(format!("L2 cleanup: read_dir failed: {e}")),
+        };
+
+        let master_kek = common::sealed_keys::get_master_kek();
+        let mut removed = 0usize;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if filename_to_id(&name_str).is_none() {
+                continue;
+            }
+            let path = entry.path();
+            // A record is expired if its updated_at is older than the cutoff.
+            // A file we cannot read/decrypt/deserialize is left in place
+            // (fail safe: do not delete data we cannot reason about).
+            let expired = match std::fs::read(&path) {
+                Ok(enc) => match crypto::symmetric::decrypt(
+                    master_kek, &enc, b"ceremony-state",
+                ) {
+                    Ok(dec) => match postcard::from_bytes::<L2Record>(&dec) {
+                        Ok(rec) => (rec.updated_at as i64) < cutoff_secs,
+                        Err(_) => false,
+                    },
+                    Err(_) => false,
+                },
+                Err(_) => false,
+            };
+            if expired {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    tracing::warn!(
+                        target: "siem",
+                        "SIEM:WARN L2 cleanup: failed to remove expired ceremony file: {e}"
+                    );
+                } else {
+                    removed += 1;
+                }
+            }
+        }
+        Ok(removed)
     }
 }
 
@@ -676,12 +737,25 @@ impl DistributedCeremonyTracker {
             match self.fetch_peer_ceremonies(peer) {
                 Ok(peer_ceremonies) => {
                     for (session_id, peer_ceremony) in peer_ceremonies {
-                        // Only adopt ceremonies with higher epoch than ours
-                        if peer_ceremony.epoch > self.ceremony_epoch {
-                            if !self.inner.sessions.contains_key(&session_id) {
+                        // Conflict resolution is PER-CEREMONY, not against the
+                        // global counter. Comparing to `self.ceremony_epoch`
+                        // (a monotonically-rising counter bumped on every local
+                        // create_ceremony) made peer recovery silently stop
+                        // importing legitimate state once this node had served
+                        // any traffic. The correct rule: adopt a peer record if
+                        // we have no record for that session, or if the peer's
+                        // per-ceremony epoch is strictly higher than the epoch
+                        // of the record we already hold ("higher epoch wins").
+                        match self.inner.sessions.get(&session_id) {
+                            None => {
                                 self.inner.sessions.insert(session_id, peer_ceremony);
                                 synced += 1;
                             }
+                            Some(existing) if peer_ceremony.epoch > existing.epoch => {
+                                self.inner.sessions.insert(session_id, peer_ceremony);
+                                synced += 1;
+                            }
+                            Some(_) => { /* our record is at least as fresh */ }
                         }
                     }
                 }
@@ -741,9 +815,26 @@ impl DistributedCeremonyTracker {
         let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
         let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
 
-        // Build sync request: our epoch as 8-byte big-endian + HMAC-SHA512 tag (CNSA 2.0)
-        let mut request = Vec::with_capacity(72);
+        // Build sync request: epoch (8 BE) || unix-millis timestamp (8 BE) ||
+        // 16-byte random nonce, then an HMAC-SHA512 tag (CNSA 2.0) over all of
+        // it. The timestamp + nonce give a peer responder the material to
+        // reject replayed sync requests (freshness window + per-request
+        // uniqueness). NOTE: the peer-side responder MUST validate that the
+        // timestamp is within an acceptable skew window and that the nonce has
+        // not been seen recently; a responder that ignores them gains no
+        // replay protection. Tracked as audit orchestrator P0 #2 part (a) —
+        // the server side of this protocol is not present in this crate.
+        let now_millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let mut nonce = [0u8; 16];
+        nonce.copy_from_slice(&crypto::entropy::generate_nonce()[..16]);
+
+        let mut request = Vec::with_capacity(96);
         request.extend_from_slice(&self.ceremony_epoch.to_be_bytes());
+        request.extend_from_slice(&now_millis.to_be_bytes());
+        request.extend_from_slice(&nonce);
 
         // Compute HMAC over the request payload
         use hmac::{Hmac, Mac};
@@ -787,28 +878,65 @@ impl DistributedCeremonyTracker {
 
         // Deserialize peer ceremonies from the authenticated payload.
         // Format: repeated [16-byte session_hex_utf8 | 1-byte state_tag | 8-byte epoch_be]
+        //
+        // SECURITY: every record is validated strictly and a malformed one
+        // aborts the whole sync (fail closed). The previous loop:
+        //   * tolerated a trailing partial record (`while offset + 25 <= len`);
+        //   * substituted an all-zero session_id when `hex_to_session_id`
+        //     failed — letting a peer poison the cache under session [0;32];
+        //   * ran `from_utf8_lossy`, so non-hex bytes became U+FFFD-laced keys;
+        //   * invented a `Failed("unknown")` ceremony for any unknown state_tag.
+        // A peer is authenticated only by a cluster-wide symmetric key, so a
+        // single compromised node could exploit any of these to inject
+        // attacker-controlled sessions; reject the batch instead.
+        if payload.len() % 25 != 0 {
+            return Err(format!(
+                "peer {} sync payload is not a whole number of 25-byte records ({} bytes)",
+                peer.addr, payload.len()
+            ));
+        }
         let mut ceremonies = Vec::new();
         let mut offset = 0;
         while offset + 25 <= payload.len() {
-            let session_hex = String::from_utf8_lossy(&payload[offset..offset + 16]).to_string();
+            let raw_hex = &payload[offset..offset + 16];
+            // The session id must be exactly 16 ASCII hex characters; reject
+            // anything else rather than lossily decoding it.
+            let session_hex = match std::str::from_utf8(raw_hex) {
+                Ok(s) if s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                    s.to_string()
+                }
+                _ => {
+                    return Err(format!(
+                        "peer {} sync record has a non-hex session id", peer.addr
+                    ));
+                }
+            };
             let state_tag = payload[offset + 16];
             let epoch = u64::from_be_bytes(
-                payload[offset + 17..offset + 25].try_into().unwrap_or([0u8; 8])
+                payload[offset + 17..offset + 25]
+                    .try_into()
+                    .map_err(|_| format!("peer {} sync record truncated epoch", peer.addr))?,
             );
 
             let state = match state_tag {
                 0 => CeremonyState::PendingOpaque,
                 1 => CeremonyState::PendingTss,
                 2 => CeremonyState::Complete,
-                _ => CeremonyState::Failed("unknown".into()),
+                other => {
+                    return Err(format!(
+                        "peer {} sync record has unknown state tag {other}", peer.addr
+                    ));
+                }
             };
 
-            // Only sync non-terminal ceremonies
+            // Only sync non-terminal ceremonies.
             if !is_terminal(&state) {
-                let mut session_id = [0u8; 32];
-                if let Some(id) = hex_to_session_id(&session_hex) {
-                    session_id = id;
-                }
+                // A session id that does not decode is a hard error — never
+                // fall back to the all-zero sentinel, which collides on a
+                // single cache slot and lets a peer shadow legitimate state.
+                let session_id = hex_to_session_id(&session_hex).ok_or_else(|| {
+                    format!("peer {} sync record session id failed hex decode", peer.addr)
+                })?;
                 ceremonies.push((session_hex, CeremonySession {
                     session_id,
                     state,
@@ -854,28 +982,34 @@ impl DistributedCeremonyTracker {
     /// This ensures expired ceremonies don't accumulate in either layer,
     /// preventing unbounded growth in the database and memory leaks in L1.
     pub fn cleanup_expired_both_layers(&mut self) -> usize {
-        // Clean L1
+        // Clean L1.
         let l1_removed = self.inner.cleanup_expired();
 
-        // Clean L2 — remove ceremonies older than the timeout
-        let cutoff = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64
-            - CEREMONY_TIMEOUT_SECS;
+        // Clean L2 — remove ceremonies older than the SAME dynamic timeout
+        // used by L1 (`ceremony_timeout_secs()`), not the legacy 30s constant,
+        // so the two layers expire entries consistently.
+        let cutoff = common::secure_time::secure_now_secs_i64()
+            - ceremony_timeout_secs();
 
-        // In production, execute: DELETE FROM ceremony_state WHERE updated_at < $1
-        // using DatabaseCeremonyPersistence::cleanup_expired_sql() with bind($cutoff)
-        let _cleanup_sql = DatabaseCeremonyPersistence::cleanup_expired_sql();
-        let _cutoff = cutoff;
+        let l2_removed = match self.persistence.cleanup_expired(cutoff) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::error!(
+                    target: "siem",
+                    "SIEM:ERROR L2 TTL cleanup failed: {e}"
+                );
+                0
+            }
+        };
 
         tracing::info!(
             l1_removed = l1_removed,
+            l2_removed = l2_removed,
             cutoff_timestamp = cutoff,
             "TTL cleanup completed on both L1 cache and L2 durable store"
         );
 
-        l1_removed
+        l1_removed + l2_removed
     }
 
     /// Spawn a background task that periodically cleans both L1 and L2.
@@ -944,17 +1078,21 @@ impl CeremonySession {
     }
 
     /// Check whether this session has expired.
+    ///
+    /// Uses `common::secure_time::secure_now_secs_i64()` — the same clock
+    /// source as the `cleanup_expired` sweeps — so the cleanup task and a
+    /// concurrent `get_mut` cannot disagree about whether a session is live.
+    /// The timeout is the dynamic `ceremony_timeout_secs()`, consistent with
+    /// L1/L2 TTL cleanup.
     pub fn is_expired(&self) -> bool {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        let expired = (now - self.created_at) > CEREMONY_TIMEOUT_SECS;
+        let now = common::secure_time::secure_now_secs_i64();
+        let timeout = ceremony_timeout_secs();
+        let expired = (now - self.created_at) > timeout;
         if expired {
             tracing::warn!(
                 session_id = %short_session_hex(&self.session_id),
                 age_secs = now - self.created_at,
-                timeout_secs = CEREMONY_TIMEOUT_SECS,
+                timeout_secs = timeout,
                 "Ceremony timeout: session exceeded maximum lifetime"
             );
         }

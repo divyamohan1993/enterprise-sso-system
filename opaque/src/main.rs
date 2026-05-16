@@ -6,8 +6,13 @@
 //! and never leaves this process.
 //!
 //! Supports two modes:
-//! - **threshold** (default): 2-of-3 distributed OPAQUE via Shamir secret sharing
-//! - **single**: Legacy single-server mode (dev/test only)
+//! - **single** (default): single-server OPAQUE.
+//! - **threshold**: 2-of-3 distributed OPAQUE — **NOT production-ready**.
+//!   The threshold OPRF combiner and the cross-server key ceremony are not
+//!   correctly implemented (a 2026-04-30 audit found the XOR-of-HMACs combiner
+//!   is not a Shamir-based PRF, and no orchestrator drives the protocol
+//!   end-to-end). Threshold mode therefore refuses to start; see
+//!   `run_threshold_mode` and `opaque::threshold` for the full rationale.
 
 use opaque::store::CredentialStore;
 
@@ -41,8 +46,10 @@ async fn main() {
         Err(failures) => tracing::warn!("STIG audit had {} failures", failures.len()),
     }
 
+    // Default is single-server OPAQUE. Threshold mode is gated off (see
+    // run_threshold_mode) until the distributed OPRF construction is correct.
     let opaque_mode = std::env::var("MILNET_OPAQUE_MODE")
-        .unwrap_or_else(|_| "threshold".to_string());
+        .unwrap_or_else(|_| "single".to_string());
 
     // Spawn health check endpoint
     let health_start = std::time::Instant::now();
@@ -161,55 +168,42 @@ async fn main() {
     }
 }
 
-/// Run the OPAQUE service in threshold mode (2-of-3 distributed).
+/// Threshold mode (2-of-3 distributed OPAQUE) — **disabled, fail-closed**.
 ///
-/// Generates an OPRF master key, splits it into Shamir shares, zeroizes the
-/// master key, and starts the threshold OPAQUE server with this node's share.
+/// # Why this refuses to start
+///
+/// A 2026-04-30 security audit found threshold OPAQUE non-functional and
+/// cryptographically unsound as shipped:
+///
+/// * `opaque::threshold::combine_evaluations_for_input` XORs independent
+///   `HMAC(share_i, input)` values. That is **not** a Shamir-based threshold
+///   PRF — different server subsets produce different "OPRF outputs", so a
+///   user who registered with servers {1,2} cannot log in via {2,3}.
+/// * Each of the 3 server processes here independently called
+///   `generate_threshold_oprf_key(2,3)`, producing **three unrelated master
+///   keys**. There is no key ceremony distributing one coherent split.
+/// * No orchestrator consumes `OpaqueResponse::ThresholdPartialEval`, so the
+///   2-round threshold protocol is never actually driven end-to-end.
+///
+/// A correct fix requires a real distributed OPRF (e.g. a DH-OPRF with
+/// Lagrange-in-the-exponent over ristretto255) plus a key-distribution
+/// ceremony and an orchestrator — a multi-component subsystem that is out of
+/// scope for the current hardening pass. Per the project security posture
+/// ("fail closed, security wins"), threshold mode refuses to start rather
+/// than authenticate users against a broken construction. Run single-server
+/// mode (the default) until distributed OPAQUE is correctly implemented.
 async fn run_threshold_mode() -> Result<(), Box<dyn std::error::Error>> {
-    use opaque::threshold::{ThresholdOpaqueConfig, ThresholdOpaqueServer, generate_threshold_oprf_key};
-
-    let server_id: u8 = std::env::var("MILNET_OPAQUE_SERVER_ID")
-        .unwrap_or_else(|_| "1".to_string())
-        .parse()
-        .unwrap_or(1);
-
-    if server_id == 0 || server_id > 3 {
-        eprintln!("MILNET_OPAQUE_SERVER_ID must be 1, 2, or 3 (got {server_id})");
-        std::process::exit(1);
-    }
-
-    tracing::info!(
-        "Initializing threshold OPAQUE (2-of-3) as server {}",
-        server_id
+    tracing::error!(
+        target: "siem",
+        category = "security",
+        severity = "CRITICAL",
+        action = "opaque_threshold_mode_disabled",
+        "FATAL: MILNET_OPAQUE_MODE=threshold is disabled. The distributed \
+         OPRF construction was found unsound and non-functional end-to-end \
+         (2026-04-30 audit) and has not yet been correctly reimplemented. \
+         Refusing to start. Use MILNET_OPAQUE_MODE=single."
     );
-
-    // Generate OPRF master key and split into 3 Shamir shares.
-    // In production, shares would be pre-distributed from a key ceremony
-    // and loaded from an HSM or secure enclave — never generated at startup.
-    let keygen_result = generate_threshold_oprf_key(2, 3);
-
-    tracing::info!(
-        "OPRF key split into 3 shares (verification_key={:02x?}...)",
-        &keygen_result.verification_key[..8]
-    );
-
-    // Extract this server's share (1-indexed)
-    let my_share = keygen_result.shares[server_id as usize - 1].clone();
-
-    // The keygen_result (and its shares for other servers) will be dropped
-    // here. In production, the other shares would have been distributed to
-    // their respective servers during a key ceremony — they are never held
-    // by a single node at runtime.
-    drop(keygen_result);
-
-    let config = ThresholdOpaqueConfig {
-        threshold: 2,
-        total_servers: 3,
-        server_id,
-    };
-
-    let threshold_server = ThresholdOpaqueServer::new(config, my_share);
-
-    let store = CredentialStore::new();
-    opaque::service::run_threshold(store, server_id, threshold_server).await
+    Err("threshold OPAQUE mode is disabled (fail-closed): the distributed \
+         OPRF construction is not production-ready — use single mode"
+        .into())
 }

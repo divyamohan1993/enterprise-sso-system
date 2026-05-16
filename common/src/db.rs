@@ -744,10 +744,18 @@ pub async fn init_database(database_url: &str) -> Result<PgPool, String> {
             code_challenge VARCHAR(255),
             tier INTEGER NOT NULL,
             nonce VARCHAR(255),
+            scope TEXT,
             created_at BIGINT NOT NULL,
             consumed BOOLEAN DEFAULT FALSE
         )
     "#).execute(&pool).await.map_err(|e| format!("Failed to create authorization_codes table: {e}"))?;
+
+    // Idempotent column add: `scope` is required so a cold-cache code-exchange
+    // on a different instance reconstructs the OIDC scope granted at
+    // authorization time instead of defaulting to empty.
+    sqlx::query("ALTER TABLE authorization_codes ADD COLUMN IF NOT EXISTS scope TEXT")
+        .execute(&pool).await
+        .map_err(|e| format!("CRITICAL: authorization_codes scope column migration failed: {e}"))?;
 
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS revoked_tokens (
@@ -791,6 +799,36 @@ pub async fn init_database(database_url: &str) -> Result<PgPool, String> {
             created_at BIGINT NOT NULL
         )
     "#).execute(&pool).await.map_err(|e| format!("Failed to create fido_credentials table: {e}"))?;
+
+    // Migration: FIDO2 security-state columns (audit fido P0).
+    //
+    // The original schema persisted only credential_id/public_key/sign_count/
+    // authenticator_type, so AAGUID, the clone-detection flag, backup-eligibility/
+    // -state and the PQ attestation blob were lost on every process restart:
+    //  - clone-detection (cloned_flag) reset to false, silently unlocking a
+    //    known-cloned authenticator;
+    //  - AAGUID loaded as the all-zero sentinel, which enforce_aaguid rejects;
+    //  - pq_attestation loaded empty, so PQ-required / military mode could not
+    //    boot once any credential was persisted.
+    // These columns let PersistentCredentialStore round-trip the full security
+    // state. Idempotent ADD COLUMN IF NOT EXISTS so reruns are safe; failures
+    // are fatal because the persistence layer is unsafe without them.
+    for (col, ddl) in [
+        ("aaguid",
+         "ALTER TABLE fido_credentials ADD COLUMN IF NOT EXISTS aaguid BYTEA"),
+        ("cloned_flag",
+         "ALTER TABLE fido_credentials ADD COLUMN IF NOT EXISTS cloned_flag BOOLEAN NOT NULL DEFAULT FALSE"),
+        ("backup_eligible",
+         "ALTER TABLE fido_credentials ADD COLUMN IF NOT EXISTS backup_eligible BOOLEAN NOT NULL DEFAULT FALSE"),
+        ("backup_state",
+         "ALTER TABLE fido_credentials ADD COLUMN IF NOT EXISTS backup_state BOOLEAN NOT NULL DEFAULT FALSE"),
+        ("pq_attestation",
+         "ALTER TABLE fido_credentials ADD COLUMN IF NOT EXISTS pq_attestation BYTEA"),
+    ] {
+        sqlx::query(ddl).execute(&pool).await.map_err(|e| {
+            format!("CRITICAL: fido_credentials column migration failed for {col}: {e}")
+        })?;
+    }
 
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS key_material (

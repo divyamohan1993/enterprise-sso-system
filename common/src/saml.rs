@@ -1001,6 +1001,18 @@ impl AuthnRequest {
                 }
             };
 
+            // SECURITY (audit common P1): a legitimate SAML message carries
+            // exactly one Signature element. More than one is a hallmark of
+            // an XML-signature wrapping attack — reject before any further
+            // parsing.
+            let signature_count = count_signature_elements(xml);
+            if signature_count != 1 {
+                return Err(format!(
+                    "SAML: expected exactly 1 Signature element, found {signature_count} -- \
+                     possible signature wrapping attack"
+                ));
+            }
+
             // SECURITY: Validate ds:Reference URI to prevent XML signature wrapping attacks.
             let reference_uris = extract_reference_uris(xml);
             if reference_uris.len() != 1 {
@@ -4345,22 +4357,44 @@ fn extract_digest_value_from_signed_info(signed_info: &str) -> Option<String> {
 /// Per the XML DSIG spec, enveloped signature transforms require removing
 /// the Signature element before computing the digest over the parent element.
 fn strip_signature_element(xml: &str) -> String {
-    // Try ds: prefixed first, then unprefixed.
-    for (start_tag, end_tag) in &[
-        ("<ds:Signature", "</ds:Signature>"),
-        ("<Signature", "</Signature>"),
-    ] {
-        if let Some(sig_start) = xml.find(start_tag) {
-            if let Some(sig_end_offset) = xml[sig_start..].find(end_tag) {
-                let sig_end = sig_start + sig_end_offset + end_tag.len();
-                let mut result = String::with_capacity(xml.len());
-                result.push_str(&xml[..sig_start]);
-                result.push_str(&xml[sig_end..]);
-                return result;
+    // SECURITY (audit common P1): remove EVERY `<Signature>` element, not
+    // just the first. The previous code stripped only the first match, so an
+    // attacker could inject a second `<ds:Signature>` whose `ds:Reference`
+    // URI matches `expected_ref` and survive into the verified document —
+    // an XML-signature wrapping vector. Loop until no Signature element
+    // remains.
+    let mut result = xml.to_string();
+    loop {
+        let mut removed_any = false;
+        for (start_tag, end_tag) in &[
+            ("<ds:Signature", "</ds:Signature>"),
+            ("<Signature", "</Signature>"),
+        ] {
+            if let Some(sig_start) = result.find(start_tag) {
+                if let Some(sig_end_offset) = result[sig_start..].find(end_tag) {
+                    let sig_end = sig_start + sig_end_offset + end_tag.len();
+                    let mut next = String::with_capacity(result.len());
+                    next.push_str(&result[..sig_start]);
+                    next.push_str(&result[sig_end..]);
+                    result = next;
+                    removed_any = true;
+                }
             }
         }
+        if !removed_any {
+            break;
+        }
     }
-    xml.to_string()
+    result
+}
+
+/// Count `<Signature>` elements (ds:-prefixed or unprefixed) in the document.
+///
+/// A legitimate SAML message carries exactly one signature; more than one is
+/// a hallmark of an XML-signature wrapping attack and callers should reject
+/// such a document outright.
+pub(crate) fn count_signature_elements(xml: &str) -> usize {
+    xml.matches("<ds:Signature").count() + xml.matches("<Signature").count()
 }
 
 /// Extract the raw `<ds:SignedInfo>...</ds:SignedInfo>` block bytes from XML.

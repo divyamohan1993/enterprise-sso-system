@@ -708,14 +708,24 @@ impl ThreatIntelManager {
         let mut any_hit = false;
 
         for feed_state in state.values() {
+            // The bloom filter is only a fast pre-filter and has a non-zero
+            // false-positive rate (~1% at the configured bits/elements
+            // ratio). The `ip_scores` map is the authoritative source, so a
+            // bloom hit MUST be confirmed by an exact-map lookup before it
+            // contributes any reputation. Treating an unconfirmed bloom hit
+            // as 0.8 would silently boost ~1% of all clean traffic toward
+            // Elevated/High classification — a false positive by design.
             if feed_state.bloom.contains(ip.as_bytes()) {
-                let score = feed_state
-                    .ip_scores
-                    .get(ip)
-                    .copied()
-                    .unwrap_or(0.8); // Bloom hit without exact match => high suspicion
-                product_clean *= 1.0 - score;
-                any_hit = true;
+                if let Some(&score) = feed_state.ip_scores.get(ip) {
+                    product_clean *= 1.0 - score;
+                    any_hit = true;
+                } else {
+                    tracing::debug!(
+                        target: "siem",
+                        ip = %ip,
+                        "threat_intel: bloom false-positive (no exact-map entry) — ignored"
+                    );
+                }
             }
         }
 

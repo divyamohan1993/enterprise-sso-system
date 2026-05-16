@@ -20,43 +20,52 @@ pub type DpopVerifyingKey = VerifyingKey<MlDsa87>;
 pub type DpopSignature = ml_dsa::Signature<MlDsa87>;
 
 /// A guarded wrapper around an ML-DSA-87 signing key that ensures the key
-/// material is zeroized when dropped and optionally memory-locked to prevent
-/// swap exposure.
+/// material is zeroized when dropped and memory-locked to prevent swap
+/// exposure.
 ///
-/// A sentinel copy of the key seed is stored in a `SecretVec` (mlocked +
-/// canary-protected) to ensure the key material cannot be swapped to disk.
-/// On drop, the sentinel is zeroized and munlocked by `SecretVec`, and the
-/// parsed key is overwritten with a deterministic dummy.
+/// SECURITY (audit P1): the signing key is held in a `Box` so it lives at a
+/// **stable heap address**. The previous implementation mlocked `&self.key`
+/// inside `new()` before the `GuardedSigningKey` was returned by value — the
+/// move memcpy'd the struct into the caller's slot, so the mlock covered the
+/// constructor's now-dead stack frame, not the live key, and `Drop` munlocked
+/// an address that was never locked. Boxing fixes this: moving a
+/// `GuardedSigningKey` moves only the `Box` pointer, never the heap allocation
+/// the key occupies, so the mlock'd region stays valid for the key's lifetime.
 pub struct GuardedSigningKey {
-    /// The parsed ML-DSA-87 signing key used for actual signing operations.
-    key: DpopSigningKey,
-    /// Memory-locked sentinel — ensures the OS mlock covers the key's
-    /// memory pages and the material is zeroized on drop.
-    _locked_sentinel: Option<crate::memguard::SecretVec>,
+    /// The parsed ML-DSA-87 signing key, heap-pinned via `Box` so its address
+    /// is stable across moves of this struct. mlocked in `new`, munlocked in
+    /// `Drop` — at the same (stable) address.
+    key: Box<DpopSigningKey>,
 }
 
 impl GuardedSigningKey {
     /// Wrap an existing `DpopSigningKey` with secure memory protections.
     ///
-    /// Creates a locked sentinel buffer to keep the process pages mlocked,
-    /// and retains the original key for signing.  If mlock fails in a
-    /// non-production environment, the key is still usable but a warning
-    /// is emitted.
+    /// Boxes the key (stable address), then mlocks the heap allocation so the
+    /// key material cannot be swapped to disk. If mlock fails in a
+    /// non-production environment, the key is still usable but a warning is
+    /// emitted; in military mode the failure is recorded.
     pub fn new(key: DpopSigningKey) -> Self {
-        let mut sentinel = vec![0u8; 64];
-        let _ = getrandom::getrandom(&mut sentinel);
-        let locked = crate::memguard::SecretVec::new(sentinel).ok();
-        let guarded = Self { key, _locked_sentinel: locked };
-        // Best-effort mlock of the actual ML-DSA-87 signing key struct memory.
-        let ptr = &guarded.key as *const DpopSigningKey as *const u8;
+        // Box first so the key has its final, stable heap address before mlock.
+        let key = Box::new(key);
+        let ptr = key.as_ref() as *const DpopSigningKey as *const u8;
         let len = std::mem::size_of::<DpopSigningKey>();
         #[allow(unsafe_code)]
         unsafe {
             if libc::mlock(ptr as *const libc::c_void, len) == 0 {
                 libc::madvise(ptr as *mut libc::c_void, len, libc::MADV_DONTDUMP);
+            } else {
+                crate::memguard::record_mlock_failure();
+                let errno = *libc::__errno_location();
+                tracing::warn!(
+                    errno = errno,
+                    len = len,
+                    "mlock failed for DPoP signing key — key remains usable but \
+                     may be swappable"
+                );
             }
         }
-        guarded
+        Self { key }
     }
 
     /// Borrow the inner signing key for use in signing operations.
@@ -67,11 +76,13 @@ impl GuardedSigningKey {
 
 impl Drop for GuardedSigningKey {
     fn drop(&mut self) {
-        // munlock signing key region before overwriting. We MUST check the
-        // return code: munlock(2) can fail with EINVAL/EAGAIN/EPERM, and a
-        // silent failure leaves the page locked (or never-locked) which can
-        // mask earlier mlock failures. Under MILNET_MILITARY_DEPLOYMENT, abort.
-        let ptr = &self.key as *const DpopSigningKey as *const u8;
+        // munlock the signing key region before overwriting. The address is
+        // the Box's heap allocation — the SAME address mlock'd in `new`,
+        // because boxing keeps it stable across moves (audit P1). We MUST
+        // check the return code: munlock(2) can fail with EINVAL/EAGAIN/EPERM,
+        // and a silent failure leaves the page locked. Under
+        // MILNET_MILITARY_DEPLOYMENT, abort.
+        let ptr = self.key.as_ref() as *const DpopSigningKey as *const u8;
         let len = std::mem::size_of::<DpopSigningKey>();
         #[allow(unsafe_code)]
         let rc = unsafe { libc::munlock(ptr as *const libc::c_void, len) };
@@ -97,10 +108,13 @@ impl Drop for GuardedSigningKey {
                 std::process::abort();
             }
         }
-        // Overwrite with deterministic dummy.
+        // Overwrite the boxed key material in place with a deterministic
+        // dummy before the heap allocation is freed. Writing through the
+        // `Box` (`*self.key`) scrubs the actual mlocked allocation, not a
+        // copy.
         let zero_seed = [0u8; 32];
         let dummy_kp = MlDsa87::from_seed(&zero_seed.into());
-        self.key = dummy_kp.signing_key().clone();
+        *self.key = dummy_kp.signing_key().clone();
     }
 }
 

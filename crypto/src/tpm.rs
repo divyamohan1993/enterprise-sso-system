@@ -175,6 +175,11 @@ impl PcrSelection {
 
 /// Header magic for TPM-sealed blobs.
 const TPM_SEALED_MAGIC: &[u8; 4] = b"TPM2";
+/// Magic prefix for the envelope-encryption wire format produced by
+/// [`TpmContext::seal_large_to_pcrs`]. Distinct from [`TPM_SEALED_MAGIC`] so
+/// that [`TpmContext::unseal_from_pcrs`] can dispatch on payload format
+/// instead of silently mis-parsing a large blob as a direct one.
+const TPM_ENVELOPE_MAGIC: &[u8; 4] = b"TPME";
 /// Current sealed blob format version.
 const TPM_SEALED_VERSION: u8 = 1;
 
@@ -473,8 +478,16 @@ impl Tpm2Context {
         // 4. Zeroize the plaintext AES key
         aes_key.zeroize();
 
-        // 5. Assemble: [sealed_key_len (4B)] [sealed_key] [nonce (12B)] [ciphertext]
+        // 5. Assemble the envelope wire format:
+        //    [magic "TPME" (4B)] [ver (1B)] [sealed_key_len (4B)] [sealed_key]
+        //    [nonce (12B)] [ciphertext]
+        //
+        // The magic + version prefix lets `unseal_from_pcrs` distinguish this
+        // format from a direct `SealedBlob` ("TPM2") and route accordingly,
+        // instead of failing to decrypt large payloads silently.
         let mut out = Vec::new();
+        out.extend_from_slice(TPM_ENVELOPE_MAGIC);
+        out.push(TPM_SEALED_VERSION);
         out.extend_from_slice(&(sealed_key.len() as u32).to_be_bytes());
         out.extend_from_slice(&sealed_key);
         out.extend_from_slice(&envelope_nonce);
@@ -484,6 +497,11 @@ impl Tpm2Context {
 
     /// Unseal data previously sealed with [`seal_to_pcrs`](Self::seal_to_pcrs).
     ///
+    /// Handles both wire formats transparently: the direct `SealedBlob`
+    /// (magic `"TPM2"`, payloads ≤ 128 bytes) and the envelope format
+    /// (magic `"TPME"`, larger payloads). Dispatch is on the 4-byte magic
+    /// prefix so a large blob is never mis-parsed as a direct one.
+    ///
     /// Fails if the PCR values have changed since sealing (indicating platform
     /// state has been modified — firmware update, OS change, etc.).
     pub fn unseal_from_pcrs(&self, sealed: &[u8]) -> Result<Vec<u8>, TpmError> {
@@ -491,6 +509,12 @@ impl Tpm2Context {
             return Err(TpmError::ContextInitFailed(
                 "TPM context not initialized".into(),
             ));
+        }
+
+        // Dispatch on the magic prefix. A large (envelope) payload begins with
+        // "TPME"; a direct sealed blob begins with "TPM2".
+        if sealed.len() >= 4 && &sealed[0..4] == TPM_ENVELOPE_MAGIC {
+            return self.unseal_large_from_pcrs(sealed);
         }
 
         let blob = SealedBlob::from_bytes(sealed)?;
@@ -532,6 +556,80 @@ impl Tpm2Context {
         seal_key.zeroize();
 
         Ok(plaintext)
+    }
+
+    /// Unseal a large payload sealed with
+    /// [`seal_large_to_pcrs`](Self::seal_large_to_pcrs) (envelope format).
+    ///
+    /// Wire format (must begin with [`TPM_ENVELOPE_MAGIC`]):
+    /// ```text
+    /// [magic "TPME" (4B)] [ver (1B)] [sealed_key_len (4B)] [sealed_key]
+    /// [nonce (12B)] [ciphertext]
+    /// ```
+    ///
+    /// Recovers the TPM-bound AES-256 envelope key via [`Self::unseal_from_pcrs`]
+    /// (so PCR-state binding is enforced for the envelope key), then decrypts
+    /// the payload with AES-256-GCM. Fails closed on any length, version, or
+    /// authentication-tag mismatch.
+    fn unseal_large_from_pcrs(&self, sealed: &[u8]) -> Result<Vec<u8>, TpmError> {
+        // Minimum: 4 (magic) + 1 (ver) + 4 (key_len) + 0 (key) + 12 (nonce) + 16 (tag).
+        const ENVELOPE_MIN_LEN: usize = 4 + 1 + 4 + 12 + 16;
+        if sealed.len() < ENVELOPE_MIN_LEN {
+            return Err(TpmError::MalformedBlob);
+        }
+        if &sealed[0..4] != TPM_ENVELOPE_MAGIC {
+            return Err(TpmError::MalformedBlob);
+        }
+        if sealed[4] != TPM_SEALED_VERSION {
+            return Err(TpmError::MalformedBlob);
+        }
+
+        let sealed_key_len = u32::from_be_bytes(
+            sealed[5..9].try_into().map_err(|_| TpmError::MalformedBlob)?,
+        ) as usize;
+
+        // Layout bounds: magic(4) + ver(1) + len(4) + sealed_key + nonce(12) + >=tag(16).
+        let key_start: usize = 9;
+        let key_end = key_start
+            .checked_add(sealed_key_len)
+            .ok_or(TpmError::MalformedBlob)?;
+        let nonce_end = key_end.checked_add(12).ok_or(TpmError::MalformedBlob)?;
+        // Need at least the 16-byte GCM tag after the nonce.
+        if sealed.len() < nonce_end + 16 {
+            return Err(TpmError::MalformedBlob);
+        }
+
+        let sealed_key_blob = &sealed[key_start..key_end];
+        let envelope_nonce = &sealed[key_end..nonce_end];
+        let ciphertext = &sealed[nonce_end..];
+
+        // 1. Recover the TPM-bound AES-256 envelope key (PCR binding enforced here).
+        let mut aes_key = self.unseal_from_pcrs(sealed_key_blob)?;
+        if aes_key.len() != 32 {
+            aes_key.zeroize();
+            return Err(TpmError::MalformedBlob);
+        }
+
+        // 2. Decrypt the payload with AES-256-GCM under the envelope key.
+        let cipher = match Aes256Gcm::new_from_slice(&aes_key) {
+            Ok(c) => c,
+            Err(e) => {
+                aes_key.zeroize();
+                return Err(TpmError::UnsealFailed(format!("AES init: {e}")));
+            }
+        };
+        let plaintext = cipher
+            .decrypt(Nonce::from_slice(envelope_nonce), ciphertext)
+            .map_err(|_| {
+                TpmError::UnsealFailed(
+                    "AES-GCM decryption failed (PCR state may have changed or blob corrupted)"
+                        .into(),
+                )
+            });
+
+        // 3. Zeroize the recovered envelope key regardless of outcome.
+        aes_key.zeroize();
+        plaintext
     }
 
     /// Reconstruct a `PcrSelection` from a 3-byte bitmask.
@@ -1049,19 +1147,46 @@ mod tests {
     #[test]
     fn sim_seal_large_envelope_roundtrip() {
         let ctx = open_sim_context(&[0]);
-        // 256 bytes — exceeds the 128-byte direct seal limit
+        // 256 bytes — exceeds the 128-byte direct seal limit, so seal_to_pcrs
+        // routes through the envelope path.
         let big_payload = vec![0x42u8; 256];
         let sealed = ctx.seal_to_pcrs(&big_payload, None).unwrap();
 
-        // The envelope format is different from a simple SealedBlob, so
-        // unseal_from_pcrs won't work directly. We verify the sealed output
-        // is non-empty and contains the inner sealed key blob.
-        assert!(!sealed.is_empty());
-        // First 4 bytes = sealed_key_len
-        let key_len =
-            u32::from_be_bytes(sealed[0..4].try_into().unwrap()) as usize;
-        assert!(key_len > 0);
-        assert!(sealed.len() > 4 + key_len + 12); // key + nonce + ciphertext
+        // Envelope format: starts with the "TPME" magic + version byte.
+        assert_eq!(&sealed[0..4], b"TPME");
+        assert_eq!(sealed[4], 1);
+
+        // unseal_from_pcrs dispatches on the magic and decrypts the envelope.
+        let recovered = ctx
+            .unseal_from_pcrs(&sealed)
+            .expect("large payload must round-trip through the envelope path");
+        assert_eq!(recovered, big_payload);
+    }
+
+    #[test]
+    fn sim_seal_large_unseal_fails_after_pcr_change() {
+        let ctx = open_sim_context(&[0]);
+        let big_payload = vec![0x7Eu8; 300];
+        let sealed = ctx.seal_to_pcrs(&big_payload, None).unwrap();
+
+        // Mutating a bound PCR must break unseal of the envelope key (fail-closed).
+        ctx.pcr_extend(0, &[0x99u8; 32]).unwrap();
+        assert!(
+            ctx.unseal_from_pcrs(&sealed).is_err(),
+            "envelope unseal must fail once a bound PCR has changed"
+        );
+    }
+
+    #[test]
+    fn sim_seal_large_unseal_rejects_truncated_envelope() {
+        let ctx = open_sim_context(&[0]);
+        let sealed = ctx.seal_to_pcrs(&vec![0x11u8; 200], None).unwrap();
+        // Truncate the ciphertext: must fail closed, not panic.
+        let truncated = &sealed[..sealed.len() - 8];
+        assert!(matches!(
+            ctx.unseal_from_pcrs(truncated),
+            Err(TpmError::MalformedBlob) | Err(TpmError::UnsealFailed(_))
+        ));
     }
 
     #[test]

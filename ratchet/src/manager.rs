@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::RwLock;
 use uuid::Uuid;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::chain::RatchetChain;
 
@@ -582,14 +582,18 @@ impl PersistentSessionManager {
         };
         let mut loaded = 0usize;
         for (sid, ep, enc, _, _) in rows {
-            let ck = decrypt_chain_key_uuid(&self.kek, &enc, &sid).map_err(|e| {
-                tracing::error!(
-                    session_id = %sid,
-                    "SIEM:CRITICAL failed to decrypt chain key during DB load: {e}"
-                );
-                format!("decrypt chain key for {sid}: {e}")
-            })?;
-            let ch = RatchetChain::from_persisted(ck, ep as u64)?;
+            // Zeroizing: the recovered plaintext chain key is scrubbed on drop;
+            // `from_persisted` takes its own copy by value.
+            let ck = Zeroizing::new(
+                decrypt_chain_key_uuid(&self.kek, &enc, &sid).map_err(|e| {
+                    tracing::error!(
+                        session_id = %sid,
+                        "SIEM:CRITICAL failed to decrypt chain key during DB load: {e}"
+                    );
+                    format!("decrypt chain key for {sid}: {e}")
+                })?,
+            );
+            let ch = RatchetChain::from_persisted(*ck, ep as u64)?;
             // Epoch rollback detection: if this session is already in memory
             // (e.g. from a prior partial load), reject if the DB epoch is older.
             if let Some(ex) = ss.get(&sid) {
@@ -621,14 +625,17 @@ impl PersistentSessionManager {
                     poisoned.into_inner()
                 }
             };
-            sessions
-                .get(&sid)
-                .ok_or_else(|| "session just created but not found".to_string())?
-                .current_key()
-                .map_err(|e| {
-                    tracing::error!("ratchet current_key failed for session {sid}: {e}");
-                    e.to_string()
-                })?
+            // Zeroizing: plaintext chain key, scrubbed on drop.
+            Zeroizing::new(
+                sessions
+                    .get(&sid)
+                    .ok_or_else(|| "session just created but not found".to_string())?
+                    .current_key()
+                    .map_err(|e| {
+                        tracing::error!("ratchet current_key failed for session {sid}: {e}");
+                        e.to_string()
+                    })?,
+            )
         };
         let enc = encrypt_chain_key_uuid(&self.kek, &ck, &sid)?;
         let now = now_us();
@@ -689,7 +696,9 @@ impl PersistentSessionManager {
             let chain = sessions
                 .get(sid)
                 .ok_or_else(|| "session not found".to_string())?;
-            let key = chain.current_key().map_err(|e| e.to_string())?;
+            // Wrap the raw chain key in Zeroizing: this snapshot lives on the
+            // stack across the DB round-trip below and must be scrubbed on drop.
+            let key = Zeroizing::new(chain.current_key().map_err(|e| e.to_string())?);
             let epoch = chain.epoch();
             (key, epoch)
         };
@@ -706,11 +715,14 @@ impl PersistentSessionManager {
                     poisoned.into_inner()
                 }
             };
-            sessions
-                .get(sid)
-                .ok_or_else(|| "session lost after advance".to_string())?
-                .current_key()
-                .map_err(|e| e.to_string())?
+            // Zeroizing: plaintext chain key, scrubbed on drop.
+            Zeroizing::new(
+                sessions
+                    .get(sid)
+                    .ok_or_else(|| "session lost after advance".to_string())?
+                    .current_key()
+                    .map_err(|e| e.to_string())?,
+            )
         };
         let enc = encrypt_chain_key_uuid(&self.kek, &new_ck, sid)?;
 
@@ -760,7 +772,7 @@ impl PersistentSessionManager {
     /// Replaces the current chain with a fresh `RatchetChain::from_persisted`
     /// reconstructed from the snapshot. If reconstruction fails, the session
     /// is destroyed entirely (fail-closed).
-    fn rollback_session(&self, sid: &Uuid, chain_key: [u8; 64], epoch: u64) {
+    fn rollback_session(&self, sid: &Uuid, chain_key: Zeroizing<[u8; 64]>, epoch: u64) {
         let mut sessions = match self.memory.sessions.write() {
             Ok(guard) => guard,
             Err(poisoned) => {
@@ -768,7 +780,9 @@ impl PersistentSessionManager {
                 poisoned.into_inner()
             }
         };
-        match RatchetChain::from_persisted(chain_key, epoch) {
+        // `from_persisted` takes the key by value; deref a copy into it. The
+        // `chain_key` Zeroizing wrapper scrubs the snapshot copy on drop.
+        match RatchetChain::from_persisted(*chain_key, epoch) {
             Ok(restored) => {
                 sessions.insert(*sid, restored);
                 tracing::warn!(

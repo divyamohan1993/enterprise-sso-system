@@ -412,18 +412,28 @@ fn verify_token_core(
         ));
     }
 
-    // 4b. Verify ceremony binding if present.
-    //     ceremony_id is set (non-zero) — verify it matches the expected ceremony.
-    //     This prevents tokens from being moved between ceremonies.
-    //     If no expected_ceremony_id is supplied by the caller, the check is
-    //     skipped (backward-compatible). Once all callers supply the expected ID,
-    //     the `None` path becomes unreachable in production.
+    // 4b. Verify ceremony binding — authoritative, fail-closed.
+    //     A non-zero `ceremony_id` means the token was deliberately bound to a
+    //     specific ceremony and MUST NOT be honoured by a verifier that cannot
+    //     prove it knows that ceremony. If the caller supplies `None` for a
+    //     ceremony-bound token, the binding cannot be checked, so we reject
+    //     rather than silently accept (a skipped check is an accepted token).
+    //     Tokens with an all-zero `ceremony_id` are not ceremony-bound and pass.
     let has_ceremony = !crypto::ct::ct_eq(&token.claims.ceremony_id, &[0u8; 32]);
     if has_ceremony {
-        if let Some(expected_ceremony) = expected_ceremony_id {
-            if !crypto::ct::ct_eq(&token.claims.ceremony_id, expected_ceremony) {
+        match expected_ceremony_id {
+            Some(expected_ceremony) => {
+                if !crypto::ct::ct_eq(&token.claims.ceremony_id, expected_ceremony) {
+                    return Err(MilnetError::CryptoVerification(
+                        "token ceremony binding mismatch — token bound to different ceremony".into(),
+                    ));
+                }
+            }
+            None => {
                 return Err(MilnetError::CryptoVerification(
-                    "token ceremony binding mismatch — token bound to different ceremony".into(),
+                    "token is ceremony-bound but verifier was not given the expected \
+                     ceremony id — cannot honour binding"
+                        .into(),
                 ));
             }
         }
@@ -516,13 +526,18 @@ pub fn verify_token_full(
 ) -> Result<TokenClaims, MilnetError> {
     // 1. Fail fast: check revocation
     if revocation_list.is_revoked(&token.claims.token_id) {
+        // SECURITY: the token's `sub` is NOT yet signature-verified here, so it
+        // is attacker-controlled. Do not place it in `user_ids` (which downstream
+        // consumers treat as authenticated principals). Record it only as a
+        // clearly-tagged unverified claim so a forged token cannot frame an
+        // arbitrary UUID with an "AuthFailure" event in the Merkle-anchored log.
         common::audit_bridge::buffer_audit_entry(
             common::audit_bridge::create_audit_entry(
                 common::types::AuditEventType::AuthFailure,
-                vec![token.claims.sub],
+                Vec::new(),
                 Vec::new(),
                 None,
-                None,
+                Some(format!("unverified-claimed-sub:{}", token.claims.sub)),
             ),
         );
         return Err(MilnetError::CryptoVerification(
@@ -532,13 +547,15 @@ pub fn verify_token_full(
     // 2. Full signature + DPoP verification
     let result = verify_token_inner(token, public_key_package, pq_verifying_key, client_dpop_key);
     if result.is_err() {
+        // SECURITY: signature verification failed — `sub` is unverified and
+        // attacker-controlled. Same handling as the revocation branch above.
         common::audit_bridge::buffer_audit_entry(
             common::audit_bridge::create_audit_entry(
                 common::types::AuditEventType::AuthFailure,
-                vec![token.claims.sub],
+                Vec::new(),
                 Vec::new(),
                 None,
-                None,
+                Some(format!("unverified-claimed-sub:{}", token.claims.sub)),
             ),
         );
     }
@@ -669,7 +686,7 @@ pub fn verify_token_with_ratchet(
     ratchet_key: &[u8; 64],
     current_epoch: u64,
 ) -> Result<TokenClaims, MilnetError> {
-    verify_token_with_ratchet_inner(token, public_key_package, pq_verifying_key, ratchet_key, current_epoch, None)
+    verify_token_with_ratchet_inner(token, public_key_package, pq_verifying_key, ratchet_key, current_epoch, None, None)
 }
 
 /// Verify a token's signature, claims, ratchet tag, AND DPoP binding.
@@ -681,7 +698,33 @@ pub fn verify_token_with_ratchet_bound(
     current_epoch: u64,
     client_dpop_key: &[u8],
 ) -> Result<TokenClaims, MilnetError> {
-    verify_token_with_ratchet_inner(token, public_key_package, pq_verifying_key, ratchet_key, current_epoch, Some(client_dpop_key))
+    verify_token_with_ratchet_inner(token, public_key_package, pq_verifying_key, ratchet_key, current_epoch, Some(client_dpop_key), None)
+}
+
+/// Verify a token's signature, claims, ratchet tag, DPoP binding, AND
+/// ceremony binding.
+///
+/// Use this when the token may be ceremony-bound: ceremony binding is
+/// authoritative (a ceremony-bound token verified without the expected
+/// ceremony id is rejected fail-closed by `verify_token_core`).
+pub fn verify_token_with_ratchet_ceremony_bound(
+    token: &Token,
+    public_key_package: &PublicKeyPackage,
+    pq_verifying_key: &PqVerifyingKey,
+    ratchet_key: &[u8; 64],
+    current_epoch: u64,
+    client_dpop_key: &[u8],
+    expected_ceremony_id: &[u8; 32],
+) -> Result<TokenClaims, MilnetError> {
+    verify_token_with_ratchet_inner(
+        token,
+        public_key_package,
+        pq_verifying_key,
+        ratchet_key,
+        current_epoch,
+        Some(client_dpop_key),
+        Some(expected_ceremony_id),
+    )
 }
 
 fn verify_token_with_ratchet_inner(
@@ -691,9 +734,10 @@ fn verify_token_with_ratchet_inner(
     ratchet_key: &[u8; 64],
     current_epoch: u64,
     client_dpop_key: Option<&[u8]>,
+    expected_ceremony_id: Option<&[u8; 32]>,
 ) -> Result<TokenClaims, MilnetError> {
     // 1. Do all existing checks (version, expiry, DPoP, ceremony binding, FROST + PQ signature, tier)
-    let claims = verify_token_core(token, public_key_package, pq_verifying_key, client_dpop_key, None)?;
+    let claims = verify_token_core(token, public_key_package, pq_verifying_key, client_dpop_key, expected_ceremony_id)?;
 
     // 2. Check ratchet epoch is within +/-3 window
     let epoch_diff = token.claims.ratchet_epoch.abs_diff(current_epoch);

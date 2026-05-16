@@ -6,7 +6,7 @@
 use common::types::{TokenClaims, Token, TokenHeader};
 use crypto::pq_sign::generate_pq_keypair;
 use crypto::threshold::dkg;
-use orchestrator::ceremony::{CeremonySession, CEREMONY_TIMEOUT_SECS};
+use orchestrator::ceremony::{ceremony_timeout_secs, CeremonySession};
 use ratchet::chain::RatchetChain;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tss::distributed::distribute_shares;
@@ -41,6 +41,20 @@ fn run_with_large_stack<F: FnOnce() + Send + 'static>(f: F) {
         .unwrap();
 }
 
+/// Distributed token building reaches `common::sealed_keys::load_master_kek()`
+/// (via the TSS nonce-seal / WAL-integrity KDF), which requires `MILNET_MASTER_KEK`
+/// or it terminates the process. Tests that build tokens must provide a synthetic
+/// KEK before the first signing call. The KEK is read and cached process-wide
+/// exactly once, so calling this from every token test is idempotent and
+/// order-independent.
+fn ensure_master_kek() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        std::env::set_var("MILNET_MASTER_KEK", "ab".repeat(32));
+    });
+}
+
 // ---------------------------------------------------------------------------
 // 1. Expired token is rejected
 // ---------------------------------------------------------------------------
@@ -49,6 +63,7 @@ fn run_with_large_stack<F: FnOnce() + Send + 'static>(f: F) {
 /// rejects it with an expiry error.
 #[test]
 fn test_token_expired_rejected() {
+    ensure_master_kek();
     run_with_large_stack(|| {
         let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
         let group_key = dkg_result.group.public_key_package.clone();
@@ -94,6 +109,7 @@ fn test_token_expired_rejected() {
 /// `verify_token` raises a concern (either error or detectable violation).
 #[test]
 fn test_token_future_iat_suspicious() {
+    ensure_master_kek();
     run_with_large_stack(|| {
         let mut dkg_result = dkg(5, 3).expect("DKG ceremony failed");
         let group_key = dkg_result.group.public_key_package.clone();
@@ -166,7 +182,7 @@ fn test_ratchet_epoch_bounds() {
 // ---------------------------------------------------------------------------
 
 /// Create a `CeremonySession`, simulate expiry by checking a session whose
-/// `created_at` is set to `CEREMONY_TIMEOUT_SECS + 1` seconds in the past.
+/// `created_at` is set past the dynamic `ceremony_timeout_secs()` window.
 #[test]
 fn test_ceremony_session_timeout() {
     // A fresh session should not be expired.
@@ -174,14 +190,14 @@ fn test_ceremony_session_timeout() {
     let fresh = CeremonySession::new(session_id);
     assert!(!fresh.is_expired(), "brand-new ceremony session must not be expired");
 
-    // Simulate a session that was created more than CEREMONY_TIMEOUT_SECS ago
-    // by directly setting the created_at field (which is public).
+    // `is_expired()` uses the dynamic `ceremony_timeout_secs()` (token-lifetime
+    // derived), not the legacy 30s constant — the test must use the same value.
+    let timeout = ceremony_timeout_secs();
     let mut old = CeremonySession::new(session_id);
-    // Set created_at to more than the timeout in the past.
-    old.created_at = now_secs() - (CEREMONY_TIMEOUT_SECS + 1);
+    // Set created_at past the timeout window (created_at is a public field).
+    old.created_at = now_secs() - (timeout + 1);
     assert!(
         old.is_expired(),
-        "ceremony session older than {}s must be expired",
-        CEREMONY_TIMEOUT_SECS
+        "ceremony session older than {timeout}s must be expired"
     );
 }

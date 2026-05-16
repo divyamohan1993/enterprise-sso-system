@@ -307,13 +307,17 @@ fn duress_pin_constant_time_verification() {
     assert!(ct_eq(&a, &b), "equal arrays must compare true");
     assert!(!ct_eq(&a, &c), "different arrays must compare false");
 
-    // Run multiple iterations to check that timing does not leak the path
-    // (This is a structural check; true timing analysis requires hardware
-    // counters which are unavailable in CI.)
-    for _ in 0..100 {
-        let _ = config.verify_pin(normal_pin);
-        let _ = config.verify_pin(duress_pin);
-        let _ = config.verify_pin(b"invalid_attempt");
+    // Run a few iterations to check that all paths stay correct under
+    // repetition. This is a structural check only; true timing analysis
+    // requires hardware counters unavailable in CI. The iteration count is
+    // deliberately small because `verify_pin` now uses memory-hard Argon2id
+    // (v3 PIN hashing) — constant-time behaviour comes from Argon2id's
+    // data-independent access pattern plus `subtle::ConstantTimeEq`, not
+    // from sample volume.
+    for _ in 0..5 {
+        assert_eq!(config.verify_pin(normal_pin), PinVerification::Normal);
+        assert_eq!(config.verify_pin(duress_pin), PinVerification::Duress);
+        assert_eq!(config.verify_pin(b"invalid_attempt"), PinVerification::Invalid);
     }
 }
 

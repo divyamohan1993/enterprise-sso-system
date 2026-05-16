@@ -54,6 +54,18 @@ pub fn derive_network_id(ip: IpAddr) -> Option<String> {
     asn.autonomous_system_number.map(|n| format!("AS{n}"))
 }
 
+/// Whether F2 verification should fail closed when the source IP has no
+/// record in the GeoLite2-ASN database. Defaults to `false` (fail open with a
+/// SIEM warning) for compatibility with partial DB coverage; set
+/// `MILNET_ASN_FAIL_CLOSED=1` in high-assurance / military deployments so an
+/// un-derivable IP cannot carry an attacker-declared `network_id`.
+fn asn_fail_closed() -> bool {
+    matches!(
+        std::env::var("MILNET_ASN_FAIL_CLOSED").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    )
+}
+
 /// Verify the client-declared `network_id` against the server-derived ASN.
 /// Returns `Ok(())` if consistent or if the feature is disabled.
 /// Returns `Err` with a brief reason otherwise — caller must hard-reject.
@@ -81,6 +93,28 @@ pub fn verify_network_id(ip: Option<IpAddr>, declared: Option<&str>) -> Result<(
                 Err("network_id mismatch with server-derived ASN")
             }
         }
-        None => Ok(()),
+        // The source IP is not in the ASN database, so the client-declared
+        // `network_id` cannot be cross-checked. This must never be silently
+        // accepted: fail closed when configured, otherwise emit a SIEM event
+        // so the verification gap is visible rather than invisible.
+        None => {
+            if asn_fail_closed() {
+                tracing::warn!(
+                    target: "siem",
+                    declared = %declared,
+                    source_ip = %ip,
+                    "SIEM:CRITICAL F2 source IP has no ASN record — fail-closed, rejecting"
+                );
+                Err("source IP has no server-derived ASN (fail-closed)")
+            } else {
+                tracing::warn!(
+                    target: "siem",
+                    declared = %declared,
+                    source_ip = %ip,
+                    "SIEM:WARNING F2 source IP has no ASN record — declared network_id unverifiable"
+                );
+                Ok(())
+            }
+        }
     }
 }

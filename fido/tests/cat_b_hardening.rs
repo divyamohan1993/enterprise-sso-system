@@ -21,6 +21,17 @@ fn make_auth_data(rp_id: &str, flags: u8, sign_count: u32) -> Vec<u8> {
     data
 }
 
+/// Build a valid WebAuthn-assertion clientDataJSON bound to a challenge/origin.
+fn make_client_data(challenge: &[u8], origin: &str) -> Vec<u8> {
+    let challenge_b64 = fido::verification::base64_url_encode(challenge);
+    format!(
+        r#"{{"type":"webauthn.get","challenge":"{challenge_b64}","origin":"{origin}"}}"#
+    )
+    .into_bytes()
+}
+
+const TEST_ORIGIN: &str = "https://sso.milnet.example";
+
 #[test]
 #[serial]
 fn b6_unknown_aaguid_rejected_in_military_mode() {
@@ -46,13 +57,14 @@ fn b9_none_format_rejected_in_military_mode() {
 #[serial]
 fn b7_sign_count_rollback_locks_credential() {
     let rp_id = "sso.milnet.example";
+    let challenge = b"b7-rollback-challenge";
     let user_id = Uuid::new_v4();
     // sign_count goes BACKWARDS: stored=10, authenticator reports 5.
     let auth_data = make_auth_data(rp_id, 0x05, 5);
     let auth_result = AuthenticationResult {
         credential_id: vec![1, 2, 3],
         authenticator_data: auth_data,
-        client_data: b"x".to_vec(),
+        client_data: make_client_data(challenge, TEST_ORIGIN),
         signature: vec![0x30, 0x44],
     };
     let mut stored = StoredCredential {
@@ -67,7 +79,9 @@ fn b7_sign_count_rollback_locks_credential() {
         backup_state: false,
         pq_attestation: Vec::new()
     };
-    let res = verify_authentication_response_with_lockout(&auth_result, &mut stored, rp_id, true);
+    let res = verify_authentication_response_with_lockout(
+        &auth_result, &mut stored, rp_id, challenge, TEST_ORIGIN, true,
+    );
     assert!(res.is_err(), "rollback must be rejected");
     assert!(stored.cloned_flag, "credential must be marked cloned");
 
@@ -76,7 +90,8 @@ fn b7_sign_count_rollback_locks_credential() {
     let auth_data2 = make_auth_data(rp_id, 0x05, 100);
     let mut auth2 = auth_result.clone();
     auth2.authenticator_data = auth_data2;
-    let res2 =
-        verify_authentication_response_with_lockout(&auth2, &mut stored, rp_id, true);
+    let res2 = verify_authentication_response_with_lockout(
+        &auth2, &mut stored, rp_id, challenge, TEST_ORIGIN, true,
+    );
     assert!(res2.is_err(), "locked credential must keep refusing");
 }

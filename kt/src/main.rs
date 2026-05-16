@@ -528,6 +528,37 @@ fn load_kt_signing_epoch(epoch_id: u64) -> KtSigningEpoch {
     }
 }
 
+/// Derive the ML-DSA-87 verifying key for `epoch_id` from its sealed seed.
+///
+/// The sealed secret `kt-epoch-<id>` is the 32-byte ML-DSA-87 seed; the
+/// verifying key is deterministic from the seed, so STH signatures persisted
+/// under any epoch can be verified on load without trusting `verifying_key.bin`
+/// (which is itself attacker-writable). Returns `None` if the epoch's sealed
+/// seed is not provisioned or is malformed.
+fn epoch_verifying_key(epoch_id: u64) -> Option<crypto::pq_sign::PqVerifyingKey> {
+    use ml_dsa::{KeyGen, MlDsa87};
+    use zeroize::Zeroize;
+
+    let key_name = format!("kt-epoch-{}", epoch_id);
+    let sealed = common::secret_loader::load_secret(&key_name).ok()?;
+
+    let mut seed = [0u8; 32];
+    if sealed.len() == 32 {
+        seed.copy_from_slice(&sealed[..]);
+    } else if sealed.len() == 64 {
+        match hex::decode(&sealed[..]) {
+            Ok(b) if b.len() == 32 => seed.copy_from_slice(&b),
+            _ => return None,
+        }
+    } else {
+        return None;
+    }
+
+    let kp = MlDsa87::from_seed(&seed.into());
+    seed.zeroize();
+    Some(kp.verifying_key().clone())
+}
+
 fn append_sth_record(path: &Path, sth: &PersistedSth) -> std::io::Result<()> {
     use std::io::Write;
     let encoded = postcard::to_allocvec(sth)
@@ -569,13 +600,76 @@ fn hash_sth(sth: &PersistedSth) -> [u8; 64] {
     out
 }
 
+/// 32-byte FIPS 204 domain separator for KT signed-tree-head signatures.
+///
+/// STH signatures are produced and verified via
+/// `crypto::pq_sign::pq_sign_raw_domain` / `pq_verify_raw_domain`, which fold
+/// this constant into the ML-DSA-87 context (`CTX_RAW_SIGN || 0x1F || domain`).
+/// Routing STHs through their own domain prevents an STH signature from being
+/// reinterpreted as any other raw-signed KT message (leaf-consensus
+/// signatures, checkpoints) that happens to share the same payload bytes.
+/// Stable — never change without a format-version bump.
+const KT_STH_SIGN_DOMAIN: [u8; 32] = *b"MILNET-KT-STH-SIGN-DOMAIN-v1\0\0\0\0";
+
+/// Reconstruct the exact ML-DSA-87 signing payload for a persisted STH.
+///
+/// Must stay byte-identical to the payload built by the STH task
+/// (`epoch_id || tree_size || root || timestamp || prev_sth_hash`, all
+/// fixed-width integers big-endian) — see the signing site in `main`.
+fn sth_signing_payload(sth: &PersistedSth) -> Vec<u8> {
+    let mut to_sign = Vec::with_capacity(8 + 8 + 64 + 8 + 64);
+    to_sign.extend_from_slice(&sth.epoch_id.to_be_bytes());
+    to_sign.extend_from_slice(&sth.tree_size.to_be_bytes());
+    to_sign.extend_from_slice(&sth.root);
+    to_sign.extend_from_slice(&sth.timestamp.to_be_bytes());
+    to_sign.extend_from_slice(&sth.prev_sth_hash);
+    to_sign
+}
+
+/// Replay `kt_sth.log`, verifying the integrity of every persisted STH before
+/// returning the chain-head hash that the next STH must extend.
+///
+/// SECURITY (P0): the STH log is the external source of truth for auditors. A
+/// host attacker with write access could otherwise append fabricated STHs and
+/// the chain head would silently be derived from forged records. Every record
+/// is therefore checked on load:
+///   1. its ML-DSA-87 signature must verify against the epoch's verifying key
+///      (re-derived from the sealed seed, not the attacker-writable
+///      `verifying_key.bin`), domain-bound to [`KT_STH_SIGN_DOMAIN`];
+///   2. its `prev_sth_hash` must equal the running chain hash.
+/// Any failure is fatal — KT refuses to start rather than trusting a tampered
+/// or unverifiable log (fail closed).
+///
+/// DEPLOYMENT NOTE: STH signatures are now domain-bound (`pq_*_raw_domain`).
+/// An STH log produced by a build that signed STHs with the un-domain-separated
+/// `pq_sign_raw` will FAIL verification here and KT will refuse to start. This
+/// is intentional fail-closed behaviour — such a log was, by definition, never
+/// verified before this fix. Operators upgrading across this change must
+/// re-establish `kt_sth.log` from a trusted checkpoint.
 fn load_last_sth_hash(path: &Path) -> [u8; 64] {
     let data = match std::fs::read(path) {
         Ok(d) => d,
-        Err(_) => return [0u8; 64],
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return [0u8; 64],
+        Err(e) => {
+            tracing::error!(
+                target: "siem",
+                category = "security",
+                severity = "CRITICAL",
+                action = "kt_sth_log_read_failed",
+                error = %e,
+                "FATAL: KT STH log unreadable — refusing to start"
+            );
+            std::process::exit(198);
+        }
     };
+
+    // Cache epoch verifying keys so a multi-record log of one epoch reseals once.
+    let mut vk_cache: std::collections::HashMap<u64, crypto::pq_sign::PqVerifyingKey> =
+        std::collections::HashMap::new();
+
     let mut last_hash = [0u8; 64];
     let mut offset = 0usize;
+    let mut record_index = 0u64;
     while offset + 4 <= data.len() {
         let n = u32::from_le_bytes(match data[offset..offset + 4].try_into() {
             Ok(b) => b,
@@ -584,18 +678,120 @@ fn load_last_sth_hash(path: &Path) -> [u8; 64] {
         offset += 4;
         if n > KT_MAX_MSG {
             tracing::error!(
-                "SIEM:CRITICAL KT STH log: length prefix {} exceeds max {} at offset {} — rejecting",
+                target: "siem",
+                severity = "CRITICAL",
+                "SIEM:CRITICAL KT STH log: length prefix {} exceeds max {} at offset {} — refusing to start",
                 n, KT_MAX_MSG, offset - 4
+            );
+            std::process::exit(198);
+        }
+        if offset + n > data.len() {
+            // Trailing partial record (e.g. crash mid-append). The verified
+            // prefix is authoritative; stop here rather than trusting it.
+            //
+            // SECURITY: a host attacker can TRUNCATE the log (drop trailing
+            // STHs) here without tripping a fatal — but this is rollback, not
+            // injection: fabricated records still fail the signature + chain
+            // checks below. Rollback of an append-only file with no external
+            // anchor is detectable only by external auditors comparing
+            // tree_size monotonicity across published STHs; that is inherent
+            // to the design, not a regression.
+            tracing::warn!(
+                "KT STH log: truncated trailing record at offset {} — ignoring",
+                offset - 4
             );
             break;
         }
-        if offset + n > data.len() {
-            break;
+
+        let sth = match postcard::from_bytes::<PersistedSth>(&data[offset..offset + n]) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(
+                    target: "siem",
+                    severity = "CRITICAL",
+                    action = "kt_sth_decode_failed",
+                    record_index = record_index,
+                    error = %e,
+                    "FATAL: KT STH log record {} failed to decode — refusing to start",
+                    record_index
+                );
+                std::process::exit(198);
+            }
+        };
+
+        // (2) Chain check: this record must extend the running hash.
+        if sth.prev_sth_hash != last_hash {
+            tracing::error!(
+                target: "siem",
+                severity = "CRITICAL",
+                action = "kt_sth_chain_break",
+                record_index = record_index,
+                "FATAL: KT STH log record {} prev_sth_hash does not match chain head — \
+                 log has been tampered with. Refusing to start.",
+                record_index
+            );
+            common::siem::SecurityEvent::tamper_detected(&format!(
+                "KT STH log chain break at record {}",
+                record_index
+            ));
+            std::process::exit(199);
         }
-        if let Ok(sth) = postcard::from_bytes::<PersistedSth>(&data[offset..offset + n]) {
-            last_hash = hash_sth(&sth);
+
+        // (1) Signature check against the epoch's verifying key.
+        // Resolve-or-cache the epoch VK; `or_insert_with` keeps the mutable
+        // borrow of `vk_cache` confined to this statement.
+        let vk = vk_cache
+            .entry(sth.epoch_id)
+            .or_insert_with(|| {
+                epoch_verifying_key(sth.epoch_id).unwrap_or_else(|| {
+                    tracing::error!(
+                        target: "siem",
+                        severity = "CRITICAL",
+                        action = "kt_sth_epoch_key_missing",
+                        record_index = record_index,
+                        epoch_id = sth.epoch_id,
+                        "FATAL: KT STH log record {} signed under epoch {} whose sealed seed \
+                         is not provisioned — cannot verify. Refusing to start.",
+                        record_index, sth.epoch_id
+                    );
+                    std::process::exit(198);
+                })
+            });
+        let payload = sth_signing_payload(&sth);
+        if !crypto::pq_sign::pq_verify_raw_domain(
+            vk,
+            &payload,
+            &KT_STH_SIGN_DOMAIN,
+            &sth.signature,
+        ) {
+            tracing::error!(
+                target: "siem",
+                severity = "CRITICAL",
+                action = "kt_sth_signature_invalid",
+                record_index = record_index,
+                epoch_id = sth.epoch_id,
+                "FATAL: KT STH log record {} has an invalid ML-DSA-87 signature — \
+                 log forgery detected. Refusing to start.",
+                record_index
+            );
+            common::siem::SecurityEvent::tamper_detected(&format!(
+                "KT STH log forged signature at record {}",
+                record_index
+            ));
+            std::process::exit(199);
         }
+
+        last_hash = hash_sth(&sth);
         offset += n;
+        record_index += 1;
+    }
+
+    if record_index > 0 {
+        tracing::info!(
+            "KT STH log verified: {} records, chain head {}",
+            record_index,
+            hex::encode(&last_hash[..8])
+        );
     }
     last_hash
 }
@@ -840,7 +1036,9 @@ async fn main() {
     let kt_pinned_vks: Arc<Vec<crypto::pq_sign::PqVerifyingKey>> =
         Arc::new(kt::consensus::load_pinned_vks());
     tracing::info!(
-        "KT 2-of-5 consensus initialized: {} local signing slots, {} pinned VKs",
+        "KT 2-of-5 consensus initialized: {} local signing slot(s) (this host's own \
+         key only), {} pinned VKs. Appends require ≥2 distinct slot signatures; the \
+         peer-signature transport must supply the remainder.",
         kt_consensus_keys.iter().filter(|k| k.is_some()).count(),
         kt_pinned_vks.len()
     );
@@ -955,30 +1153,45 @@ async fn main() {
                 persist_tree(&t, &checkpoint_path);
 
                 // D12/D16: build, sign, persist, and chain a PersistedSth.
-                // Signed payload:
+                // Signed payload (see sth_signing_payload — kept byte-identical):
                 //   epoch_id || tree_size || root || timestamp || prev_sth_hash
-                // All fixed-width integers big-endian.
+                // All fixed-width integers big-endian. The signature is bound
+                // to KT_STH_SIGN_DOMAIN so it cannot be confused with any other
+                // raw-signed KT message.
                 let timestamp = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_micros() as i64;
                 let mut prev_hash_lock = last_sth_hash_task.lock().await;
-                let mut to_sign = Vec::with_capacity(8 + 8 + 64 + 8 + 64);
-                to_sign.extend_from_slice(&epoch_id.to_be_bytes());
-                to_sign.extend_from_slice(&sth.tree_size.to_be_bytes());
-                to_sign.extend_from_slice(&sth.root);
-                to_sign.extend_from_slice(&timestamp.to_be_bytes());
-                to_sign.extend_from_slice(&*prev_hash_lock);
-                let signature = crypto::pq_sign::pq_sign_raw(pq_key, &to_sign);
-                drop(ep);
-                let persisted = PersistedSth {
+                let mut persisted = PersistedSth {
                     tree_size: sth.tree_size as u64,
                     root: sth.root,
                     timestamp,
-                    signature,
+                    signature: Vec::new(),
                     prev_sth_hash: *prev_hash_lock,
                     epoch_id,
                 };
+                // Sign the canonical payload, domain-bound to KT_STH_SIGN_DOMAIN.
+                let to_sign = sth_signing_payload(&persisted);
+                match crypto::pq_sign::pq_sign_raw_domain(
+                    pq_key,
+                    &to_sign,
+                    &KT_STH_SIGN_DOMAIN,
+                ) {
+                    Ok(sig) => persisted.signature = sig,
+                    Err(e) => {
+                        tracing::error!(
+                            target: "siem",
+                            severity = "CRITICAL",
+                            action = "kt_sth_signing_failed",
+                            error = %e,
+                            "KT STH signing failed — skipping this STH cycle"
+                        );
+                        drop(ep);
+                        continue;
+                    }
+                };
+                drop(ep);
                 if let Err(e) = append_sth_record(&sth_path, &persisted) {
                     tracing::error!("KT STH log append failed: {}", e);
                     common::siem::SecurityEvent::tamper_detected(
@@ -1053,13 +1266,19 @@ async fn main() {
                                         continue;
                                     }
                                 };
-                                // D5: 2-of-5 consensus check. The leader (this
-                                // process) signs the canonical leaf with every
-                                // local slot key it holds. In single-process
-                                // mode that is all 5 keys; in standalone mode
-                                // the peer signatures must be collected first
-                                // (see kt::consensus). The threshold check
-                                // verifies at least 2 distinct pinned VKs.
+                                // D5: 2-of-5 consensus check. Each host holds
+                                // ONLY its own slot key (keys are per-host and
+                                // never co-derived — see kt::consensus). The
+                                // leader signs with its single local slot key;
+                                // the remaining ≥1 peer signature MUST be
+                                // collected over the wire before verify_threshold
+                                // can pass. The peer-signature transport is not
+                                // yet implemented, so verify_threshold fails
+                                // closed (only 1 local signature) and the append
+                                // is rejected — a correctly deployed standalone
+                                // KT cannot accept writes until that protocol
+                                // lands. This is intentional: a passing 2-of-5
+                                // check from a single host would be theatre.
                                 let leaf_bytes = kt::consensus::canonical_leaf_bytes(
                                     &user_id,
                                     op.as_str(),

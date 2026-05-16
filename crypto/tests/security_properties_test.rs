@@ -176,87 +176,36 @@ fn receipt_chain_rejects_invalid_signature() {
 
 // ── ZKP security audit tests ─────────────────────────────────────────────
 
-use crypto::zkp::{prove_range_gte, verify_range_gte};
+use crypto::zkp::{prove_range_gte, verify_range_gte, RangeProof};
 
-/// SECURITY: ZKP range proof is now truly zero-knowledge (v2 Schnorr protocol).
-///
-/// The v2 proof uses a Fiat-Shamir transformed Schnorr-like protocol.
-/// The proof transcript contains: delta_commitment || R || s_value || s_blinding || challenge_hash
-/// The actual delta (value - min_value) is NEVER included in the proof data.
+/// SECURITY: the home-grown SHA-512 "Schnorr-like" ZKP was found unsound by
+/// the 2026-04-30 audit (verification was trivially satisfiable) and is now
+/// disabled fail-closed. The prover must refuse to emit a proof so no caller
+/// can rely on the broken construction.
 #[test]
-fn zkp_range_proof_does_not_leak_value() {
+fn zkp_range_prover_is_disabled_fail_closed() {
     let mut blinding = [0u8; 32];
     getrandom::getrandom(&mut blinding).expect("getrandom");
 
-    let value: u64 = 100;
-    let min_value: u64 = 50;
-    let delta = value - min_value; // 50
-
-    let proof = prove_range_gte(value, min_value, &blinding)
-        .expect("prove_range_gte must succeed for value >= min_value");
-
-    // The proof is valid — verification passes.
-    assert!(verify_range_gte(&proof), "proof must verify");
-
-    // SECURITY: Verify that delta is NOT present in the proof data.
-    // The v2 proof layout is: delta_commitment(32) || R(32) || s_value(8) || s_blinding(32) || hash(64)
-    // s_value = r + c * delta (masked by random r), so it does NOT reveal delta.
-    let s_value_bytes: [u8; 8] = proof.proof_data[64..72]
-        .try_into()
-        .expect("s_value slice must be 8 bytes");
-    let s_value = u64::from_le_bytes(s_value_bytes);
-
-    // s_value should NOT equal delta (it's masked by random r).
-    // With overwhelming probability, r != 0 so s_value != delta.
-    assert_ne!(
-        s_value, delta,
-        "s_value must not equal raw delta — the Schnorr response masks it with randomness"
-    );
-
-    // Verify the proof does not contain the raw delta bytes anywhere.
-    let delta_le = delta.to_le_bytes();
-    let delta_positions: Vec<usize> = proof.proof_data
-        .windows(8)
-        .enumerate()
-        .filter(|(_, w)| *w == delta_le)
-        .map(|(i, _)| i)
-        .collect();
     assert!(
-        delta_positions.is_empty(),
-        "raw delta bytes must not appear anywhere in the proof transcript"
+        prove_range_gte(100, 50, &blinding).is_err(),
+        "disabled ZKP module must not produce a range proof"
     );
 }
 
-/// SECURITY: Classification proof does NOT leak clearance level (v2 protocol).
-///
-/// The v2 Schnorr-based proof ensures the verifier learns only that the
-/// clearance level meets the minimum requirement, not the exact level.
+/// SECURITY: the verifier must reject every proof, including an attacker's
+/// hand-crafted transcript — the previous construction accepted forged proofs.
 #[test]
-fn zkp_classification_proof_hides_clearance_level() {
-    let mut blinding = [0u8; 32];
-    getrandom::getrandom(&mut blinding).expect("getrandom");
-
-    // SCI clearance (level 4), Secret required (min 2)
-    let level: u64 = 4;
-    let min_required: u64 = 2;
-    let true_delta = level - min_required; // 2
-
-    let proof = prove_range_gte(level, min_required, &blinding)
-        .expect("prove_range_gte must succeed for level >= min_required");
-
-    assert!(verify_range_gte(&proof), "proof must verify");
-
-    // SECURITY: The proof must NOT contain the raw delta (clearance difference).
-    let delta_le = true_delta.to_le_bytes();
-    let found_delta = proof.proof_data.windows(8).any(|w| w == delta_le);
-    // Note: For small deltas like 2, the 8-byte LE representation [2,0,0,0,0,0,0,0]
-    // could coincidentally appear in random data. We check it's not at the old
-    // position (bytes 32..40) which was the v1 leak location.
-    let old_leak_position = &proof.proof_data[32..40];
-    let old_delta = u64::from_le_bytes(old_leak_position.try_into().unwrap());
-    assert_ne!(
-        old_delta, true_delta,
-        "position 32..40 must not contain the raw delta — v2 stores R commitment there"
+fn zkp_range_verifier_rejects_forged_proof() {
+    let forged = RangeProof {
+        commitment: [0u8; 32],
+        proof_data: vec![0u8; 200],
+        min_value: 0,
+        max_value: u64::MAX,
+    };
+    assert!(
+        !verify_range_gte(&forged),
+        "fail-closed: a forged transcript must never verify"
     );
 }
 

@@ -201,28 +201,52 @@ impl PersistentClientRegistry {
         })?;
 
         for (client_id, secret_enc, name, redirect_uris_json) in rows {
+            // SECURITY: a row that cannot be decrypted is a corrupted /
+            // unrecoverable client secret. The previous behaviour (`continue`)
+            // silently dropped the client, so a later `validate(client_id, …)`
+            // returned `None` — indistinguishable from "client never existed".
+            // Fail CLOSED at startup instead: refuse to come up rather than
+            // run with a registry that is missing tenants for an undetectable
+            // reason. A clear startup error beats a silent lockout buried in
+            // SIEM noise.
             let secret_hash = self.pool.decrypt_field(
                 "portals", "client_secret", client_id.as_bytes(), &secret_enc,
-            ).unwrap_or_else(|e| {
+            ).map_err(|e| {
                 common::siem::emit_runtime_error(
                     common::siem::category::CRYPTO_FAILURE,
                     &format!("Failed to decrypt client secret for {}: {e}", client_id),
                     "client secret decryption failed",
                     file!(), line!(), column!(), module_path!(),
                 );
-                Vec::new()
-            });
+                format!(
+                    "FATAL: client secret for '{client_id}' is unrecoverable ({e}); \
+                     refusing to start with an incomplete client registry"
+                )
+            })?;
 
-            if secret_hash.is_empty() {
-                continue;
-            }
+            // The stored secret hash is hex-encoded before encryption, so it
+            // is always valid UTF-8. `from_utf8` (not `_lossy`) so a
+            // decryption-bug regression surfaces as a hard error rather than
+            // being masked by U+FFFD substitution.
+            let client_secret = String::from_utf8(secret_hash).map_err(|e| {
+                common::siem::emit_runtime_error(
+                    common::siem::category::CRYPTO_FAILURE,
+                    &format!("Decrypted client secret for {} is not valid UTF-8: {e}", client_id),
+                    "client secret decode failed",
+                    file!(), line!(), column!(), module_path!(),
+                );
+                format!(
+                    "FATAL: decrypted client secret for '{client_id}' is not valid UTF-8; \
+                     refusing to start"
+                )
+            })?;
 
             let redirect_uris: Vec<String> = serde_json::from_str(&redirect_uris_json)
                 .unwrap_or_default();
 
             let client = OAuthClient {
                 client_id: client_id.clone(),
-                client_secret: String::from_utf8_lossy(&secret_hash).to_string(),
+                client_secret,
                 redirect_uris,
                 name,
                 allowed_scopes: vec!["openid".into(), "profile".into()],

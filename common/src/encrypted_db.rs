@@ -34,17 +34,27 @@ pub struct EncryptedPool {
     pub pool: PgPool,
     /// Per-table KEK derivation seed (from master key hierarchy).
     /// In production this comes from HSM; here it is loaded from env / sealed storage.
-    master_kek: [u8; 32],
+    ///
+    /// SECURITY (audit common P1): the KEK is `Box`ed so it lives at a stable
+    /// HEAP address. `EncryptedPool` is returned by value (moved) from `new`
+    /// and `wrap_pool`; a `[u8; 32]` inline field would be copied to the
+    /// caller's stack slot on every move, leaving the resident copy NOT
+    /// mlocked. The heap allocation behind the `Box` does not move when the
+    /// `EncryptedPool` is moved, so the `mlock` below protects the copy that
+    /// is actually used at runtime.
+    master_kek: Box<[u8; 32]>,
 }
 
 impl EncryptedPool {
     /// Wrap a raw pool with envelope encryption using the given master KEK.
     pub fn new(pool: PgPool, master_kek: [u8; 32]) -> Self {
-        let s = Self { pool, master_kek };
+        let s = Self { pool, master_kek: Box::new(master_kek) };
         // Prevent master KEK from being swapped to disk.
         // SAFETY: mlock/madvise are memory-protection syscalls that do not
         // violate memory safety. Required to prevent the root database
-        // encryption key from being written to swap or core dumps.
+        // encryption key from being written to swap or core dumps. The KEK is
+        // heap-allocated (Box), so this address is stable across the move of
+        // `s` out of this function.
         #[cfg(unix)]
         #[allow(unsafe_code)]
         unsafe {
@@ -60,7 +70,9 @@ impl EncryptedPool {
     fn table_kek(&self, table: &str) -> Result<[u8; 32], String> {
         use hkdf::Hkdf;
         use sha2::Sha512;
-        let hk = Hkdf::<Sha512>::new(Some(b"MILNET-TABLE-KEK-v1"), &self.master_kek);
+        // `master_kek` is `Box<[u8; 32]>`; slice it so it coerces to the
+        // `&[u8]` ikm argument (a `&Box<[u8;32]>` does not coerce directly).
+        let hk = Hkdf::<Sha512>::new(Some(b"MILNET-TABLE-KEK-v1"), &self.master_kek[..]);
         let mut okm = [0u8; 32];
         hk.expand(table.as_bytes(), &mut okm)
             .map_err(|_| "HKDF-SHA512 table KEK derivation failed".to_string())?;

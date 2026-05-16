@@ -45,8 +45,9 @@ fuzz_target!(|input: Input| {
         mutated[idx] = mutated[idx].wrapping_add(0x91);
     }
     if input.swap_bytes && mutated.len() > 4 {
-        mutated.swap(0, mutated.len() - 1);
-        mutated.swap(1, mutated.len() - 2);
+        let len = mutated.len();
+        mutated.swap(0, len - 1);
+        mutated.swap(1, len - 2);
     }
     if input.duplicate_prefix && mutated.len() > 8 {
         let head: Vec<u8> = mutated.iter().take(8).copied().collect();

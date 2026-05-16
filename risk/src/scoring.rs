@@ -61,45 +61,110 @@ impl From<SerializableBaseline> for UserBaseline {
 // HMAC tamper detection (Fix 2)
 // ---------------------------------------------------------------------------
 
-/// Signed envelope wrapping serialized baselines with HMAC-SHA512.
+/// Encrypted, signed envelope wrapping serialized baselines.
+///
+/// Behavioral baselines (`known_networks`, login-hour windows, session
+/// durations) are PII per the DPDP Act 2023 / GDPR, so per CLAUDE.md they
+/// must be AES-256-GCM encrypted at rest, not stored as plaintext JSON.
+/// Construction uses encrypt-then-MAC: the payload is AES-256-GCM encrypted,
+/// then HMAC-SHA512 authenticates the ciphertext and nonce together.
 #[derive(Serialize, Deserialize)]
 pub struct SignedBaselineEnvelope {
-    /// JSON-serialized baseline map.
+    /// AES-256-GCM ciphertext of the JSON-serialized baseline map.
     pub payload: Vec<u8>,
-    /// HMAC-SHA512 over `payload`.
+    /// Random 12-byte AES-GCM nonce.
+    pub nonce: Vec<u8>,
+    /// HMAC-SHA512 over `nonce || payload`.
     pub hmac: Vec<u8>,
 }
 
+/// Derive the AES-256 data-encryption key from the envelope HMAC key.
+///
+/// Re-using the HMAC key directly as the AES key would be cross-primitive key
+/// reuse; instead an independent 32-byte subkey is derived via a
+/// domain-separated HMAC-SHA512 (HKDF-style expand). A single configured
+/// secret therefore still yields two independent keys.
+fn derive_aes_key(hmac_key: &[u8]) -> Result<[u8; 32], String> {
+    let mut mac =
+        HmacSha512::new_from_slice(hmac_key).map_err(|e| format!("aes-key derive init: {e}"))?;
+    mac.update(b"milnet-baseline-aes-256-gcm-v1");
+    let out = mac.finalize().into_bytes();
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&out[..32]);
+    Ok(key)
+}
+
 impl SignedBaselineEnvelope {
-    /// Create a signed envelope from baselines using the given key.
+    /// Create an encrypted, signed envelope from baselines using the given key.
     pub fn seal(baselines: &HashMap<Uuid, UserBaseline>, key: &[u8]) -> Result<Vec<u8>, String> {
+        use aes_gcm::aead::Aead;
+        use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+
         let serializable: HashMap<String, SerializableBaseline> = baselines
             .iter()
             .map(|(k, v)| (k.to_string(), SerializableBaseline::from(v)))
             .collect();
-        let payload = serde_json::to_vec(&serializable)
+        let plaintext = serde_json::to_vec(&serializable)
             .map_err(|e| format!("serialize baselines: {e}"))?;
-        let mut mac = HmacSha512::new_from_slice(key)
+
+        // Encrypt the PII payload with AES-256-GCM under a random nonce.
+        let aes_key = derive_aes_key(key)?;
+        let cipher =
+            Aes256Gcm::new_from_slice(&aes_key).map_err(|e| format!("aes init: {e}"))?;
+        let mut nonce_bytes = [0u8; 12];
+        getrandom::getrandom(&mut nonce_bytes).map_err(|e| format!("nonce rng: {e}"))?;
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let payload = cipher
+            .encrypt(nonce, plaintext.as_ref())
+            .map_err(|_| "aes-gcm encrypt failed".to_string())?;
+
+        // Encrypt-then-MAC: authenticate nonce and ciphertext together.
+        let mut mac = <HmacSha512 as Mac>::new_from_slice(key)
             .map_err(|e| format!("hmac init: {e}"))?;
+        mac.update(&nonce_bytes);
         mac.update(&payload);
         let hmac = mac.finalize().into_bytes().to_vec();
-        let envelope = SignedBaselineEnvelope { payload, hmac };
+
+        let envelope = SignedBaselineEnvelope {
+            payload,
+            nonce: nonce_bytes.to_vec(),
+            hmac,
+        };
         serde_json::to_vec(&envelope).map_err(|e| format!("serialize envelope: {e}"))
     }
 
-    /// Verify and deserialize baselines from a signed envelope.
+    /// Verify, decrypt, and deserialize baselines from a sealed envelope.
     pub fn unseal(data: &[u8], key: &[u8]) -> Result<HashMap<Uuid, UserBaseline>, String> {
+        use aes_gcm::aead::Aead;
+        use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+
         let envelope: SignedBaselineEnvelope = serde_json::from_slice(data)
             .map_err(|e| format!("deserialize envelope: {e}"))?;
-        let mut mac = HmacSha512::new_from_slice(key)
+        if envelope.nonce.len() != 12 {
+            return Err("invalid envelope: nonce length".to_string());
+        }
+
+        // Verify the MAC over nonce || ciphertext before any decryption.
+        let mut mac = <HmacSha512 as Mac>::new_from_slice(key)
             .map_err(|e| format!("hmac init: {e}"))?;
+        mac.update(&envelope.nonce);
         mac.update(&envelope.payload);
         mac.verify_slice(&envelope.hmac).map_err(|_| {
             tracing::error!(target: "siem", "SIEM:CRITICAL baseline file HMAC verification failed — possible tampering detected");
             "HMAC verification failed: baseline tampered".to_string()
         })?;
+
+        // MAC is valid: decrypt the AES-256-GCM payload.
+        let aes_key = derive_aes_key(key)?;
+        let cipher =
+            Aes256Gcm::new_from_slice(&aes_key).map_err(|e| format!("aes init: {e}"))?;
+        let nonce = Nonce::from_slice(&envelope.nonce);
+        let plaintext = cipher
+            .decrypt(nonce, envelope.payload.as_ref())
+            .map_err(|_| "aes-gcm decrypt failed: baseline corrupt".to_string())?;
+
         let serializable: HashMap<String, SerializableBaseline> =
-            serde_json::from_slice(&envelope.payload)
+            serde_json::from_slice(&plaintext)
                 .map_err(|e| format!("deserialize baselines: {e}"))?;
         let mut baselines = HashMap::new();
         for (k, v) in serializable {
@@ -377,8 +442,17 @@ impl BaselineStore {
         let path = baseline_persistence_path().ok_or_else(|| {
             "MILNET_RISK_BASELINE_PATH must be set in military mode".to_string()
         })?;
-        let key = std::env::var("MILNET_BASELINE_HMAC_KEY")
-            .unwrap_or_else(|_| "default-milnet-hmac-key-replace-in-prod".to_string());
+        // Military mode is fail-closed: never fall back to a known key. A
+        // hardcoded default would let anyone with the source forge signed
+        // baseline envelopes, so a missing/empty/too-short key is fatal.
+        let key = std::env::var("MILNET_BASELINE_HMAC_KEY").map_err(|_| {
+            "MILNET_BASELINE_HMAC_KEY must be set in military mode".to_string()
+        })?;
+        if key.len() < 32 {
+            return Err(
+                "MILNET_BASELINE_HMAC_KEY must be at least 32 bytes in military mode".to_string(),
+            );
+        }
         let persistence = Box::new(FileBaselinePersistence::new(path, key.into_bytes()));
         Self::with_persistence(persistence)
     }
@@ -634,6 +708,11 @@ pub struct RiskEngine {
     distributed_counter: Option<std::sync::Arc<dyn DistributedFailedAttemptCounter>>,
 }
 
+/// Score at or above which a session is classified at least `Elevated`
+/// (requires step-up auth). Defined once so the mimicry-detection floor and
+/// `classify` cannot drift apart.
+const ELEVATED_THRESHOLD: f64 = 0.3;
+
 impl RiskEngine {
     pub fn new() -> Self {
         Self {
@@ -842,13 +921,6 @@ impl RiskEngine {
             && !signals.is_unusual_time
             && signals.unusual_access_score < ACCESS_EPSILON
             && server_fails == 0;
-        if signals_too_clean {
-            // Suspiciously clean signals get a penalty that scales with how
-            // perfectly clean they are. Minimum +0.15, prevents adversaries
-            // from staying below the 0.3 Elevated threshold.
-            score += 0.15;
-        }
-
         // Add small random noise to prevent attackers from computing exact
         // threshold-crossing signal combinations. Noise range: [0.0, 0.08)
         let noise_byte = {
@@ -858,6 +930,17 @@ impl RiskEngine {
         };
         score += noise_byte;
 
+        if signals_too_clean {
+            // Suspiciously clean signals must NOT be classifiable as Normal.
+            // A +0.15 additive penalty is insufficient: with every other
+            // contribution tuned to its epsilon boundary the total can still
+            // sit at ~0.23, below the 0.30 Elevated cutoff. Enforce a hard
+            // floor at the Elevated threshold so a perfectly-crafted "clean"
+            // session is always escalated for step-up auth, which is the
+            // documented intent of mimicry detection.
+            score = score.max(ELEVATED_THRESHOLD);
+        }
+
         score.min(1.0)
     }
 
@@ -866,7 +949,7 @@ impl RiskEngine {
             RiskLevel::Critical
         } else if score >= 0.6 {
             RiskLevel::High
-        } else if score >= 0.3 {
+        } else if score >= ELEVATED_THRESHOLD {
             RiskLevel::Elevated
         } else {
             RiskLevel::Normal
@@ -986,11 +1069,17 @@ mod tests {
         let engine = RiskEngine::new();
         let user = Uuid::new_v4();
         let score = engine.compute_score(&user, &clean_signals());
-        // All-zero signals trigger the mimicry detection penalty (+0.15)
-        // plus random noise [0.0, 0.08), so score in [0.15, 0.23)
+        // Suspiciously clean signals are floored at the Elevated threshold so
+        // they can never be classified Normal — the documented purpose of
+        // mimicry detection. A perfectly-crafted "clean" session must escalate.
         assert!(
-            score >= 0.15 && score < 0.23,
-            "clean signals should trigger mimicry penalty: got {score}"
+            score >= ELEVATED_THRESHOLD,
+            "clean signals must be floored to at least Elevated: got {score}"
+        );
+        assert_eq!(
+            engine.classify(score),
+            RiskLevel::Elevated,
+            "mimicry-flagged clean signals must classify as Elevated"
         );
     }
 
@@ -1301,6 +1390,35 @@ mod tests {
     }
 
     #[test]
+    fn test_baseline_payload_is_encrypted_at_rest() {
+        // The sealed envelope must not contain baseline PII in plaintext:
+        // AES-256-GCM ciphertext makes the network labels unreadable on disk.
+        let key = b"test-key-encryption-at-rest".to_vec();
+        let user = Uuid::new_v4();
+        let mut baselines = HashMap::new();
+        baselines.insert(user, UserBaseline {
+            typical_login_hours: (9, 17),
+            known_networks: vec!["AS-SECRET-VPN-LABEL".to_string()],
+            avg_session_duration_secs: 600.0,
+            last_updated: 2000,
+            avg_login_hour: 13.0,
+        });
+
+        let sealed = SignedBaselineEnvelope::seal(&baselines, &key).unwrap();
+        let haystack = String::from_utf8_lossy(&sealed);
+        assert!(
+            !haystack.contains("AS-SECRET-VPN-LABEL"),
+            "baseline network label must not appear in plaintext in the sealed envelope"
+        );
+        // Round-trip still recovers the original PII.
+        let recovered = SignedBaselineEnvelope::unseal(&sealed, &key).unwrap();
+        assert_eq!(
+            recovered.get(&user).unwrap().known_networks,
+            vec!["AS-SECRET-VPN-LABEL".to_string()]
+        );
+    }
+
+    #[test]
     fn test_hmac_tamper_detection() {
         let key = b"test-key-tamper".to_vec();
         let user = Uuid::new_v4();
@@ -1457,10 +1575,30 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("baselines.dat");
         std::env::set_var("MILNET_RISK_BASELINE_PATH", path.to_str().unwrap());
-        std::env::set_var("MILNET_BASELINE_HMAC_KEY", "test-milnet-key");
+        // Key must be >= 32 bytes: military mode rejects weak/short keys.
+        std::env::set_var(
+            "MILNET_BASELINE_HMAC_KEY",
+            "test-milnet-baseline-hmac-key-0123456789",
+        );
 
         let result = BaselineStore::new_military();
         assert!(result.is_ok(), "military mode with path should succeed");
+
+        std::env::remove_var("MILNET_RISK_BASELINE_PATH");
+        std::env::remove_var("MILNET_BASELINE_HMAC_KEY");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_military_mode_rejects_short_hmac_key() {
+        let dir = std::env::temp_dir().join(format!("milnet_shortkey_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("baselines.dat");
+        std::env::set_var("MILNET_RISK_BASELINE_PATH", path.to_str().unwrap());
+        std::env::set_var("MILNET_BASELINE_HMAC_KEY", "too-short");
+
+        let result = BaselineStore::new_military();
+        assert!(result.is_err(), "military mode must reject a short HMAC key");
 
         std::env::remove_var("MILNET_RISK_BASELINE_PATH");
         std::env::remove_var("MILNET_BASELINE_HMAC_KEY");

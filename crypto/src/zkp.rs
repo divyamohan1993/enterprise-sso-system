@@ -1,31 +1,82 @@
-//! Zero-Knowledge Proofs for MILNET SSO.
+//! Zero-Knowledge Proofs for MILNET SSO — **DISABLED (fail-closed)**.
 //!
-//! Implements hash-based commitment schemes with Schnorr-style sigma protocol
-//! transcripts for range proofs, classification clearance, compliance
-//! attestations, and audit-chain integrity.
+//! # Status: UNAVAILABLE
 //!
-//! No elliptic-curve arithmetic is used; all proofs are built from
-//! SHA-512 hash chains, which are simple, auditable, and constant-time via
-//! [`crate::ct::ct_eq`].
+//! This module previously shipped a home-grown "Schnorr-style" sigma protocol
+//! built entirely on SHA-512 commitments. A security audit (2026-04-30) found
+//! the construction to be **cryptographically unsound**:
 //!
-//! # Security model
+//! * `verify_range_gte` checked `commit(s_value, s_blinding) == V`, where the
+//!   "verification commitment" `V` was itself supplied by the prover as
+//!   `commit(s_value, s_blinding)`. The equality was therefore *true by
+//!   construction* and tied to nothing — a forger could fabricate a valid
+//!   proof with no knowledge of any value.
+//! * `verify_audit_integrity` recomputed the Fiat-Shamir challenge into a
+//!   discarded local and only checked a self-referential `proof_hash`,
+//!   so any `(R, s_response)` pair passed verification.
 //!
-//! These are *computational* zero-knowledge proofs under the random-oracle
-//! model (SHA-512 treated as a random oracle). They are not as concise as
-//! bulletproofs, but are correct, verifiable, and have no foreign
-//! cryptographic dependencies.
+//! The root cause is structural, not a bug: SHA-512 commitments are **not
+//! homomorphic**. A Schnorr/sigma protocol requires a group in which the
+//! verifier can compute `commit(s) == R · commit(x)^c`. There is no `·` or
+//! `^` on hash digests, so a sound proof of knowledge of a committed value
+//! cannot be built from `commit() = SHA-512(...)` alone. A correct range
+//! proof needs either a Pedersen commitment over an elliptic-curve group with
+//! a real Bulletproof, or a bit-decomposition commitment with a genuine
+//! interactive (then Fiat-Shamir transformed) sigma protocol.
+//!
+//! Building a correct construction is out of scope for the current hardening
+//! pass, and the project standard forbids shipping home-grown crypto that has
+//! not been independently reviewed. Per the security posture "fail closed,
+//! security wins", every verification entry point in this module now
+//! **rejects unconditionally** and every prover entry point returns
+//! [`ZkpUnavailable`]. No caller can obtain or rely on an unsound proof.
+//!
+//! These functions are intentionally retained (rather than deleted) so that
+//! the API surface and any downstream `use` sites fail loudly and visibly,
+//! instead of silently disappearing. When a reviewed ZK construction is
+//! adopted (e.g. `bulletproofs` over `curve25519-dalek`, or `arkworks`), this
+//! module is the single place to re-enable it.
 
 use sha2::{Digest, Sha512};
 
-use crate::ct::ct_eq;
+/// Error returned by every prover entry point while the ZKP module is disabled.
+///
+/// The audit-blocked construction is unsound; callers must treat the absence
+/// of a proof as a hard failure (fail-closed), never substitute a weaker check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZkpUnavailable;
+
+impl core::fmt::Display for ZkpUnavailable {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(
+            "zero-knowledge proofs are unavailable: the hash-based construction \
+             was found unsound and is disabled fail-closed (see crypto::zkp docs)",
+        )
+    }
+}
+
+impl std::error::Error for ZkpUnavailable {}
+
+impl From<ZkpUnavailable> for String {
+    fn from(e: ZkpUnavailable) -> String {
+        e.to_string()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Commitment primitive
 // ---------------------------------------------------------------------------
 
-/// Create a commitment to `value` using a 32-byte blinding factor.
+/// Create a binding commitment to `value` using a 32-byte blinding factor.
 ///
 /// `C = SHA-512("MILNET-ZKP-COMMIT-v1" || value_le64 || blinding)[..32]`
+///
+/// This is a sound *commitment* primitive (binding + hiding under the
+/// random-oracle model) and remains available — it is used as a building
+/// block elsewhere. It is **not**, on its own, a zero-knowledge proof: it
+/// reveals nothing only because the opening is withheld. Knowledge of the
+/// committed value cannot be proven from this primitive without a homomorphic
+/// group structure, which is why the proof protocols below are disabled.
 pub fn commit(value: u64, blinding: &[u8; 32]) -> [u8; 32] {
     let mut h = Sha512::new();
     h.update(b"MILNET-ZKP-COMMIT-v1");
@@ -38,7 +89,7 @@ pub fn commit(value: u64, blinding: &[u8; 32]) -> [u8; 32] {
 }
 
 // ---------------------------------------------------------------------------
-// Proof types
+// Proof types (retained for API stability; never produced while disabled)
 // ---------------------------------------------------------------------------
 
 /// Proof that a committed value satisfies a range condition.
@@ -80,356 +131,87 @@ pub struct AuditIntegrityProof {
 }
 
 // ---------------------------------------------------------------------------
-// Range proof: prove value >= min_value
+// Range proof: prove value >= min_value — DISABLED
 // ---------------------------------------------------------------------------
 
-/// Prove that `value >= min_value`.
+/// **DISABLED.** Always returns [`ZkpUnavailable`].
 ///
-/// Proof transcript layout:
-/// ```text
-/// delta_commitment (32) || R (32) || s_value (8 LE) || s_blinding (32) || V (32) || challenge_hash (64)
-/// ```
-/// Total: 200 bytes.
+/// The previous SHA-512 "Schnorr-like" range proof was unsound (a forger could
+/// fabricate a valid proof with no knowledge of `value`). No proof is produced
+/// until a reviewed construction replaces it. Callers must fail closed.
 pub fn prove_range_gte(
-    value: u64,
-    min_value: u64,
-    blinding: &[u8; 32],
-) -> Result<RangeProof, String> {
-    if value < min_value {
-        return Err(format!(
-            "value {value} is below minimum {min_value}"
-        ));
-    }
-    let delta = value - min_value;
-
-    // Generate fresh blinding for the delta commitment.
-    let mut delta_blinding = [0u8; 32];
-    getrandom::getrandom(&mut delta_blinding)
-        .map_err(|e| format!("getrandom for delta blinding failed: {e}"))?;
-
-    let value_commitment = commit(value, blinding);
-    let delta_commitment = commit(delta, &delta_blinding);
-
-    // Build a Fiat-Shamir challenge from commitments only (no secret values).
-    // The proof demonstrates knowledge of delta without revealing it.
-    // We use a Schnorr-like protocol adapted for Pedersen commitments:
-    //   1. Prover picks random r, computes R = commit(r, r_blinding)
-    //   2. Challenge c = H(domain || value_commitment || delta_commitment || R)
-    //   3. Response s = r + c * delta, s_blind = r_blinding + c * delta_blinding
-    //   4. Verifier checks commit(s, s_blind) == R + c * delta_commitment
-    let mut r_value = [0u8; 8];
-    getrandom::getrandom(&mut r_value)
-        .map_err(|e| format!("getrandom for ZKP randomness failed: {e}"))?;
-    let r = u64::from_le_bytes(r_value);
-    let mut r_blinding = [0u8; 32];
-    getrandom::getrandom(&mut r_blinding)
-        .map_err(|e| format!("getrandom for ZKP r_blinding failed: {e}"))?;
-    let r_commitment = commit(r, &r_blinding);
-
-    // Fiat-Shamir challenge: hash of public values only.
-    let mut challenge_input = Vec::with_capacity(19 + 32 + 32 + 32);
-    challenge_input.extend_from_slice(b"MILNET-ZKP-RANGE-v2");
-    challenge_input.extend_from_slice(&value_commitment);
-    challenge_input.extend_from_slice(&delta_commitment);
-    challenge_input.extend_from_slice(&r_commitment);
-    let challenge_hash = Sha512::digest(&challenge_input);
-    let c = u64::from_le_bytes(challenge_hash[..8].try_into().unwrap());
-
-    // Responses: computed over a 128-bit intermediate to avoid truncation.
-    // s_value = r + c * delta (mod 2^64).
-    let s_value = r.wrapping_add(c.wrapping_mul(delta));
-    // s_blinding[i] = r_blinding[i] + (c * delta_blinding[i]) mod 256.
-    // We use u64 multiplication of the full challenge by each blinding byte,
-    // then reduce to u8 and add the randomness byte. This preserves all 64
-    // bits of the challenge (CR-5 fix).
-    let mut s_blinding = [0u8; 32];
-    for i in 0..32 {
-        let product = c.wrapping_mul(delta_blinding[i] as u64);
-        s_blinding[i] = r_blinding[i].wrapping_add(product as u8);
-    }
-
-    // Verification commitment: V = commit(s_value, s_blinding).
-    // Included in the proof so the verifier can recompute and compare.
-    let verification_commitment = commit(s_value, &s_blinding);
-
-    // Proof contains: delta_commitment || R || s_value || s_blinding || V || challenge_hash
-    // NO secret delta or delta_blinding is included.
-    let mut proof_data = Vec::with_capacity(32 + 32 + 8 + 32 + 32 + 64);
-    proof_data.extend_from_slice(&delta_commitment);
-    proof_data.extend_from_slice(&r_commitment);
-    proof_data.extend_from_slice(&s_value.to_le_bytes());
-    proof_data.extend_from_slice(&s_blinding);
-    proof_data.extend_from_slice(&verification_commitment);
-    proof_data.extend_from_slice(&challenge_hash);
-
-    Ok(RangeProof {
-        commitment: value_commitment,
-        proof_data,
-        min_value,
-        max_value: u64::MAX,
-    })
+    _value: u64,
+    _min_value: u64,
+    _blinding: &[u8; 32],
+) -> Result<RangeProof, ZkpUnavailable> {
+    Err(ZkpUnavailable)
 }
 
-/// Verify a `>= min_value` range proof (v2 Schnorr-like protocol).
+/// **DISABLED.** Always returns `false` (fail-closed).
 ///
-/// The proof demonstrates knowledge of delta = value - min_value without
-/// revealing delta itself. Layout:
-/// delta_commitment(32) || R(32) || s_value(8) || s_blinding(32) || V(32) || challenge_hash(64)
-pub fn verify_range_gte(proof: &RangeProof) -> bool {
-    const MIN_LEN: usize = 32 + 32 + 8 + 32 + 32 + 64;
-    if proof.proof_data.len() < MIN_LEN {
-        return false;
-    }
-
-    let delta_commitment = match proof.proof_data.get(..32) {
-        Some(s) => s,
-        None => return false,
-    };
-    let r_commitment = match proof.proof_data.get(32..64) {
-        Some(s) => s,
-        None => return false,
-    };
-    let s_value_bytes = match proof.proof_data.get(64..72) {
-        Some(s) => s,
-        None => return false,
-    };
-    let s_blinding = match proof.proof_data.get(72..104) {
-        Some(s) => s,
-        None => return false,
-    };
-    let verification_commitment = match proof.proof_data.get(104..136) {
-        Some(s) => s,
-        None => return false,
-    };
-    let challenge_hash = match proof.proof_data.get(136..200) {
-        Some(s) => s,
-        None => return false,
-    };
-
-    // Recompute the Fiat-Shamir challenge from public values only.
-    let mut challenge_input = Vec::with_capacity(19 + 32 + 32 + 32);
-    challenge_input.extend_from_slice(b"MILNET-ZKP-RANGE-v2");
-    challenge_input.extend_from_slice(&proof.commitment);
-    challenge_input.extend_from_slice(delta_commitment);
-    challenge_input.extend_from_slice(r_commitment);
-    let expected_challenge = Sha512::digest(&challenge_input);
-
-    // Verify challenge matches (constant-time).
-    if !ct_eq(&expected_challenge, challenge_hash) {
-        return false;
-    }
-
-    // Verify the Schnorr response algebraically.
-    // Recompute V' = commit(s_value, s_blinding) and check it matches the
-    // verification commitment V included in the proof. This is the actual
-    // cryptographic check that the prover knew delta such that
-    // s_value = r + c*delta and s_blinding = r_blind + c*delta_blind.
-    //
-    // Soundness: the Fiat-Shamir challenge c is bound to R and delta_commitment.
-    // A forger who doesn't know delta cannot produce (s_value, s_blinding) that
-    // open to a valid V consistent with the challenge binding.
-    let s_value = u64::from_le_bytes(match s_value_bytes.try_into() {
-        Ok(arr) => arr,
-        Err(_) => return false,
-    });
-    let mut sb = [0u8; 32];
-    sb.copy_from_slice(s_blinding);
-
-    let recomputed_v = commit(s_value, &sb);
-    ct_eq(&recomputed_v, verification_commitment)
+/// The hash-based verification was trivially satisfiable; rejecting every
+/// proof is the only safe behaviour until a sound construction is adopted.
+pub fn verify_range_gte(_proof: &RangeProof) -> bool {
+    false
 }
 
 // ---------------------------------------------------------------------------
-// Classification proof
+// Classification proof — DISABLED
 // ---------------------------------------------------------------------------
 
-/// Prove that clearance `level >= min_required`.
+/// **DISABLED.** Always returns [`ZkpUnavailable`]. See [`prove_range_gte`].
 pub fn prove_classification_range(
-    level: u8,
-    min_required: u8,
-    blinding: &[u8; 32],
-) -> Result<ClassificationProof, String> {
-    let rp = prove_range_gte(level as u64, min_required as u64, blinding)?;
-    Ok(ClassificationProof {
-        commitment: rp.commitment,
-        proof: rp.proof_data,
-        min_required,
-    })
+    _level: u8,
+    _min_required: u8,
+    _blinding: &[u8; 32],
+) -> Result<ClassificationProof, ZkpUnavailable> {
+    Err(ZkpUnavailable)
 }
 
-/// Verify a classification range proof.
-pub fn verify_classification_range(proof: &ClassificationProof) -> bool {
-    let rp = RangeProof {
-        commitment: proof.commitment,
-        proof_data: proof.proof.clone(),
-        min_value: proof.min_required as u64,
-        max_value: u64::MAX,
-    };
-    verify_range_gte(&rp)
+/// **DISABLED.** Always returns `false` (fail-closed). See [`verify_range_gte`].
+pub fn verify_classification_range(_proof: &ClassificationProof) -> bool {
+    false
 }
 
 // ---------------------------------------------------------------------------
-// Compliance attestation
+// Compliance attestation — DISABLED
 // ---------------------------------------------------------------------------
 
-/// Prove that `passed >= threshold` out of `total`.
+/// **DISABLED.** Always returns [`ZkpUnavailable`]. See [`prove_range_gte`].
 pub fn prove_compliance_threshold(
-    passed: u32,
-    total: u32,
-    threshold: u32,
-    blinding: &[u8; 32],
-) -> Result<ComplianceAttestation, String> {
-    let rp = prove_range_gte(passed as u64, threshold as u64, blinding)?;
-    Ok(ComplianceAttestation {
-        commitment: rp.commitment,
-        proof: rp.proof_data,
-        total_checks: total,
-        threshold,
-    })
+    _passed: u32,
+    _total: u32,
+    _threshold: u32,
+    _blinding: &[u8; 32],
+) -> Result<ComplianceAttestation, ZkpUnavailable> {
+    Err(ZkpUnavailable)
 }
 
-/// Verify a compliance attestation.
-pub fn verify_compliance_threshold(att: &ComplianceAttestation) -> bool {
-    let rp = RangeProof {
-        commitment: att.commitment,
-        proof_data: att.proof.clone(),
-        min_value: att.threshold as u64,
-        max_value: u64::MAX,
-    };
-    verify_range_gte(&rp)
+/// **DISABLED.** Always returns `false` (fail-closed). See [`verify_range_gte`].
+pub fn verify_compliance_threshold(_att: &ComplianceAttestation) -> bool {
+    false
 }
 
 // ---------------------------------------------------------------------------
-// Audit integrity proof
+// Audit integrity proof — DISABLED
 // ---------------------------------------------------------------------------
 
-/// Prove knowledge of `chain_root` for an audit chain of `chain_length` entries.
+/// **DISABLED.** Always returns [`ZkpUnavailable`].
 ///
-/// Uses a Schnorr-style sigma protocol: the prover demonstrates knowledge of
-/// chain_root and blinding without revealing either value.
-///
-/// Proof layout:
-/// ```text
-/// R (32) || s_response (64) || proof_hash (64)
-/// ```
-/// Total: 160 bytes.
+/// The previous "Schnorr-style" audit proof verified only a self-referential
+/// `proof_hash`; any `(R, s_response)` pair passed. No proof is produced until
+/// a reviewed construction replaces it.
 pub fn prove_audit_integrity(
-    chain_root: &[u8; 64],
-    chain_length: u64,
-    blinding: &[u8; 32],
-) -> Result<AuditIntegrityProof, String> {
-    // Commitment = SHA-512("MILNET-ZKP-AUDIT-v1" || chain_root || blinding)[..32]
-    let mut h = Sha512::new();
-    h.update(b"MILNET-ZKP-AUDIT-v1");
-    h.update(chain_root);
-    h.update(blinding);
-    let commit_hash = h.finalize();
-    let mut commitment = [0u8; 32];
-    commitment.copy_from_slice(&commit_hash[..32]);
-
-    // Schnorr-style proof of knowledge of the pre-image (chain_root, blinding).
-    // 1. Pick random nonce r (64 bytes) and r_blind (32 bytes).
-    let mut r_nonce = [0u8; 64];
-    getrandom::getrandom(&mut r_nonce)
-        .map_err(|e| format!("getrandom for audit ZKP nonce failed: {e}"))?;
-    let mut r_blind = [0u8; 32];
-    getrandom::getrandom(&mut r_blind)
-        .map_err(|e| format!("getrandom for audit ZKP r_blind failed: {e}"))?;
-
-    // 2. R = H("MILNET-ZKP-AUDIT-v1" || r_nonce || r_blind)[..32]
-    let mut rh = Sha512::new();
-    rh.update(b"MILNET-ZKP-AUDIT-v1");
-    rh.update(&r_nonce);
-    rh.update(&r_blind);
-    let r_hash = rh.finalize();
-    let mut r_commitment = [0u8; 32];
-    r_commitment.copy_from_slice(&r_hash[..32]);
-
-    // 3. Challenge c = H("MILNET-ZKP-AUDIT-CHAL" || commitment || R || chain_length)
-    let mut challenge_input = Vec::with_capacity(22 + 32 + 32 + 8);
-    challenge_input.extend_from_slice(b"MILNET-ZKP-AUDIT-CHAL");
-    challenge_input.extend_from_slice(&commitment);
-    challenge_input.extend_from_slice(&r_commitment);
-    challenge_input.extend_from_slice(&chain_length.to_le_bytes());
-    let challenge_hash = Sha512::digest(&challenge_input);
-
-    // 4. Response: s[i] = r_nonce[i] XOR (c[i % 64] AND chain_root[i]) for i in 0..64
-    //    This hides chain_root behind the random nonce while binding to the challenge.
-    let mut s_response = [0u8; 64];
-    for i in 0..64 {
-        s_response[i] = r_nonce[i] ^ (challenge_hash[i % 64] & chain_root[i]);
-    }
-
-    // Proof hash binds commitment + chain_length + R + s_response.
-    let mut proof_input: Vec<u8> = Vec::with_capacity(19 + 32 + 8 + 32 + 64);
-    proof_input.extend_from_slice(b"MILNET-ZKP-AUDIT-v1");
-    proof_input.extend_from_slice(&commitment);
-    proof_input.extend_from_slice(&chain_length.to_le_bytes());
-    proof_input.extend_from_slice(&r_commitment);
-    proof_input.extend_from_slice(&s_response);
-    let proof_hash = Sha512::digest(&proof_input);
-
-    // Proof contains ONLY: R || s_response || proof_hash.
-    // The chain_root and blinding are NOT included (zero-knowledge).
-    let mut proof = Vec::with_capacity(32 + 64 + 64);
-    proof.extend_from_slice(&r_commitment);
-    proof.extend_from_slice(&s_response);
-    proof.extend_from_slice(&proof_hash);
-
-    Ok(AuditIntegrityProof { commitment, proof, chain_length })
+    _chain_root: &[u8; 64],
+    _chain_length: u64,
+    _blinding: &[u8; 32],
+) -> Result<AuditIntegrityProof, ZkpUnavailable> {
+    Err(ZkpUnavailable)
 }
 
-/// Verify an audit integrity proof against an expected chain length.
-///
-/// Proof layout: R(32) || s_response(64) || proof_hash(64)
-///
-/// The verifier checks:
-/// 1. Chain length matches expected.
-/// 2. The proof hash is correctly derived from (commitment, chain_length, R, s_response).
-/// 3. The commitment was included in the challenge derivation (Fiat-Shamir binding).
-///
-/// The verifier does NOT see the chain_root or blinding (zero-knowledge).
-pub fn verify_audit_integrity(proof: &AuditIntegrityProof, expected_length: u64) -> bool {
-    if proof.chain_length != expected_length {
-        return false;
-    }
-    const MIN_LEN: usize = 32 + 64 + 64;
-    if proof.proof.len() < MIN_LEN {
-        return false;
-    }
-
-    let r_commitment = match proof.proof.get(..32) {
-        Some(s) => s,
-        None => return false,
-    };
-    let s_response = match proof.proof.get(32..96) {
-        Some(s) => s,
-        None => return false,
-    };
-    let proof_hash = match proof.proof.get(96..160) {
-        Some(s) => s,
-        None => return false,
-    };
-
-    // Verify the Fiat-Shamir challenge is correctly bound.
-    // Recompute: c = H("MILNET-ZKP-AUDIT-CHAL" || commitment || R || chain_length)
-    let mut challenge_input = Vec::with_capacity(22 + 32 + 32 + 8);
-    challenge_input.extend_from_slice(b"MILNET-ZKP-AUDIT-CHAL");
-    challenge_input.extend_from_slice(&proof.commitment);
-    challenge_input.extend_from_slice(r_commitment);
-    challenge_input.extend_from_slice(&proof.chain_length.to_le_bytes());
-    let _challenge_hash = Sha512::digest(&challenge_input);
-
-    // Re-derive proof hash and verify it binds all components.
-    let mut proof_input: Vec<u8> = Vec::with_capacity(19 + 32 + 8 + 32 + 64);
-    proof_input.extend_from_slice(b"MILNET-ZKP-AUDIT-v1");
-    proof_input.extend_from_slice(&proof.commitment);
-    proof_input.extend_from_slice(&proof.chain_length.to_le_bytes());
-    proof_input.extend_from_slice(r_commitment);
-    proof_input.extend_from_slice(s_response);
-    let expected_hash = Sha512::digest(&proof_input);
-
-    ct_eq(&expected_hash, proof_hash)
+/// **DISABLED.** Always returns `false` (fail-closed). See [`prove_audit_integrity`].
+pub fn verify_audit_integrity(_proof: &AuditIntegrityProof, _expected_length: u64) -> bool {
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -447,72 +229,7 @@ mod tests {
     }
 
     #[test]
-    fn test_zkp_classification_proof_valid() {
-        let blinding = random_blinding();
-        let proof = prove_classification_range(4, 2, &blinding)
-            .expect("prove must succeed for clearance 4 >= 2");
-        assert!(verify_classification_range(&proof), "valid proof must verify");
-    }
-
-    #[test]
-    fn test_zkp_classification_proof_below_minimum() {
-        let blinding = random_blinding();
-        let result = prove_classification_range(1, 3, &blinding);
-        assert!(result.is_err(), "prove must fail for clearance 1 < 3");
-    }
-
-    #[test]
-    fn test_zkp_classification_verify_tampered() {
-        let blinding = random_blinding();
-        let mut proof = prove_classification_range(5, 2, &blinding)
-            .expect("prove must succeed");
-        // Flip a byte in the middle of the proof data.
-        if let Some(b) = proof.proof.get_mut(50) {
-            *b ^= 0xFF;
-        }
-        assert!(!verify_classification_range(&proof), "tampered proof must not verify");
-    }
-
-    #[test]
-    fn test_zkp_compliance_threshold_met() {
-        let blinding = random_blinding();
-        let att = prove_compliance_threshold(18, 24, 15, &blinding)
-            .expect("prove must succeed for 18 >= 15");
-        assert!(verify_compliance_threshold(&att), "valid attestation must verify");
-    }
-
-    #[test]
-    fn test_zkp_compliance_threshold_not_met() {
-        let blinding = random_blinding();
-        let result = prove_compliance_threshold(10, 24, 15, &blinding);
-        assert!(result.is_err(), "prove must fail for 10 < 15");
-    }
-
-    #[test]
-    fn test_zkp_audit_integrity_valid() {
-        let blinding = random_blinding();
-        let mut root = [0u8; 64];
-        getrandom::getrandom(&mut root).expect("getrandom failed");
-        let proof = prove_audit_integrity(&root, 42, &blinding)
-            .expect("prove must succeed");
-        assert!(verify_audit_integrity(&proof, 42), "valid proof must verify");
-    }
-
-    #[test]
-    fn test_zkp_audit_integrity_wrong_length() {
-        let blinding = random_blinding();
-        let mut root = [0u8; 64];
-        getrandom::getrandom(&mut root).expect("getrandom failed");
-        let proof = prove_audit_integrity(&root, 42, &blinding)
-            .expect("prove must succeed");
-        assert!(
-            !verify_audit_integrity(&proof, 99),
-            "wrong expected length must cause verification failure"
-        );
-    }
-
-    #[test]
-    fn test_zkp_commitment_deterministic() {
+    fn commitment_is_deterministic() {
         let blinding = random_blinding();
         let c1 = commit(1234, &blinding);
         let c2 = commit(1234, &blinding);
@@ -520,12 +237,58 @@ mod tests {
     }
 
     #[test]
-    fn test_zkp_commitment_different_blinding() {
+    fn commitment_differs_with_blinding() {
         let b1 = random_blinding();
         let b2 = random_blinding();
-        let c1 = commit(999, &b1);
-        let c2 = commit(999, &b2);
-        // Two different blindings must (overwhelmingly) produce different commitments.
-        assert_ne!(c1, c2, "different blindings must produce different commitments");
+        assert_ne!(
+            commit(999, &b1),
+            commit(999, &b2),
+            "different blindings must produce different commitments"
+        );
+    }
+
+    /// The disabled prover entry points must never hand back a proof.
+    #[test]
+    fn provers_are_disabled_fail_closed() {
+        let blinding = random_blinding();
+        assert!(prove_range_gte(100, 50, &blinding).is_err());
+        assert!(prove_classification_range(4, 2, &blinding).is_err());
+        assert!(prove_compliance_threshold(18, 24, 15, &blinding).is_err());
+        assert!(prove_audit_integrity(&[0u8; 64], 42, &blinding).is_err());
+    }
+
+    /// Verification must reject every proof, including a hand-crafted one,
+    /// so an attacker cannot smuggle an unsound transcript past the verifier.
+    #[test]
+    fn verifiers_reject_forged_proofs() {
+        let forged_range = RangeProof {
+            commitment: [0u8; 32],
+            proof_data: vec![0u8; 200],
+            min_value: 0,
+            max_value: u64::MAX,
+        };
+        assert!(!verify_range_gte(&forged_range), "fail-closed: no range proof verifies");
+
+        let forged_class = ClassificationProof {
+            commitment: [0u8; 32],
+            proof: vec![0u8; 200],
+            min_required: 0,
+        };
+        assert!(!verify_classification_range(&forged_class));
+
+        let forged_comp = ComplianceAttestation {
+            commitment: [0u8; 32],
+            proof: vec![0u8; 200],
+            total_checks: 0,
+            threshold: 0,
+        };
+        assert!(!verify_compliance_threshold(&forged_comp));
+
+        let forged_audit = AuditIntegrityProof {
+            commitment: [0u8; 32],
+            proof: vec![0u8; 160],
+            chain_length: 42,
+        };
+        assert!(!verify_audit_integrity(&forged_audit, 42));
     }
 }

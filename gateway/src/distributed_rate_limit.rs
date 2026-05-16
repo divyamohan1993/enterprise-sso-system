@@ -430,6 +430,108 @@ pub enum RedisStream {
     Tls(tokio_rustls::client::TlsStream<tokio::net::TcpStream>),
 }
 
+/// Outcome of parsing a (possibly partial) RESP value from a byte buffer.
+enum RespParse {
+    /// A complete RESP value occupies the first `usize` bytes of the buffer.
+    Complete(usize),
+    /// More bytes are needed to complete the value.
+    Incomplete,
+    /// The bytes cannot form a valid RESP value (protocol error / desync).
+    Invalid,
+}
+
+/// Length-prefix-aware RESP parser.
+///
+/// Returns the byte length of the first complete RESP value at the start of
+/// `buf`, or `Incomplete`/`Invalid`. Unlike a "ends-with-\r\n" check this is
+/// not fooled by `\r\n` embedded inside bulk-string payloads, because bulk
+/// strings and arrays are consumed by their declared length, not by scanning
+/// for terminators.
+///
+/// Supports all five RESP2 types: `+` simple string, `-` error,
+/// `:` integer, `$` bulk string, `*` array (recursively).
+fn resp_value_len(buf: &[u8]) -> RespParse {
+    // Need at least the type byte.
+    let Some(&type_byte) = buf.first() else {
+        return RespParse::Incomplete;
+    };
+    match type_byte {
+        // Line types: terminated by the first CRLF.
+        b'+' | b'-' | b':' => match find_crlf(buf, 1) {
+            Some(end) => RespParse::Complete(end + 2),
+            None => RespParse::Incomplete,
+        },
+        // Bulk string: `$<len>\r\n<len bytes>\r\n` (or `$-1\r\n` for nil).
+        b'$' => {
+            let header_end = match find_crlf(buf, 1) {
+                Some(e) => e,
+                None => return RespParse::Incomplete,
+            };
+            let len: i64 = match std::str::from_utf8(&buf[1..header_end])
+                .ok()
+                .and_then(|s| s.parse().ok())
+            {
+                Some(v) => v,
+                None => return RespParse::Invalid,
+            };
+            if len < 0 {
+                // Nil bulk string — header only.
+                return RespParse::Complete(header_end + 2);
+            }
+            let payload_start = header_end + 2;
+            let total = payload_start + len as usize + 2; // payload + CRLF
+            if buf.len() < total {
+                return RespParse::Incomplete;
+            }
+            // Trailing CRLF must be exactly where the length says.
+            if buf[total - 2] != b'\r' || buf[total - 1] != b'\n' {
+                return RespParse::Invalid;
+            }
+            RespParse::Complete(total)
+        }
+        // Array: `*<count>\r\n` followed by `count` nested RESP values.
+        b'*' => {
+            let header_end = match find_crlf(buf, 1) {
+                Some(e) => e,
+                None => return RespParse::Incomplete,
+            };
+            let count: i64 = match std::str::from_utf8(&buf[1..header_end])
+                .ok()
+                .and_then(|s| s.parse().ok())
+            {
+                Some(v) => v,
+                None => return RespParse::Invalid,
+            };
+            let mut offset = header_end + 2;
+            if count < 0 {
+                // Nil array — header only.
+                return RespParse::Complete(offset);
+            }
+            for _ in 0..count {
+                match resp_value_len(&buf[offset..]) {
+                    RespParse::Complete(n) => offset += n,
+                    RespParse::Incomplete => return RespParse::Incomplete,
+                    RespParse::Invalid => return RespParse::Invalid,
+                }
+            }
+            RespParse::Complete(offset)
+        }
+        _ => RespParse::Invalid,
+    }
+}
+
+/// Find the index of `\r` in the first `\r\n` at or after `start`.
+fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
+    let mut i = start;
+    while i + 1 < buf.len() {
+        if buf[i] == b'\r' && buf[i + 1] == b'\n' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
 impl RedisClient {
     /// Connect to Redis via raw TCP (or TLS if MILNET_REDIS_TLS=1) using RESP protocol.
     /// No external Redis crate needed -- we speak RESP directly.
@@ -553,8 +655,13 @@ impl RedisClient {
 
     /// Send a RESP command and read a complete RESP response.
     ///
-    /// Reads in a loop until a complete RESP response is received (terminated
-    /// by \r\n), with a max buffer of 64 KiB to prevent unbounded reads.
+    /// SECURITY: reads in a loop until exactly ONE complete, well-formed RESP
+    /// value has been received, using a length-prefix-aware parser
+    /// (`resp_value_len`). The previous "buffer ends with \r\n" heuristic was
+    /// unsafe: a bulk-string payload (`$N\r\n<payload-with-CRLF>\r\n`) can
+    /// contain an interior `\r\n`, so the loop could break on a truncated
+    /// response and downstream `lines()`-based parsing could be fed attacker-
+    /// influenced fragments. Capped at 64 KiB to bound the read.
     async fn resp_command(&mut self, args: &[&str]) -> Result<String, String> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -608,9 +715,24 @@ impl RedisClient {
                     MAX_RESP_BUFFER
                 ));
             }
-            // A complete RESP response ends with \r\n
-            if buf.len() >= 2 && buf[buf.len() - 2] == b'\r' && buf[buf.len() - 1] == b'\n' {
-                break;
+            // Break only when the buffer holds exactly one complete RESP value.
+            match resp_value_len(&buf) {
+                RespParse::Complete(len) => {
+                    // A well-behaved Redis sends exactly one reply per command;
+                    // trailing bytes mean a desync — fail closed.
+                    if len != buf.len() {
+                        self.connected = false;
+                        return Err(
+                            "Redis sent trailing bytes after a complete RESP value".into(),
+                        );
+                    }
+                    break;
+                }
+                RespParse::Incomplete => continue,
+                RespParse::Invalid => {
+                    self.connected = false;
+                    return Err("malformed RESP response from Redis".into());
+                }
             }
         }
 
@@ -977,9 +1099,26 @@ impl DistributedRateLimiter {
     /// get a HashMap slot.
     async fn check_local(&self, key: &str, limit: u64) -> RateLimitResult {
         {
+            // The count-min sketch is a cheap, lock-free FLOOD backstop — not
+            // the authoritative limiter. It accumulates over the seed-rotation
+            // period (CMS_SEED_ROTATE_SECS), which can span many rate-limit
+            // windows and is not reset on per-window expiry, so gating it on
+            // the bare per-window `limit` would permanently deny an IP after
+            // `limit` lifetime requests. Precise per-window limiting (with
+            // window reset and denied-request refund) is enforced by the
+            // `local_state` counter below; the sketch only rejects egregious
+            // floods cheaply before the mutex. The threshold is therefore the
+            // larger of (a) the max legitimate volume across one rotation
+            // period and (b) a genuine-flood floor, so ordinary limit
+            // exhaustion plus retries is never penalised by the sketch.
+            let windows_per_rotation =
+                (CMS_SEED_ROTATE_SECS / self.config.window_secs.max(1)).max(1);
+            let cms_flood_threshold = limit
+                .saturating_mul(windows_per_rotation)
+                .max(REDIS_DEGRADED_LOCAL_RPS_PER_IP.saturating_mul(CMS_SEED_ROTATE_SECS));
             let mut cms = self.cms.lock().await;
             let observed = cms.observe(key.as_bytes()) as u64;
-            if observed > limit {
+            if observed > cms_flood_threshold {
                 return RateLimitResult {
                     allowed: false,
                     remaining: 0,

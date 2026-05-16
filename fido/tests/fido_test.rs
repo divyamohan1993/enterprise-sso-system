@@ -468,6 +468,8 @@ fn test_authentication_response_valid() {
         &auth_result,
         &stored,
         rp_id,
+        &challenge,
+        "https://sso.milnet.gov",
         true, // require UV
     );
 
@@ -503,6 +505,8 @@ fn test_authentication_response_wrong_rp_id() {
         &auth_result,
         &stored,
         "evil.example.com",
+        &[42u8; 32],
+        "https://sso.milnet.gov",
         true,
     );
 
@@ -539,6 +543,8 @@ fn test_authentication_response_user_verification_required() {
         &auth_result,
         &stored,
         rp_id,
+        &[42u8; 32],
+        "https://sso.milnet.gov",
         true,
     );
 
@@ -578,6 +584,8 @@ fn test_authentication_response_uv_not_required_passes() {
         &auth_result,
         &stored,
         rp_id,
+        &[42u8; 32],
+        "https://sso.milnet.gov",
         false,
     );
 
@@ -613,6 +621,8 @@ fn test_authentication_response_clone_detection() {
         &auth_result,
         &stored,
         rp_id,
+        &[42u8; 32],
+        "https://sso.milnet.gov",
         true,
     );
 
@@ -1189,7 +1199,7 @@ fn test_credential_store_challenge_lifecycle() {
     let user_id = Uuid::new_v4();
 
     let challenge = vec![10, 20, 30];
-    store.store_challenge(&challenge, user_id);
+    store.store_challenge(&challenge, user_id).unwrap();
 
     // Challenge exists
     assert!(store.has_pending_challenge(&user_id));
@@ -1208,7 +1218,7 @@ fn test_credential_store_consume_for_user() {
     let user_id = Uuid::new_v4();
 
     let challenge = vec![1, 2, 3];
-    store.store_challenge(&challenge, user_id);
+    store.store_challenge(&challenge, user_id).unwrap();
 
     assert!(store.consume_challenge_for_user(&user_id));
     // Already consumed
@@ -1225,9 +1235,9 @@ fn test_credential_store_multiple_users() {
     let cred2 = make_stored_credential(vec![2], vec![20], user1, 0, "cross-platform");
     let cred3 = make_stored_credential(vec![3], vec![30], user2, 0, "platform");
 
-    store.store_credential(cred1);
-    store.store_credential(cred2);
-    store.store_credential(cred3);
+    store.store_credential(cred1).unwrap();
+    store.store_credential(cred2).unwrap();
+    store.store_credential(cred3).unwrap();
 
     assert_eq!(store.credential_count(), 3);
     assert_eq!(store.get_user_credentials(&user1).len(), 2);
@@ -1246,7 +1256,7 @@ fn test_credential_store_get_credential_mut() {
         user_id,
         0,
         "platform",
-    ));
+    )).unwrap();
 
     // Mutate the sign count
     let cred = store.get_credential_mut(&cred_id).unwrap();
@@ -1261,10 +1271,10 @@ fn test_credential_store_remove_user_credentials() {
     let user1 = Uuid::new_v4();
     let user2 = Uuid::new_v4();
 
-    store.store_credential(make_stored_credential(vec![1], vec![10], user1, 0, "platform"));
-    store.store_credential(make_stored_credential(vec![2], vec![20], user2, 0, "platform"));
-    store.store_challenge(&[1, 2, 3], user1);
-    store.store_challenge(&[4, 5, 6], user2);
+    store.store_credential(make_stored_credential(vec![1], vec![10], user1, 0, "platform")).unwrap();
+    store.store_credential(make_stored_credential(vec![2], vec![20], user2, 0, "platform")).unwrap();
+    store.store_challenge(&[1, 2, 3], user1).unwrap();
+    store.store_challenge(&[4, 5, 6], user2).unwrap();
 
     assert_eq!(store.credential_count(), 2);
 
@@ -1428,7 +1438,7 @@ fn test_full_registration_and_authentication_flow() {
     let reg_auth_data = make_attestation_auth_data(rp_id, 0x45, 0, &cred_id, &cred_cose_key);
 
     // Store the challenge and register
-    store.store_challenge(&reg_options.challenge, user_id);
+    store.store_challenge(&reg_options.challenge, user_id).unwrap();
 
     let reg_result =
         validate_and_register(&mut store, &reg_auth_data, rp_id, user_id, "platform");
@@ -1480,6 +1490,8 @@ fn test_full_registration_and_authentication_flow() {
         &auth_result,
         &verify_cred,
         rp_id,
+        &auth_options.challenge,
+        "https://sso.milnet.gov",
         true,
     );
 
@@ -1500,7 +1512,7 @@ fn test_challenge_consumed_immediately_succeeds() {
     let user_id = Uuid::new_v4();
     let challenge = vec![0xCA, 0xFE, 0xBA, 0xBE];
 
-    store.store_challenge(&challenge, user_id);
+    store.store_challenge(&challenge, user_id).unwrap();
     // Consuming immediately (well within 60s) must succeed.
     let result = store.consume_challenge(&challenge);
     assert_eq!(result, Some(user_id), "challenge consumed immediately must return the user ID");
@@ -1512,7 +1524,7 @@ fn test_challenge_consumed_only_once() {
     let user_id = Uuid::new_v4();
     let challenge = vec![0xDE, 0xAD];
 
-    store.store_challenge(&challenge, user_id);
+    store.store_challenge(&challenge, user_id).unwrap();
     assert_eq!(store.consume_challenge(&challenge), Some(user_id));
     // Second consume must return None — challenge is single-use.
     assert_eq!(store.consume_challenge(&challenge), None, "challenge must be single-use");
@@ -1525,7 +1537,7 @@ fn test_cleanup_expired_challenges_removes_old_entries() {
 
     // Store a challenge that is fresh (just created).
     let fresh_challenge = vec![0x01];
-    store.store_challenge(&fresh_challenge, user_id);
+    store.store_challenge(&fresh_challenge, user_id).unwrap();
 
     // The fresh challenge should survive cleanup.
     store.cleanup_expired_challenges();
@@ -1546,11 +1558,11 @@ fn test_store_challenge_triggers_cleanup() {
 
     // Store a challenge for user A.
     let challenge_a = vec![0xAA];
-    store.store_challenge(&challenge_a, user_a);
+    store.store_challenge(&challenge_a, user_a).unwrap();
 
     // Store another challenge for user B — this triggers cleanup internally.
     let challenge_b = vec![0xBB];
-    store.store_challenge(&challenge_b, user_b);
+    store.store_challenge(&challenge_b, user_b).unwrap();
 
     // Both fresh challenges must still be consumable.
     assert_eq!(store.consume_challenge(&challenge_a), Some(user_a));
@@ -1563,7 +1575,7 @@ fn test_consume_challenge_for_user_works_for_fresh_challenge() {
     let user_id = Uuid::new_v4();
     let challenge = vec![0xCC];
 
-    store.store_challenge(&challenge, user_id);
+    store.store_challenge(&challenge, user_id).unwrap();
     // consume_challenge_for_user should find and consume it.
     assert!(store.consume_challenge_for_user(&user_id));
     // After consumption, no pending challenge should remain.

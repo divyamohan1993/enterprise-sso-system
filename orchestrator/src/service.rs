@@ -31,9 +31,18 @@ fn verify_receipt_independently(
     ceremony_session_id: &[u8; 32],
     receipt_signing_seed: &[u8; 32],
 ) -> Result<(), String> {
-    // 1. Verify receipt signature (ML-DSA-87 preferred, HMAC-SHA512 fallback).
-    //    This proves the receipt was signed by the OPAQUE service and has not
-    //    been tampered with in transit.
+    // 1. Verify the receipt signature.
+    //
+    // SECURITY (audit orchestrator P1): ML-DSA-87 verification is MANDATORY.
+    // The previous logic accepted EITHER the quantum-safe ML-DSA-87 signature
+    // OR the symmetric HMAC (`!mldsa_ok && !hmac_ok`). Production OPAQUE only
+    // ever signs with ML-DSA-87, so the HMAC branch was dead in normal
+    // operation but live as an attack surface: the SHARD HMAC key is shared
+    // cluster-wide for transport authentication, so anyone who compromised it
+    // could mint receipts that bypass the asymmetric path entirely. A PQ
+    // posture is only as strong as the weakest accepted scheme — so the
+    // weak alternative is removed. The HMAC is still verified, but only as a
+    // defense-in-depth ADDITIONAL check, never as a substitute.
     let mldsa_ok = {
         // Use the receipt signing seed provided by the caller, which must match
         // the seed used by the OPAQUE service's ReceiptSigner.
@@ -42,9 +51,21 @@ fn verify_receipt_independently(
         let data = crypto::receipts::receipt_signing_data(receipt);
         crypto::receipts::verify_receipt_asymmetric(vk_bytes.as_ref(), &data, &receipt.signature)
     };
+    if !mldsa_ok {
+        return Err(
+            "receipt signature verification failed (ML-DSA-87 invalid — mandatory)".into(),
+        );
+    }
+    // Additional (non-substitutable) HMAC check: only meaningful when the
+    // verification key is independent of the receipt signing key. A mismatch
+    // is logged but does not by itself reject the receipt, because production
+    // OPAQUE does not HMAC-sign receipts; the ML-DSA-87 check above is the
+    // authority.
     let hmac_ok = crypto::receipts::verify_receipt_signature(receipt, hmac_key).unwrap_or(false);
-    if !mldsa_ok && !hmac_ok {
-        return Err("receipt signature verification failed (neither ML-DSA-87 nor HMAC valid)".into());
+    if !hmac_ok {
+        tracing::debug!(
+            "receipt HMAC not valid (expected when OPAQUE signs with ML-DSA-87 only)"
+        );
     }
 
     // 2. Validate timestamp is within ±10 seconds of current time.
@@ -398,7 +419,21 @@ impl OrchestratorService {
 
     /// Low-level mTLS connect to a single address with timeout.
     async fn try_connect(&self, addr: &str) -> Result<TlsShardTransport, String> {
-        let raw_host = addr.split(':').next().unwrap_or(addr);
+        // Derive the SNI host from `addr`. A naive `split(':').next()` breaks
+        // on IPv6 literals (`[::1]:9101` -> `[`), so parse the host portion
+        // properly: a bracketed IPv6 literal, otherwise the text before the
+        // last ':'. If the host parses as an IP address, SNI uses "localhost"
+        // (an IP literal is not a valid SNI name); otherwise the hostname is
+        // used verbatim.
+        let raw_host: &str = if let Some(rest) = addr.strip_prefix('[') {
+            // "[<ipv6>]:port" or "[<ipv6>]"
+            rest.split(']').next().unwrap_or(rest)
+        } else {
+            match addr.rfind(':') {
+                Some(idx) => &addr[..idx],
+                None => addr,
+            }
+        };
         let sni_host = if raw_host.parse::<std::net::IpAddr>().is_ok() {
             "localhost"
         } else {
@@ -525,11 +560,26 @@ impl OrchestratorService {
         // F9: per-request deadline enforced on every outbound await below.
         let req_deadline = common::deadline::RequestDeadline::new(Self::AUTH_REQUEST_DEADLINE);
 
-        // F4: idempotency key for this outbound RPC sequence. Gateway may pass
-        // correlation_id; if absent, derive a fresh uuid.
-        let idempotency_key: Uuid = request.correlation_id.unwrap_or_else(Uuid::new_v4);
+        // F4: idempotency key for this outbound RPC sequence.
+        //
+        // SECURITY: the key is NOT the raw gateway-supplied correlation_id.
+        // A correlation_id is non-secret (it appears in gateway logs, HTTP
+        // headers and traces); keying the token cache on it alone would let
+        // anyone who observes/guesses it replay the cached token within the
+        // 60s TTL. The key is bound to the request credentials (username +
+        // password + dpop_key_hash), so only a caller that can reproduce the
+        // exact credentials — i.e. the legitimate caller retrying — can hit
+        // the cache. Gateway may pass correlation_id; if absent, derive a
+        // fresh uuid so unrelated requests never share a cache slot.
+        let correlation_id: Uuid = request.correlation_id.unwrap_or_else(Uuid::new_v4);
+        let idempotency_key = crate::idempotency::IdempotencyKey::derive(
+            &correlation_id,
+            &request.username,
+            &request.password,
+            &request.dpop_key_hash,
+        );
         if let Some(cached) = self.idempotency_cache.get(&idempotency_key) {
-            tracing::debug!(key = %idempotency_key, "F4 idempotency cache hit — returning cached response");
+            tracing::debug!(key = ?idempotency_key, "F4 idempotency cache hit — returning cached response");
             return Ok(cached);
         }
 

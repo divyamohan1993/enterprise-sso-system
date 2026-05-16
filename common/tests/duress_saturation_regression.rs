@@ -25,9 +25,15 @@ use uuid::Uuid;
 /// Fire many duress matches in tight succession. Even if some fall back
 /// inline, ALL should land on the callback eventually. The asynchronous
 /// dispatcher gives us at-least-once delivery for genuine duress events.
+///
+/// NOTE: `verify_pin` now uses memory-hard Argon2id (v3 PIN hashing), so a
+/// burst is bounded by real crypto cost, not microseconds. `BURST` is sized
+/// to exercise repeated delivery without making the test pathologically slow;
+/// the invariant under test (at-least-once delivery, no dropped alerts) is
+/// independent of the count.
 #[test]
 fn duress_alerts_survive_burst_load() {
-    const BURST: u32 = 200;
+    const BURST: u32 = 64;
 
     let user = Uuid::new_v4();
     let mut cfg = DuressConfig::new(user, b"normal-pin", b"duress-pin").unwrap();
@@ -44,10 +50,10 @@ fn duress_alerts_survive_burst_load() {
         assert_eq!(res, PinVerification::Duress);
     }
 
-    // Wait up to 10s for the dispatcher (and any inline fallbacks) to
-    // surface every callback. The contract is at-least-once delivery —
-    // we observe count >= BURST.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // Wait for the dispatcher (and any inline fallbacks) to surface every
+    // callback. The contract is at-least-once delivery — we observe
+    // count >= BURST. The deadline is generous to tolerate slow CI hosts.
+    let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         if count.load(Ordering::SeqCst) >= BURST {
             break;
@@ -62,23 +68,36 @@ fn duress_alerts_survive_burst_load() {
     );
 }
 
-/// Verify-pin must NEVER block on the dispatcher channel — burst load
-/// is bounded by the call's own crypto cost, not by queue drain.
+/// Verify-pin must NEVER block on the dispatcher channel — a burst is
+/// bounded by the call's own (memory-hard Argon2id) crypto cost, not by
+/// queue drain. We test this invariant *relative to* the crypto baseline so
+/// the assertion is robust to host speed: a first call establishes the
+/// inherent cost, then every subsequent call under burst load must stay
+/// within a small multiple of that baseline. Channel blocking would add
+/// unbounded dispatcher-drain latency far beyond this bound.
 #[test]
 fn verify_pin_does_not_block_under_saturation() {
     let user = Uuid::new_v4();
     let cfg = DuressConfig::new(user, b"normal-pin", b"duress-pin").unwrap();
 
-    // 64 successive duress calls — enough to saturate a bounded channel
-    // if the dispatcher is slow. Each call must return promptly.
-    for _ in 0..64 {
+    // Baseline: cost of a single verify_pin with an empty dispatcher queue.
+    let warm = Instant::now();
+    assert_eq!(cfg.verify_pin(b"duress-pin"), PinVerification::Duress);
+    let baseline = warm.elapsed();
+
+    // A blocked channel would add dispatcher-drain latency; pure crypto
+    // variance stays well within this multiple of the baseline.
+    let ceiling = baseline * 8 + Duration::from_millis(500);
+
+    for _ in 0..32 {
         let started = Instant::now();
         let res = cfg.verify_pin(b"duress-pin");
         let elapsed = started.elapsed();
         assert_eq!(res, PinVerification::Duress);
         assert!(
-            elapsed < Duration::from_secs(1),
-            "verify_pin took {elapsed:?} (saturation should not block)"
+            elapsed < ceiling,
+            "verify_pin took {elapsed:?} (baseline {baseline:?}, ceiling \
+             {ceiling:?}) — the dispatcher channel must not block verify_pin"
         );
     }
 }

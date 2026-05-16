@@ -166,11 +166,18 @@ fn random_canary() -> Result<u64, MemguardError> {
 /// The buffer is bracketed by random canary words that are verified on every
 /// access.  The data region is mlocked to prevent swapping to disk and is
 /// securely zeroed when the buffer is dropped.
+///
+/// SECURITY (audit P1): the secret bytes are held in a `Box<[u8; N]>` so they
+/// live at a **stable heap address**. An inline `[u8; N]` field would be
+/// memcpy'd whenever the `SecretBuffer` is moved (Rust has no move
+/// constructors), so an `mlock` taken in `new()` would cover the constructor's
+/// dead stack frame, not the live buffer. Boxing keeps the mlock'd region
+/// valid for the buffer's whole lifetime regardless of struct moves.
 pub struct SecretBuffer<const N: usize> {
     /// Head canary — set once at construction and checked on every access.
     canary_head: u64,
-    /// The actual secret data.
-    data: [u8; N],
+    /// The actual secret data, heap-pinned via `Box` for a stable address.
+    data: Box<[u8; N]>,
     /// Tail canary — mirrors `canary_head` with an independent random value.
     canary_tail: u64,
     /// HMAC over (nonce, canary_head, canary_tail) computed at construction.
@@ -205,7 +212,9 @@ impl<const N: usize> SecretBuffer<N> {
         };
         let mut buf = Self {
             canary_head: 0,
-            data,
+            // Box the data so it has its final, stable heap address before
+            // mlock — see the struct-level SECURITY note.
+            data: Box::new(data),
             canary_tail: 0,
             canary_hmac: 0,
             canary_nonce: nonce,
@@ -355,6 +364,23 @@ impl<const N: usize> SecretBuffer<N> {
             }
         }
         &mut self.data
+    }
+
+    /// Re-apply `mlock` to the data region at its current (stable) address.
+    ///
+    /// Boxing already guarantees the data address is stable, so callers do
+    /// not need this for correctness. It is retained as an explicit no-cost
+    /// affirmation API parallel to `MasterKey::mlock`; it simply re-locks the
+    /// boxed allocation and returns whether the buffer is locked.
+    pub fn mlock(&mut self) -> bool {
+        if !self.locked {
+            let ptr = self.data.as_ptr();
+            if mlock_slice(ptr, N) {
+                self.locked = true;
+                madv_dontdump(ptr, N);
+            }
+        }
+        self.locked
     }
 
     /// Returns whether this buffer was successfully mlocked.

@@ -197,38 +197,71 @@ impl VerifiableCredential {
 
     /// Compute the canonical hash of this credential (excluding the proof).
     /// This is the message that gets signed. Uses SHA-512 for CNSA 2.0 compliance.
+    ///
+    /// SECURITY (audit P1): every variable-length field is absorbed with an
+    /// explicit 8-byte little-endian length prefix, and every collection with
+    /// an 8-byte element count, so the hash is an unambiguous encoding of the
+    /// credential. Without this, concatenation collisions are trivial — e.g.
+    /// `("foo","bar")` and `("foob","ar")` would otherwise digest identically,
+    /// letting a signature issued on one credential authorise another. The
+    /// `v3` domain tag distinguishes this canonicalisation from the prior
+    /// (unprefixed) `v2` scheme so old and new digests can never be confused.
     pub fn canonical_hash(&self) -> [u8; 64] {
         let mut hasher = Sha512::new();
-        hasher.update(b"MILNET-VC-HASH-v2");
+        hasher.update(b"MILNET-VC-HASH-v3");
 
-        // Hash the contexts
+        /// Absorb a length-prefixed byte string (8-byte LE length || bytes).
+        fn absorb(hasher: &mut Sha512, bytes: &[u8]) {
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        }
+        /// Absorb a collection length as an 8-byte LE count.
+        fn absorb_count(hasher: &mut Sha512, count: usize) {
+            hasher.update((count as u64).to_le_bytes());
+        }
+
+        // Contexts: count, then each length-prefixed.
+        absorb_count(&mut hasher, self.contexts.len());
         for ctx in &self.contexts {
-            hasher.update(ctx.as_str().as_bytes());
+            absorb(&mut hasher, ctx.as_str().as_bytes());
         }
 
-        hasher.update(self.id.as_bytes());
+        absorb(&mut hasher, self.id.as_bytes());
 
+        // Credential types: count, then each length-prefixed.
+        absorb_count(&mut hasher, self.credential_type.len());
         for t in &self.credential_type {
-            hasher.update(t.as_bytes());
+            absorb(&mut hasher, t.as_bytes());
         }
 
-        hasher.update(self.issuer.as_bytes());
-        hasher.update(self.issuance_date.as_bytes());
+        absorb(&mut hasher, self.issuer.as_bytes());
+        absorb(&mut hasher, self.issuance_date.as_bytes());
 
-        if let Some(ref exp) = self.expiration_date {
-            hasher.update(exp.as_bytes());
+        // Optional fields: a 1-byte presence flag prevents a present-empty
+        // value from colliding with an absent one.
+        match &self.expiration_date {
+            Some(exp) => {
+                hasher.update([1u8]);
+                absorb(&mut hasher, exp.as_bytes());
+            }
+            None => hasher.update([0u8]),
         }
 
-        hasher.update(self.subject.id.as_bytes());
+        absorb(&mut hasher, self.subject.id.as_bytes());
+        absorb_count(&mut hasher, self.subject.claims.len());
         for (k, v) in &self.subject.claims {
-            hasher.update(k.as_bytes());
-            hasher.update(v.as_bytes());
+            absorb(&mut hasher, k.as_bytes());
+            absorb(&mut hasher, v.as_bytes());
         }
 
-        if let Some(ref status) = self.credential_status {
-            hasher.update(status.status_list_credential.as_bytes());
-            hasher.update(status.status_list_index.to_le_bytes());
-            hasher.update(status.status_purpose.as_bytes());
+        match &self.credential_status {
+            Some(status) => {
+                hasher.update([1u8]);
+                absorb(&mut hasher, status.status_list_credential.as_bytes());
+                hasher.update(status.status_list_index.to_le_bytes());
+                absorb(&mut hasher, status.status_purpose.as_bytes());
+            }
+            None => hasher.update([0u8]),
         }
 
         let result = hasher.finalize();

@@ -137,8 +137,8 @@ fn test_admin_role_key_labels_unique() {
 
 #[test]
 fn test_derive_admin_role_key_deterministic() {
-    let k1 = derive_admin_role_key(AdminRole::Auditor);
-    let k2 = derive_admin_role_key(AdminRole::Auditor);
+    let k1 = derive_admin_role_key(AdminRole::Auditor, "test-admin-api-key");
+    let k2 = derive_admin_role_key(AdminRole::Auditor, "test-admin-api-key");
     assert_eq!(k1, k2);
 }
 
@@ -152,7 +152,7 @@ fn test_derive_admin_role_key_unique_per_role() {
         AdminRole::ReadOnly,
     ]
     .iter()
-    .map(|r| derive_admin_role_key(*r))
+    .map(|r| derive_admin_role_key(*r, "test-admin-api-key"))
     .collect();
     let unique: std::collections::HashSet<&String> = keys.iter().collect();
     assert_eq!(keys.len(), unique.len(), "each role must derive a unique key");
@@ -160,7 +160,7 @@ fn test_derive_admin_role_key_unique_per_role() {
 
 #[test]
 fn test_derive_admin_role_key_is_hex_encoded() {
-    let key = derive_admin_role_key(AdminRole::SuperAdmin);
+    let key = derive_admin_role_key(AdminRole::SuperAdmin, "test-admin-api-key");
     assert_eq!(key.len(), 64, "32-byte key hex-encoded is 64 chars");
     assert!(
         key.chars().all(|c| c.is_ascii_hexdigit()),
@@ -425,15 +425,15 @@ fn test_admin_role_key_is_not_api_key() {
     // derive_admin_role_key produces deterministic role-specific keys,
     // but these are NOT the admin API key. The admin API key comes from
     // ADMIN_API_KEY env var with no derivation fallback.
-    let role_key = derive_admin_role_key(AdminRole::SuperAdmin);
+    let role_key = derive_admin_role_key(AdminRole::SuperAdmin, "test-admin-api-key");
     assert_eq!(role_key.len(), 64, "role key is 64 hex chars (32 bytes)");
 
     // Role keys are deterministic from a static seed
-    let role_key2 = derive_admin_role_key(AdminRole::SuperAdmin);
+    let role_key2 = derive_admin_role_key(AdminRole::SuperAdmin, "test-admin-api-key");
     assert_eq!(role_key, role_key2, "role key derivation is deterministic");
 
     // Different roles produce different keys
-    let auditor_key = derive_admin_role_key(AdminRole::Auditor);
+    let auditor_key = derive_admin_role_key(AdminRole::Auditor, "test-admin-api-key");
     assert_ne!(
         role_key, auditor_key,
         "different roles must derive different keys"

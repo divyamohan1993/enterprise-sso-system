@@ -38,6 +38,11 @@ pub struct VerifyRequest {
     /// If provided (key + current epoch), the verifier will verify
     /// the token's ratchet tag and epoch window.
     pub ratchet_state: Option<RatchetState>,
+    /// Expected ceremony session id for ceremony-binding enforcement.
+    /// A token carrying a non-zero `ceremony_id` is REJECTED unless the
+    /// caller supplies the matching ceremony id here. Callers verifying
+    /// non-ceremony-bound tokens leave this `None`.
+    pub expected_ceremony_id: Option<[u8; 32]>,
 }
 
 /// Ratchet verification state carried in a verify request.

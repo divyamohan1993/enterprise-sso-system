@@ -1051,8 +1051,18 @@ fn encode_cbor_bstr(out: &mut Vec<u8>, data: &[u8]) {
 
 /// Full authentication response verification pipeline.
 ///
-/// Validates authenticator data structure, RP ID, flags, sign count,
-/// and the assertion signature using ECDSA P-256.
+/// SECURITY (audit fido P0): challenge and origin binding is mandatory.
+/// This function previously omitted all clientDataJSON checks, which left
+/// replay/phishing protection entirely to the caller — and the in-tree
+/// caller did not perform it. Challenge and origin are now required
+/// parameters, so the type system makes it impossible to authenticate a
+/// WebAuthn assertion without binding it to the ceremony challenge and the
+/// expected origin. The challenge MUST be the single-use value issued by
+/// `create_authentication_options` and consumed by the caller.
+///
+/// Validates: clientDataJSON (`type` == `webauthn.get`, challenge, origin),
+/// authenticator data structure, RP ID, flags, sign count, and the
+/// assertion signature.
 ///
 /// `require_user_verification`: set to `true` when policy demands UV.
 ///
@@ -1061,8 +1071,20 @@ pub fn verify_authentication_response(
     auth_result: &crate::types::AuthenticationResult,
     stored_credential: &crate::types::StoredCredential,
     expected_rp_id: &str,
+    expected_challenge: &[u8],
+    expected_origin: &str,
     require_user_verification: bool,
 ) -> Result<u32, &'static str> {
+    // 0. Validate clientDataJSON: type == "webauthn.get", challenge binding
+    //    (anti-replay), and origin binding (anti-phishing). MUST run before
+    //    any signature work so a wrong-ceremony / wrong-origin assertion is
+    //    rejected unconditionally.
+    validate_client_data_authentication(
+        &auth_result.client_data,
+        expected_challenge,
+        expected_origin,
+    )?;
+
     // 1. Parse authenticator data
     let parsed = parse_authenticator_data(&auth_result.authenticator_data)?;
 
@@ -1125,10 +1147,15 @@ pub fn verify_authentication_response(
 /// While `cloned_flag` is set every subsequent call returns Err immediately
 /// (no signature verification, no token issuance) until an admin clears the
 /// flag via re-enrollment.
+///
+/// SECURITY (audit fido P0): challenge and origin binding is mandatory — see
+/// [`verify_authentication_response`].
 pub fn verify_authentication_response_with_lockout(
     auth_result: &crate::types::AuthenticationResult,
     stored_credential: &mut crate::types::StoredCredential,
     expected_rp_id: &str,
+    expected_challenge: &[u8],
+    expected_origin: &str,
     require_user_verification: bool,
 ) -> Result<u32, &'static str> {
     if stored_credential.cloned_flag {
@@ -1139,6 +1166,14 @@ pub fn verify_authentication_response_with_lockout(
         );
         return Err("Credential locked: cloned authenticator detected — admin re-enrollment required");
     }
+
+    // Challenge + origin binding (anti-replay / anti-phishing) before any
+    // signature work.
+    validate_client_data_authentication(
+        &auth_result.client_data,
+        expected_challenge,
+        expected_origin,
+    )?;
 
     let parsed = parse_authenticator_data(&auth_result.authenticator_data)?;
     validate_rp_id_hash(&parsed, expected_rp_id)?;
@@ -1196,8 +1231,9 @@ pub fn verify_authentication_response_with_lockout(
 
 /// Full authentication response verification with client data validation.
 ///
-/// Like [`verify_authentication_response`] but also validates the client data JSON
-/// (type, challenge, origin) before verifying the signature.
+/// Retained for source compatibility: [`verify_authentication_response`] now
+/// performs clientDataJSON (type/challenge/origin) validation itself, so this
+/// is a direct alias. Prefer calling [`verify_authentication_response`].
 pub fn verify_authentication_response_full(
     auth_result: &crate::types::AuthenticationResult,
     stored_credential: &crate::types::StoredCredential,
@@ -1206,18 +1242,12 @@ pub fn verify_authentication_response_full(
     expected_origin: &str,
     require_user_verification: bool,
 ) -> Result<u32, &'static str> {
-    // 0. Validate client data JSON
-    validate_client_data_authentication(
-        &auth_result.client_data,
-        expected_challenge,
-        expected_origin,
-    )?;
-
-    // Delegate to the core verification pipeline
     verify_authentication_response(
         auth_result,
         stored_credential,
         expected_rp_id,
+        expected_challenge,
+        expected_origin,
         require_user_verification,
     )
 }
@@ -2535,11 +2565,13 @@ mod tests {
         use uuid::Uuid;
 
         let rp_id = "sso.milnet.example";
+        let origin = "https://sso.milnet.example";
+        let challenge = b"sign-count-challenge";
         let user_id = Uuid::new_v4();
 
         // flags: UP | UV = 0x05, sign_count = 10
         let auth_data = make_auth_data(rp_id, 0x05, 10);
-        let client_data = b"test-client-data".to_vec();
+        let client_data = make_client_data_json("webauthn.get", challenge, origin);
 
         let (signature, public_key) = sign_auth_data(&auth_data, &client_data);
 
@@ -2564,7 +2596,9 @@ mod tests {
         pq_attestation: Vec::new()
         };
 
-        let new_count = verify_authentication_response(&auth_result, &stored, rp_id, true).unwrap();
+        let new_count = verify_authentication_response(
+            &auth_result, &stored, rp_id, challenge, origin, true,
+        ).unwrap();
         assert_eq!(new_count, 10);
     }
 
@@ -2574,6 +2608,8 @@ mod tests {
         use uuid::Uuid;
 
         let rp_id = "sso.milnet.example";
+        let origin = "https://sso.milnet.example";
+        let challenge = b"clone-detect-challenge";
         let user_id = Uuid::new_v4();
 
         // sign_count = 5 in authenticator data, but stored is 10
@@ -2582,7 +2618,7 @@ mod tests {
         let auth_result = AuthenticationResult {
             credential_id: vec![1, 2, 3],
             authenticator_data: auth_data,
-            client_data: b"test".to_vec(),
+            client_data: make_client_data_json("webauthn.get", challenge, origin),
             signature: vec![0x30, 0x44],
         };
 
@@ -2599,7 +2635,9 @@ mod tests {
         pq_attestation: Vec::new()
         };
 
-        let err = verify_authentication_response(&auth_result, &stored, rp_id, true).unwrap_err();
+        let err = verify_authentication_response(
+            &auth_result, &stored, rp_id, challenge, origin, true,
+        ).unwrap_err();
         assert_eq!(err, "Possible authenticator clone detected");
     }
 
@@ -2609,12 +2647,14 @@ mod tests {
         use uuid::Uuid;
 
         let rp_id = "sso.milnet.example";
+        let origin = "https://sso.milnet.example";
+        let challenge = b"equal-count-challenge";
         let auth_data = make_auth_data(rp_id, 0x05, 5);
 
         let auth_result = AuthenticationResult {
             credential_id: vec![1, 2, 3],
             authenticator_data: auth_data,
-            client_data: b"test".to_vec(),
+            client_data: make_client_data_json("webauthn.get", challenge, origin),
             signature: vec![0x30, 0x44],
         };
 
@@ -2631,7 +2671,9 @@ mod tests {
         pq_attestation: Vec::new()
         };
 
-        let err = verify_authentication_response(&auth_result, &stored, rp_id, true).unwrap_err();
+        let err = verify_authentication_response(
+            &auth_result, &stored, rp_id, challenge, origin, true,
+        ).unwrap_err();
         assert_eq!(err, "Possible authenticator clone detected");
     }
 
@@ -2641,9 +2683,11 @@ mod tests {
         use uuid::Uuid;
 
         let rp_id = "sso.milnet.example";
+        let origin = "https://sso.milnet.example";
+        let challenge = b"zero-counter-challenge";
         // Both stored and reported sign counts are 0 (authenticator doesn't support counters)
         let auth_data = make_auth_data(rp_id, 0x05, 0);
-        let client_data = b"test".to_vec();
+        let client_data = make_client_data_json("webauthn.get", challenge, origin);
 
         let (signature, public_key) = sign_auth_data(&auth_data, &client_data);
 
@@ -2667,7 +2711,9 @@ mod tests {
         pq_attestation: Vec::new()
         };
 
-        let result = verify_authentication_response(&auth_result, &stored, rp_id, true);
+        let result = verify_authentication_response(
+            &auth_result, &stored, rp_id, challenge, origin, true,
+        );
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
     }
@@ -2677,13 +2723,15 @@ mod tests {
         use crate::types::{AuthenticationResult, StoredCredential};
         use uuid::Uuid;
 
+        let origin = "https://sso.milnet.example";
+        let challenge = b"rp-mismatch-challenge";
         // Auth data is for "evil.com", but we expect "sso.milnet.example"
         let auth_data = make_auth_data("evil.com", 0x05, 1);
 
         let auth_result = AuthenticationResult {
             credential_id: vec![1, 2, 3],
             authenticator_data: auth_data,
-            client_data: b"test".to_vec(),
+            client_data: make_client_data_json("webauthn.get", challenge, origin),
             signature: vec![0x30, 0x44],
         };
 
@@ -2700,8 +2748,9 @@ mod tests {
         pq_attestation: Vec::new()
         };
 
-        let err = verify_authentication_response(&auth_result, &stored, "sso.milnet.example", true)
-            .unwrap_err();
+        let err = verify_authentication_response(
+            &auth_result, &stored, "sso.milnet.example", challenge, origin, true,
+        ).unwrap_err();
         assert_eq!(err, "RP ID hash mismatch");
     }
 
@@ -2711,9 +2760,11 @@ mod tests {
         use uuid::Uuid;
 
         let rp_id = "sso.milnet.example";
+        let origin = "https://sso.milnet.example";
+        let challenge = b"uv-test-challenge";
         // flags: UP only (0x01), no UV
         let auth_data = make_auth_data(rp_id, 0x01, 1);
-        let client_data = b"test".to_vec();
+        let client_data = make_client_data_json("webauthn.get", challenge, origin);
 
         let (signature, public_key) = sign_auth_data(&auth_data, &client_data);
 
@@ -2738,7 +2789,9 @@ mod tests {
         };
 
         // UV not required -- should pass
-        let result = verify_authentication_response(&auth_result, &stored, rp_id, false);
+        let result = verify_authentication_response(
+            &auth_result, &stored, rp_id, challenge, origin, false,
+        );
         assert!(result.is_ok());
 
         // UV required -- should fail (fails before signature verification)
@@ -2746,10 +2799,12 @@ mod tests {
         let auth_result2 = AuthenticationResult {
             credential_id: vec![1, 2, 3],
             authenticator_data: auth_data2,
-            client_data: b"test".to_vec(),
+            client_data: make_client_data_json("webauthn.get", challenge, origin),
             signature: vec![0x30, 0x44],
         };
-        let err = verify_authentication_response(&auth_result2, &stored, rp_id, true).unwrap_err();
+        let err = verify_authentication_response(
+            &auth_result2, &stored, rp_id, challenge, origin, true,
+        ).unwrap_err();
         assert_eq!(err, "User Verified flag not set but required by policy");
     }
 
@@ -3262,9 +3317,11 @@ mod tests {
         use uuid::Uuid;
 
         let rp_id = "sso.milnet.example";
+        let origin = "https://sso.milnet.example";
+        let challenge = b"cose-es256-challenge";
         let (signing_key, _, cose) = generate_keypair();
         let auth_data = make_auth_data(rp_id, 0x05, 1);
-        let client_data = b"test-cose-es256".to_vec();
+        let client_data = make_client_data_json("webauthn.get", challenge, origin);
         let client_data_hash = Sha256::digest(&client_data);
         let mut msg = auth_data.clone();
         msg.extend_from_slice(&client_data_hash);
@@ -3288,7 +3345,9 @@ mod tests {
         backup_state: false,
         pq_attestation: Vec::new()
         };
-        let result = verify_authentication_response(&auth_result, &stored, rp_id, true);
+        let result = verify_authentication_response(
+            &auth_result, &stored, rp_id, challenge, origin, true,
+        );
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 1);
     }
@@ -3302,12 +3361,14 @@ mod tests {
         use uuid::Uuid;
 
         let rp_id = "sso.milnet.example";
+        let origin = "https://sso.milnet.example";
+        let challenge = b"rs256-auth-challenge";
         let mut rng = rand::thread_rng();
         let private_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
         let public_key = private_key.to_public_key();
         let cose = encode_cose_key_rs256(&public_key.n().to_bytes_be(), &public_key.e().to_bytes_be());
         let auth_data = make_auth_data(rp_id, 0x05, 1);
-        let client_data = b"test-rs256-auth".to_vec();
+        let client_data = make_client_data_json("webauthn.get", challenge, origin);
         let client_data_hash = Sha256::digest(&client_data);
         let mut msg = auth_data.clone();
         msg.extend_from_slice(&client_data_hash);
@@ -3332,7 +3393,9 @@ mod tests {
         backup_state: false,
         pq_attestation: Vec::new()
         };
-        let result = verify_authentication_response(&auth_result, &stored, rp_id, true);
+        let result = verify_authentication_response(
+            &auth_result, &stored, rp_id, challenge, origin, true,
+        );
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 1);
     }
@@ -3344,12 +3407,14 @@ mod tests {
         use uuid::Uuid;
 
         let rp_id = "sso.milnet.example";
+        let origin = "https://sso.milnet.example";
+        let challenge = b"eddsa-auth-challenge";
         let mut rng = rand::thread_rng();
         let signing_key = SigningKey::generate(&mut rng);
         let public_key = signing_key.verifying_key();
         let cose = encode_cose_key_eddsa(&public_key.to_bytes());
         let auth_data = make_auth_data(rp_id, 0x05, 1);
-        let client_data = b"test-eddsa-auth".to_vec();
+        let client_data = make_client_data_json("webauthn.get", challenge, origin);
         let client_data_hash = Sha256::digest(&client_data);
         let mut msg = auth_data.clone();
         msg.extend_from_slice(&client_data_hash);
@@ -3373,7 +3438,9 @@ mod tests {
         backup_state: false,
         pq_attestation: Vec::new()
         };
-        let result = verify_authentication_response(&auth_result, &stored, rp_id, true);
+        let result = verify_authentication_response(
+            &auth_result, &stored, rp_id, challenge, origin, true,
+        );
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 1);
     }
@@ -3387,11 +3454,13 @@ mod tests {
         use uuid::Uuid;
 
         let rp_id = "sso.milnet.example";
+        let origin = "https://sso.milnet.example";
+        let challenge = b"cross-algo-challenge";
         let (_, _, es256_cose) = generate_keypair();
         let mut rng = rand::thread_rng();
         let rsa_private = RsaPrivateKey::new(&mut rng, 2048).unwrap();
         let auth_data = make_auth_data(rp_id, 0x05, 1);
-        let client_data = b"cross-algo-test".to_vec();
+        let client_data = make_client_data_json("webauthn.get", challenge, origin);
         let client_data_hash = Sha256::digest(&client_data);
         let mut msg = auth_data.clone();
         msg.extend_from_slice(&client_data_hash);
@@ -3417,7 +3486,9 @@ mod tests {
         pq_attestation: Vec::new()
         };
         // ES256 key can't verify RS256 signature
-        assert!(verify_authentication_response(&auth_result, &stored, rp_id, true).is_err());
+        assert!(verify_authentication_response(
+            &auth_result, &stored, rp_id, challenge, origin, true,
+        ).is_err());
     }
 
     // ── FIDO MDS trust store tests ────────────────────────────────────

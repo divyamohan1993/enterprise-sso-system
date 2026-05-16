@@ -2,7 +2,7 @@
 
 use kt::consensus::{
     append_checkpoint, canonical_checkpoint_bytes, hash_checkpoint, last_hash_in_log,
-    sign_checkpoint, synthesize_signing_keys, verify_checkpoint, Checkpoint,
+    sign_checkpoint, synthesize_test_signing_keys, verify_checkpoint, Checkpoint,
     CheckpointSignature, KT_THRESHOLD,
 };
 use tempfile::NamedTempFile;
@@ -22,8 +22,7 @@ fn mk_unsigned(tree_size: u64, prev_hash: [u8; 64], root_fill: u8) -> Checkpoint
 
 #[test]
 fn checkpoint_chain_link_and_quorum_verify() {
-    std::env::set_var("MILNET_MASTER_KEK", "ab".repeat(32));
-    let keys = synthesize_signing_keys();
+    let keys = synthesize_test_signing_keys();
     let vks: Vec<crypto::pq_sign::PqVerifyingKey> = keys
         .iter()
         .map(|k| k.as_ref().unwrap().verifying_key().clone())
@@ -54,25 +53,25 @@ fn checkpoint_chain_link_and_quorum_verify() {
     let count = kt::auditor::verify_log_file(path, &vks).unwrap();
     assert_eq!(count, 2);
 
-    // Tamper detection: overwrite the log with a row whose signatures
-    // have been flipped — auditor must reject.
+    // Tamper detection: overwrite the log with a row whose signed content
+    // (the Merkle root) has been altered. Every quorum signature was computed
+    // over the original `canonical_checkpoint_bytes`, so mutating the root
+    // invalidates ALL of them at once and the quorum collapses. (Flipping a
+    // single signature would not suffice: a KT_THRESHOLD-of-KT_NODES quorum
+    // tolerates individual corrupt signatures by design — that resilience is
+    // the point of the threshold scheme, not a detection gap.)
     let mut tampered = cp0.clone();
-    if let Some(first) = tampered.signatures.get_mut(0) {
-        first.signature[0] ^= 0xFF;
-    }
+    tampered.root[0] ^= 0xFF;
     let mut bytes = serde_json::to_string(&tampered).unwrap();
     bytes.push('\n');
     std::fs::write(path, bytes).unwrap();
     let res = kt::auditor::verify_log_file(path, &vks);
     assert!(res.is_err(), "tampered log must fail auditor");
-
-    std::env::remove_var("MILNET_MASTER_KEK");
 }
 
 #[test]
 fn checkpoint_below_threshold_signatures_rejected() {
-    std::env::set_var("MILNET_MASTER_KEK", "cd".repeat(32));
-    let keys = synthesize_signing_keys();
+    let keys = synthesize_test_signing_keys();
     let vks: Vec<crypto::pq_sign::PqVerifyingKey> = keys
         .iter()
         .map(|k| k.as_ref().unwrap().verifying_key().clone())
@@ -88,8 +87,6 @@ fn checkpoint_below_threshold_signatures_rejected() {
         !verify_checkpoint(&cp, &vks),
         "below-threshold checkpoint must not verify"
     );
-
-    std::env::remove_var("MILNET_MASTER_KEK");
 }
 
 #[test]

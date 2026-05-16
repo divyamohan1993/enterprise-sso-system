@@ -437,9 +437,37 @@ fn load_and_verify_checkpoints(path: &Path) -> Vec<WitnessCheckpoint> {
     verified
 }
 
+/// FIPS 204 base context string for raw ML-DSA-87 signatures.
+///
+/// MUST stay byte-identical to `crypto::pq_sign`'s `CTX_RAW_SIGN`. The
+/// `common` crate cannot depend on `crypto` (that would be a dependency
+/// cycle — `crypto` depends on `common`), so the constant is mirrored here
+/// and pinned by the `WITNESS_CTX_LEN` length assertion below.
+const WITNESS_CTX_RAW_SIGN: &[u8] = b"MILNET-RAW-SIGN-v1";
+
+/// FIPS 204 domain-separation tag bound into every audit-witness checkpoint
+/// signature. MUST be byte-identical to `WITNESS_SIGN_DOMAIN` in
+/// `services/audit-witness/src/main.rs` — exactly 32 bytes
+/// (`pq_sign_raw_domain`/`pq_verify_raw_domain` contract).
+const WITNESS_SIGN_DOMAIN: [u8; 32] = *b"AUDIT-WITNESS-CHECKPOINT-v1\0\0\0\0\0";
+
 /// Verify an ML-DSA-87 signature on checkpoint data.
+///
+/// `data` is the canonical checkpoint payload
+/// (`audit_root || kt_root || sequence_be || timestamp_be`).
+///
+/// SECURITY: this MUST mirror the audit signer end-to-end. The audit service
+/// (`audit/src/main.rs`) hashes the canonical payload with **SHA-256** to a
+/// fixed 32-byte input, then the out-of-process `audit-witness` daemon signs
+/// that hash with `pq_sign_raw_domain`, which binds a witness-specific
+/// 32-byte domain into the FIPS 204 context as `CTX_RAW_SIGN || 0x1F ||
+/// domain`. The previous verify side did neither: it called a plain
+/// `vk.verify()` (EMPTY FIPS 204 context) over the *un-hashed* 144-byte
+/// payload, so no genuine witness signature could ever verify. Reproduce
+/// both steps — SHA-256 of the payload, and the domain-bound context.
 fn verify_checkpoint_signature(vk_bytes: &[u8], data: &[u8], sig_bytes: &[u8]) -> bool {
-    use ml_dsa::{signature::Verifier, EncodedVerifyingKey, MlDsa87, VerifyingKey};
+    use ml_dsa::{EncodedVerifyingKey, MlDsa87, VerifyingKey};
+    use sha2::{Digest, Sha256};
 
     let vk_enc = match EncodedVerifyingKey::<MlDsa87>::try_from(vk_bytes) {
         Ok(enc) => enc,
@@ -450,7 +478,18 @@ fn verify_checkpoint_signature(vk_bytes: &[u8], data: &[u8], sig_bytes: &[u8]) -
         Ok(s) => s,
         Err(_) => return false,
     };
-    vk.verify(data, &sig).is_ok()
+
+    // The witness daemon signs SHA-256(payload), not the raw payload.
+    let digest = Sha256::digest(data);
+
+    // Reconstruct the FIPS 204 context exactly as `pq_sign_raw_domain` does:
+    //   CTX_RAW_SIGN (18) || 0x1F (1) || WITNESS_SIGN_DOMAIN (32) = 51 bytes.
+    let mut ctx = Vec::with_capacity(WITNESS_CTX_RAW_SIGN.len() + 1 + WITNESS_SIGN_DOMAIN.len());
+    ctx.extend_from_slice(WITNESS_CTX_RAW_SIGN);
+    ctx.push(0x1F);
+    ctx.extend_from_slice(&WITNESS_SIGN_DOMAIN);
+
+    vk.verify_with_context(digest.as_slice(), &ctx, &sig)
 }
 
 /// Load all checkpoints from a length-prefixed postcard file.

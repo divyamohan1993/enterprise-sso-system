@@ -9,12 +9,15 @@
 //! Verifying-key pinning mirrors the D4 audit design: `build.rs` produces
 //! `OUT_DIR/pinned_vks.bin` and the runtime loader parses it once at startup.
 //!
-//! Signing-key derivation: in single-process mode all 5 keys are derived from
-//! `master_kek` via HKDF-SHA512 with per-slot info strings, so the local
-//! service can synthesize its own 2-of-5 signatures for local dev/test. In
-//! standalone deployments (one process per VM) only the local slot is
-//! populated and the other signatures must arrive from peers before
-//! `commit_leaf` is called.
+//! Signing-key provisioning: each consensus node holds exactly ONE signing
+//! key — its own. The local node's ML-DSA-87 signing seed is loaded from a
+//! per-node sealed secret (`kt-node-signing-<index>`) that is independently
+//! provisioned on each host. Signing keys are deliberately NOT co-derivable:
+//! the 2-of-5 property requires that compromising one host yields one key,
+//! not five. The corresponding public keys are pinned at build time
+//! (`pinned_vks.bin`) by the release ceremony. A leader collects ≥2 peer
+//! signatures over the leaf bytes before `verify_threshold` accepts an append;
+//! the peer-signature transport is out of scope for this module.
 
 use crypto::pq_sign;
 use ml_dsa::{KeyGen, MlDsa87};
@@ -86,42 +89,136 @@ pub fn require_pinned_vks_or_panic() {
     }
 }
 
-/// Derive the 5 per-node signing keys. In single-process mode all 5 slots
-/// are populated from HKDF(master_kek, slot_info). In standalone mode only
-/// the slot matching `MILNET_KT_NODE_INDEX` is populated.
+/// Load the local node's signing key into its consensus slot.
+///
+/// Returns a `KT_NODES`-length vector in which **at most one** slot is
+/// populated — the slot named by `MILNET_KT_NODE_INDEX`, holding the key
+/// derived from this host's own sealed seed `kt-node-signing-<index>`.
+///
+/// # Why only one key
+///
+/// The previous implementation derived all 5 signing keys from the single
+/// shared `master_kek` via HKDF in "single-process mode". That made the
+/// advertised 2-of-5 quorum theatre: compromising one host yielded every
+/// consensus key. The 2-of-5 property only holds if each key lives on a
+/// separate host and is not derivable from any other host's secrets, so this
+/// function never synthesizes a key it does not own. A leader must collect
+/// the remaining ≥1 peer signature over the wire before `verify_threshold`
+/// will accept an append.
+///
+/// # Test mode
+///
+/// Under `cfg!(test)` all 5 slots are populated from deterministic per-slot
+/// seeds. This is sound for tests only: the tests derive their *own* pinned
+/// verifying keys from the same synthesized keypairs, so no real pinned VK is
+/// ever matched against a co-derived key. Production never takes this branch.
 pub fn synthesize_signing_keys() -> Vec<Option<pq_sign::PqSigningKey>> {
-    use hkdf::Hkdf;
-    use sha2::Sha512;
     use zeroize::Zeroize;
 
-    let standalone = std::env::var("MILNET_KT_STANDALONE").as_deref() == Ok("1")
-        || std::env::var("MILNET_KT_NODE_INDEX").is_ok();
-    let local_slot: Option<usize> = std::env::var("MILNET_KT_NODE_INDEX")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok());
+    if cfg!(test) {
+        return synthesize_test_signing_keys();
+    }
 
     let mut keys: Vec<Option<pq_sign::PqSigningKey>> = (0..KT_NODES).map(|_| None).collect();
-    let test_mode = cfg!(test);
 
-    for slot in 0..KT_NODES {
-        if standalone && Some(slot) != local_slot {
-            continue;
+    // Production: load ONLY this host's own signing key from its sealed seed.
+    let local_slot: usize = match std::env::var("MILNET_KT_NODE_INDEX")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        Some(idx) if idx < KT_NODES => idx,
+        _ => {
+            tracing::error!(
+                target: "siem",
+                category = "security",
+                severity = "CRITICAL",
+                action = "kt_node_index_missing",
+                "FATAL: MILNET_KT_NODE_INDEX must be set to this host's consensus \
+                 slot (0..{}). KT consensus keys are per-host and never co-derived. \
+                 Refusing to start.",
+                KT_NODES
+            );
+            std::process::exit(196);
         }
+    };
+
+    let key_name = format!("kt-node-signing-{}", local_slot);
+    let sealed = match common::secret_loader::load_secret(&key_name) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                target: "siem",
+                category = "security",
+                severity = "CRITICAL",
+                action = "kt_node_signing_key_missing",
+                node_index = local_slot,
+                key_name = %key_name,
+                error = %e,
+                "FATAL: per-node KT signing seed '{}' not provisioned in the sealed \
+                 secret store — refusing to start. Each consensus host must hold its \
+                 own independently generated seed.",
+                key_name
+            );
+            std::process::exit(196);
+        }
+    };
+
+    // Accept a raw 32-byte seed or a 64-char hex seed (env escape hatch).
+    let mut seed = [0u8; 32];
+    if sealed.len() == 32 {
+        seed.copy_from_slice(&sealed[..]);
+    } else if sealed.len() == 64 {
+        match hex::decode(&sealed[..]) {
+            Ok(b) if b.len() == 32 => seed.copy_from_slice(&b),
+            _ => {
+                tracing::error!(
+                    target: "siem",
+                    severity = "CRITICAL",
+                    node_index = local_slot,
+                    "FATAL: KT node signing seed '{}' is malformed (expected 32 raw \
+                     or 64 hex chars)",
+                    key_name
+                );
+                std::process::exit(196);
+            }
+        }
+    } else {
+        tracing::error!(
+            target: "siem",
+            severity = "CRITICAL",
+            node_index = local_slot,
+            "FATAL: KT node signing seed '{}' has unexpected size {}",
+            key_name, sealed.len()
+        );
+        std::process::exit(196);
+    }
+
+    let kp = MlDsa87::from_seed(&seed.into());
+    seed.zeroize();
+    keys[local_slot] = Some(kp.signing_key().clone());
+    keys
+}
+
+/// Synthesize all 5 consensus signing keys from deterministic per-slot seeds.
+///
+/// **Test support only.** This populates every slot with a co-derivable key
+/// and therefore must never be used in production — it exists so that unit
+/// and integration tests can exercise `sign_leaf_with_local_slots` /
+/// `verify_threshold` / `sign_checkpoint` against verifying keys derived from
+/// the same keypairs. Real deployments call [`synthesize_signing_keys`], which
+/// loads only this host's independently provisioned key.
+pub fn synthesize_test_signing_keys() -> Vec<Option<pq_sign::PqSigningKey>> {
+    use sha2::{Digest, Sha512};
+    use zeroize::Zeroize;
+
+    let mut keys: Vec<Option<pq_sign::PqSigningKey>> = (0..KT_NODES).map(|_| None).collect();
+    for (slot, key_slot) in keys.iter_mut().enumerate() {
         let mut seed = [0u8; 32];
-        if test_mode {
-            use sha2::Digest;
-            let h = Sha512::digest(format!("TEST-KT-SLOT-{}", slot).as_bytes());
-            seed.copy_from_slice(&h[..32]);
-        } else {
-            let kek = common::sealed_keys::cached_master_kek();
-            let hk = Hkdf::<Sha512>::new(Some(b"MILNET-KT-NODE-SIGN-v1"), kek);
-            let info = format!("kt-node-signing-{}", slot);
-            hk.expand(info.as_bytes(), &mut seed)
-                .expect("HKDF expand for KT node signing seed");
-        }
+        let h = Sha512::digest(format!("TEST-KT-SLOT-{}", slot).as_bytes());
+        seed.copy_from_slice(&h[..32]);
         let kp = MlDsa87::from_seed(&seed.into());
         seed.zeroize();
-        keys[slot] = Some(kp.signing_key().clone());
+        *key_slot = Some(kp.signing_key().clone());
     }
     keys
 }

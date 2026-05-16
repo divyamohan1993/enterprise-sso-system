@@ -687,7 +687,13 @@ impl AnomalyDetector {
     ///
     /// Rate-limited to MAX_FEEDBACK_PER_HOUR adjustments per hour.
     /// Returns false if rate limit exceeded or threshold dangerously high.
-    pub fn feedback(&self, was_false_positive: bool) -> bool {
+    ///
+    /// SECURITY: This is the unauthenticated threshold-adjustment primitive
+    /// and is deliberately `pub(crate)` — exposing it publicly would let any
+    /// caller bypass the dual-admin attestation gate in [`Self::feedback_signed`]
+    /// and ratchet the alert threshold up to 0.95 unilaterally. Production
+    /// callers MUST use `feedback_signed`; only in-crate tests use this.
+    pub(crate) fn feedback(&self, was_false_positive: bool) -> bool {
         let now = Instant::now();
         let mut limiter = self.feedback_limiter.lock().unwrap_or_else(|e| {
                     tracing::warn!(target: "siem", "SIEM:WARNING mutex poisoned in anomaly - recovering: thread panicked while holding lock");

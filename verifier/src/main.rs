@@ -102,11 +102,22 @@ async fn main() {
             }
         }
         Err(_) => {
-            tracing::warn!(
-                "MILNET_GROUP_VERIFYING_KEY not set; generating ephemeral test key (NOT for production)"
-            );
-            let dkg = crypto::threshold::dkg(5, 3).expect("DKG ceremony failed");
-            dkg.group.public_key_package
+            #[cfg(feature = "production")]
+            {
+                tracing::error!(
+                    "FATAL: MILNET_GROUP_VERIFYING_KEY not set with `production` feature enabled; \
+                     refusing to boot with an ephemeral key (would accept attacker-signed tokens)"
+                );
+                std::process::exit(1);
+            }
+            #[cfg(not(feature = "production"))]
+            {
+                tracing::warn!(
+                    "MILNET_GROUP_VERIFYING_KEY not set; generating ephemeral test key (NOT for production)"
+                );
+                let dkg = crypto::threshold::dkg(5, 3).expect("DKG ceremony failed");
+                dkg.group.public_key_package
+            }
         }
     };
 
@@ -130,11 +141,22 @@ async fn main() {
             crypto::pq_sign::PqVerifyingKey::decode(&encoded)
         }
         Err(_) => {
-            tracing::warn!(
-                "MILNET_PQ_VERIFYING_KEY not set; generating ephemeral test key (NOT for production)"
-            );
-            let (_sk, vk) = crypto::pq_sign::generate_pq_keypair();
-            vk
+            #[cfg(feature = "production")]
+            {
+                tracing::error!(
+                    "FATAL: MILNET_PQ_VERIFYING_KEY not set with `production` feature enabled; \
+                     refusing to boot with an ephemeral key (would accept attacker-signed tokens)"
+                );
+                std::process::exit(1);
+            }
+            #[cfg(not(feature = "production"))]
+            {
+                tracing::warn!(
+                    "MILNET_PQ_VERIFYING_KEY not set; generating ephemeral test key (NOT for production)"
+                );
+                let (_sk, vk) = crypto::pq_sign::generate_pq_keypair();
+                vk
+            }
         }
     };
 
@@ -344,14 +366,23 @@ async fn handle_verify(
                 "verifying token"
             );
 
-            // 1+2. Revocation check (fail-fast) + full signature + DPoP verification
-            //       Uses verify_token_full which combines revocation, signatures,
-            //       and mandatory DPoP key binding in a single pass.
+            // 1+2. Revocation check (fail-fast) + full signature + DPoP verification.
+            //       When the request carries an expected ceremony id, use the
+            //       ceremony-bound entrypoint so a token's `ceremony_id` is
+            //       authoritatively enforced. A ceremony-bound token presented
+            //       without an expected ceremony id is rejected fail-closed by
+            //       verify_token_core itself.
             {
                 let revocation_list = rl.lock().await;
-                if let Err(e) = verifier::verify_token_full(
-                    &token, group_key, pq_key, &revocation_list, dpop_key,
-                ) {
+                let core_result = match req.expected_ceremony_id {
+                    Some(ref ceremony) => verifier::verify_token_ceremony_bound(
+                        &token, group_key, pq_key, &revocation_list, dpop_key, ceremony,
+                    ),
+                    None => verifier::verify_token_full(
+                        &token, group_key, pq_key, &revocation_list, dpop_key,
+                    ),
+                };
+                if let Err(e) = core_result {
                     tracing::warn!(
                         token_id = ?token.claims.token_id,
                         dpop_present = dpop_key.is_some(),
@@ -368,13 +399,39 @@ async fn handle_verify(
 
             // 3. Ratchet temporal binding check (if ratchet state provided)
             if let Some(ref ratchet) = req.ratchet_state {
-                if let Err(e) = verifier::verify_token_with_ratchet(
-                    &token,
-                    group_key,
-                    pq_key,
-                    &ratchet.ratchet_key,
-                    ratchet.current_epoch,
-                ) {
+                // DPoP is mandatory: the core check above already enforced it,
+                // so `dpop_key` is guaranteed Some here. Thread the real client
+                // DPoP key through the ratchet entrypoint via the `_bound`
+                // variant; the bare `verify_token_with_ratchet` forwards
+                // client_dpop_key=None and would reject every DPoP-bound token.
+                // When a ceremony id is supplied, use the ceremony-bound
+                // ratchet entrypoint so the (now-authoritative) ceremony
+                // binding is re-checked consistently with step 1+2.
+                let ratchet_result = match (dpop_key, req.expected_ceremony_id) {
+                    (Some(key), Some(ref ceremony)) => {
+                        verifier::verify_token_with_ratchet_ceremony_bound(
+                            &token,
+                            group_key,
+                            pq_key,
+                            &ratchet.ratchet_key,
+                            ratchet.current_epoch,
+                            key,
+                            ceremony,
+                        )
+                    }
+                    (Some(key), None) => verifier::verify_token_with_ratchet_bound(
+                        &token,
+                        group_key,
+                        pq_key,
+                        &ratchet.ratchet_key,
+                        ratchet.current_epoch,
+                        key,
+                    ),
+                    (None, _) => Err(common::error::MilnetError::CryptoVerification(
+                        "DPoP binding is required".into(),
+                    )),
+                };
+                if let Err(e) = ratchet_result {
                     tracing::warn!(
                         token_id = ?token.claims.token_id,
                         error = %e,

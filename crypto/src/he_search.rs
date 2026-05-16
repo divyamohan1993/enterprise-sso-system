@@ -8,10 +8,21 @@
 //!
 //! # Security Model
 //!
-//! OPE reveals ordering relationships between ciphertexts (IND-OCPA secure).
-//! This is an intentional trade-off: range queries on timestamps require order
-//! visibility. Deterministic encryption reveals equality patterns (IND-DCPA).
-//! For fields requiring stronger privacy, use the blind index approach from
+//! **OPE LIMITATION (audit P1) — read before using `OpeContext`.** The OPE
+//! construction here is *not* IND-OCPA secure. `OpeContext::encrypt` preserves
+//! the plaintext's high 48 bits **verbatim** in the ciphertext and only
+//! PRF-scrambles the low 16 bits. For a Unix-second timestamp this means the
+//! ciphertext leaks everything except a ~18-hour window — i.e. the day, month,
+//! and year of every audit event are readable by anyone holding the
+//! ciphertexts, with no key. Only the sub-bucket position is hidden. A correct
+//! IND-OCPA scheme (e.g. Boldyreva-style lazy-sampling OPE, or an
+//! order-revealing-encryption construction) is required before this is used
+//! for anything beyond coarse-bucket range queries on non-sensitive values.
+//! Until then `OpeContext` MUST NOT be relied on to keep timestamps
+//! confidential — it provides ordering plus a large plaintext leak.
+//!
+//! Deterministic encryption reveals equality patterns (IND-DCPA). For fields
+//! requiring stronger privacy, use the blind index approach from
 //! `common::encrypted_audit` instead.
 //!
 //! Encrypted aggregation uses additive homomorphism over a simple modular
@@ -51,10 +62,16 @@ impl OpeContext {
     /// The output is a u64 ciphertext where:
     /// `encrypt(a) < encrypt(b)` iff `a < b`
     ///
-    /// This uses a lazy sampling approach: we split the plaintext into
-    /// a preserved high portion and a PRF-scrambled low portion.
+    /// # WARNING — plaintext leak (audit P1)
+    ///
+    /// This is NOT a confidentiality-preserving cipher. The top 48 bits of
+    /// `plaintext` are copied into the ciphertext unchanged; only the low 16
+    /// bits are PRF-scrambled. The ciphertext therefore reveals the plaintext
+    /// to within a 65536-unit bucket *without the key*. See the module-level
+    /// security model. Do not use for confidential values.
     pub fn encrypt(&self, plaintext: u64) -> u64 {
-        // Split: preserve top 48 bits for ordering, PRF the bottom 16
+        // Split: preserve top 48 bits for ordering, PRF the bottom 16.
+        // SECURITY: the high bits are NOT encrypted — see the doc warning.
         let high = plaintext & 0xFFFF_FFFF_FFFF_0000;
         let low = (plaintext & 0xFFFF) as u16;
 

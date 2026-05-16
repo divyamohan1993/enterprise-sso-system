@@ -89,6 +89,41 @@ pub struct DatabaseJtiStore {
     pool: sqlx::PgPool,
 }
 
+/// Run an async DB future to completion from a synchronous context.
+///
+/// SECURITY / CORRECTNESS: the `JtiReplayStore` trait is synchronous but the
+/// `DatabaseJtiStore` calls sqlx, which is async. Building a Tokio runtime and
+/// calling `block_on` on the *current* thread panics ("Cannot start a runtime
+/// from within a runtime") whenever the caller is itself inside a Tokio
+/// runtime — which every async request handler is. We therefore run the future
+/// on a dedicated OS thread that owns a fresh single-threaded runtime: that
+/// thread has no ambient runtime, so `block_on` is sound, and the calling
+/// thread simply blocks on `join`. Any panic inside the worker is converted
+/// into an `Err` so callers can fail closed rather than abort the process.
+fn block_on_db<F, T>(future_fn: F) -> Result<T, String>
+where
+    F: FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, String>> + Send>>
+        + Send
+        + 'static,
+    T: Send + 'static,
+{
+    let join = std::thread::Builder::new()
+        .name("jti-db-blocking".to_string())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("tokio runtime: {e}"))?;
+            rt.block_on(future_fn())
+        })
+        .map_err(|e| format!("spawn jti-db worker: {e}"))?;
+
+    match join.join() {
+        Ok(result) => result,
+        Err(_) => Err("jti-db worker thread panicked".to_string()),
+    }
+}
+
 impl DatabaseJtiStore {
     pub fn new(pool: sqlx::PgPool, max_local_size: usize) -> Self {
         Self {
@@ -130,17 +165,21 @@ impl JtiReplayStore for DatabaseJtiStore {
             return Ok(false);
         }
 
-        // Write-through to database using a blocking spawn since we are in sync context.
-        // Use INSERT ... ON CONFLICT to atomically check+insert.
+        // Write-through to the database. Use INSERT ... ON CONFLICT to
+        // atomically check+insert: the DB row is the authoritative,
+        // cross-instance replay record. The future runs on a dedicated
+        // runtime-owning thread (see `block_on_db`) so this is safe to call
+        // from inside an async handler.
+        //
+        // SECURITY: a DB error propagates as `Err`. The sole caller
+        // (`mark_jti_or_reject`) treats `Err` from `mark_used` as a hard
+        // verification failure, so a Postgres outage fails CLOSED — a JTI
+        // whose freshness cannot be confirmed against the authoritative store
+        // is rejected, never accepted.
         let pool = self.pool.clone();
         let jti_owned = jti.to_string();
-        let db_result = std::thread::scope(|_| {
-            // Build a minimal tokio runtime for the blocking DB call
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| format!("tokio runtime: {e}"))?;
-            rt.block_on(async {
+        let was_fresh = block_on_db(move || {
+            Box::pin(async move {
                 let result = sqlx::query(
                     "INSERT INTO jti_replay (jti, expires_at) VALUES ($1, $2) \
                      ON CONFLICT (jti) DO NOTHING"
@@ -153,9 +192,7 @@ impl JtiReplayStore for DatabaseJtiStore {
                 // rows_affected == 1 means fresh insert, 0 means conflict (replay)
                 Ok::<bool, String>(result.rows_affected() == 1)
             })
-        });
-
-        let was_fresh = db_result?;
+        })?;
         if was_fresh {
             // Update L1 cache
             if let Err(e) = self.local.mark_used(jti, expires_at) {
@@ -175,27 +212,42 @@ impl JtiReplayStore for DatabaseJtiStore {
         if self.local.is_used(jti) {
             return true;
         }
-        // Fall through to DB
+        // Fall through to the authoritative DB. The query runs on a dedicated
+        // runtime-owning thread (see `block_on_db`) so this is safe inside an
+        // async handler.
+        //
+        // SECURITY: this method MUST fail CLOSED. If the database is
+        // unreachable we cannot prove the JTI is fresh, so we report it as
+        // used (`true`). Returning `false` on a DB error would let an attacker
+        // replay any captured token against an instance whose L1 cache does
+        // not already hold the JTI — the exact stolen-token-reuse attack JTI
+        // replay protection exists to stop.
         let pool = self.pool.clone();
         let jti_owned = jti.to_string();
-        std::thread::scope(|_| {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .ok();
-            rt.map(|rt| {
-                rt.block_on(async {
-                    sqlx::query_scalar::<_, i64>(
-                        "SELECT COUNT(*) FROM jti_replay WHERE jti = $1"
-                    )
-                    .bind(&jti_owned)
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap_or(0) > 0
-                })
+        let db_result = block_on_db(move || {
+            Box::pin(async move {
+                let count = sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM jti_replay WHERE jti = $1"
+                )
+                .bind(&jti_owned)
+                .fetch_one(&pool)
+                .await
+                .map_err(|e| format!("select jti_replay: {e}"))?;
+                Ok::<bool, String>(count > 0)
             })
-            .unwrap_or(false)
-        })
+        });
+        match db_result {
+            Ok(used) => used,
+            Err(e) => {
+                tracing::error!(
+                    target: "siem",
+                    "SECURITY: JTI DB lookup failed for jti={}: {}. \
+                     Failing CLOSED — treating JTI as used to block potential replay.",
+                    jti, e
+                );
+                true
+            }
+        }
     }
 }
 
@@ -215,16 +267,41 @@ pub fn set_jti_store(store: Box<dyn JtiReplayStore>) -> Result<(), Box<dyn JtiRe
 fn jti_store() -> &'static dyn JtiReplayStore {
     JTI_STORE
         .get_or_init(|| {
-            // SECURITY: In military deployment, a distributed JTI store MUST be configured
-            // via set_jti_store() before first use. Per-process LocalJtiStore allows
-            // cross-instance token replay.
-            if std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok() {
+            // Reaching this closure means `set_jti_store` was never called: no
+            // distributed JTI store is configured. A per-process
+            // `LocalJtiStore` cannot detect a token replayed against a sibling
+            // instance, so in any multi-instance deployment this is a
+            // cross-instance replay hole.
+            //
+            // SECURITY: fail CLOSED. Outside the test build, a missing
+            // distributed store is treated as a misconfiguration and the
+            // process refuses to start. A genuinely single-instance
+            // deployment must explicitly acknowledge the per-process limit by
+            // setting `MILNET_ALLOW_LOCAL_JTI_STORE=1` (mirrors the
+            // `MILNET_ALLOW_LOCAL_PUZZLE_STORE` opt-out in gateway/puzzle.rs).
+            // Military mode is never allowed to fall back.
+            let military = std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok();
+            let local_allowed =
+                std::env::var("MILNET_ALLOW_LOCAL_JTI_STORE").is_ok();
+
+            if military {
                 tracing::error!(
                     "FATAL: No distributed JTI store configured in military deployment mode. \
                      Call set_jti_store() with a DatabaseJtiStore at startup."
                 );
                 std::process::exit(1);
             }
+
+            if !cfg!(test) && !local_allowed {
+                tracing::error!(
+                    "FATAL: No distributed JTI store configured. Per-process JTI replay \
+                     protection cannot stop a token replayed against another instance. \
+                     Call set_jti_store() with a DatabaseJtiStore at startup, or set \
+                     MILNET_ALLOW_LOCAL_JTI_STORE=1 to acknowledge a single-instance deployment."
+                );
+                std::process::exit(1);
+            }
+
             Box::new(LocalJtiStore::new(100_000))
         })
         .as_ref()
@@ -319,6 +396,19 @@ impl Drop for RefreshToken {
     }
 }
 
+/// SHA-512 hex digest of a refresh token's raw value.
+///
+/// SECURITY: refresh tokens are bearer credentials. Both the database
+/// (`refresh_tokens.token_hash`) and the persistent store's in-memory cache
+/// key tokens by this digest so a memory dump or a DB exfiltration yields only
+/// hashes, never replayable plaintext. The in-memory-only `RefreshTokenStore`
+/// keys by the raw token; `PersistentRefreshTokenStore` switches the same map
+/// to hash-keyed via `key_by_hash` so lookups stay consistent across restarts.
+fn refresh_token_hash(token: &str) -> String {
+    use sha2::{Digest, Sha512};
+    hex::encode(Sha512::digest(token.as_bytes()))
+}
+
 /// In-memory refresh token store with rotation and single-use enforcement.
 ///
 /// WARNING: This store is volatile. All refresh tokens are lost on process
@@ -328,6 +418,11 @@ pub struct RefreshTokenStore {
     /// Optional persistence backend name for operational awareness.
     /// When None, the store is purely in-memory (volatile).
     pub persistence_backend: Option<String>,
+    /// When true, the `tokens` map is keyed by the SHA-512 hash of each token
+    /// (`refresh_token_hash`) rather than by the raw token string. Set only by
+    /// `PersistentRefreshTokenStore` so its cache key matches the
+    /// `refresh_tokens.token_hash` column and survives a restart-reload.
+    key_by_hash: bool,
 }
 
 /// Custom Debug for RefreshTokenStore -- redacts token count only.
@@ -383,7 +478,17 @@ impl RefreshTokenStore {
         Ok(Self {
             tokens: HashMap::new(),
             persistence_backend: None,
+            key_by_hash: false,
         })
+    }
+
+    /// Derive the `tokens` map key for a raw token, honoring `key_by_hash`.
+    fn map_key(&self, raw_token: &str) -> String {
+        if self.key_by_hash {
+            refresh_token_hash(raw_token)
+        } else {
+            raw_token.to_string()
+        }
     }
 
     /// Issue a new refresh token for a user/client pair.
@@ -402,13 +507,19 @@ impl RefreshTokenStore {
     fn issue_in_family(&mut self, user_id: Uuid, client_id: &str, scope: &str, family_id: &str) -> String {
         let mut token_bytes = [0u8; 32];
         getrandom::getrandom(&mut token_bytes).unwrap_or_else(|e| {
+            // CSPRNG failure is unrecoverable: a refresh token without full
+            // entropy is forgeable. Abort, consistent with the CSPRNG-failure
+            // handling in `authorize.rs` and `crypto::pq_sign`. `abort` (not
+            // `exit`) is deliberate — running destructors here would touch
+            // more secret material with a broken RNG; a hard abort is the
+            // safe, consistent failure mode.
             tracing::error!("FATAL: CSPRNG failure in refresh token generation: {e}");
-            std::process::exit(1);
+            std::process::abort();
         });
         let mut token_value = format!("rt_{}", hex::encode(token_bytes));
         zeroize::Zeroize::zeroize(&mut token_bytes);
         let now = common::secure_time::secure_now_secs_i64();
-        let token_key = token_value.clone();
+        let token_key = self.map_key(&token_value);
         let token_stored = token_value.clone();
         self.tokens.insert(
             token_key,
@@ -441,7 +552,8 @@ impl RefreshTokenStore {
         token: &str,
         client_id: &str,
     ) -> Result<(RefreshToken, String), String> {
-        let rt = self.tokens.get(token).cloned()
+        let token_key = self.map_key(token);
+        let rt = self.tokens.get(&token_key).cloned()
             .ok_or_else(|| "refresh token not found".to_string())?;
 
         // SECURITY: Detect replay — if already used, this indicates token theft.
@@ -470,7 +582,7 @@ impl RefreshTokenStore {
         // Check expiry
         let now = common::secure_time::secure_now_secs_i64();
         if now > rt.expires_at {
-            self.tokens.remove(token);
+            self.tokens.remove(&token_key);
             return Err("refresh token expired".to_string());
         }
 
@@ -480,7 +592,7 @@ impl RefreshTokenStore {
         }
 
         // Mark old token as used
-        if let Some(entry) = self.tokens.get_mut(token) {
+        if let Some(entry) = self.tokens.get_mut(&token_key) {
             entry.used = true;
         }
 
@@ -549,6 +661,11 @@ impl PersistentRefreshTokenStore {
             memory: RefreshTokenStore {
                 tokens: HashMap::new(),
                 persistence_backend: Some("postgresql".to_string()),
+                // Key the L1 cache by SHA-512 token hash so it matches the
+                // `refresh_tokens.token_hash` column. Without this, tokens
+                // loaded from the DB (hash-keyed) are unredeemable after a
+                // restart while the lookup path uses the raw token string.
+                key_by_hash: true,
             },
             pool,
         };
@@ -593,12 +710,10 @@ impl PersistentRefreshTokenStore {
     /// Issue a new refresh token, writing through to the database.
     pub async fn issue(&mut self, user_id: Uuid, client_id: &str, scope: &str) -> Result<String, String> {
         let token_value = self.memory.issue(user_id, client_id, scope);
-        let token_hash = {
-            use sha2::{Digest, Sha512};
-            hex::encode(Sha512::digest(token_value.as_bytes()))
-        };
+        let token_hash = refresh_token_hash(&token_value);
 
-        let rt = self.memory.tokens.get(&token_value).cloned()
+        // The L1 cache is hash-keyed (`key_by_hash`), so look up by hash.
+        let rt = self.memory.tokens.get(&token_hash).cloned()
             .ok_or("token not found after issue")?;
 
         sqlx::query(
@@ -628,22 +743,17 @@ impl PersistentRefreshTokenStore {
         let (old_rt, new_token) = self.memory.redeem(token, client_id)?;
 
         // Mark old token as used in DB
-        let old_hash = {
-            use sha2::{Digest, Sha512};
-            hex::encode(Sha512::digest(token.as_bytes()))
-        };
+        let old_hash = refresh_token_hash(token);
         sqlx::query("UPDATE refresh_tokens SET used = TRUE WHERE token_hash = $1")
             .bind(&old_hash)
             .execute(&self.pool)
             .await
             .map_err(|e| format!("mark token used in DB: {e}"))?;
 
-        // Insert new rotated token into DB (CNSA 2.0: SHA-512)
-        let new_hash = {
-            use sha2::{Digest, Sha512};
-            hex::encode(Sha512::digest(new_token.as_bytes()))
-        };
-        if let Some(new_rt) = self.memory.tokens.get(&new_token) {
+        // Insert new rotated token into DB (CNSA 2.0: SHA-512). The L1 cache is
+        // hash-keyed (`key_by_hash`), so look up the rotated entry by hash.
+        let new_hash = refresh_token_hash(&new_token);
+        if let Some(new_rt) = self.memory.tokens.get(&new_hash) {
             sqlx::query(
                 "INSERT INTO refresh_tokens (token_hash, user_id, client_id, scope, expires_at, used, family_id) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7)"
@@ -873,13 +983,33 @@ impl Drop for OidcSigningKey {
         // and SigningKey<MlDsa87> has no Zeroize impl, we overwrite with a
         // freshly generated throwaway keypair. This replaces the real key bytes
         // in the struct's allocation with unrelated random key material.
-        let (throwaway_key, throwaway_vk) = generate_pq_keypair();
-        self.current.signing_key = throwaway_key;
-        self.current.verifying_key = throwaway_vk;
-        if let Some(ref mut prev) = self.previous {
-            let (tk2, tvk2) = generate_pq_keypair();
-            prev.signing_key = tk2;
-            prev.verifying_key = tvk2;
+        //
+        // SECURITY: use the fallible `generate_pq_keypair_checked` — the
+        // infallible `generate_pq_keypair` aborts the process on OS-CSPRNG
+        // failure, and calling that from `Drop` turns a transient RNG outage
+        // at shutdown into a hard abort (panic/abort-in-drop). One throwaway
+        // keypair is generated and cloned across both slots: the goal is to
+        // scrub the allocation, not to install distinct keys. If the CSPRNG is
+        // unavailable we log and skip the overwrite — best-effort scrubbing is
+        // strictly better than aborting, and the process is exiting anyway.
+        match crypto::pq_sign::generate_pq_keypair_checked() {
+            Ok((throwaway_key, throwaway_vk)) => {
+                self.current.signing_key = throwaway_key.clone();
+                self.current.verifying_key = throwaway_vk.clone();
+                if let Some(ref mut prev) = self.previous {
+                    prev.signing_key = throwaway_key;
+                    prev.verifying_key = throwaway_vk;
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    target: "siem",
+                    "SECURITY: OidcSigningKey::drop could not generate a throwaway \
+                     keypair to scrub key material ({}). Skipping overwrite; \
+                     process is terminating.",
+                    e
+                );
+            }
         }
         self.generation = 0;
         // Compiler fence to prevent dead-store elimination of the overwrites

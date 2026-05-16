@@ -23,7 +23,7 @@ use common::types::ModuleId;
 use shard::tls_transport::tls_connect;
 
 use sha2::{Digest, Sha512};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::distributed_rate_limit::DistributedRateLimiter;
 use crate::puzzle::{generate_challenge, get_adaptive_difficulty, verify_solution, PuzzleSolution};
@@ -210,6 +210,18 @@ pub const MAX_HEADER_LIST_SIZE: u32 = 64 * 1024;
 /// username-not-found in OPAQUE) is padded to at least this duration to
 /// prevent timing-based username enumeration.
 pub const AUTH_RESPONSE_FLOOR: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Constant-time floor for puzzle-validation failures (500 ms).
+///
+/// A puzzle failure short-circuits before the expensive legitimate path
+/// (ML-KEM-1024 decapsulation + orchestrator round-trip), which routinely
+/// takes well over 100 ms. Padding a puzzle failure only to
+/// `AUTH_RESPONSE_FLOOR` would let a network observer distinguish "puzzle
+/// solved" (slow) from "puzzle rejected" (fast) and cheaply screen
+/// successful puzzle solutions during a DDoS. Puzzle-failure paths are
+/// therefore padded to this larger floor, which envelops the legitimate
+/// KEM + orchestrator latency under normal load.
+pub const PUZZLE_FAIL_FLOOR: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Configuration for orchestrator forwarding.
 #[derive(Clone)]
@@ -581,13 +593,35 @@ impl GatewayServer {
         loop {
             let (tcp_stream, addr) = self.listener.accept().await?;
 
-            // Enforce global concurrent connection cap
-            let active = self.active_connections.load(Ordering::Relaxed);
-            if active >= MAX_CONCURRENT_CONNECTIONS {
-                warn!("rejecting connection from {addr}: global connection limit ({MAX_CONCURRENT_CONNECTIONS}) reached");
-                drop(tcp_stream);
-                continue;
-            }
+            // Enforce global concurrent connection cap.
+            // SECURITY: the cap check and the increment MUST be a single atomic
+            // operation. A separate load()-then-fetch_add() is a TOCTOU: under
+            // a burst, N tasks could each observe `active < cap` and all
+            // proceed, briefly exceeding the global cap. `fetch_update` runs a
+            // CAS loop so the slot is only claimed if still under the cap.
+            let claim = self.active_connections.fetch_update(
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+                |current| {
+                    if current >= MAX_CONCURRENT_CONNECTIONS {
+                        None
+                    } else {
+                        Some(current + 1)
+                    }
+                },
+            );
+            let active = match claim {
+                Ok(prev) => prev + 1,
+                Err(_) => {
+                    warn!("rejecting connection from {addr}: global connection limit ({MAX_CONCURRENT_CONNECTIONS}) reached");
+                    drop(tcp_stream);
+                    continue;
+                }
+            };
+
+            // The global-cap slot is now claimed. Any rejection path below
+            // MUST release it (fetch_sub) before `continue`, otherwise the
+            // counter leaks and the cap permanently shrinks.
 
             // Enforce per-IP rate limit
             if !self.check_rate_limit(addr.ip()).await {
@@ -601,6 +635,7 @@ impl GatewayServer {
                         None,
                     ),
                 );
+                self.active_connections.fetch_sub(1, Ordering::SeqCst);
                 drop(tcp_stream);
                 continue;
             }
@@ -611,12 +646,13 @@ impl GatewayServer {
                 if !result.allowed {
                     let client_ip = addr.ip().to_string();
                     warn!(ip = %client_ip, "distributed rate limit exceeded — rejecting connection");
+                    self.active_connections.fetch_sub(1, Ordering::SeqCst);
                     drop(tcp_stream);
                     continue;
                 }
             }
 
-            let active = self.active_connections.fetch_add(1, Ordering::Relaxed) + 1;
+            // Slot already claimed atomically above — do not increment again.
             let difficulty = get_adaptive_difficulty(active).max(self.difficulty);
             let orch = self.orchestrator.clone();
             let counter = self.active_connections.clone();
@@ -806,8 +842,13 @@ async fn handle_connection(
             token: None,
             error: Some(common::error_response::sanitize("nonce mismatch")),
         };
-        enforce_timing_floor(auth_start).await;
-        send_frame_with_timeout(&mut stream, &resp).await?;
+        // Pad to PUZZLE_FAIL_FLOOR *after* queueing the send so the floor
+        // covers verification + network response time and the failure path
+        // is indistinguishable from the slower legitimate KEM/orchestrator
+        // path. Send errors are still padded so a dropped peer cannot be
+        // used as an oracle.
+        let _ = send_frame_with_timeout(&mut stream, &resp).await;
+        enforce_timing_floor_to(auth_start, PUZZLE_FAIL_FLOOR).await;
         return Err("nonce mismatch".into());
     }
 
@@ -817,8 +858,8 @@ async fn handle_connection(
             token: None,
             error: Some(common::error_response::sanitize("invalid puzzle solution")),
         };
-        enforce_timing_floor(auth_start).await;
-        send_frame_with_timeout(&mut stream, &resp).await?;
+        let _ = send_frame_with_timeout(&mut stream, &resp).await;
+        enforce_timing_floor_to(auth_start, PUZZLE_FAIL_FLOOR).await;
         return Err("invalid puzzle solution".into());
     }
 
@@ -856,10 +897,18 @@ async fn handle_connection(
     // 5. Derive session key via HKDF-SHA512
     //    Context binds to this specific handshake via the puzzle nonce.
     //    The derived key is 64 bytes; we use the first 32 bytes for AES-256-GCM.
-    let session_key = crypto::xwing::derive_session_key(&shared_secret, &challenge.nonce)
-        .map_err(|e| format!("session key derivation failed: {e}"))?;
-    let enc_key: [u8; 32] = session_key[..32].try_into()
-        .map_err(|_| "session key derivation produced fewer than 32 bytes".to_string())?;
+    //    SECURITY: both the 64-byte session key and the 32-byte AES key are
+    //    wrapped in Zeroizing so they are scrubbed from stack memory when
+    //    handle_connection returns, instead of lingering in freed/reused stack.
+    let session_key = Zeroizing::new(
+        crypto::xwing::derive_session_key(&shared_secret, &challenge.nonce)
+            .map_err(|e| format!("session key derivation failed: {e}"))?,
+    );
+    let enc_key: Zeroizing<[u8; 32]> = Zeroizing::new(
+        session_key[..32]
+            .try_into()
+            .map_err(|_| "session key derivation produced fewer than 32 bytes".to_string())?,
+    );
     common::error_response::log_crypto_operation("key_derive", "HKDF-SHA512", "session_key");
     debug!("X-Wing KEM: session key established (hybrid PQ + classical)");
 
@@ -892,7 +941,7 @@ async fn handle_connection(
     // is ALSO rejected.
     match auth_req.device_attestation.as_ref() {
         Some(assertion) => {
-            match crate::device_attestation::validate_assertion(assertion, &session_key) {
+            match crate::device_attestation::validate_assertion(assertion, &session_key[..]) {
                 Ok(issued_at_secs) => {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -989,8 +1038,11 @@ async fn handle_connection(
 
     // Enforce constant-time floor on ALL auth responses (success, failure,
     // orchestrator error, username-not-found) to prevent timing-based
-    // username enumeration via OPAQUE.
-    enforce_timing_floor(auth_start).await;
+    // username enumeration via OPAQUE. Use the SAME floor as the puzzle-
+    // failure paths so a network observer cannot distinguish a completed
+    // auth (slow KEM + orchestrator path) from a rejected puzzle: every
+    // outcome converges to PUZZLE_FAIL_FLOOR.
+    enforce_timing_floor_to(auth_start, PUZZLE_FAIL_FLOOR).await;
 
     // Encrypt the response with the session key before sending
     let resp_plaintext = postcard::to_allocvec(&resp)
@@ -1001,12 +1053,18 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Pad elapsed time to the constant `AUTH_RESPONSE_FLOOR` to prevent
-/// timing-based information leakage across all authentication paths.
-async fn enforce_timing_floor(start: tokio::time::Instant) {
+/// Pad elapsed time since `start` to at least `floor` to prevent
+/// timing-based information leakage across authentication paths.
+///
+/// All authentication outcomes (puzzle failure, auth success, auth failure)
+/// are padded to `PUZZLE_FAIL_FLOOR` so they are mutually indistinguishable
+/// to a network observer. `AUTH_RESPONSE_FLOOR` remains the documented
+/// minimum floor for completed-auth responses.
+async fn enforce_timing_floor_to(start: tokio::time::Instant, floor: std::time::Duration) {
+    debug_assert!(floor >= AUTH_RESPONSE_FLOOR);
     let elapsed = start.elapsed();
-    if elapsed < AUTH_RESPONSE_FLOOR {
-        tokio::time::sleep(AUTH_RESPONSE_FLOOR - elapsed).await;
+    if elapsed < floor {
+        tokio::time::sleep(floor - elapsed).await;
     }
 }
 

@@ -1,15 +1,26 @@
 //! Threshold OPAQUE: 2-of-3 distributed password authentication.
 //!
-//! The OPRF key is split into 3 Shamir shares. Each OPAQUE server holds one
-//! share. Registration and login require 2-of-3 servers to participate —
-//! no single server can reconstruct the OPRF key or learn passwords.
+//! # Status: NOT production-ready — combiner disabled (fail-closed)
 //!
-//! # Security Properties
-//! - No single server compromise reveals passwords
-//! - OPRF key is never reconstructed in a single location
-//! - Each server performs a partial OPRF evaluation using its share
-//! - The client combines partial evaluations to get the full OPRF output
-//! - Tolerates 1 Byzantine/crashed server
+//! The intended design splits the OPRF key into 3 Shamir shares, one per
+//! OPAQUE server, so registration and login require 2-of-3 cooperation and no
+//! single server can reconstruct the key. The Shamir split/reconstruct and
+//! GF(256) arithmetic below are correct and tested.
+//!
+//! However, the *combiner* ([`ThresholdOpaqueCoordinator::combine_evaluations_for_input`])
+//! was found unsound by the 2026-04-30 security audit: it XORed independent
+//! `HMAC(share_i, input)` values, which is **not** a threshold OPRF (HMAC is
+//! not homomorphic, so different server subsets produce different outputs and
+//! 2-of-3 login cannot complete). It now fails closed. A correct construction
+//! is a DH-OPRF combining `share_i · H(input)` group elements with Lagrange
+//! coefficients in the exponent; that, plus a real key ceremony and an
+//! orchestrator, is out of scope for the current hardening pass.
+//!
+//! Threshold OPAQUE mode is therefore disabled at the service entry point —
+//! the service runs single-server OPAQUE. This module is retained for the
+//! sound Shamir primitives and so the correct combiner has a home when it
+//! lands; the proof-of-concept combiner / register / authenticate paths
+//! return an explicit error rather than a wrong result.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha512;
@@ -354,11 +365,8 @@ impl ThresholdOpaqueCoordinator {
         Self { config }
     }
 
-    /// Combine partial OPRF evaluations from at least `threshold` servers.
-    ///
-    /// Each partial evaluation is HMAC-SHA256(share_i, input). The coordinator
-    /// XORs evaluations together and applies HKDF to produce a uniform output.
-    /// The coordinator NEVER sees any share or the master key.
+    /// **DISABLED.** Always returns an error — see
+    /// [`combine_evaluations_for_input`](Self::combine_evaluations_for_input).
     pub fn combine_evaluations(
         &self,
         partials: &[PartialOprfEvaluation],
@@ -366,78 +374,49 @@ impl ThresholdOpaqueCoordinator {
         self.combine_evaluations_for_input(partials, b"threshold-opaque-combine")
     }
 
-    /// Combine partial evaluations and compute the OPRF output for the given input.
+    /// **DISABLED (fail-closed).** Always returns an error.
     ///
-    /// Each server computes HMAC-SHA256(share_value, blinded_element) as its
-    /// partial evaluation. The coordinator XORs all partial evaluations together
-    /// (after verifying proofs) and then applies HKDF-SHA512 to produce a
-    /// uniform output. The coordinator never sees any share or the master key.
+    /// # Why
+    ///
+    /// The previous implementation XORed independent `HMAC(share_i, input)`
+    /// values and HKDF'd the result. That is **not** a threshold OPRF: HMAC is
+    /// not homomorphic, so there is no algebraic relationship between the XOR
+    /// of per-share HMACs and `HMAC(master_key, input)`. Different server
+    /// subsets ({1,2} vs {2,3}) yield **different** outputs, so a user who
+    /// registered against one subset cannot authenticate against another —
+    /// the construction silently breaks 2-of-3 login.
+    ///
+    /// A correct threshold OPRF must produce the **same** output for any
+    /// qualified subset. The standard construction is a DH-OPRF: each server
+    /// returns `share_i · H(input)` (a group element), and the coordinator
+    /// combines with Lagrange coefficients *in the exponent*
+    /// (`Σ λ_i · (share_i · H) = (Σ λ_i·share_i)·H = k·H`). Implementing that
+    /// correctly requires ristretto255 group operations, a real key ceremony,
+    /// and an orchestrator — out of scope for the current hardening pass and
+    /// not something to home-grow unreviewed.
+    ///
+    /// Per the project security posture, this combiner now fails closed rather
+    /// than returning a wrong "OPRF output". Threshold OPAQUE mode is disabled
+    /// at the service entry point (`run_threshold_mode`); use single mode.
     pub fn combine_evaluations_for_input(
         &self,
-        partials: &[PartialOprfEvaluation],
-        input: &[u8],
+        _partials: &[PartialOprfEvaluation],
+        _input: &[u8],
     ) -> Result<Vec<u8>, String> {
-        if partials.len() < self.config.threshold as usize {
-            return Err(format!(
-                "need at least {} evaluations, got {}",
-                self.config.threshold,
-                partials.len()
-            ));
-        }
-
-        // Verify each server's proof before combining
-        for partial in partials {
-            // The proof should bind the evaluation to the input and server_id
-            // We can't verify the HMAC proof without the share (which we don't have),
-            // but we verify the evaluation is non-empty and the server_id is valid
-            if partial.evaluation.is_empty() {
-                return Err(format!(
-                    "empty evaluation from server {}",
-                    partial.server_id
-                ));
-            }
-            if partial.server_id >= self.config.total_servers + 1 {
-                return Err(format!(
-                    "invalid server_id {} (max {})",
-                    partial.server_id,
-                    self.config.total_servers
-                ));
-            }
-        }
-
-        // Combine partial evaluations via XOR
-        // Each evaluation is HMAC-SHA256(share_i, input), 32 bytes
-        let eval_len = partials[0].evaluation.len();
-        let mut combined = vec![0u8; eval_len];
-        for partial in partials {
-            if partial.evaluation.len() != eval_len {
-                return Err("evaluation length mismatch across servers".to_string());
-            }
-            for (i, &byte) in partial.evaluation.iter().enumerate() {
-                combined[i] ^= byte;
-            }
-        }
-
-        // Final key derivation: HKDF-SHA512 over the combined evaluation
-        // to produce a uniform output regardless of XOR distribution
-        use hkdf::Hkdf;
-        use sha2::Sha512;
-        let hk = Hkdf::<Sha512>::new(Some(b"MILNET-TOPRF-COMBINE-v1"), &combined);
-        let mut output = vec![0u8; 32];
-        hk.expand(input, &mut output)
-            .map_err(|e| format!("HKDF expand failed: {}", e))?;
-
-        // Zeroize intermediate material
-        combined.zeroize();
-
-        Ok(output)
+        Err(
+            "threshold OPRF combine is disabled: the XOR-of-HMACs construction \
+             is not a valid Shamir-based threshold PRF (inconsistent output \
+             across server subsets). A correct DH-OPRF is required — see \
+             opaque::threshold docs."
+                .to_string(),
+        )
     }
 
     /// Distributed user registration.
     ///
-    /// Collects partial OPRF evaluations (share contributions) from threshold
-    /// servers, reconstructs the OPRF key transiently, computes the full OPRF
-    /// output, and zeroizes the key.
+    /// **DISABLED (fail-closed):** delegates to the disabled combiner and
+    /// therefore always returns an error. See
+    /// [`combine_evaluations_for_input`](Self::combine_evaluations_for_input).
     pub fn register_user(
         &self,
         blinded_element: &[u8],
@@ -461,9 +440,9 @@ impl ThresholdOpaqueCoordinator {
 
     /// Distributed user authentication.
     ///
-    /// Collects partial OPRF evaluations (share contributions) from threshold
-    /// servers, combines them via XOR + HKDF, and returns the OPRF output.
-    /// The coordinator never sees any share or the master key.
+    /// **DISABLED (fail-closed):** delegates to the disabled combiner and
+    /// therefore always returns an error. See
+    /// [`combine_evaluations_for_input`](Self::combine_evaluations_for_input).
     pub fn authenticate_user(
         &self,
         blinded_element: &[u8],
@@ -707,8 +686,36 @@ mod tests {
         assert_ne!(eval1.proof, eval2.proof);
     }
 
+    // -- Combine evaluations tests (combiner is disabled fail-closed) --
+
     #[test]
-    fn test_combined_output_differs_for_different_inputs() {
+    fn test_combine_evaluations_disabled_fail_closed() {
+        // SECURITY: the XOR-of-HMACs combiner was unsound; combine must now
+        // refuse rather than return a wrong "OPRF output".
+        let result = generate_threshold_oprf_key(2, 3);
+        let servers: Vec<ThresholdOpaqueServer> = result.shares.iter().enumerate().map(|(i, share)| {
+            ThresholdOpaqueServer::new(
+                ThresholdOpaqueConfig { threshold: 2, total_servers: 3, server_id: (i + 1) as u8 },
+                share.clone(),
+            )
+        }).collect();
+        let coordinator = ThresholdOpaqueCoordinator::new(
+            ThresholdOpaqueConfig { threshold: 2, total_servers: 3, server_id: 0 },
+        );
+        let evals = vec![
+            servers[0].partial_evaluate(b"test-input"),
+            servers[1].partial_evaluate(b"test-input"),
+        ];
+        assert!(
+            coordinator.combine_evaluations(&evals).is_err(),
+            "disabled combiner must return an error, never a forged output"
+        );
+    }
+
+    // -- Distributed registration / authentication (disabled fail-closed) --
+
+    #[test]
+    fn test_register_and_authenticate_disabled_fail_closed() {
         let result = generate_threshold_oprf_key(2, 3);
         let servers: Vec<ThresholdOpaqueServer> = result.shares.iter().enumerate().map(|(i, share)| {
             ThresholdOpaqueServer::new(
@@ -720,167 +727,14 @@ mod tests {
             ThresholdOpaqueConfig { threshold: 2, total_servers: 3, server_id: 0 },
         );
         let server_refs: Vec<&ThresholdOpaqueServer> = servers.iter().take(2).collect();
-        let out_a = coordinator.register_user(b"input-a", &server_refs).unwrap();
-        let out_b = coordinator.register_user(b"input-b", &server_refs).unwrap();
-        assert_ne!(out_a, out_b, "different inputs must produce different OPRF outputs");
-    }
-
-    // -- Combine evaluations tests --
-
-    #[test]
-    fn test_combine_evaluations_2_of_3() {
-        let result = generate_threshold_oprf_key(2, 3);
-        let servers: Vec<ThresholdOpaqueServer> = result.shares.iter().enumerate().map(|(i, share)| {
-            ThresholdOpaqueServer::new(
-                ThresholdOpaqueConfig { threshold: 2, total_servers: 3, server_id: (i + 1) as u8 },
-                share.clone(),
-            )
-        }).collect();
-
-        let input = b"test-input";
-        let coordinator = ThresholdOpaqueCoordinator::new(
-            ThresholdOpaqueConfig { threshold: 2, total_servers: 3, server_id: 0 },
+        assert!(
+            coordinator.register_user(b"blinded-pw", &server_refs).is_err(),
+            "register_user must fail closed while threshold OPRF is disabled"
         );
-
-        // Get evaluations from servers 0 and 1
-        let evals_01 = vec![
-            servers[0].partial_evaluate(input),
-            servers[1].partial_evaluate(input),
-        ];
-        let combined_01 = coordinator.combine_evaluations(&evals_01).unwrap();
-
-        // The same subset should produce the same output (deterministic)
-        let evals_01_again = vec![
-            servers[0].partial_evaluate(input),
-            servers[1].partial_evaluate(input),
-        ];
-        let combined_01_again = coordinator.combine_evaluations(&evals_01_again).unwrap();
-        assert_eq!(combined_01, combined_01_again, "same subset must be deterministic");
-
-        // Output should be 32 bytes
-        assert_eq!(combined_01.len(), 32);
-    }
-
-    #[test]
-    fn test_combine_insufficient_evaluations() {
-        let result = generate_threshold_oprf_key(2, 3);
-        let server = ThresholdOpaqueServer::new(
-            ThresholdOpaqueConfig { threshold: 2, total_servers: 3, server_id: 1 },
-            result.shares[0].clone(),
+        assert!(
+            coordinator.authenticate_user(b"blinded-pw", &server_refs).is_err(),
+            "authenticate_user must fail closed while threshold OPRF is disabled"
         );
-        let coordinator = ThresholdOpaqueCoordinator::new(
-            ThresholdOpaqueConfig { threshold: 2, total_servers: 3, server_id: 0 },
-        );
-
-        // Only 1 evaluation — should fail
-        let evals = vec![server.partial_evaluate(b"test")];
-        assert!(coordinator.combine_evaluations(&evals).is_err());
-    }
-
-    #[test]
-    fn test_combine_all_three_evaluations() {
-        // Using all 3 should work and produce a valid output
-        let result = generate_threshold_oprf_key(2, 3);
-        let servers: Vec<ThresholdOpaqueServer> = result.shares.iter().enumerate().map(|(i, share)| {
-            ThresholdOpaqueServer::new(
-                ThresholdOpaqueConfig { threshold: 2, total_servers: 3, server_id: (i + 1) as u8 },
-                share.clone(),
-            )
-        }).collect();
-
-        let input = b"test-all-three";
-        let coordinator = ThresholdOpaqueCoordinator::new(
-            ThresholdOpaqueConfig { threshold: 2, total_servers: 3, server_id: 0 },
-        );
-
-        // All 3 evaluations should combine successfully
-        let evals_3 = vec![
-            servers[0].partial_evaluate(input),
-            servers[1].partial_evaluate(input),
-            servers[2].partial_evaluate(input),
-        ];
-        let combined_3 = coordinator.combine_evaluations(&evals_3).unwrap();
-
-        // Output should be 32 bytes and deterministic
-        assert_eq!(combined_3.len(), 32);
-
-        let evals_3_again = vec![
-            servers[0].partial_evaluate(input),
-            servers[1].partial_evaluate(input),
-            servers[2].partial_evaluate(input),
-        ];
-        let combined_3_again = coordinator.combine_evaluations(&evals_3_again).unwrap();
-        assert_eq!(combined_3, combined_3_again, "combining all 3 must be deterministic");
-    }
-
-    // -- Distributed registration / authentication tests --
-
-    #[test]
-    fn test_register_user() {
-        let result = generate_threshold_oprf_key(2, 3);
-        let servers: Vec<ThresholdOpaqueServer> = result.shares.iter().enumerate().map(|(i, share)| {
-            ThresholdOpaqueServer::new(
-                ThresholdOpaqueConfig { threshold: 2, total_servers: 3, server_id: (i + 1) as u8 },
-                share.clone(),
-            )
-        }).collect();
-
-        let coordinator = ThresholdOpaqueCoordinator::new(
-            ThresholdOpaqueConfig { threshold: 2, total_servers: 3, server_id: 0 },
-        );
-
-        let server_refs: Vec<&ThresholdOpaqueServer> = servers.iter().take(2).collect();
-        let oprf_output = coordinator.register_user(b"blinded-password", &server_refs);
-        assert!(oprf_output.is_ok());
-        assert_eq!(oprf_output.unwrap().len(), 32);
-    }
-
-    #[test]
-    fn test_authenticate_user() {
-        let result = generate_threshold_oprf_key(2, 3);
-        let servers: Vec<ThresholdOpaqueServer> = result.shares.iter().enumerate().map(|(i, share)| {
-            ThresholdOpaqueServer::new(
-                ThresholdOpaqueConfig { threshold: 2, total_servers: 3, server_id: (i + 1) as u8 },
-                share.clone(),
-            )
-        }).collect();
-
-        let coordinator = ThresholdOpaqueCoordinator::new(
-            ThresholdOpaqueConfig { threshold: 2, total_servers: 3, server_id: 0 },
-        );
-
-        // Register with servers 0,1
-        let server_refs_reg: Vec<&ThresholdOpaqueServer> = servers.iter().take(2).collect();
-        let reg_output = coordinator.register_user(b"blinded-pw", &server_refs_reg).unwrap();
-
-        // Authenticate with the SAME subset of servers 0,1
-        let server_refs_auth: Vec<&ThresholdOpaqueServer> = servers.iter().take(2).collect();
-        let auth_output = coordinator.authenticate_user(b"blinded-pw", &server_refs_auth).unwrap();
-
-        // Same input, same server subset, same output
-        assert_eq!(reg_output, auth_output);
-
-        // Output should be 32 bytes
-        assert_eq!(auth_output.len(), 32);
-    }
-
-    #[test]
-    fn test_authenticate_insufficient_servers() {
-        let result = generate_threshold_oprf_key(2, 3);
-        let servers: Vec<ThresholdOpaqueServer> = result.shares.iter().enumerate().map(|(i, share)| {
-            ThresholdOpaqueServer::new(
-                ThresholdOpaqueConfig { threshold: 2, total_servers: 3, server_id: (i + 1) as u8 },
-                share.clone(),
-            )
-        }).collect();
-
-        let coordinator = ThresholdOpaqueCoordinator::new(
-            ThresholdOpaqueConfig { threshold: 2, total_servers: 3, server_id: 0 },
-        );
-
-        // Only 1 server — should fail
-        let server_refs: Vec<&ThresholdOpaqueServer> = servers.iter().take(1).collect();
-        assert!(coordinator.authenticate_user(b"test", &server_refs).is_err());
     }
 
     #[test]
@@ -903,22 +757,17 @@ mod tests {
     }
 
     #[test]
-    fn test_different_inputs_produce_different_outputs() {
+    fn test_partial_evaluation_distinct_per_input() {
+        // The per-server partial evaluation (HMAC over the input) is still a
+        // sound deterministic function of (share, input) even though the
+        // cross-server combiner is disabled. Different inputs differ.
         let result = generate_threshold_oprf_key(2, 3);
-        let servers: Vec<ThresholdOpaqueServer> = result.shares.iter().enumerate().map(|(i, share)| {
-            ThresholdOpaqueServer::new(
-                ThresholdOpaqueConfig { threshold: 2, total_servers: 3, server_id: (i + 1) as u8 },
-                share.clone(),
-            )
-        }).collect();
-
-        let coordinator = ThresholdOpaqueCoordinator::new(
-            ThresholdOpaqueConfig { threshold: 2, total_servers: 3, server_id: 0 },
+        let server = ThresholdOpaqueServer::new(
+            ThresholdOpaqueConfig { threshold: 2, total_servers: 3, server_id: 1 },
+            result.shares[0].clone(),
         );
-
-        let server_refs: Vec<&ThresholdOpaqueServer> = servers.iter().take(2).collect();
-        let out_a = coordinator.register_user(b"password-a", &server_refs).unwrap();
-        let out_b = coordinator.register_user(b"password-b", &server_refs).unwrap();
-        assert_ne!(out_a, out_b);
+        let eval_a = server.partial_evaluate(b"password-a");
+        let eval_b = server.partial_evaluate(b"password-b");
+        assert_ne!(eval_a.evaluation, eval_b.evaluation);
     }
 }

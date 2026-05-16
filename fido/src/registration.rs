@@ -127,17 +127,21 @@ impl CredentialStore {
     /// Store a pending challenge associated with a user.
     ///
     /// Runs garbage collection of expired challenges before inserting.
-    /// Rejects if the store already holds `MAX_CHALLENGES` entries.
-    pub fn store_challenge(&mut self, challenge: &[u8], user_id: Uuid) {
+    /// Returns `Err` if the store already holds `MAX_CHALLENGES` entries so
+    /// the caller can surface an actionable failure instead of letting the
+    /// user fail authentication later with no diagnostic.
+    pub fn store_challenge(&mut self, challenge: &[u8], user_id: Uuid) -> Result<(), &'static str> {
         self.cleanup_expired_challenges();
         if self.challenges.len() >= Self::MAX_CHALLENGES {
             tracing::error!(
-                "FIDO: MAX_CHALLENGES ({}) reached — rejecting new challenge",
+                target: "siem",
+                "SIEM:ERROR FIDO: MAX_CHALLENGES ({}) reached — rejecting new challenge",
                 Self::MAX_CHALLENGES
             );
-            return;
+            return Err("FIDO challenge store full — try again shortly");
         }
         self.challenges.insert(challenge.to_vec(), (user_id, Instant::now()));
+        Ok(())
     }
 
     /// Consume and validate a challenge, returning the associated user ID.
@@ -185,16 +189,25 @@ impl CredentialStore {
     }
 
     /// Store a completed credential registration.
-    /// Rejects if the store already holds `MAX_CREDENTIALS` entries.
-    pub fn store_credential(&mut self, cred: StoredCredential) {
-        if self.credentials.len() >= Self::MAX_CREDENTIALS {
+    ///
+    /// Returns `Err` if the store already holds `MAX_CREDENTIALS` entries so
+    /// the caller never reports a successful enrolment for a credential that
+    /// was actually dropped (which would lock the user out permanently).
+    /// Overwriting an existing credential_id is permitted and does not count
+    /// against the cap.
+    pub fn store_credential(&mut self, cred: StoredCredential) -> Result<(), &'static str> {
+        if self.credentials.len() >= Self::MAX_CREDENTIALS
+            && !self.credentials.contains_key(&cred.credential_id)
+        {
             tracing::error!(
-                "FIDO: MAX_CREDENTIALS ({}) reached — rejecting new credential",
+                target: "siem",
+                "SIEM:ERROR FIDO: MAX_CREDENTIALS ({}) reached — rejecting new credential",
                 Self::MAX_CREDENTIALS
             );
-            return;
+            return Err("FIDO credential store full — registration rejected");
         }
         self.credentials.insert(cred.credential_id.clone(), cred);
+        Ok(())
     }
 
     /// Look up a credential by its ID.
@@ -306,7 +319,7 @@ pub fn validate_and_register_pq(
         pq_attestation: pq_attestation.to_vec(),
     };
 
-    store.store_credential(cred.clone());
+    store.store_credential(cred.clone())?;
     Ok(cred)
 }
 
@@ -353,9 +366,18 @@ impl PersistentCredentialStore {
     }
 
     /// Load all credentials from the database into the in-memory cache.
+    ///
+    /// All FIDO2 security state — AAGUID, the clone-detection flag,
+    /// backup-eligibility/-state and the PQ attestation blob — is round-tripped
+    /// from the dedicated schema columns (see the `fido_credentials` column
+    /// migration in `common::db`). A row whose public key or PQ attestation
+    /// fails to decrypt is a hard error in military mode: silently dropping it
+    /// would erase the credential from the user's account, and substituting
+    /// zero-state would unlock a known-cloned authenticator.
     async fn load_from_db(&mut self) -> Result<(), String> {
         let rows = sqlx::query(
-            "SELECT credential_id, public_key, user_id, sign_count, authenticator_type \
+            "SELECT credential_id, public_key, user_id, sign_count, authenticator_type, \
+                    aaguid, cloned_flag, backup_eligible, backup_state, pq_attestation \
              FROM fido_credentials"
         )
         .fetch_all(&self.pool.pool)
@@ -368,6 +390,8 @@ impl PersistentCredentialStore {
             format!("load fido_credentials: {e}")
         })?;
 
+        let military = is_military_deployment();
+
         for row in rows {
             use sqlx::Row;
             let cred_id_enc: Vec<u8> = row.get("credential_id");
@@ -375,56 +399,149 @@ impl PersistentCredentialStore {
             let user_id: Uuid = row.get("user_id");
             let sign_count: i32 = row.get("sign_count");
             let auth_type: String = row.get("authenticator_type");
+            let aaguid_raw: Option<Vec<u8>> = row.get("aaguid");
+            let cloned_flag: bool = row.get("cloned_flag");
+            let backup_eligible: bool = row.get("backup_eligible");
+            let backup_state: bool = row.get("backup_state");
+            let pq_attestation_enc: Option<Vec<u8>> = row.get("pq_attestation");
 
-            let pubkey = self.pool.decrypt_field(
+            let pubkey = match self.pool.decrypt_field(
                 "fido_credentials", "public_key", &cred_id_enc, &pubkey_enc,
-            ).unwrap_or_else(|e| {
-                tracing::error!(
-                    target: "siem",
-                    "SIEM:ERROR Failed to decrypt FIDO credential public key: {e}"
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!(
+                        target: "siem",
+                        "SIEM:CRITICAL Failed to decrypt FIDO credential public key: {e}"
+                    );
+                    // Fail closed: a credential we cannot decrypt must not
+                    // silently vanish from the user's account.
+                    return Err(format!(
+                        "decrypt fido credential public key (schema/key fault, NOT a policy violation): {e}"
+                    ));
+                }
+            };
+            if pubkey.is_empty() {
+                return Err(
+                    "fido credential public key decrypted to empty bytes (schema/key fault)".into(),
                 );
-                Vec::new()
-            });
-
-            if !pubkey.is_empty() {
-                self.memory.store_credential(StoredCredential {
-                    credential_id: cred_id_enc.to_vec(),
-                    public_key: pubkey,
-                    user_id,
-                    sign_count: sign_count as u32,
-                    authenticator_type: auth_type,
-                    aaguid: [0u8; 16],
-                    cloned_flag: false,
-                    backup_eligible: false,
-                    backup_state: false,
-                    pq_attestation: Vec::new(),
-                });
             }
+
+            // AAGUID: a missing column value means the credential predates the
+            // schema migration. In military mode that is unrecoverable trust
+            // state — refuse to load rather than substitute the all-zero
+            // sentinel that enforce_aaguid would (correctly) reject anyway.
+            let aaguid: [u8; 16] = match aaguid_raw {
+                Some(bytes) if bytes.len() == 16 => {
+                    let mut a = [0u8; 16];
+                    a.copy_from_slice(&bytes);
+                    a
+                }
+                _ if military => {
+                    tracing::error!(
+                        target: "siem",
+                        "SIEM:CRITICAL FIDO credential has no persisted AAGUID — schema migration \
+                         predates this credential; cannot trust it in military mode"
+                    );
+                    return Err(
+                        "fido credential missing persisted AAGUID (schema fault, NOT a policy violation)".into(),
+                    );
+                }
+                _ => [0u8; 16],
+            };
+
+            // PQ attestation: decrypt if present; in military / PQ-required
+            // mode an absent blob is a hard schema fault (the boot-time PQ
+            // binding invariant would fail anyway — surface the real cause).
+            let pq_attestation: Vec<u8> = match pq_attestation_enc {
+                Some(enc) if !enc.is_empty() => {
+                    match self.pool.decrypt_field(
+                        "fido_credentials", "pq_attestation", &cred_id_enc, &enc,
+                    ) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::error!(
+                                target: "siem",
+                                "SIEM:CRITICAL Failed to decrypt FIDO PQ attestation: {e}"
+                            );
+                            return Err(format!(
+                                "decrypt fido pq_attestation (schema/key fault, NOT a policy violation): {e}"
+                            ));
+                        }
+                    }
+                }
+                _ if military => {
+                    tracing::error!(
+                        target: "siem",
+                        "SIEM:CRITICAL FIDO credential has no persisted PQ attestation — schema \
+                         migration predates this credential; cannot satisfy PQ binding invariant"
+                    );
+                    return Err(
+                        "fido credential missing persisted PQ attestation (schema fault, NOT a policy violation)".into(),
+                    );
+                }
+                _ => Vec::new(),
+            };
+
+            self.memory.store_credential(StoredCredential {
+                credential_id: cred_id_enc.to_vec(),
+                public_key: pubkey,
+                user_id,
+                sign_count: sign_count as u32,
+                authenticator_type: auth_type,
+                aaguid,
+                cloned_flag,
+                backup_eligible,
+                backup_state,
+                pq_attestation,
+            }).map_err(|e| format!("load fido credential into L1 cache: {e}"))?;
         }
         Ok(())
     }
 
     /// Store a credential in both the database and in-memory cache.
+    ///
+    /// Persists the full FIDO2 security state — AAGUID, clone-detection flag,
+    /// backup-eligibility/-state and the PQ attestation blob — so a process
+    /// restart cannot erase it. The PQ attestation is field-encrypted like the
+    /// public key; AAGUID is a non-secret device-model identifier stored plain.
     pub async fn store_credential(&mut self, cred: StoredCredential) -> Result<(), String> {
         let pubkey_enc = self.pool.encrypt_field(
             "fido_credentials", "public_key", &cred.credential_id, &cred.public_key,
         )?;
+        let pq_enc: Option<Vec<u8>> = if cred.pq_attestation.is_empty() {
+            None
+        } else {
+            Some(self.pool.encrypt_field(
+                "fido_credentials", "pq_attestation", &cred.credential_id, &cred.pq_attestation,
+            )?)
+        };
 
         sqlx::query(
-            "INSERT INTO fido_credentials (credential_id, public_key, user_id, sign_count, authenticator_type) \
-             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (credential_id) DO UPDATE \
-             SET public_key = $2, sign_count = $4"
+            "INSERT INTO fido_credentials \
+                (credential_id, public_key, user_id, sign_count, authenticator_type, \
+                 aaguid, cloned_flag, backup_eligible, backup_state, pq_attestation) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+             ON CONFLICT (credential_id) DO UPDATE \
+             SET public_key = $2, sign_count = $4, aaguid = $6, cloned_flag = $7, \
+                 backup_eligible = $8, backup_state = $9, pq_attestation = $10"
         )
         .bind(&cred.credential_id)
         .bind(&pubkey_enc)
         .bind(cred.user_id)
         .bind(cred.sign_count as i64)
         .bind(&cred.authenticator_type)
+        .bind(&cred.aaguid[..])
+        .bind(cred.cloned_flag)
+        .bind(cred.backup_eligible)
+        .bind(cred.backup_state)
+        .bind(pq_enc)
         .execute(&self.pool.pool)
         .await
         .map_err(|e| format!("persist fido credential: {e}"))?;
 
-        self.memory.store_credential(cred);
+        self.memory.store_credential(cred)
+            .map_err(|e| format!("cache fido credential: {e}"))?;
         Ok(())
     }
 
@@ -449,8 +566,8 @@ impl PersistentCredentialStore {
     }
 
     /// Store a pending challenge (memory-only, ephemeral).
-    pub fn store_challenge(&mut self, challenge: &[u8], user_id: Uuid) {
-        self.memory.store_challenge(challenge, user_id);
+    pub fn store_challenge(&mut self, challenge: &[u8], user_id: Uuid) -> Result<(), &'static str> {
+        self.memory.store_challenge(challenge, user_id)
     }
 
     /// Consume a pending challenge (memory-only, ephemeral).
@@ -459,7 +576,36 @@ impl PersistentCredentialStore {
     }
 
     /// Update sign count in both DB and memory after successful authentication.
+    ///
+    /// Defense-in-depth: the WebAuthn sign counter is monotonic; a non-strictly-
+    /// increasing update is a clone-detection signal and MUST NOT be persisted.
+    /// This re-checks `new_count > stored` here (independent of the
+    /// `authentication::update_sign_count` check) so a buggy or attacker-
+    /// controlled call site cannot drive the persisted counter backwards.
+    /// A sign count of 0 from the authenticator is a documented exception
+    /// (the authenticator does not implement a counter) and is left untouched.
     pub async fn update_sign_count(&mut self, credential_id: &[u8], new_count: u32) -> Result<(), String> {
+        let stored = self
+            .memory
+            .get_credential(credential_id)
+            .ok_or_else(|| "update sign count: credential not found".to_string())?
+            .sign_count;
+
+        if new_count == 0 && stored == 0 {
+            // Authenticator does not implement a sign counter — nothing to do.
+            return Ok(());
+        }
+        if new_count <= stored {
+            tracing::error!(
+                target: "siem",
+                "SIEM:CRITICAL FIDO sign-count rollback rejected (stored={stored}, new={new_count}) \
+                 — possible cloned authenticator"
+            );
+            return Err(format!(
+                "sign count rollback rejected (stored={stored}, new={new_count})"
+            ));
+        }
+
         sqlx::query("UPDATE fido_credentials SET sign_count = $1 WHERE credential_id = $2")
             .bind(new_count as i64)
             .bind(credential_id)
@@ -566,7 +712,7 @@ mod tests {
 
         // Store a challenge
         let challenge = vec![10, 20, 30];
-        store.store_challenge(&challenge, user_id);
+        store.store_challenge(&challenge, user_id).unwrap();
         assert_eq!(store.consume_challenge(&challenge), Some(user_id));
         // Challenge is consumed
         assert_eq!(store.consume_challenge(&challenge), None);
@@ -584,7 +730,7 @@ mod tests {
         backup_state: false,
         pq_attestation: Vec::new()
         };
-        store.store_credential(cred);
+        store.store_credential(cred).unwrap();
 
         assert!(store.get_credential(&cred_id).is_some());
         assert_eq!(store.get_credential(&cred_id).unwrap().user_id, user_id);
@@ -699,7 +845,7 @@ mod tests {
         backup_eligible: false,
         backup_state: false,
         pq_attestation: Vec::new()
-        });
+        }).unwrap();
         assert!(store.credential_exists(&cred_id));
     }
 

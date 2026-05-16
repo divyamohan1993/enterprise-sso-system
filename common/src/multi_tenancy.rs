@@ -823,14 +823,17 @@ impl TenantPolicy {
                     Ok(p) => p,
                     Err(_) => return false,
                 };
-                // Parse both as IPv4 octets for comparison
+                // Parse both as IPv4 octets for comparison. The `::<u8>`
+                // turbofish is explicit: without it the parse target type is
+                // ambiguous (E0283) on some rustc versions because inference
+                // cannot always drive it backward from the `Vec<u8>` collect.
                 let net_octets: Vec<u8> = network_str
                     .split('.')
-                    .filter_map(|s| s.parse().ok())
+                    .filter_map(|s| s.parse::<u8>().ok())
                     .collect();
                 let ip_octets: Vec<u8> = ip
                     .split('.')
-                    .filter_map(|s| s.parse().ok())
+                    .filter_map(|s| s.parse::<u8>().ok())
                     .collect();
                 if net_octets.len() != 4 || ip_octets.len() != 4 || prefix_len > 32 {
                     return false;

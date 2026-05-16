@@ -80,6 +80,13 @@ const MAX_CODE_ATTEMPTS_PER_CLIENT: u32 = 10;
 /// Rate limit window for code consumption attempts (60 seconds).
 const CODE_ATTEMPT_WINDOW_SECS: u64 = 60;
 
+/// Maximum consumption attempts on UNKNOWN (not-in-store) codes per window,
+/// across all clients. This caps brute-forcing of random/forged codes — the
+/// dominant attack pattern the per-client limiter cannot see. Set generously:
+/// legitimate traffic only ever presents codes that are in the store, so a
+/// well-behaved deployment never approaches this ceiling.
+const MAX_UNKNOWN_CODE_ATTEMPTS: u32 = 100;
+
 // ── OAuth Redirect URI Validation (CRITICAL — prevents authorization code theft) ──
 
 /// Validate a redirect_uri against the set of registered redirect URIs for a client.
@@ -391,6 +398,12 @@ pub struct AuthorizationStore {
     /// Tracks failed code consumption attempts per client_id for rate limiting.
     /// Maps client_id -> (failed_attempt_count, window_start).
     code_attempt_tracker: HashMap<String, (u32, Instant)>,
+    /// Global rate limiter for consumption attempts on codes that are NOT in
+    /// the store (unknown / forged). The per-client tracker above cannot fire
+    /// for an unknown code because no client_id is recoverable from it, so a
+    /// brute-force of random hex codes would otherwise face no limit at this
+    /// layer. `(attempt_count, window_start)`.
+    unknown_code_attempts: (u32, Instant),
 }
 
 impl AuthorizationStore {
@@ -399,6 +412,7 @@ impl AuthorizationStore {
             codes: HashMap::new(),
             consume_count: AtomicU64::new(0),
             code_attempt_tracker: HashMap::new(),
+            unknown_code_attempts: (0, Instant::now()),
         }
     }
 
@@ -531,6 +545,23 @@ impl AuthorizationStore {
             self.code_attempt_tracker.retain(|_, (_, ts)| *ts > cutoff);
         }
 
+        // Rate-limit attempts on codes that are not in the store. This is the
+        // brute-force / forged-code path: no client_id is recoverable, so the
+        // per-client tracker above never fires for it. A global windowed
+        // counter ensures this path is not unlimited.
+        if client_id.is_none() {
+            let now = Instant::now();
+            if now.duration_since(self.unknown_code_attempts.1).as_secs()
+                >= CODE_ATTEMPT_WINDOW_SECS
+            {
+                self.unknown_code_attempts = (0, now);
+            }
+            if self.unknown_code_attempts.0 >= MAX_UNKNOWN_CODE_ATTEMPTS {
+                return None;
+            }
+            self.unknown_code_attempts.0 += 1;
+        }
+
         let auth_code = self.codes.get_mut(&hashed_key)?;
 
         // Reject already-consumed codes (replay detection)
@@ -629,20 +660,21 @@ impl PersistentAuthorizationStore {
     async fn load_from_db(&mut self) -> Result<(), String> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
         // DB stores hashed code keys and blinded code_challenges — load them directly.
-        let rows: Vec<(String, String, String, Uuid, Option<String>, i32, Option<String>, i64, bool)> =
+        // `scope` is nullable (legacy rows predate the column); a NULL maps to "".
+        let rows: Vec<(String, String, String, Uuid, Option<String>, i32, Option<String>, Option<String>, i64, bool)> =
             sqlx::query_as(
                 "SELECT code_hash, client_id, redirect_uri, user_id, \
-                 code_challenge_blind, tier, nonce, created_at, consumed \
+                 code_challenge_blind, tier, nonce, scope, created_at, consumed \
                  FROM authorization_codes WHERE created_at > $1",
             )
             .bind(now - (CODE_EXPIRY_SECS * 2))
             .fetch_all(&self.pool)
             .await
             .map_err(|e| format!("load codes: {e}"))?;
-        for (code_hash, cid, ruri, uid, cc_blind, tier, nonce, cat, consumed) in rows {
+        for (code_hash, cid, ruri, uid, cc_blind, tier, nonce, scope, cat, consumed) in rows {
             self.memory.codes.insert(code_hash, AuthorizationCode {
                 code: String::new(), client_id: cid, redirect_uri: ruri,
-                user_id: uid, scope: String::new(), code_challenge: cc_blind,
+                user_id: uid, scope: scope.unwrap_or_default(), code_challenge: cc_blind,
                 nonce, tier: tier as u8, expires_at: cat + CODE_EXPIRY_SECS,
                 consumed,
             });
@@ -655,8 +687,10 @@ impl PersistentAuthorizationStore {
         let blinded_challenge = code_challenge.as_deref().map(blind_code_challenge);
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
         // Store hashed code and blinded challenge in DB — never plaintext.
-        sqlx::query("INSERT INTO authorization_codes (code_hash, client_id, redirect_uri, user_id, code_challenge_blind, tier, nonce, created_at, consumed) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,FALSE)")
-            .bind(&hashed_key).bind(client_id).bind(redirect_uri).bind(user_id).bind(blinded_challenge.as_deref()).bind(tier as i32).bind(nonce.as_deref()).bind(now)
+        // `scope` is persisted so a cold-cache code-exchange on a sibling
+        // instance can reconstruct the granted scope (see `consume_code`).
+        sqlx::query("INSERT INTO authorization_codes (code_hash, client_id, redirect_uri, user_id, code_challenge_blind, tier, nonce, scope, created_at, consumed) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,FALSE)")
+            .bind(&hashed_key).bind(client_id).bind(redirect_uri).bind(user_id).bind(blinded_challenge.as_deref()).bind(tier as i32).bind(nonce.as_deref()).bind(scope).bind(now)
             .execute(&self.pool).await.map_err(|e| format!("persist code: {e}"))?;
         Ok(code)
     }
@@ -700,16 +734,69 @@ impl PersistentAuthorizationStore {
             return Ok(None);
         }
 
-        // DB confirmed this instance won the race — now consume from in-memory cache.
-        let r = self.memory.consume_code(code);
-        if r.is_none() {
-            // Edge case: in-memory cache was stale (e.g., code expired in cache but
-            // not in DB). The DB update already marked it consumed, which is correct.
-            tracing::warn!(
-                "Authorization code consumed in DB but not in memory cache — cache was stale"
-            );
+        // DB confirmed this instance won the race. The atomic UPDATE is the
+        // source of truth: this call MUST return the consumed code so the
+        // caller can complete the token exchange.
+        //
+        // First try the in-memory cache: when warm it carries the full record.
+        // The cold-cache path below reconstructs the same fields (including
+        // `scope`) from the DB row.
+        if let Some(r) = self.memory.consume_code(code) {
+            return Ok(Some(r));
         }
-        Ok(r)
+
+        // Cross-instance / cold-cache path: this instance won the DB race but
+        // never held the code in memory (it was issued by a sibling instance,
+        // or evicted). Returning `Ok(None)` here was the bug — it stranded a
+        // legitimately consumed code. Reconstruct the record from the DB row
+        // so the token exchange can proceed.
+        //
+        // `scope` is read from the row so the cross-instance exchange gets the
+        // real granted scope. Column names match the INSERT in
+        // `create_code_with_tier` and the SELECT in `load_from_db`
+        // (`code_challenge_blind`, `scope`). `scope` is nullable for rows
+        // written before the column existed; a NULL maps to "".
+        let row: Option<(String, String, Uuid, Option<String>, i32, Option<String>, Option<String>, i64)> =
+            sqlx::query_as(
+                "SELECT client_id, redirect_uri, user_id, code_challenge_blind, \
+                 tier, nonce, scope, created_at \
+                 FROM authorization_codes WHERE code_hash = $1",
+            )
+            .bind(&hashed_key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| format!("reload consumed code: {e}"))?;
+
+        match row {
+            Some((cid, ruri, uid, cc, tier, nonce, scope, cat)) => {
+                tracing::info!(
+                    target: "siem",
+                    "Authorization code consumed via DB-authoritative path with cold cache \
+                     — reconstructed from row for cross-instance token exchange"
+                );
+                Ok(Some(AuthorizationCode {
+                    code: String::new(),
+                    client_id: cid,
+                    redirect_uri: ruri,
+                    user_id: uid,
+                    scope: scope.unwrap_or_default(),
+                    code_challenge: cc,
+                    nonce,
+                    tier: tier as u8,
+                    expires_at: cat + CODE_EXPIRY_SECS,
+                    consumed: true,
+                }))
+            }
+            None => {
+                // The row vanished between UPDATE and SELECT (concurrent
+                // cleanup). The UPDATE still proves we won; without the row we
+                // cannot rebuild the code, so report it as unavailable.
+                tracing::warn!(
+                    "Authorization code won DB race but row disappeared before reload"
+                );
+                Ok(None)
+            }
+        }
     }
     pub fn is_code_consumed(&self, code: &str) -> bool { self.memory.is_code_consumed(code) }
     pub async fn cleanup_expired(&mut self) -> Result<(), String> {

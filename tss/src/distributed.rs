@@ -1010,8 +1010,77 @@ impl SignerNode {
         // Also persist to sealed storage (belt-and-suspenders with WAL)
         save_nonce_counter(self.nonce_counter);
 
-        let mut rng = rand::thread_rng();
+        // SECURITY (audit follow-up): the FROST round-1 nonces are generated
+        // from a CSPRNG seeded with the persistent, WAL-protected
+        // `nonce_counter`. Previously `commit()` advanced/persisted the counter
+        // but then drew nonces from `rand::thread_rng()`, so the counter never
+        // influenced the nonce — persisting it was theatre. Now the counter is
+        // load-bearing: it is mixed into the RNG seed, so the strictly
+        // monotonic, crash-durable counter guarantees the same nonce can never
+        // be produced twice across restarts / snapshot restores (FROST nonce
+        // reuse is signing-share-extracting). Fresh OS entropy is also folded
+        // in, so the nonce stays unpredictable and degrades gracefully.
+        let mut rng = self.seeded_nonce_rng();
         frost::round1::commit(self.key_package.signing_share(), &mut rng)
+    }
+
+    /// Build a CSPRNG for FROST round-1 nonce generation, seeded so that the
+    /// persistent `nonce_counter` genuinely prevents nonce reuse.
+    ///
+    /// Seed = `HKDF-SHA512(salt = "MILNET-TSS-NONCE-RNG-v1",
+    ///                      ikm  = signing_share || nonce_counter_le || os_entropy)`.
+    ///
+    /// Including `nonce_counter` (strictly monotonic, WAL-durable) means two
+    /// `commit()` calls can never share an RNG stream — even across a crash
+    /// and restart — so they can never produce the same nonce. Folding in
+    /// fresh `getrandom` entropy keeps the nonce unpredictable to anyone who
+    /// somehow knew the counter, and means a counter-handling bug alone does
+    /// not immediately repeat a nonce. `StdRng` is `rand`'s CSPRNG (ChaCha).
+    fn seeded_nonce_rng(&self) -> rand::rngs::StdRng {
+        use hkdf::Hkdf;
+        use rand::SeedableRng;
+        use sha2::Sha512;
+        use zeroize::Zeroize;
+
+        // Secret signing share bytes — domain-separates per signer.
+        // `SigningShare::serialize()` returns `Vec<u8>` directly in
+        // frost-ristretto255 2.x (the share is a scalar; serialization is
+        // infallible — cf. `crypto::threshold` which also calls it un-`?`'d).
+        let mut share_bytes = self.key_package.signing_share().serialize();
+
+        // Fresh OS entropy so the stream is not purely counter-deterministic.
+        let mut os_entropy = [0u8; 32];
+        getrandom::getrandom(&mut os_entropy).unwrap_or_else(|e| {
+            tracing::error!(
+                target: "siem",
+                severity = "CRITICAL",
+                action = "tss_nonce_rng_entropy_fail",
+                error = %e,
+                "FATAL: OS CSPRNG unavailable for FROST nonce RNG seed"
+            );
+            // Fail-closed: a signer must never proceed without fresh entropy.
+            panic!("FATAL: OS CSPRNG unavailable for TSS nonce RNG: {e}");
+        });
+
+        let mut ikm = Vec::with_capacity(share_bytes.len() + 8 + 32);
+        ikm.extend_from_slice(&share_bytes);
+        ikm.extend_from_slice(&self.nonce_counter.to_le_bytes());
+        ikm.extend_from_slice(&os_entropy);
+
+        let hk = Hkdf::<Sha512>::new(Some(b"MILNET-TSS-NONCE-RNG-v1"), &ikm);
+        let mut seed = [0u8; 32];
+        hk.expand(b"frost-round1-nonce", &mut seed)
+            .expect("HKDF-SHA512 expand of 32 bytes never fails");
+
+        let rng = rand::rngs::StdRng::from_seed(seed);
+
+        // Wipe all secret seed material from the stack.
+        seed.zeroize();
+        ikm.zeroize();
+        share_bytes.zeroize();
+        os_entropy.zeroize();
+
+        rng
     }
 
     /// Round 2: Produce a signature share (called on each signer independently).
@@ -1361,25 +1430,48 @@ impl ThresholdReconfiguration {
 ///
 /// Frost types are serialized to bytes using their own `.serialize()` /
 /// `::deserialize()` methods and wrapped as `Vec<u8>` for transport.
+///
+/// # FROST nonce-secrecy invariant (SECURITY, P0)
+///
+/// `SigningNonces` contain the signer's secret hiding/binding scalars. They
+/// MUST NEVER leave the signer process: a coordinator (or any observer who
+/// breaks one mTLS session) that learns two nonce values can solve for the
+/// signer's secret share. Therefore neither `CommitResponse` nor `SignRequest`
+/// carries nonce bytes — only the public `SigningCommitments` go on the wire.
+/// The signer retains its own `SigningNonces` in a per-ceremony session table
+/// keyed by `ceremony_id` and signs round 2 strictly with its retained values.
 #[derive(Serialize, Deserialize)]
 pub enum SignerMessage {
     /// Coordinator -> Signer: request a commitment for signing.
-    CommitRequest,
-    /// Signer -> Coordinator: commitment response with serialized nonces and commitments.
+    ///
+    /// `ceremony_id` is a fresh 32-byte random value the coordinator generates
+    /// per ceremony; the signer uses it to key the retained nonces so round 2
+    /// can be matched without ever transmitting secret nonce material.
+    CommitRequest {
+        /// Unique per-ceremony correlation id (coordinator-generated).
+        ceremony_id: [u8; 32],
+    },
+    /// Signer -> Coordinator: commitment response.
+    ///
+    /// Carries only PUBLIC material — the secret `SigningNonces` are retained
+    /// on the signer and never serialized here.
     CommitResponse {
+        /// Echoed ceremony id so the coordinator can correlate.
+        ceremony_id: [u8; 32],
         /// Serialized `frost::Identifier` bytes.
         identifier_bytes: Vec<u8>,
-        /// Serialized `frost::round1::SigningNonces` bytes.
-        nonces_bytes: Vec<u8>,
-        /// Serialized `frost::round1::SigningCommitments` bytes.
+        /// Serialized `frost::round1::SigningCommitments` bytes (public).
         commitments_bytes: Vec<u8>,
     },
     /// Coordinator -> Signer: request a signature share.
+    ///
+    /// The signer recovers its OWN retained `SigningNonces` for `ceremony_id`;
+    /// no nonce material is transmitted.
     SignRequest {
+        /// Ceremony id whose retained nonces the signer must sign with.
+        ceremony_id: [u8; 32],
         /// Serialized `frost::SigningPackage` bytes.
         signing_package_bytes: Vec<u8>,
-        /// Serialized `frost::round1::SigningNonces` bytes (returned from commit).
-        nonces_bytes: Vec<u8>,
     },
     /// Signer -> Coordinator: signature share response.
     SignResponse {
@@ -1390,6 +1482,61 @@ pub enum SignerMessage {
     },
     /// Error from signer.
     Error { message: String },
+}
+
+/// How long a signer retains a ceremony's `SigningNonces` awaiting round 2.
+///
+/// Bounds memory if a coordinator abandons a ceremony after round 1. Generous
+/// relative to `DEFAULT_SIGNING_TIMEOUT_SECS` so a slow but honest ceremony is
+/// not evicted; stale entries are pruned lazily on each new commit.
+const NONCE_SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Per-signer table of nonces retained between FROST round 1 and round 2.
+///
+/// SECURITY: this is the ONLY place a live `SigningNonces` value exists after
+/// `commit()`. Entries are single-use (removed when consumed by round 2) and
+/// time-bounded so a malicious coordinator cannot pin memory or replay an old
+/// ceremony id against fresh nonces.
+struct NonceSessionTable {
+    sessions: std::collections::HashMap<[u8; 32], (SigningNonces, std::time::Instant)>,
+}
+
+impl NonceSessionTable {
+    fn new() -> Self {
+        Self {
+            sessions: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Drop any ceremony whose nonces have outlived [`NONCE_SESSION_TTL`].
+    fn prune_expired(&mut self) {
+        let now = std::time::Instant::now();
+        self.sessions
+            .retain(|_, (_, created)| now.duration_since(*created) < NONCE_SESSION_TTL);
+    }
+
+    /// Store the retained nonces for a fresh ceremony.
+    ///
+    /// Rejects a duplicate `ceremony_id`: re-using an id would let a malicious
+    /// coordinator overwrite (or fork) an in-flight ceremony's nonces.
+    fn insert(&mut self, ceremony_id: [u8; 32], nonces: SigningNonces) -> Result<(), String> {
+        self.prune_expired();
+        if self.sessions.contains_key(&ceremony_id) {
+            return Err("duplicate ceremony id in round 1".into());
+        }
+        self.sessions
+            .insert(ceremony_id, (nonces, std::time::Instant::now()));
+        Ok(())
+    }
+
+    /// Consume (remove and return) the retained nonces for `ceremony_id`.
+    ///
+    /// Single-use: a second round-2 request for the same ceremony finds
+    /// nothing, which prevents nonce reuse if a coordinator replays a request.
+    fn take(&mut self, ceremony_id: &[u8; 32]) -> Option<SigningNonces> {
+        self.prune_expired();
+        self.sessions.remove(ceremony_id).map(|(n, _)| n)
+    }
 }
 
 /// A remote signer node that communicates via SHARD over mTLS.
@@ -1446,6 +1593,11 @@ async fn run_signer_process_inner(
     // Using tokio::sync::Mutex so that the guard is Send-safe across await points.
     let node = tokio::sync::Mutex::new(node);
 
+    // SECURITY (P0): per-ceremony retained nonces. SigningNonces NEVER cross
+    // the wire — they live only here, keyed by the coordinator-supplied
+    // ceremony id, and are consumed (single-use) by round 2.
+    let nonce_sessions = tokio::sync::Mutex::new(NonceSessionTable::new());
+
     loop {
         match listener.accept().await {
             Ok(mut transport) => {
@@ -1474,17 +1626,36 @@ async fn run_signer_process_inner(
                         };
 
                         match msg {
-                            SignerMessage::CommitRequest => {
+                            SignerMessage::CommitRequest { ceremony_id } => {
                                 let mut guard = node.lock().await;
                                 let (nonces, commitments) = guard.commit();
-
                                 let identifier_bytes = guard.identifier().serialize();
-                                let nonces_bytes = nonces.serialize().unwrap_or_default();
-                                let commitments_bytes = commitments.serialize().unwrap_or_default();
+                                drop(guard);
+
+                                // SECURITY (P0): retain the secret nonces locally,
+                                // keyed by ceremony id. They are NEVER serialized
+                                // into the response.
+                                if let Err(e) =
+                                    nonce_sessions.lock().await.insert(ceremony_id, nonces)
+                                {
+                                    tracing::warn!(
+                                        "TSS signer: rejecting commit — {e}"
+                                    );
+                                    let resp = SignerMessage::Error {
+                                        message: format!("commit rejected: {e}"),
+                                    };
+                                    if let Ok(b) = postcard::to_allocvec(&resp) {
+                                        let _ = transport.send(&b).await;
+                                    }
+                                    continue;
+                                }
+
+                                let commitments_bytes =
+                                    commitments.serialize().unwrap_or_default();
 
                                 let resp = SignerMessage::CommitResponse {
+                                    ceremony_id,
                                     identifier_bytes,
-                                    nonces_bytes,
                                     commitments_bytes,
                                 };
                                 let resp_bytes = match postcard::to_allocvec(&resp) {
@@ -1499,8 +1670,8 @@ async fn run_signer_process_inner(
                                 }
                             }
                             SignerMessage::SignRequest {
+                                ceremony_id,
                                 signing_package_bytes,
-                                nonces_bytes,
                             } => {
                                 let guard = node.lock().await;
 
@@ -1528,22 +1699,30 @@ async fn run_signer_process_inner(
                                         }
                                     };
 
-                                let nonces = match SigningNonces::deserialize(&nonces_bytes) {
-                                    Ok(n) => n,
-                                    Err(e) => {
+                                // SECURITY (P0): recover this signer's OWN retained
+                                // nonces for the ceremony. Single-use: `take`
+                                // removes the entry so a replayed SignRequest
+                                // cannot reuse the nonce (nonce reuse is
+                                // share-extracting). Nothing nonce-related is
+                                // accepted from the wire.
+                                let nonces = match nonce_sessions
+                                    .lock()
+                                    .await
+                                    .take(&ceremony_id)
+                                {
+                                    Some(n) => n,
+                                    None => {
+                                        tracing::warn!(
+                                            "TSS signer: no retained nonces for ceremony \
+                                             (unknown id, expired, or already consumed)"
+                                        );
                                         let resp = SignerMessage::Error {
-                                            message: format!("deserialize nonces: {e}"),
+                                            message: "unknown or already-consumed ceremony id"
+                                                .into(),
                                         };
-                                        let resp_bytes = match postcard::to_allocvec(&resp) {
-                                            Ok(b) => b,
-                                            Err(e) => {
-                                                tracing::error!("TSS signer: serialize response failed: {e}");
-                                                continue;
-                                            }
-                                        };
-                                        if let Err(e) = transport.send(&resp_bytes).await {
-                                    tracing::warn!("TSS signer: failed to send response: {e}");
-                                }
+                                        if let Ok(b) = postcard::to_allocvec(&resp) {
+                                            let _ = transport.send(&b).await;
+                                        }
                                         continue;
                                     }
                                 };
@@ -1760,10 +1939,17 @@ impl DistributedSigningCoordinator {
     /// Perform a distributed signing ceremony by communicating with remote
     /// signer nodes over SHARD/mTLS.
     ///
-    /// 1. Connects to `threshold` signers and sends `CommitRequest`.
-    /// 2. Collects commitments, builds the `SigningPackage`.
-    /// 3. Sends `SignRequest` to each signer with the signing package + nonces.
+    /// 1. Connects to `threshold` signers and sends `CommitRequest` carrying a
+    ///    fresh per-ceremony id.
+    /// 2. Collects PUBLIC commitments, builds the `SigningPackage`.
+    /// 3. Sends `SignRequest` (ceremony id + signing package only) to each
+    ///    signer; each signer signs with its OWN retained nonces.
     /// 4. Collects signature shares and aggregates into a group signature.
+    ///
+    /// SECURITY (P0): the coordinator never receives, stores, or transmits any
+    /// signer's `SigningNonces`. It only handles public commitments and the
+    /// ceremony id. This preserves FROST's threat model: a compromised
+    /// coordinator learns nothing that helps recover a signer's secret share.
     ///
     /// Each round is subject to the configured `signing_timeout`. If any
     /// signer fails to respond within the timeout, the ceremony is aborted
@@ -1789,12 +1975,15 @@ impl DistributedSigningCoordinator {
 
         let timeout_dur = self.signing_timeout;
 
+        // Fresh per-ceremony correlation id. Signers key their retained nonces
+        // on this; it never reveals secret material.
+        let ceremony_id: [u8; 32] = crypto::entropy::generate_nonce();
+
         // --- Round 1: Collect commitments (with timeout) ---
-        let mut nonces_map: BTreeMap<Identifier, Vec<u8>> = BTreeMap::new();
         let mut commitments_map: BTreeMap<Identifier, SigningCommitments> = BTreeMap::new();
         let mut unresponsive_signers: Vec<String> = Vec::new();
 
-        for (_id, addr) in &selected {
+        for (expected_id, addr) in &selected {
             // Use actual hostname for TLS SNI; fall back to "localhost" for bare IP
             // addresses since self-signed certs use DNS names, not IP SANs.
             let raw_host = addr.split(':').next().unwrap_or(addr);
@@ -1815,7 +2004,7 @@ impl DistributedSigningCoordinator {
                 .await
                 .map_err(|e| format!("connect to signer at {addr}: {e}"))?;
 
-                let req = SignerMessage::CommitRequest;
+                let req = SignerMessage::CommitRequest { ceremony_id };
                 let req_bytes =
                     postcard::to_allocvec(&req).map_err(|e| format!("serialize commit req: {e}"))?;
                 transport
@@ -1844,16 +2033,36 @@ impl DistributedSigningCoordinator {
                 }
                 Ok(Ok(resp)) => match resp {
                     SignerMessage::CommitResponse {
+                        ceremony_id: resp_ceremony_id,
                         identifier_bytes,
-                        nonces_bytes,
                         commitments_bytes,
                     } => {
+                        // The signer must echo the ceremony id we issued.
+                        if resp_ceremony_id != ceremony_id {
+                            return Err(format!(
+                                "signer at {addr} returned a mismatched ceremony id"
+                            ));
+                        }
                         let identifier = Identifier::deserialize(&identifier_bytes)
                             .map_err(|e| format!("deserialize identifier: {e}"))?;
+
+                        // SECURITY (P1): bind the signer-claimed identifier to
+                        // the one we expect for this address. A Byzantine
+                        // signer must not be able to impersonate another
+                        // participant's Identifier and displace it from the
+                        // commitment map.
+                        if identifier != *expected_id {
+                            common::siem::SecurityEvent::tamper_detected(&format!(
+                                "TSS: signer at {addr} claimed identifier {:?}, expected {:?}",
+                                identifier, expected_id
+                            ));
+                            return Err(format!(
+                                "signer at {addr} claimed an unexpected FROST identifier"
+                            ));
+                        }
                         let commitments = SigningCommitments::deserialize(&commitments_bytes)
                             .map_err(|e| format!("deserialize commitments: {e}"))?;
 
-                        nonces_map.insert(identifier, nonces_bytes);
                         commitments_map.insert(identifier, commitments);
                     }
                     SignerMessage::Error { message } => {
@@ -1884,11 +2093,7 @@ impl DistributedSigningCoordinator {
         let mut signature_shares: BTreeMap<Identifier, SignatureShare> = BTreeMap::new();
         unresponsive_signers.clear();
 
-        for (id, addr) in &selected {
-            let nonces_bytes = nonces_map
-                .remove(id)
-                .ok_or_else(|| format!("missing nonces for signer {:?}", id))?;
-
+        for (expected_id, addr) in &selected {
             // Use actual hostname for TLS SNI; fall back to "localhost" for bare IP
             // addresses since self-signed certs use DNS names, not IP SANs.
             let raw_host = addr.split(':').next().unwrap_or(addr);
@@ -1909,9 +2114,11 @@ impl DistributedSigningCoordinator {
                 .await
                 .map_err(|e| format!("connect to signer at {addr} for sign: {e}"))?;
 
+                // SECURITY (P0): no nonce material is sent. The signer recovers
+                // its own retained nonces via `ceremony_id`.
                 let req = SignerMessage::SignRequest {
+                    ceremony_id,
                     signing_package_bytes: signing_package_bytes.clone(),
-                    nonces_bytes,
                 };
                 let req_bytes =
                     postcard::to_allocvec(&req).map_err(|e| format!("serialize sign req: {e}"))?;
@@ -1946,6 +2153,18 @@ impl DistributedSigningCoordinator {
                     } => {
                         let identifier = Identifier::deserialize(&identifier_bytes)
                             .map_err(|e| format!("deserialize identifier: {e}"))?;
+                        // SECURITY (P1): the share must come from the signer we
+                        // addressed, not an impersonated identifier.
+                        if identifier != *expected_id {
+                            common::siem::SecurityEvent::tamper_detected(&format!(
+                                "TSS: round-2 signer at {addr} claimed identifier {:?}, \
+                                 expected {:?}",
+                                identifier, expected_id
+                            ));
+                            return Err(format!(
+                                "signer at {addr} returned a share for an unexpected identifier"
+                            ));
+                        }
                         let share = SignatureShare::deserialize(&share_bytes)
                             .map_err(|e| format!("deserialize signature share: {e}"))?;
                         signature_shares.insert(identifier, share);
@@ -2081,7 +2300,17 @@ pub fn unseal_signer_share(
     payload.identifier_bytes.zeroize();
     payload.public_key_package_bytes.zeroize();
 
-    let node = SignerNode::new(identifier, key_package);
+    // SECURITY (P0): construct with WAL-backed nonce persistence. `new` would
+    // leave nonce_counter=0 / nonce_wal=None, so every signer restart would
+    // replay low FROST nonce indices — and FROST nonce reuse is share-
+    // extracting. `new_with_wal(None)` recovers the counter from the WAL at
+    // DEFAULT_NONCE_WAL_PATH (MAX(wal, sealed) + safety margin) and keeps the
+    // WAL attached so every subsequent commit() is fsynced before use.
+    let node = SignerNode::new_with_wal(identifier, key_package, None);
+    tracing::info!(
+        nonce_counter = node.nonce_counter(),
+        "TSS signer share unsealed — nonce counter restored from WAL"
+    );
     Ok((node, public_key_package, threshold))
 }
 
@@ -3047,7 +3276,11 @@ pub async fn recovery_quorum_check(
         .await
         {
             Ok(Ok(mut transport)) => {
-                let req = SignerMessage::CommitRequest;
+                // Fresh ceremony id; the resulting nonce session is never
+                // completed and is reclaimed by the signer's TTL pruning.
+                let req = SignerMessage::CommitRequest {
+                    ceremony_id: crypto::entropy::generate_nonce(),
+                };
                 if let Ok(req_bytes) = postcard::to_allocvec(&req) {
                     if transport.send(&req_bytes).await.is_ok() {
                         if let Ok((_sender, resp_payload)) = transport.recv().await {
@@ -3353,6 +3586,15 @@ mod tests {
         // Ensure deterministic dev KEK is used
         // Production mode is always active — no env var override needed
         std::env::set_var("MILNET_MASTER_KEK", "ab".repeat(32));
+        // unseal_signer_share constructs a WAL-backed signer (P0 fix); the
+        // recovered node signs below, so point the WAL at a temp path.
+        std::env::set_var(
+            "MILNET_TSS_NONCE_WAL_PATH",
+            std::env::temp_dir()
+                .join(format!("milnet-tss-wal-{}-roundtrip", std::process::id()))
+                .to_str()
+                .unwrap(),
+        );
 
         let (coordinator, nodes) = setup_dkg();
         let node = &nodes[0];
@@ -3522,6 +3764,14 @@ mod tests {
         // connects and signs.
         // Production mode is always active — no env var override needed
         std::env::set_var("MILNET_MASTER_KEK", "ef".repeat(32));
+        // unseal_signer_share now constructs the signer with a WAL (P0 fix);
+        // point the WAL at a temp dir so commit() can fsync in the test env.
+        let wal_tmp = std::env::temp_dir().join(format!(
+            "milnet-tss-wal-{}-{}",
+            std::process::id(),
+            "sealed-share-test"
+        ));
+        std::env::set_var("MILNET_TSS_NONCE_WAL_PATH", wal_tmp.to_str().unwrap());
 
         let (coordinator, nodes) = setup_dkg();
         let threshold = coordinator.threshold;
@@ -3607,8 +3857,10 @@ mod tests {
         let selected: Vec<&(Identifier, String)> =
             coord.signer_addrs.iter().take(coord.threshold).collect();
 
-        // Round 1: Collect commitments
-        let mut nonces_map: BTreeMap<Identifier, Vec<u8>> = BTreeMap::new();
+        // Fresh per-ceremony id; nonces stay on the signers (see protocol docs).
+        let ceremony_id: [u8; 32] = crypto::entropy::generate_nonce();
+
+        // Round 1: Collect commitments (public material only).
         let mut commitments_map: BTreeMap<Identifier, SigningCommitments> = BTreeMap::new();
 
         for (_id, addr) in &selected {
@@ -3624,7 +3876,7 @@ mod tests {
             .await
             .map_err(|e| format!("connect to signer at {addr}: {e}"))?;
 
-            let req = SignerMessage::CommitRequest;
+            let req = SignerMessage::CommitRequest { ceremony_id };
             let req_bytes =
                 postcard::to_allocvec(&req).map_err(|e| format!("serialize: {e}"))?;
             transport.send(&req_bytes).await.map_err(|e| format!("send: {e}"))?;
@@ -3637,15 +3889,17 @@ mod tests {
 
             match resp {
                 SignerMessage::CommitResponse {
+                    ceremony_id: resp_ceremony_id,
                     identifier_bytes,
-                    nonces_bytes,
                     commitments_bytes,
                 } => {
+                    if resp_ceremony_id != ceremony_id {
+                        return Err("ceremony id mismatch".into());
+                    }
                     let identifier = Identifier::deserialize(&identifier_bytes)
                         .map_err(|e| format!("id: {e}"))?;
                     let commitments = SigningCommitments::deserialize(&commitments_bytes)
                         .map_err(|e| format!("commitments: {e}"))?;
-                    nonces_map.insert(identifier, nonces_bytes);
                     commitments_map.insert(identifier, commitments);
                 }
                 SignerMessage::Error { message } => {
@@ -3664,11 +3918,7 @@ mod tests {
         // Round 2: Collect signature shares
         let mut signature_shares: BTreeMap<Identifier, SignatureShare> = BTreeMap::new();
 
-        for (id, addr) in &selected {
-            let nonces_bytes = nonces_map
-                .remove(id)
-                .ok_or_else(|| format!("missing nonces for {:?}", id))?;
-
+        for (_id, addr) in &selected {
             let raw_host = addr.split(':').next().unwrap_or(addr);
             let signer_host = if raw_host.parse::<std::net::IpAddr>().is_ok() { "localhost" } else { raw_host };
             let mut transport = shard::tls_transport::tls_connect(
@@ -3682,8 +3932,8 @@ mod tests {
             .map_err(|e| format!("connect for sign: {e}"))?;
 
             let req = SignerMessage::SignRequest {
+                ceremony_id,
                 signing_package_bytes: signing_package_bytes.clone(),
-                nonces_bytes,
             };
             let req_bytes =
                 postcard::to_allocvec(&req).map_err(|e| format!("serialize: {e}"))?;

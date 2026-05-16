@@ -5,6 +5,97 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-05-16
+
+Workspace-wide security hardening pass across all 22 service/protocol crates.
+
+### Security
+
+- **authsrv**: removed the anonymous-subject login path; `/authorize` now requires
+  an authenticated server-side login session. `id_token`/`access_token` are now
+  ML-DSA-87 (FIPS 204) signed JWTs and JWKS publishes real verifying-key material.
+  `/token` validates `client_id`/`redirect_uri` against the original request and
+  requires client authentication (Argon2id) for all grant types. `/userinfo`
+  performs full RFC 9449 DPoP proof-JWT verification; the access token is now
+  DPoP-bound at `/token` issuance. `/revoke` and `/introspect` require client
+  authentication; `/end_session` validates `post_logout_redirect_uri` against a
+  per-client allowlist. CSPRNG failures now propagate instead of yielding
+  predictable all-zero tokens.
+- **admin**: closed the RBAC bypass on user-token requests — every route now
+  enforces its required role; destructive operations (`delete_user`,
+  `delete_portal`, `enroll_device`, `recovery_revoke_all`, ceremony
+  initiate/approve) gained explicit role checks. `delete_user` now requires a
+  SuperAdmin role plus an approved, single-use multi-person ceremony bound to the
+  target user. `revoke_token` requires authentication and is audit-logged.
+- **orchestrator**: the idempotency cache is now keyed on a secret-bound hash
+  instead of the gateway-supplied correlation id, closing a token-replay window.
+  Receipt verification requires the ML-DSA-87 signature (no longer satisfiable by
+  HMAC alone).
+- **crypto**: unsound zero-knowledge range/audit proofs now fail closed. FROST
+  threshold signing nonces are never placed on the wire; the persisted nonce
+  counter now deterministically seeds the nonce CSPRNG. Key-transparency consensus
+  signing keys are provisioned per host instead of being co-derived from a single
+  master key; persisted signed-tree-head entries are signature- and chain-verified
+  on load. The distributed OPAQUE threshold mode fails closed pending a sound
+  threshold-OPRF construction.
+- **audit-witness**: added anti-replay/equivocation defence (fsynced append-only
+  journal), domain-separated checkpoint signatures, per-connection timeouts and
+  request-size caps, and removed panic-on-input paths.
+- **sso-protocol**: refresh-token store keys consistently by token hash so tokens
+  survive a restart; the JTI replay store no longer panics under an async runtime
+  and now fails closed on database error; PKCE verification is constant-time
+  regardless of input length.
+- **offline-jwt**: enforces `alg` binding against the key, rejects `none`, and
+  applies an RFC 8725 algorithm allowlist; added `iss`/`aud`/`nbf` validation and
+  CRL freshness checks.
+- **threat-intel**: API keys moved out of URL query strings into headers; added
+  SSRF protection (rejects private/reserved IP ranges) and outbound request
+  timeouts.
+- **siem-cef-leef**: CEF/LEEF escapers now escape newline/carriage-return in
+  headers and values and sanitize extension keys, preventing log-injection.
+- **risk**: military mode no longer falls back to a hardcoded baseline HMAC key.
+- **stig-checks**: performs real system inspection; unobserved controls report
+  "not checked" instead of fabricating a pass.
+- **fido**: persistent credential storage round-trips full security state
+  (AAGUID, clone flag, PQ attestation); authentication verification requires
+  challenge and origin binding.
+- **verifier**: token verification with ratchet state now threads the real client
+  DPoP key; ceremony binding is enforced fail-closed.
+- **common**: 2-of-3 KEK reconstruction verifies VSS share commitments; duress PIN
+  hashing upgraded to Argon2id; secret-loader authenticates its peer over the
+  socket; checkpoint-signature verification uses the correct domain-bound context.
+
+### Fixed
+
+- **fuzz**: registered eight signature-tamper / trust-bypass fuzz harnesses that
+  were present but unbuilt.
+- **dudect-harness**: constant-time tests now exercise the real production
+  functions instead of local shims.
+- **logout-bch**, **ratchet**, **gateway**: back-channel logout URI scheme
+  validation; post-restart PQ-freshness re-evaluation; assorted hardening
+  (memory locking, key zeroization, atomic connection accounting).
+- **gateway**: the local rate-limiter's count-min-sketch flood pre-filter no
+  longer permanently denies an IP after it makes `limit` lifetime requests. The
+  sketch accumulates over its seed-rotation period, which spans many rate-limit
+  windows; it is now gated on a genuine-flood threshold rather than the
+  per-window limit, so ordinary limit exhaustion and retries are governed by the
+  authoritative per-window counter (which resets correctly and refunds denied
+  requests). The sketch remains a cheap lock-free backstop for true floods.
+- **kt**: the checkpoint tamper-detection regression test now tampers signed
+  content (the Merkle root) so all quorum signatures fail, rather than flipping
+  a single signature that a threshold quorum tolerates by design.
+- Verified the entire workspace compiles on the Linux target
+  (`cargo check --workspace --all-targets`) and corrected build/test issues
+  surfaced by that verification.
+
+### Changed
+
+- Deployment contract: key-transparency consensus nodes now require an
+  independently provisioned per-node signing secret and a node-index environment
+  variable; the distributed OPAQUE service defaults to single-server mode; an
+  existing key-transparency signed-tree-head log must be re-established from a
+  trusted checkpoint when upgrading across this release.
+
 ## [0.4.0] - 2026-03-26
 
 ### Added

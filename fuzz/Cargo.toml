@@ -28,8 +28,11 @@ toml = "0.8"
 base64 = "0.22"
 risk = { path = "../risk" }
 kt = { path = "../kt" }
+saml-sp = { path = "../saml-sp" }
+kerberos-pkinit = { path = "../kerberos-pkinit" }
 url = "2"
 http = "1"
+hex = "0.4"
 
 [features]
 default = ["production"]
@@ -258,4 +261,44 @@ doc = false
 [[bin]]
 name = "fuzz_null_byte_pii"
 path = "fuzz_targets/fuzz_null_byte_pii.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_authenticated_time"
+path = "fuzz_targets/fuzz_authenticated_time.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_authz_code_exchange"
+path = "fuzz_targets/fuzz_authz_code_exchange.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_jwt_sig_tamper"
+path = "fuzz_targets/fuzz_jwt_sig_tamper.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_kerberos_asn1"
+path = "fuzz_targets/fuzz_kerberos_asn1.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_saml_response"
+path = "fuzz_targets/fuzz_saml_response.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_saml_sig_tamper"
+path = "fuzz_targets/fuzz_saml_sig_tamper.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_scim_write"
+path = "fuzz_targets/fuzz_scim_write.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_tls_downgrade"
+path = "fuzz_targets/fuzz_tls_downgrade.rs"
 doc = false

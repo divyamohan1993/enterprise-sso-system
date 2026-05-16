@@ -20,6 +20,10 @@ use zeroize::Zeroizing;
 
 const SECRET_SOCKET_PATH: &str = "/run/milnet/secrets.sock";
 const ENV_ESCAPE_HATCH: &str = "MILNET_DEV_ALLOW_ENV_SECRETS";
+/// Maximum accepted secrets-daemon response (bytes). Any sealed secret in
+/// this system is well under 64 KiB; this caps memory use if the peer (or an
+/// impostor on the socket) streams an unbounded response.
+const MAX_SOCKET_RESPONSE: usize = 64 * 1024;
 
 /// Owned secret bytes that zeroize on drop.
 pub type SecretBuffer = Zeroizing<Vec<u8>>;
@@ -72,15 +76,34 @@ fn try_load_from_socket(name: &str) -> Result<Option<SecretBuffer>, SecretLoadEr
     }
     let mut stream = UnixStream::connect(SECRET_SOCKET_PATH)
         .map_err(|e| SecretLoadError::SocketError(format!("connect: {e}")))?;
+
+    // SECURITY (audit common P1): authenticate the peer BEFORE sending the
+    // secret name or trusting any bytes back. Without SO_PEERCRED, any
+    // process that can connect the socket could request any secret by name,
+    // or an unprivileged impostor that won a race to bind the path could
+    // serve forged secrets. The peer must be root or our own uid.
+    crate::sealed_keys::verify_uds_peer_is_trusted(&stream)
+        .map_err(|e| SecretLoadError::SocketError(format!("peer authentication: {e}")))?;
+
     use std::io::Write;
     let req = format!("GET {}\n", name);
     stream
         .write_all(req.as_bytes())
         .map_err(|e| SecretLoadError::SocketError(format!("write: {e}")))?;
+
+    // Bound the response: read at most MAX_SOCKET_RESPONSE + 1 so an
+    // over-length stream is detected and rejected rather than allocating
+    // unboundedly.
     let mut buf: Vec<u8> = Vec::new();
-    stream
+    let read = (&stream)
+        .take((MAX_SOCKET_RESPONSE as u64) + 1)
         .read_to_end(&mut buf)
         .map_err(|e| SecretLoadError::SocketError(format!("read: {e}")))?;
+    if read > MAX_SOCKET_RESPONSE {
+        return Err(SecretLoadError::SocketError(format!(
+            "secrets daemon response exceeds {MAX_SOCKET_RESPONSE} bytes"
+        )));
+    }
     if buf.is_empty() {
         return Ok(None);
     }

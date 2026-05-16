@@ -296,11 +296,9 @@ dependencies = [
  "common",
  "crypto",
  "hex",
- "libc",
  "ml-dsa",
  "nix",
  "sha2",
- "tokio",
  "tracing",
  "tracing-subscriber",
  "zeroize",
@@ -316,18 +314,12 @@ dependencies = [
  "crypto",
  "getrandom 0.2.17",
  "hex",
- "hmac",
- "rand 0.8.5",
- "reqwest",
  "serde",
  "serde_json",
- "serde_urlencoded",
  "sha2",
  "sso-protocol",
- "thiserror 2.0.18",
  "tokio",
  "tower",
- "tower-http",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -1188,9 +1180,12 @@ checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 name = "dudect-harness"
 version = "0.1.0"
 dependencies = [
+ "common",
+ "crypto",
+ "opaque",
  "rand 0.8.5",
- "serde",
- "serde_json",
+ "sso-protocol",
+ "uuid",
 ]
 
 [[package]]
@@ -2701,6 +2696,7 @@ dependencies = [
  "sha2",
  "sso-protocol",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

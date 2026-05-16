@@ -9,13 +9,13 @@
 //!   2. With an empty trust anchor store, no input ever produces an
 //!      `Ok(SamlAssertion)` — even a well-formed signed assertion must be
 //!      rejected because the issuer cannot be resolved.
-//!   3. `decode_b64` rejects any input over the 1 MiB hard limit without
-//!      allocating the full decode buffer.
+//!   3. The strict DOM parser inside `consume_response` rejects oversize
+//!      input, DOCTYPE, processing instructions and entity references
+//!      without allocating an unbounded decode buffer.
 
 use libfuzzer_sys::fuzz_target;
 use saml_sp::{
-    consume_response, decode_b64, trust::StaticTrust, ReplayCache, RequestCache,
-    ValidationConfig,
+    consume_response, trust::StaticTrust, ReplayCache, RequestCache, ValidationConfig,
 };
 
 fn cfg() -> ValidationConfig {
@@ -29,12 +29,9 @@ fn cfg() -> ValidationConfig {
 }
 
 fuzz_target!(|data: &[u8]| {
-    // 1. Base64 decode path — panic-free on any bytes.
-    if let Ok(s) = std::str::from_utf8(data) {
-        let _ = decode_b64(s);
-    }
-
-    // 2. Full validation pipeline.
+    // Full validation pipeline — `consume_response` owns the strict DOM
+    // parser, so feeding it arbitrary bytes exercises the size/DOCTYPE/PI/
+    // entity hardening directly.
     let trust = StaticTrust::new();
     let requests = RequestCache::new();
     let replays = ReplayCache::new();

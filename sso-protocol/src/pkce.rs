@@ -25,7 +25,7 @@
 // ══════════════════════════════════════════════════════════════════════
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use sha2::{Digest, Sha256};
-use subtle::ConstantTimeEq;
+use subtle::{Choice, ConstantTimeEq};
 
 /// Validate that a PKCE code_verifier is 43-128 characters per RFC 7636 Section 4.1.
 pub fn validate_verifier_length(verifier: &str) -> Result<(), &'static str> {
@@ -42,6 +42,14 @@ pub fn validate_verifier_length(verifier: &str) -> Result<(), &'static str> {
 /// Verify a PKCE code_verifier against a stored code_challenge (S256 method).
 /// Uses constant-time comparison as a defense-in-depth measure.
 /// Returns false if the verifier length is outside the RFC 7636 range (43-128).
+///
+/// SECURITY: the comparison is constant-time regardless of the supplied
+/// `code_challenge` length. A naive `a.len() == b.len() && a.ct_eq(b)` leaks,
+/// via the `&&` short-circuit, whether the lengths matched before the
+/// constant-time body runs. We instead always run the constant-time compare
+/// over a fixed-width buffer and fold the length-equality `Choice` in without
+/// branching, so neither a length mismatch nor a content mismatch is
+/// distinguishable by timing.
 pub fn verify_pkce(code_verifier: &str, code_challenge: &str) -> bool {
     if validate_verifier_length(code_verifier).is_err() {
         return false;
@@ -50,7 +58,22 @@ pub fn verify_pkce(code_verifier: &str, code_challenge: &str) -> bool {
     let computed = URL_SAFE_NO_PAD.encode(hash);
     let a = computed.as_bytes();
     let b = code_challenge.as_bytes();
-    a.len() == b.len() && a.ct_eq(b).into()
+
+    // `a` is always 43 bytes (S256: base64url-no-pad of a 32-byte digest).
+    // Compare `b` against `a` over exactly `a.len()` bytes: indices past the
+    // end of `b` are read as a fixed `0`, so the loop runs an identical number
+    // of operations for every input length. The length-equality `Choice` is
+    // ANDed in afterwards so a wrong-length challenge fails without an early
+    // return revealing the mismatch through timing.
+    let mut acc = Choice::from(0u8);
+    for (i, &x) in a.iter().enumerate() {
+        let y = if i < b.len() { b[i] } else { 0u8 };
+        // `1` bit set on any differing byte; ConstantTimeEq over single bytes.
+        acc |= !x.ct_eq(&y);
+    }
+    let lengths_equal = (a.len() as u64).ct_eq(&(b.len() as u64));
+    // Match iff no byte differed AND the lengths are equal.
+    (!acc & lengths_equal).into()
 }
 
 /// Enforce that PKCE is present. Returns an error if code_challenge is None.

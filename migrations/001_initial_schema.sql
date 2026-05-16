@@ -164,9 +164,16 @@ CREATE TABLE IF NOT EXISTS authorization_codes (
     code_challenge      VARCHAR(255),
     tier                INTEGER NOT NULL,
     nonce               VARCHAR(255),
+    -- OIDC scope granted at authorization time. Required so a cold-cache
+    -- code-exchange on a different instance reconstructs the granted scope
+    -- instead of defaulting to empty.
+    scope               TEXT,
     created_at          BIGINT NOT NULL,
     consumed            BOOLEAN DEFAULT FALSE
 );
+
+-- Idempotent column add for databases created before `scope` existed.
+ALTER TABLE authorization_codes ADD COLUMN IF NOT EXISTS scope TEXT;
 
 -- =========================================================================
 -- 9. Revoked tokens — token revocation list with TTL-based cleanup
@@ -219,11 +226,28 @@ CREATE TABLE IF NOT EXISTS fido_credentials (
     public_key          BYTEA NOT NULL,
     sign_count          INTEGER NOT NULL DEFAULT 0,
     authenticator_type  VARCHAR(50) NOT NULL,
+    -- FIDO2 security state. Without these columns the persistent store
+    -- loses AAGUID, the clone-detection flag and the PQ attestation on
+    -- every restart (see common/src/db.rs migration + fido registration).
+    aaguid              BYTEA,
+    cloned_flag         BOOLEAN NOT NULL DEFAULT FALSE,
+    backup_eligible     BOOLEAN NOT NULL DEFAULT FALSE,
+    backup_state        BOOLEAN NOT NULL DEFAULT FALSE,
+    pq_attestation      BYTEA,
     created_at          BIGINT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_fido_credentials_user_id
     ON fido_credentials (user_id);
+
+-- Idempotent column adds for databases created before the FIDO2
+-- security-state columns existed. Mirror of the migration in
+-- common/src/db.rs so a fresh install and a programmatic migration agree.
+ALTER TABLE fido_credentials ADD COLUMN IF NOT EXISTS aaguid BYTEA;
+ALTER TABLE fido_credentials ADD COLUMN IF NOT EXISTS cloned_flag BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE fido_credentials ADD COLUMN IF NOT EXISTS backup_eligible BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE fido_credentials ADD COLUMN IF NOT EXISTS backup_state BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE fido_credentials ADD COLUMN IF NOT EXISTS pq_attestation BYTEA;
 
 -- =========================================================================
 -- 13. Key material — encrypted key storage (envelope encryption)

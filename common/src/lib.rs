@@ -6,6 +6,24 @@
 //! Provides core domain types including Token, Receipt, DeviceTier,
 //! ActionLevel, and other foundational structures used across all crates.
 
+// SECURITY (audit common #14): the `test-support` feature unlocks
+// counterfeit constructors — `Token::test_fixture_unsigned`,
+// `Receipt::test_fixture_unsigned`, `BootAttestation::dev_mode` — and the
+// early-return in `enforce_distributed_fencing_in_production` that disables
+// the SIEM-CRITICAL split-brain guard.
+//
+// The real protection is the strict `#[cfg(any(test, feature =
+// "test-support"))]` gating on each of those items: with the Cargo v2
+// resolver, a `test-support` declared only in `[dev-dependencies]` is NOT
+// unified into `cargo build --release` of production binaries, so the gated
+// code is absent from a production build. A `compile_error!` guard keyed on
+// `cfg(all(production, test-support))` was tried here but removed: under
+// `cargo test --workspace` / `--all-targets` the resolver legitimately
+// unifies the dev-dependency `test-support` onto the shared `common` build
+// alongside the always-on `production` default, so the guard fired and
+// broke the entire test suite + CI without adding protection the cfg-gating
+// does not already provide.
+
 pub mod actions;
 pub mod config;
 pub mod db;

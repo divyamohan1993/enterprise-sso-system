@@ -29,10 +29,15 @@ fn pseudonym_key() -> &'static [u8; 32] {
         let kek = crate::sealed_keys::cached_master_kek();
         let hk = hkdf::Hkdf::<Sha512>::new(Some(LOG_PSEUDONYM_DOMAIN), kek);
         let mut okm = [0u8; 32];
+        // SECURITY: HKDF-SHA512 expand for 32 bytes is mathematically
+        // infallible (one SHA-512 block is 64 bytes >= 32). The previous
+        // fallback copied the master KEK into `okm` on error — that would
+        // cache the master KEK itself as the pseudonym HMAC key, letting an
+        // attacker who can gather (plaintext, pseudonym) pairs probe the
+        // master KEK directly. Make the invariant explicit and crash loud if
+        // the dependency ever changes, rather than silently downgrading.
         hk.expand(b"log-pseudonym-hmac-key", &mut okm)
-            .unwrap_or_else(|_| {
-                okm.copy_from_slice(kek);
-            });
+            .expect("HKDF-SHA512 expand for 32 bytes is infallible");
         okm
     })
 }

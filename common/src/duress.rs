@@ -24,6 +24,21 @@ const SHA256_V1_TAG: u8 = 0x01;
 /// Version tag for upgraded legacy path using SHA-512 (CNSA 2.0 compliant).
 const SHA512_V1B_TAG: u8 = 0x03;
 
+/// Version tag for the current format: Argon2id (memory-hard).
+///
+/// SECURITY (audit common P1): a duress PIN is typically 4-6 digits
+/// (10^4–10^6 search space). SHA-256/SHA-512/HKDF-SHA512 are all fast,
+/// non-memory-hard primitives, so a leaked PIN hash in any of the v1/v1b/v2
+/// formats is brute-forceable in seconds. v3 stretches the PIN through
+/// Argon2id (64 MiB memory cost), the same KDF `recovery.rs` uses, making an
+/// offline attack on a leaked hash dramatically more expensive.
+const ARGON2_V3_TAG: u8 = 0x04;
+
+/// Argon2id cost parameters for duress-PIN hashing. Matches `recovery.rs`.
+const DURESS_ARGON2_M_COST_KIB: u32 = 64 * 1024; // 64 MiB
+const DURESS_ARGON2_T_COST: u32 = 3;
+const DURESS_ARGON2_P_COST: u32 = 4;
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DuressConfig {
@@ -89,6 +104,47 @@ fn hash_pin_v2(pin: &[u8], salt: &[u8; 32]) -> Vec<u8> {
     result
 }
 
+/// Hash a PIN using Argon2id (v3 format — current). Returns
+/// `version_tag(1) || argon2id_output(32)`.
+///
+/// Argon2id is memory-hard, which is what makes a leaked low-entropy
+/// duress-PIN hash expensive to brute-force offline.
+fn hash_pin_v3(pin: &[u8], salt: &[u8; 32]) -> Vec<u8> {
+    use argon2::{Algorithm, Argon2, Params, Version};
+
+    let params = Params::new(
+        DURESS_ARGON2_M_COST_KIB,
+        DURESS_ARGON2_T_COST,
+        DURESS_ARGON2_P_COST,
+        Some(32),
+    )
+    .unwrap_or_else(|e| {
+        tracing::error!("FATAL: Argon2id params invalid for duress PIN: {e}");
+        std::process::exit(1);
+    });
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+
+    let mut okm = [0u8; 32];
+    argon2
+        .hash_password_into(pin, salt, &mut okm)
+        .unwrap_or_else(|e| {
+            tracing::error!("FATAL: Argon2id hashing failed for duress PIN: {e}");
+            std::process::exit(1);
+        });
+
+    let mut result = Vec::with_capacity(1 + 32);
+    result.push(ARGON2_V3_TAG);
+    result.extend_from_slice(&okm);
+    result
+}
+
+/// Whether the process is running in production / military mode, where the
+/// untagged legacy SHA-256 duress-PIN format must be refused.
+fn is_production_mode() -> bool {
+    std::env::var("MILNET_PRODUCTION").is_ok()
+        || std::env::var("MILNET_MILITARY_DEPLOYMENT").is_ok()
+}
+
 /// Hash a PIN using SHA-512 with domain separation (v1b format, CNSA 2.0 compliant).
 /// Returns version_tag(1) || sha512_hash(64).
 fn hash_pin_v1b(pin: &[u8]) -> Vec<u8> {
@@ -131,6 +187,10 @@ fn verify_pin_hash(pin: &[u8], stored: &[u8], salt: &[u8; 32]) -> bool {
     };
 
     match tag {
+        ARGON2_V3_TAG => {
+            let candidate = hash_pin_v3(pin, salt);
+            candidate.ct_eq(stored).into()
+        }
         HKDF_V2_TAG => {
             let candidate = hash_pin_v2(pin, salt);
             candidate.ct_eq(stored).into()
@@ -158,7 +218,21 @@ fn verify_pin_hash(pin: &[u8], stored: &[u8], salt: &[u8; 32]) -> bool {
                 hash.ct_eq(stored).into()
             } else if stored.len() == 32 {
                 // Very old legacy format (SHA-256, 32 bytes, no tag).
-                // Retained for migration path only. Not CNSA 2.0 compliant.
+                //
+                // SECURITY (audit common P1): this untagged path is a
+                // downgrade vector — an attacker who can write to
+                // `duress_pin_hash` storage could drop a 32-byte SHA-256 blob
+                // and have it silently accepted, AND SHA-256 is trivially
+                // brute-forceable for a 4-6 digit PIN. Refuse it in
+                // production / military mode; accept only outside production
+                // for legacy migration tooling.
+                if is_production_mode() {
+                    tracing::error!(
+                        target: "siem",
+                        "SIEM:CRITICAL untagged legacy SHA-256 duress PIN hash rejected in production"
+                    );
+                    return false;
+                }
                 use sha2::{Digest, Sha256};
                 let mut hasher = Sha256::new();
                 hasher.update(b"MILNET-SSO-v1-DURESS-PIN");
@@ -173,7 +247,11 @@ fn verify_pin_hash(pin: &[u8], stored: &[u8], salt: &[u8; 32]) -> bool {
 }
 
 impl DuressConfig {
-    /// Create a new DuressConfig using HKDF-SHA512 (v2) PIN hashing.
+    /// Create a new DuressConfig using Argon2id (v3) PIN hashing.
+    ///
+    /// Argon2id is memory-hard, which is required because duress PINs are
+    /// low-entropy (4-6 digits) and a leaked non-memory-hard hash is
+    /// brute-forceable in seconds.
     ///
     /// # Errors
     ///
@@ -187,8 +265,8 @@ impl DuressConfig {
             std::process::exit(1);
         });
 
-        let normal_pin_hash = hash_pin_v2(normal_pin, &salt);
-        let duress_pin_hash = hash_pin_v2(duress_pin, &salt);
+        let normal_pin_hash = hash_pin_v3(normal_pin, &salt);
+        let duress_pin_hash = hash_pin_v3(duress_pin, &salt);
 
         // Constant-time comparison to verify PINs produce different hashes.
         use subtle::ConstantTimeEq;

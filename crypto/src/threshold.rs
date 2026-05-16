@@ -80,20 +80,17 @@ impl Drop for SignerShare {
         // Zero the nonce counter (atomic, no drop concerns).
         self.nonce_counter.store(0, std::sync::atomic::Ordering::Relaxed);
 
-        // Defense-in-depth: zero the KeyPackage struct memory directly.
-        // We use ManuallyDrop to prevent double-drop of the KeyPackage, then
-        // overwrite its memory with zeros via ptr::write_bytes. This covers
-        // any in-memory representation that serialization may miss.
-        #[allow(unsafe_code)]
-        unsafe {
-            let kp_ptr = &mut self.key_package as *mut KeyPackage;
-            let kp_size = std::mem::size_of::<KeyPackage>();
-            // Replace with a default-initialized value to avoid dropping garbage.
-            // We read the old value into ManuallyDrop (preventing its Drop),
-            // then zero the memory.
-            let _old = std::mem::ManuallyDrop::new(std::ptr::read(kp_ptr));
-            std::ptr::write_bytes(kp_ptr as *mut u8, 0, kp_size);
-        }
+        // SECURITY (audit P1): the previous `unsafe` "defense-in-depth" block
+        // was actively harmful and has been removed. It did
+        // `ManuallyDrop::new(ptr::read(kp_ptr))` then `write_bytes(.., 0, ..)`,
+        // which (a) zeroed only the on-struct bytes — not the heap buffers the
+        // FROST scalars actually live in — and (b) suppressed `KeyPackage`'s
+        // own `Drop`, LEAKING those heap allocations un-zeroized. That is both
+        // a memory leak and strictly weaker than letting `KeyPackage` drop
+        // normally. `self.key_package` is now dropped here by the compiler in
+        // the ordinary way; the `frost` `KeyPackage` zeroizes its secret
+        // signing share on drop. Combined with the best-effort serialized
+        // wipe above, that is the correct, leak-free behaviour.
     }
 }
 

@@ -66,7 +66,7 @@ fn future_claims() -> TokenClaims {
         exp: now + 30_000_000, // +30 seconds
         scope: 0x0000_000F,
         dpop_hash: crypto::dpop::dpop_key_hash(&TEST_DPOP_KEY),
-        ceremony_id: [0xCC; 32],
+        ceremony_id: [0u8; 32],
         tier: 2,
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
@@ -90,7 +90,7 @@ fn expired_token_rejected() {
         exp: now - 1_000_000, // expired 1 second ago
         scope: 0x0000_000F,
         dpop_hash: crypto::dpop::dpop_key_hash(&TEST_DPOP_KEY),
-        ceremony_id: [0xCC; 32],
+        ceremony_id: [0u8; 32],
         tier: 2,
         ratchet_epoch: 1,
         token_id: [0xAB; 16],
@@ -207,7 +207,7 @@ fn future_iat_rejected() {
         exp: now + 7_200_000_000,
         scope: 0x0000_000F,
         dpop_hash: crypto::dpop::dpop_key_hash(&TEST_DPOP_KEY),
-        ceremony_id: [0xCC; 32],
+        ceremony_id: [0u8; 32],
         tier: 2,
         ratchet_epoch: 1,
         token_id: [0xAB; 16],

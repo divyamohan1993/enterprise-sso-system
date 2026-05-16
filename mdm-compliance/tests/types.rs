@@ -1,7 +1,7 @@
 use mdm_compliance::*;
 
 #[tokio::test]
-async fn intune_empty_until_wired() {
+async fn intune_not_wired_fails_loud() {
     let a = IntuneAdapter {
         tenant_id: "t".into(),
         client_id: "c".into(),
@@ -9,7 +9,15 @@ async fn intune_empty_until_wired() {
         http: reqwest::Client::new(),
     };
     assert_eq!(a.name(), "intune");
-    assert!(a.fetch().await.unwrap().is_empty());
+    // The Intune adapter is not yet wired to Microsoft Graph. Until it is,
+    // `fetch()` MUST fail loud with `NotImplemented` rather than return an
+    // empty device set: a compliance gate would read an empty set as a false
+    // "all devices compliant" all-clear. Fail-closed, never fail-open.
+    let err = a
+        .fetch()
+        .await
+        .expect_err("unwired intune adapter must fail loud, not return empty");
+    assert!(matches!(err, MdmError::NotImplemented { adapter: "intune" }));
 }
 
 #[test]

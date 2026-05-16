@@ -1582,6 +1582,14 @@ pub fn unseal_kek_2of3() -> Result<KekUnsealResult, String> {
 
 /// Reconstruct the 32-byte KEK from 2-of-3 shares using the existing
 /// Shamir implementation in `threshold_kek`.
+///
+/// SECURITY (audit common P1): every share is verified against the
+/// `StandaloneVssCommitments` (loaded from `MILNET_VSS_COMMITMENTS`, the
+/// same source the threshold-KDF path uses) BEFORE reconstruction. Without
+/// this, a single malicious or corrupted PKCS#11 slot / UDS helper could
+/// hand back a bad share and silently poison the reconstructed KEK —
+/// `reconstruct_secret` performs no commitment check of its own. A share
+/// that fails verification aborts reconstruction (fail closed).
 fn reconstruct_2of3(shares: Vec<crate::threshold_kek::KekShare>) -> Result<[u8; 32], String> {
     if shares.len() < C2_THRESHOLD as usize {
         return Err(format!(
@@ -1590,7 +1598,16 @@ fn reconstruct_2of3(shares: Vec<crate::threshold_kek::KekShare>) -> Result<[u8; 
             shares.len()
         ));
     }
-    crate::threshold_kek::reconstruct_secret(&shares[..C2_THRESHOLD as usize])
+    let chosen = &shares[..C2_THRESHOLD as usize];
+    for share in chosen {
+        if !verify_share_commitment(share) {
+            return Err(
+                "C2 2-of-3: a KEK share failed VSS commitment verification — \
+                 refusing to reconstruct a potentially poisoned KEK".to_string(),
+            );
+        }
+    }
+    crate::threshold_kek::reconstruct_secret(chosen)
 }
 
 // --- PKCS#11 backend (feature = "cac") ----------------------------------
@@ -1874,6 +1891,24 @@ fn verify_peer_credentials(
         ));
     }
     Ok(())
+}
+
+/// Verify that the peer of a connected Unix socket is a trusted local
+/// identity: either `root` (uid 0) or the same effective uid as this
+/// process. Used by the secret loader to authenticate the secrets daemon
+/// it connects to, so an unprivileged process that managed to bind a
+/// look-alike socket cannot serve forged secrets.
+pub(crate) fn verify_uds_peer_is_trusted(
+    stream: &std::os::unix::net::UnixStream,
+) -> Result<(), String> {
+    // SAFETY: geteuid() is a pure syscall taking no arguments and returning
+    // the caller's effective uid; it cannot violate memory safety.
+    let our_euid = unsafe { libc::geteuid() };
+    if verify_peer_credentials(stream, 0).is_ok() {
+        return Ok(());
+    }
+    verify_peer_credentials(stream, our_euid)
+        .map_err(|e| format!("secrets socket peer is neither root nor our own uid: {e}"))
 }
 
 #[cfg(test)]

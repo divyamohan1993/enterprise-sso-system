@@ -252,25 +252,6 @@ async fn main() {
             std::process::exit(1);
         });
 
-        // SECURITY: mlock the TLS private key material into RAM and exclude
-        // from core dumps. This prevents the key from being swapped to disk
-        // or captured in a core dump by a nation-state attacker.
-        unsafe {
-            let key_ptr = key_pem.as_ptr() as *const libc::c_void;
-            let key_len = key_pem.len();
-            if libc::mlock(key_ptr, key_len) != 0 {
-                tracing::error!(
-                    "CRITICAL: mlock failed for TLS private key ({key_len} bytes). \
-                     Key material may be swappable to disk."
-                );
-            }
-            libc::madvise(key_ptr as *mut libc::c_void, key_len, libc::MADV_DONTDUMP);
-        }
-
-        // SECURITY: Zeroize the raw PEM bytes after parsing into rustls types.
-        // The key material is now held only by rustls's PrivateKeyDer.
-        let mut key_pem = key_pem;
-
         // SECURITY: rustls-pemfile is UNMAINTAINED (RUSTSEC-2025-0134).
         // PEM parsing inlined here to eliminate the dependency entirely.
         let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
@@ -281,6 +262,7 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
+        let mut key_pem = key_pem;
         let key: rustls::pki_types::PrivateKeyDer<'static> =
             match parse_pem_private_key(&key_pem) {
                 Ok(k) => k,
@@ -290,8 +272,40 @@ async fn main() {
                 }
             };
 
-        // SECURITY: Zeroize raw PEM key bytes now that they've been parsed into rustls format.
-        // Prevents key material from lingering in process memory.
+        // SECURITY: mlock the *decoded DER* private-key material. Previously
+        // the raw PEM byte buffer was mlocked while the decoded DER (a
+        // separate Vec inside PrivateKeyDer) was left freely swappable and
+        // core-dumpable. `secret_der()` returns a slice over that live DER
+        // buffer; we pin it for as long as `PrivateKeyDer` is alive (until it
+        // is consumed by `with_single_cert` below).
+        //
+        // KNOWN LIMITATION: `with_single_cert` parses this DER into an
+        // aws-lc-rs signing-key object, which may copy the key material into
+        // its own allocation that we cannot reach to mlock. Fully sealing the
+        // long-lived signer copy requires `crypto::memguard`; this fix closes
+        // the larger, longer-lived exposure (the unmlocked DER Vec) and is a
+        // strict improvement over mlocking the even-more-transient PEM bytes.
+        unsafe {
+            let der = key.secret_der();
+            let der_ptr = der.as_ptr() as *const libc::c_void;
+            let der_len = der.len();
+            if der_len > 0 {
+                if libc::mlock(der_ptr, der_len) != 0 {
+                    tracing::error!(
+                        "CRITICAL: mlock failed for decoded TLS private key \
+                         ({der_len} bytes). Key material may be swappable to disk."
+                    );
+                }
+                libc::madvise(
+                    der_ptr as *mut libc::c_void,
+                    der_len,
+                    libc::MADV_DONTDUMP,
+                );
+            }
+        }
+
+        // SECURITY: Zeroize raw PEM key bytes now that they've been parsed into
+        // rustls format. Prevents the PEM-encoded copy from lingering in memory.
         {
             use zeroize::Zeroize;
             key_pem.zeroize();
