@@ -269,8 +269,15 @@ MILNET_KEY_DIR=/etc/milnet/keys
 MILNET_TLS_CERT=$tls/node.crt
 MILNET_TLS_KEY=$tls/node.key
 MILNET_CA_CERT=$tls/ca.crt
+MILNET_SHARD_CA_INITIAL_BOOTSTRAP=1
 RUST_LOG=info,milnet=info
 "@
+    # MILNET_SHARD_CA_INITIAL_BOOTSTRAP=1 lets the SHARD mTLS transport create
+    # its distributed CA on the first-ever deployment (shard/src/tls_ca.rs).
+    # Without it, services refuse to start when no CA exists on disk yet -
+    # the deliberate interlock against silently regenerating the trust anchor.
+    # On later runs the CA is loaded from /var/lib/milnet/shard-ca.pem; the
+    # flag then only permits (re)bootstrap for a freshly added node.
 
     $files = @{}
     $thisIp = $NodeRole.Ip
