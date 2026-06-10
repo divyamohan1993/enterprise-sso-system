@@ -140,7 +140,46 @@ async fn main() {
             "threshold" => run_threshold_mode().await,
             "single" => {
                 tracing::warn!("Running in SINGLE-SERVER mode (dev/test only — NOT for production)");
-                let store = CredentialStore::new();
+                // SECURITY (audit F4/F7): load (or first-boot generate) the
+                // OPAQUE ServerSetup SEALED under the master KEK and persisted
+                // to disk, so the OPRF seed is never a long-lived plaintext
+                // field (F4) and survives restarts without locking out users
+                // (F7). FAIL-CLOSED: a present-but-unopenable sealed blob, or a
+                // store that cannot unseal it, aborts startup — we never
+                // silently regenerate the seed.
+                let setup_path = opaque::opaque_impl::server_setup_path();
+                let handle = match opaque::opaque_impl::ServerSetupHandle::load_or_generate(
+                    &setup_path,
+                ) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        tracing::error!(
+                            target: "siem",
+                            category = "security",
+                            severity = "CRITICAL",
+                            action = "opaque_sealed_setup_load_failed",
+                            "FATAL: could not load/seal the OPAQUE ServerSetup at {:?}: {e}. \
+                             Refusing to start (fail-closed) — regenerating the OPRF seed \
+                             would invalidate every stored credential.",
+                            setup_path,
+                        );
+                        std::process::exit(1);
+                    }
+                };
+                let store = match CredentialStore::with_sealed_setup(handle) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!(
+                            target: "siem",
+                            category = "security",
+                            severity = "CRITICAL",
+                            action = "opaque_sealed_store_init_failed",
+                            "FATAL: could not initialise the sealed CredentialStore: {e}. \
+                             Refusing to start (fail-closed)."
+                        );
+                        std::process::exit(1);
+                    }
+                };
                 opaque::service::run(store).await
             }
             other => {

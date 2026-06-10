@@ -83,6 +83,10 @@ use crypto::xwing::{
     XWingKeyPair, xwing_encapsulate_tagged, xwing_decapsulate_tagged,
     KemAlgorithm,
 };
+// Tests that mutate the process-global `MILNET_PQ_KEM_ONLY` env var must not run
+// concurrently with each other (or with any test that reads the default KEM mode),
+// since std::env is shared across the parallel test threads in this binary.
+use serial_test::serial;
 
 #[test]
 fn xwing_encapsulate_decapsulate_roundtrip() {
@@ -138,6 +142,7 @@ fn xwing_tampered_ciphertext_fails() {
 }
 
 #[test]
+#[serial]
 fn xwing_mlkem_only_mode_works() {
     // Use the tagged API which supports ML-KEM-1024-only mode
     // Set the environment variable to activate ML-KEM-only mode
@@ -400,6 +405,7 @@ fn signature_algorithm_tag_dispatch() {
 }
 
 #[test]
+#[serial]
 fn kem_algorithm_tag_dispatch() {
     // Verify that KemAlgorithm tags correctly round-trip and dispatch
     let cases = [

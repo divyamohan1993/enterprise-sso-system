@@ -29,6 +29,12 @@ const RAFT_HMAC_INFO: &[u8] = b"MILNET-RAFT-HMAC-v1";
 /// Length of HMAC-SHA512 tag appended to each Raft message.
 const HMAC_TAG_LEN: usize = 64;
 
+/// Domain separator prefixed to every Raft control-plane message before the
+/// per-node ML-DSA-87 signature is computed. Prevents a signature produced for
+/// some other purpose (entry signing, attestation, snapshot) from ever being
+/// replayed as a transport-message signature.
+const RAFT_TRANSPORT_SIG_DOMAIN: &[u8] = b"MILNET-RAFT-TRANSPORT-ML-DSA-87-v1";
+
 use super::raft::{
     ClusterCommand, LogEntry, LogIndex, NodeId, RaftConfig, RaftMessage, RaftRole, RaftState,
 };
@@ -507,18 +513,46 @@ fn reject_standalone_in_production(peers: &[PeerConfig]) -> Result<(), String> {
     Ok(())
 }
 
+/// Fixed namespace for deriving a stable [`NodeId`] from a non-UUID
+/// `MILNET_NODE_ID` string (UUIDv5). This namespace is itself a constant UUID so
+/// the mapping is deterministic and identical in every process — the Raft
+/// transport, the distributed-startup attestation, and the revocation layer all
+/// derive the SAME NodeId from the same `MILNET_NODE_ID`, so a peer pins the
+/// right per-node verifying key. (Bytes are the ASCII "MILNET-NODEID\0\0\0" —
+/// any fixed 16 bytes work; they only need to be constant.)
+const MILNET_NODE_ID_NAMESPACE: uuid::Uuid = uuid::Uuid::from_bytes([
+    b'M', b'I', b'L', b'N', b'E', b'T', b'-', b'N', b'O', b'D', b'E', b'I', b'D', 0, 0, 0,
+]);
+
+/// Canonicalize a `MILNET_NODE_ID` string into the cluster [`NodeId`].
+///
+/// Resolution order:
+/// 1. A UUID string → that UUID.
+/// 2. A 128-bit hex value (optionally `0x`-prefixed) → `Uuid::from_u128`.
+/// 3. Any other string (e.g. a deploy id like `orchestrator-0`) →
+///    `Uuid::new_v5(MILNET_NODE_ID_NAMESPACE, bytes)` — a STABLE, unique UUID for
+///    that string (matches the `UUIDv5(pod-name)` scheme in the k8s design).
+///
+/// This is THE single node-id canonicalization used cluster-wide so the Raft
+/// transport, attestation, and revocation all agree on a node's [`NodeId`].
+pub fn canonical_node_id(s: &str) -> NodeId {
+    if let Ok(uuid) = uuid::Uuid::parse_str(s) {
+        return NodeId(uuid);
+    }
+    if let Ok(n) = u128::from_str_radix(s.trim_start_matches("0x"), 16) {
+        return NodeId(uuid::Uuid::from_u128(n));
+    }
+    NodeId(uuid::Uuid::new_v5(&MILNET_NODE_ID_NAMESPACE, s.as_bytes()))
+}
+
 /// Parse node ID from MILNET_NODE_ID env var, or generate a random one.
+///
+/// Non-UUID values (e.g. `orchestrator-0`) are canonicalized deterministically
+/// via [`canonical_node_id`] (UUIDv5) rather than rejected, so existing deploy
+/// configs keep a stable identity AND the attestation/transport agree.
 fn parse_node_id_from_env() -> Result<NodeId, String> {
     match std::env::var("MILNET_NODE_ID") {
-        Ok(val) => {
-            if let Ok(uuid) = uuid::Uuid::parse_str(&val) {
-                Ok(NodeId(uuid))
-            } else {
-                let n = u128::from_str_radix(val.trim_start_matches("0x"), 16)
-                    .map_err(|e| format!("invalid MILNET_NODE_ID: {e}"))?;
-                Ok(NodeId(uuid::Uuid::from_u128(n)))
-            }
-        }
+        Ok(val) => Ok(canonical_node_id(&val)),
         Err(_) => Ok(NodeId(uuid::Uuid::new_v4())),
     }
 }
@@ -768,6 +802,192 @@ fn raft_encrypt_enabled() -> bool {
     })
 }
 
+// ── Per-node ML-DSA-87 Raft message authentication ──
+//
+// SECURITY (closes the CRITICAL consensus-BFT finding):
+// The legacy transport authenticated every Raft message with a CLUSTER-WIDE
+// SHARED HMAC key (HKDF of the master KEK with a fixed salt/info). Because the
+// key is identical on every node, ONE compromised node could forge a
+// RequestVote / AppendEntries / vote-response attributed to ANY NodeId,
+// manufacture a quorum, and install itself leader. The HMAC binds a message to
+// *the cluster*, not to *a node*.
+//
+// Here every control-plane message additionally carries a per-node ML-DSA-87
+// signature over (domain || sender_id || serialized RaftMessage), verified
+// against the sender's verifying key PINNED at cluster join. A compromised node
+// can therefore only forge AS ITSELF — it cannot sign as another NodeId. The
+// HMAC is retained ONLY as a cheap first factor (it rejects random/garbage
+// frames before the expensive lattice verify); security now rests on the
+// asymmetric per-node signature.
+//
+// PERFORMANCE TRADEOFF: ML-DSA-87 sign+verify per message is dramatically
+// heavier than HMAC-SHA512 (lattice arithmetic; ~4.6 KB signatures added to
+// every heartbeat). At the default 500ms heartbeat across a small cluster this
+// is acceptable; for very large clusters the heartbeat interval should be tuned.
+// This cost is the audit-mandated price of per-node authenticity: security > perf.
+//
+// RESIDUAL (documented, not closed here): the per-node ML-DSA seed is derived
+// from the shared master KEK + NodeId (see distributed_startup::NodeIdentity).
+// A root attacker who exfiltrates the cached KEK could re-derive any node's seed
+// and forge as it. Eliminating that requires an INDEPENDENT per-node signing key
+// (e.g. generated once and sealed to each node's TPM, only the verifying key
+// shared). The pinned registry below is `NodeId -> VK bytes`, agnostic to how
+// the VK was produced, so such keys drop in with no API change. This matches the
+// codebase's documented anti-clone-not-anti-root boundary.
+
+use crate::distributed_startup::{verify_node_sig, NodeIdentity, NodeIdentityRegistry};
+
+/// A Raft control-plane message bound to its sender by a per-node ML-DSA-87
+/// signature. Serialized with postcard and carried inside the HMAC frame.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NodeAuthenticatedRaftMessage {
+    /// The node that produced this message (the *claimed* sender).
+    sender_id: NodeId,
+    /// The Raft protocol message.
+    message: RaftMessage,
+    /// ML-DSA-87 signature over
+    /// (RAFT_TRANSPORT_SIG_DOMAIN || sender_id_bytes || postcard(message))
+    /// by the sender's per-node identity key.
+    ml_dsa_sig: Vec<u8>,
+}
+
+/// Build the exact byte string that is signed/verified for a transport message:
+/// domain || sender_id(16) || postcard(message).
+fn transport_signed_bytes(sender_id: NodeId, msg_bytes: &[u8]) -> Vec<u8> {
+    let mut signed = Vec::with_capacity(
+        RAFT_TRANSPORT_SIG_DOMAIN.len() + 16 + msg_bytes.len(),
+    );
+    signed.extend_from_slice(RAFT_TRANSPORT_SIG_DOMAIN);
+    signed.extend_from_slice(sender_id.0.as_bytes());
+    signed.extend_from_slice(msg_bytes);
+    signed
+}
+
+/// Serialize and per-node-sign a Raft message, producing the wire bytes of a
+/// [`NodeAuthenticatedRaftMessage`].
+fn sign_transport_message(
+    identity: &NodeIdentity,
+    sender_id: NodeId,
+    message: &RaftMessage,
+) -> Result<Vec<u8>, String> {
+    let msg_bytes = postcard::to_allocvec(message)
+        .map_err(|e| format!("failed to serialize raft message for signing: {e}"))?;
+    let signed = transport_signed_bytes(sender_id, &msg_bytes);
+    let ml_dsa_sig = identity.node_sign(&signed);
+    let envelope = NodeAuthenticatedRaftMessage {
+        sender_id,
+        message: message.clone(),
+        ml_dsa_sig,
+    };
+    postcard::to_allocvec(&envelope)
+        .map_err(|e| format!("failed to serialize authenticated raft envelope: {e}"))
+}
+
+/// Deserialize and verify a per-node-signed Raft message.
+///
+/// FAIL-CLOSED: returns `Err` if the envelope can't be parsed, the sender is not
+/// in the pinned verifying-key registry, or the ML-DSA-87 signature does not
+/// verify. On success returns the inner `(sender_id, message)`.
+fn verify_transport_message(
+    data: &[u8],
+    registry: &NodeIdentityRegistry,
+) -> Result<(NodeId, RaftMessage), String> {
+    let envelope: NodeAuthenticatedRaftMessage = postcard::from_bytes(data)
+        .map_err(|e| format!("failed to deserialize authenticated raft envelope: {e}"))?;
+
+    // Look up the sender's PINNED verifying key. Unknown sender => reject.
+    let vk = registry.verifying_key(&envelope.sender_id).ok_or_else(|| {
+        let event = crate::siem::SecurityEvent {
+            timestamp: crate::siem::SecurityEvent::now_iso8601(),
+            category: "cluster",
+            action: "raft_unpinned_sender_rejected",
+            severity: crate::siem::Severity::Critical,
+            outcome: "failure",
+            user_id: None,
+            source_ip: None,
+            detail: Some(format!(
+                "rejected Raft message from unpinned/unknown sender {} — \
+                 no verifying key pinned at cluster join",
+                envelope.sender_id
+            )),
+        };
+        event.emit();
+        format!(
+            "unpinned Raft sender {} — rejecting (fail-closed)",
+            envelope.sender_id
+        )
+    })?;
+
+    let msg_bytes = postcard::to_allocvec(&envelope.message)
+        .map_err(|e| format!("failed to re-serialize raft message for verify: {e}"))?;
+    let signed = transport_signed_bytes(envelope.sender_id, &msg_bytes);
+
+    if !verify_node_sig(vk, &signed, &envelope.ml_dsa_sig) {
+        let event = crate::siem::SecurityEvent {
+            timestamp: crate::siem::SecurityEvent::now_iso8601(),
+            category: "cluster",
+            action: "raft_ml_dsa_verification_failed",
+            severity: crate::siem::Severity::Critical,
+            outcome: "failure",
+            user_id: None,
+            source_ip: None,
+            detail: Some(format!(
+                "rejected Raft message: ML-DSA-87 signature invalid for claimed \
+                 sender {} — possible Byzantine forgery (a node signing as another)",
+                envelope.sender_id
+            )),
+        };
+        event.emit();
+        return Err(format!(
+            "ML-DSA-87 transport signature verification failed for sender {} \
+             — rejecting forged Raft message",
+            envelope.sender_id
+        ));
+    }
+
+    Ok((envelope.sender_id, envelope.message))
+}
+
+/// Build the initial pinned [`NodeIdentityRegistry`] for the transport.
+///
+/// SELF is always pinned from this node's own identity VK (`self_vk`).
+///
+/// PEER pinning depends on the deployment:
+/// * MILITARY mode: peers are NOT pinned here. Each node's signing seed is
+///   sealed to its OWN TPM (anti-root), so a peer's verifying key is NOT locally
+///   derivable — it MUST be distributed (published by the peer) and pinned at
+///   cluster join via [`ClusterNode::pin_peer_verifying_key`]. Deriving peer VKs
+///   locally is precisely the shared-single-point anti-pattern this audit
+///   closes, so it is refused here.
+/// * NON-MILITARY (dev/test): there is no TPM and every node's identity is the
+///   KEK-bound derivation, so peer VKs ARE locally derivable and we pin them for
+///   convenience (keeps dev clusters working without a VK-exchange step).
+///
+/// This is the SAME registry type the session/revocation layer pins, so the
+/// cluster shares ONE per-node identity registry keyed on [`NodeId`].
+fn build_peer_verifying_keys(
+    config: &ClusterConfig,
+    self_vk: Vec<u8>,
+    military: bool,
+) -> NodeIdentityRegistry {
+    let mut registry = NodeIdentityRegistry::new();
+    // Pin self from the already-built identity VK.
+    registry.pin(config.node_id, self_vk);
+
+    if !military {
+        // DEV ONLY: KEK-derived identities are locally derivable, so pin peers.
+        for peer in &config.peers {
+            registry.pin(
+                peer.node_id,
+                NodeIdentity::for_node(peer.node_id.0).verifying_key(),
+            );
+        }
+    }
+    // MILITARY: peers are pinned at join from PUBLISHED VKs (see doc above).
+    registry
+}
+
 // ── ClusterNode ──
 
 /// The main async coordination handle.
@@ -783,6 +1003,10 @@ pub struct ClusterNode {
     config: Arc<ClusterConfig>,
     shutdown_tx: watch::Sender<bool>,
     leader_tx: Arc<watch::Sender<Option<NodeId>>>,
+    /// Pinned per-node verifying-key registry used by the Raft transport.
+    /// `None` when per-node auth is disabled (non-military, no KEK). The cluster
+    /// join flow pins PUBLISHED peer VKs here via [`Self::pin_peer_verifying_key`].
+    peer_vks: Option<Arc<RwLock<NodeIdentityRegistry>>>,
 }
 
 impl ClusterNode {
@@ -835,13 +1059,60 @@ impl ClusterNode {
         let (leader_tx, _leader_rx) = watch::channel::<Option<NodeId>>(None);
         let leader_tx = Arc::new(leader_tx);
 
-        // Derive HMAC key for Raft transport authentication.
+        // Derive HMAC key for Raft transport authentication (cheap first factor).
         let hmac_key: Option<Arc<[u8; 64]>> = derive_raft_hmac_key().map(Arc::new);
         if hmac_key.is_some() {
-            info!("raft transport HMAC-SHA512 authentication enabled");
+            info!("raft transport HMAC-SHA512 first-factor authentication enabled");
         } else {
             warn!("MILNET_MASTER_KEK not set — raft transport HMAC authentication DISABLED");
         }
+
+        // Per-node ML-DSA-87 authentication: bind every Raft message to its
+        // sender's pinned verifying key. This is the PRIMARY transport security
+        // factor (the HMAC is only a cheap pre-filter). Built when the master KEK
+        // is available (same precondition as the HMAC key).
+        let military = std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1");
+        // The peer registry is wrapped in an RwLock so the cluster-join flow can
+        // pin PUBLISHED peer verifying keys after start (military mode), where
+        // peer VKs are NOT locally derivable. See `pin_peer_verifying_key`.
+        let (node_identity, peer_vks): (
+            Option<Arc<NodeIdentity>>,
+            Option<Arc<RwLock<NodeIdentityRegistry>>>,
+        ) = if hmac_key.is_some() {
+            // Build THIS node's identity once. In military mode this unseals (or
+            // first-boot generates+seals) the per-node seed from the TPM and
+            // fail-closes inside `for_node` if the TPM is unavailable.
+            let identity = Arc::new(NodeIdentity::for_node(config.node_id.0));
+            let registry = build_peer_verifying_keys(&config, identity.verifying_key(), military);
+            let pinned = registry.len();
+            if military {
+                info!(
+                    pinned_nodes = pinned,
+                    "raft transport per-node ML-DSA-87 auth enabled (TPM-sealed identity); \
+                     PEER verifying keys must be pinned at join via pin_peer_verifying_key"
+                );
+            } else {
+                info!(
+                    pinned_nodes = pinned,
+                    "raft transport per-node ML-DSA-87 auth enabled (dev KEK-derived; peers pinned)"
+                );
+            }
+            (Some(identity), Some(Arc::new(RwLock::new(registry))))
+        } else {
+            // FAIL-CLOSED: military mode must never run the Raft control plane
+            // without per-node authentication. Without it, a single compromised
+            // node can forge consensus messages as any peer.
+            if military {
+                return Err(
+                    "FATAL: MILNET_MILITARY_DEPLOYMENT=1 but no master KEK available — \
+                     per-node ML-DSA-87 Raft authentication cannot be established. \
+                     Seal the master KEK to this node's TPM before starting."
+                        .to_string(),
+                );
+            }
+            warn!("master KEK absent — raft transport per-node ML-DSA authentication DISABLED (non-military)");
+            (None, None)
+        };
 
         // Channel for outgoing Raft messages.
         let (send_tx, send_rx) = mpsc::unbounded_channel::<(NodeId, RaftMessage)>();
@@ -876,6 +1147,7 @@ impl ClusterNode {
             let raft_addr = config.raft_addr.clone();
             let mut shutdown_rx = shutdown_rx.clone();
             let hmac_key = hmac_key.clone();
+            let peer_vks = peer_vks.clone();
             tokio::spawn(async move {
                 let listener = match TcpListener::bind(&raft_addr).await {
                     Ok(l) => l,
@@ -903,7 +1175,9 @@ impl ClusterNode {
                     let raft = Arc::clone(&raft);
                     let send_tx = send_tx.clone();
                     let hmac_key = hmac_key.clone();
+                    let peer_vks = peer_vks.clone();
                     tokio::spawn(async move {
+                        // First factor: HMAC frame (cheap, rejects garbage).
                         let data = if let Some(ref key) = hmac_key {
                             match recv_authenticated(&mut stream, key).await {
                                 Ok(d) => d,
@@ -921,12 +1195,30 @@ impl ClusterNode {
                                 }
                             }
                         };
+
+                        // Primary factor: per-node ML-DSA-87 signature bound to
+                        // the claimed sender's pinned verifying key. FAIL-CLOSED:
+                        // a parse error, an unpinned sender, or a bad signature
+                        // drops the message (a node can only sign AS ITSELF).
                         let (from, msg): (NodeId, RaftMessage) =
-                            match postcard::from_bytes(&data) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    warn!(err = %e, "failed to deserialize raft message");
-                                    return;
+                            if let Some(ref vks) = peer_vks {
+                                let registry = vks.read().await;
+                                match verify_transport_message(&data, &registry) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        warn!(peer = %peer_addr, err = %e, "REJECTING raft message: per-node authentication failed");
+                                        return;
+                                    }
+                                }
+                            } else {
+                                // Legacy/no-KEK path (non-military, tests):
+                                // plain (NodeId, RaftMessage) tuple.
+                                match postcard::from_bytes(&data) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        warn!(err = %e, "failed to deserialize raft message");
+                                        return;
+                                    }
                                 }
                             };
                         let responses = raft.lock().await.handle_message(from, msg);
@@ -947,6 +1239,7 @@ impl ClusterNode {
             let mut send_rx = send_rx;
             let mut shutdown_rx = shutdown_rx.clone();
             let hmac_key = hmac_key.clone();
+            let node_identity = node_identity.clone();
             tokio::spawn(async move {
                 loop {
                     let (target, msg) = tokio::select! {
@@ -971,6 +1264,7 @@ impl ClusterNode {
                     // Spawn a short-lived task so we don't block the sender loop
                     let node_id = config.node_id;
                     let hmac_key = hmac_key.clone();
+                    let node_identity = node_identity.clone();
                     tokio::spawn(async move {
                         let mut stream = match TcpStream::connect(&peer_addr).await {
                             Ok(s) => s,
@@ -983,12 +1277,26 @@ impl ClusterNode {
                                 return;
                             }
                         };
-                        let payload: (NodeId, RaftMessage) = (node_id, msg);
-                        let data = match postcard::to_allocvec(&payload) {
-                            Ok(d) => d,
-                            Err(e) => {
-                                warn!(err = %e, "failed to serialize raft message");
-                                return;
+                        // Sign with this node's per-node ML-DSA-87 identity when
+                        // available; otherwise fall back to the plain tuple
+                        // (legacy/no-KEK path). The signature binds the message
+                        // to THIS node — a peer cannot replay it as another.
+                        let data = if let Some(ref identity) = node_identity {
+                            match sign_transport_message(identity, node_id, &msg) {
+                                Ok(d) => d,
+                                Err(e) => {
+                                    warn!(err = %e, "failed to sign raft message");
+                                    return;
+                                }
+                            }
+                        } else {
+                            let payload: (NodeId, RaftMessage) = (node_id, msg);
+                            match postcard::to_allocvec(&payload) {
+                                Ok(d) => d,
+                                Err(e) => {
+                                    warn!(err = %e, "failed to serialize raft message");
+                                    return;
+                                }
                             }
                         };
                         if let Some(ref key) = hmac_key {
@@ -1067,6 +1375,7 @@ impl ClusterNode {
             config,
             shutdown_tx,
             leader_tx,
+            peer_vks,
         })
     }
 
@@ -1087,6 +1396,72 @@ impl ClusterNode {
     /// Get this node's ID.
     pub fn node_id(&self) -> NodeId {
         self.config.node_id
+    }
+
+    /// Pin a peer's PUBLISHED ML-DSA-87 verifying key into the Raft transport's
+    /// identity registry (the cluster-join step).
+    ///
+    /// In military mode each node's signing seed is sealed to its OWN TPM, so a
+    /// peer's verifying key is NOT locally derivable — the peer publishes it and
+    /// the join flow pins it here. After pinning, the transport will accept that
+    /// peer's per-node-signed Raft messages; until then they are dropped
+    /// (fail-closed). Returns `false` if per-node auth is disabled on this node.
+    ///
+    /// SECURITY: the caller MUST have authenticated the published VK before
+    /// pinning (e.g. it arrived inside an ML-DSA-signed `PeerAttestation` whose
+    /// signature was verified during distributed startup). Pinning an
+    /// unauthenticated VK would defeat the whole scheme.
+    pub async fn pin_peer_verifying_key(&self, node_id: NodeId, verifying_key: Vec<u8>) -> bool {
+        match &self.peer_vks {
+            Some(reg) => {
+                reg.write().await.pin(node_id, verifying_key);
+                info!(peer = %node_id, "pinned published peer verifying key into raft transport registry");
+                true
+            }
+            None => {
+                warn!(
+                    peer = %node_id,
+                    "pin_peer_verifying_key called but per-node auth is disabled (non-military, no KEK)"
+                );
+                false
+            }
+        }
+    }
+
+    /// This node's own ML-DSA-87 verifying key, to be PUBLISHED to peers for
+    /// pinning at join. `None` when per-node auth is disabled.
+    ///
+    /// In military mode this is the verifying key of the node's TPM-sealed
+    /// identity; peers pin it via [`Self::pin_peer_verifying_key`].
+    pub async fn self_verifying_key(&self) -> Option<Vec<u8>> {
+        let reg = self.peer_vks.as_ref()?;
+        reg.read().await.verifying_key(&self.config.node_id).map(|vk| vk.to_vec())
+    }
+
+    /// The LIVE shared per-node identity registry handle, so OTHER subsystems
+    /// (e.g. session-revocation propagation) authenticate against the SAME pinned
+    /// `NodeId -> VK` set the Raft transport uses — one registry, no duplication.
+    ///
+    /// Returns `None` when per-node auth is disabled (non-military, no KEK). The
+    /// registry is mutated by [`Self::pin_peer_verifying_key`] at cluster join, so
+    /// a holder of this `Arc<RwLock<..>>` always sees the current pinned set
+    /// (including peers pinned AFTER this call — correct for dynamic membership).
+    /// Read through it with `.read().await` then `registry.verify(node_id, ..)`.
+    pub fn identity_registry(&self) -> Option<Arc<RwLock<NodeIdentityRegistry>>> {
+        self.peer_vks.clone()
+    }
+
+    /// A point-in-time CLONE of the current pinned identity registry, for callers
+    /// whose API wants an owned / `Arc<NodeIdentityRegistry>` (e.g. a revocation
+    /// signer built via `NodeDsaSigner::from_node_identity`).
+    ///
+    /// IMPORTANT: this is a SNAPSHOT — peers pinned AFTER this call are NOT
+    /// reflected. Take it AFTER cluster-join pinning completes, or prefer
+    /// [`Self::identity_registry`] for a live view. Returns `None` when per-node
+    /// auth is disabled.
+    pub async fn identity_registry_snapshot(&self) -> Option<NodeIdentityRegistry> {
+        let reg = self.peer_vks.as_ref()?;
+        Some(reg.read().await.clone())
     }
 
     /// Get a snapshot of the current cluster state.
@@ -1205,6 +1580,21 @@ mod tests {
         assert_eq!(peers[0].raft_addr, "10.0.0.1:9090");
         assert_eq!(peers[0].service_addr, "10.0.0.1:8080");
         assert_eq!(peers[1].node_id, NodeId(uuid::Uuid::from_u128(0x2b)));
+    }
+
+    #[test]
+    fn canonical_node_id_uuid_hex_and_v5() {
+        // UUID string round-trips.
+        let u = uuid::Uuid::from_u128(0x2a);
+        assert_eq!(canonical_node_id(&u.to_string()), NodeId(u));
+        // Hex (with/without 0x) → from_u128.
+        assert_eq!(canonical_node_id("0x2a"), NodeId(uuid::Uuid::from_u128(0x2a)));
+        assert_eq!(canonical_node_id("2a"), NodeId(uuid::Uuid::from_u128(0x2a)));
+        // Non-UUID deploy id → STABLE, distinct UUIDv5 (not rejected).
+        let a = canonical_node_id("orchestrator-0");
+        assert_eq!(a, canonical_node_id("orchestrator-0"), "deterministic");
+        assert_ne!(a, canonical_node_id("orchestrator-1"), "distinct per id");
+        assert_ne!(a, canonical_node_id("tss-coordinator-0"));
     }
 
     #[test]
@@ -1424,5 +1814,200 @@ mod tests {
             }
             Ok(_) => panic!("standalone mode must be rejected, but start() succeeded"),
         }
+    }
+
+    // ── Per-node ML-DSA-87 Raft transport authentication (CRITICAL fix) ──────
+    //
+    // These exercise the transport sign/verify primitives directly with
+    // explicit-seed identities (no KEK needed). ML-DSA-87 keys are large, so the
+    // tests run on a thread with extra stack (matches RUST_MIN_STACK on OCI).
+
+    fn run_with_large_stack<F: FnOnce() + Send + 'static>(f: F) {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(f)
+            .expect("thread spawn failed")
+            .join()
+            .expect("test thread panicked");
+    }
+
+    fn test_identity(n: u8) -> crate::distributed_startup::NodeIdentity {
+        crate::distributed_startup::NodeIdentity::from_seed(
+            uuid::Uuid::from_bytes([n; 16]),
+            [n; 32],
+        )
+    }
+
+    fn registry_with(
+        identities: &[&crate::distributed_startup::NodeIdentity],
+    ) -> NodeIdentityRegistry {
+        let mut reg = NodeIdentityRegistry::new();
+        for id in identities {
+            reg.pin(id.node_id(), id.verifying_key());
+        }
+        reg
+    }
+
+    fn sample_request_vote(candidate: NodeId) -> RaftMessage {
+        RaftMessage::RequestVote {
+            term: Term(7),
+            candidate_id: candidate,
+            last_log_index: LogIndex(3),
+            last_log_term: Term(6),
+        }
+    }
+
+    /// A valid per-node-signed message verifies and round-trips its contents.
+    #[test]
+    fn transport_valid_signature_verifies() {
+        run_with_large_stack(|| {
+            let id_a = test_identity(1);
+            let node_a = id_a.node_id();
+            let registry = registry_with(&[&id_a]);
+
+            let msg = sample_request_vote(node_a);
+            let wire = sign_transport_message(&id_a, node_a, &msg).unwrap();
+            let (from, got) = verify_transport_message(&wire, &registry).unwrap();
+            assert_eq!(from, node_a);
+            assert_eq!(got, msg);
+        });
+    }
+
+    /// CORE ANTI-FORGERY PROPERTY (the CRITICAL finding): a compromised node A
+    /// cannot forge a message attributed to node B. Even though A controls the
+    /// `sender_id` field and signs over B's id, A signs with A's key, which does
+    /// not verify under B's pinned verifying key.
+    #[test]
+    fn transport_node_cannot_forge_as_another_node() {
+        run_with_large_stack(|| {
+            let id_a = test_identity(1); // compromised node
+            let id_b = test_identity(2); // victim identity A wants to impersonate
+            let node_b = id_b.node_id();
+
+            // Both A and B are pinned (their VKs known at join).
+            let registry = registry_with(&[&id_a, &id_b]);
+
+            // A crafts a RequestVote claiming to be B, signing (domain||B||msg)
+            // with A's OWN key (A does not have B's signing seed).
+            let forged_msg = sample_request_vote(node_b);
+            let msg_bytes = postcard::to_allocvec(&forged_msg).unwrap();
+            let signed = transport_signed_bytes(node_b, &msg_bytes);
+            let forged_sig = id_a.node_sign(&signed);
+            let forged_envelope = NodeAuthenticatedRaftMessage {
+                sender_id: node_b, // LIE: claims to be B
+                message: forged_msg,
+                ml_dsa_sig: forged_sig,
+            };
+            let wire = postcard::to_allocvec(&forged_envelope).unwrap();
+
+            // Verifier reconstructs (domain||B||msg) and checks against B's
+            // pinned key → A's signature fails. Forgery rejected.
+            let result = verify_transport_message(&wire, &registry);
+            assert!(
+                result.is_err(),
+                "node A must NOT be able to forge a message as node B"
+            );
+        });
+    }
+
+    /// A tampered message body is rejected (signature no longer matches).
+    #[test]
+    fn transport_tampered_message_rejected() {
+        run_with_large_stack(|| {
+            let id_a = test_identity(1);
+            let node_a = id_a.node_id();
+            let registry = registry_with(&[&id_a]);
+
+            let msg = sample_request_vote(node_a);
+            let wire = sign_transport_message(&id_a, node_a, &msg).unwrap();
+
+            // Tamper: parse, swap the message for a different term, re-serialize
+            // WITHOUT re-signing.
+            let mut env: NodeAuthenticatedRaftMessage =
+                postcard::from_bytes(&wire).unwrap();
+            env.message = RaftMessage::RequestVote {
+                term: Term(999), // attacker bumps term to win election
+                candidate_id: node_a,
+                last_log_index: LogIndex(3),
+                last_log_term: Term(6),
+            };
+            let tampered_wire = postcard::to_allocvec(&env).unwrap();
+
+            assert!(
+                verify_transport_message(&tampered_wire, &registry).is_err(),
+                "tampered Raft message must be rejected"
+            );
+        });
+    }
+
+    /// A tampered signature is rejected.
+    #[test]
+    fn transport_tampered_signature_rejected() {
+        run_with_large_stack(|| {
+            let id_a = test_identity(1);
+            let node_a = id_a.node_id();
+            let registry = registry_with(&[&id_a]);
+
+            let msg = sample_request_vote(node_a);
+            let wire = sign_transport_message(&id_a, node_a, &msg).unwrap();
+
+            let mut env: NodeAuthenticatedRaftMessage =
+                postcard::from_bytes(&wire).unwrap();
+            if !env.ml_dsa_sig.is_empty() {
+                env.ml_dsa_sig[0] ^= 0xFF;
+            }
+            let tampered_wire = postcard::to_allocvec(&env).unwrap();
+
+            assert!(
+                verify_transport_message(&tampered_wire, &registry).is_err(),
+                "message with tampered ML-DSA signature must be rejected"
+            );
+        });
+    }
+
+    /// FAIL-CLOSED: a message from an unpinned / unknown sender is rejected even
+    /// if its own self-consistent signature is valid.
+    #[test]
+    fn transport_unpinned_sender_rejected() {
+        run_with_large_stack(|| {
+            let id_a = test_identity(1);
+            let node_a = id_a.node_id();
+
+            // Registry that does NOT contain node_a (never pinned at join).
+            let id_b = test_identity(2);
+            let registry = registry_with(&[&id_b]);
+
+            // A produces a perfectly valid self-signed message.
+            let msg = sample_request_vote(node_a);
+            let wire = sign_transport_message(&id_a, node_a, &msg).unwrap();
+
+            assert!(
+                verify_transport_message(&wire, &registry).is_err(),
+                "message from an unpinned sender must be rejected (fail-closed)"
+            );
+        });
+    }
+
+    /// The pinned registry built from config derives the SAME verifying key that
+    /// each node's own identity produces (so legitimate peers verify).
+    #[test]
+    fn transport_registry_consistent_for_same_kek() {
+        run_with_large_stack(|| {
+            // Same explicit seed on both sides simulates the shared-KEK
+            // derivation agreeing on a peer's verifying key.
+            let seed = [0x5Au8; 32];
+            let uuid_val = uuid::Uuid::from_u128(0xABCD);
+            let node = NodeId(uuid_val);
+            let signer = crate::distributed_startup::NodeIdentity::from_seed(uuid_val, seed);
+            let pinned = crate::distributed_startup::NodeIdentity::from_seed(uuid_val, seed);
+            let registry = registry_with(&[&pinned]);
+
+            let msg = sample_request_vote(node);
+            let wire = sign_transport_message(&signer, node, &msg).unwrap();
+            assert!(
+                verify_transport_message(&wire, &registry).is_ok(),
+                "a peer signing with the KEK-derived key must verify against the pinned key"
+            );
+        });
     }
 }

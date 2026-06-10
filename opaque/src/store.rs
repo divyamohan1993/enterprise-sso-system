@@ -31,10 +31,23 @@ struct FakeRegistrationPool {
 
 impl FakeRegistrationPool {
     fn generate(server_setup: &ServerSetup<OpaqueCs>, count: usize) -> Self {
-        use opaque_ke::{ClientRegistration, ClientRegistrationFinishParameters};
+        use opaque_ke::{ClientRegistration, ClientRegistrationFinishParameters, Identifiers};
 
         let mut rng = OsRng;
         let mut registrations = Vec::with_capacity(count);
+
+        // SECURITY / PERF: these fake registrations are throwaway timing pads,
+        // never real credentials and never the target of an authentication. We
+        // therefore generate them with the LIGHT Argon2id KSF
+        // (`MilitaryArgon2::pad`) instead of the 64 MiB production KSF, so that
+        // building a 64-entry pool at every `CredentialStore::new()` does not
+        // cost 64 × 64 MiB of work + memory. This does NOT weaken the
+        // timing-oracle defense: when a login arrives for a non-existent user,
+        // `verify_password` re-runs the FULL-strength KSF on the
+        // attacker-supplied password via `ClientLogin::finish` (which uses the
+        // strong default KSF), so the live path is indistinguishable in timing
+        // from a real-user login regardless of how the pad blob was built.
+        let pad_ksf = crate::opaque_impl::MilitaryArgon2::pad();
 
         for i in 0..count {
             let fake_password = format!("__fake_timing_pad_{i}__");
@@ -55,7 +68,10 @@ impl FakeRegistrationPool {
                     &mut rng,
                     fake_password.as_bytes(),
                     server_start.message,
-                    ClientRegistrationFinishParameters::default(),
+                    ClientRegistrationFinishParameters::new(
+                        Identifiers::default(),
+                        Some(&pad_ksf),
+                    ),
                 )
                 .expect("fake registration client finish must succeed");
             let server_reg = ServerRegistration::<OpaqueCs>::finish(client_finish.message);
@@ -96,12 +112,46 @@ pub struct UserRecord {
     pub ksf_algorithm: String,
 }
 
+/// How the store holds the OPAQUE `ServerSetup` (OPRF seed + keypair).
+///
+/// SECURITY (audit F4): the production path keeps the seed SEALED and unseals
+/// it transiently per operation (`Sealed`), so the OPRF seed is never a
+/// long-lived plaintext field in RAM. The `Plain` variant is retained for
+/// dev/test and for callers that restore a setup from their own persistence
+/// (e.g. the admin DB path); `main.rs` single-server production mode uses
+/// `Sealed`.
+enum SetupSource {
+    /// Plaintext setup held in RAM. Dev/test or externally-persisted callers.
+    Plain(Box<ServerSetup<OpaqueCs>>),
+    /// Sealed envelope; the seed only materializes transiently inside
+    /// `ServerSetupHandle::with_setup`.
+    Sealed(Box<crate::opaque_impl::ServerSetupHandle>),
+}
+
+impl SetupSource {
+    /// Run `f` with a borrowed `&ServerSetup`, unsealing transiently for the
+    /// `Sealed` variant and wiping the plaintext immediately afterward.
+    fn with_setup<R>(
+        &self,
+        f: impl FnOnce(&ServerSetup<OpaqueCs>) -> R,
+    ) -> Result<R, MilnetError> {
+        match self {
+            SetupSource::Plain(s) => Ok(f(&**s)),
+            SetupSource::Sealed(h) => h
+                .with_setup(f)
+                .map_err(|e| MilnetError::CryptoVerification(format!("unseal server setup: {e}"))),
+        }
+    }
+}
+
 /// In-memory credential store mapping usernames to OPAQUE registration records.
 pub struct CredentialStore {
     users: HashMap<String, UserRecord>,
-    /// The server's OPAQUE setup (OPRF seed + keypair). Must be persisted
-    /// across restarts in production.
-    server_setup: ServerSetup<OpaqueCs>,
+    /// The server's OPAQUE setup (OPRF seed + keypair). In production this is
+    /// `Sealed` so the seed is never a long-lived plaintext field (audit F4);
+    /// it must also be persisted across restarts to keep users verifiable
+    /// (audit F7) — see `opaque_impl::ServerSetupHandle::load_or_generate`.
+    setup: SetupSource,
     /// Optional FIPS-compliant server setup using PBKDF2-SHA512 KSF.
     server_setup_fips: Option<ServerSetup<OpaqueCsFips>>,
     /// Pre-computed fake registrations for timing-safe user-not-found handling.
@@ -109,7 +159,11 @@ pub struct CredentialStore {
 }
 
 impl CredentialStore {
-    /// Create an empty credential store with a fresh ServerSetup.
+    /// Create an empty credential store with a fresh in-RAM ServerSetup.
+    ///
+    /// DEV/TEST ONLY: the OPRF seed is held as plaintext and is NOT persisted.
+    /// Production single-server mode must use [`with_sealed_setup`] so the seed
+    /// is sealed (F4) and persisted across restarts (F7).
     pub fn new() -> Self {
         let mut rng = OsRng;
         let server_setup = ServerSetup::<OpaqueCs>::new(&mut rng);
@@ -117,7 +171,7 @@ impl CredentialStore {
             FakeRegistrationPool::generate(&server_setup, FAKE_REGISTRATION_COUNT);
         Self {
             users: HashMap::new(),
-            server_setup,
+            setup: SetupSource::Plain(Box::new(server_setup)),
             server_setup_fips: None,
             fake_registrations,
         }
@@ -133,14 +187,14 @@ impl CredentialStore {
             FakeRegistrationPool::generate(&server_setup, FAKE_REGISTRATION_COUNT);
         Self {
             users: HashMap::new(),
-            server_setup,
+            setup: SetupSource::Plain(Box::new(server_setup)),
             server_setup_fips: Some(server_setup_fips),
             fake_registrations,
         }
     }
 
     /// Create a credential store with a provided ServerSetup (for testing or
-    /// when restoring from persistent storage).
+    /// when restoring from a caller's own persistence, e.g. the admin DB path).
     ///
     /// If FIPS mode is active, automatically initializes the FIPS server setup
     /// to prevent KSF mismatch between registration and login flows.
@@ -155,15 +209,69 @@ impl CredentialStore {
             FakeRegistrationPool::generate(&server_setup, FAKE_REGISTRATION_COUNT);
         Self {
             users: HashMap::new(),
-            server_setup,
+            setup: SetupSource::Plain(Box::new(server_setup)),
             server_setup_fips,
             fake_registrations,
         }
     }
 
+    /// Create a credential store backed by a SEALED `ServerSetup` handle
+    /// (audit F4/F7). The OPRF seed is never held as a long-lived plaintext
+    /// field; it is unsealed transiently for each OPAQUE operation via
+    /// [`crate::opaque_impl::ServerSetupHandle::with_setup`].
+    ///
+    /// The fake-registration timing pool is generated once at construction by
+    /// transiently unsealing the setup (startup cost only). Returns an error
+    /// if the handle cannot be unsealed (fail-closed).
+    ///
+    /// NOTE: FIPS dual-suite is not supported on the sealed path in this pass;
+    /// `server_setup_fips` is `None`. FIPS deployments use the Plain path.
+    pub fn with_sealed_setup(
+        handle: crate::opaque_impl::ServerSetupHandle,
+    ) -> Result<Self, MilnetError> {
+        let fake_registrations = handle
+            .with_setup(|s| FakeRegistrationPool::generate(s, FAKE_REGISTRATION_COUNT))
+            .map_err(|e| {
+                MilnetError::CryptoVerification(format!(
+                    "unseal server setup for fake-pool generation: {e}"
+                ))
+            })?;
+        Ok(Self {
+            users: HashMap::new(),
+            setup: SetupSource::Sealed(Box::new(handle)),
+            server_setup_fips: None,
+            fake_registrations,
+        })
+    }
+
+    /// Run `f` with a borrowed `&ServerSetup`, unsealing transiently on the
+    /// sealed path. This is the F4-safe accessor: prefer it over
+    /// [`server_setup`] for any code that performs an OPAQUE operation, so the
+    /// production (sealed) path never exposes a long-lived plaintext seed.
+    pub fn with_server_setup_ref<R>(
+        &self,
+        f: impl FnOnce(&ServerSetup<OpaqueCs>) -> R,
+    ) -> Result<R, MilnetError> {
+        self.setup.with_setup(f)
+    }
+
     /// Returns a reference to the server setup.
+    ///
+    /// AVAILABLE ONLY on the `Plain` path (dev/test or externally-persisted
+    /// callers). On the sealed production path this PANICS, because a transient
+    /// unsealed setup cannot outlive a borrow — sealed callers must use
+    /// [`with_server_setup_ref`]. Retained for backward compatibility with
+    /// existing callers (admin DB path, orchestrator tests) that build the
+    /// store via [`with_server_setup`].
     pub fn server_setup(&self) -> &ServerSetup<OpaqueCs> {
-        &self.server_setup
+        match &self.setup {
+            SetupSource::Plain(s) => &**s,
+            SetupSource::Sealed(_) => panic!(
+                "CredentialStore::server_setup() called on a SEALED store; \
+                 use with_server_setup_ref() (the OPRF seed is never held as a \
+                 long-lived plaintext reference on the sealed path — audit F4)"
+            ),
+        }
     }
 
     /// Returns a reference to the FIPS server setup, if initialised.
@@ -358,24 +466,30 @@ impl CredentialStore {
             }
         };
 
-        // Step 2: Server processes registration request
-        let server_start = match ServerRegistration::<OpaqueCs>::start(
-            &self.server_setup,
-            client_start.message,
-            username.as_bytes(),
-        ) {
-            Ok(ss) => ss,
-            Err(e) => {
+        // Step 2: Server processes registration request.
+        // Unseal the setup transiently (F4): the server-side start only needs
+        // `&ServerSetup` for the duration of this call, after which the seed is
+        // wiped on the sealed path.
+        let server_message = self
+            .with_server_setup_ref(|setup| {
+                ServerRegistration::<OpaqueCs>::start(
+                    setup,
+                    client_start.message.clone(),
+                    username.as_bytes(),
+                )
+                .map(|ss| ss.message)
+                .map_err(|e| format!("server reg start: {e}"))
+            })?
+            .map_err(|e| {
                 tracing::error!("OPAQUE server registration start failed: {e}");
-                return Err(MilnetError::CryptoVerification(format!("server reg start: {e}")));
-            }
-        };
+                MilnetError::CryptoVerification(e)
+            })?;
 
         // Step 3: Client finishes registration
         let client_finish = match client_start.state.finish(
             &mut rng,
             password,
-            server_start.message,
+            server_message,
             ClientRegistrationFinishParameters::default(),
         ) {
             Ok(cf) => cf,
@@ -485,17 +599,23 @@ impl CredentialStore {
         let client_start = ClientRegistration::<OpaqueCs>::start(&mut rng, password)
             .map_err(|e| MilnetError::CryptoVerification(format!("client reg start: {e}")))?;
 
-        let server_start = ServerRegistration::<OpaqueCs>::start(
-            &self.server_setup,
-            client_start.message,
-            username.as_bytes(),
-        )
-        .map_err(|e| MilnetError::CryptoVerification(format!("server reg start: {e}")))?;
+        // Transient unseal (F4): server-side start only needs &ServerSetup here.
+        let server_message = self
+            .with_server_setup_ref(|setup| {
+                ServerRegistration::<OpaqueCs>::start(
+                    setup,
+                    client_start.message.clone(),
+                    username.as_bytes(),
+                )
+                .map(|ss| ss.message)
+                .map_err(|e| format!("server reg start: {e}"))
+            })?
+            .map_err(MilnetError::CryptoVerification)?;
 
         let client_finish = client_start.state.finish(
             &mut rng,
             password,
-            server_start.message,
+            server_message,
             ClientRegistrationFinishParameters::default(),
         )
         .map_err(|e| MilnetError::CryptoVerification(format!("client reg finish: {e}")))?;
@@ -679,16 +799,25 @@ impl CredentialStore {
         let client_start = ClientLogin::<OpaqueCs>::start(&mut rng, password)
             .map_err(|_| MilnetError::CryptoVerification("login start failed".into()))?;
 
-        // Server processes login request (full OPAQUE OPRF regardless of user existence)
-        let server_start = ServerLogin::<OpaqueCs>::start(
-            &mut rng,
-            &self.server_setup,
-            Some(server_registration),
-            client_start.message,
-            username.as_bytes(),
-            ServerLoginParameters::default(),
-        )
-        .map_err(|_| MilnetError::CryptoVerification("authentication failed".into()))?;
+        // Server processes login request (full OPAQUE OPRF regardless of user
+        // existence). Transient unseal (F4): only ServerLogin::start needs
+        // &ServerSetup; the returned state finishes without it. We move the
+        // owned ServerLoginStartResult out of the closure.
+        let cred_request = client_start.message.clone();
+        let server_start = self
+            .with_server_setup_ref(|setup| {
+                let mut rng = OsRng;
+                ServerLogin::<OpaqueCs>::start(
+                    &mut rng,
+                    setup,
+                    Some(server_registration),
+                    cred_request,
+                    username.as_bytes(),
+                    ServerLoginParameters::default(),
+                )
+                .map_err(|_| ())
+            })?
+            .map_err(|_| MilnetError::CryptoVerification("authentication failed".into()))?;
 
         // Client finishes login
         let client_finish = client_start
@@ -721,29 +850,24 @@ impl CredentialStore {
 
 impl Drop for CredentialStore {
     fn drop(&mut self) {
-        // SECURITY — HONEST LIMITATION (audit P0-3):
+        // SECURITY (audit F4 / P0-3 / P1-1):
         //
-        // The OPRF seed and server keypair live inside `opaque-ke`'s
-        // `ServerSetup`, which does NOT implement `Zeroize`. The previous
-        // Drop impl serialized the setup into a fresh `Vec` and zeroized THAT
-        // COPY — which wiped nothing in the live struct and gave a false sense
-        // of protection. That no-op has been removed: serializing-then-wiping
-        // a copy is not memory hygiene and must not be presented as such.
+        // The OPRF seed lives inside `opaque-ke`'s `ServerSetup`, which does
+        // NOT implement `Zeroize`, and this crate is `#![forbid(unsafe_code)]`
+        // so it cannot be scrubbed in place. The DEFENDED fix is structural,
+        // not a Drop hack: on the PRODUCTION path the store is built via
+        // `with_sealed_setup` (`SetupSource::Sealed`), so NO plaintext
+        // `ServerSetup` is ever held in long-lived RAM — the seed materializes
+        // only transiently inside `ServerSetupHandle::with_setup`, which wipes
+        // its `Zeroizing<Vec<u8>>` plaintext on every call. The `Plain` variant
+        // remains for dev/test and externally-persisted callers (admin DB
+        // path); on that variant the seed residue in freed pages after shutdown
+        // is a KNOWN, DOCUMENTED exposure, but the Plain path is not the
+        // production posture.
         //
-        // This crate is `#![forbid(unsafe_code)]`, so the `ServerSetup` struct
-        // memory cannot be scrubbed in place here (no `ptr::write_volatile`).
-        // The CORRECT fix is to never hold a plaintext `ServerSetup` in
-        // long-lived RAM: keep it sealed (`opaque_impl::ServerSetupHandle`,
-        // AES-256-GCM under the master KEK) and unseal transiently per request
-        // via `with_setup`, which wipes the `Zeroizing<Vec<u8>>` plaintext on
-        // every call. Wiring that handle into `CredentialStore` is tracked as
-        // a follow-up refactor (audit P1-1); until then the OPRF seed residue
-        // in freed pages after shutdown is a KNOWN, DOCUMENTED exposure — not
-        // a defended one.
-        //
-        // What we CAN and DO scrub here: the in-memory user registration
-        // records (high-value for offline attacks even though they carry no
-        // plaintext passwords).
+        // What we CAN and DO scrub here regardless of variant: the in-memory
+        // user registration records (high-value for offline attacks even
+        // though they carry no plaintext passwords).
         self.users.clear();
     }
 }

@@ -5,7 +5,7 @@
 //! ceremony cleanup.
 
 use orchestrator::ceremony::{
-    CeremonySession, CeremonyState, CeremonyTracker, CEREMONY_TIMEOUT_SECS,
+    ceremony_timeout_secs, CeremonySession, CeremonyState, CeremonyTracker, CEREMONY_TIMEOUT_SECS,
     MAX_CEREMONIES_PER_USER, MAX_PENDING_CEREMONIES,
 };
 use orchestrator::messages::{OrchestratorRequest, OrchestratorResponse};
@@ -102,7 +102,7 @@ fn fresh_session_not_expired() {
 #[test]
 fn session_expired_after_timeout() {
     let mut session = CeremonySession::new([0xCC; 32]);
-    session.created_at -= CEREMONY_TIMEOUT_SECS + 1;
+    session.created_at -= ceremony_timeout_secs() + 1;
     assert!(session.is_expired());
 }
 
@@ -268,7 +268,7 @@ fn tracker_cleanup_removes_expired_sessions() {
     let user = Uuid::new_v4();
 
     let mut session = CeremonySession::new([0x01; 32]);
-    session.created_at -= CEREMONY_TIMEOUT_SECS + 1; // expire it
+    session.created_at -= ceremony_timeout_secs() + 1; // expire it
     tracker.create_ceremony(session, Some(user)).unwrap();
 
     let removed = tracker.cleanup_expired();

@@ -62,7 +62,7 @@ sha3 = "0.10"
 blake3 = "1"
 hkdf = "0.12"
 hmac = "0.12"
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util", "signal"] }
 tracing = "0.1"
@@ -105,3 +105,14 @@ lto = true
 codegen-units = 1
 strip = "symbols"
 overflow-checks = true
+
+# Optimize third-party dependencies even in debug/test builds. Without this,
+# Argon2id-heavy tests are pathologically slow: opaque/tests/proptest_opaque.rs
+# runs 1000 proptest cases, each performing a full OPAQUE+Argon2id exchange, and
+# unoptimized Argon2id is ~50-100x slower. Our own workspace crates stay
+# unoptimized (fast incremental builds, debug-assertions/overflow-checks intact);
+# only the dependency crates (argon2, opaque-ke, ml-kem, ml-dsa, curve25519, etc.)
+# are optimized. Third-party deps are compiled with the dev profile during
+# `cargo test`, so this single override covers both `cargo build` and `cargo test`.
+[profile.dev.package."*"]
+opt-level = 3

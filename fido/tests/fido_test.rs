@@ -19,19 +19,35 @@ use uuid::Uuid;
 
 // ── Test-harness init ───────────────────────────────────────────────────
 
-/// Populate `MILNET_FIDO_AAGUID_ALLOWLIST` with the all-zero AAGUID used
-/// by synthetic test credentials, in addition to the production default
-/// vendor list. Idempotent via `Once` so parallel tests don't race.
-/// Never called in release or military builds — this file is compiled
-/// only as part of the `fido` integration-test binary.
+/// A real, allow-listed authenticator AAGUID (YubiKey 5 Series, from
+/// `fido::policy::DEFAULT_AAGUIDS`) used by the synthetic attestation objects in
+/// this integration binary. The production `enforce_aaguid` gate rejects the
+/// all-zero sentinel and, in non-`cfg(test)` integration builds, requires a
+/// known AAGUID — so synthetic test credentials must present a real allow-listed
+/// identity rather than the zero placeholder.
+const TEST_AAGUID: [u8; 16] = [
+    0xcb, 0x69, 0x48, 0x1e, 0x8f, 0xf7, 0x40, 0x39,
+    0x93, 0xec, 0x0a, 0x27, 0x29, 0xa1, 0x54, 0xa8,
+];
+
+/// Relax the integration-test FIDO enrollment policy so synthetic credentials
+/// register. Idempotent via `Once` so parallel tests don't race:
+///   * pins `MILNET_FIDO_AAGUID_ALLOWLIST` to the production vendor list so
+///     `TEST_AAGUID` is accepted regardless of build-time default selection, and
+///   * sets `MILNET_FIDO_PQ_REQUIRED=0` so the mandatory ML-DSA-87 PQ-attestation
+///     binding (default-ON in non-`cfg(test)` integration builds) does not reject
+///     the synthetic objects, which carry no real PQ attestation.
+/// Never compiled into release/military builds — this file is only part of the
+/// `fido` integration-test binary. The PQ binding and AAGUID enforcement
+/// themselves are exercised by `fido/tests/cat_b_hardening.rs` and the
+/// `fido::policy` unit tests.
 fn ensure_test_aaguid_allowlist() {
     use std::sync::Once;
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         std::env::set_var(
             "MILNET_FIDO_AAGUID_ALLOWLIST",
-            "00000000-0000-0000-0000-000000000000,\
-             cb69481e-8ff7-4039-93ec-0a2729a154a8,\
+            "cb69481e-8ff7-4039-93ec-0a2729a154a8,\
              fa2b99dc-9e39-4257-8f92-4a30d23c4118,\
              2fc0579f-8113-47ea-b116-bb5a8db9202a,\
              c5ef55ff-ad9a-4b9f-b580-adebafe026d0,\
@@ -40,6 +56,7 @@ fn ensure_test_aaguid_allowlist() {
              dd4ec289-e01d-41c9-bb89-70fa845d4bf2,\
              f24a8e70-d0d3-f82c-2937-32523cc4de5a",
         );
+        std::env::set_var("MILNET_FIDO_PQ_REQUIRED", "0");
     });
 }
 
@@ -67,8 +84,10 @@ fn make_attestation_auth_data(
     data.extend_from_slice(&rp_hash);
     data.push(flags);
     data.extend_from_slice(&sign_count.to_be_bytes());
-    // AAGUID (16 zero bytes)
-    data.extend_from_slice(&[0u8; 16]);
+    // AAGUID — a real allow-listed authenticator identity (TEST_AAGUID).
+    // The all-zero sentinel is rejected by `fido::policy::enforce_aaguid` in
+    // non-`cfg(test)` integration builds, so synthetic objects use a real one.
+    data.extend_from_slice(&TEST_AAGUID);
     // credential ID length
     let cred_len = credential_id.len() as u16;
     data.extend_from_slice(&cred_len.to_be_bytes());

@@ -4,7 +4,7 @@ use common::types::{ModuleId, Token};
 use crypto::entropy::generate_key_64;
 use opaque::messages::{OpaqueRequest, OpaqueResponse};
 use opaque::store::CredentialStore;
-use orchestrator::ceremony::{CeremonySession, CeremonyState, CEREMONY_TIMEOUT_SECS};
+use orchestrator::ceremony::{ceremony_timeout_secs, CeremonySession, CeremonyState};
 use orchestrator::messages::OrchestratorRequest;
 use orchestrator::service::OrchestratorService;
 use shard::tls::{
@@ -78,7 +78,7 @@ fn ceremony_session_timeout() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64
-        - CEREMONY_TIMEOUT_SECS
+        - ceremony_timeout_secs()
         - 1;
 
     assert!(session.is_expired());

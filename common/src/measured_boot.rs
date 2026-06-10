@@ -177,6 +177,16 @@ impl BootAttestation {
 // ---------------------------------------------------------------------------
 
 /// Well-known names for sealed key blobs.
+///
+/// NOTE (master-KEK anti-clone wiring): the ACTIVE, PCR-bound master-KEK
+/// sealing now lives in [`crate::sealed_keys`] under the distinct blob names
+/// `sealed_keys::SEALED_KEK_SINGLE_NAME` / `SEALED_KEK_SHARE_NAME`, sealed to
+/// the **measured-boot** PCR set [`crate::platform_integrity::MASTER_KEK_PCR_LIST`]
+/// (0,2,4,7) and unsealed inside `sealed_keys::get_master_kek` in military
+/// mode. The generic [`seal_key`]/[`unseal_key`] wrappers below default to the
+/// narrower `sha256:0,7` policy and are retained for FROST-share sealing. Do
+/// NOT seal the master KEK via these wrappers — use
+/// `sealed_keys::seal_master_kek_to_tpm`, which binds the wider PCR set.
 pub const SEALED_MASTER_KEK: &str = "master-kek";
 pub const SEALED_FROST_SHARES: &str = "frost-shares";
 

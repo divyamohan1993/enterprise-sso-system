@@ -5,6 +5,124 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-06-10
+
+Post-audit hardening, Wave 1. A 10-domain code audit (root + bit-clone + APT +
+quantum threat model) found that strong security mechanisms existed in-tree but
+the live paths bypassed them. Wave 1 wires them in and closes 5 CRITICAL + several
+HIGH findings. Every change is fail-closed and was verified by building + testing
+on a Linux host (`RUST_MIN_STACK=8388608` for the PQ suites).
+
+### Security
+
+- **crypto (PQC core)** — closes "no real PQ KATs" (CRITICAL) and the non-standard
+  X-Wing combiner (HIGH):
+  - X-Wing combiner rebuilt to the IETF construction
+    `SHA3-256(ss_M || ss_X || ct_X || pk_X || "MILNET-XWING-v2")`, restoring the
+    MAL-BIND-K-CT / MAL-BIND-K-PK binding the previous HKDF-of-secrets combiner
+    dropped. ML-KEM-1024 retained for CNSA 2.0 Level 5 ("X-Wing-1024" variant);
+    32-byte IETF secret expanded to MILNET's 64-byte `SharedSecret` via one
+    domain-separated SHA3-512 (downstream unchanged). Follows
+    draft-connolly-cfrg-xwing-kem §5.3.
+  - Real fixed-input → fixed-output Known-Answer Tests for ML-KEM-1024 (FIPS 203,
+    NIST ACVP vectors) and ML-DSA-87 (FIPS 204, IETF LAMPS vector), wired into
+    `run_startup_kats()` so a wrong/backdoored primitive output fails closed.
+    (Previous "KATs" were roundtrip self-tests a buggy impl could pass.)
+  - Fail-closed algorithm selection under `MILNET_MILITARY_DEPLOYMENT=1`: KEM
+    locked to hybrid X-Wing-1024 (ignores `MILNET_PQ_KEM_ONLY` downgrade) and
+    signatures locked to ML-DSA-87 — a compromised node cannot strip the hedge.
+- **common/sealed_keys + platform_integrity (master KEK)** — closes the
+  env-sourced master KEK / dead vTPM-sealing CRITICAL:
+  - In military mode the master KEK / per-node KEK share is now recovered ONLY by
+    unsealing a TPM blob bound to measured-boot PCRs (sha256:0,2,4,7) via the
+    now-wired `tpm_seal/tpm_unseal`, never from `MILNET_MASTER_KEK`/`MILNET_KEK_SHARE`
+    env. `cached_master_kek` delegates so all ~25 direct callers route through the
+    vTPM. Fail-closed `exit(199)` on env-KEK present (clone indicator) / no TPM /
+    missing blob / unseal failure / PCR mismatch. New `seal_master_kek_to_tpm`
+    ceremony helper + `common/examples/seal_kek_ceremony.rs`. Residual (tracked):
+    a same-host root still satisfies the live PCR policy — deeper fix is SEV-SNP/TDX
+    attestation-bound key release.
+- **opaque (clone resistance)** — closes weak-Argon2 (CRITICAL), RAM-clone OPRF-seed
+  recovery (HIGH), and restart-lockout DoS (HIGH):
+  - Production OPAQUE KSF raised to Argon2id v19, 64 MiB / t=3 / p=4 (was the
+    library-default 19 MiB / t=2). The OPRF `ServerSetup` seed is now sealed
+    (AES-256-GCM under a master-KEK HKDF subkey), persisted, and only transiently
+    unsealed per request — no long-lived plaintext seed in RAM; fail-closed on
+    tamper (never regenerates, which would lock out all users).
+- **common/cac_auth (CAC/PIV)** — closes the authentication-bypass + OCSP-stub
+  CRITICALs:
+  - `authenticate()` now performs real RFC 5280 §6.1 path validation (chain to a
+    trusted DoD anchor with issuer-signature verification, validity window,
+    id-kp-clientAuth EKU, BasicConstraints, name chaining, required policy OIDs)
+    BEFORE trusting the cert; clearance is read only from the validated cert. A
+    self-signed cert can no longer self-assert TOP SECRET. `verify_ocsp_signature`
+    replaced (was: accept any DER SEQUENCE) with real RFC 6960 BasicOCSPResponse
+    signature verification; revoked ⇒ reject, undetermined ⇒ reject in military
+    mode. X.509 parsing via `x509-cert`, all signature verification via the FIPS
+    `aws-lc-rs` backend (RSA-PKCS1 SHA-256/384/512 + ECDSA P-256/P-384); the
+    Marvin-vulnerable `rsa` crate is not used.
+
+### Changed
+
+- **Dockerfile**: set `RUST_MIN_STACK=8388608` in the runtime image — PQ
+  operations (ML-KEM-1024 / ML-DSA-87 / X-Wing) can overflow the default 2 MiB
+  tokio worker / `spawn_blocking` stack; this matches the CI floor and prevents a
+  PQ op aborting a service thread in production.
+
+### Security — Wave 2A (distribution / no single point of failure)
+
+Wave 2 wires the secure distributed mechanisms so a compromised or cloned single
+node cannot subvert the cluster. Closes 2 CRITICAL + HIGH/MED consensus & session
+findings. Verified at code + real-swtpm level (1751/1751 common tests single-threaded;
+production wiring into the service mains is tracked as a follow-up integration).
+
+- **common/distributed_startup + cluster + raft (per-node Raft identity)** — closes
+  the cluster-wide shared-HMAC CRITICAL (one node could forge consensus as ANY
+  NodeId → fake quorum):
+  - Every Raft message is now signed with the sender's per-node ML-DSA-87 key over
+    the full message and verified against the sender's PINNED verifying key; a
+    compromised node can forge only AS ITSELF. Fail-closed: unpinned sender / bad
+    signature ⇒ drop + SIEM critical.
+  - The per-node signing key is INDEPENDENT (fresh CSPRNG, NOT KEK-derived) and
+    TPM-SEALED to each node's measured-boot PCRs (0,2,4,7) via the wired
+    `Tpm2ToolsKekSealer` — UNSEAL-ONLY at runtime; key generation is an operator
+    ceremony (`sealed_keys::seal_node_identity_to_tpm`). Root on node A unseals only
+    A's key (forges only as A; a quorum forgery needs root on ≥quorum DISTINCT TPMs),
+    and a clone on different hardware cannot unseal it. Proven on swtpm: seal/unseal
+    succeed on the genuine boot chain, and after `tpm2_pcrextend` the loader fails
+    closed (exit 199). KEK-derived identity remains a NON-military / dev fallback only.
+  - Entry-signature hardening (HIGH): security-critical Raft entries verify against
+    the COMMAND SUBJECT's key (not just the leader's), and military mode REJECTS
+    unsigned / unknown-signer entries in both `handle_append_entries` and
+    `handle_install_snapshot` (closing the silent-accept hole).
+  - Attestation, Raft transport, and revocation share ONE `NodeId`-keyed identity +
+    pinned-VK registry: `PeerAttestation` publishes the node's TPM-sealed verifying
+    key COVERED by the attestation signature (no in-transit swap), and a shared
+    `cluster::canonical_node_id` (UUID / 0x-hex / deterministic `Uuid::new_v5`
+    fallback) makes the attestation NodeId == the transport NodeId for any
+    `MILNET_NODE_ID`.
+- **common/distributed_session + persistent_session + gossip (cross-node revocation)**
+  — closes the "session revocation fails open / does not propagate" CRITICAL (F3) and
+  HIGH (F9 any-node-mints, F7 unverified gossip):
+  - Revocation is a per-user WATERMARK: the read path denies any session created
+    at/before the user's revocation watermark, honored cluster-wide even where the
+    session was never locally cached. `RevocationCoordinator` signs + broadcasts a
+    `SessionInvalidationEvent`; the receive side verifies and applies the watermark.
+  - Fail-CLOSED under partition for high-tier sessions (Tier 1/2 denied when a node
+    cannot confirm non-revocation) instead of failing open until TTL.
+  - Invalidation events are signed with the per-node ML-DSA key (origin attribution;
+    a non-originating node cannot mint events for another) and domain-separated
+    (`MILNET-SESSION-REVOKE-v1`) from the Raft transport signature to prevent
+    cross-protocol signature confusion. The legacy shared-HMAC processor is
+    deprecated. Gossip `handle_message` now verifies signatures before applying
+    membership/piggyback updates (F7).
+
+### Build — Wave 2A
+
+- Root `Cargo.toml`: enable the `uuid` `v5` feature (deterministic node-id fallback
+  for non-UUID `MILNET_NODE_ID` deploy values; aligns runtime with the documented
+  k8s `UUIDv5(pod-name)` scheme).
+
 ## [Unreleased] - 2026-05-16
 
 ### Added

@@ -19,10 +19,13 @@ use ml_dsa::{
     signature::{Signer, Verifier},
     EncodedVerifyingKey, KeyGen, MlDsa87, VerifyingKey,
 };
+use crate::raft::NodeId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
+use uuid::Uuid;
 
 /// Serde helper for `[u8; 64]` fields.
 mod byte_array_64 {
@@ -96,8 +99,10 @@ pub enum StartupError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PeerAttestation {
-    /// Unique identifier of the attesting node.
-    pub node_id: String,
+    /// The attesting node's canonical cluster [`NodeId`] (UUID). Equals the Raft
+    /// transport key and the revocation event's `node_id`, so the published
+    /// `raft_verifying_key` is pinned under the right id.
+    pub node_id: NodeId,
     /// SHA-512 hash of the peer's running binary.
     #[serde(with = "byte_array_64")]
     pub binary_hash: [u8; 64],
@@ -105,10 +110,27 @@ pub struct PeerAttestation {
     pub boot_id: String,
     /// Unix timestamp (seconds) when the attestation was created.
     pub timestamp: i64,
-    /// ML-DSA-87 signature over (node_id || binary_hash || boot_id || timestamp).
+    /// ML-DSA-87 signature over
+    /// (node_id || binary_hash || boot_id || timestamp || raft_verifying_key).
     pub signature: Vec<u8>,
-    /// Peer's ML-DSA-87 verifying (public) key.
+    /// The ML-DSA-87 verifying key that verifies THIS attestation's `signature`
+    /// (the attestation key).
     pub verifying_key: Vec<u8>,
+    /// The node's PER-NODE Raft identity verifying key (its [`NodeIdentity`] VK).
+    /// This is the key peers PIN to authenticate the node's Raft/consensus and
+    /// revocation messages. It is COVERED by `signature`, so it cannot be swapped
+    /// in transit. Distributing it here is how the cluster shares per-node VKs
+    /// without a separate protocol; under TPM-sealed identities it is the only
+    /// way a peer can learn another node's VK (it is not locally derivable).
+    #[serde(default)]
+    pub raft_verifying_key: Vec<u8>,
+}
+
+impl PeerAttestation {
+    /// This attestation's canonical cluster [`NodeId`].
+    pub fn cluster_node_id(&self) -> NodeId {
+        self.node_id
+    }
 }
 
 /// Result of a successful distributed startup verification.
@@ -124,6 +146,31 @@ pub struct StartupVerification {
     pub state_chain_synced: bool,
 }
 
+impl StartupVerification {
+    /// The per-node Raft identity VKs to PIN at cluster join, one per verified
+    /// peer: `(NodeId, raft_verifying_key)`.
+    ///
+    /// This is THE join-time bridge: feed each pair to
+    /// `ClusterNode::pin_peer_verifying_key` (and the revocation registry) so the
+    /// transport authenticates peers against their PUBLISHED, attestation-signed
+    /// VKs. Peers whose attestation carries no Raft VK (legacy) or whose node_id
+    /// is not a canonical cluster NodeId are skipped — fail-closed: an unpinned
+    /// peer's messages are dropped rather than trusted.
+    pub fn peer_identities_to_pin(&self) -> Vec<(NodeId, Vec<u8>)> {
+        self.verified_peers
+            .iter()
+            .filter_map(|att| {
+                if att.raft_verifying_key.is_empty() {
+                    // Legacy peer with no published Raft VK → skip (fail-closed:
+                    // an unpinned peer's messages are dropped, not trusted).
+                    return None;
+                }
+                Some((att.node_id, att.raft_verifying_key.clone()))
+            })
+            .collect()
+    }
+}
+
 /// Distributed startup verifier.
 ///
 /// Constructed from configuration, then `verify_cluster()` is called once
@@ -137,30 +184,45 @@ pub struct DistributedStartupVerifier {
     attestation_max_age: Duration,
     /// Resolved peer endpoints (host:port).
     peer_endpoints: Vec<String>,
-    /// This node's ML-DSA-87 signing seed (32 bytes).
+    /// This node's ML-DSA-87 attestation signing seed (32 bytes). Signs the
+    /// attestation itself; distinct from the per-node Raft identity key.
     signing_seed: [u8; 32],
-    /// This node's unique identifier.
-    node_id: String,
+    /// This node's canonical cluster [`NodeId`].
+    node_id: NodeId,
     /// Whether rolling update mode is active (allows binary hash mismatch).
     rolling_update: bool,
+    /// This node's PER-NODE Raft identity verifying key (its [`NodeIdentity`] VK),
+    /// published in this node's attestation so peers can PIN it. Empty only in
+    /// legacy/test constructions that don't supply one.
+    raft_verifying_key: Vec<u8>,
 }
 
 // ── Attestation payload construction ────────────────────────────────────────
 
 /// Build the canonical byte payload that is signed/verified for an attestation.
 ///
-/// Format: node_id_bytes || binary_hash(64) || boot_id_bytes || timestamp_be(8)
+/// Format: node_id(16) || binary_hash(64) || boot_id_bytes || timestamp_be(8)
+///         || raft_vk_len_be(4) || raft_verifying_key
+///
+/// `node_id` is the canonical [`NodeId`]'s 16 UUID bytes (fixed-width, so the
+/// boundary with `boot_id` is unambiguous). The per-node Raft verifying key is
+/// length-prefixed and included so it is authenticated by the attestation
+/// signature (a MITM cannot substitute a different VK).
 fn attestation_payload(
-    node_id: &str,
+    node_id: NodeId,
     binary_hash: &[u8; 64],
     boot_id: &str,
     timestamp: i64,
+    raft_verifying_key: &[u8],
 ) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(node_id.len() + 64 + boot_id.len() + 8);
-    payload.extend_from_slice(node_id.as_bytes());
+    let mut payload =
+        Vec::with_capacity(16 + 64 + boot_id.len() + 8 + 4 + raft_verifying_key.len());
+    payload.extend_from_slice(node_id.0.as_bytes());
     payload.extend_from_slice(binary_hash);
     payload.extend_from_slice(boot_id.as_bytes());
     payload.extend_from_slice(&timestamp.to_be_bytes());
+    payload.extend_from_slice(&(raft_verifying_key.len() as u32).to_be_bytes());
+    payload.extend_from_slice(raft_verifying_key);
     payload
 }
 
@@ -194,6 +256,244 @@ fn pq_verify(vk_bytes: &[u8], data: &[u8], sig_bytes: &[u8]) -> bool {
     vk.verify(data, &sig).is_ok()
 }
 
+// ── Per-node ML-DSA-87 identity (shared cluster-wide) ───────────────────────
+
+/// Domain separator for per-node identity seed derivation. Distinct from the
+/// attestation-seed domain (`MILNET-ATTESTATION-SEED-v1`) so the identity key
+/// and the legacy attestation key never collide even for the same node.
+const NODE_IDENTITY_DOMAIN: &[u8] = b"MILNET-NODE-IDENTITY-ML-DSA-87-v1";
+
+/// Derive a per-node ML-DSA-87 seed from the cluster master KEK and the node's
+/// identity. This is the FALLBACK derivation used outside military mode (and the
+/// documented residual in military mode until per-node TPM-sealed seeds are
+/// wired — see [`NodeIdentity::for_node`]).
+///
+/// SECURITY (closes the MEDIUM "identity is not per-node" finding):
+/// the legacy attestation seed was `SHA-512(KEK || "ATTESTATION-SEED")` with NO
+/// per-node input, so EVERY node derived the SAME keypair and a clone was
+/// cryptographically indistinguishable from the original. Here the `node_id`
+/// bytes are folded into the KDF, so two distinct NodeIds derive DISTINCT
+/// keypairs while the root of trust stays the (vTPM-sealed, anti-clone) master
+/// KEK.
+///
+/// Derivation: `SHA-512(master_kek || NODE_IDENTITY_DOMAIN || node_id_bytes)[..32]`.
+/// SHA-512 over a fixed-length-prefixed, domain-separated input is a sound KDF
+/// here because the master KEK is already a uniformly random 256-bit secret
+/// (NIST SP 800-108 / SP 800-56C extract-then-expand reduces to a single PRF
+/// call when the input keying material is already a full-entropy key).
+///
+/// RESIDUAL: because this derives from the SHARED master KEK, a root attacker
+/// who exfiltrates the cached KEK can re-derive any node's seed. True anti-root
+/// requires an INDEPENDENT per-node seed sealed to each node's TPM; feed it via
+/// [`NodeIdentity::from_sealed_seed`].
+fn derive_node_identity_seed(master_kek: &[u8; 32], node_id: &Uuid) -> [u8; 32] {
+    let mut hasher = Sha512::new();
+    hasher.update(master_kek);
+    hasher.update(NODE_IDENTITY_DOMAIN);
+    hasher.update(node_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&digest[..32]);
+    seed
+}
+
+/// A genuine per-node post-quantum (ML-DSA-87) signing identity, keyed on the
+/// cluster's [`NodeId`].
+///
+/// This is the ONE per-node identity for the whole node: the Raft control plane
+/// (consensus message authentication) and the session/revocation propagation
+/// layer both consume it so a node has a single keypair, not several. The
+/// verifying key returned by [`NodeIdentity::verifying_key`] is what every peer
+/// pins (in a [`NodeIdentityRegistry`]) at cluster join; thereafter a message is
+/// authentic only if it verifies against the pinned key for the *claimed*
+/// sender, so a compromised node can forge messages AS ITSELF but never as
+/// another NodeId.
+///
+/// The seed is held in-process and zeroized on drop (matching the
+/// [`ExternalWitnessCosigner`](crate::external_witness) convention). It is never
+/// serialized, logged, or written to disk.
+pub struct NodeIdentity {
+    /// This node's raw identity UUID (the cluster [`NodeId`]'s inner value). The
+    /// constructors take a `Uuid` (matching call sites that pass `node_id.0` and
+    /// revoke-propagation's `for_node(uuid)`); [`Self::node_id`] surfaces it as a
+    /// typed [`NodeId`] for cluster attribution.
+    node_id: Uuid,
+    /// 32-byte ML-DSA-87 seed. Zeroized on drop.
+    seed: [u8; 32],
+}
+
+impl NodeIdentity {
+    /// Acquire THIS node's identity for `node_id` (the cluster [`NodeId`]'s inner
+    /// `Uuid`).
+    ///
+    /// MILITARY mode (`MILNET_MILITARY_DEPLOYMENT=1`) — TRUE anti-root + anti-clone:
+    /// this node uses an INDEPENDENT ML-DSA-87 signing seed that is generated
+    /// fresh on first boot and TPM-SEALED to this node's measured-boot PCRs
+    /// (0,2,4,7) via [`crate::sealed_keys::Tpm2ToolsKekSealer`]; on restart it is
+    /// unsealed. The seed is NOT derived from the master KEK, so root on node A
+    /// can unseal only A's seed and forge only AS A — never as B/C. A quorum
+    /// forgery would need root on >= quorum DISTINCT nodes (each seed sealed to a
+    /// distinct TPM). A clone on different hardware cannot unseal it at all
+    /// (PCR-bound). FAIL-CLOSED: no vTPM, a missing/!=32-byte sealed blob, or a
+    /// seal/unseal error all REFUSE (process exits 199). A plaintext or
+    /// KEK-derived seed is NEVER used in military mode — that would re-introduce
+    /// the shared single point (root on any node reads the unsealed KEK from RAM
+    /// and derives every node's seed), which is exactly the CRITICAL this closes.
+    ///
+    /// NON-MILITARY (dev/test, no TPM): the master-KEK-bound derivation
+    /// ([`derive_node_identity_seed`]) is the fallback. It is anti-clone (the KEK
+    /// is itself TPM-sealed in production) but NOT anti-root, and is acceptable
+    /// only outside military mode.
+    ///
+    /// Two different `node_id`s always yield distinct keypairs under both paths.
+    pub fn for_node(node_id: Uuid) -> Self {
+        if is_military_deployment() {
+            // Anti-root: unseal this node's INDEPENDENT, TPM-sealed identity seed
+            // (sealed_keys owns the loader). Unseal-ONLY and fail-closed: it
+            // refuses (process exits 199) if the per-node blob is absent / TPM is
+            // unavailable / unseal fails. A KEK-derived seed is NEVER used here.
+            let seed = crate::sealed_keys::load_node_identity_seed_sealed(&node_id.to_string());
+            Self { node_id, seed }
+        } else {
+            // DEV/non-military fallback ONLY: KEK-bound derivation (no TPM here).
+            let kek = crate::sealed_keys::get_master_kek();
+            let seed = derive_node_identity_seed(kek, &node_id);
+            Self { node_id, seed }
+        }
+    }
+
+    /// Construct an identity from a per-node seed unsealed from THIS node's TPM
+    /// (the anti-root path), for callers that perform their own unseal. The input
+    /// `seed` should be zeroized by the caller after this call; we take ownership
+    /// and zeroize our copy on drop.
+    pub fn from_sealed_seed(node_id: Uuid, seed: [u8; 32]) -> Self {
+        Self { node_id, seed }
+    }
+
+    /// Construct an identity from an explicit 32-byte seed.
+    ///
+    /// Intended for TESTS and for callers that have already performed their own
+    /// derivation. Production military code should use [`Self::for_node`] (KEK
+    /// path) or [`Self::from_sealed_seed`] (per-node TPM path).
+    pub fn from_seed(node_id: Uuid, seed: [u8; 32]) -> Self {
+        Self { node_id, seed }
+    }
+
+    /// This node's UUID (the raw identity input).
+    pub fn uuid(&self) -> Uuid {
+        self.node_id
+    }
+
+    /// This node's cluster [`NodeId`]. Surfaces the inner [`Uuid`] as the typed
+    /// cluster id used by the [`NodeIdentityRegistry`] and revocation events.
+    pub fn node_id(&self) -> NodeId {
+        NodeId(self.node_id)
+    }
+
+    /// This node's raw ML-DSA-87 verifying-key bytes. Peers PIN this value (in a
+    /// [`NodeIdentityRegistry`]) at cluster join and use it to authenticate every
+    /// message claimed to be from this node.
+    pub fn verifying_key(&self) -> Vec<u8> {
+        pq_verifying_key(&self.seed)
+    }
+
+    /// Sign `msg` AS THIS NODE with ML-DSA-87. Returns the encoded signature.
+    ///
+    /// PERFORMANCE: ML-DSA-87 signing is far heavier than an HMAC (lattice
+    /// arithmetic, ~4.6 KB signatures). Callers on a hot path (e.g. Raft
+    /// heartbeats) accept this cost deliberately: it is the only way to bind a
+    /// message to a single node's identity so one compromised node cannot forge
+    /// as the quorum. Security over throughput is the audit-mandated tradeoff.
+    pub fn node_sign(&self, msg: &[u8]) -> Vec<u8> {
+        pq_sign(&self.seed, msg)
+    }
+}
+
+impl Drop for NodeIdentity {
+    fn drop(&mut self) {
+        // Zeroize the seed on drop (same pattern as ExternalWitnessCosigner).
+        self.seed.iter_mut().for_each(|b| *b = 0);
+    }
+}
+
+impl std::fmt::Debug for NodeIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never expose the seed via Debug.
+        f.debug_struct("NodeIdentity")
+            .field("node_id", &self.node_id)
+            .field("seed", &"<redacted>")
+            .finish()
+    }
+}
+
+/// The cluster-wide `NodeId -> verifying-key` registry, pinned at join.
+///
+/// This is THE single shared per-node identity registry: the Raft transport, the
+/// entry-signature path, and the session/revocation layer all key off the SAME
+/// [`NodeId`] type and the SAME pinned verifying keys, so a node has exactly one
+/// pinned identity across every subsystem.
+///
+/// [`NodeIdentityRegistry::verify`] is FAIL-CLOSED: an unknown/unpinned NodeId
+/// returns `false`, never a silent accept.
+#[derive(Debug, Clone, Default)]
+pub struct NodeIdentityRegistry {
+    keys: HashMap<NodeId, Vec<u8>>,
+}
+
+impl NodeIdentityRegistry {
+    /// An empty registry.
+    pub fn new() -> Self {
+        Self { keys: HashMap::new() }
+    }
+
+    /// Pin `node_id`'s ML-DSA-87 verifying key (call once at cluster join).
+    pub fn pin(&mut self, node_id: NodeId, verifying_key: Vec<u8>) {
+        self.keys.insert(node_id, verifying_key);
+    }
+
+    /// The pinned verifying key for `node_id`, if any.
+    pub fn verifying_key(&self, node_id: &NodeId) -> Option<&[u8]> {
+        self.keys.get(node_id).map(|v| v.as_slice())
+    }
+
+    /// Is `node_id` pinned in this registry?
+    pub fn contains(&self, node_id: &NodeId) -> bool {
+        self.keys.contains_key(node_id)
+    }
+
+    /// Number of pinned nodes.
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// Whether the registry has no pinned nodes.
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// Verify that `sig` over `msg` was produced by `node_id`'s pinned identity.
+    ///
+    /// FAIL-CLOSED: if `node_id` is not pinned (unknown sender), returns `false`.
+    /// This is the ONE verification entry point shared by the Raft transport and
+    /// the revocation layer.
+    pub fn verify(&self, node_id: NodeId, msg: &[u8], sig: &[u8]) -> bool {
+        match self.keys.get(&node_id) {
+            Some(vk) => pq_verify(vk, msg, sig),
+            None => false,
+        }
+    }
+}
+
+/// Statelessly verify a signature against an explicit `verifying_key`.
+///
+/// Lower-level companion to [`NodeIdentityRegistry::verify`]: use this when you
+/// have already looked up the *claimed* signer's pinned key. FAIL-CLOSED — if the
+/// signer is unknown/unpinned the caller has no key to pass and MUST reject; if
+/// the bytes don't verify this returns `false`.
+pub fn verify_node_sig(verifying_key: &[u8], msg: &[u8], sig: &[u8]) -> bool {
+    pq_verify(verifying_key, msg, sig)
+}
+
 // ── Implementation ──────────────────────────────────────────────────────────
 
 impl DistributedStartupVerifier {
@@ -222,11 +522,39 @@ impl DistributedStartupVerifier {
             return Err(StartupError::NoPeersConfigured);
         }
 
-        let node_id = std::env::var("MILNET_NODE_ID")
-            .unwrap_or_else(|_| format!("node-{}", &generate_node_suffix()));
+        // Resolve this node's CANONICAL cluster NodeId from MILNET_NODE_ID using
+        // the SHARED `cluster::canonical_node_id` (UUID / hex / UUIDv5 fallback),
+        // the SAME function the Raft transport uses. This guarantees the
+        // attestation identity == the transport NodeId == the revocation NodeId,
+        // so a peer pins the right per-node verifying key even when the deploy
+        // uses a non-UUID MILNET_NODE_ID (e.g. `orchestrator-0`).
+        let cluster_node_id: NodeId = match std::env::var("MILNET_NODE_ID") {
+            Ok(val) => crate::cluster::canonical_node_id(&val),
+            Err(_) => NodeId(Uuid::new_v4()),
+        };
 
+        let military = is_military_deployment();
         let seed_hex = std::env::var("MILNET_ATTESTATION_SEED").unwrap_or_default();
-        let signing_seed = if seed_hex.len() == 64 {
+
+        // SECURITY: In military mode a plaintext attestation seed in the
+        // environment is FORBIDDEN — a cloned image carrying a baked-in seed
+        // would impersonate a legitimate node. This mirrors the master-KEK
+        // anti-clone rule in `sealed_keys::acquire_military_kek`: key material
+        // must derive from the vTPM-sealed KEK, never from the deploy env.
+        if military && !seed_hex.is_empty() {
+            emit_siem_event(
+                "attestation_seed_env_rejected",
+                Severity::Critical,
+                "failure",
+                "MILNET_ATTESTATION_SEED present in military deployment — \
+                 plaintext seed material is forbidden (anti-clone). Remove the \
+                 env var; the attestation key derives from the vTPM-sealed KEK.",
+            );
+            return Err(StartupError::StandaloneOperationDenied);
+        }
+
+        let signing_seed = if !military && seed_hex.len() == 64 {
+            // Non-military convenience path: explicit 32-byte seed (hex).
             let mut seed = [0u8; 32];
             if let Ok(bytes) = hex::decode(&seed_hex) {
                 if bytes.len() == 32 {
@@ -236,22 +564,35 @@ impl DistributedStartupVerifier {
             seed
         } else {
             // Derive from threshold-reconstructed master KEK (not raw env var).
-            // get_master_kek() enforces 3-of-5 Shamir reconstruction in production.
-            {
-                let kek_bytes = crate::sealed_keys::get_master_kek();
-                let mut seed = [0u8; 32];
-                // Use HKDF-like derivation: SHA-512(KEK || "MILNET-ATTESTATION-SEED")
-                let mut hasher = Sha512::new();
-                hasher.update(kek_bytes);
-                hasher.update(b"MILNET-ATTESTATION-SEED-v1");
-                let result = hasher.finalize();
-                seed.copy_from_slice(&result[..32]);
-                seed
-            }
+            // get_master_kek() enforces 3-of-5 Shamir reconstruction in production
+            // and, in military mode, vTPM unseal (anti-clone).
+            //
+            // SECURITY: the `node_id` is folded into the KDF so two distinct
+            // nodes derive DISTINCT attestation keypairs (closes the per-node
+            // identity finding). Previously the derivation omitted node_id, so
+            // every node produced the SAME attestation key and a clone was
+            // indistinguishable from the original.
+            let kek_bytes = crate::sealed_keys::get_master_kek();
+            let mut seed = [0u8; 32];
+            // SHA-512(KEK || "MILNET-ATTESTATION-SEED-v2" || node_id_bytes)[..32]
+            // node_id_bytes is the canonical NodeId's 16 UUID bytes.
+            let mut hasher = Sha512::new();
+            hasher.update(kek_bytes);
+            hasher.update(b"MILNET-ATTESTATION-SEED-v2");
+            hasher.update(cluster_node_id.0.as_bytes());
+            let result = hasher.finalize();
+            seed.copy_from_slice(&result[..32]);
+            seed
         };
 
         let rolling_update =
             std::env::var("MILNET_ROLLING_UPDATE").unwrap_or_default() == "1";
+
+        // Publish this node's PER-NODE Raft identity VK in its attestation so
+        // peers pin it (TPM-sealed identity in military mode; KEK-derived in dev).
+        // This is the SAME NodeIdentity the Raft transport and revocation layer
+        // sign with — one identity, distributed once at join.
+        let raft_verifying_key = NodeIdentity::for_node(cluster_node_id.0).verifying_key();
 
         Ok(Self {
             min_peers: 2,
@@ -259,12 +600,16 @@ impl DistributedStartupVerifier {
             attestation_max_age: Duration::from_secs(60),
             peer_endpoints,
             signing_seed,
-            node_id,
+            node_id: cluster_node_id,
             rolling_update,
+            raft_verifying_key,
         })
     }
 
     /// Create a verifier with explicit configuration (for testing).
+    ///
+    /// The published per-node Raft VK is empty here; use
+    /// [`Self::with_raft_verifying_key`] or [`Self::from_node_identity`] to set it.
     pub fn with_config(
         min_peers: usize,
         attestation_timeout: Duration,
@@ -279,10 +624,38 @@ impl DistributedStartupVerifier {
             attestation_timeout,
             attestation_max_age,
             peer_endpoints,
-            signing_seed,
-            node_id,
+            // Canonicalize the test/string id to the cluster NodeId (same fn the
+            // transport uses), so attestation ids stay UUID-typed.
+            node_id: crate::cluster::canonical_node_id(&node_id),
             rolling_update,
+            raft_verifying_key: Vec::new(),
         }
+    }
+
+    /// Set the per-node Raft identity verifying key this node publishes in its
+    /// attestation (builder style). Used by tests and by callers that hold the
+    /// node's [`NodeIdentity`] VK directly.
+    pub fn with_raft_verifying_key(mut self, raft_verifying_key: Vec<u8>) -> Self {
+        self.raft_verifying_key = raft_verifying_key;
+        self
+    }
+
+    /// Seam: derive the published per-node Raft VK from a [`NodeIdentity`].
+    ///
+    /// The verifier will publish `identity.verifying_key()` in its attestation so
+    /// peers pin EXACTLY the key this node signs Raft/consensus and revocation
+    /// messages with — one shared per-node identity, distributed once at join.
+    /// Revocation propagation consumes the same identity (coordinate via this
+    /// seam, do not derive a second VK).
+    pub fn from_node_identity(mut self, identity: &NodeIdentity) -> Self {
+        self.raft_verifying_key = identity.verifying_key();
+        self
+    }
+
+    /// This node's published per-node Raft identity verifying key (empty if not
+    /// set). Peers pin this value.
+    pub fn raft_verifying_key(&self) -> &[u8] {
+        &self.raft_verifying_key
     }
 
     // ── Main entry point ────────────────────────────────────────────────────
@@ -406,17 +779,24 @@ impl DistributedStartupVerifier {
             .unwrap_or_default()
             .as_secs() as i64;
 
-        let payload = attestation_payload(&self.node_id, &binary_hash, &boot_id, timestamp);
+        let payload = attestation_payload(
+            self.node_id,
+            &binary_hash,
+            &boot_id,
+            timestamp,
+            &self.raft_verifying_key,
+        );
         let signature = pq_sign(&self.signing_seed, &payload);
         let verifying_key = pq_verifying_key(&self.signing_seed);
 
         PeerAttestation {
-            node_id: self.node_id.clone(),
+            node_id: self.node_id,
             binary_hash,
             boot_id,
             timestamp,
             signature,
             verifying_key,
+            raft_verifying_key: self.raft_verifying_key.clone(),
         }
     }
 
@@ -470,18 +850,21 @@ impl DistributedStartupVerifier {
                 ),
             );
             return Err(StartupError::AttestationExpired {
-                node_id: att.node_id.clone(),
+                node_id: att.node_id.to_string(),
                 age_secs: age,
                 max_secs: self.attestation_max_age.as_secs(),
             });
         }
 
-        // Verify ML-DSA-87 signature
+        // Verify ML-DSA-87 signature. The payload includes the published
+        // per-node Raft VK, so a tampered/substituted `raft_verifying_key` makes
+        // the signature fail here — peers only ever pin an AUTHENTICATED VK.
         let payload = attestation_payload(
-            &att.node_id,
+            att.node_id,
             &att.binary_hash,
             &att.boot_id,
             att.timestamp,
+            &att.raft_verifying_key,
         );
 
         if !pq_verify(&att.verifying_key, &payload, &att.signature) {
@@ -495,7 +878,7 @@ impl DistributedStartupVerifier {
                 ),
             );
             return Err(StartupError::InvalidSignature {
-                node_id: att.node_id.clone(),
+                node_id: att.node_id.to_string(),
             });
         }
 
@@ -553,7 +936,7 @@ impl DistributedStartupVerifier {
                 ),
             );
             return Err(StartupError::BinaryHashMismatch {
-                node_id: att.node_id.clone(),
+                node_id: att.node_id.to_string(),
             });
         }
 
@@ -663,9 +1046,9 @@ impl DistributedStartupVerifier {
         })
     }
 
-    /// Get the node ID.
-    pub fn node_id(&self) -> &str {
-        &self.node_id
+    /// Get this node's canonical cluster [`NodeId`].
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
     }
 
     /// Get the signing seed (for test introspection only via public method).
@@ -676,19 +1059,18 @@ impl DistributedStartupVerifier {
 
 // ── Utility functions ───────────────────────────────────────────────────────
 
+/// Returns `true` if this process runs in military deployment mode
+/// (`MILNET_MILITARY_DEPLOYMENT=1`).
+fn is_military_deployment() -> bool {
+    std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1")
+}
+
 /// Read the kernel boot_id for audit correlation.
 fn read_boot_id() -> String {
     std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .unwrap_or_else(|_| "unknown-boot-id".to_string())
         .trim()
         .to_string()
-}
-
-/// Generate a short random suffix for node IDs.
-fn generate_node_suffix() -> String {
-    let mut buf = [0u8; 8];
-    getrandom::getrandom(&mut buf).unwrap_or_default();
-    hex::encode(&buf[..4])
 }
 
 /// Emit a SIEM event in the DISTRIBUTED_STARTUP category.
@@ -723,17 +1105,32 @@ pub fn create_test_attestation(
     boot_id: &str,
     timestamp: i64,
 ) -> PeerAttestation {
-    let payload = attestation_payload(node_id, binary_hash, boot_id, timestamp);
+    create_test_attestation_with_raft_vk(node_id, signing_seed, binary_hash, boot_id, timestamp, &[])
+}
+
+/// Like [`create_test_attestation`] but also sets (and signs over) the published
+/// per-node Raft verifying key.
+pub fn create_test_attestation_with_raft_vk(
+    node_id: &str,
+    signing_seed: &[u8; 32],
+    binary_hash: &BinaryHash,
+    boot_id: &str,
+    timestamp: i64,
+    raft_verifying_key: &[u8],
+) -> PeerAttestation {
+    let nid = crate::cluster::canonical_node_id(node_id);
+    let payload = attestation_payload(nid, binary_hash, boot_id, timestamp, raft_verifying_key);
     let signature = pq_sign(signing_seed, &payload);
     let verifying_key = pq_verifying_key(signing_seed);
 
     PeerAttestation {
-        node_id: node_id.to_string(),
+        node_id: nid,
         binary_hash: *binary_hash,
         boot_id: boot_id.to_string(),
         timestamp,
         signature,
         verifying_key,
+        raft_verifying_key: raft_verifying_key.to_vec(),
     }
 }
 
@@ -894,7 +1291,7 @@ mod tests {
                 age_secs,
                 max_secs,
             } => {
-                assert_eq!(node_id, "peer-2");
+                assert_eq!(node_id, crate::cluster::canonical_node_id("peer-2").to_string());
                 assert!(age_secs >= 200);
                 assert_eq!(max_secs, 60);
             }
@@ -923,7 +1320,7 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             StartupError::InvalidSignature { node_id } => {
-                assert_eq!(node_id, "peer-2");
+                assert_eq!(node_id, crate::cluster::canonical_node_id("peer-2").to_string());
             }
             other => panic!("expected InvalidSignature, got: {other}"),
         }
@@ -950,7 +1347,7 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             StartupError::BinaryHashMismatch { node_id } => {
-                assert_eq!(node_id, "peer-2");
+                assert_eq!(node_id, crate::cluster::canonical_node_id("peer-2").to_string());
             }
             other => panic!("expected BinaryHashMismatch, got: {other}"),
         }
@@ -1142,10 +1539,11 @@ mod tests {
 
         // The attestation should be verifiable
         let payload = attestation_payload(
-            &att.node_id,
+            att.node_id,
             &att.binary_hash,
             &att.boot_id,
             att.timestamp,
+            &att.raft_verifying_key,
         );
         assert!(pq_verify(&att.verifying_key, &payload, &att.signature));
     }
@@ -1174,7 +1572,7 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             StartupError::InvalidSignature { node_id } => {
-                assert_eq!(node_id, "peer-x");
+                assert_eq!(node_id, crate::cluster::canonical_node_id("peer-x").to_string());
             }
             other => panic!("expected InvalidSignature, got: {other}"),
         }
@@ -1201,5 +1599,324 @@ mod tests {
             false,
         );
         assert!(verifier.discover_peers().is_err());
+    }
+
+    // ── Per-node NodeIdentity (closes MEDIUM "identity not per-node") ────────
+
+    /// ML-DSA-87 keys are large; run on a thread with extra stack
+    /// (matches `RUST_MIN_STACK=8388608` used by the OCI build).
+    fn run_with_large_stack<F: FnOnce() + Send + 'static>(f: F) {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(f)
+            .expect("thread spawn failed")
+            .join()
+            .expect("test thread panicked");
+    }
+
+    /// A test UUID (the raw identity input; `NodeIdentity` ctors take `Uuid`).
+    fn nid(n: u128) -> Uuid {
+        Uuid::from_u128(n)
+    }
+
+    /// Same master KEK + two DIFFERENT NodeIds MUST derive DISTINCT seeds.
+    /// This is the exact property whose absence was the MEDIUM finding.
+    #[test]
+    fn node_identity_seed_is_per_node() {
+        let kek = [0x11u8; 32];
+        let id_a = nid(0xA);
+        let id_b = nid(0xB);
+        let seed_a = derive_node_identity_seed(&kek, &id_a);
+        let seed_b = derive_node_identity_seed(&kek, &id_b);
+        assert_ne!(seed_a, seed_b, "two NodeIds must derive distinct seeds");
+        // Deterministic for the same inputs.
+        assert_eq!(seed_a, derive_node_identity_seed(&kek, &id_a));
+    }
+
+    /// The node-identity domain must NOT collide with the legacy attestation
+    /// domain: same KEK + same node must give different key material.
+    #[test]
+    fn node_identity_domain_separated_from_attestation() {
+        let kek = [0x22u8; 32];
+        let id = nid(0xC0FFEE);
+        let identity_seed = derive_node_identity_seed(&kek, &id);
+
+        // Reproduce the attestation-seed derivation (v2, per-node).
+        let mut hasher = Sha512::new();
+        hasher.update(kek);
+        hasher.update(b"MILNET-ATTESTATION-SEED-v2");
+        hasher.update(id.to_string().as_bytes());
+        let mut att_seed = [0u8; 32];
+        att_seed.copy_from_slice(&hasher.finalize()[..32]);
+
+        assert_ne!(
+            identity_seed, att_seed,
+            "identity and attestation seeds must be domain-separated"
+        );
+    }
+
+    /// Two distinct NodeIdentities derive DISTINCT verifying keys.
+    #[test]
+    fn node_identity_two_nodes_distinct_keys() {
+        run_with_large_stack(|| {
+            let kek = [0x33u8; 32];
+            let id_a = nid(1);
+            let id_b = nid(2);
+            let a = NodeIdentity::from_seed(id_a, derive_node_identity_seed(&kek, &id_a));
+            let b = NodeIdentity::from_seed(id_b, derive_node_identity_seed(&kek, &id_b));
+            assert_ne!(
+                a.verifying_key(),
+                b.verifying_key(),
+                "distinct nodes must have distinct ML-DSA-87 verifying keys"
+            );
+        });
+    }
+
+    /// A node's own signature verifies against its own pinned verifying key.
+    #[test]
+    fn node_identity_sign_verify_roundtrip() {
+        run_with_large_stack(|| {
+            let identity = NodeIdentity::from_seed(nid(7), [0x44u8; 32]);
+            let vk = identity.verifying_key();
+            let msg = b"consensus-message-or-revoke-event";
+            let sig = identity.node_sign(msg);
+            assert!(
+                verify_node_sig(&vk, msg, &sig),
+                "valid per-node signature must verify"
+            );
+        });
+    }
+
+    /// A tampered message or signature is rejected.
+    #[test]
+    fn node_identity_tampered_rejected() {
+        run_with_large_stack(|| {
+            let identity = NodeIdentity::from_seed(nid(8), [0x55u8; 32]);
+            let vk = identity.verifying_key();
+            let msg = b"original-message";
+            let sig = identity.node_sign(msg);
+
+            // Tampered message.
+            assert!(!verify_node_sig(&vk, b"different-message", &sig));
+
+            // Tampered signature.
+            let mut bad_sig = sig.clone();
+            bad_sig[0] ^= 0xFF;
+            assert!(!verify_node_sig(&vk, msg, &bad_sig));
+        });
+    }
+
+    /// CORE ANTI-FORGERY PROPERTY: node A signs a message; the signature does
+    /// NOT verify under node B's verifying key. A compromised node can only
+    /// sign AS ITSELF — it cannot forge messages attributed to another node.
+    #[test]
+    fn node_identity_cannot_forge_as_another_node() {
+        run_with_large_stack(|| {
+            let a = NodeIdentity::from_seed(nid(100), [0x66u8; 32]);
+            let b = NodeIdentity::from_seed(nid(200), [0x77u8; 32]);
+
+            let msg = b"i-am-node-A";
+            let sig_a = a.node_sign(msg);
+
+            // Verifying A's signature against B's pinned key MUST fail.
+            assert!(
+                !verify_node_sig(&b.verifying_key(), msg, &sig_a),
+                "node A's signature must not verify under node B's key"
+            );
+            // Sanity: it does verify under A's own key.
+            assert!(verify_node_sig(&a.verifying_key(), msg, &sig_a));
+        });
+    }
+
+    /// An unknown / unpinned signer has no verifying key; passing a wrong key
+    /// fails closed (this is how callers MUST treat an unpinned NodeId).
+    #[test]
+    fn node_identity_unknown_signer_fails_closed() {
+        run_with_large_stack(|| {
+            let signer = NodeIdentity::from_seed(nid(300), [0x88u8; 32]);
+            let msg = b"event";
+            let sig = signer.node_sign(msg);
+
+            // A verifier that never pinned this signer has only some OTHER key.
+            let unrelated_vk = NodeIdentity::from_seed(nid(301), [0x99u8; 32]).verifying_key();
+            assert!(
+                !verify_node_sig(&unrelated_vk, msg, &sig),
+                "signature from an unpinned signer must be rejected"
+            );
+        });
+    }
+
+    /// The shared NodeId-keyed registry verifies a pinned node's signature and
+    /// FAILS CLOSED for an unpinned NodeId. This is the ONE registry the Raft
+    /// transport and the revocation layer share.
+    #[test]
+    fn node_identity_registry_verify_and_fail_closed() {
+        run_with_large_stack(|| {
+            let signer = NodeIdentity::from_seed(nid(1), [0x12u8; 32]);
+            let mut reg = NodeIdentityRegistry::new();
+            reg.pin(signer.node_id(), signer.verifying_key());
+
+            let msg = b"signed-by-node-1";
+            let sig = signer.node_sign(msg);
+
+            // Pinned signer verifies.
+            assert!(reg.verify(signer.node_id(), msg, &sig));
+            // Tampered message fails.
+            assert!(!reg.verify(signer.node_id(), b"tampered", &sig));
+            // Unknown/unpinned NodeId fails closed (no silent accept).
+            assert!(!reg.verify(NodeId(nid(999)), msg, &sig));
+            assert!(!reg.contains(&NodeId(nid(999))));
+            assert_eq!(reg.len(), 1);
+        });
+    }
+
+    // ── TPM-sealed per-node identity (TRUE anti-root, military mode) ─────────
+    //
+    // The TPM seal/unseal logic + fail-closed tests live in `sealed_keys` (it
+    // owns the TpmKekSealer + the mock); see `load_node_identity_seed_inner`,
+    // `seal_node_identity_to_tpm`, and their tests there. Here we only assert
+    // that a per-node sealed seed builds a working signing identity.
+
+    /// A per-node (TPM-sealed) seed yields a usable NodeIdentity whose signatures
+    /// verify. (The seed source is exercised in `sealed_keys`; this checks the
+    /// `from_sealed_seed` -> sign/verify path.)
+    #[test]
+    fn sealed_seed_builds_working_identity() {
+        run_with_large_stack(|| {
+            // Stand-in for a TPM-unsealed seed.
+            let seed = [0x3Cu8; 32];
+            let id = NodeIdentity::from_sealed_seed(nid(5), seed);
+            let msg = b"raft-or-revoke";
+            let sig = id.node_sign(msg);
+            assert!(verify_node_sig(&id.verifying_key(), msg, &sig));
+        });
+    }
+
+    // ── Raft-VK distribution via attestation (join-time pinning) ────────────
+
+    /// The published per-node Raft VK is covered by the attestation signature:
+    /// verification succeeds with the real VK, and a SUBSTITUTED VK is rejected.
+    #[test]
+    fn attestation_covers_raft_verifying_key() {
+        run_with_large_stack(|| {
+            let raft_id = NodeIdentity::from_seed(nid(0xAB), [0x42u8; 32]);
+            let raft_vk = raft_id.verifying_key();
+            let hash = test_binary_hash();
+            let att = create_test_attestation_with_raft_vk(
+                "00000000-0000-0000-0000-0000000000ab",
+                &seed_b(),
+                &hash,
+                "boot",
+                now_secs(),
+                &raft_vk,
+            );
+
+            // Honest verification (recompute payload incl. the published VK).
+            let good = attestation_payload(
+                att.node_id, &att.binary_hash, &att.boot_id, att.timestamp,
+                &att.raft_verifying_key,
+            );
+            assert!(pq_verify(&att.verifying_key, &good, &att.signature));
+
+            // A MITM swaps the Raft VK → signature no longer matches.
+            let other_vk = NodeIdentity::from_seed(nid(0xCD), [0x43u8; 32]).verifying_key();
+            let forged = attestation_payload(
+                att.node_id, &att.binary_hash, &att.boot_id, att.timestamp, &other_vk,
+            );
+            assert!(
+                !pq_verify(&att.verifying_key, &forged, &att.signature),
+                "a substituted raft_verifying_key must break the attestation signature"
+            );
+        });
+    }
+
+    /// `verify_attestation` accepts an attestation carrying a raft VK and rejects
+    /// one whose raft VK was tampered after signing.
+    #[test]
+    fn verify_attestation_rejects_tampered_raft_vk() {
+        run_with_large_stack(|| {
+            let verifier = make_verifier(2);
+            let hash = test_binary_hash();
+            let raft_vk = NodeIdentity::from_seed(nid(1), [0x44u8; 32]).verifying_key();
+            let mut att = create_test_attestation_with_raft_vk(
+                "peer-x", &seed_b(), &hash, "test-boot-id", now_secs(), &raft_vk,
+            );
+            assert!(verifier.verify_attestation(&att).is_ok());
+
+            // Tamper the published raft VK without re-signing.
+            att.raft_verifying_key = NodeIdentity::from_seed(nid(2), [0x45u8; 32]).verifying_key();
+            assert!(
+                verifier.verify_attestation(&att).is_err(),
+                "tampered raft_verifying_key must fail attestation verification"
+            );
+        });
+    }
+
+    /// The SHARED `cluster::canonical_node_id` maps UUID / hex / non-UUID ids to
+    /// a stable NodeId, identically to the Raft transport (so attestation id ==
+    /// transport id). Non-UUID deploy ids (e.g. `orchestrator-0`) get a stable
+    /// UUIDv5 — deterministic and distinct.
+    #[test]
+    fn canonical_node_id_matches_transport() {
+        // UUID string → that UUID.
+        assert_eq!(
+            crate::cluster::canonical_node_id("00000000-0000-0000-0000-00000000002a"),
+            NodeId(Uuid::from_u128(0x2a))
+        );
+        // Hex → from_u128.
+        assert_eq!(crate::cluster::canonical_node_id("0x2a"), NodeId(Uuid::from_u128(0x2a)));
+        // Non-UUID deploy id → stable UUIDv5 (deterministic, distinct per string).
+        let a = crate::cluster::canonical_node_id("orchestrator-0");
+        let b = crate::cluster::canonical_node_id("orchestrator-1");
+        assert_eq!(a, crate::cluster::canonical_node_id("orchestrator-0"), "stable");
+        assert_ne!(a, b, "distinct deploy ids map to distinct NodeIds");
+        // attestation's accessor just returns the stored NodeId.
+        let att = create_test_attestation("orchestrator-0", &seed_b(), &test_binary_hash(), "b", 0);
+        assert_eq!(att.cluster_node_id(), a);
+    }
+
+    /// `peer_identities_to_pin` returns (NodeId, raft_vk) only for peers that
+    /// published a Raft VK; a peer with no published VK is skipped (fail-closed).
+    #[test]
+    fn startup_verification_peer_identities_to_pin() {
+        run_with_large_stack(|| {
+            let vk1 = NodeIdentity::from_seed(nid(0x11), [0x11u8; 32]).verifying_key();
+            let with_vk = PeerAttestation {
+                node_id: NodeId(Uuid::from_u128(0x11)),
+                binary_hash: [0u8; 64], boot_id: "b".into(), timestamp: 0,
+                signature: vec![], verifying_key: vec![], raft_verifying_key: vk1.clone(),
+            };
+            // No raft VK → skipped (fail-closed: unpinned peer's msgs dropped).
+            let no_vk = PeerAttestation {
+                node_id: NodeId(Uuid::from_u128(0x22)),
+                binary_hash: [0u8; 64], boot_id: "b".into(), timestamp: 0,
+                signature: vec![], verifying_key: vec![], raft_verifying_key: vec![],
+            };
+
+            let v = StartupVerification {
+                verified_peers: vec![with_vk, no_vk],
+                cluster_size: 3, quorum_achievable: true, state_chain_synced: true,
+            };
+            let pins = v.peer_identities_to_pin();
+            assert_eq!(pins.len(), 1, "only the peer with a published VK is pinnable");
+            assert_eq!(pins[0].0, NodeId(Uuid::from_u128(0x11)));
+            assert_eq!(pins[0].1, vk1);
+        });
+    }
+
+    /// The `from_node_identity` seam publishes the identity's VK in the attestation.
+    #[test]
+    fn verifier_from_node_identity_publishes_vk() {
+        run_with_large_stack(|| {
+            let identity = NodeIdentity::from_seed(nid(9), [0x77u8; 32]);
+            let expected_vk = identity.verifying_key();
+            let verifier = make_verifier(2).from_node_identity(&identity);
+            assert_eq!(verifier.raft_verifying_key(), expected_vk.as_slice());
+
+            let att = verifier.generate_own_attestation();
+            assert_eq!(att.raft_verifying_key, expected_vk);
+            // And the attestation self-verifies (VK is covered by the signature).
+            assert!(verifier.verify_attestation(&att).is_ok());
+        });
     }
 }

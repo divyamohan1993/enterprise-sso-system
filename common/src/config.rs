@@ -1187,6 +1187,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn mlp_mode_requires_both_env_vars() {
         // Neither set -> false
         std::env::remove_var("MILNET_MLP_MODE");

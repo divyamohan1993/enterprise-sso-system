@@ -17,7 +17,8 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::distributed_session::{
-    DistributedSession, DistributedSessionStore, SessionStoreConfig,
+    DistributedSession, DistributedSessionStore, InvalidationReason,
+    RevocationCoordinator, SessionInvalidationEvent, SessionStoreConfig,
 };
 use crate::encrypted_db::EncryptedPool;
 
@@ -32,6 +33,12 @@ pub struct PersistentSessionStore {
     epool: Arc<EncryptedPool>,
     /// Unique identifier for this cluster node.
     node_id: String,
+    /// Cross-node revocation coordinator (F3). When present, a local revoke
+    /// SIGNS (per-node ML-DSA-87) and BROADCASTS a [`SessionInvalidationEvent`]
+    /// so every node honors the revoke — not local-until-TTL. Optional so the
+    /// store still constructs in single-node / test contexts; the cluster wiring
+    /// site installs it via [`PersistentSessionStore::set_revocation_coordinator`].
+    coordinator: Option<Arc<RevocationCoordinator>>,
 }
 
 /// Table name used for persistent sessions in PostgreSQL.
@@ -60,11 +67,37 @@ impl PersistentSessionStore {
             ))),
             epool,
             node_id,
+            coordinator: None,
         };
 
         store.load_all_from_db(&encryption_key).await?;
 
         Ok(store)
+    }
+
+    /// Install the cross-node revocation coordinator (F3 wiring site).
+    ///
+    /// Once set, [`terminate_session`](Self::terminate_session) and
+    /// [`terminate_user_sessions`](Self::terminate_user_sessions) broadcast a
+    /// signed invalidation to all peers, and [`apply_invalidation`](Self::apply_invalidation)
+    /// can ingest peer events. Consumes and returns `self` for builder-style use.
+    #[must_use]
+    pub fn with_revocation_coordinator(
+        mut self,
+        coordinator: Arc<RevocationCoordinator>,
+    ) -> Self {
+        self.coordinator = Some(coordinator);
+        self
+    }
+
+    /// Install the coordinator after construction (when builder style is awkward).
+    pub fn set_revocation_coordinator(&mut self, coordinator: Arc<RevocationCoordinator>) {
+        self.coordinator = Some(coordinator);
+    }
+
+    /// Whether a cross-node revocation coordinator is installed.
+    pub fn has_revocation_coordinator(&self) -> bool {
+        self.coordinator.is_some()
     }
 
     /// Idempotent DDL: create the `persistent_sessions` table if it does not
@@ -397,24 +430,118 @@ impl PersistentSessionStore {
         Ok(terminated)
     }
 
-    /// Terminate all sessions for a user with write-through.
+    /// Terminate all sessions for a user with write-through AND cross-node
+    /// propagation (F3).
+    ///
+    /// This is the security-revoke path (password change, role change, account
+    /// compromise, admin action). When a [`RevocationCoordinator`] is installed,
+    /// it records a per-user revocation watermark locally (so this node's read
+    /// path denies the user's sessions even ones not individually cached) and
+    /// broadcasts a signed [`SessionInvalidationEvent`] to every peer, so the
+    /// revoke becomes effective cluster-wide instead of local-until-TTL. The
+    /// default reason is [`InvalidationReason::AdminAction`]; use
+    /// [`revoke_user`](Self::revoke_user) to specify the reason.
     pub async fn terminate_user_sessions(&self, user_id: &Uuid) -> Result<usize, String> {
-        let count = {
+        self.revoke_user(user_id, InvalidationReason::AdminAction).await
+    }
+
+    /// Revoke all of a user's sessions cluster-wide with an explicit reason.
+    ///
+    /// Local apply + DB write-through always happen. If a coordinator is present
+    /// the revoke is signed and broadcast to peers; a broadcast/transport failure
+    /// is surfaced as an error AFTER the local revoke + DB write are durable, so
+    /// the revoke is never weaker than requested (fail-closed).
+    pub async fn revoke_user(
+        &self,
+        user_id: &Uuid,
+        reason: InvalidationReason,
+    ) -> Result<usize, String> {
+        // Local apply under the write lock: record the watermark (when a
+        // coordinator exists) and terminate cached sessions.
+        let (count, broadcast_event) = {
             let mut guard = self.inner.write().await;
-            guard.terminate_user_sessions(user_id)
+            match self.coordinator.as_ref() {
+                Some(coord) => {
+                    // Sign the event, then apply it locally (apply_invalidation_event
+                    // records the per-user watermark AND terminates cached
+                    // sessions, returning the count). Defer the network fan-out
+                    // until after the DB write is durable.
+                    let event = coord.create_signed_event(*user_id, reason)?;
+                    let n = guard.apply_invalidation_event(&event);
+                    (n, Some(event))
+                }
+                None => (guard.terminate_user_sessions(user_id), None),
+            }
         };
 
-        if count > 0 {
-            sqlx::query(
-                "UPDATE persistent_sessions SET terminated = true WHERE user_id = $1",
-            )
-            .bind(user_id)
-            .execute(self.epool.raw())
-            .await
-            .map_err(|e| format!("terminate user sessions in DB: {e}"))?;
+        // Durable DB write-through (always — independent of broadcast).
+        sqlx::query(
+            "UPDATE persistent_sessions SET terminated = true WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .execute(self.epool.raw())
+        .await
+        .map_err(|e| format!("terminate user sessions in DB: {e}"))?;
+
+        // Fan out AFTER local + DB are durable. A failure here does not undo the
+        // local revoke; peers converge via anti-entropy / retry.
+        if let (Some(coord), Some(event)) = (self.coordinator.as_ref(), broadcast_event) {
+            match coord.broadcast_event(&event) {
+                Ok(peers) => tracing::info!(
+                    target: "siem",
+                    user_id = %user_id,
+                    reason = reason.as_str(),
+                    peers,
+                    "SIEM:INFO user revocation broadcast to peers"
+                ),
+                Err(e) => {
+                    tracing::error!(
+                        target: "siem",
+                        user_id = %user_id,
+                        error = %e,
+                        "SIEM:CRITICAL user revocation broadcast FAILED — applied locally + DB, peers lag until convergence"
+                    );
+                    return Err(format!("revocation applied locally but broadcast failed: {e}"));
+                }
+            }
         }
 
         Ok(count)
+    }
+
+    /// Ingest a verified cross-node invalidation event from a peer (F3 receive
+    /// side). Verifies the originating node's per-node signature + replay via the
+    /// coordinator, records the watermark in the warm cache, and persists
+    /// `terminated = true` to PostgreSQL so the revoke survives a cache reload.
+    ///
+    /// Returns the invalidated user_id on success. Requires a coordinator.
+    pub async fn apply_invalidation(
+        &self,
+        event: &SessionInvalidationEvent,
+    ) -> Result<Uuid, String> {
+        let coord = self
+            .coordinator
+            .as_ref()
+            .ok_or_else(|| "no revocation coordinator installed".to_string())?;
+
+        let user_id = {
+            let mut guard = self.inner.write().await;
+            // accept_event verifies signature + freshness + replay BEFORE
+            // applying the watermark (fail-closed verification order).
+            coord.accept_event(&mut guard, event)?
+        };
+
+        // Persist the termination so a warm-cache reload does not resurrect the
+        // revoked sessions.
+        sqlx::query(
+            "UPDATE persistent_sessions SET terminated = true WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .execute(self.epool.raw())
+        .await
+        .map_err(|e| format!("apply invalidation DB write: {e}"))?;
+
+        Ok(user_id)
     }
 
     /// Clean up expired/terminated sessions in both cache and database.

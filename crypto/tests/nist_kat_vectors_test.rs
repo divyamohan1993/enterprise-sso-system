@@ -574,3 +574,34 @@ fn slhdsa_negative_kat_wrong_message() {
         "SLH-DSA must reject signature verified against wrong message"
     );
 }
+
+// =========================================================================
+// FIPS 203 / FIPS 204 fixed-input KNOWN-ANSWER tests (end-to-end)
+//
+// These exercise the startup KAT path, which now includes true fixed-input →
+// fixed-output ML-KEM-1024 and ML-DSA-87 KATs against NIST ACVP / IETF LAMPS
+// vectors (see crypto::fips_kat). Unlike the roundtrip-with-corruption tests
+// above, a wrong or backdoored ML-KEM/ML-DSA implementation that still
+// round-trips with itself fails these closed.
+//
+// Vector sources:
+// - ML-KEM-1024: NIST ACVP-Server @65370b8, ML-KEM-{keyGen,encapDecap}-FIPS203
+//   internalProjection.json, ML-KEM-1024 tcId 51 (same vectors RustCrypto
+//   `ml-kem` validates against).
+// - ML-DSA-87: IETF LAMPS dilithium-certificates example (seed 000102…1f →
+//   fixed encoded verifying key), also in the `ml-dsa` crate test corpus.
+// =========================================================================
+
+#[test]
+fn fips203_204_startup_known_answer_tests_pass() {
+    // ML-DSA-87 / ML-KEM-1024 keygen need large stacks; run on an 8 MB thread.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            crypto::fips_kat::run_startup_kats()
+                .expect("FIPS 140-3 startup KATs (incl. ML-KEM-1024 + ML-DSA-87 fixed vectors) must pass");
+        })
+        .expect("thread spawn failed")
+        .join()
+        .expect("thread panicked");
+}

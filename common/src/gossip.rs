@@ -403,6 +403,39 @@ impl GossipProtocol {
     const MAX_PIGGYBACK_UPDATES: usize = 100;
 
     pub fn handle_message(&self, msg: GossipMessage) -> Vec<GossipAction> {
+        // SECURITY (F7): authenticate the message BEFORE applying ANY state
+        // change. Previously the piggybacked MembershipUpdates and the sender's
+        // incarnation/status were applied with NO signature check, allowing a
+        // single host on the wire to poison the failure detector — forging
+        // SUSPECT/DEAD/ALIVE transitions and incarnation bumps for arbitrary
+        // peers (Byzantine failure-detector poisoning). We now verify the
+        // HMAC-SHA512 transport signature first and DROP the message on
+        // failure. This mirrors zero-trust "never trust internal" — every
+        // received message is hostile until its signature is verified
+        // (NIST SP 800-207 §2.1: all communication secured regardless of
+        // network location).
+        if let Err(e) = msg.verify_signature(&self.transport_key) {
+            emit_gossip_siem(
+                &self.node_id,
+                "reject_unsigned",
+                &format!(
+                    "DROPPED gossip message from '{}' (incarnation {}): {}",
+                    msg.sender, msg.incarnation, e
+                ),
+            );
+            return Vec::new();
+        }
+        self.handle_message_verified(msg)
+    }
+
+    /// Process a message whose authenticity has already been established.
+    ///
+    /// SECURITY: callers MUST verify [`GossipMessage::verify_signature`] before
+    /// invoking this. The only internal caller besides [`handle_message`] is the
+    /// `Compound` expansion below, where each sub-message is covered by the
+    /// single outer signature (the sub-messages are reconstructed locally from
+    /// the already-verified envelope and never re-enter from the wire).
+    fn handle_message_verified(&self, msg: GossipMessage) -> Vec<GossipAction> {
         let mut actions = Vec::new();
 
         // Reject oversized piggyback vectors to prevent memory exhaustion
@@ -468,7 +501,11 @@ impl GossipProtocol {
                         incarnation: msg.incarnation,
                         hmac_signature: Vec::new(),
                     };
-                    actions.extend(self.handle_message(sub_msg));
+                    // Already authenticated by the outer envelope's signature —
+                    // recurse into the verified handler, NOT the public entry
+                    // point (these synthetic sub-messages carry no signature of
+                    // their own and must not be re-verified).
+                    actions.extend(self.handle_message_verified(sub_msg));
                 }
             }
         }
@@ -1077,5 +1114,146 @@ mod tests {
                 assert!(message.verify_signature(&key).is_ok());
             }
         }
+    }
+
+    // ── F7: received-message signature verification on handle_message ──────
+    //
+    // Audit finding F7 (consensus-bft/zerotrust): handle_message applied
+    // piggybacked MembershipUpdates and the sender's incarnation/status WITHOUT
+    // ever calling verify_signature → failure-detector poisoning. These tests
+    // pin the fix: a validly-signed message is processed; a message bearing a
+    // present-but-wrong signature is DROPPED and applies no state change.
+
+    /// A correctly-signed PING from a keyed peer is accepted and produces an ACK.
+    #[test]
+    fn test_handle_message_accepts_valid_signature() {
+        let key = vec![0x11u8; 32];
+        let proto = GossipProtocol::new_with_key("node-0".into(), key.clone());
+        proto.join(&[("node-1".into(), test_metadata())]);
+
+        let mut ping = GossipMessage {
+            sender: "node-1".into(),
+            msg_type: GossipMessageType::Ping { sequence: 7 },
+            piggyback: Vec::new(),
+            incarnation: 0,
+            hmac_signature: Vec::new(),
+        };
+        // Sign with the SHARED transport key, as a legitimate peer would.
+        ping.sign(&key);
+
+        let actions = proto.handle_message(ping);
+        assert_eq!(actions.len(), 1, "valid signed PING must produce an ACK");
+        match &actions[0] {
+            GossipAction::Send { message, .. } => match &message.msg_type {
+                GossipMessageType::Ack { sequence } => assert_eq!(*sequence, 7),
+                other => panic!("expected Ack, got {:?}", other),
+            },
+        }
+    }
+
+    /// A message with a present-but-WRONG signature is dropped: no ACK, and no
+    /// membership/incarnation state is mutated.
+    #[test]
+    fn test_handle_message_rejects_bad_signature() {
+        let key = vec![0x22u8; 32];
+        let wrong_key = vec![0x99u8; 32];
+        let proto = GossipProtocol::new_with_key("node-0".into(), key.clone());
+        proto.join(&[("node-1".into(), test_metadata())]);
+
+        // First put node-1 into SUSPECT locally so we can observe whether a
+        // rejected message (which carries a high incarnation that would
+        // normally refute suspicion via mark_alive) leaves state untouched.
+        proto.suspect_node("node-1");
+        assert!(proto.member_status("node-1").unwrap().is_suspect());
+
+        let mut ping = GossipMessage {
+            sender: "node-1".into(),
+            msg_type: GossipMessageType::Ping { sequence: 5 },
+            piggyback: Vec::new(),
+            incarnation: 42, // would refute suspicion via mark_alive if applied
+            hmac_signature: Vec::new(),
+        };
+        // Sign with the WRONG key → signature present but invalid.
+        ping.sign(&wrong_key);
+
+        let actions = proto.handle_message(ping);
+        assert!(
+            actions.is_empty(),
+            "message with invalid signature must be dropped (no ACK)"
+        );
+        // mark_alive must NOT have run: node-1 stays SUSPECT, proving the
+        // rejected message applied no state change.
+        assert!(
+            proto.member_status("node-1").unwrap().is_suspect(),
+            "rejected message must not restore peer to ALIVE"
+        );
+    }
+
+    /// Failure-detector poisoning is prevented: a forged piggybacked DEAD update
+    /// carried on a message with an invalid signature is NOT applied.
+    #[test]
+    fn test_handle_message_rejects_poisoned_piggyback() {
+        let key = vec![0x33u8; 32];
+        let wrong_key = vec![0x44u8; 32];
+        let proto = GossipProtocol::new_with_key("node-0".into(), key.clone());
+        proto.join(&[
+            ("node-1".into(), test_metadata()),
+            ("node-2".into(), test_metadata()),
+        ]);
+        // node-2 starts ALIVE.
+        assert!(proto.member_status("node-2").unwrap().is_alive());
+
+        // node-1 (attacker on the wire) tries to declare node-2 DEAD via a
+        // piggybacked update on a message it cannot validly sign.
+        let mut poison = GossipMessage {
+            sender: "node-1".into(),
+            msg_type: GossipMessageType::Ping { sequence: 1 },
+            piggyback: vec![MembershipUpdate {
+                node_id: "node-2".into(),
+                status: MemberStatus::Dead { since_epoch_ms: epoch_ms() },
+                incarnation: 999,
+            }],
+            incarnation: 0,
+            hmac_signature: Vec::new(),
+        };
+        poison.sign(&wrong_key); // invalid under the real transport key
+
+        let actions = proto.handle_message(poison);
+        assert!(actions.is_empty(), "poisoned message must be dropped");
+        assert!(
+            proto.member_status("node-2").unwrap().is_alive(),
+            "forged DEAD piggyback must NOT poison node-2's status"
+        );
+    }
+
+    /// A validly-signed piggybacked update IS applied (positive control for the
+    /// rejection test above).
+    #[test]
+    fn test_handle_message_applies_signed_piggyback() {
+        let key = vec![0x55u8; 32];
+        let proto = GossipProtocol::new_with_key("node-0".into(), key.clone());
+        proto.join(&[
+            ("node-1".into(), test_metadata()),
+            ("node-2".into(), test_metadata()),
+        ]);
+
+        let mut msg = GossipMessage {
+            sender: "node-1".into(),
+            msg_type: GossipMessageType::Ping { sequence: 1 },
+            piggyback: vec![MembershipUpdate {
+                node_id: "node-2".into(),
+                status: MemberStatus::Suspect { since_epoch_ms: epoch_ms() },
+                incarnation: 3,
+            }],
+            incarnation: 0,
+            hmac_signature: Vec::new(),
+        };
+        msg.sign(&key); // valid signature over sender||incarnation||type||piggyback
+
+        proto.handle_message(msg);
+        assert!(
+            proto.member_status("node-2").unwrap().is_suspect(),
+            "validly-signed SUSPECT piggyback must be applied"
+        );
     }
 }

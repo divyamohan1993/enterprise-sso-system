@@ -3,7 +3,9 @@
 //! Validates timeout enforcement, invalid state transitions, concurrent
 //! ceremony limits, cleanup on timeout, and receipt chain binding to session ID.
 
-use orchestrator::ceremony::{CeremonySession, CeremonyState, CEREMONY_TIMEOUT_SECS};
+use orchestrator::ceremony::{
+    ceremony_timeout_secs, CeremonySession, CeremonyState, CEREMONY_TIMEOUT_SECS,
+};
 
 // ── Timeout tests ────────────────────────────────────────────────────────
 
@@ -26,7 +28,7 @@ fn ceremony_expired_after_timeout() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64
-        - CEREMONY_TIMEOUT_SECS
+        - ceremony_timeout_secs()
         - 1;
 
     assert!(session.is_expired(), "session must be expired after timeout");
@@ -137,7 +139,7 @@ fn concurrent_sessions_independent_state() {
 #[test]
 fn expired_session_in_pending_opaque_detected() {
     let mut session = CeremonySession::new([0x01; 32]);
-    session.created_at -= CEREMONY_TIMEOUT_SECS + 1;
+    session.created_at -= ceremony_timeout_secs() + 1;
     assert!(session.is_expired());
     assert_eq!(session.state, CeremonyState::PendingOpaque);
 }
@@ -146,7 +148,7 @@ fn expired_session_in_pending_opaque_detected() {
 fn expired_session_in_pending_tss_detected() {
     let mut session = CeremonySession::new([0x01; 32]);
     session.opaque_complete().unwrap();
-    session.created_at -= CEREMONY_TIMEOUT_SECS + 1;
+    session.created_at -= ceremony_timeout_secs() + 1;
     assert!(session.is_expired());
     assert_eq!(session.state, CeremonyState::PendingTss);
 }

@@ -125,7 +125,20 @@ static THRESHOLD_KDF_CACHE: OnceLock<ProtectedKek> = OnceLock::new();
 
 /// Returns a reference to the cached master KEK, loading it once on first call.
 /// The KEK is mlock'd into physical RAM and excluded from core dumps.
+///
+/// SECURITY (anti-clone): in MILITARY mode this delegates to [`get_master_kek`]
+/// so that callers which historically invoke `cached_master_kek()` directly
+/// (admin/audit/tss/kt/shard/…) ALSO source key material from the vTPM, never
+/// from the environment. Without this delegation a direct caller would hit
+/// `load_master_kek()` and read `MILNET_MASTER_KEK` from env — exactly the
+/// clone-reproducible path this fix closes. The signature is unchanged. There
+/// is no recursion: `get_master_kek`'s military Path 0 never calls back into
+/// `cached_master_kek`, and its non-military fallback (which does) is only
+/// reached when this guard is inactive.
 pub fn cached_master_kek() -> &'static [u8; 32] {
+    if std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1") {
+        return get_master_kek();
+    }
     let kek = MASTER_KEK_CACHE.get_or_init(|| ProtectedKek::new(load_master_kek()));
     // mlock AFTER OnceLock placement so we lock the final heap address, not a
     // stale stack address. OnceLock guarantees the value will not move again.
@@ -524,19 +537,651 @@ fn verify_share_commitment(share: &crate::threshold_kek::KekShare) -> bool {
     valid
 }
 
+// ===========================================================================
+// vTPM-sealed master KEK acquisition (military mode anti-clone binding)
+// ===========================================================================
+//
+// THREAT MODEL — VM/disk clone on different hardware:
+//   The pre-existing KEK acquisition paths (single `MILNET_MASTER_KEK`,
+//   threshold `MILNET_KEK_SHARE`) all source key material from the process
+//   ENVIRONMENT. An attacker who clones the VM image / disk reproduces those
+//   env vars verbatim and the clone derives the *same* KEK on *different*
+//   hardware. The KEK is the root of the whole key hierarchy, so a clone
+//   decrypts everything. This is the #1 clone-resistance defect.
+//
+// FIX — bind KEK material to THIS platform's vTPM:
+//   In military deployment (`MILNET_MILITARY_DEPLOYMENT=1`) the KEK (or this
+//   node's Shamir share) is recovered exclusively by UNSEALING a TPM-sealed
+//   blob whose policy is bound to the measured-boot PCR set (0,2,4,7 — see
+//   `platform_integrity::MASTER_KEK_PCR_LIST`). The sealed object is encrypted
+//   under the TPM's Storage Root Key, which never leaves the chip
+//   (TPM 2.0 Library Spec Part 1, §23 "Protected Storage"; §14 "Object
+//   Hierarchy"). `tpm2_unseal` is gated by a `TPM2_PolicyPCR` session
+//   (Part 3, `TPM2_PolicyPCR`; Part 1, §23.7 "Enhanced Authorization"), so a
+//   clone on different firmware/bootloader/Secure-Boot state produces a
+//   different policy digest and the TPM refuses to release the secret.
+//   tpm2-tools workflow per the tpm2-software project's sealing guide
+//   (`tpm2_createprimary` → `tpm2_create -L policy` → `tpm2_load` →
+//   `tpm2_unseal`).
+//
+// FAIL-CLOSED:
+//   Military mode + (no vTPM | missing sealed blob | unseal failure | PCR
+//   mismatch | env KEK material present) ⇒ REFUSE: emit a SIEM critical and
+//   `std::process::exit(199)`. Env-sourced KEK material is FORBIDDEN in
+//   military mode; its presence is treated as a clone/misconfiguration
+//   indicator, never used. The non-military / MLP env + threshold paths are
+//   unchanged.
+//
+// HONEST RESIDUAL (anti-clone is NOT anti-root):
+//   PCR sealing defeats a clone on DIFFERENT hardware. It does NOT defeat a
+//   same-host attacker who already has root on the GENUINE node: such an
+//   attacker satisfies the live PCR policy and can invoke `tpm2_unseal`
+//   directly (or read the in-process share, see the env-injection note in
+//   `military_unseal_share_into_env`). Closing that gap requires confidential
+//   computing (AMD SEV-SNP / Intel TDX) with key release bound to a remote
+//   attestation of the workload measurement, so the secret is only released
+//   inside an attested, memory-encrypted enclave. That is a follow-up and is
+//   OUT OF SCOPE for this wiring. See `kek-tpm-changelog.md`.
+
+/// Abstraction over the TPM seal/unseal of master-KEK material.
+///
+/// The production implementation ([`Tpm2ToolsKekSealer`]) shells out to
+/// tpm2-tools via [`crate::platform_integrity`]. The trait exists so the
+/// **gating decisions** (which path is taken, and the fail-closed refusals)
+/// can be unit-tested against an in-memory software TPM without real hardware
+/// — `team-lead` exercises the real `Tpm2ToolsKekSealer` path on the OCI host
+/// with `swtpm`.
+pub trait TpmKekSealer {
+    /// Seal `secret` to the TPM under the master-KEK PCR policy, persisting the
+    /// blob under `name`.
+    fn seal(&self, name: &str, secret: &[u8]) -> Result<(), String>;
+    /// Unseal the blob previously stored under `name`. Returns an error if the
+    /// blob is missing, the TPM is unavailable, or the PCR policy is not
+    /// satisfied (clone on different hardware / changed boot chain).
+    fn unseal(&self, name: &str) -> Result<Vec<u8>, String>;
+    /// Whether a sealed blob already exists for `name` (used by the ceremony to
+    /// avoid clobbering, and by the gating logic to detect first-boot).
+    fn blob_exists(&self, name: &str) -> bool;
+    /// Whether a usable vTPM is present on this platform.
+    fn tpm_available(&self) -> bool;
+}
+
+/// Production sealer: binds KEK material to the vTPM via tpm2-tools, sealing to
+/// the measured-boot PCR set ([`crate::platform_integrity::MASTER_KEK_PCR_LIST`]).
+pub struct Tpm2ToolsKekSealer {
+    sealed_dir: Option<String>,
+}
+
+impl Tpm2ToolsKekSealer {
+    /// Construct a sealer, reading the sealed-blob directory from
+    /// `MILNET_SEALED_KEK_DIR` (falling back to the platform default
+    /// `/var/lib/milnet/sealed`).
+    pub fn from_env() -> Self {
+        let sealed_dir = std::env::var("MILNET_SEALED_KEK_DIR").ok();
+        Self { sealed_dir }
+    }
+
+    fn dir(&self) -> Option<&str> {
+        self.sealed_dir.as_deref()
+    }
+}
+
+impl TpmKekSealer for Tpm2ToolsKekSealer {
+    fn seal(&self, name: &str, secret: &[u8]) -> Result<(), String> {
+        crate::platform_integrity::tpm_seal_with_pcrs(
+            name,
+            secret,
+            self.dir(),
+            crate::platform_integrity::MASTER_KEK_PCR_LIST,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    fn unseal(&self, name: &str) -> Result<Vec<u8>, String> {
+        crate::platform_integrity::tpm_unseal_with_pcrs(
+            name,
+            self.dir(),
+            crate::platform_integrity::MASTER_KEK_PCR_LIST,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    fn blob_exists(&self, name: &str) -> bool {
+        crate::measured_boot::sealed_blob_exists(name, self.dir())
+    }
+
+    fn tpm_available(&self) -> bool {
+        // SECURITY: probe WITHOUT side effects. `platform_integrity::
+        // verify_tpm_present()` itself calls `process::exit(199)` in military
+        // mode when no TPM is found — calling it here would short-circuit the
+        // env-material-first refusal ordering and rob us of our own SIEM
+        // message. A direct device-node check is the same presence signal with
+        // no exit. (`/dev/tpmrm0` = TPM 2.0 resource-manager node, preferred;
+        // `/dev/tpm0` = raw node.)
+        std::path::Path::new("/dev/tpmrm0").exists()
+            || std::path::Path::new("/dev/tpm0").exists()
+    }
+}
+
+/// Which kind of material the master-KEK sealed blob holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealedKekMode {
+    /// The blob is the full 32-byte master KEK (single-KEK military node).
+    SingleKek,
+    /// The blob is this node's Shamir KEK share; the master is then derived via
+    /// the threshold-KDF path (the master is NEVER reconstructed).
+    Share,
+}
+
+/// Sealed-blob names. Distinct from FROST/legacy names so KEK sealing has its
+/// own PCR-bound object and lifecycle.
+pub const SEALED_KEK_SINGLE_NAME: &str = "master-kek-tpm";
+pub const SEALED_KEK_SHARE_NAME: &str = "kek-share-tpm";
+
+/// The decision the military KEK loader makes BEFORE touching key material.
+///
+/// Pure and side-effect-free so it is exhaustively unit-testable. The thin
+/// wrapper `acquire_military_kek` maps each refusal variant to a SIEM
+/// event + `exit(199)`, and each proceed variant to the corresponding unseal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MilitaryKekDecision {
+    /// Not military mode — caller falls through to the legacy env/threshold
+    /// hierarchy unchanged.
+    NotMilitary,
+    /// Refuse: env-sourced KEK material is present in military mode (clone /
+    /// misconfiguration indicator). `which` names the offending variable(s).
+    RefuseEnvMaterialPresent { which: &'static str },
+    /// Refuse: no vTPM is available, so the KEK cannot be bound to hardware.
+    RefuseNoTpm,
+    /// Refuse: the sealed blob for the selected mode is missing (the seal
+    /// ceremony has not been run on this node, or the blob was deleted).
+    RefuseSealedBlobMissing { mode: SealedKekMode },
+    /// Proceed: unseal `mode`'s blob from the TPM and use it.
+    Proceed { mode: SealedKekMode },
+}
+
+/// Decide how a MILITARY-mode node must obtain its master KEK.
+///
+/// Inputs are passed explicitly (rather than read from the environment inside)
+/// so the decision table can be unit-tested deterministically:
+///   - `is_military`:        `MILNET_MILITARY_DEPLOYMENT == 1`
+///   - `master_kek_in_env`:  `MILNET_MASTER_KEK` is set
+///   - `share_in_env`:       `MILNET_KEK_SHARE` is set
+///   - `tpm_available`:      a usable vTPM is present
+///   - `mode`:               sealing mode for this node (single vs share)
+///   - `single_blob_exists` / `share_blob_exists`: sealed-blob presence
+///
+/// Order of checks is security-critical and is asserted by the unit tests:
+///   1. env material present  → refuse (do NOT fall back to it, do NOT unseal)
+///   2. no TPM                → refuse
+///   3. selected blob missing → refuse
+///   4. otherwise             → proceed (unseal)
+#[allow(clippy::too_many_arguments)]
+pub fn decide_military_kek_source(
+    is_military: bool,
+    master_kek_in_env: bool,
+    share_in_env: bool,
+    tpm_available: bool,
+    mode: SealedKekMode,
+    single_blob_exists: bool,
+    share_blob_exists: bool,
+) -> MilitaryKekDecision {
+    if !is_military {
+        return MilitaryKekDecision::NotMilitary;
+    }
+
+    // 1. Env-sourced KEK material is FORBIDDEN in military mode. Its presence
+    //    means either a cloned image carrying baked-in secrets or an operator
+    //    misconfiguration. Either way: refuse, never consume it.
+    if master_kek_in_env && share_in_env {
+        return MilitaryKekDecision::RefuseEnvMaterialPresent {
+            which: "MILNET_MASTER_KEK and MILNET_KEK_SHARE",
+        };
+    }
+    if master_kek_in_env {
+        return MilitaryKekDecision::RefuseEnvMaterialPresent { which: "MILNET_MASTER_KEK" };
+    }
+    if share_in_env {
+        return MilitaryKekDecision::RefuseEnvMaterialPresent { which: "MILNET_KEK_SHARE" };
+    }
+
+    // 2. No vTPM ⇒ no hardware binding possible ⇒ refuse.
+    if !tpm_available {
+        return MilitaryKekDecision::RefuseNoTpm;
+    }
+
+    // 3. The sealed blob for the selected mode must exist.
+    let blob_present = match mode {
+        SealedKekMode::SingleKek => single_blob_exists,
+        SealedKekMode::Share => share_blob_exists,
+    };
+    if !blob_present {
+        return MilitaryKekDecision::RefuseSealedBlobMissing { mode };
+    }
+
+    // 4. All preconditions satisfied: unseal.
+    MilitaryKekDecision::Proceed { mode }
+}
+
+/// Determine this node's sealing mode from configuration.
+///
+/// `MILNET_SEALED_KEK_MODE = "single" | "share"`. Defaults to `Share` because
+/// threshold KDF is the mandatory distributed military posture; a node is only
+/// `SingleKek` when explicitly configured (e.g. a single-node enclave whose KEK
+/// is TPM-sealed rather than env-sourced).
+pub fn sealed_kek_mode_from_env() -> SealedKekMode {
+    match std::env::var("MILNET_SEALED_KEK_MODE").as_deref() {
+        Ok("single") => SealedKekMode::SingleKek,
+        _ => SealedKekMode::Share,
+    }
+}
+
+/// Compute the [`MilitaryKekDecision`] for the current process using `sealer`
+/// to probe TPM availability and blob presence. Reads the env predicates here
+/// so the pure [`decide_military_kek_source`] stays test-only-input.
+fn current_military_kek_decision(sealer: &dyn TpmKekSealer) -> MilitaryKekDecision {
+    let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1");
+    if !is_military {
+        return MilitaryKekDecision::NotMilitary;
+    }
+    let master_kek_in_env = std::env::var("MILNET_MASTER_KEK").is_ok();
+    let share_in_env = std::env::var("MILNET_KEK_SHARE").is_ok();
+    let mode = sealed_kek_mode_from_env();
+
+    // SECURITY ORDERING: resolve the env-material refusal BEFORE probing the
+    // sealer. `sealer.blob_exists` is harmless, but probing must not be allowed
+    // to change the outcome when env material is present — a clone carrying
+    // baked-in `MILNET_MASTER_KEK` / `MILNET_KEK_SHARE` must be refused FIRST.
+    // We pass placeholder probe inputs here because the pure function returns
+    // a `RefuseEnvMaterialPresent` before it consults them; we then re-run with
+    // real probe values only once env material is ruled out.
+    let pre = decide_military_kek_source(
+        is_military, master_kek_in_env, share_in_env,
+        /*tpm=*/ true, mode, /*single=*/ true, /*share=*/ true,
+    );
+    if matches!(pre, MilitaryKekDecision::RefuseEnvMaterialPresent { .. }) {
+        return pre;
+    }
+
+    // No env material: now it is safe to probe the TPM and sealed blobs.
+    let tpm_available = sealer.tpm_available();
+    let single_blob_exists = sealer.blob_exists(SEALED_KEK_SINGLE_NAME);
+    let share_blob_exists = sealer.blob_exists(SEALED_KEK_SHARE_NAME);
+    decide_military_kek_source(
+        is_military,
+        master_kek_in_env,
+        share_in_env,
+        tpm_available,
+        mode,
+        single_blob_exists,
+        share_blob_exists,
+    )
+}
+
+/// SIEM-log a military KEK refusal and terminate the process (exit 199),
+/// matching the fail-closed pattern used elsewhere in this module.
+fn refuse_military_kek(reason: &str) -> ! {
+    crate::siem::SecurityEvent::crypto_failure(reason);
+    tracing::error!(
+        target: "siem",
+        "SIEM:CRITICAL military KEK acquisition refused: {reason}. Process exiting (199)."
+    );
+    std::process::exit(199);
+}
+
+/// Unseal this node's Shamir share from the TPM and inject it into
+/// `MILNET_KEK_SHARE` so the existing threshold-KDF path consumes it.
+///
+/// SECURITY NOTE (in-process env injection):
+///   The threshold-KDF loader (`cached_master_kek_threshold_kdf`) reads the
+///   share from `MILNET_KEK_SHARE` and immediately overwrites + removes it. We
+///   set that var here ONLY with TPM-unsealed bytes, never from the deploy
+///   environment, and only for the few microseconds until the loader scrubs
+///   it. The transient `/proc/self/environ` exposure window is bounded by the
+///   SAME residual already documented for this module: a same-host root
+///   attacker who could read `/proc/self/environ` in that window can also call
+///   `tpm2_unseal` directly, so this injection adds no exposure beyond the
+///   accepted anti-clone-not-anti-root boundary. The alternative — changing the
+///   signature of the public threshold-KDF loader — was rejected to preserve a
+///   stable `get_master_kek` API for all callers.
+fn military_unseal_share_into_env(sealer: &dyn TpmKekSealer) {
+    let share_bytes = match sealer.unseal(SEALED_KEK_SHARE_NAME) {
+        Ok(b) => b,
+        Err(e) => refuse_military_kek(&format!(
+            "vTPM unseal of KEK share '{SEALED_KEK_SHARE_NAME}' failed \
+             (missing blob, PCR mismatch — clone on different hardware — or TPM error): {e}"
+        )),
+    };
+    // The sealed share blob holds the hex form produced by `KekShare::to_hex`
+    // (66 ASCII hex chars). Consume the Vec into a String (no extra copy of the
+    // secret); on the success path the String is the only live copy and is
+    // scrubbed below.
+    let mut share_hex = match String::from_utf8(share_bytes) {
+        Ok(s) => s,
+        Err(_) => refuse_military_kek(
+            "vTPM-unsealed KEK share is not valid UTF-8 hex — refusing to start",
+        ),
+    };
+    let trimmed = share_hex.trim().to_string();
+    zeroize_string(&mut share_hex);
+    let mut share_hex = trimmed;
+    // Validate it really is a Shamir share before injecting it anywhere.
+    if crate::threshold_kek::KekShare::from_hex(&share_hex).is_err() {
+        zeroize_string(&mut share_hex);
+        refuse_military_kek(
+            "vTPM-unsealed KEK share failed to parse as a Shamir share — refusing to start",
+        );
+    }
+    // Inject for the threshold-KDF loader, which reads and scrubs it. See the
+    // in-process env-injection SECURITY NOTE on this function.
+    std::env::set_var("MILNET_KEK_SHARE", &share_hex);
+    zeroize_string(&mut share_hex);
+}
+
+/// Unseal the full 32-byte master KEK from the TPM (single-KEK military node).
+fn military_unseal_single_kek(sealer: &dyn TpmKekSealer) -> [u8; 32] {
+    let mut unsealed = match sealer.unseal(SEALED_KEK_SINGLE_NAME) {
+        Ok(b) => b,
+        Err(e) => refuse_military_kek(&format!(
+            "vTPM unseal of master KEK '{SEALED_KEK_SINGLE_NAME}' failed \
+             (missing blob, PCR mismatch — clone on different hardware — or TPM error): {e}"
+        )),
+    };
+    if unsealed.len() != 32 {
+        let len = unsealed.len();
+        unsealed.zeroize();
+        refuse_military_kek(&format!(
+            "vTPM-unsealed master KEK has wrong length {len} (expected 32) — refusing to start"
+        ));
+    }
+    if unsealed.iter().all(|&b| b == 0) {
+        unsealed.zeroize();
+        refuse_military_kek("vTPM-unsealed master KEK is all-zero — refusing to start");
+    }
+    let mut kek = [0u8; 32];
+    kek.copy_from_slice(&unsealed);
+    unsealed.zeroize();
+    kek
+}
+
+/// Acquire the master KEK in MILITARY mode from the vTPM, or refuse.
+///
+/// This is the ONLY military KEK source. It enforces the [`MilitaryKekDecision`]
+/// table, then either:
+///   - `SingleKek`: caches the TPM-unsealed 32-byte KEK and returns it, or
+///   - `Share`:     injects the TPM-unsealed share into `MILNET_KEK_SHARE` and
+///                  routes through the existing threshold-KDF derivation.
+///
+/// Returns `None` when not in military mode (caller proceeds with the legacy
+/// hierarchy). Never returns env-sourced key material in military mode.
+fn acquire_military_kek(sealer: &dyn TpmKekSealer) -> Option<&'static [u8; 32]> {
+    match current_military_kek_decision(sealer) {
+        MilitaryKekDecision::NotMilitary => None,
+        MilitaryKekDecision::RefuseEnvMaterialPresent { which } => refuse_military_kek(&format!(
+            "env-sourced KEK material ({which}) present in military deployment. \
+             The master KEK MUST be vTPM-sealed (anti-clone). A cloned image \
+             carrying baked-in KEK material is refused. Remove the env var(s) \
+             and seal the KEK to this node's TPM via the seal ceremony."
+        )),
+        MilitaryKekDecision::RefuseNoTpm => refuse_military_kek(
+            "no vTPM available in military deployment. The master KEK MUST be \
+             sealed to and unsealed from a TPM bound to measured-boot PCRs. \
+             A node without a vTPM cannot provide clone resistance.",
+        ),
+        MilitaryKekDecision::RefuseSealedBlobMissing { mode } => refuse_military_kek(&format!(
+            "no TPM-sealed KEK blob found for mode {mode:?}. Run the seal \
+             ceremony (seal_master_kek_to_tpm) on THIS node before starting. \
+             Env-sourced KEK material is forbidden in military mode."
+        )),
+        MilitaryKekDecision::Proceed { mode } => match mode {
+            SealedKekMode::Share => {
+                // Fast path: if the threshold-KDF master is already derived and
+                // cached, don't re-unseal the share on every call.
+                if THRESHOLD_KDF_CACHE.get().is_some() {
+                    return Some(cached_master_kek_threshold_kdf());
+                }
+                military_unseal_share_into_env(sealer);
+                // Route through the existing threshold-KDF path, which now reads
+                // the TPM-unsealed share we just injected and scrubs it.
+                Some(cached_master_kek_threshold_kdf())
+            }
+            SealedKekMode::SingleKek => {
+                // Fast path: if already unsealed+cached, don't re-invoke the TPM
+                // on every call (cached_master_kek delegates here in military
+                // mode). The cache is write-once via OnceLock.
+                if let Some(cached) = MASTER_KEK_CACHE.get() {
+                    cached.lock_in_place();
+                    return Some(cached.as_bytes());
+                }
+                let kek = military_unseal_single_kek(sealer);
+                let cached = MASTER_KEK_CACHE.get_or_init(|| ProtectedKek::new(kek));
+                cached.lock_in_place();
+                Some(cached.as_bytes())
+            }
+        },
+    }
+}
+
+/// CEREMONY: seal the master KEK material to THIS node's vTPM.
+///
+/// Run ONCE per node, by an operator, BEFORE the service starts in military
+/// mode. Produces the PCR-bound sealed blob that `get_master_kek` will later
+/// unseal. The blob is written under `MILNET_SEALED_KEK_DIR` (default
+/// `/var/lib/milnet/sealed`).
+///
+/// - `SealedKekMode::SingleKek`: `material` is the 32-byte master KEK.
+/// - `SealedKekMode::Share`:     `material` is this node's `KekShare` in the
+///   66-char hex form returned by `KekShare::to_hex` (ASCII bytes).
+///
+/// After this succeeds, the corresponding env var (`MILNET_MASTER_KEK` /
+/// `MILNET_KEK_SHARE`) MUST be removed from the deployment so the node sources
+/// its KEK exclusively from the TPM. Sealing binds to
+/// [`crate::platform_integrity::MASTER_KEK_PCR_LIST`]; if the boot chain later
+/// changes (legitimate firmware update), re-run this ceremony.
+pub fn seal_master_kek_to_tpm(
+    sealer: &dyn TpmKekSealer,
+    mode: SealedKekMode,
+    material: &[u8],
+) -> Result<(), String> {
+    if !sealer.tpm_available() {
+        return Err(
+            "cannot seal KEK: no vTPM present. Sealing requires a TPM bound to \
+             measured-boot PCRs."
+                .to_string(),
+        );
+    }
+    let name = match mode {
+        SealedKekMode::SingleKek => {
+            if material.len() != 32 {
+                return Err(format!(
+                    "SingleKek sealing expects a 32-byte KEK, got {} bytes",
+                    material.len()
+                ));
+            }
+            SEALED_KEK_SINGLE_NAME
+        }
+        SealedKekMode::Share => {
+            // Validate the share parses before sealing so we never seal garbage.
+            let hex = std::str::from_utf8(material)
+                .map_err(|_| "Share sealing expects ASCII hex KekShare bytes".to_string())?;
+            crate::threshold_kek::KekShare::from_hex(hex.trim())
+                .map_err(|e| format!("Share sealing: material is not a valid KekShare: {e}"))?;
+            SEALED_KEK_SHARE_NAME
+        }
+    };
+    sealer.seal(name, material)?;
+    tracing::info!(
+        "ceremony: sealed master-KEK material (mode={:?}) to vTPM as '{}' \
+         under measured-boot PCR policy",
+        mode,
+        name,
+    );
+    Ok(())
+}
+
+// ── Per-node identity seed (INDEPENDENT of the KEK; anti-root) ───────────────
+
+/// Sealed-blob name for a node's INDEPENDENT ML-DSA-87 identity seed.
+///
+/// PER-NODE name (`node-identity-<node_id>`) so each node's identity seed is a
+/// distinct PCR-bound object. Distinct from the KEK blob names so the node
+/// identity has its own lifecycle and never collides with KEK material.
+pub fn sealed_node_identity_name(node_id: &str) -> String {
+    format!("node-identity-{node_id}")
+}
+
+/// CEREMONY: generate a fresh INDEPENDENT per-node ML-DSA-87 identity seed and
+/// seal it to THIS node's vTPM (PCR 0,2,4,7). Run ONCE per node, by an operator,
+/// BEFORE the service starts in military mode.
+///
+/// The seed is random CSPRNG output, NOT derived from the master KEK — this is
+/// the anti-root property: a KEK holder cannot reconstruct another node's seed.
+/// Returns the generated seed so the operator can derive and publish the
+/// corresponding verifying key (peers PIN that VK at cluster join). The seed
+/// itself is sealed and never leaves the node; callers MUST zeroize the returned
+/// copy once they have derived the VK.
+///
+/// Sealing binds to [`crate::platform_integrity::MASTER_KEK_PCR_LIST`]; if the
+/// boot chain later changes (legitimate firmware update), re-run this ceremony.
+pub fn seal_node_identity_to_tpm(
+    sealer: &dyn TpmKekSealer,
+    node_id: &str,
+) -> Result<[u8; 32], String> {
+    use zeroize::Zeroize;
+    if !sealer.tpm_available() {
+        return Err(
+            "cannot seal node identity: no vTPM present. The per-node identity \
+             signing key MUST be sealed to a TPM bound to measured-boot PCRs."
+                .to_string(),
+        );
+    }
+    let name = sealed_node_identity_name(node_id);
+
+    let mut seed = [0u8; 32];
+    getrandom::getrandom(&mut seed)
+        .map_err(|e| format!("CSPRNG failure generating per-node identity seed: {e}"))?;
+    if seed.iter().all(|&b| b == 0) {
+        seed.zeroize();
+        return Err("generated per-node identity seed is all-zero (CSPRNG fault)".to_string());
+    }
+    if let Err(e) = sealer.seal(&name, &seed) {
+        seed.zeroize();
+        return Err(format!(
+            "failed to TPM-seal generated per-node identity seed '{name}': {e}"
+        ));
+    }
+    tracing::info!(
+        "ceremony: generated + sealed INDEPENDENT per-node identity seed to vTPM \
+         as '{}' (PCR-bound; publish the derived verifying key for peer pinning)",
+        name,
+    );
+    Ok(seed)
+}
+
+/// Load THIS node's INDEPENDENT per-node ML-DSA-87 identity seed by UNSEALING it
+/// from the vTPM (military mode). UNSEAL-ONLY — it never generates a key.
+///
+/// FAIL-CLOSED (refuses via [`refuse_military_kek`], process exits 199) when:
+/// * no vTPM is present,
+/// * the per-node sealed blob is ABSENT (run [`seal_node_identity_to_tpm`] first),
+/// * the unseal fails (PCR mismatch — clone on different hardware — or TPM error),
+/// * the unsealed seed is not exactly 32 bytes or is all-zero.
+///
+/// The seed is INDEPENDENT of the master KEK (sealed CSPRNG output), so a KEK
+/// holder cannot derive it. A KEK-derived or env-sourced fallback is NEVER used
+/// in military mode — that is the entire point (it would re-introduce the shared
+/// single point of failure under a root-on-any-node threat model).
+///
+/// This loader is for MILITARY mode only; non-military/dev code derives its
+/// identity from the KEK (see `distributed_startup::NodeIdentity::for_node`).
+pub fn load_node_identity_seed_sealed(node_id: &str) -> [u8; 32] {
+    match load_node_identity_seed_inner(&Tpm2ToolsKekSealer::from_env(), node_id) {
+        Ok(seed) => seed,
+        Err(reason) => refuse_military_kek(&format!(
+            "per-node identity seed acquisition failed for '{node_id}': {reason}"
+        )),
+    }
+}
+
+/// Testable core of [`load_node_identity_seed_sealed`]: unseal-only, fail-closed.
+/// Takes the sealer so unit tests can inject a software TPM mock. Returns `Err`
+/// (the public wrapper turns it into a process refusal) on any failure.
+fn load_node_identity_seed_inner(
+    sealer: &dyn TpmKekSealer,
+    node_id: &str,
+) -> Result<[u8; 32], String> {
+    use zeroize::Zeroize;
+    if !sealer.tpm_available() {
+        return Err(
+            "no vTPM available — the per-node identity signing key MUST be \
+             unsealed from this node's TPM (anti-clone, anti-root)."
+                .to_string(),
+        );
+    }
+    let name = sealed_node_identity_name(node_id);
+    if !sealer.blob_exists(&name) {
+        return Err(format!(
+            "no sealed per-node identity blob '{name}'. Run the seal ceremony \
+             (seal_node_identity_to_tpm) on THIS node before starting. A \
+             KEK-derived/env fallback is forbidden in military mode."
+        ));
+    }
+    let mut unsealed = sealer.unseal(&name).map_err(|e| {
+        format!(
+            "vTPM unseal of per-node identity '{name}' failed (PCR mismatch — \
+             clone on different hardware — corrupt blob, or TPM error): {e}"
+        )
+    })?;
+    if unsealed.len() != 32 {
+        let len = unsealed.len();
+        unsealed.zeroize();
+        return Err(format!(
+            "vTPM-unsealed per-node identity seed has wrong length {len} (expected 32)"
+        ));
+    }
+    if unsealed.iter().all(|&b| b == 0) {
+        unsealed.zeroize();
+        return Err("vTPM-unsealed per-node identity seed is all-zero".to_string());
+    }
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&unsealed);
+    unsealed.zeroize();
+    tracing::info!(
+        target: "siem",
+        "per-node ML-DSA-87 identity seed unsealed from vTPM '{}' (PCR-bound, \
+         independent of KEK)",
+        name,
+    );
+    Ok(seed)
+}
+
 /// Unified entry point for obtaining the master KEK.
 ///
 /// Load hierarchy (most secure first):
-/// 1. Threshold KDF (distributed, KEK never in RAM) -- DEFAULT
+/// 0. **Military mode**: vTPM-sealed KEK / share, bound to measured-boot PCRs.
+///    This is the ONLY military path; env-sourced material is refused.
+/// 1. Threshold KDF (distributed, KEK never in RAM) -- DEFAULT (non-military)
 /// 2. Threshold reconstruction (distributed, KEK materializes briefly)
 /// 3. Single env var ONLY if MLP mode acknowledged
 ///
-/// In military mode: threshold KDF is MANDATORY, no bypass.
+/// In military mode: vTPM sealing is MANDATORY, no env bypass.
 /// In production without MLP: single env var is rejected.
 ///
 /// All services SHOULD use this function instead of calling `cached_master_kek()`
 /// or `load_master_kek()` directly.
 pub fn get_master_kek() -> &'static [u8; 32] {
+    // Path 0: Military mode MUST source KEK material from the vTPM (anti-clone).
+    // Returns Some(..) when military; refuses (exit 199) on any TPM failure or
+    // if env-sourced KEK material is present. Returns None when not military, in
+    // which case we fall through to the unchanged legacy hierarchy below.
+    if let Some(kek) = acquire_military_kek(&Tpm2ToolsKekSealer::from_env()) {
+        return kek;
+    }
+
+    // NOTE: In military mode, Path 0 above has already returned (Some) or
+    // refused (exit 199), so execution only reaches here in NON-military mode.
+    // The `is_military` guards below are retained as defense-in-depth: a
+    // belt-and-suspenders fail-closed backstop should Path 0 ever be altered.
     let is_military = std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1");
     let is_mlp_ack = std::env::var("MILNET_MLP_MODE_ACK").as_deref() == Ok("1");
     let allow_single_kek = std::env::var("MILNET_ALLOW_SINGLE_KEK").as_deref() == Ok("1");
@@ -1914,6 +2559,358 @@ pub(crate) fn verify_uds_peer_is_trusted(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    // -----------------------------------------------------------------------
+    // Software TPM test double
+    // -----------------------------------------------------------------------
+    //
+    // Simulates the anti-clone PCR binding of a real vTPM WITHOUT hardware, so
+    // the gating decisions are testable in CI. Each seal captures the sealer's
+    // current "PCR value"; unseal succeeds ONLY if the live PCR value still
+    // matches. Mutating `pcr` models a clone on different hardware / a changed
+    // boot chain: the captured policy no longer matches and unseal fails closed,
+    // exactly like `tpm2_unseal` rejecting a mismatched `tpm2_policypcr` digest.
+    // `team-lead` exercises the REAL `Tpm2ToolsKekSealer` against swtpm on OCI.
+    struct SoftwareTpmSealer {
+        present: bool,
+        /// Simulated PCR bank value (changes ⇒ different hardware / boot chain).
+        pcr: Mutex<u64>,
+        /// name -> (pcr_at_seal, plaintext)
+        store: Mutex<HashMap<String, (u64, Vec<u8>)>>,
+    }
+
+    impl SoftwareTpmSealer {
+        fn new(present: bool) -> Self {
+            Self {
+                present,
+                pcr: Mutex::new(0xA11CE),
+                store: Mutex::new(HashMap::new()),
+            }
+        }
+        /// Simulate a clone on different hardware: PCR values differ.
+        fn change_pcr(&self) {
+            *self.pcr.lock().unwrap() = 0xDEAD_BEEF;
+        }
+    }
+
+    impl TpmKekSealer for SoftwareTpmSealer {
+        fn seal(&self, name: &str, secret: &[u8]) -> Result<(), String> {
+            if !self.present {
+                return Err("software TPM: not present".into());
+            }
+            let pcr = *self.pcr.lock().unwrap();
+            self.store
+                .lock()
+                .unwrap()
+                .insert(name.to_string(), (pcr, secret.to_vec()));
+            Ok(())
+        }
+        fn unseal(&self, name: &str) -> Result<Vec<u8>, String> {
+            if !self.present {
+                return Err("software TPM: not present".into());
+            }
+            let store = self.store.lock().unwrap();
+            let (sealed_pcr, data) = store
+                .get(name)
+                .ok_or_else(|| format!("software TPM: no sealed blob '{name}'"))?;
+            let live_pcr = *self.pcr.lock().unwrap();
+            if *sealed_pcr != live_pcr {
+                // Clone on different hardware: PCR policy not satisfied.
+                return Err(format!(
+                    "software TPM: PCR mismatch for '{name}' (sealed={sealed_pcr:#x}, \
+                     live={live_pcr:#x}) — clone on different hardware, fail closed"
+                ));
+            }
+            Ok(data.clone())
+        }
+        fn blob_exists(&self, name: &str) -> bool {
+            self.present && self.store.lock().unwrap().contains_key(name)
+        }
+        fn tpm_available(&self) -> bool {
+            self.present
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // PER-NODE IDENTITY SEED — TPM-sealed, INDEPENDENT of the KEK (anti-root)
+    // -----------------------------------------------------------------------
+
+    /// Ceremony seals an independent seed; the loader then UNSEALS the SAME seed.
+    #[test]
+    fn node_identity_ceremony_seal_then_load() {
+        let sealer = SoftwareTpmSealer::new(true);
+        let node = "00000000-0000-0000-0000-00000000000a";
+
+        // No blob before the ceremony.
+        assert!(!sealer.blob_exists(&sealed_node_identity_name(node)));
+
+        let sealed = seal_node_identity_to_tpm(&sealer, node).expect("ceremony should seal");
+        assert!(sealed.iter().any(|&b| b != 0), "sealed seed must be non-zero");
+        assert!(sealer.blob_exists(&sealed_node_identity_name(node)));
+
+        // Loader unseals the SAME seed.
+        let loaded = load_node_identity_seed_inner(&sealer, node).expect("load should unseal");
+        assert_eq!(sealed, loaded, "loaded seed must equal the sealed seed");
+    }
+
+    /// FAIL-CLOSED: loading with NO prior ceremony (absent blob) refuses
+    /// (unseal-only; never auto-generates at runtime).
+    #[test]
+    fn node_identity_load_absent_blob_fails_closed() {
+        let sealer = SoftwareTpmSealer::new(true);
+        let r = load_node_identity_seed_inner(&sealer, "node-x");
+        assert!(r.is_err(), "absent per-node blob must fail closed");
+        assert!(r.unwrap_err().contains("no sealed per-node identity blob"));
+    }
+
+    /// FAIL-CLOSED: no vTPM ⇒ both ceremony and loader refuse.
+    #[test]
+    fn node_identity_no_tpm_fails_closed() {
+        let sealer = SoftwareTpmSealer::new(false);
+        assert!(seal_node_identity_to_tpm(&sealer, "node-x").is_err());
+        let r = load_node_identity_seed_inner(&sealer, "node-x");
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("vTPM"));
+    }
+
+    /// FAIL-CLOSED: a clone on different hardware cannot unseal (PCR mismatch).
+    #[test]
+    fn node_identity_clone_pcr_mismatch_fails_closed() {
+        let sealer = SoftwareTpmSealer::new(true);
+        let node = "node-clone";
+        let _ = seal_node_identity_to_tpm(&sealer, node).expect("seal on original hardware");
+        // Move the sealed blob to different hardware.
+        sealer.change_pcr();
+        let r = load_node_identity_seed_inner(&sealer, node);
+        assert!(r.is_err(), "clone on different hardware must fail closed");
+        assert!(r.unwrap_err().contains("PCR mismatch"));
+    }
+
+    /// Two DIFFERENT nodes get INDEPENDENT seeds AND distinct per-node blob names.
+    /// This is the anti-root property: root on one node yields only that node's
+    /// seed (no shared derivation, no shared blob).
+    #[test]
+    fn node_identity_seeds_independent_across_nodes() {
+        let sealer = SoftwareTpmSealer::new(true);
+        let seed_a = seal_node_identity_to_tpm(&sealer, "node-a").unwrap();
+        let seed_b = seal_node_identity_to_tpm(&sealer, "node-b").unwrap();
+        assert_ne!(seed_a, seed_b, "independent per-node seeds must differ");
+        assert_ne!(
+            sealed_node_identity_name("node-a"),
+            sealed_node_identity_name("node-b"),
+            "per-node blob names must differ"
+        );
+        // Each node loads its OWN seed.
+        assert_eq!(load_node_identity_seed_inner(&sealer, "node-a").unwrap(), seed_a);
+        assert_eq!(load_node_identity_seed_inner(&sealer, "node-b").unwrap(), seed_b);
+    }
+
+    /// The per-node blob name is `node-identity-<node_id>`.
+    #[test]
+    fn node_identity_blob_name_is_per_node() {
+        assert_eq!(sealed_node_identity_name("abc"), "node-identity-abc");
+    }
+
+    // -----------------------------------------------------------------------
+    // GATING DECISION TABLE — the security core (pure, no process::exit)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn decision_non_military_passes_through() {
+        // Not military ⇒ legacy hierarchy, regardless of TPM/env state.
+        let d = decide_military_kek_source(
+            false, true, true, false, SealedKekMode::Share, false, false,
+        );
+        assert_eq!(d, MilitaryKekDecision::NotMilitary);
+    }
+
+    #[test]
+    fn decision_military_with_env_master_kek_refuses() {
+        // SECURITY: env-sourced master KEK in military mode MUST be refused,
+        // NEVER consumed (a clone carries the same env var). This is the heart
+        // of the anti-clone fix.
+        let d = decide_military_kek_source(
+            true, /*master_in_env=*/ true, false, true, SealedKekMode::SingleKek, true, true,
+        );
+        assert!(
+            matches!(d, MilitaryKekDecision::RefuseEnvMaterialPresent { .. }),
+            "env master KEK in military mode must refuse, got {d:?}"
+        );
+    }
+
+    #[test]
+    fn decision_military_with_env_share_refuses() {
+        // Even though a share would normally drive threshold KDF, in military
+        // mode the share MUST come from the TPM, not the environment.
+        let d = decide_military_kek_source(
+            true, false, /*share_in_env=*/ true, true, SealedKekMode::Share, true, true,
+        );
+        assert!(
+            matches!(d, MilitaryKekDecision::RefuseEnvMaterialPresent { .. }),
+            "env KEK share in military mode must refuse, got {d:?}"
+        );
+    }
+
+    #[test]
+    fn decision_env_material_refused_even_before_tpm_check() {
+        // Ordering guarantee: env material is rejected even when there is NO
+        // TPM and NO blob — we must not "fall back" to env under any condition.
+        let d = decide_military_kek_source(
+            true, true, false, /*tpm=*/ false, SealedKekMode::SingleKek, false, false,
+        );
+        assert!(matches!(
+            d,
+            MilitaryKekDecision::RefuseEnvMaterialPresent { .. }
+        ));
+    }
+
+    #[test]
+    fn decision_military_no_tpm_refuses() {
+        let d = decide_military_kek_source(
+            true, false, false, /*tpm=*/ false, SealedKekMode::Share, false, false,
+        );
+        assert_eq!(d, MilitaryKekDecision::RefuseNoTpm);
+    }
+
+    #[test]
+    fn decision_military_missing_blob_refuses() {
+        // TPM present, no env material, but the seal ceremony never ran.
+        let d = decide_military_kek_source(
+            true, false, false, true, SealedKekMode::Share,
+            /*single_blob=*/ false, /*share_blob=*/ false,
+        );
+        assert_eq!(
+            d,
+            MilitaryKekDecision::RefuseSealedBlobMissing { mode: SealedKekMode::Share }
+        );
+    }
+
+    #[test]
+    fn decision_share_mode_ignores_single_blob_presence() {
+        // Share mode requires the SHARE blob; a stray single blob must not
+        // satisfy it.
+        let d = decide_military_kek_source(
+            true, false, false, true, SealedKekMode::Share,
+            /*single_blob=*/ true, /*share_blob=*/ false,
+        );
+        assert_eq!(
+            d,
+            MilitaryKekDecision::RefuseSealedBlobMissing { mode: SealedKekMode::Share }
+        );
+    }
+
+    #[test]
+    fn decision_military_share_proceeds_when_ready() {
+        let d = decide_military_kek_source(
+            true, false, false, true, SealedKekMode::Share, false, /*share_blob=*/ true,
+        );
+        assert_eq!(d, MilitaryKekDecision::Proceed { mode: SealedKekMode::Share });
+    }
+
+    #[test]
+    fn decision_military_single_proceeds_when_ready() {
+        let d = decide_military_kek_source(
+            true, false, false, true, SealedKekMode::SingleKek, /*single_blob=*/ true, false,
+        );
+        assert_eq!(d, MilitaryKekDecision::Proceed { mode: SealedKekMode::SingleKek });
+    }
+
+    // -----------------------------------------------------------------------
+    // Software-TPM seal/unseal round-trip + clone (PCR mismatch) rejection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn software_tpm_single_kek_round_trip() {
+        let tpm = SoftwareTpmSealer::new(true);
+        let kek = [0x5Au8; 32];
+        seal_master_kek_to_tpm(&tpm, SealedKekMode::SingleKek, &kek).unwrap();
+        assert!(tpm.blob_exists(SEALED_KEK_SINGLE_NAME));
+        let out = tpm.unseal(SEALED_KEK_SINGLE_NAME).unwrap();
+        assert_eq!(out, kek.to_vec(), "unseal must recover the sealed KEK");
+    }
+
+    #[test]
+    fn software_tpm_clone_on_different_hardware_fails_unseal() {
+        // ANTI-CLONE: seal on this "hardware", then simulate a clone whose PCRs
+        // differ. Unseal MUST fail closed — the whole point of the fix.
+        let tpm = SoftwareTpmSealer::new(true);
+        let kek = [0x33u8; 32];
+        seal_master_kek_to_tpm(&tpm, SealedKekMode::SingleKek, &kek).unwrap();
+        tpm.change_pcr(); // clone / different boot chain
+        let err = tpm.unseal(SEALED_KEK_SINGLE_NAME).unwrap_err();
+        assert!(err.contains("PCR mismatch"), "expected PCR mismatch, got: {err}");
+    }
+
+    #[test]
+    fn seal_single_kek_rejects_wrong_length() {
+        let tpm = SoftwareTpmSealer::new(true);
+        let too_short = [0u8; 16];
+        let err = seal_master_kek_to_tpm(&tpm, SealedKekMode::SingleKek, &too_short).unwrap_err();
+        assert!(err.contains("32-byte"), "got: {err}");
+    }
+
+    #[test]
+    fn seal_rejects_when_no_tpm() {
+        let tpm = SoftwareTpmSealer::new(false);
+        let kek = [0u8; 32];
+        let err = seal_master_kek_to_tpm(&tpm, SealedKekMode::SingleKek, &kek).unwrap_err();
+        assert!(err.contains("no vTPM"), "got: {err}");
+    }
+
+    #[test]
+    fn seal_share_mode_validates_and_round_trips() {
+        // Build a real KekShare and seal its hex form, then unseal it back.
+        let shares = crate::threshold_kek::split_secret(&[0x77u8; 32], 3, 5).unwrap();
+        let share_hex = shares[0].to_hex();
+        let tpm = SoftwareTpmSealer::new(true);
+        seal_master_kek_to_tpm(&tpm, SealedKekMode::Share, share_hex.as_bytes()).unwrap();
+        assert!(tpm.blob_exists(SEALED_KEK_SHARE_NAME));
+        let out = tpm.unseal(SEALED_KEK_SHARE_NAME).unwrap();
+        assert_eq!(out, share_hex.as_bytes().to_vec());
+        // And the unsealed bytes still parse as a share.
+        let parsed = crate::threshold_kek::KekShare::from_hex(
+            std::str::from_utf8(&out).unwrap().trim(),
+        );
+        assert!(parsed.is_ok());
+    }
+
+    #[test]
+    fn seal_share_mode_rejects_garbage() {
+        let tpm = SoftwareTpmSealer::new(true);
+        let err = seal_master_kek_to_tpm(&tpm, SealedKekMode::Share, b"not-a-share").unwrap_err();
+        assert!(err.contains("not a valid KekShare"), "got: {err}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn sealed_kek_mode_from_env_maps_correctly() {
+        // Default posture is distributed (share), per military threshold policy.
+        std::env::remove_var("MILNET_SEALED_KEK_MODE");
+        assert_eq!(sealed_kek_mode_from_env(), SealedKekMode::Share);
+
+        std::env::set_var("MILNET_SEALED_KEK_MODE", "single");
+        assert_eq!(sealed_kek_mode_from_env(), SealedKekMode::SingleKek);
+
+        std::env::set_var("MILNET_SEALED_KEK_MODE", "share");
+        assert_eq!(sealed_kek_mode_from_env(), SealedKekMode::Share);
+
+        // Unknown value falls back to the safe default (share).
+        std::env::set_var("MILNET_SEALED_KEK_MODE", "bogus");
+        assert_eq!(sealed_kek_mode_from_env(), SealedKekMode::Share);
+
+        std::env::remove_var("MILNET_SEALED_KEK_MODE");
+    }
+
+    #[test]
+    fn master_kek_pcr_list_is_measured_boot_set() {
+        // Anti-clone binding uses the full measured-boot PCR set 0,2,4,7.
+        assert_eq!(
+            crate::platform_integrity::MASTER_KEK_PCR_LIST,
+            "sha256:0,2,4,7"
+        );
+    }
 
     #[test]
     fn derive_unseal_key_is_consistent() {

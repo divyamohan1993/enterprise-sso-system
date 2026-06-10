@@ -116,15 +116,23 @@ impl CacAuthenticator {
     /// Full CAC authentication flow.
     ///
     /// Steps:
-    /// 1. Check PIN lockout for the card in `session`.
-    /// 2. Log in with the supplied PIN.
-    /// 3. Retrieve the PIV authentication certificate.
-    /// 4. Validate the certificate chain against trusted CAs.
-    /// 5. Sign the `challenge` bytes with the card's private key.
-    /// 6. Verify the signature in software.
-    /// 7. Build and return [`CacCardInfo`] plus the raw signature.
+    /// 1. Log in with the supplied PIN (lockout tracked).
+    /// 2. Retrieve the PIV authentication certificate from the card.
+    /// 3. **Validate the certificate chain to a trusted DoD PKI anchor**
+    ///    (RFC 5280 §6.1): signature chain, validity window, id-kp-clientAuth
+    ///    EKU, and required assurance policy OIDs. A certificate that does not
+    ///    chain to a trusted CA is rejected here — BEFORE it is trusted for
+    ///    anything (zerotrust-gw F1).
+    /// 4. Sign the `challenge` bytes with the card's private key.
+    /// 5. Verify the challenge signature against the now-TRUSTED certificate.
+    /// 6. **Check revocation** (OCSP/CRL) and apply the fail-closed policy
+    ///    (zerotrust-gw F2): a revoked certificate, or an undetermined status
+    ///    in military-deployment mode, denies access.
+    /// 7. Build [`CacCardInfo`], deriving the clearance from the VALIDATED
+    ///    certificate's policy OIDs (never from the attacker-supplied cert).
     ///
-    /// Emits SIEM events for success and failure.
+    /// Emits SIEM events for success and failure. Fail-closed throughout: any
+    /// validation, revocation, or signature failure denies authentication.
     pub fn authenticate(
         &mut self,
         pin: &[u8],
@@ -161,7 +169,37 @@ impl CacAuthenticator {
             }
         };
 
-        // Step 3: Sign the challenge.
+        // Step 2b: Retrieve any issuing-CA certificates the card presents so the
+        // chain can be built. Absence is tolerated (the EE may be issued
+        // directly by a trusted root); the chain builder fails closed if no
+        // path to a trust anchor exists.
+        let intermediates = session
+            .find_certificate("PIV CA")
+            .map(|c| vec![c])
+            .unwrap_or_default();
+
+        // Step 3: Validate the certificate chain to a trusted DoD PKI anchor
+        // BEFORE the certificate is trusted for anything. This is the F1 fix —
+        // without it a self-signed cert could self-assert TOP SECRET.
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let validated = match validate_piv_cert_chain(
+            &cert_der,
+            &intermediates,
+            &self.config,
+            now_unix,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(error = %e, "CAC certificate chain validation FAILED — denying");
+                emit_cac_auth_failure("chain_validation_failed");
+                return Err(e);
+            }
+        };
+
+        // Step 4: Sign the challenge.
         let signature = match session.sign_data(
             "PIV AUTH",
             challenge,
@@ -174,7 +212,7 @@ impl CacAuthenticator {
             }
         };
 
-        // Step 4: Verify the signature in software.
+        // Step 5: Verify the challenge signature against the TRUSTED cert.
         match Pkcs11Session::verify_signature(&cert_der, challenge, &signature) {
             Ok(true) => {}
             Ok(false) => {
@@ -189,16 +227,41 @@ impl CacAuthenticator {
             }
         }
 
-        // Step 5: Build card info.
-        let card_info = match session.get_card_info() {
+        // Step 6: Revocation check, fail-closed. A revoked certificate is
+        // always rejected; an undetermined status is rejected in military
+        // deployment mode (F2). Non-military mode degrades to availability.
+        match self.check_revocation(&cert_der) {
+            Ok(status) => match fail_closed_on_unavailable(status)? {
+                RevocationStatus::Revoked { reason, .. } => {
+                    tracing::error!(reason = %reason, "CAC certificate is REVOKED — denying");
+                    emit_cac_auth_failure("certificate_revoked");
+                    return Err(CacError::RevocationCheckFailed(format!(
+                        "certificate revoked: {reason}"
+                    )));
+                }
+                _ => {}
+            },
+            Err(e) => {
+                // A revocation check that errors (e.g. fail-closed military
+                // policy) denies access.
+                tracing::error!(error = %e, "CAC revocation check failed — denying");
+                emit_cac_auth_failure("revocation_check_failed");
+                return Err(e);
+            }
+        }
+
+        // Step 7: Build card info and override the clearance with the value
+        // derived from the VALIDATED certificate's policy OIDs.
+        let mut card_info = match session.get_card_info() {
             Ok(info) => info,
             Err(e) => {
                 emit_cac_auth_failure("card_info_failed");
                 return Err(e);
             }
         };
+        card_info.clearance_level = validated.clearance_level;
 
-        // Step 6: Reset PIN counter on success.
+        // Reset PIN counter on success.
         self.reset_pin_counter(&card_info.card_serial);
 
         emit_cac_auth_success(&card_info.card_serial, card_info.clearance_level);
@@ -684,30 +747,224 @@ fn parse_ocsp_cert_status(response_der: &[u8]) -> Result<RevocationStatus, CacEr
     Ok(RevocationStatus::Unknown)
 }
 
-/// Verify the OCSP response signature against trusted CA certificates.
+/// Verify the BasicOCSPResponse signature against trusted CA certificates.
 ///
-/// The BasicOCSPResponse signature is verified against the OCSP signing
-/// certificate, which must chain to one of the trusted CAs.
+/// SECURITY (zerotrust-gw F2): the previous implementation returned `true` for
+/// any DER SEQUENCE, so a forged OCSP "good" response would be accepted and a
+/// revoked certificate could authenticate. This performs real RFC 6960
+/// §4.2.1/§4.2.2.2 verification:
+///
+///   1. Unwrap `OCSPResponse → responseBytes [0] → SEQUENCE → response OCTET
+///      STRING → BasicOCSPResponse`.
+///   2. Parse `BasicOCSPResponse ::= SEQUENCE { tbsResponseData,
+///      signatureAlgorithm, signature BIT STRING, [0] certs OPTIONAL }`.
+///   3. Cryptographically verify `signature` over the raw `tbsResponseData`
+///      bytes using the signer's public key.
+///   4. The signer must be authorized: either a directly-trusted CA, OR a
+///      delegated responder certificate that itself chains (signature-verified)
+///      to a trusted CA and asserts the id-kp-OCSPSigning EKU.
+///
+/// Returns `false` (fail-closed) on any parse failure, missing/invalid
+/// signature, untrusted signer, or unsupported algorithm.
 fn verify_ocsp_signature(response_der: &[u8], trusted_ca_certs: &[Vec<u8>]) -> bool {
     if trusted_ca_certs.is_empty() {
         tracing::warn!("no trusted CA certificates configured for OCSP signature verification");
         return false;
     }
 
-    // In a full implementation, extract the signature and signing certificate
-    // from BasicOCSPResponse, then verify the signature and chain the signer
-    // back to a trusted CA. For now, verify the response is structurally valid
-    // and a signing cert is present.
-    if response_der.len() < 20 {
+    let basic = match extract_basic_ocsp_response(response_der) {
+        Some(b) => b,
+        None => {
+            tracing::warn!(
+                target: "siem",
+                "SIEM:CRITICAL OCSP response is not a well-formed BasicOCSPResponse"
+            );
+            return false;
+        }
+    };
+
+    // Parse the BasicOCSPResponse SEQUENCE.
+    let (btag, binner, _) = match der_read_tlv(&basic, 0) {
+        Some(v) => v,
+        None => return false,
+    };
+    if btag != 0x30 {
         return false;
     }
 
-    // The response must be a valid DER SEQUENCE
-    if response_der[0] != 0x30 {
+    // tbsResponseData (raw bytes that were signed).
+    let (_, _, tbs_end) = match der_read_tlv(binner, 0) {
+        Some(v) => v,
+        None => return false,
+    };
+    let tbs_response_data = &binner[0..tbs_end];
+
+    // signatureAlgorithm SEQUENCE -> OID.
+    let (sa_tag, sa_val, sa_end) = match der_read_tlv(binner, tbs_end) {
+        Some(v) => v,
+        None => return false,
+    };
+    if sa_tag != 0x30 {
         return false;
     }
+    let sig_alg_oid = match der_read_tlv(sa_val, 0)
+        .filter(|(t, _, _)| *t == 0x06)
+        .and_then(|(_, oid, _)| oid_bytes_to_dotted(oid))
+    {
+        Some(o) => o,
+        None => return false,
+    };
 
-    true
+    // signature BIT STRING (strip unused-bits octet).
+    let (sig_tag, sig_bits, sig_end) = match der_read_tlv(binner, sa_end) {
+        Some(v) => v,
+        None => return false,
+    };
+    if sig_tag != 0x03 || sig_bits.is_empty() {
+        return false;
+    }
+    let signature = &sig_bits[1..];
+
+    // Optional [0] EXPLICIT certs — embedded signer certificate(s).
+    let embedded_certs = if sig_end < binner.len() {
+        extract_ocsp_certs(&binner[sig_end..])
+    } else {
+        Vec::new()
+    };
+
+    let alg = match parse_chain_sig_alg(&sig_alg_oid) {
+        Some(a) => a,
+        None => {
+            tracing::warn!(
+                target: "siem",
+                sig_alg = %sig_alg_oid,
+                "SIEM:CRITICAL OCSP response signed with unsupported algorithm — rejecting"
+            );
+            return false;
+        }
+    };
+
+    // Try the trusted CAs directly as the signer (CA-signed OCSP response).
+    for ca_der in trusted_ca_certs {
+        if let Some(ca) = ParsedCert::parse(ca_der) {
+            if verify_signature_spki(alg, &ca.spki_der, tbs_response_data, signature) {
+                return true;
+            }
+        }
+    }
+
+    // Otherwise try each embedded responder cert: it must (a) sign the response
+    // and (b) be a delegated responder authorized by a trusted CA.
+    for resp_der in &embedded_certs {
+        let responder = match ParsedCert::parse(resp_der) {
+            Some(c) => c,
+            None => continue,
+        };
+        if !verify_signature_spki(alg, &responder.spki_der, tbs_response_data, signature) {
+            continue;
+        }
+        // RFC 6960 §4.2.2.2: delegated responder must assert id-kp-OCSPSigning
+        // and chain to a trusted CA.
+        if !responder.is_ocsp_signer {
+            tracing::warn!(
+                target: "siem",
+                "SIEM:CRITICAL OCSP responder cert lacks id-kp-OCSPSigning EKU — rejecting"
+            );
+            continue;
+        }
+        // Verify the responder cert is signed by a trusted CA.
+        for ca_der in trusted_ca_certs {
+            if let Some(ca) = ParsedCert::parse(ca_der) {
+                if ca.is_ca
+                    && ca.subject_dn == responder.issuer_dn
+                    && verify_issuer_signature(&responder, &ca).is_ok()
+                {
+                    return true;
+                }
+            }
+        }
+    }
+
+    tracing::warn!(
+        target: "siem",
+        "SIEM:CRITICAL OCSP response signature could not be verified against any trusted CA \
+         or authorized delegated responder — possible forged response"
+    );
+    false
+}
+
+/// Unwrap an `OCSPResponse` DER to the inner `BasicOCSPResponse` DER bytes.
+///
+/// `OCSPResponse ::= SEQUENCE { responseStatus ENUMERATED,
+///                              responseBytes [0] EXPLICIT ResponseBytes OPTIONAL }`
+/// `ResponseBytes ::= SEQUENCE { responseType OID, response OCTET STRING }`
+/// The `response` OCTET STRING contains the DER-encoded `BasicOCSPResponse`.
+fn extract_basic_ocsp_response(response_der: &[u8]) -> Option<Vec<u8>> {
+    let (tag, inner, _) = der_read_tlv(response_der, 0)?;
+    if tag != 0x30 {
+        return None;
+    }
+    // responseStatus ENUMERATED.
+    let (st_tag, _, st_end) = der_read_tlv(inner, 0)?;
+    if st_tag != 0x0a {
+        return None;
+    }
+    // responseBytes [0] EXPLICIT.
+    let (rb_tag, rb_val, _) = der_read_tlv(inner, st_end)?;
+    if rb_tag != 0xa0 {
+        return None;
+    }
+    // ResponseBytes SEQUENCE.
+    let (rseq_tag, rseq_val, _) = der_read_tlv(rb_val, 0)?;
+    if rseq_tag != 0x30 {
+        return None;
+    }
+    // responseType OID.
+    let (rt_tag, _, rt_end) = der_read_tlv(rseq_val, 0)?;
+    if rt_tag != 0x06 {
+        return None;
+    }
+    // response OCTET STRING -> BasicOCSPResponse.
+    let (resp_tag, resp_val, _) = der_read_tlv(rseq_val, rt_end)?;
+    if resp_tag != 0x04 {
+        return None;
+    }
+    Some(resp_val.to_vec())
+}
+
+/// Extract embedded certificates from the `[0] EXPLICIT certs` field of a
+/// BasicOCSPResponse (a SEQUENCE OF Certificate). Returns each cert's DER.
+fn extract_ocsp_certs(certs_field: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    // [0] EXPLICIT wrapper.
+    let (tag, inner, _) = match der_read_tlv(certs_field, 0) {
+        Some(v) => v,
+        None => return out,
+    };
+    if tag != 0xa0 {
+        return out;
+    }
+    // SEQUENCE OF Certificate.
+    let (stag, seq_val, _) = match der_read_tlv(inner, 0) {
+        Some(v) => v,
+        None => return out,
+    };
+    if stag != 0x30 {
+        return out;
+    }
+    let mut pos = 0;
+    while pos < seq_val.len() {
+        let start = pos;
+        let (ctag, _, next) = match der_read_tlv(seq_val, pos) {
+            Some(v) => v,
+            None => break,
+        };
+        pos = next;
+        if ctag == 0x30 {
+            out.push(seq_val[start..next].to_vec());
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1117,6 +1374,484 @@ fn der_read_length(data: &[u8], pos: usize) -> Option<(usize, usize)> {
 }
 
 // ---------------------------------------------------------------------------
+// X.509 path validation (RFC 5280) for PIV/CAC authentication certificates
+// ---------------------------------------------------------------------------
+//
+// SECURITY (zerotrust-gw F1): the previous `authenticate` flow trusted the
+// public key embedded in an ATTACKER-SUPPLIED certificate and read the security
+// clearance straight out of that cert's policy OIDs. A self-signed certificate
+// could therefore self-assert TOP SECRET. `validate_piv_cert_chain` closes that
+// hole: it builds and cryptographically verifies the certificate chain to a
+// configured DoD PKI trust anchor, enforces the validity window, the
+// id-kp-clientAuth EKU, BasicConstraints on CA certs, and the required DoD
+// assurance policy OIDs — and ONLY then is the (now trusted) certificate used
+// for challenge verification and clearance extraction.
+//
+// References:
+//   * RFC 5280 §6.1 — Certification Path Validation (basic path processing).
+//   * RFC 5280 §4.2.1.3 — Key Usage; §4.2.1.12 — Extended Key Usage.
+//   * RFC 5280 §4.2.1.4 — Certificate Policies; §4.2.1.9 — Basic Constraints.
+//   * NIST SP 800-73-4 — PIV authentication certificate asserts id-kp-clientAuth.
+//   * DoD PKI CP — assurance is conveyed via certificate policy OIDs.
+
+/// A certificate that has passed full path validation and may now be trusted.
+///
+/// Produced only by [`validate_piv_cert_chain`]. Carries the data the caller
+/// needs AFTER the chain is trusted: the security clearance derived from the
+/// validated policy OIDs, the SubjectPublicKeyInfo for challenge verification,
+/// and the serial number for revocation lookups.
+#[derive(Debug, Clone)]
+pub struct ValidatedCert {
+    /// DoD clearance level (0-4) derived from the validated certificate's
+    /// policy OIDs. Safe to trust because the cert chained to a trusted CA.
+    pub clearance_level: u8,
+    /// Policy OIDs asserted by the end-entity certificate (dotted-decimal).
+    pub policy_oids: Vec<String>,
+    /// SubjectPublicKeyInfo (DER) of the end-entity certificate, for verifying
+    /// the challenge-response signature.
+    pub spki_der: Vec<u8>,
+    /// Certificate serial number (low 64 bits) for CRL/OCSP lookups.
+    pub serial: u64,
+}
+
+/// A certificate signature algorithm we can verify with the FIPS backend.
+///
+/// Anything outside this set is rejected fail-closed rather than skipped: an
+/// unverifiable signature algorithm MUST NOT be treated as a valid signature.
+/// All map to an `aws-lc-rs` `VerificationAlgorithm` (one uniform FIPS-validated
+/// backend); the `rsa` crate (RUSTSEC-2023-0071 / Marvin) is NOT used.
+#[derive(Clone, Copy)]
+enum ChainSigAlg {
+    RsaPkcs1Sha256,
+    RsaPkcs1Sha384,
+    RsaPkcs1Sha512,
+    EcdsaP256Sha256,
+    EcdsaP384Sha384,
+}
+
+impl ChainSigAlg {
+    /// The corresponding aws-lc-rs verification algorithm.
+    fn algorithm(self) -> &'static dyn aws_lc_rs::signature::VerificationAlgorithm {
+        use aws_lc_rs::signature::{
+            ECDSA_P256_SHA256_ASN1, ECDSA_P384_SHA384_ASN1, RSA_PKCS1_2048_8192_SHA256,
+            RSA_PKCS1_2048_8192_SHA384, RSA_PKCS1_2048_8192_SHA512,
+        };
+        match self {
+            ChainSigAlg::RsaPkcs1Sha256 => &RSA_PKCS1_2048_8192_SHA256,
+            ChainSigAlg::RsaPkcs1Sha384 => &RSA_PKCS1_2048_8192_SHA384,
+            ChainSigAlg::RsaPkcs1Sha512 => &RSA_PKCS1_2048_8192_SHA512,
+            ChainSigAlg::EcdsaP256Sha256 => &ECDSA_P256_SHA256_ASN1,
+            ChainSigAlg::EcdsaP384Sha384 => &ECDSA_P384_SHA384_ASN1,
+        }
+    }
+}
+
+/// Verify `signature` over `message` using the signer's SubjectPublicKeyInfo
+/// (DER) via the FIPS-validated aws-lc-rs backend.
+///
+/// aws-lc-rs accepts X.509 SPKI DER for both RSA and ECDSA keys and hashes the
+/// message internally. RSA keys < 2048 bits are rejected by the chosen
+/// algorithm parameters. Returns `false` on any verification failure.
+fn verify_signature_spki(
+    alg: ChainSigAlg,
+    signer_spki_der: &[u8],
+    message: &[u8],
+    signature: &[u8],
+) -> bool {
+    aws_lc_rs::signature::UnparsedPublicKey::new(alg.algorithm(), signer_spki_der)
+        .verify(message, signature)
+        .is_ok()
+}
+
+/// Map a DoD/PIV certificate-policy OID set to the maximum clearance level.
+///
+/// Mirrors [`CacAuthenticator::extract_clearance_dod`] but operates on
+/// already-extracted, dotted-decimal policy OIDs from a VALIDATED certificate.
+fn clearance_from_policy_oids(policy_oids: &[String]) -> u8 {
+    let mut max_level: u8 = 0;
+    for oid in policy_oids {
+        let level = match oid.as_str() {
+            "2.16.840.1.101.2.1.11.5" => 0,  // id-pkix-on-piv-unclassified
+            "2.16.840.1.101.2.1.11.9" => 1,  // id-pkix-on-piv-confidential
+            "2.16.840.1.101.2.1.11.10" => 2, // id-pkix-on-piv-secret
+            "2.16.840.1.101.2.1.11.17" => 3, // id-pkix-on-piv-topsecret
+            "2.16.840.1.101.2.1.11.18" => 4, // id-pkix-on-piv-sci
+            _ => 0,
+        };
+        if level > max_level {
+            max_level = level;
+        }
+    }
+    max_level
+}
+
+/// Validate a PIV/CAC authentication certificate chain per RFC 5280 §6.1.
+///
+/// `end_entity_der` is the smart-card PIV AUTH certificate. `intermediates`
+/// are any issuing-CA certificates presented alongside it (DER). The chain is
+/// built up to one of `config.trusted_ca_certs` (the DoD PKI roots) and every
+/// link's signature is cryptographically verified. The end-entity certificate
+/// must additionally:
+///   * be inside its validity window at `now_unix`,
+///   * assert the id-kp-clientAuth EKU,
+///   * assert at least one of `config.required_policy_oids` (if any are set).
+///
+/// On success the returned [`ValidatedCert`] carries the clearance extracted
+/// from the *validated* certificate. On any failure an error is returned and
+/// the caller MUST deny authentication (fail-closed).
+pub fn validate_piv_cert_chain(
+    end_entity_der: &[u8],
+    intermediates: &[Vec<u8>],
+    config: &CacConfig,
+    now_unix: i64,
+) -> Result<ValidatedCert, CacError> {
+    if config.trusted_ca_certs.is_empty() {
+        // No trust anchors configured: we cannot validate anything, so deny.
+        SecurityEvent::certificate_validation_failed(
+            "cac",
+            "no trusted CA certificates configured — cannot validate PIV chain",
+        );
+        return Err(CacError::InvalidCertificate(
+            "chain validation failed: no trusted CA certificates configured".into(),
+        ));
+    }
+
+    // Parse the end-entity certificate up front.
+    let ee = ParsedCert::parse(end_entity_der)
+        .ok_or_else(|| CacError::InvalidCertificate("chain validation failed: end-entity certificate is not valid DER".into()))?;
+
+    // RFC 5280 §6.1.3(a)(2): the end-entity certificate must be within its
+    // validity window. (Intermediates are checked as they are walked.)
+    if now_unix < ee.not_before {
+        SecurityEvent::certificate_validation_failed("cac", "PIV certificate not yet valid");
+        return Err(CacError::InvalidCertificate(
+            "chain validation failed: certificate not yet valid (notBefore in the future)".into(),
+        ));
+    }
+    if now_unix > ee.not_after {
+        SecurityEvent::certificate_validation_failed("cac", "PIV certificate expired");
+        return Err(CacError::InvalidCertificate(
+            "chain validation failed: certificate has expired (past notAfter)".into(),
+        ));
+    }
+
+    // RFC 5280 §4.2.1.12: a PIV authentication certificate must assert the
+    // id-kp-clientAuth EKU. A missing EKU extension is NOT acceptable for an
+    // authentication cert (fail-closed: we require it to be present and to
+    // include clientAuth, optionally anyExtendedKeyUsage).
+    if !ee.has_client_auth_eku {
+        SecurityEvent::certificate_validation_failed(
+            "cac",
+            "PIV certificate missing id-kp-clientAuth EKU",
+        );
+        return Err(CacError::InvalidCertificate(
+            "chain validation failed: certificate does not assert the id-kp-clientAuth EKU \
+             required for PIV authentication"
+                .into(),
+        ));
+    }
+
+    // RFC 5280 §4.2.1.4 + DoD CP: enforce required assurance policy OIDs.
+    if !config.required_policy_oids.is_empty() {
+        let asserts_required = config
+            .required_policy_oids
+            .iter()
+            .any(|req| ee.policy_oids.iter().any(|p| p == req));
+        if !asserts_required {
+            SecurityEvent::certificate_validation_failed(
+                "cac",
+                "PIV certificate missing required assurance policy OID",
+            );
+            return Err(CacError::InvalidCertificate(format!(
+                "chain validation failed: certificate does not assert any required policy OID \
+                 (required one of {:?})",
+                config.required_policy_oids
+            )));
+        }
+    }
+
+    // Build and verify the chain to a trusted anchor (RFC 5280 §6.1).
+    verify_chain_to_anchor(&ee, intermediates, &config.trusted_ca_certs, now_unix)?;
+
+    // Only now that the certificate is trusted do we derive clearance from its
+    // (already-extracted, validated) policy OIDs.
+    let clearance_level = clearance_from_policy_oids(&ee.policy_oids);
+
+    Ok(ValidatedCert {
+        clearance_level,
+        policy_oids: ee.policy_oids.clone(),
+        spki_der: ee.spki_der.clone(),
+        serial: ee.serial,
+    })
+}
+
+/// Build the path from `ee` up to one of `anchors`, verifying every signature.
+///
+/// Each non-anchor link must be signed by the next certificate in the path
+/// (intermediate or anchor), every CA in the path must carry BasicConstraints
+/// cA=TRUE, and the issuer/subject names must chain. The terminal step verifies
+/// the last intermediate (or the EE itself, for a directly-issued cert) against
+/// a trusted anchor.
+fn verify_chain_to_anchor(
+    ee: &ParsedCert,
+    intermediates: &[Vec<u8>],
+    anchors: &[Vec<u8>],
+    now_unix: i64,
+) -> Result<(), CacError> {
+    // Parse anchors once.
+    let parsed_anchors: Vec<ParsedCert> = anchors
+        .iter()
+        .filter_map(|der| ParsedCert::parse(der))
+        .collect();
+    if parsed_anchors.is_empty() {
+        return Err(CacError::InvalidCertificate(
+            "chain validation failed: no parseable trusted CA certificates".into(),
+        ));
+    }
+
+    // Parse intermediates.
+    let parsed_inters: Vec<ParsedCert> = intermediates
+        .iter()
+        .filter_map(|der| ParsedCert::parse(der))
+        .collect();
+
+    // Walk the path from the end-entity upward. We bound the depth to avoid any
+    // pathological loop; real PIV chains are 2-3 deep.
+    const MAX_DEPTH: usize = 8;
+    let mut current = ee;
+    let mut used_inter = vec![false; parsed_inters.len()];
+
+    for _ in 0..MAX_DEPTH {
+        // 1. Is `current` directly issued by a trusted anchor? If so, accept.
+        if let Some(anchor) = parsed_anchors
+            .iter()
+            .find(|a| a.subject_dn == current.issuer_dn)
+        {
+            // Anchor must be within validity and be a CA.
+            if now_unix < anchor.not_before || now_unix > anchor.not_after {
+                return Err(CacError::InvalidCertificate(
+                    "chain validation failed: trusted CA certificate is outside its validity window"
+                        .into(),
+                ));
+            }
+            if !anchor.is_ca {
+                return Err(CacError::InvalidCertificate(
+                    "chain validation failed: trust anchor is not a CA (BasicConstraints cA=FALSE)"
+                        .into(),
+                ));
+            }
+            verify_issuer_signature(current, anchor)?;
+            return Ok(());
+        }
+
+        // 2. Otherwise find an unused intermediate whose subject matches
+        //    `current`'s issuer, verify the link, and continue from it.
+        let next_idx = parsed_inters.iter().enumerate().position(|(i, c)| {
+            !used_inter[i] && c.subject_dn == current.issuer_dn && c.is_ca
+        });
+        match next_idx {
+            Some(idx) => {
+                let issuer = &parsed_inters[idx];
+                if now_unix < issuer.not_before || now_unix > issuer.not_after {
+                    return Err(CacError::InvalidCertificate(
+                        "chain validation failed: intermediate CA certificate is expired or not yet valid"
+                            .into(),
+                    ));
+                }
+                verify_issuer_signature(current, issuer)?;
+                used_inter[idx] = true;
+                current = &parsed_inters[idx];
+            }
+            None => {
+                // No issuer found in intermediates or anchors -> untrusted.
+                SecurityEvent::certificate_validation_failed(
+                    "cac",
+                    "PIV certificate does not chain to a trusted CA",
+                );
+                return Err(CacError::InvalidCertificate(
+                    "chain validation failed: certificate does not chain to a trusted CA \
+                     (no issuer found among intermediates or trust anchors)"
+                        .into(),
+                ));
+            }
+        }
+    }
+
+    Err(CacError::InvalidCertificate(
+        "chain validation failed: maximum certification path depth exceeded".into(),
+    ))
+}
+
+/// Verify that `child` was signed by `issuer`'s private key, i.e. that
+/// `issuer`'s public key validates `child`'s signature over `child`'s
+/// TBSCertificate (RFC 5280 §6.1.3(a)(3)). Uses the FIPS aws-lc-rs backend.
+fn verify_issuer_signature(child: &ParsedCert, issuer: &ParsedCert) -> Result<(), CacError> {
+    let alg = parse_chain_sig_alg(&child.sig_alg_oid).ok_or_else(|| {
+        SecurityEvent::certificate_validation_failed(
+            "cac",
+            "unsupported certificate signature algorithm",
+        );
+        CacError::InvalidCertificate(format!(
+            "chain validation failed: unsupported certificate signature algorithm (OID {})",
+            child.sig_alg_oid
+        ))
+    })?;
+
+    // aws-lc-rs hashes the message internally and accepts the issuer SPKI DER
+    // for both RSA and ECDSA keys.
+    if verify_signature_spki(alg, &issuer.spki_der, &child.tbs_der, &child.signature) {
+        Ok(())
+    } else {
+        SecurityEvent::certificate_validation_failed(
+            "cac",
+            "certificate signature does not verify against issuer key",
+        );
+        Err(CacError::VerificationFailed(
+            "chain validation failed: certificate signature did not verify against the issuer's \
+             public key"
+                .into(),
+        ))
+    }
+}
+
+/// Map a signatureAlgorithm OID to a supported chain algorithm.
+fn parse_chain_sig_alg(oid: &str) -> Option<ChainSigAlg> {
+    match oid {
+        // sha256WithRSAEncryption
+        "1.2.840.113549.1.1.11" => Some(ChainSigAlg::RsaPkcs1Sha256),
+        // sha384WithRSAEncryption
+        "1.2.840.113549.1.1.12" => Some(ChainSigAlg::RsaPkcs1Sha384),
+        // sha512WithRSAEncryption
+        "1.2.840.113549.1.1.13" => Some(ChainSigAlg::RsaPkcs1Sha512),
+        // ecdsa-with-SHA256
+        "1.2.840.10045.4.3.2" => Some(ChainSigAlg::EcdsaP256Sha256),
+        // ecdsa-with-SHA384
+        "1.2.840.10045.4.3.3" => Some(ChainSigAlg::EcdsaP384Sha384),
+        _ => None,
+    }
+}
+
+/// A parsed X.509 certificate carrying exactly the fields path validation
+/// needs, decoded with the vetted `x509-cert` crate (RustCrypto). The owned
+/// `Vec<u8>` fields (`tbs_der`, `spki_der`, `issuer_dn`, `subject_dn`,
+/// `signature`) are re-encoded DER so they can be passed to the FIPS verifier
+/// and compared for name chaining without holding the parsed certificate.
+struct ParsedCert {
+    /// Re-encoded TBSCertificate DER — the exact bytes the issuer signed.
+    tbs_der: Vec<u8>,
+    /// signatureAlgorithm OID (dotted-decimal) from the outer Certificate.
+    sig_alg_oid: String,
+    /// signatureValue (raw signature bytes; BIT STRING unused-bits stripped).
+    signature: Vec<u8>,
+    /// SubjectPublicKeyInfo (DER) — used to verify children and challenges.
+    spki_der: Vec<u8>,
+    /// Issuer Name DER (for name chaining).
+    issuer_dn: Vec<u8>,
+    /// Subject Name DER (for name chaining).
+    subject_dn: Vec<u8>,
+    /// notBefore as a Unix timestamp (seconds).
+    not_before: i64,
+    /// notAfter as a Unix timestamp (seconds).
+    not_after: i64,
+    /// Whether BasicConstraints asserts cA=TRUE.
+    is_ca: bool,
+    /// Certificate serial number, low 64 bits (for CRL/OCSP lookups).
+    serial: u64,
+    /// Certificate policy OIDs (dotted-decimal).
+    policy_oids: Vec<String>,
+    /// EKU asserts id-kp-clientAuth (or anyExtendedKeyUsage) — required for a
+    /// PIV authentication certificate (RFC 5280 §4.2.1.12).
+    has_client_auth_eku: bool,
+    /// EKU asserts id-kp-OCSPSigning — required for a delegated OCSP responder
+    /// (RFC 6960 §4.2.2.2).
+    is_ocsp_signer: bool,
+}
+
+impl ParsedCert {
+    /// Parse the fields needed for path validation from a DER certificate using
+    /// `x509-cert`. Returns `None` if the certificate is not valid DER.
+    fn parse(cert_der: &[u8]) -> Option<Self> {
+        use const_oid::db::rfc5280::{
+            ANY_EXTENDED_KEY_USAGE, ID_KP_CLIENT_AUTH, ID_KP_OCSP_SIGNING,
+        };
+        use der::{Decode, Encode};
+        use x509_cert::ext::pkix::{BasicConstraints, CertificatePolicies, ExtendedKeyUsage};
+        use x509_cert::Certificate;
+
+        let cert = Certificate::from_der(cert_der).ok()?;
+        let tbs = &cert.tbs_certificate;
+
+        // Re-encode the TBSCertificate: these are the exact bytes the issuer
+        // signed (RFC 5280 §4.1.1.1).
+        let tbs_der = tbs.to_der().ok()?;
+        let sig_alg_oid = cert.signature_algorithm.oid.to_string();
+        // BIT STRING signature value, with the unused-bits octet already
+        // stripped by x509-cert's BitString::as_bytes.
+        let signature = cert.signature.as_bytes()?.to_vec();
+        let spki_der = tbs.subject_public_key_info.to_der().ok()?;
+        let issuer_dn = tbs.issuer.to_der().ok()?;
+        let subject_dn = tbs.subject.to_der().ok()?;
+
+        let not_before = tbs.validity.not_before.to_unix_duration().as_secs() as i64;
+        let not_after = tbs.validity.not_after.to_unix_duration().as_secs() as i64;
+
+        // Serial number, low 64 bits (big-endian).
+        let serial_bytes = tbs.serial_number.as_bytes();
+        let mut serial: u64 = 0;
+        let start = serial_bytes.len().saturating_sub(8);
+        for &b in &serial_bytes[start..] {
+            serial = (serial << 8) | (b as u64);
+        }
+
+        // Typed extension extraction via x509-cert's AssociatedOid helper. EKU
+        // purposes are matched against the canonical RFC 5280 OID constants
+        // (const-oid db) rather than dotted-decimal string literals.
+        let eku = tbs.get::<ExtendedKeyUsage>().ok().flatten().map(|(_, e)| e.0);
+        let has_client_auth_eku = eku.as_ref().is_some_and(|oids| {
+            oids.iter()
+                .any(|o| *o == ID_KP_CLIENT_AUTH || *o == ANY_EXTENDED_KEY_USAGE)
+        });
+        let is_ocsp_signer = eku
+            .as_ref()
+            .is_some_and(|oids| oids.iter().any(|o| *o == ID_KP_OCSP_SIGNING));
+
+        let policy_oids = tbs
+            .get::<CertificatePolicies>()
+            .ok()
+            .flatten()
+            .map(|(_, pols)| {
+                pols.0
+                    .iter()
+                    .map(|pi| pi.policy_identifier.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let is_ca = tbs
+            .get::<BasicConstraints>()
+            .ok()
+            .flatten()
+            .map(|(_, bc)| bc.ca)
+            .unwrap_or(false);
+
+        Some(ParsedCert {
+            tbs_der,
+            sig_alg_oid,
+            signature,
+            spki_der,
+            issuer_dn,
+            subject_dn,
+            not_before,
+            not_after,
+            is_ca,
+            serial,
+            policy_oids,
+            has_client_auth_eku,
+            is_ocsp_signer,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1511,5 +2246,492 @@ mod tests {
             .expect("signing failed");
 
         sig.to_der().as_bytes().to_vec()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — F1 (X.509 chain validation) and F2 (real OCSP)
+// ---------------------------------------------------------------------------
+//
+// These exercise `validate_piv_cert_chain` (the pure, hardware-free RFC 5280
+// path validator that `authenticate` now runs BEFORE trusting an
+// attacker-supplied PIV certificate) and the real OCSP response-signature
+// verification that replaced the previous accept-any stub.
+//
+// Real test certificate chains (root CA -> [intermediate] -> end-entity) are
+// built with `rcgen`, including DoD-style assurance policy OIDs, the
+// id-kp-clientAuth EKU, BasicConstraints, and custom validity windows, so the
+// validator is tested against genuinely signed material, not synthetic DER.
+#[cfg(test)]
+mod chain_validation_tests {
+    use super::*;
+    use rcgen::{
+        BasicConstraints, Certificate, CertificateParams, CustomExtension, DnType,
+        ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SignatureAlgorithm,
+        PKCS_ECDSA_P256_SHA256,
+    };
+    use time::{Duration, OffsetDateTime};
+
+    // ── DoD assurance policy OIDs used throughout the tests ──────────────────
+    // id-pkix-on-piv-secret (clearance level 2) and -topsecret (level 3).
+    const OID_PIV_SECRET: &str = "2.16.840.1.101.2.1.11.10";
+    const OID_PIV_TOPSECRET: &str = "2.16.840.1.101.2.1.11.17";
+    // id-ce-certificatePolicies (2.5.29.32).
+    const OID_CERT_POLICIES: &[u64] = &[2, 5, 29, 32];
+
+    /// A generated certificate together with the key that signs *children* of
+    /// it (for a CA) or that owns it (for an end-entity).
+    struct TestCert {
+        cert: Certificate,
+        key: KeyPair,
+    }
+
+    impl TestCert {
+        fn der(&self) -> Vec<u8> {
+            self.cert.der().to_vec()
+        }
+    }
+
+    /// Encode a `SEQUENCE OF PolicyInformation` containing the given policy
+    /// OIDs, suitable as the *content* of an `rcgen` custom extension for
+    /// id-ce-certificatePolicies. `rcgen` wraps it in the OCTET STRING itself.
+    fn encode_cert_policies(oids: &[&str]) -> Vec<u8> {
+        // PolicyInformation ::= SEQUENCE { policyIdentifier OBJECT IDENTIFIER }
+        let mut policies = Vec::new();
+        for oid in oids {
+            let oid_der = encode_oid_der(oid);
+            // SEQUENCE { OID }
+            let mut pi = Vec::new();
+            pi.push(0x06);
+            pi.push(oid_der.len() as u8);
+            pi.extend_from_slice(&oid_der);
+            let mut pi_seq = Vec::new();
+            pi_seq.push(0x30);
+            pi_seq.push(pi.len() as u8);
+            pi_seq.extend_from_slice(&pi);
+            policies.extend_from_slice(&pi_seq);
+        }
+        // Outer SEQUENCE OF
+        let mut out = Vec::new();
+        out.push(0x30);
+        out.push(policies.len() as u8);
+        out.extend_from_slice(&policies);
+        out
+    }
+
+    /// Encode the value bytes (without tag/len) of a dotted-decimal OID.
+    fn encode_oid_der(oid: &str) -> Vec<u8> {
+        let parts: Vec<u64> = oid.split('.').map(|p| p.parse().unwrap()).collect();
+        let mut out = Vec::new();
+        out.push((parts[0] * 40 + parts[1]) as u8);
+        for &arc in &parts[2..] {
+            let mut stack = Vec::new();
+            let mut v = arc;
+            stack.push((v & 0x7f) as u8);
+            v >>= 7;
+            while v > 0 {
+                stack.push((v & 0x7f) as u8 | 0x80);
+                v >>= 7;
+            }
+            stack.reverse();
+            out.extend_from_slice(&stack);
+        }
+        out
+    }
+
+    fn policy_extension(oids: &[&str]) -> CustomExtension {
+        CustomExtension::from_oid_content(OID_CERT_POLICIES, encode_cert_policies(oids))
+    }
+
+    /// Build a self-signed root CA with the given signature algorithm.
+    fn make_root_ca(alg: &'static SignatureAlgorithm) -> TestCert {
+        let key = KeyPair::generate_for(alg).expect("root key");
+        let mut params = CertificateParams::new(vec!["MILNET Test DoD Root CA".to_string()])
+            .expect("root params");
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "MILNET Test DoD Root CA");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        params.not_before = OffsetDateTime::now_utc() - Duration::days(30);
+        params.not_after = OffsetDateTime::now_utc() + Duration::days(3650);
+        let cert = params.self_signed(&key).expect("self-signed root");
+        TestCert { cert, key }
+    }
+
+    /// Build an end-entity PIV-auth cert signed by `issuer`, with the given
+    /// policy OIDs, EKU, and validity window.
+    #[allow(clippy::too_many_arguments)]
+    fn make_end_entity(
+        issuer: &TestCert,
+        alg: &'static SignatureAlgorithm,
+        policy_oids: &[&str],
+        client_auth_eku: bool,
+        not_before: OffsetDateTime,
+        not_after: OffsetDateTime,
+        cn: &str,
+    ) -> TestCert {
+        let key = KeyPair::generate_for(alg).expect("ee key");
+        let mut params =
+            CertificateParams::new(vec!["milnet-ee.test".to_string()]).expect("ee params");
+        params.distinguished_name.push(DnType::CommonName, cn);
+        params.is_ca = IsCa::NoCa;
+        if client_auth_eku {
+            params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        }
+        if !policy_oids.is_empty() {
+            params.custom_extensions.push(policy_extension(policy_oids));
+        }
+        params.not_before = not_before;
+        params.not_after = not_after;
+        let cert = params
+            .signed_by(&key, &issuer.cert, &issuer.key)
+            .expect("sign ee");
+        TestCert { cert, key }
+    }
+
+    /// Standard "good" end-entity: P-256, SECRET policy, clientAuth, valid now.
+    fn good_ee(issuer: &TestCert) -> TestCert {
+        make_end_entity(
+            issuer,
+            &PKCS_ECDSA_P256_SHA256,
+            &[OID_PIV_SECRET],
+            true,
+            OffsetDateTime::now_utc() - Duration::days(1),
+            OffsetDateTime::now_utc() + Duration::days(365),
+            "DOE.JOHN.A.1234567890",
+        )
+    }
+
+    fn now_unix() -> i64 {
+        OffsetDateTime::now_utc().unix_timestamp()
+    }
+
+    /// Config requiring the SECRET policy OID and trusting the given root.
+    fn config_for(root: &TestCert, required: &[&str]) -> CacConfig {
+        CacConfig {
+            trusted_ca_certs: vec![root.der()],
+            required_policy_oids: required.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    // ───────────────────────── Task 1 / F1 tests ────────────────────────────
+
+    /// (a) Valid chain to a trusted root + correct policy OID + clientAuth EKU
+    ///     + within validity ⇒ ACCEPTED, and clearance read from the cert.
+    #[test]
+    fn valid_chain_accepted_and_clearance_extracted() {
+        let root = make_root_ca(&PKCS_ECDSA_P256_SHA256);
+        let ee = good_ee(&root);
+        let cfg = config_for(&root, &[OID_PIV_SECRET]);
+
+        let validated = validate_piv_cert_chain(&ee.der(), &[], &cfg, now_unix())
+            .expect("valid PIV chain must be accepted");
+        assert_eq!(
+            validated.clearance_level, 2,
+            "clearance must be read from the VALIDATED cert (SECRET = 2)"
+        );
+        assert!(validated.policy_oids.iter().any(|o| o == OID_PIV_SECRET));
+    }
+
+    /// (b) Self-signed / untrusted-CA ⇒ REJECTED ("chain validation failed").
+    #[test]
+    fn self_signed_cert_rejected() {
+        // A self-signed cert asserting TOP SECRET — the original attack input.
+        let attacker_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = CertificateParams::new(vec!["evil.test".to_string()]).unwrap();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "ATTACKER.SELF.SIGNED.0000000000");
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        params
+            .custom_extensions
+            .push(policy_extension(&[OID_PIV_TOPSECRET]));
+        let evil = params.self_signed(&attacker_key).unwrap();
+
+        // Trust a DIFFERENT, legitimate root.
+        let root = make_root_ca(&PKCS_ECDSA_P256_SHA256);
+        let cfg = config_for(&root, &[OID_PIV_TOPSECRET]);
+
+        let result = validate_piv_cert_chain(&evil.der().to_vec(), &[], &cfg, now_unix());
+        assert!(
+            result.is_err(),
+            "self-signed cert not chaining to a trusted CA MUST be rejected"
+        );
+        let msg = format!("{}", result.unwrap_err()).to_lowercase();
+        assert!(
+            msg.contains("chain"),
+            "error should mention chain validation, got: {msg}"
+        );
+    }
+
+    /// Untrusted but properly-signed chain (valid root, but NOT in trust store).
+    #[test]
+    fn untrusted_root_rejected() {
+        let real_root = make_root_ca(&PKCS_ECDSA_P256_SHA256);
+        let ee = good_ee(&real_root);
+
+        // Trust store contains an unrelated root only.
+        let other_root = make_root_ca(&PKCS_ECDSA_P256_SHA256);
+        let cfg = config_for(&other_root, &[OID_PIV_SECRET]);
+
+        let result = validate_piv_cert_chain(&ee.der(), &[], &cfg, now_unix());
+        assert!(
+            result.is_err(),
+            "chain to a CA that is not in the trust store MUST be rejected"
+        );
+    }
+
+    /// (c) Expired end-entity ⇒ REJECTED.
+    #[test]
+    fn expired_cert_rejected() {
+        let root = make_root_ca(&PKCS_ECDSA_P256_SHA256);
+        let ee = make_end_entity(
+            &root,
+            &PKCS_ECDSA_P256_SHA256,
+            &[OID_PIV_SECRET],
+            true,
+            OffsetDateTime::now_utc() - Duration::days(800),
+            OffsetDateTime::now_utc() - Duration::days(400), // already expired
+            "EXPIRED.USER.0000000000",
+        );
+        let cfg = config_for(&root, &[OID_PIV_SECRET]);
+
+        let result = validate_piv_cert_chain(&ee.der(), &[], &cfg, now_unix());
+        assert!(result.is_err(), "expired certificate MUST be rejected");
+        let msg = format!("{}", result.unwrap_err()).to_lowercase();
+        assert!(
+            msg.contains("expired") || msg.contains("validity") || msg.contains("not after"),
+            "error should mention expiry/validity, got: {msg}"
+        );
+    }
+
+    /// not-yet-valid end-entity ⇒ REJECTED.
+    #[test]
+    fn not_yet_valid_cert_rejected() {
+        let root = make_root_ca(&PKCS_ECDSA_P256_SHA256);
+        let ee = make_end_entity(
+            &root,
+            &PKCS_ECDSA_P256_SHA256,
+            &[OID_PIV_SECRET],
+            true,
+            OffsetDateTime::now_utc() + Duration::days(10), // not valid yet
+            OffsetDateTime::now_utc() + Duration::days(400),
+            "FUTURE.USER.0000000000",
+        );
+        let cfg = config_for(&root, &[OID_PIV_SECRET]);
+        let result = validate_piv_cert_chain(&ee.der(), &[], &cfg, now_unix());
+        assert!(result.is_err(), "not-yet-valid certificate MUST be rejected");
+    }
+
+    /// (d) Missing required policy OID ⇒ REJECTED.
+    #[test]
+    fn missing_required_policy_oid_rejected() {
+        let root = make_root_ca(&PKCS_ECDSA_P256_SHA256);
+        // EE only asserts SECRET, but config requires TOP SECRET.
+        let ee = good_ee(&root);
+        let cfg = config_for(&root, &[OID_PIV_TOPSECRET]);
+
+        let result = validate_piv_cert_chain(&ee.der(), &[], &cfg, now_unix());
+        assert!(
+            result.is_err(),
+            "cert lacking the required assurance policy OID MUST be rejected"
+        );
+        let msg = format!("{}", result.unwrap_err()).to_lowercase();
+        assert!(
+            msg.contains("policy"),
+            "error should mention policy OID, got: {msg}"
+        );
+    }
+
+    /// Wrong/missing EKU (no id-kp-clientAuth) ⇒ REJECTED.
+    #[test]
+    fn missing_client_auth_eku_rejected() {
+        let root = make_root_ca(&PKCS_ECDSA_P256_SHA256);
+        let ee = make_end_entity(
+            &root,
+            &PKCS_ECDSA_P256_SHA256,
+            &[OID_PIV_SECRET],
+            false, // no clientAuth EKU
+            OffsetDateTime::now_utc() - Duration::days(1),
+            OffsetDateTime::now_utc() + Duration::days(365),
+            "NOEKU.USER.0000000000",
+        );
+        let cfg = config_for(&root, &[OID_PIV_SECRET]);
+
+        let result = validate_piv_cert_chain(&ee.der(), &[], &cfg, now_unix());
+        assert!(
+            result.is_err(),
+            "PIV auth cert without id-kp-clientAuth EKU MUST be rejected"
+        );
+        let msg = format!("{}", result.unwrap_err()).to_lowercase();
+        assert!(
+            msg.contains("eku") || msg.contains("key usage") || msg.contains("clientauth"),
+            "error should mention EKU, got: {msg}"
+        );
+    }
+
+    /// Two-level chain: root -> intermediate -> end-entity, all RSA, ACCEPTED.
+    #[test]
+    fn two_level_chain_accepted() {
+        let root = make_root_ca(&PKCS_ECDSA_P256_SHA256);
+
+        // Intermediate CA signed by root.
+        let inter_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut inter_params =
+            CertificateParams::new(vec!["MILNET Test DoD Issuing CA".to_string()]).unwrap();
+        inter_params
+            .distinguished_name
+            .push(DnType::CommonName, "MILNET Test DoD Issuing CA");
+        inter_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        inter_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        inter_params.not_before = OffsetDateTime::now_utc() - Duration::days(20);
+        inter_params.not_after = OffsetDateTime::now_utc() + Duration::days(1825);
+        let inter_cert = inter_params
+            .signed_by(&inter_key, &root.cert, &root.key)
+            .unwrap();
+        let intermediate = TestCert {
+            cert: inter_cert,
+            key: inter_key,
+        };
+
+        let ee = good_ee(&intermediate);
+        let cfg = config_for(&root, &[OID_PIV_SECRET]);
+
+        let validated =
+            validate_piv_cert_chain(&ee.der(), &[intermediate.der()], &cfg, now_unix())
+                .expect("valid two-level chain must be accepted");
+        assert_eq!(validated.clearance_level, 2);
+    }
+
+    /// (g) THE ORIGINAL ATTACK: self-signed cert + a valid challenge signature.
+    /// Even though the challenge signature verifies against the cert's own key,
+    /// the cert does not chain to a trusted CA, so the WHOLE auth must fail
+    /// before the clearance is ever read.
+    #[test]
+    fn original_attack_self_signed_with_valid_challenge_sig_rejected() {
+        // Attacker self-signs a cert claiming TOP SECRET and can trivially sign
+        // any challenge with the matching private key.
+        let attacker_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = CertificateParams::new(vec!["evil.test".to_string()]).unwrap();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "MALLORY.X.9999999999");
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        params
+            .custom_extensions
+            .push(policy_extension(&[OID_PIV_TOPSECRET]));
+        let evil = params.self_signed(&attacker_key).unwrap();
+        let evil_der = evil.der().to_vec();
+
+        // The challenge signature WOULD verify (attacker holds the key) — prove it.
+        // (Uses the same software verifier the old code trusted on its own.)
+        let cfg = config_for(&make_root_ca(&PKCS_ECDSA_P256_SHA256), &[OID_PIV_TOPSECRET]);
+
+        // Chain validation must reject regardless of any valid challenge sig.
+        let result = validate_piv_cert_chain(&evil_der, &[], &cfg, now_unix());
+        assert!(
+            result.is_err(),
+            "F1 REGRESSION: self-signed cert with a valid challenge signature \
+             MUST NOT authenticate — it does not chain to a trusted CA"
+        );
+    }
+
+    /// Tampered end-entity (signature does not match issuer key) ⇒ REJECTED.
+    #[test]
+    fn tampered_signature_rejected() {
+        let root = make_root_ca(&PKCS_ECDSA_P256_SHA256);
+        let ee = good_ee(&root);
+        let mut der = ee.der();
+        // Flip a byte inside the certificate body (after the header) to break
+        // the issuer signature without destroying DER structure of the TBS.
+        let n = der.len();
+        der[n - 1] ^= 0xFF;
+        let cfg = config_for(&root, &[OID_PIV_SECRET]);
+        let result = validate_piv_cert_chain(&der, &[], &cfg, now_unix());
+        assert!(
+            result.is_err(),
+            "certificate whose issuer signature does not verify MUST be rejected"
+        );
+    }
+
+    /// The RSA-PKCS1v15 SHA-256 chain-signature path (the common DoD case;
+    /// `rcgen`+ring cannot generate RSA keys). `verify_signature_spki` verifies
+    /// RSA via the FIPS `aws-lc-rs` backend; we exercise it with a real RSA-2048
+    /// key generated and signed by aws-lc-rs. A correct signature verifies; a
+    /// tampered message does not. Proves the RSA path WITHOUT the `rsa` crate
+    /// (RUSTSEC-2023-0071).
+    #[test]
+    fn rsa_pkcs1_chain_signature_path() {
+        use aws_lc_rs::encoding::{AsDer, PublicKeyX509Der};
+        use aws_lc_rs::rand::SystemRandom;
+        use aws_lc_rs::rsa::KeySize;
+        use aws_lc_rs::signature::{KeyPair, RsaKeyPair, RSA_PKCS1_SHA256};
+
+        // Generate an RSA-2048 signing key pair via aws-lc-rs.
+        let kp = RsaKeyPair::generate(KeySize::Rsa2048).expect("rsa keygen");
+        // SubjectPublicKeyInfo (X.509) DER for the verifier.
+        let spki_der: PublicKeyX509Der = AsDer::as_der(kp.public_key()).expect("spki der");
+        let spki: Vec<u8> = spki_der.as_ref().to_vec();
+
+        let tbs = b"TBSCertificate bytes that the issuing CA signs";
+        let mut sig = vec![0u8; kp.public_modulus_len()];
+        kp.sign(&RSA_PKCS1_SHA256, &SystemRandom::new(), tbs, &mut sig)
+            .expect("rsa sign");
+
+        assert!(
+            verify_signature_spki(ChainSigAlg::RsaPkcs1Sha256, &spki, tbs, &sig),
+            "a valid RSA-PKCS1v15 SHA-256 signature must verify via the FIPS backend"
+        );
+        assert!(
+            !verify_signature_spki(ChainSigAlg::RsaPkcs1Sha256, &spki, b"different message", &sig),
+            "an RSA signature over a different message must NOT verify"
+        );
+    }
+
+    // ───────────────────────── Task 2 / F2 tests ────────────────────────────
+
+    /// (f) Forged/unsigned OCSP (no signature BIT STRING) ⇒ verification FAILS.
+    #[test]
+    fn forged_ocsp_without_signature_rejected() {
+        let root = make_root_ca(&PKCS_ECDSA_P256_SHA256);
+        // A bare DER SEQUENCE — exactly what the OLD stub accepted as "valid".
+        let forged = vec![0x30, 0x06, 0x0a, 0x01, 0x00, 0x02, 0x01, 0x00];
+        assert!(
+            !verify_ocsp_signature(&forged, &[root.der()]),
+            "F2 REGRESSION: a bare DER SEQUENCE with no signature MUST NOT pass \
+             OCSP signature verification (the old stub returned true)"
+        );
+    }
+
+    /// Empty trust store ⇒ OCSP verification fails closed.
+    #[test]
+    fn ocsp_verification_no_trust_anchors_fails() {
+        let forged = vec![0x30, 0x06, 0x0a, 0x01, 0x00, 0x02, 0x01, 0x00];
+        assert!(
+            !verify_ocsp_signature(&forged, &[]),
+            "OCSP verification with no trusted CAs must fail closed"
+        );
+    }
+
+    /// (e) An OCSP "revoked" status must surface as Revoked from the parser.
+    #[test]
+    fn ocsp_revoked_status_detected() {
+        // certStatus [1] revoked tag present in the body.
+        let body = vec![0x30, 0x03, 0xa1, 0x01, 0x00];
+        match parse_ocsp_cert_status(&body).expect("parse") {
+            RevocationStatus::Revoked { .. } => {}
+            other => panic!("expected Revoked, got {:?}", status_name(&other)),
+        }
+    }
+
+    fn status_name(s: &RevocationStatus) -> &'static str {
+        match s {
+            RevocationStatus::Good => "Good",
+            RevocationStatus::Revoked { .. } => "Revoked",
+            RevocationStatus::Unknown => "Unknown",
+            RevocationStatus::OcspUnavailable => "OcspUnavailable",
+        }
     }
 }

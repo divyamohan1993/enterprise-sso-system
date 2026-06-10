@@ -26,18 +26,48 @@
 //! **deviates** by using **ML-KEM-1024** instead, to achieve CNSA 2.0
 //! Suite Level 5 compliance (NIST Security Level 5 / AES-256 equivalent).
 //!
-//! # Combiner
+//! # Combiner (IETF X-Wing construction — restores ciphertext/key binding)
 //!
-//! The shared secret is derived via HKDF-SHA512 over the concatenation of
-//! both sub-protocol shared secrets:
+//! The shared secret is derived with the IETF X-Wing combiner
+//! (draft-connolly-cfrg-xwing-kem §5.3), which hashes BOTH sub-protocol
+//! shared secrets together with the X25519 ciphertext (`ct_X`) and the
+//! recipient X25519 public key (`pk_X`):
 //!
 //! ```text
-//! shared_secret = HKDF-SHA512(salt="MILNET-XWING-v1", ikm=x25519_ss || mlkem_ss)
+//! ss32 = SHA3-256( ss_M || ss_X || ct_X || pk_X || XWingLabel )
 //! ```
 //!
-//! HKDF-SHA512 provides a robust dual-source randomness extraction that
-//! ensures the output is indistinguishable from random even if one of the
-//! two sub-protocols is completely broken.
+//! where `ss_M` is the ML-KEM-1024 shared secret, `ss_X` is the X25519 DH
+//! output, `ct_X` is the X25519 ephemeral public key transmitted to the
+//! peer, and `pk_X` is the recipient's X25519 public key.
+//!
+//! Binding `ct_X` and `pk_X` into the hash is what gives X-Wing its
+//! MAL-BIND-K-CT and MAL-BIND-K-PK properties: an attacker cannot mutate the
+//! transcript (transmitted ephemeral key or the recipient key) without
+//! changing the derived shared secret. The previous MILNET combiner
+//! (`HKDF-SHA512(x25519_ss || mlkem_ss)`) dropped these inputs and therefore
+//! dropped the binding guarantee (audit finding on X-Wing combiner).
+//!
+//! ## X-Wing-1024 variant — intentional deviation from the draft
+//!
+//! X-Wing-1024 variant — IETF X-Wing combiner adapted to ML-KEM-1024 per
+//! CNSA 2.0; intentionally NOT wire-compatible with draft X-Wing(-768).
+//! The standard draft fixes the PQ component at ML-KEM-768 (NIST Level 3).
+//! CNSA 2.0 / CNSSP-15 mandates NIST Level 5 for classified systems, so this
+//! module uses ML-KEM-1024 and a MILNET-specific domain-separation label
+//! (`MILNET-XWING-v2`) in place of the draft's `\.//^\` label. The combiner
+//! STRUCTURE (SHA3-256 over `ss_M || ss_X || ct_X || pk_X || LABEL`) is
+//! preserved exactly; only the PQ parameter set and the label differ.
+//!
+//! ## 32 → 64 byte expansion
+//!
+//! The IETF combiner emits a canonical 32-byte secret. MILNET's
+//! [`SharedSecret`] is 64 bytes (callers split it into encryption + MAC keys
+//! and seed the DRBG from it), so the 32-byte X-Wing secret is expanded to 64
+//! bytes via a single domain-separated SHA3-512 invocation. This expansion is
+//! deterministic and collision-resistant; it preserves the binding property
+//! established by the 32-byte combiner (the bound transcript is fully
+//! committed before expansion).
 //!
 //! # Why ML-KEM-1024 instead of ML-KEM-768?
 //!
@@ -47,14 +77,16 @@
 //!
 //! # References
 //!
-//! - IETF draft-connolly-cfrg-xwing-kem (X-Wing specification)
+//! - IETF draft-connolly-cfrg-xwing-kem §5.3 (X-Wing combiner)
 //! - FIPS 203 (ML-KEM / CRYSTALS-Kyber)
+//! - FIPS 202 (SHA-3 / SHAKE)
 //! - CNSA 2.0 / CNSSP-15 (NSA post-quantum algorithm requirements)
 
 use hkdf::Hkdf;
 use ml_kem::kem::{Decapsulate, Encapsulate};
 use ml_kem::{EncodedSizeUser, KemCore, MlKem1024};
 use sha2::Sha512;
+use sha3::{Digest, Sha3_256, Sha3_512};
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -67,11 +99,18 @@ const ML_KEM_CT_LEN: usize = 1568;
 /// Length of the ML-KEM-1024 encapsulation key in bytes.
 const ML_KEM_EK_LEN: usize = 1568;
 
-/// HKDF salt for the X-Wing combiner.
-const XWING_HKDF_SALT: &[u8] = b"MILNET-XWING-v1";
+/// MILNET X-Wing-1024 combiner domain-separation label.
+///
+/// Occupies the position of the IETF draft's `XWingLabel` (`\.//^\`), but is
+/// deliberately a distinct MILNET-specific value so that MILNET X-Wing-1024
+/// shared secrets can never collide with draft X-Wing(-768) secrets. The
+/// label is the FINAL field in the SHA3-256 pre-image, matching the draft's
+/// concatenation order `ss_M || ss_X || ct_X || pk_X || label`.
+const XWING_COMBINER_LABEL: &[u8] = b"MILNET-XWING-v2";
 
-/// HKDF info string for shared secret extraction.
-const XWING_HKDF_INFO: &[u8] = b"X-Wing-SharedSecret-v1";
+/// Domain-separation prefix for expanding the canonical 32-byte X-Wing
+/// secret to MILNET's 64-byte [`SharedSecret`] via SHA3-512.
+const XWING_EXPAND_LABEL: &[u8] = b"MILNET-XWING-v2-expand";
 
 /// Errors that can occur during X-Wing decapsulation.
 #[derive(Debug)]
@@ -362,46 +401,61 @@ impl Drop for XWingKeyPair {
     }
 }
 
-/// Core X-Wing combiner using HKDF-SHA512.
+/// Core X-Wing combiner (IETF draft-connolly-cfrg-xwing-kem §5.3, adapted to
+/// ML-KEM-1024 — the X-Wing-1024 variant).
 ///
-/// Extracts a 64-byte shared secret from the concatenated X25519 and ML-KEM
-/// shared secrets via:
+/// Derives the canonical 32-byte X-Wing shared secret by hashing the two
+/// sub-protocol shared secrets TOGETHER WITH the transmitted X25519 ephemeral
+/// public key (`ct_X`) and the recipient's X25519 public key (`pk_X`):
 ///
 /// ```text
-/// HKDF-SHA512(salt="MILNET-XWING-v1", ikm=x25519_ss || mlkem_ss)
+/// ss32 = SHA3-256( ss_M || ss_X || ct_X || pk_X || MILNET-XWING-v2 )
 /// ```
 ///
-/// This ensures the combined secret is indistinguishable from random even if
-/// one of the two sub-protocols is completely broken (dual-PRF property).
+/// Including `ct_X` and `pk_X` restores the MAL-BIND-K-CT / MAL-BIND-K-PK
+/// binding properties: the derived secret is committed to the exact key
+/// material exchanged on the wire, so a transcript-mutating attacker cannot
+/// produce a colliding secret. The result is then expanded to MILNET's
+/// 64-byte [`SharedSecret`] via one SHA3-512 invocation under a distinct
+/// domain-separation label (the 64-byte width is required by the DRBG seed
+/// path and the encryption+MAC key split; the expansion is collision-
+/// resistant and preserves the binding established above).
+///
+/// # Parameters
+/// - `ss_m`:  ML-KEM-1024 shared secret (32 bytes, `ss_M`).
+/// - `ss_x`:  X25519 Diffie-Hellman output (32 bytes, `ss_X`).
+/// - `ct_x`:  X25519 ephemeral public key transmitted to the peer (32 bytes).
+/// - `pk_x`:  recipient X25519 public key (32 bytes).
 fn combine(
-    x25519_ss: &[u8],
-    ml_kem_ss: &[u8],
-) -> Result<SharedSecret, XWingError> {
-    // Concatenate: x25519_ss || ml_kem_ss
-    let mut ikm = Vec::with_capacity(x25519_ss.len() + ml_kem_ss.len());
-    ikm.extend_from_slice(x25519_ss);
-    ikm.extend_from_slice(ml_kem_ss);
+    ss_m: &[u8],
+    ss_x: &[u8],
+    ct_x: &[u8; X25519_PK_LEN],
+    pk_x: &[u8; X25519_PK_LEN],
+) -> SharedSecret {
+    // ── Step 1: IETF X-Wing combiner → canonical 32-byte secret ──────────
+    //   SHA3-256( ss_M || ss_X || ct_X || pk_X || LABEL )
+    let mut h = Sha3_256::new();
+    h.update(ss_m);
+    h.update(ss_x);
+    h.update(ct_x.as_slice());
+    h.update(pk_x.as_slice());
+    h.update(XWING_COMBINER_LABEL);
+    let mut ss32 = h.finalize(); // GenericArray<u8, U32>
 
-    let hk = Hkdf::<Sha512>::new(Some(XWING_HKDF_SALT), &ikm);
+    // ── Step 2: domain-separated SHA3-512 expansion → 64-byte SharedSecret ─
+    //   SHA3-512( EXPAND_LABEL || ss32 )
+    let mut e = Sha3_512::new();
+    e.update(XWING_EXPAND_LABEL);
+    e.update(ss32.as_slice());
+    let wide = e.finalize();
+
     let mut okm = [0u8; 64];
-    if hk.expand(XWING_HKDF_INFO, &mut okm).is_err() {
-        common::siem::emit_runtime_error(
-            common::siem::category::CRYPTO_FAILURE,
-            "HKDF-SHA512 expand failed for X-Wing shared secret derivation",
-            "InvalidPrkLength",
-            file!(),
-            line!(),
-            column!(),
-            module_path!(),
-        );
-        ikm.zeroize();
-        return Err(XWingError::MlKemDecapsulationFailed);
-    }
+    okm.copy_from_slice(wide.as_slice());
 
-    // Zeroize the intermediate key material
-    ikm.zeroize();
+    // Zeroize the intermediate canonical secret.
+    ss32.as_mut_slice().zeroize();
 
-    Ok(SharedSecret(okm))
+    SharedSecret(okm)
 }
 
 /// Client-side encapsulation.
@@ -409,7 +463,7 @@ fn combine(
 /// Generates an ephemeral X25519 key pair, computes the DH shared secret
 /// against the server's public key, performs ML-KEM-1024 encapsulation against
 /// the server's encapsulation key, and combines both shared secrets through
-/// HKDF-SHA512.
+/// the IETF X-Wing combiner (binding `ct_X` and `pk_X`; see [`combine`]).
 ///
 /// Returns `(shared_secret, ciphertext)`. The ciphertext must be sent to
 /// the server so it can decapsulate and derive the same shared secret.
@@ -445,8 +499,15 @@ pub fn xwing_encapsulate(server_pk: &XWingPublicKey) -> Result<(SharedSecret, Ci
     let ml_kem_ss: &[u8] = ml_kem_ss_arr.as_slice();
     let ml_kem_ct: &[u8] = ml_kem_ct_arr.as_slice();
 
-    // Combine both shared secrets via HKDF-SHA512.
-    let ss = combine(x25519_ss.as_bytes(), ml_kem_ss)?;
+    // X-Wing combiner (IETF construction): binds the ML-KEM secret, the X25519
+    // secret, the transmitted X25519 ephemeral key (ct_X = client_pk), and the
+    // recipient X25519 public key (pk_X = server static key).
+    let ss = combine(
+        ml_kem_ss,
+        x25519_ss.as_bytes(),
+        &client_pk,
+        server_pk.x25519_pk.as_bytes(),
+    );
 
     let mut ct_bytes = [0u8; ML_KEM_CT_LEN];
     ct_bytes.copy_from_slice(ml_kem_ct);
@@ -497,8 +558,16 @@ pub fn xwing_decapsulate(
         .decapsulate(&ml_kem_ct)
         .map_err(|_| XWingError::MlKemDecapsulationFailed)?;
 
-    // Combine both shared secrets via HKDF-SHA512.
-    combine(x25519_ss.as_bytes(), ml_kem_ss.as_slice())
+    // X-Wing combiner (IETF construction), identical inputs to the
+    // encapsulator: ct_X is the client's transmitted ephemeral key, pk_X is
+    // THIS server's static X25519 public key. Mutating either input on the
+    // wire changes the derived secret, giving MAL-BIND-K-CT / MAL-BIND-K-PK.
+    Ok(combine(
+        ml_kem_ss.as_slice(),
+        x25519_ss.as_bytes(),
+        &ciphertext.x25519_pk_client,
+        server_kp.x25519_public.as_bytes(),
+    ))
 }
 
 // ── KEM Agility: Runtime-Selectable KEM Algorithms ─────────────────────────
@@ -577,16 +646,52 @@ impl KemAlgorithm {
     }
 }
 
+/// Check whether military deployment mode is active
+/// (`MILNET_MILITARY_DEPLOYMENT=1`).
+///
+/// Mirrors the canonical check used across the workspace (audit/log,
+/// verifier, tss/validator) so the deployment posture is interpreted
+/// identically everywhere.
+fn is_military_mode() -> bool {
+    std::env::var("MILNET_MILITARY_DEPLOYMENT")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
 /// Select the active KEM algorithm based on environment configuration.
 ///
-/// If the `MILNET_PQ_KEM_ONLY` environment variable is set (to any value),
-/// the pure ML-KEM-1024-only mode is activated. Otherwise, the default
-/// X-Wing hybrid mode is used.
+/// # Fail-closed in military mode
 ///
-/// SECURITY: Switching to ML-KEM-1024-only mode should be done only when
-/// there is a credible quantum threat to classical key exchange. The hybrid
-/// mode provides defense-in-depth against both classical and quantum attacks.
+/// When `MILNET_MILITARY_DEPLOYMENT=1`, this function is **LOCKED** to the
+/// hybrid X-Wing-1024 mode and the `MILNET_PQ_KEM_ONLY` downgrade variable is
+/// IGNORED. Rationale: ML-KEM-1024-only mode strips the classical X25519
+/// hedge. A compromised node (or an attacker who can set environment
+/// variables on one) must NOT be able to unilaterally remove the classical
+/// component and narrow the system to a single (lattice) hardness assumption.
+/// In classified deployments the conservative hybrid is mandatory; the
+/// downgrade is refused rather than honored.
+///
+/// Outside military mode, setting `MILNET_PQ_KEM_ONLY` (to any value) selects
+/// pure ML-KEM-1024-only mode. This is intended only for controlled
+/// environments where operational intelligence indicates classical key
+/// exchange is compromised AND the deployment is not under military lock.
+///
+/// SECURITY: The hybrid mode provides defense-in-depth against both classical
+/// and quantum attacks; it is the safe default and the only permitted choice
+/// under military lock.
 pub fn active_kem_algorithm() -> KemAlgorithm {
+    // Fail-closed: military lock pins hybrid and ignores the downgrade var.
+    if is_military_mode() {
+        if std::env::var("MILNET_PQ_KEM_ONLY").is_ok() {
+            tracing::warn!(
+                "SIEM:POLICY MILNET_PQ_KEM_ONLY is IGNORED under \
+                 MILNET_MILITARY_DEPLOYMENT=1 — X-Wing-1024 hybrid is locked; \
+                 the classical X25519 hedge cannot be stripped on a military node."
+            );
+        }
+        return KemAlgorithm::XWing;
+    }
+
     if std::env::var("MILNET_PQ_KEM_ONLY").is_ok() {
         KemAlgorithm::MlKem1024Only
     } else {
@@ -766,16 +871,53 @@ mod tests {
 
     #[test]
     fn combine_is_deterministic() {
-        let ss1 = combine(&[1u8; 32], &[0u8; 32]).expect("combine");
-        let ss2 = combine(&[1u8; 32], &[0u8; 32]).expect("combine");
+        let ct_x = [0x11u8; 32];
+        let pk_x = [0x22u8; 32];
+        let ss1 = combine(&[1u8; 32], &[0u8; 32], &ct_x, &pk_x);
+        let ss2 = combine(&[1u8; 32], &[0u8; 32], &ct_x, &pk_x);
         assert_eq!(ss1.as_bytes(), ss2.as_bytes());
     }
 
     #[test]
     fn combine_differs_on_different_inputs() {
-        let ss1 = combine(&[1u8; 32], &[0u8; 32]).expect("combine");
-        let ss2 = combine(&[0u8; 32], &[1u8; 32]).expect("combine");
+        let ct_x = [0x11u8; 32];
+        let pk_x = [0x22u8; 32];
+        // Different sub-secrets must produce different output.
+        let ss1 = combine(&[1u8; 32], &[0u8; 32], &ct_x, &pk_x);
+        let ss2 = combine(&[0u8; 32], &[1u8; 32], &ct_x, &pk_x);
         assert_ne!(ss1.as_bytes(), ss2.as_bytes());
+    }
+
+    #[test]
+    fn combine_binds_ct_x_and_pk_x() {
+        // IETF X-Wing binding: mutating either ct_X or pk_X (the transcript
+        // public keys) while holding the sub-secrets fixed MUST change the
+        // derived shared secret. This is the MAL-BIND-K-CT / MAL-BIND-K-PK
+        // property the previous HKDF(x25519_ss || mlkem_ss) combiner lacked.
+        let ss_m = [0xAAu8; 32];
+        let ss_x = [0xBBu8; 32];
+        let ct_x = [0x11u8; 32];
+        let pk_x = [0x22u8; 32];
+
+        let base = combine(&ss_m, &ss_x, &ct_x, &pk_x);
+
+        let mut ct_x2 = ct_x;
+        ct_x2[0] ^= 0x01;
+        let mutated_ct = combine(&ss_m, &ss_x, &ct_x2, &pk_x);
+        assert_ne!(
+            base.as_bytes(),
+            mutated_ct.as_bytes(),
+            "mutating ct_X must change the derived shared secret"
+        );
+
+        let mut pk_x2 = pk_x;
+        pk_x2[31] ^= 0x80;
+        let mutated_pk = combine(&ss_m, &ss_x, &ct_x, &pk_x2);
+        assert_ne!(
+            base.as_bytes(),
+            mutated_pk.as_bytes(),
+            "mutating pk_X must change the derived shared secret"
+        );
     }
 
     #[test]
@@ -887,8 +1029,10 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial] // xwing_encapsulate_tagged reads MILNET_PQ_KEM_ONLY (process-global)
     fn tagged_xwing_round_trip() {
-        // Default mode (X-Wing hybrid) tagged encapsulate/decapsulate
+        // Default mode (X-Wing hybrid) tagged encapsulate/decapsulate.
+        std::env::remove_var("MILNET_PQ_KEM_ONLY");
         let server_kp = XWingKeyPair::generate();
         let server_pk = server_kp.public_key();
 
@@ -901,7 +1045,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial] // xwing_encapsulate_tagged reads MILNET_PQ_KEM_ONLY (process-global)
     fn tagged_ciphertext_serialization() {
+        std::env::remove_var("MILNET_PQ_KEM_ONLY");
         let server_kp = XWingKeyPair::generate();
         let server_pk = server_kp.public_key();
 
@@ -912,6 +1058,37 @@ mod tests {
 
         let ct2 = TaggedCiphertext::from_bytes(bytes).unwrap();
         assert_eq!(ct2.algorithm().expect("algorithm"), KemAlgorithm::XWing);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn military_mode_locks_xwing_and_ignores_kem_only_downgrade() {
+        // In military mode the KEM-only downgrade env var MUST be ignored and
+        // the hybrid X-Wing-1024 mode locked, so a compromised node cannot
+        // strip the classical X25519 hedge.
+        std::env::set_var("MILNET_MILITARY_DEPLOYMENT", "1");
+        std::env::set_var("MILNET_PQ_KEM_ONLY", "1");
+        assert_eq!(
+            active_kem_algorithm(),
+            KemAlgorithm::XWing,
+            "military mode must lock hybrid X-Wing and ignore MILNET_PQ_KEM_ONLY"
+        );
+        std::env::remove_var("MILNET_PQ_KEM_ONLY");
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn non_military_mode_honors_kem_only_downgrade() {
+        // Outside military lock, the downgrade var still selects ML-KEM-only.
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        std::env::set_var("MILNET_PQ_KEM_ONLY", "1");
+        assert_eq!(
+            active_kem_algorithm(),
+            KemAlgorithm::MlKem1024Only,
+            "without military lock, MILNET_PQ_KEM_ONLY must select ML-KEM-1024-only"
+        );
+        std::env::remove_var("MILNET_PQ_KEM_ONLY");
     }
 
     #[test]
@@ -927,7 +1104,7 @@ mod tests {
         // when processed through ML-KEM-only vs X-Wing combiner
         let ml_kem_ss = [0x42u8; 32];
         let only_ss = combine_mlkem_only(&ml_kem_ss).expect("combine_mlkem_only");
-        let xwing_ss = combine(&[0u8; 32], &ml_kem_ss).expect("combine");
+        let xwing_ss = combine(&ml_kem_ss, &[0u8; 32], &[0u8; 32], &[0u8; 32]);
         assert_ne!(
             only_ss.as_bytes(),
             xwing_ss.as_bytes(),

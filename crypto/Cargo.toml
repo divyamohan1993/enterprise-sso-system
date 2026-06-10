@@ -29,7 +29,10 @@ ed25519-dalek.workspace = true
 frost-ristretto255.workspace = true
 frost-core.workspace = true
 ml-dsa.workspace = true
-ml-kem.workspace = true
+# `deterministic` feature (no extra deps) enables ML-KEM-1024 fixed-input KATs:
+# generate_deterministic(d,z) / encapsulate_deterministic(m), required for the
+# FIPS 203 known-answer tests in src/fips_kat.rs (NIST ACVP vectors).
+ml-kem = { workspace = true, features = ["deterministic"] }
 aes-gcm.workspace = true
 chacha20poly1305.workspace = true
 p256.workspace = true

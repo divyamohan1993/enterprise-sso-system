@@ -352,26 +352,59 @@ impl PqSignatureAlgorithm {
     }
 }
 
+/// Check whether military deployment mode is active
+/// (`MILNET_MILITARY_DEPLOYMENT=1`).
+///
+/// Mirrors the canonical check used across the workspace so the deployment
+/// posture is interpreted identically everywhere.
+fn is_military_mode() -> bool {
+    std::env::var("MILNET_MILITARY_DEPLOYMENT")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
 /// Select the active post-quantum signature algorithm based on environment
 /// configuration.
 ///
-/// Reads the `MILNET_PQ_SIGNATURE_ALG` environment variable:
+/// # Fail-closed in military mode
+///
+/// When `MILNET_MILITARY_DEPLOYMENT=1`, this function is **LOCKED** to
+/// ML-DSA-87 (CNSA 2.0 Level 5) and the `MILNET_PQ_SIGNATURE_ALG` override is
+/// IGNORED. Rationale: the active signature algorithm is a system-wide policy
+/// decision that must not be flippable at runtime via an environment variable
+/// on a single (possibly compromised) node. Algorithm migration in a
+/// classified deployment is a controlled re-deploy, not a per-node env toggle.
+/// The illegal `ML-DSA-65` value is still rejected fatally, even under the
+/// lock, so an attempt to set it is never silently accepted.
+///
+/// Outside military mode the override is honored for crypto-agility:
 /// - `"SLH-DSA-SHA2-256f"` -> `PqSignatureAlgorithm::SlhDsaSha2256f`
 /// - `"ML-DSA-65"` -> **FATAL: rejected** (Level 3 only, does not meet CNSA 2.0 Level 5)
 /// - Anything else (or unset) -> `PqSignatureAlgorithm::MlDsa87` (default, Level 5)
-///
-/// This enables algorithm migration by changing a single environment variable
-/// across all deployed services, without recompilation.
 pub fn active_pq_signature_algorithm() -> PqSignatureAlgorithm {
-    match std::env::var("MILNET_PQ_SIGNATURE_ALG").as_deref() {
-        Ok("ML-DSA-65") => {
-            tracing::error!(
-                "SIEM:FATAL MILNET_PQ_SIGNATURE_ALG=ML-DSA-65 is REJECTED — \
-                 ML-DSA-65 provides only NIST Level 3, which does not meet \
-                 CNSA 2.0 Level 5 requirements. Use ML-DSA-87 or SLH-DSA-SHA2-256f."
+    // ML-DSA-65 is ALWAYS fatal — never accepted, military lock or not.
+    if std::env::var("MILNET_PQ_SIGNATURE_ALG").as_deref() == Ok("ML-DSA-65") {
+        tracing::error!(
+            "SIEM:FATAL MILNET_PQ_SIGNATURE_ALG=ML-DSA-65 is REJECTED — \
+             ML-DSA-65 provides only NIST Level 3, which does not meet \
+             CNSA 2.0 Level 5 requirements. Use ML-DSA-87 or SLH-DSA-SHA2-256f."
+        );
+        std::process::exit(1);
+    }
+
+    // Fail-closed: military lock pins ML-DSA-87 and ignores the override var.
+    if is_military_mode() {
+        if std::env::var("MILNET_PQ_SIGNATURE_ALG").is_ok() {
+            tracing::warn!(
+                "SIEM:POLICY MILNET_PQ_SIGNATURE_ALG is IGNORED under \
+                 MILNET_MILITARY_DEPLOYMENT=1 — ML-DSA-87 is locked; the active \
+                 signature algorithm cannot be switched at runtime on a military node."
             );
-            std::process::exit(1);
         }
+        return PqSignatureAlgorithm::MlDsa87;
+    }
+
+    match std::env::var("MILNET_PQ_SIGNATURE_ALG").as_deref() {
         Ok("SLH-DSA-SHA2-256f") => PqSignatureAlgorithm::SlhDsaSha2256f,
         _ => PqSignatureAlgorithm::MlDsa87, // Default: CNSA 2.0 Level 5
     }
@@ -612,12 +645,44 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn military_mode_locks_ml_dsa_87_and_ignores_alg_override() {
+        // In military mode, the MILNET_PQ_SIGNATURE_ALG override MUST be
+        // ignored and ML-DSA-87 locked, so the active signature algorithm
+        // cannot be switched at runtime on a (possibly compromised) node.
+        std::env::set_var("MILNET_MILITARY_DEPLOYMENT", "1");
+        std::env::set_var("MILNET_PQ_SIGNATURE_ALG", "SLH-DSA-SHA2-256f");
+        assert_eq!(
+            active_pq_signature_algorithm(),
+            PqSignatureAlgorithm::MlDsa87,
+            "military mode must lock ML-DSA-87 and ignore MILNET_PQ_SIGNATURE_ALG"
+        );
+        std::env::remove_var("MILNET_PQ_SIGNATURE_ALG");
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn non_military_mode_honors_slh_dsa_override() {
+        // Outside military lock, the override still selects SLH-DSA.
+        std::env::remove_var("MILNET_MILITARY_DEPLOYMENT");
+        std::env::set_var("MILNET_PQ_SIGNATURE_ALG", "SLH-DSA-SHA2-256f");
+        assert_eq!(
+            active_pq_signature_algorithm(),
+            PqSignatureAlgorithm::SlhDsaSha2256f,
+            "without military lock, MILNET_PQ_SIGNATURE_ALG=SLH-DSA-SHA2-256f must be honored"
+        );
+        std::env::remove_var("MILNET_PQ_SIGNATURE_ALG");
+    }
+
+    #[test]
     fn test_unknown_tag_returns_none() {
         assert!(PqSignatureAlgorithm::from_tag(0xFF).is_none());
         assert!(PqSignatureAlgorithm::from_tag(0x00).is_none());
     }
 
     #[test]
+    #[serial_test::serial] // pq_sign_tagged reads MILNET_PQ_SIGNATURE_ALG (process-global)
     fn test_tagged_sign_and_verify() {
         run_with_large_stack(|| {
             let (sk, vk) = generate_pq_keypair();
@@ -632,6 +697,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial] // pq_sign_tagged reads MILNET_PQ_SIGNATURE_ALG (process-global)
     fn test_tagged_verify_wrong_data_fails() {
         run_with_large_stack(|| {
             let (sk, vk) = generate_pq_keypair();
@@ -649,6 +715,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial] // pq_sign_tagged reads MILNET_PQ_SIGNATURE_ALG (process-global)
     fn test_tagged_verify_unknown_tag_fails() {
         run_with_large_stack(|| {
             let (sk, vk) = generate_pq_keypair();

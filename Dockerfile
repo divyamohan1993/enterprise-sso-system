@@ -59,6 +59,12 @@ LABEL org.opencontainers.image.title="milnet-sso" \
 # Run as nonroot (UID 65534) — distroless/static:nonroot sets this by default
 USER 65534:65534
 
+# Post-quantum operations (ML-KEM-1024 / ML-DSA-87 / X-Wing) allocate large
+# arrays on the stack; the default 2 MiB stack of tokio worker / spawn_blocking
+# threads can overflow under them. Set an 8 MiB floor (matches CI's RUST_MIN_STACK)
+# so a PQ op never aborts a service thread in production.
+ENV RUST_MIN_STACK=8388608
+
 COPY --from=builder --chown=65534:65534 /build/service-binary /service
 
 # Read-only filesystem: no temp dirs needed, all state is external

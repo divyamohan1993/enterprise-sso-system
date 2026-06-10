@@ -153,6 +153,29 @@ pub fn is_security_critical_command(cmd: &ClusterCommand) -> bool {
     )
 }
 
+/// The node a security-critical command is *about* — its subject.
+///
+/// A security-critical entry MUST be signed by the key of the node it concerns,
+/// so the embedded `node_id` is bound to the signer's identity. This is what
+/// stops a compromised leader from forging a command attributed to another node
+/// (e.g. fabricating a `MemberJoin`/`RoleAssignment` for a node that never
+/// requested it, or stamping `TamperHealed`/`TamperDetected` against a peer
+/// using the leader's own key).
+///
+/// Returns `None` for non-security-critical commands (which need no subject
+/// binding).
+pub fn command_subject_node(cmd: &ClusterCommand) -> Option<NodeId> {
+    match cmd {
+        ClusterCommand::MemberJoin { node_id, .. }
+        | ClusterCommand::MemberLeave { node_id }
+        | ClusterCommand::RoleAssignment { node_id, .. }
+        | ClusterCommand::HealthUpdate { node_id, .. }
+        | ClusterCommand::TamperDetected { node_id, .. }
+        | ClusterCommand::TamperHealed { node_id } => Some(*node_id),
+        ClusterCommand::Noop => None,
+    }
+}
+
 /// Verify an ML-DSA-87 entry signature over (term || index || command).
 ///
 /// Returns Ok(()) if the signature is valid, Err with reason otherwise.
@@ -991,6 +1014,76 @@ impl RaftState {
         self.peer_verifying_keys.insert(peer_id, key);
     }
 
+    /// Verify that a (possibly security-critical) log entry is authentic.
+    ///
+    /// Policy (closes the HIGH "verified against leader not proposer" +
+    /// "silent-accept on unknown key" findings):
+    /// * Non-security-critical commands need no signature → always OK.
+    /// * A security-critical entry is bound to its SUBJECT
+    ///   ([`command_subject_node`]): the signature is verified against the
+    ///   subject's pinned verifying key, never merely the leader's. A leader
+    ///   therefore cannot forge a command attributed to another node.
+    /// * `military_mode` is FAIL-CLOSED: a missing signature, a missing subject,
+    ///   or an unknown/unpinned subject key all REJECT. Outside military mode the
+    ///   legacy best-effort behaviour is preserved (verify if a key is present,
+    ///   otherwise accept) so non-military test clusters keep working.
+    fn verify_entry_authenticity(
+        &self,
+        entry: &LogEntry,
+        military_mode: bool,
+    ) -> Result<(), String> {
+        if !is_security_critical_command(&entry.command) {
+            return Ok(());
+        }
+
+        // Determine the node this command is about (its subject).
+        let subject = command_subject_node(&entry.command);
+
+        match (&entry.entry_signature, subject) {
+            // Signed, and we know the subject: verify against the SUBJECT's key.
+            (Some(_sig), Some(subject_id)) => {
+                match self.peer_verifying_keys.get(&subject_id) {
+                    Some(vk) => verify_entry_signature(entry, vk).map_err(|e| {
+                        format!(
+                            "signature invalid for subject {subject_id}: {e}"
+                        )
+                    }),
+                    None => {
+                        if military_mode {
+                            Err(format!(
+                                "no pinned verifying key for subject {subject_id} \
+                                 — refusing security-critical entry (fail-closed)"
+                            ))
+                        } else {
+                            // Non-military: cannot verify, accept (legacy).
+                            Ok(())
+                        }
+                    }
+                }
+            }
+            // Signed but no identifiable subject (should not happen for
+            // security-critical commands, but be explicit): reject in military.
+            (Some(_sig), None) => {
+                if military_mode {
+                    Err("security-critical entry has no identifiable subject node \
+                         — refusing (fail-closed)"
+                        .to_string())
+                } else {
+                    Ok(())
+                }
+            }
+            // Unsigned security-critical entry.
+            (None, _) => {
+                if military_mode {
+                    Err("unsigned security-critical entry — refusing in military mode"
+                        .to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
     // ── Public API ─────────────────────────────────────────────────────────
 
     /// Handle a received message from `from`. Returns messages to send.
@@ -1127,8 +1220,20 @@ impl RaftState {
         }
         let index = LogIndex(self.last_log_index().0 + 1);
 
-        // Sign security-critical entries with this node's ML-DSA-87 key.
-        let entry_signature = if is_security_critical_command(&command) {
+        // Sign security-critical entries with this node's ML-DSA-87 key, but
+        // ONLY when this node is the command's SUBJECT (the node it is about).
+        //
+        // SECURITY: a signature is an attestation by the subject ("I am joining /
+        // taking this role / healed"). A node signs only for itself, so its key
+        // verifies under the subject's pinned key on the receiver. A leader does
+        // NOT self-sign commands about OTHER nodes — that would let it forge
+        // membership/role/tamper commands attributed to peers. Such cross-node
+        // security-critical commands therefore arrive unsigned and, in military
+        // mode, are refused by `verify_entry_authenticity` (fail-closed). The
+        // legitimate cross-node tamper path is the independent f+1 TamperQuorum
+        // (see `cluster::TamperQuorum`), which never depends on a single signer.
+        let signs_for_self = command_subject_node(&command) == Some(self.node_id);
+        let entry_signature = if is_security_critical_command(&command) && signs_for_self {
             if let Some(ref sk_bytes) = self.signing_key {
                 let cmd_bytes = postcard::to_allocvec(&command).unwrap_or_default();
                 let mut signed_msg = Vec::with_capacity(16 + cmd_bytes.len());
@@ -1697,48 +1802,33 @@ impl RaftState {
         }
 
         // SECURITY: Verify entry-level signatures on security-critical commands.
-        // In military mode (MILNET_MILITARY_DEPLOYMENT=1), unsigned security-critical
-        // entries are rejected. This prevents a compromised leader from forging
-        // TamperHealed for itself or injecting fake MemberJoin/MemberLeave.
+        //
+        // Each security-critical entry must be signed by the key of the node the
+        // command is ABOUT (its subject), NOT merely the current leader. This
+        // binds the embedded node_id to the signer's identity, so a compromised
+        // leader cannot forge a command attributed to another node (fake
+        // MemberJoin/RoleAssignment, or TamperHealed/TamperDetected stamped with
+        // the leader's own key). In military mode, an unsigned entry OR one whose
+        // subject's verifying key is unknown/unpinned is REJECTED (fail-closed),
+        // closing the previous silent-accept-on-unknown-key hole.
         let military_mode = std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1");
         for entry in &entries {
-            if is_security_critical_command(&entry.command) {
-                if let Some(ref _sig) = entry.entry_signature {
-                    // Try to verify against leader's verifying key.
-                    if let Some(vk) = self.peer_verifying_keys.get(&leader_id) {
-                        if let Err(e) = verify_entry_signature(entry, vk) {
-                            tracing::error!(
-                                node = %self.node_id,
-                                entry_index = entry.index.0,
-                                leader = %leader_id,
-                                error = %e,
-                                "REJECTING entry: signature verification failed"
-                            );
-                            return vec![(
-                                from,
-                                RaftMessage::AppendEntriesResponse {
-                                    term: self.current_term,
-                                    success: false,
-                                    match_index: LogIndex::zero(),
-                                },
-                            )];
-                        }
-                    }
-                } else if military_mode {
-                    tracing::error!(
-                        node = %self.node_id,
-                        entry_index = entry.index.0,
-                        "REJECTING unsigned security-critical entry in military mode"
-                    );
-                    return vec![(
-                        from,
-                        RaftMessage::AppendEntriesResponse {
-                            term: self.current_term,
-                            success: false,
-                            match_index: LogIndex::zero(),
-                        },
-                    )];
-                }
+            if let Err(e) = self.verify_entry_authenticity(entry, military_mode) {
+                tracing::error!(
+                    node = %self.node_id,
+                    entry_index = entry.index.0,
+                    leader = %leader_id,
+                    error = %e,
+                    "REJECTING entry: authenticity check failed"
+                );
+                return vec![(
+                    from,
+                    RaftMessage::AppendEntriesResponse {
+                        term: self.current_term,
+                        success: false,
+                        match_index: LogIndex::zero(),
+                    },
+                )];
             }
         }
 
@@ -2048,7 +2138,13 @@ impl RaftState {
             })];
         }
 
-        // Verify ML-DSA-87 signature if available.
+        // Verify ML-DSA-87 signature. A snapshot legitimately originates from the
+        // leader (it is the leader's signed state-machine snapshot), so the
+        // leader's pinned key is the correct verifier here. FAIL-CLOSED in
+        // military mode: a present signature whose leader key is unknown/unpinned
+        // is REJECTED (closing the previous silent-accept-on-unknown-key hole),
+        // exactly as for security-critical log entries.
+        let military_mode = std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1");
         if !signature.is_empty() {
             if let Some(vk) = self.peer_verifying_keys.get(&leader_id) {
                 let snap = RaftSnapshot {
@@ -2064,15 +2160,20 @@ impl RaftState {
                         term: self.current_term, success: false,
                     })];
                 }
-            }
-        } else {
-            let military_mode = std::env::var("MILNET_MILITARY_DEPLOYMENT").as_deref() == Ok("1");
-            if military_mode {
-                tracing::error!(node = %self.node_id, "REJECTING unsigned snapshot in military mode");
+            } else if military_mode {
+                tracing::error!(
+                    node = %self.node_id, leader = %leader_id,
+                    "REJECTING snapshot: no pinned verifying key for leader in military mode (fail-closed)"
+                );
                 return vec![(from, RaftMessage::InstallSnapshotResponse {
                     term: self.current_term, success: false,
                 })];
             }
+        } else if military_mode {
+            tracing::error!(node = %self.node_id, "REJECTING unsigned snapshot in military mode");
+            return vec![(from, RaftMessage::InstallSnapshotResponse {
+                term: self.current_term, success: false,
+            })];
         }
 
         // Reject if not newer than current snapshot.
@@ -3329,5 +3430,192 @@ mod tests {
         let committed = node.take_committed();
         assert_eq!(committed.len(), 1);
         std::env::remove_var("MILNET_RAFT_SNAPSHOT_THRESHOLD");
+    }
+
+    // ── Entry-signature authenticity (HIGH: subject-binding + fail-closed) ──
+
+    /// Build a security-critical entry signed by `signer_seed` over
+    /// (term || index || command), exactly as `propose` does.
+    fn make_signed_entry(
+        seed: &[u8; 32],
+        term: Term,
+        index: LogIndex,
+        command: ClusterCommand,
+    ) -> LogEntry {
+        let cmd_bytes = postcard::to_allocvec(&command).unwrap();
+        let mut signed_msg = Vec::with_capacity(16 + cmd_bytes.len());
+        signed_msg.extend_from_slice(&term.0.to_be_bytes());
+        signed_msg.extend_from_slice(&index.0.to_be_bytes());
+        signed_msg.extend_from_slice(&cmd_bytes);
+        let sig = sign_entry_ml_dsa(seed, &signed_msg).unwrap();
+        LogEntry { term, index, command, entry_signature: Some(sig) }
+    }
+
+    /// command_subject_node extracts the embedded node_id for every variant.
+    #[test]
+    fn command_subject_node_maps_each_variant() {
+        let x = NodeId::random();
+        assert_eq!(
+            command_subject_node(&ClusterCommand::MemberJoin {
+                node_id: x, addr: "a:1".into(), service_type: "gateway".into()
+            }),
+            Some(x)
+        );
+        assert_eq!(
+            command_subject_node(&ClusterCommand::TamperHealed { node_id: x }),
+            Some(x)
+        );
+        assert_eq!(command_subject_node(&ClusterCommand::Noop), None);
+    }
+
+    /// A security-critical entry signed by the SUBJECT verifies (military mode).
+    #[test]
+    fn entry_authentic_when_signed_by_subject() {
+        let subject = NodeId::random();
+        let seed = [0x21u8; 32];
+        let mut node = make_node(vec![]);
+        node.add_peer_verifying_key(subject, ml_dsa_vk_bytes(&seed));
+
+        let entry = make_signed_entry(
+            &seed, Term(2), LogIndex(5),
+            ClusterCommand::TamperHealed { node_id: subject },
+        );
+        assert!(
+            node.verify_entry_authenticity(&entry, true).is_ok(),
+            "entry signed by its subject must be accepted"
+        );
+    }
+
+    /// HIGH FINDING #1: an entry signed by some OTHER key (e.g. a compromised
+    /// leader) but ABOUT `subject` is rejected — it's verified against the
+    /// subject's pinned key, not the signer's/leader's.
+    #[test]
+    fn entry_rejected_when_signed_by_non_subject() {
+        let subject = NodeId::random();
+        let subject_seed = [0x22u8; 32];
+        let attacker_seed = [0x99u8; 32]; // a different (leader) key
+
+        let mut node = make_node(vec![]);
+        // Pin the SUBJECT's real key.
+        node.add_peer_verifying_key(subject, ml_dsa_vk_bytes(&subject_seed));
+
+        // Attacker forges TamperHealed about `subject`, signing with its OWN key.
+        let forged = make_signed_entry(
+            &attacker_seed, Term(2), LogIndex(5),
+            ClusterCommand::TamperHealed { node_id: subject },
+        );
+        assert!(
+            node.verify_entry_authenticity(&forged, true).is_err(),
+            "entry about a subject must NOT verify under a non-subject signer's key"
+        );
+    }
+
+    /// HIGH FINDING #2: in military mode, a signed security-critical entry whose
+    /// SUBJECT key is unknown/unpinned is REJECTED (no more silent-accept).
+    #[test]
+    fn entry_rejected_when_subject_key_unpinned_military() {
+        let subject = NodeId::random();
+        let seed = [0x23u8; 32];
+        // Node has NO pinned key for `subject`.
+        let node = make_node(vec![]);
+
+        let entry = make_signed_entry(
+            &seed, Term(2), LogIndex(5),
+            ClusterCommand::MemberJoin {
+                node_id: subject, addr: "10.0.0.9:443".into(), service_type: "gateway".into(),
+            },
+        );
+        assert!(
+            node.verify_entry_authenticity(&entry, true).is_err(),
+            "unpinned subject key must be rejected in military mode (fail-closed)"
+        );
+        // Outside military mode, legacy best-effort accepts (cannot verify).
+        assert!(
+            node.verify_entry_authenticity(&entry, false).is_ok(),
+            "non-military legacy path accepts when no key is available"
+        );
+    }
+
+    /// In military mode an UNSIGNED security-critical entry is rejected; a Noop
+    /// (not security-critical) is always fine.
+    #[test]
+    fn entry_unsigned_rejected_in_military_only() {
+        let node = make_node(vec![]);
+        let unsigned = LogEntry {
+            term: Term(1), index: LogIndex(1),
+            command: ClusterCommand::MemberLeave { node_id: NodeId::random() },
+            entry_signature: None,
+        };
+        assert!(node.verify_entry_authenticity(&unsigned, true).is_err());
+        assert!(node.verify_entry_authenticity(&unsigned, false).is_ok());
+
+        let noop = LogEntry {
+            term: Term(1), index: LogIndex(1),
+            command: ClusterCommand::Noop, entry_signature: None,
+        };
+        assert!(node.verify_entry_authenticity(&noop, true).is_ok());
+    }
+
+    /// A tampered command body breaks the subject signature → rejected.
+    #[test]
+    fn entry_rejected_when_command_tampered() {
+        let subject = NodeId::random();
+        let seed = [0x24u8; 32];
+        let mut node = make_node(vec![]);
+        node.add_peer_verifying_key(subject, ml_dsa_vk_bytes(&seed));
+
+        let mut entry = make_signed_entry(
+            &seed, Term(2), LogIndex(5),
+            ClusterCommand::RoleAssignment { node_id: subject, role: "follower".into() },
+        );
+        // Tamper: escalate the role without re-signing.
+        entry.command = ClusterCommand::RoleAssignment {
+            node_id: subject, role: "auth-primary".into(),
+        };
+        assert!(
+            node.verify_entry_authenticity(&entry, true).is_err(),
+            "tampered command must fail the subject signature check"
+        );
+    }
+
+    /// `propose` signs a command about ITSELF (verifies under its own key) but
+    /// does NOT self-sign a command about another node (so a leader cannot forge
+    /// cross-node security-critical commands).
+    #[test]
+    fn propose_signs_only_for_self_subject() {
+        let seed = [0x31u8; 32];
+        let mut node = make_node(vec![]);
+        let me = node.node_id();
+        node.set_signing_key(seed.to_vec());
+        node.become_leader_standalone();
+        let _ = node.take_committed();
+
+        // Command about SELF → signed.
+        let idx_self = node.propose(ClusterCommand::RoleAssignment {
+            node_id: me, role: "auth-primary".into(),
+        }).unwrap();
+        // Command about ANOTHER node → NOT self-signed.
+        let other = NodeId::random();
+        let idx_other = node.propose(ClusterCommand::RoleAssignment {
+            node_id: other, role: "follower".into(),
+        }).unwrap();
+
+        let committed = node.take_committed();
+        let self_entry = committed.iter().find(|e| e.index == idx_self).unwrap();
+        let other_entry = committed.iter().find(|e| e.index == idx_other).unwrap();
+
+        assert!(
+            self_entry.entry_signature.is_some(),
+            "command about self must be signed"
+        );
+        assert!(
+            other_entry.entry_signature.is_none(),
+            "command about another node must NOT be self-signed by the proposer"
+        );
+
+        // The self-signed entry verifies under this node's own pinned key.
+        let mut verifier = make_node(vec![]);
+        verifier.add_peer_verifying_key(me, ml_dsa_vk_bytes(&seed));
+        assert!(verifier.verify_entry_authenticity(self_entry, true).is_ok());
     }
 }

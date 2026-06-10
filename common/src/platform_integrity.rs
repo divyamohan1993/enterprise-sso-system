@@ -394,24 +394,57 @@ pub fn start_integrity_monitor(
 // ---------------------------------------------------------------------------
 
 /// Default directory for sealed key blobs.
-const DEFAULT_SEALED_DIR: &str = "/var/lib/milnet/sealed";
+pub const DEFAULT_SEALED_DIR: &str = "/var/lib/milnet/sealed";
 
-/// PCR indices used for sealing policy (UEFI firmware + Secure Boot policy).
+/// PCR indices used for the default sealing policy (UEFI firmware + Secure
+/// Boot policy). Used by FROST-share sealing for backward compatibility.
 const SEAL_PCR_LIST: &str = "sha256:0,7";
 
-/// Seal a secret to the vTPM with a PCR policy.
+/// PCR indices used for **master-KEK** sealing — the full measured-boot set.
+///
+/// Reference: TCG PC Client Platform Firmware Profile, PCR usage table.
+///   - PCR 0: UEFI firmware / SRTM (core root of trust for measurement)
+///   - PCR 2: UEFI driver / option-ROM code
+///   - PCR 4: boot manager / bootloader (MBR / EFI application) code
+///   - PCR 7: Secure Boot policy (PK/KEK/db/dbx state)
+///
+/// Binding the master KEK to all four means a clone of the disk image on a
+/// **different** physical/virtual machine — with different firmware, option
+/// ROMs, bootloader, or Secure Boot keys — cannot unseal it. This is the
+/// anti-clone property: the sealed blob is bound to the platform that sealed
+/// it, not merely to a matching boot policy.
+pub const MASTER_KEK_PCR_LIST: &str = "sha256:0,2,4,7";
+
+/// Seal a secret to the vTPM with the default (FROST-share) PCR policy.
 ///
 /// Uses `tpm2_createprimary`, `tpm2_create`, and `tpm2_load` to seal
 /// `secret` under PCRs 0 and 7. The sealed blob is written to
 /// `<sealed_dir>/<name>.pub` and `<sealed_dir>/<name>.priv`.
 ///
-/// On first deploy, call this to seal FROST shares and master KEK.
-/// On subsequent boots, call `tpm_unseal` to recover them (only succeeds
-/// if the boot chain matches the PCR policy).
+/// On first deploy, call this to seal FROST shares. On subsequent boots, call
+/// `tpm_unseal` to recover them (only succeeds if the boot chain matches the
+/// PCR policy). NOTE: the master KEK uses the WIDER measured-boot PCR set via
+/// `sealed_keys::seal_master_kek_to_tpm` ([`MASTER_KEK_PCR_LIST`]); do not seal
+/// the master KEK with this narrower-policy wrapper.
 pub fn tpm_seal(
     name: &str,
     secret: &[u8],
     sealed_dir: Option<&str>,
+) -> Result<(), PlatformError> {
+    tpm_seal_with_pcrs(name, secret, sealed_dir, SEAL_PCR_LIST)
+}
+
+/// Seal a secret to the vTPM with an explicit PCR policy list.
+///
+/// Identical to [`tpm_seal`] but binds the sealed object to the caller-chosen
+/// `pcr_list` (e.g. [`MASTER_KEK_PCR_LIST`] for the anti-clone measured-boot
+/// set). The same list MUST be passed to [`tpm_unseal_with_pcrs`] at unseal
+/// time, or the policy session digest will not match and unseal fails closed.
+pub fn tpm_seal_with_pcrs(
+    name: &str,
+    secret: &[u8],
+    sealed_dir: Option<&str>,
+    pcr_list: &str,
 ) -> Result<(), PlatformError> {
     let dir = sealed_dir.unwrap_or(DEFAULT_SEALED_DIR);
 
@@ -458,7 +491,7 @@ pub fn tpm_seal(
 
     // 2. Create PCR policy
     let pcr_output = tpm2_command("tpm2_pcrread")
-        .args(["-o", &policy_path, SEAL_PCR_LIST])
+        .args(["-o", &policy_path, pcr_list])
         .output()
         .map_err(|e| {
             PlatformError::TpmCommandFailed(format!("tpm2_pcrread: {}", e))
@@ -487,7 +520,7 @@ pub fn tpm_seal(
     }
 
     let output = tpm2_command("tpm2_policypcr")
-        .args(["-S", &policy_session, "-l", SEAL_PCR_LIST, "-L", &policy_path])
+        .args(["-S", &policy_session, "-l", pcr_list, "-L", &policy_path])
         .output()
         .map_err(|e| {
             PlatformError::TpmCommandFailed(format!("tpm2_policypcr: {}", e))
@@ -554,14 +587,14 @@ pub fn tpm_seal(
     tracing::info!(
         "platform: sealed '{}' to vTPM (PCR policy {}) at {}",
         name,
-        SEAL_PCR_LIST,
+        pcr_list,
         dir,
     );
 
     Ok(())
 }
 
-/// Unseal a secret from the vTPM.
+/// Unseal a secret from the vTPM using the default (FROST-share) PCR policy.
 ///
 /// Loads the sealed blob from `<sealed_dir>/<name>.pub` and
 /// `<sealed_dir>/<name>.priv`, then unseals using a PCR policy session.
@@ -571,6 +604,22 @@ pub fn tpm_seal(
 pub fn tpm_unseal(
     name: &str,
     sealed_dir: Option<&str>,
+) -> Result<Vec<u8>, PlatformError> {
+    tpm_unseal_with_pcrs(name, sealed_dir, SEAL_PCR_LIST)
+}
+
+/// Unseal a secret from the vTPM using an explicit PCR policy list.
+///
+/// `pcr_list` MUST match the value passed to [`tpm_seal_with_pcrs`] when the
+/// blob was created. If the live PCR bank values differ from those captured at
+/// seal time (different firmware / bootloader / Secure Boot state — i.e. a
+/// clone on different hardware), `tpm2_policypcr` produces a different policy
+/// digest, `tpm2_unseal` is rejected by the TPM, and this returns an error.
+/// Fail-closed: the caller must treat any error as "do not start".
+pub fn tpm_unseal_with_pcrs(
+    name: &str,
+    sealed_dir: Option<&str>,
+    pcr_list: &str,
 ) -> Result<Vec<u8>, PlatformError> {
     let dir = sealed_dir.unwrap_or(DEFAULT_SEALED_DIR);
     let pub_path = format!("{}/{}.pub", dir, name);
@@ -650,7 +699,7 @@ pub fn tpm_unseal(
     }
 
     let output = tpm2_command("tpm2_policypcr")
-        .args(["-S", &policy_session, "-l", SEAL_PCR_LIST])
+        .args(["-S", &policy_session, "-l", pcr_list])
         .output()
         .map_err(|e| {
             PlatformError::TpmCommandFailed(format!("tpm2_policypcr: {}", e))

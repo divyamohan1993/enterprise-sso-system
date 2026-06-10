@@ -27,6 +27,20 @@ argon2.workspace = true
 p256 = { workspace = true }
 ed25519-dalek = { workspace = true }
 cryptoki = { workspace = true, optional = true }
+# CAC/PIV X.509 chain validation (RFC 5280) and OCSP (RFC 6960). Parsing uses
+# the vetted RustCrypto X.509 crate (NOT a hand-rolled DER path validator).
+# `der` provides Decode/Encode for re-encoding the TBSCertificate and Name/SPKI
+# fields; `const-oid` (db feature) supplies canonical RFC 5280 EKU OIDs for the
+# clientAuth / OCSP-signing checks. x509-cert's der/spki/const-oid deps unify
+# with the lock.
+x509-cert = "0.2"
+const-oid = { version = "0.9", features = ["db"] }
+der = "0.7"
+# Certificate-chain and OCSP signature verification over a single FIPS-validated
+# backend. The `rsa` crate (RUSTSEC-2023-0071 / Marvin) is NOT used; aws-lc-rs
+# verifies RSA-PKCS1v15 SHA-256/384/512 and ECDSA P-256/P-384 (covering DoD PKI,
+# including real P-384 CAC/intermediate certs). Spec matches rsa-verify-shim.
+aws-lc-rs = { version = "1.10", default-features = false, features = ["aws-lc-sys"] }
 serde_json = "1"
 rand.workspace = true
 curve25519-dalek.workspace = true
@@ -41,6 +55,12 @@ parking_lot = "0.12"
 insta.workspace = true
 serde_json = "1"
 proptest = "1"
+# Build real, properly-signed test certificate chains (root CA -> EE) with
+# DoD-style policy OIDs, clientAuth EKU, and custom validity windows for the
+# CAC/PIV chain-validation tests. Both already in Cargo.lock (rcgen 0.13.2,
+# time 0.3.47); no new fetch.
+rcgen = { workspace = true }
+time = "0.3"
 serial_test.workspace = true
 syn = { version = "2", features = ["full", "visit", "extra-traits"] }
 quote = "1"

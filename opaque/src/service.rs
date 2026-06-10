@@ -153,19 +153,26 @@ pub fn handle_login_start_bound(
     };
 
     let binding = build_channel_binding_context(tls_exporter);
-    let mut params = ServerLoginParameters::default();
-    params.context = Some(&binding[..]);
 
-    let mut rng = rand::rngs::OsRng;
-    let server_login_start = ServerLogin::<OpaqueCs>::start(
-        &mut rng,
-        store.server_setup(),
-        password_file,
-        credential_request,
-        username.as_bytes(),
-        params,
-    )
-    .map_err(|e| format!("server login start: {e}"))?;
+    // Transient unseal (F4): ServerLogin::start needs &ServerSetup only for the
+    // duration of this call; the returned state finishes without it. On the
+    // sealed production path the OPRF seed is wiped immediately after.
+    let server_login_start = store
+        .with_server_setup_ref(|setup| {
+            let mut params = ServerLoginParameters::default();
+            params.context = Some(&binding[..]);
+            let mut rng = rand::rngs::OsRng;
+            ServerLogin::<OpaqueCs>::start(
+                &mut rng,
+                setup,
+                password_file,
+                credential_request,
+                username.as_bytes(),
+                params,
+            )
+            .map_err(|e| format!("server login start: {e}"))
+        })
+        .map_err(|e| format!("server setup unavailable: {e}"))??;
 
     let response_bytes = server_login_start.message.serialize().to_vec();
 
@@ -289,16 +296,21 @@ pub fn handle_login_start(
         Err(_) => None, // Use None to prevent username enumeration
     };
 
-    let mut rng = rand::rngs::OsRng;
-    let server_login_start = ServerLogin::<OpaqueCs>::start(
-        &mut rng,
-        store.server_setup(),
-        password_file,
-        credential_request,
-        username.as_bytes(),
-        ServerLoginParameters::default(),
-    )
-    .map_err(|e| format!("server login start: {e}"))?;
+    // Transient unseal (F4): ServerLogin::start needs &ServerSetup only here.
+    let server_login_start = store
+        .with_server_setup_ref(|setup| {
+            let mut rng = rand::rngs::OsRng;
+            ServerLogin::<OpaqueCs>::start(
+                &mut rng,
+                setup,
+                password_file,
+                credential_request,
+                username.as_bytes(),
+                ServerLoginParameters::default(),
+            )
+            .map_err(|e| format!("server login start: {e}"))
+        })
+        .map_err(|e| format!("server setup unavailable: {e}"))??;
 
     let response_bytes = server_login_start.message.serialize().to_vec();
 
@@ -397,14 +409,21 @@ pub fn handle_register_start(
         RegistrationRequest::<OpaqueCs>::deserialize(registration_request_bytes)
             .map_err(|e| format!("deserialize registration request: {e}"))?;
 
-    let server_start = ServerRegistration::<OpaqueCs>::start(
-        store.server_setup(),
-        registration_request,
-        username.as_bytes(),
-    )
-    .map_err(|e| format!("server registration start: {e}"))?;
+    // Transient unseal (F4): ServerRegistration::start needs &ServerSetup only
+    // for this call.
+    let response_bytes = store
+        .with_server_setup_ref(|setup| {
+            ServerRegistration::<OpaqueCs>::start(
+                setup,
+                registration_request,
+                username.as_bytes(),
+            )
+            .map(|ss| ss.message.serialize().to_vec())
+            .map_err(|e| format!("server registration start: {e}"))
+        })
+        .map_err(|e| format!("server setup unavailable: {e}"))??;
 
-    Ok(server_start.message.serialize().to_vec())
+    Ok(response_bytes)
 }
 
 /// Handle a RegisterFinish request: finalize the registration and store it.

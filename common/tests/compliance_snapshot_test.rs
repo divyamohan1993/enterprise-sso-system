@@ -79,6 +79,15 @@ fn snapshot_stig_audit_result() {
 
     // Build a structured report for snapshotting.
     // Collect check data into owned Vec to release the mutable borrow.
+    // This is a FORMAT regression guard for the static STIG check catalog, so it
+    // must be deterministic across machines. `c.status` and the pass/fail/NA
+    // summary counts are derived from the *live host's* kernel sysctls
+    // (kptr_restrict, dmesg_restrict, fips_enabled, send_redirects, …) and so
+    // vary by machine — snapshotting them makes the test pass only on the host
+    // that generated the snapshot. We therefore snapshot the static catalog
+    // (id/title/severity/category) plus the static counts (total, and `manual`,
+    // which is fixed by the human-review checks). Runtime pass/fail is asserted
+    // separately by the non-snapshot unit tests in `common::stig`.
     let check_summaries: Vec<_> = auditor
         .run_all()
         .iter()
@@ -88,7 +97,6 @@ fn snapshot_stig_audit_result() {
                 "title": c.title,
                 "severity": format!("{:?}", c.severity),
                 "category": format!("{:?}", c.category),
-                "status": format!("{:?}", c.status),
             })
         })
         .collect();
@@ -99,13 +107,7 @@ fn snapshot_stig_audit_result() {
         "audit_type": "DISA STIG / CIS Level 2",
         "summary": {
             "total": summary.total,
-            "passed": summary.passed,
-            "failed": summary.failed,
-            "not_applicable": summary.not_applicable,
             "manual": summary.manual,
-            "cat_i_failures": summary.cat_i_failures,
-            "cat_ii_failures": summary.cat_ii_failures,
-            "cat_iii_failures": summary.cat_iii_failures,
         },
         "checks": check_summaries,
     });

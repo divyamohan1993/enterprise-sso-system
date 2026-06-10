@@ -4816,6 +4816,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_encrypted_assertion_military_requires_cert() {
         std::env::set_var("MILNET_MILITARY_DEPLOYMENT", "1");
         let r = encrypt_assertion_aes256gcm("<saml:Assertion>data</saml:Assertion>", None);
