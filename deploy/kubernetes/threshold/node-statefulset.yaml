@@ -1,0 +1,146 @@
+# MILNET threshold deployment — the "pod = node = machine" manifest.
+#
+# A single StatefulSet `milnet-node` of N replicas (5 <= N <= 21). Each pod is
+# ONE cluster node: it holds the ~10 MILNET service containers for that node,
+# all sharing the pod's network namespace, IP, hostname, ONE KEK share, and ONE
+# mTLS identity — exactly like a physical fleet node.
+#
+# Set replicas: 5 (minimum, 3-of-5 threshold) up to 21 (full fleet).
+# Pod count == node count. Never a multiple of the service count.
+#
+# YAML anchors keep it DRY: the share-selection wrapper, securityContext,
+# resources, env and volumeMounts are identical for every service container
+# and defined once on the `gateway` container, aliased by the rest.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: milnet-node                    # headless — stable per-node DNS
+  namespace: milnet
+  labels: { app.kubernetes.io/name: milnet-node }
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true       # peers must resolve before Ready
+  selector: { app.kubernetes.io/name: milnet-node }
+  ports:
+    - { name: gateway,     port: 9100, targetPort: 9100 }
+    - { name: orchestrator,port: 9101, targetPort: 9101 }
+    - { name: opaque,      port: 9102, targetPort: 9102 }
+    - { name: tss-coord,   port: 9103, targetPort: 9103 }
+    - { name: verifier,    port: 9104, targetPort: 9104 }
+    - { name: ratchet,     port: 9105, targetPort: 9105 }
+    - { name: risk,        port: 9106, targetPort: 9106 }
+    - { name: audit,       port: 9108, targetPort: 9108 }
+    - { name: kt,          port: 9109, targetPort: 9109 }
+    - { name: admin,       port: 8080, targetPort: 8080 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: milnet-node
+  namespace: milnet
+spec:
+  serviceName: milnet-node
+  replicas: 5                          # <-- N nodes: 5 (min) .. 21 (fleet)
+  podManagementPolicy: Parallel        # nodes boot together to form quorum
+  selector:
+    matchLabels: { app.kubernetes.io/name: milnet-node }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: milnet-node }
+      annotations:
+        container.apparmor.security.beta.kubernetes.io/gateway: runtime/default
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        seccompProfile: { type: RuntimeDefault }
+      # Spread node-pods across k8s nodes when the cluster has several.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels: { app.kubernetes.io/name: milnet-node }
+      containers:
+        # ── service container 1/10 — defines the shared anchors ──────────────
+        - name: gateway
+          image: localhost/milnet/gateway:dev
+          imagePullPolicy: &ipp Never
+          # ord -> KEK share index ((ord mod 5)+1); every container in the pod
+          # picks up THIS node's single share.
+          command: &cmd ["/bin/sh","-c"]
+          args: &args
+            - |
+              set -eu
+              ord="${HOSTNAME##*-}"; idx=$(( ord % 5 + 1 ))
+              export MILNET_KEK_SHARE="$(cat /etc/milnet/kek/share-${idx})"
+              export MILNET_KEK_SHARE_INDEX="${idx}"
+              exec /service
+          envFrom: &ef
+            - configMapRef: { name: milnet-common-config }   # no single-KEK flags
+          env: &env
+            - name: MILNET_VSS_COMMITMENTS
+              valueFrom: { secretKeyRef: { name: milnet-vss-commitments, key: MILNET_VSS_COMMITMENTS } }
+            - name: MILNET_NODE_ID
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: MILNET_CLUSTER_PEERS
+              # all N node-pods; the node filters its own entry. Extend to N.
+              value: >-
+                milnet-node-0.milnet-node.milnet.svc.cluster.local:9101,
+                milnet-node-1.milnet-node.milnet.svc.cluster.local:9101,
+                milnet-node-2.milnet-node.milnet.svc.cluster.local:9101,
+                milnet-node-3.milnet-node.milnet.svc.cluster.local:9101,
+                milnet-node-4.milnet-node.milnet.svc.cluster.local:9101
+          securityContext: &sec
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"], add: ["IPC_LOCK"] }
+          resources: &res
+            requests: { cpu: 50m, memory: 96Mi }
+            limits:   { cpu: 300m, memory: 256Mi }
+          volumeMounts: &vm
+            - { name: kek-shares, mountPath: /etc/milnet/kek, readOnly: true }
+            - { name: mtls,       mountPath: /etc/milnet/mtls, readOnly: true }
+            - { name: tmp,        mountPath: /tmp }
+            - { name: state,      mountPath: /var/lib/milnet }
+        # ── service containers 2..10 — identical pattern, aliased anchors ────
+        - { name: orchestrator,    image: localhost/milnet/orchestrator:dev,
+            imagePullPolicy: *ipp, command: *cmd, args: *args, envFrom: *ef,
+            env: *env, securityContext: *sec, resources: *res, volumeMounts: *vm }
+        - { name: opaque,          image: localhost/milnet/opaque:dev,
+            imagePullPolicy: *ipp, command: *cmd, args: *args, envFrom: *ef,
+            env: *env, securityContext: *sec, resources: *res, volumeMounts: *vm }
+        - { name: tss-coordinator, image: localhost/milnet/tss:dev,
+            imagePullPolicy: *ipp, command: *cmd, args: *args, envFrom: *ef,
+            env: *env, securityContext: *sec, resources: *res, volumeMounts: *vm }
+        - { name: verifier,        image: localhost/milnet/verifier:dev,
+            imagePullPolicy: *ipp, command: *cmd, args: *args, envFrom: *ef,
+            env: *env, securityContext: *sec, resources: *res, volumeMounts: *vm }
+        - { name: ratchet,         image: localhost/milnet/ratchet:dev,
+            imagePullPolicy: *ipp, command: *cmd, args: *args, envFrom: *ef,
+            env: *env, securityContext: *sec, resources: *res, volumeMounts: *vm }
+        - { name: risk,            image: localhost/milnet/risk:dev,
+            imagePullPolicy: *ipp, command: *cmd, args: *args, envFrom: *ef,
+            env: *env, securityContext: *sec, resources: *res, volumeMounts: *vm }
+        - { name: audit,           image: localhost/milnet/audit:dev,
+            imagePullPolicy: *ipp, command: *cmd, args: *args, envFrom: *ef,
+            env: *env, securityContext: *sec, resources: *res, volumeMounts: *vm }
+        - { name: kt,              image: localhost/milnet/kt:dev,
+            imagePullPolicy: *ipp, command: *cmd, args: *args, envFrom: *ef,
+            env: *env, securityContext: *sec, resources: *res, volumeMounts: *vm }
+        - { name: admin,           image: localhost/milnet/admin:dev,
+            imagePullPolicy: *ipp, command: *cmd, args: *args, envFrom: *ef,
+            env: *env, securityContext: *sec, resources: *res, volumeMounts: *vm }
+        # tss-signer runs on the 5 designated signer nodes; add it as an 11th
+        # container guarded by the node ordinal, or use a second StatefulSet
+        # `milnet-signer` of exactly 5 replicas. See DESIGN.md sec 3.2 / sec 10.
+      volumes:
+        - { name: kek-shares, secret: { secretName: milnet-kek-shares, defaultMode: 0o400 } }
+        - { name: mtls,       secret: { secretName: milnet-mtls-ca,     defaultMode: 0o400 } }
+        - { name: tmp,        emptyDir: {} }
+        - { name: state,      emptyDir: {} }
