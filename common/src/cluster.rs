@@ -835,7 +835,11 @@ fn raft_encrypt_enabled() -> bool {
 // the VK was produced, so such keys drop in with no API change. This matches the
 // codebase's documented anti-clone-not-anti-root boundary.
 
-use crate::distributed_startup::{verify_node_sig, NodeIdentity, NodeIdentityRegistry};
+use crate::binary_attestation_mesh::BinaryHash;
+use crate::distributed_startup::{
+    verify_node_sig, DistributedStartupVerifier, NodeIdentity, NodeIdentityRegistry,
+    PeerAttestation,
+};
 
 /// A Raft control-plane message bound to its sender by a per-node ML-DSA-87
 /// signature. Serialized with postcard and carried inside the HMAC frame.
@@ -949,6 +953,367 @@ fn verify_transport_message(
     Ok((envelope.sender_id, envelope.message))
 }
 
+// ── Transport frame multiplexing (Raft messages + attestation handshake) ─────
+//
+// SECURITY (closes the LIVE-WIRING gap of the per-node ML-DSA-87 transport):
+// The per-node-signed Raft transport above authenticates a peer ONLY against a
+// verifying key PINNED for that peer's NodeId. In MILITARY mode nothing pins
+// peers locally (`build_peer_verifying_keys` pins SELF only, because each peer's
+// signing seed is sealed to its OWN TPM and its VK is therefore not locally
+// derivable). Until a peer's VK is pinned, EVERY Raft message from it is dropped
+// fail-closed — i.e. the cluster cannot form. The missing piece is a LIVE
+// exchange of each node's PUBLISHED, attestation-signed Raft VK.
+//
+// We carry that exchange over the SAME TCP transport the Raft RPCs use, by
+// tagging every frame with a small [`TransportFrame`] discriminant so the one
+// listener can tell a handshake from a Raft message. The handshake payload is a
+// signed [`PeerAttestation`] (`generate_own_attestation`): its ML-DSA-87
+// signature COVERS the published `raft_verifying_key`, so a man-in-the-middle
+// cannot substitute a different VK, and an unverifiable attestation is never
+// pinned (fail-closed). The attestation also rides INSIDE the existing HMAC
+// frame, so it inherits the same cheap first-factor as Raft traffic.
+//
+// DEPLOYMENT REQUIREMENTS (documented, by design — do NOT weaken):
+//  * SAME-VERSION CLUSTER: this `TransportFrame` outer tag changes the bytes the
+//    listener deserializes, so a node on this version CANNOT exchange Raft
+//    messages with a node still on the pre-handshake (raw `NodeAuthenticatedRaft
+//    Message` / raw tuple) format. The transport is therefore NOT
+//    rolling-compatible across this change. That is acceptable here: the
+//    threshold StatefulSet / LAN fleet deploys every node at a single version
+//    together (see deploy/kubernetes/threshold/). A try-TransportFrame-then-fall-
+//    back-to-raw shim was considered and deliberately rejected — it adds parsing
+//    ambiguity and a downgrade surface for zero benefit given whole-cluster
+//    deploys.
+//  * ATTESTATION FRESHNESS + BINARY HASH: a peer's attestation is rejected if it
+//    is older than `attestation_max_age` (default 60s) or — outside a rolling
+//    update — its binary hash differs from ours. So (a) the handshake regenerates
+//    a FRESH attestation on every (re)connect (see `fresh_attestation`), and
+//    (b) a genuine cross-version rollout that changes the binary needs
+//    `MILNET_ROLLING_UPDATE=1` for peers to pin across the version skew, exactly
+//    as full cluster verification requires.
+
+/// A frame on the cluster TCP transport, tagging its kind so the single listener
+/// can route a handshake versus a Raft control-plane message. Postcard-encoded,
+/// then carried inside the HMAC (and optionally AES-GCM) frame like any payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum TransportFrame {
+    /// A signed peer attestation exchanged at connect to publish (and pin) the
+    /// sender's per-node Raft verifying key. Boxed because `PeerAttestation`
+    /// carries multi-KB ML-DSA-87 material and is far larger than a Raft message,
+    /// so we keep the enum's other (hot-path) variant cheap.
+    Handshake(Box<PeerAttestation>),
+    /// The pre-existing transport payload: either a per-node-signed
+    /// [`NodeAuthenticatedRaftMessage`] (military / KEK present) or a plain
+    /// `postcard((NodeId, RaftMessage))` tuple (legacy / no-KEK / tests). The
+    /// bytes are EXACTLY what was carried before this multiplexing layer existed,
+    /// so the `sign_transport_message` / `verify_transport_message` contract is
+    /// unchanged — this only adds an outer tag.
+    Raft(Vec<u8>),
+}
+
+impl TransportFrame {
+    /// Serialize this frame to wire bytes.
+    fn to_wire(&self) -> Result<Vec<u8>, String> {
+        postcard::to_allocvec(self)
+            .map_err(|e| format!("failed to serialize transport frame: {e}"))
+    }
+
+    /// Parse a transport frame from wire bytes.
+    fn from_wire(data: &[u8]) -> Result<Self, String> {
+        postcard::from_bytes(data)
+            .map_err(|e| format!("failed to deserialize transport frame: {e}"))
+    }
+}
+
+/// The attestation handshaker: produces THIS node's signed attestation and
+/// verifies a peer's, then yields the `(NodeId, raft_verifying_key)` to pin.
+///
+/// Built once in [`ClusterNode::start`] (military mode only) and shared by the
+/// connect-side handshake task and the listener's inbound-handshake path so both
+/// directions of the exchange share one verifier and one published attestation.
+struct AttestationHandshaker {
+    verifier: DistributedStartupVerifier,
+    /// This node's own binary hash, compared against a peer's before pinning.
+    /// Pinning only authenticates a peer's identity key; binary consistency
+    /// additionally rejects pinning a peer that is running a DIFFERENT (possibly
+    /// tampered) binary — defense in depth that reuses the same policy
+    /// (honoring `MILNET_ROLLING_UPDATE`) as full cluster verification. Computed
+    /// once at construction (the running binary does not change).
+    own_binary_hash: BinaryHash,
+}
+
+impl AttestationHandshaker {
+    /// Build the handshaker, publishing EXACTLY `identity`'s verifying key in the
+    /// attestation so peers pin the same key the Raft transport signs with.
+    ///
+    /// Returns `None` (handshake disabled) if the verifier cannot be constructed
+    /// (e.g. no peers configured) — the caller treats that as "no live pinning",
+    /// which keeps the transport fail-closed rather than silently trusting peers.
+    fn new(identity: &NodeIdentity) -> Option<Self> {
+        let verifier = match DistributedStartupVerifier::new() {
+            Ok(v) => v.from_node_identity(identity),
+            Err(e) => {
+                warn!(
+                    err = %e,
+                    "attestation handshaker disabled: verifier init failed \
+                     (peers remain unpinned; military Raft transport stays fail-closed)"
+                );
+                return None;
+            }
+        };
+        // Compute the binary hash once (it does not change for the life of the
+        // process); the attestation itself is generated FRESH per send below.
+        let own_binary_hash = verifier.generate_own_attestation().binary_hash;
+        Some(Self {
+            verifier,
+            own_binary_hash,
+        })
+    }
+
+    /// Generate a FRESH signed attestation to send to a peer.
+    ///
+    /// Regenerated per (re)connect rather than cached so its `timestamp` is
+    /// current: a peer rejects any attestation older than `attestation_max_age`
+    /// (default 60s), so a stale cached attestation would fail to pin on a late
+    /// join / reconnect after a long outage. Regeneration re-signs with the
+    /// already-in-memory attestation seed (ML-DSA-87, off the Raft hot path — only
+    /// during handshake retries), and does NOT re-unseal the TPM identity seed.
+    fn fresh_attestation(&self) -> PeerAttestation {
+        self.verifier.generate_own_attestation()
+    }
+
+    /// Verify a received peer attestation and, if valid, return the
+    /// `(NodeId, raft_verifying_key)` to pin. FAIL-CLOSED: any verification
+    /// failure (bad signature, stale, missing published VK, or — outside a
+    /// rolling update — a mismatched binary hash) yields `Err` and NOTHING is
+    /// pinned, so the peer's Raft messages keep being dropped.
+    fn verify_and_extract(
+        &self,
+        att: &PeerAttestation,
+    ) -> Result<(NodeId, Vec<u8>), String> {
+        // Signature (covers the published raft_verifying_key) + freshness.
+        self.verifier
+            .verify_attestation(att)
+            .map_err(|e| format!("peer attestation rejected (sig/freshness): {e}"))?;
+
+        // Defense in depth: refuse to pin a peer running a different binary,
+        // honoring MILNET_ROLLING_UPDATE exactly as full cluster verification.
+        self.verifier
+            .verify_binary_consistency(&self.own_binary_hash, att)
+            .map_err(|e| format!("peer attestation rejected (binary consistency): {e}"))?;
+
+        if att.raft_verifying_key.is_empty() {
+            return Err(format!(
+                "peer {} published no raft_verifying_key — not pinning (fail-closed)",
+                att.node_id
+            ));
+        }
+        Ok((att.node_id, att.raft_verifying_key.clone()))
+    }
+
+    /// Test-only constructor from an explicit verifier (no env / TPM dependency),
+    /// so the verify+pin policy can be exercised hermetically.
+    #[cfg(test)]
+    fn from_verifier_for_test(
+        verifier: DistributedStartupVerifier,
+        own_binary_hash: BinaryHash,
+    ) -> Self {
+        Self {
+            verifier,
+            own_binary_hash,
+        }
+    }
+}
+
+/// Send a [`TransportFrame`] over `stream`, using the HMAC frame when a key is
+/// configured (the same envelope Raft messages use) or a plain frame otherwise.
+async fn send_transport_frame(
+    stream: &mut TcpStream,
+    frame: &TransportFrame,
+    hmac_key: Option<&[u8; 64]>,
+) -> Result<(), String> {
+    let wire = frame.to_wire()?;
+    match hmac_key {
+        Some(key) => send_authenticated(stream, &wire, key).await,
+        None => send_framed(stream, &wire).await,
+    }
+}
+
+/// Receive and parse a [`TransportFrame`] from `stream`, verifying the HMAC frame
+/// when a key is configured.
+async fn recv_transport_frame(
+    stream: &mut TcpStream,
+    hmac_key: Option<&[u8; 64]>,
+) -> Result<TransportFrame, String> {
+    let data = match hmac_key {
+        Some(key) => recv_authenticated(stream, key).await?,
+        None => recv_framed(stream).await?,
+    };
+    TransportFrame::from_wire(&data)
+}
+
+/// Emit a SIEM event for a REJECTED peer attestation during the handshake.
+/// A rejected attestation means an unverifiable/forged/tampered/stale claim, or
+/// a peer running a different binary — all security-relevant.
+fn emit_handshake_rejected(peer_addr: &str, reason: &str) {
+    let event = crate::siem::SecurityEvent {
+        timestamp: crate::siem::SecurityEvent::now_iso8601(),
+        category: "cluster",
+        action: "raft_attestation_handshake_rejected",
+        severity: crate::siem::Severity::Critical,
+        outcome: "failure",
+        user_id: None,
+        source_ip: Some(peer_addr.to_string()),
+        detail: Some(format!(
+            "rejected peer attestation during Raft VK handshake — peer NOT pinned \
+             (its Raft messages stay dropped, fail-closed): {reason}"
+        )),
+    };
+    event.emit();
+}
+
+/// Verify a received attestation and pin the peer's per-node Raft VK into the
+/// shared registry. Shared by both handshake directions. FAIL-CLOSED: returns
+/// without pinning on any verification failure (and emits a SIEM Critical).
+///
+/// On a successful (or already-present) pin, publishes the new pinned-PEER count
+/// (registry size minus self) to `pinned_peers_tx` so readiness consumers learn
+/// when peers are pinned. `watch::Sender::send_if_modified` is used so a
+/// duplicate pin (same peer re-handshaking) does not spuriously notify.
+async fn verify_and_pin(
+    att: PeerAttestation,
+    peer_addr: &str,
+    handshaker: &AttestationHandshaker,
+    peer_vks: &Arc<RwLock<NodeIdentityRegistry>>,
+    pinned_peers_tx: Option<&watch::Sender<usize>>,
+) {
+    match handshaker.verify_and_extract(&att) {
+        Ok((node_id, vk)) => {
+            // Pin under the write lock and read back the peer count atomically so
+            // the published count never races a concurrent pin.
+            let peer_count = {
+                let mut reg = peer_vks.write().await;
+                reg.pin(node_id, vk);
+                // Peers = all pinned identities minus self (self is always pinned).
+                reg.len().saturating_sub(1)
+            };
+            info!(
+                peer = %node_id,
+                peer_addr = %peer_addr,
+                pinned_peers = peer_count,
+                "pinned peer per-node Raft verifying key from verified attestation \
+                 (handshake) — peer's Raft messages now authenticated"
+            );
+            if let Some(tx) = pinned_peers_tx {
+                // Only notify when the count actually advances (idempotent pins
+                // of an already-known peer must not wake waiters needlessly).
+                tx.send_if_modified(|cur| {
+                    if peer_count > *cur {
+                        *cur = peer_count;
+                        true
+                    } else {
+                        false
+                    }
+                });
+            }
+        }
+        Err(e) => {
+            warn!(peer_addr = %peer_addr, err = %e, "REJECTING peer attestation: not pinning");
+            emit_handshake_rejected(peer_addr, &e);
+        }
+    }
+}
+
+/// Connect-side handshake: dial a peer's raft transport, send our attestation,
+/// read the peer's reply attestation, verify it, and pin the peer's Raft VK.
+///
+/// FAIL-CLOSED throughout: a connect failure, a frame error, or an unverifiable
+/// attestation simply leaves the peer unpinned (the loop in Task 5 retries on the
+/// next tick), so the transport never trusts a peer it has not authenticated.
+async fn outbound_handshake(
+    peer: &PeerConfig,
+    handshaker: &AttestationHandshaker,
+    peer_vks: &Arc<RwLock<NodeIdentityRegistry>>,
+    hmac_key: Option<&[u8; 64]>,
+    pinned_peers_tx: Option<&watch::Sender<usize>>,
+) {
+    let mut stream = match TcpStream::connect(&peer.raft_addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            debug!(
+                addr = %peer.raft_addr,
+                err = %e,
+                "handshake: failed to connect to peer (will retry)"
+            );
+            return;
+        }
+    };
+
+    // Send our own freshly-signed attestation (publishes our per-node Raft VK).
+    let own = TransportFrame::Handshake(Box::new(handshaker.fresh_attestation()));
+    if let Err(e) = send_transport_frame(&mut stream, &own, hmac_key).await {
+        debug!(addr = %peer.raft_addr, err = %e, "handshake: failed to send own attestation");
+        return;
+    }
+
+    // Read the peer's reply attestation.
+    let frame = match recv_transport_frame(&mut stream, hmac_key).await {
+        Ok(f) => f,
+        Err(e) => {
+            debug!(addr = %peer.raft_addr, err = %e, "handshake: failed to read peer attestation");
+            return;
+        }
+    };
+    match frame {
+        TransportFrame::Handshake(att) => {
+            verify_and_pin(*att, &peer.raft_addr, handshaker, peer_vks, pinned_peers_tx).await;
+        }
+        TransportFrame::Raft(_) => {
+            warn!(
+                addr = %peer.raft_addr,
+                "handshake: expected attestation reply but got a Raft frame — ignoring"
+            );
+        }
+    }
+}
+
+/// Listener-side handshake: a peer connected to US and sent its attestation.
+/// Verify + pin it, then reply with OUR attestation so the peer pins us too
+/// (symmetric exchange — completes regardless of who connected first).
+///
+/// `handshaker` is `None` if this node has no handshaker (non-military): in that
+/// case we received a handshake we cannot process, so we drop it (fail-closed).
+async fn handle_inbound_handshake(
+    stream: &mut TcpStream,
+    att: PeerAttestation,
+    peer_addr: &str,
+    handshaker: Option<&AttestationHandshaker>,
+    peer_vks: Option<&Arc<RwLock<NodeIdentityRegistry>>>,
+    hmac_key: Option<&[u8; 64]>,
+    pinned_peers_tx: Option<&watch::Sender<usize>>,
+) {
+    let (handshaker, peer_vks) = match (handshaker, peer_vks) {
+        (Some(h), Some(v)) => (h, v),
+        _ => {
+            warn!(
+                peer_addr = %peer_addr,
+                "received attestation handshake but per-node auth/handshake is disabled — dropping"
+            );
+            return;
+        }
+    };
+
+    // Verify + pin the inbound peer's VK.
+    verify_and_pin(att, peer_addr, handshaker, peer_vks, pinned_peers_tx).await;
+
+    // Reply with our own freshly-signed attestation so the initiating peer pins
+    // us as well (symmetric exchange).
+    let own = TransportFrame::Handshake(Box::new(handshaker.fresh_attestation()));
+    if let Err(e) = send_transport_frame(stream, &own, hmac_key).await {
+        debug!(peer_addr = %peer_addr, err = %e, "handshake: failed to send reply attestation");
+    }
+}
+
 /// Build the initial pinned [`NodeIdentityRegistry`] for the transport.
 ///
 /// SELF is always pinned from this node's own identity VK (`self_vk`).
@@ -1007,6 +1372,13 @@ pub struct ClusterNode {
     /// `None` when per-node auth is disabled (non-military, no KEK). The cluster
     /// join flow pins PUBLISHED peer VKs here via [`Self::pin_peer_verifying_key`].
     peer_vks: Option<Arc<RwLock<NodeIdentityRegistry>>>,
+    /// Watch carrying the number of PEERS currently pinned via the attestation
+    /// handshake (excludes self). Updated after each successful pin. `None` when
+    /// the handshake is disabled (non-military / no KEK). Consumers (e.g. the
+    /// revocation layer) use [`Self::pinned_peers_watch`] to know WHEN it is safe
+    /// to snapshot the registry — pinning is asynchronous and ongoing after
+    /// `start` returns, so a snapshot taken too early would miss peers.
+    pinned_peers_tx: Option<watch::Sender<usize>>,
 }
 
 impl ClusterNode {
@@ -1114,6 +1486,51 @@ impl ClusterNode {
             (None, None)
         };
 
+        // Attestation handshaker — LIVE peer verifying-key exchange.
+        //
+        // Built ONLY in military mode, where `build_peer_verifying_keys` pinned
+        // SELF only and peer VKs are not locally derivable (each peer's seed is
+        // sealed to its own TPM). Outside military mode every peer is already
+        // pinned from the KEK-derived identity, so no exchange is needed and we
+        // skip the handshake entirely. The handshaker publishes EXACTLY this
+        // node's identity VK (`from_node_identity`) so peers pin the same key the
+        // Raft transport signs with.
+        let handshaker: Option<Arc<AttestationHandshaker>> =
+            match (military, node_identity.as_ref()) {
+                (true, Some(identity)) => match AttestationHandshaker::new(identity) {
+                    Some(h) => {
+                        info!(
+                            "attestation handshake ENABLED: publishing this node's \
+                             per-node Raft VK to peers and pinning theirs at connect"
+                        );
+                        Some(Arc::new(h))
+                    }
+                    None => {
+                        // FAIL-CLOSED posture preserved: without a handshaker no
+                        // peer is ever pinned, so the transport keeps dropping all
+                        // peer Raft messages rather than trusting an unpinned peer.
+                        warn!(
+                            "attestation handshake DISABLED (verifier unavailable) — \
+                             peers will NOT be pinned and their Raft messages stay dropped"
+                        );
+                        None
+                    }
+                },
+                _ => None,
+            };
+
+        // Readiness watch: number of PEERS pinned via the handshake (excludes
+        // self). Only meaningful when the handshake is active; consumers await it
+        // before snapshotting the registry (see `pinned_peers_watch`). Built only
+        // when the handshake is enabled so a `None` here is an unambiguous "no
+        // live pinning happens on this node".
+        let pinned_peers_tx: Option<watch::Sender<usize>> = if handshaker.is_some() {
+            let (tx, _rx) = watch::channel::<usize>(0);
+            Some(tx)
+        } else {
+            None
+        };
+
         // Channel for outgoing Raft messages.
         let (send_tx, send_rx) = mpsc::unbounded_channel::<(NodeId, RaftMessage)>();
 
@@ -1148,6 +1565,8 @@ impl ClusterNode {
             let mut shutdown_rx = shutdown_rx.clone();
             let hmac_key = hmac_key.clone();
             let peer_vks = peer_vks.clone();
+            let handshaker = handshaker.clone();
+            let pinned_peers_tx = pinned_peers_tx.clone();
             tokio::spawn(async move {
                 let listener = match TcpListener::bind(&raft_addr).await {
                     Ok(l) => l,
@@ -1176,8 +1595,12 @@ impl ClusterNode {
                     let send_tx = send_tx.clone();
                     let hmac_key = hmac_key.clone();
                     let peer_vks = peer_vks.clone();
+                    let handshaker = handshaker.clone();
+                    let pinned_peers_tx = pinned_peers_tx.clone();
                     tokio::spawn(async move {
-                        // First factor: HMAC frame (cheap, rejects garbage).
+                        // First factor: HMAC frame (cheap, rejects garbage). The
+                        // attestation handshake rides inside this same frame, so it
+                        // inherits the HMAC pre-filter too.
                         let data = if let Some(ref key) = hmac_key {
                             match recv_authenticated(&mut stream, key).await {
                                 Ok(d) => d,
@@ -1196,6 +1619,39 @@ impl ClusterNode {
                             }
                         };
 
+                        // Demultiplex: a handshake (attestation exchange) or a
+                        // Raft control-plane message. A parse error drops the
+                        // connection (fail-closed).
+                        let frame = match TransportFrame::from_wire(&data) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                warn!(peer = %peer_addr, err = %e, "failed to parse transport frame");
+                                return;
+                            }
+                        };
+
+                        let raft_payload = match frame {
+                            TransportFrame::Handshake(att) => {
+                                // Inbound peer attestation: verify (sig covers the
+                                // published VK + freshness + binary consistency)
+                                // and pin the peer's per-node Raft VK. FAIL-CLOSED:
+                                // an unverifiable attestation pins nothing, so the
+                                // peer's Raft messages keep being dropped.
+                                handle_inbound_handshake(
+                                    &mut stream,
+                                    *att,
+                                    &peer_addr.to_string(),
+                                    handshaker.as_deref(),
+                                    peer_vks.as_ref(),
+                                    hmac_key.as_deref(),
+                                    pinned_peers_tx.as_ref(),
+                                )
+                                .await;
+                                return;
+                            }
+                            TransportFrame::Raft(payload) => payload,
+                        };
+
                         // Primary factor: per-node ML-DSA-87 signature bound to
                         // the claimed sender's pinned verifying key. FAIL-CLOSED:
                         // a parse error, an unpinned sender, or a bad signature
@@ -1203,7 +1659,7 @@ impl ClusterNode {
                         let (from, msg): (NodeId, RaftMessage) =
                             if let Some(ref vks) = peer_vks {
                                 let registry = vks.read().await;
-                                match verify_transport_message(&data, &registry) {
+                                match verify_transport_message(&raft_payload, &registry) {
                                     Ok(v) => v,
                                     Err(e) => {
                                         warn!(peer = %peer_addr, err = %e, "REJECTING raft message: per-node authentication failed");
@@ -1213,7 +1669,7 @@ impl ClusterNode {
                             } else {
                                 // Legacy/no-KEK path (non-military, tests):
                                 // plain (NodeId, RaftMessage) tuple.
-                                match postcard::from_bytes(&data) {
+                                match postcard::from_bytes(&raft_payload) {
                                     Ok(v) => v,
                                     Err(e) => {
                                         warn!(err = %e, "failed to deserialize raft message");
@@ -1299,12 +1755,22 @@ impl ClusterNode {
                                 }
                             }
                         };
+                        // Tag as a Raft frame so the peer's listener demultiplexes
+                        // it from an attestation handshake. The inner `data` bytes
+                        // are unchanged from before this multiplexing layer.
+                        let framed = match (TransportFrame::Raft(data)).to_wire() {
+                            Ok(f) => f,
+                            Err(e) => {
+                                warn!(err = %e, "failed to frame raft message");
+                                return;
+                            }
+                        };
                         if let Some(ref key) = hmac_key {
-                            if let Err(e) = send_authenticated(&mut stream, &data, key).await {
+                            if let Err(e) = send_authenticated(&mut stream, &framed, key).await {
                                 debug!(addr = %peer_addr, err = %e, "failed to send authenticated raft message");
                             }
                         } else {
-                            if let Err(e) = send_framed(&mut stream, &data).await {
+                            if let Err(e) = send_framed(&mut stream, &framed).await {
                                 debug!(addr = %peer_addr, err = %e, "failed to send raft message");
                             }
                         }
@@ -1369,6 +1835,72 @@ impl ClusterNode {
             });
         }
 
+        // Task 5: Attestation Handshake (LIVE peer verifying-key exchange).
+        //
+        // Military mode only (handshaker is None otherwise). For each configured
+        // peer that is NOT yet pinned, connect over the SAME raft transport, send
+        // our signed attestation (TransportFrame::Handshake), read the peer's
+        // reply attestation, verify it, and pin the peer's per-node Raft VK. The
+        // loop re-runs so a peer that is initially down / restarting / rejoining
+        // gets pinned once it answers (dynamic membership). Once every peer is
+        // pinned the loop idles cheaply. The listener performs the symmetric pin
+        // when a peer connects to US first, so the exchange completes regardless
+        // of who initiates.
+        if let (Some(handshaker), Some(peer_vks)) = (handshaker.clone(), peer_vks.clone()) {
+            let config = Arc::clone(&config);
+            let hmac_key = hmac_key.clone();
+            let mut shutdown_rx = shutdown_rx.clone();
+            let pinned_peers_tx = pinned_peers_tx.clone();
+            tokio::spawn(async move {
+                // Retry every 2s. tokio's interval fires its FIRST tick
+                // immediately, so the first dial may race peers' listeners binding;
+                // that just fails and self-heals on the next tick (fail-closed:
+                // until a peer answers and verifies, it is never pinned).
+                let mut interval = tokio::time::interval(Duration::from_secs(2));
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {},
+                        _ = shutdown_rx.changed() => break,
+                    }
+
+                    // Snapshot which peers still need pinning (cheap read lock).
+                    let unpinned: Vec<PeerConfig> = {
+                        let reg = peer_vks.read().await;
+                        config
+                            .peers
+                            .iter()
+                            .filter(|p| !reg.contains(&p.node_id))
+                            .cloned()
+                            .collect()
+                    };
+                    if unpinned.is_empty() {
+                        // All peers pinned; nothing to do until membership changes.
+                        continue;
+                    }
+
+                    for peer in unpinned {
+                        let handshaker = handshaker.clone();
+                        let peer_vks = peer_vks.clone();
+                        let hmac_key = hmac_key.clone();
+                        let pinned_peers_tx = pinned_peers_tx.clone();
+                        // One short-lived task per peer so a slow/unreachable peer
+                        // never blocks the others.
+                        tokio::spawn(async move {
+                            outbound_handshake(
+                                &peer,
+                                handshaker.as_ref(),
+                                &peer_vks,
+                                hmac_key.as_deref(),
+                                pinned_peers_tx.as_ref(),
+                            )
+                            .await;
+                        });
+                    }
+                }
+                debug!("attestation handshake task shut down");
+            });
+        }
+
         Ok(Self {
             raft,
             state,
@@ -1376,6 +1908,7 @@ impl ClusterNode {
             shutdown_tx,
             leader_tx,
             peer_vks,
+            pinned_peers_tx,
         })
     }
 
@@ -1462,6 +1995,54 @@ impl ClusterNode {
     pub async fn identity_registry_snapshot(&self) -> Option<NodeIdentityRegistry> {
         let reg = self.peer_vks.as_ref()?;
         Some(reg.read().await.clone())
+    }
+
+    /// The number of cluster PEERS configured for this node (excludes self).
+    ///
+    /// A readiness consumer waits until [`Self::pinned_peers_watch`] reports this
+    /// many pinned peers before treating an `identity_registry_snapshot()` as
+    /// complete. (Note: this is the CONFIGURED peer count; if a peer is down at
+    /// startup the count may never reach it, so consumers should also accept
+    /// quorum-sized progress, not strictly all peers.)
+    pub fn expected_peer_count(&self) -> usize {
+        self.config.peers.len()
+    }
+
+    /// Subscribe to the count of PEERS pinned via the attestation handshake
+    /// (excludes self), so a consumer learns WHEN peers are pinned.
+    ///
+    /// SNAPSHOT-TIMING CONTRACT (for the revocation layer and any other registry
+    /// consumer): peer pinning is ASYNCHRONOUS and ONGOING after [`Self::start`]
+    /// returns — a peer is pinned only once its signed attestation has been
+    /// exchanged and verified, which for a slow/restarting peer can be seconds
+    /// later. Therefore an [`Self::identity_registry_snapshot`] taken immediately
+    /// after `start` will MISS peers. To snapshot safely:
+    ///
+    /// ```ignore
+    /// if let Some(mut rx) = node.pinned_peers_watch() {
+    ///     // wait until at least a quorum of peers is pinned (or all):
+    ///     let want = node.expected_peer_count();
+    ///     let _ = rx.wait_for(|&n| n >= want).await;
+    /// }
+    /// let snap = node.identity_registry_snapshot().await; // now complete
+    /// ```
+    ///
+    /// PREFERRED ALTERNATIVE: hold the LIVE [`Self::identity_registry`] handle and
+    /// read through it at verification time — it always reflects the current
+    /// pinned set (including peers pinned later / after a reconnect), so no
+    /// barrier is needed. Use the snapshot+watch only if your API requires an
+    /// owned registry.
+    ///
+    /// Returns `None` when no ASYNCHRONOUS pinning happens on this node:
+    ///  * NON-MILITARY (dev/test): peers are pinned SYNCHRONOUSLY at `start`
+    ///    (locally KEK-derived, see `build_peer_verifying_keys`), so an
+    ///    `identity_registry_snapshot()` is already complete the instant `start`
+    ///    returns — no barrier is needed and `None` means "snapshot anytime".
+    ///  * NO KEK: per-node auth is fully disabled; there is no registry to snapshot.
+    /// `Some(rx)` is returned ONLY in military mode, where pinning is async and the
+    /// barrier above is required.
+    pub fn pinned_peers_watch(&self) -> Option<watch::Receiver<usize>> {
+        self.pinned_peers_tx.as_ref().map(|tx| tx.subscribe())
     }
 
     /// Get a snapshot of the current cluster state.
@@ -2007,6 +2588,226 @@ mod tests {
             assert!(
                 verify_transport_message(&wire, &registry).is_ok(),
                 "a peer signing with the KEK-derived key must verify against the pinned key"
+            );
+        });
+    }
+
+    // ── Attestation handshake (LIVE peer verifying-key exchange) ─────────────
+    //
+    // These exercise the multiplexing frame and the verify+pin policy that turns
+    // a peer's signed attestation into a pinned per-node Raft verifying key. The
+    // handshaker is built from an explicit verifier (no env/TPM) via the
+    // test-only constructor. ML-DSA-87 keys are large → run on a big stack.
+
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn now_secs_for_test() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    /// A handshaker whose verifier has 2 configured peers, 60s max age, no
+    /// rolling update, and an own binary hash of all-zero (matches the test-env
+    /// `compute_own_binary_hash` fallback, so binary consistency passes against
+    /// peers that also use [0;64]).
+    fn test_handshaker() -> AttestationHandshaker {
+        let verifier = crate::distributed_startup::DistributedStartupVerifier::with_config(
+            2,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(60),
+            vec!["10.0.0.1:9090".to_string(), "10.0.0.2:9090".to_string()],
+            [0xA1u8; 32], // attestation signing seed (this node) — unused for peer verify
+            "self-node".to_string(),
+            false,
+        );
+        AttestationHandshaker::from_verifier_for_test(verifier, [0u8; 64])
+    }
+
+    /// Build a peer's per-node Raft identity VK from an explicit seed.
+    fn peer_raft_vk(seed: u8) -> Vec<u8> {
+        crate::distributed_startup::NodeIdentity::from_seed(
+            uuid::Uuid::from_bytes([seed; 16]),
+            [seed; 32],
+        )
+        .verifying_key()
+    }
+
+    /// TransportFrame round-trips for both variants (the multiplexing contract).
+    #[test]
+    fn transport_frame_roundtrip() {
+        run_with_large_stack(|| {
+            // Raft variant: arbitrary inner bytes survive the outer tag.
+            let raft = TransportFrame::Raft(vec![1, 2, 3, 4, 5]);
+            let wire = raft.to_wire().unwrap();
+            match TransportFrame::from_wire(&wire).unwrap() {
+                TransportFrame::Raft(b) => assert_eq!(b, vec![1, 2, 3, 4, 5]),
+                _ => panic!("expected Raft variant"),
+            }
+
+            // Handshake variant: a signed attestation round-trips intact.
+            let att = crate::distributed_startup::create_test_attestation_with_raft_vk(
+                "peer-1",
+                &[0xB2u8; 32],
+                &[0u8; 64],
+                "boot",
+                now_secs_for_test(),
+                &peer_raft_vk(2),
+            );
+            let hs = TransportFrame::Handshake(Box::new(att.clone()));
+            let wire = hs.to_wire().unwrap();
+            match TransportFrame::from_wire(&wire).unwrap() {
+                TransportFrame::Handshake(got) => {
+                    assert_eq!(got.node_id, att.node_id);
+                    assert_eq!(got.raft_verifying_key, att.raft_verifying_key);
+                }
+                _ => panic!("expected Handshake variant"),
+            }
+        });
+    }
+
+    /// A valid attestation is accepted and yields the correct (NodeId, raft VK).
+    #[test]
+    fn handshake_valid_attestation_pins_peer_vk() {
+        run_with_large_stack(|| {
+            let hs = test_handshaker();
+            let vk = peer_raft_vk(2);
+            let att = crate::distributed_startup::create_test_attestation_with_raft_vk(
+                "peer-1",
+                &[0xB2u8; 32],
+                &[0u8; 64],
+                "boot",
+                now_secs_for_test(),
+                &vk,
+            );
+            let (node_id, got_vk) = hs
+                .verify_and_extract(&att)
+                .expect("valid attestation must verify");
+            assert_eq!(node_id, canonical_node_id("peer-1"));
+            assert_eq!(got_vk, vk);
+
+            // The pinned VK must actually authenticate that peer's Raft messages.
+            let mut registry = NodeIdentityRegistry::new();
+            registry.pin(node_id, got_vk);
+            let peer_identity = crate::distributed_startup::NodeIdentity::from_seed(
+                canonical_node_id("peer-1").0,
+                [2u8; 32],
+            );
+            let msg = sample_request_vote(node_id);
+            let wire = sign_transport_message(&peer_identity, node_id, &msg).unwrap();
+            assert!(
+                verify_transport_message(&wire, &registry).is_ok(),
+                "after pinning from the attestation, the peer's Raft msg must verify"
+            );
+        });
+    }
+
+    /// A tampered attestation signature is rejected → nothing pinned.
+    #[test]
+    fn handshake_tampered_signature_rejected() {
+        run_with_large_stack(|| {
+            let hs = test_handshaker();
+            let mut att = crate::distributed_startup::create_test_attestation_with_raft_vk(
+                "peer-1",
+                &[0xB2u8; 32],
+                &[0u8; 64],
+                "boot",
+                now_secs_for_test(),
+                &peer_raft_vk(2),
+            );
+            att.signature[0] ^= 0xFF;
+            assert!(
+                hs.verify_and_extract(&att).is_err(),
+                "tampered attestation signature must be rejected (fail-closed)"
+            );
+        });
+    }
+
+    /// Swapping the published raft_verifying_key after signing is rejected: the
+    /// attestation signature COVERS the VK, so the swap invalidates the signature.
+    /// This is the core anti-MITM property (a peer's VK cannot be substituted).
+    #[test]
+    fn handshake_swapped_raft_vk_rejected() {
+        run_with_large_stack(|| {
+            let hs = test_handshaker();
+            let mut att = crate::distributed_startup::create_test_attestation_with_raft_vk(
+                "peer-1",
+                &[0xB2u8; 32],
+                &[0u8; 64],
+                "boot",
+                now_secs_for_test(),
+                &peer_raft_vk(2),
+            );
+            // Attacker swaps in a DIFFERENT VK (e.g. their own) without re-signing.
+            att.raft_verifying_key = peer_raft_vk(9);
+            assert!(
+                hs.verify_and_extract(&att).is_err(),
+                "a swapped raft_verifying_key must invalidate the attestation signature"
+            );
+        });
+    }
+
+    /// An expired attestation (older than max_age) is rejected.
+    #[test]
+    fn handshake_expired_attestation_rejected() {
+        run_with_large_stack(|| {
+            let hs = test_handshaker();
+            let att = crate::distributed_startup::create_test_attestation_with_raft_vk(
+                "peer-1",
+                &[0xB2u8; 32],
+                &[0u8; 64],
+                "boot",
+                now_secs_for_test() - 200, // 200s old > 60s max
+                &peer_raft_vk(2),
+            );
+            assert!(
+                hs.verify_and_extract(&att).is_err(),
+                "an expired attestation must be rejected"
+            );
+        });
+    }
+
+    /// A peer running a DIFFERENT binary is not pinned (binary consistency),
+    /// when not in a rolling update.
+    #[test]
+    fn handshake_binary_mismatch_rejected() {
+        run_with_large_stack(|| {
+            let hs = test_handshaker(); // own_binary_hash = [0;64], rolling_update=false
+            let mut different = [0u8; 64];
+            different[0] = 0xFF;
+            let att = crate::distributed_startup::create_test_attestation_with_raft_vk(
+                "peer-1",
+                &[0xB2u8; 32],
+                &different,
+                "boot",
+                now_secs_for_test(),
+                &peer_raft_vk(2),
+            );
+            assert!(
+                hs.verify_and_extract(&att).is_err(),
+                "a peer with a mismatched binary hash must not be pinned"
+            );
+        });
+    }
+
+    /// An attestation with no published raft_verifying_key is not pinned
+    /// (fail-closed: an unpinned peer's Raft messages are dropped, not trusted).
+    #[test]
+    fn handshake_missing_raft_vk_rejected() {
+        run_with_large_stack(|| {
+            let hs = test_handshaker();
+            let att = crate::distributed_startup::create_test_attestation_with_raft_vk(
+                "peer-1",
+                &[0xB2u8; 32],
+                &[0u8; 64],
+                "boot",
+                now_secs_for_test(),
+                &[], // legacy peer: no published VK
+            );
+            assert!(
+                hs.verify_and_extract(&att).is_err(),
+                "an attestation with no raft_verifying_key must not be pinned"
             );
         });
     }

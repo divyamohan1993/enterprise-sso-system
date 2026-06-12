@@ -624,6 +624,7 @@ impl DistributedStartupVerifier {
             attestation_timeout,
             attestation_max_age,
             peer_endpoints,
+            signing_seed,
             // Canonicalize the test/string id to the cluster NodeId (same fn the
             // transport uses), so attestation ids stay UUID-typed.
             node_id: crate::cluster::canonical_node_id(&node_id),
