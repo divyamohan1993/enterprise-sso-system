@@ -77,9 +77,9 @@ dependencies = [
 
 [[package]]
 name = "aegis"
-version = "0.6.13"
+version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c250d2c49d5ac96bb1ec753b1305f5489a19632cef15846ee14803afd6300607"
+checksum = "78412fa53e6da95324e8902c3641b3ff32ab45258582ea997eb9169c68ffa219"
 dependencies = [
  "cc",
  "softaes",
