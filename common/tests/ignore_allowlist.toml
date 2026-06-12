@@ -21,6 +21,30 @@ test = "login_user_existence_no_timing_oracle"
 reason = "OPAQUE login user-existence timing oracle check; statistical, nightly bare-metal only."
 audit = "2026-04-15"
 
+[[ignored]]
+file = "opaque/tests/proptest_opaque.rs"
+test = "different_passwords_different_registrations"
+reason = "1000-case property test now runs the 64 MiB military Argon2id KSF (Wave-1 OPAQUE hardening); too slow for CI. Run on C2 release: cargo test --release -p opaque -- --ignored."
+audit = "2026-06-12"
+
+[[ignored]]
+file = "opaque/tests/proptest_opaque.rs"
+test = "register_then_login_correct_password"
+reason = "1000-case proptest under the 64 MiB military Argon2id KSF (Wave-1 OPAQUE hardening); C2 release only (--ignored)."
+audit = "2026-06-12"
+
+[[ignored]]
+file = "opaque/tests/proptest_opaque.rs"
+test = "register_then_login_wrong_password"
+reason = "1000-case proptest under the 64 MiB military Argon2id KSF (Wave-1 OPAQUE hardening); C2 release only (--ignored)."
+audit = "2026-06-12"
+
+[[ignored]]
+file = "opaque/tests/proptest_opaque.rs"
+test = "server_state_does_not_contain_password_bytes"
+reason = "1000-case proptest under the 64 MiB military Argon2id KSF (Wave-1 OPAQUE hardening); C2 release only (--ignored)."
+audit = "2026-06-12"
+
 [[disabled_files]]
 path = "saml-sp/tests/e2e.rs.disabled"
 reason = "saml-sp lib.rs is a stub; 1800 lines unwired per 2026-04-15 audit. Re-enable after saml-sp revive (W3)."
