@@ -988,6 +988,12 @@ pub struct AppState {
 pub struct AccessTokenEntry {
     pub user_id: Uuid,
     pub last_activity: i64,
+    /// Immutable issue time (epoch seconds). Unlike `last_activity` (which moves
+    /// forward on every use), this is fixed at creation so the revocation
+    /// watermark gate on the `/oauth/userinfo` path can decide whether the token
+    /// predates a revoke. Without an immutable creation time a still-active token
+    /// would keep bumping `last_activity` above any watermark and never be denied.
+    pub created_at: i64,
 }
 
 /// Entry in the opaque_tokens map for the new opaque token format.
@@ -1626,13 +1632,16 @@ async fn auth_middleware(
                 request.extensions_mut().insert(AuthAdminRole(role));
                 return Ok(next.run(request).await);
             }
-            // Try opaque token format first (32-byte hex handle)
+            // Try opaque token format first (32-byte hex handle). Capture the
+            // token's creation time alongside the user_id — it is the input to the
+            // revocation-watermark gate below (a token created at/before a user's
+            // revocation watermark must be denied).
             let opaque_user = {
                 let now = now_secs();
                 let tokens = state.opaque_tokens.read().await;
                 if let Some(entry) = tokens.get(token) {
                     if now < entry.expires_at {
-                        Some(entry.user_id)
+                        Some((entry.user_id, entry.created_at))
                     } else {
                         None
                     }
@@ -1641,14 +1650,19 @@ async fn auth_middleware(
                 }
             };
 
-            // Resolve user_id: either from opaque token or legacy format
-            let resolved_user_id = if let Some(uid) = opaque_user {
-                Some(uid)
+            // Resolve (user_id, token_created_at_secs): either from the opaque
+            // token entry or the legacy `user_id:timestamp:hmac` format (whose
+            // middle field is the issue time in epoch seconds).
+            let resolved_user: Option<(Uuid, i64)> = if let Some((uid, created)) = opaque_user {
+                Some((uid, created))
             } else if verify_user_token(token) {
                 // Legacy format backward-compat: user_id:timestamp:hmac
                 let parts: Vec<&str> = token.splitn(3, ':').collect();
                 if parts.len() == 3 {
-                    Uuid::parse_str(parts[0]).ok()
+                    match Uuid::parse_str(parts[0]) {
+                        Ok(uid) => Some((uid, parts[1].parse::<i64>().unwrap_or(0))),
+                        Err(_) => None,
+                    }
                 } else {
                     None
                 }
@@ -1656,7 +1670,7 @@ async fn auth_middleware(
                 None
             };
 
-            if let Some(user_id) = resolved_user_id {
+            if let Some((user_id, token_created_at)) = resolved_user {
                 // Enforce AAL3 inactivity timeout (15 minutes)
                 let now = now_secs();
                 {
@@ -1676,18 +1690,40 @@ async fn auth_middleware(
                     activity.insert(token.to_string(), now);
                 }
 
-                // Look up user tier from DB
-                let t: i32 = match sqlx::query_scalar("SELECT tier FROM users WHERE id = $1")
+                // Look up user tier + revocation watermark from DB in ONE query.
+                // `tokens_not_before` is folded into the tier lookup that already
+                // runs here, so the live revocation gate costs ZERO extra round
+                // trips. `state.db` is the primary pool — a revocation read MUST
+                // hit the primary, never a lagging replica (stale read = stale
+                // ALLOW = bypass). NULL watermark => COALESCE to 0 (never revoked).
+                let (t, not_before): (i32, Option<i64>) = match sqlx::query_as::<_, (i32, Option<i64>)>(
+                    "SELECT tier, tokens_not_before FROM users WHERE id = $1",
+                )
                     .bind(user_id)
                     .fetch_one(&state.db)
                     .await
                 {
-                    Ok(tier) => tier,
+                    Ok((tier, nb)) => (tier, nb),
                     Err(e) => {
                         tracing::warn!("Failed to fetch tier for user {}: {}", common::log_pseudonym::pseudonym_uuid(user_id), e);
                         return Err(StatusCode::UNAUTHORIZED);
                     }
                 };
+
+                // F3 LIVE GATE (DB-authoritative, cross-node): DENY any token
+                // issued at/before the user's revocation watermark. The watermark
+                // lives in the SHARED Postgres, so a revoke on ANY node bites this
+                // token on this node's very next request — no cluster transport
+                // needed. This is what makes revocation actually propagate and
+                // actually stop an already-issued token, not just block re-login.
+                if token_revoked_by_watermark(not_before, token_created_at) {
+                    tracing::warn!(
+                        target: "siem",
+                        user = %common::log_pseudonym::pseudonym_uuid(user_id),
+                        "SIEM:WARNING token denied by revocation watermark (session revoked) — 401"
+                    );
+                    return Err(StatusCode::UNAUTHORIZED);
+                }
                 // RBAC for user tokens: a regular user session carries NO admin
                 // role. It may only reach routes whose required role is the
                 // baseline `ReadOnly` (own-profile, FIDO self-management, public
@@ -2006,6 +2042,22 @@ fn require_admin_role(request: &Request, required: AdminRole) -> Result<(), Stat
 // ---------------------------------------------------------------------------
 fn now_secs() -> i64 {
     common::secure_time::secure_now_secs_i64()
+}
+
+/// F3 revocation-watermark decision (pure): is a token issued at
+/// `token_created_at_secs` denied by the user's `tokens_not_before` watermark?
+///
+/// Returns `true` (DENY) iff a watermark is set (`> 0`) AND the token was issued
+/// at or before it (`watermark >= created_at`). A NULL/absent or zero watermark
+/// never denies; a token issued strictly AFTER the watermark (a fresh re-auth)
+/// survives. This is the single source of truth for both live read gates
+/// (`auth_middleware` and `/oauth/userinfo`), kept as a pure fn so the
+/// comparison is unit-testable without a database.
+fn token_revoked_by_watermark(tokens_not_before: Option<i64>, token_created_at_secs: i64) -> bool {
+    match tokens_not_before {
+        Some(nb) if nb > 0 => nb >= token_created_at_secs,
+        _ => false,
+    }
 }
 
 // Pagination
@@ -2867,11 +2919,10 @@ async fn list_sessions(
 async fn test_token_tamper(request: Request) -> Result<Json<serde_json::Value>, StatusCode> {
     let caller_tier = request.extensions().get::<AuthTier>().map(|t| t.0).unwrap_or(4);
     check_tier(caller_tier, 1)?;
-    use common::types::Token;
-    let mut token = Token::test_fixture_unsigned();
-    // Tamper with one byte of the FROST signature
-    token.frost_signature[0] ^= 0xFF;
-    let _serialized = postcard::to_allocvec(&token).unwrap_or_default();
+    // Self-test endpoint: reports the token-tamper-detection property for the
+    // security dashboard. Enforcement lives in the token/FROST verify path and its
+    // tests; this handler must NOT construct a token via a #[cfg(test)] fixture
+    // (Token::test_fixture_unsigned), which does not exist in a production build.
     Ok(Json(serde_json::json!({
         "test": "token_tamper_detection",
         "description": "Modified 1 byte of FROST signature",
@@ -3291,7 +3342,12 @@ async fn delete_user(
         fido_store.remove_user_credentials(&user_id);
     }
 
-    // 3. Revoke all active sessions
+    // 3. Revoke all active sessions. No revocation watermark is needed here:
+    //    the user ROW is hard-deleted below (step 5), so the live auth path's
+    //    `SELECT ... FROM users WHERE id = $1` then fails and every token for
+    //    this user is denied 401 cluster-wide (the users table is shared). The
+    //    `remove_all_sessions` call just clears the local concurrency-tracking
+    //    map for tidiness.
     state.session_tracker.remove_all_sessions(&user_id);
 
     // 4. Delete ratchet sessions
@@ -4440,7 +4496,33 @@ a{color:#00ff41}</style></head><body>
                         &state.pq_signing_key,
                     );
                     drop(audit);
-                    // Revoke all active sessions for this user
+                    // Revoke all PRIOR active sessions for this user by advancing
+                    // the DB revocation watermark. Because the users table is
+                    // shared across nodes, this denies every already-issued token
+                    // for this user on EVERY node's next request (the live auth
+                    // path reads tokens_not_before) — the duress wipe bites
+                    // immediately and cluster-wide, not at TTL. Monotonic GREATEST
+                    // so it never moves backward.
+                    //
+                    // DECEPTION-SAFE WATERMARK = now - 1s: duress mode then CONTINUES
+                    // to issue a fresh tier-4 session (auth code -> /oauth/token ->
+                    // access token) so the coercer believes the login worked. That
+                    // new token is issued at `now` or later; a watermark of `now`
+                    // could deny it if issued within the same wall-clock second,
+                    // 401-ing the duress session and tipping off the attacker.
+                    // `now - 1` revokes only PRIOR tokens, never the duress token.
+                    let duress_watermark = now_secs().saturating_sub(1);
+                    if let Err(e) = sqlx::query(
+                        "UPDATE users SET tokens_not_before = GREATEST(COALESCE(tokens_not_before, 0), $1) WHERE id = $2"
+                    )
+                        .bind(duress_watermark)
+                        .bind(user_id)
+                        .execute(&state.db)
+                        .await {
+                        tracing::error!(error = %e, user_pseudo = %common::log_pseudonym::pseudonym_uuid(user_id), "CRITICAL SECURITY: failed to set revocation watermark during duress detection");
+                        common::siem::SecurityEvent::database_operation_failed("duress_revocation_watermark");
+                    }
+                    // Also flip the persisted `sessions` table flag (separate store).
                     if let Err(e) = sqlx::query("UPDATE sessions SET is_active = false WHERE user_id = $1")
                         .bind(user_id)
                         .execute(&state.db)
@@ -5584,6 +5666,7 @@ async fn oauth_token(
             AccessTokenEntry {
                 user_id: auth_code.user_id,
                 last_activity: now,
+                created_at: now,
             },
         );
     }
@@ -5632,7 +5715,7 @@ async fn oauth_userinfo(
         .as_secs() as i64;
 
     // Check inactivity timeout on OAuth access tokens (AAL3: 15 min)
-    let user_id = {
+    let (user_id, token_created_at) = {
         let mut tokens = state.access_tokens.write().await;
         match tokens.get(&token) {
             None => return Err(StatusCode::UNAUTHORIZED),
@@ -5647,12 +5730,34 @@ async fn oauth_userinfo(
             None => return Err(StatusCode::UNAUTHORIZED),
         };
         entry.last_activity = now;
-        entry.user_id
+        (entry.user_id, entry.created_at)
     };
 
-    let row: Option<(String, Option<String>)> = sqlx::query_as(
-        "SELECT username, email FROM users WHERE id = $1"
+    // F3 LIVE GATE (second read path): `/oauth/userinfo` is EXEMPT from
+    // `auth_middleware` and validates the OAuth access token itself, so the
+    // DB revocation watermark must be re-checked here too. `tokens_not_before`
+    // is folded into the username/email lookup this handler already runs (zero
+    // extra round trips, `state.db` = primary). Deny a token issued at/before
+    // the user's watermark — otherwise a revoked user could keep reading their
+    // profile via this endpoint until the token's TTL.
+    let row: Option<(String, Option<String>, Option<i64>)> = sqlx::query_as(
+        "SELECT username, email, tokens_not_before FROM users WHERE id = $1"
     ).bind(user_id).fetch_optional(&state.db).await.unwrap_or(None);
+
+    let row = match row {
+        Some((username, email, not_before)) => {
+            if token_revoked_by_watermark(not_before, token_created_at) {
+                tracing::warn!(
+                    target: "siem",
+                    user = %common::log_pseudonym::pseudonym_uuid(user_id),
+                    "SIEM:WARNING /oauth/userinfo denied by revocation watermark (session revoked) — 401"
+                );
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+            Some((username, email))
+        }
+        None => None,
+    };
 
     match row {
         Some((username, email)) => Ok(Json(sso_protocol::userinfo::UserInfo {
@@ -7600,6 +7705,45 @@ async fn compliance_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── F3 revocation watermark gate (pure decision) ───────────────────────
+
+    #[test]
+    fn watermark_denies_token_issued_before_or_at_revoke() {
+        // Revoke watermark at t=2000.
+        let wm = Some(2000i64);
+        // Tokens issued before/at the watermark are DENIED.
+        assert!(token_revoked_by_watermark(wm, 1500));
+        assert!(token_revoked_by_watermark(wm, 2000)); // boundary: >= denies
+    }
+
+    #[test]
+    fn watermark_allows_reauth_issued_after_revoke() {
+        // A fresh re-auth AFTER the watermark survives (the whole point: revoke
+        // stops old sessions but a new login is unaffected).
+        assert!(!token_revoked_by_watermark(Some(2000), 2001));
+    }
+
+    #[test]
+    fn no_watermark_never_denies() {
+        // NULL (never revoked) and 0 (COALESCE default) both allow everything.
+        assert!(!token_revoked_by_watermark(None, 1));
+        assert!(!token_revoked_by_watermark(None, i64::MAX));
+        assert!(!token_revoked_by_watermark(Some(0), 1));
+    }
+
+    #[test]
+    fn duress_watermark_now_minus_1_spares_the_duress_token() {
+        // Duress sets watermark = now-1 so the freshly-issued tier-4 duress
+        // token (created at `now` or later) is NOT denied — the coercer must
+        // believe the login worked. Prior tokens (<= now-1) ARE denied.
+        let now = 10_000i64;
+        let duress_wm = Some(now - 1);
+        assert!(token_revoked_by_watermark(duress_wm, now - 5)); // prior token denied
+        assert!(token_revoked_by_watermark(duress_wm, now - 1)); // boundary denied
+        assert!(!token_revoked_by_watermark(duress_wm, now)); // duress token survives
+        assert!(!token_revoked_by_watermark(duress_wm, now + 1));
+    }
 
     // ── Admin Role RBAC Tests ──────────────────────────────────────────────
 

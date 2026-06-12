@@ -644,6 +644,21 @@ pub async fn init_database(database_url: &str) -> Result<PgPool, String> {
         tracing::warn!("migration: add duress_pin_hash column failed: {}", e);
     }
 
+    // Migration (F3): per-user session revocation watermark. `tokens_not_before`
+    // is a "not-before" instant in EPOCH SECONDS: any token whose issued-at is
+    // <= this value is denied on the live auth path, even one already issued. A
+    // revoke (duress, etc.) UPSERTs it to `now`; a later re-auth issues a token
+    // with a newer issued-at and survives. Because all service nodes share this
+    // one Postgres, the watermark IS the cross-node propagation channel — node A
+    // writes it, node B reads it on the next request. NULL = no revocation.
+    // Canonical DDL lives in migrations/012_user_revocation_watermark.sql; this
+    // is the idempotent safety net (same belt-and-suspenders as the columns above).
+    if let Err(e) = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS tokens_not_before BIGINT")
+        .execute(&pool)
+        .await {
+        tracing::warn!("migration: add tokens_not_before column failed: {}", e);
+    }
+
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS devices (
             id UUID PRIMARY KEY,
